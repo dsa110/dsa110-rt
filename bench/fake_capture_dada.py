@@ -25,7 +25,13 @@ def _repo_root() -> Path:
 
 
 def _ipc_key(name: str) -> int:
-    m = {"dada": 0xDADA, "eada": 0xEADA, "fada": 0xFADA, "bada": 0xBADA}
+    m = {
+        "dada": 0xDADA,
+        "dadc": 0xDADC,
+        "eada": 0xEADA,
+        "fada": 0xFADA,
+        "bada": 0xBADA,
+    }
     if name not in m:
         raise ValueError(f"unsupported buffer key {name!r}")
     return m[name]
@@ -57,11 +63,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rate", default="native", choices=("native", "fast"))
     ap.add_argument("--secs", type=float, default=60.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--dada-key",
+        default="dada",
+        help="PSRDADA buffer key (default dada; M0 plumbing uses dadc on a dedicated ring).",
+    )
     ns = ap.parse_args(argv)
 
     bpp, ring_blocks = _load_buffer_cfg("dada")
     rng = np.random.default_rng(ns.seed)
-    writer = Writer(_ipc_key("dada"))
+    writer = Writer(_ipc_key(ns.dada_key))
 
     target = max(1, int(ns.secs / BLOCK_S))
     t0 = time.monotonic()
@@ -74,7 +85,10 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(sleep_for)
 
     writer.disconnect()
-    print(f"fake_capture_dada: wrote ~{target} block(s) to dada ({bpp} B/page × {ring_blocks} pages)")
+    print(
+        f"fake_capture_dada: wrote ~{target} block(s) to {ns.dada_key} "
+        f"({bpp} B/page × {ring_blocks} pages)"
+    )
     return 0
 
 
