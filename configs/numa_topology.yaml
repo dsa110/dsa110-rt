@@ -54,39 +54,44 @@ hosts:
         numa_node: 1
         mtu: 9000
   lxd110h01:
-    role_template: search_dev_co_resident
-    notes: >-
-      Phase-A dev on h01 (§6.2): corr + search co-resident; loopback transport.
-      GPU split — gpu0 corr_slow + search_compute@0; gpu1 corr_fast + search_compute@1.
-      Fill iface PCI IDs from `lspci` when templating systemd units.
-    numa:
-      "0":
-        cpus: "0-15"
-        dram_gb: 96
-      "1":
-        cpus: "16-31"
-        dram_gb: 96
-    gpu:
-      slow:
-        device_id: 0
+    phase_a_role: co_resident_corr_search   # see configs/host_phase.yaml
+    sockets: 2
+    cores_per_socket: 10
+    threads_per_core: 2
+    total_logical_cpus: 40
+    numa_nodes:
+      node0:
+        cpulist: "0-9,20-29"
+        mem_kb: 48080952
+        gpus: ["0000:3b:00.0"]
+        nics: ["eno1", "eno2"]                 # 1/10GbE mgmt; not used for ingest
+      node1:
+        cpulist: "10-19,30-39"
+        mem_kb: 49518084
+        gpus: ["0000:af:00.0"]
+        nics: ["enp129s0f0", "enp129s0f1"]     # 100GbE Mellanox; idle in Phase A (PSRDADA replay)
+    cuda_device_map:                            # set CUDA_DEVICE_ORDER=PCI_BUS_ID in service env
+      0: "0000:3b:00.0"                         # CUDA :0 -> NUMA 0
+      1: "0000:af:00.0"                         # CUDA :1 -> NUMA 1
+    gpu_share_mode: tbd                         # M0 derisk bench/derisk/gpu_share_jitter.py decides MPS vs time-slice
+    service_pinning:                            # consumed by services/systemd/templates/* via CPUAffinity=
+      dsart-corr-fast@01:
         numa_node: 0
-      fast:
-        device_id: 1
-        numa_node: 1
-      search0:
-        device_id: 0
+        cpu_affinity: "0-3,20-23"               # 4 phys cores + HT siblings (8 logical)
+        cuda_device: 0
+      dsart-corr-slow@01:
         numa_node: 0
-      search1:
-        device_id: 1
+        cpu_affinity: "4-5,24-25"               # 2 phys cores + HT siblings (4 logical, ~1 Hz cadence)
+        cuda_device: 0
+      dsart-search-compute@01-0:
+        numa_node: 0
+        cpu_affinity: "6-9,26-29"               # 4 phys cores + HT siblings (8 logical), shares GPU 0
+        cuda_device: 0
+      dsart-search-compute@01-1:
         numa_node: 1
-    nic:
-      snap:
-        - iface: eth_snap0
-          numa_node: 0
-        - iface: eth_snap1
-          numa_node: 0
-      search:
-        iface: lo
-        bind_ip: 127.0.0.1
-        numa_node: 1
-        mtu: 65536
+        cpu_affinity: "10-19,30-39"             # entire NUMA 1 (20 logical), sole occupant of GPU 1
+        cuda_device: 1
+    notes:
+      - "Phase A: NIC NUMA affinity is irrelevant — corr ingest is via PSRDADA replay, not Mellanox."
+      - "Mellanox (NUMA 1) + GPU 0 (NUMA 0) is cross-NUMA; verify production corr-nodes pair NIC+GPU on same node."
+      - "GPU enumeration uses CUDA_DEVICE_ORDER=PCI_BUS_ID for deterministic mapping (set in service env)."
