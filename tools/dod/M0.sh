@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # M0 Definition-of-Done (§8) — intended for h01 with dsa110-rt conda env + PSRDADA rings.
-set -euo pipefail
+# set -u DROPPED intentionally:
+#   Conda's MKL activate.d hook references MKL_INTERFACE_LAYER
+#   without a default; under 'set -u' that aborts conda activate
+#   before any STEP runs. Same issue + fix as
+#   tools/ops/install_psrdada.sh. See plan §6.
+#   pipefail kept so step failures aren't masked by tee.
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export REPO_ROOT
 export DSART_CONFIG_DIR="${REPO_ROOT}/configs"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-GNU,LP64}"
 
 # shellcheck source=/dev/null
 source "${HOME}/miniforge3/etc/profile.d/conda.sh"
