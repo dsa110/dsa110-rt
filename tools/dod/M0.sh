@@ -13,6 +13,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export REPO_ROOT
 export DSART_CONFIG_DIR="${REPO_ROOT}/configs"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${REPO_ROOT}"
 
 export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-GNU,LP64}"
 
@@ -40,7 +41,10 @@ pass
 STEP="plumbing_junkdb"
 command -v dada_junkdb >/dev/null || fail "dada_junkdb not in PATH"
 command -v dada_dbmetric >/dev/null || fail "dada_dbmetric not in PATH"
-dada_junkdb -k dada -r 1124 -t 6 || fail "dada_junkdb run"
+# Header fixture: tests/fixtures/headers/correlator_header_dsaX.txt
+# See tests/fixtures/headers/README.md for provenance.
+DSART_JUNKDB_HEADER="${DSART_JUNKDB_HEADER:-tests/fixtures/headers/correlator_header_dsaX.txt}"
+dada_junkdb -k dada -r 1124 -t 6 "${DSART_JUNKDB_HEADER}" || fail "dada_junkdb run"
 dada_dbmetric -k dada >/tmp/m0_dada_metric.txt || fail "dada_dbmetric"
 pass
 
