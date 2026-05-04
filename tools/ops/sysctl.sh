@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Apply §6.1 NIC sysctl headroom (NOPASSWD allowlist per §6.2).
+# Ubuntu 18.04 path: /sbin/sysctl (pre-/usr-merge).
+# Ubuntu 20.04+ would use /usr/sbin/sysctl. Sudoers allowlist must match.
 set -euo pipefail
 
-SYSCTL=/usr/sbin/sysctl
+SYSCTL=/sbin/sysctl
 
 sudo -n "$SYSCTL" -w net.core.rmem_max=268435456
 sudo -n "$SYSCTL" -w net.core.wmem_max=268435456
