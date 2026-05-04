@@ -3,3 +3,4 @@ work/
 __pycache__/
 .venv/
 .DS_Store
+src/dsart.egg-info/
