@@ -195,38 +195,30 @@ PY
 pass
 
 STEP="repo_corr_yaml"
-# Physics-pinned buffer sizes (derivable from §3 constants):
-#   fada bytes_per_block = NPACKETS_PER_BLOCK × NANTS × NCHAN_PER_PACKET
-#                          × 2 t × 2 pol × 1 byte (4-bit cplx packed)
-#                        = 2048 × 96 × 384 × 2 × 2 × 1
-#                        = 301,989,888 bytes  (==288 MiB)
-#   bada bytes_per_block = NBASE × NCHAN_PER_PACKET × 2 pol × 8 bytes
-#                          (complex64 = 2 × float32)
-#                        = 4656 × 384 × 2 × 8
-#                        = 28,606,464 bytes  (==27.28 MiB)
-# These are NOT config choices — they're block sizes the legacy
-# C correlator and meridian_fringestop already lock-in. M2 Chunk 0
-# corrects the repo's stub config_corr.yaml to match. Today this step
-# is INFORM-ONLY (warn + continue); M2.sh hardens to fail-fast after
-# Chunk 0 lands. Note: the F7 path dsa110-cnf/config_dsa96_corr.yaml
-# is dev-only on h23 (uncommitted); not relied upon at preflight.
-python - <<PY
-import sys, yaml
+# Physics-pinned buffer sizes (derivable from §3 constants); see
+# configs/config_corr.yaml comment for the derivation. NOT config
+# choices — these are block sizes the legacy C correlator and
+# meridian_fringestop lock in.
+python - <<PY || fail "configs/config_corr.yaml diverges from physics-pinned values (F6)"
+import yaml
 with open("${REPO_ROOT}/configs/config_corr.yaml") as f:
     cfg = yaml.safe_load(f)
 buffers = cfg.get('buffers', {})
-fada = buffers.get('fada', {}).get('bytes_per_block', -1)
-bada = buffers.get('bada', {}).get('bytes_per_block', -1)
-EXP_FADA = 2048 * 96 * 384 * 2 * 2 * 1   # 301,989,888
-EXP_BADA = 4656 * 384 * 2 * 8            #  28,606,464
-print(f"  repo fada:   bytes_per_block={fada:>11d}  (expected {EXP_FADA:>11d})")
-print(f"  repo bada:   bytes_per_block={bada:>11d}  (expected {EXP_BADA:>11d})")
-mismatch = (fada != EXP_FADA) or (bada != EXP_BADA)
-if mismatch:
-    print("  WARN: repo config_corr.yaml DOES NOT MATCH physics-pinned values "
-          "(F6 in M2_PLAN_FIXES.md). M2 Chunk 0 will fix this.")
-    sys.exit(0)  # warn-only at preflight; M2.sh will fail-fast.
-print("  OK: repo config_corr.yaml fada/bada sizing matches physics-pinned values.")
+got = {k: buffers.get(k, {}).get('bytes_per_block', -1) for k in ('dada', 'eada', 'fada', 'bada')}
+exp = {
+    'dada': 2048 * 48 * 384 * 2 * 2 * 1,   # 150,994,944
+    'eada': 2048 * 48 * 384 * 2 * 2 * 1,   # 150,994,944
+    'fada': 2048 * 96 * 384 * 2 * 2 * 1,   # 301,989,888
+    'bada': 4656 * 384 * 2 * 8,            #  28,606,464
+}
+ok = True
+for k in ('dada', 'eada', 'fada', 'bada'):
+    flag = "OK" if got[k] == exp[k] else "FAIL"
+    if got[k] != exp[k]:
+        ok = False
+    print(f"  {k}: got={got[k]:>11d} expected={exp[k]:>11d}  [{flag}]")
+if not ok:
+    raise SystemExit(1)
 PY
 pass
 
