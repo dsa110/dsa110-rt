@@ -6,6 +6,9 @@ channels:
   - conda-forge
   - pytorch
   - nvidia
+# Env creators must invoke `conda env create` with PIP_NO_BUILD_ISOLATION=1 (conda
+# inherits it and pip honors it), because legacy psrdada-python setup.py imports
+# Cython without declaring it in build-system requires.
 dependencies:
   - python >=3.11,<3.12
   - pip
@@ -34,8 +37,6 @@ dependencies:
   - ipython
 
   - pip:
-      # psrdada-python imports Cython in setup.py without declaring it in pyproject.toml [build-system] requires; pip isolated build envs then lack Cython.
-      - --no-build-isolation
       # cupy for CUDA 11.x (pairs with CUDA 11.8 user-space from the torch stack above).
       - cupy-cuda11x
       # etcd3 API client used by tooling (distinct from etcd server).
