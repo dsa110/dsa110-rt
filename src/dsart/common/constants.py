@@ -76,41 +76,44 @@ N_CHAN_PROC_NATIVE: int = N_CHGROUP * NCHAN_PER_CHGROUP
 CH0_CHGROUP_0: int = 1024
 """First processed system channel index (chgroup 0's local ch=0)."""
 
-# Processed band edges (plan §3.1 line ~418; M1 plan-fix F8 — mixed convention):
+# Processed band edges (plan §3.1 line ~418; M1 plan-fix F8 — edge convention).
 #
-# The plan uses an asymmetric edge/centre convention for the two band ends:
-#   - NU_TOP_PROC_GHZ uses EDGE: upper edge of ch_sys=1024 = f0 - 1024·Δν.
-#     Matches the §3.1 chgroup table line 408 (chgroup 0: 1498.75 MHz exact).
-#   - NU_BOT_PROC_GHZ uses CENTRE: centre of ch_sys=7167 = f0 - 7167.5·Δν.
-#     This matches the plan-pinned literal 1.311265 GHz; the §3.1 closed-form
-#     `freq(15, 383) = f0 - 7167·Δν` returns 1.311280 GHz (the edge), differing
-#     by half a channel (~15 kHz).
+# Both band ends use the EDGE convention (= upper edge of the channel that
+# anchors that end of the band), so that:
 #
-# The half-channel mismatch is absorbed operationally by the §3.6.2 stage-2
-# integer-sample rounding (`numpy.rint(Δτ / t_int_fast_us)` → 0 at all
-# practical DMs ≤ 3000 because the ratio is < 0.1 samples). Sub-agents
-# computing dispersion delays must use NU_BOT_PROC_GHZ for global-band
-# arithmetic and `NU_CHGROUP_BOT_GHZ[g]` (= edge from `freq_GHz(g, 383)`,
-# i.e. the §3.1 closed-form) for chgroup-local arithmetic. The two AGREE
-# at chgroup 15 within the rounding tolerance, which is what
-# `time_shift_corr_stage2[15, c] == 0` requires.
+#     NU_TOP_PROC_GHZ        ≡ freq_GHz(0, 0)       = f0 - 1024·Δν
+#     NU_BOT_PROC_GHZ        ≡ freq_GHz(15, 383)    = f0 - 7167·Δν
+#     NU_CHGROUP_TOP_GHZ[g]  = freq_GHz(g, 0)
+#     NU_CHGROUP_BOT_GHZ[g]  = freq_GHz(g, 383)
 #
-# F8 in M1_PLAN_FIXES.md captures the plan-prose clarification needed in §3.1.
+# Critically, this gives  NU_CHGROUP_BOT_GHZ[15] == NU_BOT_PROC_GHZ  exactly,
+# which is the precondition for `time_shift_corr_stage2[15, c] == 0` (plan §3.2
+# line 577 / §3.6.2 stage-2 invariant) holding for ALL DMs, not just for low
+# DMs where rint() happens to round to 0.
+#
+# Plan literal updates captured in M1_PLAN_FIXES.md F8/F9:
+#   - NU_BOT_PROC_GHZ:  1.311265 GHz  →  1.311281 GHz  (was centre-of-ch-7167;
+#                       now upper-edge-of-ch-7167 per the §3.1 closed-form).
+#   - BW_PROC_MHZ:      187.485 MHz   →  187.469 MHz   (= 6143·Δν · 1000;
+#                       was the asymmetric edge-top minus centre-bot value).
+#   - Δτ_proc(DM=3000): 1699.5 ms     →  1697.5 ms     (F11; computed from
+#                       the corrected literals + standard formula).
+#
+# Plan §3.1 line 408 chgroup-top table values (1498.75 MHz, 1487.03125, ...)
+# remain correct: those are the EDGE values that NU_CHGROUP_TOP_GHZ already
+# returned under the previous mixed convention.
 NU_TOP_PROC_GHZ: float = F0_CONF_GHZ - CH0_CHGROUP_0 * DELTA_NU_CH_GHZ
 """Top of processed band (GHz) = upper edge of ch_sys=1024. 1.49875 GHz exact."""
 
-_CH_BOT_INDEX_CENTRE: float = CH0_CHGROUP_0 + N_CHAN_PROC_NATIVE - 0.5
-NU_BOT_PROC_GHZ: float = F0_CONF_GHZ - _CH_BOT_INDEX_CENTRE * DELTA_NU_CH_GHZ
-"""Bottom of processed band (GHz) = centre of ch_sys=7167. ≈ 1.311265 GHz.
-NOT `freq_GHz(15, 383)` (edge of ch 7167 = 1.311280); see the convention
-note above."""
+NU_BOT_PROC_GHZ: float = F0_CONF_GHZ - (CH0_CHGROUP_0 + N_CHAN_PROC_NATIVE - 1) * DELTA_NU_CH_GHZ
+"""Bottom of processed band (GHz) = upper edge of ch_sys=7167.
+≈ 1.311281 GHz (= freq_GHz(15, 383); see edge-convention note above)."""
 
 BW_PROC_GHZ: float = NU_TOP_PROC_GHZ - NU_BOT_PROC_GHZ
 BW_PROC_MHZ: float = BW_PROC_GHZ * 1000.0
-"""Processed bandwidth (MHz). = 6143.5 · DELTA_NU_CH_GHZ * 1000 = 187.485 MHz
-exact under the §3.1 edge-top + centre-bot convention. NOT
-N_CHAN_PROC_NATIVE · DELTA_NU_CH_GHZ * 1000 = 187.500 MHz (which would be
-edge-edge, half a channel wider)."""
+"""Processed bandwidth (MHz). = 6143 · DELTA_NU_CH_GHZ * 1000 ≈ 187.469 MHz
+under the edge-edge convention. Plan literal 187.485 MHz was derived from the
+old asymmetric convention and is updated by M1 plan-fix F9."""
 
 
 # ---------------------------------------------------------------------------
