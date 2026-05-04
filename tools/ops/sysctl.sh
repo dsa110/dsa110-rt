@@ -4,13 +4,20 @@
 # Ubuntu 20.04+ would use /usr/sbin/sysctl. Sudoers allowlist must match.
 set -euo pipefail
 
-SYSCTL=/sbin/sysctl
+SYSCTL=/sbin/sysctl # Ubuntu 18.04; Ubuntu 20.04+ would use /usr/sbin/sysctl.
 
-sudo -n "$SYSCTL" -w net.core.rmem_max=268435456
-sudo -n "$SYSCTL" -w net.core.wmem_max=268435456
-sudo -n "$SYSCTL" -w net.core.netdev_max_backlog=100000
-sudo -n "$SYSCTL" -p
+apply_min() {
+  local key=$1 target=$2
+  local current
+  current=$("$SYSCTL" -n "$key")
+  if (( current >= target )); then
+    printf 'OK   %s = %s  (>= target %s; preserving)\n' "$key" "$current" "$target"
+  else
+    printf 'BUMP %s  %s -> %s\n' "$key" "$current" "$target"
+    sudo -n "$SYSCTL" -w "${key}=${target}"
+  fi
+}
 
-echo "sysctl.sh: net.core.rmem_max=$(sysctl -n net.core.rmem_max)"
-echo "sysctl.sh: net.core.wmem_max=$(sysctl -n net.core.wmem_max)"
-echo "sysctl.sh: net.core.netdev_max_backlog=$(sysctl -n net.core.netdev_max_backlog)"
+apply_min net.core.rmem_max            268435456
+apply_min net.core.wmem_max            268435456
+apply_min net.core.netdev_max_backlog  100000
