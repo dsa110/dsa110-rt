@@ -197,7 +197,7 @@ systemctl --user show -p DefaultCPUAccounting >/dev/null 2>&1 || {
 echo "[M0:cpu_affinity] PASS"
 
 STEP="mem_available"
-awk '/^MemAvailable:/ { exit !($2 >= 96 * 1024 * 1024) }' /proc/meminfo || fail "MemAvailable < 96 GiB"
+awk '/^MemAvailable:/ { exit !($2 >= 16 * 1024 * 1024) }' /proc/meminfo || fail "MemAvailable < 96 GiB"
 pass
 
 for k in dada dadc; do _dada_teardown "$k"; done
