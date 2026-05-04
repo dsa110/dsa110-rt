@@ -117,18 +117,17 @@ def test_voltages_rejects_non_ndarray() -> None:
 def _make_sparse(
     *,
     n_filled: int = 5800,
-    bits_per_cell: int = 8,
+    bits_per_cell: int = 16,
     chgroup: int = 0,
     n_grid: int = 256,
 ) -> SparseCOOPayload:
-    dtype = "int8" if bits_per_cell == 8 else "float16"
+    dtype = "int8" if bits_per_cell == 16 else "float16"
     return SparseCOOPayload(
         values=np.zeros((n_filled, 2), dtype=dtype),
         bits_per_cell=bits_per_cell,
         chgroup=chgroup,
         dm_idx=12,
         specnum=1_234_567,
-        utc_block_start_ns=1_872_345_677_000_000_000,
         n_grid=n_grid,
         n_filled=n_filled,
         pattern_id=0xDEADBEEFCAFEBABE,
@@ -139,29 +138,30 @@ def _make_sparse(
 
 
 def test_sparse_happy_cint8() -> None:
-    p = _make_sparse(bits_per_cell=8)
+    p = _make_sparse(bits_per_cell=16)
     assert p.values.dtype.name == "int8"
 
 
 def test_sparse_happy_cfp16() -> None:
-    p = _make_sparse(bits_per_cell=16)
+    p = _make_sparse(bits_per_cell=32)
     assert p.values.dtype.name == "float16"
 
 
-def test_sparse_rejects_bits_per_cell_32() -> None:
+def test_sparse_rejects_bits_per_cell_8() -> None:
+    # 8 bits-per-COMPLEX-cell is invalid (would be 4-bit components which we
+    # don't support); valid values are {16, 32} per F2 (revised at hardening).
     with pytest.raises(ValueError, match="bits_per_cell"):
-        _make_sparse(bits_per_cell=32)
+        _make_sparse(bits_per_cell=8)
 
 
 def test_sparse_rejects_dtype_mismatch() -> None:
     with pytest.raises(TypeError, match="values.dtype"):
         SparseCOOPayload(
             values=np.zeros((10, 2), dtype="float16"),
-            bits_per_cell=8,  # claims cint8 but dtype is float16
+            bits_per_cell=16,  # claims cint8 but dtype is float16
             chgroup=0,
             dm_idx=0,
             specnum=0,
-            utc_block_start_ns=0,
             n_grid=256,
             n_filled=10,
             pattern_id=0,
@@ -185,11 +185,10 @@ def test_sparse_rejects_values_shape_1d() -> None:
     with pytest.raises(ValueError, match="\\[N_filled, 2\\]"):
         SparseCOOPayload(
             values=np.zeros(100, dtype="int8"),
-            bits_per_cell=8,
+            bits_per_cell=16,
             chgroup=0,
             dm_idx=0,
             specnum=0,
-            utc_block_start_ns=0,
             n_grid=256,
             n_filled=100,
             pattern_id=0,
@@ -203,11 +202,10 @@ def test_sparse_rejects_n_filled_inconsistent() -> None:
     with pytest.raises(ValueError, match="n_filled"):
         SparseCOOPayload(
             values=np.zeros((100, 2), dtype="int8"),
-            bits_per_cell=8,
+            bits_per_cell=16,
             chgroup=0,
             dm_idx=0,
             specnum=0,
-            utc_block_start_ns=0,
             n_grid=256,
             n_filled=99,
             pattern_id=0,

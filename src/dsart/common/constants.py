@@ -266,9 +266,16 @@ TRANSPORT_HEADER_VERSION: int = 1
 TRANSPORT_HEADER_BYTES: int = 72
 """72-byte fixed header. Layout: see SparseCOOPayloadHeader in contracts.py."""
 
-SPARSE_COO_BITS_VALID: tuple[int, ...] = (8, 16)
-"""Valid bits_per_cell values: 8 = cint8 (operational), 16 = cfp16 (debug).
-Plan §4.3 comment 'bits=16 or 32' is a typo; M1 plan fix F2."""
+SPARSE_COO_BITS_VALID: tuple[int, ...] = (16, 32)
+"""Valid bits_per_cell values, in bits-per-COMPLEX-cell convention (matches
+both §9 ops-table (line 2327) and §4.3 wire format (line 1384)):
+  - 16 = cint8 complex (operational; 8 bits real + 8 bits imag)
+  - 32 = cfp16 complex (debug; 16 bits real + 16 bits imag)
+M1 plan fix F2 originally proposed bits-per-component {8, 16}; reverted at
+hardening because §9's link-budget table uses bits-per-complex-cell and is
+the dominant convention. The §4.2 line 1296 `quantize_per_block(..., bits=8,
+complex=True)` literal is the per-component value (different parameter, same
+quantize)."""
 
 
 # ---------------------------------------------------------------------------

@@ -167,18 +167,19 @@ class SparseCOOPayload:
 
     Args:
         values: ndarray ``[N_filled, 2]`` (real, imag pair). dtype ``int8``
-            for cint8 (operational; bits_per_cell=8) or ``float16`` for
-            cfp16 (debug; bits_per_cell=16). Per-cell complex; the trailing
+            for cint8 (operational; bits_per_cell=16) or ``float16`` for
+            cfp16 (debug; bits_per_cell=32). Per-cell complex; the trailing
             axis carries the (real, imag) pair.
-        bits_per_cell: 8 (cint8) or 16 (cfp16). See F2 — plan comment
-            "16 or 32" was a typo.
+        bits_per_cell: bits-per-COMPLEX-cell — 16 (cint8 complex) or 32
+            (cfp16 complex). Matches §9 ops-table convention (line 2327)
+            and §4.3 wire format (line 1384). See revised F2 in
+            M1_PLAN_FIXES.md.
         chgroup: 0..15.
         dm_idx: coarse DM trial index into ``DmPlan.coarse_dm``.
-        specnum: block start specnum.
-        utc_block_start_ns: UTC ns of ``specnum``. Carried in the wire
-            header per §3 line 310. F1 in M1_PLAN_FIXES.md notes that
-            ``Voltages`` does NOT carry this redundantly — it lives on
-            the wire-payload side only.
+        specnum: block start specnum. UTC is recovered from this via the
+            §3.5 conversion at the receiver (F1: ``utc_block_start_ns`` is
+            NOT carried — neither here nor on the wire — to avoid drift
+            between the wire form and the dataclass).
         n_grid: gridder grid size (``N_grid``) at the time this payload
             was assembled. Allows the receiver to verify ``n_filled``
             against the cached pattern table.
@@ -197,7 +198,6 @@ class SparseCOOPayload:
     chgroup: int
     dm_idx: int
     specnum: int
-    utc_block_start_ns: int
     n_grid: int
     n_filled: int
     pattern_id: int
@@ -223,7 +223,7 @@ class SparseCOOPayload:
             raise ValueError(
                 f"bits_per_cell {self.bits_per_cell} not in {SPARSE_COO_BITS_VALID}"
             )
-        expected_dtype = "int8" if self.bits_per_cell == 8 else "float16"
+        expected_dtype = "int8" if self.bits_per_cell == 16 else "float16"
         if v.dtype.name != expected_dtype:
             raise TypeError(
                 f"values.dtype {v.dtype.name!r} != {expected_dtype!r} "
