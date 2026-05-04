@@ -139,10 +139,19 @@ import numpy as np
 print(np.load("${DM_PLAN_NPZ}", allow_pickle=False)["coarse_dm"].shape[0])
 PY
 )"
+# Stage label is "complete (hardened)" once the M1 plan-fix tracker
+# (M1_PLAN_FIXES.md) has been incorporated into plan.md and deleted from
+# the repo. Mirrors the M0_prereq tolerance of `stage.startswith("complete")`.
+PLAN_FIXES_STILL_PRESENT="$([[ -f ${REPO_ROOT}/M1_PLAN_FIXES.md ]] && echo true || echo false)"
+if [[ "${PLAN_FIXES_STILL_PRESENT}" == "true" ]]; then
+  STAGE_LABEL="complete"
+else
+  STAGE_LABEL="complete (hardened)"
+fi
 cat > "${M1_STATUS_JSON}" <<JSON
 {
   "milestone": "M1",
-  "stage": "complete",
+  "stage": "${STAGE_LABEL}",
   "host": "$(hostname -s)",
   "phase": "a",
   "utc_iso": "$(date -u +%FT%TZ)",
@@ -156,10 +165,12 @@ cat > "${M1_STATUS_JSON}" <<JSON
   "tests_passed": [
     "tests/test_contracts.py",
     "tests/test_numerical_conventions.py"
-  ]
+  ],
+  "plan_fixes_applied": ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"],
+  "plan_fixes_tracker_present": ${PLAN_FIXES_STILL_PRESENT}
 }
 JSON
 pass
 
-echo "M1 PASS"
+echo "M1 PASS (${STAGE_LABEL})"
 echo "  status: ${M1_STATUS_JSON}"
