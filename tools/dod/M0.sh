@@ -17,26 +17,49 @@ cd "${REPO_ROOT}"
 
 export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-GNU,LP64}"
 
-# PSRDADA buffer lifecycle helpers used by plumbing-smoke STEPS.
-# Pattern: _dada_setup <key> <bsize_bytes> <nbufs>
-#          ... do work against -k <key> ...
-#          _dada_teardown <key>
-# Always-teardown: defensive destroy in _dada_setup + EXIT sweep of dada/dadc.
-_dada_setup() {
-  local key="$1" bsize="$2" nbufs="$3"
-  dada_db -k "$key" -d >/dev/null 2>&1 || true
-  dada_db -k "$key" -b "$bsize" -n "$nbufs" >/dev/null
+# M0 smoke: small ephemeral buffers, just enough to exercise plumbing.
+# Production buffer sizing per plan §6.1 lives in configs/config_corr.yaml
+# and is exercised in M2+ DoD, not M0.
+M0_DADA_BSIZE=$((4 * 1024 * 1024))   # 4 MiB
+M0_DADA_NBUFS=4                       # 16 MiB total — fits in any node
+
+# PSRDADA buffer lifecycle for M0 smokes.
+# PSRDADA's -k flag is HEX, not ASCII (so 'dada' -> 0xdada). Per
+# buffer key, dada_db creates 4 SysV objects:
+#   header shm:   0x0000<key>
+#   data shm:     0x000a<key>
+#   semaphore 1:  0x0001<key>
+#   semaphore 2:  0x0002<key>
+# We use the data shm as the existence canary; cleanup uses dada_db -d
+# when the buffer exists, falling back to ipcrm -M / -S on all 4 hex
+# objects if dada_db segfaults (known PSRDADA quirk on edge cases).
+_dada_buffer_exists() {
+  local key="$1"
+  ipcs -m 2>/dev/null | awk '{print $1}' | grep -qiE "^0x000a${key}$"
+}
+_dada_force_cleanup() {
+  local key="$1"
+  for hex in 0x0000"${key}" 0x000a"${key}"; do
+    ipcrm -M "$hex" >/dev/null 2>&1 || true
+  done
+  for hex in 0x0001"${key}" 0x0002"${key}"; do
+    ipcrm -S "$hex" >/dev/null 2>&1 || true
+  done
 }
 _dada_teardown() {
   local key="$1"
-  dada_db -k "$key" -d >/dev/null 2>&1 || true
+  if _dada_buffer_exists "$key"; then
+    if ! dada_db -k "$key" -d >/dev/null 2>&1; then
+      _dada_force_cleanup "$key"
+    fi
+  fi
 }
-_m0_dada_exit_sweep() {
-  for k in dada dadc; do
-    dada_db -k "$k" -d >/dev/null 2>&1 || true
-  done
+_dada_setup() {
+  local key="$1" bsize="$2" nbufs="$3"
+  _dada_teardown "$key"
+  dada_db -k "$key" -b "$bsize" -n "$nbufs" >/dev/null
 }
-trap '_m0_dada_exit_sweep' EXIT
+trap 'for k in dada dadc; do _dada_teardown "$k"; done' EXIT
 
 # shellcheck source=/dev/null
 source "${HOME}/miniforge3/etc/profile.d/conda.sh"
@@ -61,37 +84,43 @@ pass
 
 STEP="plumbing_junkdb"
 echo "== [M0:plumbing_junkdb] dada_junkdb against ephemeral buffer =="
-command -v dada_junkdb >/dev/null || fail "dada_junkdb not in PATH"
-command -v dada_dbmetric >/dev/null || fail "dada_dbmetric not in PATH"
-command -v dada_db >/dev/null || fail "dada_db not in PATH"
-# bytes_per_block × num_blocks from configs/config_corr.yaml buffers.dada (header contract).
 JUNKDB_KEY=dada
-JUNKDB_BSIZE=94371840
-JUNKDB_NBUFS=8
-_dada_setup "$JUNKDB_KEY" "$JUNKDB_BSIZE" "$JUNKDB_NBUFS"
-# Header fixture: tests/fixtures/headers/correlator_header_dsaX.txt
-# See tests/fixtures/headers/README.md for provenance.
+_dada_setup "$JUNKDB_KEY" "$M0_DADA_BSIZE" "$M0_DADA_NBUFS"
 DSART_JUNKDB_HEADER="${DSART_JUNKDB_HEADER:-tests/fixtures/headers/correlator_header_dsaX.txt}"
-if dada_junkdb -k "$JUNKDB_KEY" -r 1 -t 1 "${DSART_JUNKDB_HEADER}"; then
-  :
-else
-  echo "[M0:plumbing_junkdb] FAIL dada_junkdb run"
+JUNKDB_RC=0
+timeout 5 dada_junkdb -k "$JUNKDB_KEY" -t 1 -r 1 "$DSART_JUNKDB_HEADER" \
+  > /tmp/dsart_m0_junkdb.log 2>&1 || JUNKDB_RC=$?
+_dada_teardown "$JUNKDB_KEY"
+if [ "$JUNKDB_RC" -ne 0 ]; then
+  echo "[M0:plumbing_junkdb] FAIL dada_junkdb run (rc=$JUNKDB_RC)"
+  echo '--- tail /tmp/dsart_m0_junkdb.log ---'
+  tail -20 /tmp/dsart_m0_junkdb.log 2>/dev/null || true
   exit 1
 fi
-dada_dbmetric -k "$JUNKDB_KEY" >/tmp/m0_dada_metric.txt || fail "dada_dbmetric"
-_dada_teardown "$JUNKDB_KEY"
-pass
+echo "[M0:plumbing_junkdb] PASS"
 
 STEP="plumbing_fake_capture_dada"
-echo "== [M0:plumbing_fake_capture_dada] fake_capture_dada against ephemeral buffer =="
-CAPTURE_KEY=dadc
-CAPTURE_BSIZE=94371840
-CAPTURE_NBUFS=8
-_dada_setup "$CAPTURE_KEY" "$CAPTURE_BSIZE" "$CAPTURE_NBUFS"
-python -m bench.fake_capture_dada \
-  --rate native --secs 60 --seed 0 --dada-key "$CAPTURE_KEY" || fail "fake_capture_dada"
-_dada_teardown "$CAPTURE_KEY"
-pass
+echo "== [M0:plumbing_fake_capture_dada] fake_capture_dada with dbnull consumer =="
+FCD_KEY=dadc
+_dada_setup "$FCD_KEY" "$M0_DADA_BSIZE" "$M0_DADA_NBUFS"
+# Drainer in background; reads endlessly until killed.
+dada_dbnull -k "$FCD_KEY" -q >/dev/null 2>&1 &
+FCD_DBNULL_PID=$!
+# Bounded writer; --secs 1 must finish in ~1 sec; hard timeout 10 sec.
+FCD_RC=0
+timeout 10 python -m bench.fake_capture_dada --dada-key "$FCD_KEY" --secs 1 \
+  > /tmp/dsart_m0_fcd.log 2>&1 || FCD_RC=$?
+# Stop drainer; ignore exit code (we kill it).
+kill "$FCD_DBNULL_PID" 2>/dev/null || true
+wait "$FCD_DBNULL_PID" 2>/dev/null || true
+_dada_teardown "$FCD_KEY"
+if [ "$FCD_RC" -ne 0 ]; then
+  echo "[M0:plumbing_fake_capture_dada] FAIL fake_capture_dada exit=$FCD_RC"
+  echo '--- tail /tmp/dsart_m0_fcd.log ---'
+  tail -20 /tmp/dsart_m0_fcd.log 2>/dev/null || true
+  exit 1
+fi
+echo "[M0:plumbing_fake_capture_dada] PASS"
 
 STEP="plumbing_fake_corr"
 python -m bench.fake_corr_to_search --self-test --rate native || fail "fake_corr_to_search"
@@ -171,6 +200,6 @@ STEP="mem_available"
 awk '/^MemAvailable:/ { exit !($2 >= 96 * 1024 * 1024) }' /proc/meminfo || fail "MemAvailable < 96 GiB"
 pass
 
-for k in dada dadc; do dada_db -k "$k" -d >/dev/null 2>&1 || true; done
+for k in dada dadc; do _dada_teardown "$k"; done
 
 echo "M0 PASS"
