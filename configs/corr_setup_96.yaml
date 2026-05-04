@@ -1,0 +1,237 @@
+# verbatim copy of dsa110-shell/dsa110-cnf/corr_setup_96.yaml fetched from h23 2026-05-04T13:41:34Z; do NOT hand-edit
+# Correlator setup parameters needed by various software components
+# Stored under the etcd key /cnf/corr
+antenna_order:
+  0: 1
+  1: 2
+  2: 3
+  3: 4
+  4: 5
+  5: 6
+  6: 7
+  7: 8
+  8: 9
+  9: 11
+  10: 12
+  11: 13
+  12: 14
+  13: 15
+  14: 16
+  15: 17
+  16: 18
+  17: 19
+  18: 20
+  19: 24
+  20: 25
+  21: 26
+  22: 27
+  23: 28
+  24: 29
+  25: 30
+  26: 31
+  27: 32
+  28: 33
+  29: 34
+  30: 35
+  31: 36
+  32: 37
+  33: 38
+  34: 39
+  35: 40
+  36: 41
+  37: 42
+  38: 43
+  39: 44
+  40: 45
+  41: 46
+  42: 47
+  43: 48
+  44: 49
+  45: 50
+  46: 51
+  47: 102
+  48: 116
+  49: 68
+  50: 69
+  51: 70
+  52: 71
+  53: 72
+  54: 73
+  55: 74
+  56: 75
+  57: 76
+  58: 77
+  59: 78
+  60: 79
+  61: 80
+  62: 81
+  63: 82
+  64: 83
+  65: 84
+  66: 85
+  67: 86
+  68: 87
+  69: 88
+  70: 89
+  71: 90
+  72: 91
+  73: 92
+  74: 93
+  75: 94
+  76: 95
+  77: 96
+  78: 97
+  79: 98
+  80: 99
+  81: 100
+  82: 101
+  83: 103
+  84: 104
+  85: 105
+  86: 106
+  87: 107
+  88: 108
+  89: 109
+  90: 110
+  91: 111
+  92: 112
+  93: 113
+  94: 114
+  95: 115
+snap_antenna_order:
+  0: 24
+  1: 25
+  2: 26
+  3: 27
+  4: 28
+  5: 29
+  6: 7
+  7: 8
+  8: 9
+  9: 11
+  10: 12
+  11: 13
+  12: 14
+  13: 15
+  14: 16
+  15: 17
+  16: 18
+  17: 19
+  18: 20
+  19: 24
+  20: 25
+  21: 26
+  22: 27
+  23: 28
+  24: 29
+  25: 30
+  26: 31
+  27: 32
+  28: 33
+  29: 34
+  30: 35
+  31: 36
+  32: 37
+  33: 38
+  34: 39
+  35: 40
+  36: 41
+  37: 42
+  38: 43
+  39: 44
+  40: 45
+  41: 46
+  42: 47
+  43: 48
+  44: 49
+  45: 50
+  46: 51
+  47: 102
+  48: 116
+  49: 68
+  50: 69
+  51: 70
+  52: 71
+  53: 72
+  54: 73
+  55: 74
+  56: 75
+  57: 76
+  58: 77
+  59: 78
+  60: 79
+  61: 80
+  62: 81
+  63: 82
+  64: 83
+  65: 84
+  66: 85
+  67: 86
+  68: 87
+  69: 88
+  70: 89
+  71: 90
+  72: 91
+  73: 92
+  74: 93
+  75: 94
+  76: 95
+  77: 96
+  78: 97
+  79: 98
+  80: 99
+  81: 100
+  82: 101
+  83: 103
+  84: 104
+  85: 105
+  86: 106
+  87: 107
+  88: 108
+  89: 109
+  90: 110
+  91: 111
+  92: 112
+  93: 113
+  94: 114
+  95: 115
+antenna_order_dsc: antenna mapping
+bw_GHz: 0.25
+bw_GHz_dsc: Bandwidth
+ch0:
+  lxd110h03: 1024
+  lxd110h04: 1408
+  lxd110h05: 1792
+  lxd110h06: 2176
+  lxd110h07: 2560
+  lxd110h08: 2944
+  lxd110h10: 3328
+  lxd110h11: 3712
+  lxd110h12: 4096
+  lxd110h14: 4480
+  lxd110h15: 4864
+  lxd110h16: 5248
+  lxd110h18: 5632
+  lxd110h19: 6016
+  lxd110h21: 6400
+  lxd110h22: 6784
+chan_ascending: false
+chan_ascending_dsc: bool to specify channel order
+f0_GHz: 1.53
+f0_GHz_dsc: Frequency of the first channel before splitting into spws
+nant: 96
+nant_dsc: number of online antennas
+nchan: 8192
+nchan_dsc: Total number of channels before splitting into spws
+nchan_spw: 384
+nchan_spw_dsc: number of channels in a spectral window
+npol: 2
+npol_dsc: Number of polarizations
+pols_corr:
+- BB
+- AA
+pols_voltage:
+- B
+- A
+tsamp: 0.134217728
+tsamp_dsc: Sampling time of data that will be read in
