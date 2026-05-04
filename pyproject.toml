@@ -17,7 +17,10 @@ dependencies = [
   "pandas>=2",
   "grpcio>=1.50",
   "etcd3>=0.12,<1",
-  "protobuf>=3.20,<4",
+  "pyuvdata>=2.4",
+  "numba>=0.57",
+  "h5py>=3.8",
+  "astropy>=5.3",
 ]
 
 [project.optional-dependencies]
