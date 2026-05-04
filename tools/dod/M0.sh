@@ -103,6 +103,17 @@ STEP="host_identity"
 python -c 'import dsart.common.host as h; assert h.PHASE == "a"' || fail "host phase"
 pass
 
+echo "== [M0:cpu_affinity] checking taskset + systemd CPUAffinity availability =="
+if ! command -v taskset >/dev/null 2>&1; then
+  echo "[M0:cpu_affinity] FAIL  taskset not found (util-linux missing? unexpected on Ubuntu 18.04)"
+  exit 1
+fi
+taskset --version >/dev/null 2>&1 || {
+  echo "[M0:cpu_affinity] FAIL  taskset --version returned non-zero"; exit 1; }
+systemctl --user show -p DefaultCPUAccounting >/dev/null 2>&1 || {
+  echo "[M0:cpu_affinity] FAIL  systemctl --user show failed (linger not enabled? §6.2)"; exit 1; }
+echo "[M0:cpu_affinity] PASS"
+
 STEP="mem_available"
 awk '/^MemAvailable:/ { exit !($2 >= 96 * 1024 * 1024) }' /proc/meminfo || fail "MemAvailable < 96 GiB"
 pass
