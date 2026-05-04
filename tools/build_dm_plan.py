@@ -397,16 +397,17 @@ def _load_t_int_search_us(repo_root: Path) -> float:
     """Read default t_int_search_us from ``configs/operating_points.yaml``.
 
     Source of truth per plan §6 line ~668; M1 defaults to operating point O-4
-    (``t_int_search_us = 524.288``). The build_dm_plan output schema captures
-    the value used at build time in ``metadata.t_int_search_us`` for
-    reproducibility audits.
+    (``t_int_search_us = 524.288``). Schema: ``{default: <id>, rows: {<id>:
+    {...}}}`` (M0-pinned). The build_dm_plan output schema captures the value
+    used at build time in ``metadata.t_int_search_us`` for reproducibility
+    audits.
     """
     ops_path = repo_root / "configs" / "operating_points.yaml"
     with ops_path.open() as f:
         ops = yaml.safe_load(f)
     default_id = ops["default"]
-    point = next(p for p in ops["points"] if p["id"] == default_id)
-    return float(point["t_int_search_us"])
+    row = ops["rows"][default_id]
+    return float(row["t_int_search_us"])
 
 
 def build_dm_plan(
