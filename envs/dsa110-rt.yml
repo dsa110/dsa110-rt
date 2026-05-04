@@ -19,6 +19,9 @@ dependencies:
   - h5py
   - numpy
   - scipy
+  - cython >=3.0
+  - setuptools
+  - wheel
   - astropy
   - pyyaml
   - pandas
@@ -31,6 +34,8 @@ dependencies:
   - ipython
 
   - pip:
+      # psrdada-python imports Cython in setup.py without declaring it in pyproject.toml [build-system] requires; pip isolated build envs then lack Cython.
+      - --no-build-isolation
       # cupy for CUDA 11.x (pairs with CUDA 11.8 user-space from the torch stack above).
       - cupy-cuda11x
       # etcd3 API client used by tooling (distinct from etcd server).
