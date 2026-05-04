@@ -22,6 +22,7 @@ import os
 os.environ["DSART_TEST"] = "1"
 
 import json  # noqa: E402
+from dataclasses import fields  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -501,6 +502,11 @@ def _make_minimal_dm_plan(*, n_fine: int = 8, n_coarse: int = 3) -> DmPlan:
     )
 
 
+def _plan_kwargs(plan: DmPlan) -> dict:
+    """Extract ``DmPlan`` fields as a kwargs dict (slots=True removes __dict__)."""
+    return {f.name: getattr(plan, f.name) for f in fields(plan)}
+
+
 def test_dm_plan_happy() -> None:
     p = _make_minimal_dm_plan()
     assert p.fine_dm.shape == (8,)
@@ -509,37 +515,40 @@ def test_dm_plan_happy() -> None:
 
 def test_dm_plan_rejects_bad_dtype() -> None:
     plan = _make_minimal_dm_plan()
+    kwargs = _plan_kwargs(plan)
+    kwargs["time_shift_corr_stage1"] = plan.time_shift_corr_stage1.astype("int64")
     with pytest.raises(TypeError, match="time_shift_corr_stage1"):
-        DmPlan(
-            **{
-                **plan.__dict__,
-                "time_shift_corr_stage1": plan.time_shift_corr_stage1.astype("int64"),
-            }
-        )
+        DmPlan(**kwargs)
 
 
 def test_dm_plan_rejects_non_monotone_fine_dm() -> None:
     plan = _make_minimal_dm_plan()
     bad = plan.fine_dm.copy()
     bad[3] = bad[2]
+    kwargs = _plan_kwargs(plan)
+    kwargs["fine_dm"] = bad
     with pytest.raises(ValueError, match="fine_dm.*increasing"):
-        DmPlan(**{**plan.__dict__, "fine_dm": bad})
+        DmPlan(**kwargs)
 
 
 def test_dm_plan_rejects_missing_metadata_key() -> None:
     plan = _make_minimal_dm_plan()
     bad_md = dict(plan.metadata)
     bad_md.pop("git_sha")
+    kwargs = _plan_kwargs(plan)
+    kwargs["metadata"] = bad_md
     with pytest.raises(ValueError, match="git_sha"):
-        DmPlan(**{**plan.__dict__, "metadata": bad_md})
+        DmPlan(**kwargs)
 
 
 def test_dm_plan_rejects_metadata_version_mismatch() -> None:
     plan = _make_minimal_dm_plan()
     bad_md = dict(plan.metadata)
     bad_md["version"] = 999
+    kwargs = _plan_kwargs(plan)
+    kwargs["metadata"] = bad_md
     with pytest.raises(ValueError, match="version"):
-        DmPlan(**{**plan.__dict__, "metadata": bad_md})
+        DmPlan(**kwargs)
 
 
 def test_dm_plan_npz_round_trip(tmp_path: Path) -> None:
