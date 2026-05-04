@@ -27,9 +27,6 @@ dependencies:
   - pyyaml
   - pandas
   - grpcio
-  # etcd3 0.12 uses pre-4.x protobuf descriptor API; protobuf 4+ raises
-  # "Descriptors cannot be created directly" at import time.
-  - protobuf <4
 
   - pytest
   - ruff
@@ -39,6 +36,10 @@ dependencies:
   - pip:
       # cupy for CUDA 11.x (pairs with CUDA 11.8 user-space from the torch stack above).
       - cupy-cuda11x
+      # etcd3 0.12 uses pre-4.x protobuf descriptor API. Pinned in pip
+      # section (not conda) to avoid >18-min libmamba backtrack on grpcio
+      # compatibility.
+      - protobuf <4
       # etcd3 API client used by tooling (distinct from etcd server).
       - etcd3 >=0.12,<1
       # psrdada-python is installed after env create (see tools/ops/install_psrdada.sh): TRASAL/psrdada-python's setup.py imports Cython without declaring it in pyproject.toml [build-system].requires, so PEP 517 isolated builds fail under conda's pip subprocess.
