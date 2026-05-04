@@ -1,0 +1,36 @@
+# Corr-node PSRDADA buffers + capture/corr routine wiring (§6.1, §3.4).
+# Mirrors legacy dsa110-xengine config_corr.yaml; fada uses multi-reader r=2.
+schema_version: 1
+buffers:
+  dada:
+    key: dada
+    bytes_per_block: 94371840
+    num_blocks: 8
+    num_readers: 1
+    numa_cluster: 0
+  eada:
+    key: eada
+    bytes_per_block: 402653184
+    num_blocks: 4
+    num_readers: 1
+    numa_cluster: 1
+  fada:
+    key: fada
+    bytes_per_block: 51118080
+    num_blocks: 4
+    num_readers: 2
+    numa_cluster: 1
+  bada:
+    key: bada
+    bytes_per_block: 1996800
+    num_blocks: 40
+    num_readers: 1
+    numa_cluster: 0
+capture:
+  snap_udp_ports: [4011, 4012]
+merge:
+  executable_hint: dsaX_merge
+slow_vis:
+  service_module: dsart.services.corr_slow_compute
+fast_vis:
+  service_module: dsart.services.corr_fast_compute

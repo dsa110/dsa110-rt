@@ -1,0 +1,69 @@
+# Canonical chgroup ↔ corr host ↔ system channel grid (§3.1). freq_band_idx retired.
+# ch0: first native channel index on the 8192 SNAP grid for this corr's 384-channel slice.
+# fch_top_mhz: band-top frequency (local ch=0, highest ν) in MHz.
+schema_version: 1
+assignments:
+  - chgroup: 0
+    host: corr00
+    ch0: 1024
+    fch_top_mhz: 1498.75
+  - chgroup: 1
+    host: corr02
+    ch0: 1408
+    fch_top_mhz: 1487.03125
+  - chgroup: 2
+    host: corr03
+    ch0: 1792
+    fch_top_mhz: 1475.3125
+  - chgroup: 3
+    host: corr04
+    ch0: 2176
+    fch_top_mhz: 1463.59375
+  - chgroup: 4
+    host: corr05
+    ch0: 2560
+    fch_top_mhz: 1451.875
+  - chgroup: 5
+    host: corr06
+    ch0: 2944
+    fch_top_mhz: 1440.15625
+  - chgroup: 6
+    host: corr07
+    ch0: 3328
+    fch_top_mhz: 1428.4375
+  - chgroup: 7
+    host: corr08
+    ch0: 3712
+    fch_top_mhz: 1416.71875
+  - chgroup: 8
+    host: corr09
+    ch0: 4096
+    fch_top_mhz: 1405.0
+  - chgroup: 9
+    host: corr10
+    ch0: 4480
+    fch_top_mhz: 1393.28125
+  - chgroup: 10
+    host: corr11
+    ch0: 4864
+    fch_top_mhz: 1381.5625
+  - chgroup: 11
+    host: corr12
+    ch0: 5248
+    fch_top_mhz: 1369.84375
+  - chgroup: 12
+    host: corr13
+    ch0: 5632
+    fch_top_mhz: 1358.125
+  - chgroup: 13
+    host: corr14
+    ch0: 6016
+    fch_top_mhz: 1346.40625
+  - chgroup: 14
+    host: corr15
+    ch0: 6400
+    fch_top_mhz: 1334.6875
+  - chgroup: 15
+    host: corr16
+    ch0: 6784
+    fch_top_mhz: 1322.96875

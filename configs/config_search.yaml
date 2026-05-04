@@ -1,0 +1,19 @@
+# Search-node systemd/runtime wiring (§2.2, §6.1). RX runs one epoll process per node.
+schema_version: 1
+rx:
+  systemd_unit_template: dsart-search-rx@{search_id}.service
+  bind_addr_from_host_phase: transport_listen_addr
+  base_udp_port: 9000
+compute:
+  systemd_unit_template: dsart-search-compute@{search_id}-{gpu}.service
+  entry_module: dsart.services.search_compute
+etcd:
+  cmd_prefix_template: /cmd/search/{search_id}
+  mon_prefix_template: /mon/search/{search_id}
+pipeline_routines:
+  - udp_recv_decode_coo
+  - shm_ring_publish
+  - fine_dm_combine
+  - fft_imager_edge_mask
+  - detector_bank
+  - emit_trigger_tcp_pool

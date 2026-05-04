@@ -1,0 +1,92 @@
+# NUMA / GPU / NIC canonical bindings (§6.1) with per-host overrides (§6.2).
+schema_version: 1
+hosts:
+  h22:
+    role_template: corr
+    notes: Prototypical corr node (§6.1).
+    numa:
+      "0":
+        cpus: "0-15"
+        dram_gb: 96
+      "1":
+        cpus: "16-31"
+        dram_gb: 96
+    gpu:
+      slow:
+        device_id: 0
+        numa_node: 0
+        canonical_role: corr_slow_compute
+      fast:
+        device_id: 1
+        numa_node: 1
+        canonical_role: corr_fast_compute
+    nic:
+      snap:
+        - iface: eth_snap0
+          numa_node: 0
+        - iface: eth_snap1
+          numa_node: 0
+      search:
+        iface: eth_search40
+        numa_node: 1
+        mtu: 9000
+    sysctl_profile: tools/ops/sysctl.sh
+  h13:
+    role_template: search
+    notes: Prototypical search node (§6.1).
+    numa:
+      "0":
+        cpus: "0-15"
+        dram_gb: 96
+      "1":
+        cpus: "16-31"
+        dram_gb: 96
+    gpu:
+      search0:
+        device_id: 0
+        numa_node: 0
+      search1:
+        device_id: 1
+        numa_node: 1
+    nic:
+      search:
+        iface: eth_search40
+        numa_node: 1
+        mtu: 9000
+  lxd110h01:
+    role_template: search_dev_co_resident
+    notes: >-
+      Phase-A dev on h01 (§6.2): corr + search co-resident; loopback transport.
+      GPU split — gpu0 corr_slow + search_compute@0; gpu1 corr_fast + search_compute@1.
+      Fill iface PCI IDs from `lspci` when templating systemd units.
+    numa:
+      "0":
+        cpus: "0-15"
+        dram_gb: 96
+      "1":
+        cpus: "16-31"
+        dram_gb: 96
+    gpu:
+      slow:
+        device_id: 0
+        numa_node: 0
+      fast:
+        device_id: 1
+        numa_node: 1
+      search0:
+        device_id: 0
+        numa_node: 0
+      search1:
+        device_id: 1
+        numa_node: 1
+    nic:
+      snap:
+        - iface: eth_snap0
+          numa_node: 0
+        - iface: eth_snap1
+          numa_node: 0
+      search:
+        iface: lo
+        bind_ip: 127.0.0.1
+        numa_node: 1
+        mtu: 65536

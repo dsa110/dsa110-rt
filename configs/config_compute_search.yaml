@@ -1,0 +1,32 @@
+# Search detector + trigger + cube assembly defaults (§9 O-4).
+schema_version: 1
+dm_plan_path: configs/dm_plan.npz
+detector_class: dsart.detector.v1_deterministic.DeterministicDetector
+detector:
+  threshold_sigma: 8
+  k_img: 4
+  k_dm: 4
+  k_time: 8
+  kernel_dtype: fp16
+  k_time_widths: [1, 2, 4, 8, 16, 32, 64, 128]
+cube:
+  t_det_blocks: 2
+  block_samples_search: 256
+noise:
+  layer1_n_burnin_cubes: 5
+  layer2_tau_s: 30
+  layer2_n_burnin: 30
+trigger:
+  max_emit_per_s: 10
+  max_per_cube_per_image_kernel: 4
+  max_per_cube_total: 16
+  max_dispatch_per_s: 5
+  dedup_specnum_step: 8
+  dedup_lm_step: 0.0005
+  dedup_ttl_ms: 500
+  holdoff_ms: 50
+  completion_timeout_s: 5
+decoder:
+  merge_radius_lm: 3
+  merge_radius_fdm: 5
+  merge_radius_t: max_time_kernel_width

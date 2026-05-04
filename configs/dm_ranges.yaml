@@ -1,0 +1,44 @@
+# Human-readable mirror of dm_plan.npz DM index ranges (§3.2). Filled by tools/build_dm_plan.py in M1.
+schema_version: 1
+note: >-
+  Placeholder canonical/consumed coarse-DM index ranges per search node ID (0..3) and per GPU (0..1).
+  M1 replaces these with values consistent with dm_plan.npz.
+n_search_nodes: 4
+gpus_per_search_node: 2
+search_nodes:
+  - search_id: 0
+    dm_idx_range_canonical: [0, 5]
+    dm_idx_range_consumed: [0, 6]
+    per_gpu_canonical:
+      - [0, 2]
+      - [3, 5]
+    per_gpu_consumed:
+      - [0, 3]
+      - [2, 6]
+  - search_id: 1
+    dm_idx_range_canonical: [6, 11]
+    dm_idx_range_consumed: [5, 12]
+    per_gpu_canonical:
+      - [6, 8]
+      - [9, 11]
+    per_gpu_consumed:
+      - [5, 9]
+      - [8, 12]
+  - search_id: 2
+    dm_idx_range_canonical: [12, 17]
+    dm_idx_range_consumed: [11, 18]
+    per_gpu_canonical:
+      - [12, 14]
+      - [15, 17]
+    per_gpu_consumed:
+      - [11, 15]
+      - [14, 18]
+  - search_id: 3
+    dm_idx_range_canonical: [18, 23]
+    dm_idx_range_consumed: [17, 23]
+    per_gpu_canonical:
+      - [18, 20]
+      - [21, 23]
+    per_gpu_consumed:
+      - [17, 21]
+      - [20, 23]

@@ -1,0 +1,6 @@
+# Per-SNAP / pad-row antenna groupings for RFI Stat C (§4.2). Populated in M3 from pad wiring.
+schema_version: 1
+groups: []
+# Example entry (inactive scaffold):
+# - group_id: snap01_row_a
+#   ant_positions: [0, 1, 2, 3]

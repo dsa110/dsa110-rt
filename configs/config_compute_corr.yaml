@@ -1,0 +1,44 @@
+# Fast + slow corr compute defaults (§9 default operating point O-4 + §3.5 cadences).
+schema_version: 1
+grid:
+  n_grid: 256
+  kernel_support: 5
+  envelope_threshold: 0.5
+  image_mask_npad: auto
+quantization:
+  bits_per_cell: 16
+integration:
+  t_native_us: 32.768
+  t_int_factor: 16
+  t_int_fast_us: 262.144
+  t_int_search_us: 524.288
+dedispersion:
+  nu_top_proc_ghz: 1.49875
+  nu_bot_proc_ghz: 1.311265
+  dm_min_pc_cm3: 0
+  dm_max_pc_cm3: 3000
+static_sky:
+  tau_ms: 150
+  warmup_grace_factor: 5
+rfi:
+  sk_M_values: [64, 256, 1024, 4096]
+  threshold_b_mad: 6
+  threshold_c_mad: 5
+  running_bandpass_tau_s: 30
+transport:
+  format: sparse-COO
+cal:
+  mode: full
+voltage_ring:
+  depth_blocks: 150
+dump:
+  n_pre_blocks: 10
+  n_post_blocks: 5
+  max_concurrent: 1
+  min_interval_ms: 1500
+  queue_max_depth: 10
+fast_vis:
+  fast_micro_batches_per_block: 8
+state_checkpoint:
+  interval_s: 10
+  age_max_s: 60

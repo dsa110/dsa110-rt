@@ -1,0 +1,5 @@
+# Calibration inputs + reload policy (§3.3).
+schema_version: 1
+antennas_out: /home/ubuntu/data/cal/antennas.out
+flagants_dat: /home/ubuntu/data/cal/flagants.dat
+reload_check_interval_s: 0

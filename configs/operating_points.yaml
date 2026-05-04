@@ -1,0 +1,236 @@
+# Bench operating-point grid (§9). Sub-benches select rows by name; default is O-4.
+schema_version: 1
+default: O-4
+
+definitions:
+  # Derived placeholders until M1 dm_plan.npz exists (counts documented §9).
+  n_coarse_dm: 24
+  n_fine_dm_system: 750
+  n_fine_dm_per_gpu: 100
+
+rows:
+  O-4:
+    description: Default operating point (§9 single source of truth).
+    gated: true
+    N_grid: 256
+    bits_per_cell: 16
+    t_int_factor: 16
+    t_int_search_us: 524.288
+    T_det_blocks: 2
+    N_coarse_DM: 24
+    N_fine_DM_per_GPU: 100
+    kernel_support: 5
+    transport_format: sparse-COO
+    static_sky_tau_ms: 150
+    noise_layer1_n_burnin_cubes: 5
+    noise_layer2_tau_s: 30
+    noise_layer2_n_burnin: 30
+    detector_threshold_sigma: 8
+    detector_K_img: 4
+    detector_K_dm: 4
+    detector_K_time: 8
+    detector_kernel_dtype: fp16
+    detector_K_time_widths: [1, 2, 4, 8, 16, 32, 64, 128]
+    trigger_max_emit_per_s: 10
+    trigger_max_per_cube_per_image_kernel: 4
+    trigger_max_per_cube_total: 16
+    trigger_max_dispatch_per_s: 5
+    dump_max_concurrent: 1
+    dump_min_interval_ms: 1500
+    dump_queue_max_depth: 10
+    n_pre_blocks: 10
+    n_post_blocks: 5
+    cal_mode: full
+    voltage_ring_depth_blocks: 150
+    envelope_threshold: 0.5
+    image_mask_npad: auto
+    rfi_sk_M_values: [64, 256, 1024, 4096]
+    rfi_threshold_b: 6
+    rfi_threshold_c: 5
+    rfi_running_bandpass_tau_s: 30
+
+  # --- Bench-gated sweeps (subset of §9) ---
+  sweep_grid_192:
+    gated: true
+    extends: O-4
+    N_grid: 192
+  sweep_grid_384:
+    gated: true
+    extends: O-4
+    N_grid: 384
+
+  sweep_bits_cfp16:
+    gated: true
+    extends: O-4
+    bits_per_cell: 32
+
+  sweep_t_int_8:
+    gated: true
+    extends: O-4
+    t_int_factor: 8
+    t_int_search_us: 262.144
+  sweep_t_int_32:
+    gated: true
+    extends: O-4
+    t_int_factor: 32
+    t_int_search_us: 1048.576
+
+  sweep_kernel_3:
+    gated: true
+    extends: O-4
+    kernel_support: 3
+  sweep_kernel_7:
+    gated: true
+    extends: O-4
+    kernel_support: 7
+
+  sweep_static_sky_0:
+    gated: true
+    extends: O-4
+    static_sky_tau_ms: 0
+  sweep_static_sky_100:
+    gated: true
+    extends: O-4
+    static_sky_tau_ms: 100
+  sweep_static_sky_250:
+    gated: true
+    extends: O-4
+    static_sky_tau_ms: 250
+
+  sweep_noise_L1_burnin_1:
+    gated: true
+    extends: O-4
+    noise_layer1_n_burnin_cubes: 1
+  sweep_noise_L1_burnin_10:
+    gated: true
+    extends: O-4
+    noise_layer1_n_burnin_cubes: 10
+
+  sweep_noise_L2_tau_60:
+    gated: true
+    extends: O-4
+    noise_layer2_tau_s: 60
+
+  sweep_noise_L2_burnin_10:
+    gated: true
+    extends: O-4
+    noise_layer2_n_burnin: 10
+  sweep_noise_L2_burnin_100:
+    gated: true
+    extends: O-4
+    noise_layer2_n_burnin: 100
+
+  sweep_sk_M_narrow:
+    gated: true
+    extends: O-4
+    rfi_sk_M_values: [64, 128]
+
+  sweep_rfi_b_5:
+    gated: true
+    extends: O-4
+    rfi_threshold_b: 5
+  sweep_rfi_b_7:
+    gated: true
+    extends: O-4
+    rfi_threshold_b: 7
+
+  sweep_rfi_c_4:
+    gated: true
+    extends: O-4
+    rfi_threshold_c: 4
+  sweep_rfi_c_6:
+    gated: true
+    extends: O-4
+    rfi_threshold_c: 6
+
+  sweep_bandpass_tau_60:
+    gated: true
+    extends: O-4
+    rfi_running_bandpass_tau_s: 60
+
+  sweep_envelope_0_7:
+    gated: true
+    extends: O-4
+    envelope_threshold: 0.7
+
+  sweep_n_pre_5:
+    gated: true
+    extends: O-4
+    n_pre_blocks: 5
+  sweep_n_pre_15:
+    gated: true
+    extends: O-4
+    n_pre_blocks: 15
+
+  sweep_n_post_3:
+    gated: true
+    extends: O-4
+    n_post_blocks: 3
+  sweep_n_post_10:
+    gated: true
+    extends: O-4
+    n_post_blocks: 10
+
+  sweep_det_thresh_6:
+    gated: true
+    extends: O-4
+    detector_threshold_sigma: 6
+  sweep_det_thresh_10:
+    gated: true
+    extends: O-4
+    detector_threshold_sigma: 10
+
+  sweep_K_img_2:
+    gated: true
+    extends: O-4
+    detector_K_img: 2
+  sweep_K_img_5:
+    gated: true
+    extends: O-4
+    detector_K_img: 5
+
+  sweep_K_dm_3:
+    gated: true
+    extends: O-4
+    detector_K_dm: 3
+  sweep_K_dm_5:
+    gated: true
+    extends: O-4
+    detector_K_dm: 5
+
+  sweep_K_time_6:
+    gated: true
+    extends: O-4
+    detector_K_time: 6
+  sweep_K_time_10:
+    gated: true
+    extends: O-4
+    detector_K_time: 10
+
+  # --- Ops-tuned (not bench-gated; telemetry-driven) ---
+  ops_trigger_emit_50:
+    gated: false
+    extends: O-4
+    trigger_max_emit_per_s: 50
+  ops_trigger_dispatch_10:
+    gated: false
+    extends: O-4
+    trigger_max_dispatch_per_s: 10
+
+  ops_dump_interval_750:
+    gated: false
+    extends: O-4
+    dump_min_interval_ms: 750
+
+  dense_fallback_debug:
+    gated: false
+    extends: O-4
+    transport_format: dense-fallback
+
+dropped_sweeps_documentation:
+  - name: T_det_blocks multi-block sweep
+    rationale: §9 — dropped; T_det fixed at 2 blocks after §3.6.12 DEDISP re-pin.
+  - name: cal_mode phase_only
+    rationale: §9 — diagnostic only; production remains full.
+  - name: detector_kernel_dtype fp32 grid
+    rationale: §9 — one-shot parity in M5, not a recurring sweep row.

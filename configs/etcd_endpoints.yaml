@@ -1,0 +1,7 @@
+# Etcd client endpoints for pipeline_rt / search_rt mirrors (§4.6).
+#
+# PLACEHOLDER — chunk 2C: copy the cluster URL list from the dsa110-shell etcd client
+# configuration (same source legacy corr/search tooling uses) and paste under endpoints below.
+schema_version: 1
+endpoints:
+  - http://127.0.0.1:2379

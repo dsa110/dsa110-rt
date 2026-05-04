@@ -1,0 +1,13 @@
+# Phase-A/B host identity + transport overrides (§6.2).
+schema_version: 1
+hosts:
+  lxd110h01:
+    phase: phase_a
+    role: tbd  # corr | search | both — finalize with ops (dev co-resident uses both services regardless)
+    gpu_share_mode: tbd  # mps | time_slice — pinned by bench/derisk/gpu_share_jitter.py on h01 in M0
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "01"
+    search_id: "01"
