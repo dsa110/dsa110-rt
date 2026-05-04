@@ -1,2 +1,1 @@
-# dsa110-rt
-image-plane FRB searching
+# dsa110-rt — real-time FRB search revamp
