@@ -37,5 +37,5 @@ dependencies:
       - etcd3 >=0.12,<1
       # PSRDADA Python bindings; requires site libpsrdada headers/libs at pip install time.
       - psrdada @ git+https://github.com/TRASAL/psrdada-python.git
-      # Observatory dsautils (dsa_store, dsa_logging, …). PyPI ``dsautils`` is unrelated; use the shell checkout on h01.
-      - dsautils @ file:///home/ubuntu/proj/dsa110-shell/dsautils
+      # Observatory dsautils (dsa_store, dsa_logging, …). PyPI ``dsautils`` is unrelated; file:// is the h01 checkout dir ``dsa110-pyutils`` (import name remains ``dsautils``).
+      - dsautils @ file:///home/ubuntu/proj/dsa110-shell/dsa110-pyutils
