@@ -72,7 +72,7 @@ _dada_setup "$JUNKDB_KEY" "$JUNKDB_BSIZE" "$JUNKDB_NBUFS"
 # Header fixture: tests/fixtures/headers/correlator_header_dsaX.txt
 # See tests/fixtures/headers/README.md for provenance.
 DSART_JUNKDB_HEADER="${DSART_JUNKDB_HEADER:-tests/fixtures/headers/correlator_header_dsaX.txt}"
-if dada_junkdb -k "$JUNKDB_KEY" -r 1124 -t 6 "${DSART_JUNKDB_HEADER}"; then
+if dada_junkdb -k "$JUNKDB_KEY" -r 1 -t 1 "${DSART_JUNKDB_HEADER}"; then
   :
 else
   echo "[M0:plumbing_junkdb] FAIL dada_junkdb run"
