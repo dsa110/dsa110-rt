@@ -129,31 +129,50 @@ from psrdada import Reader, Writer
 PY
 pass
 
-STEP="dsacalib"
-# meridian_fringestop's dsamfs.routines depends on dsacalib for
-# baseline_uvw / calc_uvw. Verify it's importable so the M2 dsamfs
-# patch + fstable cache build can both run inside the dsa110-rt env.
-python - <<'PY' || fail "dsacalib import (needed for dsamfs.fringestopping)"
-import dsacalib  # noqa: F401
-print("dsacalib OK")
+STEP="casa38_env"
+# Per D13 in M2_PLAN_FIXES.md: dsamfs / dsacalib / antpos / casacore live
+# only in the casa38 conda env (h01 inventory). M2's build_fstable_cache
+# and meridian_fringestop run there; corr_slow_compute and replay_voltage
+# run in dsa110-rt. Verify casa38's deps are intact for the cross-env
+# pieces. Use the casa38 python directly; do NOT activate (we're already
+# in dsa110-rt and don't want to nest activates).
+CASA38_PY="${CASA38_PY:-/home/ubuntu/anaconda3/envs/casa38/bin/python}"
+[[ -x "${CASA38_PY}" ]] || fail "casa38 python not found at ${CASA38_PY}"
+"${CASA38_PY}" - <<'PY' || fail "casa38 env missing M2 dsamfs/dsacalib deps"
+import sys
+missing = []
+for mod in ("dsacalib", "dsamfs", "antpos", "casacore", "yaml", "numpy", "astropy"):
+    try:
+        __import__(mod)
+    except Exception as e:
+        missing.append(f"{mod}: {e}")
+if missing:
+    print("casa38 missing modules:")
+    for m in missing:
+        print("  " + m)
+    sys.exit(1)
+import dsamfs, dsacalib
+print(f"casa38 dsamfs={dsamfs.__file__} dsacalib={dsacalib.__file__}")
 PY
 pass
 
 STEP="dsamfs_source"
-# M2 patches dsamfs/routines.py in-tree (or installs an editable egg).
-# Verify the legacy dsa110-meridian-fs source tree is present + readable
-# at the expected path; M2 author will decide whether to (a) edit in
-# place, or (b) carry the patch as a src/dsart/dsamfs_patch/ overlay.
+# M2 patches dsamfs/routines.py via the casa38-installed editable
+# install (the casa38 pip listing showed 'dsa110-meridian-fs v1.7.0-dirty'
+# which is editable-pip pointing at this repo). Verify the source tree
+# is present at the expected path; M2 author edits routines.py here.
 [[ -d "${DSAMFS_REPO}" ]] || fail "DSAMFS_REPO=${DSAMFS_REPO} not a directory"
 [[ -f "${DSAMFS_REPO}/dsamfs/routines.py" ]] || fail "missing ${DSAMFS_REPO}/dsamfs/routines.py"
 [[ -f "${DSAMFS_REPO}/dsamfs/utils.py" ]]    || fail "missing ${DSAMFS_REPO}/dsamfs/utils.py"
 [[ -f "${DSAMFS_REPO}/dsamfs/fringestopping.py" ]] || fail "missing ${DSAMFS_REPO}/dsamfs/fringestopping.py"
-# Confirm it's importable from the dsa110-rt env (or PYTHONPATH-injectable)
-python - <<PY || fail "dsamfs not importable from dsa110-rt env"
-import sys
-sys.path.insert(0, "${DSAMFS_REPO}")
-import dsamfs
-import dsamfs.routines, dsamfs.utils, dsamfs.fringestopping
+# Confirm casa38's dsamfs install resolves to THIS source tree
+# (editable-mode pin; otherwise the patch would not take effect).
+"${CASA38_PY}" - <<PY || fail "dsamfs install does not resolve to ${DSAMFS_REPO}"
+import os, dsamfs
+src = os.path.realpath(os.path.dirname(dsamfs.__file__))
+expected = os.path.realpath("${DSAMFS_REPO}/dsamfs")
+assert src == expected, f"dsamfs install at {src!r} != expected {expected!r}"
+print(f"dsamfs source pin: {src}")
 PY
 pass
 
