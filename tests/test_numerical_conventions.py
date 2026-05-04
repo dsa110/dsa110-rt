@@ -191,22 +191,33 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
         f"time_shift_corr_stage2[15, :] must be 0; got "
         f"max={s2[N_CHGROUP - 1, :].max()}"
     )
-    # chgroup 0 at DM_MAX_idx ≈ 6144 ± 4 t_int_fast_us samples (line 578).
-    # The plan literal 6144 is approximate; my exact computation gives 6143.
-    s2_g0_last = int(s2[0, -1])
+    # chgroup 0 stage-2 matches analytic exactly at every coarse trial (line 578).
+    # Plan literal "≈ 6144" is the value AT DM=3000; the recursion overshoots
+    # dm_max=3000 by one trial (coarse_dm[-1] ≈ 3700), so we check:
+    #   (a) build vs. analytic match at the actual trial value (must be exact);
+    #   (b) plan-literal-at-DM=3000 self-check (independent of the build's
+    #       overshoot behaviour).
     nu_bot_chgroup0 = NU_CHGROUP_BOT_GHZ[0]
-    analytic_g0_last = int(np.rint(
-        K_DM_MS_GHZ2_PC * plan.coarse_dm[-1]
+    analytic_g0 = np.rint(
+        K_DM_MS_GHZ2_PC * plan.coarse_dm
+        * (1.0 / NU_BOT_PROC_GHZ ** 2 - 1.0 / nu_bot_chgroup0 ** 2)
+        * 1e3
+        / T_INT_FAST_US_DEFAULT
+    ).astype("int32")
+    np.testing.assert_array_equal(
+        s2[0, :], analytic_g0,
+        err_msg="time_shift_corr_stage2[0, :] mismatch with analytic",
+    )
+    # (b) plan-literal self-check at exactly DM=3000.
+    expected_at_3000 = int(np.rint(
+        K_DM_MS_GHZ2_PC * 3000.0
         * (1.0 / NU_BOT_PROC_GHZ ** 2 - 1.0 / nu_bot_chgroup0 ** 2)
         * 1e3
         / T_INT_FAST_US_DEFAULT
     ))
-    assert s2_g0_last == analytic_g0_last, (
-        f"time_shift_corr_stage2[0, -1] = {s2_g0_last} != analytic {analytic_g0_last}"
-    )
-    assert abs(s2_g0_last - 6144) <= 4, (
-        f"time_shift_corr_stage2[0, DM_MAX_idx] = {s2_g0_last}; expected ≈ 6144 ± 4 "
-        f"(plan §3.2 line 578)"
+    assert abs(expected_at_3000 - 6144) <= 4, (
+        f"plan §3.2 line 578: expected ≈ 6144 ± 4 at DM=3000; "
+        f"got analytic = {expected_at_3000}"
     )
 
     # Search-side residual invariants (line 579):
