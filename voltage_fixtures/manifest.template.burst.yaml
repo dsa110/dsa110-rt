@@ -1,0 +1,14 @@
+# Example burst-only voltage fixture manifest (§3.3). Synthetic plausible values for CI/schema checks.
+fixture_kind: burst
+utc_start_iso: "2025-08-01T09:15:00.000000Z"
+dec_deg: 45.0
+utc_start_specnum: 10293847560987654000
+n_blocks: 15
+burst:
+  mjd: 58832.387651
+  dm_pc_cm3: 332
+  expected_snr: 30
+  # lm_rad omitted — optional when operator has no precise prior (§3.3)
+cal_paths:
+  antennas_out: cal/antennas.out
+  flagants_dat: cal/flagants.dat

@@ -1,0 +1,16 @@
+# Example continuum voltage fixture manifest (§3.3). Validates against
+# tests/fixtures/voltage_fixture_manifest.schema.json
+fixture_kind: continuum
+utc_start_iso: "2025-03-15T14:22:31.123456Z"
+dec_deg: 38.295
+utc_start_specnum: 98765432101234560
+n_blocks: 15
+continuum_sources:
+  - name: 3C286
+    # Approx direction cosines at zenith-relative example pointing (radians)
+    lm_rad: [-0.00112, 0.00304]
+  - name: 3C147
+    # lm_rad omitted intentionally on one source — optional per §3.3
+cal_paths:
+  antennas_out: cal/antennas.out
+  flagants_dat: cal/flagants.dat

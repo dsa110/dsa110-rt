@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dsa110/dsa110-rt/tests/fixtures/voltage_fixture_manifest.schema.json",
+  "title": "Voltage replay fixture manifest (§3.3 discriminated union)",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/continuum_manifest",
+      "description": "Bright continuum sources; no burst (M2/M3 imager checks)."
+    },
+    {
+      "$ref": "#/$defs/burst_manifest",
+      "description": "Known FRB-like burst; no continuum (M3 dedisp / M5/M6)."
+    }
+  ],
+  "$defs": {
+    "cal_paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["antennas_out", "flagants_dat"],
+      "properties": {
+        "antennas_out": {
+          "type": "string",
+          "description": "Path relative to fixture root"
+        },
+        "flagants_dat": {
+          "type": "string",
+          "description": "Path relative to fixture root"
+        }
+      }
+    },
+    "continuum_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "lm_rad": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number"
+          },
+          "description": "Optional (l, m) radians for viz overlay"
+        }
+      }
+    },
+    "continuum_manifest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "fixture_kind",
+        "utc_start_iso",
+        "dec_deg",
+        "utc_start_specnum",
+        "n_blocks",
+        "continuum_sources",
+        "cal_paths"
+      ],
+      "properties": {
+        "fixture_kind": {
+          "const": "continuum"
+        },
+        "utc_start_iso": {
+          "type": "string"
+        },
+        "dec_deg": {
+          "type": "number"
+        },
+        "utc_start_specnum": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_blocks": {
+          "type": "integer",
+          "const": 15
+        },
+        "continuum_sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/continuum_source"
+          }
+        },
+        "cal_paths": {
+          "$ref": "#/$defs/cal_paths"
+        }
+      }
+    },
+    "burst_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mjd", "dm_pc_cm3"],
+      "properties": {
+        "mjd": {
+          "type": "number"
+        },
+        "dm_pc_cm3": {
+          "type": "number"
+        },
+        "lm_rad": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "number"
+          }
+        },
+        "expected_snr": {
+          "type": "number"
+        }
+      }
+    },
+    "burst_manifest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "fixture_kind",
+        "utc_start_iso",
+        "dec_deg",
+        "utc_start_specnum",
+        "n_blocks",
+        "burst",
+        "cal_paths"
+      ],
+      "properties": {
+        "fixture_kind": {
+          "const": "burst"
+        },
+        "utc_start_iso": {
+          "type": "string"
+        },
+        "dec_deg": {
+          "type": "number"
+        },
+        "utc_start_specnum": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "n_blocks": {
+          "type": "integer",
+          "const": 15
+        },
+        "burst": {
+          "$ref": "#/$defs/burst_payload"
+        },
+        "cal_paths": {
+          "$ref": "#/$defs/cal_paths"
+        }
+      }
+    }
+  }
+}
