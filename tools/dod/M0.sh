@@ -17,6 +17,27 @@ cd "${REPO_ROOT}"
 
 export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-GNU,LP64}"
 
+# PSRDADA buffer lifecycle helpers used by plumbing-smoke STEPS.
+# Pattern: _dada_setup <key> <bsize_bytes> <nbufs>
+#          ... do work against -k <key> ...
+#          _dada_teardown <key>
+# Always-teardown: defensive destroy in _dada_setup + EXIT sweep of dada/dadc.
+_dada_setup() {
+  local key="$1" bsize="$2" nbufs="$3"
+  dada_db -k "$key" -d >/dev/null 2>&1 || true
+  dada_db -k "$key" -b "$bsize" -n "$nbufs" >/dev/null
+}
+_dada_teardown() {
+  local key="$1"
+  dada_db -k "$key" -d >/dev/null 2>&1 || true
+}
+_m0_dada_exit_sweep() {
+  for k in dada dadc; do
+    dada_db -k "$k" -d >/dev/null 2>&1 || true
+  done
+}
+trap '_m0_dada_exit_sweep' EXIT
+
 # shellcheck source=/dev/null
 source "${HOME}/miniforge3/etc/profile.d/conda.sh"
 conda activate dsa110-rt
@@ -39,17 +60,37 @@ OUT=$(python -c 'import torch; x = torch.zeros(1, device="cuda:0"); y = torch.ze
 pass
 
 STEP="plumbing_junkdb"
+echo "== [M0:plumbing_junkdb] dada_junkdb against ephemeral buffer =="
 command -v dada_junkdb >/dev/null || fail "dada_junkdb not in PATH"
 command -v dada_dbmetric >/dev/null || fail "dada_dbmetric not in PATH"
+command -v dada_db >/dev/null || fail "dada_db not in PATH"
+# bytes_per_block × num_blocks from configs/config_corr.yaml buffers.dada (header contract).
+JUNKDB_KEY=dada
+JUNKDB_BSIZE=94371840
+JUNKDB_NBUFS=8
+_dada_setup "$JUNKDB_KEY" "$JUNKDB_BSIZE" "$JUNKDB_NBUFS"
 # Header fixture: tests/fixtures/headers/correlator_header_dsaX.txt
 # See tests/fixtures/headers/README.md for provenance.
 DSART_JUNKDB_HEADER="${DSART_JUNKDB_HEADER:-tests/fixtures/headers/correlator_header_dsaX.txt}"
-dada_junkdb -k dada -r 1124 -t 6 "${DSART_JUNKDB_HEADER}" || fail "dada_junkdb run"
-dada_dbmetric -k dada >/tmp/m0_dada_metric.txt || fail "dada_dbmetric"
+if dada_junkdb -k "$JUNKDB_KEY" -r 1124 -t 6 "${DSART_JUNKDB_HEADER}"; then
+  :
+else
+  echo "[M0:plumbing_junkdb] FAIL dada_junkdb run"
+  exit 1
+fi
+dada_dbmetric -k "$JUNKDB_KEY" >/tmp/m0_dada_metric.txt || fail "dada_dbmetric"
+_dada_teardown "$JUNKDB_KEY"
 pass
 
-STEP="plumbing_fake_capture"
-python -m bench.fake_capture_dada --rate native --secs 60 --seed 0 || fail "fake_capture_dada"
+STEP="plumbing_fake_capture_dada"
+echo "== [M0:plumbing_fake_capture_dada] fake_capture_dada against ephemeral buffer =="
+CAPTURE_KEY=dadc
+CAPTURE_BSIZE=94371840
+CAPTURE_NBUFS=8
+_dada_setup "$CAPTURE_KEY" "$CAPTURE_BSIZE" "$CAPTURE_NBUFS"
+python -m bench.fake_capture_dada \
+  --rate native --secs 60 --seed 0 --dada-key "$CAPTURE_KEY" || fail "fake_capture_dada"
+_dada_teardown "$CAPTURE_KEY"
 pass
 
 STEP="plumbing_fake_corr"
@@ -129,5 +170,7 @@ echo "[M0:cpu_affinity] PASS"
 STEP="mem_available"
 awk '/^MemAvailable:/ { exit !($2 >= 96 * 1024 * 1024) }' /proc/meminfo || fail "MemAvailable < 96 GiB"
 pass
+
+for k in dada dadc; do dada_db -k "$k" -d >/dev/null 2>&1 || true; done
 
 echo "M0 PASS"
