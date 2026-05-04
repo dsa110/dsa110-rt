@@ -21,6 +21,7 @@ _SCHEMAS: dict[str, dict[str, Any]] = {}
 CONFIG_FILENAMES_M0 = (
     "ant_groups.yaml",
     "cal_paths.yaml",
+    "corr_setup_96.yaml",
     "chgroup_assignments.yaml",
     "config_compute_corr.yaml",
     "config_compute_search.yaml",
