@@ -157,22 +157,41 @@ PY
 pass
 
 STEP="dsamfs_source"
-# M2 patches dsamfs/routines.py via the casa38-installed editable
-# install (the casa38 pip listing showed 'dsa110-meridian-fs v1.7.0-dirty'
-# which is editable-pip pointing at this repo). Verify the source tree
-# is present at the expected path; M2 author edits routines.py here.
+# M2 patches dsamfs/routines.py in the source repo. The casa38 install
+# can be either editable (pip install -e .) — in which case the patch
+# takes effect immediately — or a vanilla pip install (in which case the
+# patch needs a re-install to land in site-packages). h01 today is the
+# vanilla case but byte-identical (sha256 match) to source, so the patch
+# is safe to apply at the source path; M2 Chunk 5 owns the casa38
+# `pip install -e .` step that converts to editable as part of the patch.
 [[ -d "${DSAMFS_REPO}" ]] || fail "DSAMFS_REPO=${DSAMFS_REPO} not a directory"
 [[ -f "${DSAMFS_REPO}/dsamfs/routines.py" ]] || fail "missing ${DSAMFS_REPO}/dsamfs/routines.py"
 [[ -f "${DSAMFS_REPO}/dsamfs/utils.py" ]]    || fail "missing ${DSAMFS_REPO}/dsamfs/utils.py"
 [[ -f "${DSAMFS_REPO}/dsamfs/fringestopping.py" ]] || fail "missing ${DSAMFS_REPO}/dsamfs/fringestopping.py"
-# Confirm casa38's dsamfs install resolves to THIS source tree
-# (editable-mode pin; otherwise the patch would not take effect).
-"${CASA38_PY}" - <<PY || fail "dsamfs install does not resolve to ${DSAMFS_REPO}"
-import os, dsamfs
-src = os.path.realpath(os.path.dirname(dsamfs.__file__))
-expected = os.path.realpath("${DSAMFS_REPO}/dsamfs")
-assert src == expected, f"dsamfs install at {src!r} != expected {expected!r}"
-print(f"dsamfs source pin: {src}")
+"${CASA38_PY}" - <<PY || fail "dsamfs site-packages drifted from source repo"
+import hashlib, os
+import dsamfs
+sp_routines  = os.path.join(os.path.dirname(dsamfs.__file__), "routines.py")
+src_routines = "${DSAMFS_REPO}/dsamfs/routines.py"
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()[:16]
+sp_sha  = sha(sp_routines)
+src_sha = sha(src_routines)
+src_realpath = os.path.realpath(os.path.dirname(dsamfs.__file__))
+expected     = os.path.realpath("${DSAMFS_REPO}/dsamfs")
+if src_realpath == expected:
+    print(f"casa38 dsamfs is editable-installed at {expected}")
+elif sp_sha == src_sha:
+    print(f"casa38 dsamfs is vanilla-installed; site-packages matches source "
+          f"(sha {sp_sha}). M2 Chunk 5 must run 'pip install -e .' in casa38 "
+          f"after editing routines.py for the patch to take effect.")
+else:
+    raise SystemExit(
+        f"casa38 dsamfs at {sp_routines} (sha {sp_sha}) DIVERGES from source "
+        f"{src_routines} (sha {src_sha}). Resolve manually before M2.")
 PY
 pass
 
