@@ -39,5 +39,5 @@ dependencies:
       # etcd3 API client used by tooling (distinct from etcd server).
       - etcd3 >=0.12,<1
       # psrdada-python is installed after env create (see tools/ops/install_psrdada.sh): TRASAL/psrdada-python's setup.py imports Cython without declaring it in pyproject.toml [build-system].requires, so PEP 517 isolated builds fail under conda's pip subprocess.
-      # Observatory dsautils (dsa_store, dsa_logging, …). PyPI ``dsautils`` is unrelated; file:// is the h01 checkout dir ``dsa110-pyutils`` (import name remains ``dsautils``).
-      - dsautils @ file:///home/ubuntu/proj/dsa110-shell/dsa110-pyutils
+      # Observatory dsautils (dsa_store, dsa_logging, …). pip dist name: dsa110-pyutils; importable Python module: dsautils. PyPI ``dsautils`` is unrelated; file:// is the h01 checkout dir ``dsa110-pyutils``.
+      - dsa110-pyutils @ file:///home/ubuntu/proj/dsa110-shell/dsa110-pyutils
