@@ -34,7 +34,6 @@ export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-GNU,LP64}"
 
 M0_STATUS_JSON="${M0_STATUS_JSON:-${HOME}/dsart-m0-status.json}"
 M1_STATUS_JSON="${M1_STATUS_JSON:-${HOME}/dsart-m1-status.json}"
-LEGACY_CORR_YAML="${LEGACY_CORR_YAML:-/home/ubuntu/proj/dsa110-shell/dsa110-cnf/config_dsa96_corr.yaml}"
 DSAMFS_REPO="${DSAMFS_REPO:-/home/ubuntu/proj/dsa110-shell/dsa110-meridian-fs}"
 FSTABLE_ROOT="${FSTABLE_ROOT:-/home/ubuntu/data/fstables}"
 VF_ROOT="${VF_ROOT:-/home/ubuntu/data/voltage_fixtures}"
@@ -195,30 +194,22 @@ else:
 PY
 pass
 
-STEP="legacy_corr_yaml"
-# F7-corrected path; M2 mirrors fada/bada buffer sizes from this file.
-[[ -f "${LEGACY_CORR_YAML}" ]] || fail "${LEGACY_CORR_YAML} not found"
-python - <<PY || fail "${LEGACY_CORR_YAML} parse"
-import yaml
-with open("${LEGACY_CORR_YAML}") as f:
-    cfg = yaml.safe_load(f)
-buffers = {b['k']: b for b in cfg.get('buffers', [])}
-for k in ('fada', 'bada', 'dada', 'eada'):
-    assert k in buffers, f"legacy corr yaml missing buffer {k!r}"
-fada = buffers['fada']
-bada = buffers['bada']
-print(f"  legacy fada: b={fada['b']:>11d} n={fada['n']} c={fada['c']} r={fada.get('r','-')}")
-print(f"  legacy bada: b={bada['b']:>11d} n={bada['n']} c={bada['c']} r={bada.get('r','-')}")
-assert fada['b'] == 301_989_888, f"legacy fada bytes_per_block != 301,989,888 (got {fada['b']})"
-assert bada['b'] ==  28_606_464, f"legacy bada bytes_per_block !=  28,606,464 (got {bada['b']})"
-PY
-pass
-
 STEP="repo_corr_yaml"
-# Repo's configs/config_corr.yaml MUST eventually match legacy on
-# fada/bada bytes_per_block (M2-F6 in M2_PLAN_FIXES.md). Today this
-# step is INFORM-ONLY: if it doesn't match, log a warning + the chunk-0
-# fix-up plan. M2.sh (the full DoD) will harden this to a fail.
+# Physics-pinned buffer sizes (derivable from §3 constants):
+#   fada bytes_per_block = NPACKETS_PER_BLOCK × NANTS × NCHAN_PER_PACKET
+#                          × 2 t × 2 pol × 1 byte (4-bit cplx packed)
+#                        = 2048 × 96 × 384 × 2 × 2 × 1
+#                        = 301,989,888 bytes  (==288 MiB)
+#   bada bytes_per_block = NBASE × NCHAN_PER_PACKET × 2 pol × 8 bytes
+#                          (complex64 = 2 × float32)
+#                        = 4656 × 384 × 2 × 8
+#                        = 28,606,464 bytes  (==27.28 MiB)
+# These are NOT config choices — they're block sizes the legacy
+# C correlator and meridian_fringestop already lock-in. M2 Chunk 0
+# corrects the repo's stub config_corr.yaml to match. Today this step
+# is INFORM-ONLY (warn + continue); M2.sh hardens to fail-fast after
+# Chunk 0 lands. Note: the F7 path dsa110-cnf/config_dsa96_corr.yaml
+# is dev-only on h23 (uncommitted); not relied upon at preflight.
 python - <<PY
 import sys, yaml
 with open("${REPO_ROOT}/configs/config_corr.yaml") as f:
@@ -226,14 +217,16 @@ with open("${REPO_ROOT}/configs/config_corr.yaml") as f:
 buffers = cfg.get('buffers', {})
 fada = buffers.get('fada', {}).get('bytes_per_block', -1)
 bada = buffers.get('bada', {}).get('bytes_per_block', -1)
-print(f"  repo fada:   bytes_per_block={fada:>11d}  (legacy expects 301,989,888)")
-print(f"  repo bada:   bytes_per_block={bada:>11d}  (legacy expects  28,606,464)")
-mismatch = (fada != 301_989_888) or (bada != 28_606_464)
+EXP_FADA = 2048 * 96 * 384 * 2 * 2 * 1   # 301,989,888
+EXP_BADA = 4656 * 384 * 2 * 8            #  28,606,464
+print(f"  repo fada:   bytes_per_block={fada:>11d}  (expected {EXP_FADA:>11d})")
+print(f"  repo bada:   bytes_per_block={bada:>11d}  (expected {EXP_BADA:>11d})")
+mismatch = (fada != EXP_FADA) or (bada != EXP_BADA)
 if mismatch:
-    print("  WARN: repo config_corr.yaml DOES NOT MATCH legacy "
+    print("  WARN: repo config_corr.yaml DOES NOT MATCH physics-pinned values "
           "(F6 in M2_PLAN_FIXES.md). M2 Chunk 0 will fix this.")
     sys.exit(0)  # warn-only at preflight; M2.sh will fail-fast.
-print("  OK: repo config_corr.yaml matches legacy fada/bada sizing.")
+print("  OK: repo config_corr.yaml fada/bada sizing matches physics-pinned values.")
 PY
 pass
 
