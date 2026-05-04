@@ -24,27 +24,29 @@ M0_DADA_BSIZE=$((4 * 1024 * 1024))   # 4 MiB
 M0_DADA_NBUFS=4                       # 16 MiB total — fits in any node
 
 # PSRDADA buffer lifecycle for M0 smokes.
-# PSRDADA's -k flag is HEX, not ASCII (so 'dada' -> 0xdada). Per
-# buffer key, dada_db creates 4 SysV objects:
-#   header shm:   0x0000<key>
-#   data shm:     0x000a<key>
-#   semaphore 1:  0x0001<key>
-#   semaphore 2:  0x0002<key>
-# We use the data shm as the existence canary; cleanup uses dada_db -d
-# when the buffer exists, falling back to ipcrm -M / -S on all 4 hex
-# objects if dada_db segfaults (known PSRDADA quirk on edge cases).
+# PSRDADA's -k flag is HEX, not ASCII (so 'dada' -> 0xdada). Per buffer
+# key, dada_db creates SysV shm + semaphore objects whose ipcs keys share a
+# common hex suffix (<key>). Prefix nibbles are assigned by PSRDADA and are
+# not fixed per role (observed 0x0000–0x0011 across runs in M0 chunk 2C).
+# Existence/cleanup match any prefix: ^0x[0-9a-f]+<key>$.
 _dada_buffer_exists() {
   local key="$1"
-  ipcs -m 2>/dev/null | awk '{print $1}' | grep -qiE "^0x000a${key}$"
+  # Match any shm whose key ends in <key> (PSRDADA assigns sequential
+  # prefixes — observed 0x0000, 0x000a, 0x000b, 0x000e through 0x0011
+  # across runs; not a fixed role nibble).
+  ipcs -m 2>/dev/null | awk '{print $1}' | grep -qiE "^0x[0-9a-f]+${key}$"
 }
 _dada_force_cleanup() {
   local key="$1"
-  for hex in 0x0000"${key}" 0x000a"${key}"; do
+  local hex
+  while read -r hex; do
+    [ -n "$hex" ] || continue
     ipcrm -M "$hex" >/dev/null 2>&1 || true
-  done
-  for hex in 0x0001"${key}" 0x0002"${key}"; do
+  done < <(ipcs -m 2>/dev/null | awk -v k="$key" '$1 ~ "^0x[0-9a-f]+" k "$" { print $1 }')
+  while read -r hex; do
+    [ -n "$hex" ] || continue
     ipcrm -S "$hex" >/dev/null 2>&1 || true
-  done
+  done < <(ipcs -s 2>/dev/null | awk -v k="$key" '$1 ~ "^0x[0-9a-f]+" k "$" { print $1 }')
 }
 _dada_teardown() {
   local key="$1"
@@ -64,6 +66,9 @@ trap 'for k in dada dadc; do _dada_teardown "$k"; done' EXIT
 # shellcheck source=/dev/null
 source "${HOME}/miniforge3/etc/profile.d/conda.sh"
 conda activate dsa110-rt
+
+echo "== M0: defensive dsart editable install (tools/ops/install_dsart.sh) =="
+bash "${REPO_ROOT}/tools/ops/install_dsart.sh"
 
 STEP=""
 fail() {
@@ -136,6 +141,7 @@ pass
 
 STEP="voltage_fixtures"
 VF_ROOT=/home/ubuntu/data/voltage_fixtures
+mkdir -p "${VF_ROOT}"
 [[ -d "${VF_ROOT}" ]] || fail "missing ${VF_ROOT}"
 python - <<'PY' || fail "template/schema validation"
 import json
@@ -197,7 +203,13 @@ systemctl --user show -p DefaultCPUAccounting >/dev/null 2>&1 || {
 echo "[M0:cpu_affinity] PASS"
 
 STEP="mem_available"
-awk '/^MemAvailable:/ { exit !($2 >= 16 * 1024 * 1024) }' /proc/meminfo || fail "MemAvailable < 96 GiB"
+# M0 smoke threshold — small, easily met. M2+ DoD will use a
+# per-host threshold derived from configs/numa_topology.yaml::mem_kb
+# (sum across NUMA nodes); 96 GiB original hardcode was infeasible
+# on h01 (95 GB marketing = 93 GiB usable). See plan §8.
+M0_MIN_MEM_GIB=16
+awk -v min=$((M0_MIN_MEM_GIB * 1024 * 1024)) '/^MemAvailable:/ { exit !($2 >= min) }' /proc/meminfo \
+  || fail "MemAvailable < ${M0_MIN_MEM_GIB} GiB"
 pass
 
 for k in dada dadc; do _dada_teardown "$k"; done
