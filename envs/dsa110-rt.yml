@@ -27,6 +27,7 @@ dependencies:
   - pyyaml
   - pandas
   - grpcio
+  - jsonschema
 
   - pytest
   - ruff
