@@ -205,7 +205,13 @@ class SlowCorrKernel:
     n_time_samples: int = N_TIME_SAMPLES
 
     def __post_init__(self) -> None:
-        self.device = torch.device(self.device)
+        dev = torch.device(self.device)
+        # Normalise "cuda" → "cuda:N" so equality tests against the user's
+        # (..).to(device) tensor (which always carries an explicit index)
+        # don't spuriously fail. CPU devices are always "cpu" without index.
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        self.device = dev
         if self.nbada_pol > self.nvolt_pol:
             raise ValueError(
                 f"nbada_pol ({self.nbada_pol}) > nvolt_pol ({self.nvolt_pol})"
