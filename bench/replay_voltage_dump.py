@@ -230,16 +230,31 @@ def _pack_int4_bytes(real_q: np.ndarray, imag_q: np.ndarray) -> np.ndarray:
     return ((imag_u4 & 0x0F) << 4) | real_u4
 
 
-def antpos_linear_ew(nants: int = NANTS, spacing_m: float = 0.5) -> np.ndarray:
-    """Synthetic east-west linear array (smoke-test geometry).
+def antpos_synth_2d_grid(
+    nants: int = NANTS, n_x: int = 12, n_y: int = 8,
+    spacing_m: float = 0.5,
+) -> np.ndarray:
+    """Synthetic 2D antenna grid for smoke-test geometry.
 
-    Default 0.5-m spacing → 47.5 m max baseline → fringe spacing
-    λ/B ≈ 0.0042 rad ≈ 0.24° at 1.5 GHz. Plenty of fringe rotation
-    across the 50 MHz band for the imager check to detect the source.
+    Default ``96 ants = 12 × 8`` with 0.5 m spacing in both x (east) and
+    y (north). This gives a 5.5 m × 3.5 m physical aperture → 2D uv
+    coverage, so dirty images aren't degenerate along one axis. (Real
+    DSA-110 layout is 1D-dominated but still has slight N-S extent;
+    this test array is more isotropic to exercise the gridder.)
     """
+    if n_x * n_y != nants:
+        raise ValueError(f"{n_x} × {n_y} = {n_x * n_y} != nants={nants}")
     pos = np.zeros((nants, 3), dtype=np.float64)
-    pos[:, 0] = spacing_m * np.arange(nants)
+    for k in range(nants):
+        ix = k % n_x
+        iy = k // n_x
+        pos[k, 0] = spacing_m * ix          # east
+        pos[k, 1] = spacing_m * iy          # north
     return pos
+
+
+# Kept for backward compatibility; superseded by antpos_synth_2d_grid.
+antpos_linear_ew = antpos_synth_2d_grid
 
 
 def channel_freqs_hz(
@@ -286,7 +301,7 @@ def synthesize_block(
         `_FADA_VOLT_SHAPE = (NPACKETS=2048, NANTS=96, NCHAN=384, 2t, NPOL=2)`.
     """
     if antenna_pos_m is None:
-        antenna_pos_m = antpos_linear_ew()
+        antenna_pos_m = antpos_synth_2d_grid()
     if nu_Hz is None:
         nu_Hz = channel_freqs_hz()
 
