@@ -325,3 +325,39 @@ VOLTAGES_DTYPES_VALID: tuple[str, ...] = ("int8", "float16")
 """Valid in-process Voltages dtypes per D2: int8 fluffed (default,
 quasi-no-op from int4 wire) or fp16 fluffed (debug). int4-on-wire is a
 transport detail (plan §3 line 297) and lives in capture/, not contracts."""
+
+
+# ---------------------------------------------------------------------------
+# Slow correlator (M2; plan §8 lines 2161-2177)
+# ---------------------------------------------------------------------------
+
+LEGACY_FLUFF_SCALE: float = 0.05
+"""4-bit voltage fluff scale factor. Pinned by legacy
+`dsaX_bfCorr.cu::corr_input_copy` (lines 273-286): each signed-4-bit
+nibble is sign-extended to a fp16 in [-8, 7] and then multiplied by 0.05.
+M2's `slow_corr_kernel.unpack_int4_complex` mirrors this convention so
+auto-correlation amplitudes carry the same physical units as the legacy
+`dsaX_bfCorr` output. Per D2 in M2_PLAN_FIXES.md, NO other gain
+calibration is applied in `corr_slow_compute`."""
+
+BADA_NPOL: int = 2
+"""Slow-correlator output `npol` per D1 in M2_PLAN_FIXES.md: 2 parallel-pol
+products (XX = pol_0 × pol_0, YY = pol_1 × pol_1) — NOT the 4-hand
+{XX, XY, YX, YY} form. Matches legacy `bada` block layout consumed by
+`meridian_fringestop` (`dsamfs/utils.py::read_buffer(reader, nbls,
+nchan, npol=2)`)."""
+
+BADA_BYTES_PER_INTEGRATION: int = NBASE * NCHAN_PER_CHGROUP * BADA_NPOL * 8
+"""Bada block size = NBASE × NCHAN × NPOL × sizeof(complex64) = 28,606,464.
+Pinned by Subagent A's reading of `dsaX_bfCorr.cu` lines 1455-1460
+(`output_size = NBASE*NCHAN_PER_PACKET*2*2*4`) and `dsamfs/utils.py`
+lines 141-155 (`data.view(np.float32).reshape(-1, 2).view(np.complex64)
+.reshape(-1, nbls, nchan, npol)`). Per D8 in M2_PLAN_FIXES.md, dtype is
+`complex64` (NOT `cfp16`)."""
+
+FADA_BYTES_PER_BLOCK: int = (
+    BLOCK_SAMPLES_SPECNUM * NANTS * NCHAN_PER_CHGROUP * 2 * NPOL * 1
+)
+"""Fada block size = NPACKETS × NANTS × NCHAN × 2t × 2p × 1 byte
+(4-bit cplx packed = 1 byte / complex sample) = 301,989,888.
+Matches `configs/config_corr.yaml::buffers.fada.bytes_per_block`."""
