@@ -350,6 +350,23 @@ def grid_uv_natural(
     nbls = vis.shape[0]
     auto_mask = (np.abs(uvw_m).sum(axis=1) < 1e-9)                  # (Nbls,)
 
+    # Sign-convention note (F18/F20 — see M2_PLAN_FIXES.md). The dsamfs UVH5
+    # writer stores `vis = conj(E_ant_1) * E_ant_2` (post-F18, ant_1 < ant_2)
+    # and `uvw = pos_ant_2 - pos_ant_1` (per `dsamfs/io.py:196-197`). Empirical
+    # CASA imaging (h01 dsamfs/dsacalib pipeline) places sources at the correct
+    # sky RA/Dec with these stored values — so the operational pipeline is
+    # internally consistent. However, our `np.fft.ifft2`-based dirty imager
+    # (which applies `exp(+2πi(ul+vm))` per scipy convention) recovers the
+    # source at `(-l_TMS, -m_TMS)` from the same data, indicating that the
+    # underlying time-frequency convention DSA-110 uses gives
+    # `V(u, v) ∝ exp(+2πi·b·ŝ·ν/c)` (i.e. opposite-sign of textbook CASA).
+    # We negate u, v here so that `iFFT` recovers the source at the standard
+    # TMS `(+l, +m)` — empirically validated against post-F18 CASA `tclean`
+    # results: peak now lands at the manifest-predicted `(l, m)`.
+    uvw_m = uvw_m.copy()
+    uvw_m[:, 0] *= -1
+    uvw_m[:, 1] *= -1
+
     for ich, nu_Hz in enumerate(freqs_Hz):
         wavelength_m = SPEED_OF_LIGHT_M_PER_S / float(nu_Hz)
         # uvw in λ:
