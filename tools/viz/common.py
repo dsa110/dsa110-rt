@@ -195,6 +195,66 @@ def load_bada_capture(
     )
 
 
+def load_uvh5_concat(
+    paths: Sequence[Path | str], *, source_name: str | None = None,
+) -> VisCube:
+    """Load N per-subband UVH5 files and stitch them along the freq axis.
+
+    Each input is expected to share the same (Nbls, Ntimes, Npols) layout
+    — i.e. the per-sb outputs of `meridian_fringestop` for the same
+    fixture run. We continuum-average each input across time first
+    (matching `load_uvh5`), then concatenate along the frequency axis
+    in ascending-freq order.
+
+    The first input's `uvw_m` (geometry) is reused for the combined cube
+    — uvw is wavelength-independent at zenith, so any sb's per-baseline
+    metres displacement is correct for all sbs.
+    """
+    if len(paths) == 0:
+        raise ValueError("load_uvh5_concat: no paths supplied")
+    cubes: list[VisCube] = []
+    for p in paths:
+        cubes.append(load_uvh5(p))
+    # Sort by ascending f0 so the concatenated freq axis is monotonic
+    # (DSA-110 sb files are stored decreasing-within-sb but each sb's
+    # window decreases too, so just sort by the *minimum* freq per cube).
+    order = sorted(range(len(cubes)), key=lambda k: float(cubes[k].freqs_Hz.min()))
+    cubes = [cubes[k] for k in order]
+    sorted_paths = [paths[k] for k in order]
+
+    # Concatenate freq + visdata. For each cube, freqs_Hz may be in
+    # decreasing order (DSA convention chan_ascending=False), so flip
+    # before stacking, then reorder the channel axis of vis to match.
+    freqs_parts: list[np.ndarray] = []
+    vis_parts: list[np.ndarray] = []
+    for c in cubes:
+        f = c.freqs_Hz
+        v = c.vis  # (Nbls, Nfreqs, Npols)
+        if len(f) > 1 and f[0] > f[-1]:
+            f = f[::-1].copy()
+            v = v[:, ::-1, :].copy()
+        freqs_parts.append(f)
+        vis_parts.append(v)
+    freqs_all = np.concatenate(freqs_parts, axis=0)
+    vis_all = np.concatenate(vis_parts, axis=1)
+
+    # uvw is wavelength-independent → first cube's uvw is correct.
+    uvw_all = cubes[0].uvw_m
+    nant = cubes[0].nant
+
+    src = source_name if source_name is not None else (
+        f"concat[{len(cubes)}]: {Path(str(sorted_paths[0])).stem} … "
+        f"{Path(str(sorted_paths[-1])).stem}"
+    )
+    return VisCube(
+        vis=vis_all.astype(np.complex64),
+        uvw_m=uvw_all,
+        freqs_Hz=freqs_all,
+        nant=nant,
+        source_name=src,
+    )
+
+
 def load_uvh5(path: Path | str, *, source_name: str | None = None) -> VisCube:
     """Load a UVH5 file produced by `meridian_fringestop` via h5py.
 

@@ -53,6 +53,7 @@ from tools.viz.common import (  # noqa: E402
     grid_uv_natural,
     load_bada_capture,
     load_uvh5,
+    load_uvh5_concat,
     render_dirty_image_png,
     render_report_html,
 )
@@ -89,7 +90,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", choices=("slow_corr",), default="slow_corr",
                     help="Pipeline check (M2 supports slow_corr only)")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--uvh5", help="UVH5 file produced by meridian_fringestop")
+    src.add_argument("--uvh5", nargs="+",
+                     help="UVH5 file(s) produced by meridian_fringestop. "
+                          "Pass multiple per-subband files (e.g. "
+                          "0319_sb*.uvh5) to image with the freq axes "
+                          "stitched together.")
+    src.add_argument("--uvh5-glob",
+                     help="glob pattern matching per-sb UVH5 files; "
+                          "equivalent to expanding --uvh5 with the matches")
     src.add_argument("--bada", help="Raw bada_capture.bin (synth/smoke mode)")
     ap.add_argument("--voltage-run-id", help="Manifest run-id for overlay")
     ap.add_argument("--out", required=True, help="Output directory")
@@ -112,10 +120,24 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Load visibility cube --------------------------------------------
-    if args.uvh5:
-        cube = load_uvh5(args.uvh5)
-        source_kind = "UVH5 (operator-facing)"
-        source_path = args.uvh5
+    if args.uvh5_glob:
+        import glob as _glob
+        uvh5_paths = sorted(_glob.glob(args.uvh5_glob))
+        if not uvh5_paths:
+            raise SystemExit(f"--uvh5-glob {args.uvh5_glob!r} matched no files")
+    elif args.uvh5:
+        uvh5_paths = list(args.uvh5)
+    else:
+        uvh5_paths = []
+
+    if uvh5_paths:
+        if len(uvh5_paths) == 1:
+            cube = load_uvh5(uvh5_paths[0])
+            source_kind = "UVH5 (operator-facing)"
+        else:
+            cube = load_uvh5_concat(uvh5_paths)
+            source_kind = f"UVH5 (operator-facing, concat of {len(uvh5_paths)} sb)"
+        source_path = ",".join(str(p) for p in uvh5_paths)
     else:
         cube = load_bada_capture(args.bada,
                                   source_name=Path(args.bada).stem)
