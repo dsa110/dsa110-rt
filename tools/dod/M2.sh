@@ -159,6 +159,7 @@ STEP="build_fstable_cache_narrow_grid"
 # the DoD certifies the dsamfs.fringestopping.generate_fringestopping_table
 # integration. The full 461-DEC grid is operator-time (~30 s/file, ~4 hr
 # total) and lives outside the DoD.
+export FSTABLE_ROOT
 mkdir -p "${FSTABLE_ROOT}"
 "${CASA38_PY}" "${REPO_ROOT}/tools/build_fstable_cache.py" \
     --dec-min 25.0 --dec-max 25.25 --dec-step 0.25 \
@@ -167,27 +168,27 @@ mkdir -p "${FSTABLE_ROOT}"
 grep -q "built=2 skipped=0 failed=0" /tmp/dsart_m2_fstable_build.log \
   || { echo '--- tail /tmp/dsart_m2_fstable_build.log ---'; tail -30 /tmp/dsart_m2_fstable_build.log; fail "fstable_cache build did not complete cleanly"; }
 # Verify .npz schema matches legacy dsamfs.fringestopping (allow_pickle
-# is needed because outrigger_delays is stored as object dtype).
+# is needed because outrigger_delays is stored as object dtype). The
+# corr_setup.yaml on h01 is the dev-site 64-ant variant; nant in the
+# filename is read from corr_setup directly.
 "${CASA38_PY}" - <<'PY' || fail "fstable .npz schema mismatch"
+import glob
 import os
 import numpy as np
 root = os.environ["FSTABLE_ROOT"]
 expected_keys = {"ant_bw", "antenna_order", "bw", "bwref", "dec_rad", "ha", "outrigger_delays", "refmjd", "tsamp_s"}
-for fname in (
-    "fringestopping_table_dec_+25.0000deg_64ant_refmjd58849.000000.npz",
-    "fringestopping_table_dec_+25.2500deg_64ant_refmjd58849.000000.npz",
-):
-    p = os.path.join(root, fname)
-    assert os.path.isfile(p), f"missing {p}"
+files = sorted(glob.glob(os.path.join(root, "fringestopping_table_dec_+25.0000deg_*.npz")) +
+               glob.glob(os.path.join(root, "fringestopping_table_dec_+25.2500deg_*.npz")))
+assert len(files) == 2, f"expected 2 narrow-grid .npz files, got {files!r}"
+for p in files:
     data = np.load(p, allow_pickle=True)
     keys = set(data.files)
     missing = expected_keys - keys
     assert not missing, f"{p}: missing keys {missing}; got {keys}"
     assert data["dec_rad"].shape == (), f"{p}: dec_rad shape {data['dec_rad'].shape}"
     assert data["bw"].ndim == 2, f"{p}: bw ndim {data['bw'].ndim}"
-    print(f"  {fname}: keys={sorted(keys)} bw.shape={data['bw'].shape}")
+    print(f"  {os.path.basename(p)}: keys={sorted(keys)} bw.shape={data['bw'].shape}")
 PY
-export FSTABLE_ROOT
 pass
 
 STEP="pytest_test_voltage_fixture_slow_corr_smoke"
