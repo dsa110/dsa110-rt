@@ -96,21 +96,39 @@ def main(argv: list[str] | None = None) -> int:
     # crashing with "cannot reshape array of size 96 into shape (1, 48, 48, 8, 2)".
     #
     # We can't (and won't) edit dsamfs sources. Instead we patch
-    # `dsamfs.utils.read_buffer` so that when the bada stream ends (an empty
-    # page from psrdada or a 0-length read), it raises `SystemExit`.
-    # `SystemExit` derives from `BaseException`, which slips past the
-    # `except (AssertionError, ValueError, PSRDadaError)` clause around the
-    # read in dada_to_uvh5 — the exception unwinds the inner+outer while
-    # loops cleanly without ever entering the buggy reshape branch.
-    # The first iteration's hdf5 (the one we actually want) is renamed by
-    # `os.rename` BEFORE this exception fires, so it survives intact.
-    print("[wrapper] patching dsamfs.utils.read_buffer for clean EOD handling",
-          flush=True)
-    _orig_read_buffer = dsamfs_utils.read_buffer
+    # `dsamfs.utils.read_buffer` to raise SystemExit (a BaseException, NOT
+    # caught by `except (AssertionError, ValueError, PSRDadaError)` in
+    # dada_to_uvh5) once we're past the first integration. SystemExit
+    # unwinds the inner+outer while loops cleanly without ever entering the
+    # buggy reshape branch. The first integration's hdf5 (the one we
+    # actually want) is renamed by `os.rename` BEFORE this exception fires,
+    # so it survives intact.
+    #
+    # Three independent termination conditions ensure iter-2 never runs:
+    #   1. Empty page from psrdada (the EOD marker has size 0).
+    #   2. `reader.isEndOfData` flag flipped after markCleared.
+    #   3. A hard cap on `nint * samples_per_frame_out` successful reads,
+    #      derived from the dsamfs param yaml. (Defense in depth: even if
+    #      the writer never marks EOD and stale pages keep coming through,
+    #      we still exit after exactly one integration's worth of data.)
+    import yaml as _yaml
+    with open(args.param_file, encoding="utf-8") as _f:
+        _param = _yaml.safe_load(_f)
+    _max_reads = int(_param["nint"]) * int(_param["samples_per_frame_out"])
+    print(f"[wrapper] patching dsamfs.utils.read_buffer for clean EOD "
+          f"handling (max_reads={_max_reads})", flush=True)
+
+    _reads_done = [0]
 
     def _patched_read_buffer(reader, nbls, nchan, npol):
+        if _reads_done[0] >= _max_reads:
+            raise SystemExit(
+                f"dsamfs: reached max_reads={_max_reads} (one integration "
+                f"complete) — terminating to dodge dsamfs/io.py:343 bug")
         page = reader.getNextPage()
         reader.markCleared()
+        if reader.isEndOfData:
+            raise SystemExit("dsamfs: bada stream EOD (reader flag set)")
         data = np.asarray(page)
         if data.size == 0:
             raise SystemExit("dsamfs: bada stream ended (empty page)")
@@ -126,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"dsamfs: short bada page ({data.shape[0]} < "
                     f"{full} samples) — treating as EOD")
             data = data[:n_full * full].reshape(-1, nbls, nchan, npol)
+        _reads_done[0] += 1
         return data
 
     dsamfs_utils.read_buffer = _patched_read_buffer
