@@ -47,7 +47,7 @@ from dsart.common.constants import (
 from dsart.services.slow_corr_kernel import (
     SlowCorrKernel,
     pack_bada_block,
-    unpack_int4_complex,
+    unpack_int4_split,
 )
 
 LOG = logging.getLogger("corr_slow_compute")
@@ -163,8 +163,11 @@ def run(
                 continue
 
             # --- COMPUTE ---
-            voltages = unpack_int4_complex(page_arr, device=device)
-            vis = kernel.compute(voltages)
+            # Real-imag split with fp16 outputs → tensor cores in matmul.
+            real_v, imag_v = unpack_int4_split(page_arr, device=device,
+                                               out_dtype=torch.float16)
+            vis = kernel.compute_split(real_v, imag_v)
+            del real_v, imag_v
 
             # --- WRITE ---
             out_bytes = pack_bada_block(vis)            # uint8 view, length BADA_BYTES_PER_INTEGRATION
