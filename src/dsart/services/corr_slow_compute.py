@@ -186,6 +186,12 @@ def run(
     reader = Reader(fada_key)
     writer = Writer(bada_key)
 
+    # Initialize counters before the try-block so the bada-EOD branch in
+    # `finally` can safely reference n_out even if construction raises.
+    n_in = 0
+    n_out = 0
+    n_drop = 0
+
     try:
         # 1. Header pass-through (R12: ONCE, not per-block).
         fada_header = reader.getHeader()
@@ -229,9 +235,6 @@ def run(
             )
 
         # 3. Main loop.
-        n_in = 0
-        n_out = 0
-        n_drop = 0
         per_block_ms: list[float] = []
         t_start = time.monotonic()
 
@@ -329,6 +332,18 @@ def run(
             "ms_per_block_p99": ms_p99,
         }
     finally:
+        # Signal bada EOD so any downstream reader (e.g. meridian_fringestop's
+        # `dada_to_uvh5`) exits its consume loop cleanly instead of either
+        # blocking on an empty ring or seeing a malformed final page. The
+        # extra getNextPage() acquires an empty terminal page; markEndOfData
+        # flags it with size 0. Both calls are best-effort.
+        try:
+            if n_out > 0:
+                writer.getNextPage()
+                writer.markEndOfData()
+                LOG.info("bada writer marked EOD after n_out=%d blocks", n_out)
+        except Exception:
+            LOG.exception("bada markEndOfData failed (non-fatal)")
         try:
             reader.disconnect()
         except Exception:

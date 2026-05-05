@@ -61,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     # --- Late imports so --help works outside casa38 ---
+    import numpy as np
     import astropy.units as u
     from dsamfs import utils as dsamfs_utils
     from dsamfs.routines import run_fringestopping
@@ -85,6 +86,52 @@ def main(argv: list[str] | None = None) -> int:
               "(no-ops; --no-etcd-write)", flush=True)
         dsamfs_utils.put_outrigger_delays = lambda _delays: None
         dsamfs_utils.put_refmjd = lambda _refmjd: None
+
+    # --- Patch 3: clean end-of-stream handling for read_buffer.
+    #
+    # dsamfs/io.py:343 has a latent shape bug on the SECOND iteration of its
+    # outer `while not nans:` loop: after a successful first-iter freq-int
+    # reshape, it count_nonzero's the previous iteration's already-averaged
+    # `data` and reshapes the result with the un-averaged nfreq_int factor,
+    # crashing with "cannot reshape array of size 96 into shape (1, 48, 48, 8, 2)".
+    #
+    # We can't (and won't) edit dsamfs sources. Instead we patch
+    # `dsamfs.utils.read_buffer` so that when the bada stream ends (an empty
+    # page from psrdada or a 0-length read), it raises `SystemExit`.
+    # `SystemExit` derives from `BaseException`, which slips past the
+    # `except (AssertionError, ValueError, PSRDadaError)` clause around the
+    # read in dada_to_uvh5 — the exception unwinds the inner+outer while
+    # loops cleanly without ever entering the buggy reshape branch.
+    # The first iteration's hdf5 (the one we actually want) is renamed by
+    # `os.rename` BEFORE this exception fires, so it survives intact.
+    print("[wrapper] patching dsamfs.utils.read_buffer for clean EOD handling",
+          flush=True)
+    _orig_read_buffer = dsamfs_utils.read_buffer
+
+    def _patched_read_buffer(reader, nbls, nchan, npol):
+        page = reader.getNextPage()
+        reader.markCleared()
+        data = np.asarray(page)
+        if data.size == 0:
+            raise SystemExit("dsamfs: bada stream ended (empty page)")
+        data = data.view(np.float32)
+        data = data.reshape(-1, 2).view(np.complex64).squeeze(axis=-1)
+        try:
+            data = data.reshape(-1, nbls, nchan, npol)
+        except ValueError:
+            full = nbls * nchan * npol
+            n_full = data.shape[0] // full
+            if n_full == 0:
+                raise SystemExit(
+                    f"dsamfs: short bada page ({data.shape[0]} < "
+                    f"{full} samples) — treating as EOD")
+            data = data[:n_full * full].reshape(-1, nbls, nchan, npol)
+        return data
+
+    dsamfs_utils.read_buffer = _patched_read_buffer
+    # `dsamfs.io` did `import dsamfs.utils as pu` at module-load time, so
+    # reassigning `dsamfs_utils.read_buffer` is sufficient — `pu.read_buffer`
+    # in io.py looks up the attribute at call time on the same module object.
 
     # --- Run ---
     print(f"[wrapper] run_fringestopping(param_file={args.param_file!r}, "
