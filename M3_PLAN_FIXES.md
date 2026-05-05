@@ -1,0 +1,108 @@
+# M3 plan fixes + decisions tracker
+
+This file mirrors the M2 pattern (see git log for `M2_PLAN_FIXES.md`):
+F-items are *fixes* (corrections to plan.md or implementation choices that
+deviate from the plan as written and need to be folded back), D-items are
+*decisions* locked during implementation. Both accumulate here during M3
+development and are folded into `dsa110-rt_revamp_7b1d2669.plan.md` during
+M3 hardening (the final M3 chunk), at which point this file is deleted.
+
+For binding M2 context that M3 inherits verbatim — and the F18/F20/D8/D11/
+D13/D14/D15/D16/D17/D18 items in particular — see plan.md `§8.M2-carryover`
+(lines ~2198-2261). Do not duplicate M2 context here.
+
+For parallel-agent file-ownership / branch-model / h01-test-isolation
+conventions, see `PARALLEL_AGENTS.md`.
+
+---
+
+## F-items (fixes — corrections / additions to plan.md)
+
+### F21 — fast-corr cal-apply must fold the bfCorr DEC-only phase
+
+**Status**: PROPOSED at M3 kickoff (2026-05-05). Implemented in chunk 2
+(`chunk_2_cal_apply_with_F21_dec_phase`) before any voltage-fixture work.
+
+**Problem**: plan.md §4.2 ("cal + bandpass flatten from antennas.out
+(legacy binary format ...) cal_mode={phase_only,full} flag, hot-reload via
+cmd: reload_cal") describes the cal apply but does not specify the
+DEC-only fringe-stop phase that legacy `dsaX_bfCorr.cu::populate_weights_matrix`
+folds into the per-(ant, ch, pol) cal weight before the GEMM.
+
+The slow-corr (M2) does not need this fold because `meridian_fringestop`
+in casa38 applies fringe-stopping (HA + DEC) downstream, after the slow
+GEMM, before UVH5 write. The fast-corr has no such downstream step — it
+goes straight from GEMM → grid → iFFT, so the visibility phase **must**
+be referenced to the source direction at gridding time, otherwise the
+source falls outside the iFFT FoV.
+
+For DSA-110 specifically (meridian-pointing array, HA=0 by construction
+for any single-pulse trigger dump), only the DEC component is needed.
+
+**Fix**: extend `cal_loader` (M3, peer to M2's `cal_loader.py` for the
+slow path) to populate the per-(ant, ch, pol) GPU cal tensor as
+
+```
+cal[a, ch, pol] = bandpass[a, ch, pol] · gain[a, pol]
+                 · exp(−2π i f[ch] · sin(δ_obs − φ_lat) · N_a / c)
+```
+
+where:
+- `f[ch]` = channel center frequency (Hz)
+- `δ_obs` = observing dec (rad), supplied via etcd `cmd: prepare` (prod) or
+  CLI flag (bench)
+- `φ_lat` = OVRO latitude = 37.234° (already a constant in
+  `src/dsart/common/constants.py`)
+- `N_a` = N-S antenna position (m), from the M2-validated antpos table
+- `c` = speed of light
+
+The HA and E-W components are zero (HA=0; E-W cancels at the meridian),
+matching `dsaX_bfCorr.cu::populate_weights_matrix` for the central beam
+(`bm = 127`, lines 1082-1085 of `dsa110-xengine/src/dsaX_bfCorr.cu`).
+
+**Sign convention**: matches bfCorr's `iArm == 1` branch literally —
+`afac = -2π f / c · sin(theta)` with `theta = -(π/180) · (φ_lat − δ_obs)`,
+i.e. `θ = δ_obs − φ_lat` in rad. The cal weight is then `cos(afac · N_a) +
+i · sin(afac · N_a)`. Consumers of `V_ij = E_i^* · E_j` (per F18) get the
+right phase sign for free because the cal weight pre-multiplies E_i.
+
+**M3 plan.md changes (during hardening)**:
+- §4.2 cal subsection: add a new paragraph specifying the DEC-only fold
+  and the formula above; cross-ref `dsaX_bfCorr.cu` lines.
+- §3 add: `obs_dec_deg` to the `cmd: prepare` etcd-key schema.
+- §8 M3 DoD: add the `bench/cal_reload.py` test for `δ_obs` → cal phase
+  hot-reload (cycle through 3 different obs_dec values, confirm cal
+  tensor swaps atomically and the source position in a synthetic-fixture
+  image moves to the predicted `(l, m)` for each).
+
+**Tests (chunk 2)**:
+- `tests/test_cal_loader_dec_phase.py`:
+  - F21.1: synthetic point source at (HA=0, dec=δ_obs) is at (l, m)≈(0, 0)
+    in the iFFT image after cal-apply with `δ_obs = δ_src` (within ≤ 1
+    grid cell at default `N_grid = 256`).
+  - F21.2: same source, with `δ_obs ≠ δ_src` by Δδ, lands at (0, sin(Δδ))
+    in the image (within ≤ 1 grid cell).
+  - F21.3: two synthetic point sources at `(0, ±0.05)` rad relative to
+    `δ_obs` are correctly resolved (no axis flip vs F20).
+  - F21.4: bfCorr round-trip — given the same antpos + cal blob + δ_obs,
+    M3's cal tensor matches bfCorr's combined weight tensor element-wise
+    (`atol=1e-6` in fp32; `atol=2e-3` in fp16) — pinned by reading
+    `dsaX_bfCorr.cu::populate_weights_matrix` byte-equivalent.
+
+---
+
+## D-items (decisions — locked during M3 implementation)
+
+(none yet)
+
+---
+
+## Cross-cutting notes for M3 hardening
+
+When folding this file into plan.md (M3 chunk 11):
+
+1. F21 → §4.2 cal subsection + §8 M3 DoD `cal_reload` line.
+2. Append per-chunk implementation notes to plan.md `§8.M3-carryover`
+   (new subsection between §8 M3 and §8 M4a, mirrors `§8.M2-carryover`).
+3. Delete this file in the same commit; M3.sh detects the absence and
+   stamps `complete (hardened)`.
