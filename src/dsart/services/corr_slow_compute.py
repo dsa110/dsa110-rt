@@ -3,9 +3,24 @@
 Reads `fada` PSRDADA blocks, runs the slow correlator kernel, writes
 `bada` PSRDADA blocks. Designed to run as `dsart-corr-slow@<host>`.
 
-Per D2 in M2_PLAN_FIXES.md (user constraint 2026-05-04): NO calibration
-is applied — the user derives cal solutions from these visibilities
-downstream in their own code (out-of-scope for this revamp).
+Per D2 (revised 2026-05-04) + D17 (2026-05-05) in M2_PLAN_FIXES.md:
+the production deployment runs WITHOUT calibration — slow visibilities
+are deliberately uncalibrated so the user can derive cal solutions
+downstream. The optional ``--apply-cal <path>`` flag (off by default)
+loads a legacy ``beamformer_weights_*.dat`` blob (see
+:mod:`dsart.cal.bf_weights`) and applies per-(ant, ch_coarse, pol)
+complex gain to voltages BEFORE the GEMM. Used only for testing —
+e.g. the M2 voltage-fixture imaging DoD (Chunk 6 Phase C). Two cal
+modes are supported (``--cal-mode``):
+
+  * ``full`` (default): full complex gain — preserves amplitude
+    calibration. Slow vis become ``V_cal_ij = G_i^* G_j V_raw_ij``.
+  * ``phase``: phase-only — divides each gain by its magnitude before
+    apply. Mirrors bfCorr's `wnorm` step (`bfCorr.cu:1138-1142`).
+
+A safety-valve ``--cal-pol-swap`` flips the cal pol axis if the
+voltage data is recorded in `[A, B]` order while cal is `[B, A]`
+(default DSA-110 convention is matched: both are `[B, A]`).
 
 Per D13: this module runs in the `dsa110-rt` conda env (depends on
 `torch` + `psrdada-python`; does NOT depend on `dsacalib` / `dsamfs`
@@ -39,6 +54,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from dsart.cal.bf_weights import (
+    load_bf_weights,
+    maybe_swap_pol,
+    normalize_phase_only,
+    upsample_coarse_to_fine,
+)
 from dsart.common.config_loader import load
 from dsart.common.constants import (
     BADA_BYTES_PER_INTEGRATION,
@@ -46,6 +67,8 @@ from dsart.common.constants import (
 )
 from dsart.services.slow_corr_kernel import (
     SlowCorrKernel,
+    apply_cal_split,
+    make_cal_broadcast_tensors,
     pack_bada_block,
     unpack_int4_split,
 )
@@ -90,6 +113,43 @@ def _install_signals(state: dict[str, Any]) -> None:
     signal.signal(signal.SIGINT, handle)
 
 
+def _build_cal_tensors(
+    cal_path: Path,
+    *,
+    cal_mode: str,
+    cal_pol_swap: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Load + prep cal blob → broadcast-ready torch tensors. Returns
+    `(cal_real, cal_imag, info_dict)`. The info dict carries logging
+    metadata (file size, n_flagged, magnitude summary)."""
+    bfw = load_bf_weights(cal_path)
+    LOG.info("loaded cal blob %s: %d flagged cells, mag p50=%.3g p99=%.3g max=%.3g",
+             bfw.source_path, bfw.n_flagged,
+             bfw.magnitude_summary["mag_p50"],
+             bfw.magnitude_summary["mag_p99"],
+             bfw.magnitude_summary["mag_max"])
+    gains = bfw.gains                                       # (96, 48, 2) complex64
+    if cal_mode == "phase":
+        gains = normalize_phase_only(gains)
+    elif cal_mode != "full":
+        raise ValueError(f"--cal-mode must be full|phase, got {cal_mode!r}")
+    gains = maybe_swap_pol(gains, swap=cal_pol_swap)
+    gains_fine = upsample_coarse_to_fine(gains)             # (96, 384, 2)
+    cal_real, cal_imag = make_cal_broadcast_tensors(
+        gains_fine, device=device, dtype=dtype,
+    )
+    info = {
+        "cal_path": str(bfw.source_path),
+        "cal_mode": cal_mode,
+        "cal_pol_swap": cal_pol_swap,
+        "n_flagged": bfw.n_flagged,
+        **{f"cal_{k}": v for k, v in bfw.magnitude_summary.items()},
+    }
+    return cal_real, cal_imag, info
+
+
 def run(
     fada_key: int,
     bada_key: int,
@@ -98,6 +158,9 @@ def run(
     max_blocks: int | None = None,
     expected_fada_bytes: int = FADA_BYTES_PER_BLOCK,
     expected_bada_bytes: int = BADA_BYTES_PER_INTEGRATION,
+    cal_path: Path | None = None,
+    cal_mode: str = "full",
+    cal_pol_swap: bool = False,
 ) -> dict[str, Any]:
     """Connect to PSRDADA, run the corr loop, return summary stats.
 
@@ -111,6 +174,9 @@ def run(
     _install_signals(state)
 
     LOG.info("connecting fada=0x%x bada=0x%x device=%s", fada_key, bada_key, device)
+    if cal_path is not None:
+        LOG.info("cal mode=%s pol_swap=%s path=%s",
+                 cal_mode, cal_pol_swap, cal_path)
     reader = Reader(fada_key)
     writer = Writer(bada_key)
 
@@ -124,6 +190,10 @@ def run(
         # Stamp one M2-specific provenance key so downstream tooling can
         # tell M2 corr_slow_compute apart from legacy dsaX_bfCorr.
         bada_header["DSART_PRODUCER"] = "corr_slow_compute"
+        if cal_path is not None:
+            bada_header["DSART_CAL_PATH"] = str(cal_path)
+            bada_header["DSART_CAL_MODE"] = cal_mode
+            bada_header["DSART_CAL_POL_SWAP"] = "1" if cal_pol_swap else "0"
         writer.setHeader(bada_header)
         LOG.info("bada header: %d keys written", len(bada_header))
 
@@ -131,6 +201,15 @@ def run(
         kernel = SlowCorrKernel(device=device)
         LOG.info("kernel ready: nants=%d nchan=%d nbase=%d nbada_pol=%d",
                  kernel.nants, kernel.nchan, kernel._nbase, kernel.nbada_pol)
+
+        # 2b. (Optional) load cal blob now that device is committed.
+        cal_real_b: torch.Tensor | None = None
+        cal_imag_b: torch.Tensor | None = None
+        if cal_path is not None:
+            cal_real_b, cal_imag_b, _ = _build_cal_tensors(
+                cal_path, cal_mode=cal_mode, cal_pol_swap=cal_pol_swap,
+                device=kernel.device, dtype=torch.float16,
+            )
 
         # 3. Main loop.
         n_in = 0
@@ -166,6 +245,12 @@ def run(
             # Real-imag split with fp16 outputs → tensor cores in matmul.
             real_v, imag_v = unpack_int4_split(page_arr, device=device,
                                                out_dtype=torch.float16)
+            if cal_real_b is not None:
+                real_v_cal, imag_v_cal = apply_cal_split(
+                    real_v, imag_v, cal_real_b, cal_imag_b,
+                )
+                del real_v, imag_v
+                real_v, imag_v = real_v_cal, imag_v_cal
             vis = kernel.compute_split(real_v, imag_v)
             del real_v, imag_v
 
@@ -248,6 +333,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="path to config_corr.yaml for buffer-size validation")
     p.add_argument("--max-blocks", type=int, default=None,
                    help="stop after N fada blocks (smoke-test / bench)")
+    p.add_argument("--apply-cal", type=Path, default=None,
+                   help="path to legacy beamformer_weights_*.dat blob "
+                        "(D17 test-only; default: production = no cal)")
+    p.add_argument("--cal-mode", default="full", choices=("full", "phase"),
+                   help="full = preserve gain magnitude (default); "
+                        "phase = divide by |G| first (matches bfCorr `wnorm`)")
+    p.add_argument("--cal-pol-swap", action="store_true",
+                   help="swap cal pol axis (use if voltage is [A,B] and cal "
+                        "is [B,A]; default: assume both are [B,A] per "
+                        "DSA-110 convention)")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = p.parse_args(argv)
@@ -274,8 +369,16 @@ def main(argv: list[str] | None = None) -> int:
     bada_int = _key_to_int(args.bada_key)
     device = _pick_device(args.device)
 
+    if args.apply_cal is not None and not args.apply_cal.is_file():
+        LOG.error("--apply-cal path %s not found", args.apply_cal)
+        return 2
+
     try:
-        run(fada_int, bada_int, device, max_blocks=args.max_blocks)
+        run(fada_int, bada_int, device,
+            max_blocks=args.max_blocks,
+            cal_path=args.apply_cal,
+            cal_mode=args.cal_mode,
+            cal_pol_swap=args.cal_pol_swap)
     except _StopRequested:
         LOG.info("clean stop")
     except KeyboardInterrupt:

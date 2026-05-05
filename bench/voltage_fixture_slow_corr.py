@@ -240,7 +240,7 @@ def build_replay_cmd(
 def build_corr_cmd(
     args: argparse.Namespace, dsart_python: str, fada_key: str, bada_key: str,
 ) -> list[str]:
-    return [
+    cmd = [
         dsart_python, "-m", "dsart.services.corr_slow_compute",
         "--fada-key", fada_key,
         "--bada-key", bada_key,
@@ -249,13 +249,30 @@ def build_corr_cmd(
         "--config", str(REPO_ROOT / "configs" / "config_corr.yaml"),
         "--log-level", args.corr_log_level,
     ]
+    if args.apply_cal:
+        cmd.extend(["--apply-cal", str(args.apply_cal),
+                    "--cal-mode", args.cal_mode])
+        if args.cal_pol_swap:
+            cmd.append("--cal-pol-swap")
+    return cmd
 
 
 # ---- meridian_fringestop integration -----------------------------------
 
 
 def _meridian_fringestop_cmd(args: argparse.Namespace) -> list[str] | None:
-    """Build the meridian_fringestop command line, or None if --skip-meridian."""
+    """Build the meridian_fringestop command line, or None if --skip-meridian.
+
+    Two modes:
+      * default — invokes ``dsamfs.meridian_fringestop`` directly. This
+        relies on ``socket.gethostname()`` matching a key in the dsamfs
+        param file's ``ch0:`` dict and on etcd serving the correct
+        ``/mon/array/dec`` value.
+      * ``--meridian-param <path>`` — invokes the casa38 wrapper at
+        ``bench/casa38_meridian_wrapper.py`` which patches
+        ``dsamfs.utils.get_pointing_declination`` in-process to honour
+        ``--meridian-pt-dec-deg`` (D17 wrapper, no casa38 source mods).
+    """
     if args.skip_meridian:
         return None
     if shutil.which(args.casa38_python) is None:
@@ -273,9 +290,22 @@ def _meridian_fringestop_cmd(args: argparse.Namespace) -> list[str] | None:
         )
     out_dir = Path(args.uvh5_out).parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    # meridian_fringestop is invoked positionally:
-    #   OUTDIR WORKING_DIR ... PARAM_FILE HEADER_FILE
-    # See dsamfs/meridian_fringestop.py main entry.
+
+    if args.meridian_param:
+        # D17 wrapper: monkey-patch get_pointing_declination in-process.
+        cmd = [
+            args.casa38_python,
+            str(REPO_ROOT / "bench" / "casa38_meridian_wrapper.py"),
+            "--param-file", str(args.meridian_param),
+            "--out-dir", str(out_dir),
+            "--working-dir", str(out_dir),
+        ]
+        if args.meridian_pt_dec_deg is not None:
+            cmd.extend(["--pt-dec-deg", str(args.meridian_pt_dec_deg)])
+        return cmd
+
+    # Default: invoke dsamfs.meridian_fringestop directly (positional args).
+    # See dsamfs/meridian_fringestop.py: argv[1]=OUTDIR, argv[2]=WORKING_DIR.
     cmd = [
         args.casa38_python, "-m", "dsamfs.meridian_fringestop",
         str(out_dir),
@@ -448,6 +478,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bada-capture-out",
                     help="(when --skip-meridian) raw bada bytes output path "
                          "(default: <work-dir>/bada_capture.bin)")
+    ap.add_argument("--meridian-param", type=Path, default=None,
+                    help="custom dsamfs param yaml (D17 wrapper mode); "
+                         "if set, invokes bench/casa38_meridian_wrapper.py "
+                         "which monkey-patches get_pointing_declination")
+    ap.add_argument("--meridian-pt-dec-deg", type=float, default=None,
+                    help="(wrapper mode only) override pt_dec in degrees "
+                         "(bypasses etcd/array/dec)")
+
+    # Cal application (D17 — passed through to corr_slow_compute)
+    ap.add_argument("--apply-cal", type=Path, default=None,
+                    help="path to legacy beamformer_weights_*.dat blob "
+                         "(D17 test-only)")
+    ap.add_argument("--cal-mode", default="full", choices=("full", "phase"),
+                    help="full = preserve gain magnitude; phase = divide by |G| first")
+    ap.add_argument("--cal-pol-swap", action="store_true",
+                    help="swap cal pol axis (use if voltage and cal pol orders differ)")
 
     # Python interpreters
     ap.add_argument("--dsart-python",

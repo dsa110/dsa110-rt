@@ -337,6 +337,116 @@ def unpack_int4_split(
     return real, imag
 
 
+# --- per-antenna cal application (D17, test-only --apply-cal flag) -------
+
+
+def apply_cal_split(
+    real_v: torch.Tensor,
+    imag_v: torch.Tensor,
+    cal_real_fine: torch.Tensor,
+    cal_imag_fine: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-(ant, fine_ch, pol) complex gain to split-real-imag voltages.
+
+    Implements ``E_calibrated[a, ch, pol] = E[a, ch, pol] * G[a, ch, pol]``
+    in-line on the GEMM layout, then the downstream correlator sees
+    ``V_ij = E_i_cal^* · E_j_cal = G_i^* · G_j · (E_i^* · E_j)``
+    — i.e. the standard CASA-style "G" gain solution applied to the
+    visibilities.
+
+    Parameters
+    ----------
+    real_v, imag_v : torch.Tensor
+        Voltage real/imag, each of shape `_GEMM_LAYOUT_SHAPE = (NCHAN,
+        NTIMES_PER_PACKET, NPOL, NPACKETS_PER_BLOCK, NANTS)` and dtype
+        torch.float16 (or fp32 for CPU debug).
+    cal_real_fine, cal_imag_fine : torch.Tensor
+        Per-fine-channel cal gains in **broadcastable** layout
+        `(1, 1, NPOL, 1, NANTS)` — i.e. expanded from coarse via
+        :func:`dsart.cal.bf_weights.upsample_coarse_to_fine`, then
+        permuted from `(ant, ch, pol)` → `(ch, pol, ant)`. Or — when
+        the fine-channel dependence is the actual cal — full shape
+        `(NCHAN, 1, NPOL, 1, NANTS)`. Same dtype + device as `real_v`.
+
+    Returns
+    -------
+    (real_out, imag_out) : tuple of torch.Tensor
+        New tensors, same shape and dtype as the inputs:
+            real_out = real_v * cal_real - imag_v * cal_imag
+            imag_out = real_v * cal_imag + imag_v * cal_real
+
+    Notes
+    -----
+    Allocates 2 fresh output tensors (each ~288 MB fp16). The input
+    tensors are deleted by the caller after this returns. Performance
+    on a 2080 Ti: ~6 ms per block (memory-bound at ~50 GB/s of HBM
+    bandwidth).
+    """
+    if real_v.shape != imag_v.shape:
+        raise ValueError(
+            f"real_v shape {tuple(real_v.shape)} != imag_v shape {tuple(imag_v.shape)}"
+        )
+    if real_v.shape != _GEMM_LAYOUT_SHAPE:
+        raise ValueError(
+            f"voltage shape {tuple(real_v.shape)} != _GEMM_LAYOUT_SHAPE {_GEMM_LAYOUT_SHAPE}"
+        )
+    if real_v.dtype != imag_v.dtype:
+        raise ValueError(f"real_v dtype {real_v.dtype} != imag_v dtype {imag_v.dtype}")
+    if cal_real_fine.dtype != real_v.dtype or cal_imag_fine.dtype != real_v.dtype:
+        raise ValueError(
+            f"cal dtypes ({cal_real_fine.dtype}, {cal_imag_fine.dtype}) != "
+            f"voltage dtype {real_v.dtype}"
+        )
+    if cal_real_fine.device != real_v.device or cal_imag_fine.device != real_v.device:
+        raise ValueError(
+            f"cal devices ({cal_real_fine.device}, {cal_imag_fine.device}) != "
+            f"voltage device {real_v.device}"
+        )
+
+    real_out = real_v * cal_real_fine - imag_v * cal_imag_fine
+    imag_out = real_v * cal_imag_fine + imag_v * cal_real_fine
+    return real_out, imag_out
+
+
+def make_cal_broadcast_tensors(
+    gains_fine: np.ndarray,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a fine-channel cal array to broadcast-ready torch tensors.
+
+    Parameters
+    ----------
+    gains_fine : np.ndarray
+        Shape `(NANTS, NCHAN_PER_CHGROUP, NPOL)` complex (any precision).
+    device, dtype : passed through to torch.
+
+    Returns
+    -------
+    (cal_real, cal_imag) : tuple of torch.Tensor
+        Each of shape `(NCHAN, 1, NPOL, 1, NANTS)` so they broadcast
+        against the voltage `_GEMM_LAYOUT_SHAPE = (NCHAN, NTIMES, NPOL,
+        NPACKETS, NANTS)`.
+    """
+    if gains_fine.shape != (NANTS, NCHAN_PER_CHGROUP, NPOL):
+        raise ValueError(
+            f"gains_fine shape {gains_fine.shape}, expected "
+            f"({NANTS}, {NCHAN_PER_CHGROUP}, {NPOL})"
+        )
+    real = np.ascontiguousarray(gains_fine.real)              # (96, 384, 2)
+    imag = np.ascontiguousarray(gains_fine.imag)
+    # Permute to (ch, pol, ant) then expand to broadcast layout.
+    real_t = torch.from_numpy(real).to(device=device, dtype=dtype)
+    imag_t = torch.from_numpy(imag).to(device=device, dtype=dtype)
+    real_t = real_t.permute(1, 2, 0).contiguous()             # (384, 2, 96)
+    imag_t = imag_t.permute(1, 2, 0).contiguous()
+    # Insert singleton time + packet axes for broadcasting.
+    real_t = real_t.unsqueeze(1).unsqueeze(3)                 # (384, 1, 2, 1, 96)
+    imag_t = imag_t.unsqueeze(1).unsqueeze(3)
+    return real_t, imag_t
+
+
 # --- per-block correlator (4-real-GEMM real-imag split + halfFac=4) -------
 
 
