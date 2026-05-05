@@ -1,0 +1,36 @@
+# M2 operator-approval marker (D11 in M2_PLAN_FIXES.md).
+#
+# Presence of this file is what tools/dod/M2.sh's `operator_approval`
+# step checks to promote the DoD stamp from
+# "complete (needs operator approval)" to "complete (approved)" /
+# "complete (hardened)".
+#
+# This marker was written 2026-05-05 reflecting the operator's chat
+# approval at the end of the M2 zenith-imaging-acceptance review:
+#   "all looks great - please proceed to finish M2!~"
+# (chat transcript 5aea86b6-3996-4069-9b6f-28b3078caf36, message
+#  immediately after the F18 + F19 + F20 acceptance summary)
+#
+# The viz artifact whose sha256 is recorded below is the post-F18 +
+# post-F20 internal-imager dirty-image report for the 0319+415 zenith-
+# phased UVH5 (pol-0 / XX), generated on h01:
+#   /home/ubuntu/data/vikram/0319_reports/M2_continuum_postF18_F20fix/zenith_pol0/report.html
+# Per the F20 entry in M2_PLAN_FIXES.md that report shows the source at
+# (l = +0.0188, m = +0.0764) rad ≈ predicted (+0.0134, +0.0747) at
+# SNR=32.4 (pol-0); pol-1 at SNR=31.8. CASA `tclean` ground truth on the
+# same UVH5 places the source at (RA=49.944°, Dec=41.514°) vs 0319+415
+# truth (49.951°, 41.512°) — 0.007° offset at SNR=40.4.
+operator: vikram
+approval_utc_iso: 2026-05-05T20:45:00Z
+milestone: M2
+voltage_run_id: 0319bbb
+viz_artifact_sha256: 91b066ae1145b660de31fba9c3988fb9fbdcbdf918d3b773cbafc6f7b53d3b87
+viz_artifact_path: /home/ubuntu/data/vikram/0319_reports/M2_continuum_postF18_F20fix/zenith_pol0/report.html
+notes: >
+  M2 zenith-imaging-acceptance review (F18 sign fix + F19 zenith-frame
+  scoping + F20 internal-imager (l, m) axis-label fix). End-to-end
+  validation: post-F18 CASA tclean recovers 0319+415 at the predicted
+  RA/Dec to 0.007°; internal imager recovers it at the predicted
+  (l, m) zenith-frame coordinates with SNR ~ 32 in both pols.
+  Operator (chat) approval recorded in conversation transcript
+  5aea86b6-3996-4069-9b6f-28b3078caf36.
