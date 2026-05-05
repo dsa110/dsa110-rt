@@ -172,33 +172,16 @@ def upper_tri_indices(nants: int = NANTS) -> tuple[np.ndarray, np.ndarray]:
 # --- fluff: int4 complex bytes → two real fp16 tensors --------------------
 
 
-def _build_fluff_lut(
-    *, device: torch.device | str, scale: float, out_dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build per-byte real / imag lookup tables for `unpack_int4_split`.
-
-    Each LUT has 256 entries indexed by the raw byte value; LUT_real[b]
-    = sign-extended low nibble of b, scaled. LUT_imag[b] = sign-extended
-    high nibble of b, scaled. After this, fluff is a single gather per
-    output (one read of the raw bytes, one write of the fluffed value).
-    """
-    arr = np.arange(256, dtype=np.int16)
-    lo = (arr & 0x0F).astype(np.int16)
-    hi = ((arr >> 4) & 0x0F).astype(np.int16)
-    lo[lo >= 8] -= 16
-    hi[hi >= 8] -= 16
-    np_dtype = {torch.float16: np.float16, torch.float32: np.float32}.get(out_dtype)
-    if np_dtype is None:
-        raise ValueError(f"unsupported out_dtype {out_dtype}")
-    lut_real = torch.from_numpy((lo.astype(np_dtype)) * np.array(scale, dtype=np_dtype))
-    lut_imag = torch.from_numpy((hi.astype(np_dtype)) * np.array(scale, dtype=np_dtype))
-    return lut_real.to(device), lut_imag.to(device)
-
-
-# Module-level LUT cache keyed by (device_str, scale, dtype) so a long-running
-# service builds the LUTs exactly once per (device, scale, dtype) combo. The
-# tables are 256 entries × 2 bytes each = 512 B per LUT; trivially small.
-_FLUFF_LUT_CACHE: dict[tuple[str, float, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+# Fluff is now done via int8 arithmetic shifts (the trick from
+# `dsaX_bfCorr.cu::corr_input_copy`, line 281-284):
+#
+#   real_nibble = ((char)(byte) << 4) >> 4   // ASR sign-extends bit 3
+#   imag_nibble =  (char)(byte)        >> 4   // ASR sign-extends bit 7
+#
+# PyTorch's `>>` on `torch.int8` IS an arithmetic shift right (sign-
+# preserving), matching the C `signed char >> N` semantics that bfCorr
+# relies on. This avoids the LUT path's int64 idx promotion (which
+# created a 2.3 GB temp on a 288 MB input — single biggest perf cost).
 
 
 #: 2D byte-transpose source shape used by the bfCorr-style fast path.
@@ -285,30 +268,32 @@ def unpack_int4_split(
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
-    cache_key = (str(dev), float(scale), out_dtype)
-    luts = _FLUFF_LUT_CACHE.get(cache_key)
-    if luts is None:
-        luts = _build_fluff_lut(device=dev, scale=scale, out_dtype=out_dtype)
-        _FLUFF_LUT_CACHE[cache_key] = luts
-    lut_real, lut_imag = luts
 
     # ---- Stage 1: 2D byte-transpose (bfCorr `transpose_matrix_char`) ----
     # PyTorch's `.t().contiguous()` on a 2D byte tensor maps to a tiled
     # shared-memory transpose kernel; ~1 ms for 300 MB on a 2080 Ti.
     raw_t = torch.as_tensor(raw_arr, device=dev)               # uint8 (288 MB)
-    bytes_2d = raw_t.view(_FADA_2D_SHAPE)                      # (196608, 1536)
-    bytes_T = bytes_2d.t().contiguous()                        # (1536, 196608)
+    bytes_2d = raw_t.view(_FADA_2D_SHAPE)                      # (196608, 1536) uint8
+    bytes_T = bytes_2d.t().contiguous()                        # (1536, 196608) uint8
     del bytes_2d, raw_t
 
-    # ---- Stage 2: per-byte LUT fluff (bfCorr `corr_input_copy`) ---------
-    # `lut[bytes_T.long()]` gathers an fp16 value per byte; reshape into
-    # the GEMM-friendly layout. The .long() promotion temporarily
-    # allocates 8x the source size (2.3 GB) but is freed before the
-    # GEMM. Trades RAM for one fewer kernel pass.
-    idx = bytes_T.to(torch.long).reshape(-1)                   # int64 (2.3 GB temp)
-    real = lut_real[idx].reshape(_GEMM_LAYOUT_SHAPE)           # fp16 (588 MB)
-    imag = lut_imag[idx].reshape(_GEMM_LAYOUT_SHAPE)           # fp16 (588 MB)
-    del idx, bytes_T
+    # ---- Stage 2: int8 ASR fluff (bfCorr `corr_input_copy`, lines 281-284) ----
+    # Reinterpret uint8 → int8 (free; same memory). Then:
+    #   real_nibble = ((int8)byte << 4) >> 4   ← ASR sign-extends bit 3
+    #   imag_nibble =  (int8)byte         >> 4   ← ASR sign-extends bit 7
+    # PyTorch's `>>` on int8 IS arithmetic shift right (sign-preserving)
+    # on both CPU and CUDA — verified empirically (test_slow_corr_synth.py
+    # has spot-checks). This avoids the 2.3 GB int64 idx temp the LUT
+    # path needed.
+    raw_i8 = bytes_T.view(torch.int8)                          # int8 reinterpret (free)
+    real_i8 = (raw_i8 << 4) >> 4                               # int8 (288 MB)
+    imag_i8 = raw_i8 >> 4                                      # int8 (288 MB)
+    del raw_i8, bytes_T
+
+    # int8 → out_dtype × scale; 288 MB int8 → 588 MB fp16 (or 1.15 GB fp32).
+    real = (real_i8.to(out_dtype) * scale).reshape(_GEMM_LAYOUT_SHAPE)
+    imag = (imag_i8.to(out_dtype) * scale).reshape(_GEMM_LAYOUT_SHAPE)
+    del real_i8, imag_i8
     return real, imag
 
 
