@@ -275,7 +275,9 @@ def main(argv: list[str] | None = None) -> int:
                         "default 15 → 1 integration per fada-block batch)")
     p.add_argument("--nfreq-int", type=int, default=8,
                    help="dsamfs frequency averaging factor (default 8)")
-    p.add_argument("--cal-mode", default="full", choices=("full", "phase"))
+    p.add_argument("--cal-mode", default="phase", choices=("full", "phase"),
+                   help="phase = divide by |G| first (default; fp16 path); "
+                        "full = preserve gain magnitude (fp32 path)")
     p.add_argument("--cal-pol-swap", action="store_true")
     p.add_argument("--src-ra-deg", type=float, default=SRC_RA_DEG_DEFAULT)
     p.add_argument("--src-dec-deg", type=float, default=SRC_DEC_DEG_DEFAULT)

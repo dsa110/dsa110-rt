@@ -13,10 +13,16 @@ complex gain to voltages BEFORE the GEMM. Used only for testing —
 e.g. the M2 voltage-fixture imaging DoD (Chunk 6 Phase C). Two cal
 modes are supported (``--cal-mode``):
 
-  * ``full`` (default): full complex gain — preserves amplitude
-    calibration. Slow vis become ``V_cal_ij = G_i^* G_j V_raw_ij``.
-  * ``phase``: phase-only — divides each gain by its magnitude before
-    apply. Mirrors bfCorr's `wnorm` step (`bfCorr.cu:1138-1142`).
+  * ``phase`` (default): phase-only — divides each gain by its
+    magnitude before apply. Mirrors bfCorr's `wnorm` step
+    (`bfCorr.cu:1138-1142`). Stays in **fp16** end-to-end (|G|=1
+    keeps the GEMM safely below fp16's 6.5e4 ceiling), so tensor
+    cores remain engaged. This is the headline D17 test.
+  * ``full``: full complex gain — preserves amplitude calibration.
+    Slow vis become ``V_cal_ij = G_i^* G_j V_raw_ij``. Real bfCorr
+    cals can hit |G|>5000 → squared visibilities easily overflow
+    fp16, so this path **routes through fp32** (no tensor cores;
+    ~10× slower per block but still well within offline budgets).
 
 A safety-valve ``--cal-pol-swap`` flips the cal pol axis if the
 voltage data is recorded in `[A, B]` order while cal is `[B, A]`
@@ -159,7 +165,7 @@ def run(
     expected_fada_bytes: int = FADA_BYTES_PER_BLOCK,
     expected_bada_bytes: int = BADA_BYTES_PER_INTEGRATION,
     cal_path: Path | None = None,
-    cal_mode: str = "full",
+    cal_mode: str = "phase",
     cal_pol_swap: bool = False,
 ) -> dict[str, Any]:
     """Connect to PSRDADA, run the corr loop, return summary stats.
@@ -202,13 +208,24 @@ def run(
         LOG.info("kernel ready: nants=%d nchan=%d nbase=%d nbada_pol=%d",
                  kernel.nants, kernel.nchan, kernel._nbase, kernel.nbada_pol)
 
-        # 2b. (Optional) load cal blob now that device is committed.
+        # 2b. Decide voltage / cal dtype based on --cal-mode (D17, 2026-05-05):
+        #   * no cal           → fp16 (production fast path, tensor cores)
+        #   * --cal-mode phase → fp16 (|G|=1 → safe under fp16 ceiling)
+        #   * --cal-mode full  → fp32 (real cal |G| can hit 5e3; squaring in
+        #                       the GEMM blows past fp16 max 6.5e4)
+        if cal_path is not None and cal_mode == "full":
+            voltage_dtype: torch.dtype = torch.float32
+            LOG.info("cal-mode=full → routing voltages + GEMM through fp32 "
+                     "(amplitude headroom; ~10x slower than fp16 path)")
+        else:
+            voltage_dtype = torch.float16
+
         cal_real_b: torch.Tensor | None = None
         cal_imag_b: torch.Tensor | None = None
         if cal_path is not None:
             cal_real_b, cal_imag_b, _ = _build_cal_tensors(
                 cal_path, cal_mode=cal_mode, cal_pol_swap=cal_pol_swap,
-                device=kernel.device, dtype=torch.float16,
+                device=kernel.device, dtype=voltage_dtype,
             )
 
         # 3. Main loop.
@@ -242,9 +259,11 @@ def run(
                 continue
 
             # --- COMPUTE ---
-            # Real-imag split with fp16 outputs → tensor cores in matmul.
+            # Voltage dtype tracks --cal-mode:
+            #   fp16 for no-cal + phase-only (tensor cores)
+            #   fp32 for full-amplitude cal (avoid |G|² overflow)
             real_v, imag_v = unpack_int4_split(page_arr, device=device,
-                                               out_dtype=torch.float16)
+                                               out_dtype=voltage_dtype)
             if cal_real_b is not None:
                 real_v_cal, imag_v_cal = apply_cal_split(
                     real_v, imag_v, cal_real_b, cal_imag_b,
@@ -336,9 +355,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--apply-cal", type=Path, default=None,
                    help="path to legacy beamformer_weights_*.dat blob "
                         "(D17 test-only; default: production = no cal)")
-    p.add_argument("--cal-mode", default="full", choices=("full", "phase"),
-                   help="full = preserve gain magnitude (default); "
-                        "phase = divide by |G| first (matches bfCorr `wnorm`)")
+    p.add_argument("--cal-mode", default="phase", choices=("full", "phase"),
+                   help="phase = divide by |G| first (default; matches "
+                        "bfCorr `wnorm`; stays in fp16). "
+                        "full = preserve gain magnitude (routes through fp32 "
+                        "to keep |G|² from overflowing fp16).")
     p.add_argument("--cal-pol-swap", action="store_true",
                    help="swap cal pol axis (use if voltage is [A,B] and cal "
                         "is [B,A]; default: assume both are [B,A] per "

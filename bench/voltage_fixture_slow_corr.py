@@ -493,8 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply-cal", type=Path, default=None,
                     help="path to legacy beamformer_weights_*.dat blob "
                          "(D17 test-only)")
-    ap.add_argument("--cal-mode", default="full", choices=("full", "phase"),
-                    help="full = preserve gain magnitude; phase = divide by |G| first")
+    ap.add_argument("--cal-mode", default="phase", choices=("full", "phase"),
+                    help="phase = divide by |G| first (default; fp16 path); "
+                         "full = preserve gain magnitude (fp32 path)")
     ap.add_argument("--cal-pol-swap", action="store_true",
                     help="swap cal pol axis (use if voltage and cal pol orders differ)")
 
