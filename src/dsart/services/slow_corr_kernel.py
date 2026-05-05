@@ -282,7 +282,14 @@ def unpack_int4_split(
     # win in the slow correlator. The byte transpose primitive PyTorch
     # ships isn't tiled like bfCorr's hand-written `transpose_matrix_char`;
     # the fp32 reinterpret tricks it into using the tuned path.
-    raw_t = torch.as_tensor(raw_arr, device=dev)               # uint8 (288 MB)
+    # Always materialise as a flat (1D) C-contiguous tensor so the fp32
+    # reinterpret below works regardless of how the caller shaped raw_arr
+    # (tests pass 5D _FADA_VOLT_SHAPE arrays; the production reader passes
+    # 1D bytes from psrdada).
+    raw_t = torch.as_tensor(
+        raw_arr.reshape(-1) if raw_arr.ndim != 1 else raw_arr,
+        device=dev,
+    )                                                          # uint8 (288 MB), flat
 
     # View raw bytes as 2D fp32: (NPACKETS*NANTS, NCHAN) where each
     # fp32 = 4 bytes = (2t, 2p) cube for one (ch, pkt, ant).
