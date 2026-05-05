@@ -21,10 +21,10 @@
 # same UVH5 places the source at (RA=49.944°, Dec=41.514°) vs 0319+415
 # truth (49.951°, 41.512°) — 0.007° offset at SNR=40.4.
 operator: vikram
-approval_utc_iso: 2026-05-05T20:45:00Z
+approval_utc_iso: "2026-05-05T20:45:00Z"
 milestone: M2
-voltage_run_id: 0319bbb
-viz_artifact_sha256: 91b066ae1145b660de31fba9c3988fb9fbdcbdf918d3b773cbafc6f7b53d3b87
+voltage_run_id: "0319bbb"
+viz_artifact_sha256: "91b066ae1145b660de31fba9c3988fb9fbdcbdf918d3b773cbafc6f7b53d3b87"
 viz_artifact_path: /home/ubuntu/data/vikram/0319_reports/M2_continuum_postF18_F20fix/zenith_pol0/report.html
 notes: >
   M2 zenith-imaging-acceptance review (F18 sign fix + F19 zenith-frame

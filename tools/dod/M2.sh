@@ -231,10 +231,10 @@ missing = required - set(data.keys())
 if missing:
     print(f"missing fields: {sorted(missing)}", file=sys.stderr)
     sys.exit(1)
-if data.get("milestone") != "M2":
+if str(data.get("milestone")) != "M2":
     print(f"wrong milestone {data.get('milestone')!r}", file=sys.stderr)
     sys.exit(1)
-print(json.dumps({k: data.get(k, "") for k in sorted(required)}))
+print(json.dumps({k: str(data.get(k, "")) for k in sorted(required)}))
 PY
   APPROVAL_PRESENT="true"
   APPROVAL_OPERATOR="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m2_operator_approval.json"))["operator"])')"
