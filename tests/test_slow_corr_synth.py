@@ -217,37 +217,48 @@ def test_pack_helper_roundtrip() -> None:
 
 
 @gpu_required
-def test_kernel_sign_convention_v_ij_conj_ei_ej() -> None:
-    """V_ij = conj(E_i) · E_j (D5; matches bfCorr `dsaX_bfCorr.cu:559-581`).
+def test_kernel_sign_convention_v_ant1_conj_ant2() -> None:
+    """vis[bls] = conj(E_ant_1) · E_ant_2, ant_1 < ant_2 (dsamfs/io.py:196-197).
 
-    Construct E_a = 1 + 0j and E_b = 0 + 1j everywhere (post-fluff units).
-    Expected (for any baseline pair (a, b) where b < a):
-        V[a, b] = sum_t conj(E_a) · E_b = K · (1 - 0j) · (0 + 1j) = K · j
-        V_real == 0,  V_imag == K · scale²
-    A wrong sign convention (V_ij = E_i · conj(E_j)) would give -K·j instead.
+    The on-disk `bada` / UVH5 convention used by dsamfs / pyuvdata / CASA
+    is `vis = E_ant_1^* * E_ant_2` with ant_1 < ant_2. Under our upper-tri
+    indexing (b ≤ a), bls_idx = a*(a+1)/2 + b maps to (ant_1=b, ant_2=a),
+    i.e. ant_1 is the LOWER antenna index and ant_2 is the HIGHER.
+
+    Construct ant_1 = E = (1, 0), ant_2 = E = (0, 1). Expected:
+        vis[bls] = conj((1, 0)) · (0, 1) = (0, +1)
+        ⇒ V_real == 0,  V_imag == +K · scale²
+
+    The opposite sign (V_imag = −K · scale²) would indicate the kernel is
+    emitting `conj(E_ant_2) * E_ant_1` instead — mirror about zenith in
+    the dirty image. (This was the historic bug fixed 2026-05-05; see
+    F18/D18 in M2_PLAN_FIXES.md.)
     """
     device = torch.device("cuda")
     real_int = np.zeros(_FADA_VOLT_SHAPE, dtype=np.int8)
     imag_int = np.zeros(_FADA_VOLT_SHAPE, dtype=np.int8)
-    # ant = a (e.g. 5) has E = (1, 0); ant = b (e.g. 3) has E = (0, 1).
+    # ant_1 (lower) at index 3 has E = (1, 0); ant_2 (higher) at index 5 has E = (0, 1).
     # Use real units: int4 value 1 → fluffs to 0.05; same for imag.
-    a_test, b_test = 5, 3
-    real_int[:, a_test] = 1
-    imag_int[:, b_test] = 1
+    ant_1_test, ant_2_test = 3, 5
+    real_int[:, ant_1_test] = 1
+    imag_int[:, ant_2_test] = 1
     raw_bytes = _pack_bytes_int4(real_int, imag_int)
 
     # Use fp32 inputs to remove fp16 rounding from the comparison.
     vis = _kernel_correlate(raw_bytes, device=device, out_dtype=torch.float32)
 
-    # Locate (a, b) baseline.
+    # Locate (ant_1, ant_2) baseline. Upper-tri gather uses (a=higher, b=lower)
+    # but we extract V[b, a] in the kernel (the swap that lands the right
+    # sign convention), so bls_idx = ant_2*(ant_2+1)/2 + ant_1.
     a_idx, b_idx = upper_tri_indices(NANTS)
-    # bls_idx = a*(a+1)/2 + b for b < a, with a=5, b=3 → 5*6/2 + 3 = 18.
-    bls = a_test * (a_test + 1) // 2 + b_test
-    assert int(a_idx[bls]) == a_test and int(b_idx[bls]) == b_test, (
+    bls = ant_2_test * (ant_2_test + 1) // 2 + ant_1_test
+    # The gather indices store (a=higher, b=lower); the emitted vis at
+    # this bls_idx is V[b_idx, a_idx] = V[ant_1, ant_2] = conj(E_ant_1) · E_ant_2.
+    assert int(a_idx[bls]) == ant_2_test and int(b_idx[bls]) == ant_1_test, (
         "baseline ordering changed; update test"
     )
 
-    # Expected: V[bls] = sum_t conj((1, 0)) · (0, 1) · scale² = K · scale² · j
+    # Expected: vis[bls] = sum_t conj((1, 0)) · (0, 1) · scale² = +K · scale² · j
     expected_imag = N_TIME * (LEGACY_FLUFF_SCALE ** 2)
     # All channels and pols see the same E (no chan/pol structure in this test).
     np.testing.assert_allclose(
@@ -257,9 +268,11 @@ def test_kernel_sign_convention_v_ij_conj_ei_ej() -> None:
     np.testing.assert_allclose(
         vis[bls].imag, expected_imag, rtol=1e-4,
         err_msg=(
-            "V_imag wrong sign or magnitude — expected V_ij = conj(E_i) · E_j "
-            "convention (D5 / bfCorr line 559-581). A wrong sign would give "
-            "negative imag."
+            "V_imag wrong sign or magnitude — expected vis = conj(E_ant_1) · E_ant_2 "
+            "convention (dsamfs/io.py:196-197 — `vis = A^* B` with A=ant_1, "
+            "B=ant_2 = high). A NEGATIVE imag would indicate the historic "
+            "kernel-mirror bug (F18/D18) where vis was emitted as "
+            "conj(E_ant_2) · E_ant_1."
         ),
     )
 
@@ -454,9 +467,11 @@ def test_point_source_planar_wave_phase_recovery() -> None:
     # (constant across pkt, t_sub, pol so we can read directly from real_q[0]).
     E_post = (real_q[0, :, :, 0, 0].astype(np.float64) +
               1j * imag_q[0, :, :, 0, 0].astype(np.float64)) * LEGACY_FLUFF_SCALE
-    # V_analytic[ij, ch] = sum_t conj(E_i) · E_j = K · conj(E_i) · E_j
+    # V_analytic[bls, ch] = sum_t conj(E_ant_1) · E_ant_2  with ant_1 < ant_2,
+    # i.e. (b_idx, a_idx) under our upper-tri layout (a = higher, b = lower).
+    # This matches dsamfs/io.py:196-197 — `vis = A^* B`, A=ant_1 = lower idx.
     a_idx, b_idx = upper_tri_indices(NANTS)
-    V_analytic = N_TIME * np.conj(E_post[a_idx]) * E_post[b_idx]
+    V_analytic = N_TIME * np.conj(E_post[b_idx]) * E_post[a_idx]
     # (NBASE, NCHAN); broadcast across pol for comparison
     V_analytic = V_analytic[..., None].repeat(BADA_NPOL, axis=-1)
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import socket
@@ -62,6 +63,16 @@ SRC_DEC_DEG_DEFAULT = 41.51169444
 SRC_MJD_DEFAULT = 61108.99867338988
 SRC_SPECNUM_DEFAULT = 21094410
 
+# OVRO-LWA latitude (deg) — used for zenith-frame uvw when --no-fringestop
+# is set so we image with the same phase center the un-fringestopped
+# visibilities are referenced to. Matches dsart.common.constants.PHI_LAT_OVRO_DEG.
+PHI_LAT_OVRO_DEG = 37.234
+
+# OVRO longitude (deg). Not in dsart.common.constants — only used here for
+# LST(refmjd) calculation in the manifest's expected-source overlay. Same
+# value as in dsa110_meridian_fs/utils.py (`pu.OVRO_LON`).
+PHI_LON_OVRO_DEG = -118.281
+
 #: All sbs in the transferred dataset (sb12 is the missing h18).
 ALL_SBS_DEFAULT = [
     f"{n:02d}" for n in range(16) if n != 12
@@ -88,6 +99,72 @@ def _read_cal_yaml(yaml_path: Path) -> dict[str, object]:
     return cnf["cal_solutions"]
 
 
+def _compute_expected_lm(
+    *,
+    src_ra_deg: float,
+    src_dec_deg: float,
+    refmjd: float,
+    phase_center_dec_deg: float,
+) -> tuple[float, float, float]:
+    """Compute (l, m, ha_deg) of a source from a (HA=0, dec=phase_center_dec) phase
+    center at refmjd, using OVRO LST.
+
+    The phase center is at the meridian (HA=0) at refmjd, so its RA equals
+    LST(refmjd). The two phase-center modes the M2 imaging acceptance uses:
+
+      * **Zenith** (when ``meridian_fringestop --fringestop`` is False):
+        ``phase_center_dec_deg = PHI_LAT_OVRO_DEG = 37.234`` so the phase
+        center is at the local zenith. This matches the un-fringestopped
+        visibilities (which are zenith-phased by virtue of the antennas'
+        cable/clock delay equalization).
+      * **Source-pointed** (when ``meridian_fringestop --fringestop`` is True
+        and ``pt_dec`` was set to the source dec): ``phase_center_dec_deg
+        = src_dec_deg`` so the phase center sits at (HA=0, dec=src_dec) at
+        refmjd. The fringestop machinery rotates per-baseline phases to
+        this phase center.
+
+    Math (Thompson, Moran, Swenson Eq. 3.83):
+
+        l = cos(δ_src) · sin(α_src - α_pc)            = -cos(δ_src) · sin(HA_src)
+        m = sin(δ_src) · cos(δ_pc) - cos(δ_src) · sin(δ_pc) · cos(HA_src)
+
+    where HA_src = LST(refmjd) - α_src and α_pc = LST(refmjd) by definition
+    of (HA=0).
+
+    Returns
+    -------
+    (l_rad, m_rad, ha_src_deg) : tuple[float, float, float]
+        (l, m) in radians; HA_src in degrees, signed (positive = west).
+    """
+    try:
+        from astropy.coordinates import EarthLocation
+        from astropy.time import Time
+        import astropy.units as u
+    except ImportError as exc:
+        raise SystemExit(
+            "astropy is required for --no-fringestop mode (LST(refmjd) "
+            "computation for the manifest's expected (l, m) overlay)"
+        ) from exc
+
+    site = EarthLocation(
+        lat=PHI_LAT_OVRO_DEG * u.deg,
+        lon=PHI_LON_OVRO_DEG * u.deg,
+        height=1222 * u.m,
+    )
+    t = Time(refmjd, format="mjd", scale="utc", location=site)
+    lst_deg = float(t.sidereal_time("apparent").to_value(u.deg))
+
+    ha_src_deg = ((lst_deg - src_ra_deg) + 180.0) % 360.0 - 180.0   # ∈ (-180, +180]
+    ha_src_rad = math.radians(ha_src_deg)
+    dec_src_rad = math.radians(src_dec_deg)
+    dec_pc_rad = math.radians(phase_center_dec_deg)
+
+    l_rad = -math.cos(dec_src_rad) * math.sin(ha_src_rad)
+    m_rad = (math.sin(dec_src_rad) * math.cos(dec_pc_rad)
+             - math.cos(dec_src_rad) * math.sin(dec_pc_rad) * math.cos(ha_src_rad))
+    return l_rad, m_rad, ha_src_deg
+
+
 def _build_manifest(
     *,
     work_dir: Path,
@@ -95,8 +172,22 @@ def _build_manifest(
     cals_dir: Path,
     sb: str,
     src: dict[str, object],
+    phase_center_dec_deg: float,
+    phase_center_mode: str,
 ) -> tuple[Path, Path]:
     """Set up <work_dir>/0319_sb<NN>/{manifest.yaml, fl_0319bbb_chgroup0.out}.
+
+    Parameters
+    ----------
+    phase_center_dec_deg : float
+        Dec (deg) of the phase center the visibility data is referenced to
+        (after fringe-stop, or after no-fringestop, depending on mode).
+        Used to compute the expected (l, m) of each continuum source for
+        the imager's overlay.
+    phase_center_mode : str
+        Either ``"zenith"`` (no fringestop, phase center at OVRO zenith)
+        or ``"source"`` (fringestop=True, phase center at source dec).
+        Echoed into the manifest for traceability.
 
     Returns (fixture_dir, manifest_path).
     """
@@ -124,6 +215,16 @@ def _build_manifest(
     flagants_path = fixture_dir / "flagants.dat"
     flagants_path.write_text("")  # empty per user instruction (no flagging)
 
+    # Compute expected (l, m) of the source from the chosen phase center,
+    # so the imager can overlay the predicted spot. (`continuum_sources[*].lm_rad`
+    # is read by `tools/viz/common.expected_sources_from_manifest`.)
+    l_rad, m_rad, ha_src_deg = _compute_expected_lm(
+        src_ra_deg=float(src["ra_deg"]),
+        src_dec_deg=float(src["dec_deg"]),
+        refmjd=float(src["mjd"]),
+        phase_center_dec_deg=phase_center_dec_deg,
+    )
+
     manifest = {
         "fixture_kind": "continuum",
         "utc_start_iso": _mjd_to_utc_iso(float(src["mjd"])),
@@ -131,7 +232,10 @@ def _build_manifest(
         "utc_start_specnum": int(src["specnum"]),
         "n_blocks": 15,
         "continuum_sources": [
-            {"name": "0319+415"},
+            {
+                "name": "0319+415",
+                "lm_rad": [float(l_rad), float(m_rad)],
+            },
         ],
         "cal_paths": {
             "antennas_out": "antennas.out",
@@ -143,6 +247,9 @@ def _build_manifest(
         "voltage_link": str(voltage_link),
         "cal_link": str(cal_link),
         "sb": sb,
+        "phase_center_mode": phase_center_mode,
+        "phase_center_dec_deg": float(phase_center_dec_deg),
+        "ha_src_deg_at_refmjd": float(ha_src_deg),
     }
     manifest_path = fixture_dir / "manifest.yaml"
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False))
@@ -301,8 +408,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="set fringestop=False in the dsamfs param file so "
                         "dsamfs writes UVH5 with NO per-baseline phase "
                         "correction applied (drift-mode / zenith-phased "
-                        "visibilities). uvw_array still populated for "
-                        "(HA=0, dec=pt_dec, refmjd) frame.")
+                        "visibilities). When set, --pt-dec-deg defaults to "
+                        f"OVRO latitude ({PHI_LAT_OVRO_DEG} deg) so dsamfs "
+                        "computes uvw_array in the zenith frame, matching "
+                        "the un-fringestopped visibilities.")
+    p.add_argument("--pt-dec-deg", type=float, default=None,
+                   help="pointing declination (deg) passed to the wrapper "
+                        "via --meridian-pt-dec-deg. Default: source dec when "
+                        "fringestop is enabled (legacy); OVRO latitude "
+                        f"({PHI_LAT_OVRO_DEG} deg) when --no-fringestop "
+                        "(so uvw_array is in the zenith / drift-mode frame).")
     p.add_argument("--src-ra-deg", type=float, default=SRC_RA_DEG_DEFAULT)
     p.add_argument("--src-dec-deg", type=float, default=SRC_DEC_DEG_DEFAULT)
     p.add_argument("--src-mjd", type=float, default=SRC_MJD_DEFAULT)
@@ -364,6 +479,25 @@ def main(argv: list[str] | None = None) -> int:
     sbs = [s.strip() for s in args.sbs.split(",") if s.strip()]
     print(f"[run_0319] processing sbs: {sbs}")
 
+    # Resolve pt_dec_deg with the --no-fringestop default override.
+    # The phase-center-mode label is determined by --no-fringestop alone:
+    # explicit --pt-dec-deg overrides the dec value but doesn't change
+    # whether the visibilities are zenith-phased (set by fringestop=False)
+    # vs source-phased (fringestop=True). Operator beware.
+    phase_center_mode = "zenith" if args.no_fringestop else "source"
+    if args.pt_dec_deg is not None:
+        pt_dec_deg = args.pt_dec_deg
+        pt_dec_origin = "explicit --pt-dec-deg"
+    elif args.no_fringestop:
+        pt_dec_deg = PHI_LAT_OVRO_DEG
+        pt_dec_origin = "OVRO zenith (--no-fringestop default)"
+    else:
+        pt_dec_deg = src["dec_deg"]
+        pt_dec_origin = "source dec (fringestop=True default)"
+    print(f"[run_0319] pt_dec_deg={pt_dec_deg} ({pt_dec_origin}); "
+          f"fringestop={'OFF' if args.no_fringestop else 'ON'}; "
+          f"phase_center_mode={phase_center_mode}")
+
     summary: list[dict[str, object]] = []
     overall_rc = 0
     for sb in sbs:
@@ -377,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
         fixture_dir, _ = _build_manifest(
             work_dir=args.work_dir, voltage_root=voltage_dir, cals_dir=cals_dir,
             sb=sb, src=src,
+            phase_center_dec_deg=pt_dec_deg,
+            phase_center_mode=phase_center_mode,
         )
         param_path = _build_meridian_param(
             fixture_dir=fixture_dir, sb=sb, cal_yaml=cal_yaml, src=src,
@@ -396,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.monotonic()
         rc = _run_one_sb(
             sb=sb, fixture_dir=fixture_dir, cal_dat=cal_dat,
-            meridian_param=param_path, pt_dec_deg=src["dec_deg"],
+            meridian_param=param_path, pt_dec_deg=pt_dec_deg,
             uvh5_out=uvh5_out, n_blocks=args.n_blocks,
             dsart_python=args.dsart_python, casa38_python=args.casa38_python,
             fada_key=args.fada_key, bada_key=args.bada_key,

@@ -83,6 +83,13 @@ Numeric strategy (D3 / D4 revised 2026-05-04 — tensor cores are essential):
                           = sum_t (R_i - jI_i)(R_j + jI_j)
                           = (R_i R_j + I_i I_j) + j(R_i I_j - I_i R_j)
     → 4 real GEMMs (vs 1 complex-fp32 GEMM that bypasses TCs).
+    Note this is the per-element formula our matmul writes into the
+    NANTS×NANTS tile. The on-disk `bada` / UVH5 convention is
+    `vis = E_ant_1^* * E_ant_2` with `ant_1 < ant_2` (dsamfs/io.py:196-197),
+    so the upper-tri gather extracts at (b, a) = (lower, higher) — see
+    Stage 4 in `compute_split` for the row-vs-column-major reasoning that
+    makes this an EXPLICIT swap for PyTorch matmul (vs IMPLICIT for
+    cuBLAS column-major in bfCorr).
   * fp16 accumulator safety: with the 0.05 pre-fluff, |E|² ≤ 0.16 and
     K=2048 sum ≤ 327 — well within fp16 max (65504) by ~200×. After
     summing the 2 t_sub samples, peak is 654, still ~100× below fp16
@@ -593,9 +600,30 @@ class SlowCorrKernel:
         V_imag_b = V_imag[:, : self.nbada_pol, :, :]
 
         # ---- Stage 4: upper-triangle gather + complex assemble -----------
-        # vis[bls, ch, pol] = V[ch, pol, a, b], bls_idx = a*(a+1)/2 + b.
-        vis_real = V_real_b[..., self._a_idx, self._b_idx]      # (ch, npol, NBASE)
-        vis_imag = V_imag_b[..., self._a_idx, self._b_idx]
+        # vis[bls, ch, pol] = V[ch, pol, b, a], bls_idx = a*(a+1)/2 + b.
+        #
+        # Extract at (b, a) — i.e. (lower_ant, higher_ant) in the upper-tri
+        # pair — to match dsamfs's pyuvdata-style sign convention
+        # `vis = E_ant_1^* * E_ant_2` (dsamfs/io.py:196-197), where
+        # ant_1 = lower antenna index, ant_2 = higher antenna index.
+        # Our PyTorch matmul writes V[i, j] = conj(E_i) * E_j into a
+        # row-major (NANTS, NANTS) tile, so V[b, a] = conj(E_b) * E_a
+        # = conj(E_low) * E_high = conj(E_ant_1) * E_ant_2 — exactly the
+        # convention dsamfs / pyuvdata / CASA expects on disk.
+        #
+        # Why bfCorr gets it right despite the same per-element formula:
+        # bfCorr writes via cublasHgemm into a COLUMN-MAJOR tile and then
+        # reads the same memory ROW-major (`h_idxs[k] = i*NANTS + j`),
+        # which implicitly transposes the matrix. Our PyTorch matmul
+        # writes the result row-major directly, so we have to take the
+        # transpose explicitly via this index swap. (Equivalent to
+        # extracting at (a, b) and negating vis_imag — V_real is
+        # symmetric in (a, b), V_imag is antisymmetric.)
+        #
+        # Without this swap, the dirty image of any sky source comes out
+        # mirrored about the zenith / phase center: (l, m) -> (-l, -m).
+        vis_real = V_real_b[..., self._b_idx, self._a_idx]      # (ch, npol, NBASE)
+        vis_imag = V_imag_b[..., self._b_idx, self._a_idx]
         vis_real = vis_real.permute(2, 0, 1).contiguous()       # (NBASE, ch, npol)
         vis_imag = vis_imag.permute(2, 0, 1).contiguous()
         return torch.complex(vis_real, vis_imag)                # (4656, 384, 2)
