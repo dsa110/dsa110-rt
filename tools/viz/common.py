@@ -277,9 +277,18 @@ def load_uvh5(path: Path | str, *, source_name: str | None = None) -> VisCube:
     path = Path(path)
     with h5py.File(path, "r") as f:
         hdr = f["Header"]
-        data = f["Data/visdata"][...]                               # (Nblts, Nfreqs, Npols)
+        data = f["Data/visdata"][...]                               # (Nblts, [Nspws,] Nfreqs, Npols)
+        # pyuvdata 1.x schema has an extra Nspws=1 axis between Nblts and Nfreqs;
+        # pyuvdata 3.x and meridian_fringestop's writer use the flatter 3-D layout.
+        if data.ndim == 4:
+            if data.shape[1] != 1:
+                raise ValueError(
+                    f"{path}: visdata shape {data.shape} has Nspws={data.shape[1]} > 1; "
+                    f"multi-spw not supported"
+                )
+            data = data[:, 0, :, :]                                 # (Nblts, Nfreqs, Npols)
         uvw_blts = hdr["uvw_array"][...]                            # (Nblts, 3)
-        freqs = hdr["freq_array"][...].astype(np.float64)
+        freqs = np.asarray(hdr["freq_array"][...], dtype=np.float64).reshape(-1)
         nbls = int(hdr["Nbls"][()])
         ntimes = data.shape[0] // nbls
         if data.shape[0] != nbls * ntimes:
