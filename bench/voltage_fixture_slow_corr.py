@@ -292,13 +292,16 @@ def _meridian_fringestop_cmd(args: argparse.Namespace) -> list[str] | None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.meridian_param:
-        # D17 wrapper: monkey-patch get_pointing_declination in-process.
+        # D17 wrapper: monkey-patch get_pointing_declination in-process and
+        # stub put_outrigger_delays / put_refmjd so this test run doesn't
+        # pollute the shared /mon/fringe/* etcd keys.
         cmd = [
             args.casa38_python,
             str(REPO_ROOT / "bench" / "casa38_meridian_wrapper.py"),
             "--param-file", str(args.meridian_param),
             "--out-dir", str(out_dir),
             "--working-dir", str(out_dir),
+            "--no-etcd-write",
         ]
         if args.meridian_pt_dec_deg is not None:
             cmd.extend(["--pt-dec-deg", str(args.meridian_pt_dec_deg)])
