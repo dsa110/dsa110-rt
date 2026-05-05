@@ -158,6 +158,7 @@ def _build_meridian_param(
     hostname: str,
     nint: int,
     nfreq_int: int,
+    fringestop: bool = True,
 ) -> Path:
     """Write a per-sb dsamfs param yaml. ch0 dict has a single key matching
     the running hostname so ``socket.gethostname()`` lookup succeeds.
@@ -197,7 +198,13 @@ def _build_meridian_param(
         "samples_per_frame": 1,
         "samples_per_frame_out": 1,
         "nint": nint,
-        "fringestop": True,
+        # When False, dsamfs/routines.py:62 overwrites the fringe-stop
+        # vis_model with all-ones, so the per-(t, baseline) phase
+        # correction is a no-op — visibilities are written as-is from
+        # the slow corr (zenith / drift-mode phase). uvw_array is still
+        # populated for the (HA=0, dec=pt_dec, refmjd) frame so that
+        # geometry/metadata round-trip through pyuvdata.
+        "fringestop": fringestop,
         # pt_dec is overridden by the wrapper's monkey-patch on
         # get_pointing_declination; this value is just a placeholder.
         "pt_dec": 0.7245,  # ≈ 41.51 deg, ignored by wrapper but kept for sanity
@@ -290,6 +297,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="phase = divide by |G| first (default; fp16 path); "
                         "full = preserve gain magnitude (fp32 path)")
     p.add_argument("--cal-pol-swap", action="store_true")
+    p.add_argument("--no-fringestop", action="store_true",
+                   help="set fringestop=False in the dsamfs param file so "
+                        "dsamfs writes UVH5 with NO per-baseline phase "
+                        "correction applied (drift-mode / zenith-phased "
+                        "visibilities). uvw_array still populated for "
+                        "(HA=0, dec=pt_dec, refmjd) frame.")
     p.add_argument("--src-ra-deg", type=float, default=SRC_RA_DEG_DEFAULT)
     p.add_argument("--src-dec-deg", type=float, default=SRC_DEC_DEG_DEFAULT)
     p.add_argument("--src-mjd", type=float, default=SRC_MJD_DEFAULT)
@@ -368,6 +381,7 @@ def main(argv: list[str] | None = None) -> int:
         param_path = _build_meridian_param(
             fixture_dir=fixture_dir, sb=sb, cal_yaml=cal_yaml, src=src,
             hostname=hostname, nint=args.nint, nfreq_int=args.nfreq_int,
+            fringestop=not args.no_fringestop,
         )
         uvh5_out = args.work_dir / f"0319_sb{sb}.uvh5"
 
