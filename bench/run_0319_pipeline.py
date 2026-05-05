@@ -174,6 +174,17 @@ def _build_meridian_param(
     # dsamfs/utils.py::parse_params expects antenna_order: dict {idx: ant_id}.
     ant_od = {i: a for i, a in enumerate(antenna_order)}
 
+    # `filelength_minutes` MUST be small enough that
+    # `max_frames_per_file = ceil(filelength_minutes*60/(tsamp*nint)) = 1`.
+    # dsamfs/io.py:343 has a latent shape-bug on the second loop iteration
+    # (it tries to count_nonzero on the previous iteration's freq-averaged
+    # `data` and then reshape with the un-averaged nfreq_int factor). With
+    # max_frames=1, the inner while loop exits cleanly after writing the
+    # single integration we have data for, never triggering the bug.
+    tsamp_s = 0.134217728
+    one_frame_window_s = tsamp_s * nint                          # = 2.013 s for nint=15
+    filelength_minutes = 0.5 * one_frame_window_s / 60.0          # half-window safety
+
     param = {
         "test": False,
         "key_string": "bada",
@@ -190,12 +201,12 @@ def _build_meridian_param(
         # pt_dec is overridden by the wrapper's monkey-patch on
         # get_pointing_declination; this value is just a placeholder.
         "pt_dec": 0.7245,  # ≈ 41.51 deg, ignored by wrapper but kept for sanity
-        "tsamp": 0.134217728,
+        "tsamp": tsamp_s,
         "nfreq_int": nfreq_int,
         "antenna_order": ant_od,
         "nchan_spw": NCHAN_PER_CHGROUP,
         "ch0": {hostname: ch0},
-        "filelength_minutes": 5,
+        "filelength_minutes": filelength_minutes,
         "outrigger_delays": {},
         "refmjd": float(src["mjd"]),
     }
