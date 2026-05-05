@@ -427,6 +427,45 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     if cons_rc != 0:
                         overall_rc = max(overall_rc, 6)
 
+        # 6. Promote the meridian_fringestop UVH5 (if any) to the requested
+        # --uvh5-out path. dsamfs writes a timestamped file like
+        # `<ts>_sb<NN>.hdf5` into <out_dir>; rename the most recent one to
+        # the canonical path. If meridian exited with rc=1 due to the D17
+        # SystemExit termination but a valid integration was still produced,
+        # demote overall_rc back to 0 (the pipeline succeeded).
+        if consumer_label == "meridian_fringestop" and args.uvh5_out:
+            uvh5_out = Path(args.uvh5_out)
+            out_dir = uvh5_out.parent
+            cands = sorted(
+                p for p in out_dir.glob("*_sb*.hdf5")
+                if not p.name.endswith("_incomplete.hdf5")
+            )
+            if cands:
+                produced = cands[-1]  # most recent
+                if uvh5_out.exists():
+                    uvh5_out.unlink()
+                produced.rename(uvh5_out)
+                summary["uvh5_out"] = str(uvh5_out)
+                print(f"[orchestrator] promoted {produced.name} → {uvh5_out}",
+                      flush=True)
+                # Tidy up: remove dsamfs's iter-2 `_incomplete.hdf5` artifact.
+                for stale in out_dir.glob("*_incomplete.hdf5"):
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
+                # If meridian exited rc=1 but we got a valid integration,
+                # the pipeline succeeded — clear the consumer-failure code.
+                if cons_rc == 1 and overall_rc == 6:
+                    overall_rc = 0
+                    summary["meridian_fringestop_rc_note"] = (
+                        "rc=1 expected: D17 wrapper SystemExit terminates "
+                        "after first integration to dodge dsamfs/io.py:343 bug"
+                    )
+            else:
+                print(f"[orchestrator] WARNING: no UVH5 produced in {out_dir}",
+                      file=sys.stderr)
+
     except Exception as e:
         print(f"[orchestrator] FAILED: {e}", file=sys.stderr)
         summary["error"] = str(e)
