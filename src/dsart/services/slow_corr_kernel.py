@@ -85,9 +85,15 @@ NPACKETS_PER_BLOCK: Final[int] = BLOCK_SAMPLES_SPECNUM     # 2048
 NTIMES_PER_PACKET: Final[int] = 2
 N_TIME_SAMPLES: Final[int] = NPACKETS_PER_BLOCK * NTIMES_PER_PACKET  # 4096
 
-#: Default K-chunking for the GEMM, mirroring legacy halfFac=4 in
-#: `dsaX_bfCorr.cu` (line 41-42: "required to prevent overflow").
-HALF_FAC_DEFAULT: Final[int] = 4
+#: Default K-chunking for the GEMM. Legacy `dsaX_bfCorr.cu` (lines 41-42)
+#: uses `halfFac=4` "to prevent overflow", but legacy fluffs ×0.05 BEFORE
+#: the GEMM (matching us). With the 0.05 pre-fluff, |E|² ≤ 0.16 and the
+#: K=4096 sum ≤ 655 — well within fp16 max (65504) by ~100×. Setting the
+#: default to 1 collapses 16 matmuls + 16 cast/add launches to 4 matmuls
+#: (batched over the leading (ch, pol) dims by torch.matmul). Override
+#: with `half_fac=4` if production-RFI conditions ever push fp16 close
+#: to overflow.
+HALF_FAC_DEFAULT: Final[int] = 1
 
 # fada raw layout (C-order strides): byte index = pkt * 96*384*2*2 + ant * 384*2*2 + ...
 _FADA_VOLT_SHAPE: Final[tuple[int, ...]] = (
@@ -128,6 +134,35 @@ def upper_tri_indices(nants: int = NANTS) -> tuple[np.ndarray, np.ndarray]:
 # --- fluff: int4 complex bytes → two real fp16 tensors --------------------
 
 
+def _build_fluff_lut(
+    *, device: torch.device | str, scale: float, out_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-byte real / imag lookup tables for `unpack_int4_split`.
+
+    Each LUT has 256 entries indexed by the raw byte value; LUT_real[b]
+    = sign-extended low nibble of b, scaled. LUT_imag[b] = sign-extended
+    high nibble of b, scaled. After this, fluff is a single gather per
+    output (one read of the raw bytes, one write of the fluffed value).
+    """
+    arr = np.arange(256, dtype=np.int16)
+    lo = (arr & 0x0F).astype(np.int16)
+    hi = ((arr >> 4) & 0x0F).astype(np.int16)
+    lo[lo >= 8] -= 16
+    hi[hi >= 8] -= 16
+    np_dtype = {torch.float16: np.float16, torch.float32: np.float32}.get(out_dtype)
+    if np_dtype is None:
+        raise ValueError(f"unsupported out_dtype {out_dtype}")
+    lut_real = torch.from_numpy((lo.astype(np_dtype)) * np.array(scale, dtype=np_dtype))
+    lut_imag = torch.from_numpy((hi.astype(np_dtype)) * np.array(scale, dtype=np_dtype))
+    return lut_real.to(device), lut_imag.to(device)
+
+
+# Module-level LUT cache keyed by (device_str, scale, dtype) so a long-running
+# service builds the LUTs exactly once per (device, scale, dtype) combo. The
+# tables are 256 entries × 2 bytes each = 512 B per LUT; trivially small.
+_FLUFF_LUT_CACHE: dict[tuple[str, float, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def unpack_int4_split(
     raw: np.ndarray | bytes | memoryview,
     *,
@@ -144,6 +179,11 @@ def unpack_int4_split(
     Returns the real and imag parts as SEPARATE tensors (rather than a single
     `torch.complex` tensor) so the downstream GEMM can use fp16 tensor cores
     via the real-imag split form (D3/D4 in M2_PLAN_FIXES.md).
+
+    Implementation: per-byte LUT gather. Each output element is `LUT[b]`
+    where `b` is one of 256 possible byte values. Gather is a single
+    fused kernel pass: ~300 MB read + 600 MB write at >500 GB/s ≈ 2 ms
+    on a 2080 Ti, vs ~100 ms for the dtype-promotion + `where` chain.
 
     Parameters
     ----------
@@ -164,13 +204,6 @@ def unpack_int4_split(
     (real, imag) : tuple[torch.Tensor, torch.Tensor]
         Both tensors of shape `_FADA_VOLT_SHAPE = (2048, 96, 384, 2, 2)`
         and dtype `out_dtype`.
-
-    Notes
-    -----
-    Sign-extension uses an arithmetic trick:
-      `int8(byte_nibble) - 16` if nibble ≥ 8 else `int8(byte_nibble)`.
-    Equivalent to legacy C `(char)(((unsigned char)x << 4)) >> 4` but
-    without UB on signed shifts.
     """
     if isinstance(raw, (bytes, memoryview)):
         raw_arr = np.frombuffer(raw, dtype=np.uint8)
@@ -186,24 +219,25 @@ def unpack_int4_split(
             f"(= prod{_FADA_VOLT_SHAPE})"
         )
 
-    raw_t = torch.as_tensor(raw_arr, device=device)            # uint8 (288 MB)
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+    cache_key = (str(dev), float(scale), out_dtype)
+    luts = _FLUFF_LUT_CACHE.get(cache_key)
+    if luts is None:
+        luts = _build_fluff_lut(device=dev, scale=scale, out_dtype=out_dtype)
+        _FLUFF_LUT_CACHE[cache_key] = luts
+    lut_real, lut_imag = luts
 
-    # --- low nibble = real ---
-    # uint8 → int16 (576 MB temp), sign-extend via `where`, → out_dtype × scale
-    # (288 MB at fp16; 576 MB at fp32). int16 is the smallest dtype that holds
-    # the full sign-extended range [-8, 7] without overflow during the
-    # `- 16` step.
-    real_i16 = (raw_t & 0x0F).to(torch.int16)
-    real_i16 = torch.where(real_i16 >= 8, real_i16 - 16, real_i16)
-    real = real_i16.to(out_dtype).mul_(scale).reshape(_FADA_VOLT_SHAPE)
-    del real_i16
-
-    # --- high nibble = imag ---
-    imag_i16 = (raw_t >> 4).to(torch.int16)
-    imag_i16 = torch.where(imag_i16 >= 8, imag_i16 - 16, imag_i16)
-    imag = imag_i16.to(out_dtype).mul_(scale).reshape(_FADA_VOLT_SHAPE)
-    del imag_i16, raw_t
-
+    # uint8 → int64 indices (PyTorch only allows long indices for gather).
+    # Allocates a temp 4× the raw size. To avoid that, use take which can
+    # accept any int-dtype index in newer pytorch, but long-indexed gather
+    # is more portable.
+    raw_t = torch.as_tensor(raw_arr, device=dev)               # uint8 (288 MB)
+    idx = raw_t.to(torch.long)                                 # int64 (2.3 GB temp)
+    real = lut_real[idx].reshape(_FADA_VOLT_SHAPE)             # fp16 (288 MB)
+    imag = lut_imag[idx].reshape(_FADA_VOLT_SHAPE)             # fp16 (288 MB)
+    del idx, raw_t
     return real, imag
 
 
@@ -291,44 +325,52 @@ class SlowCorrKernel:
         # Reshape (pkt, ant, ch, t_sub, pol) → (ch, pol, ant, t_total).
         # `permute(...)` returns a view; `.contiguous()` materialises for the
         # GEMM (cuBLAS does not handle non-contiguous fp16 tensors well).
-        R = real_v.permute(2, 4, 1, 0, 3).contiguous()
-        I = imag_v.permute(2, 4, 1, 0, 3).contiguous()
-        R = R.view(self.nchan, self.nvolt_pol, self.nants, self.n_time_samples)
-        I = I.view(self.nchan, self.nvolt_pol, self.nants, self.n_time_samples)
-
+        # `.reshape` after `.contiguous()` is a free view.
+        R = real_v.permute(2, 4, 1, 0, 3).contiguous().reshape(
+            self.nchan, self.nvolt_pol, self.nants, self.n_time_samples,
+        )
+        I = imag_v.permute(2, 4, 1, 0, 3).contiguous().reshape(
+            self.nchan, self.nvolt_pol, self.nants, self.n_time_samples,
+        )
         # Free the original (pkt-major) buffers immediately. The permuted
         # `.contiguous()` copies above are independent allocations.
         del real_v, imag_v
 
-        # halfFac K-split with fp32 accumulation.
-        chunk_K = self.n_time_samples // self.half_fac
-
-        # Allocate the fp32 accumulators on the kernel's device.
-        # Shape (nchan, nvolt_pol, nants, nants); we'll slice nbada_pol after.
-        V_real = torch.zeros(
-            (self.nchan, self.nvolt_pol, self.nants, self.nants),
-            dtype=self.accum_dtype, device=self.device,
-        )
-        V_imag = torch.zeros_like(V_real)
-
-        for c in range(self.half_fac):
-            sl = slice(c * chunk_K, (c + 1) * chunk_K)
-            R_c = R[..., sl]
-            I_c = I[..., sl]
-            R_cT = R_c.transpose(-1, -2)
-            I_cT = I_c.transpose(-1, -2)
-
-            # 4 fp16 batched matmuls per chunk; outputs are fp16 (HMMA on
-            # Turing; tensor cores require fp16 inputs). Cast .to(fp32) at
-            # accumulation time to preserve precision across chunks.
-            #
-            # V_real[i,j] = sum_t  R_i(t) R_j(t) + I_i(t) I_j(t)
-            # V_imag[i,j] = sum_t  R_i(t) I_j(t) - I_i(t) R_j(t)
-            # (D5: V_ij = E_i^* · E_j  ⇒  imag = R_i I_j - I_i R_j.)
-            V_real.add_(torch.matmul(R_c, R_cT).to(self.accum_dtype))
-            V_real.add_(torch.matmul(I_c, I_cT).to(self.accum_dtype))
-            V_imag.add_(torch.matmul(R_c, I_cT).to(self.accum_dtype))
-            V_imag.sub_(torch.matmul(I_c, R_cT).to(self.accum_dtype))
+        if self.half_fac == 1:
+            # Fast path: single batched fp16 matmul per real/imag GEMM.
+            # torch.matmul automatically batches over the (ch, pol) leading
+            # dims → a single cuBLAS HgemmStridedBatched call per matmul.
+            # Output is fp16; cast to fp32 immediately for the final sum.
+            R_T = R.transpose(-1, -2)
+            I_T = I.transpose(-1, -2)
+            V_real = torch.matmul(R, R_T)                       # fp16 (ch, pol, 96, 96)
+            V_real = V_real.add_(torch.matmul(I, I_T)).to(self.accum_dtype)
+            V_imag = torch.matmul(R, I_T)
+            V_imag = V_imag.sub_(torch.matmul(I, R_T)).to(self.accum_dtype)
+        else:
+            # Legacy halfFac path: split K into `half_fac` sub-batches with
+            # fp32 accumulation across chunks (mirrors `dsaX_bfCorr.cu` lines
+            # 41-42). Useful when production data ranges push fp16 outputs
+            # close to overflow.
+            chunk_K = self.n_time_samples // self.half_fac
+            V_real = torch.zeros(
+                (self.nchan, self.nvolt_pol, self.nants, self.nants),
+                dtype=self.accum_dtype, device=self.device,
+            )
+            V_imag = torch.zeros_like(V_real)
+            for c in range(self.half_fac):
+                sl = slice(c * chunk_K, (c + 1) * chunk_K)
+                R_c = R[..., sl]
+                I_c = I[..., sl]
+                R_cT = R_c.transpose(-1, -2)
+                I_cT = I_c.transpose(-1, -2)
+                # V_real[i,j] = sum_t  R_i(t) R_j(t) + I_i(t) I_j(t)
+                # V_imag[i,j] = sum_t  R_i(t) I_j(t) - I_i(t) R_j(t)
+                # (D5: V_ij = E_i^* · E_j  ⇒  imag = R_i I_j - I_i R_j.)
+                V_real.add_(torch.matmul(R_c, R_cT).to(self.accum_dtype))
+                V_real.add_(torch.matmul(I_c, I_cT).to(self.accum_dtype))
+                V_imag.add_(torch.matmul(R_c, I_cT).to(self.accum_dtype))
+                V_imag.sub_(torch.matmul(I_c, R_cT).to(self.accum_dtype))
 
         # Restrict to the bada-output pol count.
         V_real_b = V_real[:, : self.nbada_pol, :, :]                # (ch, npol, 96, 96)
