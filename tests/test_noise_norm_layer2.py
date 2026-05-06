@@ -305,9 +305,21 @@ def test_detector_layer2_ema_converges_on_noise_cubes() -> None:
     """Feed N noise-only cubes; the EMA's per-kernel s_k should
     converge near the analytic noise std for each kernel triple
     (since cube_injection cubes have σ=1 per cell, the post-conv σ
-    for kernel (k_dm, k_time) is sqrt(k_dm × k_time))."""
+    for kernel (k_dm, k_time) = (1, K_t) is sqrt(K_t)).
+
+    Restricted to k_dm=1 kernels to avoid the small-bench fine-DM-axis
+    boundary bias: a width-K_dm=3 kernel applied to a small cube with
+    N_fdm=4 has 2/4 = 50% of fdm trials reading off the cube edge into
+    zero-padding, biasing σ_k well below the analytic sqrt(3) value
+    (this is the §3.6.10 line 1018-1035 boundary-bias issue, but on the
+    fine-DM axis instead of the time axis, and at a much higher boundary
+    fraction than production where N_fdm=100). At production sizing
+    the fdm-edge fraction is ~2% and the bias is negligible. Chunk-6
+    bench/noise_norm_calibration.py validates the full kernel bank
+    with production-sized cubes.
+    """
     bank = build_kernel_bank(
-        image_tokens=("unit",), dm_tokens=("d1", "d3"),
+        image_tokens=("unit",), dm_tokens=("d1",),
         time_tokens=("b1", "b4", "b16"),
     )
     det = DeterministicDetector(
@@ -321,13 +333,15 @@ def test_detector_layer2_ema_converges_on_noise_cubes() -> None:
         )
         det.forward(cube.to(torch.float16), validity, sigma1)
     # After 10 cubes the Welford running mean should be near analytic.
+    # Tolerance: small bench has H=W=16, T=128 (interior 0..127 since
+    # T < n_kernel_max_t falls back to full cube), N_fdm=4 → per-kernel
+    # cube has ~131k samples → sample-σ uncertainty ~sqrt(2/N) ~0.4%/cube;
+    # 10 cubes mean tightens by sqrt(10) ~ 0.13%. Plus 3σ-clip bias of
+    # ~1.5%. Use a 5% relative tolerance.
     s_k = det.layer2_state.s_k
     for k_idx, kernel in enumerate(det.kernel_bank):
         analytic = math.sqrt(kernel.k_dm_width * kernel.k_time_width)
         empirical = float(s_k[k_idx])
-        # Tolerance: small bench has H=W=16, so per-kernel-cube has ~
-        # 32k samples → σ-sample-uncertainty ~ sqrt(2/N) ~ 0.8% / cube.
-        # Across 10 cubes the mean is good to ~2.5%.
         assert abs(empirical - analytic) / analytic < 0.05, (
             f"kernel {kernel.kernel_id}: empirical s_k={empirical:.3f} "
             f"vs analytic={analytic:.3f}"
