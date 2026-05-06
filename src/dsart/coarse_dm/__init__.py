@@ -26,14 +26,20 @@ from dsart.coarse_dm.dm_plan import (
     compute_delay_native_samples_table,
     load_dm_plan,
 )
+from dsart.coarse_dm.stage1 import (
+    apply_stage1_shifts,
+    max_t_dedisp_for_plan,
+)
 from dsart.coarse_dm.stage2_fifo import Stage2FIFO
 
 __all__ = [
     "DMPlan",
     "Stage2FIFO",
+    "apply_stage1_shifts",
     "build_chgroup_freq_table_GHz",
     "coarse_dedisp",
     "compute_delay_native_samples_table",
     "load_dm_plan",
     "max_output_t_dedisp",
+    "max_t_dedisp_for_plan",
 ]
