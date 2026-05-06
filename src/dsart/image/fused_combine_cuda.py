@@ -219,24 +219,44 @@ _MODULE_CACHE: Optional[object] = None
 
 
 def _ensure_conda_gcc_on_path() -> None:
-    """Set CC/CXX env vars to the conda-forge gcc/g++ if available.
+    """Set CC/CXX env vars to a CUDA-11.8-compatible gcc.
 
-    PyTorch 2.x C++ extensions require GCC ≥ 9; h01's system gcc is
-    7.5. The dsa110-rt conda env carries gcc_linux-64 / gxx_linux-64
-    (15.x); we point the build at it via env vars. No-op on systems
-    where the conda compilers aren't installed (caller falls back to
-    whatever ``cc`` / ``c++`` resolve to and may fail with the 7.5
-    error — that's recoverable: re-run ``conda install gxx_linux-64``).
+    PyTorch 2.x C++ extensions require GCC ≥ 9; CUDA 11.8 supports
+    GCC ≤ 10. The dsa110-rt conda env carries gcc_linux-64 15.x
+    (which conda-forge defaults to), which compiles host code fine
+    but emits ``_Float64`` C++23 types in ``<limits>`` that nvcc 11.8
+    can't parse. So we use a sibling ``dsart-build`` conda env that
+    pins gcc 10 specifically. Search order:
+
+      1. ``$DSART_BUILD_CC`` / ``$DSART_BUILD_CXX`` (operator override).
+      2. ``~/miniforge3/envs/dsart-build/bin/x86_64-conda-linux-gnu-{gcc,g++}``
+         (the standard h01 setup).
+      3. ``$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-{gcc,g++}`` (current
+         env; only useable if its gcc happens to be ≤ 10).
+      4. system ``cc`` / ``c++`` (must be ≥ 9; on h01 this is 7.5,
+         so this branch loses).
+
+    One-time h01 setup:
+
+        conda create -n dsart-build -c conda-forge -y \\
+            "gcc_linux-64=10" "gxx_linux-64=10"
     """
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if not conda_prefix:
+    if "DSART_BUILD_CC" in os.environ and "DSART_BUILD_CXX" in os.environ:
+        os.environ["CC"] = os.environ["DSART_BUILD_CC"]
+        os.environ["CXX"] = os.environ["DSART_BUILD_CXX"]
         return
-    bindir = Path(conda_prefix) / "bin"
-    cc_path = bindir / "x86_64-conda-linux-gnu-gcc"
-    cxx_path = bindir / "x86_64-conda-linux-gnu-g++"
-    if cc_path.is_file() and cxx_path.is_file():
-        os.environ["CC"] = str(cc_path)
-        os.environ["CXX"] = str(cxx_path)
+    candidate_prefixes = []
+    home = Path(os.environ.get("HOME", "/home/ubuntu"))
+    candidate_prefixes.append(home / "miniforge3" / "envs" / "dsart-build")
+    if "CONDA_PREFIX" in os.environ:
+        candidate_prefixes.append(Path(os.environ["CONDA_PREFIX"]))
+    for prefix in candidate_prefixes:
+        cc_path = prefix / "bin" / "x86_64-conda-linux-gnu-gcc"
+        cxx_path = prefix / "bin" / "x86_64-conda-linux-gnu-g++"
+        if cc_path.is_file() and cxx_path.is_file():
+            os.environ["CC"] = str(cc_path)
+            os.environ["CXX"] = str(cxx_path)
+            return
 
 
 def get_module(verbose: bool = False) -> object:
