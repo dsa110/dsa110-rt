@@ -24,6 +24,7 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import time
 
@@ -50,6 +51,18 @@ from dsart.trigger.mock_listener import (  # noqa: E402
     MockTriggerListener,
     MockTriggerListenerFan,
 )
+
+
+def asyncio_test(coro_fn):
+    """Tiny adapter to let `async def` test bodies run under stock pytest
+    without requiring pytest-asyncio (which isn't installed in the
+    dsa110-rt conda env). Each test gets its own fresh event loop."""
+
+    @functools.wraps(coro_fn)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(coro_fn(*args, **kwargs))
+
+    return wrapper
 
 
 def _cand(*, snr: float = 10.0, kernel_id: str = "psf:d3:b16",
@@ -82,7 +95,7 @@ async def _wait_for(predicate, *, timeout_s: float = 2.0,
     return False
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_emit_one_candidate_to_one_listener() -> None:
     async with MockTriggerListener() as listener:
         cfg = TriggerEmitterConfig(
@@ -115,7 +128,7 @@ async def test_emit_one_candidate_to_one_listener() -> None:
             assert r.accepted
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_trigger_id_format() -> None:
     async with MockTriggerListener() as listener:
         cfg = TriggerEmitterConfig(
@@ -137,7 +150,7 @@ async def test_trigger_id_format() -> None:
             assert counter_part.isdigit()
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_fan_out_to_all_listeners() -> None:
     async with MockTriggerListenerFan(n=4) as fan:
         cfg = TriggerEmitterConfig(
@@ -165,7 +178,7 @@ async def test_fan_out_to_all_listeners() -> None:
                 f"{[l.n_received for l in fan.listeners]}"
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_holdoff_suppresses_repeat() -> None:
     async with MockTriggerListener() as listener:
         cfg = TriggerEmitterConfig(
@@ -188,7 +201,7 @@ async def test_holdoff_suppresses_repeat() -> None:
             assert emitter.emitted_total == 1
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_predicate_drops_sub_threshold() -> None:
     """Below-threshold candidates are dropped by the SnrThreshold
     condition; the EmitRecord carries predicate_pass=False + the
@@ -213,7 +226,7 @@ async def test_predicate_drops_sub_threshold() -> None:
             assert listener.n_received == 0
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_in_flight_tracker_evicts_on_completion() -> None:
     async with MockTriggerListener(
         config=MockListenerConfig(
@@ -245,7 +258,7 @@ async def test_in_flight_tracker_evicts_on_completion() -> None:
             assert emitter.in_flight_tracker.completed_ack_latency_ns_p50 is not None
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_halo_flagged_candidate_not_emitted() -> None:
     """Plan §4.4 line 1594: halo-dropped candidates are LOGGED but
     NOT emitted."""
@@ -270,7 +283,7 @@ async def test_halo_flagged_candidate_not_emitted() -> None:
             assert listener.n_received == 0
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_reconnect_on_listener_restart() -> None:
     """Kill one listener in the fan; verify the surviving listeners
     keep receiving packets and the dead one's conn flips to
@@ -343,7 +356,7 @@ async def test_reconnect_on_listener_restart() -> None:
             )
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_per_emit_record_callback_fires_for_all_candidates() -> None:
     """The on_emit_record callback fires for every Candidate (passed,
     dropped, halo-flagged) — that's the canonical ndjson sink."""
@@ -372,7 +385,7 @@ async def test_per_emit_record_callback_fires_for_all_candidates() -> None:
             assert collected[2].halo_dropped
 
 
-@pytest.mark.asyncio
+@asyncio_test
 async def test_rate_limit_caps_emit_rate() -> None:
     """Plan §8 line 2328: fire 100 triggers/s for 30 s, confirm only
     burst + rate × T are sent and the rest counted as
