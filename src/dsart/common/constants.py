@@ -166,6 +166,21 @@ Standard pulsar-astronomy value; matches scratch gen_dmtrials.py."""
 
 
 # ---------------------------------------------------------------------------
+# Vacuum speed of light (CODATA 2018; matches bfCorr's `CVAC` macro).
+# ---------------------------------------------------------------------------
+# Note: ``src/dsart/cal/cal_loader.py`` defines a local ``SPEED_OF_LIGHT_M_S``
+# with the same value (M3 chunk 1 / F21). The duplicate is harmless; both
+# paths are pinned to the same CODATA literal and the cal_loader copy is
+# scheduled to be migrated to import from here during M3 hardening. Added
+# in M3 chunk 3d (online injector) which needs it for the per-(ant, ch)
+# phasor table; importing from ``cal_loader`` would create a hard dep
+# from ``inject/`` on the cal layer.
+
+SPEED_OF_LIGHT_M_S: float = 299_792_458.0
+"""Vacuum speed of light in metres per second."""
+
+
+# ---------------------------------------------------------------------------
 # Geometry (plan §3.1 line ~446; M1 plan fix F10)
 # ---------------------------------------------------------------------------
 
