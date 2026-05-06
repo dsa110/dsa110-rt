@@ -295,6 +295,23 @@ python -m pytest tests/test_corr_fast_integration.py -q --tb=short \
   || fail "corr_fast_integration acceptance pytests failed"
 pass
 
+# --- chunk 8: transport loopback capture (TX/RX + chunk-4 Protocol plug-in) -
+# 16 acceptance tests covering: FastVisFrame codec (pack/unpack round-trip,
+# magic + CRC validation, oversize rejection, dtype-code round-trip), the
+# TransportTx semantics (one frame per (dm, t) tile, monotonic seq across
+# transmit() calls, sparse-COO + image-cube auto-detect — F26), the
+# TransportRx semantics (timeout returns None, magic + CRC validation),
+# loopback round-trip (100 cubes no loss, monotonic seq, no gaps), seq-gap
+# accounting on a manually-injected gap, and chunk-4 TransportTxStage
+# Protocol compliance (TransportTx wired into IntegrationContext.transport_tx,
+# process_block end-to-end, rfi_warming_up bit propagates to frame.flags
+# bit0). All tests use ephemeral 127.0.0.1 ports — no port contention with
+# sibling sub-agents per PARALLEL_AGENTS.md §4.5.
+STEP="chunk_8_transport_loopback_capture"
+python -m pytest tests/test_transport_loopback.py -q --tb=short \
+  || fail "transport loopback acceptance pytests failed"
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
@@ -309,11 +326,11 @@ CHUNKS_DONE=(
   "chunk_3d_online_injector"
   "chunk_4_corr_fast_integration"
   "chunk_7_16chgroup_alignment_preview"
+  "chunk_8_transport_loopback_capture"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_5_voltage_fixture_continuum"
   "chunk_6_voltage_fixture_burst_250924mptq"
-  "chunk_8_transport_loopback_capture"
   "chunk_9_dod_orchestrator_completion"
   "chunk_10_hardening"
 )
@@ -364,12 +381,12 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_3c_rfi_flagger",
     "chunk_3d_online_injector",
     "chunk_4_corr_fast_integration",
-    "chunk_7_16chgroup_alignment_preview"
+    "chunk_7_16chgroup_alignment_preview",
+    "chunk_8_transport_loopback_capture"
   ],
   "chunks_remaining": [
     "chunk_5_voltage_fixture_continuum",
     "chunk_6_voltage_fixture_burst_250924mptq",
-    "chunk_8_transport_loopback_capture",
     "chunk_9_dod_orchestrator_completion",
     "chunk_10_hardening"
   ]
