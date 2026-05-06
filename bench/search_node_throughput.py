@@ -319,29 +319,55 @@ async def _bench_main(args: argparse.Namespace) -> int:
 
     # ---- Drain the source, collecting stage timings ----
     records: List[StageTimingRecord] = []
+    skip_detector = bool(args.skip_detector)
+    if skip_detector:
+        _LOG.info(
+            "--skip-detector: bypassing Layer-1 norm + Detector.forward() "
+            "+ emitter dispatch; measuring build_cube alone."
+        )
     bench_start_ns = time.perf_counter_ns()
     try:
         async with src:
             async for slot in src:
                 t_dispatch_start = time.perf_counter_ns()
-                result = pipeline.process(slot)
-                emit_t0 = time.perf_counter_ns()
-                emitted = await emitter.process_candidates(
-                    slot.cube_id, result.candidates,
-                )
-                emit_t1 = time.perf_counter_ns()
-                rec = StageTimingRecord(
-                    cube_id=slot.cube_id,
-                    n_candidates=len(result.candidates),
-                    n_records=len(emitted),
-                    build_cube_ns=int(result.stage_timings_ns["build_cube"]),
-                    layer1_norm_ns=int(result.stage_timings_ns["layer1_norm"]),
-                    detector_forward_ns=int(
-                        result.stage_timings_ns["detector_forward"]
-                    ),
-                    emitter_dispatch_ns=int(emit_t1 - emit_t0),
-                    total_pipeline_ns=int(emit_t1 - t_dispatch_start),
-                )
+                if skip_detector:
+                    cube, validity_mask = pipeline._build_cube(slot)
+                    t_build_done = time.perf_counter_ns()
+                    rec = StageTimingRecord(
+                        cube_id=slot.cube_id,
+                        n_candidates=0,
+                        n_records=0,
+                        build_cube_ns=int(t_build_done - t_dispatch_start),
+                        layer1_norm_ns=0,
+                        detector_forward_ns=0,
+                        emitter_dispatch_ns=0,
+                        total_pipeline_ns=int(
+                            t_build_done - t_dispatch_start
+                        ),
+                    )
+                else:
+                    result = pipeline.process(slot)
+                    emit_t0 = time.perf_counter_ns()
+                    emitted = await emitter.process_candidates(
+                        slot.cube_id, result.candidates,
+                    )
+                    emit_t1 = time.perf_counter_ns()
+                    rec = StageTimingRecord(
+                        cube_id=slot.cube_id,
+                        n_candidates=len(result.candidates),
+                        n_records=len(emitted),
+                        build_cube_ns=int(
+                            result.stage_timings_ns["build_cube"]
+                        ),
+                        layer1_norm_ns=int(
+                            result.stage_timings_ns["layer1_norm"]
+                        ),
+                        detector_forward_ns=int(
+                            result.stage_timings_ns["detector_forward"]
+                        ),
+                        emitter_dispatch_ns=int(emit_t1 - emit_t0),
+                        total_pipeline_ns=int(emit_t1 - t_dispatch_start),
+                    )
                 records.append(rec)
                 if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
                     _LOG.info(
@@ -386,6 +412,7 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 "k_time": list(time_tokens),
                 "n_kernels": n_kernels_total,
             },
+            "skip_detector": skip_detector,
         },
         "wall_clock_s": bench_wall_s,
         "achieved_cubes_per_s": (
@@ -458,6 +485,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "'k_img=unit;k_dm=d1;k_time=*' to keep only the unit image "
              "kernel × d1 DM kernel × all 8 time kernels. Default: full "
              "128 triple bank. Used by Chunk 6c-β perf-vs-quality sweeps.",
+    )
+    parser.add_argument(
+        "--skip-detector", action="store_true",
+        help="Skip Layer-1 normalisation, Detector.forward(), and the "
+             "emitter dispatch. Only the combiner + 2D iFFT + edge mask "
+             "(build_cube) stage runs per cube. Used to measure the "
+             "imager-side upper-bound throughput in isolation; with the "
+             "detector skipped, GPU memory pressure disappears and the "
+             "bench can run at production geometry "
+             "(T_det=512, N_fdm=32, N_grid=256) on a 2080 Ti. "
+             "Chunk 6c follow-up.",
     )
     parser.add_argument(
         "--out", type=str,
