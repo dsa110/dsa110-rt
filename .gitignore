@@ -1,4 +1,5 @@
 work/
+scratch/
 *.pyc
 __pycache__/
 .venv/
