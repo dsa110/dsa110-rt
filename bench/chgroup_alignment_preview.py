@@ -318,8 +318,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="observing dec for the F21 cal phase (default: 53.85 ~ burst-test source)")
     p.add_argument("--chgroups", type=int, default=N_CHGROUP,
                    help=f"number of chgroups to test (default: {N_CHGROUP})")
-    p.add_argument("--device", default="cpu",
-                   help="auto / cuda / cpu (default: cpu — bench is small enough)")
+    p.add_argument("--device", default="auto",
+                   help="auto / cuda / cpu (default: auto — cuda when available; "
+                        "16-chgroup CPU run takes ~20 min, GPU ~30 s)")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = p.parse_args(argv)
@@ -329,7 +330,11 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    device = torch.device(args.device)
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    LOG.info("device = %s", device)
     if args.report_dir is None:
         utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         args.report_dir = (

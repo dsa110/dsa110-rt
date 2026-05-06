@@ -7,6 +7,14 @@ native-sample window. This is what makes the production stage-2
 ``time_shift_corr_stage2`` (chunk 9) need only to compensate for
 band-dependent geometric / dispersion residuals — the bulk-block
 alignment is already correct.
+
+The heavy multi-chgroup tests are GPU-gated (skipped on CPU because
+the chunk-4 fast-corr GEMM at the production block size = 2048
+packets × 96 ants × 384 chans takes ~90 s / chgroup on CPU; on GPU
+the same correlation completes in ~50 ms). On h01 the dsa110-rt
+env always has CUDA; on h23 / CI without GPU the heavy tests skip
+cleanly. The arithmetic / synth-byte / single-chgroup-tile-shape
+tests are lightweight and run unconditionally.
 """
 
 from __future__ import annotations
@@ -33,6 +41,18 @@ from dsart.common.constants import (                                     # noqa:
 from dsart.services.slow_corr_kernel import (                            # noqa: E402
     NPACKETS_PER_BLOCK,
     NTIMES_PER_PACKET,
+)
+
+
+def _pick_test_device() -> torch.device:
+    """GPU when available; else CPU."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+_NEEDS_GPU = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="multi-chgroup chunk-4 pipeline GEMMs are too slow on CPU "
+           "(~90 s / chgroup); skipping until run on h01 GPU",
 )
 
 
@@ -111,6 +131,7 @@ def test_expected_fast_vis_tile_arithmetic(
 # ---------------------------------------------------------------------------
 
 
+@_NEEDS_GPU
 def test_run_one_chgroup_returns_tile_power_with_correct_shape() -> None:
     impulse_pkt = 1000
     t_int = 8
@@ -118,7 +139,7 @@ def test_run_one_chgroup_returns_tile_power_with_correct_shape() -> None:
     vis_power = _run_one_chgroup(
         chgroup=0, raw=raw,
         n_grid=32, t_int_fast_native=t_int, obs_dec_deg=53.85,
-        device=torch.device("cpu"),
+        device=_pick_test_device(),
     )
     expected_n_fv = (NPACKETS_PER_BLOCK * NTIMES_PER_PACKET) // t_int
     assert vis_power.shape == (expected_n_fv,)
@@ -126,6 +147,7 @@ def test_run_one_chgroup_returns_tile_power_with_correct_shape() -> None:
     assert torch.all(vis_power >= 0)
 
 
+@_NEEDS_GPU
 def test_run_one_chgroup_peak_at_expected_tile_for_chgroup_0() -> None:
     """Single-chgroup baseline: the impulse should peak at the tile
     containing the impulse packet for the simplest case (chgroup 0).
@@ -136,7 +158,7 @@ def test_run_one_chgroup_peak_at_expected_tile_for_chgroup_0() -> None:
     vis_power = _run_one_chgroup(
         chgroup=0, raw=raw,
         n_grid=32, t_int_fast_native=t_int, obs_dec_deg=53.85,
-        device=torch.device("cpu"),
+        device=_pick_test_device(),
     )
     expected_tile = _expected_fast_vis_tile(impulse_pkt, t_int)
     peak_tile = int(torch.argmax(vis_power).item())
@@ -152,6 +174,7 @@ def test_run_one_chgroup_peak_at_expected_tile_for_chgroup_0() -> None:
 # ---------------------------------------------------------------------------
 
 
+@_NEEDS_GPU
 def test_16chgroups_all_peak_at_same_tile() -> None:
     """The headline chunk-7 pin: when we feed the SAME synthetic
     impulse-block to all 16 chgroups, the per-chgroup peak fast-vis
@@ -159,20 +182,21 @@ def test_16chgroups_all_peak_at_same_tile() -> None:
     chgroups. This proves the per-block intra-cube alignment that
     chunk 9's stage-2 alignment can rely on.
 
-    Uses a small grid (n_grid=16) and full-block tile (t_int=4096) for
-    speed; the alignment property is independent of either knob.
+    Uses a small grid (n_grid=16) for speed; the alignment property
+    is independent of n_grid.
     """
     impulse_pkt = 800
     t_int = 8                                                             # cadence-1; ensures we have many tiles
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
     expected_tile = _expected_fast_vis_tile(impulse_pkt, t_int)
 
+    device = _pick_test_device()
     peak_tiles: list[int] = []
     for chg in range(N_CHGROUP):
         vis_power = _run_one_chgroup(
             chgroup=chg, raw=raw,
             n_grid=16, t_int_fast_native=t_int, obs_dec_deg=53.85,
-            device=torch.device("cpu"),
+            device=device,
         )
         peak_tiles.append(int(torch.argmax(vis_power).item()))
 
@@ -189,6 +213,7 @@ def test_16chgroups_all_peak_at_same_tile() -> None:
     )
 
 
+@_NEEDS_GPU
 def test_16chgroups_peak_tile_invariant_under_t_int_change() -> None:
     """The alignment property holds at multiple cadences. Test at the
     burst-test 4× cadence (t_int_fast_native=32) too.
@@ -198,13 +223,14 @@ def test_16chgroups_peak_tile_invariant_under_t_int_change() -> None:
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
     expected_tile = _expected_fast_vis_tile(impulse_pkt, t_int)
 
+    device = _pick_test_device()
     # Sample every 4th chgroup for speed (still validates the property).
     peak_tiles: list[int] = []
     for chg in (0, 4, 8, 12, 15):
         vis_power = _run_one_chgroup(
             chgroup=chg, raw=raw,
             n_grid=16, t_int_fast_native=t_int, obs_dec_deg=53.85,
-            device=torch.device("cpu"),
+            device=device,
         )
         peak_tiles.append(int(torch.argmax(vis_power).item()))
 
@@ -216,6 +242,7 @@ def test_16chgroups_peak_tile_invariant_under_t_int_change() -> None:
     )
 
 
+@_NEEDS_GPU
 def test_chgroup_0_and_15_peak_within_1_tile() -> None:
     """Targeted edge-case test: chgroup 0 (lowest band) and chgroup 15
     (highest band) — the largest possible band-dependent delay
@@ -226,15 +253,16 @@ def test_chgroup_0_and_15_peak_within_1_tile() -> None:
     t_int = 8
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
 
+    device = _pick_test_device()
     p0 = _run_one_chgroup(
         chgroup=0, raw=raw,
         n_grid=16, t_int_fast_native=t_int, obs_dec_deg=53.85,
-        device=torch.device("cpu"),
+        device=device,
     )
     p15 = _run_one_chgroup(
         chgroup=15, raw=raw,
         n_grid=16, t_int_fast_native=t_int, obs_dec_deg=53.85,
-        device=torch.device("cpu"),
+        device=device,
     )
 
     pt0 = int(torch.argmax(p0).item())
