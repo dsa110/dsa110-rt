@@ -169,6 +169,22 @@ python -m pytest tests/test_fast_corr_kernel.py -q --tb=short \
   || fail "FastCorrKernel acceptance pytests failed"
 pass
 
+# --- chunk 2b: corr_fast_compute service shell -----------------------------
+# 8 smoke tests for the production compute_block() spine that wires together
+# unpack_int4_split (M2) → load_cal_with_dec_phase (chunk 1) → FastCorrKernel
+# (chunk 2a) → Stokes-I sum. Tests cover (a) shape/dtype contract for the
+# default no-cal full-block tile, (b) parameterised t_int_fast_native sweep
+# across 8/16/32/4096 packets per tile, (c) the cal-zero ⇒ outrigger-baseline
+# zero contract using the real h01 cal blob, (d) device pinning propagation,
+# and (e) zero-voltage handling. Wall time ~12 min on CPU, dominated by the
+# four full-block correlations in (b). The bulk of cal-loader / kernel
+# correctness is already pinned by chunks 1 / 2a above; this chunk just
+# verifies the wiring.
+STEP="chunk_2b_corr_fast_compute_service_shell"
+python -m pytest tests/test_corr_fast_compute_pipeline.py -q --tb=short \
+  || fail "corr_fast_compute service-shell smoke tests failed"
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
@@ -176,9 +192,9 @@ pass
 CHUNKS_DONE=(
   "chunk_1_cal_apply_with_F21_dec_phase"
   "chunk_2a_fast_corr_kernel"
+  "chunk_2b_corr_fast_compute_service_shell"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
-  "chunk_2b_corr_fast_compute_service_shell"
   "chunk_3a_gridder_sparsity_pattern"
   "chunk_3b_coarse_dm_static_sky"
   "chunk_3c_rfi_flagger"
@@ -231,10 +247,10 @@ cat > "${M3_STATUS_JSON}" <<JSON
   },
   "chunks_done": [
     "chunk_1_cal_apply_with_F21_dec_phase",
-    "chunk_2a_fast_corr_kernel"
+    "chunk_2a_fast_corr_kernel",
+    "chunk_2b_corr_fast_compute_service_shell"
   ],
   "chunks_remaining": [
-    "chunk_2b_corr_fast_compute_service_shell",
     "chunk_3a_gridder_sparsity_pattern",
     "chunk_3b_coarse_dm_static_sky",
     "chunk_3c_rfi_flagger",
