@@ -1,0 +1,71 @@
+# M5 plan-fix checklist
+
+Captured at the start of M5 (2026-05-05) from a single-agent reading of the
+binding context (in this exact order):
+
+  1. `dsa110-rt_revamp_7b1d2669.plan.md` §8.M2-carryover (lines 2198-2261) —
+     locked decisions D1-D18 and implementation gotchas F1-F20 inherited
+     from M2. Of these, F18 (PyTorch row-major vs cuBLAS column-major
+     gather) and F20 (`np.fft.ifft2` (u, v) negation for TMS-canonical
+     (l, m) axes) bind any internal imager M5 builds.
+  2. `dsa110-rt_revamp_7b1d2669.plan.md` §8 M5 (lines 2312-2341) — the M5
+     milestone scope: search_compute service, cube_injection detector
+     unit-test injector, and the four DoD benches (search_node_throughput,
+     noise_norm_calibration, trigger_emitter_wiring, cube_injection_detector,
+     voltage_fixture_search).
+  3. `dsa110-rt/PARALLEL_AGENTS.md` — branch / file-ownership / h01-test-
+     isolation conventions for M3 ∥ M5 parallel development.
+
+These are inconsistencies / typos / under-specifications in the plan that the
+M5 author resolves in code via locked decisions (see "Locked decisions"
+below). All plan edits are **deferred to the M5 hardening pass at the end**
+(final chunk) so the M5 critical path is not blocked by sequential
+plan-edit + scp + relock cycles. This file is retired during M5 hardening
+once F-items + D-items have been folded into plan.md.
+
+The list below is the **starting scaffold**; it grows as M5 chunks land
+(parallel-explore subagents surface additional F-items at chunk boundaries,
+exactly the M2 pattern documented in `M2_PLAN_FIXES.md` provenance).
+
+---
+
+## Locked decisions (apply at chunk-author time)
+
+| ID | Topic | Decision | Source |
+|----|-------|----------|--------|
+| D1 | Cube-injection scope (plan §8 line 2329) | `bench/cube_injection_detector.py` operates entirely on post-imaging `[T_det, N_fine_DM, N_grid, N_grid] float32` cubes synthesised by `src/dsart/inject/cube_injection.py`; bypasses every upstream stage (no corr, no transport, no RX ring, no fine-DM combiner, no imager). The cube is the **real-valued dirty image** the imager would have produced, not a complex visibility tensor. This decouples M5 detector dev from M3 / M4a entirely until the voltage-fixture gate runs. | Plan §8 line 2329 explicit text "develops the detector independently of every upstream stage". |
+| D2 | Detector kernel-bank shape | 4 image kernels × 4 DM kernels × 8 time kernels = **128 kernel triples** at default. Image: `("unit", "psf", "psf_shift_lm", "psf_shift_l")` per `DETECTOR_IMAGE_KERNELS`. DM: `("d1","d3","d5","d7")` per `DETECTOR_DM_KERNELS`. Time: `("b1","b2","b4","b8","b16","b32","b64","b128")` per `DETECTOR_TIME_KERNELS`. Kernel id schema `"k_img:k_dm:k_time"` already enforced by `Candidate._check_kernel_id` (M1 contracts.py). | `configs/config_compute_search.yaml::detector` + `src/dsart/common/constants.py` already pin this. M5 must not re-pin in code; consume the constants. |
+| D3 | h01 test-isolation envelope | `DSART_BUFFER_KEY_PREFIX=m5` (so `fada → fa5a`, `bada → ba5a`, `dada → da5a`); `CUDA_VISIBLE_DEVICES=1`; `DSART_ETCD_NAMESPACE_PREFIX=m5`; per-milestone lockfile `/var/lock/dsart-m5.lock`; status JSON at `~/dsart-m5-status.json`; bench reports under `bench/reports/<UTC>/<run_id>/M5/`; operator-approval marker at `bench/reports/M5/m_operator_approved.yaml`. All wired into `tools/dod/M5.sh`. | `PARALLEL_AGENTS.md` §4 (4.1 buffer keys, 4.2 GPU, 4.3 reports, 4.4 lockfile, 4.6 etcd namespace). |
+| D4 | M5 voltage-fixture gate fixture | `/home/ubuntu/data/voltages/250924mptq/` — burst, DM ≈ 404.7 pc cm⁻³, RA = 307.78°, Dec = 53.85°, MJD ≈ 60942.172, SNR ≈ 30. Same fixture M3 uses for its burst sub-DoDs (line 2286 / 2291). M5 consumes the M3-emitted captured transport-TX `.npz` set; the gate is the **only** M3 → M5 coupling point. | `PARALLEL_AGENTS.md` §1 + §5; user briefing step 5. |
+| D5 | M5 viz helpers location | `tools/viz/common.py` is owned by M3 (M2 hardening retired); M5 puts new viz helpers in `tools/viz/search_helpers.py` (new file). `tools/viz/search_detector_check.py` is the M5-owned operator-facing CLI (mirrors `corr_imager_dedisperser_check.py`'s shape; consumes the M5 cube + emitted candidates + injection log). Edits to `tools/viz/common.py` from M5 only via PR ack'd by M3. | `PARALLEL_AGENTS.md` §3 Class C `tools/viz/common.py`. |
+| D6 | Internal imager `(l, m)` sign convention | If M5 ever spins up its own internal imager helper (the production `imager.py` consumes a pre-gridded sparse tensor from M3, but `cube_injection.py` may need to compute predicted `(l, m)` for an injection at known sky coords for the voltage-fixture gate), it inherits the F20 convention from M2 carryover: negate `(u, v)` once at the table-build site so `np.fft.ifft2` (positive-exponent iFFT) lands TMS-canonical `(+l, +m)` axis labels. Document with `# F20` comment. | M2 carryover §3.6.5 / `tools/viz/common.py::grid_uv_natural`; plan §8.M2-carryover line 2228. |
+| D7 | Operator-approval marker scheme | Reuse M2's D11 scheme verbatim. Marker file at `bench/reports/M5/m_operator_approved.yaml` with fields `{operator, approval_utc_iso, milestone: M5, voltage_run_id, viz_artifact_sha256}`. M5 has TWO operator gates per plan §8 lines 2329 + 2339: cube-injection detector inspection (no fixture; the synthetic-injection heatmap) and voltage-fixture search (real burst). Convention: a single marker yaml covers both, with `voltage_run_id="cube_injection"` for the synthetic gate and `voltage_run_id="<burst_run_id>"` for the fixture gate. The M5.sh stamp logic mirrors M2.sh (`complete (needs operator approval)` → `complete (approved)` → `complete (hardened)`). | `PARALLEL_AGENTS.md` §4.3 + M2 D11 carryover. |
+| D8 | Cube-injection synthetic noise convention | Cube tensor dtype is **float32 real-valued** (the post-imager dirty image); thermal-noise background is iid Gaussian with σ = 1 per cell (so SNR readouts are direct: pixel value / 1.0); injection amplitudes are then injected at the requested SNR directly. The cube does NOT carry a complex visibility — that's the imager's input, not its output. Pin in `inject/cube_injection.py` docstring; record here so the noise-norm bench's analytic FAR `0.5 · erfc(θ/√2)` directly applies cell-for-cell at the cube level. | Plan §8 line 2329 declares the cube shape as `[T_det, N_fine_DM, N_grid, N_grid] float32` (real); the σ=1 normalization is the natural choice for a "develops independently" path. |
+| D9 | MockTriggerListener port | `127.0.0.1:11227` per plan §8 line 2328 (trigger_emitter_wiring bench). The cube_injection_detector bench (plan §8 line 2329) implicitly uses the same listener; pin one port for both benches. | Plan §8 lines 2328-2329 cross-reference. |
+
+---
+
+## Plan-fix items (apply during M5 hardening)
+
+| ID | Section | Fix | Source |
+|----|---------|-----|--------|
+| F1 | §8 line 2315 | Plan refers to `tools/build_injection_library.py` schema for cube-injection config field overlap, but the schema itself is not pinned in §3 / §3.1 (the contracts section). Cube-injection config dataclass needs a frozen contract analogous to `Candidate` — fields `(l, m, fine_dm_idx, t_in_cube, snr, profile, width_samples)` plus a serialiser to/from a yaml/npz library. M5 chunks pin the dataclass in `src/dsart/inject/cube_injection.py` and document the schema; plan §3.1 / §3 should grow a `CubeInjectionConfig` contract entry during hardening. | Author from plan §8 line 2315 + `tools/build_injection_library.py` reference. |
+| F2 | §8 line 2329 | Plan declares the cube as `[T_det, N_fine_DM, N_grid, N_grid] float32` but does not say it's real-valued (it IS — the cube is the post-imager dirty image, not a complex visibility tensor). D8 above pins `float32 real, σ=1 thermal noise per cell`; plan §8 line 2329 should add a parenthetical "real-valued; σ=1 per cell after Layer-1 normalization" to remove the ambiguity. | Implementation-time clarity; downstream consumers (`Detector.forward` Protocol) need to know the input is real to size their fp16 accumulators correctly. |
+| F3 | §8 line 2329 | Plan's cube_injection FAR check ("FAR on the noise-only background within [0.5×, 2.0×] of analytic at θ=8") does not pin **N_eff** (effective number of independent cells per cube) for the analytic Gaussian-tail formula. For a cube of `T_det × N_fine_DM × N_grid × N_grid` cells under a kernel triple of `(K_img, K_dm, K_time)` boxcar volume, `N_eff_per_cube_per_kernel ≈ (T_det × N_fine_DM × N_grid² ) / (K_img · K_dm · K_time)` summed over the 128 triples gives the per-cube expected count at threshold θ. Pin this formula in `noise_norm/` docstrings + the FAR-check helper; plan should add it as a footnote during hardening. | Implementation derivation; needed for both `bench/noise_norm_calibration.py` and the cube_injection_detector bench's FAR sub-check. |
+| F4 | §8 lines 2316-2329 | Plan lists 4 DoD benches but does not say which are mandatory for M5 closure when M3 / M4a are not yet done. Per `PARALLEL_AGENTS.md` §1, only `voltage_fixture_search.py` (line 2330) depends on M3. The other three benches plus the new `cube_injection_detector.py` (the user-flagged primary detector correctness gate per the briefing's step 5 + plan §8 line 2329 explicit "develops the detector independently of every upstream stage") are M5-internal and run h01 alone. Resolution: M5 can land all four non-fixture benches before M3 / M4a finish; M5 closure waits on the voltage-fixture gate operator sign-off. M5.sh's status JSON tracks `chunks_complete / total_chunks` so M3 / Ops can see the partial-progress state. | Briefing step 5 + plan §8 line 2329 explicit independence claim + `PARALLEL_AGENTS.md` §1. |
+| F5 | §8 line 2329 | Plan says `MockTriggerListener` on `127.0.0.1` for cube_injection_detector but does not pin the port (the trigger_emitter_wiring bench at line 2328 uses `127.0.0.1:11227`). Resolution: same listener, same port for both benches (D9 above). Plan should pin `127.0.0.1:11227` at line 2329 during hardening. | Cross-reference between lines 2328 + 2329. |
+| F6 | §8 line 2330 | Voltage-fixture gate requires the M3 captured transport-TX `.npz` set. The `.npz` contract (per-`chgroup` filename scheme, dtype, axis order, manifest fields) is implicit in plan §8 line 2291 ("16 captured transport-TX `.npz` files") but not pinned. M3's `bench/voltage_fixture_fast_corr_burst.py` will produce them; M5's consumer reads them. The `.npz` schema is a Class B integration contract between M3 and M5. Resolution: M3 publishes the schema in `M3_PLAN_FIXES.md` (or a new `src/dsart/transport/captured_npz.py` helper); M5 imports the helper read-only. Pin in plan §8 lines 2291 + 2330 cross-reference during hardening. | M3 ↔ M5 coupling point identified in `PARALLEL_AGENTS.md` §1. |
+
+---
+
+## Provenance
+
+- **M5 author** (2026-05-05) — initial scaffold from a single-agent reading of plan §8.M2-carryover + §8 M5 + `PARALLEL_AGENTS.md`. No parallel-subagent fan-out yet (M2's pattern was to fan out at the start of each chunk; M5 follows the same pattern as chunks land).
+- Items will be added by the chunk-author or by parallel-explore subagents during chunk authoring; M2's pattern was 4 subagents at M2 kickoff producing F1-F13 and 7 more F-items + 5 D-items accumulating across chunks 1-7 + the 2026-05-04/05 user pivots (D14, D17, D18). M5 will follow the same accumulation pattern.
+
+This file is committed at the start of M5 and consumed by the final M5
+hardening chunk. It is deleted after the plan is patched and re-locked —
+its job is to prevent the F-fixes from being lost between chunks. After
+deletion, `tools/dod/M5.sh::status_emit` flips
+`plan_fixes_tracker_present` to `false` and rolls the stage label from
+`complete (approved)` to `complete (hardened)`.
