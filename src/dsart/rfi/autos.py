@@ -107,13 +107,30 @@ def _check_voltage_layout(
             f"real must be 5-dim (NCHAN, 2t, NPOL, NPACKETS, NANTS); "
             f"got shape {tuple(real.shape)}"
         )
-    expected = (
-        NCHAN_PER_CHGROUP, n_times_per_packet, NPOL, n_packets, NANTS,
-    )
-    if tuple(real.shape) != expected:
+    n_ch, n_t_per_pkt, n_pol, n_pkts, n_ant = real.shape
+    # Pin the time / pol axes (these are fixed by SNAP firmware + downstream
+    # Stokes-I sums); leave NCHAN / NANTS unconstrained so synthetic tests
+    # can pass smaller cubes (production callers always feed
+    # NCHAN_PER_CHGROUP=384 + NANTS=96).
+    if n_t_per_pkt != n_times_per_packet:
         raise ValueError(
-            f"real shape {tuple(real.shape)} != expected {expected} "
-            "(GEMM layout from unpack_int4_split)"
+            f"real shape {tuple(real.shape)}: NTIMES_PER_PACKET axis "
+            f"must be {n_times_per_packet}, got {n_t_per_pkt}"
+        )
+    if n_pol != NPOL:
+        raise ValueError(
+            f"real shape {tuple(real.shape)}: NPOL axis must be "
+            f"{NPOL}, got {n_pol}"
+        )
+    if n_pkts != n_packets:
+        raise ValueError(
+            f"real shape {tuple(real.shape)}: NPACKETS axis must be "
+            f"{n_packets}, got {n_pkts}"
+        )
+    if n_ch <= 0 or n_ant <= 0:
+        raise ValueError(
+            f"real shape {tuple(real.shape)}: NCHAN / NANTS axes must "
+            f"be positive, got NCHAN={n_ch}, NANTS={n_ant}"
         )
     if real.dtype != imag.dtype:
         raise TypeError(
@@ -192,8 +209,9 @@ def compute_autos(
     #   2t) pair flattens into the natural ``t_native = pkt*2 + t_sub``
     #   ordering. This is the in-cube time order; required so each
     #   M-chunk corresponds to a contiguous time interval.
+    n_ch_in, _, _, _, n_ant_in = real.shape
     pwr = pwr.permute(4, 0, 2, 3, 1).contiguous()  # (NANTS, NCHAN, NPOL, NPACKETS, 2t)
-    pwr_flat = pwr.reshape(NANTS, NCHAN_PER_CHGROUP, NPOL, total_t)
+    pwr_flat = pwr.reshape(n_ant_in, n_ch_in, NPOL, total_t)
     del pwr
 
     # |E|⁴ = (|E|²)² — separate buffer so we can sum independently.
@@ -204,10 +222,10 @@ def compute_autos(
     for m in m_values:
         n_acc = total_t // m
         s1_m = pwr_flat.reshape(
-            NANTS, NCHAN_PER_CHGROUP, NPOL, n_acc, m,
+            n_ant_in, n_ch_in, NPOL, n_acc, m,
         ).sum(dim=-1)  # (NANTS, NCHAN, NPOL, n_acc) fp32
         s2_m = pwr2_flat.reshape(
-            NANTS, NCHAN_PER_CHGROUP, NPOL, n_acc, m,
+            n_ant_in, n_ch_in, NPOL, n_acc, m,
         ).sum(dim=-1)
         # Move N_acc to the leading axis for downstream consumers
         # (SK iterates per-accumulation along leading dim).

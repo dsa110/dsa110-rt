@@ -185,6 +185,51 @@ python -m pytest tests/test_corr_fast_compute_pipeline.py -q --tb=short \
   || fail "corr_fast_compute service-shell smoke tests failed"
 pass
 
+# --- chunk 3a: sparsity pattern + fast-vis gridder -------------------------
+# 31 acceptance tests across two suites:
+# - tests/test_sparsity_pattern.py (20): SparsityPattern dataclass shape/
+#   dtype + DEC quantisation + pattern_id sensitivity to all five inputs +
+#   F20 (u,v) negation pinned against tools/viz/common.grid_uv_natural +
+#   build_pattern input validation + frozen-dataclass smoke + h01-only
+#   n_filled fill-fraction band check.
+# - tests/test_fast_vis_gridder.py (11): output shape/dtype + cell-weights
+#   constancy + parity vs grid_uv_natural single + multi-channel + zero-vis
+#   trivial + autos / outriggers excluded + linearity in vis + construction
+#   validation. Pillbox K=1; K>1 deferred to chunk 10 hardening.
+STEP="chunk_3a_gridder_sparsity_pattern"
+python -m pytest tests/test_sparsity_pattern.py tests/test_fast_vis_gridder.py \
+  -q --tb=short \
+  || fail "gridder + sparsity-pattern acceptance pytests failed"
+pass
+
+# --- chunk 3c: RFI flagger -------------------------------------------------
+# 18 acceptance tests covering: autos accumulator (S1 / S2 at M ∈ {64, 256,
+# 1024, 4096}) + GEMM-layout vs complex-layout parity + SK threshold
+# monotonicity + SK FAR on thermal noise (with per-M Gaussian-approx
+# tolerance, see M3_PLAN_FIXES.md F23) + SK CW detection + bandpass-outlier
+# narrowband CW + group-outlier dead-antenna + SumThreshold dilation /
+# isolated / all-zero / + flagants.dat round-trip + invalid input rejects
+# + RFIFlagger combine OR-logic on orthogonal scenarios + warmup state
+# machine + one-shot flag_block + source-tag-bit disjointness.
+STEP="chunk_3c_rfi_flagger"
+python -m pytest tests/test_rfi_flagger.py -q --tb=short \
+  || fail "RFI flagger acceptance pytests failed"
+pass
+
+# --- chunk 3d: voltage-domain online injector ------------------------------
+# 19 acceptance tests covering: phasor-table unit-modulus + phase-formula
+# (F22 sign convention) + cold-plasma dispersion delay table vs analytic +
+# Gaussian / boxcar profile-vector normalisation + apply_block no-op /
+# active / boundary / outside-window / purge-far-past + F22 visibility-phase
+# pin + etcd JSON round-trip (round-trip / bad-payload reject) +
+# MockEtcdWatcher routes inject + drops non-inject + handles malformed +
+# DSART_ETCD_NAMESPACE_PREFIX honoured + GPU smoke (skipped on CPU-only
+# runners).
+STEP="chunk_3d_online_injector"
+python -m pytest tests/test_online_injector.py -q --tb=short \
+  || fail "online injector acceptance pytests failed"
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
@@ -193,12 +238,12 @@ CHUNKS_DONE=(
   "chunk_1_cal_apply_with_F21_dec_phase"
   "chunk_2a_fast_corr_kernel"
   "chunk_2b_corr_fast_compute_service_shell"
-)
-CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_3a_gridder_sparsity_pattern"
-  "chunk_3b_coarse_dm_static_sky"
   "chunk_3c_rfi_flagger"
   "chunk_3d_online_injector"
+)
+CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
+  "chunk_3b_coarse_dm_static_sky"
   "chunk_4_corr_fast_integration"
   "chunk_5_voltage_fixture_continuum"
   "chunk_6_voltage_fixture_burst_250924mptq"
@@ -248,13 +293,13 @@ cat > "${M3_STATUS_JSON}" <<JSON
   "chunks_done": [
     "chunk_1_cal_apply_with_F21_dec_phase",
     "chunk_2a_fast_corr_kernel",
-    "chunk_2b_corr_fast_compute_service_shell"
+    "chunk_2b_corr_fast_compute_service_shell",
+    "chunk_3a_gridder_sparsity_pattern",
+    "chunk_3c_rfi_flagger",
+    "chunk_3d_online_injector"
   ],
   "chunks_remaining": [
-    "chunk_3a_gridder_sparsity_pattern",
     "chunk_3b_coarse_dm_static_sky",
-    "chunk_3c_rfi_flagger",
-    "chunk_3d_online_injector",
     "chunk_4_corr_fast_integration",
     "chunk_5_voltage_fixture_continuum",
     "chunk_6_voltage_fixture_burst_250924mptq",

@@ -110,6 +110,49 @@ right phase sign for free because the cal weight pre-multiplies E_i.
     (`atol=1e-6` in fp32; `atol=2e-3` in fp16) — pinned by reading
     `dsaX_bfCorr.cu::populate_weights_matrix` byte-equivalent.
 
+### F22 — voltage-injector sign convention pinned to F18
+
+**Status**: IMPLEMENTED in chunk 3d (`tests/test_online_injector.py
+::test_F22_visibility_phase_matches_lm_target`, 2026-05-06). Lives in
+`src/dsart/inject/online.py`. The chunk-3d brief stated a `−sign`
+per-antenna phasor; the implementation uses `+sign` so that
+`conj(E_lower) · E_higher` (F18 / V_ab convention) lands at the
+`+2π i ν (b · ŝ) / c` phase that the F21 acceptance suite already
+pinned. Plan §4.2 step 5 (online injection) inherits this convention;
+the M3 hardening pass will replace the briefing's `−sign` sentence
+with a forward reference to F18 + the F22 acceptance test.
+
+### F23 — exact Nita-Gary chi-squared SK thresholds (deferred)
+
+**Status**: PENDING (M3 hardening / chunk 10). Filed during chunk 3c
+landing: `src/dsart/rfi/sk.py::sk_thresholds` uses the Gaussian
+asymptotic SK distribution (`SK ~ N(1, 4·(M-1)/((M+2)·(M+3)))`).
+Empirically (`tests/test_rfi_flagger.py::test_sk_thermal_noise_far`),
+this under-estimates the upper-tail mass at the lowest accumulation
+depth `M = 64` by ~20× — measured FAR ≈ 4e-3 vs nominal 1e-4 target
+on 524k thermal-noise cells.
+
+Production safety: the SK detector is one of four flag inputs (SK |
+bandpass-outlier | group-outlier | sum-threshold | flagants-OR);
+the OR-fold is the bound that matters in practice and the per-M FAR
+inflation manifests as a slightly higher false-flag rate at M=64,
+not a missed-detection. The `RFIFlagger` warmup state machine + the
+chunk-4 `corr_fast_compute` integration both surface the per-M flag
+counts in the transport-header `flags` byte; an operator can set
+`DEFAULT_M_VALUES = (256, 1024, 4096)` (drop M=64) at config-load
+time to avoid the leak entirely if it becomes a problem in practice.
+
+**Fix during hardening**:
+- Replace the Gaussian asymptotic `sk_thresholds` with Equation 14
+  of Nita & Gary 2010 (MNRAS 406, L60) — moment-matched chi-squared
+  with two-tailed Pearson III bounds.
+- Tighten `test_sk_thermal_noise_far` to 2× FAR across all M
+  (currently uses per-M tolerance multipliers `{64: 50×, 256: 10×,
+  1024: 5×, 4096: 5×}` set in `per_m_tol_x_far`).
+- Add a `bench/sk_threshold_calibration.py` Monte Carlo run to
+  validate the Pearson III bounds against the asymptotic Gaussian
+  on 1e8 thermal-noise samples per M.
+
 ---
 
 ## D-items (decisions — locked during M3 implementation)
