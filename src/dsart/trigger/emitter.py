@@ -657,7 +657,9 @@ class TriggerEmitter:
           - direct write/drain failure (peer reset, broken pipe);
           - receiver task observed EOF and called ``_mark_disconnected``
             while we were blocked on ``tx_queue.get()`` (writer goes
-            None under our feet).
+            None under our feet, and the receiver pushed a `None`
+            sentinel into the queue to wake us so we can reconnect
+            even when no new packet is being emitted).
         In either case we rebuild the connection on the next iteration
         with exponential backoff and drop the in-flight packet (per
         plan §4.4: fail-during-disconnect → drop on this conn only)."""
@@ -672,9 +674,9 @@ class TriggerEmitter:
                     return
                 wire = await conn.tx_queue.get()
                 # Re-check after the await — receiver may have flipped
-                # us to disconnected while we were blocked.
-                if conn.writer is None:
-                    # Drop this packet; loop back to reconnect.
+                # us to disconnected while we were blocked, and dropped
+                # a None sentinel in the queue to kick us awake.
+                if wire is None or conn.writer is None:
                     continue
                 try:
                     conn.writer.write(wire)
@@ -756,6 +758,13 @@ class TriggerEmitter:
                 await conn.writer.wait_closed()
         conn.writer = None
         conn.reader = None
+        # Wake the sender so it can re-enter _connect_with_backoff
+        # even when no fresh packet is being emitted on this conn.
+        # Best-effort: if the queue is full the sender will eventually
+        # drain a real packet, see writer is None, and reconnect.
+        if conn.tx_queue is not None:
+            with contextlib.suppress(asyncio.QueueFull):
+                conn.tx_queue.put_nowait(None)
 
 
 @dataclass(slots=True)
