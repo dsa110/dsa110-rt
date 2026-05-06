@@ -230,7 +230,7 @@ The chunk-9 §8.M3 line gates only on the bench producing this
 </body>
 </html>
 """
-    (report_dir / "report.html").write_text(html)
+    (report_dir / "report.html").write_text(html, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

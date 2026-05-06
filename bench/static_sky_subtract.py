@@ -282,7 +282,7 @@ deterministic continuum-only stream over ≥ ``5/α`` blocks.</p>
 </body>
 </html>
 """
-    (report_dir / "report.html").write_text(html)
+    (report_dir / "report.html").write_text(html, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
