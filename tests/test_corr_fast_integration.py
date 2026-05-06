@@ -285,15 +285,34 @@ def test_process_block_static_sky_disabled_passes_grid_through() -> None:
 
 
 def test_process_block_with_rfi_enabled_returns_flag_result() -> None:
+    """Verify RFI wiring: flagger fires, returns shape-correct result,
+    warmup bit set on cube 1.
+
+    NOTE: we deliberately do not assert a small FAR here — the
+    synthetic raw is ``randint(0, 256)`` int4 fluff (uniform
+    distribution), not Gaussian, so the SK detector legitimately
+    flags everything. The FAR-on-thermal-noise contract is pinned
+    by ``tests/test_rfi_flagger.py::test_sk_thermal_noise_far`` (M3
+    chunk 3c, F23). This test only validates the orchestrator's
+    RFI-stage wiring + the flag_fraction_total field is populated.
+    """
     cfg = _make_cfg(rfi_enabled=True, static_sky_disabled=True)
     ctx = _build_test_context(cfg)
     raw = _synthetic_fada_block()
     out = process_block(raw, ctx=ctx, block_n=1)
     assert isinstance(out.rfi, FlagBlockResult)
     assert out.rfi.mask.shape == (NANTS, NCHAN_PER_CHGROUP, NPOL)
+    assert out.rfi.mask.dtype == torch.bool
+    assert out.rfi.source_tags.shape == (NANTS, NCHAN_PER_CHGROUP, NPOL)
+    assert out.rfi.source_tags.dtype == torch.uint8
     assert out.rfi.warmup is True                                           # cube #1 of warmup
-    # FAR ≪ 1 on uniform-noise raw → flag fraction should be small (<5%).
-    assert out.rfi.flag_fraction_total < 0.05
+    assert 0.0 <= out.rfi.flag_fraction_total <= 1.0
+    assert out.gridded_minus_sky is not None
+    # When everything is flagged the voltage cube zeros out → grid is
+    # exactly zero. This is the expected behaviour for the synthetic
+    # full-flag case here; chunk-5 will exercise the partial-flag
+    # path on real fada data.
+    assert torch.all(out.gridded_minus_sky == 0)
 
 
 def test_process_block_static_sky_subtracts_continuum() -> None:
