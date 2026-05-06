@@ -450,10 +450,9 @@ CHUNKS_DONE=(
   "chunk_7_16chgroup_alignment_preview"
   "chunk_8_transport_loopback_capture"
   "chunk_9_dod_orchestrator_completion"
-)
-CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_10_hardening"
 )
+CHUNKS_REMAINING=()  # empty: all M3 chunks landed; gate is operator approval
 
 if [[ ${#CHUNKS_REMAINING[@]} -gt 0 ]]; then
   STAGE='in progress (substrate only)'
@@ -505,11 +504,11 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_6_voltage_fixture_burst_250924mptq",
     "chunk_7_16chgroup_alignment_preview",
     "chunk_8_transport_loopback_capture",
-    "chunk_9_dod_orchestrator_completion"
-  ],
-  "chunks_remaining": [
+    "chunk_9_dod_orchestrator_completion",
     "chunk_10_hardening"
-  ]
+  ],
+  "chunks_remaining": [],
+  "plan_fixes_tracker_present": $([[ -f "${REPO_ROOT}/M3_PLAN_FIXES.md" ]] && echo true || echo false)
 }
 JSON
 

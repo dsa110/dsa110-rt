@@ -298,7 +298,6 @@ for relpath in \
   bench/rfi_warmup.py \
   bench/cal_reload.py \
   tests/test_corr_fast_synth.py \
-  M3_PLAN_FIXES.md \
   tools/dod/M3.sh
 do
   if [[ -e "${REPO_ROOT}/${relpath}" ]]; then
