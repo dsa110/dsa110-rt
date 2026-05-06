@@ -150,10 +150,14 @@ def _get_kernel_cf16():
         return _KERNEL_CF16
     cp = _get_cupy()
     _LOG.info("compiling fused_combine_per_fdm_cf16 via NVRTC...")
+    # NVRTC doesn't accept -O3 (it's the default and the explicit
+    # flag is rejected). --use_fast_math enables denormals-to-zero
+    # and approximate transcendentals, both safe here (we only do
+    # fp16 add).
     _KERNEL_CF16 = cp.RawKernel(
         code=_CUDA_SOURCE_CF16,
         name="fused_combine_per_fdm_cf16",
-        options=("-O3", "--use_fast_math"),
+        options=("--use_fast_math",),
     )
     _LOG.info("fused_combine_per_fdm_cf16 ready")
     return _KERNEL_CF16
@@ -168,7 +172,7 @@ def _get_kernel_cf32():
     _KERNEL_CF32 = cp.RawKernel(
         code=_CUDA_SOURCE_CF32,
         name="fused_combine_per_fdm_cf32",
-        options=("-O3", "--use_fast_math"),
+        options=("--use_fast_math",),
     )
     _LOG.info("fused_combine_per_fdm_cf32 ready")
     return _KERNEL_CF32
