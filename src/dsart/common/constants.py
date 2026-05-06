@@ -361,3 +361,54 @@ FADA_BYTES_PER_BLOCK: int = (
 """Fada block size = NPACKETS × NANTS × NCHAN × 2t × 2p × 1 byte
 (4-bit cplx packed = 1 byte / complex sample) = 301,989,888.
 Matches `configs/config_corr.yaml::buffers.fada.bytes_per_block`."""
+
+
+# ---------------------------------------------------------------------------
+# RFI flagger (M3 chunk 3c; plan §4.2 step 2 / step 3 cold-start)
+# ---------------------------------------------------------------------------
+
+RFI_BANDPASS_TAU_S: float = 30.0
+"""Plan §4.2 step 3 ``τ_B`` — running-bandpass IIR time constant (s).
+The bandpass-outlier ``B_running`` 1-pole IIR uses this as its time
+constant; the cold-start window before SK and group-outlier suffice
+on their own is ``5·τ_B`` ≈ 150 s.
+
+The chunk-3c bandpass-outlier (per-cube static median+MAD) does not
+itself need an IIR warmup, but the warmup state machine inside
+:class:`dsart.rfi.combine.RFIFlagger` honours the ``5·τ_B`` cube
+window so the live ``corr_fast_compute`` service (parent M3 agent)
+can swap the IIR form into the same architecture without touching
+the warmup contract. Pinned in plan §4.2 step 3 derivation."""
+
+RFI_BANDPASS_WARMUP_CUBES_DEFAULT: int = int(
+    round(5.0 * RFI_BANDPASS_TAU_S / BLOCK_DURATION_S)
+)
+"""Default cold-start warmup window in cubes — = ``5·τ_B / 134.218 ms`` ≈
+1118 cubes at the canonical ``τ_B = 30 s``. During this window
+``flags.bit4 = rfi_warming_up`` is set in the transport header and
+the bandpass-outlier detector is bypassed; SK and group-outlier
+remain active. Tests override this to a small integer (1-5)."""
+
+RFI_SK_FAR_DEFAULT: float = 1.0e-4
+"""Default per-(ant, ch, pol, M) two-sided false-alarm rate for the SK
+detector. Pinned in plan §4.2 step 2."""
+
+RFI_BANDPASS_K_DEFAULT: float = 5.0
+"""Default outlier-σ threshold for the bandpass-outlier detector
+(briefing §4.2). MAD-σ units."""
+
+RFI_GROUP_K_DEFAULT: float = 5.0
+"""Default outlier-σ threshold for the group-outlier detector
+(briefing §4.2). MAD-σ units."""
+
+RFI_SK_M_VALUES_DEFAULT: tuple[int, ...] = (64, 256, 1024, 4096)
+"""SK accumulation depths per cube. All four divide the canonical
+4096-sample cube exactly (yielding ``N_acc ∈ {64, 16, 4, 1}``)."""
+
+RFI_SUM_THRESHOLD_MAX_M_DEFAULT: int = 8
+"""SumThreshold post-pass max sliding-window length (Offringa 2010
+default)."""
+
+RFI_SUM_THRESHOLD_ETA_DEFAULT: float = 1.5
+"""SumThreshold post-pass threshold-shape parameter (Offringa 2010
+default; per-window threshold is ``M / η^log2(M)``)."""
