@@ -156,15 +156,29 @@ python -m pytest tests/test_cal_loader_dec_phase.py -q --tb=short \
   || fail "F21 cal-loader acceptance pytests failed"
 pass
 
+# --- chunk 2a: FastCorrKernel (peer to SlowCorrKernel) ---------------------
+# 24 acceptance tests covering input validation, output shape per t_int,
+# numerical sanity (zero / autos / Hermitian), the F18 + F21 composition
+# (on-source vis is real to fp16 precision), and the helper functions.
+# Note the test_full_block_equals_slow_corr_kernel boundary test runs the
+# full 2048-packet correlation on CPU with both kernels; ~3 min wall time.
+# That's the strongest cross-kernel correctness pin and only needs to pass
+# once per release; chunks 4 / 5 will add GPU tests with smaller blocks.
+STEP="chunk_2a_fast_corr_kernel"
+python -m pytest tests/test_fast_corr_kernel.py -q --tb=short \
+  || fail "FastCorrKernel acceptance pytests failed"
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
 
 CHUNKS_DONE=(
   "chunk_1_cal_apply_with_F21_dec_phase"
+  "chunk_2a_fast_corr_kernel"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
-  "chunk_2_corr_fast_compute_base"
+  "chunk_2b_corr_fast_compute_service_shell"
   "chunk_3a_gridder_sparsity_pattern"
   "chunk_3b_coarse_dm_static_sky"
   "chunk_3c_rfi_flagger"
@@ -216,10 +230,11 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "lockfile": "${M3_LOCKFILE}"
   },
   "chunks_done": [
-    "chunk_1_cal_apply_with_F21_dec_phase"
+    "chunk_1_cal_apply_with_F21_dec_phase",
+    "chunk_2a_fast_corr_kernel"
   ],
   "chunks_remaining": [
-    "chunk_2_corr_fast_compute_base",
+    "chunk_2b_corr_fast_compute_service_shell",
     "chunk_3a_gridder_sparsity_pattern",
     "chunk_3b_coarse_dm_static_sky",
     "chunk_3c_rfi_flagger",
