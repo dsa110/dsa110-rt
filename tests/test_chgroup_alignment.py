@@ -131,16 +131,41 @@ def test_expected_fast_vis_tile_arithmetic(
 # ---------------------------------------------------------------------------
 
 
+def _free_gpu_between_chgroups(device: torch.device) -> None:
+    """Drop GPU caches so per-chgroup pipeline contexts (kernel +
+    gridder + cal tensors) don't pile up across chgroups. Production
+    runs reuse one IntegrationContext per chgroup; the test loop
+    builds N contexts back-to-back, which would otherwise OOM the GPU.
+    """
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+# Tile width used by the GPU-gated tests: 128 native samples = 32
+# fast-vis tiles per block. The fast-corr kernel batches the per-block
+# GEMM as ``(n_tiles * NCHAN * NTIMES_PER_PACKET * NPOL,
+# packets_per_tile, NANTS)``; smaller ``t_int_fast_native`` means more
+# parallel batches (and more GPU memory). At t_int=128 the batch
+# tensors stay under ~1 GiB; at t_int=8 (the production cadence) the
+# kernel currently allocates ~13 GiB before tiling, which OOMs the
+# 11 GiB h01 GPU. The alignment property pinned by these tests is
+# independent of t_int — see chunk 9's stage-2 alignment for the
+# production-cadence acceptance.
+_TEST_T_INT_FAST_NATIVE = 128
+
+
 @_NEEDS_GPU
 def test_run_one_chgroup_returns_tile_power_with_correct_shape() -> None:
     impulse_pkt = 1000
-    t_int = 8
+    t_int = _TEST_T_INT_FAST_NATIVE
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
+    device = _pick_test_device()
     vis_power = _run_one_chgroup(
         chgroup=0, raw=raw,
         n_grid=32, t_int_fast_native=t_int, obs_dec_deg=53.85,
-        device=_pick_test_device(),
+        device=device,
     )
+    _free_gpu_between_chgroups(device)
     expected_n_fv = (NPACKETS_PER_BLOCK * NTIMES_PER_PACKET) // t_int
     assert vis_power.shape == (expected_n_fv,)
     assert vis_power.dtype == torch.float32
@@ -153,13 +178,15 @@ def test_run_one_chgroup_peak_at_expected_tile_for_chgroup_0() -> None:
     containing the impulse packet for the simplest case (chgroup 0).
     """
     impulse_pkt = 500                                                     # mid-block-ish
-    t_int = 8
+    t_int = _TEST_T_INT_FAST_NATIVE
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
+    device = _pick_test_device()
     vis_power = _run_one_chgroup(
         chgroup=0, raw=raw,
         n_grid=32, t_int_fast_native=t_int, obs_dec_deg=53.85,
-        device=_pick_test_device(),
+        device=device,
     )
+    _free_gpu_between_chgroups(device)
     expected_tile = _expected_fast_vis_tile(impulse_pkt, t_int)
     peak_tile = int(torch.argmax(vis_power).item())
     assert abs(peak_tile - expected_tile) <= 1, (
@@ -186,7 +213,7 @@ def test_16chgroups_all_peak_at_same_tile() -> None:
     is independent of n_grid.
     """
     impulse_pkt = 800
-    t_int = 8                                                             # cadence-1; ensures we have many tiles
+    t_int = _TEST_T_INT_FAST_NATIVE
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
     expected_tile = _expected_fast_vis_tile(impulse_pkt, t_int)
 
@@ -199,6 +226,7 @@ def test_16chgroups_all_peak_at_same_tile() -> None:
             device=device,
         )
         peak_tiles.append(int(torch.argmax(vis_power).item()))
+        _free_gpu_between_chgroups(device)
 
     offsets = [pt - expected_tile for pt in peak_tiles]
     max_abs_offset = max(abs(o) for o in offsets)
@@ -215,11 +243,13 @@ def test_16chgroups_all_peak_at_same_tile() -> None:
 
 @_NEEDS_GPU
 def test_16chgroups_peak_tile_invariant_under_t_int_change() -> None:
-    """The alignment property holds at multiple cadences. Test at the
-    burst-test 4× cadence (t_int_fast_native=32) too.
+    """The alignment property holds at the burst-test 4×-coarser
+    cadence (t_int_fast_native = 4 × _TEST_T_INT_FAST_NATIVE). The
+    invariance shows that chunk-9's stage-2 alignment can swap
+    cadences without disturbing intra-cube alignment.
     """
     impulse_pkt = 800
-    t_int = 32
+    t_int = 4 * _TEST_T_INT_FAST_NATIVE                                   # = 512 native samples
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
     expected_tile = _expected_fast_vis_tile(impulse_pkt, t_int)
 
@@ -233,12 +263,13 @@ def test_16chgroups_peak_tile_invariant_under_t_int_change() -> None:
             device=device,
         )
         peak_tiles.append(int(torch.argmax(vis_power).item()))
+        _free_gpu_between_chgroups(device)
 
     offsets = [pt - expected_tile for pt in peak_tiles]
     max_abs_offset = max(abs(o) for o in offsets)
     assert max_abs_offset <= 1, (
-        f"peak tiles at t_int=32 = {peak_tiles}; expected = {expected_tile}; "
-        f"max abs offset = {max_abs_offset}"
+        f"peak tiles at t_int={t_int} = {peak_tiles}; "
+        f"expected = {expected_tile}; max abs offset = {max_abs_offset}"
     )
 
 
@@ -246,11 +277,10 @@ def test_16chgroups_peak_tile_invariant_under_t_int_change() -> None:
 def test_chgroup_0_and_15_peak_within_1_tile() -> None:
     """Targeted edge-case test: chgroup 0 (lowest band) and chgroup 15
     (highest band) — the largest possible band-dependent delay
-    difference — should still align within 1 fast-vis tile for the
-    default t_int.
+    difference — should still align within 1 fast-vis tile.
     """
     impulse_pkt = 1500
-    t_int = 8
+    t_int = _TEST_T_INT_FAST_NATIVE
     raw = _synth_block_with_impulse(impulse_packet=impulse_pkt)
 
     device = _pick_test_device()
@@ -259,11 +289,13 @@ def test_chgroup_0_and_15_peak_within_1_tile() -> None:
         n_grid=16, t_int_fast_native=t_int, obs_dec_deg=53.85,
         device=device,
     )
+    _free_gpu_between_chgroups(device)
     p15 = _run_one_chgroup(
         chgroup=15, raw=raw,
         n_grid=16, t_int_fast_native=t_int, obs_dec_deg=53.85,
         device=device,
     )
+    _free_gpu_between_chgroups(device)
 
     pt0 = int(torch.argmax(p0).item())
     pt15 = int(torch.argmax(p15).item())
