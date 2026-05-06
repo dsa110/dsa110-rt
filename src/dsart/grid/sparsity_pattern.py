@@ -320,6 +320,116 @@ class SparsityPattern:
 
 
 # ---------------------------------------------------------------------------
+# Core/outrigger discrimination (plan §3 line 446 / F27)
+# ---------------------------------------------------------------------------
+
+
+#: Default core-radius cut (m). The DSA-110 cal-blob antpos has a clean
+#: gap between the largest core baseline (~441 m, ant 47 / ant 83) and
+#: the smallest outrigger (~627 m, ant 84). 500 m sits in that gap and
+#: gives the canonical 82-83 core antennas. Production reads
+#: ``is_core`` from etcd ``/cnf/corr_setup_96`` (see plan §3 line 446);
+#: this is the bench/test fallback when etcd is unavailable.
+CORE_RADIUS_M_DEFAULT: float = 500.0
+
+#: Canonical core-antenna count (plan §3 line 446). Used by
+#: :func:`core_baseline_mask_from_antpos` when callers prefer to
+#: specify a count rather than a radius.
+N_CORE_DEFAULT: int = 82
+
+
+def core_baseline_mask_from_antpos(
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    *,
+    n_core: int | None = None,
+    r_core_m: float | None = None,
+) -> np.ndarray:
+    """``(NBASE,) bool`` baseline mask: True iff both antennas are core.
+
+    The "core" antennas are the geometrically central ones (radius
+    ``√(e² + n²)`` from the array origin small relative to the
+    outriggers). Production reads ``is_core`` from etcd
+    ``/cnf/corr_setup_96`` (plan §3 line 446); this helper is the
+    bench/test fallback when antpos comes from a cal-blob and etcd is
+    not available.
+
+    Specify exactly one of:
+
+    * ``n_core``: keep the ``n_core`` smallest-radius antennas as core.
+      Robust to antpos ordering.
+    * ``r_core_m``: keep antennas with radius < ``r_core_m`` (m).
+
+    The mask iterates baselines in the xGPU upper-tri order
+    (``b ≤ a``); index ``k`` corresponds to baseline ``(a, b)``
+    matching :func:`dsart.services.slow_corr_kernel.upper_tri_indices`.
+
+    Parameters
+    ----------
+    antpos_e, antpos_n : np.ndarray (NANTS,) float
+        Antenna E/N positions in metres.
+    n_core : int, optional
+        Keep this many smallest-radius antennas as core. Default
+        ``N_CORE_DEFAULT = 82``.
+    r_core_m : float, optional
+        Alternative spec: keep antennas with radius below this cut (m).
+
+    Returns
+    -------
+    np.ndarray (NBASE,) bool
+        True for baselines with BOTH endpoints in the core set.
+
+    Notes
+    -----
+    Why this exists (F27): the legacy positional helpers in
+    ``test_sparsity_pattern.py`` and friends defined "core" as
+    "antennas 0..n_core-1", but the DSA-110 cal-blob antpos is **not**
+    sorted by radius — ant index 48 is an OUTRIGGER (r ≈ 1008 m) and
+    ant index 83 is a CORE antenna (r ≈ 423 m). The positional helper
+    leaked outrigger baselines into the core image and dropped real
+    core baselines, leaving stray fills in the outer uv-plane of the
+    chunk-3a footprint plot. This helper fixes that by working off the
+    actual antpos, matching the production etcd-driven path.
+    """
+    if (n_core is None) == (r_core_m is None):
+        raise ValueError(
+            "core_baseline_mask_from_antpos: pass exactly one of "
+            "(n_core, r_core_m); got both or neither"
+        )
+    antpos_e = np.asarray(antpos_e, dtype=np.float64)
+    antpos_n = np.asarray(antpos_n, dtype=np.float64)
+    if antpos_e.shape != antpos_n.shape or antpos_e.ndim != 1:
+        raise ValueError(
+            f"antpos_e shape {antpos_e.shape} / antpos_n shape "
+            f"{antpos_n.shape} must match and be 1-D"
+        )
+    nants = int(antpos_e.shape[0])
+    radii = np.hypot(antpos_e, antpos_n)                        # (NANTS,)
+
+    if n_core is not None:
+        if not 0 < n_core <= nants:
+            raise ValueError(
+                f"n_core={n_core}, expected 1..{nants}"
+            )
+        # Smallest-radius antennas are core. argsort is stable but
+        # ties don't matter here (radii are physical distances).
+        sorted_idx = np.argsort(radii, kind="stable")
+        is_core_ant = np.zeros(nants, dtype=bool)
+        is_core_ant[sorted_idx[:n_core]] = True
+    else:
+        is_core_ant = (radii < float(r_core_m))
+
+    nbase = nants * (nants + 1) // 2
+    mask = np.zeros(nbase, dtype=bool)
+    k = 0
+    for a in range(nants):
+        for b in range(a + 1):
+            mask[k] = is_core_ant[a] and is_core_ant[b]
+            k += 1
+    return mask
+
+
+# ---------------------------------------------------------------------------
 # build_pattern + predict_pattern_id
 # ---------------------------------------------------------------------------
 

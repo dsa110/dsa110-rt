@@ -62,9 +62,9 @@ from dsart.common.constants import (  # noqa: E402
     NCHAN_PER_CHGROUP,
     NPOL,
 )
+from dsart.grid import core_baseline_mask_from_antpos                    # noqa: E402
 from dsart.services.corr_fast_integration import (  # noqa: E402
     FastIntegrationConfig,
-    _build_core_baseline_mask,
     build_context,
     process_block,
 )
@@ -189,7 +189,7 @@ def _run_one_chgroup(
         static_sky_disabled=True,
     )
     e, n = _synth_antpos_for_chgroup(seed=42)                             # SAME antpos across chgroups
-    core_mask = _build_core_baseline_mask(n_core=82)
+    core_mask = core_baseline_mask_from_antpos(e, n, n_core=82)
     ctx = build_context(
         cfg, device=device,
         antpos_e=e, antpos_n=n,

@@ -227,6 +227,63 @@ wiring) for the `N_DM == 1` case which is what chunk 5 (continuum)
 matter once the search starts asking for `N_DM > 1` trials, and
 that's chunk-9 material.
 
+### F27 — core/outrigger discrimination must be radius-based, not positional
+
+**Status**: IMPLEMENTED in chunk 7 (2026-05-06; user-spotted bug in the
+chunk-3a grid-pattern footprint plot). Lives in
+`src/dsart/grid/sparsity_pattern.py::core_baseline_mask_from_antpos`
+(new public helper, Class C — corr ↔ search shared); 8 acceptance
+pytests in `tests/test_sparsity_pattern.py::TestCoreBaselineMask
+FromAntpos` pin the no-regression-on-synthetic-antpos behavior + the
+real-h01-cal-blob-differs-from-positional behavior + edge cases
+(both-spec error, n_core out-of-range, shape mismatch).
+
+**The bug**: the legacy positional helpers in
+`tests/test_sparsity_pattern.py::_core_baseline_mask`,
+`tests/test_fast_vis_gridder.py::_core_baseline_mask`,
+`bench/grid_pattern_visualisation.py::_core_baseline_mask`, and
+`src/dsart/services/corr_fast_integration.py::_build_core_baseline
+_mask` all defined "core antennas" as `ant_idx in [0, n_core)`. This
+matched the synthetic antpos in the test files (where `_synth_antpos`
+explicitly places ants 0..81 in a tight core box) but is **wrong** on
+real DSA-110 cal-blob antpos:
+
+| ant_idx | (e_m, n_m)         | r_m   | classification        |
+|---------|--------------------|-------|-----------------------|
+| 47      | (9.0, 440.8)       | 441   | core                  |
+| **48**  | **(-985, -216)**   | **1008** | **OUTRIGGER (positional helper kept it as core)** |
+| 82      | (9.0, 432.2)       | 432   | core                  |
+| **83**  | **(197.9, -374.1)**| **423** | **CORE (positional helper rejected it as outrigger)** |
+| 84-95   | r > 627            | -     | outriggers (correct)  |
+
+The positional mask leaked outrigger-touching baselines into the
+gridder (visible as stray fills in the outer uv-plane of
+`bench/reports/<UTC>/grid-pattern-bench/M3-grid-pattern/footprint
+_chgroup0_dec53p85_ngrid256.png`) AND dropped real core baselines
+(missing fills in the core).
+
+**The fix**: `core_baseline_mask_from_antpos(antpos_e, antpos_n, *,
+n_core=82 | r_core_m=500.0)` selects the core by physical radius:
+either pick the ``n_core`` smallest-radius antennas or apply a
+``r_core_m`` (m) cut. The DSA-110 antpos has a clean gap between
+the largest core baseline (~441 m) and the smallest outrigger
+(~627 m); both the count-based and radius-based specs agree on the
+canonical 82-ant core.
+
+**Production**: production code reads `is_core` from etcd
+`/cnf/corr_setup_96` (plan §3 line 446) — not affected by this bug.
+The chunk-4 `_load_antpos_from_cal_blob` fallback path now uses the
+new radius-based helper, matching what production etcd should
+return.
+
+**Test files NOT updated**: `tests/test_sparsity_pattern.py::_core_
+baseline_mask` and `tests/test_fast_vis_gridder.py::_core_baseline_
+mask` still use the positional definition — they're paired with
+`_synth_antpos` which places core ants at indices [0, 82), so
+positional is correct for those tests' synthetic data. Adding the
+new `TestCoreBaselineMaskFromAntpos` class pins the antpos-based
+helper without disturbing the legacy positional tests.
+
 ---
 
 ## D-items (decisions — locked during M3 implementation)

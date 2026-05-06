@@ -25,20 +25,26 @@ References
 from dsart.grid.kernel import FastVisGridder
 from dsart.grid.pol_sum import stokes_i_pol_sum
 from dsart.grid.sparsity_pattern import (
+    CORE_RADIUS_M_DEFAULT,
+    N_CORE_DEFAULT,
     SparsityPattern,
     build_pattern,
     compute_antpos_hash,
     compute_chgroup_table_hash,
+    core_baseline_mask_from_antpos,
     predict_pattern_id,
     quantise_dec_deg,
 )
 
 __all__ = [
+    "CORE_RADIUS_M_DEFAULT",
     "FastVisGridder",
+    "N_CORE_DEFAULT",
     "SparsityPattern",
     "build_pattern",
     "compute_antpos_hash",
     "compute_chgroup_table_hash",
+    "core_baseline_mask_from_antpos",
     "predict_pattern_id",
     "quantise_dec_deg",
     "stokes_i_pol_sum",

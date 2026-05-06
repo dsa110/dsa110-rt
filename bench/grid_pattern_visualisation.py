@@ -109,21 +109,27 @@ def _resolve_antpos_path(explicit: str | None) -> Path:
     sys.exit(2)
 
 
-def _core_baseline_mask(n_core: int = 82) -> np.ndarray:
-    """``(NBASE,) bool`` mask: True iff both ants are in [0, n_core).
+def _core_baseline_mask(
+    antpos_e: np.ndarray, antpos_n: np.ndarray, n_core: int = 82,
+) -> np.ndarray:
+    """``(NBASE,) bool`` mask: True iff both ants are core.
 
-    Uses the simple positional definition (ants 0..n_core-1 are core)
-    for bench portability; production reads the actual ``is_core``
-    array from etcd ``/cnf/corr_setup_96`` per plan §3 line 446.
+    Selects the ``n_core`` smallest-radius antennas as the core (per
+    F27 in ``M3_PLAN_FIXES.md``). Production reads the actual
+    ``is_core`` array from etcd ``/cnf/corr_setup_96`` per plan §3
+    line 446; this radius-based fallback is what the bench uses when
+    antpos comes from a cal blob.
+
+    The cal-blob antpos is **not** sorted by radius — e.g. ant index
+    48 is an outrigger at r ≈ 1008 m AND ant index 83 is a core ant
+    at r ≈ 423 m. The earlier positional helper leaked outrigger
+    baselines into the core image and dropped real core baselines,
+    leaving stray fills in the outer uv-plane of the footprint plot.
     """
-    nbase = NANTS * (NANTS + 1) // 2
-    mask = np.zeros(nbase, dtype=bool)
-    k = 0
-    for a in range(NANTS):
-        for b in range(a + 1):
-            mask[k] = (a < n_core) and (b < n_core)
-            k += 1
-    return mask
+    from dsart.grid import core_baseline_mask_from_antpos
+    return core_baseline_mask_from_antpos(
+        antpos_e, antpos_n, n_core=n_core,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -399,10 +405,34 @@ def main() -> int:
         f"max N={bf.antpos_n.max():.1f} m)"
     )
 
-    mask = None if args.no_mask else _core_baseline_mask(n_core=82)
+    if args.no_mask:
+        mask = None
+    else:
+        mask = _core_baseline_mask(bf.antpos_e, bf.antpos_n, n_core=82)
     if mask is not None:
-        print(f"core mask: {int(mask.sum())} of {mask.size} baselines kept "
-              f"(82-ant core, autos still excluded by build_pattern)")
+        # Echo which antennas were classified as core for transparency.
+        radii = np.hypot(bf.antpos_e, bf.antpos_n)
+        sorted_idx = np.argsort(radii, kind="stable")
+        core_ants = sorted_idx[:82]
+        outrigger_ants = sorted_idx[82:]
+        r_core_max = float(radii[core_ants].max())
+        r_outrigger_min = float(radii[outrigger_ants].min())
+        print(
+            f"core mask: {int(mask.sum())} of {mask.size} baselines kept "
+            f"(82-ant core by smallest-radius selection; "
+            f"core max r={r_core_max:.1f} m, outrigger min r={r_outrigger_min:.1f} m)"
+        )
+        # Surface any positionally-surprising classifications.
+        positional_surprises = sorted(
+            [int(a) for a in core_ants if a >= 82] +
+            [int(a) for a in outrigger_ants if a < 82]
+        )
+        if positional_surprises:
+            print(
+                f"  positional-vs-radius surprise ants: "
+                f"{positional_surprises} (radius-based mask differs from "
+                f"the legacy 'first 82 are core' helper)"
+            )
 
     # Resolve out-dir
     if args.out_dir is None:

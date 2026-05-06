@@ -812,27 +812,61 @@ def load_antpos_from_cal_blob(
         - antpos_e, antpos_n : (NANTS,) float32 arrays
         - is_core_baseline_mask : (NBASE,) bool — True for cross-
           baselines where both antennas are in the 82-ant core, False
-          for outriggers or autos. Mirrors plan §3 line 452 + the
-          test_sparsity_pattern.py ``_core_baseline_mask`` helper.
+          for outriggers or autos. The mask is built by selecting the
+          ``N_CORE_DEFAULT = 82`` smallest-radius antennas (per F27 in
+          ``M3_PLAN_FIXES.md``); production reads ``is_core`` from
+          etcd ``/cnf/corr_setup_96`` (plan §3 line 446) — this is the
+          bench/test fallback when antpos comes from a cal-blob. The
+          radius-based discrimination matters because the cal-blob
+          antpos is **not** sorted by radius (e.g. ant index 48 is an
+          outrigger at r ≈ 1008 m).
     """
     from dsart.cal.bf_weights import load_bf_weights
+    from dsart.grid.sparsity_pattern import (
+        N_CORE_DEFAULT, core_baseline_mask_from_antpos,
+    )
 
     bf = load_bf_weights(cal_path)
+    antpos_e = np.asarray(bf.antpos_e, dtype=np.float32)
+    antpos_n = np.asarray(bf.antpos_n, dtype=np.float32)
     return (
-        np.asarray(bf.antpos_e, dtype=np.float32),
-        np.asarray(bf.antpos_n, dtype=np.float32),
-        _build_core_baseline_mask(n_core=82),
+        antpos_e,
+        antpos_n,
+        core_baseline_mask_from_antpos(
+            antpos_e, antpos_n, n_core=N_CORE_DEFAULT,
+        ),
     )
 
 
-def _build_core_baseline_mask(*, n_core: int = 82) -> np.ndarray:
-    """``(NBASE,) bool`` mask: True iff both antennas are in [0, n_core).
+def _build_core_baseline_mask(
+    antpos_e: np.ndarray | None = None,
+    antpos_n: np.ndarray | None = None,
+    *,
+    n_core: int = 82,
+) -> np.ndarray:
+    """``(NBASE,) bool`` mask: True iff both antennas are core.
 
-    Mirrors plan §3 line 452 + ``test_sparsity_pattern.py``'s helper
-    of the same name. The DSA-110 antenna ordering puts the 82 core
-    antennas at indices [0, 82) and the 14 outriggers at [82, 96);
-    the gridder excludes outrigger-touching baselines.
+    When ``antpos_e`` / ``antpos_n`` are provided, this delegates to
+    :func:`dsart.grid.sparsity_pattern.core_baseline_mask_from_antpos`
+    to select the ``n_core`` smallest-radius antennas — the correct
+    behavior for real DSA-110 antpos (per F27 in
+    ``M3_PLAN_FIXES.md``).
+
+    When ``antpos_e`` / ``antpos_n`` are ``None``, falls back to the
+    legacy positional definition (ants 0..n_core-1 are core). This is
+    only correct for SYNTHETIC antpos arrays where the test author
+    placed core ants at the start; real cal-blob antpos has e.g. ant
+    48 at r ≈ 1008 m (an outrigger) inside the first 82 indices.
+    Existing test files synthesise antpos that way and continue to
+    pass; production code paths in :func:`build_context` and
+    :func:`load_antpos_from_cal_blob` route through the antpos-based
+    path.
     """
+    if antpos_e is not None and antpos_n is not None:
+        from dsart.grid.sparsity_pattern import core_baseline_mask_from_antpos
+        return core_baseline_mask_from_antpos(
+            antpos_e, antpos_n, n_core=n_core,
+        )
     nbase = NANTS * (NANTS + 1) // 2
     mask = np.zeros(nbase, dtype=bool)
     k = 0

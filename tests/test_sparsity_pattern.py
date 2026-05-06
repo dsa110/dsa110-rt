@@ -55,10 +55,13 @@ from dsart.common.constants import (
     freq_GHz,
 )
 from dsart.grid.sparsity_pattern import (
+    CORE_RADIUS_M_DEFAULT,
+    N_CORE_DEFAULT,
     SPEED_OF_LIGHT_M_PER_S,
     build_pattern,
     compute_antpos_hash,
     compute_chgroup_table_hash,
+    core_baseline_mask_from_antpos,
     predict_pattern_id,
     quantise_dec_deg,
 )
@@ -707,3 +710,133 @@ def test_math_module_present() -> None:
     # constants implicitly via numpy; this is just a no-op assertion to
     # satisfy linters that flag the unused import otherwise).
     assert math.pi > 3.0
+
+
+# ---------------------------------------------------------------------------
+# core_baseline_mask_from_antpos (F27 — radius-based core/outrigger split)
+# ---------------------------------------------------------------------------
+
+
+class TestCoreBaselineMaskFromAntpos:
+    """Pin the antpos-based core mask helper (F27).
+
+    The legacy positional helper assumed ants 0..n_core-1 are core,
+    which broke on real DSA-110 cal-blob antpos (where ant 48 is an
+    outrigger at r ≈ 1008 m and ant 83 is a core ant at r ≈ 423 m).
+    """
+
+    def test_synthetic_first_82_match_positional_baseline(self) -> None:
+        """For SYNTHETIC antpos with the first 82 ants in a tight core,
+        the radius-based mask agrees with the legacy positional helper.
+        This is the no-regression check for existing tests using
+        ``_synth_antpos`` + ``_core_baseline_mask`` together.
+        """
+        e, n = _synth_antpos(seed=20260506)
+        radius_mask = core_baseline_mask_from_antpos(e, n, n_core=82)
+        positional_mask = _core_baseline_mask(n_core=82)
+        assert np.array_equal(radius_mask, positional_mask), (
+            f"radius and positional masks disagree for synthetic antpos: "
+            f"{int((radius_mask != positional_mask).sum())} of "
+            f"{radius_mask.size} baselines mismatch"
+        )
+
+    def test_real_h01_antpos_radius_differs_from_positional(self) -> None:
+        """For the REAL DSA-110 cal-blob antpos, the radius-based mask
+        SHOULD differ from positional — that's exactly the F27 bug.
+
+        Specifically: (a) ant 48 is an outrigger at r≈1008 m so all 82
+        baselines (ant 48, ant_core) that the positional mask kept get
+        DROPPED by the radius mask; (b) ant 83 is a core ant at r≈423 m
+        so all 82 baselines (ant 83, ant_core) that positional dropped
+        get KEPT by radius. Net: the symmetric difference is non-empty.
+        """
+        a = _h01_real_antpos()
+        if a is None:
+            pytest.skip("real h01 cal blob antpos not available")
+        e, n = a
+        radius_mask = core_baseline_mask_from_antpos(e, n, n_core=82)
+        positional_mask = _core_baseline_mask(n_core=82)
+        n_diff = int((radius_mask != positional_mask).sum())
+        assert n_diff > 0, (
+            "expected real h01 antpos to differ from positional; got match"
+        )
+        # Sanity: the count should be in the right ballpark — for each
+        # mis-classified ant in the first 82, ~82 baselines flip; with
+        # ant 48 swapped out and ant 83 swapped in, ~2 × 82 ≈ 164
+        # baselines disagree (modulo the ant-pairs counted twice).
+        assert n_diff < 1000, (
+            f"unexpectedly large mismatch ({n_diff} baselines); "
+            f"radius mask may have a bug"
+        )
+
+    def test_n_core_keeps_smallest_radius(self) -> None:
+        """``n_core`` selects the n smallest-radius antennas regardless
+        of array index. Make a synthetic antpos with the SMALLEST-
+        radius ant placed at the LARGEST index → the helper still
+        picks it up as core.
+        """
+        e = np.array([1000.0, 5000.0, 0.5], dtype=np.float64)
+        n_arr = np.zeros(3, dtype=np.float64)
+        # ant 2 is closest to origin (r=0.5); ant 0 is r=1000; ant 1 is r=5000.
+        # n_core=2 should pick ants 2 and 0 (the two smallest radii).
+        mask = core_baseline_mask_from_antpos(e, n_arr, n_core=2)
+        # NBASE = 3*4/2 = 6 baselines in (a,b) order with b<=a:
+        # k=0: (0,0); k=1: (1,0); k=2: (1,1); k=3: (2,0); k=4: (2,1); k=5: (2,2)
+        # Core ants: {0, 2}. Cross-only-core baselines: (2,0) → True.
+        # Autos (0,0), (1,1), (2,2) AND outrigger-touching (1,0), (1,1), (2,1)
+        # all need is_core_ant logic (autos are STILL True if both ants core
+        # — the autos drop happens later in _per_baseline_uv_meters).
+        expected = np.array([
+            True,                                                         # (0,0): both core (ant 0)
+            False,                                                        # (1,0): ant 1 outrigger
+            False,                                                        # (1,1): ant 1 outrigger
+            True,                                                         # (2,0): both core
+            False,                                                        # (2,1): ant 1 outrigger
+            True,                                                         # (2,2): both core
+        ])
+        assert np.array_equal(mask, expected), (
+            f"got mask {mask.tolist()}; expected {expected.tolist()}"
+        )
+
+    def test_r_core_m_uses_physical_threshold(self) -> None:
+        e = np.array([10.0, 100.0, 1000.0], dtype=np.float64)
+        n_arr = np.zeros(3, dtype=np.float64)
+        # r=10, 100, 1000. r_core_m=500 → ants 0 & 1 are core; ant 2 is outrigger.
+        mask = core_baseline_mask_from_antpos(e, n_arr, r_core_m=500.0)
+        expected_core = np.array([True, True, False])
+        # Reproduce the helper's (a,b) loop:
+        nbase = 3 * 4 // 2
+        expected = np.zeros(nbase, dtype=bool)
+        k = 0
+        for a in range(3):
+            for b in range(a + 1):
+                expected[k] = expected_core[a] and expected_core[b]
+                k += 1
+        assert np.array_equal(mask, expected)
+
+    def test_must_pass_exactly_one_of_n_core_or_r_core_m(self) -> None:
+        e = np.array([1.0, 2.0], dtype=np.float64)
+        n_arr = np.zeros(2, dtype=np.float64)
+        with pytest.raises(ValueError, match="exactly one"):
+            core_baseline_mask_from_antpos(e, n_arr)
+        with pytest.raises(ValueError, match="exactly one"):
+            core_baseline_mask_from_antpos(e, n_arr, n_core=1, r_core_m=10.0)
+
+    def test_n_core_out_of_range_raises(self) -> None:
+        e = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        n_arr = np.zeros(3, dtype=np.float64)
+        with pytest.raises(ValueError, match="n_core"):
+            core_baseline_mask_from_antpos(e, n_arr, n_core=0)
+        with pytest.raises(ValueError, match="n_core"):
+            core_baseline_mask_from_antpos(e, n_arr, n_core=4)
+
+    def test_shape_mismatch_raises(self) -> None:
+        e = np.array([1.0, 2.0], dtype=np.float64)
+        n_arr = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        with pytest.raises(ValueError, match="must match"):
+            core_baseline_mask_from_antpos(e, n_arr, n_core=1)
+
+    def test_default_constants_are_DSA_canonical(self) -> None:
+        # F27 canonical defaults — guard against accidental drift.
+        assert N_CORE_DEFAULT == 82
+        assert CORE_RADIUS_M_DEFAULT == 500.0
