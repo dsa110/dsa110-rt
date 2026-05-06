@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -89,6 +90,7 @@ from dsart.services.corr_fast_integration import (
 )
 from bench._corr_fast_replay import (
     accumulate_chgroup_grids,
+    compute_chgroup_cell_lambda,
     replay_chgroup,
 )
 
@@ -142,6 +144,12 @@ def _parse_t2_json(path: Path) -> dict:
         }
     with path.open("r") as fh:
         raw = json.load(fh)
+    # T2 JSON commonly nests fields under {run_id: {...}}.
+    if isinstance(raw, dict) and len(raw) == 1:
+        only_key = next(iter(raw))
+        inner = raw[only_key]
+        if isinstance(inner, dict) and any(k in inner for k in ("ra", "dec", "mjds", "dm")):
+            raw = inner
     return {
         "src_name": str(raw.get("src_name", "")),
         "ra_deg": float(raw["ra"]) if "ra" in raw else float(raw.get("ra_deg", float("nan"))),
@@ -194,11 +202,10 @@ def _emit_chgroup_npz(
     t0 = time.perf_counter()
     cfg = FastIntegrationConfig(
         chgroup=chgroup,
+        obs_dec_rad=math.radians(obs_dec_deg),
         t_int_fast_native=t_int_fast_native,
         cal_path=cal_path,
-        cal_mode="phase",
-        observing_dec_deg=obs_dec_deg,
-        rfi_disabled=True,
+        rfi_enabled=False,
         static_sky_disabled=(fixture_meta["kind"] == "burst"),
     )
     ctx, outputs = replay_chgroup(
@@ -220,7 +227,14 @@ def _emit_chgroup_npz(
     cube_3d = cube_2d.reshape(1, n_fv_total, n_filled)  # (N_DM=1, n_fv, N_filled)
 
     antpos_e, antpos_n, core_mask = load_antpos_from_cal_blob(cal_path)
-    cell_lambda = float(ctx.gridder.cell_lambda)
+    cell_lambda = float(
+        compute_chgroup_cell_lambda(
+            antpos_e, antpos_n,
+            chgroup=chgroup,
+            n_grid=int(pattern.n_grid),
+            is_core_baseline_mask=core_mask,
+        )
+    )
 
     out_path = out_dir / f"chgroup{chgroup:02d}.npz"
     np.savez_compressed(
@@ -268,24 +282,20 @@ def _emit_chgroup_npz(
 
     elapsed_s = time.perf_counter() - t0
     bytes_on_disk = out_path.stat().st_size
+    n_blocks_processed = int(len(outputs))
     LOG.info(
         "chgroup %d wrote %s (%.1f MiB, n_fv=%d, N_filled=%d, %.1f s)",
         chgroup, out_path, bytes_on_disk / (1 << 20),
         n_fv_total, n_filled, elapsed_s,
     )
 
-    # Free GPU between chgroups (F31 mitigation)
-    del ctx, outputs, cube_2d, cube_3d
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    return {
+    record = {
         "chgroup": chgroup,
         "voltage_path": str(voltage_path),
         "cal_path": str(cal_path),
         "n_fv_total": int(n_fv_total),
         "n_filled": int(n_filled),
-        "n_blocks_processed": int(len(outputs)),
+        "n_blocks_processed": n_blocks_processed,
         "cell_lambda": float(cell_lambda),
         "pattern_id_hex": f"0x{int(pattern.pattern_id):016x}",
         "n_grid": int(pattern.n_grid),
@@ -293,6 +303,13 @@ def _emit_chgroup_npz(
         "out_bytes": int(bytes_on_disk),
         "elapsed_s": float(elapsed_s),
     }
+
+    # Free GPU between chgroups (F31 mitigation)
+    del ctx, outputs, cube_2d, cube_3d
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return record
 
 
 # ---------------------------------------------------------------------------
