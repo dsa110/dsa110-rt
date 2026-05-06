@@ -41,8 +41,8 @@ from ..trigger.conditions import (
     PerCubeTotalCap,
     RateLimitTokenBucket,
     SnrThreshold,
-    TriggerCondition,
 )
+from ..trigger.predicate import TriggerCondition
 from ..trigger.emitter import (
     ConnectionEndpoint,
     EmitRecord,
