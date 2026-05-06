@@ -293,7 +293,13 @@ deterministic continuum-only stream over ≥ ``5/α`` blocks.</p>
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--n-blocks", type=int, default=24)
-    p.add_argument("--t-int-fast-native", type=int, default=32)
+    p.add_argument(
+        "--t-int-fast-native", type=int, default=128,
+        help=(
+            "fast-vis integration depth in NATIVE samples. Default 128 "
+            "fits h01's 11 GB GPU memory per F31. Production target is 8."
+        ),
+    )
     p.add_argument("--n-grid", type=int, default=64)
     p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--warmup-cubes", type=int, default=8)

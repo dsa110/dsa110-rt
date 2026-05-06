@@ -241,7 +241,15 @@ The chunk-9 §8.M3 line gates only on the bench producing this
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--duration-s", type=float, default=10.0)
-    p.add_argument("--t-int-fast-native", type=int, default=32)
+    p.add_argument(
+        "--t-int-fast-native", type=int, default=128,
+        help=(
+            "fast-vis integration depth in NATIVE samples. Default 128 "
+            "(= 4194.304 µs cadence; 32 fast-vis tiles/block) sized for "
+            "h01's 11 GB GPU per F31 (256 tiles/block @ t_int=32 OOMs). "
+            "Production target is 8 (262.144 µs); A6000 GPUs hold that."
+        ),
+    )
     p.add_argument("--n-grid", type=int, default=64)
     p.add_argument("--n-coarse-dm", type=int, default=5)
     p.add_argument("--dm-truth", type=float, default=200.0)

@@ -410,9 +410,11 @@ python -m pytest tests/test_coarse_dm_stage1.py -q --tb=short \
 # bench/reports/<UTC>/...; exact metrics inspected by operator).
 REPORT_BASE="${REPO_ROOT}/bench/reports/$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_THR="${REPORT_BASE}/M3-fast-path-throughput"
+# t_int=128 keeps n_fast_vis=32/block — same memory budget that
+# chunks 5/6/7 use on h01's 11 GB GPU 0 (per F31).
 python -m bench.fast_path_throughput \
     --duration-s 10 \
-    --t-int-fast-native 32 \
+    --t-int-fast-native 128 \
     --n-grid 64 \
     --report-dir "${REPORT_THR}" \
     || fail "fast_path_throughput bench failed"
@@ -422,7 +424,7 @@ echo "  [info] throughput bench output: ${REPORT_THR}"
 REPORT_SS="${REPORT_BASE}/M3-static-sky"
 python -m bench.static_sky_subtract \
     --n-blocks 24 \
-    --t-int-fast-native 32 \
+    --t-int-fast-native 128 \
     --n-grid 64 \
     --report-dir "${REPORT_SS}" \
     || fail "static_sky_subtract bench failed"
