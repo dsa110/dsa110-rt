@@ -379,7 +379,7 @@ def render_candidates_table_html(
         f"<table>{head}{rows_html}</table>"
         "</body></html>\n"
     )
-    out_path.write_text(html)
+    out_path.write_text(html, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -500,5 +500,5 @@ def stitch_search_html_report(
     )
 
     report_path = out_dir / "report.html"
-    report_path.write_text(html)
+    report_path.write_text(html, encoding="utf-8")
     return report_path

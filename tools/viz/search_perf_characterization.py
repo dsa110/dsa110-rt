@@ -778,7 +778,7 @@ def render_report_html(
         headline_html=headline_html,
         pareto_table_html=pareto_table_html,
     )
-    (out_dir / "report.html").write_text(html)
+    (out_dir / "report.html").write_text(html, encoding="utf-8")
 
 
 def write_pareto_json(out_dir: Path, points: Sequence[ParetoPoint]) -> None:
@@ -804,7 +804,7 @@ def write_pareto_json(out_dir: Path, points: Sequence[ParetoPoint]) -> None:
             "recovery_summary_path": p.recovery_summary_path,
             "throughput_summary_path": p.throughput_summary_path,
         })
-    (out_dir / "pareto.json").write_text(json.dumps(out, indent=2))
+    (out_dir / "pareto.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

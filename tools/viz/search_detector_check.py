@@ -357,7 +357,7 @@ def _render_cube_injection_report(
             f"empirical={s.empirical_per_cube_per_kernel:.3e} "
             f"analytic={s.analytic_per_cube_per_kernel:.3e}"
         )
-    (out_dir / "report.txt").write_text("\n".join(summary_lines) + "\n")
+    (out_dir / "report.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
     return report_path
 
