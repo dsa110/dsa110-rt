@@ -466,3 +466,26 @@ default)."""
 RFI_SUM_THRESHOLD_ETA_DEFAULT: float = 1.5
 """SumThreshold post-pass threshold-shape parameter (Offringa 2010
 default; per-window threshold is ``M / η^log2(M)``)."""
+
+
+# ---------------------------------------------------------------------------
+# Coarse-DM stage-2 (M3 chunk 3b; plan §4.2 step 8b + §3.6.2 stage-2 FIFO)
+# ---------------------------------------------------------------------------
+
+COARSE_DM_FIFO_DEPTH_DEFAULT: int = 4
+"""Default depth (in cubes) of :class:`dsart.coarse_dm.Stage2FIFO`.
+
+The corr-side production stage-2 FIFO depth is `Δt_samples_corr_stage2[g, c] /
+t_int_factor` and is per-(chgroup, coarse_dm) (plan §3.6.2 / §4.2 streaming
+pipeline lines 1322-1346) — but that contract is enforced at the
+``corr_fast_compute`` integration site (chunk 4) which sizes per-(g, c)
+against the canonical :class:`dsart.common.contracts.DmPlan.time_shift_corr_stage2`
+table. The constant pinned here is the chunk-3b *FIFO container* default
+depth (uniform across all (g, c) slots) — it sets the cube-count
+capacity of the cross-coarse-DM detector-context window on the SEARCH
+side (plan §3.6.12 ``T_det``) and the smoke-test transport-TX FIFO on
+the corr side. M5's search-side detector (parent's coordination) reads
+this default but is free to override per ``configs/config_compute_search.yaml``.
+4 = ``ceil(T_det_default / cube_dt)`` at the default operating point
+(``T_det = 512`` search samples × 524.288 µs / cube ≈ 134.218 ms ≈
+``BLOCK_DURATION_S``)."""
