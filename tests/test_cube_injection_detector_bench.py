@@ -153,3 +153,113 @@ def test_bench_match_radius_helpers() -> None:
     fdm, t = bench_mod._kernel_match_radius("garbage")
     assert fdm == bench_mod.RECOVERY_FDM_TOL
     assert t == bench_mod.RECOVERY_T_TOL
+
+
+# ---------------------------------------------------------------------------
+# Chunk 6c-α: bank-mask parser + end-to-end small bank
+# ---------------------------------------------------------------------------
+
+
+def test_parse_bank_mask_default_is_full_bank() -> None:
+    """``None`` / empty / ``"*"`` resolves to the full 128-triple bank."""
+    from dsart.common.constants import (
+        DETECTOR_DM_KERNELS,
+        DETECTOR_IMAGE_KERNELS,
+        DETECTOR_TIME_KERNELS,
+    )
+
+    for spec in (None, "", "  ", "*"):
+        img, dm, t = bench_mod.parse_bank_mask(spec)
+        assert img == DETECTOR_IMAGE_KERNELS
+        assert dm == DETECTOR_DM_KERNELS
+        assert t == DETECTOR_TIME_KERNELS
+
+
+def test_parse_bank_mask_axis_subsets() -> None:
+    """Per-axis subsets resolve to the requested tokens; unspecified
+    axes keep their full default."""
+    from dsart.common.constants import (
+        DETECTOR_DM_KERNELS,
+        DETECTOR_IMAGE_KERNELS,
+        DETECTOR_TIME_KERNELS,
+    )
+
+    img, dm, t = bench_mod.parse_bank_mask("k_img=unit")
+    assert img == ("unit",)
+    assert dm == DETECTOR_DM_KERNELS
+    assert t == DETECTOR_TIME_KERNELS
+
+    img, dm, t = bench_mod.parse_bank_mask("k_dm=d1")
+    assert img == DETECTOR_IMAGE_KERNELS
+    assert dm == ("d1",)
+    assert t == DETECTOR_TIME_KERNELS
+
+    img, dm, t = bench_mod.parse_bank_mask("k_img=unit;k_dm=d1")
+    assert img == ("unit",)
+    assert dm == ("d1",)
+    assert t == DETECTOR_TIME_KERNELS
+
+    img, dm, t = bench_mod.parse_bank_mask("k_time=b8,b16,b32")
+    assert img == DETECTOR_IMAGE_KERNELS
+    assert dm == DETECTOR_DM_KERNELS
+    assert t == ("b8", "b16", "b32")
+
+
+def test_parse_bank_mask_glob_per_axis() -> None:
+    """An explicit ``axis=*`` clause keeps that axis full."""
+    img, dm, t = bench_mod.parse_bank_mask("k_img=*;k_dm=d1")
+    from dsart.common.constants import (
+        DETECTOR_IMAGE_KERNELS,
+        DETECTOR_TIME_KERNELS,
+    )
+    assert img == DETECTOR_IMAGE_KERNELS
+    assert dm == ("d1",)
+    assert t == DETECTOR_TIME_KERNELS
+
+
+def test_parse_bank_mask_rejects_unknown_axis() -> None:
+    with pytest.raises(ValueError, match="bank-mask axis"):
+        bench_mod.parse_bank_mask("k_xxx=unit")
+
+
+def test_parse_bank_mask_rejects_unknown_token() -> None:
+    with pytest.raises(ValueError, match="bank-mask token"):
+        bench_mod.parse_bank_mask("k_img=quokka")
+    with pytest.raises(ValueError, match="bank-mask token"):
+        bench_mod.parse_bank_mask("k_dm=d99")
+    with pytest.raises(ValueError, match="bank-mask token"):
+        bench_mod.parse_bank_mask("k_time=b3")
+
+
+def test_parse_bank_mask_rejects_missing_eq() -> None:
+    with pytest.raises(ValueError, match="missing '='"):
+        bench_mod.parse_bank_mask("k_img unit")
+
+
+def test_parse_bank_mask_rejects_empty_subset() -> None:
+    with pytest.raises(ValueError, match="empty token list"):
+        bench_mod.parse_bank_mask("k_img=,,")
+
+
+def test_bench_runs_with_bank_mask(tmp_path: Path) -> None:
+    """End-to-end: run the bench with a 1×1×8 = 8-kernel sub-bank
+    (the aggressive K_img + K_dm collapse) and verify summary.json
+    reflects the resolved tokens and kernel count."""
+    out = tmp_path / "bank_mask_smoke"
+    rc = bench_mod.main([
+        "--quick-sweep",
+        "--listener-port", "0",
+        "--seed", "43",
+        "--bank-mask", "k_img=unit;k_dm=d1",
+        "--out", str(out),
+    ])
+    assert rc == 0, f"bench exited {rc}"
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["config"]["bank_mask"] == "k_img=unit;k_dm=d1"
+    resolved = summary["config"]["bank_mask_resolved"]
+    assert resolved["k_img"] == ["unit"]
+    assert resolved["k_dm"] == ["d1"]
+    assert len(resolved["k_time"]) == 8  # K_time stays full per Chunk 6c
+    assert resolved["n_kernels"] == 1 * 1 * 8
+    if summary["far"]:
+        assert all(s["n_kernels"] == 8 for s in summary["far"])

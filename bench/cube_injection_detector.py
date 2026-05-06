@@ -67,8 +67,14 @@ os.environ.setdefault("DSART_TEST", "1")  # enable contract __post_init__ checks
 
 import torch  # noqa: E402
 
+from dsart.common.constants import (  # noqa: E402
+    DETECTOR_DM_KERNELS,
+    DETECTOR_IMAGE_KERNELS,
+    DETECTOR_TIME_KERNELS,
+)
 from dsart.common.contracts import Candidate  # noqa: E402
 from dsart.detector.forward import DeterministicDetector  # noqa: E402
+from dsart.detector.kernels import build_kernel_bank  # noqa: E402
 from dsart.inject.cube_injection import (  # noqa: E402
     CubeInjectionConfig,
     iter_snr_width_grid,
@@ -143,6 +149,94 @@ RECOVERY_T_TOL: int = 64  # absorbs the K_time = 128 boxcar response width
 
 
 # ---------------------------------------------------------------------------
+# Bank-mask parser (Chunk 6c-α)
+# ---------------------------------------------------------------------------
+# The ``--bank-mask`` flag pins a subset of the K_img × K_dm × K_time bank
+# axes for the detector kernel-bank construction. Syntax:
+#
+#   "k_img=<tokens>;k_dm=<tokens>;k_time=<tokens>"
+#
+# where ``<tokens>`` is either ``"*"`` (= keep all, default for unspecified
+# axes) or a comma-separated subset, e.g. ``"unit"``, ``"unit,psf"``,
+# ``"d1"``, ``"d1,d3"``, ``"b8,b16,b32"``. Whitespace around tokens is
+# stripped. Unknown axis keys raise ValueError.
+#
+# Examples (per Chunk 6c plan):
+#
+#   --bank-mask "k_img=*;k_dm=*;k_time=*"           # full 128 (baseline)
+#   --bank-mask "k_img=unit"                        # 1×4×8 = 32  (collapse K_img)
+#   --bank-mask "k_dm=d1"                           # 4×1×8 = 32  (drop K_dm filters)
+#   --bank-mask "k_img=unit;k_dm=d1"                # 1×1×8 =  8  (aggressive)
+#
+# K_time stays full per the operator decision (Chunk 6c framing) — the
+# matched-filter time-width axis is the SNR-critical axis.
+
+_BANK_AXIS_DOMAIN: dict[str, tuple[str, ...]] = {
+    "k_img": DETECTOR_IMAGE_KERNELS,
+    "k_dm": DETECTOR_DM_KERNELS,
+    "k_time": DETECTOR_TIME_KERNELS,
+}
+
+
+def parse_bank_mask(
+    spec: Optional[str],
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+    """Parse a ``--bank-mask`` CLI string into (image, dm, time) subsets.
+
+    Returns a tuple ``(image_tokens, dm_tokens, time_tokens)`` of resolved
+    token tuples. ``None`` / empty / ``"*"`` returns the full default bank.
+
+    Raises:
+        ValueError: on unknown axis keys, unknown tokens, or empty subsets.
+    """
+    image_tokens: Tuple[str, ...] = DETECTOR_IMAGE_KERNELS
+    dm_tokens: Tuple[str, ...] = DETECTOR_DM_KERNELS
+    time_tokens: Tuple[str, ...] = DETECTOR_TIME_KERNELS
+
+    if spec is None or not spec.strip() or spec.strip() == "*":
+        return image_tokens, dm_tokens, time_tokens
+
+    overrides: dict[str, Tuple[str, ...]] = {}
+    for clause in spec.split(";"):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if "=" not in clause:
+            raise ValueError(
+                f"bank-mask clause {clause!r} missing '=' "
+                f"(expected '<axis>=<tokens>')"
+            )
+        axis, raw_tokens = clause.split("=", 1)
+        axis = axis.strip().lower()
+        if axis not in _BANK_AXIS_DOMAIN:
+            raise ValueError(
+                f"bank-mask axis {axis!r} not one of "
+                f"{sorted(_BANK_AXIS_DOMAIN)}"
+            )
+        tokens_text = raw_tokens.strip()
+        if tokens_text == "*":
+            overrides[axis] = _BANK_AXIS_DOMAIN[axis]
+            continue
+        toks = tuple(t.strip() for t in tokens_text.split(",") if t.strip())
+        if not toks:
+            raise ValueError(
+                f"bank-mask axis {axis!r} resolves to empty token list"
+            )
+        domain = _BANK_AXIS_DOMAIN[axis]
+        for t in toks:
+            if t not in domain:
+                raise ValueError(
+                    f"bank-mask token {t!r} not in {axis} domain {domain}"
+                )
+        overrides[axis] = toks
+
+    image_tokens = overrides.get("k_img", image_tokens)
+    dm_tokens = overrides.get("k_dm", dm_tokens)
+    time_tokens = overrides.get("k_time", time_tokens)
+    return image_tokens, dm_tokens, time_tokens
+
+
+# ---------------------------------------------------------------------------
 # Bench data classes
 # ---------------------------------------------------------------------------
 
@@ -192,6 +286,9 @@ def _build_detector(
     n_fdm: int,
     threshold_sigma: float,
     seed: int,
+    image_tokens: Sequence[str] = DETECTOR_IMAGE_KERNELS,
+    dm_tokens: Sequence[str] = DETECTOR_DM_KERNELS,
+    time_tokens: Sequence[str] = DETECTOR_TIME_KERNELS,
 ) -> DeterministicDetector:
     """Construct a fresh DeterministicDetector for the bench.
 
@@ -199,9 +296,20 @@ def _build_detector(
     Layer-2 σ_k EMA warm-up (and the ``NOISE_WARMUP`` flag) does not
     leak across unrelated cells. Layer-2 burn-in is short-circuited by
     seeding ``s_k`` to the analytic √(K_dm × K_time) values.
+
+    The kernel bank is constructed from the (image, dm, time) token
+    subsets so the bench can sweep bank-mask configurations per
+    Chunk 6c-α. Default subsets reproduce the full 128-triple bank.
     """
     torch.manual_seed(seed)
+    bank = build_kernel_bank(
+        image_tokens=tuple(image_tokens),
+        dm_tokens=tuple(dm_tokens),
+        time_tokens=tuple(time_tokens),
+        dtype=torch.float32,
+    )
     return DeterministicDetector(
+        kernel_bank=bank,
         threshold_sigma=threshold_sigma,
         detector_version="v1.M5",
         dtype=torch.float32,
@@ -334,6 +442,11 @@ async def _bench_main(args: argparse.Namespace) -> int:
     n_fdm = int(args.n_fdm)
     n_grid = int(args.n_grid)
 
+    image_tokens, dm_tokens, time_tokens = parse_bank_mask(args.bank_mask)
+    n_kernels_total = (
+        len(image_tokens) * len(dm_tokens) * len(time_tokens)
+    )
+
     if args.quick_sweep:
         n_trials = max(min(n_trials, 1), 1)
         n_noise_cubes = max(min(n_noise_cubes, 2), 1)
@@ -356,6 +469,11 @@ async def _bench_main(args: argparse.Namespace) -> int:
         "T_det=%d N_fdm=%d N_grid=%d threshold=%.2fσ",
         list(snrs), list(widths), n_trials, n_noise_cubes,
         t_det, n_fdm, n_grid, BENCH_DETECTOR_THRESHOLD_SIGMA,
+    )
+    _LOG.info(
+        "bank-mask: k_img=%s k_dm=%s k_time=%s (total %d kernel triples)",
+        list(image_tokens), list(dm_tokens), list(time_tokens),
+        n_kernels_total,
     )
 
     # Common injection geometry: phase centre, mid-DM, mid-time. Plan
@@ -402,7 +520,7 @@ async def _bench_main(args: argparse.Namespace) -> int:
     cell_results: List[CellResult] = []
     score_per_kernel_per_cell: dict = {}  # (snr, width) → kernel_id → snr value
     noise_summary = NoiseOnlySummary(
-        n_cubes=0, n_kernels=128,
+        n_cubes=0, n_kernels=n_kernels_total,
     )
     injection_log_lines: List[str] = []
     noise_only_log_lines: List[str] = []
@@ -437,6 +555,9 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 n_fdm=n_fdm,
                 threshold_sigma=BENCH_DETECTOR_THRESHOLD_SIGMA,
                 seed=cell_seed,
+                image_tokens=image_tokens,
+                dm_tokens=dm_tokens,
+                time_tokens=time_tokens,
             )
             recovered_snrs: List[float] = []
             matched_kernel_id: Optional[str] = None
@@ -535,6 +656,9 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 n_fdm=n_fdm,
                 threshold_sigma=BENCH_DETECTOR_THRESHOLD_SIGMA,
                 seed=args.seed + 9999,
+                image_tokens=image_tokens,
+                dm_tokens=dm_tokens,
+                time_tokens=time_tokens,
             )
             for cube_idx in range(n_noise_cubes):
                 cube_id_counter += 1
@@ -620,6 +744,13 @@ async def _bench_main(args: argparse.Namespace) -> int:
             "listener_port": listener.port,
             "quick_sweep": bool(args.quick_sweep),
             "seed": int(args.seed),
+            "bank_mask": args.bank_mask,
+            "bank_mask_resolved": {
+                "k_img": list(image_tokens),
+                "k_dm": list(dm_tokens),
+                "k_time": list(time_tokens),
+                "n_kernels": n_kernels_total,
+            },
         },
         "cells": [
             {
@@ -711,6 +842,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--seed", type=int, default=20260506,
         help="RNG seed (Layer-2 EMA ⊕ injection ⊕ noise; deterministic).",
+    )
+    ap.add_argument(
+        "--bank-mask", type=str, default=None,
+        help="Detector kernel-bank subset, e.g. "
+             "'k_img=unit;k_dm=d1;k_time=*' to keep only the unit image "
+             "kernel × d1 DM kernel × all 8 time kernels. Each axis "
+             "defaults to '*' (full subset). Default: None = full 128 "
+             "triple bank. Used by Chunk 6c-α perf-vs-quality sweeps.",
     )
     ap.add_argument(
         "--out", type=str, default=str(_default_out_dir()),
