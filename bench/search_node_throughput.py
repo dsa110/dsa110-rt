@@ -242,20 +242,32 @@ async def _bench_main(args: argparse.Namespace) -> int:
         rng=np.random.default_rng(int(args.rng_seed)),
         cube_cadence_s=cube_cadence_s,
     )
+    device = str(args.device)
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    cube_dtype = torch.float16 if (
+        args.cube_dtype == "fp16" and device != "cpu"
+    ) else torch.float32
+    detector_dtype = torch.float16 if (
+        args.cube_dtype == "fp16" and device != "cpu"
+    ) else torch.float32
+    _LOG.info("device=%s cube_dtype=%s", device, cube_dtype)
+    detector = DeterministicDetector(
+        threshold_sigma=threshold_sigma,
+        detector_version="v1.M5",
+        search_node_id=1,
+        gpu_half=1,
+        dtype=detector_dtype,
+    )
+    detector = detector.to(torch.device(device))
     pipeline = CubePipeline(
         config=CubePipelineConfig(
             n_grid=n_grid,
             edge_mask_kernel_support=5,
-            cube_dtype=torch.float32,  # h01 CPU path
-            device="cpu",
+            cube_dtype=cube_dtype,
+            device=device,
         ),
-        detector=DeterministicDetector(
-            threshold_sigma=threshold_sigma,
-            detector_version="v1.M5",
-            search_node_id=1,
-            gpu_half=1,
-            dtype=torch.float32,
-        ),
+        detector=detector,
         layer1_state=Layer1State(n_fdm=n_fdm, n_burnin_cubes=5),
     )
 
@@ -345,8 +357,8 @@ async def _bench_main(args: argparse.Namespace) -> int:
             "n_grid": n_grid,
             "threshold_sigma": threshold_sigma,
             "rng_seed": int(args.rng_seed),
-            "device": "cpu",
-            "cube_dtype": "float32",
+            "device": device,
+            "cube_dtype": str(cube_dtype).rsplit(".", 1)[-1],
         },
         "wall_clock_s": bench_wall_s,
         "achieved_cubes_per_s": (
@@ -401,6 +413,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--listener-port", type=int, default=DEFAULT_LISTENER_PORT,
     )
     parser.add_argument("--rng-seed", type=int, default=0)
+    parser.add_argument(
+        "--device", type=str, default="cpu",
+        help="torch device for the detector + cube ('cpu', 'cuda', "
+             "'cuda:0', 'auto'). Combiner + imager always run on CPU "
+             "in chunk-6b-α (the GPU sparse-scatter+cuFFT lands in the "
+             "production hardening pass).",
+    )
+    parser.add_argument(
+        "--cube-dtype", type=str, default="fp32", choices=("fp32", "fp16"),
+        help="Cube + detector dtype. fp16 only valid with --device cuda* "
+             "(plan §3.6.11 production pin).",
+    )
     parser.add_argument(
         "--out", type=str,
         default=str(REPO_ROOT / "bench" / "reports" / "throughput" / "M5"),
