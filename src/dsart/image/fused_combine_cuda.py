@@ -1,6 +1,18 @@
 """src/dsart/image/fused_combine_cuda.py — fused per-fdm combine CUDA
 kernel for the M5 imager.
 
+NOTE: requires GCC ≥ 9 (PyTorch 2.x ABI requirement). On h01 the
+system gcc is 7.5; we install ``gcc_linux-64`` / ``gxx_linux-64`` via
+conda-forge into the ``dsa110-rt`` env (gives gcc 15.2.0) and point
+``CC`` / ``CXX`` at the conda compiler before calling load_inline.
+``ninja`` is also a build-time dep (``pip install ninja`` in the
+conda env). One-time conda env setup:
+
+    conda activate dsa110-rt
+    conda install -c conda-forge "gxx_linux-64>=9" "gcc_linux-64>=9"
+    pip install ninja
+
+
 Memory pattern of the chunk-6c-follow-up bench combine step:
 
   for f in range(N_fdm):
@@ -34,11 +46,27 @@ python_addloop`` for the A/B-compare baseline).
 from __future__ import annotations
 
 import logging
+import os
+import sys
+from pathlib import Path
 from typing import Optional
 
 import torch
 
 _LOG = logging.getLogger(__name__)
+
+# C++ forward-declaration required by the load_inline auto-generated
+# main.cpp (which contains the pybind11 binding and references the
+# function defined in the .cu file). Without this, the main.cpp
+# pybind11 macro can't resolve the symbol.
+_CPP_DECL = r"""
+#include <torch/extension.h>
+
+void fused_combine_per_fdm(
+    torch::Tensor streams,
+    torch::Tensor shifts,
+    torch::Tensor output);
+"""
 
 # ---------------------------------------------------------------------------
 # CUDA source
@@ -49,6 +77,7 @@ _LOG = logging.getLogger(__name__)
 # reinterpret_cast on the data pointer.
 _CUDA_SOURCE = r"""
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -180,10 +209,6 @@ void fused_combine_per_fdm(
     }
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_combine_per_fdm", &fused_combine_per_fdm,
-          "Fused per-fdm 16-chgroup combine (M5 imager)");
-}
 """
 
 # ---------------------------------------------------------------------------
@@ -191,6 +216,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 # ---------------------------------------------------------------------------
 
 _MODULE_CACHE: Optional[object] = None
+
+
+def _ensure_conda_gcc_on_path() -> None:
+    """Set CC/CXX env vars to the conda-forge gcc/g++ if available.
+
+    PyTorch 2.x C++ extensions require GCC ≥ 9; h01's system gcc is
+    7.5. The dsa110-rt conda env carries gcc_linux-64 / gxx_linux-64
+    (15.x); we point the build at it via env vars. No-op on systems
+    where the conda compilers aren't installed (caller falls back to
+    whatever ``cc`` / ``c++`` resolve to and may fail with the 7.5
+    error — that's recoverable: re-run ``conda install gxx_linux-64``).
+    """
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if not conda_prefix:
+        return
+    bindir = Path(conda_prefix) / "bin"
+    cc_path = bindir / "x86_64-conda-linux-gnu-gcc"
+    cxx_path = bindir / "x86_64-conda-linux-gnu-g++"
+    if cc_path.is_file() and cxx_path.is_file():
+        os.environ["CC"] = str(cc_path)
+        os.environ["CXX"] = str(cxx_path)
 
 
 def get_module(verbose: bool = False) -> object:
@@ -208,11 +254,12 @@ def get_module(verbose: bool = False) -> object:
         return _MODULE_CACHE
     if not torch.cuda.is_available():
         raise RuntimeError("fused_combine_cuda requires cuda")
+    _ensure_conda_gcc_on_path()
     from torch.utils.cpp_extension import load_inline
     _LOG.info("compiling fused_combine_cuda extension (this takes ~30 s on first run)...")
     mod = load_inline(
         name="dsart_fused_combine_cuda",
-        cpp_sources="",
+        cpp_sources=_CPP_DECL,
         cuda_sources=_CUDA_SOURCE,
         functions=["fused_combine_per_fdm"],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
