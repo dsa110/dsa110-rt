@@ -275,6 +275,58 @@ python -m pytest tests/test_corr_fast_integration.py -q --tb=short \
   || fail "corr_fast_integration acceptance pytests failed"
 pass
 
+# --- chunk 5: voltage-fixture continuum imager (0319+415) ------------------
+# Two-stage gate (mirrors the chunk-4 pattern):
+# 1) tests/test_voltage_fixture_replay.py — 8 CPU-only smoke tests for
+#    the bench/_corr_fast_replay.py helper (block iteration, replay loop,
+#    sparse->dense scatter, lm/pixel round-trip). Always run.
+# 2) bench/corr_fast_continuum_0319.py — the real-data 16-chgroup imager
+#    against /home/ubuntu/data/voltages/0319/*. Runs ONLY on hosts that
+#    have the fixture tree (h01); h23 / dev hosts SKIP the real bench.
+#    PASS gate: combined_peak_offset_cells <= 4 (16-chgroup-summed dirty
+#    image with predicted (l, m) from run_0319_pipeline._compute_expected_lm).
+STEP="chunk_5_voltage_fixture_continuum"
+python -m pytest tests/test_voltage_fixture_replay.py -q --tb=short \
+  || fail "voltage-fixture replay helper acceptance pytests failed"
+if [[ -d /home/ubuntu/data/voltages/0319 ]]; then
+  REPORT_DIR="${REPO_ROOT}/bench/reports/$(date -u +%Y%m%dT%H%M%SZ)/M3-continuum-0319"
+  python -m bench.corr_fast_continuum_0319 \
+      --voltage-root /home/ubuntu/data/voltages/0319 \
+      --n-blocks 4 \
+      --t-int-fast-native 4096 \
+      --n-grid 256 \
+      --report-dir "${REPORT_DIR}" \
+      || fail "0319+415 continuum bench failed"
+  echo "  [info] continuum bench output: ${REPORT_DIR}"
+else
+  echo "  [info] /home/ubuntu/data/voltages/0319 not present; SKIP real bench"
+fi
+pass
+
+# --- chunk 6: voltage-fixture burst imager (250924mptq) --------------------
+# Same dual-mode pattern as chunk 5. Helper pytests are gated by chunk 5
+# above; chunk 6 only adds the real bench gate.
+# PASS gate: peak_offset_cells <= 4 AND peak_t_offset_native_samples <= 32
+# (operator-tunable on the burst bench CLI). The within-chgroup dispersion
+# smear (~14 ms) means the strict t-offset gate is at the edge of what's
+# achievable without per-channel intra-chgroup dedispersion (see F25 +
+# the bench module docstring); the bench surfaces an explicit knob.
+STEP="chunk_6_voltage_fixture_burst_250924mptq"
+if [[ -d /home/ubuntu/data/voltages/250924mptq ]]; then
+  REPORT_DIR="${REPO_ROOT}/bench/reports/$(date -u +%Y%m%dT%H%M%SZ)/M3-burst-250924mptq"
+  python -m bench.corr_fast_burst_250924mptq \
+      --voltage-root /home/ubuntu/data/voltages/250924mptq \
+      --n-blocks 8 \
+      --t-int-fast-native 32 \
+      --n-grid 256 \
+      --report-dir "${REPORT_DIR}" \
+      || fail "250924mptq burst bench failed"
+  echo "  [info] burst bench output: ${REPORT_DIR}"
+else
+  echo "  [info] /home/ubuntu/data/voltages/250924mptq not present; SKIP real bench"
+fi
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
@@ -288,10 +340,10 @@ CHUNKS_DONE=(
   "chunk_3c_rfi_flagger"
   "chunk_3d_online_injector"
   "chunk_4_corr_fast_integration"
-)
-CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_5_voltage_fixture_continuum"
   "chunk_6_voltage_fixture_burst_250924mptq"
+)
+CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_7_16chgroup_alignment_preview"
   "chunk_8_transport_loopback_capture"
   "chunk_9_dod_orchestrator_completion"
@@ -343,11 +395,11 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_3b_coarse_dm",
     "chunk_3c_rfi_flagger",
     "chunk_3d_online_injector",
-    "chunk_4_corr_fast_integration"
+    "chunk_4_corr_fast_integration",
+    "chunk_5_voltage_fixture_continuum",
+    "chunk_6_voltage_fixture_burst_250924mptq"
   ],
   "chunks_remaining": [
-    "chunk_5_voltage_fixture_continuum",
-    "chunk_6_voltage_fixture_burst_250924mptq",
     "chunk_7_16chgroup_alignment_preview",
     "chunk_8_transport_loopback_capture",
     "chunk_9_dod_orchestrator_completion",
