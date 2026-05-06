@@ -2,9 +2,11 @@
 
 Mode-synthetic produces a ``run.json`` with the expected fields and
 the gate fires PASS for a strong injection at known (l_pix, m_pix,
-fine_dm_idx, t_in_cube). Mode-captured raises ``NotImplementedError``
-pending M3's captured-NPZ schema (F6); we test that it raises
-cleanly with an actionable error message.
+fine_dm_idx, t_in_cube). Mode-captured (post F6 resolution
+2026-05-06) loads the M3-published captured-NPZ set via
+``dsart.transport.captured_npz`` and emits an INSPECTION_ONLY run
+record (cube shape + T2 truth) — the operator-facing detector sweep
+against the captured stack is the next chunk-7 hardening item.
 """
 
 from __future__ import annotations
@@ -70,21 +72,19 @@ def test_synthetic_mode_recovers_strong_injection(tmp_path) -> None:
     assert abs(rec["m_pix"] - burst["m_pix"]) <= 2
 
 
-def test_captured_mode_raises_until_m3_schema_locked(tmp_path) -> None:
-    """F6: M3 owns the captured-npz schema. Until the schema is
-    published, the captured-mode loader raises NotImplementedError
-    with an actionable message pointing at the chunk-7 hardening.
-    """
-    bogus_dir = tmp_path / "fake_captures"
-    bogus_dir.mkdir()
-    with pytest.raises(NotImplementedError, match="F6|captured-npz schema|M3"):
-        _load_captured_npz_set(bogus_dir)
+def test_captured_mode_raises_on_missing_manifest(tmp_path) -> None:
+    """Captured-mode loader (F6 resolved) raises ``FileNotFoundError``
+    if ``manifest.json`` is missing from the captured dir."""
+    empty_dir = tmp_path / "fake_captures"
+    empty_dir.mkdir()
+    with pytest.raises(FileNotFoundError, match="manifest.json"):
+        _load_captured_npz_set(empty_dir)
 
 
 def test_captured_mode_cli_requires_captured_dir(tmp_path) -> None:
     """``--mode captured`` without ``--captured-dir`` should fail
-    with a clear error. The CLI exits via SystemExit before the
-    NotImplementedError fires.
+    with a clear error. The CLI exits via ``SystemExit`` before the
+    loader is invoked.
     """
     with pytest.raises(SystemExit):
         main([
@@ -92,3 +92,44 @@ def test_captured_mode_cli_requires_captured_dir(tmp_path) -> None:
             "--out", str(tmp_path),
             "--listener-port", "0",
         ])
+
+
+def test_captured_mode_inspection_only_run_record(tmp_path) -> None:
+    """``--mode captured --captured-dir <synthetic-fixture>`` writes
+    an INSPECTION_ONLY ``run.json`` capturing the M3 → M5 cube shape
+    + T2 truth. The detector sweep itself is a follow-up chunk-7
+    hardening item; this test only verifies the loader-bench glue.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_captured_npz import _write_synthetic_fixture  # noqa: E402
+
+    captured_dir = tmp_path / "captured"
+    _write_synthetic_fixture(
+        captured_dir,
+        n_chgroups_present=4,
+        n_fv_total=3,
+        n_grid=8,
+        run_id="testrun",
+        is_burst=True,
+    )
+    out = tmp_path / "out"
+    rc = main([
+        "--mode", "captured",
+        "--captured-dir", str(captured_dir),
+        "--out", str(out),
+        "--listener-port", "0",
+    ])
+    assert rc == 0
+    run_path = out / "run.json"
+    assert run_path.exists()
+    rec = json.loads(run_path.read_text())
+    assert rec["mode"] == "captured"
+    assert rec["gate_status"] == "INSPECTION_ONLY"
+    assert rec["manifest"]["run_id"] == "testrun"
+    assert rec["manifest"]["src_truth"]["is_burst"] is True
+    shp = rec["streams_shape"]
+    assert shp["n_chgroup_total"] == 16
+    assert shp["n_chgroup_present"] == 4
+    assert shp["n_fv_total"] == 3
+    assert shp["n_grid"] == 8
+    assert sum(shp["valid_mask"]) == 4

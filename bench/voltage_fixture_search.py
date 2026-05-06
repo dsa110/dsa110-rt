@@ -22,13 +22,19 @@ Two CLI modes:
 
   * ``--mode captured`` (M5 closure path; needs M3 captures):
         Loads the M3-emitted ``.npz`` set from
-        ``--captured-dir <path>`` (per F6 schema; the loader will
-        adapt to M3's published schema during chunk-7 hardening),
-        rebuilds the per-chgroup uv-grid streams, drives the search-
-        compute pipeline at production cube geometry, and stamps
-        ``bench/reports/M5/m_operator_approved.yaml`` with PASS only
-        after operator inspection of the recovered (l, m, fine_dm)
-        cell against the fixture's known truth.
+        ``--captured-dir <path>`` via
+        :func:`dsart.transport.captured_npz.load_captured_run` (F6
+        resolved 2026-05-06; M3 chunk-8 fixture writer is at
+        ``bench/m3_emit_m5_fixtures.py``), rebuilds the per-chgroup
+        ``[N_chgroup=16, n_fv_total, N_grid, N_grid]`` uv-grid stream
+        stack, and currently emits an INSPECTION_ONLY record (cube
+        shape + T2 truth + valid_mask). The detector sweep against
+        the captured stack is the next chunk-7 hardening item — once
+        the fused-combine GPU path supports cf64-input cubes (or the
+        cf64 → cint8 quant step is wired), the bench will close the
+        loop and stamp ``bench/reports/M5/m_operator_approved.yaml``
+        with PASS only after operator inspection of the recovered
+        (l, m, fine_dm) cell against the fixture's T2 truth.
 
 Outputs (under ``--out``):
 
@@ -42,8 +48,9 @@ Outputs (under ``--out``):
 
 Operator gate semantics:
   * synthetic: PASS/FAIL automatic (recovery_window check).
-  * captured: NEEDS_OPERATOR until the bench is wired against M3's
-    real npz schema + the operator inspects the report.
+  * captured: INSPECTION_ONLY (loader smoke-test) → NEEDS_OPERATOR
+    once the detector sweep is wired (chunk-7 hardening). PASS lands
+    when the operator approves a recovered burst against fixture truth.
 """
 
 from __future__ import annotations
@@ -171,39 +178,53 @@ def _build_dm_grids(n_fdm: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def _load_captured_npz_set(
     captured_dir: Path,
-) -> Tuple[Dict[int, np.ndarray], Dict[str, object]]:
+) -> Tuple[np.ndarray, List[bool], "CapturedManifest"]:
     """Load the M3-emitted captured transport-TX ``.npz`` set.
 
-    F6 documents the M3 → M5 coupling point: M3 owns the schema
-    (the chunk-6 burst bench produces 16 ``.npz`` files, one per
-    chgroup, each containing the post-stage-2 dedispersed dense
-    uv-grid stream + a sidecar manifest with the cube geometry).
-    Per F6 the schema is intended to land in
-    ``src/dsart/transport/captured_npz.py`` once M3 chunk-8 hardens.
+    F6 (M3 → M5 coupling point) was resolved 2026-05-06: the schema
+    + on-disk layout are documented in
+    ``src/dsart/transport/captured_npz.py`` and produced by the M3
+    bench ``bench/m3_emit_m5_fixtures.py`` (M3 worktree, commit
+    f9981f8). M3 emits per-chgroup F26 sparse-COO NPZ + a manifest
+    under ``/home/ubuntu/data/m5_fixtures/<run_id>/``.
 
-    Until the schema is locked, this loader raises a clear error
-    pointing at the chunk-7 hardening TODO. The mode-synthetic path
-    (default) does NOT call this function and so the chunk-7 chunk-7
-    skeleton lands without an M3 dependency.
+    This wrapper:
+    1. Loads + validates the manifest + every chgroup NPZ (strict
+       schema check; missing fields raise ValueError).
+    2. Scatters each chgroup's sparse-COO vis cube to a dense
+       ``[n_fv_total, N_grid, N_grid] complex64`` slab.
+    3. Stacks them into the production-shape
+       ``[N_chgroup=16, n_fv_total, N_grid, N_grid]`` array, with
+       missing chgroups (eg sb12 in 0319) zero-filled (consult
+       ``valid_mask`` for which slots are real).
 
     Args:
-        captured_dir: directory containing 16 ``.npz`` files +
-            ``manifest.json``.
+        captured_dir: directory containing ``manifest.json`` plus one
+            ``chgroupNN.npz`` per channel group (typically 16; 0319
+            is 15 due to the known sb12 data gap).
 
     Returns:
-        Tuple of (per-chgroup dense uv-streams dict, manifest dict).
+        Tuple of:
+        - ``streams`` ``[N_chgroup=16, n_fv_total, N_grid, N_grid]``
+          complex64 dense stack (zero-filled missing slots).
+        - ``valid_mask`` ``List[bool]`` of length 16, True at slots
+          that came from real data + False at zero-filled slots.
+        - ``manifest`` ``CapturedManifest`` with cross-chgroup metadata
+          + T2 truth (burst fixtures only).
 
     Raises:
-        NotImplementedError until M3 publishes the schema.
+        FileNotFoundError if manifest or any chgroup NPZ missing.
+        ValueError on schema violation or cross-chgroup invariant
+            disagreement.
     """
-    raise NotImplementedError(
-        "voltage_fixture_search.py mode=captured needs the M3-published "
-        "captured-npz schema (see M5_PLAN_FIXES.md F6). The chunk-7 "
-        "synthetic path is the immediate gate; chunk-7 hardening swaps "
-        "in the real loader once `src/dsart/transport/captured_npz.py` "
-        "is published by M3 (transport-TX → search-compute coupling "
-        "point per PARALLEL_AGENTS.md §1)."
+    from dsart.transport.captured_npz import (
+        load_captured_run, stack_dense_streams,
     )
+    chgroups, manifest = load_captured_run(captured_dir)
+    streams, valid_mask = stack_dense_streams(
+        chgroups, fill_missing=True, n_chgroup_total=16,
+    )
+    return streams, valid_mask, manifest
 
 
 # ---------------------------------------------------------------------------
@@ -369,17 +390,86 @@ async def _bench_synthetic(args: argparse.Namespace) -> Dict[str, object]:
 
 
 async def _bench_captured(args: argparse.Namespace) -> Dict[str, object]:
-    """End-to-end mode-captured run: M3-captured npz → CubePipeline →
-    emitter → listener. Currently raises NotImplementedError pending
-    M3's npz schema (F6).
+    """End-to-end mode-captured run: M3-captured NPZ → loader → cube
+    summary. Currently produces an INSPECTION-ONLY record (no detector
+    sweep) — the operator-facing M5 voltage-fixture-search end-to-end
+    detection gate (plan §8 line 2330) is the next chunk-7 hardening
+    step and requires:
+    1. Cube-builder wired to emit ``[T_det, N_grid, N_grid]`` cubes
+       from the loaded ``[N_chgroup=16, n_fv_total, N_grid, N_grid]``
+       streams (ie wrap the chunk-8 ``fused_combine_cuda`` GPU path
+       with cf64-input support, OR cf64 → cint8 quant followed by the
+       chunk-8 cint8-fused path).
+    2. (l, m, t_in_cube) burst-truth coordinates from
+       ``manifest.src_truth`` + the burst's MJD vs the dump-start MJD.
+    3. Pass/fail decision: detector recovers a candidate at the
+       expected (kernel, l, m, t) with SNR ≥ 8σ.
+    Until then this captured-mode run records the loader output (cube
+    geometry, T2 truth, valid_mask) so the operator can verify the
+    M3 → M5 hand-off shape is correct.
     """
     if not args.captured_dir:
         raise SystemExit(
             "--mode captured requires --captured-dir <path>"
         )
     captured_dir = Path(args.captured_dir).resolve()
-    _load_captured_npz_set(captured_dir)  # raises until F6 lands
-    return {}  # unreachable; here for type completeness
+    streams, valid_mask, manifest = _load_captured_npz_set(captured_dir)
+
+    n_chg, n_fv, n_grid, n_grid_y = streams.shape
+    assert n_grid == n_grid_y, "streams must be square"
+    n_valid = sum(valid_mask)
+    abs_max = float(np.abs(streams).max()) if streams.size else 0.0
+    abs_mean = float(np.abs(streams).mean()) if streams.size else 0.0
+
+    _LOG.info(
+        "captured loader: run=%s src_kind=%s n_chgroup_present=%d/%d "
+        "n_fv_total=%d N_grid=%d streams_bytes=%d (abs max=%.3g mean=%.3g)",
+        manifest.run_id, manifest.src_kind, n_valid, n_chg,
+        n_fv, n_grid, streams.nbytes, abs_max, abs_mean,
+    )
+
+    return {
+        "mode": "captured",
+        "captured_dir": str(captured_dir),
+        "manifest": {
+            "run_id": manifest.run_id,
+            "src_kind": manifest.src_kind,
+            "src_name": manifest.src_name,
+            "obs_dec_deg": manifest.obs_dec_deg,
+            "t_int_fast_us": manifest.t_int_fast_us,
+            "t_int_fast_native": manifest.t_int_fast_native,
+            "n_chgroups_in_manifest": manifest.n_chgroups,
+            "chgroups": list(manifest.chgroups),
+            "git_sha": manifest.git_sha,
+            "utc_iso": manifest.utc_iso,
+            "src_truth": {
+                "src_name": manifest.src_truth.src_name,
+                "ra_deg": manifest.src_truth.ra_deg,
+                "dec_deg": manifest.src_truth.dec_deg,
+                "mjd_trigger": manifest.src_truth.mjd_trigger,
+                "dm_pc_cc": manifest.src_truth.dm_pc_cc,
+                "t2_snr": manifest.src_truth.t2_snr,
+                "is_burst": manifest.is_burst,
+            },
+        },
+        "streams_shape": {
+            "n_chgroup_total": int(n_chg),
+            "n_chgroup_present": int(n_valid),
+            "n_fv_total": int(n_fv),
+            "n_grid": int(n_grid),
+            "valid_mask": list(valid_mask),
+            "streams_dtype": str(streams.dtype),
+            "streams_bytes": int(streams.nbytes),
+            "abs_max": abs_max,
+            "abs_mean": abs_mean,
+        },
+        # Detector-sweep gate not yet wired in mode=captured; see the
+        # docstring above for the chunk-7 hardening TODO list. For now
+        # we report INSPECTION_ONLY so the operator sees a clear
+        # status rather than a green PASS that doesn't actually
+        # exercise the detector.
+        "gate_status": "INSPECTION_ONLY",
+    }
 
 
 async def _bench_main(args: argparse.Namespace) -> int:
@@ -421,7 +511,9 @@ async def _bench_main(args: argparse.Namespace) -> int:
         run_record.get("gate_status"),
         run_record.get("recovered") is not None,
     )
-    return 0 if run_record.get("gate_status") in ("PASS", "NEEDS_OPERATOR") else 1
+    return 0 if run_record.get("gate_status") in (
+        "PASS", "NEEDS_OPERATOR", "INSPECTION_ONLY",
+    ) else 1
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -431,7 +523,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode", choices=("synthetic", "captured"), default="synthetic",
         help="synthetic: M3-independent injection through full pipeline; "
-             "captured: M3 → M5 integration (needs M3 npz schema, F6).",
+             "captured: M3 → M5 integration via "
+             "dsart.transport.captured_npz (F6 resolved 2026-05-06; "
+             "currently INSPECTION_ONLY — detector sweep is the next "
+             "chunk-7 hardening item).",
     )
     parser.add_argument(
         "--captured-dir", type=str, default=None,
