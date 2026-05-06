@@ -283,15 +283,31 @@ def test_stage1_shift_dispersed_input_aligns_at_truth_dm():
 
 def test_stage1_shift_off_dm_smears_burst():
     """At a non-truth DM trial the per-channel impulses do NOT
-    collapse to a single bin — the dedispersed peak is a small
-    fraction of the truth peak."""
-    plan = _make_test_plan(n_coarse=4, dm_max_pc_cc=300.0)
-    chgroup = 0
+    collapse to a single bin — the dedispersed peak is a strict
+    fraction of the truth peak.
+
+    Uses ``n_chan_test=NCHAN_PER_CHGROUP`` and a high DM so the
+    intra-chgroup dispersion sweep spans many bins (>=8 bins
+    between top and bottom of the chgroup at DM=2000 in chgroup 15).
+    Channels with distinct bin_shift_truth values collapse cleanly
+    at the truth DM and smear at the wrong DM.
+    """
+    plan = _make_test_plan(n_coarse=4, dm_max_pc_cc=2000.0)
+    chgroup = 15  # lowest-frequency chgroup → largest dispersion
     dm_idx_truth = 3
-    n_chan_test = 24
+    n_chan_test = NCHAN_PER_CHGROUP
+
     bin_shifts_truth = plan.delay_bins_per_chgroup(
         chgroup
     )[:n_chan_test, dm_idx_truth]
+    n_unique_shifts = int(np.unique(bin_shifts_truth).shape[0])
+    # Sanity gate: must have many distinct bin shifts so smearing
+    # is non-trivial.
+    assert n_unique_shifts >= 4, (
+        f"test setup expects ≥ 4 distinct bin shifts in chgroup={chgroup} "
+        f"at DM={plan.dm_pc_cc[dm_idx_truth]}; got {n_unique_shifts}"
+    )
+
     max_shift_overall = int(
         plan.delay_bins_per_chgroup(chgroup)[:n_chan_test, :].max()
     )
@@ -309,15 +325,25 @@ def test_stage1_shift_off_dm_smears_burst():
     out_zero = apply_stage1_shifts(
         vis, plan, chgroup=chgroup, dm_idx=0,
     )
-    # Truncate to common time axis for fair comparison
     t_common = min(out_truth.shape[0], out_zero.shape[0])
     truth_peak = out_truth[:t_common, 0, :].sum(dim=-1).real.max().item()
     zero_peak = out_zero[:t_common, 0, :].sum(dim=-1).real.max().item()
-    # Truth peak should be n_chan; off-DM peak should be << n_chan
-    # (each channel's impulse hits a different bin)
+    # Truth peak == n_chan (all channels collapse at t0_top);
+    # zero peak << n_chan because the impulses spread across
+    # many distinct bins.
     assert truth_peak == pytest.approx(n_chan_test, abs=1e-3)
+    # The largest single bin in the off-DM sum has at most
+    # `max_chan_per_bin = ceil(n_chan / n_unique_shifts)` channels
+    # contributing — strict upper bound on the smeared peak.
+    max_chan_per_bin = int(
+        np.ceil(n_chan_test / n_unique_shifts)
+    )
+    assert zero_peak <= max_chan_per_bin + 1e-3, (
+        f"off-DM peak {zero_peak} exceeds max_chan_per_bin "
+        f"{max_chan_per_bin} (n_unique_shifts={n_unique_shifts})"
+    )
     assert zero_peak < 0.5 * n_chan_test, (
-        f"off-DM peak {zero_peak} should be << truth peak {truth_peak}"
+        f"off-DM peak {zero_peak} should be < 0.5 * n_chan ({n_chan_test})"
     )
 
 
