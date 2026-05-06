@@ -20,8 +20,29 @@ conventions, see `PARALLEL_AGENTS.md`.
 
 ### F21 — fast-corr cal-apply must fold the bfCorr DEC-only phase
 
-**Status**: PROPOSED at M3 kickoff (2026-05-05). Implemented in chunk 2
-(`chunk_2_cal_apply_with_F21_dec_phase`) before any voltage-fixture work.
+**Status**: IMPLEMENTED in chunk 1 (`chunk_1_cal_apply_with_F21_dec_phase`,
+2026-05-05). Lives in `src/dsart/cal/cal_loader.py` (new, M3-owned;
+peer to M2's slow-corr cal pipeline in
+`corr_slow_compute._build_cal_tensors`). Four acceptance pytests in
+`tests/test_cal_loader_dec_phase.py` pin the sign convention against
+`dsaX_bfCorr.cu::populate_weights_matrix` central-beam (iArm==1, bm=127)
+to ≤ 1e-11 rad in fp64; `M3.sh` chunk_1 STEP gates on those pytests.
+
+**Implementation notes** (carryover for M3 hardening / plan §4.2 fold):
+- `compute_dec_phase` returns complex128 (full fp64) so the F21 fold
+  composes losslessly with the cal-blob multiply; the cplx64 → fp16
+  cast is deferred to `make_cal_broadcast_tensors` (single point of
+  precision loss for the cal tensor, matching M2's slow-corr path).
+- TMS Eq. 3.19 sign convention pinned: per-antenna voltage phase
+  `+2π f sin(δ_src − φ_lat) N_a / c`; F21 cal weight has the
+  OPPOSITE sign `−2π f sin(δ_obs − φ_lat) N_a / c` (cancels the
+  geometric phase when δ_obs = δ_src). Module docstring derives
+  both from first principles + bfCorr CU-code line numbers.
+- F21.4 (bfCorr round-trip) does NOT use the bfCorr literal `37.23`
+  for φ_lat — it uses M2's full-precision `PHI_LAT_OVRO_RAD =
+  math.radians(37.234)` on both sides, so the test pins the formula
+  STRUCTURE / SIGN, not the literal. (M1 plan-fix F10 already
+  retired the 4-digit truncation in production code.)
 
 **Problem**: plan.md §4.2 ("cal + bandpass flatten from antennas.out
 (legacy binary format ...) cal_mode={phase_only,full} flag, hot-reload via

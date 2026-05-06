@@ -143,27 +143,39 @@ pass
 # When the last chunk gates pass, the operator-approval block + final
 # stamp logic at the bottom of this file kicks in (mirrors M2.sh lines
 # 213-280).
-#
-# Currently NO chunks have landed; the script stops here and emits
-# "in progress (substrate only)".
+
+# --- chunk 1: cal-apply with F21 DEC-only phase fold (M3_PLAN_FIXES.md F21) -
+# Validates the fast-corr cal-tensor loader: complex cal blob → fine-channel
+# upsample → optional phase-only normalisation / pol-swap → F21 fringe-stop
+# phase fold → broadcast-ready torch tensors. Four acceptance tests pin the
+# sign convention to bfCorr's central-beam formula (iArm==1, bm=127) and
+# verify on-source phase cancellation, off-source residual phase, and a
+# parity guard against F20.
+STEP="chunk_1_cal_apply_with_F21_dec_phase"
+python -m pytest tests/test_cal_loader_dec_phase.py -q --tb=short \
+  || fail "F21 cal-loader acceptance pytests failed"
+pass
 
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
 
-CHUNKS_DONE=()       # populate as chunks land
+CHUNKS_DONE=(
+  "chunk_1_cal_apply_with_F21_dec_phase"
+)
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
-  "chunk_1_rfi_flagger"
-  "chunk_2_cal_apply_with_F21_dec_phase"
-  "chunk_3_corr_fast_compute_GEMM"
-  "chunk_4_gridder_sparsity_pattern"
-  "chunk_5_coarse_dm_static_sky"
-  "chunk_6_transport_loopback_capture"
-  "chunk_7_voltage_fixture_continuum"
-  "chunk_8_voltage_fixture_burst_250924mptq"
-  "chunk_9_16chgroup_alignment_preview"
-  "chunk_10_dod_orchestrator_completion"
-  "chunk_11_hardening"
+  "chunk_2_corr_fast_compute_base"
+  "chunk_3a_gridder_sparsity_pattern"
+  "chunk_3b_coarse_dm_static_sky"
+  "chunk_3c_rfi_flagger"
+  "chunk_3d_online_injector"
+  "chunk_4_corr_fast_integration"
+  "chunk_5_voltage_fixture_continuum"
+  "chunk_6_voltage_fixture_burst_250924mptq"
+  "chunk_7_16chgroup_alignment_preview"
+  "chunk_8_transport_loopback_capture"
+  "chunk_9_dod_orchestrator_completion"
+  "chunk_10_hardening"
 )
 
 if [[ ${#CHUNKS_REMAINING[@]} -gt 0 ]]; then
@@ -203,19 +215,22 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "etcd_namespace_prefix": "${DSART_ETCD_NAMESPACE_PREFIX}",
     "lockfile": "${M3_LOCKFILE}"
   },
-  "chunks_done": [],
+  "chunks_done": [
+    "chunk_1_cal_apply_with_F21_dec_phase"
+  ],
   "chunks_remaining": [
-    "chunk_1_rfi_flagger",
-    "chunk_2_cal_apply_with_F21_dec_phase",
-    "chunk_3_corr_fast_compute_GEMM",
-    "chunk_4_gridder_sparsity_pattern",
-    "chunk_5_coarse_dm_static_sky",
-    "chunk_6_transport_loopback_capture",
-    "chunk_7_voltage_fixture_continuum",
-    "chunk_8_voltage_fixture_burst_250924mptq",
-    "chunk_9_16chgroup_alignment_preview",
-    "chunk_10_dod_orchestrator_completion",
-    "chunk_11_hardening"
+    "chunk_2_corr_fast_compute_base",
+    "chunk_3a_gridder_sparsity_pattern",
+    "chunk_3b_coarse_dm_static_sky",
+    "chunk_3c_rfi_flagger",
+    "chunk_3d_online_injector",
+    "chunk_4_corr_fast_integration",
+    "chunk_5_voltage_fixture_continuum",
+    "chunk_6_voltage_fixture_burst_250924mptq",
+    "chunk_7_16chgroup_alignment_preview",
+    "chunk_8_transport_loopback_capture",
+    "chunk_9_dod_orchestrator_completion",
+    "chunk_10_hardening"
   ]
 }
 JSON
