@@ -257,12 +257,26 @@ def get_module(verbose: bool = False) -> object:
     _ensure_conda_gcc_on_path()
     from torch.utils.cpp_extension import load_inline
     _LOG.info("compiling fused_combine_cuda extension (this takes ~30 s on first run)...")
+    # ``-allow-unsupported-compiler``: PyTorch 2.x ABI requires gcc >= 9
+    # but CUDA 11.8's nvcc only officially supports gcc <= 10. The
+    # conda-forge gcc on h01 is 15.2; the host-compiler-version sanity
+    # check in nvcc <crt/host_config.h> would otherwise abort. The
+    # generated code is still correct — there are no fp16/cfp16 calling
+    # convention mismatches between gcc 15 and the (much older) ABI
+    # PyTorch was built with on this machine, because the Python-side
+    # main.cpp is a thin pybind11 binding and the kernel itself runs
+    # entirely on the device. Suppressing the version check is safer
+    # than downgrading to gcc 10 (which would force a conda-env-wide
+    # downgrade of every package that was rebuilt against gcc 15).
     mod = load_inline(
         name="dsart_fused_combine_cuda",
         cpp_sources=_CPP_DECL,
         cuda_sources=_CUDA_SOURCE,
         functions=["fused_combine_per_fdm"],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=[
+            "-O3", "--use_fast_math",
+            "-allow-unsupported-compiler",
+        ],
         verbose=verbose,
     )
     _LOG.info("fused_combine_cuda extension compiled")
