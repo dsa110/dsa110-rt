@@ -333,7 +333,7 @@ def _process_one_cube(
         elif len(slices) == 1:
             uv.copy_(slices[0])
         else:
-            torch.stack(slices, dim=0).sum(dim=0, out=uv)
+            torch.sum(torch.stack(slices, dim=0), dim=0, out=uv)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t1 = time.perf_counter_ns()
