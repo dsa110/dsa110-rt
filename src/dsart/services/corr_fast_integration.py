@@ -684,9 +684,9 @@ def _build_gridder(
     )
     LOG.info(
         "sparsity pattern: chgroup=%d obs_dec_deg=%.4f n_grid=%d "
-        "kernel_support=%d → n_filled=%d (id=%s)",
+        "kernel_support=%d → n_filled=%d (id=0x%016x)",
         cfg.chgroup, math.degrees(cfg.obs_dec_rad), cfg.n_grid,
-        cfg.kernel_support, pattern.n_filled, pattern.pattern_id[:16],
+        cfg.kernel_support, pattern.n_filled, int(pattern.pattern_id),
     )
     gridder = FastVisGridder.from_pattern(
         pattern, antpos_e, antpos_n,
