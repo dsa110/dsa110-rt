@@ -138,7 +138,6 @@ def iterate_voltage_blocks(
     Yields:
         ``bytes`` of length exactly ``block_bytes``. The final partial
         block (if file length is not a multiple of ``block_bytes``) is
-        DROPPED with a warning log line — this matches M2's
         ``voltage_fixture_slow_corr.py`` behaviour and the real
         DSA-110 dumper which always writes whole blocks.
     """
@@ -150,7 +149,6 @@ def iterate_voltage_blocks(
     n_blocks_in_file = file_size // block_bytes
     n_partial = file_size - n_blocks_in_file * block_bytes
     if n_partial > 0:
-        LOG.warning(
             "%s: %d trailing partial bytes (= %.3f blocks); will be dropped",
             voltage_path.name, n_partial, n_partial / block_bytes,
         )
@@ -159,7 +157,6 @@ def iterate_voltage_blocks(
     if max_blocks is not None:
         n_to_yield = min(n_to_yield, max_blocks)
     if n_to_yield <= 0:
-        LOG.warning(
             "%s: no blocks to yield (n_blocks_in_file=%d skip=%d max=%s)",
             voltage_path.name, n_blocks_in_file, skip_blocks, max_blocks,
         )
@@ -180,7 +177,6 @@ def iterate_voltage_blocks(
             if len(chunk) != block_bytes:
                 # Should never trip given file_size precheck, but
                 # guards against concurrent truncation.
-                LOG.warning(
                     "short read: got %d expected %d; stopping",
                     len(chunk), block_bytes,
                 )
@@ -470,16 +466,23 @@ def compute_chgroup_cell_lambda(
         chgroup: chgroup index 0..15.
         n_grid: gridder grid side length (default 256).
         is_core_baseline_mask: ``(NBASE,)`` bool mask. Default = standard
-            82-core mask.
+            82-core mask, built radius-based from ``antpos_e``,
+            ``antpos_n`` (per F27 — matches the chunk-4
+            ``_load_antpos_from_cal_blob`` path so cell_lambda mirrors
+            production).
 
     Returns:
         ``cell_lambda`` in λ units (cycles per radian per cell — the
         pixel size of the dense (u, v) grid).
     """
-    from dsart.grid.sparsity_pattern import _per_baseline_uv_meters
+    from dsart.grid.sparsity_pattern import (
+        _per_baseline_uv_meters, core_baseline_mask_from_antpos,
+    )
 
     if is_core_baseline_mask is None:
-        is_core_baseline_mask = _build_core_baseline_mask(n_core=82)
+        is_core_baseline_mask = core_baseline_mask_from_antpos(
+            antpos_e, antpos_n, n_core=82,
+        )
     du_m, dv_m = _per_baseline_uv_meters(
         antpos_e, antpos_n,
         is_core_baseline_mask=is_core_baseline_mask,
