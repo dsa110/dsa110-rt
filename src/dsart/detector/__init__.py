@@ -1,26 +1,37 @@
 """DSA-110 real-time pipeline subpackage: detector.
 
-The v1 deterministic conv-bank detector (plan §3.6 / §4.4) lives in
-``forward.py`` (``Detector`` Protocol + ``DeterministicDetector``
-Module + ``boxcar_via_cumsum`` primitive) and ``kernels.py`` (kernel-bank
-construction, K=128 default per D2 in M5_PLAN_FIXES.md).
+The v1 deterministic conv-bank detector (plan §3.6 / §4.4) is split
+across four files per ``PARALLEL_AGENTS.md`` §3 Class A ownership:
 
-Chunk 2 will add ``decoder.py`` (per-kernel local-max NMS +
-canonical-zone emit gate) and ``merger.py`` (cross-kernel SNR-sort + 4D
-merge-radius suppression). Chunk 3 will add the sibling ``noise_norm/``
-subpackage (Layer-1 σ-clipped global scalar + Layer-2 per-kernel σ_k
-EMA).
+  - ``forward.py``  — ``Detector`` Protocol + ``DeterministicDetector``
+                      Module wiring conv-bank → decoder → merger →
+                      canonical-zone gate; the ``boxcar_via_cumsum``
+                      primitive (the only allowed K_dm/K_time consumer
+                      per plan §3.6.13).
+  - ``kernels.py``  — Kernel-bank construction (K=128 default per D2).
+  - ``decoder.py``  — Per-kernel local-max NMS + canonical-zone emit gate.
+  - ``merger.py``   — Cross-kernel SNR-sort + 4D merge-radius suppression.
 
-File-name decomposition (``forward.py / decoder.py / merger.py /
-kernels.py``) follows ``PARALLEL_AGENTS.md`` §3 Class A ownership; this
-diverges from plan §3 line 94 which lists ``interface.py /
-v1_deterministic.py / decoder.py / noise_norm.py``. See F8 in
-``M5_PLAN_FIXES.md`` for the rename rationale; plan will be updated
-during M5 hardening.
+Chunk 3 will add the sibling ``noise_norm/`` subpackage (Layer-1
+σ-clipped global scalar + Layer-2 per-kernel σ_k EMA), at which point
+the ``DeterministicDetector._sigma_k_placeholder`` buffer (D11) is
+replaced by the EMA-tracked tensor with no Protocol surface change.
+
+This decomposition diverges from plan §3 line 94 which lists
+``interface.py / v1_deterministic.py / decoder.py / noise_norm.py``;
+see F8 in ``M5_PLAN_FIXES.md`` for the rename rationale (plan updated
+during M5 hardening).
 """
 
+from .decoder import decode_local_max, filter_to_canonical
 from .forward import Detector, DeterministicDetector, boxcar_via_cumsum
 from .kernels import DEFAULT_DETECTOR_DTYPE, Kernel, build_kernel_bank, make_image_kernel
+from .merger import (
+    DEFAULT_MERGE_RADIUS_FDM,
+    DEFAULT_MERGE_RADIUS_LM,
+    DEFAULT_MERGE_RADIUS_T,
+    merge_across_kernels,
+)
 
 __all__ = [
     "Detector",
@@ -30,4 +41,10 @@ __all__ = [
     "build_kernel_bank",
     "make_image_kernel",
     "DEFAULT_DETECTOR_DTYPE",
+    "decode_local_max",
+    "filter_to_canonical",
+    "merge_across_kernels",
+    "DEFAULT_MERGE_RADIUS_LM",
+    "DEFAULT_MERGE_RADIUS_FDM",
+    "DEFAULT_MERGE_RADIUS_T",
 ]

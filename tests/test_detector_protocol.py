@@ -99,15 +99,129 @@ def _small_cube(
     return cube, validity, sigma1
 
 
-def test_forward_returns_empty_list_in_chunk_1() -> None:
-    """Chunk-1 stub: ``forward()`` returns ``[]`` until the chunk-2
-    decoder lands. The Protocol surface is stable from chunk 1 forward.
+def test_forward_returns_list_of_candidates_on_noise_only_cube() -> None:
+    """Chunk 2 wires the decoder + merger in. On a small noise-only cube
+    the threshold (default 8 σ) prunes essentially everything, so the
+    list is typically empty — but the *type* contract is ``list[Candidate]``
+    and the call must not raise. (The Chunk-2 decoder/merger tests below
+    exercise the populated-list path with a strong injection.)
     """
     det = DeterministicDetector()
     cube, validity, sigma1 = _small_cube()
     out = det.forward(cube, validity, sigma1)
     assert isinstance(out, list)
-    assert out == []
+    for cand in out:
+        assert hasattr(cand, "kernel_id"), "expected Candidate-like records"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: cube_injection -> forward() -> merged Candidates (chunk 2)
+# ---------------------------------------------------------------------------
+
+
+def test_forward_recovers_strong_injection_via_cube_injection() -> None:
+    """Inject one strong (snr=15, width=4) boxcar into a small post-imager
+    cube; assert ``forward()`` returns at least one Candidate at the
+    correct (l_pix, m_pix, fine_dm_idx) within the expected NMS tolerance,
+    with snr ≥ 0.85 × injected (plan §8 line 2329 cube-injection
+    bench's recovered-SNR tolerance).
+    """
+    from dsart.inject.cube_injection import (
+        CubeInjectionConfig,
+        synthesise_cube,
+    )
+
+    n_grid = 16
+    n_fdm = 4
+    t_det = 64
+    cfg = CubeInjectionConfig(
+        l_pix=8, m_pix=8, fine_dm_idx=2, t_in_cube=32,
+        snr=15.0, width_samples=4,
+    )
+    cube, validity, sigma1 = synthesise_cube(
+        t_det=t_det, n_fdm=n_fdm, n_grid=n_grid,
+        injections=(cfg,),
+        rng=np.random.default_rng(20260505),
+    )
+    # Cast to fp16 to mirror the production hot-path dtype (D11 placeholder
+    # s_k assumes σ=1 unit-noise — the cube_injection D8 lock supplies
+    # that exactly, and width=4 noise-std after boxcar is √4 = 2 = s_k
+    # for a "d1:b4" triple, etc.).
+    det = DeterministicDetector(threshold_sigma=8.0, dtype=torch.float16)
+    out = det.forward(cube.to(torch.float16), validity, sigma1)
+    assert isinstance(out, list)
+    assert len(out) >= 1, "expected at least one Candidate for a strong injection"
+    # Pick the candidate closest to the injection cell.
+    nearest = min(
+        out,
+        key=lambda c: (
+            abs(int(c.l) - cfg.l_pix)
+            + abs(int(c.m) - cfg.m_pix)
+            + abs(int(c.dm_idx) - cfg.fine_dm_idx)
+        ),
+    )
+    # NMS spatial radius is 2 cells, fdm radius is k_dm_width // 2 + 1
+    # (≤ 4 at d7), time radius is k_time_width // 2 + 1 (≤ 65 at b128).
+    assert abs(int(nearest.l) - cfg.l_pix) <= 2
+    assert abs(int(nearest.m) - cfg.m_pix) <= 2
+    assert abs(int(nearest.dm_idx) - cfg.fine_dm_idx) <= 4
+    # Recovered SNR ≥ 0.85 × injected (plan §8 line 2329); fp16 + s_k
+    # placeholder + decoder threshold leaves comfortable margin.
+    assert nearest.snr >= 0.85 * cfg.snr, (
+        f"recovered snr={nearest.snr} < 0.85 × injected={cfg.snr}"
+    )
+
+
+def test_forward_noise_only_cube_threshold_keeps_far_low() -> None:
+    """A pure-noise cube (no injection) at θ=8 should fire essentially
+    no candidates — analytic FAR ``0.5·erfc(8/√2)`` is 6.2e-16 per cell
+    × ~few-thousand effective cells per kernel × 128 kernels << 1.
+    """
+    from dsart.inject.cube_injection import synthesise_cube
+
+    cube, validity, sigma1 = synthesise_cube(
+        t_det=64, n_fdm=4, n_grid=16,
+        rng=np.random.default_rng(20260505),
+    )
+    det = DeterministicDetector(threshold_sigma=8.0, dtype=torch.float16)
+    out = det.forward(cube.to(torch.float16), validity, sigma1)
+    # On 64 × 4 × 16 × 16 = 65k cells × 128 kernels we expect zero or
+    # very-rare hits at θ=8. Allow up to 3 to absorb the boxcar
+    # noise-correlation factor without making the test flaky.
+    assert len(out) <= 3, (
+        f"got {len(out)} candidates from a noise-only cube at θ=8 — "
+        f"check Layer-2 σ_k placeholder calibration"
+    )
+
+
+def test_forward_canonical_zone_gate_drops_out_of_range_dm() -> None:
+    """When dm_idx_canonical_lo / hi kwargs are passed, the gate drops
+    candidates whose dm_idx falls outside that range."""
+    from dsart.inject.cube_injection import (
+        CubeInjectionConfig,
+        synthesise_cube,
+    )
+
+    cfg = CubeInjectionConfig(
+        l_pix=8, m_pix=8, fine_dm_idx=2, t_in_cube=32,
+        snr=15.0, width_samples=4,
+    )
+    cube, validity, sigma1 = synthesise_cube(
+        t_det=64, n_fdm=4, n_grid=16,
+        injections=(cfg,),
+        rng=np.random.default_rng(20260505),
+    )
+    det = DeterministicDetector(threshold_sigma=8.0, dtype=torch.float16)
+    # Canonical range [0, 1] excludes the injection at fdm=2.
+    out = det.forward(
+        cube.to(torch.float16), validity, sigma1,
+        dm_idx_canonical_lo=0,
+        dm_idx_canonical_hi=1,
+        n_kernel_max_t=128,
+    )
+    assert out == [], (
+        f"expected no candidates after halo gate excluded fdm=2; got {len(out)}"
+    )
 
 
 def test_forward_return_type_list_of_candidates() -> None:
@@ -350,16 +464,27 @@ def test_boxcar_via_cumsum_fp32_arithmetic_exact() -> None:
 # ---------------------------------------------------------------------------
 
 
-_FORBIDDEN_KDM_KTIME_OPS = {
-    # Forbidden along K_dm / K_time per plan §3.6.13. We catch ANY use of
-    # these in the detector hot path; if a chunk-2+ author needs one
-    # along the (l, m) axis (image-axis NMS in the decoder is fine), they
-    # add an explicit ``# noqa: AST-CUMSUM`` comment-allow which this
-    # scanner does NOT handle today (intentionally simple — chunks add a
-    # whitelist mechanism if/when they need one).
+_FORBIDDEN_KDM_KTIME_OPS_CONVBANK = {
+    # Forbidden along K_dm / K_time per plan §3.6.13 in the conv-bank
+    # files (forward.py, kernels.py). The naive width-by-width form via
+    # F.conv1d / F.avg_pool1d / F.max_pool1d burns ~10x the FLOPs of the
+    # cumsum-difference form; only ``boxcar_via_cumsum`` is allowed.
     "conv1d",
     "avg_pool1d",
     "max_pool1d",
+}
+
+_FORBIDDEN_KDM_KTIME_OPS_DECODER = {
+    # Decoder's NMS path legitimately uses F.max_pool3d (on fdm, l, m)
+    # and F.max_pool1d (on time) per plan §1588 — these are local-max
+    # NMS with a single max per cell, NOT a width-by-width sum substitute,
+    # so they cannot replace the cumsum trick and the §3.6.13 FLOPs
+    # argument doesn't apply. F.conv1d / F.avg_pool1d remain forbidden
+    # in decoder.py because those *would* be sum-based and could
+    # accidentally re-introduce the naive boxcar form. See F9 in
+    # M5_PLAN_FIXES.md for the plan reconciliation.
+    "conv1d",
+    "avg_pool1d",
 }
 
 
@@ -387,20 +512,38 @@ def _module_path(*parts: str) -> pathlib.Path:
         "src/dsart/detector/kernels.py",
     ],
 )
-def test_no_forbidden_kdm_ktime_ops_in_detector(module_relpath: str) -> None:
+def test_no_forbidden_kdm_ktime_ops_in_convbank(module_relpath: str) -> None:
     """Plan §3.6.13 clause (a): naive width-by-width K_dm / K_time forms
-    are forbidden in the detector hot path. The only allowed K_dm /
+    are forbidden in the conv-bank files. The only allowed K_dm /
     K_time consumer is ``boxcar_via_cumsum``.
     """
     src = _module_path(module_relpath).read_text()
     calls = _gather_attr_calls(src)
     forbidden = sorted(
-        {c for c in calls if c in _FORBIDDEN_KDM_KTIME_OPS}
+        {c for c in calls if c in _FORBIDDEN_KDM_KTIME_OPS_CONVBANK}
     )
     assert not forbidden, (
         f"{module_relpath} uses forbidden K_dm/K_time ops "
         f"{forbidden}; plan §3.6.13 clause (a) requires "
         f"boxcar_via_cumsum exclusively along those axes"
+    )
+
+
+def test_no_forbidden_sum_ops_in_decoder() -> None:
+    """Decoder NMS uses F.max_pool* legitimately (plan §1588 prescribes it);
+    F.conv1d / F.avg_pool1d remain forbidden so the decoder cannot
+    accidentally re-introduce the naive boxcar form along K_dm / K_time.
+    See F9 in M5_PLAN_FIXES.md for the plan reconciliation.
+    """
+    src = _module_path("src/dsart/detector/decoder.py").read_text()
+    calls = _gather_attr_calls(src)
+    forbidden = sorted(
+        {c for c in calls if c in _FORBIDDEN_KDM_KTIME_OPS_DECODER}
+    )
+    assert not forbidden, (
+        f"decoder.py uses forbidden sum-conv ops {forbidden}; "
+        f"plan §3.6.13 clause (a) (refined per F9) forbids "
+        f"F.conv1d / F.avg_pool1d in decoder.py — F.max_pool* is allowed."
     )
 
 

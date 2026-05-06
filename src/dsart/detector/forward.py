@@ -41,16 +41,24 @@ chunk-2 decoder.
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 import torch.nn.functional as F
 
 from ..common.contracts import Candidate
+from .decoder import decode_local_max, filter_to_canonical
 from .kernels import (
     DEFAULT_DETECTOR_DTYPE,
     Kernel,
     build_kernel_bank,
+)
+from .merger import (
+    DEFAULT_MERGE_RADIUS_FDM,
+    DEFAULT_MERGE_RADIUS_LM,
+    DEFAULT_MERGE_RADIUS_T,
+    merge_across_kernels,
 )
 
 __all__ = [
@@ -247,6 +255,11 @@ class DeterministicDetector(torch.nn.Module):
         detector_version: str = "v1.M5",
         device: Optional[torch.device] = None,
         dtype: torch.dtype = DEFAULT_DETECTOR_DTYPE,
+        merge_radius_lm: int = DEFAULT_MERGE_RADIUS_LM,
+        merge_radius_fdm: int = DEFAULT_MERGE_RADIUS_FDM,
+        merge_radius_t: int = DEFAULT_MERGE_RADIUS_T,
+        search_node_id: int = 0,
+        gpu_half: int = 0,
     ) -> None:
         super().__init__()
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
@@ -255,6 +268,22 @@ class DeterministicDetector(torch.nn.Module):
         self._threshold_sigma = float(threshold_sigma)
         self._detector_version = str(detector_version)
         self._dtype = dtype
+        self._merge_radius_lm = int(merge_radius_lm)
+        self._merge_radius_fdm = int(merge_radius_fdm)
+        self._merge_radius_t = int(merge_radius_t)
+        self._search_node_id = int(search_node_id)
+        self._gpu_half = int(gpu_half)
+
+        # Layer-2 σ_k EMA placeholder (D11): for chunks 1-2, s_k is the
+        # analytic noise std of an unweighted-sum boxcar of K_dm × K_time
+        # cells over unit-σ Gaussian input. Chunk 3 swaps this for the
+        # EMA-tracked value with no Protocol surface change. The buffer
+        # is registered so .to(device) / .cuda() / state_dict round-trip.
+        s_k_init = torch.tensor(
+            [math.sqrt(k.k_dm_width * k.k_time_width) for k in self._kernel_bank],
+            dtype=torch.float32,
+        )
+        self.register_buffer("_sigma_k_placeholder", s_k_init, persistent=False)
 
         # Move image kernels to ``device`` if given, and register them as
         # buffers so torch.nn.Module's .to() / .cuda() / state_dict
@@ -312,21 +341,85 @@ class DeterministicDetector(torch.nn.Module):
         cube: torch.Tensor,
         validity_mask: torch.Tensor,
         sigma_layer1: torch.Tensor,
+        *,
+        dm_idx_canonical_lo: Optional[int] = None,
+        dm_idx_canonical_hi: Optional[int] = None,
+        n_kernel_max_t: Optional[int] = None,
+        event_specnum: int = 0,
+        fine_to_coarse: Optional[torch.Tensor] = None,
+        fine_dm_pc_cm3: Optional[torch.Tensor] = None,
     ) -> List[Candidate]:
         """v1-locked Protocol entrypoint. Returns final emitted Candidates.
 
-        Chunk 1 lands the conv-bank and exposes the per-kernel score
-        tensors via ``_compute_per_kernel_scores``; the decoder stub here
-        returns an empty list. Chunk 2 wires in the per-kernel local-max
-        NMS + cross-kernel merger; chunk 3 wires in the Layer-2 σ_k EMA
-        for the SNR division. The Protocol surface is stable from chunk 1
-        forward.
+        Chunk 2 lands the per-kernel local-max NMS (``decoder.py``) +
+        cross-kernel SNR-sort merger (``merger.py``) + canonical-zone
+        emit gate. Chunk 3 swaps the placeholder ``_sigma_k_placeholder``
+        buffer for the per-kernel σ_k EMA tracked across cubes (D11) — no
+        change to the forward() signature.
+
+        The kwarg-only fields are M5-internal extensions (NOT on the
+        Protocol surface — Chunk 6 search_compute owns them and passes
+        them in from the cube/DmPlan context):
+
+          - ``dm_idx_canonical_lo`` / ``dm_idx_canonical_hi``: this
+            (search_node, gpu_half)'s canonical fine-DM range. If both
+            are None, the gate is permissive (no halo drops) — the
+            Chunk-2 cube-injection unit tests use this default.
+          - ``n_kernel_max_t``: widest time-kernel boxcar width used by
+            the time-edge gate. Defaults to the max of the bank's
+            k_time_width values.
+          - ``event_specnum``: cube-start specnum (stamped onto every
+            emitted Candidate as ``event_specnum + t_in_cube``). Default
+            0 for unit tests; Chunk-6 search_compute passes the real
+            cube start.
+          - ``fine_to_coarse`` / ``fine_dm_pc_cm3``: ``DmPlan`` lookup
+            tables. If None, decoder uses unit-stub fallbacks (Chunk-2
+            unit-test path).
         """
-        # Chunk-1 stub: invoke the conv bank to certify the path is wired,
-        # then return []. The score tensor is materialised only to surface
-        # any shape/dtype regressions early; chunks 2/3 will consume it.
-        _ = self._compute_per_kernel_scores(cube, validity_mask)
-        return []
+        scores = self._compute_per_kernel_scores(cube, validity_mask)
+
+        s_k = self._sigma_k_placeholder.view(-1, 1, 1, 1, 1).to(scores.dtype)
+        scores_snr = scores / s_k
+
+        if n_kernel_max_t is None:
+            n_kernel_max_t = max(k.k_time_width for k in self._kernel_bank)
+
+        per_kernel_cands: List[Candidate] = []
+        for k_idx, kernel in enumerate(self._kernel_bank):
+            per_kernel_cands.extend(
+                decode_local_max(
+                    scores_snr[k_idx],
+                    threshold=self._threshold_sigma,
+                    kernel_id=kernel.kernel_id,
+                    k_dm_width=kernel.k_dm_width,
+                    k_time_width=kernel.k_time_width,
+                    detector_version=self._detector_version,
+                    search_node_id=self._search_node_id,
+                    gpu_half=self._gpu_half,
+                    event_specnum=event_specnum,
+                    fine_to_coarse=fine_to_coarse,
+                    fine_dm_pc_cm3=fine_dm_pc_cm3,
+                )
+            )
+
+        merged = merge_across_kernels(
+            per_kernel_cands,
+            merge_radius_lm=self._merge_radius_lm,
+            merge_radius_fdm=self._merge_radius_fdm,
+            merge_radius_t=self._merge_radius_t,
+        )
+
+        if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
+            return merged
+        emit, _dropped = filter_to_canonical(
+            merged,
+            dm_idx_canonical_lo=dm_idx_canonical_lo,
+            dm_idx_canonical_hi=dm_idx_canonical_hi,
+            t_det=cube.shape[0],
+            n_kernel_max_t=n_kernel_max_t,
+            cube_t_offset=event_specnum,
+        )
+        return emit
 
     # -----------------------------------------------------------------
     # Internals (chunk-1 testable)
