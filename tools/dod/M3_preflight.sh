@@ -210,14 +210,22 @@ pass
 
 STEP="m2_helpers_import"
 # The fast-corr GEMM reuses M2's slow_corr_kernel helpers per §8 M3 line
-# 2264. Import-check them so a partial M2 install fails fast.
+# 2264. Import-check them so a partial M2 install fails fast. Note: the
+# D15 voltage-layout transform (fp32-reinterpret 2D byte-transpose) is
+# *inlined* inside unpack_int4_split (not a standalone export); see
+# slow_corr_kernel.py lines 279-313 ("Stage 1: fp32-reinterpret 2D
+# transpose") + the module docstring §(1).
 python - <<'PY' || fail "M2 GPU helpers not importable"
 from dsart.services.slow_corr_kernel import (
-    voltage_layout_transform,
-    unpack_int4_split,
-    apply_cal_split,
+    unpack_int4_split,        # D15 + D16: fp32-reinterpret 2D byte-transpose + int8-ASR fluff
+    apply_cal_split,          # F17/D17: per-(ant, ch, pol) cal-apply on the split fp16 tensors
+    make_cal_broadcast_tensors,  # cal-tensor packing for apply_cal_split
+    SlowCorrKernel,           # the fp16 chained-matmul GEMM driver (D8/F12)
+    pack_bada_block,          # F8/D7: cfp32 bada packer for replay_voltage_dump
+    upper_tri_indices,        # F18: PyTorch row-major upper-tri-gather index swap
 )
-print("  voltage_layout_transform / unpack_int4_split / apply_cal_split OK")
+print("  unpack_int4_split / apply_cal_split / make_cal_broadcast_tensors /")
+print("  SlowCorrKernel / pack_bada_block / upper_tri_indices OK")
 PY
 pass
 
