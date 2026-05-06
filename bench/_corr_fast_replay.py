@@ -138,6 +138,7 @@ def iterate_voltage_blocks(
     Yields:
         ``bytes`` of length exactly ``block_bytes``. The final partial
         block (if file length is not a multiple of ``block_bytes``) is
+        DROPPED with a warning log line — this matches M2's
         ``voltage_fixture_slow_corr.py`` behaviour and the real
         DSA-110 dumper which always writes whole blocks.
     """
@@ -149,6 +150,7 @@ def iterate_voltage_blocks(
     n_blocks_in_file = file_size // block_bytes
     n_partial = file_size - n_blocks_in_file * block_bytes
     if n_partial > 0:
+        LOG.warning(
             "%s: %d trailing partial bytes (= %.3f blocks); will be dropped",
             voltage_path.name, n_partial, n_partial / block_bytes,
         )
@@ -157,6 +159,7 @@ def iterate_voltage_blocks(
     if max_blocks is not None:
         n_to_yield = min(n_to_yield, max_blocks)
     if n_to_yield <= 0:
+        LOG.warning(
             "%s: no blocks to yield (n_blocks_in_file=%d skip=%d max=%s)",
             voltage_path.name, n_blocks_in_file, skip_blocks, max_blocks,
         )
@@ -177,6 +180,7 @@ def iterate_voltage_blocks(
             if len(chunk) != block_bytes:
                 # Should never trip given file_size precheck, but
                 # guards against concurrent truncation.
+                LOG.warning(
                     "short read: got %d expected %d; stopping",
                     len(chunk), block_bytes,
                 )
