@@ -361,3 +361,42 @@ FADA_BYTES_PER_BLOCK: int = (
 """Fada block size = NPACKETS × NANTS × NCHAN × 2t × 2p × 1 byte
 (4-bit cplx packed = 1 byte / complex sample) = 301,989,888.
 Matches `configs/config_corr.yaml::buffers.fada.bytes_per_block`."""
+
+
+# ---------------------------------------------------------------------------
+# Fast-vis sparse uv-grid (M3 chunk 3a; plan §3 lines 305-309 + §4.2 line 1350)
+# ---------------------------------------------------------------------------
+
+N_GRID_DEFAULT: int = 256
+"""Default fast-vis uv-grid side length (cells per axis). Plan §3 line 305
++ §3 line 309 (size table). Power-of-two for the search-side iFFT."""
+
+KERNEL_SUPPORT_DEFAULT: int = 1
+"""Default gridding kernel support in cells (1 = nearest-cell pillbox).
+Plan §3 line 306 + §4.2 line 1351 (G7) — wider Gaussian supports
+(K ∈ {3, 5, 7}) reserved for the M3 hardening pass; the chunk 3a
+gridder ships pillbox + leaves the LUT plumbing as a future follow-up."""
+
+PATTERN_ID_PERSON: bytes = b"dsart-pattern"
+"""``hashlib.blake2b(person=...)`` personalisation tag for ``pattern_id``
+hashing (plan §3 line 307). Pinned here as a single source of truth so
+both ``corr_fast_compute`` (M3) and ``dsart-search-rx`` (M5) compute the
+same hash. **Length must be ≤ 16 bytes** (blake2b person-string limit);
+``len(b"dsart-pattern") == 13`` ✓."""
+
+PATTERN_DEC_QUANT_DEG: float = 0.25
+"""Quantisation bin (degrees) for ``dec_deg`` going into ``pattern_id``.
+Plan §3 line 307: "dec_deg quantised to 0.25 deg". Bins are
+``round(dec_deg / 0.25) * 0.25``; declinations within ± 0.125 deg of
+each other share a pattern.
+
+This bin width was chosen so that pattern reuse covers a full transit
+(the array's primary-beam HWHM is ~ 1.75° at 1.4 GHz, so a 0.25°
+quantisation costs ≤ 0.06 cells of (u, v) drift even at the longest
+core baseline) without producing observably different cell rounding."""
+
+PATTERN_HASH_BYTES: int = 8
+"""``pattern_id`` is the leading ``PATTERN_HASH_BYTES`` of a blake2b
+digest, interpreted as little-endian uint64 (plan §3 line 307: 64-bit
+hash). This must equal 8 to match the wire-format header field
+``SparseCOOPayloadHeader.pattern_id`` (uint64)."""
