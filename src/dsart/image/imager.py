@@ -17,11 +17,19 @@ Per ``[fine_dm, t]`` slice, the imager:
      Mask is multiplicative ``[N_grid, N_grid] float32``.
   5. Casts to fp16 to feed the detector cube ring (§3.6.11 dtype pin).
 
-The production path (Chunk 6b ``services/search_compute.py``) keeps the
-output buffer on GPU + reuses a cached cuFFT C2C plan; this Chunk-6a
-module ships a pure-numpy / pure-torch path that runs CPU-only on h01
-for the unit tests + the cube-injection bench's voltage-fixture
-cross-check (Chunk 7).
+The production-grade GPU path lives in :mod:`dsart.image.imager_gpu`
+(landed Chunk 8: D19/D20/D21 in ``M5_PLAN_FIXES.md``). That module
+fuses the M3 cint8 dequant + per-fdm 16-chgroup combine into a single
+NVRTC kernel, runs cuFFT-cfp16 ``ifft2`` + fftshift, and applies
+:func:`compute_edge_mask` (defined here) at deployment geometry — 9.79
+cubes/s at T_det=256 / N_fdm=32 / N_grid=256 on h01 GPU 1, comfortably
+clearing the plan §8 8 cubes/s target. The live ``services/
+search_compute.py`` service consumes :class:`dsart.image.imager_gpu.GpuImager`
+directly; this Chunk-6a module retains the pure-numpy / pure-torch
+helpers (:func:`compute_edge_mask`, :func:`dirty_image_from_uv_grid`,
+:func:`apply_edge_mask`) that are needed for unit tests, the chunk-7
+captured-mode loader's pre-quant cf64 reference path, and the cube-
+injection bench's voltage-fixture cross-check.
 """
 
 from __future__ import annotations
