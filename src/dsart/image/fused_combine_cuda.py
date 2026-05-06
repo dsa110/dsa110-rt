@@ -221,25 +221,28 @@ _MODULE_CACHE: Optional[object] = None
 def _ensure_conda_gcc_on_path() -> None:
     """Set CC/CXX env vars to a CUDA-11.8-compatible gcc.
 
-    PyTorch 2.x C++ extensions require GCC ≥ 9; CUDA 11.8 supports
-    GCC ≤ 10. The dsa110-rt conda env carries gcc_linux-64 15.x
-    (which conda-forge defaults to), which compiles host code fine
-    but emits ``_Float64`` C++23 types in ``<limits>`` that nvcc 11.8
-    can't parse. So we use a sibling ``dsart-build`` conda env that
-    pins gcc 10 specifically. Search order:
+    PyTorch 2.5.x C++ extensions require gcc ≥ 9 to compile (newer
+    pybind11 templates have gcc-10 std::tuple template-pack issues —
+    use gcc ≥ 11). CUDA 11.8's nvcc officially supports gcc ≤ 10 but
+    gcc 11 works in practice via ``-allow-unsupported-compiler``.
+    The dsa110-rt env's gcc 15 emits C++23 ``_Float64`` types nvcc
+    can't parse, so it's unusable here.
+
+    Sweet spot: gcc 11. Live in a sibling ``dsart-build`` conda env.
+    Search order:
 
       1. ``$DSART_BUILD_CC`` / ``$DSART_BUILD_CXX`` (operator override).
       2. ``~/miniforge3/envs/dsart-build/bin/x86_64-conda-linux-gnu-{gcc,g++}``
          (the standard h01 setup).
       3. ``$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-{gcc,g++}`` (current
-         env; only useable if its gcc happens to be ≤ 10).
+         env; only useable if its gcc happens to be 9-11).
       4. system ``cc`` / ``c++`` (must be ≥ 9; on h01 this is 7.5,
          so this branch loses).
 
     One-time h01 setup:
 
         conda create -n dsart-build -c conda-forge -y \\
-            "gcc_linux-64=10" "gxx_linux-64=10"
+            "gcc_linux-64=11" "gxx_linux-64=11"
     """
     if "DSART_BUILD_CC" in os.environ and "DSART_BUILD_CXX" in os.environ:
         os.environ["CC"] = os.environ["DSART_BUILD_CC"]
@@ -277,17 +280,14 @@ def get_module(verbose: bool = False) -> object:
     _ensure_conda_gcc_on_path()
     from torch.utils.cpp_extension import load_inline
     _LOG.info("compiling fused_combine_cuda extension (this takes ~30 s on first run)...")
-    # ``-allow-unsupported-compiler``: PyTorch 2.x ABI requires gcc >= 9
-    # but CUDA 11.8's nvcc only officially supports gcc <= 10. The
-    # conda-forge gcc on h01 is 15.2; the host-compiler-version sanity
-    # check in nvcc <crt/host_config.h> would otherwise abort. The
-    # generated code is still correct — there are no fp16/cfp16 calling
-    # convention mismatches between gcc 15 and the (much older) ABI
-    # PyTorch was built with on this machine, because the Python-side
-    # main.cpp is a thin pybind11 binding and the kernel itself runs
-    # entirely on the device. Suppressing the version check is safer
-    # than downgrading to gcc 10 (which would force a conda-env-wide
-    # downgrade of every package that was rebuilt against gcc 15).
+    # PyTorch 2.5.x with the gcc-15.2-built libstdc++ pulls in C++23
+    # ``_Float64`` types from <limits> that nvcc 11.8 cannot parse, so
+    # the dsa110-rt env's gcc 15 is unusable for ext compilation. We
+    # use a sibling ``dsart-build`` conda env pinned to gcc 11. CUDA
+    # 11.8's nvcc officially supports gcc ≤ 10, but gcc 11 works in
+    # practice (no C++23 types, no <tuple> template-pack regressions
+    # from gcc 10) once the version check is overridden via
+    # ``-allow-unsupported-compiler``.
     mod = load_inline(
         name="dsart_fused_combine_cuda",
         cpp_sources=_CPP_DECL,
