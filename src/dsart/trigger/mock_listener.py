@@ -119,6 +119,12 @@ class MockTriggerListener:
         self._dropped_connections: int = 0
         self._stop_event: Optional[asyncio.Event] = None
         self._reject_counter: int = 0
+        # Active per-client writers so stop() can drop existing
+        # connections and force the emitter to observe the disconnect.
+        # `asyncio.Server.close()` only stops accepting new connections
+        # — it does NOT close already-accepted ones, which would leave
+        # the emitter happily writing to a "stopped" listener.
+        self._active_writers: "set[asyncio.StreamWriter]" = set()
 
     @property
     def n_received(self) -> int:
@@ -139,13 +145,19 @@ class MockTriggerListener:
         if self._server is not None:
             raise RuntimeError("listener already started")
         self._stop_event = asyncio.Event()
+        # On a restart we *must* re-bind to the same port the emitter
+        # already knows about (self.port), otherwise the emitter's
+        # exponential backoff will never find us again. On the very
+        # first start we honour the caller's requested port (which
+        # may be 0 → ephemeral).
+        bind_port = self.port if self.port > 0 else self._requested_port
         self._server = await asyncio.start_server(
             self._handle_client,
             host=self.host,
-            port=self._requested_port,
+            port=bind_port,
         )
         sock = self._server.sockets[0] if self._server.sockets else None
-        self.port = sock.getsockname()[1] if sock is not None else self._requested_port
+        self.port = sock.getsockname()[1] if sock is not None else bind_port
         return self
 
     async def stop(self) -> None:
@@ -154,6 +166,19 @@ class MockTriggerListener:
         if self._stop_event is not None:
             self._stop_event.set()
         self._server.close()
+        # Force-close every still-open client connection so the emitter
+        # observes EOF and flips to RECONNECTING. (`server.close()`
+        # alone leaves established sockets running until the *client*
+        # disconnects.)
+        active = list(self._active_writers)
+        self._active_writers.clear()
+        for w in active:
+            with contextlib.suppress(Exception):
+                w.close()
+        for w in active:
+            with contextlib.suppress(Exception):
+                await w.wait_closed()
+            self._dropped_connections += 1
         with contextlib.suppress(Exception):
             await self._server.wait_closed()
         self._server = None
@@ -170,6 +195,7 @@ class MockTriggerListener:
         writer: asyncio.StreamWriter,
     ) -> None:
         self._connections_seen += 1
+        self._active_writers.add(writer)
         buf = b""
         try:
             while True:
@@ -190,6 +216,7 @@ class MockTriggerListener:
         except (asyncio.CancelledError, ConnectionResetError):
             return
         finally:
+            self._active_writers.discard(writer)
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()

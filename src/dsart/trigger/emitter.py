@@ -651,7 +651,16 @@ class TriggerEmitter:
     # ----- per-connection tasks -----
 
     async def _sender_loop(self, conn: _Connection) -> None:
-        """Connect (with backoff), then loop: drain TX queue → write."""
+        """Connect (with backoff), then loop: drain TX queue → write.
+
+        The sender handles disconnects from two directions:
+          - direct write/drain failure (peer reset, broken pipe);
+          - receiver task observed EOF and called ``_mark_disconnected``
+            while we were blocked on ``tx_queue.get()`` (writer goes
+            None under our feet).
+        In either case we rebuild the connection on the next iteration
+        with exponential backoff and drop the in-flight packet (per
+        plan §4.4: fail-during-disconnect → drop on this conn only)."""
         try:
             while not self._stop:
                 if conn.writer is None:
@@ -659,15 +668,19 @@ class TriggerEmitter:
                     if conn.writer is None:
                         # Backoff was cancelled; exit.
                         return
-                # Drain the queue.
                 if conn.tx_queue is None:
                     return
                 wire = await conn.tx_queue.get()
+                # Re-check after the await — receiver may have flipped
+                # us to disconnected while we were blocked.
+                if conn.writer is None:
+                    # Drop this packet; loop back to reconnect.
+                    continue
                 try:
                     conn.writer.write(wire)
                     await conn.writer.drain()
                     conn.n_sent += 1
-                except (ConnectionError, OSError) as e:
+                except (ConnectionError, OSError, BrokenPipeError) as e:
                     _LOG.warning(
                         "sender_loop: write to %s:%s failed: %s",
                         conn.endpoint.host, conn.endpoint.port, e,
