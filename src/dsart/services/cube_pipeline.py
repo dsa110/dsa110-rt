@@ -34,8 +34,9 @@ combiner + imager onto GPU + plumbs a cuFFT plan cache.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -114,6 +115,11 @@ class CubePipelineResult:
             detector.
         candidates: list of ``Candidate``s emitted by the detector
             (post-decoder, post-merger).
+        stage_timings_ns: per-stage wall-clock duration (ns) of the
+            most recent ``process()`` call. Keys are
+            ``{"build_cube", "layer1_norm", "detector_forward",
+            "total"}``. Used by ``bench/search_node_throughput.py`` to
+            build the per-stage histogram.
     """
 
     cube_id: int
@@ -122,6 +128,7 @@ class CubePipelineResult:
     sigma_layer1: torch.Tensor
     validity_mask: torch.Tensor
     candidates: List[Candidate]
+    stage_timings_ns: Dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +249,18 @@ class CubePipeline:
         kwarg and rebases ``Candidate.event_specnum`` to absolute
         specnums internally; we pass ``slot.specnum_start`` so
         downstream emitter sees absolute values.
+
+        Stage-level wall-clock timings are captured into
+        ``CubePipelineResult.stage_timings_ns`` for the throughput
+        bench. ``time.perf_counter_ns`` is monotonic and high-resolution
+        on linux; the stages are sequential so the timings sum to
+        ``total`` modulo a few ns of bookkeeping.
         """
+        t0 = time.perf_counter_ns()
         cube, validity_mask = self._build_cube(slot)
+        t1 = time.perf_counter_ns()
         cube_norm, sigma_layer1 = self._layer1_normalise(cube)
+        t2 = time.perf_counter_ns()
         with torch.no_grad():
             cands = self.detector.forward(
                 cube_norm,
@@ -252,6 +268,13 @@ class CubePipeline:
                 sigma_layer1,
                 event_specnum=int(slot.specnum_start),
             )
+        t3 = time.perf_counter_ns()
+        timings = {
+            "build_cube": t1 - t0,
+            "layer1_norm": t2 - t1,
+            "detector_forward": t3 - t2,
+            "total": t3 - t0,
+        }
         return CubePipelineResult(
             cube_id=slot.cube_id,
             specnum_start=slot.specnum_start,
@@ -259,4 +282,5 @@ class CubePipeline:
             sigma_layer1=sigma_layer1,
             validity_mask=validity_mask,
             candidates=cands,
+            stage_timings_ns=timings,
         )
