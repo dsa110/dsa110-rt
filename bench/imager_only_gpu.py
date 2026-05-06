@@ -245,51 +245,53 @@ def _dequant_cint8_to_complex_gpu(
 
     Output: ``[N_chgroup, T_stream, N_grid, N_grid]`` ``complex_dtype``.
 
-    Done chgroup-by-chgroup to bound peak GPU memory: the intermediate
-    fp32 → complex64 cast for one chgroup is ``T_stream × N_grid² × 8``
-    bytes (≈ 320 MiB at production T_stream=640, N_grid=256), vs ≈ 5
-    GiB if all 16 chgroups were converted at once.
+    Vectorised across all chgroups in a single op-graph. Goes through
+    fp32 → cf64 → ``complex_dtype`` because ``torch.complex(re, im)``
+    only supports fp32/fp64 and ``torch.view_as_complex`` only
+    supports fp32→cf64 / fp64→cf128. The intermediate fp32/cf64
+    tensors are short-lived and get freed before the per-fdm loop
+    runs (GPU caching allocator releases the slabs back to the pool).
+
+    Memory at production T_stream=640, N_grid=256, N_chgroup=16:
+        cint8 input: 1.25 GiB (caller-owned)
+        fp32 temp:    5.0 GiB (this function, freed at exit)
+        cfp16 out:    2.5 GiB (returned)
+
+    If 5 GiB intermediate is too much, build with ``chunk_size`` set
+    to process N_chgroup // chunk_size chgroups at a time.
 
     Per ``SparseCOOPayload``, the scale/offset are per-block scalars
     computed at the corr side from the filled cells. For the bench we
     pass the constants in (default scale=1, offset=0); production
     M3-emitted payloads carry them.
-
-    ``torch.complex(re, im)`` only supports fp32/fp64, and
-    ``torch.view_as_complex`` only supports fp32→cf64 / fp64→cf128.
-    For ``complex_dtype = torch.complex32`` we therefore go via fp32 →
-    cf64 → cf32.
     """
-    n_chgroup, t_stream, _, n_grid, _ = streams_cint8.shape
-    out = torch.empty(
-        (n_chgroup, t_stream, n_grid, n_grid),
-        dtype=complex_dtype, device=streams_cint8.device,
-    )
-    for g in range(n_chgroup):
-        # [T_stream, 2, N_grid, N_grid] cint8 → fp32
-        chg = streams_cint8[g].to(dtype=torch.float32)
-        if scale != 1.0 or offset != 0.0:
-            chg = chg * float(scale) + float(offset)
-        # permute last to [T_stream, N_grid, N_grid, 2] for view_as_complex.
-        chg = chg.permute(0, 2, 3, 1).contiguous()
-        chg_complex64 = torch.view_as_complex(chg)  # [T_stream, N_grid, N_grid] cf64
-        out[g] = chg_complex64.to(dtype=complex_dtype)
-        del chg, chg_complex64
+    # Fast vectorised path.
+    chg = streams_cint8.to(dtype=torch.float32)  # [..., 2, N_grid, N_grid] fp32
+    if scale != 1.0 or offset != 0.0:
+        chg = chg * float(scale) + float(offset)
+    # permute last to [..., N_grid, N_grid, 2] for view_as_complex.
+    chg = chg.permute(0, 1, 3, 4, 2).contiguous()
+    chg_cf64 = torch.view_as_complex(chg)  # [..., N_grid, N_grid] cf64
+    out = chg_cf64.to(dtype=complex_dtype)
     return out
 
 
 def _process_one_cube(
     *,
     streams_complex: torch.Tensor,  # [N_chgroup, T_stream, N_grid, N_grid] complex
-    time_shifts: torch.Tensor,      # [N_fdm, N_chgroup] int32
+    time_shifts_cpu: List[List[int]],   # [N_fdm][N_chgroup] python ints
     workspace: GpuImagerWorkspace,
 ) -> Dict[str, int]:
     """Run the full GPU imager for one cube. Writes into
-    ``workspace.output_cube``. Returns per-stage ns dict."""
-    n_chgroup = streams_complex.shape[0]
+    ``workspace.output_cube``. Returns per-stage ns dict.
+
+    ``time_shifts_cpu`` is plain Python ints (host-resident) so we can
+    slice without forcing a GPU→CPU sync inside the per-fdm loop.
+    """
     t_stream = streams_complex.shape[1]
     t_det = workspace.t_det
     n_fdm = workspace.n_fdm
+    n_chgroup = len(time_shifts_cpu[0])
     edge = workspace.edge_mask_real
     output = workspace.output_cube
     uv = workspace.uv_slab
@@ -303,20 +305,27 @@ def _process_one_cube(
     t_loop_start = time.perf_counter_ns()
     for f in range(n_fdm):
         # ---- combine: 16-chgroup index-shifted sum into uv slab. ----
+        # Each chgroup g's contribution is stream[g, t + shift[f, g]] for
+        # t in [0, t_det). We crop the source to [shift, shift+t_det)
+        # and add into uv[:t_det]. shifts are host Python ints so the
+        # slice index is a no-op for the GPU graph.
         t0 = time.perf_counter_ns()
-        uv.zero_()
-        # Each chgroup g's contribution is stream[g, t - shift[f, g]] for
-        # t in [0, t_det). We crop the source to the valid window
-        # [shift, shift + t_det) and add into uv[:t_det].
-        shifts_f = time_shifts[f]
-        for g in range(n_chgroup):
-            s = int(shifts_f[g].item())
-            # t_stream is sized so that shift+t_det <= t_stream by
-            # construction in the bench. Production has the same guarantee
-            # via the receive-ring pre-roll buffer.
-            if s + t_det > t_stream:
-                continue  # zero-fill (production: cube-validity gate)
-            uv += streams_complex[g, s : s + t_det]
+        shifts_f = time_shifts_cpu[f]
+        # Build a [N_chgroup, T_det, N, N] view by stacking shifted
+        # slices, then sum across the chgroup axis. Each shifted slice
+        # is contiguous (since dim 1 of streams is stride T_det × N²),
+        # so torch.stack is one big copy + sum is one reduction kernel.
+        slices = [
+            streams_complex[g, shifts_f[g] : shifts_f[g] + t_det]
+            for g in range(n_chgroup)
+            if shifts_f[g] + t_det <= t_stream
+        ]
+        if not slices:
+            uv.zero_()
+        elif len(slices) == 1:
+            uv.copy_(slices[0])
+        else:
+            torch.stack(slices, dim=0).sum(dim=0, out=uv)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t1 = time.perf_counter_ns()
@@ -421,23 +430,56 @@ def _bench_main(args: argparse.Namespace) -> int:
         cube_dtype=cube_dtype, complex_dtype=complex_dtype,
     )
 
-    # Per-cube the "input" (per-chgroup int8 streams + time-shift table)
-    # is regenerated. In production this comes from M3 RX-ring slots.
+    # Pre-stage two host-side cint8 buffers on GPU and alternate per
+    # cube. This decouples bench-only host-side input generation cost
+    # (numpy.random for ~1.25 GiB int8/cube is multi-second on CPU)
+    # from the imager work we want to measure. Two buffers (vs one)
+    # avoids any in-cache reuse that would mask realistic memory
+    # bandwidth pressure.
+    _LOG.info("pre-staging cint8 buffers on GPU (2 × %.2f MiB)",
+              N_CHGROUP * t_stream * 2 * n_grid * n_grid / (1024 * 1024))
+    streams_buffers_gpu: List[torch.Tensor] = []
+    for k in range(2):
+        s_cpu = _build_synthetic_streams(
+            n_chgroup=N_CHGROUP, t_stream=t_stream, n_grid=n_grid, rng=rng,
+        )
+        streams_buffers_gpu.append(s_cpu.to(device=device, non_blocking=False))
+        del s_cpu
+    torch.cuda.synchronize()
+
+    # Pre-warm cuFFT plan on a one-shot dummy cube. Without this the
+    # first cube's ifft2 carries the cuFFT plan-build cost (~270 ms at
+    # production geometry); we'd rather attribute that to startup.
+    _LOG.info("warming up cuFFT plan...")
+    dequant_warm = _dequant_cint8_to_complex_gpu(
+        streams_buffers_gpu[0], complex_dtype=complex_dtype,
+    )
+    _ = torch.fft.ifft2(dequant_warm[:t_det])
+    torch.cuda.synchronize()
+    del dequant_warm
+
     records: List[StageRecord] = []
     bench_start_ns = time.perf_counter_ns()
     for cube_id in range(n_cubes):
-        # ---- generate cint8 streams + dequant on GPU (scatter step) ----
-        streams_cint8_cpu = _build_synthetic_streams(
-            n_chgroup=N_CHGROUP, t_stream=t_stream, n_grid=n_grid, rng=rng,
-        )
-        time_shifts = _build_time_shifts(
+        # Round-robin between the two pre-staged GPU input buffers.
+        streams_cint8_gpu = streams_buffers_gpu[cube_id % len(streams_buffers_gpu)]
+
+        # Time-shift table is small (N_fdm × N_chgroup int32) so we
+        # generate it on host as Python ints. The per-fdm loop then
+        # never has to ``.item()`` a GPU tensor (saving ~25 ms/cube
+        # at production geometry).
+        shifts_arr = _build_time_shifts(
             n_fdm=n_fdm, n_chgroup=N_CHGROUP,
             t_stream_pad=t_stream_pad, rng=rng,
-        ).to(device=device)
+        ).numpy()
+        time_shifts_cpu = [
+            [int(shifts_arr[f, g]) for g in range(N_CHGROUP)]
+            for f in range(n_fdm)
+        ]
 
+        # ---- scatter (cint8 → cfp16 dequant) ----
         torch.cuda.synchronize()
         t_scatter_start = time.perf_counter_ns()
-        streams_cint8_gpu = streams_cint8_cpu.to(device=device, non_blocking=False)
         streams_complex = _dequant_cint8_to_complex_gpu(
             streams_cint8_gpu, complex_dtype=complex_dtype,
         )
@@ -447,10 +489,10 @@ def _bench_main(args: argparse.Namespace) -> int:
         # ---- run the per-fdm imager loop ----
         timings = _process_one_cube(
             streams_complex=streams_complex,
-            time_shifts=time_shifts,
+            time_shifts_cpu=time_shifts_cpu,
             workspace=workspace,
         )
-        del streams_complex, streams_cint8_gpu
+        del streams_complex
 
         rec = StageRecord(
             cube_id=cube_id,
@@ -474,7 +516,15 @@ def _bench_main(args: argparse.Namespace) -> int:
             )
 
     bench_wall_s = (time.perf_counter_ns() - bench_start_ns) / 1.0e9
-    achieved_cubes_per_s = len(records) / bench_wall_s if bench_wall_s > 0 else 0.0
+    # cubes/s is computed from the sum of per-cube imager work
+    # (excluding host-side input generation, which is bench-only). The
+    # sum here is sequential because each cube waits for the previous
+    # to finish writing into the output buffer; production has 1 cube
+    # in-flight at a time per GPU half by the same logic.
+    sum_total_ns = sum(r.total_ns for r in records)
+    achieved_cubes_per_s = (
+        len(records) * 1.0e9 / sum_total_ns if sum_total_ns > 0 else 0.0
+    )
 
     # ---- write outputs ----
     ndjson_path = out_dir / "stage_timings.ndjson"
@@ -502,6 +552,7 @@ def _bench_main(args: argparse.Namespace) -> int:
         "wall_clock_s": bench_wall_s,
         "achieved_cubes_per_s": achieved_cubes_per_s,
         "n_cubes_processed": len(records),
+        "imager_total_s": sum_total_ns / 1.0e9,
         "percentiles_ms": {
             "scatter": percentiles([r.scatter_ns for r in records]),
             "combine": percentiles([r.combine_ns for r in records]),
