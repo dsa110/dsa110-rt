@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>M5 Chunk 6c — perf-vs-quality characterization</title>
+<style>
+  body { font-family: Helvetica, Arial, sans-serif; margin: 1.5em;
+         color: #222; max-width: 1200px; }
+  h1 { font-size: 1.6em; }
+  h2 { font-size: 1.2em; margin-top: 1.5em;
+        border-bottom: 1px solid #aaa; padding-bottom: 0.2em; }
+  table { border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; }
+  th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: right; }
+  th { background: #f0f0f0; }
+  td.label { text-align: left; font-family: monospace; }
+  .headline { background: #fff7d0; border-left: 4px solid #b58900;
+               padding: 0.6em 0.8em; margin: 0.6em 0; }
+  .meta { color: #666; font-size: 0.85em; }
+  img { max-width: 100%; height: auto; border: 1px solid #ddd;
+         margin: 0.5em 0; }
+  .disclaimer { color: #555; font-size: 0.85em; font-style: italic;
+                 margin-top: 1em; }
+</style>
+</head>
+<body>
+
+<h1>M5 Chunk 6c — perf-vs-quality characterization</h1>
+<div class="meta">2026-05-06T16:38:36.130768+00:00 · target = 8.00 cubes/s
+· mid cell = (snr=8, width=32)</div>
+
+<div class="headline">No measured bank-mask + N_grid combination hits ≥ 8.0 cubes/s (best observed: 1.57). The GPU port (combiner+imager+detector on cuda; cuFFT plan cache; fused boxcar) is required regardless of bank shrinkage.</div>
+
+<h2>Pareto: cubes/s vs. recovery</h2>
+<img src="pareto.png" alt="Pareto plot">
+
+<h2>Joined Pareto table</h2>
+<table><tr><th>label (bank-mask)</th><th>N_grid</th><th>n_kernels</th><th>cubes/s</th><th>total p50 (ms)</th><th>total p99 (ms)</th><th>detector p50 (ms)</th><th>build_cube p50 (ms)</th><th>recovery@mid</th><th>SNR ratio@mid</th></tr><tr><td class='label'>full</td><td>128</td><td>128</td><td>1.57</td><td>334.27</td><td>437.70</td><td>297.58</td><td>33.08</td><td>1.00</td><td>1.25</td></tr><tr><td class='label'>k_img=unit;k_dm=d1</td><td>256</td><td>8</td><td>0.69</td><td>223.80</td><td>308.27</td><td>64.89</td><td>150.06</td><td>1.00</td><td>1.25</td></tr><tr><td class='label'>k_dm=d1</td><td>256</td><td>32</td><td>0.62</td><td>377.96</td><td>487.72</td><td>223.45</td><td>146.72</td><td>1.00</td><td>1.25</td></tr><tr><td class='label'>k_img=unit</td><td>256</td><td>32</td><td>0.58</td><td>387.73</td><td>517.74</td><td>223.90</td><td>155.95</td><td>1.00</td><td>1.25</td></tr><tr><td class='label'>full</td><td>256</td><td>128</td><td>0.44</td><td>1048.33</td><td>1218.84</td><td>893.77</td><td>147.62</td><td>1.00</td><td>1.25</td></tr></table>
+
+<h2>Per-mask recovery heatmaps</h2>
+<img src="recovery_grid.png" alt="Recovery grid">
+
+<h2>Per-mask throughput stage breakdown</h2>
+<img src="throughput_stages.png" alt="Throughput stage breakdown">
+
+<p class="disclaimer">
+No PASS/FAIL banner per plan §4.7. The operator inspects this report
+and chooses a kernel-bank configuration. Recovery fractions come from
+``bench/cube_injection_detector.py`` runs at the listed bank-mask;
+throughput numbers come from ``bench/search_node_throughput.py`` runs
+at the listed (n_grid, bank-mask). Per Chunk 6c framing, N_grid=256 is
+the operator's preferred grid; N_grid=128 measurements quantify the
+perf headroom if 256 ever proves infeasible.
+</p>
+
+</body>
+</html>

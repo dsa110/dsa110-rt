@@ -288,13 +288,18 @@ def _process_one_cube(
     *,
     streams_complex: torch.Tensor,  # [N_chgroup, T_stream, N_grid, N_grid] complex
     time_shifts_cpu: List[List[int]],   # [N_fdm][N_chgroup] python ints
+    time_shifts_gpu: torch.Tensor,      # [N_fdm, N_chgroup] int32 cuda (for fused kernel)
     workspace: GpuImagerWorkspace,
+    combine_impl: str,
 ) -> Dict[str, int]:
     """Run the full GPU imager for one cube. Writes into
     ``workspace.output_cube``. Returns per-stage ns dict.
 
-    ``time_shifts_cpu`` is plain Python ints (host-resident) so we can
-    slice without forcing a GPU→CPU sync inside the per-fdm loop.
+    ``time_shifts_cpu`` is plain Python ints (host-resident) so the
+    ``python_addloop`` impl can slice without forcing a GPU→CPU sync
+    inside the per-fdm loop. ``time_shifts_gpu`` is the same table on
+    GPU as int32, used by the ``fused_cuda`` impl which reads it
+    inside the kernel.
     """
     t_stream = streams_complex.shape[1]
     t_det = workspace.t_det
@@ -305,6 +310,10 @@ def _process_one_cube(
     uv = workspace.uv_slab
     img = workspace.img_slab_real
 
+    use_fused = (combine_impl == "fused_cuda")
+    if use_fused:
+        from dsart.image.fused_combine_cuda import fused_combine_per_fdm
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     t_combine_total = 0
@@ -313,22 +322,24 @@ def _process_one_cube(
     t_loop_start = time.perf_counter_ns()
     for f in range(n_fdm):
         # ---- combine: 16-chgroup index-shifted sum into uv slab. ----
-        # Each chgroup g's contribution is stream[g, t + shift[f, g]] for
-        # t in [0, t_det). We crop the source to [shift, shift+t_det)
-        # and add into uv[:t_det]. shifts are host Python ints so the
-        # slice index is a no-op for the GPU graph.
         t0 = time.perf_counter_ns()
-        shifts_f = time_shifts_cpu[f]
-        # Accumulate via in-place add_(): N_chgroup eltwise-adds per
-        # fdm. Each add reads 2 × 64 MiB and writes 64 MiB at
-        # production geometry (cfp16 [T_det=512, N=256, N=256] = 64 MiB).
-        # Faster than torch.stack→sum because that allocates a 1 GiB
-        # transient per fdm and runs N_chgroup separate copies anyway.
-        uv.zero_()
-        for g in range(n_chgroup):
-            s = shifts_f[g]
-            if s + t_det <= t_stream:
-                uv.add_(streams_complex[g, s : s + t_det])
+        if use_fused:
+            # Single CUDA kernel: one read of each chgroup + one write
+            # to uv. Memory traffic ~3× lower than the Python add-loop
+            # version. Boundary check (shift+t_det > t_stream) is
+            # cell-wise inside the kernel.
+            fused_combine_per_fdm(
+                streams_complex, time_shifts_gpu[f].contiguous(), uv,
+            )
+        else:
+            # Python fallback (A/B baseline): N_chgroup eltwise-adds
+            # per fdm, each reading 2 × slab_volume and writing slab_volume.
+            shifts_f = time_shifts_cpu[f]
+            uv.zero_()
+            for g in range(n_chgroup):
+                s = shifts_f[g]
+                if s + t_det <= t_stream:
+                    uv.add_(streams_complex[g, s : s + t_det])
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t1 = time.perf_counter_ns()
@@ -458,21 +469,29 @@ def _bench_main(args: argparse.Namespace) -> int:
     torch.cuda.synchronize()
     del warm_uv
 
+    # Pre-compile the fused CUDA kernel once before timing if requested.
+    # The first call to load_inline() builds the .so (~30 s); subsequent
+    # imports load instantly from the torch_extensions cache.
+    if args.combine_impl == "fused_cuda":
+        from dsart.image.fused_combine_cuda import get_module
+        _LOG.info("compiling fused_combine_cuda kernel (~30 s on first run)...")
+        get_module(verbose=False)
+        _LOG.info("fused_combine_cuda kernel ready")
+
     records: List[StageRecord] = []
     bench_start_ns = time.perf_counter_ns()
     for cube_id in range(n_cubes):
         # Time-shift table is small (N_fdm × N_chgroup int32) so we
         # generate it on host as Python ints. The per-fdm loop then
         # never has to ``.item()`` a GPU tensor (saving ~25 ms/cube
-        # at production geometry).
+        # at production geometry); we also stage the same table on GPU
+        # as int32 so the fused CUDA kernel can read it directly.
         shifts_arr = _build_time_shifts(
             n_fdm=n_fdm, n_chgroup=N_CHGROUP,
             t_stream_pad=t_stream_pad, rng=rng,
-        ).numpy()
-        time_shifts_cpu = [
-            [int(shifts_arr[f, g]) for g in range(N_CHGROUP)]
-            for f in range(n_fdm)
-        ]
+        )
+        time_shifts_cpu = shifts_arr.tolist()
+        time_shifts_gpu = shifts_arr.to(device=device, dtype=torch.int32)
 
         # ---- scatter (cint8 → cfp16 dequant) ----
         torch.cuda.synchronize()
@@ -487,7 +506,9 @@ def _bench_main(args: argparse.Namespace) -> int:
         timings = _process_one_cube(
             streams_complex=streams_complex,
             time_shifts_cpu=time_shifts_cpu,
+            time_shifts_gpu=time_shifts_gpu,
             workspace=workspace,
+            combine_impl=args.combine_impl,
         )
         del streams_complex
 
@@ -545,6 +566,7 @@ def _bench_main(args: argparse.Namespace) -> int:
             "complex_dtype": str(complex_dtype).rsplit(".", 1)[-1],
             "device": "cuda",
             "seed": int(args.seed),
+            "combine_impl": str(args.combine_impl),
         },
         "wall_clock_s": bench_wall_s,
         "achieved_cubes_per_s": achieved_cubes_per_s,
@@ -591,6 +613,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "Production T_stream = T_det + max_shift.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--combine-impl", type=str, default="fused_cuda",
+        choices=("fused_cuda", "python_addloop"),
+        help="Per-fdm 16-chgroup combine implementation. fused_cuda "
+             "(default, production target) JIT-compiles a custom CUDA "
+             "kernel via torch.utils.cpp_extension.load_inline that "
+             "fuses all 16 chgroup reads + 1 output write into one "
+             "kernel; python_addloop is the chunk-6c-follow-up A/B "
+             "baseline that does N_chgroup separate uv.add_(...) ops.",
+    )
     parser.add_argument(
         "--out", type=str,
         default=str(REPO_ROOT / "bench" / "reports" / "imager_gpu" / "M5"),
