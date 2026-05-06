@@ -249,16 +249,16 @@ def test_stage1_shift_dispersed_input_aligns_at_truth_dm():
     """A burst dispersed at the truth DM, with per-channel arrivals
     at ``t0_top + bin_shift[ch]``, dedisperses to a single time
     ``t' = t0_top`` after applying the same DM trial."""
-    plan = _make_test_plan(n_coarse=4, dm_max_pc_cc=300.0)
-    chgroup = 0
+    plan = _make_test_plan(n_coarse=4, dm_max_pc_cc=2000.0)
+    chgroup = 15  # lowest-frequency chgroup → largest dispersion
     dm_idx_truth = 3  # largest DM
-    n_chan_test = 24
+    n_chan_test = NCHAN_PER_CHGROUP
     bin_shifts = plan.delay_bins_per_chgroup(
         chgroup
     )[:n_chan_test, dm_idx_truth]
     max_shift = int(bin_shifts.max())
-    n_fast_vis = max_shift + 64
-    t0_top = max_shift + 5
+    t0_top = 5
+    n_fast_vis = max_shift + t0_top + 16
 
     vis = _channel_dispersed_vis(
         n_fast_vis=n_fast_vis, t0_top=t0_top, plan=plan,
@@ -311,8 +311,12 @@ def test_stage1_shift_off_dm_smears_burst():
     max_shift_overall = int(
         plan.delay_bins_per_chgroup(chgroup)[:n_chan_test, :].max()
     )
-    n_fast_vis = max_shift_overall + 64
-    t0_top = max_shift_overall + 5
+    # n_fast_vis must hold the LAST channel's impulse at
+    # t_ch = t0_top + max_shift_overall AND give some output range
+    # after applying the truth shift. Pick t0_top=5 (small) so the
+    # output at t' = 5 receives all per-channel impulses.
+    t0_top = 5
+    n_fast_vis = max_shift_overall + t0_top + 16
 
     vis = _channel_dispersed_vis(
         n_fast_vis=n_fast_vis, t0_top=t0_top, plan=plan,
