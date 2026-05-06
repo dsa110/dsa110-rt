@@ -87,14 +87,16 @@ def test_compute_time_shift_search_matches_closed_form() -> None:
         fine_dm_pc_cm3=fine,
         fine_to_coarse=f2c,
     )
-    # Check a handful of cells explicitly.
+    # Check a handful of cells explicitly. delta_tau_us takes
+    # (nu_low, nu_high, dm); for g < 15 chgroup_bot[g] > nu_bot_proc,
+    # so nu_low IS nu_bot_proc and shift = +rint(Δτ / t_int).
     for f_idx in (0, 5, 17, len(fine) - 1):
         c_idx = int(f2c[f_idx])
         ddm = float(fine[f_idx] - coarse[c_idx])
         for g in range(N_CHGROUP - 1):
             d_us = delta_tau_us(
-                float(NU_CHGROUP_BOT_GHZ[g]),
                 float(NU_BOT_PROC_GHZ),
+                float(NU_CHGROUP_BOT_GHZ[g]),
                 ddm,
             )
             expected = int(np.rint(d_us / T_INT_SEARCH_US_DEFAULT))
