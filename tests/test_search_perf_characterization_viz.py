@@ -422,7 +422,7 @@ def test_main_writes_full_report(tmp_path: Path) -> None:
     ):
         assert (out / fn).is_file(), f"missing {fn}"
 
-    html = (out / "report.html").read_text()
+    html = (out / "report.html").read_text(encoding="utf-8")
     assert "M5 Chunk 6c" in html
     # Must NOT carry an automated PASS/FAIL banner per plan §4.7.
     assert "PASSED" not in html
@@ -430,7 +430,7 @@ def test_main_writes_full_report(tmp_path: Path) -> None:
     # The headline mentions either the bank mask or the GPU port.
     assert "k_img=unit;k_dm=d1" in html or "GPU port" in html
 
-    pareto = json.loads((out / "pareto.json").read_text())
+    pareto = json.loads((out / "pareto.json").read_text(encoding="utf-8"))
     assert isinstance(pareto, list)
     assert len(pareto) == 2
     labels = {row["label"] for row in pareto}

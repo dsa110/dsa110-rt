@@ -146,7 +146,7 @@ def test_render_candidates_table_html(tmp_path: Path) -> None:
     ]
     out = tmp_path / "candidates.html"
     render_candidates_table_html(rows, out_path=out)
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     assert "<!doctype html>" in text
     assert "unit:d3:b16" in text
     assert "(noise-only" in text
@@ -174,7 +174,7 @@ def test_stitch_search_html_report(tmp_path: Path) -> None:
         extra_links=[("README", "README.txt")],
     )
     assert report_path == tmp_path / "report.html"
-    text = report_path.read_text()
+    text = report_path.read_text(encoding="utf-8")
     # The report's only mention of PASS/FAIL is the operator-facing
     # disclaimer ("No PASS/FAIL banner — operator inspects manually");
     # there must be no per-criterion verdict words.
@@ -293,6 +293,6 @@ def test_cli_cube_injection_end_to_end(tmp_path: Path) -> None:
     assert len(pngs) == 1
 
     # Report.html header must include the operator-pinned tool name.
-    report_text = (out_dir / "report.html").read_text()
+    report_text = (out_dir / "report.html").read_text(encoding="utf-8")
     assert "search_detector_check" in report_text
     assert "No PASS/FAIL banner" in report_text

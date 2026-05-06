@@ -41,7 +41,6 @@ and the corresponding tests.
 
 from __future__ import annotations
 
-import locale
 import logging
 from typing import Optional, Tuple
 
@@ -49,28 +48,16 @@ import torch
 
 _LOG = logging.getLogger(__name__)
 
-
-def _restore_user_locale() -> None:
-    """Restore the user's locale (clobbered by cupy / NVRTC).
-
-    cupy invokes NVRTC which calls ``setlocale(LC_ALL, "C")`` somewhere
-    in its toolchain bootstrap; that resets Python's default
-    ``locale.getpreferredencoding(False)`` from "UTF-8" to "ANSI_X3.4-1968"
-    (ASCII), which makes ``Path.write_text(...)`` / ``open(..., "r")``
-    fall back to ASCII encoding for the rest of the process. Subsequent
-    reads/writes of UTF-8-containing HTML reports (Greek σ, em-dashes)
-    then crash with UnicodeEncodeError.
-
-    We call this after every NVRTC compile to undo the damage. The
-    ``""`` argument tells setlocale to read from the LANG / LC_ALL
-    environment variable.
-    """
-    try:
-        locale.setlocale(locale.LC_ALL, "")
-    except locale.Error:
-        # Best effort; on systems with no LANG env var this can fail.
-        # The viz code's defensive ``encoding="utf-8"`` covers us.
-        pass
+# CAVEAT: cupy's NVRTC compile path calls ``setlocale(LC_ALL, "C")``
+# inside its toolchain bootstrap, which clobbers Python's default
+# ``locale.getpreferredencoding(False)`` from "UTF-8" to ASCII for
+# the rest of the process. Python's ``setlocale(LC_ALL, "")``
+# afterwards silently no-ops (the locale fastpath cache stays in
+# the wrong state), so the only workable defence is for *every*
+# file I/O in this codebase to pass ``encoding="utf-8"`` explicitly.
+# tools/viz/* + tests/test_search*viz*.py have been audited; new
+# code that touches text files in the same process as fused_combine
+# must do the same.
 
 # Lazy imports of cupy: this module is only useful on a cuda host.
 # We defer the import to the first call so the rest of the package
@@ -183,8 +170,6 @@ def _get_kernel_cf16():
         name="fused_combine_per_fdm_cf16",
         options=("--use_fast_math",),
     )
-    # cupy/NVRTC has clobbered the locale; restore.
-    _restore_user_locale()
     _LOG.info("fused_combine_per_fdm_cf16 ready")
     return _KERNEL_CF16
 
@@ -200,7 +185,6 @@ def _get_kernel_cf32():
         name="fused_combine_per_fdm_cf32",
         options=("--use_fast_math",),
     )
-    _restore_user_locale()
     _LOG.info("fused_combine_per_fdm_cf32 ready")
     return _KERNEL_CF32
 
