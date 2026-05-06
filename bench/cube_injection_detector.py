@@ -335,8 +335,21 @@ async def _bench_main(args: argparse.Namespace) -> int:
     n_grid = int(args.n_grid)
 
     if args.quick_sweep:
-        n_trials = max(n_trials, 1)
-        n_noise_cubes = max(min(n_noise_cubes, 4), 1)
+        n_trials = max(min(n_trials, 1), 1)
+        n_noise_cubes = max(min(n_noise_cubes, 2), 1)
+        # Smaller cubes than the operator-facing default so the CPU-side
+        # 128-kernel inner loop stays fast (the smoke / DoD path doesn't
+        # need the full plan-pinned T_det = 512). The full-sweep path
+        # honours the CLI defaults.
+        # K_time = 128 / K_dm = 5, 7 boxcars are skipped when the cube
+        # axis is shorter than the kernel; the detector handles this
+        # gracefully (forward.py L627, L635 guards).
+        if t_det == DEFAULT_T_DET:
+            t_det = 64
+        if n_fdm == DEFAULT_N_FDM:
+            n_fdm = 4
+        if n_grid == DEFAULT_N_GRID:
+            n_grid = 16
 
     _LOG.info(
         "bench config: snrs=%s widths=%s n_trials=%d n_noise_cubes=%d "
