@@ -601,6 +601,14 @@ def main(argv: list[str] | None = None) -> int:
             elapsed_s=float(elapsed),
         )
         chgroup_results.append(result)
+
+        # Free the per-chgroup GPU tensors before the next sb's
+        # build_context allocates a fresh kernel + sparsity pattern;
+        # otherwise residual fp16 intermediates from compute_split's
+        # last call will fragment GPU memory enough to OOM at sb01+.
+        del ctx, outputs, sparse, dense, cube
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         LOG.info(
             "  sb%s peak: (row,col)=(%d,%d) t_idx=%d -> t_native (chg0 top frame)=%d "
             "value=%.3g cell_lambda=%.3g",

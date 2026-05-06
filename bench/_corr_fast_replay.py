@@ -293,6 +293,14 @@ def replay_chgroup(
             None if out.gridded_minus_sky is None
             else tuple(out.gridded_minus_sky.shape),
         )
+        # Reduce GPU memory fragmentation across blocks. The fast-corr
+        # kernel allocates large fp16 (n_fv, batch, 96, 96) intermediates
+        # that the caching allocator may otherwise hold onto, eventually
+        # triggering OOM on 11 GB consumer GPUs at small t_int_fast_native
+        # values (e.g. 32). The output gridded_minus_sky is tiny so we
+        # safely clear caches per block.
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     return ctx, outputs
 
