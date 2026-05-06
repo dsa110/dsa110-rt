@@ -175,10 +175,12 @@ def test_stitch_search_html_report(tmp_path: Path) -> None:
     )
     assert report_path == tmp_path / "report.html"
     text = report_path.read_text()
-    # No PASS/FAIL banner anywhere.
-    assert "PASS" not in text and "FAIL" not in text
-    # Per plan: explicit "No PASS/FAIL" note.
+    # The report's only mention of PASS/FAIL is the operator-facing
+    # disclaimer ("No PASS/FAIL banner — operator inspects manually");
+    # there must be no per-criterion verdict words.
     assert "No PASS/FAIL banner" in text
+    assert "PASSED" not in text and "FAILED" not in text
+    assert "verdict" not in text.lower()
     # All figures are present.
     assert "x.png" in text
     assert "y.png" in text
