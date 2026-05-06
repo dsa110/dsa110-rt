@@ -148,11 +148,116 @@ across all M (no per-M tolerance multipliers). Backwards-compat:
 for any downstream consumer that needs the asymptotic form (none in
 production).
 
+### F24 — coarse-DM time shifts are stored in NATIVE samples (not bin units)
+
+**Status**: IMPLEMENTED in chunk 3b (`tests/test_coarse_dm.py
+::test_F24_coarse_dm_uses_native_t_axis`, 2026-05-06). Lives in
+`src/dsart/coarse_dm/dm_plan.py`. The per-`(chgroup, channel, dm)`
+delay table is in NATIVE samples (32.768 µs each, M2 D15);
+fast-vis-bin-unit shifts are derived once at apply time via
+`round(delay_native / t_int_fast_native)`. This composes losslessly
+with the canonical `contracts.DmPlan.time_shift_corr_stage2` (also
+native units) without compound rounding.
+
+**Rationale**: storing shifts in fast-vis bin units would couple the
+coarse-DM plan to the runtime `t_int_fast_native` knob (default 8 →
+262.144 µs cadence; burst-test override 32 → 1048.576 µs). Native
+samples decouple them; the lookup table is fixed-once at plan build,
+the bin reduction happens at integration time per the active
+`t_int_fast_native`.
+
+### F25 — coarse-DM integration shape: vis-domain stage-1 shifts (not post-grid)
+
+**Status**: DOCUMENTED (architectural reconciliation deferred to chunk
+6 / 9 integration). Plan §4.2 step 4 specifies stage-1 per-channel
+INTEGER-sample time shifts on the visibility tensor `(n_fv, NBASE,
+NCHAN)` BEFORE the gridder, with one gridder call per coarse-DM
+trial — i.e. the per-trial coarse-DM cube is produced by `grid(time_
+shift_corr_stage1(vis, dm_idx))`, not by post-grid manipulation.
+
+Three primitives are involved:
+
+1. **`coarse_dm.dedisp.coarse_dedisp(image_cube, plan, ...)`** —
+   chunk-3b's pure-math primitive on `[T_fast, NCHAN, N_grid,
+   N_grid]` cubes. Pinned by 18 acceptance tests; bench
+   `coarse_dm_recovery.py` confirms exact `(t, l, m)` recovery on
+   synthetic burst.
+
+2. **`corr_fast_integration.CoarseDMStage` Protocol** — chunk-4's
+   plug-in surface. Currently typed against POST-grid sparse-COO
+   `(n_fv, N_filled)` and returns `(N_DM, n_fv, N_filled)`. The
+   default `NoOpCoarseDM` returns `gridded.unsqueeze(0)` — a
+   no-op-with-trivial-DM-axis adapter that is correct for the
+   `N_DM == 1` case but does NOT exercise the production stage-1
+   shift path.
+
+3. **`time_shift_corr_stage1` (planned, not yet authored)** — vis-
+   domain integer-sample shift. Per plan §4.2 step 4, this is what
+   chunk-4 should call before `gridder.compute()` per coarse-DM
+   trial. The `DMPlan.delay_native_samples()` lookup from chunk 3b
+   provides the data; the chunk-4 integration loop is the missing
+   wiring.
+
+**Reconciliation plan** (chunk 6 + chunk 9 work):
+
+- Chunk 6 (`voltage_fixture_burst_250924mptq`) runs with
+  `--single-dm` (custom 1-cell DM plan per the user's burst-test
+  config), so the no-op CoarseDMStage stub is correct as-is. No
+  chunk-4 refactor needed for chunk 6.
+- Chunk 9 (`dod_orchestrator_completion`) is where the production
+  multi-DM-trial integration wires together. At that point chunk 4
+  needs:
+  - `process_block` restructured to loop over `dm_idx in plan
+    .coarse_indices` after Stokes-I sum: `vis_shifted =
+    apply_stage1_shifts(vis_stokes_i, plan, dm_idx)` →
+    `gridded[dm_idx] = gridder.compute(vis_shifted)` → static-sky
+    EMA per-trial → stage2 fifo per-trial → transport per-trial.
+  - `CoarseDMStage` Protocol re-typed to take vis_stokes_i + plan +
+    chgroup, return `dict[int, torch.Tensor]` of per-trial shifted
+    visibilities. The chunk-3b `coarse_dedisp` primitive remains the
+    math reference; the integration loop is the production path.
+- This is a 6-9 chunk-of-effort refactor in chunk 9 — tracked as
+  D-decision in the chunk-9 brief.
+
+**Why this is safe to defer**: today's stub passes the no-DM case
+through correctly, and chunk-4's integration tests pin the
+orchestrator's correctness (RFI zero-fill, static-sky, plug-in stage
+wiring) for the `N_DM == 1` case which is what chunk 5 (continuum)
++ chunk 6 (single-DM burst) need. The vis-domain stage-1 shifts only
+matter once the search starts asking for `N_DM > 1` trials, and
+that's chunk-9 material.
+
 ---
 
 ## D-items (decisions — locked during M3 implementation)
 
-(none yet)
+### D-coarse-dm-A — Convention A vs B for DMPlan delay reference
+
+**Status**: LOCKED in chunk 3b. Documented in `src/dsart/coarse_dm/
+dm_plan.py` module docstring + this entry.
+
+The chunk-3b `DMPlan.delay_native_samples(g, ch, dm)` uses
+**Convention A**: per-chgroup, the reference channel is each
+chgroup's own TOP channel, so `delay_native_samples(g, ch=0, dm) ≡
+0` for all `g, dm` (channel 0 = top frequency in chgroup `g`). The
+canonical `contracts.DmPlan.time_shift_corr_stage1` table (M2
+schema) uses **Convention B**: reference is each chgroup's BOT
+channel.
+
+Both conventions are equivalent up to a per-`(g, dm)` constant
+offset of `max_delay_in_chgroup`. The chunk-3b convention forces
+output `t' ∈ [0, T_fast - max_Δ)` which keeps the dedispersed cube
+positionally aligned with the input cube's first sample (cleaner
+test semantics + matches the chunk-3b briefing's
+`test_dm_plan_delay_zero_at_top_freq` pin). Convention B is needed
+downstream for stage-2 inter-chgroup alignment to `ν_bot_proc`.
+
+The chunk-4 integration glue (per F25) is responsible for
+translating between conventions when wiring into the production
+stage-2 path (chunk 9). Both conventions live in the codebase:
+canonical `DmPlan` (Class C, contracts) keeps Convention B; chunk-3b
+slim `DMPlan` (Class A, owned by `coarse_dm/dm_plan.py`) keeps
+Convention A.
 
 ---
 

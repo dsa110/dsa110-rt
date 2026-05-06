@@ -230,6 +230,22 @@ python -m pytest tests/test_online_injector.py -q --tb=short \
   || fail "online injector acceptance pytests failed"
 pass
 
+# --- chunk 3b: coarse-DM dedisperser + Stage-2 FIFO + DMPlan ---------------
+# 18 acceptance tests covering: DMPlan slim-view + canonical-DmPlan ↔ npz
+# round-trips + delay-table monotonicity (DM, freq) + zero-at-top-freq
+# anchor (Convention A) + chunk-3b coarse-only single-DM npz fixture for
+# chunk 6 + coarse_dedisp output shape/dtype + zero-DM passthrough +
+# synthetic-burst exact recovery + off-DM amplitude drop ≥ 50% + fp32
+# accumulator / fp16 output safety margin + per-(g, ch, dm) shifts in
+# NATIVE samples (F24 pin) + Stage2FIFO push/pop ordering + capacity
+# eviction + partial-fill behaviour + push-for-Protocol adapter for
+# chunk-4 wiring + F18+F20+F21 composition in dedispersed image
+# (point source at known (l, m, dm) lands at (+l, +m) post-dedisp).
+STEP="chunk_3b_coarse_dm"
+python -m pytest tests/test_coarse_dm.py -q --tb=short \
+  || fail "coarse-DM acceptance pytests failed"
+pass
+
 # --- chunk 4: corr_fast_integration (full-pipeline orchestrator) -----------
 # 19 acceptance tests covering the chunk-4 production service
 # corr_fast_integration that wires together (in order):
@@ -268,12 +284,12 @@ CHUNKS_DONE=(
   "chunk_2a_fast_corr_kernel"
   "chunk_2b_corr_fast_compute_service_shell"
   "chunk_3a_gridder_sparsity_pattern"
+  "chunk_3b_coarse_dm"
   "chunk_3c_rfi_flagger"
   "chunk_3d_online_injector"
   "chunk_4_corr_fast_integration"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
-  "chunk_3b_coarse_dm_static_sky"
   "chunk_5_voltage_fixture_continuum"
   "chunk_6_voltage_fixture_burst_250924mptq"
   "chunk_7_16chgroup_alignment_preview"
@@ -324,12 +340,12 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_2a_fast_corr_kernel",
     "chunk_2b_corr_fast_compute_service_shell",
     "chunk_3a_gridder_sparsity_pattern",
+    "chunk_3b_coarse_dm",
     "chunk_3c_rfi_flagger",
     "chunk_3d_online_injector",
     "chunk_4_corr_fast_integration"
   ],
   "chunks_remaining": [
-    "chunk_3b_coarse_dm_static_sky",
     "chunk_5_voltage_fixture_continuum",
     "chunk_6_voltage_fixture_burst_250924mptq",
     "chunk_7_16chgroup_alignment_preview",
