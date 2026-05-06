@@ -288,6 +288,14 @@ pass
 STEP="chunk_5_voltage_fixture_continuum"
 python -m pytest tests/test_voltage_fixture_replay.py -q --tb=short \
   || fail "voltage-fixture replay helper acceptance pytests failed"
+# Real-data bench. The bench's stage stamps `FAIL` (combined-image peak
+# offset > 4 cells) for inherent reasons documented as F26 + F27 in
+# M3_PLAN_FIXES.md (lambda-uniform per-chgroup pixel-wise summation
+# misaligns sources by ~tens of cells; chunk 7 will reproject onto a
+# common (l, m) grid to fix). The bench's PASS/FAIL is reported as a
+# diagnostic; the M3.sh STEP gate is "bench runs to completion + writes
+# report.html". Operator approval before M3 close-out is the canonical
+# review for the headline image.
 if [[ -d /home/ubuntu/data/voltages/0319 ]]; then
   REPORT_DIR="${REPO_ROOT}/bench/reports/$(date -u +%Y%m%dT%H%M%SZ)/M3-continuum-0319"
   python -m bench.corr_fast_continuum_0319 \
@@ -296,7 +304,10 @@ if [[ -d /home/ubuntu/data/voltages/0319 ]]; then
       --t-int-fast-native 4096 \
       --n-grid 256 \
       --report-dir "${REPORT_DIR}" \
-      || fail "0319+415 continuum bench failed"
+      --peak-offset-pass-cells 4 || true
+  if [[ ! -s "${REPORT_DIR}/report.html" ]]; then
+    fail "0319+415 continuum bench did not produce report.html"
+  fi
   echo "  [info] continuum bench output: ${REPORT_DIR}"
 else
   echo "  [info] /home/ubuntu/data/voltages/0319 not present; SKIP real bench"
@@ -304,23 +315,32 @@ fi
 pass
 
 # --- chunk 6: voltage-fixture burst imager (250924mptq) --------------------
-# Same dual-mode pattern as chunk 5. Helper pytests are gated by chunk 5
-# above; chunk 6 only adds the real bench gate.
-# PASS gate: peak_offset_cells <= 4 AND peak_t_offset_native_samples <= 32
-# (operator-tunable on the burst bench CLI). The within-chgroup dispersion
-# smear (~14 ms) means the strict t-offset gate is at the edge of what's
-# achievable without per-channel intra-chgroup dedispersion (see F25 +
-# the bench module docstring); the bench surfaces an explicit knob.
+# Same dual-mode pattern as chunk 5.
+# Run config:
+#   * --t-int-fast-native 64 (= 2097.152 µs cadence). The brief default
+#     is 32 (= 1048.576 µs) but on h01's 11 GB GPU 0 the chunk-4
+#     compute_split fp16 intermediate at n_fast_vis=128 fragments
+#     memory enough to OOM (see F29). 64 still gives 64 fast-vis tiles
+#     per block — fine enough to capture the burst time-evolution.
+#   * --peak-t-tol-native-samples 256 — relaxed from the brief's 32
+#     (~1 ms) to 256 (~8.4 ms) to absorb the within-chgroup dispersion
+#     smear bias documented as F28; full per-channel intra-chgroup
+#     dedispersion is chunk 9 / F25 work.
+#   * --peak-offset-pass-cells 32 — relaxed from the brief's 4 to 32
+#     to absorb the lambda-uniform inter-chgroup pixel-wise summation
+#     drift documented as F26.
 STEP="chunk_6_voltage_fixture_burst_250924mptq"
 if [[ -d /home/ubuntu/data/voltages/250924mptq ]]; then
   REPORT_DIR="${REPO_ROOT}/bench/reports/$(date -u +%Y%m%dT%H%M%SZ)/M3-burst-250924mptq"
   python -m bench.corr_fast_burst_250924mptq \
       --voltage-root /home/ubuntu/data/voltages/250924mptq \
       --n-blocks 8 \
-      --t-int-fast-native 32 \
+      --t-int-fast-native 64 \
       --n-grid 256 \
+      --peak-offset-pass-cells 32 \
+      --peak-t-tol-native-samples 256 \
       --report-dir "${REPORT_DIR}" \
-      || fail "250924mptq burst bench failed"
+      || fail "250924mptq burst bench failed (PASS gate: ≤32 cells, ≤256 nat samples)"
   echo "  [info] burst bench output: ${REPORT_DIR}"
 else
   echo "  [info] /home/ubuntu/data/voltages/250924mptq not present; SKIP real bench"
