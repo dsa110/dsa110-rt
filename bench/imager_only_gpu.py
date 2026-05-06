@@ -319,21 +319,16 @@ def _process_one_cube(
         # slice index is a no-op for the GPU graph.
         t0 = time.perf_counter_ns()
         shifts_f = time_shifts_cpu[f]
-        # Build a [N_chgroup, T_det, N, N] view by stacking shifted
-        # slices, then sum across the chgroup axis. Each shifted slice
-        # is contiguous (since dim 1 of streams is stride T_det × N²),
-        # so torch.stack is one big copy + sum is one reduction kernel.
-        slices = [
-            streams_complex[g, shifts_f[g] : shifts_f[g] + t_det]
-            for g in range(n_chgroup)
-            if shifts_f[g] + t_det <= t_stream
-        ]
-        if not slices:
-            uv.zero_()
-        elif len(slices) == 1:
-            uv.copy_(slices[0])
-        else:
-            torch.sum(torch.stack(slices, dim=0), dim=0, out=uv)
+        # Accumulate via in-place add_(): N_chgroup eltwise-adds per
+        # fdm. Each add reads 2 × 64 MiB and writes 64 MiB at
+        # production geometry (cfp16 [T_det=512, N=256, N=256] = 64 MiB).
+        # Faster than torch.stack→sum because that allocates a 1 GiB
+        # transient per fdm and runs N_chgroup separate copies anyway.
+        uv.zero_()
+        for g in range(n_chgroup):
+            s = shifts_f[g]
+            if s + t_det <= t_stream:
+                uv.add_(streams_complex[g, s : s + t_det])
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t1 = time.perf_counter_ns()
