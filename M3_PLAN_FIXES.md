@@ -168,64 +168,76 @@ the bin reduction happens at integration time per the active
 
 ### F25 — coarse-DM integration shape: vis-domain stage-1 shifts (not post-grid)
 
-**Status**: DOCUMENTED (architectural reconciliation deferred to chunk
-6 / 9 integration). Plan §4.2 step 4 specifies stage-1 per-channel
-INTEGER-sample time shifts on the visibility tensor `(n_fv, NBASE,
-NCHAN)` BEFORE the gridder, with one gridder call per coarse-DM
-trial — i.e. the per-trial coarse-DM cube is produced by `grid(time_
-shift_corr_stage1(vis, dm_idx))`, not by post-grid manipulation.
+**Status**: IMPLEMENTED in chunk 9 (`src/dsart/coarse_dm/stage1.py`,
+`Stage1MultiDMCoarseDM` in `src/dsart/services/corr_fast_integration.py`,
+2026-05-06). 24 acceptance tests in `tests/test_coarse_dm_stage1.py`
+pin the production multi-DM-trial integration: `process_block`
+branches on `ctx.multi_dm_coarse_dm` (set when `cfg.dm_plan_path` /
+`build_context(dm_plan=...)`); when set, runs vis-domain stage-1
+shifts → per-trial gridder → per-trial static-sky → returns
+``(N_DM, T_dedisp, N_filled)`` complex64. When unset, the legacy
+chunk-4 single-DM path is preserved unchanged for all existing
+chunk-4 tests + chunk-5 / chunk-6 single-DM benches.
 
-Three primitives are involved:
+**Implementation notes**:
+- `apply_stage1_shifts(vis, plan, chgroup, dm_idx)` — per-channel
+  integer-bin forward shifts on `(n_fv, NBASE, NCHAN)` complex.
+  Coalesces slice-copies by grouping channels that share the
+  same bin shift — at native NCHAN=384 with low DMs this collapses
+  to O(t_dedisp) unique shifts, ~10× fewer kernel launches than a
+  naive per-channel loop.
+- `Stage1MultiDMCoarseDM(plan, gridder, chgroup, dm_indices)`
+  internalises the per-trial loop: `dedisperse_from_vis(vis_stokes_i)
+  → (N_DM, T_dedisp, N_filled)`. The uniform `T_dedisp` axis
+  across trials = `n_fast_vis - max_bin_shift_over_selected_DMs`.
+- `FastIntegrationConfig.dm_plan_path` (load at startup) +
+  `dm_indices_subset` (subset of plan trials). `build_context`
+  pin: `plan.t_int_fast_native ≈ cfg.t_int_fast_native` (raises
+  on mismatch).
+- Per-trial static-sky EMA: each DM trial's gridded slice is run
+  through the SAME `StaticSkyEMA` instance (the EMA is over the
+  per-cell spatial pattern, not per-trial; same continuum sources
+  appear at slightly different cells per trial due to coarse-DM
+  smearing, so the EMA learns the union — adequate for chunk-9
+  throughput / static-sky benches; full per-trial EMA bookkeeping
+  is chunk-10 hardening if production needs it).
+
+**Background** (the architectural mismatch that F25 fixed):
+
+Plan §4.2 step 4 specifies stage-1 per-channel INTEGER-sample time
+shifts on the visibility tensor `(n_fv, NBASE, NCHAN)` BEFORE the
+gridder, with one gridder call per coarse-DM trial. Chunk 4 (the
+chunk-9-predecessor orchestrator) declared the `CoarseDMStage`
+Protocol against POST-grid sparse-COO `(n_fv, N_filled)` returning
+`(N_DM, n_fv, N_filled)`, with a default `NoOpCoarseDM` that
+trivially wrapped `gridded.unsqueeze(0)`. That stub was sufficient
+for the chunk-5 / chunk-6 single-DM-trial benches but did not
+exercise the production stage-1 shift path.
+
+Chunk 9's `Stage1MultiDMCoarseDM` is the production reconciliation:
 
 1. **`coarse_dm.dedisp.coarse_dedisp(image_cube, plan, ...)`** —
-   chunk-3b's pure-math primitive on `[T_fast, NCHAN, N_grid,
-   N_grid]` cubes. Pinned by 18 acceptance tests; bench
-   `coarse_dm_recovery.py` confirms exact `(t, l, m)` recovery on
-   synthetic burst.
+   chunk-3b's image-cube reference primitive (post-iFFT). Pinned by
+   18 acceptance tests; `bench/coarse_dm_recovery.py` confirms exact
+   `(t, l, m)` recovery. Algorithmically equivalent to the new
+   stage-1 path (iFFT2 commutes with per-channel time shifts).
+2. **`corr_fast_integration.NoOpCoarseDM` + post-grid `CoarseDMStage`
+   Protocol** — chunk-4 legacy plug-in. **Preserved unchanged** for
+   backward compatibility (single-DM benches don't need the loop).
+3. **`coarse_dm.stage1.apply_stage1_shifts` +
+   `corr_fast_integration.Stage1MultiDMCoarseDM`** — chunk-9
+   production. Wired by `cfg.dm_plan_path` /
+   `build_context(dm_plan=...)`; orchestrator branches on
+   `ctx.multi_dm_coarse_dm`.
 
-2. **`corr_fast_integration.CoarseDMStage` Protocol** — chunk-4's
-   plug-in surface. Currently typed against POST-grid sparse-COO
-   `(n_fv, N_filled)` and returns `(N_DM, n_fv, N_filled)`. The
-   default `NoOpCoarseDM` returns `gridded.unsqueeze(0)` — a
-   no-op-with-trivial-DM-axis adapter that is correct for the
-   `N_DM == 1` case but does NOT exercise the production stage-1
-   shift path.
-
-3. **`time_shift_corr_stage1` (planned, not yet authored)** — vis-
-   domain integer-sample shift. Per plan §4.2 step 4, this is what
-   chunk-4 should call before `gridder.compute()` per coarse-DM
-   trial. The `DMPlan.delay_native_samples()` lookup from chunk 3b
-   provides the data; the chunk-4 integration loop is the missing
-   wiring.
-
-**Reconciliation plan** (chunk 6 + chunk 9 work):
-
-- Chunk 6 (`voltage_fixture_burst_250924mptq`) runs with
-  `--single-dm` (custom 1-cell DM plan per the user's burst-test
-  config), so the no-op CoarseDMStage stub is correct as-is. No
-  chunk-4 refactor needed for chunk 6.
-- Chunk 9 (`dod_orchestrator_completion`) is where the production
-  multi-DM-trial integration wires together. At that point chunk 4
-  needs:
-  - `process_block` restructured to loop over `dm_idx in plan
-    .coarse_indices` after Stokes-I sum: `vis_shifted =
-    apply_stage1_shifts(vis_stokes_i, plan, dm_idx)` →
-    `gridded[dm_idx] = gridder.compute(vis_shifted)` → static-sky
-    EMA per-trial → stage2 fifo per-trial → transport per-trial.
-  - `CoarseDMStage` Protocol re-typed to take vis_stokes_i + plan +
-    chgroup, return `dict[int, torch.Tensor]` of per-trial shifted
-    visibilities. The chunk-3b `coarse_dedisp` primitive remains the
-    math reference; the integration loop is the production path.
-- This is a 6-9 chunk-of-effort refactor in chunk 9 — tracked as
-  D-decision in the chunk-9 brief.
-
-**Why this is safe to defer**: today's stub passes the no-DM case
-through correctly, and chunk-4's integration tests pin the
-orchestrator's correctness (RFI zero-fill, static-sky, plug-in stage
-wiring) for the `N_DM == 1` case which is what chunk 5 (continuum)
-+ chunk 6 (single-DM burst) need. The vis-domain stage-1 shifts only
-matter once the search starts asking for `N_DM > 1` trials, and
-that's chunk-9 material.
+**Why post-grid stub is still safe** (legacy path semantics): the
+single-DM `NoOpCoarseDM` simply asserts the trivial-DM-axis reshape;
+chunk-4's integration tests pin the orchestrator's correctness for
+the `N_DM == 1` case (RFI zero-fill, static-sky, plug-in stage
+wiring), which is what chunks 5 (continuum) + 6 (single-DM burst)
+need. The vis-domain stage-1 shifts only matter once the search
+starts asking for `N_DM > 1` trials, which is the chunk-9 production
+path.
 
 ### F27 — core/outrigger discrimination must be radius-based, not positional
 
