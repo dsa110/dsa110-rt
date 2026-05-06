@@ -135,6 +135,46 @@ def _parse_t2_json(path: Path) -> dict:
     }
 
 
+def _compute_expected_lm(
+    *,
+    src_ra_deg: float,
+    src_dec_deg: float,
+    src_mjd: float,
+    phase_center_dec_deg: float,
+) -> tuple[float, float, float]:
+    """Astropy-backed (l, m) prediction for the burst at the dump MJD.
+
+    Mirrors :func:`bench.run_0319_pipeline._compute_expected_lm`. The burst
+    is on-axis if HA(src_mjd, OVRO_LON) ≡ src_ra_deg, but in practice
+    the trigger MJD precedes transit by O(arcmin) — astropy returns the
+    actual HA so the ``(l, m)`` prediction is correct even off-meridian.
+
+    Returns
+    -------
+    (l_rad, m_rad, ha_src_deg)
+    """
+    from astropy.coordinates import EarthLocation
+    from astropy.time import Time
+
+    OVRO_LON_DEG = -118.281
+    OVRO_LAT_DEG = 37.234
+    loc = EarthLocation.from_geodetic(
+        lon=OVRO_LON_DEG, lat=OVRO_LAT_DEG, height=1188.0,
+    )
+    t = Time(src_mjd, format="mjd", location=loc)
+    lst_deg = float(t.sidereal_time("apparent").deg)
+    ha_src_deg = ((lst_deg - src_ra_deg) + 180.0) % 360.0 - 180.0
+    ha_rad = math.radians(ha_src_deg)
+    dec_src_rad = math.radians(src_dec_deg)
+    dec_pc_rad = math.radians(phase_center_dec_deg)
+    l_rad = -math.cos(dec_src_rad) * math.sin(ha_rad)
+    m_rad = (
+        math.sin(dec_src_rad) * math.cos(dec_pc_rad)
+        - math.cos(dec_src_rad) * math.sin(dec_pc_rad) * math.cos(ha_rad)
+    )
+    return l_rad, m_rad, ha_src_deg
+
+
 def _build_single_dm_plan(
     *,
     dm_pc_cc: float,
@@ -639,11 +679,24 @@ def main(argv: list[str] | None = None) -> int:
     peak_value = float(interior.flat[peak_flat])
     peak_t_native = peak_t_idx * args.t_int_fast_native                   # in chgroup-0 top frame after alignment
 
-    # Predicted (l, m): on-axis (HA=0, dec=obs_dec) → (0, 0).
-    expected_l = 0.0
-    expected_m = 0.0
+    # Predicted (l, m): astropy-backed from MJD + RA + Dec. The brief
+    # asserts the burst is on-axis at MJD, but in practice the dump MJD
+    # in T2_*.json is the TRIGGER time which precedes transit by O(min)
+    # of HA, so the source IS off-axis at MJD by HA · cos(δ). Computing
+    # the prediction astropy-style mirrors run_0319_pipeline and produces
+    # the correct PASS/FAIL gate against the per-chgroup peaks.
+    expected_l, expected_m, ha_src_deg = _compute_expected_lm(
+        src_ra_deg=src["ra_deg"],
+        src_dec_deg=src["dec_deg"],
+        src_mjd=src["mjd"],
+        phase_center_dec_deg=obs_dec_deg,
+    )
     chg0_cell_lambda = per_chgroup_cell_lambda.get(
         0, next(iter(per_chgroup_cell_lambda.values())),
+    )
+    LOG.info(
+        "expected (l, m) at MJD=%.6f: l=%.6f m=%.6f rad (HA_src=%.4f deg)",
+        src["mjd"], expected_l, expected_m, ha_src_deg,
     )
     pred_row, pred_col = lm_to_pixel(
         expected_l, expected_m,
@@ -771,7 +824,12 @@ def main(argv: list[str] | None = None) -> int:
         "peak_snr": float(peak_snr),
         "off_pulse_median": float(off_med),
         "off_pulse_sigma": float(off_sigma),
-        "expected_lm": {"l_rad": expected_l, "m_rad": expected_m},
+        "expected_lm": {
+            "l_rad": expected_l,
+            "m_rad": expected_m,
+            "ha_src_deg": ha_src_deg,
+            "phase_center_mode": "source_dec (F21)",
+        },
         "predicted_pixel_row": int(pred_row),
         "predicted_pixel_col": int(pred_col),
         "chg0_cell_lambda": float(chg0_cell_lambda),
