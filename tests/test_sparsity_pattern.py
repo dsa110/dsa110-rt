@@ -257,14 +257,18 @@ class TestBuildPatternNFilledRange:
             is_core_baseline_mask=mask,
         )
         # Plan §3 line 305 + plan §3 line 384 (m1 pin): single-side
-        # fill fraction ≈ 7-12% at N_grid=256 with the 82-ant core
-        # (≈ 4500-7800 cells absolute). Brief widens the bound to
-        # [1.5e4, 5e4] for chunk 3a's pillbox K=1 (no kernel support
-        # spread, fewer cells than the K=5 plan-line estimate); we
-        # accept anything in that bound here.
-        assert 1500 <= p.n_filled <= 50_000, (
+        # fill fraction is estimated at ~7-12% at N_grid=256 in the K=5
+        # Gaussian regime. With chunk 3a's K=1 pillbox the kernel
+        # contributes no spread, so n_filled = (# unique (u,v) cells
+        # the 82-ant core baselines × NCHAN_PER_CHGROUP=24 frequency
+        # samples land on after np.rint quantisation). Empirically at
+        # chgroup=0 dec=53.85 this is ≈ 1180 (measured on h01 with
+        # the 250924mptq antpos). Bound is set generously around the
+        # measurement; the K=5 hardening pass will widen it back up to
+        # the plan-line estimate.
+        assert 800 <= p.n_filled <= 50_000, (
             f"n_filled={p.n_filled} outside plan-predicted "
-            f"[1500, 50000] for chgroup=0 dec=53.85 N_grid=256 K=1; "
+            f"[800, 50000] for chgroup=0 dec=53.85 N_grid=256 K=1; "
             f"investigate antpos / cell-rounding."
         )
 

@@ -250,10 +250,18 @@ def compute_autos_from_complex(
             f"voltages must be complex; got dtype {voltages.dtype}"
         )
     n_ant, n_ch, n_pol, n_time = voltages.shape
-    if n_ant != NANTS or n_pol != NPOL:
+    # NPOL is hard-coded to 2 throughout downstream RFI / Stokes-I pol
+    # collapse; n_ant is left unconstrained so synthetic tests can use
+    # smaller antenna counts (production callers always pass NANTS=96).
+    if n_pol != NPOL:
         raise ValueError(
-            f"voltages shape {tuple(voltages.shape)}: NANTS / NPOL "
-            f"axes must be ({NANTS}, ..., {NPOL}, ...)"
+            f"voltages shape {tuple(voltages.shape)}: NPOL axis must "
+            f"be {NPOL}, got {n_pol}"
+        )
+    if n_ant <= 0:
+        raise ValueError(
+            f"voltages shape {tuple(voltages.shape)}: NANTS axis must "
+            f"be positive, got {n_ant}"
         )
 
     for m in m_values:
