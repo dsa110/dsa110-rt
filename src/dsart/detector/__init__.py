@@ -12,10 +12,11 @@ across four files per ``PARALLEL_AGENTS.md`` §3 Class A ownership:
   - ``decoder.py``  — Per-kernel local-max NMS + canonical-zone emit gate.
   - ``merger.py``   — Cross-kernel SNR-sort + 4D merge-radius suppression.
 
-Chunk 3 will add the sibling ``noise_norm/`` subpackage (Layer-1
-σ-clipped global scalar + Layer-2 per-kernel σ_k EMA), at which point
-the ``DeterministicDetector._sigma_k_placeholder`` buffer (D11) is
-replaced by the EMA-tracked tensor with no Protocol surface change.
+Chunk 3 added the sibling ``noise_norm/`` subpackage (Layer-1
+σ-clipped global scalar + Layer-2 per-kernel σ_k EMA); the
+``DeterministicDetector._sigma_k`` buffer mirrors the EMA-tracked
+tensor (D11 placeholder retired) and the warmup flag-bit-set logic
+fires while the EMA is in burn-in.
 
 This decomposition diverges from plan §3 line 94 which lists
 ``interface.py / v1_deterministic.py / decoder.py / noise_norm.py``;

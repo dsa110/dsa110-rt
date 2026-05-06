@@ -1,0 +1,325 @@
+"""Tests for ``dsart.noise_norm.layer2`` (M5 chunk 3).
+
+Plan §3.6.10 lines 1015-1035 + plan §3.6.13 ``test_layer2_interior_ema``.
+Coverage:
+
+  * ``layer2_interior_sigma`` shape / dtype contract; reduces over
+    interior slice [n_kernel_max_t//2, T_det − n_kernel_max_t//2] and
+    returns ``[K] float32``.
+  * Interior σ is *higher* than full-cube σ on a noise-only cube whose
+    boundary 25% has partial-width zero-padding bias (plan §1132
+    invariant). We synthesise that bias by injecting a deliberately
+    suppressed boundary on the score.
+  * ``Layer2State`` Welford burn-in over first ``n_burnin`` cubes —
+    s_k converges to the running mean of per-cube σs.
+  * Post-burn-in: EMA with γ = 1 - exp(-cube_cadence_s/τ_s); decay
+    rate matches analytic.
+  * ``valid=False`` skips the update (state is unchanged after the call,
+    cube_count still increments — wait, plan §319 says invalid cubes
+    skip BOTH forward and noise updates; we test that the EMA value is
+    preserved).
+
+Also tests the integration with ``DeterministicDetector`` end-to-end:
+
+  * After ``layer2_n_burnin`` noise-only cubes, the detector's emitted
+    candidate count drops to ~0 (the EMA has learned the per-kernel σ_k
+    and threshold rejects the noise tail).
+  * NOISE_WARMUP flag is set on every Candidate while the EMA is in
+    burn-in; cleared from cube ``layer2_n_burnin`` onward.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import numpy as np
+import pytest
+
+os.environ.setdefault("DSART_TEST", "1")
+
+import torch  # noqa: E402
+
+from dsart.common.contracts import CandidateFlags  # noqa: E402
+from dsart.detector.forward import DeterministicDetector  # noqa: E402
+from dsart.detector.kernels import build_kernel_bank  # noqa: E402
+from dsart.inject.cube_injection import (  # noqa: E402
+    CubeInjectionConfig,
+    synthesise_cube,
+)
+from dsart.noise_norm.layer2 import (  # noqa: E402
+    Layer2State,
+    layer2_interior_sigma,
+)
+
+
+def _scores_random(K: int = 4, T: int = 32, N_fdm: int = 4, H: int = 8,
+                   seed: int = 42, scale: float = 1.0) -> torch.Tensor:
+    """Random per-kernel score tensor."""
+    rng = np.random.default_rng(seed)
+    return torch.from_numpy(
+        rng.standard_normal((K, T, N_fdm, H, H)).astype(np.float32) * scale
+    )
+
+
+# ---------------------------------------------------------------------------
+# layer2_interior_sigma
+# ---------------------------------------------------------------------------
+
+
+def test_layer2_interior_sigma_shape_dtype() -> None:
+    scores = _scores_random(K=8, T=512, N_fdm=4, H=16)
+    sigmas = layer2_interior_sigma(scores, n_kernel_max_t=128)
+    assert sigmas.shape == (8,)
+    assert sigmas.dtype == torch.float32
+
+
+def test_layer2_interior_sigma_unit_input_yields_unit_sigma() -> None:
+    """N(0, 1) score → σ ≈ 1.0 per kernel."""
+    scores = _scores_random(K=2, T=512, N_fdm=4, H=16, scale=1.0)
+    sigmas = layer2_interior_sigma(scores, n_kernel_max_t=128)
+    for k in range(2):
+        assert abs(float(sigmas[k]) - 1.0) < 0.01
+
+
+def test_layer2_interior_sigma_excludes_biased_boundary() -> None:
+    """If we deliberately suppress the boundary 25% of the cube to
+    simulate the §3.6.12 partial-width bias, the interior σ should
+    remain near 1 while the full-cube σ drops noticeably below 1."""
+    rng = np.random.default_rng(20260505)
+    K, T, N_fdm, H = 1, 512, 2, 16  # noqa: N806
+    scores = torch.from_numpy(
+        rng.standard_normal((K, T, N_fdm, H, H)).astype(np.float32)
+    )
+    # Suppress the boundary 25% (first 64 + last 64 samples) by
+    # multiplying by 0.5 — this mimics the partial-width zero-pad bias.
+    scores[:, :64, :, :, :] *= 0.5
+    scores[:, -64:, :, :, :] *= 0.5
+
+    sigma_interior = float(
+        layer2_interior_sigma(scores, n_kernel_max_t=128)[0]
+    )
+    # Full-cube σ for the SAME tensor.
+    from dsart.noise_norm.layer1 import sigma_clipped_std
+    sigma_full = sigma_clipped_std(scores[0])
+
+    assert sigma_interior > sigma_full, (
+        f"interior σ ({sigma_interior}) should be > full-cube σ "
+        f"({sigma_full}) when boundary is suppressed"
+    )
+    # And the ratio should be in the plan-pinned range [1.05, 1.20]
+    # (we deliberately chose a 0.5x suppression which puts the ratio
+    # near the upper end of the plan-cited interval).
+    ratio = sigma_interior / sigma_full
+    assert 1.05 <= ratio <= 1.30, (
+        f"interior/full ratio = {ratio:.3f} outside plan-pinned [1.05, 1.20] "
+        f"(allowing 1.30 for the 0.5x boundary scaling chosen here)"
+    )
+
+
+def test_layer2_interior_sigma_small_cube_falls_back_to_full() -> None:
+    """If T_det ≤ n_kernel_max_t, the interior slice is empty, so we
+    fall back to using the full cube. Used by small unit-test cubes."""
+    scores = _scores_random(K=2, T=16, N_fdm=2, H=4)
+    sigmas = layer2_interior_sigma(scores, n_kernel_max_t=128)
+    assert sigmas.shape == (2,)
+    for k in range(2):
+        assert abs(float(sigmas[k]) - 1.0) < 0.05
+
+
+# ---------------------------------------------------------------------------
+# Layer2State burn-in + EMA
+# ---------------------------------------------------------------------------
+
+
+def test_layer2_state_init_defaults() -> None:
+    s = Layer2State(n_kernels=4)
+    assert s.n_kernels == 4
+    assert s.s_k.shape == (4,)
+    assert s.cube_count == 0
+    assert s.is_warming_up
+    assert s.gamma == pytest.approx(
+        1.0 - math.exp(-0.134218 / 30.0), rel=1e-4
+    )
+
+
+def test_layer2_state_burnin_is_running_mean() -> None:
+    """During burn-in, s_k is the Welford running mean of per-cube σs."""
+    s = Layer2State(n_kernels=1, n_burnin=5)
+    sigmas = [1.0, 2.0, 3.0, 4.0, 5.0]
+    expected_means = [1.0, 1.5, 2.0, 2.5, 3.0]
+    for i, sigma in enumerate(sigmas):
+        s_k, _ = s.update_and_query(
+            per_kernel_sigma=torch.tensor([sigma], dtype=torch.float32)
+        )
+        assert abs(float(s_k[0]) - expected_means[i]) < 1e-5
+
+
+def test_layer2_state_post_burnin_is_ema() -> None:
+    """After n_burnin cubes the update switches to EMA: s_k ← γ·σ_cube +
+    (1-γ)·s_k."""
+    s = Layer2State(n_kernels=1, n_burnin=3)
+    # Burn-in: 3 cubes at σ=1 → s_k = 1.
+    for _ in range(3):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0]))
+    assert not s.is_warming_up
+    # Now feed σ=2; s_k should jump by γ × (2 - 1) = γ.
+    pre = float(s.s_k[0])
+    s_k, _ = s.update_and_query(per_kernel_sigma=torch.tensor([2.0]))
+    expected_post = pre + s.gamma * (2.0 - pre)
+    assert abs(float(s_k[0]) - expected_post) < 1e-5
+
+
+def test_layer2_state_invalid_cube_skips_update() -> None:
+    """When valid=False (RFI'd / warmup-flagged cube), the EMA is NOT
+    updated — but the cube_count does NOT increment either (per plan
+    §319 invalid cubes skip BOTH forward and noise updates)."""
+    s = Layer2State(n_kernels=1, n_burnin=3)
+    # Burn-in to a known value.
+    for _ in range(3):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0]))
+    pre_count = s.cube_count
+    pre_value = float(s.s_k[0])
+    # Now pass valid=False with a wildly different σ.
+    s_k, _ = s.update_and_query(
+        per_kernel_sigma=torch.tensor([100.0]), valid=False,
+    )
+    assert s.cube_count == pre_count
+    assert abs(float(s_k[0]) - pre_value) < 1e-5
+
+
+def test_layer2_state_zero_sigma_falls_back_to_previous() -> None:
+    """A degenerate cube that produces σ_cube=0 for some kernel does
+    NOT poison the EMA — the previous value is reused for that kernel."""
+    s = Layer2State(n_kernels=2, n_burnin=2)
+    s.update_and_query(per_kernel_sigma=torch.tensor([1.0, 1.0]))
+    s.update_and_query(per_kernel_sigma=torch.tensor([2.0, 2.0]))
+    # Now feed σ=0 for kernel 1; it should retain its previous value.
+    pre = s.s_k[1].clone()
+    s_k, _ = s.update_and_query(per_kernel_sigma=torch.tensor([3.0, 0.0]))
+    assert s_k[1] == pre
+
+
+def test_layer2_state_reset_clears_state() -> None:
+    s = Layer2State(n_kernels=2, n_burnin=5)
+    for _ in range(3):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0, 1.0]))
+    s.reset()
+    assert s.cube_count == 0
+    assert torch.allclose(s.s_k, torch.ones(2))
+
+
+def test_layer2_state_rejects_bad_inputs() -> None:
+    s = Layer2State(n_kernels=2, n_burnin=5)
+    with pytest.raises(ValueError, match="exactly one"):
+        s.update_and_query()
+    with pytest.raises(ValueError, match="shape"):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0]))
+
+
+# ---------------------------------------------------------------------------
+# Detector end-to-end with Layer-2 wired
+# ---------------------------------------------------------------------------
+
+
+def test_detector_warmup_flag_set_during_burnin() -> None:
+    """Plan §1610: the detector sets flags.bit3 = noise_warmup on
+    every emitted Candidate while the Layer-2 EMA is in burn-in."""
+    cfg = CubeInjectionConfig(
+        l_pix=8, m_pix=8, fine_dm_idx=2, t_in_cube=32,
+        snr=15.0, width_samples=4,
+    )
+    cube, validity, sigma1 = synthesise_cube(
+        t_det=64, n_fdm=4, n_grid=16,
+        injections=(cfg,),
+        rng=np.random.default_rng(20260505),
+    )
+    # Use a small bank so the test is fast; n_burnin=5 (small).
+    bank = build_kernel_bank(
+        image_kernels=("unit",),
+        dm_kernels=("d1",),
+        time_kernels=("b1", "b4"),
+    )
+    det = DeterministicDetector(
+        kernel_bank=bank, threshold_sigma=8.0, dtype=torch.float16,
+        layer2_n_burnin=5, layer2_seed_unit=True,
+    )
+    out = det.forward(cube.to(torch.float16), validity, sigma1)
+    # Cube 0 → still warming up.
+    assert det.layer2_state.cube_count == 1
+    assert det.layer2_state.is_warming_up
+    if out:
+        for cand in out:
+            assert cand.flags & int(CandidateFlags.NOISE_WARMUP), (
+                f"expected NOISE_WARMUP flag during burn-in; got flags={cand.flags}"
+            )
+
+
+def test_detector_warmup_flag_clears_after_burnin() -> None:
+    """After ``n_burnin`` cubes the warmup flag clears."""
+    bank = build_kernel_bank(
+        image_kernels=("unit",), dm_kernels=("d1",),
+        time_kernels=("b1", "b4"),
+    )
+    det = DeterministicDetector(
+        kernel_bank=bank, threshold_sigma=8.0, dtype=torch.float16,
+        layer2_n_burnin=3, layer2_seed_unit=True,
+    )
+    rng = np.random.default_rng(20260505)
+    # Push 3 noise-only cubes through to complete burn-in.
+    for _ in range(3):
+        cube, validity, sigma1 = synthesise_cube(
+            t_det=64, n_fdm=4, n_grid=16, rng=rng,
+        )
+        det.forward(cube.to(torch.float16), validity, sigma1)
+    assert det.layer2_state.cube_count == 3
+    assert not det.layer2_state.is_warming_up
+
+    # Now inject + run; emitted candidates should NOT carry NOISE_WARMUP.
+    cfg = CubeInjectionConfig(
+        l_pix=8, m_pix=8, fine_dm_idx=2, t_in_cube=32,
+        snr=15.0, width_samples=4,
+    )
+    cube, validity, sigma1 = synthesise_cube(
+        t_det=64, n_fdm=4, n_grid=16,
+        injections=(cfg,), rng=rng,
+    )
+    out = det.forward(cube.to(torch.float16), validity, sigma1)
+    assert len(out) >= 1
+    for cand in out:
+        assert not (cand.flags & int(CandidateFlags.NOISE_WARMUP)), (
+            f"expected NOISE_WARMUP cleared post-burn-in; got flags={cand.flags}"
+        )
+
+
+def test_detector_layer2_ema_converges_on_noise_cubes() -> None:
+    """Feed N noise-only cubes; the EMA's per-kernel s_k should
+    converge near the analytic noise std for each kernel triple
+    (since cube_injection cubes have σ=1 per cell, the post-conv σ
+    for kernel (k_dm, k_time) is sqrt(k_dm × k_time))."""
+    bank = build_kernel_bank(
+        image_kernels=("unit",), dm_kernels=("d1", "d3"),
+        time_kernels=("b1", "b4", "b16"),
+    )
+    det = DeterministicDetector(
+        kernel_bank=bank, threshold_sigma=8.0, dtype=torch.float16,
+        layer2_n_burnin=10, layer2_seed_unit=False,  # start at 1.0
+    )
+    rng = np.random.default_rng(20260505)
+    for _ in range(10):
+        cube, validity, sigma1 = synthesise_cube(
+            t_det=128, n_fdm=4, n_grid=16, rng=rng,
+        )
+        det.forward(cube.to(torch.float16), validity, sigma1)
+    # After 10 cubes the Welford running mean should be near analytic.
+    s_k = det.layer2_state.s_k
+    for k_idx, kernel in enumerate(det.kernel_bank):
+        analytic = math.sqrt(kernel.k_dm_width * kernel.k_time_width)
+        empirical = float(s_k[k_idx])
+        # Tolerance: small bench has H=W=16, so per-kernel-cube has ~
+        # 32k samples → σ-sample-uncertainty ~ sqrt(2/N) ~ 0.8% / cube.
+        # Across 10 cubes the mean is good to ~2.5%.
+        assert abs(empirical - analytic) / analytic < 0.05, (
+            f"kernel {kernel.kernel_id}: empirical s_k={empirical:.3f} "
+            f"vs analytic={analytic:.3f}"
+        )

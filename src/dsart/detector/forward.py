@@ -47,7 +47,14 @@ from typing import List, Optional, Protocol, Tuple, runtime_checkable
 import torch
 import torch.nn.functional as F
 
-from ..common.contracts import Candidate
+from ..common.constants import (
+    CUBE_CADENCE_S_DEFAULT,
+    N_KERNEL_MAX_T_DEFAULT,
+    NOISE_LAYER2_N_BURNIN_DEFAULT,
+    NOISE_LAYER2_TAU_S_DEFAULT,
+)
+from ..common.contracts import Candidate, CandidateFlags
+from ..noise_norm.layer2 import Layer2State
 from .decoder import decode_local_max, filter_to_canonical
 from .kernels import (
     DEFAULT_DETECTOR_DTYPE,
@@ -66,6 +73,26 @@ __all__ = [
     "DeterministicDetector",
     "boxcar_via_cumsum",
 ]
+
+
+def _with_flags(cand: Candidate, new_flags: int) -> Candidate:
+    """Return a copy of ``cand`` with ``flags = new_flags``. The chunk-3
+    Layer-2 burn-in path uses this to OR in NOISE_WARMUP without
+    mutating the frozen Candidate dataclass."""
+    return Candidate(
+        l=cand.l,
+        m=cand.m,
+        dm_fine=cand.dm_fine,
+        dm_idx=cand.dm_idx,
+        event_specnum=cand.event_specnum,
+        width_samples=cand.width_samples,
+        kernel_id=cand.kernel_id,
+        snr=cand.snr,
+        detector_version=cand.detector_version,
+        flags=int(new_flags),
+        search_node_id=cand.search_node_id,
+        gpu_half=cand.gpu_half,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +287,12 @@ class DeterministicDetector(torch.nn.Module):
         merge_radius_t: int = DEFAULT_MERGE_RADIUS_T,
         search_node_id: int = 0,
         gpu_half: int = 0,
+        cube_cadence_s: float = CUBE_CADENCE_S_DEFAULT,
+        layer2_tau_s: float = NOISE_LAYER2_TAU_S_DEFAULT,
+        layer2_n_burnin: int = NOISE_LAYER2_N_BURNIN_DEFAULT,
+        n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
+        layer2_state: Optional[Layer2State] = None,
+        layer2_seed_unit: bool = True,
     ) -> None:
         super().__init__()
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
@@ -273,17 +306,42 @@ class DeterministicDetector(torch.nn.Module):
         self._merge_radius_t = int(merge_radius_t)
         self._search_node_id = int(search_node_id)
         self._gpu_half = int(gpu_half)
+        self._n_kernel_max_t = int(n_kernel_max_t)
 
-        # Layer-2 σ_k EMA placeholder (D11): for chunks 1-2, s_k is the
-        # analytic noise std of an unweighted-sum boxcar of K_dm × K_time
-        # cells over unit-σ Gaussian input. Chunk 3 swaps this for the
-        # EMA-tracked value with no Protocol surface change. The buffer
-        # is registered so .to(device) / .cuda() / state_dict round-trip.
-        s_k_init = torch.tensor(
-            [math.sqrt(k.k_dm_width * k.k_time_width) for k in self._kernel_bank],
-            dtype=torch.float32,
+        # Layer-2 σ_k EMA (Chunk 3, plan §3.6.10). On cold start the EMA
+        # buffer is seeded to the analytic value for unit-σ Gaussian
+        # input — sqrt(k_dm_width × k_time_width) — so the very first
+        # cube emitted (before the burn-in completes) divides by a
+        # sensible scalar instead of 1.0. Tests / benches that want
+        # canonical Welford behaviour from cold can pass
+        # layer2_seed_unit=False to start at 1.0.
+        if layer2_state is None:
+            layer2_state = Layer2State(
+                n_kernels=len(self._kernel_bank),
+                cube_cadence_s=cube_cadence_s,
+                tau_s=layer2_tau_s,
+                n_burnin=int(layer2_n_burnin),
+                n_kernel_max_t=int(n_kernel_max_t),
+                device=device,
+            )
+            if layer2_seed_unit:
+                seed = torch.tensor(
+                    [
+                        math.sqrt(k.k_dm_width * k.k_time_width)
+                        for k in self._kernel_bank
+                    ],
+                    dtype=layer2_state._s_k.dtype,
+                    device=layer2_state._s_k.device,
+                )
+                layer2_state._s_k.copy_(seed)
+        self._layer2 = layer2_state
+        # Mirror current σ_k as a registered buffer so .to(device) /
+        # state_dict round-trip the EMA tensor (the Module owns the
+        # state via register_buffer; Layer2State.update_and_query
+        # writes into the same underlying tensor).
+        self.register_buffer(
+            "_sigma_k", layer2_state._s_k, persistent=False
         )
-        self.register_buffer("_sigma_k_placeholder", s_k_init, persistent=False)
 
         # Move image kernels to ``device`` if given, and register them as
         # buffers so torch.nn.Module's .to() / .cuda() / state_dict
@@ -326,6 +384,14 @@ class DeterministicDetector(torch.nn.Module):
         return self._threshold_sigma
 
     @property
+    def layer2_state(self) -> Layer2State:
+        """The Layer-2 σ_k EMA state machine. Exposed for telemetry /
+        bench introspection (e.g. asserting ``cube_count`` /
+        ``is_warming_up`` / ``s_k`` after a sequence of cubes); the hot
+        path consumes it via ``forward()`` directly."""
+        return self._layer2
+
+    @property
     def kernel_bank(self) -> Tuple[Kernel, ...]:
         """Return the underlying ``Kernel`` records (not just the ids).
 
@@ -353,9 +419,11 @@ class DeterministicDetector(torch.nn.Module):
 
         Chunk 2 lands the per-kernel local-max NMS (``decoder.py``) +
         cross-kernel SNR-sort merger (``merger.py``) + canonical-zone
-        emit gate. Chunk 3 swaps the placeholder ``_sigma_k_placeholder``
-        buffer for the per-kernel σ_k EMA tracked across cubes (D11) — no
-        change to the forward() signature.
+        emit gate. Chunk 3 wires the per-kernel σ_k EMA via
+        ``Layer2State`` (registered buffer ``_sigma_k`` mirrors the
+        EMA-tracked tensor for state_dict round-trip) and sets
+        ``flags.bit3 = noise_warmup`` on every emitted Candidate while
+        the EMA is still in burn-in.
 
         The kwarg-only fields are M5-internal extensions (NOT on the
         Protocol surface — Chunk 6 search_compute owns them and passes
@@ -378,29 +446,45 @@ class DeterministicDetector(torch.nn.Module):
         """
         scores = self._compute_per_kernel_scores(cube, validity_mask)
 
-        s_k = self._sigma_k_placeholder.view(-1, 1, 1, 1, 1).to(scores.dtype)
+        # Determine cube validity: any (T_det, N_fdm) cell False in the
+        # mask flags the cube as suspect. Plan §319 says invalid cubes
+        # skip BOTH forward and noise updates; here we still run forward
+        # (the candidate log records what the detector saw) but skip
+        # the EMA update so a contaminated cube doesn't poison σ_k.
+        cube_valid = bool(torch.all(validity_mask).item())
+        s_k_tensor, is_warming_up = self._layer2.update_and_query(
+            scores=scores, valid=cube_valid,
+        )
+        # Mirror back into the registered buffer so state_dict / .to()
+        # round-trip the latest EMA value.
+        self._sigma_k.copy_(s_k_tensor)
+
+        s_k = s_k_tensor.view(-1, 1, 1, 1, 1).to(scores.dtype)
         scores_snr = scores / s_k
 
         if n_kernel_max_t is None:
-            n_kernel_max_t = max(k.k_time_width for k in self._kernel_bank)
+            n_kernel_max_t = self._n_kernel_max_t
+
+        warmup_flag = int(CandidateFlags.NOISE_WARMUP) if is_warming_up else 0
 
         per_kernel_cands: List[Candidate] = []
         for k_idx, kernel in enumerate(self._kernel_bank):
-            per_kernel_cands.extend(
-                decode_local_max(
-                    scores_snr[k_idx],
-                    threshold=self._threshold_sigma,
-                    kernel_id=kernel.kernel_id,
-                    k_dm_width=kernel.k_dm_width,
-                    k_time_width=kernel.k_time_width,
-                    detector_version=self._detector_version,
-                    search_node_id=self._search_node_id,
-                    gpu_half=self._gpu_half,
-                    event_specnum=event_specnum,
-                    fine_to_coarse=fine_to_coarse,
-                    fine_dm_pc_cm3=fine_dm_pc_cm3,
-                )
+            cands = decode_local_max(
+                scores_snr[k_idx],
+                threshold=self._threshold_sigma,
+                kernel_id=kernel.kernel_id,
+                k_dm_width=kernel.k_dm_width,
+                k_time_width=kernel.k_time_width,
+                detector_version=self._detector_version,
+                search_node_id=self._search_node_id,
+                gpu_half=self._gpu_half,
+                event_specnum=event_specnum,
+                fine_to_coarse=fine_to_coarse,
+                fine_dm_pc_cm3=fine_dm_pc_cm3,
             )
+            if warmup_flag:
+                cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
+            per_kernel_cands.extend(cands)
 
         merged = merge_across_kernels(
             per_kernel_cands,
