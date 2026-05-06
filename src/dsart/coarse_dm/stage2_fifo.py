@@ -237,6 +237,45 @@ class Stage2FIFO:
         return iter(self._buf)
 
     # ------------------------------------------------------------------
+    # Chunk-4 integration adapter
+    # ------------------------------------------------------------------
+
+    def push_for_protocol(
+        self, cube: torch.Tensor, *, block_n: int = 0,
+    ) -> list[torch.Tensor]:
+        """Adapter matching the chunk-4 ``Stage2FifoStage`` Protocol.
+
+        The chunk-4 ``corr_fast_integration`` orchestrator (in
+        ``dsart.services.corr_fast_integration``) declares::
+
+            class Stage2FifoStage(Protocol):
+                def push(self, dedispersed: torch.Tensor, *, block_n: int)
+                    -> list[torch.Tensor]: ...
+
+        — it treats the FIFO as returning a *list* of evictees (any
+        length 0..N) so the transport-TX layer downstream can treat
+        emit semantics uniformly. :meth:`push` here returns
+        ``Optional[Tensor]`` (cleaner for the per-push case where at
+        most one cube is evicted), so this method wraps the call and
+        produces the protocol-shaped list.
+
+        Use this adapter at the chunk-4 integration site::
+
+            ctx.stage2_fifo = Stage2FIFO(depth=...)
+            # ... in run_block():
+            cubes_for_tx = ctx.stage2_fifo.push_for_protocol(
+                dedispersed, block_n=block_n,
+            )
+
+        ``block_n`` is accepted but ignored — the FIFO does not store
+        per-block metadata (the cube itself carries any timestamp
+        information via its caller-attached attrs, or via the
+        transport header at TX time).
+        """
+        evicted = self.push(cube)
+        return [] if evicted is None else [evicted]
+
+    # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
