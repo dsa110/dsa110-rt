@@ -69,7 +69,10 @@ os.environ.setdefault("DSART_TEST", "1")
 
 import torch  # noqa: E402
 
+from bench._bank_mask import parse_bank_mask  # noqa: E402
+
 from dsart.detector.forward import DeterministicDetector  # noqa: E402
+from dsart.detector.kernels import build_kernel_bank  # noqa: E402
 from dsart.noise_norm.layer1 import Layer1State  # noqa: E402
 from dsart.services.cube_pipeline import (  # noqa: E402
     CubePipeline,
@@ -224,10 +227,20 @@ async def _bench_main(args: argparse.Namespace) -> int:
     threshold_sigma = float(args.threshold_sigma)
     cube_cadence_s = float(args.cube_cadence_s)
 
+    image_tokens, dm_tokens, time_tokens = parse_bank_mask(args.bank_mask)
+    n_kernels_total = (
+        len(image_tokens) * len(dm_tokens) * len(time_tokens)
+    )
+
     _LOG.info(
         "bench config: n_cubes=%d cadence=%.3fs T_det=%d N_fdm=%d N_grid=%d "
         "threshold=%.2fσ",
         n_cubes, cube_cadence_s, t_det, n_fdm, n_grid, threshold_sigma,
+    )
+    _LOG.info(
+        "bank-mask: k_img=%s k_dm=%s k_time=%s (total %d kernel triples)",
+        list(image_tokens), list(dm_tokens), list(time_tokens),
+        n_kernels_total,
     )
 
     coarse_dm, fine_dm, fine_to_coarse = _build_dm_grids(n_fdm)
@@ -252,7 +265,14 @@ async def _bench_main(args: argparse.Namespace) -> int:
         args.cube_dtype == "fp16" and device != "cpu"
     ) else torch.float32
     _LOG.info("device=%s cube_dtype=%s", device, cube_dtype)
+    bank = build_kernel_bank(
+        image_tokens=image_tokens,
+        dm_tokens=dm_tokens,
+        time_tokens=time_tokens,
+        dtype=detector_dtype,
+    )
     detector = DeterministicDetector(
+        kernel_bank=bank,
         threshold_sigma=threshold_sigma,
         detector_version="v1.M5",
         search_node_id=1,
@@ -359,6 +379,13 @@ async def _bench_main(args: argparse.Namespace) -> int:
             "rng_seed": int(args.rng_seed),
             "device": device,
             "cube_dtype": str(cube_dtype).rsplit(".", 1)[-1],
+            "bank_mask": args.bank_mask,
+            "bank_mask_resolved": {
+                "k_img": list(image_tokens),
+                "k_dm": list(dm_tokens),
+                "k_time": list(time_tokens),
+                "n_kernels": n_kernels_total,
+            },
         },
         "wall_clock_s": bench_wall_s,
         "achieved_cubes_per_s": (
@@ -424,6 +451,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--cube-dtype", type=str, default="fp32", choices=("fp32", "fp16"),
         help="Cube + detector dtype. fp16 only valid with --device cuda* "
              "(plan §3.6.11 production pin).",
+    )
+    parser.add_argument(
+        "--bank-mask", type=str, default=None,
+        help="Detector kernel-bank subset, e.g. "
+             "'k_img=unit;k_dm=d1;k_time=*' to keep only the unit image "
+             "kernel × d1 DM kernel × all 8 time kernels. Default: full "
+             "128 triple bank. Used by Chunk 6c-β perf-vs-quality sweeps.",
     )
     parser.add_argument(
         "--out", type=str,

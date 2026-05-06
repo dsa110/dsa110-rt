@@ -22,9 +22,10 @@ import pytest
 os.environ.setdefault("DSART_TEST", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "bench"))
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from search_node_throughput import (  # noqa: E402
+from bench.search_node_throughput import (  # noqa: E402
     QUICK_SMOKE_N_CUBES,
     _build_arg_parser,
     main,
@@ -99,3 +100,25 @@ def test_summary_has_expected_percentiles(tmp_path) -> None:
         pct["total_pipeline"]["p50"]
         >= 0.5 * pct["detector_forward"]["p50"]
     ), pct
+
+
+def test_quick_smoke_with_bank_mask(tmp_path) -> None:
+    """End-to-end smoke with the 1×1×8 = 8-kernel sub-bank (Chunk 6c-β).
+
+    Asserts the resolved bank-mask is round-tripped into summary.json
+    so the Chunk 6c-γ Pareto plot tool can label each run point.
+    """
+    rc = main([
+        "--quick-smoke",
+        "--out", str(tmp_path),
+        "--listener-port", "0",
+        "--bank-mask", "k_img=unit;k_dm=d1",
+    ])
+    assert rc == 0
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["config"]["bank_mask"] == "k_img=unit;k_dm=d1"
+    resolved = summary["config"]["bank_mask_resolved"]
+    assert resolved["k_img"] == ["unit"]
+    assert resolved["k_dm"] == ["d1"]
+    assert len(resolved["k_time"]) == 8
+    assert resolved["n_kernels"] == 1 * 1 * 8
