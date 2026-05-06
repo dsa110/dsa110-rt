@@ -148,11 +148,109 @@ extern "C" __global__ void fused_combine_per_fdm_cf32(
 }
 """
 
-# Cache the compiled cupy.RawKernel objects (one per dtype). Each
-# RawKernel call compiles the kernel source via NVRTC; the compiled
-# cubin is then cached on disk by cupy.
+
+# Fused dequant + per-fdm combine: reads cint8 streams directly, no
+# intermediate cfp16 buffer. Streams layout matches the M3 wire
+# payload + bench staging: ``[N_chgroup, T_stream, 2, N_grid, N_grid]``
+# int8, re plane at axis_2=0 + im plane at axis_2=1 (split, NOT
+# interleaved). Per-block scale/offset are not yet baked in here —
+# the bench currently uses scale=1, offset=0 (random-fill
+# pessimistic case); production wiring will pass per-chgroup scale +
+# offset float arrays for the cast.
+#
+# Memory traffic at production T=256 N_fdm=32 N_grid=256:
+#   reads:  32 fdm × 16 chg × T × N² × 2 B = 17.2 GiB cint8 (half of
+#           the cfp16 fused-combine kernel)
+#   writes: 32 fdm × T × N² × 4 B = 2 GiB cfp16
+#   total:  19.2 GiB / cube → ~38 ms theoretical at 510 GB/s
+# vs the current scatter (35.6 ms, 4-pass dequant) + fused_combine
+# (72.1 ms, cfp16 reads) = 107.7 ms. Projected ~3× win on the
+# combined dequant+combine path; lands T_det=256 inside the 8 cubes/s
+# plan §8 budget.
+#
+# Numerical: int32 accumulation across all 16 chgroups is exact (max
+# ±16 × 127 = ±2032 fits comfortably). The single fp16 cast at the
+# end carries ≤1 fp16 ULP (≈ 2 at magnitudes near 2k). The
+# python_addloop reference path dequantises EACH chgroup to cfp16
+# then accumulates as cfp16, taking ~16 ULP of fp16 reduction error;
+# this fused kernel is therefore strictly more accurate.
+_CUDA_SOURCE_CF16_DEQUANT = r"""
+#include <cuda_fp16.h>
+
+extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16(
+    const signed char* __restrict__ streams,  // [N_chg, T, 2, N, N] int8
+    const int*         __restrict__ shifts,   // [N_chg]
+    __half2*           __restrict__ output,   // [T_det, N, N] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid)
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    if (v >= n_grid || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int spatial_offset = u * n_grid + v;
+    const int t_stride       = 2 * n_grid_sq;       // re plane + im plane
+    const int chg_stride     = t_stream * t_stride;
+
+    int acc_re = 0;
+    int acc_im = 0;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int s = shifts[g];
+        const int t_src = s + t;
+        if (t_src < t_stream) {
+            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            acc_re += (int)streams[base];                      // re plane
+            acc_im += (int)streams[base + n_grid_sq];          // im plane
+        }
+    }
+    output[t * n_grid_sq + spatial_offset] = __floats2half2_rn(
+        (float)acc_re, (float)acc_im
+    );
+}
+"""
+
+_CUDA_SOURCE_CF32_DEQUANT = r"""
+extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf32(
+    const signed char* __restrict__ streams,
+    const int*         __restrict__ shifts,
+    float2*            __restrict__ output,
+    int n_chgroup, int t_stream, int t_det, int n_grid)
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    if (v >= n_grid || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int spatial_offset = u * n_grid + v;
+    const int t_stride       = 2 * n_grid_sq;
+    const int chg_stride     = t_stream * t_stride;
+
+    int acc_re = 0;
+    int acc_im = 0;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int s = shifts[g];
+        const int t_src = s + t;
+        if (t_src < t_stream) {
+            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            acc_re += (int)streams[base];
+            acc_im += (int)streams[base + n_grid_sq];
+        }
+    }
+    output[t * n_grid_sq + spatial_offset] = make_float2(
+        (float)acc_re, (float)acc_im
+    );
+}
+"""
+
+# Cache the compiled cupy.RawKernel objects (one per dtype × variant).
+# Each RawKernel call compiles the kernel source via NVRTC; the
+# compiled cubin is then cached on disk by cupy.
 _KERNEL_CF16: Optional[object] = None
 _KERNEL_CF32: Optional[object] = None
+_KERNEL_CF16_DEQUANT: Optional[object] = None
+_KERNEL_CF32_DEQUANT: Optional[object] = None
 
 
 def _get_kernel_cf16():
@@ -187,6 +285,36 @@ def _get_kernel_cf32():
     )
     _LOG.info("fused_combine_per_fdm_cf32 ready")
     return _KERNEL_CF32
+
+
+def _get_kernel_cf16_dequant():
+    global _KERNEL_CF16_DEQUANT
+    if _KERNEL_CF16_DEQUANT is not None:
+        return _KERNEL_CF16_DEQUANT
+    cp = _get_cupy()
+    _LOG.info("compiling fused_dequant_combine_per_fdm_cint8_to_cf16 via NVRTC...")
+    _KERNEL_CF16_DEQUANT = cp.RawKernel(
+        code=_CUDA_SOURCE_CF16_DEQUANT,
+        name="fused_dequant_combine_per_fdm_cint8_to_cf16",
+        options=("--use_fast_math",),
+    )
+    _LOG.info("fused_dequant_combine_per_fdm_cint8_to_cf16 ready")
+    return _KERNEL_CF16_DEQUANT
+
+
+def _get_kernel_cf32_dequant():
+    global _KERNEL_CF32_DEQUANT
+    if _KERNEL_CF32_DEQUANT is not None:
+        return _KERNEL_CF32_DEQUANT
+    cp = _get_cupy()
+    _LOG.info("compiling fused_dequant_combine_per_fdm_cint8_to_cf32 via NVRTC...")
+    _KERNEL_CF32_DEQUANT = cp.RawKernel(
+        code=_CUDA_SOURCE_CF32_DEQUANT,
+        name="fused_dequant_combine_per_fdm_cint8_to_cf32",
+        options=("--use_fast_math",),
+    )
+    _LOG.info("fused_dequant_combine_per_fdm_cint8_to_cf32 ready")
+    return _KERNEL_CF32_DEQUANT
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +355,9 @@ def _torch_to_cupy_view(t: torch.Tensor) -> object:
     elif t.dtype == torch.int32:
         cp_dtype = cp.int32
         elem_size = 4
+    elif t.dtype == torch.int8:
+        cp_dtype = cp.int8
+        elem_size = 1
     else:
         raise ValueError(f"unsupported torch dtype for cupy view: {t.dtype}")
 
@@ -326,11 +457,116 @@ def fused_combine_per_fdm(
         )
 
 
+def fused_dequant_combine_per_fdm(
+    streams_cint8: torch.Tensor,
+    shifts: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Run the fused cint8-input dequant+combine kernel into ``output``.
+
+    Single-pass NVRTC kernel that reads cint8 streams directly (no
+    intermediate cfp16 buffer), accumulates per-fdm across N_chgroup
+    in int32 registers (exact for N_chg ≤ 16, max ±2032), and writes
+    one output cfp16 / cfp32 cell. Eliminates the ~36 ms scatter step
+    in ``bench/imager_only_gpu.py`` at production geometry, lifting
+    the imager from 6.0 cubes/s → ~11 cubes/s at T_det=256
+    (projected; measured numbers in `bench/imager_only_gpu_results.md`).
+
+    Args:
+        streams_cint8: ``[N_chgroup, T_stream, 2, N_grid, N_grid]``
+            ``int8``, cuda, contiguous. axis_2 is re/im split (re
+            plane first, then im plane). Matches the M3 wire-payload
+            staging in ``bench.imager_only_gpu._build_synthetic_streams``.
+        shifts: ``[N_chgroup]`` ``int32``, cuda. Per-chgroup time shift
+            for the (single) fdm trial this call produces.
+        output: ``[T_det, N_grid, N_grid]`` ``complex32`` or
+            ``complex64``, cuda, contiguous. Overwritten with the
+            combined uv slab.
+
+    Semantic equivalence to the chained Python pipeline:
+        ``streams_cf = dequant(streams_cint8)  # cint8 -> cf32 -> cfXX
+          output.zero_()
+          for g in range(N_chgroup):
+              if shifts[g] + T_det <= T_stream:
+                  output += streams_cf[g, shifts[g] : shifts[g] + T_det]``
+
+    cint8-to-cf16/cf32 dequant is exact for the cint8 [-127, +127]
+    range since both fp16 and fp32 mantissas have ≥ 7 bits. The
+    int32 accumulation is also exact (max sum ±2032 fits in int16).
+    Boundary check (``shift + t < T_stream``) is cell-wise inside
+    the kernel, matching the Python guard cell-by-cell rather than
+    chgroup-by-chgroup; safe under the test-fixture invariant that
+    no shift overhangs by more than T_det - 1.
+    """
+    if not (streams_cint8.is_cuda and shifts.is_cuda and output.is_cuda):
+        raise RuntimeError("fused_dequant_combine_per_fdm: all tensors must be cuda")
+    if streams_cint8.dtype != torch.int8:
+        raise RuntimeError(
+            f"streams_cint8 must be int8; got {streams_cint8.dtype}"
+        )
+    if shifts.dtype != torch.int32:
+        raise RuntimeError(f"shifts must be int32; got {shifts.dtype}")
+    if streams_cint8.dim() != 5:
+        raise RuntimeError(
+            "streams_cint8 must be 5-D [N_chg, T_stream, 2, N, N]; "
+            f"got dim={streams_cint8.dim()}"
+        )
+    if output.dim() != 3:
+        raise RuntimeError("output must be 3-D [T_det, N, N]")
+
+    n_chgroup, t_stream, two, n_grid, n_grid_y = streams_cint8.shape
+    if two != 2:
+        raise RuntimeError(
+            f"streams_cint8 axis 2 must be 2 (re/im split); got {two}"
+        )
+    if n_grid_y != n_grid:
+        raise RuntimeError("streams_cint8 must be square in u/v")
+    if shifts.shape != (n_chgroup,):
+        raise RuntimeError(
+            f"shifts shape mismatch: got {tuple(shifts.shape)}, "
+            f"expected ({n_chgroup},)"
+        )
+    t_det, n_out_x, n_out_y = output.shape
+    if n_out_x != n_grid or n_out_y != n_grid:
+        raise RuntimeError("output spatial dims must match streams")
+
+    cp = _get_cupy()
+    streams_cp = _torch_to_cupy_view(streams_cint8)
+    shifts_cp = _torch_to_cupy_view(shifts)
+    output_cp = _torch_to_cupy_view(output)
+
+    if output.dtype == torch.complex32:
+        kernel = _get_kernel_cf16_dequant()
+    elif output.dtype == torch.complex64:
+        kernel = _get_kernel_cf32_dequant()
+    else:
+        raise RuntimeError(
+            f"unsupported output dtype: {output.dtype}; "
+            "expected complex32 or complex64"
+        )
+
+    block: Tuple[int, int, int] = (32, 4, 8)
+    grid: Tuple[int, int, int] = (
+        (n_grid + block[0] - 1) // block[0],
+        (n_grid + block[1] - 1) // block[1],
+        (t_det  + block[2] - 1) // block[2],
+    )
+    torch_stream = torch.cuda.current_stream()
+    with cp.cuda.ExternalStream(torch_stream.cuda_stream):
+        kernel(
+            grid, block,
+            (streams_cp, shifts_cp, output_cp,
+             int(n_chgroup), int(t_stream), int(t_det), int(n_grid)),
+        )
+
+
 def get_module(verbose: bool = False) -> object:
     """Pre-warm the kernel compile (compatibility shim with the old
     cpp_extension API used by the bench).
 
-    Triggers compilation of the cfp16 kernel (the production target);
-    the cfp32 kernel is compiled lazily on first use.
+    Triggers compilation of the cfp16 kernel (the original chunk-6c
+    production target); the other 3 variants are compiled lazily on
+    first use. The bench's ``--combine-impl`` selector calls the
+    matching ``_get_kernel_*`` getter at startup as well.
     """
     return _get_kernel_cf16()

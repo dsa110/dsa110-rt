@@ -286,9 +286,10 @@ def _dequant_cint8_to_complex_gpu(
 
 def _process_one_cube(
     *,
-    streams_complex: torch.Tensor,  # [N_chgroup, T_stream, N_grid, N_grid] complex
-    time_shifts_cpu: List[List[int]],   # [N_fdm][N_chgroup] python ints
-    time_shifts_gpu: torch.Tensor,      # [N_fdm, N_chgroup] int32 cuda (for fused kernel)
+    streams_complex: Optional[torch.Tensor],  # [N_chg, T, N, N] complex (cfp16 / cf32)
+    streams_cint8: Optional[torch.Tensor],    # [N_chg, T, 2, N, N] int8 (M3 wire)
+    time_shifts_cpu: List[List[int]],         # [N_fdm][N_chgroup] python ints
+    time_shifts_gpu: torch.Tensor,            # [N_fdm, N_chgroup] int32 cuda
     workspace: GpuImagerWorkspace,
     combine_impl: str,
 ) -> Dict[str, int]:
@@ -298,10 +299,22 @@ def _process_one_cube(
     ``time_shifts_cpu`` is plain Python ints (host-resident) so the
     ``python_addloop`` impl can slice without forcing a GPU→CPU sync
     inside the per-fdm loop. ``time_shifts_gpu`` is the same table on
-    GPU as int32, used by the ``fused_cuda`` impl which reads it
-    inside the kernel.
+    GPU as int32, used by the ``fused_cuda`` and ``fused_cuda_cint8``
+    impls which read it inside the kernel.
+
+    Exactly one of ``streams_complex`` (for python_addloop / fused_cuda)
+    or ``streams_cint8`` (for fused_cuda_cint8) must be supplied.
     """
-    t_stream = streams_complex.shape[1]
+    if combine_impl == "fused_cuda_cint8":
+        if streams_cint8 is None:
+            raise ValueError("fused_cuda_cint8 requires streams_cint8")
+        t_stream = streams_cint8.shape[1]
+    else:
+        if streams_complex is None:
+            raise ValueError(
+                f"combine_impl={combine_impl} requires streams_complex"
+            )
+        t_stream = streams_complex.shape[1]
     t_det = workspace.t_det
     n_fdm = workspace.n_fdm
     n_chgroup = len(time_shifts_cpu[0])
@@ -310,9 +323,10 @@ def _process_one_cube(
     uv = workspace.uv_slab
     img = workspace.img_slab_real
 
-    use_fused = (combine_impl == "fused_cuda")
-    if use_fused:
+    if combine_impl == "fused_cuda":
         from dsart.image.fused_combine_cuda import fused_combine_per_fdm
+    elif combine_impl == "fused_cuda_cint8":
+        from dsart.image.fused_combine_cuda import fused_dequant_combine_per_fdm
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -323,13 +337,23 @@ def _process_one_cube(
     for f in range(n_fdm):
         # ---- combine: 16-chgroup index-shifted sum into uv slab. ----
         t0 = time.perf_counter_ns()
-        if use_fused:
-            # Single CUDA kernel: one read of each chgroup + one write
-            # to uv. Memory traffic ~3× lower than the Python add-loop
-            # version. Boundary check (shift+t_det > t_stream) is
-            # cell-wise inside the kernel.
+        if combine_impl == "fused_cuda":
+            # Single CUDA kernel reading cfp16 streams: each chgroup
+            # read once + one output write per cube. Memory traffic
+            # ~3× lower than the Python add-loop. Boundary check
+            # (shift+t_det > t_stream) is cell-wise.
             fused_combine_per_fdm(
                 streams_complex, time_shifts_gpu[f].contiguous(), uv,
+            )
+        elif combine_impl == "fused_cuda_cint8":
+            # Single CUDA kernel reading cint8 streams DIRECTLY (no
+            # cfp16 intermediate): cint8 reads are half the size of
+            # cfp16 reads → another ~2× win on the dominant memory
+            # traffic. The bench's "scatter" stage is omitted entirely
+            # in this mode (the kernel does dequant + combine in one
+            # pass via int32 accumulation).
+            fused_dequant_combine_per_fdm(
+                streams_cint8, time_shifts_gpu[f].contiguous(), uv,
             )
         else:
             # Python fallback (A/B baseline): N_chgroup eltwise-adds
@@ -469,14 +493,32 @@ def _bench_main(args: argparse.Namespace) -> int:
     torch.cuda.synchronize()
     del warm_uv
 
-    # Pre-compile the fused CUDA kernel once before timing if requested.
-    # The first call to load_inline() builds the .so (~30 s); subsequent
-    # imports load instantly from the torch_extensions cache.
+    # Pre-compile the fused CUDA kernels once before timing if requested.
+    # The first NVRTC compile takes ~3 s; subsequent runs hit the cupy
+    # disk cache and start instantly.
     if args.combine_impl == "fused_cuda":
         from dsart.image.fused_combine_cuda import get_module
-        _LOG.info("compiling fused_combine_cuda kernel (~30 s on first run)...")
+        _LOG.info("compiling fused_combine_cuda cf16 kernel (~3 s on first run)...")
         get_module(verbose=False)
-        _LOG.info("fused_combine_cuda kernel ready")
+        _LOG.info("fused_combine_cuda cf16 kernel ready")
+    elif args.combine_impl == "fused_cuda_cint8":
+        from dsart.image.fused_combine_cuda import (
+            _get_kernel_cf16_dequant, _get_kernel_cf32_dequant,
+        )
+        _LOG.info(
+            "compiling fused_dequant_combine_cint8 kernel (~3 s on first run)..."
+        )
+        if complex_dtype == torch.complex32:
+            _get_kernel_cf16_dequant()
+        else:
+            _get_kernel_cf32_dequant()
+        _LOG.info("fused_dequant_combine_cint8 kernel ready")
+
+    # In ``fused_cuda_cint8`` mode the kernel reads the cint8 streams
+    # directly: we skip the dequant scatter step entirely. ``scatter_ns``
+    # is reported as 0 in this mode (and ``total_ns`` is just the per-fdm
+    # loop time).
+    skip_scatter = (args.combine_impl == "fused_cuda_cint8")
 
     records: List[StageRecord] = []
     bench_start_ns = time.perf_counter_ns()
@@ -493,24 +535,32 @@ def _bench_main(args: argparse.Namespace) -> int:
         time_shifts_cpu = shifts_arr.tolist()
         time_shifts_gpu = shifts_arr.to(device=device, dtype=torch.int32)
 
-        # ---- scatter (cint8 → cfp16 dequant) ----
-        torch.cuda.synchronize()
-        t_scatter_start = time.perf_counter_ns()
-        streams_complex = _dequant_cint8_to_complex_gpu(
-            streams_cint8_gpu, complex_dtype=complex_dtype,
-        )
-        torch.cuda.synchronize()
-        scatter_ns = time.perf_counter_ns() - t_scatter_start
+        # ---- scatter (cint8 → cfp16 dequant), skipped in cint8-fused mode ----
+        if skip_scatter:
+            scatter_ns = 0
+            streams_complex_arg = None
+            streams_cint8_arg = streams_cint8_gpu
+        else:
+            torch.cuda.synchronize()
+            t_scatter_start = time.perf_counter_ns()
+            streams_complex_arg = _dequant_cint8_to_complex_gpu(
+                streams_cint8_gpu, complex_dtype=complex_dtype,
+            )
+            torch.cuda.synchronize()
+            scatter_ns = time.perf_counter_ns() - t_scatter_start
+            streams_cint8_arg = None
 
         # ---- run the per-fdm imager loop ----
         timings = _process_one_cube(
-            streams_complex=streams_complex,
+            streams_complex=streams_complex_arg,
+            streams_cint8=streams_cint8_arg,
             time_shifts_cpu=time_shifts_cpu,
             time_shifts_gpu=time_shifts_gpu,
             workspace=workspace,
             combine_impl=args.combine_impl,
         )
-        del streams_complex
+        if streams_complex_arg is not None:
+            del streams_complex_arg
 
         rec = StageRecord(
             cube_id=cube_id,
@@ -614,14 +664,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--combine-impl", type=str, default="fused_cuda",
-        choices=("fused_cuda", "python_addloop"),
-        help="Per-fdm 16-chgroup combine implementation. fused_cuda "
-             "(default, production target) JIT-compiles a custom CUDA "
-             "kernel via torch.utils.cpp_extension.load_inline that "
-             "fuses all 16 chgroup reads + 1 output write into one "
-             "kernel; python_addloop is the chunk-6c-follow-up A/B "
-             "baseline that does N_chgroup separate uv.add_(...) ops.",
+        "--combine-impl", type=str, default="fused_cuda_cint8",
+        choices=("fused_cuda_cint8", "fused_cuda", "python_addloop"),
+        help="Per-fdm 16-chgroup combine implementation. "
+             "fused_cuda_cint8 (default, chunk-8 production target) "
+             "fuses cint8 dequant + combine into a single NVRTC kernel "
+             "(skips the scatter step entirely). fused_cuda is the "
+             "chunk-6c follow-up that fuses just the combine across "
+             "the 16 chgroups but still requires a separate cint8 -> "
+             "cfp16 scatter pass. python_addloop is the chunk-6c-α "
+             "A/B baseline that does N_chgroup separate uv.add_(...) "
+             "ops; useful only for measuring the kernel speedup.",
     )
     parser.add_argument(
         "--out", type=str,
