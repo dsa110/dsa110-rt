@@ -180,28 +180,29 @@ def boxcar_via_cumsum(
     ndim = x.dim()
     if axis < 0:
         axis = ndim + axis
-    # F.pad goes from last axis to first; pad spec for axis ``a`` is at
-    # position 2 * (ndim - 1 - a) and 2 * (ndim - 1 - a) + 1.
     pad_spec = [0] * (2 * ndim)
     pad_spec[2 * (ndim - 1 - axis)] = pad_left
     pad_spec[2 * (ndim - 1 - axis) + 1] = pad_right
     x_padded = F.pad(x, pad_spec, mode="constant", value=0.0)
 
-    # Cumulative sum along ``axis``; prepend a zero so out[i] = c[i+width] − c[i].
-    cs = torch.cumsum(x_padded, dim=axis)
+    # Accumulate the cumsum in fp32 even when the input is fp16 — the
+    # plan §3.6.13 pin requires fp16 rel-err ≤ 1e-3 vs the fp32 numpy
+    # reference, which a pure-fp16 cumsum across the T_det = 512 axis
+    # cannot meet (~5e-3 p99 with naive fp16 cumsum). Casting once at
+    # entry and once at the boundary is cheap (≤ 2× memory traffic on
+    # the cumsum buffers, no extra compute since cumsum is bandwidth-
+    # bound) and is what keeps the K_time = 128 boxcar within spec.
+    accum_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+    cs = torch.cumsum(x_padded.to(accum_dtype), dim=axis)
     zero_shape = list(cs.shape)
     zero_shape[axis] = 1
     zero = torch.zeros(zero_shape, dtype=cs.dtype, device=cs.device)
     cs = torch.cat([zero, cs], dim=axis)
 
-    # cs.shape[axis] == n + width + 1; output[i] for i in [0, n) is
-    # cs[i + width] − cs[i].
     high = cs.narrow(axis, width, n)
     low = cs.narrow(axis, 0, n)
     out = high - low
 
-    # Cast back to input dtype (cumsum upcasts fp16 to fp32 internally on
-    # some torch versions).
     if out.dtype != x.dtype:
         out = out.to(x.dtype)
     return out
@@ -407,12 +408,13 @@ class DeterministicDetector(torch.nn.Module):
         T_det, N_fdm, H, W = cube.shape  # noqa: N806 (uppercase domain names)
         K = len(self._kernel_bank)  # noqa: N806
 
-        # Promote the cube to fp32 for the cumsum pipeline. fp16 cumsum has
-        # ~3-decimal-digit precision over the full T_det = 512 axis which
-        # is fine for the K_time = 128 boxcar (rel-err ≤ 1e-3 per spec)
-        # but accumulates round-off if we keep it fp16 across the K_dm
-        # second pass. Promoting to fp32 once is cheaper than promoting
-        # twice and matches the §4.4 noise_norm Layer-2 σ_k float32 dtype.
+        # Promote the cube to fp32 for the conv pipeline so per-kernel
+        # scores are accumulated at full precision (the §4.4 noise_norm
+        # Layer-2 σ_k EMA wants fp32). ``boxcar_via_cumsum`` itself also
+        # internally upcasts fp16/bf16 inputs for the cumsum to honour
+        # the §3.6.13 rel-err pin, but doing the promotion once here
+        # avoids the cast-cast round-trip across the per-kernel inner
+        # loop and keeps the K_dm and K_time boxcars stay-in-fp32.
         cube_f32 = cube.to(torch.float32)
 
         scores = torch.empty(
