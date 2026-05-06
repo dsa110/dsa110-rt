@@ -258,8 +258,8 @@ async def _bench_main(args: argparse.Namespace) -> int:
         search_node_id=1,
         gpu_half=1,
         dtype=detector_dtype,
+        device=torch.device(device),
     )
-    detector = detector.to(torch.device(device))
     pipeline = CubePipeline(
         config=CubePipelineConfig(
             n_grid=n_grid,
