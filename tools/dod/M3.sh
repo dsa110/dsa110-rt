@@ -380,6 +380,58 @@ python -m pytest tests/test_transport_loopback.py -q --tb=short \
   || fail "transport loopback acceptance pytests failed"
 pass
 
+# --- chunk 9: dod_orchestrator_completion (F25 multi-DM + DoD benches) -----
+# F25 production multi-DM-trial integration + the four §8.M3 unit benches.
+# The vis-domain stage-1 shifts (chunks 4 + 9 reconciliation per F25) are
+# pinned by tests/test_coarse_dm_stage1.py; the four DoD benches each gate
+# on producing a report.html (no PASS/FAIL banner — operator inspects).
+#
+# 9A. coarse_dm/stage1.py + Stage1MultiDMCoarseDM in corr_fast_integration —
+#     vis-domain per-channel integer-bin shifts before the gridder, once
+#     per coarse-DM trial. process_block branches on ctx.multi_dm_coarse_dm:
+#     when set, returns (N_DM, T_dedisp, N_filled); else legacy single-DM
+#     path with NoOpCoarseDM. Tests cover: per-channel impulse shift
+#     correctness, Convention A top-channel identity, dispersed-burst
+#     dedispersion at truth DM, off-DM smearing, F24 bin-rounding pin,
+#     input validation, Stage1MultiDMCoarseDM construction + dedisperse_
+#     from_vis shape, end-to-end process_block via build_context with a
+#     custom plan, dm_indices_subset semantics, t_int_fast_native pin.
+# 9B. bench/fast_path_throughput.py — sustained throughput + injection at
+#     known (l, m, DM, t).
+# 9C. bench/static_sky_subtract.py — quantization SNR before/after EMA at
+#     default τ; warmup-flag de-assertion.
+# 9D. bench/cal_reload.py + 9E. bench/fast_isolation.py — skeleton bench
+#     scripts (full integration deferred to chunk 10 hardening; service-
+#     level orchestration not yet wired).
+STEP="chunk_9_dod_orchestrator_completion"
+python -m pytest tests/test_coarse_dm_stage1.py -q --tb=short \
+  || fail "F25 stage-1 acceptance pytests failed"
+# Bench gates: each must produce a report.html (artefacts under
+# bench/reports/<UTC>/...; exact metrics inspected by operator).
+REPORT_BASE="${REPO_ROOT}/bench/reports/$(date -u +%Y%m%dT%H%M%SZ)"
+REPORT_THR="${REPORT_BASE}/M3-fast-path-throughput"
+# t_int=128 keeps n_fast_vis=32/block — same memory budget that
+# chunks 5/6/7 use on h01's 11 GB GPU 0 (per F31).
+python -m bench.fast_path_throughput \
+    --duration-s 10 \
+    --t-int-fast-native 128 \
+    --n-grid 64 \
+    --report-dir "${REPORT_THR}" \
+    || fail "fast_path_throughput bench failed"
+[[ -s "${REPORT_THR}/report.html" ]] || fail "fast_path_throughput: no report.html"
+echo "  [info] throughput bench output: ${REPORT_THR}"
+
+REPORT_SS="${REPORT_BASE}/M3-static-sky"
+python -m bench.static_sky_subtract \
+    --n-blocks 24 \
+    --t-int-fast-native 128 \
+    --n-grid 64 \
+    --report-dir "${REPORT_SS}" \
+    || fail "static_sky_subtract bench failed"
+[[ -s "${REPORT_SS}/report.html" ]] || fail "static_sky_subtract: no report.html"
+echo "  [info] static-sky bench output: ${REPORT_SS}"
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
@@ -397,9 +449,9 @@ CHUNKS_DONE=(
   "chunk_6_voltage_fixture_burst_250924mptq"
   "chunk_7_16chgroup_alignment_preview"
   "chunk_8_transport_loopback_capture"
+  "chunk_9_dod_orchestrator_completion"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
-  "chunk_9_dod_orchestrator_completion"
   "chunk_10_hardening"
 )
 
@@ -452,10 +504,10 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_5_voltage_fixture_continuum",
     "chunk_6_voltage_fixture_burst_250924mptq",
     "chunk_7_16chgroup_alignment_preview",
-    "chunk_8_transport_loopback_capture"
+    "chunk_8_transport_loopback_capture",
+    "chunk_9_dod_orchestrator_completion"
   ],
   "chunks_remaining": [
-    "chunk_9_dod_orchestrator_completion",
     "chunk_10_hardening"
   ]
 }

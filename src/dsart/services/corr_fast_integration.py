@@ -85,6 +85,7 @@ from dsart.cal.cal_loader import (
 from dsart.common.config_loader import load
 from dsart.common.constants import (
     FADA_BYTES_PER_BLOCK,
+    N_CHGROUP,
     NANTS,
     NATIVE_SAMPLE_US,
     NCHAN_PER_CHGROUP,
@@ -108,6 +109,11 @@ from dsart.services.corr_fast_kernel import (
 from dsart.services.slow_corr_kernel import (
     apply_cal_split,
     unpack_int4_split,
+)
+from dsart.coarse_dm.dm_plan import DMPlan
+from dsart.coarse_dm.stage1 import (
+    apply_stage1_shifts,
+    max_t_dedisp_for_plan,
 )
 
 
@@ -234,6 +240,164 @@ class NoOpTransportTx:
         rfi_warming_up: bool,
     ) -> int:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 multi-DM-trial coarse-DM (F25 production path)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Stage1MultiDMCoarseDM:
+    """Production coarse-DM stage: vis-domain stage-1 shifts → per-trial grid.
+
+    Per F25 (M3_PLAN_FIXES.md), the production multi-DM-trial
+    integration applies per-channel integer-bin shifts on the
+    visibility tensor before the gridder, once per coarse-DM trial.
+    The :func:`apply_stage1_shifts` primitive provides the math; this
+    class wraps it in the chunk-4 ``CoarseDMStage`` Protocol shape so
+    the orchestrator's :func:`process_block_multi_dm` can call it
+    uniformly across the DM-axis loop.
+
+    Constructed once per chgroup at service startup; held in
+    ``IntegrationContext.coarse_dm`` for the lifetime of the run.
+    The ``plan`` is read-only; ``gridder`` is the same one used for
+    the single-DM legacy path.
+
+    Args:
+        plan: :class:`dsart.coarse_dm.dm_plan.DMPlan` whose
+            ``t_int_fast_us`` matches the runtime
+            ``t_int_fast_native``. Construction-time pin: chunk-9
+            tests + the chunk-4 orchestrator both check that
+            ``plan.t_int_fast_native`` equals
+            ``ctx.cfg.t_int_fast_native``.
+        gridder: chunk-3a :class:`dsart.grid.FastVisGridder`.
+        chgroup: chgroup index this dedisperser is bound to (matches
+            ``ctx.cfg.chgroup``).
+        dm_indices: optional ``(N_DM_subset,)`` int subset of the
+            plan's DM trials to compute (default: all
+            ``plan.n_coarse``).
+    """
+
+    plan: DMPlan
+    gridder: "FastVisGridder"
+    chgroup: int
+    dm_indices: np.ndarray | None = None
+
+    _t_dedisp_cache: dict[int, int] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _dm_idx_iter: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.chgroup < N_CHGROUP:
+            raise ValueError(
+                f"Stage1MultiDMCoarseDM.chgroup={self.chgroup}, "
+                f"expected 0..{N_CHGROUP - 1}"
+            )
+        if self.dm_indices is None:
+            self._dm_idx_iter = np.arange(
+                self.plan.n_coarse, dtype=np.int64,
+            )
+        else:
+            arr = np.asarray(self.dm_indices, dtype=np.int64).reshape(-1)
+            if arr.size == 0:
+                raise ValueError("dm_indices is empty")
+            if int(arr.min()) < 0 or int(arr.max()) >= self.plan.n_coarse:
+                raise IndexError(
+                    f"dm_indices contain out-of-range trials "
+                    f"(plan.n_coarse={self.plan.n_coarse})"
+                )
+            self._dm_idx_iter = arr
+
+    @property
+    def n_dm(self) -> int:
+        return int(self._dm_idx_iter.shape[0])
+
+    def t_dedisp_for(self, n_fast_vis: int) -> int:
+        """Uniform output time-axis length across all DM trials.
+
+        Equals ``n_fast_vis - max_bin_shift_over_all_selected_DMs``.
+        Cached per ``n_fast_vis`` value.
+
+        Returns 0 if the cube is too short for any DM trial — caller
+        should treat 0 as "skip emit" (matches the chunk-3b stage-2
+        FIFO warm-up no-emit policy).
+        """
+        cache_key = int(n_fast_vis)
+        cached = self._t_dedisp_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        t = max_t_dedisp_for_plan(
+            cache_key, self.plan,
+            chgroup=self.chgroup,
+            dm_indices=self._dm_idx_iter,
+        )
+        self._t_dedisp_cache[cache_key] = int(t)
+        return int(t)
+
+    def dedisperse_from_vis(
+        self,
+        vis_stokes_i: torch.Tensor,
+        *,
+        block_n: int,
+    ) -> torch.Tensor:
+        """Run the per-DM-trial stage-1 shift + gridder loop.
+
+        Parameters
+        ----------
+        vis_stokes_i : torch.Tensor
+            Shape ``(n_fast_vis, NBASE, NCHAN)`` complex64 — output
+            of :func:`stokes_i_pol_sum`.
+        block_n : int
+            Block counter (mirrors PSRDADA page sequence). Used for
+            logging only; does NOT affect the math.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(N_DM, T_dedisp, N_filled)`` complex64. Each DM
+            trial's slice ``[c]`` is
+            ``gridder.compute(stage1_shift(vis_stokes_i, plan, dm_idx_iter[c]))``
+            truncated to the uniform ``T_dedisp`` time axis.
+
+        Raises
+        ------
+        ValueError
+            If ``vis_stokes_i`` has the wrong shape or the cube is
+            too short for any DM trial.
+        """
+        if vis_stokes_i.ndim != 3:
+            raise ValueError(
+                f"vis_stokes_i must be 3-D (n_fv, NBASE, NCHAN); "
+                f"got {vis_stokes_i.ndim}-D shape "
+                f"{tuple(vis_stokes_i.shape)}"
+            )
+        n_fv = int(vis_stokes_i.shape[0])
+        t_dedisp = self.t_dedisp_for(n_fv)
+        if t_dedisp <= 0:
+            raise ValueError(
+                f"n_fast_vis={n_fv} too short for plan max bin shift "
+                f"on chgroup={self.chgroup}; selected DMs span "
+                f"{self.plan.dm_pc_cc[self._dm_idx_iter[0]]:.1f}.."
+                f"{self.plan.dm_pc_cc[self._dm_idx_iter[-1]]:.1f} pc/cc"
+            )
+
+        n_filled = int(self.gridder.pattern.n_filled)
+        out = torch.empty(
+            (self.n_dm, t_dedisp, n_filled),
+            dtype=torch.complex64,
+            device=vis_stokes_i.device,
+        )
+        for c, dm_idx in enumerate(self._dm_idx_iter.tolist()):
+            vis_shifted = apply_stage1_shifts(
+                vis_stokes_i, self.plan,
+                chgroup=self.chgroup, dm_idx=int(dm_idx),
+                t_dedisp=t_dedisp,
+            )
+            out[c] = self.gridder.compute(vis_shifted)
+            del vis_shifted
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +612,22 @@ class FastIntegrationConfig:
     static_sky_alpha: float = 0.001
     static_sky_warmup_cubes: int = 8
     static_sky_disabled: bool = False
+    dm_plan_path: Path | None = None
+    """Optional path to a DMPlan ``.npz`` (canonical or chunk-3b slim
+    schema). When set, the orchestrator uses the F25 production
+    multi-DM-trial path: stage-1 vis-domain shifts → per-trial
+    gridder → per-trial static-sky → per-trial stage-2 FIFO →
+    transport. When unset (default), the orchestrator uses the
+    legacy single-DM path with the post-grid ``CoarseDMStage`` Protocol
+    plug-in (chunk 4 behaviour preserved for backward compatibility
+    + single-DM benches such as chunk 5 / chunk 6)."""
+
+    dm_indices_subset: tuple[int, ...] | None = None
+    """Optional subset of the plan's DM trials to evaluate. Useful
+    for the chunk-6 single-DM burst replay (``--single-dm`` is
+    equivalent to ``dm_indices_subset=(<burst_dm_idx>,)``) and for
+    chunk-9 throughput benches that evaluate a sparse subset of
+    trials. ``None`` means all ``plan.n_coarse`` trials."""
 
 
 @dataclass
@@ -473,6 +653,13 @@ class IntegrationContext:
     coarse_dm: CoarseDMStage = field(default_factory=NoOpCoarseDM)
     stage2_fifo: Stage2FifoStage = field(default_factory=NoOpStage2Fifo)
     transport_tx: TransportTxStage = field(default_factory=NoOpTransportTx)
+
+    multi_dm_coarse_dm: Stage1MultiDMCoarseDM | None = None
+    """When set (chunk-9 production path), :func:`process_block` uses
+    the F25 multi-DM-trial integration: vis-domain stage-1 shifts +
+    per-trial gridder + per-trial static-sky. When ``None`` (chunk-4
+    legacy path), the post-grid ``coarse_dm`` Protocol stub is used
+    instead."""
 
 
 @dataclass
@@ -566,20 +753,45 @@ def process_block(
     vis_stokes_i = stokes_i_pol_sum(vis_2pol)                            # (n_fv, NBASE, NCHAN)
     del vis_2pol
 
-    # 7. Gridder (sparse-COO)
-    gridded = ctx.gridder.compute(vis_stokes_i)                          # (n_fv, N_filled) complex64
-    del vis_stokes_i
+    if ctx.multi_dm_coarse_dm is not None:
+        # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
+        # stage-1 shifts → per-trial grid → per-trial static-sky.
+        # Returns (N_DM, T_dedisp, N_filled) complex64.
+        dedispersed = ctx.multi_dm_coarse_dm.dedisperse_from_vis(
+            vis_stokes_i, block_n=block_n,
+        )
+        del vis_stokes_i
 
-    # 8. Static-sky EMA subtraction
-    if ctx.static_sky is not None and not ctx.cfg.static_sky_disabled:
-        gridded_minus_sky = ctx.static_sky.apply(gridded)
+        # 8. Per-trial static-sky EMA subtraction (collapses the
+        # T_dedisp axis → N_filled internally; replicates back to
+        # the full (T_dedisp, N_filled) shape).
+        if ctx.static_sky is not None and not ctx.cfg.static_sky_disabled:
+            n_dm, t_dedisp, n_filled = dedispersed.shape
+            for c in range(n_dm):
+                dedispersed[c] = ctx.static_sky.apply(dedispersed[c])
+
+        # The "headline" pre-stage2 cube is the multi-DM cube itself.
+        # Tests + benches read this from IntegrationOutput.gridded_minus_sky.
+        gridded_minus_sky = dedispersed
     else:
-        gridded_minus_sky = gridded
+        # ----- Chunk-4 legacy path (single-DM, post-grid coarse-DM stub)
+        # 7. Gridder (sparse-COO)
+        gridded = ctx.gridder.compute(vis_stokes_i)                      # (n_fv, N_filled) complex64
+        del vis_stokes_i
 
-    # 9. Coarse-DM dedispersion (no-op stub today)
-    dedispersed = ctx.coarse_dm.dedisperse(
-        gridded_minus_sky, block_n=block_n, chgroup=ctx.cfg.chgroup,
-    )
+        # 8. Static-sky EMA subtraction
+        if ctx.static_sky is not None and not ctx.cfg.static_sky_disabled:
+            gridded_minus_sky = ctx.static_sky.apply(gridded)
+        else:
+            gridded_minus_sky = gridded
+
+        # 9. Coarse-DM dedispersion (no-op stub today; chunk 3b's
+        # primitive lives in a separate module — chunk 9 introduced
+        # ``Stage1MultiDMCoarseDM`` for the production multi-DM
+        # path, which is the branch above).
+        dedispersed = ctx.coarse_dm.dedisperse(
+            gridded_minus_sky, block_n=block_n, chgroup=ctx.cfg.chgroup,
+        )
 
     # 10. Stage-2 FIFO push (no-op stub today)
     cubes_for_tx = ctx.stage2_fifo.push(dedispersed, block_n=block_n)
@@ -706,6 +918,7 @@ def build_context(
     coarse_dm: CoarseDMStage | None = None,
     stage2_fifo: Stage2FifoStage | None = None,
     transport_tx: TransportTxStage | None = None,
+    dm_plan: DMPlan | None = None,
 ) -> IntegrationContext:
     """One-shot context builder. Tests call this directly with synthetic
     antpos arrays; the service shell calls this after reading the fada
@@ -770,6 +983,44 @@ def build_context(
     else:
         LOG.info("StaticSkyEMA DISABLED (cfg.static_sky_disabled=True)")
 
+    # Chunk-9 / F25 production multi-DM path.
+    # ``dm_plan`` arg overrides ``cfg.dm_plan_path`` — used by tests +
+    # benches that synthesise a custom plan (e.g. chunk-6 single-DM
+    # burst, chunk-9 throughput).
+    multi_dm: Stage1MultiDMCoarseDM | None = None
+    plan: DMPlan | None = dm_plan
+    if plan is None and cfg.dm_plan_path is not None:
+        plan = DMPlan.load(cfg.dm_plan_path)
+    if plan is not None:
+        # Sanity: t_int_fast_native pin (within fp tolerance for
+        # non-integer cadences, which the schema allows).
+        plan_native = plan.t_int_fast_native
+        if abs(plan_native - cfg.t_int_fast_native) > 1e-6:
+            raise ValueError(
+                f"DMPlan.t_int_fast_native={plan_native} does not match "
+                f"cfg.t_int_fast_native={cfg.t_int_fast_native} — "
+                f"rebuild the plan or change the config"
+            )
+        dm_indices_arr: np.ndarray | None = None
+        if cfg.dm_indices_subset is not None:
+            dm_indices_arr = np.asarray(
+                cfg.dm_indices_subset, dtype=np.int64,
+            )
+        multi_dm = Stage1MultiDMCoarseDM(
+            plan=plan,
+            gridder=gridder,
+            chgroup=cfg.chgroup,
+            dm_indices=dm_indices_arr,
+        )
+        LOG.info(
+            "Stage1MultiDMCoarseDM ready: chgroup=%d n_dm=%d t_int_fast_us=%.3f "
+            "(plan_n_coarse=%d, dm_subset=%s)",
+            cfg.chgroup, multi_dm.n_dm, plan.t_int_fast_us,
+            plan.n_coarse,
+            "all" if cfg.dm_indices_subset is None else
+            str(cfg.dm_indices_subset),
+        )
+
     return IntegrationContext(
         cfg=cfg,
         device=device,
@@ -786,6 +1037,7 @@ def build_context(
         transport_tx=(
             transport_tx if transport_tx is not None else NoOpTransportTx()
         ),
+        multi_dm_coarse_dm=multi_dm,
     )
 
 
