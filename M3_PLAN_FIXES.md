@@ -286,6 +286,67 @@ helper without disturbing the legacy positional tests.
 
 ---
 
+### F26 — transport TX accepts both sparse-COO and image cubes
+
+**Status**: PROPOSED (chunk 8, 2026-05-06). IMPLEMENTED in
+`src/dsart/transport/tx.py::TransportTx._transmit_one_cube` via
+`cube.ndim` auto-detect, with three pinning tests in
+`tests/test_transport_loopback.py`.
+
+**Problem**: plan §3 / §4.3 describes the production transport
+payload as a 1-D `[N_filled]` complex value vector — the COO-
+gathered sparse representation that the search side scatters back
+through its locally-computed pattern table (Option C). But the chunk-4
+`TransportTxStage.transmit` Protocol takes a generic
+`cubes_for_tx: list[torch.Tensor]` whose shape varies with the
+upstream stage:
+
+* Today (chunk 4 + chunk 3b's `coarse_dedisp`): cubes are
+  `(N_DM, n_fast_vis, N_filled)` — sparse-COO, the gridder's
+  `[N_filled]` slice replicated across the dedispersion / fast-vis
+  axes.
+* Future (chunk 9's full-pipeline orchestrator + any
+  iFFT2-already-done variant): cubes may arrive as
+  `(N_DM, n_fast_vis, N_grid, N_grid)` image cubes.
+
+A transport TX that hard-coded `ndim == 3` would silently mishandle
+the image-cube case (treating `N_grid` as `N_filled` produces
+garbage); a transport TX that hard-coded `ndim == 4` would refuse
+the chunk-4-today output.
+
+**Fix**: `TransportTx._transmit_one_cube` auto-detects via
+`cube.ndim`:
+
+* `ndim == 3` → sparse-COO `(N_DM, n_fv, N_filled)`, payload per
+  `(dm_idx, t_idx)` is the 1-D `(N_filled,)` complex slice. Frame
+  header `n_grid = 0` (a sentinel meaning "ask the receiver's cached
+  SparsityPattern for the dense grid").
+* `ndim == 4` → image cube `(N_DM, n_fv, N_grid, N_grid)`, payload
+  is the flattened `(N_grid * N_grid,)` complex slice. Frame header
+  `n_grid` is the real grid side length.
+* anything else → `ValueError`; non-square trailing axes → `ValueError`.
+
+**M3 plan.md changes (during hardening)**:
+- §3 fast-vis-cube data-plane contract: add a paragraph specifying
+  the two TX-side input shapes + the auto-detect convention.
+- §4.4 transport plane: reference the F26 auto-detect from the TX
+  module bullet.
+- M4a's production header (72-byte) keeps both `n_grid` (image cube)
+  AND `n_filled` (sparse-COO) fields per plan §3; for the chunk-8
+  32-byte simplified header, `n_grid = 0` is the "sparse" sentinel.
+
+**Tests (chunk 8)**:
+- `test_TransportTx_sends_one_frame_per_tile` — sparse-COO
+  `(N_DM=3, n_fv=5, N_filled=16)` → 15 frames sent; chgroup + dm_idx +
+  t_idx round-trip cleanly.
+- `test_TransportTx_image_cube_shape_auto_detected` — image cube
+  `(1, 1, 32, 32)` cfp16 → 1 frame; `payload_bytes == 32*32*4` (4
+  bytes/cell for cfp16); `frame.n_grid == 32`.
+- `test_TransportTx_rejects_bad_cube_shape` — `ndim ∉ {3, 4}` raises
+  `ValueError`; non-square trailing axes raise `ValueError`.
+
+---
+
 ## D-items (decisions — locked during M3 implementation)
 
 ### D-coarse-dm-A — Convention A vs B for DMPlan delay reference
