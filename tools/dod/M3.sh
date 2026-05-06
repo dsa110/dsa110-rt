@@ -230,6 +230,35 @@ python -m pytest tests/test_online_injector.py -q --tb=short \
   || fail "online injector acceptance pytests failed"
 pass
 
+# --- chunk 4: corr_fast_integration (full-pipeline orchestrator) -----------
+# 19 acceptance tests covering the chunk-4 production service
+# corr_fast_integration that wires together (in order):
+#   unpack_int4_split (M2)
+#   → RFIFlagger.flag_block (chunk 3c)
+#   → apply_rfi_mask_to_voltages (chunk 4) — voltage-cube zero-fill
+#   → apply_cal_split with F21 (chunk 1)
+#   → FastCorrKernel.compute_split (chunk 2a)
+#   → stokes_i_pol_sum (chunk 2a)
+#   → FastVisGridder.compute (chunk 3a) — sparse-COO grid
+#   → StaticSkyEMA.apply (chunk 4) — running-mean EMA subtraction
+#   → coarse_dm.dedisperse (chunk 3b stub today, real impl in 3b)
+#   → stage2_fifo.push (chunk 3b stub today)
+#   → transport_tx.transmit (chunk 8 stub today)
+# The last three stages are pluggable via Protocol shapes
+# (CoarseDMStage, Stage2FifoStage, TransportTxStage) so chunks 3b / 8
+# land without touching this orchestrator.
+# Tests cover: voltage-cube zero-fill semantics + shape/dtype rejects
+# + StaticSkyEMA cold-start / warmup / subtract / convergence + cfg
+# kill-switches + build_context default-stub wiring + process_block
+# end-to-end shape / RFI-result presence / static-sky cancellation /
+# pluggable-stage call-shape recording / and a cross-module pin
+# (chunk-4 pre-grid Stokes-I === chunk-2b spine output) so future
+# F-item drift gets caught at the integration boundary.
+STEP="chunk_4_corr_fast_integration"
+python -m pytest tests/test_corr_fast_integration.py -q --tb=short \
+  || fail "corr_fast_integration acceptance pytests failed"
+pass
+
 # ---------------------------------------------------------------------------
 # Stage stamping
 # ---------------------------------------------------------------------------
@@ -241,10 +270,10 @@ CHUNKS_DONE=(
   "chunk_3a_gridder_sparsity_pattern"
   "chunk_3c_rfi_flagger"
   "chunk_3d_online_injector"
+  "chunk_4_corr_fast_integration"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_3b_coarse_dm_static_sky"
-  "chunk_4_corr_fast_integration"
   "chunk_5_voltage_fixture_continuum"
   "chunk_6_voltage_fixture_burst_250924mptq"
   "chunk_7_16chgroup_alignment_preview"
@@ -296,11 +325,11 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_2b_corr_fast_compute_service_shell",
     "chunk_3a_gridder_sparsity_pattern",
     "chunk_3c_rfi_flagger",
-    "chunk_3d_online_injector"
+    "chunk_3d_online_injector",
+    "chunk_4_corr_fast_integration"
   ],
   "chunks_remaining": [
     "chunk_3b_coarse_dm_static_sky",
-    "chunk_4_corr_fast_integration",
     "chunk_5_voltage_fixture_continuum",
     "chunk_6_voltage_fixture_burst_250924mptq",
     "chunk_7_16chgroup_alignment_preview",
