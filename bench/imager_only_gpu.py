@@ -240,39 +240,47 @@ def _dequant_cint8_to_complex_gpu(
     complex_dtype: torch.dtype,
     scale: float = 1.0,
     offset: float = 0.0,
+    chunk_size: int = 4,
 ) -> torch.Tensor:
     """Dequantise the per-chgroup cint8 streams → complex tensor on GPU.
 
     Output: ``[N_chgroup, T_stream, N_grid, N_grid]`` ``complex_dtype``.
 
-    Vectorised across all chgroups in a single op-graph. Goes through
-    fp32 → cf64 → ``complex_dtype`` because ``torch.complex(re, im)``
-    only supports fp32/fp64 and ``torch.view_as_complex`` only
-    supports fp32→cf64 / fp64→cf128. The intermediate fp32/cf64
-    tensors are short-lived and get freed before the per-fdm loop
-    runs (GPU caching allocator releases the slabs back to the pool).
+    Processes ``chunk_size`` chgroups at a time to bound the transient
+    fp32 working memory. ``torch.view_as_complex`` only supports
+    fp32→cf64 / fp64→cf128, so we go through fp32 → cf64 →
+    ``complex_dtype``; the ``.contiguous()`` after the permute also
+    transiently duplicates the fp32 buffer.
 
-    Memory at production T_stream=640, N_grid=256, N_chgroup=16:
+    Memory at production T_stream=640, N_grid=256, N_chgroup=16,
+    ``chunk_size=4``:
         cint8 input: 1.25 GiB (caller-owned)
-        fp32 temp:    5.0 GiB (this function, freed at exit)
+        fp32 temp:    1.25 GiB (this function, transient per chunk)
+        fp32 contig:  1.25 GiB (this function, transient per chunk)
         cfp16 out:    2.5 GiB (returned)
-
-    If 5 GiB intermediate is too much, build with ``chunk_size`` set
-    to process N_chgroup // chunk_size chgroups at a time.
+    Peak: ~6.25 GiB. Comfortably fits with a 2 GiB output cube buffer.
 
     Per ``SparseCOOPayload``, the scale/offset are per-block scalars
     computed at the corr side from the filled cells. For the bench we
     pass the constants in (default scale=1, offset=0); production
     M3-emitted payloads carry them.
     """
-    # Fast vectorised path.
-    chg = streams_cint8.to(dtype=torch.float32)  # [..., 2, N_grid, N_grid] fp32
-    if scale != 1.0 or offset != 0.0:
-        chg = chg * float(scale) + float(offset)
-    # permute last to [..., N_grid, N_grid, 2] for view_as_complex.
-    chg = chg.permute(0, 1, 3, 4, 2).contiguous()
-    chg_cf64 = torch.view_as_complex(chg)  # [..., N_grid, N_grid] cf64
-    out = chg_cf64.to(dtype=complex_dtype)
+    n_chgroup, t_stream, _, n_grid, _ = streams_cint8.shape
+    out = torch.empty(
+        (n_chgroup, t_stream, n_grid, n_grid),
+        dtype=complex_dtype, device=streams_cint8.device,
+    )
+    chunk_size = max(1, min(chunk_size, n_chgroup))
+    for g0 in range(0, n_chgroup, chunk_size):
+        g1 = min(n_chgroup, g0 + chunk_size)
+        chg = streams_cint8[g0:g1].to(dtype=torch.float32)
+        if scale != 1.0 or offset != 0.0:
+            chg = chg * float(scale) + float(offset)
+        # permute last to [..., N_grid, N_grid, 2] for view_as_complex.
+        chg = chg.permute(0, 1, 3, 4, 2).contiguous()
+        chg_cf64 = torch.view_as_complex(chg)
+        out[g0:g1] = chg_cf64.to(dtype=complex_dtype)
+        del chg, chg_cf64
     return out
 
 
@@ -430,40 +438,34 @@ def _bench_main(args: argparse.Namespace) -> int:
         cube_dtype=cube_dtype, complex_dtype=complex_dtype,
     )
 
-    # Pre-stage two host-side cint8 buffers on GPU and alternate per
-    # cube. This decouples bench-only host-side input generation cost
-    # (numpy.random for ~1.25 GiB int8/cube is multi-second on CPU)
-    # from the imager work we want to measure. Two buffers (vs one)
-    # avoids any in-cache reuse that would mask realistic memory
-    # bandwidth pressure.
-    _LOG.info("pre-staging cint8 buffers on GPU (2 × %.2f MiB)",
+    # Pre-stage one host-side cint8 buffer on GPU. The second buffer
+    # was meant to avoid in-cache reuse, but at production geometry
+    # (~1.25 GiB/buffer) the L2 cache is far smaller than even a
+    # single chgroup, so reuse already hits global memory the same
+    # way; one buffer keeps the GPU-side memory budget tight.
+    _LOG.info("pre-staging cint8 buffer on GPU (%.2f MiB)",
               N_CHGROUP * t_stream * 2 * n_grid * n_grid / (1024 * 1024))
-    streams_buffers_gpu: List[torch.Tensor] = []
-    for k in range(2):
-        s_cpu = _build_synthetic_streams(
-            n_chgroup=N_CHGROUP, t_stream=t_stream, n_grid=n_grid, rng=rng,
-        )
-        streams_buffers_gpu.append(s_cpu.to(device=device, non_blocking=False))
-        del s_cpu
+    s_cpu = _build_synthetic_streams(
+        n_chgroup=N_CHGROUP, t_stream=t_stream, n_grid=n_grid, rng=rng,
+    )
+    streams_cint8_gpu = s_cpu.to(device=device, non_blocking=False)
+    del s_cpu
     torch.cuda.synchronize()
 
-    # Pre-warm cuFFT plan on a one-shot dummy cube. Without this the
+    # Pre-warm cuFFT plan on a one-shot dummy slab. Without this the
     # first cube's ifft2 carries the cuFFT plan-build cost (~270 ms at
     # production geometry); we'd rather attribute that to startup.
     _LOG.info("warming up cuFFT plan...")
-    dequant_warm = _dequant_cint8_to_complex_gpu(
-        streams_buffers_gpu[0], complex_dtype=complex_dtype,
+    warm_uv = torch.empty(
+        (t_det, n_grid, n_grid), dtype=complex_dtype, device=device,
     )
-    _ = torch.fft.ifft2(dequant_warm[:t_det])
+    _ = torch.fft.ifft2(warm_uv)
     torch.cuda.synchronize()
-    del dequant_warm
+    del warm_uv
 
     records: List[StageRecord] = []
     bench_start_ns = time.perf_counter_ns()
     for cube_id in range(n_cubes):
-        # Round-robin between the two pre-staged GPU input buffers.
-        streams_cint8_gpu = streams_buffers_gpu[cube_id % len(streams_buffers_gpu)]
-
         # Time-shift table is small (N_fdm × N_chgroup int32) so we
         # generate it on host as Python ints. The per-fdm loop then
         # never has to ``.item()`` a GPU tensor (saving ~25 ms/cube
