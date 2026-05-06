@@ -242,7 +242,7 @@ def compute_autos_from_complex(
     """
     if voltages.ndim != 4:
         raise ValueError(
-            f"voltages must be 4-dim (NANTS, NCHAN, NPOL, NTIME); "
+            f"voltages must be 4-dim (n_ant, n_ch, n_pol, n_time); "
             f"got shape {tuple(voltages.shape)}"
         )
     if not voltages.is_complex():
@@ -250,11 +250,15 @@ def compute_autos_from_complex(
             f"voltages must be complex; got dtype {voltages.dtype}"
         )
     n_ant, n_ch, n_pol, n_time = voltages.shape
-    if n_ant != NANTS or n_pol != NPOL:
+    if n_pol != NPOL:
         raise ValueError(
-            f"voltages shape {tuple(voltages.shape)}: NANTS / NPOL "
-            f"axes must be ({NANTS}, ..., {NPOL}, ...)"
+            f"voltages shape {tuple(voltages.shape)}: NPOL axis "
+            f"must be {NPOL}, got {n_pol}"
         )
+    # Note: this helper accepts arbitrary n_ant / n_ch (tests use
+    # smaller dimensions for speed). The production GEMM-layout entry
+    # ``compute_autos`` enforces the canonical (NANTS=96, NCHAN=384)
+    # shape.
 
     for m in m_values:
         if m <= 0 or n_time % m != 0:

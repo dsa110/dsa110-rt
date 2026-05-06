@@ -616,12 +616,6 @@ def test_combine_warmup_state_machine(tmp_path: Path) -> None:
     n_ch = 16
     n_pol = 2
     n_time = 4096
-    voltages = _random_complex_voltages(
-        n_ant=n_ant, n_ch=n_ch, n_pol=n_pol, n_time=n_time, sigma=1.0,
-    )
-    autos = compute_autos_from_complex(voltages, m_values=(4096,))
-    re_g, im_g = _gemm_layout_from_complex(voltages, n_packets=2048)
-    autos_full = compute_autos(re_g, im_g)
 
     flagger = RFIFlagger(
         flagants_path=None,
@@ -629,26 +623,39 @@ def test_combine_warmup_state_machine(tmp_path: Path) -> None:
     )
     headers = [MockTransportHeader() for _ in range(6)]
 
-    # Patch in our test-cube autos so we don't need to inflate to full
-    # NANTS-NCHAN dimensions.
-    # Easiest: monkey-patch flagger via autos_override. The combine
-    # path uses compute_autos internally, which validates shape == (NANTS,
-    # NCHAN, NPOL, ...). We supply an autos_override directly.
-    autos_for_inject = compute_autos_from_complex(
-        _random_complex_voltages(n_time=4096),
-    )
-
+    rng = np.random.default_rng(20260510)
     for i in range(6):
+        # Use compute_autos_from_complex at reduced size for speed; the
+        # combine path's flagants broadcast adapts to the autos shape.
+        re = rng.normal(0.0, 1.0 / math.sqrt(2.0),
+                        size=(n_ant, n_ch, n_pol, n_time))
+        im = rng.normal(0.0, 1.0 / math.sqrt(2.0),
+                        size=(n_ant, n_ch, n_pol, n_time))
+        voltages = torch.as_tensor((re + 1j * im).astype(np.complex64))
+        autos_for_inject = compute_autos_from_complex(voltages)
+
         result = flagger.flag_block(
             real=None, imag=None,
             autos_override=autos_for_inject,
             update_header=headers[i],
         )
+        # Output mask carries the autos' (n_ant, n_ch, n_pol) cube shape.
+        assert result.mask.shape == (n_ant, n_ch, n_pol)
         if i < 3:
-            assert result.warmup
-            assert headers[i].is_rfi_warming_up()
+            assert result.warmup, f"cube {i}: expected warmup=True"
+            assert headers[i].is_rfi_warming_up(), (
+                f"cube {i}: expected header.bit4 set"
+            )
+            # bandpass-outlier bypass: no source-tag bit 1<<1 set.
+            bp_bit = (
+                (result.source_tags & int(FlagSourceBit.BANDPASS_OUTLIER))
+                != 0
+            )
+            assert not bp_bit.any().item(), (
+                f"cube {i}: bandpass-outlier should be bypassed in warmup"
+            )
         else:
-            assert not result.warmup
+            assert not result.warmup, f"cube {i}: expected warmup=False"
             assert not headers[i].is_rfi_warming_up()
 
     flagger.reset_warmup()

@@ -158,11 +158,28 @@ class MockTransportHeader:
 # ---------------------------------------------------------------------------
 
 
-def _flagants_to_cube(flagants_mask: torch.Tensor) -> torch.Tensor:
-    """Broadcast a ``[NANTS]`` bool mask to ``[NANTS, NCHAN, NPOL]``."""
+def _flagants_to_cube(
+    flagants_mask: torch.Tensor,
+    *,
+    n_ant: int = NANTS,
+    n_ch: int = NCHAN_PER_CHGROUP,
+    n_pol: int = NPOL,
+) -> torch.Tensor:
+    """Broadcast a flagants ant mask to ``[n_ant, n_ch, n_pol]``.
+
+    Args:
+        flagants_mask: bool tensor of length ≥ ``n_ant``. Production
+            uses :data:`NANTS`; tests pass a shorter reduced mask.
+        n_ant, n_ch, n_pol: target cube dims. Defaults are the
+            canonical voltage cube dims.
+    """
+    if flagants_mask.shape[0] < n_ant:
+        raise ValueError(
+            f"flagants_mask length {flagants_mask.shape[0]} < n_ant {n_ant}"
+        )
     return (
-        flagants_mask.view(NANTS, 1, 1)
-        .expand(NANTS, NCHAN_PER_CHGROUP, NPOL)
+        flagants_mask[:n_ant].view(n_ant, 1, 1)
+        .expand(n_ant, n_ch, n_pol)
         .contiguous()
     )
 
@@ -364,11 +381,17 @@ class RFIFlagger:
         else:
             sum_m = torch.zeros_like(sk_m)
 
-        # ---- flagants.dat (broadcast [NANTS] → [NANTS, NCHAN, NPOL]) ---
+        # ---- flagants.dat (broadcast [NANTS] → cube shape) -------
         device = sk_m.device
         if self._flagants_mask.device != device:
             self._flagants_mask = self._flagants_mask.to(device)
-        fa_m = _flagants_to_cube(self._flagants_mask)
+        n_ant_actual, n_ch_actual, n_pol_actual = sk_m.shape
+        fa_m = _flagants_to_cube(
+            self._flagants_mask,
+            n_ant=n_ant_actual,
+            n_ch=n_ch_actual,
+            n_pol=n_pol_actual,
+        )
 
         # ---- OR-fold ----------------------------------------------
         final = sk_m | bp_m | gr_m | sum_m | fa_m
