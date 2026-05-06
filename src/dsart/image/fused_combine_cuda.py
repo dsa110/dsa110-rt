@@ -1,18 +1,6 @@
 """src/dsart/image/fused_combine_cuda.py — fused per-fdm combine CUDA
 kernel for the M5 imager.
 
-NOTE: requires GCC ≥ 9 (PyTorch 2.x ABI requirement). On h01 the
-system gcc is 7.5; we install ``gcc_linux-64`` / ``gxx_linux-64`` via
-conda-forge into the ``dsa110-rt`` env (gives gcc 15.2.0) and point
-``CC`` / ``CXX`` at the conda compiler before calling load_inline.
-``ninja`` is also a build-time dep (``pip install ninja`` in the
-conda env). One-time conda env setup:
-
-    conda activate dsa110-rt
-    conda install -c conda-forge "gxx_linux-64>=9" "gcc_linux-64>=9"
-    pip install ninja
-
-
 Memory pattern of the chunk-6c-follow-up bench combine step:
 
   for f in range(N_fdm):
@@ -28,71 +16,69 @@ already near the 616 GB/s peak HBM bandwidth on a 2080 Ti.
 This module ships a fused per-fdm kernel that reads each chgroup once
 and writes the output once. Memory pattern reduces to
 ``N_fdm × (16 + 1) × T_det × N²`` cfp16 = 17× slab volume per cube ≈
-34 GiB at the same geometry → ~67 ms theoretical (~3× speedup).
+34 GiB at the same geometry → ~67 ms theoretical (~3× speedup,
+including kernel-overhead inefficiencies).
 
 The kernel handles the boundary case ``s + t >= T_stream`` (a chgroup
 that shifts off the end of the stream is treated as zero, matching
-the bench's Python ``if s + T_det <= T_stream: uv.add_(...)`` guard).
+the bench's Python ``if s + T_det <= T_stream: uv.add_(...)`` guard
+cell-wise).
 
-Compiled at first import via ``torch.utils.cpp_extension.load_inline``
-(takes ~30 s; cached under ``$TORCH_HOME/cuda``). Subsequent runs
-load the compiled .so instantly.
+JIT-compiled at first use via ``cupy.RawKernel``, which goes through
+NVRTC (CUDA's runtime compiler) — no host gcc, no cpp_extension
+ninja-build dance. The compiled cubin is cached by cupy under
+``$CUPY_CACHE_DIR`` (default ``~/.cupy/kernel_cache``); re-runs are
+near-instant after the first.
 
 Used by ``bench/imager_only_gpu.py`` when ``--combine-impl
 fused_cuda`` is passed (the default; pass ``--combine-impl
-python_addloop`` for the A/B-compare baseline).
+python_addloop`` for the chunk-6c-follow-up A/B baseline).
+
+NOTE: this module imports ``cupy`` at top level. The dsa110-rt conda
+env on h01 ships cupy 13.x; CI without cuda skips both this module
+and the corresponding tests.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import sys
-from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 _LOG = logging.getLogger(__name__)
 
-# C++ forward-declaration required by the load_inline auto-generated
-# main.cpp (which contains the pybind11 binding and references the
-# function defined in the .cu file). Without this, the main.cpp
-# pybind11 macro can't resolve the symbol.
-_CPP_DECL = r"""
-#include <torch/extension.h>
+# Lazy imports of cupy: this module is only useful on a cuda host.
+# We defer the import to the first call so the rest of the package
+# remains importable on cuda-less CI.
+_cp: Optional[object] = None
 
-void fused_combine_per_fdm(
-    torch::Tensor streams,
-    torch::Tensor shifts,
-    torch::Tensor output);
-"""
+
+def _get_cupy():
+    global _cp
+    if _cp is not None:
+        return _cp
+    import cupy as cp  # noqa: WPS433  # intentional lazy import
+    _cp = cp
+    return cp
+
 
 # ---------------------------------------------------------------------------
-# CUDA source
+# CUDA source (compiled via NVRTC; no host gcc involvement)
 # ---------------------------------------------------------------------------
 
-# All-cfp16 (complex32) variant. PyTorch's complex32 has the same
-# memory layout as ``__half2`` (interleaved real/imag fp16), so we
-# reinterpret_cast on the data pointer.
-_CUDA_SOURCE = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+# Two kernels: one for cfp16 (production target) and one for cfp32
+# (numerical-precision audit fallback). PyTorch's complex32 is laid
+# out as ``__half2`` (interleaved real/imag fp16); complex64 is
+# ``float2`` (interleaved fp32). We reinterpret the raw GPU pointer
+# at kernel-call time.
+_CUDA_SOURCE_CF16 = r"""
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
 
-// Per-fdm fused combine. One launch produces one [T_det, N, N] cfp16
-// uv slab. shifts is a small host-staged [N_chgroup] int32 tensor on
-// device; the kernel reads each chgroup's contiguous slice once and
-// accumulates into the per-output element directly.
-//
-// Block layout: each thread produces one (t, u, v) output element.
-// We tile (v_pix, u_pix, t) over the grid for coalesced reads/writes
-// (the v_pix axis is the innermost, matches cfp16 stride 1).
-__global__ void fused_combine_per_fdm_cf16_kernel(
-    const __half2* __restrict__ streams,    // [N_chg, T_stream, N, N]
-    const int*     __restrict__ shifts,     // [N_chg]
-    __half2*       __restrict__ output,     // [T_det, N, N]
+extern "C" __global__ void fused_combine_per_fdm_cf16(
+    const __half2* __restrict__ streams,
+    const int*     __restrict__ shifts,
+    __half2*       __restrict__ output,
     int n_chgroup, int t_stream, int t_det, int n_grid)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
@@ -105,8 +91,6 @@ __global__ void fused_combine_per_fdm_cf16_kernel(
     const int chg_stride     = t_stream * n_grid_sq;
 
     __half2 acc = __floats2half2_rn(0.0f, 0.0f);
-    // shifts is read by every thread in the warp; the L1 cache makes
-    // this essentially free after the first warp loads it.
     for (int g = 0; g < n_chgroup; ++g) {
         const int s = shifts[g];
         const int t_src = s + t;
@@ -119,13 +103,10 @@ __global__ void fused_combine_per_fdm_cf16_kernel(
     }
     output[t * n_grid_sq + spatial_offset] = acc;
 }
+"""
 
-// All-cfp32 (complex64) variant. Mirrors the cf16 kernel structure;
-// used only by the A/B sanity check in tests, never on the M5 hot
-// path. complex64 is two doubles? — no: complex64 is two fp32. We
-// keep the dispatch open in case the operator wants a fp32 fallback
-// for numerical-precision audits.
-__global__ void fused_combine_per_fdm_cf32_kernel(
+_CUDA_SOURCE_CF32 = r"""
+extern "C" __global__ void fused_combine_per_fdm_cf32(
     const float2* __restrict__ streams,
     const int*    __restrict__ shifts,
     float2*       __restrict__ output,
@@ -154,154 +135,95 @@ __global__ void fused_combine_per_fdm_cf32_kernel(
     }
     output[t * n_grid_sq + spatial_offset] = acc;
 }
-
-void fused_combine_per_fdm(
-    torch::Tensor streams,  // [N_chgroup, T_stream, N, N] cfp16 OR cfp32
-    torch::Tensor shifts,   // [N_chgroup] int32 (cuda)
-    torch::Tensor output)   // [T_det, N, N] same dtype as streams
-{
-    TORCH_CHECK(streams.is_cuda(), "streams must be cuda");
-    TORCH_CHECK(shifts.is_cuda(),  "shifts must be cuda");
-    TORCH_CHECK(output.is_cuda(),  "output must be cuda");
-    TORCH_CHECK(streams.is_contiguous(), "streams must be contiguous");
-    TORCH_CHECK(output.is_contiguous(),  "output must be contiguous");
-    TORCH_CHECK(shifts.scalar_type() == torch::kInt32, "shifts must be int32");
-    TORCH_CHECK(streams.scalar_type() == output.scalar_type(),
-                "streams and output dtype must match");
-
-    const int n_chgroup = streams.size(0);
-    const int t_stream  = streams.size(1);
-    const int n_grid    = streams.size(2);
-    TORCH_CHECK(streams.size(3) == n_grid, "streams must be square in u/v");
-    const int t_det     = output.size(0);
-    TORCH_CHECK(output.size(1) == n_grid && output.size(2) == n_grid,
-                "output spatial dims must match streams");
-    TORCH_CHECK(shifts.size(0) == n_chgroup,
-                "shifts must have N_chgroup entries");
-
-    // Block: (32, 4, 8) = 1024 threads. v=inner so 32 threads per warp
-    // map to a contiguous run of v_pix pairs (cfp16 = 4 B/element →
-    // 32 × 4 = 128 B = one HBM transaction).
-    dim3 block(32, 4, 8);
-    dim3 grid(
-        (n_grid + block.x - 1) / block.x,
-        (n_grid + block.y - 1) / block.y,
-        (t_det  + block.z - 1) / block.z
-    );
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (streams.scalar_type() == torch::kComplexHalf) {
-        fused_combine_per_fdm_cf16_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __half2*>(streams.data_ptr()),
-            shifts.data_ptr<int>(),
-            reinterpret_cast<__half2*>(output.data_ptr()),
-            n_chgroup, t_stream, t_det, n_grid
-        );
-    } else if (streams.scalar_type() == torch::kComplexFloat) {
-        fused_combine_per_fdm_cf32_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const float2*>(streams.data_ptr()),
-            shifts.data_ptr<int>(),
-            reinterpret_cast<float2*>(output.data_ptr()),
-            n_chgroup, t_stream, t_det, n_grid
-        );
-    } else {
-        TORCH_CHECK(false, "unsupported dtype: ", streams.scalar_type());
-    }
-}
-
 """
 
-# ---------------------------------------------------------------------------
-# Compilation
-# ---------------------------------------------------------------------------
-
-_MODULE_CACHE: Optional[object] = None
-
-
-def _ensure_conda_gcc_on_path() -> None:
-    """Set CC/CXX env vars to a CUDA-11.8-compatible gcc.
-
-    PyTorch 2.5.x C++ extensions require gcc ≥ 9 to compile (newer
-    pybind11 templates have gcc-10 std::tuple template-pack issues —
-    use gcc ≥ 11). CUDA 11.8's nvcc officially supports gcc ≤ 10 but
-    gcc 11 works in practice via ``-allow-unsupported-compiler``.
-    The dsa110-rt env's gcc 15 emits C++23 ``_Float64`` types nvcc
-    can't parse, so it's unusable here.
-
-    Sweet spot: gcc 11. Live in a sibling ``dsart-build`` conda env.
-    Search order:
-
-      1. ``$DSART_BUILD_CC`` / ``$DSART_BUILD_CXX`` (operator override).
-      2. ``~/miniforge3/envs/dsart-build/bin/x86_64-conda-linux-gnu-{gcc,g++}``
-         (the standard h01 setup).
-      3. ``$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-{gcc,g++}`` (current
-         env; only useable if its gcc happens to be 9-11).
-      4. system ``cc`` / ``c++`` (must be ≥ 9; on h01 this is 7.5,
-         so this branch loses).
-
-    One-time h01 setup:
-
-        conda create -n dsart-build -c conda-forge -y \\
-            "gcc_linux-64=11" "gxx_linux-64=11"
-    """
-    if "DSART_BUILD_CC" in os.environ and "DSART_BUILD_CXX" in os.environ:
-        os.environ["CC"] = os.environ["DSART_BUILD_CC"]
-        os.environ["CXX"] = os.environ["DSART_BUILD_CXX"]
-        return
-    candidate_prefixes = []
-    home = Path(os.environ.get("HOME", "/home/ubuntu"))
-    candidate_prefixes.append(home / "miniforge3" / "envs" / "dsart-build")
-    if "CONDA_PREFIX" in os.environ:
-        candidate_prefixes.append(Path(os.environ["CONDA_PREFIX"]))
-    for prefix in candidate_prefixes:
-        cc_path = prefix / "bin" / "x86_64-conda-linux-gnu-gcc"
-        cxx_path = prefix / "bin" / "x86_64-conda-linux-gnu-g++"
-        if cc_path.is_file() and cxx_path.is_file():
-            os.environ["CC"] = str(cc_path)
-            os.environ["CXX"] = str(cxx_path)
-            return
+# Cache the compiled cupy.RawKernel objects (one per dtype). Each
+# RawKernel call compiles the kernel source via NVRTC; the compiled
+# cubin is then cached on disk by cupy.
+_KERNEL_CF16: Optional[object] = None
+_KERNEL_CF32: Optional[object] = None
 
 
-def get_module(verbose: bool = False) -> object:
-    """Return the compiled CUDA extension. JIT-compile on first call.
-
-    Cached under ``$TORCH_EXTENSIONS_DIR`` (default
-    ``~/.cache/torch_extensions/<py_ver>_<cu_ver>``); recompiles only
-    when the source changes.
-
-    Raises:
-        RuntimeError if cuda is not available, or compile fails.
-    """
-    global _MODULE_CACHE
-    if _MODULE_CACHE is not None:
-        return _MODULE_CACHE
-    if not torch.cuda.is_available():
-        raise RuntimeError("fused_combine_cuda requires cuda")
-    _ensure_conda_gcc_on_path()
-    from torch.utils.cpp_extension import load_inline
-    _LOG.info("compiling fused_combine_cuda extension (this takes ~30 s on first run)...")
-    # PyTorch 2.5.x with the gcc-15.2-built libstdc++ pulls in C++23
-    # ``_Float64`` types from <limits> that nvcc 11.8 cannot parse, so
-    # the dsa110-rt env's gcc 15 is unusable for ext compilation. We
-    # use a sibling ``dsart-build`` conda env pinned to gcc 11. CUDA
-    # 11.8's nvcc officially supports gcc ≤ 10, but gcc 11 works in
-    # practice (no C++23 types, no <tuple> template-pack regressions
-    # from gcc 10) once the version check is overridden via
-    # ``-allow-unsupported-compiler``.
-    mod = load_inline(
-        name="dsart_fused_combine_cuda",
-        cpp_sources=_CPP_DECL,
-        cuda_sources=_CUDA_SOURCE,
-        functions=["fused_combine_per_fdm"],
-        extra_cuda_cflags=[
-            "-O3", "--use_fast_math",
-            "-allow-unsupported-compiler",
-        ],
-        verbose=verbose,
+def _get_kernel_cf16():
+    global _KERNEL_CF16
+    if _KERNEL_CF16 is not None:
+        return _KERNEL_CF16
+    cp = _get_cupy()
+    _LOG.info("compiling fused_combine_per_fdm_cf16 via NVRTC...")
+    _KERNEL_CF16 = cp.RawKernel(
+        code=_CUDA_SOURCE_CF16,
+        name="fused_combine_per_fdm_cf16",
+        options=("-O3", "--use_fast_math"),
     )
-    _LOG.info("fused_combine_cuda extension compiled")
-    _MODULE_CACHE = mod
-    return mod
+    _LOG.info("fused_combine_per_fdm_cf16 ready")
+    return _KERNEL_CF16
+
+
+def _get_kernel_cf32():
+    global _KERNEL_CF32
+    if _KERNEL_CF32 is not None:
+        return _KERNEL_CF32
+    cp = _get_cupy()
+    _LOG.info("compiling fused_combine_per_fdm_cf32 via NVRTC...")
+    _KERNEL_CF32 = cp.RawKernel(
+        code=_CUDA_SOURCE_CF32,
+        name="fused_combine_per_fdm_cf32",
+        options=("-O3", "--use_fast_math"),
+    )
+    _LOG.info("fused_combine_per_fdm_cf32 ready")
+    return _KERNEL_CF32
+
+
+# ---------------------------------------------------------------------------
+# Torch-to-cupy zero-copy view
+# ---------------------------------------------------------------------------
+
+
+def _torch_to_cupy_view(t: torch.Tensor) -> object:
+    """Return a zero-copy cupy ndarray view of a cuda torch tensor.
+
+    cupy 13.x's complex32 dtype is experimental and not always
+    binary-compatible with torch.complex32 across cupy/torch
+    versions; we sidestep by reinterpreting the underlying memory
+    as ``uint32`` (cfp16 = 32 bits/element) or ``uint64`` (cfp32 =
+    64 bits/element) — same bytes, just an opaque type to cupy. The
+    kernel re-casts the pointer to ``__half2`` / ``float2`` inside.
+
+    Args:
+        t: cuda torch tensor, contiguous.
+
+    Returns:
+        cupy.ndarray viewing the same GPU memory.
+    """
+    cp = _get_cupy()
+    if not t.is_cuda:
+        raise ValueError(f"expected cuda tensor; got device={t.device}")
+    if not t.is_contiguous():
+        raise ValueError("tensor must be contiguous")
+
+    n_bytes = t.numel() * t.element_size()
+    # Reinterpret the dtype to something cupy is happy about.
+    if t.dtype == torch.complex32 or t.dtype == torch.float16:
+        cp_dtype = cp.uint32
+        elem_size = 4 if t.dtype == torch.complex32 else 2
+    elif t.dtype == torch.complex64 or t.dtype == torch.float32:
+        cp_dtype = cp.uint64 if t.dtype == torch.complex64 else cp.uint32
+        elem_size = 8 if t.dtype == torch.complex64 else 4
+    elif t.dtype == torch.int32:
+        cp_dtype = cp.int32
+        elem_size = 4
+    else:
+        raise ValueError(f"unsupported torch dtype for cupy view: {t.dtype}")
+
+    n_elems = n_bytes // elem_size
+    mem = cp.cuda.UnownedMemory(t.data_ptr(), n_bytes, owner=t, device_id=t.device.index)
+    memptr = cp.cuda.MemoryPointer(mem, 0)
+    return cp.ndarray(shape=(n_elems,), dtype=cp_dtype, memptr=memptr)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def fused_combine_per_fdm(
@@ -329,5 +251,71 @@ def fused_combine_per_fdm(
     cell-wise (so partial cube tails inherit zero-fill, matching the
     Python guard).
     """
-    mod = get_module()
-    mod.fused_combine_per_fdm(streams, shifts, output)
+    if not (streams.is_cuda and shifts.is_cuda and output.is_cuda):
+        raise RuntimeError("fused_combine_per_fdm: all tensors must be cuda")
+    if streams.dtype != output.dtype:
+        raise RuntimeError(
+            f"streams ({streams.dtype}) and output ({output.dtype}) "
+            "dtype must match"
+        )
+    if shifts.dtype != torch.int32:
+        raise RuntimeError(f"shifts must be int32; got {shifts.dtype}")
+    if streams.dim() != 4 or output.dim() != 3:
+        raise RuntimeError(
+            f"expected streams.dim()=4, output.dim()=3; got "
+            f"{streams.dim()=} {output.dim()=}"
+        )
+
+    n_chgroup, t_stream, n_grid, n_grid_y = streams.shape
+    if n_grid_y != n_grid:
+        raise RuntimeError("streams must be square in u/v")
+    if shifts.shape != (n_chgroup,):
+        raise RuntimeError(
+            f"shifts shape mismatch: got {tuple(shifts.shape)}, "
+            f"expected ({n_chgroup},)"
+        )
+    t_det, n_out_x, n_out_y = output.shape
+    if n_out_x != n_grid or n_out_y != n_grid:
+        raise RuntimeError("output spatial dims must match streams")
+
+    cp = _get_cupy()
+    streams_cp = _torch_to_cupy_view(streams)
+    shifts_cp = _torch_to_cupy_view(shifts)
+    output_cp = _torch_to_cupy_view(output)
+
+    if streams.dtype == torch.complex32:
+        kernel = _get_kernel_cf16()
+    elif streams.dtype == torch.complex64:
+        kernel = _get_kernel_cf32()
+    else:
+        raise RuntimeError(f"unsupported dtype: {streams.dtype}")
+
+    # Block (32, 4, 8) = 1024 threads max per 2080 Ti SM (Turing).
+    # The 32-thread x-axis maps one warp's load to a 128 B coalesced
+    # transaction (32 × 4 B per cfp16 element).
+    block: Tuple[int, int, int] = (32, 4, 8)
+    grid: Tuple[int, int, int] = (
+        (n_grid + block[0] - 1) // block[0],
+        (n_grid + block[1] - 1) // block[1],
+        (t_det  + block[2] - 1) // block[2],
+    )
+
+    # Use the active torch CUDA stream so the kernel synchronises
+    # with the surrounding pytorch ops naturally.
+    torch_stream = torch.cuda.current_stream()
+    with cp.cuda.ExternalStream(torch_stream.cuda_stream):
+        kernel(
+            grid, block,
+            (streams_cp, shifts_cp, output_cp,
+             int(n_chgroup), int(t_stream), int(t_det), int(n_grid)),
+        )
+
+
+def get_module(verbose: bool = False) -> object:
+    """Pre-warm the kernel compile (compatibility shim with the old
+    cpp_extension API used by the bench).
+
+    Triggers compilation of the cfp16 kernel (the production target);
+    the cfp32 kernel is compiled lazily on first use.
+    """
+    return _get_kernel_cf16()
