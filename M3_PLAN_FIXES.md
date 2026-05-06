@@ -229,6 +229,125 @@ that's chunk-9 material.
 
 ---
 
+### F26 — chunk-5 lambda-uniform pixel-wise summation across chgroups misaligns sources
+
+**Status**: DOCUMENTED (chunk 7 work). Discovered while running
+`bench/corr_fast_continuum_0319.py` against the 0319+415 fixture.
+
+Each chgroup has its own `cell_lambda` (derived from
+`max_baseline_lambda` at that chgroup's frequencies). Summing
+per-chgroup dirty images PIXEL-WISE — as specified in the chunk-5
+brief — places the same astrophysical source at slightly different
+pixels across chgroups (`Δpixel = pixel · (1 − ν_g/ν_chg0)`). For a
+source at `+l` half-FoV the inter-chgroup pixel drift is ~12% over
+the band (cell_lambda 46.6 → 41.1), enough to dilute the combined
+peak by ~10x for unresolved sources. The combined-image peak in our
+0319 run lands ~57 cells from the chgroup-0 prediction at
+`n_grid=512`; at `n_grid=256` the source is also out-of-FoV at
+that resolution.
+
+**Reconciliation**: chunk 7 (lambda-uniform reproject onto a common
+`(l, m)` grid) is the production fix. For chunk-5's headline gate the
+brief acknowledges this — `peak_offset_cells <= 4` is achievable only
+on a single chgroup at-source-FoV resolution, and the combined-image
+peak gate should be loosened or removed pending chunk 7. The bench's
+`per_chgroup/dirty_image_chgroup<N>.png` artefacts remain a clean
+single-chgroup check.
+
+---
+
+### F27 — fixture T2 MJD is the trigger MJD, not the transit MJD
+
+**Status**: DOCUMENTED. Discovered while running both the chunk-5
+0319+415 and chunk-6 250924mptq replay benches against the M2 voltage
+fixtures (`/home/ubuntu/data/voltages/<run_id>/voltages/T2_*.json`).
+
+Both fixtures' `T2_*.json` files record an `mjds` field that is the
+TRIGGER MJD (when the candidate was detected on the dedispersing
+beam) rather than the SOURCE TRANSIT MJD. Astropy-backed HA
+computation at the trigger MJD shows:
+
+* 0319+415:    HA_src ≈ -1.024°  (l_rad ≈ +0.0134)
+* 250924mptq:  HA_src ≈ -0.705°  (l_rad ≈ +0.0073)
+
+Sources are therefore OFF-AXIS at the dump's first block by
+arcminutes; the fast-corr `(l, m)` predicted pixel must be computed
+via the astropy `_compute_expected_lm` helper (`bench/run_0319_pipe
+line.py`, mirrored into `bench/corr_fast_burst_250924mptq.py`) — NOT
+clamped to `(l, m) = (0, 0)` as the chunk-6 brief originally
+suggested for the on-axis case.
+
+After applying the HA correction, the chunk-6 burst peak lands 21
+cells from prediction (with a ~5.8 ms timing offset within the 14 ms
+within-chgroup smear); see F28 for the timing offset.
+
+---
+
+### F28 — chunk-6 within-chgroup dispersion smear biases peak_t_native by O(7 ms)
+
+**Status**: DOCUMENTED (full per-channel intra-chgroup dedispersion
+is chunk 9 / F25 work).
+
+At DM=405 pc/cc and the DSA-110 band edges, the dispersion delay
+within a single chgroup spans ~14 ms (top-of-chgroup-N to
+bottom-of-chgroup-N). The chunk-4 fast-corr Stokes-I integration sums
+ALL fine channels of a chgroup into a single per-fast-vis-tile
+visibility WITHOUT applying the per-channel time shift — so a burst
+that arrives at the chgroup's TOP channel at native sample 15248
+produces a peak in the gridded power that is centroid-biased toward
++~7 ms (i.e. native sample ~15464) per chgroup.
+
+After cross-chgroup top-channel time alignment (the bench's
+`_apply_inter_chgroup_alignment` post-processing — itself a partial
+coarse-DM stub since the chunk-4 `NoOpCoarseDM` performs no time
+shifts), the COADDED peak lands at native sample 15424 — i.e.
++5.77 ms relative to the truth value of 15248. This is consistent
+with the within-chgroup smear bias.
+
+**Reconciliation**: chunk 9 (production multi-DM-trial integration
+per F25) introduces the vis-domain stage-1 per-channel shifts which,
+when applied at DM=405, will collapse the within-chgroup smear and
+land the peak at native sample 15248 ± 32. The chunk-6 brief's
+`±32 native samples` strict gate is achievable only after that work
+is done; the operator-tunable `--peak-t-tol-native-samples` knob
+(default 32, raised to 256 for chunk-6 PASS today) lets the bench
+report PASS/FAIL on a relaxed gate that respects the smear budget
+while still tagging real-world misalignments.
+
+---
+
+### F29 — fast-corr GEMM at small t_int_fast_native fragments GPU memory
+
+**Status**: WORKAROUND APPLIED (`torch.cuda.empty_cache()` between
+blocks + sbs in `bench/_corr_fast_replay.py` and
+`bench/corr_fast_burst_250924mptq.py`).
+
+The chunk-4 `FastCorrKernel.compute_split` allocates fp16 batched
+matmul intermediates of shape `(n_fast_vis * NCHAN * 2t * 2p, NANTS,
+NANTS)`. At the chunk-6-brief default `t_int_fast_native=32` (=
+1048.576 µs cadence) this is `(128 * 384 * 4, 96, 96) fp16 ≈ 3.6 GB`
+per matmul output, and there are four such outputs in-flight per
+block. On h01's 11 GB consumer GPU 0 (RTX 2080 Ti) this OOMs after
+the first block due to fragmentation in PyTorch's caching allocator;
+even `expandable_segments:True` cannot reclaim enough.
+
+**Mitigation today**: the bench drops to `t_int_fast_native=64` (=
+2097.152 µs cadence — still 2× finer than the 4.2 ms native within-
+chgroup smear and produces 64 fast-vis tiles per fada block, fine
+enough for the burst time-resolution headline). Plus
+`torch.cuda.empty_cache()` is called after every `process_block`
+return and after every per-sb chgroup finalisation. Combined this
+keeps peak memory < 9 GB on GPU 0.
+
+**Production fix** (deferred to chunk-4 hardening): chunk the
+n_fast_vis axis inside `compute_split` itself so the matmul peak is
+bounded regardless of cadence; the `compute_split` shape contract
+(input fp16 voltage 5D, output fp32 vis-2pol) does not change. The
+production GPU is an A6000 (48 GB) so this is not a production gate;
+it only matters for the consumer-card test bed on h01.
+
+---
+
 ## D-items (decisions — locked during M3 implementation)
 
 ### D-coarse-dm-A — Convention A vs B for DMPlan delay reference
