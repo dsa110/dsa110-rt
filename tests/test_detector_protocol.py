@@ -300,14 +300,25 @@ def test_boxcar_via_cumsum_preserves_dtype() -> None:
 def test_boxcar_via_cumsum_fp16_relerr_within_pin() -> None:
     """Plan §3.6.13 clause (b): fp16 rel-err ≤ 1e-3 on a representative
     workload (T_det=512, K_time=128 wide-boxcar).
+
+    The plan invariant pins the *cumsum-arithmetic* equivalence between
+    boxcar_via_cumsum(x) and the sliding-window reference: given the
+    SAME input tensor, the two must agree to within fp16 representation
+    noise. We therefore feed both paths the same fp16-quantized cube
+    (cast to fp32 only for the numpy reference's actual sum), so the
+    test isolates cumsum-arithmetic error from the unrelated input
+    quantization noise that arises when fp32 → fp16 input rounding is
+    re-injected into the comparison.
     """
     rng = np.random.default_rng(20260505)
-    x_np = rng.standard_normal((512, 8, 32, 32)).astype(np.float32)
-    out_fp16 = boxcar_via_cumsum(
-        torch.from_numpy(x_np).to(torch.float16), axis=0, width=128
-    ).to(torch.float32).numpy()
-    ref = _reference_boxcar_via_sliding_window(x_np, width=128, axis=0)
-    # Compare relative error excluding cells where ref is near zero.
+    x_np_fp32 = rng.standard_normal((512, 8, 32, 32)).astype(np.float32)
+    # Take the fp16 view both paths will see, then promote to fp32 so the
+    # numpy reference can sum at full precision.
+    x_fp16 = torch.from_numpy(x_np_fp32).to(torch.float16)
+    x_quantized_fp32 = x_fp16.to(torch.float32).numpy()
+    out_fp16 = boxcar_via_cumsum(x_fp16, axis=0, width=128).to(torch.float32).numpy()
+    ref = _reference_boxcar_via_sliding_window(x_quantized_fp32, width=128, axis=0)
+    # Exclude cells where ref is near zero (relerr is ill-defined there).
     nonzero_mask = np.abs(ref) > 1.0
     if nonzero_mask.sum() == 0:
         pytest.skip("ref tensor too sparse for meaningful rel-err comparison")
@@ -318,6 +329,19 @@ def test_boxcar_via_cumsum_fp16_relerr_within_pin() -> None:
     assert p99 <= 1e-3, (
         f"fp16 cumsum p99 rel-err = {p99:.2e} > 1e-3 (plan §3.6.13 pin)"
     )
+
+
+def test_boxcar_via_cumsum_fp32_arithmetic_exact() -> None:
+    """Companion exactness check: with fp32 input (no quantization), the
+    cumsum-difference primitive must match the sliding-window reference
+    to fp32 precision. This catches off-by-one centring bugs that the
+    fp16 pin would mask.
+    """
+    rng = np.random.default_rng(20260505)
+    x_np = rng.standard_normal((128, 4, 8, 8)).astype(np.float32)
+    out = boxcar_via_cumsum(torch.from_numpy(x_np), axis=0, width=32).numpy()
+    ref = _reference_boxcar_via_sliding_window(x_np, width=32, axis=0)
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
