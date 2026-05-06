@@ -243,16 +243,23 @@ additional `T2.dm` field is the burst's known DM; the burst position is
 dump-start MJD for ≤32 s of LST drift, which is negligible for `(l, m)`
 acceptance per F19/D18 from the M2 carryover).
 
-**Active fixtures**:
+**Active fixtures** (the on-disk file PREFIX may differ from the directory
+name — the run-id embedded in `<prefix>_sb<NN>_data.out` is the legacy
+DSA-110 trigger ID, which is sometimes shortened in the parent directory
+name; benches glob `*_sb*_data.out` rather than assuming prefix == dir):
 
-- `0319/` — continuum fixture (3C-class compact source 0319+415,
-  `T2_0319bbb.json`). M2 acceptance fixture; M3 reuses for the continuum
-  imager check (§8 line 2282).
-- `250924mptq/` — burst fixture (DM≈404.7 pc/cc, RA=307.78°, Dec=53.85°,
-  MJD=60942.172, SNR≈30, `T2_250924mptq.json` carries `dm`/`ra`/`dec`/
-  `mjds`/`specnum`). Used for the M3 burst sub-DoD (§8 line 2286), the M3
-  16-chgroup alignment preview (§8 line 2291), and the M5 voltage-fixture
-  end-to-end gate (§8 line 2330).
+- `0319/` — continuum fixture (3C-class compact source 0319+415; on-disk
+  prefix is `0319bbb`, T2 file is `T2_0319bbb.json`). M2 acceptance
+  fixture; M3 reuses for the continuum imager check (§8 line 2282).
+  **KNOWN DATA GAP**: missing `sb12`; only 15 of 16 SBs present
+  (sb00..sb11 + sb13..sb15). M2's dispatcher worked around this by
+  skipping sb12; M3 + M5 should do the same.
+- `250924mptq/` — burst fixture; on-disk prefix matches dir name, T2 is
+  `T2_250924mptq.json`. T2 carries `dm`=404.688 pc/cc, `ra`=307.776667°,
+  `dec`=53.848986°, `mjds`=60942.172498, `specnum`=17254656, `snr`=30.
+  All 16 SBs present. Used for the M3 burst sub-DoD (§8 line 2286), the
+  M3 16-chgroup alignment preview (§8 line 2291), and the M5
+  voltage-fixture end-to-end gate (§8 line 2330).
 
 ### 5.1 Burst-fixture test config recipe (250924mptq)
 
