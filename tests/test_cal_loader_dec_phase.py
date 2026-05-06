@@ -3,20 +3,46 @@
 See M3_PLAN_FIXES.md F21 for design + the four acceptance criteria
 (F21.1 through F21.4) implemented here.
 
-Math summary:
-* Source at (HA=0, dec=δ_src) produces per-antenna voltage phase
-  ``φ_a(f) = −2π f · sin(δ_src − φ_lat) · N_a / c``  (N-S baseline only;
-  HA=0 so E-W and U components cancel for the planar DSA-110 core).
-* Visibility per F18 is ``V_ab = E_a^* · E_b`` so the visibility phase
-  is ``+2π f · sin(δ_src − φ_lat) · (N_a − N_b) / c``  (i.e. the
-  *opposite sign* of the per-antenna voltage phase, *and* the
-  per-baseline N is N_a−N_b not N_b−N_a; the latter follows from
-  ``conj(E_a) · E_b = exp(+i φ_a) · exp(+i φ_b · 0)`` etc — see
-  derivation in F21.1's docstring).
-* The F21 cal weight ``W_a(f) = exp(−2π i f · sin(δ_obs − φ_lat) · N_a / c)``
-  pre-multiplies E_a → ``E_a^cal = W_a · E_a``. Per-antenna phase becomes
-  ``φ_a^cal = φ_a + arg(W_a) = −2π f · (sin(δ_src − φ_lat) − sin(δ_obs − φ_lat))
-  · N_a / c``. With δ_obs = δ_src this is identically zero (F21.1).
+Math summary (TMS Eq. 3.19 with planar DSA-110 core convention)
+==============================================================
+
+For a source at (HA=0, dec=δ_src) with δ_src > φ_lat (north of zenith),
+the local ENU source direction is ``s = (0, sin(δ_src − φ_lat),
+cos(δ_src − φ_lat))``. The geometric path-difference at antenna a
+(position ``(E_a, N_a, U_a)``) is ``r_a · s = N_a sin(δ_src − φ_lat)
++ U_a cos(δ_src − φ_lat)``. The wavefront arrives at antenna a with
+delay ``τ_a = −r_a · s / c`` (sign: antennas with positive r·s are
+"out front" and see the wavefront first ⇒ negative delay relative to
+the array origin).
+
+Convention ``E_origin(t) = exp(+i 2π ν t)`` (positive frequency in
+the exponent) gives:
+
+    E_a(t) = E_origin(t − τ_a) = exp(+i 2π ν t) · exp(+i 2π ν · r_a · s / c)
+
+For DSA-110's planar core (U_a ≈ 0) at HA=0:
+
+    **E_a(f) = exp(+2π i f · sin(δ_src − φ_lat) · N_a / c)**
+
+(POSITIVE sign in the per-antenna voltage exponent — TMS convention.)
+
+The F21 cal weight cancels this geometric phase per antenna:
+
+    **W_a(f) = exp(−2π i f · sin(δ_obs − φ_lat) · N_a / c)**
+
+so ``E_a^cal = W_a · E_a = exp(+2π i f · (sin(δ_src − φ_lat) −
+sin(δ_obs − φ_lat)) · N_a / c)``. With δ_obs = δ_src the post-cal
+voltage phase is identically zero (F21.1).
+
+Visibility (F18 convention ``V_ab = conj(E_a^cal) · E_b^cal`` for
+``a < b``):
+
+    arg(V_ab) = +2π f · (sin(δ_src − φ_lat) − sin(δ_obs − φ_lat))
+                  · (N_b − N_a) / c
+
+(POSITIVE sign, baseline ordering ``N_b − N_a`` per F18 — F21.2 pins
+this to ≤ 1e-10 rad against the predicted formula across multiple
+baselines and channels.)
 """
 
 from __future__ import annotations
@@ -71,12 +97,15 @@ def _synthetic_voltage_for_source(
     sin_delta = math.sin(src_dec_rad - PHI_LAT_OVRO_RAD)
     n_a = antpos_n.astype(np.float64, copy=False)
 
-    # Per-antenna voltage phase: φ_a(f) = −2π f · sin(δ_src − φ_lat) · N_a / c
+    # Per-antenna voltage phase per TMS / F21 module-docstring derivation:
+    # φ_a(f) = +2π f · sin(δ_src − φ_lat) · N_a / c
+    # (POSITIVE sign in voltage exponent; cancelled by the F21 cal weight
+    # which has NEGATIVE sign per the bfCorr-iArm==1 / central-beam fold.)
     arg = (
-        -2.0 * math.pi * sin_delta / SPEED_OF_LIGHT_M_S
+        +2.0 * math.pi * sin_delta / SPEED_OF_LIGHT_M_S
         * f_hz[None, :] * n_a[:, None]
     )                                                       # (NANTS, NCHAN)
-    phase = np.exp(1j * arg)
+    phase = np.cos(arg) + 1j * np.sin(arg)
     e = (amplitude * phase).astype(np.complex128)            # (NANTS, NCHAN)
     return np.broadcast_to(
         e[:, :, None], (NANTS, NCHAN_PER_CHGROUP, NPOL)
@@ -154,21 +183,28 @@ def test_F21_1_on_source_cal_cancels_voltage_phase() -> None:
         chgroup=chgroup,
         obs_dec_rad=obs_dec_rad,
         antpos_n=antpos_n,
-    )                                                        # (NANTS, NCHAN) complex64
+    )                                                        # (NANTS, NCHAN) complex128
+    assert dec_phase.dtype == np.complex128, (
+        "compute_dec_phase must return complex128 to keep the F21 fold "
+        "at full fp64 precision; cplx64 cast happens later in the pipeline."
+    )
     gains_fine = np.broadcast_to(
         dec_phase[:, :, None], (NANTS, NCHAN_PER_CHGROUP, NPOL)
-    ).astype(np.complex128)
+    )                                                        # already complex128
 
     post_cal = voltages * gains_fine                         # (NANTS, NCHAN, NPOL)
 
     # Every cell has unit modulus (no amplitude effects in this test);
-    # phase should be 0 exactly to numerical precision in fp64.
-    assert np.allclose(np.abs(post_cal), 1.0, atol=1e-10)
+    # phase should be 0 to fp64 precision.
+    assert np.allclose(np.abs(post_cal), 1.0, atol=1e-12)
     phases = np.angle(post_cal)
     max_phase_residual = float(np.max(np.abs(phases)))
-    assert max_phase_residual < 1e-10, (
+    # Tolerance: for the high-cycle regime arg ~ 700 rad, fp64
+    # transcendental precision is ~ulp(arg) · cos(arg) ≈ 1e-13. Allow
+    # 1e-11 to absorb compound rounding through the multiplication.
+    assert max_phase_residual < 1e-11, (
         f"max post-cal phase residual = {max_phase_residual:.3e} rad "
-        f"(expected ≤ 1e-10); the F21 fold has a sign / scaling error."
+        f"(expected ≤ 1e-11); the F21 fold has a sign / scaling error."
     )
 
 
@@ -213,10 +249,10 @@ def test_F21_2_off_dec_source_residual_phase_predicts_image_shift() -> None:
         chgroup=chgroup,
         obs_dec_rad=obs_dec_rad,                            # phase to obs_dec
         antpos_n=antpos_n,
-    )
+    )                                                        # complex128
     gains_fine = np.broadcast_to(
         dec_phase[:, :, None], (NANTS, NCHAN_PER_CHGROUP, NPOL)
-    ).astype(np.complex128)
+    )
     post_cal = voltages * gains_fine                         # (NANTS, NCHAN, NPOL)
 
     # Pick a few representative baselines (skip self-baselines).
@@ -231,18 +267,19 @@ def test_F21_2_off_dec_source_residual_phase_predicts_image_shift() -> None:
     )
 
     for (a, b) in baselines:
-        # Per F18: V_ab = conj(E_a) · E_b for a < b. We choose pol 0; both
-        # pols have identical phase per the unpolarised source.
+        # Per F18: V_ab = conj(E_a) · E_b for a < b. We choose pol 0;
+        # both pols have identical phase per the unpolarised source.
         v_ab = np.conj(post_cal[a, :, 0]) * post_cal[b, :, 0]   # (NCHAN,)
         observed_phase = np.angle(v_ab)                      # (NCHAN,) rad
 
-        # Predicted: combining per-antenna phases φ_a^cal − φ_b^cal where
-        #   φ_a^cal = -2π f · (sin(δ_src − φ_lat) − sin(δ_obs − φ_lat)) · N_a / c
-        # gives V_ab phase = +2π f · (sin(δ_src − φ_lat) − sin(δ_obs − φ_lat))
-        #                       · (N_a − N_b) / c
+        # Predicted (see module-docstring derivation):
+        #   φ_a^cal = +2π f · (sin(δ_src − φ_lat) − sin(δ_obs − φ_lat)) · N_a / c
+        #   arg(V_ab) = -φ_a^cal + φ_b^cal
+        #             = +2π f · (sin(δ_src − φ_lat) − sin(δ_obs − φ_lat))
+        #                · (N_b − N_a) / c
         predicted_phase = (
             +2.0 * math.pi * (sin_src - sin_obs) / SPEED_OF_LIGHT_M_S
-            * f_hz * (n_a[a] - n_a[b])
+            * f_hz * (n_a[b] - n_a[a])
         )
 
         # Wrap both to (-π, π] for comparison.
@@ -251,7 +288,7 @@ def test_F21_2_off_dec_source_residual_phase_predicts_image_shift() -> None:
         assert max_residual < 1e-10, (
             f"baseline ({a}, {b}): max visibility-phase residual "
             f"{max_residual:.3e} rad (expected ≤ 1e-10). "
-            f"F21 fold sign / scaling does not match the bfCorr eq."
+            f"F21 fold sign / scaling does not match the predicted formula."
         )
 
 
@@ -262,82 +299,101 @@ def test_F21_2_off_dec_source_residual_phase_predicts_image_shift() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_F21_3_resolved_pair_no_flip_relative_to_F20() -> None:
-    """Two sources straddling obs_dec recover at the predicted m-axis pixels
-    (and same sign as the prediction — the F20 (u, v) negation in
-    grid_uv_natural already canonicalises (l, m) per TMS / CASA, so any
-    sign-flip introduced by F21 would manifest as the two sources
-    swapping sides on the image m-axis).
+def test_F21_3_two_sources_straddling_obs_dec_have_opposite_phase_slopes() -> None:
+    """Sources at obs_dec ± Δδ produce opposite-sign visibility-phase slopes.
 
-    This is a *visibility-plane* test (no actual gridder/iFFT used —
-    that's covered by tests/test_voltage_fixture_slow_corr_smoke.py
-    end-to-end). Here we verify that for a source at +Δδ from obs_dec,
-    the visibility phase increases linearly with N_b − N_a in the same
-    sense as bfCorr predicts; and for a source at −Δδ it decreases with
-    the same magnitude. If F21 introduced a parity flip, the two
-    sources' phase-vs-N curves would NOT be mirror-symmetric.
+    Setup:
+      * obs_dec = 45°
+      * Two source decs: δ_+ = obs_dec + Δδ (north of phase centre),
+                         δ_− = obs_dec − Δδ (south of phase centre)
+        with Δδ small enough that the linear (small-angle) regime holds
+        per-baseline at fp64 precision (Δδ = 1e-3 rad ≈ 0.057° ⇒
+        non-linear correction is at the ~Δδ²/2 ≈ 5e-7 relative level
+        — much tighter than the 1e-10 tolerance).
+      * For each source separately, compute the per-baseline post-cal
+        visibility phase at the mid-channel and compare against the
+        F21.2 predicted formula. Both must independently match — the
+        ``+Δδ ↔ −Δδ`` parity comes for free if both pass.
+
+    This is the parity guard against F20 / F21 sign interactions: F20
+    negates (u, v) inside ``grid_uv_natural`` to canonicalise (l, m)
+    per TMS / CASA. If F21 introduced a parity flip relative to that
+    convention, the predicted formula here (which derives the
+    visibility phase directly from F21 + F18) would still self-match,
+    but the downstream image plane would have its m-axis flipped. The
+    end-to-end M3 burst sub-DoD (§8 line 2286) catches that downstream
+    flip; this test catches the visibility-plane half (sign of the
+    per-baseline visibility-phase slope wrt source dec).
     """
     chgroup = 0
     obs_dec_rad = math.radians(45.0)
-    delta_rad = 0.05                                        # ~2.86°
+    delta_rad = 1.0e-3                                      # ~0.057°, linear regime
     antpos_n = _antpos_n_realistic()
 
     cal_phase = compute_dec_phase(
         chgroup=chgroup,
         obs_dec_rad=obs_dec_rad,
         antpos_n=antpos_n,
-    )
+    )                                                        # complex128
     gains = np.broadcast_to(
         cal_phase[:, :, None], (NANTS, NCHAN_PER_CHGROUP, NPOL)
-    ).astype(np.complex128)
+    )
 
     n_a = antpos_n.astype(np.float64, copy=False)
     sin_obs = math.sin(obs_dec_rad - PHI_LAT_OVRO_RAD)
-    f_hz_mid = freq_GHz(chgroup, NCHAN_PER_CHGROUP // 2) * 1.0e9   # use mid-channel for clarity
+    mid_ch = NCHAN_PER_CHGROUP // 2
+    f_hz_mid = freq_GHz(chgroup, mid_ch) * 1.0e9
 
-    sin_plus = math.sin(obs_dec_rad + delta_rad - PHI_LAT_OVRO_RAD)
-    sin_minus = math.sin(obs_dec_rad - delta_rad - PHI_LAT_OVRO_RAD)
+    # Pick a few representative baselines spanning the antpos range.
+    baselines = [(0, 47), (5, 90), (20, 70), (1, 95), (3, 17)]
 
-    # Voltages and post-cal phases for each source separately.
-    plus_vals = []
-    minus_vals = []
-    for src_sign, sin_src, store in [
-        (+1, sin_plus, plus_vals),
-        (-1, sin_minus, minus_vals),
-    ]:
+    for src_sign in (+1.0, -1.0):
         src_dec_rad = obs_dec_rad + src_sign * delta_rad
-        v = _synthetic_voltage_for_source(
+        sin_src = math.sin(src_dec_rad - PHI_LAT_OVRO_RAD)
+
+        voltages = _synthetic_voltage_for_source(
             chgroup=chgroup,
             src_dec_rad=src_dec_rad,
             antpos_n=antpos_n,
         )
-        post_cal = v * gains
-        # All baselines (a, b) with a < b — collect visibility phase at one freq.
-        for a in range(0, NANTS, 19):
-            for b in range(a + 1, NANTS, 19):
-                v_ab = (
-                    np.conj(post_cal[a, NCHAN_PER_CHGROUP // 2, 0])
-                    * post_cal[b, NCHAN_PER_CHGROUP // 2, 0]
-                )
-                store.append((a, b, np.angle(v_ab)))
+        post_cal = voltages * gains                          # (NANTS, NCHAN, NPOL)
 
-    # For each baseline that appears in both source's lists, check the
-    # phases are equal in magnitude and OPPOSITE in sign (mirror about
-    # zero). If F21 had a sign flip, we'd see them with the SAME sign
-    # for the same Δδ, breaking this test.
-    plus_dict = {(a, b): p for (a, b, p) in plus_vals}
-    minus_dict = {(a, b): p for (a, b, p) in minus_vals}
-    common = sorted(set(plus_dict) & set(minus_dict))
-    assert len(common) >= 5, "test setup error: not enough baselines"
-    max_asym = 0.0
-    for (a, b) in common:
-        # Sum of phases should be ~0 (mirror-symmetric).
-        s = np.angle(np.exp(1j * (plus_dict[(a, b)] + minus_dict[(a, b)])))
-        max_asym = max(max_asym, abs(s))
-    assert max_asym < 1e-9, (
-        f"max +Δδ vs −Δδ phase-sum residual = {max_asym:.3e} rad "
-        f"(expected ≤ 1e-9). The F21 fold is NOT mirror-symmetric "
-        f"about obs_dec; likely a parity bug relative to F20."
+        for (a, b) in baselines:
+            v_ab = (
+                np.conj(post_cal[a, mid_ch, 0])
+                * post_cal[b, mid_ch, 0]
+            )
+            observed_phase = float(np.angle(v_ab))
+            predicted_phase = (
+                +2.0 * math.pi * (sin_src - sin_obs) / SPEED_OF_LIGHT_M_S
+                * f_hz_mid * (n_a[b] - n_a[a])
+            )
+            diff = float(np.angle(np.exp(1j * (observed_phase - predicted_phase))))
+            assert abs(diff) < 1e-10, (
+                f"src_sign={src_sign:+.0f}Δδ baseline=({a},{b}): "
+                f"observed={observed_phase:.6e}, predicted={predicted_phase:.6e}, "
+                f"diff={diff:.3e} rad (expected ≤ 1e-10). "
+                f"F21 ↔ F18 sign convention or parity is broken."
+            )
+
+    # Sanity: confirm Δδ is small enough that |predicted_phase|
+    # actually has opposite signs for ±Δδ on at least one baseline at
+    # this mid-channel — otherwise the test trivially passes by
+    # symmetry around 0.
+    a, b = baselines[0]
+    sin_plus = math.sin(obs_dec_rad + delta_rad - PHI_LAT_OVRO_RAD)
+    sin_minus = math.sin(obs_dec_rad - delta_rad - PHI_LAT_OVRO_RAD)
+    pred_plus = (
+        +2.0 * math.pi * (sin_plus - sin_obs) / SPEED_OF_LIGHT_M_S
+        * f_hz_mid * (n_a[b] - n_a[a])
+    )
+    pred_minus = (
+        +2.0 * math.pi * (sin_minus - sin_obs) / SPEED_OF_LIGHT_M_S
+        * f_hz_mid * (n_a[b] - n_a[a])
+    )
+    assert pred_plus * pred_minus < 0, (
+        "test sanity broken: predicted +Δδ and −Δδ phases have the same "
+        "sign — pick a different baseline, mid-channel, or Δδ."
     )
 
 
@@ -364,24 +420,29 @@ def test_F21_4_bfcorr_round_trip_central_beam() -> None:
     ``calc_weights`` line 1159. Substituting and simplifying gives
     exactly the F21 formula in :func:`compute_dec_phase`.
 
-    Tolerance: this is a pure-numpy (fp64 → complex64) vs C-eq
-    (transcribed in numpy) comparison; should match to fp32 precision.
-    The test budget is 1e-6 absolute on real and imag parts.
+        Tolerance: pure-fp64 vs pure-fp64 transcription of the same
+    formula. Should match to ~1e-12 (transcendental ulp accumulation
+    through the 638-rad arg). Test budget is 1e-11 absolute on real
+    and imag parts.
     """
     chgroup = 5                                              # mid-band; doesn't matter
     obs_dec_rad = math.radians(53.848986)                   # 250924mptq Dec
     antpos_n = _antpos_n_realistic()
 
-    # M3 implementation
+    # M3 implementation (returns complex128 — full fp64 precision)
     f21 = compute_dec_phase(
         chgroup=chgroup,
         obs_dec_rad=obs_dec_rad,
         antpos_n=antpos_n,
-    )                                                        # (NANTS, NCHAN) complex64
+    )                                                        # (NANTS, NCHAN) complex128
+    assert f21.dtype == np.complex128, (
+        "compute_dec_phase must return complex128 for the F21.4 "
+        "round-trip to match bfCorr to fp64 precision."
+    )
 
     # bfCorr reference formula transcribed from CU code, central beam
-    # (bm=127). PHI_LAT in degrees per the CU comment (37.23 — note the
-    # CU code uses 37.23, not 37.234, but the M2-validated Python
+    # (bm=127). PHI_LAT in degrees per the CU comment (37.23 — note
+    # the CU code uses 37.23, not 37.234, but the M2-validated Python
     # constant is 37.234 for full math.radians precision; both should
     # agree once we use the M2-calibrated constant in the python side
     # too. The bfCorr code's 37.23 is a 4-digit truncation that
@@ -402,26 +463,30 @@ def test_F21_4_bfcorr_round_trip_central_beam() -> None:
         # CU: afac = -2.*PI*fqs[fq]*sinf(theta)/CVAC
         afac = -2.0 * math.pi * f_hz * math.sin(theta) / cvac
         for a in range(NANTS):
-            arg = afac * antpos_n[a]
+            arg = afac * float(antpos_n[a])
             bf_real[a, ch] = math.cos(arg)
             bf_imag[a, ch] = math.sin(arg)
 
-    f21_real = f21.real.astype(np.float64)
-    f21_imag = f21.imag.astype(np.float64)
+    f21_real = f21.real
+    f21_imag = f21.imag
 
     real_max_diff = float(np.max(np.abs(f21_real - bf_real)))
     imag_max_diff = float(np.max(np.abs(f21_imag - bf_imag)))
 
-    # complex64 ≈ 7-digit precision; allow 2e-7 to be safe for the
-    # outermost N_a · f product magnitudes (max ~ 3e10 m·Hz ≈ 30 GHz·m
-    # → ~100 cycles; precision of cos is ~ulp(1) = 1e-7).
-    assert real_max_diff < 2.0e-7, (
+    # fp64 transcendental at arg ~ 638 rad: ulp(arg) ≈ 7e-14;
+    # trig precision ~ulp(arg) per the libm error contract; cos / sin
+    # output near unit magnitude has absolute error ~7e-14. Allow
+    # 1e-11 to absorb compound rounding through the multiplication
+    # chain (-2π · sin_delta / c · f · N_a) which has ~5 fp ops, each
+    # ~1 ulp ≈ 2e-16 relative ⇒ ~1e-15 cumulative on the final arg ⇒
+    # cos/sin error ≈ arg · 1e-15 ≈ 6e-13. Margin x16.
+    assert real_max_diff < 1.0e-11, (
         f"F21 vs bfCorr real-part max diff = {real_max_diff:.3e} "
-        f"(expected ≤ 2e-7); sign-convention or formula mismatch."
+        f"(expected ≤ 1e-11); sign-convention or formula mismatch."
     )
-    assert imag_max_diff < 2.0e-7, (
+    assert imag_max_diff < 1.0e-11, (
         f"F21 vs bfCorr imag-part max diff = {imag_max_diff:.3e} "
-        f"(expected ≤ 2e-7); sign-convention or formula mismatch."
+        f"(expected ≤ 1e-11); sign-convention or formula mismatch."
     )
 
 
@@ -532,14 +597,26 @@ def test_F21_load_cal_with_dec_phase_e2e() -> None:
 
     # In both cases the geometric (F21 + voltage) phase has been
     # cancelled, so what remains is just the cal-blob's intrinsic
-    # complex gain. The two should agree element-wise (within fp32
-    # precision).
-    max_abs_diff = float(np.max(np.abs(post_cal - post_cal_zenith)))
+    # complex gain. The two should agree element-wise modulo the
+    # cal-tensor fp32 cast precision (~ulp at unit magnitude, ~1.2e-7).
+    # Skip cells where the cal blob is exactly zero (CASA-flagged
+    # solutions; both sides agree on those by construction but the
+    # post-cal value is 0 ± noise).
+    cal_blob_zero_mask = (
+        np.abs(out.raw_bf_weights.gains) == 0.0
+    )                                                        # (96, 48, 2)
+    cal_blob_zero_fine = np.repeat(cal_blob_zero_mask, 8, axis=1)  # (96, 384, 2)
+    valid_mask = ~cal_blob_zero_fine
+
+    diff = post_cal - post_cal_zenith                        # (NANTS, NCHAN, NPOL)
+    max_abs_diff = float(np.max(np.abs(diff[valid_mask])))
     # cal-blob intrinsic gains have magnitude 1 (phase-only) so any
     # F21 sign/scaling error would show up here as an O(1) residual.
-    assert max_abs_diff < 1.0e-4, (
+    # fp32 precision allows ~1e-6 per cell; allow 1e-5 for compound
+    # rounding through the broadcast / multiplication chain.
+    assert max_abs_diff < 1.0e-5, (
         f"E2E cancellation test: max diff = {max_abs_diff:.3e} "
-        f"(expected ≤ 1e-4 for fp32). The F21 fold either has a "
+        f"(expected ≤ 1e-5 for fp32). The F21 fold either has a "
         f"sign error in the loader path or doesn't compose correctly "
         f"with the cal blob."
     )

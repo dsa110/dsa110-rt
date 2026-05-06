@@ -238,7 +238,8 @@ def compute_dec_phase(
     Returns
     -------
     np.ndarray
-        Shape ``(NANTS, NCHAN_PER_CHGROUP)`` complex64. Each element
+        Shape ``(NANTS, NCHAN_PER_CHGROUP)`` **complex128** (full fp64
+        precision). Each element
 
         .. math::
             \\exp\\!\\left(-2\\pi i \\cdot f[\\mathrm{ch}] \\cdot
@@ -250,11 +251,15 @@ def compute_dec_phase(
 
     Notes
     -----
-    Always evaluated at float64 precision internally; the returned
-    array is downcast to complex64 (the same precision as
-    :class:`dsart.cal.bf_weights.BfWeights.gains`) so it can be
-    multiplied straight into the cal array without dtype-promotion
-    surprises.
+    Returns complex128 (NOT complex64) so the F21 fold preserves full
+    fp64 precision through the cal-blob multiply in
+    :func:`load_cal_with_dec_phase`. The fp16/fp32 cast for the GEMM
+    happens inside :func:`make_cal_broadcast_tensors`, which is the
+    single place where the cal-tensor precision is lossily reduced.
+    Callers writing tests can compare complex128 outputs against the
+    analytical formula to ~1e-13 rad; downstream production code
+    operates on the fp16 broadcast tensors with no visible precision
+    difference vs the complex64 path (the fp16 cast dominates).
     """
     if not 0 <= chgroup < 16:
         raise ValueError(f"chgroup={chgroup}, expected 0..15")
@@ -278,7 +283,11 @@ def compute_dec_phase(
         * f_hz[None, :] * n_a[:, None]
     )                                                       # (NANTS, NCHAN_PER_CHGROUP)
 
-    return np.exp(1j * arg).astype(np.complex64)
+    # Compute cos / sin separately (instead of np.exp(1j*arg)) — gives
+    # numerically identical results to math.cos/math.sin per element,
+    # avoids any range-reduction subtleties in libm's complex exp for
+    # large pure-imaginary arguments.
+    return (np.cos(arg) + 1j * np.sin(arg)).astype(np.complex128)
 
 
 # ---------------------------------------------------------------------------
@@ -359,15 +368,19 @@ def load_cal_with_dec_phase(
     gains = maybe_swap_pol(gains, swap=pol_swap)
     gains_fine = upsample_coarse_to_fine(gains)             # (96, 384, 2)
 
-    dec_phase = compute_dec_phase(                          # (96, 384) complex64
+    dec_phase = compute_dec_phase(                          # (96, 384) complex128
         chgroup=chgroup,
         obs_dec_rad=obs_dec_rad,
         antpos_n=bfw.antpos_n,
     )
-    # Broadcast over pol axis. Gain × DEC-phase is associative + commutative
-    # (both are scalar complex multiplications per cell).
+    # Broadcast over pol axis. Gain × DEC-phase is associative +
+    # commutative (both are scalar complex multiplications per cell).
+    # Multiply in complex128 for precision (gains_fine is cplx64; the
+    # cplx64 → cplx128 promotion costs 6 MB of transient memory and
+    # avoids ulp-noise accumulation in the high-cycle regime where
+    # arg = 2π · f · sin(δ-φ) · N_a / c can reach ~700 rad).
     gains_fine_with_dec = (
-        gains_fine * dec_phase[:, :, None]
+        gains_fine.astype(np.complex128) * dec_phase[:, :, None]
     ).astype(np.complex64)                                  # (96, 384, 2)
 
     cal_real, cal_imag = make_cal_broadcast_tensors(
