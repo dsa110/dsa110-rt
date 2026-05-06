@@ -50,6 +50,7 @@ from dsart.rfi.group_outlier import DEFAULT_GROUP_K, group_outlier_mask
 from dsart.rfi.sk import (
     DEFAULT_SK_FAR,
     compute_sk,
+    gaussian_sk_thresholds,
     sk_combined_mask,
     sk_mask,
     sk_thresholds,
@@ -71,6 +72,7 @@ __all__ = [
     # SK
     "DEFAULT_SK_FAR",
     "compute_sk",
+    "gaussian_sk_thresholds",
     "sk_combined_mask",
     "sk_mask",
     "sk_thresholds",

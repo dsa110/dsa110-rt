@@ -260,7 +260,7 @@ def compute_autos_from_complex(
     """
     if voltages.ndim != 4:
         raise ValueError(
-            f"voltages must be 4-dim (NANTS, NCHAN, NPOL, NTIME); "
+            f"voltages must be 4-dim (n_ant, n_ch, n_pol, n_time); "
             f"got shape {tuple(voltages.shape)}"
         )
     if not voltages.is_complex():
@@ -268,19 +268,21 @@ def compute_autos_from_complex(
             f"voltages must be complex; got dtype {voltages.dtype}"
         )
     n_ant, n_ch, n_pol, n_time = voltages.shape
-    # NPOL is hard-coded to 2 throughout downstream RFI / Stokes-I pol
-    # collapse; n_ant is left unconstrained so synthetic tests can use
-    # smaller antenna counts (production callers always pass NANTS=96).
     if n_pol != NPOL:
         raise ValueError(
-            f"voltages shape {tuple(voltages.shape)}: NPOL axis must "
-            f"be {NPOL}, got {n_pol}"
+            f"voltages shape {tuple(voltages.shape)}: NPOL axis "
+            f"must be {NPOL}, got {n_pol}"
         )
     if n_ant <= 0:
         raise ValueError(
             f"voltages shape {tuple(voltages.shape)}: NANTS axis must "
             f"be positive, got {n_ant}"
         )
+    # Note: this helper accepts arbitrary n_ant / n_ch (tests use
+    # smaller dimensions for speed). The GEMM-layout entry
+    # ``compute_autos`` similarly accepts arbitrary spatial dimensions
+    # via ``_check_voltage_layout`` so synthetic test cubes work in
+    # both code paths.
 
     for m in m_values:
         if m <= 0 or n_time % m != 0:

@@ -205,29 +205,22 @@ def test_sk_thresholds_monotone() -> None:
 
 
 def test_sk_thermal_noise_far() -> None:
-    """Pure thermal noise voltages → SK FAR within the per-M Gaussian-
-    approximation envelope (M3_PLAN_FIXES.md F23).
+    """Pure thermal noise voltages → SK FAR ≤ 2 × target.
 
     "1000-block sample" interpreted as enough cells that the rate
     estimate is statistically meaningful at the target FAR. We use a
     smaller-per-block, more-blocks configuration so the test runs in
     a few seconds on CPU.
 
-    The exact Nita-Gary 2010 SK distribution is right-skewed for low
-    M; the Gaussian approximation (sk_thresholds) underestimates the
-    upper-tail mass at M=64, which inflates the *measured* per-M FAR
-    beyond the nominal target. The per-M bounds below are calibrated
-    multipliers that envelope the empirical leak, not the asymptotic
-    ``2 × FAR`` bound. The exact-Nita-Gary chi-squared upgrade is
-    M3_PLAN_FIXES.md F23 (deferred to chunk 10 hardening); the
-    OR-fold across M-values + bandpass / group / sum-threshold post-
-    pass is the bound that matters in production.
+    Backed by the chunk-3c Monte-Carlo / Pearson-IV cached SK
+    thresholds in `src/dsart/rfi/sk.py` (commit 25c77ac, M3_PLAN_FIXES
+    F23 IMPLEMENTED). The Gaussian-asymptotic form was off by ~40× on
+    the upper tail at M=64 due to right-skew of the SK distribution;
+    the empirical-CDF lookup is tight to the nominal FAR within MC
+    sampling noise across all M ∈ {64, 256, 1024, 4096}.
     """
     far = 1e-4
-    # Per-M Gaussian-approximation tolerance (×FAR). M=64 has the
-    # heaviest right skew so the largest multiplier; M ≥ 256 are
-    # essentially Gaussian.
-    per_m_tol_x_far = {64: 50.0, 256: 10.0, 1024: 5.0, 4096: 5.0}
+    target_max = 2.0 * far
     # Smaller voltage block: 16 ants × 32 ch × 2 pol × 4096 t per block.
     # 100 blocks → 16·32·2·4096 = 4.2e6 cells per block × 100 = 4.2e8 cells.
     # That's 4.2e8 × FAR = 42000 expected false flags; σ ≈ √42000 ≈ 200 →
@@ -270,12 +263,9 @@ def test_sk_thermal_noise_far() -> None:
         n_acc = n_time // m
         cells = n_cells_total_per_m * n_acc
         rate = n_flags_per_m[m] / cells
-        target_max_m = per_m_tol_x_far[m] * far
-        assert rate <= target_max_m, (
-            f"M={m}: SK FAR {rate:.2e} > {per_m_tol_x_far[m]:.0f}× target "
-            f"({target_max_m:.2e}) — Gaussian-approx tolerance "
-            f"(M3_PLAN_FIXES.md F23) — (flags={n_flags_per_m[m]}, "
-            f"cells={cells})"
+        assert rate <= target_max, (
+            f"M={m}: SK FAR {rate:.2e} > 2× target {target_max:.2e} "
+            f"(flags={n_flags_per_m[m]}, cells={cells})"
         )
 
     # Combined OR-fold rate is bounded by sum of per-M rates × per-M
@@ -633,12 +623,6 @@ def test_combine_warmup_state_machine(tmp_path: Path) -> None:
     n_ch = 16
     n_pol = 2
     n_time = 4096
-    voltages = _random_complex_voltages(
-        n_ant=n_ant, n_ch=n_ch, n_pol=n_pol, n_time=n_time, sigma=1.0,
-    )
-    autos = compute_autos_from_complex(voltages, m_values=(4096,))
-    re_g, im_g = _gemm_layout_from_complex(voltages, n_packets=2048)
-    autos_full = compute_autos(re_g, im_g)
 
     flagger = RFIFlagger(
         flagants_path=None,
@@ -646,26 +630,39 @@ def test_combine_warmup_state_machine(tmp_path: Path) -> None:
     )
     headers = [MockTransportHeader() for _ in range(6)]
 
-    # Patch in our test-cube autos so we don't need to inflate to full
-    # NANTS-NCHAN dimensions.
-    # Easiest: monkey-patch flagger via autos_override. The combine
-    # path uses compute_autos internally, which validates shape == (NANTS,
-    # NCHAN, NPOL, ...). We supply an autos_override directly.
-    autos_for_inject = compute_autos_from_complex(
-        _random_complex_voltages(n_time=4096),
-    )
-
+    rng = np.random.default_rng(20260510)
     for i in range(6):
+        # Use compute_autos_from_complex at reduced size for speed; the
+        # combine path's flagants broadcast adapts to the autos shape.
+        re = rng.normal(0.0, 1.0 / math.sqrt(2.0),
+                        size=(n_ant, n_ch, n_pol, n_time))
+        im = rng.normal(0.0, 1.0 / math.sqrt(2.0),
+                        size=(n_ant, n_ch, n_pol, n_time))
+        voltages = torch.as_tensor((re + 1j * im).astype(np.complex64))
+        autos_for_inject = compute_autos_from_complex(voltages)
+
         result = flagger.flag_block(
             real=None, imag=None,
             autos_override=autos_for_inject,
             update_header=headers[i],
         )
+        # Output mask carries the autos' (n_ant, n_ch, n_pol) cube shape.
+        assert result.mask.shape == (n_ant, n_ch, n_pol)
         if i < 3:
-            assert result.warmup
-            assert headers[i].is_rfi_warming_up()
+            assert result.warmup, f"cube {i}: expected warmup=True"
+            assert headers[i].is_rfi_warming_up(), (
+                f"cube {i}: expected header.bit4 set"
+            )
+            # bandpass-outlier bypass: no source-tag bit 1<<1 set.
+            bp_bit = (
+                (result.source_tags & int(FlagSourceBit.BANDPASS_OUTLIER))
+                != 0
+            )
+            assert not bp_bit.any().item(), (
+                f"cube {i}: bandpass-outlier should be bypassed in warmup"
+            )
         else:
-            assert not result.warmup
+            assert not result.warmup, f"cube {i}: expected warmup=False"
             assert not headers[i].is_rfi_warming_up()
 
     flagger.reset_warmup()
