@@ -80,21 +80,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from dsart.common.constants import (
-    BLOCK_SAMPLES_NATIVE,
     K_DM_MS_GHZ2_PC,
     NATIVE_SAMPLE_US,
-    N_CHGROUP,
-    NCHAN_PER_CHGROUP,
     NU_CHGROUP_TOP_GHZ,
-    freq_GHz,
 )
 from dsart.coarse_dm.dm_plan import (
     DMPlan,
     build_chgroup_freq_table_GHz,
     compute_delay_native_samples_table,
 )
-from dsart.services.slow_corr_kernel import NPACKETS_PER_BLOCK
-from dsart.services.corr_fast_kernel import NTIMES_PER_PACKET
 
 from bench._corr_fast_replay import (
     ReplayDefaults,
