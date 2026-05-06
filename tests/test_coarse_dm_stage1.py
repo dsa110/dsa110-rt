@@ -45,7 +45,11 @@ import numpy as np
 import pytest
 import torch
 
-from dsart.coarse_dm.dm_plan import DMPlan
+from dsart.coarse_dm.dm_plan import (
+    DMPlan,
+    build_chgroup_freq_table_GHz,
+    compute_delay_native_samples_table,
+)
 from dsart.coarse_dm.stage1 import (
     apply_stage1_shifts,
     max_t_dedisp_for_plan,
@@ -73,14 +77,30 @@ def _make_test_plan(
 ) -> DMPlan:
     """Construct a small DMPlan for tests.
 
-    Uses ``DMPlan.build`` (not the canonical-DmPlan path) so tests
-    don't depend on the M2 contracts schema. Generates ``n_coarse``
-    DM trials linearly from 0 to ``dm_max_pc_cc``.
+    Manually wires the slim DMPlan dataclass fields (no canonical
+    DmPlan dependency) so tests don't require a full M2 ``dm_plan.npz``
+    fixture. Generates ``n_coarse`` DM trials linearly from
+    ``epsilon`` (avoiding the strictly-increasing constraint at 0)
+    to ``dm_max_pc_cc``.
     """
-    dm_pc_cc = np.linspace(0.0, dm_max_pc_cc, n_coarse).astype(np.float32)
-    return DMPlan.build(
+    if n_coarse == 1:
+        dm_pc_cc = np.array([dm_max_pc_cc], dtype=np.float64)
+    else:
+        # First entry must be >= 0; use 0 for the first, linspace
+        # for the rest. n_coarse >= 2 here.
+        dm_pc_cc = np.linspace(
+            0.0, dm_max_pc_cc, n_coarse,
+        ).astype(np.float64)
+    chgroup_freqs_GHz = build_chgroup_freq_table_GHz()
+    delay_table = compute_delay_native_samples_table(
+        dm_pc_cc, chgroup_freqs_GHz,
+    )
+    return DMPlan(
         dm_pc_cc=dm_pc_cc,
+        n_fine_per_coarse=1,
         t_int_fast_us=float(t_int_fast_us),
+        chgroup_freqs_GHz=chgroup_freqs_GHz,
+        _delay_native_samples_table=delay_table,
     )
 
 
@@ -649,8 +669,10 @@ def test_process_block_multi_dm_path_returns_N_DM_axis(_orchestrator_artifacts):
 def test_process_block_legacy_path_preserved_when_no_dm_plan():
     """When ``cfg.dm_plan_path`` is None and no plan is passed to
     ``build_context``, the chunk-4 legacy single-DM path is used —
-    output shape is ``(1, n_fv, N_filled)`` from the NoOpCoarseDM
-    stub."""
+    ``IntegrationOutput.gridded_minus_sky`` is 2D ``(n_fv, N_filled)``
+    matching the chunk-4 contract (the NoOpCoarseDM wrapping into
+    ``(1, n_fv, N_filled)`` is internal to the dedispersed cube
+    forwarded to stage-2 + transport, NOT what tests inspect here)."""
     from dsart.services.corr_fast_integration import (
         FastIntegrationConfig,
         build_context,
@@ -682,12 +704,11 @@ def test_process_block_legacy_path_preserved_when_no_dm_plan():
     )
     out = process_block(raw, ctx=ctx, block_n=1)
     g = out.gridded_minus_sky
-    # NoOpCoarseDM wraps gridded with [1, ...] axis → ndim 3
+    # Legacy path: 2D (n_fv, N_filled) — chunk-4 contract.
     assert g is not None
-    assert g.ndim == 3
-    assert g.shape[0] == 1
-    assert g.shape[1] == ctx.kernel.n_fast_vis_per_full_block
-    assert g.shape[2] == ctx.gridder.pattern.n_filled
+    assert g.ndim == 2
+    assert g.shape[0] == ctx.kernel.n_fast_vis_per_full_block
+    assert g.shape[1] == ctx.gridder.pattern.n_filled
 
 
 def test_process_block_multi_dm_static_sky_subtraction(tmp_path):

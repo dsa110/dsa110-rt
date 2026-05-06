@@ -78,7 +78,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dsart.coarse_dm.dm_plan import DMPlan
+from dsart.coarse_dm.dm_plan import (
+    DMPlan,
+    build_chgroup_freq_table_GHz,
+    compute_delay_native_samples_table,
+)
 from dsart.common.constants import (
     NANTS,
     NATIVE_SAMPLE_US,
@@ -280,10 +284,17 @@ def main(argv: list[str] | None = None) -> int:
     # falls in the middle of the trials.
     dm_pc_cc = np.linspace(
         0.0, 2.0 * args.dm_truth, args.n_coarse_dm,
-    ).astype(np.float32)
-    plan = DMPlan.build(
+    ).astype(np.float64)
+    chgroup_freqs_GHz = build_chgroup_freq_table_GHz()
+    delay_table = compute_delay_native_samples_table(
+        dm_pc_cc, chgroup_freqs_GHz,
+    )
+    plan = DMPlan(
         dm_pc_cc=dm_pc_cc,
+        n_fine_per_coarse=1,
         t_int_fast_us=float(args.t_int_fast_native * NATIVE_SAMPLE_US),
+        chgroup_freqs_GHz=chgroup_freqs_GHz,
+        _delay_native_samples_table=delay_table,
     )
 
     antpos_e, antpos_n = _synth_antpos(seed=42)
