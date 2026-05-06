@@ -106,10 +106,11 @@ class TimeShiftSearchTable:
                 f"fine_to_coarse.shape[0]={self.fine_to_coarse.shape[0]} != "
                 f"shifts.shape[0]={self.shifts.shape[0]} (N_fine)"
             )
-        if int(np.min(self.shifts[:, N_CHGROUP - 1])) != 0:
+        if not np.all(self.shifts[:, N_CHGROUP - 1] == 0):
             raise ValueError(
-                "time_shift_search[:, 15] must be 0 by §3.6.3 sign convention "
-                "(chgroup 15 is the reference; ν_chgroup_bot[15] == ν_bot_proc)"
+                "time_shift_search[:, 15] must be 0 for every fine-DM row by "
+                "§3.6.3 sign convention (chgroup 15 is the reference; "
+                "ν_chgroup_bot[15] == ν_bot_proc)"
             )
         if int(np.min(self.shifts)) < 0:
             raise ValueError(
@@ -196,8 +197,14 @@ def compute_time_shift_search(
         c = int(fine_to_coarse[f])
         ddm = float(fine_dm_pc_cm3[f] - coarse_dm_pc_cm3[c])
         for g in range(N_CHGROUP):
+            # Argument order: (nu_low, nu_high). For g < 15 we have
+            # chgroup_bot[g] > nu_bot_proc (chgroup-0 is band-top, -15
+            # is band-bottom = nu_bot_proc), so nu_bot_proc is the LOW
+            # frequency. δdm > 0 then yields Δτ > 0; chgroup g leads
+            # ν_bot_proc by Δτ and must be advanced by ``+rint(Δτ /
+            # t_int)`` samples to align.
             d_us = delta_tau_us(
-                float(chgroup_bot[g]), float(nu_bot_proc_GHz), ddm
+                float(nu_bot_proc_GHz), float(chgroup_bot[g]), ddm
             )
             shifts[f, g] = int(np.rint(d_us / t_int_search_us))
     # Force chgroup-15 row to zero (paranoia: floating-point noise in
