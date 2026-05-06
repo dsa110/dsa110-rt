@@ -368,11 +368,17 @@ Matches `configs/config_corr.yaml::buffers.fada.bytes_per_block`."""
 # ---------------------------------------------------------------------------
 
 T_INT_FACTOR_DEFAULT: int = 16
-"""Default search-stage post-integration factor (fast → search). Plan §9
-default; ``t_int_search_us = T_INT_FACTOR_DEFAULT × T_INT_FAST_US_DEFAULT
-= 524.288 µs``."""
+"""Default native→search post-integration factor.
+``t_int_search_us = T_INT_FACTOR_DEFAULT × NATIVE_SAMPLE_US = 16 ×
+32.768 = 524.288 µs``. Matches ``configs/config_compute_corr.yaml::
+t_int_factor`` and ``configs/operating_points.yaml::default``. (NB:
+``t_int_fast_us = 8 × NATIVE_SAMPLE_US = 262.144`` is configured
+independently in `configs/config_compute_corr.yaml`; the
+fast→search ratio at the default operating point happens to be
+``T_INT_FACTOR_DEFAULT / 8 = 2``, but the canonical ratio
+sub-agents read against is the **native→search** one.)"""
 
-T_INT_SEARCH_US_DEFAULT: float = T_INT_FACTOR_DEFAULT * T_INT_FAST_US_DEFAULT
+T_INT_SEARCH_US_DEFAULT: float = T_INT_FACTOR_DEFAULT * NATIVE_SAMPLE_US
 """Search-stage sample period in µs (= 524.288 at default ops).
 Pinned by plan §3.5 ``test_constants_pinned``: ``t_int_search_us ==
 524.288``."""
