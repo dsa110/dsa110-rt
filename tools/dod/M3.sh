@@ -246,6 +246,26 @@ python -m pytest tests/test_coarse_dm.py -q --tb=short \
   || fail "coarse-DM acceptance pytests failed"
 pass
 
+# --- chunk 7: 16-chgroup alignment preview ---------------------------------
+# 9 acceptance tests that pin the per-block intra-cube alignment across
+# 16 chgroups. The headline test (test_16chgroups_all_peak_at_same_tile)
+# feeds the same synthetic impulse-bearing voltage block to all 16
+# chgroups through corr_fast_integration.process_block and asserts that
+# the per-chgroup peak fast-vis tile is identical (±1) across all 16
+# chgroups. This is the "stage-1 is alignment-correct, stage-2 only
+# needs to compensate band-dependent residuals" invariant that chunk 9
+# stage-2 alignment will rely on.
+# Other tests cover: synth-block byte layout (impulse packet at 0x77,
+# byte stride correctness), out-of-range impulse rejection, deterministic
+# RNG, _expected_fast_vis_tile arithmetic across the cadence sweep
+# {8, 32, 4096}, single-chgroup peak-at-expected-tile pin, edge-case
+# chgroup 0 vs chgroup 15 alignment, and the t_int=32 burst-cadence
+# invariance.
+STEP="chunk_7_16chgroup_alignment_preview"
+python -m pytest tests/test_chgroup_alignment.py -q --tb=short \
+  || fail "16-chgroup alignment preview pytests failed"
+pass
+
 # --- chunk 4: corr_fast_integration (full-pipeline orchestrator) -----------
 # 19 acceptance tests covering the chunk-4 production service
 # corr_fast_integration that wires together (in order):
@@ -288,11 +308,11 @@ CHUNKS_DONE=(
   "chunk_3c_rfi_flagger"
   "chunk_3d_online_injector"
   "chunk_4_corr_fast_integration"
+  "chunk_7_16chgroup_alignment_preview"
 )
 CHUNKS_REMAINING=(   # update as chunks land; empty when M3 is complete
   "chunk_5_voltage_fixture_continuum"
   "chunk_6_voltage_fixture_burst_250924mptq"
-  "chunk_7_16chgroup_alignment_preview"
   "chunk_8_transport_loopback_capture"
   "chunk_9_dod_orchestrator_completion"
   "chunk_10_hardening"
@@ -343,12 +363,12 @@ cat > "${M3_STATUS_JSON}" <<JSON
     "chunk_3b_coarse_dm",
     "chunk_3c_rfi_flagger",
     "chunk_3d_online_injector",
-    "chunk_4_corr_fast_integration"
+    "chunk_4_corr_fast_integration",
+    "chunk_7_16chgroup_alignment_preview"
   ],
   "chunks_remaining": [
     "chunk_5_voltage_fixture_continuum",
     "chunk_6_voltage_fixture_burst_250924mptq",
-    "chunk_7_16chgroup_alignment_preview",
     "chunk_8_transport_loopback_capture",
     "chunk_9_dod_orchestrator_completion",
     "chunk_10_hardening"
