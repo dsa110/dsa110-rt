@@ -434,6 +434,77 @@ def test_F18_F21_compose_on_source_vis_is_real() -> None:
 
 
 # ---------------------------------------------------------------------------
+# F31a — chunked compute_split is bit-identical to un-chunked
+# ---------------------------------------------------------------------------
+
+
+class TestComputeSplitChunked:
+    """F31a: chunked compute_split is bit-identical to un-chunked.
+
+    F31a chunks the n_fast_vis axis to bound the fp16 V_real / V_imag
+    matmul intermediate to ~1 GB on the 2080Ti production GPU. The
+    fp16 matmuls per slab use exactly the same inputs as the
+    un-chunked path, so output must be bit-identical.
+    """
+
+    @pytest.mark.parametrize(
+        ("n_packets_in", "t_int", "n_fv_chunk"),
+        [
+            (16, 8, 1),       # 4 fv tiles, chunked one-at-a-time
+            (16, 8, 2),       # 4 fv tiles, 2 per chunk
+            (32, 8, 4),       # 8 fv tiles, 4 per chunk
+            (32, 32, 1),      # 2 fv tiles, chunked one-at-a-time
+            (4, 8, 1),        # 1 fv tile (single chunk)
+        ],
+    )
+    def test_chunked_equals_unchunked(self, n_packets_in, t_int, n_fv_chunk):
+        r, i = _random_fp16_voltages(n_packets_in)
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=t_int,
+        )
+        vis_un = kernel.compute_split(r, i)
+        vis_ch = kernel.compute_split(r, i, n_fv_chunk=n_fv_chunk)
+        assert vis_un.shape == vis_ch.shape
+        assert vis_un.dtype == vis_ch.dtype
+        # Bit-identical (CPU deterministic matmul)
+        torch.testing.assert_close(
+            vis_ch, vis_un,
+            rtol=0, atol=0,
+            msg=lambda m: f"F31a chunked != un-chunked: {m}",
+        )
+
+    def test_auto_chunk_size_default(self):
+        """Auto-pick yields a positive size and produces correct output."""
+        r, i = _random_fp16_voltages(16)
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=8,
+        )
+        vis_default = kernel.compute_split(r, i)
+        vis_explicit = kernel.compute_split(r, i, n_fv_chunk=None)
+        torch.testing.assert_close(vis_default, vis_explicit, rtol=0, atol=0)
+
+    def test_rejects_zero_chunk(self):
+        r, i = _random_fp16_voltages(16)
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=8,
+        )
+        with pytest.raises(ValueError, match="n_fv_chunk"):
+            kernel.compute_split(r, i, n_fv_chunk=0)
+
+    def test_rejects_chunk_larger_than_total(self):
+        r, i = _random_fp16_voltages(16)  # 4 fv tiles
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=8,
+        )
+        with pytest.raises(ValueError, match="n_fv_chunk"):
+            kernel.compute_split(r, i, n_fv_chunk=5)
+
+
+# ---------------------------------------------------------------------------
 # stokes_i_pol_sum + zero_v4_cells helpers
 # ---------------------------------------------------------------------------
 
