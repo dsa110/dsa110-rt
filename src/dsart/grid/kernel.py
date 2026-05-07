@@ -85,8 +85,10 @@ from dsart.common.constants import (
 )
 from dsart.grid.sparsity_pattern import (
     SPEED_OF_LIGHT_M_PER_S,
+    SUPPORTED_KERNEL_SUPPORTS,
     SparsityPattern,
     _per_baseline_uv_meters,
+    gaussian_kernel_weights,
 )
 
 
@@ -122,14 +124,24 @@ class FastVisGridder:
     device : torch.device
         Where the scatter runs.
     cell_index_map : torch.Tensor
-        ``(NBASE * NCHAN,) int64`` mapping flat ``(bls, ch)`` index to
-        the filled-cell index in ``[0, N_filled)``, or to ``N_filled``
-        (= sentinel) for out-of-grid / auto / outrigger baselines.
+        ``(NBASE * NCHAN * K * K,) int64`` mapping flat
+        ``(bls, ch, dy, dx)`` tap index to the filled-cell index in
+        ``[0, N_filled)``, or to ``N_filled`` (= sentinel) for
+        out-of-grid / auto / outrigger taps. ``K = pattern.kernel_support``;
+        for K=1 this collapses to ``(NBASE * NCHAN,)`` (one tap per
+        (bls, ch)) and is bit-identical to the pre-G7 layout. Inner
+        order over the K² taps is row-major
+        (``i = (dy + K//2) * K + (dx + K//2)``) so it matches
+        ``gaussian_kernel_weights(K).reshape(-1)``.
     cell_weights_cpu : torch.Tensor
-        ``(N_filled,) float32`` count of (bls, ch) hits per filled
-        cell. Constant per pattern; computed once at construction.
-        Held on CPU; access via :attr:`cell_weights` for the device-
-        resident mirror.
+        ``(N_filled,) float32`` per-cell **sum of squared per-tap
+        Gaussian weights** :math:`\\sum_i w_i^2` accumulated over every
+        in-grid (bls, ch, dy, dx) tap that lands in the cell — the
+        natural-weighting weight for a tapered grid (cf. plan
+        §3.6.5 G10). For K=1 (pillbox) every tap weight is 1.0 so
+        this collapses to the per-cell **count** of (bls, ch) hits,
+        bit-identical to the pre-G7 cell-weights array. Held on CPU;
+        access via :attr:`cell_weights` for the device-resident mirror.
     """
 
     pattern: SparsityPattern
@@ -138,6 +150,7 @@ class FastVisGridder:
     cell_weights_cpu: torch.Tensor
 
     _cell_weights_device: torch.Tensor = field(init=False, repr=False)
+    _tap_weights_device: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         dev = torch.device(self.device)
@@ -145,15 +158,23 @@ class FastVisGridder:
             dev = torch.device(f"cuda:{torch.cuda.current_device()}")
         self.device = dev
 
+        kernel_support = int(self.pattern.kernel_support)
+        if kernel_support not in SUPPORTED_KERNEL_SUPPORTS:
+            raise ValueError(
+                f"pattern.kernel_support={kernel_support} not in "
+                f"{SUPPORTED_KERNEL_SUPPORTS}; G7 supports K ∈ {{1, 3, 5}}."
+            )
+
         if self.cell_index_map.dtype != torch.int64:
             raise TypeError(
                 f"cell_index_map dtype must be int64; got "
                 f"{self.cell_index_map.dtype}"
             )
-        expected_n = NBASE * NCHAN_PER_CHGROUP
+        expected_n = NBASE * NCHAN_PER_CHGROUP * kernel_support * kernel_support
         if self.cell_index_map.shape != (expected_n,):
             raise ValueError(
-                f"cell_index_map shape must be ({expected_n},); got "
+                f"cell_index_map shape must be ({expected_n},) "
+                f"(NBASE * NCHAN * K * K, K={kernel_support}); got "
                 f"{tuple(self.cell_index_map.shape)}"
             )
         n_filled = self.pattern.n_filled
@@ -185,6 +206,16 @@ class FastVisGridder:
         self.cell_index_map = self.cell_index_map.to(self.device)
         self._cell_weights_device = self.cell_weights_cpu.to(self.device)
 
+        # Per-tap Gaussian weights (K*K,) float32 on the device. For
+        # K=1 this is exactly ``[1.0]`` so the scatter math collapses
+        # to a no-op multiply (bit-identical to pre-G7).
+        tap_weights_np = gaussian_kernel_weights(kernel_support).astype(
+            np.float32
+        ).reshape(-1)
+        self._tap_weights_device = torch.from_numpy(tap_weights_np).to(
+            self.device
+        )
+
     # ------------------------------------------------------------------
     # Constructor classmethod — the canonical entry point
     # ------------------------------------------------------------------
@@ -203,10 +234,18 @@ class FastVisGridder:
 
         Re-runs the same per-baseline ``(u, v)`` arithmetic that
         :func:`dsart.grid.sparsity_pattern.build_pattern` ran, then
-        looks up each ``(bls, ch)`` cell in the pattern to produce a
-        flat ``cell_index_map``. This is the ~ms-cost work that
-        plan §4.2 step 5 absorbs into ``cmd: prepare``; tests + bench
-        call it on every construction.
+        looks up each ``(bls, ch, dy, dx)`` tap (K² taps per
+        ``(bls, ch)`` for ``K = pattern.kernel_support``) in the
+        pattern to produce a flat ``cell_index_map`` of length
+        ``NBASE * NCHAN * K * K``. The per-tap Gaussian weights are
+        derived deterministically from K via
+        :func:`dsart.grid.sparsity_pattern.gaussian_kernel_weights`,
+        held on-device for the hot-path scatter and used to compute
+        ``cell_weights = Σ w²`` (natural weighting for a tapered grid).
+        For K=1 this collapses to one tap per (bls, ch) with weight
+        1.0 — bit-identical to the pre-G7 layout. This is the ~ms-cost
+        work that plan §4.2 step 5 absorbs into ``cmd: prepare``;
+        tests + bench call it on every construction.
 
         Args:
             pattern: the sparsity pattern. Carries ``chgroup``,
@@ -241,6 +280,12 @@ class FastVisGridder:
         chgroup = pattern.chgroup
         n_grid = pattern.n_grid
         n_filled = pattern.n_filled
+        kernel_support = int(pattern.kernel_support)
+        if kernel_support not in SUPPORTED_KERNEL_SUPPORTS:
+            raise ValueError(
+                f"pattern.kernel_support={kernel_support} not in "
+                f"{SUPPORTED_KERNEL_SUPPORTS}; G7 supports K ∈ {{1, 3, 5}}."
+            )
 
         # ---- Re-run the geometric build (cheap; same as build_pattern) --
         du_m, dv_m = _per_baseline_uv_meters(
@@ -281,68 +326,107 @@ class FastVisGridder:
         )))
         cell_lambda = max_baseline_lambda * 2.0 / n_grid
         half = n_grid // 2
-        ix_col_kept = np.rint(u_lam / cell_lambda).astype(np.int64) + half
-        ix_row_kept = np.rint(v_lam / cell_lambda).astype(np.int64) + half
-        in_grid_kept = (
-            (ix_row_kept >= 0) & (ix_row_kept < n_grid)
-            & (ix_col_kept >= 0) & (ix_col_kept < n_grid)
+        ix_col_kept_center = (
+            np.rint(u_lam / cell_lambda).astype(np.int64) + half
+        )                                                              # (Nkept, NCHAN)
+        ix_row_kept_center = (
+            np.rint(v_lam / cell_lambda).astype(np.int64) + half
         )
 
-        # Pack pattern (row, col) into a uint32 key. Build a dict
-        # mapping packed key → filled-cell index.
-        pat_keys = (pattern.ix_row.astype(np.uint32) << 16) | pattern.ix_col.astype(np.uint32)
-        # `pat_keys` is sorted by virtue of the build_pattern unique()
-        # sort, so we can use np.searchsorted instead of a Python dict.
+        # G7: expand each (kept-bls, ch) center into a K×K neighborhood.
+        # Inner tap order is row-major over (dy, dx) so the flat index
+        # (dy + half_K) * K + (dx + half_K) matches
+        # ``gaussian_kernel_weights(K).reshape(-1)``.
+        K = kernel_support
+        half_kernel = K // 2
+        offsets = np.arange(-half_kernel, half_kernel + 1, dtype=np.int64)
+        dy_grid, dx_grid = np.meshgrid(offsets, offsets, indexing="ij")
+        ix_row_kept_taps = (
+            ix_row_kept_center[:, :, None, None]
+            + dy_grid[None, None, :, :]
+        )                                                              # (Nkept, NCHAN, K, K)
+        ix_col_kept_taps = (
+            ix_col_kept_center[:, :, None, None]
+            + dx_grid[None, None, :, :]
+        )
+        in_grid_kept_taps = (
+            (ix_row_kept_taps >= 0) & (ix_row_kept_taps < n_grid)
+            & (ix_col_kept_taps >= 0) & (ix_col_kept_taps < n_grid)
+        )
 
-        # ---- Build the (NBASE, NCHAN) cell_index map --------------------
-        cell_idx = np.full((NBASE, NCHAN_PER_CHGROUP), n_filled, dtype=np.int64)
+        # Pack pattern (row, col) into a uint32 key. ``pat_keys`` is
+        # sorted by virtue of the build_pattern unique() sort, so we
+        # can use np.searchsorted instead of a Python dict.
+        pat_keys = (
+            pattern.ix_row.astype(np.uint32) << 16
+        ) | pattern.ix_col.astype(np.uint32)
 
-        # Index every (kept-bls, ch) into the pattern.
-        kept_keys = (
-            ix_row_kept.astype(np.uint32) << 16
-        ) | ix_col_kept.astype(np.uint32)                              # (Nkept, NCHAN)
+        # ---- Build the (NBASE, NCHAN, K, K) cell_index map -------------
+        cell_idx_taps = np.full(
+            (NBASE, NCHAN_PER_CHGROUP, K, K), n_filled, dtype=np.int64
+        )
+
+        kept_tap_keys = (
+            ix_row_kept_taps.astype(np.uint32) << 16
+        ) | ix_col_kept_taps.astype(np.uint32)                         # (Nkept, NCHAN, K, K)
         # Searchsorted only inside the in-grid mask to skip out-of-grid
-        # baselines (those keys would bind to a wrong cell otherwise
-        # because searchsorted returns insertion index).
-        in_grid_keys = kept_keys[in_grid_kept]
+        # taps (those keys would bind to a wrong cell otherwise because
+        # searchsorted returns insertion index).
+        in_grid_keys = kept_tap_keys[in_grid_kept_taps]
         positions = np.searchsorted(pat_keys, in_grid_keys)
-        # Sanity: every in-grid key must match an existing pattern key.
+        # Sanity: every in-grid tap key must match an existing pattern
+        # key. ``build_pattern`` unions every K×K-neighborhood cell into
+        # the pattern, so an in-grid tap is by construction in the
+        # pattern; a mismatch here means the two ends drifted.
         if positions.size:
             if int(positions.max()) >= pat_keys.size:
                 raise RuntimeError(
-                    "internal: in-grid (bls, ch) key not present in"
-                    " pattern keys (build_pattern / from_pattern"
-                    " geometric drift)."
+                    "internal: in-grid (bls, ch, dy, dx) tap key not"
+                    " present in pattern keys (build_pattern /"
+                    " from_pattern geometric drift)."
                 )
             if not np.all(pat_keys[positions] == in_grid_keys):
                 raise RuntimeError(
-                    "internal: in-grid (bls, ch) key mismatch against"
-                    " pattern keys (build_pattern / from_pattern"
-                    " geometric drift)."
+                    "internal: in-grid (bls, ch, dy, dx) tap key"
+                    " mismatch against pattern keys (build_pattern /"
+                    " from_pattern geometric drift)."
                 )
 
-        # Scatter the filled-cell indices back into (NBASE, NCHAN).
-        # We need to walk the kept-baseline axis, mapping kept_idx → the
-        # full BLS index it came from.
-        kept_idx_per_bls_inv = np.where(kept_per_bls >= 0)[0]         # (Nkept,)
-        # Build a (Nkept, NCHAN) tensor of filled-cell indices, sentinel
-        # in the out-of-grid slots.
-        cell_idx_kept = np.full((kept_idx_per_bls_inv.size, NCHAN_PER_CHGROUP),
-                                n_filled, dtype=np.int64)
-        cell_idx_kept[in_grid_kept] = positions.astype(np.int64)
-        # Place rows into cell_idx via the kept→bls map.
-        cell_idx[kept_idx_per_bls_inv, :] = cell_idx_kept
+        # Scatter the filled-cell indices back into (NBASE, NCHAN, K, K)
+        # via the kept→bls map.
+        kept_idx_per_bls_inv = np.where(kept_per_bls >= 0)[0]          # (Nkept,)
+        cell_idx_kept_taps = np.full(
+            (kept_idx_per_bls_inv.size, NCHAN_PER_CHGROUP, K, K),
+            n_filled, dtype=np.int64,
+        )
+        cell_idx_kept_taps[in_grid_kept_taps] = positions.astype(np.int64)
+        cell_idx_taps[kept_idx_per_bls_inv, :, :, :] = cell_idx_kept_taps
 
-        # ---- Per-cell weights = count of (bls, ch) → filled-cell hits ---
-        weights = np.zeros(n_filled, dtype=np.float32)
-        valid_mask = cell_idx < n_filled
-        np.add.at(weights, cell_idx[valid_mask], 1.0)
+        # ---- Per-cell weights = Σ w² over in-grid taps -----------------
+        # Natural weighting for a tapered grid (plan §3.6.5 G10): the
+        # variance-minimising estimator weights samples by their
+        # squared gridding kernel coefficient. For K=1 every tap weight
+        # is 1.0 so Σ w² collapses to the per-cell sample count.
+        tap_weights_2d = gaussian_kernel_weights(K).astype(np.float32)  # (K, K)
+        # Broadcast tap weights into (NBASE, NCHAN, K, K) shape so each
+        # tap pairs with its weight, then sum-of-squares per filled cell.
+        tap_w_per_idx = np.broadcast_to(
+            tap_weights_2d[None, None, :, :],
+            cell_idx_taps.shape,
+        )
+        cell_weights = np.zeros(n_filled, dtype=np.float32)
+        cell_idx_flat = cell_idx_taps.reshape(-1)
+        tap_w_flat_sq = (tap_w_per_idx.reshape(-1) ** 2).astype(np.float32)
+        valid_mask = cell_idx_flat < n_filled
+        np.add.at(
+            cell_weights, cell_idx_flat[valid_mask], tap_w_flat_sq[valid_mask],
+        )
 
         return cls(
             pattern=pattern,
             device=torch.device(device),
-            cell_index_map=torch.from_numpy(cell_idx.reshape(-1)),
-            cell_weights_cpu=torch.from_numpy(weights),
+            cell_index_map=torch.from_numpy(cell_idx_flat),
+            cell_weights_cpu=torch.from_numpy(cell_weights),
         )
 
     # ------------------------------------------------------------------
@@ -351,17 +435,33 @@ class FastVisGridder:
 
     @property
     def cell_weights(self) -> torch.Tensor:
-        """``(N_filled,) float32`` per-cell sample-count for natural weighting.
+        """``(N_filled,) float32`` per-cell **sum-of-squared per-tap weights**.
 
-        Computed once at :meth:`from_pattern` construction and cached on
-        the gridder's device. Constant per pattern (does not depend on
-        the input vis), so callers may read this once after construction
-        and bind it into a noise-norm pipeline without re-fetching every
-        call.
+        For each filled cell ``c`` returns
+        :math:`\\sum_{i\\,:\\,c_i = c}\\,w_i^2`, summed over every
+        ``(bls, ch, dy, dx)`` tap whose Gaussian-weighted contribution
+        landed in cell ``c`` from any in-grid baseline. This is the
+        **natural-weighting** weight for a tapered grid (plan §3.6.5
+        G10): the variance-minimising estimator weights samples by
+        their squared gridding-kernel coefficient, not by the kernel
+        coefficient itself.
+
+        For ``kernel_support = 1`` (pillbox) every per-tap weight is
+        ``1.0`` so :math:`\\sum w^2` collapses to the per-cell sample
+        count — bit-identical to the pre-G7 ``cell_weights`` array.
+        For ``K ∈ {3, 5}`` (G7 Gaussian taper) the central-cell weight
+        approaches the count, while corner-tap contributions are
+        suppressed quadratically by the Gaussian profile.
+
+        Computed once at :meth:`from_pattern` construction and cached
+        on the gridder's device. Constant per pattern (does not depend
+        on the input vis), so callers may read this once after
+        construction and bind it into a noise-norm pipeline without
+        re-fetching every call.
 
         Plan §4.2 step 5 + §3.6.5 G10 — the search-side detector
-        normalises by per-pixel sample counts when computing Layer-1
-        noise; this is the producer of those counts.
+        normalises by per-pixel weight when computing Layer-1 noise;
+        this is the producer of those weights.
         """
         return self._cell_weights_device
 
@@ -413,11 +513,24 @@ class FastVisGridder:
         vis_cfp32 = vis_stokes_i.to(torch.complex64)
 
         n_filled = self.pattern.n_filled
-        # Flatten (NBASE, NCHAN) → (NBASE * NCHAN); broadcast index map
-        # to all fast-vis tiles. ``scatter_add_`` requires same-shape
-        # index + src tensors.
-        src = vis_cfp32.reshape(n_fv, nb * nch)                       # (n_fv, NBASE*NCHAN)
-        idx = self.cell_index_map.unsqueeze(0).expand(n_fv, -1)       # (n_fv, NBASE*NCHAN)
+        # Flatten (NBASE, NCHAN) → (NBASE * NCHAN); each (bls, ch)
+        # sample is replicated K² times and weighted by the per-tap
+        # Gaussian coefficients. For K=1 (pillbox) the weight is 1.0
+        # so the multiply is exact in fp32 and the scatter math
+        # collapses to the pre-G7 single-tap path bit-identically.
+        src = vis_cfp32.reshape(n_fv, nb * nch)                        # (n_fv, NBASE*NCHAN)
+        # ``self._tap_weights_device`` is a (K*K,) float32 tensor
+        # ordered to match the inner (dy, dx) tap order of
+        # ``cell_index_map``.
+        weights_flat = self._tap_weights_device                        # (K*K,)
+        n_taps = weights_flat.shape[0]                                 # = K*K
+        # complex × real preserves complex64; broadcasting:
+        # src (n_fv, NBASE*NCHAN, 1) * weights (1, 1, K*K)
+        #   → (n_fv, NBASE*NCHAN, K*K). Reshape to flat per-tap
+        # source vector for the scatter.
+        src_taps = src.unsqueeze(2) * weights_flat.unsqueeze(0).unsqueeze(0)
+        src_taps_flat = src_taps.reshape(n_fv, nb * nch * n_taps)
+        idx_taps = self.cell_index_map.unsqueeze(0).expand(n_fv, -1)  # (n_fv, NBASE*NCHAN*K*K)
 
         # PyTorch ``scatter_add_`` doesn't support complex on all
         # backends (in particular CPU complex scatter is not vectorised
@@ -427,8 +540,8 @@ class FastVisGridder:
             (n_fv, n_filled + 1), dtype=torch.float32, device=self.device,
         )
         out_imag = torch.zeros_like(out_real)
-        out_real.scatter_add_(1, idx, src.real.contiguous())
-        out_imag.scatter_add_(1, idx, src.imag.contiguous())
+        out_real.scatter_add_(1, idx_taps, src_taps_flat.real.contiguous())
+        out_imag.scatter_add_(1, idx_taps, src_taps_flat.imag.contiguous())
         out_buf = torch.complex(out_real, out_imag)
 
         # Strip the sentinel slot.

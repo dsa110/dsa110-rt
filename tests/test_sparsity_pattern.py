@@ -59,11 +59,13 @@ from dsart.grid.sparsity_pattern import (
     MAX_CORE_STATION_DEFAULT,
     N_CORE_DEFAULT,
     SPEED_OF_LIGHT_M_PER_S,
+    SUPPORTED_KERNEL_SUPPORTS,
     build_pattern,
     compute_antpos_hash,
     compute_chgroup_table_hash,
     core_baseline_mask_from_antpos,
     core_baseline_mask_from_station_numbers,
+    gaussian_kernel_weights,
     predict_pattern_id,
     quantise_dec_deg,
 )
@@ -639,10 +641,16 @@ class TestF20UvNegation:
 
 class TestBuildPatternValidation:
 
-    def test_rejects_kernel_support_gt_1_until_hardening(self) -> None:
+    def test_accepts_kernel_support_3_and_5(self) -> None:
+        """G7 (plan §4.2 line 1351) lifts the K=1-only carve-out;
+        K ∈ {1, 3, 5} are all accepted and produce a valid pattern."""
         e, n = _synth_antpos()
-        with pytest.raises(NotImplementedError, match="kernel_support"):
-            build_pattern(e, n, chgroup=0, dec_deg=37.0, kernel_support=3)
+        for K in (1, 3, 5):
+            p = build_pattern(
+                e, n, chgroup=0, dec_deg=37.0, kernel_support=K,
+            )
+            assert p.kernel_support == K
+            assert p.n_filled > 0
 
     def test_rejects_zero_n_grid(self) -> None:
         e, n = _synth_antpos()
@@ -903,3 +911,209 @@ class TestCoreBaselineMaskFromStationNumbers:
         bad = np.array([[1, 2], [3, 4]])
         with pytest.raises(ValueError, match="1-D"):
             core_baseline_mask_from_station_numbers(bad)
+
+
+# ---------------------------------------------------------------------------
+# G7: Gaussian gridding kernel weights (plan §4.2 line 1351)
+# ---------------------------------------------------------------------------
+
+
+class TestGaussianKernel:
+    """Pin :func:`gaussian_kernel_weights` shape, normalisation, and
+    rejection of non-supported K values (G7 acceptance gate)."""
+
+    def test_K1_is_delta(self) -> None:
+        w = gaussian_kernel_weights(1)
+        assert w.shape == (1, 1)
+        assert w.dtype == np.float64
+        # Pillbox / nearest cell: single tap with weight 1.0.
+        assert w[0, 0] == pytest.approx(1.0)
+
+    def test_K3_is_sigma_half(self) -> None:
+        """K=3 ⇒ σ = (3-1)/4 = 0.5 cells. Unnormalised:
+        center = 1, axial = exp(-2), corner = exp(-4). After
+        normalising so the matrix sums to 1, the central tap is
+        ``1/Σ`` and the corner is ``exp(-4)/Σ``."""
+        w = gaussian_kernel_weights(3)
+        assert w.shape == (3, 3)
+        # Σ_unnorm = 1 + 4·exp(-2) + 4·exp(-4).
+        sigma_unnorm = 1.0 + 4.0 * np.exp(-2.0) + 4.0 * np.exp(-4.0)
+        # Central tap = 1 / Σ.
+        assert w[1, 1] == pytest.approx(1.0 / sigma_unnorm, rel=1e-12)
+        # Corner tap = exp(-2 / (2·0.5²)) / Σ = exp(-4) / Σ.
+        assert w[0, 0] == pytest.approx(np.exp(-4.0) / sigma_unnorm, rel=1e-12)
+        assert w[2, 2] == pytest.approx(np.exp(-4.0) / sigma_unnorm, rel=1e-12)
+        # Symmetric.
+        np.testing.assert_allclose(w, w.T, atol=0)
+        # Sum-normalised.
+        assert w.sum() == pytest.approx(1.0, rel=0, abs=1e-15)
+
+    def test_K5_normalisation(self) -> None:
+        w = gaussian_kernel_weights(5)
+        assert w.shape == (5, 5)
+        # Σ weights == 1.0 within fp64 eps.
+        assert w.sum() == pytest.approx(1.0, rel=0, abs=1e-15)
+        # K=5 ⇒ σ = (5-1)/4 = 1.0 cell. Centre tap dominates.
+        assert w[2, 2] == w.max()
+        # Symmetric in 4 directions.
+        np.testing.assert_allclose(w, w.T, atol=0)
+        np.testing.assert_allclose(w, w[::-1, :], atol=0)
+        np.testing.assert_allclose(w, w[:, ::-1], atol=0)
+
+    @pytest.mark.parametrize("bad_K", [2, 4])
+    def test_rejects_even_K(self, bad_K: int) -> None:
+        with pytest.raises(ValueError, match=r"kernel_support"):
+            gaussian_kernel_weights(bad_K)
+
+    def test_rejects_K_above_5(self) -> None:
+        with pytest.raises(ValueError, match=r"kernel_support"):
+            gaussian_kernel_weights(7)
+
+    def test_rejects_zero_or_negative_K(self) -> None:
+        with pytest.raises(ValueError, match=r"kernel_support"):
+            gaussian_kernel_weights(0)
+        with pytest.raises(ValueError, match=r"kernel_support"):
+            gaussian_kernel_weights(-1)
+
+    def test_supported_kernel_supports_constant(self) -> None:
+        # G7 contract: only K ∈ {1, 3, 5} ship in this milestone.
+        assert SUPPORTED_KERNEL_SUPPORTS == (1, 3, 5)
+
+
+# ---------------------------------------------------------------------------
+# G7: build_pattern with K > 1 (plan §4.2 line 1351)
+# ---------------------------------------------------------------------------
+
+
+class TestKGreaterThanOne:
+    """Pin :func:`build_pattern` behaviour at K ∈ {3, 5}: the pattern
+    grows monotonically with K (every K=1 cell is still in the K=3
+    pattern, plus the spread cells), and ``pattern_id`` differs
+    between K values so the corr / search ends cannot silently reuse
+    a different-K pattern."""
+
+    @pytest.fixture
+    def common_kw(self) -> dict:
+        e, n = _synth_antpos(seed=20260507)
+        mask = _core_baseline_mask(n_core=82)
+        return {
+            "antpos_e": e,
+            "antpos_n": n,
+            "chgroup": 0,
+            "dec_deg": 53.85,
+            "n_grid": N_GRID_DEFAULT,
+            "is_core_baseline_mask": mask,
+        }
+
+    def test_K3_grows_n_filled(self, common_kw: dict) -> None:
+        """K=3's n_filled ≥ K=1's, and ≤ K=1's + (K²-1) · n_baselines.
+
+        The lower bound is monotonicity: every K=1 cell stays filled at
+        K=3 (the K=1 cell *is* the K=3 (dy=0, dx=0) tap of the same
+        baseline). The upper bound is "no more than 8 extra cells per
+        kept baseline, per channel" — a loose upper bound (most
+        K=3-introduced cells are already filled by neighbouring
+        baselines, so the actual growth is much smaller).
+        """
+        p_k1 = build_pattern(kernel_support=1, **common_kw)
+        p_k3 = build_pattern(kernel_support=3, **common_kw)
+        assert p_k3.n_filled >= p_k1.n_filled, (
+            f"K=3 dropped K=1 cells: n_filled(K=3)={p_k3.n_filled} "
+            f"< n_filled(K=1)={p_k1.n_filled}"
+        )
+        # Loose upper bound: 8 = 3² - 1 extra cells per kept baseline
+        # × NCHAN_PER_CHGROUP. Per-channel because every (bls, ch)
+        # contributes K² candidate cells.
+        n_baselines_in_grid = int(np.asarray(common_kw["is_core_baseline_mask"]).sum())
+        # Subtract autos from the kept count (autos are excluded inside
+        # build_pattern; the upper bound should track cross-baselines).
+        # The synthetic mask keeps autos ((0,0), (1,1), …, (81,81)) as
+        # True since both endpoints satisfy a < n_core. ``_per_baseline_uv_meters``
+        # drops them. Subtract 82 for safety so the bound is tight
+        # without underestimating.
+        n_cross = n_baselines_in_grid - NANTS                              # rough; loose bound
+        upper = p_k1.n_filled + (3 * 3 - 1) * max(n_cross, 1) * NCHAN_PER_CHGROUP
+        assert p_k3.n_filled <= upper, (
+            f"K=3 n_filled={p_k3.n_filled} exceeds loose upper bound "
+            f"{upper}; expansion may be over-counting cells."
+        )
+        # K=3 pattern must STRICTLY contain the K=1 pattern's filled
+        # cells (set inclusion).
+        cells_k1 = set(zip(p_k1.ix_row.tolist(), p_k1.ix_col.tolist()))
+        cells_k3 = set(zip(p_k3.ix_row.tolist(), p_k3.ix_col.tolist()))
+        assert cells_k1.issubset(cells_k3), (
+            f"K=3 pattern missing {len(cells_k1 - cells_k3)} K=1 cells; "
+            f"the K=1 pattern should be a subset of K=3."
+        )
+
+    def test_K5_grows_n_filled_more_than_K3(self, common_kw: dict) -> None:
+        p_k1 = build_pattern(kernel_support=1, **common_kw)
+        p_k3 = build_pattern(kernel_support=3, **common_kw)
+        p_k5 = build_pattern(kernel_support=5, **common_kw)
+        # Strict monotone growth in K: K=1 ⊂ K=3 ⊂ K=5 (set inclusion).
+        cells_k1 = set(zip(p_k1.ix_row.tolist(), p_k1.ix_col.tolist()))
+        cells_k3 = set(zip(p_k3.ix_row.tolist(), p_k3.ix_col.tolist()))
+        cells_k5 = set(zip(p_k5.ix_row.tolist(), p_k5.ix_col.tolist()))
+        assert cells_k1.issubset(cells_k3) and cells_k3.issubset(cells_k5)
+        assert p_k5.n_filled >= p_k3.n_filled >= p_k1.n_filled
+
+    def test_K3_pattern_id_differs_from_K1(self, common_kw: dict) -> None:
+        """``pattern_id`` includes ``kernel_support`` so K=1 vs K=3
+        patterns cannot collide. (Already pinned in the
+        :class:`TestPatternIdSensitivity` payload tests via
+        :func:`predict_pattern_id`; re-pinned here against
+        :func:`build_pattern` itself now that K > 1 is supported.)"""
+        p_k1 = build_pattern(kernel_support=1, **common_kw)
+        p_k3 = build_pattern(kernel_support=3, **common_kw)
+        p_k5 = build_pattern(kernel_support=5, **common_kw)
+        ids = {p_k1.pattern_id, p_k3.pattern_id, p_k5.pattern_id}
+        assert len(ids) == 3, (
+            f"pattern_ids collide across K ∈ {{1, 3, 5}}: {ids}"
+        )
+
+    def test_K1_unchanged_vs_pre_G7(self, common_kw: dict) -> None:
+        """G7 acceptance: K=1 build_pattern output must be bit-identical
+        to the pre-G7 pillbox build (the inner-tap loop collapses to
+        the (dy, dx) = (0, 0) tap with weight 1.0). The strongest
+        proxy without a pre-G7 commit on hand is to verify that the
+        K=1 pattern is exactly the union of per-(bls, ch) np.rint()
+        cells — i.e. no spurious extra cells crept in from the K×K
+        loop.
+        """
+        from dsart.common.constants import NCHAN_PER_CHGROUP as _NCH
+        from dsart.common.constants import freq_GHz as _f
+        from dsart.grid.sparsity_pattern import _per_baseline_uv_meters
+
+        p = build_pattern(kernel_support=1, **common_kw)
+        e = common_kw["antpos_e"]
+        n = common_kw["antpos_n"]
+        mask = common_kw["is_core_baseline_mask"]
+        n_grid = common_kw["n_grid"]
+        chgroup = common_kw["chgroup"]
+        du_m, dv_m = _per_baseline_uv_meters(
+            e, n, is_core_baseline_mask=mask,
+        )
+        nu_GHz = np.asarray(
+            [_f(chgroup, ch) for ch in range(_NCH)], dtype=np.float64,
+        )
+        wave_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)
+        u_lam = -du_m[:, None] / wave_m[None, :]
+        v_lam = -dv_m[:, None] / wave_m[None, :]
+        max_bl = float(np.max(np.maximum(np.abs(u_lam), np.abs(v_lam))))
+        cell_lambda = max_bl * 2.0 / n_grid
+        half = n_grid // 2
+        ix_col = np.rint(u_lam / cell_lambda).astype(np.int64) + half
+        ix_row = np.rint(v_lam / cell_lambda).astype(np.int64) + half
+        in_grid = (
+            (ix_row >= 0) & (ix_row < n_grid)
+            & (ix_col >= 0) & (ix_col < n_grid)
+        )
+        expected = set(zip(
+            ix_row[in_grid].tolist(), ix_col[in_grid].tolist(),
+        ))
+        actual = set(zip(p.ix_row.tolist(), p.ix_col.tolist()))
+        assert expected == actual, (
+            f"K=1 build_pattern drifted from pre-G7 pillbox cell set: "
+            f"expected−actual={len(expected - actual)} "
+            f"actual−expected={len(actual - expected)}"
+        )

@@ -87,13 +87,24 @@ from dsart.common.constants import (
 
 __all__ = [
     "SPEED_OF_LIGHT_M_PER_S",
+    "SUPPORTED_KERNEL_SUPPORTS",
     "SparsityPattern",
     "build_pattern",
     "compute_antpos_hash",
     "compute_chgroup_table_hash",
+    "gaussian_kernel_weights",
     "predict_pattern_id",
     "quantise_dec_deg",
 ]
+
+
+#: K values accepted by :func:`build_pattern` and the gridder. Plan
+#: §4.2 line 1351 (G7) admits ``{1, 3, 5}`` — odd K so the kernel is
+#: centred on a cell, capped at 5 because the M3 gridder budget for
+#: per-(bls, ch) scatter taps is 25 (= 5²); larger K bloats the
+#: ``cell_index_map`` past the point where it fits in L2 on the search
+#: GPUs. K=1 is the legacy pillbox path (bit-identical to pre-G7).
+SUPPORTED_KERNEL_SUPPORTS: Final[tuple[int, ...]] = (1, 3, 5)
 
 
 #: Speed of light (m / s). Local copy avoids importing astropy from a
@@ -207,6 +218,69 @@ def quantise_dec_deg(dec_deg: float) -> float:
         quantise_dec_deg(41.499) == 41.5
     """
     return float(np.round(dec_deg / PATTERN_DEC_QUANT_DEG)) * PATTERN_DEC_QUANT_DEG
+
+
+def gaussian_kernel_weights(kernel_support: int) -> np.ndarray:
+    """Return ``(K, K)`` float64 Gaussian gridding weights, sum-normalised to 1.
+
+    G7 anti-aliasing kernel (plan §4.2 line 1351). Each per-``(bls, ch)``
+    Stokes-I sample is scattered into the K×K neighborhood of its
+    nearest ``(ix_row, ix_col)`` cell, weighted by
+
+    .. math::
+
+        w(\\Delta y, \\Delta x) \\propto
+        \\exp\\!\\Big(-\\,\\tfrac{\\Delta x^2 + \\Delta y^2}{2\\,\\sigma^2}\\Big),
+        \\qquad \\sigma = \\tfrac{K - 1}{4}\\;\\text{cells}
+
+    with the weights normalised so :math:`\\sum w = 1` per (bls, ch)
+    contribution (so the total amplitude scattered into the grid
+    equals the input vis amplitude — Parseval-friendly).
+
+    For ``K = 1`` returns ``[[1.0]]`` (delta function ⇒ legacy pillbox
+    path; the K>1 scatter math collapses to one tap with weight 1.0).
+    For ``K = 3`` ⇒ σ = 0.5 cells; for ``K = 5`` ⇒ σ = 1.0 cell. The
+    σ = (K−1)/4 choice approximately matches the Gaussian
+    primary-beam-induced PSF widening at half a primary beam — i.e.
+    the source amplitude is band-limited to ~ K cells for sources
+    inside half the PB, and any amplitude leaking past the K cells
+    that would alias to the conjugate ``(-l, -m)`` is suppressed by
+    the Gaussian taper (see ``bench/g7_alias_injection.py``).
+
+    Parameters
+    ----------
+    kernel_support : int
+        K, must be in :data:`SUPPORTED_KERNEL_SUPPORTS` (= ``(1, 3, 5)``).
+
+    Returns
+    -------
+    np.ndarray
+        ``(K, K)`` float64 array. Row index = ``Δy + K//2``; column
+        index = ``Δx + K//2``. Entries sum to ``1.0`` within fp64 eps.
+
+    Raises
+    ------
+    ValueError
+        If ``kernel_support`` is not in :data:`SUPPORTED_KERNEL_SUPPORTS`
+        (i.e. even K, K ≤ 0, or K > 5).
+    """
+    if kernel_support not in SUPPORTED_KERNEL_SUPPORTS:
+        raise ValueError(
+            f"kernel_support={kernel_support} not in "
+            f"{SUPPORTED_KERNEL_SUPPORTS}; G7 only ships K ∈ "
+            f"{{1, 3, 5}} (odd, centred, ≤ 5)."
+        )
+    if kernel_support == 1:
+        return np.array([[1.0]], dtype=np.float64)
+    K = kernel_support
+    sigma = (K - 1) / 4.0
+    half = K // 2
+    coords = np.arange(-half, half + 1, dtype=np.float64)        # (K,)
+    dx = coords[None, :]                                          # (1, K)
+    dy = coords[:, None]                                          # (K, 1)
+    w = np.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))     # (K, K)
+    w /= w.sum()
+    return w
 
 
 def _pattern_id_payload(
@@ -600,12 +674,18 @@ def build_pattern(
             ``n_grid`` (plan §3 line 305 m1 pin).
         kernel_support: cells of gridding kernel support. Defaults to
             :data:`dsart.common.constants.KERNEL_SUPPORT_DEFAULT` (= 1,
-            pillbox / nearest cell). Values > 1 are reserved for the M3
-            hardening pass (Gaussian taper, plan §4.2 line 1351 G7);
-            this chunk validates the input and folds it into
-            ``pattern_id`` so a future taper extension cannot silently
-            reuse an old-K pattern, but does NOT widen the per-baseline
-            cell write-set.
+            pillbox / nearest cell). Must be in
+            :data:`SUPPORTED_KERNEL_SUPPORTS` (= ``(1, 3, 5)``). For
+            ``K > 1`` (G7 anti-aliasing Gaussian taper, plan §4.2 line
+            1351), the pattern includes EVERY cell in the K×K
+            neighborhood of each (bls, ch) center cell that any
+            baseline contributes to with non-zero weight; the gridder
+            (:mod:`dsart.grid.kernel`) scatters K² Gaussian-weighted
+            taps per (bls, ch) pair, normalised so the per-tap weights
+            sum to 1. K=1 is bit-identical to the pre-G7 pillbox.
+            ``kernel_support`` is folded into ``pattern_id`` so the
+            corr / search ends cannot silently reuse a different-K
+            pattern.
         is_core_baseline_mask: optional ``(NBASE,)`` bool, True where
             both antennas of the baseline are in the 82-ant core
             (per plan §3 line 452 / V-4 outrigger zero-fill convention).
@@ -645,16 +725,15 @@ def build_pattern(
     # it. Sub-agents who feed a non-pow-of-2 pattern into the production
     # transport will fail at the SparseCOOPayload construction step,
     # not silently here.
-    if kernel_support <= 0:
-        raise ValueError(f"kernel_support={kernel_support} must be > 0")
-    if kernel_support != 1:
-        # Documented carve-out: not silently dropped, just not implemented.
-        # Tests assert this raises so future-K consumers don't get a
-        # stale pillbox pattern.
-        raise NotImplementedError(
-            f"kernel_support={kernel_support} > 1 (Gaussian taper) is "
-            f"reserved for the M3 hardening pass per plan §4.2 line 1351 "
-            f"(G7); chunk 3a only ships pillbox (kernel_support=1)."
+    if kernel_support not in SUPPORTED_KERNEL_SUPPORTS:
+        # G7 (plan §4.2 line 1351): pillbox + Gaussian taper at K ∈
+        # {1, 3, 5}. Even K (no central cell) and K > 5 (scatter-tap
+        # budget blowout — see :data:`SUPPORTED_KERNEL_SUPPORTS`) are
+        # rejected here, before any of the geometric build kicks in,
+        # so misconfigurations fail loudly at ``cmd: prepare``.
+        raise ValueError(
+            f"kernel_support={kernel_support} not in "
+            f"{SUPPORTED_KERNEL_SUPPORTS}; G7 supports K ∈ {{1, 3, 5}}."
         )
 
     if antpos_hash is None:
@@ -715,17 +794,33 @@ def build_pattern(
     cell_lambda = max_baseline_lambda * 2.0 / n_grid
 
     half = n_grid // 2
-    ix_col = np.rint(u_lam / cell_lambda).astype(np.int64) + half     # u-axis
-    ix_row = np.rint(v_lam / cell_lambda).astype(np.int64) + half     # v-axis
+    ix_col_center = np.rint(u_lam / cell_lambda).astype(np.int64) + half  # u-axis
+    ix_row_center = np.rint(v_lam / cell_lambda).astype(np.int64) + half  # v-axis
 
-    # Drop cells outside the grid (no toroidal wrap; matches
-    # ``grid_uv_natural`` semantics).
-    in_grid = (
-        (ix_row >= 0) & (ix_row < n_grid)
-        & (ix_col >= 0) & (ix_col < n_grid)
+    # G7: expand each (kept-bls, ch) center into a K×K neighborhood
+    # ``(center_row + dy, center_col + dx)`` for ``dy, dx ∈
+    # [-K//2, +K//2]``. Cells outside ``[0, n_grid)`` are still
+    # dropped (no toroidal wrap; matches ``grid_uv_natural``
+    # semantics + the gridder scatter sentinel slot in
+    # :mod:`dsart.grid.kernel`). For K=1 this is a no-op (the only
+    # offset is (0, 0)) so the K=1 pattern is bit-identical to the
+    # pre-G7 pillbox build.
+    half_kernel = kernel_support // 2
+    offsets = np.arange(-half_kernel, half_kernel + 1, dtype=np.int64)
+    dy_grid, dx_grid = np.meshgrid(offsets, offsets, indexing="ij")     # (K, K)
+    # (Nkept, NCHAN, K, K)
+    ix_row_taps = (
+        ix_row_center[:, :, None, None] + dy_grid[None, None, :, :]
     )
-    ix_row_flat = ix_row[in_grid].astype(np.uint32)
-    ix_col_flat = ix_col[in_grid].astype(np.uint32)
+    ix_col_taps = (
+        ix_col_center[:, :, None, None] + dx_grid[None, None, :, :]
+    )
+    in_grid = (
+        (ix_row_taps >= 0) & (ix_row_taps < n_grid)
+        & (ix_col_taps >= 0) & (ix_col_taps < n_grid)
+    )
+    ix_row_flat = ix_row_taps[in_grid].astype(np.uint32)
+    ix_col_flat = ix_col_taps[in_grid].astype(np.uint32)
 
     # Deduplicate + sort for bit-reproducibility (plan §3 line 306).
     # Pack (row, col) into a single uint32 key for unique() — N_grid
