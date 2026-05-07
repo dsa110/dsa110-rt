@@ -217,15 +217,15 @@ class TestF33SummedDmPlan:
         """Synthesise a minimal-valid canonical :class:`DmPlan` (full
         schema; mirrors :func:`tests.test_contracts._make_minimal_dm_plan`).
         """
-        from dsart.common.contracts import (
+        from dsart.common.contracts import DmPlan
+        from dsart.common.constants import (
+            BW_PROC_MHZ,
             DM_PLAN_METADATA_VERSION,
-            DmPlan,
+            N_CHAN_PROC_NATIVE,
             N_SEARCH,
             N_SEARCH_GPU,
-            NU_TOP_PROC_GHZ,
             NU_BOT_PROC_GHZ,
-            BW_PROC_MHZ,
-            N_CHAN_PROC_NATIVE,
+            NU_TOP_PROC_GHZ,
         )
         if dms is None:
             dms = [0.0, 100.0, 1000.0, 3000.0]
