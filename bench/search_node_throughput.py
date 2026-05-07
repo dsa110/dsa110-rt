@@ -254,7 +254,15 @@ async def _bench_main(args: argparse.Namespace) -> int:
         fine_to_coarse=fine_to_coarse,
         rng=np.random.default_rng(int(args.rng_seed)),
         cube_cadence_s=cube_cadence_s,
+        pre_quantise=bool(args.prequantise),
     )
+    if args.prequantise:
+        _LOG.info(
+            "SyntheticRxRingSource: --prequantise on (M3 RX-ring "
+            "chunk-8b emulation: one cf32 cube quantised once and "
+            "yielded as cint8 every iteration; isolates GPU pipeline "
+            "from host-side bench scaffolding)."
+        )
     device = str(args.device)
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -316,11 +324,25 @@ async def _bench_main(args: argparse.Namespace) -> int:
         "image_backend=%s gpu_complex_dtype=%s",
         image_backend, gpu_complex_dtype,
     )
+    layer1_max_samples = (
+        int(args.layer1_max_samples)
+        if args.layer1_max_samples is not None and int(args.layer1_max_samples) > 0
+        else None
+    )
     pipeline = CubePipeline(
         config=pipeline_cfg,
         detector=detector,
-        layer1_state=Layer1State(n_fdm=n_fdm, n_burnin_cubes=5),
+        layer1_state=Layer1State(
+            n_fdm=n_fdm,
+            n_burnin_cubes=5,
+            max_samples=layer1_max_samples,
+        ),
     )
+    if layer1_max_samples is not None:
+        _LOG.info(
+            "Layer1State: max_samples=%d (per-fdm σ-clip subsample cap)",
+            layer1_max_samples,
+        )
 
     # ---- Listener + emitter setup ----
     listener_cfg = MockListenerConfig(
@@ -553,6 +575,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "boxcar (forwarded to boxcar_via_cumsum's tile_size arg). "
              "Default 64 caps the fp32 cumsum working set at ~768 MiB "
              "at production geometry.",
+    )
+    parser.add_argument(
+        "--prequantise", action="store_true",
+        help="Pre-quantise one cube of cf32 streams to cint8 once in "
+             "the synthetic RxRing source and re-yield the cached cint8 "
+             "stack on every iteration. Emulates the chunk-8b RX-ring "
+             "production contract (M3 emits cint8 already; search node "
+             "never re-quantises) and isolates the GPU pipeline cost "
+             "from host-side bench scaffolding (synthetic source "
+             "generation + cf -> cint8 quantise dominate the bench at "
+             "T_det=256/N_grid=256 — together ~5 s/cube on h01).",
+    )
+    parser.add_argument(
+        "--layer1-max-samples", type=int, default=1_000_000,
+        help="Per-fdm cell-count cap for the Layer-1 σ-clipped std "
+             "(forwarded to ``Layer1State.max_samples``). At production "
+             "geometry each fdm slab has 256³ = 16.8 M cells; capping "
+             "at 1 M brings ``torch.median`` per iter from ~25 ms to "
+             "~1 ms with σ̂ standard error ≈ 7e-4 σ. Set ≤ 0 or omit to "
+             "disable (chunk-1 behaviour: full slab). Default 1_000_000.",
     )
     parser.add_argument(
         "--out", type=str,
