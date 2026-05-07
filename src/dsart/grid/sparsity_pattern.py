@@ -91,7 +91,9 @@ __all__ = [
     "SparsityPattern",
     "build_pattern",
     "compute_antpos_hash",
+    "compute_chgroup_auto_cell_lambda",
     "compute_chgroup_table_hash",
+    "compute_top_of_band_cell_lambda",
     "gaussian_kernel_weights",
     "predict_pattern_id",
     "quantise_dec_deg",
@@ -292,6 +294,7 @@ def _pattern_id_payload(
     antpos_hash: int,
     chgroup_table_hash: int,
     chan_sum_factor: int = 1,
+    cell_lambda: float = 0.0,
 ) -> bytes:
     """Pack the input tuple into a fixed-layout byte string for hashing.
 
@@ -310,13 +313,24 @@ def _pattern_id_payload(
         8       8      float64 dec_deg_quant
         16      8      uint64  antpos_hash
         24      8      uint64  chgroup_table_hash
-        total: 32 bytes
+        32      8      float64 cell_lambda           (F28; ≥ 0; 0 reserved for "auto")
+        total: 40 bytes
 
-    Bumping the layout keeps F33-summed patterns collision-free vs
-    legacy K=1 / K∈{3,5} patterns (corr or search end picking up a
-    stale pattern with mismatched ``chan_sum_factor`` would feed
-    a 384-channel pattern with 48-channel vis or vice versa, with
-    catastrophic mis-gridded cells).
+    The :data:`cell_lambda` field (F28) is folded into ``pattern_id``
+    so the corr and search ends cannot silently mismatch on the
+    cell-scale: legacy per-chgroup auto-fit yields a ``cell_lambda``
+    derived from this chgroup's max baseline + top frequency, while
+    F28 common-cell-lambda mode yields a value derived from the
+    top-of-band reference frequency. Using a stale pattern of one
+    flavour against vis of the other would silently mis-grid.
+
+    Bumping the layout keeps F33-summed and F28-common-cell-lambda
+    patterns collision-free vs legacy K=1 / K∈{3,5} patterns. A corr
+    or search end picking up a stale pattern with mismatched
+    ``chan_sum_factor`` or ``cell_lambda`` would feed a 384-channel
+    pattern with 48-channel vis (or vice versa) or a chgroup-local
+    cell scale with common-grid vis, with catastrophic mis-gridded
+    cells.
     """
     if not 0 <= chgroup < (1 << 16):
         raise ValueError(f"chgroup={chgroup} out of uint16 range")
@@ -336,6 +350,10 @@ def _pattern_id_payload(
         raise ValueError(
             f"chgroup_table_hash={chgroup_table_hash} not a uint64"
         )
+    if not (np.isfinite(cell_lambda) and cell_lambda >= 0.0):
+        raise ValueError(
+            f"cell_lambda={cell_lambda} must be finite and ≥ 0"
+        )
     return (
         np.uint16(chgroup).tobytes()
         + np.uint16(n_grid).tobytes()
@@ -344,6 +362,7 @@ def _pattern_id_payload(
         + np.float64(dec_deg_quant).tobytes()
         + np.uint64(antpos_hash).tobytes()
         + np.uint64(chgroup_table_hash).tobytes()
+        + np.float64(cell_lambda).tobytes()
     )
 
 
@@ -401,6 +420,30 @@ class SparsityPattern:
     chgroup_table_hash : int
         ``blake2b_64`` of the chgroup → ch0 / ν_chgroup_top table
         (provenance).
+    cell_lambda : float
+        F28: per-cell λ-extent of the (u, v) grid (cycles per radian
+        per cell). Image-domain pixel size is ``1 / (n_grid *
+        cell_lambda)`` rad. Two regimes:
+
+        * **per-chgroup auto** (legacy, default when
+          :func:`build_pattern` is called with ``cell_lambda=None``):
+          ``cell_lambda`` is sized so this chgroup's largest
+          baseline-in-λ critically samples the grid edge —
+          ``cell_lambda = max_baseline_lambda(this chgroup) * 2 /
+          n_grid``. Each chgroup gets its OWN pixel scale, so the
+          same source lands at slightly different pixels in
+          different chgroups.
+        * **common (F28)**: caller supplies an explicit
+          ``cell_lambda`` (e.g. derived from the top-of-band
+          reference frequency via
+          :func:`compute_top_of_band_cell_lambda`). All chgroups
+          share the same image pixel grid, so their gridded image
+          cubes can be summed pixel-for-pixel by the
+          fine-dedisperser/imager without resampling.
+
+        Stored on the dataclass + folded into ``pattern_id`` so the
+        corr and search ends cannot silently mismatch on the cell
+        scale.
     """
 
     ix_row: np.ndarray
@@ -414,6 +457,7 @@ class SparsityPattern:
     antpos_hash: int
     chgroup_table_hash: int
     chan_sum_factor: int = 1
+    cell_lambda: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +697,151 @@ def _per_baseline_uv_meters(
     return du_m, dv_m
 
 
+def compute_chgroup_auto_cell_lambda(
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    *,
+    chgroup: int,
+    n_grid: int = N_GRID_DEFAULT,
+    chan_sum_factor: int = 1,
+    is_core_baseline_mask: np.ndarray | None = None,
+) -> float:
+    """Per-chgroup auto-fit ``cell_lambda`` (legacy pre-F28 default).
+
+    Mirrors the ``cell_lambda`` that :func:`build_pattern` would derive
+    internally when invoked with ``cell_lambda=None`` (the legacy
+    auto-fit path). Returns
+
+    ::
+
+        cell_lambda = max_baseline_lambda(this chgroup, top channel)
+                      * 2 / n_grid
+
+    so this chgroup's longest baseline-in-λ critically samples the
+    grid edge. Each chgroup gets its OWN cell scale, so a fixed
+    (l, m) source lands at slightly different image pixels in
+    different chgroups.
+
+    Used by :func:`predict_pattern_id` callers who need the
+    legacy-path cell scale to cross-check the pattern hash against
+    a peer that built the pattern with ``cell_lambda=None``.
+
+    Args:
+        antpos_e, antpos_n: ``(NANTS,)`` float arrays.
+        chgroup: chgroup index ``0..N_CHGROUP-1``. Picks
+            ``ν_top(chgroup) = freq_GHz(chgroup, 0)``.
+        n_grid: gridder grid side length. Default
+            :data:`N_GRID_DEFAULT` (= 256).
+        chan_sum_factor: F33 channel-sum factor. Default ``1``
+            (pre-F33). Affects the wavelength array used for the
+            outer product (see :func:`build_pattern` body for the
+            band-CENTER convention).
+        is_core_baseline_mask: optional ``(NBASE,)`` bool. None ⇒
+            keep all cross-baselines (matches :func:`build_pattern`).
+
+    Returns:
+        ``cell_lambda`` in λ units (cycles per radian per cell).
+
+    Raises:
+        ValueError: on degenerate antpos / mask (zero baseline).
+    """
+    du_m, dv_m = _per_baseline_uv_meters(
+        antpos_e, antpos_n, is_core_baseline_mask=is_core_baseline_mask,
+    )
+    nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
+    nu_GHz_full = np.asarray(
+        [freq_GHz(chgroup, ch) for ch in range(NCHAN_PER_CHGROUP)],
+        dtype=np.float64,
+    )
+    if chan_sum_factor == 1:
+        nu_GHz = nu_GHz_full
+    else:
+        nu_GHz = nu_GHz_full.reshape(nchan_eff, chan_sum_factor).mean(axis=1)
+    wavelength_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)
+    u_lam = -du_m[:, None] / wavelength_m[None, :]                    # F20 negation
+    v_lam = -dv_m[:, None] / wavelength_m[None, :]
+    max_baseline_lambda = float(np.max(np.maximum(
+        np.abs(u_lam), np.abs(v_lam),
+    )))
+    if max_baseline_lambda == 0.0:
+        raise ValueError(
+            "max_baseline_lambda == 0 (degenerate antpos / mask); "
+            "cannot compute cell_lambda."
+        )
+    return max_baseline_lambda * 2.0 / n_grid
+
+
+def compute_top_of_band_cell_lambda(
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    *,
+    n_grid: int = N_GRID_DEFAULT,
+    is_core_baseline_mask: np.ndarray | None = None,
+) -> float:
+    """F28: common ``cell_lambda`` for ALL chgroups, sized to the top of band.
+
+    Returns
+
+    ::
+
+        cell_lambda_common = max_baseline_lambda(top of band) * 2 / n_grid
+
+    where ``max_baseline_lambda(top of band)`` is the longest kept
+    baseline-in-λ at the highest frequency in the system —
+    ``freq_GHz(chgroup=0, ch=0)`` per the package convention (= ν_TOP
+    of the band; see :data:`dsart.common.constants.NU_TOP_PROC_GHZ`).
+    Choosing the top-of-band frequency makes the resulting cell scale
+    the LARGEST any chgroup would auto-fit to, which guarantees:
+
+    * **chgroup 0 (top)**: critically sampled — the longest baseline
+      lands exactly at ``±N_grid/2`` cells (no aliasing, no wasted
+      grid cells).
+    * **chgroup g > 0 (lower frequency)**: oversampled — at lower
+      frequencies the same baselines map to SMALLER ``|u|, |v|`` in
+      λ, so they all sit inside the grid with room to spare. The
+      pattern fill fraction drops monotonically with chgroup.
+    * **all chgroups**: the SAME cell scale ⇒ the same image-domain
+      pixel grid. A fixed (l, m) source lands at the SAME ``(row,
+      col)`` pixel in every chgroup, so per-chgroup gridded image
+      cubes can be summed pixel-for-pixel by the
+      fine-dedisperser/imager without resampling.
+
+    Args:
+        antpos_e, antpos_n: ``(NANTS,)`` float arrays.
+        n_grid: gridder grid side length. Default
+            :data:`N_GRID_DEFAULT` (= 256).
+        is_core_baseline_mask: optional ``(NBASE,)`` bool. None ⇒
+            keep all cross-baselines (matches :func:`build_pattern`).
+
+    Returns:
+        ``cell_lambda_common`` in λ units. Pass to all 16
+        :func:`build_pattern` calls (one per chgroup) to land them
+        on a shared image pixel grid.
+
+    Raises:
+        ValueError: on degenerate antpos / mask (zero baseline).
+    """
+    du_m, dv_m = _per_baseline_uv_meters(
+        antpos_e, antpos_n, is_core_baseline_mask=is_core_baseline_mask,
+    )
+    # Top of band ≡ freq_GHz(0, 0) = NU_TOP_PROC_GHZ (smallest λ ⇒
+    # largest |u|, |v| in λ-units of any baseline at any chgroup).
+    nu_top_GHz = float(freq_GHz(0, 0))
+    wavelength_top_m = SPEED_OF_LIGHT_M_PER_S / (nu_top_GHz * 1e9)
+    # F20 negation cancels under abs(); skip it here for clarity.
+    u_lam_top = du_m / wavelength_top_m
+    v_lam_top = dv_m / wavelength_top_m
+    max_baseline_lambda_top = float(np.max(np.maximum(
+        np.abs(u_lam_top), np.abs(v_lam_top),
+    )))
+    if max_baseline_lambda_top == 0.0:
+        raise ValueError(
+            "max_baseline_lambda(top of band) == 0 (degenerate antpos "
+            "/ mask); cannot compute cell_lambda_common."
+        )
+    return max_baseline_lambda_top * 2.0 / n_grid
+
+
 def build_pattern(
     antpos_e: np.ndarray,
     antpos_n: np.ndarray,
@@ -662,6 +851,7 @@ def build_pattern(
     n_grid: int = N_GRID_DEFAULT,
     kernel_support: int = KERNEL_SUPPORT_DEFAULT,
     chan_sum_factor: int = 1,
+    cell_lambda: float | None = None,
     is_core_baseline_mask: np.ndarray | None = None,
     antpos_hash: int | None = None,
     chgroup_table_hash: int | None = None,
@@ -710,6 +900,27 @@ def build_pattern(
             ``kernel_support`` is folded into ``pattern_id`` so the
             corr / search ends cannot silently reuse a different-K
             pattern.
+        cell_lambda: F28 — optional override for the per-cell λ-extent
+            of the (u, v) grid. Two regimes:
+
+            * ``None`` (legacy default): each chgroup's ``cell_lambda``
+              is auto-fit so that THIS chgroup's largest baseline-in-λ
+              critically samples the grid edge:
+              ``cell_lambda = max_baseline_lambda(this chgroup) * 2 /
+              n_grid``. Each chgroup gets its own pixel scale, so a
+              fixed (l, m) source lands at slightly different pixels
+              in different chgroups.
+            * ``> 0`` (F28 common): caller supplies an explicit value
+              (typically derived from the top-of-band reference
+              frequency via
+              :func:`compute_top_of_band_cell_lambda`). All chgroups
+              built with the SAME ``cell_lambda`` share the same image
+              pixel grid, so per-chgroup gridded image cubes can be
+              summed pixel-for-pixel by the fine-dedisperser/imager
+              without resampling.
+
+            Folded into ``pattern_id`` so the corr and search ends
+            cannot silently mismatch on the cell scale.
         is_core_baseline_mask: optional ``(NBASE,)`` bool, True where
             both antennas of the baseline are in the 82-ant core
             (per plan §3 line 452 / V-4 outrigger zero-fill convention).
@@ -770,22 +981,19 @@ def build_pattern(
             f"NCHAN_PER_CHGROUP={NCHAN_PER_CHGROUP}; summed-channel "
             f"grid would not align."
         )
+    # F28: validate cell_lambda (None ⇒ legacy auto-fit; > 0 ⇒ common).
+    if cell_lambda is not None:
+        if not (np.isfinite(cell_lambda) and cell_lambda > 0.0):
+            raise ValueError(
+                f"cell_lambda={cell_lambda} must be finite and > 0; "
+                f"pass None for legacy per-chgroup auto-fit."
+            )
 
     if antpos_hash is None:
         antpos_hash = compute_antpos_hash(antpos_e, antpos_n)
     if chgroup_table_hash is None:
         chgroup_table_hash = compute_chgroup_table_hash()
     dec_deg_quant = quantise_dec_deg(dec_deg)
-
-    pattern_id = _blake2b_u64(_pattern_id_payload(
-        chgroup=chgroup,
-        dec_deg_quant=dec_deg_quant,
-        n_grid=n_grid,
-        kernel_support=kernel_support,
-        chan_sum_factor=chan_sum_factor,
-        antpos_hash=antpos_hash,
-        chgroup_table_hash=chgroup_table_hash,
-    ))
 
     # ---- Geometric build (DEC-independent in the lambda-uniform
     #      convention adopted here; see docstring) ----------------------
@@ -823,11 +1031,14 @@ def build_pattern(
 
     # Cell scale per plan §3 line 305: ``duv = max_baseline_lambda /
     # (N_grid/2)``  ⇔  ``cell_lambda = max_baseline_lambda * 2 / N_grid``.
-    # ``max_baseline_lambda`` is the largest ``|u|`` or ``|v|`` over all
-    # kept baselines AT THE TOP OF THIS CHGROUP (smallest wavelength,
-    # largest λ-units value). Computing it from the outer-product
-    # tensor makes the cell scale automatically track outrigger
-    # exclusion + the chgroup-local frequency.
+    # F28 (this regime — common cell_lambda across chgroups): if a
+    # ``cell_lambda`` was supplied, use it as-is. Otherwise auto-fit
+    # from THIS chgroup's max baseline-in-λ, where ``max_baseline_lambda``
+    # is the largest ``|u|`` or ``|v|`` over all kept baselines AT THE
+    # TOP OF THIS CHGROUP (smallest wavelength, largest λ-units value).
+    # Computing the auto-fit from the outer-product tensor makes the
+    # cell scale automatically track outrigger exclusion + the
+    # chgroup-local frequency.
     max_baseline_lambda = float(np.max(np.maximum(
         np.abs(u_lam), np.abs(v_lam),
     )))
@@ -836,11 +1047,43 @@ def build_pattern(
             "max_baseline_lambda == 0 (degenerate antpos / mask); "
             "cannot build a sparsity pattern."
         )
-    cell_lambda = max_baseline_lambda * 2.0 / n_grid
+    if cell_lambda is None:
+        cell_lambda_used = max_baseline_lambda * 2.0 / n_grid
+    else:
+        cell_lambda_used = float(cell_lambda)
+        # F28 sanity: warn (via ValueError) if the supplied cell_lambda
+        # is so much SMALLER than the chgroup-local auto-fit that the
+        # baselines spill past ±N_grid/2 cells. A cell_lambda that is
+        # MUCH LARGER than auto-fit is fine (the chgroup is just
+        # oversampled). The factor-of-2 slack avoids tripping on
+        # rounding-edge cases at the grid corners.
+        cell_lambda_min = max_baseline_lambda * 2.0 / n_grid
+        if cell_lambda_used < 0.5 * cell_lambda_min:
+            raise ValueError(
+                f"supplied cell_lambda={cell_lambda_used:.6g} is too "
+                f"small for chgroup={chgroup}: this chgroup's longest "
+                f"baseline at top-of-chgroup is "
+                f"{max_baseline_lambda:.6g} λ which would alias past "
+                f"±N_grid/2 cells at this cell scale. Pick a "
+                f"cell_lambda ≥ "
+                f"{0.5 * cell_lambda_min:.6g} (auto-fit value: "
+                f"{cell_lambda_min:.6g})."
+            )
+
+    pattern_id = _blake2b_u64(_pattern_id_payload(
+        chgroup=chgroup,
+        dec_deg_quant=dec_deg_quant,
+        n_grid=n_grid,
+        kernel_support=kernel_support,
+        chan_sum_factor=chan_sum_factor,
+        antpos_hash=antpos_hash,
+        chgroup_table_hash=chgroup_table_hash,
+        cell_lambda=cell_lambda_used,
+    ))
 
     half = n_grid // 2
-    ix_col_center = np.rint(u_lam / cell_lambda).astype(np.int64) + half  # u-axis
-    ix_row_center = np.rint(v_lam / cell_lambda).astype(np.int64) + half  # v-axis
+    ix_col_center = np.rint(u_lam / cell_lambda_used).astype(np.int64) + half  # u-axis
+    ix_row_center = np.rint(v_lam / cell_lambda_used).astype(np.int64) + half  # v-axis
 
     # G7: expand each (kept-bls, ch) center into a K×K neighborhood
     # ``(center_row + dy, center_col + dx)`` for ``dy, dx ∈
@@ -894,6 +1137,7 @@ def build_pattern(
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
         chan_sum_factor=int(chan_sum_factor),
+        cell_lambda=float(cell_lambda_used),
     )
 
 
@@ -904,10 +1148,12 @@ def predict_pattern_id(
     n_grid: int = N_GRID_DEFAULT,
     kernel_support: int = KERNEL_SUPPORT_DEFAULT,
     chan_sum_factor: int = 1,
+    cell_lambda: float | None = None,
     antpos_e: np.ndarray | None = None,
     antpos_n: np.ndarray | None = None,
     antpos_hash: int | None = None,
     chgroup_table_hash: int | None = None,
+    is_core_baseline_mask: np.ndarray | None = None,
 ) -> int:
     """Compute ``pattern_id`` without building the full pattern.
 
@@ -918,20 +1164,62 @@ def predict_pattern_id(
     :func:`build_pattern.pattern_id`.
 
     Args:
-        chgroup, dec_deg, n_grid, kernel_support: as in
-            :func:`build_pattern`.
-        antpos_e, antpos_n: optional antpos arrays; if provided, used
-            to compute ``antpos_hash`` via :func:`compute_antpos_hash`.
-        antpos_hash: optional pre-computed antpos hash. Must be provided
-            if ``antpos_e``/``antpos_n`` are not.
+        chgroup, dec_deg, n_grid, kernel_support, chan_sum_factor:
+            as in :func:`build_pattern`.
+        cell_lambda: F28 — same semantics as in :func:`build_pattern`.
+
+            * ``None`` (legacy default): the per-chgroup auto-fit
+              value is computed from ``antpos_e/antpos_n`` (which must
+              therefore be passed; the bare ``antpos_hash`` is not
+              enough). Bit-identical to the pre-F28 hash for callers
+              who took the auto-fit path.
+            * ``> 0`` (F28 common): supplied by the caller (typically
+              from :func:`compute_top_of_band_cell_lambda`); folded
+              into the hash so corr / search ends cannot silently
+              mismatch on the cell scale.
+        antpos_e, antpos_n: optional antpos arrays; required when
+            ``cell_lambda`` is ``None`` (so the auto-fit can be
+            recomputed) AND/OR when ``antpos_hash`` is not given.
+        antpos_hash: optional pre-computed antpos hash. Required if
+            ``antpos_e``/``antpos_n`` are not given AND ``cell_lambda``
+            is supplied.
         chgroup_table_hash: optional pre-computed chgroup-table hash.
             Defaults to :func:`compute_chgroup_table_hash` over the
             package constants.
+        is_core_baseline_mask: optional ``(NBASE,)`` bool mask, only
+            consulted when ``cell_lambda is None`` (so the auto-fit
+            sees the same baselines :func:`build_pattern` would).
 
     Returns:
         64-bit unsigned int matching
         :attr:`SparsityPattern.pattern_id` for the same inputs.
     """
+    if cell_lambda is None:
+        # Legacy auto-fit path: must have the actual antpos arrays so
+        # the same auto-fit math :func:`build_pattern` runs can be
+        # re-executed here.
+        if antpos_e is None or antpos_n is None:
+            raise ValueError(
+                "predict_pattern_id with cell_lambda=None (auto-fit) "
+                "requires both antpos_e and antpos_n; the bare "
+                "antpos_hash is insufficient because the auto-fit "
+                "must recompute the same max_baseline_lambda(this "
+                "chgroup) that build_pattern derived. Either pass "
+                "antpos_e/antpos_n, or pass cell_lambda explicitly."
+            )
+        cell_lambda_used = compute_chgroup_auto_cell_lambda(
+            antpos_e, antpos_n,
+            chgroup=chgroup, n_grid=n_grid,
+            chan_sum_factor=chan_sum_factor,
+            is_core_baseline_mask=is_core_baseline_mask,
+        )
+    else:
+        if not (np.isfinite(cell_lambda) and cell_lambda > 0.0):
+            raise ValueError(
+                f"cell_lambda={cell_lambda} must be finite and > 0; "
+                f"pass None for legacy per-chgroup auto-fit."
+            )
+        cell_lambda_used = float(cell_lambda)
     if antpos_hash is None:
         if antpos_e is None or antpos_n is None:
             raise ValueError(
@@ -950,5 +1238,6 @@ def predict_pattern_id(
         chan_sum_factor=chan_sum_factor,
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
+        cell_lambda=cell_lambda_used,
     ))
 

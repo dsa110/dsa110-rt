@@ -575,6 +575,7 @@ class ReplayDefaults:
     obs_dec_deg: float
     n_grid: int = 256
     kernel_support: int = 1
+    cell_lambda_mode: str = "common"                                 # F28 default
     t_int_fast_native: int = 8                                       # production cadence
     cal_mode: str = CalMode.PHASE_ONLY
     cal_pol_swap: bool = False
@@ -594,6 +595,7 @@ class ReplayDefaults:
             obs_dec_rad=math.radians(self.obs_dec_deg),
             n_grid=self.n_grid,
             kernel_support=self.kernel_support,
+            cell_lambda_mode=self.cell_lambda_mode,
             t_int_fast_native=self.t_int_fast_native,
             cal_path=cal_path,
             cal_mode=self.cal_mode,
