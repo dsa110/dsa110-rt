@@ -72,6 +72,8 @@ __all__ = [
     "Detector",
     "DeterministicDetector",
     "boxcar_via_cumsum",
+    "boxcar_from_padded_cumsum",
+    "precompute_padded_cumsum",
 ]
 
 
@@ -233,6 +235,185 @@ def boxcar_via_cumsum(
     return _boxcar_via_cumsum_untiled(x, axis=axis, width=width)
 
 
+def precompute_padded_cumsum(
+    x: torch.Tensor,
+    *,
+    axis: int,
+    max_width: int,
+    accum_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Pre-compute the zero-prepended, max-width-padded cumsum that the
+    :func:`boxcar_from_padded_cumsum` shortcut consumes.
+
+    For the v1 detector kernel-bank where every kernel shares a delta
+    image + delta DM kernel, the entire bank's per-kernel time-axis
+    boxcar can be expressed as ``W`` narrow-subtractions over a SINGLE
+    cumsum of the cube (no per-kernel cumsum work). This helper builds
+    that one shared cumsum once per pass; ``boxcar_from_padded_cumsum``
+    then computes any boxcar with width ``≤ max_width`` for free
+    (modulo a single fp32 -> output_dtype subtract and cast).
+
+    Memory model: the returned cumsum is ``fp32`` with shape ``x.shape``
+    extended along ``axis`` by ``max_width`` (``max_width // 2`` zero
+    pad-left, ``max_width - 1 - max_width // 2`` zero pad-right, ``+1``
+    for the prepended-zero row) — for the production geometry
+    ``[T_det=256, N_fdm=32, N_grid=256]`` fp16 cube + ``max_width=128``
+    that is ``(384 + 1) * 32 * 256 * 256 * 4 B ≈ 3.0 GiB``. This fits
+    on an 11 GiB 2080 Ti alongside the fp16 cube (1 GiB) and per-kernel
+    fp16 score transient (~1 GiB).
+
+    Args:
+        x: Input tensor (any dtype with cumsum support).
+        axis: Cumsum axis.
+        max_width: Largest boxcar width that will be queried via
+            :func:`boxcar_from_padded_cumsum`. The pad geometry is
+            sized for this width.
+        accum_dtype: Cumsum accumulation dtype. ``None`` -> ``fp32``
+            for fp16/bf16 inputs, ``x.dtype`` otherwise.
+
+    Returns:
+        ``cs`` tensor of shape ``x.shape`` with axis-``axis`` length
+        equal to ``x.shape[axis] + max_width + 1``. ``cs[i] = sum_{j<i}
+        padded[j]`` along ``axis``, with the leading ``max_width//2``
+        and trailing ``max_width - 1 - max_width//2`` rows zero-padded
+        (so off-edge boxcar accesses read partial sums, equivalent to
+        the chunk-1 ``F.pad(..., 0)`` boundary).
+    """
+    if max_width < 1:
+        raise ValueError(f"max_width={max_width}, expected ≥ 1")
+    n = x.shape[axis]
+    if max_width > n:
+        raise ValueError(
+            f"max_width={max_width} exceeds axis-{axis} length {n}"
+        )
+
+    pad_left = max_width // 2
+    pad_right = max_width - 1 - pad_left
+
+    if accum_dtype is None:
+        accum_dtype = (
+            torch.float32
+            if x.dtype in (torch.float16, torch.bfloat16)
+            else x.dtype
+        )
+
+    # Build the padded-cumsum tensor with ZERO transient allocation
+    # beyond ``cs`` itself. The chunk-1 ``F.pad + cast + cumsum + cat``
+    # recipe blows ~12 GiB transient at production geometry; allocating
+    # an intermediate ``cube_accum`` adds another ~2.15 GiB. ``torch.
+    # cumsum`` accepts an ``out=`` argument that writes the cumsum
+    # directly into a pre-allocated slice of ``cs``, so no additional
+    # buffer is needed. Memory profile here:
+    #
+    #   cs zeros        : (n + max_width, ...) accum_dtype  (~3.0 GiB)
+    #   peak (during construction) ............................ ~3.0 GiB
+    #
+    # ``cs`` itself is the only allocation; the cumsum + right-tail
+    # constant-fill both write through views of ``cs``.
+    out_shape = list(x.shape)
+    out_shape[axis] = n + max_width
+    cs = torch.zeros(out_shape, dtype=accum_dtype, device=x.device)
+    target = cs.narrow(axis, 1 + pad_left, n)
+    torch.cumsum(x, dim=axis, dtype=accum_dtype, out=target)
+    if pad_right > 0:
+        # Fill the right padding with the final cumulative sum so
+        # boxcar windows that overhang the right edge see a constant
+        # cs (equivalent to padding the input with zeros on the right).
+        last_row = cs.narrow(axis, 1 + pad_left + n - 1, 1)
+        cs.narrow(axis, 1 + pad_left + n, pad_right).copy_(last_row)
+    return cs
+
+
+def boxcar_from_padded_cumsum(
+    cs: torch.Tensor,
+    *,
+    axis: int,
+    width: int,
+    max_width: int,
+    n_out: int,
+    out_dtype: Optional[torch.dtype] = None,
+    w_tile_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Compute a centred boxcar of ``width`` over the original input
+    using a cumsum produced by :func:`precompute_padded_cumsum` with
+    ``max_width``. ``O(N)`` total work; no cumsum re-computation.
+
+    For ``width = 1`` returns a no-op narrow back to the original
+    range — the unit boxcar is identity but we still produce a tensor
+    of shape ``[..., n_out, ...]`` for caller convenience.
+
+    Args:
+        cs: Output of :func:`precompute_padded_cumsum`.
+        axis: Cumsum axis.
+        width: Desired boxcar width (``≤ max_width``).
+        max_width: ``max_width`` used to build ``cs``.
+        n_out: Output length along ``axis`` (typically the original
+            input's axis-``axis`` length, e.g. ``T_det``).
+        out_dtype: Optional cast for the returned tensor; ``None``
+            keeps ``cs.dtype``.
+        w_tile_size: When set and ``axis != cs.ndim - 1`` and ``cs.ndim
+            >= 2``, write the output one ``w_tile_size``-column tile
+            of the last axis at a time; bounds the fp32 ``high - low``
+            transient at ~``w_tile_size × n_out × prefix_axes × 4 B``.
+            At production geometry (T=256, F=32, H=W=256) the untiled
+            fp32 ``high - low`` is ~2 GiB; ``w_tile_size=64`` caps it
+            at ~16 MiB.
+
+    Returns:
+        Boxcar-summed tensor with the same shape as ``cs`` except axis
+        ``axis`` is ``n_out``.
+    """
+    if width < 1 or width > max_width:
+        raise ValueError(
+            f"width={width} not in [1, max_width={max_width}]"
+        )
+    pad_left_full = max_width // 2
+    pad_left_w = width // 2
+    offset = pad_left_full - pad_left_w
+
+    untiled = (
+        w_tile_size is None
+        or cs.ndim < 2
+        or axis == cs.ndim - 1
+    )
+    if untiled:
+        if width == 1:
+            out = cs.narrow(axis, offset + 1, n_out) - cs.narrow(axis, offset, n_out)
+        else:
+            high = cs.narrow(axis, offset + width, n_out)
+            low = cs.narrow(axis, offset, n_out)
+            out = high - low
+        if out_dtype is not None and out.dtype != out_dtype:
+            out = out.to(out_dtype)
+        return out
+
+    # Tiled along the last axis (W) to bound the fp32 ``high - low``
+    # transient. We pre-allocate the output (fp16 in production) and
+    # write each tile via a tile-local subtract+cast.
+    last_dim = cs.ndim - 1
+    out_shape = list(cs.shape)
+    out_shape[axis] = n_out
+    eff_dtype = out_dtype if out_dtype is not None else cs.dtype
+    out = torch.empty(out_shape, dtype=eff_dtype, device=cs.device)
+    for w0 in range(0, cs.shape[last_dim], int(w_tile_size)):
+        w1 = min(w0 + int(w_tile_size), cs.shape[last_dim])
+        cs_tile = cs.narrow(last_dim, w0, w1 - w0)
+        if width == 1:
+            tile = (
+                cs_tile.narrow(axis, offset + 1, n_out)
+                - cs_tile.narrow(axis, offset, n_out)
+            )
+        else:
+            high = cs_tile.narrow(axis, offset + width, n_out)
+            low = cs_tile.narrow(axis, offset, n_out)
+            tile = high - low
+        if tile.dtype != eff_dtype:
+            tile = tile.to(eff_dtype)
+        out.narrow(last_dim, w0, w1 - w0).copy_(tile)
+        del cs_tile, tile
+    return out
+
+
 def _boxcar_via_cumsum_untiled(
     x: torch.Tensor,
     *,
@@ -354,6 +535,10 @@ class DeterministicDetector(torch.nn.Module):
         # over the K-batched score tensor stay valid.
         self._streaming = bool(streaming)
         self._streaming_tile_size = int(streaming_tile_size)
+        # Pre-allocated padded-cumsum scratch for the v1-collapsed-bank
+        # amortise fast-path; built lazily on first cube and reused
+        # across cubes (saves a ~3 GiB malloc/free per cube).
+        self._amortise_cs: Optional[torch.Tensor] = None
         if self._streaming and self._streaming_tile_size < 1:
             raise ValueError(
                 f"streaming_tile_size={streaming_tile_size}, expected ≥ 1"
@@ -794,6 +979,66 @@ class DeterministicDetector(torch.nn.Module):
 
         return t_summed
 
+    def _get_or_build_amortise_cs(
+        self,
+        cube: torch.Tensor,
+        *,
+        max_width: int,
+    ) -> torch.Tensor:
+        """Return the pre-allocated padded-cumsum scratch (shape
+        ``(T_det + max_width, F, H, W)`` accum_dtype). Allocate on
+        first call; reuse across cubes. Caller must populate the
+        contents via :meth:`_fill_amortise_cs` before reading.
+
+        The buffer is intentionally NOT zeroed on reuse: the leading
+        ``pad_left + 1`` rows are static zeros (they're part of the
+        max-width zero-pad and never get overwritten), and the
+        trailing ``pad_right`` rows are constant-fill of the new cube's
+        total cumsum (rewritten by :meth:`_fill_amortise_cs`). The
+        cumsum middle section (``narrow(axis, 1+pad_left, T_det)``)
+        is overwritten in-place via ``torch.cumsum(out=...)`` so no
+        stale data leaks.
+        """
+        accum_dtype = (
+            torch.float32
+            if cube.dtype in (torch.float16, torch.bfloat16)
+            else cube.dtype
+        )
+        n = cube.shape[0]
+        target_shape = (n + max_width,) + tuple(cube.shape[1:])
+        if (
+            self._amortise_cs is not None
+            and self._amortise_cs.shape == target_shape
+            and self._amortise_cs.dtype == accum_dtype
+            and self._amortise_cs.device == cube.device
+        ):
+            return self._amortise_cs
+        self._amortise_cs = torch.zeros(
+            target_shape, dtype=accum_dtype, device=cube.device,
+        )
+        return self._amortise_cs
+
+    def _fill_amortise_cs(
+        self,
+        cs: torch.Tensor,
+        cube: torch.Tensor,
+        *,
+        max_width: int,
+        axis: int = 0,
+    ) -> None:
+        """Populate the pre-allocated cs buffer with the new cube's
+        zero-padded cumulative sum along ``axis``. See
+        :func:`precompute_padded_cumsum` for the layout.
+        """
+        n = cube.shape[axis]
+        pad_left = max_width // 2
+        pad_right = max_width - 1 - pad_left
+        target = cs.narrow(axis, 1 + pad_left, n)
+        torch.cumsum(cube, dim=axis, dtype=cs.dtype, out=target)
+        if pad_right > 0:
+            last_row = cs.narrow(axis, 1 + pad_left + n - 1, 1)
+            cs.narrow(axis, 1 + pad_left + n, pad_right).copy_(last_row)
+
     def _streaming_forward(
         self,
         cube: torch.Tensor,
@@ -857,6 +1102,38 @@ class DeterministicDetector(torch.nn.Module):
         cube_valid = bool(torch.all(validity_mask).item())
         tile_size = self._streaming_tile_size
 
+        # Detect the v1-collapsed bank optimisation: every kernel uses
+        # a 1×1 delta image kernel + a width-1 (no-op) DM boxcar; the
+        # entire bank's per-kernel time-axis boxcar is then a single
+        # shared time-axis cumsum + per-kernel narrow-subtract. This
+        # amortises K cumsums into 1 per pass — the dominant detector
+        # cost at production geometry (T_det=256, N_fdm=32, N_grid=256)
+        # because each cumsum is a ~10 GiB fp32 memory-traffic blow.
+        # See M5_PLAN_FIXES (D26).
+        all_image_delta = all(
+            kernel.image_kernel_size == 1
+            and float(getattr(kernel, "image_kernel").item()) == 1.0
+            for kernel in self._kernel_bank
+        )
+        all_dm_unit = all(
+            kernel.k_dm_width == 1 for kernel in self._kernel_bank
+        )
+        amortise_time_cumsum = (
+            bool(all_image_delta)
+            and bool(all_dm_unit)
+            and len(self._kernel_bank) > 1
+        )
+        amortise_max_width = 1
+        if amortise_time_cumsum:
+            amortise_max_width = max(
+                int(kernel.k_time_width) for kernel in self._kernel_bank
+            )
+            if amortise_max_width > cube.shape[0]:
+                # max_width must fit the cumsum axis; fall back to the
+                # per-kernel boxcar path for the (rare) tiny-cube case.
+                amortise_time_cumsum = False
+                amortise_max_width = 1
+
         # ---- Pass 1: per-kernel σ_this for the Layer-2 update ----
         sigma_this_per_kernel = torch.empty(
             (K,), dtype=torch.float32, device=cube.device,
@@ -866,10 +1143,35 @@ class DeterministicDetector(torch.nn.Module):
         # on the streaming path.
         from ..noise_norm.layer2 import layer2_interior_sigma
 
-        for k_idx, kernel in enumerate(self._kernel_bank):
-            score_k = self._compute_score_for_kernel(
-                cube, kernel, tile_size=tile_size,
+        # Pre-allocate (or reuse) the amortised-cumsum buffer once
+        # per detector lifetime. Avoids re-allocating a ~3 GiB buffer
+        # per cube and avoids the caching-allocator fragmentation that
+        # forces a per-cube ``empty_cache`` (~150 ms cost).
+        if amortise_time_cumsum:
+            cs_pass1 = self._get_or_build_amortise_cs(
+                cube, max_width=amortise_max_width,
             )
+            self._fill_amortise_cs(
+                cs_pass1, cube, max_width=amortise_max_width,
+            )
+        else:
+            cs_pass1 = None
+
+        for k_idx, kernel in enumerate(self._kernel_bank):
+            if cs_pass1 is not None:
+                score_k = boxcar_from_padded_cumsum(
+                    cs_pass1,
+                    axis=0,
+                    width=int(kernel.k_time_width),
+                    max_width=amortise_max_width,
+                    n_out=int(cube.shape[0]),
+                    out_dtype=cube.dtype,
+                    w_tile_size=tile_size,
+                )
+            else:
+                score_k = self._compute_score_for_kernel(
+                    cube, kernel, tile_size=tile_size,
+                )
             # Keep score_k in its native dtype (typically fp16 on the
             # production GPU path); ``sigma_clipped_std`` upcasts to
             # fp32 internally. ``layer2_interior_sigma`` expects a
@@ -897,11 +1199,25 @@ class DeterministicDetector(torch.nn.Module):
         warmup_flag = int(CandidateFlags.NOISE_WARMUP) if is_warming_up else 0
 
         # ---- Pass 2: per-kernel decode against the just-updated σ_k ----
+        # Reuse the same pre-allocated cs buffer (the cube hasn't
+        # changed between passes — Layer-2 just updated σ_k).
+        cs_pass2 = cs_pass1
         per_kernel_cands: List[Candidate] = []
         for k_idx, kernel in enumerate(self._kernel_bank):
-            score_k = self._compute_score_for_kernel(
-                cube, kernel, tile_size=tile_size,
-            )
+            if cs_pass2 is not None:
+                score_k = boxcar_from_padded_cumsum(
+                    cs_pass2,
+                    axis=0,
+                    width=int(kernel.k_time_width),
+                    max_width=amortise_max_width,
+                    n_out=int(cube.shape[0]),
+                    out_dtype=cube.dtype,
+                    w_tile_size=tile_size,
+                )
+            else:
+                score_k = self._compute_score_for_kernel(
+                    cube, kernel, tile_size=tile_size,
+                )
             s_k_scalar = float(s_k_tensor[k_idx].item())
             if s_k_scalar == 0.0:
                 # Degenerate kernel: should never happen post-Layer-2's
@@ -944,6 +1260,8 @@ class DeterministicDetector(torch.nn.Module):
                 cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
             per_kernel_cands.extend(cands)
 
+        # Note: the amortise cs buffer (cs_pass1 == cs_pass2) is owned
+        # by the detector and reused across cubes; do not free here.
         merged = merge_across_kernels(
             per_kernel_cands,
             merge_radius_lm=self._merge_radius_lm,
