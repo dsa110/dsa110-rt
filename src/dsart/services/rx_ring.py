@@ -112,6 +112,18 @@ class CubeRingSlot:
             chunk-8b delivery and isolate the GPU pipeline cost from
             host-side bench scaffolding. Default ``None`` keeps the
             chunk-6a contract (cf streams only).
+        per_chgroup_scale: optional ``[N_chg] float32`` array of per-
+            chgroup multiplicative dequant scales (chunk-8(c)). Pairs
+            with ``per_chgroup_cint8_stack``: when populated the GPU
+            imager applies ``scale[g] * cint8[g, ...] + offset[g]``
+            inline so the dirty-image output is in physical visibility
+            units. ``None`` defers to the imager's unit-scale fast
+            path (Layer-1 σ-clip downstream still normalises away any
+            constant gain). The bench fallback uses ``1 / quantise_
+            global_scale`` broadcast over all 16 chgroups.
+        per_chgroup_offset_re / per_chgroup_offset_im: optional
+            ``[N_chg] float32`` arrays of per-chgroup DC re / im
+            offsets. ``None`` → zeros.
     """
 
     cube_id: int
@@ -123,6 +135,9 @@ class CubeRingSlot:
     t_det: int
     n_grid: int
     per_chgroup_cint8_stack: Optional[np.ndarray] = None
+    per_chgroup_scale: Optional[np.ndarray] = None
+    per_chgroup_offset_re: Optional[np.ndarray] = None
+    per_chgroup_offset_im: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.cube_id < 0:
@@ -169,6 +184,35 @@ class CubeRingSlot:
                     f"per_chgroup_cint8_stack n_grid axes "
                     f"({cint8.shape[3]}, {cint8.shape[4]}) != n_grid="
                     f"{self.n_grid}"
+                )
+        # Per-chgroup calibration arrays (chunk-8(c)). All three are
+        # length-N_chg float32 1-D arrays with N_chg matching the cint8
+        # stack's outer dim when present (otherwise informational —
+        # CubePipeline._build_cube_gpu reconciles vs cfg.gpu_n_chgroup).
+        n_chg_expected: Optional[int]
+        if self.per_chgroup_cint8_stack is not None:
+            n_chg_expected = int(self.per_chgroup_cint8_stack.shape[0])
+        else:
+            n_chg_expected = None
+        for name, arr in (
+            ("per_chgroup_scale", self.per_chgroup_scale),
+            ("per_chgroup_offset_re", self.per_chgroup_offset_re),
+            ("per_chgroup_offset_im", self.per_chgroup_offset_im),
+        ):
+            if arr is None:
+                continue
+            if arr.dtype != np.float32:
+                raise TypeError(
+                    f"{name}.dtype={arr.dtype}, expected float32"
+                )
+            if arr.ndim != 1:
+                raise ValueError(
+                    f"{name}.shape={arr.shape}, expected 1-D [N_chg]"
+                )
+            if n_chg_expected is not None and arr.shape[0] != n_chg_expected:
+                raise ValueError(
+                    f"{name}.shape={arr.shape} != per_chgroup_cint8_stack "
+                    f"N_chg={n_chg_expected}"
                 )
 
 

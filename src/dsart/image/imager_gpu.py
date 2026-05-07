@@ -159,13 +159,22 @@ class GpuImager:
         *,
         streams_cint8: torch.Tensor,           # [N_chg, T_stream, 2, N, N] int8
         time_shifts_gpu: torch.Tensor,         # [N_fdm, N_chgroup] int32 cuda
+        chgroup_scales: Optional[torch.Tensor] = None,
+        chgroup_offsets_re: Optional[torch.Tensor] = None,
+        chgroup_offsets_im: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the full GPU imager for one cube.
 
         Per-fdm pipeline:
           1. Fused dequant + 16-chgroup index-shifted sum into ``uv_slab``
              (single CUDA kernel; reads cint8 streams, writes
-             ``[T_det, N, N]`` complex_dtype).
+             ``[T_det, N, N]`` complex_dtype). When the optional
+             ``chgroup_scales`` / ``chgroup_offsets_*`` arrays are
+             provided, the kernel applies the per-chgroup
+             ``z[g] = scale[g] * cint8[g] + offset[g]`` calibration
+             inline (chunk-8(c)); otherwise it runs the unit-scale
+             int32-accumulate fast path (Layer-1 σ-clip downstream
+             absorbs any constant scaling).
           2. ``Re(fftshift(ifft2(uv_slab)))`` → ``img_slab_real``.
           3. ``img_slab_real * edge_mask_real`` → ``output_cube[:, f]``.
 
@@ -185,6 +194,17 @@ class GpuImager:
                 the dedispersed cube peaks at cube-time ``t_15`` (the
                 chgroup-15 row of the shift table is identically zero
                 by §3.6.3).
+            chgroup_scales: optional ``[N_chgroup] float32`` cuda
+                tensor of per-chgroup multiplicative scales (chunk-
+                8(c)). When provided, every fdm trial uses the same
+                calibration vector (per-chgroup gain is constant
+                within a cube). ``None`` → unit scale.
+            chgroup_offsets_re: optional ``[N_chgroup] float32`` cuda
+                tensor of per-chgroup real-part DC offsets. ``None``
+                → zeros.
+            chgroup_offsets_im: optional ``[N_chgroup] float32`` cuda
+                tensor of per-chgroup imag-part DC offsets. ``None``
+                → zeros.
 
         Returns:
             ``self.output_cube`` (``[T_det, N_fdm, N_grid, N_grid]
@@ -240,11 +260,28 @@ class GpuImager:
                 "no fdm trial can fit"
             )
 
+        # Calibration arrays (optional). Shape / dtype validation
+        # happens inside fused_dequant_combine_per_fdm; we bind the
+        # variables here so all per-fdm calls share the same tensors.
+        for name, cal in (
+            ("chgroup_scales", chgroup_scales),
+            ("chgroup_offsets_re", chgroup_offsets_re),
+            ("chgroup_offsets_im", chgroup_offsets_im),
+        ):
+            if cal is not None and cal.shape != (cfg.n_chgroup,):
+                raise ValueError(
+                    f"{name}.shape={tuple(cal.shape)}, "
+                    f"expected ({cfg.n_chgroup},)"
+                )
+
         for f in range(cfg.n_fdm):
             fused_dequant_combine_per_fdm(
                 streams_cint8,
                 time_shifts_gpu[f].contiguous(),
                 self.uv_slab,
+                scales=chgroup_scales,
+                offsets_re=chgroup_offsets_re,
+                offsets_im=chgroup_offsets_im,
             )
             img_complex = torch.fft.ifft2(self.uv_slab)
             img_complex = torch.fft.fftshift(img_complex, dim=(-2, -1))

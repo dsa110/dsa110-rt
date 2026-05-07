@@ -438,3 +438,315 @@ def test_fused_dequant_combine_matches_cint8_combine_chgroups(cuda_module):
     assert abs(peak_val - 100 * n_chg) < 1e-3, (
         f"dequant coherent peak should equal 100×N_chg={100 * n_chg}; got {peak_val}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Chunk-8(c) — per-chgroup (scale, offset) calibration variant
+# ---------------------------------------------------------------------------
+
+
+def _python_dequant_combine_calib_cf32(
+    streams_cint8: torch.Tensor,
+    shifts: torch.Tensor,
+    scales: torch.Tensor,
+    offsets_re: torch.Tensor,
+    offsets_im: torch.Tensor,
+    t_det: int,
+) -> torch.Tensor:
+    """Python reference for the calibrated cint8-input fused kernel:
+
+        out[t] = sum_g_in_range (scale[g] * cint8[g, t - shift[g]]
+                                 + complex(offset_re[g], offset_im[g]))
+
+    Out-of-range chgroups contribute 0 (no scale, no offset).
+    """
+    n_chg, t_stream, two, n_grid, _ = streams_cint8.shape
+    assert two == 2
+    re = streams_cint8[:, :, 0, :, :].to(torch.float32)
+    im = streams_cint8[:, :, 1, :, :].to(torch.float32)
+    out = torch.zeros(
+        (t_det, n_grid, n_grid), dtype=torch.complex64,
+        device=streams_cint8.device,
+    )
+    sc = scales.to(torch.float32).cpu().numpy()
+    o_re = offsets_re.to(torch.float32).cpu().numpy()
+    o_im = offsets_im.to(torch.float32).cpu().numpy()
+    for g in range(n_chg):
+        s = int(shifts[g].item())
+        t_in_lo = max(0, s)
+        t_in_hi = min(t_det, t_stream + s)
+        if t_in_hi > t_in_lo:
+            re_slab = re[g, t_in_lo - s : t_in_hi - s] * float(sc[g]) + float(o_re[g])
+            im_slab = im[g, t_in_lo - s : t_in_hi - s] * float(sc[g]) + float(o_im[g])
+            out[t_in_lo:t_in_hi] += torch.complex(re_slab, im_slab)
+    return out
+
+
+def test_fused_dequant_combine_calib_cf32_random(cuda_module):
+    """Calibrated cint8 → cf32 path: per-chgroup scale + offset applied
+    inline matches the Python reference within fp32 reduction tolerance.
+    """
+    torch.manual_seed(13)
+    n_chg, t_stream, n_grid, t_det = 16, 96, 32, 64
+    streams_cint8 = torch.randint(
+        low=-127, high=128, size=(n_chg, t_stream, 2, n_grid, n_grid),
+        dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.randint(
+        0, t_stream - t_det + 1, (n_chg,), dtype=torch.int32, device="cuda",
+    )
+    # Non-trivial calibration: per-chgroup scale ≈ 0.01 with ~30%
+    # spread; complex offset O(1) per chgroup.
+    g_cpu = torch.Generator().manual_seed(13)
+    scales = (
+        0.01 * (1.0 + 0.3 * torch.randn(n_chg, generator=g_cpu))
+    ).to(torch.float32).cuda()
+    offsets_re = (
+        0.5 * torch.randn(n_chg, generator=g_cpu)
+    ).to(torch.float32).cuda()
+    offsets_im = (
+        0.5 * torch.randn(n_chg, generator=g_cpu)
+    ).to(torch.float32).cuda()
+
+    out_fused = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams_cint8, shifts, out_fused,
+        scales=scales, offsets_re=offsets_re, offsets_im=offsets_im,
+    )
+    out_ref = _python_dequant_combine_calib_cf32(
+        streams_cint8, shifts, scales, offsets_re, offsets_im, t_det,
+    )
+    diff = (out_fused - out_ref).abs().max().item()
+    assert diff < 1e-3, f"calib cf32 fused vs python diff = {diff:.3e}"
+
+
+def test_fused_dequant_combine_calib_cf16_random(cuda_module):
+    """Calibrated cint8 → cf16 path: matches the cf32-then-cast
+    reference within fp16 ULP tolerance.
+
+    Per-cell magnitudes after sum: |re|, |im| ≤ 16 × (127 × 0.013 + 0.5)
+    ≈ 34. fp16 ULP at that magnitude is 1/16 ≈ 0.06; with 4-ULP
+    headroom for accumulation order we use atol=0.5.
+    """
+    torch.manual_seed(17)
+    n_chg, t_stream, n_grid, t_det = 16, 96, 32, 64
+    streams_cint8 = torch.randint(
+        low=-127, high=128, size=(n_chg, t_stream, 2, n_grid, n_grid),
+        dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.randint(
+        0, t_stream - t_det + 1, (n_chg,), dtype=torch.int32, device="cuda",
+    )
+    g_cpu = torch.Generator().manual_seed(17)
+    scales = (
+        0.01 * (1.0 + 0.3 * torch.randn(n_chg, generator=g_cpu))
+    ).to(torch.float32).cuda()
+    offsets_re = (
+        0.5 * torch.randn(n_chg, generator=g_cpu)
+    ).to(torch.float32).cuda()
+    offsets_im = (
+        0.5 * torch.randn(n_chg, generator=g_cpu)
+    ).to(torch.float32).cuda()
+
+    out_fused = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex32, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams_cint8, shifts, out_fused,
+        scales=scales, offsets_re=offsets_re, offsets_im=offsets_im,
+    )
+    out_ref_cf32 = _python_dequant_combine_calib_cf32(
+        streams_cint8, shifts, scales, offsets_re, offsets_im, t_det,
+    )
+    out_ref_cf16 = out_ref_cf32.to(torch.complex32)
+    diff = (out_fused - out_ref_cf16).abs().max().item()
+    assert diff < 0.5, (
+        f"calib cf16 fused vs cf32-then-cast diff = {diff:.3e} > 0.5"
+    )
+
+
+def test_fused_dequant_combine_calib_unit_matches_int_path(cuda_module):
+    """Backward compat: the calibrated kernel with scales=1 / offsets=0
+    matches the int-acc fast path bit-exactly (modulo fp32 vs int32
+    accumulation order, which is identical here for a multiply-by-1).
+    """
+    torch.manual_seed(23)
+    n_chg, t_stream, n_grid, t_det = 16, 96, 32, 64
+    streams_cint8 = torch.randint(
+        low=-127, high=128, size=(n_chg, t_stream, 2, n_grid, n_grid),
+        dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.randint(
+        0, t_stream - t_det + 1, (n_chg,), dtype=torch.int32, device="cuda",
+    )
+    out_int = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(streams_cint8, shifts, out_int)
+
+    scales = torch.ones((n_chg,), dtype=torch.float32, device="cuda")
+    offsets = torch.zeros((n_chg,), dtype=torch.float32, device="cuda")
+    out_calib = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams_cint8, shifts, out_calib,
+        scales=scales, offsets_re=offsets, offsets_im=offsets,
+    )
+    diff = (out_int - out_calib).abs().max().item()
+    # Sum of ≤16 ints in fp32 = sum of same ints in int32 (≤16-bit
+    # magnitude fits exactly in fp32's 23-bit mantissa). No drift.
+    assert diff == 0.0, f"calib(unit) vs int-fast-path diff = {diff:.3e}"
+
+
+def test_fused_dequant_combine_calib_partial_None_uses_defaults(cuda_module):
+    """When only one of (scales, offsets_re, offsets_im) is provided,
+    the others default to ones / zeros respectively.
+    """
+    torch.manual_seed(29)
+    n_chg, t_stream, n_grid, t_det = 4, 32, 8, 16
+    streams_cint8 = torch.randint(
+        low=-127, high=128, size=(n_chg, t_stream, 2, n_grid, n_grid),
+        dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.zeros((n_chg,), dtype=torch.int32, device="cuda")
+    g_cpu = torch.Generator().manual_seed(29)
+    scales = (1.0 + 0.5 * torch.randn(n_chg, generator=g_cpu)).to(
+        torch.float32
+    ).cuda()
+
+    out_fused = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams_cint8, shifts, out_fused, scales=scales,
+    )
+
+    # Equivalent: explicit zeros for offsets.
+    zeros = torch.zeros((n_chg,), dtype=torch.float32, device="cuda")
+    out_explicit = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams_cint8, shifts, out_explicit,
+        scales=scales, offsets_re=zeros, offsets_im=zeros,
+    )
+    assert torch.equal(out_fused, out_explicit)
+
+
+def test_fused_dequant_combine_calib_offset_only_constant_shifts(cuda_module):
+    """zero-stream + non-zero offsets: each in-range chgroup contributes
+    its constant DC, so out[t] = sum_g (in_range_mask[g, t]) * offset[g].
+    For shifts=[0, 0, 0, 0] all chgroups are in-range at every t in
+    [0, T_det), so out[t] = sum_g offset[g] for every cell.
+    """
+    n_chg, t_stream, n_grid, t_det = 4, 32, 4, 16
+    streams = torch.zeros(
+        (n_chg, t_stream, 2, n_grid, n_grid), dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.zeros((n_chg,), dtype=torch.int32, device="cuda")
+    scales = torch.ones((n_chg,), dtype=torch.float32, device="cuda")
+    offsets_re = torch.tensor(
+        [0.5, -1.0, 2.0, 3.5], dtype=torch.float32, device="cuda",
+    )
+    offsets_im = torch.tensor(
+        [0.0, 0.25, -0.5, 1.5], dtype=torch.float32, device="cuda",
+    )
+    out = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams, shifts, out,
+        scales=scales, offsets_re=offsets_re, offsets_im=offsets_im,
+    )
+    expect_re = float(offsets_re.sum().item())
+    expect_im = float(offsets_im.sum().item())
+    re_diff = (out.real.to(torch.float32) - expect_re).abs().max().item()
+    im_diff = (out.imag.to(torch.float32) - expect_im).abs().max().item()
+    assert re_diff < 1e-5, f"DC re mismatch: {re_diff}"
+    assert im_diff < 1e-5, f"DC im mismatch: {im_diff}"
+
+
+def test_fused_dequant_combine_calib_offset_only_partial_shift(cuda_module):
+    """Non-zero shifts: only in-range chgroups contribute their DC.
+    With shifts=[0, 4, 8, 12] and t_det=16, output at t<4 sees only
+    chgroup 0; at t<8 sees chgroups 0, 1; at t<12 sees 0..2; at t≥12
+    sees all four.
+    """
+    n_chg, t_stream, n_grid, t_det = 4, 32, 4, 16
+    streams = torch.zeros(
+        (n_chg, t_stream, 2, n_grid, n_grid), dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device="cuda")
+    scales = torch.ones((n_chg,), dtype=torch.float32, device="cuda")
+    offsets_re = torch.tensor(
+        [1.0, 2.0, 4.0, 8.0], dtype=torch.float32, device="cuda",
+    )
+    offsets_im = torch.zeros((n_chg,), dtype=torch.float32, device="cuda")
+    out = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda",
+    )
+    fused_dequant_combine_per_fdm(
+        streams, shifts, out,
+        scales=scales, offsets_re=offsets_re, offsets_im=offsets_im,
+    )
+    out_re = out.real.to(torch.float32)
+    # Active-chgroup sum at each time bin.
+    expected = torch.zeros((t_det,), dtype=torch.float32, device="cuda")
+    for t in range(t_det):
+        for g in range(n_chg):
+            if t >= int(shifts[g].item()):
+                expected[t] += float(offsets_re[g].item())
+    for t in range(t_det):
+        cell_max_diff = (out_re[t] - expected[t]).abs().max().item()
+        assert cell_max_diff < 1e-5, (
+            f"t={t}: DC sum {out_re[t, 0, 0].item()} != expected "
+            f"{expected[t].item()}"
+        )
+
+
+def test_fused_dequant_combine_calib_validates_calibration_dtype(cuda_module):
+    """Non-float32 calibration arrays should raise."""
+    n_chg, t_stream, n_grid, t_det = 4, 32, 8, 16
+    streams = torch.zeros(
+        (n_chg, t_stream, 2, n_grid, n_grid), dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.zeros((n_chg,), dtype=torch.int32, device="cuda")
+    out = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex32, device="cuda",
+    )
+    bad = torch.zeros((n_chg,), dtype=torch.float64, device="cuda")
+    with pytest.raises(RuntimeError, match=r"scales must be float32"):
+        fused_dequant_combine_per_fdm(streams, shifts, out, scales=bad)
+
+
+def test_fused_dequant_combine_calib_validates_calibration_shape(cuda_module):
+    """Per-chgroup arrays must be length N_chg."""
+    n_chg, t_stream, n_grid, t_det = 4, 32, 8, 16
+    streams = torch.zeros(
+        (n_chg, t_stream, 2, n_grid, n_grid), dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.zeros((n_chg,), dtype=torch.int32, device="cuda")
+    out = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex32, device="cuda",
+    )
+    bad = torch.zeros((n_chg + 1,), dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match=r"scales shape mismatch"):
+        fused_dequant_combine_per_fdm(streams, shifts, out, scales=bad)
+
+
+def test_fused_dequant_combine_calib_validates_calibration_device(cuda_module):
+    """Per-chgroup arrays must be on cuda."""
+    n_chg, t_stream, n_grid, t_det = 4, 32, 8, 16
+    streams = torch.zeros(
+        (n_chg, t_stream, 2, n_grid, n_grid), dtype=torch.int8, device="cuda",
+    )
+    shifts = torch.zeros((n_chg,), dtype=torch.int32, device="cuda")
+    out = torch.empty(
+        (t_det, n_grid, n_grid), dtype=torch.complex32, device="cuda",
+    )
+    cpu_arr = torch.zeros((n_chg,), dtype=torch.float32)  # not cuda
+    with pytest.raises(RuntimeError, match=r"scales must be cuda"):
+        fused_dequant_combine_per_fdm(streams, shifts, out, scales=cpu_arr)

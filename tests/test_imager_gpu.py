@@ -299,3 +299,111 @@ def test_process_cube_reuses_workspace_across_calls() -> None:
         streams_cint8=streams, time_shifts_gpu=shifts,
     ).clone()
     assert torch.equal(out1, out2)
+
+
+# ---------------------------------------------------------------------------
+# Chunk-8(c) — per-chgroup (scale, offset) plumbing through GpuImager
+# ---------------------------------------------------------------------------
+
+
+def test_process_cube_unit_calibration_matches_default() -> None:
+    """``process_cube`` with explicit unit-scale + zero-offset arrays
+    matches the default (None) call cell-for-cell. Verifies the calib
+    dispatch is a no-op when the calibration is trivial.
+    """
+    device = _cuda_or_skip()
+    n_chg, n_fdm, t_det, t_stream, n_grid = 4, 4, 16, 32, 32
+    imager = build_default_gpu_imager(
+        n_grid=n_grid, t_det=t_det, n_fdm=n_fdm, n_chgroup=n_chg,
+        device=device,
+    )
+    streams = _make_streams(
+        n_chg=n_chg, t_stream=t_stream, n_grid=n_grid, device=device, seed=5,
+    )
+    shifts = _make_time_shifts(
+        n_fdm=n_fdm, n_chgroup=n_chg, t_stream=t_stream, t_det=t_det,
+        device=device, seed=5,
+    )
+    out_default = imager.process_cube(
+        streams_cint8=streams, time_shifts_gpu=shifts,
+    ).clone()
+
+    scales = torch.ones((n_chg,), dtype=torch.float32, device=device)
+    offsets = torch.zeros((n_chg,), dtype=torch.float32, device=device)
+    out_calib = imager.process_cube(
+        streams_cint8=streams, time_shifts_gpu=shifts,
+        chgroup_scales=scales,
+        chgroup_offsets_re=offsets,
+        chgroup_offsets_im=offsets,
+    ).clone()
+    # fp32 (1*x = int(x) cast to fp32) reduction matches int32 reduction
+    # bit-exact for ≤16 chgroups; the iFFT2 + edge mask are deterministic
+    # so the cubes must be byte-identical.
+    assert torch.equal(out_default, out_calib)
+
+
+def test_process_cube_constant_scale_scales_output_linearly() -> None:
+    """``process_cube`` with a uniform scale=k applied to every chgroup
+    produces an output cube that is a factor of ~k larger than the
+    default unit-scale output (linear in the dequant gain).
+    """
+    device = _cuda_or_skip()
+    n_chg, n_fdm, t_det, t_stream, n_grid = 4, 2, 8, 16, 16
+    imager = build_default_gpu_imager(
+        n_grid=n_grid, t_det=t_det, n_fdm=n_fdm, n_chgroup=n_chg,
+        device=device,
+    )
+    streams = _make_streams(
+        n_chg=n_chg, t_stream=t_stream, n_grid=n_grid, device=device, seed=7,
+    )
+    shifts = _make_time_shifts(
+        n_fdm=n_fdm, n_chgroup=n_chg, t_stream=t_stream, t_det=t_det,
+        device=device, seed=7,
+    )
+    out_default = imager.process_cube(
+        streams_cint8=streams, time_shifts_gpu=shifts,
+    ).clone().to(torch.float32)
+
+    k = 2.5
+    scales = torch.full((n_chg,), k, dtype=torch.float32, device=device)
+    out_scaled = imager.process_cube(
+        streams_cint8=streams, time_shifts_gpu=shifts, chgroup_scales=scales,
+    ).clone().to(torch.float32)
+
+    # Where the default output is meaningfully non-zero (away from the
+    # edge mask), the scaled output should be k * default. Use a
+    # masked relative-error check; cells near zero get absolute atol.
+    abs_default = out_default.abs()
+    threshold = 1e-2 * abs_default.max()
+    mask = abs_default > threshold
+    if mask.any():
+        ratio = (out_scaled[mask] / out_default[mask]).abs()
+        # cf16 → fp32 path has ~3% relative error from the cf16 round
+        # trip; tolerate 5%.
+        assert torch.all((ratio - k).abs() < k * 0.05).item(), (
+            f"scale-by-{k} produced unexpected ratio: "
+            f"min={ratio.min().item():.3f} max={ratio.max().item():.3f}"
+        )
+
+
+def test_process_cube_rejects_calibration_wrong_shape() -> None:
+    """Per-chgroup arrays must be ``(N_chgroup,)``."""
+    device = _cuda_or_skip()
+    n_chg, n_fdm, t_det, t_stream, n_grid = 4, 2, 8, 16, 16
+    imager = build_default_gpu_imager(
+        n_grid=n_grid, t_det=t_det, n_fdm=n_fdm, n_chgroup=n_chg,
+        device=device,
+    )
+    streams = _make_streams(
+        n_chg=n_chg, t_stream=t_stream, n_grid=n_grid, device=device,
+    )
+    shifts = _make_time_shifts(
+        n_fdm=n_fdm, n_chgroup=n_chg, t_stream=t_stream, t_det=t_det,
+        device=device,
+    )
+    bad_scales = torch.ones((n_chg + 1,), dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match=r"chgroup_scales\.shape"):
+        imager.process_cube(
+            streams_cint8=streams, time_shifts_gpu=shifts,
+            chgroup_scales=bad_scales,
+        )

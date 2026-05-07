@@ -199,17 +199,16 @@ def test_gpu_imager_built_lazily_and_reused() -> None:
     not torch.cuda.is_available(), reason="CubePipeline GPU backend requires cuda",
 )
 def test_cpu_and_gpu_backends_agree_on_dispersed_pulse() -> None:
-    """CPU and GPU backends both peak at the same (t, fdm, l, m) for
-    a synthetic dispersed pulse (locks the §3.6.3 sign-convention
-    parity at the pipeline level).
+    """CPU and GPU backends both peak at the same (t, fdm, l, m) AND
+    at the same physical amplitude for a synthetic dispersed pulse
+    (locks the §3.6.3 sign-convention parity AND the chunk-8(c) per-
+    chgroup scale bake-in at the pipeline level).
 
-    Amplitude note: the GPU backend round-trips through cint8 with a
-    global max-abs scale (D25's ``transport.quantize.quantise_streams_global_cint8``),
-    so the GPU cube is the CPU cube multiplied by that scale. The
-    test therefore asserts:
-      * Same (t, fdm, l, m) peak location across both backends.
-      * GPU peak / CPU peak ratio matches the quantise scale within
-        a small tolerance (cint8 rounding error is ≤ 1 ULP per cell).
+    With ``bake_quantise_scale=True`` (the chunk-8(c) production
+    default), the GPU dequant kernel applies ``1 / quantise_scale``
+    per-chgroup so the dirty-image output is in the same physical
+    visibility units as the CPU reference (modulo cint8 rounding).
+    The GPU / CPU peak ratio is therefore ≈ 1.0.
     """
     n_grid = 16
     t_det = 64
@@ -244,6 +243,7 @@ def test_cpu_and_gpu_backends_agree_on_dispersed_pulse() -> None:
         gpu_complex_dtype=torch.complex64,    # cf32 audit path
         image_backend="gpu",
         quantise_target_max=quantise_target_max,
+        bake_quantise_scale=True,
     )
     gpu_det = _make_detector(dtype=torch.float32, device="cuda")
     gpu_pipe = CubePipeline(config=gpu_cfg, detector=gpu_det)
@@ -268,17 +268,169 @@ def test_cpu_and_gpu_backends_agree_on_dispersed_pulse() -> None:
         "(§3.6.3 sign-convention parity)"
     )
 
-    # GPU / CPU amplitude ratio must equal the quantise scale within
-    # cint8 rounding tolerance.
+    # With bake_quantise_scale=True the GPU output is in physical
+    # units; the GPU / CPU amplitude ratio must be ≈ 1.0 within cint8
+    # rounding tolerance (≤ 1 ULP per cell ⇒ ~1% relative error after
+    # a 16-chgroup sum + iFFT).
     cpu_pk_val = float(cpu_cube[cpu_peak[0], target_fdm_idx,
                                 cpu_peak[1], cpu_peak[2]])
     gpu_pk_val = float(gpu_cube[gpu_peak[0], target_fdm_idx,
                                 gpu_peak[1], gpu_peak[2]])
-    expected_scale = quantise_target_max / pulse_amp     # 120 / 100 = 1.2
     ratio = gpu_pk_val / cpu_pk_val
+    assert abs(ratio - 1.0) < 0.05, (
+        f"GPU/CPU peak ratio {ratio:.4f} != 1.0 (tol 5%); "
+        "physical-units bake-in regression?"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CubePipeline GPU backend requires cuda",
+)
+def test_gpu_backend_legacy_unscaled_mode() -> None:
+    """``bake_quantise_scale=False`` keeps the legacy "cint8-magnitude"
+    GPU output (Layer-1 σ-clip downstream is constant-scale-invariant
+    so this still works for SNR-based detection — but the absolute
+    amplitudes are scaled by the host-quantise factor).
+
+    Before chunk-8(c), the GPU pipeline always behaved this way; the
+    flag exists so callers that depend on the legacy behaviour can opt
+    out of the bake-in. Production should leave the flag at its
+    default ``True``.
+    """
+    n_grid = 16
+    t_det = 64
+    n_fdm = 4
+    t_15 = 40
+    pulse_amp = 100
+    quantise_target_max = 120
+
+    slot, target_fdm = _build_dispersed_slot(
+        t_det=t_det, n_fdm=n_fdm, n_grid=n_grid, t_15=t_15,
+        pulse_amp=pulse_amp,
+    )
+    target_fdm_idx = int(target_fdm[0])
+
+    cpu_cfg = CubePipelineConfig(
+        n_grid=n_grid,
+        edge_mask_kernel_support=3,
+        device="cpu",
+        cube_dtype=torch.float32,
+        image_backend="cpu",
+    )
+    cpu_pipe = CubePipeline(
+        config=cpu_cfg,
+        detector=_make_detector(dtype=torch.float32, device="cpu"),
+    )
+    cpu_cube = cpu_pipe.process(slot).cube.cpu().numpy()
+
+    gpu_cfg = CubePipelineConfig(
+        n_grid=n_grid,
+        edge_mask_kernel_support=3,
+        device="cuda",
+        cube_dtype=torch.float32,
+        gpu_complex_dtype=torch.complex64,
+        image_backend="gpu",
+        quantise_target_max=quantise_target_max,
+        bake_quantise_scale=False,
+    )
+    gpu_pipe = CubePipeline(
+        config=gpu_cfg,
+        detector=_make_detector(dtype=torch.float32, device="cuda"),
+    )
+    gpu_cube = gpu_pipe.process(slot).cube.cpu().numpy()
+
+    def _peak_val(cube: np.ndarray, fdm: int) -> float:
+        return float(cube[:, fdm].max())
+
+    cpu_pk = _peak_val(cpu_cube, target_fdm_idx)
+    gpu_pk = _peak_val(gpu_cube, target_fdm_idx)
+    expected_scale = quantise_target_max / pulse_amp     # 120 / 100 = 1.2
+    ratio = gpu_pk / cpu_pk
     assert abs(ratio - expected_scale) / expected_scale < 0.05, (
-        f"GPU/CPU peak ratio {ratio:.4f} != quantise scale "
+        f"legacy GPU/CPU peak ratio {ratio:.4f} != quantise scale "
         f"{expected_scale:.4f} (tol 5%)"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CubePipeline GPU backend requires cuda",
+)
+def test_gpu_backend_uses_slot_per_chgroup_scale_when_provided() -> None:
+    """When the slot carries ``per_chgroup_scale`` (chunk-8(c)
+    production-style metadata bundled with a pre-quantised cint8
+    stack), the GPU imager applies it directly and ignores the host-
+    quantise scale path. With per-chgroup scale = 1 / pulse_amp, the
+    output should match the CPU reference within cint8 rounding.
+    """
+    n_grid = 16
+    t_det = 64
+    n_fdm = 4
+    t_15 = 40
+    pulse_amp = 100
+
+    slot, target_fdm = _build_dispersed_slot(
+        t_det=t_det, n_fdm=n_fdm, n_grid=n_grid, t_15=t_15,
+        pulse_amp=pulse_amp,
+    )
+    target_fdm_idx = int(target_fdm[0])
+
+    # Manually quantise the cf32 streams to cint8 with the same global
+    # max-abs scale the bench fallback would have applied; then expose
+    # the inverse scale on the slot as per-chgroup metadata.
+    from dsart.transport.quantize import quantise_per_chgroup_into_cint8
+
+    n_chg = N_CHGROUP
+    t_stream = next(iter(slot.per_chgroup_streams.values())).shape[0]
+    cint8_buf = np.empty(
+        (n_chg, t_stream, 2, n_grid, n_grid), dtype=np.int8,
+    )
+    scale = quantise_per_chgroup_into_cint8(
+        slot.per_chgroup_streams,
+        out_cint8=cint8_buf,
+        target_max=120,
+        zero_fill_missing=True,
+    )
+    inv_scale = np.float32(1.0 / scale)
+    slot_with_metadata = CubeRingSlot(
+        cube_id=slot.cube_id,
+        specnum_start=slot.specnum_start,
+        per_chgroup_streams=slot.per_chgroup_streams,
+        time_shift_table=slot.time_shift_table,
+        validity_mask=slot.validity_mask,
+        n_fdm_in_cube=slot.n_fdm_in_cube,
+        t_det=slot.t_det,
+        n_grid=slot.n_grid,
+        per_chgroup_cint8_stack=cint8_buf,
+        per_chgroup_scale=np.full(n_chg, inv_scale, dtype=np.float32),
+        per_chgroup_offset_re=np.zeros(n_chg, dtype=np.float32),
+        per_chgroup_offset_im=np.zeros(n_chg, dtype=np.float32),
+    )
+
+    cpu_pipe = CubePipeline(
+        config=CubePipelineConfig(
+            n_grid=n_grid, edge_mask_kernel_support=3, device="cpu",
+            cube_dtype=torch.float32, image_backend="cpu",
+        ),
+        detector=_make_detector(dtype=torch.float32, device="cpu"),
+    )
+    cpu_cube = cpu_pipe.process(slot).cube.cpu().numpy()
+
+    gpu_pipe = CubePipeline(
+        config=CubePipelineConfig(
+            n_grid=n_grid, edge_mask_kernel_support=3, device="cuda",
+            cube_dtype=torch.float32, gpu_complex_dtype=torch.complex64,
+            image_backend="gpu",
+        ),
+        detector=_make_detector(dtype=torch.float32, device="cuda"),
+    )
+    gpu_cube = gpu_pipe.process(slot_with_metadata).cube.cpu().numpy()
+
+    cpu_pk = float(cpu_cube[:, target_fdm_idx].max())
+    gpu_pk = float(gpu_cube[:, target_fdm_idx].max())
+    ratio = gpu_pk / cpu_pk
+    assert abs(ratio - 1.0) < 0.05, (
+        f"slot-supplied calib GPU/CPU peak ratio {ratio:.4f} != 1.0 "
+        "(tol 5%); per-chgroup scale plumbing regression?"
     )
 
 

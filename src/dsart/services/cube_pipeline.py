@@ -123,6 +123,17 @@ class CubePipelineConfig:
         quantise_target_max: clip target for the host-side
             cf → cint8 quantiser. The D25 default is 120 (leaves
             headroom for chgroup-summed roundoff).
+        bake_quantise_scale: chunk-8(c) flag controlling whether the
+            host-quantise global scale is fed forward to the GPU
+            dequant kernel as ``1 / scale`` (broadcast over all
+            chgroups) so the dirty-image output is in physical
+            visibility units. Defaults to ``True``. Set ``False`` to
+            keep the legacy "cint8-magnitude" output that earlier
+            chunks produced (Layer-1 σ-clip downstream is cell-wise
+            insensitive to a constant scale, so this flag is only
+            observable to callers that consume the dirty image
+            pre-Layer-1 — the synthetic-burst recovery bench, the
+            per-fdm peak-amplitude logger).
     """
 
     n_grid: int
@@ -137,6 +148,7 @@ class CubePipelineConfig:
     gpu_n_chgroup: int = N_CHGROUP
     gpu_complex_dtype: torch.dtype = torch.complex32
     quantise_target_max: int = 120
+    bake_quantise_scale: bool = True
 
     def __post_init__(self) -> None:
         if self.n_grid <= 0 or self.n_grid & (self.n_grid - 1):
@@ -415,12 +427,26 @@ class CubePipeline:
         # 1) chunk-8b production (M3 RX-ring delivers cint8 already):
         #    ``slot.per_chgroup_cint8_stack`` is populated; we skip the
         #    host quantise and copy the cint8 stack straight to GPU.
+        #    chunk-8(c): the slot may also carry per-chgroup
+        #    (scale, offset) calibration metadata
+        #    (``slot.per_chgroup_scale``, ``slot.per_chgroup_offset_*``)
+        #    that the GPU imager applies inline so the dirty image is
+        #    in physical visibility units.
         #
         # 2) bench / pre-chunk-8b: ``slot.per_chgroup_streams`` are cf
         #    streams. Quantise streaming per-chgroup into the re-used
         #    host buffer (avoids the dense cf32 stack + cf64 round-trip
         #    the original quantiser allocates, ~13 GiB transient host
-        #    allocs at production geometry).
+        #    allocs at production geometry). The returned global scale
+        #    is fed to the GPU imager as ``1 / scale`` broadcast over
+        #    all chgroups so the dirty image is in the same physical
+        #    units as path (1) — dropping a no-op (scale=1) leaves the
+        #    output in cint8-magnitude units which Layer-1 normalises
+        #    out cell-wise but loses the absolute-magnitude semantics
+        #    production downstream may want.
+        chgroup_scale_t: Optional[torch.Tensor] = None
+        chgroup_offset_re_t: Optional[torch.Tensor] = None
+        chgroup_offset_im_t: Optional[torch.Tensor] = None
         if slot.per_chgroup_cint8_stack is not None:
             cint8_src = slot.per_chgroup_cint8_stack
             if cint8_src.shape != (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid):
@@ -432,8 +458,20 @@ class CubePipeline:
             cint8_t = torch.from_numpy(
                 np.ascontiguousarray(cint8_src)
             ).to(self._device)
+            if slot.per_chgroup_scale is not None:
+                chgroup_scale_t = torch.from_numpy(
+                    np.ascontiguousarray(slot.per_chgroup_scale, dtype=np.float32)
+                ).to(self._device)
+            if slot.per_chgroup_offset_re is not None:
+                chgroup_offset_re_t = torch.from_numpy(
+                    np.ascontiguousarray(slot.per_chgroup_offset_re, dtype=np.float32)
+                ).to(self._device)
+            if slot.per_chgroup_offset_im is not None:
+                chgroup_offset_im_t = torch.from_numpy(
+                    np.ascontiguousarray(slot.per_chgroup_offset_im, dtype=np.float32)
+                ).to(self._device)
         else:
-            _scale = quantise_per_chgroup_into_cint8(
+            quantise_scale = quantise_per_chgroup_into_cint8(
                 slot.per_chgroup_streams,
                 out_cint8=self._cint8_host_buf,
                 target_max=cfg.quantise_target_max,
@@ -442,6 +480,19 @@ class CubePipeline:
             # Push to GPU. ``self._cint8_host_buf`` is mutated in-place
             # next cube; the H2D copy must finalise before we re-use it.
             cint8_t = torch.from_numpy(self._cint8_host_buf).to(self._device)
+            # Bake the inverse of the host-quantise scale into the
+            # imager dequant so the output is in physical units. The
+            # bench host-quantiser uses a single global scale across
+            # all chgroups (per-chgroup would distort cross-chgroup
+            # magnitude balance — see transport/quantize.py docstring),
+            # so all 16 entries here share the same value. Production
+            # (path 1) ships per-chgroup metadata directly.
+            if cfg.bake_quantise_scale and quantise_scale > 0.0:
+                inv_scale = 1.0 / float(quantise_scale)
+                chgroup_scale_t = torch.full(
+                    (n_chg,), inv_scale,
+                    dtype=torch.float32, device=self._device,
+                )
         shifts_t = torch.from_numpy(
             np.ascontiguousarray(slot.time_shift_table.shifts.astype(np.int32))
         ).to(self._device)
@@ -449,6 +500,9 @@ class CubePipeline:
         cube = self._gpu_imager.process_cube(  # type: ignore[union-attr]
             streams_cint8=cint8_t,
             time_shifts_gpu=shifts_t,
+            chgroup_scales=chgroup_scale_t,
+            chgroup_offsets_re=chgroup_offset_re_t,
+            chgroup_offsets_im=chgroup_offset_im_t,
         )
         # GpuImager owns output_cube in-place; clone so the caller can
         # hold it across the next cube. Cheap on cuda; ~3 ms at
