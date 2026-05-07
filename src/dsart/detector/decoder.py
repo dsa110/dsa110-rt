@@ -54,6 +54,7 @@ from ..common.contracts import Candidate, CandidateFlags
 
 __all__ = [
     "decode_local_max",
+    "decode_topk_lowmem",
     "filter_to_canonical",
 ]
 
@@ -210,6 +211,145 @@ def decode_local_max(
             )
         )
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Memory-bounded peak finder (chunk-8 production at production geometry)
+# ---------------------------------------------------------------------------
+
+
+def decode_topk_lowmem(
+    score: torch.Tensor,
+    *,
+    threshold: float,
+    kernel_id: str,
+    k_dm_width: int,
+    k_time_width: int,
+    k_psf_radius: int = 0,
+    detector_version: str = "v1.M5",
+    search_node_id: int = 0,
+    gpu_half: int = 0,
+    event_specnum: int = 0,
+    fine_to_coarse: Optional[torch.Tensor] = None,
+    fine_dm_pc_cm3: Optional[torch.Tensor] = None,
+    n_top: int = 64,
+) -> List[Candidate]:
+    """Memory-bounded peak finder for one kernel's SNR cube.
+
+    The chunk-2 ``decode_local_max`` is a strict local-max NMS (every
+    accepted Candidate is the max of its 4D neighborhood). It runs
+    ``F.max_pool3d`` over (fdm, l, m) per timestep + ``F.max_pool1d``
+    over time via ``permute().reshape()`` to a contiguous
+    ``[N_fdm·H·W, 1, T_det]`` layout. At production geometry (T_det=256,
+    N_fdm=32, N_grid=256, fp16) this materialises ~3 GiB of transient
+    plus a >2 GiB cuDNN workspace inside ``F.max_pool1d`` — total live
+    memory tips past the 11 GiB 2080 Ti budget when stacked behind the
+    chunk-8 GpuImager + score buffers.
+
+    ``decode_topk_lowmem`` is a STRICT SUBSET of ``decode_local_max``'s
+    output for the same threshold: it lifts the top-N global SNR peaks
+    (single fused ``torch.topk`` call, ~16 MiB workspace) then de-
+    duplicates within the kernel's NMS radii. Every Candidate emitted
+    here would also be emitted by ``decode_local_max`` (same kernel_id,
+    same (l, m, dm_idx, t), same SNR); the difference is that
+    ``decode_local_max`` may emit additional local maxima beyond the
+    top-N — the cross-kernel merger handles cross-kernel deduplication
+    regardless, so the merged candidate list is the same when N is
+    chosen ≥ the per-kernel post-NMS count (the production
+    PerCubePerKernelCap predicate caps the emitter at 4 per kernel
+    per cube; n_top=64 is generously above that).
+
+    Args:
+        score: ``[T_det, N_fdm, H, W]`` SNR-normalised score tensor.
+            Any float dtype (the function does not upcast).
+        threshold: SNR threshold; cells with ``snr <= threshold`` are
+            never emitted.
+        kernel_id / k_dm_width / k_time_width / k_psf_radius:
+            forwarded to the per-kernel NMS-radius calculation. Same
+            convention as ``decode_local_max``.
+        detector_version / search_node_id / gpu_half / event_specnum:
+            stamped on emitted Candidates.
+        fine_to_coarse / fine_dm_pc_cm3: optional ``DmPlan`` lookup
+            tables for ``Candidate.dm_idx`` / ``dm_fine`` respectively.
+            Same chunk-2 stub fallback as ``decode_local_max``.
+        n_top: number of top-SNR cells to inspect for the NMS-radius
+            de-duplication. Default 64. The production
+            ``PerCubePerKernelCap`` predicate keeps at most 4 per
+            kernel per cube; n_top=64 leaves headroom for a handful
+            of competing peaks within the NMS radii to be ordered
+            by SNR before the cap.
+
+    Returns:
+        ``List[Candidate]`` ordered by descending SNR. Empty when
+        ``score.max() <= threshold``.
+    """
+    if score.dim() != 4:
+        raise ValueError(
+            f"score.dim()={score.dim()}, expected 4 [T_det, N_fdm, H, W]"
+        )
+    T_det, N_fdm, H, W = score.shape  # noqa: N806
+
+    snr_max_t = score.max()
+    if float(snr_max_t.item()) <= threshold:
+        return []
+
+    delta_l = max(2, int(k_psf_radius))
+    delta_m = max(2, int(k_psf_radius))
+    delta_fdm = int(k_dm_width) // 2 + 1
+    delta_t = int(k_time_width) // 2 + 1
+
+    flat = score.contiguous().reshape(-1)
+    k = int(min(n_top, flat.numel()))
+    top_vals, top_indices = torch.topk(flat, k=k)
+    top_vals_np = top_vals.detach().cpu().numpy()
+    top_indices_np = top_indices.detach().cpu().numpy()
+
+    out: List[Candidate] = []
+    accepted: List[Tuple[int, int, int, int]] = []  # (t, fdm, l, m)
+    for v, ix in zip(top_vals_np, top_indices_np):
+        v_f = float(v)
+        if v_f <= threshold:
+            break
+        t = int(ix) // (N_fdm * H * W)
+        rem = int(ix) % (N_fdm * H * W)
+        f = rem // (H * W)
+        rem = rem % (H * W)
+        l_ = rem // W
+        m_ = rem % W
+        suppressed = False
+        for at, af, al, am in accepted:
+            if (abs(t - at) <= delta_t and abs(f - af) <= delta_fdm
+                    and abs(l_ - al) <= delta_l and abs(m_ - am) <= delta_m):
+                suppressed = True
+                break
+        if suppressed:
+            continue
+        accepted.append((t, f, l_, m_))
+        if fine_to_coarse is not None:
+            dm_idx = int(fine_to_coarse[f].item())
+        else:
+            dm_idx = int(f)
+        if fine_dm_pc_cm3 is not None:
+            dm_fine = float(fine_dm_pc_cm3[f].item())
+        else:
+            dm_fine = float(f)
+        out.append(
+            Candidate(
+                l=float(l_),
+                m=float(m_),
+                dm_fine=dm_fine,
+                dm_idx=dm_idx,
+                event_specnum=int(event_specnum) + int(t),
+                width_samples=int(k_time_width),
+                kernel_id=kernel_id,
+                snr=v_f,
+                detector_version=detector_version,
+                flags=int(CandidateFlags.NONE),
+                search_node_id=int(search_node_id),
+                gpu_half=int(gpu_half),
+            )
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------

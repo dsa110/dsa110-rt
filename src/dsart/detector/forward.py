@@ -55,7 +55,7 @@ from ..common.constants import (
 )
 from ..common.contracts import Candidate, CandidateFlags
 from ..noise_norm.layer2 import Layer2State
-from .decoder import decode_local_max, filter_to_canonical
+from .decoder import decode_local_max, decode_topk_lowmem, filter_to_canonical
 from .kernels import (
     DEFAULT_DETECTOR_DTYPE,
     Kernel,
@@ -337,6 +337,8 @@ class DeterministicDetector(torch.nn.Module):
         streaming: bool = False,
         streaming_tile_size: int = 64,
         layer2_sigma_max_samples: Optional[int] = 1_000_000,
+        streaming_decoder: str = "topk_lowmem",
+        streaming_decoder_n_top: int = 64,
     ) -> None:
         super().__init__()
         # Streaming forward (chunk-8 production refactor): when True,
@@ -369,6 +371,29 @@ class DeterministicDetector(torch.nn.Module):
             int(layer2_sigma_max_samples)
             if layer2_sigma_max_samples is not None else None
         )
+        # Streaming-forward decoder selection. ``decode_local_max`` is
+        # the strict 4D local-max NMS but at production geometry its
+        # ``permute().reshape()`` + ``F.max_pool1d`` workspace blows
+        # past the 11 GiB 2080 Ti budget; ``decode_topk_lowmem`` is a
+        # strict subset that uses ``torch.topk`` + per-kernel NMS-radius
+        # de-duplication with ~16 MiB workspace. The cross-kernel
+        # merger handles cross-kernel deduplication regardless, and the
+        # production PerCubePerKernelCap caps emitter dispatch at 4 per
+        # kernel per cube, so n_top=64 leaves enough headroom for the
+        # lowmem path to match the strict path's emitter output in
+        # practice. Pass "local_max" to opt back into the strict NMS
+        # (small geometries only).
+        if streaming_decoder not in ("local_max", "topk_lowmem"):
+            raise ValueError(
+                f"streaming_decoder={streaming_decoder!r}; expected "
+                f"'local_max' or 'topk_lowmem'"
+            )
+        self._streaming_decoder = str(streaming_decoder)
+        self._streaming_decoder_n_top = int(streaming_decoder_n_top)
+        if self._streaming_decoder_n_top < 1:
+            raise ValueError(
+                f"streaming_decoder_n_top={streaming_decoder_n_top}, expected ≥ 1"
+            )
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
             dtype=dtype
         )
@@ -885,19 +910,35 @@ class DeterministicDetector(torch.nn.Module):
             snr_k = score_k / s_k_scalar
             del score_k
 
-            cands = decode_local_max(
-                snr_k,
-                threshold=self._threshold_sigma,
-                kernel_id=kernel.kernel_id,
-                k_dm_width=kernel.k_dm_width,
-                k_time_width=kernel.k_time_width,
-                detector_version=self._detector_version,
-                search_node_id=self._search_node_id,
-                gpu_half=self._gpu_half,
-                event_specnum=event_specnum,
-                fine_to_coarse=fine_to_coarse,
-                fine_dm_pc_cm3=fine_dm_pc_cm3,
-            )
+            if self._streaming_decoder == "topk_lowmem":
+                cands = decode_topk_lowmem(
+                    snr_k,
+                    threshold=self._threshold_sigma,
+                    kernel_id=kernel.kernel_id,
+                    k_dm_width=kernel.k_dm_width,
+                    k_time_width=kernel.k_time_width,
+                    detector_version=self._detector_version,
+                    search_node_id=self._search_node_id,
+                    gpu_half=self._gpu_half,
+                    event_specnum=event_specnum,
+                    fine_to_coarse=fine_to_coarse,
+                    fine_dm_pc_cm3=fine_dm_pc_cm3,
+                    n_top=self._streaming_decoder_n_top,
+                )
+            else:
+                cands = decode_local_max(
+                    snr_k,
+                    threshold=self._threshold_sigma,
+                    kernel_id=kernel.kernel_id,
+                    k_dm_width=kernel.k_dm_width,
+                    k_time_width=kernel.k_time_width,
+                    detector_version=self._detector_version,
+                    search_node_id=self._search_node_id,
+                    gpu_half=self._gpu_half,
+                    event_specnum=event_specnum,
+                    fine_to_coarse=fine_to_coarse,
+                    fine_dm_pc_cm3=fine_dm_pc_cm3,
+                )
             del snr_k
             if warmup_flag:
                 cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
