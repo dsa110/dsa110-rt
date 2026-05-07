@@ -391,22 +391,28 @@ async def _bench_synthetic(args: argparse.Namespace) -> Dict[str, object]:
 
 async def _bench_captured(args: argparse.Namespace) -> Dict[str, object]:
     """End-to-end mode-captured run: M3-captured NPZ → loader → cube
-    summary. Currently produces an INSPECTION-ONLY record (no detector
-    sweep) — the operator-facing M5 voltage-fixture-search end-to-end
-    detection gate (plan §8 line 2330) is the next chunk-7 hardening
-    step and requires:
-    1. Cube-builder wired to emit ``[T_det, N_grid, N_grid]`` cubes
-       from the loaded ``[N_chgroup=16, n_fv_total, N_grid, N_grid]``
-       streams (ie wrap the chunk-8 ``fused_combine_cuda`` GPU path
-       with cf64-input support, OR cf64 → cint8 quant followed by the
-       chunk-8 cint8-fused path).
-    2. (l, m, t_in_cube) burst-truth coordinates from
-       ``manifest.src_truth`` + the burst's MJD vs the dump-start MJD.
-    3. Pass/fail decision: detector recovers a candidate at the
-       expected (kernel, l, m, t) with SNR ≥ 8σ.
-    Until then this captured-mode run records the loader output (cube
-    geometry, T2 truth, valid_mask) so the operator can verify the
-    M3 → M5 hand-off shape is correct.
+    summary, optionally followed by the v1 detector sweep.
+
+    Two sub-modes (operator-controlled via ``--detector-sweep``):
+
+      ``--detector-sweep`` ON (chunk-7 closure default for is_burst
+        captures): delegates to
+        :mod:`bench.captured_burst_detector` (D24) which loads the cf
+        streams, quantises to cint8, runs the production GpuImager
+        + Layer-1 σ-clip + 8-kernel collapsed-bank streaming detector,
+        and stamps PASS / FAIL based on burst recovery + matched-
+        filter K_time SNR boost. The captured_burst_detector's
+        ``detector.json`` is folded into this bench's ``run.json``
+        envelope.
+
+      ``--detector-sweep`` OFF: legacy INSPECTION_ONLY behaviour
+        (loader smoke-test only); useful when the operator wants to
+        verify the M3 → M5 hand-off shape without burning the GPU.
+
+    The voltage_fixture_search.run.json envelope keeps the M5
+    operator-approval marker stable: ``m_operator_approved.yaml``
+    references this bench's ``voltage_run_id`` (= manifest.run_id),
+    not the captured_burst_detector's report directly.
     """
     if not args.captured_dir:
         raise SystemExit(
@@ -428,7 +434,7 @@ async def _bench_captured(args: argparse.Namespace) -> Dict[str, object]:
         n_fv, n_grid, streams.nbytes, abs_max, abs_mean,
     )
 
-    return {
+    record: Dict[str, object] = {
         "mode": "captured",
         "captured_dir": str(captured_dir),
         "manifest": {
@@ -463,13 +469,112 @@ async def _bench_captured(args: argparse.Namespace) -> Dict[str, object]:
             "abs_max": abs_max,
             "abs_mean": abs_mean,
         },
-        # Detector-sweep gate not yet wired in mode=captured; see the
-        # docstring above for the chunk-7 hardening TODO list. For now
-        # we report INSPECTION_ONLY so the operator sees a clear
-        # status rather than a green PASS that doesn't actually
-        # exercise the detector.
-        "gate_status": "INSPECTION_ONLY",
     }
+
+    # Free the cf64 streams: captured_burst_detector reloads from
+    # disk in its own process-managed memory budget. Holding the
+    # full [16, n_fv_total, 256, 256] cf64 stack here (~1 GiB) on
+    # top of the imager's GPU workspace would risk an OOM during
+    # the detector sweep.
+    del streams
+
+    if not getattr(args, "detector_sweep", False):
+        record["gate_status"] = "INSPECTION_ONLY"
+        record["detector_sweep"] = None
+        return record
+
+    # ---- Detector sweep delegated to captured_burst_detector.
+    # We import here (lazily) to avoid pulling torch/cupy in the
+    # synthetic-mode code path (the synthetic mode uses the CPU
+    # cube_pipeline + a small mock listener and runs in CI).
+    import bench.captured_burst_detector as cbd  # noqa: E402
+
+    detector_out = Path(args.out).resolve() / "detector"
+    detector_out.mkdir(parents=True, exist_ok=True)
+    cbd_args = argparse.Namespace(
+        captured_dir=str(captured_dir),
+        out=str(detector_out),
+        detector_t_det=int(args.detector_t_det),
+        n_fdm=int(args.detector_n_fdm),
+        dm_min=float(args.detector_dm_min),
+        dm_max=float(args.detector_dm_max),
+        coarse_dm=float(args.detector_coarse_dm),
+        shift_offset=int(args.detector_shift_offset),
+        threshold_sigma=float(args.threshold_sigma),
+        target_max=int(args.detector_target_max),
+        merge_radius_lm=int(args.detector_merge_radius_lm),
+        merge_radius_fdm=int(args.detector_merge_radius_fdm),
+        merge_radius_t=int(args.detector_merge_radius_t),
+    )
+    _LOG.info(
+        "captured detector sweep: T_det=%d N_fdm=%d threshold=%.1fσ "
+        "DM∈[%.1f, %.1f] (writing %s)",
+        cbd_args.detector_t_det, cbd_args.n_fdm, cbd_args.threshold_sigma,
+        cbd_args.dm_min, cbd_args.dm_max, detector_out,
+    )
+    rc = cbd._bench_main(cbd_args)
+    detector_record_path = detector_out / "detector.json"
+    if not detector_record_path.exists():
+        record["gate_status"] = "FAIL"
+        record["detector_sweep"] = {
+            "rc": int(rc),
+            "error": "captured_burst_detector did not write detector.json",
+        }
+        return record
+    detector_record = json.loads(detector_record_path.read_text())
+    record["detector_sweep"] = {
+        "rc": int(rc),
+        "detector_json_path": str(detector_record_path),
+        "n_candidates_post_merge": detector_record.get(
+            "n_candidates_post_merge"
+        ),
+        "top_candidate": detector_record.get("top_candidate"),
+        "burst_match": detector_record.get("burst_match"),
+        "rfi_contamination": detector_record.get("rfi_contamination"),
+        "timings_ms": detector_record.get("timings_ms"),
+    }
+    # captured_burst_detector returns rc=0 on PASS, rc=1 on FAIL.
+    # The detector.json itself does NOT carry a gate_status field
+    # (its PASS/FAIL is derived from burst_match on emit), so we
+    # re-derive it here for the run.json envelope using the same
+    # gate semantics (plan §8 line 2330):
+    #   * is_burst fixture → PASS iff burst_match present + matched
+    #     SNR ≥ threshold + matched_filter_snr_boost ≥ 1.0.
+    #   * negative-control fixture → PASS iff NO candidates emitted.
+    if manifest.is_burst:
+        bm = detector_record.get("burst_match")
+        record["gate_status"] = (
+            "PASS"
+            if (
+                bm is not None
+                and float(bm.get("matched_snr", 0.0))
+                >= float(args.threshold_sigma)
+                and float(bm.get("matched_filter_snr_boost", 0.0)) >= 1.0
+            )
+            else "FAIL"
+        )
+        if bm is not None:
+            record["recovered"] = {
+                "kernel_id": bm.get("matched_kernel_id"),
+                "snr": bm.get("matched_snr"),
+                "l_pix": bm.get("l_pix"),
+                "m_pix": bm.get("m_pix"),
+                "dm_idx": bm.get("dm_idx"),
+                "dm_fine_pc_cc": bm.get("dm_fine_pc_cc"),
+                "t_in_cube": bm.get("t_in_cube"),
+                "matched_filter_snr_boost": bm.get(
+                    "matched_filter_snr_boost"
+                ),
+                "labelled_dm_pc_cc": bm.get("labelled_dm_pc_cc"),
+                "dm_residual_frac": bm.get("dm_residual_frac"),
+            }
+        else:
+            record["recovered"] = None
+    else:
+        n_cand = int(detector_record.get("n_candidates_post_merge") or 0)
+        record["gate_status"] = "PASS" if n_cand == 0 else "FAIL"
+        record["recovered"] = None
+    return record
 
 
 async def _bench_main(args: argparse.Namespace) -> int:
@@ -545,6 +650,56 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out", type=str,
         default=str(REPO_ROOT / "bench" / "reports" / "voltage_fixture" / "M5"),
+    )
+
+    # ----- captured-mode detector-sweep knobs (plan §8 line 2330).
+    parser.add_argument(
+        "--detector-sweep", action="store_true",
+        help="captured-mode only: run the v1 detector sweep "
+             "(D24 captured_burst_detector logic) and stamp PASS/FAIL "
+             "based on burst recovery + matched-filter K_time SNR boost. "
+             "Without this flag, captured-mode is INSPECTION_ONLY.",
+    )
+    parser.add_argument("--detector-t-det", type=int, default=256,
+                        help="captured-mode detector cube T_det (default "
+                             "256, the operator-pinned v1 deployment "
+                             "integration time per D26).")
+    parser.add_argument("--detector-n-fdm", type=int, default=32,
+                        help="captured-mode detector N_fdm (default 32).")
+    parser.add_argument("--detector-dm-min", type=float, default=370.0,
+                        help="captured-mode fdm grid lower bound in pc/cc.")
+    parser.add_argument("--detector-dm-max", type=float, default=420.0,
+                        help="captured-mode fdm grid upper bound in pc/cc.")
+    parser.add_argument("--detector-coarse-dm", type=float, default=0.0,
+                        help="coarse DM the captured streams are claimed "
+                             "to be dedispersed to. Default 0.0 since the "
+                             "250924mptq fixture is empirically NOT pre-"
+                             "stage-2 dedispersed (D23 caveat).")
+    parser.add_argument("--detector-shift-offset", type=int, default=125,
+                        help="add this many samples to all per-(fdm, "
+                             "chgroup) shifts so the burst lands inside "
+                             "the canonical zone of the cube (default 125 "
+                             "puts the 250924mptq burst at cube_t ≈ 128, "
+                             "the centre of T_det=256).")
+    parser.add_argument("--detector-target-max", type=int, default=120,
+                        help="cint8 quantisation target absolute max.")
+    # Defaults pulled directly from dsart.detector.merger so the
+    # bench tracks production NMS radii without manual sync.
+    from dsart.detector import (  # noqa: E402
+        DEFAULT_MERGE_RADIUS_LM, DEFAULT_MERGE_RADIUS_FDM,
+        DEFAULT_MERGE_RADIUS_T,
+    )
+    parser.add_argument(
+        "--detector-merge-radius-lm", type=int,
+        default=DEFAULT_MERGE_RADIUS_LM,
+    )
+    parser.add_argument(
+        "--detector-merge-radius-fdm", type=int,
+        default=DEFAULT_MERGE_RADIUS_FDM,
+    )
+    parser.add_argument(
+        "--detector-merge-radius-t", type=int,
+        default=DEFAULT_MERGE_RADIUS_T,
     )
     return parser
 

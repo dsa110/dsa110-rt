@@ -94,6 +94,190 @@ def test_captured_mode_cli_requires_captured_dir(tmp_path) -> None:
         ])
 
 
+def test_captured_mode_detector_sweep_translates_burst_match(
+    tmp_path, monkeypatch,
+) -> None:
+    """``--mode captured --detector-sweep`` invokes
+    :mod:`bench.captured_burst_detector` and folds its
+    ``detector.json`` into the voltage_fixture_search run.json
+    envelope. We mock captured_burst_detector to keep the test
+    CPU-only (the real path requires CUDA + a 4 GiB cf64 capture).
+    The mock produces a deterministic burst_match record so the
+    test exercises the gate-translation logic.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_captured_npz import _write_synthetic_fixture  # noqa: E402
+
+    captured_dir = tmp_path / "captured"
+    _write_synthetic_fixture(
+        captured_dir,
+        n_chgroups_present=4,
+        n_fv_total=3,
+        n_grid=8,
+        run_id="testrun_burst",
+        is_burst=True,
+    )
+    out = tmp_path / "out"
+
+    def _fake_bench_main(ns) -> int:
+        Path(ns.out).mkdir(parents=True, exist_ok=True)
+        (Path(ns.out) / "detector.json").write_text(json.dumps({
+            "schema_version": "v1.M5.captured-detector-mock",
+            "manifest": {
+                "run_id": "testrun_burst",
+                "is_burst": True,
+                "src_truth": {"dm_pc_cc": 100.0},
+            },
+            "n_candidates_post_merge": 1,
+            "top_candidate": {
+                "snr": 20.0, "kernel_id": "unit:d1:b4",
+                "l_pix": 7, "m_pix": 9, "dm_idx": 5,
+                "dm_fine_pc_cc": 99.5, "t_in_cube": 100,
+                "width_samples": 4, "detector_version": "v1.M5", "flags": 0,
+            },
+            "burst_match": {
+                "matched_kernel_id": "unit:d1:b4",
+                "matched_k_time": 4,
+                "matched_snr": 20.0,
+                "b1_snr": 15.0,
+                "matched_filter_snr_boost": 1.33,
+                "l_pix": 7, "m_pix": 9, "dm_idx": 5,
+                "dm_fine_pc_cc": 99.5, "t_in_cube": 100,
+                "labelled_dm_pc_cc": 100.0,
+                "dm_residual_frac": -0.005,
+                "match_radii": {"lm_pix": 5, "dm_consistency_frac": 0.02},
+                "dm_consistent": True,
+                "burst_kernels": [],
+            },
+            "rfi_contamination": [],
+            "timings_ms": {
+                "imager_total": 1.0, "detector_total": 1.0,
+                "bench_total": 2.0,
+            },
+        }))
+        return 0
+
+    import bench.captured_burst_detector as cbd  # noqa: E402
+    monkeypatch.setattr(cbd, "_bench_main", _fake_bench_main)
+
+    rc = main([
+        "--mode", "captured",
+        "--captured-dir", str(captured_dir),
+        "--detector-sweep",
+        "--out", str(out),
+        "--listener-port", "0",
+    ])
+    assert rc == 0
+    rec = json.loads((out / "run.json").read_text())
+    assert rec["mode"] == "captured"
+    assert rec["gate_status"] == "PASS"
+    assert rec["manifest"]["run_id"] == "testrun_burst"
+    assert rec["detector_sweep"]["rc"] == 0
+    assert rec["detector_sweep"]["n_candidates_post_merge"] == 1
+    assert rec["detector_sweep"]["burst_match"]["matched_snr"] == 20.0
+    rcv = rec["recovered"]
+    assert rcv is not None
+    assert rcv["kernel_id"] == "unit:d1:b4"
+    assert rcv["snr"] == 20.0
+    assert rcv["l_pix"] == 7
+    assert rcv["m_pix"] == 9
+    assert rcv["dm_residual_frac"] == -0.005
+
+
+def test_captured_mode_detector_sweep_fails_when_no_burst_match(
+    tmp_path, monkeypatch,
+) -> None:
+    """``--detector-sweep`` against an is_burst fixture stamps
+    gate_status=FAIL when the captured_burst_detector returns no
+    burst_match (eg threshold too high, or burst location off-grid)."""
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_captured_npz import _write_synthetic_fixture  # noqa: E402
+
+    captured_dir = tmp_path / "captured"
+    _write_synthetic_fixture(
+        captured_dir,
+        n_chgroups_present=4,
+        n_fv_total=3,
+        n_grid=8,
+        run_id="testrun_burst",
+        is_burst=True,
+    )
+    out = tmp_path / "out"
+
+    def _fake_bench_main(ns) -> int:
+        Path(ns.out).mkdir(parents=True, exist_ok=True)
+        (Path(ns.out) / "detector.json").write_text(json.dumps({
+            "n_candidates_post_merge": 0,
+            "top_candidate": None,
+            "burst_match": None,
+            "rfi_contamination": [],
+            "timings_ms": {"bench_total": 1.0},
+        }))
+        return 1
+
+    import bench.captured_burst_detector as cbd  # noqa: E402
+    monkeypatch.setattr(cbd, "_bench_main", _fake_bench_main)
+
+    rc = main([
+        "--mode", "captured",
+        "--captured-dir", str(captured_dir),
+        "--detector-sweep",
+        "--out", str(out),
+        "--listener-port", "0",
+    ])
+    # voltage_fixture_search exits 1 when gate_status=FAIL; this
+    # confirms the gate translation surfaces failure all the way to
+    # the operator's CI shell.
+    assert rc == 1
+    rec = json.loads((out / "run.json").read_text())
+    assert rec["gate_status"] == "FAIL"
+    assert rec["recovered"] is None
+
+
+def test_captured_mode_detector_sweep_negative_control(
+    tmp_path, monkeypatch,
+) -> None:
+    """Negative-control fixture (is_burst=False): PASS iff the
+    detector emits 0 candidates."""
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from test_captured_npz import _write_synthetic_fixture  # noqa: E402
+
+    captured_dir = tmp_path / "captured"
+    _write_synthetic_fixture(
+        captured_dir,
+        n_chgroups_present=4,
+        n_fv_total=3,
+        n_grid=8,
+        run_id="testrun_neg",
+        is_burst=False,
+    )
+    out = tmp_path / "out"
+
+    def _fake_bench_main_clean(ns) -> int:
+        Path(ns.out).mkdir(parents=True, exist_ok=True)
+        (Path(ns.out) / "detector.json").write_text(json.dumps({
+            "n_candidates_post_merge": 0,
+            "top_candidate": None, "burst_match": None,
+            "rfi_contamination": [],
+        }))
+        return 0
+
+    import bench.captured_burst_detector as cbd  # noqa: E402
+    monkeypatch.setattr(cbd, "_bench_main", _fake_bench_main_clean)
+
+    rc = main([
+        "--mode", "captured",
+        "--captured-dir", str(captured_dir),
+        "--detector-sweep",
+        "--out", str(out),
+        "--listener-port", "0",
+    ])
+    assert rc == 0
+    rec = json.loads((out / "run.json").read_text())
+    assert rec["gate_status"] == "PASS"
+    assert rec["recovered"] is None
+
+
 def test_captured_mode_inspection_only_run_record(tmp_path) -> None:
     """``--mode captured --captured-dir <synthetic-fixture>`` writes
     an INSPECTION_ONLY ``run.json`` capturing the M3 → M5 cube shape
