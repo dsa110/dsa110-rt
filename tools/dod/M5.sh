@@ -68,7 +68,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export REPO_ROOT
 export DSART_CONFIG_DIR="${REPO_ROOT}/configs"
-export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+# pyproject.toml uses [tool.setuptools.packages.find] where=["src"], so the
+# `dsart` package lives at ${REPO_ROOT}/src/dsart. PYTHONPATH must point at
+# the `src` parent — pointing at ${REPO_ROOT} alone falls through to the
+# conda env's editable install (which on h01 may resolve to the M3 working
+# tree, parallel to ours, that doesn't carry M5 detector modules).
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${REPO_ROOT}"
 
 export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-GNU,LP64}"
