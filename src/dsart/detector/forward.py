@@ -151,6 +151,7 @@ def boxcar_via_cumsum(
     *,
     axis: int,
     width: int,
+    tile_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply an unweighted centred boxcar of integer ``width`` along
     ``axis`` via the cumsum-difference primitive.
@@ -186,6 +187,16 @@ def boxcar_via_cumsum(
         x: Input tensor. Any shape, any dtype that supports ``cumsum``.
         axis: Axis along which to apply the boxcar.
         width: Boxcar width in samples. Must be ≥ 1.
+        tile_size: When set and ``axis != x.ndim - 1`` and ``x.ndim >= 2``,
+            process the input in ``tile_size``-column chunks along the
+            LAST axis to bound the fp32 cumsum working set. Bit-exact
+            equivalent to the untiled output (cumsum is associative
+            across tile boundaries that are along an axis DIFFERENT
+            from the cumsum axis). Use this on memory-constrained GPUs
+            at production geometry (T_det=256, N_fdm=32, N_grid=256):
+            untiled, the fp32 cumsum + cat + diff transients peak at
+            ~9 GiB; tile_size=64 caps them at ~768 MiB. Default None =
+            untiled (current/historical behavior).
 
     Returns:
         Boxcar-summed tensor of the same shape and dtype as ``x``.
@@ -202,6 +213,38 @@ def boxcar_via_cumsum(
             f"centred boxcar"
         )
 
+    ndim = x.dim()
+    if axis < 0:
+        axis = ndim + axis
+
+    if tile_size is not None and ndim >= 2 and axis != ndim - 1:
+        last_dim = ndim - 1
+        out = torch.empty_like(x)
+        for w0 in range(0, x.shape[last_dim], int(tile_size)):
+            w1 = min(w0 + int(tile_size), x.shape[last_dim])
+            tile_in = x.narrow(last_dim, w0, w1 - w0)
+            tile_out = _boxcar_via_cumsum_untiled(
+                tile_in, axis=axis, width=width,
+            )
+            out.narrow(last_dim, w0, w1 - w0).copy_(tile_out)
+            del tile_in, tile_out
+        return out
+
+    return _boxcar_via_cumsum_untiled(x, axis=axis, width=width)
+
+
+def _boxcar_via_cumsum_untiled(
+    x: torch.Tensor,
+    *,
+    axis: int,
+    width: int,
+) -> torch.Tensor:
+    """Untiled core of :func:`boxcar_via_cumsum`. Always executes a single
+    pad+cumsum+diff over the full input. Callers wanting bounded fp32
+    working-set should use ``boxcar_via_cumsum(..., tile_size=...)``.
+    """
+    n = x.shape[axis]
+
     # Half-widths for centred boxcar. For even width the centre is biased
     # left (this matches numpy.cumsum-difference convention; v1 K_dm
     # widths are odd, K_time widths are powers of two but applied as
@@ -213,8 +256,6 @@ def boxcar_via_cumsum(
     # last_axis_pad_r, ..., first_axis_pad_l, first_axis_pad_r) so we
     # construct the pad spec carefully.
     ndim = x.dim()
-    if axis < 0:
-        axis = ndim + axis
     pad_spec = [0] * (2 * ndim)
     pad_spec[2 * (ndim - 1 - axis)] = pad_left
     pad_spec[2 * (ndim - 1 - axis) + 1] = pad_right
@@ -293,8 +334,27 @@ class DeterministicDetector(torch.nn.Module):
         n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
         layer2_state: Optional[Layer2State] = None,
         layer2_seed_unit: bool = True,
+        streaming: bool = False,
+        streaming_tile_size: int = 64,
     ) -> None:
         super().__init__()
+        # Streaming forward (chunk-8 production refactor): when True,
+        # ``forward()`` dispatches to ``_streaming_forward()`` which
+        # processes kernels one at a time so the per-kernel score
+        # tensor (~1-2 GiB at production geometry T_det=256, N_fdm=32,
+        # N_grid=256, fp16) is allocated and freed per kernel instead
+        # of held in a [K, T, F, H, W] batched buffer (16 GiB for K=8,
+        # 256 GiB for K=128 — won't fit on an 11 GiB 2080 Ti). The
+        # production search-compute service (chunk-6) sets streaming=
+        # True; the chunk-1/2 unit tests + small-geom benches keep the
+        # batched (default False) path so their existing assertions
+        # over the K-batched score tensor stay valid.
+        self._streaming = bool(streaming)
+        self._streaming_tile_size = int(streaming_tile_size)
+        if self._streaming and self._streaming_tile_size < 1:
+            raise ValueError(
+                f"streaming_tile_size={streaming_tile_size}, expected ≥ 1"
+            )
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
             dtype=dtype
         )
@@ -443,7 +503,23 @@ class DeterministicDetector(torch.nn.Module):
           - ``fine_to_coarse`` / ``fine_dm_pc_cm3``: ``DmPlan`` lookup
             tables. If None, decoder uses unit-stub fallbacks (Chunk-2
             unit-test path).
+
+        When ``self._streaming`` is True (production search-compute
+        default at production geometry), this dispatches to
+        ``_streaming_forward`` which produces semantically equivalent
+        candidates with bounded per-kernel memory (chunk-8 production
+        refactor); see ``_streaming_forward`` docstring.
         """
+        if self._streaming:
+            return self._streaming_forward(
+                cube, validity_mask, sigma_layer1,
+                dm_idx_canonical_lo=dm_idx_canonical_lo,
+                dm_idx_canonical_hi=dm_idx_canonical_hi,
+                n_kernel_max_t=n_kernel_max_t,
+                event_specnum=event_specnum,
+                fine_to_coarse=fine_to_coarse,
+                fine_dm_pc_cm3=fine_dm_pc_cm3,
+            )
         scores = self._compute_per_kernel_scores(cube, validity_mask)
 
         # Determine cube validity: any (T_det, N_fdm) cell False in the
@@ -605,40 +681,222 @@ class DeterministicDetector(torch.nn.Module):
         # the per-image-kernel buffer (so v2's PSF kernel slots in here
         # without changing the loop structure).
         for k_idx, kernel in enumerate(self._kernel_bank):
-            img_buf_name = self._image_kernel_buffers[kernel.image_token]
-            img_kernel = getattr(self, img_buf_name)
-
-            if kernel.image_kernel_size == 1:
-                # 1×1 delta → no-op; multiply by scalar value (1.0 in v1).
-                spatial = cube_f32 * float(img_kernel.item())
-            else:  # pragma: no cover  (v2 path; not exercised in chunk 1)
-                # F.conv2d expects [N, C_in, H, W] with kernel [C_out, C_in,
-                # K_h, K_w]. Treat (T_det, N_fdm) as the batch dims and
-                # invoke conv2d via reshape.
-                x = cube_f32.reshape(T_det * N_fdm, 1, H, W)
-                w = img_kernel.unsqueeze(0).unsqueeze(0).to(torch.float32)
-                pad = kernel.image_kernel_size // 2
-                y = F.conv2d(x, w, padding=pad)
-                spatial = y.reshape(T_det, N_fdm, H, W)
-
-            # K_dm centred boxcar (axis = 1, the N_fdm axis).
-            # ``boxcar_via_cumsum`` is the only allowed K_dm consumer per
-            # plan §3.6.13 test_detector_conv_flops_cumsum_pin.
-            if kernel.k_dm_width > 1 and N_fdm >= kernel.k_dm_width:
-                dm_summed = boxcar_via_cumsum(
-                    spatial, axis=1, width=kernel.k_dm_width
-                )
-            else:
-                dm_summed = spatial
-
-            # K_time centred boxcar (axis = 0, the T_det axis).
-            if kernel.k_time_width > 1 and T_det >= kernel.k_time_width:
-                t_summed = boxcar_via_cumsum(
-                    dm_summed, axis=0, width=kernel.k_time_width
-                )
-            else:
-                t_summed = dm_summed
-
-            scores[k_idx] = t_summed
+            scores[k_idx] = self._compute_score_for_kernel(
+                cube_f32, kernel, tile_size=None,
+            )
 
         return scores
+
+    def _compute_score_for_kernel(
+        self,
+        cube: torch.Tensor,
+        kernel: Kernel,
+        *,
+        tile_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Compute the per-kernel score for ONE kernel triple.
+
+        This is the per-iteration body of
+        :meth:`_compute_per_kernel_scores`, factored out so the
+        chunk-8 streaming forward can iterate kernel-by-kernel without
+        materialising the full ``[K, T_det, N_fdm, H, W]`` batched
+        score tensor.
+
+        Args:
+            cube: ``[T_det, N_fdm, H, W]`` cube tensor (any float
+                dtype). The output is in the same dtype as ``cube``;
+                ``boxcar_via_cumsum`` upcasts internally so cumsum
+                accuracy is preserved at the §3.6.13 fp16 rel-err pin
+                regardless of caller dtype.
+            kernel: one of ``self._kernel_bank``.
+            tile_size: optional W-axis tile size forwarded to
+                ``boxcar_via_cumsum``. Set on memory-constrained GPUs
+                at production geometry to bound the fp32 cumsum
+                working set (default None = untiled, the historical
+                ``_compute_per_kernel_scores`` behaviour).
+
+        Returns:
+            Per-kernel score tensor, shape ``[T_det, N_fdm, H, W]``,
+            same dtype as ``cube``.
+        """
+        T_det, N_fdm, H, W = cube.shape  # noqa: N806
+        img_buf_name = self._image_kernel_buffers[kernel.image_token]
+        img_kernel = getattr(self, img_buf_name)
+
+        if kernel.image_kernel_size == 1:
+            # 1×1 delta → no-op; multiply by scalar value (1.0 in v1).
+            spatial = cube * float(img_kernel.item())
+        else:  # pragma: no cover  (v2 path; not exercised in chunk 1)
+            # F.conv2d expects [N, C_in, H, W] with kernel
+            # [C_out, C_in, K_h, K_w]. Treat (T_det, N_fdm) as the
+            # batch dims and invoke conv2d via reshape.
+            x = cube.reshape(T_det * N_fdm, 1, H, W).to(torch.float32)
+            w = img_kernel.unsqueeze(0).unsqueeze(0).to(torch.float32)
+            pad = kernel.image_kernel_size // 2
+            y = F.conv2d(x, w, padding=pad)
+            spatial = y.reshape(T_det, N_fdm, H, W).to(cube.dtype)
+
+        if kernel.k_dm_width > 1 and N_fdm >= kernel.k_dm_width:
+            dm_summed = boxcar_via_cumsum(
+                spatial, axis=1, width=kernel.k_dm_width,
+                tile_size=tile_size,
+            )
+        else:
+            dm_summed = spatial
+
+        if kernel.k_time_width > 1 and T_det >= kernel.k_time_width:
+            t_summed = boxcar_via_cumsum(
+                dm_summed, axis=0, width=kernel.k_time_width,
+                tile_size=tile_size,
+            )
+        else:
+            t_summed = dm_summed
+
+        return t_summed
+
+    def _streaming_forward(
+        self,
+        cube: torch.Tensor,
+        validity_mask: torch.Tensor,
+        sigma_layer1: torch.Tensor,
+        *,
+        dm_idx_canonical_lo: Optional[int] = None,
+        dm_idx_canonical_hi: Optional[int] = None,
+        n_kernel_max_t: Optional[int] = None,
+        event_specnum: int = 0,
+        fine_to_coarse: Optional[torch.Tensor] = None,
+        fine_dm_pc_cm3: Optional[torch.Tensor] = None,
+    ) -> List[Candidate]:
+        """Kernel-by-kernel streaming forward (chunk-8 production path).
+
+        Semantically equivalent to the batched ``forward()`` path:
+        same Layer-2 σ_k EMA update (per_kernel_sigma path; identical
+        to the batched ``scores=`` path because both call
+        ``layer2_interior_sigma`` with the same per-kernel σ-clip
+        parameters), same SNR computation (scores / just-updated σ_k),
+        same per-kernel ``decode_local_max``, same cross-kernel merge
+        and canonical-zone gate. The single behavioural difference vs
+        the batched path is candidate ordering within an SNR tie —
+        ``merge_across_kernels`` then re-sorts deterministically so
+        the emit-list ordering is bit-exact.
+
+        Two passes over the kernel bank are required to preserve the
+        "divide by JUST-UPDATED σ_k" semantics of the batched path:
+
+          * Pass 1: per kernel, compute score_k (kept in ``cube.dtype``,
+            typically fp16 in production) → compute σ_this_k via
+            ``layer2_interior_sigma`` → discard score_k. The σ_this
+            collection is the [K]-vector handed to Layer-2.
+          * Layer-2 ``update_and_query(per_kernel_sigma=σ_this_vec)``
+            returns the just-updated ``s_k``.
+          * Pass 2: per kernel, recompute score_k → snr_k =
+            score_k / s_k[k] → ``decode_local_max(snr_k, ...)``.
+
+        Total compute is ~2× the batched path's per-kernel score
+        compute. At production geometry (T_det=256, N_fdm=32,
+        N_grid=256, K=128) the per-kernel score compute is the
+        dominant detector cost, so wall-clock is ~2× the batched
+        forward — but the batched path OOMs at this geometry (16 GiB
+        for K=8 fp32 upfront allocation; 256 GiB for K=128) so 2× of
+        the streaming compute is the only path that fits on an 11 GiB
+        2080 Ti.
+
+        Memory ceiling per kernel:
+          * score_k in ``cube.dtype`` (~1 GiB at production fp16) +
+          * boxcar transients (~0.7 GiB with ``tile_size=64``;
+            ~9 GiB untiled — see ``boxcar_via_cumsum``'s
+            ``tile_size=`` docstring) +
+          * decode_local_max transients (~5-6 GiB at production fp16
+            via the permute().reshape() copy in the time-axis
+            ``F.max_pool1d`` step) +
+          * persistent: cube + Layer-2 ``s_k`` + image-kernel buffers.
+        """
+        self._validate_cube(cube, validity_mask)
+
+        K = len(self._kernel_bank)  # noqa: N806
+        cube_valid = bool(torch.all(validity_mask).item())
+        tile_size = self._streaming_tile_size
+
+        # ---- Pass 1: per-kernel σ_this for the Layer-2 update ----
+        sigma_this_per_kernel = torch.empty(
+            (K,), dtype=torch.float32, device=cube.device,
+        )
+        # Avoid the circular import by pulling the symbol here; this
+        # keeps the module-top imports stable and the symbol used only
+        # on the streaming path.
+        from ..noise_norm.layer2 import layer2_interior_sigma
+
+        for k_idx, kernel in enumerate(self._kernel_bank):
+            score_k = self._compute_score_for_kernel(
+                cube, kernel, tile_size=tile_size,
+            )
+            sigma_k = layer2_interior_sigma(
+                score_k.unsqueeze(0).to(torch.float32),
+                n_kernel_max_t=self._layer2.n_kernel_max_t,
+                n_sigma=self._layer2.n_sigma,
+                n_iterations=self._layer2.n_iterations,
+            )
+            sigma_this_per_kernel[k_idx] = sigma_k[0]
+            del score_k, sigma_k
+
+        # ---- Layer-2 update (single-vector path; equivalent to the
+        # ``scores=`` path's internal per-kernel loop in layer2.py) ----
+        s_k_tensor, is_warming_up = self._layer2.update_and_query(
+            per_kernel_sigma=sigma_this_per_kernel, valid=cube_valid,
+        )
+        self._sigma_k.copy_(s_k_tensor)
+
+        if n_kernel_max_t is None:
+            n_kernel_max_t = self._n_kernel_max_t
+        warmup_flag = int(CandidateFlags.NOISE_WARMUP) if is_warming_up else 0
+
+        # ---- Pass 2: per-kernel decode against the just-updated σ_k ----
+        per_kernel_cands: List[Candidate] = []
+        for k_idx, kernel in enumerate(self._kernel_bank):
+            score_k = self._compute_score_for_kernel(
+                cube, kernel, tile_size=tile_size,
+            )
+            s_k_scalar = float(s_k_tensor[k_idx].item())
+            if s_k_scalar == 0.0:
+                # Degenerate kernel: should never happen post-Layer-2's
+                # zero-replace guard but defend against div-by-zero.
+                s_k_scalar = 1.0
+            snr_k = score_k / s_k_scalar
+            del score_k
+
+            cands = decode_local_max(
+                snr_k,
+                threshold=self._threshold_sigma,
+                kernel_id=kernel.kernel_id,
+                k_dm_width=kernel.k_dm_width,
+                k_time_width=kernel.k_time_width,
+                detector_version=self._detector_version,
+                search_node_id=self._search_node_id,
+                gpu_half=self._gpu_half,
+                event_specnum=event_specnum,
+                fine_to_coarse=fine_to_coarse,
+                fine_dm_pc_cm3=fine_dm_pc_cm3,
+            )
+            del snr_k
+            if warmup_flag:
+                cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
+            per_kernel_cands.extend(cands)
+
+        merged = merge_across_kernels(
+            per_kernel_cands,
+            merge_radius_lm=self._merge_radius_lm,
+            merge_radius_fdm=self._merge_radius_fdm,
+            merge_radius_t=self._merge_radius_t,
+        )
+
+        if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
+            return merged
+        emit, _dropped = filter_to_canonical(
+            merged,
+            dm_idx_canonical_lo=dm_idx_canonical_lo,
+            dm_idx_canonical_hi=dm_idx_canonical_hi,
+            t_det=cube.shape[0],
+            n_kernel_max_t=n_kernel_max_t,
+            cube_t_offset=event_specnum,
+        )
+        return emit

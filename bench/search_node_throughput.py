@@ -279,6 +279,12 @@ async def _bench_main(args: argparse.Namespace) -> int:
         gpu_half=1,
         dtype=detector_dtype,
         device=torch.device(device),
+        streaming=bool(args.detector_streaming),
+        streaming_tile_size=int(args.detector_streaming_tile_size),
+    )
+    _LOG.info(
+        "detector: streaming=%s tile_size=%d",
+        bool(args.detector_streaming), int(args.detector_streaming_tile_size),
     )
     image_backend = str(args.image_backend)
     if image_backend == "gpu":
@@ -530,6 +536,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "GpuImager (host-side cf->cint8 quantise + fused dequant+combine "
              "CUDA kernel + cuFFT-cfp16 ifft2 + edge mask). 'gpu' requires "
              "--device cuda* and --cube-dtype fp16 (production pin).",
+    )
+    parser.add_argument(
+        "--detector-streaming", action="store_true",
+        help="Use the chunk-8 streaming kernel-by-kernel detector "
+             "forward (DeterministicDetector(streaming=True)). The "
+             "batched forward materialises [K, T, F, H, W] up front "
+             "(16 GiB for K=8 fp32 at production T_det=256, N_fdm=32, "
+             "N_grid=256 — OOMs on an 11 GiB 2080 Ti). The streaming "
+             "forward is ~2× the batched detector compute but is the "
+             "only path that fits at production geometry.",
+    )
+    parser.add_argument(
+        "--detector-streaming-tile-size", type=int, default=64,
+        help="W-axis tile size for the streaming detector's lowmem "
+             "boxcar (forwarded to boxcar_via_cumsum's tile_size arg). "
+             "Default 64 caps the fp32 cumsum working set at ~768 MiB "
+             "at production geometry.",
     )
     parser.add_argument(
         "--out", type=str,

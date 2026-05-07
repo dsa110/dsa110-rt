@@ -92,6 +92,8 @@ class SearchComputeConfig:
     detector_dtype: torch.dtype = torch.float16
     detector_device: str = "cpu"
     detector_version: str = "v1.M5"
+    detector_streaming: bool = True
+    detector_streaming_tile_size: int = 64
     search_node_id: int = 1
     gpu_half: int = 1
     layer1_n_burnin_cubes: int = 5
@@ -167,6 +169,8 @@ class SearchComputeService:
             gpu_half=config.gpu_half,
             dtype=config.detector_dtype,
             device=torch.device(config.detector_device),
+            streaming=config.detector_streaming,
+            streaming_tile_size=config.detector_streaming_tile_size,
         )
 
     @property
