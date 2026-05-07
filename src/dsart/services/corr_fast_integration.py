@@ -1021,8 +1021,26 @@ def process_block(
             nbada_pol=ctx.kernel.nbada_pol,
         )
 
+    # F33: pre-allocate the Stokes-I cube at the SUMMED-channel
+    # nchan from the start (not at full nchan, then sum after). At
+    # the production op-point (t_int_fast_native=8, chan_sum_factor=8)
+    # this drops the Stokes-I cube footprint from
+    # (512, NBASE, 384)·cfp32 ≈ 7 GB to (512, NBASE, 48)·cfp32
+    # ≈ 900 MB on a 2080Ti — without this in-loop sum the bench OOMs
+    # (real_v + imag_v fp32 voltages already hold ~5 GB before the
+    # Stokes-I allocation). The per-slab pol-sum + chan-sum keeps the
+    # peak transient under the F31b 256 MB target.
+    chan_sum_factor = int(ctx.cfg.chan_sum_factor)
+    full_nchan = ctx.kernel.nchan
+    if chan_sum_factor > 1 and full_nchan % chan_sum_factor != 0:
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor} does not divide "
+            f"nchan={full_nchan}; configure cfg.chan_sum_factor "
+            f"so that NCHAN_PER_CHGROUP is divisible."
+        )
+    nchan_eff = full_nchan // chan_sum_factor if chan_sum_factor > 1 else full_nchan
     vis_stokes_i = torch.empty(
-        (n_fv_total, NBASE, ctx.kernel.nchan),
+        (n_fv_total, NBASE, nchan_eff),
         dtype=torch.complex64, device=ctx.device,
     )
     for fv0 in range(0, n_fv_total, n_fv_chunk):
@@ -1033,31 +1051,17 @@ def process_block(
         real_v_slab = real_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
         imag_v_slab = imag_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
         vis_2pol_slab = ctx.kernel.compute_split(real_v_slab, imag_v_slab)
-        # Pol-sum in-place into the pre-allocated Stokes-I cube.
-        vis_stokes_i[fv0:fv1] = stokes_i_pol_sum(vis_2pol_slab)
-        del real_v_slab, imag_v_slab, vis_2pol_slab
+        # Per-slab pol-sum (-> cfp32 (slab, NBASE, nchan_full)) and
+        # F33 chan-sum (-> cfp32 (slab, NBASE, nchan_eff)) into the
+        # pre-allocated summed-channel Stokes-I cube.
+        stokes_i_slab = stokes_i_pol_sum(vis_2pol_slab)
+        if chan_sum_factor > 1:
+            stokes_i_slab = stokes_i_slab.reshape(
+                fv1 - fv0, NBASE, nchan_eff, chan_sum_factor,
+            ).sum(dim=-1)
+        vis_stokes_i[fv0:fv1] = stokes_i_slab
+        del real_v_slab, imag_v_slab, vis_2pol_slab, stokes_i_slab
     del real_v, imag_v
-
-    # F33: sum every ``chan_sum_factor`` adjacent fine channels into one
-    # effective channel BEFORE dedispersion. Reduces ``vis_stokes_i``
-    # cfp32 footprint by the same factor (default 8 → 7 GB → 900 MB on
-    # a 2080Ti at ``t_int_fast_native=8``). The downstream gridder
-    # pattern + DMPlan are built against the summed-channel band-CENTER
-    # frequencies (see ``build_context`` for the wiring); the math here
-    # is just a (NCHAN_eff, chan_sum_factor) reshape + sum.
-    chan_sum_factor = int(ctx.cfg.chan_sum_factor)
-    if chan_sum_factor > 1:
-        full_nchan = ctx.kernel.nchan
-        if full_nchan % chan_sum_factor != 0:
-            raise ValueError(
-                f"chan_sum_factor={chan_sum_factor} does not divide "
-                f"nchan={full_nchan}; configure cfg.chan_sum_factor "
-                f"so that NCHAN_PER_CHGROUP is divisible."
-            )
-        nchan_eff = full_nchan // chan_sum_factor
-        vis_stokes_i = vis_stokes_i.reshape(
-            n_fv_total, NBASE, nchan_eff, chan_sum_factor,
-        ).sum(dim=-1)
 
     if ctx.multi_dm_coarse_dm is not None:
         # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
