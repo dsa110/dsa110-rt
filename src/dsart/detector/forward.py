@@ -336,6 +336,7 @@ class DeterministicDetector(torch.nn.Module):
         layer2_seed_unit: bool = True,
         streaming: bool = False,
         streaming_tile_size: int = 64,
+        layer2_sigma_max_samples: Optional[int] = 1_000_000,
     ) -> None:
         super().__init__()
         # Streaming forward (chunk-8 production refactor): when True,
@@ -355,6 +356,19 @@ class DeterministicDetector(torch.nn.Module):
             raise ValueError(
                 f"streaming_tile_size={streaming_tile_size}, expected ≥ 1"
             )
+        # Layer-2 σ-clip subsample cap (production knob): the per-kernel
+        # interior σ-clipped std at production geometry would otherwise
+        # call torch.median on a 2.05 M-cell fp32 tensor, allocating
+        # ~8 GiB of sort workspace. With max_samples=1_000_000 (≈ 50 %
+        # of the interior at T_det=256 / N_fdm=32 / N_grid=256), the
+        # estimator standard error is σ̂ / √(2 N) ≈ 7e-4 σ — well
+        # below the EMA cube-to-cube noise floor — and the working set
+        # collapses to ~16 MiB. Pass None to disable subsampling
+        # (chunk-1 / chunk-3 unit-test path).
+        self._layer2_sigma_max_samples = (
+            int(layer2_sigma_max_samples)
+            if layer2_sigma_max_samples is not None else None
+        )
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
             dtype=dtype
         )
@@ -382,6 +396,7 @@ class DeterministicDetector(torch.nn.Module):
                 tau_s=layer2_tau_s,
                 n_burnin=int(layer2_n_burnin),
                 n_kernel_max_t=int(n_kernel_max_t),
+                sigma_max_samples=self._layer2_sigma_max_samples,
                 device=device,
             )
             if layer2_seed_unit:
@@ -830,11 +845,17 @@ class DeterministicDetector(torch.nn.Module):
             score_k = self._compute_score_for_kernel(
                 cube, kernel, tile_size=tile_size,
             )
+            # Keep score_k in its native dtype (typically fp16 on the
+            # production GPU path); ``sigma_clipped_std`` upcasts to
+            # fp32 internally. ``layer2_interior_sigma`` expects a
+            # 5-D [K, T, F, H, W] tensor with K=1 here; use a no-copy
+            # view so we don't double the per-kernel transient.
             sigma_k = layer2_interior_sigma(
-                score_k.unsqueeze(0).to(torch.float32),
+                score_k.unsqueeze(0),
                 n_kernel_max_t=self._layer2.n_kernel_max_t,
                 n_sigma=self._layer2.n_sigma,
                 n_iterations=self._layer2.n_iterations,
+                max_samples=self._layer2_sigma_max_samples,
             )
             sigma_this_per_kernel[k_idx] = sigma_k[0]
             del score_k, sigma_k

@@ -54,6 +54,8 @@ def sigma_clipped_std(
     *,
     n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
     n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
+    max_samples: Optional[int] = None,
+    rng_seed: int = 0,
 ) -> float:
     """Compute the σ-clipped robust standard deviation of ``x``.
 
@@ -70,6 +72,23 @@ def sigma_clipped_std(
         x: tensor of arbitrary shape; flattened internally.
         n_sigma: clip threshold in σ units. Default 3.0.
         n_iterations: number of clip iterations. Default 3.
+        max_samples: optional upper bound on the number of cells used
+            for the median + clipped-std estimate. When the flattened
+            input has more than ``max_samples`` cells, a deterministic
+            uniform random subsample of size ``max_samples`` is drawn
+            (Generator(rng_seed); same seed → same subsample). Used
+            by the chunk-8 streaming detector to bound the working
+            set of ``torch.median`` (which sorts O(N) cells +
+            allocates O(N) workspace) at production geometry — the
+            per-kernel score has 2.05 M cells fp32 (~8 GiB if 2 GiB
+            input × 4× sort workspace) which doesn't fit on an 11 GiB
+            2080 Ti; ``max_samples=1_000_000`` caps the median
+            workspace at ~16 MiB at the cost of σ̂ standard error
+            ≈ σ / √(2 N_samples) ≈ 7e-4 σ — well below the EMA's
+            cube-to-cube noise floor.
+            Default None preserves chunk-1 behaviour (full input).
+        rng_seed: seed for the subsample RNG. Same value → same
+            subsample for a given input shape.
 
     Returns:
         ``float`` σ-clipped std. Returns 0.0 on an all-NaN or
@@ -82,6 +101,22 @@ def sigma_clipped_std(
     flat = x.reshape(-1)
     if flat.dtype == torch.float16:
         flat = flat.to(torch.float32)
+
+    if max_samples is not None and flat.numel() > int(max_samples):
+        # Deterministic uniform subsample; we use torch.randperm with a
+        # fixed-seed Generator on the input's device so the subsample
+        # selection lives where the data lives (no host->device round-
+        # trip per-cube). The subsample is taken BEFORE the isfinite
+        # filter so the worst case (all-finite input) is bounded by
+        # max_samples cells in flight.
+        gen = torch.Generator(device=flat.device)
+        gen.manual_seed(int(rng_seed))
+        idx = torch.randint(
+            0, flat.numel(), (int(max_samples),),
+            device=flat.device, generator=gen,
+        )
+        flat = flat[idx]
+
     finite = flat[torch.isfinite(flat)]
     if finite.numel() == 0:
         return 0.0

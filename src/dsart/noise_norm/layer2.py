@@ -61,6 +61,7 @@ def layer2_interior_sigma(
     n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
     n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
     n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
+    max_samples: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute one interior σ_k per kernel triple from one cube's
     per-kernel score tensor.
@@ -98,6 +99,8 @@ def layer2_interior_sigma(
             scores[k, t_lo:t_hi, :, :, :],
             n_sigma=n_sigma,
             n_iterations=n_iterations,
+            max_samples=max_samples,
+            rng_seed=int(k),
         )
     return out
 
@@ -121,6 +124,7 @@ class Layer2State:
         n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
         n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
         n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
+        sigma_max_samples: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -142,6 +146,9 @@ class Layer2State:
         self.n_kernel_max_t = int(n_kernel_max_t)
         self.n_sigma = float(n_sigma)
         self.n_iterations = int(n_iterations)
+        self.sigma_max_samples = (
+            int(sigma_max_samples) if sigma_max_samples is not None else None
+        )
         self.gamma = 1.0 - math.exp(-self.cube_cadence_s / self.tau_s)
 
         # State: per-kernel running mean / EMA value. Initialised to 1.0
@@ -216,6 +223,7 @@ class Layer2State:
                 n_kernel_max_t=self.n_kernel_max_t,
                 n_sigma=self.n_sigma,
                 n_iterations=self.n_iterations,
+                max_samples=self.sigma_max_samples,
             ).to(self._s_k.dtype).to(self._s_k.device)
         else:
             assert per_kernel_sigma is not None
