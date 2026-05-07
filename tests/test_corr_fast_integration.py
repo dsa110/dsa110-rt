@@ -526,3 +526,90 @@ def test_F24_pipeline_composes_grid_consistent_with_chunk2b_spine() -> None:
         "chunk-2b spine output for the same raw input + kernel + no-cal "
         "config — drift here means F18/F21 sign-conventions are at risk."
     )
+
+
+# ---------------------------------------------------------------------------
+# F31b: streamed kernel + Stokes-I chunking inside process_block
+# ---------------------------------------------------------------------------
+
+
+class TestF31bStreaming:
+    """F31b: per-block kernel + Stokes-I streaming is bit-identical to un-chunked.
+
+    F31b adds an inner ``n_fv_chunk`` slab loop in :func:`process_block`
+    so the cfp32 ``(n_fv_slab, NBASE, NCHAN, NPOL)`` ``compute_split``
+    intermediate stays bounded (~256 MB target) instead of growing to
+    ~14 GB at the production ``t_int_fast_native=8`` cadence. The fp16
+    matmuls per slab use the same inputs as the un-chunked path so the
+    end-to-end gridded output must be bit-identical between
+    ``cfg.n_fv_chunk=None`` (auto), explicit chunk sizes, and the
+    legacy "all in one slab" behaviour.
+    """
+
+    @pytest.mark.parametrize("n_fv_chunk", [1, 2, 4, 8, 16])
+    def test_chunked_equals_unchunked(self, n_fv_chunk):
+        # t_int_fast_native=32 → packets_per_fast_vis=16 →
+        # 2048 / 16 = 128 fast-vis tiles per block.
+        cfg_full = _make_cfg(t_int_fast_native=32, n_fv_chunk=128)
+        ctx_full = _build_test_context(cfg_full)
+        raw = _synthetic_fada_block()
+        out_full = process_block(raw, ctx=ctx_full, block_n=1)
+
+        cfg_ch = _make_cfg(t_int_fast_native=32, n_fv_chunk=n_fv_chunk)
+        ctx_ch = _build_test_context(cfg_ch)
+        out_ch = process_block(raw, ctx=ctx_ch, block_n=1)
+
+        assert out_full.gridded_minus_sky.shape == out_ch.gridded_minus_sky.shape
+        torch.testing.assert_close(
+            out_ch.gridded_minus_sky,
+            out_full.gridded_minus_sky,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_default_n_fv_chunk_auto_yields_valid_output(self):
+        """``cfg.n_fv_chunk=None`` ⇒ auto-pick streams the block end-to-end."""
+        cfg = _make_cfg(t_int_fast_native=32)
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        out_auto = process_block(raw, ctx=ctx, block_n=1)
+        assert out_auto.gridded_minus_sky is not None
+        assert out_auto.gridded_minus_sky.shape == (
+            ctx.kernel.n_fast_vis_per_full_block,
+            ctx.gridder.pattern.n_filled,
+        )
+        assert out_auto.gridded_minus_sky.dtype == torch.complex64
+
+    def test_auto_matches_explicit_full_block(self):
+        """``n_fv_chunk=None`` (auto) ≡ ``n_fv_chunk=n_fv_total``."""
+        cfg_auto = _make_cfg(t_int_fast_native=32)
+        ctx_auto = _build_test_context(cfg_auto)
+        raw = _synthetic_fada_block()
+        out_auto = process_block(raw, ctx=ctx_auto, block_n=1)
+
+        cfg_full = _make_cfg(t_int_fast_native=32, n_fv_chunk=128)
+        ctx_full = _build_test_context(cfg_full)
+        out_full = process_block(raw, ctx=ctx_full, block_n=1)
+
+        torch.testing.assert_close(
+            out_auto.gridded_minus_sky,
+            out_full.gridded_minus_sky,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_rejects_zero_chunk(self):
+        cfg = _make_cfg(t_int_fast_native=32, n_fv_chunk=0)
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        with pytest.raises(ValueError, match="n_fv_chunk"):
+            process_block(raw, ctx=ctx, block_n=1)
+
+    def test_chunk_larger_than_total_clamped(self):
+        """``n_fv_chunk > n_fv_total`` is clamped to ``n_fv_total`` (no error)."""
+        # 128 fast-vis tiles total; ask for a slab of 256 → clamped to 128.
+        cfg = _make_cfg(t_int_fast_native=32, n_fv_chunk=256)
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        out = process_block(raw, ctx=ctx, block_n=1)
+        assert out.gridded_minus_sky is not None

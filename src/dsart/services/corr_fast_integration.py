@@ -57,6 +57,7 @@ CLI:
         [--kernel-support 1]
         [--static-sky-alpha 0.001]
         [--static-sky-disabled]
+        [--n-fv-chunk N]               # F31b: bound peak GPU memory
         [--output-dir /tmp/dsart-fast-grid]
         [--blocks-output-mode full|first_tile_only|none]
 """
@@ -72,7 +73,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 import numpy as np
 import torch
@@ -88,6 +89,7 @@ from dsart.common.constants import (
     N_CHGROUP,
     NANTS,
     NATIVE_SAMPLE_US,
+    NBASE,
     NCHAN_PER_CHGROUP,
     NPOL,
     PHI_LAT_OVRO_DEG,
@@ -107,6 +109,7 @@ from dsart.services.corr_fast_kernel import (
     stokes_i_pol_sum,
 )
 from dsart.services.slow_corr_kernel import (
+    NTIMES_PER_PACKET,
     apply_cal_split,
     unpack_int4_split,
 )
@@ -629,6 +632,25 @@ class FastIntegrationConfig:
     chunk-9 throughput benches that evaluate a sparse subset of
     trials. ``None`` means all ``plan.n_coarse`` trials."""
 
+    n_fv_chunk: int | None = None
+    """F31b: per-block streaming chunk size for the kernel + Stokes-I
+    pipeline. When set, ``process_block`` slices the voltage block
+    into ``n_fv_chunk`` fast-vis-tile slabs, runs
+    ``FastCorrKernel.compute_split`` on each slab, immediately
+    pol-sums to Stokes I, and writes the slab into the
+    pre-allocated ``(n_fv_total, NBASE, NCHAN)`` Stokes-I cube. This
+    bounds the peak transient cfp32 ``(n_fv_slab, NBASE, NCHAN, NPOL)``
+    intermediate to ~MB instead of the ~14 GB full-block size at
+    ``t_int_fast_native=8`` on a 2080Ti — required by F31 for
+    production fit on the 11 GB production GPU.
+
+    None ⇒ auto-pick the largest power-of-two slab whose cfp32
+    output ``vis_2pol`` slab tensor stays under
+    :data:`_F31B_CHUNK_TARGET_BYTES` (= 256 MB). Cap at
+    ``n_fv_total`` for the block. The Stokes-I cube itself
+    (``vis_stokes_i``) is still a single allocation; F33's
+    8-channel pre-dedispersion sum reduces THAT to ~MB."""
+
 
 @dataclass
 class IntegrationContext:
@@ -688,6 +710,35 @@ class IntegrationOutput:
 # ---------------------------------------------------------------------------
 
 
+#: F31b: target peak transient-byte budget for the per-slab
+#: ``vis_2pol`` cfp32 tensor returned by ``FastCorrKernel.compute_split``
+#: when ``process_block`` streams chunks. 256 MB leaves headroom for
+#: the surviving full-block ``vis_stokes_i`` (still cfp32-large at
+#: ``NCHAN=384``; F33's 8-channel sum reduces THAT to ~MB).
+_F31B_CHUNK_TARGET_BYTES: Final[int] = 256 << 20
+
+
+def _auto_n_fv_chunk_for_streaming(
+    n_fv_total: int, *, nchan: int, nbada_pol: int = 2,
+    nbase: int = NBASE, target_bytes: int = _F31B_CHUNK_TARGET_BYTES,
+) -> int:
+    """F31b: largest power-of-two ``n_fv_chunk`` whose per-slab cfp32
+    ``vis_2pol`` ≤ ``target_bytes``. Capped at ``n_fv_total``.
+
+    Per-slab bytes = ``n_fv_chunk * nbase * nchan * nbada_pol * 8``
+    (cfp32 = 8 bytes). Round-down to power-of-two so all slabs but the
+    last are equal-sized + the matmul tile shape stays GEMM-friendly.
+    """
+    bytes_per_fv = nbase * nchan * nbada_pol * 8
+    if bytes_per_fv == 0:
+        return max(1, n_fv_total)
+    raw = max(1, target_bytes // bytes_per_fv)
+    pow2 = 1
+    while pow2 * 2 <= raw:
+        pow2 *= 2
+    return min(pow2, n_fv_total)
+
+
 def process_block(
     raw: np.ndarray,
     *,
@@ -706,8 +757,13 @@ def process_block(
         2. RFI flag_block(real, imag) → FlagBlockResult (if cfg.rfi_enabled)
         3. Apply RFI mask to voltages (if cfg.rfi_mask_voltage_zero_fill)
         4. apply_cal_split (if ctx.cal is not None)
-        5. FastCorrKernel.compute_split → (n_fv, NBASE, NCHAN, 2)
-        6. stokes_i_pol_sum → (n_fv, NBASE, NCHAN)
+        5. + 6. **Streamed** per-``n_fv_chunk`` slab: FastCorrKernel.compute_split
+              → stokes_i_pol_sum → write into the pre-allocated
+              ``(n_fv_total, NBASE, NCHAN)`` Stokes-I cube. F31b
+              ensures the cfp32 ``(n_fv_slab, NBASE, NCHAN, NPOL)``
+              intermediate is bounded to ~256 MB (vs ~14 GB
+              full-block at ``t_int_fast_native=8``) so the pipeline
+              fits on the 11 GB 2080Ti production GPU.
         7. FastVisGridder.compute → (n_fv, N_filled) complex64
         8. StaticSkyEMA.apply (if cfg.static_sky_disabled is False)
         9. coarse_dm.dedisperse → (N_DM, n_fv, N_filled)
@@ -747,11 +803,55 @@ def process_block(
         del real_v, imag_v
         real_v, imag_v = real_v_c, imag_v_c
 
-    # 5. + 6. Fast-corr GEMM + Stokes I
-    vis_2pol = ctx.kernel.compute_split(real_v, imag_v)
+    # 5. + 6. F31b: streamed kernel + Stokes-I per n_fv_chunk slab.
+    # The voltage tensor's n_packets_in axis is divisible into
+    # ``n_fv_total`` equal slices of ``packets_per_fast_vis = ppfv``
+    # packets each, one per fast-vis output tile. We pull
+    # ``n_fv_chunk`` consecutive tiles' worth of voltages, run them
+    # through the kernel, immediately collapse the NPOL axis to
+    # Stokes I, and write the slab result into the pre-allocated
+    # cube. The huge cfp32 ``(n_fv_total, NBASE, NCHAN, NPOL)``
+    # intermediate is never materialised end-to-end.
+    ppfv = ctx.cfg.t_int_fast_native // NTIMES_PER_PACKET
+    n_packets_in = real_v.shape[3]
+    if n_packets_in % ppfv != 0:
+        raise ValueError(
+            f"process_block: n_packets_in={n_packets_in} not a "
+            f"multiple of packets_per_fast_vis={ppfv} "
+            f"(t_int_fast_native={ctx.cfg.t_int_fast_native}); the "
+            f"voltage block cannot be tiled into integer fast-vis "
+            f"slabs."
+        )
+    n_fv_total = n_packets_in // ppfv
+    if ctx.cfg.n_fv_chunk is not None:
+        n_fv_chunk = int(ctx.cfg.n_fv_chunk)
+        if n_fv_chunk <= 0:
+            raise ValueError(
+                f"cfg.n_fv_chunk={n_fv_chunk}, expected > 0"
+            )
+        n_fv_chunk = min(n_fv_chunk, n_fv_total)
+    else:
+        n_fv_chunk = _auto_n_fv_chunk_for_streaming(
+            n_fv_total, nchan=ctx.kernel.nchan,
+            nbada_pol=ctx.kernel.nbada_pol,
+        )
+
+    vis_stokes_i = torch.empty(
+        (n_fv_total, NBASE, ctx.kernel.nchan),
+        dtype=torch.complex64, device=ctx.device,
+    )
+    for fv0 in range(0, n_fv_total, n_fv_chunk):
+        fv1 = min(fv0 + n_fv_chunk, n_fv_total)
+        # Slice voltages on the n_packets_in axis. ``contiguous()``
+        # is required because ``compute_split`` -> ``view`` after
+        # ``permute`` requires C-contiguous memory.
+        real_v_slab = real_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
+        imag_v_slab = imag_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
+        vis_2pol_slab = ctx.kernel.compute_split(real_v_slab, imag_v_slab)
+        # Pol-sum in-place into the pre-allocated Stokes-I cube.
+        vis_stokes_i[fv0:fv1] = stokes_i_pol_sum(vis_2pol_slab)
+        del real_v_slab, imag_v_slab, vis_2pol_slab
     del real_v, imag_v
-    vis_stokes_i = stokes_i_pol_sum(vis_2pol)                            # (n_fv, NBASE, NCHAN)
-    del vis_2pol
 
     if ctx.multi_dm_coarse_dm is not None:
         # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
@@ -1441,6 +1541,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="disable static-sky subtraction entirely (useful for "
                         "the 0319 continuum bench where the brightest source "
                         "IS the static sky)")
+    p.add_argument("--n-fv-chunk", type=int, default=None,
+                   help="F31b: per-block streaming chunk size for the "
+                        "kernel + Stokes-I pipeline. Default: auto "
+                        "(picks largest pow-2 slab whose cfp32 vis_2pol "
+                        "stays under 256 MB; required for the 11 GB "
+                        "2080Ti production GPU at t_int_fast_native=8). "
+                        "Pass an explicit value to override (e.g. 8 for "
+                        "deterministic memory profiling).")
     p.add_argument("--output-dir", type=Path,
                    default=Path("/tmp/dsart-fast-grid"),
                    help="per-block output dir (default: %(default)s)")
@@ -1488,6 +1596,7 @@ def main(argv: list[str] | None = None) -> int:
         static_sky_alpha=args.static_sky_alpha,
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,
+        n_fv_chunk=args.n_fv_chunk,
     )
 
     try:
