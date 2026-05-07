@@ -286,11 +286,39 @@ class Stage1MultiDMCoarseDM:
     gridder: "FastVisGridder"
     chgroup: int
     dm_indices: np.ndarray | None = None
+    sliding_window: bool = False
+    """F34: 2-block sliding-window stage-1.
+
+    When ``True``, :meth:`dedisperse_from_vis` joins the previous
+    block's ``vis_stokes_i`` with the current one along the time
+    axis before applying stage-1 shifts and gridding, then emits
+    the dedispersed slice corresponding to the **previous** block
+    (now fully resolved against any pulse whose lower-frequency
+    tail crosses into the current block). The first call emits an
+    all-zero output (no previous block to resolve); thereafter the
+    pipeline runs at one-block-in / one-block-out cadence with
+    one block of latency.
+
+    Required at the M3 production op-point: at DM = 3000 pc/cc and
+    ``t_int_fast_native = 8`` (262.144 µs cadence), the max
+    intra-chgroup delay reaches ~480 fast-vis bins (~ block size
+    of 512 bins), so a pulse landing near the end of any block
+    has its lower-frequency tail dispersed into the next block.
+    Single-block stage-1 silently truncates that tail; the
+    sliding window recovers it.
+
+    K = 2 (= ring-buffer depth) suffices because the max delay
+    is bounded by the DM = 3000 ceiling per the M3 production
+    review."""
 
     _t_dedisp_cache: dict[int, int] = field(
         default_factory=dict, init=False, repr=False,
     )
     _dm_idx_iter: np.ndarray = field(init=False, repr=False)
+    _prev_vis_stokes_i: torch.Tensor | None = field(
+        default=None, init=False, repr=False,
+    )
+    _prev_block_n: int = field(default=-1, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0 <= self.chgroup < N_CHGROUP:
@@ -339,6 +367,39 @@ class Stage1MultiDMCoarseDM:
         self._t_dedisp_cache[cache_key] = int(t)
         return int(t)
 
+    def _dedisperse_one_window(
+        self, vis_stokes_i: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply per-DM stage-1 shift + grid to a single vis tensor.
+
+        Inner primitive shared by the legacy (single-block) and
+        F34-sliding-window paths. Returns
+        ``(N_DM, T_dedisp(n_fv), N_filled) complex64`` where
+        ``T_dedisp(n_fv) = n_fv - max_bin_shift`` over the selected
+        DM subset.
+
+        The caller is responsible for shape validation (this private
+        method is hot-path; the public wrappers do the upfront
+        shape-check + max-shift sanity errors).
+        """
+        n_fv = int(vis_stokes_i.shape[0])
+        t_dedisp = self.t_dedisp_for(n_fv)
+        n_filled = int(self.gridder.pattern.n_filled)
+        out = torch.empty(
+            (self.n_dm, t_dedisp, n_filled),
+            dtype=torch.complex64,
+            device=vis_stokes_i.device,
+        )
+        for c, dm_idx in enumerate(self._dm_idx_iter.tolist()):
+            vis_shifted = apply_stage1_shifts(
+                vis_stokes_i, self.plan,
+                chgroup=self.chgroup, dm_idx=int(dm_idx),
+                t_dedisp=t_dedisp,
+            )
+            out[c] = self.gridder.compute(vis_shifted)
+            del vis_shifted
+        return out
+
     def dedisperse_from_vis(
         self,
         vis_stokes_i: torch.Tensor,
@@ -364,6 +425,14 @@ class Stage1MultiDMCoarseDM:
             ``gridder.compute(stage1_shift(vis_stokes_i, plan, dm_idx_iter[c]))``
             truncated to the uniform ``T_dedisp`` time axis.
 
+            With ``sliding_window=True`` (F34): the FIRST call seeds
+            the ring buffer and returns an all-zero
+            ``(N_DM, n_fast_vis, N_filled)`` cube. Subsequent calls
+            join the previous and current ``vis_stokes_i`` along the
+            time axis, dedisperse the join, and emit the slice
+            ``[:, :n_fast_vis, :]`` corresponding to the PREVIOUS
+            block (now fully resolved). One-block latency.
+
         Raises
         ------
         ValueError
@@ -377,29 +446,83 @@ class Stage1MultiDMCoarseDM:
                 f"{tuple(vis_stokes_i.shape)}"
             )
         n_fv = int(vis_stokes_i.shape[0])
-        t_dedisp = self.t_dedisp_for(n_fv)
-        if t_dedisp <= 0:
-            raise ValueError(
-                f"n_fast_vis={n_fv} too short for plan max bin shift "
-                f"on chgroup={self.chgroup}; selected DMs span "
-                f"{self.plan.dm_pc_cc[self._dm_idx_iter[0]]:.1f}.."
-                f"{self.plan.dm_pc_cc[self._dm_idx_iter[-1]]:.1f} pc/cc"
+
+        if not self.sliding_window:
+            # Legacy (pre-F34) single-block path. Bit-identical.
+            t_dedisp = self.t_dedisp_for(n_fv)
+            if t_dedisp <= 0:
+                raise ValueError(
+                    f"n_fast_vis={n_fv} too short for plan max bin "
+                    f"shift on chgroup={self.chgroup}; selected DMs "
+                    f"span {self.plan.dm_pc_cc[self._dm_idx_iter[0]]:.1f}.."
+                    f"{self.plan.dm_pc_cc[self._dm_idx_iter[-1]]:.1f} pc/cc"
+                )
+            return self._dedisperse_one_window(vis_stokes_i)
+
+        # F34 sliding-window path: join prev + current, dedisp the
+        # join, emit the prev block's slice. One-block latency.
+        n_filled = int(self.gridder.pattern.n_filled)
+        if self._prev_vis_stokes_i is None:
+            # Cold start: nothing to emit yet. Save current; return
+            # all-zeros at the prev-block shape so downstream stages
+            # (static-sky EMA / FIFO / TX) see a uniformly-shaped
+            # cube every block. The static-sky EMA's warmup window
+            # absorbs this no-emit (it's already gated to ignore
+            # all-zeros during cold-start).
+            self._prev_vis_stokes_i = vis_stokes_i.clone()
+            self._prev_block_n = int(block_n)
+            return torch.zeros(
+                (self.n_dm, n_fv, n_filled),
+                dtype=torch.complex64,
+                device=vis_stokes_i.device,
             )
 
-        n_filled = int(self.gridder.pattern.n_filled)
-        out = torch.empty(
-            (self.n_dm, t_dedisp, n_filled),
-            dtype=torch.complex64,
-            device=vis_stokes_i.device,
-        )
-        for c, dm_idx in enumerate(self._dm_idx_iter.tolist()):
-            vis_shifted = apply_stage1_shifts(
-                vis_stokes_i, self.plan,
-                chgroup=self.chgroup, dm_idx=int(dm_idx),
-                t_dedisp=t_dedisp,
+        prev_n_fv = int(self._prev_vis_stokes_i.shape[0])
+        if prev_n_fv != n_fv:
+            # Variable-block-size streams aren't supported (the static
+            # FADA buffer guarantees uniform blocks; warn loudly so
+            # any non-static-FADA caller catches the mismatch).
+            raise ValueError(
+                f"sliding-window: prev block n_fv={prev_n_fv} != "
+                f"current n_fv={n_fv}; F34 assumes uniform-block "
+                f"streams (PSRDADA fada page or dada_junkdb)."
             )
-            out[c] = self.gridder.compute(vis_shifted)
-            del vis_shifted
+
+        joined = torch.cat(
+            [self._prev_vis_stokes_i, vis_stokes_i], dim=0,
+        )                                                              # (2*n_fv, NBASE, NCHAN_eff)
+        joined_n_fv = int(joined.shape[0])
+        t_dedisp_joined = self.t_dedisp_for(joined_n_fv)
+        if t_dedisp_joined < n_fv:
+            # The plan's max bin shift exceeds the prev-block length —
+            # i.e. a pulse at top freq in the prev block's first tile
+            # has its bot-freq tail FURTHER than (n_fv + n_fv) bins
+            # later. K=2 ring buffer can't recover that — would need
+            # K≥3. At DM=3000 pc/cc + t_int_fast_native=8 the max
+            # shift is ~480 bins ≪ n_fv = 512, so this should never
+            # trigger in production; raising loudly here so a future
+            # high-DM extension is forced to bump K explicitly.
+            raise ValueError(
+                f"sliding-window: max plan shift "
+                f"({joined_n_fv - t_dedisp_joined}) exceeds "
+                f"prev-block n_fv={n_fv}; bump ring-buffer K above 2."
+            )
+
+        dedisp_joined = self._dedisperse_one_window(joined)            # (n_dm, t_dedisp_joined, n_filled)
+
+        # Emit the slice corresponding to the PREVIOUS block: the
+        # first n_fv tiles of the joined output. Per Convention A
+        # (stage-1 reference = chgroup TOP), output time index 0
+        # aligns with the prev block's input time 0 at the top
+        # channel; lower channels' shifts are absorbed by the join
+        # so output[:, :n_fv] is the FULLY-resolved prev block.
+        out = dedisp_joined[:, :n_fv, :].clone()
+
+        # Slide: current becomes the new prev for the next call.
+        self._prev_vis_stokes_i = vis_stokes_i.clone()
+        self._prev_block_n = int(block_n)
+
+        del joined, dedisp_joined
         return out
 
 
@@ -650,6 +773,27 @@ class FastIntegrationConfig:
     ``n_fv_total`` for the block. The Stokes-I cube itself
     (``vis_stokes_i``) is still a single allocation; F33's
     8-channel pre-dedispersion sum reduces THAT to ~MB."""
+
+    sliding_window: bool = False
+    """F34: 2-block sliding-window stage-1 dedispersion. When True,
+    :class:`Stage1MultiDMCoarseDM` keeps a ``K = 2`` ring buffer of
+    the previous block's ``vis_stokes_i`` and joins it with the
+    current block before applying stage-1 shifts; the dedispersed
+    output corresponds to the PREVIOUS block (now fully resolved
+    against any pulse whose lower-frequency tail crosses into the
+    current block).
+
+    Required at the M3 production op-point: at DM = 3000 pc/cc and
+    ``t_int_fast_native = 8`` the max intra-chgroup delay reaches
+    ~480 fast-vis bins, comparable to the ~512-bin block size, so
+    cross-block pulses are otherwise truncated. K = 2 ring depth
+    is sufficient (DM = 3000 ceiling per the M3 production review).
+
+    Cost: one-block (~134 ms) latency, +1 vis_stokes_i clone in
+    GPU memory (~900 MB at chan_sum_factor=8), and one extra
+    stage-1 + grid pass per block (since the join is 2× the
+    block size). The latency is acceptable for the search; the
+    memory + compute fit on the 11 GB 2080Ti budget."""
 
     chan_sum_factor: int = 1
     """F33: number of fine channels collapsed into one effective
@@ -1174,14 +1318,16 @@ def build_context(
             gridder=gridder,
             chgroup=cfg.chgroup,
             dm_indices=dm_indices_arr,
+            sliding_window=bool(cfg.sliding_window),
         )
         LOG.info(
             "Stage1MultiDMCoarseDM ready: chgroup=%d n_dm=%d t_int_fast_us=%.3f "
-            "(plan_n_coarse=%d, dm_subset=%s)",
+            "(plan_n_coarse=%d, dm_subset=%s, sliding_window=%s)",
             cfg.chgroup, multi_dm.n_dm, plan.t_int_fast_us,
             plan.n_coarse,
             "all" if cfg.dm_indices_subset is None else
             str(cfg.dm_indices_subset),
+            cfg.sliding_window,
         )
 
     return IntegrationContext(
@@ -1621,6 +1767,13 @@ def main(argv: list[str] | None = None) -> int:
                         "divide NCHAN_PER_CHGROUP (= 384). The DMPlan and "
                         "gridder pattern are rebuilt against summed-"
                         "channel band-CENTER frequencies.")
+    p.add_argument("--sliding-window", action="store_true",
+                   help="F34: 2-block sliding-window stage-1 dedispersion. "
+                        "Keeps a K=2 ring buffer of vis_stokes_i so that "
+                        "pulses crossing block boundaries (intra-chgroup "
+                        "delay ~480 fast-vis bins at DM=3000 pc/cc, "
+                        "t_int_fast_native=8) are fully resolved. Adds one "
+                        "block (~134 ms) of latency.")
     p.add_argument("--output-dir", type=Path,
                    default=Path("/tmp/dsart-fast-grid"),
                    help="per-block output dir (default: %(default)s)")
@@ -1670,6 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
         static_sky_disabled=args.static_sky_disabled,
         n_fv_chunk=args.n_fv_chunk,
         chan_sum_factor=args.chan_sum_factor,
+        sliding_window=args.sliding_window,
     )
 
     try:

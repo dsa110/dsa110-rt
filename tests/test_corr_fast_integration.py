@@ -37,6 +37,7 @@ from dsart.services.corr_fast_integration import (
     NoOpCoarseDM,
     NoOpStage2Fifo,
     NoOpTransportTx,
+    Stage1MultiDMCoarseDM,
     StaticSkyEMA,
     apply_rfi_mask_to_voltages,
     build_context,
@@ -661,3 +662,171 @@ class TestF33ChanSumFactor:
         cfg = _make_cfg(chan_sum_factor=7)
         with pytest.raises(ValueError, match="does not divide"):
             _build_test_context(cfg)
+
+
+# ---------------------------------------------------------------------------
+# F34: 2-block sliding-window stage-1 dedispersion
+# ---------------------------------------------------------------------------
+
+
+class TestF34SlidingWindow:
+    """F34: ``Stage1MultiDMCoarseDM.sliding_window=True`` keeps a K=2
+    ring buffer so cross-block pulses are fully resolved at high DM
+    (max intra-chgroup delay ~480 fast-vis bins at DM=3000 pc/cc,
+    t_int_fast_native=8 ≈ 1 block).
+    """
+
+    def _make_stage1(
+        self, sliding_window: bool, *, n_chan: int = 4,
+    ) -> tuple[Stage1MultiDMCoarseDM, "FastVisGridder"]:
+        """Build a tiny Stage1MultiDMCoarseDM with a synthetic 1-DM-trial
+        plan + 4-ant gridder so the test runs in well under a second.
+        """
+        # Synthetic 4-ant pattern + gridder (mirrors test_fast_vis_gridder).
+        from dsart.coarse_dm.dm_plan import (
+            DMPlan,
+            build_chgroup_freq_table_GHz,
+            compute_delay_native_samples_table,
+        )
+        from dsart.grid.kernel import FastVisGridder
+        from dsart.grid.sparsity_pattern import build_pattern
+        from dsart.common.constants import T_INT_FAST_US_DEFAULT, NCHAN_PER_CHGROUP
+
+        e, n = _synth_antpos()
+        core_mask = _build_core_baseline_mask(n_core=82)
+        pattern = build_pattern(
+            antpos_e=e, antpos_n=n,
+            chgroup=0, dec_deg=53.85, n_grid=64,
+            kernel_support=1, is_core_baseline_mask=core_mask,
+        )
+        gridder = FastVisGridder.from_pattern(
+            pattern, e, n,
+            is_core_baseline_mask=core_mask,
+            device=torch.device("cpu"),
+        )
+        # DMPlan with two trials (DM=0 + small) so n_dm > 1.
+        coarse_dm = np.asarray([0.0, 50.0], dtype=np.float64)
+        chgroup_freqs = build_chgroup_freq_table_GHz()
+        table = compute_delay_native_samples_table(coarse_dm, chgroup_freqs)
+        plan = DMPlan(
+            dm_pc_cc=coarse_dm,
+            n_fine_per_coarse=1,
+            t_int_fast_us=float(T_INT_FAST_US_DEFAULT),
+            chgroup_freqs_GHz=chgroup_freqs,
+            _delay_native_samples_table=table,
+        )
+        stage1 = Stage1MultiDMCoarseDM(
+            plan=plan, gridder=gridder, chgroup=0,
+            sliding_window=sliding_window,
+        )
+        return stage1, gridder
+
+    def test_sliding_window_off_is_legacy(self) -> None:
+        """``sliding_window=False`` ⇒ bit-identical to pre-F34 path."""
+        stage1, gridder = self._make_stage1(sliding_window=False)
+        n_fv = 64
+        n_filled = gridder.pattern.n_filled
+        torch.manual_seed(20260507)
+        vis = torch.complex(
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+        )
+        out = stage1.dedisperse_from_vis(vis, block_n=0)
+        assert out.shape == (
+            stage1.n_dm, stage1.t_dedisp_for(n_fv), n_filled,
+        )
+        # Same call again with the same input → identical result
+        # (no hidden state in the legacy path).
+        out2 = stage1.dedisperse_from_vis(vis, block_n=1)
+        torch.testing.assert_close(out, out2, rtol=0, atol=0)
+
+    def test_sliding_window_first_call_emits_zeros(self) -> None:
+        """First call (cold start) returns an all-zero cube of the
+        prev-block shape ``(n_dm, n_fv, n_filled)``."""
+        stage1, gridder = self._make_stage1(sliding_window=True)
+        n_fv = 64
+        n_filled = gridder.pattern.n_filled
+        torch.manual_seed(20260508)
+        vis = torch.complex(
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+        )
+        out = stage1.dedisperse_from_vis(vis, block_n=0)
+        assert out.shape == (stage1.n_dm, n_fv, n_filled)
+        assert torch.all(out == 0)
+        # State: prev is now `vis`.
+        assert stage1._prev_vis_stokes_i is not None
+        assert stage1._prev_block_n == 0
+
+    def test_sliding_window_emits_prev_block(self) -> None:
+        """After the cold start, dedisperse_from_vis emits the
+        dedispersed PREVIOUS block. At DM=0 (no shift) and with
+        ``vis_block_1`` ≠ 0, the emitted output should equal the
+        legacy single-block dedispersion of ``vis_block_0`` (since
+        DM=0 stage-1 shifts are all zero, so joining two blocks
+        and slicing [0:n_fv] equals dedispersing block_0 alone).
+        """
+        sw_stage1, gridder = self._make_stage1(sliding_window=True)
+        legacy_stage1, _ = self._make_stage1(sliding_window=False)
+        # Pick the DM=0 trial only so the slicing collapses to a
+        # block-aligned identity. The DM=50 trial has small bin
+        # shifts that will differ between sliding+legacy by the
+        # cross-block contribution from block_1.
+        sw_stage1._dm_idx_iter = np.asarray([0], dtype=np.int64)
+        legacy_stage1._dm_idx_iter = np.asarray([0], dtype=np.int64)
+        # Reset the t_dedisp cache because we mutated _dm_idx_iter.
+        sw_stage1._t_dedisp_cache.clear()
+        legacy_stage1._t_dedisp_cache.clear()
+
+        n_fv = 64
+        torch.manual_seed(20260509)
+        vis_0 = torch.complex(
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+        )
+        vis_1 = torch.complex(
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+            torch.randn(n_fv, NANTS * (NANTS + 1) // 2,
+                        NCHAN_PER_CHGROUP),
+        )
+        # Sliding-window: cold-start absorbs block 0, second call
+        # emits block-0 dedispersed (because DM=0 → no shift).
+        out_zero = sw_stage1.dedisperse_from_vis(vis_0, block_n=0)
+        assert torch.all(out_zero == 0)
+        out_block0 = sw_stage1.dedisperse_from_vis(vis_1, block_n=1)
+        # Legacy: dedisperse vis_0 alone.
+        legacy_out_block0 = legacy_stage1.dedisperse_from_vis(
+            vis_0, block_n=0,
+        )
+        # Sliding-window output is shape (1, n_fv, n_filled);
+        # legacy is (1, t_dedisp(n_fv), n_filled). At DM=0 the
+        # max bin shift is 0, so t_dedisp(n_fv) = n_fv and the
+        # slicing matches.
+        assert out_block0.shape == legacy_out_block0.shape
+        torch.testing.assert_close(
+            out_block0, legacy_out_block0, rtol=0, atol=0,
+        )
+
+    def test_sliding_window_rejects_block_size_mismatch(self) -> None:
+        """Variable block sizes break the sliding-window contract."""
+        stage1, _ = self._make_stage1(sliding_window=True)
+        n_fv_a = 64
+        vis_a = torch.complex(
+            torch.zeros(n_fv_a, NANTS * (NANTS + 1) // 2, NCHAN_PER_CHGROUP),
+            torch.zeros(n_fv_a, NANTS * (NANTS + 1) // 2, NCHAN_PER_CHGROUP),
+        )
+        stage1.dedisperse_from_vis(vis_a, block_n=0)                   # cold start
+        n_fv_b = 32
+        vis_b = torch.complex(
+            torch.zeros(n_fv_b, NANTS * (NANTS + 1) // 2, NCHAN_PER_CHGROUP),
+            torch.zeros(n_fv_b, NANTS * (NANTS + 1) // 2, NCHAN_PER_CHGROUP),
+        )
+        with pytest.raises(ValueError, match="prev block n_fv"):
+            stage1.dedisperse_from_vis(vis_b, block_n=1)
