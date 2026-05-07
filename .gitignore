@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 .DS_Store
 src/dsart.egg-info/
+bench/reports/
