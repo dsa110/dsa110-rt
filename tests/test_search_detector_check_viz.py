@@ -9,7 +9,11 @@ These tests are pure-Python (no torch / no detector) so they run in
     with no PASS/FAIL banner.
   * The CLI in cube_injection mode parses bench-shaped NDJSON / summary
     JSON and writes a complete report directory.
-  * ``--mode burst`` raises ``NotImplementedError`` (M5 chunk 7).
+  * ``--mode burst`` consumes a ``detector.json`` (output of
+    ``bench/captured_burst_detector.py`` or
+    ``bench/voltage_fixture_search.py --mode captured --detector-sweep``)
+    and writes butterfly + DM-curve + per-kernel-SNR figures + the
+    candidates table + master report.html (M5 chunk 7 closure D27).
 """
 
 from __future__ import annotations
@@ -188,13 +192,244 @@ def test_stitch_search_html_report(tmp_path: Path) -> None:
     assert "README" in text
 
 
-def test_cli_burst_mode_not_implemented() -> None:
-    with pytest.raises(NotImplementedError) as excinfo:
+def test_cli_burst_mode_requires_detector_json() -> None:
+    """``--mode burst`` requires ``--detector-json``; the CLI exits
+    via SystemExit (argparse error) when it's missing."""
+    with pytest.raises(SystemExit):
         search_detector_check.main([
             "--mode", "burst",
             "--out", "/tmp/should_not_exist",
         ])
-    assert "chunk 7" in str(excinfo.value)
+
+
+def test_cli_burst_mode_missing_detector_json(tmp_path: Path) -> None:
+    """``--mode burst --detector-json /nonexistent`` should fail with
+    a clear argparse error, not crash later."""
+    with pytest.raises(SystemExit):
+        search_detector_check.main([
+            "--mode", "burst",
+            "--detector-json", str(tmp_path / "nonexistent.json"),
+            "--out", str(tmp_path / "report"),
+        ])
+
+
+def _synthetic_detector_record() -> dict:
+    """Synthetic detector.json record matching the schema produced by
+    ``bench/captured_burst_detector.py`` — used by the burst-mode CLI
+    smoke tests below.
+    """
+    return {
+        "schema_version": "v1.M5.captured-detector-test",
+        "captured_dir": "/tmp/synth-fixture",
+        "manifest": {
+            "run_id": "synth01",
+            "src_kind": "burst",
+            "is_burst": True,
+            "src_truth": {
+                "dm_pc_cc": 100.0, "ra_deg": 180.0,
+                "dec_deg": 30.0, "t2_snr": 25.0,
+            },
+            "n_chgroups_present": 16, "n_chgroups_total": 16,
+            "valid_mask": [True] * 16, "t_int_fast_us": 524.288,
+        },
+        "config": {
+            "detector_t_det": 256, "n_fdm": 8, "n_grid": 32,
+            "n_chgroup": 16, "dm_min_pc_cc": 90.0, "dm_max_pc_cc": 110.0,
+            "coarse_dm_pc_cc": 0.0, "shift_offset": 0,
+            "threshold_sigma": 8.0, "target_max": 120,
+            "quant_scale": 1.0, "merge_radius_lm": 3,
+            "merge_radius_fdm": 5, "merge_radius_t": 128,
+            "kernel_bank": [
+                f"unit:d1:b{w}" for w in [1, 2, 4, 8, 16, 32, 64, 128]
+            ],
+        },
+        "fdm_grid": {
+            "fine_dm_pc_cm3": [
+                90.0, 92.857, 95.714, 98.571,
+                101.428, 104.285, 107.142, 110.0,
+            ],
+            "coarse_dm_pc_cm3": [0.0],
+            "max_shift_samples": 50, "max_shift_ms": 26.2,
+        },
+        "timings_ms": {
+            "imager_total": 600.0, "detector_total": 1500.0,
+            "bench_total": 38000.0,
+        },
+        "per_kernel_stats": [
+            {
+                "kernel_id": f"unit:d1:b{w}",
+                "snr_max": float(10.0 + w),
+                "snr_max_pos": {"t": 100, "fdm": 3, "l": 16, "m": 18},
+                "n_candidates": 1, "elapsed_ms": 45.0,
+            }
+            for w in [1, 2, 4, 8, 16, 32, 64, 128]
+        ],
+        "n_candidates_post_merge": 2,
+        "top_candidate": {
+            "snr": 138.0, "kernel_id": "unit:d1:b128",
+            "l_pix": 16, "m_pix": 18, "dm_idx": 3,
+            "dm_fine_pc_cc": 98.571, "t_in_cube": 100,
+            "width_samples": 128, "detector_version": "v1.M5", "flags": 0,
+        },
+        "candidates": [
+            {
+                "snr": 138.0, "kernel_id": "unit:d1:b128",
+                "l_pix": 16, "m_pix": 18, "dm_idx": 3,
+                "dm_fine_pc_cc": 98.571, "t_in_cube": 100,
+                "width_samples": 128,
+            },
+            {
+                "snr": 50.0, "kernel_id": "unit:d1:b8",
+                "l_pix": 8, "m_pix": 8, "dm_idx": 5,
+                "dm_fine_pc_cc": 104.285, "t_in_cube": 200,
+                "width_samples": 8,
+            },
+        ],
+        "burst_match": {
+            "matched_kernel_id": "unit:d1:b8",
+            "matched_k_time": 8, "matched_snr": 18.0, "b1_snr": 11.0,
+            "matched_filter_snr_boost": 1.64,
+            "l_pix": 16, "m_pix": 18, "dm_idx": 3,
+            "dm_fine_pc_cc": 98.571, "t_in_cube": 100,
+            "labelled_dm_pc_cc": 100.0, "dm_residual_frac": -0.014,
+            "match_radii": {"lm_pix": 5, "dm_consistency_frac": 0.02},
+            "dm_consistent": True,
+            "burst_kernels": [],
+        },
+        "rfi_contamination": [
+            {
+                "snr": 50.0, "kernel_id": "unit:d1:b8",
+                "l_pix": 8, "m_pix": 8, "dm_idx": 5,
+                "dm_fine_pc_cc": 104.285, "t_in_cube": 200,
+                "width_samples": 8, "delta_lm_pix": [-8, -10],
+                "delta_fdm": 2,
+                "note": "off-burst high-SNR candidate",
+            },
+        ],
+        "dm_curves_at_top_candidate_lm": [
+            {
+                "kernel_id": f"unit:d1:b{w}", "k_time_width": w,
+                "curve": [
+                    {"fdm_idx": f, "dm_pc_cc": 90.0 + 2.857 * f,
+                     "snr": 5.0 + 0.5 * (8 - abs(f - 3)) * (w / 4.0)}
+                    for f in range(8)
+                ],
+            }
+            for w in [1, 2, 4, 8, 16, 32, 64, 128]
+        ],
+    }
+
+
+def test_cli_burst_mode_end_to_end(tmp_path: Path) -> None:
+    """Feed a synthetic detector.json through ``--mode burst`` and
+    verify the CLI writes the expected report files."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    rc = search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    assert rc == 0
+    assert (out_dir / "report.html").is_file()
+    assert (out_dir / "candidates.html").is_file()
+    assert (out_dir / "butterfly.png").is_file()
+    assert (out_dir / "dm_curve.png").is_file()
+    assert (out_dir / "per_kernel_snr.png").is_file()
+    # PNGs are non-empty.
+    for png in ("butterfly.png", "dm_curve.png", "per_kernel_snr.png"):
+        assert (out_dir / png).stat().st_size > 0
+
+
+def test_burst_report_contains_burst_match_summary(tmp_path: Path) -> None:
+    """The burst-mode report.html embeds the green burst-match
+    summary box with matched kernel, MF boost, and DM residual."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    # Burst-recovered green summary box.
+    assert "Burst recovered" in html
+    assert "unit:d1:b8" in html  # matched kernel
+    assert "1.64" in html  # MF boost
+    assert "98.571" in html  # recovered fine DM
+    assert "100.000" in html or "100.0" in html  # labelled DM
+    # Per plan §4.7: NO PASS/FAIL banner. The header explicitly says
+    # "No PASS/FAIL banner"; the burst-recovered box is informational.
+    assert "No PASS/FAIL banner" in html
+
+
+def test_burst_report_contains_rfi_contamination_table(
+    tmp_path: Path,
+) -> None:
+    """If detector.json has a non-empty rfi_contamination list, the
+    burst report.html surfaces it as a separate table."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert "Off-burst high-SNR detections" in html
+    assert "static-sky-subtract IIR" in html
+
+
+def test_burst_report_no_match_when_burst_match_absent(
+    tmp_path: Path,
+) -> None:
+    """If detector.json has burst_match=None (eg threshold too high
+    or location off-grid), the burst report stamps a red 'No burst
+    match' box instead of the green 'Burst recovered' box."""
+    rec = _synthetic_detector_record()
+    rec["burst_match"] = None
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(rec))
+    out_dir = tmp_path / "report"
+    rc = search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    assert rc == 0
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert "No burst match" in html
+    assert "Burst recovered" not in html
+
+
+def test_burst_candidates_table_highlights_burst_match(
+    tmp_path: Path,
+) -> None:
+    """The burst-mode candidates.html highlights candidates near the
+    burst (l, m) in green and off-burst candidates in yellow."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    html = (out_dir / "candidates.html").read_text(encoding="utf-8")
+    assert "burst-match" in html
+    assert "off-burst" in html
+    # Two synthetic candidates — one at burst (16, 18) ~= burst loc,
+    # one at off-burst (8, 8). Both rows in the table.
+    assert "unit:d1:b128" in html  # burst-match row
+    assert "unit:d1:b8" in html  # off-burst row
 
 
 def test_cli_cube_injection_end_to_end(tmp_path: Path) -> None:
