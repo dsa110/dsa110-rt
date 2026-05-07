@@ -143,6 +143,8 @@ def layer1_global_scalar(
     *,
     n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
     n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
+    max_samples: Optional[int] = None,
+    rng_seed: int = 0,
 ) -> torch.Tensor:
     """Compute the per-fine_DM σ-clipped robust std for one cube.
 
@@ -153,6 +155,16 @@ def layer1_global_scalar(
 
     Args:
         cube: ``[T_det, N_fdm, H, W]`` cube tensor (real-valued).
+        max_samples: optional upper bound on the number of cells used
+            for the per-fdm σ estimate; passes through to
+            ``sigma_clipped_std``. At production geometry (T_det=256,
+            N_grid=256) each fdm slab has 256³ = 16.8 M cells; a
+            ``max_samples=1_000_000`` cap brings ``torch.median`` per
+            iter from ~25 ms to ~1 ms with σ̂ standard error
+            ≈ σ / √(2 × 1e6) ≈ 7e-4 σ. Default ``None`` preserves the
+            chunk-1 behaviour (full slab).
+        rng_seed: seed for the subsample RNG; the per-fdm call uses
+            ``rng_seed + fdm`` so each fdm gets a distinct subsample.
 
     Returns:
         ``[N_fdm] float32`` per-fine_DM σ scalars. Suitable for
@@ -170,6 +182,8 @@ def layer1_global_scalar(
             cube[:, fdm, :, :],
             n_sigma=n_sigma,
             n_iterations=n_iterations,
+            max_samples=max_samples,
+            rng_seed=int(rng_seed) + int(fdm),
         )
     return sigmas
 
@@ -200,6 +214,8 @@ class Layer1State:
         n_burnin_cubes: int = NOISE_LAYER1_N_BURNIN_CUBES_DEFAULT,
         n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
         n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
+        max_samples: Optional[int] = None,
+        rng_seed: int = 0,
     ) -> None:
         if n_fdm < 1:
             raise ValueError(f"n_fdm={n_fdm}, expected ≥ 1")
@@ -211,6 +227,10 @@ class Layer1State:
         self.n_burnin_cubes = int(n_burnin_cubes)
         self.n_sigma = float(n_sigma)
         self.n_iterations = int(n_iterations)
+        self.max_samples = (
+            int(max_samples) if max_samples is not None else None
+        )
+        self.rng_seed = int(rng_seed)
         # Per-fdm sigma history: deque of length ≤ n_burnin_cubes.
         self._history: list[Deque[float]] = [
             deque(maxlen=self.n_burnin_cubes) for _ in range(self.n_fdm)
@@ -264,6 +284,8 @@ class Layer1State:
                 cube,
                 n_sigma=self.n_sigma,
                 n_iterations=self.n_iterations,
+                max_samples=self.max_samples,
+                rng_seed=self.rng_seed,
             )
         else:
             assert per_fdm_sigma is not None
