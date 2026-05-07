@@ -52,8 +52,6 @@ from dsart.detector.forward import (  # noqa: E402
 from dsart.detector.kernels import build_kernel_bank  # noqa: E402
 from dsart.inject.cube_injection import (  # noqa: E402
     CubeInjectionConfig,
-    InjectionProfile,
-    add_injection,
     synthesise_cube,
 )
 
@@ -116,13 +114,10 @@ def _candidate_key(c) -> tuple:
 def test_streaming_matches_batched_noise_only_no_candidates() -> None:
     """Pure unit-σ Gaussian → no candidates above θ=8 in either path
     (probability of any cell crossing in a 16×16×4×4 cube is ~1e-8)."""
-    cube = synthesise_cube(
+    cube_t, validity_mask, sigma_layer1 = synthesise_cube(
         t_det=16, n_fdm=4, n_grid=8,
         rng=np.random.default_rng(0),
     )
-    cube_t = torch.from_numpy(cube).to(torch.float32)
-    validity_mask = torch.ones((16, 4), dtype=torch.bool)
-    sigma_layer1 = torch.ones((4,), dtype=torch.float32)
 
     det_b = _make_detector(streaming=False)
     det_s = _make_detector(streaming=True)
@@ -144,22 +139,18 @@ def test_streaming_matches_batched_with_injection() -> None:
     with matching SNR. Use a generous amplitude so the recovered SNR
     well exceeds θ=8."""
     cfg = CubeInjectionConfig(
-        cube_idx=0,
-        t_in_cube=8,
         l_pix=4, m_pix=4,
         fine_dm_idx=2,
-        snr_at_injection_cell=15.0,
+        t_in_cube=8,
+        snr=15.0,
         width_samples=4,
-        profile=InjectionProfile.BOXCAR,
+        profile="boxcar",
     )
-    cube = synthesise_cube(
+    cube_t, validity_mask, sigma_layer1 = synthesise_cube(
         t_det=16, n_fdm=4, n_grid=8,
         rng=np.random.default_rng(42),
         injections=(cfg,),
     )
-    cube_t = torch.from_numpy(cube).to(torch.float32)
-    validity_mask = torch.ones((16, 4), dtype=torch.bool)
-    sigma_layer1 = torch.ones((4,), dtype=torch.float32)
 
     det_b = _make_detector(streaming=False)
     det_s = _make_detector(streaming=True)
@@ -196,22 +187,18 @@ def test_streaming_matches_batched_warmup_flag() -> None:
     detector default seeds σ_k to the analytic value but does NOT
     advance cube_count, so cube_count=0 < n_burnin=1 holds)."""
     cfg = CubeInjectionConfig(
-        cube_idx=0,
-        t_in_cube=8,
         l_pix=4, m_pix=4,
         fine_dm_idx=2,
-        snr_at_injection_cell=15.0,
+        t_in_cube=8,
+        snr=15.0,
         width_samples=4,
-        profile=InjectionProfile.BOXCAR,
+        profile="boxcar",
     )
-    cube = synthesise_cube(
+    cube_t, validity_mask, sigma_layer1 = synthesise_cube(
         t_det=16, n_fdm=4, n_grid=8,
         rng=np.random.default_rng(42),
         injections=(cfg,),
     )
-    cube_t = torch.from_numpy(cube).to(torch.float32)
-    validity_mask = torch.ones((16, 4), dtype=torch.bool)
-    sigma_layer1 = torch.ones((4,), dtype=torch.float32)
 
     def _new_warmup_detector(streaming: bool) -> DeterministicDetector:
         return DeterministicDetector(
