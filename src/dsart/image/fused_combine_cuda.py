@@ -101,11 +101,17 @@ extern "C" __global__ void fused_combine_per_fdm_cf16(
     const int spatial_offset = u * n_grid + v;
     const int chg_stride     = t_stream * n_grid_sq;
 
+    // Plan section 3.6.3 sign convention: at output cube-time t,
+    // chgroup g contributes streams[g, t - shifts[g]]. Out-of-range
+    // reads (negative or >= t_stream) yield a zero contribution,
+    // matching combine_chgroups zero-fill on cube-time samples not
+    // yet present in the stream. shifts[g] is non-negative
+    // (plan section 3.6.3 invariant).
     __half2 acc = __floats2half2_rn(0.0f, 0.0f);
     for (int g = 0; g < n_chgroup; ++g) {
         const int s = shifts[g];
-        const int t_src = s + t;
-        if (t_src < t_stream) {
+        const int t_src = t - s;
+        if (t_src >= 0 && t_src < t_stream) {
             const __half2 val = streams[
                 g * chg_stride + t_src * n_grid_sq + spatial_offset
             ];
@@ -132,11 +138,13 @@ extern "C" __global__ void fused_combine_per_fdm_cf32(
     const int spatial_offset = u * n_grid + v;
     const int chg_stride     = t_stream * n_grid_sq;
 
+    // Plan section 3.6.3 sign convention:
+    //   out[t] = sum_g streams[g, t - shifts[g]].
     float2 acc = make_float2(0.0f, 0.0f);
     for (int g = 0; g < n_chgroup; ++g) {
         const int s = shifts[g];
-        const int t_src = s + t;
-        if (t_src < t_stream) {
+        const int t_src = t - s;
+        if (t_src >= 0 && t_src < t_stream) {
             const float2 val = streams[
                 g * chg_stride + t_src * n_grid_sq + spatial_offset
             ];
@@ -193,12 +201,14 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16(
     const int t_stride       = 2 * n_grid_sq;       // re plane + im plane
     const int chg_stride     = t_stream * t_stride;
 
+    // Plan section 3.6.3 sign convention:
+    //   out[t] = sum_g streams[g, t - shifts[g]].
     int acc_re = 0;
     int acc_im = 0;
     for (int g = 0; g < n_chgroup; ++g) {
         const int s = shifts[g];
-        const int t_src = s + t;
-        if (t_src < t_stream) {
+        const int t_src = t - s;
+        if (t_src >= 0 && t_src < t_stream) {
             const int base = g * chg_stride + t_src * t_stride + spatial_offset;
             acc_re += (int)streams[base];                      // re plane
             acc_im += (int)streams[base + n_grid_sq];          // im plane
@@ -227,12 +237,14 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf32(
     const int t_stride       = 2 * n_grid_sq;
     const int chg_stride     = t_stream * t_stride;
 
+    // Plan section 3.6.3 sign convention:
+    //   out[t] = sum_g streams[g, t - shifts[g]].
     int acc_re = 0;
     int acc_im = 0;
     for (int g = 0; g < n_chgroup; ++g) {
         const int s = shifts[g];
-        const int t_src = s + t;
-        if (t_src < t_stream) {
+        const int t_src = t - s;
+        if (t_src >= 0 && t_src < t_stream) {
             const int base = g * chg_stride + t_src * t_stride + spatial_offset;
             acc_re += (int)streams[base];
             acc_im += (int)streams[base + n_grid_sq];
@@ -387,15 +399,27 @@ def fused_combine_per_fdm(
         output: ``[T_det, N_grid, N_grid]`` same dtype as ``streams``,
             cuda, contiguous. Overwritten with the combined uv slab.
 
-    Semantic equivalence to the Python add-loop:
+    §3.6.3 sign convention (matches ``fine_dm/combiner.py::combine_chgroups``):
+
+        ``output[t] = sum_g streams[g, t - shifts[g]]``
+
+    Equivalent Python add-loop reference:
+
         ``output.zero_()
           for g in range(N_chgroup):
-              if shifts[g] + T_det <= T_stream:
-                  output += streams[g, shifts[g] : shifts[g] + T_det]``
+              s = int(shifts[g])
+              t_in_lo = max(0, s)
+              t_in_hi = min(T_det, T_stream + s)
+              if t_in_hi > t_in_lo:
+                  output[t_in_lo:t_in_hi] += streams[g, t_in_lo - s : t_in_hi - s]``
 
-    Boundary: chgroups whose shift would read past T_stream are skipped
-    cell-wise (so partial cube tails inherit zero-fill, matching the
-    Python guard).
+    Boundary: chgroups whose ``t - shift`` index is negative or past
+    ``T_stream`` zero-fill cell-wise (no exception). Combined with the
+    §3.6.3 invariant ``shifts[g] >= 0``, this means chgroup g's
+    contribution clips to ``output[shifts[g] : T_det]``; cube-time
+    samples in ``[0, shifts[g])`` get a zero contribution from that
+    chgroup. The chunk-2 cube-validity gate is responsible for
+    rejecting cubes whose receive-ring slots haven't filled enough.
     """
     if not (streams.is_cuda and shifts.is_cuda and output.is_cuda):
         raise RuntimeError("fused_combine_per_fdm: all tensors must be cuda")
@@ -483,20 +507,28 @@ def fused_dequant_combine_per_fdm(
             ``complex64``, cuda, contiguous. Overwritten with the
             combined uv slab.
 
-    Semantic equivalence to the chained Python pipeline:
-        ``streams_cf = dequant(streams_cint8)  # cint8 -> cf32 -> cfXX
+    §3.6.3 sign convention (matches ``fine_dm/combiner.py::combine_chgroups``):
+
+        ``output[t] = sum_g dequant(streams_cint8[g, t - shifts[g]])``
+
+    Equivalent Python add-loop reference:
+
+        ``streams_cf = streams_cint8.astype(cf32)   # cint8 → cf32 (exact)
           output.zero_()
           for g in range(N_chgroup):
-              if shifts[g] + T_det <= T_stream:
-                  output += streams_cf[g, shifts[g] : shifts[g] + T_det]``
+              s = int(shifts[g])
+              t_in_lo = max(0, s)
+              t_in_hi = min(T_det, T_stream + s)
+              if t_in_hi > t_in_lo:
+                  output[t_in_lo:t_in_hi] += streams_cf[g,
+                                                        t_in_lo - s : t_in_hi - s]``
 
     cint8-to-cf16/cf32 dequant is exact for the cint8 [-127, +127]
     range since both fp16 and fp32 mantissas have ≥ 7 bits. The
     int32 accumulation is also exact (max sum ±2032 fits in int16).
-    Boundary check (``shift + t < T_stream``) is cell-wise inside
-    the kernel, matching the Python guard cell-by-cell rather than
-    chgroup-by-chgroup; safe under the test-fixture invariant that
-    no shift overhangs by more than T_det - 1.
+    Boundary check (``0 <= t - shift < T_stream``) is cell-wise inside
+    the kernel: cube-time samples with no in-range stream sample for
+    chgroup g get a zero contribution from that chgroup.
     """
     if not (streams_cint8.is_cuda and shifts.is_cuda and output.is_cuda):
         raise RuntimeError("fused_dequant_combine_per_fdm: all tensors must be cuda")

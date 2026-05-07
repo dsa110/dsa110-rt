@@ -175,12 +175,16 @@ class GpuImager:
                 (real / imaginary). Caller owns this tensor; this
                 method only reads from it.
             time_shifts_gpu: ``[N_fdm, N_chgroup] int32`` per-(fdm,
-                chgroup) sample shift (the fine-DM trial offsets). For
-                each fdm ``f``, chgroup ``g`` contributes
-                ``streams_cint8[g, shifts[f, g] : shifts[f, g] + T_det]``.
-                Out-of-bound shifts (``shift + T_det > T_stream``) are
-                silently skipped by the fused kernel (treated as a zero
-                contribution from that chgroup).
+                chgroup) sample shift (the fine-DM trial offsets), as
+                produced by ``fine_dm/combiner.py::compute_time_shift_search``.
+                Per §3.6.3 the fused kernel reads chgroup ``g``'s
+                stream at ``streams_cint8[g, t - shifts[f, g]]`` for
+                output cube-time ``t`` (zero-fill outside
+                ``[0, T_stream)``). For a coherently dispersed pulse
+                whose chgroup-15 sample lands at stream-time ``t_15``,
+                the dedispersed cube peaks at cube-time ``t_15`` (the
+                chgroup-15 row of the shift table is identically zero
+                by §3.6.3).
 
         Returns:
             ``self.output_cube`` (``[T_det, N_fdm, N_grid, N_grid]

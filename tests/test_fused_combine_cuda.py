@@ -3,18 +3,25 @@
 Skipped unless ``cuda`` is available (the test runs only on the M5
 isolation worktree on h01 GPU 1; CI without GPU passes by skipping).
 
-The fused kernel claims to be cell-for-cell equivalent to the
-Python ``uv.zero_(); for g: uv.add_(streams[g, s_g:s_g+T_det])``
-fallback, modulo cfp16 floating-point ordering. The tests verify:
+The fused kernel implements the §3.6.3 sign convention:
+
+    ``output[t] = sum_g streams[g, t - shifts[g]]``
+
+with cell-wise zero-fill for out-of-range ``t - shifts[g]``. This is
+identical to ``fine_dm/combiner.py::combine_chgroups`` (the CPU
+reference). The tests verify:
 
 1. Random-shifts case: cf32 (exact equality up to fp32 reduction
-   order) and cf16 (atol=2.0 — generous because cfp16 has a 4-bit
-   mantissa for the imag/real lanes; chgroup-summed magnitudes can
-   easily span a few units at our random-fill amplitudes).
-2. Boundary case: a chgroup with shift+t_det > t_stream is
-   silently skipped (zero-fill), matching the Python guard.
+   order) and cf16 (atol < 1 ULP × √16).
+2. Boundary case: cube-time samples ``t < shifts[g]`` get a zero
+   contribution from chgroup ``g`` (matches combine_chgroups'
+   zero-fill on samples not yet present in the stream).
 3. shifts=zero edge case: the kernel just sums the first t_det
    samples of each chgroup.
+4. ``test_fused_combine_matches_combine_chgroups`` (D25): a synthetic
+   dispersed pulse + ``compute_time_shift_search`` table gives a
+   coherent dedispersion peak at the chgroup-15 burst time —
+   verifying GPU and CPU agree on §3.6.3's sign.
 """
 from __future__ import annotations
 
@@ -48,13 +55,19 @@ def cuda_module():
 
 
 def _python_combine(streams: torch.Tensor, shifts: torch.Tensor, t_det: int) -> torch.Tensor:
-    """Reference Python add-loop (the bench's ``python_addloop`` impl)."""
+    """Reference Python add-loop matching ``combine_chgroups`` and §3.6.3:
+
+        ``out[t] = sum_g streams[g, t - shifts[g]]``  with zero-fill
+        outside ``[0, T_stream)``.
+    """
     n_chg, t_stream, n, _ = streams.shape
     out = torch.zeros((t_det, n, n), dtype=streams.dtype, device=streams.device)
     for g in range(n_chg):
         s = int(shifts[g].item())
-        if s + t_det <= t_stream:
-            out += streams[g, s : s + t_det]
+        t_in_lo = max(0, s)
+        t_in_hi = min(t_det, t_stream + s)
+        if t_in_hi > t_in_lo:
+            out[t_in_lo:t_in_hi] += streams[g, t_in_lo - s : t_in_hi - s]
     return out
 
 
@@ -124,17 +137,14 @@ def test_fused_combine_zero_shifts(cuda_module):
     assert diff < 0.05, f"zero-shift fused-vs-expected max diff = {diff:.3e}"
 
 
-def test_fused_combine_partial_overhang(cuda_module):
-    """Edge: a chgroup whose shift+t_det > t_stream is skipped cell-wise.
+def test_fused_combine_zero_fill_below_shift(cuda_module):
+    """§3.6.3 zero-fill: cube-time t < shifts[g] gets zero contribution
+    from chgroup g (the corresponding stream sample is t - s < 0).
 
-    The kernel uses ``if s + t < t_stream`` per cell, so the partial
-    overhang produces zeros for the affected output time samples for
-    that chgroup, matching the Python ``if s + T_det <= T_stream:
-    skip-add`` guard cell-by-cell rather than chgroup-by-chgroup.
-
-    For exact equivalence to the Python guard (which skips the entire
-    chgroup if any sample would overhang), we ensure the test setup
-    has no in-range overhangs and rely on the per-cell semantic.
+    With shifts = [0, 4, 8, 12] and t_det=16, output at t < 12 gets
+    contributions only from a subset of chgroups; output at t = 12..15
+    gets contributions from all four. The Python reference (now matching
+    combine_chgroups) is the source of truth.
     """
     torch.manual_seed(0)
     n_chg, t_stream, n_grid, t_det = 4, 32, 8, 16
@@ -142,10 +152,7 @@ def test_fused_combine_partial_overhang(cuda_module):
         torch.randn((n_chg, t_stream, n_grid, n_grid), dtype=torch.float32, device="cuda"),
         torch.randn((n_chg, t_stream, n_grid, n_grid), dtype=torch.float32, device="cuda"),
     ).to(torch.complex32)
-    # All shifts safely within bounds for this test:
-    shifts = torch.tensor([0, 4, 8, 16], dtype=torch.int32, device="cuda")
-    assert all(int(s) + t_det <= t_stream for s in shifts), \
-        "test fixture must keep all shifts in range"
+    shifts = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device="cuda")
 
     out_fused = torch.empty((t_det, n_grid, n_grid), dtype=torch.complex32, device="cuda")
     fused_combine_per_fdm(streams, shifts, out_fused)
@@ -153,6 +160,11 @@ def test_fused_combine_partial_overhang(cuda_module):
 
     diff = (out_fused - out_python).abs().max().item()
     assert diff < 0.05
+
+    # Sanity: at t=0, only chgroup 0 contributes (others have shift > 0).
+    expected_t0 = streams[0, 0]
+    diff_t0 = (out_fused[0] - expected_t0).abs().max().item()
+    assert diff_t0 < 0.05, f"t=0 should equal chgroup-0 only; diff={diff_t0:.3e}"
 
 
 def test_fused_combine_dtype_mismatch_raises(cuda_module):
@@ -179,17 +191,12 @@ def _python_dequant_combine_cf32(
 ) -> torch.Tensor:
     """Python reference for the cint8-input fused kernel: dequant
     each chgroup to cfp32 (exact, since cint8 ⊂ fp32 mantissa) then
-    accumulate across chgroups in cfp32.
+    apply the §3.6.3 ``out[t] = sum_g stream[g, t - shift[g]]`` rule.
 
     Layout: streams_cint8 is ``[N_chg, T_stream, 2, N, N]`` with
     re plane at axis_2=0 and im plane at axis_2=1, matching the
     bench's ``_build_synthetic_streams`` layout (which mirrors the
     M3 wire payload).
-
-    Returns a cf32 result for use as a high-precision reference
-    (the kernel's int32 accumulator → cfp16 cast has only one
-    rounding step, so its output should match this cf32 reference
-    to within ~1 fp16 ULP).
     """
     n_chg, t_stream, two, n_grid, _ = streams_cint8.shape
     assert two == 2
@@ -199,8 +206,10 @@ def _python_dequant_combine_cf32(
     out = torch.zeros((t_det, n_grid, n_grid), dtype=torch.complex64, device=streams_cint8.device)
     for g in range(n_chg):
         s = int(shifts[g].item())
-        if s + t_det <= t_stream:
-            out += streams_cf32[g, s : s + t_det]
+        t_in_lo = max(0, s)
+        t_in_hi = min(t_det, t_stream + s)
+        if t_in_hi > t_in_lo:
+            out[t_in_lo:t_in_hi] += streams_cf32[g, t_in_lo - s : t_in_hi - s]
     return out
 
 
@@ -313,3 +322,119 @@ def test_fused_dequant_combine_layout_validation(cuda_module):
     out = torch.empty((16, 8, 8), dtype=torch.complex32, device="cuda")
     with pytest.raises(RuntimeError, match=r"streams_cint8 axis 2 must be 2"):
         fused_dequant_combine_per_fdm(bad, shifts, out)
+
+
+# ---------------------------------------------------------------------------
+# D25 — §3.6.3 sign-convention coherence: GPU agrees with combine_chgroups
+# ---------------------------------------------------------------------------
+
+
+def test_fused_combine_matches_combine_chgroups(cuda_module):
+    """GPU kernel + ``compute_time_shift_search`` table coherently sums
+    a synthetic dispersed pulse to the **same cube-time** as the CPU
+    reference ``combine_chgroups``. This locks §3.6.3's ``out[t] =
+    sum_g stream[g, t - shift[g]]`` convention across GPU and CPU.
+
+    Setup: place a unit pulse in chgroup g at stream-time ``t_g = t_15
+    - shifts[15-row, g]`` for a true DM. The dedispersed cube must
+    peak at cube-time ``t_15`` with magnitude == N_chgroup.
+    """
+    import numpy as np
+    from dsart.fine_dm.combiner import combine_chgroups, compute_time_shift_search
+
+    n_chg, t_stream, n_grid, t_det = 16, 384, 8, 256
+    true_dm = 100.0
+    t_15 = 250
+
+    table = compute_time_shift_search(
+        coarse_dm_pc_cm3=np.array([0.0]),
+        fine_dm_pc_cm3=np.array([true_dm]),
+        fine_to_coarse=np.zeros(1, dtype=np.int64),
+        t_int_search_us=524.288,
+    )
+    shifts_np = table.shifts[0]   # [N_chg]
+    t_burst = t_15 - shifts_np    # per-chgroup stream-time of the pulse
+
+    # Build per-chgroup cf32 streams with a unit pulse at the dispersed
+    # arrival time per chgroup. Same fixture for CPU and GPU so any
+    # disagreement reflects a sign-convention divergence.
+    streams_cf = np.zeros((n_chg, t_stream, n_grid, n_grid), dtype=np.complex64)
+    l_b, m_b = n_grid // 2, n_grid // 2
+    for g in range(n_chg):
+        streams_cf[g, int(t_burst[g]), l_b, m_b] = 1.0
+
+    cpu_out = combine_chgroups(
+        per_chgroup_streams={g: streams_cf[g] for g in range(n_chg)},
+        time_shift_per_chgroup=shifts_np,
+        t_window=(0, t_det),
+        n_grid=n_grid,
+    )
+    cpu_peak_t = int(np.argmax(np.abs(cpu_out[:, l_b, m_b])))
+    cpu_peak_val = float(np.abs(cpu_out[cpu_peak_t, l_b, m_b]))
+    assert cpu_peak_t == t_15, (
+        f"CPU combine_chgroups must peak at t_15={t_15}; got {cpu_peak_t}"
+    )
+    assert abs(cpu_peak_val - n_chg) < 1e-5, (
+        f"CPU coherent peak should equal N_chg={n_chg}; got {cpu_peak_val}"
+    )
+
+    streams_t = torch.from_numpy(streams_cf).to(torch.complex64).cuda()
+    shifts_t = torch.from_numpy(shifts_np.astype(np.int32)).cuda()
+    out_t = torch.empty((t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda")
+    fused_combine_per_fdm(streams_t, shifts_t, out_t)
+    gpu_re = out_t.real.to(torch.float32).cpu().numpy()
+    gpu_peak_t = int(np.argmax(np.abs(gpu_re[:, l_b, m_b])))
+    gpu_peak_val = float(np.abs(gpu_re[gpu_peak_t, l_b, m_b]))
+    assert gpu_peak_t == t_15, (
+        f"GPU fused_combine must peak at t_15={t_15}; got {gpu_peak_t} "
+        "(sign-convention regression vs CPU combine_chgroups)"
+    )
+    assert abs(gpu_peak_val - n_chg) < 1e-3, (
+        f"GPU coherent peak should equal N_chg={n_chg}; got {gpu_peak_val}"
+    )
+
+    # The two should agree numerically.
+    cpu_re = cpu_out.real.astype(np.float32)
+    diff = float(np.abs(gpu_re - cpu_re).max())
+    assert diff < 1e-4, (
+        f"GPU vs CPU max-abs diff = {diff:.3e}; should be near machine-eps "
+        "(both implement out[t] = sum_g stream[g, t - shift[g]])"
+    )
+
+
+def test_fused_dequant_combine_matches_cint8_combine_chgroups(cuda_module):
+    """Same §3.6.3 lock-in as test_fused_combine_matches_combine_chgroups,
+    but for the cint8-input dequant+combine variant.
+    """
+    import numpy as np
+    from dsart.fine_dm.combiner import combine_chgroups, compute_time_shift_search
+
+    n_chg, t_stream, n_grid, t_det = 16, 384, 8, 256
+    true_dm = 100.0
+    t_15 = 250
+
+    table = compute_time_shift_search(
+        coarse_dm_pc_cm3=np.array([0.0]),
+        fine_dm_pc_cm3=np.array([true_dm]),
+        fine_to_coarse=np.zeros(1, dtype=np.int64),
+        t_int_search_us=524.288,
+    )
+    shifts_np = table.shifts[0]
+    t_burst = t_15 - shifts_np
+
+    streams_cint8 = np.zeros((n_chg, t_stream, 2, n_grid, n_grid), dtype=np.int8)
+    l_b, m_b = n_grid // 2, n_grid // 2
+    for g in range(n_chg):
+        streams_cint8[g, int(t_burst[g]), 0, l_b, m_b] = 100  # real plane
+
+    streams_t = torch.from_numpy(streams_cint8).cuda()
+    shifts_t = torch.from_numpy(shifts_np.astype(np.int32)).cuda()
+    out_t = torch.empty((t_det, n_grid, n_grid), dtype=torch.complex64, device="cuda")
+    fused_dequant_combine_per_fdm(streams_t, shifts_t, out_t)
+    gpu_re = out_t.real.to(torch.float32).cpu().numpy()
+    peak_t = int(np.argmax(np.abs(gpu_re[:, l_b, m_b])))
+    peak_val = float(np.abs(gpu_re[peak_t, l_b, m_b]))
+    assert peak_t == t_15, f"dequant fused must peak at t_15={t_15}; got {peak_t}"
+    assert abs(peak_val - 100 * n_chg) < 1e-3, (
+        f"dequant coherent peak should equal 100×N_chg={100 * n_chg}; got {peak_val}"
+    )
