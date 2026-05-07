@@ -100,6 +100,18 @@ class CubeRingSlot:
             combiner builds ``[T_det, n_fdm_in_cube, N_grid, N_grid]``.
         t_det: number of cube-time samples per cube (production: 512).
         n_grid: spatial grid side (production: 256).
+        per_chgroup_cint8_stack: optional pre-quantised cint8 stream
+            stack ``[N_chg, T_stream, 2, N_grid, N_grid] int8`` (split-
+            plane re/im, M3 wire layout). When present, the GPU
+            ``_build_cube_gpu`` path bypasses host-side cf -> cint8
+            quantisation and copies straight to the GPU. This is the
+            chunk-8b RX-ring contract: M3 emits cint8 streams already
+            quantised with per-block (scale, offset); production never
+            re-quantises on the search node. Bench paths (synthetic
+            source, ``--prequantise``) populate this field to emulate
+            chunk-8b delivery and isolate the GPU pipeline cost from
+            host-side bench scaffolding. Default ``None`` keeps the
+            chunk-6a contract (cf streams only).
     """
 
     cube_id: int
@@ -110,6 +122,7 @@ class CubeRingSlot:
     n_fdm_in_cube: int
     t_det: int
     n_grid: int
+    per_chgroup_cint8_stack: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.cube_id < 0:
@@ -140,6 +153,23 @@ class CubeRingSlot:
                 f"time_shift_table covers {self.time_shift_table.shifts.shape[0]} "
                 f"fine-DM trials != n_fdm_in_cube={self.n_fdm_in_cube}"
             )
+        if self.per_chgroup_cint8_stack is not None:
+            cint8 = self.per_chgroup_cint8_stack
+            if cint8.dtype != np.int8:
+                raise TypeError(
+                    f"per_chgroup_cint8_stack.dtype={cint8.dtype}, expected int8"
+                )
+            if cint8.ndim != 5 or cint8.shape[2] != 2:
+                raise ValueError(
+                    f"per_chgroup_cint8_stack.shape={cint8.shape}, expected "
+                    f"(N_chg, T_stream, 2, N_grid, N_grid)"
+                )
+            if cint8.shape[3] != self.n_grid or cint8.shape[4] != self.n_grid:
+                raise ValueError(
+                    f"per_chgroup_cint8_stack n_grid axes "
+                    f"({cint8.shape[3]}, {cint8.shape[4]}) != n_grid="
+                    f"{self.n_grid}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +278,8 @@ class SyntheticRxRingSource:
         injections: Sequence[SyntheticInjection] = (),
         cube_cadence_s: float = 0.0,
         t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
+        pre_quantise: bool = False,
+        prequantise_target_max: int = 120,
     ) -> None:
         if n_cubes <= 0:
             raise ValueError(f"n_cubes={n_cubes}, expected > 0")
@@ -271,6 +303,16 @@ class SyntheticRxRingSource:
         self._cubes_emitted = 0
         self._started = False
         self._stopped = False
+        # Bench-only chunk-8b RX-ring emulation: pre-quantise one cube
+        # of cf32 streams to cint8 once and yield the same cached cint8
+        # stack on every iteration. Lets the throughput bench measure
+        # the GPU pipeline cost in isolation from host-side bench
+        # scaffolding (synthetic source generation + cf -> cint8
+        # quantise). Production M3 RX-ring delivers cint8 already.
+        self._pre_quantise = bool(pre_quantise)
+        self._prequantise_target_max = int(prequantise_target_max)
+        self._cached_cint8: Optional[np.ndarray] = None
+        self._cached_streams: Optional[Mapping[int, np.ndarray]] = None
 
     @property
     def time_shift_table(self) -> TimeShiftSearchTable:
@@ -327,10 +369,37 @@ class SyntheticRxRingSource:
             await self.start()
         while self._cubes_emitted < self._n_cubes and not self._stopped:
             cube_idx = self._cubes_emitted
+            if self._pre_quantise:
+                # Generate one canonical cube + quantise once; reuse for
+                # every cube. Emulates the chunk-8b RX-ring contract
+                # (M3 emits cint8 already; search-node never re-quantises).
+                if self._cached_cint8 is None:
+                    from ..transport.quantize import (
+                        quantise_per_chgroup_into_cint8,
+                    )
+                    self._cached_streams = self._gen_cube_streams(0)
+                    self._cached_cint8 = np.empty(
+                        (
+                            N_CHGROUP, self._t_stream, 2,
+                            self._n_grid, self._n_grid,
+                        ),
+                        dtype=np.int8,
+                    )
+                    quantise_per_chgroup_into_cint8(
+                        self._cached_streams,
+                        out_cint8=self._cached_cint8,
+                        target_max=self._prequantise_target_max,
+                        zero_fill_missing=True,
+                    )
+                streams = self._cached_streams
+                cint8_stack = self._cached_cint8
+            else:
+                streams = self._gen_cube_streams(cube_idx)
+                cint8_stack = None
             slot = CubeRingSlot(
                 cube_id=cube_idx,
                 specnum_start=cube_idx * self._t_det,
-                per_chgroup_streams=self._gen_cube_streams(cube_idx),
+                per_chgroup_streams=streams,
                 time_shift_table=self._time_shift_table,
                 validity_mask=np.ones(
                     (self._t_det, self._n_fdm), dtype=np.bool_
@@ -338,6 +407,7 @@ class SyntheticRxRingSource:
                 n_fdm_in_cube=self._n_fdm,
                 t_det=self._t_det,
                 n_grid=self._n_grid,
+                per_chgroup_cint8_stack=cint8_stack,
             )
             self._cubes_emitted += 1
             yield slot

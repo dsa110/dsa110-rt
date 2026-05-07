@@ -337,7 +337,7 @@ class CubePipeline:
         scaffolding.
         """
         from ..image.imager_gpu import GpuImager, GpuImagerConfig
-        from ..transport.quantize import quantise_streams_global_cint8
+        from ..transport.quantize import quantise_per_chgroup_into_cint8
 
         cfg = self.config
         if slot.n_grid != cfg.n_grid:
@@ -410,36 +410,38 @@ class CubePipeline:
                 dtype=np.int8,
             )
 
-        # Stack into a cf64 view of the host buffer; quantise to cint8
-        # in-place. (We avoid a separate cf64 stack allocation by
-        # building the cint8 buffer directly via the quantiser.)
-        streams_stack = np.zeros(
-            (n_chg, t_stream, cfg.n_grid, cfg.n_grid),
-            dtype=np.complex64,
-        )
-        for g, stream in slot.per_chgroup_streams.items():
-            if not (0 <= g < n_chg):
+        # Two delivery paths:
+        #
+        # 1) chunk-8b production (M3 RX-ring delivers cint8 already):
+        #    ``slot.per_chgroup_cint8_stack`` is populated; we skip the
+        #    host quantise and copy the cint8 stack straight to GPU.
+        #
+        # 2) bench / pre-chunk-8b: ``slot.per_chgroup_streams`` are cf
+        #    streams. Quantise streaming per-chgroup into the re-used
+        #    host buffer (avoids the dense cf32 stack + cf64 round-trip
+        #    the original quantiser allocates, ~13 GiB transient host
+        #    allocs at production geometry).
+        if slot.per_chgroup_cint8_stack is not None:
+            cint8_src = slot.per_chgroup_cint8_stack
+            if cint8_src.shape != (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid):
                 raise ValueError(
-                    f"slot.per_chgroup_streams contains chgroup={g}; "
-                    f"expected 0..{n_chg - 1}"
+                    f"slot.per_chgroup_cint8_stack.shape={cint8_src.shape}; "
+                    f"expected ({n_chg}, {t_stream}, 2, {cfg.n_grid}, "
+                    f"{cfg.n_grid})"
                 )
-            stream_np = np.asarray(stream)
-            if stream_np.shape != (t_stream, cfg.n_grid, cfg.n_grid):
-                raise ValueError(
-                    f"per_chgroup_streams[{g}].shape={stream_np.shape}; "
-                    f"expected ({t_stream}, {cfg.n_grid}, {cfg.n_grid})"
-                )
-            if not np.iscomplexobj(stream_np):
-                raise ValueError(
-                    f"per_chgroup_streams[{g}].dtype={stream_np.dtype}; "
-                    "expected complex"
-                )
-            streams_stack[g] = stream_np
-        cint8_np, _scale = quantise_streams_global_cint8(
-            streams_stack, target_max=cfg.quantise_target_max,
-        )
-        # Push to GPU.
-        cint8_t = torch.from_numpy(cint8_np).to(self._device)
+            cint8_t = torch.from_numpy(
+                np.ascontiguousarray(cint8_src)
+            ).to(self._device)
+        else:
+            _scale = quantise_per_chgroup_into_cint8(
+                slot.per_chgroup_streams,
+                out_cint8=self._cint8_host_buf,
+                target_max=cfg.quantise_target_max,
+                zero_fill_missing=True,
+            )
+            # Push to GPU. ``self._cint8_host_buf`` is mutated in-place
+            # next cube; the H2D copy must finalise before we re-use it.
+            cint8_t = torch.from_numpy(self._cint8_host_buf).to(self._device)
         shifts_t = torch.from_numpy(
             np.ascontiguousarray(slot.time_shift_table.shifts.astype(np.int32))
         ).to(self._device)

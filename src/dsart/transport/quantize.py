@@ -27,11 +27,14 @@ fallback.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Mapping, Tuple
 
 import numpy as np
 
-__all__ = ["quantise_streams_global_cint8"]
+__all__ = [
+    "quantise_streams_global_cint8",
+    "quantise_per_chgroup_into_cint8",
+]
 
 
 def quantise_streams_global_cint8(
@@ -100,3 +103,125 @@ def quantise_streams_global_cint8(
     cint8[:, :, 0] = re.astype(np.int8)
     cint8[:, :, 1] = im.astype(np.int8)
     return cint8, scale
+
+
+def quantise_per_chgroup_into_cint8(
+    per_chgroup_streams: Mapping[int, np.ndarray],
+    *,
+    out_cint8: np.ndarray,
+    target_max: int = 120,
+    zero_fill_missing: bool = True,
+) -> float:
+    """Streaming per-chgroup cf32 -> cint8 quantiser writing into a
+    caller-supplied output buffer.
+
+    Equivalent (up to fp32 vs fp64 rounding) to
+    ``quantise_streams_global_cint8`` but avoids three large transient
+    allocations the dense path makes per cube: (a) the
+    ``[N_chg, T_stream, N_grid, N_grid] cf32`` stack the caller would
+    otherwise have to materialise, (b) the ``cf64`` real/imag copies
+    the dense path uses for the rint/clip step, and (c) the implicit
+    ``re * scale`` and ``np.rint`` temp buffers (each ~5 GiB at
+    production T_det=256/N_fdm=32/N_grid=256/N_chg=16). Working set
+    here is one chgroup at a time (~80 MiB) regardless of N_chg.
+
+    The function makes two passes over the streams:
+
+      1. Global max-abs scan (fp32 reductions per chgroup; no large
+         temp allocs).
+      2. Scale + rint + clip + cast to int8 directly into the
+         caller-supplied ``out_cint8`` buffer, one chgroup at a time.
+
+    A single global scale across all chgroups + re/im planes is used,
+    matching ``quantise_streams_global_cint8`` (per-chgroup scales
+    would distort the cross-chgroup magnitude balance the imager's
+    coherent-sum step depends on).
+
+    Args:
+        per_chgroup_streams: ``{chgroup_idx -> [T_stream, N_grid,
+            N_grid] complex}``. Any complex dtype accepted; the inner
+            ``re * scale`` math runs in the array's native float
+            precision (typically fp32 for cf32 inputs).
+        out_cint8: pre-allocated ``[N_chg, T_stream, 2, N_grid,
+            N_grid] int8`` output buffer. Caller owns the buffer; can
+            be re-used across cubes.
+        target_max: post-scale absolute clip target (<= 127 for int8).
+        zero_fill_missing: if True, chgroups absent from
+            ``per_chgroup_streams`` have their slice in ``out_cint8``
+            zeroed (the imager kernel reads these as zero
+            contributions). If False, missing chgroups are left
+            untouched (caller responsibility to pre-zero).
+
+    Returns:
+        The single global scale applied (``target_max / global_max``).
+    """
+    if out_cint8.ndim != 5 or out_cint8.dtype != np.int8:
+        raise ValueError(
+            f"out_cint8 must be 5-D int8; got shape={out_cint8.shape} "
+            f"dtype={out_cint8.dtype}"
+        )
+    n_chg, t_stream, two, n_grid_h, n_grid_w = out_cint8.shape
+    if two != 2:
+        raise ValueError(
+            f"out_cint8 axis-2 must have size 2 (re/im); got {two}"
+        )
+    if not (1 <= int(target_max) <= 127):
+        raise ValueError(
+            f"target_max must be in [1, 127]; got {target_max!r}"
+        )
+
+    g_max = 0.0
+    for g, stream in per_chgroup_streams.items():
+        if not (0 <= int(g) < n_chg):
+            raise ValueError(
+                f"per_chgroup_streams contains chgroup={g}; expected "
+                f"0..{n_chg - 1}"
+            )
+        s = np.asarray(stream)
+        if not np.iscomplexobj(s):
+            raise ValueError(
+                f"per_chgroup_streams[{g}].dtype={s.dtype}; expected complex"
+            )
+        if s.shape != (t_stream, n_grid_h, n_grid_w):
+            raise ValueError(
+                f"per_chgroup_streams[{g}].shape={s.shape}; expected "
+                f"({t_stream}, {n_grid_h}, {n_grid_w})"
+            )
+        re = s.real
+        im = s.imag
+        re_max = float(np.abs(re).max(initial=0.0))
+        im_max = float(np.abs(im).max(initial=0.0))
+        if re_max > g_max:
+            g_max = re_max
+        if im_max > g_max:
+            g_max = im_max
+
+    scale = (float(target_max) / g_max) if g_max > 0.0 else 1.0
+    scale_dtype: np.dtype
+    sample_stream = next(iter(per_chgroup_streams.values()), None)
+    if sample_stream is not None and np.asarray(sample_stream).dtype == np.complex64:
+        scale_dtype = np.float32
+    else:
+        scale_dtype = np.float64
+    scale_typed = scale_dtype.type(scale) if hasattr(scale_dtype, "type") else np.array(
+        scale, dtype=scale_dtype
+    )
+
+    if zero_fill_missing:
+        present = set(int(g) for g in per_chgroup_streams.keys())
+        for g in range(n_chg):
+            if g not in present:
+                out_cint8[g].fill(0)
+
+    for g, stream in per_chgroup_streams.items():
+        s = np.asarray(stream)
+        re = s.real
+        im = s.imag
+        re_q = np.rint(re * scale_typed)
+        np.clip(re_q, -127, 127, out=re_q)
+        out_cint8[int(g), :, 0] = re_q.astype(np.int8)
+        im_q = np.rint(im * scale_typed)
+        np.clip(im_q, -127, 127, out=im_q)
+        out_cint8[int(g), :, 1] = im_q.astype(np.int8)
+
+    return scale
