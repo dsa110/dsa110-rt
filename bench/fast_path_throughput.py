@@ -78,11 +78,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dsart.coarse_dm.dm_plan import (
-    DMPlan,
-    build_chgroup_freq_table_GHz,
-    compute_delay_native_samples_table,
-)
+from dsart.coarse_dm.dm_plan import DMPlan
 from dsart.common.constants import (
     NANTS,
     NATIVE_SAMPLE_US,
@@ -101,6 +97,87 @@ from dsart.services.slow_corr_kernel import (
 
 
 LOG = logging.getLogger("fast_path_throughput")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic DM plan
+# ---------------------------------------------------------------------------
+
+
+def _build_synthetic_summed_plan(
+    *,
+    n_coarse: int,
+    dm_max: float,
+    chan_sum_factor: int,
+    t_int_fast_us: float,
+) -> DMPlan:
+    """Build a synthetic-but-fully-valid summed-channel :class:`DMPlan`.
+
+    Goes through the canonical :class:`dsart.common.contracts.DmPlan`
+    schema and :meth:`DMPlan.from_summed_canonical` (F33), so the
+    plan's per-(g, ch_summed, dm) delay table is shaped to match the
+    cfg's ``chan_sum_factor`` and :func:`build_context` accepts it.
+    """
+    from dsart.common.contracts import DmPlan
+    from dsart.common.constants import (
+        BW_PROC_MHZ,
+        DM_PLAN_METADATA_VERSION,
+        N_CHAN_PROC_NATIVE,
+        N_CHGROUP,
+        N_SEARCH,
+        N_SEARCH_GPU,
+        NCHAN_PER_CHGROUP,
+        NU_BOT_PROC_GHZ,
+        NU_TOP_PROC_GHZ,
+    )
+
+    coarse = np.linspace(0.0, float(dm_max), int(n_coarse), dtype=np.float64)
+    n_fine = max(8, 2 * int(n_coarse))
+    fine = np.linspace(coarse[0], coarse[-1], n_fine, dtype=np.float64)
+    fine_offsets_idx = np.linspace(
+        0, n_fine, num=int(n_coarse) + 1, dtype=np.int32,
+    )
+    canonical = DmPlan(
+        dm_min=float(coarse[0]),
+        dm_max=float(coarse[-1]) + 1.0,
+        tol=1.5,
+        fine_dm=fine,
+        coarse_dm=coarse,
+        fine_to_coarse=np.zeros(n_fine, dtype=np.int32),
+        fine_offsets_idx=fine_offsets_idx,
+        fine_offsets_flat=np.zeros(n_fine, dtype=np.float64),
+        time_shift_corr_stage1=np.zeros(
+            (N_CHGROUP, NCHAN_PER_CHGROUP, int(n_coarse)), dtype=np.int32,
+        ),
+        time_shift_corr_stage2=np.zeros(
+            (N_CHGROUP, int(n_coarse)), dtype=np.int32,
+        ),
+        time_shift_search=np.zeros((n_fine, N_CHGROUP), dtype=np.int32),
+        dm_idx_range_canonical=np.zeros((N_SEARCH, 2), dtype=np.int32),
+        dm_idx_range_consumed=np.zeros((N_SEARCH, 2), dtype=np.int32),
+        dm_idx_range_canonical_per_gpu=np.zeros(
+            (N_SEARCH, N_SEARCH_GPU, 2), dtype=np.int32,
+        ),
+        dm_idx_range_consumed_per_gpu=np.zeros(
+            (N_SEARCH, N_SEARCH_GPU, 2), dtype=np.int32,
+        ),
+        dm_overlap_coarse=2,
+        metadata={
+            "band_top_GHz": NU_TOP_PROC_GHZ,
+            "band_bot_GHz": NU_BOT_PROC_GHZ,
+            "BW_MHz": BW_PROC_MHZ,
+            "N_chan_proc_native": N_CHAN_PROC_NATIVE,
+            "t_int_fast_us": float(t_int_fast_us),
+            "t_int_search_us": 524.288,
+            "tol": 1.5,
+            "build_utc_ns": 1_872_345_677_000_000_000,
+            "git_sha": "fast-path-throughput-bench",
+            "version": DM_PLAN_METADATA_VERSION,
+        },
+    )
+    return DMPlan.from_summed_canonical(
+        canonical, chan_sum_factor=int(chan_sum_factor),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -349,20 +426,15 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("device=%s", device)
 
     # Custom DM plan: linear from 0 to 2*dm_truth so the truth DM
-    # falls in the middle of the trials.
-    dm_pc_cc = np.linspace(
-        0.0, 2.0 * args.dm_truth, args.n_coarse_dm,
-    ).astype(np.float64)
-    chgroup_freqs_GHz = build_chgroup_freq_table_GHz()
-    delay_table = compute_delay_native_samples_table(
-        dm_pc_cc, chgroup_freqs_GHz,
-    )
-    plan = DMPlan(
-        dm_pc_cc=dm_pc_cc,
-        n_fine_per_coarse=1,
+    # falls in the middle of the trials. Built via the canonical
+    # DmPlan -> DMPlan.from_summed_canonical path so chan_sum_factor
+    # propagates correctly into the per-(g, ch_summed, dm) delay
+    # table (build_context asserts this match).
+    plan = _build_synthetic_summed_plan(
+        n_coarse=int(args.n_coarse_dm),
+        dm_max=2.0 * float(args.dm_truth),
+        chan_sum_factor=int(args.chan_sum_factor),
         t_int_fast_us=float(args.t_int_fast_native * NATIVE_SAMPLE_US),
-        chgroup_freqs_GHz=chgroup_freqs_GHz,
-        _delay_native_samples_table=delay_table,
     )
 
     antpos_e, antpos_n = _synth_antpos(seed=42)
