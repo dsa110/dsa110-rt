@@ -47,6 +47,7 @@ from dsart.grid.sparsity_pattern import (
     SPEED_OF_LIGHT_M_PER_S,
     SparsityPattern,
     build_pattern,
+    gaussian_kernel_weights,
 )
 
 
@@ -81,6 +82,7 @@ def _sparse_4ant_pattern_and_gridder(
     n_grid: int = 64,
     chgroup: int = 0,
     device: str = "cpu",
+    kernel_support: int = 1,
 ) -> tuple[
     SparsityPattern, FastVisGridder, np.ndarray, np.ndarray, np.ndarray, float
 ]:
@@ -114,7 +116,7 @@ def _sparse_4ant_pattern_and_gridder(
         chgroup=chgroup,
         dec_deg=37.234,
         n_grid=n_grid,
-        kernel_support=1,
+        kernel_support=kernel_support,
         is_core_baseline_mask=mask,
     )
     gridder = FastVisGridder.from_pattern(
@@ -499,3 +501,182 @@ def test_gridder_is_linear_in_vis() -> None:
     diff = (o_combined - o_expected).abs().max().item()
     # cfp32 round-off bound: ~1e-5 absolute.
     assert diff < 1e-4, f"linearity broken: max abs diff = {diff:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# G7: Anti-aliasing Gaussian gridding kernel (K ∈ {3, 5})
+# ---------------------------------------------------------------------------
+
+
+def _legacy_K1_grid_reference(
+    pattern: SparsityPattern,
+    cell_index_map: np.ndarray,
+    vis: np.ndarray,
+) -> np.ndarray:
+    """Pre-G7 K=1 scatter reference: pure Python loop.
+
+    For each (bls, ch) maps to a single cell via ``cell_index_map``;
+    the output cell value is the sum of contributing vis entries. Used
+    by the K=1 bit-identical regression check below — bypasses the
+    G7 K² scatter math entirely so an accidental change in the K=1
+    code path is caught without needing a pre-G7 commit on hand.
+    """
+    n_fv = vis.shape[0]
+    n_filled = pattern.n_filled
+    out = np.zeros((n_fv, n_filled), dtype=np.complex64)
+    cell_idx = np.asarray(cell_index_map, dtype=np.int64)
+    valid = cell_idx < n_filled
+    flat_vis = vis.reshape(n_fv, NBASE * NCHAN_PER_CHGROUP)
+    for fv in range(n_fv):
+        for i in np.flatnonzero(valid):
+            out[fv, cell_idx[i]] += flat_vis[fv, i]
+    return out
+
+
+class TestKGreaterThanOne:
+    """G7 (plan §4.2 line 1351): K ∈ {3, 5} Gaussian taper.
+
+    K=1 path must be bit-identical to the pre-G7 pillbox; K=3 / K=5
+    spread each (bls, ch) sample into a Gaussian-weighted K×K
+    neighborhood with normalised taps so total amplitude is conserved
+    — the regression bench (``bench/g7_alias_injection.py``) verifies
+    the alias-suppression behaviour these unit tests don't probe
+    directly.
+    """
+
+    def test_K1_unchanged_vs_legacy(self) -> None:
+        """K=1 compute output must match the pre-G7 single-tap scatter
+        reference for an arbitrary point-source vis. Equivalent to
+        verifying that for K=1 the new scatter math collapses to one
+        tap per (bls, ch) with weight 1.0."""
+        pat, g, _e, _n, _mask, _cl = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=1,
+        )
+        vis_t = _vis_for_4ant_baselines(value=1.5 - 0.7j, ch_only=23)
+        out = g.compute(vis_t).cpu().numpy()
+        cell_idx = g.cell_index_map.cpu().numpy()
+        out_ref = _legacy_K1_grid_reference(pat, cell_idx, vis_t.numpy())
+        np.testing.assert_array_equal(out, out_ref)
+        # K=1 post-G7 path multiplies by 1.0 (exact in fp32) and
+        # scatters in the same order as pre-G7 → bit-identical.
+        assert out.dtype == np.complex64
+
+    def test_K3_smears_a_delta_input(self) -> None:
+        """Single non-zero (bls, ch) with K=1 lands in one cell;
+        K=3 spreads it over a 3×3 Gaussian neighborhood. The 9 cell
+        values match ``v · gaussian_kernel_weights(3)``."""
+        pat_k1, g_k1, *_ = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=1,
+        )
+        pat_k3, g_k3, *_ = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=3,
+        )
+        bls_idx = 1 * (1 + 1) // 2 + 0                                # (a=1, b=0)
+        ch = 10
+        v = 2.0 - 1.5j
+        vis = torch.zeros(
+            (1, NBASE, NCHAN_PER_CHGROUP), dtype=torch.complex64,
+        )
+        vis[0, bls_idx, ch] = v
+        out_k1 = g_k1.compute(vis).cpu().numpy()[0]
+        out_k3 = g_k3.compute(vis).cpu().numpy()[0]
+
+        nonzero_k1 = np.flatnonzero(out_k1 != 0)
+        assert nonzero_k1.size == 1
+        assert out_k1[nonzero_k1[0]] == np.complex64(v)
+
+        center_row = int(pat_k1.ix_row[nonzero_k1[0]])
+        center_col = int(pat_k1.ix_col[nonzero_k1[0]])
+        weights = gaussian_kernel_weights(3).astype(np.float64)
+        k3_cells = {
+            (int(r), int(c)): i
+            for i, (r, c) in enumerate(zip(
+                pat_k3.ix_row.tolist(), pat_k3.ix_col.tolist(),
+            ))
+        }
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                rr, cc = center_row + dy, center_col + dx
+                expected_w = weights[dy + 1, dx + 1]
+                assert (rr, cc) in k3_cells, (
+                    f"K=3 cell ({rr}, {cc}) missing from pattern around "
+                    f"center ({center_row}, {center_col}); "
+                    f"build_pattern K=3 expansion is incomplete."
+                )
+                got = out_k3[k3_cells[(rr, cc)]]
+                expected = np.complex64(complex(v) * expected_w)
+                assert abs(got - expected) < 1e-6, (
+                    f"K=3 tap ({dy:+d}, {dx:+d}) got {got} expected "
+                    f"{expected}; weight={expected_w:.6f}"
+                )
+        assert int(np.sum(out_k3 != 0)) == 9, (
+            f"K=3 expected exactly 9 (3×3) non-zero cells; got "
+            f"{int(np.sum(out_k3 != 0))}"
+        )
+
+    def test_K3_total_amplitude_preserved(self) -> None:
+        """``Σ |grid_K3| ≈ Σ |grid_K1|`` for a single-baseline
+        single-channel vis — the K=3 Gaussian taps share the input
+        phase and have weights summing to 1, so their |·| sum equals
+        |v| (= the K=1 single-cell magnitude)."""
+        _pat_k1, g_k1, *_ = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=1,
+        )
+        _pat_k3, g_k3, *_ = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=3,
+        )
+        bls_idx = 1 * (1 + 1) // 2 + 0
+        ch = 10
+        v = 3.0 + 4.0j                                                # |v| = 5
+        vis = torch.zeros(
+            (1, NBASE, NCHAN_PER_CHGROUP), dtype=torch.complex64,
+        )
+        vis[0, bls_idx, ch] = v
+        out_k1 = g_k1.compute(vis).cpu().numpy()[0]
+        out_k3 = g_k3.compute(vis).cpu().numpy()[0]
+        sum_abs_k1 = float(np.abs(out_k1).sum())
+        sum_abs_k3 = float(np.abs(out_k3).sum())
+        assert sum_abs_k1 == pytest.approx(abs(v), rel=1e-6)
+        assert sum_abs_k3 == pytest.approx(sum_abs_k1, rel=1e-5), (
+            f"K=3 amplitude leaked: sum|grid_K1|={sum_abs_k1:.6f} "
+            f"sum|grid_K3|={sum_abs_k3:.6f}"
+        )
+
+    def test_K5_smears_a_delta_input(self) -> None:
+        """Same 5×5 expansion check as K=3 — pins the build_pattern +
+        gridder K² scatter for the largest supported K."""
+        pat_k1, g_k1, *_ = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=1,
+        )
+        pat_k5, g_k5, *_ = _sparse_4ant_pattern_and_gridder(
+            n_grid=64, kernel_support=5,
+        )
+        bls_idx = 1 * (1 + 1) // 2 + 0
+        ch = 10
+        v = 1.0 + 0.0j
+        vis = torch.zeros(
+            (1, NBASE, NCHAN_PER_CHGROUP), dtype=torch.complex64,
+        )
+        vis[0, bls_idx, ch] = v
+        out_k1 = g_k1.compute(vis).cpu().numpy()[0]
+        out_k5 = g_k5.compute(vis).cpu().numpy()[0]
+        nonzero_k1 = np.flatnonzero(out_k1 != 0)
+        assert nonzero_k1.size == 1
+        center_row = int(pat_k1.ix_row[nonzero_k1[0]])
+        center_col = int(pat_k1.ix_col[nonzero_k1[0]])
+        weights = gaussian_kernel_weights(5).astype(np.float64)
+        k5_cells = {
+            (int(r), int(c)): i
+            for i, (r, c) in enumerate(zip(
+                pat_k5.ix_row.tolist(), pat_k5.ix_col.tolist(),
+            ))
+        }
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                rr, cc = center_row + dy, center_col + dx
+                expected_w = weights[dy + 2, dx + 2]
+                assert (rr, cc) in k5_cells
+                got = out_k5[k5_cells[(rr, cc)]]
+                expected = np.complex64(complex(v) * expected_w)
+                assert abs(got - expected) < 1e-6
+        assert int(np.sum(out_k5 != 0)) == 25
