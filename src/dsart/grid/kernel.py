@@ -164,17 +164,27 @@ class FastVisGridder:
                 f"pattern.kernel_support={kernel_support} not in "
                 f"{SUPPORTED_KERNEL_SUPPORTS}; G7 supports K ∈ {{1, 3, 5}}."
             )
+        chan_sum_factor = int(getattr(self.pattern, "chan_sum_factor", 1))
+        if chan_sum_factor < 1 or NCHAN_PER_CHGROUP % chan_sum_factor != 0:
+            raise ValueError(
+                f"pattern.chan_sum_factor={chan_sum_factor} invalid "
+                f"(must be ≥ 1 and divide NCHAN_PER_CHGROUP="
+                f"{NCHAN_PER_CHGROUP})."
+            )
+        nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
 
         if self.cell_index_map.dtype != torch.int64:
             raise TypeError(
                 f"cell_index_map dtype must be int64; got "
                 f"{self.cell_index_map.dtype}"
             )
-        expected_n = NBASE * NCHAN_PER_CHGROUP * kernel_support * kernel_support
+        expected_n = NBASE * nchan_eff * kernel_support * kernel_support
         if self.cell_index_map.shape != (expected_n,):
             raise ValueError(
                 f"cell_index_map shape must be ({expected_n},) "
-                f"(NBASE * NCHAN * K * K, K={kernel_support}); got "
+                f"(NBASE * NCHAN_eff * K * K, NCHAN_eff="
+                f"{nchan_eff} = NCHAN_PER_CHGROUP // chan_sum_factor="
+                f"{chan_sum_factor}, K={kernel_support}); got "
                 f"{tuple(self.cell_index_map.shape)}"
             )
         n_filled = self.pattern.n_filled
@@ -286,6 +296,14 @@ class FastVisGridder:
                 f"pattern.kernel_support={kernel_support} not in "
                 f"{SUPPORTED_KERNEL_SUPPORTS}; G7 supports K ∈ {{1, 3, 5}}."
             )
+        chan_sum_factor = int(getattr(pattern, "chan_sum_factor", 1))
+        if chan_sum_factor < 1 or NCHAN_PER_CHGROUP % chan_sum_factor != 0:
+            raise ValueError(
+                f"pattern.chan_sum_factor={chan_sum_factor} invalid "
+                f"(must be ≥ 1 and divide NCHAN_PER_CHGROUP="
+                f"{NCHAN_PER_CHGROUP})."
+            )
+        nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
 
         # ---- Re-run the geometric build (cheap; same as build_pattern) --
         du_m, dv_m = _per_baseline_uv_meters(
@@ -310,12 +328,20 @@ class FastVisGridder:
             keep = keep & np.asarray(is_core_baseline_mask, dtype=bool)
         kept_per_bls[keep] = np.arange(int(keep.sum()), dtype=np.int64)
 
-        # Per-channel wavelengths (chgroup-local).
-        nu_GHz = np.asarray(
+        # Per-channel wavelengths (chgroup-local). F33: when
+        # chan_sum_factor > 1, use the band-CENTER frequency of each
+        # summed group — must match build_pattern exactly.
+        nu_GHz_full = np.asarray(
             [freq_GHz(chgroup, ch) for ch in range(NCHAN_PER_CHGROUP)],
             dtype=np.float64,
         )
-        wavelength_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)        # (NCHAN,)
+        if chan_sum_factor == 1:
+            nu_GHz = nu_GHz_full
+        else:
+            nu_GHz = nu_GHz_full.reshape(
+                nchan_eff, chan_sum_factor,
+            ).mean(axis=1)
+        wavelength_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)        # (NCHAN_eff,)
         u_lam = (du_m[:, None] / wavelength_m[None, :])               # (Nkept, NCHAN)
         v_lam = (dv_m[:, None] / wavelength_m[None, :])
         u_lam = -u_lam                                                # F20
@@ -361,9 +387,9 @@ class FastVisGridder:
             pattern.ix_row.astype(np.uint32) << 16
         ) | pattern.ix_col.astype(np.uint32)
 
-        # ---- Build the (NBASE, NCHAN, K, K) cell_index map -------------
+        # ---- Build the (NBASE, NCHAN_eff, K, K) cell_index map -------------
         cell_idx_taps = np.full(
-            (NBASE, NCHAN_PER_CHGROUP, K, K), n_filled, dtype=np.int64
+            (NBASE, nchan_eff, K, K), n_filled, dtype=np.int64
         )
 
         kept_tap_keys = (
@@ -392,11 +418,11 @@ class FastVisGridder:
                     " from_pattern geometric drift)."
                 )
 
-        # Scatter the filled-cell indices back into (NBASE, NCHAN, K, K)
-        # via the kept→bls map.
+        # Scatter the filled-cell indices back into
+        # (NBASE, NCHAN_eff, K, K) via the kept→bls map.
         kept_idx_per_bls_inv = np.where(kept_per_bls >= 0)[0]          # (Nkept,)
         cell_idx_kept_taps = np.full(
-            (kept_idx_per_bls_inv.size, NCHAN_PER_CHGROUP, K, K),
+            (kept_idx_per_bls_inv.size, nchan_eff, K, K),
             n_filled, dtype=np.int64,
         )
         cell_idx_kept_taps[in_grid_kept_taps] = positions.astype(np.int64)
@@ -497,10 +523,13 @@ class FastVisGridder:
         n_fv, nb, nch = vis_stokes_i.shape
         if nb != NBASE:
             raise ValueError(f"vis_stokes_i.shape[1]={nb} != NBASE={NBASE}")
-        if nch != NCHAN_PER_CHGROUP:
+        chan_sum_factor = int(getattr(self.pattern, "chan_sum_factor", 1))
+        nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
+        if nch != nchan_eff:
             raise ValueError(
-                f"vis_stokes_i.shape[2]={nch} != NCHAN_PER_CHGROUP="
-                f"{NCHAN_PER_CHGROUP}"
+                f"vis_stokes_i.shape[2]={nch} != NCHAN_eff="
+                f"{nchan_eff} (NCHAN_PER_CHGROUP // "
+                f"chan_sum_factor={chan_sum_factor})"
             )
         if vis_stokes_i.device != self.device:
             raise ValueError(

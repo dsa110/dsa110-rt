@@ -291,6 +291,7 @@ def _pattern_id_payload(
     kernel_support: int,
     antpos_hash: int,
     chgroup_table_hash: int,
+    chan_sum_factor: int = 1,
 ) -> bytes:
     """Pack the input tuple into a fixed-layout byte string for hashing.
 
@@ -305,10 +306,17 @@ def _pattern_id_payload(
         0       2      uint16  chgroup
         2       2      uint16  n_grid
         4       2      uint16  kernel_support
-        6       8      float64 dec_deg_quant
-        14      8      uint64  antpos_hash
-        22      8      uint64  chgroup_table_hash
-        total: 30 bytes
+        6       2      uint16  chan_sum_factor       (F33; 1 ⇒ legacy)
+        8       8      float64 dec_deg_quant
+        16      8      uint64  antpos_hash
+        24      8      uint64  chgroup_table_hash
+        total: 32 bytes
+
+    Bumping the layout keeps F33-summed patterns collision-free vs
+    legacy K=1 / K∈{3,5} patterns (corr or search end picking up a
+    stale pattern with mismatched ``chan_sum_factor`` would feed
+    a 384-channel pattern with 48-channel vis or vice versa, with
+    catastrophic mis-gridded cells).
     """
     if not 0 <= chgroup < (1 << 16):
         raise ValueError(f"chgroup={chgroup} out of uint16 range")
@@ -317,6 +325,10 @@ def _pattern_id_payload(
     if not 0 < kernel_support < (1 << 16):
         raise ValueError(
             f"kernel_support={kernel_support} out of uint16 range"
+        )
+    if not 0 < chan_sum_factor < (1 << 16):
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor} out of uint16 range"
         )
     if not 0 <= antpos_hash < (1 << 64):
         raise ValueError(f"antpos_hash={antpos_hash} not a uint64")
@@ -328,6 +340,7 @@ def _pattern_id_payload(
         np.uint16(chgroup).tobytes()
         + np.uint16(n_grid).tobytes()
         + np.uint16(kernel_support).tobytes()
+        + np.uint16(chan_sum_factor).tobytes()
         + np.float64(dec_deg_quant).tobytes()
         + np.uint64(antpos_hash).tobytes()
         + np.uint64(chgroup_table_hash).tobytes()
@@ -374,6 +387,15 @@ class SparsityPattern:
         Quantised declination (degrees) used in the ``pattern_id`` hash.
     kernel_support : int
         Cells of gridding kernel support (1 = pillbox / nearest cell).
+    chan_sum_factor : int
+        F33: number of fine channels collapsed per "channel" used by
+        this pattern. ``1`` (legacy default) ⇒ per-fine-channel grid
+        with ``NCHAN_PER_CHGROUP`` channels (= 384). ``> 1`` (e.g.
+        ``8``) ⇒ summed-channel pattern with ``NCHAN_PER_CHGROUP //
+        chan_sum_factor`` effective channels. Must divide
+        ``NCHAN_PER_CHGROUP``. Folded into ``pattern_id`` so the corr
+        and search ends cannot silently mismatch their summing
+        factors.
     antpos_hash : int
         ``blake2b_64`` of the antpos arrays used (provenance).
     chgroup_table_hash : int
@@ -391,6 +413,7 @@ class SparsityPattern:
     kernel_support: int
     antpos_hash: int
     chgroup_table_hash: int
+    chan_sum_factor: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +661,7 @@ def build_pattern(
     dec_deg: float,
     n_grid: int = N_GRID_DEFAULT,
     kernel_support: int = KERNEL_SUPPORT_DEFAULT,
+    chan_sum_factor: int = 1,
     is_core_baseline_mask: np.ndarray | None = None,
     antpos_hash: int | None = None,
     chgroup_table_hash: int | None = None,
@@ -735,6 +759,17 @@ def build_pattern(
             f"kernel_support={kernel_support} not in "
             f"{SUPPORTED_KERNEL_SUPPORTS}; G7 supports K ∈ {{1, 3, 5}}."
         )
+    # F33: validate chan_sum_factor.
+    if chan_sum_factor < 1:
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor}, expected ≥ 1"
+        )
+    if NCHAN_PER_CHGROUP % chan_sum_factor != 0:
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor} does not divide "
+            f"NCHAN_PER_CHGROUP={NCHAN_PER_CHGROUP}; summed-channel "
+            f"grid would not align."
+        )
 
     if antpos_hash is None:
         antpos_hash = compute_antpos_hash(antpos_e, antpos_n)
@@ -747,6 +782,7 @@ def build_pattern(
         dec_deg_quant=dec_deg_quant,
         n_grid=n_grid,
         kernel_support=kernel_support,
+        chan_sum_factor=chan_sum_factor,
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
     ))
@@ -757,12 +793,21 @@ def build_pattern(
         antpos_e, antpos_n, is_core_baseline_mask=is_core_baseline_mask
     )
 
-    # Per-channel wavelengths over this chgroup's 384 fine channels.
-    nu_GHz = np.asarray(
+    # Per-channel wavelengths. F33: when chan_sum_factor > 1, use the
+    # band-CENTER frequency of each summed group (mean of the
+    # ``chan_sum_factor`` constituent fine channels in GHz). For
+    # chan_sum_factor == 1 this is bit-identical to the pre-F33
+    # path (the mean of a length-1 group is the fine channel itself).
+    nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
+    nu_GHz_full = np.asarray(
         [freq_GHz(chgroup, ch) for ch in range(NCHAN_PER_CHGROUP)],
         dtype=np.float64,
     )
-    wavelength_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)            # (NCHAN,)
+    if chan_sum_factor == 1:
+        nu_GHz = nu_GHz_full
+    else:
+        nu_GHz = nu_GHz_full.reshape(nchan_eff, chan_sum_factor).mean(axis=1)
+    wavelength_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)            # (NCHAN_eff,)
 
     # Outer product → (N_kept, NCHAN) in λ. Float64 throughout to keep
     # cell rounding deterministic at the 10⁻⁶-cell level (the rint() at
@@ -848,6 +893,7 @@ def build_pattern(
         kernel_support=kernel_support,
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
+        chan_sum_factor=int(chan_sum_factor),
     )
 
 
@@ -857,6 +903,7 @@ def predict_pattern_id(
     dec_deg: float,
     n_grid: int = N_GRID_DEFAULT,
     kernel_support: int = KERNEL_SUPPORT_DEFAULT,
+    chan_sum_factor: int = 1,
     antpos_e: np.ndarray | None = None,
     antpos_n: np.ndarray | None = None,
     antpos_hash: int | None = None,
@@ -900,6 +947,7 @@ def predict_pattern_id(
         dec_deg_quant=dec_deg_quant,
         n_grid=n_grid,
         kernel_support=kernel_support,
+        chan_sum_factor=chan_sum_factor,
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
     ))

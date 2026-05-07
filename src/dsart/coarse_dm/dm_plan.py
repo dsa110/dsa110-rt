@@ -125,6 +125,57 @@ def build_chgroup_freq_table_GHz() -> np.ndarray:
     )
 
 
+def build_summed_chgroup_freq_table_GHz(
+    chan_sum_factor: int,
+) -> np.ndarray:
+    """F33: build the ``(N_chgroup, NCHAN_PER_CHGROUP // chan_sum_factor))``
+    summed-channel frequency table.
+
+    Each summed channel ``ch_s`` represents the average of the fine
+    frequencies in the half-open range ``[ch_s * chan_sum_factor,
+    (ch_s + 1) * chan_sum_factor)``. The arithmetic mean is taken in
+    GHz (linear in ν, which is the appropriate quantity for an
+    integration over a flat-bandpass receiver — the dispersion
+    delay's ``1 / ν²`` curvature is small over an 8-channel summed
+    span, ≤ 0.14 % at 1.4 GHz). Lower-frequency (later) summed
+    channels still have larger DM delay than the chgroup TOP, so
+    Convention A holds.
+
+    Used by :meth:`DMPlan.from_summed_canonical` and by
+    :func:`dsart.grid.sparsity_pattern.build_pattern` when
+    ``chan_sum_factor > 1`` so the gridder pattern's
+    ``(u_lam, v_lam)`` mapping uses the summed-channel reference
+    frequency. The DM smearing within a single summed channel at
+    DM = 3000 pc/cc, ν = 1.31 GHz is ~ 2.7 ms (per the M3 production
+    review; ≪ the search-side fine-DM step) — acceptable for the
+    M3 production op-point.
+
+    Args:
+        chan_sum_factor: factor ``k`` such that 8 fine channels →
+            1 summed channel for ``k = 8``. Must divide
+            :data:`dsart.common.constants.NCHAN_PER_CHGROUP`.
+
+    Returns:
+        ``(N_CHGROUP, NCHAN_PER_CHGROUP // chan_sum_factor) float64``
+        in GHz, descending in frequency within each chgroup.
+    """
+    if chan_sum_factor < 1:
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor}, expected ≥ 1"
+        )
+    if NCHAN_PER_CHGROUP % chan_sum_factor != 0:
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor} does not divide "
+            f"NCHAN_PER_CHGROUP={NCHAN_PER_CHGROUP}"
+        )
+    full = build_chgroup_freq_table_GHz()                             # (G, NCHAN)
+    if chan_sum_factor == 1:
+        return full
+    nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
+    summed = full.reshape(N_CHGROUP, nchan_eff, chan_sum_factor).mean(axis=2)
+    return summed
+
+
 def compute_delay_native_samples_table(
     coarse_dm: np.ndarray,
     chgroup_freqs_GHz: np.ndarray,
@@ -218,6 +269,17 @@ class DMPlan:
     # it accidentally.
     _delay_native_samples_table: np.ndarray = field(repr=False)
 
+    #: F33: number of fine channels collapsed per "channel" represented
+    #: in this plan. ``1`` (default) ⇒ legacy per-fine-channel plan
+    #: with ``chgroup_freqs_GHz.shape[1] == NCHAN_PER_CHGROUP``;
+    #: ``> 1`` ⇒ summed-channel plan (e.g. ``chan_sum_factor = 8``
+    #: collapses the 384 fine channels per chgroup into 48 summed
+    #: channels with band-CENTER reference frequencies). The plan's
+    #: ``chgroup_freqs_GHz.shape[1]`` is ``NCHAN_PER_CHGROUP //
+    #: chan_sum_factor`` in that case. NCHAN_PER_CHGROUP must be
+    #: divisible by ``chan_sum_factor``.
+    chan_sum_factor: int = 1
+
     def __post_init__(self) -> None:
         if self.dm_pc_cc.ndim != 1:
             raise ValueError(
@@ -229,10 +291,23 @@ class DMPlan:
                 f"DMPlan.dm_pc_cc dtype must be float64; got "
                 f"{self.dm_pc_cc.dtype}"
             )
-        if self.chgroup_freqs_GHz.shape != (N_CHGROUP, NCHAN_PER_CHGROUP):
+        if self.chan_sum_factor < 1:
+            raise ValueError(
+                f"DMPlan.chan_sum_factor={self.chan_sum_factor}, "
+                f"expected ≥ 1"
+            )
+        if NCHAN_PER_CHGROUP % self.chan_sum_factor != 0:
+            raise ValueError(
+                f"DMPlan.chan_sum_factor={self.chan_sum_factor} does "
+                f"not divide NCHAN_PER_CHGROUP={NCHAN_PER_CHGROUP}; "
+                f"summed-channel grid would not align."
+            )
+        nchan_eff = NCHAN_PER_CHGROUP // self.chan_sum_factor
+        if self.chgroup_freqs_GHz.shape != (N_CHGROUP, nchan_eff):
             raise ValueError(
                 f"DMPlan.chgroup_freqs_GHz shape must be "
-                f"({N_CHGROUP}, {NCHAN_PER_CHGROUP}); got "
+                f"({N_CHGROUP}, {nchan_eff}) for chan_sum_factor="
+                f"{self.chan_sum_factor}; got "
                 f"{self.chgroup_freqs_GHz.shape}"
             )
         if self.t_int_fast_us <= 0:
@@ -256,11 +331,12 @@ class DMPlan:
 
         # Precomputed delay table dimensions.
         if self._delay_native_samples_table.shape != (
-            N_CHGROUP, NCHAN_PER_CHGROUP, n_coarse,
+            N_CHGROUP, nchan_eff, n_coarse,
         ):
             raise ValueError(
                 f"DMPlan._delay_native_samples_table shape must be "
-                f"({N_CHGROUP}, {NCHAN_PER_CHGROUP}, {n_coarse}); got "
+                f"({N_CHGROUP}, {nchan_eff}, {n_coarse}) for "
+                f"chan_sum_factor={self.chan_sum_factor}; got "
                 f"{self._delay_native_samples_table.shape}"
             )
         if self._delay_native_samples_table.dtype != np.int64:
@@ -290,6 +366,14 @@ class DMPlan:
     def n_coarse(self) -> int:
         """Number of coarse-DM trials (= ``len(dm_pc_cc)``)."""
         return int(self.dm_pc_cc.shape[0])
+
+    @property
+    def nchan_per_chgroup(self) -> int:
+        """Effective number of channels per chgroup represented in
+        this plan: ``NCHAN_PER_CHGROUP // chan_sum_factor``. Equals
+        :data:`dsart.common.constants.NCHAN_PER_CHGROUP` when
+        ``chan_sum_factor == 1`` (legacy per-fine-channel plan)."""
+        return int(NCHAN_PER_CHGROUP // self.chan_sum_factor)
 
     @property
     def t_int_fast_native(self) -> float:
@@ -337,11 +421,14 @@ class DMPlan:
     # ------------------------------------------------------------------
 
     def delay_native_samples_per_chgroup(self, chgroup: int) -> np.ndarray:
-        """Return ``(NCHAN_PER_CHGROUP, N_coarse) int64`` slice for one chgroup.
+        """Return ``(nchan_per_chgroup, N_coarse) int64`` slice for one chgroup.
 
         Zero-copy view into the precomputed table. The dedisp kernel
         calls this once per chgroup and walks all (ch, dm) pairs from
-        the returned slice.
+        the returned slice. ``nchan_per_chgroup`` is
+        :data:`dsart.common.constants.NCHAN_PER_CHGROUP // chan_sum_factor`
+        — the summed-channel count when this plan was built with
+        :meth:`from_summed_canonical` (F33).
         """
         if not 0 <= chgroup < N_CHGROUP:
             raise IndexError(
@@ -404,6 +491,69 @@ class DMPlan:
             t_int_fast_us=t_int_fast_us,
             chgroup_freqs_GHz=chgroup_freqs_GHz,
             _delay_native_samples_table=delay_table,
+        )
+
+    @classmethod
+    def from_summed_canonical(cls, plan, *, chan_sum_factor: int) -> "DMPlan":
+        """F33: build a summed-channel :class:`DMPlan` from a canonical
+        :class:`DmPlan`.
+
+        Same as :meth:`from_canonical` but the per-channel frequency
+        table + the per-(g, ch, dm) delay table are computed against
+        the summed-channel grid: each summed channel uses the
+        band-CENTER frequency of its constituent fine-channel block
+        (see :func:`build_summed_chgroup_freq_table_GHz`). Convention A
+        (delay reference = chgroup-top summed channel) is preserved.
+
+        For ``chan_sum_factor == 1`` this is identical to
+        :meth:`from_canonical`. For ``chan_sum_factor == 8``
+        (the M3 production op-point per the F33 review) the
+        resulting plan has ``nchan_per_chgroup == 48`` channels per
+        chgroup, with delays of size
+        ``(N_CHGROUP, 48, N_coarse) int64``. The DM smearing
+        absorbed inside each summed channel at DM = 3000 pc/cc,
+        ν = 1.31 GHz is ~ 2.7 ms (per the M3 production review;
+        ≪ the search-side fine-DM step).
+
+        Args:
+            plan: a :class:`dsart.common.contracts.DmPlan` (the
+                canonical schema produced by :mod:`tools.build_dm_plan`).
+            chan_sum_factor: positive int that divides
+                :data:`dsart.common.constants.NCHAN_PER_CHGROUP`. ``1``
+                ⇒ identical to :meth:`from_canonical`.
+
+        Returns:
+            :class:`DMPlan` with ``chan_sum_factor`` set, summed
+            ``chgroup_freqs_GHz``, and a delay table of shape
+            ``(N_CHGROUP, NCHAN_PER_CHGROUP // chan_sum_factor,
+            N_coarse)``.
+        """
+        from dsart.common.contracts import DmPlan
+        if not isinstance(plan, DmPlan):
+            raise TypeError(
+                f"from_summed_canonical expected DmPlan; got "
+                f"{type(plan).__name__}"
+            )
+        if chan_sum_factor < 1:
+            raise ValueError(
+                f"chan_sum_factor={chan_sum_factor}, expected ≥ 1"
+            )
+        coarse_dm = plan.coarse_dm.astype(np.float64, copy=True)
+        n_coarse = coarse_dm.shape[0]
+        n_fine = plan.fine_dm.shape[0]
+        n_fine_per_coarse = max(1, int(round(n_fine / max(1, n_coarse))))
+        t_int_fast_us = float(plan.metadata["t_int_fast_us"])
+        summed_freqs = build_summed_chgroup_freq_table_GHz(chan_sum_factor)
+        delay_table = compute_delay_native_samples_table(
+            coarse_dm, summed_freqs,
+        )
+        return cls(
+            dm_pc_cc=coarse_dm,
+            n_fine_per_coarse=n_fine_per_coarse,
+            t_int_fast_us=t_int_fast_us,
+            chgroup_freqs_GHz=summed_freqs,
+            _delay_native_samples_table=delay_table,
+            chan_sum_factor=int(chan_sum_factor),
         )
 
     @classmethod

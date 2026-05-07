@@ -651,6 +651,24 @@ class FastIntegrationConfig:
     (``vis_stokes_i``) is still a single allocation; F33's
     8-channel pre-dedispersion sum reduces THAT to ~MB."""
 
+    chan_sum_factor: int = 1
+    """F33: number of fine channels collapsed into one effective
+    channel before dedispersion / gridding. ``1`` (default) keeps
+    the legacy per-fine-channel pipeline (NCHAN = 384 per chgroup).
+    ``8`` (M3 production op-point per the F33 review) sums each
+    8-channel block of ``vis_stokes_i`` into one channel BEFORE
+    coarse-DM dedispersion, reducing the post-Stokes-I cfp32 cube
+    from ~7 GB → ~900 MB on a 2080Ti at ``t_int_fast_native = 8``.
+    The DMPlan is rebuilt against the summed-channel band-CENTER
+    frequencies (see :meth:`DMPlan.from_summed_canonical`), and the
+    sparsity pattern + gridder use the same band-CENTER frequencies
+    (folded into ``pattern_id``).
+
+    Constraint: must divide :data:`NCHAN_PER_CHGROUP` (= 384). The
+    DM smearing inside one summed channel at DM = 3000 pc/cc,
+    ν = 1.31 GHz is ~ 2.7 ms — well below the search-side fine-DM
+    step (per the M3 production review)."""
+
 
 @dataclass
 class IntegrationContext:
@@ -853,6 +871,27 @@ def process_block(
         del real_v_slab, imag_v_slab, vis_2pol_slab
     del real_v, imag_v
 
+    # F33: sum every ``chan_sum_factor`` adjacent fine channels into one
+    # effective channel BEFORE dedispersion. Reduces ``vis_stokes_i``
+    # cfp32 footprint by the same factor (default 8 → 7 GB → 900 MB on
+    # a 2080Ti at ``t_int_fast_native=8``). The downstream gridder
+    # pattern + DMPlan are built against the summed-channel band-CENTER
+    # frequencies (see ``build_context`` for the wiring); the math here
+    # is just a (NCHAN_eff, chan_sum_factor) reshape + sum.
+    chan_sum_factor = int(ctx.cfg.chan_sum_factor)
+    if chan_sum_factor > 1:
+        full_nchan = ctx.kernel.nchan
+        if full_nchan % chan_sum_factor != 0:
+            raise ValueError(
+                f"chan_sum_factor={chan_sum_factor} does not divide "
+                f"nchan={full_nchan}; configure cfg.chan_sum_factor "
+                f"so that NCHAN_PER_CHGROUP is divisible."
+            )
+        nchan_eff = full_nchan // chan_sum_factor
+        vis_stokes_i = vis_stokes_i.reshape(
+            n_fv_total, NBASE, nchan_eff, chan_sum_factor,
+        ).sum(dim=-1)
+
     if ctx.multi_dm_coarse_dm is not None:
         # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
         # stage-1 shifts → per-trial grid → per-trial static-sky.
@@ -992,13 +1031,15 @@ def _build_gridder(
         dec_deg=math.degrees(cfg.obs_dec_rad),
         n_grid=cfg.n_grid,
         kernel_support=cfg.kernel_support,
+        chan_sum_factor=cfg.chan_sum_factor,
         is_core_baseline_mask=is_core_baseline_mask,
     )
     LOG.info(
         "sparsity pattern: chgroup=%d obs_dec_deg=%.4f n_grid=%d "
-        "kernel_support=%d → n_filled=%d (id=0x%016x)",
+        "kernel_support=%d chan_sum_factor=%d → n_filled=%d (id=0x%016x)",
         cfg.chgroup, math.degrees(cfg.obs_dec_rad), cfg.n_grid,
-        cfg.kernel_support, pattern.n_filled, int(pattern.pattern_id),
+        cfg.kernel_support, cfg.chan_sum_factor,
+        pattern.n_filled, int(pattern.pattern_id),
     )
     gridder = FastVisGridder.from_pattern(
         pattern, antpos_e, antpos_n,
@@ -1090,8 +1131,30 @@ def build_context(
     multi_dm: Stage1MultiDMCoarseDM | None = None
     plan: DMPlan | None = dm_plan
     if plan is None and cfg.dm_plan_path is not None:
-        plan = DMPlan.load(cfg.dm_plan_path)
+        # F33-aware NPZ load. Always go via the canonical DmPlan so the
+        # summed-channel branch can rebuild delay tables against the
+        # band-CENTER frequencies; the chan_sum_factor=1 path is
+        # bit-identical to the legacy from_npz route.
+        from dsart.common.contracts import DmPlan as _CanonicalDmPlan
+        canonical = _CanonicalDmPlan.from_npz(str(cfg.dm_plan_path))
+        if cfg.chan_sum_factor == 1:
+            plan = DMPlan.from_canonical(canonical)
+        else:
+            plan = DMPlan.from_summed_canonical(
+                canonical, chan_sum_factor=cfg.chan_sum_factor,
+            )
     if plan is not None:
+        # F33: chan_sum_factor pin — if the caller built a plan
+        # externally (e.g. tests passing a synthetic DMPlan), it must
+        # match the integration cfg or the gridder pattern + DMPlan
+        # delay-table channel grids will silently drift.
+        if int(plan.chan_sum_factor) != int(cfg.chan_sum_factor):
+            raise ValueError(
+                f"DMPlan.chan_sum_factor={plan.chan_sum_factor} does "
+                f"not match cfg.chan_sum_factor={cfg.chan_sum_factor}; "
+                f"rebuild the plan via DMPlan.from_summed_canonical "
+                f"with chan_sum_factor={cfg.chan_sum_factor}."
+            )
         # Sanity: t_int_fast_native pin (within fp tolerance for
         # non-integer cadences, which the schema allows).
         plan_native = plan.t_int_fast_native
@@ -1549,6 +1612,15 @@ def main(argv: list[str] | None = None) -> int:
                         "2080Ti production GPU at t_int_fast_native=8). "
                         "Pass an explicit value to override (e.g. 8 for "
                         "deterministic memory profiling).")
+    p.add_argument("--chan-sum-factor", type=int, default=1,
+                   help="F33: collapse this many adjacent fine channels "
+                        "into one effective channel before dedispersion. "
+                        "Default: 1 (per-fine-channel pipeline; legacy). "
+                        "Production op-point: 8 (NCHAN 384 → 48; reduces "
+                        "post-Stokes-I cfp32 cube ~7 GB → ~900 MB). Must "
+                        "divide NCHAN_PER_CHGROUP (= 384). The DMPlan and "
+                        "gridder pattern are rebuilt against summed-"
+                        "channel band-CENTER frequencies.")
     p.add_argument("--output-dir", type=Path,
                    default=Path("/tmp/dsart-fast-grid"),
                    help="per-block output dir (default: %(default)s)")
@@ -1597,6 +1669,7 @@ def main(argv: list[str] | None = None) -> int:
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,
         n_fv_chunk=args.n_fv_chunk,
+        chan_sum_factor=args.chan_sum_factor,
     )
 
     try:

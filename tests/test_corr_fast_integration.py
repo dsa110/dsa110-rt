@@ -613,3 +613,51 @@ class TestF31bStreaming:
         raw = _synthetic_fada_block()
         out = process_block(raw, ctx=ctx, block_n=1)
         assert out.gridded_minus_sky is not None
+
+
+# ---------------------------------------------------------------------------
+# F33: chan_sum_factor pipeline
+# ---------------------------------------------------------------------------
+
+
+class TestF33ChanSumFactor:
+    """F33: pre-dedispersion 8-channel sum reduces the post-Stokes-I
+    cube by ``chan_sum_factor``, the gridder pattern is rebuilt
+    against summed-channel band-CENTER frequencies, and the output
+    shape stays ``(n_fv, N_filled)``.
+    """
+
+    def test_chan_sum_factor_default_is_one(self) -> None:
+        """``cfg.chan_sum_factor`` defaults to 1 ⇒ legacy pipeline."""
+        cfg = _make_cfg()
+        assert cfg.chan_sum_factor == 1
+        ctx = _build_test_context(cfg)
+        assert ctx.gridder.pattern.chan_sum_factor == 1
+
+    def test_chan_sum_factor_8_runs_end_to_end(self) -> None:
+        """``cfg.chan_sum_factor = 8`` ⇒ the gridder pattern gets 48
+        effective channels and process_block produces a valid
+        ``(n_fv, N_filled)`` cube."""
+        cfg = _make_cfg(chan_sum_factor=8)
+        ctx = _build_test_context(cfg)
+        assert ctx.gridder.pattern.chan_sum_factor == 8
+        raw = _synthetic_fada_block()
+        out = process_block(raw, ctx=ctx, block_n=1)
+        assert out.gridded_minus_sky is not None
+        assert out.gridded_minus_sky.dtype == torch.complex64
+        n_fv = ctx.kernel.n_fast_vis_per_full_block
+        n_filled = ctx.gridder.pattern.n_filled
+        assert out.gridded_minus_sky.shape == (n_fv, n_filled)
+        # Sanity: the summed pattern's n_filled is ≤ the per-fine
+        # pattern's n_filled (fewer (u, v) cells when channels collapse).
+        cfg_ref = _make_cfg(chan_sum_factor=1)
+        ctx_ref = _build_test_context(cfg_ref)
+        assert (
+            ctx.gridder.pattern.n_filled <= ctx_ref.gridder.pattern.n_filled
+        )
+
+    def test_chan_sum_factor_invalid(self) -> None:
+        """Non-divisor of NCHAN_PER_CHGROUP fails at build_pattern."""
+        cfg = _make_cfg(chan_sum_factor=7)
+        with pytest.raises(ValueError, match="does not divide"):
+            _build_test_context(cfg)

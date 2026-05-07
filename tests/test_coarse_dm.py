@@ -169,6 +169,21 @@ class TestDMPlanInvariants:
                     f"delay = {plan.delay_native_samples(g, 0, k)}"
                 )
 
+    def test_dm_plan_chan_sum_factor_default_one(self) -> None:
+        """Pre-F33 behaviour: ``chan_sum_factor`` defaults to 1; all
+        existing test fixtures + benches that build a DMPlan without
+        the parameter continue to see ``nchan_per_chgroup == 384``
+        (= ``NCHAN_PER_CHGROUP``)."""
+        plan = _make_dm_plan(dms=[0.0, 50.0, 405.0])
+        assert plan.chan_sum_factor == 1
+        assert plan.nchan_per_chgroup == NCHAN_PER_CHGROUP
+        assert plan.chgroup_freqs_GHz.shape == (
+            N_CHGROUP, NCHAN_PER_CHGROUP,
+        )
+        assert plan._delay_native_samples_table.shape == (
+            N_CHGROUP, NCHAN_PER_CHGROUP, plan.n_coarse,
+        )
+
     def test_dm_plan_load_save_round_trip(self, tmp_path: Path) -> None:
         """Coarse-only ``.npz`` round-trip preserves every field."""
         plan = _make_dm_plan(
@@ -192,6 +207,148 @@ class TestDMPlanInvariants:
                         loaded.delay_native_samples(g, ch, k)
                         == plan.delay_native_samples(g, ch, k)
                     )
+
+
+class TestF33SummedDmPlan:
+    """F33: :meth:`DMPlan.from_summed_canonical` + summed-channel
+    plumbing across :meth:`DMPlan` schema."""
+
+    def _canonical(self, *, dms: list[float] | None = None):
+        """Synthesise a minimal-valid canonical :class:`DmPlan` (full
+        schema; mirrors :func:`tests.test_contracts._make_minimal_dm_plan`).
+        """
+        from dsart.common.contracts import (
+            DM_PLAN_METADATA_VERSION,
+            DmPlan,
+            N_SEARCH,
+            N_SEARCH_GPU,
+            NU_TOP_PROC_GHZ,
+            NU_BOT_PROC_GHZ,
+            BW_PROC_MHZ,
+            N_CHAN_PROC_NATIVE,
+        )
+        if dms is None:
+            dms = [0.0, 100.0, 1000.0, 3000.0]
+        coarse = np.asarray(dms, dtype=np.float64)
+        n_coarse = coarse.size
+        n_fine = max(8, 2 * n_coarse)
+        fine = np.linspace(
+            float(dms[0]), float(dms[-1]), n_fine, dtype=np.float64,
+        )
+        fine_offsets_idx = np.linspace(
+            0, n_fine, num=n_coarse + 1, dtype=np.int32,
+        )
+        return DmPlan(
+            dm_min=float(dms[0]),
+            dm_max=float(dms[-1]) + 1.0,
+            tol=1.5,
+            fine_dm=fine,
+            coarse_dm=coarse,
+            fine_to_coarse=np.zeros(n_fine, dtype=np.int32),
+            fine_offsets_idx=fine_offsets_idx,
+            fine_offsets_flat=np.zeros(n_fine, dtype=np.float64),
+            time_shift_corr_stage1=np.zeros(
+                (N_CHGROUP, NCHAN_PER_CHGROUP, n_coarse), dtype=np.int32,
+            ),
+            time_shift_corr_stage2=np.zeros(
+                (N_CHGROUP, n_coarse), dtype=np.int32,
+            ),
+            time_shift_search=np.zeros((n_fine, N_CHGROUP), dtype=np.int32),
+            dm_idx_range_canonical=np.zeros((N_SEARCH, 2), dtype=np.int32),
+            dm_idx_range_consumed=np.zeros((N_SEARCH, 2), dtype=np.int32),
+            dm_idx_range_canonical_per_gpu=np.zeros(
+                (N_SEARCH, N_SEARCH_GPU, 2), dtype=np.int32,
+            ),
+            dm_idx_range_consumed_per_gpu=np.zeros(
+                (N_SEARCH, N_SEARCH_GPU, 2), dtype=np.int32,
+            ),
+            dm_overlap_coarse=2,
+            metadata={
+                "band_top_GHz": NU_TOP_PROC_GHZ,
+                "band_bot_GHz": NU_BOT_PROC_GHZ,
+                "BW_MHz": BW_PROC_MHZ,
+                "N_chan_proc_native": N_CHAN_PROC_NATIVE,
+                "t_int_fast_us": float(T_INT_FAST_US_DEFAULT),
+                "t_int_search_us": 524.288,
+                "tol": 1.5,
+                "build_utc_ns": 1_872_345_677_000_000_000,
+                "git_sha": "deadbeef",
+                "version": DM_PLAN_METADATA_VERSION,
+            },
+        )
+
+    def test_chan_sum_factor_8_shapes(self) -> None:
+        canonical = self._canonical()
+        plan = DMPlan.from_summed_canonical(canonical, chan_sum_factor=8)
+        assert plan.chan_sum_factor == 8
+        assert plan.nchan_per_chgroup == NCHAN_PER_CHGROUP // 8
+        assert plan.chgroup_freqs_GHz.shape == (
+            N_CHGROUP, NCHAN_PER_CHGROUP // 8,
+        )
+        assert plan._delay_native_samples_table.shape == (
+            N_CHGROUP, NCHAN_PER_CHGROUP // 8, plan.n_coarse,
+        )
+
+    def test_chan_sum_factor_8_top_zero(self) -> None:
+        """Convention A invariant: top SUMMED channel of every chgroup
+        has zero shift for every (g, dm)."""
+        canonical = self._canonical(dms=[0.0, 100.0, 3000.0])
+        plan = DMPlan.from_summed_canonical(canonical, chan_sum_factor=8)
+        for g in range(N_CHGROUP):
+            for k in range(plan.n_coarse):
+                assert plan.delay_native_samples(g, 0, k) == 0
+
+    def test_chan_sum_factor_8_delay_monotone_in_dm(self) -> None:
+        """Within a chgroup, lower-frequency summed channels delay
+        more, and DM-monotonicity holds at fixed channel."""
+        canonical = self._canonical(dms=[0.0, 100.0, 1000.0, 3000.0])
+        plan = DMPlan.from_summed_canonical(canonical, chan_sum_factor=8)
+        for g in (0, 7, 15):
+            # Largest summed channel is the lowest freq.
+            ch_last = plan.nchan_per_chgroup - 1
+            delays = np.asarray(
+                [
+                    plan.delay_native_samples(g, ch_last, k)
+                    for k in range(plan.n_coarse)
+                ],
+                dtype=np.int64,
+            )
+            assert (np.diff(delays) >= 0).all()
+            assert delays[-1] > 0
+
+    def test_chan_sum_factor_8_top_freq_above_summed_freqs(self) -> None:
+        """Summed-channel grid is monotone DECREASING within a chgroup
+        (matches the descending fine-channel convention).
+        Band-CENTER freq of summed-ch 0 > band-CENTER of summed-ch 1
+        > … > band-CENTER of summed-ch (NCHAN_eff − 1)."""
+        canonical = self._canonical()
+        plan = DMPlan.from_summed_canonical(canonical, chan_sum_factor=8)
+        for g in range(N_CHGROUP):
+            row = plan.chgroup_freqs_GHz[g]
+            assert (np.diff(row) < 0).all(), (
+                f"chgroup {g} summed freqs not monotone-decreasing: {row}"
+            )
+
+    def test_chan_sum_factor_1_equals_from_canonical(self) -> None:
+        """``from_summed_canonical(plan, chan_sum_factor=1)`` ≡
+        ``from_canonical(plan)`` (legacy bit-identical check)."""
+        canonical = self._canonical()
+        a = DMPlan.from_canonical(canonical)
+        b = DMPlan.from_summed_canonical(canonical, chan_sum_factor=1)
+        assert a.chan_sum_factor == b.chan_sum_factor == 1
+        np.testing.assert_array_equal(
+            a.chgroup_freqs_GHz, b.chgroup_freqs_GHz,
+        )
+        np.testing.assert_array_equal(
+            a._delay_native_samples_table, b._delay_native_samples_table,
+        )
+
+    def test_chan_sum_factor_invalid(self) -> None:
+        canonical = self._canonical()
+        with pytest.raises(ValueError, match="chan_sum_factor"):
+            DMPlan.from_summed_canonical(canonical, chan_sum_factor=0)
+        with pytest.raises(ValueError, match="does not divide"):
+            DMPlan.from_summed_canonical(canonical, chan_sum_factor=7)
 
 
 # ---------------------------------------------------------------------------
