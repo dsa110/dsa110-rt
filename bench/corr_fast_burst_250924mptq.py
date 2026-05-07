@@ -469,6 +469,15 @@ def main(argv: list[str] | None = None) -> int:
                         "fast-vis tile). Default 32 = 1048.576 µs cadence "
                         "(4× burst-test override per PARALLEL_AGENTS.md §5.1).")
     p.add_argument("--n-grid", type=int, default=256)
+    p.add_argument("--cell-lambda-mode", default="common",
+                   choices=("common", "per_chgroup"),
+                   help="F28: per-cell (u, v) λ-extent across chgroups. "
+                        "'common' (default; F28): shared cell scale "
+                        "from top-of-band — burst lands at the same "
+                        "image pixel in every chgroup. 'per_chgroup' "
+                        "(legacy): each chgroup auto-fits its own cell "
+                        "scale; the burst's column drifts ~5 cells "
+                        "from sb00 to sb15 in this mode.")
     p.add_argument("--report-dir", type=Path, required=True)
     p.add_argument("--device", default="auto")
     p.add_argument("--src-json", type=Path, default=None)
@@ -572,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
             obs_dec_deg=obs_dec_deg,
             n_grid=args.n_grid,
             kernel_support=1,
+            cell_lambda_mode=args.cell_lambda_mode,                  # F28
             t_int_fast_native=args.t_int_fast_native,
             cal_mode=args.cal_mode,
             cal_pol_swap=args.cal_pol_swap,
