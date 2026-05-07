@@ -99,6 +99,7 @@ from dsart.grid import (
     FastVisGridder,
     SparsityPattern,
     build_pattern,
+    compute_top_of_band_cell_lambda,
 )
 from dsart.rfi import (
     FlagBlockResult,
@@ -728,6 +729,28 @@ class FastIntegrationConfig:
     obs_dec_rad: float
     n_grid: int = 256
     kernel_support: int = 1
+    cell_lambda_mode: str = "common"
+    """F28: how :func:`build_pattern` picks the per-cell (u, v) λ-extent.
+
+    * ``"common"`` (F28 default): all chgroups share a single
+      ``cell_lambda`` derived from the top-of-band reference frequency
+      via :func:`compute_top_of_band_cell_lambda`. A fixed (l, m)
+      source then lands at the SAME image pixel in every chgroup, so
+      per-chgroup gridded image cubes are stackable by the
+      fine-dedisperser/imager without resampling. Top of band is
+      critically sampled; lower-frequency chgroups are oversampled
+      (their ``n_filled`` shrinks).
+    * ``"per_chgroup"`` (legacy pre-F28): each chgroup auto-fits its
+      own ``cell_lambda`` from this chgroup's longest baseline-in-λ.
+      The chunk-6 burst bench observes this as a 5-pixel column drift
+      across the 16 chgroups — the artefact F28 fixes.
+
+    Test code that needs the legacy path bit-identically (e.g.
+    grid-pixel parity asserts pinned against the pre-F28 outputs)
+    should pass ``"per_chgroup"`` explicitly. New benches and
+    production should use ``"common"`` and stack chgroup cubes
+    pixel-for-pixel."""
+
     t_int_fast_native: int = T_INT_FAST_NATIVE
     cal_path: Path | None = None
     cal_mode: str = CalMode.PHASE_ONLY
@@ -1169,6 +1192,20 @@ def _build_gridder(
     is_core_baseline_mask: np.ndarray | None,
     device: torch.device,
 ) -> tuple[SparsityPattern, FastVisGridder]:
+    # F28: resolve cell_lambda per ``cfg.cell_lambda_mode``.
+    if cfg.cell_lambda_mode == "common":
+        cell_lambda_used = compute_top_of_band_cell_lambda(
+            antpos_e, antpos_n,
+            n_grid=cfg.n_grid,
+            is_core_baseline_mask=is_core_baseline_mask,
+        )
+    elif cfg.cell_lambda_mode == "per_chgroup":
+        cell_lambda_used = None                                       # legacy auto-fit in build_pattern
+    else:
+        raise ValueError(
+            f"cfg.cell_lambda_mode={cfg.cell_lambda_mode!r}; expected "
+            f"'common' (F28 default) or 'per_chgroup' (legacy)."
+        )
     pattern = build_pattern(
         antpos_e, antpos_n,
         chgroup=cfg.chgroup,
@@ -1176,13 +1213,16 @@ def _build_gridder(
         n_grid=cfg.n_grid,
         kernel_support=cfg.kernel_support,
         chan_sum_factor=cfg.chan_sum_factor,
+        cell_lambda=cell_lambda_used,
         is_core_baseline_mask=is_core_baseline_mask,
     )
     LOG.info(
         "sparsity pattern: chgroup=%d obs_dec_deg=%.4f n_grid=%d "
-        "kernel_support=%d chan_sum_factor=%d → n_filled=%d (id=0x%016x)",
+        "kernel_support=%d chan_sum_factor=%d cell_lambda_mode=%s "
+        "cell_lambda=%.4g → n_filled=%d (id=0x%016x)",
         cfg.chgroup, math.degrees(cfg.obs_dec_rad), cfg.n_grid,
         cfg.kernel_support, cfg.chan_sum_factor,
+        cfg.cell_lambda_mode, float(pattern.cell_lambda),
         pattern.n_filled, int(pattern.pattern_id),
     )
     gridder = FastVisGridder.from_pattern(
@@ -1774,6 +1814,18 @@ def main(argv: list[str] | None = None) -> int:
                         "delay ~480 fast-vis bins at DM=3000 pc/cc, "
                         "t_int_fast_native=8) are fully resolved. Adds one "
                         "block (~134 ms) of latency.")
+    p.add_argument("--cell-lambda-mode", default="common",
+                   choices=("common", "per_chgroup"),
+                   help="F28: per-cell (u, v) λ-extent selection. "
+                        "'common' (default; F28): a single cell_lambda "
+                        "from the top-of-band frequency is shared across "
+                        "all chgroups so a fixed (l, m) source lands at "
+                        "the same image pixel in every chgroup, enabling "
+                        "pixel-wise stacking by the fine-dedisperser/imager. "
+                        "'per_chgroup' (legacy pre-F28): each chgroup "
+                        "auto-fits its own cell scale; the burst bench "
+                        "exhibits a 5-pixel column drift across the band "
+                        "in this mode.")
     p.add_argument("--output-dir", type=Path,
                    default=Path("/tmp/dsart-fast-grid"),
                    help="per-block output dir (default: %(default)s)")
@@ -1824,6 +1876,7 @@ def main(argv: list[str] | None = None) -> int:
         n_fv_chunk=args.n_fv_chunk,
         chan_sum_factor=args.chan_sum_factor,
         sliding_window=args.sliding_window,
+        cell_lambda_mode=args.cell_lambda_mode,
     )
 
     try:

@@ -62,7 +62,9 @@ from dsart.grid.sparsity_pattern import (
     SUPPORTED_KERNEL_SUPPORTS,
     build_pattern,
     compute_antpos_hash,
+    compute_chgroup_auto_cell_lambda,
     compute_chgroup_table_hash,
+    compute_top_of_band_cell_lambda,
     core_baseline_mask_from_antpos,
     core_baseline_mask_from_station_numbers,
     gaussian_kernel_weights,
@@ -385,20 +387,63 @@ def test_predict_pattern_id_matches_build_pattern_id() -> None:
     )
     p = build_pattern(e, n, is_core_baseline_mask=mask, **kw)
     # Same inputs ⇒ same pattern_id, regardless of which API path.
-    pid = predict_pattern_id(antpos_e=e, antpos_n=n, **kw)
+    # F28: mask flows into the auto-fit cell_lambda, so predict must
+    # see the same mask as build to derive the same hash.
+    pid = predict_pattern_id(
+        antpos_e=e, antpos_n=n, is_core_baseline_mask=mask, **kw,
+    )
     assert pid == p.pattern_id
-    # Bypass with pre-computed hashes.
+    # Bypass with pre-computed hashes — F28 still requires antpos
+    # arrays for the cell_lambda auto-fit (or an explicit cell_lambda).
     ap_h = compute_antpos_hash(e, n)
     cg_h = compute_chgroup_table_hash()
     pid2 = predict_pattern_id(
+        antpos_e=e, antpos_n=n,
+        is_core_baseline_mask=mask,
         antpos_hash=ap_h, chgroup_table_hash=cg_h, **kw,
     )
     assert pid2 == p.pattern_id
+    # F28 explicit cell_lambda: still matches build when fed the
+    # value build resolved.
+    pid3 = predict_pattern_id(
+        antpos_hash=ap_h, chgroup_table_hash=cg_h,
+        cell_lambda=float(p.cell_lambda), **kw,
+    )
+    assert pid3 == p.pattern_id
+
+
+def test_predict_pattern_id_requires_antpos_for_auto_cell_lambda() -> None:
+    """F28: cell_lambda=None (auto-fit) requires the antpos arrays so
+    the auto-fit can be recomputed; the bare antpos_hash is not enough."""
+    with pytest.raises(ValueError, match="antpos_e and antpos_n"):
+        predict_pattern_id(
+            chgroup=0, dec_deg=37.0, n_grid=128, kernel_support=1,
+        )
+
+
+def test_predict_pattern_id_explicit_cell_lambda_accepts_hash_only() -> None:
+    """F28: with an explicit cell_lambda, antpos_hash alone is enough
+    (no need to recompute auto-fit) — matches the corr/search ``cmd:
+    prepare`` handshake where one end may only ship the hash."""
+    e, n = _synth_antpos(seed=7)
+    ap_h = compute_antpos_hash(e, n)
+    pid = predict_pattern_id(
+        chgroup=0, dec_deg=37.0, n_grid=128, kernel_support=1,
+        cell_lambda=12.5,
+        antpos_hash=ap_h,
+    )
+    assert isinstance(pid, int)
+    assert 0 <= pid < (1 << 64)
 
 
 def test_predict_pattern_id_requires_antpos_or_hash() -> None:
+    """F28 (explicit cell_lambda path): without antpos arrays AND
+    without antpos_hash, predict_pattern_id still raises."""
     with pytest.raises(ValueError, match="antpos_hash"):
-        predict_pattern_id(chgroup=0, dec_deg=37.0, n_grid=128, kernel_support=1)
+        predict_pattern_id(
+            chgroup=0, dec_deg=37.0, n_grid=128, kernel_support=1,
+            cell_lambda=12.5,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1188,3 +1233,205 @@ class TestF33ChanSumFactor:
             p = build_pattern(chan_sum_factor=csf, **common_kw)
             assert p.chan_sum_factor == csf
             assert p.n_filled > 0
+
+
+# ---------------------------------------------------------------------------
+# F28: common cell_lambda across chgroups
+# ---------------------------------------------------------------------------
+
+
+class TestF28CommonCellLambda:
+    """F28: optional ``cell_lambda`` on :func:`build_pattern` lets the
+    caller pin a single (u, v) cell scale across all chgroups so the
+    image-domain pixel grid is shared. The resolved value is stored
+    on the :class:`SparsityPattern` and folded into ``pattern_id``.
+    """
+
+    @pytest.fixture
+    def antpos_and_mask(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        e, n = _synth_antpos(seed=20260507)
+        mask = _core_baseline_mask(n_core=82)
+        return e, n, mask
+
+    def test_legacy_default_unchanged(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """``cell_lambda=None`` (default) ⇒ pattern matches the
+        pre-F28 auto-fit path bit-identically: same ``ix_row``,
+        ``ix_col``, ``n_filled``, AND the auto-fit cell_lambda is
+        stored on the pattern."""
+        e, n, mask = antpos_and_mask
+        p_auto = build_pattern(
+            e, n, chgroup=0, dec_deg=37.5, n_grid=128,
+            kernel_support=1, is_core_baseline_mask=mask,
+        )
+        # Cell lambda is the same as what the helper computes.
+        cl_helper = compute_chgroup_auto_cell_lambda(
+            e, n, chgroup=0, n_grid=128, is_core_baseline_mask=mask,
+        )
+        assert float(p_auto.cell_lambda) == pytest.approx(cl_helper, rel=1e-9)
+        # Calling with cell_lambda=cl_helper explicitly must give the
+        # same pattern bit-for-bit.
+        p_explicit = build_pattern(
+            e, n, chgroup=0, dec_deg=37.5, n_grid=128,
+            kernel_support=1, cell_lambda=cl_helper,
+            is_core_baseline_mask=mask,
+        )
+        assert int(p_explicit.pattern_id) == int(p_auto.pattern_id)
+        np.testing.assert_array_equal(p_explicit.ix_row, p_auto.ix_row)
+        np.testing.assert_array_equal(p_explicit.ix_col, p_auto.ix_col)
+
+    def test_top_of_band_helper_matches_chgroup_0_autofit(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """``compute_top_of_band_cell_lambda`` should equal the
+        per-chgroup auto-fit at chgroup 0 (top of band)."""
+        e, n, mask = antpos_and_mask
+        cl_top = compute_top_of_band_cell_lambda(
+            e, n, n_grid=128, is_core_baseline_mask=mask,
+        )
+        cl_chg0 = compute_chgroup_auto_cell_lambda(
+            e, n, chgroup=0, n_grid=128, is_core_baseline_mask=mask,
+        )
+        assert cl_top == pytest.approx(cl_chg0, rel=1e-9)
+
+    def test_top_of_band_strictly_larger_than_low_chgroup_autofit(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """At lower frequencies the auto-fit shrinks, so the F28
+        common (= top-of-band) value is the LARGEST auto-fit any
+        chgroup would pick."""
+        e, n, mask = antpos_and_mask
+        cl_top = compute_top_of_band_cell_lambda(
+            e, n, n_grid=128, is_core_baseline_mask=mask,
+        )
+        cl_chg15 = compute_chgroup_auto_cell_lambda(
+            e, n, chgroup=15, n_grid=128, is_core_baseline_mask=mask,
+        )
+        assert cl_top > cl_chg15
+        # The spread is bounded by the band ν_TOP / ν_BOT ratio.
+        # Sanity check that we're not drifting too far either way.
+        assert 1.05 < (cl_top / cl_chg15) < 1.30
+
+    def test_common_cell_lambda_pixel_grid_is_shared(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """F28 acceptance test: with a common cell_lambda, the same
+        baseline maps to the same (row, col) cell at the band-CENTER
+        of every chgroup that includes it. Equivalently, the image
+        pixel scale ``1 / (n_grid * cell_lambda)`` is identical
+        across chgroups."""
+        e, n, mask = antpos_and_mask
+        cl_common = compute_top_of_band_cell_lambda(
+            e, n, n_grid=128, is_core_baseline_mask=mask,
+        )
+        p0 = build_pattern(
+            e, n, chgroup=0, dec_deg=37.5, n_grid=128,
+            kernel_support=1, cell_lambda=cl_common,
+            is_core_baseline_mask=mask,
+        )
+        p15 = build_pattern(
+            e, n, chgroup=15, dec_deg=37.5, n_grid=128,
+            kernel_support=1, cell_lambda=cl_common,
+            is_core_baseline_mask=mask,
+        )
+        # Same cell_lambda stored on both.
+        assert float(p0.cell_lambda) == float(p15.cell_lambda) == cl_common
+        # Top-of-band chgroup 0 is critically sampled, so its pattern
+        # is at least as full as the lower-frequency chgroup 15
+        # (which is oversampled and therefore has fewer non-zero
+        # cells under the common scale). Strict inequality requires
+        # a rich enough antpos mosaic — assert ≥ to stay robust.
+        assert p0.n_filled >= p15.n_filled
+
+    def test_pattern_id_distinguishes_different_cell_lambdas(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """``pattern_id`` folds in the resolved cell_lambda (F28),
+        so two patterns built with different cell scales (same
+        chgroup, same antpos, etc.) must hash to different IDs."""
+        e, n, mask = antpos_and_mask
+        cl_top = compute_top_of_band_cell_lambda(
+            e, n, n_grid=128, is_core_baseline_mask=mask,
+        )
+        # Build with auto-fit (legacy) ...
+        p_auto = build_pattern(
+            e, n, chgroup=15, dec_deg=37.5, n_grid=128,
+            kernel_support=1, is_core_baseline_mask=mask,
+        )
+        # ... vs F28 common (top of band).
+        p_common = build_pattern(
+            e, n, chgroup=15, dec_deg=37.5, n_grid=128,
+            kernel_support=1, cell_lambda=cl_top,
+            is_core_baseline_mask=mask,
+        )
+        assert int(p_auto.pattern_id) != int(p_common.pattern_id)
+        assert float(p_auto.cell_lambda) != float(p_common.cell_lambda)
+
+    def test_invalid_cell_lambda_raises(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """Non-finite or non-positive ``cell_lambda`` is rejected."""
+        e, n, mask = antpos_and_mask
+        for bad in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="cell_lambda"):
+                build_pattern(
+                    e, n, chgroup=0, dec_deg=37.5, n_grid=128,
+                    kernel_support=1, cell_lambda=bad,
+                    is_core_baseline_mask=mask,
+                )
+
+    def test_too_small_cell_lambda_rejected(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """A ``cell_lambda`` so small that this chgroup's longest
+        baseline-in-λ aliases past ±N_grid/2 cells is rejected
+        loudly at ``cmd: prepare`` (not silently mis-gridded)."""
+        e, n, mask = antpos_and_mask
+        cl_min = compute_chgroup_auto_cell_lambda(
+            e, n, chgroup=0, n_grid=128, is_core_baseline_mask=mask,
+        )
+        with pytest.raises(ValueError, match="too small"):
+            build_pattern(
+                e, n, chgroup=0, dec_deg=37.5, n_grid=128,
+                kernel_support=1,
+                cell_lambda=0.1 * cl_min,                            # way too small
+                is_core_baseline_mask=mask,
+            )
+
+    def test_predict_pattern_id_round_trip_explicit(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """``predict_pattern_id`` with an explicit ``cell_lambda``
+        round-trips against ``build_pattern`` for the same value."""
+        e, n, mask = antpos_and_mask
+        cl_top = compute_top_of_band_cell_lambda(
+            e, n, n_grid=128, is_core_baseline_mask=mask,
+        )
+        p = build_pattern(
+            e, n, chgroup=7, dec_deg=37.5, n_grid=128,
+            kernel_support=1, cell_lambda=cl_top,
+            is_core_baseline_mask=mask,
+        )
+        pid = predict_pattern_id(
+            chgroup=7, dec_deg=37.5, n_grid=128, kernel_support=1,
+            cell_lambda=cl_top,
+            antpos_e=e, antpos_n=n,
+            is_core_baseline_mask=mask,
+        )
+        assert pid == p.pattern_id
+
+    def test_top_of_band_helper_invariant_across_n_grid(
+        self, antpos_and_mask: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> None:
+        """Doubling ``n_grid`` halves the cell_lambda (cell scale ∝
+        1/n_grid). Sanity check: the helper formula matches the
+        ``max_baseline * 2 / n_grid`` convention."""
+        e, n, mask = antpos_and_mask
+        cl_128 = compute_top_of_band_cell_lambda(
+            e, n, n_grid=128, is_core_baseline_mask=mask,
+        )
+        cl_256 = compute_top_of_band_cell_lambda(
+            e, n, n_grid=256, is_core_baseline_mask=mask,
+        )
+        assert cl_128 == pytest.approx(2.0 * cl_256, rel=1e-9)

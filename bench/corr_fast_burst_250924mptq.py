@@ -602,13 +602,15 @@ def main(argv: list[str] | None = None) -> int:
         cube_np = cube.cpu().numpy()
         per_chgroup_image_cubes[chgroup] = cube_np
 
-        from dsart.services.corr_fast_integration import load_antpos_from_cal_blob
-        ap_e, ap_n, core_mask = load_antpos_from_cal_blob(cal_path)
-        cell_lambda = compute_chgroup_cell_lambda(
-            ap_e, ap_n, chgroup=chgroup, n_grid=args.n_grid,
-            is_core_baseline_mask=core_mask,
-        )
-        per_chgroup_cell_lambda[chgroup] = float(cell_lambda)
+        # F28: read the resolved cell_lambda straight off the pattern
+        # (build_pattern stores whatever cell-scale it actually used:
+        # the F28 common value if cfg.cell_lambda_mode="common", or
+        # the per-chgroup auto-fit if "per_chgroup"). Falling back to
+        # ``compute_chgroup_cell_lambda`` here would re-derive the
+        # auto-fit and reintroduce the drift this bench is meant to
+        # measure.
+        cell_lambda = float(ctx.gridder.pattern.cell_lambda)
+        per_chgroup_cell_lambda[chgroup] = cell_lambda
 
         # Per-chgroup peak (in this chgroup's own time axis + cell-lambda).
         edge_pad = 8

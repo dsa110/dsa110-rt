@@ -347,10 +347,24 @@ class FastVisGridder:
         u_lam = -u_lam                                                # F20
         v_lam = -v_lam
 
-        max_baseline_lambda = float(np.max(np.maximum(
-            np.abs(u_lam), np.abs(v_lam),
-        )))
-        cell_lambda = max_baseline_lambda * 2.0 / n_grid
+        # F28: read the resolved ``cell_lambda`` straight off the
+        # pattern instead of recomputing. ``build_pattern`` either
+        # auto-fit it from this chgroup's max baseline-in-λ
+        # (legacy) or accepted an external common value (F28); in
+        # either case the pattern carries the canonical resolved
+        # number, so re-deriving it here would re-introduce the
+        # exact divergence between corr and search ends that
+        # F28 + the cell_lambda-in-pattern-id field exist to
+        # prevent. (Pre-F28 builds default ``cell_lambda`` to 0.0
+        # on the dataclass; fall back to recomputing in that case
+        # to preserve the legacy contract with any external
+        # callers who still construct SparsityPattern by hand.)
+        cell_lambda = float(getattr(pattern, "cell_lambda", 0.0))
+        if cell_lambda <= 0.0:
+            max_baseline_lambda = float(np.max(np.maximum(
+                np.abs(u_lam), np.abs(v_lam),
+            )))
+            cell_lambda = max_baseline_lambda * 2.0 / n_grid
         half = n_grid // 2
         ix_col_kept_center = (
             np.rint(u_lam / cell_lambda).astype(np.int64) + half

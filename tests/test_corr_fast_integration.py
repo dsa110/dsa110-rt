@@ -830,3 +830,123 @@ class TestF34SlidingWindow:
         )
         with pytest.raises(ValueError, match="prev block n_fv"):
             stage1.dedisperse_from_vis(vis_b, block_n=1)
+
+
+# ---------------------------------------------------------------------------
+# F28: cell_lambda_mode plumbing
+# ---------------------------------------------------------------------------
+
+
+class TestF28CellLambdaMode:
+    """F28: ``cfg.cell_lambda_mode`` controls how :func:`build_pattern`
+    picks the per-cell λ-extent. ``"common"`` (new default) shares one
+    cell scale across all chgroups so a fixed (l, m) source lands at
+    the same image pixel everywhere; ``"per_chgroup"`` (legacy)
+    auto-fits per chgroup and drifts as the column-offset bench shows.
+    """
+
+    def test_common_mode_yields_same_cell_lambda_across_chgroups(self) -> None:
+        """The whole point of F28: common cell_lambda is identical
+        for every chgroup."""
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        cell_lambdas = []
+        for cg in (0, 7, 15):
+            cfg = _make_cfg(
+                chgroup=cg, cell_lambda_mode="common",
+            )
+            ctx = build_context(
+                cfg, device=torch.device("cpu"),
+                antpos_e=e, antpos_n=n,
+                is_core_baseline_mask=core_mask,
+            )
+            cell_lambdas.append(float(ctx.gridder.pattern.cell_lambda))
+        # Bit-equal across chgroups (top-of-band reference is
+        # chgroup-independent + the antpos/mask are shared).
+        assert cell_lambdas[0] == cell_lambdas[1] == cell_lambdas[2]
+
+    def test_per_chgroup_mode_yields_distinct_cell_lambdas(self) -> None:
+        """Legacy ``per_chgroup`` mode: each chgroup's ``cell_lambda``
+        is auto-fit to its own band, so they differ."""
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        cl_chg0 = float(build_context(
+            _make_cfg(chgroup=0, cell_lambda_mode="per_chgroup"),
+            device=torch.device("cpu"),
+            antpos_e=e, antpos_n=n,
+            is_core_baseline_mask=core_mask,
+        ).gridder.pattern.cell_lambda)
+        cl_chg15 = float(build_context(
+            _make_cfg(chgroup=15, cell_lambda_mode="per_chgroup"),
+            device=torch.device("cpu"),
+            antpos_e=e, antpos_n=n,
+            is_core_baseline_mask=core_mask,
+        ).gridder.pattern.cell_lambda)
+        # Top-of-band (chg 0) → larger cell_lambda; bottom-of-band
+        # (chg 15) → smaller. Spread matches NU_TOP/NU_BOT ratio.
+        assert cl_chg0 > cl_chg15
+        assert cl_chg0 / cl_chg15 > 1.10                              # ≥ 10% spread
+
+    def test_common_vs_per_chgroup_differ_for_non_top_chgroup(self) -> None:
+        """For chgroup 0 the two modes should give the same cell_lambda
+        (the auto-fit IS the top-of-band value), but for chgroup 15
+        the F28 common mode is LARGER than the per-chgroup auto-fit."""
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+
+        def cell_lambda(cg: int, mode: str) -> float:
+            return float(build_context(
+                _make_cfg(chgroup=cg, cell_lambda_mode=mode),
+                device=torch.device("cpu"),
+                antpos_e=e, antpos_n=n,
+                is_core_baseline_mask=core_mask,
+            ).gridder.pattern.cell_lambda)
+
+        cl_chg0_common = cell_lambda(0, "common")
+        cl_chg0_per = cell_lambda(0, "per_chgroup")
+        # Top-of-chgroup-0 frequency = top-of-band ⇒ values match.
+        assert cl_chg0_common == pytest.approx(cl_chg0_per, rel=1e-9)
+        cl_chg15_common = cell_lambda(15, "common")
+        cl_chg15_per = cell_lambda(15, "per_chgroup")
+        # F28 common is sized to top-of-band (largest baseline-in-λ
+        # of the band), so it's strictly larger than the chgroup-15
+        # auto-fit (lower frequency ⇒ smaller |u|, |v| in λ).
+        assert cl_chg15_common > cl_chg15_per
+
+    def test_common_mode_is_default(self) -> None:
+        cfg = FastIntegrationConfig(chgroup=0, obs_dec_rad=math.radians(53.85))
+        assert cfg.cell_lambda_mode == "common"
+
+    def test_invalid_mode_raises(self) -> None:
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        cfg = _make_cfg(cell_lambda_mode="bogus")
+        with pytest.raises(ValueError, match="cell_lambda_mode"):
+            build_context(
+                cfg, device=torch.device("cpu"),
+                antpos_e=e, antpos_n=n,
+                is_core_baseline_mask=core_mask,
+            )
+
+    def test_pattern_id_differs_between_modes_for_low_chgroup(self) -> None:
+        """``pattern_id`` folds in the resolved ``cell_lambda`` (F28),
+        so two patterns with different cell scales for the same
+        chgroup must have different ``pattern_id``s."""
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        ctx_common = build_context(
+            _make_cfg(chgroup=15, cell_lambda_mode="common"),
+            device=torch.device("cpu"),
+            antpos_e=e, antpos_n=n,
+            is_core_baseline_mask=core_mask,
+        )
+        ctx_per = build_context(
+            _make_cfg(chgroup=15, cell_lambda_mode="per_chgroup"),
+            device=torch.device("cpu"),
+            antpos_e=e, antpos_n=n,
+            is_core_baseline_mask=core_mask,
+        )
+        assert (
+            int(ctx_common.gridder.pattern.pattern_id)
+            != int(ctx_per.gridder.pattern.pattern_id)
+        )
