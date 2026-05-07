@@ -1117,3 +1117,74 @@ class TestKGreaterThanOne:
             f"expected−actual={len(expected - actual)} "
             f"actual−expected={len(actual - expected)}"
         )
+
+
+class TestF33ChanSumFactor:
+    """F33 (M3 production op-point): pre-dedispersion 8-channel sum.
+
+    :func:`build_pattern` accepts a ``chan_sum_factor`` parameter that
+    builds the pattern against the SUMMED-channel band-CENTER
+    frequency grid. ``chan_sum_factor=1`` (default) is bit-identical
+    to the pre-F33 path. ``chan_sum_factor=8`` (production) uses
+    NCHAN_eff = 48 effective channels and the band-CENTER ν of each
+    8-channel block.
+    """
+
+    @pytest.fixture
+    def common_kw(self) -> dict:
+        e, n = _synth_antpos(seed=20260507)
+        mask = _core_baseline_mask(n_core=82)
+        return {
+            "antpos_e": e,
+            "antpos_n": n,
+            "chgroup": 0,
+            "dec_deg": 53.85,
+            "n_grid": N_GRID_DEFAULT,
+            "is_core_baseline_mask": mask,
+        }
+
+    def test_chan_sum_factor_1_is_legacy_pillbox(self, common_kw: dict) -> None:
+        """``chan_sum_factor=1`` ⇒ bit-identical to pre-F33."""
+        p_default = build_pattern(**common_kw)
+        p_csf1 = build_pattern(chan_sum_factor=1, **common_kw)
+        assert p_default.pattern_id == p_csf1.pattern_id
+        assert np.array_equal(p_default.ix_row, p_csf1.ix_row)
+        assert np.array_equal(p_default.ix_col, p_csf1.ix_col)
+        assert p_csf1.chan_sum_factor == 1
+
+    def test_chan_sum_factor_8_pattern_id_differs(self, common_kw: dict) -> None:
+        """``pattern_id`` includes ``chan_sum_factor`` so summed and
+        per-fine-channel patterns cannot collide."""
+        p_csf1 = build_pattern(chan_sum_factor=1, **common_kw)
+        p_csf8 = build_pattern(chan_sum_factor=8, **common_kw)
+        assert p_csf1.pattern_id != p_csf8.pattern_id
+        assert p_csf8.chan_sum_factor == 8
+
+    def test_chan_sum_factor_8_n_filled_smaller(self, common_kw: dict) -> None:
+        """Summed-channel pattern fills FEWER cells than per-fine-channel
+        (each summed channel contributes one (u, v) cell instead of 8)."""
+        p_csf1 = build_pattern(chan_sum_factor=1, **common_kw)
+        p_csf8 = build_pattern(chan_sum_factor=8, **common_kw)
+        # The summed-channel pattern should have ≤ as many filled
+        # cells (8x fewer per-(bls, ch) contributions; many fewer
+        # distinct cells after dedup).
+        assert p_csf8.n_filled <= p_csf1.n_filled
+
+    def test_rejects_invalid_chan_sum_factor(self, common_kw: dict) -> None:
+        # Zero / negative.
+        with pytest.raises(ValueError, match="chan_sum_factor"):
+            build_pattern(chan_sum_factor=0, **common_kw)
+        with pytest.raises(ValueError, match="chan_sum_factor"):
+            build_pattern(chan_sum_factor=-1, **common_kw)
+        # Not a divisor of NCHAN_PER_CHGROUP (= 384).
+        with pytest.raises(ValueError, match="does not divide"):
+            build_pattern(chan_sum_factor=7, **common_kw)
+        with pytest.raises(ValueError, match="does not divide"):
+            build_pattern(chan_sum_factor=384 + 1, **common_kw)
+
+    def test_chan_sum_factor_in_supported_divisors(self, common_kw: dict) -> None:
+        # 1, 2, 4, 8, 16 all divide 384; 8 is the production op-point.
+        for csf in (1, 2, 4, 8, 16):
+            p = build_pattern(chan_sum_factor=csf, **common_kw)
+            assert p.chan_sum_factor == csf
+            assert p.n_filled > 0
