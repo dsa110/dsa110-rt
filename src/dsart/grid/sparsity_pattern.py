@@ -324,18 +324,27 @@ class SparsityPattern:
 # ---------------------------------------------------------------------------
 
 
-#: Default core-radius cut (m). The DSA-110 cal-blob antpos has a clean
-#: gap between the largest core baseline (~441 m, ant 47 / ant 83) and
-#: the smallest outrigger (~627 m, ant 84). 500 m sits in that gap and
-#: gives the canonical 82-83 core antennas. Production reads
-#: ``is_core`` from etcd ``/cnf/corr_setup_96`` (see plan §3 line 446);
-#: this is the bench/test fallback when etcd is unavailable.
+#: Default core-radius cut (m). NOTE (F32): radius is INSUFFICIENT for
+#: discriminating DSA-110 core vs outrigger antennas, because outrigger
+#: stations 103/104/.../115 lie at radii (~420-1100 m) that overlap with
+#: the legitimate core stations 99-102 (which have N ≈ 423-441 m). The
+#: canonical discriminator is the STATION NUMBER: stations ≤ 102 are
+#: core, 103-116 are outriggers (12 outriggers + 1 outrigger-set
+#: station = 14 outriggers). Production reads ``is_core`` from etcd
+#: ``/cnf/corr_setup_96`` (plan §3 line 446); for cal-blob fixtures use
+#: :func:`core_baseline_mask_from_station_numbers` with the
+#: ``antenna_order`` from the cal yaml. The radius helper below is
+#: retained ONLY for synthetic tests where station numbers are absent.
 CORE_RADIUS_M_DEFAULT: float = 500.0
 
-#: Canonical core-antenna count (plan §3 line 446). Used by
-#: :func:`core_baseline_mask_from_antpos` when callers prefer to
-#: specify a count rather than a radius.
+#: Canonical core-antenna count (plan §3 line 446) = 82, when the array
+#: is the standard 96-ant DSA-110 layout (96 = 82 core + 14 outriggers).
 N_CORE_DEFAULT: int = 82
+
+#: Largest station number that is a CORE antenna in the canonical
+#: DSA-110 layout. Station ≤ this is core; station > this is an
+#: outrigger. Used by :func:`core_baseline_mask_from_station_numbers`.
+MAX_CORE_STATION_DEFAULT: int = 102
 
 
 def core_baseline_mask_from_antpos(
@@ -419,6 +428,59 @@ def core_baseline_mask_from_antpos(
     else:
         is_core_ant = (radii < float(r_core_m))
 
+    nbase = nants * (nants + 1) // 2
+    mask = np.zeros(nbase, dtype=bool)
+    k = 0
+    for a in range(nants):
+        for b in range(a + 1):
+            mask[k] = is_core_ant[a] and is_core_ant[b]
+            k += 1
+    return mask
+
+
+def core_baseline_mask_from_station_numbers(
+    antenna_order: list[int] | np.ndarray,
+    *,
+    max_core_station: int = MAX_CORE_STATION_DEFAULT,
+) -> np.ndarray:
+    """``(NBASE,) bool`` baseline mask: True iff both antennas are core.
+
+    Canonical DSA-110 core/outrigger discrimination by STATION NUMBER:
+    station ≤ ``max_core_station`` (default 102) is core; station >
+    is an outrigger. This is robust to cal-blob antpos ordering and
+    matches production etcd ``/cnf/corr_setup_96::is_core`` (plan §3
+    line 446).
+
+    F32 (M3 carryover): the radius-based heuristic
+    :func:`core_baseline_mask_from_antpos` cannot separate core from
+    outrigger reliably for DSA-110 because outrigger stations 103-115
+    have radii (~420-1100 m) that OVERLAP with legit core stations
+    99-102 (N ≈ 423-441 m). For example, station 103 (E=+198, N=−374,
+    r=423 m) and station 100 (E=+9, N=+424, r=424 m) have nearly
+    identical radii but station 100 is core, 103 is outrigger.
+    Station-number is the only unambiguous discriminator.
+
+    Parameters
+    ----------
+    antenna_order : list[int] or array-like (NANTS,)
+        Per-fada-slot DSA-110 station numbers, e.g. from the cal yaml's
+        ``cal_solutions.antenna_order``.
+    max_core_station : int
+        Largest station number that is core. Default
+        :data:`MAX_CORE_STATION_DEFAULT` = 102.
+
+    Returns
+    -------
+    np.ndarray (NBASE,) bool
+        True for baselines with BOTH endpoints in the core set.
+    """
+    antenna_order = np.asarray(antenna_order, dtype=np.int64)
+    if antenna_order.ndim != 1:
+        raise ValueError(
+            f"antenna_order must be 1-D; got shape {antenna_order.shape}"
+        )
+    nants = int(antenna_order.shape[0])
+    is_core_ant = (antenna_order <= int(max_core_station))
     nbase = nants * (nants + 1) // 2
     mask = np.zeros(nbase, dtype=bool)
     k = 0

@@ -337,7 +337,7 @@ contract plus the SparsityPattern fields plus truth metadata):
 | `n_grid, n_filled, kernel_support, dec_deg_quant` | scalars | SparsityPattern inputs |
 | `antpos_hash, chgroup_table_hash` | `uint64` | provenance |
 | `antpos_e, antpos_n` | `float32 (NANTS,)` | for M5-side pattern recompute |
-| `is_core_baseline_mask` | `bool (NBASE,)` | F27 radius-based core mask |
+| `is_core_baseline_mask` | `bool (NBASE,)` | F32 station-number core mask (`antenna_order[slot] <= 102`); F27 radius mask is the fallback for synthetic antpos only |
 | `chgroup, t_int_fast_native, t_int_fast_us, n_fv_total, n_blocks_processed` | scalars | cadence + processed-block count |
 | `cell_lambda, phi_lat_ovro_deg, obs_dec_deg` | scalars | grid scaling + F21 phase-centre dec |
 | `src_kind, src_name, src_ra_deg, src_dec_deg, src_mjd_trigger, src_dm_pc_cc, src_t2_snr` | scalars / strings | T2_*.json truth metadata |

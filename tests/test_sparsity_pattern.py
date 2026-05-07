@@ -56,12 +56,14 @@ from dsart.common.constants import (
 )
 from dsart.grid.sparsity_pattern import (
     CORE_RADIUS_M_DEFAULT,
+    MAX_CORE_STATION_DEFAULT,
     N_CORE_DEFAULT,
     SPEED_OF_LIGHT_M_PER_S,
     build_pattern,
     compute_antpos_hash,
     compute_chgroup_table_hash,
     core_baseline_mask_from_antpos,
+    core_baseline_mask_from_station_numbers,
     predict_pattern_id,
     quantise_dec_deg,
 )
@@ -840,3 +842,64 @@ class TestCoreBaselineMaskFromAntpos:
         # F27 canonical defaults — guard against accidental drift.
         assert N_CORE_DEFAULT == 82
         assert CORE_RADIUS_M_DEFAULT == 500.0
+
+
+# ---------------------------------------------------------------------------
+# core_baseline_mask_from_station_numbers (F32 — station-number core/outrigger
+# split; supersedes F27 radius mask for real DSA-110 antpos)
+# ---------------------------------------------------------------------------
+
+
+class TestCoreBaselineMaskFromStationNumbers:
+    def test_default_max_core_station_is_102(self) -> None:
+        assert MAX_CORE_STATION_DEFAULT == 102
+
+    def test_station_le_102_is_core(self) -> None:
+        antenna_order = [101, 102, 103]
+        mask = core_baseline_mask_from_station_numbers(antenna_order)
+        # 3 ants → NBASE=6: (0,0), (1,0), (1,1), (2,0), (2,1), (2,2)
+        # Core ants: slot 0 (st 101), slot 1 (st 102). Slot 2 (st 103) is outrigger.
+        expected = np.array([
+            True,                                                         # (0,0)
+            True,                                                         # (1,0)
+            True,                                                         # (1,1)
+            False,                                                        # (2,0)
+            False,                                                        # (2,1)
+            False,                                                        # (2,2)
+        ])
+        assert np.array_equal(mask, expected)
+
+    def test_dsa110_82_core_count(self) -> None:
+        """Synthetic DSA-110-style antenna_order: 82 stations ≤ 102 and 14
+        stations 103-116. Mask must select 82·83/2 = 3403 baselines."""
+        core_stations = list(range(1, 83))                                # 82 cores
+        outrigger_stations = list(range(103, 117))                        # 14 outriggers
+        antenna_order = core_stations + outrigger_stations
+        assert len(antenna_order) == 96
+        mask = core_baseline_mask_from_station_numbers(antenna_order)
+        assert int(mask.sum()) == 82 * 83 // 2 == 3403
+
+    def test_max_core_station_param_overrides_default(self) -> None:
+        antenna_order = [50, 100, 102, 110]
+        mask_102 = core_baseline_mask_from_station_numbers(antenna_order)
+        mask_101 = core_baseline_mask_from_station_numbers(
+            antenna_order, max_core_station=101)
+        # max=102: cores {50, 100, 102} → 3·4/2 = 6 core baselines
+        # max=101: cores {50, 100} → 2·3/2 = 3 core baselines
+        assert int(mask_102.sum()) == 6
+        assert int(mask_101.sum()) == 3
+
+    def test_outrigger_only_yields_zero_mask(self) -> None:
+        antenna_order = [103, 104, 105]
+        mask = core_baseline_mask_from_station_numbers(antenna_order)
+        assert not mask.any()
+
+    def test_all_core_yields_full_mask(self) -> None:
+        antenna_order = [1, 2, 3]
+        mask = core_baseline_mask_from_station_numbers(antenna_order)
+        assert mask.all()
+
+    def test_1d_required(self) -> None:
+        bad = np.array([[1, 2], [3, 4]])
+        with pytest.raises(ValueError, match="1-D"):
+            core_baseline_mask_from_station_numbers(bad)

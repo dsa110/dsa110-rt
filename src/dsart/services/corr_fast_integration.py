@@ -1050,6 +1050,8 @@ def build_context(
 
 def load_antpos_from_cal_blob(
     cal_path: Path,
+    *,
+    cal_yaml_path: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load antenna positions + the core-baseline mask from a cal blob.
 
@@ -1058,36 +1060,62 @@ def load_antpos_from_cal_blob(
     derived against, so reading both from the same blob guarantees
     the antpos hash on the SparsityPattern matches.
 
+    The CAL YAML (sibling of the .dat) carries ``antenna_order`` —
+    the per-fada-slot DSA-110 station numbers. F32 (M3 carryover)
+    requires station-number-based core/outrigger discrimination; if
+    the yaml is missing this loader falls back to the legacy
+    radius-based mask (which is unreliable for DSA-110 — see
+    :func:`dsart.grid.sparsity_pattern.core_baseline_mask_from_station_numbers`).
+
+    Parameters
+    ----------
+    cal_path : Path
+        Path to ``beamformer_weights_*.dat``.
+    cal_yaml_path : Path, optional
+        Path to the sibling cal yaml. If ``None``, looks for any
+        ``beamformer_weights_*.yaml`` in the same directory.
+
     Returns
     -------
     (antpos_e, antpos_n, is_core_baseline_mask) : tuple
         - antpos_e, antpos_n : (NANTS,) float32 arrays
         - is_core_baseline_mask : (NBASE,) bool — True for cross-
-          baselines where both antennas are in the 82-ant core, False
-          for outriggers or autos. The mask is built by selecting the
-          ``N_CORE_DEFAULT = 82`` smallest-radius antennas (per F27 in
-          ``M3_PLAN_FIXES.md``); production reads ``is_core`` from
-          etcd ``/cnf/corr_setup_96`` (plan §3 line 446) — this is the
-          bench/test fallback when antpos comes from a cal-blob. The
-          radius-based discrimination matters because the cal-blob
-          antpos is **not** sorted by radius (e.g. ant index 48 is an
-          outrigger at r ≈ 1008 m).
+          baselines where both antennas have station ≤ 102 (the
+          canonical core). False for autos or any baseline involving
+          a station 103-116 outrigger.
     """
     from dsart.cal.bf_weights import load_bf_weights
     from dsart.grid.sparsity_pattern import (
-        N_CORE_DEFAULT, core_baseline_mask_from_antpos,
+        N_CORE_DEFAULT,
+        core_baseline_mask_from_antpos,
+        core_baseline_mask_from_station_numbers,
     )
 
     bf = load_bf_weights(cal_path)
     antpos_e = np.asarray(bf.antpos_e, dtype=np.float32)
     antpos_n = np.asarray(bf.antpos_n, dtype=np.float32)
-    return (
-        antpos_e,
-        antpos_n,
-        core_baseline_mask_from_antpos(
+
+    cal_path = Path(cal_path)
+    yaml_path = cal_yaml_path
+    if yaml_path is None:
+        candidates = sorted(cal_path.parent.glob("beamformer_weights_*.yaml"))
+        if candidates:
+            yaml_path = candidates[0]
+
+    if yaml_path is not None and yaml_path.is_file():
+        import yaml as _yaml
+        with open(yaml_path, "r") as f:
+            ydoc = _yaml.safe_load(f)
+        antenna_order = ydoc["cal_solutions"]["antenna_order"]
+        mask = core_baseline_mask_from_station_numbers(antenna_order)
+    else:
+        # Legacy fallback (radius-based; F32 notes this is unreliable
+        # for DSA-110 — outriggers 103-115 overlap in radius with core
+        # 99-102). Kept here only for tests that don't have a yaml.
+        mask = core_baseline_mask_from_antpos(
             antpos_e, antpos_n, n_core=N_CORE_DEFAULT,
-        ),
-    )
+        )
+    return (antpos_e, antpos_n, mask)
 
 
 def _build_core_baseline_mask(
