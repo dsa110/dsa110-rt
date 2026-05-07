@@ -103,6 +103,33 @@ synthetic blocks** (e.g. 16 packets → 4 fast-vis tiles at t_int=8)
 that fit comfortably in 100s of MB. The full-block production budget
 is enforced by the chunk 3a / chunk 4 integration, not by this kernel.
 
+F31a — chunking the n_fast_vis axis
+-----------------------------------
+
+Independent of the cfp32 output-tensor budget above, the kernel's
+fp16 ``V_real`` / ``V_imag`` GEMM intermediate has shape
+``(n_fast_vis * NCHAN * NTIMES_PER_PACKET * NPOL, NANTS, NANTS)``.
+At the production cadence (``t_int_fast_native=8`` ⇒ ``n_fast_vis=512``,
+``NCHAN=384``, ``NTIMES_PER_PACKET=2``, ``NPOL=2``, ``NANTS=96``)
+that's ``512 * 384 * 2 * 2 * 96² * 2 bytes ≈ 14.5 GB`` per buffer —
+which doesn't fit on the **11 GB 2080Ti** production GPU (the
+deployment target is the 2080Ti, NOT an A6000; confirmed 2026-05).
+
+F31a tames this by chunking the leading ``n_fast_vis`` axis inside
+:meth:`FastCorrKernel.compute_split` so each per-slab ``V_real`` /
+``V_imag`` intermediate stays under :data:`_F31A_CHUNK_TARGET_BYTES`
+(= 1 GB target peak by default). With that target the auto-pick
+yields ``n_fv_chunk = 32`` at production → 16 slabs of ~865 MB each,
+leaving headroom for input voltages, the upper-tri output, and any
+gridder workspace that runs alongside.
+
+Chunking is **bit-identical** to the un-chunked path: each slab feeds
+the same fp16 matmul kernels with the exact same per-batch-element
+inputs as a monolithic call would, and the slab outputs are
+``torch.cat``'d on the leading ``n_fast_vis`` axis without any extra
+arithmetic. Callers can pass ``n_fv_chunk=`` explicitly to override
+the auto-pick (e.g. for benchmarking).
+
 References
 ==========
 
@@ -151,6 +178,24 @@ __all__ = [
 #: + the M3 burst sub-DoD use the 4× override (32 native samples,
 #: 1048.576 µs) per user clarification 2026-05-05.
 DEFAULT_T_INT_FAST_NATIVE: Final[int] = T_INT_FAST_NATIVE  # = 8
+
+
+#: F31a auto-chunk target peak (in bytes) for the per-slab fp16 V_real /
+#: V_imag matmul intermediate inside :meth:`FastCorrKernel.compute_split`.
+#: When ``n_fv_chunk`` is left as ``None`` (default), compute_split picks
+#: the largest power of two ``n_fv_chunk`` such that
+#:
+#:     ``n_fv_chunk * nchan * NTIMES_PER_PACKET * nvolt_pol * nants² * 2``
+#:
+#: bytes ≤ this target. At production
+#: (``nchan=384, NTIMES_PER_PACKET=2, nvolt_pol=2, nants=96``) the
+#: per-fast-vis fp16 footprint is ~27 MB, so the auto-pick lands at
+#: ``n_fv_chunk = 32`` → 16 slabs of ~865 MB each. Sized to leave
+#: comfortable headroom on the 11 GB 2080Ti production GPU.
+#: This is a *target peak*, not a hard ceiling; callers can override
+#: by passing ``n_fv_chunk=`` explicitly. See the module-level
+#: "Memory budget — F31a" docstring section for the full rationale.
+_F31A_CHUNK_TARGET_BYTES: Final[int] = 1 << 30                # 1 GiB
 
 
 def validate_fast_voltage_shape(
@@ -319,6 +364,8 @@ class FastCorrKernel:
         self,
         real_v: torch.Tensor,
         imag_v: torch.Tensor,
+        *,
+        n_fv_chunk: int | None = None,
     ) -> torch.Tensor:
         """Correlate one block, emitting ``n_fast_vis`` independent tiles.
 
@@ -331,6 +378,22 @@ class FastCorrKernel:
             ``packets_per_fast_vis = t_int_fast_native / NTIMES_PER_PACKET``.
             For full-block production, ``n_packets_in = NPACKETS_PER_BLOCK
             = 2048``; tests may pass smaller values.
+        n_fv_chunk : int | None, keyword-only, default ``None``
+            **F31a — chunking the n_fast_vis axis.** Per-slab fast-vis
+            count for the inner fp16 matmul. ``None`` (default)
+            auto-picks the largest power of two such that the per-slab
+            fp16 ``V_real`` / ``V_imag`` intermediate stays under
+            :data:`_F31A_CHUNK_TARGET_BYTES` (= 1 GB target peak),
+            capped at the total ``n_fast_vis`` for this call. At
+            production cadence (``n_fast_vis=512``) the auto-pick is
+            32 → 16 slabs of ~865 MB each, keeping the kernel inside
+            the 11 GB 2080Ti budget. Pass an explicit positive integer
+            in ``[1, n_fast_vis_total]`` to override (e.g. for
+            benchmarking). The chunked path is **bit-identical** to
+            ``n_fv_chunk = n_fast_vis_total`` (same per-batch fp16
+            matmul inputs, same upper-tri gather, ``torch.cat`` on
+            the leading axis introduces no arithmetic). See the
+            module-level "Memory budget — F31a" section for context.
 
         Returns
         -------
@@ -363,19 +426,109 @@ class FastCorrKernel:
         n_packets_in = real_v.shape[3]
         assert n_packets_in == n_fast_vis * packets_per_fast_vis  # validate guarantee
 
-        # ---- Stage 1: reshape n_packets_in into (n_fast_vis, ppfv) ----
-        # Layout: (NCHAN, 2t, 2p, n_fast_vis, ppfv, NANTS) — pure view.
-        R5 = real_v.view(
-            self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
-            n_fast_vis, packets_per_fast_vis, self.nants,
+        # ---- F31a: pick / validate the per-slab n_fv_chunk ----
+        if n_fv_chunk is None:
+            n_fv_chunk = self._auto_n_fv_chunk(n_fast_vis)
+        elif not (1 <= n_fv_chunk <= n_fast_vis):
+            raise ValueError(
+                f"n_fv_chunk={n_fv_chunk} must be in "
+                f"[1, n_fv_total={n_fast_vis}]"
+            )
+
+        # ---- F31a: slice n_packets_in into n_fv_chunk slabs ----
+        # Each slab covers exactly `n_fv_slab` consecutive fast-vis
+        # tiles, i.e. `n_fv_slab * packets_per_fast_vis` packets.
+        # `.contiguous()` is required because the slab is sliced on
+        # the n_packets_in axis (not the trailing axis), and
+        # _compute_one_slab calls `.view()` to reshape it; PyTorch
+        # rejects `.view()` on a non-contiguous tensor.
+        out_chunks: list[torch.Tensor] = []
+        for fv0 in range(0, n_fast_vis, n_fv_chunk):
+            fv1 = min(fv0 + n_fv_chunk, n_fast_vis)
+            n_fv_slab = fv1 - fv0
+            p0 = fv0 * packets_per_fast_vis
+            p1 = fv1 * packets_per_fast_vis
+            real_slab = real_v[:, :, :, p0:p1, :].contiguous()
+            imag_slab = imag_v[:, :, :, p0:p1, :].contiguous()
+            vis_slab = self._compute_one_slab(
+                real_slab, imag_slab,
+                n_fv_slab=n_fv_slab,
+                packets_per_fast_vis=packets_per_fast_vis,
+            )
+            out_chunks.append(vis_slab)
+            # Drop slab refs eagerly so PyTorch's allocator can reuse
+            # the workspace for the next slab. Critical on the 2080Ti;
+            # harmless on CPU.
+            del real_slab, imag_slab, vis_slab
+
+        return torch.cat(out_chunks, dim=0)
+
+    def _auto_n_fv_chunk(self, n_fv_total: int) -> int:
+        """Pick the largest power-of-two ``n_fv_chunk`` keeping the per-slab
+        fp16 ``V_real`` / ``V_imag`` intermediate under
+        :data:`_F31A_CHUNK_TARGET_BYTES`.
+
+        Per-slab fp16 footprint per buffer (one of V_real, V_imag):
+        ``n_fv_chunk * nchan * NTIMES_PER_PACKET * nvolt_pol *
+        nants² * 2 bytes``.
+        """
+        bytes_per_fv = (
+            self.nchan
+            * NTIMES_PER_PACKET
+            * self.nvolt_pol
+            * self.nants * self.nants
+            * 2                                                  # fp16 = 2 B
         )
-        I5 = imag_v.view(
+        # Largest fast-vis count whose fp16 V_real fits in the target.
+        # `max(..., 1)` guards the (highly hypothetical) case of a
+        # per-fast-vis footprint already over the target, which would
+        # otherwise yield a chunk size of 0 and an infinite loop above.
+        max_fv = max(_F31A_CHUNK_TARGET_BYTES // bytes_per_fv, 1)
+        # Round down to a power of two. Power-of-two slabs guarantee
+        # n_fast_vis % n_fv_chunk == 0 for all n_fast_vis values that
+        # come out of the realistic t_int_fast_native ladder (which is
+        # itself a power of two), so the trailing slab is never a
+        # ragged remainder at production scales.
+        chunk = 1 << (max_fv.bit_length() - 1)
+        return min(chunk, n_fv_total)
+
+    def _compute_one_slab(
+        self,
+        real_v_slab: torch.Tensor,
+        imag_v_slab: torch.Tensor,
+        *,
+        n_fv_slab: int,
+        packets_per_fast_vis: int,
+    ) -> torch.Tensor:
+        """Compute fast-vis output for one F31a slab of ``n_fv_slab`` tiles.
+
+        Inputs are sliced + contiguous voltage tensors of shape
+        ``(nchan, NTIMES_PER_PACKET, nvolt_pol,
+        n_fv_slab * packets_per_fast_vis, nants)`` (i.e. a
+        ``[:, :, :, p0:p1, :].contiguous()`` view of the full block
+        voltages). Returns a slab of fast visibilities of shape
+        ``(n_fv_slab, NBASE, NCHAN, BADA_NPOL)`` cfp32.
+
+        This is the per-slab body of the un-chunked kernel; chunking
+        on the leading n_fast_vis axis is purely a memory-budget
+        transform (each slab feeds the same per-batch fp16 matmul
+        inputs as a monolithic call would), so concatenating slab
+        outputs reproduces the un-chunked result bit-identically on
+        deterministic backends.
+        """
+        # ---- Stage 1: reshape n_packets_in into (n_fv_slab, ppfv) ----
+        # Layout: (NCHAN, 2t, 2p, n_fv_slab, ppfv, NANTS) — pure view.
+        R5 = real_v_slab.view(
             self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
-            n_fast_vis, packets_per_fast_vis, self.nants,
+            n_fv_slab, packets_per_fast_vis, self.nants,
+        )
+        I5 = imag_v_slab.view(
+            self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
+            n_fv_slab, packets_per_fast_vis, self.nants,
         )
 
-        # ---- Stage 2: move n_fast_vis to leading dim ----
-        # New layout: (n_fast_vis, NCHAN, 2t, 2p, ppfv, NANTS).
+        # ---- Stage 2: move n_fv_slab to leading dim ----
+        # New layout: (n_fv_slab, NCHAN, 2t, 2p, ppfv, NANTS).
         # `permute` returns a non-contiguous view; `.contiguous()`
         # materialises it once so downstream `.reshape` calls don't
         # incur per-call layout copies.
@@ -384,8 +537,8 @@ class FastCorrKernel:
         del R5, I5
 
         # ---- Stage 3: flatten leading dims into batched matmul ----
-        # (n_fast_vis * NCHAN * 2t * 2p, ppfv, NANTS).
-        new_batch = n_fast_vis * self.nchan * NTIMES_PER_PACKET * self.nvolt_pol
+        # (n_fv_slab * NCHAN * 2t * 2p, ppfv, NANTS).
+        new_batch = n_fv_slab * self.nchan * NTIMES_PER_PACKET * self.nvolt_pol
         R = R6.reshape(new_batch, packets_per_fast_vis, self.nants)  # fp16 view
         I = I6.reshape(new_batch, packets_per_fast_vis, self.nants)
         del R6, I6
@@ -403,16 +556,16 @@ class FastCorrKernel:
         del R, I, R_T, I_T
 
         # ---- Stage 5: sum over t_sub (axis 2 in the 6D view), cast to fp32 ----
-        # batch dim = n_fast_vis * NCHAN * 2t * 2p. Reshape and sum the 2t axis.
+        # batch dim = n_fv_slab * NCHAN * 2t * 2p. Reshape and sum the 2t axis.
         V_real_6d = V_real.view(
-            n_fast_vis, self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
+            n_fv_slab, self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
             self.nants, self.nants,
         )
         V_imag_6d = V_imag.view(
-            n_fast_vis, self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
+            n_fv_slab, self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
             self.nants, self.nants,
         )
-        # Sum over t_sub → (n_fast_vis, NCHAN, nvolt_pol, NANTS, NANTS).
+        # Sum over t_sub → (n_fv_slab, NCHAN, nvolt_pol, NANTS, NANTS).
         V_real = V_real_6d.sum(dim=2).to(self.accum_dtype)
         V_imag = V_imag_6d.sum(dim=2).to(self.accum_dtype)
         del V_real_6d, V_imag_6d
