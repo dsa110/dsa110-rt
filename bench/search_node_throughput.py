@@ -280,13 +280,38 @@ async def _bench_main(args: argparse.Namespace) -> int:
         dtype=detector_dtype,
         device=torch.device(device),
     )
+    image_backend = str(args.image_backend)
+    if image_backend == "gpu":
+        if not device.startswith("cuda"):
+            raise SystemExit(
+                f"--image-backend gpu requires --device cuda*, got "
+                f"--device {device!r}"
+            )
+        if cube_dtype != torch.float16:
+            raise SystemExit(
+                "--image-backend gpu currently pins cube_dtype=fp16 "
+                "(GpuImager runs cuFFT-cfp16). Use --cube-dtype fp16."
+            )
+        gpu_complex_dtype = torch.complex32
+    else:
+        gpu_complex_dtype = torch.complex64
+
+    pipeline_cfg = CubePipelineConfig(
+        n_grid=n_grid,
+        edge_mask_kernel_support=5,
+        cube_dtype=cube_dtype,
+        device=device,
+        image_backend=image_backend,
+        gpu_t_det=t_det if image_backend == "gpu" else None,
+        gpu_n_fdm=n_fdm if image_backend == "gpu" else None,
+        gpu_complex_dtype=gpu_complex_dtype,
+    )
+    _LOG.info(
+        "image_backend=%s gpu_complex_dtype=%s",
+        image_backend, gpu_complex_dtype,
+    )
     pipeline = CubePipeline(
-        config=CubePipelineConfig(
-            n_grid=n_grid,
-            edge_mask_kernel_support=5,
-            cube_dtype=cube_dtype,
-            device=device,
-        ),
+        config=pipeline_cfg,
         detector=detector,
         layer1_state=Layer1State(n_fdm=n_fdm, n_burnin_cubes=5),
     )
@@ -496,6 +521,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "bench can run at production geometry "
              "(T_det=512, N_fdm=32, N_grid=256) on a 2080 Ti. "
              "Chunk 6c follow-up.",
+    )
+    parser.add_argument(
+        "--image-backend", type=str, default="cpu", choices=("cpu", "gpu"),
+        help="CubePipeline image backend. 'cpu' (default) uses the "
+             "chunk-6a numpy reference (combine_chgroups + "
+             "dirty_image_from_uv_grid). 'gpu' uses the chunk-8 production "
+             "GpuImager (host-side cf->cint8 quantise + fused dequant+combine "
+             "CUDA kernel + cuFFT-cfp16 ifft2 + edge mask). 'gpu' requires "
+             "--device cuda* and --cube-dtype fp16 (production pin).",
     )
     parser.add_argument(
         "--out", type=str,
