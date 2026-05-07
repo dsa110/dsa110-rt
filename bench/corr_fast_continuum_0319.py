@@ -74,7 +74,6 @@ from dsart.services.corr_fast_kernel import NTIMES_PER_PACKET
 from bench._corr_fast_replay import (
     ReplayDefaults,
     accumulate_chgroup_grids,
-    compute_chgroup_cell_lambda,
     dirty_image_from_dense_grid,
     lm_to_pixel,
     replay_chgroup,
@@ -200,6 +199,7 @@ def _process_one_sb(
     device: torch.device,
     per_chgroup_dir: Path,
     expected_lm_rad: tuple[float, float],
+    draw_peak_marker: bool = False,
 ) -> ChgroupResult:
     """Replay one sb's voltages and produce a per-chgroup dirty image + peak."""
     chgroup = int(sb)
@@ -229,12 +229,10 @@ def _process_one_sb(
     img = dirty_image_from_dense_grid(dense)[0]                      # (N, N) float32
     img_np = img.cpu().numpy()
 
-    from dsart.services.corr_fast_integration import load_antpos_from_cal_blob
-    ap_e, ap_n, core_mask = load_antpos_from_cal_blob(cal_path)
-    cell_lambda = compute_chgroup_cell_lambda(
-        ap_e, ap_n, chgroup=chgroup, n_grid=cfg.n_grid,
-        is_core_baseline_mask=core_mask,
-    )
+    # F28: read the resolved cell_lambda directly off the pattern
+    # (matches whatever cell scale build_pattern actually used —
+    # F28 common from top-of-band, or legacy per-chgroup auto-fit).
+    cell_lambda = float(ctx.gridder.pattern.cell_lambda)
 
     # Predicted (l, m) → pixel
     half = cfg.n_grid // 2
@@ -269,10 +267,10 @@ def _process_one_sb(
     _save_image_png(
         img_np,
         title=f"chgroup={chgroup} (sb{sb}); n_blocks={n_blocks}; "
-              f"peak_offset={peak_offset} cells",
+              f"peak_offset={peak_offset} cells; K={cfg.kernel_support}",
         out_path=image_path,
         expected_lm_pixel=(int(pred_row), int(pred_col)),
-        peak_lm_pixel=(peak_row, peak_col),
+        peak_lm_pixel=(peak_row, peak_col) if draw_peak_marker else None,
         cell_lambda=cell_lambda,
     )
 
@@ -382,6 +380,25 @@ def main(argv: list[str] | None = None) -> int:
                         "per block (continuum).")
     p.add_argument("--n-grid", type=int, default=256,
                    help="image-plane grid side length")
+    p.add_argument("--kernel-support", type=int, default=1,
+                   choices=(1, 3, 5),
+                   help="G7: gridding kernel support cells. K=1 "
+                        "(default; legacy pillbox / nearest cell), "
+                        "K=3 / K=5 = Gaussian-tapered K^2 grid taps "
+                        "per (bls, ch) for anti-aliasing.")
+    p.add_argument("--cell-lambda-mode", default="common",
+                   choices=("common", "per_chgroup"),
+                   help="F28: per-cell (u, v) λ-extent across chgroups. "
+                        "'common' (default; F28): shared cell scale "
+                        "from top-of-band so a fixed (l, m) source "
+                        "lands at the same pixel in every chgroup. "
+                        "'per_chgroup' (legacy): each chgroup auto-fits "
+                        "its own cell scale.")
+    p.add_argument("--draw-peak-marker", action="store_true",
+                   help="Overlay a yellow '+' on the measured peak in "
+                        "the dirty-image PNGs. Off by default so the "
+                        "peak pixel itself is visible; the predicted-"
+                        "source 'rx' marker is always drawn.")
     p.add_argument("--report-dir", type=Path, required=True,
                    help="output dir for HTML + PNGs + summary.json")
     p.add_argument("--device", default="auto",
@@ -486,7 +503,8 @@ def main(argv: list[str] | None = None) -> int:
             chgroup=int(sb),
             obs_dec_deg=src["dec_deg"],
             n_grid=n_grid,
-            kernel_support=1,
+            kernel_support=args.kernel_support,                      # G7
+            cell_lambda_mode=args.cell_lambda_mode,                  # F28
             t_int_fast_native=args.t_int_fast_native,
             cal_mode=args.cal_mode,
             cal_pol_swap=args.cal_pol_swap,
@@ -498,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
             result, img_np = _process_one_sb(
                 sb=sb, voltage_path=voltage_path, cal_path=cal_path,
                 cfg_template=cfg_template, src=src,
+                draw_peak_marker=bool(args.draw_peak_marker),
                 n_blocks=args.n_blocks, device=device,
                 per_chgroup_dir=per_chgroup_dir,
                 expected_lm_rad=(expected_l, expected_m),
@@ -548,10 +567,14 @@ def main(argv: list[str] | None = None) -> int:
     _save_image_png(
         combined_image,
         title=f"0319+415 — 16-chgroup-summed dirty image\n"
-              f"n_blocks={args.n_blocks}/chgroup; peak_offset={combined_offset} cells",
+              f"n_blocks={args.n_blocks}/chgroup; "
+              f"peak_offset={combined_offset} cells; K={args.kernel_support}",
         out_path=combined_image_path,
         expected_lm_pixel=(int(pred_row), int(pred_col)),
-        peak_lm_pixel=(int(peak_row_combined), int(peak_col_combined)),
+        peak_lm_pixel=(
+            (int(peak_row_combined), int(peak_col_combined))
+            if args.draw_peak_marker else None
+        ),
         cell_lambda=float(chg0_cell_lambda),
     )
 
@@ -588,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
         "n_chgroups_skipped": len(sbs) - len(chgroup_results),
         "per_chgroup": [asdict(r) for r in chgroup_results],
         "peak_offset_pass_gate_cells": args.peak_offset_pass_cells,
+        "kernel_support": int(args.kernel_support),
+        "cell_lambda_mode": args.cell_lambda_mode,
     }
     summary_path = args.report_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
