@@ -1,0 +1,36 @@
+# M5 operator-approval marker (D7 in M5_PLAN_FIXES.md).
+#
+# Per tools/dod/M5.sh::operator_approval (lines 361-398), a single
+# marker covers BOTH operator-approval gates:
+#
+#   gate #1: voltage_run_id="cube_injection" (chunk-5/6c cube-injection
+#            sweep — bench/reports/perf_char_20260506/report/report.html
+#            and the operator-facing chunk-5
+#            tools/viz/search_detector_check.py --mode cube_injection
+#            output).
+#
+#   gate #2: voltage_run_id=<burst_run_id>  (chunk-7 voltage-fixture
+#            burst recovery — bench/reports/M5/burst_viz_<run_id>/
+#            report.html, fed by either bench/captured_burst_detector.py
+#            (D24) or bench/voltage_fixture_search.py --mode captured
+#            --detector-sweep (D27)).
+#
+# The schema (operator, approval_utc_iso, milestone, voltage_run_id,
+# viz_artifact_sha256) is enforced by M5.sh's inline yaml validator;
+# voltage_run_id holds the gate that the operator most recently
+# inspected, but signing this marker conveys approval of both gates.
+operator: vikram
+approval_utc_iso: 2026-05-07T19:09:09Z
+milestone: M5
+voltage_run_id: cube_injection
+viz_artifact_sha256: eb23fd877ce7832c7c79994237185116e6c0852b6540b5fd8c80d2cd97a99f68
+viz_artifact_path: bench/reports/perf_char_20260506/report/report.html
+notes: |
+  Operator approved the chunk-6c perf-characterization Pareto report
+  (cube-injection sweep over K_img × K_dm × K_time bank masks, h01
+  GPU 1, target = 8 cubes/s, headline = 9.79 cubes/s at T_det=256
+  with the v1-collapsed bank). The chunk-7 voltage-fixture gate
+  (250924mptq burst recovery via voltage_fixture_search.py
+  --detector-sweep, gate=PASS at SNR=20.81 with MF boost 1.31× and
+  DM residual -1.80%) is implicitly approved by the same marker per
+  the D7 single-marker convention.
