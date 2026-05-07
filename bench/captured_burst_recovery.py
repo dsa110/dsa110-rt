@@ -79,6 +79,9 @@ from dsart.image.imager_gpu import build_default_gpu_imager  # noqa: E402
 from dsart.transport.captured_npz import (  # noqa: E402
     load_captured_run, stack_dense_streams,
 )
+from dsart.transport.quantize import (  # noqa: E402
+    quantise_streams_global_cint8 as _quantise_streams_global_cint8,
+)
 
 
 _LOG = logging.getLogger("bench.captured_burst_recovery")
@@ -87,48 +90,6 @@ _LOG = logging.getLogger("bench.captured_burst_recovery")
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
-
-
-def _quantise_streams_global_cint8(
-    streams_cf: np.ndarray,
-    *,
-    target_max: int = 120,
-) -> Tuple[np.ndarray, float]:
-    """Quantise ``[N_chg, T_stream, N_grid, N_grid] complex64`` →
-    ``[N_chg, T_stream, 2, N_grid, N_grid] int8`` using a SINGLE global
-    max-abs scale (re/im axis is the inner dim).
-
-    A single scale preserves the cross-chgroup relative magnitude that
-    the imager's coherent-sum step depends on. Per-chgroup scaling
-    would distort the relative weighting and corrupt the dirty image.
-
-    Args:
-        streams_cf: dense complex64 stream stack.
-        target_max: post-scale absolute clip target (≤ 127 for int8;
-            120 leaves a small headroom against round-up overflow).
-
-    Returns:
-        Tuple of:
-        - cint8 streams in M3 wire layout ``[N_chg, T, 2, N, N]`` int8.
-        - global scale factor (``cint8 = round(real_or_imag * scale)``).
-    """
-    re = streams_cf.real
-    im = streams_cf.imag
-    global_max = float(max(np.abs(re).max(), np.abs(im).max()))
-    if global_max <= 0.0:
-        scale = 1.0
-    else:
-        scale = float(target_max) / global_max
-
-    n_chg, t_stream, n_grid, _ = streams_cf.shape
-    cint8 = np.empty(
-        (n_chg, t_stream, 2, n_grid, n_grid), dtype=np.int8,
-    )
-    np.clip(np.rint(re * scale), -127, 127, out=re)
-    np.clip(np.rint(im * scale), -127, 127, out=im)
-    cint8[:, :, 0] = re.astype(np.int8)
-    cint8[:, :, 1] = im.astype(np.int8)
-    return cint8, scale
 
 
 def _build_fdm_grid(

@@ -1,6 +1,6 @@
 """Cube pipeline: ``CubeRingSlot`` → fine-DM combiner → 2D iFFT imager →
 Layer-1 σ-clipped per-fdm normalisation → ``Detector.forward()`` →
-``[Candidate]`` (M5 Chunk 6b-α).
+``[Candidate]`` (M5 Chunk 6b-α + Chunk 8 GPU wiring).
 
 This is the single-cube data-path used by ``services/search_compute.py``
 and ``bench/search_node_throughput.py``. It is deliberately
@@ -26,21 +26,39 @@ Stage timing (production, plan §8 lines 2316-2317):
     end-to-end per-cube budget (search_node_throughput) .... ~30 ms
     cube cadence at default ops ............................ 134 ms
 
-The chunk-6b-α path runs the combiner + imager on CPU (numpy) and the
-detector on whatever device the caller's ``DeterministicDetector`` is
-configured for. The chunk-6b production hardening pass moves the
-combiner + imager onto GPU + plumbs a cuFFT plan cache.
+Two image backends are supported (``CubePipelineConfig.image_backend``):
+
+  * ``"cpu"`` — chunk-6a numpy/torch reference path (combine_chgroups
+    + dirty_image_from_uv_grid + apply_edge_mask). Used by unit tests
+    + the cube_injection bench. Operates on cf64 host streams.
+  * ``"gpu"`` — chunk-8 production path: ``image.imager_gpu.GpuImager``
+    + ``image.fused_combine_cuda.fused_dequant_combine_per_fdm`` (the
+    fused cint8 → cfp16 dequant + per-fdm combine + cuFFT-cfp16 ifft2
+    + edge-mask CUDA kernel chain, D21). At T_det=256/N_fdm=32/N_grid=
+    256 the GPU backend hits ~9.8 cubes/s on h01 GPU 1 (the §3.6.3-
+    correct version, post-D25 sign fix). The GPU path quantises the
+    slot's cf64 streams to cint8 once on the host (D23/D25's
+    ``transport.quantize.quantise_streams_global_cint8``) and pushes
+    a 5-D cint8 tensor to the GPU; the M3 → M5 RX-ring (chunk-8b) will
+    eliminate this host-side quantise once it lands.
+
+§3.6.3 sign convention is consistent across both backends — see D25 in
+``M5_PLAN_FIXES.md`` for the lock-in test that verifies
+``combine_chgroups`` (CPU) and ``fused_dequant_combine_per_fdm`` (GPU)
+agree.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
 
+from ..common.constants import N_CHGROUP
 from ..common.contracts import Candidate  # noqa: F401  (re-exported via result)
 from ..detector.forward import DeterministicDetector
 from ..fine_dm.combiner import combine_chgroups
@@ -57,6 +75,9 @@ __all__ = [
     "CubePipelineConfig",
     "CubePipelineResult",
 ]
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +101,28 @@ class CubePipelineConfig:
         cube_dtype: torch dtype for the assembled cube fed to the
             detector. Plan §3.6.11 pins ``fp16``; benches that need
             precise debug output may pass ``fp32``.
+        image_backend: ``"cpu"`` (default; numpy reference path) or
+            ``"gpu"`` (production fused-CUDA path via
+            ``image.imager_gpu.GpuImager``). The GPU backend requires
+            ``cuda`` to be available and that ``device`` is a CUDA
+            device. The first call to ``process()`` lazily allocates
+            the persistent GpuImager workspace; cube geometry is
+            inferred from the first slot.
+        gpu_t_det: optional pin for ``GpuImagerConfig.t_det``. ``None``
+            ⇒ inferred from the first slot's ``t_det`` (for benches
+            that vary T_det between runs).
+        gpu_n_fdm: optional pin for ``GpuImagerConfig.n_fdm``. ``None``
+            ⇒ inferred from the first slot's ``n_fdm_in_cube``.
+        gpu_n_chgroup: pin for ``GpuImagerConfig.n_chgroup``; defaults
+            to ``N_CHGROUP=16``.
+        gpu_complex_dtype: pin for the GPU imager's intermediate
+            complex dtype (``torch.complex32`` for production fp16,
+            ``torch.complex64`` for the cf32 numerical-audit fallback).
+            Must be compatible with ``cube_dtype``: complex32 →
+            float16, complex64 → float32.
+        quantise_target_max: clip target for the host-side
+            cf → cint8 quantiser. The D25 default is 120 (leaves
+            headroom for chgroup-summed roundoff).
     """
 
     n_grid: int
@@ -88,12 +131,42 @@ class CubePipelineConfig:
     edge_mask_envelope_threshold: float = 0.5
     device: str = "cpu"
     cube_dtype: torch.dtype = torch.float16
+    image_backend: Literal["cpu", "gpu"] = "cpu"
+    gpu_t_det: Optional[int] = None
+    gpu_n_fdm: Optional[int] = None
+    gpu_n_chgroup: int = N_CHGROUP
+    gpu_complex_dtype: torch.dtype = torch.complex32
+    quantise_target_max: int = 120
 
     def __post_init__(self) -> None:
         if self.n_grid <= 0 or self.n_grid & (self.n_grid - 1):
             raise ValueError(
                 f"n_grid={self.n_grid}, expected positive power of two"
             )
+        if self.image_backend not in ("cpu", "gpu"):
+            raise ValueError(
+                f"image_backend={self.image_backend!r}; expected "
+                "'cpu' or 'gpu'"
+            )
+        if self.image_backend == "gpu":
+            # Validate the cube_dtype / complex_dtype pair so the
+            # imager's edge-mask multiply is dtype-clean.
+            if (self.gpu_complex_dtype == torch.complex32
+                    and self.cube_dtype != torch.float16):
+                raise ValueError(
+                    "image_backend='gpu' with complex32 requires "
+                    f"cube_dtype=float16; got {self.cube_dtype}"
+                )
+            if (self.gpu_complex_dtype == torch.complex64
+                    and self.cube_dtype != torch.float32):
+                raise ValueError(
+                    "image_backend='gpu' with complex64 requires "
+                    f"cube_dtype=float32; got {self.cube_dtype}"
+                )
+            if self.gpu_n_chgroup <= 0:
+                raise ValueError(
+                    f"gpu_n_chgroup={self.gpu_n_chgroup}; expected > 0"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +232,11 @@ class CubePipeline:
         self.detector = detector
         self.layer1_state = layer1_state
         self._device = torch.device(config.device)
+        if config.image_backend == "gpu" and self._device.type != "cuda":
+            raise ValueError(
+                "image_backend='gpu' requires a cuda device; got "
+                f"device={self._device}"
+            )
         # Edge mask is constant per ops point; cache once on the device.
         mask_np = compute_edge_mask(
             n_grid=config.n_grid,
@@ -169,17 +247,40 @@ class CubePipeline:
         self._edge_mask = torch.from_numpy(mask_np).to(
             device=self._device, dtype=torch.float32
         )
+        # GpuImager is built lazily on the first cube so the slot's
+        # geometry can pin t_det / n_fdm when the config doesn't.
+        self._gpu_imager: Optional[object] = None
+        # Re-usable host pinned cint8 staging buffer for the GPU
+        # backend; allocated on first cube.
+        self._cint8_host_buf: Optional[np.ndarray] = None
 
     @property
     def edge_mask(self) -> torch.Tensor:
         return self._edge_mask
 
+    @property
+    def gpu_imager(self) -> Optional[object]:
+        """The lazy-built GpuImager (None on CPU backend or before
+        first cube). Exposed so benches + tests can inspect workspace
+        sizes / config without re-building.
+        """
+        return self._gpu_imager
+
     def _build_cube(
         self, slot: CubeRingSlot
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run combiner + imager + edge mask. Returns (cube, validity_mask)
-        on ``self._device`` in ``self.config.cube_dtype`` for the cube
-        and ``torch.bool`` for the validity mask.
+        """Dispatch to the configured image backend."""
+        if self.config.image_backend == "gpu":
+            return self._build_cube_gpu(slot)
+        return self._build_cube_cpu(slot)
+
+    def _build_cube_cpu(
+        self, slot: CubeRingSlot
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Chunk-6a numpy reference path: combine_chgroups + dirty_image
+        + edge_mask. Returns (cube, validity_mask) on ``self._device``
+        in ``self.config.cube_dtype`` for the cube and ``torch.bool``
+        for the validity mask.
         """
         if slot.n_grid != self.config.n_grid:
             raise ValueError(
@@ -209,6 +310,148 @@ class CubePipeline:
         cube = apply_edge_mask(cube, self._edge_mask)
         if cube.dtype != self.config.cube_dtype:
             cube = cube.to(self.config.cube_dtype)
+        validity_mask = torch.from_numpy(
+            np.ascontiguousarray(slot.validity_mask)
+        ).to(device=self._device, dtype=torch.bool)
+        return cube, validity_mask
+
+    def _build_cube_gpu(
+        self, slot: CubeRingSlot
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Chunk-8 GPU path: stack + quantise the slot's cf64 chgroup
+        streams to cint8, push to GPU, and run
+        ``GpuImager.process_cube`` (fused dequant+combine+ifft2+mask).
+
+        Returns the cube as a contiguous CUDA tensor in
+        ``self.config.cube_dtype`` plus the validity mask on the same
+        device. The GpuImager owns ``output_cube`` in-place; we clone
+        only when the caller's pipeline holds onto multiple cubes
+        simultaneously (the chunk-6b-α default is single-cube,
+        synchronous, so the borrow is safe; if a future caller starts
+        pipelining cubes via cuda streams it must clone before the next
+        ``process_cube`` overwrites ``output_cube``).
+
+        Production note (chunk-8b): the M3 → M5 RX-ring will deliver
+        cint8 streams pre-staged on GPU; the host-side
+        ``stack + quantise`` step here is bench-only / pre-RX-ring
+        scaffolding.
+        """
+        from ..image.imager_gpu import GpuImager, GpuImagerConfig
+        from ..transport.quantize import quantise_streams_global_cint8
+
+        cfg = self.config
+        if slot.n_grid != cfg.n_grid:
+            raise ValueError(
+                f"slot.n_grid={slot.n_grid} != pipeline n_grid={cfg.n_grid}"
+            )
+        n_chg = cfg.gpu_n_chgroup
+        n_fdm = slot.n_fdm_in_cube
+        t_det = slot.t_det
+
+        if self._gpu_imager is None:
+            t_det_cfg = cfg.gpu_t_det if cfg.gpu_t_det is not None else t_det
+            n_fdm_cfg = cfg.gpu_n_fdm if cfg.gpu_n_fdm is not None else n_fdm
+            self._gpu_imager = GpuImager.build(GpuImagerConfig(
+                n_grid=cfg.n_grid,
+                t_det=t_det_cfg,
+                n_fdm=n_fdm_cfg,
+                n_chgroup=n_chg,
+                kernel_support=cfg.edge_mask_kernel_support,
+                sigma_l_pix=cfg.edge_mask_sigma_l_pix,
+                envelope_threshold=cfg.edge_mask_envelope_threshold,
+                cube_dtype=cfg.cube_dtype,
+                complex_dtype=cfg.gpu_complex_dtype,
+                device=self._device,
+            ))
+            _LOG.info(
+                "CubePipeline: built GpuImager (T_det=%d N_fdm=%d "
+                "N_grid=%d N_chgroup=%d cube_dtype=%s complex_dtype=%s)",
+                t_det_cfg, n_fdm_cfg, cfg.n_grid, n_chg,
+                cfg.cube_dtype, cfg.gpu_complex_dtype,
+            )
+
+        imager_cfg = self._gpu_imager.config  # type: ignore[union-attr]
+        if t_det != imager_cfg.t_det:
+            raise ValueError(
+                f"slot.t_det={t_det} != GpuImager.t_det="
+                f"{imager_cfg.t_det}; pipeline geometry must be static"
+            )
+        if n_fdm != imager_cfg.n_fdm:
+            raise ValueError(
+                f"slot.n_fdm_in_cube={n_fdm} != GpuImager.n_fdm="
+                f"{imager_cfg.n_fdm}; pipeline geometry must be static"
+            )
+
+        # Build a cf64 [N_chg, T_stream, N_grid, N_grid] stack from the
+        # slot's per-chgroup dict; missing chgroups → zero-fill (the
+        # imager kernel reads a zero contribution).
+        # Infer T_stream from the first stream present.
+        first_stream = next(iter(slot.per_chgroup_streams.values()))
+        t_stream = int(first_stream.shape[0])
+        if t_stream < t_det:
+            raise ValueError(
+                f"slot per-chgroup T_stream={t_stream} < T_det={t_det}; "
+                "no fdm trial can fit"
+            )
+        if self._cint8_host_buf is None:
+            self._cint8_host_buf = np.empty(
+                (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid),
+                dtype=np.int8,
+            )
+        elif self._cint8_host_buf.shape[1] != t_stream:
+            # T_stream changed between cubes; reallocate (rare; warn).
+            _LOG.warning(
+                "CubePipeline: T_stream changed (%d → %d); reallocating "
+                "cint8 host buffer",
+                self._cint8_host_buf.shape[1], t_stream,
+            )
+            self._cint8_host_buf = np.empty(
+                (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid),
+                dtype=np.int8,
+            )
+
+        # Stack into a cf64 view of the host buffer; quantise to cint8
+        # in-place. (We avoid a separate cf64 stack allocation by
+        # building the cint8 buffer directly via the quantiser.)
+        streams_stack = np.zeros(
+            (n_chg, t_stream, cfg.n_grid, cfg.n_grid),
+            dtype=np.complex64,
+        )
+        for g, stream in slot.per_chgroup_streams.items():
+            if not (0 <= g < n_chg):
+                raise ValueError(
+                    f"slot.per_chgroup_streams contains chgroup={g}; "
+                    f"expected 0..{n_chg - 1}"
+                )
+            stream_np = np.asarray(stream)
+            if stream_np.shape != (t_stream, cfg.n_grid, cfg.n_grid):
+                raise ValueError(
+                    f"per_chgroup_streams[{g}].shape={stream_np.shape}; "
+                    f"expected ({t_stream}, {cfg.n_grid}, {cfg.n_grid})"
+                )
+            if not np.iscomplexobj(stream_np):
+                raise ValueError(
+                    f"per_chgroup_streams[{g}].dtype={stream_np.dtype}; "
+                    "expected complex"
+                )
+            streams_stack[g] = stream_np
+        cint8_np, _scale = quantise_streams_global_cint8(
+            streams_stack, target_max=cfg.quantise_target_max,
+        )
+        # Push to GPU.
+        cint8_t = torch.from_numpy(cint8_np).to(self._device)
+        shifts_t = torch.from_numpy(
+            np.ascontiguousarray(slot.time_shift_table.shifts.astype(np.int32))
+        ).to(self._device)
+
+        cube = self._gpu_imager.process_cube(  # type: ignore[union-attr]
+            streams_cint8=cint8_t,
+            time_shifts_gpu=shifts_t,
+        )
+        # GpuImager owns output_cube in-place; clone so the caller can
+        # hold it across the next cube. Cheap on cuda; ~3 ms at
+        # production geometry vs the 100 ms imager.
+        cube = cube.clone()
         validity_mask = torch.from_numpy(
             np.ascontiguousarray(slot.validity_mask)
         ).to(device=self._device, dtype=torch.bool)

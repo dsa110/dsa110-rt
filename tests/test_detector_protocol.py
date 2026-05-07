@@ -517,7 +517,13 @@ def test_no_forbidden_kdm_ktime_ops_in_convbank(module_relpath: str) -> None:
     are forbidden in the conv-bank files. The only allowed K_dm /
     K_time consumer is ``boxcar_via_cumsum``.
     """
-    src = _module_path(module_relpath).read_text()
+    # encoding="utf-8" is required: tests/test_fused_combine_cuda.py's
+    # cupy/NVRTC compile clobbers Python's default locale to ASCII for
+    # the rest of the process (see locale-clobber comment in
+    # src/dsart/image/fused_combine_cuda.py); without an explicit
+    # encoding, Path.read_text() falls back to ASCII and crashes on
+    # the UTF-8 §-bullets in this codebase.
+    src = _module_path(module_relpath).read_text(encoding="utf-8")
     calls = _gather_attr_calls(src)
     forbidden = sorted(
         {c for c in calls if c in _FORBIDDEN_KDM_KTIME_OPS_CONVBANK}
@@ -535,7 +541,8 @@ def test_no_forbidden_sum_ops_in_decoder() -> None:
     accidentally re-introduce the naive boxcar form along K_dm / K_time.
     See F9 in M5_PLAN_FIXES.md for the plan reconciliation.
     """
-    src = _module_path("src/dsart/detector/decoder.py").read_text()
+    # encoding="utf-8" — see comment above on the cupy NVRTC locale clobber.
+    src = _module_path("src/dsart/detector/decoder.py").read_text(encoding="utf-8")
     calls = _gather_attr_calls(src)
     forbidden = sorted(
         {c for c in calls if c in _FORBIDDEN_KDM_KTIME_OPS_DECODER}

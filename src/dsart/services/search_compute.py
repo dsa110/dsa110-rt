@@ -76,6 +76,14 @@ class SearchComputeConfig:
     The chunk-6b-α scope ships fields needed by the pipeline + emitter
     + Layer-1 state. Endpoint discovery (etcd watch) and dynamic
     reconfiguration are deferred to chunk-6b production hardening.
+
+    The chunk-8 production wiring uses the GPU image backend by
+    default — the pipeline's ``image_backend="gpu"`` config selects
+    the fused dequant + combine + cuFFT-cfp16 ifft2 + edge-mask
+    pipeline (D21 / D25). Benches that need the chunk-6a numpy CPU
+    reference path (e.g. cube_injection_detector) build their own
+    ``CubePipelineConfig(image_backend="cpu")`` and pass it directly
+    to ``CubePipeline``.
     """
 
     pipeline: CubePipelineConfig
@@ -145,13 +153,21 @@ class SearchComputeService:
 
     @staticmethod
     def _build_detector(config: SearchComputeConfig) -> DeterministicDetector:
+        # Pass ``device=`` to the constructor (NOT ``.to(device)`` after-
+        # the-fact) so the internal ``Layer2State._s_k`` is allocated
+        # directly on the target device. ``.to(device)`` reassigns the
+        # registered ``_sigma_k`` buffer but Layer2State retains a
+        # pointer to the original CPU tensor, so the EMA divisor would
+        # straddle devices on cuda. Passing ``device=`` at construction
+        # time keeps Layer2State + ``_sigma_k`` on the same device.
         return DeterministicDetector(
             threshold_sigma=config.detector_threshold_sigma,
             detector_version=config.detector_version,
             search_node_id=config.search_node_id,
             gpu_half=config.gpu_half,
             dtype=config.detector_dtype,
-        ).to(torch.device(config.detector_device))
+            device=torch.device(config.detector_device),
+        )
 
     @property
     def detector(self) -> DeterministicDetector:
