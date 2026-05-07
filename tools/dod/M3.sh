@@ -121,7 +121,9 @@ STEP="m3_substrate_files"
 # list grows as chunks land.
 declare -a M3_SUBSTRATE_FILES=(
   "PARALLEL_AGENTS.md"
-  "M3_PLAN_FIXES.md"
+  # M3_PLAN_FIXES.md retired per chunk-10 hardening (folded into
+  # plan §8.M3-carryover); status-emit rolls STAGE to 'complete
+  # (hardened)' when the file is absent (line ~469 below).
   "tools/dod/M3.sh"
   "tools/dod/M3_preflight.sh"
 )
