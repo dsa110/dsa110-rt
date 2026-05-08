@@ -153,6 +153,7 @@ import torch
 from dsart.common.constants import (
     BADA_NPOL,
     NANTS,
+    NBASE,
     NCHAN_PER_CHGROUP,
     NPOL,
     T_INT_FAST_NATIVE,
@@ -366,6 +367,8 @@ class FastCorrKernel:
         imag_v: torch.Tensor,
         *,
         n_fv_chunk: int | None = None,
+        fuse_stokes_i: bool = False,
+        chan_sum_factor: int = 1,
     ) -> torch.Tensor:
         """Correlate one block, emitting ``n_fast_vis`` independent tiles.
 
@@ -435,6 +438,31 @@ class FastCorrKernel:
                 f"[1, n_fv_total={n_fast_vis}]"
             )
 
+        # ---- RT Phase 3: fused Stokes-I + chan-sum output ---------------
+        # When ``fuse_stokes_i`` is set, ``_compute_one_slab`` collapses
+        # the BADA-pol axis to Stokes I and (if ``chan_sum_factor > 1``)
+        # collapses each ``chan_sum_factor``-block of fine channels to
+        # one summed channel inside Stage 6, so the per-slab return is
+        # ``(n_fv_slab, NBASE, NCHAN_eff)`` cfp32 instead of the
+        # ``(n_fv_slab, NBASE, NCHAN, 2)`` cfp32 vis_2pol cube. At the
+        # production op-point (NCHAN=384, NPOL=2, chan_sum_factor=8)
+        # this drops the per-slab output transient from ~28.6 MB/fv to
+        # ~1.8 MB/fv (16× reduction), letting the F31b OUTER chunking
+        # in process_block be eliminated entirely.
+        if fuse_stokes_i:
+            if chan_sum_factor < 1 or self.nchan % chan_sum_factor != 0:
+                raise ValueError(
+                    f"chan_sum_factor={chan_sum_factor} must be ≥ 1 "
+                    f"and divide nchan={self.nchan}"
+                )
+            nchan_eff = self.nchan // chan_sum_factor
+            out_full = torch.empty(
+                (n_fast_vis, NBASE, nchan_eff),
+                dtype=torch.complex64, device=self.device,
+            )
+        else:
+            out_full = None
+
         # ---- F31a: slice n_packets_in into n_fv_chunk slabs ----
         # Each slab covers exactly `n_fv_slab` consecutive fast-vis
         # tiles, i.e. `n_fv_slab * packets_per_fast_vis` packets.
@@ -454,13 +482,20 @@ class FastCorrKernel:
                 real_slab, imag_slab,
                 n_fv_slab=n_fv_slab,
                 packets_per_fast_vis=packets_per_fast_vis,
+                fuse_stokes_i=fuse_stokes_i,
+                chan_sum_factor=chan_sum_factor,
             )
-            out_chunks.append(vis_slab)
+            if fuse_stokes_i:
+                out_full[fv0:fv1] = vis_slab
+            else:
+                out_chunks.append(vis_slab)
             # Drop slab refs eagerly so PyTorch's allocator can reuse
             # the workspace for the next slab. Critical on the 2080Ti;
             # harmless on CPU.
             del real_slab, imag_slab, vis_slab
 
+        if fuse_stokes_i:
+            return out_full
         return torch.cat(out_chunks, dim=0)
 
     def _auto_n_fv_chunk(self, n_fv_total: int) -> int:
@@ -499,6 +534,8 @@ class FastCorrKernel:
         *,
         n_fv_slab: int,
         packets_per_fast_vis: int,
+        fuse_stokes_i: bool = False,
+        chan_sum_factor: int = 1,
     ) -> torch.Tensor:
         """Compute fast-vis output for one F31a slab of ``n_fv_slab`` tiles.
 
@@ -583,6 +620,25 @@ class FastCorrKernel:
         # Move (NBASE) before (ch, pol).
         vis_real = vis_real.permute(0, 3, 1, 2).contiguous()     # (fv, NBASE, ch, npol)
         vis_imag = vis_imag.permute(0, 3, 1, 2).contiguous()
+        if fuse_stokes_i:
+            # RT Phase 3: collapse npol → Stokes I (sum across BADA pol
+            # axis) and (optionally) chan_sum_factor adjacent fine
+            # channels into one summed channel, all on the per-slab
+            # buffer before assembling the cfp32 complex output. This
+            # eliminates the cfp32 vis_2pol slab transient (~14 MB/fv at
+            # the production op-point) — the per-slab return is the
+            # final summed-channel Stokes-I cube instead.
+            vis_real = vis_real.sum(dim=-1)                      # (fv, NBASE, ch)
+            vis_imag = vis_imag.sum(dim=-1)
+            if chan_sum_factor > 1:
+                nchan_eff = self.nchan // chan_sum_factor
+                vis_real = vis_real.reshape(
+                    n_fv_slab, NBASE, nchan_eff, chan_sum_factor,
+                ).sum(dim=-1)
+                vis_imag = vis_imag.reshape(
+                    n_fv_slab, NBASE, nchan_eff, chan_sum_factor,
+                ).sum(dim=-1)
+            return torch.complex(vis_real, vis_imag)             # (fv, NBASE, NCHAN_eff)
         return torch.complex(vis_real, vis_imag)                 # (fv, 4656, 384, 2)
 
 

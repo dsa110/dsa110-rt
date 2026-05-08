@@ -1057,15 +1057,24 @@ def process_block(
         del real_v, imag_v
         real_v, imag_v = real_v_c, imag_v_c
 
-    # 5. + 6. F31b: streamed kernel + Stokes-I per n_fv_chunk slab.
-    # The voltage tensor's n_packets_in axis is divisible into
-    # ``n_fv_total`` equal slices of ``packets_per_fast_vis = ppfv``
-    # packets each, one per fast-vis output tile. We pull
-    # ``n_fv_chunk`` consecutive tiles' worth of voltages, run them
-    # through the kernel, immediately collapse the NPOL axis to
-    # Stokes I, and write the slab result into the pre-allocated
-    # cube. The huge cfp32 ``(n_fv_total, NBASE, NCHAN, NPOL)``
-    # intermediate is never materialised end-to-end.
+    # 5. + 6. Streamed kernel + Stokes-I.
+    #
+    # Two paths:
+    #
+    # - **RT Phase 3 fused fast path** (default whenever
+    #   ``chan_sum_factor > 1`` and ``cfg.n_fv_chunk`` is ``None``):
+    #   one ``compute_split(real_v, imag_v, fuse_stokes_i=True)`` call
+    #   that returns the full ``(n_fv_total, NBASE, NCHAN_eff)`` cfp32
+    #   Stokes-I cube directly. F31a's internal slab chunking still
+    #   bounds the fp16 V_real / V_imag footprint, but the F31b OUTER
+    #   chunk loop, the cfp32 vis_2pol slab transient, and the separate
+    #   ``stokes_i_pol_sum`` + chan-sum pass are all eliminated.
+    #
+    # - **F31b LEGACY PATH** (``chan_sum_factor == 1`` OR the bench /
+    #   test pinned ``cfg.n_fv_chunk``): per-slab kernel + pol-sum +
+    #   optional chan-sum into a pre-allocated summed-channel cube.
+    #   Kept intact so the existing test fixtures + the M3 single-
+    #   chgroup CPU benches that exercise vis_2pol behavior still work.
     ppfv = ctx.cfg.t_int_fast_native // NTIMES_PER_PACKET
     n_packets_in = real_v.shape[3]
     if n_packets_in % ppfv != 0:
@@ -1077,28 +1086,6 @@ def process_block(
             f"slabs."
         )
     n_fv_total = n_packets_in // ppfv
-    if ctx.cfg.n_fv_chunk is not None:
-        n_fv_chunk = int(ctx.cfg.n_fv_chunk)
-        if n_fv_chunk <= 0:
-            raise ValueError(
-                f"cfg.n_fv_chunk={n_fv_chunk}, expected > 0"
-            )
-        n_fv_chunk = min(n_fv_chunk, n_fv_total)
-    else:
-        n_fv_chunk = _auto_n_fv_chunk_for_streaming(
-            n_fv_total, nchan=ctx.kernel.nchan,
-            nbada_pol=ctx.kernel.nbada_pol,
-        )
-
-    # F33: pre-allocate the Stokes-I cube at the SUMMED-channel
-    # nchan from the start (not at full nchan, then sum after). At
-    # the production op-point (t_int_fast_native=8, chan_sum_factor=8)
-    # this drops the Stokes-I cube footprint from
-    # (512, NBASE, 384)·cfp32 ≈ 7 GB to (512, NBASE, 48)·cfp32
-    # ≈ 900 MB on a 2080Ti — without this in-loop sum the bench OOMs
-    # (real_v + imag_v fp32 voltages already hold ~5 GB before the
-    # Stokes-I allocation). The per-slab pol-sum + chan-sum keeps the
-    # peak transient under the F31b 256 MB target.
     chan_sum_factor = int(ctx.cfg.chan_sum_factor)
     full_nchan = ctx.kernel.nchan
     if chan_sum_factor > 1 and full_nchan % chan_sum_factor != 0:
@@ -1107,30 +1094,47 @@ def process_block(
             f"nchan={full_nchan}; configure cfg.chan_sum_factor "
             f"so that NCHAN_PER_CHGROUP is divisible."
         )
-    nchan_eff = full_nchan // chan_sum_factor if chan_sum_factor > 1 else full_nchan
-    vis_stokes_i = torch.empty(
-        (n_fv_total, NBASE, nchan_eff),
-        dtype=torch.complex64, device=ctx.device,
+    nchan_eff = (
+        full_nchan // chan_sum_factor if chan_sum_factor > 1 else full_nchan
     )
-    for fv0 in range(0, n_fv_total, n_fv_chunk):
-        fv1 = min(fv0 + n_fv_chunk, n_fv_total)
-        # Slice voltages on the n_packets_in axis. ``contiguous()``
-        # is required because ``compute_split`` -> ``view`` after
-        # ``permute`` requires C-contiguous memory.
-        real_v_slab = real_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
-        imag_v_slab = imag_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
-        vis_2pol_slab = ctx.kernel.compute_split(real_v_slab, imag_v_slab)
-        # Per-slab pol-sum (-> cfp32 (slab, NBASE, nchan_full)) and
-        # F33 chan-sum (-> cfp32 (slab, NBASE, nchan_eff)) into the
-        # pre-allocated summed-channel Stokes-I cube.
-        stokes_i_slab = stokes_i_pol_sum(vis_2pol_slab)
-        if chan_sum_factor > 1:
-            stokes_i_slab = stokes_i_slab.reshape(
-                fv1 - fv0, NBASE, nchan_eff, chan_sum_factor,
-            ).sum(dim=-1)
-        vis_stokes_i[fv0:fv1] = stokes_i_slab
-        del real_v_slab, imag_v_slab, vis_2pol_slab, stokes_i_slab
-    del real_v, imag_v
+
+    use_fused_path = (chan_sum_factor > 1 and ctx.cfg.n_fv_chunk is None)
+    if use_fused_path:
+        vis_stokes_i = ctx.kernel.compute_split(
+            real_v, imag_v,
+            fuse_stokes_i=True, chan_sum_factor=chan_sum_factor,
+        )
+        del real_v, imag_v
+    else:
+        if ctx.cfg.n_fv_chunk is not None:
+            n_fv_chunk = int(ctx.cfg.n_fv_chunk)
+            if n_fv_chunk <= 0:
+                raise ValueError(
+                    f"cfg.n_fv_chunk={n_fv_chunk}, expected > 0"
+                )
+            n_fv_chunk = min(n_fv_chunk, n_fv_total)
+        else:
+            n_fv_chunk = _auto_n_fv_chunk_for_streaming(
+                n_fv_total, nchan=ctx.kernel.nchan,
+                nbada_pol=ctx.kernel.nbada_pol,
+            )
+        vis_stokes_i = torch.empty(
+            (n_fv_total, NBASE, nchan_eff),
+            dtype=torch.complex64, device=ctx.device,
+        )
+        for fv0 in range(0, n_fv_total, n_fv_chunk):
+            fv1 = min(fv0 + n_fv_chunk, n_fv_total)
+            real_v_slab = real_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
+            imag_v_slab = imag_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
+            vis_2pol_slab = ctx.kernel.compute_split(real_v_slab, imag_v_slab)
+            stokes_i_slab = stokes_i_pol_sum(vis_2pol_slab)
+            if chan_sum_factor > 1:
+                stokes_i_slab = stokes_i_slab.reshape(
+                    fv1 - fv0, NBASE, nchan_eff, chan_sum_factor,
+                ).sum(dim=-1)
+            vis_stokes_i[fv0:fv1] = stokes_i_slab
+            del real_v_slab, imag_v_slab, vis_2pol_slab, stokes_i_slab
+        del real_v, imag_v
 
     if ctx.multi_dm_coarse_dm is not None:
         # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
