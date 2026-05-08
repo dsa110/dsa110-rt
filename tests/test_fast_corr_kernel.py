@@ -205,20 +205,27 @@ def test_full_block_equals_slow_corr_kernel() -> None:
     diff = vis_fast[0] - vis_slow                              # (NBASE, NCHAN, BADA_NPOL) cfp32
     max_real = float(torch.max(torch.abs(diff.real)).item())
     max_imag = float(torch.max(torch.abs(diff.imag)).item())
+    max_mag_real = float(torch.max(torch.abs(vis_slow.real)).item())
+    max_mag_imag = float(torch.max(torch.abs(vis_slow.imag)).item())
     # Both kernels do the same fp16 matmul on the same tensors → cast
-    # to fp32 → upper-tri gather. Should agree exactly (deterministic
-    # CPU matmul). Allow 1e-5 absolute as a tolerance for any ordering
-    # differences in the t_sub vs ppfv reduction order. (For the M3
-    # production test on GPU this tolerance may need to grow to 1e-2;
-    # CPU here gives us the sharpest comparison.)
-    assert max_real < 1e-5, (
+    # to fp32 → upper-tri gather. Reduction order differs (the slow
+    # kernel runs a single K=NPACKETS_PER_BLOCK*NTIMES_PER_PACKET=4096
+    # GEMM; the fast kernel runs two K=2t*ppfv=4096 GEMMs whose
+    # outputs are added in fp16). At the production op-point the
+    # output magnitudes are O(50k–100k), so fp32 ULP is ~0.008–0.016
+    # — the right yard-stick is **relative** tolerance ≤ 1e-5
+    # (equivalently a few fp32 ULPs at the per-cell magnitude).
+    rel_real = max_real / max(max_mag_real, 1.0)
+    rel_imag = max_imag / max(max_mag_imag, 1.0)
+    assert rel_real < 1e-5, (
         f"FastCorrKernel(t_int=N_TIME_SAMPLES) vs SlowCorrKernel: "
-        f"max real diff = {max_real:.3e}; expected ≤ 1e-5. "
-        f"FastCorrKernel does NOT reduce to SlowCorrKernel at the boundary."
+        f"max real diff = {max_real:.3e} (relative {rel_real:.2e} of "
+        f"|vis|_max = {max_mag_real:.3e}); expected rel < 1e-5."
     )
-    assert max_imag < 1e-5, (
+    assert rel_imag < 1e-5, (
         f"FastCorrKernel(t_int=N_TIME_SAMPLES) vs SlowCorrKernel: "
-        f"max imag diff = {max_imag:.3e}; expected ≤ 1e-5."
+        f"max imag diff = {max_imag:.3e} (relative {rel_imag:.2e} of "
+        f"|vis|_max = {max_mag_imag:.3e}); expected rel < 1e-5."
     )
 
 
