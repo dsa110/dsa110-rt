@@ -345,6 +345,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--n-grid", type=int, default=256)
     p.add_argument("--n-coarse-dm", type=int, default=24)
     p.add_argument("--chan-sum-factor", type=int, default=8)
+    p.add_argument("--dm-chunk-size", type=int, default=2,
+                   help="DM trials concatenated per gridder.compute call (RT Phase 2). "
+                        "Smaller = less memory, more launch overhead.")
     p.add_argument("--dm-truth", type=float, default=1500.0)
     p.add_argument("--no-trace", action="store_true",
                    help="skip the torch.profiler chrome trace.")
@@ -394,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         t_int_fast_native=args.t_int_fast_native,
         rfi_enabled=False,
         static_sky_disabled=True,
+        dm_chunk_size=args.dm_chunk_size,
     )
     ctx = build_context(
         cfg=cfg, device=device,
