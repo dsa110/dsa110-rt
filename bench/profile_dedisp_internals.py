@@ -31,13 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dsart.coarse_dm.dm_plan import DMPlan
-from dsart.common.constants import (
-    NANTS,
-    NATIVE_SAMPLE_US,
-    NBASE,
-    NCHAN_PER_CHGROUP,
-)
+from dsart.common.constants import NATIVE_SAMPLE_US
 from dsart.services.corr_fast_integration import (
     FastIntegrationConfig,
     Stage1MultiDMCoarseDM,
@@ -45,51 +39,14 @@ from dsart.services.corr_fast_integration import (
     _build_core_baseline_mask,
     process_block,
 )
-from dsart.services.slow_corr_kernel import (
-    NPACKETS_PER_BLOCK,
-    NTIMES_PER_PACKET,
+
+from bench.fast_path_throughput import (
+    _build_synthetic_summed_plan,
+    _synth_antpos,
 )
 
 
 LOG = logging.getLogger("profile_dedisp_internals")
-
-
-# ---------- duplicated synth helpers from profile_fast_path_K1.py ----------
-
-
-def _synth_antpos(seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    e = np.zeros(NANTS, dtype=np.float32)
-    n = np.zeros(NANTS, dtype=np.float32)
-    e[:82] = rng.uniform(-300.0, 300.0, size=82).astype(np.float32)
-    n[:82] = rng.uniform(-300.0, 300.0, size=82).astype(np.float32)
-    e[82:] = rng.uniform(-5000.0, 5000.0, size=NANTS - 82).astype(np.float32)
-    n[82:] = rng.uniform(-2000.0, 2000.0, size=NANTS - 82).astype(np.float32)
-    return e, n
-
-
-def _build_synthetic_summed_plan(
-    *, n_coarse: int, dm_max: float, chan_sum_factor: int,
-    t_int_fast_us: float,
-) -> DMPlan:
-    from dsart.coarse_dm.dm_plan import (
-        build_chgroup_freq_table_GHz,
-        compute_delay_native_samples_table,
-    )
-    dm_pc_cc = np.linspace(0.0, dm_max, n_coarse, dtype=np.float64)
-    chgroup_freqs_full = build_chgroup_freq_table_GHz()
-    nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
-    chgroup_freqs = chgroup_freqs_full.reshape(
-        chgroup_freqs_full.shape[0], nchan_eff, chan_sum_factor,
-    ).mean(axis=2)
-    table = compute_delay_native_samples_table(dm_pc_cc, chgroup_freqs)
-    return DMPlan(
-        dm_pc_cc=dm_pc_cc,
-        n_fine_per_coarse=1,
-        t_int_fast_us=t_int_fast_us,
-        chgroup_freqs_GHz=chgroup_freqs,
-        _delay_native_samples_table=table,
-    )
 
 
 # ---------- patched _dedisperse_one_window with internal timers ----------
@@ -226,20 +183,19 @@ def main(argv=None):
     ctx = build_context(
         cfg=cfg, device=device,
         antpos_e=antpos_e, antpos_n=antpos_n,
-        is_core_baseline_mask=_build_core_baseline_mask(n_core=82),
-        plan=plan,
+        dm_plan=plan,
     )
 
+    from dsart.common.constants import FADA_BYTES_PER_BLOCK
     rng = np.random.default_rng(seed=20260508)
     raw_blocks = [
-        rng.integers(0, 256, size=ctx.kernel.fada_bytes_per_block,
-                     dtype=np.uint8)
+        rng.integers(0, 256, size=FADA_BYTES_PER_BLOCK, dtype=np.uint8)
         for _ in range(args.warmup + args.n_blocks)
     ]
 
     LOG.info("ready: n_filled=%d n_dm=%d n_fv_per_block=%d",
              ctx.gridder.pattern.n_filled,
-             ctx.coarse_dm.n_dm,
+             ctx.multi_dm_coarse_dm.n_dm,
              ctx.kernel.n_fast_vis_per_full_block)
 
     # Patch in the instrumented dedisp.
