@@ -617,6 +617,109 @@ class TestF31bStreaming:
 
 
 # ---------------------------------------------------------------------------
+# RT Phase 3: fused Stokes-I + chan-sum compute_split in process_block
+# ---------------------------------------------------------------------------
+
+
+class TestRTPhase3FusedComputeSplit:
+    """RT Phase 3: when ``cfg.chan_sum_factor > 1`` and ``cfg.n_fv_chunk
+    is None``, ``process_block`` calls ``compute_split(fuse_stokes_i=True,
+    chan_sum_factor=K)`` once per block and skips the F31b OUTER chunk
+    loop. The resulting summed-channel Stokes-I cube must be bit-
+    identical to the legacy F31b path that pins ``cfg.n_fv_chunk`` and
+    runs the per-slab ``stokes_i_pol_sum`` + ``reshape().sum()`` pipeline.
+
+    F31a's INTERNAL slab chunking (inside ``compute_split``) is gated on
+    the same fp16 V_real budget in either path, so the per-slab fp16
+    matmul inputs are byte-identical.
+    """
+
+    @pytest.mark.parametrize(
+        ("t_int", "chan_sum_factor", "legacy_n_fv_chunk"),
+        [
+            (32, 8, 128),     # 128 fv tiles, K=8 (production-like)
+            (32, 4, 128),
+            (32, 2, 128),
+            (32, 8, 16),      # legacy path with explicit small chunks
+            (32, 8, 1),       # legacy path slab-of-1
+            (8, 8, 512),      # production cadence: 512 fv tiles (slow on CPU)
+        ],
+    )
+    def test_fused_path_bit_identical_to_legacy_streaming(
+        self, t_int, chan_sum_factor, legacy_n_fv_chunk,
+    ) -> None:
+        # Fused path: cfg.n_fv_chunk=None ⇒ uses use_fused_path=True
+        cfg_fused = _make_cfg(
+            t_int_fast_native=t_int,
+            chan_sum_factor=chan_sum_factor,
+            n_fv_chunk=None,
+        )
+        ctx_fused = _build_test_context(cfg_fused)
+        raw = _synthetic_fada_block()
+        out_fused = process_block(raw, ctx=ctx_fused, block_n=1)
+
+        # Legacy path: cfg.n_fv_chunk is pinned ⇒ takes the F31b loop.
+        cfg_legacy = _make_cfg(
+            t_int_fast_native=t_int,
+            chan_sum_factor=chan_sum_factor,
+            n_fv_chunk=legacy_n_fv_chunk,
+        )
+        ctx_legacy = _build_test_context(cfg_legacy)
+        out_legacy = process_block(raw, ctx=ctx_legacy, block_n=1)
+
+        assert out_fused.gridded_minus_sky.shape == out_legacy.gridded_minus_sky.shape
+        assert out_fused.gridded_minus_sky.dtype == out_legacy.gridded_minus_sky.dtype
+        torch.testing.assert_close(
+            out_fused.gridded_minus_sky,
+            out_legacy.gridded_minus_sky,
+            rtol=0,
+            atol=0,
+            msg=lambda m: (
+                f"Phase 3 fused (cfp32, fused) != F31b legacy (pinned "
+                f"n_fv_chunk={legacy_n_fv_chunk}, K={chan_sum_factor}, "
+                f"t_int={t_int}): {m}"
+            ),
+        )
+
+    def test_fused_path_disabled_when_chan_sum_is_one(self) -> None:
+        """Phase-3 fast path only fires when chan_sum_factor > 1."""
+        cfg = _make_cfg(t_int_fast_native=32, chan_sum_factor=1)
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        out = process_block(raw, ctx=ctx, block_n=1)
+        # Pinned-chunk legacy path equivalence (F31b regression).
+        cfg_pin = _make_cfg(
+            t_int_fast_native=32, chan_sum_factor=1, n_fv_chunk=128,
+        )
+        ctx_pin = _build_test_context(cfg_pin)
+        out_pin = process_block(raw, ctx=ctx_pin, block_n=1)
+        torch.testing.assert_close(
+            out.gridded_minus_sky, out_pin.gridded_minus_sky,
+            rtol=0, atol=0,
+        )
+
+    def test_fused_path_disabled_when_n_fv_chunk_pinned(self) -> None:
+        """User pinning ``cfg.n_fv_chunk`` keeps the legacy F31b path
+        even when ``chan_sum_factor > 1`` (bench overrides honored)."""
+        cfg = _make_cfg(
+            t_int_fast_native=32, chan_sum_factor=8, n_fv_chunk=8,
+        )
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        out = process_block(raw, ctx=ctx, block_n=1)
+        # The fused path with no pin has to be bit-identical to this.
+        cfg_auto = _make_cfg(
+            t_int_fast_native=32, chan_sum_factor=8, n_fv_chunk=None,
+        )
+        ctx_auto = _build_test_context(cfg_auto)
+        out_auto = process_block(raw, ctx=ctx_auto, block_n=1)
+        torch.testing.assert_close(
+            out.gridded_minus_sky, out_auto.gridded_minus_sky,
+            rtol=0, atol=0,
+        )
+
+
+# ---------------------------------------------------------------------------
 # F33: chan_sum_factor pipeline
 # ---------------------------------------------------------------------------
 
