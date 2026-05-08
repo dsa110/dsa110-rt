@@ -461,8 +461,38 @@ async def _drive_bench(
     udp_set = set(inj.udp_cubes)
     max_observed_depth = 0
     n_udp_arm_failures = 0
+    # Cumulative time spent inside ``cube_dump.submit`` across all
+    # cubes. This is the true chunk-7 "dispatch hot-path latency" — the
+    # time the real-time path is held up by writer-queue management.
+    # Each submit is non-blocking (queue.put_nowait), so this is bounded
+    # by the per-call overhead regardless of how slow np.savez runs in
+    # the writer thread. Exposed as ``submit_dispatch_total_ms`` /
+    # ``submit_dispatch_p99_us`` in the report so the chunk-7
+    # backpressure gate can assert on the writer-impact-only latency
+    # rather than the pipeline-bound wall time.
+    submit_call_times_ns: List[int] = []
 
     await service.start()
+    # Wrap ``cube_dump.submit`` with a per-call timer so we can isolate
+    # the writer-impacted dispatch hot path from the pipeline-bound
+    # outer loop. The wrapper is installed AFTER service.start so the
+    # service's internal reference (built from cube_dump_writer_config)
+    # is the one we're decorating; subsequent ``service._cube_dump``
+    # accesses still resolve to the same instance.
+    if service.cube_dump is not None:
+        _wrapped_writer = service.cube_dump
+        _orig_submit = _wrapped_writer.submit
+
+        def _timed_submit(*args_inner: Any, **kwargs_inner: Any) -> bool:
+            t_call_start = time.perf_counter_ns()
+            try:
+                return _orig_submit(*args_inner, **kwargs_inner)
+            finally:
+                submit_call_times_ns.append(
+                    time.perf_counter_ns() - t_call_start
+                )
+
+        _wrapped_writer.submit = _timed_submit  # type: ignore[assignment]
     if bool(args.enable_udp) and service.udp_listener is not None:
         udp_port = service.udp_listener.bound_port
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -549,6 +579,16 @@ async def _drive_bench(
         cube_dump.recent_write_ms_ms if cube_dump else ()
     )
 
+    submit_total_ms = (
+        sum(submit_call_times_ns) / 1.0e6
+        if submit_call_times_ns else 0.0
+    )
+    submit_p99_us = (
+        float(np.percentile(
+            np.asarray(submit_call_times_ns, dtype=np.float64) / 1.0e3,
+            99.0,
+        )) if submit_call_times_ns else 0.0
+    )
     summary: Dict[str, Any] = {
         "n_cubes_processed": int(service.cubes_processed),
         "n_candidates_emitted": int(service.candidates_emitted),
@@ -563,7 +603,19 @@ async def _drive_bench(
         "writer_max_ms": (
             float(max(write_ms_arr)) if write_ms_arr else 0.0
         ),
+        # ``wall_s`` is the dispatch loop wall (cube-by-cube
+        # processing including pipeline.process + clustering); it does
+        # NOT include service.stop()'s writer-drain wait. The chunk-7
+        # spec example value (3.7 s for 100 cubes) reflects this.
         "wall_s": float(dispatch_wall_s),
+        # ``submit_dispatch_total_ms`` is the cumulative time spent
+        # inside CubeDumpWriter.submit across all cubes. Each submit
+        # is non-blocking (queue.put_nowait), so this stays sub-ms
+        # even under the chunk-7 backpressure gate (slow np.savez
+        # in the writer thread cannot leak to the dispatch path).
+        "submit_dispatch_total_ms": float(submit_total_ms),
+        "submit_dispatch_p99_us": float(submit_p99_us),
+        "submit_dispatch_n_calls": int(len(submit_call_times_ns)),
     }
     queue_backpressure: Dict[str, Any] = {
         "queue_maxsize": int(args.queue_maxsize),
