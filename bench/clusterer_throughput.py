@@ -1,89 +1,104 @@
 #!/usr/bin/env python3
-"""bench/clusterer_throughput.py — M6 Chunk 6 D5 fallback gate.
+"""bench/clusterer_throughput.py — M6 chunk 6 clusterer throughput
+gate (D5 fallback predicate).
 
-Characterises the M6 per-cube clusterer
-(``dsart.cluster.forward.cluster_candidates``) at production-like
-candidate-stream loads, so the M6 D5 backend decision can be made:
-HDBSCAN remains primary if p99 ≤ 50 ms at the production geometry, else
-the runtime falls back to sklearn DBSCAN (M6_PLAN_FIXES.md D5).
+Per M6 D5 the clusterer's primary backend is HDBSCAN (cityblock,
+``min_cluster_size=2``, ``min_samples=1``,
+``cluster_selection_epsilon=10.0``). The fallback is sklearn DBSCAN
+(``eps=10``, ``min_samples=2``, cityblock). The decision between
+backends is gated by **per-cube clustering wall-clock latency at
+production candidate load**: HDBSCAN p99 latency at the production
+candidate count (default 1000 candidates / cube) must be ≤ 50 ms.
+If not, the operator flips ``ClustererConfig.backend`` to
+``"dbscan"`` in ``configs/config_compute_search.yaml``.
 
-Per-cube production geometry (D4/D5):
-  * worst-case ~1000 candidates per cube at θ = 8 σ with the cross-
-    kernel merger applied;
-  * cube cadence ~134 ms (8 cubes/s) at the default ops point;
-  * p99 latency budget = 50 ms (~38 % of the 134 ms cube period — any
-    longer and the next cube's detector forward catches up to the
-    clusterer worker on the ThreadPool).
+This bench drives ``cluster.forward.cluster_candidates`` against
+synthetic per-cube candidate streams and reports p50 / p95 / p99 /
+mean / stddev latency plus throughput across a sweep of candidate
+counts and backends. The D5 gate verdict is emitted in the JSON
+report under ``d5_gate.pass``; the script exits 0 on PASS, 1 on FAIL.
 
-This bench drives the public clusterer API ONLY (no service / pipeline
-wiring); it consumes ``cluster_candidates(cands, geom, config=...)``
-and times the wall clock per call.
+The synthetic candidate generator plants ``cluster_fraction``
+(default 0.7) of each cube's candidates into clusters of 5-20
+candidates within a 5-pixel (l, m) radius; the remainder are
+uniformly distributed noise. Generator output honours the M5
+detector convention (``Candidate.l = float(l_pix)``,
+``Candidate.m = float(m_pix)``,
+``Candidate.dm_fine = fine_dm_pc_cc[fine_dm_idx]``).
 
 CLI surface (see ``--help`` for the full grid):
 
   python -m bench.clusterer_throughput \\
-      [--report-dir bench/reports/M6/clusterer_throughput] \\
-      [--backend hdbscan]               \\
-      [--feature-mode int]              \\
-      [--n-cubes 200]                   \\
-      [--n-cands-per-cube 1000]         \\
-      [--rng-seed 42]                   \\
-      [--device cpu]                    \\
-      [--p99-budget-ms 50.0]
+      [--n-cubes 100]                                            \\
+      [--candidate-counts 50 100 200 500 1000 2000]              \\
+      [--backends hdbscan dbscan]                                \\
+      [--cluster-fraction 0.7]                                   \\
+      [--seed 42]                                                \\
+      [--report-path bench/reports/M6/clusterer_throughput.json] \\
+      [--p99-budget-ms 50.0]                                     \\
+      [--production-candidate-count 1000]                        \\
+      [--device cpu]
 
-Outputs (under ``--report-dir``):
+Output (single JSON file at ``--report-path``):
 
-  * ``report.json`` — single-shot bench report with config, summary
-    percentiles (p50/p90/p99/max/mean/n_cubes_run/n_cands_total/
-    n_records_total/n_clusters_total/n_noise_total), and the D5
-    fallback predicate (``passes`` = p99 ≤ budget).
-  * ``per_cube.csv``  — one row per cube
-    (``cube_id, n_cands, n_records, n_clusters, n_noise, wall_ms``).
+  {
+    "schema_version": 1,
+    "git_sha": "...",
+    "host": "lxd110h01",
+    "n_cubes": 100,
+    "production_candidate_count": 1000,
+    "p99_budget_ms": 50.0,
+    "results": [
+      {"backend": "hdbscan", "n_cands": 1000, "p50_ms": 12.3,
+       "p95_ms": 24.1, "p99_ms": 41.8, "mean_ms": 14.2,
+       "stddev_ms": 5.1, "throughput_cubes_s": 70.4,
+       "n_clusters_mean": 14.0, "n_noise_mean": 280.0},
+      ...
+    ],
+    "d5_gate": {
+      "pass": true,
+      "decision": "evaluated",
+      "hdbscan_p99_at_production_ms": 41.8,
+      "p99_budget_ms": 50.0,
+      "fallback_required": false,
+      "production_candidate_count": 1000
+    }
+  }
 
-Synthetic candidate-stream generator (per cube):
-
-  * ``n_cands ~ Poisson(λ = n_cands_per_cube)`` so the load varies
-    cube-to-cube. (Realistic — most cubes are quiet; occasional
-    high-FAR cubes spike to the worst-case 1000+ load.)
-  * One injected burst kernel of ``K ~ Uniform[2, 20]`` candidates
-    co-located in (l_pix, m_pix, fine_dm_idx, t_in_cube) with a small
-    jitter to exercise the clusterer's grouping logic.
-  * Remaining candidates are noise — uniform over the cube's
-    (l_pix, m_pix, fine_dm_idx, t_in_cube) grid with random
-    ``width_samples`` ∈ {1, 2, 4, 8, 16, 32, 64, 128}.
-  * SNR drawn ``8 + Exponential(scale=2)`` for noise,
-    ``15 + Exponential(scale=10)`` for burst-kernel members.
-  * Reproducibility: ``np.random.default_rng(rng_seed)`` per run; per-
-    cube sub-RNG seeded ``rng_seed * 1_000_003 + cube_id``.
-
-The bench is a producer of timing data; the M6.sh DoD step
-``bench_clusterer_throughput`` invokes it with the production load
-(``--n-cubes 200 --n-cands-per-cube 1000``) and the report.json is
-inspected by the operator before flipping the runtime backend.
+Skipped-gate policy: if the production candidate count is not present
+in the HDBSCAN sweep (because the operator excluded ``hdbscan`` from
+``--backends`` or excluded ``--production-candidate-count`` from
+``--candidate-counts``), the gate is *not* failed — instead it emits
+``decision="skipped"`` with ``pass=true`` and
+``hdbscan_p99_at_production_ms=null``. The exit code stays 0. Rationale:
+the gate's only failure mode that should block CI is "HDBSCAN ran at
+the production point and was too slow"; missing-data cases are an
+operator/CI configuration mistake rather than a real D5 violation.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import os
-import random
 import socket
-import statistics
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+# Enable contract __post_init__ checks for the synthetic Candidate /
+# CubeGeometry constructions; matches the production search-compute
+# default and keeps the bench honest about contract conformance.
 os.environ.setdefault("DSART_TEST", "1")
 
 from dsart.cluster.forward import (  # noqa: E402
@@ -91,7 +106,6 @@ from dsart.cluster.forward import (  # noqa: E402
     ClustererConfig,
     cluster_candidates,
 )
-from dsart.cluster.features import FeatureMode  # noqa: E402
 from dsart.common.contracts import (  # noqa: E402
     Candidate,
     CandidateFlags,
@@ -103,545 +117,657 @@ _LOG = logging.getLogger("bench.clusterer_throughput")
 
 
 # ---------------------------------------------------------------------------
-# Defaults — production-geometry numbers locked in M6_PLAN_FIXES.md D4/D5.
+# Defaults (D5 production lock; matches services.search_compute defaults)
 # ---------------------------------------------------------------------------
 
-DEFAULT_REPORT_DIR: Path = (
-    REPO_ROOT / "bench" / "reports" / "M6" / "clusterer_throughput"
-)
-DEFAULT_BACKEND: str = ClustererBackend.HDBSCAN
-DEFAULT_FEATURE_MODE: str = FeatureMode.INT
-DEFAULT_N_CUBES: int = 200
-DEFAULT_N_CANDS_PER_CUBE: int = 1000
-DEFAULT_RNG_SEED: int = 42
-DEFAULT_DEVICE: str = "cpu"
+DEFAULT_CANDIDATE_COUNTS: Tuple[int, ...] = (50, 100, 200, 500, 1000, 2000)
+DEFAULT_BACKENDS: Tuple[str, ...] = ("hdbscan", "dbscan")
+DEFAULT_N_CUBES: int = 100
+DEFAULT_CLUSTER_FRACTION: float = 0.7
+DEFAULT_SEED: int = 42
 DEFAULT_P99_BUDGET_MS: float = 50.0
+DEFAULT_PRODUCTION_CANDIDATE_COUNT: int = 1000
 
-# Cube geometry (production defaults — match the spec verbatim).
-GEOM_SAMPLE_PERIOD_SPECNUM: int = 16
-GEOM_T_DET: int = 256
-GEOM_N_GRID: int = 256
-GEOM_N_FDM_IN_CUBE: int = 32
-GEOM_SAMPLE_PERIOD_US: float = 131.072
-GEOM_CELL_L_RAD: float = 1.5e-4
-GEOM_CELL_M_RAD: float = 1.5e-4
-GEOM_L0_RAD: float = 0.0
-GEOM_M0_RAD: float = 0.0
-GEOM_FINE_DM_LO: float = 50.0
-GEOM_FINE_DM_HI: float = 800.0
-GEOM_MJD_START_BASE: float = 60942.0
-GEOM_CUBE_PERIOD_S: float = 134e-3  # cube cadence at default ops
+DEFAULT_REPORT_PATH: Path = (
+    REPO_ROOT / "bench" / "reports" / "M6" / "clusterer_throughput.json"
+)
 
-# Allowed boxcar widths (matches DETECTOR_K_TIME_WIDTHS in constants.py;
-# kept inline here so the bench has no transitive dep on constants).
-NOISE_WIDTH_CHOICES: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+# Production-like cube geometry per M6 D1/D6 + plan §3.6.12 pins. The
+# bench's clusterer is geometry-agnostic for timing — these values just
+# need to be self-consistent and large enough that fine_dm / l_pix /
+# m_pix have realistic dynamic range.
+PROD_N_GRID: int = 256
+PROD_T_DET: int = 512
+PROD_N_FDM_IN_CUBE: int = 32
+PROD_SAMPLE_PERIOD_US: float = 131.072
+PROD_SAMPLE_PERIOD_SPECNUM: int = 16
+PROD_CELL_L_RAD: float = 1.5e-4
+PROD_CELL_M_RAD: float = 1.5e-4
 
-# Burst-kernel jitter radius (in detector-frame units). Tight enough
-# that the clusterer reliably groups the burst members under default
-# eps=10 cityblock; loose enough to exercise the inner-loop NMS.
-BURST_LM_JITTER: int = 1
-BURST_DM_JITTER: int = 1
-BURST_T_JITTER: int = 2
-BURST_K_MIN: int = 2
-BURST_K_MAX: int = 20
+# Detector kernel id used for synthetic Candidates. Must be a valid
+# triple (image:dm:time) per Candidate._check_kernel_id; "unit:d1:b4"
+# is the default M5 detector triple at narrow boxcar.
+DETECTOR_KERNEL_ID: str = "unit:d1:b4"
 
-# Noise + burst SNR distributions (M6 D5: matches what the M5 detector
-# emits at θ=8σ). Noise candidates cluster around the threshold;
-# burst-kernel members carry a heavier tail to mimic real bursts.
-NOISE_SNR_OFFSET: float = 8.0
-NOISE_SNR_SCALE: float = 2.0
-BURST_SNR_OFFSET: float = 15.0
-BURST_SNR_SCALE: float = 10.0
+# Synthetic-cluster geometry per spec.
+SYNTH_CLUSTER_RADIUS_PIX: int = 5
+SYNTH_CLUSTER_SIZE_MIN: int = 5
+SYNTH_CLUSTER_SIZE_MAX: int = 20
+SYNTH_WIDTHS: Tuple[int, ...] = (1, 2, 4, 8, 16)
+SYNTH_SNR_MIN: float = 4.0
+SYNTH_SNR_MAX: float = 50.0
 
-# Detector-frame defaults used to populate Candidate fields that the
-# clusterer ignores but the dataclass __post_init__ still validates.
-DEFAULT_KERNEL_ID: str = "unit:d1:b4"
-DEFAULT_DETECTOR_VERSION: str = "v1.M6.bench"
+# Search-node id reserved for synthetic candidates (must be 0..N_SEARCH-1
+# per Candidate.__post_init__). 2 is the M5/M6 default detector node.
+SYNTH_SEARCH_NODE_ID: int = 2
+SYNTH_GPU_HALF: int = 1
 
 
 # ---------------------------------------------------------------------------
-# Per-cube wall-clock record (driver-internal; not persisted as-is).
+# Geometry + Candidate factories
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class CubeTimingRecord:
-    """One cube's clusterer wall-clock + record-count snapshot."""
+def _build_geometry(cube_id: int = 0) -> CubeGeometry:
+    """Build a production-like ``CubeGeometry`` for a synthetic cube.
 
-    cube_id: int
-    n_cands: int
-    n_records: int
-    n_clusters: int
-    n_noise: int
-    wall_ms: float
+    Args:
+        cube_id: monotonic cube counter for this cube. Mirrors
+            ``CubeRingSlot.cube_id`` and propagates into
+            ``ClusterRecord.cube_id``.
 
-
-# ---------------------------------------------------------------------------
-# Synthetic candidate-stream generator
-# ---------------------------------------------------------------------------
-
-
-def _build_geometry(cube_id: int) -> CubeGeometry:
-    """Build a production-geometry ``CubeGeometry`` for cube ``cube_id``.
-
-    The sample0 specnum advances by ``t_det * sample_period_specnum`` per
-    cube; ``mjd_start`` advances by 134 ms (the default-ops cube
-    cadence). Both choices match the spec's reference geometry block.
+    Returns:
+        CubeGeometry instance with the production-like geometry constants
+        pinned at module top (n_grid=256, t_det=512, n_fdm_in_cube=32,
+        sample_period_us=131.072, etc.).
     """
-    specnum_start = int(cube_id * GEOM_T_DET * GEOM_SAMPLE_PERIOD_SPECNUM)
     fine_dm_pc_cc = np.linspace(
-        GEOM_FINE_DM_LO, GEOM_FINE_DM_HI, GEOM_N_FDM_IN_CUBE, dtype=np.float64
+        50.0, 800.0, PROD_N_FDM_IN_CUBE, dtype=np.float64
     )
-    mjd_start = GEOM_MJD_START_BASE + cube_id * GEOM_CUBE_PERIOD_S / 86400.0
     return CubeGeometry(
         cube_id=int(cube_id),
-        specnum_start=specnum_start,
-        sample_period_specnum=GEOM_SAMPLE_PERIOD_SPECNUM,
-        t_det=GEOM_T_DET,
-        n_grid=GEOM_N_GRID,
-        n_fdm_in_cube=GEOM_N_FDM_IN_CUBE,
-        sample_period_us=GEOM_SAMPLE_PERIOD_US,
-        cell_l_rad=GEOM_CELL_L_RAD,
-        cell_m_rad=GEOM_CELL_M_RAD,
-        l0_rad=GEOM_L0_RAD,
-        m0_rad=GEOM_M0_RAD,
+        specnum_start=0,
+        sample_period_specnum=PROD_SAMPLE_PERIOD_SPECNUM,
+        t_det=PROD_T_DET,
+        n_grid=PROD_N_GRID,
+        n_fdm_in_cube=PROD_N_FDM_IN_CUBE,
+        sample_period_us=PROD_SAMPLE_PERIOD_US,
+        cell_l_rad=PROD_CELL_L_RAD,
+        cell_m_rad=PROD_CELL_M_RAD,
+        l0_rad=0.0,
+        m0_rad=0.0,
         fine_dm_pc_cc=fine_dm_pc_cc,
-        mjd_start=float(mjd_start),
+        mjd_start=60942.0,
     )
 
 
 def _make_candidate(
     *,
-    geom: CubeGeometry,
     l_pix: int,
     m_pix: int,
     fine_dm_idx: int,
     t_in_cube: int,
     width_samples: int,
     snr: float,
+    geom: CubeGeometry,
+    search_node_id: int = SYNTH_SEARCH_NODE_ID,
+    gpu_half: int = SYNTH_GPU_HALF,
 ) -> Candidate:
-    """Build one Candidate consistent with the cube geometry.
+    """Build one ``Candidate`` honouring the M5 detector convention.
 
-    The clusterer recovers ``fine_dm_idx`` from ``cand.dm_fine`` via
-    searchsorted on ``geom.fine_dm_pc_cc``; we set ``dm_fine`` to the
-    exact grid value so the round-trip is lossless. ``event_specnum``
-    is computed from ``t_in_cube`` so the ``t_in_cube`` recovery in
-    features.py matches the input we synthesised.
+    Sets ``l = float(l_pix)``, ``m = float(m_pix)``, and
+    ``dm_fine = geom.fine_dm_pc_cc[fine_dm_idx]`` so that the clusterer's
+    INT-mode feature recovery (in :mod:`dsart.cluster.features`) round-
+    trips back to the planted indices.
     """
     return Candidate(
         l=float(l_pix),
         m=float(m_pix),
         dm_fine=float(geom.fine_dm_pc_cc[fine_dm_idx]),
-        dm_idx=int(fine_dm_idx),
+        dm_idx=0,
         event_specnum=int(
             geom.specnum_start + t_in_cube * geom.sample_period_specnum
         ),
         width_samples=int(width_samples),
-        kernel_id=DEFAULT_KERNEL_ID,
+        kernel_id=DETECTOR_KERNEL_ID,
         snr=float(snr),
-        detector_version=DEFAULT_DETECTOR_VERSION,
+        detector_version="v1.M5",
         flags=int(CandidateFlags.NONE),
-        search_node_id=0,
-        gpu_half=0,
+        search_node_id=int(search_node_id),
+        gpu_half=int(gpu_half),
     )
 
 
-def _generate_cube_candidates(
-    *,
+# ---------------------------------------------------------------------------
+# Synthetic candidate generator
+# ---------------------------------------------------------------------------
+
+
+def synthesize_candidates(
+    n_cands: int,
+    cluster_fraction: float,
     geom: CubeGeometry,
-    n_cands_per_cube_lambda: int,
     rng: np.random.Generator,
-) -> List[Candidate]:
-    """Synthesise one cube's candidate list per the spec's recipe.
+    *,
+    search_node_id: int = SYNTH_SEARCH_NODE_ID,
+    gpu_half: int = SYNTH_GPU_HALF,
+) -> Tuple[List[Candidate], np.ndarray]:
+    """Generate one cube's worth of synthetic ``Candidate`` records.
 
-    Returns a list of ``Candidate`` records; length is Poisson-drawn
-    around ``n_cands_per_cube_lambda``. The first ``K`` rows are the
-    burst-kernel members (so a downstream consumer that wants to slice
-    off "the burst" can take ``cands[:K]``); the rest are noise rows.
+    A fraction ``cluster_fraction`` of the candidates are planted into
+    clusters of size :data:`SYNTH_CLUSTER_SIZE_MIN`-
+    :data:`SYNTH_CLUSTER_SIZE_MAX` within a
+    :data:`SYNTH_CLUSTER_RADIUS_PIX`-pixel (l, m) radius, centred at a
+    random integer (l_pix, m_pix, fine_dm_idx, t_in_cube). Members
+    inherit the cluster centre's ``width_samples`` (so a cluster lands
+    on the same boxcar response). The remaining
+    ``round(n_cands * (1 - cluster_fraction))`` candidates are uniform
+    noise across the (n_grid, n_grid, n_fdm_in_cube, t_det) grid.
+
+    Cluster sizes are sampled iid uniformly until the running total
+    would exceed the planted-cluster target. If the residual budget is
+    smaller than :data:`SYNTH_CLUSTER_SIZE_MIN`, the residual rolls into
+    the noise bucket (so ``actual_planted ≤ target``; the slack is at
+    most ``SYNTH_CLUSTER_SIZE_MIN - 1`` candidates).
+
+    Args:
+        n_cands: total candidate count.
+        cluster_fraction: fraction in [0, 1] of candidates to plant in
+            clusters (the rest are noise).
+        geom: cube geometry for unit conversion + index bounds.
+        rng: numpy ``Generator`` (drives all sampling; for determinism,
+            seed at the call site).
+        search_node_id: ``Candidate.search_node_id``; default
+            :data:`SYNTH_SEARCH_NODE_ID`.
+        gpu_half: ``Candidate.gpu_half``; default
+            :data:`SYNTH_GPU_HALF`.
+
+    Returns:
+        Tuple ``(cands, planted_cluster_ids)`` where:
+          * ``cands`` is a list of length ``n_cands``.
+          * ``planted_cluster_ids`` is an ``ndarray[int64, n_cands]``
+            with ``-1`` for noise candidates and ``k ≥ 0`` for the
+            ``k``-th planted cluster (per-cube, monotonic). The ordering
+            is "all clustered candidates first, then noise" — within
+            each cluster the candidates are contiguous in ``cands``.
+
+    Raises:
+        ValueError: if ``cluster_fraction`` is outside ``[0, 1]`` or
+            ``n_cands < 0``.
     """
-    n_cands = int(rng.poisson(n_cands_per_cube_lambda))
-    if n_cands <= 0:
-        return []
-
-    # ----- Burst kernel -----
-    k_burst = int(rng.integers(BURST_K_MIN, BURST_K_MAX + 1))
-    k_burst = min(k_burst, n_cands)
-    centre_l = int(rng.integers(0, geom.n_grid))
-    centre_m = int(rng.integers(0, geom.n_grid))
-    centre_fdm = int(rng.integers(0, geom.n_fdm_in_cube))
-    centre_t = int(rng.integers(0, geom.t_det))
-
-    cands: List[Candidate] = []
-    for _ in range(k_burst):
-        l_pix = int(np.clip(
-            centre_l + int(rng.integers(-BURST_LM_JITTER, BURST_LM_JITTER + 1)),
-            0, geom.n_grid - 1,
-        ))
-        m_pix = int(np.clip(
-            centre_m + int(rng.integers(-BURST_LM_JITTER, BURST_LM_JITTER + 1)),
-            0, geom.n_grid - 1,
-        ))
-        fdm = int(np.clip(
-            centre_fdm + int(rng.integers(-BURST_DM_JITTER, BURST_DM_JITTER + 1)),
-            0, geom.n_fdm_in_cube - 1,
-        ))
-        t_in_cube = int(np.clip(
-            centre_t + int(rng.integers(-BURST_T_JITTER, BURST_T_JITTER + 1)),
-            0, geom.t_det - 1,
-        ))
-        # Burst members carry a single shared boxcar width (a real burst
-        # at one DM trial is best matched by one (k_dm, k_time) triple).
-        width = int(rng.choice(NOISE_WIDTH_CHOICES))
-        snr = BURST_SNR_OFFSET + float(rng.exponential(BURST_SNR_SCALE))
-        cands.append(_make_candidate(
-            geom=geom,
-            l_pix=l_pix, m_pix=m_pix,
-            fine_dm_idx=fdm, t_in_cube=t_in_cube,
-            width_samples=width, snr=snr,
-        ))
-
-    # ----- Noise rows -----
-    n_noise = n_cands - k_burst
-    if n_noise > 0:
-        noise_l = rng.integers(0, geom.n_grid, size=n_noise)
-        noise_m = rng.integers(0, geom.n_grid, size=n_noise)
-        noise_fdm = rng.integers(0, geom.n_fdm_in_cube, size=n_noise)
-        noise_t = rng.integers(0, geom.t_det, size=n_noise)
-        noise_widths = rng.choice(NOISE_WIDTH_CHOICES, size=n_noise)
-        noise_snrs = NOISE_SNR_OFFSET + rng.exponential(
-            NOISE_SNR_SCALE, size=n_noise
+    if not 0.0 <= cluster_fraction <= 1.0:
+        raise ValueError(
+            f"cluster_fraction={cluster_fraction}, expected ∈ [0, 1]"
         )
-        for i in range(n_noise):
-            cands.append(_make_candidate(
+    if n_cands < 0:
+        raise ValueError(f"n_cands={n_cands}, expected ≥ 0")
+    if n_cands == 0:
+        return [], np.zeros(0, dtype=np.int64)
+
+    n_target_cluster = int(round(n_cands * cluster_fraction))
+    cluster_ids = np.full(n_cands, -1, dtype=np.int64)
+    cands: List[Candidate] = []
+    cluster_count = 0
+
+    margin = SYNTH_CLUSTER_RADIUS_PIX + 1  # keep cluster centres off the edge
+
+    while True:
+        remaining = n_target_cluster - len(cands)
+        if remaining < SYNTH_CLUSTER_SIZE_MIN:
+            break
+        size_max = min(SYNTH_CLUSTER_SIZE_MAX, remaining)
+        size = int(rng.integers(SYNTH_CLUSTER_SIZE_MIN, size_max + 1))
+
+        center_l = float(rng.uniform(margin, geom.n_grid - margin))
+        center_m = float(rng.uniform(margin, geom.n_grid - margin))
+        center_dm_idx = int(rng.integers(0, geom.n_fdm_in_cube))
+        center_t = int(rng.integers(0, geom.t_det))
+        cluster_width = int(rng.choice(np.asarray(SYNTH_WIDTHS)))
+
+        for _ in range(size):
+            theta = float(rng.uniform(0.0, 2.0 * np.pi))
+            r = float(rng.uniform(0.0, float(SYNTH_CLUSTER_RADIUS_PIX)))
+            l_pix = int(round(center_l + r * np.cos(theta)))
+            m_pix = int(round(center_m + r * np.sin(theta)))
+            l_pix = max(0, min(geom.n_grid - 1, l_pix))
+            m_pix = max(0, min(geom.n_grid - 1, m_pix))
+            # Slight in-cluster jitter on dm/time so cntb_dm > 1 is
+            # plausible without breaking the eps=10 cityblock budget.
+            dm_offset = int(rng.integers(-1, 2))   # {-1, 0, 1}
+            t_offset = int(rng.integers(-2, 3))    # {-2,-1,0,1,2}
+            dm_idx = max(
+                0, min(geom.n_fdm_in_cube - 1, center_dm_idx + dm_offset)
+            )
+            t_in_cube = max(0, min(geom.t_det - 1, center_t + t_offset))
+            snr = float(rng.uniform(SYNTH_SNR_MIN, SYNTH_SNR_MAX))
+            cand = _make_candidate(
+                l_pix=l_pix, m_pix=m_pix,
+                fine_dm_idx=dm_idx, t_in_cube=t_in_cube,
+                width_samples=cluster_width, snr=snr,
                 geom=geom,
-                l_pix=int(noise_l[i]),
-                m_pix=int(noise_m[i]),
-                fine_dm_idx=int(noise_fdm[i]),
-                t_in_cube=int(noise_t[i]),
-                width_samples=int(noise_widths[i]),
-                snr=float(noise_snrs[i]),
-            ))
-    return cands
+                search_node_id=search_node_id, gpu_half=gpu_half,
+            )
+            cands.append(cand)
+            cluster_ids[len(cands) - 1] = cluster_count
+        cluster_count += 1
+
+    while len(cands) < n_cands:
+        l_pix = int(rng.integers(0, geom.n_grid))
+        m_pix = int(rng.integers(0, geom.n_grid))
+        dm_idx = int(rng.integers(0, geom.n_fdm_in_cube))
+        t_in_cube = int(rng.integers(0, geom.t_det))
+        width = int(rng.choice(np.asarray(SYNTH_WIDTHS)))
+        snr = float(rng.uniform(SYNTH_SNR_MIN, SYNTH_SNR_MAX))
+        cand = _make_candidate(
+            l_pix=l_pix, m_pix=m_pix,
+            fine_dm_idx=dm_idx, t_in_cube=t_in_cube,
+            width_samples=width, snr=snr,
+            geom=geom,
+            search_node_id=search_node_id, gpu_half=gpu_half,
+        )
+        cands.append(cand)
+
+    return cands, cluster_ids
 
 
 # ---------------------------------------------------------------------------
-# Bench driver
+# Sweep + summary
 # ---------------------------------------------------------------------------
 
 
-def _percentiles_ms(values_ms: Sequence[float]) -> Dict[str, float]:
-    """Compute p50/p90/p99/max/mean of a list of millisecond values.
+@dataclass(frozen=True)
+class _SweepResult:
+    """Per-(backend, n_cands) sweep result; internal aggregation type."""
+    backend: str
+    n_cands: int
+    timings_ms: np.ndarray
+    n_clusters_per_cube: List[int]
+    n_noise_per_cube: List[int]
 
-    Empty input returns all-zero so the JSON report stays well-formed
-    even on a degenerate (n_cubes=0) bench run; the predicate then
-    trivially passes.
+
+def _percentile(values_ms: np.ndarray, q: float) -> float:
+    """Compute percentile in milliseconds; safe on empty inputs."""
+    return float(np.percentile(values_ms, q)) if values_ms.size else 0.0
+
+
+def _run_sweep(
+    backend: str,
+    n_cands: int,
+    n_cubes: int,
+    cluster_fraction: float,
+    rng: np.random.Generator,
+) -> _SweepResult:
+    """Run ``n_cubes`` per-cube clusterings of synthetic candidate
+    streams; return the timing + record-count aggregate.
+
+    Args:
+        backend: ``"hdbscan"`` or ``"dbscan"``.
+        n_cands: per-cube candidate count.
+        n_cubes: number of cubes to time.
+        cluster_fraction: fraction of synthetic candidates planted in
+            clusters (passed to :func:`synthesize_candidates`).
+        rng: pre-seeded RNG; the caller is responsible for determinism
+            across re-runs.
+
+    Returns:
+        A :class:`_SweepResult` with per-cube wall-clock latencies and
+        cluster / noise counts.
     """
-    if not values_ms:
-        return {
-            "p50_ms": 0.0,
-            "p90_ms": 0.0,
-            "p99_ms": 0.0,
-            "max_ms": 0.0,
-            "mean_ms": 0.0,
-        }
-    arr = np.asarray(values_ms, dtype=np.float64)
+    cfg = ClustererConfig(backend=backend)
+    timings_ms = np.empty(n_cubes, dtype=np.float64)
+    n_clusters: List[int] = []
+    n_noise: List[int] = []
+    for cube_idx in range(n_cubes):
+        geom = _build_geometry(cube_id=cube_idx)
+        cands, _ = synthesize_candidates(n_cands, cluster_fraction, geom, rng)
+        t0 = time.perf_counter()
+        labels, _records = cluster_candidates(cands, geom, config=cfg)
+        t1 = time.perf_counter()
+        timings_ms[cube_idx] = (t1 - t0) * 1000.0
+        unique_labels = {int(lbl) for lbl in labels.tolist()}
+        n_clusters.append(sum(1 for lbl in unique_labels if lbl >= 0))
+        n_noise.append(int((labels == -1).sum()))
+    return _SweepResult(
+        backend=backend,
+        n_cands=n_cands,
+        timings_ms=timings_ms,
+        n_clusters_per_cube=n_clusters,
+        n_noise_per_cube=n_noise,
+    )
+
+
+def _summarise(result: _SweepResult) -> Dict[str, object]:
+    """Reduce a sweep to a JSON-friendly summary row."""
+    arr = result.timings_ms
+    p50 = _percentile(arr, 50)
+    p95 = _percentile(arr, 95)
+    p99 = _percentile(arr, 99)
+    mean_ms = float(arr.mean()) if arr.size else 0.0
+    stddev_ms = float(arr.std(ddof=0)) if arr.size else 0.0
+    throughput = (1000.0 / mean_ms) if mean_ms > 0 else 0.0
+    n_clusters = result.n_clusters_per_cube
+    n_noise = result.n_noise_per_cube
     return {
-        "p50_ms": float(np.percentile(arr, 50)),
-        "p90_ms": float(np.percentile(arr, 90)),
-        "p99_ms": float(np.percentile(arr, 99)),
-        "max_ms": float(arr.max()),
-        "mean_ms": float(arr.mean()),
+        "backend": result.backend,
+        "n_cands": int(result.n_cands),
+        "p50_ms": p50,
+        "p95_ms": p95,
+        "p99_ms": p99,
+        "mean_ms": mean_ms,
+        "stddev_ms": stddev_ms,
+        "throughput_cubes_s": throughput,
+        "n_clusters_mean": (
+            float(np.mean(n_clusters)) if n_clusters else 0.0
+        ),
+        "n_noise_mean": float(np.mean(n_noise)) if n_noise else 0.0,
     }
 
 
+# ---------------------------------------------------------------------------
+# Misc utilities
+# ---------------------------------------------------------------------------
+
+
 def _git_sha() -> str:
-    """Return ``HEAD`` SHA, or ``"unknown"`` if not in a git tree."""
+    """Return the HEAD git sha; ``"unknown"`` if git lookup fails."""
     try:
         out = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=str(REPO_ROOT),
             stderr=subprocess.DEVNULL,
         )
-        return out.decode("ascii").strip()
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return out.decode().strip()
+    except Exception:
         return "unknown"
 
 
 def _hostname() -> str:
-    """Return the short hostname (matches the M6.sh ``host`` field convention)."""
-    try:
-        return socket.gethostname().split(".")[0]
-    except OSError:
-        return "unknown"
+    """Return the short hostname (= what ``hostname -s`` would emit)."""
+    return socket.gethostname().split(".", 1)[0]
 
 
-def _run_bench(
+def _print_summary_table(rows: Sequence[Dict[str, object]]) -> None:
+    """Pretty-print the sweep table to stdout."""
+    header = (
+        "backend", "n_cands", "p50_ms", "p95_ms", "p99_ms",
+        "throughput_cubes_s",
+    )
+    fmt = "{:>10s} {:>8s} {:>10s} {:>10s} {:>10s} {:>20s}"
+    print(fmt.format(*header))
+    print(fmt.format(*("-" * len(h) for h in header)))
+    row_fmt = (
+        "{backend:>10s} {n_cands:>8d} {p50_ms:>10.3f} "
+        "{p95_ms:>10.3f} {p99_ms:>10.3f} {throughput_cubes_s:>20.2f}"
+    )
+    for r in rows:
+        print(row_fmt.format(
+            backend=str(r["backend"]),
+            n_cands=int(r["n_cands"]),
+            p50_ms=float(r["p50_ms"]),
+            p95_ms=float(r["p95_ms"]),
+            p99_ms=float(r["p99_ms"]),
+            throughput_cubes_s=float(r["throughput_cubes_s"]),
+        ))
+
+
+# ---------------------------------------------------------------------------
+# D5 gate evaluation
+# ---------------------------------------------------------------------------
+
+
+def _evaluate_d5_gate(
+    rows: Sequence[Dict[str, object]],
     *,
-    backend: str,
-    feature_mode: str,
-    n_cubes: int,
-    n_cands_per_cube: int,
-    rng_seed: int,
-) -> Tuple[List[CubeTimingRecord], List[float]]:
-    """Drive the clusterer over ``n_cubes`` synthetic cubes.
-
-    Returns:
-        Tuple ``(per_cube_records, wall_ms_list)`` where the second
-        element is a flat list of per-cube wall-times in milliseconds
-        (used to compute summary percentiles).
-    """
-    cfg = ClustererConfig(backend=backend, feature_mode=feature_mode)
-    master_rng = np.random.default_rng(rng_seed)
-    # Per-cube sub-RNG is derived from a master-RNG-driven jump count so
-    # results are reproducible AND independent across cubes.
-    sub_seeds = master_rng.integers(0, 2**63 - 1, size=n_cubes, dtype=np.int64)
-
-    per_cube_records: List[CubeTimingRecord] = []
-    wall_ms_list: List[float] = []
-
-    for cube_id in range(n_cubes):
-        sub_rng = np.random.default_rng(int(sub_seeds[cube_id]))
-        geom = _build_geometry(cube_id)
-        cands = _generate_cube_candidates(
-            geom=geom,
-            n_cands_per_cube_lambda=n_cands_per_cube,
-            rng=sub_rng,
-        )
-
-        t0 = time.perf_counter_ns()
-        labels, records = cluster_candidates(cands, geom, config=cfg)
-        t1 = time.perf_counter_ns()
-        wall_ms = (t1 - t0) / 1e6
-
-        n_clusters = int(np.sum(labels >= 0)) if labels.size else 0
-        n_noise = int(np.sum(labels == -1)) if labels.size else 0
-        record = CubeTimingRecord(
-            cube_id=cube_id,
-            n_cands=len(cands),
-            n_records=len(records),
-            n_clusters=n_clusters,
-            n_noise=n_noise,
-            wall_ms=wall_ms,
-        )
-        per_cube_records.append(record)
-        wall_ms_list.append(wall_ms)
-
-        if cube_id == 0 or (cube_id + 1) % 25 == 0 or cube_id == n_cubes - 1:
-            _LOG.info(
-                "cube %4d/%d : n_cands=%5d n_records=%5d wall=%.2f ms",
-                cube_id + 1, n_cubes, record.n_cands,
-                record.n_records, record.wall_ms,
-            )
-
-    return per_cube_records, wall_ms_list
-
-
-def _write_per_cube_csv(
-    path: Path, per_cube_records: Sequence[CubeTimingRecord]
-) -> None:
-    """Write the per-cube CSV with the spec's column schema.
-
-    Columns: ``cube_id, n_cands, n_records, n_clusters, n_noise, wall_ms``.
-    ``wall_ms`` is written with 6-decimal precision (≈1 ns at ms scale).
-    """
-    with path.open("w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow([
-            "cube_id", "n_cands", "n_records",
-            "n_clusters", "n_noise", "wall_ms",
-        ])
-        for r in per_cube_records:
-            writer.writerow([
-                r.cube_id, r.n_cands, r.n_records,
-                r.n_clusters, r.n_noise, f"{r.wall_ms:.6f}",
-            ])
-
-
-def _build_report(
-    *,
-    backend: str,
-    feature_mode: str,
-    n_cubes: int,
-    n_cands_per_cube: int,
-    rng_seed: int,
     p99_budget_ms: float,
-    per_cube_records: Sequence[CubeTimingRecord],
-    wall_ms_list: Sequence[float],
-) -> Dict[str, Any]:
-    """Assemble the JSON report dict per the spec schema."""
-    pct = _percentiles_ms(wall_ms_list)
-    n_cands_total = int(sum(r.n_cands for r in per_cube_records))
-    n_records_total = int(sum(r.n_records for r in per_cube_records))
-    n_clusters_total = int(sum(r.n_clusters for r in per_cube_records))
-    n_noise_total = int(sum(r.n_noise for r in per_cube_records))
+    production_candidate_count: int,
+) -> Dict[str, object]:
+    """Apply the D5 fallback predicate to the sweep results.
 
-    summary = {
-        "p50_ms": pct["p50_ms"],
-        "p90_ms": pct["p90_ms"],
-        "p99_ms": pct["p99_ms"],
-        "max_ms": pct["max_ms"],
-        "mean_ms": pct["mean_ms"],
-        "n_cubes_run": int(len(per_cube_records)),
-        "n_cands_total": n_cands_total,
-        "n_records_total": n_records_total,
-        "n_clusters_total": n_clusters_total,
-        "n_noise_total": n_noise_total,
-    }
-    p99_observed = pct["p99_ms"]
-    return {
-        "git_sha": _git_sha(),
-        "host": _hostname(),
-        "config": {
-            "backend": backend,
-            "feature_mode": feature_mode,
-            "n_cubes": int(n_cubes),
-            "n_cands_per_cube": int(n_cands_per_cube),
-            "rng_seed": int(rng_seed),
-        },
-        "summary": summary,
-        "d5_fallback_predicate": {
+    Per spec: the gate's ``pass`` field is ``true`` iff HDBSCAN p99
+    latency at the production candidate count is ≤ ``p99_budget_ms``.
+    If the HDBSCAN sweep doesn't include the production candidate count
+    (because the operator excluded ``hdbscan`` from ``--backends`` or
+    ``production_candidate_count`` from ``--candidate-counts``), the gate
+    returns ``decision="skipped"`` with ``pass=true`` (does not block CI).
+    """
+    hdbscan_at_prod = next(
+        (
+            r for r in rows
+            if r["backend"] == ClustererBackend.HDBSCAN
+            and int(r["n_cands"]) == production_candidate_count
+        ),
+        None,
+    )
+    if hdbscan_at_prod is None:
+        return {
+            "pass": True,
+            "decision": "skipped",
+            "reason": (
+                f"HDBSCAN result at n_cands={production_candidate_count}"
+                f" not present in sweep"
+            ),
+            "hdbscan_p99_at_production_ms": None,
             "p99_budget_ms": float(p99_budget_ms),
-            "p99_observed_ms": float(p99_observed),
-            "passes": bool(p99_observed <= p99_budget_ms),
-        },
+            "fallback_required": False,
+            "production_candidate_count": int(production_candidate_count),
+        }
+    p99 = float(hdbscan_at_prod["p99_ms"])
+    passed = p99 <= float(p99_budget_ms)
+    return {
+        "pass": bool(passed),
+        "decision": "evaluated",
+        "hdbscan_p99_at_production_ms": p99,
+        "p99_budget_ms": float(p99_budget_ms),
+        "fallback_required": (not passed),
+        "production_candidate_count": int(production_candidate_count),
     }
 
 
 # ---------------------------------------------------------------------------
-# CLI plumbing
+# CLI
 # ---------------------------------------------------------------------------
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    """Construct the bench's ``argparse`` parser.
-
-    Exposed at module scope so the test suite can introspect the CLI
-    surface without invoking ``main``.
-    """
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    parser = argparse.ArgumentParser(
+        description=(
+            "M6 chunk 6 clusterer throughput bench — D5 fallback gate "
+            "for HDBSCAN p99 ≤ 50 ms at production candidate load."
+        )
     )
-    ap.add_argument(
-        "--report-dir", type=str, default=str(DEFAULT_REPORT_DIR),
-        help=f"Output directory (default: {DEFAULT_REPORT_DIR}).",
-    )
-    ap.add_argument(
-        "--backend", type=str,
-        choices=(ClustererBackend.HDBSCAN, ClustererBackend.DBSCAN),
-        default=DEFAULT_BACKEND,
-        help=f"Clusterer backend (default: {DEFAULT_BACKEND}).",
-    )
-    ap.add_argument(
-        "--feature-mode", type=str,
-        choices=(FeatureMode.INT, FeatureMode.REAL),
-        default=DEFAULT_FEATURE_MODE,
-        help=f"Clusterer feature mode (default: {DEFAULT_FEATURE_MODE}).",
-    )
-    ap.add_argument(
+    parser.add_argument(
         "--n-cubes", type=int, default=DEFAULT_N_CUBES,
-        help=f"Number of cubes to bench (default: {DEFAULT_N_CUBES}).",
+        help="Number of cubes to time per (backend, n_cands) sweep.",
     )
-    ap.add_argument(
-        "--n-cands-per-cube", type=int, default=DEFAULT_N_CANDS_PER_CUBE,
-        help=f"Poisson lambda for per-cube candidate count "
-             f"(default: {DEFAULT_N_CANDS_PER_CUBE}).",
+    parser.add_argument(
+        "--candidate-counts", type=int, nargs="+",
+        default=list(DEFAULT_CANDIDATE_COUNTS),
+        help="Sweep over per-cube candidate counts.",
     )
-    ap.add_argument(
-        "--rng-seed", type=int, default=DEFAULT_RNG_SEED,
-        help=f"Master RNG seed (default: {DEFAULT_RNG_SEED}).",
+    parser.add_argument(
+        "--backends", type=str, nargs="+",
+        default=list(DEFAULT_BACKENDS),
+        choices=(ClustererBackend.HDBSCAN, ClustererBackend.DBSCAN),
+        help="Clusterer backends to sweep.",
     )
-    ap.add_argument(
-        "--device", type=str, default=DEFAULT_DEVICE,
-        help=f"Compute device label (default: {DEFAULT_DEVICE}). The "
-             f"clusterer is CPU-only today; this is a label that lands "
-             f"in report.json so future GPU backends can be diff'd.",
+    parser.add_argument(
+        "--cluster-fraction", type=float, default=DEFAULT_CLUSTER_FRACTION,
+        help=(
+            "Fraction of synthetic candidates planted in clusters of "
+            f"{SYNTH_CLUSTER_SIZE_MIN}-{SYNTH_CLUSTER_SIZE_MAX} within a "
+            f"{SYNTH_CLUSTER_RADIUS_PIX}-pixel (l, m) radius. The rest "
+            "are uniform noise."
+        ),
     )
-    ap.add_argument(
+    parser.add_argument(
+        "--seed", type=int, default=DEFAULT_SEED,
+        help="np.random seed; controls synthetic candidate determinism.",
+    )
+    parser.add_argument(
+        "--report-path", type=Path, default=DEFAULT_REPORT_PATH,
+        help=f"JSON report destination. Default: {DEFAULT_REPORT_PATH}.",
+    )
+    parser.add_argument(
         "--p99-budget-ms", type=float, default=DEFAULT_P99_BUDGET_MS,
-        help=f"D5 fallback budget in ms (default: {DEFAULT_P99_BUDGET_MS}).",
+        help="D5 fallback predicate: HDBSCAN p99 budget in ms.",
     )
-    return ap
+    parser.add_argument(
+        "--production-candidate-count",
+        type=int, default=DEFAULT_PRODUCTION_CANDIDATE_COUNT,
+        help=(
+            "Per-cube candidate count whose HDBSCAN p99 the D5 gate "
+            "evaluates. Must be present in --candidate-counts for the "
+            "gate to render an 'evaluated' verdict; otherwise the gate "
+            "reports 'skipped' (pass=true, non-blocking)."
+        ),
+    )
+    parser.add_argument(
+        "--device", type=str, default="cpu",
+        help=(
+            "Informational only — clusterer is CPU-only. Recorded in "
+            "the report for operator audit (matches the deployed device)."
+        ),
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Suppress progress logging (only emit the summary table).",
+    )
+    return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Bench entry point. Returns a Unix-style exit code (0 = success)."""
-    argv = argv if argv is not None else sys.argv[1:]
-    ap = _build_arg_parser()
-    args = ap.parse_args(argv)
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Bench entry point. Returns the process exit code (0 = D5 PASS,
+    1 = D5 FAIL).
 
-    report_dir = Path(args.report_dir).resolve()
-    report_dir.mkdir(parents=True, exist_ok=True)
+    Args:
+        argv: optional argv override (for in-process test harnesses).
+            Defaults to ``sys.argv[1:]``.
+    """
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
 
-    if not _LOG.handlers:
+    if not args.quiet and not _LOG.handlers:
+        _LOG.setLevel(logging.INFO)
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(
             logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
         )
         _LOG.addHandler(handler)
-    _LOG.setLevel(logging.INFO)
-    _LOG.info(
-        "bench config: backend=%s feature_mode=%s n_cubes=%d "
-        "n_cands_per_cube=%d rng_seed=%d device=%s p99_budget_ms=%.2f",
-        args.backend, args.feature_mode, args.n_cubes,
-        args.n_cands_per_cube, args.rng_seed,
-        args.device, args.p99_budget_ms,
-    )
 
-    # The bench is deterministic via numpy's default_rng; we still seed
-    # python's random + PYTHONHASHSEED-equivalent for any transitive
-    # consumer (e.g. hdbscan's tie-breaks) that might reach for them.
-    random.seed(args.rng_seed)
+    n_cubes = int(args.n_cubes)
+    backends = list(args.backends)
+    candidate_counts = list(args.candidate_counts)
+    cluster_fraction = float(args.cluster_fraction)
+    seed = int(args.seed)
+    p99_budget_ms = float(args.p99_budget_ms)
+    production_candidate_count = int(args.production_candidate_count)
+    report_path: Path = Path(args.report_path).resolve()
 
-    per_cube_records, wall_ms_list = _run_bench(
-        backend=args.backend,
-        feature_mode=args.feature_mode,
-        n_cubes=int(args.n_cubes),
-        n_cands_per_cube=int(args.n_cands_per_cube),
-        rng_seed=int(args.rng_seed),
-    )
-
-    csv_path = report_dir / "per_cube.csv"
-    _write_per_cube_csv(csv_path, per_cube_records)
-
-    report = _build_report(
-        backend=args.backend,
-        feature_mode=args.feature_mode,
-        n_cubes=int(args.n_cubes),
-        n_cands_per_cube=int(args.n_cands_per_cube),
-        rng_seed=int(args.rng_seed),
-        p99_budget_ms=float(args.p99_budget_ms),
-        per_cube_records=per_cube_records,
-        wall_ms_list=wall_ms_list,
-    )
-    report_path = report_dir / "report.json"
-    report_path.write_text(json.dumps(report, indent=2))
+    if n_cubes <= 0:
+        raise SystemExit(f"--n-cubes={n_cubes}, expected > 0")
+    if not candidate_counts:
+        raise SystemExit("--candidate-counts must be non-empty")
+    if not backends:
+        raise SystemExit("--backends must be non-empty")
 
     _LOG.info(
-        "p50=%.2f ms p90=%.2f ms p99=%.2f ms max=%.2f ms mean=%.2f ms "
-        "(n_cubes=%d n_cands=%d n_records=%d n_clusters=%d n_noise=%d)",
-        report["summary"]["p50_ms"],
-        report["summary"]["p90_ms"],
-        report["summary"]["p99_ms"],
-        report["summary"]["max_ms"],
-        report["summary"]["mean_ms"],
-        report["summary"]["n_cubes_run"],
-        report["summary"]["n_cands_total"],
-        report["summary"]["n_records_total"],
-        report["summary"]["n_clusters_total"],
-        report["summary"]["n_noise_total"],
+        "config: n_cubes=%d backends=%s candidate_counts=%s "
+        "cluster_fraction=%.2f seed=%d p99_budget_ms=%.2f "
+        "production_candidate_count=%d device=%s",
+        n_cubes, backends, candidate_counts, cluster_fraction, seed,
+        p99_budget_ms, production_candidate_count, args.device,
     )
-    pred = report["d5_fallback_predicate"]
-    _LOG.info(
-        "D5 predicate: p99_observed=%.2f ms %s budget=%.2f ms (passes=%s)",
-        pred["p99_observed_ms"],
-        "<=" if pred["passes"] else ">",
-        pred["p99_budget_ms"],
-        pred["passes"],
+
+    # Spawn deterministic per-(backend, n_cands) RNGs from a single
+    # SeedSequence so that ordering of backends/candidate_counts in the
+    # CLI doesn't change which sub-RNG runs each sweep. This is what
+    # makes the bench bit-reproducible across re-runs with the same
+    # ``--seed``.
+    n_pairs = len(backends) * len(candidate_counts)
+    child_seqs = np.random.SeedSequence(seed).spawn(n_pairs)
+
+    rows: List[Dict[str, object]] = []
+    pair_idx = 0
+    for backend in backends:
+        for n_cands in candidate_counts:
+            rng = np.random.default_rng(child_seqs[pair_idx])
+            pair_idx += 1
+            _LOG.info(
+                "sweep: backend=%s n_cands=%d (%d cubes)",
+                backend, n_cands, n_cubes,
+            )
+            t0 = time.perf_counter()
+            result = _run_sweep(
+                backend, n_cands, n_cubes, cluster_fraction, rng,
+            )
+            wall_s = time.perf_counter() - t0
+            row = _summarise(result)
+            _LOG.info(
+                "  -> p50=%.3fms p95=%.3fms p99=%.3fms "
+                "mean=%.3fms throughput=%.1f cubes/s "
+                "(sweep wall=%.1fs, n_clusters_mean=%.1f, "
+                "n_noise_mean=%.1f)",
+                row["p50_ms"], row["p95_ms"], row["p99_ms"],
+                row["mean_ms"], row["throughput_cubes_s"], wall_s,
+                row["n_clusters_mean"], row["n_noise_mean"],
+            )
+            rows.append(row)
+
+    d5_gate = _evaluate_d5_gate(
+        rows,
+        p99_budget_ms=p99_budget_ms,
+        production_candidate_count=production_candidate_count,
     )
-    _LOG.info("wrote report=%s per_cube=%s", report_path, csv_path)
-    return 0
+
+    report = {
+        "schema_version": 1,
+        "bench": "clusterer_throughput",
+        "milestone": "M6",
+        "utc_iso": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git_sha(),
+        "host": _hostname(),
+        "n_cubes": n_cubes,
+        "candidate_counts": candidate_counts,
+        "backends": backends,
+        "cluster_fraction": cluster_fraction,
+        "seed": seed,
+        "production_candidate_count": production_candidate_count,
+        "p99_budget_ms": p99_budget_ms,
+        "device": str(args.device),
+        "results": rows,
+        "d5_gate": d5_gate,
+    }
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    _LOG.info("wrote %s", report_path)
+
+    print()
+    print("clusterer throughput summary")
+    _print_summary_table(rows)
+    print()
+    print(
+        f"D5 gate: pass={d5_gate['pass']} "
+        f"decision={d5_gate['decision']!r}"
+    )
+    if d5_gate.get("hdbscan_p99_at_production_ms") is not None:
+        print(
+            f"  hdbscan p99 at n_cands={production_candidate_count}: "
+            f"{d5_gate['hdbscan_p99_at_production_ms']:.3f} ms "
+            f"(budget {p99_budget_ms:.3f} ms)"
+        )
+    elif d5_gate.get("decision") == "skipped":
+        print(f"  skipped: {d5_gate.get('reason')}")
+    if d5_gate.get("fallback_required"):
+        print(
+            "  fallback required: flip "
+            "ClustererConfig.backend = 'dbscan' in "
+            "configs/config_compute_search.yaml"
+        )
+
+    return 0 if d5_gate["pass"] else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
