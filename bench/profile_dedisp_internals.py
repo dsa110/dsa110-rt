@@ -92,8 +92,6 @@ def _profile_one_call(
         bin_shifts, dtype=torch.int64, device=device,
     )
     t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
-    cim_2d = stage1.gridder.cell_index_map.reshape(nb, nch)
-    cim_cb = cim_2d.t().contiguous()
     t1 = _stamp_sync(); _add("B_setup_indices", (t1 - t) * 1000); t = t1
 
     out = torch.empty(
@@ -116,23 +114,18 @@ def _profile_one_call(
         gathered = torch.gather(vis_T, 1, t_idx_b)
         t1 = _stamp_sync(); _add("C_gather_chunk", (t1 - t) * 1000); t = t1
 
-        # D. Per-channel scatter
-        gathered_re = torch.view_as_real(gathered)
-        out_re = torch.zeros(
-            (chunk * t_dedisp, n_filled + 1, 2),
-            dtype=torch.float32, device=device,
-        )
-        for c in range(nch):
-            out_re.index_add_(1, cim_cb[c], gathered_re[c])
-        out_buf = torch.view_as_complex(
-            out_re[:, :n_filled, :].contiguous()
-        )
-        out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
-        t1 = _stamp_sync(); _add("D_scatter_chunk", (t1 - t) * 1000); t = t1
+        # D. Transpose gather output back to (T_chunk, B, C)
+        buf = gathered.permute(1, 2, 0).contiguous()
+        t1 = _stamp_sync(); _add("D_transpose_back", (t1 - t) * 1000); t = t1
 
-        del bs_chunk, t_idx, t_idx_b, gathered, gathered_re, out_re, out_buf
+        # E. Legacy gridder.compute scatter
+        grid_chunk = stage1.gridder.compute(buf)
+        out[c0:c1] = grid_chunk.reshape(chunk, t_dedisp, n_filled)
+        t1 = _stamp_sync(); _add("E_gridder_scatter", (t1 - t) * 1000); t = t1
 
-    del vis_T, bin_shifts_dev, t_arange, cim_cb, cim_2d
+        del bs_chunk, t_idx, t_idx_b, gathered, buf, grid_chunk
+
+    del vis_T, bin_shifts_dev, t_arange
     return out
 
 
