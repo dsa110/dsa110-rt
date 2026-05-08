@@ -1029,6 +1029,36 @@ def process_block(
     :class:`IntegrationOutput`
         Per-block diagnostic + output bundle.
     """
+    # RT Phase 4: process_block is now a thin wrapper that calls the
+    # corr-side and consume-side phases sequentially on the default
+    # stream. The phase split is what BlockPipeliner uses to overlap
+    # the two halves on separate CUDA streams.
+    vis_stokes_i, rfi_result = _process_block_corr_phase(
+        raw, ctx=ctx, block_n=block_n,
+    )
+    return _process_block_consume_phase(
+        vis_stokes_i, rfi_result,
+        ctx=ctx, block_n=block_n,
+    )
+
+
+def _process_block_corr_phase(
+    raw: np.ndarray,
+    *,
+    ctx: IntegrationContext,
+    block_n: int,
+) -> tuple[torch.Tensor, FlagBlockResult | None]:
+    """RT Phase 4: corr-side half of :func:`process_block`.
+
+    Steps 1-6: unpack int4 → RFI flag → RFI mask → cal apply → fused
+    ``compute_split`` → returns a ready-to-grid Stokes-I cube.
+
+    All ops in this function run on the current CUDA stream (either
+    the default stream when called from :func:`process_block`, or the
+    pipeliner's ``_corr_stream``). Pure GPU work after the host-side
+    int4 unpack; the returned ``vis_stokes_i`` may still be in flight
+    on the calling stream when this function returns.
+    """
     # 1. Unpack
     real_v, imag_v = unpack_int4_split(
         raw, device=ctx.device, out_dtype=ctx.voltage_dtype,
@@ -1136,6 +1166,28 @@ def process_block(
             del real_v_slab, imag_v_slab, vis_2pol_slab, stokes_i_slab
         del real_v, imag_v
 
+    return vis_stokes_i, rfi_result
+
+
+def _process_block_consume_phase(
+    vis_stokes_i: torch.Tensor,
+    rfi_result: FlagBlockResult | None,
+    *,
+    ctx: IntegrationContext,
+    block_n: int,
+) -> IntegrationOutput:
+    """RT Phase 4: consume-side half of :func:`process_block`.
+
+    Steps 7-11: dedispersion → static-sky subtract → stage2 fifo push
+    → transport tx. All ops run on the current CUDA stream (either
+    the default stream when called from :func:`process_block`, or the
+    pipeliner's ``_dedisp_stream``).
+
+    Caller must ensure ``vis_stokes_i`` is fully written by the time
+    work on the current stream starts (handled by ``BlockPipeliner``
+    via cross-stream events; trivially satisfied for the default-
+    stream path).
+    """
     if ctx.multi_dm_coarse_dm is not None:
         # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
         # stage-1 shifts → per-trial grid → per-trial static-sky.
@@ -1191,6 +1243,281 @@ def process_block(
         n_tx=n_tx,
         block_n=block_n,
     )
+
+
+# ---------------------------------------------------------------------------
+# RT Phase 4: 2-stream / 2-slot ring-buffer pipeliner
+# ---------------------------------------------------------------------------
+
+
+class BlockPipeliner:
+    """RT Phase 4: overlap the corr-side and consume-side halves of
+    :func:`process_block` on two CUDA streams with a 2-slot ring buffer.
+
+    Why
+    ===
+
+    After Phase 3, the K=1 production op-point per-block GPU breakdown
+    on a 2080Ti is roughly::
+
+        unpack_int4_split        ~107 ms   (4%)
+        compute_split (fused)    ~817 ms   (36%)   ── corr stream A
+        dedisperse_one_window   ~1370 ms   (60%)   ── consume stream B
+                                ─────────
+        wall (sequential)       ~2306 ms   (= corr + dedisp)
+
+    Stream A (corr) and stream B (dedisp + gridder) are independent —
+    they only communicate through ``vis_stokes_i``, which is at most
+    ~88 MB at the production op-point — so they can run concurrently
+    on separate CUDA streams. Steady-state overlapped wall =
+    ``max(corr_time, dedisp_time)`` ≈ 1370 ms per block, a 1.7×
+    speedup over the sequential Phase 3 path.
+
+    Trade-off: 2-block result latency. The output of block ``N`` is
+    returned by the ``push(N+2)`` call (since slot ``N % 2`` is reused
+    by block ``N+2`` and we sync on it then). Real-time FRB search
+    cares about per-block throughput, not the 268 ms (= 2 × 134 ms)
+    extra wall latency.
+
+    Pipeline
+    ========
+
+    Per ``push(raw, block_n)`` call::
+
+        slot = self._n_pushed % n_buffers              # 0 or 1
+
+        # ── Stream A: corr-side (independent of consume) ──
+        # (No explicit wait_event needed: stream A serializes through
+        # its own queue; vis_stokes_i is stream-A-allocated and only
+        # consumed on stream B after the cross-stream record_stream.)
+        with cuda.stream(corr_stream):
+            vis_stokes_i, rfi_result = _corr_phase(raw, ctx)
+            corr_done.record(corr_stream)
+
+        # ── Stream B: consume-side (waits for corr-side) ──
+        with cuda.stream(dedisp_stream):
+            dedisp_stream.wait_event(corr_done)
+            # CRITICAL: tell allocator stream B is also using
+            # vis_stokes_i so it isn't freed before B is done.
+            vis_stokes_i.record_stream(dedisp_stream)
+            output = _consume_phase(vis_stokes_i, rfi_result, ctx, n)
+            dedisp_done.record(dedisp_stream)
+
+    The output for block ``N`` is held until ``push(N+n_buffers)``,
+    at which point we synchronize on ``dedisp_done[N % n_buffers]``
+    and return it. Use :meth:`flush` after the last ``push`` to
+    drain the in-flight blocks.
+
+    Bit-identity
+    ============
+
+    The pipelined path produces bit-identical
+    ``IntegrationOutput.gridded_minus_sky`` to a sequential loop
+    over :func:`process_block`, because the per-block GPU graph is
+    unchanged — only the host-side issue order and stream
+    assignment differ. The cross-stream events ensure stream B
+    reads the same bytes from ``vis_stokes_i`` it would have on
+    the default stream.
+
+    Notes
+    =====
+
+    * Requires ``ctx.device.type == "cuda"``. CPU contexts can't
+      use multiple streams; on CPU just call :func:`process_block`
+      sequentially.
+    * Stateful subsystems (``static_sky`` EMA, ``stage2_fifo``,
+      ``transport_tx``, ``Stage1MultiDMCoarseDM`` sliding window)
+      are updated in block order on stream B's queue, which
+      preserves the same in-order semantics as the sequential
+      path. The static-sky EMA is float-state on the GPU; reads
+      and writes are serialized by stream B.
+    * The host-side ``rfi_result`` (a Python dataclass returned
+      by stream A) is captured synchronously in stream A's
+      issue-time slice and handed off to stream B at issue
+      time too — its scalar fields ``flag_fraction_total``
+      and ``warmup`` are bool / float, not GPU tensors, so no
+      cross-stream synchronization is required for them.
+    """
+
+    def __init__(
+        self,
+        ctx: IntegrationContext,
+        *,
+        n_buffers: int = 2,
+    ) -> None:
+        if ctx.device.type != "cuda":
+            raise ValueError(
+                f"BlockPipeliner requires a CUDA context; got "
+                f"ctx.device={ctx.device}. Use process_block() "
+                f"directly for CPU contexts."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "BlockPipeliner needs torch.cuda.is_available()"
+            )
+        if n_buffers < 2:
+            raise ValueError(
+                f"n_buffers={n_buffers}; pipelining requires "
+                f"≥2 buffers (got 1 ⇒ no overlap)."
+            )
+
+        self.ctx = ctx
+        self.n_buffers = n_buffers
+        self._corr_stream = torch.cuda.Stream(device=ctx.device)
+        self._dedisp_stream = torch.cuda.Stream(device=ctx.device)
+
+        # Per-slot in-flight state. Only the dedisp_done event needs to
+        # survive across push() calls (we sync on it to free up the slot
+        # for re-use). vis_stokes_i is not pre-allocated; it's produced
+        # fresh by stream A's compute_split each block (the allocator
+        # caches the underlying memory after the first n_buffers blocks).
+        self._dedisp_done_events: list[torch.cuda.Event | None] = (
+            [None] * n_buffers
+        )
+        self._inflight_outputs: list[IntegrationOutput | None] = (
+            [None] * n_buffers
+        )
+
+        self._n_pushed = 0
+        self._closed = False
+
+    def push(
+        self,
+        raw: np.ndarray,
+        *,
+        block_n: int,
+    ) -> IntegrationOutput | None:
+        """Submit one fada block to the pipeline.
+
+        Returns the :class:`IntegrationOutput` for the block submitted
+        ``n_buffers`` calls ago, or ``None`` while the pipeline is
+        still warming up (first ``n_buffers`` calls).
+        """
+        if self._closed:
+            raise RuntimeError("BlockPipeliner.push() after close()")
+
+        slot = self._n_pushed % self.n_buffers
+
+        # If this slot was previously written, sync on its dedisp_done
+        # event and return its output now (= block_n - n_buffers).
+        prior_output: IntegrationOutput | None = None
+        if self._n_pushed >= self.n_buffers:
+            ev = self._dedisp_done_events[slot]
+            assert ev is not None, (
+                f"BlockPipeliner: slot {slot} reused but no "
+                f"dedisp_done event recorded"
+            )
+            ev.synchronize()
+            prior_output = self._inflight_outputs[slot]
+            self._inflight_outputs[slot] = None
+            self._dedisp_done_events[slot] = None
+
+        # ── Stream A: corr-side ──
+        # Note: the corr stream serializes through its own queue, so
+        # block N's corr is naturally ordered after block N-1's corr.
+        # We do NOT need wait_event on the consume side here: the
+        # vis_stokes_i is stream-A-allocated, so until we cross-stream
+        # it to stream B (via the record_stream + wait_event below),
+        # the allocator won't reclaim its memory.
+        with torch.cuda.stream(self._corr_stream):
+            vis_stokes_i, rfi_result = _process_block_corr_phase(
+                raw, ctx=self.ctx, block_n=block_n,
+            )
+            corr_done = torch.cuda.Event()
+            corr_done.record(self._corr_stream)
+
+        # ── Stream B: consume-side ──
+        # 1) wait_event(corr_done): stream B waits for stream A's
+        #    compute_split to fully populate vis_stokes_i.
+        # 2) vis_stokes_i.record_stream(dedisp_stream): tells the
+        #    caching allocator that the dedisp stream is also using
+        #    this tensor. Without this, when block N+1's corr starts
+        #    on stream A and the allocator looks for free buffers, it
+        #    might reclaim vis_stokes_i before stream B has finished
+        #    reading from it (since stream A has already finished).
+        with torch.cuda.stream(self._dedisp_stream):
+            self._dedisp_stream.wait_event(corr_done)
+            vis_stokes_i.record_stream(self._dedisp_stream)
+            output = _process_block_consume_phase(
+                vis_stokes_i, rfi_result,
+                ctx=self.ctx, block_n=block_n,
+            )
+            dedisp_done = torch.cuda.Event()
+            dedisp_done.record(self._dedisp_stream)
+
+        # Stash output + event for retrieval ``n_buffers`` calls from now.
+        self._inflight_outputs[slot] = output
+        self._dedisp_done_events[slot] = dedisp_done
+        self._n_pushed += 1
+        return prior_output
+
+    def flush(self) -> list[IntegrationOutput]:
+        """Drain in-flight blocks. Returns outputs in submission order.
+
+        Call after the last :meth:`push`. After ``flush``, the
+        pipeliner cannot accept more pushes (call :meth:`close`).
+        """
+        outs: list[IntegrationOutput] = []
+        # The slots still holding in-flight blocks are the LAST
+        # ``min(n_pushed, n_buffers)`` blocks submitted.
+        n_pending = min(self._n_pushed, self.n_buffers)
+        first_pending = self._n_pushed - n_pending
+        for i in range(n_pending):
+            slot = (first_pending + i) % self.n_buffers
+            ev = self._dedisp_done_events[slot]
+            if ev is None:
+                continue
+            ev.synchronize()
+            outs.append(self._inflight_outputs[slot])
+            self._inflight_outputs[slot] = None
+            self._dedisp_done_events[slot] = None
+        return outs
+
+    def close(self) -> None:
+        """Mark the pipeliner closed; no further pushes accepted."""
+        self._closed = True
+
+
+def process_blocks_pipelined(
+    raws: list[np.ndarray],
+    *,
+    ctx: IntegrationContext,
+    n_buffers: int = 2,
+    block_n_start: int = 1,
+) -> list[IntegrationOutput]:
+    """Convenience: run :class:`BlockPipeliner` over a list of raw blocks.
+
+    Drains the pipeline at the end so the caller gets one
+    :class:`IntegrationOutput` per input ``raw``, in submission order.
+
+    Used by the Phase-4 bit-identity test + the perf bench. Production
+    code should construct a :class:`BlockPipeliner` and call ``push``
+    inside the fada read loop so the host can issue the next read while
+    the GPU pipeline drains the prior block.
+    """
+    pipeliner = BlockPipeliner(ctx, n_buffers=n_buffers)
+    outs: list[IntegrationOutput | None] = [None] * len(raws)
+    push_idx = 0
+    for raw in raws:
+        prior = pipeliner.push(raw, block_n=block_n_start + push_idx)
+        if prior is not None:
+            outs[push_idx - n_buffers] = prior
+        push_idx += 1
+    drained = pipeliner.flush()
+    pipeliner.close()
+    # The last n_buffers entries should now be filled by ``drained``,
+    # in submission order.
+    for i, out in enumerate(drained):
+        outs[len(raws) - len(drained) + i] = out
+    # Sanity: every output slot should be populated.
+    for i, out in enumerate(outs):
+        if out is None:
+            raise RuntimeError(
+                f"process_blocks_pipelined: output slot {i} not "
+                f"populated (n_pushed={push_idx}, n_drained="
+                f"{len(drained)}, n_buffers={n_buffers})"
+            )
+    return outs  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

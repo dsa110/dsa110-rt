@@ -348,6 +348,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dm-truth", type=float, default=1500.0)
     p.add_argument("--no-trace", action="store_true",
                    help="skip the torch.profiler chrome trace.")
+    p.add_argument(
+        "--pipeline", action="store_true",
+        help=(
+            "RT Phase 4: use BlockPipeliner (2 streams + 2-slot ring "
+            "buffer) instead of the sequential process_block() loop. "
+            "Reports steady-state per-block wall time (= the slower "
+            "of the corr / dedisp halves, after warmup)."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -400,33 +409,93 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     counters = _PhaseCounters()
-    unwind = _install_phase_wrappers(counters)
+    if args.pipeline:
+        # Phase counters use blocking ``ev_end.synchronize()`` after each
+        # wrapped call to read elapsed_time; that would defeat the
+        # 2-stream pipeliner's overlap. Skip the wrappers in pipelined
+        # mode and only report wall time per push (= steady-state
+        # bottleneck stream's per-block ms = max(corr, dedisp)).
+        unwind = lambda: None
+    else:
+        unwind = _install_phase_wrappers(counters)
 
     rng = np.random.default_rng(seed=0)
 
     block_n = 0
-    # Warmup (no counters; warmup also seeds the F34 ring buffer)
-    for _ in range(args.warmup):
-        block_n += 1
-        raw = _synth_voltage_block(rng=rng)
-        process_block(raw, ctx=ctx, block_n=block_n)
-    if torch.cuda.is_available():
+    if args.pipeline:
+        # RT Phase 4: 2-stream pipeliner. The phase counters still
+        # accumulate per-block GPU ms (unchanged), but the wall-clock
+        # measurement reports steady-state (post-warmup) per-push
+        # latency, which is = max(corr_phase, dedisp_phase) once the
+        # 2-slot ring buffer is full.
+        from dsart.services.corr_fast_integration import BlockPipeliner
+        if not torch.cuda.is_available():
+            raise RuntimeError("--pipeline requires CUDA")
+        pipeliner = BlockPipeliner(ctx, n_buffers=2)
+
+        # Warmup: seed the F34 sliding-window state + fill the
+        # pipeliner's 2-slot ring buffer.
+        for _ in range(args.warmup):
+            block_n += 1
+            raw = _synth_voltage_block(rng=rng)
+            pipeliner.push(raw, block_n=block_n)
         torch.cuda.synchronize()
 
-    LOG.info("warmup done; profiling %d blocks", args.n_blocks)
-    per_block_wall_ms: list[float] = []
-    for _ in range(args.n_blocks):
-        block_n += 1
-        raw = _synth_voltage_block(rng=rng)
-        counters.reset_block()
+        LOG.info(
+            "warmup done; pipelined profiling %d blocks (n_buffers=2)",
+            args.n_blocks,
+        )
+        # Steady-state pipelined wall = host-perceived time per push.
+        # In steady state, push(N+2) blocks on dedisp_done[N % 2], so
+        # its wall time is the time between "block N's dedisp
+        # completes" and the previous push's return — i.e., the
+        # gap between the slow stream's per-block emit times,
+        # which equals max(corr_time, dedisp_time). We do NOT
+        # synchronize after push (that would serialize and defeat
+        # the pipelining); the next push() does the right thing
+        # by blocking on the dedisp event when needed.
+        per_block_wall_ms: list[float] = []
+        t_prev = time.perf_counter()
+        for _ in range(args.n_blocks):
+            block_n += 1
+            raw = _synth_voltage_block(rng=rng)
+            counters.reset_block()
+            t_push_start = time.perf_counter()
+            pipeliner.push(raw, block_n=block_n)
+            t_push_end = time.perf_counter()
+            # Host-perceived push latency for THIS push (steady state
+            # = pipeline bottleneck per block).
+            per_block_wall_ms.append((t_push_end - t_push_start) * 1000.0)
+            counters.commit_block()
+            t_prev = t_push_end
+        # Drain — flush() syncs on the trailing in-flight blocks so the
+        # phase counters see complete events.
+        pipeliner.flush()
+        pipeliner.close()
+        torch.cuda.synchronize()
+    else:
+        # Warmup (no counters; warmup also seeds the F34 ring buffer)
+        for _ in range(args.warmup):
+            block_n += 1
+            raw = _synth_voltage_block(rng=rng)
+            process_block(raw, ctx=ctx, block_n=block_n)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        process_block(raw, ctx=ctx, block_n=block_n)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        per_block_wall_ms.append((time.perf_counter() - t0) * 1000.0)
-        counters.commit_block()
+
+        LOG.info("warmup done; profiling %d blocks", args.n_blocks)
+        per_block_wall_ms = []
+        for _ in range(args.n_blocks):
+            block_n += 1
+            raw = _synth_voltage_block(rng=rng)
+            counters.reset_block()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            process_block(raw, ctx=ctx, block_n=block_n)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            per_block_wall_ms.append((time.perf_counter() - t0) * 1000.0)
+            counters.commit_block()
 
     # Optionally one chrome trace block
     trace_path = None

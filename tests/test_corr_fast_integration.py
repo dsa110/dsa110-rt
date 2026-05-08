@@ -31,6 +31,7 @@ from dsart.services.slow_corr_kernel import (
 )
 from dsart.rfi import FlagBlockResult, FlagSourceBit
 from dsart.services.corr_fast_integration import (
+    BlockPipeliner,
     FastIntegrationConfig,
     IntegrationContext,
     IntegrationOutput,
@@ -42,6 +43,7 @@ from dsart.services.corr_fast_integration import (
     apply_rfi_mask_to_voltages,
     build_context,
     process_block,
+    process_blocks_pipelined,
     _build_core_baseline_mask,
 )
 
@@ -721,6 +723,116 @@ class TestRTPhase3FusedComputeSplit:
             out.gridded_minus_sky, out_auto.gridded_minus_sky,
             rtol=0, atol=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# RT Phase 4: 2-stream / 2-slot ring-buffer pipeliner bit-identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="BlockPipeliner requires a CUDA device (h01 GPU)",
+)
+class TestRTPhase4Pipeliner:
+    """RT Phase 4: ``BlockPipeliner`` is bit-identical to a sequential
+    loop over :func:`process_block` on the GPU.
+
+    The pipeline issues per-block stream-A (corr) work and stream-B
+    (dedisp + gridder) work back-to-back; cross-stream events ensure
+    stream B reads the same vis_stokes_i bytes that the default-
+    stream sequential path would. The static-sky EMA, stage2 fifo,
+    and ``Stage1MultiDMCoarseDM`` sliding window are all updated in
+    block order on stream B's serialized queue, so stateful subsystems
+    see the same per-block update sequence.
+
+    Skipped on CPU because :class:`BlockPipeliner` requires CUDA
+    (multiple stream usage). The full integration test on h01 GPU
+    pins both per-block ``gridded_minus_sky`` bytes and the n_tx
+    counter against the sequential path.
+    """
+
+    @pytest.mark.parametrize("n_blocks", [1, 2, 3, 4])
+    def test_pipelined_equals_sequential(self, n_blocks: int) -> None:
+        device = torch.device("cuda")
+        cfg = _make_cfg(t_int_fast_native=32, chan_sum_factor=8)
+        antpos_e, antpos_n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+
+        # Two contexts so the static-sky EMA / sliding window state in
+        # each is independent (the pipelined and sequential runs each
+        # start from a fresh-state context).
+        ctx_seq = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
+        ctx_pip = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
+
+        raws = [
+            _synthetic_fada_block(seed=20260505 + i)
+            for i in range(n_blocks)
+        ]
+
+        # Sequential reference
+        outs_seq: list[IntegrationOutput] = []
+        for i, raw in enumerate(raws):
+            outs_seq.append(
+                process_block(raw, ctx=ctx_seq, block_n=i + 1)
+            )
+
+        # Pipelined run (n_buffers=2 → 2-block latency)
+        outs_pip = process_blocks_pipelined(
+            raws, ctx=ctx_pip, n_buffers=2, block_n_start=1,
+        )
+
+        assert len(outs_pip) == len(outs_seq) == n_blocks
+
+        for i in range(n_blocks):
+            seq = outs_seq[i]
+            pip = outs_pip[i]
+            assert pip.block_n == seq.block_n, (
+                f"block {i}: pipelined block_n={pip.block_n} != "
+                f"seq block_n={seq.block_n}"
+            )
+            assert pip.n_tx == seq.n_tx, (
+                f"block {i}: pipelined n_tx={pip.n_tx} != seq "
+                f"n_tx={seq.n_tx}"
+            )
+            assert pip.gridded_minus_sky.shape == seq.gridded_minus_sky.shape
+            assert pip.gridded_minus_sky.dtype == seq.gridded_minus_sky.dtype
+            torch.testing.assert_close(
+                pip.gridded_minus_sky,
+                seq.gridded_minus_sky,
+                rtol=0, atol=0,
+                msg=lambda m: (
+                    f"Phase-4 pipelined != Phase-3 sequential for "
+                    f"block {i}: {m}"
+                ),
+            )
+
+    def test_rejects_cpu_context(self) -> None:
+        cfg = _make_cfg()
+        ctx = _build_test_context(cfg)              # CPU context
+        with pytest.raises(ValueError, match="CUDA"):
+            BlockPipeliner(ctx)
+
+    def test_rejects_n_buffers_lt_2(self) -> None:
+        device = torch.device("cuda")
+        cfg = _make_cfg()
+        antpos_e, antpos_n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        ctx = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
+        with pytest.raises(ValueError, match="n_buffers"):
+            BlockPipeliner(ctx, n_buffers=1)
 
 
 # ---------------------------------------------------------------------------
