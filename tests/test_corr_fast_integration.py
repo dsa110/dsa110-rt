@@ -641,12 +641,12 @@ class TestRTPhase3FusedComputeSplit:
             (32, 4, 128),
             (32, 2, 128),
             (32, 8, 16),      # legacy path with explicit small chunks
-            (32, 8, 1),       # legacy path slab-of-1
-            # Note: ``t_int_fast_native=8`` (production cadence, 512 fv
-            # tiles) is exercised by tests/test_fast_corr_kernel.py
-            # directly on the GEMM kernel; running both legacy + fused
-            # ``process_block`` at that cadence on CPU takes ~5+ min and
-            # adds no coverage beyond the per-kernel test.
+            # Note: heavier rows (n_fv_chunk=1 with 128-tile blocks, or
+            # the production t_int_fast_native=8 cadence with 512 tiles)
+            # are exercised at the kernel level by
+            # tests/test_fast_corr_kernel.py::TestComputeSplitFusedStokesI;
+            # running both legacy + fused process_block on CPU at those
+            # shapes adds no coverage beyond the per-kernel test.
         ],
     )
     def test_fused_path_bit_identical_to_legacy_streaming(
