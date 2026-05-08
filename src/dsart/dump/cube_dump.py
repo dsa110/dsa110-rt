@@ -1,0 +1,525 @@
+"""Cube-dump writer thread + bright-pulse predicate (M6 chunk 3).
+
+Implements the two surfaces of the per-(search_node, gpu_half) cube
+dumper described in ``M6_PLAN_FIXES.md`` D7/D8:
+
+  1. ``BrightPulsePredicate`` — auto-trigger gate. Evaluates a
+     ``ClusterRecord`` against a configurable predicate (SNR floor,
+     fine-DM band, width ceiling, cluster-cardinality floor, plus a
+     per-process holdoff) and returns ``True`` iff the cluster should
+     fire a cube dump. Holdoff state is advanced as a side effect on
+     a ``True`` return so consecutive bursts within ``holdoff_ms`` are
+     squelched.
+
+  2. ``CubeDumpWriter`` — single-worker writer thread fed by a bounded
+     ``queue.Queue(maxsize=4)``. Each accepted submit pops in the
+     drain loop and writes a ``[T_det, N_fine_DM, N_grid, N_grid]``
+     float16 cube as an NPZ archive at
+     ``${DUMP_ROOT}/cube_s${sid}_g${g}_${event_specnum_start}.npz``
+     with a sidecar manifest. When the queue is full ``put_nowait``
+     raises and the dispatch path logs a WARNING, increments the
+     ``n_dropped`` counter, and returns ``False`` — the real-time hot
+     path is non-blocking.
+
+The auto-trigger path fires on the CURRENT cube (the GPU cube tensor
+is still in scope right after clustering); the UDP path (chunk 4
+listener, chunk 5 wiring) flips a one-shot flag that fires on the
+NEXT cube. This module exposes both shapes via the same ``submit``
+API: chunk 5 just builds an ``udp`` ``CubeDumpManifest`` (with
+``cluster_record=None``) when consuming the flag.
+
+NPZ schema (per D7):
+    cube                  -> [T_det, N_fdm, N_grid, N_grid] float16
+    mjd_start             -> 0-d float64
+    event_specnum_start   -> 0-d int64
+    t_det                 -> 0-d int32
+    n_fdm_in_cube         -> 0-d int32
+    n_grid                -> 0-d int32
+    cluster_record        -> 0-d 'U' (json-encoded ``asdict``; ``'null'`` for udp)
+    trigger_source        -> 0-d 'U'  ('auto' | 'udp')
+    search_node_id        -> 0-d int32
+    gpu_half              -> 0-d int32
+
+Compatible with ``np.load(path, allow_pickle=False)`` because no field
+is an object array (the JSON cluster record is stored as a unicode
+0-d ndarray, mirroring ``DmPlan.to_npz``).
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import dataclasses
+import json
+import logging
+import queue
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
+import numpy as np
+
+from ..common.contracts import ClusterRecord, CubeDumpManifest
+from ._clock import monotonic_ms
+
+__all__ = [
+    "BrightPulsePredicateConfig",
+    "BrightPulsePredicate",
+    "CubeDumpWriterConfig",
+    "CubeDumpWriter",
+]
+
+
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Bright-pulse predicate (D8)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BrightPulsePredicateConfig:
+    """Configurable thresholds for the auto-trigger predicate (M6 D8).
+
+    A cluster fires the cube dump iff ALL conditions hold:
+
+      * ``snr >= min_snr``
+      * ``dm_fine_min_pc_cc <= dm_fine_pc_cc <= dm_fine_max_pc_cc``
+        (each ``None`` bound disables that side)
+      * ``width_samples <= width_samples_max`` (``None`` disables)
+      * ``cntc >= min_cntc`` (default 1 accepts singletons)
+      * ``now_ms - last_dump_ms >= holdoff_ms`` (per-process)
+
+    Args:
+        min_snr: peak-candidate SNR floor in sigma. Default 10.0.
+        dm_fine_min_pc_cc: lower fine-DM bound in pc cm^-3, inclusive.
+            ``None`` disables the lower bound.
+        dm_fine_max_pc_cc: upper fine-DM bound in pc cm^-3, inclusive.
+            ``None`` disables the upper bound.
+        width_samples_max: matched-filter width ceiling in samples,
+            inclusive. ``None`` disables.
+        min_cntc: cluster-cardinality floor (>= 1).
+        holdoff_ms: per-process minimum gap between successful auto
+            triggers in milliseconds. Bursts are rare; this prevents a
+            sidelobe run from firing dozens of NPZs.
+    """
+
+    min_snr: float = 10.0
+    dm_fine_min_pc_cc: Optional[float] = None
+    dm_fine_max_pc_cc: Optional[float] = None
+    width_samples_max: Optional[int] = None
+    min_cntc: int = 1
+    holdoff_ms: float = 5000.0
+
+
+class BrightPulsePredicate:
+    """Stateful evaluator for the bright-pulse auto-trigger gate.
+
+    Holds the timestamp of the last successful dispatch; on each call
+    re-evaluates the configurable thresholds and the holdoff window. A
+    ``True`` return advances the holdoff clock; ``False`` does not, so
+    consecutive failures don't move the deadline.
+
+    The instance is intended to be owned by the per-(search_node,
+    gpu_half) clusterer dispatch path (chunk 5 wiring). It is NOT
+    thread-safe — use one instance per dispatch thread.
+
+    Args:
+        config: locked-in predicate thresholds.
+        time_now_ms: callable returning the current monotonic time in
+            milliseconds. Defaults to ``_clock.monotonic_ms``. Tests
+            inject a fake clock to advance time without sleeping.
+    """
+
+    __slots__ = ("_config", "_time_now_ms", "_last_dispatch_ms")
+
+    def __init__(
+        self,
+        config: BrightPulsePredicateConfig,
+        *,
+        time_now_ms: Callable[[], float] = monotonic_ms,
+    ) -> None:
+        if config.min_cntc < 1:
+            raise ValueError(
+                f"min_cntc={config.min_cntc}, expected >= 1"
+            )
+        if config.holdoff_ms < 0.0:
+            raise ValueError(
+                f"holdoff_ms={config.holdoff_ms}, expected >= 0"
+            )
+        if (
+            config.dm_fine_min_pc_cc is not None
+            and config.dm_fine_max_pc_cc is not None
+            and config.dm_fine_min_pc_cc > config.dm_fine_max_pc_cc
+        ):
+            raise ValueError(
+                f"dm_fine_min_pc_cc={config.dm_fine_min_pc_cc} > "
+                f"dm_fine_max_pc_cc={config.dm_fine_max_pc_cc}"
+            )
+        self._config = config
+        self._time_now_ms = time_now_ms
+        self._last_dispatch_ms: Optional[float] = None
+
+    def __call__(self, record: ClusterRecord) -> bool:
+        """Return True iff ``record`` fires the auto-trigger predicate.
+
+        Side effect: a ``True`` return advances the holdoff clock so
+        the next predicate-passing record within ``holdoff_ms`` returns
+        ``False``.
+
+        Args:
+            record: peak ``ClusterRecord`` from the per-cube clusterer.
+
+        Returns:
+            ``True`` iff every threshold passes AND the holdoff window
+            has elapsed.
+        """
+        cfg = self._config
+        if record.snr < cfg.min_snr:
+            return False
+        if (
+            cfg.dm_fine_min_pc_cc is not None
+            and record.dm_fine_pc_cc < cfg.dm_fine_min_pc_cc
+        ):
+            return False
+        if (
+            cfg.dm_fine_max_pc_cc is not None
+            and record.dm_fine_pc_cc > cfg.dm_fine_max_pc_cc
+        ):
+            return False
+        if (
+            cfg.width_samples_max is not None
+            and record.width_samples > cfg.width_samples_max
+        ):
+            return False
+        if record.cntc < cfg.min_cntc:
+            return False
+        now_ms = self._time_now_ms()
+        if (
+            self._last_dispatch_ms is not None
+            and (now_ms - self._last_dispatch_ms) < cfg.holdoff_ms
+        ):
+            return False
+        self._last_dispatch_ms = now_ms
+        return True
+
+    @property
+    def last_dispatch_ms(self) -> Optional[float]:
+        """Timestamp (ms) of the last True return, or None if never fired."""
+        return self._last_dispatch_ms
+
+
+# ---------------------------------------------------------------------------
+# Cube-dump writer thread (D7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CubeDumpWriterConfig:
+    """Configuration for ``CubeDumpWriter`` (M6 D7).
+
+    Args:
+        dump_root: directory under which NPZ dumps are written. Files
+            land at ``${dump_root}/cube_s${sid}_g${g}_${event_specnum_start}.npz``.
+            The directory is NOT auto-created — production wiring sets
+            this from ``DSART_M6_CUBE_DUMP_DIR`` (or its default
+            ``${REPO_ROOT}/bench/reports/M6/cube_dump/``) and the
+            milestone bring-up provisions it.
+        search_node_id: 0..N_SEARCH-1 of the dumping process.
+        gpu_half: 0..N_SEARCH_GPU-1 of the dumping process.
+        queue_maxsize: bounded queue depth between the dispatch path
+            and the writer thread. Default 4 per D7. ``put_nowait`` on
+            a full queue logs WARNING + increments ``n_dropped``.
+    """
+
+    dump_root: Path
+    search_node_id: int
+    gpu_half: int
+    queue_maxsize: int = 4
+
+
+# Sentinel pushed onto the queue by ``stop()`` to terminate the drain
+# loop. Defined at module scope so it has a stable identity even if
+# ``CubeDumpWriter`` is reloaded.
+_DRAIN_SENTINEL = object()
+
+
+class CubeDumpWriter:
+    """Single-worker NPZ cube-dump writer thread (M6 D7).
+
+    Uses one ``concurrent.futures.ThreadPoolExecutor(max_workers=1)``
+    per ``CubeDumpWriter`` instance, fed by a bounded
+    ``queue.Queue(maxsize=queue_maxsize)``. The dispatch path calls
+    ``submit`` with the cube tensor and a fully-built
+    ``CubeDumpManifest``; ``submit`` pushes onto the queue with
+    ``put_nowait`` and returns ``True`` on success or ``False`` if the
+    queue is full (with a WARNING log and ``n_dropped`` increment).
+
+    The drain loop:
+
+      1. Pops ``(cube, manifest)``.
+      2. Converts the cube to ``np.ndarray`` of dtype float16 if it
+         arrived as a torch tensor or in another dtype.
+      3. ``np.savez`` to the canonical path.
+      4. Increments ``n_dumped`` on success or ``n_failed`` on
+         ``OSError`` (logged at ERROR; the worker thread does not
+         re-raise into the dispatch path).
+
+    The torch -> numpy conversion intentionally happens IN the writer
+    thread, not in the dispatch path, so the real-time GPU pipeline
+    doesn't pay the ``.cpu()`` synchronization cost.
+
+    Counters (``n_dumped``, ``n_dropped``, ``n_failed``,
+    ``queue_depth``) are read-only properties safe to inspect from
+    the operator process.
+
+    Lifecycle: instantiate, call ``start()`` once, call ``submit()``
+    repeatedly from the dispatch thread, then call ``stop()`` once at
+    shutdown to drain pending dumps and shut the executor down.
+    """
+
+    def __init__(self, config: CubeDumpWriterConfig) -> None:
+        if config.queue_maxsize <= 0:
+            raise ValueError(
+                f"queue_maxsize={config.queue_maxsize}, expected > 0"
+            )
+        self._config = config
+        self._queue: queue.Queue[Any] = queue.Queue(
+            maxsize=config.queue_maxsize
+        )
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._drain_future: Optional[concurrent.futures.Future] = None
+        self._started = False
+        self._stopped = False
+        self._n_dumped = 0
+        self._n_dropped = 0
+        self._n_failed = 0
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Spin up the single-worker executor and the drain loop."""
+        if self._started:
+            return
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=(
+                f"cube-dump-s{self._config.search_node_id}"
+                f"-g{self._config.gpu_half}"
+            ),
+        )
+        self._drain_future = self._executor.submit(self._drain_loop)
+        self._started = True
+
+    def stop(self) -> None:
+        """Drain the queue and shut the executor down.
+
+        Pushes a sentinel onto the queue (blocking ``put`` so it lands
+        even if the queue is currently full — the drain loop will pop
+        items in front of it first, eventually clearing space) and
+        joins the worker. After ``stop()`` returns, all accepted dumps
+        have been written and no truncated files remain.
+        """
+        if not self._started or self._stopped:
+            return
+        self._stopped = True
+        self._queue.put(_DRAIN_SENTINEL)
+        assert self._executor is not None
+        self._executor.shutdown(wait=True)
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    def submit(
+        self,
+        *,
+        cube: Any,
+        manifest: CubeDumpManifest,
+    ) -> bool:
+        """Enqueue a cube for asynchronous NPZ dump.
+
+        Args:
+            cube: cube tensor with shape
+                ``[T_det, n_fdm_in_cube, n_grid, n_grid]``. Accepted
+                as ``np.ndarray`` (any real dtype; cast to float16 in
+                the writer thread) or as a torch tensor (same; the
+                ``.detach().cpu().numpy()`` round-trip happens in the
+                writer thread, not on the dispatch hot path).
+            manifest: fully-validated ``CubeDumpManifest``. The
+                writer thread builds the canonical NPZ path from the
+                manifest's ``event_specnum_start`` and the writer's
+                ``(search_node_id, gpu_half)`` config; the manifest's
+                ``npz_path`` field is informational.
+
+        Returns:
+            ``True`` if the cube was accepted onto the queue;
+            ``False`` if the queue was full. ``False`` returns log
+            ``cube_dump_dropped: queue full (cube_id=%d)`` at WARNING
+            and increment ``n_dropped``.
+
+        Raises:
+            RuntimeError: if called before ``start()`` or after
+                ``stop()``.
+        """
+        if not self._started:
+            raise RuntimeError("CubeDumpWriter.submit() before start()")
+        if self._stopped:
+            raise RuntimeError("CubeDumpWriter.submit() after stop()")
+        try:
+            self._queue.put_nowait((cube, manifest))
+            return True
+        except queue.Full:
+            _log.warning(
+                "cube_dump_dropped: queue full (cube_id=%d)",
+                manifest.cube_id,
+            )
+            self._n_dropped += 1
+            return False
+
+    # ------------------------------------------------------------------
+    # Counters
+    # ------------------------------------------------------------------
+
+    @property
+    def n_dumped(self) -> int:
+        """Number of NPZ dumps successfully written."""
+        return self._n_dumped
+
+    @property
+    def n_dropped(self) -> int:
+        """Number of submits dropped due to queue-full backpressure."""
+        return self._n_dropped
+
+    @property
+    def n_failed(self) -> int:
+        """Number of dumps that raised ``OSError`` in the writer thread."""
+        return self._n_failed
+
+    @property
+    def queue_depth(self) -> int:
+        """Approximate current depth of the writer queue.
+
+        ``Queue.qsize`` is documented as approximate (not reliable for
+        synchronization decisions) but is fine for operator metrics.
+        """
+        return self._queue.qsize()
+
+    # ------------------------------------------------------------------
+    # Worker
+    # ------------------------------------------------------------------
+
+    def _drain_loop(self) -> None:
+        """Pop-and-write loop, runs on the executor's single worker."""
+        while True:
+            item = self._queue.get()
+            try:
+                if item is _DRAIN_SENTINEL:
+                    return
+                cube, manifest = item
+                try:
+                    self._write_one(cube, manifest)
+                    self._n_dumped += 1
+                except OSError as exc:
+                    _log.error(
+                        "cube_dump write failed (cube_id=%d, "
+                        "event_specnum_start=%d): %s",
+                        manifest.cube_id,
+                        manifest.event_specnum_start,
+                        exc,
+                    )
+                    self._n_failed += 1
+                except Exception as exc:  # pragma: no cover - defensive
+                    _log.exception(
+                        "cube_dump unexpected error (cube_id=%d): %s",
+                        manifest.cube_id,
+                        exc,
+                    )
+                    self._n_failed += 1
+            finally:
+                self._queue.task_done()
+
+    def _write_one(
+        self,
+        cube: Any,
+        manifest: CubeDumpManifest,
+    ) -> None:
+        """Convert + persist a single (cube, manifest) pair to NPZ."""
+        cube_np = _coerce_cube_to_float16_ndarray(cube)
+        path = self._compose_path(manifest)
+        cluster_record_json = _cluster_record_to_json(manifest.cluster_record)
+        np.savez(
+            str(path),
+            cube=cube_np,
+            mjd_start=np.asarray(manifest.mjd_start, dtype="float64"),
+            event_specnum_start=np.asarray(
+                manifest.event_specnum_start, dtype="int64"
+            ),
+            t_det=np.asarray(manifest.t_det, dtype="int32"),
+            n_fdm_in_cube=np.asarray(manifest.n_fdm_in_cube, dtype="int32"),
+            n_grid=np.asarray(manifest.n_grid, dtype="int32"),
+            cluster_record=np.asarray(cluster_record_json, dtype="U"),
+            trigger_source=np.asarray(manifest.trigger_source, dtype="U"),
+            search_node_id=np.asarray(
+                self._config.search_node_id, dtype="int32"
+            ),
+            gpu_half=np.asarray(self._config.gpu_half, dtype="int32"),
+        )
+
+    def _compose_path(self, manifest: CubeDumpManifest) -> Path:
+        """Build the canonical NPZ path for ``manifest``."""
+        sid = self._config.search_node_id
+        g = self._config.gpu_half
+        return self._config.dump_root / (
+            f"cube_s{sid}_g{g}_{manifest.event_specnum_start}.npz"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-private helpers
+# ---------------------------------------------------------------------------
+
+
+def _coerce_cube_to_float16_ndarray(cube: Any) -> np.ndarray:
+    """Return ``cube`` as a ``np.ndarray`` of dtype float16.
+
+    Accepts a ``np.ndarray`` directly or duck-types a torch tensor via
+    ``detach().cpu().numpy()``. Conversion is best-effort: any object
+    that surfaces ``.detach``, ``.cpu``, and ``.numpy`` works without
+    importing torch (the test host has torch, the worktree host does
+    not).
+    """
+    if isinstance(cube, np.ndarray):
+        if cube.dtype == np.float16:
+            return cube
+        return cube.astype(np.float16, copy=False)
+    if (
+        hasattr(cube, "detach")
+        and hasattr(cube, "cpu")
+        and hasattr(cube, "numpy")
+    ):
+        # Torch tensor (or compatible duck-type). The .cpu() call is
+        # the synchronization point we deliberately keep off the
+        # dispatch hot path.
+        arr = cube.detach().cpu().numpy()
+        if arr.dtype == np.float16:
+            return arr
+        return arr.astype(np.float16, copy=False)
+    raise TypeError(
+        f"cube must be np.ndarray or torch tensor; got {type(cube).__name__}"
+    )
+
+
+def _cluster_record_to_json(record: Optional[ClusterRecord]) -> str:
+    """Serialise a ``ClusterRecord`` (or ``None``) for the NPZ sidecar.
+
+    UDP dumps carry no cluster metadata, so the field stores
+    ``json.dumps(None)`` (``"null"``) per D7. Auto dumps carry the
+    peak cluster's full dataclass, serialised via
+    ``dataclasses.asdict`` -> ``json.dumps``.
+    """
+    if record is None:
+        return json.dumps(None)
+    return json.dumps(dataclasses.asdict(record))
