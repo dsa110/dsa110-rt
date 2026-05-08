@@ -514,12 +514,12 @@ def test_gridder_phase2_spmm_matches_legacy_scatter(kernel_support):
     (``compute``) must match the legacy per-tap ``scatter_add_`` loop
     (``_compute_legacy_scatter``) on an arbitrary random vis input.
 
-    For K=1 each output cell receives contributions in a unique
-    src→cell direction so the spmm and scatter_add_ paths are
-    bit-identical (no fp32 reduction-order divergence). For K∈{3, 5}
-    the per-tap scatter sums multiple taps per cell in the order
-    given by the loop; the spmm sums them in cuSPARSE row order.
-    These differ only in fp32 round-off — pin to 1e-5 relative.
+    cuSPARSE spmm and ``scatter_add_`` reduce per-cell contributions
+    in different orders. Even for K=1 (single tap per source) each
+    output cell typically receives many (bls, ch) contributions, so
+    fp32 sum non-associativity produces ULP-level differences between
+    the two paths. Pin to 1e-5 relative across all K (observed
+    ~3e-6 rel on the random 4-ant test fixture).
     """
     _, g, *_ = _sparse_4ant_pattern_and_gridder(
         n_grid=64, kernel_support=kernel_support,
@@ -534,16 +534,13 @@ def test_gridder_phase2_spmm_matches_legacy_scatter(kernel_support):
     out_spmm = g.compute(v).cpu().numpy()
     out_scatter = g._compute_legacy_scatter(v).cpu().numpy()
     assert out_spmm.shape == out_scatter.shape
-    if kernel_support == 1:
-        np.testing.assert_array_equal(out_spmm, out_scatter)
-    else:
-        diff = np.max(np.abs(out_spmm - out_scatter))
-        ref = np.max(np.abs(out_scatter))
-        rel = diff / max(ref, 1e-30)
-        assert rel < 1e-5, (
-            f"K={kernel_support} spmm vs scatter abs={diff:.3e} "
-            f"rel={rel:.3e}"
-        )
+    diff = np.max(np.abs(out_spmm - out_scatter))
+    ref = np.max(np.abs(out_scatter))
+    rel = diff / max(ref, 1e-30)
+    assert rel < 1e-5, (
+        f"K={kernel_support} spmm vs scatter abs={diff:.3e} "
+        f"rel={rel:.3e}"
+    )
 
 
 # ---------------------------------------------------------------------------
