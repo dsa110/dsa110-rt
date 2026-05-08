@@ -47,6 +47,7 @@ from dsart.grid.sparsity_pattern import build_pattern
 from dsart.services.corr_fast_integration import (
     Stage1MultiDMCoarseDM,
     _build_core_baseline_mask,
+    compute_top_of_band_cell_lambda,
 )
 from bench.fast_path_throughput import (
     _build_synthetic_summed_plan,
@@ -164,14 +165,19 @@ def main(argv=None):
 
     antpos_e, antpos_n = _synth_antpos(seed=42)
     core_mask = _build_core_baseline_mask(n_core=82)
-    # Match the production op-point's common cell_lambda=148 (output from
-    # the bench/profile_fast_path_K1.py log line: "sparsity pattern: ...
-    # cell_lambda_mode=common cell_lambda=148 → n_filled=460").
+    # Match the production op-point's common cell_lambda — same logic as
+    # corr_fast_integration._build_gridder when cfg.cell_lambda_mode="common".
+    cell_lambda_common = compute_top_of_band_cell_lambda(
+        antpos_e, antpos_n, n_grid=args.n_grid,
+        is_core_baseline_mask=core_mask,
+    )
+    LOG.info("common cell_lambda = %.4g (matches production op-point)",
+             cell_lambda_common)
     pattern = build_pattern(
         antpos_e=antpos_e, antpos_n=antpos_n,
         chgroup=0, dec_deg=53.85, n_grid=args.n_grid,
         kernel_support=1, chan_sum_factor=args.chan_sum_factor,
-        cell_lambda=148.0,
+        cell_lambda=cell_lambda_common,
         is_core_baseline_mask=core_mask,
     )
     gridder = FastVisGridder.from_pattern(
