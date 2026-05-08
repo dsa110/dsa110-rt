@@ -45,6 +45,13 @@ def _make_geom(cube_id=0, **overrides) -> CubeGeometry:
 
 
 def _make_cands(geom, n=5):
+    """Build n Candidates whose event_specnum lies inside ``geom``'s window.
+
+    event_specnum = geom.specnum_start + 64 * sample_period_specnum (= 64
+    samples into the cube). Critically, the cands MUST be regenerated
+    against the geom they're submitted with — passing geom-A cands to
+    geom-B will yield t_in_cube < 0.
+    """
     return [
         Candidate(
             l=float(10 + i),
@@ -114,11 +121,10 @@ def test_counters_advance() -> None:
     svc = ClustererService(config=ClustererConfig(backend=ClustererBackend.DBSCAN))
     svc.start()
     try:
-        geom = _make_geom()
-        cands = _make_cands(geom, n=3)
         for i in range(5):
             geom_i = _make_geom(cube_id=i)
-            future = svc.submit(cands, geom_i)
+            cands_i = _make_cands(geom_i, n=3)
+            future = svc.submit(cands_i, geom_i)
             future.result(timeout=5.0)
         assert svc.n_submitted == 5
         assert svc.n_completed == 5
@@ -163,13 +169,13 @@ def test_concurrent_submit_from_multiple_threads() -> None:
     svc = ClustererService(config=ClustererConfig(backend=ClustererBackend.DBSCAN))
     svc.start()
     try:
-        geom = _make_geom()
-        cands = _make_cands(geom, n=3)
         futures = []
         lock = threading.Lock()
 
         def submit_one(i):
-            f = svc.submit(cands, _make_geom(cube_id=i))
+            geom_i = _make_geom(cube_id=i)
+            cands_i = _make_cands(geom_i, n=3)
+            f = svc.submit(cands_i, geom_i)
             with lock:
                 futures.append(f)
 

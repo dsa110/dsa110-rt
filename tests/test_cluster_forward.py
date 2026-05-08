@@ -310,19 +310,26 @@ def test_invalid_backend_raises() -> None:
 
 
 def test_dbscan_eps_override_is_honoured() -> None:
+    """An eps override changes the resulting partition.
+
+    With the default eps=10 two well-separated points are noise;
+    with eps=10000 they merge into one cluster.
+    """
     geom = _make_geom()
     cands = [
-        _make_cand(l_pix=10, m_pix=20, fine_dm_idx=2, t_in_cube=64, snr=10.0),
-        _make_cand(l_pix=10, m_pix=20, fine_dm_idx=2, t_in_cube=64, snr=12.0),
+        _make_cand(l_pix=10, m_pix=20, fine_dm_idx=0, t_in_cube=10, snr=10.0),
+        _make_cand(l_pix=200, m_pix=240, fine_dm_idx=7, t_in_cube=250,
+                   width_samples=8, snr=12.0),
     ]
-    # With eps=0.0 nothing groups; both become noise (DBSCAN min_samples=2).
-    cfg = ClustererConfig(backend=ClustererBackend.DBSCAN, dbscan_eps=0.0)
-    labels, records = cluster_candidates(cands, geom, config=cfg)
-    # All same point → DBSCAN can still group at eps=0 because they
-    # have distance 0; but dbscan_min_samples=2 fires only if there are
-    # ≥2 within eps. They are, so they cluster. (The test is to verify
-    # the eps override path is invoked at all.)
-    assert labels.shape == (2,)
+    # Default eps=10 → both noise singletons.
+    cfg_default = ClustererConfig(backend=ClustererBackend.DBSCAN)
+    labels_d, _ = cluster_candidates(cands, geom, config=cfg_default)
+    assert set(labels_d.tolist()) == {-1}
+
+    # Override eps to a huge value → one cluster.
+    cfg_huge = ClustererConfig(backend=ClustererBackend.DBSCAN, dbscan_eps=10_000.0)
+    labels_h, _ = cluster_candidates(cands, geom, config=cfg_huge)
+    assert set(labels_h.tolist()) == {0}
 
 
 def test_records_are_cluster_records() -> None:
