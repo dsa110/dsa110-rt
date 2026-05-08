@@ -759,33 +759,43 @@ class TestRTPhase4Pipeliner:
         antpos_e, antpos_n = _synth_antpos(seed=42)
         core_mask = _build_core_baseline_mask(n_core=82)
 
-        # Two contexts so the static-sky EMA / sliding window state in
-        # each is independent (the pipelined and sequential runs each
-        # start from a fresh-state context).
-        ctx_seq = build_context(
-            cfg, device=device,
-            antpos_e=antpos_e, antpos_n=antpos_n,
-            is_core_baseline_mask=core_mask,
-        )
-        ctx_pip = build_context(
-            cfg, device=device,
-            antpos_e=antpos_e, antpos_n=antpos_n,
-            is_core_baseline_mask=core_mask,
-        )
-
         raws = [
             _synthetic_fada_block(seed=20260505 + i)
             for i in range(n_blocks)
         ]
 
-        # Sequential reference
+        # Sequential reference. Run on a fresh ctx; tear down + empty
+        # the allocator cache before building the pipelined ctx so
+        # we don't keep two ctx-worth of working memory live (the
+        # 2080Ti's 11 GB budget can't fit two simultaneous compute_split
+        # working sets).
+        ctx_seq = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
         outs_seq: list[IntegrationOutput] = []
         for i, raw in enumerate(raws):
+            out = process_block(raw, ctx=ctx_seq, block_n=i + 1)
+            # Move the result to CPU so we can free the GPU ctx without
+            # losing the per-block reference for comparison.
             outs_seq.append(
-                process_block(raw, ctx=ctx_seq, block_n=i + 1)
+                IntegrationOutput(
+                    gridded_minus_sky=out.gridded_minus_sky.detach().cpu(),
+                    rfi=out.rfi,
+                    n_tx=out.n_tx,
+                    block_n=out.block_n,
+                )
             )
+        del ctx_seq, out
+        torch.cuda.empty_cache()
 
-        # Pipelined run (n_buffers=2 → 2-block latency)
+        # Pipelined run on a fresh ctx (n_buffers=2 → 2-block latency)
+        ctx_pip = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
         outs_pip = process_blocks_pipelined(
             raws, ctx=ctx_pip, n_buffers=2, block_n_start=1,
         )
@@ -806,7 +816,7 @@ class TestRTPhase4Pipeliner:
             assert pip.gridded_minus_sky.shape == seq.gridded_minus_sky.shape
             assert pip.gridded_minus_sky.dtype == seq.gridded_minus_sky.dtype
             torch.testing.assert_close(
-                pip.gridded_minus_sky,
+                pip.gridded_minus_sky.cpu(),
                 seq.gridded_minus_sky,
                 rtol=0, atol=0,
                 msg=lambda m: (
