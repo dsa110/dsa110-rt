@@ -118,12 +118,22 @@ def _profile_one_call(
         buf = gathered.permute(1, 2, 0).contiguous()
         t1 = _stamp_sync(); _add("D_transpose_back", (t1 - t) * 1000); t = t1
 
-        # E. Legacy gridder.compute scatter
-        grid_chunk = stage1.gridder.compute(buf)
-        out[c0:c1] = grid_chunk.reshape(chunk, t_dedisp, n_filled)
-        t1 = _stamp_sync(); _add("E_gridder_scatter", (t1 - t) * 1000); t = t1
+        # E. Inline single-batch scatter (view_as_real, no .real/.imag copies)
+        cell_index_map = stage1.gridder.cell_index_map
+        t_chunk = chunk * t_dedisp
+        src_re = torch.view_as_real(buf.reshape(t_chunk, nb * nch))
+        out_re = torch.zeros(
+            (t_chunk, n_filled + 1, 2),
+            dtype=torch.float32, device=device,
+        )
+        out_re.index_add_(1, cell_index_map, src_re)
+        out_buf = torch.view_as_complex(
+            out_re[:, :n_filled, :].contiguous()
+        )
+        out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
+        t1 = _stamp_sync(); _add("E_inline_scatter", (t1 - t) * 1000); t = t1
 
-        del bs_chunk, t_idx, t_idx_b, gathered, buf, grid_chunk
+        del bs_chunk, t_idx, t_idx_b, gathered, buf, src_re, out_re, out_buf
 
     del vis_T, bin_shifts_dev, t_arange
     return out

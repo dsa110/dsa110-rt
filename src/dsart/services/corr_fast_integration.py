@@ -469,6 +469,16 @@ class Stage1MultiDMCoarseDM:
         )                                                                  # (C, n_dm)
         t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
 
+        # ---- Inline K=1 scatter pre-fetch the gridder's cell index map ----
+        # We bypass ``self.gridder.compute()`` to avoid its
+        # ``.real.contiguous() / .imag.contiguous()`` copies, which
+        # allocate 1.85 GB of transient memory per call — combined
+        # with the dedisp gather + permute buffers (~5 GB) this OOMs
+        # the 2080 Ti (11 GB budget). Use ``torch.view_as_real`` on
+        # the cfp32 source to scatter both Re/Im halves with a single
+        # ``index_add_`` (no extra alloc).
+        cell_index_map = self.gridder.cell_index_map                       # (NBASE * NCHAN_eff,) int64
+
         out = torch.empty(
             (self.n_dm, t_dedisp, n_filled),
             dtype=torch.complex64, device=device,
@@ -479,6 +489,7 @@ class Stage1MultiDMCoarseDM:
         for c0 in range(0, self.n_dm, dm_chunk):
             c1 = min(c0 + dm_chunk, self.n_dm)
             chunk = c1 - c0
+            t_chunk = chunk * t_dedisp
 
             # ---- Single-launch coalesced gather over (chunk * t_dedisp) bins ----
             # ``t_idx[c, dm*t_dedisp + t] = bs[c, dm] + t``. Stride-0
@@ -487,21 +498,37 @@ class Stage1MultiDMCoarseDM:
             bs_chunk = bin_shifts_dev[:, c0:c1]                            # (C, chunk)
             t_idx = (
                 bs_chunk[:, :, None] + t_arange[None, None, :]
-            ).reshape(nch, chunk * t_dedisp)                               # (C, T_chunk)
-            t_idx_b = t_idx[:, :, None].expand(nch, chunk * t_dedisp, nb)  # stride 0 on B
+            ).reshape(nch, t_chunk)                                        # (C, T_chunk)
+            t_idx_b = t_idx[:, :, None].expand(nch, t_chunk, nb)           # stride 0 on B
             gathered = torch.gather(vis_T, 1, t_idx_b)                     # (C, T_chunk, B) cfp32
+            del bs_chunk, t_idx, t_idx_b
 
-            # ---- Transpose gather output back to (T_chunk, B, C) for the
-            # legacy gridder. The intermediate (C, T_chunk, B) layout
-            # gave us the coalesced gather; flipping back to (T_chunk,
-            # B, C) lets the legacy single-batch index_add_ run at its
-            # full ~33 ms / chunk throughput rather than the
-            # per-channel ~68 ms / chunk we'd get with 48 small
-            # NCHAN_eff launches.
+            # ---- Transpose to (T_chunk, B, C) and scatter ----
+            # The gather output's (C, T_chunk, B) layout gave us coalesced
+            # reads; we now flip back to the legacy (T_chunk, B, C)
+            # layout that the gridder's ``cell_index_map`` (ordered
+            # ``b * NCHAN_eff + c``) expects. ``view_as_real`` then
+            # turns the cfp32 source into a (T_chunk, NSRC, 2) fp32
+            # tensor with no copy (cfp32 = interleaved Re/Im fp32),
+            # so a single ``index_add_`` scatters both halves at
+            # once — equivalent to the gridder's K=1 fast path but
+            # without the 1.85 GB ``.real.contiguous()`` /
+            # ``.imag.contiguous()`` transients.
             buf = gathered.permute(1, 2, 0).contiguous()                   # (T_chunk, B, C) cfp32
-            grid_chunk = self.gridder.compute(buf)                         # (T_chunk, n_filled)
-            out[c0:c1] = grid_chunk.reshape(chunk, t_dedisp, n_filled)
-            del bs_chunk, t_idx, t_idx_b, gathered, buf, grid_chunk
+            del gathered
+            src_re = torch.view_as_real(
+                buf.reshape(t_chunk, nb * nch)
+            )                                                              # (T_chunk, NSRC, 2) fp32
+            out_re = torch.zeros(
+                (t_chunk, n_filled + 1, 2),
+                dtype=torch.float32, device=device,
+            )
+            out_re.index_add_(1, cell_index_map, src_re)
+            out_buf = torch.view_as_complex(
+                out_re[:, :n_filled, :].contiguous()
+            )                                                              # (T_chunk, n_filled) cfp32
+            out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
+            del buf, src_re, out_re, out_buf
 
         del vis_T, bin_shifts_dev, t_arange
         return out
