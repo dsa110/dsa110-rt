@@ -448,6 +448,92 @@ def test_stage1_shift_rejects_t_dedisp_too_large():
 
 
 # ---------------------------------------------------------------------------
+# 5b. Phase 1 perf-refactor pin: bit-identity vs the legacy per-shift-group
+#     loop form of apply_stage1_shifts. Catches gather-form drift.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_apply_stage1_shifts(
+    vis: torch.Tensor,
+    plan: DMPlan,
+    *,
+    chgroup: int,
+    dm_idx: int,
+    t_dedisp: int | None = None,
+) -> torch.Tensor:
+    """Pre-Phase-1 reference: per-shift-group ``index_select`` /
+    ``index_copy_`` loop. Pinned in tests to keep the new
+    single-launch ``torch.gather`` form bit-identical.
+    """
+    n_fv, n_base_v, n_chan_v = vis.shape
+    bin_shifts_full = plan.delay_bins_per_chgroup(chgroup)
+    bin_shifts = bin_shifts_full[:n_chan_v, dm_idx]
+    max_shift = int(bin_shifts.max())
+    available = n_fv - max_shift
+    if t_dedisp is None:
+        t_dedisp = available
+    out = torch.empty(
+        (t_dedisp, n_base_v, n_chan_v),
+        dtype=vis.dtype, device=vis.device,
+    )
+    unique_shifts, inverse = np.unique(bin_shifts, return_inverse=True)
+    for s_i, s in enumerate(unique_shifts.tolist()):
+        ch_in_group = np.where(inverse == s_i)[0]
+        if ch_in_group.size == 0:
+            continue
+        s_int = int(s)
+        if ch_in_group.size == 1:
+            ch = int(ch_in_group[0])
+            out[:, :, ch] = vis[s_int:s_int + t_dedisp, :, ch]
+        else:
+            ch_t = torch.from_numpy(ch_in_group).to(
+                device=vis.device, dtype=torch.int64,
+            )
+            out.index_copy_(
+                2, ch_t,
+                vis[s_int:s_int + t_dedisp].index_select(2, ch_t),
+            )
+    return out
+
+
+@pytest.mark.parametrize("dm_idx", [0, 1, 2, 3])
+@pytest.mark.parametrize("n_chan_v", [16, 48, 96])
+def test_stage1_shift_phase1_gather_matches_legacy_per_shift_loop(dm_idx, n_chan_v):
+    """Phase 1 perf refactor pin: the single-launch ``torch.gather``
+    form must be **bit-identical** to the legacy per-shift-group loop
+    across (dm_idx, n_chan_v) combinations representative of the
+    production op-point (chan-summed NCHAN_v ∈ {48} and the synthetic
+    chan-counts used elsewhere in this file)."""
+    plan = _make_test_plan(
+        n_coarse=4, dm_max_pc_cc=400.0, t_int_fast_us=1048.576,
+    )
+    n_fv = 256
+    rng = np.random.default_rng(seed=12345 + dm_idx + n_chan_v)
+    real = rng.standard_normal((n_fv, NBASE, n_chan_v)).astype(np.float32)
+    imag = rng.standard_normal((n_fv, NBASE, n_chan_v)).astype(np.float32)
+    vis = torch.from_numpy(real) + 1j * torch.from_numpy(imag)
+    vis = vis.to(torch.complex64)
+
+    bin_shifts = plan.delay_bins_per_chgroup(0)[:n_chan_v, dm_idx]
+    max_shift = int(bin_shifts.max())
+    t_dedisp = n_fv - max_shift
+
+    out_new = apply_stage1_shifts(
+        vis, plan, chgroup=0, dm_idx=dm_idx, t_dedisp=t_dedisp,
+    )
+    out_legacy = _legacy_apply_stage1_shifts(
+        vis, plan, chgroup=0, dm_idx=dm_idx, t_dedisp=t_dedisp,
+    )
+    assert out_new.shape == out_legacy.shape
+    # Bit-identical: gather is a pure copy, so legacy slice-copy must match.
+    assert torch.equal(out_new, out_legacy), (
+        f"phase1 gather drifted from legacy loop at dm_idx={dm_idx}, "
+        f"n_chan_v={n_chan_v}: max abs diff = "
+        f"{(out_new - out_legacy).abs().max().item()}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 6. max_t_dedisp_for_plan
 # ---------------------------------------------------------------------------
 
