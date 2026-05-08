@@ -512,24 +512,34 @@ class Stage1MultiDMCoarseDM:
             gathered = torch.gather(vis_T, 0, t_idx_3d)                    # (T_chunk, C, B) cfp32
             del bs_chunk, t_idx_2d, t_idx_3d
 
-            # ---- Reshape (free view) + Re/Im scatter via swapped cim_cb ----
+            # ---- Reshape (free view) + serialized Re/Im scatter via swapped cim_cb ----
             # ``gathered.reshape(t_chunk, C*B)`` is a view (gathered is
             # contiguous). Then split into Re/Im (each ~488 MB at the
-            # production op-point at chunk=2 joined) and scatter each into
-            # a (T_chunk, n_filled+1) accumulator. Same scatter pattern
-            # the legacy gridder.compute K=1 fast path uses, just with
-            # a (c*NBASE + b)-keyed index map instead of (b*C + c).
+            # production op-point at chunk=2 joined-block) and scatter
+            # each into a (T_chunk, n_filled+1) accumulator. Same
+            # scatter pattern the legacy gridder.compute K=1 fast path
+            # uses, just with a (c*NBASE + b)-keyed index map instead
+            # of (b*C + c).
+            #
+            # The Re and Im halves are allocated and scattered
+            # *serially* — only one ~488 MB ``.contiguous()``
+            # transient is alive at a time. Holding both Re + Im
+            # transients concurrently was the OOM trigger for the
+            # F31b pipelined path on the 2080 Ti (~970 MB peak vs
+            # 488 MB now), and it doesn't change the math.
             src = gathered.reshape(t_chunk, nch * nb)                      # (T_chunk, NSRC) cfp32 view
-            src_re = src.real.contiguous()
-            src_im = src.imag.contiguous()
-            del gathered, src
             out_re = torch.zeros(
                 (t_chunk, n_filled + 1), dtype=torch.float32, device=device,
             )
-            out_im = torch.zeros_like(out_re)
+            src_re = src.real.contiguous()                                 # 488 MB transient
             out_re.index_add_(1, cim_cb, src_re)
+            del src_re
+
+            out_im = torch.zeros_like(out_re)
+            src_im = src.imag.contiguous()                                 # 488 MB transient
             out_im.index_add_(1, cim_cb, src_im)
-            del src_re, src_im
+            del src_im, gathered, src
+
             out_buf = torch.complex(out_re[:, :n_filled], out_im[:, :n_filled])
             out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
             del out_re, out_im, out_buf
