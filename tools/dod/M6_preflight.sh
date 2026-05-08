@@ -179,7 +179,13 @@ assert hasattr(sklearn.cluster, "DBSCAN"), "sklearn.cluster.DBSCAN not present"
 PY
 python - <<'PY' || warn "hdbscan not installed; D5 fallback path will be tested but primary path will skip. install with: pip install hdbscan"
 import hdbscan
-print(f"hdbscan={hdbscan.__version__}")
+import importlib.metadata
+try:
+    ver = importlib.metadata.version("hdbscan")
+except importlib.metadata.PackageNotFoundError:
+    ver = getattr(hdbscan, "__version__", "unknown")
+print(f"hdbscan={ver}")
+assert hasattr(hdbscan, "HDBSCAN"), "hdbscan.HDBSCAN class not present"
 PY
 pass
 
