@@ -139,14 +139,15 @@ pass
 
 STEP="dsart_import"
 # Core M1 modules must import cleanly. M5 modules (detector, fine_dm,
-# image, inject, noise_norm, trigger) currently only contain __init__.py
-# stubs; importing them is cheap and catches any package-discovery bugs
-# from the kickoff scaffolding.
+# image, inject, noise_norm) currently only contain __init__.py stubs;
+# importing them is cheap and catches any package-discovery bugs from
+# the kickoff scaffolding. The dsart.trigger subpackage was retired
+# in M6 chunk 0 (delegated to corr-side dsa110-xengine framework).
 python -c '
 import dsart, dsart.common.host, dsart.common.config_loader
 import dsart.common.contracts, dsart.common.constants, dsart.common.dispersion
 import dsart.detector, dsart.fine_dm, dsart.image
-import dsart.inject, dsart.trigger
+import dsart.inject
 ' || fail "dsart package import"
 pass
 
@@ -199,13 +200,7 @@ n_triples = det["k_img"] * det["k_dm"] * det["k_time"]
 assert n_triples == 128, f"K_img*K_dm*K_time = {n_triples}, expected 128 (D2 in M5_PLAN_FIXES.md)"
 assert det["kernel_dtype"] in ("fp16", "fp32"), f"kernel_dtype={det['kernel_dtype']}"
 print(f"detector: K_img={det['k_img']} K_dm={det['k_dm']} K_time={det['k_time']} -> {n_triples} triples; threshold={det['threshold_sigma']}")
-trig = cfg["trigger"]
-trig_required = {"max_emit_per_s", "max_per_cube_per_image_kernel", "max_per_cube_total",
-                 "max_dispatch_per_s", "dedup_specnum_step", "dedup_lm_step",
-                 "dedup_ttl_ms", "holdoff_ms", "completion_timeout_s"}
-trig_missing = trig_required - set(trig.keys())
-if trig_missing:
-    raise SystemExit(f"trigger missing keys: {sorted(trig_missing)}")
+# trigger emitter retired in M6 chunk 0; M6_preflight.sh will validate the cluster + cube-dump + UDP-listener config keys instead.
 PY
 pass
 

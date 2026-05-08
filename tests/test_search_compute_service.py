@@ -1,13 +1,12 @@
 """Tests for ``dsart.services.search_compute`` (M5 Chunk 6b-α).
 
-Covers the end-to-end glue between ``SyntheticRxRingSource`` →
-``CubePipeline`` (combiner + imager + Layer-1 + detector) →
-``TriggerEmitter`` → ``MockTriggerListener``.
+RX-ring → CubePipeline only (M6 chunk 0: trigger emitter retired;
+cluster + cube-dump integration lands chunks 1-5).
 
 The stack is the production data path with the synthetic RX-ring
-source (instead of M4a's POSIX-shm) and the loopback mock listener
-(instead of corr-side M4b). All numerical correctness gates live in
-the chunk-1..6a unit tests; this module gates **wiring + lifecycle**:
+source (instead of M4a's POSIX-shm). All numerical correctness gates
+live in the chunk-1..6a unit tests; this module gates **wiring +
+lifecycle**:
 
   * ``SyntheticRxRingSource`` yields the right number of slots with
     the right shapes; injections land at the requested cell.
@@ -15,8 +14,7 @@ the chunk-1..6a unit tests; this module gates **wiring + lifecycle**:
     with cube shape ``[T_det, N_fdm, N_grid, N_grid]`` and
     ``len(candidates) ≥ 0``.
   * ``SearchComputeService.run()`` drains the source end-to-end without
-    raising, processing every cube and dispatching at least the
-    expected count to the loopback listener.
+    raising, processing every cube.
   * Service.stop() leaves no dangling tasks (asyncio shutdown is clean).
 """
 
@@ -49,11 +47,6 @@ from dsart.services.search_compute import (  # noqa: E402
     SearchComputeConfig,
     SearchComputeService,
 )
-from dsart.trigger.emitter import ConnectionEndpoint  # noqa: E402
-from dsart.trigger.mock_listener import (  # noqa: E402
-    MockListenerConfig,
-    MockTriggerListener,
-)
 
 
 # Custom asyncio test decorator (no pytest-asyncio dependency, mirrors
@@ -61,6 +54,8 @@ from dsart.trigger.mock_listener import (  # noqa: E402
 
 
 def asyncio_test(func):
+    """Custom asyncio test decorator (no pytest-asyncio dependency)."""
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         return asyncio.run(func(*args, **kwargs))
@@ -241,51 +236,30 @@ def test_cube_pipeline_rejects_n_grid_mismatch() -> None:
 @asyncio_test
 async def test_search_compute_service_drains_synthetic_source() -> None:
     """End-to-end smoke: 3 cubes through the full stack, no exceptions,
-    cube counter ticks, mock listener receives N records."""
-    listener = MockTriggerListener(
-        host="127.0.0.1", port=0,
-        config=MockListenerConfig(
-            accept_rate=1.0, accept_delay_ms=0.0, completed_delay_ms=0.5,
-            send_completed=True,
-        ),
+    cube counter ticks."""
+    src = _build_synth_source(
+        n_cubes=3, t_det=32, n_fdm=4, n_grid=8, rng_seed=42,
     )
-    await listener.start()
+    config = SearchComputeConfig(
+        pipeline=CubePipelineConfig(
+            n_grid=8, edge_mask_kernel_support=3,
+            cube_dtype=torch.float32, device="cpu",
+        ),
+        n_fdm=4,
+        detector_threshold_sigma=4.0,  # low threshold so we see candidates
+        detector_dtype=torch.float32,
+        detector_device="cpu",
+        search_node_id=0,
+        gpu_half=0,
+    )
+    service = SearchComputeService(config=config, source=src)
+    await service.start()
     try:
-        src = _build_synth_source(
-            n_cubes=3, t_det=32, n_fdm=4, n_grid=8, rng_seed=42,
-        )
-        config = SearchComputeConfig(
-            pipeline=CubePipelineConfig(
-                n_grid=8, edge_mask_kernel_support=3,
-                cube_dtype=torch.float32, device="cpu",
-            ),
-            n_fdm=4,
-            detector_threshold_sigma=4.0,  # low threshold so we see candidates
-            detector_dtype=torch.float32,
-            detector_device="cpu",
-            search_node_id=0,
-            gpu_half=0,
-            holdoff_ms=0.0,
-            snr_threshold=4.0,
-            per_cube_per_kernel_cap=128,
-            per_cube_total_cap=1024,
-            rate_limit_per_s=1e6,
-            rate_limit_burst=1_000_000,
-            correlation_endpoints=(
-                ConnectionEndpoint(host=listener.host, port=listener.port),
-            ),
-        )
-        service = SearchComputeService(config=config, source=src)
-        await service.start()
-        try:
-            await service.run()
-        finally:
-            await service.stop()
-        assert service.cubes_processed == 3
-        assert service.candidates_emitted >= 0
-        assert service.records_dispatched >= 0
+        await service.run()
     finally:
-        await listener.stop()
+        await service.stop()
+    assert service.cubes_processed == 3
+    assert service.candidates_emitted >= 0
 
 
 @asyncio_test
@@ -294,51 +268,29 @@ async def test_search_compute_service_emits_for_strong_injection() -> None:
     at least one candidate. We don't gate on count or kernel — that's
     chunk-5's bench's job — only that the wiring fires.
     """
-    listener = MockTriggerListener(
-        host="127.0.0.1", port=0,
-        config=MockListenerConfig(accept_rate=1.0, send_completed=True),
+    inj = SyntheticInjection(
+        cube_idx=0, t_in_cube=16, l_pix=4, m_pix=4, amplitude=200.0,
     )
-    await listener.start()
+    src = _build_synth_source(
+        n_cubes=1, t_det=32, n_fdm=4, n_grid=8,
+        rng_seed=7, injections=(inj,),
+    )
+    config = SearchComputeConfig(
+        pipeline=CubePipelineConfig(
+            n_grid=8, edge_mask_kernel_support=3,
+            cube_dtype=torch.float32, device="cpu",
+        ),
+        n_fdm=4,
+        detector_threshold_sigma=4.0,
+        detector_dtype=torch.float32,
+        detector_device="cpu",
+        search_node_id=0,
+        gpu_half=0,
+    )
+    service = SearchComputeService(config=config, source=src)
+    await service.start()
     try:
-        # Strong injection at the middle of cube 0
-        inj = SyntheticInjection(
-            cube_idx=0, t_in_cube=16, l_pix=4, m_pix=4, amplitude=200.0,
-        )
-        src = _build_synth_source(
-            n_cubes=1, t_det=32, n_fdm=4, n_grid=8,
-            rng_seed=7, injections=(inj,),
-        )
-        config = SearchComputeConfig(
-            pipeline=CubePipelineConfig(
-                n_grid=8, edge_mask_kernel_support=3,
-                cube_dtype=torch.float32, device="cpu",
-            ),
-            n_fdm=4,
-            detector_threshold_sigma=4.0,
-            detector_dtype=torch.float32,
-            detector_device="cpu",
-            search_node_id=0,
-            gpu_half=0,
-            holdoff_ms=0.0,
-            snr_threshold=4.0,
-            per_cube_per_kernel_cap=128,
-            per_cube_total_cap=1024,
-            rate_limit_per_s=1e6,
-            rate_limit_burst=1_000_000,
-            correlation_endpoints=(
-                ConnectionEndpoint(host=listener.host, port=listener.port),
-            ),
-        )
-        service = SearchComputeService(config=config, source=src)
-        await service.start()
-        try:
-            await service.run()
-        finally:
-            await service.stop()
-        # Don't gate on records_dispatched > 0 — fan-out to a single
-        # endpoint is best-effort and may race the mock listener's
-        # accept loop in a tight pytest cycle. cubes_processed is the
-        # robust gate.
-        assert service.cubes_processed == 1
+        await service.run()
     finally:
-        await listener.stop()
+        await service.stop()
+    assert service.cubes_processed == 1

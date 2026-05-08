@@ -7,8 +7,9 @@ Cube-level (post-imager) injection sweep. Synthesises a thermal-noise
 boxcar injection at known
 ``(l_pix, m_pix, fine_dm_idx, t_in_cube, snr, width_samples)``, and
 feeds the cube straight into ``Detector.forward()`` → decoder →
-canonical-zone gate → cross-kernel merger → holdoff → emitter →
-``MockTriggerListener`` (loopback TCP).
+canonical-zone gate → cross-kernel merger. M6 chunk 0 retired the
+trigger emitter; the bench now operates purely on the pipeline /
+detector ``Candidate`` output (no TCP fan-out, no MockTriggerListener).
 
 This bench does NOT depend on M3 / M4a / corr-side artefacts. It runs
 h01 alone (or any laptop with the dsa110-rt env) and is the user-facing
@@ -22,16 +23,15 @@ CLI surface (see ``--help`` for the full grid):
       [--widths 2 4 8 16 32 64 128]                  \\
       [--n-trials-per-cell 3]                        \\
       [--noise-only-cubes 30]                        \\
-      [--listener-port 11227]                        \\
       [--out bench/reports/<UTC>/cube_injection/M5/]
 
 Outputs (under ``--out``):
 
-  * ``injection_log.ndjson``    — per-injection record (one JSON per
-    line); consumed by ``tools/viz/search_detector_check.py
-    --mode cube_injection``.
-  * ``noise_only_log.ndjson``  — per-noise-only-cube record (one JSON
-    per line) for the FAR sub-check.
+  * ``injection_log.ndjson``   — one JSON line per emitted injection
+    ``Candidate`` (``dataclasses.asdict(c)``); consumed by
+    ``tools/viz/search_detector_check.py --mode cube_injection``.
+  * ``noise_only_log.ndjson`` — one JSON line per noise-only
+    ``Candidate`` for the FAR sub-check.
   * ``summary.json``           — aggregate metrics + bench config snapshot.
   * ``bench.log``              — human-readable progress / per-cell log.
 
@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -80,23 +81,6 @@ from dsart.inject.cube_injection import (  # noqa: E402
     iter_snr_width_grid,
     synthesise_cube,
 )
-from dsart.trigger.conditions import (  # noqa: E402
-    PerCubePerKernelCap,
-    PerCubeTotalCap,
-    RateLimitTokenBucket,
-    SnrThreshold,
-)
-from dsart.trigger.emitter import (  # noqa: E402
-    ConnectionEndpoint,
-    EmitRecord,
-    TriggerEmitter,
-    TriggerEmitterConfig,
-)
-from dsart.trigger.holdoff import HoldoffStateMachine  # noqa: E402
-from dsart.trigger.mock_listener import (  # noqa: E402
-    MockListenerConfig,
-    MockTriggerListener,
-)
 
 
 _LOG = logging.getLogger("bench.cube_injection_detector")
@@ -124,15 +108,10 @@ DEFAULT_T_DET: int = 512
 DEFAULT_N_FDM: int = 8
 DEFAULT_N_GRID: int = 64
 
-# Default trigger-emitter knobs for the bench. Caps are intentionally
-# loose so the FAR sub-check's tail samples aren't over-suppressed; the
-# operator-facing throughput bench (Chunk 6) exercises the production
-# caps separately.
-BENCH_PER_KERNEL_CAP: int = 128
-BENCH_PER_CUBE_CAP: int = 1024
-BENCH_RATE_LIMIT_PER_S: float = 1_000_000.0
-BENCH_RATE_LIMIT_BURST: int = 1_000_000
-BENCH_HOLDOFF_MS: float = 50.0
+# Detector threshold for the bench. M6 chunk 0 retired the trigger
+# emitter so per-cube caps + rate-limits + holdoff knobs no longer
+# apply here — the bench operates directly on the detector candidate
+# list, which is already SNR-cut at this threshold.
 BENCH_DETECTOR_THRESHOLD_SIGMA: float = 5.0  # capture θ ∈ {6, 7, 8, 9, 10}
 
 # Recovery tolerance per plan §8 line 2329 (cube-level injection bypasses
@@ -192,8 +171,7 @@ class NoiseOnlySummary:
     n_cubes: int
     n_kernels: int
     candidate_snrs: List[float] = field(default_factory=list)
-    n_emit_records: int = 0
-    n_predicate_passed: int = 0
+    n_candidates: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -294,45 +272,37 @@ def _is_match(
 # ---------------------------------------------------------------------------
 
 
-async def _run_one_injection_trial(
+def _run_one_injection_trial(
     inj: CubeInjectionConfig,
     *,
     detector: DeterministicDetector,
-    emitter: TriggerEmitter,
     rng: np.random.Generator,
     t_det: int,
     n_fdm: int,
     n_grid: int,
-    cube_id: int,
-) -> Tuple[List[Candidate], List[EmitRecord]]:
-    """Synthesise one (noise + injection) cube, run detector, fan out
-    via the emitter; return the per-cube candidate list + EmitRecords."""
+) -> List[Candidate]:
+    """Synthesise one (noise + injection) cube, run detector; return
+    the per-cube candidate list."""
     cube, validity_mask, sigma_layer1 = synthesise_cube(
         t_det=t_det, n_fdm=n_fdm, n_grid=n_grid,
         injections=(inj,), rng=rng,
     )
-    cands = _detect_one_cube(detector, cube, validity_mask, sigma_layer1)
-    records = await emitter.process_candidates(cube_id, cands)
-    return cands, records
+    return _detect_one_cube(detector, cube, validity_mask, sigma_layer1)
 
 
-async def _run_one_noise_only_cube(
+def _run_one_noise_only_cube(
     *,
     detector: DeterministicDetector,
-    emitter: TriggerEmitter,
     rng: np.random.Generator,
     t_det: int,
     n_fdm: int,
     n_grid: int,
-    cube_id: int,
-) -> Tuple[List[Candidate], List[EmitRecord]]:
+) -> List[Candidate]:
     cube, validity_mask, sigma_layer1 = synthesise_cube(
         t_det=t_det, n_fdm=n_fdm, n_grid=n_grid,
         injections=(), rng=rng,
     )
-    cands = _detect_one_cube(detector, cube, validity_mask, sigma_layer1)
-    records = await emitter.process_candidates(cube_id, cands)
-    return cands, records
+    return _detect_one_cube(detector, cube, validity_mask, sigma_layer1)
 
 
 async def _bench_main(args: argparse.Namespace) -> int:
@@ -405,221 +375,129 @@ async def _bench_main(args: argparse.Namespace) -> int:
     fine_dm_idx = n_fdm // 2
     t_in_cube = t_det // 2
 
-    # ---- Listener + emitter setup ----
-    listener_cfg = MockListenerConfig(
-        accept_rate=1.0,
-        accept_delay_ms=0.0,
-        completed_delay_ms=1.0,
-        send_completed=True,
-    )
-    listener = MockTriggerListener(
-        host="127.0.0.1", port=int(args.listener_port), config=listener_cfg,
-    )
-    await listener.start()
-    _LOG.info("MockTriggerListener up on %s:%d", listener.host, listener.port)
-
-    endpoint = ConnectionEndpoint(host=listener.host, port=listener.port)
-    conditions = [
-        SnrThreshold(min_snr=BENCH_DETECTOR_THRESHOLD_SIGMA),
-        PerCubePerKernelCap(max_per_kernel=BENCH_PER_KERNEL_CAP),
-        PerCubeTotalCap(max_total=BENCH_PER_CUBE_CAP),
-        RateLimitTokenBucket(
-            rate_per_s=BENCH_RATE_LIMIT_PER_S,
-            burst=BENCH_RATE_LIMIT_BURST,
-        ),
-    ]
-    holdoff = HoldoffStateMachine(holdoff_ms=BENCH_HOLDOFF_MS)
-    emitter_cfg = TriggerEmitterConfig(
-        search_node_id=1,
-        gpu_half=1,
-        endpoints=[endpoint],
-        conditions=conditions,
-        holdoff=holdoff,
-    )
-    emitter = TriggerEmitter(emitter_cfg)
-
     cell_results: List[CellResult] = []
     score_per_kernel_per_cell: dict = {}  # (snr, width) → kernel_id → snr value
     noise_summary = NoiseOnlySummary(
         n_cubes=0, n_kernels=n_kernels_total,
     )
-    injection_log_lines: List[str] = []
-    noise_only_log_lines: List[str] = []
+    injection_candidates: List[Candidate] = []
+    noise_only_candidates: List[Candidate] = []
 
-    cube_id_counter = 0
+    # ----- Sweep over (snr, width) cells -----
+    for inj in iter_snr_width_grid(
+        snrs=tuple(float(s) for s in snrs),
+        widths=tuple(int(w) for w in widths),
+        l_pix=l_pix,
+        m_pix=m_pix,
+        fine_dm_idx=fine_dm_idx,
+        t_in_cube=t_in_cube,
+    ):
+        cell_seed = (
+            args.seed
+            + 1000 * int(inj.snr)
+            + int(inj.width_samples)
+        )
+        detector = _build_detector(
+            t_det=t_det,
+            n_fdm=n_fdm,
+            threshold_sigma=BENCH_DETECTOR_THRESHOLD_SIGMA,
+            seed=cell_seed,
+            image_tokens=image_tokens,
+            dm_tokens=dm_tokens,
+            time_tokens=time_tokens,
+        )
+        recovered_snrs: List[float] = []
+        matched_kernel_id: Optional[str] = None
+        kernel_score_at_match: dict = {}
 
-    try:
-        await emitter.start()
-
-        # Wait for the emitter's connection to come up.
-        for _ in range(50):
-            if all(s == "up" for s in emitter.conn_state):
-                break
-            await asyncio.sleep(0.02)
-
-        # ----- Sweep over (snr, width) cells -----
-        for inj in iter_snr_width_grid(
-            snrs=tuple(float(s) for s in snrs),
-            widths=tuple(int(w) for w in widths),
-            l_pix=l_pix,
-            m_pix=m_pix,
-            fine_dm_idx=fine_dm_idx,
-            t_in_cube=t_in_cube,
-        ):
-            cell_seed = (
-                args.seed
-                + 1000 * int(inj.snr)
-                + int(inj.width_samples)
-            )
-            detector = _build_detector(
+        for trial in range(n_trials):
+            trial_rng = np.random.default_rng(cell_seed + 17 * trial)
+            cands = _run_one_injection_trial(
+                inj,
+                detector=detector,
+                rng=trial_rng,
                 t_det=t_det,
                 n_fdm=n_fdm,
-                threshold_sigma=BENCH_DETECTOR_THRESHOLD_SIGMA,
-                seed=cell_seed,
-                image_tokens=image_tokens,
-                dm_tokens=dm_tokens,
-                time_tokens=time_tokens,
+                n_grid=n_grid,
             )
-            recovered_snrs: List[float] = []
-            matched_kernel_id: Optional[str] = None
-            kernel_score_at_match: dict = {}
+            injection_candidates.extend(cands)
+            # Find best matching candidate (highest SNR among matches).
+            matches = [c for c in cands if _is_match(c, inj)]
+            if matches:
+                best = max(matches, key=lambda c: c.snr)
+                recovered_snrs.append(float(best.snr))
+                if matched_kernel_id is None:
+                    matched_kernel_id = best.kernel_id
+            # Snapshot per-kernel score map for the FIRST trial only
+            # (the operator only needs one heatmap per cell).
+            if trial == 0:
+                for c in cands:
+                    if not _is_match(c, inj):
+                        continue
+                    prev = kernel_score_at_match.get(c.kernel_id, 0.0)
+                    if c.snr > prev:
+                        kernel_score_at_match[c.kernel_id] = float(c.snr)
 
-            for trial in range(n_trials):
-                cube_id_counter += 1
-                trial_rng = np.random.default_rng(cell_seed + 17 * trial)
-                _, records = await _run_one_injection_trial(
-                    inj,
-                    detector=detector,
-                    emitter=emitter,
-                    rng=trial_rng,
-                    t_det=t_det,
-                    n_fdm=n_fdm,
-                    n_grid=n_grid,
-                    cube_id=cube_id_counter,
-                )
-                # Find best matching candidate (highest SNR among matches).
-                matches = [
-                    rec for rec in records
-                    if _is_match(rec.candidate, inj)
-                ]
-                if matches:
-                    best = max(matches, key=lambda r: r.candidate.snr)
-                    recovered_snrs.append(float(best.candidate.snr))
-                    if matched_kernel_id is None:
-                        matched_kernel_id = best.candidate.kernel_id
-                # Snapshot per-kernel score map for the FIRST trial only
-                # (the operator only needs one heatmap per cell).
-                if trial == 0:
-                    for rec in records:
-                        c = rec.candidate
-                        if not _is_match(c, inj):
-                            continue
-                        prev = kernel_score_at_match.get(c.kernel_id, 0.0)
-                        if c.snr > prev:
-                            kernel_score_at_match[c.kernel_id] = float(c.snr)
+        cell = CellResult(
+            injected={
+                "snr": float(inj.snr),
+                "width_samples": int(inj.width_samples),
+                "l_pix": inj.l_pix,
+                "m_pix": inj.m_pix,
+                "fine_dm_idx": inj.fine_dm_idx,
+                "t_in_cube": inj.t_in_cube,
+                "profile": inj.profile,
+            },
+            n_trials=n_trials,
+            n_recovered=len(recovered_snrs),
+            recovered_snrs=list(recovered_snrs),
+            matched_kernel_id=matched_kernel_id,
+            cube_t_det=t_det,
+            cube_n_fdm=n_fdm,
+            cube_n_grid=n_grid,
+        )
+        cell_results.append(cell)
+        score_per_kernel_per_cell[
+            (float(inj.snr), int(inj.width_samples))
+        ] = dict(kernel_score_at_match)
 
-            cell = CellResult(
-                injected={
-                    "snr": float(inj.snr),
-                    "width_samples": int(inj.width_samples),
-                    "l_pix": inj.l_pix,
-                    "m_pix": inj.m_pix,
-                    "fine_dm_idx": inj.fine_dm_idx,
-                    "t_in_cube": inj.t_in_cube,
-                    "profile": inj.profile,
-                },
-                n_trials=n_trials,
-                n_recovered=len(recovered_snrs),
-                recovered_snrs=list(recovered_snrs),
-                matched_kernel_id=matched_kernel_id,
-                cube_t_det=t_det,
-                cube_n_fdm=n_fdm,
-                cube_n_grid=n_grid,
+        _LOG.info(
+            "cell snr=%.1f width=%d : recovered %d/%d (mean ratio=%.3f) "
+            "matched=%s",
+            inj.snr, inj.width_samples,
+            cell.n_recovered, cell.n_trials,
+            cell.snr_ratio_mean, cell.matched_kernel_id,
+        )
+
+    # ----- Noise-only FAR sub-check -----
+    if n_noise_cubes > 0:
+        far_detector = _build_detector(
+            t_det=t_det,
+            n_fdm=n_fdm,
+            threshold_sigma=BENCH_DETECTOR_THRESHOLD_SIGMA,
+            seed=args.seed + 9999,
+            image_tokens=image_tokens,
+            dm_tokens=dm_tokens,
+            time_tokens=time_tokens,
+        )
+        for cube_idx in range(n_noise_cubes):
+            noise_rng = np.random.default_rng(args.seed + 50_000 + cube_idx)
+            cands = _run_one_noise_only_cube(
+                detector=far_detector,
+                rng=noise_rng,
+                t_det=t_det,
+                n_fdm=n_fdm,
+                n_grid=n_grid,
             )
-            cell_results.append(cell)
-            score_per_kernel_per_cell[
-                (float(inj.snr), int(inj.width_samples))
-            ] = dict(kernel_score_at_match)
-
+            cube_snrs = [float(c.snr) for c in cands]
+            noise_summary.candidate_snrs.extend(cube_snrs)
+            noise_summary.n_candidates += len(cands)
+            noise_only_candidates.extend(cands)
             _LOG.info(
-                "cell snr=%.1f width=%d : recovered %d/%d (mean ratio=%.3f) "
-                "matched=%s",
-                inj.snr, inj.width_samples,
-                cell.n_recovered, cell.n_trials,
-                cell.snr_ratio_mean, cell.matched_kernel_id,
+                "noise-only cube %d/%d : %d candidates",
+                cube_idx + 1, n_noise_cubes, len(cands),
             )
-
-            inj_record = {
-                "kind": "injection",
-                "injected": cell.injected,
-                "n_trials": n_trials,
-                "n_recovered": cell.n_recovered,
-                "recovered_snrs": list(recovered_snrs),
-                "snr_ratio_mean": (
-                    cell.snr_ratio_mean
-                    if math.isfinite(cell.snr_ratio_mean)
-                    else None
-                ),
-                "matched_kernel_id": matched_kernel_id,
-                "score_per_kernel_at_match": kernel_score_at_match,
-                "cube_geometry": {
-                    "T_det": t_det,
-                    "N_fdm": n_fdm,
-                    "N_grid": n_grid,
-                },
-            }
-            injection_log_lines.append(json.dumps(inj_record))
-
-        # ----- Noise-only FAR sub-check -----
-        if n_noise_cubes > 0:
-            far_detector = _build_detector(
-                t_det=t_det,
-                n_fdm=n_fdm,
-                threshold_sigma=BENCH_DETECTOR_THRESHOLD_SIGMA,
-                seed=args.seed + 9999,
-                image_tokens=image_tokens,
-                dm_tokens=dm_tokens,
-                time_tokens=time_tokens,
-            )
-            for cube_idx in range(n_noise_cubes):
-                cube_id_counter += 1
-                noise_rng = np.random.default_rng(args.seed + 50_000 + cube_idx)
-                _, records = await _run_one_noise_only_cube(
-                    detector=far_detector,
-                    emitter=emitter,
-                    rng=noise_rng,
-                    t_det=t_det,
-                    n_fdm=n_fdm,
-                    n_grid=n_grid,
-                    cube_id=cube_id_counter,
-                )
-                cube_snrs = [float(rec.candidate.snr) for rec in records]
-                noise_summary.candidate_snrs.extend(cube_snrs)
-                noise_summary.n_emit_records += len(records)
-                noise_summary.n_predicate_passed += sum(
-                    1 for rec in records if rec.predicate_pass
-                )
-                noise_only_log_lines.append(json.dumps({
-                    "kind": "noise_only",
-                    "cube_id": cube_id_counter,
-                    "candidate_snrs": cube_snrs,
-                    "cube_geometry": {
-                        "T_det": t_det,
-                        "N_fdm": n_fdm,
-                        "N_grid": n_grid,
-                    },
-                }))
-                _LOG.info(
-                    "noise-only cube %d/%d : %d emit-records",
-                    cube_idx + 1, n_noise_cubes, len(records),
-                )
-            noise_summary.n_cubes = n_noise_cubes
-
-    finally:
-        try:
-            await emitter.stop()
-        finally:
-            await listener.stop()
+        noise_summary.n_cubes = n_noise_cubes
 
     # ----- Aggregate FAR by θ -----
     thetas = [6.0, 7.0, 8.0, 9.0, 10.0]
@@ -637,12 +515,14 @@ async def _bench_main(args: argparse.Namespace) -> int:
             })
 
     # ----- Persist logs + summary -----
-    (out_dir / "injection_log.ndjson").write_text(
-        "\n".join(injection_log_lines) + ("\n" if injection_log_lines else "")
-    )
-    (out_dir / "noise_only_log.ndjson").write_text(
-        "\n".join(noise_only_log_lines) + ("\n" if noise_only_log_lines else "")
-    )
+    injection_path = out_dir / "injection_log.ndjson"
+    with injection_path.open("w") as fh:
+        for c in injection_candidates:
+            fh.write(json.dumps(dataclasses.asdict(c)) + "\n")
+    noise_only_path = out_dir / "noise_only_log.ndjson"
+    with noise_only_path.open("w") as fh:
+        for c in noise_only_candidates:
+            fh.write(json.dumps(dataclasses.asdict(c)) + "\n")
 
     summary = {
         "tool": "bench/cube_injection_detector.py",
@@ -662,7 +542,6 @@ async def _bench_main(args: argparse.Namespace) -> int:
             "recovery_lm_tol": RECOVERY_LM_TOL,
             "recovery_fdm_tol": RECOVERY_FDM_TOL,
             "recovery_t_tol": RECOVERY_T_TOL,
-            "listener_port": listener.port,
             "quick_sweep": bool(args.quick_sweep),
             "seed": int(args.seed),
             "bank_mask": args.bank_mask,
@@ -689,8 +568,7 @@ async def _bench_main(args: argparse.Namespace) -> int:
             for c in cell_results
         ],
         "far": far_samples,
-        "noise_only_total_emit_records": noise_summary.n_emit_records,
-        "noise_only_predicate_passed": noise_summary.n_predicate_passed,
+        "noise_only_total_candidates": noise_summary.n_candidates,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     _LOG.info("wrote %d injection cells + %d noise-only cubes to %s",
@@ -753,12 +631,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--n-grid", type=int, default=DEFAULT_N_GRID,
         help=f"Cube spatial side length (default: {DEFAULT_N_GRID}).",
-    )
-    ap.add_argument(
-        "--listener-port", type=int, default=0,
-        help="Mock listener TCP port (0 = ephemeral; per D9/F5 the "
-             "operator-facing pin is 11227; tests use 0 to avoid h01 "
-             "M3 ∥ M5 collisions).",
     )
     ap.add_argument(
         "--seed", type=int, default=20260506,

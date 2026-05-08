@@ -2,13 +2,13 @@
 """bench/search_node_throughput.py — M5 Chunk 6b-β throughput +
 per-stage latency bench (plan §8 lines 2316-2317).
 
-Drives the ``SearchComputeService`` against a ``SyntheticRxRingSource``
-at the configured cube cadence, instruments per-stage wall-clock
-timing (combiner+imager, Layer-1 normalisation, detector forward,
-emitter fan-out), and writes a compact NDJSON / JSON result set the
-operator inspects via ``tools/viz/search_detector_check.py --mode
-throughput`` (the viz mode lands in chunk-7 hardening; chunk-6b-β
-ships the producer + a CLI summary).
+Drives the ``CubePipeline`` against a ``SyntheticRxRingSource`` at the
+configured cube cadence, instruments per-stage wall-clock timing
+(combiner+imager, Layer-1 normalisation, detector forward), and writes
+a compact NDJSON / JSON result set the operator inspects via
+``tools/viz/search_detector_check.py --mode throughput`` (the viz mode
+lands in chunk-7 hardening; chunk-6b-β ships the producer + a CLI
+summary).
 
 Bench rate budget (production, plan §8 line 2317):
     cube cadence at default ops ........ 134 ms (7.45 cubes/s)
@@ -25,7 +25,6 @@ CLI surface (see ``--help`` for the full grid):
       [--cube-cadence-s 0.0]                         \\
       [--t-det 64] [--n-fdm 8] [--n-grid 32]         \\
       [--threshold-sigma 8.0]                        \\
-      [--listener-port 11227]                        \\
       [--out bench/reports/<UTC>/throughput/M5/]     \\
       [--quick-smoke]
 
@@ -33,7 +32,7 @@ Outputs (under ``--out``):
 
   * ``stage_timings.ndjson`` — one record per cube
         ``{cube_id, build_cube_ns, layer1_norm_ns, detector_forward_ns,
-           emitter_dispatch_ns, total_pipeline_ns, n_candidates}``
+           total_pipeline_ns, n_candidates}``
   * ``summary.json``         — config + percentile summary
         ``{config: {...}, n_cubes, percentiles: {p50, p90, p99} per
            stage}``
@@ -42,7 +41,10 @@ Outputs (under ``--out``):
 Operator gate: per-stage p99 < 30 ms total at default ops geometry
 (``T_det=512, N_fdm=32, N_grid=256`` on cuda). The chunk-6b-β default
 geometry (T_det=64) is sized for h01-CPU smoke; the operator runs the
-full geometry on h01-GPU during M5 hardening.
+full geometry on h01-GPU during M5 hardening. (M6 chunk 0 retired the
+M5 trigger emitter; this bench no longer measures emitter-dispatch
+latency — the corr-side dsa110-xengine framework owns voltage-trigger
+fan-out in M6.)
 """
 
 from __future__ import annotations
@@ -81,22 +83,6 @@ from dsart.services.cube_pipeline import (  # noqa: E402
 from dsart.services.rx_ring import (  # noqa: E402
     SyntheticRxRingSource,
 )
-from dsart.trigger.conditions import (  # noqa: E402
-    PerCubePerKernelCap,
-    PerCubeTotalCap,
-    RateLimitTokenBucket,
-    SnrThreshold,
-)
-from dsart.trigger.emitter import (  # noqa: E402
-    ConnectionEndpoint,
-    TriggerEmitter,
-    TriggerEmitterConfig,
-)
-from dsart.trigger.holdoff import HoldoffStateMachine  # noqa: E402
-from dsart.trigger.mock_listener import (  # noqa: E402
-    MockListenerConfig,
-    MockTriggerListener,
-)
 
 
 _LOG = logging.getLogger("bench.search_node_throughput")
@@ -116,7 +102,6 @@ DEFAULT_N_GRID: int = 32
 DEFAULT_N_CUBES: int = 50
 DEFAULT_CUBE_CADENCE_S: float = 0.0
 DEFAULT_THRESHOLD_SIGMA: float = 8.0
-DEFAULT_LISTENER_PORT: int = 11227
 
 # --quick-smoke: minimal pass (5 cubes) for the M5.sh DoD path; full
 # perf characterisation lives in the operator-facing runs.
@@ -131,22 +116,18 @@ class StageTimingRecord:
     """One cube's stage-timing record (NDJSON record)."""
     cube_id: int
     n_candidates: int
-    n_records: int
     build_cube_ns: int
     layer1_norm_ns: int
     detector_forward_ns: int
-    emitter_dispatch_ns: int
     total_pipeline_ns: int
 
     def to_json(self) -> Dict[str, int]:
         return {
             "cube_id": self.cube_id,
             "n_candidates": self.n_candidates,
-            "n_records": self.n_records,
             "build_cube_ns": self.build_cube_ns,
             "layer1_norm_ns": self.layer1_norm_ns,
             "detector_forward_ns": self.detector_forward_ns,
-            "emitter_dispatch_ns": self.emitter_dispatch_ns,
             "total_pipeline_ns": self.total_pipeline_ns,
         }
 
@@ -344,96 +325,58 @@ async def _bench_main(args: argparse.Namespace) -> int:
             layer1_max_samples,
         )
 
-    # ---- Listener + emitter setup ----
-    listener_cfg = MockListenerConfig(
-        accept_rate=1.0, accept_delay_ms=0.0, completed_delay_ms=0.5,
-        send_completed=True,
-    )
-    listener = MockTriggerListener(
-        host="127.0.0.1", port=int(args.listener_port), config=listener_cfg,
-    )
-    await listener.start()
-    _LOG.info("MockTriggerListener up on %s:%d", listener.host, listener.port)
-    endpoint = ConnectionEndpoint(host=listener.host, port=listener.port)
-    emitter_cfg = TriggerEmitterConfig(
-        search_node_id=1,
-        gpu_half=1,
-        endpoints=[endpoint],
-        conditions=[
-            SnrThreshold(min_snr=threshold_sigma),
-            PerCubePerKernelCap(max_per_kernel=4),
-            PerCubeTotalCap(max_total=16),
-            RateLimitTokenBucket(rate_per_s=10.0, burst=10),
-        ],
-        holdoff=HoldoffStateMachine(holdoff_ms=50.0),
-    )
-    emitter = TriggerEmitter(emitter_cfg)
-    await emitter.start()
-
     # ---- Drain the source, collecting stage timings ----
     records: List[StageTimingRecord] = []
     skip_detector = bool(args.skip_detector)
     if skip_detector:
         _LOG.info(
-            "--skip-detector: bypassing Layer-1 norm + Detector.forward() "
-            "+ emitter dispatch; measuring build_cube alone."
+            "--skip-detector: bypassing Layer-1 norm + Detector.forward(); "
+            "measuring build_cube alone."
         )
     bench_start_ns = time.perf_counter_ns()
-    try:
-        async with src:
-            async for slot in src:
-                t_dispatch_start = time.perf_counter_ns()
-                if skip_detector:
-                    cube, validity_mask = pipeline._build_cube(slot)
-                    t_build_done = time.perf_counter_ns()
-                    rec = StageTimingRecord(
-                        cube_id=slot.cube_id,
-                        n_candidates=0,
-                        n_records=0,
-                        build_cube_ns=int(t_build_done - t_dispatch_start),
-                        layer1_norm_ns=0,
-                        detector_forward_ns=0,
-                        emitter_dispatch_ns=0,
-                        total_pipeline_ns=int(
-                            t_build_done - t_dispatch_start
-                        ),
-                    )
-                else:
-                    result = pipeline.process(slot)
-                    emit_t0 = time.perf_counter_ns()
-                    emitted = await emitter.process_candidates(
-                        slot.cube_id, result.candidates,
-                    )
-                    emit_t1 = time.perf_counter_ns()
-                    rec = StageTimingRecord(
-                        cube_id=slot.cube_id,
-                        n_candidates=len(result.candidates),
-                        n_records=len(emitted),
-                        build_cube_ns=int(
-                            result.stage_timings_ns["build_cube"]
-                        ),
-                        layer1_norm_ns=int(
-                            result.stage_timings_ns["layer1_norm"]
-                        ),
-                        detector_forward_ns=int(
-                            result.stage_timings_ns["detector_forward"]
-                        ),
-                        emitter_dispatch_ns=int(emit_t1 - emit_t0),
-                        total_pipeline_ns=int(emit_t1 - t_dispatch_start),
-                    )
-                records.append(rec)
-                if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
-                    _LOG.info(
-                        "cube=%d/%d total=%.2fms detector=%.2fms cands=%d",
-                        slot.cube_id + 1, n_cubes,
-                        rec.total_pipeline_ns / 1.0e6,
-                        rec.detector_forward_ns / 1.0e6,
-                        rec.n_candidates,
-                    )
-                await src.release(slot.cube_id)
-    finally:
-        await emitter.stop()
-        await listener.stop()
+    async with src:
+        async for slot in src:
+            t_dispatch_start = time.perf_counter_ns()
+            if skip_detector:
+                cube, validity_mask = pipeline._build_cube(slot)
+                t_build_done = time.perf_counter_ns()
+                rec = StageTimingRecord(
+                    cube_id=slot.cube_id,
+                    n_candidates=0,
+                    build_cube_ns=int(t_build_done - t_dispatch_start),
+                    layer1_norm_ns=0,
+                    detector_forward_ns=0,
+                    total_pipeline_ns=int(
+                        t_build_done - t_dispatch_start
+                    ),
+                )
+            else:
+                result = pipeline.process(slot)
+                t_done = time.perf_counter_ns()
+                rec = StageTimingRecord(
+                    cube_id=slot.cube_id,
+                    n_candidates=len(result.candidates),
+                    build_cube_ns=int(
+                        result.stage_timings_ns["build_cube"]
+                    ),
+                    layer1_norm_ns=int(
+                        result.stage_timings_ns["layer1_norm"]
+                    ),
+                    detector_forward_ns=int(
+                        result.stage_timings_ns["detector_forward"]
+                    ),
+                    total_pipeline_ns=int(t_done - t_dispatch_start),
+                )
+            records.append(rec)
+            if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
+                _LOG.info(
+                    "cube=%d/%d total=%.2fms detector=%.2fms cands=%d",
+                    slot.cube_id + 1, n_cubes,
+                    rec.total_pipeline_ns / 1.0e6,
+                    rec.detector_forward_ns / 1.0e6,
+                    rec.n_candidates,
+                )
+            await src.release(slot.cube_id)
     bench_wall_s = (time.perf_counter_ns() - bench_start_ns) / 1.0e9
 
     # ---- Write outputs ----
@@ -473,15 +416,11 @@ async def _bench_main(args: argparse.Namespace) -> int:
         ),
         "n_cubes_processed": len(records),
         "n_candidates_total": int(sum(r.n_candidates for r in records)),
-        "n_records_total": int(sum(r.n_records for r in records)),
         "percentiles_ms": {
             "build_cube": percentiles([r.build_cube_ns for r in records]),
             "layer1_norm": percentiles([r.layer1_norm_ns for r in records]),
             "detector_forward": percentiles(
                 [r.detector_forward_ns for r in records]
-            ),
-            "emitter_dispatch": percentiles(
-                [r.emitter_dispatch_ns for r in records]
             ),
             "total_pipeline": percentiles(
                 [r.total_pipeline_ns for r in records]
@@ -516,9 +455,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--threshold-sigma", type=float, default=DEFAULT_THRESHOLD_SIGMA,
     )
-    parser.add_argument(
-        "--listener-port", type=int, default=DEFAULT_LISTENER_PORT,
-    )
     parser.add_argument("--rng-seed", type=int, default=0)
     parser.add_argument(
         "--device", type=str, default="cpu",
@@ -541,12 +477,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--skip-detector", action="store_true",
-        help="Skip Layer-1 normalisation, Detector.forward(), and the "
-             "emitter dispatch. Only the combiner + 2D iFFT + edge mask "
-             "(build_cube) stage runs per cube. Used to measure the "
-             "imager-side upper-bound throughput in isolation; with the "
-             "detector skipped, GPU memory pressure disappears and the "
-             "bench can run at production geometry "
+        help="Skip Layer-1 normalisation + Detector.forward(). Only the "
+             "combiner + 2D iFFT + edge mask (build_cube) stage runs per "
+             "cube. Used to measure the imager-side upper-bound throughput "
+             "in isolation; with the detector skipped, GPU memory pressure "
+             "disappears and the bench can run at production geometry "
              "(T_det=512, N_fdm=32, N_grid=256) on a 2080 Ti. "
              "Chunk 6c follow-up.",
     )

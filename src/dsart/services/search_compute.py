@@ -1,24 +1,16 @@
-"""Search-node compute service entry (RX ring → detector → triggers).
+"""Search-node compute service entry (RX ring → detector).
 
-M5 Chunk 6b-α: long-running asyncio orchestrator that drives the
-``CubePipeline`` from a pluggable ``RxRingSource`` and fans out each
-cube's emitted ``Candidate`` list through a ``TriggerEmitter`` to a
-configured set of correlation-listener endpoints.
+M5 Chunk 6b-α (M6 chunk 0: trigger emitter retired): long-running asyncio
+orchestrator that drives the ``CubePipeline`` from a pluggable
+``RxRingSource``. Per-cube ``Candidate`` lists are surfaced from
+``CubePipelineResult``; downstream cluster + cube-dump + UDP-listener
+integration lands in M6 chunks 1-5.
 
 Responsibilities (plan §3.6 + §4.4):
-  1. Bring up RX-ring source (M4a in production; ``SyntheticRxRingSource``
-     for benches / unit tests).
-  2. Construct ``CubePipeline`` + ``DeterministicDetector`` +
-     ``Layer1State`` from the resolved ``SearchComputeConfig``.
-  3. Bring up ``TriggerEmitter`` with predicate chain + holdoff state
-     machine + endpoint pool.
-  4. Per-cube loop:
-       - acquire next slot from the RX ring
-       - pipeline.process(slot)              → CubePipelineResult
-       - emitter.process_candidates(...)     → fan-out
-       - source.release(slot.cube_id)
-  5. Graceful shutdown via ``await service.stop()``: stops the RX-ring,
-     drains the emitter, closes endpoint connections.
+  1. Bring up RX-ring source.
+  2. Construct CubePipeline + DeterministicDetector + Layer1State.
+  3. Per-cube loop: acquire slot → pipeline.process(slot) → release.
+     (M6 chunks 1-5 will add: clusterer + cube-dump + UDP listener.)
 
 Production path runs ``main()`` from a CLI; benches subclass / wire
 the service directly to inject a synthetic source.
@@ -28,28 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 
 from ..common.contracts import Candidate
 from ..detector.forward import DeterministicDetector
 from ..noise_norm.layer1 import Layer1State
-from ..trigger.conditions import (
-    PerCubePerKernelCap,
-    PerCubeTotalCap,
-    RateLimitTokenBucket,
-    SnrThreshold,
-)
-from ..trigger.predicate import TriggerCondition
-from ..trigger.emitter import (
-    ConnectionEndpoint,
-    EmitRecord,
-    TriggerEmitter,
-    TriggerEmitterConfig,
-)
-from ..trigger.holdoff import HoldoffStateMachine
 from .cube_pipeline import CubePipeline, CubePipelineConfig
 from .rx_ring import CubeRingSlot, RxRingSource
 
@@ -73,9 +51,9 @@ class SearchComputeConfig:
     """Static (per-process-lifetime) service config (plan §9 O-4 +
     ``configs/config_compute_search.yaml``).
 
-    The chunk-6b-α scope ships fields needed by the pipeline + emitter
-    + Layer-1 state. Endpoint discovery (etcd watch) and dynamic
-    reconfiguration are deferred to chunk-6b production hardening.
+    The chunk-6b-α scope ships fields needed by the pipeline + Layer-1
+    state. Endpoint discovery (etcd watch) and dynamic reconfiguration
+    are deferred to chunk-6b production hardening.
 
     The chunk-8 production wiring uses the GPU image backend by
     default — the pipeline's ``image_backend="gpu"`` config selects
@@ -99,13 +77,6 @@ class SearchComputeConfig:
     layer1_n_burnin_cubes: int = 5
     layer1_n_sigma: float = 3.0
     layer1_n_iterations: int = 3
-    holdoff_ms: float = 50.0
-    snr_threshold: float = 8.0
-    per_cube_per_kernel_cap: int = 4
-    per_cube_total_cap: int = 16
-    rate_limit_per_s: float = 10.0
-    rate_limit_burst: int = 10
-    correlation_endpoints: Sequence[ConnectionEndpoint] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -147,11 +118,9 @@ class SearchComputeService:
             detector=self._detector,
             layer1_state=self._layer1_state,
         )
-        self._emitter: Optional[TriggerEmitter] = None
         self._stopping = asyncio.Event()
         self._cubes_processed = 0
         self._candidates_emitted = 0
-        self._records_dispatched = 0
 
     @staticmethod
     def _build_detector(config: SearchComputeConfig) -> DeterministicDetector:
@@ -182,10 +151,6 @@ class SearchComputeService:
         return self._pipeline
 
     @property
-    def emitter(self) -> Optional[TriggerEmitter]:
-        return self._emitter
-
-    @property
     def cubes_processed(self) -> int:
         return self._cubes_processed
 
@@ -193,53 +158,26 @@ class SearchComputeService:
     def candidates_emitted(self) -> int:
         return self._candidates_emitted
 
-    @property
-    def records_dispatched(self) -> int:
-        return self._records_dispatched
-
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
 
     async def start(self) -> None:
-        """Bring up the RX-ring source + emitter."""
+        """Bring up the RX-ring source."""
         await self._source.start()
-        conditions: List[TriggerCondition] = [
-            SnrThreshold(min_snr=self._config.snr_threshold),
-            PerCubePerKernelCap(max_per_kernel=self._config.per_cube_per_kernel_cap),
-            PerCubeTotalCap(max_total=self._config.per_cube_total_cap),
-            RateLimitTokenBucket(
-                rate_per_s=self._config.rate_limit_per_s,
-                burst=self._config.rate_limit_burst,
-            ),
-        ]
-        holdoff = HoldoffStateMachine(holdoff_ms=self._config.holdoff_ms)
-        emitter_cfg = TriggerEmitterConfig(
-            search_node_id=self._config.search_node_id,
-            gpu_half=self._config.gpu_half,
-            endpoints=list(self._config.correlation_endpoints),
-            conditions=conditions,
-            holdoff=holdoff,
-        )
-        self._emitter = TriggerEmitter(emitter_cfg)
-        await self._emitter.start()
         _LOG.info(
-            "SearchComputeService up (sid=%d, gpu_half=%d, %d endpoints)",
+            "SearchComputeService up (sid=%d, gpu_half=%d)",
             self._config.search_node_id,
             self._config.gpu_half,
-            len(self._config.correlation_endpoints),
         )
 
     async def stop(self) -> None:
         self._stopping.set()
-        if self._emitter is not None:
-            await self._emitter.stop()
         await self._source.stop()
         _LOG.info(
-            "SearchComputeService stopped: cubes=%d candidates=%d records=%d",
+            "SearchComputeService stopped: cubes=%d candidates=%d",
             self._cubes_processed,
             self._candidates_emitted,
-            self._records_dispatched,
         )
 
     # -----------------------------------------------------------------
@@ -248,28 +186,16 @@ class SearchComputeService:
 
     async def _process_one_cube(
         self, slot: CubeRingSlot
-    ) -> List[EmitRecord]:
+    ) -> List[Candidate]:
         result = self._pipeline.process(slot)
         self._cubes_processed += 1
         self._candidates_emitted += len(result.candidates)
-        if self._emitter is None:
-            raise RuntimeError(
-                "SearchComputeService.start() must be called before processing cubes"
-            )
-        records = await self._emitter.process_candidates(
-            slot.cube_id, result.candidates
-        )
-        self._records_dispatched += len(records)
-        return records
+        return result.candidates
 
     async def run(self) -> None:
         """Main loop. Iterates over RX-ring slots until source exhausts
         or ``stop()`` is called.
         """
-        if self._emitter is None:
-            raise RuntimeError(
-                "SearchComputeService.run() requires start() first"
-            )
         async for slot in self._source:
             if self._stopping.is_set():
                 break
