@@ -735,8 +735,8 @@ class TestRTPhase3FusedComputeSplit:
     reason="BlockPipeliner requires a CUDA device (h01 GPU)",
 )
 class TestRTPhase4Pipeliner:
-    """RT Phase 4: ``BlockPipeliner`` is bit-identical to a sequential
-    loop over :func:`process_block` on the GPU.
+    """RT Phase 4: ``BlockPipeliner`` is numerically equivalent to a
+    sequential loop over :func:`process_block` on the GPU.
 
     The pipeline issues per-block stream-A (corr) work and stream-B
     (dedisp + gridder) work back-to-back; cross-stream events ensure
@@ -746,10 +746,22 @@ class TestRTPhase4Pipeliner:
     block order on stream B's serialized queue, so stateful subsystems
     see the same per-block update sequence.
 
+    Tolerance
+    =========
+
+    The gridder uses ``torch.index_add_`` which is implemented as
+    atomic float32 adds on CUDA; the per-cell reduction order is
+    determined by GPU thread scheduling, which is **not** deterministic
+    across stream contexts (sequential default-stream vs pipelined
+    non-default streams). Per the existing Phase 2 contract (kernel
+    test ``test_chunked_equals_unchunked`` is bit-identical only on
+    CPU), we test for ULP-level numerical agreement (``rtol=1e-5,
+    atol=1e-4``) on GPU rather than byte-identity.
+
     Skipped on CPU because :class:`BlockPipeliner` requires CUDA
     (multiple stream usage). The full integration test on h01 GPU
-    pins both per-block ``gridded_minus_sky`` bytes and the n_tx
-    counter against the sequential path.
+    pins both per-block ``gridded_minus_sky`` (within tolerance)
+    and the ``n_tx`` counter against the sequential path.
     """
 
     @pytest.mark.parametrize("n_blocks", [1, 2, 3, 4])
@@ -815,10 +827,12 @@ class TestRTPhase4Pipeliner:
             )
             assert pip.gridded_minus_sky.shape == seq.gridded_minus_sky.shape
             assert pip.gridded_minus_sky.dtype == seq.gridded_minus_sky.dtype
+            # ULP-level equivalence: index_add_ atomic-add reduction
+            # order is non-deterministic across GPU stream contexts.
             torch.testing.assert_close(
                 pip.gridded_minus_sky.cpu(),
                 seq.gridded_minus_sky,
-                rtol=0, atol=0,
+                rtol=1e-5, atol=1e-4,
                 msg=lambda m: (
                     f"Phase-4 pipelined != Phase-3 sequential for "
                     f"block {i}: {m}"
