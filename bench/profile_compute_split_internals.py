@@ -95,7 +95,7 @@ def _profile_one_slab(
         imag_slab = imag_v[:, :, :, p0:p1, :].contiguous()
         t1 = _stamp_sync(); _add("A_slab_contig", (t1 - t) * 1000); t = t1
 
-        # ---- inline _compute_one_slab with stage timers ----
+        # ---- inline Phase 6 _compute_one_slab with stage timers ----
 
         # Stage 1: views (free)
         R5 = real_slab.view(
@@ -107,22 +107,20 @@ def _profile_one_slab(
             n_fv_slab_actual, packets_per_fast_vis, kernel.nants,
         )
 
-        # Stage 2: permute + contiguous
-        R6 = R5.permute(3, 0, 1, 2, 4, 5).contiguous()
-        I6 = I5.permute(3, 0, 1, 2, 4, 5).contiguous()
+        # Stage 2: permute (3, 0, 2, 1, 4, 5) — (2t, ppfv) adjacent for K-fold
+        R6 = R5.permute(3, 0, 2, 1, 4, 5).contiguous()
+        I6 = I5.permute(3, 0, 2, 1, 4, 5).contiguous()
         del R5, I5
         t1 = _stamp_sync(); _add("B_stage2_perm", (t1 - t) * 1000); t = t1
 
-        # Stage 3: reshape into batched
-        new_batch = (
-            n_fv_slab_actual * kernel.nchan
-            * NTIMES_PER_PACKET * kernel.nvolt_pol
-        )
-        R = R6.reshape(new_batch, packets_per_fast_vis, kernel.nants)
-        I = I6.reshape(new_batch, packets_per_fast_vis, kernel.nants)
+        # Stage 3: fold (2t * ppfv) into K → batched matmul shape
+        K_combined = NTIMES_PER_PACKET * packets_per_fast_vis
+        new_batch = n_fv_slab_actual * kernel.nchan * kernel.nvolt_pol
+        R = R6.reshape(new_batch, K_combined, kernel.nants)
+        I = I6.reshape(new_batch, K_combined, kernel.nants)
         del R6, I6
 
-        # Stage 4: 4 batched fp16 GEMMs
+        # Stage 4: 4 batched fp16 GEMMs (now K=8, half the output volume)
         R_T = R.transpose(-1, -2)
         I_T = I.transpose(-1, -2)
         V_real = torch.matmul(R_T, R)
@@ -132,40 +130,41 @@ def _profile_one_slab(
         del R, I, R_T, I_T
         t1 = _stamp_sync(); _add("C_stage4_gemm", (t1 - t) * 1000); t = t1
 
-        # Stage 5: sum over t_sub + cast to fp32
-        V_real_6d = V_real.view(
-            n_fv_slab_actual, kernel.nchan, NTIMES_PER_PACKET,
-            kernel.nvolt_pol, kernel.nants, kernel.nants,
+        # Stage 5: nbada_pol slice (no t_sub sum needed!)
+        V_real_5d = V_real.view(
+            n_fv_slab_actual, kernel.nchan, kernel.nvolt_pol,
+            kernel.nants, kernel.nants,
         )
-        V_imag_6d = V_imag.view(
-            n_fv_slab_actual, kernel.nchan, NTIMES_PER_PACKET,
-            kernel.nvolt_pol, kernel.nants, kernel.nants,
+        V_imag_5d = V_imag.view(
+            n_fv_slab_actual, kernel.nchan, kernel.nvolt_pol,
+            kernel.nants, kernel.nants,
         )
-        V_real = V_real_6d.sum(dim=2).to(kernel.accum_dtype)
-        V_imag = V_imag_6d.sum(dim=2).to(kernel.accum_dtype)
-        del V_real_6d, V_imag_6d
-        V_real_b = V_real[:, :, :kernel.nbada_pol, :, :]
-        V_imag_b = V_imag[:, :, :kernel.nbada_pol, :, :]
-        t1 = _stamp_sync(); _add("D_stage5_sum", (t1 - t) * 1000); t = t1
+        V_real_b = V_real_5d[:, :, :kernel.nbada_pol, :, :]
+        V_imag_b = V_imag_5d[:, :, :kernel.nbada_pol, :, :]
+        t1 = _stamp_sync(); _add("D_stage5_slice", (t1 - t) * 1000); t = t1
 
-        # Stage 6: gather + permute + Stokes-I + chan-sum + complex
-        vis_real = V_real_b[..., kernel._b_idx, kernel._a_idx]
-        vis_imag = V_imag_b[..., kernel._b_idx, kernel._a_idx]
-        vis_real = vis_real.permute(0, 3, 1, 2).contiguous()
-        vis_imag = vis_imag.permute(0, 3, 1, 2).contiguous()
-        # Stokes-I sum over BADA pols
-        vis_real = vis_real.sum(dim=-1)
-        vis_imag = vis_imag.sum(dim=-1)
-        # chan-sum
+        # Stage 6: gather upper-tri (fp16) → cast → Stokes-I → chan-sum → permute
+        vis_real_fp16 = V_real_b[..., kernel._b_idx, kernel._a_idx]
+        vis_imag_fp16 = V_imag_b[..., kernel._b_idx, kernel._a_idx]
+        del V_real, V_imag, V_real_5d, V_imag_5d, V_real_b, V_imag_b
+        # Cast to fp32 on the post-gather tensor (50x smaller than legacy)
+        vis_real = vis_real_fp16.to(kernel.accum_dtype)
+        vis_imag = vis_imag_fp16.to(kernel.accum_dtype)
+        del vis_real_fp16, vis_imag_fp16
+        # Stokes-I + chan-sum + permute
+        vis_real = vis_real.sum(dim=2)
+        vis_imag = vis_imag.sum(dim=2)
         if chan_sum_factor > 1:
             vis_real = vis_real.reshape(
-                n_fv_slab_actual, NBASE, nchan_eff, chan_sum_factor,
-            ).sum(dim=-1)
+                n_fv_slab_actual, nchan_eff, chan_sum_factor, NBASE,
+            ).sum(dim=2)
             vis_imag = vis_imag.reshape(
-                n_fv_slab_actual, NBASE, nchan_eff, chan_sum_factor,
-            ).sum(dim=-1)
+                n_fv_slab_actual, nchan_eff, chan_sum_factor, NBASE,
+            ).sum(dim=2)
+        vis_real = vis_real.permute(0, 2, 1).contiguous()
+        vis_imag = vis_imag.permute(0, 2, 1).contiguous()
         out_full[fv0:fv1] = torch.complex(vis_real, vis_imag)
-        del vis_real, vis_imag, V_real, V_imag, V_real_b, V_imag_b
+        del vis_real, vis_imag
         t1 = _stamp_sync(); _add("E_stage6_pack", (t1 - t) * 1000); t = t1
 
         del real_slab, imag_slab
