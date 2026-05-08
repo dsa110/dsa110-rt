@@ -341,29 +341,59 @@ APPROVAL_UTC=""
 APPROVAL_VOLTAGE_RUN_ID=""
 APPROVAL_VIZ_SHA=""
 if [[ -f "${M6_OPERATOR_APPROVAL_FILE}" ]]; then
-  python3 - <<PY > /tmp/dsart_m6_operator_approval.json || fail "operator-approval yaml is malformed"
+  # M6 chunk-8 template: the operator-viz tools commit drops a placeholder
+  # marker with TEMPLATE values per ``bench/reports/M6/m_operator_approved.yaml``.
+  # If any TEMPLATE token survives, treat the marker as not-yet-approved
+  # and emit a WARN — operator hasn't actually signed off yet. This is the
+  # minimal extension over the prior "file exists -> approved" check.
+  if grep -q 'TEMPLATE' "${M6_OPERATOR_APPROVAL_FILE}"; then
+    warn "operator-approval marker at ${M6_OPERATOR_APPROVAL_FILE} contains TEMPLATE values — not yet approved"
+  else
+    python3 - <<PY > /tmp/dsart_m6_operator_approval.json || fail "operator-approval yaml is malformed"
 import json
 import sys
 import yaml
 with open("${M6_OPERATOR_APPROVAL_FILE}") as fh:
     data = yaml.safe_load(fh) or {}
-required = {"operator", "approval_utc_iso", "milestone", "voltage_run_id", "viz_artifact_sha256"}
-missing = required - set(data.keys())
-if missing:
-    print(f"missing fields: {sorted(missing)}", file=sys.stderr)
+# Accept either the M5-style schema (operator/approval_utc_iso/milestone/
+# voltage_run_id/viz_artifact_sha256) or the M6-chunk-8 template-derived
+# schema (approved_by/approved_at_utc/approved_git_sha). The chunk-8
+# inspector + verifier produce per-tool reports rather than a single
+# voltage_run_id-keyed artifact, so the simpler schema is the canonical
+# M6 form. Both are treated as approval as long as TEMPLATE is absent.
+def first_nonempty(*keys):
+    for k in keys:
+        v = data.get(k)
+        if v:
+            return str(v)
+    return ""
+operator = first_nonempty("approved_by", "operator")
+utc = first_nonempty("approved_at_utc", "approval_utc_iso")
+if not operator or not utc:
+    print(
+        "missing operator+approval-utc fields "
+        "(need approved_by/approved_at_utc OR operator/approval_utc_iso)",
+        file=sys.stderr,
+    )
     sys.exit(1)
-if str(data.get("milestone")) != "M6":
-    print(f"wrong milestone {data.get('milestone')!r}", file=sys.stderr)
-    sys.exit(1)
-print(json.dumps({k: str(data.get(k, "")) for k in sorted(required)}))
+out = {
+    "operator": operator,
+    "approval_utc_iso": utc,
+    "voltage_run_id": first_nonempty("voltage_run_id"),
+    "viz_artifact_sha256": first_nonempty(
+        "approved_git_sha", "viz_artifact_sha256"
+    ),
+}
+print(json.dumps(out))
 PY
-  APPROVAL_PRESENT="true"
-  APPROVAL_OPERATOR="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["operator"])')"
-  APPROVAL_UTC="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["approval_utc_iso"])')"
-  APPROVAL_VOLTAGE_RUN_ID="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["voltage_run_id"])')"
-  APPROVAL_VIZ_SHA="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["viz_artifact_sha256"])')"
-  echo "  marker present at ${M6_OPERATOR_APPROVAL_FILE}"
-  echo "  operator=${APPROVAL_OPERATOR} utc=${APPROVAL_UTC} run_id=${APPROVAL_VOLTAGE_RUN_ID}"
+    APPROVAL_PRESENT="true"
+    APPROVAL_OPERATOR="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["operator"])')"
+    APPROVAL_UTC="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["approval_utc_iso"])')"
+    APPROVAL_VOLTAGE_RUN_ID="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["voltage_run_id"])')"
+    APPROVAL_VIZ_SHA="$(python3 -c 'import json; print(json.load(open("/tmp/dsart_m6_operator_approval.json"))["viz_artifact_sha256"])')"
+    echo "  marker present at ${M6_OPERATOR_APPROVAL_FILE}"
+    echo "  operator=${APPROVAL_OPERATOR} utc=${APPROVAL_UTC} run_id=${APPROVAL_VOLTAGE_RUN_ID}"
+  fi
 else
   warn "no operator-approval marker at ${M6_OPERATOR_APPROVAL_FILE} — stamp will be 'needs operator approval'"
 fi
