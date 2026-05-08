@@ -577,25 +577,34 @@ class FastVisGridder:
         )
         out_imag = torch.zeros_like(out_real)
 
-        # Per-tap scatter loop: for each of the K² taps, weight the
+        # Per-tap accumulation loop. For each of the K² taps, weight the
         # full (n_fv, NBASE*NCHAN) source tensor by ``weights_flat[t]``
-        # and scatter into the cells indexed by ``cell_index_map[:, t]``.
-        # This bounds the peak transient to one (n_fv, NBASE*NCHAN_eff)
-        # cfp32 tile ≈ 1 GB at the production op-point, instead of
-        # materialising the full ``src.unsqueeze(2) * weights`` outer
-        # product which is K² × that — 9 GB at K=3 and 23 GB at K=5
-        # (OOMs on a 2080Ti). The K=1 path is a single iteration with
-        # ``weights_flat[0] = 1.0`` so the scatter is bit-identical to
-        # the pre-G7 single-tap path.
+        # and accumulate into the cells indexed by ``cell_index_map[:, t]``
+        # using ``Tensor.index_add_`` (1-D index = 1.8 MB int64 at the
+        # production op-point) instead of ``scatter_add_`` (would need
+        # an (n_fv, NSRC) int64 index = ~3.7 GB at chunk=2 — blows the
+        # 2080 Ti budget). For K=1, ``weights_flat[0] == 1.0`` so the
+        # multiply is skipped (bit-identical to weighting by 1.0). The
+        # K=1 path then collapses to two ``index_add_`` calls (real +
+        # imag), no per-tap loop overhead.
         cim = self.cell_index_map.reshape(-1, n_taps)                 # (NBASE*NCHAN_eff, K*K)
-        for t in range(n_taps):
-            w = weights_flat[t]
-            src_w_real = (src.real * w).contiguous()
-            src_w_imag = (src.imag * w).contiguous()
-            idx_t = cim[:, t].unsqueeze(0).expand(n_fv, -1).contiguous()
-            out_real.scatter_add_(1, idx_t, src_w_real)
-            out_imag.scatter_add_(1, idx_t, src_w_imag)
-            del src_w_real, src_w_imag, idx_t
+        if n_taps == 1:
+            # K=1 fast path
+            idx_1d = cim[:, 0]                                         # (NSRC,) int64
+            src_real_c = src.real.contiguous()
+            src_imag_c = src.imag.contiguous()
+            out_real.index_add_(1, idx_1d, src_real_c)
+            out_imag.index_add_(1, idx_1d, src_imag_c)
+            del src_real_c, src_imag_c
+        else:
+            for t in range(n_taps):
+                w = weights_flat[t]
+                idx_t = cim[:, t]                                      # (NSRC,) int64
+                src_w_real = (src.real * w).contiguous()
+                src_w_imag = (src.imag * w).contiguous()
+                out_real.index_add_(1, idx_t, src_w_real)
+                out_imag.index_add_(1, idx_t, src_w_imag)
+                del src_w_real, src_w_imag
         out_buf = torch.complex(out_real, out_imag)
 
         # Strip the sentinel slot.
