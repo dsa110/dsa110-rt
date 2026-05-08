@@ -279,29 +279,15 @@ quantize)."""
 
 
 # ---------------------------------------------------------------------------
-# Trigger packet (plan §3 lines 354-383)
+# Trigger packet constants (plan §3 lines 354-383) — RETIRED in M6 chunk-9
+# hardening sweep along with TriggerPacket / TriggerAck dataclasses.
+# Voltage-trigger handoff is operator-mediated through the legacy
+# dsa110-xengine framework (dsaX_trigger / dsaX_store / fada). A future
+# revival of the original-M6 voltage-trigger workstream (§M-defer) will
+# re-lock TRIGGER_SCHEMA_VERSION, TRIGGER_PRIORITIES, TRIGGER_ACK_STAGES,
+# TRIGGER_ACK_REASONS, TRIGGER_OPERATOR_SEARCH_NODE_ID under whatever
+# new transport is chosen.
 # ---------------------------------------------------------------------------
-
-TRIGGER_SCHEMA_VERSION: int = 1
-
-TRIGGER_PRIORITIES: tuple[str, ...] = ("high", "normal", "low")
-
-TRIGGER_ACK_STAGES: tuple[str, ...] = ("accepted", "completed")
-
-TRIGGER_ACK_REASONS: tuple[str, ...] = (
-    "dup",
-    "ratelimit",
-    "bad_schema",
-    "listener_overloaded",
-    "action_unsupported",
-    "dump_queue_full",
-)
-"""Allowed values of TriggerAck.reason when accepted=False (plan §3 line 383
-+ §4.5 line 1718 dump_queue_full)."""
-
-TRIGGER_OPERATOR_SEARCH_NODE_ID: int = 255
-"""search_node_id reserved for ctrltrigger operator-issued triggers
-(plan §3.4 line 627; §4.6 line 1728). Detector-emitted candidates use 0..3."""
 
 
 # ---------------------------------------------------------------------------

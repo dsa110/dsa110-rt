@@ -1,6 +1,13 @@
 # Search detector + cube assembly defaults (§9 O-4). M6 chunk 0
-# retired the M5 trigger emitter; cluster + cube-dump + UDP-listener
-# config keys land in M6 chunks 1-5.
+# retired the M5 trigger emitter; the M6 sub-system blocks below
+# (clusterer / cube_dump / udp_listener / cands_logger) are the
+# locked decisions from M6 D1-D12 + the chunk-6 D5 bench verdict.
+#
+# Note: the yaml→dataclass wiring for the M6 sub-system blocks is not
+# yet plumbed through `dsart.common.config_loader` — benches and tests
+# currently construct the dataclasses programmatically. The blocks are
+# committed here as the canonical defaults for the future M7 control-
+# plane wire-up; sub-agents picking up the wiring task can read them.
 schema_version: 1
 dm_plan_path: configs/dm_plan.npz
 detector_class: dsart.detector.forward.DeterministicDetector
@@ -22,3 +29,48 @@ decoder:
   merge_radius_lm: 3
   merge_radius_fdm: 5
   merge_radius_t: max_time_kernel_width
+
+# M6 D4 + D5 — clusterer backend pinned to DBSCAN per the chunk-6
+# bench verdict (see bench/reports/M6/clusterer_throughput.json):
+# HDBSCAN p99 at 1000 cands/cube was 55.6 ms (> 50 ms budget); DBSCAN
+# at 1000 cands/cube was 14.1 ms (well within budget). Backend is a
+# free knob — operator can flip back to "hdbscan" once HDBSCAN p99
+# regresses to <50 ms.
+clusterer:
+  backend: dbscan         # D5 fallback. Use "hdbscan" if D5 gate passes.
+  feature_mode: int       # D3 — also writes real units to T1/T2 unconditionally.
+  weights: [4.0, 1.0, 1.0, 1.0, 1.0]   # log2_width × 4, fdm_idx × 1, t_in_cube × 1, l_pix × 1, m_pix × 1
+  min_cluster_size: 2     # D4 — HDBSCAN-equivalent of DBSCAN's min_samples.
+  min_samples: 1          # D4.
+  cluster_selection_epsilon: 10.0      # D4.
+  dbscan_eps: 10.0        # D5 fallback: cityblock distance.
+  dbscan_min_samples: 2
+  metric: manhattan       # ≡ cityblock; HDBSCAN spelling.
+
+# M6 D1 + D2 — T1/T2 ASCII candidate + cluster logger.
+cands_logger:
+  log_root: bench/reports/M6/cands_log     # ${DSART_M6_CANDS_LOG_DIR} overrides.
+  rotate_interval_s: 3600                  # D2 — hourly rotation on the UTC hour.
+  search_node_id: 0
+  gpu_half: 0
+
+# M6 D7 — cube-dump writer (NPZ float16, single-worker thread, bounded queue).
+cube_dump:
+  dump_root: bench/reports/M6/cube_dump    # ${DSART_M6_CUBE_DUMP_DIR} overrides.
+  queue_maxsize: 4                         # D7 — backpressure drops on overflow.
+  search_node_id: 0
+  gpu_half: 0
+
+# M6 D8 — auto-trigger predicate (only fires when ALL conditions hold).
+bright_pulse_predicate:
+  min_snr: 10.0           # peak candidate SNR threshold.
+  dm_fine_min_pc_cc: null # null ⇒ no lower bound.
+  dm_fine_max_pc_cc: null # null ⇒ no upper bound.
+  width_samples_max: null # null ⇒ no upper bound.
+  min_cntc: 1             # cluster cardinality floor (1 = accept singletons).
+  holdoff_ms: 5000        # per-process; sidelobe runs don't fire dozens of NPZs.
+
+# M6 D9 — UDP "dump-next-cube" listener.
+udp_trigger_listener:
+  host: 127.0.0.1         # bind on-host only by default.
+  port: 11227             # legacy dsaX_filTrigger_twoInput slot, freed in M6.

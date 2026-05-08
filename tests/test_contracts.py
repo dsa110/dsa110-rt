@@ -39,7 +39,6 @@ from dsart.common.constants import (  # noqa: E402
     NU_TOP_PROC_GHZ,
     BW_PROC_MHZ,
     N_CHAN_PROC_NATIVE,
-    TRIGGER_OPERATOR_SEARCH_NODE_ID,
     VOLTAGES_SHAPE,
 )
 from dsart.common.contracts import (  # noqa: E402
@@ -50,8 +49,6 @@ from dsart.common.contracts import (  # noqa: E402
     CubeGeometry,
     DmPlan,
     SparseCOOPayload,
-    TriggerAck,
-    TriggerPacket,
     Voltages,
 )
 
@@ -295,163 +292,13 @@ def test_candidate_frozen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TriggerPacket
+# TriggerPacket / TriggerAck contract tests — RETIRED in M6 chunk-9 sweep
+# (the dataclasses were dropped from src/dsart/common/contracts.py;
+# voltage-trigger handoff is now operator-mediated through legacy
+# dsa110-xengine; see plan §M6 / §M-defer for the deferred reactivation
+# path that will re-introduce wire-form trigger contracts under whatever
+# transport is chosen).
 # ---------------------------------------------------------------------------
-
-
-def _make_trigger(**overrides: object) -> TriggerPacket:
-    base = dict(
-        trigger_id="s2-g1-000123",
-        search_node_id=2,
-        emit_utc_ns=1_872_345_678_901_234_567,
-        event_specnum=12_345_678,
-        event_utc_ns=1_872_345_677_000_000_000,
-        l=0.012,
-        m=-0.034,
-        dm_fine=524.6,
-        dm_idx=87,
-        fine_dm_trial=87,
-        width_samples=4,
-        kernel_id="psf:d3:b16",
-        snr=9.7,
-        actions={"voltage_dump": True, "filterbank": True, "n_beams": 1},
-        priority="normal",
-        src_name="auto_20260430_142511_b3",
-    )
-    base.update(overrides)
-    return TriggerPacket(**base)  # type: ignore[arg-type]
-
-
-def test_trigger_happy() -> None:
-    _make_trigger()
-
-
-def test_trigger_operator_search_node_ok() -> None:
-    _make_trigger(
-        search_node_id=TRIGGER_OPERATOR_SEARCH_NODE_ID,
-        trigger_id="op-1872345678901234567",
-        priority="high",
-    )
-
-
-def test_trigger_rejects_bad_priority() -> None:
-    with pytest.raises(ValueError, match="priority"):
-        _make_trigger(priority="urgent")
-
-
-def test_trigger_rejects_search_node_5() -> None:
-    with pytest.raises(ValueError, match="search_node_id"):
-        _make_trigger(search_node_id=5)
-
-
-def test_trigger_rejects_empty_trigger_id() -> None:
-    with pytest.raises(ValueError, match="trigger_id"):
-        _make_trigger(trigger_id="")
-
-
-def test_trigger_n_pre_blocks_none_ok() -> None:
-    p = _make_trigger(n_pre_blocks=None, n_post_blocks=None)
-    assert p.n_pre_blocks is None and p.n_post_blocks is None
-
-
-# ---------------------------------------------------------------------------
-# TriggerAck
-# ---------------------------------------------------------------------------
-
-
-def test_trigger_ack_accepted_happy() -> None:
-    TriggerAck(
-        trigger_id="s2-g1-000123",
-        stage="accepted",
-        ack_utc_ns=1_872_345_678_901_234_567,
-        accepted=True,
-        queue_depth=3,
-    )
-
-
-def test_trigger_ack_accepted_dup() -> None:
-    TriggerAck(
-        trigger_id="s2-g1-000123",
-        stage="accepted",
-        ack_utc_ns=1_872_345_678_901_234_567,
-        accepted=False,
-        reason="dup",
-        dup_of="s1-g0-000099",
-    )
-
-
-def test_trigger_ack_completed_happy() -> None:
-    TriggerAck(
-        trigger_id="s2-g1-000123",
-        stage="completed",
-        ack_utc_ns=1_872_345_678_901_234_567,
-        voltage_dump_path="/home/ubuntu/data/fl_12345678.out",
-        filterbank_paths=("/home/ubuntu/data/auto_20260430_142511_b3_b0.fil",),
-        dump_completion_utc_ns=1_872_345_679_201_234_567,
-        dump_duration_ms=312,
-    )
-
-
-def test_trigger_ack_rejects_bad_stage() -> None:
-    with pytest.raises(ValueError, match="stage"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="other",
-            ack_utc_ns=0,
-        )
-
-
-def test_trigger_ack_accepted_requires_accepted_flag() -> None:
-    with pytest.raises(ValueError, match="accepted"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="accepted",
-            ack_utc_ns=0,
-        )
-
-
-def test_trigger_ack_rejected_requires_reason() -> None:
-    with pytest.raises(ValueError, match="reason"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="accepted",
-            ack_utc_ns=0,
-            accepted=False,
-            reason=None,
-        )
-
-
-def test_trigger_ack_dup_requires_dup_of() -> None:
-    with pytest.raises(ValueError, match="dup_of"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="accepted",
-            ack_utc_ns=0,
-            accepted=False,
-            reason="dup",
-        )
-
-
-def test_trigger_ack_completed_requires_dump_fields() -> None:
-    with pytest.raises(ValueError, match="dump_completion_utc_ns"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="completed",
-            ack_utc_ns=0,
-        )
-
-
-def test_trigger_ack_filterbank_paths_must_be_tuple() -> None:
-    with pytest.raises(TypeError, match="filterbank_paths"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="completed",
-            ack_utc_ns=0,
-            voltage_dump_path="/x",
-            filterbank_paths=["/x"],  # type: ignore[arg-type]
-            dump_completion_utc_ns=0,
-            dump_duration_ms=0,
-        )
 
 
 # ---------------------------------------------------------------------------

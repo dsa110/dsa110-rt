@@ -164,10 +164,11 @@ pass
 # ---------------------------------------------------------------------
 
 # Chunk 0 — kickoff (THIS CHUNK)
-#   Deliverables: M6_PLAN_FIXES.md, tools/dod/M6_preflight.sh,
-#                 tools/dod/M6.sh, hard-rm of M5 trigger emitter.
-CHUNK_0_KICKOFF_PRESENT=$([[ -f "${REPO_ROOT}/M6_PLAN_FIXES.md" \
-                           && -f "${REPO_ROOT}/tools/dod/M6_preflight.sh" \
+#   Deliverables: tools/dod/M6_preflight.sh, tools/dod/M6.sh, hard-rm
+#   of M5 trigger emitter (src/dsart/trigger/). M6_PLAN_FIXES.md was
+#   originally required, but chunk 9 hardening retires it (folded into
+#   plan.md), so we don't gate on its presence.
+CHUNK_0_KICKOFF_PRESENT=$([[ -f "${REPO_ROOT}/tools/dod/M6_preflight.sh" \
                            && -f "${REPO_ROOT}/tools/dod/M6.sh" \
                            && ! -d "${REPO_ROOT}/src/dsart/trigger" ]] && echo true || echo false)
 

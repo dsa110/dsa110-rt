@@ -12,15 +12,18 @@ Contracts:
     SparseCOOPayload      — corr → search value vector (in-process; wire
                             byte layout in §4.3)
     Candidate             — detector output (search → clusterer)
-    TriggerPacket         — legacy trigger packet (M6 ch0: dead code;
-                            tracked for chunk-9 sweep)
-    TriggerAck            — legacy ACK record (M6 ch0: dead code;
-                            tracked for chunk-9 sweep)
     DmPlan                — DM plan struct (build_dm_plan.py output;
                             commits to configs/dm_plan.npz)
     CubeGeometry          — per-cube geometric metadata (M6 chunk 1)
     ClusterRecord         — clusterer output, one row per cluster (M6 ch1)
     CubeDumpManifest      — sidecar metadata for each NPZ cube dump (M6 ch3)
+
+(The pre-M6-pivot ``TriggerPacket`` / ``TriggerAck`` contracts were
+dropped in the M6 chunk-9 hardening sweep — voltage-trigger handoff is
+operator-mediated via the legacy ``dsa110-xengine`` framework, see
+plan §M6 / §M-defer. A future revival of the original-M6 voltage-
+trigger workstream will re-lock these under whatever new transport is
+chosen.)
 
 All fields use ``Final``-style typing — re-binding fails at runtime via
 ``frozen=True``. Mutating ndarray *contents* is still possible (frozen
@@ -46,11 +49,6 @@ from .constants import (
     N_SEARCH,
     N_SEARCH_GPU,
     SPARSE_COO_BITS_VALID,
-    TRIGGER_ACK_REASONS,
-    TRIGGER_ACK_STAGES,
-    TRIGGER_OPERATOR_SEARCH_NODE_ID,
-    TRIGGER_PRIORITIES,
-    TRIGGER_SCHEMA_VERSION,
     VOLTAGES_DTYPES_VALID,
     VOLTAGES_SHAPE,
 )
@@ -60,8 +58,6 @@ __all__ = [
     "Voltages",
     "SparseCOOPayload",
     "Candidate",
-    "TriggerPacket",
-    "TriggerAck",
     "DmPlan",
     "CubeGeometry",
     "ClusterRecord",
@@ -303,166 +299,6 @@ class Candidate:
             )
         if self.flags < 0 or self.flags >= (1 << 32):
             raise ValueError(f"flags={self.flags}, expected uint32")
-
-
-# ---------------------------------------------------------------------------
-# TriggerPacket — plan §3 lines 355-372 + F4 fix
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class TriggerPacket:
-    """Search → corr trigger (newline-delimited JSON over persistent TCP).
-
-    Wire form: ``json.dumps(asdict(packet))``. Schema versioned via ``v``.
-
-    ``trigger_id`` format is ``s<sid>-g<g>-<counter>`` per F4 (§4.4 long
-    form, plan §3 example was abbreviated). Operator-issued triggers
-    use ``search_node_id == TRIGGER_OPERATOR_SEARCH_NODE_ID (= 255)``
-    and ``trigger_id == "op-<utc_ns>"``.
-
-    Fields that the emitter derives (not present on Candidate):
-      - ``trigger_id`` (per-(search_node, gpu) monotonic counter)
-      - ``emit_utc_ns`` (now)
-      - ``event_utc_ns`` (from ``event_specnum`` via specnum→UTC table)
-      - ``actions``, ``priority``, ``src_name`` (from policy + trigger
-        predicate; defaults are pinned in §4.4)
-      - ``n_pre_blocks``, ``n_post_blocks`` (None → corr listener uses
-        config defaults of 10/5).
-      - ``fine_dm_trial`` (= ``dm_idx`` in v1 per O-7 trim).
-    """
-
-    trigger_id: str
-    search_node_id: int
-    emit_utc_ns: int
-    event_specnum: int
-    event_utc_ns: int
-    l: float
-    m: float
-    dm_fine: float
-    dm_idx: int
-    fine_dm_trial: int
-    width_samples: int
-    kernel_id: str
-    snr: float
-    actions: dict
-    priority: str
-    src_name: str
-    n_pre_blocks: Optional[int] = None
-    n_post_blocks: Optional[int] = None
-    v: int = TRIGGER_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if not DSART_TEST:
-            return
-        if self.v != TRIGGER_SCHEMA_VERSION:
-            raise ValueError(
-                f"v={self.v}, expected {TRIGGER_SCHEMA_VERSION}"
-            )
-        sid = self.search_node_id
-        if not (0 <= sid < N_SEARCH or sid == TRIGGER_OPERATOR_SEARCH_NODE_ID):
-            raise ValueError(
-                f"search_node_id={sid}, expected 0..{N_SEARCH - 1} "
-                f"or {TRIGGER_OPERATOR_SEARCH_NODE_ID} (operator)"
-            )
-        if not self.trigger_id:
-            raise ValueError("trigger_id must be non-empty")
-        if self.priority not in TRIGGER_PRIORITIES:
-            raise ValueError(
-                f"priority={self.priority!r} not in {TRIGGER_PRIORITIES}"
-            )
-        _check_kernel_id(self.kernel_id)
-        if self.event_specnum < 0:
-            raise ValueError(f"event_specnum={self.event_specnum}, expected ≥ 0")
-        if self.dm_fine < 0:
-            raise ValueError(f"dm_fine={self.dm_fine}, expected ≥ 0")
-        if self.dm_idx < 0:
-            raise ValueError(f"dm_idx={self.dm_idx}, expected ≥ 0")
-        if self.width_samples <= 0:
-            raise ValueError(f"width_samples={self.width_samples}, expected > 0")
-        if self.n_pre_blocks is not None and self.n_pre_blocks < 0:
-            raise ValueError(f"n_pre_blocks={self.n_pre_blocks}, expected ≥ 0")
-        if self.n_post_blocks is not None and self.n_post_blocks < 0:
-            raise ValueError(f"n_post_blocks={self.n_post_blocks}, expected ≥ 0")
-        if not isinstance(self.actions, dict):
-            raise TypeError(
-                f"actions must be dict; got {type(self.actions).__name__}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# TriggerAck — plan §3 lines 374-382
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class TriggerAck:
-    """Corr → search ACK record (newline-delimited JSON; two stages).
-
-    The corr listener sends two ACK records per trigger over the same
-    TCP connection: one with ``stage="accepted"`` (within ~ms) and one
-    with ``stage="completed"`` (after dump completes; ~100-700 ms).
-
-    Stage-specific fields are optional on the dataclass; ``__post_init__``
-    enforces presence per ``stage`` value. JSON serialisation drops
-    ``None``-valued fields per §4.5 line 1718.
-
-    ``reason`` is non-None only when ``accepted=False``. Allowed values
-    in ``TRIGGER_ACK_REASONS`` per §3 line 383 + §4.5 line 1718
-    ``dump_queue_full`` (which §3 missed; F2/F-related).
-    """
-
-    trigger_id: str
-    stage: str
-    ack_utc_ns: int
-    accepted: Optional[bool] = None
-    reason: Optional[str] = None
-    queue_depth: Optional[int] = None
-    dup_of: Optional[str] = None
-    voltage_dump_path: Optional[str] = None
-    filterbank_paths: Optional[tuple] = None  # tuple of str (frozen-friendly)
-    dump_completion_utc_ns: Optional[int] = None
-    dump_duration_ms: Optional[int] = None
-    v: int = TRIGGER_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if not DSART_TEST:
-            return
-        if self.v != TRIGGER_SCHEMA_VERSION:
-            raise ValueError(f"v={self.v}, expected {TRIGGER_SCHEMA_VERSION}")
-        if self.stage not in TRIGGER_ACK_STAGES:
-            raise ValueError(
-                f"stage={self.stage!r} not in {TRIGGER_ACK_STAGES}"
-            )
-        if not self.trigger_id:
-            raise ValueError("trigger_id must be non-empty")
-        if self.stage == "accepted":
-            if self.accepted is None:
-                raise ValueError("stage='accepted' requires `accepted` bool")
-            if not self.accepted:
-                if self.reason is None or self.reason not in TRIGGER_ACK_REASONS:
-                    raise ValueError(
-                        f"reason={self.reason!r} required and must be in "
-                        f"{TRIGGER_ACK_REASONS} when accepted=False"
-                    )
-                if self.reason == "dup" and not self.dup_of:
-                    raise ValueError("reason='dup' requires `dup_of`")
-        elif self.stage == "completed":
-            if self.dump_completion_utc_ns is None:
-                raise ValueError(
-                    "stage='completed' requires `dump_completion_utc_ns`"
-                )
-            if self.dump_duration_ms is None or self.dump_duration_ms < 0:
-                raise ValueError(
-                    f"dump_duration_ms={self.dump_duration_ms}, expected ≥ 0"
-                )
-            if self.filterbank_paths is not None and not isinstance(
-                self.filterbank_paths, tuple
-            ):
-                raise TypeError(
-                    f"filterbank_paths must be tuple; got "
-                    f"{type(self.filterbank_paths).__name__}"
-                )
 
 
 # ---------------------------------------------------------------------------
