@@ -164,12 +164,13 @@ def main(argv=None):
     )
 
     antpos_e, antpos_n = _synth_antpos(seed=42)
-    core_mask = _build_core_baseline_mask(n_core=82)
-    # Match the production op-point's common cell_lambda — same logic as
-    # corr_fast_integration._build_gridder when cfg.cell_lambda_mode="common".
+    # bench/profile_fast_path_K1.py builds the production context WITHOUT
+    # is_core_baseline_mask — the cell_lambda is sized to the longest
+    # baseline including outriggers (96-ant set). To match its op-point
+    # exactly (cell_lambda~148 → n_filled=460) we pass mask=None too.
     cell_lambda_common = compute_top_of_band_cell_lambda(
         antpos_e, antpos_n, n_grid=args.n_grid,
-        is_core_baseline_mask=core_mask,
+        is_core_baseline_mask=None,
     )
     LOG.info("common cell_lambda = %.4g (matches production op-point)",
              cell_lambda_common)
@@ -178,11 +179,11 @@ def main(argv=None):
         chgroup=0, dec_deg=53.85, n_grid=args.n_grid,
         kernel_support=1, chan_sum_factor=args.chan_sum_factor,
         cell_lambda=cell_lambda_common,
-        is_core_baseline_mask=core_mask,
+        is_core_baseline_mask=None,
     )
     gridder = FastVisGridder.from_pattern(
         pattern, antpos_e, antpos_n,
-        is_core_baseline_mask=core_mask,
+        is_core_baseline_mask=None,
         device=device,
     )
     stage1 = Stage1MultiDMCoarseDM(
