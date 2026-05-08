@@ -961,6 +961,18 @@ class TestRTPhase5DedispLayout:
         )
         return vis.to(device)
 
+    # Tolerances:
+    # The legacy path scatter-adds in flat (b * NCHAN_eff + c) order
+    # within each chunk; the new path scatter-adds per channel,
+    # accumulating contributions in a different order. For sums of
+    # ~10^3 - 10^5 unit-stddev values, fp32 reduction-order produces
+    # absolute differences on the order of 1e-4 to 1e-3. We pin
+    # rtol=1e-4 atol=1e-3 — large enough to absorb the reorder, small
+    # enough that any real algorithm bug (sign flip, off-by-one in
+    # bin shifts, wrong cell index) produces O(1)-scale failures.
+    _DEDISP_RTOL = 1e-4
+    _DEDISP_ATOL = 1e-3
+
     @pytest.mark.parametrize(
         "n_fv,n_coarse_dm",
         [(64, 4), (96, 6), (128, 8)],
@@ -981,11 +993,9 @@ class TestRTPhase5DedispLayout:
         )
         out_new = stage1._dedisperse_one_window(vis)
         out_legacy = stage1._dedisperse_one_window_legacy(vis)
-        # Per-channel index_add reduction order differs from the
-        # flatten-all scatter order → ULP-level (not bit) agreement.
         torch.testing.assert_close(
             out_new, out_legacy,
-            rtol=1e-5, atol=1e-4,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
             msg=lambda m: (
                 f"Phase-5 layout dedisp != legacy on CPU "
                 f"(n_fv={n_fv}, n_dm={n_coarse_dm}): {m}"
@@ -1009,7 +1019,7 @@ class TestRTPhase5DedispLayout:
         out_legacy = stage1._dedisperse_one_window_legacy(vis)
         torch.testing.assert_close(
             out_new, out_legacy,
-            rtol=1e-5, atol=1e-4,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
             msg=lambda m: (
                 f"Phase-5 layout dedisp != legacy "
                 f"(chan_sum=8, CPU): {m}"
@@ -1036,7 +1046,7 @@ class TestRTPhase5DedispLayout:
         out_legacy = stage1._dedisperse_one_window_legacy(vis)
         torch.testing.assert_close(
             out_new.cpu(), out_legacy.cpu(),
-            rtol=1e-5, atol=1e-4,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
             msg=lambda m: (
                 f"Phase-5 layout dedisp != legacy on GPU: {m}"
             ),
@@ -1083,7 +1093,7 @@ class TestRTPhase5DedispLayout:
         out_legacy = stage1_legacy.dedisperse_from_vis(vis_1, block_n=1)
         torch.testing.assert_close(
             out_new, out_legacy,
-            rtol=1e-5, atol=1e-4,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
             msg=lambda m: (
                 f"Phase-5 sliding-window emit != legacy: {m}"
             ),
