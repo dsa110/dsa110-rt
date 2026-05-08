@@ -288,6 +288,10 @@ class Stage1MultiDMCoarseDM:
     chgroup: int
     dm_indices: np.ndarray | None = None
     sliding_window: bool = False
+    dm_chunk_size: int = 4
+    """RT Phase 2: number of coarse-DM trials per gridder.compute call.
+    See :attr:`IntegrationCfg.dm_chunk_size` for memory + perf rationale.
+    Default 4 matches the production cfg default."""
     """F34: 2-block sliding-window stage-1.
 
     When ``True``, :meth:`dedisperse_from_vis` joins the previous
@@ -379,6 +383,18 @@ class Stage1MultiDMCoarseDM:
         ``T_dedisp(n_fv) = n_fv - max_bin_shift`` over the selected
         DM subset.
 
+        RT Phase 2: groups DM trials into chunks of
+        :attr:`dm_chunk_size` (default 4) and fuses each chunk's
+        gridder.compute calls into a single (``chunk * t_dedisp``,
+        NBASE, NCHAN_eff) scatter. At the production K=1 op-point the
+        per-DM scatter is atomic-bound (~500 src contributions / cell);
+        widening the scatter's batch axis by 4x quadruples the number
+        of in-flight (t_row, cell) atomic queues, recovering SM
+        utilisation that was being left on the table by the 24
+        single-DM scatters. Stage-1 gathers write directly into the
+        chunk buffer via ``apply_stage1_shifts(out=...)`` so there is
+        no extra ~1.6 GB/DM copy.
+
         The caller is responsible for shape validation (this private
         method is hot-path; the public wrappers do the upfront
         shape-check + max-shift sanity errors).
@@ -386,19 +402,46 @@ class Stage1MultiDMCoarseDM:
         n_fv = int(vis_stokes_i.shape[0])
         t_dedisp = self.t_dedisp_for(n_fv)
         n_filled = int(self.gridder.pattern.n_filled)
+        nb = int(vis_stokes_i.shape[1])
+        nch = int(vis_stokes_i.shape[2])
         out = torch.empty(
             (self.n_dm, t_dedisp, n_filled),
             dtype=torch.complex64,
             device=vis_stokes_i.device,
         )
-        for c, dm_idx in enumerate(self._dm_idx_iter.tolist()):
-            vis_shifted = apply_stage1_shifts(
-                vis_stokes_i, self.plan,
-                chgroup=self.chgroup, dm_idx=int(dm_idx),
-                t_dedisp=t_dedisp,
+        dm_chunk = max(1, int(getattr(self, "dm_chunk_size", 4)))
+        dm_chunk = min(dm_chunk, self.n_dm)
+        for c0 in range(0, self.n_dm, dm_chunk):
+            c1 = min(c0 + dm_chunk, self.n_dm)
+            chunk = c1 - c0
+            if chunk == 1:
+                vis_shifted = apply_stage1_shifts(
+                    vis_stokes_i, self.plan,
+                    chgroup=self.chgroup,
+                    dm_idx=int(self._dm_idx_iter[c0]),
+                    t_dedisp=t_dedisp,
+                )
+                out[c0] = self.gridder.compute(vis_shifted)
+                del vis_shifted
+                continue
+            # Chunked path: one (chunk*t_dedisp, NB, NCH) scratch buffer,
+            # gather DMs in-place, then one wide gridder.compute.
+            buf = torch.empty(
+                (chunk * t_dedisp, nb, nch),
+                dtype=vis_stokes_i.dtype,
+                device=vis_stokes_i.device,
             )
-            out[c] = self.gridder.compute(vis_shifted)
-            del vis_shifted
+            for i in range(chunk):
+                dm_idx = int(self._dm_idx_iter[c0 + i])
+                apply_stage1_shifts(
+                    vis_stokes_i, self.plan,
+                    chgroup=self.chgroup, dm_idx=dm_idx,
+                    t_dedisp=t_dedisp,
+                    out=buf[i * t_dedisp:(i + 1) * t_dedisp],
+                )
+            grid_chunk = self.gridder.compute(buf)                     # (chunk*t_dedisp, n_filled)
+            out[c0:c1] = grid_chunk.reshape(chunk, t_dedisp, n_filled)
+            del buf, grid_chunk
         return out
 
     def dedisperse_from_vis(
@@ -835,6 +878,28 @@ class FastIntegrationConfig:
     DM smearing inside one summed channel at DM = 3000 pc/cc,
     ν = 1.31 GHz is ~ 2.7 ms — well below the search-side fine-DM
     step (per the M3 production review)."""
+
+    dm_chunk_size: int = 4
+    """RT Phase 2: number of coarse-DM trials whose stage-1-shifted
+    vis is concatenated along the time axis into one
+    :meth:`FastVisGridder.compute` call.
+
+    The gridder.compute hot path is atomic-bound (each output cell
+    receives ~500 contributions per (t, cell) row), and at
+    ``n_fv_per_block=512`` × ``sliding_window=2`` block join the per-
+    DM scatter is ~1024 t-rows wide — under-utilising a 2080 Ti's
+    ~136 simultaneous warps. Stacking ``dm_chunk_size`` DM trials
+    into one ``(dm_chunk_size * t_dedisp, NBASE, NCHAN_eff)``
+    scatter quadruples the (t_row, cell) parallelism dim with no
+    extra work, recovering throughput.
+
+    Memory cost per chunk: ``dm_chunk_size * t_dedisp * NBASE *
+    NCHAN_eff * 8 bytes`` cfp32 ≈ ``dm_chunk_size * 1.6 GB`` at the
+    production op-point. ``dm_chunk_size = 4`` peaks at ~6.5 GB
+    scratch on top of the resident vis_stokes_i (~1.7 GB) and the
+    ring-buffered prev-block vis (~1.7 GB) — fits inside the 11 GB
+    2080 Ti budget. ``dm_chunk_size = 1`` recovers the legacy
+    (pre-Phase-2) one-DM-per-call path."""
 
 
 @dataclass
@@ -1363,15 +1428,16 @@ def build_context(
             chgroup=cfg.chgroup,
             dm_indices=dm_indices_arr,
             sliding_window=bool(cfg.sliding_window),
+            dm_chunk_size=int(cfg.dm_chunk_size),
         )
         LOG.info(
             "Stage1MultiDMCoarseDM ready: chgroup=%d n_dm=%d t_int_fast_us=%.3f "
-            "(plan_n_coarse=%d, dm_subset=%s, sliding_window=%s)",
+            "(plan_n_coarse=%d, dm_subset=%s, sliding_window=%s, dm_chunk_size=%d)",
             cfg.chgroup, multi_dm.n_dm, plan.t_int_fast_us,
             plan.n_coarse,
             "all" if cfg.dm_indices_subset is None else
             str(cfg.dm_indices_subset),
-            cfg.sliding_window,
+            cfg.sliding_window, multi_dm.dm_chunk_size,
         )
 
     return IntegrationContext(

@@ -139,6 +139,7 @@ def apply_stage1_shifts(
     chgroup: int,
     dm_idx: int,
     t_dedisp: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply per-channel forward integer-bin time shifts to a vis tensor.
 
@@ -281,5 +282,22 @@ def apply_stage1_shifts(
     # (t_dedisp, 1, NCHAN_v) — broadcast across NBASE on the gather call
     t_idx = (t_arange[:, None, None] + bin_shifts_t[None, None, :])
     t_idx_b = t_idx.expand(t_dedisp, n_base_v, n_chan_v)
-    out = vis.gather(0, t_idx_b)
-    return out
+    if out is None:
+        return vis.gather(0, t_idx_b)
+    # In-place gather into a pre-allocated buffer (RT Phase 2: lets the
+    # multi-DM dedisperser stack chunks of DM trials into one big
+    # gridder.compute call without an extra 1.6 GB/DM copy).
+    if out.shape != (t_dedisp, n_base_v, n_chan_v):
+        raise ValueError(
+            f"out shape {tuple(out.shape)} != "
+            f"({t_dedisp}, {n_base_v}, {n_chan_v})"
+        )
+    if out.dtype != vis.dtype:
+        raise TypeError(
+            f"out dtype {out.dtype} != vis dtype {vis.dtype}"
+        )
+    if out.device != vis.device:
+        raise ValueError(
+            f"out device {out.device} != vis device {vis.device}"
+        )
+    return torch.gather(vis, 0, t_idx_b, out=out)

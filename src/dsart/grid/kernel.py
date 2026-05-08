@@ -151,11 +151,6 @@ class FastVisGridder:
 
     _cell_weights_device: torch.Tensor = field(init=False, repr=False)
     _tap_weights_device: torch.Tensor = field(init=False, repr=False)
-    # Phase-2 spmm path: pre-built CSR linear operator A (n_filled, NSRC)
-    # whose row-c, column-s entry is Σ_{t: cell_idx[s, t] == c} tap_w[t].
-    # Sentinel (cell_idx == n_filled) entries are dropped at build time so
-    # we never write a discarded slot inside the spmm.
-    _A_csr: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         dev = torch.device(self.device)
@@ -230,46 +225,6 @@ class FastVisGridder:
         self._tap_weights_device = torch.from_numpy(tap_weights_np).to(
             self.device
         )
-
-        # ----------------------------------------------------------------
-        # Phase-2 perf refactor: build the CSR sparse linear operator A
-        # of shape (n_filled, NSRC) once at construction. NSRC = NBASE *
-        # NCHAN_eff. The row-c, column-s entry is
-        #     A[c, s] = Σ_{t : cell_idx[s, t] == c} tap_weights[t]
-        # The hot-path call replaces 2 × K² ``scatter_add_`` invocations
-        # (atomics-bound, ~62 ms / scatter on a 2080 Ti at the production
-        # K=1 op-point) with 2 × ``torch.sparse.mm`` (cuSPARSE spmm,
-        # segment-reduction-bound, ~10-20× higher throughput).
-        # Sentinel taps (cell_idx == n_filled) are DROPPED here so the
-        # discarded slot disappears entirely — the spmm output is
-        # already (n_filled, n_fv).
-        # ----------------------------------------------------------------
-        nsrc = NBASE * nchan_eff
-        cim_np = self.cell_index_map.cpu().numpy()                    # (NSRC*K²,)
-        # src_idx (= column) for each (s, t) entry
-        src_idx_per_entry = np.repeat(
-            np.arange(nsrc, dtype=np.int64), kernel_support * kernel_support,
-        )                                                              # (NSRC*K²,)
-        # tap_weight (= value) for each (s, t) entry, broadcast across NSRC
-        weight_per_entry = np.tile(
-            tap_weights_np, nsrc,
-        ).astype(np.float32)                                           # (NSRC*K²,)
-        # Drop sentinel entries
-        keep_mask = cim_np < n_filled
-        rows = cim_np[keep_mask].astype(np.int64)
-        cols = src_idx_per_entry[keep_mask]
-        vals = weight_per_entry[keep_mask]
-        # Build COO then coalesce + convert to CSR. Coalesce sums any
-        # duplicate (row, col) entries — these can occur in principle
-        # (two taps from the same source landing in the same cell when
-        # the per-tap shifts collide); for K=1 each src has exactly one
-        # tap so there are no duplicates.
-        indices = torch.from_numpy(np.stack([rows, cols])).to(self.device)
-        values = torch.from_numpy(vals).to(self.device)
-        A_coo = torch.sparse_coo_tensor(
-            indices=indices, values=values, size=(n_filled, nsrc),
-        ).coalesce()
-        self._A_csr = A_coo.to_sparse_csr()
 
     # ------------------------------------------------------------------
     # Constructor classmethod — the canonical entry point
@@ -601,58 +556,38 @@ class FastVisGridder:
         vis_cfp32 = vis_stokes_i.to(torch.complex64)
 
         n_filled = self.pattern.n_filled
-        # Flatten (n_fv, NBASE, NCHAN) → (n_fv, NSRC). NSRC = NBASE*NCHAN_eff.
-        src = vis_cfp32.reshape(n_fv, nb * nch)                        # (n_fv, NSRC)
+        # Flatten (NBASE, NCHAN) → (NBASE * NCHAN); each (bls, ch)
+        # sample is replicated K² times and weighted by the per-tap
+        # Gaussian coefficients. For K=1 (pillbox) the weight is 1.0
+        # so the multiply is exact in fp32 and the scatter math
+        # collapses to the pre-G7 single-tap path bit-identically.
+        src = vis_cfp32.reshape(n_fv, nb * nch)                        # (n_fv, NBASE*NCHAN)
+        # ``self._tap_weights_device`` is a (K*K,) float32 tensor
+        # ordered to match the inner (dy, dx) tap order of
+        # ``cell_index_map``.
+        weights_flat = self._tap_weights_device                        # (K*K,)
+        n_taps = int(weights_flat.shape[0])                            # = K*K
 
-        # Phase-2 spmm path. ``self._A_csr`` is a (n_filled, NSRC) sparse
-        # CSR matrix whose row-c column-s entry is
-        # Σ_{t : cell_idx[s,t]==c} tap_weights[t]; ``torch.sparse.mm``
-        # then segment-reduces all source contributions to each output
-        # cell in a single cuSPARSE call per real/imag plane (no atomics,
-        # no Python loop over K² taps, no 461-cell sentinel slot to
-        # strip). The transposes below produce a contiguous (NSRC, n_fv)
-        # view (1 GB cfp32 → 0.5 GB fp32 each plane); each transpose is
-        # ~1 ms at peak DRAM BW, an order of magnitude smaller than the
-        # spmm itself.
-        src_real_t = src.real.t().contiguous()                         # (NSRC, n_fv)
-        src_imag_t = src.imag.t().contiguous()
-        out_real_t = torch.sparse.mm(self._A_csr, src_real_t)          # (n_filled, n_fv)
-        out_imag_t = torch.sparse.mm(self._A_csr, src_imag_t)
-        out_buf = torch.complex(
-            out_real_t.t().contiguous(), out_imag_t.t().contiguous(),
-        )                                                              # (n_fv, n_filled)
-        return out_buf
-
-    # ------------------------------------------------------------------
-    # Legacy per-tap scatter path — kept for correctness pinning only.
-    # The hot path is :meth:`compute` (Phase 2 spmm) above.
-    # ------------------------------------------------------------------
-
-    def _compute_legacy_scatter(
-        self, vis_stokes_i: torch.Tensor,
-    ) -> torch.Tensor:
-        """Pre-Phase-2 reference: per-tap ``scatter_add_`` loop.
-
-        Bit-identical to the spmm path for K=1 (single-tap, weight=1.0)
-        and equivalent up to ULP-level fp32 reordering noise for K∈{3,5}
-        (per-cell sums in different order). Pinned in unit tests so
-        future refactors of either path keep them locked together.
-        """
-        if not vis_stokes_i.is_complex():
-            raise TypeError(
-                f"vis_stokes_i must be complex; got {vis_stokes_i.dtype}"
-            )
-        n_fv, nb, nch = vis_stokes_i.shape
-        vis_cfp32 = vis_stokes_i.to(torch.complex64)
-        n_filled = self.pattern.n_filled
-        src = vis_cfp32.reshape(n_fv, nb * nch)
-        weights_flat = self._tap_weights_device
-        n_taps = int(weights_flat.shape[0])
+        # PyTorch ``scatter_add_`` doesn't support complex on all
+        # backends (in particular CPU complex scatter is not vectorised
+        # to the same path as float32 scatter). Split into real / imag
+        # and scatter each — same answer, portable across CPU / CUDA.
         out_real = torch.zeros(
             (n_fv, n_filled + 1), dtype=torch.float32, device=self.device,
         )
         out_imag = torch.zeros_like(out_real)
-        cim = self.cell_index_map.reshape(-1, n_taps)
+
+        # Per-tap scatter loop: for each of the K² taps, weight the
+        # full (n_fv, NBASE*NCHAN) source tensor by ``weights_flat[t]``
+        # and scatter into the cells indexed by ``cell_index_map[:, t]``.
+        # This bounds the peak transient to one (n_fv, NBASE*NCHAN_eff)
+        # cfp32 tile ≈ 1 GB at the production op-point, instead of
+        # materialising the full ``src.unsqueeze(2) * weights`` outer
+        # product which is K² × that — 9 GB at K=3 and 23 GB at K=5
+        # (OOMs on a 2080Ti). The K=1 path is a single iteration with
+        # ``weights_flat[0] = 1.0`` so the scatter is bit-identical to
+        # the pre-G7 single-tap path.
+        cim = self.cell_index_map.reshape(-1, n_taps)                 # (NBASE*NCHAN_eff, K*K)
         for t in range(n_taps):
             w = weights_flat[t]
             src_w_real = (src.real * w).contiguous()
@@ -662,4 +597,6 @@ class FastVisGridder:
             out_imag.scatter_add_(1, idx_t, src_w_imag)
             del src_w_real, src_w_imag, idx_t
         out_buf = torch.complex(out_real, out_imag)
+
+        # Strip the sentinel slot.
         return out_buf[:, :n_filled].contiguous()

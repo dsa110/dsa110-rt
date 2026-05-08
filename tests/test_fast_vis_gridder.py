@@ -504,46 +504,6 @@ def test_gridder_is_linear_in_vis() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase-2 perf refactor pin: spmm hot path vs legacy per-tap scatter
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("kernel_support", [1, 3, 5])
-def test_gridder_phase2_spmm_matches_legacy_scatter(kernel_support):
-    """Phase 2 perf refactor pin: the cuSPARSE spmm hot path
-    (``compute``) must match the legacy per-tap ``scatter_add_`` loop
-    (``_compute_legacy_scatter``) on an arbitrary random vis input.
-
-    cuSPARSE spmm and ``scatter_add_`` reduce per-cell contributions
-    in different orders. Even for K=1 (single tap per source) each
-    output cell typically receives many (bls, ch) contributions, so
-    fp32 sum non-associativity produces ULP-level differences between
-    the two paths. Pin to 1e-5 relative across all K (observed
-    ~3e-6 rel on the random 4-ant test fixture).
-    """
-    _, g, *_ = _sparse_4ant_pattern_and_gridder(
-        n_grid=64, kernel_support=kernel_support,
-    )
-    rng = np.random.default_rng(seed=20260507)
-    n_fv = 4
-    v_np = (
-        rng.normal(size=(n_fv, NBASE, NCHAN_PER_CHGROUP))
-        + 1j * rng.normal(size=(n_fv, NBASE, NCHAN_PER_CHGROUP))
-    ).astype(np.complex64)
-    v = torch.from_numpy(v_np)
-    out_spmm = g.compute(v).cpu().numpy()
-    out_scatter = g._compute_legacy_scatter(v).cpu().numpy()
-    assert out_spmm.shape == out_scatter.shape
-    diff = np.max(np.abs(out_spmm - out_scatter))
-    ref = np.max(np.abs(out_scatter))
-    rel = diff / max(ref, 1e-30)
-    assert rel < 1e-5, (
-        f"K={kernel_support} spmm vs scatter abs={diff:.3e} "
-        f"rel={rel:.3e}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # G7: Anti-aliasing Gaussian gridding kernel (K ∈ {3, 5})
 # ---------------------------------------------------------------------------
 
