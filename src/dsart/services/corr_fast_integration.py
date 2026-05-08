@@ -384,8 +384,8 @@ class Stage1MultiDMCoarseDM:
         ``T_dedisp(n_fv) = n_fv - max_bin_shift`` over the selected
         DM subset.
 
-        RT Phase 5 — layout-aware coalesced gather + legacy scatter
-        =============================================================
+        RT Phase 5 — layout-aware coalesced gather, no transpose
+        ==========================================================
 
         Replaces the Phase-2 implementation's pattern of:
 
@@ -402,46 +402,54 @@ class Stage1MultiDMCoarseDM:
           2. Pass the buffer to ``gridder.compute`` which scatter-
              adds into a ``(T, n_filled+1)`` complex output.
 
-        With a three-step layout-aware path:
+        With a two-step layout-aware path that does NOT require a
+        transpose-back of the gather output:
 
           1. Permute ``vis_stokes_i`` once per call to
-             ``(NCHAN_eff, n_fv, NBASE)`` so ``B`` becomes innermost
-             (stride 1). The per-(c, t') gather now reads ``NBASE``
-             contiguous bytes per memory transaction → fully
-             coalesced. (~48 ms / call @ production op-point.)
+             ``(n_fv, NCHAN_eff, NBASE)`` (just swap the inner two
+             dims). ``B`` becomes innermost (stride 1) so the
+             per-(t, c) gather reads ``NBASE`` contiguous bytes per
+             memory transaction → fully coalesced. (~48 ms / call @
+             production op-point; ~1.83 GB transient.)
           2. Per chunk: one ``torch.gather`` along the time axis
-             into a ``(NCHAN_eff, chunk*t_dedisp, NBASE)`` buffer
-             (~9 ms / chunk × 12 = 113 ms / block).
-          3. Per chunk: transpose the gather output back to
-             ``(chunk*t_dedisp, NBASE, NCHAN_eff)`` via
-             ``permute(1, 2, 0).contiguous()`` (~9 ms / chunk × 12 =
-             108 ms / block) and call the LEGACY ``gridder.compute``
-             single-batch scatter (~33 ms / chunk × 12 = 394 ms).
+             with a ``(chunk*t_dedisp, NCHAN_eff, NBASE)`` index
+             (broadcast stride-0 on ``B``) → output naturally lands
+             in ``(chunk*t_dedisp, NCHAN_eff, NBASE)`` contiguous.
+             No transpose needed: ``reshape(T_chunk, C*B)`` is a
+             free view.
+          3. Per chunk: ``.real.contiguous() / .imag.contiguous()``
+             split + two 2-D ``index_add_`` calls (Re + Im) into a
+             ``(T_chunk, n_filled+1)`` fp32 accumulator, using a
+             *swapped* cell-index map ``cim_cb[c*NBASE + b] =
+             cell_index_map[b*NCHAN_eff + c]``. This is the same
+             fast scatter the legacy ``gridder.compute`` K=1 fast
+             path uses; we only re-order the index to match our
+             (T, C, B) source layout.
 
-        The output transpose costs ~108 ms / block but unlocks the
-        legacy gridder's amortized single-call scatter (394 ms),
-        which is ~2× faster than per-channel scatter (~816 ms with
-        576 small ``index_add`` launches at the production op-point).
-        Atomic-add scatter work is unchanged; only the gather
-        bandwidth and gather-buffer materialisation are affected.
+        The big wins vs the Phase-4 baseline:
+
+          * Coalesced gather (~9× faster on the gather step).
+          * No (T, B, C) transpose-back materialisation (~150 ms +
+            ~1 GB transient saved per call vs an earlier attempt).
+          * Same fast 2-D ``index_add_`` scatter (~33 ms / chunk).
 
         Phase 5 measured @ production op-point on h01 GPU::
 
             phase                Phase 4 ms    Phase 5 ms    Δ
             -----------------    ----------    ----------    -------
             permute_vis               0             48        +48
-            gather (12 chunks)       977           113       -864
-            transpose_back            0            108       +108
-            scatter (gridder)        394           394          0
+            gather (12 chunks)       977           110       -867
+            src_re/im split           0             45        +45
+            scatter (Re + Im)        394           394          0
             -----------------    ----------    ----------    -------
-            dedisp_total           1371           663       -708
+            dedisp_total           1371           597       -774
 
         Equivalence with the legacy path is bit-identical on CPU
-        (the gather is mathematically identical — only the source
-        layout differs — and the scatter calls the same legacy
-        gridder.compute) and ULP-tolerant on GPU (atomic-add
-        reduction order is non-deterministic across kernel-launch
-        boundaries).
+        (gather is mathematically identical — only the source
+        layout differs — and the scatter is the same Re/Im
+        ``index_add_`` with a re-ordered index map) and
+        ULP-tolerant on GPU (atomic-add reduction order is
+        non-deterministic across kernel-launch boundaries).
 
         Caller is responsible for shape validation; the public
         wrappers (``dedisperse_from_vis``) do the upfront
@@ -454,12 +462,11 @@ class Stage1MultiDMCoarseDM:
         nch = int(vis_stokes_i.shape[2])
         device = vis_stokes_i.device
 
-        # ---- Permute vis to (NCHAN_eff, n_fv, NBASE) for coalesced gather ----
-        # B becomes innermost (stride 1) so each 32-thread warp reads
-        # NBASE contiguous bytes per memory transaction. One transpose
-        # per call (~1.83 GB at production op-point; ~48 ms @ 80 GB/s
-        # transpose throughput on the 2080 Ti).
-        vis_T = vis_stokes_i.permute(2, 0, 1).contiguous()                 # (C, T_full, B)
+        # ---- Permute vis to (n_fv, NCHAN_eff, NBASE) for coalesced gather ----
+        # Swap inner two dims of (T, B, C) → (T, C, B). B becomes
+        # innermost (stride 1) so each 32-thread warp reads NBASE
+        # contiguous cfp32 bytes per memory transaction.
+        vis_T = vis_stokes_i.permute(0, 2, 1).contiguous()                 # (T_full, C, B)
 
         # ---- Pre-cache per-(c, dm) bin-shift table on device --------------
         bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
@@ -469,15 +476,16 @@ class Stage1MultiDMCoarseDM:
         )                                                                  # (C, n_dm)
         t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
 
-        # ---- Inline K=1 scatter pre-fetch the gridder's cell index map ----
-        # We bypass ``self.gridder.compute()`` to avoid its
-        # ``.real.contiguous() / .imag.contiguous()`` copies, which
-        # allocate 1.85 GB of transient memory per call — combined
-        # with the dedisp gather + permute buffers (~5 GB) this OOMs
-        # the 2080 Ti (11 GB budget). Use ``torch.view_as_real`` on
-        # the cfp32 source to scatter both Re/Im halves with a single
-        # ``index_add_`` (no extra alloc).
-        cell_index_map = self.gridder.cell_index_map                       # (NBASE * NCHAN_eff,) int64
+        # ---- Build the swapped (c*NBASE + b) cell-index map ---------------
+        # The gridder.cell_index_map is flat (NBASE * NCHAN_eff,) ordered
+        # ``b * NCHAN_eff + c`` because the canonical legacy scatter source
+        # layout is (T, B, C). Our gather output is (T, C, B) — same
+        # cells, different flat ordering — so we re-key the index to
+        # ``c * NBASE + b``. One small int64 tensor (1.8 MB), built once
+        # per call; the source-side cell mapping is identical so the
+        # scatter math (sum over (b, c) → cell) is bit-equivalent.
+        cim_bc = self.gridder.cell_index_map.reshape(nb, nch)              # (B, C) view
+        cim_cb = cim_bc.t().contiguous().reshape(-1)                       # (C*B,) int64
 
         out = torch.empty(
             (self.n_dm, t_dedisp, n_filled),
@@ -491,46 +499,42 @@ class Stage1MultiDMCoarseDM:
             chunk = c1 - c0
             t_chunk = chunk * t_dedisp
 
-            # ---- Single-launch coalesced gather over (chunk * t_dedisp) bins ----
-            # ``t_idx[c, dm*t_dedisp + t] = bs[c, dm] + t``. Stride-0
-            # broadcast across NBASE on the gather call avoids
-            # materialising a (C, T, B) int64 index.
+            # ---- Single-launch coalesced gather over (chunk*t_dedisp) bins ----
+            # Build (T_chunk, C) int64 time-index then expand stride-0
+            # over B (no NB-fold int64 materialisation). Output lands in
+            # (T_chunk, C, B) contiguous.
             bs_chunk = bin_shifts_dev[:, c0:c1]                            # (C, chunk)
-            t_idx = (
-                bs_chunk[:, :, None] + t_arange[None, None, :]
-            ).reshape(nch, t_chunk)                                        # (C, T_chunk)
-            t_idx_b = t_idx[:, :, None].expand(nch, t_chunk, nb)           # stride 0 on B
-            gathered = torch.gather(vis_T, 1, t_idx_b)                     # (C, T_chunk, B) cfp32
-            del bs_chunk, t_idx, t_idx_b
+            # bs_chunk.t(): (chunk, C). Add t broadcast over (chunk, t_dedisp, C).
+            t_idx_2d = (
+                bs_chunk.t()[:, None, :] + t_arange[None, :, None]
+            ).reshape(t_chunk, nch)                                        # (T_chunk, C)
+            t_idx_3d = t_idx_2d[:, :, None].expand(t_chunk, nch, nb)       # stride 0 on B
+            gathered = torch.gather(vis_T, 0, t_idx_3d)                    # (T_chunk, C, B) cfp32
+            del bs_chunk, t_idx_2d, t_idx_3d
 
-            # ---- Transpose to (T_chunk, B, C) and scatter ----
-            # The gather output's (C, T_chunk, B) layout gave us coalesced
-            # reads; we now flip back to the legacy (T_chunk, B, C)
-            # layout that the gridder's ``cell_index_map`` (ordered
-            # ``b * NCHAN_eff + c``) expects. ``view_as_real`` then
-            # turns the cfp32 source into a (T_chunk, NSRC, 2) fp32
-            # tensor with no copy (cfp32 = interleaved Re/Im fp32),
-            # so a single ``index_add_`` scatters both halves at
-            # once — equivalent to the gridder's K=1 fast path but
-            # without the 1.85 GB ``.real.contiguous()`` /
-            # ``.imag.contiguous()`` transients.
-            buf = gathered.permute(1, 2, 0).contiguous()                   # (T_chunk, B, C) cfp32
-            del gathered
-            src_re = torch.view_as_real(
-                buf.reshape(t_chunk, nb * nch)
-            )                                                              # (T_chunk, NSRC, 2) fp32
+            # ---- Reshape (free view) + Re/Im scatter via swapped cim_cb ----
+            # ``gathered.reshape(t_chunk, C*B)`` is a view (gathered is
+            # contiguous). Then split into Re/Im (each ~488 MB at the
+            # production op-point at chunk=2 joined) and scatter each into
+            # a (T_chunk, n_filled+1) accumulator. Same scatter pattern
+            # the legacy gridder.compute K=1 fast path uses, just with
+            # a (c*NBASE + b)-keyed index map instead of (b*C + c).
+            src = gathered.reshape(t_chunk, nch * nb)                      # (T_chunk, NSRC) cfp32 view
+            src_re = src.real.contiguous()
+            src_im = src.imag.contiguous()
+            del gathered, src
             out_re = torch.zeros(
-                (t_chunk, n_filled + 1, 2),
-                dtype=torch.float32, device=device,
+                (t_chunk, n_filled + 1), dtype=torch.float32, device=device,
             )
-            out_re.index_add_(1, cell_index_map, src_re)
-            out_buf = torch.view_as_complex(
-                out_re[:, :n_filled, :].contiguous()
-            )                                                              # (T_chunk, n_filled) cfp32
+            out_im = torch.zeros_like(out_re)
+            out_re.index_add_(1, cim_cb, src_re)
+            out_im.index_add_(1, cim_cb, src_im)
+            del src_re, src_im
+            out_buf = torch.complex(out_re[:, :n_filled], out_im[:, :n_filled])
             out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
-            del buf, src_re, out_re, out_buf
+            del out_re, out_im, out_buf
 
-        del vis_T, bin_shifts_dev, t_arange
+        del vis_T, bin_shifts_dev, t_arange, cim_bc, cim_cb
         return out
 
     def _dedisperse_one_window_legacy(

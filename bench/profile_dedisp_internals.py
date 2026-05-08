@@ -81,17 +81,19 @@ def _profile_one_call(
 
     t = _stamp_sync()
 
-    # A. Permute vis to (C, T, B)
-    vis_T = vis_joined.permute(2, 0, 1).contiguous()
+    # A. Permute vis to (T, C, B)  — swap inner two dims of (T, B, C)
+    vis_T = vis_joined.permute(0, 2, 1).contiguous()
     t1 = _stamp_sync(); _add("A_permute_vis", (t1 - t) * 1000); t = t1
 
-    # B. Setup indices
+    # B. Setup indices + swapped cell_index_map (c * NBASE + b)
     bin_shifts_full = stage1.plan.delay_bins_per_chgroup(stage1.chgroup)
     bin_shifts = bin_shifts_full[:nch, stage1._dm_idx_iter]
     bin_shifts_dev = torch.as_tensor(
         bin_shifts, dtype=torch.int64, device=device,
     )
     t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
+    cim_bc = stage1.gridder.cell_index_map.reshape(nb, nch)
+    cim_cb = cim_bc.t().contiguous().reshape(-1)
     t1 = _stamp_sync(); _add("B_setup_indices", (t1 - t) * 1000); t = t1
 
     out = torch.empty(
@@ -104,38 +106,37 @@ def _profile_one_call(
     for c0 in range(0, stage1.n_dm, dm_chunk):
         c1 = min(c0 + dm_chunk, stage1.n_dm)
         chunk = c1 - c0
+        t_chunk = chunk * t_dedisp
 
-        # C. Gather chunk
-        bs_chunk = bin_shifts_dev[:, c0:c1]
-        t_idx = (
-            bs_chunk[:, :, None] + t_arange[None, None, :]
-        ).reshape(nch, chunk * t_dedisp)
-        t_idx_b = t_idx[:, :, None].expand(nch, chunk * t_dedisp, nb)
-        gathered = torch.gather(vis_T, 1, t_idx_b)
+        # C. Gather chunk → (T_chunk, C, B)
+        bs_chunk = bin_shifts_dev[:, c0:c1]                            # (C, chunk)
+        t_idx_2d = (
+            bs_chunk.t()[:, None, :] + t_arange[None, :, None]
+        ).reshape(t_chunk, nch)                                        # (T_chunk, C)
+        t_idx_b = t_idx_2d[:, :, None].expand(t_chunk, nch, nb)        # stride 0 on B
+        gathered = torch.gather(vis_T, 0, t_idx_b)                     # (T_chunk, C, B) cfp32
         t1 = _stamp_sync(); _add("C_gather_chunk", (t1 - t) * 1000); t = t1
 
-        # D. Transpose gather output back to (T_chunk, B, C)
-        buf = gathered.permute(1, 2, 0).contiguous()
-        t1 = _stamp_sync(); _add("D_transpose_back", (t1 - t) * 1000); t = t1
+        # D. Re/Im split (.contiguous copies)
+        src = gathered.reshape(t_chunk, nch * nb)                      # view (gathered is contiguous)
+        src_re = src.real.contiguous()
+        src_im = src.imag.contiguous()
+        t1 = _stamp_sync(); _add("D_re_im_split", (t1 - t) * 1000); t = t1
 
-        # E. Inline single-batch scatter (view_as_real, no .real/.imag copies)
-        cell_index_map = stage1.gridder.cell_index_map
-        t_chunk = chunk * t_dedisp
-        src_re = torch.view_as_real(buf.reshape(t_chunk, nb * nch))
+        # E. Re/Im scatter via swapped cell_index_map (c * NBASE + b)
         out_re = torch.zeros(
-            (t_chunk, n_filled + 1, 2),
-            dtype=torch.float32, device=device,
+            (t_chunk, n_filled + 1), dtype=torch.float32, device=device,
         )
-        out_re.index_add_(1, cell_index_map, src_re)
-        out_buf = torch.view_as_complex(
-            out_re[:, :n_filled, :].contiguous()
-        )
+        out_im = torch.zeros_like(out_re)
+        out_re.index_add_(1, cim_cb, src_re)
+        out_im.index_add_(1, cim_cb, src_im)
+        out_buf = torch.complex(out_re[:, :n_filled], out_im[:, :n_filled])
         out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
-        t1 = _stamp_sync(); _add("E_inline_scatter", (t1 - t) * 1000); t = t1
+        t1 = _stamp_sync(); _add("E_scatter_re_im", (t1 - t) * 1000); t = t1
 
-        del bs_chunk, t_idx, t_idx_b, gathered, buf, src_re, out_re, out_buf
+        del bs_chunk, t_idx_2d, t_idx_b, gathered, src, src_re, src_im, out_re, out_im, out_buf
 
-    del vis_T, bin_shifts_dev, t_arange
+    del vis_T, bin_shifts_dev, t_arange, cim_bc, cim_cb
     return out
 
 
