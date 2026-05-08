@@ -207,13 +207,14 @@ CHUNK_6_BENCH_CLUSTER_PRESENT=$([[ -f "${REPO_ROOT}/bench/clusterer_throughput.p
 #   Deliverables: bench/cube_dump_e2e.py.
 CHUNK_7_BENCH_DUMP_PRESENT=$([[ -f "${REPO_ROOT}/bench/cube_dump_e2e.py" ]] && echo true || echo false)
 
-# Chunk 8 — plan.md edits (M6 §, M-defer §, contracts, ascii log §3.3)
-#   Marked complete when M6_PLAN_FIXES.md mentions §M6 fold lock-in.
-#   Detect via grep for "F1 — Rewrite plan §M6 in full" being marked done.
-#   For now: trip on chunk-9 marker (M6_PLAN_FIXES.md retired).
-CHUNK_8_PLAN_EDITS_PRESENT=$([[ ! -f "${REPO_ROOT}/M6_PLAN_FIXES.md" ]] && echo true || echo false)
+# Chunk 8 — operator viz (T1/T2 inspector + cube-dump verifier)
+#   Deliverables: tools/viz/m6_t1_t2_inspector.py +
+#                 tools/viz/m6_cube_dump_verifier.py.
+CHUNK_8_OPERATOR_VIZ_PRESENT=$([[ -f "${REPO_ROOT}/tools/viz/m6_t1_t2_inspector.py" ]] && \
+                                [[ -f "${REPO_ROOT}/tools/viz/m6_cube_dump_verifier.py" ]] && \
+                                echo true || echo false)
 
-# Chunk 9 — hardening (retire M6_PLAN_FIXES.md after folding F+D into plan.md)
+# Chunk 9 — hardening (fold M6_PLAN_FIXES into plan.md; retire tracker)
 #   Marked complete when M6_PLAN_FIXES.md is DELETED.
 CHUNK_9_HARDENING_COMPLETE=$([[ ! -f "${REPO_ROOT}/M6_PLAN_FIXES.md" ]] && echo true || echo false)
 
@@ -223,7 +224,7 @@ for v in "${CHUNK_0_KICKOFF_PRESENT}" "${CHUNK_1_CLUSTERER_PRESENT}" \
          "${CHUNK_2_CANDS_LOGGER_PRESENT}" "${CHUNK_3_INTEGRATION_PRESENT}" \
          "${CHUNK_4_CUBE_DUMP_PRESENT}" "${CHUNK_5_UDP_LISTENER_PRESENT}" \
          "${CHUNK_6_BENCH_CLUSTER_PRESENT}" "${CHUNK_7_BENCH_DUMP_PRESENT}" \
-         "${CHUNK_8_PLAN_EDITS_PRESENT}" "${CHUNK_9_HARDENING_COMPLETE}"; do
+         "${CHUNK_8_OPERATOR_VIZ_PRESENT}" "${CHUNK_9_HARDENING_COMPLETE}"; do
   [[ "${v}" == "true" ]] && COMPLETED_CHUNKS=$((COMPLETED_CHUNKS + 1))
 done
 
@@ -237,7 +238,7 @@ echo "    chunk 4 (cube dump)            = ${CHUNK_4_CUBE_DUMP_PRESENT}"
 echo "    chunk 5 (udp listener)         = ${CHUNK_5_UDP_LISTENER_PRESENT}"
 echo "    chunk 6 (clusterer bench)      = ${CHUNK_6_BENCH_CLUSTER_PRESENT}"
 echo "    chunk 7 (cube_dump_e2e bench)  = ${CHUNK_7_BENCH_DUMP_PRESENT}"
-echo "    chunk 8 (plan.md edits)        = ${CHUNK_8_PLAN_EDITS_PRESENT}"
+echo "    chunk 8 (operator viz)         = ${CHUNK_8_OPERATOR_VIZ_PRESENT}"
 echo "    chunk 9 (hardening, retired)   = ${CHUNK_9_HARDENING_COMPLETE}"
 pass
 
@@ -416,7 +417,7 @@ cat > "${M6_STATUS_JSON}" <<JSON
       "5_udp_listener":          ${CHUNK_5_UDP_LISTENER_PRESENT},
       "6_clusterer_bench":       ${CHUNK_6_BENCH_CLUSTER_PRESENT},
       "7_cube_dump_e2e_bench":   ${CHUNK_7_BENCH_DUMP_PRESENT},
-      "8_plan_edits":            ${CHUNK_8_PLAN_EDITS_PRESENT},
+      "8_operator_viz":          ${CHUNK_8_OPERATOR_VIZ_PRESENT},
       "9_hardening":             ${CHUNK_9_HARDENING_COMPLETE}
     }
   },
