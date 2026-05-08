@@ -207,25 +207,30 @@ def test_full_block_equals_slow_corr_kernel() -> None:
     max_imag = float(torch.max(torch.abs(diff.imag)).item())
     max_mag_real = float(torch.max(torch.abs(vis_slow.real)).item())
     max_mag_imag = float(torch.max(torch.abs(vis_slow.imag)).item())
-    # Both kernels do the same fp16 matmul on the same tensors → cast
-    # to fp32 → upper-tri gather. Reduction order differs (the slow
-    # kernel runs a single K=NPACKETS_PER_BLOCK*NTIMES_PER_PACKET=4096
-    # GEMM; the fast kernel runs two K=2t*ppfv=4096 GEMMs whose
-    # outputs are added in fp16). At the production op-point the
-    # output magnitudes are O(50k–100k), so fp32 ULP is ~0.008–0.016
-    # — the right yard-stick is **relative** tolerance ≤ 1e-5
-    # (equivalently a few fp32 ULPs at the per-cell magnitude).
+    # Slow kernel:  K=NPACKETS_PER_BLOCK=2048 GEMM, t_sub as batch
+    #               axis, sum over t_sub in fp16 then cast fp32.
+    # Fast (RT P6): K=2t*ppfv=4096 (t_sub folded into K) — single
+    #               GEMM with HMMA fp32 accumulator absorbs the t_sub
+    #               sum, then in-place add of I^T @ I in fp16.
+    #
+    # Both paths do ~3 fp16 truncations on the way to fp32, but at
+    # different points in the reduction tree, so output cells differ
+    # by O(few) fp16 ULPs. At fp16 magnitude M the ULP is M·2^-10,
+    # so the right yard-stick is a *relative* tolerance pegged to a
+    # few fp16 ULPs (we use 1e-3 ≈ 1 fp16 ULP).
     rel_real = max_real / max(max_mag_real, 1.0)
     rel_imag = max_imag / max(max_mag_imag, 1.0)
-    assert rel_real < 1e-5, (
+    assert rel_real < 1e-3, (
         f"FastCorrKernel(t_int=N_TIME_SAMPLES) vs SlowCorrKernel: "
         f"max real diff = {max_real:.3e} (relative {rel_real:.2e} of "
-        f"|vis|_max = {max_mag_real:.3e}); expected rel < 1e-5."
+        f"|vis|_max = {max_mag_real:.3e}); expected rel < 1e-3 "
+        f"(few fp16 ULPs)."
     )
-    assert rel_imag < 1e-5, (
+    assert rel_imag < 1e-3, (
         f"FastCorrKernel(t_int=N_TIME_SAMPLES) vs SlowCorrKernel: "
         f"max imag diff = {max_imag:.3e} (relative {rel_imag:.2e} of "
-        f"|vis|_max = {max_mag_imag:.3e}); expected rel < 1e-5."
+        f"|vis|_max = {max_mag_imag:.3e}); expected rel < 1e-3 "
+        f"(few fp16 ULPs)."
     )
 
 
