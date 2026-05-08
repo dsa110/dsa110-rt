@@ -47,14 +47,16 @@ is an object array (the JSON cluster record is stored as a unicode
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import dataclasses
 import json
 import logging
 import queue
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Deque, Optional, Tuple
 
 import numpy as np
 
@@ -244,6 +246,13 @@ class CubeDumpWriterConfig:
 _DRAIN_SENTINEL = object()
 
 
+# Default ring-buffer depth for ``CubeDumpWriter`` writer-time history.
+# 256 samples is enough to smooth a few seconds of bursty production
+# dumps for the cube-dump-e2e bench's writer_p99_ms metric while keeping
+# the per-instance memory footprint bounded (256 × 8B = 2 KiB).
+_DEFAULT_RECENT_WRITE_MS_CAPACITY: int = 256
+
+
 class CubeDumpWriter:
     """Single-worker NPZ cube-dump writer thread (M6 D7).
 
@@ -294,6 +303,16 @@ class CubeDumpWriter:
         self._n_dumped = 0
         self._n_dropped = 0
         self._n_failed = 0
+        # Writer-time ring buffer. Each entry is the wall-clock duration
+        # of a single ``np.savez`` call in milliseconds. Sized small so
+        # the per-instance footprint is negligible (~2 KiB at the
+        # default capacity); the cube-dump-e2e bench uses this to
+        # compute ``writer_p99_ms``. Mutated only from the writer
+        # thread; reads from the dispatch / operator thread observe a
+        # consistent (deque-internal-locked) view.
+        self._recent_write_ms: Deque[float] = collections.deque(
+            maxlen=_DEFAULT_RECENT_WRITE_MS_CAPACITY
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -407,6 +426,23 @@ class CubeDumpWriter:
         """
         return self._queue.qsize()
 
+    @property
+    def recent_write_ms_ms(self) -> Tuple[float, ...]:
+        """Recent ``np.savez`` wall-clock durations (ms), oldest first.
+
+        Snapshot of the writer-thread's ring buffer (capacity = 256 by
+        default). Empty until the worker has finished at least one
+        write. Used by ``bench/cube_dump_e2e.py`` to compute the
+        ``writer_p50_ms`` / ``writer_p99_ms`` / ``writer_max_ms``
+        operator-facing metrics without exposing the dispatch hot path
+        to the timing instrumentation.
+
+        The returned tuple is a snapshot; concurrent worker writes
+        produce a new ring-buffer state but never mutate the returned
+        sequence.
+        """
+        return tuple(self._recent_write_ms)
+
     # ------------------------------------------------------------------
     # Worker
     # ------------------------------------------------------------------
@@ -446,10 +482,20 @@ class CubeDumpWriter:
         cube: Any,
         manifest: CubeDumpManifest,
     ) -> None:
-        """Convert + persist a single (cube, manifest) pair to NPZ."""
+        """Convert + persist a single (cube, manifest) pair to NPZ.
+
+        Times the inner ``np.savez`` call with ``time.perf_counter`` and
+        appends the duration (ms) to the ``recent_write_ms_ms`` ring
+        buffer. The cube-coerce step is deliberately *not* timed: it
+        runs in the writer thread for the same dispatch-hot-path
+        reason as the np.savez call, but its cost is tied to torch
+        sync rather than disk IO and would muddy the operator-facing
+        writer-time metric.
+        """
         cube_np = _coerce_cube_to_float16_ndarray(cube)
         path = self._compose_path(manifest)
         cluster_record_json = _cluster_record_to_json(manifest.cluster_record)
+        t_savez_start = time.perf_counter()
         np.savez(
             str(path),
             cube=cube_np,
@@ -467,6 +513,11 @@ class CubeDumpWriter:
             ),
             gpu_half=np.asarray(self._config.gpu_half, dtype="int32"),
         )
+        write_ms = (time.perf_counter() - t_savez_start) * 1.0e3
+        # ``collections.deque.append`` is documented thread-safe in
+        # CPython (single-element atomic op); reads via ``tuple(deque)``
+        # snapshot a consistent state. No explicit lock needed.
+        self._recent_write_ms.append(write_ms)
 
     def _compose_path(self, manifest: CubeDumpManifest) -> Path:
         """Build the canonical NPZ path for ``manifest``."""
