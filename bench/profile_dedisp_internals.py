@@ -54,9 +54,16 @@ LOG = logging.getLogger("profile_dedisp_internals")
 
 def _make_instrumented_dedisp(orig_method, counters_dict):
     """Wrap ``Stage1MultiDMCoarseDM._dedisperse_one_window`` with per-phase
-    cuda.Event timers. Re-implements the full method body inline so we
-    can time each segment.
+    perf_counter + torch.cuda.synchronize timers. Re-implements the
+    full method body inline so we can time each segment.
     """
+    def _add(name, ms):
+        counters_dict.setdefault(name, []).append(ms)
+
+    def _stamp():
+        torch.cuda.synchronize()
+        return time.perf_counter()
+
     def instrumented(self, vis_stokes_i):
         n_fv = int(vis_stokes_i.shape[0])
         t_dedisp = self.t_dedisp_for(n_fv)
@@ -65,23 +72,12 @@ def _make_instrumented_dedisp(orig_method, counters_dict):
         nch = int(vis_stokes_i.shape[2])
         device = vis_stokes_i.device
 
-        def _new_event_pair():
-            return (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-
-        def _add(name, ms):
-            counters_dict.setdefault(name, []).append(ms)
-
-        # Phase A: permute
-        ev0, ev1 = _new_event_pair(); ev0.record()
+        t = _stamp()
+        # Phase A: permute vis
         vis_T = vis_stokes_i.permute(2, 0, 1).contiguous()
-        ev1.record(); ev1.synchronize()
-        _add("A_permute_vis", ev0.elapsed_time(ev1))
+        t1 = _stamp(); _add("A_permute_vis", (t1 - t) * 1000.0); t = t1
 
-        # Pre-cache bin shifts + cell index map
-        ev0, ev1 = _new_event_pair(); ev0.record()
+        # Phase B: setup indices
         bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
         bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]
         bin_shifts_dev = torch.as_tensor(
@@ -90,8 +86,7 @@ def _make_instrumented_dedisp(orig_method, counters_dict):
         t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
         cim_2d = self.gridder.cell_index_map.reshape(nb, nch)
         cim_cb = cim_2d.t().contiguous()
-        ev1.record(); ev1.synchronize()
-        _add("B_setup_indices", ev0.elapsed_time(ev1))
+        t1 = _stamp(); _add("B_setup_indices", (t1 - t) * 1000.0); t = t1
 
         out = torch.empty(
             (self.n_dm, t_dedisp, n_filled),
@@ -104,19 +99,16 @@ def _make_instrumented_dedisp(orig_method, counters_dict):
             c1 = min(c0 + dm_chunk, self.n_dm)
             chunk = c1 - c0
 
-            # Phase C: gather
-            ev0, ev1 = _new_event_pair(); ev0.record()
+            # Phase C: build index + gather
             bs_chunk = bin_shifts_dev[:, c0:c1]
             t_idx = (
                 bs_chunk[:, :, None] + t_arange[None, None, :]
             ).reshape(nch, chunk * t_dedisp)
             t_idx_b = t_idx[:, :, None].expand(nch, chunk * t_dedisp, nb)
             gathered = torch.gather(vis_T, 1, t_idx_b)
-            ev1.record(); ev1.synchronize()
-            _add("C_gather_chunk", ev0.elapsed_time(ev1))
+            t1 = _stamp(); _add("C_gather_chunk", (t1 - t) * 1000.0); t = t1
 
             # Phase D: per-channel scatter
-            ev0, ev1 = _new_event_pair(); ev0.record()
             gathered_re = torch.view_as_real(gathered)
             out_re = torch.zeros(
                 (chunk * t_dedisp, n_filled + 1, 2),
@@ -128,8 +120,7 @@ def _make_instrumented_dedisp(orig_method, counters_dict):
                 out_re[:, :n_filled, :].contiguous()
             )
             out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
-            ev1.record(); ev1.synchronize()
-            _add("D_scatter_chunk", ev0.elapsed_time(ev1))
+            t1 = _stamp(); _add("D_scatter_chunk", (t1 - t) * 1000.0); t = t1
 
             del bs_chunk, t_idx, t_idx_b, gathered, gathered_re, out_re, out_buf
 
