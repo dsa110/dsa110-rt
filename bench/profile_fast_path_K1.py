@@ -207,6 +207,28 @@ def _install_phase_wrappers(counters: _PhaseCounters) -> Callable[[], None]:
     cfi_mod.apply_stage1_shifts = _time_cuda(
         orig_apply_stage1, counters, "apply_stage1_shifts__sum_over_DMs",
     )
+    # RT Phase 2: dedisp_from_vis is the whole stage-1 + gridder loop;
+    # subtract gridder.compute time below to attribute the (multi-DM)
+    # gather portion.
+    orig_dedisp = cfi_mod.Stage1MultiDMCoarseDM._dedisperse_one_window
+
+    def patched_dedisp(self, *args, **kwargs):
+        if torch.cuda.is_available():
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+            out = orig_dedisp(self, *args, **kwargs)
+            ev_end.record()
+            ev_end.synchronize()
+            ms = ev_start.elapsed_time(ev_end)
+        else:
+            t0 = time.perf_counter()
+            out = orig_dedisp(self, *args, **kwargs)
+            ms = (time.perf_counter() - t0) * 1000.0
+        counters.add("dedisperse_one_window__total", ms)
+        return out
+
+    cfi_mod.Stage1MultiDMCoarseDM._dedisperse_one_window = patched_dedisp
 
     def patched_compute_split(self, *args, **kwargs):
         if torch.cuda.is_available():
@@ -248,6 +270,7 @@ def _install_phase_wrappers(counters: _PhaseCounters) -> Callable[[], None]:
         cfi_mod.apply_cal_split = orig_apply_cal
         cfi_mod.stokes_i_pol_sum = orig_stokes_i
         cfi_mod.apply_stage1_shifts = orig_apply_stage1
+        cfi_mod.Stage1MultiDMCoarseDM._dedisperse_one_window = orig_dedisp
         kernel_mod.FastCorrKernel.compute_split = orig_compute_split
         FastVisGridder.compute = orig_grid_compute
 
