@@ -859,6 +859,237 @@ class TestRTPhase4Pipeliner:
             BlockPipeliner(ctx, n_buffers=1)
 
 
+class TestRTPhase5DedispLayout:
+    """RT Phase 5: layout-aware fused gather + per-channel scatter is
+    numerically equivalent to the legacy uncoalesced gather +
+    ``gridder.compute`` scatter (Phase 2).
+
+    The new ``_dedisperse_one_window`` permutes ``vis_stokes_i`` to
+    ``(NCHAN_eff, n_fv, NBASE)`` so the per-(c, t') gather reads
+    ``NBASE`` contiguous bytes per memory transaction (vs the legacy
+    ``(T, B, C)`` layout's stride-NBASE*NCHAN_eff time access). The
+    scatter then runs as a per-channel ``index_add_`` into a fused
+    ``(T_chunk, n_filled+1, 2)`` fp32 buffer (using
+    :func:`torch.view_as_real`), eliminating the per-iteration
+    ``.real.contiguous() / .imag.contiguous()`` copies.
+
+    The atomic-add scatter work is unchanged — same source values,
+    same target cells — only regrouped by channel. On CPU the
+    per-channel reduction order differs from the legacy
+    flatten-then-scatter order, so we expect ULP-level (not
+    bit-identical) agreement even on the deterministic CPU backend.
+    On GPU the index_add is non-deterministic across kernel-launch
+    boundaries; same ULP tolerance applies.
+
+    Tested cases:
+
+    * ``test_layout_equals_legacy_cpu`` (single window, chan_sum=1)
+    * ``test_layout_equals_legacy_chan_sum_cpu`` (chan_sum=8 — the
+      production op-point's reduced-channel pipeline)
+    * ``test_layout_equals_legacy_gpu`` (CUDA-only; production op-
+      point at small n_grid for fast test runtime)
+    * ``test_layout_equals_legacy_through_sliding_window`` (full
+      F34 path: emit prev-block slice after a cold-start + a
+      block-1 push)
+    """
+
+    def _build_stage1_with_dm_plan(
+        self,
+        *,
+        chan_sum_factor: int = 1,
+        n_grid: int = 64,
+        n_coarse_dm: int = 4,
+        sliding_window: bool = False,
+        device: torch.device,
+    ) -> "Stage1MultiDMCoarseDM":
+        """Synthetic Stage1MultiDMCoarseDM with N_coarse_dm trials so
+        the dm_chunk_size loop iterates more than once (default
+        dm_chunk_size=2 ⇒ ceil(N/2) chunks).
+
+        Uses the same antpos / core-mask as the rest of the test
+        module so the gridder pattern matches across builders.
+        """
+        from dsart.coarse_dm.dm_plan import (
+            DMPlan,
+            build_chgroup_freq_table_GHz,
+            compute_delay_native_samples_table,
+        )
+        from dsart.grid.kernel import FastVisGridder
+        from dsart.grid.sparsity_pattern import build_pattern
+        from dsart.common.constants import T_INT_FAST_US_DEFAULT
+
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        pattern = build_pattern(
+            antpos_e=e, antpos_n=n,
+            chgroup=0, dec_deg=53.85, n_grid=n_grid,
+            kernel_support=1,
+            chan_sum_factor=chan_sum_factor,
+            is_core_baseline_mask=core_mask,
+        )
+        gridder = FastVisGridder.from_pattern(
+            pattern, e, n,
+            is_core_baseline_mask=core_mask,
+            device=device,
+        )
+        dm_pc_cc = np.linspace(0.0, 200.0, n_coarse_dm, dtype=np.float64)
+        chgroup_freqs = build_chgroup_freq_table_GHz()
+        table = compute_delay_native_samples_table(dm_pc_cc, chgroup_freqs)
+        plan = DMPlan(
+            dm_pc_cc=dm_pc_cc,
+            n_fine_per_coarse=1,
+            t_int_fast_us=float(T_INT_FAST_US_DEFAULT),
+            chgroup_freqs_GHz=chgroup_freqs,
+            _delay_native_samples_table=table,
+        )
+        return Stage1MultiDMCoarseDM(
+            plan=plan, gridder=gridder, chgroup=0,
+            sliding_window=sliding_window,
+        )
+
+    def _make_random_vis(
+        self,
+        *,
+        n_fv: int, nch: int, device: torch.device, seed: int,
+    ) -> torch.Tensor:
+        """Random Stokes-I vis tensor (n_fv, NBASE, nch) cfp32."""
+        from dsart.common.constants import NBASE
+        torch.manual_seed(seed)
+        vis = torch.complex(
+            torch.randn(n_fv, NBASE, nch),
+            torch.randn(n_fv, NBASE, nch),
+        )
+        return vis.to(device)
+
+    @pytest.mark.parametrize(
+        "n_fv,n_coarse_dm",
+        [(64, 4), (96, 6), (128, 8)],
+    )
+    def test_layout_equals_legacy_cpu(
+        self, n_fv: int, n_coarse_dm: int,
+    ) -> None:
+        """Layout-aware path matches legacy on CPU at chan_sum_factor=1."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cpu")
+        stage1 = self._build_stage1_with_dm_plan(
+            chan_sum_factor=1, n_grid=64,
+            n_coarse_dm=n_coarse_dm, device=device,
+        )
+        vis = self._make_random_vis(
+            n_fv=n_fv, nch=NCHAN_PER_CHGROUP,
+            device=device, seed=20260507 + n_fv,
+        )
+        out_new = stage1._dedisperse_one_window(vis)
+        out_legacy = stage1._dedisperse_one_window_legacy(vis)
+        # Per-channel index_add reduction order differs from the
+        # flatten-all scatter order → ULP-level (not bit) agreement.
+        torch.testing.assert_close(
+            out_new, out_legacy,
+            rtol=1e-5, atol=1e-4,
+            msg=lambda m: (
+                f"Phase-5 layout dedisp != legacy on CPU "
+                f"(n_fv={n_fv}, n_dm={n_coarse_dm}): {m}"
+            ),
+        )
+
+    def test_layout_equals_legacy_chan_sum_cpu(self) -> None:
+        """Layout path matches legacy at chan_sum_factor=8 (production)."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cpu")
+        stage1 = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, device=device,
+        )
+        nch_eff = NCHAN_PER_CHGROUP // 8
+        vis = self._make_random_vis(
+            n_fv=96, nch=nch_eff,
+            device=device, seed=20260507,
+        )
+        out_new = stage1._dedisperse_one_window(vis)
+        out_legacy = stage1._dedisperse_one_window_legacy(vis)
+        torch.testing.assert_close(
+            out_new, out_legacy,
+            rtol=1e-5, atol=1e-4,
+            msg=lambda m: (
+                f"Phase-5 layout dedisp != legacy "
+                f"(chan_sum=8, CPU): {m}"
+            ),
+        )
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA-only",
+    )
+    def test_layout_equals_legacy_gpu(self) -> None:
+        """Layout path matches legacy on GPU at chan_sum=8 (production)."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cuda")
+        stage1 = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, device=device,
+        )
+        nch_eff = NCHAN_PER_CHGROUP // 8
+        vis = self._make_random_vis(
+            n_fv=96, nch=nch_eff,
+            device=device, seed=20260507,
+        )
+        out_new = stage1._dedisperse_one_window(vis)
+        out_legacy = stage1._dedisperse_one_window_legacy(vis)
+        torch.testing.assert_close(
+            out_new.cpu(), out_legacy.cpu(),
+            rtol=1e-5, atol=1e-4,
+            msg=lambda m: (
+                f"Phase-5 layout dedisp != legacy on GPU: {m}"
+            ),
+        )
+
+    def test_layout_equals_legacy_through_sliding_window(self) -> None:
+        """Full F34 sliding-window path: emit prev-block slice after
+        cold-start + push, layout-aware vs legacy must agree."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cpu")
+
+        # Build TWO independent stage1 instances with identical config so
+        # the sliding-window state evolves the same for both — but one
+        # uses the new dedisp path, the other monkey-patched to the legacy.
+        stage1_new = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, sliding_window=True, device=device,
+        )
+        stage1_legacy = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, sliding_window=True, device=device,
+        )
+        # Force stage1_legacy to use the legacy inner call so all of
+        # dedisperse_from_vis (cat / clone / slice) runs identically.
+        stage1_legacy._dedisperse_one_window = (
+            stage1_legacy._dedisperse_one_window_legacy
+        )
+
+        nch_eff = NCHAN_PER_CHGROUP // 8
+        n_fv = 64
+        vis_0 = self._make_random_vis(
+            n_fv=n_fv, nch=nch_eff, device=device, seed=20260507,
+        )
+        vis_1 = self._make_random_vis(
+            n_fv=n_fv, nch=nch_eff, device=device, seed=20260508,
+        )
+        # Cold start: both should emit zeros.
+        z_new = stage1_new.dedisperse_from_vis(vis_0, block_n=0)
+        z_legacy = stage1_legacy.dedisperse_from_vis(vis_0, block_n=0)
+        assert torch.all(z_new == 0)
+        assert torch.all(z_legacy == 0)
+        # Block 1: emits dedispersed slice corresponding to block 0.
+        out_new = stage1_new.dedisperse_from_vis(vis_1, block_n=1)
+        out_legacy = stage1_legacy.dedisperse_from_vis(vis_1, block_n=1)
+        torch.testing.assert_close(
+            out_new, out_legacy,
+            rtol=1e-5, atol=1e-4,
+            msg=lambda m: (
+                f"Phase-5 sliding-window emit != legacy: {m}"
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # F33: chan_sum_factor pipeline
 # ---------------------------------------------------------------------------
