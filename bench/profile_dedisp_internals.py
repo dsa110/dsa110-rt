@@ -164,10 +164,14 @@ def main(argv=None):
 
     antpos_e, antpos_n = _synth_antpos(seed=42)
     core_mask = _build_core_baseline_mask(n_core=82)
+    # Match the production op-point's common cell_lambda=148 (output from
+    # the bench/profile_fast_path_K1.py log line: "sparsity pattern: ...
+    # cell_lambda_mode=common cell_lambda=148 → n_filled=460").
     pattern = build_pattern(
         antpos_e=antpos_e, antpos_n=antpos_n,
         chgroup=0, dec_deg=53.85, n_grid=args.n_grid,
         kernel_support=1, chan_sum_factor=args.chan_sum_factor,
+        cell_lambda=148.0,
         is_core_baseline_mask=core_mask,
     )
     gridder = FastVisGridder.from_pattern(
