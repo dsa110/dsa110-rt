@@ -694,7 +694,7 @@ def _make_cluster_record(**overrides: object) -> ClusterRecord:
         t_seconds=64 * 131.072e-6,
         width_samples=4,
         snr=20.81,
-        kernel_id="d1:b1:b4",
+        kernel_id="unit:d1:b4",
         event_specnum=2048,
         search_node_id=2,
         gpu_half=1,
