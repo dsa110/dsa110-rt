@@ -303,6 +303,13 @@ class SearchComputeService:
                 config=cfg.bright_pulse_predicate_config
             )
         if cfg.cube_dump_writer_config is not None:
+            # M6 D7 dump_root may not exist yet on first run (production:
+            # /home/ubuntu/data/m6/cube_dump; tests: tmp_path/dumps).
+            # The writer thread's np.savez does not auto-mkdir, so make
+            # sure the dir is in place before any dispatch happens.
+            Path(cfg.cube_dump_writer_config.dump_root).mkdir(
+                parents=True, exist_ok=True
+            )
             self._cube_dump = CubeDumpWriter(config=cfg.cube_dump_writer_config)
             self._cube_dump.start()
         if cfg.udp_trigger_listener_config is not None:
