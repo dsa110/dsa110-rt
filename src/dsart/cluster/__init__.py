@@ -55,8 +55,8 @@ except ImportError:
     pass
 
 try:  # pragma: no cover
-    from .state import ClusterState  # type: ignore[attr-defined]
+    from .state import ClustererService, ClustererServiceResult
 
-    __all__.append("ClusterState")
+    __all__.extend(["ClustererService", "ClustererServiceResult"])
 except ImportError:
     pass
