@@ -405,44 +405,45 @@ class Stage1MultiDMCoarseDM:
         n_filled = int(self.gridder.pattern.n_filled)
         nb = int(vis_stokes_i.shape[1])
         nch = int(vis_stokes_i.shape[2])
+        device = vis_stokes_i.device
         out = torch.empty(
             (self.n_dm, t_dedisp, n_filled),
             dtype=torch.complex64,
-            device=vis_stokes_i.device,
+            device=device,
         )
         dm_chunk = max(1, int(getattr(self, "dm_chunk_size", 2)))
         dm_chunk = min(dm_chunk, self.n_dm)
+
+        # Pre-cache the full per-(ch, dm) bin-shift table on the device
+        # (sliced to the active vis NCHAN). One small int64 tensor —
+        # avoids a per-DM CPU→GPU shuffle inside the chunk loop.
+        bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
+        bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]            # (NCHAN_v, n_dm)
+        bin_shifts_dev = torch.as_tensor(
+            bin_shifts, dtype=torch.int64, device=device,
+        )                                                                # (NCHAN_v, n_dm)
+        t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
+
         for c0 in range(0, self.n_dm, dm_chunk):
             c1 = min(c0 + dm_chunk, self.n_dm)
             chunk = c1 - c0
-            if chunk == 1:
-                vis_shifted = apply_stage1_shifts(
-                    vis_stokes_i, self.plan,
-                    chgroup=self.chgroup,
-                    dm_idx=int(self._dm_idx_iter[c0]),
-                    t_dedisp=t_dedisp,
-                )
-                out[c0] = self.gridder.compute(vis_shifted)
-                del vis_shifted
-                continue
-            # Chunked path: one (chunk*t_dedisp, NB, NCH) scratch buffer,
-            # gather DMs in-place, then one wide gridder.compute.
-            buf = torch.empty(
-                (chunk * t_dedisp, nb, nch),
-                dtype=vis_stokes_i.dtype,
-                device=vis_stokes_i.device,
-            )
-            for i in range(chunk):
-                dm_idx = int(self._dm_idx_iter[c0 + i])
-                apply_stage1_shifts(
-                    vis_stokes_i, self.plan,
-                    chgroup=self.chgroup, dm_idx=dm_idx,
-                    t_dedisp=t_dedisp,
-                    out=buf[i * t_dedisp:(i + 1) * t_dedisp],
-                )
+            # Build a (chunk * t_dedisp, 1, NCHAN_v) int64 time-index
+            # tensor that, broadcast across NBASE on the gather, lifts
+            # `chunk` DM trials' worth of stage-1-shifted vis out of
+            # ``vis_stokes_i`` in one CUDA kernel launch (vs `chunk`
+            # separate single-DM gathers). Index size: 64 KB per chunk
+            # at chunk=2 — negligible.
+            bs_chunk = bin_shifts_dev[:, c0:c1]                        # (NCHAN_v, chunk)
+            # (chunk, t_dedisp, NCHAN_v) = bin_shifts.T[c, None, ch] + arange[None, t, None]
+            t_idx = (
+                bs_chunk.t()[:, None, :] + t_arange[None, :, None]
+            )                                                          # (chunk, t_dedisp, NCHAN_v)
+            t_idx_flat = t_idx.reshape(chunk * t_dedisp, 1, nch)
+            t_idx_b = t_idx_flat.expand(chunk * t_dedisp, nb, nch)
+            buf = vis_stokes_i.gather(0, t_idx_b)                      # (chunk*t_dedisp, NB, NCH)
             grid_chunk = self.gridder.compute(buf)                     # (chunk*t_dedisp, n_filled)
             out[c0:c1] = grid_chunk.reshape(chunk, t_dedisp, n_filled)
-            del buf, grid_chunk
+            del buf, grid_chunk, t_idx, t_idx_flat, t_idx_b
         return out
 
     def dedisperse_from_vis(
