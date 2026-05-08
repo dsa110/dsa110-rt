@@ -288,10 +288,11 @@ class Stage1MultiDMCoarseDM:
     chgroup: int
     dm_indices: np.ndarray | None = None
     sliding_window: bool = False
-    dm_chunk_size: int = 4
+    dm_chunk_size: int = 2
     """RT Phase 2: number of coarse-DM trials per gridder.compute call.
     See :attr:`IntegrationCfg.dm_chunk_size` for memory + perf rationale.
-    Default 4 matches the production cfg default."""
+    Default 2 matches the production cfg default (chunk=4 OOMs on a
+    2080 Ti at the joined-window op-point)."""
     """F34: 2-block sliding-window stage-1.
 
     When ``True``, :meth:`dedisperse_from_vis` joins the previous
@@ -384,12 +385,12 @@ class Stage1MultiDMCoarseDM:
         DM subset.
 
         RT Phase 2: groups DM trials into chunks of
-        :attr:`dm_chunk_size` (default 4) and fuses each chunk's
+        :attr:`dm_chunk_size` (default 2) and fuses each chunk's
         gridder.compute calls into a single (``chunk * t_dedisp``,
         NBASE, NCHAN_eff) scatter. At the production K=1 op-point the
         per-DM scatter is atomic-bound (~500 src contributions / cell);
-        widening the scatter's batch axis by 4x quadruples the number
-        of in-flight (t_row, cell) atomic queues, recovering SM
+        widening the scatter's batch axis 2x doubles the number of
+        in-flight (t_row, cell) atomic queues, recovering SM
         utilisation that was being left on the table by the 24
         single-DM scatters. Stage-1 gathers write directly into the
         chunk buffer via ``apply_stage1_shifts(out=...)`` so there is
@@ -409,7 +410,7 @@ class Stage1MultiDMCoarseDM:
             dtype=torch.complex64,
             device=vis_stokes_i.device,
         )
-        dm_chunk = max(1, int(getattr(self, "dm_chunk_size", 4)))
+        dm_chunk = max(1, int(getattr(self, "dm_chunk_size", 2)))
         dm_chunk = min(dm_chunk, self.n_dm)
         for c0 in range(0, self.n_dm, dm_chunk):
             c1 = min(c0 + dm_chunk, self.n_dm)
@@ -879,7 +880,7 @@ class FastIntegrationConfig:
     ν = 1.31 GHz is ~ 2.7 ms — well below the search-side fine-DM
     step (per the M3 production review)."""
 
-    dm_chunk_size: int = 4
+    dm_chunk_size: int = 2
     """RT Phase 2: number of coarse-DM trials whose stage-1-shifted
     vis is concatenated along the time axis into one
     :meth:`FastVisGridder.compute` call.
@@ -890,16 +891,18 @@ class FastIntegrationConfig:
     DM scatter is ~1024 t-rows wide — under-utilising a 2080 Ti's
     ~136 simultaneous warps. Stacking ``dm_chunk_size`` DM trials
     into one ``(dm_chunk_size * t_dedisp, NBASE, NCHAN_eff)``
-    scatter quadruples the (t_row, cell) parallelism dim with no
+    scatter widens the (t_row, cell) parallelism dim with no
     extra work, recovering throughput.
 
     Memory cost per chunk: ``dm_chunk_size * t_dedisp * NBASE *
     NCHAN_eff * 8 bytes`` cfp32 ≈ ``dm_chunk_size * 1.6 GB`` at the
-    production op-point. ``dm_chunk_size = 4`` peaks at ~6.5 GB
-    scratch on top of the resident vis_stokes_i (~1.7 GB) and the
-    ring-buffered prev-block vis (~1.7 GB) — fits inside the 11 GB
-    2080 Ti budget. ``dm_chunk_size = 1`` recovers the legacy
-    (pre-Phase-2) one-DM-per-call path."""
+    production op-point. The gridder internally splits cfp32 → 2×
+    fp32 (real+imag) for the scatter, doubling the transient peak;
+    chunk=2 fits the 11 GB 2080 Ti envelope (joined vis 1.7 GB +
+    ring-buffer prev vis 0.9 GB + chunk buf 3.2 GB cfp32 + 2×
+    1.6 GB fp32 split ≈ 9 GB), chunk=4 OOMs (~15.5 GB peak).
+    ``dm_chunk_size = 1`` recovers the legacy (pre-Phase-2) one-DM-
+    per-call path."""
 
 
 @dataclass
