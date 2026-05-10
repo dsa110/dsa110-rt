@@ -174,6 +174,17 @@ def _buffer_address_and_size(buf: object) -> tuple[int, int] | None:
     if isinstance(buf, np.ndarray):
         if not buf.flags["C_CONTIGUOUS"] and not buf.flags["F_CONTIGUOUS"]:
             return None
+        # Production PSRDADA buffers are always WRITEABLE (psrdada-python
+        # maps ipcio_t pages with PROT_READ|PROT_WRITE). Bench / test
+        # paths that wrap raw bytes from disk via np.frombuffer(bytes)
+        # produce non-writable arrays; PyTorch torch.as_tensor() on a
+        # non-writable array takes a special internal H2D path that
+        # conflicts with our explicit cudaHostRegister, producing
+        # cudaErrorAlreadyMapped on the second iteration. Skip pinning
+        # here -- callers fall back to the pageable path (slower but
+        # correct).
+        if not buf.flags["WRITEABLE"]:
+            return None
         return int(buf.ctypes.data), int(buf.nbytes)
     if isinstance(buf, memoryview):
         if not buf.contiguous:
