@@ -373,6 +373,86 @@ class Stage1MultiDMCoarseDM:
         self._t_dedisp_cache[cache_key] = int(t)
         return int(t)
 
+    def _dedisperse_one_window_phase9_cpu(
+        self, vis_stokes_i: torch.Tensor,
+    ) -> torch.Tensor:
+        """Phase-9 PyTorch fallback for the dedisp inner kernel.
+
+        Used on CPU where the Triton fused kernel can't run. Bit-
+        equivalent to the GPU Triton path modulo fp32 reduction-order
+        rounding. Mirrors the pre-Phase-10 implementation: coalesced
+        gather (T, B, C) → (T, C, B), single complex64 ``index_add_``
+        scatter, dm-chunked.
+        """
+        n_fv = int(vis_stokes_i.shape[0])
+        t_dedisp = self.t_dedisp_for(n_fv)
+        n_filled = int(self.gridder.pattern.n_filled)
+        nb = int(vis_stokes_i.shape[1])
+        nch = int(vis_stokes_i.shape[2])
+        device = vis_stokes_i.device
+
+        vis_T = vis_stokes_i.permute(0, 2, 1).contiguous()
+        bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
+        bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]
+        bin_shifts_dev = torch.as_tensor(
+            bin_shifts, dtype=torch.int64, device=device,
+        )
+        t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
+        cim_bc = self.gridder.cell_index_map.reshape(nb, nch)
+        cim_cb = cim_bc.t().contiguous().reshape(-1)
+        out = torch.empty(
+            (self.n_dm, t_dedisp, n_filled),
+            dtype=torch.complex64, device=device,
+        )
+        dm_chunk = max(1, int(getattr(self, "dm_chunk_size", 2)))
+        dm_chunk = min(dm_chunk, self.n_dm)
+        for c0 in range(0, self.n_dm, dm_chunk):
+            c1 = min(c0 + dm_chunk, self.n_dm)
+            chunk = c1 - c0
+            t_chunk = chunk * t_dedisp
+            bs_chunk = bin_shifts_dev[:, c0:c1]
+            t_idx_2d = (
+                bs_chunk.t()[:, None, :] + t_arange[None, :, None]
+            ).reshape(t_chunk, nch)
+            t_idx_3d = t_idx_2d[:, :, None].expand(t_chunk, nch, nb)
+            gathered = torch.gather(vis_T, 0, t_idx_3d)
+            src = gathered.reshape(t_chunk, nch * nb)
+            out_c = torch.zeros(
+                (t_chunk, n_filled + 1),
+                dtype=torch.complex64, device=device,
+            )
+            out_c.index_add_(1, cim_cb, src)
+            out[c0:c1] = out_c[:, :n_filled].reshape(chunk, t_dedisp, n_filled)
+        return out
+
+    def _get_dedisp_csr(
+        self, *, nb: int, nch: int, n_filled: int, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lazily construct + cache the per-cell CSR map for the
+        Phase-10 fused Triton dedisp kernel.
+
+        See :func:`triton_dedisp.build_cell_csr` for the layout.
+        Cached on the instance keyed by ``(nb, nch, n_filled, device)``
+        because the gridder pattern (and hence cell_index_map) is fixed
+        per-context, so this only ever runs once per Stage1MultiDMCoarseDM.
+        """
+        cache_key = (nb, nch, n_filled, str(device))
+        cached = getattr(self, "_dedisp_csr_cache", None)
+        if cached is None:
+            cached = {}
+            self._dedisp_csr_cache = cached
+        hit = cached.get(cache_key)
+        if hit is not None:
+            return hit
+        from dsart.services.triton_dedisp import build_cell_csr  # noqa: PLC0415
+        cim_bc = self.gridder.cell_index_map.to(device)                # (NSRC,) int64
+        csr_offs, csr_b, csr_c = build_cell_csr(
+            cim_bc, n_filled=n_filled, nchan_eff=nch, nbase=nb,
+        )
+        triple = (csr_offs, csr_b, csr_c)
+        cached[cache_key] = triple
+        return triple
+
     def _dedisperse_one_window(
         self, vis_stokes_i: torch.Tensor,
     ) -> torch.Tensor:
@@ -462,90 +542,58 @@ class Stage1MultiDMCoarseDM:
         nch = int(vis_stokes_i.shape[2])
         device = vis_stokes_i.device
 
-        # ---- Permute vis to (n_fv, NCHAN_eff, NBASE) for coalesced gather ----
-        # Swap inner two dims of (T, B, C) → (T, C, B). B becomes
-        # innermost (stride 1) so each 32-thread warp reads NBASE
-        # contiguous cfp32 bytes per memory transaction.
-        vis_T = vis_stokes_i.permute(0, 2, 1).contiguous()                 # (T_full, C, B)
+        # CPU fallback — Triton requires CUDA tensors. Tests that run
+        # purely on CPU still need a working dedisp path; route to the
+        # legacy Phase-9 PyTorch implementation in that case. Production
+        # path (and the GPU integration / RT bench) always takes the
+        # Triton branch below.
+        if device.type != "cuda":
+            return self._dedisperse_one_window_phase9_cpu(vis_stokes_i)
 
-        # ---- Pre-cache per-(c, dm) bin-shift table on device --------------
+        # RT Phase 10 — fused gather+scatter Triton kernel.
+        # Replaces the (gather → 1.78 GB cfp32 intermediate → 130 ms
+        # complex64 atomicAdd scatter) pair with one kernel that walks
+        # each grid cell's CSR source list directly. Microbench at
+        # production op-point: 196 → 12 ms (16.4×). End-to-end win
+        # validated below in the in-tree integration tests.
+        from dsart.services.triton_dedisp import fused_dedisp_triton  # noqa: PLC0415
+
+        # One-time permute (T, B, C) cfp32 → (B, C, T) cfp32. The
+        # kernel needs T to be the innermost dim so 32-thread warps
+        # coalesce. Same memory cost as the legacy (T, B, C) → (T, C, B)
+        # permute (one full-tensor copy of ~870 MB at the production
+        # op-point).
+        vis_BCT = vis_stokes_i.permute(1, 2, 0).contiguous()         # (B, C, T_full) cfp32
+
+        # Split into (re, im) fp32 views. The kernel reads one fp32 at
+        # a time; we avoid the fp32 cast since the input is already
+        # cfp32 (from the Phase-6/9 stages of compute_split).
+        vis_re = vis_BCT.real.contiguous()                            # (B, C, T_full) fp32
+        vis_im = vis_BCT.imag.contiguous()
+        del vis_BCT
+
+        # Per-(c, dm) bin-shift table → device int32. n_dm * nch * 4
+        # bytes — under 5 KB at the production op-point.
         bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
-        bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]              # (C, n_dm)
+        bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]
         bin_shifts_dev = torch.as_tensor(
-            bin_shifts, dtype=torch.int64, device=device,
-        )                                                                  # (C, n_dm)
-        t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
+            bin_shifts, dtype=torch.int32, device=device,
+        ).contiguous()                                                # (C, n_dm) int32
 
-        # ---- Build the swapped (c*NBASE + b) cell-index map ---------------
-        # The gridder.cell_index_map is flat (NBASE * NCHAN_eff,) ordered
-        # ``b * NCHAN_eff + c`` because the canonical legacy scatter source
-        # layout is (T, B, C). Our gather output is (T, C, B) — same
-        # cells, different flat ordering — so we re-key the index to
-        # ``c * NBASE + b``. One small int64 tensor (1.8 MB), built once
-        # per call; the source-side cell mapping is identical so the
-        # scatter math (sum over (b, c) → cell) is bit-equivalent.
-        cim_bc = self.gridder.cell_index_map.reshape(nb, nch)              # (B, C) view
-        cim_cb = cim_bc.t().contiguous().reshape(-1)                       # (C*B,) int64
-
-        out = torch.empty(
-            (self.n_dm, t_dedisp, n_filled),
-            dtype=torch.complex64, device=device,
+        # CSR map of grid cell → source (b, c) list. Cached per context.
+        csr_offs, csr_b, csr_c = self._get_dedisp_csr(
+            nb=nb, nch=nch, n_filled=n_filled, device=device,
         )
-        dm_chunk = max(1, int(getattr(self, "dm_chunk_size", 2)))
-        dm_chunk = min(dm_chunk, self.n_dm)
 
-        for c0 in range(0, self.n_dm, dm_chunk):
-            c1 = min(c0 + dm_chunk, self.n_dm)
-            chunk = c1 - c0
-            t_chunk = chunk * t_dedisp
-
-            # ---- Single-launch coalesced gather over (chunk*t_dedisp) bins ----
-            # Build (T_chunk, C) int64 time-index then expand stride-0
-            # over B (no NB-fold int64 materialisation). Output lands in
-            # (T_chunk, C, B) contiguous.
-            bs_chunk = bin_shifts_dev[:, c0:c1]                            # (C, chunk)
-            # bs_chunk.t(): (chunk, C). Add t broadcast over (chunk, t_dedisp, C).
-            t_idx_2d = (
-                bs_chunk.t()[:, None, :] + t_arange[None, :, None]
-            ).reshape(t_chunk, nch)                                        # (T_chunk, C)
-            t_idx_3d = t_idx_2d[:, :, None].expand(t_chunk, nch, nb)       # stride 0 on B
-            gathered = torch.gather(vis_T, 0, t_idx_3d)                    # (T_chunk, C, B) cfp32
-            del bs_chunk, t_idx_2d, t_idx_3d
-
-            # ---- Reshape (free view) + serialized Re/Im scatter via swapped cim_cb ----
-            # ``gathered.reshape(t_chunk, C*B)`` is a view (gathered is
-            # contiguous). Then split into Re/Im (each ~488 MB at the
-            # production op-point at chunk=2 joined-block) and scatter
-            # each into a (T_chunk, n_filled+1) accumulator. Same
-            # scatter pattern the legacy gridder.compute K=1 fast path
-            # uses, just with a (c*NBASE + b)-keyed index map instead
-            # of (b*C + c).
-            #
-            # The Re and Im halves are allocated and scattered
-            # *serially* — only one ~488 MB ``.contiguous()``
-            # transient is alive at a time. Holding both Re + Im
-            # transients concurrently was the OOM trigger for the
-            # F31b pipelined path on the 2080 Ti (~970 MB peak vs
-            # 488 MB now), and it doesn't change the math.
-            src = gathered.reshape(t_chunk, nch * nb)                      # (T_chunk, NSRC) cfp32 view
-            out_re = torch.zeros(
-                (t_chunk, n_filled + 1), dtype=torch.float32, device=device,
-            )
-            src_re = src.real.contiguous()                                 # 488 MB transient
-            out_re.index_add_(1, cim_cb, src_re)
-            del src_re
-
-            out_im = torch.zeros_like(out_re)
-            src_im = src.imag.contiguous()                                 # 488 MB transient
-            out_im.index_add_(1, cim_cb, src_im)
-            del src_im, gathered, src
-
-            out_buf = torch.complex(out_re[:, :n_filled], out_im[:, :n_filled])
-            out[c0:c1] = out_buf.reshape(chunk, t_dedisp, n_filled)
-            del out_re, out_im, out_buf
-
-        del vis_T, bin_shifts_dev, t_arange, cim_bc, cim_cb
-        return out
+        out_re, out_im = fused_dedisp_triton(
+            vis_re, vis_im,
+            bin_shifts=bin_shifts_dev,
+            csr_offs=csr_offs, csr_b=csr_b, csr_c=csr_c,
+            n_filled=n_filled, t_dedisp=t_dedisp,
+            BLOCK_T=128,
+        )
+        del vis_re, vis_im, bin_shifts_dev
+        return torch.complex(out_re, out_im)
 
     def _dedisperse_one_window_legacy(
         self, vis_stokes_i: torch.Tensor,
@@ -1191,6 +1239,25 @@ def process_block(
     )
 
 
+def _process_block_unpack_phase(
+    raw: np.ndarray,
+    *,
+    ctx: IntegrationContext,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RT Phase 13 (3-stream BlockPipeliner): unpack-only sub-phase.
+
+    Splits Step 1 of :func:`_process_block_corr_phase` out into its
+    own callable so the 3-stream :class:`BlockPipeliner3S` can issue
+    it on a dedicated unpack stream — overlapping the H2D copy +
+    fluff with the previous block's compute_split on the compute
+    stream. Returns the (real_v, imag_v) fp16 voltage pair in GEMM
+    layout.
+    """
+    return unpack_int4_split(
+        raw, device=ctx.device, out_dtype=ctx.voltage_dtype,
+    )
+
+
 def _process_block_corr_phase(
     raw: np.ndarray,
     *,
@@ -1209,9 +1276,7 @@ def _process_block_corr_phase(
     on the calling stream when this function returns.
     """
     # 1. Unpack
-    real_v, imag_v = unpack_int4_split(
-        raw, device=ctx.device, out_dtype=ctx.voltage_dtype,
-    )
+    real_v, imag_v = _process_block_unpack_phase(raw, ctx=ctx)
 
     # 2. RFI flag (before cal — flags should be on raw data + DC pol
     # so that any cal-induced dynamic range shifts can't mask them).
@@ -1272,6 +1337,100 @@ def _process_block_corr_phase(
             f"chan_sum_factor={chan_sum_factor} does not divide "
             f"nchan={full_nchan}; configure cfg.chan_sum_factor "
             f"so that NCHAN_PER_CHGROUP is divisible."
+        )
+    nchan_eff = (
+        full_nchan // chan_sum_factor if chan_sum_factor > 1 else full_nchan
+    )
+
+    use_fused_path = (chan_sum_factor > 1 and ctx.cfg.n_fv_chunk is None)
+    if use_fused_path:
+        vis_stokes_i = ctx.kernel.compute_split(
+            real_v, imag_v,
+            fuse_stokes_i=True, chan_sum_factor=chan_sum_factor,
+        )
+        del real_v, imag_v
+    else:
+        if ctx.cfg.n_fv_chunk is not None:
+            n_fv_chunk = int(ctx.cfg.n_fv_chunk)
+            if n_fv_chunk <= 0:
+                raise ValueError(
+                    f"cfg.n_fv_chunk={n_fv_chunk}, expected > 0"
+                )
+            n_fv_chunk = min(n_fv_chunk, n_fv_total)
+        else:
+            n_fv_chunk = _auto_n_fv_chunk_for_streaming(
+                n_fv_total, nchan=ctx.kernel.nchan,
+                nbada_pol=ctx.kernel.nbada_pol,
+            )
+        vis_stokes_i = torch.empty(
+            (n_fv_total, NBASE, nchan_eff),
+            dtype=torch.complex64, device=ctx.device,
+        )
+        for fv0 in range(0, n_fv_total, n_fv_chunk):
+            fv1 = min(fv0 + n_fv_chunk, n_fv_total)
+            real_v_slab = real_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
+            imag_v_slab = imag_v[:, :, :, fv0 * ppfv : fv1 * ppfv, :].contiguous()
+            vis_2pol_slab = ctx.kernel.compute_split(real_v_slab, imag_v_slab)
+            stokes_i_slab = stokes_i_pol_sum(vis_2pol_slab)
+            if chan_sum_factor > 1:
+                stokes_i_slab = stokes_i_slab.reshape(
+                    fv1 - fv0, NBASE, nchan_eff, chan_sum_factor,
+                ).sum(dim=-1)
+            vis_stokes_i[fv0:fv1] = stokes_i_slab
+            del real_v_slab, imag_v_slab, vis_2pol_slab, stokes_i_slab
+        del real_v, imag_v
+
+    return vis_stokes_i, rfi_result
+
+
+def _process_block_compute_phase(
+    real_v: torch.Tensor,
+    imag_v: torch.Tensor,
+    *,
+    ctx: IntegrationContext,
+    block_n: int,
+) -> tuple[torch.Tensor, FlagBlockResult | None]:
+    """RT Phase 13 (3-stream BlockPipeliner): RFI + cal + compute_split.
+
+    Steps 2-6 of :func:`_process_block_corr_phase`, taking the
+    pre-unpacked (real_v, imag_v) voltages instead of raw bytes.
+    Caller is responsible for stream-syncing the inputs from the
+    upstream unpack stream before issuing this on a different stream.
+    """
+    # 2. RFI flag (before cal — flags should be on raw data + DC pol
+    # so that any cal-induced dynamic range shifts can't mask them).
+    rfi_result: FlagBlockResult | None = None
+    if ctx.rfi_flagger is not None and ctx.cfg.rfi_enabled:
+        rfi_result = ctx.rfi_flagger.flag_block(real_v, imag_v)
+        if ctx.cfg.rfi_mask_voltage_zero_fill and rfi_result.mask.any():
+            real_v, imag_v = apply_rfi_mask_to_voltages(
+                real_v, imag_v, rfi_result.mask,
+            )
+
+    # 4. Cal apply with F21 DEC-phase fold
+    if ctx.cal is not None:
+        real_v_c, imag_v_c = apply_cal_split(
+            real_v, imag_v, ctx.cal.cal_real, ctx.cal.cal_imag,
+        )
+        del real_v, imag_v
+        real_v, imag_v = real_v_c, imag_v_c
+
+    # 5. + 6. Streamed kernel + Stokes-I (production fused fast path).
+    ppfv = ctx.cfg.t_int_fast_native // NTIMES_PER_PACKET
+    n_packets_in = real_v.shape[3]
+    if n_packets_in % ppfv != 0:
+        raise ValueError(
+            f"compute_phase: n_packets_in={n_packets_in} not a multiple "
+            f"of packets_per_fast_vis={ppfv} (t_int_fast_native="
+            f"{ctx.cfg.t_int_fast_native})"
+        )
+    n_fv_total = n_packets_in // ppfv
+    chan_sum_factor = int(ctx.cfg.chan_sum_factor)
+    full_nchan = ctx.kernel.nchan
+    if chan_sum_factor > 1 and full_nchan % chan_sum_factor != 0:
+        raise ValueError(
+            f"chan_sum_factor={chan_sum_factor} does not divide "
+            f"nchan={full_nchan}"
         )
     nchan_eff = (
         full_nchan // chan_sum_factor if chan_sum_factor > 1 else full_nchan
@@ -1624,6 +1783,152 @@ class BlockPipeliner:
 
     def close(self) -> None:
         """Mark the pipeliner closed; no further pushes accepted."""
+        self._closed = True
+
+
+class BlockPipeliner3S:
+    """RT Phase 13: 3-stream variant of :class:`BlockPipeliner`.
+
+    Splits the pipeline into THREE phases on three CUDA streams:
+
+      * **Stream U** (unpack): :func:`_process_block_unpack_phase` —
+        H2D + Stage-1 transpose + Triton fluff (~53 ms / block at the
+        production op-point post-Phase-12).
+      * **Stream C** (compute): :func:`_process_block_compute_phase` —
+        RFI + cal + fused HMMA Triton ``compute_split`` (~91 ms).
+      * **Stream D** (dedisp): :func:`_process_block_consume_phase` —
+        Phase-10 fused gather+scatter Triton dedisp + downstream
+        consumers (~60 ms).
+
+    Steady-state wall is ``max(U_time, C_time, D_time)`` plus a small
+    cross-stream serialisation overhead. At the production op-point
+    post-Phases 11+12 that's ``max(53, 91, 60) ≈ 91 ms`` theoretical
+    (actual measured under SM contention TBD). Equivalently a 3-block
+    output latency: the result of block ``N`` is returned by
+    ``push(N+3)``.
+
+    Why three streams?
+    ==================
+    The 2-stream :class:`BlockPipeliner` overlaps the corr-side wall
+    (unpack + compute_split = 144 ms) with the consume-side wall
+    (dedisp = 60 ms) → max = 144 ms. Now that Phases 8/11 cratered
+    the GEMM tail, the unpack stage (53 ms) is comparable in cost to
+    the dedisp stage (60 ms), and pulling it out into its own stream
+    can shift the long pole from compute_split (91 ms) to itself
+    instead of the corr_phase sum.
+
+    The (real_v, imag_v) intermediate (~1.17 GB / block at production
+    op-point) is held per-slot — with ``n_buffers=3`` this peaks at
+    ~3.5 GB on the 11 GB 2080Ti.
+    """
+
+    def __init__(
+        self,
+        ctx: IntegrationContext,
+        *,
+        n_buffers: int = 3,
+    ) -> None:
+        if ctx.device.type != "cuda":
+            raise ValueError(
+                f"BlockPipeliner3S requires CUDA; got ctx.device={ctx.device}"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("BlockPipeliner3S needs torch.cuda.is_available()")
+        if n_buffers < 3:
+            raise ValueError(
+                f"n_buffers={n_buffers}; 3-stream pipelining requires ≥3 buffers"
+            )
+        self.ctx = ctx
+        self.n_buffers = n_buffers
+        self._unpack_stream  = torch.cuda.Stream(device=ctx.device)
+        self._compute_stream = torch.cuda.Stream(device=ctx.device)
+        self._dedisp_stream  = torch.cuda.Stream(device=ctx.device)
+
+        self._dedisp_done_events: list[torch.cuda.Event | None] = (
+            [None] * n_buffers
+        )
+        self._inflight_outputs: list[IntegrationOutput | None] = (
+            [None] * n_buffers
+        )
+        self._n_pushed = 0
+        self._closed = False
+
+    def push(
+        self,
+        raw: np.ndarray,
+        *,
+        block_n: int,
+    ) -> IntegrationOutput | None:
+        """Submit one fada block to the 3-stream pipeline.
+
+        Returns the :class:`IntegrationOutput` for the block submitted
+        ``n_buffers`` calls ago, or ``None`` while the pipeline is
+        warming up.
+        """
+        if self._closed:
+            raise RuntimeError("BlockPipeliner3S.push() after close()")
+
+        slot = self._n_pushed % self.n_buffers
+
+        prior_output: IntegrationOutput | None = None
+        if self._n_pushed >= self.n_buffers:
+            ev = self._dedisp_done_events[slot]
+            assert ev is not None
+            ev.synchronize()
+            prior_output = self._inflight_outputs[slot]
+            self._inflight_outputs[slot] = None
+            self._dedisp_done_events[slot] = None
+
+        # ── Stream U: unpack ──
+        with torch.cuda.stream(self._unpack_stream):
+            real_v, imag_v = _process_block_unpack_phase(raw, ctx=self.ctx)
+            unpack_done = torch.cuda.Event()
+            unpack_done.record(self._unpack_stream)
+
+        # ── Stream C: RFI + cal + compute_split ──
+        with torch.cuda.stream(self._compute_stream):
+            self._compute_stream.wait_event(unpack_done)
+            real_v.record_stream(self._compute_stream)
+            imag_v.record_stream(self._compute_stream)
+            vis_stokes_i, rfi_result = _process_block_compute_phase(
+                real_v, imag_v, ctx=self.ctx, block_n=block_n,
+            )
+            compute_done = torch.cuda.Event()
+            compute_done.record(self._compute_stream)
+
+        # ── Stream D: dedisp + downstream ──
+        with torch.cuda.stream(self._dedisp_stream):
+            self._dedisp_stream.wait_event(compute_done)
+            vis_stokes_i.record_stream(self._dedisp_stream)
+            output = _process_block_consume_phase(
+                vis_stokes_i, rfi_result,
+                ctx=self.ctx, block_n=block_n,
+            )
+            dedisp_done = torch.cuda.Event()
+            dedisp_done.record(self._dedisp_stream)
+
+        self._inflight_outputs[slot] = output
+        self._dedisp_done_events[slot] = dedisp_done
+        self._n_pushed += 1
+        return prior_output
+
+    def flush(self) -> list[IntegrationOutput]:
+        """Drain in-flight blocks. Returns outputs in submission order."""
+        outs: list[IntegrationOutput] = []
+        n_pending = min(self._n_pushed, self.n_buffers)
+        first_pending = self._n_pushed - n_pending
+        for i in range(n_pending):
+            slot = (first_pending + i) % self.n_buffers
+            ev = self._dedisp_done_events[slot]
+            if ev is None:
+                continue
+            ev.synchronize()
+            outs.append(self._inflight_outputs[slot])
+            self._inflight_outputs[slot] = None
+            self._dedisp_done_events[slot] = None
+        return outs
+
+    def close(self) -> None:
         self._closed = True
 
 

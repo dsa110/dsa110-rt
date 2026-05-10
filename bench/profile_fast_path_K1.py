@@ -425,6 +425,30 @@ def main(argv: list[str] | None = None) -> int:
 
     rng = np.random.default_rng(seed=0)
 
+    # Pre-allocate a small ring of synthetic raw blocks and cycle
+    # through them. This mirrors PSRDADA's behaviour (a fixed pool
+    # of N shared-memory pages cycled forever, see
+    # ``DEFAULT_FADA_NUM_BLOCKS = 4`` in
+    # bench/voltage_fixture_slow_corr.py) so that the host-pin auto-
+    # registration in unpack_int4_split sees a small set of stable
+    # buffer addresses, just like production. Without this, every
+    # iteration mints a fresh ~288 MB numpy buffer; the previous one
+    # is GC'd, its VA range is recycled, and the host_pin registry
+    # ends up holding stale (addr, size) tuples that point at
+    # different physical pages — which can trigger
+    # ``cudaErrorAlreadyMapped`` in the pipelined path where two
+    # in-flight async H2D copies from different blocks exist
+    # concurrently.
+    _RING_DEPTH = 4
+    raw_ring = [_synth_voltage_block(rng=rng) for _ in range(_RING_DEPTH)]
+    _ring_pos = 0
+
+    def next_raw():
+        nonlocal _ring_pos
+        out = raw_ring[_ring_pos % _RING_DEPTH]
+        _ring_pos += 1
+        return out
+
     block_n = 0
     if args.pipeline:
         # RT Phase 4: 2-stream pipeliner. The phase counters still
@@ -441,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         # pipeliner's 2-slot ring buffer.
         for _ in range(args.warmup):
             block_n += 1
-            raw = _synth_voltage_block(rng=rng)
+            raw = next_raw()
             pipeliner.push(raw, block_n=block_n)
         torch.cuda.synchronize()
 
@@ -462,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         t_prev = time.perf_counter()
         for _ in range(args.n_blocks):
             block_n += 1
-            raw = _synth_voltage_block(rng=rng)
+            raw = next_raw()
             counters.reset_block()
             t_push_start = time.perf_counter()
             pipeliner.push(raw, block_n=block_n)
@@ -481,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         # Warmup (no counters; warmup also seeds the F34 ring buffer)
         for _ in range(args.warmup):
             block_n += 1
-            raw = _synth_voltage_block(rng=rng)
+            raw = next_raw()
             process_block(raw, ctx=ctx, block_n=block_n)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -490,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         per_block_wall_ms = []
         for _ in range(args.n_blocks):
             block_n += 1
-            raw = _synth_voltage_block(rng=rng)
+            raw = next_raw()
             counters.reset_block()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -507,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from torch.profiler import profile, ProfilerActivity, schedule
             block_n += 1
-            raw = _synth_voltage_block(rng=rng)
+            raw = next_raw()
             activities = [ProfilerActivity.CPU]
             if torch.cuda.is_available():
                 activities.append(ProfilerActivity.CUDA)

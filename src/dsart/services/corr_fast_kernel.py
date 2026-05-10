@@ -610,21 +610,82 @@ class FastCorrKernel:
         I = I6.reshape(new_batch, K_combined, self.nants)
         del R6, I6
 
-        # ---- Stage 4: the 4 batched fp16 matmuls ----
-        # Per batch: V_real = R^T @ R + I^T @ I,
-        #            V_imag = R^T @ I - I^T @ R.
-        # GEMM accumulator is fp32 (HMMA.h32) so the K=8 reduction
-        # is computed at fp32 precision before being downcast to the
-        # fp16 output dtype. This is *more* numerically conservative
-        # than the legacy K=4 + post-GEMM .add_ + .sum path which
-        # stacked two fp16 truncations per t_sub.
-        R_T = R.transpose(-1, -2)                                # (batch, NANTS, K_combined)
-        I_T = I.transpose(-1, -2)
-        V_real = torch.matmul(R_T, R)                            # fp16 (batch, 96, 96)
-        V_real = V_real.add_(torch.matmul(I_T, I))               # in-place fp16
-        V_imag = torch.matmul(R_T, I)
-        V_imag = V_imag.sub_(torch.matmul(I_T, R))
-        del R, I, R_T, I_T
+        # ---- Stage 4: the 2 batched fp16 matmuls (RT Phase 8: K-stacked) ----
+        # Replaces the legacy 4 GEMMs + 2 element-wise add_/sub_ with
+        # 2 GEMMs of doubled K, eliminating the post-GEMM fp16
+        # element-wise adds (which dominated Stage 4 at ~5 ms / slab,
+        # 47 % of stage time). The s1688 HMMA tile is 16x16x16, so
+        # doubling K from 8 → 16 also doubles the per-tile useful
+        # work (K=8 was wasting half the K-tile dim).
+        #
+        # Construction:
+        #   A_re   = [R; I]   along K  → (batch, 2*K, NANTS)
+        #   A_im_b = [I; -R]  along K  → (batch, 2*K, NANTS)
+        #
+        # Then:
+        #   V_real = A_re^T   @ A_re   = R^T@R + I^T@I        ✓
+        #   V_imag = A_re^T   @ A_im_b = R^T@I + I^T@(-R)      = R^T@I - I^T@R ✓
+        #
+        # Output volume HALVES vs the alt "(2K, 2N)" stacking that
+        # would write a (batch, 192, 192) tensor — we keep the
+        # same (batch, 96, 96) per-output footprint.
+        #
+        # Production op-point speedup measured on h01 2080 Ti:
+        # 10.59 → 3.18 ms / slab (3.33×), 1.27 → 4.56 TFLOPS fp16-TC.
+        A_re   = torch.cat([R,  I], dim=1)                         # (batch, 2K, NANTS)
+        A_im_b = torch.cat([I, -R], dim=1)                         # (batch, 2K, NANTS)
+        del R, I
+
+        # ---- Stage 4+5+6 FUSED (RT Phase 11): single Triton HMMA kernel
+        # ----------------------------------------------------------------
+        # When all preconditions for the fast path are met, hand off to
+        # ``triton_corr_fused.fused_corr_post_triton`` which performs
+        # Stages 4 (2 stacked-K HMMA GEMMs) + 5 (slice) + 6 (upper-tri
+        # gather + fp32 cast + Stokes-I + chan-sum + permute + complex)
+        # in ONE kernel — never materialising the (B, 96, 96) fp16 V
+        # cube to global memory. Microbench at the production op-point
+        # measured: 13.50 → 3.71 ms / slab (3.64×, ~157 ms / block
+        # saved). End-to-end win validated downstream by the integration
+        # tests + the production-shaped psrdada bench.
+        #
+        # Requirements (validated below):
+        #   * CUDA tensors (Triton requires GPU)
+        #   * fuse_stokes_i path (kernel always sums pols + chans)
+        #   * nbada_pol == nvolt_pol (kernel always sums all pols
+        #     in the (CSF * NVP) inner loop). Production = 2 == 2 ✓.
+        #   * NCHAN divisible by chan_sum_factor (kernel pre-sums
+        #     CSF chans per output). Production = 384 / 8 ✓.
+        # CPU fallback retains the Phase-8 PyTorch path verbatim.
+        if (
+            fuse_stokes_i
+            and A_re.device.type == "cuda"
+            and self.nbada_pol == self.nvolt_pol
+            and self.nchan % chan_sum_factor == 0
+            # Triton tl.dot on Turing (sm_75) requires K ≥ 16 for fp16
+            # HMMA. Stacked-K = 2 * K_combined = 2 * NTIMES_PER_PACKET *
+            # packets_per_fast_vis. Production op-point K=16 (t_int=8)
+            # is OK; t_int=4 would give K=8 — fall back to PyTorch.
+            and A_re.shape[1] >= 16
+        ):
+            from dsart.services.triton_corr_fused import (  # noqa: PLC0415
+                fused_corr_post_triton,
+            )
+            nchan_eff = self.nchan // chan_sum_factor
+            out_re, out_im = fused_corr_post_triton(
+                A_re.contiguous(), A_im_b.contiguous(),
+                n_fv=n_fv_slab,
+                nchan=self.nchan,
+                nchan_eff=nchan_eff,
+                nvp=self.nvolt_pol,
+                csf=chan_sum_factor,
+                nbase=NBASE,
+            )
+            del A_re, A_im_b
+            return torch.complex(out_re, out_im)              # (fv, NBASE, NCHAN_eff) cfp32
+
+        V_real = torch.matmul(A_re.transpose(-1, -2), A_re)        # fp16 (batch, 96, 96)
+        V_imag = torch.matmul(A_re.transpose(-1, -2), A_im_b)      # fp16 (batch, 96, 96)
+        del A_re, A_im_b
 
         # ---- Stage 5: nbada_pol slice (no t_sub sum needed) ----
         # batch dim = n_fv_slab * NCHAN * nvolt_pol. View as 5D.
