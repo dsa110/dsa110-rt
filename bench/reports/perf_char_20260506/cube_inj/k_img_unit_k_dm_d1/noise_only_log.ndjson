@@ -1,0 +1,5 @@
+{"kind": "noise_only", "cube_id": 17, "candidate_snrs": [5.15579080581665], "cube_geometry": {"T_det": 256, "N_fdm": 4, "N_grid": 32}}
+{"kind": "noise_only", "cube_id": 18, "candidate_snrs": [5.060828685760498], "cube_geometry": {"T_det": 256, "N_fdm": 4, "N_grid": 32}}
+{"kind": "noise_only", "cube_id": 19, "candidate_snrs": [5.027204513549805], "cube_geometry": {"T_det": 256, "N_fdm": 4, "N_grid": 32}}
+{"kind": "noise_only", "cube_id": 20, "candidate_snrs": [], "cube_geometry": {"T_det": 256, "N_fdm": 4, "N_grid": 32}}
+{"kind": "noise_only", "cube_id": 21, "candidate_snrs": [5.119739532470703, 5.111883163452148], "cube_geometry": {"T_det": 256, "N_fdm": 4, "N_grid": 32}}

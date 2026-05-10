@@ -489,3 +489,72 @@ this default but is free to override per ``configs/config_compute_search.yaml``.
 4 = ``ceil(T_det_default / cube_dt)`` at the default operating point
 (``T_det = 512`` search samples × 524.288 µs / cube ≈ 134.218 ms ≈
 ``BLOCK_DURATION_S``)."""
+
+
+# ---------------------------------------------------------------------------
+# Detector noise-norm pins (M5 chunk 3; plan §3.6.9 / §3.6.10 / §3.6.12)
+# ---------------------------------------------------------------------------
+
+T_INT_FACTOR_DEFAULT: int = 16
+"""Default native→search post-integration factor.
+``t_int_search_us = T_INT_FACTOR_DEFAULT × NATIVE_SAMPLE_US = 16 ×
+32.768 = 524.288 µs``. Matches ``configs/config_compute_corr.yaml::
+t_int_factor`` and ``configs/operating_points.yaml::default``. (NB:
+``t_int_fast_us = 8 × NATIVE_SAMPLE_US = 262.144`` is configured
+independently in `configs/config_compute_corr.yaml`; the
+fast→search ratio at the default operating point happens to be
+``T_INT_FACTOR_DEFAULT / 8 = 2``, but the canonical ratio
+sub-agents read against is the **native→search** one.)"""
+
+T_INT_SEARCH_US_DEFAULT: float = T_INT_FACTOR_DEFAULT * NATIVE_SAMPLE_US
+"""Search-stage sample period in µs (= 524.288 at default ops).
+Pinned by plan §3.5 ``test_constants_pinned``: ``t_int_search_us ==
+524.288``."""
+
+CUBE_CADENCE_SAMPLES_DEFAULT: int = 256
+"""Cube cadence in t_int_search_us samples (plan §3.6.12 line 1514: one
+new cube every block-cadence = 134.218 ms = 256 search-cadence samples).
+Search-node throughput is ``1 / (CUBE_CADENCE_SAMPLES_DEFAULT ×
+T_INT_SEARCH_US_DEFAULT × 1e-6) ≈ 7.45 cubes/s`` at default ops."""
+
+CUBE_CADENCE_S_DEFAULT: float = (
+    CUBE_CADENCE_SAMPLES_DEFAULT * T_INT_SEARCH_US_DEFAULT * 1e-6
+)
+"""Cube cadence in seconds (= 0.134218 s at default ops). Used by the
+Layer-2 EMA's ``γ = 1 - exp(-cube_cadence_s / τ_s)`` smoothing factor."""
+
+N_KERNEL_MAX_T_DEFAULT: int = 128
+"""Widest detector time-kernel boxcar width (plan §3.6.10 + §3.6.12).
+Equals ``max(DETECTOR_K_TIME_WIDTHS)`` at default config and drives the
+Layer-2 interior-only σ_k EMA's edge-trim length and the canonical-zone
+emit gate's time-edge gate."""
+
+NOISE_LAYER1_N_BURNIN_CUBES_DEFAULT: int = 5
+"""Layer-1 σ-clipped global-scalar burn-in length (plan §3.6.9 line 997
++ ``configs/config_compute_search.yaml::noise.layer1_n_burnin_cubes``).
+For the first 5 cubes after ``cmd: start``, σ_layer1[fdm] is the median
+of the 5 most recent per-cube σs (robust against single-cube RFI burst
+contamination); from cube 6 onward, σ uses the current cube only.
+Tunable in §9: ``{1, 5 (default), 10}``."""
+
+NOISE_LAYER2_TAU_S_DEFAULT: float = 30.0
+"""Layer-2 EMA time constant in seconds (plan §3.6.10 line 1025;
+``configs/config_compute_search.yaml::noise.layer2_tau_s``). At
+``CUBE_CADENCE_S_DEFAULT`` this gives ``γ ≈ 0.00447`` (smoothing on a
+~30 s window). Tunable in §9 + the noise-norm calibration bench (M5
+DoD §8 line 2326): ``{30, 60}`` both must satisfy the FAR gate."""
+
+NOISE_LAYER2_N_BURNIN_DEFAULT: int = 30
+"""Layer-2 σ_k EMA burn-in length in cubes (plan §3.6.10 line 1026
++ ``configs/config_compute_search.yaml::noise.layer2_n_burnin``). Sets
+``flags.bit3 = noise_warmup`` on every emitted Candidate during the
+first 30 cubes after ``cmd: start``; from cube 30 onward the warmup
+flag clears and the EMA replaces the Welford running mean."""
+
+NOISE_SIGMA_CLIP_NSIGMA_DEFAULT: float = 3.0
+"""σ-clip threshold for ``sigma_clipped_std`` (plan §3.6.9 line 985).
+3-iteration loop with 3σ clip per iteration is the v1 default; deeper
+clipping or a different kernel is out of scope for v1."""
+
+NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT: int = 3
+"""Number of σ-clip iterations (plan §3.6.9 line 988)."""

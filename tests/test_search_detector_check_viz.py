@@ -1,0 +1,533 @@
+"""Smoke tests for ``tools/viz/search_helpers.py`` and
+``tools/viz/search_detector_check.py`` (M5 chunk 5).
+
+These tests are pure-Python (no torch / no detector) so they run in
+<2 s on any matplotlib-equipped env. They exercise:
+
+  * Each rendering helper produces a non-empty PNG / HTML output.
+  * ``stitch_search_html_report`` writes a self-contained ``report.html``
+    with no PASS/FAIL banner.
+  * The CLI in cube_injection mode parses bench-shaped NDJSON / summary
+    JSON and writes a complete report directory.
+  * ``--mode burst`` consumes a ``detector.json`` (output of
+    ``bench/captured_burst_detector.py`` or
+    ``bench/voltage_fixture_search.py --mode captured --detector-sweep``)
+    and writes butterfly + DM-curve + per-kernel-SNR figures + the
+    candidates table + master report.html (M5 chunk 7 closure D27).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+os.environ.setdefault("DSART_TEST", "1")
+
+from tools.viz import search_detector_check  # noqa: E402
+from tools.viz.search_helpers import (  # noqa: E402
+    CandidateRow,
+    FarSample,
+    FigureEntry,
+    KernelScoreEntry,
+    RecoveryCell,
+    gaussian_tail_far,
+    n_eff_per_cube_per_kernel,
+    render_candidates_table_html,
+    render_far_curve_png,
+    render_recovery_heatmap_png,
+    render_score_per_kernel_png,
+    stitch_search_html_report,
+)
+
+
+def test_gaussian_tail_far_known_values() -> None:
+    """Sanity-check the Gaussian-tail FAR helper against known limits."""
+    assert gaussian_tail_far(0.0) == pytest.approx(0.5, abs=1e-6)
+    # Standard normal one-sided tail at θ=1: ~0.1587
+    assert gaussian_tail_far(1.0) == pytest.approx(0.1587, abs=1e-3)
+    # θ=5: ~2.87e-7
+    assert gaussian_tail_far(5.0) == pytest.approx(2.87e-7, rel=1e-2)
+
+
+def test_n_eff_per_cube_per_kernel_formula() -> None:
+    n_eff = n_eff_per_cube_per_kernel(
+        t_det=512, n_fdm=8, n_grid=64,
+        k_img_volume=1, k_dm_width=3, k_time_width=4,
+    )
+    # 512 * 8 * 64 * 64 / (1 * 3 * 4) = 16777216 / 12 ≈ 1.398e6
+    assert n_eff == pytest.approx(16777216 / 12, rel=1e-9)
+
+
+def test_n_eff_rejects_zero_widths() -> None:
+    with pytest.raises(ValueError):
+        n_eff_per_cube_per_kernel(
+            t_det=64, n_fdm=4, n_grid=8,
+            k_img_volume=0, k_dm_width=1, k_time_width=1,
+        )
+
+
+def test_render_recovery_heatmap_png(tmp_path: Path) -> None:
+    cells = [
+        RecoveryCell(injected_snr=8.0, width_samples=4,
+                     n_injected=3, n_recovered=2, snr_ratio_mean=0.95),
+        RecoveryCell(injected_snr=8.0, width_samples=8,
+                     n_injected=3, n_recovered=3, snr_ratio_mean=0.97),
+        RecoveryCell(injected_snr=12.0, width_samples=4,
+                     n_injected=3, n_recovered=3, snr_ratio_mean=0.99),
+        RecoveryCell(injected_snr=12.0, width_samples=8,
+                     n_injected=3, n_recovered=3, snr_ratio_mean=1.00),
+    ]
+    out = tmp_path / "recovery_heatmap.png"
+    render_recovery_heatmap_png(cells, out_path=out, title="recovery test")
+    assert out.is_file()
+    assert out.stat().st_size > 0
+    # PNG magic bytes
+    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_render_score_per_kernel_png(tmp_path: Path) -> None:
+    entries = []
+    for i_img, img in enumerate(("unit", "psf")):
+        for i_dm, dm_w in enumerate((1, 3, 5, 7)):
+            for i_t, t_w in enumerate((1, 2, 4, 8)):
+                entries.append(KernelScoreEntry(
+                    image_token=img,
+                    dm_token=f"d{dm_w}",
+                    time_token=f"b{t_w}",
+                    k_dm_width=dm_w,
+                    k_time_width=t_w,
+                    snr=float(8.0 + i_img + i_dm + i_t),
+                ))
+    out = tmp_path / "score_per_kernel.png"
+    render_score_per_kernel_png(entries, out_path=out, title="score test")
+    assert out.is_file()
+    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_render_far_curve_png(tmp_path: Path) -> None:
+    samples = [
+        FarSample(theta=t, empirical_per_cube_per_kernel=10**-t,
+                  analytic_per_cube_per_kernel=2 * 10**-t,
+                  n_cubes=30, n_kernels=128)
+        for t in (5.0, 6.0, 7.0, 8.0, 9.0)
+    ]
+    out = tmp_path / "far.png"
+    render_far_curve_png(samples, out_path=out)
+    assert out.is_file()
+
+
+def test_render_candidates_table_html(tmp_path: Path) -> None:
+    rows = [
+        CandidateRow(
+            rank=1,
+            observed={
+                "kernel_id": "unit:d3:b16", "snr": 9.5,
+                "l": 32, "m": 32, "dm_idx": 4,
+                "event_specnum": 256, "width_samples": 16,
+            },
+            injected={
+                "l_pix": 32, "m_pix": 32,
+                "fine_dm_idx": 4, "t_in_cube": 256,
+            },
+        ),
+        CandidateRow(
+            rank=2,
+            observed={
+                "kernel_id": "?", "snr": 8.2,
+                "l": 0, "m": 0, "dm_idx": 0,
+                "event_specnum": 17, "width_samples": 0,
+            },
+            injected=None,
+        ),
+    ]
+    out = tmp_path / "candidates.html"
+    render_candidates_table_html(rows, out_path=out)
+    text = out.read_text(encoding="utf-8")
+    assert "<!doctype html>" in text
+    assert "unit:d3:b16" in text
+    assert "(noise-only" in text
+
+
+def test_stitch_search_html_report(tmp_path: Path) -> None:
+    figures = [
+        FigureEntry(
+            png_filename="x.png",
+            caption="x figure",
+            observed="42",
+            expected="≥40",
+        ),
+        FigureEntry(
+            png_filename="y.png",
+            caption="y figure (no metrics)",
+        ),
+    ]
+    report_path = stitch_search_html_report(
+        out_dir=tmp_path,
+        title="Test report",
+        header_meta={"Run": "test", "Mode": "cube_injection"},
+        figures=figures,
+        candidates_html_filename="candidates.html",
+        extra_links=[("README", "README.txt")],
+    )
+    assert report_path == tmp_path / "report.html"
+    text = report_path.read_text(encoding="utf-8")
+    # The report's only mention of PASS/FAIL is the operator-facing
+    # disclaimer ("No PASS/FAIL banner — operator inspects manually");
+    # there must be no per-criterion verdict words.
+    assert "No PASS/FAIL banner" in text
+    assert "PASSED" not in text and "FAILED" not in text
+    assert "verdict" not in text.lower()
+    # All figures are present.
+    assert "x.png" in text
+    assert "y.png" in text
+    assert "candidates.html" in text
+    assert "README" in text
+
+
+def test_cli_burst_mode_requires_detector_json() -> None:
+    """``--mode burst`` requires ``--detector-json``; the CLI exits
+    via SystemExit (argparse error) when it's missing."""
+    with pytest.raises(SystemExit):
+        search_detector_check.main([
+            "--mode", "burst",
+            "--out", "/tmp/should_not_exist",
+        ])
+
+
+def test_cli_burst_mode_missing_detector_json(tmp_path: Path) -> None:
+    """``--mode burst --detector-json /nonexistent`` should fail with
+    a clear argparse error, not crash later."""
+    with pytest.raises(SystemExit):
+        search_detector_check.main([
+            "--mode", "burst",
+            "--detector-json", str(tmp_path / "nonexistent.json"),
+            "--out", str(tmp_path / "report"),
+        ])
+
+
+def _synthetic_detector_record() -> dict:
+    """Synthetic detector.json record matching the schema produced by
+    ``bench/captured_burst_detector.py`` — used by the burst-mode CLI
+    smoke tests below.
+    """
+    return {
+        "schema_version": "v1.M5.captured-detector-test",
+        "captured_dir": "/tmp/synth-fixture",
+        "manifest": {
+            "run_id": "synth01",
+            "src_kind": "burst",
+            "is_burst": True,
+            "src_truth": {
+                "dm_pc_cc": 100.0, "ra_deg": 180.0,
+                "dec_deg": 30.0, "t2_snr": 25.0,
+            },
+            "n_chgroups_present": 16, "n_chgroups_total": 16,
+            "valid_mask": [True] * 16, "t_int_fast_us": 524.288,
+        },
+        "config": {
+            "detector_t_det": 256, "n_fdm": 8, "n_grid": 32,
+            "n_chgroup": 16, "dm_min_pc_cc": 90.0, "dm_max_pc_cc": 110.0,
+            "coarse_dm_pc_cc": 0.0, "shift_offset": 0,
+            "threshold_sigma": 8.0, "target_max": 120,
+            "quant_scale": 1.0, "merge_radius_lm": 3,
+            "merge_radius_fdm": 5, "merge_radius_t": 128,
+            "kernel_bank": [
+                f"unit:d1:b{w}" for w in [1, 2, 4, 8, 16, 32, 64, 128]
+            ],
+        },
+        "fdm_grid": {
+            "fine_dm_pc_cm3": [
+                90.0, 92.857, 95.714, 98.571,
+                101.428, 104.285, 107.142, 110.0,
+            ],
+            "coarse_dm_pc_cm3": [0.0],
+            "max_shift_samples": 50, "max_shift_ms": 26.2,
+        },
+        "timings_ms": {
+            "imager_total": 600.0, "detector_total": 1500.0,
+            "bench_total": 38000.0,
+        },
+        "per_kernel_stats": [
+            {
+                "kernel_id": f"unit:d1:b{w}",
+                "snr_max": float(10.0 + w),
+                "snr_max_pos": {"t": 100, "fdm": 3, "l": 16, "m": 18},
+                "n_candidates": 1, "elapsed_ms": 45.0,
+            }
+            for w in [1, 2, 4, 8, 16, 32, 64, 128]
+        ],
+        "n_candidates_post_merge": 2,
+        "top_candidate": {
+            "snr": 138.0, "kernel_id": "unit:d1:b128",
+            "l_pix": 16, "m_pix": 18, "dm_idx": 3,
+            "dm_fine_pc_cc": 98.571, "t_in_cube": 100,
+            "width_samples": 128, "detector_version": "v1.M5", "flags": 0,
+        },
+        "candidates": [
+            {
+                "snr": 138.0, "kernel_id": "unit:d1:b128",
+                "l_pix": 16, "m_pix": 18, "dm_idx": 3,
+                "dm_fine_pc_cc": 98.571, "t_in_cube": 100,
+                "width_samples": 128,
+            },
+            {
+                "snr": 50.0, "kernel_id": "unit:d1:b8",
+                "l_pix": 8, "m_pix": 8, "dm_idx": 5,
+                "dm_fine_pc_cc": 104.285, "t_in_cube": 200,
+                "width_samples": 8,
+            },
+        ],
+        "burst_match": {
+            "matched_kernel_id": "unit:d1:b8",
+            "matched_k_time": 8, "matched_snr": 18.0, "b1_snr": 11.0,
+            "matched_filter_snr_boost": 1.64,
+            "l_pix": 16, "m_pix": 18, "dm_idx": 3,
+            "dm_fine_pc_cc": 98.571, "t_in_cube": 100,
+            "labelled_dm_pc_cc": 100.0, "dm_residual_frac": -0.014,
+            "match_radii": {"lm_pix": 5, "dm_consistency_frac": 0.02},
+            "dm_consistent": True,
+            "burst_kernels": [],
+        },
+        "rfi_contamination": [
+            {
+                "snr": 50.0, "kernel_id": "unit:d1:b8",
+                "l_pix": 8, "m_pix": 8, "dm_idx": 5,
+                "dm_fine_pc_cc": 104.285, "t_in_cube": 200,
+                "width_samples": 8, "delta_lm_pix": [-8, -10],
+                "delta_fdm": 2,
+                "note": "off-burst high-SNR candidate",
+            },
+        ],
+        "dm_curves_at_top_candidate_lm": [
+            {
+                "kernel_id": f"unit:d1:b{w}", "k_time_width": w,
+                "curve": [
+                    {"fdm_idx": f, "dm_pc_cc": 90.0 + 2.857 * f,
+                     "snr": 5.0 + 0.5 * (8 - abs(f - 3)) * (w / 4.0)}
+                    for f in range(8)
+                ],
+            }
+            for w in [1, 2, 4, 8, 16, 32, 64, 128]
+        ],
+    }
+
+
+def test_cli_burst_mode_end_to_end(tmp_path: Path) -> None:
+    """Feed a synthetic detector.json through ``--mode burst`` and
+    verify the CLI writes the expected report files."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    rc = search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    assert rc == 0
+    assert (out_dir / "report.html").is_file()
+    assert (out_dir / "candidates.html").is_file()
+    assert (out_dir / "butterfly.png").is_file()
+    assert (out_dir / "dm_curve.png").is_file()
+    assert (out_dir / "per_kernel_snr.png").is_file()
+    # PNGs are non-empty.
+    for png in ("butterfly.png", "dm_curve.png", "per_kernel_snr.png"):
+        assert (out_dir / png).stat().st_size > 0
+
+
+def test_burst_report_contains_burst_match_summary(tmp_path: Path) -> None:
+    """The burst-mode report.html embeds the green burst-match
+    summary box with matched kernel, MF boost, and DM residual."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    # Burst-recovered green summary box.
+    assert "Burst recovered" in html
+    assert "unit:d1:b8" in html  # matched kernel
+    assert "1.64" in html  # MF boost
+    assert "98.571" in html  # recovered fine DM
+    assert "100.000" in html or "100.0" in html  # labelled DM
+    # Per plan §4.7: NO PASS/FAIL banner. The header explicitly says
+    # "No PASS/FAIL banner"; the burst-recovered box is informational.
+    assert "No PASS/FAIL banner" in html
+
+
+def test_burst_report_contains_rfi_contamination_table(
+    tmp_path: Path,
+) -> None:
+    """If detector.json has a non-empty rfi_contamination list, the
+    burst report.html surfaces it as a separate table."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert "Off-burst high-SNR detections" in html
+    assert "static-sky-subtract IIR" in html
+
+
+def test_burst_report_no_match_when_burst_match_absent(
+    tmp_path: Path,
+) -> None:
+    """If detector.json has burst_match=None (eg threshold too high
+    or location off-grid), the burst report stamps a red 'No burst
+    match' box instead of the green 'Burst recovered' box."""
+    rec = _synthetic_detector_record()
+    rec["burst_match"] = None
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(rec))
+    out_dir = tmp_path / "report"
+    rc = search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    assert rc == 0
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert "No burst match" in html
+    assert "Burst recovered" not in html
+
+
+def test_burst_candidates_table_highlights_burst_match(
+    tmp_path: Path,
+) -> None:
+    """The burst-mode candidates.html highlights candidates near the
+    burst (l, m) in green and off-burst candidates in yellow."""
+    det_path = tmp_path / "detector.json"
+    det_path.write_text(json.dumps(_synthetic_detector_record()))
+    out_dir = tmp_path / "report"
+    search_detector_check.main([
+        "--mode", "burst",
+        "--detector-json", str(det_path),
+        "--voltage-run-id", "synth01",
+        "--out", str(out_dir),
+    ])
+    html = (out_dir / "candidates.html").read_text(encoding="utf-8")
+    assert "burst-match" in html
+    assert "off-burst" in html
+    # Two synthetic candidates — one at burst (16, 18) ~= burst loc,
+    # one at off-burst (8, 8). Both rows in the table.
+    assert "unit:d1:b128" in html  # burst-match row
+    assert "unit:d1:b8" in html  # off-burst row
+
+
+def test_cli_cube_injection_end_to_end(tmp_path: Path) -> None:
+    """Feed a synthetic injection_log + summary through the CLI."""
+    injection_log = tmp_path / "injection_log.ndjson"
+    noise_only_log = tmp_path / "noise_only_log.ndjson"
+    summary_json = tmp_path / "summary.json"
+    out_dir = tmp_path / "report"
+
+    # One supra-threshold injection cell with a sane recovery + a
+    # sub-threshold cell with no recovery.
+    inj_records = [
+        {
+            "kind": "injection",
+            "injected": {
+                "snr": 12.0, "width_samples": 16,
+                "l_pix": 32, "m_pix": 32,
+                "fine_dm_idx": 4, "t_in_cube": 256,
+                "profile": "boxcar",
+            },
+            "n_trials": 3,
+            "n_recovered": 3,
+            "recovered_snrs": [11.7, 11.9, 12.1],
+            "matched_kernel_id": "unit:d3:b16",
+            "score_per_kernel_at_match": {
+                "unit:d3:b16": 12.0,
+                "unit:d3:b32": 9.5,
+                "unit:d1:b16": 7.5,
+            },
+            "cube_geometry": {"T_det": 512, "N_fdm": 8, "N_grid": 64},
+        },
+        {
+            "kind": "injection",
+            "injected": {
+                "snr": 6.0, "width_samples": 4,
+                "l_pix": 32, "m_pix": 32,
+                "fine_dm_idx": 4, "t_in_cube": 256,
+                "profile": "boxcar",
+            },
+            "n_trials": 3,
+            "n_recovered": 0,
+            "recovered_snrs": [],
+            "matched_kernel_id": None,
+            "score_per_kernel_at_match": {},
+            "cube_geometry": {"T_det": 512, "N_fdm": 8, "N_grid": 64},
+        },
+    ]
+    injection_log.write_text(
+        "\n".join(json.dumps(r) for r in inj_records) + "\n"
+    )
+
+    noise_records = [
+        {
+            "kind": "noise_only",
+            "cube_id": i + 1,
+            "candidate_snrs": [5.6, 6.2, 7.1],
+            "cube_geometry": {"T_det": 512, "N_fdm": 8, "N_grid": 64},
+        }
+        for i in range(3)
+    ]
+    noise_only_log.write_text(
+        "\n".join(json.dumps(r) for r in noise_records) + "\n"
+    )
+
+    summary = {
+        "tool": "bench/cube_injection_detector.py",
+        "config": {
+            "T_det": 512, "N_fdm": 8, "N_grid": 64,
+            "seed": 12345,
+        },
+        "far": [
+            {"theta": 6.0, "empirical_per_cube_per_kernel": 1e-4,
+             "n_cubes": 3, "n_kernels": 128},
+            {"theta": 8.0, "empirical_per_cube_per_kernel": 1e-7,
+             "n_cubes": 3, "n_kernels": 128},
+        ],
+    }
+    summary_json.write_text(json.dumps(summary))
+
+    rc = search_detector_check.main([
+        "--mode", "cube_injection",
+        "--injection-log", str(injection_log),
+        "--noise-only-log", str(noise_only_log),
+        "--summary", str(summary_json),
+        "--out", str(out_dir),
+    ])
+    assert rc == 0
+
+    assert (out_dir / "report.html").is_file()
+    assert (out_dir / "report.txt").is_file()
+    assert (out_dir / "recovery_heatmap.png").is_file()
+    assert (out_dir / "noise_only_far.png").is_file()
+    assert (out_dir / "candidates.html").is_file()
+    # Per-cell score map written for the supra-threshold cell only.
+    pngs = list(out_dir.glob("score_per_kernel_*.png"))
+    assert len(pngs) == 1
+
+    # Report.html header must include the operator-pinned tool name.
+    report_text = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert "search_detector_check" in report_text
+    assert "No PASS/FAIL banner" in report_text

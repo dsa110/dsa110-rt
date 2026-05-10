@@ -1,0 +1,85 @@
+{
+  "achieved_cubes_per_s": 1.5748858096167997,
+  "bench": "search_node_throughput",
+  "config": {
+    "bank_mask": "*",
+    "bank_mask_resolved": {
+      "k_dm": [
+        "d1",
+        "d3",
+        "d5",
+        "d7"
+      ],
+      "k_img": [
+        "unit",
+        "psf",
+        "psf_shift_lm",
+        "psf_shift_l"
+      ],
+      "k_time": [
+        "b1",
+        "b2",
+        "b4",
+        "b8",
+        "b16",
+        "b32",
+        "b64",
+        "b128"
+      ],
+      "n_kernels": 128
+    },
+    "cube_cadence_s": 0.0,
+    "cube_dtype": "float16",
+    "device": "cuda",
+    "n_cubes": 30,
+    "n_fdm": 2,
+    "n_grid": 128,
+    "rng_seed": 0,
+    "t_det": 32,
+    "threshold_sigma": 8.0
+  },
+  "milestone": "M5",
+  "n_candidates_total": 0,
+  "n_cubes_processed": 30,
+  "n_records_total": 0,
+  "percentiles_ms": {
+    "build_cube": {
+      "max": 46.130383,
+      "mean": 33.77026056666667,
+      "p50": 33.077369,
+      "p90": 34.685544,
+      "p99": 44.46884946000001
+    },
+    "detector_forward": {
+      "max": 329.432758,
+      "mean": 297.44238029999997,
+      "p50": 297.58454400000005,
+      "p90": 299.8473543,
+      "p99": 321.15080489
+    },
+    "emitter_dispatch": {
+      "max": 0.082772,
+      "mean": 0.018395166666666667,
+      "p50": 0.012441,
+      "p90": 0.029276900000000005,
+      "p99": 0.07015758000000004
+    },
+    "layer1_norm": {
+      "max": 101.172622,
+      "mean": 6.919218866666666,
+      "p50": 3.6552805,
+      "p90": 3.8208330000000004,
+      "p99": 72.94748315000008
+    },
+    "total_pipeline": {
+      "max": 476.773131,
+      "mean": 338.1742179666666,
+      "p50": 334.2734365,
+      "p90": 337.4443741,
+      "p99": 437.6952864800001
+    }
+  },
+  "schema_version": 1,
+  "utc": "2026-05-06T16:38:33.985821+00:00",
+  "wall_clock_s": 19.049000135
+}

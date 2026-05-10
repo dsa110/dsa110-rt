@@ -1,7 +1,7 @@
 # Search detector + trigger + cube assembly defaults (§9 O-4).
 schema_version: 1
 dm_plan_path: configs/dm_plan.npz
-detector_class: dsart.detector.v1_deterministic.DeterministicDetector
+detector_class: dsart.detector.forward.DeterministicDetector
 detector:
   threshold_sigma: 8
   k_img: 4
