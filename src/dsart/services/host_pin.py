@@ -274,7 +274,69 @@ def maybe_register_host_buffer(buf: object) -> bool:
         )
         return True
     if rval == _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED:
-        # Steady-state hot path. Idempotent re-register.
+        # Two cases land here:
+        #   (a) Steady-state hot path: PSRDADA hands us back the same
+        #       buffer page we already pinned earlier (same numpy base
+        #       object). The driver still has the page-lock, the
+        #       physical pages are unchanged, and we just refresh our
+        #       bookkeeping. This is the production-fast path.
+        #   (b) A fresh numpy buffer landed at a recycled VA whose
+        #       previous owner's weakref finalizer hasn't fired yet
+        #       (Python GC is non-deterministic; pytest + bench loops
+        #       that mint a fresh ~288 MB buffer per iteration are the
+        #       canonical trigger). The new array's *physical* pages
+        #       are different from the old, but cudaHostRegister keys
+        #       its bookkeeping on the host VA pointer alone, so the
+        #       driver still has the stale pages page-locked. Treating
+        #       this as success leaves us silently doing H2D copies
+        #       against the wrong physical pages, which manifests
+        #       later as cudaErrorInvalidArgument / "resource already
+        #       mapped" inside the next torch.as_tensor.
+        #
+        # We distinguish via the _FINALIZERS dict (keyed by id(base)):
+        # case (a) has a live finalizer for this base, case (b) does
+        # not. In case (b) we force-unregister the stale registration
+        # and re-register, so the driver sees the fresh physical pages.
+        force_clean = False
+        if isinstance(buf, np.ndarray):
+            base = _numpy_base(buf)
+            base_id = id(base)
+            with _REGISTRY_LOCK:
+                force_clean = base_id not in _FINALIZERS
+        if force_clean:
+            cudart.cudaHostUnregister(ctypes.c_void_p(addr))
+            with _REGISTRY_LOCK:
+                _REGISTERED.discard((addr, size))
+            rval = cudart.cudaHostRegister(
+                ctypes.c_void_p(addr), ctypes.c_size_t(size),
+                ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
+            )
+            if rval == 0:
+                with _REGISTRY_LOCK:
+                    _REGISTERED.add((addr, size))
+                if isinstance(buf, np.ndarray):
+                    base = _numpy_base(buf)
+                    base_id = id(base)
+                    with _REGISTRY_LOCK:
+                        if base_id not in _FINALIZERS:
+                            cb = _make_unregister_finalizer(addr, size)
+                            if cb is not None:
+                                _FINALIZERS[base_id] = weakref.finalize(
+                                    base, cb,
+                                )
+                LOG.debug(
+                    "host-pin: force-cleaned stale registration at "
+                    "addr=0x%x size=%d MB (recycled VA), re-registered",
+                    addr, size // (1024 * 1024),
+                )
+                return True
+            LOG.debug(
+                "host-pin: force-clean re-register failed rval=%d at "
+                "addr=0x%x; falling back to pageable",
+                rval, addr,
+            )
+            return False
+        # Case (a): refresh bookkeeping; no driver call needed.
         with _REGISTRY_LOCK:
             _REGISTERED.add((addr, size))
         return True
