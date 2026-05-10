@@ -675,11 +675,17 @@ class TestRTPhase3FusedComputeSplit:
 
         assert out_fused.gridded_minus_sky.shape == out_legacy.gridded_minus_sky.shape
         assert out_fused.gridded_minus_sky.dtype == out_legacy.gridded_minus_sky.dtype
+        # RT Phase 6 (fold t_sub into K + delay fp32 cast in compute_split)
+        # changed where the fp32 cast lands in compute_split, so the fused
+        # path is no longer bit-identical to the F31b legacy path; it is
+        # fp16-ULP-equivalent (atol ≈ 1 fp16 ULP, rtol ≈ 1e-6).
+        # Same tolerance relaxation already applied in commits 8ccf41f /
+        # 984eab5 to the slow-vs-fast tolerance test; mirroring here.
         torch.testing.assert_close(
             out_fused.gridded_minus_sky,
             out_legacy.gridded_minus_sky,
-            rtol=0,
-            atol=0,
+            rtol=1e-5,
+            atol=1e-4,
             msg=lambda m: (
                 f"Phase 3 fused (cfp32, fused) != F31b legacy (pinned "
                 f"n_fv_chunk={legacy_n_fv_chunk}, K={chan_sum_factor}, "
@@ -719,9 +725,11 @@ class TestRTPhase3FusedComputeSplit:
         )
         ctx_auto = _build_test_context(cfg_auto)
         out_auto = process_block(raw, ctx=ctx_auto, block_n=1)
+        # See test_fused_path_bit_identical_to_legacy_streaming above for
+        # the RT Phase 6 fp16-ULP tolerance rationale.
         torch.testing.assert_close(
             out.gridded_minus_sky, out_auto.gridded_minus_sky,
-            rtol=0, atol=0,
+            rtol=1e-5, atol=1e-4,
         )
 
 
@@ -735,6 +743,27 @@ class TestRTPhase3FusedComputeSplit:
     reason="BlockPipeliner requires a CUDA device (h01 GPU)",
 )
 class TestRTPhase4Pipeliner:
+    @pytest.fixture(autouse=True)
+    def _clear_host_pin_registry(self):
+        # RT Phase 7 (host_pin.py) caches cudaHostRegister bindings via
+        # weakref.finalize on the numpy base buffer. Under pytest the
+        # parametrised cases mint a fresh ~288 MB buffer per call and
+        # rely on Python GC to fire the finalizer; pytest holds enough
+        # frame references that the finalizers don't run promptly, so
+        # by the 4th parametrisation (~3 GB pinned cumulative) the
+        # next torch.as_tensor(arr, device=cuda) hits
+        # cudaErrorInvalidArgument. Force-clear the registry between
+        # tests so each case starts from a clean pinning state.
+        import gc
+        from dsart.services import host_pin
+        host_pin.unregister_all()
+        gc.collect()
+        torch.cuda.empty_cache()
+        yield
+        host_pin.unregister_all()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     """RT Phase 4: ``BlockPipeliner`` is numerically equivalent to a
     sequential loop over :func:`process_block` on the GPU.
 
