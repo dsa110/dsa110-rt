@@ -1,6 +1,6 @@
-"""Data-plane contract dataclasses (plan §3 + §3.2).
+"""Data-plane contract dataclasses (plan §3 + §3.2 + M6 chunk 1).
 
-These six frozen, slotted dataclasses are the integration contract between
+These frozen, slotted dataclasses are the integration contract between
 workstreams. Sub-agents wire functions against these types; the
 ``__post_init__`` shape/dtype/value asserts run only when ``DSART_TEST=1``
 (see ``config_loader.DSART_TEST``) so the production hot path has zero
@@ -11,11 +11,19 @@ Contracts:
     Voltages              — merged voltage tensor (in-process, GPU)
     SparseCOOPayload      — corr → search value vector (in-process; wire
                             byte layout in §4.3)
-    Candidate             — detector output (search → trigger emitter)
-    TriggerPacket         — emitted trigger (search → corr; JSON over TCP)
-    TriggerAck            — corr → search ACK (two-stage; JSON over TCP)
+    Candidate             — detector output (search → clusterer)
     DmPlan                — DM plan struct (build_dm_plan.py output;
                             commits to configs/dm_plan.npz)
+    CubeGeometry          — per-cube geometric metadata (M6 chunk 1)
+    ClusterRecord         — clusterer output, one row per cluster (M6 ch1)
+    CubeDumpManifest      — sidecar metadata for each NPZ cube dump (M6 ch3)
+
+(The pre-M6-pivot ``TriggerPacket`` / ``TriggerAck`` contracts were
+dropped in the M6 chunk-9 hardening sweep — voltage-trigger handoff is
+operator-mediated via the legacy ``dsa110-xengine`` framework, see
+plan §M6 / §M-defer. A future revival of the original-M6 voltage-
+trigger workstream will re-lock these under whatever new transport is
+chosen.)
 
 All fields use ``Final``-style typing — re-binding fails at runtime via
 ``frozen=True``. Mutating ndarray *contents* is still possible (frozen
@@ -41,11 +49,6 @@ from .constants import (
     N_SEARCH,
     N_SEARCH_GPU,
     SPARSE_COO_BITS_VALID,
-    TRIGGER_ACK_REASONS,
-    TRIGGER_ACK_STAGES,
-    TRIGGER_OPERATOR_SEARCH_NODE_ID,
-    TRIGGER_PRIORITIES,
-    TRIGGER_SCHEMA_VERSION,
     VOLTAGES_DTYPES_VALID,
     VOLTAGES_SHAPE,
 )
@@ -55,9 +58,10 @@ __all__ = [
     "Voltages",
     "SparseCOOPayload",
     "Candidate",
-    "TriggerPacket",
-    "TriggerAck",
     "DmPlan",
+    "CubeGeometry",
+    "ClusterRecord",
+    "CubeDumpManifest",
 ]
 
 
@@ -298,166 +302,6 @@ class Candidate:
 
 
 # ---------------------------------------------------------------------------
-# TriggerPacket — plan §3 lines 355-372 + F4 fix
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class TriggerPacket:
-    """Search → corr trigger (newline-delimited JSON over persistent TCP).
-
-    Wire form: ``json.dumps(asdict(packet))``. Schema versioned via ``v``.
-
-    ``trigger_id`` format is ``s<sid>-g<g>-<counter>`` per F4 (§4.4 long
-    form, plan §3 example was abbreviated). Operator-issued triggers
-    use ``search_node_id == TRIGGER_OPERATOR_SEARCH_NODE_ID (= 255)``
-    and ``trigger_id == "op-<utc_ns>"``.
-
-    Fields that the emitter derives (not present on Candidate):
-      - ``trigger_id`` (per-(search_node, gpu) monotonic counter)
-      - ``emit_utc_ns`` (now)
-      - ``event_utc_ns`` (from ``event_specnum`` via specnum→UTC table)
-      - ``actions``, ``priority``, ``src_name`` (from policy + trigger
-        predicate; defaults are pinned in §4.4)
-      - ``n_pre_blocks``, ``n_post_blocks`` (None → corr listener uses
-        config defaults of 10/5).
-      - ``fine_dm_trial`` (= ``dm_idx`` in v1 per O-7 trim).
-    """
-
-    trigger_id: str
-    search_node_id: int
-    emit_utc_ns: int
-    event_specnum: int
-    event_utc_ns: int
-    l: float
-    m: float
-    dm_fine: float
-    dm_idx: int
-    fine_dm_trial: int
-    width_samples: int
-    kernel_id: str
-    snr: float
-    actions: dict
-    priority: str
-    src_name: str
-    n_pre_blocks: Optional[int] = None
-    n_post_blocks: Optional[int] = None
-    v: int = TRIGGER_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if not DSART_TEST:
-            return
-        if self.v != TRIGGER_SCHEMA_VERSION:
-            raise ValueError(
-                f"v={self.v}, expected {TRIGGER_SCHEMA_VERSION}"
-            )
-        sid = self.search_node_id
-        if not (0 <= sid < N_SEARCH or sid == TRIGGER_OPERATOR_SEARCH_NODE_ID):
-            raise ValueError(
-                f"search_node_id={sid}, expected 0..{N_SEARCH - 1} "
-                f"or {TRIGGER_OPERATOR_SEARCH_NODE_ID} (operator)"
-            )
-        if not self.trigger_id:
-            raise ValueError("trigger_id must be non-empty")
-        if self.priority not in TRIGGER_PRIORITIES:
-            raise ValueError(
-                f"priority={self.priority!r} not in {TRIGGER_PRIORITIES}"
-            )
-        _check_kernel_id(self.kernel_id)
-        if self.event_specnum < 0:
-            raise ValueError(f"event_specnum={self.event_specnum}, expected ≥ 0")
-        if self.dm_fine < 0:
-            raise ValueError(f"dm_fine={self.dm_fine}, expected ≥ 0")
-        if self.dm_idx < 0:
-            raise ValueError(f"dm_idx={self.dm_idx}, expected ≥ 0")
-        if self.width_samples <= 0:
-            raise ValueError(f"width_samples={self.width_samples}, expected > 0")
-        if self.n_pre_blocks is not None and self.n_pre_blocks < 0:
-            raise ValueError(f"n_pre_blocks={self.n_pre_blocks}, expected ≥ 0")
-        if self.n_post_blocks is not None and self.n_post_blocks < 0:
-            raise ValueError(f"n_post_blocks={self.n_post_blocks}, expected ≥ 0")
-        if not isinstance(self.actions, dict):
-            raise TypeError(
-                f"actions must be dict; got {type(self.actions).__name__}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# TriggerAck — plan §3 lines 374-382
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class TriggerAck:
-    """Corr → search ACK record (newline-delimited JSON; two stages).
-
-    The corr listener sends two ACK records per trigger over the same
-    TCP connection: one with ``stage="accepted"`` (within ~ms) and one
-    with ``stage="completed"`` (after dump completes; ~100-700 ms).
-
-    Stage-specific fields are optional on the dataclass; ``__post_init__``
-    enforces presence per ``stage`` value. JSON serialisation drops
-    ``None``-valued fields per §4.5 line 1718.
-
-    ``reason`` is non-None only when ``accepted=False``. Allowed values
-    in ``TRIGGER_ACK_REASONS`` per §3 line 383 + §4.5 line 1718
-    ``dump_queue_full`` (which §3 missed; F2/F-related).
-    """
-
-    trigger_id: str
-    stage: str
-    ack_utc_ns: int
-    accepted: Optional[bool] = None
-    reason: Optional[str] = None
-    queue_depth: Optional[int] = None
-    dup_of: Optional[str] = None
-    voltage_dump_path: Optional[str] = None
-    filterbank_paths: Optional[tuple] = None  # tuple of str (frozen-friendly)
-    dump_completion_utc_ns: Optional[int] = None
-    dump_duration_ms: Optional[int] = None
-    v: int = TRIGGER_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if not DSART_TEST:
-            return
-        if self.v != TRIGGER_SCHEMA_VERSION:
-            raise ValueError(f"v={self.v}, expected {TRIGGER_SCHEMA_VERSION}")
-        if self.stage not in TRIGGER_ACK_STAGES:
-            raise ValueError(
-                f"stage={self.stage!r} not in {TRIGGER_ACK_STAGES}"
-            )
-        if not self.trigger_id:
-            raise ValueError("trigger_id must be non-empty")
-        if self.stage == "accepted":
-            if self.accepted is None:
-                raise ValueError("stage='accepted' requires `accepted` bool")
-            if not self.accepted:
-                if self.reason is None or self.reason not in TRIGGER_ACK_REASONS:
-                    raise ValueError(
-                        f"reason={self.reason!r} required and must be in "
-                        f"{TRIGGER_ACK_REASONS} when accepted=False"
-                    )
-                if self.reason == "dup" and not self.dup_of:
-                    raise ValueError("reason='dup' requires `dup_of`")
-        elif self.stage == "completed":
-            if self.dump_completion_utc_ns is None:
-                raise ValueError(
-                    "stage='completed' requires `dump_completion_utc_ns`"
-                )
-            if self.dump_duration_ms is None or self.dump_duration_ms < 0:
-                raise ValueError(
-                    f"dump_duration_ms={self.dump_duration_ms}, expected ≥ 0"
-                )
-            if self.filterbank_paths is not None and not isinstance(
-                self.filterbank_paths, tuple
-            ):
-                raise TypeError(
-                    f"filterbank_paths must be tuple; got "
-                    f"{type(self.filterbank_paths).__name__}"
-                )
-
-
-# ---------------------------------------------------------------------------
 # DmPlan — plan §3.2 lines 542-571
 # ---------------------------------------------------------------------------
 
@@ -644,4 +488,320 @@ class DmPlan:
                 dm_idx_range_consumed_per_gpu=data["dm_idx_range_consumed_per_gpu"].astype("int32", copy=False),
                 dm_overlap_coarse=int(data["dm_overlap_coarse"]),
                 metadata=metadata,
+            )
+
+
+# ---------------------------------------------------------------------------
+# CubeGeometry — M6 chunk 1 (per-cube geometric metadata for clusterer +
+# T1/T2 logger; passed alongside the per-cube candidate list)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CubeGeometry:
+    """Per-cube geometric metadata used by the clusterer to convert
+    detector pixel/index coordinates to real-unit physical coordinates
+    for ``ClusterRecord`` and T1/T2 ASCII logging (M6 D1/D3).
+
+    The detector emits ``Candidate`` records with ``l`` and ``m`` as
+    float-cast pixel indices (see ``detector.decoder.decode_local_max``)
+    and ``dm_fine`` as the resolved fine-DM in pc cm⁻³. The clusterer
+    needs (a) the pixel→radian conversion to write real-unit T1/T2
+    rows, and (b) the cube-specnum origin to convert ``event_specnum``
+    to a sample index ``t_in_cube``. Both come from this struct.
+
+    Args:
+        cube_id: monotonic cube counter (matches CubeRingSlot.cube_id).
+        specnum_start: spec num at sample 0 of this cube. Used to
+            compute t_in_cube = (event_specnum - specnum_start) //
+            sample_period_specnum.
+        sample_period_specnum: spec-nums per detector sample (= 16 in
+            production: t_int_search_us / t_int_fast_us).
+        t_det: number of time samples in the cube (= 256 in production).
+        n_grid: grid size on each spatial axis (= 256 in production).
+        n_fdm_in_cube: number of fine-DM trials in this cube
+            (= len(fine_dm_pc_cc)).
+        sample_period_us: time between adjacent detector samples in
+            microseconds (= t_int_search_us in DmPlan.metadata).
+        cell_l_rad: l-axis pixel pitch in radians (positive scalar).
+            Computed by the gridder from λ / (n_grid · cell_λ).
+        cell_m_rad: m-axis pixel pitch in radians (positive scalar).
+        l0_rad: l value at pixel index 0 (offset to true sky origin).
+            Default 0.0 = pixel-centred grid.
+        m0_rad: m value at pixel index 0. Default 0.0.
+        fine_dm_pc_cc: fine-DM grid in pc cm⁻³, monotonic increasing,
+            shape ``[n_fdm_in_cube]`` float64.
+        mjd_start: double-precision MJD at sample 0 of this cube.
+            Computed by the caller (production: from the host
+            specnum→UTC table; bench: from utc_block_start_ns).
+
+    Notes:
+        ``fine_dm_pc_cc`` is a *view* of the cube's fine-DM column
+        (typically a slice of ``DmPlan.fine_dm`` for the consumed range
+        of this (search_node, gpu_half)). The clusterer treats it as
+        read-only; mutations leak across cubes.
+    """
+
+    cube_id: int
+    specnum_start: int
+    sample_period_specnum: int
+    t_det: int
+    n_grid: int
+    n_fdm_in_cube: int
+    sample_period_us: float
+    cell_l_rad: float
+    cell_m_rad: float
+    l0_rad: float
+    m0_rad: float
+    fine_dm_pc_cc: np.ndarray
+    mjd_start: float
+
+    def __post_init__(self) -> None:
+        if not DSART_TEST:
+            return
+        if self.cube_id < 0:
+            raise ValueError(f"cube_id={self.cube_id}, expected ≥ 0")
+        if self.specnum_start < 0:
+            raise ValueError(f"specnum_start={self.specnum_start}, expected ≥ 0")
+        if self.sample_period_specnum <= 0:
+            raise ValueError(
+                f"sample_period_specnum={self.sample_period_specnum}, expected > 0"
+            )
+        if self.t_det <= 0:
+            raise ValueError(f"t_det={self.t_det}, expected > 0")
+        if self.n_grid <= 0 or self.n_grid & (self.n_grid - 1):
+            raise ValueError(f"n_grid={self.n_grid}, expected positive power of two")
+        if self.n_fdm_in_cube <= 0:
+            raise ValueError(f"n_fdm_in_cube={self.n_fdm_in_cube}, expected > 0")
+        if self.sample_period_us <= 0.0:
+            raise ValueError(f"sample_period_us={self.sample_period_us}, expected > 0")
+        if self.cell_l_rad <= 0.0:
+            raise ValueError(f"cell_l_rad={self.cell_l_rad}, expected > 0")
+        if self.cell_m_rad <= 0.0:
+            raise ValueError(f"cell_m_rad={self.cell_m_rad}, expected > 0")
+        if not isinstance(self.fine_dm_pc_cc, np.ndarray):
+            raise TypeError(
+                f"fine_dm_pc_cc must be np.ndarray; got {type(self.fine_dm_pc_cc).__name__}"
+            )
+        if self.fine_dm_pc_cc.dtype.name != "float64":
+            raise TypeError(
+                f"fine_dm_pc_cc.dtype = {self.fine_dm_pc_cc.dtype.name!r}, expected 'float64'"
+            )
+        if self.fine_dm_pc_cc.shape != (self.n_fdm_in_cube,):
+            raise ValueError(
+                f"fine_dm_pc_cc.shape = {self.fine_dm_pc_cc.shape}, "
+                f"expected ({self.n_fdm_in_cube},)"
+            )
+        if not np.isfinite(self.mjd_start):
+            raise ValueError(f"mjd_start={self.mjd_start} not finite")
+
+
+# ---------------------------------------------------------------------------
+# ClusterRecord — M6 chunk 1 (one record per cluster from
+# cluster.forward.cluster_candidates; the integration contract between the
+# clusterer and the ASCII logger / cube-dump predicate)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterRecord:
+    """One cluster record emitted by ``cluster.forward.cluster_candidates``
+    (M6 D1/D3/D6).
+
+    Per M6 D6 the clusterer is per-cube; ``cluster_id`` is unique within
+    a (cube_id, search_node_id, gpu_half) triple, NOT globally. Noise
+    points (HDBSCAN/DBSCAN label = -1) are emitted as singleton records
+    with ``cluster_id = -1`` and ``cntc = cntb_lm = cntb_dm = 1``.
+
+    The peak (highest-SNR) candidate's full feature set is flattened into
+    this record. The integer-index fields (l_pix, m_pix, fine_dm_idx,
+    t_in_cube) carry the detector-frame coordinates; the real-unit
+    fields (l_rad, m_rad, dm_fine_pc_cc, t_seconds) are derived from
+    those through the ``CubeGeometry`` sidecar at clustering time. T1/T2
+    log rows always write the real units (D1/D3).
+
+    Args:
+        cluster_id: per-cube cluster id (-1 for HDBSCAN/DBSCAN noise
+            points; ≥0 for actual clusters).
+        cube_id: monotonic cube counter (= CubeGeometry.cube_id).
+        cntc: cluster cardinality (number of candidates in cluster;
+            = 1 for noise points).
+        cntb_lm: number of unique (l_pix, m_pix) cells in cluster.
+        cntb_dm: number of unique fine_dm_idx trials in cluster.
+        peak_candidate_idx: index of the peak (highest-SNR) candidate
+            in the per-cube input candidate list.
+        l_rad: peak's l in radians (= l_pix * cell_l_rad + l0_rad).
+        m_rad: peak's m in radians (= m_pix * cell_m_rad + m0_rad).
+        l_pix: peak's cube pixel index ∈ [0, n_grid).
+        m_pix: peak's cube pixel index ∈ [0, n_grid).
+        dm_fine_pc_cc: peak's fine DM in pc cm⁻³.
+        fine_dm_idx: peak's index into CubeGeometry.fine_dm_pc_cc
+            ∈ [0, n_fdm_in_cube).
+        t_in_cube: peak's sample index ∈ [0, t_det).
+        t_seconds: peak's time in seconds since cube start
+            (= t_in_cube * sample_period_us / 1e6).
+        width_samples: peak's matched-filter width in samples.
+        snr: peak's score in σ.
+        kernel_id: peak's detector kernel triple id ("k_img:k_dm:k_time").
+        event_specnum: peak's absolute spec num.
+        search_node_id: 0..N_SEARCH-1.
+        gpu_half: 0..N_SEARCH_GPU-1.
+    """
+
+    cluster_id: int
+    cube_id: int
+    cntc: int
+    cntb_lm: int
+    cntb_dm: int
+    peak_candidate_idx: int
+    l_rad: float
+    m_rad: float
+    l_pix: int
+    m_pix: int
+    dm_fine_pc_cc: float
+    fine_dm_idx: int
+    t_in_cube: int
+    t_seconds: float
+    width_samples: int
+    snr: float
+    kernel_id: str
+    event_specnum: int
+    search_node_id: int
+    gpu_half: int
+
+    def __post_init__(self) -> None:
+        if not DSART_TEST:
+            return
+        if self.cluster_id < -1:
+            raise ValueError(
+                f"cluster_id={self.cluster_id}, expected ≥ -1 (-1 = noise)"
+            )
+        if self.cube_id < 0:
+            raise ValueError(f"cube_id={self.cube_id}, expected ≥ 0")
+        if self.cntc <= 0:
+            raise ValueError(f"cntc={self.cntc}, expected > 0")
+        if self.cntb_lm <= 0 or self.cntb_lm > self.cntc:
+            raise ValueError(
+                f"cntb_lm={self.cntb_lm}, expected 0 < cntb_lm ≤ cntc={self.cntc}"
+            )
+        if self.cntb_dm <= 0 or self.cntb_dm > self.cntc:
+            raise ValueError(
+                f"cntb_dm={self.cntb_dm}, expected 0 < cntb_dm ≤ cntc={self.cntc}"
+            )
+        if self.peak_candidate_idx < 0:
+            raise ValueError(
+                f"peak_candidate_idx={self.peak_candidate_idx}, expected ≥ 0"
+            )
+        if self.l_pix < 0:
+            raise ValueError(f"l_pix={self.l_pix}, expected ≥ 0")
+        if self.m_pix < 0:
+            raise ValueError(f"m_pix={self.m_pix}, expected ≥ 0")
+        if self.dm_fine_pc_cc < 0:
+            raise ValueError(f"dm_fine_pc_cc={self.dm_fine_pc_cc}, expected ≥ 0")
+        if self.fine_dm_idx < 0:
+            raise ValueError(f"fine_dm_idx={self.fine_dm_idx}, expected ≥ 0")
+        if self.t_in_cube < 0:
+            raise ValueError(f"t_in_cube={self.t_in_cube}, expected ≥ 0")
+        if self.width_samples <= 0:
+            raise ValueError(f"width_samples={self.width_samples}, expected > 0")
+        if self.event_specnum < 0:
+            raise ValueError(f"event_specnum={self.event_specnum}, expected ≥ 0")
+        _check_kernel_id(self.kernel_id)
+        if not 0 <= self.search_node_id < N_SEARCH:
+            raise ValueError(
+                f"search_node_id={self.search_node_id}, expected 0..{N_SEARCH - 1}"
+            )
+        if not 0 <= self.gpu_half < N_SEARCH_GPU:
+            raise ValueError(
+                f"gpu_half={self.gpu_half}, expected 0..{N_SEARCH_GPU - 1}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# CubeDumpManifest — M6 chunk 3 (sidecar metadata for each NPZ cube dump)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CubeDumpManifest:
+    """Sidecar metadata for each NPZ cube dump (M6 D7).
+
+    Holds the bookkeeping needed to: (a) re-load the dump, (b) attribute
+    the dump back to its source trigger (auto-clustered cluster vs UDP),
+    and (c) audit the writer-thread queue from the operator side.
+
+    The NPZ file itself contains the cube tensor + a compact summary
+    of these fields; this dataclass is the in-process form used by the
+    cube-dump writer thread (M6 chunk 3) and the cube-dump bench (M6
+    chunk 7).
+
+    Args:
+        cube_id: monotonic cube counter (matches CubeRingSlot.cube_id).
+        event_specnum_start: spec num at sample 0 of the dumped cube.
+        mjd_start: double-precision MJD at sample 0 of dumped cube.
+        t_det: number of time samples in the dumped cube.
+        n_fdm_in_cube: number of fine-DM trials in the dumped cube.
+        n_grid: grid size on each spatial axis.
+        trigger_source: "auto" (cluster crossed bright-pulse predicate)
+            or "udp" (external UDP listener fired).
+        cluster_record: peak ClusterRecord for "auto" dumps; None for
+            "udp" dumps (which don't carry per-candidate metadata —
+            see M6 D9/D12).
+        npz_path: absolute path to the NPZ file on disk.
+        search_node_id: 0..N_SEARCH-1 (the dumping process).
+        gpu_half: 0..N_SEARCH_GPU-1 (the dumping process).
+    """
+
+    cube_id: int
+    event_specnum_start: int
+    mjd_start: float
+    t_det: int
+    n_fdm_in_cube: int
+    n_grid: int
+    trigger_source: str
+    cluster_record: Optional[ClusterRecord]
+    npz_path: str
+    search_node_id: int
+    gpu_half: int
+
+    def __post_init__(self) -> None:
+        if not DSART_TEST:
+            return
+        if self.cube_id < 0:
+            raise ValueError(f"cube_id={self.cube_id}, expected ≥ 0")
+        if self.event_specnum_start < 0:
+            raise ValueError(
+                f"event_specnum_start={self.event_specnum_start}, expected ≥ 0"
+            )
+        if not np.isfinite(self.mjd_start):
+            raise ValueError(f"mjd_start={self.mjd_start} not finite")
+        if self.t_det <= 0:
+            raise ValueError(f"t_det={self.t_det}, expected > 0")
+        if self.n_fdm_in_cube <= 0:
+            raise ValueError(f"n_fdm_in_cube={self.n_fdm_in_cube}, expected > 0")
+        if self.n_grid <= 0 or self.n_grid & (self.n_grid - 1):
+            raise ValueError(
+                f"n_grid={self.n_grid}, expected positive power of two"
+            )
+        if self.trigger_source not in ("auto", "udp"):
+            raise ValueError(
+                f"trigger_source={self.trigger_source!r}, expected 'auto' or 'udp'"
+            )
+        if self.trigger_source == "auto" and self.cluster_record is None:
+            raise ValueError(
+                "trigger_source='auto' requires cluster_record to be non-None"
+            )
+        if self.trigger_source == "udp" and self.cluster_record is not None:
+            raise ValueError(
+                "trigger_source='udp' requires cluster_record to be None"
+            )
+        if not self.npz_path:
+            raise ValueError("npz_path must be non-empty")
+        if not 0 <= self.search_node_id < N_SEARCH:
+            raise ValueError(
+                f"search_node_id={self.search_node_id}, expected 0..{N_SEARCH - 1}"
+            )
+        if not 0 <= self.gpu_half < N_SEARCH_GPU:
+            raise ValueError(
+                f"gpu_half={self.gpu_half}, expected 0..{N_SEARCH_GPU - 1}"
             )

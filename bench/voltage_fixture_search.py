@@ -5,7 +5,7 @@ gate (plan §8 line 2330).
 End-to-end M5 closure gate: feed the M3-captured transport-TX ``.npz``
 set (per chunk 6 `bench/corr_fast_burst_250924mptq.py` output) into
 the search-compute pipeline and verify the burst is recovered as a
-trigger packet at the expected (l, m, fine_dm, t) cell.
+``Candidate`` at the expected (l, m, fine_dm, t) cell.
 
 Plan §8 line 2330 specifies the fixture as the 250924mptq burst
 (DM ≈ 404.7 pc cm⁻³, RA = 307.78°, Dec = 53.85°, MJD ≈ 60942.172,
@@ -38,13 +38,15 @@ Two CLI modes:
 
 Outputs (under ``--out``):
 
-  * ``run.json``       — the full run record:
+  * ``run.json``        — the full run record:
         ``{config, mode, fixture: {dm, ra_deg, dec_deg, mjd, snr},
            recovered: {l_pix, m_pix, fine_dm_idx, t_in_cube, snr,
                        kernel_id} or null,
            gate_status: PASS|FAIL|NEEDS_OPERATOR}``
-  * ``triggers.ndjson`` — per-emitted ``TriggerPacket``.
-  * ``bench.log``      — operator progress.
+  * ``candidates.ndjson`` — per-emitted ``Candidate`` (one JSON line
+        each, from ``dataclasses.asdict``). Synthetic mode only;
+        captured mode does not surface per-Candidate output yet.
+  * ``bench.log``       — operator progress.
 
 Operator gate semantics:
   * synthetic: PASS/FAIL automatic (recovery_window check).
@@ -57,13 +59,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import math
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -87,22 +90,6 @@ from dsart.services.cube_pipeline import (  # noqa: E402
 from dsart.services.rx_ring import (  # noqa: E402
     SyntheticInjection,
     SyntheticRxRingSource,
-)
-from dsart.trigger.conditions import (  # noqa: E402
-    PerCubePerKernelCap,
-    PerCubeTotalCap,
-    RateLimitTokenBucket,
-    SnrThreshold,
-)
-from dsart.trigger.emitter import (  # noqa: E402
-    ConnectionEndpoint,
-    TriggerEmitter,
-    TriggerEmitterConfig,
-)
-from dsart.trigger.holdoff import HoldoffStateMachine  # noqa: E402
-from dsart.trigger.mock_listener import (  # noqa: E402
-    MockListenerConfig,
-    MockTriggerListener,
 )
 
 
@@ -142,7 +129,9 @@ class SyntheticBurstSpec:
     with a strong δ injection at the requested cell. Distinct from the
     chunk-5 ``cube_injection_detector`` bench because chunk-7 still
     drives the **full search_compute pipeline** (combiner + imager +
-    Layer-1 + detector + emitter + listener).
+    Layer-1 + detector). M6 chunk 0 retired the trigger emitter +
+    listener; per-Candidate output now flows directly from the
+    pipeline result.
     """
     cube_idx: int
     t_in_cube: int
@@ -233,12 +222,16 @@ def _load_captured_npz_set(
 
 
 async def _bench_synthetic(args: argparse.Namespace) -> Dict[str, object]:
-    """End-to-end mode-synthetic run: synthetic RX-ring → CubePipeline
-    → emitter → mock listener. Returns the run record dict.
+    """End-to-end mode-synthetic run: synthetic RX-ring → CubePipeline.
+
+    Per-cube ``Candidate`` lists are collected directly from
+    ``CubePipelineResult`` (M6 chunk 0 retired the M5 trigger emitter
+    + listener). Returns the run record dict.
     """
     t_det = int(args.t_det)
     n_fdm = int(args.n_fdm)
     n_grid = int(args.n_grid)
+    out_dir = Path(args.out).resolve()
 
     # Place the burst at the cube centre (well within the time-edge
     # gate's K_time/2 buffer; lm at phase centre for unambiguous
@@ -285,46 +278,18 @@ async def _bench_synthetic(args: argparse.Namespace) -> Dict[str, object]:
         layer1_state=Layer1State(n_fdm=n_fdm, n_burnin_cubes=1),
     )
 
-    # ---- Listener + emitter ----
-    listener = MockTriggerListener(
-        host="127.0.0.1", port=int(args.listener_port),
-        config=MockListenerConfig(
-            accept_rate=1.0, accept_delay_ms=0.0,
-            completed_delay_ms=0.5, send_completed=True,
-        ),
-    )
-    await listener.start()
-    endpoint = ConnectionEndpoint(host=listener.host, port=listener.port)
-    emitter_cfg = TriggerEmitterConfig(
-        search_node_id=1,
-        gpu_half=1,
-        endpoints=[endpoint],
-        conditions=[
-            SnrThreshold(min_snr=float(args.threshold_sigma)),
-            PerCubePerKernelCap(max_per_kernel=128),
-            PerCubeTotalCap(max_total=1024),
-            RateLimitTokenBucket(rate_per_s=1e6, burst=1_000_000),
-        ],
-        holdoff=HoldoffStateMachine(holdoff_ms=0.0),
-    )
-    emitter = TriggerEmitter(emitter_cfg)
-    await emitter.start()
-
-    all_records = []
     all_cands: List[Candidate] = []
-    try:
-        async with src:
-            async for slot in src:
-                result = pipeline.process(slot)
-                all_cands.extend(result.candidates)
-                records = await emitter.process_candidates(
-                    slot.cube_id, result.candidates,
-                )
-                all_records.extend(records)
-                await src.release(slot.cube_id)
-    finally:
-        await emitter.stop()
-        await listener.stop()
+    async with src:
+        async for slot in src:
+            result = pipeline.process(slot)
+            all_cands.extend(result.candidates)
+            await src.release(slot.cube_id)
+
+    candidates_path = out_dir / "candidates.ndjson"
+    with candidates_path.open("w") as fh:
+        for c in all_cands:
+            fh.write(json.dumps(dataclasses.asdict(c)) + "\n")
+    _LOG.info("wrote %s (%d candidates)", candidates_path, len(all_cands))
 
     # Find the candidate closest to the expected (l, m, fine_dm, t).
     recovered: Optional[Dict[str, object]] = None
@@ -384,7 +349,6 @@ async def _bench_synthetic(args: argparse.Namespace) -> Dict[str, object]:
         },
         "recovered": recovered,
         "n_candidates": len(all_cands),
-        "n_records_dispatched": len(all_records),
         "gate_status": gate_status,
     }
 
@@ -646,7 +610,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--synthetic-amplitude", type=float, default=300.0)
     parser.add_argument("--rng-seed", type=int, default=0)
-    parser.add_argument("--listener-port", type=int, default=11227)
     parser.add_argument(
         "--out", type=str,
         default=str(REPO_ROOT / "bench" / "reports" / "voltage_fixture" / "M5"),

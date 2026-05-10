@@ -39,16 +39,16 @@ from dsart.common.constants import (  # noqa: E402
     NU_TOP_PROC_GHZ,
     BW_PROC_MHZ,
     N_CHAN_PROC_NATIVE,
-    TRIGGER_OPERATOR_SEARCH_NODE_ID,
     VOLTAGES_SHAPE,
 )
 from dsart.common.contracts import (  # noqa: E402
     Candidate,
     CandidateFlags,
+    ClusterRecord,
+    CubeDumpManifest,
+    CubeGeometry,
     DmPlan,
     SparseCOOPayload,
-    TriggerAck,
-    TriggerPacket,
     Voltages,
 )
 
@@ -292,163 +292,13 @@ def test_candidate_frozen() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TriggerPacket
+# TriggerPacket / TriggerAck contract tests — RETIRED in M6 chunk-9 sweep
+# (the dataclasses were dropped from src/dsart/common/contracts.py;
+# voltage-trigger handoff is now operator-mediated through legacy
+# dsa110-xengine; see plan §M6 / §M-defer for the deferred reactivation
+# path that will re-introduce wire-form trigger contracts under whatever
+# transport is chosen).
 # ---------------------------------------------------------------------------
-
-
-def _make_trigger(**overrides: object) -> TriggerPacket:
-    base = dict(
-        trigger_id="s2-g1-000123",
-        search_node_id=2,
-        emit_utc_ns=1_872_345_678_901_234_567,
-        event_specnum=12_345_678,
-        event_utc_ns=1_872_345_677_000_000_000,
-        l=0.012,
-        m=-0.034,
-        dm_fine=524.6,
-        dm_idx=87,
-        fine_dm_trial=87,
-        width_samples=4,
-        kernel_id="psf:d3:b16",
-        snr=9.7,
-        actions={"voltage_dump": True, "filterbank": True, "n_beams": 1},
-        priority="normal",
-        src_name="auto_20260430_142511_b3",
-    )
-    base.update(overrides)
-    return TriggerPacket(**base)  # type: ignore[arg-type]
-
-
-def test_trigger_happy() -> None:
-    _make_trigger()
-
-
-def test_trigger_operator_search_node_ok() -> None:
-    _make_trigger(
-        search_node_id=TRIGGER_OPERATOR_SEARCH_NODE_ID,
-        trigger_id="op-1872345678901234567",
-        priority="high",
-    )
-
-
-def test_trigger_rejects_bad_priority() -> None:
-    with pytest.raises(ValueError, match="priority"):
-        _make_trigger(priority="urgent")
-
-
-def test_trigger_rejects_search_node_5() -> None:
-    with pytest.raises(ValueError, match="search_node_id"):
-        _make_trigger(search_node_id=5)
-
-
-def test_trigger_rejects_empty_trigger_id() -> None:
-    with pytest.raises(ValueError, match="trigger_id"):
-        _make_trigger(trigger_id="")
-
-
-def test_trigger_n_pre_blocks_none_ok() -> None:
-    p = _make_trigger(n_pre_blocks=None, n_post_blocks=None)
-    assert p.n_pre_blocks is None and p.n_post_blocks is None
-
-
-# ---------------------------------------------------------------------------
-# TriggerAck
-# ---------------------------------------------------------------------------
-
-
-def test_trigger_ack_accepted_happy() -> None:
-    TriggerAck(
-        trigger_id="s2-g1-000123",
-        stage="accepted",
-        ack_utc_ns=1_872_345_678_901_234_567,
-        accepted=True,
-        queue_depth=3,
-    )
-
-
-def test_trigger_ack_accepted_dup() -> None:
-    TriggerAck(
-        trigger_id="s2-g1-000123",
-        stage="accepted",
-        ack_utc_ns=1_872_345_678_901_234_567,
-        accepted=False,
-        reason="dup",
-        dup_of="s1-g0-000099",
-    )
-
-
-def test_trigger_ack_completed_happy() -> None:
-    TriggerAck(
-        trigger_id="s2-g1-000123",
-        stage="completed",
-        ack_utc_ns=1_872_345_678_901_234_567,
-        voltage_dump_path="/home/ubuntu/data/fl_12345678.out",
-        filterbank_paths=("/home/ubuntu/data/auto_20260430_142511_b3_b0.fil",),
-        dump_completion_utc_ns=1_872_345_679_201_234_567,
-        dump_duration_ms=312,
-    )
-
-
-def test_trigger_ack_rejects_bad_stage() -> None:
-    with pytest.raises(ValueError, match="stage"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="other",
-            ack_utc_ns=0,
-        )
-
-
-def test_trigger_ack_accepted_requires_accepted_flag() -> None:
-    with pytest.raises(ValueError, match="accepted"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="accepted",
-            ack_utc_ns=0,
-        )
-
-
-def test_trigger_ack_rejected_requires_reason() -> None:
-    with pytest.raises(ValueError, match="reason"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="accepted",
-            ack_utc_ns=0,
-            accepted=False,
-            reason=None,
-        )
-
-
-def test_trigger_ack_dup_requires_dup_of() -> None:
-    with pytest.raises(ValueError, match="dup_of"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="accepted",
-            ack_utc_ns=0,
-            accepted=False,
-            reason="dup",
-        )
-
-
-def test_trigger_ack_completed_requires_dump_fields() -> None:
-    with pytest.raises(ValueError, match="dump_completion_utc_ns"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="completed",
-            ack_utc_ns=0,
-        )
-
-
-def test_trigger_ack_filterbank_paths_must_be_tuple() -> None:
-    with pytest.raises(TypeError, match="filterbank_paths"):
-        TriggerAck(
-            trigger_id="s2-g1-000123",
-            stage="completed",
-            ack_utc_ns=0,
-            voltage_dump_path="/x",
-            filterbank_paths=["/x"],  # type: ignore[arg-type]
-            dump_completion_utc_ns=0,
-            dump_duration_ms=0,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -590,3 +440,233 @@ def test_dsart_test_disabled_skips_asserts(monkeypatch: pytest.MonkeyPatch) -> N
         specnum0=-1,  # negative
         utc_block_start_ns=-1,
     )
+
+
+# ---------------------------------------------------------------------------
+# CubeGeometry — M6 chunk 1
+# ---------------------------------------------------------------------------
+
+
+def _make_cube_geometry(**overrides: object) -> CubeGeometry:
+    base: dict = dict(
+        cube_id=0,
+        specnum_start=1024,
+        sample_period_specnum=16,
+        t_det=256,
+        n_grid=256,
+        n_fdm_in_cube=32,
+        sample_period_us=131.072,
+        cell_l_rad=1.5e-4,
+        cell_m_rad=1.5e-4,
+        l0_rad=0.0,
+        m0_rad=0.0,
+        fine_dm_pc_cc=np.linspace(50.0, 800.0, 32, dtype=np.float64),
+        mjd_start=60942.123456789,
+    )
+    base.update(overrides)
+    return CubeGeometry(**base)  # type: ignore[arg-type]
+
+
+def test_cube_geometry_happy() -> None:
+    geom = _make_cube_geometry()
+    assert geom.cube_id == 0
+    assert geom.fine_dm_pc_cc.shape == (32,)
+    assert geom.fine_dm_pc_cc.dtype.name == "float64"
+
+
+@pytest.mark.parametrize(
+    "field, value, exc",
+    [
+        ("cube_id", -1, ValueError),
+        ("specnum_start", -1, ValueError),
+        ("sample_period_specnum", 0, ValueError),
+        ("t_det", 0, ValueError),
+        ("n_grid", 100, ValueError),  # not power of two
+        ("n_grid", 0, ValueError),
+        ("n_fdm_in_cube", 0, ValueError),
+        ("sample_period_us", 0.0, ValueError),
+        ("cell_l_rad", 0.0, ValueError),
+        ("cell_m_rad", -1e-4, ValueError),
+        ("mjd_start", float("nan"), ValueError),
+    ],
+)
+def test_cube_geometry_rejects_bad_scalar(field, value, exc) -> None:
+    with pytest.raises(exc):
+        _make_cube_geometry(**{field: value})
+
+
+def test_cube_geometry_rejects_fine_dm_dtype_mismatch() -> None:
+    bad = np.linspace(50.0, 800.0, 32, dtype=np.float32)
+    with pytest.raises(TypeError, match="fine_dm_pc_cc.dtype"):
+        _make_cube_geometry(fine_dm_pc_cc=bad)
+
+
+def test_cube_geometry_rejects_fine_dm_shape_mismatch() -> None:
+    bad = np.linspace(50.0, 800.0, 31, dtype=np.float64)
+    with pytest.raises(ValueError, match="fine_dm_pc_cc.shape"):
+        _make_cube_geometry(fine_dm_pc_cc=bad)
+
+
+def test_cube_geometry_rejects_fine_dm_wrong_type() -> None:
+    with pytest.raises(TypeError, match="fine_dm_pc_cc must be np.ndarray"):
+        _make_cube_geometry(fine_dm_pc_cc=[50.0] * 32)  # type: ignore[arg-type]
+
+
+def test_cube_geometry_is_frozen() -> None:
+    geom = _make_cube_geometry()
+    with pytest.raises((AttributeError, Exception)):
+        geom.cube_id = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# ClusterRecord — M6 chunk 1
+# ---------------------------------------------------------------------------
+
+
+def _make_cluster_record(**overrides: object) -> ClusterRecord:
+    base: dict = dict(
+        cluster_id=0,
+        cube_id=0,
+        cntc=3,
+        cntb_lm=2,
+        cntb_dm=2,
+        peak_candidate_idx=1,
+        l_rad=1.5e-4 * 132,
+        m_rad=1.5e-4 * 230,
+        l_pix=132,
+        m_pix=230,
+        dm_fine_pc_cc=397.42,
+        fine_dm_idx=15,
+        t_in_cube=64,
+        t_seconds=64 * 131.072e-6,
+        width_samples=4,
+        snr=20.81,
+        kernel_id="unit:d1:b4",
+        event_specnum=2048,
+        search_node_id=2,
+        gpu_half=1,
+    )
+    base.update(overrides)
+    return ClusterRecord(**base)  # type: ignore[arg-type]
+
+
+def test_cluster_record_happy() -> None:
+    cr = _make_cluster_record()
+    assert cr.cluster_id == 0
+    assert cr.cntc == 3
+    assert cr.cntb_lm == 2
+    assert cr.cntb_dm == 2
+
+
+def test_cluster_record_noise_label_ok() -> None:
+    cr = _make_cluster_record(cluster_id=-1, cntc=1, cntb_lm=1, cntb_dm=1)
+    assert cr.cluster_id == -1
+
+
+@pytest.mark.parametrize(
+    "field, value, exc, match",
+    [
+        ("cluster_id", -2, ValueError, "cluster_id"),
+        ("cube_id", -1, ValueError, "cube_id"),
+        ("cntc", 0, ValueError, "cntc"),
+        ("cntb_lm", 0, ValueError, "cntb_lm"),
+        ("cntb_lm", 5, ValueError, "cntb_lm"),  # > cntc=3
+        ("cntb_dm", 0, ValueError, "cntb_dm"),
+        ("cntb_dm", 5, ValueError, "cntb_dm"),
+        ("peak_candidate_idx", -1, ValueError, "peak_candidate_idx"),
+        ("l_pix", -1, ValueError, "l_pix"),
+        ("m_pix", -1, ValueError, "m_pix"),
+        ("dm_fine_pc_cc", -1.0, ValueError, "dm_fine_pc_cc"),
+        ("fine_dm_idx", -1, ValueError, "fine_dm_idx"),
+        ("t_in_cube", -1, ValueError, "t_in_cube"),
+        ("width_samples", 0, ValueError, "width_samples"),
+        ("event_specnum", -1, ValueError, "event_specnum"),
+        ("kernel_id", "bogus", ValueError, "kernel_id"),
+        ("search_node_id", -1, ValueError, "search_node_id"),
+        ("search_node_id", N_SEARCH, ValueError, "search_node_id"),
+        ("gpu_half", -1, ValueError, "gpu_half"),
+        ("gpu_half", N_SEARCH_GPU, ValueError, "gpu_half"),
+    ],
+)
+def test_cluster_record_rejects_bad_field(field, value, exc, match) -> None:
+    with pytest.raises(exc, match=match):
+        _make_cluster_record(**{field: value})
+
+
+def test_cluster_record_is_frozen() -> None:
+    cr = _make_cluster_record()
+    with pytest.raises((AttributeError, Exception)):
+        cr.cluster_id = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# CubeDumpManifest — M6 chunk 3
+# ---------------------------------------------------------------------------
+
+
+def _make_cube_dump_manifest(**overrides: object) -> CubeDumpManifest:
+    cluster_record = _make_cluster_record()
+    base: dict = dict(
+        cube_id=0,
+        event_specnum_start=1024,
+        mjd_start=60942.123456789,
+        t_det=256,
+        n_fdm_in_cube=32,
+        n_grid=256,
+        trigger_source="auto",
+        cluster_record=cluster_record,
+        npz_path="/tmp/dump_s2_g1_1024.npz",
+        search_node_id=2,
+        gpu_half=1,
+    )
+    base.update(overrides)
+    return CubeDumpManifest(**base)  # type: ignore[arg-type]
+
+
+def test_cube_dump_manifest_auto_happy() -> None:
+    m = _make_cube_dump_manifest()
+    assert m.trigger_source == "auto"
+    assert m.cluster_record is not None
+
+
+def test_cube_dump_manifest_udp_happy() -> None:
+    m = _make_cube_dump_manifest(trigger_source="udp", cluster_record=None)
+    assert m.trigger_source == "udp"
+    assert m.cluster_record is None
+
+
+def test_cube_dump_manifest_auto_requires_cluster_record() -> None:
+    with pytest.raises(ValueError, match="trigger_source='auto'"):
+        _make_cube_dump_manifest(trigger_source="auto", cluster_record=None)
+
+
+def test_cube_dump_manifest_udp_rejects_cluster_record() -> None:
+    cr = _make_cluster_record()
+    with pytest.raises(ValueError, match="trigger_source='udp'"):
+        _make_cube_dump_manifest(trigger_source="udp", cluster_record=cr)
+
+
+@pytest.mark.parametrize(
+    "field, value, exc, match",
+    [
+        ("cube_id", -1, ValueError, "cube_id"),
+        ("event_specnum_start", -1, ValueError, "event_specnum_start"),
+        ("mjd_start", float("nan"), ValueError, "mjd_start"),
+        ("t_det", 0, ValueError, "t_det"),
+        ("n_fdm_in_cube", 0, ValueError, "n_fdm_in_cube"),
+        ("n_grid", 100, ValueError, "n_grid"),
+        ("trigger_source", "manual", ValueError, "trigger_source"),
+        ("npz_path", "", ValueError, "npz_path"),
+        ("search_node_id", -1, ValueError, "search_node_id"),
+        ("gpu_half", -1, ValueError, "gpu_half"),
+    ],
+)
+def test_cube_dump_manifest_rejects_bad_field(field, value, exc, match) -> None:
+    with pytest.raises(exc, match=match):
+        _make_cube_dump_manifest(**{field: value})
+
+
+def test_cube_dump_manifest_is_frozen() -> None:
+    m = _make_cube_dump_manifest()
+    with pytest.raises((AttributeError, Exception)):
+        m.cube_id = 99  # type: ignore[misc]

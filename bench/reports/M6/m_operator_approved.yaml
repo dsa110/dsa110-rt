@@ -1,0 +1,13 @@
+# Operator approval marker for M6 (search-node clustering + cube dump).
+#
+# To approve, replace the lines below with:
+#   approved_by: <your name>
+#   approved_at_utc: <ISO-8601 timestamp>
+#   approved_git_sha: <git sha at approval time>
+#
+# The M6.sh DoD harness checks this file's presence + non-template content
+# to advance the milestone stage from 'complete (needs operator approval)'
+# to 'complete (approved)'.
+approved_by: TEMPLATE
+approved_at_utc: TEMPLATE
+approved_git_sha: TEMPLATE
