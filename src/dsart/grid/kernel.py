@@ -566,14 +566,7 @@ class FastVisGridder:
         # ordered to match the inner (dy, dx) tap order of
         # ``cell_index_map``.
         weights_flat = self._tap_weights_device                        # (K*K,)
-        n_taps = weights_flat.shape[0]                                 # = K*K
-        # complex × real preserves complex64; broadcasting:
-        # src (n_fv, NBASE*NCHAN, 1) * weights (1, 1, K*K)
-        #   → (n_fv, NBASE*NCHAN, K*K). Reshape to flat per-tap
-        # source vector for the scatter.
-        src_taps = src.unsqueeze(2) * weights_flat.unsqueeze(0).unsqueeze(0)
-        src_taps_flat = src_taps.reshape(n_fv, nb * nch * n_taps)
-        idx_taps = self.cell_index_map.unsqueeze(0).expand(n_fv, -1)  # (n_fv, NBASE*NCHAN*K*K)
+        n_taps = int(weights_flat.shape[0])                            # = K*K
 
         # PyTorch ``scatter_add_`` doesn't support complex on all
         # backends (in particular CPU complex scatter is not vectorised
@@ -583,8 +576,35 @@ class FastVisGridder:
             (n_fv, n_filled + 1), dtype=torch.float32, device=self.device,
         )
         out_imag = torch.zeros_like(out_real)
-        out_real.scatter_add_(1, idx_taps, src_taps_flat.real.contiguous())
-        out_imag.scatter_add_(1, idx_taps, src_taps_flat.imag.contiguous())
+
+        # Per-tap accumulation loop. For each of the K² taps, weight the
+        # full (n_fv, NBASE*NCHAN) source tensor by ``weights_flat[t]``
+        # and accumulate into the cells indexed by ``cell_index_map[:, t]``
+        # using ``Tensor.index_add_`` (1-D index = 1.8 MB int64 at the
+        # production op-point) instead of ``scatter_add_`` (would need
+        # an (n_fv, NSRC) int64 index = ~3.7 GB at chunk=2 — blows the
+        # 2080 Ti budget). For K=1, ``weights_flat[0] == 1.0`` so the
+        # multiply is skipped (bit-identical to weighting by 1.0). The
+        # K=1 path then collapses to two ``index_add_`` calls (real +
+        # imag), no per-tap loop overhead.
+        cim = self.cell_index_map.reshape(-1, n_taps)                 # (NBASE*NCHAN_eff, K*K)
+        if n_taps == 1:
+            # K=1 fast path
+            idx_1d = cim[:, 0]                                         # (NSRC,) int64
+            src_real_c = src.real.contiguous()
+            src_imag_c = src.imag.contiguous()
+            out_real.index_add_(1, idx_1d, src_real_c)
+            out_imag.index_add_(1, idx_1d, src_imag_c)
+            del src_real_c, src_imag_c
+        else:
+            for t in range(n_taps):
+                w = weights_flat[t]
+                idx_t = cim[:, t]                                      # (NSRC,) int64
+                src_w_real = (src.real * w).contiguous()
+                src_w_imag = (src.imag * w).contiguous()
+                out_real.index_add_(1, idx_t, src_w_real)
+                out_imag.index_add_(1, idx_t, src_w_imag)
+                del src_w_real, src_w_imag
         out_buf = torch.complex(out_real, out_imag)
 
         # Strip the sentinel slot.

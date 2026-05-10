@@ -31,6 +31,7 @@ from dsart.services.slow_corr_kernel import (
 )
 from dsart.rfi import FlagBlockResult, FlagSourceBit
 from dsart.services.corr_fast_integration import (
+    BlockPipeliner,
     FastIntegrationConfig,
     IntegrationContext,
     IntegrationOutput,
@@ -42,6 +43,7 @@ from dsart.services.corr_fast_integration import (
     apply_rfi_mask_to_voltages,
     build_context,
     process_block,
+    process_blocks_pipelined,
     _build_core_baseline_mask,
 )
 
@@ -614,6 +616,488 @@ class TestF31bStreaming:
         raw = _synthetic_fada_block()
         out = process_block(raw, ctx=ctx, block_n=1)
         assert out.gridded_minus_sky is not None
+
+
+# ---------------------------------------------------------------------------
+# RT Phase 3: fused Stokes-I + chan-sum compute_split in process_block
+# ---------------------------------------------------------------------------
+
+
+class TestRTPhase3FusedComputeSplit:
+    """RT Phase 3: when ``cfg.chan_sum_factor > 1`` and ``cfg.n_fv_chunk
+    is None``, ``process_block`` calls ``compute_split(fuse_stokes_i=True,
+    chan_sum_factor=K)`` once per block and skips the F31b OUTER chunk
+    loop. The resulting summed-channel Stokes-I cube must be bit-
+    identical to the legacy F31b path that pins ``cfg.n_fv_chunk`` and
+    runs the per-slab ``stokes_i_pol_sum`` + ``reshape().sum()`` pipeline.
+
+    F31a's INTERNAL slab chunking (inside ``compute_split``) is gated on
+    the same fp16 V_real budget in either path, so the per-slab fp16
+    matmul inputs are byte-identical.
+    """
+
+    @pytest.mark.parametrize(
+        ("t_int", "chan_sum_factor", "legacy_n_fv_chunk"),
+        [
+            (32, 8, 128),     # 128 fv tiles, K=8 (production-like)
+            (32, 4, 128),
+            (32, 2, 128),
+            (32, 8, 16),      # legacy path with explicit small chunks
+            # Note: heavier rows (n_fv_chunk=1 with 128-tile blocks, or
+            # the production t_int_fast_native=8 cadence with 512 tiles)
+            # are exercised at the kernel level by
+            # tests/test_fast_corr_kernel.py::TestComputeSplitFusedStokesI;
+            # running both legacy + fused process_block on CPU at those
+            # shapes adds no coverage beyond the per-kernel test.
+        ],
+    )
+    def test_fused_path_bit_identical_to_legacy_streaming(
+        self, t_int, chan_sum_factor, legacy_n_fv_chunk,
+    ) -> None:
+        # Fused path: cfg.n_fv_chunk=None ⇒ uses use_fused_path=True
+        cfg_fused = _make_cfg(
+            t_int_fast_native=t_int,
+            chan_sum_factor=chan_sum_factor,
+            n_fv_chunk=None,
+        )
+        ctx_fused = _build_test_context(cfg_fused)
+        raw = _synthetic_fada_block()
+        out_fused = process_block(raw, ctx=ctx_fused, block_n=1)
+
+        # Legacy path: cfg.n_fv_chunk is pinned ⇒ takes the F31b loop.
+        cfg_legacy = _make_cfg(
+            t_int_fast_native=t_int,
+            chan_sum_factor=chan_sum_factor,
+            n_fv_chunk=legacy_n_fv_chunk,
+        )
+        ctx_legacy = _build_test_context(cfg_legacy)
+        out_legacy = process_block(raw, ctx=ctx_legacy, block_n=1)
+
+        assert out_fused.gridded_minus_sky.shape == out_legacy.gridded_minus_sky.shape
+        assert out_fused.gridded_minus_sky.dtype == out_legacy.gridded_minus_sky.dtype
+        torch.testing.assert_close(
+            out_fused.gridded_minus_sky,
+            out_legacy.gridded_minus_sky,
+            rtol=0,
+            atol=0,
+            msg=lambda m: (
+                f"Phase 3 fused (cfp32, fused) != F31b legacy (pinned "
+                f"n_fv_chunk={legacy_n_fv_chunk}, K={chan_sum_factor}, "
+                f"t_int={t_int}): {m}"
+            ),
+        )
+
+    def test_fused_path_disabled_when_chan_sum_is_one(self) -> None:
+        """Phase-3 fast path only fires when chan_sum_factor > 1."""
+        cfg = _make_cfg(t_int_fast_native=32, chan_sum_factor=1)
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        out = process_block(raw, ctx=ctx, block_n=1)
+        # Pinned-chunk legacy path equivalence (F31b regression).
+        cfg_pin = _make_cfg(
+            t_int_fast_native=32, chan_sum_factor=1, n_fv_chunk=128,
+        )
+        ctx_pin = _build_test_context(cfg_pin)
+        out_pin = process_block(raw, ctx=ctx_pin, block_n=1)
+        torch.testing.assert_close(
+            out.gridded_minus_sky, out_pin.gridded_minus_sky,
+            rtol=0, atol=0,
+        )
+
+    def test_fused_path_disabled_when_n_fv_chunk_pinned(self) -> None:
+        """User pinning ``cfg.n_fv_chunk`` keeps the legacy F31b path
+        even when ``chan_sum_factor > 1`` (bench overrides honored)."""
+        cfg = _make_cfg(
+            t_int_fast_native=32, chan_sum_factor=8, n_fv_chunk=8,
+        )
+        ctx = _build_test_context(cfg)
+        raw = _synthetic_fada_block()
+        out = process_block(raw, ctx=ctx, block_n=1)
+        # The fused path with no pin has to be bit-identical to this.
+        cfg_auto = _make_cfg(
+            t_int_fast_native=32, chan_sum_factor=8, n_fv_chunk=None,
+        )
+        ctx_auto = _build_test_context(cfg_auto)
+        out_auto = process_block(raw, ctx=ctx_auto, block_n=1)
+        torch.testing.assert_close(
+            out.gridded_minus_sky, out_auto.gridded_minus_sky,
+            rtol=0, atol=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RT Phase 4: 2-stream / 2-slot ring-buffer pipeliner bit-identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="BlockPipeliner requires a CUDA device (h01 GPU)",
+)
+class TestRTPhase4Pipeliner:
+    """RT Phase 4: ``BlockPipeliner`` is numerically equivalent to a
+    sequential loop over :func:`process_block` on the GPU.
+
+    The pipeline issues per-block stream-A (corr) work and stream-B
+    (dedisp + gridder) work back-to-back; cross-stream events ensure
+    stream B reads the same vis_stokes_i bytes that the default-
+    stream sequential path would. The static-sky EMA, stage2 fifo,
+    and ``Stage1MultiDMCoarseDM`` sliding window are all updated in
+    block order on stream B's serialized queue, so stateful subsystems
+    see the same per-block update sequence.
+
+    Tolerance
+    =========
+
+    The gridder uses ``torch.index_add_`` which is implemented as
+    atomic float32 adds on CUDA; the per-cell reduction order is
+    determined by GPU thread scheduling, which is **not** deterministic
+    across stream contexts (sequential default-stream vs pipelined
+    non-default streams). Per the existing Phase 2 contract (kernel
+    test ``test_chunked_equals_unchunked`` is bit-identical only on
+    CPU), we test for ULP-level numerical agreement (``rtol=1e-5,
+    atol=1e-4``) on GPU rather than byte-identity.
+
+    Skipped on CPU because :class:`BlockPipeliner` requires CUDA
+    (multiple stream usage). The full integration test on h01 GPU
+    pins both per-block ``gridded_minus_sky`` (within tolerance)
+    and the ``n_tx`` counter against the sequential path.
+    """
+
+    @pytest.mark.parametrize("n_blocks", [1, 2, 3, 4])
+    def test_pipelined_equals_sequential(self, n_blocks: int) -> None:
+        device = torch.device("cuda")
+        cfg = _make_cfg(t_int_fast_native=32, chan_sum_factor=8)
+        antpos_e, antpos_n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+
+        raws = [
+            _synthetic_fada_block(seed=20260505 + i)
+            for i in range(n_blocks)
+        ]
+
+        # Sequential reference. Run on a fresh ctx; tear down + empty
+        # the allocator cache before building the pipelined ctx so
+        # we don't keep two ctx-worth of working memory live (the
+        # 2080Ti's 11 GB budget can't fit two simultaneous compute_split
+        # working sets).
+        ctx_seq = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
+        outs_seq: list[IntegrationOutput] = []
+        for i, raw in enumerate(raws):
+            out = process_block(raw, ctx=ctx_seq, block_n=i + 1)
+            # Move the result to CPU so we can free the GPU ctx without
+            # losing the per-block reference for comparison.
+            outs_seq.append(
+                IntegrationOutput(
+                    gridded_minus_sky=out.gridded_minus_sky.detach().cpu(),
+                    rfi=out.rfi,
+                    n_tx=out.n_tx,
+                    block_n=out.block_n,
+                )
+            )
+        del ctx_seq, out
+        torch.cuda.empty_cache()
+
+        # Pipelined run on a fresh ctx (n_buffers=2 → 2-block latency)
+        ctx_pip = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
+        outs_pip = process_blocks_pipelined(
+            raws, ctx=ctx_pip, n_buffers=2, block_n_start=1,
+        )
+
+        assert len(outs_pip) == len(outs_seq) == n_blocks
+
+        for i in range(n_blocks):
+            seq = outs_seq[i]
+            pip = outs_pip[i]
+            assert pip.block_n == seq.block_n, (
+                f"block {i}: pipelined block_n={pip.block_n} != "
+                f"seq block_n={seq.block_n}"
+            )
+            assert pip.n_tx == seq.n_tx, (
+                f"block {i}: pipelined n_tx={pip.n_tx} != seq "
+                f"n_tx={seq.n_tx}"
+            )
+            assert pip.gridded_minus_sky.shape == seq.gridded_minus_sky.shape
+            assert pip.gridded_minus_sky.dtype == seq.gridded_minus_sky.dtype
+            # ULP-level equivalence: index_add_ atomic-add reduction
+            # order is non-deterministic across GPU stream contexts.
+            torch.testing.assert_close(
+                pip.gridded_minus_sky.cpu(),
+                seq.gridded_minus_sky,
+                rtol=1e-5, atol=1e-4,
+                msg=lambda m: (
+                    f"Phase-4 pipelined != Phase-3 sequential for "
+                    f"block {i}: {m}"
+                ),
+            )
+
+    def test_rejects_cpu_context(self) -> None:
+        cfg = _make_cfg()
+        ctx = _build_test_context(cfg)              # CPU context
+        with pytest.raises(ValueError, match="CUDA"):
+            BlockPipeliner(ctx)
+
+    def test_rejects_n_buffers_lt_2(self) -> None:
+        device = torch.device("cuda")
+        cfg = _make_cfg()
+        antpos_e, antpos_n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        ctx = build_context(
+            cfg, device=device,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=core_mask,
+        )
+        with pytest.raises(ValueError, match="n_buffers"):
+            BlockPipeliner(ctx, n_buffers=1)
+
+
+class TestRTPhase5DedispLayout:
+    """RT Phase 5: layout-aware fused gather + per-channel scatter is
+    numerically equivalent to the legacy uncoalesced gather +
+    ``gridder.compute`` scatter (Phase 2).
+
+    The new ``_dedisperse_one_window`` permutes ``vis_stokes_i`` to
+    ``(NCHAN_eff, n_fv, NBASE)`` so the per-(c, t') gather reads
+    ``NBASE`` contiguous bytes per memory transaction (vs the legacy
+    ``(T, B, C)`` layout's stride-NBASE*NCHAN_eff time access). The
+    scatter then runs as a per-channel ``index_add_`` into a fused
+    ``(T_chunk, n_filled+1, 2)`` fp32 buffer (using
+    :func:`torch.view_as_real`), eliminating the per-iteration
+    ``.real.contiguous() / .imag.contiguous()`` copies.
+
+    The atomic-add scatter work is unchanged — same source values,
+    same target cells — only regrouped by channel. On CPU the
+    per-channel reduction order differs from the legacy
+    flatten-then-scatter order, so we expect ULP-level (not
+    bit-identical) agreement even on the deterministic CPU backend.
+    On GPU the index_add is non-deterministic across kernel-launch
+    boundaries; same ULP tolerance applies.
+
+    Tested cases:
+
+    * ``test_layout_equals_legacy_cpu`` (single window, chan_sum=1)
+    * ``test_layout_equals_legacy_chan_sum_cpu`` (chan_sum=8 — the
+      production op-point's reduced-channel pipeline)
+    * ``test_layout_equals_legacy_gpu`` (CUDA-only; production op-
+      point at small n_grid for fast test runtime)
+    * ``test_layout_equals_legacy_through_sliding_window`` (full
+      F34 path: emit prev-block slice after a cold-start + a
+      block-1 push)
+    """
+
+    def _build_stage1_with_dm_plan(
+        self,
+        *,
+        chan_sum_factor: int = 1,
+        n_grid: int = 64,
+        n_coarse_dm: int = 4,
+        sliding_window: bool = False,
+        device: torch.device,
+    ) -> "Stage1MultiDMCoarseDM":
+        """Synthetic Stage1MultiDMCoarseDM with N_coarse_dm trials so
+        the dm_chunk_size loop iterates more than once (default
+        dm_chunk_size=2 ⇒ ceil(N/2) chunks).
+
+        Uses the same antpos / core-mask as the rest of the test
+        module so the gridder pattern matches across builders.
+        """
+        from dsart.coarse_dm.dm_plan import (
+            DMPlan,
+            build_chgroup_freq_table_GHz,
+            compute_delay_native_samples_table,
+        )
+        from dsart.grid.kernel import FastVisGridder
+        from dsart.grid.sparsity_pattern import build_pattern
+        from dsart.common.constants import T_INT_FAST_US_DEFAULT
+
+        e, n = _synth_antpos(seed=42)
+        core_mask = _build_core_baseline_mask(n_core=82)
+        pattern = build_pattern(
+            antpos_e=e, antpos_n=n,
+            chgroup=0, dec_deg=53.85, n_grid=n_grid,
+            kernel_support=1,
+            chan_sum_factor=chan_sum_factor,
+            is_core_baseline_mask=core_mask,
+        )
+        gridder = FastVisGridder.from_pattern(
+            pattern, e, n,
+            is_core_baseline_mask=core_mask,
+            device=device,
+        )
+        dm_pc_cc = np.linspace(0.0, 200.0, n_coarse_dm, dtype=np.float64)
+        chgroup_freqs = build_chgroup_freq_table_GHz()
+        table = compute_delay_native_samples_table(dm_pc_cc, chgroup_freqs)
+        plan = DMPlan(
+            dm_pc_cc=dm_pc_cc,
+            n_fine_per_coarse=1,
+            t_int_fast_us=float(T_INT_FAST_US_DEFAULT),
+            chgroup_freqs_GHz=chgroup_freqs,
+            _delay_native_samples_table=table,
+        )
+        return Stage1MultiDMCoarseDM(
+            plan=plan, gridder=gridder, chgroup=0,
+            sliding_window=sliding_window,
+        )
+
+    def _make_random_vis(
+        self,
+        *,
+        n_fv: int, nch: int, device: torch.device, seed: int,
+    ) -> torch.Tensor:
+        """Random Stokes-I vis tensor (n_fv, NBASE, nch) cfp32."""
+        from dsart.common.constants import NBASE
+        torch.manual_seed(seed)
+        vis = torch.complex(
+            torch.randn(n_fv, NBASE, nch),
+            torch.randn(n_fv, NBASE, nch),
+        )
+        return vis.to(device)
+
+    # Tolerances:
+    # The legacy path scatter-adds in flat (b * NCHAN_eff + c) order
+    # within each chunk; the new path scatter-adds per channel,
+    # accumulating contributions in a different order. For sums of
+    # ~10^3 - 10^5 unit-stddev values, fp32 reduction-order produces
+    # absolute differences on the order of 1e-4 to 1e-3. We pin
+    # rtol=1e-4 atol=1e-3 — large enough to absorb the reorder, small
+    # enough that any real algorithm bug (sign flip, off-by-one in
+    # bin shifts, wrong cell index) produces O(1)-scale failures.
+    _DEDISP_RTOL = 1e-4
+    _DEDISP_ATOL = 1e-3
+
+    @pytest.mark.parametrize(
+        "n_fv,n_coarse_dm",
+        [(64, 4), (96, 6), (128, 8)],
+    )
+    def test_layout_equals_legacy_cpu(
+        self, n_fv: int, n_coarse_dm: int,
+    ) -> None:
+        """Layout-aware path matches legacy on CPU at chan_sum_factor=1."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cpu")
+        stage1 = self._build_stage1_with_dm_plan(
+            chan_sum_factor=1, n_grid=64,
+            n_coarse_dm=n_coarse_dm, device=device,
+        )
+        vis = self._make_random_vis(
+            n_fv=n_fv, nch=NCHAN_PER_CHGROUP,
+            device=device, seed=20260507 + n_fv,
+        )
+        out_new = stage1._dedisperse_one_window(vis)
+        out_legacy = stage1._dedisperse_one_window_legacy(vis)
+        torch.testing.assert_close(
+            out_new, out_legacy,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
+            msg=lambda m: (
+                f"Phase-5 layout dedisp != legacy on CPU "
+                f"(n_fv={n_fv}, n_dm={n_coarse_dm}): {m}"
+            ),
+        )
+
+    def test_layout_equals_legacy_chan_sum_cpu(self) -> None:
+        """Layout path matches legacy at chan_sum_factor=8 (production)."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cpu")
+        stage1 = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, device=device,
+        )
+        nch_eff = NCHAN_PER_CHGROUP // 8
+        vis = self._make_random_vis(
+            n_fv=96, nch=nch_eff,
+            device=device, seed=20260507,
+        )
+        out_new = stage1._dedisperse_one_window(vis)
+        out_legacy = stage1._dedisperse_one_window_legacy(vis)
+        torch.testing.assert_close(
+            out_new, out_legacy,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
+            msg=lambda m: (
+                f"Phase-5 layout dedisp != legacy "
+                f"(chan_sum=8, CPU): {m}"
+            ),
+        )
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA-only",
+    )
+    def test_layout_equals_legacy_gpu(self) -> None:
+        """Layout path matches legacy on GPU at chan_sum=8 (production)."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cuda")
+        stage1 = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, device=device,
+        )
+        nch_eff = NCHAN_PER_CHGROUP // 8
+        vis = self._make_random_vis(
+            n_fv=96, nch=nch_eff,
+            device=device, seed=20260507,
+        )
+        out_new = stage1._dedisperse_one_window(vis)
+        out_legacy = stage1._dedisperse_one_window_legacy(vis)
+        torch.testing.assert_close(
+            out_new.cpu(), out_legacy.cpu(),
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
+            msg=lambda m: (
+                f"Phase-5 layout dedisp != legacy on GPU: {m}"
+            ),
+        )
+
+    def test_layout_equals_legacy_through_sliding_window(self) -> None:
+        """Full F34 sliding-window path: emit prev-block slice after
+        cold-start + push, layout-aware vs legacy must agree."""
+        from dsart.common.constants import NCHAN_PER_CHGROUP
+        device = torch.device("cpu")
+
+        # Build TWO independent stage1 instances with identical config so
+        # the sliding-window state evolves the same for both — but one
+        # uses the new dedisp path, the other monkey-patched to the legacy.
+        stage1_new = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, sliding_window=True, device=device,
+        )
+        stage1_legacy = self._build_stage1_with_dm_plan(
+            chan_sum_factor=8, n_grid=64,
+            n_coarse_dm=4, sliding_window=True, device=device,
+        )
+        # Force stage1_legacy to use the legacy inner call so all of
+        # dedisperse_from_vis (cat / clone / slice) runs identically.
+        stage1_legacy._dedisperse_one_window = (
+            stage1_legacy._dedisperse_one_window_legacy
+        )
+
+        nch_eff = NCHAN_PER_CHGROUP // 8
+        n_fv = 64
+        vis_0 = self._make_random_vis(
+            n_fv=n_fv, nch=nch_eff, device=device, seed=20260507,
+        )
+        vis_1 = self._make_random_vis(
+            n_fv=n_fv, nch=nch_eff, device=device, seed=20260508,
+        )
+        # Cold start: both should emit zeros.
+        z_new = stage1_new.dedisperse_from_vis(vis_0, block_n=0)
+        z_legacy = stage1_legacy.dedisperse_from_vis(vis_0, block_n=0)
+        assert torch.all(z_new == 0)
+        assert torch.all(z_legacy == 0)
+        # Block 1: emits dedispersed slice corresponding to block 0.
+        out_new = stage1_new.dedisperse_from_vis(vis_1, block_n=1)
+        out_legacy = stage1_legacy.dedisperse_from_vis(vis_1, block_n=1)
+        torch.testing.assert_close(
+            out_new, out_legacy,
+            rtol=self._DEDISP_RTOL, atol=self._DEDISP_ATOL,
+            msg=lambda m: (
+                f"Phase-5 sliding-window emit != legacy: {m}"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,7 @@ def apply_stage1_shifts(
     chgroup: int,
     dm_idx: int,
     t_dedisp: int | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply per-channel forward integer-bin time shifts to a vis tensor.
 
@@ -189,15 +190,21 @@ def apply_stage1_shifts(
 
     Notes
     -----
-    - **Coalesced slice-copy**: channels with the same bin shift are
-      copied in a single ``out[:, :, ch_t] = vis[s:s+t_dedisp, :, ch_t]``
-      call, not one per channel. At native NCHAN=384 with low DMs this
-      collapses to O(t_dedisp) unique shifts → ~10× fewer kernel
-      launches than a per-channel loop.
-    - **No re-allocation**: the output tensor is allocated once and
-      filled in-place via slice assignment. Total alloc traffic per
-      call is ``T_dedisp * NBASE * NCHAN * sizeof(complex)`` — for
-      the production op-point ~9 MB.
+    - **Single-launch gather (real-time perf Phase 1)**: builds a
+      ``(t_dedisp, 1, NCHAN_v)`` int64 time-index tensor whose entry
+      ``[t, 0, c]`` is ``t + bin_shifts[c]``, expands the NBASE dim
+      with stride 0 (no copy), and runs a single ``vis.gather(0, ...)``
+      to materialise the shifted output. One CUDA-kernel launch per
+      call, no Python loop over per-shift-group ``index_select`` /
+      ``index_copy_`` ops. The previous per-shift-group form did
+      O(unique_shifts) small ops and was launch-overhead-bound on a
+      2080 Ti at the production op-point (96 ms/call observed vs
+      ~10 ms/call expected at peak DRAM bandwidth — see
+      ``bench/profile_fast_path_K1.py`` baseline).
+    - **No re-allocation**: ``torch.gather`` allocates the output
+      once. Total alloc traffic per call is
+      ``t_dedisp * NBASE * NCHAN * sizeof(complex)`` — for the
+      production op-point ~900 MB at NCHAN=48 (chan-summed).
     - **F24 pin**: bin shifts come from
       ``plan.delay_bins_per_chgroup(chgroup)`` which rounds the
       stored NATIVE-sample delay table to bins via
@@ -262,30 +269,35 @@ def apply_stage1_shifts(
             )
 
     # ------------------------------------------------------------------
-    # Allocate output + group channels by shift (coalesced slice-copy)
+    # Single-launch gather along the time axis. The index has shape
+    # (t_dedisp, 1, NCHAN_v) and is broadcast (stride=0) along the NBASE
+    # dim — torch.gather(0, ...) accepts arbitrary input/index strides
+    # so no materialisation of a (t_dedisp, NBASE, NCHAN_v) int64 tensor
+    # (~13 GB at the production op-point) is required.
     # ------------------------------------------------------------------
-    out = torch.empty(
-        (t_dedisp, n_base_v, n_chan_v),
-        dtype=vis.dtype, device=vis.device,
-    )
-
-    unique_shifts, inverse = np.unique(bin_shifts, return_inverse=True)
-    for s_i, s in enumerate(unique_shifts.tolist()):
-        ch_in_group = np.where(inverse == s_i)[0]
-        if ch_in_group.size == 0:
-            continue
-        s_int = int(s)
-        # Single coalesced copy for all channels sharing this shift
-        if ch_in_group.size == 1:
-            ch = int(ch_in_group[0])
-            out[:, :, ch] = vis[s_int:s_int + t_dedisp, :, ch]
-        else:
-            ch_t = torch.from_numpy(ch_in_group).to(
-                device=vis.device, dtype=torch.int64,
-            )
-            out.index_copy_(
-                2, ch_t,
-                vis[s_int:s_int + t_dedisp].index_select(2, ch_t),
-            )
-
-    return out
+    bin_shifts_t = torch.as_tensor(
+        bin_shifts, dtype=torch.int64, device=vis.device,
+    )                                                                 # (NCHAN_v,)
+    t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=vis.device)
+    # (t_dedisp, 1, NCHAN_v) — broadcast across NBASE on the gather call
+    t_idx = (t_arange[:, None, None] + bin_shifts_t[None, None, :])
+    t_idx_b = t_idx.expand(t_dedisp, n_base_v, n_chan_v)
+    if out is None:
+        return vis.gather(0, t_idx_b)
+    # In-place gather into a pre-allocated buffer (RT Phase 2: lets the
+    # multi-DM dedisperser stack chunks of DM trials into one big
+    # gridder.compute call without an extra 1.6 GB/DM copy).
+    if out.shape != (t_dedisp, n_base_v, n_chan_v):
+        raise ValueError(
+            f"out shape {tuple(out.shape)} != "
+            f"({t_dedisp}, {n_base_v}, {n_chan_v})"
+        )
+    if out.dtype != vis.dtype:
+        raise TypeError(
+            f"out dtype {out.dtype} != vis dtype {vis.dtype}"
+        )
+    if out.device != vis.device:
+        raise ValueError(
+            f"out device {out.device} != vis device {vis.device}"
+        )
+    return torch.gather(vis, 0, t_idx_b, out=out)

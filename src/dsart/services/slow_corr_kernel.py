@@ -122,6 +122,7 @@ from dsart.common.constants import (
     NCHAN_PER_CHGROUP,
     NPOL,
 )
+from dsart.services.host_pin import maybe_register_host_buffer
 
 
 # --- module-level constants (echoed for explicit binding in this file) ----
@@ -276,7 +277,65 @@ def unpack_int4_split(
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device(f"cuda:{torch.cuda.current_device()}")
 
+    # Mirror bfCorr's `dada_cuda_dbregister` (dsaX_bfCorr.cu lines 92-121):
+    # register the host buffer with CUDA so the H2D below uses the
+    # pinned-memory fast path (~12 GB/s) instead of the pageable path
+    # (~4-5 GB/s through an internal staging buffer). Idempotent — only
+    # the first encounter of each PSRDADA buffer page pays the
+    # cudaHostRegister cost; thereafter it's a dict lookup. Skipped for
+    # CPU device (no GPU H2D) and for non-numpy inputs that don't expose
+    # a stable host pointer (e.g. raw bytes from tests). Diagnostic-only:
+    # registration failure is non-fatal — H2D falls back to pageable.
+    if dev.type == "cuda":
+        maybe_register_host_buffer(raw_arr)
+
+    # ---- H2D copy (always needed first) ----
+    # Always materialise as a flat (1D) C-contiguous tensor so any
+    # downstream view operation works regardless of how the caller shaped
+    # raw_arr (tests pass 5D _FADA_VOLT_SHAPE arrays; the production
+    # reader passes 1D bytes from psrdada).
+    raw_t = torch.as_tensor(
+        raw_arr.reshape(-1) if raw_arr.ndim != 1 else raw_arr,
+        device=dev,
+    )                                                          # uint8 (288 MB), flat
+
+    # ---- Stage 1+2+3 FUSED (RT Phase 14): single Triton kernel
+    # straight from on-wire bytes to fp16 GEMM layout ----
+    # When the device is CUDA and the output dtype is fp16, hand off
+    # to ``triton_unpack_onwire.fused_int4_unpack_onwire_triton`` which
+    # collapses the entire post-H2D chain (Stage 1 fp32-reinterpret 2D
+    # transpose + Stage 2 byte permute + Stage 3 int4 ASR fluff +
+    # scale + fp16 cast) into one kernel pass. Reads on-wire fp32
+    # cells (each = 4 bytes = (2t, 2p) cube for one (pkt, ant, ch)),
+    # bit-decomposes to 4 bytes per cell, fluffs each, and writes 8
+    # fp16 outputs per byte read.
+    #
+    # Microbench at the production op-point measured: post-H2D
+    # 28 -> 8 ms (~20 ms / block saved on the fast-correlator unpack).
+    # Bit-identical to the Phase 12 reference path (4-op PyTorch chain
+    # after the cuBLAS fp32 transpose).
+    #
+    # CPU and non-fp16 paths fall back to the legacy chain below.
+    if dev.type == "cuda" and out_dtype == torch.float16:
+        from dsart.services.triton_unpack_onwire import (  # noqa: PLC0415
+            fused_int4_unpack_onwire_triton,
+        )
+        real, imag = fused_int4_unpack_onwire_triton(
+            raw_t,
+            NPACKETS=NPACKETS_PER_BLOCK,
+            NANTS=NANTS,
+            NCHAN=NCHAN_PER_CHGROUP,
+            NTIMES=NTIMES_PER_PACKET,
+            NPOL=NPOL,
+            scale=float(scale),
+            out_dtype=out_dtype,
+        )
+        del raw_t
+        return real, imag
+
     # ---- Stage 1: fp32-reinterpret 2D transpose (~25 ms for 302 MB) ----
+    # (Legacy CPU / non-fp16 path; CUDA fp16 takes the Phase 14 fast
+    # path above.)
     # The fada layout has stride 4 bytes for NCHAN and strides 2, 1 for
     # (2t, 2p), so each 4 consecutive bytes form one (ch, all 2t, all 2p)
     # cube for a fixed (pkt, ant). Viewing 4 bytes as one fp32 cell lets
@@ -289,14 +348,6 @@ def unpack_int4_split(
     # win in the slow correlator. The byte transpose primitive PyTorch
     # ships isn't tiled like bfCorr's hand-written `transpose_matrix_char`;
     # the fp32 reinterpret tricks it into using the tuned path.
-    # Always materialise as a flat (1D) C-contiguous tensor so the fp32
-    # reinterpret below works regardless of how the caller shaped raw_arr
-    # (tests pass 5D _FADA_VOLT_SHAPE arrays; the production reader passes
-    # 1D bytes from psrdada).
-    raw_t = torch.as_tensor(
-        raw_arr.reshape(-1) if raw_arr.ndim != 1 else raw_arr,
-        device=dev,
-    )                                                          # uint8 (288 MB), flat
 
     # View raw bytes as 2D fp32: (NPACKETS*NANTS, NCHAN) where each
     # fp32 = 4 bytes = (2t, 2p) cube for one (ch, pkt, ant).
@@ -315,6 +366,13 @@ def unpack_int4_split(
         NTIMES_PER_PACKET, NPOL,
     )
     del fp32_2d, fp32_T, raw_t
+
+    # NOTE: the Phase-12 Triton fluff fast-path that used to live here
+    # (post-Stage-1 transpose) is superseded by Phase 14
+    # (``triton_unpack_onwire.fused_int4_unpack_onwire_triton``) which
+    # is dispatched at the top of this function for CUDA + fp16 — i.e.
+    # the only case Phase 12 ever ran. The Phase 12 module
+    # ``triton_unpack.py`` is kept for the microbench harnesses.
 
     # ---- Stage 2: byte-permute to GEMM layout (~2 ms post-fp32-transpose) ----
     # Permute (NCHAN, NPACKETS, NANTS, 2t, 2p) → (NCHAN, 2t, 2p, NPACKETS, NANTS).

@@ -205,20 +205,32 @@ def test_full_block_equals_slow_corr_kernel() -> None:
     diff = vis_fast[0] - vis_slow                              # (NBASE, NCHAN, BADA_NPOL) cfp32
     max_real = float(torch.max(torch.abs(diff.real)).item())
     max_imag = float(torch.max(torch.abs(diff.imag)).item())
-    # Both kernels do the same fp16 matmul on the same tensors → cast
-    # to fp32 → upper-tri gather. Should agree exactly (deterministic
-    # CPU matmul). Allow 1e-5 absolute as a tolerance for any ordering
-    # differences in the t_sub vs ppfv reduction order. (For the M3
-    # production test on GPU this tolerance may need to grow to 1e-2;
-    # CPU here gives us the sharpest comparison.)
-    assert max_real < 1e-5, (
+    max_mag_real = float(torch.max(torch.abs(vis_slow.real)).item())
+    max_mag_imag = float(torch.max(torch.abs(vis_slow.imag)).item())
+    # Slow kernel:  K=NPACKETS_PER_BLOCK=2048 GEMM, t_sub as batch
+    #               axis, sum over t_sub in fp16 then cast fp32.
+    # Fast (RT P6): K=2t*ppfv=4096 (t_sub folded into K) — single
+    #               GEMM with HMMA fp32 accumulator absorbs the t_sub
+    #               sum, then in-place add of I^T @ I in fp16.
+    #
+    # Both paths do ~3 fp16 truncations on the way to fp32, but at
+    # different points in the reduction tree, so output cells differ
+    # by O(few) fp16 ULPs. At fp16 magnitude M the ULP is M·2^-10,
+    # so the right yard-stick is a *relative* tolerance pegged to a
+    # few fp16 ULPs (we use 1e-3 ≈ 1 fp16 ULP).
+    rel_real = max_real / max(max_mag_real, 1.0)
+    rel_imag = max_imag / max(max_mag_imag, 1.0)
+    assert rel_real < 1e-3, (
         f"FastCorrKernel(t_int=N_TIME_SAMPLES) vs SlowCorrKernel: "
-        f"max real diff = {max_real:.3e}; expected ≤ 1e-5. "
-        f"FastCorrKernel does NOT reduce to SlowCorrKernel at the boundary."
+        f"max real diff = {max_real:.3e} (relative {rel_real:.2e} of "
+        f"|vis|_max = {max_mag_real:.3e}); expected rel < 1e-3 "
+        f"(few fp16 ULPs)."
     )
-    assert max_imag < 1e-5, (
+    assert rel_imag < 1e-3, (
         f"FastCorrKernel(t_int=N_TIME_SAMPLES) vs SlowCorrKernel: "
-        f"max imag diff = {max_imag:.3e}; expected ≤ 1e-5."
+        f"max imag diff = {max_imag:.3e} (relative {rel_imag:.2e} of "
+        f"|vis|_max = {max_mag_imag:.3e}); expected rel < 1e-3 "
+        f"(few fp16 ULPs)."
     )
 
 
@@ -561,3 +573,96 @@ class TestZeroV4Helper:
         v = torch.zeros((4, 100, 384, 2), dtype=torch.complex64)
         with pytest.raises(ValueError, match="last dim = 4"):
             zero_v4_cells(v)
+
+
+# ---------------------------------------------------------------------------
+# RT Phase 3: fused Stokes-I + chan-sum compute_split
+# ---------------------------------------------------------------------------
+
+
+class TestComputeSplitFusedStokesI:
+    """RT Phase 3: ``fuse_stokes_i=True`` collapses the BADA pol axis
+    (and optionally the chan_sum_factor adjacent fine channels) directly
+    inside ``_compute_one_slab`` Stage 6, before assembling the cfp32
+    output. The fused output must equal the legacy two-step path:
+
+        legacy = stokes_i_pol_sum(compute_split(r, i)) [.reshape().sum()]
+
+    On CPU (deterministic matmul + deterministic reduction order in the
+    pol-sum / chan-sum), the fused output is bit-identical to the legacy
+    two-step output: both perform the same fp32 add of the two pol
+    channels, then (for K>1) the same fp32 reduction across the
+    chan_sum_factor adjacent channels.
+    """
+
+    @pytest.mark.parametrize(
+        ("n_packets_in", "t_int", "n_fv_chunk", "chan_sum_factor"),
+        [
+            (16, 8, None, 1),         # 4 fv tiles, K=1, default chunk
+            (16, 8, 2, 1),            # F31a chunked, K=1
+            (16, 8, None, 2),         # K=2 chan-sum
+            (16, 8, None, 8),         # K=8 — the production op-point
+            (16, 8, 1, 8),            # F31a chunk-of-1 + K=8
+            (32, 8, 4, 8),            # 8 fv tiles, F31a=4 + K=8
+            (32, 32, None, 8),        # 2 fv tiles (burst test cadence)
+        ],
+    )
+    def test_fused_equals_legacy_two_step(
+        self, n_packets_in, t_int, n_fv_chunk, chan_sum_factor,
+    ) -> None:
+        r, i = _random_fp16_voltages(n_packets_in)
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=t_int,
+        )
+        # Legacy two-step: compute_split → stokes_i_pol_sum → optional chan-sum
+        vis_2pol = kernel.compute_split(r, i, n_fv_chunk=n_fv_chunk)
+        legacy = stokes_i_pol_sum(vis_2pol)
+        if chan_sum_factor > 1:
+            n_fv = legacy.shape[0]
+            nbase = legacy.shape[1]
+            nchan_eff = NCHAN_PER_CHGROUP // chan_sum_factor
+            legacy = legacy.reshape(
+                n_fv, nbase, nchan_eff, chan_sum_factor,
+            ).sum(dim=-1)
+
+        # Fused Phase-3 one-step path
+        fused = kernel.compute_split(
+            r, i,
+            n_fv_chunk=n_fv_chunk,
+            fuse_stokes_i=True,
+            chan_sum_factor=chan_sum_factor,
+        )
+
+        assert fused.shape == legacy.shape
+        assert fused.dtype == legacy.dtype
+        torch.testing.assert_close(
+            fused, legacy,
+            rtol=0, atol=0,
+            msg=lambda m: f"fused != legacy two-step: {m}",
+        )
+
+    def test_fused_matches_unfused_when_K_is_1(self) -> None:
+        """K=1 (no chan-sum) is just a pol-sum; equivalent to the helper."""
+        r, i = _random_fp16_voltages(16)
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=8,
+        )
+        vis_2pol = kernel.compute_split(r, i)
+        legacy = stokes_i_pol_sum(vis_2pol)
+        fused = kernel.compute_split(r, i, fuse_stokes_i=True)
+        assert fused.shape == legacy.shape
+        torch.testing.assert_close(fused, legacy, rtol=0, atol=0)
+
+    def test_rejects_chan_sum_factor_not_dividing_nchan(self) -> None:
+        r, i = _random_fp16_voltages(16)
+        kernel = FastCorrKernel(
+            device=torch.device("cpu"),
+            t_int_fast_native=8,
+        )
+        # 384 % 7 != 0
+        with pytest.raises(ValueError, match="chan_sum_factor"):
+            kernel.compute_split(
+                r, i, fuse_stokes_i=True, chan_sum_factor=7,
+            )

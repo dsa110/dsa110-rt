@@ -153,6 +153,7 @@ import torch
 from dsart.common.constants import (
     BADA_NPOL,
     NANTS,
+    NBASE,
     NCHAN_PER_CHGROUP,
     NPOL,
     T_INT_FAST_NATIVE,
@@ -366,6 +367,8 @@ class FastCorrKernel:
         imag_v: torch.Tensor,
         *,
         n_fv_chunk: int | None = None,
+        fuse_stokes_i: bool = False,
+        chan_sum_factor: int = 1,
     ) -> torch.Tensor:
         """Correlate one block, emitting ``n_fast_vis`` independent tiles.
 
@@ -435,6 +438,31 @@ class FastCorrKernel:
                 f"[1, n_fv_total={n_fast_vis}]"
             )
 
+        # ---- RT Phase 3: fused Stokes-I + chan-sum output ---------------
+        # When ``fuse_stokes_i`` is set, ``_compute_one_slab`` collapses
+        # the BADA-pol axis to Stokes I and (if ``chan_sum_factor > 1``)
+        # collapses each ``chan_sum_factor``-block of fine channels to
+        # one summed channel inside Stage 6, so the per-slab return is
+        # ``(n_fv_slab, NBASE, NCHAN_eff)`` cfp32 instead of the
+        # ``(n_fv_slab, NBASE, NCHAN, 2)`` cfp32 vis_2pol cube. At the
+        # production op-point (NCHAN=384, NPOL=2, chan_sum_factor=8)
+        # this drops the per-slab output transient from ~28.6 MB/fv to
+        # ~1.8 MB/fv (16× reduction), letting the F31b OUTER chunking
+        # in process_block be eliminated entirely.
+        if fuse_stokes_i:
+            if chan_sum_factor < 1 or self.nchan % chan_sum_factor != 0:
+                raise ValueError(
+                    f"chan_sum_factor={chan_sum_factor} must be ≥ 1 "
+                    f"and divide nchan={self.nchan}"
+                )
+            nchan_eff = self.nchan // chan_sum_factor
+            out_full = torch.empty(
+                (n_fast_vis, NBASE, nchan_eff),
+                dtype=torch.complex64, device=self.device,
+            )
+        else:
+            out_full = None
+
         # ---- F31a: slice n_packets_in into n_fv_chunk slabs ----
         # Each slab covers exactly `n_fv_slab` consecutive fast-vis
         # tiles, i.e. `n_fv_slab * packets_per_fast_vis` packets.
@@ -454,13 +482,20 @@ class FastCorrKernel:
                 real_slab, imag_slab,
                 n_fv_slab=n_fv_slab,
                 packets_per_fast_vis=packets_per_fast_vis,
+                fuse_stokes_i=fuse_stokes_i,
+                chan_sum_factor=chan_sum_factor,
             )
-            out_chunks.append(vis_slab)
+            if fuse_stokes_i:
+                out_full[fv0:fv1] = vis_slab
+            else:
+                out_chunks.append(vis_slab)
             # Drop slab refs eagerly so PyTorch's allocator can reuse
             # the workspace for the next slab. Critical on the 2080Ti;
             # harmless on CPU.
             del real_slab, imag_slab, vis_slab
 
+        if fuse_stokes_i:
+            return out_full
         return torch.cat(out_chunks, dim=0)
 
     def _auto_n_fv_chunk(self, n_fv_total: int) -> int:
@@ -499,6 +534,8 @@ class FastCorrKernel:
         *,
         n_fv_slab: int,
         packets_per_fast_vis: int,
+        fuse_stokes_i: bool = False,
+        chan_sum_factor: int = 1,
     ) -> torch.Tensor:
         """Compute fast-vis output for one F31a slab of ``n_fv_slab`` tiles.
 
@@ -507,14 +544,44 @@ class FastCorrKernel:
         n_fv_slab * packets_per_fast_vis, nants)`` (i.e. a
         ``[:, :, :, p0:p1, :].contiguous()`` view of the full block
         voltages). Returns a slab of fast visibilities of shape
-        ``(n_fv_slab, NBASE, NCHAN, BADA_NPOL)`` cfp32.
+        ``(n_fv_slab, NBASE, NCHAN, BADA_NPOL)`` cfp32 (legacy 2-pol
+        path) or ``(n_fv_slab, NBASE, NCHAN_eff)`` cfp32 (fused
+        Stokes-I + chan-sum path).
 
-        This is the per-slab body of the un-chunked kernel; chunking
-        on the leading n_fast_vis axis is purely a memory-budget
-        transform (each slab feeds the same per-batch fp16 matmul
-        inputs as a monolithic call would), so concatenating slab
-        outputs reproduces the un-chunked result bit-identically on
-        deterministic backends.
+        RT Phase 6 — fold t_sub into K + delay fp32 cast until after
+        upper-triangle gather:
+
+          * **Stage 2/3 (was: ppfv-K, t_sub-as-batch-axis)** —
+            ``2t * ppfv`` is folded into the GEMM K-dim. Stage 2's
+            permute is ``(3, 0, 2, 1, 4, 5)`` instead of
+            ``(3, 0, 1, 2, 4, 5)`` so that ``2t`` and ``ppfv`` end up
+            adjacent and can be ``.view``-folded into K. The post-fold
+            K is ``2t * ppfv = 8`` (vs 4 before) — better for the 2080
+            Ti's tensor cores (still under the K=16 sweet spot but a
+            real step up from K=4).
+          * **Stage 4 (4 fp16 GEMMs, half the output volume)** — the
+            GEMM accumulator now carries the t_sub sum natively, so
+            the 4-matmul output is ``(B*NCHAN*nvolt_pol, NANTS,
+            NANTS)`` fp16 — *half* the elements of the legacy
+            ``(B*NCHAN*2t*nvolt_pol, NANTS, NANTS)``.
+          * **Stage 5 (now just nbada_pol slice + cast deferred)** —
+            no t_sub sum needed (already in the GEMM). The fp32 cast
+            is *deferred* to after the upper-triangle gather, where
+            the tensor is 50× smaller (``NBASE`` instead of
+            ``NANTS²`` per (ch, pol) row).
+          * **Stage 6 (gather while fp16 → small cast → reductions)**
+            — upper-tri gather is performed on the fp16 cube,
+            shrinking ``(fv, NCHAN, npol, 96, 96)`` → ``(fv, NCHAN,
+            npol, NBASE)``. The fp32 cast is a single 50-MB-class
+            allocation per real/imag, after which Stokes-I sum,
+            chan-sum, and the final permute fall through to
+            ``torch.complex``.
+
+        Numerical equivalence with the legacy path is bit-identical
+        on CPU (the GEMM and cast are deterministic; folding K
+        merely re-orders the t_sub fp32 reduction into the
+        accumulator) and ULP-tolerant on GPU (HMMA fp32-accumulator
+        order is non-deterministic across kernel-launch boundaries).
         """
         # ---- Stage 1: reshape n_packets_in into (n_fv_slab, ppfv) ----
         # Layout: (NCHAN, 2t, 2p, n_fv_slab, ppfv, NANTS) — pure view.
@@ -527,63 +594,153 @@ class FastCorrKernel:
             n_fv_slab, packets_per_fast_vis, self.nants,
         )
 
-        # ---- Stage 2: move n_fv_slab to leading dim ----
-        # New layout: (n_fv_slab, NCHAN, 2t, 2p, ppfv, NANTS).
-        # `permute` returns a non-contiguous view; `.contiguous()`
-        # materialises it once so downstream `.reshape` calls don't
-        # incur per-call layout copies.
-        R6 = R5.permute(3, 0, 1, 2, 4, 5).contiguous()
-        I6 = I5.permute(3, 0, 1, 2, 4, 5).contiguous()
+        # ---- Stage 2: move n_fv_slab to leading + arrange (2p, 2t, ppfv) ----
+        # New layout: (n_fv_slab, NCHAN, 2p, 2t, ppfv, NANTS) so that
+        # the (2t, ppfv) pair is adjacent and can be view-folded into
+        # the GEMM K-dim in Stage 3 below.
+        R6 = R5.permute(3, 0, 2, 1, 4, 5).contiguous()
+        I6 = I5.permute(3, 0, 2, 1, 4, 5).contiguous()
         del R5, I5
 
-        # ---- Stage 3: flatten leading dims into batched matmul ----
-        # (n_fv_slab * NCHAN * 2t * 2p, ppfv, NANTS).
-        new_batch = n_fv_slab * self.nchan * NTIMES_PER_PACKET * self.nvolt_pol
-        R = R6.reshape(new_batch, packets_per_fast_vis, self.nants)  # fp16 view
-        I = I6.reshape(new_batch, packets_per_fast_vis, self.nants)
+        # ---- Stage 3: fold (2t * ppfv) into K → batched matmul shape ----
+        # (n_fv_slab * NCHAN * 2p, 2t * ppfv, NANTS).
+        K_combined = NTIMES_PER_PACKET * packets_per_fast_vis
+        new_batch = n_fv_slab * self.nchan * self.nvolt_pol
+        R = R6.reshape(new_batch, K_combined, self.nants)             # fp16 view
+        I = I6.reshape(new_batch, K_combined, self.nants)
         del R6, I6
 
-        # ---- Stage 4: the 4 batched fp16 matmuls (same as SlowCorrKernel) ----
-        # Per batch: V_real = R^T @ R + I^T @ I,
-        #            V_imag = R^T @ I - I^T @ R.
-        # (batch, ppfv, NANTS).T @ (batch, ppfv, NANTS) → (batch, NANTS, NANTS).
-        R_T = R.transpose(-1, -2)                                # (batch, NANTS, ppfv)
-        I_T = I.transpose(-1, -2)
-        V_real = torch.matmul(R_T, R)                            # fp16 (batch, 96, 96)
-        V_real = V_real.add_(torch.matmul(I_T, I))               # in-place fp16
-        V_imag = torch.matmul(R_T, I)
-        V_imag = V_imag.sub_(torch.matmul(I_T, R))
-        del R, I, R_T, I_T
+        # ---- Stage 4: the 2 batched fp16 matmuls (RT Phase 8: K-stacked) ----
+        # Replaces the legacy 4 GEMMs + 2 element-wise add_/sub_ with
+        # 2 GEMMs of doubled K, eliminating the post-GEMM fp16
+        # element-wise adds (which dominated Stage 4 at ~5 ms / slab,
+        # 47 % of stage time). The s1688 HMMA tile is 16x16x16, so
+        # doubling K from 8 → 16 also doubles the per-tile useful
+        # work (K=8 was wasting half the K-tile dim).
+        #
+        # Construction:
+        #   A_re   = [R; I]   along K  → (batch, 2*K, NANTS)
+        #   A_im_b = [I; -R]  along K  → (batch, 2*K, NANTS)
+        #
+        # Then:
+        #   V_real = A_re^T   @ A_re   = R^T@R + I^T@I        ✓
+        #   V_imag = A_re^T   @ A_im_b = R^T@I + I^T@(-R)      = R^T@I - I^T@R ✓
+        #
+        # Output volume HALVES vs the alt "(2K, 2N)" stacking that
+        # would write a (batch, 192, 192) tensor — we keep the
+        # same (batch, 96, 96) per-output footprint.
+        #
+        # Production op-point speedup measured on h01 2080 Ti:
+        # 10.59 → 3.18 ms / slab (3.33×), 1.27 → 4.56 TFLOPS fp16-TC.
+        A_re   = torch.cat([R,  I], dim=1)                         # (batch, 2K, NANTS)
+        A_im_b = torch.cat([I, -R], dim=1)                         # (batch, 2K, NANTS)
+        del R, I
 
-        # ---- Stage 5: sum over t_sub (axis 2 in the 6D view), cast to fp32 ----
-        # batch dim = n_fv_slab * NCHAN * 2t * 2p. Reshape and sum the 2t axis.
-        V_real_6d = V_real.view(
-            n_fv_slab, self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
+        # ---- Stage 4+5+6 FUSED (RT Phase 11): single Triton HMMA kernel
+        # ----------------------------------------------------------------
+        # When all preconditions for the fast path are met, hand off to
+        # ``triton_corr_fused.fused_corr_post_triton`` which performs
+        # Stages 4 (2 stacked-K HMMA GEMMs) + 5 (slice) + 6 (upper-tri
+        # gather + fp32 cast + Stokes-I + chan-sum + permute + complex)
+        # in ONE kernel — never materialising the (B, 96, 96) fp16 V
+        # cube to global memory. Microbench at the production op-point
+        # measured: 13.50 → 3.71 ms / slab (3.64×, ~157 ms / block
+        # saved). End-to-end win validated downstream by the integration
+        # tests + the production-shaped psrdada bench.
+        #
+        # Requirements (validated below):
+        #   * CUDA tensors (Triton requires GPU)
+        #   * fuse_stokes_i path (kernel always sums pols + chans)
+        #   * nbada_pol == nvolt_pol (kernel always sums all pols
+        #     in the (CSF * NVP) inner loop). Production = 2 == 2 ✓.
+        #   * NCHAN divisible by chan_sum_factor (kernel pre-sums
+        #     CSF chans per output). Production = 384 / 8 ✓.
+        # CPU fallback retains the Phase-8 PyTorch path verbatim.
+        if (
+            fuse_stokes_i
+            and A_re.device.type == "cuda"
+            and self.nbada_pol == self.nvolt_pol
+            and self.nchan % chan_sum_factor == 0
+            # Triton tl.dot on Turing (sm_75) requires K ≥ 16 for fp16
+            # HMMA. Stacked-K = 2 * K_combined = 2 * NTIMES_PER_PACKET *
+            # packets_per_fast_vis. Production op-point K=16 (t_int=8)
+            # is OK; t_int=4 would give K=8 — fall back to PyTorch.
+            and A_re.shape[1] >= 16
+        ):
+            from dsart.services.triton_corr_fused import (  # noqa: PLC0415
+                fused_corr_post_triton,
+            )
+            nchan_eff = self.nchan // chan_sum_factor
+            out_re, out_im = fused_corr_post_triton(
+                A_re.contiguous(), A_im_b.contiguous(),
+                n_fv=n_fv_slab,
+                nchan=self.nchan,
+                nchan_eff=nchan_eff,
+                nvp=self.nvolt_pol,
+                csf=chan_sum_factor,
+                nbase=NBASE,
+            )
+            del A_re, A_im_b
+            return torch.complex(out_re, out_im)              # (fv, NBASE, NCHAN_eff) cfp32
+
+        V_real = torch.matmul(A_re.transpose(-1, -2), A_re)        # fp16 (batch, 96, 96)
+        V_imag = torch.matmul(A_re.transpose(-1, -2), A_im_b)      # fp16 (batch, 96, 96)
+        del A_re, A_im_b
+
+        # ---- Stage 5: nbada_pol slice (no t_sub sum needed) ----
+        # batch dim = n_fv_slab * NCHAN * nvolt_pol. View as 5D.
+        V_real_5d = V_real.view(
+            n_fv_slab, self.nchan, self.nvolt_pol,
+            self.nants, self.nants,
+        )                                                          # (fv, ch, 2p, 96, 96) fp16
+        V_imag_5d = V_imag.view(
+            n_fv_slab, self.nchan, self.nvolt_pol,
             self.nants, self.nants,
         )
-        V_imag_6d = V_imag.view(
-            n_fv_slab, self.nchan, NTIMES_PER_PACKET, self.nvolt_pol,
-            self.nants, self.nants,
-        )
-        # Sum over t_sub → (n_fv_slab, NCHAN, nvolt_pol, NANTS, NANTS).
-        V_real = V_real_6d.sum(dim=2).to(self.accum_dtype)
-        V_imag = V_imag_6d.sum(dim=2).to(self.accum_dtype)
-        del V_real_6d, V_imag_6d
+        V_real_b = V_real_5d[:, :, : self.nbada_pol, :, :]         # (fv, ch, npol, 96, 96) fp16
+        V_imag_b = V_imag_5d[:, :, : self.nbada_pol, :, :]
 
-        # Restrict to bada-output pol count (parallel-hands by default).
-        V_real_b = V_real[:, :, : self.nbada_pol, :, :]          # (fv, ch, npol, 96, 96)
-        V_imag_b = V_imag[:, :, : self.nbada_pol, :, :]
+        # ---- Stage 6: upper-triangle gather (still fp16!) → cast → reductions ----
+        # The fp16 gather output is 50× smaller than the (96, 96) fp16
+        # cube it came from, so the subsequent fp32 cast operates on
+        # a much smaller tensor. Same b/a index swap as SlowCorrKernel.
+        vis_real_fp16 = V_real_b[..., self._b_idx, self._a_idx]    # (fv, ch, npol, NBASE) fp16
+        vis_imag_fp16 = V_imag_b[..., self._b_idx, self._a_idx]
+        del V_real, V_imag, V_real_5d, V_imag_5d, V_real_b, V_imag_b
 
-        # ---- Stage 6: upper-triangle gather + complex assemble ----
-        # Same b/a index swap as SlowCorrKernel (see its docstring for
-        # the long F18 explanation). vis[fv, bls, ch, pol] = V[fv, ch,
-        # pol, b, a], bls_idx = a*(a+1)/2 + b.
-        vis_real = V_real_b[..., self._b_idx, self._a_idx]       # (fv, ch, npol, NBASE)
-        vis_imag = V_imag_b[..., self._b_idx, self._a_idx]
-        # Move (NBASE) before (ch, pol).
-        vis_real = vis_real.permute(0, 3, 1, 2).contiguous()     # (fv, NBASE, ch, npol)
+        if fuse_stokes_i:
+            # ---- Fused Stokes-I + chan-sum path (production fast path) ----
+            # Cast to fp32 on the (fv, ch, npol, NBASE) tensor, then
+            # do all reductions in fp32. Total fp32 transient at the
+            # production op-point: 32 * 384 * 2 * 4656 * 4 = ~440 MB
+            # per real/imag (vs ~904 MB for the legacy 5D fp32 cube).
+            vis_real = vis_real_fp16.to(self.accum_dtype)          # (fv, ch, npol, NBASE) fp32
+            vis_imag = vis_imag_fp16.to(self.accum_dtype)
+            del vis_real_fp16, vis_imag_fp16
+            # Stokes-I sum over BADA pol → (fv, ch, NBASE)
+            vis_real = vis_real.sum(dim=2)
+            vis_imag = vis_imag.sum(dim=2)
+            if chan_sum_factor > 1:
+                nchan_eff = self.nchan // chan_sum_factor
+                vis_real = vis_real.reshape(
+                    n_fv_slab, nchan_eff, chan_sum_factor, NBASE,
+                ).sum(dim=2)
+                vis_imag = vis_imag.reshape(
+                    n_fv_slab, nchan_eff, chan_sum_factor, NBASE,
+                ).sum(dim=2)
+            # Final permute to canonical (fv, NBASE, NCHAN_eff)
+            vis_real = vis_real.permute(0, 2, 1).contiguous()
+            vis_imag = vis_imag.permute(0, 2, 1).contiguous()
+            return torch.complex(vis_real, vis_imag)               # (fv, NBASE, NCHAN_eff)
+
+        # ---- Legacy 2-pol path: cast to fp32, permute, complex ----
+        vis_real = vis_real_fp16.to(self.accum_dtype)              # (fv, ch, npol, NBASE) fp32
+        vis_imag = vis_imag_fp16.to(self.accum_dtype)
+        del vis_real_fp16, vis_imag_fp16
+        # Move (NBASE) before (ch, pol) → (fv, NBASE, ch, npol).
+        vis_real = vis_real.permute(0, 3, 1, 2).contiguous()
         vis_imag = vis_imag.permute(0, 3, 1, 2).contiguous()
-        return torch.complex(vis_real, vis_imag)                 # (fv, 4656, 384, 2)
+        return torch.complex(vis_real, vis_imag)                   # (fv, NBASE, NCHAN, BADA_NPOL)
 
 
 # ---------------------------------------------------------------------------

@@ -208,10 +208,19 @@ class TestGridderParityWithGridUvNatural:
     """Per-cell sums match the slow-corr reference imager."""
 
     def test_single_channel_dense_scatter_matches_grid_uv_natural(self) -> None:
+        # ``tools/`` is the repo-root sibling of ``src/``; pyproject.toml
+        # only adds ``src/`` to the package path, so we splice in the
+        # repo root before importing the reference imager.
+        import sys as _sys, pathlib as _pl
+        _root = str(_pl.Path(__file__).resolve().parents[1])
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
         try:
             from tools.viz.common import grid_uv_natural
-        except ImportError:
-            pytest.skip("tools.viz.common not importable from test env.")
+        except ImportError as exc:
+            pytest.skip(
+                f"tools.viz.common not importable from test env: {exc}"
+            )
 
         n_grid = 64
         ch_test = 23
@@ -280,10 +289,16 @@ class TestGridderParityWithGridUvNatural:
         """Same parity gate but with vis on EVERY channel (the
         production scenario; any per-channel cell-index drift would
         show up as a per-cell sum diff)."""
+        import sys as _sys, pathlib as _pl
+        _root = str(_pl.Path(__file__).resolve().parents[1])
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
         try:
             from tools.viz.common import grid_uv_natural
-        except ImportError:
-            pytest.skip("tools.viz.common not importable from test env.")
+        except ImportError as exc:
+            pytest.skip(
+                f"tools.viz.common not importable from test env: {exc}"
+            )
 
         n_grid = 64
         pat, g, e, n_, mask, cell_lambda = _sparse_4ant_pattern_and_gridder(

@@ -78,11 +78,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dsart.coarse_dm.dm_plan import (
-    DMPlan,
-    build_chgroup_freq_table_GHz,
-    compute_delay_native_samples_table,
-)
+from dsart.coarse_dm.dm_plan import DMPlan
 from dsart.common.constants import (
     NANTS,
     NATIVE_SAMPLE_US,
@@ -101,6 +97,87 @@ from dsart.services.slow_corr_kernel import (
 
 
 LOG = logging.getLogger("fast_path_throughput")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic DM plan
+# ---------------------------------------------------------------------------
+
+
+def _build_synthetic_summed_plan(
+    *,
+    n_coarse: int,
+    dm_max: float,
+    chan_sum_factor: int,
+    t_int_fast_us: float,
+) -> DMPlan:
+    """Build a synthetic-but-fully-valid summed-channel :class:`DMPlan`.
+
+    Goes through the canonical :class:`dsart.common.contracts.DmPlan`
+    schema and :meth:`DMPlan.from_summed_canonical` (F33), so the
+    plan's per-(g, ch_summed, dm) delay table is shaped to match the
+    cfg's ``chan_sum_factor`` and :func:`build_context` accepts it.
+    """
+    from dsart.common.contracts import DmPlan
+    from dsart.common.constants import (
+        BW_PROC_MHZ,
+        DM_PLAN_METADATA_VERSION,
+        N_CHAN_PROC_NATIVE,
+        N_CHGROUP,
+        N_SEARCH,
+        N_SEARCH_GPU,
+        NCHAN_PER_CHGROUP,
+        NU_BOT_PROC_GHZ,
+        NU_TOP_PROC_GHZ,
+    )
+
+    coarse = np.linspace(0.0, float(dm_max), int(n_coarse), dtype=np.float64)
+    n_fine = max(8, 2 * int(n_coarse))
+    fine = np.linspace(coarse[0], coarse[-1], n_fine, dtype=np.float64)
+    fine_offsets_idx = np.linspace(
+        0, n_fine, num=int(n_coarse) + 1, dtype=np.int32,
+    )
+    canonical = DmPlan(
+        dm_min=float(coarse[0]),
+        dm_max=float(coarse[-1]) + 1.0,
+        tol=1.5,
+        fine_dm=fine,
+        coarse_dm=coarse,
+        fine_to_coarse=np.zeros(n_fine, dtype=np.int32),
+        fine_offsets_idx=fine_offsets_idx,
+        fine_offsets_flat=np.zeros(n_fine, dtype=np.float64),
+        time_shift_corr_stage1=np.zeros(
+            (N_CHGROUP, NCHAN_PER_CHGROUP, int(n_coarse)), dtype=np.int32,
+        ),
+        time_shift_corr_stage2=np.zeros(
+            (N_CHGROUP, int(n_coarse)), dtype=np.int32,
+        ),
+        time_shift_search=np.zeros((n_fine, N_CHGROUP), dtype=np.int32),
+        dm_idx_range_canonical=np.zeros((N_SEARCH, 2), dtype=np.int32),
+        dm_idx_range_consumed=np.zeros((N_SEARCH, 2), dtype=np.int32),
+        dm_idx_range_canonical_per_gpu=np.zeros(
+            (N_SEARCH, N_SEARCH_GPU, 2), dtype=np.int32,
+        ),
+        dm_idx_range_consumed_per_gpu=np.zeros(
+            (N_SEARCH, N_SEARCH_GPU, 2), dtype=np.int32,
+        ),
+        dm_overlap_coarse=2,
+        metadata={
+            "band_top_GHz": NU_TOP_PROC_GHZ,
+            "band_bot_GHz": NU_BOT_PROC_GHZ,
+            "BW_MHz": BW_PROC_MHZ,
+            "N_chan_proc_native": N_CHAN_PROC_NATIVE,
+            "t_int_fast_us": float(t_int_fast_us),
+            "t_int_search_us": 524.288,
+            "tol": 1.5,
+            "build_utc_ns": 1_872_345_677_000_000_000,
+            "git_sha": "fast-path-throughput-bench",
+            "version": DM_PLAN_METADATA_VERSION,
+        },
+    )
+    return DMPlan.from_summed_canonical(
+        canonical, chan_sum_factor=int(chan_sum_factor),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +237,14 @@ class _ThroughputSummary:
     device: str
     git_sha: str
     utc_iso: str
+    kernel_support: int = 1
+    chan_sum_factor: int = 1
+    sliding_window: bool = False
+    cell_lambda_mode: str = "common"
+    n_fv_chunk: int | None = None
+    block_period_ms: float = 0.0
+    realtime_factor: float = 0.0
+    realtime_pass: bool = False
 
 
 def _write_report(
@@ -204,11 +289,16 @@ def _write_report(
         json.dumps(asdict(summary), indent=2),
     )
 
+    rt_label = "PASS" if summary.realtime_pass else "FAIL"
+    rt_color = "green" if summary.realtime_pass else "red"
     html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>M3 fast-path throughput</title></head>
 <body style="font-family:sans-serif">
 <h1>M3 fast-path throughput</h1>
+<p><b>Real-time</b>: <span style="color:{rt_color};font-weight:bold">{rt_label}</span>
+&nbsp;&nbsp;<b>p99 / block_period</b>: {summary.p99_per_block_ms:.2f} / {summary.block_period_ms:.2f} ms
+&nbsp;&nbsp;<b>real-time factor</b>: {summary.realtime_factor:.2f}x</p>
 <p><b>Cubes/s</b>: {summary.cubes_per_second:.2f}
 &nbsp;&nbsp;<b>n_blocks</b>: {summary.n_blocks}
 &nbsp;&nbsp;<b>p50 latency</b>: {summary.p50_per_block_ms:.2f} ms
@@ -219,14 +309,18 @@ def _write_report(
 &nbsp;&nbsp;<b>n_filled</b>: {summary.n_filled}
 &nbsp;&nbsp;<b>t_int</b>: {summary.t_int_fast_us:.3f} µs
 &nbsp;&nbsp;<b>device</b>: {summary.device}</p>
+<p><b>kernel_support (G7)</b>: {summary.kernel_support}
+&nbsp;&nbsp;<b>chan_sum_factor (F33)</b>: {summary.chan_sum_factor}
+&nbsp;&nbsp;<b>sliding_window (F34)</b>: {summary.sliding_window}
+&nbsp;&nbsp;<b>cell_lambda_mode (F28)</b>: {summary.cell_lambda_mode}
+&nbsp;&nbsp;<b>n_fv_chunk (F31b)</b>: {summary.n_fv_chunk}</p>
 <p><b>git_sha</b>: <code>{summary.git_sha}</code>
 &nbsp;&nbsp;<b>utc_iso</b>: {summary.utc_iso}</p>
 <img src="latency_histogram.png" style="max-width:900px;border:1px solid #ccc">
 <hr>
-<p>Operator note: ≥ 7.45 cubes/s is the §9 steady-state requirement
-on a 2080 Ti at full ops; this CPU bench is for path correctness.
-The chunk-9 §8.M3 line gates only on the bench producing this
-<code>report.html</code>.</p>
+<p>Real-time gate: each fada block ingests {summary.block_period_ms:.2f} ms of native
+samples ({NPACKETS_PER_BLOCK} packets × {NTIMES_PER_PACKET} samples × {NATIVE_SAMPLE_US:.3f} µs).
+PASS iff p99 process_block latency ≤ that period.</p>
 </body>
 </html>
 """
@@ -240,19 +334,62 @@ The chunk-9 §8.M3 line gates only on the bench producing this
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--duration-s", type=float, default=10.0)
+    p.add_argument("--duration-s", type=float, default=60.0,
+                   help="bench duration. Default 60 s (= ~447 fada blocks "
+                        "at 134 ms each) gives a stable p50/p99 for "
+                        "1-min real-time soak validation.")
     p.add_argument(
-        "--t-int-fast-native", type=int, default=128,
+        "--t-int-fast-native", type=int, default=8,
         help=(
-            "fast-vis integration depth in NATIVE samples. Default 128 "
-            "(= 4194.304 µs cadence; 32 fast-vis tiles/block) sized for "
-            "h01's 11 GB GPU per F31 (256 tiles/block @ t_int=32 OOMs). "
-            "Production target is 8 (262.144 µs); A6000 GPUs hold that."
+            "fast-vis integration depth in NATIVE samples. Default 8 "
+            "(= 262.144 µs cadence; 512 fast-vis tiles/block) — the "
+            "M3 PRODUCTION cadence on the 2080Ti, made memory-feasible "
+            "by F31a (kernel chunking) + F31b (streaming chunks) + "
+            "F33 (8-channel pre-dedispersion sum)."
         ),
     )
-    p.add_argument("--n-grid", type=int, default=64)
-    p.add_argument("--n-coarse-dm", type=int, default=5)
-    p.add_argument("--dm-truth", type=float, default=200.0)
+    p.add_argument("--n-grid", type=int, default=256,
+                   help="image-plane grid side. Default 256 (production "
+                        "O-4 op-point).")
+    p.add_argument("--n-coarse-dm", type=int, default=24,
+                   help="coarse DM trials. Default 24 = production O-4 "
+                        "operating point (configs/operating_points.yaml "
+                        "N_coarse_DM).")
+    p.add_argument("--dm-truth", type=float, default=1500.0,
+                   help="injected DM (pc/cc). Default 1500 puts the "
+                        "truth in the middle of the 0..2*dm_truth = "
+                        "0..3000 plan, which spans the M3 DM_max of "
+                        "3000 pc/cc.")
+    p.add_argument("--kernel-support", type=int, default=1,
+                   choices=(1, 3, 5),
+                   help="G7 gridding-kernel support cells. K=1 "
+                        "(default; legacy pillbox), K=3 / K=5 = "
+                        "Gaussian-tapered K^2 grid taps per (bls, ch).")
+    p.add_argument("--chan-sum-factor", type=int, default=8,
+                   help="F33: pre-dedispersion channel-sum factor. "
+                        "Default 8 (production: 384 fine ch -> 48 "
+                        "summed ch). At DM=3000, ν=1.31 GHz the max "
+                        "intra-summed-channel smearing is ~2.7 ms, "
+                        "well within the search t_int.")
+    p.add_argument("--sliding-window", action="store_true", default=True,
+                   help="F34: 2-block sliding-window stage-1 with K=2 "
+                        "ring buffer. Default ON (required at M3 prod "
+                        "op-point because at DM=3000 the intra-chgroup "
+                        "delay reaches ~480 fv bins, comparable to "
+                        "the ~512-bin block size).")
+    p.add_argument("--no-sliding-window", action="store_false",
+                   dest="sliding_window",
+                   help="disable F34 (regression / debug only).")
+    p.add_argument("--cell-lambda-mode", default="common",
+                   choices=("common", "per_chgroup"),
+                   help="F28: 'common' (production default; shared "
+                        "top-of-band cell scale across chgroups) or "
+                        "'per_chgroup' (legacy auto-fit; ~5-cell "
+                        "column drift across chgroups).")
+    p.add_argument("--n-fv-chunk", type=int, default=None,
+                   help="F31b: streaming fast-vis chunk size. None "
+                        "(default) auto-picks the largest power-of-two "
+                        "slab under the F31b 256 MB target.")
     p.add_argument(
         "--device", type=str, default="auto", choices=("auto", "cpu", "cuda"),
     )
@@ -289,20 +426,15 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("device=%s", device)
 
     # Custom DM plan: linear from 0 to 2*dm_truth so the truth DM
-    # falls in the middle of the trials.
-    dm_pc_cc = np.linspace(
-        0.0, 2.0 * args.dm_truth, args.n_coarse_dm,
-    ).astype(np.float64)
-    chgroup_freqs_GHz = build_chgroup_freq_table_GHz()
-    delay_table = compute_delay_native_samples_table(
-        dm_pc_cc, chgroup_freqs_GHz,
-    )
-    plan = DMPlan(
-        dm_pc_cc=dm_pc_cc,
-        n_fine_per_coarse=1,
+    # falls in the middle of the trials. Built via the canonical
+    # DmPlan -> DMPlan.from_summed_canonical path so chan_sum_factor
+    # propagates correctly into the per-(g, ch_summed, dm) delay
+    # table (build_context asserts this match).
+    plan = _build_synthetic_summed_plan(
+        n_coarse=int(args.n_coarse_dm),
+        dm_max=2.0 * float(args.dm_truth),
+        chan_sum_factor=int(args.chan_sum_factor),
         t_int_fast_us=float(args.t_int_fast_native * NATIVE_SAMPLE_US),
-        chgroup_freqs_GHz=chgroup_freqs_GHz,
-        _delay_native_samples_table=delay_table,
     )
 
     antpos_e, antpos_n = _synth_antpos(seed=42)
@@ -310,7 +442,11 @@ def main(argv: list[str] | None = None) -> int:
         chgroup=0,
         obs_dec_rad=math.radians(53.85),
         n_grid=args.n_grid,
-        kernel_support=1,
+        kernel_support=int(args.kernel_support),                 # G7
+        cell_lambda_mode=str(args.cell_lambda_mode),             # F28
+        chan_sum_factor=int(args.chan_sum_factor),               # F33
+        sliding_window=bool(args.sliding_window),                # F34
+        n_fv_chunk=args.n_fv_chunk,                              # F31b
         t_int_fast_native=args.t_int_fast_native,
         rfi_enabled=False,                 # synthetic noise; flag fraction
                                            # would otherwise be ~100%
@@ -358,6 +494,17 @@ def main(argv: list[str] | None = None) -> int:
     p50 = float(np.percentile(per_block_ms, 50))
     p99 = float(np.percentile(per_block_ms, 99))
 
+    # Real-time gate: each fada block is NPACKETS_PER_BLOCK fada
+    # packets of NTIMES_PER_PACKET native samples = the wall-clock
+    # period the corr-node has to ingest + process before the next
+    # block arrives. Real-time PASS iff p99 ≤ that period.
+    block_period_us = float(
+        NPACKETS_PER_BLOCK * NTIMES_PER_PACKET * NATIVE_SAMPLE_US
+    )
+    block_period_ms = block_period_us * 1e-3
+    realtime_factor = (p99 / block_period_ms) if block_period_ms > 0 else 0.0
+    realtime_pass = bool(p99 <= block_period_ms)
+
     summary = _ThroughputSummary(
         duration_s=duration,
         n_blocks=block_n,
@@ -372,11 +519,22 @@ def main(argv: list[str] | None = None) -> int:
         device=str(device),
         git_sha=_git_sha(),
         utc_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        kernel_support=int(args.kernel_support),
+        chan_sum_factor=int(args.chan_sum_factor),
+        sliding_window=bool(args.sliding_window),
+        cell_lambda_mode=str(args.cell_lambda_mode),
+        n_fv_chunk=(int(args.n_fv_chunk) if args.n_fv_chunk is not None else None),
+        block_period_ms=block_period_ms,
+        realtime_factor=realtime_factor,
+        realtime_pass=realtime_pass,
     )
     LOG.info(
         "throughput: %d blocks in %.2f s = %.2f cubes/s "
-        "(p50 %.1f ms, p99 %.1f ms)",
+        "(p50 %.1f ms, p99 %.1f ms; block_period=%.1f ms; rt_factor=%.2fx; "
+        "real-time %s)",
         block_n, duration, summary.cubes_per_second, p50, p99,
+        block_period_ms, realtime_factor,
+        "PASS" if realtime_pass else "FAIL",
     )
 
     _write_report(args.report_dir, summary=summary, per_block_ms=per_block_ms)

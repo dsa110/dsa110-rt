@@ -469,6 +469,16 @@ def main(argv: list[str] | None = None) -> int:
                         "fast-vis tile). Default 32 = 1048.576 µs cadence "
                         "(4× burst-test override per PARALLEL_AGENTS.md §5.1).")
     p.add_argument("--n-grid", type=int, default=256)
+    p.add_argument("--kernel-support", type=int, default=1,
+                   choices=(1, 3, 5),
+                   help="G7: gridding kernel support cells. K=1 "
+                        "(default; legacy pillbox / nearest cell), "
+                        "K=3 (3x3 Gaussian taper), K=5 (5x5 Gaussian "
+                        "taper). Larger K suppresses aliasing at the "
+                        "cost of K^2 grid taps per (bls, ch). All K "
+                        "values are folded into pattern_id and the "
+                        "gridder + sparsity-pattern derive matching "
+                        "weights.")
     p.add_argument("--cell-lambda-mode", default="common",
                    choices=("common", "per_chgroup"),
                    help="F28: per-cell (u, v) λ-extent across chgroups. "
@@ -478,6 +488,18 @@ def main(argv: list[str] | None = None) -> int:
                         "(legacy): each chgroup auto-fits its own cell "
                         "scale; the burst's column drifts ~5 cells "
                         "from sb00 to sb15 in this mode.")
+    p.add_argument("--draw-peak-marker", action="store_true",
+                   help="Overlay a yellow '+' marker on the measured "
+                        "peak pixel in image PNGs. Off by default (the "
+                        "marker hides the very pixel under inspection); "
+                        "the predicted-source 'rx' marker is always "
+                        "drawn from the T2 (l, m).")
+    p.add_argument("--per-chgroup-image-sbs", default="00,04,08,12,15",
+                   help="Comma-separated SB IDs to dump per-chgroup peak "
+                        "images for (under per_chgroup/sb<SB>_peak.png). "
+                        "Default '00,04,08,12,15' covers a band sweep "
+                        "(top, upper, mid, lower, bottom). Pass empty "
+                        "string to skip.")
     p.add_argument("--report-dir", type=Path, required=True)
     p.add_argument("--device", default="auto")
     p.add_argument("--src-json", type=Path, default=None)
@@ -580,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             chgroup=chgroup,
             obs_dec_deg=obs_dec_deg,
             n_grid=args.n_grid,
-            kernel_support=1,
+            kernel_support=args.kernel_support,                      # G7
             cell_lambda_mode=args.cell_lambda_mode,                  # F28
             t_int_fast_native=args.t_int_fast_native,
             cal_mode=args.cal_mode,
@@ -783,12 +805,58 @@ def main(argv: list[str] | None = None) -> int:
     _save_image_png(
         coadded_cube[peak_t_idx],
         title=f"peak frame (t_idx={peak_t_idx}, t_native={peak_t_native}); "
-              f"DM={src['dm_pc_cc']:.3f}",
+              f"DM={src['dm_pc_cc']:.3f} K={args.kernel_support}",
         out_path=peak_image_path,
         expected_lm_pixel=(int(pred_row), int(pred_col)),
-        peak_lm_pixel=(int(peak_row), int(peak_col)),
+        peak_lm_pixel=(
+            (int(peak_row), int(peak_col))
+            if args.draw_peak_marker else None
+        ),
         cell_lambda=chg0_cell_lambda,
     )
+
+    # Per-chgroup peak images (band sweep). Drop one PNG per requested
+    # SB at THAT subband's own peak time, so the user can A/B the
+    # gridding-kernel response at top/middle/bottom of band.
+    per_chgroup_image_dir = args.report_dir / "per_chgroup"
+    per_chgroup_image_paths: dict[str, str] = {}
+    requested_sbs = [
+        s.strip() for s in (args.per_chgroup_image_sbs or "").split(",")
+        if s.strip()
+    ]
+    if requested_sbs:
+        per_chgroup_image_dir.mkdir(parents=True, exist_ok=True)
+        sb_results = {r.sb: r for r in chgroup_results}
+        for sb_id in requested_sbs:
+            r = sb_results.get(sb_id)
+            if r is None:
+                LOG.warning(
+                    "  skipping per-chgroup image for sb%s (not in results)",
+                    sb_id,
+                )
+                continue
+            cube_np = per_chgroup_image_cubes.get(r.chgroup)
+            if cube_np is None:
+                continue
+            sb_image_path = per_chgroup_image_dir / f"sb{sb_id}_peak.png"
+            _save_image_png(
+                cube_np[r.peak_t_idx],
+                title=(
+                    f"sb{sb_id} (chgroup={r.chgroup}) peak frame: "
+                    f"t_idx={r.peak_t_idx}, value={r.peak_value:.3g}, "
+                    f"K={args.kernel_support}, "
+                    f"cell_λ={r.cell_lambda:.3g}"
+                ),
+                out_path=sb_image_path,
+                expected_lm_pixel=(int(pred_row), int(pred_col)),
+                peak_lm_pixel=(
+                    (int(r.peak_pixel_row), int(r.peak_pixel_col))
+                    if args.draw_peak_marker else None
+                ),
+                cell_lambda=float(r.cell_lambda),
+            )
+            per_chgroup_image_paths[sb_id] = str(sb_image_path)
+            LOG.info("wrote per-chgroup image %s", sb_image_path)
 
     movie_path = _build_movie(
         coadded_cube, args.report_dir,
@@ -852,8 +920,11 @@ def main(argv: list[str] | None = None) -> int:
         "peak_t_tol_native_samples": args.peak_t_tol_native_samples,
         "movie_path": (str(movie_path) if movie_path else None),
         "peak_image_path": str(peak_image_path),
+        "per_chgroup_image_paths": per_chgroup_image_paths,
         "time_series_path": str(ts_path),
         "dm_plan_single_npz": str(plan_path),
+        "kernel_support": int(args.kernel_support),
+        "cell_lambda_mode": args.cell_lambda_mode,
     }
     summary_path = args.report_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))

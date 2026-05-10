@@ -265,19 +265,33 @@ class TestBuildPatternNFilledRange:
             kernel_support=1,
             is_core_baseline_mask=mask,
         )
-        # Plan §3 line 305 + plan §3 line 384 (m1 pin): single-side
-        # fill fraction is estimated at ~7-12% at N_grid=256 in the K=5
-        # Gaussian regime. With chunk 3a's K=1 pillbox the kernel
-        # contributes no spread, so n_filled = (# unique (u,v) cells
-        # the 82-ant core baselines × NCHAN_PER_CHGROUP=24 frequency
-        # samples land on after np.rint quantisation). Empirically at
-        # chgroup=0 dec=53.85 this is ≈ 1180 (measured on h01 with
-        # the 250924mptq antpos). Bound is set generously around the
-        # measurement; the K=5 hardening pass will widen it back up to
-        # the plan-line estimate.
-        assert 800 <= p.n_filled <= 50_000, (
-            f"n_filled={p.n_filled} outside plan-predicted "
-            f"[800, 50000] for chgroup=0 dec=53.85 N_grid=256 K=1; "
+        # Plan §3 line 305: "single-side fill fraction is monotone
+        # non-increasing in N_grid; ~ 7-12% at N_grid ∈ {128..512}".
+        # That estimate was for the K=5 Gaussian taper (each sample
+        # hits ~ 25 cells), which is reserved for the M3 hardening
+        # pass (plan §4.2 line 1351 G7); chunk 3a ships K=1 pillbox
+        # (each sample hits 1 cell), so the absolute ``n_filled``
+        # is ~ 5× lower. Empirically on the 250924mptq antpos with
+        # the simple positional 82-ant core mask:
+        #   N_grid=128 ⇒ 4.5% fill (~ 740 cells)
+        #   N_grid=256 ⇒ 3.4% fill (~ 2200 cells)   [this test point]
+        #   N_grid=384 ⇒ 2.2% fill (~ 3200 cells)
+        #   N_grid=512 ⇒ 1.4% fill (~ 3700 cells)
+        # The bench (``bench/grid_pattern_visualisation.py``) reports
+        # the full sweep + monotonicity check. Here we just bound the
+        # absolute count loosely to catch a ``build_pattern`` regression
+        # that drops below ~ 100 cells (e.g. cell_lambda 100× too big →
+        # everything packs into a single cell) or runs above ~ 50k
+        # (e.g. F20 sign drift causes wrap-around aliasing). Note
+        # ``_core_baseline_mask(n_core=82)`` uses the simple positional
+        # definition (ants 0..81 are core), which differs from the
+        # production etcd ``/cnf/corr_setup_96.is_core`` array by ~ 1
+        # ant (ant 48 is geometrically an outrigger but lands in the
+        # first-82 mask); the absolute ``n_filled`` for the production
+        # mask would differ by ~ 30%, still well inside the bound.
+        assert 500 <= p.n_filled <= 50_000, (
+            f"n_filled={p.n_filled} outside sanity bound "
+            f"[500, 50000] for chgroup=0 dec=53.85 N_grid=256 K=1; "
             f"investigate antpos / cell-rounding."
         )
 
@@ -559,12 +573,16 @@ class TestF20UvNegation:
         filled cells must agree. This is the "shared sign convention"
         gate.
         """
+        import sys as _sys, pathlib as _pl
+        _root = str(_pl.Path(__file__).resolve().parents[1])
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
         try:
             from tools.viz.common import grid_uv_natural
-        except ImportError:
+        except ImportError as exc:
             pytest.skip(
-                "tools.viz.common not importable from test env; pin the"
-                " sys.path or run from the repo root."
+                f"tools.viz.common not importable from test env: {exc}"
+                " — pin the sys.path or run from the repo root."
             )
 
         # 4 active core ants + 92 stub ants at the origin (masked out).
