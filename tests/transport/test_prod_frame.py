@@ -50,6 +50,13 @@ from dsart.transport.prod_frame import (
 # ---------------------------------------------------------------------------
 
 
+def _f32(x: float) -> float:
+    """Pre-quantise to float32 so dataclass equality after pack→unpack
+    is bit-exact (the wire format stores float32, so 1.5e-3 stored as
+    Python float becomes 0.001500000013... after round-trip)."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
 def _realistic_header(
     **overrides: object,
 ) -> ProdFrameHeader:
@@ -67,8 +74,8 @@ def _realistic_header(
         pattern_id=0xDEADBEEFCAFEBABE,
         bits_per_cell=BITS_CINT8_COMPLEX,
         t_int_factor=8,
-        scale=1.5e-3,
-        offset=-0.5,
+        scale=_f32(1.5e-3),    # realistic cint8 dequant scale, pre-quantised to float32
+        offset=_f32(-0.5),
         payload_bytes_in_frag=5800 * BITS_CINT8_COMPLEX // 8,
         flags=FLAG_QUANTIZED | FLAG_LAST_IN_BLOCK,
         version=VERSION,
