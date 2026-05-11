@@ -186,7 +186,7 @@ import yaml
 with open("${REPO_ROOT}/configs/config_compute_search.yaml") as f:
     cfg = yaml.safe_load(f)
 required_top = {"schema_version", "dm_plan_path", "detector_class", "detector",
-                "cube", "noise", "trigger", "decoder"}
+                "cube", "noise", "udp_trigger_listener", "decoder"}
 missing = required_top - set(cfg.keys())
 if missing:
     raise SystemExit(f"missing top-level keys: {sorted(missing)}")
