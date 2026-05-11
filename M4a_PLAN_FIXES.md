@@ -52,13 +52,98 @@ Six DoD invariants (plan §M4a line 2383):
 
 ## F-items (fixes — corrections / additions to plan.md)
 
-_(none yet — populate as fixes are discovered during chunk development)_
+- **F1 (chunk 4 build system)**: plan §4.4 line 1465 states "Owner module:
+  `src/dsart/transport/recv_ring.py` (Python ctypes wrapper) +
+  `src/dsart/transport/recv_ring.c` (struct definitions; ...)" but does
+  not pin the C extension build mode. D-item D3 locks it to setuptools
+  + `setup.py` (with `Extension('dsart.transport._recv_ring', ...)`).
+  pyproject.toml [tool.setuptools] cannot declare ext_modules in
+  setuptools<64; the setup.py exists alongside pyproject.toml only for
+  that purpose. Fold into plan §4.4 line 1465 in M4a hardening.
+
+- **F2 (chunk 5 CUDA host-register)**: plan §4.4 line 1467 says
+  "cudaHostRegister(addr, size, cudaHostRegisterMapped | cudaHostRegisterPortable)
+  so both compute processes' GPU contexts can cudaHostGetDevicePointer for
+  zero-copy DMA." `ProductionRxRingSource._try_register_ring` is currently
+  a no-op because the chunk-4 C API does not expose the mmap base address
+  (`rx_ring_get_base_ptr` is missing). D-item D2 records the deferral to
+  the chunk-7 GPU-integration bench. Fold into plan §4.4 line 1467 with a
+  pointer to D2 when chunk 7 lands.
 
 ---
 
 ## D-items (decisions — implementation-level choices locked during M4a)
 
-_(none yet — populate as decisions are made during chunk development)_
+- **D1 (chunk 4 huge-page fallback)**: plan §4.4 line 1467 prescribes
+  `mmap(MAP_SHARED | MAP_LOCKED | MAP_HUGETLB | (1 GiB shift if available))`.
+  On h01 the kernel may not have huge pages reserved
+  (`/proc/sys/vm/nr_hugepages == 0`); requesting `MAP_HUGETLB` from a
+  non-privileged process is also rejected on most distributions. The
+  chunk-4 C implementation uses plain `mmap(MAP_SHARED, ...)` for v1 and
+  documents the 4 KiB-page fallback here. If chunk-7 perf gate exposes
+  cross-NUMA bandwidth shortfall, revisit with hugetlbfs mount + setuid
+  helper. The 2 NUMA p99-latency budget (≤ 134 ms per cube) is met by 4 KiB
+  pages at default ops per the chunk-4 cross-NUMA latency probe test.
+
+- **D2 (chunk 5 cudaHostRegister deferral)**: see F2 above. Chunk 5's
+  `ProductionRxRingSource._try_register_ring` is a documented no-op; the
+  actual cudaHostRegister call lives in chunk-7 once the C API exposes a
+  base-ptr accessor. Tests for chunk 5 pass `enable_cuda_register=False`.
+
+- **D3 (chunk 4 build system: setuptools, not cmake)**: setuptools
+  `Extension('dsart.transport._recv_ring', ...)` is the build mode for the
+  C extension. pyproject.toml [tool.setuptools] cannot declare ext_modules
+  in setuptools<64; an explicit `setup.py` lives alongside pyproject.toml.
+  Rejected alternatives: cmake (adds a build-system dependency for a
+  ~400-line C file; pip would need scikit-build-core), meson (same;
+  unfamiliar build orchestration for this repo), bare `gcc` Makefile
+  (defers the build to deploy time; defeats `pip install -e .`
+  ergonomics). Setuptools is already the build backend.
+
+- **D4 (chunk 3 corr_idx convention)**: plan §4.3 / §4.4 references
+  per-`(corr, dm_idx)` flows but does not pin whether `corr_idx == chgroup`
+  or `corr_idx == sender_node_id`. M4a fixes `corr_idx = chgroup` because
+  in the §2.2 / §6.1 split each corr node owns exactly one chgroup. The
+  per-(corr, dm_idx) reorder window keys on `(header.chgroup, header.dm_idx)`.
+  Fold into plan §4.3 in M4a hardening.
+
+- **D5 (chunk 3 reorder-window slide policy)**: plan §4.3 line 1473 says
+  "Out-of-order seq arrivals within the window land in their correct slot;
+  arrivals beyond the window fall through `pattern_mismatch=false,
+  data_present=false`". The chunk-3 implementation interprets this as:
+  - `seq < head` → silently dropped (`out_of_order_drop_count++`),
+    no zero-fill slot emitted to the ring.
+  - `seq > tail` → slide window, zero-fill any displaced incomplete slots
+    (`window_slide_zerofill_count++`, `seq_gap_count_per_flow[(corr,dm)]++`).
+  - `seq ∈ [head, tail]` and bitmap not yet full → buffer; commit only on
+    full reassembly.
+  The reasoning: late arrivals are silent noise (a retransmission past the
+  window's lifetime), while window-slide drops are budgeted data loss
+  that downstream cube-validity must see.
+
+- **D6 (chunk 3 dequant at COO-store)**: plan §4.4 line 1462 pins
+  dequantisation at COO-store time. Chunk 3 emits `np.complex64` arrays
+  on the `RxProdSlot` (not raw int8 / fp16). The chunk-4 ring stores raw
+  bytes; the dequantisation happens in `dequantise_payload` inside the
+  reorder-window commit callback. Per the plan this means the **ring carries
+  float values, not raw quantized ints**.
+
+  An alternative considered: leave bytes in the ring and dequantise on the
+  GPU compute side. Rejected because (a) plan §4.4 line 1462 explicitly
+  pins dequant to COO-store, (b) the GPU sparse-scatter kernel runs against
+  complex64 cells (G5 +uv-only single-pol), and (c) doing dequant on the
+  RX side keeps the per-payload `scale`/`offset` close to the per-payload
+  header rather than threading them through to the GPU.
+
+- **D7 (chunk 4 shm name format)**: `/dsart_rx_ring_<s>_<utc_ns>` is the
+  plan-suggested format (plan §4.4 line 1467 cites `/dsart_rx_ring_<s>`).
+  M4a chunk 4 leaves the naming to the caller — the C API takes `name`
+  verbatim. The chunk-7 bench will fix the format with the utc_ns suffix.
+
+- **D8 (chunk 4 build artifact path)**: the C extension `.so` is named
+  `_recv_ring.cpython-<ver>-<arch>.so` (PEP 3149). `recv_ring.py` globs
+  for `_recv_ring*.so` so both `pip install -e .` (installed) and
+  `python setup.py build_ext --inplace` (inplace) paths work.
 
 ---
 
@@ -70,9 +155,9 @@ M4a chunks (deps in parens):
 |---|---|---|---|
 | 1 | `prod_frame_72b` — `src/dsart/transport/prod_frame.py` + tests | scaffolding | M4a driver (synchronous) |
 | 2 | `tx_prod_header` — `transport/tx.py` extend to 72-byte header + fragmentation + token-bucket pacer | not started | TX agent |
-| 3 | `rx_defrag` — `transport/rx.py` per-(corr, dm_idx) reorder window + bitmap + pattern_id verify | not started | RX agent |
-| 4 | `recv_ring_shm` — POSIX-shm SPMC sparse ring (`transport/recv_ring.{c,py}`); CONC-1 contract | not started | RX agent |
-| 5 | `production_source` — `transport/production_rx_ring.py` satisfying `services/rx_ring.RxRingSource` Protocol | not started | RX agent (deps 3 + 4) |
+| 3 | `rx_defrag` — `transport/rx.py` per-(corr, dm_idx) reorder window + bitmap + pattern_id verify | landed (m4a/rx-defrag-and-ring) | RX agent |
+| 4 | `recv_ring_shm` — POSIX-shm SPMC sparse ring (`transport/recv_ring.{c,py}`); CONC-1 contract | landed (m4a/rx-defrag-and-ring) | RX agent |
+| 5 | `production_source` — `transport/production_rx_ring.py` satisfying `services/rx_ring.RxRingSource` Protocol | landed (m4a/rx-defrag-and-ring) | RX agent |
 | 6 | `c_epoll_loop` — **conditional**, only if chunk-7 perf gate fails Python `recvmmsg` at target rate | not started | RX agent (on-call) |
 | 7 | `bench_net_loopback` — `bench/net_loopback.py` with the 6 DoD invariants + env-var reload shim | not started | M4a driver (post-merge) |
 | 8 | `dod_orchestrator` — `tools/dod/M4a.sh` + `M4a_preflight.sh` + status JSON; retire `M4a_PLAN_FIXES.md` | not started | M4a driver |
