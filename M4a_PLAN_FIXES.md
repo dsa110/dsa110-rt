@@ -397,3 +397,59 @@ Per plan §3.7 mon-key registry:
 
 M4a uses the existing M0 `tools.mon_key_emitter` (in-process for benches);
 real `/mon/` writes are wired in M7.
+
+---
+
+## D15 (chunk 6 — *implemented*): C epoll RX loop
+
+Promoted from "deferred / nice-to-have" to **required** on 2026-05-11
+after the production-rate bench measurements on h01 (see
+`docs/m4a/prod_rate_findings.md`). **Implemented and validated on
+h01 the same day** — 60 s @ 7.885 Gb/s, 0% loss, 0 zerofills, 0
+protocol errors. See ``docs/m4a/prod_rate_findings.md`` § "Chunk 6
+result" for the full table.
+
+**Measured ceilings** at the §9 default op-point on h01 loopback
+(`bench/net_loopback.py --prod fan-in-mp`, 60 s):
+
+* TX (per-process, isolated CPU): **0.41 Gb/s** vs 0.438 Gb/s target
+  (93% — TX is close enough with multi-process, will recheck under
+  C TX path if chunk 6 motivates one).
+* TX (per-process, 16 subprocs sharing CPUs): **0.37 Gb/s** (84%).
+* **RX (Python `recvfrom` + `ingest_datagram`): ~1 Gb/s** vs 7.0 Gb/s
+  target — **7× short** of the per-search-node ingress requirement.
+
+The Python recv loop is single-threaded by GIL constraint and pays
+~40 µs per datagram (recvfrom + struct.unpack + dequant + reorder
+book-keeping); the 7 Gb/s production target demands a ~10 µs/datagram
+budget that the Python recv path will not reach.
+
+Chunk-6 scope (drop-in replacement for `_RxLoop` + the recv hot path
+in `TransportRxProd.ingest_datagram`):
+
+* New C lib `src/dsart/transport/recv_epoll.{c,py}` owning the UDP
+  socket, running an `epoll` loop in its own pthread, draining via
+  `recvmmsg(64)`.
+* Per-datagram in C: header validate → pattern_id check → per-(
+  chgroup, dm_idx) reorder window update → on commit / mismatch /
+  zerofill, publish to the existing chunk-4 shm ring with the *raw
+  quantised payload* (no dequant on the recv path).
+* Dequant moves to the compute reader (`ProductionRxRingSource`,
+  invoked once per used slot), already approved as D4.
+* Mon-key counters (`bad_magic_count`, `pattern_mismatch_count`,
+  `window_slide_zerofill_count`, …) become `_Atomic` u64 fields
+  readable from Python via ctypes; same key set as today.
+* Python `TransportRxProd` remains as the reference implementation
+  used by unit tests; the new C path is selected via a config flag.
+
+Acceptance: re-run `--prod fan-in-mp` and require
+`observed_gbps_aggregate ≥ 6.66` (95% of 7.008) with
+`loss_pct < 0.5%` and all protocol counters at zero. See
+`docs/m4a/prod_rate_findings.md` for the full table.
+
+The TX-side gap (7-16% short of target depending on CPU contention)
+is comfortably closeable by the M4a-spec'd one-process-per-corr-node
+deployment with 4 TX threads, **once chunk 6 frees the search-side
+CPU budget**. If chunk-6 measurements still show a TX gap on the
+matching `--prod fan-out-mp` re-run, we open a separate D-item for
+a C TX path; for now, do not touch TX.
