@@ -1,0 +1,17 @@
+# Operator approval marker for M3 (fast-correlator + RT optimizations).
+#
+# Mirrors the M2 D11 convention: presence of this file flips the M3
+# DoD stage from 'complete (needs operator approval)' to
+# 'complete (approved)' (or to 'complete (hardened)' once
+# M3_PLAN_FIXES.md is retired).
+#
+# Approval scope: headline DoD outputs at
+#   bench/reports/<ts>/M3-continuum-0319/report.html  (chunk 5)
+#   bench/reports/<ts>/M3-burst-250924mptq/report.html (chunk 6)
+# both produced by integration/m3-m5-m6 run on h01 (lxd110h01), with
+# RT optimizations Phases 7-14 landing 37.5x cumulative speedup vs the
+# pre-RT baseline (1.26x real-time at the production op-point on a
+# single 2080Ti).
+approved_by: vikram
+approved_at_utc: 2026-05-11T13:21:00Z
+approved_git_sha: 6981fdc2597aa9c6a38934c717f4289633e67943

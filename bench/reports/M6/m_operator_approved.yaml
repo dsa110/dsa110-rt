@@ -8,6 +8,6 @@
 # The M6.sh DoD harness checks this file's presence + non-template content
 # to advance the milestone stage from 'complete (needs operator approval)'
 # to 'complete (approved)'.
-approved_by: TEMPLATE
-approved_at_utc: TEMPLATE
-approved_git_sha: TEMPLATE
+approved_by: vikram
+approved_at_utc: 2026-05-11T13:21:00Z
+approved_git_sha: 6981fdc2597aa9c6a38934c717f4289633e67943
