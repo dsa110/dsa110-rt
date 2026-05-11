@@ -160,6 +160,26 @@ mkdir -p "${REPO_ROOT}/bench/reports" "${HOME}/dsart-integration-logs" 2>/dev/nu
 [[ -w "${HOME}" ]] || fail "${HOME} not writable"
 pass
 
+STEP="gcc_available"
+# chunk 4 needs gcc to build the _recv_ring C extension.
+command -v gcc >/dev/null 2>&1 || fail "gcc not found in PATH; needed for chunk-4 C extension"
+GCC_VERSION="$(gcc --version | head -1)"
+echo "  info: ${GCC_VERSION}"
+pass
+
+STEP="dev_shm"
+# chunk 4 needs POSIX shm at /dev/shm. Default-ops ring is ~2.3 GiB at
+# N_grid=256; require ≥ 4 GiB free.
+mountpoint -q /dev/shm || fail "/dev/shm is not a mountpoint"
+SHM_FREE_KB="$(df /dev/shm | awk 'NR==2 {print $4}')"
+SHM_FREE_GIB=$((SHM_FREE_KB / 1024 / 1024))
+if [[ "${SHM_FREE_GIB}" -lt 4 ]]; then
+  warn "/dev/shm free=${SHM_FREE_GIB} GiB < 4 GiB (chunk-4 may fail at largest op-point)"
+else
+  echo "  info: /dev/shm free=${SHM_FREE_GIB} GiB"
+fi
+pass
+
 STEP="m4a_target_files"
 # Sanity: chunk-8 scaffold exists; M4a will extend in-place + add new
 # modules. List only the files chunks 1..8 need either to exist (read)
