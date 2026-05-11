@@ -400,11 +400,14 @@ real `/mon/` writes are wired in M7.
 
 ---
 
-## D15 (chunk 6 — *required*): C epoll RX loop
+## D15 (chunk 6 — *implemented*): C epoll RX loop
 
 Promoted from "deferred / nice-to-have" to **required** on 2026-05-11
 after the production-rate bench measurements on h01 (see
-`docs/m4a/prod_rate_findings.md`).
+`docs/m4a/prod_rate_findings.md`). **Implemented and validated on
+h01 the same day** — 60 s @ 7.885 Gb/s, 0% loss, 0 zerofills, 0
+protocol errors. See ``docs/m4a/prod_rate_findings.md`` § "Chunk 6
+result" for the full table.
 
 **Measured ceilings** at the §9 default op-point on h01 loopback
 (`bench/net_loopback.py --prod fan-in-mp`, 60 s):

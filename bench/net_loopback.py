@@ -957,6 +957,164 @@ def _mp_tx_worker(
     })
 
 
+def _mp_wire_tx_worker(
+    op_kwargs: dict,
+    chgroup: int,
+    rx_port: int,
+    duration_s: float,
+    result_q,
+) -> None:
+    """Wire-rate TX worker: pre-builds one set of valid ProdFrame
+    datagrams (one per (dm_idx, frag_idx)) and ``sendto``s them in a
+    tight loop, paced by a deadline-driven Python sleep. Bypasses the
+    Python encode + scale/offset computation per cube and so probes the
+    *recv-side* ceiling without TX-encoding contention.
+
+    The pre-built wire bytes are protocol-valid: pattern_id, chgroup,
+    dm_idx, frag_idx, n_frags, n_filled, payload_bytes_in_frag all
+    match a real cube. seq increments per loop iteration so the RX
+    reorder window advances. specnum increments too.
+    """
+    from bench.net_loopback import ProdOpPoint, _stable_pattern_id
+    from dsart.transport.prod_frame import (
+        BITS_CINT8_COMPLEX,
+        FLAG_QUANTIZED,
+        FLAG_LAST_IN_BLOCK,
+        ProdFrameHeader,
+        pack_frame,
+        split_payload_into_fragments,
+    )
+    import socket as _sock
+    import struct as _struct
+    import time as _time
+
+    op = ProdOpPoint(**op_kwargs)
+    pid = _stable_pattern_id(30.0)
+    bytes_per_cell = op.bits_per_cell // 8
+
+    sock = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    try:
+        sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_SNDBUF, 8 * 1024 * 1024)
+    except OSError:
+        pass
+    addr = ("127.0.0.1", rx_port)
+
+    # Build the per-(dm_idx, frag_idx) wire bytes ONCE. Payload bytes are
+    # arbitrary (zeros are fine — protocol validation only checks the
+    # header). seq + specnum are patched per-iteration by struct.pack_into
+    # at fixed offsets.
+    payload_bytes_per_dm = op.n_filled * bytes_per_cell
+    raw_payload = bytes(payload_bytes_per_dm)
+    frags_per_dm = split_payload_into_fragments(
+        raw_payload, max_frag_payload_bytes=op.max_frag_payload_bytes,
+    )
+    n_frags = len(frags_per_dm)
+    flags = FLAG_QUANTIZED  # quantised cint8
+    wire_packets: list[bytearray] = []
+    for dm_idx in range(op.n_dm_per_tx):
+        for frag_idx, frag in enumerate(frags_per_dm):
+            f = flags
+            if frag_idx == n_frags - 1:
+                f |= FLAG_LAST_IN_BLOCK
+            hdr = ProdFrameHeader(
+                seq=0,           # patched per iteration
+                specnum=0,       # patched per iteration
+                chgroup=chgroup,
+                dm_idx=dm_idx,
+                frag_idx=frag_idx,
+                n_frags=n_frags,
+                n_grid=op.n_grid,
+                n_filled=op.n_filled,
+                pattern_id=pid,
+                bits_per_cell=op.bits_per_cell,
+                t_int_factor=op.t_int_factor,
+                scale=1.0,
+                offset=0.0,
+                payload_bytes_in_frag=len(frag),
+                flags=f,
+            )
+            wire = bytearray(pack_frame(hdr, frag))
+            wire_packets.append(wire)
+
+    # Header field offsets we'll patch each iteration (from the
+    # _HEADER_FMT in prod_frame.py: "<I H H Q Q ..."):
+    #   magic        (4 B) @ 0
+    #   version      (2 B) @ 4
+    #   flags        (2 B) @ 6
+    #   seq          (8 B) @ 8
+    #   specnum      (8 B) @ 16
+    SEQ_OFF = 8
+    SPECNUM_OFF = 16
+
+    # Per-cube period (deadline-driven). target_gbps_per_dm sets the rate
+    # of cube emission, where one cube = n_dm × n_frags datagrams.
+    bytes_per_cube = sum(len(f) for f in frags_per_dm) * op.n_dm_per_tx + (
+        n_frags * op.n_dm_per_tx * 72
+    )
+    bytes_per_sec_target = (
+        op.target_gbps_per_dm * op.n_dm_per_tx * 1e9 / 8.0
+    )
+    target_period_s = (
+        bytes_per_cube / bytes_per_sec_target
+        if bytes_per_sec_target > 0 else 0.0
+    )
+    # Allow override: env DSART_M4A_WIRE_RATE_GBPS sets aggregate per-TX
+    # target Gb/s (overrides target_gbps_per_dm derivation above).
+    import os as _os
+    env_rate = _os.environ.get("DSART_M4A_WIRE_RATE_GBPS")
+    if env_rate is not None:
+        try:
+            bytes_per_sec_target = float(env_rate) * 1e9 / 8.0
+            target_period_s = (
+                bytes_per_cube / bytes_per_sec_target
+                if bytes_per_sec_target > 0 else 0.0
+            )
+        except ValueError:
+            pass
+
+    cubes_emitted = 0
+    frames_sent = 0
+    seq_per_dm = [0] * op.n_dm_per_tx
+    t_start_ns = _time.monotonic_ns()
+    deadline_ns = t_start_ns + int(duration_s * 1e9)
+    next_t = _time.monotonic()
+
+    # Tight inner loop. One "cube iter" emits n_dm × n_frags datagrams.
+    while _time.monotonic_ns() < deadline_ns:
+        for dm_idx in range(op.n_dm_per_tx):
+            seq = seq_per_dm[dm_idx]
+            for frag_idx in range(n_frags):
+                pkt = wire_packets[dm_idx * n_frags + frag_idx]
+                _struct.pack_into("<Q", pkt, SEQ_OFF, seq)
+                _struct.pack_into("<Q", pkt, SPECNUM_OFF, cubes_emitted)
+                try:
+                    sock.sendto(pkt, addr)
+                    frames_sent += 1
+                except OSError:
+                    pass
+            seq_per_dm[dm_idx] = seq + 1
+        cubes_emitted += 1
+        if target_period_s > 0.0:
+            next_t += target_period_s
+            sleep_s = next_t - _time.monotonic()
+            if sleep_s > 0.0:
+                _time.sleep(sleep_s)
+            else:
+                # Behind schedule — let TX run unpaced this iteration.
+                next_t = _time.monotonic()
+
+    t_stop_ns = _time.monotonic_ns()
+    elapsed_s = (t_stop_ns - t_start_ns) * 1e-9
+    sock.close()
+    result_q.put({
+        "chgroup": chgroup,
+        "cubes_emitted": int(cubes_emitted),
+        "frames_sent": int(frames_sent),
+        "elapsed_s": float(elapsed_s),
+        "tx_dropped_payloads": 0,
+    })
+
+
 @dataclass
 class _MpTxStats:
     """Minimal stats from a multi-process TX worker."""
@@ -1122,6 +1280,217 @@ def prod_fan_in_16x_mp(
         duration_s=dt,
         metrics=m,
         failure_reason=reason,
+    )
+
+
+def _run_wire_tx_batch(
+    op: ProdOpPoint,
+    chgroups: list[int],
+    rx_port: int,
+    duration_s: float,
+) -> list[_MpTxStats]:
+    """Like :func:`_run_mp_tx_batch` but spawns ``_mp_wire_tx_worker``s
+    that bypass the Python encode path. Used for max-rate C-RX probing."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q: mp.Queue = ctx.Queue()
+    op_kwargs = asdict(op)
+    procs = []
+    for chg in chgroups:
+        p = ctx.Process(
+            target=_mp_wire_tx_worker,
+            args=(op_kwargs, chg, rx_port, duration_s, q),
+        )
+        p.start()
+        procs.append(p)
+    results: list[_MpTxStats] = []
+    for _ in chgroups:
+        try:
+            d = q.get(timeout=duration_s + 30.0)
+        except Exception as e:  # pylint: disable=broad-except
+            LOG.error("wire-tx worker did not return stats: %s", e)
+            continue
+        results.append(_MpTxStats(**d))
+    for p in procs:
+        p.join(timeout=10.0)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=5.0)
+    return results
+
+
+def prod_fan_in_16x_mp_c(
+    quick: bool, duration_override: Optional[float] = None,
+    *,
+    wire_tx: bool = False,
+) -> InvariantResult:
+    """P2-mp-c: 16 TX subprocesses → C RxEpoll. The chunk-6 acceptance test.
+
+    Identical to P2-mp except the RX path is the C epoll loop
+    (:class:`dsart.transport.recv_epoll.RxEpoll`) instead of the Python
+    ``_RxLoop`` + ``TransportRxProd.ingest_datagram`` pair. Drives the
+    same 16 TX subprocesses producing ~7 Gb/s aggregate ingress; the
+    pass criteria are tightened to ``loss_pct < 0.5%`` because the
+    C path should not be the bottleneck.
+
+    When ``wire_tx=True``: TX workers pre-build valid wire datagrams and
+    pump them in a tight sendto loop, bypassing Python encode/scale
+    overhead. This probes the *C RX ceiling*: how many Gb/s of valid
+    prod-frame UDP can the C loop drain without loss?
+    """
+    # Lazy import — only require the chunk-6 C extension when this test
+    # is selected, so the rest of the bench keeps working without it.
+    from dsart.transport.recv_epoll import RxEpoll
+
+    op = ProdOpPoint()
+    duration_s = duration_override or (5.0 if quick else 60.0)
+    chgroups = list(range(op.n_corr_nodes))
+    pid = _stable_pattern_id(30.0)
+
+    rx = RxEpoll.open(
+        bind_host="127.0.0.1",
+        bind_port=0,
+        so_rcvbuf_bytes=op.rcvbuf_mib * 1024 * 1024,
+    )
+    for c in chgroups:
+        rx.set_expected_pattern_id(c, pid)
+    rx.start()
+
+    t0 = time.monotonic()
+    try:
+        if wire_tx:
+            mp_stats = _run_wire_tx_batch(
+                op, chgroups=chgroups, rx_port=rx.port, duration_s=duration_s,
+            )
+        else:
+            mp_stats = _run_mp_tx_batch(
+                op, chgroups=chgroups, rx_port=rx.port, duration_s=duration_s,
+            )
+        time.sleep(2.0)
+    finally:
+        try:
+            rx.stop()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    counters = rx.counters()
+    rx.close()
+    dt = time.monotonic() - t0
+
+    # Synthesise an InvariantResult-compatible metrics dict drawn from
+    # the C-side counters + the mp_stats TX side.
+    cubes_emitted = sum(s.cubes_emitted for s in mp_stats)
+    frames_sent = sum(s.frames_sent for s in mp_stats)
+    tx_dropped = sum(s.tx_dropped_payloads for s in mp_stats)
+    payload_bytes_emitted = cubes_emitted * op.bytes_per_cube_per_tx
+    elapsed = max((s.elapsed_s for s in mp_stats), default=duration_s)
+    observed_gbps = (
+        (payload_bytes_emitted * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
+    )
+    expected_committed = (
+        cubes_emitted * op.n_dm_per_tx * op.n_fast_vis - tx_dropped
+    )
+    loss_pct = 100.0 * max(
+        0.0,
+        1.0 - (counters.n_committed / max(expected_committed, 1)),
+    )
+    per_proc_gbps = [
+        (s.cubes_emitted * op.bytes_per_cube_per_tx * 8) / (s.elapsed_s * 1e9)
+        if s.elapsed_s > 0 else 0.0
+        for s in mp_stats
+    ]
+    metrics = {
+        "duration_s": duration_s,
+        "elapsed_s": elapsed,
+        "n_tx": len(mp_stats),
+        "cubes_emitted_total": cubes_emitted,
+        "frames_sent_total": frames_sent,
+        "tx_dropped_payloads_total": tx_dropped,
+        "datagrams_received_total": counters.n_received,
+        "n_committed_total": counters.n_committed,
+        "expected_committed": expected_committed,
+        "loss_pct": loss_pct,
+        "payload_bytes_emitted": payload_bytes_emitted,
+        "observed_gbps_aggregate": observed_gbps,
+        "per_proc_observed_gbps_min": min(per_proc_gbps) if per_proc_gbps else 0.0,
+        "per_proc_observed_gbps_max": max(per_proc_gbps) if per_proc_gbps else 0.0,
+        "per_proc_observed_gbps_mean": (
+            sum(per_proc_gbps) / len(per_proc_gbps) if per_proc_gbps else 0.0
+        ),
+        "target_gbps_per_tx": op.target_gbps_per_tx,
+        "target_gbps_per_dm": op.target_gbps_per_dm,
+        "target_gbps_aggregate_per_search": op.target_gbps_aggregate_per_search,
+        "pattern_mismatches": counters.pattern_mismatch_count,
+        "window_slide_zerofill_count": counters.window_slide_zerofill_count,
+        "out_of_order_drop_count": counters.out_of_order_drop_count,
+        "bad_field_range_count": counters.bad_field_range_count,
+        "bad_length_count": counters.bad_length_count,
+        "bad_magic_count": counters.bad_magic_count,
+        "bad_version_count": counters.bad_version_count,
+        "reserved_bit_count": counters.reserved_bit_count,
+        "bytes_received_total": counters.bytes_received_total,
+    }
+    target_agg = op.target_gbps_aggregate_per_search  # ~7 Gb/s
+    # Chunk-6 acceptance: rate within 95% of target, loss < 0.5%, no
+    # protocol errors, no pattern mismatches.
+    rate_ok = observed_gbps >= 0.95 * target_agg
+    loss_ok = loss_pct < 0.5
+    no_mismatch = counters.pattern_mismatch_count == 0
+    no_proto_errors = (
+        counters.bad_magic_count == 0
+        and counters.bad_length_count == 0
+        and counters.bad_version_count == 0
+        and counters.bad_field_range_count == 0
+    )
+    passed = rate_ok and loss_ok and no_mismatch and no_proto_errors
+    bits: list[str] = []
+    if not rate_ok:
+        bits.append(
+            f"observed_gbps={observed_gbps:.3f} < "
+            f"0.95*target={target_agg * 0.95:.3f}"
+        )
+    if not loss_ok:
+        bits.append(f"loss_pct={loss_pct:.3f}% >= 0.5%")
+    if not no_mismatch:
+        bits.append(
+            f"pattern_mismatches={counters.pattern_mismatch_count}"
+        )
+    if not no_proto_errors:
+        bits.append(
+            f"protocol errors: bad_magic={counters.bad_magic_count} "
+            f"bad_length={counters.bad_length_count} "
+            f"bad_version={counters.bad_version_count} "
+            f"bad_field={counters.bad_field_range_count}"
+        )
+    reason = None if passed else "; ".join(bits)
+    return InvariantResult(
+        name="P2mpc_fan_in_16x_mp_C_RX_7Gbps_per_search",
+        passed=passed,
+        duration_s=dt,
+        metrics=metrics,
+        failure_reason=reason,
+    )
+
+
+def prod_fan_in_16x_mp_c_wire(
+    quick: bool, duration_override: Optional[float] = None,
+) -> InvariantResult:
+    """P2-mp-c-wire: max-rate C-RX probe with pre-built wire datagrams.
+
+    The TX side bypasses Python encoding so we can push the C RX as hard
+    as 16 sendto-only subprocesses can. Measures the C RX ceiling
+    (per-search-node ingress).
+    """
+    r = prod_fan_in_16x_mp_c(
+        quick, duration_override=duration_override, wire_tx=True,
+    )
+    return InvariantResult(
+        name="P2mpcw_fan_in_16x_C_RX_max_rate_wire",
+        passed=r.passed,
+        duration_s=r.duration_s,
+        metrics=r.metrics,
+        failure_reason=r.failure_reason,
     )
 
 
@@ -1468,6 +1837,8 @@ PROD_TESTS = [
     ("fan-out", prod_fan_out_4x),
     ("fan-in-mp", prod_fan_in_16x_mp),
     ("fan-out-mp", prod_fan_out_4x_mp),
+    ("fan-in-mp-c", prod_fan_in_16x_mp_c),
+    ("fan-in-mp-c-wire", prod_fan_in_16x_mp_c_wire),
 ]
 
 
