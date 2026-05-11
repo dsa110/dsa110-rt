@@ -172,6 +172,11 @@ class _PendingSeq:
     # validity_flags for the ring slot when committed
     validity_flags: int = 0  # bit0 = data_present (set on commit)
     occupied: bool = False
+    # committed: True after on_commit fires; stays True (does NOT reset)
+    # until the window slides past this seq. Lets _slide_to distinguish a
+    # successfully-committed slot from a never-received seq. See test
+    # test_seq_gap_causes_zerofill (plan §4.3 line 1474).
+    committed: bool = False
 
     def reset(self) -> None:
         self.seq = 0
@@ -181,6 +186,7 @@ class _PendingSeq:
         self.header = None
         self.validity_flags = 0
         self.occupied = False
+        self.committed = False
 
     @property
     def all_frags_received(self) -> bool:
@@ -227,15 +233,33 @@ class _ReorderWindow:
     def _slide_to(self, new_head: int) -> None:
         """Slide the window so that ``new_head`` is the new head seq.
 
-        Any slots that fall off the tail with incomplete bitmaps are
-        zero-filled and the on_zerofill callback is invoked.
+        For each seq the window slides past:
+        * If the slot belongs to that seq and was committed -> just reset
+          (successful reassembly; no zero-fill).
+        * If the slot belongs to that seq but reassembly was incomplete
+          -> zero-fill with the known ``n_frags_expected``.
+        * If the slot does NOT belong to that seq (slot is empty or
+          holds a different / later seq) -> the seq was never received
+          at all; zero-fill with ``n_frags_expected=0`` (unknown).
+
+        The third case is the gap-detection path that
+        ``test_seq_gap_causes_zerofill`` keys on (plan section 4.3 line
+        1474: "When the window slides past a seq with missing
+        fragments, the corresponding ring slot validity bit is set to
+        false and the slot is zero-filled" -- "missing fragments"
+        includes "never received any fragment").
         """
         assert self._head_seq is not None
         for seq_to_drop in range(self._head_seq, new_head):
             slot = self._slot_for(seq_to_drop)
-            if slot.occupied and not slot.all_frags_received:
-                self._on_zerofill(seq_to_drop, slot.n_frags_expected)
-            slot.reset()
+            if slot.occupied and slot.seq == seq_to_drop:
+                if slot.committed:
+                    slot.reset()
+                else:
+                    self._on_zerofill(seq_to_drop, slot.n_frags_expected)
+                    slot.reset()
+            else:
+                self._on_zerofill(seq_to_drop, 0)
         self._head_seq = new_head
 
     def ingest_fragment(
@@ -282,14 +306,18 @@ class _ReorderWindow:
             slot.fragments_received_bitmap |= (1 << frag_idx)
         slot.frag_buffers.append((frag_idx, payload))
 
-        if slot.all_frags_received:
+        if slot.all_frags_received and not slot.committed:
             # Reassemble fragments in order.
             slot.frag_buffers.sort(key=lambda x: x[0])
             full_payload = b"".join(p for _, p in slot.frag_buffers)
             validity = 0b00000001  # bit0 = data_present
             validity |= slot.validity_flags
             self._on_commit(slot.header, full_payload, validity)
-            slot.reset()
+            # Keep slot.occupied + slot.seq so _slide_to can distinguish
+            # "successfully committed" from "never received". The slot is
+            # released by _slide_to when the window advances past this seq.
+            slot.committed = True
+            slot.frag_buffers = []  # free payload bytes eagerly
 
 
 # ---------------------------------------------------------------------------

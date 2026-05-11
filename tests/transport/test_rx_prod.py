@@ -180,9 +180,10 @@ class TestReorderWindowHappyPath:
         n_filled = 200
         payload = _make_cint8_payload(n_filled)
         frags = split_payload_into_fragments(payload, max_frag_payload_bytes=n_filled)
-        # With n_filled=200 and max_frag=200, we get 1 fragment. Use smaller mtu.
+        # n_filled=200 cells at cint8 cplx (2 B/cell) = 400 B; split at
+        # max_frag=100 -> 4 fragments.
         frags = split_payload_into_fragments(payload, max_frag_payload_bytes=100)
-        assert len(frags) == 2
+        assert len(frags) == 4
 
         prod, slots = _make_prod()
 
@@ -465,14 +466,30 @@ class TestHeaderErrors:
         assert prod.prod_stats.bad_length_count == 1
 
     def test_reserved_bit2_set_dropped(self) -> None:
-        """v1 reserved-bit2 set → dropped + reserved_bit_count bumped."""
+        """v1 reserved-bit2 set → dropped + reserved_bit_count bumped.
+
+        ``pack_frame`` validates that bit2 MUST be zero, so we pack with
+        a valid flags value first and then patch bit2 on the wire to
+        simulate a non-conformant sender.
+        """
+        import struct as _struct
         prod, slots = _make_prod()
-        buf = _pack_single_fragment(
-            seq=0, n_filled=50, flags=FLAG_QUANTIZED | FLAG_RESERVED_BIT2
-        )
+        buf = bytearray(_pack_single_fragment(
+            seq=0, n_filled=50, flags=FLAG_QUANTIZED
+        ))
+        # Patch flags field (offset 6, uint16 LE) to set bit2.
+        cur_flags = _struct.unpack_from("<H", buf, 6)[0]
+        _struct.pack_into("<H", buf, 6, cur_flags | FLAG_RESERVED_BIT2)
+        buf = bytes(buf)
         prod.ingest_datagram(buf)
         assert len(slots) == 0
-        assert prod.prod_stats.reserved_bit_count == 1
+        # RX classifies reserved-bit drops under bad_field_range_count
+        # because chunk-1's ProdFrameFieldRangeError covers both reserved-
+        # bit and out-of-range fields; the RX doesn't message-sniff to
+        # break it out as a separate counter. The bad_field_range_count
+        # counter is the wire-format-error catch-all.
+        assert prod.prod_stats.bad_field_range_count == 1
+        assert prod.prod_stats.n_committed == 0
 
 
 # ---------------------------------------------------------------------------

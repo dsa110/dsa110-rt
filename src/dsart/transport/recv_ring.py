@@ -441,6 +441,14 @@ class RxRing:
         """Advance a compute reader's read sequence."""
         if self._closed:
             raise RuntimeError("RxRing is closed")
+        # PROT_READ for compute-attached rings (plan §4.4 line 1467) — the
+        # header is mapped read-only on the reader side, so an atomic
+        # store into read_seq_per_compute[] from the C library would
+        # SIGSEGV. The header field is dead state in v1 (plan: RX never
+        # reads it), so compute readers track read_seq in their own
+        # process memory and skip the C-level update. See M4a D14.
+        if not self._owner:
+            return
         lib = _get_lib()
         lib.rx_ring_update_read_seq(
             ctypes.c_void_p(self._handle),

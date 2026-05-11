@@ -284,6 +284,33 @@ The C extension `.so` is named `_recv_ring.cpython-<ver>-<arch>.so`
 `pip install -e .` (installed) and `python setup.py build_ext --inplace`
 (inplace) paths work.
 
+### D14 (chunk 4): `update_read_seq` is a no-op on readonly-attached rings
+
+`mmap_attach_readonly` maps the segment `PROT_READ` for compute readers
+per plan §4.4 line 1467 ("read-only for compute; only RX writes"). The
+chunk-4 C library's `rx_ring_update_read_seq` does an `__atomic_store_n`
+into `read_seq_per_compute[]`, which faults on a read-only page (SIGSEGV).
+
+Resolution: `RxRing.update_read_seq` early-returns when `not self._owner`
+(reader side). The header field `read_seq_per_compute[]` is dead state
+in v1 — plan §4.4 line 1471 pins "RX never reads
+`read_seq_per_compute[g]`; it advances its `write_seq_per_corr[c]`
+regardless of consumer progress." So compute-side read-seq tracking
+lives in Python state inside `ProductionRxRingSource` (and any future
+compute consumer), and the in-shm field is a forward-compat reservation.
+
+Alternative considered: map the segment RW for compute readers (i.e.,
+drop the PROT_READ pin). Rejected because plan §4.4 line 1467 explicitly
+calls out "read-only for compute" as a safety property — the RW model
+would let a buggy compute reader corrupt the writer's slot data.
+
+Discovered during post-merge integration testing on h01
+(test_release_updates_read_seq segfault, 2026-05-11). Both M4a F1
+in chunk 5 (cudaHostRegister deferral) and this D14 want the C API to
+grow a base-pointer accessor in chunk 7 — at that point we may also
+expose a `mmap_attach_with_read_seq_rw(...)` helper that maps the
+header RW while keeping the data slots PROT_READ. Deferred to chunk 7.
+
 ---
 
 ## Chunk ledger
