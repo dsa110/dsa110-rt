@@ -583,10 +583,22 @@ class TestPacerAndMonKeys:
         )
         try:
             cube = _make_sparse_cube(2, 1, 20)
-            for _ in range(10):
-                tx._transmit_one_cube_prod(cube, specnum=1, flags=0)
-            assert tx.tx_dropped_payloads > 0, (
-                "tx_dropped_payloads should be > 0 with rate=0"
+            # First send creates the per-dm buckets. Drain them so the
+            # *next* send must queue / drop instead of debiting tokens.
+            tx._transmit_one_cube_prod(cube, specnum=0, flags=0)
+            for bucket in tx._bucket_by_flow.values():
+                bucket._balance = 0.0
+                bucket._fifo.clear()
+            # With FIFO depth=1, subsequent payloads cause drops.
+            before = tx.tx_dropped_payloads
+            for specnum in range(1, 10):
+                tx._transmit_one_cube_prod(cube, specnum=specnum, flags=0)
+                # Keep the bucket drained between sends.
+                for bucket in tx._bucket_by_flow.values():
+                    bucket._balance = 0.0
+            assert tx.tx_dropped_payloads > before, (
+                "tx_dropped_payloads should increment when bucket is drained "
+                "and FIFO is at capacity"
             )
         finally:
             tx.close()
@@ -622,28 +634,36 @@ class TestPacerAndMonKeys:
         tx.close()
 
     def test_e4_token_rate_matches_target_within_10_percent(self):
-        """Token bucket refill matches target_gbps × headroom within 10%."""
+        """Token bucket refill matches target_gbps × headroom within 10%.
+
+        Refill is verified over 0.1 s with capacity sized larger than
+        the expected refill so we test the rate, not the capacity cap.
+        """
         target_gbps = 0.001          # 1 Mbps = 125 KB/s
         pacer_headroom = 1.05
-        expected_rate = target_gbps * 1e9 / 8.0 * pacer_headroom
+        expected_rate = target_gbps * 1e9 / 8.0 * pacer_headroom  # B/s
+        dt_s = 0.1
+        expected_refill_bytes = expected_rate * dt_s             # ~13125
 
         bucket = _TokenBucket(
             rate_bytes_per_sec=expected_rate,
-            capacity_bytes=int(DEFAULT_MAX_FRAG_PAYLOAD_BYTES * 4),
+            # Capacity big enough not to clamp the refill at this dt.
+            capacity_bytes=int(expected_refill_bytes * 10),
         )
         bucket._balance = 0.0
         start_ns = time.monotonic_ns()
-        one_sec_ns = int(1e9)
         bucket._last_ns = start_ns
 
         with mock.patch("dsart.transport.tx.time") as mock_time:
-            mock_time.monotonic_ns.return_value = start_ns + one_sec_ns
+            mock_time.monotonic_ns.return_value = start_ns + int(dt_s * 1e9)
             bucket._refill()
 
-        relative_error = abs(bucket._balance - expected_rate) / expected_rate
+        relative_error = (
+            abs(bucket._balance - expected_refill_bytes) / expected_refill_bytes
+        )
         assert relative_error < 0.10, (
-            f"Token rate error > 10%: expected={expected_rate:.1f} B/s, "
-            f"balance after 1 s = {bucket._balance:.1f}"
+            f"Token rate error > 10%: expected={expected_refill_bytes:.1f} B "
+            f"over {dt_s} s, got balance={bucket._balance:.1f}"
         )
 
 
