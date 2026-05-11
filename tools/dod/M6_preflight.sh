@@ -129,7 +129,7 @@ pass
 
 STEP="git_branch"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[[ "${BRANCH}" == "m6/main" ]] || fail "expected branch=m6/main, got ${BRANCH}"
+[[ "${BRANCH}" == "m6/main" || "${BRANCH}" == "integration/m3-m5-m6" ]] || fail "expected branch=m6/main or integration/m3-m5-m6, got ${BRANCH}"
 git remote -v | grep -q '^origin' || fail "missing origin remote"
 pass
 
