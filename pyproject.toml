@@ -30,3 +30,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# M4a chunk 4: _recv_ring C extension is declared in setup.py because
+# pyproject.toml does not support ext_modules directly via setuptools.
+# See setup.py at repo root.
