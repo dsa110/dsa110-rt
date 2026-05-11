@@ -52,13 +52,133 @@ Six DoD invariants (plan §M4a line 2383):
 
 ## F-items (fixes — corrections / additions to plan.md)
 
-_(none yet — populate as fixes are discovered during chunk development)_
+### F1 (chunk 2): `specnum` plumbing into `TransportTx.transmit`
+
+Plan §4.3 header line 1422 specifies `specnum` (uint64, SNAP block-start
+counter, cross-corr time alignment). The chunk-8 `TransportTx.transmit`
+Protocol signature is
+
+```python
+def transmit(self, cubes_for_tx, *, block_n: int, rfi_warming_up: bool) -> int
+```
+
+— there is no `specnum` argument; `block_n` is the chunk-4 corr-side
+block counter (NOT the F-engine packet seq). The chunk-2 prod-frame
+path needs `specnum` from upstream block metadata.
+
+**Chunk-2 mitigation**: extended the `transmit(...)` signature with an
+optional `specnum: int | None = None` argument. When
+`use_prod_frame=True` and `specnum is None`, `transmit` raises
+`NotImplementedError` with a clear message about wiring upstream.
+
+**Fold-back during M4a hardening**: the `TransportTxStage` Protocol in
+`services/corr_fast_integration.py` should add `specnum` to its
+contract, and the chunk-4 orchestrator should pass the SNAP block-start
+seq derived from the upstream voltage-block metadata (chunk-4 already
+has access to specnum-equivalent fields via the fada reader; see
+`F-engine packet block` plumbing in `slow_corr_kernel.py`).
+
+### F2 (chunk 2): image-cube ndim=4 deferred in prod path
+
+The chunk-8 path supports both sparse-COO (ndim=3) and image-cube
+(ndim=4) cubes per F26 (M3 chunk-8). The chunk-2 prod-frame path
+deliberately implements only the sparse-COO case (the §4.3 wire format
+is COO + `pattern_id` round-trip; image-cube delivery would require a
+peer wire format).
+
+`_transmit_one_cube_prod` raises `NotImplementedError` on `ndim==4`
+with a clear pointer to the chunk-7 net-loopback bench. If the
+chunk-7 bench needs image-cube delivery, the M4a driver should add a
+dedicated wire format (likely outside the prod-frame envelope, since
+N_grid² fp16 = 65 536 × 4 B / 8964 ≈ 30 fragments per (dm, t) pair
+puts heavy pressure on the seq counter).
 
 ---
 
 ## D-items (decisions — implementation-level choices locked during M4a)
 
-_(none yet — populate as decisions are made during chunk development)_
+### D1 (chunk 2): `FLAG_QUANTIZED` is set only for cint8, not cfp16
+
+Plan §4.3 line 1414 reads `bit0=quantized` (vs cfp16 — implicit in
+§4.3 wire-format bullet line 1408 "operational cint8 cell"). The
+chunk-1 spec (`prod_frame.py` `FLAG_QUANTIZED` constant docstring)
+calls bit0 "payload is quantized cint8 (vs cfp16)" — distinct from
+`bits_per_cell`, which is the encoding selector.
+
+Chunk-2 locks: `FLAG_QUANTIZED` is set iff `bits_per_cell ==
+BITS_CINT8_COMPLEX` (16). For cfp16 (32), the wire payload is the
+"no quantisation" fp16 path and the bit is clear. `scale` and
+`offset` are fixed at `1.0` and `0.0` respectively for cfp16
+(identity dequant), so the receiver's `x = scale*q + offset` rule
+applies uniformly across both paths.
+
+Tests: `test_c2_cfp16_scale_is_identity_flag_quantized_clear` and
+`test_x8_cint8_flag_quantized_set_cfp16_not_set` pin this behaviour.
+
+### D2 (chunk 2): per-flow pacer is keyed by `dm_idx` only
+
+Plan §4.3 line 1447 specifies "per-flow token-bucket rate-limiter".
+The §4.3 line 1402 "per (corr, search) pair" UDP flow vocabulary
+suggests one flow per corr-side TX (since each `TransportTx` binds
+to one destination IP:port already). Within a single `TransportTx`,
+the "per-flow" cardinality is therefore per-`dm_idx` (matching the
+`seq_by_flow: dict[(corr_idx, dm_idx), int]` plan §4.3 line 1421
+contract for sequence numbers).
+
+Chunk-2 locks: `TransportTx._bucket_by_flow: dict[int, _TokenBucket]`
+keyed by `dm_idx`, lazily created when a `dm_idx` is first seen.
+The `(corr_idx, ...)` half of the (corr, dm_idx) key is implicit
+because each TransportTx is bound to one corr's chgroup, and the
+mon-key path `/mon/corr/<corr_idx>/transport/tx_dropped_payloads`
+already discriminates by corr.
+
+### D3 (chunk 2): seq advances even when all fragments dropped
+
+Plan §4.3 line 1421: "seq is monotonically increasing per (corr,
+dm_idx) flow". When the pacer drops every fragment of a payload
+(extreme back-pressure), the seq counter still advances by one
+(the payload is "emitted" from the corr's POV — the drop is
+accounted via `tx_dropped_payloads`, not as a "didn't emit a seq").
+
+This matches the chunk-1 receiver-side contract: missing fragments
+are detected via the seq reorder window slide-out (§4.3 line 1473).
+If the TX skipped seq values, the receiver could not distinguish a
+"silent TX" from a "lost-on-wire" event.
+
+Chunk-2 locks: in `_transmit_one_cube_prod`, the `_next_seq(dm_idx)`
+call is made before the per-fragment send loop, and `seq` is reused
+across all fragments of the same payload. `tx_dropped_payloads`
+increments at most once per (dm_idx, t_idx) payload regardless of
+how many fragments were dropped.
+
+### D4 (chunk 2): token-bucket "drop-oldest" semantics
+
+Plan §4.3 line 1447: "if the bucket throttles, the sender drops the
+oldest queued payload". The chunk-2 `_TokenBucket` implements this
+literally: when the FIFO is full and a new item arrives that cannot
+be sent immediately, the FIFO's oldest entry is popped and
+`drop_count` is incremented. The new item replaces it. The fixed
+bucket capacity is `max_frag_payload_bytes * 4` (4-fragment burst
+absorption), and the FIFO depth is configurable
+(`TransportTxProdConfig.bucket_fifo_depth`, default 4).
+
+### D5 (chunk 2): mon-key emission is in-process counters (M0 pattern)
+
+The plan §3.7 mon-key registry expects `/mon/corr/<n>/transport/*`
+keys writable by the M4a driver. Per `M4a_PLAN_FIXES.md` "Mon-keys
+M4a is responsible for emitting", M4a uses `tools.mon_key_emitter`
+for benches and real `/mon/` writes are wired in M7.
+
+`tools/mon_key_emitter.py` does not yet exist in the repo (the M3
+chunks emit their mon-keys via direct attribute access on the
+service object, drained by chunk-7-and-later wiring). Chunk-2
+follows the M3 pattern: expose `tx_dropped_payloads` and
+`cube_seq_emitted` as `int64` attributes on the `TransportTx`
+instance; an external drainer (chunk-7 bench, M7 etcd writer) reads
+them at the 2 s mon-key cadence. The attribute names map 1:1 onto
+the `/mon/corr/<n>/transport/*` key suffixes.
+
+---
 
 ---
 
@@ -68,8 +188,8 @@ M4a chunks (deps in parens):
 
 | # | Chunk | Status | Owner |
 |---|---|---|---|
-| 1 | `prod_frame_72b` — `src/dsart/transport/prod_frame.py` + tests | scaffolding | M4a driver (synchronous) |
-| 2 | `tx_prod_header` — `transport/tx.py` extend to 72-byte header + fragmentation + token-bucket pacer | not started | TX agent |
+| 1 | `prod_frame_72b` — `src/dsart/transport/prod_frame.py` + tests | merged (42/42 on h01) | M4a driver (synchronous) |
+| 2 | `tx_prod_header` — `transport/tx.py` extend to 72-byte header + fragmentation + token-bucket pacer | landed on `m4a/tx-prod-header` (35/35 chunk-2 tests; 42/42 chunk-1; 16/16 chunk-8 loopback on h01) | TX agent |
 | 3 | `rx_defrag` — `transport/rx.py` per-(corr, dm_idx) reorder window + bitmap + pattern_id verify | not started | RX agent |
 | 4 | `recv_ring_shm` — POSIX-shm SPMC sparse ring (`transport/recv_ring.{c,py}`); CONC-1 contract | not started | RX agent |
 | 5 | `production_source` — `transport/production_rx_ring.py` satisfying `services/rx_ring.RxRingSource` Protocol | not started | RX agent (deps 3 + 4) |
