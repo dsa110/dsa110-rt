@@ -21,7 +21,11 @@ dependencies:
   - scipy
   # psrdada-python (TRASAL) .pyx files don't compile with Cython 3.x.
   - cython >=0.29.36,<3
-  - setuptools
+  # setuptools 81 removed the bundled `pkg_resources` module; dsautils
+  # (dsa110-pyutils) still does `from pkg_resources import …` in
+  # dsa_store.py / dsa_logging.py. Pin <81 until the observatory utils
+  # are ported to importlib.resources.
+  - setuptools <81
   - wheel
   - astropy
   - pyyaml
