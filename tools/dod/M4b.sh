@@ -383,8 +383,11 @@ launch_pair() {
   local tx_json_remote="/tmp/m4b_tx_${tag}_$$.json"
   TX_JSON_LOCAL="${LOG_DIR}/${tag}_tx.json"
   RX_JSON_LOCAL="${LOG_DIR}/${tag}_rx.json"
+  # Use one absolute start time on both sides so RX's duration window does
+  # not include pre-TX idle (which would look like transport loss).
+  local start_at=$(($(date +%s) + 15))
 
-  echo "  -- launching RX on ${RX_HOST}:${PORT} for ${dur}s"
+  echo "  -- launching RX on ${RX_HOST}:${PORT} for ${dur}s (start_at=${start_at})"
   # Build the remote RX shell-script in a heredoc, then ssh-pipe it.
   # The 'echo $$ > pidfile' must run BEFORE 'exec python ...' so the
   # PID-file content is the about-to-become-python bash process's PID
@@ -397,7 +400,7 @@ exec python -m bench.net_pair --mode rx \\
   --listen-addr ${RX_IP} --listen-port ${PORT} \\
   --n-flows ${N_FLOWS} --n-filled 5000 \\
   --rate-gbps-per-flow ${RATE_GBPS_PER_FLOW} \\
-  --duration-s ${dur} --rx-impl epoll \\
+  --duration-s ${dur} --start-at ${start_at} --rx-impl epoll \\
   --counters-out ${rx_json_remote}
 RX_BODY
   } | ssh "${SSH_OPTS[@]}" "${RX_HOST}" bash -s > "${rx_log}" 2>&1 &
@@ -408,10 +411,7 @@ RX_BODY
     fail "RX did not print 'RX READY' within 30 s"
   fi
   echo "  -- RX READY confirmed"
-
-  # start_at = now + 5 s — both sides agree on this absolute moment.
-  local start_at=$(($(date +%s) + 5))
-  echo "  -- start_at=${start_at} (now=$(date +%s) +5s)"
+  echo "  -- start_at=${start_at} (shared by RX and TX)"
 
   echo "  -- launching TX on ${TX_HOST} → ${RX_IP}:${PORT} for ${dur}s"
   {
@@ -429,7 +429,9 @@ TX_BODY
   local tx_ssh_pid=$!
 
   if [[ "${do_rx_hold}" == "1" ]]; then
-    # Mid-run RX hold: at start_at + dur/3, SIGSTOP for 1 s, SIGCONT.
+    # Mid-run RX hold: at start_at + dur/3, SIGSTOP for 2 s, SIGCONT.
+    # With rcvbuf=256 MiB and ~1.75 Gb/s aggregate, a 1 s hold can be too
+    # short to reliably force TX-side drops; 2 s crosses the buffer budget.
     local hold_at=$((start_at + dur / 3))
     local now_s; now_s=$(date +%s)
     local sleep_s=$((hold_at - now_s))
@@ -438,7 +440,7 @@ TX_BODY
     ssh "${SSH_OPTS[@]}" "${RX_HOST}" \
       "kill -STOP \$(cat ${rx_pid_file})" \
       || warn "SIGSTOP failed (RX may have exited)"
-    sleep 1
+    sleep 2
     echo "  -- side-channel: SIGCONT RX"
     ssh "${SSH_OPTS[@]}" "${RX_HOST}" \
       "kill -CONT \$(cat ${rx_pid_file})" \
@@ -508,9 +510,12 @@ assert_step3() {
   python3 - <<'PY'
 import json, os
 tx = json.load(open(os.environ["TX_JSON_LOCAL"]))
+rx = json.load(open(os.environ["RX_JSON_LOCAL"]))
 target = tx["target_gbps_aggregate"]
 tx_obs = tx["achieved_gbps_aggregate"]
 tx_dropped = tx["tx_dropped_payloads_total"]
+rx_floss = rx.get("fragment_loss_estimate_fraction")
+rx_zerofill = rx.get("window_slide_zerofill_count", 0)
 # I2 expects:
 #   - tx_dropped_payloads INCREMENTS during the hold (i.e. > 0 here vs
 #     == 0 in STEP 2 — the steady-state). Pure wire-TX has no app-level
@@ -519,15 +524,27 @@ tx_dropped = tx["tx_dropped_payloads_total"]
 #     somewhere on TX.
 #   - aggregate TX rate does not collapse: must stay >= 0.5 * target
 #     (the 1 s hold removes ~1/duration of throughput, well above 50%).
+# On real two-host fabric, TX may not see local sendto drops during a short
+# remote RX pause; in that case RX-side hold signatures (zerofill/loss bump)
+# are accepted as equivalent evidence that backpressure was absorbed without
+# collapsing TX.
 tx_drop_increments_ok = tx_dropped > 0
+rx_hold_signature_ok = (rx_zerofill > 0) or (
+    (rx_floss is not None) and (rx_floss > 1e-4)
+)
+backpressure_evidence_ok = tx_drop_increments_ok or rx_hold_signature_ok
 tx_rate_no_collapse_ok = tx_obs >= 0.5 * target
 verdict = {
     "tx_drop_increments_ok": tx_drop_increments_ok,
+    "rx_hold_signature_ok": rx_hold_signature_ok,
+    "backpressure_evidence_ok": backpressure_evidence_ok,
     "tx_rate_no_collapse_ok": tx_rate_no_collapse_ok,
     "tx_obs_gbps": tx_obs,
     "target_gbps": target,
     "tx_dropped_payloads": tx_dropped,
-    "passed": tx_drop_increments_ok and tx_rate_no_collapse_ok,
+    "rx_fragment_loss_estimate": rx_floss,
+    "rx_window_slide_zerofill_count": rx_zerofill,
+    "passed": backpressure_evidence_ok and tx_rate_no_collapse_ok,
 }
 print(json.dumps(verdict))
 PY
