@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# dsart-rt -- single operator tool for the dsart-rt control plane (M7).
+#
+# Wraps two concerns the operator interacts with:
+#
+#   1. SYSTEMD layer ('services' subcommand): bring the per-node
+#      dsart-rt.service up/down on a fleet of hosts via `systemctl --user`
+#      over SSH.
+#   2. ETCD layer ('pipeline' / 'verb' / 'mon' subcommands): drive the
+#      pipeline by writing JSON {cmd, val} into /cmd/<namespace>/<n> and
+#      reading /mon/<namespace>/<n> via dsautils.
+#
+# The two layers stay disjoint by design (per Q15 of the M7 scoping
+# doc): services-layer manages the orchestrator process; etcd-layer
+# drives the pipeline routines it spawns.
+#
+# Default node sets match the production topology
+# (REALTIME_FRB_SEARCH.md §1): 16 corr nodes (n01..n22 minus n17/n20
+# minus the 4 search nodes), 4 search nodes (n01, n02, n09, n13).
+#
+# Examples:
+#   dsart-rt services up    --corr n06 --search n01           # smoke 1+1
+#   dsart-rt services up                                       # full fleet
+#   dsart-rt services status                                   # whole fleet
+#   dsart-rt pipeline start --dec 53.85                        # broadcast
+#   dsart-rt pipeline stop                                     # broadcast
+#   dsart-rt verb send utc_start --val 1234567 --corr n06
+#   dsart-rt mon show       --corr n06
+#
+# Status / exit code conventions:
+#   0 -- success on all nodes
+#   1 -- partial success (some node(s) failed; see stderr)
+#   2 -- usage error
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# --- Default fleet (REALTIME_FRB_SEARCH.md §1) ------------------------
+# Source-of-truth name: tools/dod/corner_turn.sh ${CORR_NODES} +
+# ${RX_IP[@]}. We mirror those here for ergonomic dsart-rt usage.
+DEFAULT_CORR_NODES="n03 n04 n05 n06 n07 n08 n10 n11 n12 n14 n15 n16 n18 n19 n21 n22"
+DEFAULT_SEARCH_NODES="n01 n02 n09 n13"
+
+# Map node -> CN id for the orchestrator (-cn arg). For corr nodes the
+# CN id is the trailing digit pair (n06 -> 6); for search nodes same.
+# This intentionally matches the operator's mental model.
+node_to_cn() {
+  local n="${1#n}"
+  printf '%s' "${n#0}"  # strip leading zero so n06 -> 6
+}
+
+# SSH wrapper: per-node, ~5s connect timeout. Inherit caller's
+# SSH agent so passwordless flows work when configured.
+SSH_OPTS=(-o ConnectTimeout=5 -o StrictHostKeyChecking=no
+          -o BatchMode=yes -o LogLevel=ERROR)
+
+usage() {
+  cat >&2 <<'EOF'
+dsart-rt -- single operator tool for the dsart-rt control plane (M7).
+
+USAGE
+  dsart-rt services {install|up|down|restart|status} [--corr LIST] [--search LIST]
+  dsart-rt pipeline {start|stop|status}              [--corr LIST] [--search LIST] [--dec D] [--val V]
+  dsart-rt verb send VERB                            [--corr LIST] [--search LIST] [--val V]
+  dsart-rt mon   {show|tail}                         [--corr LIST] [--search LIST]
+  dsart-rt push-config                               [--instance pipeline_rt|search_rt|all]
+
+ARGUMENTS
+  --corr   "n03 n04 ..."  override the corr-node list (default: 16 prod nodes)
+  --search "n01 n02 ..."  override the search-node list (default: 4 prod nodes)
+  --dec D                 observing dec in degrees (used as `start` verb val)
+  --val V                 raw verb value (passed through for `verb send`)
+  --instance I            push-config target instance
+
+For details on each subcommand see services/dsart-rt.service +
+src/dsart/services/dsart_rt.py docstrings.
+EOF
+  exit 2
+}
+
+# --- Arg parser ---------------------------------------------------------
+SUBCMD="${1:-}"; shift || true
+ACTION="${1:-}"
+case "${SUBCMD}" in
+  services|pipeline|mon|verb|push-config) ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "[ERROR] unknown subcommand: ${SUBCMD}" >&2; usage ;;
+esac
+[[ -n "${ACTION}" || "${SUBCMD}" == "push-config" ]] && shift || true
+
+CORR_NODES="${DEFAULT_CORR_NODES}"
+SEARCH_NODES="${DEFAULT_SEARCH_NODES}"
+DEC_ARG=""
+VAL_ARG=""
+INSTANCE_ARG="all"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --corr)     CORR_NODES="$2"; shift 2;;
+    --search)   SEARCH_NODES="$2"; shift 2;;
+    --dec)      DEC_ARG="$2"; shift 2;;
+    --val)      VAL_ARG="$2"; shift 2;;
+    --instance) INSTANCE_ARG="$2"; shift 2;;
+    -h|--help)  usage;;
+    *) echo "[ERROR] unknown flag: $1" >&2; usage;;
+  esac
+done
+
+# --- Helpers ------------------------------------------------------------
+
+remote_ssh() {
+  local host="$1" rest=("${@:2}")
+  ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" "${rest[@]}"
+}
+
+for_each_node() {
+  # $1: instance name (pipeline_rt|search_rt; informational only).
+  # $2: node list.
+  # $3+: function name + extra args. The function is called as
+  #      `$fn <host> <cn_id> <instance> <extra...>`.
+  local instance="$1" nodes="$2"; shift 2
+  local fn="$1"; shift
+  local exit_status=0
+  for node in ${nodes}; do
+    local cn; cn=$(node_to_cn "${node}")
+    if ! "${fn}" "${node}" "${cn}" "${instance}" "$@"; then
+      exit_status=1
+    fi
+  done
+  return ${exit_status}
+}
+
+# ---- services subcommands ---------------------------------------------
+
+services_install_one() {
+  local host="$1" cn="$2" instance="$3"
+  printf '[%s] install dsart-rt.service (instance=%s, cn=%d)\n' "${host}" "${instance}" "${cn}"
+  # Push the unit file + per-host env file + ensure ~/.config/systemd/user exists.
+  local unit_src="${REPO_ROOT}/services/systemd/dsart-rt.service"
+  ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" \
+    "mkdir -p ~/.config/systemd/user && \
+     cat > ~/.config/dsart-rt.env <<EOF
+DSART_INSTANCE=${instance}
+DSART_CN=${cn}
+DSART_CONDA_ROOT=\${DSART_CONDA_ROOT:-/home/ubuntu/miniforge3}
+DSART_CONDA_ENV=\${DSART_CONDA_ENV:-dsa110-rt}
+DSART_RT_LOG_DIR=\${DSART_RT_LOG_DIR:-/home/ubuntu/tmp/dsart-rt}
+EOF"
+  scp -q "${SSH_OPTS[@]}" "${unit_src}" "${host}.pro.pvt:~/.config/systemd/user/dsart-rt.service"
+  ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" "systemctl --user daemon-reload"
+}
+
+services_up_one() {
+  local host="$1"
+  printf '[%s] systemctl --user start dsart-rt\n' "${host}"
+  ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" \
+    "systemctl --user start dsart-rt && systemctl --user is-active dsart-rt"
+}
+
+services_down_one() {
+  local host="$1"
+  printf '[%s] systemctl --user stop dsart-rt\n' "${host}"
+  ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" "systemctl --user stop dsart-rt || true"
+}
+
+services_restart_one() {
+  local host="$1"
+  printf '[%s] systemctl --user restart dsart-rt\n' "${host}"
+  ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" "systemctl --user restart dsart-rt"
+}
+
+services_status_one() {
+  local host="$1"
+  local out
+  if out=$(ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" \
+       "systemctl --user is-active dsart-rt 2>&1; \
+        systemctl --user show -p MainPID -p ActiveState -p SubState dsart-rt 2>&1" 2>&1); then
+    printf '[%s] %s\n' "${host}" "$(printf '%s' "${out}" | tr '\n' ' ')"
+  else
+    printf '[%s] SSH FAILED\n' "${host}"
+    return 1
+  fi
+}
+
+# ---- pipeline / verb subcommands --------------------------------------
+# These talk to etcd from h23 (or wherever the operator is running this
+# script). We need dsautils available locally for that. Falls back to
+# trying conda-activated dsa110-rt env if dsautils not on default PATH.
+
+with_conda_python() {
+  if python3 -c "import dsautils" 2>/dev/null; then
+    python3 "$@"
+    return
+  fi
+  bash -lc "source /home/ubuntu/miniforge3/etc/profile.d/conda.sh && conda activate dsa110-rt >/dev/null 2>&1 && python3 $*"
+}
+
+verb_send_one() {
+  local host="$1" cn="$2" instance="$3" verb="$4" val="$5"
+  local ns
+  if [[ "${instance}" == "pipeline_rt" ]]; then ns=corr_rt; else ns=search_rt; fi
+  printf '[%s] etcd put /cmd/%s/%d <- {cmd:%s, val:%s}\n' "${host}" "${ns}" "${cn}" "${verb}" "${val:-null}"
+  with_conda_python - <<PYEOF
+from dsautils.dsa_store import DsaStore
+import json
+val = ${val:-None}
+DsaStore().put_dict("/cmd/${ns}/${cn}", {"cmd": "${verb}", "val": val})
+PYEOF
+}
+
+mon_show_one() {
+  local host="$1" cn="$2" instance="$3"
+  local ns
+  if [[ "${instance}" == "pipeline_rt" ]]; then ns=corr_rt; else ns=search_rt; fi
+  with_conda_python - <<PYEOF
+from dsautils.dsa_store import DsaStore
+import json
+d = DsaStore().get_dict("/mon/${ns}/${cn}") or {}
+print("== ${host} cn=${cn} ${instance} ==")
+print(json.dumps(d, indent=2)[:1200])
+PYEOF
+}
+
+# ---- entry-point dispatch ---------------------------------------------
+
+case "${SUBCMD}" in
+  services)
+    case "${ACTION}" in
+      install)
+        for_each_node pipeline_rt "${CORR_NODES}" services_install_one
+        for_each_node search_rt   "${SEARCH_NODES}" services_install_one
+        ;;
+      up)
+        for_each_node pipeline_rt "${CORR_NODES}" services_up_one
+        for_each_node search_rt   "${SEARCH_NODES}" services_up_one
+        ;;
+      down)
+        for_each_node pipeline_rt "${CORR_NODES}" services_down_one
+        for_each_node search_rt   "${SEARCH_NODES}" services_down_one
+        ;;
+      restart)
+        for_each_node pipeline_rt "${CORR_NODES}" services_restart_one
+        for_each_node search_rt   "${SEARCH_NODES}" services_restart_one
+        ;;
+      status)
+        for_each_node pipeline_rt "${CORR_NODES}" services_status_one
+        for_each_node search_rt   "${SEARCH_NODES}" services_status_one
+        ;;
+      *) echo "[ERROR] unknown services action: ${ACTION}" >&2; usage ;;
+    esac
+    ;;
+
+  pipeline)
+    case "${ACTION}" in
+      start)
+        # `start` verb val carries observing dec in degrees (CUSTOMDEC).
+        val="${DEC_ARG}"
+        if [[ -z "${val}" ]]; then
+          echo "[WARN] no --dec given; pipeline 'start' verb val=null (CUSTOMDEC not substituted)" >&2
+          val=""
+        fi
+        for_each_node pipeline_rt "${CORR_NODES}" verb_send_one start "${val:-None}"
+        for_each_node search_rt   "${SEARCH_NODES}" verb_send_one start "${val:-None}"
+        ;;
+      stop)
+        for_each_node pipeline_rt "${CORR_NODES}" verb_send_one stop None
+        for_each_node search_rt   "${SEARCH_NODES}" verb_send_one stop None
+        ;;
+      status)
+        for_each_node pipeline_rt "${CORR_NODES}" mon_show_one
+        for_each_node search_rt   "${SEARCH_NODES}" mon_show_one
+        ;;
+      *) echo "[ERROR] unknown pipeline action: ${ACTION}" >&2; usage ;;
+    esac
+    ;;
+
+  verb)
+    if [[ "${ACTION}" != "send" ]]; then
+      echo "[ERROR] verb subcommand only supports 'send'" >&2; usage
+    fi
+    target_verb="$1"; shift || { echo "[ERROR] need VERB arg" >&2; usage; }
+    for_each_node pipeline_rt "${CORR_NODES}" verb_send_one "${target_verb}" "${VAL_ARG:-None}"
+    for_each_node search_rt   "${SEARCH_NODES}" verb_send_one "${target_verb}" "${VAL_ARG:-None}"
+    ;;
+
+  mon)
+    case "${ACTION}" in
+      show)
+        for_each_node pipeline_rt "${CORR_NODES}" mon_show_one
+        for_each_node search_rt   "${SEARCH_NODES}" mon_show_one
+        ;;
+      *) echo "[ERROR] unknown mon action: ${ACTION}" >&2; usage ;;
+    esac
+    ;;
+
+  push-config)
+    cd "${REPO_ROOT}"
+    with_conda_python "${REPO_ROOT}/tools/ops/push_dsart_to_etcd.py" \
+      --instance "${INSTANCE_ARG}" --config-dir "${REPO_ROOT}/configs"
+    ;;
+esac

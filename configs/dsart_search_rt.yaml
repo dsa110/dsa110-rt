@@ -1,0 +1,45 @@
+# dsart-rt search-node pipeline config — pushed to etcd under
+# /cnf/search_rt by tools/ops/push_dsart_to_etcd.py and consumed at
+# runtime by services/dsart_rt.py (`-in search_rt`).
+#
+# Search nodes have NO PSRDADA buffers in the M4a transport contract —
+# the search-RX writes directly into a POSIX-shm SPMC sparse ring
+# (src/dsart/transport/recv_ring.c + production_rx_ring.py) and the
+# search-compute halves attach to that ring. So 'buffers:' is empty by
+# design; recv_ring is created/torn-down inside the search-rx process
+# itself (M4a chunk 4 ownership), not by dsart_rt's dada_db setup.
+#
+# Schema parity with dsart_pipeline_rt.yaml is preserved so the same
+# dsart_rt.py orchestrator binary handles both instances.
+schema_version: 1
+
+# No mode switch for search — the search-side wire format is always
+# the M4a prod-frame UDP regardless of whether the corr senders are
+# in junkdb or real mode. Synthetic search-side load tests (M7.2)
+# instead use bench/net_pair.py as the TX side, with the real search-rx
+# binary as the RX side; we don't fork the search-side pipeline graph.
+
+buffers: []
+
+routines:
+  # ---- search-rx (M4a chunk-6 C epoll) ----------------------------
+  # Lands in M7.2 — kept stubbed so the schema is complete. The
+  # search-rx binary owns its POSIX-shm ring lifecycle; dsart_rt just
+  # fork-execs it and tracks the PID + emits mon-dict.
+  # - name: search_rx
+  #   cmd: python
+  #   args: -m dsart.transport.recv_epoll --bind 10.41.0.x --port-base 6625 --so-rcvbuf 268435456 --ring-shm-name /dsart_rxring
+  #   hostargs:
+  #     n01: --bind 10.41.0.205
+  #     n02: --bind 10.41.0.222
+  #     n09: --bind 10.41.0.253
+  #     n13: --bind 10.41.0.238
+
+  # ---- search-compute x 2 (one per GPU half) ----------------------
+  # Land in M7.2 alongside search-rx. Stubbed:
+  # - name: search_compute_0
+  #   cmd: python
+  #   args: -m dsart.services.search_compute --search-id CN --gpu-half 0 --ring-shm-name /dsart_rxring
+  # - name: search_compute_1
+  #   cmd: python
+  #   args: -m dsart.services.search_compute --search-id CN --gpu-half 1 --ring-shm-name /dsart_rxring

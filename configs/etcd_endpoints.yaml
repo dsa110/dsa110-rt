@@ -1,7 +1,18 @@
 # Etcd client endpoints for pipeline_rt / search_rt mirrors (§4.6).
 #
-# PLACEHOLDER — chunk 2C: copy the cluster URL list from the dsa110-shell etcd client
-# configuration (same source legacy corr/search tooling uses) and paste under endpoints below.
+# Production cluster — same endpoint legacy corr.py uses
+# (cf. /home/ubuntu/miniforge3/envs/dsa110-rt/lib/python3.11/site-packages/
+# dsautils/conf/etcdConfig.yml on every corr/search node). The legacy
+# stack and the new dsart-rt control plane share this cluster but write
+# to disjoint key namespaces (legacy = /cnf/pipeline + /cmd/corr/<n> +
+# /mon/corr/<n>; dsart-rt = /cnf/pipeline_rt + /cmd/corr_rt/<n> +
+# /mon/corr_rt/<n>) so the two can run side-by-side without contending
+# for the same etcd keys.
+#
+# In Python, prefer dsautils.dsa_store.DsaStore() which auto-discovers
+# this endpoint and handles JSON dict put/get/watch. Direct etcd3
+# clients should hit the host:port form (no http:// prefix; etcd3 0.12
+# does not accept URLs).
 schema_version: 1
 endpoints:
-  - http://127.0.0.1:2379
+  - etcdv3service.pro.pvt:2379

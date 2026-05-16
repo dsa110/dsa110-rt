@@ -1,0 +1,90 @@
+# dsart-rt corr-node pipeline config — pushed to etcd under
+# /cnf/pipeline_rt by tools/ops/push_dsart_to_etcd.py and consumed at
+# runtime by services/dsart_rt.py (`-in pipeline_rt`).
+#
+# Schema mirrors the legacy /cnf/pipeline (corr.py-compatible) so the
+# routine substitution + spawn semantics stay identical to the existing
+# operator workflow. The two key differences vs legacy are:
+#
+#   1. The 'captures.mode' switch lets a corr node feed the fada chain
+#      from synthetic data (dada_junkdb) instead of the real SNAP
+#      capture binary. This is what the M7.1 / M7.3 stages of the on-sky
+#      bring-up use (production-rate plumbing without a telescope).
+#
+#   2. fada is multi-reader (r=2) so slow- and fast-corr can attach to
+#      the same ring without copying. The legacy /cnf/pipeline does the
+#      same; called out here because new readers (a diagnostic tap, for
+#      example) MUST bump r before being added.
+#
+# Buffer byte/block math is physics-pinned by the legacy block layout —
+# see configs/config_corr.yaml comments for the derivation. Do NOT edit
+# without also editing the consumer services.
+schema_version: 1
+
+# captures.mode is the M7 stage switch:
+#   junkdb  → spawn dada_junkdb x2 (fills dada+eada with /dev/urandom at
+#             native cadence; used by M7.1/M7.3 plumbing stages).
+#   real    → spawn dsaX_capture_manythread x2 (live SNAP UDP capture;
+#             used by M7.5/M7.6 on-sky stages).
+# M7.0 ships both routine sets but the captures.mode flag is consulted
+# by dsart_rt._select_routines() before spawning.
+captures:
+  mode: junkdb
+
+buffers:
+  - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
+  - {k: eada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 1)
+  - {k: fada, b: 301989888, n: 70,  c: 1, r: 2}   # 288 MiB x 70 = 9.4 s merged voltage (slow + fast both read)
+  - {k: bada, b:  28606464, n: 300, c: 1, r: 1}   # 27.3 MiB x 300 = 40 s slow-vis (meridian_fringestop reads)
+
+routines:
+  # ---- captures (mode-gated) ---------------------------------------
+  # dada_junkdb usage (verified against the installed binary on n06,
+  # /usr/local/bin/dada_junkdb): positional arg is a PSRDADA ASCII
+  # header file (NOT a data source); -g is a flag for gaussian
+  # distribution (not a path); -r is MB/s; -t seconds. The legacy
+  # correlator_header_dsaX.txt under dsa110-xengine/src/ is byte-shape
+  # compatible with the dada/eada blocks. M0.sh::[plumbing_junkdb]
+  # uses this same header for the same role.
+  - name: cap_a_junkdb
+    when: captures.mode == junkdb
+    cmd: /usr/local/bin/dada_junkdb
+    # -r 1200 MB/s ~= 144 MiB/0.134218s native cadence (tools/junkdb_runbook.md).
+    # -t 86400 = 1 day (orchestrator stops it via SIGTERM on `stop` verb).
+    # -g = gaussian-distributed payload (flag, no value).
+    args: -k dada -r 1200 -t 86400 -g /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+  - name: cap_b_junkdb
+    when: captures.mode == junkdb
+    cmd: /usr/local/bin/dada_junkdb
+    args: -k eada -r 1200 -t 86400 -g /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+
+  - name: cap_a_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_capture_manythread
+    args: -k dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
+  - name: cap_b_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_capture_manythread
+    args: -k eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+
+  # ---- merge (always on; reads dada+eada -> writes fada) ------------
+  # Lands in M7.1 — kept here as a stub so the schema is complete.
+  # - name: merge
+  #   cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
+  #   args: -i dada -j eada -o fada
+
+  # ---- corr_slow + corr_fast --------------------------------------
+  # Land in M7.1. Stubbed for forward visibility:
+  # - name: corr_slow
+  #   cmd: python
+  #   args: -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device auto
+  # - name: corr_fast
+  #   cmd: python
+  #   args: -m dsart.services.corr_fast_integration --fada-key fada --chgroup CHGROUP --obs-dec-deg CUSTOMDEC --device auto
+  #   hostargs:
+  #     # Chgroup is fixed per corr node (REALTIME_FRB_SEARCH.md §1
+  #     # n03=chgroup0, n04=1, ..., n22=15). CHGROUP gets substituted
+  #     # from each host's --cn arg at routine spawn time.
+  #     n03: --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
+  #     n04: --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb01.dat
+  #     # ... (filled in by M7.1)
