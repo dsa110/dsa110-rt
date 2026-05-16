@@ -81,15 +81,32 @@ routines:
   # ---- corr_slow (M2; reads fada -> writes bada) -------------------
   # Production runs WITHOUT cal apply (slow-vis are emitted uncalibrated
   # so meridian_fringestop / downstream pipelines can derive their own
-  # cal). cuda:0 = GPU 0 = NUMA 0 (matches configs/numa_topology.yaml
-  # h22 corr template).
+  # cal). Pinned to GPU 0 via CUDA_VISIBLE_DEVICES (see M7.1 lessons-
+  # learned below; without per-process GPU isolation the corr_slow +
+  # corr_fast pair hits a Triton "context is destroyed" race).
   - name: corr_slow
     cmd: python
     args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
 
   # ---- corr_fast (M3 production integration; reads fada -> TX) -----
   # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +
-  # static-sky + coarse-DM + gridder + transport TX into the void).
+  # static-sky + multi-DM-trial coarse-DM dedispersion + gridder +
+  # transport TX into the void).
+  #
+  # Op-point: REALTIME-FEASIBLE x32 integration (vs the production
+  # x8 used in earlier benches). At x8 the 2080Ti was not quite
+  # sustaining block cadence — every 4 blocks the gridder + dedisp
+  # would slip ~10-20 ms. x32 (1048.576 µs cadence; 4× longer
+  # integration) cuts the fast-vis tile count from 512/block to
+  # 128/block, dropping the gridder+dedisp work by ~4×. The matching
+  # coarse-DM trial count drops from 24 → 5 (band-local Δdm step
+  # scales linearly with t_int_fast, so we need ~4× fewer trials to
+  # cover the same DM range at the same smearing tolerance). With
+  # chan_sum_factor=8 (production F33) + sliding-window (production
+  # F34) this op-point sustains realtime with comfortable headroom
+  # on a single 2080Ti.
   #
   # Per-node cal blob: CALSB is substituted by dsart_rt at spawn-time
   # to "sb%02d" of the corr-node's chgroup (n06 -> sb03, n03 -> sb00,
@@ -101,10 +118,13 @@ routines:
   # `dsart-rt services install` once that bake-in lands; M7.1 stages
   # n06 by hand for the smoke).
   #
-  # --device cuda:1 = GPU 1 = NUMA 1 (matches fada.numa_cluster=1).
-  # --blocks-output-mode none: don't write fast-vis tiles to disk
-  # during soak (TB-scale per hour). --output-dir is still needed
-  # for sidecars (RFI-fraction time series, etc.).
+  # GPU isolation: CUDA_VISIBLE_DEVICES=1 hides GPU 0 from this
+  # process; the post-mask logical device 0 == physical GPU 1, which
+  # is the NUMA-1 GPU paired with fada (configs/config_corr.yaml::
+  # fada.numa_cluster = 1). Without this mask, simultaneous Triton
+  # JIT in corr_fast + corr_slow on the same node crashes one of
+  # them with "Triton Error [CUDA]: context is destroyed" — see
+  # M7-1-REPORT.md for the bisect.
   - name: corr_fast
     cmd: python
     args: >-
@@ -112,11 +132,18 @@ routines:
       --fada-key fada
       --chgroup CHGROUP
       --obs-dec-deg CUSTOMDEC
-      --device cuda:1
+      --device cuda:0
       --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_CALSB.dat
       --cal-mode phase_only
       --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
+      --t-int-fast-native 32
+      --n-coarse-dm 5
+      --dm-max 1000
+      --chan-sum-factor 8
+      --sliding-window
       --n-grid 256
       --output-dir /home/ubuntu/tmp/dsart-fast-grid
       --blocks-output-mode none
       --log-level INFO
+    env:
+      CUDA_VISIBLE_DEVICES: "1"

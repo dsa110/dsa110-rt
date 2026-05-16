@@ -141,6 +141,13 @@ class RoutineSpec:
     args: str = ""
     hostargs: dict[str, str] = field(default_factory=dict)
     when: Optional[str] = None
+    # Per-routine env overlay. Merged on top of os.environ at spawn
+    # time so multi-process CUDA workers can each get their own
+    # CUDA_VISIBLE_DEVICES mask (without that mask, two children
+    # initializing different CUDA devices on the same node hit a
+    # "Triton Error [CUDA]: context is destroyed" race; see the M7.1
+    # report for the failure mode).
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +176,7 @@ class PipelineConfig:
                 args=r.get("args", ""),
                 hostargs=dict(r.get("hostargs") or {}),
                 when=r.get("when"),
+                env={str(k): str(v) for k, v in (r.get("env") or {}).items()},
             )
             for r in (raw.get("routines") or [])
         )
@@ -519,8 +527,22 @@ class RtOrchestrator:
             argv = self._build_argv(r, val)
             log_path = self._routine_log_path(r.name)
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            LOG.info("spawn %s -> log=%s; argv=%s",
-                     r.name, log_path, " ".join(shlex.quote(a) for a in argv))
+            # Per-routine env overlay on top of os.environ. Substitution
+            # (CHGROUP / CALSB / CN / CUSTOMDEC) is applied to env
+            # VALUES too, so e.g. CUDA_VISIBLE_DEVICES could use CN.
+            env = None
+            if r.env:
+                env = dict(os.environ)
+                for k, v in r.env.items():
+                    env[k] = self._substitute(str(v), val)
+                env_log = ", ".join(f"{k}={env[k]!r}" for k in r.env)
+            else:
+                env_log = ""
+            LOG.info(
+                "spawn %s -> log=%s; argv=%s%s",
+                r.name, log_path, " ".join(shlex.quote(a) for a in argv),
+                f"; env_overlay={{{env_log}}}" if env_log else "",
+            )
             # Use shell=False; capture all output to per-routine log.
             log_fh = open(log_path, "ab", buffering=0)
             try:
@@ -530,6 +552,7 @@ class RtOrchestrator:
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=env,
                 )
             except FileNotFoundError as exc:
                 log_fh.close()

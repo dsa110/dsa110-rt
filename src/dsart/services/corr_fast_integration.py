@@ -2435,6 +2435,7 @@ def run(
     coarse_dm: CoarseDMStage | None = None,
     stage2_fifo: Stage2FifoStage | None = None,
     transport_tx: TransportTxStage | None = None,
+    dm_plan: DMPlan | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -2492,6 +2493,7 @@ def run(
             coarse_dm=coarse_dm,
             stage2_fifo=stage2_fifo,
             transport_tx=transport_tx,
+            dm_plan=dm_plan,
         )
 
         per_block_ms: list[float] = []
@@ -2616,6 +2618,21 @@ def main(argv: list[str] | None = None) -> int:
                         "fast-vis tile. Default: %d (= %d µs cadence). "
                         "Burst-test override: 32 (= 1048.576 µs, 4× cadence)."
                         % (T_INT_FAST_NATIVE, int(T_INT_FAST_NATIVE * NATIVE_SAMPLE_US)))
+    p.add_argument("--n-coarse-dm", type=int, default=0,
+                   help="If > 0, build a SYNTHETIC summed-channel DMPlan "
+                        "with this many coarse trials linearly spaced from "
+                        "0 to --dm-max and enable the F25 multi-DM-trial "
+                        "stage1 → gridder → dedispersion path. Use 5 with "
+                        "--t-int-fast-native 32 for the realtime-feasible "
+                        "x32 op-point; 24 with --t-int-fast-native 8 for "
+                        "the production O-4 op-point. Default: 0 (legacy "
+                        "single-DM path; no dedispersion).")
+    p.add_argument("--dm-max", type=float, default=1000.0,
+                   help="dm_max (pc/cc) for the synthetic --n-coarse-dm "
+                        "plan. Ignored when --n-coarse-dm = 0. Default: "
+                        "1000 (covers the M3 FRB injection range without "
+                        "the extreme-DM smearing the x8 path was sized "
+                        "against).")
     p.add_argument("--obs-dec-deg", type=float, required=True,
                    help="observing source declination (deg) — F21 + gridder "
                         "pattern lookup")
@@ -2738,6 +2755,22 @@ def main(argv: list[str] | None = None) -> int:
         cell_lambda_mode=args.cell_lambda_mode,
     )
 
+    dm_plan: DMPlan | None = None
+    if args.n_coarse_dm > 0:
+        from dsart.coarse_dm.synthetic_plan import build_synthetic_summed_plan
+        dm_plan = build_synthetic_summed_plan(
+            n_coarse=int(args.n_coarse_dm),
+            dm_max=float(args.dm_max),
+            chan_sum_factor=int(args.chan_sum_factor),
+            t_int_fast_us=float(args.t_int_fast_native * NATIVE_SAMPLE_US),
+        )
+        LOG.info(
+            "synthetic DMPlan: n_coarse=%d dm_max=%.1f chan_sum_factor=%d "
+            "t_int_fast_us=%.3f (degenerate-but-shape-valid; F25 path active)",
+            args.n_coarse_dm, args.dm_max, args.chan_sum_factor,
+            args.t_int_fast_native * NATIVE_SAMPLE_US,
+        )
+
     try:
         run(
             fada_int,
@@ -2746,6 +2779,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg,
             max_blocks=args.max_blocks,
             blocks_output_mode=args.blocks_output_mode,
+            dm_plan=dm_plan,
         )
     except _StopRequested:
         LOG.info("clean stop")
