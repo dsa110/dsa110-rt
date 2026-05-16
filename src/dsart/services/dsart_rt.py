@@ -557,10 +557,18 @@ class RtOrchestrator:
         return argv
 
     def _substitute(self, token: str, val: Any) -> str:
+        # Legacy substitutions (match corr.py CUSTOMDEC semantics):
         if "CUSTOMDEC" in token and val is not None:
             token = token.replace("CUSTOMDEC", str(val))
+        # Per-node substitutions (dsart-rt convention):
+        #   CHGROUP -> int chgroup index 0..15
+        #   CALSB   -> "sb%02d" (e.g. n06 -> "sb03"), for cal-blob paths
+        #              shared across all 16 corr nodes via one YAML.
+        #   CN      -> cn_id (int)
         if "CHGROUP" in token:
             token = token.replace("CHGROUP", str(self._cn_to_chgroup()))
+        if "CALSB" in token:
+            token = token.replace("CALSB", f"sb{self._cn_to_chgroup():02d}")
         if "CN" in token:
             token = token.replace("CN", str(self.cn_id))
         return token

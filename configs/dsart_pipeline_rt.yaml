@@ -68,23 +68,55 @@ routines:
     args: -k eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
 
   # ---- merge (always on; reads dada+eada -> writes fada) ------------
-  # Lands in M7.1 — kept here as a stub so the schema is complete.
-  # - name: merge
-  #   cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
-  #   args: -i dada -j eada -o fada
+  # dsaX_merge reads dada+eada and writes fada (the merged-voltage
+  # ring that both corr_slow and corr_fast consume). -m enables
+  # multithread write. -c pins to a core; we pick CPU 12 (NUMA 1) so
+  # the merge isn't competing with corr_fast (NUMA 1 GPU 1 = CUDA :1)
+  # for cache, but is on the same NUMA node as fada (per
+  # configs/config_corr.yaml: fada.numa_cluster = 1).
+  - name: merge
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
+    args: -i dada -j eada -o fada -m -c 12
 
-  # ---- corr_slow + corr_fast --------------------------------------
-  # Land in M7.1. Stubbed for forward visibility:
-  # - name: corr_slow
-  #   cmd: python
-  #   args: -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device auto
-  # - name: corr_fast
-  #   cmd: python
-  #   args: -m dsart.services.corr_fast_integration --fada-key fada --chgroup CHGROUP --obs-dec-deg CUSTOMDEC --device auto
-  #   hostargs:
-  #     # Chgroup is fixed per corr node (REALTIME_FRB_SEARCH.md §1
-  #     # n03=chgroup0, n04=1, ..., n22=15). CHGROUP gets substituted
-  #     # from each host's --cn arg at routine spawn time.
-  #     n03: --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
-  #     n04: --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb01.dat
-  #     # ... (filled in by M7.1)
+  # ---- corr_slow (M2; reads fada -> writes bada) -------------------
+  # Production runs WITHOUT cal apply (slow-vis are emitted uncalibrated
+  # so meridian_fringestop / downstream pipelines can derive their own
+  # cal). cuda:0 = GPU 0 = NUMA 0 (matches configs/numa_topology.yaml
+  # h22 corr template).
+  - name: corr_slow
+    cmd: python
+    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO
+
+  # ---- corr_fast (M3 production integration; reads fada -> TX) -----
+  # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +
+  # static-sky + coarse-DM + gridder + transport TX into the void).
+  #
+  # Per-node cal blob: CALSB is substituted by dsart_rt at spawn-time
+  # to "sb%02d" of the corr-node's chgroup (n06 -> sb03, n03 -> sb00,
+  # n22 -> sb15). One YAML line, all 16 corr nodes.
+  #
+  # Each corr node must have the 250924mptq cal bundle staged at the
+  # canonical location before M7.1 / M7.4 (M7.PREP distributes the
+  # voltages; the much smaller cal bundle is staged separately by
+  # `dsart-rt services install` once that bake-in lands; M7.1 stages
+  # n06 by hand for the smoke).
+  #
+  # --device cuda:1 = GPU 1 = NUMA 1 (matches fada.numa_cluster=1).
+  # --blocks-output-mode none: don't write fast-vis tiles to disk
+  # during soak (TB-scale per hour). --output-dir is still needed
+  # for sidecars (RFI-fraction time series, etc.).
+  - name: corr_fast
+    cmd: python
+    args: >-
+      -u -m dsart.services.corr_fast_integration
+      --fada-key fada
+      --chgroup CHGROUP
+      --obs-dec-deg CUSTOMDEC
+      --device cuda:1
+      --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_CALSB.dat
+      --cal-mode phase_only
+      --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
+      --n-grid 256
+      --output-dir /home/ubuntu/tmp/dsart-fast-grid
+      --blocks-output-mode none
+      --log-level INFO

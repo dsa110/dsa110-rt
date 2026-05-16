@@ -136,6 +136,35 @@ for_each_node() {
 services_install_one() {
   local host="$1" cn="$2" instance="$3"
   printf '[%s] install dsart-rt.service (instance=%s, cn=%d)\n' "${host}" "${instance}" "${cn}"
+
+  # Invariant check #1 (carry-over from M7.0 lessons-learned): setuptools<81
+  # must be present so dsautils.dsa_store's `from pkg_resources import …`
+  # works. Setuptools 81 removed the bundled pkg_resources module. n01+n02
+  # drifted past 81 during M4b debug; we caught it at M7.0 smoke. Surface
+  # the drift HERE before the systemd path is exercised.
+  local check
+  check=$(ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" '
+    set -e
+    /home/ubuntu/miniforge3/envs/dsa110-rt/bin/python -c "
+import sys, pkg_resources  # the import we depend on
+from importlib.metadata import version
+v = tuple(int(x) for x in version(\"setuptools\").split(\".\")[:2])
+if v >= (81, 0):
+    print(f\"FAIL setuptools={v} >= 81 (pkg_resources is on borrowed time)\")
+    sys.exit(2)
+print(f\"OK setuptools={v} + pkg_resources importable\")
+" 2>&1
+  ') || true
+  if [[ "${check}" == *FAIL* ]]; then
+    echo "[${host}] INVARIANT FAIL: ${check}" >&2
+    echo "[${host}] auto-repair: pip install setuptools<81" >&2
+    ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" \
+      '/home/ubuntu/miniforge3/envs/dsa110-rt/bin/pip install "setuptools<81" --quiet 2>&1 | tail -3' \
+      || { echo "[${host}] auto-repair FAILED; manual intervention required" >&2; return 1; }
+  else
+    echo "[${host}] ${check}"
+  fi
+
   # Push the unit file + per-host env file + ensure ~/.config/systemd/user exists.
   local unit_src="${REPO_ROOT}/services/systemd/dsart-rt.service"
   ssh "${SSH_OPTS[@]}" "${host}.pro.pvt" \
