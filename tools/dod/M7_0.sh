@@ -160,14 +160,28 @@ sys.exit(0 if ok else 1)"
 
 echo
 echo "=== STEP 8: shm + junkdb processes are gone ==="
-shm_lines=$(ipcs -m | grep -E '^0x' | wc -l)
+# n06 has a known bash quirk where chained `ipcs -m | grep | wc -l`
+# triggers a subshell segfault (seen during M7.0 smoke 2026-05-16,
+# also during M4b-era diags). Side-step it: write to a tmp file and
+# count via a single greps. Both ipcs and pgrep are otherwise reliable.
+IPCS_TMP=/tmp/dsart-m7_0-ipcs.txt
+ipcs -m > "${IPCS_TMP}" 2>/dev/null || true
+shm_lines=$(grep -c '^0x' "${IPCS_TMP}" || echo 0)
 echo "shm segments: ${shm_lines}"
-[[ "${shm_lines}" -eq 0 ]] || echo "(non-zero is OK if other containers run PSRDADA; check for our keys specifically)"
-junkdb_lines=$(pgrep -af dada_junkdb | wc -l)
-echo "dada_junkdb processes: ${junkdb_lines}"
+# Non-zero is OK if another LXD container on this hardware runs PSRDADA;
+# we only care about our 4 keys (dada / eada / fada / bada) being gone,
+# and that's already verified by Step 7's mon-dict + the fact that
+# dada_db -d in Step 6's stop verb succeeded.
+
+PGREP_TMP=/tmp/dsart-m7_0-pgrep.txt
+pgrep -af dada_junkdb > "${PGREP_TMP}" 2>/dev/null || true
+junkdb_lines=$(wc -l < "${PGREP_TMP}" 2>/dev/null || echo 0)
+echo "dada_junkdb processes still alive: ${junkdb_lines}"
 if [[ "${junkdb_lines}" -gt 0 ]]; then
+  cat "${PGREP_TMP}" >&2
   echo "FAIL: leftover dada_junkdb" >&2; exit 1
 fi
+rm -f "${IPCS_TMP}" "${PGREP_TMP}"
 
 echo
 echo "=== STEP 9: SIGTERM orchestrator; verify clean exit ==="
