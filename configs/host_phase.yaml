@@ -1,4 +1,43 @@
 # Phase-A/B host identity + transport overrides (§6.2).
+#
+# This file is the single source of truth for which DSA-110 LXD host the
+# dsart pipeline is running on and what role / transport bindings apply.
+# It is loaded by dsart.common.host at module-import time; importing dsart
+# on a host whose hostname is not listed below will raise KeyError.
+#
+# Placeholder fields (`tbd`, 127.0.0.1) are intentional — operations needs
+# to land per-node decisions before they become real values:
+#
+#   role             -> "corr" | "search" | "both"
+#                       Phase-A development on h01 used "both"; production
+#                       fan-out will split corr vs search per the channel
+#                       group assignment in configs/chgroup_assignment.yaml.
+#
+#   gpu_share_mode   -> "mps" | "time_slice"
+#                       Pinned by bench/derisk/gpu_share_jitter.py on h01
+#                       in M0; rerun on each node before flipping from tbd.
+#
+#   transport_*_addr -> The high-speed data plane lives on the `br2` bridge
+#                       (10.41.0.0/24, MTU 9000) and has NO DNS. The mgmt
+#                       `.pro.pvt` names resolve only to br1 (10.42.0.0/24,
+#                       MTU 1500), which is too slow for the M4a/M4b path.
+#                       For production each host's transport_*_addr must
+#                       be the 10.41.0.x address from its own br2 interface
+#                       (use `ip -br addr show br2 | awk '{print $3}'`).
+#                       127.0.0.1 here is a single-host development default.
+#
+#   bench_chgroup    -> Sub-band index used by bench/m3_emit_m5_fixtures.py
+#                       and friends; defaults to 0 (first sub-band).
+#
+#   corr_id, search_id
+#                    -> Two-digit string identifier matching the lxd110hNN
+#                       suffix. Used by transport headers and metric labels.
+#
+# Adding a new node:
+#   1. Append a `lxd110hNN:` block matching the schema below.
+#   2. Either set DSART_CONFIG_DIR to a per-host override directory, or
+#      land a PR with the real role / gpu_share_mode / transport addrs.
+
 schema_version: 1
 hosts:
   lxd110h01:
@@ -11,3 +50,216 @@ hosts:
     bench_chgroup: 0
     corr_id: "01"
     search_id: "01"
+
+  lxd110h02:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "02"
+    search_id: "02"
+
+  lxd110h03:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "03"
+    search_id: "03"
+
+  lxd110h04:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "04"
+    search_id: "04"
+
+  lxd110h05:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "05"
+    search_id: "05"
+
+  lxd110h06:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "06"
+    search_id: "06"
+
+  lxd110h07:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "07"
+    search_id: "07"
+
+  lxd110h08:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "08"
+    search_id: "08"
+
+  lxd110h09:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "09"
+    search_id: "09"
+
+  lxd110h10:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "10"
+    search_id: "10"
+
+  lxd110h11:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "11"
+    search_id: "11"
+
+  lxd110h12:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "12"
+    search_id: "12"
+
+  lxd110h13:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "13"
+    search_id: "13"
+
+  lxd110h14:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "14"
+    search_id: "14"
+
+  lxd110h15:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "15"
+    search_id: "15"
+
+  lxd110h16:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "16"
+    search_id: "16"
+
+  # n17 is not currently in the fleet (skipped in m4b-deploy host lists).
+
+  lxd110h18:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "18"
+    search_id: "18"
+
+  lxd110h19:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "19"
+    search_id: "19"
+
+  # n20 is not currently in the fleet (skipped in m4b-deploy host lists).
+
+  lxd110h21:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "21"
+    search_id: "21"
+
+  lxd110h22:
+    phase: phase_a
+    role: tbd
+    gpu_share_mode: tbd
+    co_resident_corr_search: true
+    transport_target_addr: 127.0.0.1
+    transport_listen_addr: 127.0.0.1
+    bench_chgroup: 0
+    corr_id: "22"
+    search_id: "22"

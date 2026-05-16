@@ -36,7 +36,10 @@ def _load_host_phase() -> dict[str, Any]:
     path = CONFIG_DIR / "host_phase.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"Missing host_phase.yaml at {path}")
-    data = yaml.safe_load(path.read_text())
+    # Explicit utf-8: this module is imported at production-node startup under
+    # systemd / non-interactive ssh, where locale.getpreferredencoding() can
+    # be ASCII. host_phase.yaml's header comment includes "§" (non-ASCII).
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     hosts = data.get("hosts")
     if not isinstance(hosts, dict):
         raise ValueError("host_phase.yaml must contain a mapping 'hosts:'")
