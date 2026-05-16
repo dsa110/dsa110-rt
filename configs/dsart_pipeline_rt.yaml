@@ -142,6 +142,7 @@ routines:
       --chan-sum-factor 8
       --sliding-window
       --n-grid 256
+      --max-blocks 0
       --output-dir /home/ubuntu/tmp/dsart-fast-grid
       --blocks-output-mode none
       --log-level INFO

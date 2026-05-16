@@ -2612,7 +2612,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="path to config_corr.yaml for fada buffer-size validation")
     p.add_argument("--max-blocks", type=int, default=1,
                    help="stop after N fada blocks (default: 1 for "
-                        "smoke runs; production: omit for unlimited)")
+                        "smoke runs; production: pass 0 = unlimited, "
+                        "run until fada EOD).")
     p.add_argument("--t-int-fast-native", type=int, default=T_INT_FAST_NATIVE,
                    help="fast-corr integration depth in NATIVE samples per "
                         "fast-vis tile. Default: %d (= %d µs cadence). "
@@ -2771,13 +2772,17 @@ def main(argv: list[str] | None = None) -> int:
             args.t_int_fast_native * NATIVE_SAMPLE_US,
         )
 
+    # --max-blocks 0 sentinel = unlimited (production / soak runs).
+    max_blocks: int | None = (
+        None if args.max_blocks == 0 else int(args.max_blocks)
+    )
     try:
         run(
             fada_int,
             args.output_dir,
             device,
             cfg,
-            max_blocks=args.max_blocks,
+            max_blocks=max_blocks,
             blocks_output_mode=args.blocks_output_mode,
             dm_plan=dm_plan,
         )
