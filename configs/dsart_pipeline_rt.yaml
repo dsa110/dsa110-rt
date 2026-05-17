@@ -49,14 +49,26 @@ routines:
   - name: cap_a_junkdb
     when: captures.mode == junkdb
     cmd: /usr/local/bin/dada_junkdb
-    # -r 1200 MB/s ~= 144 MiB/0.134218s native cadence (tools/junkdb_runbook.md).
-    # -t 86400 = 1 day (orchestrator stops it via SIGTERM on `stop` verb).
+    # -r 1073 MiB/s = 144 MiB / 134.218 ms = EXACT native cadence. Note
+    # that dada_junkdb's -r flag is MiB/s (binary; `rate_base=1024*1024`
+    # in dada_junkdb.c:391) despite the help text saying "MB/s" — we
+    # had been using -r 1200 (= 12 % over native), which built spurious
+    # queue depth in dada/eada and was implicated in the M7.1 5-min
+    # soak hang where merge stopped advancing fada at ~3 min.
+    # -t 86400: transfer_size = 86400 × 1.125 GB/s = ~97 TB of bytes
+    # to write before junkdb exits (= ~24 h at native cadence). Plenty
+    # of headroom for any 60-min soak; orchestrator still kills with
+    # SIGTERM on `stop` verb well before then.
     # -g = gaussian-distributed payload (flag, no value).
-    args: -k dada -r 1200 -t 86400 -g /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+    # -z = PSRDADA zero-copy direct shm write — avoids the user-buffer
+    # → ring-buffer memcpy that the default path does, giving merge a
+    # cleaner producer in the multi-reader (r=2) fada → corr_slow +
+    # corr_fast topology.
+    args: -k dada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
   - name: cap_b_junkdb
     when: captures.mode == junkdb
     cmd: /usr/local/bin/dada_junkdb
-    args: -k eada -r 1200 -t 86400 -g /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+    args: -k eada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
 
   - name: cap_a_real
     when: captures.mode == real
@@ -89,6 +101,35 @@ routines:
     args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO
     env:
       CUDA_VISIBLE_DEVICES: "0"
+
+  # ---- bada_drain (always-on; reads bada -> /dev/null) -------------
+  # Without a bada reader, corr_slow fills bada (300 buffers ~= 40 s of
+  # slow-vis) and then deadlocks on the 301st write. That back-pressures
+  # merge (which can't free fada slots because corr_slow as a fada
+  # reader stops advancing) and the whole pipeline hangs. The legacy
+  # /cnf/pipeline (corr.py-compatible) has a dada_dbnull on bada
+  # always-on for exactly this reason: a "drain of last resort" that
+  # keeps the back-pressure chain unblocked even before the real bada
+  # consumers (meridian_fringestop, dsaX_nsfrb) come up.
+  #
+  # Bug repro (M7.1 / n06, both 13:30 + 14:26 soaks of May 17, 2026):
+  #   corr_slow halts at n_in=301 n_out=301 -> emits
+  #   "ipcbuf_get_next_write: error decrement CLEAR" -> merge
+  #   silently stops emitting "written block N" syslog entries
+  #   shortly thereafter (n_blocks ≈ 360, ≈ corr_slow.r_buf + fada.nbufs)
+  #   -> corr_fast drains the buffered fada blocks (last n_in=368)
+  #   then blocks on getNextPage() with "ipcbuf_get_next_read: error
+  #   decrement FULL". Adding this routine fixes the deadlock at
+  #   the source. See M7-1-REPORT.md for the full diagnosis.
+  - name: bada_drain
+    # We use the in-tree Python drain ``dsart.services.dada_drain``
+    # instead of the legacy /usr/local/bin/dada_dbnull. See the
+    # module docstring for the three blocking bugs that disqualified
+    # dada_dbnull for our use (no -S without OBS_XFER, -X int overflow
+    # past ~2 GiB, default 64 MiB transfer + respawn jitter costing
+    # ~35 ms/block of corr_fast latency).
+    cmd: python
+    args: -u -m dsart.services.dada_drain --key bada --log-level INFO
 
   # ---- corr_fast (M3 production integration; reads fada -> TX) -----
   # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +
