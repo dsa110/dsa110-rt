@@ -40,11 +40,15 @@ delegated to the corr-side ``dsa110-xengine`` framework.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
+import signal
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 import torch
@@ -54,6 +58,10 @@ from ..cluster import (
     CandsLoggerConfig,
     ClustererConfig,
     ClustererService,
+)
+from ..common.constants import (
+    CUBE_CADENCE_SAMPLES_DEFAULT,
+    T_INT_SEARCH_US_DEFAULT,
 )
 from ..common.contracts import Candidate, CubeGeometry
 from ..detector.forward import DeterministicDetector
@@ -526,12 +534,39 @@ class SearchComputeService:
     async def run(self) -> None:
         """Main loop. Iterates over RX-ring slots until source exhausts
         or ``stop()`` is called.
+
+        Emits one INFO line per ``_status_every_cubes`` cubes (default
+        10) so the M7.2 / production soaks have a visible progress
+        signal in the orchestrator logs without having to wait for a
+        SIGTERM-triggered final stats line.
         """
+        status_every = 10
+        next_status = status_every
+        loop_start = time.monotonic()
+        last_log = loop_start
+        last_cubes = 0
         async for slot in self._source:
             if self._stopping.is_set():
                 break
             await self._process_one_cube(slot)
             await self._source.release(slot.cube_id)
+            if self._cubes_processed >= next_status:
+                now = time.monotonic()
+                d_cubes = self._cubes_processed - last_cubes
+                dt = max(now - last_log, 1e-9)
+                _LOG.info(
+                    "cube_progress: cubes=%d cands=%d clusters=%d "
+                    "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                    self._cubes_processed,
+                    self._candidates_emitted,
+                    self._clusters_emitted,
+                    d_cubes / dt,
+                    dt,
+                    self._cubes_processed / max(now - loop_start, 1e-9),
+                )
+                next_status += status_every
+                last_log = now
+                last_cubes = self._cubes_processed
 
 
 # ---------------------------------------------------------------------------
@@ -539,19 +574,425 @@ class SearchComputeService:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """Production CLI entry. Chunk 6b-α + M6 chunk 5 ship the orchestrator
-    + all sub-system wiring; real RX-ring binding (M4a POSIX-shm),
-    config-loader, etcd watch, and SIGTERM handling land in the chunk-6b
-    hardening pass once M4a's receive-ring API is locked.
-    """
-    raise NotImplementedError(
-        "search_compute production CLI lands in M5 Chunk 6b hardening "
-        "(needs M4a receive-ring API). M5 Chunk 6b-α + M6 chunk 5 "
-        "deliver the SearchComputeService class with full M6 sub-system "
-        "wiring for use by benches + unit tests."
+# ---------------------------------------------------------------------------
+# CLI helpers (M7.2)
+# ---------------------------------------------------------------------------
+
+
+def _load_yaml(path: Path) -> dict:
+    """Minimal YAML loader (lazy import; sub-system configs only)."""
+    import yaml  # local import; pyyaml is a runtime dep already
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _dm_grids_from_npz(
+    dm_plan_path: Path, n_coarse: int, n_fdm: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load DM grids from a DmPlan NPZ. Falls back to a synthetic linear
+    grid if the file is unreadable. The NPZ layout (set by the corr-side
+    ``dm_plan`` tooling): ``coarse_dm`` (or ``coarse_dm_pc_cm3``),
+    ``fine_dm`` (or ``fine_dm_pc_cm3``), ``fine_to_coarse``."""
+    with np.load(dm_plan_path) as npz:
+        coarse_key = next(
+            (k for k in ("coarse_dm_pc_cm3", "coarse_dm") if k in npz),
+            None,
+        )
+        fine_key = next(
+            (k for k in ("fine_dm_pc_cm3", "fine_dm") if k in npz),
+            None,
+        )
+        if coarse_key is None or fine_key is None:
+            raise KeyError(
+                f"DM plan {dm_plan_path} missing 'coarse_dm'/'fine_dm' keys; "
+                f"found {list(npz.keys())}"
+            )
+        coarse_dm = np.asarray(npz[coarse_key], dtype=np.float64)
+        fine_dm = np.asarray(npz[fine_key], dtype=np.float64)
+        if "fine_to_coarse" in npz:
+            f2c = np.asarray(npz["fine_to_coarse"], dtype=np.int32)
+        else:
+            # Default: every fine maps to coarse cell 0 (safe; matches
+            # the M4a unit-test convention).
+            f2c = np.zeros(len(fine_dm), dtype=np.int32)
+    # Trim to the requested sizes if the on-disk plan is bigger.
+    coarse_dm = coarse_dm[:n_coarse]
+    fine_dm = fine_dm[:n_fdm]
+    f2c = f2c[:n_fdm]
+    if len(f2c) != len(fine_dm):
+        raise ValueError(
+            f"DM plan {dm_plan_path}: fine_to_coarse length "
+            f"{len(f2c)} != fine_dm length {len(fine_dm)}"
+        )
+    return coarse_dm, fine_dm, f2c
+
+
+def _synthetic_dm_grids(
+    n_coarse: int, n_fdm: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bench / smoke DM grids: all fine DMs map to coarse cell 0 so
+    ``compute_time_shift_search`` produces non-negative shifts."""
+    coarse_dm = np.linspace(0.0, 300.0, n_coarse, dtype=np.float64)
+    fine_dm = np.linspace(0.0, 100.0, n_fdm, dtype=np.float64)
+    f2c = np.zeros(n_fdm, dtype=np.int32)
+    return coarse_dm, fine_dm, f2c
+
+
+def _build_search_config_from_yaml(
+    yaml_doc: dict,
+    *,
+    n_grid: int,
+    n_fdm: int,
+    gpu_half: int,
+    search_node_id: int,
+    image_backend: str,
+    device: str,
+    enable_clusterer: bool,
+    enable_cube_dump: bool,
+    enable_udp_listener: bool,
+    enable_cands_logger: bool,
+    fine_dm_pc_cc_full: Optional[np.ndarray],
+) -> SearchComputeConfig:
+    """Translate ``configs/config_compute_search.yaml`` into
+    ``SearchComputeConfig`` with optional M6 sub-systems gated on the
+    per-subsystem ``enable_*`` flags. This is the M7.2 inline shim; the
+    full ``config_loader`` integration is the M7.2.5 follow-up."""
+    det = yaml_doc.get("detector", {}) or {}
+    noise = yaml_doc.get("noise", {}) or {}
+    pipe_cfg = CubePipelineConfig(
+        n_grid=int(n_grid),
+        image_backend=image_backend,   # "cpu" or "gpu"
+        device=device,
+    )
+
+    clusterer_cfg: Optional[ClustererConfig] = None
+    if enable_clusterer:
+        cl = yaml_doc.get("clusterer", {}) or {}
+        kwargs: dict[str, Any] = {}
+        if "backend" in cl:
+            kwargs["backend"] = str(cl["backend"])
+        if "feature_mode" in cl:
+            kwargs["feature_mode"] = str(cl["feature_mode"])
+        if "weights" in cl:
+            kwargs["weights"] = tuple(float(w) for w in cl["weights"])
+        if "min_cluster_size" in cl:
+            kwargs["min_cluster_size"] = int(cl["min_cluster_size"])
+        if "min_samples" in cl:
+            kwargs["min_samples"] = int(cl["min_samples"])
+        if "cluster_selection_epsilon" in cl:
+            kwargs["cluster_selection_epsilon"] = float(
+                cl["cluster_selection_epsilon"]
+            )
+        if "dbscan_eps" in cl:
+            kwargs["dbscan_eps"] = float(cl["dbscan_eps"])
+        if "dbscan_min_samples" in cl:
+            kwargs["dbscan_min_samples"] = int(cl["dbscan_min_samples"])
+        if "metric" in cl:
+            kwargs["metric"] = str(cl["metric"])
+        clusterer_cfg = ClustererConfig(**kwargs)
+
+    cube_dump_cfg: Optional[CubeDumpWriterConfig] = None
+    if enable_cube_dump:
+        cd = yaml_doc.get("cube_dump", {}) or {}
+        cube_dump_cfg = CubeDumpWriterConfig(
+            dump_root=Path(cd.get("dump_root", "/tmp/dsart-cube-dump")),
+            search_node_id=int(cd.get("search_node_id", search_node_id)),
+            gpu_half=int(cd.get("gpu_half", gpu_half)),
+            queue_maxsize=int(cd.get("queue_maxsize", 4)),
+        )
+
+    udp_listener_cfg: Optional[UdpTriggerListenerConfig] = None
+    if enable_udp_listener:
+        ul = yaml_doc.get("udp_trigger_listener", {}) or {}
+        udp_listener_cfg = UdpTriggerListenerConfig(
+            host=str(ul.get("host", "127.0.0.1")),
+            port=int(ul.get("port", 11227)),
+        )
+
+    cands_logger_cfg: Optional[CandsLoggerConfig] = None
+    if enable_cands_logger:
+        cl = yaml_doc.get("cands_logger", {}) or {}
+        cands_logger_cfg = CandsLoggerConfig(
+            log_root=Path(cl.get("log_root", "/tmp/dsart-cands-log")),
+            search_node_id=int(cl.get("search_node_id", search_node_id)),
+            gpu_half=int(cl.get("gpu_half", gpu_half)),
+        )
+
+    predicate_cfg: Optional[BrightPulsePredicateConfig] = None
+    if enable_cube_dump:
+        bp = yaml_doc.get("bright_pulse_predicate", {}) or {}
+        kwargs2: dict[str, Any] = {}
+        for k in ("min_snr", "dm_fine_min_pc_cc", "dm_fine_max_pc_cc",
+                  "width_samples_max", "min_cntc", "holdoff_ms"):
+            if k in bp:
+                kwargs2[k] = bp[k]
+        if kwargs2:
+            predicate_cfg = BrightPulsePredicateConfig(**kwargs2)
+        else:
+            predicate_cfg = BrightPulsePredicateConfig()
+
+    return SearchComputeConfig(
+        pipeline=pipe_cfg,
+        n_fdm=int(n_fdm),
+        detector_threshold_sigma=float(det.get("threshold_sigma", 8.0)),
+        detector_device=device,
+        search_node_id=int(search_node_id),
+        gpu_half=int(gpu_half),
+        layer1_n_burnin_cubes=int(noise.get("layer1_n_burnin_cubes", 5)),
+        fine_dm_pc_cc_full=fine_dm_pc_cc_full,
+        clusterer_config=clusterer_cfg,
+        cube_dump_writer_config=cube_dump_cfg,
+        bright_pulse_predicate_config=predicate_cfg,
+        udp_trigger_listener_config=udp_listener_cfg,
+        cands_logger_config=cands_logger_cfg,
     )
 
 
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop,
+                             stop_event: asyncio.Event) -> None:
+    """Wire SIGTERM/SIGINT to set ``stop_event`` so the main loop
+    exits cleanly. Mirrors the dsart_rt orchestrator's contract."""
+    def _handle(signum: int) -> None:
+        _LOG.info("received signal %d; stopping…", signum)
+        stop_event.set()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle, sig)
+        except (NotImplementedError, RuntimeError):
+            # Not all platforms / event loops support add_signal_handler;
+            # fall back to signal.signal which is good enough for the
+            # orchestrator-launched case.
+            signal.signal(sig, lambda s, _f: _handle(s))
+
+
+async def _run_async(args: argparse.Namespace) -> int:
+    # Lazy import so the CLI parser still works without the C extension
+    # when --help is invoked on a dev box.
+    from ..transport.production_rx_ring import ProductionRxRingSource
+    from ..transport.recv_ring import (
+        BYTES_CFP16_COMPLEX,
+        BYTES_CINT8_COMPLEX,
+        RxRingDims,
+    )
+
+    bpc = (BYTES_CINT8_COMPLEX if args.bytes_per_cell == 2
+           else BYTES_CFP16_COMPLEX)
+    dims = RxRingDims(
+        n_corr=args.n_corr,
+        n_coarse_dm=args.n_coarse_dm,
+        t_buf_samples=args.t_buf_samples,
+        n_filled_per_corr=args.n_filled,
+        bytes_per_cell=bpc,
+    )
+
+    if args.dm_plan_path is not None and args.dm_plan_path.exists():
+        coarse_dm, fine_dm, f2c = _dm_grids_from_npz(
+            args.dm_plan_path, args.n_coarse_dm, args.n_fdm
+        )
+        _LOG.info(
+            "DM grids loaded from %s: n_coarse=%d n_fdm=%d",
+            args.dm_plan_path, len(coarse_dm), len(fine_dm),
+        )
+    else:
+        coarse_dm, fine_dm, f2c = _synthetic_dm_grids(
+            args.n_coarse_dm, args.n_fdm
+        )
+        _LOG.warning(
+            "DM plan path %s unavailable; using synthetic grids "
+            "(coarse=%d fine=%d) — this is OK for M7.2 fake-data soak "
+            "but PRODUCTION must point --dm-plan-path at the corr-side "
+            "DmPlan NPZ.",
+            args.dm_plan_path, args.n_coarse_dm, args.n_fdm,
+        )
+
+    source = ProductionRxRingSource(
+        shm_name=args.shm_name,
+        ring_dims=dims,
+        n_fdm_in_cube=args.n_fdm,
+        t_det=args.t_det,
+        coarse_dm_pc_cm3=coarse_dm,
+        fine_dm_pc_cm3=fine_dm,
+        fine_to_coarse=f2c,
+        compute_half=args.gpu_half,
+        t_int_search_us=args.t_int_search_us,
+        cube_cadence_samples=args.cube_cadence_samples,
+        n_grid=args.n_grid,
+        enable_cuda_register=args.cuda_register,
+        poll_interval_s=args.poll_interval_s,
+        max_cubes=args.max_cubes if args.max_cubes > 0 else None,
+        fan_in_min_corrs=args.fan_in_min_corrs,
+    )
+
+    if args.config_yaml is not None and args.config_yaml.exists():
+        yaml_doc = _load_yaml(args.config_yaml)
+        _LOG.info("loaded search-compute yaml from %s", args.config_yaml)
+    else:
+        yaml_doc = {}
+        if args.config_yaml is not None:
+            _LOG.warning(
+                "config_yaml=%s not found; using empty doc (all "
+                "M6 sub-systems disabled by default).",
+                args.config_yaml,
+            )
+
+    cfg = _build_search_config_from_yaml(
+        yaml_doc,
+        n_grid=args.n_grid,
+        n_fdm=args.n_fdm,
+        gpu_half=args.gpu_half,
+        search_node_id=args.search_node_id,
+        image_backend=args.image_backend,
+        device=args.device,
+        enable_clusterer=args.enable_clusterer,
+        enable_cube_dump=args.enable_cube_dump,
+        enable_udp_listener=args.enable_udp_listener,
+        enable_cands_logger=args.enable_cands_logger,
+        fine_dm_pc_cc_full=fine_dm,
+    )
+
+    service = SearchComputeService(config=cfg, source=source)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(loop, stop_event)
+
+    async def _signal_watcher() -> None:
+        await stop_event.wait()
+        _LOG.info("stop_event fired; signalling service.stop()…")
+        await service.stop()
+
+    await service.start()
+    watcher_task = asyncio.create_task(_signal_watcher())
+    rc = 0
+    try:
+        await service.run()
+    except Exception:  # noqa: BLE001
+        _LOG.exception("search_compute service crashed")
+        rc = 1
+    finally:
+        stop_event.set()
+        await watcher_task
+        # service.stop() may have been invoked by the watcher already;
+        # call it again so the source/sub-systems are definitely torn
+        # down on the normal exit path.
+        await service.stop()
+    _LOG.info(
+        "search_compute exit: cubes=%d cands=%d clusters=%d rc=%d",
+        service.cubes_processed, service.candidates_emitted,
+        service.clusters_emitted, rc,
+    )
+    return rc
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # --- Ring binding (M7.2.3 / Phase B contract) ---------------------
+    p.add_argument("--shm-name", required=True,
+                   help="POSIX-shm name to attach (created by the "
+                        "search-rx process, e.g. /dsart-rxring-n01).")
+    p.add_argument("--n-corr", type=int, default=16,
+                   help="ring dim: number of correlator groups (default: 16)")
+    p.add_argument("--n-coarse-dm", type=int, default=5,
+                   help="ring dim: number of coarse DM slabs (default: 5 = "
+                        "M7.1 op-point)")
+    p.add_argument("--t-buf-samples", type=int, default=4096,
+                   help="ring dim: time-axis depth in search-cadence samples "
+                        "(default 4096 ≈ 16 cube cadences of headroom).")
+    p.add_argument("--n-filled", type=int, default=5000,
+                   help="ring dim: cells per (corr, dm) slot")
+    p.add_argument("--bytes-per-cell", type=int, default=2, choices=(2, 4),
+                   help="ring dim: 2=cint8 complex (prod default), "
+                        "4=cfp16 complex (debug)")
+
+    # --- Cube assembler tuning ----------------------------------------
+    p.add_argument("--n-fdm", type=int, default=16,
+                   help="fine-DM trials per cube for THIS half "
+                        "(default: 16). Production: 32 per half = 64 total.")
+    p.add_argument("--t-det", type=int, default=512,
+                   help="detector window length in samples (default: 512 = "
+                        "2 × block_samples_search). Must be ≥ cube_cadence "
+                        "for the validity_mask to cover every t.")
+    p.add_argument("--cube-cadence-samples", type=int,
+                   default=CUBE_CADENCE_SAMPLES_DEFAULT,
+                   help=f"slots per cube (default: {CUBE_CADENCE_SAMPLES_DEFAULT})")
+    p.add_argument("--t-int-search-us", type=float,
+                   default=T_INT_SEARCH_US_DEFAULT,
+                   help=f"search-cadence sample period in µs "
+                        f"(default: {T_INT_SEARCH_US_DEFAULT})")
+    p.add_argument("--n-grid", type=int, default=256,
+                   help="uv-grid side length (default: 256)")
+    p.add_argument("--cuda-register", action="store_true",
+                   help="attempt cudaHostRegister on the ring (deferred "
+                        "D-item D2; safe to leave off until the C API "
+                        "exposes rx_ring_get_base_ptr).")
+    p.add_argument("--poll-interval-s", type=float, default=0.001,
+                   help="how long the assembler sleeps between write_seq "
+                        "polls (default 1ms; production-rate-safe).")
+    p.add_argument("--fan-in-min-corrs", type=int, default=16,
+                   help="minimum number of chgroups that must have "
+                        "advanced past the next cube boundary before "
+                        "we emit a cube (default 16 = production "
+                        "strict all-chgroups-required; M7.2 smoke "
+                        "should pass 1 to allow partial fan-in).")
+
+    # --- SearchComputeService identity --------------------------------
+    p.add_argument("--gpu-half", type=int, default=0, choices=(0, 1),
+                   help="which compute half this process serves (0 or 1)")
+    p.add_argument("--search-node-id", type=int, default=1,
+                   help="search node id (1..4 in production)")
+    p.add_argument("--device", default="cpu",
+                   help="torch device for detector + cube tensor "
+                        "(cpu / cuda / cuda:N). Default: cpu")
+    p.add_argument("--image-backend", default="cpu",
+                   choices=("cpu", "gpu"),
+                   help="CubePipeline image backend (cpu / gpu). Default: cpu "
+                        "for M7.2 bring-up; flip to gpu once a real GPU is "
+                        "available on the search nodes.")
+
+    # --- DM plan source -----------------------------------------------
+    p.add_argument("--dm-plan-path", type=Path, default=None,
+                   help="path to a DmPlan NPZ "
+                        "(keys: coarse_dm_pc_cm3, fine_dm_pc_cm3, "
+                        "fine_to_coarse). Falls back to a synthetic linear "
+                        "grid if omitted/unreadable.")
+
+    # --- M6 sub-system gating + config --------------------------------
+    p.add_argument("--config-yaml", type=Path, default=None,
+                   help="optional configs/config_compute_search.yaml. "
+                        "Only consulted for the sub-system blocks gated "
+                        "by --enable-* flags below.")
+    p.add_argument("--enable-clusterer", action="store_true")
+    p.add_argument("--enable-cube-dump", action="store_true")
+    p.add_argument("--enable-udp-listener", action="store_true")
+    p.add_argument("--enable-cands-logger", action="store_true")
+    p.add_argument("--enable-all", action="store_true",
+                   help="shortcut: enable all M6 sub-systems above")
+
+    # --- Lifecycle ----------------------------------------------------
+    p.add_argument("--max-cubes", type=int, default=0,
+                   help="stop after this many cubes (default 0 = unlimited; "
+                        "production: 0, run until SIGTERM).")
+    p.add_argument("--log-level", default="INFO",
+                   choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+
+    args = p.parse_args(argv)
+    if args.enable_all:
+        args.enable_clusterer = True
+        args.enable_cube_dump = True
+        args.enable_udp_listener = True
+        args.enable_cands_logger = True
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    return asyncio.run(_run_async(args))
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

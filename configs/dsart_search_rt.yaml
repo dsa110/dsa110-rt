@@ -21,25 +21,103 @@ schema_version: 1
 
 buffers: []
 
-routines:
-  # ---- search-rx (M4a chunk-6 C epoll) ----------------------------
-  # Lands in M7.2 — kept stubbed so the schema is complete. The
-  # search-rx binary owns its POSIX-shm ring lifecycle; dsart_rt just
-  # fork-execs it and tracks the PID + emits mon-dict.
-  # - name: search_rx
-  #   cmd: python
-  #   args: -m dsart.transport.recv_epoll --bind 10.41.0.x --port-base 6625 --so-rcvbuf 268435456 --ring-shm-name /dsart_rxring
-  #   hostargs:
-  #     n01: --bind 10.41.0.205
-  #     n02: --bind 10.41.0.222
-  #     n09: --bind 10.41.0.253
-  #     n13: --bind 10.41.0.238
+# Per-node substitution conventions (dsart_rt._substitute):
+#   CN     -> cn_id integer (1 / 2 / 9 / 13 for the four search nodes).
+#   CALSB  -> "sb%02d" of the corr chgroup; UNUSED here (search nodes
+#             have no chgroup). Don't reference it from search args.
+#   CHGROUP -> chgroup index 0..15; ALSO unused here.
+# Per-host overrides via the `hostargs:` block pick up first by FQDN
+# (n01.pro.pvt) then bare short hostname (n01).
 
-  # ---- search-compute x 2 (one per GPU half) ----------------------
-  # Land in M7.2 alongside search-rx. Stubbed:
-  # - name: search_compute_0
-  #   cmd: python
-  #   args: -m dsart.services.search_compute --search-id CN --gpu-half 0 --ring-shm-name /dsart_rxring
-  # - name: search_compute_1
-  #   cmd: python
-  #   args: -m dsart.services.search_compute --search-id CN --gpu-half 1 --ring-shm-name /dsart_rxring
+routines:
+  # ---- search_rx (M4a chunk 6 + M7.2 ring publish) -----------------
+  # Long-running C-epoll fan-in. Binds 16 UDP ports (6625..6640 = one
+  # per corr chgroup) on the node's nic.search address, drains each
+  # via a single epoll pthread, reassembles fragmented prod_frames and
+  # publishes reassembled cube slots into a POSIX-shm SPMC ring named
+  # /dsart-rxring-<cn_id> (e.g. /dsart-rxring-1 on n01). The two
+  # search_compute halves attach to this same ring as read-only
+  # consumers (n_filled, t_buf_samples, bytes_per_cell must match
+  # exactly between owner and consumer or the ctypes header check
+  # rejects at attach time).
+  #
+  # Op-point (M7.2 = M7.1 mirror): n_corr=16, n_coarse_dm=5,
+  # bytes_per_cell=2 (cint8 complex), t_buf_samples=4096 (~16 cube
+  # cadences of headroom — safe for a momentary compute-half stall).
+  #
+  # SO_RCVBUF=256 MiB matches corner_turn.sh and the M7.PREP socket
+  # buffer note (/proc/sys/net/core/rmem_max must be ≥ 268435456 on
+  # the search nodes; M7.0 ops bootstrap raises it).
+  #
+  # The pattern_id table is intentionally omitted for M7.2; the smoke
+  # uses bench/net_pair.py as TX, which emits a known constant
+  # pattern_id per chgroup, but we run with no expected_pattern_id
+  # registered so every frame is accepted. Production M7.4+ will load
+  # a JSON file via --pattern-id-file.
+  - name: search_rx
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_rx
+      --port-base 6625 --n-ports 16
+      --so-rcvbuf-bytes 268435456
+      --shm-name /dsart-rxring-CN
+      --n-corr 16 --n-coarse-dm 5
+      --t-buf-samples 4096 --n-filled 5000
+      --bytes-per-cell 2
+      --status-interval-s 5.0
+      --log-level INFO
+    hostargs:
+      n01: --bind-host 10.41.0.205
+      n02: --bind-host 10.41.0.222
+      n09: --bind-host 10.41.0.253
+      n13: --bind-host 10.41.0.238
+
+  # ---- search_compute x 2 (one per GPU half) -----------------------
+  # Both halves attach the SAME ring (read-only) and process the same
+  # cube slots, but each one runs the detector on a disjoint slice of
+  # fine-DM trials (full plan = 64 fdm → half 0 = trials 0..31, half
+  # 1 = trials 32..63; both halves use n_fdm=32 per cube). image_backend
+  # = cpu / device = cpu for M7.2 bring-up — search nodes do not yet
+  # have a GPU pinned for image-cube build / detector. Flip both to
+  # gpu / cuda:0 / cuda:1 in M7.5 once the search-side GPU plan lands.
+  #
+  # The two halves run as independent processes so a crash in one
+  # doesn't take down the other; dsart_rt restarts them on the
+  # `start` verb. Each writes its own stderr log under
+  # ~/tmp/dsart-rt/search_rt-<cn_id>-search_compute_{0,1}.log.
+  #
+  # M6 sub-systems (clusterer, cube_dump, udp_listener, cands_logger)
+  # are all gated OFF for the M7.2 plumbing smoke — they're exercised
+  # by the M5/M6 unit + bench suites, and adding them here would just
+  # add cycles to the per-cube driver loop without changing the
+  # transport-side conclusions. M7.3 reactivates --enable-all once
+  # the production config_compute_search.yaml is staged.
+  - name: search_compute_0
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_compute
+      --shm-name /dsart-rxring-CN
+      --n-corr 16 --n-coarse-dm 5
+      --t-buf-samples 4096 --n-filled 5000
+      --bytes-per-cell 2
+      --n-fdm 32 --t-det 512 --n-grid 256
+      --gpu-half 0 --search-node-id CN
+      --device cpu --image-backend cpu
+      --poll-interval-s 0.001
+      --max-cubes 0
+      --log-level INFO
+
+  - name: search_compute_1
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_compute
+      --shm-name /dsart-rxring-CN
+      --n-corr 16 --n-coarse-dm 5
+      --t-buf-samples 4096 --n-filled 5000
+      --bytes-per-cell 2
+      --n-fdm 32 --t-det 512 --n-grid 256
+      --gpu-half 1 --search-node-id CN
+      --device cpu --image-backend cpu
+      --poll-interval-s 0.001
+      --max-cubes 0
+      --log-level INFO

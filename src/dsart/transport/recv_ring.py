@@ -309,7 +309,21 @@ class RxRing:
         name: str,
         dims: RxRingDims,
     ) -> "RxRing":
-        """Attach read-only to an existing shm segment (compute reader)."""
+        """Attach as a consumer to an existing shm segment.
+
+        NOTE: despite the historical method name (kept for
+        backward-compatibility), the consumer mapping is
+        ``PROT_READ|PROT_WRITE`` — the SPMC contract requires the
+        consumer to atomically bump
+        ``overrun_count_per_compute[half]`` (on every reader-side
+        overrun in ``rx_ring_read_slot``) and to update
+        ``read_seq_per_compute[half]`` (on every ``release``).
+        With a true ``PROT_READ`` mapping the first overrun /
+        release would segfault. OS-level isolation between writer
+        and consumer is intentionally weak; the SPMC contract is
+        enforced by the atomic protocol, not by mmap protection
+        bits.
+        """
         lib = _get_lib()
         errbuf = ctypes.create_string_buffer(256)
         handle = lib.rx_ring_open_or_create(

@@ -214,7 +214,18 @@ rx_ring_open_or_create(
     );
     ring->shm_size = HEADER_SIZE + data_size;
 
-    int oflags = owner ? (O_CREAT | O_RDWR) : O_RDONLY;
+    /* CONSUMER WRITE PATHS:
+     *   rx_ring_read_slot bumps overrun_count_per_compute[half] on overrun
+     *   rx_ring_update_read_seq writes read_seq_per_compute[half] on every
+     *   cube release.
+     * Neither field is writable through PROT_READ — a "read-only" attach
+     * therefore segfaults on the first overrun/release. We open the fd
+     * O_RDWR and map PROT_READ|PROT_WRITE on both sides. The OS-level
+     * isolation between writer and consumer is intentionally weak: the
+     * SPMC contract is enforced by the C atomic protocol, not by
+     * mmap protection bits.
+     */
+    int oflags = owner ? (O_CREAT | O_RDWR) : O_RDWR;
     mode_t mode = owner ? 0660 : 0;
 
     ring->shm_fd = shm_open(name, oflags, mode);
@@ -233,7 +244,7 @@ rx_ring_open_or_create(
         }
     }
 
-    int prot = owner ? (PROT_READ | PROT_WRITE) : PROT_READ;
+    int prot = PROT_READ | PROT_WRITE;
     int flags = MAP_SHARED;
 
     void *base = mmap(NULL, ring->shm_size, prot, flags, ring->shm_fd, 0);

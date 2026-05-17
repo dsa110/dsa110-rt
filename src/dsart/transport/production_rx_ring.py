@@ -37,6 +37,10 @@ from typing import AsyncIterator, Mapping, Optional
 
 import numpy as np
 
+from dsart.common.constants import (
+    CUBE_CADENCE_SAMPLES_DEFAULT,
+    T_INT_SEARCH_US_DEFAULT,
+)
 from dsart.services.rx_ring import CubeRingSlot
 from dsart.fine_dm.combiner import (
     TimeShiftSearchTable,
@@ -47,6 +51,7 @@ from dsart.transport.recv_ring import (
     BYTES_CINT8_COMPLEX,
     VF_DATA_PRESENT,
     VF_PATTERN_MISMATCH,
+    VF_RX_OVERRUN,
     RxRing,
     RxRingDims,
 )
@@ -134,11 +139,13 @@ class ProductionRxRingSource:
         fine_dm_pc_cm3: np.ndarray,
         fine_to_coarse: np.ndarray,
         compute_half: int = 0,
-        t_int_search_us: float = 8.192,
-        cube_cadence_samples: int = 256,
+        t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
+        cube_cadence_samples: int = CUBE_CADENCE_SAMPLES_DEFAULT,
+        n_grid: int = 256,
         enable_cuda_register: bool = True,
         poll_interval_s: float = 0.001,
         max_cubes: Optional[int] = None,
+        fan_in_min_corrs: int = 1,
     ) -> None:
         if n_fdm_in_cube <= 0:
             raise ValueError(f"n_fdm_in_cube={n_fdm_in_cube}, expected > 0")
@@ -150,6 +157,11 @@ class ProductionRxRingSource:
             raise ValueError(
                 f"cube_cadence_samples={cube_cadence_samples}, expected > 0"
             )
+        if not 1 <= fan_in_min_corrs <= ring_dims.n_corr:
+            raise ValueError(
+                f"fan_in_min_corrs={fan_in_min_corrs} not in "
+                f"[1, {ring_dims.n_corr}]"
+            )
 
         self._shm_name = shm_name
         self._ring_dims = ring_dims
@@ -157,9 +169,11 @@ class ProductionRxRingSource:
         self._t_det = int(t_det)
         self._compute_half = int(compute_half)
         self._cube_cadence_samples = int(cube_cadence_samples)
+        self._n_grid_override = int(n_grid)
         self._poll_interval_s = float(poll_interval_s)
         self._max_cubes = max_cubes
         self._enable_cuda_register = bool(enable_cuda_register)
+        self._fan_in_min_corrs = int(fan_in_min_corrs)
 
         self._time_shift_table = compute_time_shift_search(
             coarse_dm_pc_cm3=coarse_dm_pc_cm3,
@@ -175,19 +189,69 @@ class ProductionRxRingSource:
         self._stopped: bool = False
         self._cubes_emitted: int = 0
 
+        # Mon-dict counters (read by SearchComputeService for status JSON).
+        # These are PROCESS-LOCAL — the assembler bumps them as it reads
+        # the ring. They are the consumer-side mirror of the recv_epoll
+        # ring_* counters (the producer's view).
+        self._n_slots_read: int = 0
+        self._n_overrun: int = 0
+        self._n_pattern_mismatch: int = 0
+        self._n_no_data_present: int = 0
+
+        # Pre-allocated zero-filled per_chgroup_streams cache.
+        # ----------------------------------------------------
+        # The CubePipeline GPU path actually consumes the cint8 stack
+        # (see CubeRingSlot.per_chgroup_cint8_stack); the per_chgroup_streams
+        # dict is the CPU/legacy fallback path. For the M7.2 system
+        # bring-up the synthetic TX (bench/net_pair) ships all-zero
+        # payloads, so the physically-correct streams ARE all zeros —
+        # we can amortise the alloc across cubes by handing out the
+        # same cached view every cube. The downstream pipeline only
+        # READS the streams (combine_chgroups reduces them into the
+        # search cube), so sharing the buffer is safe.
+        #
+        # NOTE (deferred to M7.4): once real on-sky data flows, the
+        # assembler needs to scatter the raw quantised COO bytes from
+        # each ring slot into the dense per_chgroup grid using a
+        # pre-built linear-index LUT keyed by pattern_id, AND ship
+        # scale/offset/pattern_id metadata via a sidecar (the ring
+        # payload only carries cell values, not coordinates or quant
+        # metadata). See M4a_PLAN_FIXES.md note re: "dequant on
+        # compute reader".
+        self._t_stream = self._t_det + int(
+            self._time_shift_table.shifts.max(initial=0)
+        )
+        self._n_grid_cached = self._n_grid_override
+        self._per_chgroup_streams_zero: dict[int, np.ndarray] = {
+            corr: np.zeros(
+                (self._t_stream, self._n_grid_cached, self._n_grid_cached),
+                dtype=np.complex64,
+            )
+            for corr in range(self._ring_dims.n_corr)
+        }
+
     @property
     def time_shift_table(self) -> TimeShiftSearchTable:
         return self._time_shift_table
 
     @property
     def n_grid(self) -> int:
-        """The grid side length, derived from N_filled via the gridder pattern."""
-        # NOTE: The receive ring carries sparse-COO values, not dense grids;
-        # n_grid is a contract surfaced on the CubeRingSlot for downstream
-        # consumers that build dense [N_grid, N_grid] uv-grids.
-        # We surface it as a constructor param at the M4a integration point
-        # in chunk 7. For now, infer from ring_dims if needed.
-        return 256  # default ops point per plan §3 line 305
+        """The grid side length, surfaced to downstream consumers that
+        build dense ``[N_grid, N_grid]`` uv-grids. The ring carries
+        sparse-COO cell values only (no coordinates); ``n_grid`` is the
+        contract dimension matched against the search-compute config."""
+        return self._n_grid_cached
+
+    @property
+    def stats(self) -> dict:
+        """Process-local read counters (mon-dict source)."""
+        return {
+            "cubes_emitted": int(self._cubes_emitted),
+            "n_slots_read": int(self._n_slots_read),
+            "n_overrun": int(self._n_overrun),
+            "n_pattern_mismatch": int(self._n_pattern_mismatch),
+            "n_no_data_present": int(self._n_no_data_present),
+        }
 
     @property
     def cuda_registered(self) -> bool:
@@ -279,14 +343,27 @@ class ProductionRxRingSource:
             if self._max_cubes is not None and self._cubes_emitted >= self._max_cubes:
                 break
 
-            # Check if write_seq has advanced enough for a cube.
-            min_wseq = None
-            for corr in range(self._ring_dims.n_corr):
-                w = self._ring.get_write_seq(corr)
-                if min_wseq is None or w < min_wseq:
-                    min_wseq = w
-
-            if min_wseq is None or min_wseq < last_cube_seq_boundary + self._cube_cadence_samples:
+            # Cube-emit gating (M7.2 fan-in semantics):
+            # ----------------------------------------
+            # The full 16-corr search fan-in is designed for every
+            # chgroup to be live; if any chgroup is silent the natural
+            # ``min(write_seq)`` over corrs stays at 0 and the source
+            # deadlocks (the M7.2 loopback smoke caught this when only
+            # chgroup 0 was sending). We instead emit a cube as soon as
+            # ``fan_in_min_corrs`` chgroups have advanced past the next
+            # boundary — the per-(corr, t) ``validity_mask`` written by
+            # ``_assemble_cube`` already marks silent corrs' samples as
+            # invalid, so the downstream detector correctly gates Layer-2
+            # EMA updates on the partial cube. Production sets
+            # ``fan_in_min_corrs == n_corr`` (every chgroup required);
+            # smoke / dev set it to 1.
+            wseqs = [
+                self._ring.get_write_seq(corr)
+                for corr in range(self._ring_dims.n_corr)
+            ]
+            target_seq = last_cube_seq_boundary + self._cube_cadence_samples
+            n_at_target = sum(1 for w in wseqs if w >= target_seq)
+            if n_at_target < self._fan_in_min_corrs:
                 await asyncio.sleep(self._poll_interval_s)
                 continue
 
@@ -306,45 +383,69 @@ class ProductionRxRingSource:
     ) -> CubeRingSlot:
         """Assemble one cube's worth of per-chgroup streams from the ring.
 
-        Reads from the ring with the time-shift-search table applied to
-        align each chgroup's coarse-DM stream. Returns a CubeRingSlot with:
-        - per_chgroup_streams: dict[chgroup → [T_stream, N_grid, N_grid] complex64].
-          For sparse-COO chunks 3/4/5, the dense [N_grid, N_grid] axis is
-          materialised by the combiner downstream (plan §4.4 line 1462: the
-          ring carries sparse COO; the dense materialisation is lazy).
-          We surface a placeholder dense stream that the M5 combiner will
-          replace once the sparse-scatter kernel is integrated.
-        - time_shift_table: TimeShiftSearchTable built at construction.
-        - validity_mask: [T_det, N_fdm] bool; True where every chgroup slot
-          has data_present=True AND pattern_mismatch=False; False otherwise.
+        Walks every ring slot the cube depends on — ``(corr, coarse_dm, t)``
+        for ``corr ∈ [0, n_corr)``, ``coarse_dm ∈ [0, n_coarse_dm)``, and
+        ``t ∈ [specnum_start, specnum_start + cube_cadence_samples)`` —
+        and builds a :class:`CubeRingSlot`. Each ``read_slot`` exercises
+        the real shm path (kernel mmap, atomic acquire on write_seq, full
+        slot ``memcpy``), so the assembler exerts production-realistic
+        bandwidth pressure on the ring even in synthetic-TX bring-up.
 
-        NOTE: The full sparse→dense decode path lives in the M5 combiner
-        kernel (out of scope for chunk 5). We expose the validity mask and
-        the time-shift table; chunk 7's bench joins this against the dense
-        materialiser.
+        Validity mask ``[T_det, N_fdm]``:
+
+          * Initial state: ``True`` everywhere.
+          * Drops to ``False`` for ``t in [0, T_det)`` whenever ANY
+            (corr, coarse_dm) slot at that ``t`` is:
+              - read-side overrun (``rx_ring_read_slot`` returned -1
+                because the writer lapped us);
+              - missing ``VF_DATA_PRESENT``; or
+              - carrying ``VF_PATTERN_MISMATCH``.
+          * Detector consumes ``torch.all(validity_mask)`` as a coarse
+            cube-valid bool gating Layer-2 EMA updates (see
+            :meth:`DeterministicDetector.forward`), so any per-slot
+            problem suppresses sigma-bank learning for that whole cube.
+
+        ``per_chgroup_streams``:
+
+          * **M7.2 bring-up scope (this implementation):** hands the
+            consumer the pre-allocated zero-filled cache built in
+            ``__init__``. The synthetic TX (``bench/net_pair``) ships
+            all-zero payloads, so the physically-correct streams ARE
+            zeros and we save the per-cube allocation + memset (which
+            would otherwise be ~1.2 GB of complex64 per cube at
+            16 chgroups × T_stream × N_grid² ).
+          * **Deferred to M7.4 (real on-sky):** scatter the quantised
+            COO cell values from each ring slot into the dense
+            ``[T_stream, N_grid, N_grid]`` per-chgroup grid using a
+            pre-built linear-index LUT keyed by ``pattern_id``, and
+            apply per-slot scale/offset for dequant. That work also
+            requires the recv_epoll producer to ship ``scale`` /
+            ``offset`` / ``pattern_id`` / ``n_filled`` as a sidecar in
+            the ring slot (today the slot is payload-bytes + validity
+            only); see M4a_PLAN_FIXES.md and ``recv_ring.c`` slot
+            layout for the contract.
         """
         assert self._ring is not None
         n_corr = self._ring_dims.n_corr
+        n_coarse_dm = self._ring_dims.n_coarse_dm
         n_grid = self.n_grid
-        t_stream = self._t_det + int(self._time_shift_table.shifts.max(initial=0))
 
-        per_chgroup_streams: dict[int, np.ndarray] = {}
         validity_mask = np.ones(
             (self._t_det, self._n_fdm_in_cube), dtype=np.bool_
         )
 
         for corr in range(n_corr):
-            stream = np.zeros(
-                (t_stream, n_grid, n_grid), dtype=np.complex64
-            )
-            # For each (coarse_dm, t) in the cube, read the slot and check
-            # validity. We DO NOT materialise the dense grid here (chunk-5
-            # scope is the Protocol surface, not the GPU sparse-scatter
-            # kernel). validity_mask drops to False if any chgroup slot is
-            # missing or pattern-mismatched.
-            for dm in range(min(self._ring_dims.n_coarse_dm, 1)):
+            # Read every (coarse_dm, t) slot the cube depends on. This
+            # is real ring bandwidth — slot size = n_filled × bpc bytes
+            # (e.g. 5000 × 2 = 10 KiB at the default op-point), so per
+            # cube we move n_corr × n_coarse_dm × cube_cadence × 10 KiB
+            # bytes through ``rx_ring_read_slot``. At
+            # 7.45 cubes/s × 16 × 5 × 256 × 10 KiB ≈ 1.5 GB/s of memcpy
+            # — well within the host's L3/RAM bandwidth on n01/n06.
+            for dm in range(n_coarse_dm):
                 for t in range(self._cube_cadence_samples):
                     t_abs = specnum_start + t
+                    self._n_slots_read += 1
                     try:
                         _payload, vf = self._ring.read_slot(
                             corr=corr,
@@ -353,19 +454,34 @@ class ProductionRxRingSource:
                             compute_half=self._compute_half,
                         )
                     except OSError:
-                        # Overrun — propagate as validity drop for this t.
+                        # rx_ring_read_slot returned -1 with VF_RX_OVERRUN
+                        # (writer lapped us by more than T_buf samples).
+                        self._n_overrun += 1
                         if t < self._t_det:
                             validity_mask[t, :] = False
                         continue
-                    if not (vf & VF_DATA_PRESENT) or (vf & VF_PATTERN_MISMATCH):
+                    if vf & VF_RX_OVERRUN:
+                        self._n_overrun += 1
                         if t < self._t_det:
                             validity_mask[t, :] = False
-            per_chgroup_streams[corr] = stream
+                        continue
+                    if vf & VF_PATTERN_MISMATCH:
+                        self._n_pattern_mismatch += 1
+                        if t < self._t_det:
+                            validity_mask[t, :] = False
+                        continue
+                    if not (vf & VF_DATA_PRESENT):
+                        # Hole (e.g. window-slide zerofill from
+                        # recv_epoll). The slot wrote but with
+                        # validity=0; counts as "no data this t".
+                        self._n_no_data_present += 1
+                        if t < self._t_det:
+                            validity_mask[t, :] = False
 
         return CubeRingSlot(
             cube_id=cube_id,
             specnum_start=specnum_start,
-            per_chgroup_streams=per_chgroup_streams,
+            per_chgroup_streams=self._per_chgroup_streams_zero,
             time_shift_table=self._time_shift_table,
             validity_mask=validity_mask,
             n_fdm_in_cube=self._n_fdm_in_cube,
