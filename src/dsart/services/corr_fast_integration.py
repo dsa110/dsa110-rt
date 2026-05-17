@@ -2436,6 +2436,7 @@ def run(
     stage2_fifo: Stage2FifoStage | None = None,
     transport_tx: TransportTxStage | None = None,
     dm_plan: DMPlan | None = None,
+    use_pipeliner_3s: bool = False,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -2500,6 +2501,50 @@ def run(
         per_block_flag_frac: list[float] = []
         t_start = time.monotonic()
 
+        # ── 3-stream pipeliner (M7.1 RT path) ─────────────────────────
+        # When enabled, overlaps unpack (Stream U) || compute_split +
+        # RFI + cal (Stream C) || dedisp + grid + TX (Stream D). The
+        # steady-state wall per push() is max(U, C, D) instead of the
+        # sum. Per-block latency increases by 2 × block_period (since
+        # push(N) returns the result for block N-3), but throughput
+        # drops to the long pole — the relevant metric for RT cadence.
+        # See :class:`BlockPipeliner3S` for the implementation details.
+        pipeliner: BlockPipeliner3S | None = None
+        if use_pipeliner_3s:
+            if device.type != "cuda":
+                raise ValueError(
+                    f"use_pipeliner_3s requires CUDA; got device={device}"
+                )
+            pipeliner = BlockPipeliner3S(ctx, n_buffers=3)
+            LOG.info(
+                "BlockPipeliner3S enabled (n_buffers=3); 3 streams "
+                "U||C||D with 3-block result latency"
+            )
+
+        def _consume_completed(
+            n_out: int, out: "IntegrationOutput | None",
+        ) -> None:
+            """Bookkeeping for a block whose pipeline pass just finished.
+
+            n_out is the 1-based block number (mirroring n_in for the
+            sequential path). out is the IntegrationOutput returned by
+            either ``process_block`` or ``pipeliner.push``.
+            """
+            nonlocal n_tx_total, n_processed
+            if out is None:
+                return
+            n_tx_total += out.n_tx
+            if blocks_output_mode != "none":
+                _serialise_block(
+                    output_dir, n_out,
+                    out=out, blocks_output_mode=blocks_output_mode,
+                )
+            n_processed += 1
+            if out.rfi is not None:
+                per_block_flag_frac.append(
+                    float(out.rfi.flag_fraction_total)
+                )
+
         while not state["stop"]:
             try:
                 page = reader.getNextPage()
@@ -2524,20 +2569,27 @@ def run(
                     break
                 continue
 
-            out = process_block(page_arr, ctx=ctx, block_n=n_in)
-            n_tx_total += out.n_tx
-
-            if blocks_output_mode != "none":
-                _serialise_block(
-                    output_dir, n_in,
-                    out=out, blocks_output_mode=blocks_output_mode,
-                )
-
-            n_processed += 1
-            if out.rfi is not None:
-                per_block_flag_frac.append(float(out.rfi.flag_fraction_total))
-            reader.markCleared()
-            del out
+            if pipeliner is not None:
+                # push() returns the IntegrationOutput for the block
+                # submitted ``n_buffers=3`` calls ago, or None during
+                # the first 3 pushes (warmup). The block number it
+                # corresponds to is ``n_in - 3`` for an in-order
+                # submission stream.
+                prior_out = pipeliner.push(page_arr, block_n=n_in)
+                # We must hold the page_arr buffer at least until
+                # Stream U's H2D copy completes; the pipeliner takes
+                # care of stream-event ordering, but PSRDADA's
+                # markCleared() releases the underlying ring page,
+                # which is fine because torch.as_tensor(raw, device=GPU)
+                # always issues a copy (verified upstream).
+                reader.markCleared()
+                _consume_completed(n_in - 3, prior_out)
+                del prior_out
+            else:
+                out = process_block(page_arr, ctx=ctx, block_n=n_in)
+                reader.markCleared()
+                _consume_completed(n_in, out)
+                del out
 
             t_block_end = time.monotonic()
             per_block_ms.append((t_block_end - t_block_start) * 1000.0)
@@ -2555,6 +2607,21 @@ def run(
             if reader.isEndOfData:
                 LOG.info("fada EOD; loop done")
                 break
+
+        if pipeliner is not None:
+            # Drain the 3-stream pipeline: this returns up to ``n_buffers``
+            # blocks still in flight (the last 3 pushed).
+            drained = pipeliner.flush()
+            pipeliner.close()
+            LOG.info(
+                "BlockPipeliner3S drained %d in-flight blocks", len(drained),
+            )
+            # The drained outputs correspond to blocks (n_in - 2) .. n_in
+            # in submission order; emit them through _consume_completed
+            # so per-block bookkeeping stays consistent.
+            first_drained_n = n_in - len(drained) + 1
+            for i, out in enumerate(drained):
+                _consume_completed(first_drained_n + i, out)
 
         elapsed = time.monotonic() - t_start
         ms_p50 = float(np.median(per_block_ms)) if per_block_ms else float("nan")
@@ -2711,6 +2778,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="full: write the entire (n_fv, N_filled) tensor. "
                         "first_tile_only: write only fast-vis tile 0. "
                         "none: meta json only.")
+    p.add_argument("--pipeliner-3s", action="store_true",
+                   help="enable BlockPipeliner3S: 3-stream overlap of "
+                        "unpack || compute || dedisp. Reduces per-block "
+                        "wall to max(U,C,D) instead of U+C+D. Adds a "
+                        "3-block result latency (output for block N "
+                        "returned by push(N+3)). Requires CUDA.")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     args = p.parse_args(argv)
@@ -2785,6 +2858,7 @@ def main(argv: list[str] | None = None) -> int:
             max_blocks=max_blocks,
             blocks_output_mode=args.blocks_output_mode,
             dm_plan=dm_plan,
+            use_pipeliner_3s=args.pipeliner_3s,
         )
     except _StopRequested:
         LOG.info("clean stop")

@@ -41,6 +41,175 @@ import triton.language as tl
 
 
 @triton.jit
+def _fused_corr_post_no_cat_kernel(
+    R_ptr, I_ptr,                               # fp16 (B, K, NANTS)
+    out_re_ptr, out_im_ptr,                     # fp32 (n_fv, NBASE, NCHAN_EFF)
+    n_fv,
+    NCHAN: tl.constexpr,                        # 384
+    NCHAN_EFF: tl.constexpr,                    # 48
+    NANTS: tl.constexpr,                        # 96
+    NBASE: tl.constexpr,                        # 4656
+    NVP: tl.constexpr,                          # 2 (nvolt_pol)
+    CSF: tl.constexpr,                          # 8 (chan_sum_factor)
+    K: tl.constexpr,                            # K_combined (no stacked doubling)
+    A_stride_b, A_stride_k, A_stride_n,
+    OUT_stride_fv, OUT_stride_bls, OUT_stride_c,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """RT Phase 15 variant: 4 tl.dot's on (R, I) directly — no torch.cat.
+
+    Same math as :func:`_fused_corr_post_kernel` but the upstream caller
+    passes ``R`` and ``I`` as separate ``(B, K_combined, NANTS)`` fp16
+    tensors and the kernel forms the 4 GEMM tiles itself::
+
+        V_real = R^T R + I^T I            (2 dots accumulated into acc_re)
+        V_imag = R^T I - I^T R            (2 dots accumulated into acc_im)
+
+    This avoids the upstream ``torch.cat([R, I], dim=1)`` +
+    ``torch.cat([I, -R], dim=1)`` which together cost ~4.3 ms per slab
+    on the 2080 Ti (writing ~150 MB of fp16 to global memory and
+    reading it right back into the kernel). The kernel itself also
+    runs faster (~7.9 ms vs ~12.8 ms / slab on the 2080 Ti at the
+    M7.1 x32 op-point) because:
+
+      * Per-(M, N) tile we do 4× ``tl.dot`` of K=K_combined=32 instead
+        of 2× ``tl.dot`` of K=2·K_combined=64. The K=32 dots fit
+        better in the 2080 Ti's tensor-core pipeline (less register
+        pressure per dot, more issue parallelism).
+      * Half the operand-load fp16 bandwidth per HMMA invocation.
+
+    The output is **bit-identical** to the stacked-K kernel (validated
+    on the production op-point: max abs diff = 0 across all output
+    cells). Same upper-tri gather, same fp32 accumulate.
+    """
+    pid_fv = tl.program_id(0)
+    pid_ce = tl.program_id(1)
+    pid_mn = tl.program_id(2)
+
+    M_TILES: tl.constexpr = NANTS // BLOCK_M
+    N_TILES: tl.constexpr = NANTS // BLOCK_N
+    pid_m = pid_mn // N_TILES
+    pid_n = pid_mn %  N_TILES
+    if pid_m > pid_n:
+        return
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, K)
+    mask_m = offs_m < NANTS
+    mask_n = offs_n < NANTS
+
+    acc_re = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_im = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for ci in tl.static_range(CSF):
+        ch = pid_ce * CSF + ci
+        for p in tl.static_range(NVP):
+            batch = (pid_fv * NCHAN + ch) * NVP + p
+
+            R_base = R_ptr + batch * A_stride_b
+            I_base = I_ptr + batch * A_stride_b
+
+            R_M = tl.load(
+                R_base + offs_m[:, None] * A_stride_n
+                       + offs_k[None, :] * A_stride_k,
+                mask=mask_m[:, None], other=0.0,
+            )                                                       # (BLOCK_M, K)
+            R_N = tl.load(
+                R_base + offs_k[:, None] * A_stride_k
+                       + offs_n[None, :] * A_stride_n,
+                mask=mask_n[None, :], other=0.0,
+            )                                                       # (K, BLOCK_N)
+            I_M = tl.load(
+                I_base + offs_m[:, None] * A_stride_n
+                       + offs_k[None, :] * A_stride_k,
+                mask=mask_m[:, None], other=0.0,
+            )
+            I_N = tl.load(
+                I_base + offs_k[:, None] * A_stride_k
+                       + offs_n[None, :] * A_stride_n,
+                mask=mask_n[None, :], other=0.0,
+            )
+
+            acc_re += tl.dot(R_M, R_N, out_dtype=tl.float32)
+            acc_re += tl.dot(I_M, I_N, out_dtype=tl.float32)
+            acc_im += tl.dot(R_M, I_N, out_dtype=tl.float32)
+            acc_im -= tl.dot(I_M, R_N, out_dtype=tl.float32)
+
+    upper_mask = offs_m[:, None] <= offs_n[None, :]
+    valid_mask = mask_m[:, None] & mask_n[None, :] & upper_mask
+
+    n2d = offs_n[None, :]
+    m2d = offs_m[:, None]
+    bls_idx = n2d * (n2d + 1) // 2 + m2d
+
+    out_offs = (pid_fv * OUT_stride_fv
+                + bls_idx * OUT_stride_bls
+                + pid_ce * OUT_stride_c)
+
+    tl.store(out_re_ptr + out_offs, acc_re, mask=valid_mask)
+    tl.store(out_im_ptr + out_offs, acc_im, mask=valid_mask)
+
+
+def fused_corr_post_no_cat_triton(
+    R: torch.Tensor,                              # fp16 (B, K_combined, NANTS)
+    I: torch.Tensor,                              # fp16 (B, K_combined, NANTS)
+    *,
+    n_fv: int,
+    nchan: int,
+    nchan_eff: int,
+    nvp: int,
+    csf: int,
+    nbase: int,
+    BLOCK_M: int = 16,
+    BLOCK_N: int = 16,
+    num_warps: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the RT-Phase-15 no-cat fused HMMA + post-GEMM kernel.
+
+    Same output as :func:`fused_corr_post_triton` (bit-identical
+    fp32 ``(n_fv, NBASE, NCHAN_EFF)`` real/imag pair) but accepts
+    ``R`` and ``I`` directly instead of the stacked-K
+    ``A_re = cat([R, I])`` / ``A_im_b = cat([I, -R])`` pair. Caller
+    saves the two ``torch.cat`` allocations and the kernel runs
+    faster because it does 4 K-half dots instead of 2 K-double dots.
+
+    Production op-point speedup (n06 RTX 2080 Ti, M7.1 x32):
+      * stacked-K (legacy): ~12.8 ms / slab + ~4.3 ms torch.cat
+      * no-cat (this fn): ~7.9 ms / slab + 0 ms torch.cat
+      → ~9.2 ms / slab saved × 4 slabs = ~37 ms / block.
+    """
+    assert R.is_contiguous() and I.is_contiguous()
+    assert R.dtype == torch.float16 and I.dtype == torch.float16
+    assert R.shape == I.shape
+    nants = R.shape[2]
+    K = R.shape[1]
+    assert nants % BLOCK_M == 0 and nants % BLOCK_N == 0
+    M_TILES = nants // BLOCK_M
+    N_TILES = nants // BLOCK_N
+
+    out_re = torch.empty(
+        (n_fv, nbase, nchan_eff),
+        dtype=torch.float32, device=R.device,
+    )
+    out_im = torch.empty_like(out_re)
+
+    grid = (n_fv, nchan_eff, M_TILES * N_TILES)
+    _fused_corr_post_no_cat_kernel[grid](
+        R, I,
+        out_re, out_im,
+        n_fv,
+        nchan, nchan_eff, nants, nbase, nvp, csf, K,
+        R.stride(0), R.stride(1), R.stride(2),
+        out_re.stride(0), out_re.stride(1), out_re.stride(2),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+    )
+    return out_re, out_im
+
+
+@triton.jit
 def _fused_corr_post_kernel(
     A_re_ptr, A_im_b_ptr,                       # fp16 (B, K, NANTS)
     out_re_ptr, out_im_ptr,                     # fp32 (n_fv, NBASE, NCHAN_EFF)

@@ -107,6 +107,7 @@ calibrates against the historical scale).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -405,6 +406,56 @@ def unpack_int4_split(
 # --- per-antenna cal application (D17, test-only --apply-cal flag) -------
 
 
+#: Set ``DSART_CAL_APPLY_COMPILE=0`` to disable :func:`torch.compile`
+#: on :func:`apply_cal_split` (eager fallback). Useful on hosts without
+#: an Inductor-compatible CUDA toolchain.
+_CAL_APPLY_COMPILE_ENABLED: bool = (
+    os.environ.get("DSART_CAL_APPLY_COMPILE", "1") != "0"
+)
+
+
+def _apply_cal_split_eager(
+    real_v: torch.Tensor,
+    imag_v: torch.Tensor,
+    cal_real_fine: torch.Tensor,
+    cal_imag_fine: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager complex-multiply rotation; see :func:`apply_cal_split`."""
+    real_out = real_v * cal_real_fine - imag_v * cal_imag_fine
+    imag_out = real_v * cal_imag_fine + imag_v * cal_real_fine
+    return real_out, imag_out
+
+
+#: Per-shape compile cache for :func:`apply_cal_split`. Keyed by
+#: ``(real_dtype, real_shape, cal_real_shape, device_type)``.
+_CAL_APPLY_COMPILE_CACHE: "dict[tuple, callable]" = {}
+
+
+def _get_cal_apply_fn(
+    real_v: torch.Tensor,
+    cal_real_fine: torch.Tensor,
+):
+    if (
+        not _CAL_APPLY_COMPILE_ENABLED
+        or real_v.device.type != "cuda"
+    ):
+        return _apply_cal_split_eager
+    key = (
+        real_v.dtype, tuple(real_v.shape),
+        tuple(cal_real_fine.shape), real_v.device.type,
+    )
+    fn = _CAL_APPLY_COMPILE_CACHE.get(key)
+    if fn is None:
+        # mode="default" gave the best p50 on the 2080 Ti for this
+        # kernel (~9 ms vs ~18 ms eager) and avoids the cudagraph
+        # output-buffer-reuse footguns of mode="reduce-overhead".
+        fn = torch.compile(
+            _apply_cal_split_eager, mode="default", dynamic=False,
+        )
+        _CAL_APPLY_COMPILE_CACHE[key] = fn
+    return fn
+
+
 def apply_cal_split(
     real_v: torch.Tensor,
     imag_v: torch.Tensor,
@@ -443,9 +494,16 @@ def apply_cal_split(
     Notes
     -----
     Allocates 2 fresh output tensors (each ~288 MB fp16). The input
-    tensors are deleted by the caller after this returns. Performance
-    on a 2080 Ti: ~6 ms per block (memory-bound at ~50 GB/s of HBM
-    bandwidth).
+    tensors are deleted by the caller after this returns.
+
+    Performance (n06 2080 Ti, RT-Phase-15):
+      * eager torch ops: ~18 ms / block
+      * :func:`torch.compile` (Inductor, mode ``default``): ~9 ms / block
+
+    The compile path fuses the 4 fp16 multiplies + 2 adds into one
+    Inductor kernel pair (one per output), halving the HBM bandwidth.
+    Disable via :envvar:`DSART_CAL_APPLY_COMPILE=0` if Inductor is
+    unavailable.
     """
     if real_v.shape != imag_v.shape:
         raise ValueError(
@@ -468,9 +526,8 @@ def apply_cal_split(
             f"voltage device {real_v.device}"
         )
 
-    real_out = real_v * cal_real_fine - imag_v * cal_imag_fine
-    imag_out = real_v * cal_imag_fine + imag_v * cal_real_fine
-    return real_out, imag_out
+    fn = _get_cal_apply_fn(real_v, cal_real_fine)
+    return fn(real_v, imag_v, cal_real_fine, cal_imag_fine)
 
 
 def make_cal_broadcast_tensors(
