@@ -66,7 +66,19 @@ routines:
       --bytes-per-cell 2
       --status-interval-s 5.0
       --log-level INFO
+    # Hostargs lookup tries the FQDN first, then the bare short hostname
+    # (dsart_rt.py:571). In the production lab `socket.gethostname()`
+    # returns `lxd110h<NN>` (the kernel-level container name), NOT the
+    # operator-facing `n<NN>` alias. We list BOTH forms so the yaml
+    # works in either case — the lab one is the path that actually
+    # matches today (verified on n01.pro.pvt 2026-05-17, M7.2.8 prep);
+    # the `n<NN>` keys are kept as future-proofing in case a node ever
+    # gets its kernel hostname renamed to the short alias.
     hostargs:
+      lxd110h01: --bind-host 10.41.0.205
+      lxd110h02: --bind-host 10.41.0.222
+      lxd110h09: --bind-host 10.41.0.253
+      lxd110h13: --bind-host 10.41.0.238
       n01: --bind-host 10.41.0.205
       n02: --bind-host 10.41.0.222
       n09: --bind-host 10.41.0.253
@@ -76,10 +88,22 @@ routines:
   # Both halves attach the SAME ring (read-only) and process the same
   # cube slots, but each one runs the detector on a disjoint slice of
   # fine-DM trials (full plan = 64 fdm → half 0 = trials 0..31, half
-  # 1 = trials 32..63; both halves use n_fdm=32 per cube). image_backend
-  # = cpu / device = cpu for M7.2 bring-up — search nodes do not yet
-  # have a GPU pinned for image-cube build / detector. Flip both to
-  # gpu / cuda:0 / cuda:1 in M7.5 once the search-side GPU plan lands.
+  # 1 = trials 32..63; both halves use n_fdm=32 per cube).
+  #
+  # M7.2.8 flipped to PRODUCTION GPU op-point (user-clarified
+  # 2026-05-18): both halves pinned to cuda:0 / cuda:1,
+  # image_backend=gpu. The prior 89cb1bc commit had this on CPU with
+  # the comment "search nodes don't yet have a GPU pinned" — that was
+  # wrong; n01 (and the other 3 search nodes) each have 2 × RTX 2080 Ti
+  # (cuda:0, cuda:1, 11 GB each). The point of M7.2.8 is to verify the
+  # search-side GPU pipeline keeps real-time at production op-point on
+  # synthetic data, analogous to how M7.1 validated the corr-side
+  # GPU pipeline on dada_junkdb data.
+  #
+  # Production op-point:
+  #   n_grid=256, n_fdm=32, t_det=512, cube_cadence_samples=256
+  #     (= 134.218 ms / cube = 7.45 cubes/s RT)
+  #   t_int_search_us=524.288 (default; pinned in plan §3.5)
   #
   # The two halves run as independent processes so a crash in one
   # doesn't take down the other; dsart_rt restarts them on the
@@ -87,11 +111,8 @@ routines:
   # ~/tmp/dsart-rt/search_rt-<cn_id>-search_compute_{0,1}.log.
   #
   # M6 sub-systems (clusterer, cube_dump, udp_listener, cands_logger)
-  # are all gated OFF for the M7.2 plumbing smoke — they're exercised
-  # by the M5/M6 unit + bench suites, and adding them here would just
-  # add cycles to the per-cube driver loop without changing the
-  # transport-side conclusions. M7.3 reactivates --enable-all once
-  # the production config_compute_search.yaml is staged.
+  # are all gated OFF for M7.2 — they land in M7.3 along with the
+  # full 16x4 fleet bring-up.
   - name: search_compute_0
     cmd: python
     args: >-
@@ -101,11 +122,17 @@ routines:
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
       --n-fdm 32 --t-det 512 --n-grid 256
+      --cube-cadence-samples 256
       --gpu-half 0 --search-node-id CN
-      --device cpu --image-backend cpu
+      --device cuda:0 --image-backend gpu
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
+    env:
+      # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
+      # always pass --device cuda:0 (the post-mask logical device).
+      # half 0 → physical GPU 0.
+      CUDA_VISIBLE_DEVICES: "0"
 
   - name: search_compute_1
     cmd: python
@@ -116,8 +143,12 @@ routines:
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
       --n-fdm 32 --t-det 512 --n-grid 256
+      --cube-cadence-samples 256
       --gpu-half 1 --search-node-id CN
-      --device cpu --image-backend cpu
+      --device cuda:0 --image-backend gpu
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
+    env:
+      # half 1 → physical GPU 1 (logical cuda:0 inside this process).
+      CUDA_VISIBLE_DEVICES: "1"

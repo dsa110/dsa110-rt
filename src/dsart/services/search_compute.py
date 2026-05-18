@@ -821,6 +821,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         poll_interval_s=args.poll_interval_s,
         max_cubes=args.max_cubes if args.max_cubes > 0 else None,
         fan_in_min_corrs=args.fan_in_min_corrs,
+        attach_timeout_s=args.attach_timeout_s,
     )
 
     if args.config_yaml is not None and args.config_yaml.exists():
@@ -937,6 +938,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "we emit a cube (default 16 = production "
                         "strict all-chgroups-required; M7.2 smoke "
                         "should pass 1 to allow partial fan-in).")
+    p.add_argument("--attach-timeout-s", type=float, default=30.0,
+                   help="wait up to this long for search_rx to create "
+                        "the shm ring before giving up (default 30s; "
+                        "covers the search_rx 16-port bind + ring "
+                        "init lag when both routines are fork-execed "
+                        "by dsart_rt in the same verb dispatch).")
 
     # --- SearchComputeService identity --------------------------------
     p.add_argument("--gpu-half", type=int, default=0, choices=(0, 1),

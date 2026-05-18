@@ -105,10 +105,20 @@ def gen_dm_list(
     n_chan: int,
     dt_us: float,
     tol: float,
+    n_cap: int | None = None,
 ) -> np.ndarray:
-    """Iterate gen_dmtrials_step from dm_min until exceeding dm_max."""
+    """Iterate gen_dmtrials_step from dm_min until exceeding dm_max.
+
+    If ``n_cap`` is given, the iteration also stops once the list reaches
+    ``n_cap`` entries (whichever exit triggers first). The natural exit
+    (``dms[-1] >= dm_max``) is preserved when ``n_cap is None``; M7.2
+    uses the n_cap path to lock the coarse-DM trial count exactly (and
+    lets the resulting ``coarse_dm[-1]`` define the effective dm_max).
+    """
     dms = [float(dm_min)]
     while dms[-1] < dm_max:
+        if n_cap is not None and len(dms) >= n_cap:
+            break
         dms.append(
             gen_dmtrials_step(dms[-1], nu_GHz, dnu_MHz, n_chan, dt_us, tol)
         )
@@ -121,7 +131,11 @@ def gen_dm_list(
 
 
 def build_fine_list(
-    dm_min: float, dm_max: float, t_int_search_us: float, tol: float
+    dm_min: float,
+    dm_max: float,
+    t_int_search_us: float,
+    tol: float,
+    n_cap: int | None = None,
 ) -> np.ndarray:
     """Step 1: fine list parameterised over the processed band (§3.2 line 511).
 
@@ -129,6 +143,10 @@ def build_fine_list(
     Δν_MHz    = DELTA_NU_CH_GHZ * 1e3                    (≈ 0.030518 MHz)
     N_chan    = N_CHAN_PROC_NATIVE                       (= 6144)
     Δt_us     = t_int_search_us                          (from operating point)
+
+    M7.2: optional ``n_cap`` truncates the recursion at a fixed trial count;
+    used by the n-coarse-cap path so fine_dm stops at the effective dm_max
+    (= coarse_dm[-1]) rather than over-running into uncovered DM space.
     """
     nu_center = (NU_TOP_PROC_GHZ + NU_BOT_PROC_GHZ) / 2.0
     return gen_dm_list(
@@ -139,11 +157,16 @@ def build_fine_list(
         n_chan=N_CHAN_PROC_NATIVE,
         dt_us=t_int_search_us,
         tol=tol,
+        n_cap=n_cap,
     )
 
 
 def build_coarse_list(
-    dm_min: float, dm_max: float, t_int_fast_us: float, tol: float
+    dm_min: float,
+    dm_max: float,
+    t_int_fast_us: float,
+    tol: float,
+    n_cap: int | None = None,
 ) -> np.ndarray:
     """Step 2: coarse list per-corr (shared across all 16 corrs; §3.2 line 525).
 
@@ -153,6 +176,12 @@ def build_coarse_list(
     treats the chgroup as a single wide channel for intra-band smearing
     accounting (the corr-side stage-1 pre-grid integrates 384 → 1).
     Δt_us is t_int_fast_us (corr-side cadence).
+
+    M7.2: ``n_cap`` locks the coarse-DM trial count exactly. The
+    effective DM coverage is ``coarse_dm[-1]`` (the last computed
+    trial), NOT the requested ``dm_max``; callers using ``n_cap``
+    should rebuild the fine list with the effective dm_max so no fine
+    trials orphan past the last coarse cell.
     """
     nu_center_chgroup0 = (NU_CHGROUP_TOP_GHZ[0] + NU_CHGROUP_BOT_GHZ[0]) / 2.0
     bw_chgroup_MHz = (NU_CHGROUP_TOP_GHZ[0] - NU_CHGROUP_BOT_GHZ[0]) * 1000.0
@@ -164,6 +193,7 @@ def build_coarse_list(
         n_chan=1,
         dt_us=t_int_fast_us,
         tol=tol,
+        n_cap=n_cap,
     )
 
 
@@ -417,11 +447,42 @@ def build_dm_plan(
     tol: float,
     t_int_fast_us: float,
     t_int_search_us: float,
+    n_coarse_cap: int | None = None,
     repo_root: Path = REPO_ROOT,
 ) -> DmPlan:
-    """Build a complete ``DmPlan`` per plan §3.2 (steps 1-5)."""
-    fine_dm = build_fine_list(dm_min, dm_max, t_int_search_us, tol)
-    coarse_dm = build_coarse_list(dm_min, dm_max, t_int_fast_us, tol)
+    """Build a complete ``DmPlan`` per plan §3.2 (steps 1-5).
+
+    Args:
+        n_coarse_cap: optional cap on the coarse-DM trial count. When set,
+            ``coarse_dm`` is truncated to exactly ``n_coarse_cap`` entries
+            (assuming the unbounded recursion would have produced at least
+            that many; otherwise the natural dm_max exit triggers first
+            and a ValueError is raised). The fine list is also rebuilt
+            against the effective dm_max = ``coarse_dm[-1]`` so no fine
+            trial lands past the last coarse cell.
+    """
+    coarse_dm = build_coarse_list(
+        dm_min, dm_max, t_int_fast_us, tol, n_cap=n_coarse_cap
+    )
+    if n_coarse_cap is not None and coarse_dm.shape[0] < n_coarse_cap:
+        raise ValueError(
+            f"n_coarse_cap={n_coarse_cap} but the recursion only produced "
+            f"{coarse_dm.shape[0]} trials before exceeding dm_max={dm_max}. "
+            f"Raise --dm-max or lower --tol/--dm-min to extend the natural list."
+        )
+    effective_dm_max = float(coarse_dm[-1])
+    # Fine list covers [dm_min, effective_dm_max]. The natural recursion
+    # exit produces one trial past effective_dm_max; we KEEP it so the
+    # last coarse cell is populated. ``build_fine_to_coarse`` maps that
+    # tail trial to the last coarse cell via searchsorted+clip with
+    # δdm = (tail - coarse_dm[-1]) ≥ 0 — bounded by one fine recursion
+    # step, well below any other cell's δdm spread. Clipping it out
+    # leaves the last coarse cell empty (degenerate; wastes one DM
+    # trial worth of corr-side compute), so we deliberately let it
+    # overshoot.
+    fine_dm = build_fine_list(
+        dm_min, effective_dm_max, t_int_search_us, tol
+    )
     fine_to_coarse, fine_offsets_idx, fine_offsets_flat = build_fine_to_coarse(
         fine_dm, coarse_dm
     )
@@ -447,7 +508,7 @@ def build_dm_plan(
 
     return DmPlan(
         dm_min=float(dm_min),
-        dm_max=float(dm_max),
+        dm_max=float(effective_dm_max),
         tol=float(tol),
         fine_dm=fine_dm,
         coarse_dm=coarse_dm,
@@ -478,6 +539,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dm-max", type=float, default=DM_MAX_DEFAULT)
     p.add_argument("--tol", type=float, default=DM_TOL_DEFAULT)
     p.add_argument(
+        "--n-coarse-cap",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on coarse-DM trial count. Truncates the legacy "
+            "gen_dmtrials recursion at exactly N trials and uses "
+            "coarse_dm[-1] as the effective dm_max (the fine list is "
+            "clipped to match). Used by M7.2 to compare {6,7,8}-trial "
+            "operating points while preserving (dm_min, tol)."
+        ),
+    )
+    p.add_argument(
         "--t-int-fast-us",
         type=float,
         default=T_INT_FAST_US_DEFAULT,
@@ -504,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
         tol=args.tol,
         t_int_fast_us=args.t_int_fast_us,
         t_int_search_us=t_int_search_us,
+        n_coarse_cap=args.n_coarse_cap,
     )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

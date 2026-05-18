@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import warnings
 from typing import AsyncIterator, Mapping, Optional
 
@@ -146,6 +147,7 @@ class ProductionRxRingSource:
         poll_interval_s: float = 0.001,
         max_cubes: Optional[int] = None,
         fan_in_min_corrs: int = 1,
+        attach_timeout_s: float = 30.0,
     ) -> None:
         if n_fdm_in_cube <= 0:
             raise ValueError(f"n_fdm_in_cube={n_fdm_in_cube}, expected > 0")
@@ -174,6 +176,7 @@ class ProductionRxRingSource:
         self._max_cubes = max_cubes
         self._enable_cuda_register = bool(enable_cuda_register)
         self._fan_in_min_corrs = int(fan_in_min_corrs)
+        self._attach_timeout_s = float(attach_timeout_s)
 
         self._time_shift_table = compute_time_shift_search(
             coarse_dm_pc_cm3=coarse_dm_pc_cm3,
@@ -258,10 +261,71 @@ class ProductionRxRingSource:
         return self._cuda_registered
 
     async def start(self) -> None:
-        """Open the shm ring and optionally cudaHostRegister it."""
+        """Open the shm ring and optionally cudaHostRegister it.
+
+        The shm segment is created by the search_rx process (the ring
+        OWNER), which can take ~1-2 s to bind its sockets and bring up
+        the SPMC ring before the consumer-side mmap_attach_readonly
+        can succeed. Under dsart_rt all routines fork-exec in the same
+        verb dispatch, so the search_compute halves typically race
+        search_rx by ~100-1000 ms. We retry the attach for up to
+        ``attach_timeout_s`` (default 30 s) so the orchestrator can
+        treat the routines as order-independent without explicit
+        sleeps in the YAML.
+
+        The retry interval is fixed at 200 ms (15× per second). For a
+        typical "owner came up 1 s after consumer" race this is 5
+        polls before success, which is below the noise floor of the
+        rest of the bring-up flow.
+        """
         if self._started:
             return
-        self._ring = RxRing.mmap_attach_readonly(self._shm_name, self._ring_dims)
+        attach_timeout_s = self._attach_timeout_s
+        deadline = time.monotonic() + attach_timeout_s
+        last_err: OSError | None = None
+        while True:
+            try:
+                self._ring = RxRing.mmap_attach_readonly(
+                    self._shm_name, self._ring_dims
+                )
+                break
+            except OSError as exc:
+                # Two retryable races:
+                #   - "No such file or directory": shm not yet created
+                #     by the owner (typical when search_rx and
+                #     search_compute fork-exec simultaneously).
+                #   - "bad magic: 0x00000000": shm exists but the owner
+                #     has not yet called rx_ring_init_header — i.e. the
+                #     shm_open(O_CREAT) raced ahead of the header memset.
+                # Everything else (dims mismatch, perms, real header
+                # corruption) propagates immediately.
+                msg = str(exc)
+                if (
+                    "No such file or directory" not in msg
+                    and "bad magic: 0x00000000" not in msg
+                ):
+                    raise
+                last_err = exc
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"ProductionRxRingSource.start: waited "
+                        f"{attach_timeout_s:.1f}s for owner to create "
+                        f"shm '{self._shm_name}'; giving up "
+                        f"(last error: {msg})"
+                    ) from exc
+                LOG.debug(
+                    "shm '%s' not yet present; retrying in 200ms "
+                    "(deadline in %.1fs)",
+                    self._shm_name,
+                    deadline - time.monotonic(),
+                )
+                await asyncio.sleep(0.200)
+        if last_err is not None:
+            LOG.info(
+                "shm '%s' attached after retry (initial: %s)",
+                self._shm_name,
+                last_err,
+            )
         if self._enable_cuda_register:
             # The ring's mapped pages live at ring._handle's mmap base.
             # We can't easily get the raw address through the ctypes wrapper
