@@ -48,6 +48,7 @@ path (pre-cint8-quantisation reference); they are NOT redundant.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -105,9 +106,21 @@ class GpuImager:
     config: GpuImagerConfig
     device: torch.device
     edge_mask_real: torch.Tensor   # [N_grid, N_grid] cube_dtype
-    output_cube: torch.Tensor      # [T_det, N_fdm, N_grid, N_grid] cube_dtype
+    output_cube: torch.Tensor      # ping-pong buffer A [T_det, N_fdm, N, N]
+    output_cube_alt: torch.Tensor  # ping-pong buffer B [T_det, N_fdm, N, N]
     uv_slab: torch.Tensor          # [T_det, N_grid, N_grid] complex_dtype
     img_slab_real: torch.Tensor    # [T_det, N_grid, N_grid] cube_dtype
+    # ``edge_mask_per_fdm`` is an optional per-fdm-fused edge mask of
+    # shape ``[N_fdm, N_grid, N_grid] cube_dtype``. When non-None,
+    # ``process_cube`` uses it INSTEAD of ``edge_mask_real`` so the
+    # caller can fold a per-fdm scaling (e.g. Layer-1 ``1/σ``) into
+    # the imager's output multiply without a separate cube-sized
+    # divide downstream. ``None`` reverts to the historical single-
+    # mask path. Set via :meth:`set_edge_mask_per_fdm`.
+    edge_mask_per_fdm: Optional[torch.Tensor] = None
+    uv_batch: Optional[torch.Tensor] = None        # [B, T_det, N, N] complex_dtype
+    img_batch_real: Optional[torch.Tensor] = None  # [B, T_det, N, N] cube_dtype
+    _output_index: int = 0
 
     @classmethod
     def build(cls, config: GpuImagerConfig) -> "GpuImager":
@@ -130,6 +143,10 @@ class GpuImager:
             (config.t_det, config.n_fdm, config.n_grid, config.n_grid),
             dtype=config.cube_dtype, device=device,
         )
+        output_alt = torch.empty(
+            (config.t_det, config.n_fdm, config.n_grid, config.n_grid),
+            dtype=config.cube_dtype, device=device,
+        )
         uv = torch.empty(
             (config.t_det, config.n_grid, config.n_grid),
             dtype=config.complex_dtype, device=device,
@@ -146,7 +163,7 @@ class GpuImager:
         )
         return cls(
             config=config, device=device,
-            edge_mask_real=edge_t, output_cube=output,
+            edge_mask_real=edge_t, output_cube=output, output_cube_alt=output_alt,
             uv_slab=uv, img_slab_real=img,
         )
 
@@ -274,25 +291,132 @@ class GpuImager:
                     f"expected ({cfg.n_chgroup},)"
                 )
 
-        for f in range(cfg.n_fdm):
-            fused_dequant_combine_per_fdm(
-                streams_cint8,
-                time_shifts_gpu[f].contiguous(),
-                self.uv_slab,
-                scales=chgroup_scales,
-                offsets_re=chgroup_offsets_re,
-                offsets_im=chgroup_offsets_im,
+        # Process fdm trials in small chunks so cuFFT sees a tiny batch
+        # instead of 34 independent single-slab launches. This is exact
+        # math-equivalent to the per-fdm loop and improves launch/cache
+        # efficiency without changing detector inputs.
+        fft_batch_env = int(os.environ.get("DSART_IMAGER_FFT_BATCH", "12"))
+        fft_batch = min(max(1, fft_batch_env), int(cfg.n_fdm))
+        if (
+            self.uv_batch is None
+            or self.uv_batch.shape != (fft_batch, cfg.t_det, cfg.n_grid, cfg.n_grid)
+            or self.uv_batch.dtype != cfg.complex_dtype
+            or self.uv_batch.device != self.device
+        ):
+            self.uv_batch = torch.empty(
+                (fft_batch, cfg.t_det, cfg.n_grid, cfg.n_grid),
+                dtype=cfg.complex_dtype,
+                device=self.device,
             )
-            img_complex = torch.fft.ifft2(self.uv_slab)
-            img_complex = torch.fft.fftshift(img_complex, dim=(-2, -1))
-            torch.mul(
-                img_complex.real.to(cfg.cube_dtype),
-                self.edge_mask_real,
-                out=self.img_slab_real,
+        if (
+            self.img_batch_real is None
+            or self.img_batch_real.shape != (fft_batch, cfg.t_det, cfg.n_grid, cfg.n_grid)
+            or self.img_batch_real.dtype != cfg.cube_dtype
+            or self.img_batch_real.device != self.device
+        ):
+            self.img_batch_real = torch.empty(
+                (fft_batch, cfg.t_det, cfg.n_grid, cfg.n_grid),
+                dtype=cfg.cube_dtype,
+                device=self.device,
             )
-            self.output_cube[:, f, :, :] = self.img_slab_real
 
-        return self.output_cube
+        for f0 in range(0, cfg.n_fdm, fft_batch):
+            n_batch = min(fft_batch, cfg.n_fdm - f0)
+            for j in range(n_batch):
+                fused_dequant_combine_per_fdm(
+                    streams_cint8,
+                    time_shifts_gpu[f0 + j].contiguous(),
+                    self.uv_batch[j],
+                    scales=chgroup_scales,
+                    offsets_re=chgroup_offsets_re,
+                    offsets_im=chgroup_offsets_im,
+                )
+
+            img_complex = torch.fft.ifft2(self.uv_batch[:n_batch])
+            img_complex = torch.fft.fftshift(img_complex, dim=(-2, -1))
+            if self.edge_mask_per_fdm is not None:
+                # Per-fdm fused edge-mask × (1/σ_layer1_prev). Broadcasts
+                # ``[n_batch, 1, N, N]`` over the T_det axis of
+                # ``img_complex.real``. The output cube is then already
+                # Layer-1-normalised — the CubePipeline skips its
+                # explicit ``cube / σ`` divide.
+                mask_slice = self.edge_mask_per_fdm[f0:f0 + n_batch, None, :, :]
+                torch.mul(
+                    img_complex.real.to(cfg.cube_dtype),
+                    mask_slice,
+                    out=self.img_batch_real[:n_batch],
+                )
+            else:
+                torch.mul(
+                    img_complex.real.to(cfg.cube_dtype),
+                    self.edge_mask_real[None, None, :, :],
+                    out=self.img_batch_real[:n_batch],
+                )
+            out_cube = (
+                self.output_cube
+                if self._output_index == 0
+                else self.output_cube_alt
+            )
+            out_cube[:, f0:f0 + n_batch, :, :] = self.img_batch_real[
+                :n_batch
+            ].permute(1, 0, 2, 3)
+        out_final = (
+            self.output_cube
+            if self._output_index == 0
+            else self.output_cube_alt
+        )
+        self._output_index = 1 - self._output_index
+        return out_final
+
+    # ------------------------------------------------------------------
+    # Per-fdm fused edge mask (Layer-1 fold-in)
+    # ------------------------------------------------------------------
+
+    def set_edge_mask_per_fdm(
+        self,
+        sigma_inv: Optional[torch.Tensor],
+    ) -> None:
+        """Refresh the per-fdm fused edge mask.
+
+        When ``sigma_inv`` is None, drop the per-fdm mask (revert to
+        the constant ``edge_mask_real`` path). When ``sigma_inv`` is
+        a ``[N_fdm] float`` cuda tensor, build/reuse a
+        ``[N_fdm, N_grid, N_grid] cube_dtype`` buffer of
+        ``edge_mask_real[None, :, :] * sigma_inv[:, None, None]``. The
+        caller passes ``1/σ_layer1`` so the imager's output multiply
+        fuses the Layer-1 divide.
+        """
+        if sigma_inv is None:
+            self.edge_mask_per_fdm = None
+            return
+        cfg = self.config
+        if sigma_inv.shape != (cfg.n_fdm,):
+            raise ValueError(
+                f"sigma_inv.shape={tuple(sigma_inv.shape)}, expected "
+                f"({cfg.n_fdm},)"
+            )
+        if (
+            self.edge_mask_per_fdm is None
+            or self.edge_mask_per_fdm.shape
+            != (cfg.n_fdm, cfg.n_grid, cfg.n_grid)
+            or self.edge_mask_per_fdm.dtype != cfg.cube_dtype
+            or self.edge_mask_per_fdm.device != self.device
+        ):
+            self.edge_mask_per_fdm = torch.empty(
+                (cfg.n_fdm, cfg.n_grid, cfg.n_grid),
+                dtype=cfg.cube_dtype,
+                device=self.device,
+            )
+        # ``edge_mask_real`` is [N, N] cube_dtype; broadcast multiply
+        # to [N_fdm, N, N] keeps the cast in cube_dtype.
+        sigma_inv_cube = sigma_inv.to(
+            dtype=cfg.cube_dtype, device=self.device
+        )
+        torch.mul(
+            self.edge_mask_real[None, :, :],
+            sigma_inv_cube[:, None, None],
+            out=self.edge_mask_per_fdm,
+        )
 
 
 # ---------------------------------------------------------------------------

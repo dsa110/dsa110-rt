@@ -41,7 +41,7 @@ routines:
   # exactly between owner and consumer or the ctypes header check
   # rejects at attach time).
   #
-  # Op-point (M7.2 = M7.1 mirror): n_corr=16, n_coarse_dm=5,
+  # Op-point (M7.2 production): n_corr=16, n_coarse_dm=8,
   # bytes_per_cell=2 (cint8 complex), t_buf_samples=4096 (~16 cube
   # cadences of headroom — safe for a momentary compute-half stall).
   #
@@ -61,7 +61,7 @@ routines:
       --port-base 6625 --n-ports 16
       --so-rcvbuf-bytes 268435456
       --shm-name /dsart-rxring-CN
-      --n-corr 16 --n-coarse-dm 5
+      --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
       --status-interval-s 5.0
@@ -87,8 +87,10 @@ routines:
   # ---- search_compute x 2 (one per GPU half) -----------------------
   # Both halves attach the SAME ring (read-only) and process the same
   # cube slots, but each one runs the detector on a disjoint slice of
-  # fine-DM trials (full plan = 64 fdm → half 0 = trials 0..31, half
-  # 1 = trials 32..63; both halves use n_fdm=32 per cube).
+  # fine-DM trials from the shared v2 DM plan. In M7.2-low on n01:
+  #   half 0 owns coarse_dm index 0  -> K=34 fine rows
+  #   half 1 owns coarse_dm index 1  -> K=34 fine rows
+  # (M7.2-high uses owners 6 and 7).
   #
   # M7.2.8 flipped to PRODUCTION GPU op-point (user-clarified
   # 2026-05-18): both halves pinned to cuda:0 / cuda:1,
@@ -101,9 +103,9 @@ routines:
   # GPU pipeline on dada_junkdb data.
   #
   # Production op-point:
-  #   n_grid=256, n_fdm=32, t_det=512, cube_cadence_samples=256
-  #     (= 134.218 ms / cube = 7.45 cubes/s RT)
-  #   t_int_search_us=524.288 (default; pinned in plan §3.5)
+  #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan), t_det=256,
+  #   cube_cadence_samples=128 (= 134.218 ms / cube = 7.45 cubes/s RT)
+  #   t_int_search_us=1048.576 (matches corr t_int_fast at 32x native)
   #
   # The two halves run as independent processes so a crash in one
   # doesn't take down the other; dsart_rt restarts them on the
@@ -118,13 +120,26 @@ routines:
     args: >-
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
-      --n-corr 16 --n-coarse-dm 5
+      --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
-      --n-fdm 32 --t-det 512 --n-grid 256
-      --cube-cadence-samples 256
+      --n-fdm 34 --t-det 256 --n-grid 256
+      --cube-cadence-samples 128
+      --t-int-search-us 1048.576
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
+      --fan-in-min-corrs 15
+      --coarse-dm-owners-half-0 0
+      --coarse-dm-owners-half-1 1
       --gpu-half 0 --search-node-id CN
       --device cuda:0 --image-backend gpu
+      --detector-streaming-tile-size 256
+      --detector-streaming-decoder-n-top 24
+      --detector-boxcar-accum-dtype fp16
+      --detector-layer2-max-samples 100000
+      --detector-k-img unit
+      --detector-k-dm d1
+      --detector-k-time b1,b2,b4,b8,b16,b32,b64
+      --layer1-max-samples 25000
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
@@ -139,13 +154,26 @@ routines:
     args: >-
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
-      --n-corr 16 --n-coarse-dm 5
+      --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
-      --n-fdm 32 --t-det 512 --n-grid 256
-      --cube-cadence-samples 256
+      --n-fdm 34 --t-det 256 --n-grid 256
+      --cube-cadence-samples 128
+      --t-int-search-us 1048.576
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
+      --fan-in-min-corrs 15
+      --coarse-dm-owners-half-0 0
+      --coarse-dm-owners-half-1 1
       --gpu-half 1 --search-node-id CN
       --device cuda:0 --image-backend gpu
+      --detector-streaming-tile-size 256
+      --detector-streaming-decoder-n-top 24
+      --detector-boxcar-accum-dtype fp16
+      --detector-layer2-max-samples 100000
+      --detector-k-img unit
+      --detector-k-dm d1
+      --detector-k-time b1,b2,b4,b8,b16,b32,b64
+      --layer1-max-samples 25000
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO

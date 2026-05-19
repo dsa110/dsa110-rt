@@ -61,10 +61,14 @@ from ..cluster import (
 )
 from ..common.constants import (
     CUBE_CADENCE_SAMPLES_DEFAULT,
+    DETECTOR_IMAGE_KERNELS,
+    DETECTOR_DM_KERNELS,
+    DETECTOR_TIME_KERNELS,
     T_INT_SEARCH_US_DEFAULT,
 )
 from ..common.contracts import Candidate, CubeGeometry
 from ..detector.forward import DeterministicDetector
+from ..detector.kernels import build_kernel_bank
 from ..dump import (
     BrightPulsePredicate,
     BrightPulsePredicateConfig,
@@ -75,7 +79,7 @@ from ..dump import (
 )
 from ..common.contracts import CubeDumpManifest
 from ..noise_norm.layer1 import Layer1State
-from .cube_pipeline import CubePipeline, CubePipelineConfig
+from .cube_pipeline import CubePipeline, CubePipelineConfig, PrefetchedCube
 from .rx_ring import CubeRingSlot, RxRingSource
 
 __all__ = [
@@ -149,11 +153,21 @@ class SearchComputeConfig:
     detector_version: str = "v1.M5"
     detector_streaming: bool = True
     detector_streaming_tile_size: int = 64
+    detector_streaming_decoder_n_top: int = 64
+    detector_image_tokens: tuple[str, ...] = ("unit",)
+    detector_dm_tokens: tuple[str, ...] = ("d1",)
+    detector_time_tokens: tuple[str, ...] = (
+        "b1", "b2", "b4", "b8", "b16", "b32", "b64",
+    )
+    detector_boxcar_accum_dtype: Optional[torch.dtype] = None
+    detector_layer2_max_samples: Optional[int] = 100_000
+    pipeline_overlap: bool = False
     search_node_id: int = 1
     gpu_half: int = 1
     layer1_n_burnin_cubes: int = 5
     layer1_n_sigma: float = 3.0
     layer1_n_iterations: int = 3
+    layer1_max_samples: Optional[int] = 100_000
 
     # --- M6 chunk 5: cube-geometry hyperparameters ---------------------
     cube_cell_l_rad: float = 1.5e-4
@@ -210,6 +224,7 @@ class SearchComputeService:
             n_burnin_cubes=config.layer1_n_burnin_cubes,
             n_sigma=config.layer1_n_sigma,
             n_iterations=config.layer1_n_iterations,
+            max_samples=config.layer1_max_samples,
         )
         self._pipeline = CubePipeline(
             config=config.pipeline,
@@ -236,7 +251,14 @@ class SearchComputeService:
         # Pass ``device=`` to the constructor (NOT ``.to(device)`` after-
         # the-fact) so the internal ``Layer2State._s_k`` is allocated
         # directly on the target device (see M5 chunk 6 lock).
+        bank = build_kernel_bank(
+            image_tokens=config.detector_image_tokens,
+            dm_tokens=config.detector_dm_tokens,
+            time_tokens=config.detector_time_tokens,
+            dtype=config.detector_dtype,
+        )
         return DeterministicDetector(
+            kernel_bank=bank,
             threshold_sigma=config.detector_threshold_sigma,
             detector_version=config.detector_version,
             search_node_id=config.search_node_id,
@@ -245,6 +267,9 @@ class SearchComputeService:
             device=torch.device(config.detector_device),
             streaming=config.detector_streaming,
             streaming_tile_size=config.detector_streaming_tile_size,
+            streaming_decoder_n_top=config.detector_streaming_decoder_n_top,
+            boxcar_accum_dtype=config.detector_boxcar_accum_dtype,
+            layer2_sigma_max_samples=config.detector_layer2_max_samples,
         )
 
     @property
@@ -409,7 +434,10 @@ class SearchComputeService:
         )
 
     async def _process_one_cube(
-        self, slot: CubeRingSlot
+        self,
+        slot: CubeRingSlot,
+        *,
+        prefetched: Optional[PrefetchedCube] = None,
     ) -> List[Candidate]:
         cfg = self._config
 
@@ -421,7 +449,10 @@ class SearchComputeService:
             udp_armed = self._udp_listener.consume_dump_next_cube_flag()
 
         # Step 2 — pipeline (M5).
-        result = self._pipeline.process(slot)
+        if prefetched is not None:
+            result = self._pipeline.process_prefetched(prefetched)
+        else:
+            result = self._pipeline.process(slot)
         self._cubes_processed += 1
         self._candidates_emitted += len(result.candidates)
 
@@ -545,28 +576,75 @@ class SearchComputeService:
         loop_start = time.monotonic()
         last_log = loop_start
         last_cubes = 0
-        async for slot in self._source:
-            if self._stopping.is_set():
-                break
-            await self._process_one_cube(slot)
-            await self._source.release(slot.cube_id)
-            if self._cubes_processed >= next_status:
-                now = time.monotonic()
-                d_cubes = self._cubes_processed - last_cubes
-                dt = max(now - last_log, 1e-9)
-                _LOG.info(
-                    "cube_progress: cubes=%d cands=%d clusters=%d "
-                    "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
-                    self._cubes_processed,
-                    self._candidates_emitted,
-                    self._clusters_emitted,
-                    d_cubes / dt,
-                    dt,
-                    self._cubes_processed / max(now - loop_start, 1e-9),
+        if (
+            self._config.pipeline.image_backend == "gpu"
+            and self._config.pipeline_overlap
+        ):
+            aiter = self._source.__aiter__()
+            try:
+                slot = await aiter.__anext__()
+            except StopAsyncIteration:
+                slot = None
+            pending = (
+                self._pipeline.prefetch_build(slot)
+                if slot is not None
+                else None
+            )
+            while slot is not None and pending is not None:
+                if self._stopping.is_set():
+                    break
+                try:
+                    next_slot = await aiter.__anext__()
+                except StopAsyncIteration:
+                    next_slot = None
+                next_pending = (
+                    self._pipeline.prefetch_build(next_slot)
+                    if next_slot is not None
+                    else None
                 )
-                next_status += status_every
-                last_log = now
-                last_cubes = self._cubes_processed
+                await self._process_one_cube(slot, prefetched=pending)
+                await self._source.release(slot.cube_id)
+                slot, pending = next_slot, next_pending
+                if self._cubes_processed >= next_status:
+                    now = time.monotonic()
+                    d_cubes = self._cubes_processed - last_cubes
+                    dt = max(now - last_log, 1e-9)
+                    _LOG.info(
+                        "cube_progress: cubes=%d cands=%d clusters=%d "
+                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                        self._cubes_processed,
+                        self._candidates_emitted,
+                        self._clusters_emitted,
+                        d_cubes / dt,
+                        dt,
+                        self._cubes_processed / max(now - loop_start, 1e-9),
+                    )
+                    next_status += status_every
+                    last_log = now
+                    last_cubes = self._cubes_processed
+        else:
+            async for slot in self._source:
+                if self._stopping.is_set():
+                    break
+                await self._process_one_cube(slot)
+                await self._source.release(slot.cube_id)
+                if self._cubes_processed >= next_status:
+                    now = time.monotonic()
+                    d_cubes = self._cubes_processed - last_cubes
+                    dt = max(now - last_log, 1e-9)
+                    _LOG.info(
+                        "cube_progress: cubes=%d cands=%d clusters=%d "
+                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                        self._cubes_processed,
+                        self._candidates_emitted,
+                        self._clusters_emitted,
+                        d_cubes / dt,
+                        dt,
+                        self._cubes_processed / max(now - loop_start, 1e-9),
+                    )
+                    next_status += status_every
+                    last_log = now
+                    last_cubes = self._cubes_processed
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +665,7 @@ def _load_yaml(path: Path) -> dict:
 
 
 def _dm_grids_from_npz(
-    dm_plan_path: Path, n_coarse: int, n_fdm: int
+    dm_plan_path: Path, n_coarse: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load DM grids from a DmPlan NPZ. Falls back to a synthetic linear
     grid if the file is unreadable. The NPZ layout (set by the corr-side
@@ -615,16 +693,58 @@ def _dm_grids_from_npz(
             # Default: every fine maps to coarse cell 0 (safe; matches
             # the M4a unit-test convention).
             f2c = np.zeros(len(fine_dm), dtype=np.int32)
-    # Trim to the requested sizes if the on-disk plan is bigger.
+    # Trim coarse to ring dims if on-disk plan is bigger. Fine/f2c are
+    # intentionally left full-size so the caller can apply the explicit
+    # per-half owner selection before trimming.
     coarse_dm = coarse_dm[:n_coarse]
-    fine_dm = fine_dm[:n_fdm]
-    f2c = f2c[:n_fdm]
     if len(f2c) != len(fine_dm):
         raise ValueError(
             f"DM plan {dm_plan_path}: fine_to_coarse length "
             f"{len(f2c)} != fine_dm length {len(fine_dm)}"
         )
     return coarse_dm, fine_dm, f2c
+
+
+def _select_dm_owner_half(
+    *,
+    coarse_dm: np.ndarray,
+    fine_dm: np.ndarray,
+    fine_to_coarse: np.ndarray,
+    owner_coarse_idx: int,
+    expected_n_fdm: int,
+    gpu_half: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Select one coarse-DM owner for this half and remap to local indices.
+
+    M7.2 v2 ownership model: each GPU-half owns exactly one coarse DM index.
+    We therefore:
+      - keep only fine trials whose global fine_to_coarse == owner_coarse_idx
+      - keep coarse_dm[owner_coarse_idx] as a length-1 local coarse table
+      - remap fine_to_coarse to all zeros (local coarse index 0)
+    """
+    if not 0 <= owner_coarse_idx < len(coarse_dm):
+        raise ValueError(
+            f"gpu_half={gpu_half}: owner coarse index {owner_coarse_idx} "
+            f"outside [0, {len(coarse_dm) - 1}]"
+        )
+    sel = np.nonzero(fine_to_coarse == owner_coarse_idx)[0]
+    if sel.size == 0:
+        raise ValueError(
+            f"gpu_half={gpu_half}: no fine DM rows map to coarse index "
+            f"{owner_coarse_idx}"
+        )
+    fine_local = fine_dm[sel].astype(np.float64, copy=False)
+    coarse_local = np.asarray(
+        [coarse_dm[owner_coarse_idx]], dtype=np.float64
+    )
+    f2c_local = np.zeros(fine_local.shape[0], dtype=np.int32)
+    if expected_n_fdm > 0 and fine_local.shape[0] != expected_n_fdm:
+        raise ValueError(
+            f"gpu_half={gpu_half}: owner coarse index {owner_coarse_idx} "
+            f"yields n_fdm={fine_local.shape[0]}, but --n-fdm={expected_n_fdm}. "
+            f"Use matching n_fdm (M7.2 v2 expects K = N_fine/8)."
+        )
+    return coarse_local, fine_local, f2c_local
 
 
 def _synthetic_dm_grids(
@@ -636,6 +756,18 @@ def _synthetic_dm_grids(
     fine_dm = np.linspace(0.0, 100.0, n_fdm, dtype=np.float64)
     f2c = np.zeros(n_fdm, dtype=np.int32)
     return coarse_dm, fine_dm, f2c
+
+
+def _parse_kernel_tokens(csv: str, *, allowed: tuple[str, ...], field: str) -> tuple[str, ...]:
+    toks = tuple(t.strip() for t in str(csv).split(",") if t.strip())
+    if not toks:
+        raise ValueError(f"{field}: empty token list")
+    bad = [t for t in toks if t not in allowed]
+    if bad:
+        raise ValueError(
+            f"{field}: unknown tokens {bad}; allowed={list(allowed)}"
+        )
+    return toks
 
 
 def _build_search_config_from_yaml(
@@ -651,6 +783,15 @@ def _build_search_config_from_yaml(
     enable_cube_dump: bool,
     enable_udp_listener: bool,
     enable_cands_logger: bool,
+    detector_streaming_tile_size: int,
+    detector_streaming_decoder_n_top: int,
+    pipeline_overlap: bool,
+    detector_k_img_csv: str,
+    detector_k_dm_csv: str,
+    detector_k_time_csv: str,
+    detector_boxcar_accum_dtype: str,
+    detector_layer2_max_samples: Optional[int],
+    layer1_max_samples: Optional[int],
     fine_dm_pc_cc_full: Optional[np.ndarray],
 ) -> SearchComputeConfig:
     """Translate ``configs/config_compute_search.yaml`` into
@@ -731,14 +872,62 @@ def _build_search_config_from_yaml(
         else:
             predicate_cfg = BrightPulsePredicateConfig()
 
+    if detector_boxcar_accum_dtype == "default":
+        boxcar_accum_dtype: Optional[torch.dtype] = None
+    elif detector_boxcar_accum_dtype == "fp32":
+        boxcar_accum_dtype = torch.float32
+    elif detector_boxcar_accum_dtype == "fp16":
+        boxcar_accum_dtype = torch.float16
+    elif detector_boxcar_accum_dtype == "bf16":
+        boxcar_accum_dtype = torch.bfloat16
+    else:
+        raise ValueError(
+            "detector_boxcar_accum_dtype must be one of "
+            "default/fp32/fp16/bf16"
+        )
+
+    det_img_tokens = _parse_kernel_tokens(
+        detector_k_img_csv,
+        allowed=DETECTOR_IMAGE_KERNELS,
+        field="--detector-k-img",
+    )
+    det_dm_tokens = _parse_kernel_tokens(
+        detector_k_dm_csv,
+        allowed=DETECTOR_DM_KERNELS,
+        field="--detector-k-dm",
+    )
+    det_time_tokens = _parse_kernel_tokens(
+        detector_k_time_csv,
+        allowed=DETECTOR_TIME_KERNELS,
+        field="--detector-k-time",
+    )
+
     return SearchComputeConfig(
         pipeline=pipe_cfg,
         n_fdm=int(n_fdm),
         detector_threshold_sigma=float(det.get("threshold_sigma", 8.0)),
+        detector_streaming_tile_size=int(detector_streaming_tile_size),
+        detector_streaming_decoder_n_top=int(detector_streaming_decoder_n_top),
+        pipeline_overlap=bool(pipeline_overlap),
+        detector_image_tokens=det_img_tokens,
+        detector_dm_tokens=det_dm_tokens,
+        detector_time_tokens=det_time_tokens,
+        detector_boxcar_accum_dtype=boxcar_accum_dtype,
+        detector_layer2_max_samples=(
+            int(detector_layer2_max_samples)
+            if detector_layer2_max_samples is not None
+            and int(detector_layer2_max_samples) > 0
+            else None
+        ),
         detector_device=device,
         search_node_id=int(search_node_id),
         gpu_half=int(gpu_half),
         layer1_n_burnin_cubes=int(noise.get("layer1_n_burnin_cubes", 5)),
+        layer1_max_samples=(
+            int(layer1_max_samples)
+            if layer1_max_samples is not None
+            else None
+        ),
         fine_dm_pc_cc_full=fine_dm_pc_cc_full,
         clusterer_config=clusterer_cfg,
         cube_dump_writer_config=cube_dump_cfg,
@@ -787,10 +976,10 @@ async def _run_async(args: argparse.Namespace) -> int:
 
     if args.dm_plan_path is not None and args.dm_plan_path.exists():
         coarse_dm, fine_dm, f2c = _dm_grids_from_npz(
-            args.dm_plan_path, args.n_coarse_dm, args.n_fdm
+            args.dm_plan_path, args.n_coarse_dm
         )
         _LOG.info(
-            "DM grids loaded from %s: n_coarse=%d n_fdm=%d",
+            "DM grids loaded from %s: n_coarse=%d n_fdm_full=%d",
             args.dm_plan_path, len(coarse_dm), len(fine_dm),
         )
     else:
@@ -805,10 +994,40 @@ async def _run_async(args: argparse.Namespace) -> int:
             args.dm_plan_path, args.n_coarse_dm, args.n_fdm,
         )
 
+    # Optional M7.2 explicit half-owner mapping: each half owns exactly
+    # one coarse DM index and all K fine rows around it.
+    owner_idx: Optional[int] = None
+    if args.gpu_half == 0 and args.coarse_dm_owners_half_0 is not None:
+        owner_idx = int(args.coarse_dm_owners_half_0)
+    if args.gpu_half == 1 and args.coarse_dm_owners_half_1 is not None:
+        owner_idx = int(args.coarse_dm_owners_half_1)
+    if owner_idx is not None:
+        coarse_dm, fine_dm, f2c = _select_dm_owner_half(
+            coarse_dm=coarse_dm,
+            fine_dm=fine_dm,
+            fine_to_coarse=f2c,
+            owner_coarse_idx=owner_idx,
+            expected_n_fdm=int(args.n_fdm),
+            gpu_half=int(args.gpu_half),
+        )
+        _LOG.info(
+            "M7.2 owner map: gpu_half=%d owns coarse_dm[%d]=%.3f; "
+            "n_fdm_local=%d",
+            args.gpu_half,
+            owner_idx,
+            float(coarse_dm[0]),
+            int(fine_dm.shape[0]),
+        )
+    elif fine_dm.shape[0] > args.n_fdm:
+        # Legacy fallback (no explicit owner map): trim fine rows so
+        # benches can still request small synthetic cubes.
+        fine_dm = fine_dm[: args.n_fdm]
+        f2c = f2c[: args.n_fdm]
+
     source = ProductionRxRingSource(
         shm_name=args.shm_name,
         ring_dims=dims,
-        n_fdm_in_cube=args.n_fdm,
+        n_fdm_in_cube=int(fine_dm.shape[0]),
         t_det=args.t_det,
         coarse_dm_pc_cm3=coarse_dm,
         fine_dm_pc_cm3=fine_dm,
@@ -839,7 +1058,7 @@ async def _run_async(args: argparse.Namespace) -> int:
     cfg = _build_search_config_from_yaml(
         yaml_doc,
         n_grid=args.n_grid,
-        n_fdm=args.n_fdm,
+        n_fdm=int(fine_dm.shape[0]),
         gpu_half=args.gpu_half,
         search_node_id=args.search_node_id,
         image_backend=args.image_backend,
@@ -848,6 +1067,15 @@ async def _run_async(args: argparse.Namespace) -> int:
         enable_cube_dump=args.enable_cube_dump,
         enable_udp_listener=args.enable_udp_listener,
         enable_cands_logger=args.enable_cands_logger,
+        detector_streaming_tile_size=args.detector_streaming_tile_size,
+        detector_streaming_decoder_n_top=args.detector_streaming_decoder_n_top,
+        pipeline_overlap=args.pipeline_overlap,
+        detector_k_img_csv=args.detector_k_img,
+        detector_k_dm_csv=args.detector_k_dm,
+        detector_k_time_csv=args.detector_k_time,
+        detector_boxcar_accum_dtype=args.detector_boxcar_accum_dtype,
+        detector_layer2_max_samples=args.detector_layer2_max_samples,
+        layer1_max_samples=args.layer1_max_samples,
         fine_dm_pc_cc_full=fine_dm,
     )
 
@@ -948,6 +1176,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --- SearchComputeService identity --------------------------------
     p.add_argument("--gpu-half", type=int, default=0, choices=(0, 1),
                    help="which compute half this process serves (0 or 1)")
+    p.add_argument("--coarse-dm-owners-half-0", type=int, default=None,
+                   help=("M7.2 explicit owner map: global coarse-DM index "
+                         "owned by gpu-half=0 on this search node. "
+                         "When set, half-0 selects only fine DM rows that map "
+                         "to this coarse index and remaps them to local "
+                         "coarse index 0."))
+    p.add_argument("--coarse-dm-owners-half-1", type=int, default=None,
+                   help=("M7.2 explicit owner map: global coarse-DM index "
+                         "owned by gpu-half=1 on this search node. "
+                         "When set, half-1 selects only fine DM rows that map "
+                         "to this coarse index and remaps them to local "
+                         "coarse index 0."))
     p.add_argument("--search-node-id", type=int, default=1,
                    help="search node id (1..4 in production)")
     p.add_argument("--device", default="cpu",
@@ -958,6 +1198,40 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="CubePipeline image backend (cpu / gpu). Default: cpu "
                         "for M7.2 bring-up; flip to gpu once a real GPU is "
                         "available on the search nodes.")
+    p.add_argument("--detector-streaming-tile-size", type=int, default=256,
+                   help="Streaming detector W-tile size (default 256 for "
+                        "commissioning time-only bank on 2080 Ti).")
+    p.add_argument("--detector-streaming-decoder-n-top", type=int, default=64,
+                   help="Per-kernel top-k budget used by the streaming "
+                        "decoder (default 64).")
+    p.add_argument("--pipeline-overlap", action="store_true",
+                   help="Enable one-cube lookahead overlap: prebuild cube "
+                        "N+1 while processing cube N (GPU backend only).")
+    p.add_argument("--detector-k-img", type=str, default="unit",
+                   help="Comma-separated detector image kernels "
+                        f"(subset of {list(DETECTOR_IMAGE_KERNELS)}). "
+                        "Commissioning default: unit.")
+    p.add_argument("--detector-k-dm", type=str, default="d1",
+                   help="Comma-separated detector DM kernels "
+                        f"(subset of {list(DETECTOR_DM_KERNELS)}). "
+                        "Commissioning default: d1.")
+    p.add_argument("--detector-k-time", type=str,
+                   default="b1,b2,b4,b8,b16,b32,b64",
+                   help="Comma-separated detector time kernels "
+                        f"(subset of {list(DETECTOR_TIME_KERNELS)}). "
+                        "Commissioning default excludes b128.")
+    p.add_argument("--detector-boxcar-accum-dtype", type=str,
+                   default="fp16", choices=("default", "fp32", "fp16", "bf16"),
+                   help="Cumsum accumulation dtype for streaming detector "
+                        "amortised boxcar path. Commissioning default: fp16.")
+    p.add_argument("--detector-layer2-max-samples", type=int, default=100000,
+                   help="Per-kernel sample cap for Layer-2 interior sigma "
+                        "clipping. Set <=0 to disable subsampling. "
+                        "Commissioning default: 100000.")
+    p.add_argument("--layer1-max-samples", type=int, default=100_000,
+                   help="Per-fdm sample cap for Layer-1 sigma-clipped std. "
+                        "Commissioning default 100k (vs 1M bench legacy) for "
+                        "lower latency with still-sub-percent sigma error.")
 
     # --- DM plan source -----------------------------------------------
     p.add_argument("--dm-plan-path", type=Path, default=None,

@@ -50,10 +50,11 @@ agree.
 
 from __future__ import annotations
 
+import os
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -74,6 +75,8 @@ __all__ = [
     "CubePipeline",
     "CubePipelineConfig",
     "CubePipelineResult",
+    "PrefetchedCube",
+    "PrefetchedH2dCube",
 ]
 
 
@@ -216,6 +219,46 @@ class CubePipelineResult:
     stage_timings_ns: Dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class PrefetchedCube:
+    """One cube pre-built on the optional prefetch stream."""
+
+    slot: CubeRingSlot
+    cube: torch.Tensor
+    validity_mask: torch.Tensor
+    build_start_ns: int
+    build_ready_event: Optional[torch.cuda.Event] = None
+
+
+@dataclass(slots=True)
+class _H2dStaged:
+    """Staged H2D tensors for the narrow-overlap path.
+
+    Holds the GPU tensors and an optional CUDA event recorded on the
+    H2D stream so the main stream can wait on the copy before running
+    the imager. ``cint8_buf_idx`` records which ping-pong cint8 buffer
+    the tensor lives in (so the prefetch for the next cube alternates
+    targets and doesn't overwrite the in-flight imager input).
+    """
+
+    slot: CubeRingSlot
+    cint8_t: torch.Tensor
+    shifts_t: torch.Tensor
+    chgroup_scale_t: Optional[torch.Tensor]
+    chgroup_offset_re_t: Optional[torch.Tensor]
+    chgroup_offset_im_t: Optional[torch.Tensor]
+    cint8_buf_idx: int
+    build_start_ns: int
+    h2d_event: Optional[torch.cuda.Event] = None
+
+
+@dataclass(slots=True)
+class PrefetchedH2dCube:
+    """Prefetched H2D-only handle (chunk-8d narrow overlap)."""
+
+    staged: _H2dStaged
+
+
 # ---------------------------------------------------------------------------
 # Cube pipeline
 # ---------------------------------------------------------------------------
@@ -265,6 +308,48 @@ class CubePipeline:
         # Re-usable host pinned cint8 staging buffer for the GPU
         # backend; allocated on first cube.
         self._cint8_host_buf: Optional[np.ndarray] = None
+        # Re-usable CUDA staging buffers to avoid per-cube allocations
+        # on the hot path.
+        self._cint8_gpu_buf: Optional[torch.Tensor] = None
+        # Ping-pong cint8 GPU buffers for the narrow-overlap H2D path
+        # (cube N's H2D writes one; cube N+1's H2D writes the other so
+        # the in-flight imager input is not clobbered). Built lazily
+        # on first H2D prefetch.
+        self._cint8_gpu_buf_pp: List[Optional[torch.Tensor]] = [None, None]
+        self._cint8_pp_index: int = 0
+        self._shifts_gpu_buf: Optional[torch.Tensor] = None
+        self._validity_gpu_buf: Optional[torch.Tensor] = None
+        self._validity_all_true_gpu: Optional[torch.Tensor] = None
+        self._last_shifts_host_id: Optional[int] = None
+        self._prefetch_stream: Optional[torch.cuda.Stream] = None
+        # Separate stream dedicated to the cint8 H2D copy in the narrow
+        # overlap path. The H2D engine is independent from the GPU's
+        # SMs so this can run fully concurrent with the main stream's
+        # imager / detector kernels.
+        self._h2d_stream: Optional[torch.cuda.Stream] = None
+        if self._device.type == "cuda":
+            self._prefetch_stream = torch.cuda.Stream(device=self._device)
+            self._h2d_stream = torch.cuda.Stream(device=self._device)
+        # Single-pass Layer-1 fold-in (chunk-8d): the GPU imager can
+        # multiply its output by ``edge_mask * (1/σ_layer1_prev[f])``
+        # so the cube emerges already-Layer-1-normalised; the per-cube
+        # ``cube / σ`` divide downstream is then a no-op. Activated by
+        # default on the production GPU backend with a 1-cube lag
+        # (same semantics as the single-pass Layer-2 σ_k EMA). Toggle
+        # off via ``DSART_DISABLE_FUSED_LAYER1=1`` for A/B benches.
+        self._fuse_layer1_into_imager = (
+            self._device.type == "cuda"
+            and config.image_backend == "gpu"
+            and not bool(
+                int(os.environ.get("DSART_DISABLE_FUSED_LAYER1", "0"))
+            )
+        )
+        # Per-fdm σ_layer1 from the previous cube, used to seed the
+        # imager's fused mask each cube. ``None`` means "no prev cube
+        # yet" → imager runs with the constant ``edge_mask_real``
+        # (effectively σ_prev = 1 for cube 0, which is also during
+        # Layer-1 burn-in so the warmup flag is set anyway).
+        self._sigma_layer1_prev: Optional[torch.Tensor] = None
 
     @property
     def edge_mask(self) -> torch.Tensor:
@@ -330,24 +415,47 @@ class CubePipeline:
     def _build_cube_gpu(
         self, slot: CubeRingSlot
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Chunk-8 GPU path: stack + quantise the slot's cf64 chgroup
-        streams to cint8, push to GPU, and run
-        ``GpuImager.process_cube`` (fused dequant+combine+ifft2+mask).
+        """Chunk-8 GPU path: stage H2D for cint8/shifts/calibration,
+        run ``GpuImager.process_cube`` (fused dequant+combine+ifft2+
+        mask), and set up the validity mask. Returns the cube as a
+        contiguous CUDA tensor in ``self.config.cube_dtype`` plus the
+        validity mask on the same device.
 
-        Returns the cube as a contiguous CUDA tensor in
-        ``self.config.cube_dtype`` plus the validity mask on the same
-        device. The GpuImager owns ``output_cube`` in-place; we clone
-        only when the caller's pipeline holds onto multiple cubes
-        simultaneously (the chunk-6b-α default is single-cube,
-        synchronous, so the borrow is safe; if a future caller starts
-        pipelining cubes via cuda streams it must clone before the next
-        ``process_cube`` overwrites ``output_cube``).
-
-        Production note (chunk-8b): the M3 → M5 RX-ring will deliver
-        cint8 streams pre-staged on GPU; the host-side
-        ``stack + quantise`` step here is bench-only / pre-RX-ring
-        scaffolding.
+        Production note (chunk-8b): the M3 → M5 RX-ring delivers
+        cint8 streams pre-staged on host; the host-side
+        ``stack + quantise`` fallback below is bench-only / pre-
+        RX-ring scaffolding (used when ``per_chgroup_streams`` arrives
+        without ``per_chgroup_cint8_stack`` populated).
         """
+        staged = self._stage_h2d(slot, cint8_dest_idx=0, use_pp=False)
+        cube = self._run_imager_from_staged(staged)
+        validity_mask = self._build_validity_mask(slot)
+        return cube, validity_mask
+
+    def _stage_h2d(
+        self,
+        slot: CubeRingSlot,
+        *,
+        cint8_dest_idx: int = 0,
+        use_pp: bool = False,
+    ) -> _H2dStaged:
+        """Pin host buffers and copy cint8 / shifts / calibration to
+        the GPU. Returns the staged tensors but does NOT run the imager
+        or any validity-mask setup.
+
+        Args:
+            slot: cube ring slot to stage.
+            cint8_dest_idx: which ping-pong cint8 GPU buffer to target
+                (0 or 1). Ignored when ``use_pp`` is False — the
+                synchronous ``_build_cube_gpu`` path uses the single
+                ``_cint8_gpu_buf`` slot to preserve historical
+                behaviour.
+            use_pp: when True, write into the ping-pong buffer at
+                ``_cint8_gpu_buf_pp[cint8_dest_idx]``; the narrow-
+                overlap path uses this so prefetch H2D for cube N+1
+                doesn't clobber the imager's input for cube N.
+        """
+        from .host_pin import maybe_register_host_buffer
         from ..image.imager_gpu import GpuImager, GpuImagerConfig
         from ..transport.quantize import quantise_per_chgroup_into_cint8
 
@@ -447,6 +555,46 @@ class CubePipeline:
         chgroup_scale_t: Optional[torch.Tensor] = None
         chgroup_offset_re_t: Optional[torch.Tensor] = None
         chgroup_offset_im_t: Optional[torch.Tensor] = None
+        enable_gpu_buf_reuse = bool(
+            int(os.environ.get("DSART_ENABLE_GPU_BUF_REUSE", "0"))
+        )
+
+        def _resolve_cint8_buf(
+            host_shape: Tuple[int, ...],
+        ) -> torch.Tensor:
+            """Return the GPU buffer to copy this cube's cint8 into.
+
+            Picks the ping-pong slot when ``use_pp`` is True; otherwise
+            falls back to the legacy single ``_cint8_gpu_buf`` field.
+            """
+            if use_pp:
+                buf = self._cint8_gpu_buf_pp[cint8_dest_idx]
+                if (
+                    buf is None
+                    or buf.shape != host_shape
+                    or buf.device != self._device
+                ):
+                    buf = torch.empty(
+                        host_shape, dtype=torch.int8, device=self._device,
+                    )
+                    self._cint8_gpu_buf_pp[cint8_dest_idx] = buf
+                return buf
+            if (
+                self._cint8_gpu_buf is None
+                or self._cint8_gpu_buf.shape != host_shape
+                or self._cint8_gpu_buf.device != self._device
+            ):
+                self._cint8_gpu_buf = torch.empty(
+                    host_shape, dtype=torch.int8, device=self._device,
+                )
+            return self._cint8_gpu_buf
+
+        # Always non_blocking when use_pp (the caller runs on the H2D
+        # stream and synchronises via a CUDA event); also when the
+        # legacy gpu_buf_reuse path is on. Off otherwise to preserve
+        # historical behaviour.
+        non_blocking = bool(use_pp or enable_gpu_buf_reuse)
+
         if slot.per_chgroup_cint8_stack is not None:
             cint8_src = slot.per_chgroup_cint8_stack
             if cint8_src.shape != (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid):
@@ -455,21 +603,27 @@ class CubePipeline:
                     f"expected ({n_chg}, {t_stream}, 2, {cfg.n_grid}, "
                     f"{cfg.n_grid})"
                 )
-            cint8_t = torch.from_numpy(
-                np.ascontiguousarray(cint8_src)
-            ).to(self._device)
+            cint8_host = np.ascontiguousarray(cint8_src)
+            maybe_register_host_buffer(cint8_host)
+            cint8_host_t = torch.from_numpy(cint8_host)
+            if use_pp or enable_gpu_buf_reuse:
+                gpu_buf = _resolve_cint8_buf(tuple(cint8_host_t.shape))
+                gpu_buf.copy_(cint8_host_t, non_blocking=non_blocking)
+                cint8_t = gpu_buf
+            else:
+                cint8_t = cint8_host_t.to(self._device)
             if slot.per_chgroup_scale is not None:
                 chgroup_scale_t = torch.from_numpy(
                     np.ascontiguousarray(slot.per_chgroup_scale, dtype=np.float32)
-                ).to(self._device)
+                ).to(self._device, non_blocking=non_blocking)
             if slot.per_chgroup_offset_re is not None:
                 chgroup_offset_re_t = torch.from_numpy(
                     np.ascontiguousarray(slot.per_chgroup_offset_re, dtype=np.float32)
-                ).to(self._device)
+                ).to(self._device, non_blocking=non_blocking)
             if slot.per_chgroup_offset_im is not None:
                 chgroup_offset_im_t = torch.from_numpy(
                     np.ascontiguousarray(slot.per_chgroup_offset_im, dtype=np.float32)
-                ).to(self._device)
+                ).to(self._device, non_blocking=non_blocking)
         else:
             quantise_scale = quantise_per_chgroup_into_cint8(
                 slot.per_chgroup_streams,
@@ -477,41 +631,103 @@ class CubePipeline:
                 target_max=cfg.quantise_target_max,
                 zero_fill_missing=True,
             )
-            # Push to GPU. ``self._cint8_host_buf`` is mutated in-place
-            # next cube; the H2D copy must finalise before we re-use it.
-            cint8_t = torch.from_numpy(self._cint8_host_buf).to(self._device)
-            # Bake the inverse of the host-quantise scale into the
-            # imager dequant so the output is in physical units. The
-            # bench host-quantiser uses a single global scale across
-            # all chgroups (per-chgroup would distort cross-chgroup
-            # magnitude balance — see transport/quantize.py docstring),
-            # so all 16 entries here share the same value. Production
-            # (path 1) ships per-chgroup metadata directly.
+            maybe_register_host_buffer(self._cint8_host_buf)
+            cint8_host_t = torch.from_numpy(self._cint8_host_buf)
+            if use_pp or enable_gpu_buf_reuse:
+                gpu_buf = _resolve_cint8_buf(tuple(cint8_host_t.shape))
+                gpu_buf.copy_(cint8_host_t, non_blocking=non_blocking)
+                cint8_t = gpu_buf
+            else:
+                cint8_t = cint8_host_t.to(self._device)
             if cfg.bake_quantise_scale and quantise_scale > 0.0:
                 inv_scale = 1.0 / float(quantise_scale)
                 chgroup_scale_t = torch.full(
                     (n_chg,), inv_scale,
                     dtype=torch.float32, device=self._device,
                 )
-        shifts_t = torch.from_numpy(
-            np.ascontiguousarray(slot.time_shift_table.shifts.astype(np.int32))
-        ).to(self._device)
+        shifts_host_np = np.ascontiguousarray(slot.time_shift_table.shifts.astype(np.int32))
+        shifts_host_id = int(shifts_host_np.__array_interface__["data"][0])
+        if enable_gpu_buf_reuse or use_pp:
+            if (
+                self._shifts_gpu_buf is None
+                or self._shifts_gpu_buf.shape != shifts_host_np.shape
+                or self._shifts_gpu_buf.device != self._device
+            ):
+                self._shifts_gpu_buf = torch.empty(
+                    shifts_host_np.shape, dtype=torch.int32, device=self._device
+                )
+                self._last_shifts_host_id = None
+            if self._last_shifts_host_id != shifts_host_id:
+                shifts_host_t = torch.from_numpy(shifts_host_np)
+                self._shifts_gpu_buf.copy_(
+                    shifts_host_t, non_blocking=non_blocking,
+                )
+                self._last_shifts_host_id = shifts_host_id
+            shifts_t = self._shifts_gpu_buf
+        else:
+            shifts_t = torch.from_numpy(shifts_host_np).to(self._device)
 
-        cube = self._gpu_imager.process_cube(  # type: ignore[union-attr]
-            streams_cint8=cint8_t,
-            time_shifts_gpu=shifts_t,
-            chgroup_scales=chgroup_scale_t,
-            chgroup_offsets_re=chgroup_offset_re_t,
-            chgroup_offsets_im=chgroup_offset_im_t,
+        return _H2dStaged(
+            slot=slot,
+            cint8_t=cint8_t,
+            shifts_t=shifts_t,
+            chgroup_scale_t=chgroup_scale_t,
+            chgroup_offset_re_t=chgroup_offset_re_t,
+            chgroup_offset_im_t=chgroup_offset_im_t,
+            cint8_buf_idx=cint8_dest_idx,
+            build_start_ns=0,  # caller fills in
         )
-        # GpuImager owns output_cube in-place; clone so the caller can
-        # hold it across the next cube. Cheap on cuda; ~3 ms at
-        # production geometry vs the 100 ms imager.
-        cube = cube.clone()
-        validity_mask = torch.from_numpy(
-            np.ascontiguousarray(slot.validity_mask)
-        ).to(device=self._device, dtype=torch.bool)
-        return cube, validity_mask
+
+    def _run_imager_from_staged(self, staged: _H2dStaged) -> torch.Tensor:
+        """Run the GPU imager on already-staged H2D tensors.
+
+        Always runs on ``torch.cuda.current_stream()``. The caller is
+        responsible for waiting on any H2D event before invoking this.
+        """
+        if self._gpu_imager is None:
+            raise RuntimeError(
+                "_run_imager_from_staged called before GpuImager was built"
+            )
+        return self._gpu_imager.process_cube(  # type: ignore[union-attr]
+            streams_cint8=staged.cint8_t,
+            time_shifts_gpu=staged.shifts_t,
+            chgroup_scales=staged.chgroup_scale_t,
+            chgroup_offsets_re=staged.chgroup_offset_re_t,
+            chgroup_offsets_im=staged.chgroup_offset_im_t,
+        )
+
+    def _build_validity_mask(self, slot: CubeRingSlot) -> torch.Tensor:
+        """Materialise the [T_det, N_fdm] bool validity mask on the
+        GPU. Uses the cached all-true tensor when the slot reports no
+        invalid (T, F) cells, otherwise performs a small H2D.
+        """
+        enable_gpu_buf_reuse = bool(
+            int(os.environ.get("DSART_ENABLE_GPU_BUF_REUSE", "0"))
+        )
+        validity_np = np.ascontiguousarray(slot.validity_mask)
+        if bool(validity_np.all()):
+            if (
+                self._validity_all_true_gpu is None
+                or self._validity_all_true_gpu.shape != validity_np.shape
+                or self._validity_all_true_gpu.device != self._device
+            ):
+                self._validity_all_true_gpu = torch.ones(
+                    validity_np.shape, dtype=torch.bool, device=self._device
+                )
+            return self._validity_all_true_gpu
+        validity_host_t = torch.from_numpy(validity_np)
+        if enable_gpu_buf_reuse:
+            if (
+                self._validity_gpu_buf is None
+                or self._validity_gpu_buf.shape != validity_host_t.shape
+                or self._validity_gpu_buf.device != self._device
+            ):
+                self._validity_gpu_buf = torch.empty(
+                    validity_host_t.shape, dtype=torch.bool, device=self._device
+                )
+            self._validity_gpu_buf.copy_(validity_host_t, non_blocking=False)
+            return self._validity_gpu_buf
+        return validity_host_t.to(device=self._device, dtype=torch.bool)
 
     def _layer1_normalise(
         self,
@@ -523,6 +739,15 @@ class CubePipeline:
         running burn-in across cubes); falls back to per-cube
         σ-clipped scalar if ``layer1_state is None`` (test/bench path
         that wants Layer-1 to be a no-op).
+
+        Single-pass Layer-1 fused-imager mode (chunk-8d, active when
+        ``self._fuse_layer1_into_imager`` is True): the imager has
+        already multiplied the cube by ``1/σ_layer1_prev[f]``, so the
+        incoming ``cube`` is in pre-divided units. Layer-1 σ is
+        estimated on the pre-divided cube and multiplied by
+        ``σ_layer1_prev`` to recover absolute units before feeding
+        ``Layer1State``. The σ to use for the *next* cube is then
+        pushed to the imager's per-fdm fused mask.
         """
         if self.layer1_state is None:
             # Compute σ but do NOT broadcast-divide — the caller is in
@@ -533,12 +758,215 @@ class CubePipeline:
                 (n_fdm,), dtype=torch.float32, device=cube.device
             )
             return cube, sigma
-        sigma = self.layer1_state.update_and_query(cube=cube.to(torch.float32))
+        if (
+            self._fuse_layer1_into_imager
+            and self.config.image_backend == "gpu"
+        ):
+            return self._layer1_normalise_fused(cube)
+        sigma = self.layer1_state.update_and_query(cube=cube)
         if sigma.device != cube.device:
             sigma = sigma.to(cube.device)
         # Broadcast-divide. cube is [T_det, N_fdm, H, W]; sigma is [N_fdm].
         cube_normalised = cube / sigma[None, :, None, None].to(cube.dtype)
         return cube_normalised, sigma
+
+    def _layer1_normalise_fused(
+        self,
+        cube: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Layer-1 estimation with the divide fused into the imager.
+
+        On entry, ``cube`` has already been multiplied by
+        ``1/σ_layer1_prev[f]`` inside the imager (or is in raw units
+        on the very first cube, when ``self._sigma_layer1_prev`` is
+        None). We:
+
+          1. Estimate σ on the cube as-presented (``σ_observed``).
+          2. Recover absolute-unit σ_this = σ_observed * σ_prev so
+             the Layer1State burn-in/median tracks the same statistic
+             it always has.
+          3. Push the resulting per-fdm σ_for_use into the imager's
+             fused mask cache so the NEXT cube emerges pre-divided
+             by σ_for_use.
+
+        The detector receives ``cube`` unchanged (already divided by
+        σ_prev). With the single-pass Layer-2 EMA, the 1-cube lag in
+        σ_layer1 composes cleanly with the existing 1-cube lag in
+        σ_k — both apply during EMA burn-in and become bit-identical
+        steady state after the burn-in completes.
+        """
+        sigma_observed = self.layer1_state._layer1_sigma_cached(cube)
+        if self._sigma_layer1_prev is None:
+            sigma_this = sigma_observed
+        else:
+            prev = self._sigma_layer1_prev.to(
+                dtype=sigma_observed.dtype, device=sigma_observed.device
+            )
+            sigma_this = sigma_observed * prev
+        sigma_for_use = self.layer1_state.update_and_query(
+            per_fdm_sigma=sigma_this
+        )
+        if sigma_for_use.device != cube.device:
+            sigma_for_use = sigma_for_use.to(cube.device)
+        # Refresh imager's fused mask for the NEXT cube. ``set_edge_
+        # mask_per_fdm`` consumes ``1/σ`` directly.
+        sigma_inv = torch.reciprocal(
+            sigma_for_use.clamp(min=torch.finfo(torch.float32).tiny)
+        )
+        if self._gpu_imager is not None:
+            self._gpu_imager.set_edge_mask_per_fdm(sigma_inv)
+        self._sigma_layer1_prev = sigma_for_use
+        return cube, sigma_for_use
+
+    def prefetch_h2d(self, slot: CubeRingSlot) -> PrefetchedH2dCube:
+        """Stage the cube's H2D copies on the dedicated H2D stream.
+
+        Chunk-8d narrow overlap: only the cint8 / shifts / calibration
+        host→device copy runs concurrently with the previous cube's
+        imager + detector work. The imager runs on the main stream
+        inside :meth:`process_h2d_prefetched` (after waiting on the
+        H2D event). This avoids the SM contention that regressed the
+        prior full-prefetch overlap path (the H2D engine is
+        independent from the SMs).
+
+        Uses ping-pong cint8 GPU buffers so cube N+1's H2D doesn't
+        clobber cube N's in-flight imager input.
+        """
+        t0 = time.perf_counter_ns()
+        # The first build (imager not yet built) cannot stage H2D on a
+        # background stream because the imager build path inspects /
+        # allocates the output cube on the main stream. Run inline.
+        if self._h2d_stream is None or self._gpu_imager is None:
+            staged = self._stage_h2d(slot, cint8_dest_idx=0, use_pp=False)
+            staged.build_start_ns = t0
+            return PrefetchedH2dCube(staged=staged)
+        # Alternate ping-pong buffer index per call.
+        idx = self._cint8_pp_index
+        self._cint8_pp_index = 1 - self._cint8_pp_index
+        with torch.cuda.stream(self._h2d_stream):
+            staged = self._stage_h2d(
+                slot, cint8_dest_idx=idx, use_pp=True,
+            )
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(self._h2d_stream)
+        staged.build_start_ns = t0
+        staged.h2d_event = event
+        return PrefetchedH2dCube(staged=staged)
+
+    def process_h2d_prefetched(
+        self,
+        prefetched: PrefetchedH2dCube,
+    ) -> CubePipelineResult:
+        """Run imager + Layer-1 + detector on a cube whose H2D was
+        prefetched via :meth:`prefetch_h2d`.
+
+        Main stream waits on the H2D event (if any), then runs the
+        imager. From the caller's perspective ``build_cube`` is the
+        sum of (a) the asynchronous H2D wait + (b) the imager
+        compute, plus any contention from the next cube's prefetch.
+        Layer-1 and detector behave as in :meth:`process`.
+        """
+        staged = prefetched.staged
+        slot = staged.slot
+        if staged.h2d_event is not None:
+            torch.cuda.current_stream(self._device).wait_event(
+                staged.h2d_event
+            )
+        # Imager + validity mask are computed on the main stream so
+        # they overlap with the NEXT cube's H2D prefetch (issued by
+        # the caller before process_h2d_prefetched is invoked).
+        cube = self._run_imager_from_staged(staged)
+        validity_mask = self._build_validity_mask(slot)
+        t1 = time.perf_counter_ns()
+        cube_norm, sigma_layer1 = self._layer1_normalise(cube)
+        t2 = time.perf_counter_ns()
+        with torch.no_grad():
+            cands = self.detector.forward(
+                cube_norm,
+                validity_mask,
+                sigma_layer1,
+                event_specnum=int(slot.specnum_start),
+            )
+        t3 = time.perf_counter_ns()
+        timings = {
+            "build_cube": t1 - staged.build_start_ns,
+            "layer1_norm": t2 - t1,
+            "detector_forward": t3 - t2,
+            "total": t3 - staged.build_start_ns,
+        }
+        return CubePipelineResult(
+            cube_id=slot.cube_id,
+            specnum_start=slot.specnum_start,
+            cube=cube_norm,
+            sigma_layer1=sigma_layer1,
+            validity_mask=validity_mask,
+            candidates=cands,
+            stage_timings_ns=timings,
+        )
+
+    def prefetch_build(self, slot: CubeRingSlot) -> PrefetchedCube:
+        """Build one cube on the prefetch stream when available.
+
+        The returned tensors remain valid until the next build reuses
+        the internal GpuImager output buffer, so callers should consume
+        the prefetched cube before launching another build on the same
+        pipeline instance.
+        """
+        t0 = time.perf_counter_ns()
+        if self._prefetch_stream is None:
+            cube, validity_mask = self._build_cube(slot)
+            return PrefetchedCube(
+                slot=slot,
+                cube=cube,
+                validity_mask=validity_mask,
+                build_start_ns=t0,
+                build_ready_event=None,
+            )
+        with torch.cuda.stream(self._prefetch_stream):
+            cube, validity_mask = self._build_cube(slot)
+            ready = torch.cuda.Event(enable_timing=False)
+            ready.record(self._prefetch_stream)
+        return PrefetchedCube(
+            slot=slot,
+            cube=cube,
+            validity_mask=validity_mask,
+            build_start_ns=t0,
+            build_ready_event=ready,
+        )
+
+    def process_prefetched(self, prefetched: PrefetchedCube) -> CubePipelineResult:
+        """Run Layer-1 + detector on a prefetched cube."""
+        slot = prefetched.slot
+        if prefetched.build_ready_event is not None:
+            torch.cuda.current_stream(self._device).wait_event(
+                prefetched.build_ready_event
+            )
+        t1 = time.perf_counter_ns()
+        cube_norm, sigma_layer1 = self._layer1_normalise(prefetched.cube)
+        t2 = time.perf_counter_ns()
+        with torch.no_grad():
+            cands = self.detector.forward(
+                cube_norm,
+                prefetched.validity_mask,
+                sigma_layer1,
+                event_specnum=int(slot.specnum_start),
+            )
+        t3 = time.perf_counter_ns()
+        timings = {
+            "build_cube": t1 - prefetched.build_start_ns,
+            "layer1_norm": t2 - t1,
+            "detector_forward": t3 - t2,
+            "total": t3 - prefetched.build_start_ns,
+        }
+        return CubePipelineResult(
+            cube_id=slot.cube_id,
+            specnum_start=slot.specnum_start,
+            cube=cube_norm,
+            sigma_layer1=sigma_layer1,
+            validity_mask=prefetched.validity_mask,
+            candidates=cands,
+            stage_timings_ns=timings,
+        )
 
     def process(self, slot: CubeRingSlot) -> CubePipelineResult:
         """Run the full per-cube pipeline. Synchronous (the I/O wait

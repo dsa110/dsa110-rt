@@ -42,6 +42,7 @@ chunk-2 decoder.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
@@ -55,7 +56,12 @@ from ..common.constants import (
 )
 from ..common.contracts import Candidate, CandidateFlags
 from ..noise_norm.layer2 import Layer2State
-from .decoder import decode_local_max, decode_topk_lowmem, filter_to_canonical
+from .decoder import (
+    decode_local_max,
+    decode_topk_argmax_lowmem,
+    decode_topk_lowmem,
+    filter_to_canonical,
+)
 from .kernels import (
     DEFAULT_DETECTOR_DTYPE,
     Kernel,
@@ -67,6 +73,7 @@ from .merger import (
     DEFAULT_MERGE_RADIUS_T,
     merge_across_kernels,
 )
+from .triton_boxcar import boxcar_from_padded_cumsum_triton
 
 __all__ = [
     "Detector",
@@ -331,6 +338,7 @@ def boxcar_from_padded_cumsum(
     width: int,
     max_width: int,
     n_out: int,
+    t_base: int = 0,
     out_dtype: Optional[torch.dtype] = None,
     w_tile_size: Optional[int] = None,
 ) -> torch.Tensor:
@@ -349,6 +357,9 @@ def boxcar_from_padded_cumsum(
         max_width: ``max_width`` used to build ``cs``.
         n_out: Output length along ``axis`` (typically the original
             input's axis-``axis`` length, e.g. ``T_det``).
+        t_base: Start index in the original unpadded axis for the
+            returned samples. ``0`` means emit from the first sample;
+            positive values allow interior-only scoring windows.
         out_dtype: Optional cast for the returned tensor; ``None``
             keeps ``cs.dtype``.
         w_tile_size: When set and ``axis != cs.ndim - 1`` and ``cs.ndim
@@ -367,9 +378,32 @@ def boxcar_from_padded_cumsum(
         raise ValueError(
             f"width={width} not in [1, max_width={max_width}]"
         )
+    if t_base < 0:
+        raise ValueError(f"t_base must be >= 0; got {t_base}")
+
+    # CUDA fast path (axis=0): fused subtract(+cast) Triton kernel.
+    # Fallback to torch path on unsupported dtypes/layouts/devices.
+    triton_out = boxcar_from_padded_cumsum_triton(
+        cs,
+        axis=axis,
+        width=width,
+        max_width=max_width,
+        n_out=n_out,
+        t_base=t_base,
+        out_dtype=out_dtype,
+    )
+    if triton_out is not None:
+        return triton_out
+
     pad_left_full = max_width // 2
     pad_left_w = width // 2
     offset = pad_left_full - pad_left_w
+    start = t_base + offset
+    max_hi = start + width + n_out
+    if max_hi > int(cs.shape[axis]):
+        raise ValueError(
+            "Requested (t_base, n_out, width) window exceeds padded cumsum bounds"
+        )
 
     untiled = (
         w_tile_size is None
@@ -378,10 +412,10 @@ def boxcar_from_padded_cumsum(
     )
     if untiled:
         if width == 1:
-            out = cs.narrow(axis, offset + 1, n_out) - cs.narrow(axis, offset, n_out)
+            out = cs.narrow(axis, start + 1, n_out) - cs.narrow(axis, start, n_out)
         else:
-            high = cs.narrow(axis, offset + width, n_out)
-            low = cs.narrow(axis, offset, n_out)
+            high = cs.narrow(axis, start + width, n_out)
+            low = cs.narrow(axis, start, n_out)
             out = high - low
         if out_dtype is not None and out.dtype != out_dtype:
             out = out.to(out_dtype)
@@ -400,12 +434,12 @@ def boxcar_from_padded_cumsum(
         cs_tile = cs.narrow(last_dim, w0, w1 - w0)
         if width == 1:
             tile = (
-                cs_tile.narrow(axis, offset + 1, n_out)
-                - cs_tile.narrow(axis, offset, n_out)
+                cs_tile.narrow(axis, start + 1, n_out)
+                - cs_tile.narrow(axis, start, n_out)
             )
         else:
-            high = cs_tile.narrow(axis, offset + width, n_out)
-            low = cs_tile.narrow(axis, offset, n_out)
+            high = cs_tile.narrow(axis, start + width, n_out)
+            low = cs_tile.narrow(axis, start, n_out)
             tile = high - low
         if tile.dtype != eff_dtype:
             tile = tile.to(eff_dtype)
@@ -520,6 +554,7 @@ class DeterministicDetector(torch.nn.Module):
         layer2_sigma_max_samples: Optional[int] = 1_000_000,
         streaming_decoder: str = "topk_lowmem",
         streaming_decoder_n_top: int = 64,
+        boxcar_accum_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         # Streaming forward (chunk-8 production refactor): when True,
@@ -539,6 +574,38 @@ class DeterministicDetector(torch.nn.Module):
         # amortise fast-path; built lazily on first cube and reused
         # across cubes (saves a ~3 GiB malloc/free per cube).
         self._amortise_cs: Optional[torch.Tensor] = None
+        # Layer-2 σ-clip per-kernel subsample-index cache: built lazily
+        # on first cube and reused across cubes so the Layer-2 σ
+        # estimator's ``randint`` cost is paid once per pipeline
+        # lifetime, not K × per-cube. ``(key, idx)`` where ``key``
+        # encodes the interior-slab shape + device + max_samples;
+        # ``idx`` is a ``[K, max_samples] int64`` cuda tensor of flat
+        # indices into the interior slab.
+        self._layer2_idx: Optional[torch.Tensor] = None
+        self._layer2_idx_key: Optional[Tuple] = None
+        # Optional override of the cumsum accumulation dtype for the
+        # amortise fast-path. Default ``None`` preserves the chunk-8
+        # behaviour (``fp32`` accum when ``cube.dtype`` is ``fp16``/
+        # ``bf16``). Setting to ``torch.float16`` opts into the
+        # commissioning fast-path where the entire cs buffer is stored
+        # in fp16 — halves the memory traffic of ``boxcar_from_padded_
+        # cumsum`` (saves ~100 ms / pass at production geometry on a
+        # 2080 Ti) at the cost of accumulated fp16 rounding in the
+        # cumsum. Empirically (test/precision_fp16_cumsum on n01) the
+        # sigma_clipped_std output differs by ≤ 0.02% across all 7
+        # K_time widths at T_det=256 / N_fdm=34 / N_grid=256 — 75x
+        # below the Layer-2 EMA's intrinsic 1.5% cube-to-cube noise
+        # floor (plan §1622). Production search_compute on the 2080 Ti
+        # pin sets this to fp16; small-geom unit tests leave it None.
+        self._boxcar_accum_dtype: Optional[torch.dtype] = boxcar_accum_dtype
+        if (
+            boxcar_accum_dtype is not None
+            and boxcar_accum_dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            raise ValueError(
+                f"boxcar_accum_dtype={boxcar_accum_dtype!r}; expected one of "
+                "torch.float16, torch.bfloat16, torch.float32, or None"
+            )
         if self._streaming and self._streaming_tile_size < 1:
             raise ValueError(
                 f"streaming_tile_size={streaming_tile_size}, expected ≥ 1"
@@ -999,11 +1066,14 @@ class DeterministicDetector(torch.nn.Module):
         is overwritten in-place via ``torch.cumsum(out=...)`` so no
         stale data leaks.
         """
-        accum_dtype = (
-            torch.float32
-            if cube.dtype in (torch.float16, torch.bfloat16)
-            else cube.dtype
-        )
+        if self._boxcar_accum_dtype is not None:
+            accum_dtype = self._boxcar_accum_dtype
+        else:
+            accum_dtype = (
+                torch.float32
+                if cube.dtype in (torch.float16, torch.bfloat16)
+                else cube.dtype
+            )
         n = cube.shape[0]
         target_shape = (n + max_width,) + tuple(cube.shape[1:])
         if (
@@ -1054,37 +1124,21 @@ class DeterministicDetector(torch.nn.Module):
     ) -> List[Candidate]:
         """Kernel-by-kernel streaming forward (chunk-8 production path).
 
-        Semantically equivalent to the batched ``forward()`` path:
-        same Layer-2 σ_k EMA update (per_kernel_sigma path; identical
-        to the batched ``scores=`` path because both call
-        ``layer2_interior_sigma`` with the same per-kernel σ-clip
-        parameters), same SNR computation (scores / just-updated σ_k),
-        same per-kernel ``decode_local_max``, same cross-kernel merge
-        and canonical-zone gate. The single behavioural difference vs
-        the batched path is candidate ordering within an SNR tie —
-        ``merge_across_kernels`` then re-sorts deterministically so
-        the emit-list ordering is bit-exact.
+        Single-pass semantics for production throughput: decode cube N
+        with the PREVIOUS Layer-2 EMA state ``s_k_prev``, then update
+        Layer-2 at end-of-cube from cube N's per-kernel σ estimates.
 
-        Two passes over the kernel bank are required to preserve the
-        "divide by JUST-UPDATED σ_k" semantics of the batched path:
+          * For each kernel k: compute ``score_k`` once, compute
+            ``sigma_this_k`` from ``score_k`` for the Layer-2 update,
+            and decode ``snr_k = score_k / s_k_prev[k]``.
+          * After all kernels: call
+            ``update_and_query(per_kernel_sigma=sigma_this_vec)`` so the
+            returned ``s_k`` becomes the divisor state for cube N+1.
 
-          * Pass 1: per kernel, compute score_k (kept in ``cube.dtype``,
-            typically fp16 in production) → compute σ_this_k via
-            ``layer2_interior_sigma`` → discard score_k. The σ_this
-            collection is the [K]-vector handed to Layer-2.
-          * Layer-2 ``update_and_query(per_kernel_sigma=σ_this_vec)``
-            returns the just-updated ``s_k``.
-          * Pass 2: per kernel, recompute score_k → snr_k =
-            score_k / s_k[k] → ``decode_local_max(snr_k, ...)``.
-
-        Total compute is ~2× the batched path's per-kernel score
-        compute. At production geometry (T_det=256, N_fdm=32,
-        N_grid=256, K=128) the per-kernel score compute is the
-        dominant detector cost, so wall-clock is ~2× the batched
-        forward — but the batched path OOMs at this geometry (16 GiB
-        for K=8 fp32 upfront allocation; 256 GiB for K=128) so 2× of
-        the streaming compute is the only path that fits on an 11 GiB
-        2080 Ti.
+        This removes the second full score pass (the dominant detector
+        cost at production geometry) while preserving the same
+        per-kernel σ estimator and EMA dynamics. The trade-off is a
+        one-cube lag in the σ divisor used for thresholding.
 
         Memory ceiling per kernel:
           * score_k in ``cube.dtype`` (~1 GiB at production fp16) +
@@ -1134,37 +1188,142 @@ class DeterministicDetector(torch.nn.Module):
                 amortise_time_cumsum = False
                 amortise_max_width = 1
 
-        # ---- Pass 1: per-kernel σ_this for the Layer-2 update ----
-        sigma_this_per_kernel = torch.empty(
-            (K,), dtype=torch.float32, device=cube.device,
-        )
-        # Avoid the circular import by pulling the symbol here; this
-        # keeps the module-top imports stable and the symbol used only
-        # on the streaming path.
-        from ..noise_norm.layer2 import layer2_interior_sigma
+        # Decode uses the PREVIOUS Layer-2 EMA state. We update the EMA
+        # at end-of-cube so the new state applies to cube N+1.
+        s_k_decode = self._sigma_k.detach().clone()
+
+        # Per-kernel σ_this for the Layer-2 update is computed AFTER
+        # the decode loop in a single batched σ-clip call (saves the
+        # 7× python-loop + per-kernel ``.item()`` syncs the chunk-8
+        # path used to pay). The per-kernel interior subsamples are
+        # accumulated into ``sigma_samples`` as the loop iterates.
+        # ``layer2_interior_sigma`` is no longer used on the streaming
+        # path, but is still re-exported for non-streaming consumers.
+        from ..noise_norm.layer1 import sigma_clipped_std_batched
 
         # Pre-allocate (or reuse) the amortised-cumsum buffer once
         # per detector lifetime. Avoids re-allocating a ~3 GiB buffer
         # per cube and avoids the caching-allocator fragmentation that
         # forces a per-cube ``empty_cache`` (~150 ms cost).
         if amortise_time_cumsum:
-            cs_pass1 = self._get_or_build_amortise_cs(
+            cs = self._get_or_build_amortise_cs(
                 cube, max_width=amortise_max_width,
             )
             self._fill_amortise_cs(
-                cs_pass1, cube, max_width=amortise_max_width,
+                cs, cube, max_width=amortise_max_width,
             )
         else:
-            cs_pass1 = None
+            cs = None
 
+        # Canonical filtering drops edge times in a window set by
+        # n_kernel_max_t. Skip scoring those dropped edge bins entirely
+        # to avoid wasted detector work.
+        if n_kernel_max_t is None:
+            n_kernel_max_t = self._n_kernel_max_t
+        disable_interior = bool(int(os.environ.get("DSART_DISABLE_INTERIOR_SCORE", "0")))
+        t_edge = 0 if disable_interior else max(0, int(n_kernel_max_t) // 2)
+        t_base = 0
+        n_out_eff = int(cube.shape[0])
+        if t_edge > 0 and (2 * t_edge) < int(cube.shape[0]):
+            t_base = t_edge
+            n_out_eff = int(cube.shape[0]) - (2 * t_edge)
+        sigma_n_kernel_max_t = 1 if t_base > 0 else self._layer2.n_kernel_max_t
+        decoder_n_top = self._streaming_decoder_n_top
+        if t_base > 0 and n_out_eff < int(cube.shape[0]):
+            scale = float(cube.shape[0]) / float(n_out_eff)
+            decoder_n_top = max(
+                self._streaming_decoder_n_top,
+                int(math.ceil(self._streaming_decoder_n_top * scale)),
+            )
+        enable_argmax_decode = bool(
+            int(os.environ.get("DSART_ENABLE_ARGMAX_DECODE", "0"))
+        )
+        use_argmax_decode = (
+            self._streaming_decoder == "topk_lowmem"
+            and bool(all_image_delta)
+            and bool(all_dm_unit)
+            and enable_argmax_decode
+        )
+        argmax_topk = decoder_n_top * K
+
+        # Pre-resolve the interior slab geometry and per-kernel
+        # subsample indices for the batched Layer-2 σ. When the
+        # caller has interior scoring active (``t_base > 0``), the
+        # full ``score_k`` IS the interior slab; otherwise we slice
+        # ``[t_sig_lo:t_sig_hi]`` to match the historical
+        # ``layer2_interior_sigma`` semantics.
+        sig_max = self._layer2_sigma_max_samples
+        if t_base > 0:
+            t_sig_lo, t_sig_hi = 0, int(n_out_eff)
+        else:
+            lo = int(sigma_n_kernel_max_t) // 2
+            hi = int(cube.shape[0]) - lo
+            if hi <= lo:
+                # ``sigma_n_kernel_max_t`` wider than the cube (tiny
+                # unit-test geometry) → fall back to the whole slab.
+                lo, hi = 0, int(cube.shape[0])
+            t_sig_lo, t_sig_hi = lo, hi
+        interior_t = int(t_sig_hi - t_sig_lo)
+        n_per_kernel_interior = (
+            interior_t * int(cube.shape[1]) * int(cube.shape[2]) * int(cube.shape[3])
+        )
+        layer2_subsample_active = (
+            sig_max is not None
+            and int(sig_max) > 0
+            and n_per_kernel_interior > int(sig_max)
+        )
+        if layer2_subsample_active:
+            m_l2 = int(sig_max)
+            l2_key = (
+                K,
+                n_per_kernel_interior,
+                m_l2,
+                str(cube.device),
+            )
+            if (
+                self._layer2_idx is None
+                or self._layer2_idx_key != l2_key
+            ):
+                gen = torch.Generator(device=cube.device)
+                idx_stack = torch.empty(
+                    (K, m_l2), dtype=torch.int64, device=cube.device,
+                )
+                for kk in range(K):
+                    gen.manual_seed(int(kk))
+                    idx_stack[kk] = torch.randint(
+                        0, n_per_kernel_interior, (m_l2,),
+                        device=cube.device, generator=gen,
+                    )
+                self._layer2_idx = idx_stack
+                self._layer2_idx_key = l2_key
+            sigma_samples = torch.empty(
+                (K, m_l2), dtype=torch.float32, device=cube.device,
+            )
+        else:
+            sigma_samples = None  # full interior; batched sigma over per-row flatten
+
+        # Build a stacked container for the non-subsample path. Per-row
+        # length is the full interior cell count; for the production
+        # 100 k cap this branch is inactive (and would OOM if hit).
+        if not layer2_subsample_active:
+            sigma_full = torch.empty(
+                (K, n_per_kernel_interior),
+                dtype=torch.float32,
+                device=cube.device,
+            )
+
+        per_kernel_cands: List[Candidate] = []
+        argmax_snr: Optional[torch.Tensor] = None
+        argmax_winner: Optional[torch.Tensor] = None
         for k_idx, kernel in enumerate(self._kernel_bank):
-            if cs_pass1 is not None:
+            if cs is not None:
                 score_k = boxcar_from_padded_cumsum(
-                    cs_pass1,
+                    cs,
                     axis=0,
                     width=int(kernel.k_time_width),
                     max_width=amortise_max_width,
-                    n_out=int(cube.shape[0]),
+                    n_out=n_out_eff,
+                    t_base=t_base,
                     out_dtype=cube.dtype,
                     w_tile_size=tile_size,
                 )
@@ -1172,102 +1331,151 @@ class DeterministicDetector(torch.nn.Module):
                 score_k = self._compute_score_for_kernel(
                     cube, kernel, tile_size=tile_size,
                 )
-            # Keep score_k in its native dtype (typically fp16 on the
-            # production GPU path); ``sigma_clipped_std`` upcasts to
-            # fp32 internally. ``layer2_interior_sigma`` expects a
-            # 5-D [K, T, F, H, W] tensor with K=1 here; use a no-copy
-            # view so we don't double the per-kernel transient.
-            sigma_k = layer2_interior_sigma(
-                score_k.unsqueeze(0),
-                n_kernel_max_t=self._layer2.n_kernel_max_t,
-                n_sigma=self._layer2.n_sigma,
-                n_iterations=self._layer2.n_iterations,
-                max_samples=self._layer2_sigma_max_samples,
-            )
-            sigma_this_per_kernel[k_idx] = sigma_k[0]
-            del score_k, sigma_k
+            if t_base > 0 and int(score_k.shape[0]) != n_out_eff:
+                score_k = score_k.narrow(0, t_base, n_out_eff)
+            # Subsample this kernel's interior into the stacked
+            # sigma buffer. Math-equivalent to the prior
+            # ``layer2_interior_sigma(score_k.unsqueeze(0))`` call but
+            # defers the σ-clip iteration loop until after every
+            # kernel has contributed (one batched ``nanmedian`` over
+            # ``[K, max_samples]`` replaces K sequential medians +
+            # ``.item()`` syncs).
+            if t_base > 0:
+                interior_view = score_k
+            else:
+                interior_view = score_k.narrow(0, t_sig_lo, t_sig_hi - t_sig_lo)
+            flat_interior = interior_view.reshape(-1)
+            if layer2_subsample_active:
+                # int64 fancy-index gather; upcast on read so the
+                # ``sigma_samples`` buffer is already fp32.
+                sigma_samples[k_idx] = flat_interior[
+                    self._layer2_idx[k_idx]
+                ].to(torch.float32)
+            else:
+                sigma_full[k_idx] = flat_interior.to(torch.float32)
 
-        # ---- Layer-2 update (single-vector path; equivalent to the
-        # ``scores=`` path's internal per-kernel loop in layer2.py) ----
+            s_k_scalar = float(s_k_decode[k_idx].item())
+            if s_k_scalar == 0.0:
+                # Degenerate kernel: should never happen post-Layer-2's
+                # zero-replace guard but defend against div-by-zero.
+                s_k_scalar = 1.0
+
+            if use_argmax_decode:
+                # Argmax decode path still needs an SNR cube to compare
+                # cross-kernel; keep the explicit divide on this branch.
+                snr_k = score_k / s_k_scalar
+                if argmax_snr is None:
+                    argmax_snr = snr_k.clone()
+                    argmax_winner = torch.full(
+                        snr_k.shape,
+                        int(k_idx),
+                        dtype=torch.int16,
+                        device=snr_k.device,
+                    )
+                else:
+                    better = snr_k > argmax_snr
+                    argmax_snr = torch.where(better, snr_k, argmax_snr)
+                    argmax_winner[better] = int(k_idx)
+                del snr_k
+            elif self._streaming_decoder == "topk_lowmem":
+                # No per-cube SNR materialisation: threshold raw
+                # ``score_k`` against ``threshold * s_k``; emitted
+                # Candidate.snr is rescaled from raw_top_val / s_k.
+                cands = decode_topk_lowmem(
+                    score_k,
+                    threshold=self._threshold_sigma,
+                    kernel_id=kernel.kernel_id,
+                    k_dm_width=kernel.k_dm_width,
+                    k_time_width=kernel.k_time_width,
+                    detector_version=self._detector_version,
+                    search_node_id=self._search_node_id,
+                    gpu_half=self._gpu_half,
+                    event_specnum=(int(event_specnum) + t_base),
+                    fine_to_coarse=fine_to_coarse,
+                    fine_dm_pc_cm3=fine_dm_pc_cm3,
+                    n_top=decoder_n_top,
+                    snr_divisor=s_k_scalar,
+                )
+            else:
+                # ``decode_local_max`` builds a ``score > threshold``
+                # mask on the raw score; same snr_divisor trick lets
+                # it skip the per-cube divide.
+                cands = decode_local_max(
+                    score_k,
+                    threshold=self._threshold_sigma,
+                    kernel_id=kernel.kernel_id,
+                    k_dm_width=kernel.k_dm_width,
+                    k_time_width=kernel.k_time_width,
+                    detector_version=self._detector_version,
+                    search_node_id=self._search_node_id,
+                    gpu_half=self._gpu_half,
+                    event_specnum=(int(event_specnum) + t_base),
+                    fine_to_coarse=fine_to_coarse,
+                    fine_dm_pc_cm3=fine_dm_pc_cm3,
+                    snr_divisor=s_k_scalar,
+                )
+            if not use_argmax_decode:
+                per_kernel_cands.extend(cands)
+            del score_k
+
+        if use_argmax_decode and argmax_snr is not None and argmax_winner is not None:
+            per_kernel_cands = decode_topk_argmax_lowmem(
+                argmax_snr,
+                argmax_winner,
+                threshold=self._threshold_sigma,
+                kernel_ids=[kernel.kernel_id for kernel in self._kernel_bank],
+                kernel_time_widths=[
+                    int(kernel.k_time_width) for kernel in self._kernel_bank
+                ],
+                merge_radius_lm=self._merge_radius_lm,
+                merge_radius_fdm=self._merge_radius_fdm,
+                merge_radius_t=self._merge_radius_t,
+                detector_version=self._detector_version,
+                search_node_id=self._search_node_id,
+                gpu_half=self._gpu_half,
+                event_specnum=(int(event_specnum) + t_base),
+                fine_to_coarse=fine_to_coarse,
+                fine_dm_pc_cm3=fine_dm_pc_cm3,
+                n_top=argmax_topk,
+            )
+            del argmax_snr, argmax_winner
+
+        # Single batched σ-clip over the stacked per-kernel samples
+        # (replaces K sequential ``layer2_interior_sigma`` calls).
+        # ``sigma_samples`` / ``sigma_full`` lives in fp32 already so
+        # the batched primitive can skip the upcast.
+        sigma_stack = (
+            sigma_samples if layer2_subsample_active else sigma_full
+        )
+        sigma_this_per_kernel = sigma_clipped_std_batched(
+            sigma_stack,
+            n_sigma=self._layer2.n_sigma,
+            n_iterations=self._layer2.n_iterations,
+        )
+
+        # End-of-cube Layer-2 update; new s_k applies to the NEXT cube.
         s_k_tensor, is_warming_up = self._layer2.update_and_query(
             per_kernel_sigma=sigma_this_per_kernel, valid=cube_valid,
         )
         self._sigma_k.copy_(s_k_tensor)
 
-        if n_kernel_max_t is None:
-            n_kernel_max_t = self._n_kernel_max_t
         warmup_flag = int(CandidateFlags.NOISE_WARMUP) if is_warming_up else 0
+        if warmup_flag:
+            per_kernel_cands = [
+                _with_flags(c, c.flags | warmup_flag) for c in per_kernel_cands
+            ]
 
-        # ---- Pass 2: per-kernel decode against the just-updated σ_k ----
-        # Reuse the same pre-allocated cs buffer (the cube hasn't
-        # changed between passes — Layer-2 just updated σ_k).
-        cs_pass2 = cs_pass1
-        per_kernel_cands: List[Candidate] = []
-        for k_idx, kernel in enumerate(self._kernel_bank):
-            if cs_pass2 is not None:
-                score_k = boxcar_from_padded_cumsum(
-                    cs_pass2,
-                    axis=0,
-                    width=int(kernel.k_time_width),
-                    max_width=amortise_max_width,
-                    n_out=int(cube.shape[0]),
-                    out_dtype=cube.dtype,
-                    w_tile_size=tile_size,
-                )
-            else:
-                score_k = self._compute_score_for_kernel(
-                    cube, kernel, tile_size=tile_size,
-                )
-            s_k_scalar = float(s_k_tensor[k_idx].item())
-            if s_k_scalar == 0.0:
-                # Degenerate kernel: should never happen post-Layer-2's
-                # zero-replace guard but defend against div-by-zero.
-                s_k_scalar = 1.0
-            snr_k = score_k / s_k_scalar
-            del score_k
-
-            if self._streaming_decoder == "topk_lowmem":
-                cands = decode_topk_lowmem(
-                    snr_k,
-                    threshold=self._threshold_sigma,
-                    kernel_id=kernel.kernel_id,
-                    k_dm_width=kernel.k_dm_width,
-                    k_time_width=kernel.k_time_width,
-                    detector_version=self._detector_version,
-                    search_node_id=self._search_node_id,
-                    gpu_half=self._gpu_half,
-                    event_specnum=event_specnum,
-                    fine_to_coarse=fine_to_coarse,
-                    fine_dm_pc_cm3=fine_dm_pc_cm3,
-                    n_top=self._streaming_decoder_n_top,
-                )
-            else:
-                cands = decode_local_max(
-                    snr_k,
-                    threshold=self._threshold_sigma,
-                    kernel_id=kernel.kernel_id,
-                    k_dm_width=kernel.k_dm_width,
-                    k_time_width=kernel.k_time_width,
-                    detector_version=self._detector_version,
-                    search_node_id=self._search_node_id,
-                    gpu_half=self._gpu_half,
-                    event_specnum=event_specnum,
-                    fine_to_coarse=fine_to_coarse,
-                    fine_dm_pc_cm3=fine_dm_pc_cm3,
-                )
-            del snr_k
-            if warmup_flag:
-                cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
-            per_kernel_cands.extend(cands)
-
-        # Note: the amortise cs buffer (cs_pass1 == cs_pass2) is owned
-        # by the detector and reused across cubes; do not free here.
-        merged = merge_across_kernels(
-            per_kernel_cands,
-            merge_radius_lm=self._merge_radius_lm,
-            merge_radius_fdm=self._merge_radius_fdm,
-            merge_radius_t=self._merge_radius_t,
-        )
+        # Note: the amortise cs buffer is owned by the detector and
+        # reused across cubes; do not free here.
+        if use_argmax_decode:
+            merged = per_kernel_cands
+        else:
+            merged = merge_across_kernels(
+                per_kernel_cands,
+                merge_radius_lm=self._merge_radius_lm,
+                merge_radius_fdm=self._merge_radius_fdm,
+                merge_radius_t=self._merge_radius_t,
+            )
 
         if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
             return merged

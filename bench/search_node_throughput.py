@@ -260,6 +260,20 @@ async def _bench_main(args: argparse.Namespace) -> int:
         time_tokens=time_tokens,
         dtype=detector_dtype,
     )
+    boxcar_accum_arg = str(getattr(args, "detector_boxcar_accum_dtype", "default"))
+    if boxcar_accum_arg == "default":
+        boxcar_accum_dtype: Optional[torch.dtype] = None
+    elif boxcar_accum_arg == "fp32":
+        boxcar_accum_dtype = torch.float32
+    elif boxcar_accum_arg == "fp16":
+        boxcar_accum_dtype = torch.float16
+    elif boxcar_accum_arg == "bf16":
+        boxcar_accum_dtype = torch.bfloat16
+    else:
+        raise SystemExit(
+            f"--detector-boxcar-accum-dtype={boxcar_accum_arg!r}; expected "
+            "one of default/fp32/fp16/bf16"
+        )
     detector = DeterministicDetector(
         kernel_bank=bank,
         threshold_sigma=threshold_sigma,
@@ -270,10 +284,24 @@ async def _bench_main(args: argparse.Namespace) -> int:
         device=torch.device(device),
         streaming=bool(args.detector_streaming),
         streaming_tile_size=int(args.detector_streaming_tile_size),
+        streaming_decoder_n_top=int(args.detector_streaming_decoder_n_top),
+        boxcar_accum_dtype=boxcar_accum_dtype,
+        layer2_sigma_max_samples=(
+            int(args.detector_layer2_max_samples)
+            if int(args.detector_layer2_max_samples) > 0
+            else None
+        ),
     )
     _LOG.info(
-        "detector: streaming=%s tile_size=%d",
+        "detector: streaming=%s tile_size=%d boxcar_accum_dtype=%s "
+        "layer2_sigma_max_samples=%s",
         bool(args.detector_streaming), int(args.detector_streaming_tile_size),
+        boxcar_accum_dtype,
+        (
+            int(args.detector_layer2_max_samples)
+            if int(args.detector_layer2_max_samples) > 0
+            else None
+        ),
     )
     image_backend = str(args.image_backend)
     if image_backend == "gpu":
@@ -328,6 +356,7 @@ async def _bench_main(args: argparse.Namespace) -> int:
     # ---- Drain the source, collecting stage timings ----
     records: List[StageTimingRecord] = []
     skip_detector = bool(args.skip_detector)
+    enable_overlap = bool(args.pipeline_overlap)
     if skip_detector:
         _LOG.info(
             "--skip-detector: bypassing Layer-1 norm + Detector.forward(); "
@@ -335,48 +364,99 @@ async def _bench_main(args: argparse.Namespace) -> int:
         )
     bench_start_ns = time.perf_counter_ns()
     async with src:
-        async for slot in src:
-            t_dispatch_start = time.perf_counter_ns()
-            if skip_detector:
-                cube, validity_mask = pipeline._build_cube(slot)
-                t_build_done = time.perf_counter_ns()
-                rec = StageTimingRecord(
-                    cube_id=slot.cube_id,
-                    n_candidates=0,
-                    build_cube_ns=int(t_build_done - t_dispatch_start),
-                    layer1_norm_ns=0,
-                    detector_forward_ns=0,
-                    total_pipeline_ns=int(
-                        t_build_done - t_dispatch_start
-                    ),
+        if (
+            enable_overlap
+            and (not skip_detector)
+            and image_backend == "gpu"
+        ):
+            # Chunk-8d narrow overlap: prefetch only the cint8 H2D for
+            # cube N+1 on a dedicated H2D stream while the main stream
+            # runs imager + Layer-1 + detector for cube N. Avoids the
+            # SM contention that regressed the prior full-prefetch
+            # overlap path; the H2D engine is independent of the SMs.
+            aiter = src.__aiter__()
+            try:
+                slot = await aiter.__anext__()
+            except StopAsyncIteration:
+                slot = None
+            pending = pipeline.prefetch_h2d(slot) if slot is not None else None
+            while slot is not None and pending is not None:
+                t_dispatch_start = time.perf_counter_ns()
+                try:
+                    next_slot = await aiter.__anext__()
+                except StopAsyncIteration:
+                    next_slot = None
+                next_pending = (
+                    pipeline.prefetch_h2d(next_slot)
+                    if next_slot is not None
+                    else None
                 )
-            else:
-                result = pipeline.process(slot)
+                result = pipeline.process_h2d_prefetched(pending)
                 t_done = time.perf_counter_ns()
                 rec = StageTimingRecord(
                     cube_id=slot.cube_id,
                     n_candidates=len(result.candidates),
-                    build_cube_ns=int(
-                        result.stage_timings_ns["build_cube"]
-                    ),
-                    layer1_norm_ns=int(
-                        result.stage_timings_ns["layer1_norm"]
-                    ),
+                    build_cube_ns=int(result.stage_timings_ns["build_cube"]),
+                    layer1_norm_ns=int(result.stage_timings_ns["layer1_norm"]),
                     detector_forward_ns=int(
                         result.stage_timings_ns["detector_forward"]
                     ),
                     total_pipeline_ns=int(t_done - t_dispatch_start),
                 )
-            records.append(rec)
-            if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
-                _LOG.info(
-                    "cube=%d/%d total=%.2fms detector=%.2fms cands=%d",
-                    slot.cube_id + 1, n_cubes,
-                    rec.total_pipeline_ns / 1.0e6,
-                    rec.detector_forward_ns / 1.0e6,
-                    rec.n_candidates,
-                )
-            await src.release(slot.cube_id)
+                records.append(rec)
+                if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
+                    _LOG.info(
+                        "cube=%d/%d total=%.2fms detector=%.2fms cands=%d",
+                        slot.cube_id + 1, n_cubes,
+                        rec.total_pipeline_ns / 1.0e6,
+                        rec.detector_forward_ns / 1.0e6,
+                        rec.n_candidates,
+                    )
+                await src.release(slot.cube_id)
+                slot, pending = next_slot, next_pending
+        else:
+            async for slot in src:
+                t_dispatch_start = time.perf_counter_ns()
+                if skip_detector:
+                    cube, validity_mask = pipeline._build_cube(slot)
+                    t_build_done = time.perf_counter_ns()
+                    rec = StageTimingRecord(
+                        cube_id=slot.cube_id,
+                        n_candidates=0,
+                        build_cube_ns=int(t_build_done - t_dispatch_start),
+                        layer1_norm_ns=0,
+                        detector_forward_ns=0,
+                        total_pipeline_ns=int(
+                            t_build_done - t_dispatch_start
+                        ),
+                    )
+                else:
+                    result = pipeline.process(slot)
+                    t_done = time.perf_counter_ns()
+                    rec = StageTimingRecord(
+                        cube_id=slot.cube_id,
+                        n_candidates=len(result.candidates),
+                        build_cube_ns=int(
+                            result.stage_timings_ns["build_cube"]
+                        ),
+                        layer1_norm_ns=int(
+                            result.stage_timings_ns["layer1_norm"]
+                        ),
+                        detector_forward_ns=int(
+                            result.stage_timings_ns["detector_forward"]
+                        ),
+                        total_pipeline_ns=int(t_done - t_dispatch_start),
+                    )
+                records.append(rec)
+                if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
+                    _LOG.info(
+                        "cube=%d/%d total=%.2fms detector=%.2fms cands=%d",
+                        slot.cube_id + 1, n_cubes,
+                        rec.total_pipeline_ns / 1.0e6,
+                        rec.detector_forward_ns / 1.0e6,
+                        rec.n_candidates,
+                    )
+                await src.release(slot.cube_id)
     bench_wall_s = (time.perf_counter_ns() - bench_start_ns) / 1.0e9
 
     # ---- Write outputs ----
@@ -409,6 +489,7 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 "n_kernels": n_kernels_total,
             },
             "skip_detector": skip_detector,
+            "pipeline_overlap": bool(enable_overlap),
         },
         "wall_clock_s": bench_wall_s,
         "achieved_cubes_per_s": (
@@ -510,6 +591,38 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "boxcar (forwarded to boxcar_via_cumsum's tile_size arg). "
              "Default 64 caps the fp32 cumsum working set at ~768 MiB "
              "at production geometry.",
+    )
+    parser.add_argument(
+        "--pipeline-overlap",
+        action="store_true",
+        help="Enable one-cube lookahead overlap: prebuild cube N+1 on a "
+             "prefetch stream while running Layer-1 + detector on cube N "
+             "(GPU backend only).",
+    )
+    parser.add_argument(
+        "--detector-streaming-decoder-n-top", type=int, default=64,
+        help="Per-kernel top-k budget used by streaming decoder "
+        "(decode_topk_lowmem). Lower values reduce topk work; keep "
+        "well above expected per-kernel candidate counts.",
+    )
+    parser.add_argument(
+        "--detector-boxcar-accum-dtype", type=str, default="default",
+        choices=("default", "fp32", "fp16", "bf16"),
+        help="Cumsum accumulation dtype for the streaming detector's "
+             "amortise-cumsum fast-path. 'default' (None to the detector) "
+             "preserves chunk-8 behaviour (fp32 accum when cube is fp16). "
+             "'fp16' opts into the commissioning fast-path that halves "
+             "boxcar memory traffic (saves ~190 ms / cube at production "
+             "geometry on a 2080 Ti). The empirically measured σ-clip "
+             "error vs fp32 is ≤ 0.02% across all 7 K_time widths at "
+             "T_det=256 / N_fdm=34 / N_grid=256 — 75x below the Layer-2 "
+             "EMA's intrinsic 1.5% cube-to-cube noise floor (plan §1622).",
+    )
+    parser.add_argument(
+        "--detector-layer2-max-samples", type=int, default=1_000_000,
+        help="Per-kernel sample cap for Layer-2 interior sigma clipping. "
+             "Set <=0 to disable subsampling (full interior). Default "
+             "1,000,000 (current production-safe baseline).",
     )
     parser.add_argument(
         "--prequantise", action="store_true",

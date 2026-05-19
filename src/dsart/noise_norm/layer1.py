@@ -31,7 +31,7 @@ Implementation notes:
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Optional
+from typing import Deque, Optional, Tuple
 
 import numpy as np
 import torch
@@ -46,7 +46,80 @@ __all__ = [
     "Layer1State",
     "layer1_global_scalar",
     "sigma_clipped_std",
+    "sigma_clipped_std_batched",
 ]
+
+
+def sigma_clipped_std_batched(
+    samples: torch.Tensor,
+    *,
+    n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
+    n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
+) -> torch.Tensor:
+    """Vectorised σ-clipped std over the last axis of a 2-D tensor.
+
+    Computes one ``sigma_clipped_std`` per row in a single batched
+    pipeline (no per-row Python loop, no per-row ``.item()`` syncs).
+    NaN-aware: any non-finite input cell is dropped from the estimator
+    (consistent with the scalar :func:`sigma_clipped_std`).
+
+    Args:
+        samples: ``[B, M]`` tensor of pre-subsampled cells. ``B`` rows
+            (independent estimators), ``M`` cells per row. Any float
+            dtype; internally upcast to fp32 for the accumulation.
+        n_sigma: clip threshold in σ units. Default 3.0.
+        n_iterations: number of clip iterations. Default 3.
+
+    Returns:
+        ``[B] float32`` per-row σ-clipped standard deviation, on the
+        same device as ``samples``. Rows that are entirely
+        non-finite (or empty) return 0.0.
+    """
+    if samples.dim() != 2:
+        raise ValueError(
+            f"samples.dim()={samples.dim()}, expected 2 [B, M]"
+        )
+    B, M = samples.shape
+    if B == 0 or M == 0:
+        return torch.zeros((B,), dtype=torch.float32, device=samples.device)
+
+    s = samples if samples.dtype == torch.float32 else samples.to(torch.float32)
+
+    finite = torch.isfinite(s)
+    nan_value = torch.tensor(float("nan"), dtype=torch.float32, device=s.device)
+    s_active = torch.where(finite, s, nan_value)
+
+    # Initial median + σ over the finite cells.
+    medians = torch.nanmedian(s_active, dim=1).values  # [B] fp32
+    diff_sq = (s_active - medians[:, None]) ** 2       # NaN propagates
+    count = finite.sum(dim=1).to(torch.float32).clamp(min=1.0)
+    # nansum of (NaN)^2 still drops the NaN cells (NaN squared is NaN).
+    sigmas = torch.sqrt(torch.nansum(diff_sq, dim=1) / count)
+
+    active = finite
+    for _ in range(int(n_iterations)):
+        lo = medians - n_sigma * sigmas
+        hi = medians + n_sigma * sigmas
+        # NaN comparisons short-circuit to False so we don't need to
+        # AND with ``finite`` again, but the explicit AND with
+        # ``active`` keeps once-rejected cells out for good (the
+        # scalar form's iteration shrinks the working set monotonically).
+        in_band = (s >= lo[:, None]) & (s <= hi[:, None])
+        active = active & in_band
+        s_clipped = torch.where(active, s, nan_value)
+        medians = torch.nanmedian(s_clipped, dim=1).values
+        diff_sq = (s_clipped - medians[:, None]) ** 2
+        count = active.sum(dim=1).to(torch.float32).clamp(min=1.0)
+        sigmas = torch.sqrt(torch.nansum(diff_sq, dim=1) / count)
+
+    # Replace any NaN (all-NaN row) with 0.0 to match the scalar form's
+    # all-NaN-returns-zero contract.
+    sigmas = torch.where(
+        torch.isnan(sigmas),
+        torch.zeros((), dtype=torch.float32, device=s.device),
+        sigmas,
+    )
+    return sigmas
 
 
 def sigma_clipped_std(
@@ -99,16 +172,8 @@ def sigma_clipped_std(
         return 0.0
 
     flat = x.reshape(-1)
-    if flat.dtype == torch.float16:
-        flat = flat.to(torch.float32)
 
     if max_samples is not None and flat.numel() > int(max_samples):
-        # Deterministic uniform subsample; we use torch.randperm with a
-        # fixed-seed Generator on the input's device so the subsample
-        # selection lives where the data lives (no host->device round-
-        # trip per-cube). The subsample is taken BEFORE the isfinite
-        # filter so the worst case (all-finite input) is bounded by
-        # max_samples cells in flight.
         gen = torch.Generator(device=flat.device)
         gen.manual_seed(int(rng_seed))
         idx = torch.randint(
@@ -116,26 +181,14 @@ def sigma_clipped_std(
             device=flat.device, generator=gen,
         )
         flat = flat[idx]
-
-    finite = flat[torch.isfinite(flat)]
-    if finite.numel() == 0:
-        return 0.0
-
-    s = finite
-    median = torch.median(s).item()
-    sigma = float(torch.sqrt(torch.mean((s - median) ** 2)).item())
-    for _ in range(int(n_iterations)):
-        if sigma == 0.0 or s.numel() == 0:
-            break
-        lo = median - n_sigma * sigma
-        hi = median + n_sigma * sigma
-        mask = (s >= lo) & (s <= hi)
-        s = s[mask]
-        if s.numel() == 0:
-            break
-        median = torch.median(s).item()
-        sigma = float(torch.sqrt(torch.mean((s - median) ** 2)).item())
-    return float(sigma)
+    # Dispatch through the batched primitive so the scalar path and
+    # the batched-per-fdm path share one σ-clip implementation.
+    sigmas = sigma_clipped_std_batched(
+        flat.unsqueeze(0),
+        n_sigma=n_sigma,
+        n_iterations=n_iterations,
+    )
+    return float(sigmas[0].item())
 
 
 def layer1_global_scalar(
@@ -175,17 +228,70 @@ def layer1_global_scalar(
         raise ValueError(
             f"cube.dim()={cube.dim()}, expected 4 [T_det, N_fdm, H, W]"
         )
-    n_fdm = cube.shape[1]
-    sigmas = torch.empty((n_fdm,), dtype=torch.float32, device=cube.device)
-    for fdm in range(n_fdm):
-        sigmas[fdm] = sigma_clipped_std(
-            cube[:, fdm, :, :],
-            n_sigma=n_sigma,
-            n_iterations=n_iterations,
-            max_samples=max_samples,
-            rng_seed=int(rng_seed) + int(fdm),
+    T_det, n_fdm, H, W = cube.shape  # noqa: N806
+    n_per_fdm = int(T_det) * int(H) * int(W)
+    device = cube.device
+
+    if (
+        max_samples is not None
+        and int(max_samples) > 0
+        and n_per_fdm > int(max_samples)
+    ):
+        # Per-fdm independent subsamples with deterministic seeds
+        # (matching the pre-batched ``rng_seed + fdm`` convention). The
+        # subsamples are drawn via fancy indexing into the [T,F,H,W]
+        # cube to avoid the ~1 GiB ``permute().contiguous()`` copy at
+        # production geometry.
+        m = int(max_samples)
+        flat_idx = torch.empty((n_fdm, m), dtype=torch.int64, device=device)
+        gen = torch.Generator(device=device)
+        for fdm in range(n_fdm):
+            gen.manual_seed(int(rng_seed) + int(fdm))
+            flat_idx[fdm] = torch.randint(
+                0, n_per_fdm, (m,), device=device, generator=gen,
+            )
+        samples = _gather_samples_per_fdm(
+            cube, flat_idx, T_det=T_det, H=H, W=W,
         )
-    return sigmas
+    else:
+        # Full-slab batched path: reshape to [F, T*H*W] with a single
+        # contiguous copy (small cubes in tests / cf32-audit benches).
+        samples = (
+            cube.permute(1, 0, 2, 3).contiguous().view(n_fdm, n_per_fdm)
+        )
+    return sigma_clipped_std_batched(
+        samples,
+        n_sigma=n_sigma,
+        n_iterations=n_iterations,
+    )
+
+
+def _gather_samples_per_fdm(
+    cube: torch.Tensor,
+    flat_idx: torch.Tensor,
+    *,
+    T_det: int,
+    H: int,
+    W: int,
+) -> torch.Tensor:
+    """Gather subsamples for each fdm trial from a [T, F, H, W] cube.
+
+    ``flat_idx`` has shape ``[N_fdm, M]`` with each entry in
+    ``[0, T_det * H * W)`` (a flat (t, h, w) index into the fdm slab).
+    Returns ``[N_fdm, M]`` with the same dtype as ``cube``. Uses fancy
+    indexing so the cube's contiguous [T, F, H, W] layout is not
+    materially copied.
+    """
+    n_fdm = flat_idx.shape[0]
+    hw = int(H) * int(W)
+    t_idx = (flat_idx // hw).to(torch.int64)
+    rem = flat_idx % hw
+    h_idx = (rem // int(W)).to(torch.int64)
+    w_idx = (rem % int(W)).to(torch.int64)
+    fdm_idx = torch.arange(
+        n_fdm, dtype=torch.int64, device=cube.device
+    ).unsqueeze(1).expand_as(flat_idx)
+    return cube[t_idx, fdm_idx, h_idx, w_idx]
 
 
 class Layer1State:
@@ -236,6 +342,12 @@ class Layer1State:
             deque(maxlen=self.n_burnin_cubes) for _ in range(self.n_fdm)
         ]
         self._cube_count = 0
+        # Cached subsample-index tensor (built lazily on first cube,
+        # keyed by cube shape + device). Re-used across cubes so we
+        # pay the randint generation cost exactly once per pipeline
+        # lifetime, not per cube.
+        self._subsample_idx: Optional[torch.Tensor] = None
+        self._subsample_key: Optional[Tuple[int, int, int, int, str]] = None
 
     @property
     def cube_count(self) -> int:
@@ -255,6 +367,74 @@ class Layer1State:
         for d in self._history:
             d.clear()
         self._cube_count = 0
+
+    def _layer1_sigma_cached(self, cube: torch.Tensor) -> torch.Tensor:
+        """Compute per-fdm Layer-1 σ on ``cube`` using a cached
+        subsample-index tensor.
+
+        The cached indices match the deterministic ``rng_seed + fdm``
+        scheme used by the prior per-fdm Python loop, so successive
+        cubes at the same geometry see the same subsample positions
+        (which is statistically equivalent to fresh-per-cube
+        subsampling for the σ-clip estimator and avoids ~3-5 ms of
+        per-cube ``randint`` launches at production geometry).
+        """
+        if cube.dim() != 4:
+            raise ValueError(
+                f"cube.dim()={cube.dim()}, expected 4 [T_det, N_fdm, H, W]"
+            )
+        T_det, n_fdm, H, W = cube.shape
+        if n_fdm != self.n_fdm:
+            raise ValueError(
+                f"cube N_fdm={n_fdm} != Layer1State.n_fdm={self.n_fdm}"
+            )
+        device = cube.device
+        n_per_fdm = int(T_det) * int(H) * int(W)
+        key = (
+            int(T_det),
+            int(self.n_fdm),
+            int(H),
+            int(W),
+            str(device),
+        )
+        needs_subsample = (
+            self.max_samples is not None
+            and int(self.max_samples) > 0
+            and n_per_fdm > int(self.max_samples)
+        )
+        if needs_subsample:
+            if (
+                self._subsample_idx is None
+                or self._subsample_key != key
+            ):
+                m = int(self.max_samples)
+                flat_idx = torch.empty(
+                    (self.n_fdm, m), dtype=torch.int64, device=device,
+                )
+                gen = torch.Generator(device=device)
+                for fdm in range(self.n_fdm):
+                    gen.manual_seed(int(self.rng_seed) + int(fdm))
+                    flat_idx[fdm] = torch.randint(
+                        0, n_per_fdm, (m,),
+                        device=device, generator=gen,
+                    )
+                self._subsample_idx = flat_idx
+                self._subsample_key = key
+            samples = _gather_samples_per_fdm(
+                cube, self._subsample_idx,
+                T_det=int(T_det), H=int(H), W=int(W),
+            )
+        else:
+            samples = (
+                cube.permute(1, 0, 2, 3)
+                .contiguous()
+                .view(self.n_fdm, n_per_fdm)
+            )
+        return sigma_clipped_std_batched(
+            samples,
+            n_sigma=self.n_sigma,
+            n_iterations=self.n_iterations,
+        )
 
     def update_and_query(
         self,
@@ -280,13 +460,7 @@ class Layer1State:
                 "pass exactly one of cube= or per_fdm_sigma="
             )
         if cube is not None:
-            sigma_this = layer1_global_scalar(
-                cube,
-                n_sigma=self.n_sigma,
-                n_iterations=self.n_iterations,
-                max_samples=self.max_samples,
-                rng_seed=self.rng_seed,
-            )
+            sigma_this = self._layer1_sigma_cached(cube)
         else:
             assert per_fdm_sigma is not None
             sigma_this = per_fdm_sigma.to(torch.float32)

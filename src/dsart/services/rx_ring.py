@@ -418,6 +418,7 @@ class SyntheticRxRingSource:
                 # every cube. Emulates the chunk-8b RX-ring contract
                 # (M3 emits cint8 already; search-node never re-quantises).
                 if self._cached_cint8 is None:
+                    from .host_pin import maybe_register_host_buffer
                     from ..transport.quantize import (
                         quantise_per_chgroup_into_cint8,
                     )
@@ -435,6 +436,9 @@ class SyntheticRxRingSource:
                         target_max=self._prequantise_target_max,
                         zero_fill_missing=True,
                     )
+                    # Pin once so CubePipeline H2D can DMA directly from
+                    # the cached cint8 slab (bench-only source path).
+                    maybe_register_host_buffer(self._cached_cint8)
                 streams = self._cached_streams
                 cint8_stack = self._cached_cint8
             else:
