@@ -54,6 +54,11 @@ wait
 # 2026-05-20: the n02/n09/n13 search-node bootstrap blew up because the
 # .so files were >5 days stale (no recv_epoll_add_port symbol) -- this
 # step prevents recurrence.
+# 2026-05-20 (M7.5): build_ext now also drives `make` inside
+# src/dsart/capture/ via the build_ext_with_capture_binary subclass
+# in setup.py; the corr nodes need the resulting dsart_capture_manythread
+# binary for the production captures.mode=real path. Build is best-effort
+# (it'll skip cleanly on the search node, which has libpsrdada=missing).
 echo "=== rebuilding C extensions on every node (parallel) ==="
 build_one() {
   local host=$1
