@@ -413,12 +413,17 @@ void stats_thread(void *arg)
         if (MON != NULL) {
             atomic_store_explicit(&MON->n_dropped_payload, pkt_drp,
                                   memory_order_release);
-            atomic_store_explicit(&MON->last_seq_no, last_seq,
-                                  memory_order_release);
             atomic_store_explicit(&MON->n_seq_skipped, (uint64_t)skipct,
                                   memory_order_release);
             atomic_store_explicit(&MON->n_block_writes, (uint64_t)writeBlock,
                                   memory_order_release);
+            /* NOTE: last_seq_no is stamped by recv_thread on every
+             * packet -- see the atomic_store there. We deliberately
+             * don't stamp it here because (a) the recv side already
+             * stamps it at packet rate, and (b) the legacy `last_seq`
+             * volatile is 0-initialised, so reading it here would
+             * race with recv_thread's first-packet update during
+             * the first stats_thread tick. */
             dsart_capture_mon_tick(MON);
         }
 
@@ -749,6 +754,26 @@ void recv_thread(void *arg)
             last_seq = seq_no;
             pthread_mutex_unlock(&mutex);
             (void)prev_seq_no;
+
+            /* DSART: stamp last_seq_no into mon shm here, not in the
+             * stats_thread, so the operator's "arm against latest
+             * specnum" workflow never races the stats_thread's 2 s
+             * startup sleep. Without this, the first sample of
+             * last_seq_no via the shm reads the initial 0 even
+             * though the recv threads have been draining packets
+             * for hundreds of ms -- the operator computes
+             * `UTC_START = 0 + offset`, which is far in the past,
+             * and the binary spends 5 s catching block_start_byte
+             * up to actual wire position via the temp_buffers
+             * max-overflow path. (Observed live on n06: 2465 fake
+             * block-completes before steady state.)
+             *
+             * Atomic store cost: ~1 ns / packet. At production
+             * 244 k pps / port this is ~0.024% CPU per thread. */
+            if (MON != NULL) {
+                atomic_store_explicit(&MON->last_seq_no, seq_no,
+                                      memory_order_release);
+            }
 
             /* start-condition gate (unchanged from legacy other than
              * the deterministic-arm tightening on UTC_START sentinel) */
