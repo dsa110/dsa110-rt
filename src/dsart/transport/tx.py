@@ -50,9 +50,25 @@ gridder, exactly what this transport layer is designed to avoid.
 
 When ``use_prod_frame=True``, :meth:`transmit` routes each cube to
 :meth:`_transmit_one_cube_prod` which emits production 72-byte
-ProdFrame headers with per-payload ``scale``/``offset`` quantisation,
-MTU-aware fragmentation, and a per-``dm_idx`` token-bucket pacer.
-The chunk-8 path is preserved for the M3 loopback bench.
+ProdFrame headers with per-payload ``scale``/``offset`` quantisation
+and MTU-aware fragmentation.
+
+By default the production path uses **bypass-pacer mode**
+(``TransportTxProdConfig.bypass_pacer=True``): each fragment is
+``sendto``-d directly with no in-Python rate-limiter, matching the
+``bench/net_pair.py`` / 16×4 corner-turn TX pattern that the M4b core
+DoD validated at 1.752 Gb/s on a single pair and the corner-turn
+validated at 28 Gb/s aggregate across 64 pairs with **zero
+tx_dropped_payloads** (see ``m4b-deploy/M4B-PAIR-REPORT.md`` and
+``m4b-deploy/CORNER-TURN-REPORT.md``). The kernel ``SO_SNDBUF`` (256
+MiB by default) absorbs the per-cube fragment burst.
+
+The legacy in-Python per-``dm_idx`` token-bucket pacer is preserved
+under ``bypass_pacer=False`` for tests and for any caller that wants
+application-level rate-shaping; this path was found to over-aggressively
+drop the bursty output of ``corr_fast_integration`` at the M7.2 op-point
+and is no longer the default. The chunk-8 path is preserved for the M3
+loopback bench.
 """
 
 from __future__ import annotations
@@ -138,7 +154,43 @@ class TransportTxProdConfig:
             paths ``/mon/corr/<corr_idx>/transport/*``.
         bucket_fifo_depth: maximum number of pending fragments in each
             per-dm_idx FIFO queue. Drop-oldest semantics when full
-            (plan §4.3 line 1447).
+            (plan §4.3 line 1447). **Ignored when ``bypass_pacer=True``
+            (the default).**
+        bypass_pacer: when ``True`` (default, M7.2 amend 2026-05-19), the
+            production path bypasses the in-Python ``_TokenBucket`` pacer
+            entirely and emits each fragment via raw ``sock.sendto`` in
+            the producer-loop tick. This matches the M4b
+            (``bench/net_pair.py``) and 16×4 corner-turn TX pattern that
+            was validated at up to **1.752 Gb/s on a single (corr,
+            search) pair** with **0 tx_dropped_payloads on 64/64 pairs**
+            (see ``m4b-deploy/M4B-PAIR-REPORT.md`` and
+            ``m4b-deploy/CORNER-TURN-REPORT.md``).
+
+            Rationale: the bucket's ``bucket_fifo_depth=4`` is sized for
+            smooth feeds; ``corr_fast_integration`` instead emits a
+            burst of N_FAST_VIS × N_FRAGS fragments per cube (~256
+            fragments for the M7.2 op-point) inside a ~30 ms encode
+            window followed by a 100 ms idle, which over-runs the FIFO
+            and drop-oldest's most of every cube's frags before they
+            reach the wire. M4b/corner-turn proved the kernel
+            ``SO_SNDBUF`` + 100 GbE wire absorb the burst cleanly when
+            ``sendto`` is called directly; the only "real" wire drop
+            signal we then need is ``sendto`` returning ``OSError``
+            (kernel ``ENOBUFS``), which the bypass path counts as
+            :attr:`TransportTx.tx_wire_drops`.
+
+            Set to ``False`` to preserve the legacy in-Python pacer
+            behaviour (used by tests in ``tests/transport/test_tx_prod.py``
+            that exercise the bucket semantics directly).
+        sndbuf_mib: size of the UDP socket send buffer
+            (``SO_SNDBUF`` MiB). Default 256 MiB matches
+            ``bench/net_pair.py`` (which used 256 MiB at the M4b core
+            DoD). Large enough to absorb a per-cube fragment burst at
+            the M7.2 op-point (a few MiB) plus generous head-room for
+            the M7.3 4×W workers per corr scaling. The kernel clamps
+            this to ``net.core.wmem_max`` (256 MiB on the production
+            fleet per ``tools/ops/sysctl.sh``), so larger values are
+            silently clamped — they don't raise.
     """
 
     target_gbps_per_flow: float
@@ -148,6 +200,19 @@ class TransportTxProdConfig:
     bits_per_cell: int = BITS_CINT8_COMPLEX
     corr_idx: int = 0
     bucket_fifo_depth: int = 4
+    dm_idx_offset: int = 0
+    bypass_pacer: bool = True
+    sndbuf_mib: int = 256
+    """M7.2 DM-axis global-index shim: added to the LOCAL ``dm_idx`` (the
+    cube-DM axis index inside the per-worker slice handed to
+    ``transmit``) before writing the frame header. Use 0 when ``transmit``
+    receives the full N_DM cube (single-worker / direct path). Use
+    ``dm_lo_global`` (the global coarse-DM index of the worker's DM[0])
+    when this TX instance only handles a SLICE of the cube — the search
+    side then reads ``frame.dm_idx`` directly as the global coarse-DM
+    index without needing port-based disambiguation. The per-flow seq
+    counters and token buckets ALSO key by the global dm_idx so each
+    global coarse-DM gets its own ordering / pacing channel."""
 
     def __post_init__(self) -> None:
         if self.target_gbps_per_flow < 0.0:
@@ -360,14 +425,21 @@ class TransportTx:
         self.prod_config: TransportTxProdConfig | None = prod_config
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Loopback / single-host: large enough sndbuf to absorb a burst
-        # of cubes without `sendto` returning EAGAIN.
+        # SO_SNDBUF sizing: prod-frame path takes the explicit
+        # ``prod_config.sndbuf_mib`` (default 256 MiB — matches
+        # ``bench/net_pair.py`` at the M4b core DoD). Chunk-8 path
+        # keeps the legacy 8 MiB default (loopback bench only).
+        sndbuf_bytes = (
+            int(prod_config.sndbuf_mib) * 1024 * 1024
+            if (use_prod_frame and prod_config is not None)
+            else 8 * 1024 * 1024
+        )
         try:
             self._sock.setsockopt(
-                socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024,
+                socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf_bytes,
             )
         except OSError:
-            LOG.warning("could not raise SO_SNDBUF; loopback bursts may EAGAIN")
+            LOG.warning("could not raise SO_SNDBUF; bursts may EAGAIN")
 
         self._addr = (self.host, self.port)
         # Chunk-8 seq counter (single per-TX counter):
@@ -389,9 +461,30 @@ class TransportTx:
 
         # M4a mon-key counters (in-process; drained by tools.mon_key_emitter)
         # /mon/corr/<n>/transport/tx_dropped_payloads
+        #
+        # SEMANTIC NOTE (M7.2 amend, 2026-05-19): this counter is
+        # incremented every time _TokenBucket.try_send() returns False —
+        # which fires for BOTH "fragment queued in FIFO for next refill"
+        # AND "FIFO full, oldest popped". Most increments in normal
+        # production are queue-events (fragment held briefly, then
+        # flushed on the next refill tick) — NOT on-wire losses. The
+        # TRUE on-wire drop counter is :attr:`tx_wire_drops` (sum of
+        # per-flow ``_TokenBucket.drop_count``), which only counts the
+        # FIFO-full pops. Operators monitoring delivery health should
+        # watch ``tx_wire_drops`` (true loss) rather than this counter
+        # (which conflates queue jitter with loss).
         self.tx_dropped_payloads: int = 0
         # /mon/corr/<n>/transport/cube_seq_emitted (last emitted seq)
         self.cube_seq_emitted: int = 0
+        # /mon/corr/<n>/transport/wire_send_fail_count — raw-sendto
+        # failure counter used by the M7.2-amend bypass-pacer path
+        # (``TransportTxProdConfig.bypass_pacer=True``). Each kernel
+        # ``ENOBUFS`` / ``EAGAIN`` from ``sock.sendto`` increments this
+        # by 1 fragment. It is exposed through :attr:`tx_wire_drops`
+        # alongside the legacy bucket drop_count, so a single mon-key
+        # name reports true on-wire loss regardless of which TX path
+        # the worker is running.
+        self._wire_send_fail_count: int = 0
 
     # ---- Public API ------------------------------------------------------
 
@@ -412,6 +505,36 @@ class TransportTx:
         """Next seq number that :meth:`transmit` would emit (chunk-8 path).
         Tests introspect this to verify monotonicity across calls."""
         return self._seq
+
+    @property
+    def tx_wire_drops(self) -> int:
+        """Total TRUE on-wire fragment drops across both prod-frame TX
+        paths.
+
+        - **Bypass-pacer path** (``TransportTxProdConfig.bypass_pacer=True``,
+          the default): wire drops are kernel ``sendto`` failures
+          (``ENOBUFS`` etc.). Each failure increments
+          :attr:`_wire_send_fail_count` by 1 fragment. This matches the
+          M4b ``bench/net_pair.py`` semantics — fragments that the
+          kernel could not accept onto the wire.
+        - **Legacy bucket path** (``bypass_pacer=False``): wire drops are
+          bucket-FIFO pops, which only happen when a bucket's FIFO is
+          full (>= ``bucket_fifo_depth``) AND a new fragment arrives
+          while the bucket is exhausted — the oldest queued fragment is
+          popped without being sent (``_TokenBucket._fifo.popleft()``).
+
+        This is distinct from :attr:`tx_dropped_payloads`, which counts
+        whole payloads that experienced ANY fragment drop in this cube
+        (and, in the legacy bucket path, also fires for fragments that
+        were merely queued for the next refill tick).
+
+        Use this counter (NOT ``tx_dropped_payloads``) to monitor real
+        UDP delivery loss in production.
+        """
+        return int(
+            self._wire_send_fail_count
+            + sum(b.drop_count for b in self._bucket_by_flow.values())
+        )
 
     def reset_seq(self, *, to: int = 0) -> None:
         """Force-set the chunk-8 seq counter. Used by tests to inject seq
@@ -452,6 +575,7 @@ class TransportTx:
         # lifecycle: stats reset on service restart / re-prepare).
         self.tx_dropped_payloads = 0
         self.cube_seq_emitted = 0
+        self._wire_send_fail_count = 0
 
     # ---- Stage Protocol --------------------------------------------------
 
@@ -824,19 +948,45 @@ class TransportTx:
             base_flags |= FLAG_QUANTIZED
 
         n_frags_sent = 0
+        dm_offset = int(cfg.dm_idx_offset)  # M7.2 global-index shim
+        bypass_pacer = bool(cfg.bypass_pacer)
+        # Bind hot-path locals to avoid attribute lookups per fragment.
+        sock = self._sock
+        addr = self._addr
 
-        for dm_idx in range(n_dm):
-            bucket = self._get_bucket(dm_idx)
-            # Allocate seq before we know if any fragment will be sent;
-            # seq advances even if all fragments are dropped (per plan
-            # §4.3 line 1421 monotone contract — the receiver uses seq
-            # gaps for drop accounting, not for replay).
-            seq = self._next_seq(dm_idx)
+        for dm_idx_local in range(n_dm):
+            # M7.2: shift LOCAL dm-axis index to GLOBAL coarse-DM index
+            # for the frame header AND for the per-flow seq + token
+            # bucket keys. Default (dm_idx_offset == 0) is a no-op for
+            # single-worker / direct callers.
+            dm_idx = dm_idx_local + dm_offset
+            # Lazily create bucket only when the legacy pacer path is
+            # in use; bypass-pacer mode never touches _bucket_by_flow.
+            bucket = None if bypass_pacer else self._get_bucket(dm_idx)
             payload_dropped = False
+            seq = 0  # set inside the t_idx loop; tracked here for cube_seq_emitted
 
             for t_idx in range(n_fv):
+                # M7.2-amend (2026-05-20): allocate ONE wire seq PER
+                # (cube, dm, t_idx) so the consumer-side RX ring's
+                # ``write_seq_per_corr`` advances at the same cadence
+                # as the ring slot it indexes (one (corr, dm, t) slot
+                # per wire seq). Previously this was hoisted OUT of the
+                # t_idx loop, so all n_fast_vis (= 128 at the prod
+                # op-point) payloads of a (cube, dm) collapsed to a
+                # single seq and ALL clobbered the same ring slot —
+                # only the last t_idx sample survived, and
+                # ``ProductionRxRingSource._iter`` saw wseq advance at
+                # the per-cube rate (2 / cube) instead of the per-
+                # sample rate (256 / cube at n_fv=128 × 2 dms),
+                # under-counting by 128× and forcing ~13 s waits
+                # between emitted cubes. Allocating per-t_idx is the
+                # only correct mapping for the existing RX ring slot
+                # geometry (one slot = one (corr, dm, sample)).
+                seq = self._next_seq(dm_idx)
+
                 slice_np = (
-                    cube_cpu[dm_idx, t_idx]
+                    cube_cpu[dm_idx_local, t_idx]
                     .numpy()
                     .astype(np.complex64, copy=False)
                 )                                                        # (N_filled,) complex64
@@ -888,14 +1038,38 @@ class TransportTx:
                     )
                     wire = pack_frame(hdr, frag)
 
-                    if bucket.try_send(wire, self._sock, self._addr):
-                        n_frags_sent += 1
+                    if bypass_pacer:
+                        # M7.2-amend (2026-05-19): raw paced sendto,
+                        # matching ``bench/net_pair.py`` and the 16×4
+                        # corner-turn TX pattern. The kernel SO_SNDBUF
+                        # (sized via prod_config.sndbuf_mib) absorbs
+                        # the in-cube fragment burst; the wire drains
+                        # it at line rate. We never block the producer
+                        # (UDP, fire-and-forget per plan §4.3 "drop
+                        # oldest, don't block") — ``sendto`` returning
+                        # ``OSError`` (kernel ``ENOBUFS`` etc.) is the
+                        # only true wire-drop signal and increments
+                        # _wire_send_fail_count.
+                        try:
+                            sock.sendto(wire, addr)
+                            n_frags_sent += 1
+                        except OSError:
+                            self._wire_send_fail_count += 1
+                            if not payload_dropped:
+                                payload_dropped = True
+                                self.tx_dropped_payloads += 1
                     else:
-                        # Pacer dropped (or queued for later); count
-                        # the PAYLOAD (not fragment) as dropped once.
-                        if not payload_dropped:
-                            payload_dropped = True
-                            self.tx_dropped_payloads += 1
+                        # Legacy in-Python pacer path (preserved for
+                        # tests and for any caller that explicitly opts
+                        # in via TransportTxProdConfig(bypass_pacer=False)).
+                        if bucket.try_send(wire, sock, addr):
+                            n_frags_sent += 1
+                        else:
+                            # Pacer dropped (or queued for later); count
+                            # the PAYLOAD (not fragment) as dropped once.
+                            if not payload_dropped:
+                                payload_dropped = True
+                                self.tx_dropped_payloads += 1
 
             # Update cube_seq_emitted mon-key with last seq for this
             # dm_idx. The mon-key tracks the highest seq emitted.

@@ -148,6 +148,12 @@ class ProductionRxRingSource:
         max_cubes: Optional[int] = None,
         fan_in_min_corrs: int = 1,
         attach_timeout_s: float = 30.0,
+        n_active_dms_per_corr: int = 1,
+        # M7.4 scatter wiring (all optional — when omitted the source
+        # falls back to the M7.2 zero-stub cint8 stack path):
+        owned_coarse_dm: int | None = None,
+        linear_lut_per_corr: np.ndarray | None = None,
+        n_filled_per_corr: np.ndarray | None = None,
     ) -> None:
         if n_fdm_in_cube <= 0:
             raise ValueError(f"n_fdm_in_cube={n_fdm_in_cube}, expected > 0")
@@ -164,6 +170,11 @@ class ProductionRxRingSource:
                 f"fan_in_min_corrs={fan_in_min_corrs} not in "
                 f"[1, {ring_dims.n_corr}]"
             )
+        if not 1 <= n_active_dms_per_corr <= ring_dims.n_coarse_dm:
+            raise ValueError(
+                f"n_active_dms_per_corr={n_active_dms_per_corr} not in "
+                f"[1, {ring_dims.n_coarse_dm}]"
+            )
 
         self._shm_name = shm_name
         self._ring_dims = ring_dims
@@ -176,6 +187,7 @@ class ProductionRxRingSource:
         self._max_cubes = max_cubes
         self._enable_cuda_register = bool(enable_cuda_register)
         self._fan_in_min_corrs = int(fan_in_min_corrs)
+        self._n_active_dms_per_corr = int(n_active_dms_per_corr)
         self._attach_timeout_s = float(attach_timeout_s)
 
         self._time_shift_table = compute_time_shift_search(
@@ -225,13 +237,156 @@ class ProductionRxRingSource:
             self._time_shift_table.shifts.max(initial=0)
         )
         self._n_grid_cached = self._n_grid_override
+        # M7.2-amend (2026-05-20): emit a pre-built ZERO cint8 stack
+        # ----------------------------------------------------------
+        # Before this amend the assembler shipped 16 dense complex64
+        # zero streams (~1.6 GiB) and the CubePipeline ``_stage_h2d``
+        # path round-tripped them through ``quantise_per_chgroup_into
+        # _cint8`` every cube. ``py-spy`` (n01, 16x1 fleet, 2026-05-20)
+        # showed that single function dominating the search-compute
+        # main thread: ~3.5 s of wall per cube on the 16x1 op-point,
+        # which collapsed cube throughput to ~0.06 cubes/s (target
+        # 7.45 cubes/s). The CPU quantise is wasted work because (a)
+        # the input is all zeros (M4a M7.4 scatter is deferred), and
+        # (b) the production wire layout IS cint8 already — so the
+        # eventual M7.4 path doesn't quantise on the search node
+        # either. Shipping a pre-built zero cint8 stack short-
+        # circuits the quantise entirely AND matches the M7.4 wire
+        # layout we'll land. We keep ``per_chgroup_streams`` as a
+        # tiny single-key stub (its only consumer in ``_stage_h2d``
+        # reads ``next(iter(...)).shape[0]`` to recover ``T_stream``)
+        # so the CPU-fallback dense-stack path still has a sane
+        # shape descriptor when run by tests.
+        n_corr = self._ring_dims.n_corr
+        self._per_chgroup_cint8_stack_zero: np.ndarray = np.zeros(
+            (n_corr, self._t_stream, 2,
+             self._n_grid_cached, self._n_grid_cached),
+            dtype=np.int8,
+        )
+        # Unit calibration: scale=1, offset=0 → the imager's dequant-
+        # combine kernel reads ``scale * cint8 + offset`` and returns
+        # zero contributions, matching what the legacy CPU-quantise
+        # path produced on the same zero input.
+        self._per_chgroup_scale_unit: np.ndarray = np.ones(
+            (n_corr,), dtype=np.float32,
+        )
+        self._per_chgroup_offset_zero: np.ndarray = np.zeros(
+            (n_corr,), dtype=np.float32,
+        )
+        # Legacy cf-streams field — kept for (a) the
+        # ``_stage_h2d`` ``T_stream`` lookup which calls ``next(iter
+        # (...)).shape[0]`` and (b) the existing N_CORR-key contract
+        # exercised by ``tests/transport/test_production_rx_ring_
+        # phaseb.py``. We point all 16 keys at the SAME zero buffer
+        # so the working-set is one ``[T_stream, N_grid, N_grid]
+        # cf32`` page (~100 MiB) rather than 16x that. The GPU
+        # branch in ``_stage_h2d`` ignores the streams dict entirely
+        # once ``per_chgroup_cint8_stack`` is present.
+        _cf_stub = np.zeros(
+            (self._t_stream, self._n_grid_cached, self._n_grid_cached),
+            dtype=np.complex64,
+        )
         self._per_chgroup_streams_zero: dict[int, np.ndarray] = {
-            corr: np.zeros(
-                (self._t_stream, self._n_grid_cached, self._n_grid_cached),
-                dtype=np.complex64,
-            )
-            for corr in range(self._ring_dims.n_corr)
+            corr: _cf_stub for corr in range(n_corr)
         }
+
+        # M7.4 scatter wiring
+        # -------------------
+        # When ``linear_lut_per_corr`` + ``owned_coarse_dm`` are provided,
+        # ``_assemble_cube`` switches from the M7.2 zero-stub path to the
+        # ``rx_ring_assemble_dense_block`` C helper that scatters real
+        # COO cint8 payloads from ring slots into the dense
+        # ``[N_corr, T_det, 2, N_grid, N_grid]`` plane via the per-corr
+        # LUT. Per-(corr, t) scale + offset sidecars are captured into
+        # ``[N_corr, T_det]`` f32 arrays for the GPU dequant kernel
+        # (``fused_dequant_combine_per_fdm_per_t``).
+        #
+        # The LUT is keyed by ``corr_idx`` (which == ``chgroup_idx`` in
+        # the production fan-out): ``linear_lut_per_corr[c, k]`` is the
+        # flat ``ix_row[k] * n_grid + ix_col[k]`` target into the
+        # ``[n_grid, n_grid]`` dense plane, where ``ix_row/ix_col`` come
+        # from ``SparsityPattern.build_pattern(chgroup=c, ...)`` on the
+        # search side. The corr-side gridder generates COO cells in the
+        # SAME sorted order (see ``FastVisGridder.from_pattern``), so
+        # entry ``k`` of the wire payload scatters to ``lut[c, k]``.
+        self._owned_coarse_dm: int | None = (
+            int(owned_coarse_dm) if owned_coarse_dm is not None else None
+        )
+        self._scatter_enabled: bool = (
+            self._owned_coarse_dm is not None
+            and linear_lut_per_corr is not None
+            and n_filled_per_corr is not None
+        )
+        self._linear_lut: np.ndarray | None = None
+        self._n_filled_per_corr: np.ndarray | None = None
+        # Pre-allocated scatter output buffers (one set; reused every
+        # cube to avoid per-cube allocations on the search hot path).
+        # The dense cint8 stack is sized ``[N_corr, T_det, 2, N, N]``
+        # — for T_det=192, N_corr=16, N_grid=256 → ~150 MiB. We deliberately
+        # size at T_det rather than T_stream because the search-overlap
+        # wait gate (target_seq = (... + t_det) × n_active_dms_per_corr)
+        # only guarantees committed slots over [specnum_start,
+        # specnum_start + t_det) — the additional lookahead samples for
+        # positive fine-DM shifts beyond t_det are NOT guaranteed
+        # in-ring yet, so we don't scatter them. The downstream GPU
+        # kernel sees zeros in those rows, matching the M7.2 stub.
+        self._scatter_cint8_buf: np.ndarray | None = None
+        self._scatter_scale_buf: np.ndarray | None = None
+        self._scatter_offre_buf: np.ndarray | None = None
+        self._scatter_offim_buf: np.ndarray | None = None
+        self._scatter_validity_buf: np.ndarray | None = None
+
+        if self._scatter_enabled:
+            if not 0 <= self._owned_coarse_dm < self._ring_dims.n_coarse_dm:
+                raise ValueError(
+                    f"owned_coarse_dm={self._owned_coarse_dm} not in "
+                    f"[0, {self._ring_dims.n_coarse_dm})"
+                )
+            self._linear_lut = np.ascontiguousarray(
+                linear_lut_per_corr, dtype=np.int32
+            )
+            if self._linear_lut.ndim != 2 or self._linear_lut.shape[0] != n_corr:
+                raise ValueError(
+                    f"linear_lut_per_corr.shape={self._linear_lut.shape}; "
+                    f"expected ({n_corr}, lut_stride)"
+                )
+            self._n_filled_per_corr = np.ascontiguousarray(
+                n_filled_per_corr, dtype=np.int32
+            )
+            if self._n_filled_per_corr.shape != (n_corr,):
+                raise ValueError(
+                    f"n_filled_per_corr.shape="
+                    f"{self._n_filled_per_corr.shape}; expected ({n_corr},)"
+                )
+            # NOTE: we use T_STREAM-sized cint8 buffers (not T_det) so the
+            # GPU dequant kernel can index lookahead samples without going
+            # out of bounds. The scatter ONLY fills [0, t_det) rows; rows
+            # [t_det, T_stream) stay zero (their wire slots may not yet
+            # be committed when the cube is emitted — see comment above).
+            self._scatter_cint8_buf = np.zeros(
+                (n_corr, self._t_stream, 2,
+                 self._n_grid_cached, self._n_grid_cached),
+                dtype=np.int8,
+            )
+            self._scatter_scale_buf = np.zeros(
+                (n_corr, self._t_stream), dtype=np.float32,
+            )
+            self._scatter_offre_buf = np.zeros(
+                (n_corr, self._t_stream), dtype=np.float32,
+            )
+            self._scatter_offim_buf = np.zeros(
+                (n_corr, self._t_stream), dtype=np.float32,
+            )
+            self._scatter_validity_buf = np.zeros(
+                (self._t_det,), dtype=np.uint8,
+            )
+            LOG.info(
+                "M7.4 scatter enabled: owned_coarse_dm=%d, "
+                "n_filled_per_corr=%s, lut_stride=%d",
+                self._owned_coarse_dm,
+                self._n_filled_per_corr.tolist(),
+                int(self._linear_lut.shape[1]),
+            )
 
     @property
     def time_shift_table(self) -> TimeShiftSearchTable:
@@ -425,7 +580,31 @@ class ProductionRxRingSource:
                 self._ring.get_write_seq(corr)
                 for corr in range(self._ring_dims.n_corr)
             ]
-            target_seq = last_cube_seq_boundary + self._cube_cadence_samples
+            # Search-overlap geometry: the cube boundary advances by
+            # ``cube_cadence_samples`` between emits but each cube's
+            # detector window is ``t_det`` samples wide. Wait until at
+            # least ``fan_in_min_corrs`` corrs have written the full
+            # detector window (last_cube_seq_boundary + t_det) so the
+            # per-t validity walk sees all in-window slots — overlap
+            # rows [cube_cadence, t_det) included.
+            #
+            # M7.2-amend (2026-05-20): the C-side
+            # ``write_seq_per_corr[corr]`` counter advances by ONE per
+            # ``rx_ring_write_slot`` call — i.e. it sums across all
+            # active dms (1 increment per (corr, dm, sample) slot
+            # written). To wait until SAMPLES up through
+            # ``last + t_det`` are present in every active (corr, dm)
+            # plane, we scale the target by ``n_active_dms_per_corr``
+            # (the number of dms the producer ships per cube, e.g. 2
+            # for ``coarse_dm_mask=0x03``). Without this scale the
+            # waiter under-waits by ``n_active_dms_per_corr ×`` and
+            # emits cubes whose detector-window slots have not yet
+            # arrived (their validity bytes remain zero → "no data
+            # present"), which collapses detection sensitivity.
+            target_seq = (
+                (last_cube_seq_boundary + self._t_det)
+                * self._n_active_dms_per_corr
+            )
             n_at_target = sum(1 for w in wseqs if w >= target_seq)
             if n_at_target < self._fan_in_min_corrs:
                 await asyncio.sleep(self._poll_interval_s)
@@ -494,53 +673,139 @@ class ProductionRxRingSource:
         n_coarse_dm = self._ring_dims.n_coarse_dm
         n_grid = self.n_grid
 
-        validity_mask = np.ones(
-            (self._t_det, self._n_fdm_in_cube), dtype=np.bool_
-        )
+        # M7.4 fast path
+        # --------------
+        # When scatter is wired (an LUT was provided at __init__), do
+        # the dense-scatter walk in one C call: it captures the per-(corr,
+        # t) validity AND scatters the COO cint8 payload into the
+        # pre-allocated dense buffer AND records per-(corr, t) scale /
+        # offset sidecars. Cost: ~3-5 ms per cube vs. ~50 μs for the
+        # validity-only walk; the difference buys us real per-cube
+        # dequant data instead of zeros.
+        if self._scatter_enabled:
+            assert self._linear_lut is not None
+            assert self._n_filled_per_corr is not None
+            assert self._scatter_cint8_buf is not None
+            assert self._scatter_scale_buf is not None
+            assert self._scatter_offre_buf is not None
+            assert self._scatter_offim_buf is not None
+            assert self._scatter_validity_buf is not None
+            assert self._owned_coarse_dm is not None
 
-        for corr in range(n_corr):
-            # Read every (coarse_dm, t) slot the cube depends on. This
-            # is real ring bandwidth — slot size = n_filled × bpc bytes
-            # (e.g. 5000 × 2 = 10 KiB at the default op-point), so per
-            # cube we move n_corr × n_coarse_dm × cube_cadence × 10 KiB
-            # bytes through ``rx_ring_read_slot``. At
-            # 7.45 cubes/s × 16 × 5 × 256 × 10 KiB ≈ 1.5 GB/s of memcpy
-            # — well within the host's L3/RAM bandwidth on n01/n06.
-            for dm in range(n_coarse_dm):
-                for t in range(self._cube_cadence_samples):
-                    t_abs = specnum_start + t
-                    self._n_slots_read += 1
-                    try:
-                        _payload, vf = self._ring.read_slot(
-                            corr=corr,
-                            dm=dm,
-                            t_seq=t_abs,
-                            compute_half=self._compute_half,
-                        )
-                    except OSError:
-                        # rx_ring_read_slot returned -1 with VF_RX_OVERRUN
-                        # (writer lapped us by more than T_buf samples).
-                        self._n_overrun += 1
-                        if t < self._t_det:
-                            validity_mask[t, :] = False
-                        continue
-                    if vf & VF_RX_OVERRUN:
-                        self._n_overrun += 1
-                        if t < self._t_det:
-                            validity_mask[t, :] = False
-                        continue
-                    if vf & VF_PATTERN_MISMATCH:
-                        self._n_pattern_mismatch += 1
-                        if t < self._t_det:
-                            validity_mask[t, :] = False
-                        continue
-                    if not (vf & VF_DATA_PRESENT):
-                        # Hole (e.g. window-slide zerofill from
-                        # recv_epoll). The slot wrote but with
-                        # validity=0; counts as "no data this t".
-                        self._n_no_data_present += 1
-                        if t < self._t_det:
-                            validity_mask[t, :] = False
+            # M7.4: the scatter helper takes ``out_t_stride=T_stream``
+            # so it knows the corr-axis stride of the dense buffer is
+            # ``T_stream * 2 * N_grid^2`` even though only rows
+            # ``[0, t_det)`` are actually written. Rows [t_det, T_stream)
+            # are left untouched — the GPU dequant kernel sees them as
+            # zero (cold start; previous cubes also only fill [0, t_det)
+            # AND we ``fill(0)`` the buffer at the top of every cube
+            # except the cold start to clear any carry-over from the
+            # previous cube's [0, t_det) writes).
+            if cube_id > 0:
+                # The C helper re-zeros rows [0, t_det) on every call,
+                # but the LOOKAHEAD tail [t_det, T_stream) from the
+                # previous cube may still hold stale data. Clear it.
+                # (At T_stream≈t_det+max_shift the tail is small, so
+                # this is sub-millisecond.)
+                if self._t_stream > self._t_det:
+                    self._scatter_cint8_buf[:, self._t_det:].fill(0)
+                    self._scatter_scale_buf[:, self._t_det:].fill(0)
+                    self._scatter_offre_buf[:, self._t_det:].fill(0)
+                    self._scatter_offim_buf[:, self._t_det:].fill(0)
+
+            (
+                _cint8_out, _scale_out, _offre_out, _offim_out,
+                valid_per_t, dn_over, dn_pat, dn_nodp,
+            ) = self._ring.assemble_dense_block(
+                specnum_start=int(specnum_start),
+                t_det=int(self._t_det),
+                n_grid=int(n_grid),
+                owned_dm=int(self._owned_coarse_dm),
+                n_filled_per_corr=self._n_filled_per_corr,
+                linear_lut_strided=self._linear_lut,
+                compute_half=int(self._compute_half),
+                out_t_stride=int(self._t_stream),
+                out_cint8=self._scatter_cint8_buf,
+                out_scale=self._scatter_scale_buf,
+                out_offset_re=self._scatter_offre_buf,
+                out_offset_im=self._scatter_offim_buf,
+                out_validity=self._scatter_validity_buf,
+            )
+            self._n_slots_read += n_corr * self._t_det
+            self._n_overrun += dn_over
+            self._n_pattern_mismatch += dn_pat
+            self._n_no_data_present += dn_nodp
+
+            validity_mask = np.broadcast_to(
+                valid_per_t[:, None], (self._t_det, self._n_fdm_in_cube)
+            ).copy()
+
+            return CubeRingSlot(
+                cube_id=cube_id,
+                specnum_start=specnum_start,
+                per_chgroup_streams=self._per_chgroup_streams_zero,
+                time_shift_table=self._time_shift_table,
+                validity_mask=validity_mask,
+                n_fdm_in_cube=self._n_fdm_in_cube,
+                t_det=self._t_det,
+                n_grid=n_grid,
+                per_chgroup_cint8_stack=self._scatter_cint8_buf,
+                # M7.4: per-(corr, t) scale + offset sidecars. The
+                # GPU pipeline detects these via the new
+                # ``per_chgroup_scale_per_t`` field on CubeRingSlot
+                # and dispatches to ``fused_dequant_combine_per_fdm_per_t``;
+                # if not present it falls back to per-chgroup scale.
+                per_chgroup_scale=None,
+                per_chgroup_offset_re=None,
+                per_chgroup_offset_im=None,
+                per_chgroup_scale_per_t=self._scatter_scale_buf,
+                per_chgroup_offset_re_per_t=self._scatter_offre_buf,
+                per_chgroup_offset_im_per_t=self._scatter_offim_buf,
+            )
+
+        # M7.2 zero-stub path (no scatter wired):
+        # --------------------------------------
+        # Batched C walk over the (n_corr × n_coarse_dm × t_det) vf bytes
+        # via the rx_ring_assemble_validity_block entry point added in
+        # recv_ring.c. The pre-M7.2.9 Python loop did ~16K Python-level
+        # ctypes round-trips per cube — observed 0.12 cubes/s on n01 vs.
+        # the 7.45 cubes/s production target. The new path is ~50 μs per
+        # cube (16K atomic acquire-loads). Fallback to the Python loop
+        # ONLY if the C extension was built against an older recv_ring.c
+        # that does not export the symbol.
+        try:
+            valid_per_t, dn_over, dn_pat, dn_nodp = (
+                self._ring.assemble_validity_block(
+                    specnum_start=int(specnum_start),
+                    cube_cadence_samples=int(self._cube_cadence_samples),
+                    t_det=int(self._t_det),
+                    compute_half=int(self._compute_half),
+                    coarse_dm_mask=(1 << n_coarse_dm) - 1,
+                )
+            )
+            self._n_slots_read += (
+                n_corr * n_coarse_dm * self._t_det
+            )
+            self._n_overrun += dn_over
+            self._n_pattern_mismatch += dn_pat
+            self._n_no_data_present += dn_nodp
+
+            validity_mask = np.broadcast_to(
+                valid_per_t[:, None], (self._t_det, self._n_fdm_in_cube)
+            ).copy()
+        except NotImplementedError:
+            if not getattr(self, "_warned_stale_so", False):
+                LOG.warning(
+                    "ProductionRxRingSource: _recv_ring.so is stale "
+                    "(missing rx_ring_assemble_validity_block); "
+                    "falling back to per-slot Python loop. Rebuild "
+                    "with `python setup.py build_ext --inplace` to "
+                    "get the M7.2.9 ~60x assembly speedup."
+                )
+                self._warned_stale_so = True
+            validity_mask = self._assemble_validity_python_fallback(
+                specnum_start=specnum_start
+            )
 
         return CubeRingSlot(
             cube_id=cube_id,
@@ -551,7 +816,61 @@ class ProductionRxRingSource:
             n_fdm_in_cube=self._n_fdm_in_cube,
             t_det=self._t_det,
             n_grid=n_grid,
+            per_chgroup_cint8_stack=self._per_chgroup_cint8_stack_zero,
+            per_chgroup_scale=self._per_chgroup_scale_unit,
+            per_chgroup_offset_re=self._per_chgroup_offset_zero,
+            per_chgroup_offset_im=self._per_chgroup_offset_zero,
         )
+
+    def _assemble_validity_python_fallback(
+        self,
+        *,
+        specnum_start: int,
+    ) -> np.ndarray:
+        """Per-slot Python loop kept for hosts with a stale recv_ring.so.
+
+        Identical semantics to the pre-M7.2.9 hot path; only used if
+        the batched C helper is missing. Each cube costs ~8 s here vs.
+        ~50 μs in C, so always rebuild the extension after a recv_ring
+        pull.
+        """
+        assert self._ring is not None
+        n_corr = self._ring_dims.n_corr
+        n_coarse_dm = self._ring_dims.n_coarse_dm
+        validity_mask = np.ones(
+            (self._t_det, self._n_fdm_in_cube), dtype=np.bool_
+        )
+        # M7.2 search-overlap geometry: walk the full t_det window, not
+        # just cube_cadence_samples. cube_cadence_samples is the stride
+        # between cube emits; t_det is the detector window per cube.
+        for corr in range(n_corr):
+            for dm in range(n_coarse_dm):
+                for t in range(self._t_det):
+                    t_abs = specnum_start + t
+                    self._n_slots_read += 1
+                    try:
+                        _payload, vf = self._ring.read_slot(
+                            corr=corr,
+                            dm=dm,
+                            t_seq=t_abs,
+                            compute_half=self._compute_half,
+                        )
+                    except OSError:
+                        self._n_overrun += 1
+                        validity_mask[t, :] = False
+                        continue
+                    if vf & VF_RX_OVERRUN:
+                        self._n_overrun += 1
+                        validity_mask[t, :] = False
+                        continue
+                    if vf & VF_PATTERN_MISMATCH:
+                        self._n_pattern_mismatch += 1
+                        validity_mask[t, :] = False
+                        continue
+                    if not (vf & VF_DATA_PRESENT):
+                        self._n_no_data_present += 1
+                        validity_mask[t, :] = False
+        return validity_mask
 
 
 # Protocol conformance: keep the import of RxRingSource for type-checkers

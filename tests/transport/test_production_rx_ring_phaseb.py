@@ -229,8 +229,9 @@ def test_single_cube_round_trip(producer):
         assert stream.shape[2] == N_GRID
         assert stream.shape[0] >= T_DET
         assert stream.dtype == np.complex64
-    # n_slots_read = n_corr × n_coarse_dm × cube_cadence.
-    assert source.stats["n_slots_read"] == N_CORR * N_COARSE_DM * CUBE_CADENCE
+    # M7.2 search-overlap: assemble walks t_det rows per (corr, dm) —
+    # cube_cadence is just the cube-emit stride, not the walk length.
+    assert source.stats["n_slots_read"] == N_CORR * N_COARSE_DM * T_DET
     assert source.stats["n_overrun"] == 0
     assert source.stats["n_pattern_mismatch"] == 0
     assert source.stats["n_no_data_present"] == 0
@@ -295,9 +296,10 @@ def test_two_cubes_yielded_in_order(producer):
     for s in slots:
         assert s.validity_mask.all()
     assert source.stats["cubes_emitted"] == n_cubes_to_send
+    # M7.2 search-overlap: each cube walks t_det rows per (corr, dm).
     assert (
         source.stats["n_slots_read"]
-        == n_cubes_to_send * N_CORR * N_COARSE_DM * CUBE_CADENCE
+        == n_cubes_to_send * N_CORR * N_COARSE_DM * T_DET
     )
 
 

@@ -167,6 +167,7 @@ def run(
     cal_path: Path | None = None,
     cal_mode: str = "phase",
     cal_pol_swap: bool = False,
+    ready_sentinel_path: Path | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA, run the corr loop, return summary stats.
 
@@ -237,6 +238,25 @@ def run(
         # 3. Main loop.
         per_block_ms: list[float] = []
         t_start = time.monotonic()
+
+        # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator
+        # that Python imports + GPU init + kernel construction + cal
+        # tensor load are complete. Triton JIT still fires on the first
+        # kernel call (first block), but that warmup is short (~1 s on
+        # corr_slow's small kernel set) vs. the ~10 s of pre-loop init
+        # we've already done — gating junkdb here cuts the ring fill-up
+        # transient by an order of magnitude.
+        if ready_sentinel_path is not None:
+            try:
+                ready_sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+                ready_sentinel_path.touch()
+                LOG.info("ready sentinel touched: %s", ready_sentinel_path)
+            except OSError as e:
+                LOG.warning(
+                    "failed to touch ready sentinel %s: %s "
+                    "(continuing without gate)",
+                    ready_sentinel_path, e,
+                )
 
         while not state["stop"]:
             # --- READ ---
@@ -381,6 +401,13 @@ def main(argv: list[str] | None = None) -> int:
                         "DSA-110 convention)")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    p.add_argument("--ready-sentinel-path", type=Path, default=None,
+                   help="M7.2: touch this file once Python imports, GPU "
+                        "init, and kernel construction are complete (just "
+                        "before the main loop). The dsart_rt orchestrator "
+                        "gates capture routines (dada_junkdb) on this file "
+                        "so they do not stuff the dada/eada rings during "
+                        "the multi-second cold start of this consumer.")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -414,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
             max_blocks=args.max_blocks,
             cal_path=args.apply_cal,
             cal_mode=args.cal_mode,
-            cal_pol_swap=args.cal_pol_swap)
+            cal_pol_swap=args.cal_pol_swap,
+            ready_sentinel_path=args.ready_sentinel_path)
     except _StopRequested:
         LOG.info("clean stop")
     except KeyboardInterrupt:

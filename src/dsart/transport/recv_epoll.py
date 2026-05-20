@@ -173,6 +173,17 @@ def _bind_signatures(lib: ctypes.CDLL) -> None:
         fn.argtypes = []
         fn.restype = ctypes.c_uint64
 
+    # Per-(corr, dm) flow counters (M7.2 G4 observability).
+    for name in (
+        "ring_slots_written_for",
+        "ring_data_present_for",
+        "ring_pattern_mismatch_for",
+        "ring_zerofill_for",
+    ):
+        fn = getattr(lib, f"recv_epoll_get_{name}")
+        fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        fn.restype = ctypes.c_uint64
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -536,3 +547,26 @@ class RxEpoll:
                 g.recv_epoll_get_ring_write_error_count()
             ),
         )
+
+    def ring_data_present_matrix(
+        self,
+        *,
+        n_corr: int,
+        n_coarse_dm: int,
+    ) -> list[list[int]]:
+        """Return ``[n_corr][n_coarse_dm]`` ring_data_present counters.
+
+        Element ``[corr][dm]`` is the monotone count of slots published
+        with ``VF_DATA_PRESENT`` for that exact (corr=chgroup, coarse-DM)
+        cell since process start.
+        """
+        g = self._lib
+        out: list[list[int]] = []
+        for corr in range(int(n_corr)):
+            row: list[int] = []
+            for dm in range(int(n_coarse_dm)):
+                row.append(
+                    int(g.recv_epoll_get_ring_data_present_for(corr, dm))
+                )
+            out.append(row)
+        return out

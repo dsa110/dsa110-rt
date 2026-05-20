@@ -252,6 +252,14 @@ typedef struct rx_epoll {
     _Atomic uint64_t ring_pattern_mismatch_count; /* validity & VF_PATTERN_MISMATCH */
     _Atomic uint64_t ring_zerofill_slot_count;    /* validity == 0 (hole) */
     _Atomic uint64_t ring_write_error_count;      /* rx_ring_write_slot rc != 0 */
+    /* Per-(corr=chgroup, dm) ingress counters (M7.2 G4 observability):
+     * these let operators distinguish "cell intentionally silent under
+     * current ownership mask" (stays at 0) from "cell should be live but
+     * isn't" (unexpected 0) and from active flows (monotone >0). */
+    _Atomic uint64_t ring_slots_written_by_flow[MAX_CHGROUPS][MAX_DMS];
+    _Atomic uint64_t ring_data_present_by_flow[MAX_CHGROUPS][MAX_DMS];
+    _Atomic uint64_t ring_pattern_mismatch_by_flow[MAX_CHGROUPS][MAX_DMS];
+    _Atomic uint64_t ring_zerofill_by_flow[MAX_CHGROUPS][MAX_DMS];
 
     /* Pre-allocated recvmmsg buffers. */
     struct mmsghdr mmsg[RECV_BATCH];
@@ -302,19 +310,27 @@ static inline size_t concat_fragments(rx_epoll_t *s, slot_t *slot) {
 }
 
 /* Phase B helper: publish a slot to the ring. Caller has already
- * decided ``validity`` and (when payload != NULL) ``payload_bytes``.
- * Updates the appropriate ring_* counters. Safe to call when no ring is
- * attached (returns 0 without doing anything). */
+ * decided ``validity`` and (when payload != NULL) ``payload_bytes``,
+ * ``scale``, ``offset``.
+ *
+ * M7.4 amend (2026-05-20): scale + offset are now part of the
+ * ``rx_ring_write_slot`` (v2 slot layout) call. ``commit_slot`` reads
+ * them from the first-fragment ProdFrame header it stashed in
+ * ``slot->hdr``. ``zerofill_slot`` / pattern-mismatch stubs pass
+ * scale=0.0f, offset=0.0f — the search-side dense-scatter treats zero
+ * scale as "skip" so the dense accumulator stays correct. */
 static inline void ring_publish(rx_epoll_t *s,
                                 uint32_t corr, uint32_t dm,
                                 uint64_t t_seq,
                                 const void *payload, size_t payload_bytes,
+                                float scale, float offset,
                                 uint16_t validity) {
     if (!atomic_load_explicit(&s->ring_attached, memory_order_acquire))
         return;
     if (s->ring == NULL) return;  /* defensive */
     int rc = rx_ring_write_slot(s->ring, corr, dm, t_seq,
-                                payload, payload_bytes, validity);
+                                payload, payload_bytes,
+                                scale, offset, validity);
     if (rc != 0) {
         atomic_fetch_add_explicit(&s->ring_write_error_count, 1,
                                   memory_order_relaxed);
@@ -322,15 +338,41 @@ static inline void ring_publish(rx_epoll_t *s,
     }
     atomic_fetch_add_explicit(&s->ring_slots_written, 1,
                               memory_order_relaxed);
+    if (corr < MAX_CHGROUPS && dm < MAX_DMS) {
+        atomic_fetch_add_explicit(
+            &s->ring_slots_written_by_flow[corr][dm], 1,
+            memory_order_relaxed
+        );
+    }
     if (validity & RX_RING_VF_DATA_PRESENT)
         atomic_fetch_add_explicit(&s->ring_data_present_count, 1,
                                   memory_order_relaxed);
+    if ((validity & RX_RING_VF_DATA_PRESENT)
+        && corr < MAX_CHGROUPS && dm < MAX_DMS) {
+        atomic_fetch_add_explicit(
+            &s->ring_data_present_by_flow[corr][dm], 1,
+            memory_order_relaxed
+        );
+    }
     if (validity & RX_RING_VF_PATTERN_MISMATCH)
         atomic_fetch_add_explicit(&s->ring_pattern_mismatch_count, 1,
                                   memory_order_relaxed);
+    if ((validity & RX_RING_VF_PATTERN_MISMATCH)
+        && corr < MAX_CHGROUPS && dm < MAX_DMS) {
+        atomic_fetch_add_explicit(
+            &s->ring_pattern_mismatch_by_flow[corr][dm], 1,
+            memory_order_relaxed
+        );
+    }
     if (validity == 0)
         atomic_fetch_add_explicit(&s->ring_zerofill_slot_count, 1,
                                   memory_order_relaxed);
+    if (validity == 0 && corr < MAX_CHGROUPS && dm < MAX_DMS) {
+        atomic_fetch_add_explicit(
+            &s->ring_zerofill_by_flow[corr][dm], 1,
+            memory_order_relaxed
+        );
+    }
 }
 
 /* Commit one fully-reassembled payload. Updates n_committed. Publishes
@@ -342,8 +384,20 @@ static inline void commit_slot(rx_epoll_t *s, slot_t *slot, uint32_t corr,
         return;
     /* Phase B: publish reassembled payload to shm ring. */
     size_t payload_bytes = concat_fragments(s, slot);
+    /* M7.4 amend (2026-05-20): forward the per-slot dequant params from
+     * the first-fragment ProdFrame header. The TX side computed them
+     * over filled cells only (tx.py::_compute_scale_offset) so the
+     * search-side scatter can dequantise this slot independent of the
+     * cube-window dynamic range. ``hdr_set`` is true when at least
+     * frag 0 arrived — which is the precondition for `commit_slot`
+     * (we only commit once the bitmap is full, and frag 0 is required
+     * for the bitmap to be valid). Defensive fallback to (0, 0) if
+     * the hdr somehow wasn't set. */
+    float scale  = slot->hdr_set ? slot->hdr.scale  : 0.0f;
+    float offset = slot->hdr_set ? slot->hdr.offset : 0.0f;
     ring_publish(s, corr, dm, slot->seq,
                  s->concat_scratch, payload_bytes,
+                 scale, offset,
                  RX_RING_VF_DATA_PRESENT);
 }
 
@@ -362,7 +416,9 @@ static inline void zerofill_slot(rx_epoll_t *s, uint32_t corr,
     /* Publish a zero-payload slot at the missing seq with validity=0
      * so the consumer's validity_mask drops this t and write_seq keeps
      * advancing. */
-    ring_publish(s, corr, dm, seq, NULL, 0, 0);
+    /* M7.4: zerofill stubs have no dequant info; scale=0 signals "skip"
+     * to the search-side dense scatter. */
+    ring_publish(s, corr, dm, seq, NULL, 0, 0.0f, 0.0f, 0);
 }
 
 static void slot_reset(slot_t *slot) {
@@ -608,8 +664,11 @@ static void drain_one_batch(rx_epoll_t *s, int fd) {
                  * write_seq for this corr keeps advancing instead of
                  * stalling. Mirrors TransportRxProd._make_commit_cb's
                  * pattern-mismatch path: zero payload + VF_PATTERN_MISMATCH. */
+                /* M7.4: pattern-mismatch stubs ship no payload and no
+                 * dequant info; scale=0 ⇒ search-side scatter skips. */
                 ring_publish(s, hdr.chgroup, hdr.dm_idx, hdr.seq,
-                             NULL, 0, RX_RING_VF_PATTERN_MISMATCH);
+                             NULL, 0, 0.0f, 0.0f,
+                             RX_RING_VF_PATTERN_MISMATCH);
                 /* Mark the seq as logically handled in the reorder
                  * window so a later window_slide_to() doesn't republish
                  * a VALIDITY=0 hole on top of our VF_PATTERN_MISMATCH
@@ -888,6 +947,37 @@ COUNTER_GETTER(ring_pattern_mismatch_count)
 COUNTER_GETTER(ring_zerofill_slot_count)
 COUNTER_GETTER(ring_write_error_count)
 #undef COUNTER_GETTER
+
+/* Per-(corr,dm) ingress counters (M7.2 G4 observability).
+ * Return 0 for out-of-range indices or before open/init. */
+uint64_t recv_epoll_get_ring_slots_written_for(uint32_t corr, uint32_t dm) {
+    if (!g_state_init) return 0;
+    if (corr >= MAX_CHGROUPS || dm >= MAX_DMS) return 0;
+    return atomic_load_explicit(
+        &g_state.ring_slots_written_by_flow[corr][dm], memory_order_relaxed
+    );
+}
+uint64_t recv_epoll_get_ring_data_present_for(uint32_t corr, uint32_t dm) {
+    if (!g_state_init) return 0;
+    if (corr >= MAX_CHGROUPS || dm >= MAX_DMS) return 0;
+    return atomic_load_explicit(
+        &g_state.ring_data_present_by_flow[corr][dm], memory_order_relaxed
+    );
+}
+uint64_t recv_epoll_get_ring_pattern_mismatch_for(uint32_t corr, uint32_t dm) {
+    if (!g_state_init) return 0;
+    if (corr >= MAX_CHGROUPS || dm >= MAX_DMS) return 0;
+    return atomic_load_explicit(
+        &g_state.ring_pattern_mismatch_by_flow[corr][dm], memory_order_relaxed
+    );
+}
+uint64_t recv_epoll_get_ring_zerofill_for(uint32_t corr, uint32_t dm) {
+    if (!g_state_init) return 0;
+    if (corr >= MAX_CHGROUPS || dm >= MAX_DMS) return 0;
+    return atomic_load_explicit(
+        &g_state.ring_zerofill_by_flow[corr][dm], memory_order_relaxed
+    );
+}
 
 /* Misc info: how many ports are currently bound. */
 int recv_epoll_get_n_sockets(void) {

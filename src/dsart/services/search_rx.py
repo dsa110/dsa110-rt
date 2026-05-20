@@ -231,6 +231,20 @@ class SearchRxService:
                 d_bytes / dt / 1e6,
                 d_bytes * 8 / dt / 1e9,
             )
+            # M7.2 G4 observability: expose per-(chgroup, coarse-DM)
+            # ingress counters so operators can distinguish
+            # intentionally-empty cells (remain zero under ownership mask)
+            # from unexpected silence in cells that should be active.
+            matrix = self._rx.ring_data_present_matrix(
+                n_corr=self.n_corr,
+                n_coarse_dm=self.n_coarse_dm,
+            )
+            LOG.info(
+                "rx_ingress_by_corr_dm: n_corr=%d n_coarse_dm=%d data_present=%s",
+                self.n_corr,
+                self.n_coarse_dm,
+                matrix,
+            )
             last_received = c.n_received
             last_committed = c.n_committed
             last_ring_writes = c.ring_slots_written

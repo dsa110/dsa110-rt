@@ -45,13 +45,33 @@ def _load_recv_ring_lib() -> ctypes.CDLL:
     """Load ``_recv_ring.so`` (built by setuptools next to this file).
 
     Search order:
-    1. ``_recv_ring.so`` alongside this file (editable install / inplace build).
-    2. Any ``_recv_ring*.so`` found by ``ctypes.util.find_library``.
+    1. ``_recv_ring.cpython-<MAJ><MIN>-*.so`` matching this interpreter's
+       ABI tag (e.g. cpython-311 for Python 3.11). This is the artifact
+       ``python setup.py build_ext --inplace`` writes for the active env.
+    2. Any other ``_recv_ring*.so`` alongside this file (covers
+       undecorated `_recv_ring.so` from editable builds).
     3. Fall back to loading ``librt.so`` and return a stub with a warning.
+
+    Why the ABI-tag filter: hosts that have been through multiple
+    interpreter upgrades (e.g. legacy cpython-38 builds left behind on
+    n01) can end up with two ``_recv_ring*.so`` files in the package
+    directory. The default ``glob`` order is filesystem-dependent and
+    can return the OLD .so first, in which case the loader picks a
+    binary that's out of sync with the current ``recv_ring.c`` symbol
+    set — symptomatically: M7.2.9-era code that calls
+    ``rx_ring_assemble_validity_block`` would silently fall back to
+    the legacy Python loop. Selecting by ABI tag first avoids this.
     """
+    import sys as _sys
+
     here = Path(__file__).parent
-    # Glob for the build artifact (e.g. _recv_ring.cpython-311-x86_64-linux-gnu.so)
-    candidates = list(here.glob("_recv_ring*.so"))
+    abi_tag = f"cpython-{_sys.version_info.major}{_sys.version_info.minor}"
+    abi_matches = sorted(here.glob(f"_recv_ring.{abi_tag}-*.so"))
+    other_matches = [
+        p for p in sorted(here.glob("_recv_ring*.so"))
+        if p not in abi_matches
+    ]
+    candidates = abi_matches + other_matches
     if candidates:
         lib_path = str(candidates[0])
     else:
@@ -111,7 +131,11 @@ def _bind_c_api(lib: ctypes.CDLL) -> None:
     lib.rx_ring_unlink.restype = ctypes.c_int
     lib.rx_ring_unlink.argtypes = [ctypes.c_char_p]
 
-    # rx_ring_write_slot
+    # rx_ring_write_slot — M7.4 v2 signature (adds float scale + offset
+    # before the uint16 validity_flags). The C library exposes ONLY the
+    # v2 symbol after the M7.4 rebuild; older .so builds will fail at
+    # ``RxRing.write_slot`` with a ctypes argtype mismatch (caller-side
+    # stale-build detection).
     lib.rx_ring_write_slot.restype = ctypes.c_int
     lib.rx_ring_write_slot.argtypes = [
         ctypes.c_void_p,   # ring
@@ -120,6 +144,8 @@ def _bind_c_api(lib: ctypes.CDLL) -> None:
         ctypes.c_uint64,   # t_seq
         ctypes.c_void_p,   # payload
         ctypes.c_size_t,   # payload_bytes
+        ctypes.c_float,    # scale (M7.4)
+        ctypes.c_float,    # offset (M7.4)
         ctypes.c_uint16,   # validity_flags
     ]
 
@@ -168,6 +194,56 @@ def _bind_c_api(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_uint64),  # slot_stride_bytes
         ctypes.POINTER(ctypes.c_size_t),  # shm_size
     ]
+
+    # rx_ring_assemble_validity_block (M7.2 hot-path optimisation):
+    # batched walk of (n_corr × popcount(coarse_dm_mask) × cube_cadence)
+    # slot vf bytes; aggregates per-t validity + counters in one C call.
+    # Bound only if the .so was rebuilt against the new recv_ring.c
+    # (older builds will not export this symbol; the wrapper falls back
+    # to a Python loop). Stale-binary detection lives in
+    # ``RxRing.assemble_validity_block`` rather than here so the import
+    # succeeds for older C builds too.
+    if hasattr(lib, "rx_ring_assemble_validity_block"):
+        lib.rx_ring_assemble_validity_block.restype = ctypes.c_int
+        lib.rx_ring_assemble_validity_block.argtypes = [
+            ctypes.c_void_p,                  # ring
+            ctypes.c_uint64,                  # specnum_start
+            ctypes.c_uint32,                  # cube_cadence_samples
+            ctypes.c_uint32,                  # t_det
+            ctypes.c_uint32,                  # compute_half
+            ctypes.c_uint32,                  # coarse_dm_mask
+            ctypes.POINTER(ctypes.c_uint8),   # out_validity_per_t
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_overrun
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_pattern_mismatch
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_no_data_present
+        ]
+
+    # rx_ring_assemble_dense_block (M7.4): batched dense scatter +
+    # per-(corr, t) scale/offset sidecar capture. Optional symbol so
+    # callers with stale .so builds can fall back to the zero-stub
+    # path in ProductionRxRingSource (M7.2 behaviour).
+    if hasattr(lib, "rx_ring_assemble_dense_block"):
+        lib.rx_ring_assemble_dense_block.restype = ctypes.c_int
+        lib.rx_ring_assemble_dense_block.argtypes = [
+            ctypes.c_void_p,                  # ring
+            ctypes.c_uint64,                  # specnum_start
+            ctypes.c_uint32,                  # t_det
+            ctypes.c_uint32,                  # out_t_stride  (≥ t_det)
+            ctypes.c_uint32,                  # n_grid
+            ctypes.c_uint32,                  # owned_dm
+            ctypes.c_uint32,                  # compute_half
+            ctypes.POINTER(ctypes.c_int32),   # n_filled_per_corr [n_corr]
+            ctypes.POINTER(ctypes.c_int32),   # linear_lut_strided [n_corr * lut_stride]
+            ctypes.c_uint32,                  # lut_stride
+            ctypes.POINTER(ctypes.c_int8),    # out_cint8
+            ctypes.POINTER(ctypes.c_float),   # out_scale_per_t [n_corr * out_t_stride]
+            ctypes.POINTER(ctypes.c_float),   # out_offset_re_per_t [n_corr * out_t_stride]
+            ctypes.POINTER(ctypes.c_float),   # out_offset_im_per_t [n_corr * out_t_stride]
+            ctypes.POINTER(ctypes.c_uint8),   # out_validity_per_t [t_det]
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_overrun
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_pattern_mismatch
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_no_data_present
+        ]
 
 
 # Lazy-load; None if the .so is missing (stub mode for tests that mock it).
@@ -375,8 +451,11 @@ class RxRing:
         t_seq: int,
         payload: bytes | np.ndarray | None,
         validity_flags: int,
+        *,
+        scale: float = 0.0,
+        offset: float = 0.0,
     ) -> None:
-        """Write one COO slot to the ring.
+        """Write one COO slot to the ring (M7.4 v2 layout).
 
         Args:
             corr: correlator index (0..n_corr-1).
@@ -384,6 +463,14 @@ class RxRing:
             t_seq: absolute time-sequence number; slot index = t_seq % T_buf.
             payload: raw bytes or numpy array. ``None`` → zero-fill.
             validity_flags: bitmask (see VF_* constants).
+            scale: per-slot dequant multiplicative scale (f32). M7.4 amend;
+                defaults to 0.0 (which the search-side scatter treats as
+                "skip dequant contribution"). Production callers
+                (recv_epoll.c::commit_slot) pass the per-(cube, dm, t_idx)
+                scale from the ProdFrame header.
+            offset: per-slot dequant DC offset (f32). Symmetric cint8 path
+                always emits 0; we ship one offset on the wire and the
+                search-side scatter duplicates into re + im sidecars.
         """
         if self._closed:
             raise RuntimeError("RxRing is closed")
@@ -407,6 +494,8 @@ class RxRing:
             ctypes.c_uint64(t_seq),
             payload_ptr,
             ctypes.c_size_t(payload_bytes),
+            ctypes.c_float(float(scale)),
+            ctypes.c_float(float(offset)),
             ctypes.c_uint16(validity_flags),
         )
         if ret != 0:
@@ -450,6 +539,286 @@ class RxRing:
                 f"rx_ring_read_slot failed (ret={ret}, vf={out_vf.value:#04x})"
             )
         return bytes(out_buf), int(out_vf.value)
+
+    def assemble_validity_block(
+        self,
+        *,
+        specnum_start: int,
+        cube_cadence_samples: int,
+        t_det: int,
+        compute_half: int = 0,
+        coarse_dm_mask: int | None = None,
+    ) -> tuple[np.ndarray, int, int, int]:
+        """Batched validity-walk over a cube's worth of ring slots.
+
+        Replaces the per-cube
+        ``n_corr × popcount(coarse_dm_mask) × cube_cadence_samples``
+        rx_ring_read_slot calls (the M7.2 ProductionRxRingSource hot
+        path) with a single C call. Does NOT memcpy payloads — only the
+        vf bytes are inspected, which is all the M7.2 consumer needs
+        (the bring-up CubePipeline takes its per-chgroup streams from
+        a pre-allocated zero-filled cache; see
+        ``ProductionRxRingSource._per_chgroup_streams_zero``).
+
+        Args:
+            specnum_start: absolute t for slot 0 of the cube's detector
+                window.
+            cube_cadence_samples: stride between cube emits — reserved
+                for future per-cube book-keeping. The walk uses
+                ``t_det`` exclusively.
+            t_det: detector window length (samples walked). The wseq
+                wait in :class:`ProductionRxRingSource._iter` gates on
+                ``t_det`` samples having been written past the cube
+                boundary, so the walk is guaranteed in-window slots.
+            compute_half: 0 or 1, for the per-half overrun-counter bump.
+            coarse_dm_mask: bitmask of which coarse-DMs to include
+                (bit ``i`` set ⇒ include ``dm=i``). ``None`` ⇒ all
+                ``n_coarse_dm`` dims (matches the legacy Python loop).
+
+        Returns:
+            Tuple ``(validity_per_t, n_overrun, n_pattern_mismatch,
+            n_no_data_present)``:
+
+            * ``validity_per_t``: ``np.bool_`` array of shape
+              ``(t_det,)``. Entry ``t`` is ``True`` iff every
+              (corr, dm-in-mask) slot at that ``t`` reported
+              ``VF_DATA_PRESENT`` and no overrun / pattern mismatch.
+              Entries at ``t ≥ t_det`` are always ``True`` (callers
+              only read ``[:t_det]``).
+            * The three ``int`` counters are deltas for THIS cube; the
+              caller folds them into its own running totals.
+
+        Raises:
+            RuntimeError: if the ring is closed.
+            OSError: if the underlying C call returned non-zero (bad
+                args, etc.).
+            NotImplementedError: if the loaded ``_recv_ring.so`` does
+                not export ``rx_ring_assemble_validity_block`` (stale
+                build — rebuild with ``python setup.py build_ext
+                --inplace``).
+        """
+        if self._closed:
+            raise RuntimeError("RxRing is closed")
+        lib = _get_lib()
+        if not hasattr(lib, "rx_ring_assemble_validity_block"):
+            raise NotImplementedError(
+                "_recv_ring.so does not export "
+                "rx_ring_assemble_validity_block; rebuild the C "
+                "extension: `python setup.py build_ext --inplace`"
+            )
+
+        if coarse_dm_mask is None:
+            coarse_dm_mask = (1 << self.dims.n_coarse_dm) - 1
+
+        # The C function writes ``t_det`` validity bytes (one per
+        # detector-window sample). Size the output buffer accordingly.
+        out = np.ones(int(t_det), dtype=np.uint8)
+        n_over = ctypes.c_uint64(0)
+        n_pat = ctypes.c_uint64(0)
+        n_nodp = ctypes.c_uint64(0)
+        ret = lib.rx_ring_assemble_validity_block(
+            ctypes.c_void_p(self._handle),
+            ctypes.c_uint64(int(specnum_start)),
+            ctypes.c_uint32(int(cube_cadence_samples)),
+            ctypes.c_uint32(int(t_det)),
+            ctypes.c_uint32(int(compute_half)),
+            ctypes.c_uint32(int(coarse_dm_mask)),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.byref(n_over),
+            ctypes.byref(n_pat),
+            ctypes.byref(n_nodp),
+        )
+        if ret != 0:
+            raise OSError(
+                f"rx_ring_assemble_validity_block failed (ret={ret})"
+            )
+        return (
+            out.astype(np.bool_, copy=False),
+            int(n_over.value),
+            int(n_pat.value),
+            int(n_nodp.value),
+        )
+
+    def assemble_dense_block(
+        self,
+        *,
+        specnum_start: int,
+        t_det: int,
+        n_grid: int,
+        owned_dm: int,
+        n_filled_per_corr: np.ndarray,
+        linear_lut_strided: np.ndarray,
+        compute_half: int = 0,
+        out_t_stride: int | None = None,
+        out_cint8: np.ndarray | None = None,
+        out_scale: np.ndarray | None = None,
+        out_offset_re: np.ndarray | None = None,
+        out_offset_im: np.ndarray | None = None,
+        out_validity: np.ndarray | None = None,
+    ) -> tuple[
+        np.ndarray,  # out_cint8                  (n_corr, out_t_stride, 2, n_grid, n_grid)
+        np.ndarray,  # out_scale                  (n_corr, out_t_stride)
+        np.ndarray,  # out_offset_re              (n_corr, out_t_stride)
+        np.ndarray,  # out_offset_im              (n_corr, out_t_stride)
+        np.ndarray,  # out_validity               (t_det,) bool
+        int,         # n_overrun
+        int,         # n_pattern_mismatch
+        int,         # n_no_data_present
+    ]:
+        """Batched dense-scatter walk over a cube's worth of ring slots (M7.4).
+
+        Drop-in replacement for the M7.2 zero-stub
+        ``ProductionRxRingSource._per_chgroup_cint8_stack_zero`` path.
+        Walks ``(n_corr, owned_dm, t in [0, t_det))`` ring slots and
+        scatters each slot's COO cint8 payload into a dense per-(corr, t)
+        ``[2, n_grid, n_grid]`` plane via the caller-supplied LUT, AND
+        captures the per-slot ``scale`` / ``offset`` sidecar into
+        per-(corr, t) arrays for the GPU dequant kernel
+        (``fused_dequant_combine_per_fdm_per_t``).
+
+        Args:
+            specnum_start: absolute ``t`` for slot 0 of the cube window.
+            t_det: detector window length. Same wseq-wait gate as
+                :meth:`assemble_validity_block`.
+            n_grid: dense-grid edge size.
+            owned_dm: coarse-DM index to scatter (each search_compute
+                half owns ONE coarse-DM; mirrors
+                ``--coarse-dm-owners-half-{0,1}``).
+            n_filled_per_corr: ``int32 [n_corr]`` actual N_filled per
+                corr's sparsity pattern. Use ``-1`` to mark a corr as
+                "intentionally silent" (no scatter; dense stays zero).
+            linear_lut_strided: ``int32 [n_corr, lut_stride]`` row-major
+                LUT. Entry ``[c, k]`` = ``ix_row[k] * n_grid + ix_col[k]``
+                — the flat ``n_grid * n_grid`` target index. Padding
+                rows beyond ``n_filled_per_corr[c]`` are ignored.
+            compute_half: 0 or 1.
+            out_*: caller-allocated output buffers; allocated fresh
+                when ``None``. Reusing buffers across cubes avoids
+                per-cube allocations on the search hot path.
+
+        Returns:
+            ``(out_cint8, out_scale, out_offset_re, out_offset_im,
+            out_validity, n_overrun, n_pattern_mismatch,
+            n_no_data_present)``.
+
+        Raises:
+            RuntimeError: if the ring is closed.
+            OSError: if the C call returned non-zero.
+            NotImplementedError: if the .so doesn't export
+                ``rx_ring_assemble_dense_block`` (rebuild C extensions).
+        """
+        if self._closed:
+            raise RuntimeError("RxRing is closed")
+        lib = _get_lib()
+        if not hasattr(lib, "rx_ring_assemble_dense_block"):
+            raise NotImplementedError(
+                "_recv_ring.so does not export "
+                "rx_ring_assemble_dense_block; rebuild the C "
+                "extension: `python setup.py build_ext --inplace`"
+            )
+
+        n_corr = int(self.dims.n_corr)
+        t_det = int(t_det)
+        n_grid = int(n_grid)
+        # out_t_stride: caller-managed T axis of the dense output. When
+        # ``None`` we mirror t_det (smallest valid value); callers that
+        # want lookahead beyond the detector window allocate a larger
+        # buffer (e.g. T_stream-sized) and pass that explicitly.
+        out_t_stride_i = int(out_t_stride) if out_t_stride is not None else t_det
+        if out_t_stride_i < t_det:
+            raise ValueError(
+                f"out_t_stride={out_t_stride_i} must be >= t_det={t_det}"
+            )
+
+        n_filled_arr = np.ascontiguousarray(n_filled_per_corr, dtype=np.int32)
+        if n_filled_arr.shape != (n_corr,):
+            raise ValueError(
+                f"n_filled_per_corr.shape={n_filled_arr.shape}; "
+                f"expected ({n_corr},)"
+            )
+        lut = np.ascontiguousarray(linear_lut_strided, dtype=np.int32)
+        if lut.ndim != 2 or lut.shape[0] != n_corr:
+            raise ValueError(
+                f"linear_lut_strided.shape={lut.shape}; "
+                f"expected ({n_corr}, lut_stride)"
+            )
+        lut_stride = int(lut.shape[1])
+
+        cint8_shape = (n_corr, out_t_stride_i, 2, n_grid, n_grid)
+        if out_cint8 is None:
+            out_cint8 = np.zeros(cint8_shape, dtype=np.int8)
+        elif out_cint8.shape != cint8_shape:
+            raise ValueError(
+                f"out_cint8.shape={out_cint8.shape}; expected {cint8_shape}"
+            )
+        elif out_cint8.dtype != np.int8:
+            raise ValueError(
+                f"out_cint8.dtype={out_cint8.dtype}; expected int8"
+            )
+        if not out_cint8.flags["C_CONTIGUOUS"]:
+            raise ValueError(
+                "out_cint8 must be C-contiguous (M7.4 scatter writes "
+                "in row-major order)"
+            )
+
+        def _scratch_or_alloc(arr: np.ndarray | None, shape, dtype):
+            if arr is None:
+                return np.zeros(shape, dtype=dtype)
+            if arr.shape != shape or arr.dtype != dtype:
+                raise ValueError(
+                    f"buffer shape/dtype mismatch: got "
+                    f"{arr.shape}/{arr.dtype}, expected {shape}/{dtype}"
+                )
+            if not arr.flags["C_CONTIGUOUS"]:
+                raise ValueError(
+                    "M7.4 scatter output buffers must be C-contiguous"
+                )
+            return arr
+
+        per_t_shape = (n_corr, out_t_stride_i)
+        out_scale     = _scratch_or_alloc(out_scale,     per_t_shape, np.float32)
+        out_offset_re = _scratch_or_alloc(out_offset_re, per_t_shape, np.float32)
+        out_offset_im = _scratch_or_alloc(out_offset_im, per_t_shape, np.float32)
+        out_validity  = _scratch_or_alloc(out_validity,  (t_det,),    np.uint8)
+
+        n_over = ctypes.c_uint64(0)
+        n_pat = ctypes.c_uint64(0)
+        n_nodp = ctypes.c_uint64(0)
+
+        ret = lib.rx_ring_assemble_dense_block(
+            ctypes.c_void_p(self._handle),
+            ctypes.c_uint64(int(specnum_start)),
+            ctypes.c_uint32(t_det),
+            ctypes.c_uint32(out_t_stride_i),
+            ctypes.c_uint32(n_grid),
+            ctypes.c_uint32(int(owned_dm)),
+            ctypes.c_uint32(int(compute_half)),
+            n_filled_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            lut.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_uint32(lut_stride),
+            out_cint8.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            out_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_offset_re.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_offset_im.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_validity.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.byref(n_over),
+            ctypes.byref(n_pat),
+            ctypes.byref(n_nodp),
+        )
+        if ret != 0:
+            raise OSError(
+                f"rx_ring_assemble_dense_block failed (ret={ret})"
+            )
+        return (
+            out_cint8,
+            out_scale,
+            out_offset_re,
+            out_offset_im,
+            out_validity.astype(np.bool_, copy=False),
+            int(n_over.value),
+            int(n_pat.value),
+            int(n_nodp.value),
+        )
 
     def update_read_seq(self, compute_half: int, new_read_seq: int) -> None:
         """Advance a compute reader's read sequence."""

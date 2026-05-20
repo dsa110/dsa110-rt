@@ -144,9 +144,14 @@ def test_spawn_single_worker_one_cube():
 
 
 def test_spawn_multi_worker_dm_split():
-    rx, port = _make_rx()
-    n_dm_total = 8
+    """4-worker / N=8 split. Each worker uses port = base_port + worker_idx.
+    All workers emit frames carrying GLOBAL dm_idx (worker_idx*per_worker_dm
+    + local) via the ``dm_idx_offset`` shim in TransportTxProdConfig.
+    """
+    # Pick a free port range. We bind 4 sockets, one per worker.
     n_workers = 4
+    rx_socks, base_port = _bind_per_worker_ports(base_port=0, n_workers=n_workers)
+    n_dm_total = 8
     n_fv = 8
     n_filled = 32
     cube = _make_cube(n_dm_total, n_fv, n_filled)
@@ -158,7 +163,7 @@ def test_spawn_multi_worker_dm_split():
         dtype=np.dtype("complex64"),
     )
     cfg = AsyncTransportTxConfig(
-        host="127.0.0.1", port=port, chgroup=5,
+        host="127.0.0.1", port=base_port, chgroup=5,
         n_workers=n_workers, n_dm_total=n_dm_total,
         ring_dims=dims,
         pattern_id=_FAKE_PATTERN_ID, n_grid=_FAKE_N_GRID,
@@ -166,7 +171,6 @@ def test_spawn_multi_worker_dm_split():
     )
     tx = AsyncTransportTx.spawn(cfg)
     try:
-        # DM split sanity
         assert tx.n_workers == n_workers
         for w in range(n_workers):
             lo, hi = tx.dm_split(w)
@@ -178,30 +182,42 @@ def test_spawn_multi_worker_dm_split():
             [cube], block_n=200, rfi_warming_up=False, specnum=0xDEADBEEF,
         )
         assert n_handed == 1
-        frames = _drain_rx_until_idle(rx, idle_s=0.8)
-        # Each of n_dm_total × n_fv tiles emits ≥ 1 fragment.
-        assert len(frames) >= n_dm_total * n_fv, (
-            f"expected >= {n_dm_total * n_fv} frames, got {len(frames)}"
+
+        # Drain ALL 4 sockets (one per worker). Each worker emits
+        # per_worker_dm × n_fv tiles.
+        all_frames: list[tuple[int, bytes]] = []
+        for w, rx in enumerate(rx_socks):
+            frames = _drain_rx_until_idle(rx, idle_s=0.6)
+            all_frames.extend((w, f) for f in frames)
+        # Aggregate frame count: ≥ n_dm_total × n_fv (each tile emits
+        # ≥ 1 fragment).
+        assert len(all_frames) >= n_dm_total * n_fv, (
+            f"expected >= {n_dm_total * n_fv} frames across all 4 "
+            f"workers, got {len(all_frames)}"
         )
-        # All frames should have a valid chgroup; collect dm_idx per
-        # frame to verify the split.
-        seen_dm = set()
-        for f in frames:
+        # Frames from worker w MUST carry global dm_idx in
+        # [w*per_worker_dm, (w+1)*per_worker_dm). Across all workers,
+        # all 8 GLOBAL dm_idx values must appear.
+        seen_dm: set[int] = set()
+        for w, f in all_frames:
             hdr, _payload = unpack_frame(f)
             assert hdr.chgroup == 5
-            seen_dm.add(int(hdr.dm_idx))
-        # Each worker (w) emits frames with header dm_idx in
-        # [0, hi-lo) — the prod-frame dm_idx is LOCAL to the cube the
-        # worker transmits, since each worker calls
-        # TransportTx.transmit([slice]) independently. So all workers
-        # emit dm_idx in {0, 1} (per_worker_dm == 2).
-        assert seen_dm == set(range(per_worker_dm)), (
-            f"expected dm_idx range = {set(range(per_worker_dm))}, "
+            gdm = int(hdr.dm_idx)
+            seen_dm.add(gdm)
+            lo = w * per_worker_dm
+            assert lo <= gdm < lo + per_worker_dm, (
+                f"frame on worker-w={w} port carries global dm_idx="
+                f"{gdm}, outside expected range "
+                f"[{lo}, {lo + per_worker_dm})"
+            )
+        assert seen_dm == set(range(n_dm_total)), (
+            f"expected GLOBAL dm_idx range = {set(range(n_dm_total))}, "
             f"got {seen_dm}"
         )
     finally:
         tx.close()
-        rx.close()
+        for rx in rx_socks:
+            rx.close()
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +226,8 @@ def test_spawn_multi_worker_dm_split():
 
 
 def test_many_blocks_no_backpressure():
-    rx, port = _make_rx()
+    n_workers = 2
+    socks, base_port = _bind_per_worker_ports(base_port=0, n_workers=n_workers)
     n_dm = 4
     n_fv = 16
     n_filled = 64
@@ -219,8 +236,8 @@ def test_many_blocks_no_backpressure():
         dtype=np.dtype("complex64"),
     )
     cfg = AsyncTransportTxConfig(
-        host="127.0.0.1", port=port, chgroup=7,
-        n_workers=2, n_dm_total=n_dm,
+        host="127.0.0.1", port=base_port, chgroup=7,
+        n_workers=n_workers, n_dm_total=n_dm,
         ring_dims=dims,
         pattern_id=_FAKE_PATTERN_ID, n_grid=_FAKE_N_GRID,
         target_gbps_per_flow=100.0,
@@ -229,38 +246,40 @@ def test_many_blocks_no_backpressure():
     tx = AsyncTransportTx.spawn(cfg)
     try:
         cube = _make_cube(n_dm, n_fv, n_filled)
-        # Warm-up cube — wait for it to land on RX before measuring steady
-        # state. Worker spawn takes ~1.5 s on first import; the steady-state
-        # behaviour starts after that.
+        # Warm-up cube — drain ALL worker ports until at least worker 0
+        # has emitted (signals workers are up).
         tx.transmit([cube], block_n=0, rfi_warming_up=False, specnum=0)
-        _ = _drain_rx_until_idle(rx, idle_s=0.3, first_packet_timeout_s=5.0)
+        _ = _drain_rx_until_idle(socks[0], idle_s=0.3, first_packet_timeout_s=5.0)
+        for s in socks[1:]:
+            _ = _drain_rx_until_idle(s, idle_s=0.1, first_packet_timeout_s=1.0)
 
-        # Now run at ~production cadence (8 Hz ≈ 134 ms; we go faster to
-        # keep the test brief but still slower than the encode rate).
         n_blocks = 12
         backpressure_before = tx.stats()["n_backpressure_total"]
         for b in range(n_blocks):
             tx.transmit(
                 [cube], block_n=b + 1, rfi_warming_up=False, specnum=1000 + b,
             )
-            time.sleep(0.02)  # 50 Hz — well below worker encode rate
-        frames = _drain_rx_until_idle(rx, idle_s=0.5)
-        assert len(frames) >= n_blocks * n_dm * n_fv, (
-            f"expected >= {n_blocks * n_dm * n_fv} frames, got {len(frames)}"
+            time.sleep(0.02)
+        # Drain ALL worker ports.
+        total_frames = 0
+        for s in socks:
+            total_frames += len(_drain_rx_until_idle(s, idle_s=0.4))
+        assert total_frames >= n_blocks * n_dm * n_fv, (
+            f"expected >= {n_blocks * n_dm * n_fv} frames across all "
+            f"workers, got {total_frames}"
         )
         stats = tx.stats()
         # +1 for the warm-up cube.
         assert stats["n_cubes_in"] == n_blocks + 1
         assert stats["n_workers_alive"] == cfg.n_workers
-        # Steady-state backpressure should be zero (warm-up backpressure
-        # is excluded by snapshotting the counter before the burst).
         steady_bp = stats["n_backpressure_total"] - backpressure_before
         assert steady_bp == 0, (
             f"steady-state backpressure should be 0, got {steady_bp}"
         )
     finally:
         tx.close()
-        rx.close()
+        for s in socks:
+            s.close()
 
 
 # ---------------------------------------------------------------------------
@@ -334,4 +353,164 @@ def test_missing_specnum_raises():
             tx.transmit([cube], block_n=0, rfi_warming_up=False)
     finally:
         tx.close()
+        rx.close()
+
+
+# ---------------------------------------------------------------------------
+# M7.2 selective TX mask
+# ---------------------------------------------------------------------------
+
+
+def _spawn_with_mask(mask: int, base_port: int, n_workers: int = 4, n_dm_total: int = 8):
+    """Helper: spawn AsyncTransportTx with given coarse_dm_mask."""
+    per_worker_dm = n_dm_total // n_workers
+    dims = CubeShmRingDims(
+        n_slots=4, shape=(per_worker_dm, 8, 32),
+        dtype=np.dtype("complex64"),
+    )
+    cfg = AsyncTransportTxConfig(
+        host="127.0.0.1", port=base_port, chgroup=3,
+        n_workers=n_workers, n_dm_total=n_dm_total,
+        ring_dims=dims,
+        pattern_id=_FAKE_PATTERN_ID, n_grid=_FAKE_N_GRID,
+        target_gbps_per_flow=100.0,
+        coarse_dm_mask=mask,
+    )
+    return AsyncTransportTx.spawn(cfg)
+
+
+def _bind_per_worker_ports(base_port: int, n_workers: int):
+    """Bind one RX socket per worker port (base_port + w).
+
+    To handle OS-allocated ports + collision-free sequential binding,
+    scan upward from a high-numbered base until ``n_workers`` consecutive
+    ports succeed. The returned ``base`` is the first port of the run.
+    """
+    if base_port == 0:
+        import random
+        # Probe a high range to find n_workers consecutive free ports.
+        for _ in range(64):
+            cand = random.randint(20000, 60000 - n_workers)
+            socks_try: list[socket.socket] = []
+            try:
+                for w in range(n_workers):
+                    s, _p = _make_rx(port=cand + w)
+                    socks_try.append(s)
+                return socks_try, cand
+            except (OSError, PermissionError):
+                for s in socks_try:
+                    s.close()
+                continue
+        raise RuntimeError("could not find n_workers consecutive free ports")
+    socks: list[socket.socket] = []
+    for w in range(n_workers):
+        socks.append(_make_rx(port=base_port + w)[0])
+    return socks, base_port
+
+
+def test_coarse_dm_mask_m72_low_emits_only_worker0():
+    """M7.2-low (mask=0x03): only worker 0 (DM[0,2)) transmits; workers
+    1-3 drain. Worker 0's port (base_port + 0) receives frames with
+    GLOBAL dm_idx in {0, 1}; the other 3 ports stay silent.
+    """
+    n_workers = 4
+    socks, base = _bind_per_worker_ports(base_port=0, n_workers=n_workers)
+    tx = _spawn_with_mask(mask=0x03, base_port=base, n_workers=n_workers)
+    try:
+        cube = _make_cube(8, 8, 32)
+        tx.transmit([cube], block_n=10, rfi_warming_up=False, specnum=1)
+        w0_frames = _drain_rx_until_idle(socks[0], idle_s=0.6)
+        w_other = []
+        for w in range(1, n_workers):
+            w_other.extend(_drain_rx_until_idle(
+                socks[w], idle_s=0.2, first_packet_timeout_s=0.5))
+        assert len(w0_frames) > 0, "expected frames on worker-0 port"
+        assert len(w_other) == 0, (
+            f"expected NO frames on workers 1..3; got {len(w_other)}"
+        )
+        gdm = {int(unpack_frame(f)[0].dm_idx) for f in w0_frames}
+        assert gdm == {0, 1}, (
+            f"M7.2-low: worker 0 must emit GLOBAL dm_idx={{0,1}}; got {gdm}"
+        )
+    finally:
+        tx.close()
+        for s in socks:
+            s.close()
+
+
+def test_coarse_dm_mask_m72_high_emits_only_worker3():
+    """M7.2-high (mask=0xC0): only worker 3 (DM[6,8)) transmits; workers
+    0-2 drain. Worker 3's port (base_port + 3) receives frames with
+    GLOBAL dm_idx in {6, 7}; the other 3 ports stay silent.
+    """
+    n_workers = 4
+    socks, base = _bind_per_worker_ports(base_port=0, n_workers=n_workers)
+    tx = _spawn_with_mask(mask=0xC0, base_port=base, n_workers=n_workers)
+    try:
+        cube = _make_cube(8, 8, 32)
+        tx.transmit([cube], block_n=10, rfi_warming_up=False, specnum=1)
+        w3_frames = _drain_rx_until_idle(socks[3], idle_s=0.6)
+        w_other = []
+        for w in (0, 1, 2):
+            w_other.extend(_drain_rx_until_idle(
+                socks[w], idle_s=0.2, first_packet_timeout_s=0.5))
+        assert len(w3_frames) > 0, "expected frames on worker-3 port"
+        assert len(w_other) == 0, (
+            f"expected NO frames on workers 0..2; got {len(w_other)}"
+        )
+        gdm = {int(unpack_frame(f)[0].dm_idx) for f in w3_frames}
+        assert gdm == {6, 7}, (
+            f"M7.2-high: worker 3 must emit GLOBAL dm_idx={{6,7}}; got {gdm}"
+        )
+    finally:
+        tx.close()
+        for s in socks:
+            s.close()
+
+
+def test_coarse_dm_mask_full_emits_all_global_dm():
+    """Default mask=0xFF (M7.3): all 4 workers transmit; union of
+    GLOBAL dm_idx values across all 4 worker ports == {0..7}.
+    """
+    n_workers = 4
+    socks, base = _bind_per_worker_ports(base_port=0, n_workers=n_workers)
+    tx = _spawn_with_mask(mask=0xFF, base_port=base, n_workers=n_workers)
+    try:
+        cube = _make_cube(8, 8, 32)
+        tx.transmit([cube], block_n=10, rfi_warming_up=False, specnum=1)
+        seen_gdm: set[int] = set()
+        total = 0
+        for w in range(n_workers):
+            for f in _drain_rx_until_idle(socks[w], idle_s=0.4):
+                total += 1
+                seen_gdm.add(int(unpack_frame(f)[0].dm_idx))
+        assert seen_gdm == set(range(8)), (
+            f"expected GLOBAL dm_idx={{0..7}} across all workers; got {seen_gdm}"
+        )
+        # 8 global DM × 8 fv ⇒ ≥ 64 fragments
+        assert total >= 64, f"expected ≥ 64 total frames; got {total}"
+    finally:
+        tx.close()
+        for s in socks:
+            s.close()
+
+
+def test_coarse_dm_mask_partial_overlap_rejected():
+    """Mask 0x05 (DM 0, 2) crosses worker boundaries (worker 0 = DM[0,2),
+    worker 1 = DM[2,4)) — partial overlap MUST raise at spawn."""
+    rx, port = _make_rx()
+    try:
+        with pytest.raises(ValueError, match="align"):
+            _spawn_with_mask(mask=0x05, base_port=port)
+    finally:
+        rx.close()
+
+
+def test_coarse_dm_mask_all_disabled_rejected():
+    """Mask 0x00 disables every worker — must raise at spawn."""
+    rx, port = _make_rx()
+    try:
+        with pytest.raises(ValueError, match="disables every worker"):
+            _spawn_with_mask(mask=0x00, base_port=port)
+    finally:
         rx.close()

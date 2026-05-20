@@ -64,11 +64,26 @@ routines:
     # → ring-buffer memcpy that the default path does, giving merge a
     # cleaner producer in the multi-reader (r=2) fada → corr_slow +
     # corr_fast topology.
+    #
+    # gate_on_paths (M7.2, 2026-05-19): junkdb is gated on the corr_fast
+    # and corr_slow ready-sentinels so it does not stuff dada/eada to
+    # 19/20 + fada to 70/70 during the ~90 s of Python + GPU + Triton
+    # cold start on those consumers. Without the gate the soak first
+    # 90 s is a back-pressured ring-fill transient (rings drain to
+    # steady state in 1-2 s after corr_fast starts reading fada, but
+    # the operator sees a misleading "rings near full" snapshot in
+    # mon-dict during the warmup window).
     args: -k dada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+    gate_on_paths:
+      - /tmp/dsart-corr-fast-CN.ready
+      - /tmp/dsart-corr-slow-CN.ready
   - name: cap_b_junkdb
     when: captures.mode == junkdb
     cmd: /usr/local/bin/dada_junkdb
     args: -k eada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+    gate_on_paths:
+      - /tmp/dsart-corr-fast-CN.ready
+      - /tmp/dsart-corr-slow-CN.ready
 
   - name: cap_a_real
     when: captures.mode == real
@@ -98,7 +113,7 @@ routines:
   # corr_fast pair hits a Triton "context is destroyed" race).
   - name: corr_slow
     cmd: python
-    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO
+    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO --ready-sentinel-path /tmp/dsart-corr-slow-CN.ready
     env:
       CUDA_VISIBLE_DEVICES: "0"
 
@@ -178,14 +193,20 @@ routines:
       --cal-mode phase_only
       --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
       --t-int-fast-native 32
-      --n-coarse-dm 5
-      --dm-max 1000
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --chan-sum-factor 8
       --sliding-window
       --n-grid 256
+      --transport-tx-mode prod
+      --transport-tx-workers 4
+      --transport-tx-host 10.41.0.205
+      --transport-tx-base-port 6625
+      --transport-tx-coarse-dm-mask 0xFF
+      --transport-tx-worker-hosts 10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238
       --max-blocks 0
       --output-dir /home/ubuntu/tmp/dsart-fast-grid
       --blocks-output-mode none
       --log-level INFO
+      --ready-sentinel-path /tmp/dsart-corr-fast-CN.ready
     env:
       CUDA_VISIBLE_DEVICES: "1"

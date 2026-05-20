@@ -363,8 +363,62 @@ async def _bench_main(args: argparse.Namespace) -> int:
             "measuring build_cube alone."
         )
     bench_start_ns = time.perf_counter_ns()
+    full_prefetch = bool(getattr(args, "full_prefetch", False))
     async with src:
         if (
+            full_prefetch
+            and (not skip_detector)
+            and image_backend == "gpu"
+        ):
+            # M7.2 cube-cadence experiment: full prefetch — runs the
+            # NEXT cube's imager on a dedicated stream concurrent with
+            # the CURRENT cube's Layer-1 + detector. With the imager
+            # collapsed to the new cube_cadence samples (carry-over),
+            # the cross-cube parallelism becomes worth the SM contention
+            # because imager is now ~50% of layer1+det's cost.
+            aiter = src.__aiter__()
+            try:
+                slot = await aiter.__anext__()
+            except StopAsyncIteration:
+                slot = None
+            pending = (
+                pipeline.prefetch_build(slot) if slot is not None else None
+            )
+            while slot is not None and pending is not None:
+                t_dispatch_start = time.perf_counter_ns()
+                try:
+                    next_slot = await aiter.__anext__()
+                except StopAsyncIteration:
+                    next_slot = None
+                next_pending = (
+                    pipeline.prefetch_build(next_slot)
+                    if next_slot is not None
+                    else None
+                )
+                result = pipeline.process_prefetched(pending)
+                t_done = time.perf_counter_ns()
+                rec = StageTimingRecord(
+                    cube_id=slot.cube_id,
+                    n_candidates=len(result.candidates),
+                    build_cube_ns=int(result.stage_timings_ns["build_cube"]),
+                    layer1_norm_ns=int(result.stage_timings_ns["layer1_norm"]),
+                    detector_forward_ns=int(
+                        result.stage_timings_ns["detector_forward"]
+                    ),
+                    total_pipeline_ns=int(t_done - t_dispatch_start),
+                )
+                records.append(rec)
+                if (slot.cube_id + 1) % max(1, n_cubes // 10) == 0:
+                    _LOG.info(
+                        "cube=%d/%d total=%.2fms detector=%.2fms cands=%d",
+                        slot.cube_id + 1, n_cubes,
+                        rec.total_pipeline_ns / 1.0e6,
+                        rec.detector_forward_ns / 1.0e6,
+                        rec.n_candidates,
+                    )
+                await src.release(slot.cube_id)
+                slot, pending = next_slot, next_pending
+        elif (
             enable_overlap
             and (not skip_detector)
             and image_backend == "gpu"
@@ -593,6 +647,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "at production geometry.",
     )
     parser.add_argument(
+        "--full-prefetch",
+        action="store_true",
+        help="M7.2 cube-cadence experiment: run the full imager (H2D + "
+             "combine + IFFT + edge mask) for cube N+1 on a dedicated "
+             "GPU stream concurrent with cube N's Layer-1 + detector. "
+             "Takes precedence over --pipeline-overlap. Mirrors the "
+             "old chunk-8 'wide overlap' path; intended for use with "
+             "the cube-cadence carry-over where the imager is ~50% "
+             "of layer1+det.",
+    )
+    parser.add_argument(
         "--pipeline-overlap",
         action="store_true",
         help="Enable one-cube lookahead overlap: prebuild cube N+1 on a "
@@ -636,7 +701,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "T_det=256/N_grid=256 — together ~5 s/cube on h01).",
     )
     parser.add_argument(
-        "--layer1-max-samples", type=int, default=1_000_000,
+        "--layer1-max-samples", type=int, default=10_000,
         help="Per-fdm cell-count cap for the Layer-1 σ-clipped std "
              "(forwarded to ``Layer1State.max_samples``). At production "
              "geometry each fdm slab has 256³ = 16.8 M cells; capping "

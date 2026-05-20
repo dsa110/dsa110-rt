@@ -167,7 +167,11 @@ class SearchComputeConfig:
     layer1_n_burnin_cubes: int = 5
     layer1_n_sigma: float = 3.0
     layer1_n_iterations: int = 3
-    layer1_max_samples: Optional[int] = 100_000
+    # M7.2 perf gate: Layer-1 σ-clip cap dropped 100K → 10K. Std-error
+    # on σ̂ scales as σ/√(2N): 10K samples ⇒ 7e-3 σ, well below the
+    # cube-to-cube EMA noise floor (≈ a few percent). Trade saved ~50 ms
+    # of `torch.nanmedian` per cube at production geometry.
+    layer1_max_samples: Optional[int] = 10_000
 
     # --- M6 chunk 5: cube-geometry hyperparameters ---------------------
     cube_cell_l_rad: float = 1.5e-4
@@ -1041,6 +1045,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         max_cubes=args.max_cubes if args.max_cubes > 0 else None,
         fan_in_min_corrs=args.fan_in_min_corrs,
         attach_timeout_s=args.attach_timeout_s,
+        n_active_dms_per_corr=args.n_active_dms_per_corr,
     )
 
     if args.config_yaml is not None and args.config_yaml.exists():
@@ -1160,6 +1165,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--poll-interval-s", type=float, default=0.001,
                    help="how long the assembler sleeps between write_seq "
                         "polls (default 1ms; production-rate-safe).")
+    p.add_argument("--n-active-dms-per-corr", type=int, default=1,
+                   help="number of coarse-DM tiles the upstream "
+                        "producer ships per (corr, cube) — equals "
+                        "popcount(corr_fast coarse_dm_mask). The "
+                        "C-side RxRing write_seq_per_corr counter "
+                        "increments per (corr, dm, sample) slot "
+                        "write, so the consumer-side ``_iter`` must "
+                        "scale ``target_seq`` by this factor to wait "
+                        "for the full detector window in EVERY active "
+                        "dm plane (not just one). Default 1 preserves "
+                        "single-dm benchmark / smoke compatibility; "
+                        "production 16x1 / 16x4 with "
+                        "coarse_dm_mask=0x03 passes 2.")
     p.add_argument("--fan-in-min-corrs", type=int, default=16,
                    help="minimum number of chgroups that must have "
                         "advanced past the next cube boundary before "
@@ -1228,7 +1246,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Per-kernel sample cap for Layer-2 interior sigma "
                         "clipping. Set <=0 to disable subsampling. "
                         "Commissioning default: 100000.")
-    p.add_argument("--layer1-max-samples", type=int, default=100_000,
+    p.add_argument("--layer1-max-samples", type=int, default=10_000,
                    help="Per-fdm sample cap for Layer-1 sigma-clipped std. "
                         "Commissioning default 100k (vs 1M bench legacy) for "
                         "lower latency with still-sub-percent sigma error.")

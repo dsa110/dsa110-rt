@@ -61,7 +61,13 @@ void rx_ring_close(rx_ring_t *ring);
 
 int  rx_ring_unlink(const char *name);
 
-/* Producer (RX side). */
+/* Producer (RX side). M7.4 amend (v2 slot layout): per-slot scale + offset
+ * are now persisted alongside the payload bytes so the search-side
+ * scatter (rx_ring_assemble_dense_block) can dequantise correctly.
+ * Producers that don't have dequant info (e.g. zerofill / pattern-
+ * mismatch stubs) should pass scale=0.0f, offset=0.0f — the assembler
+ * treats zero scale as "skip dequant contribution" so the dense
+ * accumulator stays correct. */
 int
 rx_ring_write_slot(
     rx_ring_t  *ring,
@@ -70,6 +76,8 @@ rx_ring_write_slot(
     uint64_t    t_seq,
     const void *payload,
     size_t      payload_bytes,
+    float       scale,
+    float       offset,
     uint16_t    validity_flags
 );
 
@@ -106,6 +114,32 @@ rx_ring_get_dims(
     uint32_t  *out_bytes_per_cell,
     uint64_t  *out_slot_stride_bytes,
     size_t    *out_shm_size
+);
+
+/* M7.4: batched dense-scatter walker. Replaces the per-cube Python
+ * ``rx_ring_read_slot`` × N_corr × T_det loop AND the COO→dense scatter
+ * that would otherwise live in pure Python. See recv_ring.c for the
+ * full memory contract. */
+int
+rx_ring_assemble_dense_block(
+    rx_ring_t      *ring,
+    uint64_t        specnum_start,
+    uint32_t        t_det,
+    uint32_t        out_t_stride,
+    uint32_t        n_grid,
+    uint32_t        owned_dm,
+    uint32_t        compute_half,
+    const int32_t  *n_filled_per_corr,
+    const int32_t  *linear_lut_strided,
+    uint32_t        lut_stride,
+    int8_t         *out_cint8,
+    float          *out_scale_per_t,
+    float          *out_offset_re_per_t,
+    float          *out_offset_im_per_t,
+    uint8_t        *out_validity_per_t,
+    uint64_t       *out_n_overrun,
+    uint64_t       *out_n_pattern_mismatch,
+    uint64_t       *out_n_no_data_present
 );
 
 #ifdef __cplusplus

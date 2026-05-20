@@ -320,6 +320,13 @@ class CubePipeline:
         self._shifts_gpu_buf: Optional[torch.Tensor] = None
         self._validity_gpu_buf: Optional[torch.Tensor] = None
         self._validity_all_true_gpu: Optional[torch.Tensor] = None
+        # M7.2-amend (2026-05-20): persistent pinned host buffer the
+        # ``_build_validity_mask`` path copies the slot's freshly
+        # alloc'd numpy validity mask into before the H2D. Pinning is
+        # required for ``non_blocking=True`` to actually run async on
+        # the prefetch stream; see ``_build_validity_mask`` for the
+        # full rationale.
+        self._validity_host_pinned: Optional[torch.Tensor] = None
         self._last_shifts_host_id: Optional[int] = None
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
         # Separate stream dedicated to the cint8 H2D copy in the narrow
@@ -612,15 +619,33 @@ class CubePipeline:
                 cint8_t = gpu_buf
             else:
                 cint8_t = cint8_host_t.to(self._device)
-            if slot.per_chgroup_scale is not None:
+            # M7.4: prefer per-(chgroup, t) sidecars when present. The
+            # ProductionRxRingSource M7.4 scatter path populates these
+            # via ``rx_ring_assemble_dense_block`` (per-slot scale +
+            # offset from the wire). The H2D ships 2-D [N_chg, T_stream]
+            # f32 tensors; the GPU dequant kernel detects rank 2 and
+            # dispatches to ``fused_dequant_combine_per_fdm_per_t``.
+            if slot.per_chgroup_scale_per_t is not None:
+                chgroup_scale_t = torch.from_numpy(
+                    np.ascontiguousarray(slot.per_chgroup_scale_per_t, dtype=np.float32)
+                ).to(self._device, non_blocking=non_blocking)
+            elif slot.per_chgroup_scale is not None:
                 chgroup_scale_t = torch.from_numpy(
                     np.ascontiguousarray(slot.per_chgroup_scale, dtype=np.float32)
                 ).to(self._device, non_blocking=non_blocking)
-            if slot.per_chgroup_offset_re is not None:
+            if slot.per_chgroup_offset_re_per_t is not None:
+                chgroup_offset_re_t = torch.from_numpy(
+                    np.ascontiguousarray(slot.per_chgroup_offset_re_per_t, dtype=np.float32)
+                ).to(self._device, non_blocking=non_blocking)
+            elif slot.per_chgroup_offset_re is not None:
                 chgroup_offset_re_t = torch.from_numpy(
                     np.ascontiguousarray(slot.per_chgroup_offset_re, dtype=np.float32)
                 ).to(self._device, non_blocking=non_blocking)
-            if slot.per_chgroup_offset_im is not None:
+            if slot.per_chgroup_offset_im_per_t is not None:
+                chgroup_offset_im_t = torch.from_numpy(
+                    np.ascontiguousarray(slot.per_chgroup_offset_im_per_t, dtype=np.float32)
+                ).to(self._device, non_blocking=non_blocking)
+            elif slot.per_chgroup_offset_im is not None:
                 chgroup_offset_im_t = torch.from_numpy(
                     np.ascontiguousarray(slot.per_chgroup_offset_im, dtype=np.float32)
                 ).to(self._device, non_blocking=non_blocking)
@@ -715,19 +740,54 @@ class CubePipeline:
                     validity_np.shape, dtype=torch.bool, device=self._device
                 )
             return self._validity_all_true_gpu
-        validity_host_t = torch.from_numpy(validity_np)
         if enable_gpu_buf_reuse:
             if (
                 self._validity_gpu_buf is None
-                or self._validity_gpu_buf.shape != validity_host_t.shape
+                or self._validity_gpu_buf.shape != validity_np.shape
                 or self._validity_gpu_buf.device != self._device
             ):
                 self._validity_gpu_buf = torch.empty(
-                    validity_host_t.shape, dtype=torch.bool, device=self._device
+                    validity_np.shape, dtype=torch.bool, device=self._device
                 )
-            self._validity_gpu_buf.copy_(validity_host_t, non_blocking=False)
+            # M7.2-amend (2026-05-20): persistent PINNED host buffer +
+            # ``non_blocking=True`` H2D
+            # ----------------------------------------------------------
+            # Before this amend the validity copy ran with
+            # ``non_blocking=False``, which under ``prefetch_build``
+            # synchronously drained the ``_prefetch_stream`` queue
+            # (cudaStreamSynchronize) at the END of every cube — i.e.
+            # the prefetch was serialised with the previous cube's
+            # detector + layer1 work on the main stream. py-spy
+            # (2026-05-20) showed this single line as ~77% of the
+            # per-cube CPU wall after the cint8 H2D became async.
+            #
+            # PyTorch only honours ``non_blocking=True`` for H2D when
+            # the source memory is pinned (otherwise it silently falls
+            # back to a synchronous copy). The slot validity mask is
+            # freshly allocated by ``ProductionRxRingSource`` every
+            # cube (np.broadcast_to(...).copy()), so we maintain a
+            # persistent host-pinned PyTorch buffer here and copy the
+            # numpy view into it before the H2D. Cost of the
+            # ``numpy->pinned host`` copy is ~6.5 KiB per cube (T_det
+            # x N_fdm bool); the resulting H2D is fully async and the
+            # ``build_ready_event`` recorded immediately after in
+            # ``prefetch_build`` is what downstream stages wait on
+            # for correctness.
+            if (
+                self._validity_host_pinned is None
+                or self._validity_host_pinned.shape != validity_np.shape
+            ):
+                self._validity_host_pinned = torch.empty(
+                    validity_np.shape, dtype=torch.bool, pin_memory=True,
+                )
+            self._validity_host_pinned.copy_(torch.from_numpy(validity_np))
+            self._validity_gpu_buf.copy_(
+                self._validity_host_pinned, non_blocking=True,
+            )
             return self._validity_gpu_buf
-        return validity_host_t.to(device=self._device, dtype=torch.bool)
+        return torch.from_numpy(validity_np).to(
+            device=self._device, dtype=torch.bool
+        )
 
     def _layer1_normalise(
         self,

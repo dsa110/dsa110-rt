@@ -2722,6 +2722,9 @@ def run(
     transport_tx_target_gbps_per_flow: float = 0.073,
     transport_tx_workers: int = 0,
     transport_tx_ring_slots: int = 8,
+    transport_tx_coarse_dm_mask: int = 0xFF,
+    transport_tx_worker_hosts: str = "",
+    ready_sentinel_path: Path | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -2945,9 +2948,25 @@ def run(
                 )
                 pattern_id = 0
 
+            # M7.3 (2026-05-20): parse comma-separated per-worker
+            # destination hosts. Empty string keeps the legacy
+            # single-host behaviour (host:port + w per worker).
+            worker_hosts_list: list[str] | None = None
+            if transport_tx_worker_hosts:
+                worker_hosts_list = [
+                    h.strip() for h in transport_tx_worker_hosts.split(",")
+                    if h.strip()
+                ]
+                if len(worker_hosts_list) != int(transport_tx_workers):
+                    raise ValueError(
+                        f"--transport-tx-worker-hosts has "
+                        f"{len(worker_hosts_list)} entries; expected "
+                        f"--transport-tx-workers={transport_tx_workers}"
+                    )
             async_cfg = AsyncTransportTxConfig(
                 host=transport_tx_host,
                 port=transport_tx_port,
+                worker_hosts=worker_hosts_list,
                 chgroup=int(cfg.chgroup),
                 n_workers=int(transport_tx_workers),
                 n_dm_total=int(n_dm_total),
@@ -2958,6 +2977,7 @@ def run(
                 corr_idx=int(cfg.chgroup),
                 log_level="INFO",
                 shm_name_prefix=f"dsart-corr-tx-{cfg.chgroup}",
+                coarse_dm_mask=int(transport_tx_coarse_dm_mask) & 0xFF,
             )
             async_tx = AsyncTransportTx.spawn(async_cfg)
             ctx.transport_tx = _AsyncTransportTxAdapter(async_tx)
@@ -3062,6 +3082,27 @@ def run(
             if out.rfi is not None:
                 per_block_flag_frac.append(
                     float(out.rfi.flag_fraction_total)
+                )
+
+        # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator
+        # that Python imports + GPU init + Triton modules import + cal
+        # loading + DM plan loading + pipeliner construction are all
+        # complete. Triton JIT itself still fires on the first kernel
+        # call inside the loop (a few seconds of warmup), but that's
+        # ~10× shorter than the pre-loop init we've already finished.
+        # The orchestrator gates capture routines (dada_junkdb) on this
+        # file so they don't pre-fill dada/eada to ~19/20 during this
+        # process's multi-second cold start.
+        if ready_sentinel_path is not None:
+            try:
+                ready_sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+                ready_sentinel_path.touch()
+                LOG.info("ready sentinel touched: %s", ready_sentinel_path)
+            except OSError as e:
+                LOG.warning(
+                    "failed to touch ready sentinel %s: %s "
+                    "(continuing without gate)",
+                    ready_sentinel_path, e,
                 )
 
         while not state["stop"]:
@@ -3360,9 +3401,19 @@ def main(argv: list[str] | None = None) -> int:
                          "UDP packets if no listener is bound, but "
                          "the sendto syscall + encoding cost is "
                          "still paid)."))
-    p.add_argument("--transport-tx-port", type=int, default=9000,
-                   help="M7.2: UDP destination port for TransportTx. "
-                        "Default 9000. Production = 9000 + chgroup.")
+    p.add_argument("--transport-tx-port",
+                   "--transport-tx-base-port",
+                   dest="transport_tx_port",
+                   type=int, default=9000,
+                   help="M7.2: BASE UDP destination port for the worker "
+                        "pool. Worker w sends to host:(port + w). The "
+                        "per-worker offset lets the search side identify "
+                        "which corr-worker each frame originates from "
+                        "via the L4 source port. Default 9000. "
+                        "Production (M7.3 + M7.2 plan): 6625 (workers "
+                        "0..3 → 6625..6628). The `--transport-tx-base-port` "
+                        "spelling is the canonical form; the legacy "
+                        "`--transport-tx-port` spelling is preserved.")
     p.add_argument("--transport-tx-mode",
                    choices=("chunk8", "prod"), default="chunk8",
                    help=("M7.2: TransportTx wire format. "
@@ -3404,8 +3455,46 @@ def main(argv: list[str] | None = None) -> int:
                          "1 s of cube buffering; covers worker "
                          "startup jitter and burstiness. Only used "
                          "when --transport-tx-workers > 0."))
+    p.add_argument("--transport-tx-coarse-dm-mask",
+                   type=lambda s: int(s, 0), default=0xFF,
+                   help=("M7.2 selective TX mask over coarse-DM "
+                         "indices (LSB = coarse_dm[0]). Workers whose "
+                         "DM-slice is ENTIRELY OUT of the mask drain "
+                         "without transmitting; workers whose slice is "
+                         "ENTIRELY IN transmit normally. Default 0xFF "
+                         "(M7.3 production = all 8 coarse DMs sent). "
+                         "M7.2-low: 0x03 (coarse 0,1 to n01). "
+                         "M7.2-high: 0xC0 (coarse 6,7 to n01). Mask "
+                         "must align with worker DM-slice boundaries "
+                         "(typically n_workers=4, N=8 ⇒ workers cover "
+                         "DM[0:2),[2:4),[4:6),[6:8) so 0x03 / 0x0C / "
+                         "0x30 / 0xC0 are valid; 0x05 etc. would be "
+                         "rejected). Accepts 0x / 0o / decimal."))
+    p.add_argument("--transport-tx-worker-hosts", type=str, default="",
+                   help=("M7.3: comma-separated list of destination "
+                         "IPs/hostnames — one per --transport-tx-workers "
+                         "worker. When set, worker w sends to "
+                         "worker_hosts[w]:<port> (no per-worker port "
+                         "offset; each search node binds to the same "
+                         "base port). Length MUST equal "
+                         "--transport-tx-workers. Empty string (the "
+                         "default) keeps the M7.2 16x1 behaviour where "
+                         "all workers share --transport-tx-host and the "
+                         "port offset (host:port + w) disambiguates. "
+                         "Production 16x4 example: "
+                         "'10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238' "
+                         "with --transport-tx-workers 4."))
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    p.add_argument("--ready-sentinel-path", type=Path, default=None,
+                   help="M7.2: touch this file once Python imports, GPU "
+                        "init, cal loading, DM plan loading, and pipeliner "
+                        "construction are complete (just before the main "
+                        "loop). The dsart_rt orchestrator gates capture "
+                        "routines (dada_junkdb) on this file so they do "
+                        "not stuff the dada/eada rings during this "
+                        "process's multi-second cold start (~90 s on a "
+                        "2080Ti including Triton module imports).")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -3510,6 +3599,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
             transport_tx_workers=args.transport_tx_workers,
             transport_tx_ring_slots=args.transport_tx_ring_slots,
+            transport_tx_coarse_dm_mask=args.transport_tx_coarse_dm_mask,
+            transport_tx_worker_hosts=args.transport_tx_worker_hosts,
+            ready_sentinel_path=args.ready_sentinel_path,
         )
     except _StopRequested:
         LOG.info("clean stop")

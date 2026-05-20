@@ -130,6 +130,25 @@ class _AsyncTxWorkerCfg:
     t_int_factor: int = 1
     corr_idx: int = 0
     worker_idle_exit_s: float = 300.0
+    bypass_pacer: bool = True
+    """M7.2-amend (2026-05-19): when True (default), the worker's
+    TransportTx runs in bypass-pacer mode — raw ``sendto`` per fragment,
+    matching the M4b ``bench/net_pair.py`` / 16×4 corner-turn TX pattern
+    that was validated at production rate with zero TX-side drops. See
+    :class:`~dsart.transport.tx.TransportTxProdConfig.bypass_pacer`."""
+    sndbuf_mib: int = 256
+    """SO_SNDBUF size in MiB. Default 256 matches the M4b net_pair
+    bench (which used 256 MiB). The kernel silently clamps to
+    ``net.core.wmem_max`` (256 MiB on the production fleet)."""
+    transmit_enabled: bool = True
+    """M7.2 coarse-DM mask gate (resolved at spawn time from
+    ``AsyncTransportTxConfig.coarse_dm_mask``). When ``False`` the worker
+    runs as a DRAIN — it still consumes ring slots and releases them
+    (so the producer is never back-pressured by an idle ring), but does
+    NOT encode + sendto. This is the mechanism by which an M7.2-low
+    corr node TXes ONLY coarse 0,1 (workers covering those DMs run
+    normally; workers covering 2..7 drain silently). Default True ⇒
+    M7.3 production (all DMs transmitted)."""
     """If wait_slot returns None continuously for this many seconds
     AFTER at least one cube has been processed, the worker assumes
     the producer is gone and exits. The "after at least one cube"
@@ -185,31 +204,48 @@ def _async_tx_worker_main(
     from dsart.transport.prod_frame import BITS_CINT8_COMPLEX
     from dsart.transport.tx import TransportTx, TransportTxProdConfig
 
-    prod_cfg = TransportTxProdConfig(
-        target_gbps_per_flow=cfg.target_gbps_per_flow,
-        pacer_headroom=cfg.pacer_headroom,
-        bits_per_cell=BITS_CINT8_COMPLEX,
-        t_int_factor=cfg.t_int_factor,
-        corr_idx=cfg.corr_idx,
-        bucket_fifo_depth=cfg.bucket_fifo_depth,
-    )
-    tx = TransportTx(
-        host=cfg.host,
-        port=cfg.port,
-        chgroup=int(cfg.chgroup),
-        use_prod_frame=True,
-        prod_config=prod_cfg,
-    )
-    tx.prepare_prod(
-        pattern_id_by_chgroup={int(cfg.chgroup): int(cfg.pattern_id)},
-        n_grid=int(cfg.n_grid),
-    )
-    log.info(
-        "TransportTx ready: %s:%d chgroup=%d dm[%d:%d) gbps/flow=%.3f "
-        "n_grid=%d pattern_id=%d",
-        cfg.host, cfg.port, cfg.chgroup, cfg.dm_lo, cfg.dm_hi,
-        cfg.target_gbps_per_flow, cfg.n_grid, cfg.pattern_id,
-    )
+    tx: TransportTx | None = None
+    if cfg.transmit_enabled:
+        prod_cfg = TransportTxProdConfig(
+            target_gbps_per_flow=cfg.target_gbps_per_flow,
+            pacer_headroom=cfg.pacer_headroom,
+            bits_per_cell=BITS_CINT8_COMPLEX,
+            t_int_factor=cfg.t_int_factor,
+            corr_idx=cfg.corr_idx,
+            bucket_fifo_depth=cfg.bucket_fifo_depth,
+            dm_idx_offset=int(cfg.dm_lo),
+            bypass_pacer=bool(cfg.bypass_pacer),
+            sndbuf_mib=int(cfg.sndbuf_mib),
+        )
+        tx = TransportTx(
+            host=cfg.host,
+            port=cfg.port,
+            chgroup=int(cfg.chgroup),
+            use_prod_frame=True,
+            prod_config=prod_cfg,
+        )
+        tx.prepare_prod(
+            pattern_id_by_chgroup={int(cfg.chgroup): int(cfg.pattern_id)},
+            n_grid=int(cfg.n_grid),
+        )
+        log.info(
+            "TransportTx ready: %s:%d chgroup=%d dm[%d:%d) "
+            "dm_idx_offset=%d gbps/flow=%.3f n_grid=%d pattern_id=%d "
+            "bypass_pacer=%s sndbuf_mib=%d",
+            cfg.host, cfg.port, cfg.chgroup, cfg.dm_lo, cfg.dm_hi,
+            cfg.dm_lo, cfg.target_gbps_per_flow, cfg.n_grid, cfg.pattern_id,
+            cfg.bypass_pacer, cfg.sndbuf_mib,
+        )
+    else:
+        # Mask-disabled worker (M7.2-low / M7.2-high subset variants).
+        # Still consume slots so the ring never back-pressures the
+        # producer, but skip the encode + sendto entirely (no UDP socket
+        # opened, no TransportTx state initialised).
+        log.info(
+            "TransportTx DISABLED by coarse_dm_mask: chgroup=%d dm[%d:%d) "
+            "operating in DRAIN-ONLY mode (no encode, no sendto)",
+            cfg.chgroup, cfg.dm_lo, cfg.dm_hi,
+        )
 
     ring = CubeShmRing(
         name=cfg.shm_name,
@@ -221,7 +257,11 @@ def _async_tx_worker_main(
 
     n_cubes = 0
     n_frames = 0
-    n_drops_at_start = int(tx.tx_dropped_payloads)
+    # tx_dropped_payloads conflates "fragment queued for next refill"
+    # with true on-wire loss (see tx.py amend note); tx_wire_drops is
+    # the FIFO-pop-only counter (true UDP loss).
+    n_drops_at_start = int(tx.tx_dropped_payloads) if tx is not None else 0
+    n_wire_drops_at_start = int(tx.tx_wire_drops) if tx is not None else 0
     t_start = time.monotonic()
     idle_since: float | None = None
     encode_ms_samples: list[float] = []
@@ -261,34 +301,39 @@ def _async_tx_worker_main(
             idle_since = None
 
             t_encode_start = time.monotonic()
-            cube_view = ring.view_slot(meta.slot_idx)
-            # Build a TX cube whose shape matches the logical cube the
-            # producer copied in. ``ring_dims.shape`` is the *upper-
-            # bound* shape; ``meta.n_dm/n_fv/n_filled`` are the actual
-            # populated extents for this block (only meta.n_filled may
-            # ever change in steady state; the producer pre-pads to
-            # ring_dims for the others).
-            logical = cube_view[:meta.n_dm, :meta.n_fv, :meta.n_filled]
-            # TransportTx.transmit expects torch.Tensor (complex). The
-            # from_numpy view shares memory with the shm slot; no copy.
-            tx_input = torch.from_numpy(logical)
-            try:
-                n_sent = tx.transmit(
-                    [tx_input],
-                    block_n=int(meta.block_n),
-                    rfi_warming_up=bool(meta.rfi_warming_up),
-                    specnum=int(meta.specnum),
-                )
-            except Exception:
-                log.exception(
-                    "tx.transmit raised on block_n=%d", meta.block_n,
-                )
+            if tx is not None:
+                cube_view = ring.view_slot(meta.slot_idx)
+                # Build a TX cube whose shape matches the logical cube
+                # the producer copied in. ``ring_dims.shape`` is the
+                # *upper-bound* shape; ``meta.n_dm/n_fv/n_filled`` are
+                # the actual populated extents for this block (only
+                # meta.n_filled may ever change in steady state; the
+                # producer pre-pads to ring_dims for the others).
+                logical = cube_view[:meta.n_dm, :meta.n_fv, :meta.n_filled]
+                # TransportTx.transmit expects torch.Tensor (complex). The
+                # from_numpy view shares memory with the shm slot; no copy.
+                tx_input = torch.from_numpy(logical)
+                try:
+                    n_sent = tx.transmit(
+                        [tx_input],
+                        block_n=int(meta.block_n),
+                        rfi_warming_up=bool(meta.rfi_warming_up),
+                        specnum=int(meta.specnum),
+                    )
+                except Exception:
+                    log.exception(
+                        "tx.transmit raised on block_n=%d", meta.block_n,
+                    )
+                    n_sent = 0
+            else:
+                # Drain-only worker (mask-disabled): no encode, no send.
                 n_sent = 0
             t_encode_ms = (time.monotonic() - t_encode_start) * 1e3
             encode_ms_samples.append(t_encode_ms)
 
             # Release BEFORE the next dequeue: the producer is free to
-            # reuse the slot now (the TX data is already on the wire).
+            # reuse the slot now (the TX data is already on the wire,
+            # or — for drain-only workers — discarded).
             ring.release_slot(meta.slot_idx)
 
             n_cubes += 1
@@ -300,12 +345,20 @@ def _async_tx_worker_main(
                     enc_max = float(np.max(encode_ms_samples))
                 else:
                     enc_p50 = enc_p99 = enc_max = 0.0
+                pacer_qd_now = (
+                    int(tx.tx_dropped_payloads) - n_drops_at_start
+                    if tx is not None else 0
+                )
+                wire_drops_now = (
+                    int(tx.tx_wire_drops) - n_wire_drops_at_start
+                    if tx is not None else 0
+                )
                 log.info(
-                    "n_cubes=%d n_frames=%d drops=%d "
-                    "encode_ms p50=%.2f p99=%.2f max=%.2f",
-                    n_cubes, n_frames,
-                    int(tx.tx_dropped_payloads) - n_drops_at_start,
+                    "n_cubes=%d n_frames=%d wire_drops=%d pacer_qd=%d "
+                    "encode_ms p50=%.2f p99=%.2f max=%.2f%s",
+                    n_cubes, n_frames, wire_drops_now, pacer_qd_now,
                     enc_p50, enc_p99, enc_max,
+                    "" if tx is not None else " [drain-only]",
                 )
                 encode_ms_samples.clear()
     finally:
@@ -316,9 +369,15 @@ def _async_tx_worker_main(
                 "n_cubes": int(n_cubes),
                 "n_frames": int(n_frames),
                 "elapsed_s": float(elapsed),
-                "tx_dropped_payloads": int(
-                    tx.tx_dropped_payloads - n_drops_at_start
+                "tx_dropped_payloads": (
+                    int(tx.tx_dropped_payloads - n_drops_at_start)
+                    if tx is not None else 0
                 ),
+                "tx_wire_drops": (
+                    int(tx.tx_wire_drops - n_wire_drops_at_start)
+                    if tx is not None else 0
+                ),
+                "transmit_enabled": bool(cfg.transmit_enabled),
             })
         except Exception:  # pragma: no cover — shutdown path
             log.warning("failed to post final stats")
@@ -326,10 +385,11 @@ def _async_tx_worker_main(
             ring.close()
         except Exception:  # pragma: no cover
             log.exception("ring.close() raised")
-        try:
-            tx.close()
-        except Exception:  # pragma: no cover
-            log.exception("tx.close() raised")
+        if tx is not None:
+            try:
+                tx.close()
+            except Exception:  # pragma: no cover
+                log.exception("tx.close() raised")
         log.info(
             "exiting: n_cubes=%d n_frames=%d elapsed=%.1fs",
             n_cubes, n_frames, elapsed,
@@ -352,6 +412,12 @@ class AsyncTransportTxConfig:
 
     host: str
     port: int
+    """Base UDP port for the worker pool. Worker ``w`` (w ∈ [0, n_workers))
+    sends to ``host:port + w``. This per-worker offset lets the search
+    side disambiguate which corr-worker each frame came from at the L4
+    layer — required for M7.3 where all 4 workers per corr transmit
+    simultaneously. For M7.2 it lets n01 bind to each port independently
+    (e.g., only port+0 for M7.2-low if only worker 0 transmits)."""
     chgroup: int
     n_workers: int
     n_dm_total: int
@@ -361,6 +427,16 @@ class AsyncTransportTxConfig:
     target_gbps_per_flow: float = 0.073
     pacer_headroom: float = 1.05
     bucket_fifo_depth: int = 4
+    bypass_pacer: bool = True
+    """M7.2-amend (2026-05-19): when True (default), each worker's
+    TransportTx skips the in-Python token-bucket pacer and ``sendto``s
+    every fragment directly. Matches the M4b ``bench/net_pair.py`` and
+    16×4 corner-turn TX pattern that was validated at 28 Gb/s aggregate
+    with zero TX drops. Set False only for tests that exercise the
+    legacy bucket semantics."""
+    sndbuf_mib: int = 256
+    """SO_SNDBUF size in MiB for every worker's UDP socket. Default 256
+    matches ``bench/net_pair.py``."""
     t_int_factor: int = 1
     corr_idx: int = 0
     reserve_timeout_s: float = 1.0
@@ -372,6 +448,35 @@ class AsyncTransportTxConfig:
     log_level: str = "INFO"
     worker_idle_exit_s: float = 30.0
     shm_name_prefix: str = "dsart-corr-tx"
+    worker_hosts: list[str] | None = None
+    """M7.3 (2026-05-20): per-worker destination host override. If set,
+    worker ``w`` sends to ``worker_hosts[w]:port`` instead of
+    ``host:port + w`` (note: the per-worker port-offset is dropped when
+    destinations are distinct hosts — the IP layer already
+    disambiguates). Length MUST equal ``n_workers``. When ``None``
+    (the default) every worker shares the single ``host`` and uses the
+    legacy ``host:port + w`` semantics — the M7.2 low/high 16x1 mode.
+    The 16x4 fan-out (one worker per search-node destination) sets
+    ``worker_hosts=[n01_ip, n02_ip, n09_ip, n13_ip]`` so each corr
+    egress targets a distinct search node — exactly the per-search-node
+    fan-out the corner-turn was designed for (see module docstring
+    lines 52-58 'forward-compatible to M7.3 4-search-node fan-out')."""
+    coarse_dm_mask: int = 0xFF
+    """M7.2 selective TX: bitmask over coarse-DM indices (LSB = coarse_dm[0]).
+    Workers whose [dm_lo, dm_hi) slice is ENTIRELY OUT of the mask run as
+    drain-only (no TransportTx initialised, no UDP socket opened, no
+    encode/sendto). Workers whose slice is ENTIRELY IN the mask transmit
+    normally. Partial-overlap is an ERROR (the mask must align with the
+    contiguous DM-axis slices produced by the n_workers split).
+
+    Production presets:
+      • 0xFF — M7.3 (all 8 coarse DMs go to all 4 search nodes).
+      • 0x03 — M7.2-low  (coarse 0, 1 → n01 only).
+      • 0xC0 — M7.2-high (coarse 6, 7 → n01 only).
+
+    Other values are allowed if mask-bits align to worker DM-slice
+    boundaries; otherwise spawn raises ValueError.
+    """
 
 
 @dataclass
@@ -484,6 +589,54 @@ class AsyncTransportTx:
                 f"max dm-per-worker = {max_dm_per_worker}"
             )
 
+        # Resolve the M7.2 coarse-DM TX mask into per-worker
+        # transmit_enabled flags. Mask must align with worker DM-slice
+        # boundaries (entirely in OR entirely out for each worker);
+        # partial-overlap would require sub-slice masking which is not
+        # implemented (and not needed for the M7.2-low / -high variants
+        # which align exactly on worker boundaries).
+        mask = int(cfg.coarse_dm_mask) & ((1 << cfg.n_dm_total) - 1)
+        per_worker_enabled: list[bool] = []
+        for w, (lo, hi) in enumerate(dm_splits):
+            in_bits = sum(1 for d in range(lo, hi) if (mask >> d) & 1)
+            slice_len = hi - lo
+            if in_bits == slice_len:
+                per_worker_enabled.append(True)
+            elif in_bits == 0:
+                per_worker_enabled.append(False)
+            else:
+                raise ValueError(
+                    f"coarse_dm_mask=0x{cfg.coarse_dm_mask:02x} does not "
+                    f"align with worker {w} DM-slice [{lo}, {hi}): "
+                    f"{in_bits}/{slice_len} bits in mask. Mask must be "
+                    f"entirely in OR entirely out of each worker's slice "
+                    f"(currently partial-overlap is unsupported)."
+                )
+        if not any(per_worker_enabled):
+            raise ValueError(
+                f"coarse_dm_mask=0x{cfg.coarse_dm_mask:02x} disables "
+                f"every worker; nothing would be transmitted."
+            )
+
+        # M7.3 (2026-05-20): per-worker host map. ``worker_hosts`` overrides
+        # the single ``host`` field when set; each worker w sends to
+        # ``worker_hosts[w]:port`` (note: no per-worker port offset when
+        # destinations are distinct hosts — the L4 disambiguation already
+        # happens at the IP layer). When ``worker_hosts is None`` we keep
+        # the legacy ``host:port + w`` semantics so 16x1 and tests do not
+        # change.
+        if cfg.worker_hosts is not None:
+            if len(cfg.worker_hosts) != cfg.n_workers:
+                raise ValueError(
+                    f"worker_hosts has {len(cfg.worker_hosts)} entries; "
+                    f"expected n_workers={cfg.n_workers}"
+                )
+            worker_dest_host = list(cfg.worker_hosts)
+            worker_dest_port = [int(cfg.port)] * cfg.n_workers
+        else:
+            worker_dest_host = [cfg.host] * cfg.n_workers
+            worker_dest_port = [int(cfg.port) + w for w in range(cfg.n_workers)]
+
         ctx = mp.get_context(start_method)
         workers: list[_WorkerHandle] = []
         pid = os.getpid()
@@ -511,18 +664,21 @@ class AsyncTransportTx:
                     dm_hi=hi,
                     shm_name=shm_name,
                     ring_dims=cfg.ring_dims,
-                    host=cfg.host,
-                    port=cfg.port,
+                    host=worker_dest_host[w],
+                    port=worker_dest_port[w],
                     chgroup=cfg.chgroup,
                     target_gbps_per_flow=cfg.target_gbps_per_flow,
                     pattern_id=cfg.pattern_id,
                     n_grid=cfg.n_grid,
                     bucket_fifo_depth=cfg.bucket_fifo_depth,
                     pacer_headroom=cfg.pacer_headroom,
+                    bypass_pacer=bool(cfg.bypass_pacer),
+                    sndbuf_mib=int(cfg.sndbuf_mib),
                     t_int_factor=cfg.t_int_factor,
                     corr_idx=cfg.corr_idx,
                     worker_idle_exit_s=cfg.worker_idle_exit_s,
                     log_level=cfg.log_level,
+                    transmit_enabled=per_worker_enabled[w],
                 )
                 proc = ctx.Process(
                     target=_async_tx_worker_main,
@@ -545,9 +701,11 @@ class AsyncTransportTx:
                 )
             LOG.info(
                 "AsyncTransportTx spawned: corr_idx=%d n_workers=%d "
-                "dm_split=%s host=%s port=%d gbps/flow=%.3f",
+                "dm_split=%s tx_enabled=%s mask=0x%02x host=%s port=%d "
+                "gbps/flow=%.3f",
                 cfg.corr_idx, cfg.n_workers, dm_splits,
-                cfg.host, cfg.port, cfg.target_gbps_per_flow,
+                per_worker_enabled, mask, cfg.host, cfg.port,
+                cfg.target_gbps_per_flow,
             )
         except Exception:
             # Tear down any workers we did spawn.

@@ -368,6 +368,110 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
 """
 
 
+# M7.4 — per-(chgroup, t_src) scale + offset variant
+# ---------------------------------------------------
+# The cube assembler (rx_ring_assemble_dense_block) emits a per-(corr, t)
+# scale/offset sidecar — see ProductionRxRingSource._assemble_cube. The
+# wire side computes scale per (cube, dm, t_idx) over the FILLED cells
+# only (tx.py::_compute_scale_offset), so the per-cube dynamic range
+# varies by ~1-2 bits across the t_det window. Compressing all of that
+# into a single per-chgroup scalar (the legacy ``[N_chg]`` calib path)
+# would either truncate dynamic range or force a wasteful re-quantise
+# on the search side. The per-t kernel below dequantises with the
+# native per-(corr, t_src) scale at zero extra cost (the lookup just
+# adds a multiply by ``t_src`` to the existing index math).
+#
+# Kernel signature differs ONLY in the indexing of scales/offsets:
+#   per-chg: scales[g]
+#   per-t  : scales[g * t_stream + t_src]
+# Layout for the per-t arrays is row-major ``[N_chg, T_stream]`` f32,
+# matching how the assembler writes them (see recv_ring.c::
+# rx_ring_assemble_dense_block).
+_CUDA_SOURCE_CF16_DEQUANT_CALIB_PER_T = r"""
+#include <cuda_fp16.h>
+
+extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16(
+    const signed char* __restrict__ streams,    // [N_chg, T, 2, N, N] int8
+    const int*         __restrict__ shifts,     // [N_chg] int32
+    const float*       __restrict__ scales,     // [N_chg, T] fp32 — per-(g, t_src)
+    const float*       __restrict__ offset_re,  // [N_chg, T] fp32
+    const float*       __restrict__ offset_im,  // [N_chg, T] fp32
+    __half2*           __restrict__ output,     // [T_det, N, N] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid)
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    if (v >= n_grid || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int spatial_offset = u * n_grid + v;
+    const int t_stride       = 2 * n_grid_sq;
+    const int chg_stride     = t_stream * t_stride;
+
+    // out[t] = sum_g (scale[g, t_src] * cint8[g, t_src] + offset[g, t_src]).
+    // scale==0 from the assembler signals "skip this (g, t_src) slot"
+    // (zerofill, pattern-mismatch, or overrun); the multiply zeros the
+    // contribution and we still add 0 to the accumulator.
+    float acc_re = 0.0f;
+    float acc_im = 0.0f;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int s = shifts[g];
+        const int t_src = t - s;
+        if (t_src >= 0 && t_src < t_stream) {
+            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const float c_re = (float)streams[base];
+            const float c_im = (float)streams[base + n_grid_sq];
+            const int   gt   = g * t_stream + t_src;
+            const float sc   = scales[gt];
+            acc_re = fmaf(sc, c_re, acc_re) + offset_re[gt];
+            acc_im = fmaf(sc, c_im, acc_im) + offset_im[gt];
+        }
+    }
+    output[t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
+}
+"""
+
+_CUDA_SOURCE_CF32_DEQUANT_CALIB_PER_T = r"""
+extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf32(
+    const signed char* __restrict__ streams,
+    const int*         __restrict__ shifts,
+    const float*       __restrict__ scales,     // [N_chg, T]
+    const float*       __restrict__ offset_re,  // [N_chg, T]
+    const float*       __restrict__ offset_im,  // [N_chg, T]
+    float2*            __restrict__ output,
+    int n_chgroup, int t_stream, int t_det, int n_grid)
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    if (v >= n_grid || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int spatial_offset = u * n_grid + v;
+    const int t_stride       = 2 * n_grid_sq;
+    const int chg_stride     = t_stream * t_stride;
+
+    float acc_re = 0.0f;
+    float acc_im = 0.0f;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int s = shifts[g];
+        const int t_src = t - s;
+        if (t_src >= 0 && t_src < t_stream) {
+            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const float c_re = (float)streams[base];
+            const float c_im = (float)streams[base + n_grid_sq];
+            const int   gt   = g * t_stream + t_src;
+            const float sc   = scales[gt];
+            acc_re = fmaf(sc, c_re, acc_re) + offset_re[gt];
+            acc_im = fmaf(sc, c_im, acc_im) + offset_im[gt];
+        }
+    }
+    output[t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
+}
+"""
+
+
 # Cache the compiled cupy.RawKernel objects (one per dtype × variant).
 # Each RawKernel call compiles the kernel source via NVRTC; the
 # compiled cubin is then cached on disk by cupy.
@@ -377,6 +481,8 @@ _KERNEL_CF16_DEQUANT: Optional[object] = None
 _KERNEL_CF32_DEQUANT: Optional[object] = None
 _KERNEL_CF16_DEQUANT_CALIB: Optional[object] = None
 _KERNEL_CF32_DEQUANT_CALIB: Optional[object] = None
+_KERNEL_CF16_DEQUANT_CALIB_PER_T: Optional[object] = None
+_KERNEL_CF32_DEQUANT_CALIB_PER_T: Optional[object] = None
 
 
 def _get_kernel_cf16():
@@ -475,6 +581,44 @@ def _get_kernel_cf32_dequant_calib():
     )
     _LOG.info("fused_dequant_scale_offset_combine_per_fdm_cint8_to_cf32 ready")
     return _KERNEL_CF32_DEQUANT_CALIB
+
+
+def _get_kernel_cf16_dequant_calib_per_t():
+    global _KERNEL_CF16_DEQUANT_CALIB_PER_T
+    if _KERNEL_CF16_DEQUANT_CALIB_PER_T is not None:
+        return _KERNEL_CF16_DEQUANT_CALIB_PER_T
+    cp = _get_cupy()
+    _LOG.info(
+        "compiling fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16 via NVRTC..."
+    )
+    _KERNEL_CF16_DEQUANT_CALIB_PER_T = cp.RawKernel(
+        code=_CUDA_SOURCE_CF16_DEQUANT_CALIB_PER_T,
+        name="fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16",
+        options=("--use_fast_math",),
+    )
+    _LOG.info(
+        "fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16 ready"
+    )
+    return _KERNEL_CF16_DEQUANT_CALIB_PER_T
+
+
+def _get_kernel_cf32_dequant_calib_per_t():
+    global _KERNEL_CF32_DEQUANT_CALIB_PER_T
+    if _KERNEL_CF32_DEQUANT_CALIB_PER_T is not None:
+        return _KERNEL_CF32_DEQUANT_CALIB_PER_T
+    cp = _get_cupy()
+    _LOG.info(
+        "compiling fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf32 via NVRTC..."
+    )
+    _KERNEL_CF32_DEQUANT_CALIB_PER_T = cp.RawKernel(
+        code=_CUDA_SOURCE_CF32_DEQUANT_CALIB_PER_T,
+        name="fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf32",
+        options=("--use_fast_math",),
+    )
+    _LOG.info(
+        "fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf32 ready"
+    )
+    return _KERNEL_CF32_DEQUANT_CALIB_PER_T
 
 
 # ---------------------------------------------------------------------------
@@ -794,29 +938,57 @@ def fused_dequant_combine_per_fdm(
         offsets_re = torch.zeros((n_chgroup,), dtype=torch.float32, device=output.device)
     if offsets_im is None:
         offsets_im = torch.zeros((n_chgroup,), dtype=torch.float32, device=output.device)
+
+    # M7.4: detect per-(chgroup, t_src) calibration mode. We accept both
+    # the legacy ``[N_chg]`` per-chgroup shape AND the new
+    # ``[N_chg, T_stream]`` per-t shape from the same wrapper so callers
+    # don't need to switch kernel entry points; the dispatch happens
+    # here based on tensor rank. All three arrays must agree on shape.
+    per_t_mode = all(t is not None and t.dim() == 2
+                     for t in (scales, offsets_re, offsets_im))
+    if any(t.dim() == 2 for t in (scales, offsets_re, offsets_im)) and not per_t_mode:
+        raise RuntimeError(
+            "fused_dequant_combine_per_fdm: scales/offsets_re/offsets_im "
+            "must all be 1-D [N_chg] OR all be 2-D [N_chg, T_stream]; "
+            f"got shapes {tuple(scales.shape)}, {tuple(offsets_re.shape)}, "
+            f"{tuple(offsets_im.shape)}"
+        )
+
+    expected_shape = (n_chgroup, t_stream) if per_t_mode else (n_chgroup,)
     for name, t in (("scales", scales), ("offsets_re", offsets_re),
                     ("offsets_im", offsets_im)):
         if not t.is_cuda:
             raise RuntimeError(f"{name} must be cuda; got device={t.device}")
         if t.dtype != torch.float32:
             raise RuntimeError(f"{name} must be float32; got {t.dtype}")
-        if t.shape != (n_chgroup,):
+        if t.shape != expected_shape:
             raise RuntimeError(
                 f"{name} shape mismatch: got {tuple(t.shape)}, "
-                f"expected ({n_chgroup},)"
+                f"expected {expected_shape}"
             )
         if not t.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
 
-    if output.dtype == torch.complex32:
-        kernel = _get_kernel_cf16_dequant_calib()
-    elif output.dtype == torch.complex64:
-        kernel = _get_kernel_cf32_dequant_calib()
+    if per_t_mode:
+        if output.dtype == torch.complex32:
+            kernel = _get_kernel_cf16_dequant_calib_per_t()
+        elif output.dtype == torch.complex64:
+            kernel = _get_kernel_cf32_dequant_calib_per_t()
+        else:
+            raise RuntimeError(
+                f"unsupported output dtype: {output.dtype}; "
+                "expected complex32 or complex64"
+            )
     else:
-        raise RuntimeError(
-            f"unsupported output dtype: {output.dtype}; "
-            "expected complex32 or complex64"
-        )
+        if output.dtype == torch.complex32:
+            kernel = _get_kernel_cf16_dequant_calib()
+        elif output.dtype == torch.complex64:
+            kernel = _get_kernel_cf32_dequant_calib()
+        else:
+            raise RuntimeError(
+                f"unsupported output dtype: {output.dtype}; "
+                "expected complex32 or complex64"
+            )
 
     scales_cp = _torch_to_cupy_view(scales)
     offsets_re_cp = _torch_to_cupy_view(offsets_re)

@@ -235,8 +235,36 @@ DM_MIN_DEFAULT: float = 0.0
 DM_MAX_DEFAULT: float = 3000.0
 DM_TOL_DEFAULT: float = 1.5
 
-DM_PLAN_METADATA_VERSION: int = 1
-"""Schema version for the dm_plan.npz metadata dict (plan §3.2 line 570)."""
+DM_PLAN_METADATA_VERSION: int = 2
+"""Schema version for the dm_plan.npz metadata dict (plan §3.2 line 570).
+
+v1 (M1..M7.1): coarse-DM via Levin recursion on chgroup-0 (top sub-band,
+loosest spacing); fine-DM via Levin on full band; fine_to_coarse via
+``searchsorted(side='right') - 1`` (each fine maps to the largest coarse
+≤ fine), so δdm ≥ 0 and time_shift_search ≥ 0; per-(search, GPU) ranges
+balanced by fine-trial weight with halo of dm_overlap_coarse cells.
+
+v2 (M7.2, user clarification 2026-05-18):
+  • coarse list and fine list both built via the Levin (Lina Levin thesis)
+    recursion; the bottom sub-band (chgroup 15, lowest ν → tightest spacing)
+    is used to set ``dm_max_effective`` = coarse_seed[N_coarse-1] for
+    ``N_coarse = 8`` fixed. The bottom-sub-band recursion's POSITIONS are
+    discarded after dm_max is fixed.
+  • Fine list: full-band Levin over [dm_min, dm_max_effective], trimmed
+    to a multiple of N_GPU = 8 from the tail.
+  • Coarse positions: coarse_dm[i] = fine_dm[i*K + K//2] where K = N_fine/8.
+    Coarse DMs sit at the MIDPOINTS of the K-fine GPU buckets.
+  • fine_to_coarse[f] = f // K (1:1 GPU ownership, no halo, no inter-GPU
+    coarse overlap; each GPU owns exactly one coarse DM and K fine DMs
+    SYMMETRIC about it).
+  • time_shift_search is SIGNED int32: K/2 fines per GPU sit BELOW their
+    coarse (δdm < 0 → negative shifts, read PAST data) and K/2 sit ABOVE
+    (δdm > 0 → positive shifts, read FUTURE data via one-sided rewind).
+  • dm_overlap_coarse = 0.
+  • Per-(search, GPU) ranges are exact: dm_idx_range_*_per_gpu[s, g] =
+    (2s+g, 2s+g) for s ∈ [0, N_SEARCH), g ∈ [0, N_SEARCH_GPU). Per-GPU
+    fine-DM coverage is fine_dm[(2s+g)*K : (2s+g+1)*K].
+"""
 
 
 # ---------------------------------------------------------------------------

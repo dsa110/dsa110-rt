@@ -84,6 +84,25 @@ routines:
       n09: --bind-host 10.41.0.253
       n13: --bind-host 10.41.0.238
 
+  # M7.3 (2026-05-20): per-search-node owner overrides
+  # ---------------------------------------------------
+  # The ``--coarse-dm-owners-half-{0,1}`` defaults set in each
+  # ``search_compute_{0,1}`` routine's ``args:`` block are for the n01
+  # 16x1 case (owners=0,1). In the 16x4 production fan-out each of the
+  # four search nodes owns a different pair of coarse-DMs:
+  #   n01 → 0, 1   (default in args:, no override needed)
+  #   n02 → 2, 3
+  #   n09 → 4, 5
+  #   n13 → 6, 7
+  # We bolt those onto the per-routine ``args:`` lists via the routine
+  # hostargs maps below. ``argparse`` is last-wins for scalar
+  # ``--coarse-dm-owners-half-{0,1}``, so the routine-level defaults
+  # are silently overridden by the per-host entries here. ``dsart_rt``
+  # tries the FQDN-style key (``lxd110h<NN>``) first then the bare
+  # short hostname (``n<NN>``) — we list both so the config works
+  # whether ``socket.gethostname()`` returns the kernel-level
+  # container name or the operator alias.
+
   # ---- search_compute x 2 (one per GPU half) -----------------------
   # Both halves attach the SAME ring (read-only) and process the same
   # cube slots, but each one runs the detector on a disjoint slice of
@@ -103,8 +122,14 @@ routines:
   # GPU pipeline on dada_junkdb data.
   #
   # Production op-point:
-  #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan), t_det=256,
-  #   cube_cadence_samples=128 (= 134.218 ms / cube = 7.45 cubes/s RT)
+  #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan),
+  #   t_det=192, cube_cadence_samples=128
+  #     ⇒ search overlap = t_det - cube_cadence_samples = 64 samples
+  #       (= b_max, the minimum overlap that catches any pulse up to
+  #       64 samples wide straddling a cube boundary). M7.2 perf gate
+  #       (May 2026): drop from t_det=256 → 192 saved ~35 ms/cube
+  #       across imager + layer1 at the production op-point, bringing
+  #       the per-cube wall to ~105 ms inside the 134.218 ms RT budget.
   #   t_int_search_us=1048.576 (matches corr t_int_fast at 32x native)
   #
   # The two halves run as independent processes so a crash in one
@@ -115,6 +140,19 @@ routines:
   # M6 sub-systems (clusterer, cube_dump, udp_listener, cands_logger)
   # are all gated OFF for M7.2 — they land in M7.3 along with the
   # full 16x4 fleet bring-up.
+  # M7.2-amend (2026-05-20): turned ON ``--pipeline-overlap`` for both
+  # halves. The narrow-overlap path (prefetch cube N+1 onto a
+  # dedicated CUDA H2D stream while the imager+detector run cube N
+  # on the compute stream) hides the ~35 ms cint8 H2D (~420 MiB) +
+  # validity H2D under the GPU work. py-spy (2026-05-20) showed
+  # ``cint8_host_t.to(device)`` + the validity-mask sync barrier
+  # as the dominant per-cube wall-time at the 16x1 op-point AFTER
+  # the cint8-stack quantise bypass landed; without overlap the
+  # search node hit ~6.55 cubes/s vs the 7.45 cubes/s target. The
+  # bench (``bench/search_node_throughput.py``) has always used
+  # ``--pipeline-overlap`` so the GPU pipeline benchmark numbers
+  # (~105 ms p50 at production geometry) are an apples-to-apples
+  # match only when the prod service runs with it on too.
   - name: search_compute_0
     cmd: python
     args: >-
@@ -123,11 +161,12 @@ routines:
       --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
-      --n-fdm 34 --t-det 256 --n-grid 256
+      --n-fdm 34 --t-det 192 --n-grid 256
       --cube-cadence-samples 128
       --t-int-search-us 1048.576
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --fan-in-min-corrs 15
+      --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
       --coarse-dm-owners-half-1 1
       --gpu-half 0 --search-node-id CN
@@ -139,15 +178,35 @@ routines:
       --detector-k-img unit
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
-      --layer1-max-samples 25000
+      --layer1-max-samples 10000
+      --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
+    hostargs:
+      lxd110h02: --coarse-dm-owners-half-0 2
+      lxd110h09: --coarse-dm-owners-half-0 4
+      lxd110h13: --coarse-dm-owners-half-0 6
+      n02: --coarse-dm-owners-half-0 2
+      n09: --coarse-dm-owners-half-0 4
+      n13: --coarse-dm-owners-half-0 6
     env:
       # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
       # always pass --device cuda:0 (the post-mask logical device).
       # half 0 → physical GPU 0.
       CUDA_VISIBLE_DEVICES: "0"
+      # M7.2-amend (2026-05-20): flip the cint8 + shift/calibration
+      # H2D copies in ``cube_pipeline._stage_h2d`` to ``non_blocking=
+      # True`` (the env knob gates ``copy_(..., non_blocking)`` on
+      # the cached GPU buffer). Without this, ``prefetch_build``
+      # still BLOCKS the CPU thread on the ~35 ms cint8 .to() even
+      # though the kernels themselves are issued on the dedicated
+      # prefetch CUDA stream, so the overlap window collapses to
+      # the imager/detector compute only. py-spy confirmed
+      # ``_stage_h2d`` line 614 as the CPU-side block. Enabling
+      # the env makes the H2D fully asynchronous on the prefetch
+      # stream, restoring the narrow-overlap window.
+      DSART_ENABLE_GPU_BUF_REUSE: "1"
 
   - name: search_compute_1
     cmd: python
@@ -157,11 +216,12 @@ routines:
       --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 4096 --n-filled 5000
       --bytes-per-cell 2
-      --n-fdm 34 --t-det 256 --n-grid 256
+      --n-fdm 34 --t-det 192 --n-grid 256
       --cube-cadence-samples 128
       --t-int-search-us 1048.576
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --fan-in-min-corrs 15
+      --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
       --coarse-dm-owners-half-1 1
       --gpu-half 1 --search-node-id CN
@@ -173,10 +233,20 @@ routines:
       --detector-k-img unit
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
-      --layer1-max-samples 25000
+      --layer1-max-samples 10000
+      --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
+    hostargs:
+      lxd110h02: --coarse-dm-owners-half-1 3
+      lxd110h09: --coarse-dm-owners-half-1 5
+      lxd110h13: --coarse-dm-owners-half-1 7
+      n02: --coarse-dm-owners-half-1 3
+      n09: --coarse-dm-owners-half-1 5
+      n13: --coarse-dm-owners-half-1 7
     env:
       # half 1 → physical GPU 1 (logical cuda:0 inside this process).
       CUDA_VISIBLE_DEVICES: "1"
+      # M7.2-amend (2026-05-20): see search_compute_0 for rationale.
+      DSART_ENABLE_GPU_BUF_REUSE: "1"

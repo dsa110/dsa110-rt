@@ -148,6 +148,15 @@ class RoutineSpec:
     # "Triton Error [CUDA]: context is destroyed" race; see the M7.1
     # report for the failure mode).
     env: dict[str, str] = field(default_factory=dict)
+    # M7.2 (2026-05-19) warmup-aware spawn ordering: this routine
+    # will not be spawned until ALL paths listed in ``gate_on_paths``
+    # exist on the local filesystem. Used to delay capture routines
+    # (dada_junkdb) until corr_fast / corr_slow have finished their
+    # multi-second Python + GPU + Triton import cold start (they
+    # touch a sentinel right before entering their main loop). The
+    # orchestrator deletes any pre-existing sentinels at the start
+    # of ``_verb_start`` so a re-start doesn't see stale files.
+    gate_on_paths: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +186,9 @@ class PipelineConfig:
                 hostargs=dict(r.get("hostargs") or {}),
                 when=r.get("when"),
                 env={str(k): str(v) for k, v in (r.get("env") or {}).items()},
+                gate_on_paths=tuple(
+                    str(p) for p in (r.get("gate_on_paths") or [])
+                ),
             )
             for r in (raw.get("routines") or [])
         )
@@ -516,6 +528,15 @@ class RtOrchestrator:
             if r.when is None or _evaluate_when(r.when, self._config.raw)
         )
 
+    # ------------------------------------------------------------------
+    # M7.2 (2026-05-19) warmup-aware spawn ordering
+    # ------------------------------------------------------------------
+    # Default timeout the orchestrator will wait on sentinel paths
+    # before opening the gate anyway. corr_fast's cold start runs ~90 s
+    # on a 2080Ti including Triton module imports; 240 s gives 2.5×
+    # headroom. Override via DSART_RT_GATE_TIMEOUT_S if a host is slow.
+    _GATE_DEFAULT_TIMEOUT_S = 240.0
+
     def _spawn_routines(
         self, routines: tuple[RoutineSpec, ...], val: Any
     ) -> None:
@@ -523,43 +544,129 @@ class RtOrchestrator:
         if not active:
             LOG.info("no routines to spawn (check captures.mode in config)")
             return
-        for r in active:
-            argv = self._build_argv(r, val)
-            log_path = self._routine_log_path(r.name)
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            # Per-routine env overlay on top of os.environ. Substitution
-            # (CHGROUP / CALSB / CN / CUSTOMDEC) is applied to env
-            # VALUES too, so e.g. CUDA_VISIBLE_DEVICES could use CN.
-            env = None
-            if r.env:
-                env = dict(os.environ)
-                for k, v in r.env.items():
-                    env[k] = self._substitute(str(v), val)
-                env_log = ", ".join(f"{k}={env[k]!r}" for k in r.env)
-            else:
-                env_log = ""
+
+        # Partition into two waves: routines that don't gate on
+        # anything spawn first (producers + consumers of the compute
+        # path); routines that DO gate spawn second (capture sources).
+        # Sentinel cleanup happens BEFORE wave 1 so stale files from a
+        # crashed prior run don't open the gate prematurely.
+        # gate_on_paths go through _substitute() so CN / CHGROUP /
+        # CALSB / CUSTOMDEC tokens resolve consistently with the argv
+        # tokens (per-node sentinel files avoid cross-node collisions
+        # when multiple corr_rt instances share /tmp via NFS).
+        wave1 = tuple(r for r in active if not r.gate_on_paths)
+        wave2 = tuple(r for r in active if r.gate_on_paths)
+        all_gate_paths: tuple[str, ...] = tuple({
+            self._substitute(p, val)
+            for r in wave2 for p in r.gate_on_paths
+        })
+        if all_gate_paths:
+            for p in all_gate_paths:
+                try:
+                    os.remove(p)
+                    LOG.info("removed stale sentinel %s", p)
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    LOG.warning("could not remove stale sentinel %s: %s", p, e)
+
+        # Wave 1: spawn ungated routines (compute path).
+        for r in wave1:
+            self._spawn_one_routine(r, val)
+        if wave2:
             LOG.info(
-                "spawn %s -> log=%s; argv=%s%s",
-                r.name, log_path, " ".join(shlex.quote(a) for a in argv),
-                f"; env_overlay={{{env_log}}}" if env_log else "",
+                "wave-1 spawned (%d routines); waiting for sentinels: %s",
+                len(wave1), list(all_gate_paths),
             )
-            # Use shell=False; capture all output to per-routine log.
-            log_fh = open(log_path, "ab", buffering=0)
-            try:
-                proc = subprocess.Popen(  # noqa: S603 — argv is operator-controlled
-                    argv,
-                    stdout=log_fh,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                    env=env,
+            # Wait for sentinels. Capture routines (wave 2) stay gated
+            # until all listed paths exist. If the gate times out we
+            # open it anyway and log a warning — better to run with a
+            # warmup transient than to deadlock the start verb.
+            timeout_s = float(
+                os.environ.get(
+                    "DSART_RT_GATE_TIMEOUT_S",
+                    self._GATE_DEFAULT_TIMEOUT_S,
                 )
-            except FileNotFoundError as exc:
-                log_fh.close()
-                LOG.error("spawn %s failed: %s (cmd not found: %r)",
-                          r.name, exc, argv[0])
-                continue
-            self._children[r.name] = proc
+            )
+            self._wait_for_sentinels(all_gate_paths, timeout_s=timeout_s)
+            # Wave 2: spawn gated routines (capture path).
+            for r in wave2:
+                self._spawn_one_routine(r, val)
+
+    def _wait_for_sentinels(
+        self,
+        paths: tuple[str, ...],
+        *,
+        timeout_s: float,
+    ) -> None:
+        """Block until every path in ``paths`` exists, or ``timeout_s``
+        elapses. Polls at 0.5 s. Honors ``self._stop_evt`` so SIGTERM
+        during the wait short-circuits cleanly.
+        """
+        t_start = time.monotonic()
+        pending = list(paths)
+        while pending:
+            if self._stop_evt.is_set():
+                LOG.info("gate wait interrupted by stop signal")
+                return
+            still_pending = [p for p in pending if not os.path.exists(p)]
+            if not still_pending:
+                elapsed = time.monotonic() - t_start
+                LOG.info("all gate sentinels present after %.1fs", elapsed)
+                return
+            pending = still_pending
+            if (time.monotonic() - t_start) > timeout_s:
+                LOG.warning(
+                    "gate timeout: %.1fs elapsed, still missing %s; "
+                    "opening gate anyway (capture routines may see a "
+                    "warmup transient on consumers)",
+                    timeout_s, pending,
+                )
+                return
+            self._stop_evt.wait(0.5)
+
+    def _spawn_one_routine(self, r: RoutineSpec, val: Any) -> None:
+        argv = self._build_argv(r, val)
+        log_path = self._routine_log_path(r.name)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        # Per-routine env overlay on top of os.environ. Substitution
+        # (CHGROUP / CALSB / CN / CUSTOMDEC) is applied to env
+        # VALUES too, so e.g. CUDA_VISIBLE_DEVICES could use CN.
+        env = None
+        if r.env:
+            env = dict(os.environ)
+            for k, v in r.env.items():
+                env[k] = self._substitute(str(v), val)
+            env_log = ", ".join(f"{k}={env[k]!r}" for k in r.env)
+        else:
+            env_log = ""
+        gate_log = (
+            f"; gate_on_paths={list(r.gate_on_paths)}"
+            if r.gate_on_paths else ""
+        )
+        LOG.info(
+            "spawn %s -> log=%s; argv=%s%s%s",
+            r.name, log_path, " ".join(shlex.quote(a) for a in argv),
+            f"; env_overlay={{{env_log}}}" if env_log else "",
+            gate_log,
+        )
+        # Use shell=False; capture all output to per-routine log.
+        log_fh = open(log_path, "ab", buffering=0)
+        try:
+            proc = subprocess.Popen(  # noqa: S603 — argv is operator-controlled
+                argv,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            log_fh.close()
+            LOG.error("spawn %s failed: %s (cmd not found: %r)",
+                      r.name, exc, argv[0])
+            return
+        self._children[r.name] = proc
 
     def _build_argv(self, r: RoutineSpec, val: Any) -> list[str]:
         cmd_parts = shlex.split(r.cmd)

@@ -280,15 +280,22 @@ class GpuImager:
         # Calibration arrays (optional). Shape / dtype validation
         # happens inside fused_dequant_combine_per_fdm; we bind the
         # variables here so all per-fdm calls share the same tensors.
+        # M7.4: accept BOTH the legacy 1-D [N_chg] form and the new
+        # 2-D [N_chg, T_stream] per-(chgroup, t) form. The kernel
+        # dispatch inside ``fused_dequant_combine_per_fdm`` switches
+        # on rank; the imager just forwards.
         for name, cal in (
             ("chgroup_scales", chgroup_scales),
             ("chgroup_offsets_re", chgroup_offsets_re),
             ("chgroup_offsets_im", chgroup_offsets_im),
         ):
-            if cal is not None and cal.shape != (cfg.n_chgroup,):
+            if cal is None:
+                continue
+            valid_shapes = ((cfg.n_chgroup,), (cfg.n_chgroup, t_stream))
+            if tuple(cal.shape) not in valid_shapes:
                 raise ValueError(
                     f"{name}.shape={tuple(cal.shape)}, "
-                    f"expected ({cfg.n_chgroup},)"
+                    f"expected {valid_shapes[0]} or {valid_shapes[1]}"
                 )
 
         # Process fdm trials in small chunks so cuFFT sees a tiny batch

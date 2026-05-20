@@ -1315,7 +1315,137 @@ class DeterministicDetector(torch.nn.Module):
         per_kernel_cands: List[Candidate] = []
         argmax_snr: Optional[torch.Tensor] = None
         argmax_winner: Optional[torch.Tensor] = None
-        for k_idx, kernel in enumerate(self._kernel_bank):
+        # M7.2 fast path: single fused multi-boxcar argmax pass when the
+        # bank is K_img=1 / K_dm=1 (i.e., the v1-collapsed bank where
+        # ``amortise_time_cumsum`` is true) and we have ≥ 2 kernels. The
+        # fused Triton kernel reads the padded cumsum once per output
+        # cell and produces (max_snr, winner_kernel_idx) — replacing K
+        # cube-sized boxcar passes + K topk calls with one of each.
+        fused_done = False
+        disable_fused = bool(
+            int(os.environ.get("DSART_DISABLE_FUSED_MULTI_BOXCAR", "0"))
+        )
+        if (
+            cs is not None
+            and amortise_time_cumsum
+            and K >= 2
+            and not use_argmax_decode
+            and self._streaming_decoder == "topk_lowmem"
+            and not disable_fused
+            and cube.dtype in (torch.float16, torch.float32)
+        ):
+            from .triton_boxcar import multi_boxcar_argmax_triton
+
+            pad_left_full = int(amortise_max_width) // 2
+            widths_host = [int(k.k_time_width) for k in self._kernel_bank]
+            offsets_host = [pad_left_full - (w // 2) for w in widths_host]
+            sigma_inv_host = [
+                1.0 / max(float(s_k_decode[k].item()), 1e-30)
+                for k in range(K)
+            ]
+            widths_t = torch.tensor(
+                widths_host, dtype=torch.int32, device=cube.device,
+            )
+            offsets_t = torch.tensor(
+                offsets_host, dtype=torch.int32, device=cube.device,
+            )
+            sigma_inv_t = torch.tensor(
+                sigma_inv_host, dtype=torch.float32, device=cube.device,
+            )
+
+            fused_result = multi_boxcar_argmax_triton(
+                cs,
+                widths=widths_t,
+                offsets=offsets_t,
+                sigma_inv=sigma_inv_t,
+                n_out=n_out_eff,
+                t_base=t_base,
+                out_max_dtype=cube.dtype,
+            )
+            if fused_result is not None:
+                max_snr_cube, winner_cube = fused_result
+
+                # Per-kernel σ for the Layer-2 update: gather subsamples
+                # from cs at indices ``self._layer2_idx[k]`` (which index
+                # a [interior_t × F × H × W] flat layout). For each
+                # kernel k, score_k = cs[t+off[k]+w[k]] - cs[t+off[k]];
+                # subtract at the random subsample positions.
+                if layer2_subsample_active:
+                    t_offset = (
+                        int(t_base) if t_base > 0 else int(t_sig_lo)
+                    )
+                    n_f_l = int(cube.shape[1])
+                    n_h_l = int(cube.shape[2])
+                    n_w_l = int(cube.shape[3])
+                    FHW = n_f_l * n_h_l * n_w_l
+                    cs_flat = cs.reshape(-1)
+                    for k_idx2 in range(K):
+                        idx_k = self._layer2_idx[k_idx2]
+                        t_in = idx_k // FHW
+                        fhw_in = idx_k % FHW
+                        low_idx = (
+                            (t_in + t_offset + offsets_host[k_idx2]) * FHW
+                            + fhw_in
+                        )
+                        high_idx = (
+                            (
+                                t_in + t_offset + offsets_host[k_idx2]
+                                + widths_host[k_idx2]
+                            )
+                            * FHW + fhw_in
+                        )
+                        low_v = cs_flat.index_select(0, low_idx).to(torch.float32)
+                        high_v = cs_flat.index_select(0, high_idx).to(torch.float32)
+                        sigma_samples[k_idx2] = high_v - low_v
+                else:
+                    # Full-interior path: materialise per-kernel score
+                    # cubes for the sigma estimate (rare; OOMs at prod
+                    # geometry so layer2_subsample_active is True there).
+                    for k_idx2 in range(K):
+                        score_k_full = boxcar_from_padded_cumsum(
+                            cs, axis=0,
+                            width=int(widths_host[k_idx2]),
+                            max_width=amortise_max_width,
+                            n_out=n_out_eff,
+                            t_base=t_base,
+                            out_dtype=torch.float32,
+                            w_tile_size=tile_size,
+                        )
+                        if t_base > 0:
+                            interior_view = score_k_full
+                        else:
+                            interior_view = score_k_full.narrow(
+                                0, t_sig_lo, t_sig_hi - t_sig_lo,
+                            )
+                        sigma_full[k_idx2] = interior_view.reshape(-1)
+                        del score_k_full
+
+                # Single global topk + decode on (max_snr, winner_idx).
+                per_kernel_cands = decode_topk_argmax_lowmem(
+                    max_snr_cube,
+                    winner_cube,
+                    threshold=self._threshold_sigma,
+                    kernel_ids=[k.kernel_id for k in self._kernel_bank],
+                    kernel_time_widths=widths_host,
+                    merge_radius_lm=self._merge_radius_lm,
+                    merge_radius_fdm=self._merge_radius_fdm,
+                    merge_radius_t=self._merge_radius_t,
+                    detector_version=self._detector_version,
+                    search_node_id=self._search_node_id,
+                    gpu_half=self._gpu_half,
+                    event_specnum=(int(event_specnum) + t_base),
+                    fine_to_coarse=fine_to_coarse,
+                    fine_dm_pc_cm3=fine_dm_pc_cm3,
+                    n_top=decoder_n_top * K,
+                )
+                del max_snr_cube, winner_cube
+                fused_done = True
+
+        if fused_done:
+            kernel_iter: list = []
+        else:
+            kernel_iter = list(enumerate(self._kernel_bank))
+        for k_idx, kernel in kernel_iter:
             if cs is not None:
                 score_k = boxcar_from_padded_cumsum(
                     cs,
@@ -1467,7 +1597,10 @@ class DeterministicDetector(torch.nn.Module):
 
         # Note: the amortise cs buffer is owned by the detector and
         # reused across cubes; do not free here.
-        if use_argmax_decode:
+        if use_argmax_decode or fused_done:
+            # ``decode_topk_argmax_lowmem`` already produced
+            # de-duplicated candidates across the kernel bank — skip the
+            # cross-kernel merger.
             merged = per_kernel_cands
         else:
             merged = merge_across_kernels(
