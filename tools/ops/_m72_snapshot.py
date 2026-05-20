@@ -40,11 +40,31 @@ def summarise_corr(cn):
     buffers = d.get("buffers") or {}
     bufs = {k: fmt_dada(v) for k, v in buffers.items()}
     uptime = d.get("uptime_s")
+    # Capture mon: pull /mon/corr_rt/<cn>/capture/<port> for each
+    # SNAP UDP port (4011/4012). The sidecar publishes either a
+    # full snapshot or a 'shm_status: missing' placeholder; we
+    # collapse to one summary string per port for the snapshot.
+    capture_summary = {}
+    for port in (4011, 4012):
+        cap = store.get_dict(f"/mon/corr_rt/{cn}/capture/{port}") or {}
+        if not cap:
+            capture_summary[port] = "-"
+            continue
+        if cap.get("shm_status") == "missing":
+            capture_summary[port] = "MISS"
+            continue
+        arm = cap.get("arm_state", "?")
+        gbps = cap.get("rate_gbps", 0.0)
+        kdrop = cap.get("rate_kernel_drop_pps", 0)
+        degraded = cap.get("degraded", False)
+        flag = "!" if degraded or kdrop > 0 else ""
+        capture_summary[port] = f"{arm[:4]}/{gbps:.2f}{flag}"
     return {
         "state": state,
         "uptime_s": uptime,
         "routines": rou_states,
         "buffers": bufs,
+        "capture": capture_summary,
     }
 
 
@@ -68,8 +88,9 @@ def main():
           f"routines={s['routines']}")
     print()
     print("=== CORR NODES ===")
-    header = f"{'cn':>3} {'state':<9} {'up':>6} {'cap_a':>5} {'cap_b':>5} " \
-             f"{'merge':>5} {'cs':>5} {'cf':>5} {'drain':>5} | dada/eada/fada/bada"
+    header = (f"{'cn':>3} {'state':<9} {'up':>6} {'cap_a':>5} {'cap_b':>5} "
+              f"{'merge':>5} {'cs':>5} {'cf':>5} {'drain':>5} "
+              f"{'mon':>4} | dada/eada/fada/bada | cap4011 / cap4012")
     print(header)
     print("-" * len(header))
     for cn in CORR_NODES_CN:
@@ -78,14 +99,17 @@ def main():
         b = c["buffers"]
         up = (f"{c['uptime_s']:.0f}s"
               if isinstance(c['uptime_s'], (int, float)) else "-")
-        # Pick the right cap routine name based on what showed up
         cap_a = r.get("cap_a_junkdb") or r.get("cap_a_real") or "-"
         cap_b = r.get("cap_b_junkdb") or r.get("cap_b_real") or "-"
+        mon_alive = r.get("capture_control", "-")
+        cap_state = c.get("capture", {})
         print(f"{cn:>3} {c['state']:<9} {up:>6} {cap_a:>5} {cap_b:>5} "
               f"{r.get('merge','-'):>5} {r.get('corr_slow','-'):>5} "
               f"{r.get('corr_fast','-'):>5} {r.get('bada_drain','-'):>5} "
-              f"| {b.get('dada','-')}/{b.get('eada','-')}/"
-              f"{b.get('fada','-')}/{b.get('bada','-')}")
+              f"{mon_alive:>4} | "
+              f"{b.get('dada','-')}/{b.get('eada','-')}/"
+              f"{b.get('fada','-')}/{b.get('bada','-')} | "
+              f"{cap_state.get(4011, '-'):>10} / {cap_state.get(4012, '-'):>10}")
 
 
 if __name__ == "__main__":

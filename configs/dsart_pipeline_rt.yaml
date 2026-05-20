@@ -85,14 +85,37 @@ routines:
       - /tmp/dsart-corr-fast-CN.ready
       - /tmp/dsart-corr-slow-CN.ready
 
+  # Vendored dsart capture binary (built by setup.py build_ext, lives
+  # inside the dsa110-rt package tree). Improvements vs upstream
+  # legacy dsaX_capture_manythread: recvmmsg(64) batch receive,
+  # deterministic arming (no auto-arm: requires explicit etcd
+  # utc_start verb), explicit SO_RCVBUF=256 MiB, POSIX-shm mon
+  # publisher consumed by capture_control sidecar. See
+  # src/dsart/capture/README.md for the full diff vs upstream.
+  #
+  # The `-p` flag selects the SNAP-side UDP data port; -k selects the
+  # PSRDADA output key (dada / eada). -q is optional; if unset the
+  # binary defaults to 11223 for dPort=4011 and 11224 for dPort=4012
+  # (matches the legacy convention dsart_rt._send_utc_udp targets).
   - name: cap_a_real
     when: captures.mode == real
-    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_capture_manythread
-    args: -k dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
+    cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
+    args: -o dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
   - name: cap_b_real
     when: captures.mode == real
-    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_capture_manythread
-    args: -k eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+    cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
+    args: -o eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+
+  # Mon-publisher sidecar -- snapshots the POSIX-shm segments the two
+  # capture binaries publish, pushes into etcd at
+  # /mon/corr_rt/CN/capture/<port>. Active in both `real` (production)
+  # and `junkdb` (synthetic) modes -- in junkdb mode the shm doesn't
+  # exist and the sidecar publishes a single 'shm_status: missing'
+  # placeholder lane per port, so the dashboard surface stays stable
+  # across captures.mode flips.
+  - name: capture_control
+    cmd: python
+    args: -u -m dsart.services.capture_control --udp-ports 4011,4012 --cn-id CN --log-level INFO
 
   # ---- merge (always on; reads dada+eada -> writes fada) ------------
   # dsaX_merge reads dada+eada and writes fada (the merged-voltage
