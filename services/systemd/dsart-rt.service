@@ -1,0 +1,67 @@
+# dsart-rt control-plane orchestrator (M7 chunk 0).
+#
+# ONE user-systemd service per corr or search node. Mirrors the legacy
+# `corr.py` pattern (REALTIME_FRB_SEARCH.md §8): a single long-running
+# Python process that owns the pipeline lifecycle, reads its config
+# from etcd, and watches /cmd/<namespace>/<n> for verbs.
+#
+# Per-node parameters (DSART_INSTANCE, DSART_CN, conda env path) live
+# in /home/ubuntu/.config/dsart-rt.env, populated by:
+#   tools/ops/dsart-rt services install --corr n06 --search n01
+#
+# Per Q16 design decision (m7/control-plane scoping doc): the unit
+# sources the conda env ONCE at startup and lets fork-execed children
+# inherit $PATH / $PYTHONPATH / $CONDA_PREFIX. Children that need a
+# different env (e.g. a CUDA-pinned python) wrap themselves in
+# `conda run -n <env>` in their /cnf/<instance>_rt routine entry.
+#
+# Install (as the ubuntu user, NOT as root):
+#   mkdir -p ~/.config/systemd/user
+#   cp services/systemd/dsart-rt.service ~/.config/systemd/user/dsart-rt.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dsart-rt
+#
+# The tools/ops/dsart-rt operator CLI wraps these steps.
+
+[Unit]
+Description=DSA-110 dsart-rt control plane (M7)
+# We don't depend on a multi-user.target here because we're a user
+# service (--user). Failing fast on etcd unreachable is fine; systemd
+# will restart us per the Restart= policy.
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/dsart-rt.env
+
+# Conda env activation pattern (per Q16): activate once, exec the
+# orchestrator with the env's python so children inherit PATH +
+# PYTHONPATH + LD_LIBRARY_PATH (psrdada-python needs libpsrdada.so on
+# LD_LIBRARY_PATH).
+#
+# DSART_CONDA_ENV (default: dsa110-rt) lets the operator pin a different
+# env per node from the env file if needed.
+ExecStart=/bin/bash -lc 'source ${DSART_CONDA_ROOT:-/home/ubuntu/miniforge3}/etc/profile.d/conda.sh && conda activate ${DSART_CONDA_ENV:-dsa110-rt} && exec python -m dsart.services.dsart_rt -in $DSART_INSTANCE -cn $DSART_CN'
+
+WorkingDirectory=%h
+
+# Lifecycle: SIGTERM triggers the orchestrator's signal handler which
+# auto-stops the pipeline (kills routines + destroys buffers) before
+# exiting. Give it 30 s for slow GPU children to flush; force-kill
+# after that.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+SendSIGKILL=yes
+
+# Restart only on unexpected failure (orchestrator crash). A clean
+# `systemctl --user stop` should NOT trigger restart.
+Restart=on-failure
+RestartSec=5s
+
+# StandardOutput / StandardError -> journald. Inspect with
+# `journalctl --user -u dsart-rt -f`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -55,6 +55,7 @@ from ..common.contracts import Candidate, CandidateFlags
 __all__ = [
     "decode_local_max",
     "decode_topk_lowmem",
+    "decode_topk_argmax_lowmem",
     "filter_to_canonical",
 ]
 
@@ -78,6 +79,7 @@ def decode_local_max(
     event_specnum: int = 0,
     fine_to_coarse: Optional[torch.Tensor] = None,
     fine_dm_pc_cm3: Optional[torch.Tensor] = None,
+    snr_divisor: float = 1.0,
 ) -> List[Candidate]:
     """Run per-kernel threshold + 4D local-max NMS and emit Candidates.
 
@@ -140,10 +142,21 @@ def decode_local_max(
     delta_fdm = int(k_dm_width) // 2 + 1
     delta_t = int(k_time_width) // 2 + 1
 
+    # Rescale threshold once on the host so we can compare raw scores
+    # (skips the per-kernel cube-sized SNR materialisation when the
+    # caller passes a raw score + snr_divisor > 1).
+    snr_divisor_f = float(snr_divisor)
+    if snr_divisor_f <= 0.0:
+        raise ValueError(
+            f"snr_divisor={snr_divisor_f}, expected > 0"
+        )
+    inv_snr_divisor = 1.0 / snr_divisor_f
+    raw_threshold = float(threshold) * snr_divisor_f
+
     # Threshold prune. Scores at or below threshold can never produce
     # candidates so we mask them out before max-pool to keep the NMS
     # window from inheriting a sub-threshold "winner" by default.
-    above = score > threshold
+    above = score > raw_threshold
     if not torch.any(above):
         return []
 
@@ -203,7 +216,7 @@ def decode_local_max(
                 event_specnum=int(event_specnum) + int(t_idx),
                 width_samples=int(k_time_width),
                 kernel_id=kernel_id,
-                snr=float(snr_value),
+                snr=float(snr_value) * inv_snr_divisor,
                 detector_version=detector_version,
                 flags=int(CandidateFlags.NONE),
                 search_node_id=int(search_node_id),
@@ -233,6 +246,7 @@ def decode_topk_lowmem(
     fine_to_coarse: Optional[torch.Tensor] = None,
     fine_dm_pc_cm3: Optional[torch.Tensor] = None,
     n_top: int = 64,
+    snr_divisor: float = 1.0,
 ) -> List[Candidate]:
     """Memory-bounded peak finder for one kernel's SNR cube.
 
@@ -278,10 +292,20 @@ def decode_topk_lowmem(
             kernel per cube; n_top=64 leaves headroom for a handful
             of competing peaks within the NMS radii to be ordered
             by SNR before the cap.
+        snr_divisor: scalar divisor applied to ``score`` to convert
+            raw kernel-output values into SNR units (i.e. SNR =
+            score / snr_divisor). When > 1, ``score`` is expected to
+            be in raw (un-divided) units; ``threshold`` is rescaled
+            internally as ``threshold * snr_divisor`` so the
+            comparison happens on raw values without materialising a
+            divided cube. Emitted ``Candidate.snr`` values are
+            rescaled to true SNR units. Default 1.0 (input is already
+            SNR-normalised; behaviour identical to the historical
+            single-argument form).
 
     Returns:
         ``List[Candidate]`` ordered by descending SNR. Empty when
-        ``score.max() <= threshold``.
+        ``score.max() / snr_divisor <= threshold``.
     """
     if score.dim() != 4:
         raise ValueError(
@@ -289,9 +313,15 @@ def decode_topk_lowmem(
         )
     T_det, N_fdm, H, W = score.shape  # noqa: N806
 
-    snr_max_t = score.max()
-    if float(snr_max_t.item()) <= threshold:
-        return []
+    # Rescale threshold once on the host so the GPU work below
+    # operates on raw scores (no per-kernel cube-sized divide).
+    snr_divisor_f = float(snr_divisor)
+    if snr_divisor_f <= 0.0:
+        raise ValueError(
+            f"snr_divisor={snr_divisor_f}, expected > 0"
+        )
+    inv_snr_divisor = 1.0 / snr_divisor_f
+    raw_threshold = float(threshold) * snr_divisor_f
 
     delta_l = max(2, int(k_psf_radius))
     delta_m = max(2, int(k_psf_radius))
@@ -300,6 +330,9 @@ def decode_topk_lowmem(
 
     flat = score.contiguous().reshape(-1)
     k = int(min(n_top, flat.numel()))
+    # Single fused topk: skip the prior .max() early-exit. ``topk(k)``
+    # already returns the descending top-k, so if top_vals[0] is below
+    # threshold we exit after the same single D->H of <= n_top values.
     top_vals, top_indices = torch.topk(flat, k=k)
     top_vals_np = top_vals.detach().cpu().numpy()
     top_indices_np = top_indices.detach().cpu().numpy()
@@ -307,8 +340,8 @@ def decode_topk_lowmem(
     out: List[Candidate] = []
     accepted: List[Tuple[int, int, int, int]] = []  # (t, fdm, l, m)
     for v, ix in zip(top_vals_np, top_indices_np):
-        v_f = float(v)
-        if v_f <= threshold:
+        v_raw = float(v)
+        if v_raw <= raw_threshold:
             break
         t = int(ix) // (N_fdm * H * W)
         rem = int(ix) % (N_fdm * H * W)
@@ -342,6 +375,123 @@ def decode_topk_lowmem(
                 event_specnum=int(event_specnum) + int(t),
                 width_samples=int(k_time_width),
                 kernel_id=kernel_id,
+                snr=v_raw * inv_snr_divisor,
+                detector_version=detector_version,
+                flags=int(CandidateFlags.NONE),
+                search_node_id=int(search_node_id),
+                gpu_half=int(gpu_half),
+            )
+        )
+    return out
+
+
+def decode_topk_argmax_lowmem(
+    score: torch.Tensor,
+    winner_kernel_idx: torch.Tensor,
+    *,
+    threshold: float,
+    kernel_ids: List[str],
+    kernel_time_widths: List[int],
+    merge_radius_lm: int,
+    merge_radius_fdm: int,
+    merge_radius_t: int,
+    detector_version: str = "v1.M5",
+    search_node_id: int = 0,
+    gpu_half: int = 0,
+    event_specnum: int = 0,
+    fine_to_coarse: Optional[torch.Tensor] = None,
+    fine_dm_pc_cm3: Optional[torch.Tensor] = None,
+    n_top: int = 256,
+) -> List[Candidate]:
+    """Single-pass low-memory decode on a max-over-kernel SNR cube.
+
+    ``score`` is the per-cell max SNR over the active kernel bank and
+    ``winner_kernel_idx`` stores the winning kernel index per cell.
+    The function applies one global top-k pass + merge-radius
+    suppression and emits Candidates annotated with the winner kernel's
+    metadata.
+    """
+    if score.dim() != 4:
+        raise ValueError(
+            f"score.dim()={score.dim()}, expected 4 [T_det, N_fdm, H, W]"
+        )
+    if winner_kernel_idx.shape != score.shape:
+        raise ValueError(
+            f"winner_kernel_idx.shape={tuple(winner_kernel_idx.shape)} "
+            f"!= score.shape={tuple(score.shape)}"
+        )
+    if merge_radius_lm < 0 or merge_radius_fdm < 0 or merge_radius_t < 0:
+        raise ValueError(
+            "merge radii must be >= 0; got "
+            f"({merge_radius_lm}, {merge_radius_fdm}, {merge_radius_t})"
+        )
+    if len(kernel_ids) != len(kernel_time_widths):
+        raise ValueError(
+            "kernel_ids and kernel_time_widths length mismatch: "
+            f"{len(kernel_ids)} != {len(kernel_time_widths)}"
+        )
+    if not kernel_ids:
+        return []
+
+    T_det, N_fdm, H, W = score.shape  # noqa: N806
+    snr_max_t = score.max()
+    if float(snr_max_t.item()) <= threshold:
+        return []
+
+    flat = score.contiguous().reshape(-1)
+    k = int(min(max(1, n_top), flat.numel()))
+    top_vals, top_indices = torch.topk(flat, k=k)
+    top_vals_np = top_vals.detach().cpu().numpy()
+    top_indices_np = top_indices.detach().cpu().numpy()
+    winner_flat = winner_kernel_idx.contiguous().reshape(-1)
+
+    out: List[Candidate] = []
+    accepted: List[Tuple[int, int, int, int]] = []  # (t, fdm, l, m)
+    for v, ix in zip(top_vals_np, top_indices_np):
+        v_f = float(v)
+        if v_f <= threshold:
+            break
+        t = int(ix) // (N_fdm * H * W)
+        rem = int(ix) % (N_fdm * H * W)
+        f = rem // (H * W)
+        rem = rem % (H * W)
+        l_ = rem // W
+        m_ = rem % W
+
+        suppressed = False
+        for at, af, al, am in accepted:
+            if (
+                abs(t - at) <= merge_radius_t
+                and abs(f - af) <= merge_radius_fdm
+                and abs(l_ - al) <= merge_radius_lm
+                and abs(m_ - am) <= merge_radius_lm
+            ):
+                suppressed = True
+                break
+        if suppressed:
+            continue
+        accepted.append((t, f, l_, m_))
+
+        k_idx = int(winner_flat[int(ix)].item())
+        if k_idx < 0 or k_idx >= len(kernel_ids):
+            continue
+        if fine_to_coarse is not None:
+            dm_idx = int(fine_to_coarse[f].item())
+        else:
+            dm_idx = int(f)
+        if fine_dm_pc_cm3 is not None:
+            dm_fine = float(fine_dm_pc_cm3[f].item())
+        else:
+            dm_fine = float(f)
+        out.append(
+            Candidate(
+                l=float(l_),
+                m=float(m_),
+                dm_fine=dm_fine,
+                dm_idx=dm_idx,
+                event_specnum=int(event_specnum) + int(t),
+                width_samples=int(kernel_time_widths[k_idx]),
+                kernel_id=kernel_ids[k_idx],
                 snr=v_f,
                 detector_version=detector_version,
                 flags=int(CandidateFlags.NONE),

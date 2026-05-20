@@ -136,8 +136,28 @@ def test_streaming_matches_batched_noise_only_no_candidates() -> None:
 def test_streaming_matches_batched_with_injection() -> None:
     """Inject one wide-boxcar pulse at a known (l, m, dm, t) → both
     paths must recover at least one candidate at the injection cell
-    with matching SNR. Use a generous amplitude so the recovered SNR
-    well exceeds θ=8."""
+    with matching SNR after the Layer-2 EMA has burned in. Use a
+    generous amplitude so the recovered SNR well exceeds θ=8.
+
+    Single-pass streaming divides scores by the *previous* cube's
+    σ_k (the production single-pass design, chunk-8b: σ_k is updated
+    at end-of-cube so the new EMA applies to cube N+1). The batched
+    two-pass forward updates σ_k mid-call and divides by the
+    measured σ_k. For the very first cube the streaming divisor is
+    the analytic seed sqrt(K_dm·K_time) while the batched divisor
+    is the measured σ_k — they differ by up to ~5 % for small
+    geometries.
+
+    After ``n_burnin`` cubes of identical-statistics noise the σ_k
+    EMA from streaming converges to the per-cube measured σ_k, so
+    both paths re-converge on SNR. The test feeds 6 noise cubes
+    (n_burnin=4 by default) and asserts SNR equality on the 7th
+    cube, which carries the same injection in a fresh noise
+    realisation. The strict (rtol=1e-4) equality used by the
+    earlier two-pass implementation is replaced with rtol=2e-2 to
+    absorb the fp32 rounding accumulated through the EMA + the per-
+    cube subsample noise in the σ-clip estimator.
+    """
     cfg = CubeInjectionConfig(
         l_pix=4, m_pix=4,
         fine_dm_idx=2,
@@ -146,25 +166,34 @@ def test_streaming_matches_batched_with_injection() -> None:
         width_samples=4,
         profile="boxcar",
     )
+
+    det_b = _make_detector(streaming=False)
+    det_s = _make_detector(streaming=True)
+
+    # Warm up the σ_k EMAs on identical noise (no injection); after
+    # ``n_burnin`` cubes both paths' σ_k tracks the measured σ.
+    rng_burn = np.random.default_rng(20260519)
+    for _ in range(6):
+        cube_n, vmask_n, sigma_l1_n = synthesise_cube(
+            t_det=16, n_fdm=4, n_grid=8, rng=rng_burn, injections=(),
+        )
+        det_b.forward(cube_n, vmask_n, sigma_l1_n)
+        det_s.forward(cube_n, vmask_n, sigma_l1_n)
+
+    # Now run the injection cube through both detectors. The σ_k EMA
+    # is past burn-in so streaming's previous-cube divisor equals
+    # batched's measured divisor.
     cube_t, validity_mask, sigma_layer1 = synthesise_cube(
         t_det=16, n_fdm=4, n_grid=8,
         rng=np.random.default_rng(42),
         injections=(cfg,),
     )
-
-    det_b = _make_detector(streaming=False)
-    det_s = _make_detector(streaming=True)
-
     cands_b = det_b.forward(cube_t, validity_mask, sigma_layer1)
     cands_s = det_s.forward(cube_t, validity_mask, sigma_layer1)
 
-    # Both paths must recover at least one candidate.
     assert cands_b, "batched forward returned no candidates"
     assert cands_s, "streaming forward returned no candidates"
 
-    # Top-SNR candidate from each must agree on the (l, m, dm_idx, t)
-    # bin within the merger's NMS tolerance, AND the SNRs must agree
-    # to fp32 round-off (both paths are fp32 here).
     top_b = max(cands_b, key=lambda c: c.snr)
     top_s = max(cands_s, key=lambda c: c.snr)
     assert top_b.kernel_id == top_s.kernel_id
@@ -172,12 +201,13 @@ def test_streaming_matches_batched_with_injection() -> None:
     assert abs(top_b.m - top_s.m) <= 1
     assert top_b.dm_idx == top_s.dm_idx
     assert abs(top_b.event_specnum - top_s.event_specnum) <= 1
-    assert math.isclose(top_b.snr, top_s.snr, rel_tol=1e-4, abs_tol=1e-3)
+    assert math.isclose(top_b.snr, top_s.snr, rel_tol=2e-2)
 
-    # Layer-2 σ_k post-update agrees per kernel.
+    # Layer-2 σ_k post-update agrees per kernel within the same
+    # rounding budget.
     sk_b = det_b.layer2_state.s_k.detach().cpu().numpy()
     sk_s = det_s.layer2_state.s_k.detach().cpu().numpy()
-    assert np.allclose(sk_b, sk_s, rtol=1e-4, atol=1e-4)
+    assert np.allclose(sk_b, sk_s, rtol=2e-2, atol=1e-3)
 
 
 def test_streaming_matches_batched_warmup_flag() -> None:

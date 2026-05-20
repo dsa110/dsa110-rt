@@ -1,0 +1,252 @@
+# dsart-rt search-node pipeline config — pushed to etcd under
+# /cnf/search_rt by tools/ops/push_dsart_to_etcd.py and consumed at
+# runtime by services/dsart_rt.py (`-in search_rt`).
+#
+# Search nodes have NO PSRDADA buffers in the M4a transport contract —
+# the search-RX writes directly into a POSIX-shm SPMC sparse ring
+# (src/dsart/transport/recv_ring.c + production_rx_ring.py) and the
+# search-compute halves attach to that ring. So 'buffers:' is empty by
+# design; recv_ring is created/torn-down inside the search-rx process
+# itself (M4a chunk 4 ownership), not by dsart_rt's dada_db setup.
+#
+# Schema parity with dsart_pipeline_rt.yaml is preserved so the same
+# dsart_rt.py orchestrator binary handles both instances.
+schema_version: 1
+
+# No mode switch for search — the search-side wire format is always
+# the M4a prod-frame UDP regardless of whether the corr senders are
+# in junkdb or real mode. Synthetic search-side load tests (M7.2)
+# instead use bench/net_pair.py as the TX side, with the real search-rx
+# binary as the RX side; we don't fork the search-side pipeline graph.
+
+buffers: []
+
+# Per-node substitution conventions (dsart_rt._substitute):
+#   CN     -> cn_id integer (1 / 2 / 9 / 13 for the four search nodes).
+#   CALSB  -> "sb%02d" of the corr chgroup; UNUSED here (search nodes
+#             have no chgroup). Don't reference it from search args.
+#   CHGROUP -> chgroup index 0..15; ALSO unused here.
+# Per-host overrides via the `hostargs:` block pick up first by FQDN
+# (n01.pro.pvt) then bare short hostname (n01).
+
+routines:
+  # ---- search_rx (M4a chunk 6 + M7.2 ring publish) -----------------
+  # Long-running C-epoll fan-in. Binds 16 UDP ports (6625..6640 = one
+  # per corr chgroup) on the node's nic.search address, drains each
+  # via a single epoll pthread, reassembles fragmented prod_frames and
+  # publishes reassembled cube slots into a POSIX-shm SPMC ring named
+  # /dsart-rxring-<cn_id> (e.g. /dsart-rxring-1 on n01). The two
+  # search_compute halves attach to this same ring as read-only
+  # consumers (n_filled, t_buf_samples, bytes_per_cell must match
+  # exactly between owner and consumer or the ctypes header check
+  # rejects at attach time).
+  #
+  # Op-point (M7.2 production): n_corr=16, n_coarse_dm=8,
+  # bytes_per_cell=2 (cint8 complex), t_buf_samples=4096 (~16 cube
+  # cadences of headroom — safe for a momentary compute-half stall).
+  #
+  # SO_RCVBUF=256 MiB matches corner_turn.sh and the M7.PREP socket
+  # buffer note (/proc/sys/net/core/rmem_max must be ≥ 268435456 on
+  # the search nodes; M7.0 ops bootstrap raises it).
+  #
+  # The pattern_id table is intentionally omitted for M7.2; the smoke
+  # uses bench/net_pair.py as TX, which emits a known constant
+  # pattern_id per chgroup, but we run with no expected_pattern_id
+  # registered so every frame is accepted. Production M7.4+ will load
+  # a JSON file via --pattern-id-file.
+  - name: search_rx
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_rx
+      --port-base 6625 --n-ports 16
+      --so-rcvbuf-bytes 268435456
+      --shm-name /dsart-rxring-CN
+      --n-corr 16 --n-coarse-dm 8
+      --t-buf-samples 4096 --n-filled 5000
+      --bytes-per-cell 2
+      --status-interval-s 5.0
+      --log-level INFO
+    # Hostargs lookup tries the FQDN first, then the bare short hostname
+    # (dsart_rt.py:571). In the production lab `socket.gethostname()`
+    # returns `lxd110h<NN>` (the kernel-level container name), NOT the
+    # operator-facing `n<NN>` alias. We list BOTH forms so the yaml
+    # works in either case — the lab one is the path that actually
+    # matches today (verified on n01.pro.pvt 2026-05-17, M7.2.8 prep);
+    # the `n<NN>` keys are kept as future-proofing in case a node ever
+    # gets its kernel hostname renamed to the short alias.
+    hostargs:
+      lxd110h01: --bind-host 10.41.0.205
+      lxd110h02: --bind-host 10.41.0.222
+      lxd110h09: --bind-host 10.41.0.253
+      lxd110h13: --bind-host 10.41.0.238
+      n01: --bind-host 10.41.0.205
+      n02: --bind-host 10.41.0.222
+      n09: --bind-host 10.41.0.253
+      n13: --bind-host 10.41.0.238
+
+  # M7.3 (2026-05-20): per-search-node owner overrides
+  # ---------------------------------------------------
+  # The ``--coarse-dm-owners-half-{0,1}`` defaults set in each
+  # ``search_compute_{0,1}`` routine's ``args:`` block are for the n01
+  # 16x1 case (owners=0,1). In the 16x4 production fan-out each of the
+  # four search nodes owns a different pair of coarse-DMs:
+  #   n01 → 0, 1   (default in args:, no override needed)
+  #   n02 → 2, 3
+  #   n09 → 4, 5
+  #   n13 → 6, 7
+  # We bolt those onto the per-routine ``args:`` lists via the routine
+  # hostargs maps below. ``argparse`` is last-wins for scalar
+  # ``--coarse-dm-owners-half-{0,1}``, so the routine-level defaults
+  # are silently overridden by the per-host entries here. ``dsart_rt``
+  # tries the FQDN-style key (``lxd110h<NN>``) first then the bare
+  # short hostname (``n<NN>``) — we list both so the config works
+  # whether ``socket.gethostname()`` returns the kernel-level
+  # container name or the operator alias.
+
+  # ---- search_compute x 2 (one per GPU half) -----------------------
+  # Both halves attach the SAME ring (read-only) and process the same
+  # cube slots, but each one runs the detector on a disjoint slice of
+  # fine-DM trials from the shared v2 DM plan. In M7.2-low on n01:
+  #   half 0 owns coarse_dm index 0  -> K=34 fine rows
+  #   half 1 owns coarse_dm index 1  -> K=34 fine rows
+  # (M7.2-high uses owners 6 and 7).
+  #
+  # M7.2.8 flipped to PRODUCTION GPU op-point (user-clarified
+  # 2026-05-18): both halves pinned to cuda:0 / cuda:1,
+  # image_backend=gpu. The prior 89cb1bc commit had this on CPU with
+  # the comment "search nodes don't yet have a GPU pinned" — that was
+  # wrong; n01 (and the other 3 search nodes) each have 2 × RTX 2080 Ti
+  # (cuda:0, cuda:1, 11 GB each). The point of M7.2.8 is to verify the
+  # search-side GPU pipeline keeps real-time at production op-point on
+  # synthetic data, analogous to how M7.1 validated the corr-side
+  # GPU pipeline on dada_junkdb data.
+  #
+  # Production op-point:
+  #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan),
+  #   t_det=192, cube_cadence_samples=128
+  #     ⇒ search overlap = t_det - cube_cadence_samples = 64 samples
+  #       (= b_max, the minimum overlap that catches any pulse up to
+  #       64 samples wide straddling a cube boundary). M7.2 perf gate
+  #       (May 2026): drop from t_det=256 → 192 saved ~35 ms/cube
+  #       across imager + layer1 at the production op-point, bringing
+  #       the per-cube wall to ~105 ms inside the 134.218 ms RT budget.
+  #   t_int_search_us=1048.576 (matches corr t_int_fast at 32x native)
+  #
+  # The two halves run as independent processes so a crash in one
+  # doesn't take down the other; dsart_rt restarts them on the
+  # `start` verb. Each writes its own stderr log under
+  # ~/tmp/dsart-rt/search_rt-<cn_id>-search_compute_{0,1}.log.
+  #
+  # M6 sub-systems (clusterer, cube_dump, udp_listener, cands_logger)
+  # are all gated OFF for M7.2 — they land in M7.3 along with the
+  # full 16x4 fleet bring-up.
+  # M7.2-amend (2026-05-20): turned ON ``--pipeline-overlap`` for both
+  # halves. The narrow-overlap path (prefetch cube N+1 onto a
+  # dedicated CUDA H2D stream while the imager+detector run cube N
+  # on the compute stream) hides the ~35 ms cint8 H2D (~420 MiB) +
+  # validity H2D under the GPU work. py-spy (2026-05-20) showed
+  # ``cint8_host_t.to(device)`` + the validity-mask sync barrier
+  # as the dominant per-cube wall-time at the 16x1 op-point AFTER
+  # the cint8-stack quantise bypass landed; without overlap the
+  # search node hit ~6.55 cubes/s vs the 7.45 cubes/s target. The
+  # bench (``bench/search_node_throughput.py``) has always used
+  # ``--pipeline-overlap`` so the GPU pipeline benchmark numbers
+  # (~105 ms p50 at production geometry) are an apples-to-apples
+  # match only when the prod service runs with it on too.
+  - name: search_compute_0
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_compute
+      --shm-name /dsart-rxring-CN
+      --n-corr 16 --n-coarse-dm 8
+      --t-buf-samples 4096 --n-filled 5000
+      --bytes-per-cell 2
+      --n-fdm 34 --t-det 192 --n-grid 256
+      --cube-cadence-samples 128
+      --t-int-search-us 1048.576
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
+      --fan-in-min-corrs 15
+      --n-active-dms-per-corr 2
+      --coarse-dm-owners-half-0 0
+      --coarse-dm-owners-half-1 1
+      --gpu-half 0 --search-node-id CN
+      --device cuda:0 --image-backend gpu
+      --detector-streaming-tile-size 256
+      --detector-streaming-decoder-n-top 24
+      --detector-boxcar-accum-dtype fp16
+      --detector-layer2-max-samples 100000
+      --detector-k-img unit
+      --detector-k-dm d1
+      --detector-k-time b1,b2,b4,b8,b16,b32,b64
+      --layer1-max-samples 10000
+      --pipeline-overlap
+      --poll-interval-s 0.001
+      --max-cubes 0
+      --log-level INFO
+    hostargs:
+      lxd110h02: --coarse-dm-owners-half-0 2
+      lxd110h09: --coarse-dm-owners-half-0 4
+      lxd110h13: --coarse-dm-owners-half-0 6
+      n02: --coarse-dm-owners-half-0 2
+      n09: --coarse-dm-owners-half-0 4
+      n13: --coarse-dm-owners-half-0 6
+    env:
+      # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
+      # always pass --device cuda:0 (the post-mask logical device).
+      # half 0 → physical GPU 0.
+      CUDA_VISIBLE_DEVICES: "0"
+      # M7.2-amend (2026-05-20): flip the cint8 + shift/calibration
+      # H2D copies in ``cube_pipeline._stage_h2d`` to ``non_blocking=
+      # True`` (the env knob gates ``copy_(..., non_blocking)`` on
+      # the cached GPU buffer). Without this, ``prefetch_build``
+      # still BLOCKS the CPU thread on the ~35 ms cint8 .to() even
+      # though the kernels themselves are issued on the dedicated
+      # prefetch CUDA stream, so the overlap window collapses to
+      # the imager/detector compute only. py-spy confirmed
+      # ``_stage_h2d`` line 614 as the CPU-side block. Enabling
+      # the env makes the H2D fully asynchronous on the prefetch
+      # stream, restoring the narrow-overlap window.
+      DSART_ENABLE_GPU_BUF_REUSE: "1"
+
+  - name: search_compute_1
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_compute
+      --shm-name /dsart-rxring-CN
+      --n-corr 16 --n-coarse-dm 8
+      --t-buf-samples 4096 --n-filled 5000
+      --bytes-per-cell 2
+      --n-fdm 34 --t-det 192 --n-grid 256
+      --cube-cadence-samples 128
+      --t-int-search-us 1048.576
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
+      --fan-in-min-corrs 15
+      --n-active-dms-per-corr 2
+      --coarse-dm-owners-half-0 0
+      --coarse-dm-owners-half-1 1
+      --gpu-half 1 --search-node-id CN
+      --device cuda:0 --image-backend gpu
+      --detector-streaming-tile-size 256
+      --detector-streaming-decoder-n-top 24
+      --detector-boxcar-accum-dtype fp16
+      --detector-layer2-max-samples 100000
+      --detector-k-img unit
+      --detector-k-dm d1
+      --detector-k-time b1,b2,b4,b8,b16,b32,b64
+      --layer1-max-samples 10000
+      --pipeline-overlap
+      --poll-interval-s 0.001
+      --max-cubes 0
+      --log-level INFO
+    hostargs:
+      lxd110h02: --coarse-dm-owners-half-1 3
+      lxd110h09: --coarse-dm-owners-half-1 5
+      lxd110h13: --coarse-dm-owners-half-1 7
+      n02: --coarse-dm-owners-half-1 3
+      n09: --coarse-dm-owners-half-1 5
+      n13: --coarse-dm-owners-half-1 7
+    env:
+      # half 1 → physical GPU 1 (logical cuda:0 inside this process).
+      CUDA_VISIBLE_DEVICES: "1"
+      # M7.2-amend (2026-05-20): see search_compute_0 for rationale.
+      DSART_ENABLE_GPU_BUF_REUSE: "1"

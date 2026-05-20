@@ -1,0 +1,212 @@
+# dsart-rt corr-node pipeline config — pushed to etcd under
+# /cnf/pipeline_rt by tools/ops/push_dsart_to_etcd.py and consumed at
+# runtime by services/dsart_rt.py (`-in pipeline_rt`).
+#
+# Schema mirrors the legacy /cnf/pipeline (corr.py-compatible) so the
+# routine substitution + spawn semantics stay identical to the existing
+# operator workflow. The two key differences vs legacy are:
+#
+#   1. The 'captures.mode' switch lets a corr node feed the fada chain
+#      from synthetic data (dada_junkdb) instead of the real SNAP
+#      capture binary. This is what the M7.1 / M7.3 stages of the on-sky
+#      bring-up use (production-rate plumbing without a telescope).
+#
+#   2. fada is multi-reader (r=2) so slow- and fast-corr can attach to
+#      the same ring without copying. The legacy /cnf/pipeline does the
+#      same; called out here because new readers (a diagnostic tap, for
+#      example) MUST bump r before being added.
+#
+# Buffer byte/block math is physics-pinned by the legacy block layout —
+# see configs/config_corr.yaml comments for the derivation. Do NOT edit
+# without also editing the consumer services.
+schema_version: 1
+
+# captures.mode is the M7 stage switch:
+#   junkdb  → spawn dada_junkdb x2 (fills dada+eada with /dev/urandom at
+#             native cadence; used by M7.1/M7.3 plumbing stages).
+#   real    → spawn dsaX_capture_manythread x2 (live SNAP UDP capture;
+#             used by M7.5/M7.6 on-sky stages).
+# M7.0 ships both routine sets but the captures.mode flag is consulted
+# by dsart_rt._select_routines() before spawning.
+captures:
+  mode: junkdb
+
+buffers:
+  - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
+  - {k: eada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 1)
+  - {k: fada, b: 301989888, n: 70,  c: 1, r: 2}   # 288 MiB x 70 = 9.4 s merged voltage (slow + fast both read)
+  - {k: bada, b:  28606464, n: 300, c: 1, r: 1}   # 27.3 MiB x 300 = 40 s slow-vis (meridian_fringestop reads)
+
+routines:
+  # ---- captures (mode-gated) ---------------------------------------
+  # dada_junkdb usage (verified against the installed binary on n06,
+  # /usr/local/bin/dada_junkdb): positional arg is a PSRDADA ASCII
+  # header file (NOT a data source); -g is a flag for gaussian
+  # distribution (not a path); -r is MB/s; -t seconds. The legacy
+  # correlator_header_dsaX.txt under dsa110-xengine/src/ is byte-shape
+  # compatible with the dada/eada blocks. M0.sh::[plumbing_junkdb]
+  # uses this same header for the same role.
+  - name: cap_a_junkdb
+    when: captures.mode == junkdb
+    cmd: /usr/local/bin/dada_junkdb
+    # -r 1073 MiB/s = 144 MiB / 134.218 ms = EXACT native cadence. Note
+    # that dada_junkdb's -r flag is MiB/s (binary; `rate_base=1024*1024`
+    # in dada_junkdb.c:391) despite the help text saying "MB/s" — we
+    # had been using -r 1200 (= 12 % over native), which built spurious
+    # queue depth in dada/eada and was implicated in the M7.1 5-min
+    # soak hang where merge stopped advancing fada at ~3 min.
+    # -t 86400: transfer_size = 86400 × 1.125 GB/s = ~97 TB of bytes
+    # to write before junkdb exits (= ~24 h at native cadence). Plenty
+    # of headroom for any 60-min soak; orchestrator still kills with
+    # SIGTERM on `stop` verb well before then.
+    # -g = gaussian-distributed payload (flag, no value).
+    # -z = PSRDADA zero-copy direct shm write — avoids the user-buffer
+    # → ring-buffer memcpy that the default path does, giving merge a
+    # cleaner producer in the multi-reader (r=2) fada → corr_slow +
+    # corr_fast topology.
+    #
+    # gate_on_paths (M7.2, 2026-05-19): junkdb is gated on the corr_fast
+    # and corr_slow ready-sentinels so it does not stuff dada/eada to
+    # 19/20 + fada to 70/70 during the ~90 s of Python + GPU + Triton
+    # cold start on those consumers. Without the gate the soak first
+    # 90 s is a back-pressured ring-fill transient (rings drain to
+    # steady state in 1-2 s after corr_fast starts reading fada, but
+    # the operator sees a misleading "rings near full" snapshot in
+    # mon-dict during the warmup window).
+    args: -k dada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+    gate_on_paths:
+      - /tmp/dsart-corr-fast-CN.ready
+      - /tmp/dsart-corr-slow-CN.ready
+  - name: cap_b_junkdb
+    when: captures.mode == junkdb
+    cmd: /usr/local/bin/dada_junkdb
+    args: -k eada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+    gate_on_paths:
+      - /tmp/dsart-corr-fast-CN.ready
+      - /tmp/dsart-corr-slow-CN.ready
+
+  - name: cap_a_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_capture_manythread
+    args: -k dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
+  - name: cap_b_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_capture_manythread
+    args: -k eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+
+  # ---- merge (always on; reads dada+eada -> writes fada) ------------
+  # dsaX_merge reads dada+eada and writes fada (the merged-voltage
+  # ring that both corr_slow and corr_fast consume). -m enables
+  # multithread write. -c pins to a core; we pick CPU 12 (NUMA 1) so
+  # the merge isn't competing with corr_fast (NUMA 1 GPU 1 = CUDA :1)
+  # for cache, but is on the same NUMA node as fada (per
+  # configs/config_corr.yaml: fada.numa_cluster = 1).
+  - name: merge
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
+    args: -i dada -j eada -o fada -m -c 12
+
+  # ---- corr_slow (M2; reads fada -> writes bada) -------------------
+  # Production runs WITHOUT cal apply (slow-vis are emitted uncalibrated
+  # so meridian_fringestop / downstream pipelines can derive their own
+  # cal). Pinned to GPU 0 via CUDA_VISIBLE_DEVICES (see M7.1 lessons-
+  # learned below; without per-process GPU isolation the corr_slow +
+  # corr_fast pair hits a Triton "context is destroyed" race).
+  - name: corr_slow
+    cmd: python
+    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO --ready-sentinel-path /tmp/dsart-corr-slow-CN.ready
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  # ---- bada_drain (always-on; reads bada -> /dev/null) -------------
+  # Without a bada reader, corr_slow fills bada (300 buffers ~= 40 s of
+  # slow-vis) and then deadlocks on the 301st write. That back-pressures
+  # merge (which can't free fada slots because corr_slow as a fada
+  # reader stops advancing) and the whole pipeline hangs. The legacy
+  # /cnf/pipeline (corr.py-compatible) has a dada_dbnull on bada
+  # always-on for exactly this reason: a "drain of last resort" that
+  # keeps the back-pressure chain unblocked even before the real bada
+  # consumers (meridian_fringestop, dsaX_nsfrb) come up.
+  #
+  # Bug repro (M7.1 / n06, both 13:30 + 14:26 soaks of May 17, 2026):
+  #   corr_slow halts at n_in=301 n_out=301 -> emits
+  #   "ipcbuf_get_next_write: error decrement CLEAR" -> merge
+  #   silently stops emitting "written block N" syslog entries
+  #   shortly thereafter (n_blocks ≈ 360, ≈ corr_slow.r_buf + fada.nbufs)
+  #   -> corr_fast drains the buffered fada blocks (last n_in=368)
+  #   then blocks on getNextPage() with "ipcbuf_get_next_read: error
+  #   decrement FULL". Adding this routine fixes the deadlock at
+  #   the source. See M7-1-REPORT.md for the full diagnosis.
+  - name: bada_drain
+    # We use the in-tree Python drain ``dsart.services.dada_drain``
+    # instead of the legacy /usr/local/bin/dada_dbnull. See the
+    # module docstring for the three blocking bugs that disqualified
+    # dada_dbnull for our use (no -S without OBS_XFER, -X int overflow
+    # past ~2 GiB, default 64 MiB transfer + respawn jitter costing
+    # ~35 ms/block of corr_fast latency).
+    cmd: python
+    args: -u -m dsart.services.dada_drain --key bada --log-level INFO
+
+  # ---- corr_fast (M3 production integration; reads fada -> TX) -----
+  # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +
+  # static-sky + multi-DM-trial coarse-DM dedispersion + gridder +
+  # transport TX into the void).
+  #
+  # Op-point: REALTIME-FEASIBLE x32 integration (vs the production
+  # x8 used in earlier benches). At x8 the 2080Ti was not quite
+  # sustaining block cadence — every 4 blocks the gridder + dedisp
+  # would slip ~10-20 ms. x32 (1048.576 µs cadence; 4× longer
+  # integration) cuts the fast-vis tile count from 512/block to
+  # 128/block, dropping the gridder+dedisp work by ~4×. The matching
+  # coarse-DM trial count drops from 24 → 5 (band-local Δdm step
+  # scales linearly with t_int_fast, so we need ~4× fewer trials to
+  # cover the same DM range at the same smearing tolerance). With
+  # chan_sum_factor=8 (production F33) + sliding-window (production
+  # F34) this op-point sustains realtime with comfortable headroom
+  # on a single 2080Ti.
+  #
+  # Per-node cal blob: CALSB is substituted by dsart_rt at spawn-time
+  # to "sb%02d" of the corr-node's chgroup (n06 -> sb03, n03 -> sb00,
+  # n22 -> sb15). One YAML line, all 16 corr nodes.
+  #
+  # Each corr node must have the 250924mptq cal bundle staged at the
+  # canonical location before M7.1 / M7.4 (M7.PREP distributes the
+  # voltages; the much smaller cal bundle is staged separately by
+  # `dsart-rt services install` once that bake-in lands; M7.1 stages
+  # n06 by hand for the smoke).
+  #
+  # GPU isolation: CUDA_VISIBLE_DEVICES=1 hides GPU 0 from this
+  # process; the post-mask logical device 0 == physical GPU 1, which
+  # is the NUMA-1 GPU paired with fada (configs/config_corr.yaml::
+  # fada.numa_cluster = 1). Without this mask, simultaneous Triton
+  # JIT in corr_fast + corr_slow on the same node crashes one of
+  # them with "Triton Error [CUDA]: context is destroyed" — see
+  # M7-1-REPORT.md for the bisect.
+  - name: corr_fast
+    cmd: python
+    args: >-
+      -u -m dsart.services.corr_fast_integration
+      --fada-key fada
+      --chgroup CHGROUP
+      --obs-dec-deg CUSTOMDEC
+      --device cuda:0
+      --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_CALSB.dat
+      --cal-mode phase_only
+      --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
+      --t-int-fast-native 32
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
+      --chan-sum-factor 8
+      --sliding-window
+      --n-grid 256
+      --transport-tx-mode prod
+      --transport-tx-workers 4
+      --transport-tx-host 10.41.0.205
+      --transport-tx-base-port 6625
+      --transport-tx-coarse-dm-mask 0xFF
+      --transport-tx-worker-hosts 10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238
+      --max-blocks 0
+      --output-dir /home/ubuntu/tmp/dsart-fast-grid
+      --blocks-output-mode none
+      --log-level INFO
+      --ready-sentinel-path /tmp/dsart-corr-fast-CN.ready
+    env:
+      CUDA_VISIBLE_DEVICES: "1"

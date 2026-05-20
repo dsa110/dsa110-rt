@@ -124,6 +124,18 @@ class CubeRingSlot:
         per_chgroup_offset_re / per_chgroup_offset_im: optional
             ``[N_chg] float32`` arrays of per-chgroup DC re / im
             offsets. ``None`` → zeros.
+        per_chgroup_scale_per_t: optional ``[N_chg, T_stream] float32``
+            array of per-(chgroup, time-sample) scales (M7.4). When
+            present this wins over ``per_chgroup_scale`` and the GPU
+            pipeline dispatches to the per-t dequant kernel
+            (``fused_dequant_combine_per_fdm_per_t``). Each entry is
+            the scale that the TX side used to quantise the corresponding
+            slot's COO payload (``tx.py::_compute_scale_offset``); the
+            ``ProductionRxRingSource`` M7.4 dense-scatter path populates
+            this via ``rx_ring_assemble_dense_block``.
+        per_chgroup_offset_re_per_t, per_chgroup_offset_im_per_t:
+            optional ``[N_chg, T_stream] float32`` per-(chgroup, t)
+            offsets. M7.4 amend; pair with ``per_chgroup_scale_per_t``.
     """
 
     cube_id: int
@@ -138,6 +150,12 @@ class CubeRingSlot:
     per_chgroup_scale: Optional[np.ndarray] = None
     per_chgroup_offset_re: Optional[np.ndarray] = None
     per_chgroup_offset_im: Optional[np.ndarray] = None
+    # M7.4: per-(corr, t) sidecars. Mutually exclusive with the
+    # per-chgroup variants — the GPU pipeline picks the per-t kernel
+    # when these are set, otherwise the per-chgroup kernel.
+    per_chgroup_scale_per_t: Optional[np.ndarray] = None
+    per_chgroup_offset_re_per_t: Optional[np.ndarray] = None
+    per_chgroup_offset_im_per_t: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.cube_id < 0:
@@ -213,6 +231,46 @@ class CubeRingSlot:
                 raise ValueError(
                     f"{name}.shape={arr.shape} != per_chgroup_cint8_stack "
                     f"N_chg={n_chg_expected}"
+                )
+
+        # M7.4 per-(chgroup, t) sidecar validation
+        per_t_arrays = (
+            ("per_chgroup_scale_per_t", self.per_chgroup_scale_per_t),
+            ("per_chgroup_offset_re_per_t", self.per_chgroup_offset_re_per_t),
+            ("per_chgroup_offset_im_per_t", self.per_chgroup_offset_im_per_t),
+        )
+        any_per_t = any(arr is not None for _, arr in per_t_arrays)
+        if any_per_t and self.per_chgroup_scale is not None:
+            raise ValueError(
+                "per_chgroup_scale_per_t is mutually exclusive with "
+                "per_chgroup_scale; provide one or the other, not both"
+            )
+        for name, arr in per_t_arrays:
+            if arr is None:
+                continue
+            if arr.dtype != np.float32:
+                raise TypeError(
+                    f"{name}.dtype={arr.dtype}, expected float32"
+                )
+            if arr.ndim != 2:
+                raise ValueError(
+                    f"{name}.shape={arr.shape}, expected 2-D "
+                    f"[N_chg, T_stream]"
+                )
+            if n_chg_expected is not None and arr.shape[0] != n_chg_expected:
+                raise ValueError(
+                    f"{name}.shape={arr.shape} != per_chgroup_cint8_stack "
+                    f"N_chg={n_chg_expected}"
+                )
+            # T_stream matches the cint8 stack's T axis when both present.
+            if (
+                self.per_chgroup_cint8_stack is not None
+                and arr.shape[1] != self.per_chgroup_cint8_stack.shape[1]
+            ):
+                raise ValueError(
+                    f"{name}.shape[1]={arr.shape[1]} != "
+                    f"per_chgroup_cint8_stack.T_stream="
+                    f"{self.per_chgroup_cint8_stack.shape[1]}"
                 )
 
 
@@ -418,6 +476,7 @@ class SyntheticRxRingSource:
                 # every cube. Emulates the chunk-8b RX-ring contract
                 # (M3 emits cint8 already; search-node never re-quantises).
                 if self._cached_cint8 is None:
+                    from .host_pin import maybe_register_host_buffer
                     from ..transport.quantize import (
                         quantise_per_chgroup_into_cint8,
                     )
@@ -435,6 +494,9 @@ class SyntheticRxRingSource:
                         target_max=self._prequantise_target_max,
                         zero_fill_missing=True,
                     )
+                    # Pin once so CubePipeline H2D can DMA directly from
+                    # the cached cint8 slab (bench-only source path).
+                    maybe_register_host_buffer(self._cached_cint8)
                 streams = self._cached_streams
                 cint8_stack = self._cached_cint8
             else:

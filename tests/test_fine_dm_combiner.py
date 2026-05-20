@@ -141,15 +141,27 @@ def test_compute_time_shift_search_rejects_bad_inputs() -> None:
         )
 
 
-def test_time_shift_search_table_rejects_negative() -> None:
-    bad = np.zeros((4, N_CHGROUP), dtype=np.int32)
-    bad[0, 3] = -1
-    with pytest.raises(ValueError, match="non-negative"):
-        TimeShiftSearchTable(
-            shifts=bad,
-            fine_to_coarse=np.zeros(4, dtype=np.int64),
-            t_int_search_us=T_INT_SEARCH_US_DEFAULT,
-        )
+def test_time_shift_search_table_accepts_signed_shifts() -> None:
+    """v2 (2026-05-18): shifts are SIGNED. The TimeShiftSearchTable must
+    accept both positive (read FUTURE) and negative (read PAST) shifts;
+    only the chgroup-15 reference column is constrained to zero.
+
+    Pre-v2 this test was ``rejects_negative``; under the v2 even-K
+    partition K/2 fines per coarse sit BELOW the coarse (δdm < 0) and
+    K/2 sit ABOVE (δdm > 0), so the table must round-trip both signs.
+    """
+    signed = np.zeros((4, N_CHGROUP), dtype=np.int32)
+    signed[0, 3] = -7        # fine below coarse
+    signed[1, 7] = +11       # fine above coarse
+    signed[2, 14] = -1       # near chgroup-15 boundary
+    # chgroup 15 column must stay 0 (still enforced under v2)
+    table = TimeShiftSearchTable(
+        shifts=signed,
+        fine_to_coarse=np.zeros(4, dtype=np.int64),
+        t_int_search_us=T_INT_SEARCH_US_DEFAULT,
+    )
+    assert int(table.shifts.min()) == -7
+    assert int(table.shifts.max()) == +11
 
 
 def test_time_shift_search_table_rejects_chgroup15_nonzero() -> None:

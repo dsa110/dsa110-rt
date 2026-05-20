@@ -132,9 +132,9 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
     n_fine = plan.fine_dm.shape[0]
     n_coarse = plan.coarse_dm.shape[0]
 
-    # Counts in expected ranges (plan §3.2 line 573).
+    # Counts in expected ranges (plan §3.2 line 573; v2 locks N_coarse=8).
     assert 100 < n_fine < 2000, f"N_fine={n_fine} outside expected window"
-    assert 8 < n_coarse < 64, f"N_coarse={n_coarse} outside expected window"
+    assert 8 <= n_coarse <= 64, f"N_coarse={n_coarse} outside expected window"
 
     # fine_dm strictly increasing (line 573).
     assert np.all(np.diff(plan.fine_dm) > 0), "fine_dm not strictly increasing"
@@ -147,9 +147,32 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
     # CSR consistency: idx[N_coarse] == N_fine; flat shape == N_fine.
     assert int(plan.fine_offsets_idx[-1]) == n_fine
     assert plan.fine_offsets_flat.shape == (n_fine,)
-    assert np.all(plan.fine_offsets_flat >= -1e-12), (
-        "fine_offsets_flat must be ≥ 0 (each fine assigned to coarse below it)"
-    )
+    if plan.metadata.get("version", 1) >= 2:
+        # v2: each GPU owns K fines SYMMETRIC about its coarse_dm[i], so
+        # fine_offsets_flat (= δdm) is SIGNED. The midpoint per GPU is
+        # exactly 0; ~K//2 entries per GPU are negative and ~K//2 positive.
+        K = n_fine // n_coarse
+        assert n_fine == K * n_coarse, (
+            f"v2: N_fine={n_fine} not divisible by N_coarse={n_coarse}"
+        )
+        for i in range(n_coarse):
+            mid = i * K + K // 2
+            assert abs(plan.fine_offsets_flat[mid]) < 1e-9, (
+                f"v2: fine_offsets_flat[{mid}] (GPU-{i} midpoint) = "
+                f"{plan.fine_offsets_flat[mid]} ≠ 0"
+            )
+        n_neg = int((plan.fine_offsets_flat < -1e-9).sum())
+        n_pos = int((plan.fine_offsets_flat > +1e-9).sum())
+        # Expect roughly K/2 negative + K/2 positive per GPU (8 GPUs)
+        assert n_neg > 0 and n_pos > 0, (
+            f"v2: fine_offsets_flat must be signed; got n_neg={n_neg}, "
+            f"n_pos={n_pos}"
+        )
+    else:
+        # v1: fine_to_coarse via searchsorted+clip → δdm ≥ 0
+        assert np.all(plan.fine_offsets_flat >= -1e-12), (
+            "v1: fine_offsets_flat must be ≥ 0 (fine assigned to coarse below it)"
+        )
 
     # Stage 1 invariants (lines 574-577):
     s1 = plan.time_shift_corr_stage1
@@ -166,7 +189,12 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
     assert (diffs <= 0).all(), (
         "time_shift_corr_stage1 must be non-increasing in ch per (chgroup, c)"
     )
-    # (d) ch=0 row matches the analytic formula exactly (rint).
+    # (d) ch=0 row matches the analytic formula exactly (rint). Use the
+    # cadence the plan was BUILT with (per metadata), not the constants
+    # default — they diverged when the production op-point moved to
+    # t_int_fast_us = 1048.576 µs and constants.T_INT_FAST_US_DEFAULT
+    # was left at the commissioning value.
+    t_int_fast_built = float(plan.metadata["t_int_fast_us"])
     for g in range(N_CHGROUP):
         nu_top_g = NU_CHGROUP_TOP_GHZ[g]
         nu_bot_g = NU_CHGROUP_BOT_GHZ[g]
@@ -174,7 +202,7 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
             K_DM_MS_GHZ2_PC * plan.coarse_dm
             * (1.0 / nu_bot_g ** 2 - 1.0 / nu_top_g ** 2)
             * 1e3
-            / T_INT_FAST_US_DEFAULT
+            / t_int_fast_built
         ).astype("int32")
         np.testing.assert_array_equal(
             s1[g, 0, :], analytic,
@@ -202,34 +230,52 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
         K_DM_MS_GHZ2_PC * plan.coarse_dm
         * (1.0 / NU_BOT_PROC_GHZ ** 2 - 1.0 / nu_bot_chgroup0 ** 2)
         * 1e3
-        / T_INT_FAST_US_DEFAULT
+        / t_int_fast_built
     ).astype("int32")
     np.testing.assert_array_equal(
         s2[0, :], analytic_g0,
         err_msg="time_shift_corr_stage2[0, :] mismatch with analytic",
     )
-    # (b) plan-literal self-check at exactly DM=3000.
+    # (b) plan-literal self-check at exactly DM=3000 (uses the plan's
+    # cadence). The plan §3.2 line 578 literal "≈ 6144" assumed the
+    # commissioning t_int_fast_us = 262.144 µs; for a different cadence
+    # the value scales by 262.144 / t_int_fast_us.
     expected_at_3000 = int(np.rint(
         K_DM_MS_GHZ2_PC * 3000.0
         * (1.0 / NU_BOT_PROC_GHZ ** 2 - 1.0 / nu_bot_chgroup0 ** 2)
         * 1e3
-        / T_INT_FAST_US_DEFAULT
+        / t_int_fast_built
     ))
-    assert abs(expected_at_3000 - 6144) <= 4, (
-        f"plan §3.2 line 578: expected ≈ 6144 ± 4 at DM=3000; "
-        f"got analytic = {expected_at_3000}"
+    literal_scaled = int(round(6144 * 262.144 / t_int_fast_built))
+    assert abs(expected_at_3000 - literal_scaled) <= 4, (
+        f"plan §3.2 line 578: expected ≈ {literal_scaled} ± 4 at DM=3000 "
+        f"under t_int_fast = {t_int_fast_built} µs; got analytic = "
+        f"{expected_at_3000}"
     )
 
     # Search-side residual invariants (line 579):
     ss = plan.time_shift_search
     assert ss.shape == (n_fine, N_CHGROUP)
     assert ss.dtype == np.int32
-    assert (ss >= 0).all(), (
-        "time_shift_search must be ≥ 0 (line 579) — requires δdm ≥ 0 binning"
-    )
     assert (ss[:, N_CHGROUP - 1] == 0).all(), (
         "time_shift_search[:, 15] must be 0 (chgroup-15 = ν_bot_proc)"
     )
+    if plan.metadata.get("version", 1) >= 2:
+        # v2: shifts are SIGNED (K//2 fines below coarse → shift < 0;
+        # K//2 fines above → shift > 0; on-coarse fines → shift = 0).
+        # Sanity: there must be at least one positive AND one negative shift
+        # (other than chgroup-15 which is always 0).
+        ss_nonref = ss[:, : N_CHGROUP - 1]
+        assert int((ss_nonref < 0).sum()) > 0, (
+            "v2: expected at least some negative shifts (fines below coarse_dm)"
+        )
+        assert int((ss_nonref > 0).sum()) > 0, (
+            "v2: expected at least some positive shifts (fines above coarse_dm)"
+        )
+    else:
+        assert (ss >= 0).all(), (
+            "v1: time_shift_search must be ≥ 0 (line 579) — δdm ≥ 0 binning"
+        )
 
     # Bound check (line 580): max stage-1 ≈ widest chgroup intra-band Δτ at DM_MAX.
     # The widest chgroup is the LOWEST-frequency one (chgroup 15) because the
@@ -241,8 +287,8 @@ def test_dm_plan_time_shift_tables(dm_plan: DmPlan) -> None:
         K_DM_MS_GHZ2_PC * plan.coarse_dm[-1]
         * (1.0 / nu_bot_widest ** 2 - 1.0 / nu_top_widest ** 2) * 1e3
     )
-    s1_max_us = int(s1.max()) * T_INT_FAST_US_DEFAULT
-    assert abs(s1_max_us - analytic_max_us) <= T_INT_FAST_US_DEFAULT, (
+    s1_max_us = int(s1.max()) * t_int_fast_built
+    assert abs(s1_max_us - analytic_max_us) <= t_int_fast_built, (
         f"max(time_shift_corr_stage1) × t_int_fast = {s1_max_us} µs; "
         f"analytic Δτ at chgroup-{g_max_band} (widest) = {analytic_max_us} µs"
     )
@@ -312,4 +358,4 @@ def test_dm_plan_metadata(dm_plan: DmPlan) -> None:
     assert md["tol"] > 0
     assert md["build_utc_ns"] > 0
     assert isinstance(md["git_sha"], str) and len(md["git_sha"]) > 0
-    assert md["version"] == 1
+    assert md["version"] == 2

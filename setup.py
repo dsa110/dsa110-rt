@@ -40,9 +40,20 @@ _recv_ring = Extension(
     language="c",
 )
 
+# NOTE: _recv_epoll links a private copy of recv_ring.c so that the M7.2
+# Phase B ring-publish path can call rx_ring_write_slot without a
+# cross-extension ctypes hop on the hot path. _recv_ring.so still
+# ships its own copy for the Python-driven ring create/attach/read
+# path; the two .so files cooperate via the POSIX shm name (each has
+# its own static copy of the ring functions but they operate on the
+# same kernel-shared mmap). See recv_ring.h.
 _recv_epoll = Extension(
     name="dsart.transport._recv_epoll",
-    sources=["src/dsart/transport/recv_epoll.c"],
+    sources=[
+        "src/dsart/transport/recv_epoll.c",
+        "src/dsart/transport/recv_ring.c",
+    ],
+    include_dirs=["src/dsart/transport"],
     extra_compile_args=[
         "-O3",
         "-std=c11",
@@ -51,6 +62,7 @@ _recv_epoll = Extension(
         "-pthread",
     ],
     extra_link_args=[
+        "-lrt",
         "-pthread",
     ],
     language="c",

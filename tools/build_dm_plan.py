@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
-"""Build the dsa110-rt DM plan and write it to ``configs/dm_plan.npz``.
+"""Build the dsa110-rt v2 DM plan and write it to ``configs/dm_plan.npz``.
 
-Implements plan §3.2 verbatim:
+v2 scheme (user-clarified 2026-05-18; supersedes v1):
 
-  Step 1  fine_dm: gen_dmtrials_step recursion over the processed band.
-  Step 2  coarse_dm: gen_dmtrials_step recursion over chgroup 0's local
-          band (= worst-case = highest ν → smallest Δdm; SHARED across
-          all 16 corr nodes).
-  Step 3  fine_to_coarse + CSR-flat fine_offsets (each fine assigned to
-          the largest coarse_dm[c] ≤ fine_dm[f] ⇒ δdm ≥ 0 by construction,
-          which is what enables `time_shift_search ≥ 0`).
-  Step 4  DEDISP three-table set:
+  Step 1  Bottom-sub-band Levin seed (chgroup 15, lowest ν → tightest
+          spacing) to find ``dm_max_effective``: take exactly N_coarse=8
+          steps of the recursion from ``dm_min``; ``dm_max_effective`` =
+          ``coarse_seed[7]``. Discard the seed POSITIONS afterwards.
+  Step 2  Full-band Levin recursion over ``[dm_min, dm_max_effective]`` →
+          raw fine-DM list (length N_fine_raw).
+  Step 3  Trim the tail to a multiple of N_coarse=8:
+          ``N_fine = (N_fine_raw // 8) * 8``, ``K = N_fine / 8``.
+  Step 4  Place coarse DMs at the K-fine bucket midpoints:
+          ``coarse_dm[i] = fine_dm[i*K + K//2]``. Each GPU owns K fine
+          DMs SYMMETRIC about its assigned coarse_dm[i].
+  Step 5  ``fine_to_coarse[f] = f // K`` (1:1 GPU ownership); ``δdm =
+          fine_dm[f] - coarse_dm[f // K]`` is SIGNED. ``time_shift_search``
+          is correspondingly SIGNED; the combiner reads
+          ``stream[t - shift]`` which handles both signs (PAST data
+          naturally available; FUTURE data via one-sided rewind).
+  Step 6  Per-(search, GPU) partition: ``[s, g] = (2s+g, 2s+g)``. No halo,
+          no inter-GPU overlap; ``dm_overlap_coarse = 0``.
+
+  Also written by Step 4:
             time_shift_corr_stage1[N_chgroup, N_chan, N_coarse] int32
             time_shift_corr_stage2[N_chgroup, N_coarse]         int32
-            time_shift_search[N_fine, N_chgroup]                int32
-  Step 5  Per-search-node + per-GPU partitioning with halo overlap.
-
-DoD (plan §8 line 2141 second half):
-  pytest tests/test_numerical_conventions.py::test_dm_plan_time_shift_tables
-  passes against the produced .npz.
+            time_shift_search    [N_fine, N_chgroup]            int32 (SIGNED)
 
 Usage:
-  python tools/build_dm_plan.py [--out PATH] [--dm-min 0] [--dm-max 3000]
-                                [--tol 1.5] [--t-int-fast-us 262.144]
+  python tools/build_dm_plan.py [--out PATH] [--dm-min 100] [--dm-max 3000]
+                                [--tol 1.6] [--t-int-fast-us 1048.576]
                                 [--t-int-search-us FROM_OPS_YAML]
+                                [--n-coarse-cap 8]
 """
 
 from __future__ import annotations
@@ -43,9 +51,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from dsart.common.constants import (  # noqa: E402
-    BLOCK_SAMPLES_NATIVE,
     DELTA_NU_CH_GHZ,
-    DETECTOR_K_DM_WIDEST,
     DM_MAX_DEFAULT,
     DM_MIN_DEFAULT,
     DM_PLAN_METADATA_VERSION,
@@ -105,10 +111,20 @@ def gen_dm_list(
     n_chan: int,
     dt_us: float,
     tol: float,
+    n_cap: int | None = None,
 ) -> np.ndarray:
-    """Iterate gen_dmtrials_step from dm_min until exceeding dm_max."""
+    """Iterate gen_dmtrials_step from dm_min until exceeding dm_max.
+
+    If ``n_cap`` is given, the iteration also stops once the list reaches
+    ``n_cap`` entries (whichever exit triggers first). The natural exit
+    (``dms[-1] >= dm_max``) is preserved when ``n_cap is None``; M7.2
+    uses the n_cap path to lock the coarse-DM trial count exactly (and
+    lets the resulting ``coarse_dm[-1]`` define the effective dm_max).
+    """
     dms = [float(dm_min)]
     while dms[-1] < dm_max:
+        if n_cap is not None and len(dms) >= n_cap:
+            break
         dms.append(
             gen_dmtrials_step(dms[-1], nu_GHz, dnu_MHz, n_chan, dt_us, tol)
         )
@@ -121,7 +137,11 @@ def gen_dm_list(
 
 
 def build_fine_list(
-    dm_min: float, dm_max: float, t_int_search_us: float, tol: float
+    dm_min: float,
+    dm_max: float,
+    t_int_search_us: float,
+    tol: float,
+    n_cap: int | None = None,
 ) -> np.ndarray:
     """Step 1: fine list parameterised over the processed band (§3.2 line 511).
 
@@ -129,6 +149,10 @@ def build_fine_list(
     Δν_MHz    = DELTA_NU_CH_GHZ * 1e3                    (≈ 0.030518 MHz)
     N_chan    = N_CHAN_PROC_NATIVE                       (= 6144)
     Δt_us     = t_int_search_us                          (from operating point)
+
+    M7.2: optional ``n_cap`` truncates the recursion at a fixed trial count;
+    used by the n-coarse-cap path so fine_dm stops at the effective dm_max
+    (= coarse_dm[-1]) rather than over-running into uncovered DM space.
     """
     nu_center = (NU_TOP_PROC_GHZ + NU_BOT_PROC_GHZ) / 2.0
     return gen_dm_list(
@@ -139,31 +163,65 @@ def build_fine_list(
         n_chan=N_CHAN_PROC_NATIVE,
         dt_us=t_int_search_us,
         tol=tol,
+        n_cap=n_cap,
     )
 
 
 def build_coarse_list(
-    dm_min: float, dm_max: float, t_int_fast_us: float, tol: float
+    dm_min: float,
+    dm_max: float,
+    t_int_fast_us: float,
+    tol: float,
+    n_cap: int | None = None,
 ) -> np.ndarray:
-    """Step 2: coarse list per-corr (shared across all 16 corrs; §3.2 line 525).
+    """Step 2: coarse list using the BOTTOM-MOST sub-band (user-clarified
+    2026-05-18; was previously chgroup 0 = TOP sub-band, which is physically
+    backwards — see fix below).
 
-    Worst-case = chgroup 0 (highest ν_chgroup_center → smallest band-local
-    Δdm). Use the recursion at chgroup-0's center frequency + chgroup-0's
+    Per the Levin-thesis recursion (the same gen_dmtrials formula reused
+    for the fine list), the maximum allowable ΔDM step is limited by the
+    DM-smearing tolerance Δt_smear ≤ tol · Δt_int. Smearing within a
+    chgroup of bandwidth B at center ν scales as B · ΔDM / ν³ — so the
+    LOWEST-ν chgroup (= NU_CHGROUP_BOT_GHZ[15]) gives the WORST smear and
+    therefore the TIGHTEST coarse-DM spacing. Using the top chgroup
+    (formerly hard-coded as chgroup[0]) gives the LOOSEST spacing, which
+    under-resolves the high-DM end and is exactly what the prior builder
+    was doing — the M7.2 conversation 2026-05-18 surfaced this bug. The
+    docstring claim "Worst-case = chgroup 0 (highest ν → smallest Δdm)"
+    was wrong on the physics: higher ν → smaller smear → LARGER allowed
+    ΔDM → LOOSER spacing → smaller N_coarse for a fixed dm_max → coarser
+    grid. We want the tightest spacing, hence the bottom chgroup.
+
+    Use the recursion at chgroup-15's center frequency + chgroup-15's
     local bandwidth (≈ 11.72 MHz = 384 channels × Δν_ch); ``n_chan = 1``
     treats the chgroup as a single wide channel for intra-band smearing
-    accounting (the corr-side stage-1 pre-grid integrates 384 → 1).
+    accounting (the corr-side stage-1 pre-grid integrates 384 → 1; the
+    residual smear after stage-1 is the chgroup-wide bandwidth applied
+    to the ΔDM step).
     Δt_us is t_int_fast_us (corr-side cadence).
+
+    M7.2: ``n_cap`` locks the coarse-DM trial count exactly. The
+    effective DM coverage is ``coarse_dm[-1]`` (the last computed
+    trial), NOT the requested ``dm_max``; callers using ``n_cap``
+    should rebuild the fine list with the effective dm_max so no fine
+    trials orphan past the last coarse cell.
     """
-    nu_center_chgroup0 = (NU_CHGROUP_TOP_GHZ[0] + NU_CHGROUP_BOT_GHZ[0]) / 2.0
-    bw_chgroup_MHz = (NU_CHGROUP_TOP_GHZ[0] - NU_CHGROUP_BOT_GHZ[0]) * 1000.0
+    BOTTOM_CHGROUP = N_CHGROUP - 1
+    nu_center_chgroup_bottom = (
+        NU_CHGROUP_TOP_GHZ[BOTTOM_CHGROUP] + NU_CHGROUP_BOT_GHZ[BOTTOM_CHGROUP]
+    ) / 2.0
+    bw_chgroup_MHz = (
+        NU_CHGROUP_TOP_GHZ[BOTTOM_CHGROUP] - NU_CHGROUP_BOT_GHZ[BOTTOM_CHGROUP]
+    ) * 1000.0
     return gen_dm_list(
         dm_min=dm_min,
         dm_max=dm_max,
-        nu_GHz=nu_center_chgroup0,
+        nu_GHz=nu_center_chgroup_bottom,
         dnu_MHz=bw_chgroup_MHz,
         n_chan=1,
         dt_us=t_int_fast_us,
         tol=tol,
+        n_cap=n_cap,
     )
 
 
@@ -175,38 +233,50 @@ def build_coarse_list(
 def build_fine_to_coarse(
     fine_dm: np.ndarray, coarse_dm: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Assign each fine trial to the largest coarse cell ≤ fine_dm.
+    """v2 even-K partition: ``fine_to_coarse[f] = f // K`` with
+    ``K = N_fine // N_coarse``.
 
-    By construction this gives δdm = fine_dm[f] - coarse_dm[c] ≥ 0,
-    which is the precondition for `time_shift_search ≥ 0` (§3.2 line 579).
+    Pre-condition: N_fine MUST be divisible by N_coarse (the caller —
+    ``build_dm_plan`` v2 — trims the fine list tail to enforce this).
+    The coarse positions ``coarse_dm[i] = fine_dm[i*K + K//2]`` are the
+    midpoints of the per-GPU K-fine buckets, so δdm = fine_dm[f] -
+    coarse_dm[f//K] is SIGNED (K//2 fines per coarse sit BELOW with
+    δdm < 0, K - K//2 - 1 sit ABOVE with δdm > 0, and exactly one is
+    EQUAL with δdm = 0). The downstream ``time_shift_search`` table is
+    correspondingly signed; the search-side combiner reads
+    ``stream[t - shift]`` which handles both signs (negative shifts
+    read PAST data from the rolling RX ring; positive shifts read
+    FUTURE data delivered by one-sided rewind).
 
     Returns:
-        fine_to_coarse  int32[N_fine]: c index per fine.
-        fine_offsets_idx int32[N_coarse + 1]: CSR row pointers.
-        fine_offsets_flat float64[N_fine]: CSR-grouped (fine_dm - coarse_dm[c])
-            in coarse-major, fine-ascending order.
+        fine_to_coarse  int32[N_fine]: c index per fine (= f // K).
+        fine_offsets_idx int32[N_coarse + 1]: CSR row pointers (each
+            coarse cell holds exactly K fines, so this is a simple
+            ``[0, K, 2K, ..., N_fine]`` sequence).
+        fine_offsets_flat float64[N_fine]: CSR-grouped
+            ``(fine_dm[f] - coarse_dm[f // K])`` values; SIGNED.
     """
     n_fine = fine_dm.shape[0]
     n_coarse = coarse_dm.shape[0]
-    fine_to_coarse = np.searchsorted(coarse_dm, fine_dm, side="right") - 1
-    fine_to_coarse = np.clip(fine_to_coarse, 0, n_coarse - 1).astype("int32")
-
-    # CSR row pointers from per-coarse counts.
-    counts = np.bincount(fine_to_coarse, minlength=n_coarse)
-    fine_offsets_idx = np.zeros(n_coarse + 1, dtype="int32")
-    fine_offsets_idx[1:] = np.cumsum(counts).astype("int32")
-
-    # Pack offsets in coarse-major order. Stable sort preserves fine-ascending
-    # order within each coarse cell (since fine_dm is itself ascending).
-    order = np.argsort(fine_to_coarse, kind="stable")
-    fine_offsets_flat = (
-        fine_dm[order] - coarse_dm[fine_to_coarse[order]]
-    ).astype("float64")
-
-    if n_fine != fine_offsets_flat.shape[0]:
-        raise RuntimeError(
-            f"CSR length {fine_offsets_flat.shape[0]} != N_fine {n_fine}"
+    if n_coarse <= 0:
+        raise ValueError(f"n_coarse={n_coarse} must be > 0")
+    if n_fine % n_coarse != 0:
+        raise ValueError(
+            f"v2 DM plan: N_fine={n_fine} must be divisible by N_coarse="
+            f"{n_coarse}; caller (build_dm_plan v2) trims the fine list "
+            f"tail to enforce this. Got K = {n_fine}/{n_coarse} = "
+            f"{n_fine / n_coarse:.3f} (non-integer)."
         )
+    k = n_fine // n_coarse
+    fine_to_coarse = (np.arange(n_fine, dtype="int64") // k).astype("int32")
+
+    # CSR row pointers from per-coarse counts (uniform K per cell under v2).
+    fine_offsets_idx = (np.arange(n_coarse + 1, dtype="int32") * k)
+
+    # No re-sort: fines are already grouped in coarse-major order under
+    # f // K, and ascending within each cell (since fine_dm is ascending).
+    fine_offsets_flat = (fine_dm - coarse_dm[fine_to_coarse]).astype("float64")
+
     if int(fine_offsets_idx[-1]) != n_fine:
         raise RuntimeError(
             f"CSR sentinel {fine_offsets_idx[-1]} != N_fine {n_fine}"
@@ -271,11 +341,7 @@ def build_time_shifts(
     # Search residual: time_shift_search[f, g]
     #   = rint( (τ(ν_bot_proc, δdm) - τ(ν_chgroup_bot[g], δdm)) / t_int_search_us )
     #   = rint( Δτ_us(ν_chgroup_bot[g], ν_bot_proc, δdm) / t_int_search_us )
-    delta_dm = fine_dm - coarse_dm[fine_to_coarse]   # [N_fine]; ≥ 0 by construction
-    if (delta_dm < 0).any():
-        raise RuntimeError(
-            "δdm contains negatives — fine_to_coarse binning is broken"
-        )
+    delta_dm = fine_dm - coarse_dm[fine_to_coarse]   # [N_fine]; SIGNED under v2
     delta_us_search = _delta_tau_us_array(
         np.asarray(NU_BOT_PROC_GHZ, dtype="float64"),
         nu_chgroup_bot_arr[None, :],                    # [1, G]
@@ -307,74 +373,58 @@ def build_time_shifts(
 # ---------------------------------------------------------------------------
 
 
-def _balance_split(
-    cum_weight: np.ndarray, n_buckets: int
-) -> np.ndarray:
-    """Find ``n_buckets - 1`` split indices that balance ``cum_weight`` evenly.
-
-    Returns indices ``s_0, s_1, ..., s_{n_buckets-2}`` such that bucket k
-    covers ``[s_{k-1}+1 .. s_k]`` (with ``s_{-1} = -1`` and an implicit
-    ``s_{n_buckets-1} = N - 1``).
-    """
-    total = float(cum_weight[-1])
-    targets = [total * (i + 1) / n_buckets for i in range(n_buckets - 1)]
-    split = np.searchsorted(cum_weight, targets, side="right")
-    # Each split index is the first cell whose cumulative weight EXCEEDS the
-    # target; the bucket boundary is the index BEFORE that.
-    return np.maximum(split - 1, 0).astype("int32")
-
-
 def build_partition(
-    fine_to_coarse: np.ndarray, n_coarse: int, dm_overlap_coarse: int
+    n_coarse: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Step 5: per-(search, GPU) canonical + consumed coarse-DM ranges.
+    """v2 per-(search, GPU) canonical + consumed coarse-DM ranges.
 
-    Balanced on fine-trials-per-range (not coarse-trials), per §3.2 line 532.
-    Halo of ``dm_overlap_coarse`` coarse cells on each side of every range.
+    Each GPU owns exactly ONE coarse DM under the v2 scheme (no halo, no
+    inter-GPU overlap, 1:1 mapping). GPU (s, g) owns coarse index
+    ``i = N_SEARCH_GPU * s + g``. Pre-condition:
+    ``n_coarse == N_SEARCH * N_SEARCH_GPU`` (= 8 under production).
+
+    Per-search-node spans two contiguous coarse cells (g=0 and g=1):
+    ``dm_idx_range_{canonical,consumed}[s] = (2s, 2s+1)``.
+    Per-GPU is degenerate point: ``[s, g] = (2s+g, 2s+g)``.
+
+    Returns:
+        canonical: ``[N_SEARCH, 2] int32`` ``(lo, hi)`` per search node.
+        consumed:  ``[N_SEARCH, 2] int32`` identical (dm_overlap_coarse=0).
+        canonical_per_gpu: ``[N_SEARCH, N_SEARCH_GPU, 2] int32``.
+        consumed_per_gpu:  ``[N_SEARCH, N_SEARCH_GPU, 2] int32`` identical.
     """
-    fine_per_coarse = np.bincount(fine_to_coarse, minlength=n_coarse)
-    cum = np.cumsum(fine_per_coarse).astype("float64")
-
-    # Search-node boundaries: split at N_SEARCH-1 internal points.
-    sn_split = _balance_split(cum, N_SEARCH)
+    expected = N_SEARCH * N_SEARCH_GPU
+    if n_coarse != expected:
+        raise ValueError(
+            f"v2 DM plan requires n_coarse == N_SEARCH * N_SEARCH_GPU = "
+            f"{expected}; got {n_coarse}"
+        )
     canonical = np.zeros((N_SEARCH, 2), dtype="int32")
     consumed = np.zeros((N_SEARCH, 2), dtype="int32")
-    prev = 0
-    for s in range(N_SEARCH):
-        hi = int(sn_split[s]) if s < N_SEARCH - 1 else n_coarse - 1
-        canonical[s] = (prev, hi)
-        consumed[s] = (
-            max(0, prev - dm_overlap_coarse),
-            min(n_coarse - 1, hi + dm_overlap_coarse),
-        )
-        prev = hi + 1
-
-    # Per-GPU: split each search node's canonical range into N_SEARCH_GPU halves.
     canonical_per_gpu = np.zeros((N_SEARCH, N_SEARCH_GPU, 2), dtype="int32")
     consumed_per_gpu = np.zeros((N_SEARCH, N_SEARCH_GPU, 2), dtype="int32")
     for s in range(N_SEARCH):
-        lo, hi = int(canonical[s, 0]), int(canonical[s, 1])
-        # Sub-cumulative within this search node (zero-based)
-        sub = cum[lo : hi + 1] - (cum[lo - 1] if lo > 0 else 0.0)
-        gpu_split = _balance_split(sub, N_SEARCH_GPU)
-        prev_g = lo
+        lo = N_SEARCH_GPU * s
+        hi = N_SEARCH_GPU * s + (N_SEARCH_GPU - 1)
+        canonical[s] = (lo, hi)
+        consumed[s] = (lo, hi)
         for g in range(N_SEARCH_GPU):
-            hi_g = lo + int(gpu_split[g]) if g < N_SEARCH_GPU - 1 else hi
-            canonical_per_gpu[s, g] = (prev_g, hi_g)
-            consumed_per_gpu[s, g] = (
-                max(0, prev_g - dm_overlap_coarse),
-                min(n_coarse - 1, hi_g + dm_overlap_coarse),
-            )
-            prev_g = hi_g + 1
-
+            i = N_SEARCH_GPU * s + g
+            canonical_per_gpu[s, g] = (i, i)
+            consumed_per_gpu[s, g] = (i, i)
     return canonical, consumed, canonical_per_gpu, consumed_per_gpu
 
 
 def compute_dm_overlap_coarse(fine_to_coarse: np.ndarray, n_coarse: int) -> int:
-    """``ceil(K_dm_widest / (2 · mean_fine_per_coarse))``; ≥ 1 (§3.2 line 535)."""
-    fine_per_coarse = np.bincount(fine_to_coarse, minlength=n_coarse)
-    mean_fpc = max(1.0, float(fine_per_coarse.mean()))
-    return max(1, int(math.ceil(DETECTOR_K_DM_WIDEST / (2.0 * mean_fpc))))
+    """v2: dm_overlap_coarse = 0 (no halo, no inter-GPU coarse overlap).
+
+    Under v2 each GPU owns exactly one coarse cube with no neighbors
+    consumed. The legacy ``ceil(K_dm_widest / (2 · mean_fine_per_coarse))``
+    formula is replaced by a constant 0; the ``fine_to_coarse`` and
+    ``n_coarse`` arguments are kept for ABI symmetry with v1 callers.
+    """
+    del fine_to_coarse, n_coarse  # v2: unused
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -417,20 +467,93 @@ def build_dm_plan(
     tol: float,
     t_int_fast_us: float,
     t_int_search_us: float,
+    n_coarse_cap: int | None = None,
     repo_root: Path = REPO_ROOT,
 ) -> DmPlan:
-    """Build a complete ``DmPlan`` per plan §3.2 (steps 1-5)."""
-    fine_dm = build_fine_list(dm_min, dm_max, t_int_search_us, tol)
-    coarse_dm = build_coarse_list(dm_min, dm_max, t_int_fast_us, tol)
+    """Build a complete v2 ``DmPlan`` (user-clarified scheme, 2026-05-18).
+
+    Flow:
+      1. Bottom-sub-band Levin recursion (chgroup 15) from ``dm_min`` with
+         ``n_cap = N_coarse = N_SEARCH * N_SEARCH_GPU = 8``. The 8th step's
+         DM value sets ``dm_max_effective``; the recursion's POSITIONS are
+         then discarded (only its final-step DM is used).
+      2. Full-band Levin recursion (processed band, per-channel Δν, n_chan
+         = N_CHAN_PROC_NATIVE) from ``dm_min`` to ``dm_max_effective`` → a
+         raw fine-DM list of length ``N_fine_raw``.
+      3. Trim the tail of the raw fine list to the largest multiple of
+         ``N_coarse``: ``N_fine = (N_fine_raw // N_coarse) * N_coarse`` and
+         ``K = N_fine / N_coarse``.
+      4. Place coarse DMs at the bucket midpoints:
+         ``coarse_dm[i] = fine_dm[i*K + K//2]`` for ``i = 0..N_coarse-1``.
+         This makes the coarse DMs sit naturally in the middle of each
+         GPU's K-fine ownership range (K/2 fines below, ~K/2 above).
+      5. ``fine_to_coarse[f] = f // K`` (1:1 even split), δdm = fine_dm[f]
+         - coarse_dm[f // K] is SIGNED → ``time_shift_search`` is SIGNED.
+      6. Per-(search, GPU) partition is 1:1: ``[s, g] = (2s+g, 2s+g)``.
+         No halo, no inter-GPU overlap, ``dm_overlap_coarse = 0``.
+
+    Args:
+        n_coarse_cap: must equal ``N_SEARCH * N_SEARCH_GPU`` (default 8)
+            under v2. Retained for ABI compatibility; non-default values
+            will raise. Defaults to ``N_SEARCH * N_SEARCH_GPU`` when None.
+        dm_max: provides the upper bound for the bottom-sub-band recursion
+            search. dm_max_effective is derived from the recursion's 8th
+            step (typically << dm_max). dm_max must be > dm_min and large
+            enough that the recursion does not exit early.
+    """
+    n_coarse_target = N_SEARCH * N_SEARCH_GPU  # = 8 in production
+    n_cap = n_coarse_cap if n_coarse_cap is not None else n_coarse_target
+    if n_cap != n_coarse_target:
+        raise ValueError(
+            f"v2 DM plan requires n_coarse == N_SEARCH * N_SEARCH_GPU = "
+            f"{n_coarse_target}; got n_coarse_cap={n_cap}"
+        )
+
+    # Step 1: bottom-sub-band Levin seed to determine dm_max_effective.
+    coarse_seed = build_coarse_list(
+        dm_min, dm_max, t_int_fast_us, tol, n_cap=n_cap
+    )
+    if coarse_seed.shape[0] < n_cap:
+        raise ValueError(
+            f"bottom-sub-band Levin produced only {coarse_seed.shape[0]} "
+            f"trials before dm_max={dm_max}; need {n_cap}. Raise --dm-max "
+            f"or lower --tol/--dm-min."
+        )
+    dm_max_effective = float(coarse_seed[-1])
+
+    # Step 2: full-band fine list over [dm_min, dm_max_effective].
+    fine_raw = build_fine_list(dm_min, dm_max_effective, t_int_search_us, tol)
+    n_fine_raw = fine_raw.shape[0]
+    if n_fine_raw < n_cap:
+        raise ValueError(
+            f"full-band Levin produced N_fine_raw={n_fine_raw} < N_coarse="
+            f"{n_cap}; cannot form even-K partition. Loosen --tol or raise "
+            f"--dm-max."
+        )
+
+    # Step 3: trim to multiple of N_coarse.
+    n_fine = (n_fine_raw // n_cap) * n_cap
+    fine_dm = fine_raw[:n_fine].astype("float64")
+    k = n_fine // n_cap
+    final_dm_max = float(fine_dm[-1])
+
+    # Step 4: coarse_dm[i] = fine_dm[i*K + K//2] (bucket midpoints).
+    coarse_dm = np.array(
+        [fine_dm[i * k + k // 2] for i in range(n_cap)],
+        dtype="float64",
+    )
+
+    # Step 5: fine_to_coarse + CSR offsets (signed deltas).
     fine_to_coarse, fine_offsets_idx, fine_offsets_flat = build_fine_to_coarse(
         fine_dm, coarse_dm
     )
     ts_s1, ts_s2, ts_search = build_time_shifts(
         fine_dm, coarse_dm, fine_to_coarse, t_int_fast_us, t_int_search_us
     )
-    n_coarse = coarse_dm.shape[0]
-    overlap = compute_dm_overlap_coarse(fine_to_coarse, n_coarse)
-    canon, cons, canon_g, cons_g = build_partition(fine_to_coarse, n_coarse, overlap)
+
+    # Step 6: 1:1 GPU-owns-1-coarse partition (no halo).
+    overlap = compute_dm_overlap_coarse(fine_to_coarse, n_cap)  # = 0
+    canon, cons, canon_g, cons_g = build_partition(n_cap)
 
     metadata = {
         "band_top_GHz": float(NU_TOP_PROC_GHZ),
@@ -443,11 +566,19 @@ def build_dm_plan(
         "build_utc_ns": int(time.time_ns()),
         "git_sha": _git_sha(repo_root),
         "version": DM_PLAN_METADATA_VERSION,
+        # v2-specific bookkeeping (informational; not required by the
+        # consumers but useful for debugging + report-generation):
+        "v2_dm_max_seed_bottom_subband": float(dm_max_effective),
+        "v2_dm_max_final": final_dm_max,
+        "v2_K_fines_per_gpu": int(k),
+        "v2_n_fine_raw_before_trim": int(n_fine_raw),
+        "v2_n_fine_trimmed": int(n_fine_raw - n_fine),
+        "v2_coarse_seed_pos_pc_cm3": [float(x) for x in coarse_seed.tolist()],
     }
 
     return DmPlan(
         dm_min=float(dm_min),
-        dm_max=float(dm_max),
+        dm_max=final_dm_max,
         tol=float(tol),
         fine_dm=fine_dm,
         coarse_dm=coarse_dm,
@@ -478,6 +609,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dm-max", type=float, default=DM_MAX_DEFAULT)
     p.add_argument("--tol", type=float, default=DM_TOL_DEFAULT)
     p.add_argument(
+        "--n-coarse-cap",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on coarse-DM trial count. Truncates the legacy "
+            "gen_dmtrials recursion at exactly N trials and uses "
+            "coarse_dm[-1] as the effective dm_max (the fine list is "
+            "clipped to match). Used by M7.2 to compare {6,7,8}-trial "
+            "operating points while preserving (dm_min, tol)."
+        ),
+    )
+    p.add_argument(
         "--t-int-fast-us",
         type=float,
         default=T_INT_FAST_US_DEFAULT,
@@ -504,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         tol=args.tol,
         t_int_fast_us=args.t_int_fast_us,
         t_int_search_us=t_int_search_us,
+        n_coarse_cap=args.n_coarse_cap,
     )
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

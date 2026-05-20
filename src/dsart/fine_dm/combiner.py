@@ -112,11 +112,18 @@ class TimeShiftSearchTable:
                 "§3.6.3 sign convention (chgroup 15 is the reference; "
                 "ν_chgroup_bot[15] == ν_bot_proc)"
             )
-        if int(np.min(self.shifts)) < 0:
-            raise ValueError(
-                "time_shift_search must be non-negative for δdm ≥ 0 "
-                "(plan §3.6.3 sign convention)"
-            )
+        # Shifts are SIGNED int32 under the v2 DM-plan convention (per
+        # user clarification 2026-05-18). With the even-K-around-coarse
+        # GPU partitioning, each GPU owns K = N_fine/8 fine DMs that sit
+        # SYMMETRICALLY around its assigned coarse_dm[i]. Fines BELOW the
+        # coarse have δdm < 0 → negative shifts (read PAST data from the
+        # rolling RX ring; naturally available, no rewind needed). Fines
+        # ABOVE the coarse have δdm > 0 → positive shifts (read FUTURE
+        # data; supplied by the corr-side one-sided rewind / dsaX_hella
+        # convention). combine_chgroups() applies stream[t - shift] which
+        # works for both signs as long as the rolling buffer has the
+        # required past+future coverage; the validity gate at the cube
+        # boundary is enforced upstream.
         if self.t_int_search_us <= 0:
             raise ValueError(
                 f"t_int_search_us must be > 0; got {self.t_int_search_us!r}"
@@ -144,8 +151,12 @@ def compute_time_shift_search(
     rounding rule is ``numpy.rint`` (half-to-even / banker's rounding)
     per the §3.6 rounding-direction lock.
 
-    Sign convention: shifts are non-negative for ``δdm ≥ 0``. The
-    chgroup-15 row is identically zero (chgroup-15's band-bottom IS
+    Sign convention (v2, 2026-05-18): shifts are SIGNED int32. δdm can be
+    positive (fine above coarse → POSITIVE shift, advance/read-FUTURE) or
+    negative (fine below coarse → NEGATIVE shift, retreat/read-PAST).
+    Both signs are required under the v2 even-K-around-coarse partition
+    where each search GPU owns K fine DMs SYMMETRIC about coarse_dm[i].
+    The chgroup-15 row is identically zero (chgroup-15's band-bottom IS
     ``ν_bot_proc`` by construction; see ``common/constants.py::NU_CHGROUP_BOT_GHZ``).
 
     Args:
@@ -211,11 +222,9 @@ def compute_time_shift_search(
     # delta_tau at the construction frequency could yield ±1-sample
     # noise away from zero on some platforms).
     shifts[:, N_CHGROUP - 1] = 0
-    if int(shifts.min()) < 0:
-        raise ValueError(
-            "computed shifts include negative values for δdm ≥ 0; "
-            "check coarse_dm / fine_dm / fine_to_coarse alignment"
-        )
+    # v2 (2026-05-18): shifts are SIGNED — δdm < 0 (fine below coarse)
+    # yields negative shifts (read PAST data from the rolling RX ring).
+    # See TimeShiftSearchTable docstring for the full convention.
     return TimeShiftSearchTable(
         shifts=shifts,
         fine_to_coarse=fine_to_coarse.astype(np.int64, copy=False),

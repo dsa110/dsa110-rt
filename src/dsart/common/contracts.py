@@ -327,9 +327,32 @@ class DmPlan:
     Round-trips through ``configs/dm_plan.npz`` via ``to_npz()`` /
     ``from_npz()``. All array fields use the dtypes pinned in §3.2.
 
-    See plan §3.2 lines 542-571 for the full schema. The CSR pair
-    (``fine_offsets_idx``, ``fine_offsets_flat``) replaces the legacy
-    list-of-ragged-arrays representation that npz cannot round-trip.
+    See plan §3.2 lines 542-571 for the full schema and
+    ``constants.py::DM_PLAN_METADATA_VERSION`` for the v1 → v2 schema
+    history (the v2 even-K-around-coarse partition landed for M7.2 per
+    user direction 2026-05-18). The CSR pair (``fine_offsets_idx``,
+    ``fine_offsets_flat``) replaces the legacy list-of-ragged-arrays
+    representation that npz cannot round-trip.
+
+    Sign conventions (v2):
+      • ``time_shift_corr_stage1`` and ``time_shift_corr_stage2`` remain
+        non-negative (corr-side alignment always shifts to ν_bot_proc).
+      • ``time_shift_search`` is SIGNED int32 — fines BELOW their coarse
+        carry negative shifts (read PAST data from the rolling RX ring;
+        naturally available), fines ABOVE carry positive shifts (read
+        FUTURE data delivered by the corr-side one-sided rewind).
+        ``time_shift_search[:, 15]`` is identically 0 (ν_chgroup_bot[15]
+        == ν_bot_proc by construction).
+      • ``fine_offsets_flat`` (= δdm in pc/cm³) is SIGNED under v2.
+
+    Per-(search, GPU) ranges (v2):
+      • ``dm_idx_range_canonical_per_gpu[s, g] = (i, i)`` where
+        ``i = N_SEARCH_GPU * s + g``. Each search GPU owns EXACTLY ONE
+        coarse cube (no halo, no inter-GPU coarse overlap).
+      • Per-GPU fine-DM ownership is the K = N_fine/N_coarse contiguous
+        fines ``fine_dm[(2s+g)*K : (2s+g+1)*K]`` (derivable from
+        ``fine_to_coarse[f] = f // K``; not stored separately).
+      • ``dm_overlap_coarse = 0``.
     """
 
     dm_min: float

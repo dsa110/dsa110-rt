@@ -174,17 +174,36 @@ def _buffer_address_and_size(buf: object) -> tuple[int, int] | None:
     if isinstance(buf, np.ndarray):
         if not buf.flags["C_CONTIGUOUS"] and not buf.flags["F_CONTIGUOUS"]:
             return None
-        # Production PSRDADA buffers are always WRITEABLE (psrdada-python
-        # maps ipcio_t pages with PROT_READ|PROT_WRITE). Bench / test
-        # paths that wrap raw bytes from disk via np.frombuffer(bytes)
-        # produce non-writable arrays; PyTorch torch.as_tensor() on a
-        # non-writable array takes a special internal H2D path that
-        # conflicts with our explicit cudaHostRegister, producing
-        # cudaErrorAlreadyMapped on the second iteration. Skip pinning
-        # here -- callers fall back to the pageable path (slower but
-        # correct).
-        if not buf.flags["WRITEABLE"]:
-            return None
+        # CORRECTION (2026-05-17, M7.1 5-min soak bisect on n06):
+        # psrdada-python's Reader.getNextPage() actually returns a
+        # NON-writeable view of the ipcio_t ring page (the underlying
+        # mmap on the reader side is PROT_READ-only — only the writer
+        # has PROT_WRITE). So the production fada-read path was
+        # falling through this branch and skipping pinning, dropping
+        # the H2D path onto the pageable code (~4-5 GB/s vs ~12 GB/s
+        # pinned, i.e. 60-72 ms vs 25 ms for a 288 MB fada block).
+        # This is the 33 ms gap between the standalone bench
+        # (108 ms p50, writeable synth buffers) and the orchestrator
+        # (141 ms p50, non-writeable PSRDADA pages) measured at the
+        # M7.1 x32 op-point.
+        #
+        # The original "skip if not WRITEABLE" was a band-aid for a
+        # different problem: PyTorch's torch.as_tensor() on a
+        # non-writeable array used to take a special internal H2D
+        # path that did its own cudaHostRegister, conflicting with
+        # ours and raising cudaErrorAlreadyMapped on the second
+        # iteration. That collision is harmless now — the host_pin
+        # registry treats already-mapped pages as success (see the
+        # cudaErrorHostMemoryAlreadyRegistered=712 short-circuit in
+        # maybe_register_host_buffer). So we let PSRDADA-style
+        # non-writeable pages through, pin them, and skip the
+        # PyTorch internal-pin path by ensuring the page is already
+        # in the driver's pinned set.
+        #
+        # Bench paths that mint a fresh np.frombuffer(bytes) per
+        # iteration are still safe: cudaHostRegister succeeds
+        # idempotently on the stable VA range, the GC finalizer
+        # tears it down, and the next iteration re-pins.
         return int(buf.ctypes.data), int(buf.nbytes)
     if isinstance(buf, memoryview):
         if not buf.contiguous:

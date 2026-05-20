@@ -93,15 +93,24 @@ def _make_prod_tx(
     t_int_factor: int = 1,
     bucket_fifo_depth: int = 16,
     pacer_headroom: float = 1.05,
+    bypass_pacer: bool = False,
 ) -> TransportTx:
     """Build a :class:`TransportTx` with ``use_prod_frame=True`` sending
-    to ``127.0.0.1:rx_port``. Calls :meth:`prepare_prod` automatically."""
+    to ``127.0.0.1:rx_port``. Calls :meth:`prepare_prod` automatically.
+
+    Default ``bypass_pacer=False`` keeps the existing tests in this
+    module exercising the legacy in-Python token-bucket pacer path
+    (those tests were written specifically to validate bucket
+    semantics). Production callers default to ``True`` instead — see
+    :class:`~dsart.transport.tx.TransportTxProdConfig.bypass_pacer`.
+    """
     cfg = TransportTxProdConfig(
         target_gbps_per_flow=target_gbps,
         pacer_headroom=pacer_headroom,
         bits_per_cell=bits_per_cell,
         t_int_factor=t_int_factor,
         bucket_fifo_depth=bucket_fifo_depth,
+        bypass_pacer=bypass_pacer,
     )
     tx = TransportTx(
         "127.0.0.1",
@@ -665,6 +674,98 @@ class TestPacerAndMonKeys:
             f"Token rate error > 10%: expected={expected_refill_bytes:.1f} B "
             f"over {dt_s} s, got balance={bucket._balance:.1f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# (e2) Bypass-pacer path (M7.2-amend 2026-05-19, matches bench/net_pair.py)
+# ---------------------------------------------------------------------------
+
+
+class TestBypassPacer:
+    """Group (e2): ``TransportTxProdConfig.bypass_pacer=True`` raw-sendto
+    path. Mirrors the ``bench/net_pair.py`` / 16×4 corner-turn TX
+    pattern that the M4b core DoD validated at production rate with
+    zero TX drops.
+    """
+
+    def test_e2b1_bypass_emits_all_fragments_via_sendto_no_bucket(self):
+        """bypass_pacer=True: every fragment lands on the wire and no
+        ``_TokenBucket`` is created."""
+        rx_sock, rx_port = _make_rx_sock()
+        tx = _make_prod_tx(rx_port, bypass_pacer=True)
+        try:
+            cube = _make_sparse_cube(2, 3, 20)
+            n_sent = tx._transmit_one_cube_prod(cube, specnum=7, flags=0)
+            # 2 dm × 3 t × 1 frag (small payload < MTU) = 6 fragments.
+            assert n_sent == 6
+            # No buckets created in bypass mode.
+            assert tx._bucket_by_flow == {}
+            # All-OK on loopback ⇒ no wire-drop, no payload-drop.
+            assert tx.tx_wire_drops == 0
+            assert tx.tx_dropped_payloads == 0
+            assert tx._wire_send_fail_count == 0
+            # Drain the receive side so we don't pin kernel buffer.
+            frames = _recv_all_frames(rx_sock, 6)
+            assert len(frames) == 6
+        finally:
+            tx.close()
+            rx_sock.close()
+
+    def test_e2b2_bypass_counts_sendto_oserror_as_wire_drop(self):
+        """bypass_pacer=True: ``OSError`` from ``sendto`` ⇒ +1 in
+        ``_wire_send_fail_count`` per fragment and +1 in
+        ``tx_dropped_payloads`` per payload."""
+        rx_sock, rx_port = _make_rx_sock()
+        rx_sock.close()
+        tx = _make_prod_tx(rx_port, bypass_pacer=True)
+        try:
+            cube = _make_sparse_cube(1, 2, 20)  # 1 dm × 2 t × 1 frag = 2 frags
+
+            class _BoomSock:
+                """Fake socket that raises ENOBUFS-equivalent on every sendto."""
+                def sendto(self, _data, _addr):
+                    raise OSError("ENOBUFS")
+
+                def close(self):
+                    pass
+
+            tx._sock = _BoomSock()  # swap in failing socket
+
+            n_sent = tx._transmit_one_cube_prod(cube, specnum=1, flags=0)
+            assert n_sent == 0, "no fragments could reach the wire"
+            # 2 fragments failed ⇒ wire_send_fail_count == 2.
+            assert tx._wire_send_fail_count == 2
+            assert tx.tx_wire_drops == 2
+            # Per-payload accounting: 1 dm × 2 t ⇒ 2 payloads, each with
+            # at least one failed fragment ⇒ tx_dropped_payloads bumps
+            # once per payload (per-(dm,t) scope is one increment per
+            # outer dm_idx loop iteration).
+            assert tx.tx_dropped_payloads >= 1
+        finally:
+            tx.close()
+
+    def test_e2b3_bypass_default_in_TransportTxProdConfig(self):
+        """``TransportTxProdConfig()`` defaults to ``bypass_pacer=True``
+        (the production-correct M4b semantics)."""
+        cfg = TransportTxProdConfig(target_gbps_per_flow=0.073)
+        assert cfg.bypass_pacer is True
+        assert cfg.sndbuf_mib == 256
+
+    def test_e2b4_prepare_prod_resets_wire_fail_count(self):
+        """``prepare_prod`` clears the new bypass-mode failure counter
+        alongside the existing prod mon-keys."""
+        rx_sock, rx_port = _make_rx_sock()
+        tx = _make_prod_tx(rx_port, bypass_pacer=True)
+        try:
+            tx._wire_send_fail_count = 99
+            tx.tx_dropped_payloads = 5
+            tx.prepare_prod({3: _FAKE_PATTERN_ID}, _FAKE_N_GRID)
+            assert tx._wire_send_fail_count == 0
+            assert tx.tx_wire_drops == 0
+            assert tx.tx_dropped_payloads == 0
+        finally:
+            tx.close()
+            rx_sock.close()
 
 
 # ---------------------------------------------------------------------------

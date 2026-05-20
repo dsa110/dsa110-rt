@@ -65,6 +65,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -85,6 +86,7 @@ from dsart.cal.cal_loader import (
 )
 from dsart.common.config_loader import load
 from dsart.common.constants import (
+    BLOCK_SAMPLES_NATIVE,
     FADA_BYTES_PER_BLOCK,
     N_CHGROUP,
     NANTS,
@@ -119,6 +121,18 @@ from dsart.coarse_dm.stage1 import (
     apply_stage1_shifts,
     max_t_dedisp_for_plan,
 )
+from dsart.coarse_dm.stage2_fifo import Stage2FIFO
+from dsart.common.constants import COARSE_DM_FIFO_DEPTH_DEFAULT
+from dsart.transport.frame import (
+    DTYPE_CFP16,
+    DTYPE_CINT8,
+)
+from dsart.transport.tx import TransportTx
+from dsart.transport.async_tx import (
+    AsyncTransportTx,
+    AsyncTransportTxConfig,
+)
+from dsart.transport.tx_ring import CubeShmRingDims
 
 
 LOG = logging.getLogger("corr_fast_integration")
@@ -228,6 +242,85 @@ class NoOpStage2Fifo:
         return [dedispersed]
 
 
+class _Stage2FIFOAdapter:
+    """Protocol-compatible wrapper around :class:`Stage2FIFO`.
+
+    The orchestrator calls ``stage2_fifo.push(dedispersed, *, block_n)
+    -> list[Tensor]`` per the :class:`Stage2FifoStage` Protocol; the
+    real :class:`Stage2FIFO` has ``push(cube) -> Tensor | None`` and a
+    separate ``push_for_protocol`` adapter method. This thin wrapper
+    routes through ``push_for_protocol`` so the real FIFO drops in
+    with no protocol churn.
+
+    Used when the operator passes ``--transport-tx-host``: the
+    Stage-2 FIFO becomes a real K-deep cube ring (M7.2 overlap path)
+    instead of the M3 :class:`NoOpStage2Fifo` identity adapter.
+    """
+
+    __slots__ = ("fifo",)
+
+    def __init__(self, depth: int) -> None:
+        self.fifo = Stage2FIFO(depth=depth)
+
+    def push(
+        self,
+        dedispersed: torch.Tensor,
+        *,
+        block_n: int,
+    ) -> list[torch.Tensor]:
+        return self.fifo.push_for_protocol(dedispersed, block_n=block_n)
+
+
+class _TransportTxAdapter:
+    """Protocol-compatible wrapper around :class:`TransportTx`.
+
+    Bridges two signature gaps so the M7.2 production TX wires into
+    the chunk-4 orchestrator without modifying the call site:
+
+    1. :class:`TransportTx.transmit` supports an optional
+       ``specnum`` kwarg that the M4a prod-frame path REQUIRES
+       (raises ``NotImplementedError`` otherwise). The chunk-4
+       :class:`TransportTxStage` Protocol does not pass ``specnum``.
+       This adapter supplies ``specnum=block_n`` automatically when
+       the underlying TX uses ``use_prod_frame=True``.
+    2. Decouples the orchestrator from import-time knowledge of the
+       transport stack (only the adapter holds the concrete TX
+       instance; the orchestrator only sees the Protocol surface).
+
+    Production wiring (M7.2.8 corner-turn) will source ``specnum``
+    from the SNAP F-engine packet counter at the start of each block
+    (plan §4.3 line 1421); for the M7.2 Phase A corr-side benchmark,
+    ``block_n`` is a monotone proxy good enough to satisfy the
+    receiver's seq-gap accounting (which the loopback drain ignores).
+    """
+
+    __slots__ = ("tx", "_pass_specnum")
+
+    def __init__(self, tx: TransportTx) -> None:
+        self.tx = tx
+        self._pass_specnum: bool = bool(tx.use_prod_frame)
+
+    def transmit(
+        self,
+        cubes_for_tx: list[torch.Tensor],
+        *,
+        block_n: int,
+        rfi_warming_up: bool,
+    ) -> int:
+        if self._pass_specnum:
+            return self.tx.transmit(
+                cubes_for_tx,
+                block_n=block_n,
+                rfi_warming_up=rfi_warming_up,
+                specnum=int(block_n),
+            )
+        return self.tx.transmit(
+            cubes_for_tx,
+            block_n=block_n,
+            rfi_warming_up=rfi_warming_up,
+        )
+
+
 @dataclass
 class NoOpTransportTx:
     """Drop-on-the-floor TX. Used until chunk 8 plugs in.
@@ -244,6 +337,58 @@ class NoOpTransportTx:
         rfi_warming_up: bool,
     ) -> int:
         return 0
+
+
+class _AsyncTransportTxAdapter:
+    """Protocol-compatible wrapper around :class:`AsyncTransportTx`.
+
+    M7.2 production path: off-loads the encode + ``sendto`` work to
+    worker subprocesses so the main GPU-pipeline thread is never
+    blocked on TX. The hot-path :meth:`transmit` only does:
+
+      1. D2H of the cube (once; ~10 ms PCIe at the N=8 op-point).
+      2. ``numpy.copyto`` per worker into the worker's shm slot
+         (~1 ms each at production dims).
+      3. ``mp.Queue.put`` per worker to signal the slot is ready.
+
+    Total main-thread cost: ~10 ms D2H + ~4 × 1 ms slot copies + ~4 ×
+    Queue.put overhead. The remaining ~64 ms of cint8 quantisation +
+    ProdFrame packing + ``sendto`` syscalls runs concurrently in the
+    worker subprocesses, overlapping with the *next* block's GPU
+    compute.
+
+    Required by the user's "no shortcuts" production-only directive
+    for M7.2: the corr-side egress must hit the wire at the production
+    rate while the corr-side block budget stays at its M7.1 ceiling
+    (~110 ms p50 at the N=8 prod settings).
+
+    Args:
+        async_tx: a constructed :class:`AsyncTransportTx`. Owns its
+            worker subprocesses + shm rings for the lifetime of the
+            ``corr_fast`` service.
+    """
+
+    __slots__ = ("async_tx",)
+
+    def __init__(self, async_tx: AsyncTransportTx) -> None:
+        self.async_tx = async_tx
+
+    def transmit(
+        self,
+        cubes_for_tx: list[torch.Tensor],
+        *,
+        block_n: int,
+        rfi_warming_up: bool,
+    ) -> int:
+        return self.async_tx.transmit(
+            cubes_for_tx,
+            block_n=block_n,
+            rfi_warming_up=rfi_warming_up,
+            specnum=int(block_n),
+        )
+
+    def close(self) -> None:
+        self.async_tx.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1279,99 @@ class IntegrationContext:
     legacy path), the post-grid ``coarse_dm`` Protocol stub is used
     instead."""
 
+    profiler: "StageProfiler | None" = None
+    """Optional per-stage CUDA-event timing profiler (M7.2 Phase 0
+    diagnostic). When set, :func:`process_block` brackets each major
+    stage with a paired ``torch.cuda.Event`` and the profiler logs a
+    rolling mean per stage every ``profiler.every`` blocks. When
+    ``None`` (default), the profiler hooks are skipped entirely so
+    the hot path has zero overhead. See :class:`StageProfiler`."""
+
+
+class StageProfiler:
+    """Per-stage CUDA-event timing for the corr-fast pipeline (M7.2
+    Phase 0 diagnostic).
+
+    Wrap a section of code with::
+
+        with ctx.profiler.bracket("multi_dm"):
+            ...
+
+    The profiler records a paired ``torch.cuda.Event`` around each
+    section, then on :meth:`commit_block` syncs the last event and
+    accumulates the elapsed time. Every ``every`` blocks it emits a
+    summary log line of mean per-stage ms over the window.
+
+    Overhead: 2 event-records per bracketed stage (~10 µs each) plus
+    one ``synchronize`` per block. The synchronize is comparable to
+    the wall-clock the orchestrator already pays at the end of each
+    block (the next iteration blocks on PSRDADA fada writability),
+    so the net measurement perturbation is small. The profiler is
+    OFF by default — pass ``--profile-stages-every N`` to enable.
+    """
+
+    def __init__(self, every: int = 64) -> None:
+        if every < 1:
+            raise ValueError(f"StageProfiler.every={every}, expected >= 1")
+        self.every = int(every)
+        self._block_n: int = 0
+        self._totals: dict[str, list[float]] = {}
+        # Active brackets for the current block (cleared on commit_block).
+        # Stored as (name, start_event, end_event).
+        self._pending: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+    @contextlib.contextmanager
+    def bracket(self, name: str):
+        """Bracket a code section with a paired CUDA event."""
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            self._pending.append((name, start, end))
+
+    def commit_block(self) -> None:
+        """Sync the last event, accumulate per-stage ms, emit if due."""
+        if not self._pending:
+            self._block_n += 1
+            return
+        # Syncing the final event ensures all stages' end events have
+        # actually completed on the GPU (events recorded earlier on
+        # the same stream are guaranteed-done by the time a later
+        # event syncs). elapsed_time() then returns a well-defined
+        # number for every bracket.
+        self._pending[-1][2].synchronize()
+        for name, start, end in self._pending:
+            self._totals.setdefault(name, []).append(start.elapsed_time(end))
+        self._pending.clear()
+        self._block_n += 1
+        if self._block_n >= self.every:
+            self._emit()
+            self._block_n = 0
+
+    def _emit(self) -> None:
+        if not self._totals:
+            return
+        parts: list[str] = []
+        for name, ms_list in self._totals.items():
+            if not ms_list:
+                continue
+            mean = sum(ms_list) / len(ms_list)
+            ms_sorted = sorted(ms_list)
+            p50 = ms_sorted[len(ms_sorted) // 2]
+            p99 = ms_sorted[min(len(ms_sorted) - 1, int(0.99 * len(ms_sorted)))]
+            parts.append(f"{name}=mean:{mean:.2f}ms p50:{p50:.2f}ms p99:{p99:.2f}ms")
+        LOG.info(
+            "stage-profile (over %d blocks): %s",
+            sum(len(v) for v in self._totals.values()) // max(1, len(self._totals)),
+            " | ".join(parts),
+        )
+        # Reset windows for next emission.
+        for ms_list in self._totals.values():
+            ms_list.clear()
+
 
 @dataclass
 class IntegrationOutput:
@@ -1230,6 +1468,23 @@ def process_block(
     # corr-side and consume-side phases sequentially on the default
     # stream. The phase split is what BlockPipeliner uses to overlap
     # the two halves on separate CUDA streams.
+    if ctx.profiler is not None:
+        # M7.2 Phase 0 diagnostic: bracket the two halves so we can
+        # decompose per-block ms into corr-half (unpack + RFI + cal +
+        # compute_split) vs consume-half (multi-DM dedisp + static-sky
+        # + stage2_fifo + transport_tx). The two halves are the
+        # natural boundary for N-scaling questions: the corr-half is
+        # N-independent; the consume-half is where ``n_dm`` shows up.
+        with ctx.profiler.bracket("corr_phase"):
+            vis_stokes_i, rfi_result = _process_block_corr_phase(
+                raw, ctx=ctx, block_n=block_n,
+            )
+        with ctx.profiler.bracket("consume_phase"):
+            out = _process_block_consume_phase(
+                vis_stokes_i, rfi_result, ctx=ctx, block_n=block_n,
+            )
+        return out
+
     vis_stokes_i, rfi_result = _process_block_corr_phase(
         raw, ctx=ctx, block_n=block_n,
     )
@@ -1500,18 +1755,30 @@ def _process_block_consume_phase(
         # ----- Chunk-9 / F25 production path: multi-DM-trial vis-domain
         # stage-1 shifts → per-trial grid → per-trial static-sky.
         # Returns (N_DM, T_dedisp, N_filled) complex64.
-        dedispersed = ctx.multi_dm_coarse_dm.dedisperse_from_vis(
-            vis_stokes_i, block_n=block_n,
-        )
+        if ctx.profiler is not None:
+            with ctx.profiler.bracket("multi_dm"):
+                dedispersed = ctx.multi_dm_coarse_dm.dedisperse_from_vis(
+                    vis_stokes_i, block_n=block_n,
+                )
+        else:
+            dedispersed = ctx.multi_dm_coarse_dm.dedisperse_from_vis(
+                vis_stokes_i, block_n=block_n,
+            )
         del vis_stokes_i
 
         # 8. Per-trial static-sky EMA subtraction (collapses the
         # T_dedisp axis → N_filled internally; replicates back to
         # the full (T_dedisp, N_filled) shape).
         if ctx.static_sky is not None and not ctx.cfg.static_sky_disabled:
-            n_dm, t_dedisp, n_filled = dedispersed.shape
-            for c in range(n_dm):
-                dedispersed[c] = ctx.static_sky.apply(dedispersed[c])
+            if ctx.profiler is not None:
+                with ctx.profiler.bracket("static_sky"):
+                    n_dm, t_dedisp, n_filled = dedispersed.shape
+                    for c in range(n_dm):
+                        dedispersed[c] = ctx.static_sky.apply(dedispersed[c])
+            else:
+                n_dm, t_dedisp, n_filled = dedispersed.shape
+                for c in range(n_dm):
+                    dedispersed[c] = ctx.static_sky.apply(dedispersed[c])
 
         # The "headline" pre-stage2 cube is the multi-DM cube itself.
         # Tests + benches read this from IntegrationOutput.gridded_minus_sky.
@@ -1536,14 +1803,23 @@ def _process_block_consume_phase(
             gridded_minus_sky, block_n=block_n, chgroup=ctx.cfg.chgroup,
         )
 
-    # 10. Stage-2 FIFO push (no-op stub today)
-    cubes_for_tx = ctx.stage2_fifo.push(dedispersed, block_n=block_n)
-
-    # 11. Transport TX (no-op stub today)
+    # 10. Stage-2 FIFO push (NoOp stub or real Stage2FIFO ring;
+    #     see ``--transport-tx-host`` wiring in :func:`run`)
+    # 11. Transport TX (NoOp stub, chunk-8 cfp16/cint8, or M4a prod
+    #     ProdFrame + cint8 + pacer; see ``--transport-tx-host``)
     rfi_warmup_flag = bool(rfi_result.warmup) if rfi_result is not None else False
-    n_tx = ctx.transport_tx.transmit(
-        cubes_for_tx, block_n=block_n, rfi_warming_up=rfi_warmup_flag,
-    )
+    if ctx.profiler is not None:
+        with ctx.profiler.bracket("stage2_tx"):
+            cubes_for_tx = ctx.stage2_fifo.push(dedispersed, block_n=block_n)
+            n_tx = ctx.transport_tx.transmit(
+                cubes_for_tx, block_n=block_n,
+                rfi_warming_up=rfi_warmup_flag,
+            )
+    else:
+        cubes_for_tx = ctx.stage2_fifo.push(dedispersed, block_n=block_n)
+        n_tx = ctx.transport_tx.transmit(
+            cubes_for_tx, block_n=block_n, rfi_warming_up=rfi_warmup_flag,
+        )
 
     return IntegrationOutput(
         gridded_minus_sky=gridded_minus_sky,
@@ -2435,6 +2711,20 @@ def run(
     coarse_dm: CoarseDMStage | None = None,
     stage2_fifo: Stage2FifoStage | None = None,
     transport_tx: TransportTxStage | None = None,
+    dm_plan: DMPlan | None = None,
+    use_pipeliner_3s: bool = False,
+    profile_stages_every: int = 0,
+    stage2_fifo_depth: int = COARSE_DM_FIFO_DEPTH_DEFAULT,
+    transport_tx_host: str = "",
+    transport_tx_port: int = 9000,
+    transport_tx_mode: str = "chunk8",
+    transport_tx_dtype: str = "cfp16",
+    transport_tx_target_gbps_per_flow: float = 0.073,
+    transport_tx_workers: int = 0,
+    transport_tx_ring_slots: int = 8,
+    transport_tx_coarse_dm_mask: int = 0xFF,
+    transport_tx_worker_hosts: str = "",
+    ready_sentinel_path: Path | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -2485,6 +2775,98 @@ def run(
                 "gridder pattern matches the cal."
             )
         antpos_e, antpos_n, core_mask = load_antpos_from_cal_blob(cfg.cal_path)
+
+        # ── M7.2 overlap path: real Stage2FIFO + TransportTx ─────────
+        # When --transport-tx-host is set, replace the NoOp stubs with
+        # the real :class:`Stage2FIFO` (M3 chunk 3b) + :class:`TransportTx`
+        # (M3 chunk 8 + M4a chunk 2) so the per-block budget includes
+        # the cross-chgroup timing FIFO and the cube-encode + sendto
+        # syscall costs. Phase-0 measurements with the NoOp stubs
+        # missed both of these N-scaling components.
+        #
+        # M7.2 production async path (--transport-tx-workers > 0):
+        # the inline ``TransportTx.transmit`` blocks the GPU pipeline
+        # for ~74 ms per cube at the N=8 op-point (Python encode +
+        # sendto). Off-loading to N worker subprocesses keeps the
+        # corr-side block budget at its M7.1 ceiling (~110 ms p50)
+        # while still hitting the wire at production rate. Construction
+        # happens AFTER build_context (n_grid + n_filled are needed
+        # from gridder.pattern). Below we install Stage2FIFO eagerly
+        # and replace ctx.transport_tx after build_context.
+        use_async_tx = (
+            bool(transport_tx_host)
+            and transport_tx_workers > 0
+            and transport_tx_mode == "prod"
+        )
+        if use_async_tx:
+            if stage2_fifo is None:
+                stage2_fifo = _Stage2FIFOAdapter(depth=stage2_fifo_depth)
+                LOG.info(
+                    "M7.2 async TX: real Stage2FIFO depth=%d (was NoOp)",
+                    stage2_fifo_depth,
+                )
+            if transport_tx is None:
+                # Placeholder; real AsyncTransportTx built after
+                # build_context() once gridder.pattern is finalised.
+                transport_tx = NoOpTransportTx()
+        elif transport_tx_host:
+            if stage2_fifo is None:
+                stage2_fifo = _Stage2FIFOAdapter(depth=stage2_fifo_depth)
+                LOG.info(
+                    "M7.2 overlap: real Stage2FIFO ring depth=%d (was NoOp)",
+                    stage2_fifo_depth,
+                )
+            if transport_tx is None:
+                if transport_tx_mode == "chunk8":
+                    dtype_code = (
+                        DTYPE_CFP16 if transport_tx_dtype == "cfp16"
+                        else DTYPE_CINT8
+                    )
+                    real_tx = TransportTx(
+                        host=transport_tx_host,
+                        port=transport_tx_port,
+                        chgroup=int(cfg.chgroup),
+                        dtype_code=dtype_code,
+                        use_prod_frame=False,
+                    )
+                    LOG.info(
+                        "M7.2 overlap: real TransportTx (chunk8) → "
+                        "%s:%d chgroup=%d dtype=%s (was NoOp)",
+                        transport_tx_host, transport_tx_port,
+                        cfg.chgroup, transport_tx_dtype,
+                    )
+                else:
+                    # prod mode: 72-byte ProdFrame with cint8 + pacer.
+                    # Requires prepare_prod() before any transmit; we
+                    # call it after build_context where gridder.pattern
+                    # is finalised so n_grid + pattern_id are known.
+                    from dsart.transport.prod_frame import (
+                        BITS_CINT8_COMPLEX,
+                    )
+                    from dsart.transport.tx import TransportTxProdConfig
+                    prod_cfg = TransportTxProdConfig(
+                        target_gbps_per_flow=(
+                            transport_tx_target_gbps_per_flow
+                        ),
+                        bits_per_cell=BITS_CINT8_COMPLEX,
+                        t_int_factor=1,
+                        corr_idx=int(cfg.chgroup),
+                    )
+                    real_tx = TransportTx(
+                        host=transport_tx_host,
+                        port=transport_tx_port,
+                        chgroup=int(cfg.chgroup),
+                        use_prod_frame=True,
+                        prod_config=prod_cfg,
+                    )
+                    LOG.info(
+                        "M7.2 overlap: real TransportTx (prod) → "
+                        "%s:%d chgroup=%d gbps/flow=%.3f (was NoOp)",
+                        transport_tx_host, transport_tx_port,
+                        cfg.chgroup, transport_tx_target_gbps_per_flow,
+                    )
+                transport_tx = _TransportTxAdapter(real_tx)
+
         ctx = build_context(
             cfg, device=device,
             antpos_e=antpos_e, antpos_n=antpos_n,
@@ -2492,11 +2874,236 @@ def run(
             coarse_dm=coarse_dm,
             stage2_fifo=stage2_fifo,
             transport_tx=transport_tx,
+            dm_plan=dm_plan,
         )
+
+        # ── M7.2 production async TX path ─────────────────────────────
+        # Spawn AsyncTransportTx workers now that gridder.pattern is
+        # finalised. The async path is mandatory for production: the
+        # inline TransportTx blocks the GPU pipeline by ~74 ms per cube
+        # at the N=8 op-point (Python encode + sendto). Off-loading to
+        # subprocesses keeps the corr-side block budget at its M7.1
+        # ceiling (~110 ms p50) while still hitting the wire at
+        # production rate; TX latency overlaps into the *next* block's
+        # GPU compute.
+        async_tx: AsyncTransportTx | None = None
+        if use_async_tx:
+            from dsart.grid.sparsity_pattern import predict_pattern_id
+            pat = ctx.gridder.pattern  # SparsityPattern
+            n_filled = int(pat.n_filled)
+            n_grid_eff = int(pat.n_grid)
+            # n_dm_total: prefer the runtime Stage1MultiDMCoarseDM,
+            # since the DMPlan may have come from cfg.dm_plan_path
+            # (loaded inside build_context, not via the dm_plan arg).
+            if ctx.multi_dm_coarse_dm is not None:
+                n_dm_total = int(ctx.multi_dm_coarse_dm.n_dm)
+            elif dm_plan is not None:
+                n_dm_total = int(dm_plan.n_coarse)
+            else:
+                raise RuntimeError(
+                    "AsyncTransportTx: no DMPlan available "
+                    "(neither cfg.dm_plan_path nor dm_plan arg)"
+                )
+            if n_dm_total < transport_tx_workers:
+                raise ValueError(
+                    f"--transport-tx-workers={transport_tx_workers} > "
+                    f"n_dm_total={n_dm_total}; each worker needs >= 1 DM trial"
+                )
+            n_dm_per_worker = (
+                n_dm_total + transport_tx_workers - 1
+            ) // transport_tx_workers
+            # Upper bound on n_fast_vis for the ring slot. Worst case
+            # is no dedispersion-shift loss; t_int_fast_native=32 →
+            # n_fv_max = BLOCK_SAMPLES_NATIVE / t_int_fast_native = 128.
+            n_fast_vis_max = (
+                BLOCK_SAMPLES_NATIVE // max(1, cfg.t_int_fast_native)
+            )
+            ring_dims = CubeShmRingDims(
+                n_slots=transport_tx_ring_slots,
+                shape=(n_dm_per_worker, n_fast_vis_max, n_filled),
+                dtype=np.dtype("complex64"),
+            )
+            # Compute pattern_id from the actual pattern. For loopback
+            # bench the search side is a drain, but for end-to-end
+            # M7.2 the search node validates the pattern_id against
+            # its own SparsityPattern. The predict_pattern_id call is
+            # cheap (no full pattern build).
+            try:
+                pattern_id = int(predict_pattern_id(
+                    chgroup=int(cfg.chgroup),
+                    dec_deg=float(np.degrees(cfg.obs_dec_rad)),
+                    n_grid=n_grid_eff,
+                    kernel_support=int(cfg.kernel_support),
+                    chan_sum_factor=int(cfg.chan_sum_factor),
+                    antpos_e=antpos_e,
+                    antpos_n=antpos_n,
+                    is_core_baseline_mask=core_mask,
+                )) & 0xFFFF_FFFF_FFFF_FFFF
+            except Exception:
+                LOG.warning(
+                    "predict_pattern_id failed; falling back to 0 "
+                    "(loopback-only; production e2e requires matching "
+                    "pattern_id on the search side)",
+                    exc_info=True,
+                )
+                pattern_id = 0
+
+            # M7.3 (2026-05-20): parse comma-separated per-worker
+            # destination hosts. Empty string keeps the legacy
+            # single-host behaviour (host:port + w per worker).
+            worker_hosts_list: list[str] | None = None
+            if transport_tx_worker_hosts:
+                worker_hosts_list = [
+                    h.strip() for h in transport_tx_worker_hosts.split(",")
+                    if h.strip()
+                ]
+                if len(worker_hosts_list) != int(transport_tx_workers):
+                    raise ValueError(
+                        f"--transport-tx-worker-hosts has "
+                        f"{len(worker_hosts_list)} entries; expected "
+                        f"--transport-tx-workers={transport_tx_workers}"
+                    )
+            async_cfg = AsyncTransportTxConfig(
+                host=transport_tx_host,
+                port=transport_tx_port,
+                worker_hosts=worker_hosts_list,
+                chgroup=int(cfg.chgroup),
+                n_workers=int(transport_tx_workers),
+                n_dm_total=int(n_dm_total),
+                ring_dims=ring_dims,
+                pattern_id=pattern_id,
+                n_grid=n_grid_eff,
+                target_gbps_per_flow=float(transport_tx_target_gbps_per_flow),
+                corr_idx=int(cfg.chgroup),
+                log_level="INFO",
+                shm_name_prefix=f"dsart-corr-tx-{cfg.chgroup}",
+                coarse_dm_mask=int(transport_tx_coarse_dm_mask) & 0xFF,
+            )
+            async_tx = AsyncTransportTx.spawn(async_cfg)
+            ctx.transport_tx = _AsyncTransportTxAdapter(async_tx)
+            LOG.info(
+                "M7.2 async TX spawned: n_workers=%d n_dm_total=%d "
+                "dm_per_worker=%d ring_slots=%d n_fv_max=%d n_filled=%d "
+                "n_grid=%d pattern_id=0x%x host=%s:%d gbps/flow=%.3f",
+                transport_tx_workers, n_dm_total, n_dm_per_worker,
+                transport_tx_ring_slots, n_fast_vis_max, n_filled,
+                n_grid_eff, pattern_id, transport_tx_host,
+                transport_tx_port, transport_tx_target_gbps_per_flow,
+            )
+
+        # M7.2 prod-mode prepare_prod: needs gridder.sparsity_pattern
+        # which is finalised inside build_context. Call here after
+        # context build so n_grid + pattern_id are available.
+        if (
+            transport_tx_host
+            and transport_tx_mode == "prod"
+            and isinstance(transport_tx, _TransportTxAdapter)
+            and transport_tx.tx.use_prod_frame
+        ):
+            # M3 sparsity_pattern.n_grid is the n_grid of the cached
+            # pattern; the pattern_id is a stable hash that the search
+            # side will validate against its own cached pattern. For
+            # the M7.2 corr-only benchmark we don't have a search-side
+            # validator, so the pattern_id is fixed at 0 (the cube is
+            # opaque on loopback). Production wiring (M7.2.8 corner-
+            # turn) will source pattern_id from the search node via
+            # /cnf/search/* — out of scope for the Phase 0/A bench.
+            pat = ctx.gridder.pattern  # SparsityPattern
+            transport_tx.tx.prepare_prod(
+                pattern_id_by_chgroup={int(cfg.chgroup): 0},
+                n_grid=int(pat.n_grid),
+            )
+            LOG.info(
+                "M7.2 overlap: TransportTx.prepare_prod(n_grid=%d, "
+                "pattern_id=0)",
+                int(pat.n_grid),
+            )
+        # M7.2 Phase 0 diagnostic: optional per-stage CUDA-event timing.
+        # Disabled by default (zero hot-path overhead). Incompatible
+        # with the 3-stream pipeliner (which would record events on
+        # different streams; the elapsed_time math would be wrong) —
+        # mutual exclusion enforced below.
+        if profile_stages_every > 0:
+            if use_pipeliner_3s:
+                raise ValueError(
+                    "--profile-stages-every is incompatible with "
+                    "--pipeliner-3s (events on different streams have "
+                    "no meaningful elapsed_time)."
+                )
+            ctx.profiler = StageProfiler(every=profile_stages_every)
+            LOG.info(
+                "StageProfiler enabled: emitting per-stage means every "
+                "%d blocks", profile_stages_every,
+            )
 
         per_block_ms: list[float] = []
         per_block_flag_frac: list[float] = []
         t_start = time.monotonic()
+
+        # ── 3-stream pipeliner (M7.1 RT path) ─────────────────────────
+        # When enabled, overlaps unpack (Stream U) || compute_split +
+        # RFI + cal (Stream C) || dedisp + grid + TX (Stream D). The
+        # steady-state wall per push() is max(U, C, D) instead of the
+        # sum. Per-block latency increases by 2 × block_period (since
+        # push(N) returns the result for block N-3), but throughput
+        # drops to the long pole — the relevant metric for RT cadence.
+        # See :class:`BlockPipeliner3S` for the implementation details.
+        pipeliner: BlockPipeliner3S | None = None
+        if use_pipeliner_3s:
+            if device.type != "cuda":
+                raise ValueError(
+                    f"use_pipeliner_3s requires CUDA; got device={device}"
+                )
+            pipeliner = BlockPipeliner3S(ctx, n_buffers=3)
+            LOG.info(
+                "BlockPipeliner3S enabled (n_buffers=3); 3 streams "
+                "U||C||D with 3-block result latency"
+            )
+
+        def _consume_completed(
+            n_out: int, out: "IntegrationOutput | None",
+        ) -> None:
+            """Bookkeeping for a block whose pipeline pass just finished.
+
+            n_out is the 1-based block number (mirroring n_in for the
+            sequential path). out is the IntegrationOutput returned by
+            either ``process_block`` or ``pipeliner.push``.
+            """
+            nonlocal n_tx_total, n_processed
+            if out is None:
+                return
+            n_tx_total += out.n_tx
+            if blocks_output_mode != "none":
+                _serialise_block(
+                    output_dir, n_out,
+                    out=out, blocks_output_mode=blocks_output_mode,
+                )
+            n_processed += 1
+            if out.rfi is not None:
+                per_block_flag_frac.append(
+                    float(out.rfi.flag_fraction_total)
+                )
+
+        # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator
+        # that Python imports + GPU init + Triton modules import + cal
+        # loading + DM plan loading + pipeliner construction are all
+        # complete. Triton JIT itself still fires on the first kernel
+        # call inside the loop (a few seconds of warmup), but that's
+        # ~10× shorter than the pre-loop init we've already finished.
+        # The orchestrator gates capture routines (dada_junkdb) on this
+        # file so they don't pre-fill dada/eada to ~19/20 during this
+        # process's multi-second cold start.
+        if ready_sentinel_path is not None:
+            try:
+                ready_sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+                ready_sentinel_path.touch()
+                LOG.info("ready sentinel touched: %s", ready_sentinel_path)
+            except OSError as e:
+                LOG.warning(
+                    "failed to touch ready sentinel %s: %s "
+                    "(continuing without gate)",
+                    ready_sentinel_path, e,
+                )
 
         while not state["stop"]:
             try:
@@ -2522,20 +3129,34 @@ def run(
                     break
                 continue
 
-            out = process_block(page_arr, ctx=ctx, block_n=n_in)
-            n_tx_total += out.n_tx
+            if pipeliner is not None:
+                # push() returns the IntegrationOutput for the block
+                # submitted ``n_buffers=3`` calls ago, or None during
+                # the first 3 pushes (warmup). The block number it
+                # corresponds to is ``n_in - 3`` for an in-order
+                # submission stream.
+                prior_out = pipeliner.push(page_arr, block_n=n_in)
+                # We must hold the page_arr buffer at least until
+                # Stream U's H2D copy completes; the pipeliner takes
+                # care of stream-event ordering, but PSRDADA's
+                # markCleared() releases the underlying ring page,
+                # which is fine because torch.as_tensor(raw, device=GPU)
+                # always issues a copy (verified upstream).
+                reader.markCleared()
+                _consume_completed(n_in - 3, prior_out)
+                del prior_out
+            else:
+                out = process_block(page_arr, ctx=ctx, block_n=n_in)
+                reader.markCleared()
+                _consume_completed(n_in, out)
+                del out
 
-            if blocks_output_mode != "none":
-                _serialise_block(
-                    output_dir, n_in,
-                    out=out, blocks_output_mode=blocks_output_mode,
-                )
-
-            n_processed += 1
-            if out.rfi is not None:
-                per_block_flag_frac.append(float(out.rfi.flag_fraction_total))
-            reader.markCleared()
-            del out
+            # M7.2 Phase 0 diagnostic: flush this block's per-stage
+            # CUDA events into the rolling histogram. Disabled (None)
+            # in the default config; under --pipeliner-3s the profiler
+            # is explicitly forbidden (see context build).
+            if ctx.profiler is not None:
+                ctx.profiler.commit_block()
 
             t_block_end = time.monotonic()
             per_block_ms.append((t_block_end - t_block_start) * 1000.0)
@@ -2553,6 +3174,21 @@ def run(
             if reader.isEndOfData:
                 LOG.info("fada EOD; loop done")
                 break
+
+        if pipeliner is not None:
+            # Drain the 3-stream pipeline: this returns up to ``n_buffers``
+            # blocks still in flight (the last 3 pushed).
+            drained = pipeliner.flush()
+            pipeliner.close()
+            LOG.info(
+                "BlockPipeliner3S drained %d in-flight blocks", len(drained),
+            )
+            # The drained outputs correspond to blocks (n_in - 2) .. n_in
+            # in submission order; emit them through _consume_completed
+            # so per-block bookkeeping stays consistent.
+            first_drained_n = n_in - len(drained) + 1
+            for i, out in enumerate(drained):
+                _consume_completed(first_drained_n + i, out)
 
         elapsed = time.monotonic() - t_start
         ms_p50 = float(np.median(per_block_ms)) if per_block_ms else float("nan")
@@ -2586,6 +3222,16 @@ def run(
             reader.disconnect()
         except Exception:
             LOG.exception("reader.disconnect failed (non-fatal)")
+        # M7.2 async TX: clean shutdown of worker subprocesses + shm.
+        # ``async_tx`` is defined only inside the ``try`` block above
+        # (after build_context); guard with locals() since the
+        # ``finally`` clause runs even if we never reached the wiring.
+        _async_tx = locals().get("async_tx")
+        if _async_tx is not None:
+            try:
+                _async_tx.close()
+            except Exception:
+                LOG.exception("async_tx.close failed (non-fatal)")
 
 
 # ---------------------------------------------------------------------------
@@ -2610,12 +3256,39 @@ def main(argv: list[str] | None = None) -> int:
                    help="path to config_corr.yaml for fada buffer-size validation")
     p.add_argument("--max-blocks", type=int, default=1,
                    help="stop after N fada blocks (default: 1 for "
-                        "smoke runs; production: omit for unlimited)")
+                        "smoke runs; production: pass 0 = unlimited, "
+                        "run until fada EOD).")
     p.add_argument("--t-int-fast-native", type=int, default=T_INT_FAST_NATIVE,
                    help="fast-corr integration depth in NATIVE samples per "
                         "fast-vis tile. Default: %d (= %d µs cadence). "
                         "Burst-test override: 32 (= 1048.576 µs, 4× cadence)."
                         % (T_INT_FAST_NATIVE, int(T_INT_FAST_NATIVE * NATIVE_SAMPLE_US)))
+    p.add_argument("--n-coarse-dm", type=int, default=0,
+                   help="If > 0, build a SYNTHETIC summed-channel DMPlan "
+                        "with this many coarse trials linearly spaced from "
+                        "0 to --dm-max and enable the F25 multi-DM-trial "
+                        "stage1 → gridder → dedispersion path. Use 5 with "
+                        "--t-int-fast-native 32 for the realtime-feasible "
+                        "x32 op-point; 24 with --t-int-fast-native 8 for "
+                        "the production O-4 op-point. Default: 0 (legacy "
+                        "single-DM path; no dedispersion).")
+    p.add_argument("--dm-max", type=float, default=1000.0,
+                   help="dm_max (pc/cc) for the synthetic --n-coarse-dm "
+                        "plan. Ignored when --n-coarse-dm = 0. Default: "
+                        "1000 (covers the M3 FRB injection range without "
+                        "the extreme-DM smearing the x8 path was sized "
+                        "against).")
+    p.add_argument("--dm-plan-path", type=Path, default=None,
+                   help="Path to a canonical DmPlan ``.npz`` built by "
+                        "tools/build_dm_plan.py. When set, the F25 multi-"
+                        "DM-trial path is enabled and the plan supersedes "
+                        "any --n-coarse-dm synthetic plan (which is the "
+                        "M7.1 shortcut). Use this for M7.2+ where the "
+                        "coarse-DM trial list must come from the legacy "
+                        "gen_dmtrials recursion (not a linear stand-in). "
+                        "The plan's t_int_fast_us is pinned to "
+                        "--t-int-fast-native × NATIVE_SAMPLE_US at "
+                        "load-time; mismatch raises.")
     p.add_argument("--obs-dec-deg", type=float, required=True,
                    help="observing source declination (deg) — F21 + gridder "
                         "pattern lookup")
@@ -2693,8 +3366,135 @@ def main(argv: list[str] | None = None) -> int:
                    help="full: write the entire (n_fv, N_filled) tensor. "
                         "first_tile_only: write only fast-vis tile 0. "
                         "none: meta json only.")
+    p.add_argument("--pipeliner-3s", action="store_true",
+                   help="enable BlockPipeliner3S: 3-stream overlap of "
+                        "unpack || compute || dedisp. Reduces per-block "
+                        "wall to max(U,C,D) instead of U+C+D. Adds a "
+                        "3-block result latency (output for block N "
+                        "returned by push(N+3)). Requires CUDA.")
+    p.add_argument("--profile-stages-every", type=int, default=0,
+                   help="M7.2 Phase 0 diagnostic. When > 0, brackets "
+                        "corr_phase / consume_phase / multi_dm / "
+                        "static_sky / stage2_tx with paired CUDA "
+                        "events and emits a mean+p50+p99 ms per stage "
+                        "every N blocks. Default 0 = OFF (zero hot-"
+                        "path overhead). Use 64 to get a per-stage "
+                        "breakdown every ~8.6s at the current op-point.")
+    # ── M7.2 overlap path: real Stage2FIFO + TransportTx ─────────────
+    p.add_argument("--stage2-fifo-depth", type=int,
+                   default=COARSE_DM_FIFO_DEPTH_DEFAULT,
+                   help=("M7.2: depth (in cubes) of the real "
+                         "Stage2FIFO ring. Only used when "
+                         "--transport-tx-host is set. "
+                         f"Default {COARSE_DM_FIFO_DEPTH_DEFAULT} "
+                         "(COARSE_DM_FIFO_DEPTH_DEFAULT). The FIFO "
+                         "is the timing buffer for cross-chgroup "
+                         "alignment per plan §3.6.2; the per-(g, c) "
+                         "delay budget at the current DM plan must "
+                         "fit in `depth` cubes."))
+    p.add_argument("--transport-tx-host", type=str, default="",
+                   help=("M7.2: when set, enables the real Stage2FIFO + "
+                         "TransportTx path (replaces the NoOp stubs). "
+                         "Empty (default) keeps the M3 / Phase-0 "
+                         "behaviour (no TX). Use 127.0.0.1 for "
+                         "loopback benchmarks (the kernel drops the "
+                         "UDP packets if no listener is bound, but "
+                         "the sendto syscall + encoding cost is "
+                         "still paid)."))
+    p.add_argument("--transport-tx-port",
+                   "--transport-tx-base-port",
+                   dest="transport_tx_port",
+                   type=int, default=9000,
+                   help="M7.2: BASE UDP destination port for the worker "
+                        "pool. Worker w sends to host:(port + w). The "
+                        "per-worker offset lets the search side identify "
+                        "which corr-worker each frame originates from "
+                        "via the L4 source port. Default 9000. "
+                        "Production (M7.3 + M7.2 plan): 6625 (workers "
+                        "0..3 → 6625..6628). The `--transport-tx-base-port` "
+                        "spelling is the canonical form; the legacy "
+                        "`--transport-tx-port` spelling is preserved.")
+    p.add_argument("--transport-tx-mode",
+                   choices=("chunk8", "prod"), default="chunk8",
+                   help=("M7.2: TransportTx wire format. "
+                         "'chunk8' = simple 32-byte FastVisFrame, "
+                         "one sendto per (dm_idx, t_idx), no pacing "
+                         "(loopback bench path). 'prod' = M4a 72-byte "
+                         "ProdFrame with cint8 quantisation + MTU "
+                         "fragmentation + per-dm_idx token bucket "
+                         "(production path). 'prod' requires "
+                         "--transport-tx-target-gbps-per-flow > 0 "
+                         "and uses block_n as specnum."))
+    p.add_argument("--transport-tx-dtype",
+                   choices=("cfp16", "cint8"), default="cfp16",
+                   help=("M7.2: payload encoding for chunk8 mode. "
+                         "Ignored in prod mode (which uses cint8 "
+                         "always per plan §9). Default cfp16."))
+    p.add_argument("--transport-tx-target-gbps-per-flow",
+                   type=float, default=0.073,
+                   help=("M7.2: per-dm_idx target rate for the prod "
+                         "token-bucket pacer (Gbps). Default 0.073 "
+                         "per plan §4.3 line 1447 (6 DM trials per "
+                         "corr-search pair × 0.073 ≈ 0.44 Gbps per "
+                         "pair). Ignored in chunk8 mode."))
+    p.add_argument("--transport-tx-workers", type=int, default=0,
+                   help=("M7.2 PRODUCTION async TX: off-load encode + "
+                         "sendto to N worker subprocesses so the GPU "
+                         "pipeline thread is never blocked on TX. "
+                         "Each worker handles a contiguous DM-axis "
+                         "slice of the cube. Production default = 4 "
+                         "(4-way DM split, forward-compatible to "
+                         "M7.3 fan-out across 4 search nodes). 0 = "
+                         "inline synchronous TX (M3 chunk-8 + M4a "
+                         "chunk-2 behaviour, blows the RT budget at "
+                         "N=8 — debug only). Requires --transport-tx-mode "
+                         "= prod."))
+    p.add_argument("--transport-tx-ring-slots", type=int, default=8,
+                   help=("M7.2: depth of each per-worker TX cube ring "
+                         "(POSIX shm). 8 slots × 134 ms cadence ≈ "
+                         "1 s of cube buffering; covers worker "
+                         "startup jitter and burstiness. Only used "
+                         "when --transport-tx-workers > 0."))
+    p.add_argument("--transport-tx-coarse-dm-mask",
+                   type=lambda s: int(s, 0), default=0xFF,
+                   help=("M7.2 selective TX mask over coarse-DM "
+                         "indices (LSB = coarse_dm[0]). Workers whose "
+                         "DM-slice is ENTIRELY OUT of the mask drain "
+                         "without transmitting; workers whose slice is "
+                         "ENTIRELY IN transmit normally. Default 0xFF "
+                         "(M7.3 production = all 8 coarse DMs sent). "
+                         "M7.2-low: 0x03 (coarse 0,1 to n01). "
+                         "M7.2-high: 0xC0 (coarse 6,7 to n01). Mask "
+                         "must align with worker DM-slice boundaries "
+                         "(typically n_workers=4, N=8 ⇒ workers cover "
+                         "DM[0:2),[2:4),[4:6),[6:8) so 0x03 / 0x0C / "
+                         "0x30 / 0xC0 are valid; 0x05 etc. would be "
+                         "rejected). Accepts 0x / 0o / decimal."))
+    p.add_argument("--transport-tx-worker-hosts", type=str, default="",
+                   help=("M7.3: comma-separated list of destination "
+                         "IPs/hostnames — one per --transport-tx-workers "
+                         "worker. When set, worker w sends to "
+                         "worker_hosts[w]:<port> (no per-worker port "
+                         "offset; each search node binds to the same "
+                         "base port). Length MUST equal "
+                         "--transport-tx-workers. Empty string (the "
+                         "default) keeps the M7.2 16x1 behaviour where "
+                         "all workers share --transport-tx-host and the "
+                         "port offset (host:port + w) disambiguates. "
+                         "Production 16x4 example: "
+                         "'10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238' "
+                         "with --transport-tx-workers 4."))
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    p.add_argument("--ready-sentinel-path", type=Path, default=None,
+                   help="M7.2: touch this file once Python imports, GPU "
+                        "init, cal loading, DM plan loading, and pipeliner "
+                        "construction are complete (just before the main "
+                        "loop). The dsart_rt orchestrator gates capture "
+                        "routines (dada_junkdb) on this file so they do "
+                        "not stuff the dada/eada rings during this "
+                        "process's multi-second cold start (~90 s on a "
+                        "2080Ti including Triton module imports).")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -2718,6 +3518,18 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error("--apply-cal path %s not found", args.apply_cal)
         return 2
 
+    if args.dm_plan_path is not None and args.n_coarse_dm > 0:
+        LOG.error(
+            "--dm-plan-path %s and --n-coarse-dm %d are mutually exclusive "
+            "(the canonical plan supersedes the synthetic linear shortcut). "
+            "Drop one.",
+            args.dm_plan_path, args.n_coarse_dm,
+        )
+        return 2
+    if args.dm_plan_path is not None and not args.dm_plan_path.is_file():
+        LOG.error("--dm-plan-path %s not found", args.dm_plan_path)
+        return 2
+
     cfg = FastIntegrationConfig(
         chgroup=args.chgroup,
         obs_dec_rad=math.radians(args.obs_dec_deg),
@@ -2736,16 +3548,60 @@ def main(argv: list[str] | None = None) -> int:
         chan_sum_factor=args.chan_sum_factor,
         sliding_window=args.sliding_window,
         cell_lambda_mode=args.cell_lambda_mode,
+        dm_plan_path=args.dm_plan_path,
     )
 
+    dm_plan: DMPlan | None = None
+    if args.n_coarse_dm > 0:
+        from dsart.coarse_dm.synthetic_plan import build_synthetic_summed_plan
+        dm_plan = build_synthetic_summed_plan(
+            n_coarse=int(args.n_coarse_dm),
+            dm_max=float(args.dm_max),
+            chan_sum_factor=int(args.chan_sum_factor),
+            t_int_fast_us=float(args.t_int_fast_native * NATIVE_SAMPLE_US),
+        )
+        LOG.info(
+            "synthetic DMPlan: n_coarse=%d dm_max=%.1f chan_sum_factor=%d "
+            "t_int_fast_us=%.3f (degenerate-but-shape-valid; F25 path active)",
+            args.n_coarse_dm, args.dm_max, args.chan_sum_factor,
+            args.t_int_fast_native * NATIVE_SAMPLE_US,
+        )
+    elif args.dm_plan_path is not None:
+        LOG.info(
+            "canonical DMPlan: loading %s (chan_sum_factor=%d, "
+            "t_int_fast_us=%.3f)",
+            args.dm_plan_path, args.chan_sum_factor,
+            args.t_int_fast_native * NATIVE_SAMPLE_US,
+        )
+
+    # --max-blocks 0 sentinel = unlimited (production / soak runs).
+    max_blocks: int | None = (
+        None if args.max_blocks == 0 else int(args.max_blocks)
+    )
     try:
         run(
             fada_int,
             args.output_dir,
             device,
             cfg,
-            max_blocks=args.max_blocks,
+            max_blocks=max_blocks,
             blocks_output_mode=args.blocks_output_mode,
+            dm_plan=dm_plan,
+            use_pipeliner_3s=args.pipeliner_3s,
+            profile_stages_every=args.profile_stages_every,
+            stage2_fifo_depth=args.stage2_fifo_depth,
+            transport_tx_host=args.transport_tx_host,
+            transport_tx_port=args.transport_tx_port,
+            transport_tx_mode=args.transport_tx_mode,
+            transport_tx_dtype=args.transport_tx_dtype,
+            transport_tx_target_gbps_per_flow=(
+                args.transport_tx_target_gbps_per_flow
+            ),
+            transport_tx_workers=args.transport_tx_workers,
+            transport_tx_ring_slots=args.transport_tx_ring_slots,
+            transport_tx_coarse_dm_mask=args.transport_tx_coarse_dm_mask,
+            transport_tx_worker_hosts=args.transport_tx_worker_hosts,
+            ready_sentinel_path=args.ready_sentinel_path,
         )
     except _StopRequested:
         LOG.info("clean stop")
