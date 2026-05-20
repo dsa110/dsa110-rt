@@ -141,26 +141,45 @@ def build_fine_list(
     dm_max: float,
     t_int_search_us: float,
     tol: float,
+    chan_sum_factor: int,
     n_cap: int | None = None,
 ) -> np.ndarray:
     """Step 1: fine list parameterised over the processed band (§3.2 line 511).
 
     nu_center = (NU_TOP_PROC_GHZ + NU_BOT_PROC_GHZ) / 2  (≈ 1.405 GHz)
-    Δν_MHz    = DELTA_NU_CH_GHZ * 1e3                    (≈ 0.030518 MHz)
-    N_chan    = N_CHAN_PROC_NATIVE                       (= 6144)
+    Δν_MHz    = (DELTA_NU_CH_GHZ * 1e3) * chan_sum_factor
+    N_chan    = N_CHAN_PROC_NATIVE // chan_sum_factor
     Δt_us     = t_int_search_us                          (from operating point)
+
+    Production M7.3 path runs corr-side ``--chan-sum-factor 8`` before
+    coarse/fine dedispersion, so the effective full-band channelisation
+    for Levin spacing is:
+      Δν_MHz = 0.244140625
+      N_chan = 768
+    (with the same ~1.405 GHz center frequency). This function takes
+    ``chan_sum_factor`` explicitly so the plan builder tracks the actual
+    corr-side pipeline shape instead of silently assuming native 6144 chans.
 
     M7.2: optional ``n_cap`` truncates the recursion at a fixed trial count;
     used by the n-coarse-cap path so fine_dm stops at the effective dm_max
     (= coarse_dm[-1]) rather than over-running into uncovered DM space.
     """
+    if chan_sum_factor <= 0:
+        raise ValueError(f"chan_sum_factor must be > 0, got {chan_sum_factor}")
+    if N_CHAN_PROC_NATIVE % chan_sum_factor != 0:
+        raise ValueError(
+            f"N_CHAN_PROC_NATIVE={N_CHAN_PROC_NATIVE} is not divisible by "
+            f"chan_sum_factor={chan_sum_factor}"
+        )
     nu_center = (NU_TOP_PROC_GHZ + NU_BOT_PROC_GHZ) / 2.0
+    dnu_mhz = (DELTA_NU_CH_GHZ * 1e3) * float(chan_sum_factor)
+    n_chan_eff = N_CHAN_PROC_NATIVE // chan_sum_factor
     return gen_dm_list(
         dm_min=dm_min,
         dm_max=dm_max,
         nu_GHz=nu_center,
-        dnu_MHz=DELTA_NU_CH_GHZ * 1e3,
-        n_chan=N_CHAN_PROC_NATIVE,
+        dnu_MHz=dnu_mhz,
+        n_chan=n_chan_eff,
         dt_us=t_int_search_us,
         tol=tol,
         n_cap=n_cap,
@@ -467,6 +486,8 @@ def build_dm_plan(
     tol: float,
     t_int_fast_us: float,
     t_int_search_us: float,
+    chan_sum_factor: int = 8,
+    tol_coarse_seed: float | None = None,
     n_coarse_cap: int | None = None,
     repo_root: Path = REPO_ROOT,
 ) -> DmPlan:
@@ -509,9 +530,11 @@ def build_dm_plan(
             f"{n_coarse_target}; got n_coarse_cap={n_cap}"
         )
 
+    coarse_seed_tol = float(tol if tol_coarse_seed is None else tol_coarse_seed)
+
     # Step 1: bottom-sub-band Levin seed to determine dm_max_effective.
     coarse_seed = build_coarse_list(
-        dm_min, dm_max, t_int_fast_us, tol, n_cap=n_cap
+        dm_min, dm_max, t_int_fast_us, coarse_seed_tol, n_cap=n_cap
     )
     if coarse_seed.shape[0] < n_cap:
         raise ValueError(
@@ -522,7 +545,9 @@ def build_dm_plan(
     dm_max_effective = float(coarse_seed[-1])
 
     # Step 2: full-band fine list over [dm_min, dm_max_effective].
-    fine_raw = build_fine_list(dm_min, dm_max_effective, t_int_search_us, tol)
+    fine_raw = build_fine_list(
+        dm_min, dm_max_effective, t_int_search_us, tol, chan_sum_factor
+    )
     n_fine_raw = fine_raw.shape[0]
     if n_fine_raw < n_cap:
         raise ValueError(
@@ -563,9 +588,13 @@ def build_dm_plan(
         "t_int_fast_us": float(t_int_fast_us),
         "t_int_search_us": float(t_int_search_us),
         "tol": float(tol),
+        "coarse_seed_tol": coarse_seed_tol,
         "build_utc_ns": int(time.time_ns()),
         "git_sha": _git_sha(repo_root),
         "version": DM_PLAN_METADATA_VERSION,
+        "fine_chan_sum_factor": int(chan_sum_factor),
+        "fine_n_chan_effective": int(N_CHAN_PROC_NATIVE // chan_sum_factor),
+        "fine_dnu_mhz_effective": float((DELTA_NU_CH_GHZ * 1e3) * chan_sum_factor),
         # v2-specific bookkeeping (informational; not required by the
         # consumers but useful for debugging + report-generation):
         "v2_dm_max_seed_bottom_subband": float(dm_max_effective),
@@ -609,6 +638,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dm-max", type=float, default=DM_MAX_DEFAULT)
     p.add_argument("--tol", type=float, default=DM_TOL_DEFAULT)
     p.add_argument(
+        "--tol-coarse-seed",
+        type=float,
+        default=None,
+        help=(
+            "Optional tolerance used ONLY for the bottom-sub-band coarse seed "
+            "(Step 1). Default: same as --tol."
+        ),
+    )
+    p.add_argument(
+        "--chan-sum-factor",
+        type=int,
+        default=8,
+        help=(
+            "Effective channel summing factor applied before fine-DM Levin "
+            "spacing. 8 => dnu=0.244140625 MHz, n_chan=768."
+        ),
+    )
+    p.add_argument(
         "--n-coarse-cap",
         type=int,
         default=None,
@@ -647,6 +694,8 @@ def main(argv: list[str] | None = None) -> int:
         tol=args.tol,
         t_int_fast_us=args.t_int_fast_us,
         t_int_search_us=t_int_search_us,
+        chan_sum_factor=args.chan_sum_factor,
+        tol_coarse_seed=args.tol_coarse_seed,
         n_coarse_cap=args.n_coarse_cap,
     )
     out_path = Path(args.out)
@@ -658,6 +707,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  N_fine            = {plan.fine_dm.shape[0]}")
         print(f"  N_coarse          = {plan.coarse_dm.shape[0]}")
         print(f"  dm_overlap_coarse = {plan.dm_overlap_coarse}")
+        print(
+            "  fine_spacing      = "
+            f"{plan.metadata['fine_dnu_mhz_effective']:.9f} MHz, "
+            f"n_chan={plan.metadata['fine_n_chan_effective']} "
+            f"(chan_sum_factor={plan.metadata['fine_chan_sum_factor']})"
+        )
+        print(
+            f"  tol/coarse_seed_tol = {plan.tol:.3f}/"
+            f"{plan.metadata['coarse_seed_tol']:.3f}"
+        )
         print(
             f"  time_shift_corr_stage1 = {plan.time_shift_corr_stage1.shape} int32 "
             f"(max={int(plan.time_shift_corr_stage1.max())} samples)"
