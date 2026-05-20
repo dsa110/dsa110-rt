@@ -29,7 +29,7 @@ schema_version: 1
 # M7.0 ships both routine sets but the captures.mode flag is consulted
 # by dsart_rt._select_routines() before spawning.
 captures:
-  mode: junkdb
+  mode: real
 
 buffers:
   - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
@@ -97,14 +97,59 @@ routines:
   # PSRDADA output key (dada / eada). -q is optional; if unset the
   # binary defaults to 11223 for dPort=4011 and 11224 for dPort=4012
   # (matches the legacy convention dsart_rt._send_utc_udp targets).
+  #
+  # Per-host -j <DATA_IP>:
+  #   The SNAP UDP datagrams arrive on enp129s0f0 of each corr node.
+  #   The legacy default ("-j" unset -> bind to 127.0.0.1) is fine for
+  #   loopback smoke tests but produces silent zero-packet capture on
+  #   live SNAPs (observed n06 2026-05-20: cap binary up, shm armed,
+  #   n_recv_packets=0 for the entire soak because INADDR_LOOPBACK
+  #   doesn't pick up traffic destined for the 100GbE interface).
+  #   We use the per-host `hostargs:` mechanism (see search_rt.yaml
+  #   bind-host example) to pin the right NIC IP without parameterising
+  #   the YAML via tokens. IPs verified live on each node 2026-05-20.
   - name: cap_a_real
     when: captures.mode == real
     cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
     args: -o dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
+    hostargs:
+      lxd110h03: -j 10.41.0.224
+      lxd110h04: -j 10.41.0.138
+      lxd110h05: -j 10.41.0.206
+      lxd110h06: -j 10.41.0.203
+      lxd110h07: -j 10.41.0.208
+      lxd110h08: -j 10.41.0.209
+      lxd110h10: -j 10.41.0.211
+      lxd110h11: -j 10.41.0.216
+      lxd110h12: -j 10.41.0.218
+      lxd110h14: -j 10.41.0.212
+      lxd110h15: -j 10.41.0.223
+      lxd110h16: -j 10.41.0.220
+      lxd110h18: -j 10.41.0.228
+      lxd110h19: -j 10.41.0.227
+      lxd110h21: -j 10.41.0.250
+      lxd110h22: -j 10.41.0.233
   - name: cap_b_real
     when: captures.mode == real
     cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
     args: -o eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+    hostargs:
+      lxd110h03: -j 10.41.0.224
+      lxd110h04: -j 10.41.0.138
+      lxd110h05: -j 10.41.0.206
+      lxd110h06: -j 10.41.0.203
+      lxd110h07: -j 10.41.0.208
+      lxd110h08: -j 10.41.0.209
+      lxd110h10: -j 10.41.0.211
+      lxd110h11: -j 10.41.0.216
+      lxd110h12: -j 10.41.0.218
+      lxd110h14: -j 10.41.0.212
+      lxd110h15: -j 10.41.0.223
+      lxd110h16: -j 10.41.0.220
+      lxd110h18: -j 10.41.0.228
+      lxd110h19: -j 10.41.0.227
+      lxd110h21: -j 10.41.0.250
+      lxd110h22: -j 10.41.0.233
 
   # Mon-publisher sidecar -- snapshots the POSIX-shm segments the two
   # capture binaries publish, pushes into etcd at
