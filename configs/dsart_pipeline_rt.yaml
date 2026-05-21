@@ -260,6 +260,12 @@ routines:
       --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_CALSB.dat
       --cal-mode phase_only
       --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
+      --sk-far 1e-4
+      --bandpass-k 5.0
+      --group-k 5.0
+      --sumthr-max-m 8
+      --sumthr-eta 1.5
+      --rfi-m-values 64,256,1024,4096
       --t-int-fast-native 32
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --chan-sum-factor 8
@@ -276,5 +282,29 @@ routines:
       --blocks-output-mode none
       --log-level INFO
       --ready-sentinel-path /tmp/dsart-corr-fast-CN.ready
+      --rfi-mon-cn-id CN
+      --rfi-mon-window-size 16
+      --rfi-mon-freq-downsample 4
+      --rfi-mon-shm-slots 64
     env:
       CUDA_VISIBLE_DEVICES: "1"
+
+  # M7.6 RFI monitor exporter sidecar. Sibling of corr_fast — reads
+  # the 16-cube window shm /dev/shm/dsart-rfi-window-CN that
+  # corr_fast_integration publishes, exposes it over HTTP on port
+  # 5780 (h23 dashboard pulls), and pushes the scalar window
+  # summary to etcd at /mon/corr_rt/CN/rfi every 2 s.
+  #
+  # Lifecycle: starts whenever corr_fast does; safe to start even
+  # when the shm isn't there yet (it retries every cadence). No GPU
+  # usage; no CUDA_VISIBLE_DEVICES setting.
+  - name: rfi_monitor_export
+    cmd: python
+    args: >-
+      -u -m dsart.services.rfi_monitor_export
+      --cn-id CN
+      --etcd-cadence-s 2.0
+      --staleness-s 10.0
+      --http-bind 0.0.0.0
+      --http-port 5780
+      --log-level INFO

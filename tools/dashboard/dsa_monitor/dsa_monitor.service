@@ -1,0 +1,20 @@
+[Unit]
+Description=DSA-110 Monitor Dashboard (Antennas/RFI + SEFDs + Bursts)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/proj/dsa110-rt/tools/dashboard/dsa_monitor
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/ubuntu/proj/dsa110-rt/src:/home/ubuntu/proj/dsa110-rt/tools/dashboard/dsa_monitor
+Environment=DSA_MONITOR_PORT=5778
+Environment=DSA_MONITOR_BIND=0.0.0.0
+Environment=SEFD_DASHBOARD_URL=http://lxd110h23:5777/
+ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u app.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

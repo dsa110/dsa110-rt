@@ -1145,6 +1145,19 @@ class FastIntegrationConfig:
     flagants_path: Path | None = None
     rfi_enabled: bool = True
     rfi_mask_voltage_zero_fill: bool = True
+    # ---- RFI flagger tuning knobs (M7.6) ----
+    # All default to the library defaults baked into dsart.rfi.*; override
+    # via the CLI flags (--sk-far, --bandpass-k, --group-k, --sumthr-max-m,
+    # --sumthr-eta, --m-values, --warmup-cubes, --sumthr-disabled) so the
+    # production pipeline can be retuned without code changes.
+    rfi_sk_far: float | None = None
+    rfi_bandpass_k: float | None = None
+    rfi_group_k: float | None = None
+    rfi_sumthr_max_m: int | None = None
+    rfi_sumthr_eta: float | None = None
+    rfi_m_values: tuple[int, ...] | None = None
+    rfi_warmup_cubes: int | None = None
+    rfi_sumthr_enabled: bool = True
     static_sky_alpha: float = 0.001
     static_sky_warmup_cubes: int = 8
     static_sky_disabled: bool = False
@@ -2409,15 +2422,33 @@ def build_context(
 
     rfi_flagger: RFIFlagger | None = None
     if cfg.rfi_enabled:
-        rfi_flagger = RFIFlagger(
-            flagants_path=cfg.flagants_path,
-            device=device,
-        )
+        rfi_kwargs: dict[str, Any] = {
+            "flagants_path": cfg.flagants_path,
+            "device": device,
+            "run_sum_threshold": cfg.rfi_sumthr_enabled,
+        }
+        if cfg.rfi_sk_far is not None:
+            rfi_kwargs["sk_far"] = cfg.rfi_sk_far
+        if cfg.rfi_bandpass_k is not None:
+            rfi_kwargs["bandpass_k"] = cfg.rfi_bandpass_k
+        if cfg.rfi_group_k is not None:
+            rfi_kwargs["group_k"] = cfg.rfi_group_k
+        if cfg.rfi_sumthr_max_m is not None:
+            rfi_kwargs["sum_threshold_max_m"] = cfg.rfi_sumthr_max_m
+        if cfg.rfi_sumthr_eta is not None:
+            rfi_kwargs["sum_threshold_eta"] = cfg.rfi_sumthr_eta
+        if cfg.rfi_m_values is not None:
+            rfi_kwargs["m_values"] = cfg.rfi_m_values
+        if cfg.rfi_warmup_cubes is not None:
+            rfi_kwargs["warmup_cubes"] = cfg.rfi_warmup_cubes
+        rfi_flagger = RFIFlagger(**rfi_kwargs)
         LOG.info(
             "RFIFlagger ready: warmup_cubes=%d sk_far=%.3g "
-            "bandpass_k=%.2f group_k=%.2f",
+            "bandpass_k=%.2f group_k=%.2f sumthr=%s m_values=%s",
             rfi_flagger.warmup_cubes, rfi_flagger._sk_far,
             rfi_flagger._bandpass_k, rfi_flagger._group_k,
+            "on" if cfg.rfi_sumthr_enabled else "OFF",
+            rfi_flagger._m_values,
         )
     else:
         LOG.info("RFIFlagger DISABLED (cfg.rfi_enabled=False)")
@@ -2725,6 +2756,11 @@ def run(
     transport_tx_coarse_dm_mask: int = 0xFF,
     transport_tx_worker_hosts: str = "",
     ready_sentinel_path: Path | None = None,
+    # M7.6 RFI monitoring (None on rfi_mon_cn_id disables the path)
+    rfi_mon_cn_id: int | None = None,
+    rfi_mon_window_size: int | None = None,
+    rfi_mon_freq_downsample: int | None = None,
+    rfi_mon_shm_slots: int = 64,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -3040,6 +3076,59 @@ def run(
         per_block_flag_frac: list[float] = []
         t_start = time.monotonic()
 
+        # ── M7.6 RFI window aggregator + shm writer ───────────────────
+        # Only constructed when RFI is enabled AND a cn_id was provided
+        # (set when dsart_rt spawns the routine; in standalone bench
+        # mode rfi_mon_cn_id may be None and we skip the export path).
+        # The aggregator accumulates one 16-cube window at the
+        # production cadence (≈ 2.147 s of voltages); on each window
+        # close it publishes a record to /dev/shm/dsart-rfi-window-<cn>
+        # which the rfi_monitor_export sidecar reads and serves over
+        # HTTP for the h23 monitoring dashboard. Negligible hot-path
+        # cost (~0.5 ms / cube).
+        rfi_aggregator: "RFIWindowAggregator | None" = None
+        rfi_shm_writer: "RFIMonShmWriter | None" = None
+        if ctx.rfi_flagger is not None and rfi_mon_cn_id is not None:
+            from dsart.services.rfi_window import (
+                FREQ_DOWNSAMPLE_DEFAULT,
+                RFIWindowAggregator,
+                WINDOW_SIZE_DEFAULT,
+            )
+            from dsart.services.rfi_mon_shm import RFIMonShmWriter
+
+            agg_window = int(rfi_mon_window_size or WINDOW_SIZE_DEFAULT)
+            agg_ds = int(rfi_mon_freq_downsample or FREQ_DOWNSAMPLE_DEFAULT)
+            rfi_aggregator = RFIWindowAggregator(
+                n_ants=NANTS,
+                n_chan=NCHAN_PER_CHGROUP,
+                n_pol=NPOL,
+                window_size=agg_window,
+                freq_downsample=agg_ds,
+                device=device,
+            )
+            rfi_shm_writer = RFIMonShmWriter(
+                cn_id=int(rfi_mon_cn_id),
+                n_ants=NANTS,
+                n_chan_ds=rfi_aggregator.n_chan_ds,
+                n_pol=NPOL,
+                window_size=agg_window,
+                freq_downsample=agg_ds,
+                n_slots=int(rfi_mon_shm_slots),
+            )
+            LOG.info(
+                "M7.6 RFI monitor: aggregator window=%d cubes (~%.2f s), "
+                "freq_downsample=%d × (NCHAN=%d -> %d), shm=%s slots=%d",
+                agg_window,
+                agg_window * (NATIVE_SAMPLE_US * 2048 * 1e-6),
+                agg_ds, NCHAN_PER_CHGROUP, rfi_aggregator.n_chan_ds,
+                f"/dev/shm/dsart-rfi-window-{rfi_mon_cn_id}",
+                int(rfi_mon_shm_slots),
+            )
+        elif ctx.rfi_flagger is not None:
+            LOG.info(
+                "M7.6 RFI monitor: disabled (no --rfi-mon-cn-id supplied)"
+            )
+
         # ── 3-stream pipeliner (M7.1 RT path) ─────────────────────────
         # When enabled, overlaps unpack (Stream U) || compute_split +
         # RFI + cal (Stream C) || dedisp + grid + TX (Stream D). The
@@ -3083,6 +3172,36 @@ def run(
                 per_block_flag_frac.append(
                     float(out.rfi.flag_fraction_total)
                 )
+
+            # M7.6: feed the RFI window aggregator + shm publisher.
+            # Only active when both --rfi-mon-cn-id was supplied (so
+            # rfi_aggregator + rfi_shm_writer are non-None) and the
+            # flagger actually returned an s1_full (it does on the
+            # production code path; tests with autos_override that
+            # omit the full-block M may set None — skip then).
+            if (
+                rfi_aggregator is not None
+                and rfi_shm_writer is not None
+                and out.rfi is not None
+                and out.rfi.s1_full is not None
+            ):
+                try:
+                    window = rfi_aggregator.push(
+                        s1_full=out.rfi.s1_full,
+                        mask=out.rfi.mask,
+                        source_tags=out.rfi.source_tags,
+                        block_n=int(n_out),
+                        warmup=bool(out.rfi.warmup),
+                    )
+                    if window is not None:
+                        rfi_shm_writer.publish(window)
+                except Exception:
+                    # Monitoring should never sink the hot path. Log
+                    # once-per-cube and continue; ops can drain the
+                    # shm independently.
+                    LOG.exception(
+                        "M7.6 rfi monitor publish failed (continuing)"
+                    )
 
         # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator
         # that Python imports + GPU init + Triton modules import + cal
@@ -3232,6 +3351,18 @@ def run(
                 _async_tx.close()
             except Exception:
                 LOG.exception("async_tx.close failed (non-fatal)")
+        # M7.6 RFI monitor: close + unlink the shm. Leaving the segment
+        # behind would confuse the sidecar + h23 dashboard on the next
+        # spawn (stale writer pid, stale magic if ABI ever bumps).
+        _shm_writer = locals().get("rfi_shm_writer")
+        if _shm_writer is not None:
+            try:
+                _shm_writer.close()
+                _shm_writer.unlink()
+            except Exception:
+                LOG.exception(
+                    "rfi_shm_writer close/unlink failed (non-fatal)"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -3309,6 +3440,36 @@ def main(argv: list[str] | None = None) -> int:
                    help="disable the RFI flagger entirely (e.g. for "
                         "synth-data tests with injected narrowband signals "
                         "that would trigger the SK detector)")
+    # ---- RFI tuning knobs (M7.6) ----
+    # All optional; when omitted the library defaults from dsart.rfi.*
+    # are used. The defaults live in dsart.rfi.{sk, bandpass_outlier,
+    # group_outlier, sum_threshold, autos} and combine.RFIFlagger.
+    p.add_argument("--sk-far", type=float, default=None,
+                   help="SK two-sided per-(M, cell) false-alarm rate "
+                        "(library default: 1e-4)")
+    p.add_argument("--bandpass-k", type=float, default=None,
+                   help="bandpass-outlier MAD-sigma threshold "
+                        "(library default: 5.0)")
+    p.add_argument("--group-k", type=float, default=None,
+                   help="group-outlier MAD-sigma threshold across ants "
+                        "(library default: 5.0)")
+    p.add_argument("--sumthr-max-m", type=int, default=None,
+                   help="SumThreshold maximum dilation window (must be a "
+                        "power of two; library default: 8)")
+    p.add_argument("--sumthr-eta", type=float, default=None,
+                   help="SumThreshold shape parameter eta "
+                        "(library default: 1.5)")
+    p.add_argument("--sumthr-disabled", action="store_true",
+                   help="disable the SumThreshold post-pass (SK + "
+                        "bandpass + group + flagants still active)")
+    p.add_argument("--rfi-m-values", type=str, default=None,
+                   help="comma-separated SK accumulation depths (must be "
+                        "divisors of 4096; library default: 64,256,1024,4096)")
+    p.add_argument("--rfi-warmup-cubes", type=int, default=None,
+                   help="cold-start window length (cubes) during which "
+                        "bandpass-outlier is bypassed and rfi_warming_up "
+                        "is asserted in the transport header. Library "
+                        "default ~1118 cubes (~150 s).")
     p.add_argument("--n-grid", type=int, default=256,
                    help="grid side length (default: 256)")
     p.add_argument("--kernel-support", type=int, default=1,
@@ -3495,6 +3656,26 @@ def main(argv: list[str] | None = None) -> int:
                         "not stuff the dada/eada rings during this "
                         "process's multi-second cold start (~90 s on a "
                         "2080Ti including Triton module imports).")
+    # ---- M7.6 RFI monitoring (window aggregator + shm publisher) ----
+    p.add_argument("--rfi-mon-cn-id", type=int, default=None,
+                   help="When set, enable the M7.6 16-cube RFI window "
+                        "aggregator and publish records to "
+                        "/dev/shm/dsart-rfi-window-<cn-id>. The sidecar "
+                        "rfi_monitor_export reads this shm to serve "
+                        "the h23 dashboard. Omit (default) to disable.")
+    p.add_argument("--rfi-mon-window-size", type=int, default=None,
+                   help="cubes per RFI monitor window (default: 16 = "
+                        "~2.147 s of voltages)")
+    p.add_argument("--rfi-mon-freq-downsample", type=int, default=None,
+                   help="channel downsample factor in the RFI monitor "
+                        "shm (default: 4 -> 96 ch/chgroup at "
+                        "NCHAN_PER_CHGROUP=384). Must divide "
+                        "NCHAN_PER_CHGROUP.")
+    p.add_argument("--rfi-mon-shm-slots", type=int, default=64,
+                   help="ring depth (number of window slots) in the "
+                        "RFI monitor shm. Default 64 = ~137 s of "
+                        "history; the h23 service polls fast enough "
+                        "that this is just the consumer's lag budget.")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -3530,6 +3711,16 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error("--dm-plan-path %s not found", args.dm_plan_path)
         return 2
 
+    # ---- RFI knob parsing (M7.6) ----
+    rfi_m_values_parsed: tuple[int, ...] | None = None
+    if getattr(args, "rfi_m_values", None) is not None:
+        rfi_m_values_parsed = tuple(
+            int(s) for s in args.rfi_m_values.split(",") if s
+        )
+        if not rfi_m_values_parsed:
+            LOG.error("--rfi-m-values must be non-empty after parsing")
+            return 2
+
     cfg = FastIntegrationConfig(
         chgroup=args.chgroup,
         obs_dec_rad=math.radians(args.obs_dec_deg),
@@ -3541,6 +3732,14 @@ def main(argv: list[str] | None = None) -> int:
         cal_pol_swap=args.cal_pol_swap,
         flagants_path=args.flagants,
         rfi_enabled=not args.rfi_disabled,
+        rfi_sk_far=args.sk_far,
+        rfi_bandpass_k=args.bandpass_k,
+        rfi_group_k=args.group_k,
+        rfi_sumthr_max_m=args.sumthr_max_m,
+        rfi_sumthr_eta=args.sumthr_eta,
+        rfi_m_values=rfi_m_values_parsed,
+        rfi_warmup_cubes=args.rfi_warmup_cubes,
+        rfi_sumthr_enabled=not args.sumthr_disabled,
         static_sky_alpha=args.static_sky_alpha,
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,
@@ -3602,6 +3801,10 @@ def main(argv: list[str] | None = None) -> int:
             transport_tx_coarse_dm_mask=args.transport_tx_coarse_dm_mask,
             transport_tx_worker_hosts=args.transport_tx_worker_hosts,
             ready_sentinel_path=args.ready_sentinel_path,
+            rfi_mon_cn_id=args.rfi_mon_cn_id,
+            rfi_mon_window_size=args.rfi_mon_window_size,
+            rfi_mon_freq_downsample=args.rfi_mon_freq_downsample,
+            rfi_mon_shm_slots=args.rfi_mon_shm_slots,
         )
     except _StopRequested:
         LOG.info("clean stop")
