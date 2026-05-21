@@ -1,0 +1,54 @@
+# dsart_rt → InfluxDB pusher (M7.6).
+#
+# Polls the etcd /mon/{corr_rt,search_rt,service/*}/... prefixes and
+# mirrors them into InfluxDB 1.x line protocol.  See
+# tools/dashboard/dsart_rt_to_influx/README.md for the full deploy
+# recipe.
+#
+# Intentional design choice: this is a **system** unit (not --user),
+# co-located with the influxd 1.7 daemon on lxd110h20 so writes go
+# loopback.  Mirrors RH's convention for the other etcd↔influx
+# services on the same host (etcd2db.service, etcdWx.service).
+#
+# Install (as ubuntu, with sudo for the cp + daemon-reload + enable):
+#   sudo cp tools/dashboard/dsart_rt_to_influx/dsart_rt_to_influx.service \
+#       /etc/systemd/system/
+#   sudo cp tools/dashboard/dsart_rt_to_influx/startDsartRtToInflux \
+#       /home/ubuntu/bin/
+#   sudo chmod +x /home/ubuntu/bin/startDsartRtToInflux
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dsart_rt_to_influx.service
+#   journalctl -u dsart_rt_to_influx.service -f
+
+[Unit]
+Description=dsart-rt mon-points → InfluxDB pusher (M7.6)
+Documentation=man:dsart_rt_to_influx
+After=network-online.target influxdb.service
+Wants=network-online.target
+Requires=influxdb.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/bin/startDsartRtToInflux
+ExecReload=/usr/bin/pkill -9 -f startDsartRtToInflux && /home/ubuntu/bin/startDsartRtToInflux
+ExecStop=/usr/bin/pkill -f startDsartRtToInflux
+
+# Graceful shutdown: pusher catches SIGTERM via its signal handler
+# and finishes the current tick before exiting.  Give it the cadence
+# (1 s) plus a safety margin.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+SendSIGKILL=yes
+
+Restart=on-failure
+RestartSec=30
+
+# Mirror the etcd2db.service convention (journald).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
