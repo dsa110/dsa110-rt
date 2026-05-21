@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# Wrapper for /etc/systemd/system/dsart_rt_to_influx.service.
+#
+# Mirrors the style of /home/ubuntu/bin/startEtcd2db (RH's wrapper
+# for the existing etcd → InfluxDB bridge): a tiny shell entry that
+# the systemd unit's ExecStart can pkill cleanly via Service.ExecStop.
+#
+# We deliberately run in the `casa38` conda env (the same env the
+# h23 dashboard service uses) rather than `dsa110-rt` (the orchestrator
+# env) because:
+#   1. casa38 already has dsautils + requests + influxdb installed
+#      and is the long-standing dsa110 dashboard/operator env;
+#   2. the pusher is pure Python with no GPU / CUDA / psrdada deps,
+#      so the heavier dsa110-rt env would be overkill;
+#   3. matches the file's own module docstring + the README.
+
+set -euo pipefail
+
+REPO_ROOT="${DSART_RT_REPO:-/home/ubuntu/proj/dsa110-rt}"
+PUSHER_DIR="${REPO_ROOT}/tools/dashboard/dsart_rt_to_influx"
+PY_BIN="${DSART_RT_TO_INFLUX_PY:-/home/ubuntu/anaconda3/envs/casa38/bin/python}"
+
+INFLUX_URL="${DSART_RT_TO_INFLUX_URL:-http://localhost:8086}"
+INFLUX_DB="${DSART_RT_TO_INFLUX_DB:-dsa110}"
+POLL_CADENCE_S="${DSART_RT_TO_INFLUX_POLL_S:-1.0}"
+LOG_LEVEL="${DSART_RT_TO_INFLUX_LOG_LEVEL:-INFO}"
+
+cd "${PUSHER_DIR}"
+
+exec "${PY_BIN}" -u pusher.py \
+    --influx-url "${INFLUX_URL}" \
+    --influx-db  "${INFLUX_DB}" \
+    --poll-cadence-s "${POLL_CADENCE_S}" \
+    --log-level "${LOG_LEVEL}"
