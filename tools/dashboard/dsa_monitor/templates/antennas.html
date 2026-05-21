@@ -8,13 +8,20 @@
 {% block content %}
 <h1>Antennas / RFI</h1>
 
+<div class="plot-card">
+    <h2>Fleet thumbnails — latest pre-flag bandpass per antenna</h2>
+    <img src="/plot/thumb_grid.png?t={{ snapshot_unix|int }}"
+         alt="fleet bandpass thumbnails (12 x 8 = 96 antennas)">
+    <div class="muted">12 × 8 grid. Each panel: XX (blue) + YY (orange) on a shared log-S<sub>1</sub> y-axis. Green dashed = HI (1.42 GHz). Real DSA-110 antenna numbers (per <code>configs/corr_setup_96.yaml::antenna_order</code>), NOT cube indices. "no data" = at least one of the 16 corr exporters has no record covering this ant in the latest window.</div>
+</div>
+
 <div class="card">
     <form method="GET" action="/antennas" class="controls">
         <label for="ant">Antenna:</label>
         <select name="ant" id="ant" onchange="this.form.submit()">
-            {% for i in ant_choices %}
+            {% for i, num in ant_choices %}
             <option value="{{ i }}" {% if i == ant_idx %}selected{% endif %}>
-                ant {{ i + 1 }}  (idx {{ i }})
+                ant {{ num }}  (cube idx {{ i }})
             </option>
             {% endfor %}
         </select>
