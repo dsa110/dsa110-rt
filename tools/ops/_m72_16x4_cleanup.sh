@@ -18,6 +18,12 @@ cleanup_corr() {
     for k in dada eada fada bada gada hada; do dada_db -d -k \$k >/dev/null 2>&1; done
     ipcs -m | awk '/ubuntu/ {print \$2}' | xargs -r -I{} ipcrm -m {} 2>/dev/null
     rm -f /tmp/dsart-corr-*.ready
+    # M7.5: dsart_capture_manythread registers atexit(shm_unlink) but
+    # kill -9 skips atexit; without this rm the next run's capture
+    # binary re-opens the stale shm with the previous run's PID still
+    # in it, which confuses the sidecar's freshness logic and the
+    # operator-side _m72_snapshot.py.
+    rm -f /dev/shm/dsart-capture-* 2>/dev/null
     rm -rf /tmp/dsart-rt-children
     mkdir -p /tmp/dsart-rt-children
     echo OK
