@@ -115,12 +115,24 @@ class FlagBlockResult:
             cubes.
         flag_fraction_total: scalar fraction of cells flagged
             (``mask.float().mean()``). Convenience for monitoring.
+        s1_full: fp32 ``S1_4096`` per (ant, ch, pol). Same shape as
+            ``mask``. The full-cube auto-power that the flagger
+            computed internally from
+            :func:`dsart.rfi.compute_autos` (and that bandpass-outlier
+            / group-outlier consumed). Exposed here so monitoring
+            (M7.6 :class:`dsart.services.rfi_window.RFIWindowAggregator`)
+            can build a per-ant pre-flag bandpass without
+            recomputing the autos. ``None`` for callers that pass an
+            ``autos_override`` whose ``s1`` does not contain the
+            full-block M; only set on the production code path that
+            calls ``compute_autos`` itself.
     """
 
     mask: torch.Tensor
     source_tags: torch.Tensor
     warmup: bool
     flag_fraction_total: float
+    s1_full: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +431,7 @@ class RFIFlagger:
             source_tags=tags,
             warmup=warmup_flag,
             flag_fraction_total=flag_frac,
+            s1_full=s1_full,
         )
 
 

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Burst candidates – DSA Monitor{% endblock %}
+
+{% block content %}
+<h1>Burst candidates</h1>
+<div class="banner info">
+    Burst-candidate tab is a stub. Architecture + UI to be designed in a follow-up;
+    until then this page lives here purely so the nav layout matches the final
+    three-tab plan (Antennas/RFI · SEFDs · Burst candidates).
+</div>
+
+<div class="card">
+    <h2>Planned content (sketch)</h2>
+    <ul style="margin-left: 20px; font-size: 14px; line-height: 1.7;">
+        <li>Live feed of recent T1 / T2 candidates pulled from <code>/mon/search_rt/&lt;n&gt;/cands</code></li>
+        <li>Per-candidate stamp + dynamic spectrum links (image cube tiles from the search nodes)</li>
+        <li>Filtering by DM, S/N, time, ant-mask validity</li>
+        <li>Cross-link from RFI tab: "this candidate fired during the next 16-cube window where ant N was group-flagged"</li>
+    </ul>
+</div>
+{% endblock %}

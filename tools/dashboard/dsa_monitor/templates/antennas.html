@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Antennas / RFI – DSA Monitor{% endblock %}
+
+{% macro cell(c) -%}
+<td class="value {% if c.warn %}warn{% endif %}">{{ c.fmt }}</td>
+{%- endmacro %}
+
+{% block content %}
+<h1>Antennas / RFI</h1>
+
+<div class="card">
+    <form method="GET" action="/antennas" class="controls">
+        <label for="ant">Antenna:</label>
+        <select name="ant" id="ant" onchange="this.form.submit()">
+            {% for i in ant_choices %}
+            <option value="{{ i }}" {% if i == ant_idx %}selected{% endif %}>
+                ant {{ i + 1 }}  (idx {{ i }})
+            </option>
+            {% endfor %}
+        </select>
+        <button class="btn" type="submit">go</button>
+        <span class="muted">selected: ant {{ ant_num }} (cube idx {{ ant_idx }})</span>
+    </form>
+</div>
+
+<div class="card">
+    <h3>16 corr-node exporters</h3>
+    <div class="nodes-panel">
+        {% for n in nodes_status %}
+        {% set ok = n.last_fetch_ok %}
+        {% set stale = (n.n_windows == 0) %}
+        <div class="node-cell {% if not ok %}fail{% elif stale %}stale{% else %}ok{% endif %}">
+            <div><span class="cn">cn{{ '%02d' % n.cn_id }}</span> · ch{{ n.chgroup }}</div>
+            <div>{{ n.host }}</div>
+            <div>{{ n.n_windows }} win · seq={{ n.last_seq }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<div class="plot-card">
+    <h2>Pre-flag bandpass — latest 16-cube mean</h2>
+    <img src="/plot/bandpass.png?ant={{ ant_idx }}&t={{ snapshot_unix|int }}" alt="bandpass">
+    <div class="muted">All 16 corr nodes concatenated (1536 ch · 4× downsample). XX (pol 0) + YY (pol 1) overlaid. Vertical dotted lines = inter-chgroup boundaries.</div>
+</div>
+
+<div class="plot-card">
+    <h2>Pre-flag bandpass waterfall — last 30 min</h2>
+    <img src="/plot/bandpass_wf.png?ant={{ ant_idx }}&t={{ snapshot_unix|int }}" alt="bandpass waterfall">
+    <div class="muted">Each row = one 16-cube window (≈2.15 s). 4× freq-downsampled. log<sub>10</sub> S<sub>1</sub>. XX above, YY below.</div>
+</div>
+
+<div class="plot-card">
+    <h2>Flag fraction — latest 16-cube window</h2>
+    <img src="/plot/flag_spectrum.png?ant={{ ant_idx }}&t={{ snapshot_unix|int }}" alt="flag spectrum">
+    <div class="muted">Final OR-fold mask (sk ∪ bandpass-outlier ∪ group-outlier ∪ sumthr ∪ flagants). XX + YY overlaid.</div>
+</div>
+
+<div class="plot-card">
+    <h2>Flag waterfall — last 30 min</h2>
+    <img src="/plot/flag_wf.png?ant={{ ant_idx }}&t={{ snapshot_unix|int }}" alt="flag waterfall">
+    <div class="muted">Final OR-fold mask fraction per (16-cube window, downsampled channel). Cmap range 0..1. XX above, YY below.</div>
+</div>
+
+<div class="card">
+    <h2>Monitor points — ant {{ ant_num }}</h2>
+
+    {% if not table.raw_present %}
+    <div class="banner warn">No <code>/mon/ant/{{ ant_num }}</code> entry in etcd (check ant pointing service). Drive/pointing/thermal cells will show "—".</div>
+    {% endif %}
+
+    <div class="ant-table">
+        <div class="ant-section">
+            <h3>Pointing</h3>
+            <table class="metric">
+                <tr><td>elevation [deg]</td>{{ cell(table.pointing.ant_el_deg) }}</tr>
+                <tr><td>commanded el [deg]</td>{{ cell(table.pointing.ant_cmd_el_deg) }}</tr>
+                <tr><td>el error [deg]</td>{{ cell(table.pointing.ant_el_err_deg) }}</tr>
+            </table>
+        </div>
+
+        <div class="ant-section">
+            <h3>Drive</h3>
+            <table class="metric">
+                <tr><td>drv_state</td>{{ cell(table.drive.drv_state) }}</tr>
+                <tr><td>drv_cmd</td>{{ cell(table.drive.drv_cmd) }}</tr>
+                <tr><td>drv_act</td>{{ cell(table.drive.drv_act) }}</tr>
+                <tr><td>brake_on</td>{{ cell(table.drive.brake_on) }}</tr>
+                <tr><td>at north lim</td>{{ cell(table.drive.at_north_lim) }}</tr>
+                <tr><td>at south lim</td>{{ cell(table.drive.at_south_lim) }}</tr>
+                <tr><td>fan_err</td>{{ cell(table.drive.fan_err) }}</tr>
+                <tr><td>emergency off</td>{{ cell(table.drive.emergency_off) }}</tr>
+            </table>
+        </div>
+
+        <div class="ant-section">
+            <h3>Thermal [°C]</h3>
+            <table class="metric">
+                <tr><td>motor temp</td>{{ cell(table.thermal.motor_temp_c) }}</tr>
+                <tr><td>focus temp</td>{{ cell(table.thermal.focus_temp_c) }}</tr>
+                <tr><td>FEB temp A</td>{{ cell(table.thermal.feb_temp_a) }}</tr>
+                <tr><td>FEB temp B</td>{{ cell(table.thermal.feb_temp_b) }}</tr>
+            </table>
+        </div>
+
+        <div class="ant-section">
+            <h3>RF / front-end</h3>
+            <table class="metric">
+                <tr><td>LNA current A [mA]</td>{{ cell(table.rf.lna_current_a_mA) }}</tr>
+                <tr><td>LNA current B [mA]</td>{{ cell(table.rf.lna_current_b_mA) }}</tr>
+                <tr><td>noise A on</td>{{ cell(table.rf.noise_a_on) }}</tr>
+                <tr><td>noise B on</td>{{ cell(table.rf.noise_b_on) }}</tr>
+                <tr><td>RF power A [dBm]</td>{{ cell(table.rf.rf_pwr_a_dBm) }}</tr>
+                <tr><td>RF power B [dBm]</td>{{ cell(table.rf.rf_pwr_b_dBm) }}</tr>
+                <tr><td>FEB current A [mA]</td>{{ cell(table.rf.feb_current_a_mA) }}</tr>
+                <tr><td>FEB current B [mA]</td>{{ cell(table.rf.feb_current_b_mA) }}</tr>
+            </table>
+        </div>
+
+        <div class="ant-section">
+            <h3>Power</h3>
+            <table class="metric">
+                <tr><td>laser volts A</td>{{ cell(table.power.laser_volts_a) }}</tr>
+                <tr><td>laser volts B</td>{{ cell(table.power.laser_volts_b) }}</tr>
+                <tr><td>PSU volt</td>{{ cell(table.power.psu_volt) }}</tr>
+            </table>
+        </div>
+
+        <div class="ant-section">
+            <h3>RFI aggregates (latest 16-cube window across 16 cn)</h3>
+            <table class="metric">
+                <tr><td>in-band power XX</td>{{ cell(table.rfi.in_band_power_xx) }}</tr>
+                <tr><td>in-band power YY</td>{{ cell(table.rfi.in_band_power_yy) }}</tr>
+                <tr><td>flag frac XX</td>{{ cell(table.rfi.frac_flagged_total_xx) }}</tr>
+                <tr><td>flag frac YY</td>{{ cell(table.rfi.frac_flagged_total_yy) }}</tr>
+                <tr><td>flag frac (both pol)</td>{{ cell(table.rfi.frac_flagged_total) }}</tr>
+                <tr><td>group-flagged XX</td>{{ cell(table.rfi.group_flagged_xx_this_window) }}</tr>
+                <tr><td>group-flagged YY</td>{{ cell(table.rfi.group_flagged_yy_this_window) }}</tr>
+                <tr><td>30-min windows observed</td>{{ cell(table.rfi.n_windows_observed) }}</tr>
+            </table>
+        </div>
+
+        <div class="ant-section">
+            <h3>etcd freshness</h3>
+            <table class="metric">
+                <tr><td>/mon/ant/{{ ant_num }} age [s]</td>{{ cell(table.etcd.age_s) }}</tr>
+                <tr><td>/mon/ant/{{ ant_num }} stale</td>{{ cell(table.etcd.stale) }}</tr>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

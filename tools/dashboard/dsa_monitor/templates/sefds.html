@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}SEFDs – DSA Monitor{% endblock %}
+
+{% block content %}
+<h1>SEFDs</h1>
+<div class="banner info">
+    SEFD dashboard is the existing service on port 5777 (managed by
+    <code>sefd_dashboard.service</code>). Embedded below for convenience;
+    click here to open standalone: <a href="{{ sefd_url }}" target="_blank">{{ sefd_url }}</a>
+</div>
+<div class="iframe-wrap">
+    <iframe src="{{ sefd_url }}" title="SEFD dashboard"></iframe>
+</div>
+{% endblock %}
