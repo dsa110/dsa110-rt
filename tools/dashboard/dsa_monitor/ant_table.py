@@ -64,26 +64,53 @@ from typing import Any, Optional
 
 import numpy as np
 
+from antenna_map import (
+    NANTS_CUBE,
+    all_ant_nums,
+    ant_num_to_cube_idx,
+    cube_idx_to_ant_num,
+)
 from rfi_store import StoreSnapshot
 
 LOG = logging.getLogger("dsa_monitor.ant_table")
 
-# Antenna numbering: ant_idx 0..95 is the corr's 0-based index into
-# the (NANTS, NCHAN, NPOL) cubes; ant_num 1..96 is the operator-
-# facing antenna ID (matches /mon/ant/<N>).
-NANTS_DASH: int = 96
+# Antenna numbering:
+#   * cube_idx (0..95) is the position of the antenna in the corr's
+#     (NANTS, NCHAN, NPOL) cube. ALL plot/aggregator code addresses
+#     antennas by cube_idx.
+#   * ant_num (1..115, with gaps) is the operator-facing DSA-110
+#     antenna ID — what shows up in /mon/ant/<N> and on every
+#     elsewhere-spoken-aloud reference. The two are NOT equal (e.g.
+#     cube_idx 47 → ant 102, cube_idx 48 → ant 116). See
+#     antenna_map.py for the canonical bijection (verbatim copy of
+#     configs/corr_setup_96.yaml::antenna_order).
+NANTS_DASH: int = NANTS_CUBE
 
 ETCD_MON_ANT_KEY = "/mon/ant/{ant_num}"
 ETCD_STALENESS_S = 60.0                            # /mon/ant/<n> updates ~3 s
 
 
 def ant_idx_to_ant_num(ant_idx: int) -> int:
-    """Translate from cube 0-based ant_idx to operator-facing 1-based."""
-    return int(ant_idx) + 1
+    """cube 0-based index → operator-facing DSA-110 antenna number.
+
+    Uses the corr_setup_96.yaml antenna_order map (mirrored in
+    antenna_map.py). This is NOT ``ant_idx + 1``; the corr ordering
+    has gaps and out-of-band IDs.
+    """
+    return cube_idx_to_ant_num(int(ant_idx))
 
 
 def ant_num_to_ant_idx(ant_num: int) -> int:
-    return int(ant_num) - 1
+    """Operator-facing DSA-110 antenna number → cube 0-based index.
+
+    Raises KeyError if the antenna is not part of the 96-ant set.
+    """
+    return ant_num_to_cube_idx(int(ant_num))
+
+
+def all_ant_nums_in_cube_order() -> tuple[int, ...]:
+    """Re-export for templates that need the full ant-num list."""
+    return all_ant_nums()
 
 
 # ---------------------------------------------------------------------------

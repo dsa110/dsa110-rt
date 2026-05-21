@@ -47,8 +47,14 @@ from plot_render import (
     render_bandpass_waterfall,
     render_flag_spectrum,
     render_flag_waterfall,
+    render_thumb_grid,
 )
-from ant_table import build_ant_table, NANTS_DASH, ant_idx_to_ant_num
+from ant_table import (
+    build_ant_table,
+    NANTS_DASH,
+    all_ant_nums_in_cube_order,
+    ant_idx_to_ant_num,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +152,16 @@ def antennas_rfi():
             "last_fetch_ok": cring.last_fetch_ok,
             "last_seq": cring.last_seq,
         })
+    # (cube_idx, ant_num) pairs, in cube-index order. Templates use the
+    # cube_idx as the form value and the ant_num as the human label.
+    ant_choices = list(zip(range(NANTS_DASH), all_ant_nums_in_cube_order()))
     return render_template(
         "antennas.html",
         active_tab="antennas",
         ant_idx=ant_idx,
         ant_num=ant_idx_to_ant_num(ant_idx),
         n_ants=NANTS_DASH,
-        ant_choices=list(range(NANTS_DASH)),
+        ant_choices=ant_choices,
         table=table,
         nodes_status=nodes_status,
         snapshot_unix=snap.snapshot_unix,
@@ -232,6 +241,14 @@ def plot_flag_wf():
         snap, ant_idx=ant_idx,
         ant_label=str(ant_idx_to_ant_num(ant_idx)),
     )
+    return _png_response(png)
+
+
+@app.route("/plot/thumb_grid.png")
+def plot_thumb_grid():
+    """12-col × 8-row fleet bandpass thumbnails (one PNG, all 96 antennas)."""
+    snap = store.snapshot()
+    png = render_thumb_grid(snap, ant_nums=all_ant_nums_in_cube_order())
     return _png_response(png)
 
 
