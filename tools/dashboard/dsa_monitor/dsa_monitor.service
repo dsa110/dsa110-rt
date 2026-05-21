@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/ubuntu/proj/dsa110-rt/tools/dashboard/dsa_monitor
+WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt/tools/dashboard/dsa_monitor
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/home/ubuntu/proj/dsa110-rt/src:/home/ubuntu/proj/dsa110-rt/tools/dashboard/dsa_monitor
+Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src:/home/ubuntu/vikram/dev/dsa110-rt/tools/dashboard/dsa_monitor
 Environment=DSA_MONITOR_PORT=5778
 Environment=DSA_MONITOR_BIND=0.0.0.0
 Environment=SEFD_DASHBOARD_URL=http://lxd110h23:5777/
