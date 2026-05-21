@@ -10,7 +10,10 @@ import sys
 from dsautils.dsa_store import DsaStore
 
 CORR_NODES_CN = (3, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 21, 22)
-SEARCH_CN = 1
+# M7.3 16x4 expanded the search side from 1 -> 4 nodes.
+# n01 -> cn 1, n02 -> cn 2, n09 -> cn 9, n13 -> cn 13.
+SEARCH_CN_LIST = (1, 2, 9, 13)
+SEARCH_CN = 1  # legacy single-node alias for 16x1 callers
 
 store = DsaStore()
 
@@ -82,10 +85,11 @@ def summarise_search(cn):
 
 
 def main():
-    print("=== SEARCH NODE ===")
-    s = summarise_search(SEARCH_CN)
-    print(f"  cn={SEARCH_CN} state={s['state']} uptime={s['uptime_s']}s "
-          f"routines={s['routines']}")
+    print("=== SEARCH NODES ===")
+    for cn in SEARCH_CN_LIST:
+        s = summarise_search(cn)
+        print(f"  cn={cn:>2} state={s['state']:<9} uptime={s['uptime_s']!s:>8}s "
+              f"routines={s['routines']}")
     print()
     print("=== CORR NODES ===")
     header = (f"{'cn':>3} {'state':<9} {'up':>6} {'cap_a':>5} {'cap_b':>5} "
