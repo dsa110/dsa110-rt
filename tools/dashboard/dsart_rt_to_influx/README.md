@@ -153,6 +153,34 @@ documented in `M7.6-MONITOR-POINTS-SEARCH.md` §7 (`.../rx`,
 them.  When the corresponding publisher ships, add a `make_*_points`
 helper and route it from `InfluxPusherService._route`.
 
+## Grafana dashboard
+
+A companion Grafana dashboard is committed under
+[`grafana/`](grafana/) and lives at uid `dsartRtMpV1` on the
+`lxd110h20:3000` instance:
+
+* `http://lxd110h20.sas.pvt:3000/d/dsartRtMpV1/dsart-rt-corr_rt-search_rt`
+
+It renders all 6 new measurements grouped into seven rows (fleet
+heartbeats, corr routine state, capture pipeline, capture health
+flags, RFI, search routine state, service heartbeat cadences) using
+the same look-and-feel as the existing `Correlator` dashboard.
+
+Re-generate the JSON and POST it back to the live instance with:
+
+```bash
+# 1. Regenerate dashboard JSON (commit the diff if you want the change
+#    tracked).
+python tools/dashboard/dsart_rt_to_influx/grafana/build_dashboard.py
+
+# 2. POST to Grafana on h20.  Default URL / creds match the
+#    long-running install.  --post will overwrite the existing
+#    dashboard at uid dsartRtMpV1.
+python tools/dashboard/dsart_rt_to_influx/grafana/build_dashboard.py \
+    --post --grafana-url http://localhost:3000 \
+    --grafana-auth admin:adminLETmeIN
+```
+
 ## File layout
 
 ```
@@ -160,8 +188,11 @@ tools/dashboard/dsart_rt_to_influx/
 ├── pusher.py                   The service (≈800 LOC including docstrings)
 ├── startDsartRtToInflux        Bash wrapper that systemd's ExecStart calls
 ├── dsart_rt_to_influx.service  systemd system unit
+├── grafana/
+│   ├── build_dashboard.py        Dashboard generator (idempotent, --post)
+│   └── dsart_rt_dashboard.json   Committed snapshot
 └── README.md                   this file
 
 tests/
-└── test_dsart_rt_to_influx_pusher.py  pytest suite (35 tests)
+└── test_dsart_rt_to_influx_pusher.py  pytest suite (51 tests)
 ```
