@@ -1,0 +1,34 @@
+[Unit]
+Description=DSA-110 dsart-rt C2 coincidencer (h23)
+Documentation=file:/home/ubuntu/vikram/dev/dsa110-rt/docs/c1c2/C1C2_DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs under the operator user; the casa38 conda env provides
+# event.names + dsautils + slack_sdk (same env legacy T2 ran in).
+WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
+ExecStart=/bin/bash -lc 'source /home/ubuntu/miniforge3/etc/profile.d/conda.sh && conda activate casa38 && exec python -u -m dsart.services.coincidencer --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml'
+Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
+Environment=PYTHONUNBUFFERED=1
+Environment=MPLBACKEND=Agg
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# SIGHUP triggers in-process criteria reload (see services/coincidencer.py).
+KillMode=mixed
+
+# Reasonable resource caps — coincidencer is light (a few hundred
+# rows/sec at production rate) but the plotter forks matplotlib so
+# bound the open-fd / nproc.
+LimitNOFILE=8192
+LimitNPROC=512
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsart_c2
+
+[Install]
+WantedBy=default.target
