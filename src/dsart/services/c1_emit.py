@@ -1,0 +1,401 @@
+"""C1 → C2 TCP batch emitter (M7.4 search-node side).
+
+Per ``docs/c1c2/C1C2_DESIGN.md`` §2.6 + ``C1C2_WIRE_SCHEMA.md`` §1,
+each ``(search_node_id, gpu_half)`` maintains exactly one persistent
+TCP connection to ``c1.c2_endpoint`` (default ``h23:11500``). The
+:class:`C1TcpEmitter` exposed here owns that connection's lifecycle
+and a bounded outbound queue. The per-cube driver calls
+:meth:`C1TcpEmitter.submit` synchronously with a fully-built
+``C1BatchHeader`` + the cube's survivor list; the connection task
+drains the queue, encodes each batch via the locked
+``coinc.wire.C1BatchEncoder``, and ``sendall``s it onto the socket.
+
+Backpressure semantics:
+  * Outbound queue is bounded (default depth = 16).
+  * ``submit`` is non-blocking: queue-full drops are counted as
+    ``batches_dropped`` and surfaced via :attr:`mon`.
+  * The connection task reconnects on socket-level failures with
+    exponential backoff (250 ms → 30 s cap) per the wire schema.
+
+The module imports asyncio + socket only (no torch / numpy). The
+encoder is pure (no I/O) so unit tests round-trip through a local
+in-process TCP echo server.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+from ..coinc.wire import (
+    C1BatchEncoder,
+    C1BatchHeader,
+    C1CandidateRow,
+    SCHEMA_VERSION,
+)
+from ..common.contracts import Candidate, CubeGeometry
+
+__all__ = [
+    "C1EmitConfig",
+    "C1TcpEmitter",
+    "candidate_to_c1_row",
+]
+
+
+_LOG = logging.getLogger("dsart.services.c1_emit")
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class C1EmitConfig:
+    """Static config for the per-(search_node, gpu_half) C1 emitter.
+
+    Args:
+        host: C2 server hostname / IPv4.
+        port: C2 server TCP port (default 11500 per wire schema).
+        search_node_id: 0..N_SEARCH-1.
+        gpu_half: 0 or 1.
+        queue_depth: outbound asyncio queue depth (per design doc
+            default 16).
+        connect_backoff_initial_s: first reconnect sleep on failure.
+        connect_backoff_max_s: cap on the reconnect sleep.
+        send_timeout_s: per-batch ``asyncio.wait_for`` deadline for the
+            ``writer.drain()`` call. None disables.
+    """
+
+    host: str
+    port: int = 11500
+    search_node_id: int = 0
+    gpu_half: int = 0
+    queue_depth: int = 16
+    connect_backoff_initial_s: float = 0.25
+    connect_backoff_max_s: float = 30.0
+    send_timeout_s: Optional[float] = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Candidate → C1CandidateRow mapping
+# ---------------------------------------------------------------------------
+
+
+def candidate_to_c1_row(
+    cand: Candidate,
+    *,
+    geom: CubeGeometry,
+) -> C1CandidateRow:
+    """Project a ``Candidate`` + ``CubeGeometry`` sidecar into a
+    locked-schema ``C1CandidateRow``.
+
+    The detector emits Candidates with ``l``, ``m`` as float-cast
+    pixel indices and ``dm_idx`` as the global fine-DM index (the
+    search-compute service threads the cube's ``DmPlan`` view to
+    ``decode_local_max``, which writes the index from
+    ``fine_to_coarse`` if present — see ``detector/decoder.py``). The
+    ``CubeGeometry`` provides the radian-units conversion and the
+    per-cube fine-DM grid; we use it to populate both ``l_rad / m_rad``
+    and ``dm_pc_cc / fine_dm_idx``.
+
+    ``fine_dm_idx`` is recovered as the local index into
+    ``geom.fine_dm_pc_cc`` by matching ``dm_fine`` ≈
+    ``geom.fine_dm_pc_cc[fine_dm_idx]``. If ``dm_fine`` doesn't fall
+    on the per-cube grid (e.g. test fixtures that pass synthetic
+    floats), we clamp ``fine_dm_idx`` to 0; the C2 receiver tolerates
+    that.
+    """
+    l_pix = int(round(float(cand.l)))
+    m_pix = int(round(float(cand.m)))
+    n_grid = int(geom.n_grid)
+    if l_pix < 0:
+        l_pix = 0
+    elif l_pix >= n_grid:
+        l_pix = n_grid - 1
+    if m_pix < 0:
+        m_pix = 0
+    elif m_pix >= n_grid:
+        m_pix = n_grid - 1
+    l_rad = float(geom.l0_rad) + float(geom.cell_l_rad) * float(cand.l)
+    m_rad = float(geom.m0_rad) + float(geom.cell_m_rad) * float(cand.m)
+
+    # Recover per-cube fine_dm_idx via the geometry grid. We match on
+    # the float value rather than carrying it through the Candidate to
+    # avoid bloating that contract — the cube grid is small and the
+    # lookup is rare (a handful of survivors per cube).
+    fine_dm = geom.fine_dm_pc_cc
+    fine_dm_idx = 0
+    if fine_dm is not None and fine_dm.size > 0:
+        # Closest-grid lookup; bench / test fixtures may pass synthetic
+        # ``dm_fine`` floats that don't exactly fall on the grid.
+        diffs = abs(fine_dm - float(cand.dm_fine))
+        fine_dm_idx = int(diffs.argmin())
+    return C1CandidateRow(
+        snr=float(cand.snr),
+        l_rad=float(l_rad),
+        m_rad=float(m_rad),
+        l_pix=int(l_pix),
+        m_pix=int(m_pix),
+        dm_pc_cc=float(cand.dm_fine),
+        dm_idx_global=int(cand.dm_idx),
+        fine_dm_idx=int(fine_dm_idx),
+        event_specnum=int(cand.event_specnum),
+        width_samples=int(cand.width_samples),
+        kernel_id=str(cand.kernel_id),
+        flags=int(cand.flags),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outbound queue payload + emitter task
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboundBatch:
+    header: C1BatchHeader
+    rows: Tuple[C1CandidateRow, ...]
+
+
+class C1TcpEmitter:
+    """Asyncio-driven persistent TCP client for the C1 → C2 path.
+
+    Lifecycle:
+        ``emitter = C1TcpEmitter(config=cfg)``
+        ``task = asyncio.create_task(emitter.run())``
+        ``... emitter.submit(header, candidates) ...``
+        ``await emitter.stop()``
+        ``await task``
+
+    The :meth:`run` coroutine owns the connection lifecycle; it
+    reconnects on any socket-level error with exponential backoff. The
+    :meth:`submit` method is synchronous and non-blocking so the
+    per-cube driver can call it directly without yielding to the
+    event loop.
+
+    Mon-points exposed via :attr:`mon`:
+        * ``connected`` (bool) — True while a writer is open.
+        * ``bytes_sent`` (int) — cumulative encoded-batch bytes shipped.
+        * ``batches_sent`` (int) — cumulative successful sends.
+        * ``batches_dropped`` (int) — cumulative queue-full drops.
+        * ``batches_send_failed`` (int) — sends that raised mid-send.
+        * ``reconnects`` (int) — count of socket reconnect attempts.
+        * ``queue_depth`` (int) — current outbound queue depth.
+        * ``last_connect_error`` (str | None) — last connect-error str
+          (mostly for operator triage).
+        * ``last_connected_at_ns`` (int) — monotonic-ns of last
+          successful connect.
+    """
+
+    def __init__(self, *, config: C1EmitConfig) -> None:
+        if config.queue_depth <= 0:
+            raise ValueError(
+                f"queue_depth={config.queue_depth}, expected > 0"
+            )
+        self._config = config
+        self._queue: "asyncio.Queue[_OutboundBatch]" = asyncio.Queue(
+            maxsize=config.queue_depth
+        )
+        self._stopping = asyncio.Event()
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._reader: Optional[asyncio.StreamReader] = None
+        self._mon: Dict[str, Any] = {
+            "connected": False,
+            "bytes_sent": 0,
+            "batches_sent": 0,
+            "batches_dropped": 0,
+            "batches_send_failed": 0,
+            "reconnects": 0,
+            "queue_depth": 0,
+            "last_connect_error": None,
+            "last_connected_at_ns": 0,
+            "host": config.host,
+            "port": int(config.port),
+            "search_node_id": int(config.search_node_id),
+            "gpu_half": int(config.gpu_half),
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def submit(
+        self,
+        header: C1BatchHeader,
+        candidates: Sequence[Candidate],
+        *,
+        geom: Optional[CubeGeometry] = None,
+        rows: Optional[Sequence[C1CandidateRow]] = None,
+    ) -> bool:
+        """Non-blocking enqueue. Returns True on success, False on
+        queue-full drop.
+
+        Pass ``rows=`` when the caller has already projected
+        Candidates into ``C1CandidateRow``s (saves one walk on the
+        hot path). When ``rows`` is None, the caller must pass
+        ``geom`` so the row mapping can fill ``l_rad / m_rad /
+        fine_dm_idx``.
+
+        The encoded header field ``n_candidates`` must match
+        ``len(rows)`` after projection; this method asserts it.
+        """
+        if rows is None:
+            if geom is None:
+                raise ValueError(
+                    "submit() requires either rows= or geom= to project candidates"
+                )
+            rows_tuple = tuple(
+                candidate_to_c1_row(c, geom=geom) for c in candidates
+            )
+        else:
+            rows_tuple = tuple(rows)
+        if header.n_candidates != len(rows_tuple):
+            raise ValueError(
+                f"header.n_candidates={header.n_candidates} != "
+                f"len(rows)={len(rows_tuple)}"
+            )
+        try:
+            self._queue.put_nowait(_OutboundBatch(header=header, rows=rows_tuple))
+            self._mon["queue_depth"] = self._queue.qsize()
+            return True
+        except asyncio.QueueFull:
+            self._mon["batches_dropped"] = int(self._mon["batches_dropped"]) + 1
+            _LOG.warning(
+                "c1_emit drop (queue full); cube_id=%d depth=%d",
+                int(header.cube_id), self._queue.maxsize,
+            )
+            return False
+
+    async def stop(self) -> None:
+        """Signal the run loop to drain + exit. Idempotent."""
+        self._stopping.set()
+        # Push a sentinel so the queue-await wakes up promptly.
+        try:
+            self._queue.put_nowait(_SHUTDOWN_SENTINEL)
+        except asyncio.QueueFull:
+            # Queue is full; loop will check _stopping after the next
+            # drain.
+            pass
+
+    @property
+    def mon(self) -> Dict[str, Any]:
+        """Live mon-point dict. Snapshot-friendly (caller may dict-copy)."""
+        self._mon["queue_depth"] = self._queue.qsize()
+        return self._mon
+
+    # ------------------------------------------------------------------
+    # Run loop
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Connection + send lifecycle. Reconnects on failure with
+        exponential backoff until :meth:`stop` is called."""
+        backoff = float(self._config.connect_backoff_initial_s)
+        while not self._stopping.is_set():
+            try:
+                await self._connect_once()
+                # Successful connect → reset backoff.
+                backoff = float(self._config.connect_backoff_initial_s)
+                await self._drain_loop()
+            except asyncio.CancelledError:
+                _LOG.info("c1_emit run() cancelled; tearing down")
+                break
+            except Exception as exc:  # noqa: BLE001
+                self._mon["last_connect_error"] = repr(exc)
+                self._mon["connected"] = False
+                _LOG.warning(
+                    "c1_emit connection failed (%s:%d): %r; sleeping %.2fs",
+                    self._config.host, self._config.port, exc, backoff,
+                )
+            finally:
+                await self._close_writer()
+            if self._stopping.is_set():
+                break
+            try:
+                await asyncio.wait_for(
+                    self._stopping.wait(), timeout=backoff
+                )
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(
+                backoff * 2.0,
+                float(self._config.connect_backoff_max_s),
+            )
+
+    async def _connect_once(self) -> None:
+        _LOG.info(
+            "c1_emit connecting to %s:%d (sid=%d, gpu_half=%d)",
+            self._config.host,
+            self._config.port,
+            self._config.search_node_id,
+            self._config.gpu_half,
+        )
+        self._reader, self._writer = await asyncio.open_connection(
+            host=self._config.host, port=self._config.port,
+        )
+        self._mon["connected"] = True
+        self._mon["reconnects"] = int(self._mon["reconnects"]) + 1
+        self._mon["last_connect_error"] = None
+        self._mon["last_connected_at_ns"] = int(time.monotonic_ns())
+        _LOG.info(
+            "c1_emit connected to %s:%d (sid=%d, gpu_half=%d, reconnects=%d)",
+            self._config.host,
+            self._config.port,
+            self._config.search_node_id,
+            self._config.gpu_half,
+            int(self._mon["reconnects"]),
+        )
+
+    async def _drain_loop(self) -> None:
+        assert self._writer is not None
+        writer = self._writer
+        while not self._stopping.is_set():
+            item = await self._queue.get()
+            self._mon["queue_depth"] = self._queue.qsize()
+            if item is _SHUTDOWN_SENTINEL:
+                return
+            try:
+                payload = C1BatchEncoder.encode(item.header, item.rows)
+                writer.write(payload)
+                if self._config.send_timeout_s is not None:
+                    await asyncio.wait_for(
+                        writer.drain(),
+                        timeout=self._config.send_timeout_s,
+                    )
+                else:
+                    await writer.drain()
+                self._mon["bytes_sent"] = int(self._mon["bytes_sent"]) + len(payload)
+                self._mon["batches_sent"] = int(self._mon["batches_sent"]) + 1
+            except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
+                self._mon["batches_send_failed"] = (
+                    int(self._mon["batches_send_failed"]) + 1
+                )
+                _LOG.warning(
+                    "c1_emit send failed (cube_id=%d): %r; tearing connection",
+                    int(item.header.cube_id), exc,
+                )
+                raise  # outer loop reconnects
+            finally:
+                # The asyncio.Queue tracks unfinished tasks; signal done.
+                self._queue.task_done()
+
+    async def _close_writer(self) -> None:
+        w = self._writer
+        self._writer = None
+        self._reader = None
+        self._mon["connected"] = False
+        if w is None:
+            return
+        try:
+            w.close()
+            await w.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# Sentinel used to wake the queue.get() in the run loop on stop().
+_SHUTDOWN_SENTINEL: Any = object()
