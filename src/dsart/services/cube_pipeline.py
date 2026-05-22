@@ -77,6 +77,9 @@ __all__ = [
     "CubePipelineResult",
     "PrefetchedCube",
     "PrefetchedH2dCube",
+    "RetainedCube",
+    "CubeRetentionRing",
+    "find_cube_for_specnum",
 ]
 
 
@@ -257,6 +260,264 @@ class PrefetchedH2dCube:
     """Prefetched H2D-only handle (chunk-8d narrow overlap)."""
 
     staged: _H2dStaged
+
+
+# ---------------------------------------------------------------------------
+# C1 cube retention ring (M7.4) — depth-N pinned host buffer keeping the
+# last N cube tensors live in CPU RAM so the C2 trigger listener can look
+# up + dump any cube within the window.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedCube:
+    """One pinned-host cube tensor retained on the CPU side for later
+    C2-triggered NPZ dump. The full cube tensor is held by reference;
+    do not mutate it after handing it to the ring.
+
+    Args:
+        cube_id: monotonic cube counter (= ``CubeRingSlot.cube_id``).
+        event_specnum_start: spec num at sample 0 of this cube.
+        mjd_start: double-precision MJD at sample 0.
+        t_det: number of time samples in the cube.
+        n_fdm: number of fine-DM trials in the cube
+            (= ``CubeGeometry.n_fdm_in_cube``).
+        n_grid: spatial grid side.
+        sample_period_specnum: spec-nums per detector sample.
+        sample_period_us: time between adjacent detector samples in µs.
+        pinned_host_tensor: ``np.ndarray`` of shape
+            ``[t_det, n_fdm, n_grid, n_grid]`` in fp16; intended to live
+            in pinned host memory (the ring's slots own the
+            allocations).
+    """
+
+    cube_id: int
+    event_specnum_start: int
+    mjd_start: float
+    t_det: int
+    n_fdm: int
+    n_grid: int
+    sample_period_specnum: int
+    sample_period_us: float
+    pinned_host_tensor: np.ndarray
+
+
+def find_cube_for_specnum(
+    ring: "CubeRetentionRing",
+    event_specnum: int,
+) -> Optional[RetainedCube]:
+    """Return the retained cube whose ``[specnum_start, specnum_start +
+    t_det * sample_period_specnum)`` window contains ``event_specnum``.
+
+    Returns ``None`` if no retained cube covers the requested specnum.
+    On a multi-hit (impossible at production geometry where cubes
+    advance by ``cube_cadence_samples`` < ``t_det`` but possible during
+    extreme overlap) the most recently written hit wins (the C2
+    trigger always wants the freshest cube containing the event).
+    """
+    # Walk newest → oldest so the freshest hit wins.
+    best: Optional[RetainedCube] = None
+    for cube in ring.iter_newest_first():
+        start = int(cube.event_specnum_start)
+        end_exclusive = start + int(cube.t_det) * int(cube.sample_period_specnum)
+        if start <= int(event_specnum) < end_exclusive:
+            best = cube
+            break
+    return best
+
+
+class CubeRetentionRing:
+    """Circular buffer of the last N detector cubes (M7.4 C1 stage).
+
+    Each ring slot owns a pinned-host ``np.ndarray`` sized for the
+    fixed production geometry ``[t_det, n_fdm, n_grid, n_grid]`` fp16.
+    The ring is written to with :meth:`stage_cube` which (a) ensures
+    the destination slot is allocated, (b) does the GPU→host fp16
+    copy, and (c) commits a new :class:`RetainedCube` record at the
+    write head.
+
+    At production geometry (``t_det=192``, ``n_fdm=34``, ``n_grid=256``,
+    fp16) one cube ≈ 3.2 GiB; ``depth=8`` is ~26 GiB per gpu_half =
+    ~52 GiB per search node (well inside the 256 GiB budget). The
+    depth is a YAML knob (``c1.cube_ring_depth``) so the operator can
+    throttle down to ``depth=2`` for tight memory during shake-down.
+
+    Args:
+        depth: ring size. ``>= 1``.
+        t_det, n_fdm, n_grid: pin geometry. ``stage_cube`` raises if
+            a new cube's shape doesn't match.
+        pinned: when True, allocate the host buffers with
+            ``torch.empty(..., pin_memory=True)`` and wrap as
+            ``np.ndarray`` for the cross-thread interface. Tests pass
+            ``pinned=False`` to skip the pin (no CUDA on CI hosts).
+    """
+
+    def __init__(
+        self,
+        *,
+        depth: int,
+        t_det: int,
+        n_fdm: int,
+        n_grid: int,
+        pinned: bool = True,
+    ) -> None:
+        if depth < 1:
+            raise ValueError(f"depth={depth}, expected ≥ 1")
+        if t_det <= 0 or n_fdm <= 0 or n_grid <= 0:
+            raise ValueError(
+                f"t_det={t_det}, n_fdm={n_fdm}, n_grid={n_grid} all expected > 0"
+            )
+        self._depth = int(depth)
+        self._t_det = int(t_det)
+        self._n_fdm = int(n_fdm)
+        self._n_grid = int(n_grid)
+        self._pinned = bool(pinned)
+        self._buffers: List[Optional[np.ndarray]] = [None] * self._depth
+        self._records: List[Optional[RetainedCube]] = [None] * self._depth
+        self._write_pos: int = 0
+        self._n_committed: int = 0
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    @property
+    def n_committed(self) -> int:
+        """Number of cubes ever committed (monotonic; not the live
+        count, which is ``min(n_committed, depth)``)."""
+        return self._n_committed
+
+    @property
+    def write_pos(self) -> int:
+        return self._write_pos
+
+    @property
+    def t_det(self) -> int:
+        return self._t_det
+
+    @property
+    def n_fdm(self) -> int:
+        return self._n_fdm
+
+    @property
+    def n_grid(self) -> int:
+        return self._n_grid
+
+    def _ensure_buffer(self, idx: int) -> np.ndarray:
+        """Lazy-allocate the pinned host buffer at ring slot ``idx``."""
+        buf = self._buffers[idx]
+        shape = (self._t_det, self._n_fdm, self._n_grid, self._n_grid)
+        if buf is None or buf.shape != shape or buf.dtype != np.float16:
+            if self._pinned:
+                # Pin via torch so the GPU-side ``cudaMemcpyAsync`` can
+                # run on a side stream; expose the ndarray view to the
+                # listener / writer threads. We don't import torch at
+                # module-time here (already imported above for the
+                # detector glue), but we keep the allocation behind a
+                # try/except so CPU-only CI hosts still build the ring.
+                try:
+                    t = torch.empty(shape, dtype=torch.float16, pin_memory=True)
+                    buf = t.numpy()
+                except (RuntimeError, AssertionError):
+                    buf = np.empty(shape, dtype=np.float16)
+            else:
+                buf = np.empty(shape, dtype=np.float16)
+            self._buffers[idx] = buf
+        return buf
+
+    def stage_cube(
+        self,
+        *,
+        cube_id: int,
+        event_specnum_start: int,
+        mjd_start: float,
+        sample_period_specnum: int,
+        sample_period_us: float,
+        cube_tensor: Any,
+    ) -> RetainedCube:
+        """Copy ``cube_tensor`` into the next ring slot and commit a
+        :class:`RetainedCube` record. ``cube_tensor`` may be a
+        ``np.ndarray`` (CPU path / tests) or a torch tensor (GPU path);
+        in either case the destination buffer is pinned-host fp16. The
+        copy is synchronous from the caller's perspective — the
+        production path issues it from the cube driver after the
+        detector returns, so it does NOT block the GPU pipeline (the
+        detector's fwd has already completed before we touch the ring).
+
+        Returns:
+            The freshly committed :class:`RetainedCube`.
+        """
+        if cube_id < 0:
+            raise ValueError(f"cube_id={cube_id}, expected ≥ 0")
+        idx = self._write_pos
+        dest = self._ensure_buffer(idx)
+        # Coerce src to a fp16 ndarray of the expected shape. The
+        # production path expects the cube tensor to already be in
+        # fp16 on the GPU, so this is a simple ``.cpu().numpy()``
+        # round-trip. Tests pass np arrays directly.
+        if isinstance(cube_tensor, np.ndarray):
+            src = cube_tensor
+            if src.dtype != np.float16:
+                src = src.astype(np.float16, copy=False)
+        elif (
+            hasattr(cube_tensor, "detach")
+            and hasattr(cube_tensor, "cpu")
+            and hasattr(cube_tensor, "numpy")
+        ):
+            src_t = cube_tensor.detach().to(torch.float16)
+            src = src_t.cpu().numpy()
+        else:
+            raise TypeError(
+                f"cube_tensor must be np.ndarray or torch tensor; got "
+                f"{type(cube_tensor).__name__}"
+            )
+        if src.shape != dest.shape:
+            raise ValueError(
+                f"cube_tensor.shape={src.shape} != ring geometry {dest.shape}"
+            )
+        np.copyto(dest, src, casting="same_kind")
+        record = RetainedCube(
+            cube_id=int(cube_id),
+            event_specnum_start=int(event_specnum_start),
+            mjd_start=float(mjd_start),
+            t_det=int(self._t_det),
+            n_fdm=int(self._n_fdm),
+            n_grid=int(self._n_grid),
+            sample_period_specnum=int(sample_period_specnum),
+            sample_period_us=float(sample_period_us),
+            pinned_host_tensor=dest,
+        )
+        self._records[idx] = record
+        self._write_pos = (idx + 1) % self._depth
+        self._n_committed += 1
+        return record
+
+    def iter_newest_first(self):
+        """Iterator over live ``RetainedCube`` records from newest →
+        oldest. Skips empty slots (first ``min(depth, n_committed)``
+        bumps fill the ring)."""
+        n_live = min(self._depth, self._n_committed)
+        for k in range(n_live):
+            idx = (self._write_pos - 1 - k) % self._depth
+            rec = self._records[idx]
+            if rec is not None:
+                yield rec
+
+    def iter_oldest_first(self):
+        """Iterator over live ``RetainedCube`` records from oldest →
+        newest. Useful for diagnostics."""
+        n_live = min(self._depth, self._n_committed)
+        start = (self._write_pos - n_live) % self._depth
+        for k in range(n_live):
+            idx = (start + k) % self._depth
+            rec = self._records[idx]
+            if rec is not None:
+                yield rec
+
+    def snapshot(self) -> List[RetainedCube]:
+        """Live snapshot of retained cubes, newest first. Convenience
+        wrapper around :meth:`iter_newest_first`."""
+        return list(self.iter_newest_first())
 
 
 # ---------------------------------------------------------------------------
