@@ -491,9 +491,17 @@ class CubeDumpWriter:
         reason as the np.savez call, but its cost is tied to torch
         sync rather than disk IO and would muddy the operator-facing
         writer-time metric.
+
+        M7.4: when ``manifest.npz_path`` points at an absolute
+        location (e.g. the C2 trigger listener routed the dump into a
+        per-event subdir), honour it directly instead of using the
+        writer's canonical ``${dump_root}/cube_s..npz`` template. The
+        M6 legacy ``auto`` / ``udp`` paths still leave ``npz_path``
+        informational (matches the writer's canonical layout) so this
+        is a strict superset of the historical behaviour.
         """
         cube_np = _coerce_cube_to_float16_ndarray(cube)
-        path = self._compose_path(manifest)
+        path = self._resolve_path(manifest)
         cluster_record_json = _cluster_record_to_json(manifest.cluster_record)
         t_savez_start = time.perf_counter()
         np.savez(
@@ -526,6 +534,54 @@ class CubeDumpWriter:
         return self._config.dump_root / (
             f"cube_s{sid}_g{g}_{manifest.event_specnum_start}.npz"
         )
+
+    def _resolve_path(self, manifest: CubeDumpManifest) -> Path:
+        """Resolve the on-disk path for ``manifest``.
+
+        Default behaviour (M6): ignore ``manifest.npz_path`` entirely
+        — the writer composes ``${dump_root}/cube_s${sid}_g${g}_${ev}.npz``
+        from its own config. The manifest's ``npz_path`` is a mirror of
+        that canonical layout, intentionally informational so legacy
+        dispatch callers don't have to know the writer's dump_root.
+
+        M7.4 C2 trigger extension: when ``manifest.npz_path`` points at
+        a *subdirectory* of the writer's ``dump_root`` (i.e. the C2
+        trigger listener routed the dump into
+        ``${dump_root}/<event_name>/cube_s..._g..._N.npz``), honour the
+        override and auto-create the per-event subdir. Anything outside
+        the writer's dump_root is treated as a stale informational
+        placeholder and ignored — preserves the M6 contract for the
+        existing dispatch callers + their tests.
+        """
+        canonical = self._compose_path(manifest)
+        if not manifest.npz_path:
+            return canonical
+        candidate = Path(manifest.npz_path)
+        dump_root = Path(self._config.dump_root).resolve()
+        try:
+            resolved_parent = candidate.resolve().parent
+        except (OSError, RuntimeError):
+            return canonical
+        # Only honour the override when its parent is a *strict* subdir
+        # of dump_root (depth ≥ 1 under dump_root). Same-parent equality
+        # falls back to canonical so the M6 legacy callers see the
+        # historical filename.
+        try:
+            rel = resolved_parent.relative_to(dump_root)
+        except ValueError:
+            return canonical
+        if rel == Path("."):
+            return canonical
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.warning(
+                "cube_dump: failed to create event dir %s: %r; "
+                "falling back to canonical path %s",
+                candidate.parent, exc, canonical,
+            )
+            return canonical
+        return candidate
 
 
 # ---------------------------------------------------------------------------

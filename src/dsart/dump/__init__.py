@@ -19,6 +19,7 @@ for the data contracts.
 
 from __future__ import annotations
 
+from .c2_trigger_listener import C2TriggerListener, C2TriggerListenerConfig
 from .cube_dump import (
     BrightPulsePredicate,
     BrightPulsePredicateConfig,
@@ -32,6 +33,8 @@ __all__ = [
     "BrightPulsePredicateConfig",
     "CubeDumpWriter",
     "CubeDumpWriterConfig",
+    "C2TriggerListener",
+    "C2TriggerListenerConfig",
     "UdpTriggerListener",
     "UdpTriggerListenerConfig",
 ]
