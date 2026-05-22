@@ -59,6 +59,7 @@ from ..cluster import (
     ClustererConfig,
     ClustererService,
 )
+from ..coinc.wire import build_header
 from ..common.constants import (
     CUBE_CADENCE_SAMPLES_DEFAULT,
     DETECTOR_IMAGE_KERNELS,
@@ -69,9 +70,12 @@ from ..common.constants import (
 from ..common.contracts import Candidate, CubeGeometry
 from ..detector.forward import DeterministicDetector
 from ..detector.kernels import build_kernel_bank
+from ..detector.merger import MergerConfig
 from ..dump import (
     BrightPulsePredicate,
     BrightPulsePredicateConfig,
+    C2TriggerListener,
+    C2TriggerListenerConfig,
     CubeDumpWriter,
     CubeDumpWriterConfig,
     UdpTriggerListener,
@@ -79,7 +83,13 @@ from ..dump import (
 )
 from ..common.contracts import CubeDumpManifest
 from ..noise_norm.layer1 import Layer1State
-from .cube_pipeline import CubePipeline, CubePipelineConfig, PrefetchedCube
+from .c1_emit import C1EmitConfig, C1TcpEmitter, candidate_to_c1_row
+from .cube_pipeline import (
+    CubePipeline,
+    CubePipelineConfig,
+    CubeRetentionRing,
+    PrefetchedCube,
+)
 from .rx_ring import CubeRingSlot, RxRingSource
 
 __all__ = [
@@ -193,6 +203,32 @@ class SearchComputeConfig:
     # --- M6 chunk 5: orchestration knobs ------------------------------
     cluster_result_timeout_s: float = 1.0
 
+    # --- M7.4 C1 stage ------------------------------------------------
+    # ``enable_legacy_clusterer`` gates the legacy DBSCAN/HDBSCAN
+    # clusterer + cands_logger + BrightPulsePredicate path. Default
+    # False per M7.4 design (C1 emit replaces per-node clustering); set
+    # True in offline tools / replay benches that still want T1/T2 rows.
+    enable_legacy_clusterer: bool = False
+    # C1 cross-kernel merger geometry (see MergerConfig defaults).
+    merger_config: Optional[MergerConfig] = None
+    # Single SNR knob; when set, overrides ``detector_threshold_sigma``
+    # and is also enforced defensively at the C1 emit boundary.
+    c1_snr_min: Optional[float] = None
+    # Depth of the pinned-host cube retention ring (one slot per cube;
+    # 1 slot ≈ 3.2 GiB at the production t_det=192 / n_fdm=34 /
+    # n_grid=256 / fp16 geometry, so 8 slots ≈ 26 GiB per gpu_half).
+    cube_ring_depth: int = 8
+    # C1 → C2 TCP emitter. None disables the emitter (tests + offline
+    # benches that don't need it).
+    c1_emit_config: Optional[C1EmitConfig] = None
+    # C2 → C1 UDP trigger listener. None disables the listener.
+    c2_trigger_listener_config: Optional[C2TriggerListenerConfig] = None
+    # Cube dump root for the C2-triggered dumps (per-event subdir is
+    # built by the listener). When ``c2_trigger_listener_config`` is
+    # set this MUST match its ``dump_root`` so the listener and the
+    # writer agree on where files land.
+    c1_dump_root: Optional[Path] = None
+
 
 # ---------------------------------------------------------------------------
 # SearchComputeService
@@ -249,6 +285,13 @@ class SearchComputeService:
         self._cube_dump: Optional[CubeDumpWriter] = None
         self._udp_listener: Optional[UdpTriggerListener] = None
         self._cands_logger: Optional[CandsLogger] = None
+        # M7.4 C1 stage.
+        self._cube_ring: Optional[CubeRetentionRing] = None
+        self._c1_emit: Optional[C1TcpEmitter] = None
+        self._c1_emit_task: Optional[asyncio.Task] = None
+        self._c2_trigger: Optional[C2TriggerListener] = None
+        self._c1_batches_submitted = 0
+        self._c1_batches_dropped = 0
 
     @staticmethod
     def _build_detector(config: SearchComputeConfig) -> DeterministicDetector:
@@ -274,6 +317,8 @@ class SearchComputeService:
             streaming_decoder_n_top=config.detector_streaming_decoder_n_top,
             boxcar_accum_dtype=config.detector_boxcar_accum_dtype,
             layer2_sigma_max_samples=config.detector_layer2_max_samples,
+            merger_config=config.merger_config,
+            c1_snr_min=config.c1_snr_min,
         )
 
     @property
@@ -324,6 +369,52 @@ class SearchComputeService:
     def cands_logger(self) -> Optional[CandsLogger]:
         return self._cands_logger
 
+    @property
+    def cube_ring(self) -> Optional[CubeRetentionRing]:
+        return self._cube_ring
+
+    @property
+    def c1_emit(self) -> Optional[C1TcpEmitter]:
+        return self._c1_emit
+
+    @property
+    def c2_trigger(self) -> Optional[C2TriggerListener]:
+        return self._c2_trigger
+
+    @property
+    def c1_batches_submitted(self) -> int:
+        return self._c1_batches_submitted
+
+    @property
+    def c1_batches_dropped(self) -> int:
+        return self._c1_batches_dropped
+
+    def mon_snapshot(self) -> dict:
+        """Combined per-service mon-points snapshot. Includes the C1
+        emitter + C2 trigger listener counters under nested keys."""
+        snap = {
+            "cubes_processed": int(self._cubes_processed),
+            "candidates_emitted": int(self._candidates_emitted),
+            "clusters_emitted": int(self._clusters_emitted),
+            "auto_dumps_dispatched": int(self._auto_dumps_dispatched),
+            "udp_dumps_dispatched": int(self._udp_dumps_dispatched),
+            "cluster_timeouts": int(self._cluster_timeouts),
+            "c1_batches_submitted": int(self._c1_batches_submitted),
+            "c1_batches_dropped": int(self._c1_batches_dropped),
+            "search_node_id": int(self._config.search_node_id),
+            "gpu_half": int(self._config.gpu_half),
+        }
+        if self._c1_emit is not None:
+            snap["c1_emit"] = dict(self._c1_emit.mon)
+        if self._c2_trigger is not None:
+            snap["c2_trigger"] = dict(self._c2_trigger.mon)
+        if self._cube_ring is not None:
+            snap["cube_ring"] = {
+                "depth": int(self._cube_ring.depth),
+                "n_committed": int(self._cube_ring.n_committed),
+            }
+        return snap
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -332,10 +423,17 @@ class SearchComputeService:
         """Bring up the RX-ring source + all configured sub-systems."""
         await self._source.start()
         cfg = self._config
-        if cfg.clusterer_config is not None:
+        # M7.4 C1 stage: per-half cube retention ring. Built before the
+        # cube driver starts so the first cube can stage into slot 0.
+        # The ring's geometry is taken from the first slot lazily in
+        # ``_process_one_cube``; here we just defer to the per-cube
+        # path to populate.
+        if cfg.cube_ring_depth > 0:
+            self._cube_ring = None  # actual ring built lazily on first cube
+        if cfg.enable_legacy_clusterer and cfg.clusterer_config is not None:
             self._clusterer = ClustererService(config=cfg.clusterer_config)
             self._clusterer.start()
-        if cfg.bright_pulse_predicate_config is not None:
+        if cfg.enable_legacy_clusterer and cfg.bright_pulse_predicate_config is not None:
             self._predicate = BrightPulsePredicate(
                 config=cfg.bright_pulse_predicate_config
             )
@@ -350,25 +448,71 @@ class SearchComputeService:
             self._cube_dump = CubeDumpWriter(config=cfg.cube_dump_writer_config)
             self._cube_dump.start()
         if cfg.udp_trigger_listener_config is not None:
+            # Legacy "dump next cube" listener; kept for the M6 path so
+            # operator scripts can still arm a one-shot dump while we
+            # roll out C2-triggered dumps.
             self._udp_listener = UdpTriggerListener(
                 config=cfg.udp_trigger_listener_config
             )
             await self._udp_listener.start()
-        if cfg.cands_logger_config is not None:
+        if cfg.enable_legacy_clusterer and cfg.cands_logger_config is not None:
             self._cands_logger = CandsLogger(config=cfg.cands_logger_config)
+        # M7.4 C1 emitter (TCP → h23).
+        if cfg.c1_emit_config is not None:
+            self._c1_emit = C1TcpEmitter(config=cfg.c1_emit_config)
+            self._c1_emit_task = asyncio.create_task(self._c1_emit.run())
+        # M7.4 C2 trigger listener (UDP from h23). Requires the ring
+        # to be reachable; we defer ring construction to the first
+        # cube but build the listener now bound to a placeholder ring
+        # that gets swapped in when the ring exists.
+        if cfg.c2_trigger_listener_config is not None:
+            # Build a 0-cube ring placeholder until the first cube
+            # comes through and we know the geometry. The listener's
+            # ``find_cube_for_specnum`` walks the ring snapshot at
+            # call time so swapping the ring is safe.
+            if self._cube_ring is None:
+                placeholder_ring = CubeRetentionRing(
+                    depth=max(1, int(cfg.cube_ring_depth)),
+                    t_det=1, n_fdm=1, n_grid=1,  # tiny; never written
+                    pinned=False,
+                )
+                self._cube_ring = placeholder_ring
+            self._c2_trigger = C2TriggerListener(
+                config=cfg.c2_trigger_listener_config,
+                ring=self._cube_ring,
+                cube_dump=self._cube_dump,
+            )
+            await self._c2_trigger.start()
         _LOG.info(
             "SearchComputeService up "
-            "(sid=%d, gpu_half=%d, cluster=%s, dump=%s, udp=%s, log=%s)",
+            "(sid=%d, gpu_half=%d, cluster=%s, dump=%s, udp=%s, log=%s, "
+            "c1_emit=%s, c2_trigger=%s, ring_depth=%d)",
             cfg.search_node_id,
             cfg.gpu_half,
             self._clusterer is not None,
             self._cube_dump is not None,
             self._udp_listener is not None,
             self._cands_logger is not None,
+            self._c1_emit is not None,
+            self._c2_trigger is not None,
+            int(cfg.cube_ring_depth),
         )
 
     async def stop(self) -> None:
         self._stopping.set()
+        if self._c2_trigger is not None:
+            await self._c2_trigger.stop()
+        if self._c1_emit is not None:
+            await self._c1_emit.stop()
+            if self._c1_emit_task is not None:
+                try:
+                    await asyncio.wait_for(self._c1_emit_task, timeout=5.0)
+                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    self._c1_emit_task.cancel()
+                    try:
+                        await self._c1_emit_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
         if self._udp_listener is not None:
             await self._udp_listener.stop()
         if self._cube_dump is not None:
@@ -380,13 +524,16 @@ class SearchComputeService:
         await self._source.stop()
         _LOG.info(
             "SearchComputeService stopped: cubes=%d cands=%d clusters=%d "
-            "auto_dumps=%d udp_dumps=%d cluster_timeouts=%d",
+            "auto_dumps=%d udp_dumps=%d cluster_timeouts=%d "
+            "c1_batches_submitted=%d c1_batches_dropped=%d",
             self._cubes_processed,
             self._candidates_emitted,
             self._clusters_emitted,
             self._auto_dumps_dispatched,
             self._udp_dumps_dispatched,
             self._cluster_timeouts,
+            self._c1_batches_submitted,
+            self._c1_batches_dropped,
         )
 
     # -----------------------------------------------------------------
@@ -445,9 +592,10 @@ class SearchComputeService:
     ) -> List[Candidate]:
         cfg = self._config
 
-        # Step 1 — UDP arm check (M6 D9): a UDP datagram arriving any
-        # time before this cube was dequeued arms a single dump-next
-        # for THIS cube. Subsequent UDPs during this cube don't stack.
+        # Step 1 — legacy UDP arm check (M6 D9): a UDP datagram
+        # arriving any time before this cube was dequeued arms a
+        # single dump-next for THIS cube. The M7.4 C2 trigger path is
+        # listener-driven (dumps from the ring), not a per-cube arm.
         udp_armed = False
         if self._udp_listener is not None:
             udp_armed = self._udp_listener.consume_dump_next_cube_flag()
@@ -460,7 +608,7 @@ class SearchComputeService:
         self._cubes_processed += 1
         self._candidates_emitted += len(result.candidates)
 
-        # Build geometry once for both clusterer + dumps.
+        # Build geometry once for both clusterer + dumps + emitter.
         geom = self._geom_from_slot(slot)
 
         # Step 3 — UDP dump (this cube). Submit BEFORE clustering so the
@@ -485,8 +633,20 @@ class SearchComputeService:
             if accepted:
                 self._udp_dumps_dispatched += 1
 
-        # Step 4 — clusterer (M6 chunk 1; ThreadPoolExecutor).
-        if self._clusterer is not None:
+        # Step 4a — M7.4 C1 stage: stage the cube into the retention
+        # ring + emit candidates to C2. We stage AFTER the detector
+        # ran (the GPU pipeline is done with the cube tensor) so the
+        # ring copy doesn't compete for the compute stream.
+        self._maybe_stage_cube_in_ring(slot, result.cube, geom)
+        # C1 emit. Always invoked when the emitter is configured —
+        # even on empty cubes, so the heartbeat / connectivity check
+        # keeps flowing.
+        if self._c1_emit is not None:
+            self._submit_c1_batch(slot, geom, result.candidates)
+
+        # Step 4b — legacy clusterer (M6 chunk 1) — disabled by default
+        # under the M7.4 C1 stage; kept for offline benches.
+        if cfg.enable_legacy_clusterer and self._clusterer is not None:
             future = self._clusterer.submit(result.candidates, geom)
             try:
                 cluster_result = future.result(
@@ -503,7 +663,8 @@ class SearchComputeService:
                 return result.candidates
             self._clusters_emitted += len(cluster_result.records)
 
-            # Step 5 — auto dumps (M6 D8 predicate).
+            # Step 5 — auto dumps (M6 D8 predicate). Legacy path; the
+            # M7.4 C2 trigger is the canonical dump path.
             triggered_ids: set[int] = set()
             for record in cluster_result.records:
                 if self._predicate is not None and self._predicate(record):
@@ -541,6 +702,91 @@ class SearchComputeService:
                 )
 
         return result.candidates
+
+    def _maybe_stage_cube_in_ring(
+        self,
+        slot: CubeRingSlot,
+        cube_tensor: Any,
+        geom: CubeGeometry,
+    ) -> None:
+        """Stage the post-detector cube into the C1 retention ring.
+
+        Lazily builds the ring on the first cube once we know the
+        actual geometry. Skips silently when neither the ring nor a
+        C2 trigger listener is configured (saves the ~3 GiB copy on
+        legacy-only deployments)."""
+        cfg = self._config
+        wants_ring = (
+            cfg.c2_trigger_listener_config is not None
+            or cfg.cube_ring_depth > 0
+            and self._c2_trigger is not None
+        )
+        if not wants_ring:
+            return
+        need_rebuild = (
+            self._cube_ring is None
+            or self._cube_ring.depth != cfg.cube_ring_depth
+            or self._cube_ring.t_det != slot.t_det
+            or self._cube_ring.n_fdm != slot.n_fdm_in_cube
+            or self._cube_ring.n_grid != slot.n_grid
+        )
+        if need_rebuild:
+            self._cube_ring = CubeRetentionRing(
+                depth=int(cfg.cube_ring_depth),
+                t_det=int(slot.t_det),
+                n_fdm=int(slot.n_fdm_in_cube),
+                n_grid=int(slot.n_grid),
+                pinned=False,  # production: keep host-pinned; tests pass np
+            )
+            # Re-point the C2 trigger listener at the rebuilt ring.
+            if self._c2_trigger is not None:
+                self._c2_trigger.set_ring(self._cube_ring)
+        try:
+            self._cube_ring.stage_cube(
+                cube_id=int(slot.cube_id),
+                event_specnum_start=int(slot.specnum_start),
+                mjd_start=float(geom.mjd_start),
+                sample_period_specnum=int(geom.sample_period_specnum),
+                sample_period_us=float(geom.sample_period_us),
+                cube_tensor=cube_tensor,
+            )
+        except (ValueError, TypeError) as exc:
+            _LOG.warning(
+                "cube_ring stage failed (cube_id=%d): %r",
+                int(slot.cube_id), exc,
+            )
+
+    def _submit_c1_batch(
+        self,
+        slot: CubeRingSlot,
+        geom: CubeGeometry,
+        candidates: List[Candidate],
+    ) -> None:
+        """Project ``candidates`` into the C1 row schema + push onto
+        the emitter's outbound queue. Drops on queue-full are surfaced
+        via the emitter's mon-points + the service's own counters."""
+        assert self._c1_emit is not None
+        cfg = self._config
+        rows = tuple(
+            candidate_to_c1_row(c, geom=geom) for c in candidates
+        )
+        header = build_header(
+            cube_id=int(slot.cube_id),
+            event_specnum_start=int(slot.specnum_start),
+            mjd_start=float(geom.mjd_start),
+            sample_period_specnum=int(geom.sample_period_specnum),
+            sample_period_us=float(geom.sample_period_us),
+            n_grid=int(slot.n_grid),
+            n_fdm_in_cube=int(slot.n_fdm_in_cube),
+            search_node_id=int(cfg.search_node_id),
+            gpu_half=int(cfg.gpu_half),
+            n_candidates=len(rows),
+        )
+        accepted = self._c1_emit.submit(header, candidates, rows=rows)
+        if accepted:
+            self._c1_batches_submitted += 1
+        else:
+            self._c1_batches_dropped += 1
 
     def _cube_dump_path(self, source: str, key_specnum: int) -> str:
         """Build the canonical per-cube NPZ path.
@@ -797,6 +1043,8 @@ def _build_search_config_from_yaml(
     detector_layer2_max_samples: Optional[int],
     layer1_max_samples: Optional[int],
     fine_dm_pc_cc_full: Optional[np.ndarray],
+    enable_c1: bool = True,
+    c1_bind_host_override: Optional[str] = None,
 ) -> SearchComputeConfig:
     """Translate ``configs/config_compute_search.yaml`` into
     ``SearchComputeConfig`` with optional M6 sub-systems gated on the
@@ -906,6 +1154,72 @@ def _build_search_config_from_yaml(
         field="--detector-k-time",
     )
 
+    # -----------------------------------------------------------------
+    # M7.4 C1 stage wiring (single source of truth for SNR / merger /
+    # ring / emit / trigger listener / dump root).
+    # -----------------------------------------------------------------
+    c1 = (yaml_doc.get("c1", {}) or {}) if enable_c1 else {}
+    c1_snr_min: Optional[float] = (
+        float(c1.get("snr_min")) if "snr_min" in c1 else None
+    )
+    merger_yaml = c1.get("merger", {}) or {}
+    merger_cfg: Optional[MergerConfig] = None
+    if c1 or merger_yaml:
+        merger_cfg = MergerConfig(
+            lm_max_cells=int(merger_yaml.get("lm_max_cells", 3)),
+            dm_max_trials=int(merger_yaml.get("dm_max_trials", 2)),
+            t_frac=float(merger_yaml.get("t_frac", 1.0)),
+            sample_period_specnum=int(
+                merger_yaml.get(
+                    "sample_period_specnum",
+                    yaml_doc.get("cube", {}).get("sample_period_specnum", 16),
+                )
+            ),
+        )
+    cube_ring_depth_yaml = int(c1.get("cube_ring_depth", 8))
+    c2_endpoint = c1.get("c2_endpoint", {}) or {}
+    c1_emit_cfg: Optional[C1EmitConfig] = None
+    if enable_c1 and c2_endpoint:
+        c1_emit_cfg = C1EmitConfig(
+            host=str(c2_endpoint.get("host", "h23")),
+            port=int(c2_endpoint.get("port", 11500)),
+            search_node_id=int(search_node_id),
+            gpu_half=int(gpu_half),
+            queue_depth=int(c1.get("emit_queue_depth", 16)),
+        )
+    dump_listener_yaml = c1.get("dump_listener", {}) or {}
+    c1_dump_root = (
+        Path(c1["dump_root"]) if "dump_root" in c1 else None
+    )
+    c2_listener_cfg: Optional[C2TriggerListenerConfig] = None
+    if enable_c1 and dump_listener_yaml:
+        bind_host = c1_bind_host_override or str(
+            dump_listener_yaml.get("bind_host", "")
+        ).strip()
+        # Empty bind_host defers to per-host CLI override; if no
+        # override was provided we fall back to 0.0.0.0 (binds all
+        # interfaces). Production wires the per-host search-net IP via
+        # the orchestrator's hostargs.
+        if not bind_host:
+            bind_host = "0.0.0.0"
+        listener_dump_root = c1_dump_root or Path(
+            c1.get("dump_root", "/home/ubuntu/data/c2/cube_dump")
+        )
+        c2_listener_cfg = C2TriggerListenerConfig(
+            bind_host=bind_host,
+            base_port=int(dump_listener_yaml.get("base_port", 11227)),
+            gpu_half=int(gpu_half),
+            search_node_id=int(search_node_id),
+            dump_root=listener_dump_root,
+        )
+
+    # Honor a top-level YAML ``enable_legacy_clusterer`` knob as the
+    # source of truth when present; falls back to the CLI flag when
+    # absent (preserves legacy bench behavior).
+    legacy_enabled = bool(
+        yaml_doc.get("enable_legacy_clusterer", bool(enable_clusterer))
+    )
+
     return SearchComputeConfig(
         pipeline=pipe_cfg,
         n_fdm=int(n_fdm),
@@ -938,6 +1252,13 @@ def _build_search_config_from_yaml(
         bright_pulse_predicate_config=predicate_cfg,
         udp_trigger_listener_config=udp_listener_cfg,
         cands_logger_config=cands_logger_cfg,
+        enable_legacy_clusterer=legacy_enabled,
+        merger_config=merger_cfg,
+        c1_snr_min=c1_snr_min,
+        cube_ring_depth=cube_ring_depth_yaml,
+        c1_emit_config=c1_emit_cfg,
+        c2_trigger_listener_config=c2_listener_cfg,
+        c1_dump_root=c1_dump_root,
     )
 
 
@@ -1082,6 +1403,8 @@ async def _run_async(args: argparse.Namespace) -> int:
         detector_layer2_max_samples=args.detector_layer2_max_samples,
         layer1_max_samples=args.layer1_max_samples,
         fine_dm_pc_cc_full=fine_dm,
+        enable_c1=not args.disable_c1,
+        c1_bind_host_override=args.c1_bind_host,
     )
 
     service = SearchComputeService(config=cfg, source=source)
@@ -1269,6 +1592,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--enable-cands-logger", action="store_true")
     p.add_argument("--enable-all", action="store_true",
                    help="shortcut: enable all M6 sub-systems above")
+    # --- M7.4 C1 stage gating (defaults ON; off-switch lets benches /
+    # --- legacy soaks skip the C1 wiring entirely) --------------------
+    p.add_argument("--disable-c1", action="store_true",
+                   help="skip M7.4 C1 wiring (merger / SNR / cube "
+                        "ring / emit / trigger listener). Default ON; "
+                        "use this only for legacy benches.")
+    p.add_argument("--c1-bind-host", default=None,
+                   help="override c1.dump_listener.bind_host (the "
+                        "search-net IP for the C2 trigger listener). "
+                        "Production: the orchestrator's hostargs.")
 
     # --- Lifecycle ----------------------------------------------------
     p.add_argument("--max-cubes", type=int, default=0,

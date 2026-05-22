@@ -183,13 +183,22 @@ routines:
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
+      --config-yaml /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+      --enable-cube-dump
     hostargs:
-      lxd110h02: --coarse-dm-owners-half-0 2
-      lxd110h09: --coarse-dm-owners-half-0 4
-      lxd110h13: --coarse-dm-owners-half-0 6
-      n02: --coarse-dm-owners-half-0 2
-      n09: --coarse-dm-owners-half-0 4
-      n13: --coarse-dm-owners-half-0 6
+      # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
+      # per-host C1 trigger-listener bind addresses (M7.4). The
+      # ``--c1-bind-host`` arg is appended via argparse "last wins" so
+      # the per-host IPv4 takes precedence over the empty default in
+      # ``c1.dump_listener.bind_host`` below.
+      lxd110h01: --c1-bind-host 10.41.0.205
+      lxd110h02: --coarse-dm-owners-half-0 2 --c1-bind-host 10.41.0.222
+      lxd110h09: --coarse-dm-owners-half-0 4 --c1-bind-host 10.41.0.253
+      lxd110h13: --coarse-dm-owners-half-0 6 --c1-bind-host 10.41.0.238
+      n01: --c1-bind-host 10.41.0.205
+      n02: --coarse-dm-owners-half-0 2 --c1-bind-host 10.41.0.222
+      n09: --coarse-dm-owners-half-0 4 --c1-bind-host 10.41.0.253
+      n13: --coarse-dm-owners-half-0 6 --c1-bind-host 10.41.0.238
     env:
       # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
       # always pass --device cuda:0 (the post-mask logical device).
@@ -238,15 +247,109 @@ routines:
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
+      --config-yaml /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+      --enable-cube-dump
     hostargs:
-      lxd110h02: --coarse-dm-owners-half-1 3
-      lxd110h09: --coarse-dm-owners-half-1 5
-      lxd110h13: --coarse-dm-owners-half-1 7
-      n02: --coarse-dm-owners-half-1 3
-      n09: --coarse-dm-owners-half-1 5
-      n13: --coarse-dm-owners-half-1 7
+      lxd110h01: --c1-bind-host 10.41.0.205
+      lxd110h02: --coarse-dm-owners-half-1 3 --c1-bind-host 10.41.0.222
+      lxd110h09: --coarse-dm-owners-half-1 5 --c1-bind-host 10.41.0.253
+      lxd110h13: --coarse-dm-owners-half-1 7 --c1-bind-host 10.41.0.238
+      n01: --c1-bind-host 10.41.0.205
+      n02: --coarse-dm-owners-half-1 3 --c1-bind-host 10.41.0.222
+      n09: --coarse-dm-owners-half-1 5 --c1-bind-host 10.41.0.253
+      n13: --coarse-dm-owners-half-1 7 --c1-bind-host 10.41.0.238
     env:
       # half 1 → physical GPU 1 (logical cuda:0 inside this process).
       CUDA_VISIBLE_DEVICES: "1"
       # M7.2-amend (2026-05-20): see search_compute_0 for rationale.
       DSART_ENABLE_GPU_BUF_REUSE: "1"
+
+# ---------------------------------------------------------------------------
+# M7.4 C1 stage config (locked schema; see docs/c1c2/C1C2_WIRE_SCHEMA.md §3
+# for the source-of-truth schema). Search-compute processes read this block
+# via the ``--config-yaml`` flag wired into each ``search_compute_{0,1}``
+# routine above. Bump this file's ``schema_version`` if you change the c1
+# block in a way that breaks the loader.
+#
+# Memory cost of the cube ring (per gpu_half):
+#   per cube ≈ t_det * n_fdm * n_grid * n_grid * 2 bytes (fp16)
+#           = 192 * 34 * 256 * 256 * 2 = ~3.2 GiB at the production
+#             op-point. ``cube_ring_depth: 8`` → ~26 GiB per half →
+#             ~52 GiB per search node (well inside the 256 GiB host
+#             budget). Drop to 2 during shake-down if pinned memory
+#             is constrained.
+# ---------------------------------------------------------------------------
+c1:
+  snr_min: 9.0                       # detector NMS threshold AND emit floor
+  cube_ring_depth: 8                 # CPU-side cube tensors retained per half
+  merger:
+    lm_max_cells: 3                  # OR-mode half-window on (l, m) cells
+    dm_max_trials: 2                 # half-window on fine-DM index
+    t_frac: 1.0                      # |Δt| ≤ t_frac * 0.5 * (w_i + w_j) samples
+    sample_period_specnum: 16        # spec-nums per detector sample
+  c2_endpoint:
+    host: lxd110h23                  # h23 == lxd110h23 in the lab
+    port: 11500
+  emit_queue_depth: 16
+  dump_listener:
+    bind_host: ""                    # filled per-host via --c1-bind-host above
+    base_port: 11227                 # actual port = base_port + gpu_half
+  dump_root: /home/ubuntu/data/c2/cube_dump
+  uploader:
+    remote_root: ubuntu@lxd110h23:/dataz/dsa110/candidates
+    bandwidth_limit_kbps: 0          # 0 = unlimited
+
+# Cube geometry knobs shared with the merger block. The merger reads
+# ``cube.sample_period_specnum`` as the default for
+# ``merger.sample_period_specnum`` when the latter is omitted.
+cube:
+  sample_period_specnum: 16
+
+# Legacy clusterer / cands_logger gating. M7.4 production runs with C1
+# emit replacing per-node clustering — leave this False unless an offline
+# tool wants T1/T2 ASCII rows from a replay bench.
+enable_legacy_clusterer: false
+
+# ---------------------------------------------------------------------------
+# M7.4 C2 (h23 coincidencer) config (locked schema; see
+# docs/c1c2/C1C2_WIRE_SCHEMA.md §3 for the source-of-truth schema and
+# docs/c1c2/C1C2_DESIGN.md §3 for the runtime semantics). Read by
+# ``src/dsart/services/coincidencer.py`` via ``CoincidencerConfig.from_yaml``.
+#
+# The C2 service lives only on h23 — search nodes load this file via
+# ``--config-yaml`` for the c1: block above and ignore coinc:.
+# ---------------------------------------------------------------------------
+coinc:
+  bind:
+    host: "0.0.0.0"
+    port: 11500                    # mirrors c1.c2_endpoint.port
+  window_s: 5.0                    # rolling buffer time depth
+  csv_retention_hours: 48
+  csv_dir_c1: /dataz/dsa110/operations/C1/cluster_output
+  csv_dir_c2: /dataz/dsa110/operations/C2/cluster_output
+  event_archive_root: /dataz/dsa110/candidates
+  trigger_criteria_path: /home/ubuntu/vikram/dev/dsa110-rt/configs/c2_trigger_criteria.yaml
+  dump_broadcast:
+    port_base: 11227               # actual port = port_base + gpu_half
+    hosts:
+      # (search_node_id, ipv4) — must match the per-host bind addresses
+      # in the search_compute_{0,1} routines above so the UDP triggers
+      # land on the C1TriggerListener's bound socket.
+      "1": "10.41.0.205"           # n01 / lxd110h01
+      "2": "10.41.0.222"           # n02 / lxd110h02
+      "9": "10.41.0.253"           # n09 / lxd110h09
+      "13": "10.41.0.238"          # n13 / lxd110h13
+  plotter:
+    n_workers: 2
+    per_event_timeout_s: 30.0
+  # Event-name allocator (event.names + etcd /mon/corr/1/trigger):
+  etcd_lastname_key: "/mon/corr/1/trigger"
+  event_pkg_path: "/home/ubuntu/proj/dsa110-shell/dsa110-event"
+  name_allocator_offline: false    # flip true on dev hosts w/o etcd
+  # Plot dispatcher: wait for all 8 cubes or this many seconds, then plot.
+  plot_cube_wait_s: 60.0
+  plot_dispatch_poll_s: 5.0
+  plot_expected_cube_count: 8
+  # Mon-points export (every coinc.mon_publish_interval_s seconds):
+  mon_etcd_key: "/mon/c2/h23"
+  mon_publish_interval_s: 5.0
