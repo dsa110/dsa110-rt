@@ -81,11 +81,26 @@ class C1BatchHeader:
     cube_id: int
     event_specnum_start: int
     mjd_start: float
+    sample_period_specnum: int
+    sample_period_us: float
     n_grid: int
     n_fdm_in_cube: int
     search_node_id: int
     gpu_half: int
     n_candidates: int
+
+    def candidate_mjd(self, event_specnum: int) -> float:
+        """Convert a candidate's ``event_specnum`` to MJD using this header.
+
+        Mirrors the recipe in ``docs/c1c2/C1C2_WIRE_SCHEMA.md §1.1``.
+        """
+        samples_since_start = (
+            (event_specnum - self.event_specnum_start) // self.sample_period_specnum
+        )
+        return (
+            self.mjd_start
+            + samples_since_start * self.sample_period_us / 1e6 / 86400.0
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +134,8 @@ class C1BatchEncoder:
             f"{header.cube_id} "
             f"{header.event_specnum_start} "
             f"{header.mjd_start:.11f} "
+            f"{header.sample_period_specnum} "
+            f"{header.sample_period_us:.6f} "
             f"{header.n_grid} "
             f"{header.n_fdm_in_cube} "
             f"{header.search_node_id} "
@@ -193,20 +210,22 @@ def _parse_header(line: str) -> C1BatchHeader:
     if not s.startswith("# C1 "):
         raise BadBatch(f"header must start with '# C1 '; got {line!r}")
     toks = s[len("# C1 "):].split()
-    if len(toks) != 9:
+    if len(toks) != 11:
         raise BadBatch(
-            f"header expects 9 fields after '# C1 '; got {len(toks)}: {toks}"
+            f"header expects 11 fields after '# C1 '; got {len(toks)}: {toks}"
         )
     try:
         schema_version = int(toks[0])
         cube_id = int(toks[1])
         event_specnum_start = int(toks[2])
         mjd_start = float(toks[3])
-        n_grid = int(toks[4])
-        n_fdm_in_cube = int(toks[5])
-        search_node_id = int(toks[6])
-        gpu_half = int(toks[7])
-        n_candidates = int(toks[8])
+        sample_period_specnum = int(toks[4])
+        sample_period_us = float(toks[5])
+        n_grid = int(toks[6])
+        n_fdm_in_cube = int(toks[7])
+        search_node_id = int(toks[8])
+        gpu_half = int(toks[9])
+        n_candidates = int(toks[10])
     except ValueError as exc:
         raise BadBatch(f"header type error: {exc}; line={line!r}") from None
     if schema_version != SCHEMA_VERSION:
@@ -216,11 +235,21 @@ def _parse_header(line: str) -> C1BatchHeader:
         )
     if n_candidates < 0:
         raise BadBatch(f"n_candidates={n_candidates} must be >= 0")
+    if sample_period_specnum <= 0:
+        raise BadBatch(
+            f"sample_period_specnum={sample_period_specnum} must be > 0"
+        )
+    if sample_period_us <= 0.0:
+        raise BadBatch(
+            f"sample_period_us={sample_period_us} must be > 0"
+        )
     return C1BatchHeader(
         schema_version=schema_version,
         cube_id=cube_id,
         event_specnum_start=event_specnum_start,
         mjd_start=mjd_start,
+        sample_period_specnum=sample_period_specnum,
+        sample_period_us=sample_period_us,
         n_grid=n_grid,
         n_fdm_in_cube=n_fdm_in_cube,
         search_node_id=search_node_id,
@@ -334,6 +363,8 @@ def build_header(
     cube_id: int,
     event_specnum_start: int,
     mjd_start: float,
+    sample_period_specnum: int,
+    sample_period_us: float,
     n_grid: int,
     n_fdm_in_cube: int,
     search_node_id: int,
@@ -346,6 +377,8 @@ def build_header(
         cube_id=cube_id,
         event_specnum_start=event_specnum_start,
         mjd_start=mjd_start,
+        sample_period_specnum=sample_period_specnum,
+        sample_period_us=sample_period_us,
         n_grid=n_grid,
         n_fdm_in_cube=n_fdm_in_cube,
         search_node_id=search_node_id,

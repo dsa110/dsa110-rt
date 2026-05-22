@@ -42,12 +42,24 @@ def _make_header(n_candidates: int) -> wire.C1BatchHeader:
         cube_id=7,
         event_specnum_start=100_000,
         mjd_start=60781.123456789012,
+        sample_period_specnum=16,
+        sample_period_us=1048.576,
         n_grid=256,
         n_fdm_in_cube=34,
         search_node_id=1,
         gpu_half=0,
         n_candidates=n_candidates,
     )
+
+
+def test_c1_header_candidate_mjd_round_trips_specnum() -> None:
+    header = _make_header(0)
+    spn = header.event_specnum_start + 5 * header.sample_period_specnum
+    mjd = header.candidate_mjd(spn)
+    expected = header.mjd_start + 5 * header.sample_period_us / 1e6 / 86400.0
+    assert abs(mjd - expected) < 1e-15
+    # zero offset -> mjd_start exactly
+    assert header.candidate_mjd(header.event_specnum_start) == header.mjd_start
 
 
 @pytest.mark.parametrize("n_candidates", [0, 1, 5, 25])
@@ -90,7 +102,7 @@ def test_c1_batch_mismatched_count_raises() -> None:
 
 def test_c1_parse_unknown_schema_version_raises() -> None:
     line = (
-        "# C1 9 1 0 60781.00000000000 256 34 1 0 0"
+        "# C1 9 1 0 60781.00000000000 16 1048.576000 256 34 1 0 0"
     )
     with pytest.raises(wire.BadBatch, match="schema_version"):
         wire.parse_c1_batch([line, "# END"])

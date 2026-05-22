@@ -32,7 +32,7 @@ and logs+drops anything else (mon-point `c2_bad_schema`).
 ASCII, line-delimited, one "cube batch" per atomic write:
 
 ```
-# C1 <schema_version> <cube_id> <event_specnum_start> <mjd_start> <n_grid> <n_fdm_in_cube> <search_node_id> <gpu_half> <n_candidates>
+# C1 <schema_version> <cube_id> <event_specnum_start> <mjd_start> <sample_period_specnum> <sample_period_us> <n_grid> <n_fdm_in_cube> <search_node_id> <gpu_half> <n_candidates>
 <candidate row 1>
 <candidate row 2>
 ...
@@ -44,12 +44,27 @@ Lines:
 
 - `#`-prefixed header line:
   - `schema_version` — integer, currently `1`.
-  - `cube_id`, `event_specnum_start`, `n_grid`, `n_fdm_in_cube`,
-    `search_node_id`, `gpu_half` — integers.
+  - `cube_id`, `event_specnum_start`, `sample_period_specnum`,
+    `n_grid`, `n_fdm_in_cube`, `search_node_id`, `gpu_half` —
+    integers.  `sample_period_specnum` is the number of raw SNAP
+    spec-num units per detector sample (= 16 at default ops);
+    same value on every batch in a fleet but carried explicitly so
+    C2 needs no out-of-band knobs.
   - `mjd_start` — fixed-point `%.11f` (so the round-trip preserves
     µs-precision; mirrors the T1 ASCII logger's `_FMT_MJD`).
+  - `sample_period_us` — fixed-point `%.6f` µs per detector
+    sample (= 1048.576 µs at default ops; carried explicitly so
+    C2 can convert ``event_specnum`` → MJD without an out-of-band
+    config).
   - `n_candidates` — integer; informational (C2 reads exactly
     `n_candidates` rows then the END line).
+
+  Candidate MJD recovery on the C2 side:
+
+  ```
+  samples_since_cube_start = (row.event_specnum - header.event_specnum_start) // header.sample_period_specnum
+  candidate_mjd            = header.mjd_start + samples_since_cube_start * header.sample_period_us / 1e6 / 86400.0
+  ```
 - Candidate row schema (one space between fields, no trailing
   space, terminated `\n`):
 
