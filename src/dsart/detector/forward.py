@@ -71,7 +71,9 @@ from .merger import (
     DEFAULT_MERGE_RADIUS_FDM,
     DEFAULT_MERGE_RADIUS_LM,
     DEFAULT_MERGE_RADIUS_T,
+    MergerConfig,
     merge_across_kernels,
+    merge_across_kernels_c1,
 )
 from .triton_boxcar import boxcar_from_padded_cumsum_triton
 
@@ -541,6 +543,8 @@ class DeterministicDetector(torch.nn.Module):
         merge_radius_lm: int = DEFAULT_MERGE_RADIUS_LM,
         merge_radius_fdm: int = DEFAULT_MERGE_RADIUS_FDM,
         merge_radius_t: int = DEFAULT_MERGE_RADIUS_T,
+        merger_config: Optional[MergerConfig] = None,
+        c1_snr_min: Optional[float] = None,
         search_node_id: int = 0,
         gpu_half: int = 0,
         cube_cadence_s: float = CUBE_CADENCE_S_DEFAULT,
@@ -649,12 +653,23 @@ class DeterministicDetector(torch.nn.Module):
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
             dtype=dtype
         )
+        # C1 unification (M7.4): when ``c1_snr_min`` is set, it overrides
+        # ``threshold_sigma`` for the per-kernel NMS threshold AND is
+        # used as a defensive final-emit floor in
+        # ``_apply_c1_emit_floor``. The single knob is the C1 SNR
+        # floor; legacy callers may still pass ``threshold_sigma`` alone.
+        if c1_snr_min is not None:
+            threshold_sigma = float(c1_snr_min)
         self._threshold_sigma = float(threshold_sigma)
+        self._c1_snr_min: Optional[float] = (
+            float(c1_snr_min) if c1_snr_min is not None else None
+        )
         self._detector_version = str(detector_version)
         self._dtype = dtype
         self._merge_radius_lm = int(merge_radius_lm)
         self._merge_radius_fdm = int(merge_radius_fdm)
         self._merge_radius_t = int(merge_radius_t)
+        self._merger_config: Optional[MergerConfig] = merger_config
         self._search_node_id = int(search_node_id)
         self._gpu_half = int(gpu_half)
         self._n_kernel_max_t = int(n_kernel_max_t)
@@ -734,6 +749,46 @@ class DeterministicDetector(torch.nn.Module):
     @property
     def threshold_sigma(self) -> float:
         return self._threshold_sigma
+
+    @property
+    def merger_config(self) -> Optional[MergerConfig]:
+        """C1 merger geometry (``None`` ⇒ legacy axis-AND merger)."""
+        return self._merger_config
+
+    @property
+    def c1_snr_min(self) -> Optional[float]:
+        """C1 SNR floor (single knob used for NMS threshold + emit gate)."""
+        return self._c1_snr_min
+
+    def _merge_per_kernel_cands(
+        self, per_kernel_cands: List[Candidate]
+    ) -> List[Candidate]:
+        """Apply the configured cross-kernel merger to a flat per-kernel
+        candidate list. Routes to ``merge_across_kernels_c1`` when a
+        :class:`MergerConfig` is wired (M7.4 C1 path) and to the legacy
+        axis-AND ``merge_across_kernels`` otherwise.
+        """
+        if self._merger_config is not None:
+            return merge_across_kernels_c1(per_kernel_cands, self._merger_config)
+        return merge_across_kernels(
+            per_kernel_cands,
+            merge_radius_lm=self._merge_radius_lm,
+            merge_radius_fdm=self._merge_radius_fdm,
+            merge_radius_t=self._merge_radius_t,
+        )
+
+    def _apply_c1_emit_floor(
+        self, cands: List[Candidate]
+    ) -> List[Candidate]:
+        """Defensive C1 emit-floor (``c1_snr_min``). The per-kernel
+        decoder already drops anything ≤ ``threshold_sigma``; this is a
+        belt-and-braces filter so the C1 emitter never ships a sub-SNR
+        candidate even if a future decoder change weakens the inner
+        threshold. No-op when ``c1_snr_min`` is unset."""
+        if self._c1_snr_min is None:
+            return cands
+        floor = float(self._c1_snr_min)
+        return [c for c in cands if float(c.snr) >= floor]
 
     @property
     def layer2_state(self) -> Layer2State:
@@ -854,15 +909,10 @@ class DeterministicDetector(torch.nn.Module):
                 cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
             per_kernel_cands.extend(cands)
 
-        merged = merge_across_kernels(
-            per_kernel_cands,
-            merge_radius_lm=self._merge_radius_lm,
-            merge_radius_fdm=self._merge_radius_fdm,
-            merge_radius_t=self._merge_radius_t,
-        )
+        merged = self._merge_per_kernel_cands(per_kernel_cands)
 
         if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
-            return merged
+            return self._apply_c1_emit_floor(merged)
         emit, _dropped = filter_to_canonical(
             merged,
             dm_idx_canonical_lo=dm_idx_canonical_lo,
@@ -871,7 +921,7 @@ class DeterministicDetector(torch.nn.Module):
             n_kernel_max_t=n_kernel_max_t,
             cube_t_offset=event_specnum,
         )
-        return emit
+        return self._apply_c1_emit_floor(emit)
 
     # -----------------------------------------------------------------
     # Internals (chunk-1 testable)
@@ -1597,7 +1647,12 @@ class DeterministicDetector(torch.nn.Module):
 
         # Note: the amortise cs buffer is owned by the detector and
         # reused across cubes; do not free here.
-        if use_argmax_decode or fused_done:
+        if self._merger_config is not None:
+            # C1 path (M7.4): re-merge under the new geometry even when
+            # the fused/argmax decoders already de-duplicated under
+            # legacy radii, so the survivors carry C1 semantics.
+            merged = merge_across_kernels_c1(per_kernel_cands, self._merger_config)
+        elif use_argmax_decode or fused_done:
             # ``decode_topk_argmax_lowmem`` already produced
             # de-duplicated candidates across the kernel bank — skip the
             # cross-kernel merger.
@@ -1611,7 +1666,7 @@ class DeterministicDetector(torch.nn.Module):
             )
 
         if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
-            return merged
+            return self._apply_c1_emit_floor(merged)
         emit, _dropped = filter_to_canonical(
             merged,
             dm_idx_canonical_lo=dm_idx_canonical_lo,
@@ -1620,4 +1675,4 @@ class DeterministicDetector(torch.nn.Module):
             n_kernel_max_t=n_kernel_max_t,
             cube_t_offset=event_specnum,
         )
-        return emit
+        return self._apply_c1_emit_floor(emit)
