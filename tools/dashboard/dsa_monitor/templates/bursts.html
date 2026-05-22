@@ -3,19 +3,73 @@
 
 {% block content %}
 <h1>Burst candidates</h1>
-<div class="banner info">
-    Burst-candidate tab is a stub. Architecture + UI to be designed in a follow-up;
-    until then this page lives here purely so the nav layout matches the final
-    three-tab plan (Antennas/RFI · SEFDs · Burst candidates).
+
+{% if not archive_available %}
+<div class="banner warn">
+    Burst-candidates archive root <code>{{ archive_root }}</code> is
+    not present on this host. The C2 service writes triggered events
+    to that path on h23 (<code>dsart_c2.service</code> /
+    <code>docs/c1c2/C1C2_DESIGN.md §3.5</code>). On dev hosts this tab
+    will stay empty until the path is mounted or an archive is symlinked
+    in.
+</div>
+{% endif %}
+
+<div class="card">
+    <h2>Recent events ({{ events|length }} shown)</h2>
+    <div class="muted">
+        Source: <code>{{ archive_root }}</code> · click an event for the
+        4-panel plots + Level3 metadata. Newest first by directory
+        mtime.
+    </div>
+    {% if events %}
+    <table class="metric" style="margin-top: 12px;">
+        <thead>
+            <tr>
+                <th>event</th>
+                <th>class</th>
+                <th class="value">mjd peak</th>
+                <th class="value">n_events</th>
+                <th class="value">snr_max</th>
+                <th class="value">dm_median</th>
+                <th class="value">l_median</th>
+                <th class="value">m_median</th>
+                <th class="value">cubes</th>
+                <th class="value">plots</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for e in events %}
+            <tr>
+                <td><a href="/bursts/{{ e.name }}">{{ e.name }}</a></td>
+                <td>{{ e.trigger_class or '—' }}</td>
+                <td class="value">{{ '%.6f'|format(e.mjd_peak) if e.mjd_peak is not none else '—' }}</td>
+                <td class="value">{{ e.n_events if e.n_events is not none else '—' }}</td>
+                <td class="value">{{ '%.2f'|format(e.snr_max) if e.snr_max is not none else '—' }}</td>
+                <td class="value">{{ '%.2f'|format(e.dm_median) if e.dm_median is not none else '—' }}</td>
+                <td class="value">{{ '%.3e'|format(e.l_median) if e.l_median is not none else '—' }}</td>
+                <td class="value">{{ '%.3e'|format(e.m_median) if e.m_median is not none else '—' }}</td>
+                <td class="value">{{ e.n_cubes }}/8</td>
+                <td class="value">{{ e.n_plots }}/4</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="muted" style="margin-top: 8px;">No events yet.</div>
+    {% endif %}
 </div>
 
 <div class="card">
-    <h2>Planned content (sketch)</h2>
-    <ul style="margin-left: 20px; font-size: 14px; line-height: 1.7;">
-        <li>Live feed of recent T1 / T2 candidates pulled from <code>/mon/search_rt/&lt;n&gt;/cands</code></li>
-        <li>Per-candidate stamp + dynamic spectrum links (image cube tiles from the search nodes)</li>
-        <li>Filtering by DM, S/N, time, ant-mask validity</li>
-        <li>Cross-link from RFI tab: "this candidate fired during the next 16-cube window where ant N was group-flagged"</li>
+    <h3>External tools</h3>
+    <ul style="margin-left: 20px; font-size: 13px; line-height: 1.7;">
+        <li>C1 hiplot (per-row candidates, hourly):
+            <a href="http://lxd110h23:5017/">lxd110h23:5017</a></li>
+        <li>C2 hiplot (per-cluster, hourly):
+            <a href="http://lxd110h23:5027/">lxd110h23:5027</a></li>
+        <li>Design + bring-up runbooks:
+            <code>docs/c1c2/C1C2_DESIGN.md</code>,
+            <code>docs/c1c2/M7.4_BRINGUP.md</code></li>
     </ul>
 </div>
 {% endblock %}

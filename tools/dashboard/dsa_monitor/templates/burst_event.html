@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}{{ event.name }} – burst – DSA Monitor{% endblock %}
+
+{% block content %}
+<h1>burst event — {{ event.name }}</h1>
+
+<div class="muted">
+    <a href="/bursts">← all bursts</a> · archive:
+    <code>{{ event.archive_dir }}</code>
+</div>
+
+<div class="card">
+    <h2>Level3 metadata</h2>
+    {% if event.metadata %}
+    <pre style="background:#2d3436;color:#dfe6e9;padding:12px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.45;font-family:'Menlo','Consolas',monospace;">{{ metadata_pretty }}</pre>
+    {% else %}
+    <div class="banner warn">No <code>Level3/{{ event.name }}.json</code> on disk yet.</div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>Plots</h2>
+    {% if event.plots %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px;">
+        {% for plot in event.plots %}
+        <div class="plot-card">
+            <h3>{{ plot }}</h3>
+            <img src="/bursts/{{ event.name }}/plot/{{ plot }}" alt="{{ plot }}">
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="muted">No plots written yet — the C2 plot worker fires when cubes land in <code>{{ event.archive_dir }}/cubes/</code> (or after the 60 s wait expires).</div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>Cubes ({{ event.cubes|length }} / 8)</h2>
+    {% if event.cubes %}
+    <ul style="margin-left:20px;font-size:13px;font-family:'Menlo','Consolas',monospace;">
+        {% for c in event.cubes %}
+        <li>{{ c }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <div class="muted">No NPZs uploaded yet (the per-search-node <code>dsart_cube_uploader.service</code> rsyncs them after the C2 trigger lands).</div>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>CSV inputs</h2>
+    <ul style="margin-left:20px;font-size:13px;">
+        <li>C2 cluster row: {{ 'present' if event.has_c2_csv else 'missing' }} (<code>Level2/C2_{{ event.name }}.csv</code>)</li>
+        <li>C1 window snapshot: {{ 'present' if event.has_c1_csv else 'missing' }} (<code>Level2/C1_window_{{ event.name }}.csv</code>)</li>
+    </ul>
+</div>
+{% endblock %}
