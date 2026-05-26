@@ -77,10 +77,47 @@ __all__ = [
     "CubePipelineResult",
     "PrefetchedCube",
     "PrefetchedH2dCube",
+    "RetainedCube",
+    "CubeRetentionRing",
+    "find_cube_for_specnum",
 ]
 
 
 _LOG = logging.getLogger(__name__)
+
+
+# Maximum finite magnitude we keep in fp16 cube tensors. fp16 saturates
+# above ~65504, so very bright bursts (or pathological dequant inputs)
+# can produce inf/-inf at a handful of pixels in the imager output or
+# after Layer-1 normalisation. Detection is robust to that (the detector
+# already clips fp16 internally), but downstream consumers — diagnostic
+# dumps, plots, clustering centroid math, c2 payloads — break on inf.
+# We clip to ~92% of fp16 max so the few saturated samples become a
+# finite "bright" value instead of inf. The bound is well above any
+# realistic σ-normalised signal in normal operation.
+_FP16_CLIP_MAX: float = 60000.0
+
+
+def _clamp_inf_to_finite(cube: torch.Tensor) -> torch.Tensor:
+    """Replace ±inf / NaN in a cube with finite, dtype-safe bounds.
+
+    No-op when the cube has no non-finite values (fast path covers the
+    common case at zero cost on quiet cubes). On bright bursts the
+    saturated samples land at ±``_FP16_CLIP_MAX`` instead of ±inf so
+    the rest of the pipeline can keep doing finite arithmetic on them.
+
+    Runs in-place on the input tensor to avoid an extra full-cube
+    allocation in the hot path.
+    """
+    if cube.dtype == torch.float16:
+        clip = _FP16_CLIP_MAX
+    else:
+        # fp32 / fp64 / bf16: pick a dtype-relative bound. We still
+        # clip so a hypothetical inf-producing op upstream can't poison
+        # the rest of the pipeline.
+        finfo = torch.finfo(cube.dtype)
+        clip = finfo.max * 0.5
+    return torch.nan_to_num(cube, nan=0.0, posinf=clip, neginf=-clip)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +189,34 @@ class CubePipelineConfig:
     gpu_complex_dtype: torch.dtype = torch.complex32
     quantise_target_max: int = 120
     bake_quantise_scale: bool = True
+    # M7.4 (fp16 imager safety):
+    # When False (default since the M7.4 SNR-explosion diagnosis), the
+    # GPU imager runs the unit-scale fused-combine fast path — every
+    # chgroup contributes its dequantised cint8 magnitude without the
+    # per-chgroup mul-add. This matches the original chunk-6c design
+    # (see ``image.fused_combine_cuda::fused_dequant_combine_per_fdm``
+    # docstring: "Used by every existing caller ... where the global
+    # scale lives downstream of the imager (Layer-1 σ-clip normalises
+    # it out cell-wise)").
+    #
+    # Why default False:
+    #   * Production fp16/cfp16 cuFFT IFFT2 butterflies have very
+    #     little dynamic-range headroom (~6.5e4). When static-sky is
+    #     OFF (or hasn't converged) and a bright source is present,
+    #     per-chgroup quantiser scales become large (~1e2). After
+    #     dequant+combine the UV slab values reach ~2e5, and the
+    #     cuFFT-cfp16 intermediates saturate to NaN, producing
+    #     all-NaN cubes and pathological Layer-1 σ estimates.
+    #   * Layer-1 σ-clip is per-cell and absorbs any constant scaling,
+    #     so dropping the calibration multiply does not affect the
+    #     detector's SNR (verified on the 0319+415 continuum: bench
+    #     numpy IFFT2 22.5σ vs fp16 unit-scale 22.6σ).
+    #   * The fast path is also slightly cheaper (skips a fp32 mul-add
+    #     per cell × N_chgroup); the imager remains FFT-bound and the
+    #     plan §8 cube/s target is unaffected.
+    # Set True only for benches/dumps that need physical-Jy amplitudes
+    # in the raw cube (e.g. ``bench/imager_only_gpu.py``).
+    gpu_imager_apply_per_chgroup_calibration: bool = False
 
     def __post_init__(self) -> None:
         if self.n_grid <= 0 or self.n_grid & (self.n_grid - 1):
@@ -260,6 +325,264 @@ class PrefetchedH2dCube:
 
 
 # ---------------------------------------------------------------------------
+# C1 cube retention ring (M7.4) — depth-N pinned host buffer keeping the
+# last N cube tensors live in CPU RAM so the C2 trigger listener can look
+# up + dump any cube within the window.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedCube:
+    """One pinned-host cube tensor retained on the CPU side for later
+    C2-triggered NPZ dump. The full cube tensor is held by reference;
+    do not mutate it after handing it to the ring.
+
+    Args:
+        cube_id: monotonic cube counter (= ``CubeRingSlot.cube_id``).
+        event_specnum_start: spec num at sample 0 of this cube.
+        mjd_start: double-precision MJD at sample 0.
+        t_det: number of time samples in the cube.
+        n_fdm: number of fine-DM trials in the cube
+            (= ``CubeGeometry.n_fdm_in_cube``).
+        n_grid: spatial grid side.
+        sample_period_specnum: spec-nums per detector sample.
+        sample_period_us: time between adjacent detector samples in µs.
+        pinned_host_tensor: ``np.ndarray`` of shape
+            ``[t_det, n_fdm, n_grid, n_grid]`` in fp16; intended to live
+            in pinned host memory (the ring's slots own the
+            allocations).
+    """
+
+    cube_id: int
+    event_specnum_start: int
+    mjd_start: float
+    t_det: int
+    n_fdm: int
+    n_grid: int
+    sample_period_specnum: int
+    sample_period_us: float
+    pinned_host_tensor: np.ndarray
+
+
+def find_cube_for_specnum(
+    ring: "CubeRetentionRing",
+    event_specnum: int,
+) -> Optional[RetainedCube]:
+    """Return the retained cube whose ``[specnum_start, specnum_start +
+    t_det * sample_period_specnum)`` window contains ``event_specnum``.
+
+    Returns ``None`` if no retained cube covers the requested specnum.
+    On a multi-hit (impossible at production geometry where cubes
+    advance by ``cube_cadence_samples`` < ``t_det`` but possible during
+    extreme overlap) the most recently written hit wins (the C2
+    trigger always wants the freshest cube containing the event).
+    """
+    # Walk newest → oldest so the freshest hit wins.
+    best: Optional[RetainedCube] = None
+    for cube in ring.iter_newest_first():
+        start = int(cube.event_specnum_start)
+        end_exclusive = start + int(cube.t_det) * int(cube.sample_period_specnum)
+        if start <= int(event_specnum) < end_exclusive:
+            best = cube
+            break
+    return best
+
+
+class CubeRetentionRing:
+    """Circular buffer of the last N detector cubes (M7.4 C1 stage).
+
+    Each ring slot owns a pinned-host ``np.ndarray`` sized for the
+    fixed production geometry ``[t_det, n_fdm, n_grid, n_grid]`` fp16.
+    The ring is written to with :meth:`stage_cube` which (a) ensures
+    the destination slot is allocated, (b) does the GPU→host fp16
+    copy, and (c) commits a new :class:`RetainedCube` record at the
+    write head.
+
+    At production geometry (``t_det=192``, ``n_fdm=34``, ``n_grid=256``,
+    fp16) one cube ≈ 3.2 GiB; ``depth=8`` is ~26 GiB per gpu_half =
+    ~52 GiB per search node (well inside the 256 GiB budget). The
+    depth is a YAML knob (``c1.cube_ring_depth``) so the operator can
+    throttle down to ``depth=2`` for tight memory during shake-down.
+
+    Args:
+        depth: ring size. ``>= 1``.
+        t_det, n_fdm, n_grid: pin geometry. ``stage_cube`` raises if
+            a new cube's shape doesn't match.
+        pinned: when True, allocate the host buffers with
+            ``torch.empty(..., pin_memory=True)`` and wrap as
+            ``np.ndarray`` for the cross-thread interface. Tests pass
+            ``pinned=False`` to skip the pin (no CUDA on CI hosts).
+    """
+
+    def __init__(
+        self,
+        *,
+        depth: int,
+        t_det: int,
+        n_fdm: int,
+        n_grid: int,
+        pinned: bool = True,
+    ) -> None:
+        if depth < 1:
+            raise ValueError(f"depth={depth}, expected ≥ 1")
+        if t_det <= 0 or n_fdm <= 0 or n_grid <= 0:
+            raise ValueError(
+                f"t_det={t_det}, n_fdm={n_fdm}, n_grid={n_grid} all expected > 0"
+            )
+        self._depth = int(depth)
+        self._t_det = int(t_det)
+        self._n_fdm = int(n_fdm)
+        self._n_grid = int(n_grid)
+        self._pinned = bool(pinned)
+        self._buffers: List[Optional[np.ndarray]] = [None] * self._depth
+        self._records: List[Optional[RetainedCube]] = [None] * self._depth
+        self._write_pos: int = 0
+        self._n_committed: int = 0
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    @property
+    def n_committed(self) -> int:
+        """Number of cubes ever committed (monotonic; not the live
+        count, which is ``min(n_committed, depth)``)."""
+        return self._n_committed
+
+    @property
+    def write_pos(self) -> int:
+        return self._write_pos
+
+    @property
+    def t_det(self) -> int:
+        return self._t_det
+
+    @property
+    def n_fdm(self) -> int:
+        return self._n_fdm
+
+    @property
+    def n_grid(self) -> int:
+        return self._n_grid
+
+    def _ensure_buffer(self, idx: int) -> np.ndarray:
+        """Lazy-allocate the pinned host buffer at ring slot ``idx``."""
+        buf = self._buffers[idx]
+        shape = (self._t_det, self._n_fdm, self._n_grid, self._n_grid)
+        if buf is None or buf.shape != shape or buf.dtype != np.float16:
+            if self._pinned:
+                # Pin via torch so the GPU-side ``cudaMemcpyAsync`` can
+                # run on a side stream; expose the ndarray view to the
+                # listener / writer threads. We don't import torch at
+                # module-time here (already imported above for the
+                # detector glue), but we keep the allocation behind a
+                # try/except so CPU-only CI hosts still build the ring.
+                try:
+                    t = torch.empty(shape, dtype=torch.float16, pin_memory=True)
+                    buf = t.numpy()
+                except (RuntimeError, AssertionError):
+                    buf = np.empty(shape, dtype=np.float16)
+            else:
+                buf = np.empty(shape, dtype=np.float16)
+            self._buffers[idx] = buf
+        return buf
+
+    def stage_cube(
+        self,
+        *,
+        cube_id: int,
+        event_specnum_start: int,
+        mjd_start: float,
+        sample_period_specnum: int,
+        sample_period_us: float,
+        cube_tensor: Any,
+    ) -> RetainedCube:
+        """Copy ``cube_tensor`` into the next ring slot and commit a
+        :class:`RetainedCube` record. ``cube_tensor`` may be a
+        ``np.ndarray`` (CPU path / tests) or a torch tensor (GPU path);
+        in either case the destination buffer is pinned-host fp16. The
+        copy is synchronous from the caller's perspective — the
+        production path issues it from the cube driver after the
+        detector returns, so it does NOT block the GPU pipeline (the
+        detector's fwd has already completed before we touch the ring).
+
+        Returns:
+            The freshly committed :class:`RetainedCube`.
+        """
+        if cube_id < 0:
+            raise ValueError(f"cube_id={cube_id}, expected ≥ 0")
+        idx = self._write_pos
+        dest = self._ensure_buffer(idx)
+        # Coerce src to a fp16 ndarray of the expected shape. The
+        # production path expects the cube tensor to already be in
+        # fp16 on the GPU, so this is a simple ``.cpu().numpy()``
+        # round-trip. Tests pass np arrays directly.
+        if isinstance(cube_tensor, np.ndarray):
+            src = cube_tensor
+            if src.dtype != np.float16:
+                src = src.astype(np.float16, copy=False)
+        elif (
+            hasattr(cube_tensor, "detach")
+            and hasattr(cube_tensor, "cpu")
+            and hasattr(cube_tensor, "numpy")
+        ):
+            src_t = cube_tensor.detach().to(torch.float16)
+            src = src_t.cpu().numpy()
+        else:
+            raise TypeError(
+                f"cube_tensor must be np.ndarray or torch tensor; got "
+                f"{type(cube_tensor).__name__}"
+            )
+        if src.shape != dest.shape:
+            raise ValueError(
+                f"cube_tensor.shape={src.shape} != ring geometry {dest.shape}"
+            )
+        np.copyto(dest, src, casting="same_kind")
+        record = RetainedCube(
+            cube_id=int(cube_id),
+            event_specnum_start=int(event_specnum_start),
+            mjd_start=float(mjd_start),
+            t_det=int(self._t_det),
+            n_fdm=int(self._n_fdm),
+            n_grid=int(self._n_grid),
+            sample_period_specnum=int(sample_period_specnum),
+            sample_period_us=float(sample_period_us),
+            pinned_host_tensor=dest,
+        )
+        self._records[idx] = record
+        self._write_pos = (idx + 1) % self._depth
+        self._n_committed += 1
+        return record
+
+    def iter_newest_first(self):
+        """Iterator over live ``RetainedCube`` records from newest →
+        oldest. Skips empty slots (first ``min(depth, n_committed)``
+        bumps fill the ring)."""
+        n_live = min(self._depth, self._n_committed)
+        for k in range(n_live):
+            idx = (self._write_pos - 1 - k) % self._depth
+            rec = self._records[idx]
+            if rec is not None:
+                yield rec
+
+    def iter_oldest_first(self):
+        """Iterator over live ``RetainedCube`` records from oldest →
+        newest. Useful for diagnostics."""
+        n_live = min(self._depth, self._n_committed)
+        start = (self._write_pos - n_live) % self._depth
+        for k in range(n_live):
+            idx = (start + k) % self._depth
+            rec = self._records[idx]
+            if rec is not None:
+                yield rec
+
+    def snapshot(self) -> List[RetainedCube]:
+        """Live snapshot of retained cubes, newest first. Convenience
+        wrapper around :meth:`iter_newest_first`."""
+        return list(self.iter_newest_first())
+
+
+# ---------------------------------------------------------------------------
 # Cube pipeline
 # ---------------------------------------------------------------------------
 
@@ -282,10 +605,20 @@ class CubePipeline:
         config: CubePipelineConfig,
         detector: DeterministicDetector,
         layer1_state: Optional[Layer1State] = None,
+        *,
+        fine_dm_pc_cm3: Optional[torch.Tensor] = None,
     ) -> None:
         self.config = config
         self.detector = detector
         self.layer1_state = layer1_state
+        # M7.4 fix: detector.forward(..., fine_dm_pc_cm3=...) is what
+        # makes the decoder write the actual physical DM (pc/cc) into
+        # ``Candidate.dm_fine`` instead of falling back to the fdm INDEX
+        # (decoder.py lines 206-209). Without this the C1 emitter ships
+        # ``dm_pc_cc = fdm_idx`` and the C2 trigger criteria can't match
+        # in pc/cc units (see C1 csv: ``dm_pc_cc`` and ``dm_idx_global``
+        # were identical integers prior to this fix).
+        self._fine_dm_pc_cm3: Optional[torch.Tensor] = fine_dm_pc_cm3
         self._device = torch.device(config.device)
         if config.image_backend == "gpu" and self._device.type != "cuda":
             raise ValueError(
@@ -414,6 +747,7 @@ class CubePipeline:
         cube = apply_edge_mask(cube, self._edge_mask)
         if cube.dtype != self.config.cube_dtype:
             cube = cube.to(self.config.cube_dtype)
+        cube = _clamp_inf_to_finite(cube)
         validity_mask = torch.from_numpy(
             np.ascontiguousarray(slot.validity_mask)
         ).to(device=self._device, dtype=torch.bool)
@@ -713,13 +1047,22 @@ class CubePipeline:
             raise RuntimeError(
                 "_run_imager_from_staged called before GpuImager was built"
             )
-        return self._gpu_imager.process_cube(  # type: ignore[union-attr]
+        # M7.4: gate per-chgroup calibration on cfg flag; default False
+        # picks the unit-scale fused fast path (chunk-6c design) which is
+        # fp16-safe and matches the bench's σ-normalised behaviour.
+        # See ``CubePipelineConfig.gpu_imager_apply_per_chgroup_calibration``
+        # for the full rationale.
+        apply_cal = bool(
+            self.config.gpu_imager_apply_per_chgroup_calibration
+        )
+        cube = self._gpu_imager.process_cube(  # type: ignore[union-attr]
             streams_cint8=staged.cint8_t,
             time_shifts_gpu=staged.shifts_t,
-            chgroup_scales=staged.chgroup_scale_t,
-            chgroup_offsets_re=staged.chgroup_offset_re_t,
-            chgroup_offsets_im=staged.chgroup_offset_im_t,
+            chgroup_scales=staged.chgroup_scale_t if apply_cal else None,
+            chgroup_offsets_re=staged.chgroup_offset_re_t if apply_cal else None,
+            chgroup_offsets_im=staged.chgroup_offset_im_t if apply_cal else None,
         )
+        return _clamp_inf_to_finite(cube)
 
     def _build_validity_mask(self, slot: CubeRingSlot) -> torch.Tensor:
         """Materialise the [T_det, N_fdm] bool validity mask on the
@@ -828,7 +1171,7 @@ class CubePipeline:
             sigma = sigma.to(cube.device)
         # Broadcast-divide. cube is [T_det, N_fdm, H, W]; sigma is [N_fdm].
         cube_normalised = cube / sigma[None, :, None, None].to(cube.dtype)
-        return cube_normalised, sigma
+        return _clamp_inf_to_finite(cube_normalised), sigma
 
     def _layer1_normalise_fused(
         self,
@@ -876,7 +1219,7 @@ class CubePipeline:
         if self._gpu_imager is not None:
             self._gpu_imager.set_edge_mask_per_fdm(sigma_inv)
         self._sigma_layer1_prev = sigma_for_use
-        return cube, sigma_for_use
+        return _clamp_inf_to_finite(cube), sigma_for_use
 
     def prefetch_h2d(self, slot: CubeRingSlot) -> PrefetchedH2dCube:
         """Stage the cube's H2D copies on the dedicated H2D stream.
@@ -946,6 +1289,7 @@ class CubePipeline:
                 validity_mask,
                 sigma_layer1,
                 event_specnum=int(slot.specnum_start),
+                fine_dm_pc_cm3=self._fine_dm_pc_cm3,
             )
         t3 = time.perf_counter_ns()
         timings = {
@@ -954,6 +1298,9 @@ class CubePipeline:
             "detector_forward": t3 - t2,
             "total": t3 - staged.build_start_ns,
         }
+        self._debug_log_cube_stats(
+            slot.cube_id, cube, cube_norm, sigma_layer1, validity_mask, cands,
+        )
         return CubePipelineResult(
             cube_id=slot.cube_id,
             specnum_start=slot.specnum_start,
@@ -963,6 +1310,102 @@ class CubePipeline:
             candidates=cands,
             stage_timings_ns=timings,
         )
+
+    @staticmethod
+    def _debug_log_cube_stats(
+        cube_id: int,
+        cube_raw: torch.Tensor,
+        cube_norm: torch.Tensor,
+        sigma_layer1: torch.Tensor,
+        validity_mask: torch.Tensor,
+        cands,
+    ) -> None:
+        """One-line stats per cube for M7.4 detector debug. Reductions
+        happen in the cube's native dtype to avoid a fp32 copy that
+        would blow the GPU memory budget for the [T_det,N_fdm,H,W]
+        cube. We use ``.amin()/.amax()/.mean()/.std()`` and convert to
+        python scalars via ``.item()``; ``mean`` and ``std`` upcast
+        internally for fp16 but only on the scalar accumulator (no
+        full-tensor allocation)."""
+        try:
+            # All reductions are scalar — no whole-cube copies.
+            raw_min = float(cube_raw.amin().item())
+            raw_max = float(cube_raw.amax().item())
+            raw_mean = float(cube_raw.float().mean().item()) if cube_raw.numel() < (1 << 24) else float("nan")
+            # For large cubes skip mean (mean() over fp16 needs fp32 accum, can OOM).
+            # Use a small-slice mean as a cheap proxy.
+            if cube_raw.numel() >= (1 << 24):
+                # 64-pixel slice across first dim only — cheap.
+                raw_mean = float(cube_raw[:1].float().mean().item())
+            n_norm_min = float(cube_norm.amin().item())
+            n_norm_max = float(cube_norm.amax().item())
+            # Convert sigma_layer1 (small: [N_fdm]) without worries.
+            sl = sigma_layer1.detach().to(torch.float32).flatten()
+            sl_min = float(sl.amin().item())
+            sl_max = float(sl.amax().item())
+            sl_med = float(sl.median().item())
+            vm = validity_mask.detach()
+            n_valid = int(vm.sum().item())
+            n_total = int(vm.numel())
+            # peak SNR estimate: cube_norm.max(); if Layer1 normalised, max ≈ peak SNR
+            _LOG.info(
+                "cube_debug cid=%d shape=%s dtype=%s raw[min/max]=%.3g/%.3g raw_slice_mean=%.3g "
+                "norm[min/max]=%.3g/%.3g sigma_l1[min/med/max]=%.3g/%.3g/%.3g "
+                "valid=%d/%d (%.1f%%) n_cands=%d",
+                cube_id,
+                tuple(cube_raw.shape),
+                str(cube_raw.dtype),
+                raw_min, raw_max, raw_mean,
+                n_norm_min, n_norm_max,
+                sl_min, sl_med, sl_max,
+                n_valid, n_total, 100.0 * n_valid / max(1, n_total),
+                len(cands),
+            )
+            dump_dir = os.environ.get("DSART_M74_CUBE_DUMP_DIR")
+            dump_every = int(os.environ.get("DSART_M74_CUBE_DUMP_EVERY", "0") or 0)
+            if dump_dir and dump_every > 0 and (cube_id % dump_every) == 0:
+                try:
+                    os.makedirs(dump_dir, exist_ok=True)
+                    # M7.4: dual-GPU search has two compute halves writing
+                    # cubes for overlapping cube_ids; an optional
+                    # ``DSART_M74_DUMP_TAG`` env (set per-half by the
+                    # orchestrator) disambiguates so neither overwrites
+                    # the other's dump. Default falls back to PID for
+                    # unambiguous per-process files.
+                    tag_env = os.environ.get("DSART_M74_DUMP_TAG", "")
+                    tag = tag_env if tag_env else f"pid{os.getpid()}"
+                    p = os.path.join(
+                        dump_dir,
+                        f"cube_{cube_id:06d}_{tag}.pt",
+                    )
+                    # Move to CPU in fp16 to keep the dump small.
+                    cn_cpu = cube_norm.detach().to(
+                        device="cpu",
+                        dtype=torch.float16
+                        if cube_norm.dtype.is_floating_point
+                        else cube_norm.dtype,
+                    )
+                    cr_cpu = cube_raw.detach().to(
+                        device="cpu",
+                        dtype=torch.float16
+                        if cube_raw.dtype.is_floating_point
+                        else cube_raw.dtype,
+                    )
+                    torch.save(
+                        {
+                            "cube_raw": cr_cpu,
+                            "cube_norm": cn_cpu,
+                            "sigma_layer1": sigma_layer1.detach().cpu(),
+                            "validity_mask": validity_mask.detach().cpu(),
+                            "n_cands": len(cands),
+                        },
+                        p,
+                    )
+                    _LOG.info("cube_debug dumped to %s", p)
+                except Exception as exc:
+                    _LOG.warning("cube_debug dump failed cid=%d: %s", cube_id, exc)
+        except Exception as exc:
+            _LOG.warning("cube_debug log failed cid=%d: %s", cube_id, exc)
 
     def prefetch_build(self, slot: CubeRingSlot) -> PrefetchedCube:
         """Build one cube on the prefetch stream when available.
@@ -1010,8 +1453,13 @@ class CubePipeline:
                 prefetched.validity_mask,
                 sigma_layer1,
                 event_specnum=int(slot.specnum_start),
+                fine_dm_pc_cm3=self._fine_dm_pc_cm3,
             )
         t3 = time.perf_counter_ns()
+        self._debug_log_cube_stats(
+            slot.cube_id, prefetched.cube, cube_norm, sigma_layer1,
+            prefetched.validity_mask, cands,
+        )
         timings = {
             "build_cube": t1 - prefetched.build_start_ns,
             "layer1_norm": t2 - t1,
@@ -1054,6 +1502,7 @@ class CubePipeline:
                 validity_mask,
                 sigma_layer1,
                 event_specnum=int(slot.specnum_start),
+                fine_dm_pc_cm3=self._fine_dm_pc_cm3,
             )
         t3 = time.perf_counter_ns()
         timings = {
@@ -1062,6 +1511,9 @@ class CubePipeline:
             "detector_forward": t3 - t2,
             "total": t3 - t0,
         }
+        self._debug_log_cube_stats(
+            slot.cube_id, cube, cube_norm, sigma_layer1, validity_mask, cands,
+        )
         return CubePipelineResult(
             cube_id=slot.cube_id,
             specnum_start=slot.specnum_start,

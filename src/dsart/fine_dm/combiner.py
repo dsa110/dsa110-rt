@@ -138,6 +138,7 @@ def compute_time_shift_search(
     t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
     nu_chgroup_bot_GHz: Optional[Tuple[float, ...]] = None,
     nu_bot_proc_GHz: float = NU_BOT_PROC_GHZ,
+    include_coarse_offset: bool = False,
 ) -> TimeShiftSearchTable:
     """Build the per-fine-DM × per-chgroup integer-sample shift table.
 
@@ -150,6 +151,28 @@ def compute_time_shift_search(
     where ``δdm[f] = fine_dm[f] - coarse_dm[fine_to_coarse[f]]``. The
     rounding rule is ``numpy.rint`` (half-to-even / banker's rounding)
     per the §3.6 rounding-direction lock.
+
+    M7.4 stage-2-absent escape hatch (``include_coarse_offset=True``):
+    when the upstream corr-side pipeline does NOT apply the per-coarse-DM
+    stage-2 inter-chgroup alignment to ν_bot_proc (which is the current
+    state of the production transport TX path — see ``coarse_dm/stage2_fifo.py``
+    docstring re: "per-(g, c) depth-sizing happening at the integration
+    site" + the lack of any apply-stage-2 surface in
+    ``transport/``), the search-side shifts must absorb the FULL
+    per-chgroup inter-band delay for ``fine_dm[f]`` (not just the
+    δdm differential). Switching to absolute-DM accounting bakes in
+    the missing stage-2 correction:
+
+        Δt_samples_search[f, g] = rint(
+            Δτ_us(ν_chgroup_bot_g, ν_bot_proc, fine_dm[f]) / t_int_search_us
+        )
+
+    Max shift jumps from ~76 to ~210 samples at fdm=33 for the
+    250924mptq DM plan; ``ProductionRxRing._t_stream =
+    t_det + max(shifts)`` auto-grows the cint8 history window
+    accordingly. Default ``False`` keeps the legacy
+    stage-3-differential-only behaviour for the production pipeline
+    once corr-side stage-2 lands.
 
     Sign convention (v2, 2026-05-18): shifts are SIGNED int32. δdm can be
     positive (fine above coarse → POSITIVE shift, advance/read-FUTURE) or
@@ -206,7 +229,10 @@ def compute_time_shift_search(
     shifts = np.zeros((n_fine, N_CHGROUP), dtype=np.int32)
     for f in range(n_fine):
         c = int(fine_to_coarse[f])
-        ddm = float(fine_dm_pc_cm3[f] - coarse_dm_pc_cm3[c])
+        if include_coarse_offset:
+            ddm = float(fine_dm_pc_cm3[f])
+        else:
+            ddm = float(fine_dm_pc_cm3[f] - coarse_dm_pc_cm3[c])
         for g in range(N_CHGROUP):
             # Argument order: (nu_low, nu_high). For g < 15 we have
             # chgroup_bot[g] > nu_bot_proc (chgroup-0 is band-top, -15

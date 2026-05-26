@@ -59,6 +59,7 @@ from ..cluster import (
     ClustererConfig,
     ClustererService,
 )
+from ..coinc.wire import build_header
 from ..common.constants import (
     CUBE_CADENCE_SAMPLES_DEFAULT,
     DETECTOR_IMAGE_KERNELS,
@@ -69,9 +70,12 @@ from ..common.constants import (
 from ..common.contracts import Candidate, CubeGeometry
 from ..detector.forward import DeterministicDetector
 from ..detector.kernels import build_kernel_bank
+from ..detector.merger import MergerConfig
 from ..dump import (
     BrightPulsePredicate,
     BrightPulsePredicateConfig,
+    C2TriggerListener,
+    C2TriggerListenerConfig,
     CubeDumpWriter,
     CubeDumpWriterConfig,
     UdpTriggerListener,
@@ -79,7 +83,13 @@ from ..dump import (
 )
 from ..common.contracts import CubeDumpManifest
 from ..noise_norm.layer1 import Layer1State
-from .cube_pipeline import CubePipeline, CubePipelineConfig, PrefetchedCube
+from .c1_emit import C1EmitConfig, C1TcpEmitter, candidate_to_c1_row
+from .cube_pipeline import (
+    CubePipeline,
+    CubePipelineConfig,
+    CubeRetentionRing,
+    PrefetchedCube,
+)
 from .rx_ring import CubeRingSlot, RxRingSource
 
 __all__ = [
@@ -161,6 +171,20 @@ class SearchComputeConfig:
     )
     detector_boxcar_accum_dtype: Optional[torch.dtype] = None
     detector_layer2_max_samples: Optional[int] = 100_000
+    # M7.4 hardening: Layer-2 σ_k EMA knobs exposed for tuning. The
+    # detector defaults are sensible at production geometry, but
+    # cube_cadence_s + tau_s + n_burnin all interact via
+    # ``gamma = 1 - exp(-cadence/tau)`` and the 250924mptq replay
+    # showed σ_k can be depressed by sparse-valid cubes (one node
+    # snowballed to SNR ~ 4.7e4). ``layer2_sigma_floor`` clamps σ_k
+    # from below; ``layer2_valid_min_fraction`` relaxes the strict
+    # 100% validity gate so σ_k can keep learning when 1–2% of
+    # UV cells are flagged.
+    detector_cube_cadence_s: Optional[float] = None  # None ⇒ detector default
+    detector_layer2_tau_s: Optional[float] = None
+    detector_layer2_n_burnin: Optional[int] = None
+    detector_layer2_sigma_floor: float = 0.0
+    detector_layer2_valid_min_fraction: float = 1.0
     pipeline_overlap: bool = False
     search_node_id: int = 1
     gpu_half: int = 1
@@ -172,6 +196,14 @@ class SearchComputeConfig:
     # cube-to-cube EMA noise floor (≈ a few percent). Trade saved ~50 ms
     # of `torch.nanmedian` per cube at production geometry.
     layer1_max_samples: Optional[int] = 10_000
+    # M7.4: σ floor for Layer-1 to suppress the static-sky-EMA-warmup
+    # transient (cubes 1-2 of a fresh start can drop σ ~200× below
+    # steady state, producing massive false-positive SNRs). 0.0 ⇒
+    # disabled (legacy default). Production replay default 5e-3 sits
+    # between the warmup-transient σ (~10⁻⁴) and the steady-state
+    # noise floor (~2×10⁻²) and was empirically validated against
+    # the 250924mptq burst.
+    layer1_sigma_floor: float = 0.0
 
     # --- M6 chunk 5: cube-geometry hyperparameters ---------------------
     cube_cell_l_rad: float = 1.5e-4
@@ -192,6 +224,32 @@ class SearchComputeConfig:
 
     # --- M6 chunk 5: orchestration knobs ------------------------------
     cluster_result_timeout_s: float = 1.0
+
+    # --- M7.4 C1 stage ------------------------------------------------
+    # ``enable_legacy_clusterer`` gates the legacy DBSCAN/HDBSCAN
+    # clusterer + cands_logger + BrightPulsePredicate path. Default
+    # False per M7.4 design (C1 emit replaces per-node clustering); set
+    # True in offline tools / replay benches that still want T1/T2 rows.
+    enable_legacy_clusterer: bool = False
+    # C1 cross-kernel merger geometry (see MergerConfig defaults).
+    merger_config: Optional[MergerConfig] = None
+    # Single SNR knob; when set, overrides ``detector_threshold_sigma``
+    # and is also enforced defensively at the C1 emit boundary.
+    c1_snr_min: Optional[float] = None
+    # Depth of the pinned-host cube retention ring (one slot per cube;
+    # 1 slot ≈ 3.2 GiB at the production t_det=192 / n_fdm=34 /
+    # n_grid=256 / fp16 geometry, so 8 slots ≈ 26 GiB per gpu_half).
+    cube_ring_depth: int = 8
+    # C1 → C2 TCP emitter. None disables the emitter (tests + offline
+    # benches that don't need it).
+    c1_emit_config: Optional[C1EmitConfig] = None
+    # C2 → C1 UDP trigger listener. None disables the listener.
+    c2_trigger_listener_config: Optional[C2TriggerListenerConfig] = None
+    # Cube dump root for the C2-triggered dumps (per-event subdir is
+    # built by the listener). When ``c2_trigger_listener_config`` is
+    # set this MUST match its ``dump_root`` so the listener and the
+    # writer agree on where files land.
+    c1_dump_root: Optional[Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +287,26 @@ class SearchComputeService:
             n_sigma=config.layer1_n_sigma,
             n_iterations=config.layer1_n_iterations,
             max_samples=config.layer1_max_samples,
+            sigma_floor=config.layer1_sigma_floor,
         )
+        # M7.4: thread the fine-DM grid (pc/cc) into the pipeline so
+        # the decoder writes the physical DM (pc/cc) into
+        # ``Candidate.dm_fine`` instead of falling back to the fdm INDEX.
+        # The C1 emitter ships ``dm_pc_cc=cand.dm_fine`` downstream, so
+        # this is what makes the C2 trigger criteria (``dm_median_min_pc_cc``
+        # etc.) compare apples to apples.
+        fine_dm_tensor: Optional[torch.Tensor] = None
+        if config.fine_dm_pc_cc_full is not None:
+            fine_dm_tensor = torch.as_tensor(
+                config.fine_dm_pc_cc_full,
+                dtype=torch.float32,
+                device=torch.device(config.pipeline.device),
+            )
         self._pipeline = CubePipeline(
             config=config.pipeline,
             detector=self._detector,
             layer1_state=self._layer1_state,
+            fine_dm_pc_cm3=fine_dm_tensor,
         )
         self._stopping = asyncio.Event()
         self._cubes_processed = 0
@@ -249,6 +322,13 @@ class SearchComputeService:
         self._cube_dump: Optional[CubeDumpWriter] = None
         self._udp_listener: Optional[UdpTriggerListener] = None
         self._cands_logger: Optional[CandsLogger] = None
+        # M7.4 C1 stage.
+        self._cube_ring: Optional[CubeRetentionRing] = None
+        self._c1_emit: Optional[C1TcpEmitter] = None
+        self._c1_emit_task: Optional[asyncio.Task] = None
+        self._c2_trigger: Optional[C2TriggerListener] = None
+        self._c1_batches_submitted = 0
+        self._c1_batches_dropped = 0
 
     @staticmethod
     def _build_detector(config: SearchComputeConfig) -> DeterministicDetector:
@@ -261,6 +341,17 @@ class SearchComputeService:
             time_tokens=config.detector_time_tokens,
             dtype=config.detector_dtype,
         )
+        # Layer-2 EMA knobs: forward only if the yaml supplied an
+        # override so the detector's compile-time defaults remain the
+        # source of truth for tests + benches that don't set them.
+        l2_kwargs: dict = {}
+        if config.detector_cube_cadence_s is not None:
+            l2_kwargs["cube_cadence_s"] = float(config.detector_cube_cadence_s)
+        if config.detector_layer2_tau_s is not None:
+            l2_kwargs["layer2_tau_s"] = float(config.detector_layer2_tau_s)
+        if config.detector_layer2_n_burnin is not None:
+            l2_kwargs["layer2_n_burnin"] = int(config.detector_layer2_n_burnin)
+
         return DeterministicDetector(
             kernel_bank=bank,
             threshold_sigma=config.detector_threshold_sigma,
@@ -274,6 +365,13 @@ class SearchComputeService:
             streaming_decoder_n_top=config.detector_streaming_decoder_n_top,
             boxcar_accum_dtype=config.detector_boxcar_accum_dtype,
             layer2_sigma_max_samples=config.detector_layer2_max_samples,
+            layer2_sigma_floor=float(config.detector_layer2_sigma_floor),
+            layer2_valid_min_fraction=float(
+                config.detector_layer2_valid_min_fraction
+            ),
+            merger_config=config.merger_config,
+            c1_snr_min=config.c1_snr_min,
+            **l2_kwargs,
         )
 
     @property
@@ -324,6 +422,52 @@ class SearchComputeService:
     def cands_logger(self) -> Optional[CandsLogger]:
         return self._cands_logger
 
+    @property
+    def cube_ring(self) -> Optional[CubeRetentionRing]:
+        return self._cube_ring
+
+    @property
+    def c1_emit(self) -> Optional[C1TcpEmitter]:
+        return self._c1_emit
+
+    @property
+    def c2_trigger(self) -> Optional[C2TriggerListener]:
+        return self._c2_trigger
+
+    @property
+    def c1_batches_submitted(self) -> int:
+        return self._c1_batches_submitted
+
+    @property
+    def c1_batches_dropped(self) -> int:
+        return self._c1_batches_dropped
+
+    def mon_snapshot(self) -> dict:
+        """Combined per-service mon-points snapshot. Includes the C1
+        emitter + C2 trigger listener counters under nested keys."""
+        snap = {
+            "cubes_processed": int(self._cubes_processed),
+            "candidates_emitted": int(self._candidates_emitted),
+            "clusters_emitted": int(self._clusters_emitted),
+            "auto_dumps_dispatched": int(self._auto_dumps_dispatched),
+            "udp_dumps_dispatched": int(self._udp_dumps_dispatched),
+            "cluster_timeouts": int(self._cluster_timeouts),
+            "c1_batches_submitted": int(self._c1_batches_submitted),
+            "c1_batches_dropped": int(self._c1_batches_dropped),
+            "search_node_id": int(self._config.search_node_id),
+            "gpu_half": int(self._config.gpu_half),
+        }
+        if self._c1_emit is not None:
+            snap["c1_emit"] = dict(self._c1_emit.mon)
+        if self._c2_trigger is not None:
+            snap["c2_trigger"] = dict(self._c2_trigger.mon)
+        if self._cube_ring is not None:
+            snap["cube_ring"] = {
+                "depth": int(self._cube_ring.depth),
+                "n_committed": int(self._cube_ring.n_committed),
+            }
+        return snap
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -332,10 +476,17 @@ class SearchComputeService:
         """Bring up the RX-ring source + all configured sub-systems."""
         await self._source.start()
         cfg = self._config
-        if cfg.clusterer_config is not None:
+        # M7.4 C1 stage: per-half cube retention ring. Built before the
+        # cube driver starts so the first cube can stage into slot 0.
+        # The ring's geometry is taken from the first slot lazily in
+        # ``_process_one_cube``; here we just defer to the per-cube
+        # path to populate.
+        if cfg.cube_ring_depth > 0:
+            self._cube_ring = None  # actual ring built lazily on first cube
+        if cfg.enable_legacy_clusterer and cfg.clusterer_config is not None:
             self._clusterer = ClustererService(config=cfg.clusterer_config)
             self._clusterer.start()
-        if cfg.bright_pulse_predicate_config is not None:
+        if cfg.enable_legacy_clusterer and cfg.bright_pulse_predicate_config is not None:
             self._predicate = BrightPulsePredicate(
                 config=cfg.bright_pulse_predicate_config
             )
@@ -350,25 +501,71 @@ class SearchComputeService:
             self._cube_dump = CubeDumpWriter(config=cfg.cube_dump_writer_config)
             self._cube_dump.start()
         if cfg.udp_trigger_listener_config is not None:
+            # Legacy "dump next cube" listener; kept for the M6 path so
+            # operator scripts can still arm a one-shot dump while we
+            # roll out C2-triggered dumps.
             self._udp_listener = UdpTriggerListener(
                 config=cfg.udp_trigger_listener_config
             )
             await self._udp_listener.start()
-        if cfg.cands_logger_config is not None:
+        if cfg.enable_legacy_clusterer and cfg.cands_logger_config is not None:
             self._cands_logger = CandsLogger(config=cfg.cands_logger_config)
+        # M7.4 C1 emitter (TCP → h23).
+        if cfg.c1_emit_config is not None:
+            self._c1_emit = C1TcpEmitter(config=cfg.c1_emit_config)
+            self._c1_emit_task = asyncio.create_task(self._c1_emit.run())
+        # M7.4 C2 trigger listener (UDP from h23). Requires the ring
+        # to be reachable; we defer ring construction to the first
+        # cube but build the listener now bound to a placeholder ring
+        # that gets swapped in when the ring exists.
+        if cfg.c2_trigger_listener_config is not None:
+            # Build a 0-cube ring placeholder until the first cube
+            # comes through and we know the geometry. The listener's
+            # ``find_cube_for_specnum`` walks the ring snapshot at
+            # call time so swapping the ring is safe.
+            if self._cube_ring is None:
+                placeholder_ring = CubeRetentionRing(
+                    depth=max(1, int(cfg.cube_ring_depth)),
+                    t_det=1, n_fdm=1, n_grid=1,  # tiny; never written
+                    pinned=False,
+                )
+                self._cube_ring = placeholder_ring
+            self._c2_trigger = C2TriggerListener(
+                config=cfg.c2_trigger_listener_config,
+                ring=self._cube_ring,
+                cube_dump=self._cube_dump,
+            )
+            await self._c2_trigger.start()
         _LOG.info(
             "SearchComputeService up "
-            "(sid=%d, gpu_half=%d, cluster=%s, dump=%s, udp=%s, log=%s)",
+            "(sid=%d, gpu_half=%d, cluster=%s, dump=%s, udp=%s, log=%s, "
+            "c1_emit=%s, c2_trigger=%s, ring_depth=%d)",
             cfg.search_node_id,
             cfg.gpu_half,
             self._clusterer is not None,
             self._cube_dump is not None,
             self._udp_listener is not None,
             self._cands_logger is not None,
+            self._c1_emit is not None,
+            self._c2_trigger is not None,
+            int(cfg.cube_ring_depth),
         )
 
     async def stop(self) -> None:
         self._stopping.set()
+        if self._c2_trigger is not None:
+            await self._c2_trigger.stop()
+        if self._c1_emit is not None:
+            await self._c1_emit.stop()
+            if self._c1_emit_task is not None:
+                try:
+                    await asyncio.wait_for(self._c1_emit_task, timeout=5.0)
+                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                    self._c1_emit_task.cancel()
+                    try:
+                        await self._c1_emit_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
         if self._udp_listener is not None:
             await self._udp_listener.stop()
         if self._cube_dump is not None:
@@ -380,13 +577,16 @@ class SearchComputeService:
         await self._source.stop()
         _LOG.info(
             "SearchComputeService stopped: cubes=%d cands=%d clusters=%d "
-            "auto_dumps=%d udp_dumps=%d cluster_timeouts=%d",
+            "auto_dumps=%d udp_dumps=%d cluster_timeouts=%d "
+            "c1_batches_submitted=%d c1_batches_dropped=%d",
             self._cubes_processed,
             self._candidates_emitted,
             self._clusters_emitted,
             self._auto_dumps_dispatched,
             self._udp_dumps_dispatched,
             self._cluster_timeouts,
+            self._c1_batches_submitted,
+            self._c1_batches_dropped,
         )
 
     # -----------------------------------------------------------------
@@ -445,9 +645,10 @@ class SearchComputeService:
     ) -> List[Candidate]:
         cfg = self._config
 
-        # Step 1 — UDP arm check (M6 D9): a UDP datagram arriving any
-        # time before this cube was dequeued arms a single dump-next
-        # for THIS cube. Subsequent UDPs during this cube don't stack.
+        # Step 1 — legacy UDP arm check (M6 D9): a UDP datagram
+        # arriving any time before this cube was dequeued arms a
+        # single dump-next for THIS cube. The M7.4 C2 trigger path is
+        # listener-driven (dumps from the ring), not a per-cube arm.
         udp_armed = False
         if self._udp_listener is not None:
             udp_armed = self._udp_listener.consume_dump_next_cube_flag()
@@ -460,7 +661,7 @@ class SearchComputeService:
         self._cubes_processed += 1
         self._candidates_emitted += len(result.candidates)
 
-        # Build geometry once for both clusterer + dumps.
+        # Build geometry once for both clusterer + dumps + emitter.
         geom = self._geom_from_slot(slot)
 
         # Step 3 — UDP dump (this cube). Submit BEFORE clustering so the
@@ -485,8 +686,20 @@ class SearchComputeService:
             if accepted:
                 self._udp_dumps_dispatched += 1
 
-        # Step 4 — clusterer (M6 chunk 1; ThreadPoolExecutor).
-        if self._clusterer is not None:
+        # Step 4a — M7.4 C1 stage: stage the cube into the retention
+        # ring + emit candidates to C2. We stage AFTER the detector
+        # ran (the GPU pipeline is done with the cube tensor) so the
+        # ring copy doesn't compete for the compute stream.
+        self._maybe_stage_cube_in_ring(slot, result.cube, geom)
+        # C1 emit. Always invoked when the emitter is configured —
+        # even on empty cubes, so the heartbeat / connectivity check
+        # keeps flowing.
+        if self._c1_emit is not None:
+            self._submit_c1_batch(slot, geom, result.candidates)
+
+        # Step 4b — legacy clusterer (M6 chunk 1) — disabled by default
+        # under the M7.4 C1 stage; kept for offline benches.
+        if cfg.enable_legacy_clusterer and self._clusterer is not None:
             future = self._clusterer.submit(result.candidates, geom)
             try:
                 cluster_result = future.result(
@@ -503,7 +716,8 @@ class SearchComputeService:
                 return result.candidates
             self._clusters_emitted += len(cluster_result.records)
 
-            # Step 5 — auto dumps (M6 D8 predicate).
+            # Step 5 — auto dumps (M6 D8 predicate). Legacy path; the
+            # M7.4 C2 trigger is the canonical dump path.
             triggered_ids: set[int] = set()
             for record in cluster_result.records:
                 if self._predicate is not None and self._predicate(record):
@@ -541,6 +755,91 @@ class SearchComputeService:
                 )
 
         return result.candidates
+
+    def _maybe_stage_cube_in_ring(
+        self,
+        slot: CubeRingSlot,
+        cube_tensor: Any,
+        geom: CubeGeometry,
+    ) -> None:
+        """Stage the post-detector cube into the C1 retention ring.
+
+        Lazily builds the ring on the first cube once we know the
+        actual geometry. Skips silently when neither the ring nor a
+        C2 trigger listener is configured (saves the ~3 GiB copy on
+        legacy-only deployments)."""
+        cfg = self._config
+        wants_ring = (
+            cfg.c2_trigger_listener_config is not None
+            or cfg.cube_ring_depth > 0
+            and self._c2_trigger is not None
+        )
+        if not wants_ring:
+            return
+        need_rebuild = (
+            self._cube_ring is None
+            or self._cube_ring.depth != cfg.cube_ring_depth
+            or self._cube_ring.t_det != slot.t_det
+            or self._cube_ring.n_fdm != slot.n_fdm_in_cube
+            or self._cube_ring.n_grid != slot.n_grid
+        )
+        if need_rebuild:
+            self._cube_ring = CubeRetentionRing(
+                depth=int(cfg.cube_ring_depth),
+                t_det=int(slot.t_det),
+                n_fdm=int(slot.n_fdm_in_cube),
+                n_grid=int(slot.n_grid),
+                pinned=False,  # production: keep host-pinned; tests pass np
+            )
+            # Re-point the C2 trigger listener at the rebuilt ring.
+            if self._c2_trigger is not None:
+                self._c2_trigger.set_ring(self._cube_ring)
+        try:
+            self._cube_ring.stage_cube(
+                cube_id=int(slot.cube_id),
+                event_specnum_start=int(slot.specnum_start),
+                mjd_start=float(geom.mjd_start),
+                sample_period_specnum=int(geom.sample_period_specnum),
+                sample_period_us=float(geom.sample_period_us),
+                cube_tensor=cube_tensor,
+            )
+        except (ValueError, TypeError) as exc:
+            _LOG.warning(
+                "cube_ring stage failed (cube_id=%d): %r",
+                int(slot.cube_id), exc,
+            )
+
+    def _submit_c1_batch(
+        self,
+        slot: CubeRingSlot,
+        geom: CubeGeometry,
+        candidates: List[Candidate],
+    ) -> None:
+        """Project ``candidates`` into the C1 row schema + push onto
+        the emitter's outbound queue. Drops on queue-full are surfaced
+        via the emitter's mon-points + the service's own counters."""
+        assert self._c1_emit is not None
+        cfg = self._config
+        rows = tuple(
+            candidate_to_c1_row(c, geom=geom) for c in candidates
+        )
+        header = build_header(
+            cube_id=int(slot.cube_id),
+            event_specnum_start=int(slot.specnum_start),
+            mjd_start=float(geom.mjd_start),
+            sample_period_specnum=int(geom.sample_period_specnum),
+            sample_period_us=float(geom.sample_period_us),
+            n_grid=int(slot.n_grid),
+            n_fdm_in_cube=int(slot.n_fdm_in_cube),
+            search_node_id=int(cfg.search_node_id),
+            gpu_half=int(cfg.gpu_half),
+            n_candidates=len(rows),
+        )
+        accepted = self._c1_emit.submit(header, candidates, rows=rows)
+        if accepted:
+            self._c1_batches_submitted += 1
+        else:
+            self._c1_batches_dropped += 1
 
     def _cube_dump_path(self, source: str, key_specnum: int) -> str:
         """Build the canonical per-cube NPZ path.
@@ -615,13 +914,15 @@ class SearchComputeService:
                     dt = max(now - last_log, 1e-9)
                     _LOG.info(
                         "cube_progress: cubes=%d cands=%d clusters=%d "
-                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
+                        "src=%s",
                         self._cubes_processed,
                         self._candidates_emitted,
                         self._clusters_emitted,
                         d_cubes / dt,
                         dt,
                         self._cubes_processed / max(now - loop_start, 1e-9),
+                        getattr(self._source, "stats", {}),
                     )
                     next_status += status_every
                     last_log = now
@@ -638,13 +939,15 @@ class SearchComputeService:
                     dt = max(now - last_log, 1e-9)
                     _LOG.info(
                         "cube_progress: cubes=%d cands=%d clusters=%d "
-                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
+                        "src=%s",
                         self._cubes_processed,
                         self._candidates_emitted,
                         self._clusters_emitted,
                         d_cubes / dt,
                         dt,
                         self._cubes_processed / max(now - loop_start, 1e-9),
+                        getattr(self._source, "stats", {}),
                     )
                     next_status += status_every
                     last_log = now
@@ -796,7 +1099,10 @@ def _build_search_config_from_yaml(
     detector_boxcar_accum_dtype: str,
     detector_layer2_max_samples: Optional[int],
     layer1_max_samples: Optional[int],
+    layer1_sigma_floor: float,
     fine_dm_pc_cc_full: Optional[np.ndarray],
+    enable_c1: bool = True,
+    c1_bind_host_override: Optional[str] = None,
 ) -> SearchComputeConfig:
     """Translate ``configs/config_compute_search.yaml`` into
     ``SearchComputeConfig`` with optional M6 sub-systems gated on the
@@ -839,8 +1145,23 @@ def _build_search_config_from_yaml(
     cube_dump_cfg: Optional[CubeDumpWriterConfig] = None
     if enable_cube_dump:
         cd = yaml_doc.get("cube_dump", {}) or {}
+        # M7.4: the C2 trigger listener composes its per-event manifest
+        # ``npz_path`` under ``c1.dump_root``; the writer's
+        # ``_resolve_path()`` only honors that override when the listener
+        # path is a *subdir* of the writer's own ``dump_root``. So the
+        # writer ``dump_root`` MUST equal (or be an ancestor of)
+        # ``c1.dump_root`` or every C2-triggered dump falls back to the
+        # writer's canonical layout (no per-event subdir, file lands
+        # outside the candidate archive). Default the writer to
+        # ``c1.dump_root`` here so the single yaml knob controls both
+        # sides; an explicit ``cube_dump.dump_root`` still wins (e.g. for
+        # legacy bench paths).
+        c1_yaml = yaml_doc.get("c1", {}) or {}
+        default_dump_root = c1_yaml.get(
+            "dump_root", "/tmp/dsart-cube-dump"
+        )
         cube_dump_cfg = CubeDumpWriterConfig(
-            dump_root=Path(cd.get("dump_root", "/tmp/dsart-cube-dump")),
+            dump_root=Path(cd.get("dump_root", default_dump_root)),
             search_node_id=int(cd.get("search_node_id", search_node_id)),
             gpu_half=int(cd.get("gpu_half", gpu_half)),
             queue_maxsize=int(cd.get("queue_maxsize", 4)),
@@ -906,6 +1227,82 @@ def _build_search_config_from_yaml(
         field="--detector-k-time",
     )
 
+    # -----------------------------------------------------------------
+    # M7.4 C1 stage wiring (single source of truth for SNR / merger /
+    # ring / emit / trigger listener / dump root).
+    # -----------------------------------------------------------------
+    c1 = (yaml_doc.get("c1", {}) or {}) if enable_c1 else {}
+    c1_snr_min: Optional[float] = (
+        float(c1.get("snr_min")) if "snr_min" in c1 else None
+    )
+    merger_yaml = c1.get("merger", {}) or {}
+    merger_cfg: Optional[MergerConfig] = None
+    if c1 or merger_yaml:
+        merger_cfg = MergerConfig(
+            lm_max_cells=int(merger_yaml.get("lm_max_cells", 3)),
+            dm_max_trials=int(merger_yaml.get("dm_max_trials", 2)),
+            t_frac=float(merger_yaml.get("t_frac", 1.0)),
+            sample_period_specnum=int(
+                merger_yaml.get(
+                    "sample_period_specnum",
+                    yaml_doc.get("cube", {}).get("sample_period_specnum", 16),
+                )
+            ),
+        )
+    cube_ring_depth_yaml = int(c1.get("cube_ring_depth", 8))
+    c2_endpoint = c1.get("c2_endpoint", {}) or {}
+    c1_emit_cfg: Optional[C1EmitConfig] = None
+    if enable_c1 and c2_endpoint:
+        c1_emit_cfg = C1EmitConfig(
+            host=str(c2_endpoint.get("host", "h23")),
+            port=int(c2_endpoint.get("port", 11500)),
+            search_node_id=int(search_node_id),
+            gpu_half=int(gpu_half),
+            queue_depth=int(c1.get("emit_queue_depth", 16)),
+        )
+    dump_listener_yaml = c1.get("dump_listener", {}) or {}
+    c1_dump_root = (
+        Path(c1["dump_root"]) if "dump_root" in c1 else None
+    )
+    c2_listener_cfg: Optional[C2TriggerListenerConfig] = None
+    if enable_c1 and dump_listener_yaml:
+        bind_host = c1_bind_host_override or str(
+            dump_listener_yaml.get("bind_host", "")
+        ).strip()
+        # Empty bind_host defers to per-host CLI override; if no
+        # override was provided we fall back to 0.0.0.0 (binds all
+        # interfaces). Production wires the per-host search-net IP via
+        # the orchestrator's hostargs.
+        if not bind_host:
+            bind_host = "0.0.0.0"
+        listener_dump_root = c1_dump_root or Path(
+            c1.get("dump_root", "/home/ubuntu/data/c2/cube_dump")
+        )
+        c2_listener_cfg = C2TriggerListenerConfig(
+            bind_host=bind_host,
+            base_port=int(dump_listener_yaml.get("base_port", 11227)),
+            gpu_half=int(gpu_half),
+            search_node_id=int(search_node_id),
+            dump_root=listener_dump_root,
+        )
+
+    # Honor a top-level YAML ``enable_legacy_clusterer`` knob as the
+    # source of truth when present; falls back to the CLI flag when
+    # absent (preserves legacy bench behavior).
+    legacy_enabled = bool(
+        yaml_doc.get("enable_legacy_clusterer", bool(enable_clusterer))
+    )
+
+    # Layer-2 σ_k EMA yaml knobs (M7.4 hardening). All optional —
+    # absence preserves detector defaults.
+    detector_cube_cadence_s_yaml = det.get("cube_cadence_s", None)
+    detector_layer2_tau_s_yaml = det.get("layer2_tau_s", None)
+    detector_layer2_n_burnin_yaml = det.get("layer2_n_burnin", None)
+    detector_layer2_sigma_floor_yaml = float(det.get("layer2_sigma_floor", 0.0))
+    detector_layer2_valid_min_fraction_yaml = float(
+        det.get("layer2_valid_min_fraction", 1.0)
+    )
+
     return SearchComputeConfig(
         pipeline=pipe_cfg,
         n_fdm=int(n_fdm),
@@ -923,6 +1320,20 @@ def _build_search_config_from_yaml(
             and int(detector_layer2_max_samples) > 0
             else None
         ),
+        detector_cube_cadence_s=(
+            float(detector_cube_cadence_s_yaml)
+            if detector_cube_cadence_s_yaml is not None else None
+        ),
+        detector_layer2_tau_s=(
+            float(detector_layer2_tau_s_yaml)
+            if detector_layer2_tau_s_yaml is not None else None
+        ),
+        detector_layer2_n_burnin=(
+            int(detector_layer2_n_burnin_yaml)
+            if detector_layer2_n_burnin_yaml is not None else None
+        ),
+        detector_layer2_sigma_floor=detector_layer2_sigma_floor_yaml,
+        detector_layer2_valid_min_fraction=detector_layer2_valid_min_fraction_yaml,
         detector_device=device,
         search_node_id=int(search_node_id),
         gpu_half=int(gpu_half),
@@ -932,12 +1343,27 @@ def _build_search_config_from_yaml(
             if layer1_max_samples is not None
             else None
         ),
+        # CLI flag --layer1-sigma-floor (>0.0) overrides the YAML
+        # default; legacy YAML value is used when the CLI flag is 0.0
+        # (its argparse default), so existing callers see no change.
+        layer1_sigma_floor=(
+            float(layer1_sigma_floor)
+            if float(layer1_sigma_floor) > 0.0
+            else float(noise.get("layer1_sigma_floor", 0.0))
+        ),
         fine_dm_pc_cc_full=fine_dm_pc_cc_full,
         clusterer_config=clusterer_cfg,
         cube_dump_writer_config=cube_dump_cfg,
         bright_pulse_predicate_config=predicate_cfg,
         udp_trigger_listener_config=udp_listener_cfg,
         cands_logger_config=cands_logger_cfg,
+        enable_legacy_clusterer=legacy_enabled,
+        merger_config=merger_cfg,
+        c1_snr_min=c1_snr_min,
+        cube_ring_depth=cube_ring_depth_yaml,
+        c1_emit_config=c1_emit_cfg,
+        c2_trigger_listener_config=c2_listener_cfg,
+        c1_dump_root=c1_dump_root,
     )
 
 
@@ -1028,6 +1454,107 @@ async def _run_async(args: argparse.Namespace) -> int:
         fine_dm = fine_dm[: args.n_fdm]
         f2c = f2c[: args.n_fdm]
 
+    # M7.5 imager-data-path activation: build the per-chgroup sparsity
+    # patterns on the search side so the dense scatter C helper can
+    # run. We mirror corr_fast_compute exactly:
+    #   - antpos + core-baseline mask loaded from the SAME cal blob the
+    #     corr side used for beamformer_weights (the bf header carries
+    #     antpos; the sibling yaml carries antenna_order for the
+    #     core/outrigger split). This guarantees ``antpos_hash`` agrees.
+    #   - dec_deg + n_grid + kernel_support + chan_sum_factor + cell_
+    #     lambda_mode all match the corr-side launcher knobs.
+    # When --cal-blob-path or --obs-dec-deg is missing we fall back to
+    # the M7.2 stub path; downstream cube data will be zeros (sentinel
+    # for an unactivated pipeline).
+    linear_lut_per_corr: Optional[np.ndarray] = None
+    n_filled_per_corr_arr: Optional[np.ndarray] = None
+    if args.cal_blob_path is not None and args.obs_dec_deg is not None:
+        try:
+            from ..grid.sparsity_pattern import (
+                build_pattern,
+                compute_top_of_band_cell_lambda,
+            )
+            from ..services.corr_fast_integration import (
+                load_antpos_from_cal_blob,
+            )
+            antpos_e, antpos_n, is_core_mask = load_antpos_from_cal_blob(
+                args.cal_blob_path,
+            )
+            if args.cell_lambda_mode == "common":
+                cell_lambda_used = compute_top_of_band_cell_lambda(
+                    antpos_e, antpos_n,
+                    n_grid=int(args.n_grid),
+                    is_core_baseline_mask=is_core_mask,
+                )
+            else:
+                cell_lambda_used = None
+            n_corr_local = int(args.n_corr)
+            patterns = []
+            for c in range(n_corr_local):
+                pat = build_pattern(
+                    antpos_e, antpos_n,
+                    chgroup=c,
+                    dec_deg=float(args.obs_dec_deg),
+                    n_grid=int(args.n_grid),
+                    kernel_support=int(args.kernel_support),
+                    chan_sum_factor=int(args.chan_sum_factor),
+                    cell_lambda=cell_lambda_used,
+                    is_core_baseline_mask=is_core_mask,
+                )
+                patterns.append(pat)
+            n_filled_max = max(int(p.n_filled) for p in patterns)
+            ring_n_filled = int(dims.n_filled_per_corr)
+            if n_filled_max > ring_n_filled:
+                raise ValueError(
+                    f"M7.5 LUT: max n_filled across chgroups = "
+                    f"{n_filled_max} > ring n_filled_per_corr = "
+                    f"{ring_n_filled}. Increase --n-filled to "
+                    f"≥ {n_filled_max} or check pattern build inputs."
+                )
+            # LUT stride = ring slot's n_filled (so the C helper's
+            # ``slot_base + 2*k`` cint8 walk + ``lut_c[k]`` LUT walk are
+            # zipped on the same k axis the wire ships).
+            linear_lut_per_corr = np.zeros(
+                (n_corr_local, ring_n_filled), dtype=np.int32,
+            )
+            n_filled_per_corr_arr = np.zeros(n_corr_local, dtype=np.int32)
+            for c, pat in enumerate(patterns):
+                n = int(pat.n_filled)
+                # ``ix_row * n_grid + ix_col`` — row-major scatter into the
+                # dense [n_grid, n_grid] plane; matches the C helper's
+                # ``re_plane[lin] = src[2*k]`` line + the test fixture's
+                # ``lut[c, k] = ix * n_grid + iy`` convention.
+                lin = (
+                    pat.ix_row.astype(np.int32) * int(args.n_grid)
+                    + pat.ix_col.astype(np.int32)
+                )
+                linear_lut_per_corr[c, :n] = lin
+                n_filled_per_corr_arr[c] = n
+            _LOG.info(
+                "M7.5 sparsity LUTs built: n_corr=%d n_grid=%d "
+                "kernel_support=%d chan_sum=%d cell_lambda_mode=%s "
+                "n_filled_per_corr=%s pattern_ids=%s",
+                n_corr_local, int(args.n_grid), int(args.kernel_support),
+                int(args.chan_sum_factor), args.cell_lambda_mode,
+                n_filled_per_corr_arr.tolist(),
+                [f"0x{int(p.pattern_id):016x}" for p in patterns],
+            )
+        except Exception as exc:
+            _LOG.exception(
+                "M7.5 LUT build failed (%s); falling back to M7.2 "
+                "zero-stub path. n_cands will be 0.",
+                exc,
+            )
+            linear_lut_per_corr = None
+            n_filled_per_corr_arr = None
+    else:
+        _LOG.warning(
+            "M7.5 activation skipped: cal_blob_path=%s obs_dec_deg=%s. "
+            "Falling back to M7.2 zero-stub assembly (cubes will be "
+            "zeros; expect n_cands=0).",
+            args.cal_blob_path, args.obs_dec_deg,
+        )
+
     source = ProductionRxRingSource(
         shm_name=args.shm_name,
         ring_dims=dims,
@@ -1046,6 +1573,24 @@ async def _run_async(args: argparse.Namespace) -> int:
         fan_in_min_corrs=args.fan_in_min_corrs,
         attach_timeout_s=args.attach_timeout_s,
         n_active_dms_per_corr=args.n_active_dms_per_corr,
+        # M7.4 fix: in the M7.2 fallback path (no scatter wiring) the
+        # validity walk in production_rx_ring uses this to know which
+        # coarse_dm to expect data in. Without it the walker marks
+        # every t invalid because the non-owned-dm slots are never
+        # written by the partitioned TX workers.
+        owned_coarse_dm=owner_idx,
+        # M7.5 scatter activation — when both linear_lut + n_filled are
+        # set the source switches to assemble_dense_block (real cint8
+        # scatter); otherwise the M7.2 zero-stub path is used.
+        linear_lut_per_corr=linear_lut_per_corr,
+        n_filled_per_corr=n_filled_per_corr_arr,
+        # M7.4 stage-2-absent escape hatch: bake the per-coarse-DM
+        # inter-chgroup ν_bot_proc alignment into the search-side
+        # shifts. Mandatory for the M7.4 250924mptq replay until the
+        # corr-side stage-2 application is wired in.
+        include_coarse_offset_in_search_shifts=bool(
+            args.include_coarse_offset_in_search_shifts
+        ),
     )
 
     if args.config_yaml is not None and args.config_yaml.exists():
@@ -1081,7 +1626,10 @@ async def _run_async(args: argparse.Namespace) -> int:
         detector_boxcar_accum_dtype=args.detector_boxcar_accum_dtype,
         detector_layer2_max_samples=args.detector_layer2_max_samples,
         layer1_max_samples=args.layer1_max_samples,
+        layer1_sigma_floor=args.layer1_sigma_floor,
         fine_dm_pc_cc_full=fine_dm,
+        enable_c1=not args.disable_c1,
+        c1_bind_host_override=args.c1_bind_host,
     )
 
     service = SearchComputeService(config=cfg, source=source)
@@ -1191,6 +1739,42 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "init lag when both routines are fork-execed "
                         "by dsart_rt in the same verb dispatch).")
 
+    # --- M7.5 imager-data-path activation: per-chgroup sparsity-pattern
+    # LUTs so the dense scatter helper in production_rx_ring can run.
+    # If --cal-blob-path + --obs-dec-deg are both set, search_compute
+    # builds the (n_corr, n_filled_max) linear LUT at startup by calling
+    # dsart.grid.sparsity_pattern.build_pattern(...) for every chgroup —
+    # mirroring corr_fast_compute (same antpos + dec + n_grid + K_support
+    # + chan_sum_factor + cell_lambda_mode), producing bit-identical
+    # patterns per the Option-C contract. Without these args the source
+    # falls back to the M7.2 zero-stub path (sentinel cubes; n_cands=0).
+    p.add_argument("--cal-blob-path", type=Path, default=None,
+                   help="path to any beamformer_weights_*.dat blob; used "
+                        "to load (antpos_e, antpos_n, is_core_baseline_"
+                        "mask) consistent with the corr-side cal. When "
+                        "set together with --obs-dec-deg, search_compute "
+                        "builds the per-corr SparsityPattern LUTs and "
+                        "enables the M7.4 dense scatter.")
+    p.add_argument("--obs-dec-deg", type=float, default=None,
+                   help="observation declination in degrees. MUST match "
+                        "the corr-side --obs-dec-deg (within the "
+                        "0.25° quantisation of pattern_id) for the "
+                        "per-packet pattern_id check to pass.")
+    p.add_argument("--kernel-support", type=int, default=1,
+                   help="gridding kernel support in cells (default: 1, "
+                        "matching corr_fast_integration.FastIntegration"
+                        "Config.kernel_support default; pillbox).")
+    p.add_argument("--chan-sum-factor", type=int, default=8,
+                   help="F33: collapse this many fine channels per "
+                        "chgroup before gridding (must match the "
+                        "corr-side --chan-sum-factor; default 8 to "
+                        "match the M7.4 launcher).")
+    p.add_argument("--cell-lambda-mode", default="common",
+                   choices=("common", "per_chgroup"),
+                   help="F28 cell-lambda mode (must match corr; default "
+                        "'common' = all chgroups share one image-pixel "
+                        "grid via compute_top_of_band_cell_lambda).")
+
     # --- SearchComputeService identity --------------------------------
     p.add_argument("--gpu-half", type=int, default=0, choices=(0, 1),
                    help="which compute half this process serves (0 or 1)")
@@ -1250,6 +1834,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Per-fdm sample cap for Layer-1 sigma-clipped std. "
                         "Commissioning default 100k (vs 1M bench legacy) for "
                         "lower latency with still-sub-percent sigma error.")
+    p.add_argument("--layer1-sigma-floor", type=float, default=0.0,
+                   help="Lower-bound clamp on the per-fdm Layer-1 sigma, "
+                        "applied uniformly across burnin-median and "
+                        "post-burnin paths. Suppresses the static-sky-EMA "
+                        "warmup transient (cubes 1-2 of a fresh start can "
+                        "drop sigma ~200x below steady state). 0.0 (default) "
+                        "disables. M7.4 burst-replay recommended: 5e-3.")
+    p.add_argument("--include-coarse-offset-in-search-shifts",
+                   action="store_true", default=False,
+                   help="M7.4 stage-2-absent escape hatch: bake the "
+                        "per-coarse-DM inter-chgroup ν_bot_proc alignment "
+                        "into the search-side time_shift_search table. "
+                        "Required while the corr-side stage-2 application "
+                        "is not yet wired (Stage2FIFO is just a ring "
+                        "buffer; no per-(g, c) time-shift application "
+                        "exists anywhere in transport/). T_stream grows "
+                        "from t_det + ~76 to t_det + ~210 samples; the "
+                        "RX cint8 history window grows correspondingly. "
+                        "Default False once corr-side stage-2 lands.")
 
     # --- DM plan source -----------------------------------------------
     p.add_argument("--dm-plan-path", type=Path, default=None,
@@ -1269,6 +1872,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--enable-cands-logger", action="store_true")
     p.add_argument("--enable-all", action="store_true",
                    help="shortcut: enable all M6 sub-systems above")
+    # --- M7.4 C1 stage gating (defaults ON; off-switch lets benches /
+    # --- legacy soaks skip the C1 wiring entirely) --------------------
+    p.add_argument("--disable-c1", action="store_true",
+                   help="skip M7.4 C1 wiring (merger / SNR / cube "
+                        "ring / emit / trigger listener). Default ON; "
+                        "use this only for legacy benches.")
+    p.add_argument("--c1-bind-host", default=None,
+                   help="override c1.dump_listener.bind_host (the "
+                        "search-net IP for the C2 trigger listener). "
+                        "Production: the orchestrator's hostargs.")
 
     # --- Lifecycle ----------------------------------------------------
     p.add_argument("--max-cubes", type=int, default=0,

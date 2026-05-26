@@ -125,6 +125,7 @@ class Layer2State:
         n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
         n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
         sigma_max_samples: Optional[int] = None,
+        sigma_floor: float = 0.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -138,6 +139,8 @@ class Layer2State:
             raise ValueError(f"n_burnin={n_burnin}, expected ≥ 0")
         if n_kernel_max_t < 1:
             raise ValueError(f"n_kernel_max_t={n_kernel_max_t}, expected ≥ 1")
+        if sigma_floor < 0:
+            raise ValueError(f"sigma_floor={sigma_floor}, expected ≥ 0")
 
         self.n_kernels = int(n_kernels)
         self.cube_cadence_s = float(cube_cadence_s)
@@ -149,6 +152,13 @@ class Layer2State:
         self.sigma_max_samples = (
             int(sigma_max_samples) if sigma_max_samples is not None else None
         )
+        # M7.4 hardening: prevent σ_k from being depressed by sparse-valid
+        # cubes (low-amplitude masked cells biasing σ-clip downwards).
+        # σ_k is clamped to ``sigma_floor`` from below after every update
+        # so SNR = score / σ_k is bounded above by ``score / sigma_floor``
+        # (no unbounded inflation when σ_k learning gets unlucky on one
+        # node). Default 0.0 preserves legacy behaviour bit-for-bit.
+        self.sigma_floor = float(sigma_floor)
         self.gamma = 1.0 - math.exp(-self.cube_cadence_s / self.tau_s)
 
         # State: per-kernel running mean / EMA value. Initialised to 1.0
@@ -245,6 +255,14 @@ class Layer2State:
             self._s_k = (count * self._s_k + sigma_this) / (count + 1.0)
         else:
             self._s_k = self.gamma * sigma_this + (1.0 - self.gamma) * self._s_k
+
+        # σ_k floor: prevents the EMA from being depressed by an
+        # unlucky low-amplitude (masked / RFI'd / non-stationary)
+        # cube. Applied AFTER the blend so steady-state σ_k > floor
+        # is unchanged; only protects the divisor in pathological
+        # cases. Disabled by default (``sigma_floor=0.0``).
+        if self.sigma_floor > 0.0:
+            self._s_k = torch.clamp(self._s_k, min=self.sigma_floor)
 
         self._cube_count += 1
         return self._s_k.detach().clone(), self.is_warming_up

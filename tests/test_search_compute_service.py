@@ -371,6 +371,12 @@ def _full_config(
             )
             if enable_log else None
         ),
+        # M7.4 strip: the legacy DBSCAN/HDBSCAN clusterer + cands_logger
+        # + BrightPulsePredicate path is gated behind this flag. Tests
+        # that build a full config with ``enable_cluster=True`` flip
+        # the gate on so the legacy fixtures still exercise the
+        # clusterer hand-off.
+        enable_legacy_clusterer=bool(enable_cluster),
     )
 
 

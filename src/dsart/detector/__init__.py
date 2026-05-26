@@ -31,7 +31,9 @@ from .merger import (
     DEFAULT_MERGE_RADIUS_FDM,
     DEFAULT_MERGE_RADIUS_LM,
     DEFAULT_MERGE_RADIUS_T,
+    MergerConfig,
     merge_across_kernels,
+    merge_across_kernels_c1,
 )
 
 __all__ = [
@@ -44,7 +46,9 @@ __all__ = [
     "DEFAULT_DETECTOR_DTYPE",
     "decode_local_max",
     "filter_to_canonical",
+    "MergerConfig",
     "merge_across_kernels",
+    "merge_across_kernels_c1",
     "DEFAULT_MERGE_RADIUS_LM",
     "DEFAULT_MERGE_RADIUS_FDM",
     "DEFAULT_MERGE_RADIUS_T",

@@ -71,7 +71,9 @@ from .merger import (
     DEFAULT_MERGE_RADIUS_FDM,
     DEFAULT_MERGE_RADIUS_LM,
     DEFAULT_MERGE_RADIUS_T,
+    MergerConfig,
     merge_across_kernels,
+    merge_across_kernels_c1,
 )
 from .triton_boxcar import boxcar_from_padded_cumsum_triton
 
@@ -541,6 +543,8 @@ class DeterministicDetector(torch.nn.Module):
         merge_radius_lm: int = DEFAULT_MERGE_RADIUS_LM,
         merge_radius_fdm: int = DEFAULT_MERGE_RADIUS_FDM,
         merge_radius_t: int = DEFAULT_MERGE_RADIUS_T,
+        merger_config: Optional[MergerConfig] = None,
+        c1_snr_min: Optional[float] = None,
         search_node_id: int = 0,
         gpu_half: int = 0,
         cube_cadence_s: float = CUBE_CADENCE_S_DEFAULT,
@@ -549,6 +553,8 @@ class DeterministicDetector(torch.nn.Module):
         n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
         layer2_state: Optional[Layer2State] = None,
         layer2_seed_unit: bool = True,
+        layer2_sigma_floor: float = 0.0,
+        layer2_valid_min_fraction: float = 1.0,
         streaming: bool = False,
         streaming_tile_size: int = 64,
         layer2_sigma_max_samples: Optional[int] = 1_000_000,
@@ -649,15 +655,42 @@ class DeterministicDetector(torch.nn.Module):
         self._kernel_bank: Tuple[Kernel, ...] = kernel_bank or build_kernel_bank(
             dtype=dtype
         )
+        # C1 unification (M7.4): when ``c1_snr_min`` is set, it overrides
+        # ``threshold_sigma`` for the per-kernel NMS threshold AND is
+        # used as a defensive final-emit floor in
+        # ``_apply_c1_emit_floor``. The single knob is the C1 SNR
+        # floor; legacy callers may still pass ``threshold_sigma`` alone.
+        if c1_snr_min is not None:
+            threshold_sigma = float(c1_snr_min)
         self._threshold_sigma = float(threshold_sigma)
+        self._c1_snr_min: Optional[float] = (
+            float(c1_snr_min) if c1_snr_min is not None else None
+        )
         self._detector_version = str(detector_version)
         self._dtype = dtype
         self._merge_radius_lm = int(merge_radius_lm)
         self._merge_radius_fdm = int(merge_radius_fdm)
         self._merge_radius_t = int(merge_radius_t)
+        self._merger_config: Optional[MergerConfig] = merger_config
         self._search_node_id = int(search_node_id)
         self._gpu_half = int(gpu_half)
         self._n_kernel_max_t = int(n_kernel_max_t)
+
+        # M7.4 hardening: validity-mask threshold for gating Layer-2
+        # σ_k EMA updates. Legacy behaviour required 100% valid cells
+        # (``layer2_valid_min_fraction=1.0``); this is too strict in
+        # the field where 1–2% of UV cells fail per cube — Layer-2
+        # σ_k then never updates and stays at the seed value, which
+        # diverges across nodes (see 250924mptq postmortem).
+        # Set to e.g. 0.95 to allow updates while still rejecting
+        # cubes with significant flag fractions. Per-cube valid
+        # fraction is ``validity_mask.sum() / numel``.
+        if not (0.0 <= layer2_valid_min_fraction <= 1.0):
+            raise ValueError(
+                f"layer2_valid_min_fraction={layer2_valid_min_fraction}, "
+                f"expected in [0.0, 1.0]"
+            )
+        self._layer2_valid_min_fraction = float(layer2_valid_min_fraction)
 
         # Layer-2 σ_k EMA (Chunk 3, plan §3.6.10). On cold start the EMA
         # buffer is seeded to the analytic value for unit-σ Gaussian
@@ -674,6 +707,7 @@ class DeterministicDetector(torch.nn.Module):
                 n_burnin=int(layer2_n_burnin),
                 n_kernel_max_t=int(n_kernel_max_t),
                 sigma_max_samples=self._layer2_sigma_max_samples,
+                sigma_floor=float(layer2_sigma_floor),
                 device=device,
             )
             if layer2_seed_unit:
@@ -734,6 +768,46 @@ class DeterministicDetector(torch.nn.Module):
     @property
     def threshold_sigma(self) -> float:
         return self._threshold_sigma
+
+    @property
+    def merger_config(self) -> Optional[MergerConfig]:
+        """C1 merger geometry (``None`` ⇒ legacy axis-AND merger)."""
+        return self._merger_config
+
+    @property
+    def c1_snr_min(self) -> Optional[float]:
+        """C1 SNR floor (single knob used for NMS threshold + emit gate)."""
+        return self._c1_snr_min
+
+    def _merge_per_kernel_cands(
+        self, per_kernel_cands: List[Candidate]
+    ) -> List[Candidate]:
+        """Apply the configured cross-kernel merger to a flat per-kernel
+        candidate list. Routes to ``merge_across_kernels_c1`` when a
+        :class:`MergerConfig` is wired (M7.4 C1 path) and to the legacy
+        axis-AND ``merge_across_kernels`` otherwise.
+        """
+        if self._merger_config is not None:
+            return merge_across_kernels_c1(per_kernel_cands, self._merger_config)
+        return merge_across_kernels(
+            per_kernel_cands,
+            merge_radius_lm=self._merge_radius_lm,
+            merge_radius_fdm=self._merge_radius_fdm,
+            merge_radius_t=self._merge_radius_t,
+        )
+
+    def _apply_c1_emit_floor(
+        self, cands: List[Candidate]
+    ) -> List[Candidate]:
+        """Defensive C1 emit-floor (``c1_snr_min``). The per-kernel
+        decoder already drops anything ≤ ``threshold_sigma``; this is a
+        belt-and-braces filter so the C1 emitter never ships a sub-SNR
+        candidate even if a future decoder change weakens the inner
+        threshold. No-op when ``c1_snr_min`` is unset."""
+        if self._c1_snr_min is None:
+            return cands
+        floor = float(self._c1_snr_min)
+        return [c for c in cands if float(c.snr) >= floor]
 
     @property
     def layer2_state(self) -> Layer2State:
@@ -819,7 +893,13 @@ class DeterministicDetector(torch.nn.Module):
         # skip BOTH forward and noise updates; here we still run forward
         # (the candidate log records what the detector saw) but skip
         # the EMA update so a contaminated cube doesn't poison σ_k.
-        cube_valid = bool(torch.all(validity_mask).item())
+        # M7.4: allow Layer-2 EMA updates when the valid fraction
+        # crosses a tunable threshold (default still 100% to preserve
+        # legacy behaviour). When relaxed, a small fraction of
+        # masked/flagged cells does not prevent σ_k learning, which
+        # was empirically required to converge σ_k across nodes on
+        # the 250924mptq replay.
+        cube_valid = self._compute_cube_valid(validity_mask)
         s_k_tensor, is_warming_up = self._layer2.update_and_query(
             scores=scores, valid=cube_valid,
         )
@@ -854,15 +934,10 @@ class DeterministicDetector(torch.nn.Module):
                 cands = [_with_flags(c, c.flags | warmup_flag) for c in cands]
             per_kernel_cands.extend(cands)
 
-        merged = merge_across_kernels(
-            per_kernel_cands,
-            merge_radius_lm=self._merge_radius_lm,
-            merge_radius_fdm=self._merge_radius_fdm,
-            merge_radius_t=self._merge_radius_t,
-        )
+        merged = self._merge_per_kernel_cands(per_kernel_cands)
 
         if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
-            return merged
+            return self._apply_c1_emit_floor(merged)
         emit, _dropped = filter_to_canonical(
             merged,
             dm_idx_canonical_lo=dm_idx_canonical_lo,
@@ -871,7 +946,7 @@ class DeterministicDetector(torch.nn.Module):
             n_kernel_max_t=n_kernel_max_t,
             cube_t_offset=event_specnum,
         )
-        return emit
+        return self._apply_c1_emit_floor(emit)
 
     # -----------------------------------------------------------------
     # Internals (chunk-1 testable)
@@ -911,6 +986,23 @@ class DeterministicDetector(torch.nn.Module):
             raise TypeError(
                 f"validity_mask.dtype={validity_mask.dtype}, expected torch.bool"
             )
+
+    def _compute_cube_valid(self, validity_mask: torch.Tensor) -> bool:
+        """Decide whether to use this cube to update Layer-2 σ_k.
+
+        Returns True when at least ``layer2_valid_min_fraction`` of the
+        ``(T_det, N_fdm)`` cells are True. Default 1.0 reproduces the
+        pre-M7.4 strict ``torch.all`` behaviour bit-for-bit; values
+        below 1.0 let σ_k learn from cubes that have a few sparse
+        invalid cells (the field-typical regime).
+        """
+        if self._layer2_valid_min_fraction >= 1.0:
+            return bool(torch.all(validity_mask).item())
+        n_total = int(validity_mask.numel())
+        if n_total <= 0:
+            return False
+        n_valid = int(validity_mask.sum().item())
+        return (n_valid / n_total) >= self._layer2_valid_min_fraction
 
     def _compute_per_kernel_scores(
         self,
@@ -1153,7 +1245,7 @@ class DeterministicDetector(torch.nn.Module):
         self._validate_cube(cube, validity_mask)
 
         K = len(self._kernel_bank)  # noqa: N806
-        cube_valid = bool(torch.all(validity_mask).item())
+        cube_valid = self._compute_cube_valid(validity_mask)
         tile_size = self._streaming_tile_size
 
         # Detect the v1-collapsed bank optimisation: every kernel uses
@@ -1597,7 +1689,12 @@ class DeterministicDetector(torch.nn.Module):
 
         # Note: the amortise cs buffer is owned by the detector and
         # reused across cubes; do not free here.
-        if use_argmax_decode or fused_done:
+        if self._merger_config is not None:
+            # C1 path (M7.4): re-merge under the new geometry even when
+            # the fused/argmax decoders already de-duplicated under
+            # legacy radii, so the survivors carry C1 semantics.
+            merged = merge_across_kernels_c1(per_kernel_cands, self._merger_config)
+        elif use_argmax_decode or fused_done:
             # ``decode_topk_argmax_lowmem`` already produced
             # de-duplicated candidates across the kernel bank — skip the
             # cross-kernel merger.
@@ -1611,7 +1708,7 @@ class DeterministicDetector(torch.nn.Module):
             )
 
         if dm_idx_canonical_lo is None or dm_idx_canonical_hi is None:
-            return merged
+            return self._apply_c1_emit_floor(merged)
         emit, _dropped = filter_to_canonical(
             merged,
             dm_idx_canonical_lo=dm_idx_canonical_lo,
@@ -1620,4 +1717,4 @@ class DeterministicDetector(torch.nn.Module):
             n_kernel_max_t=n_kernel_max_t,
             cube_t_offset=event_specnum,
         )
-        return emit
+        return self._apply_c1_emit_floor(emit)

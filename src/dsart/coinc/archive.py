@@ -1,0 +1,348 @@
+"""Per-event archive layout writer.
+
+For each triggered cluster, C2 lays out a directory tree under
+``coinc.event_archive_root/<event_name>/`` (default
+``/dataz/dsa110/candidates/<event_name>/``):
+
+```
+<event_name>/
+├── Level2/
+│   ├── C2_<name>.csv           # the cluster's per-candidate rows
+│   ├── C1_window_<name>.csv    # all in-window C1 candidates around it
+│   └── plots/                  # populated later by the plot worker
+├── Level3/
+│   └── <name>.json             # trigger metadata
+├── cubes/                      # populated by cube_uploader rsyncs
+├── voltages/                   # filled later by corr-side voltage dump
+├── filterbank/                 # filled later
+└── calibration/                # symlink to fixture cal/ for replays
+```
+
+See ``docs/c1c2/C1C2_DESIGN.md`` §3.5 for the layout contract.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import os
+import tempfile
+from dataclasses import asdict
+from pathlib import Path
+from typing import Iterable, Mapping, Optional, Sequence
+
+from .stats import ClusterStats
+from .window import WindowEntry
+
+__all__ = [
+    "EventArchiveWriter",
+    "C1_WINDOW_CSV_FIELDS",
+    "C2_CLUSTER_CSV_FIELDS",
+    "EVENT_SUBDIRS",
+]
+
+
+_LOG = logging.getLogger("dsart.coinc.archive")
+
+
+# Subdirectories created beneath /dataz/dsa110/candidates/<name>/.
+# voltages/ and filterbank/ are filled later by other workers; we
+# still create them so downstream tooling can assume they exist.
+EVENT_SUBDIRS: tuple[str, ...] = (
+    "Level2",
+    "Level2/plots",
+    "Level3",
+    "cubes",
+    "voltages",
+    "filterbank",
+    "calibration",
+)
+
+
+# C1 per-row CSV schema. Order matches docs/c1c2/C1C2_DESIGN.md §3.6.
+C1_WINDOW_CSV_FIELDS: tuple[str, ...] = (
+    "mjd",
+    "event_specnum",
+    "snr",
+    "dm_pc_cc",
+    "dm_idx_global",
+    "fine_dm_idx",
+    "l_rad",
+    "m_rad",
+    "l_pix",
+    "m_pix",
+    "width_samples",
+    "kernel_id",
+    "flags",
+    "search_node_id",
+    "gpu_half",
+    "cube_id",
+    "trigger",
+)
+
+
+# C2 per-cluster CSV schema. Order matches docs/c1c2/C1C2_DESIGN.md §3.6.
+C2_CLUSTER_CSV_FIELDS: tuple[str, ...] = (
+    "mjd_peak",
+    "snr_max",
+    "snr_sum",
+    "snr_mean",
+    "n_events",
+    "n_search_nodes",
+    "n_gpu_halves",
+    "dm_median",
+    "dm_iqr",
+    "dm_min",
+    "dm_max",
+    "l_median",
+    "m_median",
+    "lm_diag_rad",
+    "width_median",
+    "width_min",
+    "width_max",
+    "t_span_s",
+    "t_start_mjd",
+    "t_end_mjd",
+    "kernel_ids_distinct",
+    "trigger_class",
+    "trigger",
+)
+
+
+def _atomic_write(path: Path, body: str) -> None:
+    """Write ``body`` to ``path`` via tempfile + os.rename (atomic)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    except Exception:
+        # Best effort to clean up the temp file on failure.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def entry_to_csv_row(
+    entry: WindowEntry, *, trigger: str = "",
+) -> dict[str, object]:
+    return {
+        "mjd": f"{entry.mjd:.11f}",
+        "event_specnum": entry.event_specnum,
+        "snr": f"{entry.snr:.6e}",
+        "dm_pc_cc": f"{entry.dm_pc_cc:.6f}",
+        "dm_idx_global": entry.dm_idx_global,
+        "fine_dm_idx": entry.fine_dm_idx,
+        "l_rad": f"{entry.l_rad:.9e}",
+        "m_rad": f"{entry.m_rad:.9e}",
+        "l_pix": entry.l_pix,
+        "m_pix": entry.m_pix,
+        "width_samples": entry.width_samples,
+        "kernel_id": entry.kernel_id,
+        "flags": entry.flags,
+        "search_node_id": entry.search_node_id,
+        "gpu_half": entry.gpu_half,
+        "cube_id": entry.cube_id,
+        "trigger": trigger,
+    }
+
+
+def stats_to_csv_row(
+    stats: ClusterStats,
+    *,
+    trigger_class: str = "",
+    trigger: str = "",
+) -> dict[str, object]:
+    t_span_s = (stats.t_end_mjd - stats.t_start_mjd) * 86400.0
+    return {
+        "mjd_peak": f"{stats.t_peak_mjd:.11f}",
+        "snr_max": f"{stats.snr_max:.6e}",
+        "snr_sum": f"{stats.snr_sum:.6e}",
+        "snr_mean": f"{stats.snr_mean:.6e}",
+        "n_events": stats.n_events,
+        "n_search_nodes": stats.n_search_nodes,
+        "n_gpu_halves": stats.n_gpu_halves,
+        "dm_median": f"{stats.dm_median:.6f}",
+        "dm_iqr": f"{stats.dm_iqr:.6f}",
+        "dm_min": f"{stats.dm_min:.6f}",
+        "dm_max": f"{stats.dm_max:.6f}",
+        "l_median": f"{stats.l_median:.9e}",
+        "m_median": f"{stats.m_median:.9e}",
+        "lm_diag_rad": f"{stats.lm_diag_rad:.9e}",
+        "width_median": f"{stats.width_median:.3f}",
+        "width_min": stats.width_min,
+        "width_max": stats.width_max,
+        "t_span_s": f"{t_span_s:.6e}",
+        "t_start_mjd": f"{stats.t_start_mjd:.11f}",
+        "t_end_mjd": f"{stats.t_end_mjd:.11f}",
+        "kernel_ids_distinct": ";".join(stats.kernel_ids_distinct),
+        "trigger_class": trigger_class,
+        "trigger": trigger,
+    }
+
+
+class EventArchiveWriter:
+    """Create + populate ``<archive_root>/<event_name>/``.
+
+    Use:
+        wr = EventArchiveWriter(archive_root, calibration_source=...)
+        evdir = wr.create("260521abcd")
+        wr.write_c2_cluster_csv(evdir, "260521abcd", stats,
+                                trigger_class="bright_frb")
+        wr.write_c1_window_csv(evdir, "260521abcd", members,
+                               trigger="260521abcd")
+        wr.write_l3_metadata(evdir, "260521abcd", metadata_dict)
+    """
+
+    def __init__(
+        self,
+        archive_root: Path,
+        *,
+        calibration_source: Optional[Path] = None,
+    ) -> None:
+        self._root = Path(archive_root)
+        self._cal_src = (
+            Path(calibration_source) if calibration_source else None
+        )
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    def event_dir(self, event_name: str) -> Path:
+        return self._root / event_name
+
+    def create(self, event_name: str) -> Path:
+        """Create the per-event directory tree; idempotent."""
+        if not event_name or "/" in event_name:
+            raise ValueError(f"bad event_name: {event_name!r}")
+        ev = self.event_dir(event_name)
+        for sub in EVENT_SUBDIRS:
+            (ev / sub).mkdir(parents=True, exist_ok=True)
+        # Symlink calibration/ if a source is configured. Existing
+        # entries (file or symlink) are left alone.
+        if self._cal_src is not None:
+            cal_dir = ev / "calibration"
+            # We created cal_dir as a mkdir above; only replace it with
+            # a symlink if empty (don't blow away anything the operator
+            # may have dropped in there).
+            if cal_dir.is_dir() and not any(cal_dir.iterdir()):
+                try:
+                    cal_dir.rmdir()
+                    os.symlink(str(self._cal_src), str(cal_dir))
+                except OSError as exc:
+                    _LOG.warning(
+                        "failed to symlink calibration/ -> %s for %s: %s",
+                        self._cal_src, event_name, exc,
+                    )
+        return ev
+
+    def write_c2_cluster_csv(
+        self,
+        event_dir: Path,
+        event_name: str,
+        stats: ClusterStats,
+        *,
+        trigger_class: str = "",
+        trigger: str = "",
+    ) -> Path:
+        path = event_dir / "Level2" / f"C2_{event_name}.csv"
+        row = stats_to_csv_row(
+            stats, trigger_class=trigger_class, trigger=trigger,
+        )
+        body = self._render_csv(C2_CLUSTER_CSV_FIELDS, [row])
+        _atomic_write(path, body)
+        return path
+
+    def write_c1_window_csv(
+        self,
+        event_dir: Path,
+        event_name: str,
+        members: Iterable[WindowEntry],
+        *,
+        trigger: str = "",
+    ) -> Path:
+        path = event_dir / "Level2" / f"C1_window_{event_name}.csv"
+        rows = [entry_to_csv_row(m, trigger=trigger) for m in members]
+        body = self._render_csv(C1_WINDOW_CSV_FIELDS, rows)
+        _atomic_write(path, body)
+        return path
+
+    def write_l3_metadata(
+        self,
+        event_dir: Path,
+        event_name: str,
+        metadata: Mapping[str, object],
+    ) -> Path:
+        path = event_dir / "Level3" / f"{event_name}.json"
+        body = json.dumps(metadata, indent=2, sort_keys=True, default=str)
+        _atomic_write(path, body + "\n")
+        return path
+
+    @staticmethod
+    def _render_csv(
+        fields: Sequence[str], rows: Sequence[Mapping[str, object]],
+    ) -> str:
+        import io
+        buf = io.StringIO()
+        writer = csv.DictWriter(
+            buf, fieldnames=list(fields), extrasaction="ignore",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        return buf.getvalue()
+
+
+def stats_to_l3_metadata(
+    *,
+    event_name: str,
+    stats: ClusterStats,
+    trigger_class_name: str,
+    trigger_action: str,
+    holdoff_s: float,
+    schema_version: int = 1,
+) -> dict[str, object]:
+    """Build the L3 JSON payload the legacy archive consumer expects.
+
+    Mirrors the legacy tasktrigger shape where it's compatible; new
+    keys are nested under ``c2`` so we don't fight the old consumer.
+    """
+    return {
+        "event_name": event_name,
+        "schema_version": schema_version,
+        "trigger": {
+            "class": trigger_class_name,
+            "action": trigger_action,
+            "holdoff_s": holdoff_s,
+        },
+        "c2": {
+            "n_events": stats.n_events,
+            "n_search_nodes": stats.n_search_nodes,
+            "n_gpu_halves": stats.n_gpu_halves,
+            "snr_max": stats.snr_max,
+            "snr_mean": stats.snr_mean,
+            "snr_sum": stats.snr_sum,
+            "dm_min": stats.dm_min,
+            "dm_max": stats.dm_max,
+            "dm_median": stats.dm_median,
+            "dm_iqr": stats.dm_iqr,
+            "l_median": stats.l_median,
+            "m_median": stats.m_median,
+            "lm_diag_rad": stats.lm_diag_rad,
+            "width_min": stats.width_min,
+            "width_max": stats.width_max,
+            "width_median": stats.width_median,
+            "t_start_mjd": stats.t_start_mjd,
+            "t_end_mjd": stats.t_end_mjd,
+            "t_peak_mjd": stats.t_peak_mjd,
+            "peak_event_specnum": stats.peak_event_specnum,
+            "kernel_ids_distinct": list(stats.kernel_ids_distinct),
+        },
+    }

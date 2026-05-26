@@ -1,0 +1,25 @@
+[Unit]
+Description=DSA-110 hiplot — C1 hourly cluster output (h23, port 5017)
+Documentation=file:/home/ubuntu/vikram/dev/dsa110-rt/docs/c1c2/C1C2_DESIGN.md
+After=network-online.target dsart_c2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/dataz/dsa110/operations/C1/cluster_output
+# Modelled on the legacy ~/.config/systemd/user/hiplot.service on h23:
+# `hiplot -p <port>` serves the cwd's *.csv to the browser. The
+# default hiplot port is 5005; we put C1 on 5017 to leave room for
+# the legacy 5007 instance during the M7.4 cutover (we'll stop the
+# legacy one only after this is verified up).
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/hiplot --port 5017 --host 0.0.0.0
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiplot_c1
+
+[Install]
+WantedBy=default.target

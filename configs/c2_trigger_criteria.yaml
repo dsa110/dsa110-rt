@@ -1,0 +1,47 @@
+# C2 coincidencer trigger criteria.
+#
+# Hot-reloadable on SIGHUP (the C2 service watches mtime).  See
+# docs/c1c2/C1C2_DESIGN.md §3.4 for action semantics.
+#
+# Defaults below are starter values for the M7.4 burst-replay
+# shake-down; operator is expected to retune based on the
+# 250924mptq run.
+#
+# Notes on semantics (see src/dsart/coinc/criteria.py):
+#   * ``dm_iqr_max_pc_cc`` is SNR-scaled: the value here is the cap
+#     applied at snr_max=12; the effective cap grows hyperbolically
+#     and is infinity at snr_max>=50. This lets very-bright bursts
+#     (which trip many DM trials at once) pass while keeping a tight
+#     cap for low-SNR candidates.
+#   * ``lm_diag_max_rad`` is the diagonal of the cluster's (l,m)
+#     bounding box, in radians; ~0 for a true point source.
+
+trigger_classes:
+  - name: bright_frb
+    description: "high-S/N, multi-half coincident, tight DM/width/lm — FRB candidate"
+    require:
+      snr_max_min: 12.0
+      n_events_min: 3
+      n_search_nodes_min: 2
+      dm_median_min_pc_cc: 50.0
+      dm_median_max_pc_cc: 4000.0
+      dm_iqr_max_pc_cc: 30.0
+      width_median_max_samples: 32
+      lm_diag_max_rad: 0.1
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
+  - name: bright_pulsar
+    description: "single-source multi-pulse train, tight DM"
+    require:
+      snr_max_min: 10.0
+      n_events_min: 5
+      dm_iqr_max_pc_cc: 2.0
+    action: dump_all_gpus
+    holdoff_s: 5.0
+
+  - name: log_only
+    description: "fallback — every cluster that doesn't trip a real trigger"
+    require:
+      n_events_min: 1
+    action: log_only

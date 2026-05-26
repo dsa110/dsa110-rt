@@ -55,6 +55,7 @@ from ant_table import (
     all_ant_nums_in_cube_order,
     ant_idx_to_ant_num,
 )
+from cands_panel_funcs import ArchiveBrowser, DEFAULT_ARCHIVE_ROOT
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,11 @@ class _LazyEtcd:
 
 
 etcd_store = _LazyEtcd()
+
+
+# Burst-candidates archive browser (h23 reads /dataz/dsa110/candidates/).
+# Module-level singleton — cheap to construct, all I/O is per-request.
+cands_browser = ArchiveBrowser()
 
 
 def _init_store_and_poller() -> None:
@@ -180,11 +186,40 @@ def sefds():
 
 @app.route("/bursts")
 def bursts():
+    events = cands_browser.list_events()
     return render_template(
         "bursts.html",
         active_tab="bursts",
         sefd_url=SEFD_DASHBOARD_URL,
+        events=events,
+        archive_root=str(cands_browser.root),
+        archive_available=cands_browser.is_available,
     )
+
+
+@app.route("/bursts/<name>")
+def burst_event(name: str):
+    import json as _json
+    detail = cands_browser.event_detail(name)
+    if detail is None:
+        abort(404)
+    return render_template(
+        "burst_event.html",
+        active_tab="bursts",
+        event=detail,
+        metadata_pretty=_json.dumps(
+            detail.metadata, indent=2, sort_keys=True, default=str,
+        ),
+        sefd_url=SEFD_DASHBOARD_URL,
+    )
+
+
+@app.route("/bursts/<name>/plot/<plot_name>")
+def burst_event_plot(name: str, plot_name: str):
+    p = cands_browser.plot_path(name, plot_name)
+    if p is None:
+        abort(404)
+    return send_file(str(p), mimetype="image/png")
 
 
 # ---------- Plot endpoints (PNG) ------------------------------------------

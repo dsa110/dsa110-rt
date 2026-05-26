@@ -74,7 +74,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Final, Optional, Protocol
 
 import numpy as np
 import torch
@@ -269,6 +269,81 @@ class _Stage2FIFOAdapter:
         block_n: int,
     ) -> list[torch.Tensor]:
         return self.fifo.push_for_protocol(dedispersed, block_n=block_n)
+
+
+class _Stage2InterChgroupShiftAdapter:
+    """Lazy wrapper around :class:`Stage2InterChgroupShiftFifo`.
+
+    Option A wire-in: applies per-(coarse-DM) inter-chgroup time
+    alignment at the corr_fast TX boundary, so the search side can
+    revert to ``compute_time_shift_search(include_coarse_offset=False)``
+    and the search-side rx-ring buffer shrinks back to the
+    stage-3-only minimum (~16x smaller at the M7.4 op point).
+
+    The inner :class:`Stage2InterChgroupShiftFifo` requires
+    ``t_dedisp`` at construction, but that value is only known once
+    the first dedispersed cube is produced (it depends on the corr-
+    fast cadence + block size + multi-DM stage-1 history). This
+    adapter constructs the inner FIFO on the FIRST push, using the
+    incoming cube's ``shape[1]`` as the ground truth.
+    """
+
+    __slots__ = ("_chgroup", "_coarse_dm", "_t_int_corr_us", "_inner")
+
+    def __init__(
+        self,
+        *,
+        chgroup: int,
+        coarse_dm_pc_cm3: np.ndarray,
+        t_int_corr_us: float,
+    ) -> None:
+        self._chgroup = int(chgroup)
+        self._coarse_dm = np.ascontiguousarray(
+            coarse_dm_pc_cm3, dtype=np.float64
+        )
+        self._t_int_corr_us = float(t_int_corr_us)
+        self._inner: Optional["Stage2InterChgroupShiftFifo"] = None
+
+    def push(
+        self,
+        dedispersed: torch.Tensor,
+        *,
+        block_n: int,
+    ) -> list[torch.Tensor]:
+        if self._inner is None:
+            from dsart.coarse_dm.stage2_chgroup_alignment import (
+                Stage2InterChgroupShiftFifo,
+            )
+            if dedispersed.ndim != 3:
+                raise ValueError(
+                    "Stage2InterChgroupShiftFifo expects (N_DM, T, N_filled); "
+                    f"got ndim={dedispersed.ndim}"
+                )
+            n_dm_in = int(dedispersed.shape[0])
+            t_dedisp = int(dedispersed.shape[1])
+            if n_dm_in != self._coarse_dm.size:
+                raise ValueError(
+                    f"Stage2InterChgroupShiftFifo n_dm mismatch: "
+                    f"cube.shape[0]={n_dm_in} != "
+                    f"len(coarse_dm)={self._coarse_dm.size}"
+                )
+            self._inner = Stage2InterChgroupShiftFifo(
+                chgroup=self._chgroup,
+                coarse_dm_pc_cm3=self._coarse_dm,
+                t_dedisp=t_dedisp,
+                t_int_corr_us=self._t_int_corr_us,
+            )
+            LOG.info(
+                "Stage2InterChgroupShiftFifo built: chgroup=%d n_dm=%d "
+                "t_dedisp=%d max_shift_samples=%d "
+                "max_ring_depth_cubes=%d",
+                self._chgroup,
+                self._inner.n_dm,
+                self._inner.t_dedisp,
+                int(self._inner.shifts_samples.max()),
+                self._inner.max_ring_depth_in_cubes,
+            )
+        return self._inner.push(dedispersed, block_n=block_n)
 
 
 class _TransportTxAdapter:
@@ -934,6 +1009,13 @@ class StaticSkyEMA:
     fringe winding, which the F21 DEC-phase cal already partially
     de-rotates), so the EMA learns + subtracts them.
 
+    Multi-DM mode (M7.4 fix): set ``n_dm > 1`` to maintain ``n_dm``
+    independent EMA states. The :meth:`apply` ``dm_slot`` argument
+    selects which state to read+update. This is required when the
+    same EMA is fed multiple dedispersion trials in one block — a
+    single shared state would have each trial's residuals leak into
+    the others, leaving comparable burst energy in every trial.
+
     Args:
         alpha: EMA smoothing factor in (0, 1]. The EMA half-life is
             ``ln(0.5) / ln(1-alpha) ≈ 0.69 / alpha`` cubes. Default
@@ -942,15 +1024,24 @@ class StaticSkyEMA:
         warmup_cubes: number of cubes at the start during which we
             BUILD the EMA but do NOT subtract (so the first few
             cubes are not artificially zeroed by the cold EMA).
+        n_dm: number of independent EMA states to keep. Default 1
+            (legacy single-DM path). Set to ``plan.n_coarse`` (or
+            ``multi_dm.n_dm``) to make each dedispersion trial own
+            its own running mean. Backward-compatible: ``dm_slot=0``
+            with ``n_dm=1`` reproduces the legacy single-slot
+            behaviour bit-for-bit.
     """
 
     alpha: float = 0.001
     warmup_cubes: int = 8
+    n_dm: int = 1
 
-    _running_mean: torch.Tensor | None = field(
-        default=None, init=False, repr=False,
+    _running_mean_per_dm: list = field(
+        default_factory=list, init=False, repr=False,
     )
-    _cubes_seen: int = field(default=0, init=False, repr=False)
+    _cubes_seen_per_dm: list = field(
+        default_factory=list, init=False, repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not (0.0 < self.alpha <= 1.0):
@@ -962,20 +1053,36 @@ class StaticSkyEMA:
                 f"StaticSkyEMA.warmup_cubes={self.warmup_cubes}, "
                 f"expected >= 0"
             )
+        if self.n_dm < 1:
+            raise ValueError(
+                f"StaticSkyEMA.n_dm={self.n_dm}, expected >= 1"
+            )
+        self._running_mean_per_dm = [None] * int(self.n_dm)
+        self._cubes_seen_per_dm = [0] * int(self.n_dm)
 
     @property
     def cubes_seen(self) -> int:
-        return self._cubes_seen
+        """Cubes seen in slot 0 (backwards-compat alias for single-DM use)."""
+        return int(self._cubes_seen_per_dm[0]) if self._cubes_seen_per_dm else 0
+
+    def cubes_seen_for(self, dm_slot: int = 0) -> int:
+        return int(self._cubes_seen_per_dm[int(dm_slot)])
 
     @property
     def in_warmup(self) -> bool:
-        return self._cubes_seen < self.warmup_cubes
+        """Slot 0 warmup status (backwards-compat alias)."""
+        return self.cubes_seen < self.warmup_cubes
+
+    def in_warmup_for(self, dm_slot: int = 0) -> bool:
+        return self.cubes_seen_for(dm_slot) < self.warmup_cubes
 
     def reset(self) -> None:
-        self._running_mean = None
-        self._cubes_seen = 0
+        self._running_mean_per_dm = [None] * int(self.n_dm)
+        self._cubes_seen_per_dm = [0] * int(self.n_dm)
 
-    def apply(self, gridded: torch.Tensor) -> torch.Tensor:
+    def apply(
+        self, gridded: torch.Tensor, dm_slot: int = 0,
+    ) -> torch.Tensor:
         """Subtract the running mean from ``gridded`` and update the EMA.
 
         ``gridded`` is expected to be ``(n_fast_vis, N_filled)`` complex64
@@ -983,6 +1090,10 @@ class StaticSkyEMA:
         kept at ``(N_filled,)`` complex64 — averaged over the
         ``n_fast_vis`` axis on the way in, broadcast back on the way
         out.
+
+        ``dm_slot``: which of ``n_dm`` independent EMA states to
+        read+update. Default 0 for backwards-compat with the
+        legacy single-DM call sites.
         """
         if not gridded.is_complex():
             raise TypeError(
@@ -995,26 +1106,34 @@ class StaticSkyEMA:
                 f"(n_fast_vis, N_filled); got "
                 f"{tuple(gridded.shape)}"
             )
+        slot = int(dm_slot)
+        if slot < 0 or slot >= self.n_dm:
+            raise IndexError(
+                f"StaticSkyEMA.apply: dm_slot={slot} out of range "
+                f"[0, {self.n_dm})"
+            )
 
         per_cell_mean = gridded.mean(dim=0)                              # (N_filled,)
+        running_mean = self._running_mean_per_dm[slot]
+        cubes_seen = int(self._cubes_seen_per_dm[slot])
 
-        if self._running_mean is None:
-            self._running_mean = per_cell_mean.clone().detach()
+        if running_mean is None:
+            self._running_mean_per_dm[slot] = per_cell_mean.clone().detach()
             out = gridded.clone()                                        # cold start: pass through
-        elif self.in_warmup:
+        elif cubes_seen < self.warmup_cubes:
             out = gridded.clone()                                        # build EMA, don't subtract
-            self._running_mean = (
-                (1.0 - self.alpha) * self._running_mean
+            self._running_mean_per_dm[slot] = (
+                (1.0 - self.alpha) * running_mean
                 + self.alpha * per_cell_mean
             )
         else:
-            out = gridded - self._running_mean.unsqueeze(0)              # subtract, then update
-            self._running_mean = (
-                (1.0 - self.alpha) * self._running_mean
+            out = gridded - running_mean.unsqueeze(0)                    # subtract, then update
+            self._running_mean_per_dm[slot] = (
+                (1.0 - self.alpha) * running_mean
                 + self.alpha * per_cell_mean
             )
 
-        self._cubes_seen += 1
+        self._cubes_seen_per_dm[slot] = cubes_seen + 1
         return out
 
 
@@ -1782,16 +1901,27 @@ def _process_block_consume_phase(
         # 8. Per-trial static-sky EMA subtraction (collapses the
         # T_dedisp axis → N_filled internally; replicates back to
         # the full (T_dedisp, N_filled) shape).
+        #
+        # M7.4 fix: pass ``dm_slot=c`` so each dedispersion trial has
+        # its own EMA state (built by ``_build_integration_context``
+        # with ``n_dm=plan.n_coarse``). A shared single-slot EMA
+        # leaks each trial's residuals into every subsequent trial,
+        # which empirically made the burst show up at comparable
+        # SNR in every coarse-DM bin on the 250924mptq replay.
         if ctx.static_sky is not None and not ctx.cfg.static_sky_disabled:
             if ctx.profiler is not None:
                 with ctx.profiler.bracket("static_sky"):
                     n_dm, t_dedisp, n_filled = dedispersed.shape
                     for c in range(n_dm):
-                        dedispersed[c] = ctx.static_sky.apply(dedispersed[c])
+                        dedispersed[c] = ctx.static_sky.apply(
+                            dedispersed[c], dm_slot=c,
+                        )
             else:
                 n_dm, t_dedisp, n_filled = dedispersed.shape
                 for c in range(n_dm):
-                    dedispersed[c] = ctx.static_sky.apply(dedispersed[c])
+                    dedispersed[c] = ctx.static_sky.apply(
+                        dedispersed[c], dm_slot=c,
+                    )
 
         # The "headline" pre-stage2 cube is the multi-DM cube itself.
         # Tests + benches read this from IntegrationOutput.gridded_minus_sky.
@@ -2460,23 +2590,17 @@ def build_context(
         device=device,
     )
 
-    static_sky: StaticSkyEMA | None = None
-    if not cfg.static_sky_disabled:
-        static_sky = StaticSkyEMA(
-            alpha=cfg.static_sky_alpha,
-            warmup_cubes=cfg.static_sky_warmup_cubes,
-        )
-        LOG.info(
-            "StaticSkyEMA ready: alpha=%.4g warmup_cubes=%d",
-            static_sky.alpha, static_sky.warmup_cubes,
-        )
-    else:
-        LOG.info("StaticSkyEMA DISABLED (cfg.static_sky_disabled=True)")
-
     # Chunk-9 / F25 production multi-DM path.
     # ``dm_plan`` arg overrides ``cfg.dm_plan_path`` — used by tests +
     # benches that synthesise a custom plan (e.g. chunk-6 single-DM
     # burst, chunk-9 throughput).
+    #
+    # M7.4 fix: we load the plan *before* the StaticSkyEMA so the EMA
+    # can be sized with one independent state per coarse-DM trial
+    # (``n_dm=plan.n_coarse``). The pre-M7.4 single-slot EMA leaked
+    # residuals across DM trials and made bursts appear at comparable
+    # SNR in every coarse-DM bin (see the per-(sid, half) ``dm_p50``
+    # table in the 250924mptq postmortem).
     multi_dm: Stage1MultiDMCoarseDM | None = None
     plan: DMPlan | None = dm_plan
     if plan is None and cfg.dm_plan_path is not None:
@@ -2535,6 +2659,24 @@ def build_context(
             str(cfg.dm_indices_subset),
             cfg.sliding_window, multi_dm.dm_chunk_size,
         )
+
+    # StaticSkyEMA — one independent state per coarse-DM trial when
+    # the multi-DM path is active; legacy single-DM path uses one
+    # slot (the default). See class docstring for the M7.4 motivation.
+    n_static_sky_slots = int(multi_dm.n_dm) if multi_dm is not None else 1
+    static_sky: StaticSkyEMA | None = None
+    if not cfg.static_sky_disabled:
+        static_sky = StaticSkyEMA(
+            alpha=cfg.static_sky_alpha,
+            warmup_cubes=cfg.static_sky_warmup_cubes,
+            n_dm=n_static_sky_slots,
+        )
+        LOG.info(
+            "StaticSkyEMA ready: alpha=%.4g warmup_cubes=%d n_dm=%d",
+            static_sky.alpha, static_sky.warmup_cubes, static_sky.n_dm,
+        )
+    else:
+        LOG.info("StaticSkyEMA DISABLED (cfg.static_sky_disabled=True)")
 
     return IntegrationContext(
         cfg=cfg,
@@ -2746,6 +2888,7 @@ def run(
     use_pipeliner_3s: bool = False,
     profile_stages_every: int = 0,
     stage2_fifo_depth: int = COARSE_DM_FIFO_DEPTH_DEFAULT,
+    stage2_mode: str = "uniform",
     transport_tx_host: str = "",
     transport_tx_port: int = 9000,
     transport_tx_mode: str = "chunk8",
@@ -2834,24 +2977,71 @@ def run(
             and transport_tx_workers > 0
             and transport_tx_mode == "prod"
         )
+        # Option A (M7.4 follow-up): if the operator opts in via
+        # ``--stage2-mode per_coarse_dm``, install the per-(chgroup,
+        # coarse-DM) shift FIFO instead of the uniform-depth one. The
+        # adapter constructs lazily on the first push so we don't need
+        # to know ``t_dedisp`` here.
+        def _install_per_coarse_dm_fifo() -> "_Stage2InterChgroupShiftAdapter":
+            if dm_plan is None and cfg.dm_plan_path is None:
+                raise ValueError(
+                    "--stage2-mode=per_coarse_dm requires a DM plan "
+                    "(set --dm-plan-path or pass dm_plan=... to run())"
+                )
+            local_plan = dm_plan
+            if local_plan is None:
+                from dsart.coarse_dm.dm_plan import load_dm_plan
+                local_plan = load_dm_plan(str(cfg.dm_plan_path))
+            from dsart.common.constants import NATIVE_SAMPLE_US
+            return _Stage2InterChgroupShiftAdapter(
+                chgroup=int(cfg.chgroup),
+                coarse_dm_pc_cm3=local_plan.dm_pc_cc,
+                t_int_corr_us=float(
+                    cfg.t_int_fast_native * NATIVE_SAMPLE_US
+                ),
+            )
+
+        use_per_coarse_dm_stage2 = stage2_mode == "per_coarse_dm"
+        if stage2_mode not in ("uniform", "per_coarse_dm"):
+            raise ValueError(
+                f"stage2_mode={stage2_mode!r}; expected "
+                f"'uniform' or 'per_coarse_dm'"
+            )
+
         if use_async_tx:
             if stage2_fifo is None:
-                stage2_fifo = _Stage2FIFOAdapter(depth=stage2_fifo_depth)
-                LOG.info(
-                    "M7.2 async TX: real Stage2FIFO depth=%d (was NoOp)",
-                    stage2_fifo_depth,
-                )
+                if use_per_coarse_dm_stage2:
+                    stage2_fifo = _install_per_coarse_dm_fifo()
+                    LOG.info(
+                        "M7.2 async TX + Option A: per-coarse-DM stage-2 "
+                        "FIFO installed (chgroup=%d)",
+                        cfg.chgroup,
+                    )
+                else:
+                    stage2_fifo = _Stage2FIFOAdapter(depth=stage2_fifo_depth)
+                    LOG.info(
+                        "M7.2 async TX: real Stage2FIFO depth=%d (was NoOp)",
+                        stage2_fifo_depth,
+                    )
             if transport_tx is None:
                 # Placeholder; real AsyncTransportTx built after
                 # build_context() once gridder.pattern is finalised.
                 transport_tx = NoOpTransportTx()
         elif transport_tx_host:
             if stage2_fifo is None:
-                stage2_fifo = _Stage2FIFOAdapter(depth=stage2_fifo_depth)
-                LOG.info(
-                    "M7.2 overlap: real Stage2FIFO ring depth=%d (was NoOp)",
-                    stage2_fifo_depth,
-                )
+                if use_per_coarse_dm_stage2:
+                    stage2_fifo = _install_per_coarse_dm_fifo()
+                    LOG.info(
+                        "M7.2 overlap + Option A: per-coarse-DM stage-2 "
+                        "FIFO installed (chgroup=%d)",
+                        cfg.chgroup,
+                    )
+                else:
+                    stage2_fifo = _Stage2FIFOAdapter(depth=stage2_fifo_depth)
+                    LOG.info(
+                        "M7.2 overlap: real Stage2FIFO ring depth=%d (was NoOp)",
+                        stage2_fifo_depth,
+                    )
             if transport_tx is None:
                 if transport_tx_mode == "chunk8":
                     dtype_code = (
@@ -3546,13 +3736,33 @@ def main(argv: list[str] | None = None) -> int:
                    default=COARSE_DM_FIFO_DEPTH_DEFAULT,
                    help=("M7.2: depth (in cubes) of the real "
                          "Stage2FIFO ring. Only used when "
-                         "--transport-tx-host is set. "
+                         "--transport-tx-host is set and "
+                         "--stage2-mode=uniform (default). "
                          f"Default {COARSE_DM_FIFO_DEPTH_DEFAULT} "
                          "(COARSE_DM_FIFO_DEPTH_DEFAULT). The FIFO "
                          "is the timing buffer for cross-chgroup "
                          "alignment per plan §3.6.2; the per-(g, c) "
                          "delay budget at the current DM plan must "
                          "fit in `depth` cubes."))
+    p.add_argument(
+        "--stage2-mode",
+        type=str,
+        default="uniform",
+        choices=("uniform", "per_coarse_dm"),
+        help=(
+            "M7.4 Option A: select the stage-2 inter-chgroup time-"
+            "alignment FIFO implementation.\n"
+            "  uniform        : legacy K-deep ring (Stage2FIFO); the "
+            "search side must absorb the per-chgroup offset via "
+            "compute_time_shift_search(include_coarse_offset=True). "
+            "Default.\n"
+            "  per_coarse_dm  : per-(chgroup, coarse-DM) sample-exact "
+            "shift FIFO (Stage2InterChgroupShiftFifo). The search "
+            "side must run with include_coarse_offset=False; "
+            "reclaims ~50%% of the search-side rx-ring t_buf. "
+            "Requires --dm-plan-path."
+        ),
+    )
     p.add_argument("--transport-tx-host", type=str, default="",
                    help=("M7.2: when set, enables the real Stage2FIFO + "
                          "TransportTx path (replaces the NoOp stubs). "
@@ -3789,6 +3999,7 @@ def main(argv: list[str] | None = None) -> int:
             use_pipeliner_3s=args.pipeliner_3s,
             profile_stages_every=args.profile_stages_every,
             stage2_fifo_depth=args.stage2_fifo_depth,
+            stage2_mode=args.stage2_mode,
             transport_tx_host=args.transport_tx_host,
             transport_tx_port=args.transport_tx_port,
             transport_tx_mode=args.transport_tx_mode,

@@ -1,0 +1,684 @@
+"""C2 (h23 coincidencer) service entry.
+
+Top-level async orchestrator that wires the
+:mod:`dsart.coinc` library into one long-running service. Lifted into
+``dsart.services.coincidencer`` so systemd's ExecStart can target it
+as ``python -u -m dsart.services.coincidencer``.
+
+Lifecycle (matches docs/c1c2/C1C2_DESIGN.md §3):
+
+  1. Parse CLI args, load YAML.
+  2. Bind the TCP receiver on ``coinc.bind`` (default 0.0.0.0:11500).
+  3. Start two RollingCsvWriter instances (C1 per-row, C2 per-cluster).
+  4. Spawn the PlotWorker (ThreadPoolExecutor).
+  5. Per accepted C1 batch: push to TimeWindow + CoincidenceGraph,
+     evaluate each touched component, on ``dump_all_gpus``:
+       - allocate a name (EventNameAllocator);
+       - create the per-event archive directory;
+       - write Level2/C2_<name>.csv + Level2/C1_window_<name>.csv +
+         Level3/<name>.json;
+       - UDP-broadcast the trigger to the 8 C1 listeners;
+       - schedule the plot job (deferred until cubes land or 60 s).
+  6. Hourly housekeeping: CSV rotation + retention enforcement +
+     stale-pending-plot reaper.
+  7. SIGHUP → ``CriteriaEvaluator.force_reload``.
+  8. SIGTERM / SIGINT → graceful shutdown.
+  9. Mon-points export to etcd at ``/mon/c2/h23`` every 5 s.
+
+The service is single-threaded asyncio (plus the plotter
+ThreadPoolExecutor); per-connection work serialises through one loop.
+
+CLI mirrors ``search_compute.py`` for operator muscle memory:
+
+  python -u -m dsart.services.coincidencer
+      --config /path/to/dsart_search_rt.yaml
+      --criteria /path/to/c2_trigger_criteria.yaml
+      [--log-level INFO]
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import signal
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+import yaml
+
+from ..coinc import wire
+from ..coinc.archive import (
+    C1_WINDOW_CSV_FIELDS,
+    C2_CLUSTER_CSV_FIELDS,
+    EventArchiveWriter,
+    entry_to_csv_row,
+    stats_to_csv_row,
+    stats_to_l3_metadata,
+)
+from ..coinc.broadcast import TriggerBroadcaster
+from ..coinc.components import CoincidenceGraph
+from ..coinc.criteria import CriteriaEvaluator
+from ..coinc.csv_rotator import RollingCsvWriter
+from ..coinc.names import EventNameAllocator
+from ..coinc.plotter import PlotWorker, enqueue_event
+from ..coinc.receiver import C1BatchReceiver
+from ..coinc.stats import ClusterStats, compute_stats
+from ..coinc.window import TimeWindow, WindowEntry
+
+__all__ = [
+    "CoincidencerConfig",
+    "CoincidencerService",
+    "main",
+]
+
+
+_LOG = logging.getLogger("dsart.services.coincidencer")
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CoincidencerConfig:
+    bind_host: str = "0.0.0.0"
+    bind_port: int = 11500
+
+    window_s: float = 5.0
+    csv_retention_hours: int = 48
+    csv_dir_c1: Path = Path("/dataz/dsa110/operations/C1/cluster_output")
+    csv_dir_c2: Path = Path("/dataz/dsa110/operations/C2/cluster_output")
+    event_archive_root: Path = Path("/dataz/dsa110/candidates")
+    trigger_criteria_path: Path = Path(
+        "/home/ubuntu/vikram/dev/dsa110-rt/configs/c2_trigger_criteria.yaml"
+    )
+
+    dump_broadcast_port_base: int = 11227
+    dump_broadcast_hosts: Mapping[int, str] = field(default_factory=dict)
+
+    plotter_n_workers: int = 2
+    plotter_per_event_timeout_s: float = 30.0
+
+    # Event-name allocator config.
+    etcd_lastname_key: str = "/mon/corr/1/trigger"
+    event_pkg_path: Optional[Path] = Path(
+        "/home/ubuntu/proj/dsa110-shell/dsa110-event"
+    )
+    name_allocator_offline: bool = False
+
+    # Plot dispatcher (how long to wait for cubes before plotting).
+    plot_cube_wait_s: float = 60.0
+    plot_dispatch_poll_s: float = 5.0
+    plot_expected_cube_count: int = 8
+
+    # Mon-points export.
+    mon_etcd_key: str = "/mon/c2/h23"
+    mon_publish_interval_s: float = 5.0
+
+    @classmethod
+    def from_yaml(cls, path: Path, *, override: Optional[Mapping[str, Any]] = None
+                 ) -> "CoincidencerConfig":
+        with Path(path).open("r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f) or {}
+        coinc = doc.get("coinc", {}) or {}
+        if override:
+            coinc = {**coinc, **override}
+        bind = coinc.get("bind", {}) or {}
+        dump = coinc.get("dump_broadcast", {}) or {}
+        plotter = coinc.get("plotter", {}) or {}
+        hosts_raw = dump.get("hosts", {}) or {}
+        hosts: Dict[int, str] = {int(k): str(v) for k, v in hosts_raw.items()}
+        return cls(
+            bind_host=str(bind.get("host", "0.0.0.0")),
+            bind_port=int(bind.get("port", 11500)),
+            window_s=float(coinc.get("window_s", 5.0)),
+            csv_retention_hours=int(coinc.get("csv_retention_hours", 48)),
+            csv_dir_c1=Path(coinc.get(
+                "csv_dir_c1",
+                "/dataz/dsa110/operations/C1/cluster_output",
+            )),
+            csv_dir_c2=Path(coinc.get(
+                "csv_dir_c2",
+                "/dataz/dsa110/operations/C2/cluster_output",
+            )),
+            event_archive_root=Path(coinc.get(
+                "event_archive_root", "/dataz/dsa110/candidates",
+            )),
+            trigger_criteria_path=Path(coinc.get(
+                "trigger_criteria_path",
+                "/home/ubuntu/vikram/dev/dsa110-rt/configs/c2_trigger_criteria.yaml",
+            )),
+            dump_broadcast_port_base=int(dump.get("port_base", 11227)),
+            dump_broadcast_hosts=hosts,
+            plotter_n_workers=int(plotter.get("n_workers", 2)),
+            plotter_per_event_timeout_s=float(
+                plotter.get("per_event_timeout_s", 30.0),
+            ),
+            etcd_lastname_key=str(coinc.get(
+                "etcd_lastname_key", "/mon/corr/1/trigger",
+            )),
+            event_pkg_path=(
+                Path(coinc["event_pkg_path"])
+                if coinc.get("event_pkg_path") else None
+            ),
+            name_allocator_offline=bool(
+                coinc.get("name_allocator_offline", False),
+            ),
+            plot_cube_wait_s=float(coinc.get("plot_cube_wait_s", 60.0)),
+            plot_dispatch_poll_s=float(
+                coinc.get("plot_dispatch_poll_s", 5.0),
+            ),
+            plot_expected_cube_count=int(
+                coinc.get("plot_expected_cube_count", 8),
+            ),
+            mon_etcd_key=str(coinc.get("mon_etcd_key", "/mon/c2/h23")),
+            mon_publish_interval_s=float(
+                coinc.get("mon_publish_interval_s", 5.0),
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mon-points etcd wrapper (mockable, exactly like other dsart services)
+# ---------------------------------------------------------------------------
+
+
+class _StoreWrapper:
+    """Thin DsaStore wrapper; falls back to a no-op when etcd is gone."""
+
+    def __init__(self, mock: Optional[Any] = None) -> None:
+        if mock is not None:
+            self._store = mock
+            self._available = True
+            return
+        try:
+            from dsautils.dsa_store import DsaStore  # noqa: WPS433
+            self._store = DsaStore()
+            self._available = True
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "DsaStore unavailable (%s); mon-points export disabled",
+                exc,
+            )
+            self._store = None
+            self._available = False
+
+    def put_dict(self, key: str, value: Mapping[str, Any]) -> None:
+        if not self._available or self._store is None:
+            return
+        try:
+            self._store.put_dict(key, dict(value))
+        except Exception:  # noqa: BLE001
+            _LOG.exception("etcd put_dict(%s) failed", key)
+
+
+# ---------------------------------------------------------------------------
+# Pending plot bookkeeping
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PendingPlot:
+    event_name: str
+    submitted_at_monotonic: float
+    stats: ClusterStats
+    members: Tuple[WindowEntry, ...]
+
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+
+
+class CoincidencerService:
+    """C2 orchestrator. Construct, then call :meth:`run`."""
+
+    def __init__(
+        self,
+        config: CoincidencerConfig,
+        *,
+        mon_store: Optional[Any] = None,
+        name_allocator: Optional[EventNameAllocator] = None,
+        broadcaster: Optional[TriggerBroadcaster] = None,
+    ) -> None:
+        self._config = config
+
+        self._window = TimeWindow(window_s=config.window_s)
+        self._graph = CoincidenceGraph()
+        self._criteria = CriteriaEvaluator(config.trigger_criteria_path)
+
+        self._c1_csv = RollingCsvWriter(
+            config.csv_dir_c1, "c1", C1_WINDOW_CSV_FIELDS,
+            retention_hours=config.csv_retention_hours,
+        )
+        self._c2_csv = RollingCsvWriter(
+            config.csv_dir_c2, "c2", C2_CLUSTER_CSV_FIELDS,
+            retention_hours=config.csv_retention_hours,
+        )
+
+        self._archive = EventArchiveWriter(config.event_archive_root)
+
+        self._broadcaster = broadcaster or TriggerBroadcaster(
+            config.dump_broadcast_hosts,
+            port_base=config.dump_broadcast_port_base,
+        )
+
+        self._allocator = name_allocator or EventNameAllocator(
+            etcd_key=config.etcd_lastname_key,
+            event_pkg_path=config.event_pkg_path,
+            offline=config.name_allocator_offline,
+        )
+
+        self._plot_worker = PlotWorker(
+            max_workers=config.plotter_n_workers,
+            per_event_timeout_s=config.plotter_per_event_timeout_s,
+        )
+        self._pending_plots: Dict[str, _PendingPlot] = {}
+
+        self._mon_store = _StoreWrapper(mock=mon_store)
+
+        self._receiver = C1BatchReceiver(
+            host=config.bind_host,
+            port=config.bind_port,
+            on_batch=self._on_batch,
+        )
+
+        # Bookkeeping / mon-points.
+        self._counters: Dict[str, int] = {
+            "rows_in": 0,
+            "components_evaluated": 0,
+            "triggers_dump": 0,
+            "triggers_log_only": 0,
+            "broadcast_send_ok": 0,
+            "broadcast_send_fail": 0,
+            "plots_dispatched": 0,
+            "csv_rotations": 0,
+            "csv_removed": 0,
+        }
+        self._last_event_name: Optional[str] = None
+        self._last_trigger_class: Optional[str] = None
+        self._last_event_mjd: Optional[float] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._tasks: List[asyncio.Task] = []
+        self._started_unix: float = 0.0
+
+    # ----- public API ---------------------------------------------------
+
+    async def run(self) -> int:
+        loop = asyncio.get_running_loop()
+        self._stop_event = asyncio.Event()
+        self._install_signal_handlers(loop)
+        self._started_unix = time.time()
+
+        await self._receiver.start()
+        self._tasks.append(
+            asyncio.create_task(self._receiver.serve_forever(),
+                                name="c2-receiver"),
+        )
+        self._tasks.append(
+            asyncio.create_task(self._housekeep_loop(),
+                                name="c2-housekeep"),
+        )
+        self._tasks.append(
+            asyncio.create_task(self._plot_dispatcher_loop(),
+                                name="c2-plot-dispatcher"),
+        )
+        self._tasks.append(
+            asyncio.create_task(self._mon_publish_loop(),
+                                name="c2-mon-publish"),
+        )
+
+        _LOG.info(
+            "coincidencer up: bind=%s:%d window=%.1fs criteria=%s "
+            "archive_root=%s csv_dir_c1=%s csv_dir_c2=%s",
+            self._config.bind_host, self._config.bind_port,
+            self._config.window_s, self._config.trigger_criteria_path,
+            self._config.event_archive_root,
+            self._config.csv_dir_c1, self._config.csv_dir_c2,
+        )
+
+        rc = 0
+        try:
+            await self._stop_event.wait()
+        finally:
+            await self.stop()
+        return rc
+
+    async def stop(self) -> None:
+        _LOG.info("coincidencer shutdown begin")
+        for t in self._tasks:
+            t.cancel()
+        await self._receiver.stop()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
+        try:
+            self._broadcaster.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._plot_worker.shutdown(wait=True)
+        except Exception:  # noqa: BLE001
+            pass
+        _LOG.info("coincidencer shutdown done")
+
+    # ----- batch handler ------------------------------------------------
+
+    async def _on_batch(self, batch: wire.C1Batch, peer_repr: str) -> None:
+        if batch.header.n_candidates == 0:
+            # Empty heartbeat; nothing to do for the graph but record.
+            return
+        new_entries = self._window.add(batch.header, batch.candidates)
+        aged = self._window.aged_out()
+        if aged:
+            self._graph.remove_many(aged)
+        for e in new_entries:
+            self._graph.add(e)
+        self._counters["rows_in"] += len(new_entries)
+
+        # Hot-reload criteria if the file mtime changed under us.
+        self._criteria.reload_if_changed()
+
+        # Write the per-row C1 hiplot CSV for *every* received candidate
+        # (independent of triggering).
+        now_utc = datetime.now(timezone.utc)
+        for e in new_entries:
+            self._c1_csv.append_row(
+                entry_to_csv_row(e, trigger=""),
+                now_utc=now_utc,
+            )
+
+        # Walk only the components touched by this batch.
+        touched = self._graph.components_touched(new_entries)
+        for comp_id in touched:
+            members = self._graph.component_members(comp_id)
+            if not members:
+                continue
+            stats = compute_stats(members)
+            self._counters["components_evaluated"] += 1
+            tc = self._criteria.evaluate(stats)
+            if tc is None:
+                continue
+            await self._fire(stats, members, tc)
+
+    async def _fire(
+        self,
+        stats: ClusterStats,
+        members: List[WindowEntry],
+        trigger_class,
+    ) -> None:
+        """Dispatch on the trigger-class action."""
+        action = trigger_class.action
+        now_utc = datetime.now(timezone.utc)
+
+        if action == "dump_all_gpus":
+            event_name = self._allocator.allocate(stats.t_peak_mjd)
+            self._last_event_name = event_name
+            self._last_trigger_class = trigger_class.name
+            self._last_event_mjd = stats.t_peak_mjd
+
+            ev_dir = self._archive.create(event_name)
+            self._archive.write_c2_cluster_csv(
+                ev_dir, event_name, stats,
+                trigger_class=trigger_class.name, trigger=event_name,
+            )
+            self._archive.write_c1_window_csv(
+                ev_dir, event_name, members, trigger=event_name,
+            )
+            self._archive.write_l3_metadata(
+                ev_dir, event_name,
+                stats_to_l3_metadata(
+                    event_name=event_name,
+                    stats=stats,
+                    trigger_class_name=trigger_class.name,
+                    trigger_action=trigger_class.action,
+                    holdoff_s=trigger_class.holdoff_s,
+                ),
+            )
+            self._c2_csv.append_row(
+                stats_to_csv_row(
+                    stats, trigger_class=trigger_class.name,
+                    trigger=event_name,
+                ),
+                now_utc=now_utc,
+            )
+            result = self._broadcaster.broadcast(
+                event_name=event_name,
+                event_specnum=stats.peak_event_specnum,
+                mjd_target=stats.t_peak_mjd,
+                trigger_class_id=hash(trigger_class.name) & 0xFFFF,
+            )
+            ok = sum(1 for v in result.values() if v)
+            fail = len(result) - ok
+            self._counters["broadcast_send_ok"] += ok
+            self._counters["broadcast_send_fail"] += fail
+            self._counters["triggers_dump"] += 1
+
+            # Schedule the plot job; the dispatcher loop watches for
+            # cubes to arrive (or the 60-second deadline).
+            self._pending_plots[event_name] = _PendingPlot(
+                event_name=event_name,
+                submitted_at_monotonic=time.monotonic(),
+                stats=stats,
+                members=tuple(members),
+            )
+            _LOG.info(
+                "DUMP class=%s name=%s n=%d snr_max=%.2f dm_med=%.2f "
+                "broadcast=%d/%d",
+                trigger_class.name, event_name, stats.n_events,
+                stats.snr_max, stats.dm_median, ok, len(result),
+            )
+        elif action == "log_only":
+            self._c2_csv.append_row(
+                stats_to_csv_row(
+                    stats, trigger_class=trigger_class.name,
+                    trigger="",
+                ),
+                now_utc=now_utc,
+            )
+            self._counters["triggers_log_only"] += 1
+            _LOG.info(
+                "LOG class=%s n=%d snr_max=%.2f dm_med=%.2f",
+                trigger_class.name, stats.n_events, stats.snr_max,
+                stats.dm_median,
+            )
+        else:
+            _LOG.warning(
+                "unknown trigger action %r for class %s; skipping",
+                action, trigger_class.name,
+            )
+
+    # ----- background loops --------------------------------------------
+
+    async def _housekeep_loop(self) -> None:
+        """Hourly CSV rotation check + retention enforcement."""
+        try:
+            while True:
+                await asyncio.sleep(60.0)
+                now_utc = datetime.now(timezone.utc)
+                rotated_c1 = self._c1_csv.maybe_rotate(now_utc)
+                rotated_c2 = self._c2_csv.maybe_rotate(now_utc)
+                self._counters["csv_rotations"] += int(rotated_c1) + int(rotated_c2)
+                removed = (
+                    self._c1_csv.housekeep(now_utc)
+                    + self._c2_csv.housekeep(now_utc)
+                )
+                self._counters["csv_removed"] += removed
+        except asyncio.CancelledError:
+            return
+
+    async def _plot_dispatcher_loop(self) -> None:
+        """Periodically scan pending plot jobs; dispatch when cubes land
+        or the deadline expires."""
+        try:
+            while True:
+                await asyncio.sleep(self._config.plot_dispatch_poll_s)
+                if not self._pending_plots:
+                    continue
+                now_mono = time.monotonic()
+                ready: List[str] = []
+                for name, pp in list(self._pending_plots.items()):
+                    cubes_dir = (
+                        self._config.event_archive_root / name / "cubes"
+                    )
+                    n_cubes = 0
+                    if cubes_dir.is_dir():
+                        n_cubes = sum(
+                            1 for p in cubes_dir.glob("cube_s*_g*_*.npz")
+                            if p.is_file()
+                        )
+                    age = now_mono - pp.submitted_at_monotonic
+                    if (
+                        n_cubes >= self._config.plot_expected_cube_count
+                        or age >= self._config.plot_cube_wait_s
+                    ):
+                        ready.append(name)
+                for name in ready:
+                    pp = self._pending_plots.pop(name)
+                    enqueue_event(
+                        self._plot_worker, name,
+                        self._config.event_archive_root,
+                        stats=pp.stats, members=list(pp.members),
+                    )
+                    self._counters["plots_dispatched"] += 1
+                    _LOG.info(
+                        "plot dispatched for %s (waited %.1fs)",
+                        name, now_mono - pp.submitted_at_monotonic,
+                    )
+        except asyncio.CancelledError:
+            return
+
+    async def _mon_publish_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._config.mon_publish_interval_s)
+                payload: Dict[str, Any] = {
+                    "ts_unix": time.time(),
+                    "uptime_s": time.time() - self._started_unix,
+                    "window_size": len(self._window),
+                    "graph_size": len(self._graph),
+                    "pending_plots": len(self._pending_plots),
+                    "last_event_name": self._last_event_name,
+                    "last_trigger_class": self._last_trigger_class,
+                    "last_event_mjd": self._last_event_mjd,
+                    "receiver": self._receiver.counters.snapshot(),
+                    "counters": dict(self._counters),
+                }
+                self._mon_store.put_dict(
+                    self._config.mon_etcd_key, payload,
+                )
+        except asyncio.CancelledError:
+            return
+
+    # ----- signals ------------------------------------------------------
+
+    def _install_signal_handlers(
+        self, loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        def _on_term() -> None:
+            _LOG.info("SIGTERM/SIGINT received; stopping")
+            if self._stop_event is not None:
+                self._stop_event.set()
+
+        def _on_hup() -> None:
+            _LOG.info("SIGHUP received; reloading criteria")
+            try:
+                self._criteria.force_reload()
+            except Exception:  # noqa: BLE001
+                _LOG.exception("criteria reload failed")
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _on_term)
+            except (NotImplementedError, RuntimeError):
+                pass
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _on_hup)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--config", type=Path,
+        default=Path(
+            "/home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml",
+        ),
+        help="YAML config; reads the 'coinc:' top-level block.",
+    )
+    p.add_argument(
+        "--criteria", type=Path, default=None,
+        help="Optional override for coinc.trigger_criteria_path.",
+    )
+    p.add_argument(
+        "--bind-host", type=str, default=None,
+        help="Override coinc.bind.host.",
+    )
+    p.add_argument(
+        "--bind-port", type=int, default=None,
+        help="Override coinc.bind.port.",
+    )
+    p.add_argument(
+        "--archive-root", type=Path, default=None,
+        help="Override coinc.event_archive_root.",
+    )
+    p.add_argument(
+        "--name-allocator-offline", action="store_true",
+        help="Force the FallbackAllocator (no etcd / event.names).",
+    )
+    p.add_argument(
+        "--log-level", default="INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+    )
+    return p
+
+
+async def _run_async(args: argparse.Namespace) -> int:
+    override: Dict[str, Any] = {}
+    if args.bind_host or args.bind_port:
+        bind = {}
+        if args.bind_host:
+            bind["host"] = args.bind_host
+        if args.bind_port:
+            bind["port"] = args.bind_port
+        override["bind"] = bind
+    if args.archive_root is not None:
+        override["event_archive_root"] = str(args.archive_root)
+    if args.criteria is not None:
+        override["trigger_criteria_path"] = str(args.criteria)
+    if args.name_allocator_offline:
+        override["name_allocator_offline"] = True
+
+    cfg = CoincidencerConfig.from_yaml(args.config, override=override)
+    svc = CoincidencerService(cfg)
+    return await svc.run()
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+    return asyncio.run(_run_async(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

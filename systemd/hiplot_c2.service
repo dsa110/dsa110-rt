@@ -1,0 +1,20 @@
+[Unit]
+Description=DSA-110 hiplot — C2 hourly cluster output (h23, port 5027)
+Documentation=file:/home/ubuntu/vikram/dev/dsa110-rt/docs/c1c2/C1C2_DESIGN.md
+After=network-online.target dsart_c2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/dataz/dsa110/operations/C2/cluster_output
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/hiplot --port 5027 --host 0.0.0.0
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiplot_c2
+
+[Install]
+WantedBy=default.target

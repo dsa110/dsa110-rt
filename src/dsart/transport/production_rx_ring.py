@@ -154,6 +154,11 @@ class ProductionRxRingSource:
         owned_coarse_dm: int | None = None,
         linear_lut_per_corr: np.ndarray | None = None,
         n_filled_per_corr: np.ndarray | None = None,
+        # M7.4 stage-2-absent escape hatch: bake the per-coarse-DM
+        # inter-chgroup alignment to ν_bot_proc into the search-side
+        # shifts (see ``compute_time_shift_search`` docstring). Used
+        # while the corr-side stage-2 application is not yet wired.
+        include_coarse_offset_in_search_shifts: bool = False,
     ) -> None:
         if n_fdm_in_cube <= 0:
             raise ValueError(f"n_fdm_in_cube={n_fdm_in_cube}, expected > 0")
@@ -195,6 +200,10 @@ class ProductionRxRingSource:
             fine_dm_pc_cm3=fine_dm_pc_cm3,
             fine_to_coarse=fine_to_coarse,
             t_int_search_us=t_int_search_us,
+            include_coarse_offset=bool(include_coarse_offset_in_search_shifts),
+        )
+        self._include_coarse_offset_in_search_shifts = bool(
+            include_coarse_offset_in_search_shifts
         )
 
         # Lazy state — opened in start()
@@ -773,6 +782,17 @@ class ProductionRxRingSource:
         # cube (16K atomic acquire-loads). Fallback to the Python loop
         # ONLY if the C extension was built against an older recv_ring.c
         # that does not export the symbol.
+        # M7.4 fix: when the TX-side partitions coarse_dm trials across
+        # workers (e.g., 4 workers × 2 dms each → each search node only
+        # receives the 2 dms its workers were assigned), the assembler
+        # MUST restrict its validity walk to the dms this half actually
+        # owns. Walking all 8 dms with mask=0xFF would mark every t
+        # invalid because slots for the 6 non-owned dms are never written
+        # → vf=0 → no_data_present → bad=1.
+        if self._owned_coarse_dm is not None:
+            walk_mask = 1 << int(self._owned_coarse_dm)
+        else:
+            walk_mask = (1 << n_coarse_dm) - 1
         try:
             valid_per_t, dn_over, dn_pat, dn_nodp = (
                 self._ring.assemble_validity_block(
@@ -780,7 +800,7 @@ class ProductionRxRingSource:
                     cube_cadence_samples=int(self._cube_cadence_samples),
                     t_det=int(self._t_det),
                     compute_half=int(self._compute_half),
-                    coarse_dm_mask=(1 << n_coarse_dm) - 1,
+                    coarse_dm_mask=int(walk_mask),
                 )
             )
             self._n_slots_read += (
