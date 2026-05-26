@@ -9,10 +9,17 @@ Type=simple
 # Runs under the operator user; the casa38 conda env provides
 # event.names + dsautils + slack_sdk (same env legacy T2 ran in).
 WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
-ExecStart=/bin/bash -lc 'source /home/ubuntu/miniforge3/etc/profile.d/conda.sh && conda activate casa38 && exec python -u -m dsart.services.coincidencer --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml'
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.services.coincidencer --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
 Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
+Environment=PATH=/home/ubuntu/anaconda3/envs/dsart_h23/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=MPLBACKEND=Agg
+# Keep BLAS/OpenMP thread pools small so a coincidencer + 2 plotter
+# workers cannot starve the box. C2 work is light (a few hundred
+# rows/sec at production rate) so single-threaded BLAS is sufficient.
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
 Restart=on-failure
 RestartSec=3
 KillSignal=SIGTERM
@@ -20,11 +27,9 @@ TimeoutStopSec=15
 # SIGHUP triggers in-process criteria reload (see services/coincidencer.py).
 KillMode=mixed
 
-# Reasonable resource caps — coincidencer is light (a few hundred
-# rows/sec at production rate) but the plotter forks matplotlib so
-# bound the open-fd / nproc.
-LimitNOFILE=8192
-LimitNPROC=512
+# Resource caps: leave nproc unset (inherit user-slice default) so
+# OpenBLAS/matplotlib pools can grow if needed; only cap open files.
+LimitNOFILE=16384
 
 StandardOutput=journal
 StandardError=journal

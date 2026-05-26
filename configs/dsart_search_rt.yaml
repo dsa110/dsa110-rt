@@ -179,12 +179,18 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
+      --include-coarse-offset-in-search-shifts
       --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
-      --config-yaml /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+      --config-yaml /home/ubuntu/proj/dsa110-rt/configs/dsart_search_rt.yaml
       --enable-cube-dump
+      --cal-blob-path /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
+      --obs-dec-deg 53.848986
+      --kernel-support 1
+      --chan-sum-factor 8
+      --cell-lambda-mode common
     hostargs:
       # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
       # per-host C1 trigger-listener bind addresses (M7.4). The
@@ -216,6 +222,9 @@ routines:
       # the env makes the H2D fully asynchronous on the prefetch
       # stream, restoring the narrow-overlap window.
       DSART_ENABLE_GPU_BUF_REUSE: "1"
+      # M7.4: tag cube-dump filenames so the two compute halves don't
+      # race-overwrite each other's ``cube_{cid:06d}.pt``.
+      DSART_M74_DUMP_TAG: "h0"
 
   - name: search_compute_1
     cmd: python
@@ -235,6 +244,11 @@ routines:
       --coarse-dm-owners-half-1 1
       --gpu-half 1 --search-node-id CN
       --device cuda:0 --image-backend gpu
+      --cal-blob-path /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
+      --obs-dec-deg 53.848986
+      --kernel-support 1
+      --chan-sum-factor 8
+      --cell-lambda-mode common
       --detector-streaming-tile-size 256
       --detector-streaming-decoder-n-top 24
       --detector-boxcar-accum-dtype fp16
@@ -243,11 +257,12 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
+      --include-coarse-offset-in-search-shifts
       --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
       --log-level INFO
-      --config-yaml /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+      --config-yaml /home/ubuntu/proj/dsa110-rt/configs/dsart_search_rt.yaml
       --enable-cube-dump
     hostargs:
       lxd110h01: --c1-bind-host 10.41.0.205
@@ -263,6 +278,8 @@ routines:
       CUDA_VISIBLE_DEVICES: "1"
       # M7.2-amend (2026-05-20): see search_compute_0 for rationale.
       DSART_ENABLE_GPU_BUF_REUSE: "1"
+      # M7.4: tag cube-dump filenames per-half to prevent collisions.
+      DSART_M74_DUMP_TAG: "h1"
 
 # ---------------------------------------------------------------------------
 # M7.4 C1 stage config (locked schema; see docs/c1c2/C1C2_WIRE_SCHEMA.md §3
@@ -280,7 +297,7 @@ routines:
 #             is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 9.0                       # detector NMS threshold AND emit floor
+  snr_min: 4.0                       # M7.4 burst-replay debug: probe whether detector fires at all (production 9.0)
   cube_ring_depth: 8                 # CPU-side cube tensors retained per half
   merger:
     lm_max_cells: 3                  # OR-mode half-window on (l, m) cells
@@ -288,7 +305,7 @@ c1:
     t_frac: 1.0                      # |Δt| ≤ t_frac * 0.5 * (w_i + w_j) samples
     sample_period_specnum: 16        # spec-nums per detector sample
   c2_endpoint:
-    host: lxd110h23                  # h23 == lxd110h23 in the lab
+    host: lxd110h23.pro.pvt          # FQDN (search nodes can't resolve bare 'lxd110h23')
     port: 11500
   emit_queue_depth: 16
   dump_listener:
@@ -304,6 +321,50 @@ c1:
 # ``merger.sample_period_specnum`` when the latter is omitted.
 cube:
   sample_period_specnum: 16
+
+# M7.4 burst-replay noise knobs.
+#
+# layer1_n_burnin_cubes: 1 means each cube's sigma comes from that
+#   cube alone (no cross-cube median ring) — safest for short replays
+#   (<<5 cubes pre-burst) where the default 5-cube median would be
+#   contaminated by the burst itself.
+#
+# layer1_sigma_floor: 5e-3 clamps the per-fdm sigma from below.
+#   Without the floor, the static-sky-EMA-warmup transient drives
+#   sigma to ~1e-4 (200x below the steady-state noise floor) on
+#   cubes 1-2 of a fresh start, producing 10^5-sigma false-positive
+#   detections everywhere. 5e-3 sits between the warmup transient
+#   sigma and the steady-state floor (~2e-2) and was empirically
+#   validated against the 250924mptq replay; tune by inspecting
+#   /tmp/m74_diag/fig1_l1_sigma_evolution.png.
+noise:
+  layer1_n_burnin_cubes: 1
+  layer1_sigma_floor: 5.0e-3
+
+# M7.4 hardening: Layer-2 σ_k EMA tuning. The 250924mptq replay surfaced
+# a node-specific σ_k snowball (n02 SNR ~ 4.7e4) when σ_k was depressed
+# by sparse-valid cubes. The detector also rejected ALL updates under
+# the legacy strict 100%-valid gate, which left σ_k pinned at the seed
+# on most nodes and let inter-node luck dominate.
+#
+# Wired knobs (read by ``_build_search_config_from_yaml`` → forwarded
+# to ``DeterministicDetector``):
+#   layer2_valid_min_fraction: allow σ_k updates when ≥ this fraction
+#       of (T_det, N_fdm) cells are valid. 1.0 = legacy strict gate;
+#       0.95 reflects field-typical UV-cell flagging.
+#   layer2_sigma_floor: clamp σ_k from below after every update so
+#       a pathological cube can never depress the divisor enough to
+#       blow up SNR. Tune from the offline σ_k calibration bench;
+#       0.0 disables the clamp (preserves bit-for-bit legacy).
+#   cube_cadence_s / layer2_tau_s / layer2_n_burnin: omit to use the
+#       detector defaults (production-tuned). Override to shorten
+#       burn-in on short replays.
+detector:
+  layer2_valid_min_fraction: 0.9
+  layer2_sigma_floor: 0.5
+  # cube_cadence_s: 0.13421772
+  # layer2_tau_s: 30.0
+  # layer2_n_burnin: 8
 
 # Legacy clusterer / cands_logger gating. M7.4 production runs with C1
 # emit replacing per-node clustering — leave this False unless an offline

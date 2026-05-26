@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/dataz/dsa110/operations/C2/cluster_output
-ExecStart=/bin/bash -lc 'source /home/ubuntu/miniforge3/etc/profile.d/conda.sh && conda activate casa38 && exec hiplot --port 5027 --host 0.0.0.0'
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/hiplot --port 5027 --host 0.0.0.0
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=3

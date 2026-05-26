@@ -553,6 +553,8 @@ class DeterministicDetector(torch.nn.Module):
         n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
         layer2_state: Optional[Layer2State] = None,
         layer2_seed_unit: bool = True,
+        layer2_sigma_floor: float = 0.0,
+        layer2_valid_min_fraction: float = 1.0,
         streaming: bool = False,
         streaming_tile_size: int = 64,
         layer2_sigma_max_samples: Optional[int] = 1_000_000,
@@ -674,6 +676,22 @@ class DeterministicDetector(torch.nn.Module):
         self._gpu_half = int(gpu_half)
         self._n_kernel_max_t = int(n_kernel_max_t)
 
+        # M7.4 hardening: validity-mask threshold for gating Layer-2
+        # σ_k EMA updates. Legacy behaviour required 100% valid cells
+        # (``layer2_valid_min_fraction=1.0``); this is too strict in
+        # the field where 1–2% of UV cells fail per cube — Layer-2
+        # σ_k then never updates and stays at the seed value, which
+        # diverges across nodes (see 250924mptq postmortem).
+        # Set to e.g. 0.95 to allow updates while still rejecting
+        # cubes with significant flag fractions. Per-cube valid
+        # fraction is ``validity_mask.sum() / numel``.
+        if not (0.0 <= layer2_valid_min_fraction <= 1.0):
+            raise ValueError(
+                f"layer2_valid_min_fraction={layer2_valid_min_fraction}, "
+                f"expected in [0.0, 1.0]"
+            )
+        self._layer2_valid_min_fraction = float(layer2_valid_min_fraction)
+
         # Layer-2 σ_k EMA (Chunk 3, plan §3.6.10). On cold start the EMA
         # buffer is seeded to the analytic value for unit-σ Gaussian
         # input — sqrt(k_dm_width × k_time_width) — so the very first
@@ -689,6 +707,7 @@ class DeterministicDetector(torch.nn.Module):
                 n_burnin=int(layer2_n_burnin),
                 n_kernel_max_t=int(n_kernel_max_t),
                 sigma_max_samples=self._layer2_sigma_max_samples,
+                sigma_floor=float(layer2_sigma_floor),
                 device=device,
             )
             if layer2_seed_unit:
@@ -874,7 +893,13 @@ class DeterministicDetector(torch.nn.Module):
         # skip BOTH forward and noise updates; here we still run forward
         # (the candidate log records what the detector saw) but skip
         # the EMA update so a contaminated cube doesn't poison σ_k.
-        cube_valid = bool(torch.all(validity_mask).item())
+        # M7.4: allow Layer-2 EMA updates when the valid fraction
+        # crosses a tunable threshold (default still 100% to preserve
+        # legacy behaviour). When relaxed, a small fraction of
+        # masked/flagged cells does not prevent σ_k learning, which
+        # was empirically required to converge σ_k across nodes on
+        # the 250924mptq replay.
+        cube_valid = self._compute_cube_valid(validity_mask)
         s_k_tensor, is_warming_up = self._layer2.update_and_query(
             scores=scores, valid=cube_valid,
         )
@@ -961,6 +986,23 @@ class DeterministicDetector(torch.nn.Module):
             raise TypeError(
                 f"validity_mask.dtype={validity_mask.dtype}, expected torch.bool"
             )
+
+    def _compute_cube_valid(self, validity_mask: torch.Tensor) -> bool:
+        """Decide whether to use this cube to update Layer-2 σ_k.
+
+        Returns True when at least ``layer2_valid_min_fraction`` of the
+        ``(T_det, N_fdm)`` cells are True. Default 1.0 reproduces the
+        pre-M7.4 strict ``torch.all`` behaviour bit-for-bit; values
+        below 1.0 let σ_k learn from cubes that have a few sparse
+        invalid cells (the field-typical regime).
+        """
+        if self._layer2_valid_min_fraction >= 1.0:
+            return bool(torch.all(validity_mask).item())
+        n_total = int(validity_mask.numel())
+        if n_total <= 0:
+            return False
+        n_valid = int(validity_mask.sum().item())
+        return (n_valid / n_total) >= self._layer2_valid_min_fraction
 
     def _compute_per_kernel_scores(
         self,
@@ -1203,7 +1245,7 @@ class DeterministicDetector(torch.nn.Module):
         self._validate_cube(cube, validity_mask)
 
         K = len(self._kernel_bank)  # noqa: N806
-        cube_valid = bool(torch.all(validity_mask).item())
+        cube_valid = self._compute_cube_valid(validity_mask)
         tile_size = self._streaming_tile_size
 
         # Detect the v1-collapsed bank optimisation: every kernel uses

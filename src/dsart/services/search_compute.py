@@ -171,6 +171,20 @@ class SearchComputeConfig:
     )
     detector_boxcar_accum_dtype: Optional[torch.dtype] = None
     detector_layer2_max_samples: Optional[int] = 100_000
+    # M7.4 hardening: Layer-2 σ_k EMA knobs exposed for tuning. The
+    # detector defaults are sensible at production geometry, but
+    # cube_cadence_s + tau_s + n_burnin all interact via
+    # ``gamma = 1 - exp(-cadence/tau)`` and the 250924mptq replay
+    # showed σ_k can be depressed by sparse-valid cubes (one node
+    # snowballed to SNR ~ 4.7e4). ``layer2_sigma_floor`` clamps σ_k
+    # from below; ``layer2_valid_min_fraction`` relaxes the strict
+    # 100% validity gate so σ_k can keep learning when 1–2% of
+    # UV cells are flagged.
+    detector_cube_cadence_s: Optional[float] = None  # None ⇒ detector default
+    detector_layer2_tau_s: Optional[float] = None
+    detector_layer2_n_burnin: Optional[int] = None
+    detector_layer2_sigma_floor: float = 0.0
+    detector_layer2_valid_min_fraction: float = 1.0
     pipeline_overlap: bool = False
     search_node_id: int = 1
     gpu_half: int = 1
@@ -182,6 +196,14 @@ class SearchComputeConfig:
     # cube-to-cube EMA noise floor (≈ a few percent). Trade saved ~50 ms
     # of `torch.nanmedian` per cube at production geometry.
     layer1_max_samples: Optional[int] = 10_000
+    # M7.4: σ floor for Layer-1 to suppress the static-sky-EMA-warmup
+    # transient (cubes 1-2 of a fresh start can drop σ ~200× below
+    # steady state, producing massive false-positive SNRs). 0.0 ⇒
+    # disabled (legacy default). Production replay default 5e-3 sits
+    # between the warmup-transient σ (~10⁻⁴) and the steady-state
+    # noise floor (~2×10⁻²) and was empirically validated against
+    # the 250924mptq burst.
+    layer1_sigma_floor: float = 0.0
 
     # --- M6 chunk 5: cube-geometry hyperparameters ---------------------
     cube_cell_l_rad: float = 1.5e-4
@@ -265,11 +287,26 @@ class SearchComputeService:
             n_sigma=config.layer1_n_sigma,
             n_iterations=config.layer1_n_iterations,
             max_samples=config.layer1_max_samples,
+            sigma_floor=config.layer1_sigma_floor,
         )
+        # M7.4: thread the fine-DM grid (pc/cc) into the pipeline so
+        # the decoder writes the physical DM (pc/cc) into
+        # ``Candidate.dm_fine`` instead of falling back to the fdm INDEX.
+        # The C1 emitter ships ``dm_pc_cc=cand.dm_fine`` downstream, so
+        # this is what makes the C2 trigger criteria (``dm_median_min_pc_cc``
+        # etc.) compare apples to apples.
+        fine_dm_tensor: Optional[torch.Tensor] = None
+        if config.fine_dm_pc_cc_full is not None:
+            fine_dm_tensor = torch.as_tensor(
+                config.fine_dm_pc_cc_full,
+                dtype=torch.float32,
+                device=torch.device(config.pipeline.device),
+            )
         self._pipeline = CubePipeline(
             config=config.pipeline,
             detector=self._detector,
             layer1_state=self._layer1_state,
+            fine_dm_pc_cm3=fine_dm_tensor,
         )
         self._stopping = asyncio.Event()
         self._cubes_processed = 0
@@ -304,6 +341,17 @@ class SearchComputeService:
             time_tokens=config.detector_time_tokens,
             dtype=config.detector_dtype,
         )
+        # Layer-2 EMA knobs: forward only if the yaml supplied an
+        # override so the detector's compile-time defaults remain the
+        # source of truth for tests + benches that don't set them.
+        l2_kwargs: dict = {}
+        if config.detector_cube_cadence_s is not None:
+            l2_kwargs["cube_cadence_s"] = float(config.detector_cube_cadence_s)
+        if config.detector_layer2_tau_s is not None:
+            l2_kwargs["layer2_tau_s"] = float(config.detector_layer2_tau_s)
+        if config.detector_layer2_n_burnin is not None:
+            l2_kwargs["layer2_n_burnin"] = int(config.detector_layer2_n_burnin)
+
         return DeterministicDetector(
             kernel_bank=bank,
             threshold_sigma=config.detector_threshold_sigma,
@@ -317,8 +365,13 @@ class SearchComputeService:
             streaming_decoder_n_top=config.detector_streaming_decoder_n_top,
             boxcar_accum_dtype=config.detector_boxcar_accum_dtype,
             layer2_sigma_max_samples=config.detector_layer2_max_samples,
+            layer2_sigma_floor=float(config.detector_layer2_sigma_floor),
+            layer2_valid_min_fraction=float(
+                config.detector_layer2_valid_min_fraction
+            ),
             merger_config=config.merger_config,
             c1_snr_min=config.c1_snr_min,
+            **l2_kwargs,
         )
 
     @property
@@ -861,13 +914,15 @@ class SearchComputeService:
                     dt = max(now - last_log, 1e-9)
                     _LOG.info(
                         "cube_progress: cubes=%d cands=%d clusters=%d "
-                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
+                        "src=%s",
                         self._cubes_processed,
                         self._candidates_emitted,
                         self._clusters_emitted,
                         d_cubes / dt,
                         dt,
                         self._cubes_processed / max(now - loop_start, 1e-9),
+                        getattr(self._source, "stats", {}),
                     )
                     next_status += status_every
                     last_log = now
@@ -884,13 +939,15 @@ class SearchComputeService:
                     dt = max(now - last_log, 1e-9)
                     _LOG.info(
                         "cube_progress: cubes=%d cands=%d clusters=%d "
-                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall)",
+                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
+                        "src=%s",
                         self._cubes_processed,
                         self._candidates_emitted,
                         self._clusters_emitted,
                         d_cubes / dt,
                         dt,
                         self._cubes_processed / max(now - loop_start, 1e-9),
+                        getattr(self._source, "stats", {}),
                     )
                     next_status += status_every
                     last_log = now
@@ -1042,6 +1099,7 @@ def _build_search_config_from_yaml(
     detector_boxcar_accum_dtype: str,
     detector_layer2_max_samples: Optional[int],
     layer1_max_samples: Optional[int],
+    layer1_sigma_floor: float,
     fine_dm_pc_cc_full: Optional[np.ndarray],
     enable_c1: bool = True,
     c1_bind_host_override: Optional[str] = None,
@@ -1087,8 +1145,23 @@ def _build_search_config_from_yaml(
     cube_dump_cfg: Optional[CubeDumpWriterConfig] = None
     if enable_cube_dump:
         cd = yaml_doc.get("cube_dump", {}) or {}
+        # M7.4: the C2 trigger listener composes its per-event manifest
+        # ``npz_path`` under ``c1.dump_root``; the writer's
+        # ``_resolve_path()`` only honors that override when the listener
+        # path is a *subdir* of the writer's own ``dump_root``. So the
+        # writer ``dump_root`` MUST equal (or be an ancestor of)
+        # ``c1.dump_root`` or every C2-triggered dump falls back to the
+        # writer's canonical layout (no per-event subdir, file lands
+        # outside the candidate archive). Default the writer to
+        # ``c1.dump_root`` here so the single yaml knob controls both
+        # sides; an explicit ``cube_dump.dump_root`` still wins (e.g. for
+        # legacy bench paths).
+        c1_yaml = yaml_doc.get("c1", {}) or {}
+        default_dump_root = c1_yaml.get(
+            "dump_root", "/tmp/dsart-cube-dump"
+        )
         cube_dump_cfg = CubeDumpWriterConfig(
-            dump_root=Path(cd.get("dump_root", "/tmp/dsart-cube-dump")),
+            dump_root=Path(cd.get("dump_root", default_dump_root)),
             search_node_id=int(cd.get("search_node_id", search_node_id)),
             gpu_half=int(cd.get("gpu_half", gpu_half)),
             queue_maxsize=int(cd.get("queue_maxsize", 4)),
@@ -1220,6 +1293,16 @@ def _build_search_config_from_yaml(
         yaml_doc.get("enable_legacy_clusterer", bool(enable_clusterer))
     )
 
+    # Layer-2 σ_k EMA yaml knobs (M7.4 hardening). All optional —
+    # absence preserves detector defaults.
+    detector_cube_cadence_s_yaml = det.get("cube_cadence_s", None)
+    detector_layer2_tau_s_yaml = det.get("layer2_tau_s", None)
+    detector_layer2_n_burnin_yaml = det.get("layer2_n_burnin", None)
+    detector_layer2_sigma_floor_yaml = float(det.get("layer2_sigma_floor", 0.0))
+    detector_layer2_valid_min_fraction_yaml = float(
+        det.get("layer2_valid_min_fraction", 1.0)
+    )
+
     return SearchComputeConfig(
         pipeline=pipe_cfg,
         n_fdm=int(n_fdm),
@@ -1237,6 +1320,20 @@ def _build_search_config_from_yaml(
             and int(detector_layer2_max_samples) > 0
             else None
         ),
+        detector_cube_cadence_s=(
+            float(detector_cube_cadence_s_yaml)
+            if detector_cube_cadence_s_yaml is not None else None
+        ),
+        detector_layer2_tau_s=(
+            float(detector_layer2_tau_s_yaml)
+            if detector_layer2_tau_s_yaml is not None else None
+        ),
+        detector_layer2_n_burnin=(
+            int(detector_layer2_n_burnin_yaml)
+            if detector_layer2_n_burnin_yaml is not None else None
+        ),
+        detector_layer2_sigma_floor=detector_layer2_sigma_floor_yaml,
+        detector_layer2_valid_min_fraction=detector_layer2_valid_min_fraction_yaml,
         detector_device=device,
         search_node_id=int(search_node_id),
         gpu_half=int(gpu_half),
@@ -1245,6 +1342,14 @@ def _build_search_config_from_yaml(
             int(layer1_max_samples)
             if layer1_max_samples is not None
             else None
+        ),
+        # CLI flag --layer1-sigma-floor (>0.0) overrides the YAML
+        # default; legacy YAML value is used when the CLI flag is 0.0
+        # (its argparse default), so existing callers see no change.
+        layer1_sigma_floor=(
+            float(layer1_sigma_floor)
+            if float(layer1_sigma_floor) > 0.0
+            else float(noise.get("layer1_sigma_floor", 0.0))
         ),
         fine_dm_pc_cc_full=fine_dm_pc_cc_full,
         clusterer_config=clusterer_cfg,
@@ -1349,6 +1454,107 @@ async def _run_async(args: argparse.Namespace) -> int:
         fine_dm = fine_dm[: args.n_fdm]
         f2c = f2c[: args.n_fdm]
 
+    # M7.5 imager-data-path activation: build the per-chgroup sparsity
+    # patterns on the search side so the dense scatter C helper can
+    # run. We mirror corr_fast_compute exactly:
+    #   - antpos + core-baseline mask loaded from the SAME cal blob the
+    #     corr side used for beamformer_weights (the bf header carries
+    #     antpos; the sibling yaml carries antenna_order for the
+    #     core/outrigger split). This guarantees ``antpos_hash`` agrees.
+    #   - dec_deg + n_grid + kernel_support + chan_sum_factor + cell_
+    #     lambda_mode all match the corr-side launcher knobs.
+    # When --cal-blob-path or --obs-dec-deg is missing we fall back to
+    # the M7.2 stub path; downstream cube data will be zeros (sentinel
+    # for an unactivated pipeline).
+    linear_lut_per_corr: Optional[np.ndarray] = None
+    n_filled_per_corr_arr: Optional[np.ndarray] = None
+    if args.cal_blob_path is not None and args.obs_dec_deg is not None:
+        try:
+            from ..grid.sparsity_pattern import (
+                build_pattern,
+                compute_top_of_band_cell_lambda,
+            )
+            from ..services.corr_fast_integration import (
+                load_antpos_from_cal_blob,
+            )
+            antpos_e, antpos_n, is_core_mask = load_antpos_from_cal_blob(
+                args.cal_blob_path,
+            )
+            if args.cell_lambda_mode == "common":
+                cell_lambda_used = compute_top_of_band_cell_lambda(
+                    antpos_e, antpos_n,
+                    n_grid=int(args.n_grid),
+                    is_core_baseline_mask=is_core_mask,
+                )
+            else:
+                cell_lambda_used = None
+            n_corr_local = int(args.n_corr)
+            patterns = []
+            for c in range(n_corr_local):
+                pat = build_pattern(
+                    antpos_e, antpos_n,
+                    chgroup=c,
+                    dec_deg=float(args.obs_dec_deg),
+                    n_grid=int(args.n_grid),
+                    kernel_support=int(args.kernel_support),
+                    chan_sum_factor=int(args.chan_sum_factor),
+                    cell_lambda=cell_lambda_used,
+                    is_core_baseline_mask=is_core_mask,
+                )
+                patterns.append(pat)
+            n_filled_max = max(int(p.n_filled) for p in patterns)
+            ring_n_filled = int(dims.n_filled_per_corr)
+            if n_filled_max > ring_n_filled:
+                raise ValueError(
+                    f"M7.5 LUT: max n_filled across chgroups = "
+                    f"{n_filled_max} > ring n_filled_per_corr = "
+                    f"{ring_n_filled}. Increase --n-filled to "
+                    f"≥ {n_filled_max} or check pattern build inputs."
+                )
+            # LUT stride = ring slot's n_filled (so the C helper's
+            # ``slot_base + 2*k`` cint8 walk + ``lut_c[k]`` LUT walk are
+            # zipped on the same k axis the wire ships).
+            linear_lut_per_corr = np.zeros(
+                (n_corr_local, ring_n_filled), dtype=np.int32,
+            )
+            n_filled_per_corr_arr = np.zeros(n_corr_local, dtype=np.int32)
+            for c, pat in enumerate(patterns):
+                n = int(pat.n_filled)
+                # ``ix_row * n_grid + ix_col`` — row-major scatter into the
+                # dense [n_grid, n_grid] plane; matches the C helper's
+                # ``re_plane[lin] = src[2*k]`` line + the test fixture's
+                # ``lut[c, k] = ix * n_grid + iy`` convention.
+                lin = (
+                    pat.ix_row.astype(np.int32) * int(args.n_grid)
+                    + pat.ix_col.astype(np.int32)
+                )
+                linear_lut_per_corr[c, :n] = lin
+                n_filled_per_corr_arr[c] = n
+            _LOG.info(
+                "M7.5 sparsity LUTs built: n_corr=%d n_grid=%d "
+                "kernel_support=%d chan_sum=%d cell_lambda_mode=%s "
+                "n_filled_per_corr=%s pattern_ids=%s",
+                n_corr_local, int(args.n_grid), int(args.kernel_support),
+                int(args.chan_sum_factor), args.cell_lambda_mode,
+                n_filled_per_corr_arr.tolist(),
+                [f"0x{int(p.pattern_id):016x}" for p in patterns],
+            )
+        except Exception as exc:
+            _LOG.exception(
+                "M7.5 LUT build failed (%s); falling back to M7.2 "
+                "zero-stub path. n_cands will be 0.",
+                exc,
+            )
+            linear_lut_per_corr = None
+            n_filled_per_corr_arr = None
+    else:
+        _LOG.warning(
+            "M7.5 activation skipped: cal_blob_path=%s obs_dec_deg=%s. "
+            "Falling back to M7.2 zero-stub assembly (cubes will be "
+            "zeros; expect n_cands=0).",
+            args.cal_blob_path, args.obs_dec_deg,
+        )
+
     source = ProductionRxRingSource(
         shm_name=args.shm_name,
         ring_dims=dims,
@@ -1367,6 +1573,24 @@ async def _run_async(args: argparse.Namespace) -> int:
         fan_in_min_corrs=args.fan_in_min_corrs,
         attach_timeout_s=args.attach_timeout_s,
         n_active_dms_per_corr=args.n_active_dms_per_corr,
+        # M7.4 fix: in the M7.2 fallback path (no scatter wiring) the
+        # validity walk in production_rx_ring uses this to know which
+        # coarse_dm to expect data in. Without it the walker marks
+        # every t invalid because the non-owned-dm slots are never
+        # written by the partitioned TX workers.
+        owned_coarse_dm=owner_idx,
+        # M7.5 scatter activation — when both linear_lut + n_filled are
+        # set the source switches to assemble_dense_block (real cint8
+        # scatter); otherwise the M7.2 zero-stub path is used.
+        linear_lut_per_corr=linear_lut_per_corr,
+        n_filled_per_corr=n_filled_per_corr_arr,
+        # M7.4 stage-2-absent escape hatch: bake the per-coarse-DM
+        # inter-chgroup ν_bot_proc alignment into the search-side
+        # shifts. Mandatory for the M7.4 250924mptq replay until the
+        # corr-side stage-2 application is wired in.
+        include_coarse_offset_in_search_shifts=bool(
+            args.include_coarse_offset_in_search_shifts
+        ),
     )
 
     if args.config_yaml is not None and args.config_yaml.exists():
@@ -1402,6 +1626,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         detector_boxcar_accum_dtype=args.detector_boxcar_accum_dtype,
         detector_layer2_max_samples=args.detector_layer2_max_samples,
         layer1_max_samples=args.layer1_max_samples,
+        layer1_sigma_floor=args.layer1_sigma_floor,
         fine_dm_pc_cc_full=fine_dm,
         enable_c1=not args.disable_c1,
         c1_bind_host_override=args.c1_bind_host,
@@ -1514,6 +1739,42 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "init lag when both routines are fork-execed "
                         "by dsart_rt in the same verb dispatch).")
 
+    # --- M7.5 imager-data-path activation: per-chgroup sparsity-pattern
+    # LUTs so the dense scatter helper in production_rx_ring can run.
+    # If --cal-blob-path + --obs-dec-deg are both set, search_compute
+    # builds the (n_corr, n_filled_max) linear LUT at startup by calling
+    # dsart.grid.sparsity_pattern.build_pattern(...) for every chgroup —
+    # mirroring corr_fast_compute (same antpos + dec + n_grid + K_support
+    # + chan_sum_factor + cell_lambda_mode), producing bit-identical
+    # patterns per the Option-C contract. Without these args the source
+    # falls back to the M7.2 zero-stub path (sentinel cubes; n_cands=0).
+    p.add_argument("--cal-blob-path", type=Path, default=None,
+                   help="path to any beamformer_weights_*.dat blob; used "
+                        "to load (antpos_e, antpos_n, is_core_baseline_"
+                        "mask) consistent with the corr-side cal. When "
+                        "set together with --obs-dec-deg, search_compute "
+                        "builds the per-corr SparsityPattern LUTs and "
+                        "enables the M7.4 dense scatter.")
+    p.add_argument("--obs-dec-deg", type=float, default=None,
+                   help="observation declination in degrees. MUST match "
+                        "the corr-side --obs-dec-deg (within the "
+                        "0.25° quantisation of pattern_id) for the "
+                        "per-packet pattern_id check to pass.")
+    p.add_argument("--kernel-support", type=int, default=1,
+                   help="gridding kernel support in cells (default: 1, "
+                        "matching corr_fast_integration.FastIntegration"
+                        "Config.kernel_support default; pillbox).")
+    p.add_argument("--chan-sum-factor", type=int, default=8,
+                   help="F33: collapse this many fine channels per "
+                        "chgroup before gridding (must match the "
+                        "corr-side --chan-sum-factor; default 8 to "
+                        "match the M7.4 launcher).")
+    p.add_argument("--cell-lambda-mode", default="common",
+                   choices=("common", "per_chgroup"),
+                   help="F28 cell-lambda mode (must match corr; default "
+                        "'common' = all chgroups share one image-pixel "
+                        "grid via compute_top_of_band_cell_lambda).")
+
     # --- SearchComputeService identity --------------------------------
     p.add_argument("--gpu-half", type=int, default=0, choices=(0, 1),
                    help="which compute half this process serves (0 or 1)")
@@ -1573,6 +1834,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Per-fdm sample cap for Layer-1 sigma-clipped std. "
                         "Commissioning default 100k (vs 1M bench legacy) for "
                         "lower latency with still-sub-percent sigma error.")
+    p.add_argument("--layer1-sigma-floor", type=float, default=0.0,
+                   help="Lower-bound clamp on the per-fdm Layer-1 sigma, "
+                        "applied uniformly across burnin-median and "
+                        "post-burnin paths. Suppresses the static-sky-EMA "
+                        "warmup transient (cubes 1-2 of a fresh start can "
+                        "drop sigma ~200x below steady state). 0.0 (default) "
+                        "disables. M7.4 burst-replay recommended: 5e-3.")
+    p.add_argument("--include-coarse-offset-in-search-shifts",
+                   action="store_true", default=False,
+                   help="M7.4 stage-2-absent escape hatch: bake the "
+                        "per-coarse-DM inter-chgroup ν_bot_proc alignment "
+                        "into the search-side time_shift_search table. "
+                        "Required while the corr-side stage-2 application "
+                        "is not yet wired (Stage2FIFO is just a ring "
+                        "buffer; no per-(g, c) time-shift application "
+                        "exists anywhere in transport/). T_stream grows "
+                        "from t_det + ~76 to t_det + ~210 samples; the "
+                        "RX cint8 history window grows correspondingly. "
+                        "Default False once corr-side stage-2 lands.")
 
     # --- DM plan source -----------------------------------------------
     p.add_argument("--dm-plan-path", type=Path, default=None,

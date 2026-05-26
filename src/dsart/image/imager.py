@@ -116,6 +116,7 @@ def compute_edge_mask(
     envelope_threshold: float = 0.5,
     drop_dc: bool = True,
     dtype: np.dtype = np.float32,
+    apply_ifft2_dc_correction: bool = True,
 ) -> np.ndarray:
     """Return the multiplicative edge-mask, shape ``[N_grid, N_grid]``.
 
@@ -126,6 +127,26 @@ def compute_edge_mask(
 
     The mask is constant per operating point; callers cache it once
     at startup and re-use across cubes.
+
+    M7.4 ``apply_ifft2_dc_correction`` (2026-05-23): the gridder
+    (:mod:`dsart.grid.sparsity_pattern`) writes ``V(u=0, v=0)`` at
+    array index ``(N/2, N/2)`` — the natural radio-interferometry
+    "DC at the center" convention. The imager pipeline then computes
+    ``Re(fftshift(ifft2(uv_grid)))``, but ``ifft2`` assumes DC at
+    index ``(0, 0)``. By the Fourier-shift theorem this introduces a
+    per-pixel sign flip ``(-1)^(x+y)`` ("checkerboard") that
+    ``fftshift`` does NOT undo (it's a translation, not a phase
+    rotation; for even ``N=256`` the parity of ``(x+y)`` is
+    preserved through ``fftshift``). The checkerboard manifests as
+    the "strange positive/negative pattern" on dirty images and as
+    a strong negative ``lag(0,1)`` / ``lag(1,0)`` spatial
+    autocorrelation in the noise field (verified empirically:
+    -0.64 at lag(0,1) on the 250924mptq replay, cube 8, t=60,
+    fdm=33 — flips to +0.64 after correction). Multiplying the
+    edge mask by ``(-1)^(i+j)`` undoes the checkerboard at zero
+    added compute (the imager's edge-mask multiply already happens
+    on every cube). Default ``True``; set ``False`` only to
+    reproduce legacy pre-M7.4 imagery for regression studies.
     """
     npad = image_mask_npad(
         n_grid=n_grid,
@@ -143,6 +164,13 @@ def compute_edge_mask(
         dc = n_grid // 2
         if 0 <= dc < n_grid:
             mask[dc, dc] = 0.0
+    if apply_ifft2_dc_correction:
+        ii, jj = np.indices((n_grid, n_grid))
+        # (-1)^(i+j) — equivalent to a per-pixel sign flip of every
+        # odd-parity pixel. Encodes the missing ``ifftshift(uv)``
+        # before ``ifft2`` (DC-at-center convention; see docstring).
+        sign = (1.0 - 2.0 * ((ii + jj) & 1)).astype(dtype)
+        mask = mask * sign
     return mask
 
 

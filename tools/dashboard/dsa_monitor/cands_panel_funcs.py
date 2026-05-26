@@ -48,7 +48,7 @@ _EVENT_NAME_RE = re.compile(r"^\d{6}[a-z]{4}$")
 _SAFE_EVENT_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class EventSummary:
     """One row in the events table."""
 
@@ -65,7 +65,7 @@ class EventSummary:
     n_plots: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class EventDetail:
     """Per-event detail page data."""
 

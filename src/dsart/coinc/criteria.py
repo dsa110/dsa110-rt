@@ -34,7 +34,12 @@ Recognised require keys (all optional, ANDed):
   * ``n_search_nodes_min`` / ``n_search_nodes_max``
   * ``n_gpu_halves_min`` / ``n_gpu_halves_max``
   * ``dm_median_min_pc_cc`` / ``dm_median_max_pc_cc``
-  * ``dm_iqr_max_pc_cc``
+  * ``dm_iqr_max_pc_cc`` — SNR-scaled cap. The yaml value is the cap
+    applied at ``snr_max == DM_IQR_SNR_THRESHOLD`` (default 12); the
+    effective cap grows hyperbolically and becomes infinite at
+    ``snr_max >= DM_IQR_SNR_CEILING`` (default 50). This accommodates
+    very-bright bursts that trip many DM trials simultaneously while
+    keeping the tight cap for low-SNR candidates.
   * ``width_median_max_samples`` / ``width_median_min_samples``
   * ``lm_diag_max_rad`` / ``lm_diag_min_rad``
 
@@ -51,10 +56,11 @@ is cheap — single stat).
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
@@ -70,35 +76,77 @@ __all__ = [
 _LOG = logging.getLogger("dsart.coinc.criteria")
 
 
+# SNR scaling for dm_iqr_max_pc_cc:
+#
+# A bright FRB sweeps a wide range of trial DMs simultaneously (since
+# the matched-filter response stays above the C1 threshold across many
+# adjacent fdm bins). Holding the cluster's dm_iqr to a tight cap (like
+# 30 pc/cc) is therefore correct for low-SNR (genuine narrow-DM)
+# candidates but rejects the brightest events outright. We scale the
+# cap with ``cluster.snr_max`` along a hyperbolic curve:
+#
+#   - at ``snr_max == DM_IQR_SNR_THRESHOLD`` (12.0): cap = yaml_value
+#     (so the operator's tunable matches the standard low-SNR regime)
+#   - at ``snr_max >= DM_IQR_SNR_CEILING`` (50.0): cap = +inf
+#     (saturated bursts always pass the IQR check)
+#   - in between: cap = yaml_value * (CEILING - THRESHOLD) /
+#                       (CEILING - snr_max)
+#
+# This matches the operator spec: "30 at the threshold, infinite at
+# SNR>50". (Tunable thresholds are module-level constants rather than
+# YAML keys to keep the require-block declarative.)
+DM_IQR_SNR_THRESHOLD: float = 12.0
+DM_IQR_SNR_CEILING: float = 50.0
+
+
+def _dm_iqr_max_snr_scaled(stats: ClusterStats, t: float) -> bool:
+    """``dm_iqr_max_pc_cc`` predicate, with hyperbolic SNR scaling.
+
+    Returns True iff ``stats.dm_iqr`` satisfies the snr_max-scaled cap.
+    See ``DM_IQR_SNR_THRESHOLD`` / ``DM_IQR_SNR_CEILING`` block above
+    for the cap formula.
+    """
+    s = float(stats.snr_max)
+    if s >= DM_IQR_SNR_CEILING:
+        return True
+    span = DM_IQR_SNR_CEILING - DM_IQR_SNR_THRESHOLD
+    denom = DM_IQR_SNR_CEILING - max(s, DM_IQR_SNR_THRESHOLD)
+    # max(...) clamps the denominator from below at ``span`` so that
+    # for snr_max <= THRESHOLD the cap is exactly ``t`` (no scaling).
+    cap = t * span / denom
+    return float(stats.dm_iqr) <= cap
+
+
 # Lookup table mapping a require-key to:
-#   (statistic-attr, comparator)
-# Comparator is a callable (stat_value, threshold) -> bool that
-# returns True iff the stat satisfies the threshold.
+#   (predicate)
+# Predicate is a callable ``(stats, threshold) -> bool`` that returns
+# True iff the cluster satisfies the require entry. Predicates receive
+# the full ``ClusterStats`` so we can implement stat-coupled criteria
+# (e.g. snr_max-scaled dm_iqr cap, see ``_dm_iqr_max_snr_scaled``).
 _REQUIRE_PREDICATES: Tuple[
-    Tuple[str, str, Any], ...
+    Tuple[str, Callable[[ClusterStats, float], bool]], ...
 ] = (
-    # (require_key, stat_attr, comparator)
-    ("snr_max_min", "snr_max", lambda v, t: v >= t),
-    ("snr_max_max", "snr_max", lambda v, t: v <= t),
-    ("snr_sum_min", "snr_sum", lambda v, t: v >= t),
-    ("snr_sum_max", "snr_sum", lambda v, t: v <= t),
-    ("snr_mean_min", "snr_mean", lambda v, t: v >= t),
-    ("snr_mean_max", "snr_mean", lambda v, t: v <= t),
-    ("n_events_min", "n_events", lambda v, t: v >= t),
-    ("n_events_max", "n_events", lambda v, t: v <= t),
-    ("n_search_nodes_min", "n_search_nodes", lambda v, t: v >= t),
-    ("n_search_nodes_max", "n_search_nodes", lambda v, t: v <= t),
-    ("n_gpu_halves_min", "n_gpu_halves", lambda v, t: v >= t),
-    ("n_gpu_halves_max", "n_gpu_halves", lambda v, t: v <= t),
-    ("dm_median_min_pc_cc", "dm_median", lambda v, t: v >= t),
-    ("dm_median_max_pc_cc", "dm_median", lambda v, t: v <= t),
-    ("dm_iqr_max_pc_cc", "dm_iqr", lambda v, t: v <= t),
-    ("width_median_max_samples", "width_median", lambda v, t: v <= t),
-    ("width_median_min_samples", "width_median", lambda v, t: v >= t),
-    ("lm_diag_max_rad", "lm_diag_rad", lambda v, t: v <= t),
-    ("lm_diag_min_rad", "lm_diag_rad", lambda v, t: v >= t),
+    ("snr_max_min", lambda s, t: s.snr_max >= t),
+    ("snr_max_max", lambda s, t: s.snr_max <= t),
+    ("snr_sum_min", lambda s, t: s.snr_sum >= t),
+    ("snr_sum_max", lambda s, t: s.snr_sum <= t),
+    ("snr_mean_min", lambda s, t: s.snr_mean >= t),
+    ("snr_mean_max", lambda s, t: s.snr_mean <= t),
+    ("n_events_min", lambda s, t: s.n_events >= t),
+    ("n_events_max", lambda s, t: s.n_events <= t),
+    ("n_search_nodes_min", lambda s, t: s.n_search_nodes >= t),
+    ("n_search_nodes_max", lambda s, t: s.n_search_nodes <= t),
+    ("n_gpu_halves_min", lambda s, t: s.n_gpu_halves >= t),
+    ("n_gpu_halves_max", lambda s, t: s.n_gpu_halves <= t),
+    ("dm_median_min_pc_cc", lambda s, t: s.dm_median >= t),
+    ("dm_median_max_pc_cc", lambda s, t: s.dm_median <= t),
+    ("dm_iqr_max_pc_cc", _dm_iqr_max_snr_scaled),
+    ("width_median_max_samples", lambda s, t: s.width_median <= t),
+    ("width_median_min_samples", lambda s, t: s.width_median >= t),
+    ("lm_diag_max_rad", lambda s, t: s.lm_diag_rad <= t),
+    ("lm_diag_min_rad", lambda s, t: s.lm_diag_rad >= t),
 )
-_REQUIRE_KEYS = {key for key, _, _ in _REQUIRE_PREDICATES}
+_REQUIRE_KEYS = {key for key, _ in _REQUIRE_PREDICATES}
 
 
 class BadCriteriaFile(ValueError):
@@ -191,10 +239,10 @@ def _load_yaml_classes(path: Path) -> List[TriggerClass]:
 
 
 def _matches(stats: ClusterStats, require: Mapping[str, float]) -> bool:
-    for key, attr, comparator in _REQUIRE_PREDICATES:
+    for key, predicate in _REQUIRE_PREDICATES:
         if key not in require:
             continue
-        if not comparator(getattr(stats, attr), require[key]):
+        if not predicate(stats, require[key]):
             return False
     return True
 

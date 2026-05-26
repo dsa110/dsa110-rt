@@ -322,12 +322,17 @@ class Layer1State:
         n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
         max_samples: Optional[int] = None,
         rng_seed: int = 0,
+        sigma_floor: float = 0.0,
     ) -> None:
         if n_fdm < 1:
             raise ValueError(f"n_fdm={n_fdm}, expected ≥ 1")
         if n_burnin_cubes < 1:
             raise ValueError(
                 f"n_burnin_cubes={n_burnin_cubes}, expected ≥ 1"
+            )
+        if sigma_floor < 0.0:
+            raise ValueError(
+                f"sigma_floor={sigma_floor}, expected ≥ 0"
             )
         self.n_fdm = int(n_fdm)
         self.n_burnin_cubes = int(n_burnin_cubes)
@@ -337,6 +342,15 @@ class Layer1State:
             int(max_samples) if max_samples is not None else None
         )
         self.rng_seed = int(rng_seed)
+        # M7.4: σ floor protects the burst replay's first 2-3 cubes
+        # from the static-sky-EMA-warmup transient where the cube
+        # residual is dominated by ALPHA*static_sky_init and the
+        # σ-clipped std collapses to 1e-4 (vs the post-burst noise
+        # floor ~2×10⁻²). A floor between the warmup-transient σ and
+        # the steady-state σ (10⁻³ … 5×10⁻³) suppresses the warmup
+        # false positives without affecting steady-state detection.
+        # Default 0.0 ⇒ disabled (preserves legacy semantics).
+        self.sigma_floor = float(sigma_floor)
         # Per-fdm sigma history: deque of length ≤ n_burnin_cubes.
         self._history: list[Deque[float]] = [
             deque(maxlen=self.n_burnin_cubes) for _ in range(self.n_fdm)
@@ -483,8 +497,16 @@ class Layer1State:
             for fdm in range(self.n_fdm):
                 out_np[fdm] = float(np.median(list(self._history[fdm])))
             self._cube_count += 1
-            return torch.from_numpy(out_np).to(device)
+            out_t = torch.from_numpy(out_np).to(device)
+        else:
+            # Cube 5+ : just return the current cube's σ directly.
+            self._cube_count += 1
+            out_t = sigma_this
 
-        # Cube 5+ : just return the current cube's σ directly.
-        self._cube_count += 1
-        return sigma_this
+        # M7.4 σ-floor (applied uniformly to both burnin-median and
+        # post-burnin paths so the fp16-imager / static-sky-EMA-warmup
+        # transient — which can drive σ to ~10⁻⁴, ~200× below the
+        # steady-state floor — cannot inflate downstream SNRs).
+        if self.sigma_floor > 0.0:
+            out_t = out_t.clamp_min(float(self.sigma_floor))
+        return out_t

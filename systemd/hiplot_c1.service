@@ -12,7 +12,7 @@ WorkingDirectory=/dataz/dsa110/operations/C1/cluster_output
 # default hiplot port is 5005; we put C1 on 5017 to leave room for
 # the legacy 5007 instance during the M7.4 cutover (we'll stop the
 # legacy one only after this is verified up).
-ExecStart=/bin/bash -lc 'source /home/ubuntu/miniforge3/etc/profile.d/conda.sh && conda activate casa38 && exec hiplot --port 5017 --host 0.0.0.0'
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/hiplot --port 5017 --host 0.0.0.0
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=3
