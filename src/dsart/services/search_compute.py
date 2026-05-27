@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -315,6 +316,14 @@ class SearchComputeService:
         self._auto_dumps_dispatched = 0
         self._udp_dumps_dispatched = 0
         self._cluster_timeouts = 0
+        # M7.4 RT-perf debug: per-stage wall accumulator (ns); reset by
+        # the cube_progress logger so the printed mean is over the
+        # last block.
+        self._stage_ns_accum: dict[str, int] = {
+            "build_cube": 0, "layer1_norm": 0,
+            "detector_forward": 0, "total": 0,
+        }
+        self._stage_ns_count: int = 0
 
         # Sub-systems — built in start() if their config is non-None.
         self._clusterer: Optional[ClustererService] = None
@@ -660,6 +669,13 @@ class SearchComputeService:
             result = self._pipeline.process(slot)
         self._cubes_processed += 1
         self._candidates_emitted += len(result.candidates)
+        # M7.4 RT-perf debug (2026-05-27): accumulate per-stage wall
+        # timings so the cube_progress log can surface mean build /
+        # layer1 / detector / total wall per cube alongside cubes/s.
+        # Resets every progress block.
+        for _k in ("build_cube", "layer1_norm", "detector_forward", "total"):
+            self._stage_ns_accum[_k] += int(result.stage_timings_ns.get(_k, 0))
+        self._stage_ns_count += 1
 
         # Build geometry once for both clusterer + dumps + emitter.
         geom = self._geom_from_slot(slot)
@@ -874,6 +890,65 @@ class SearchComputeService:
             / f"cube_s{cfg.search_node_id}_g{cfg.gpu_half}_{int(key_specnum)}.npz"
         )
 
+    def _log_cube_progress(
+        self,
+        *,
+        now_loop_start: float,
+        last_log_mono: float,
+        last_cubes_count: int,
+    ) -> None:
+        """Emit one ``cube_progress`` log line with rich timing info.
+
+        Reads + RESETS the rolling accumulators
+        (``_stage_ns_accum``/``_stage_ns_count`` and the source's
+        scatter timing) so each line reports per-block means rather
+        than running averages. Centralised here (was duplicated across
+        the pipeline-overlap and serial branches of :meth:`run`) so the
+        timing-instrumentation surface only lives in one place.
+        """
+        now = time.monotonic()
+        d_cubes = self._cubes_processed - last_cubes_count
+        dt = max(now - last_log_mono, 1e-9)
+        _scatter_t = (
+            self._source.get_scatter_timing_and_reset()
+            if hasattr(self._source, "get_scatter_timing_and_reset")
+            else {"mean_us": 0.0, "max_us": 0.0, "count": 0}
+        )
+        _build_t = (
+            self._pipeline.get_build_event_timing_and_reset()
+            if hasattr(self._pipeline, "get_build_event_timing_and_reset")
+            else {"h2d_ms": 0.0, "imager_ms": 0.0, "valid_ms": 0.0, "n": 0}
+        )
+        n_stage = max(int(self._stage_ns_count), 1)
+        st = self._stage_ns_accum
+        build_ms = (st["build_cube"] / n_stage) / 1_000_000.0
+        layer1_ms = (st["layer1_norm"] / n_stage) / 1_000_000.0
+        det_ms = (st["detector_forward"] / n_stage) / 1_000_000.0
+        total_ms = (st["total"] / n_stage) / 1_000_000.0
+        # Reset accumulators after read.
+        for _k in self._stage_ns_accum:
+            self._stage_ns_accum[_k] = 0
+        self._stage_ns_count = 0
+        _LOG.info(
+            "cube_progress: cubes=%d cands=%d clusters=%d "
+            "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
+            "stage_ms[build/l1/det/total]=%.1f/%.1f/%.1f/%.1f "
+            "build_ms[h2d/imager/valid]=%.1f/%.1f/%.1f(n=%d) "
+            "scatter=%.1f/%.1f us(mean/max,n=%d) src=%s",
+            self._cubes_processed,
+            self._candidates_emitted,
+            self._clusters_emitted,
+            d_cubes / dt,
+            dt,
+            self._cubes_processed / max(now - now_loop_start, 1e-9),
+            build_ms, layer1_ms, det_ms, total_ms,
+            _build_t["h2d_ms"], _build_t["imager_ms"], _build_t["valid_ms"],
+            _build_t["n"],
+            _scatter_t["mean_us"], _scatter_t["max_us"],
+            _scatter_t["count"],
+            getattr(self._source, "stats", {}),
+        )
+
     async def run(self) -> None:
         """Main loop. Iterates over RX-ring slots until source exhausts
         or ``stop()`` is called.
@@ -918,24 +993,12 @@ class SearchComputeService:
                 await self._source.release(slot.cube_id)
                 slot, pending = next_slot, next_pending
                 if self._cubes_processed >= next_status:
-                    now = time.monotonic()
-                    d_cubes = self._cubes_processed - last_cubes
-                    dt = max(now - last_log, 1e-9)
-                    _LOG.info(
-                        "cube_progress: cubes=%d cands=%d clusters=%d "
-                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
-                        "src=%s",
-                        self._cubes_processed,
-                        self._candidates_emitted,
-                        self._clusters_emitted,
-                        d_cubes / dt,
-                        dt,
-                        self._cubes_processed / max(now - loop_start, 1e-9),
-                        getattr(self._source, "stats", {}),
-                    )
-                    next_status += status_every
-                    last_log = now
+                    self._log_cube_progress(now_loop_start=loop_start,
+                                            last_log_mono=last_log,
+                                            last_cubes_count=last_cubes)
+                    last_log = time.monotonic()
                     last_cubes = self._cubes_processed
+                    next_status += status_every
         else:
             async for slot in self._source:
                 if self._stopping.is_set():
@@ -943,24 +1006,12 @@ class SearchComputeService:
                 await self._process_one_cube(slot)
                 await self._source.release(slot.cube_id)
                 if self._cubes_processed >= next_status:
-                    now = time.monotonic()
-                    d_cubes = self._cubes_processed - last_cubes
-                    dt = max(now - last_log, 1e-9)
-                    _LOG.info(
-                        "cube_progress: cubes=%d cands=%d clusters=%d "
-                        "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
-                        "src=%s",
-                        self._cubes_processed,
-                        self._candidates_emitted,
-                        self._clusters_emitted,
-                        d_cubes / dt,
-                        dt,
-                        self._cubes_processed / max(now - loop_start, 1e-9),
-                        getattr(self._source, "stats", {}),
-                    )
-                    next_status += status_every
-                    last_log = now
+                    self._log_cube_progress(now_loop_start=loop_start,
+                                            last_log_mono=last_log,
+                                            last_cubes_count=last_cubes)
+                    last_log = time.monotonic()
                     last_cubes = self._cubes_processed
+                    next_status += status_every
 
 
 # ---------------------------------------------------------------------------
@@ -1591,8 +1642,20 @@ async def _run_async(args: argparse.Namespace) -> int:
         # M7.5 scatter activation — when both linear_lut + n_filled are
         # set the source switches to assemble_dense_block (real cint8
         # scatter); otherwise the M7.2 zero-stub path is used.
-        linear_lut_per_corr=linear_lut_per_corr,
-        n_filled_per_corr=n_filled_per_corr_arr,
+        # ``DSART_DISABLE_SCATTER=1`` is a debug-only env to force the
+        # M7.2 zero-stub path (used by the M7.3 baseline re-bench
+        # 2026-05-27 to confirm the non-scatter pipeline still hits
+        # 7.45 cubes/s with the M7.4 C1/C2/Option-A bolt-ons present).
+        linear_lut_per_corr=(
+            None
+            if os.environ.get("DSART_DISABLE_SCATTER", "0") == "1"
+            else linear_lut_per_corr
+        ),
+        n_filled_per_corr=(
+            None
+            if os.environ.get("DSART_DISABLE_SCATTER", "0") == "1"
+            else n_filled_per_corr_arr
+        ),
         # M7.4 stage-2-absent escape hatch: bake the per-coarse-DM
         # inter-chgroup ν_bot_proc alignment into the search-side
         # shifts. Mandatory for the M7.4 250924mptq replay until the

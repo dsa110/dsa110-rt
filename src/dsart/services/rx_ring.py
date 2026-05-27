@@ -156,6 +156,17 @@ class CubeRingSlot:
     per_chgroup_scale_per_t: Optional[np.ndarray] = None
     per_chgroup_offset_re_per_t: Optional[np.ndarray] = None
     per_chgroup_offset_im_per_t: Optional[np.ndarray] = None
+    # M7.4.1 GPU-scatter (2026-05-27): compact COO wire payload + the
+    # LUT/n_filled metadata the GPU scatter kernel needs to expand it
+    # into the dense plane on-device. When set, the CubePipeline runs
+    # `gpu_scatter.zero_dense_rows` + `scatter_compact_to_dense` AFTER
+    # the H2D and BEFORE the imager kernel, producing the SAME dense
+    # plane that ``per_chgroup_cint8_stack`` would have carried — but
+    # with a ~30 MiB H2D instead of ~565 MiB. Mutually exclusive with
+    # ``per_chgroup_cint8_stack``: emit one OR the other, not both.
+    compact_cells_packed: Optional[np.ndarray] = None
+    compact_n_filled_per_corr: Optional[np.ndarray] = None
+    compact_lut: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.cube_id < 0:
@@ -203,6 +214,53 @@ class CubeRingSlot:
                     f"({cint8.shape[3]}, {cint8.shape[4]}) != n_grid="
                     f"{self.n_grid}"
                 )
+        # M7.4.1 compact-payload validation. Mutually exclusive with
+        # per_chgroup_cint8_stack: the GPU pipeline either gets the
+        # dense plane pre-baked (M7.4) OR a compact COO buffer it
+        # expands GPU-side (M7.4.1).
+        compact = self.compact_cells_packed
+        if compact is not None:
+            if self.per_chgroup_cint8_stack is not None:
+                raise ValueError(
+                    "compact_cells_packed is mutually exclusive with "
+                    "per_chgroup_cint8_stack; emit one or the other"
+                )
+            if compact.dtype != np.int8:
+                raise TypeError(
+                    f"compact_cells_packed.dtype={compact.dtype}, expected int8"
+                )
+            if compact.ndim != 3:
+                raise ValueError(
+                    f"compact_cells_packed.shape={compact.shape}, expected "
+                    "(N_corr, T_det, n_filled_max * 2)"
+                )
+            if compact.shape[1] != self.t_det:
+                raise ValueError(
+                    f"compact_cells_packed.shape[1]={compact.shape[1]} != "
+                    f"t_det={self.t_det}"
+                )
+            if self.compact_n_filled_per_corr is None:
+                raise ValueError(
+                    "compact_n_filled_per_corr REQUIRED when "
+                    "compact_cells_packed is set"
+                )
+            if self.compact_lut is None:
+                raise ValueError(
+                    "compact_lut REQUIRED when compact_cells_packed is set"
+                )
+            nfp = self.compact_n_filled_per_corr
+            if nfp.dtype != np.int32 or nfp.shape != (compact.shape[0],):
+                raise ValueError(
+                    f"compact_n_filled_per_corr expected int32 "
+                    f"({compact.shape[0]},), got {nfp.dtype} {nfp.shape}"
+                )
+            lut = self.compact_lut
+            if lut.dtype != np.int32 or lut.ndim != 2 or lut.shape[0] != compact.shape[0]:
+                raise ValueError(
+                    f"compact_lut expected int32 ({compact.shape[0]}, "
+                    f"lut_stride); got {lut.dtype} {lut.shape}"
+                )
+
         # Per-chgroup calibration arrays (chunk-8(c)). All three are
         # length-N_chg float32 1-D arrays with N_chg matching the cint8
         # stack's outer dim when present (otherwise informational —
@@ -210,6 +268,9 @@ class CubeRingSlot:
         n_chg_expected: Optional[int]
         if self.per_chgroup_cint8_stack is not None:
             n_chg_expected = int(self.per_chgroup_cint8_stack.shape[0])
+        elif self.compact_cells_packed is not None:
+            # In compact mode, N_chg == N_corr (compact[0]).
+            n_chg_expected = int(self.compact_cells_packed.shape[0])
         else:
             n_chg_expected = None
         for name, arr in (

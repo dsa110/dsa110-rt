@@ -101,13 +101,23 @@ _FP16_CLIP_MAX: float = 60000.0
 def _clamp_inf_to_finite(cube: torch.Tensor) -> torch.Tensor:
     """Replace ±inf / NaN in a cube with finite, dtype-safe bounds.
 
-    No-op when the cube has no non-finite values (fast path covers the
-    common case at zero cost on quiet cubes). On bright bursts the
-    saturated samples land at ±``_FP16_CLIP_MAX`` instead of ±inf so
-    the rest of the pipeline can keep doing finite arithmetic on them.
+    On bright bursts the saturated samples land at ±``_FP16_CLIP_MAX``
+    instead of ±inf so the rest of the pipeline can keep doing finite
+    arithmetic on them.
 
-    Runs in-place on the input tensor to avoid an extra full-cube
-    allocation in the hot path.
+    M7.4 RT fix (2026-05-27): runs **truly in-place** via
+    ``torch.nan_to_num_`` — the previous docstring CLAIMED in-place
+    but used the out-of-place ``torch.nan_to_num`` form which
+    allocates a fresh 3.2 GiB fp16 tensor per call. With four
+    per-cube call sites (post-imager, two layer1 paths, CPU path) the
+    extra alloc + write-back was costing ~25 ms / cube of pure
+    memory-traffic overhead — measured 6.4 ms / pass at the
+    GPU's ~500 GB/s memory BW × 4 passes × 1 alloc each. The in-place
+    form drops the alloc and the redundant write-back, recovering
+    most of the 105 ms p50 → 165 ms regression observed since M7.3.
+    Safe in-place: torch documents ``nan_to_num_`` as no-graph,
+    no-stride-flip; the imager + layer1 callers do NOT re-use the
+    pre-clamp tensor, so an in-place mutation is correct.
     """
     if cube.dtype == torch.float16:
         clip = _FP16_CLIP_MAX
@@ -117,7 +127,9 @@ def _clamp_inf_to_finite(cube: torch.Tensor) -> torch.Tensor:
         # the rest of the pipeline.
         finfo = torch.finfo(cube.dtype)
         clip = finfo.max * 0.5
-    return torch.nan_to_num(cube, nan=0.0, posinf=clip, neginf=-clip)
+    # torch.nan_to_num_ is the genuine in-place form; the trailing
+    # underscore is load-bearing.
+    return torch.nan_to_num_(cube, nan=0.0, posinf=clip, neginf=-clip)
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +683,11 @@ class CubePipeline:
         # GpuImager is built lazily on the first cube so the slot's
         # geometry can pin t_det / n_fdm when the config doesn't.
         self._gpu_imager: Optional[object] = None
+        # M7.4 RT-perf debug (2026-05-27): per-cube GPU-event ring used
+        # by ``_build_cube_gpu`` to time the H2D / imager / validity
+        # sub-stages. Read + drained by
+        # :meth:`get_build_event_timing_and_reset`.
+        self._dbg_build_events: list = []
         # Re-usable host pinned cint8 staging buffer for the GPU
         # backend; allocated on first cube.
         self._cint8_host_buf: Optional[np.ndarray] = None
@@ -683,6 +700,17 @@ class CubePipeline:
         # on first H2D prefetch.
         self._cint8_gpu_buf_pp: List[Optional[torch.Tensor]] = [None, None]
         self._cint8_pp_index: int = 0
+        # M7.4.1 GPU-scatter (2026-05-27): compact COO buffer +
+        # cached LUT + n_filled_per_corr GPU tensors. The LUT and
+        # n_filled are static for the lifetime of the search so we
+        # only H2D them once (detected by host pointer identity).
+        # The compact buffer is per-cube; it's ~30 MiB vs the
+        # M7.4 dense path's ~565 MiB.
+        self._compact_gpu_buf: Optional[torch.Tensor] = None
+        self._compact_lut_gpu: Optional[torch.Tensor] = None
+        self._compact_lut_host_id: Optional[int] = None
+        self._compact_nfp_gpu: Optional[torch.Tensor] = None
+        self._compact_nfp_host_id: Optional[int] = None
         self._shifts_gpu_buf: Optional[torch.Tensor] = None
         self._validity_gpu_buf: Optional[torch.Tensor] = None
         self._validity_all_true_gpu: Optional[torch.Tensor] = None
@@ -801,9 +829,30 @@ class CubePipeline:
         RX-ring scaffolding (used when ``per_chgroup_streams`` arrives
         without ``per_chgroup_cint8_stack`` populated).
         """
+        # M7.4 RT-perf debug (2026-05-27): GPU-event-based sub-stage
+        # timing of _stage_h2d / _run_imager / _build_validity. ``time.
+        # perf_counter`` is meaningless here because all three steps
+        # issue async CUDA work and return before the GPU is done.
+        # Cost: 4 × torch.cuda.Event.record (≈2 µs each). The events
+        # are READ + RESET by the cube_progress logger.
+        _ev_t0 = torch.cuda.Event(enable_timing=True)
+        _ev_t1 = torch.cuda.Event(enable_timing=True)
+        _ev_t2 = torch.cuda.Event(enable_timing=True)
+        _ev_t3 = torch.cuda.Event(enable_timing=True)
+        _ev_t0.record()
         staged = self._stage_h2d(slot, cint8_dest_idx=0, use_pp=False)
+        _ev_t1.record()
         cube = self._run_imager_from_staged(staged)
+        _ev_t2.record()
         validity_mask = self._build_validity_mask(slot)
+        _ev_t3.record()
+        # Stash on self for the cube_progress logger to read; we don't
+        # synchronize here (that would defeat pipeline-overlap). The
+        # logger syncs before reading, far enough ahead that the events
+        # have long since completed.
+        self._dbg_build_events.append((_ev_t0, _ev_t1, _ev_t2, _ev_t3))
+        if len(self._dbg_build_events) > 32:
+            self._dbg_build_events.pop(0)
         return cube, validity_mask
 
     def _stage_h2d(
@@ -969,7 +1018,134 @@ class CubePipeline:
         # historical behaviour.
         non_blocking = bool(use_pp or enable_gpu_buf_reuse)
 
-        if slot.per_chgroup_cint8_stack is not None:
+        if slot.compact_cells_packed is not None:
+            # M7.4.1 GPU-scatter (2026-05-27): ship the compact COO
+            # buffer (~30 MiB) + per-corr LUT + n_filled to the GPU,
+            # then expand on-device into the dense cint8 plane via
+            # gpu_scatter. Eliminates the 565 MiB dense H2D + 565 MiB
+            # CPU memset that the M7.4 dense path required.
+            from ..transport.gpu_scatter import (
+                scatter_compact_to_dense,
+                zero_dense_rows,
+            )
+            compact = slot.compact_cells_packed
+            nfp = slot.compact_n_filled_per_corr
+            lut = slot.compact_lut
+            assert compact is not None
+            assert nfp is not None
+            assert lut is not None
+            n_corr_c = int(compact.shape[0])
+            if n_corr_c != n_chg:
+                raise ValueError(
+                    f"compact_cells_packed N_corr={n_corr_c} != "
+                    f"pipeline N_chg={n_chg}"
+                )
+            n_filled_max = int(compact.shape[2] // 2)
+            # The dense GPU buffer is permanent. Its T axis must be
+            # >= t_stream so the imager kernel's per-(g, t_src) lookup
+            # lands in-bounds. We allocate (N_chg, t_stream, 2, N, N)
+            # and zero rows [0, t_det) before each cube's scatter; rows
+            # [t_det, t_stream) are zeroed ONCE at allocation time and
+            # never touched again (mirrors the M7.4 dense scatter's
+            # tail-stays-zero invariant — the compact assembler never
+            # writes lookahead samples either).
+            dense_shape = (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid)
+            if use_pp:
+                buf = self._cint8_gpu_buf_pp[cint8_dest_idx]
+                if (
+                    buf is None or buf.shape != dense_shape
+                    or buf.device != self._device
+                ):
+                    buf = torch.zeros(
+                        dense_shape, dtype=torch.int8, device=self._device,
+                    )
+                    self._cint8_gpu_buf_pp[cint8_dest_idx] = buf
+                cint8_t = buf
+            else:
+                if (
+                    self._cint8_gpu_buf is None
+                    or self._cint8_gpu_buf.shape != dense_shape
+                    or self._cint8_gpu_buf.device != self._device
+                ):
+                    self._cint8_gpu_buf = torch.zeros(
+                        dense_shape, dtype=torch.int8, device=self._device,
+                    )
+                cint8_t = self._cint8_gpu_buf
+
+            # H2D the compact buffer (~30 MiB) + LUT + n_filled. The
+            # LUT and n_filled are static for the lifetime of the
+            # search so we cache them GPU-side after first use. The
+            # compact buffer is per-cube so it H2D's each call.
+            compact_host = np.ascontiguousarray(compact)
+            maybe_register_host_buffer(compact_host)
+            compact_host_t = torch.from_numpy(compact_host)
+            if self._compact_gpu_buf is None or self._compact_gpu_buf.shape != compact_host_t.shape:
+                self._compact_gpu_buf = torch.empty(
+                    compact_host_t.shape,
+                    dtype=torch.int8,
+                    device=self._device,
+                )
+            self._compact_gpu_buf.copy_(compact_host_t, non_blocking=non_blocking)
+
+            lut_host_id = int(lut.__array_interface__["data"][0])
+            if (
+                self._compact_lut_gpu is None
+                or self._compact_lut_gpu.shape != lut.shape
+                or self._compact_lut_host_id != lut_host_id
+            ):
+                lut_host_t = torch.from_numpy(np.ascontiguousarray(lut))
+                self._compact_lut_gpu = lut_host_t.to(
+                    self._device, non_blocking=non_blocking,
+                )
+                self._compact_lut_host_id = lut_host_id
+
+            nfp_host_id = int(nfp.__array_interface__["data"][0])
+            if (
+                self._compact_nfp_gpu is None
+                or self._compact_nfp_gpu.shape != nfp.shape
+                or self._compact_nfp_host_id != nfp_host_id
+            ):
+                nfp_host_t = torch.from_numpy(np.ascontiguousarray(nfp))
+                self._compact_nfp_gpu = nfp_host_t.to(
+                    self._device, non_blocking=non_blocking,
+                )
+                self._compact_nfp_host_id = nfp_host_id
+
+            # Zero rows [0, t_det) of the dense plane, then scatter the
+            # compact cells into the zeroed region. Tail rows
+            # [t_det, t_stream) stay at the original zero from buffer
+            # allocation, matching the M7.4 dense scatter convention.
+            zero_dense_rows(dense=cint8_t, t_det=t_det)
+            scatter_compact_to_dense(
+                cells_packed=self._compact_gpu_buf,
+                lut=self._compact_lut_gpu,
+                n_filled_per_corr=self._compact_nfp_gpu,
+                dense=cint8_t,
+                t_det=t_det,
+                n_grid=cfg.n_grid,
+                n_filled_max=n_filled_max,
+            )
+            # Sidecar H2D follows the same per-(chgroup, t) path as
+            # the M7.4 dense scatter (shape [N_chg, T_stream] f32).
+            if slot.per_chgroup_scale_per_t is not None:
+                chgroup_scale_t = torch.from_numpy(
+                    np.ascontiguousarray(
+                        slot.per_chgroup_scale_per_t, dtype=np.float32,
+                    )
+                ).to(self._device, non_blocking=non_blocking)
+            if slot.per_chgroup_offset_re_per_t is not None:
+                chgroup_offset_re_t = torch.from_numpy(
+                    np.ascontiguousarray(
+                        slot.per_chgroup_offset_re_per_t, dtype=np.float32,
+                    )
+                ).to(self._device, non_blocking=non_blocking)
+            if slot.per_chgroup_offset_im_per_t is not None:
+                chgroup_offset_im_t = torch.from_numpy(
+                    np.ascontiguousarray(
+                        slot.per_chgroup_offset_im_per_t, dtype=np.float32,
+                    )
+                ).to(self._device, non_blocking=non_blocking)
+        elif slot.per_chgroup_cint8_stack is not None:
             cint8_src = slot.per_chgroup_cint8_stack
             if cint8_src.shape != (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid):
                 raise ValueError(
@@ -1069,6 +1245,48 @@ class CubePipeline:
             cint8_buf_idx=cint8_dest_idx,
             build_start_ns=0,  # caller fills in
         )
+
+    def get_build_event_timing_and_reset(self) -> dict:
+        """Drain the GPU-event ring and return mean per-sub-stage GPU
+        time in ms. Synchronizes only the events that have been
+        recorded — the events were issued at least ``len(ring)`` cubes
+        ago, so their GPU work has long since completed and the wait
+        is non-blocking in practice."""
+        if not self._dbg_build_events:
+            return {
+                "h2d_ms": 0.0, "imager_ms": 0.0, "valid_ms": 0.0,
+                "n": 0,
+            }
+        events = list(self._dbg_build_events)
+        self._dbg_build_events = []
+        # Wait for the LAST event in the oldest tuple to ensure all
+        # earlier events have a valid elapsed_time.
+        if events:
+            try:
+                events[-1][3].synchronize()
+            except Exception:  # noqa: BLE001
+                pass
+        h2d_ms = imager_ms = valid_ms = 0.0
+        n_ok = 0
+        for (t0, t1, t2, t3) in events:
+            try:
+                h2d_ms += float(t0.elapsed_time(t1))
+                imager_ms += float(t1.elapsed_time(t2))
+                valid_ms += float(t2.elapsed_time(t3))
+                n_ok += 1
+            except Exception:  # noqa: BLE001
+                continue
+        if n_ok == 0:
+            return {
+                "h2d_ms": 0.0, "imager_ms": 0.0, "valid_ms": 0.0,
+                "n": 0,
+            }
+        return {
+            "h2d_ms": h2d_ms / n_ok,
+            "imager_ms": imager_ms / n_ok,
+            "valid_ms": valid_ms / n_ok,
+            "n": n_ok,
+        }
 
     def _run_imager_from_staged(self, staged: _H2dStaged) -> torch.Tensor:
         """Run the GPU imager on already-staged H2D tensors.
@@ -1252,7 +1470,15 @@ class CubePipeline:
         if self._gpu_imager is not None:
             self._gpu_imager.set_edge_mask_per_fdm(sigma_inv)
         self._sigma_layer1_prev = sigma_for_use
-        return _clamp_inf_to_finite(cube), sigma_for_use
+        # M7.4 RT fix (2026-05-27): the fused-layer1 path does NOT
+        # modify ``cube`` (the σ is consumed by the NEXT cube's imager,
+        # not applied to this cube here). ``cube`` was already passed
+        # through ``_clamp_inf_to_finite`` immediately after the imager
+        # in ``_run_imager_from_staged``, so a second clamp here is
+        # redundant — drop it to save another ~6.4 ms / cube of
+        # full-cube memory traffic. The non-fused path (see line ~1208)
+        # still clamps because its broadcast-divide can introduce inf.
+        return cube, sigma_for_use
 
     def prefetch_h2d(self, slot: CubeRingSlot) -> PrefetchedH2dCube:
         """Stage the cube's H2D copies on the dedicated H2D stream.
@@ -1359,7 +1585,25 @@ class CubePipeline:
         cube. We use ``.amin()/.amax()/.mean()/.std()`` and convert to
         python scalars via ``.item()``; ``mean`` and ``std`` upcast
         internally for fp16 but only on the scalar accumulator (no
-        full-tensor allocation)."""
+        full-tensor allocation).
+
+        Production gating (added 2026-05-27 after the M7.4 real-SNAP
+        soak showed 4.76 cubes/s vs the 7.45 target): this routine
+        performs ≈ 8 GPU→CPU ``.item()`` syncs per cube
+        (cube_raw.amin/amax/slice-mean, cube_norm.amin/amax,
+        sigma_layer1.amin/median/amax, validity_mask.sum). py-spy on
+        n01 caught each sync at 2–4 ms with a steady-state stall
+        because the main stream had unfinished GPU work — the per-cube
+        cost was ~25 ms wall, i.e. ~20% of the 134 ms RT budget.
+        Production gates the whole helper on ``DSART_CUBE_DEBUG=1``
+        (default off); the M7.4 burst-replay and noise-test runbooks
+        set it to 1 explicitly.
+        """
+        # Cheap early-out before any GPU work. Allows operators to
+        # enable per-cube stats via env without restarting only when
+        # they need it (e.g. during M7.4 debug).
+        if os.environ.get("DSART_CUBE_DEBUG", "0") != "1":
+            return
         try:
             # All reductions are scalar — no whole-cube copies.
             raw_min = float(cube_raw.amin().item())

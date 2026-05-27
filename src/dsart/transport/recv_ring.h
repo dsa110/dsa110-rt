@@ -143,6 +143,43 @@ rx_ring_assemble_dense_block(
     uint64_t       *out_n_no_data_present
 );
 
+/* M7.4.1 GPU-scatter (2026-05-27): like ``rx_ring_assemble_dense_block``
+ * but writes the compact COO wire payload [N_corr, T_det, n_filled_max*2]
+ * cint8 instead of the dense per-(corr, t) ``[2, N_grid, N_grid]`` plane.
+ * The dense scatter then happens GPU-side from this compact buffer,
+ * eliminating the 565 MiB CPU memset + the 565 MiB H2D in favour of a
+ * ~30 MiB H2D (n_filled=5000, N_corr=16, T_det=192 → 30 MiB compact vs
+ * 565 MiB dense, ~19× reduction). The compact buffer carries the same
+ * wire bytes (re_0, im_0, re_1, im_1, …) the slot already has, so the
+ * C body collapses to ``memcpy(slot.payload, compact[corr, t, :], n*2)``
+ * per slot — no per-cell loop, no per-corr LUT touch on CPU. The LUT
+ * lives GPU-side permanently after a one-time H2D at startup.
+ *
+ * Same validation + skipping semantics as ``rx_ring_assemble_dense_block``;
+ * invalid slots leave the compact row at zero (the GPU kernel skips
+ * scatter when scale==0 → the dense plane stays at the memset-0 baseline
+ * the GPU re-applies each cube). */
+int
+rx_ring_assemble_compact_block(
+    rx_ring_t      *ring,
+    uint64_t        specnum_start,
+    uint32_t        t_det,
+    uint32_t        sidecar_t_stride,         /* T axis of the sidecars (>= t_det) */
+    uint32_t        owned_dm,
+    uint32_t        compute_half,
+    uint32_t        n_active_dms_per_corr,
+    const int32_t  *n_filled_per_corr,        /* [n_corr] */
+    int8_t         *out_cells_packed,         /* [n_corr * t_det * n_filled_max * 2] */
+    uint32_t        n_filled_max,             /* wire ``n_filled_per_corr`` from header */
+    float          *out_scale_per_t,          /* [n_corr * sidecar_t_stride] */
+    float          *out_offset_re_per_t,      /* [n_corr * sidecar_t_stride] */
+    float          *out_offset_im_per_t,      /* [n_corr * sidecar_t_stride] */
+    uint8_t        *out_validity_per_t,       /* [t_det] */
+    uint64_t       *out_n_overrun,
+    uint64_t       *out_n_pattern_mismatch,
+    uint64_t       *out_n_no_data_present
+);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

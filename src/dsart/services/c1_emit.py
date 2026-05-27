@@ -203,6 +203,10 @@ class C1TcpEmitter:
         self._stopping = asyncio.Event()
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader: Optional[asyncio.StreamReader] = None
+        # Rate-limiter for the queue-full drop warning. Initialise to
+        # -inf so the very first drop logs immediately; subsequent
+        # drops are batched per the policy in ``submit``.
+        self._last_drop_log_mono: float = float("-inf")
         self._mon: Dict[str, Any] = {
             "connected": False,
             "bytes_sent": 0,
@@ -264,10 +268,26 @@ class C1TcpEmitter:
             return True
         except asyncio.QueueFull:
             self._mon["batches_dropped"] = int(self._mon["batches_dropped"]) + 1
-            _LOG.warning(
-                "c1_emit drop (queue full); cube_id=%d depth=%d",
-                int(header.cube_id), self._queue.maxsize,
+            # Rate-limited drop log: a stuck C2 emitter would otherwise
+            # flood every cube (steady-state ~5–7 lines / s × 8 halves
+            # = 60+ lines/s on the search-rx logger). Suppress unless
+            # we've seen at least N more drops since the previous warn
+            # OR M seconds elapsed — keeps the "first drop after a long
+            # quiet period" observable but stops the spam during
+            # continuous backpressure.
+            n_dropped = int(self._mon["batches_dropped"])
+            should_log = (
+                n_dropped == 1
+                or n_dropped % 100 == 0
+                or (time.monotonic() - self._last_drop_log_mono) > 30.0
             )
+            if should_log:
+                _LOG.warning(
+                    "c1_emit drop (queue full); cube_id=%d depth=%d "
+                    "(total_dropped=%d)",
+                    int(header.cube_id), self._queue.maxsize, n_dropped,
+                )
+                self._last_drop_log_mono = time.monotonic()
             return False
 
     async def stop(self) -> None:

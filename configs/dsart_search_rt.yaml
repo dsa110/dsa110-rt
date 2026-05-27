@@ -225,6 +225,21 @@ routines:
       # M7.4: tag cube-dump filenames so the two compute halves don't
       # race-overwrite each other's ``cube_{cid:06d}.pt``.
       DSART_M74_DUMP_TAG: "h0"
+      # M7.3 baseline RE-BENCH (2026-05-27): set DSART_DISABLE_SCATTER=
+      # "1" to force the M7.2 zero-stub validity path so we can confirm
+      # the non-scatter pipeline still hits 7.45 cubes/s with all the
+      # M7.4 C1/C2/Option-A bolt-ons. Leave at "0" for production.
+      DSART_DISABLE_SCATTER: "0"
+      # M7.4.1 GPU-scatter (2026-05-27): when set to "1", the CPU-side
+      # scatter writes the COMPACT ~30 MiB COO buffer instead of the
+      # ~565 MiB dense plane; the CubePipeline expands it GPU-side via
+      # gpu_scatter. Eliminates 565 MiB CPU memset + 565 MiB H2D per
+      # cube (the dominant bottleneck identified by the M7.4 diagnosis
+      # 2026-05-27: H2D=75 ms, ~50% of the 134 ms RT budget). Byte-
+      # identical dense plane vs the dense path (parity tested in
+      # tests/transport/test_recv_ring_assemble_compact.py). Flip to
+      # "0" to A/B the dense path on the same binary.
+      DSART_GPU_SCATTER: "1"
 
   - name: search_compute_1
     cmd: python
@@ -280,6 +295,14 @@ routines:
       DSART_ENABLE_GPU_BUF_REUSE: "1"
       # M7.4: tag cube-dump filenames per-half to prevent collisions.
       DSART_M74_DUMP_TAG: "h1"
+      # M7.3 baseline RE-BENCH (2026-05-27): see search_compute_0
+      # rationale. Set to "0" to restore the M7.4 active-scatter
+      # production path.
+      DSART_DISABLE_SCATTER: "0"
+      # M7.4.1 GPU-scatter (2026-05-27): see search_compute_0 for
+      # rationale + parity / perf evidence. Flip to "0" to A/B the
+      # M7.4 dense-CPU-scatter path on the same binary.
+      DSART_GPU_SCATTER: "1"
 
 # ---------------------------------------------------------------------------
 # M7.4 C1 stage config (locked schema; see docs/c1c2/C1C2_WIRE_SCHEMA.md §3
@@ -298,7 +321,7 @@ routines:
 # ---------------------------------------------------------------------------
 c1:
   snr_min: 8.0                       # Production: 8σ floor (Phase 1a noise test used 6.0 to characterise FA distribution).
-  cube_ring_depth: 8                 # CPU-side cube tensors retained per half
+  cube_ring_depth: 0                 # M7.4 RT-perf TEMP (2026-05-27): retention ring disabled while we measure the non-stage-cube RT path; the 3.2-GiB-per-cube DtoH was burning ~200 ms / cube of PCIe bus (cubes are 192*34*256*256*2 = 3.2 GiB fp16). Restore to 8 (or eventually move dump to a GPU-resident ring) once we have RT performance.
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index

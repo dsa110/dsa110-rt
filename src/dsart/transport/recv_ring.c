@@ -1061,6 +1061,193 @@ rx_ring_assemble_dense_block(
 
 
 /*
+ * rx_ring_assemble_compact_block (M7.4.1)
+ *
+ * Compact-payload variant of rx_ring_assemble_dense_block. Walks the
+ * same (corr, owned_dm, t in [0, t_det)) slot set, performs the same
+ * vf-bit validation, and writes the SAME per-(corr, t) sidecar arrays
+ * (scale, offset_re, offset_im) and the validity bitmap. Diverges only
+ * in the payload destination: instead of scattering cells into a
+ * [N_corr, out_t_stride, 2, N_grid, N_grid] dense int8 plane via a
+ * per-corr LUT, it memcpy's the raw slot's [n_filled_max * 2] cint8
+ * wire bytes into a compact [N_corr, t_det, n_filled_max * 2] buffer.
+ *
+ * Memory model
+ * ------------
+ * - The slot's "payload" is the leading ``n_filled_max * bpc`` bytes of
+ *   the slot. With ``bpc=2`` (cint8 path) that's exactly ``n_filled_max
+ *   * 2`` bytes laid out as ``[re_0, im_0, re_1, im_1, …]`` — see
+ *   tx.py::_encode_payload + rx.py::dequantise_cint8.
+ * - We blindly memcpy ALL ``n_filled_max * 2`` bytes for valid slots
+ *   even though only the leading ``n_filled_per_corr[corr] * 2`` of
+ *   them carry data; the tail is wire-padding the producer left at
+ *   zero (slot allocation is np.zeros at startup; producer touches
+ *   only the [0, n_filled_per_corr[corr]) prefix). The GPU scatter
+ *   kernel ignores entries beyond ``n_filled_per_corr[corr]`` via the
+ *   per-corr LUT length, so reading the wire-zero tail is harmless.
+ *   Net win: ONE memcpy per slot instead of a per-cell loop. On a
+ *   Skylake host this is ~3 GiB/s ⇒ for 3072 slots × 10 KiB =
+ *   30 MiB ⇒ ~10 ms (vs the dense path's 38 ms memset + 30 ms scatter
+ *   = ~68 ms; ~3× CPU speedup on the source side alone).
+ * - The compact buffer is zeroed in [0, t_det) rows on entry so
+ *   invalid slots land at zero — the GPU scatter kernel skips
+ *   contribution when ``scale==0`` so this is consistent with the
+ *   dense path's "invalid → dense plane stays zero" semantics.
+ *
+ * Returns 0 on success; -1 on invalid args.
+ */
+int
+rx_ring_assemble_compact_block(
+    rx_ring_t      *ring,
+    uint64_t        specnum_start,
+    uint32_t        t_det,
+    uint32_t        sidecar_t_stride,
+    uint32_t        owned_dm,
+    uint32_t        compute_half,
+    uint32_t        n_active_dms_per_corr,
+    const int32_t  *n_filled_per_corr,
+    int8_t         *out_cells_packed,
+    uint32_t        n_filled_max,
+    float          *out_scale_per_t,
+    float          *out_offset_re_per_t,
+    float          *out_offset_im_per_t,
+    uint8_t        *out_validity_per_t,
+    uint64_t       *out_n_overrun,
+    uint64_t       *out_n_pattern_mismatch,
+    uint64_t       *out_n_no_data_present
+)
+{
+    if (!ring || !ring->hdr) return -1;
+    if (!n_filled_per_corr) return -1;
+    if (!out_cells_packed) return -1;
+    if (!out_scale_per_t || !out_offset_re_per_t || !out_offset_im_per_t)
+        return -1;
+    if (!out_validity_per_t) return -1;
+    if (compute_half >= N_COMPUTE) return -1;
+    /* Sidecars must be >= t_det wide so the imager's per-(g, t) scale
+     * lookup (with stride = T_stream) lands in-bounds even when the
+     * GPU dense plane uses a T_stream > t_det lookahead. */
+    if (sidecar_t_stride < t_det) return -1;
+
+    rx_ring_header_t *h = ring->hdr;
+    const uint32_t n_corr        = h->n_corr;
+    const uint32_t n_coarse_dm   = h->n_coarse_dm;
+    const uint64_t t_buf         = h->t_buf_samples;
+    const uint64_t slot_stride   = h->slot_stride_bytes;
+    const uint32_t bpc           = h->bytes_per_cell;
+    const size_t   payload_bytes = (size_t)h->n_filled_per_corr * bpc;
+    uint8_t       *data_base     = (uint8_t *)ring->data;
+
+    if (owned_dm >= n_coarse_dm) return -1;
+    if (bpc != 2) return -1;
+    /* n_filled_max must match the wire-side header EXACTLY: we memcpy
+     * a fixed payload_bytes per slot and the compact buffer's row
+     * stride is sized at n_filled_max*2. A mismatch would either
+     * overflow the destination or skip cells. */
+    if (n_filled_max != h->n_filled_per_corr) return -1;
+
+    const size_t row_bytes = (size_t)n_filled_max * 2;  /* bpc=2 enforced */
+
+    /* Zero the compact buffer (full [0, t_det) rows) + sidecars (full
+     * [0, sidecar_t_stride) so the [t_det, T_stream) tail lookups by
+     * the imager kernel see scale==0 = skip) + validity. */
+    memset(out_cells_packed, 0, (size_t)n_corr * t_det * row_bytes);
+    memset(out_scale_per_t,
+           0, (size_t)n_corr * sidecar_t_stride * sizeof(float));
+    memset(out_offset_re_per_t,
+           0, (size_t)n_corr * sidecar_t_stride * sizeof(float));
+    memset(out_offset_im_per_t,
+           0, (size_t)n_corr * sidecar_t_stride * sizeof(float));
+    memset(out_validity_per_t,  1, (size_t)t_det);
+
+    uint64_t n_overrun = 0;
+    uint64_t n_pattern_mismatch = 0;
+    uint64_t n_no_data_present = 0;
+
+    for (uint32_t corr = 0; corr < n_corr; corr++) {
+        uint64_t wseq = __atomic_load_n(
+            &h->write_seq_per_corr[corr], __ATOMIC_ACQUIRE
+        );
+        const int32_t nfilled_c = n_filled_per_corr[corr];
+        if (nfilled_c < 0) continue;  /* intentionally silent */
+
+        /* Base pointer to the (corr, owned_dm) sub-block of the ring. */
+        uint8_t *col_base = data_base
+            + ((size_t)corr * n_coarse_dm + owned_dm) * t_buf * slot_stride;
+
+        int8_t *cells_corr = out_cells_packed
+            + (size_t)corr * (size_t)t_det * row_bytes;
+        float  *scale_corr = out_scale_per_t     + (size_t)corr * sidecar_t_stride;
+        float  *offre_corr = out_offset_re_per_t + (size_t)corr * sidecar_t_stride;
+        float  *offim_corr = out_offset_im_per_t + (size_t)corr * sidecar_t_stride;
+
+        const uint64_t n_active_safe =
+            n_active_dms_per_corr > 0 ? n_active_dms_per_corr : 1;
+        const uint64_t wseq_lap_threshold =
+            (t_buf + (uint64_t)t_det) * n_active_safe;
+
+        for (uint32_t t = 0; t < t_det; t++) {
+            const uint64_t t_abs = specnum_start + (uint64_t)t;
+
+            if (wseq > t_abs * n_active_safe + wseq_lap_threshold) {
+                n_overrun++;
+                __atomic_fetch_add(
+                    &h->overrun_count_per_compute[compute_half],
+                    1, __ATOMIC_RELAXED
+                );
+                out_validity_per_t[t] = 0;
+                continue;  /* leave compact row + scale = 0 */
+            }
+
+            const size_t t_idx = (size_t)(t_abs % t_buf);
+            uint8_t *slot_base = col_base + t_idx * slot_stride;
+
+            uint16_t *vfp = (uint16_t *)(slot_base
+                                         + payload_bytes
+                                         + SCALE_OFFSET_BYTES);
+            uint16_t vf = __atomic_load_n(vfp, __ATOMIC_ACQUIRE);
+
+            int bad = 0;
+            if (vf & VF_RX_OVERRUN) {
+                n_overrun++; bad = 1;
+            } else if (vf & VF_PATTERN_MISMATCH) {
+                n_pattern_mismatch++; bad = 1;
+            } else if (!(vf & VF_DATA_PRESENT)) {
+                n_no_data_present++; bad = 1;
+            }
+
+            if (bad) {
+                out_validity_per_t[t] = 0;
+                continue;
+            }
+
+            const float scale = *(float *)(slot_base + payload_bytes);
+            const float off   = *(float *)(slot_base + payload_bytes
+                                          + sizeof(float));
+            scale_corr[t] = scale;
+            offre_corr[t] = off;
+            offim_corr[t] = off;
+
+            /* COMPACT MEMCPY: ALL n_filled_max*2 bytes go to the dest
+             * row. The tail beyond n_filled_per_corr[corr]*2 is
+             * wire-zero (producer never writes there); reading it is
+             * a benign small-memory waste and the GPU scatter ignores
+             * those slots via the per-corr LUT length. */
+            memcpy(cells_corr + (size_t)t * row_bytes,
+                   slot_base,
+                   row_bytes);
+        }
+    }
+
+    if (out_n_overrun)          *out_n_overrun          += n_overrun;
+    if (out_n_pattern_mismatch) *out_n_pattern_mismatch += n_pattern_mismatch;
+    if (out_n_no_data_present)  *out_n_no_data_present  += n_no_data_present;
+
+    return 0;
+}
+
+
+/*
  * rx_ring_get_dims — expose dimensions to callers (useful for Python ctypes).
  */
 void

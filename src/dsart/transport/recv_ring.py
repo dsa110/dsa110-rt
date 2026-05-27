@@ -247,6 +247,31 @@ def _bind_c_api(lib: ctypes.CDLL) -> None:
             ctypes.POINTER(ctypes.c_uint64),  # out_n_no_data_present
         ]
 
+    # rx_ring_assemble_compact_block (M7.4.1 GPU-scatter, 2026-05-27):
+    # compact COO wire-payload variant of dense_block. Optional symbol
+    # so older .so builds gracefully degrade to the dense path.
+    if hasattr(lib, "rx_ring_assemble_compact_block"):
+        lib.rx_ring_assemble_compact_block.restype = ctypes.c_int
+        lib.rx_ring_assemble_compact_block.argtypes = [
+            ctypes.c_void_p,                  # ring
+            ctypes.c_uint64,                  # specnum_start
+            ctypes.c_uint32,                  # t_det
+            ctypes.c_uint32,                  # sidecar_t_stride (>= t_det)
+            ctypes.c_uint32,                  # owned_dm
+            ctypes.c_uint32,                  # compute_half
+            ctypes.c_uint32,                  # n_active_dms_per_corr
+            ctypes.POINTER(ctypes.c_int32),   # n_filled_per_corr [n_corr]
+            ctypes.POINTER(ctypes.c_int8),    # out_cells_packed [n_corr * t_det * n_filled_max * 2]
+            ctypes.c_uint32,                  # n_filled_max
+            ctypes.POINTER(ctypes.c_float),   # out_scale_per_t      [n_corr * sidecar_t_stride]
+            ctypes.POINTER(ctypes.c_float),   # out_offset_re_per_t  [n_corr * sidecar_t_stride]
+            ctypes.POINTER(ctypes.c_float),   # out_offset_im_per_t  [n_corr * sidecar_t_stride]
+            ctypes.POINTER(ctypes.c_uint8),   # out_validity_per_t   [t_det]
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_overrun
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_pattern_mismatch
+            ctypes.POINTER(ctypes.c_uint64),  # out_n_no_data_present
+        ]
+
 
 # Lazy-load; None if the .so is missing (stub mode for tests that mock it).
 _LIB: Optional[ctypes.CDLL] = None
@@ -826,6 +851,164 @@ class RxRing:
             )
         return (
             out_cint8,
+            out_scale,
+            out_offset_re,
+            out_offset_im,
+            out_validity.astype(np.bool_, copy=False),
+            int(n_over.value),
+            int(n_pat.value),
+            int(n_nodp.value),
+        )
+
+    def assemble_compact_block(
+        self,
+        *,
+        specnum_start: int,
+        t_det: int,
+        owned_dm: int,
+        n_filled_per_corr: np.ndarray,
+        n_filled_max: int,
+        compute_half: int = 0,
+        n_active_dms_per_corr: int = 1,
+        sidecar_t_stride: int | None = None,
+        out_cells_packed: np.ndarray | None = None,
+        out_scale: np.ndarray | None = None,
+        out_offset_re: np.ndarray | None = None,
+        out_offset_im: np.ndarray | None = None,
+        out_validity: np.ndarray | None = None,
+    ) -> tuple[
+        np.ndarray,  # out_cells_packed  (n_corr, t_det, n_filled_max * 2)
+        np.ndarray,  # out_scale         (n_corr, sidecar_t_stride)
+        np.ndarray,  # out_offset_re     (n_corr, sidecar_t_stride)
+        np.ndarray,  # out_offset_im     (n_corr, sidecar_t_stride)
+        np.ndarray,  # out_validity      (t_det,) bool
+        int,         # n_overrun
+        int,         # n_pattern_mismatch
+        int,         # n_no_data_present
+    ]:
+        """Compact-payload walker (M7.4.1 GPU-scatter, 2026-05-27).
+
+        Like :meth:`assemble_dense_block` but emits the raw COO wire
+        payload (~30 MiB) instead of the dense per-(corr, t) plane
+        (~565 MiB). The GPU-side scatter consumes the compact buffer
+        + the per-corr LUT (preloaded GPU-side at startup) and writes
+        the dense plane directly in device memory. Eliminates the
+        CPU-side 565 MiB memset + 565 MiB H2D from the cube hot path.
+
+        Args:
+            specnum_start: absolute ``t`` for slot 0 of the cube window.
+            t_det: detector window length.
+            owned_dm: coarse-DM index to scatter.
+            n_filled_per_corr: ``int32 [n_corr]`` actual N_filled per
+                corr's sparsity pattern. ``-1`` marks a corr silent.
+            n_filled_max: wire-side ``n_filled_per_corr`` from the
+                ring header (the leading dim that bounds the slot
+                payload bytes). Must equal ``dims.n_filled_per_corr``.
+            compute_half: 0 or 1.
+            n_active_dms_per_corr: same wseq-wait gate as
+                :meth:`assemble_validity_block`.
+            out_*: caller-allocated buffers for reuse across cubes.
+
+        Returns:
+            ``(cells_packed, scale, offset_re, offset_im, validity,
+            n_overrun, n_pattern_mismatch, n_no_data_present)``.
+        """
+        if self._closed:
+            raise RuntimeError("RxRing is closed")
+        lib = _get_lib()
+        if not hasattr(lib, "rx_ring_assemble_compact_block"):
+            raise NotImplementedError(
+                "_recv_ring.so does not export "
+                "rx_ring_assemble_compact_block; rebuild the C "
+                "extension: `python setup.py build_ext --inplace`"
+            )
+
+        n_corr = int(self.dims.n_corr)
+        t_det = int(t_det)
+        n_filled_max = int(n_filled_max)
+        if n_filled_max != int(self.dims.n_filled_per_corr):
+            raise ValueError(
+                f"n_filled_max={n_filled_max} must equal "
+                f"dims.n_filled_per_corr={self.dims.n_filled_per_corr}"
+            )
+        sidecar_t_stride_i = int(sidecar_t_stride) if sidecar_t_stride is not None else t_det
+        if sidecar_t_stride_i < t_det:
+            raise ValueError(
+                f"sidecar_t_stride={sidecar_t_stride_i} must be >= t_det={t_det}"
+            )
+
+        n_filled_arr = np.ascontiguousarray(n_filled_per_corr, dtype=np.int32)
+        if n_filled_arr.shape != (n_corr,):
+            raise ValueError(
+                f"n_filled_per_corr.shape={n_filled_arr.shape}; "
+                f"expected ({n_corr},)"
+            )
+
+        cells_shape = (n_corr, t_det, n_filled_max * 2)
+        if out_cells_packed is None:
+            out_cells_packed = np.zeros(cells_shape, dtype=np.int8)
+        elif (
+            out_cells_packed.shape != cells_shape
+            or out_cells_packed.dtype != np.int8
+            or not out_cells_packed.flags["C_CONTIGUOUS"]
+        ):
+            raise ValueError(
+                f"out_cells_packed must be C-contiguous int8 of shape "
+                f"{cells_shape}; got {out_cells_packed.shape}/"
+                f"{out_cells_packed.dtype}"
+            )
+
+        per_t_shape = (n_corr, sidecar_t_stride_i)
+
+        def _scratch_or_alloc(arr, shape, dtype):
+            if arr is None:
+                return np.zeros(shape, dtype=dtype)
+            if (
+                arr.shape != shape
+                or arr.dtype != dtype
+                or not arr.flags["C_CONTIGUOUS"]
+            ):
+                raise ValueError(
+                    f"buffer shape/dtype mismatch: got {arr.shape}/"
+                    f"{arr.dtype}, expected {shape}/{dtype}"
+                )
+            return arr
+
+        out_scale     = _scratch_or_alloc(out_scale,     per_t_shape, np.float32)
+        out_offset_re = _scratch_or_alloc(out_offset_re, per_t_shape, np.float32)
+        out_offset_im = _scratch_or_alloc(out_offset_im, per_t_shape, np.float32)
+        out_validity  = _scratch_or_alloc(out_validity,  (t_det,),    np.uint8)
+
+        n_over = ctypes.c_uint64(0)
+        n_pat = ctypes.c_uint64(0)
+        n_nodp = ctypes.c_uint64(0)
+
+        n_active_safe = int(n_active_dms_per_corr) if n_active_dms_per_corr > 0 else 1
+        ret = lib.rx_ring_assemble_compact_block(
+            ctypes.c_void_p(self._handle),
+            ctypes.c_uint64(int(specnum_start)),
+            ctypes.c_uint32(t_det),
+            ctypes.c_uint32(sidecar_t_stride_i),
+            ctypes.c_uint32(int(owned_dm)),
+            ctypes.c_uint32(int(compute_half)),
+            ctypes.c_uint32(n_active_safe),
+            n_filled_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            out_cells_packed.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            ctypes.c_uint32(n_filled_max),
+            out_scale.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_offset_re.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_offset_im.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            out_validity.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.byref(n_over),
+            ctypes.byref(n_pat),
+            ctypes.byref(n_nodp),
+        )
+        if ret != 0:
+            raise OSError(
+                f"rx_ring_assemble_compact_block failed (ret={ret})"
+            )
+        return (
+            out_cells_packed,
             out_scale,
             out_offset_re,
             out_offset_im,
