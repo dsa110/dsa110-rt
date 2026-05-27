@@ -297,10 +297,10 @@ routines:
 #             is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 4.0                       # M7.4 burst-replay debug: probe whether detector fires at all (production 9.0)
+  snr_min: 6.0                       # Phase 1a noise test: low floor to sweep σ ∈ [6, 7, 8, 9, 10] in one run; restore to 8.0 after.
   cube_ring_depth: 8                 # CPU-side cube tensors retained per half
   merger:
-    lm_max_cells: 3                  # OR-mode half-window on (l, m) cells
+    lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index
     t_frac: 1.0                      # |Δt| ≤ t_frac * 0.5 * (w_i + w_j) samples
     sample_period_specnum: 16        # spec-nums per detector sample
@@ -360,7 +360,13 @@ noise:
 #       detector defaults (production-tuned). Override to shorten
 #       burn-in on short replays.
 detector:
-  layer2_valid_min_fraction: 0.9
+  # M7.4 noise test: relax from 0.9 to 0.0 so Layer-2 σ_k EMA learns
+  # even when cap_synth_fada throttles the producer below native cadence
+  # (the consumer's seek-forward outpaces the heterogeneous per-corr
+  # producer rates → most t's flag invalid via OR-across-corrs even
+  # though the underlying noise statistics are still valid Gaussian).
+  # Restore to 0.9 before resuming on-sky operations.
+  layer2_valid_min_fraction: 0.0
   layer2_sigma_floor: 0.5
   # cube_cadence_s: 0.13421772
   # layer2_tau_s: 30.0

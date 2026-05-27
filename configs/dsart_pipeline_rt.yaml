@@ -29,7 +29,13 @@ schema_version: 1
 # M7.0 ships both routine sets but the captures.mode flag is consulted
 # by dsart_rt._select_routines() before spawning.
 captures:
-  mode: real
+  # synth_fada (M7.4 noise test): bypass dada_junkdb (which has a bug —
+  # only fills gaussian data for nbit ∈ {8,32}; our header is nbit=4 so
+  # junkdb writes zeros) and skip dsaX_merge. A bench helper
+  # `replay_voltage_dump --synthesize` writes properly-packed 4-bit
+  # gaussian voltages directly to fada, which both corr_fast and
+  # corr_slow read.
+  mode: synth_fada
 
 buffers:
   - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
@@ -84,6 +90,37 @@ routines:
     gate_on_paths:
       - /tmp/dsart-corr-fast-CN.ready
       - /tmp/dsart-corr-slow-CN.ready
+
+  # ---- synth_fada (M7.4 noise test) ---------------------------------
+  # The legacy /usr/local/bin/dada_junkdb has a known bug: its gaussian
+  # writer only branches on nbit ∈ {8, 32} (see dada_junkdb.c:266-279).
+  # Our pipeline runs at nbit=4 (packed int4 complex voltages), so the
+  # `-g` flag is effectively a no-op and the dada/eada buffers receive
+  # only the zero-initialised user buffer. With zeros into corr_fast,
+  # the gridder + dedispersion produce zero cubes, sigma_l1 floors at
+  # 5e-3, and no C1 candidates fire. This mode bypasses the broken
+  # junkdb + dsaX_merge plumbing and uses bench/replay_voltage_dump.py
+  # in --synthesize mode, which generates properly-packed 4-bit
+  # gaussian voltages in the FADA layout
+  # (NPACKETS=2048, NANTS=96, NCHAN=384, 2t, NPOL=2) and writes them
+  # straight to fada. corr_slow + corr_fast each remain a passive fada
+  # reader. --synth-thermal-sigma=1.5 sits comfortably in the [-8,7]
+  # int4 range (5σ headroom). --n-blocks=400000 gives ~14.9 h before
+  # the writer exits; the orchestrator SIGTERMs well before then on
+  # the stop verb.
+  - name: cap_synth_fada
+    when: captures.mode == synth_fada
+    cmd: /home/ubuntu/miniforge3/envs/dsa110-rt/bin/python
+    args: -u -m bench.replay_voltage_dump --synthesize --n-blocks 400000 --synth-thermal-sigma 1.5 --fada-key fada
+    env:
+      PYTHONPATH: /home/ubuntu/proj/dsa110-rt
+    # NOTE: no gate_on_paths here. cap_synth_fada is the sole fada
+    # writer in this mode and provides the PSRDADA header that
+    # corr_fast.getHeader() blocks on; gating on the corr_fast ready
+    # sentinel would deadlock (corr_fast can't reach ready without a
+    # header, and the header only arrives once cap_synth_fada starts).
+    # Back-pressure is naturally bounded by fada n=70 buffers ≈ 9.4 s
+    # and PSRDADA flow control.
 
   # Vendored dsart capture binary (built by setup.py build_ext, lives
   # inside the dsa110-rt package tree). Improvements vs upstream
@@ -170,6 +207,7 @@ routines:
   # for cache, but is on the same NUMA node as fada (per
   # configs/config_corr.yaml: fada.numa_cluster = 1).
   - name: merge
+    when: captures.mode != synth_fada
     cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
     args: -i dada -j eada -o fada -m -c 12
 

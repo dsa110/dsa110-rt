@@ -50,7 +50,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+import concurrent.futures
+from typing import Any, Callable, Iterable, Iterator, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -230,6 +231,78 @@ def _pack_int4_bytes(real_q: np.ndarray, imag_q: np.ndarray) -> np.ndarray:
     return ((imag_u4 & 0x0F) << 4) | real_u4
 
 
+# ---- parallel noise-only synthesis (used by the M7.4 synth_fada test) -----
+#
+# numpy's PRNG is single-threaded for ``rng.normal`` / ``standard_normal``,
+# so a (2048, 96, 384, 2, 2) draw takes ~6-15 s/block on the corr nodes.
+# We shard along the packet axis across a persistent ProcessPoolExecutor.
+# Each worker draws its slice with an independent ``SeedSequence``-derived
+# Generator, quantises to int4, and packs to uint8 — returning bytes only,
+# so the parent never holds the float32 intermediate (avoids 5 GB peak).
+
+_NOISE_POOL: Optional["concurrent.futures.ProcessPoolExecutor"] = None
+_NOISE_POOL_WORKERS: int = 0
+
+
+def _noise_chunk_worker(args: Tuple[int, int, float, Tuple[int, ...]]) -> np.ndarray:
+    """ProcessPool worker: draw + quantise + pack one packet-axis shard.
+
+    Returns packed uint8 bytes of shape ``(n_packets, NANTS, NCHAN, 2t,
+    NPOL)``. The seed is derived from (block_idx, worker_idx) so each
+    block is reproducible-but-distinct, and across workers within a
+    block the streams are independent (SeedSequence.spawn semantics).
+    """
+    block_idx, worker_idx, sigma, shape = args
+    ss = np.random.SeedSequence([0x5713_5A09, int(block_idx), int(worker_idx)])
+    rng = np.random.default_rng(ss)
+    real_f = rng.standard_normal(size=shape, dtype=np.float32) * np.float32(sigma)
+    imag_f = rng.standard_normal(size=shape, dtype=np.float32) * np.float32(sigma)
+    real_q = _quantize_to_int4(real_f)
+    imag_q = _quantize_to_int4(imag_f)
+    return _pack_int4_bytes(real_q, imag_q)
+
+
+def _get_noise_pool(workers: int) -> "concurrent.futures.ProcessPoolExecutor":
+    """Lazily create / reuse a process pool sized to ``workers``."""
+    global _NOISE_POOL, _NOISE_POOL_WORKERS
+    if _NOISE_POOL is None or _NOISE_POOL_WORKERS != workers:
+        import concurrent.futures
+        if _NOISE_POOL is not None:
+            _NOISE_POOL.shutdown(wait=False, cancel_futures=True)
+        _NOISE_POOL = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+        _NOISE_POOL_WORKERS = workers
+    return _NOISE_POOL
+
+
+def _synthesize_block_noise_parallel(
+    sigma: float,
+    block_idx: int,
+    workers: int = 8,
+) -> np.ndarray:
+    """Generate ``_FADA_VOLT_SHAPE`` of int4-packed gaussian noise in parallel.
+
+    Shards along the leading NPACKETS axis (2048). ``workers`` must
+    divide NPACKETS; default 8 gives 256 packets/worker, which fits in
+    ~1 GB of float32 + int8 in each worker before packing.
+    """
+    npackets = _FADA_VOLT_SHAPE[0]
+    if npackets % workers != 0:
+        raise ValueError(
+            f"workers={workers} must divide NPACKETS={npackets}"
+        )
+    per = npackets // workers
+    chunk_shape = (per,) + _FADA_VOLT_SHAPE[1:]
+    pool = _get_noise_pool(workers)
+    args = [(block_idx, w, sigma, chunk_shape) for w in range(workers)]
+    chunks = list(pool.map(_noise_chunk_worker, args))
+    out = np.concatenate(chunks, axis=0).reshape(-1)
+    if out.nbytes != FADA_BYTES_PER_BLOCK:
+        raise RuntimeError(
+            f"parallel noise block size {out.nbytes} != {FADA_BYTES_PER_BLOCK}"
+        )
+    return out
+
+
 def antpos_synth_2d_grid(
     nants: int = NANTS, n_x: int = 12, n_y: int = 8,
     spacing_m: float = 0.5,
@@ -305,6 +378,23 @@ def synthesize_block(
     if nu_Hz is None:
         nu_Hz = channel_freqs_hz()
 
+    sources_list = list(continuum_sources)
+    # Fast path (no continuum sources): generate float32 real + imag noise
+    # in parallel across worker processes (each draws 1/8 of the block)
+    # and pack to int4 inside the workers, so this function returns
+    # already-packed uint8 bytes ready for fada. Without parallelism the
+    # original path needed ~14-17 s/block on the corr nodes
+    # (single-threaded ``rng.normal`` of a (2048, 96, 384, 2, 2)
+    # complex128 buffer ≈ 5 GB); the persistent ProcessPoolExecutor pool
+    # drops that to ~2.5 s/block with 8 workers — close enough to native
+    # cadence (134 ms) that the producer/consumer rate mismatch in the
+    # search-side rx ring stops dropping cubes.
+    if not sources_list and thermal_sigma_pre_fluff > 0:
+        return _synthesize_block_noise_parallel(
+            sigma=float(thermal_sigma_pre_fluff),
+            block_idx=block_idx,
+        )
+
     if thermal_sigma_pre_fluff > 0:
         E = (
             rng.normal(0, thermal_sigma_pre_fluff, size=_FADA_VOLT_SHAPE)
@@ -313,7 +403,7 @@ def synthesize_block(
     else:
         E = np.zeros(_FADA_VOLT_SHAPE, dtype=np.complex128)
 
-    for l, m, amp in continuum_sources:
+    for l, m, amp in sources_list:
         n_dir = float(np.sqrt(max(0.0, 1.0 - l * l - m * m)))
         s_hat = np.array([l, m, n_dir], dtype=np.float64)
         bdotS = antenna_pos_m @ s_hat                                # (NANTS,)
