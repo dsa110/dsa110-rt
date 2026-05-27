@@ -40,7 +40,7 @@ _recv_ring = Extension(
     name="dsart.transport._recv_ring",
     sources=["src/dsart/transport/recv_ring.c"],
     extra_compile_args=[
-        "-O2",
+        "-O3",
         "-std=c11",
         "-Wall",
         "-Wextra",

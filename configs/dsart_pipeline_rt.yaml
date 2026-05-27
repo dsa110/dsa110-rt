@@ -29,13 +29,11 @@ schema_version: 1
 # M7.0 ships both routine sets but the captures.mode flag is consulted
 # by dsart_rt._select_routines() before spawning.
 captures:
-  # synth_fada (M7.4 noise test): bypass dada_junkdb (which has a bug —
-  # only fills gaussian data for nbit ∈ {8,32}; our header is nbit=4 so
-  # junkdb writes zeros) and skip dsaX_merge. A bench helper
-  # `replay_voltage_dump --synthesize` writes properly-packed 4-bit
-  # gaussian voltages directly to fada, which both corr_fast and
-  # corr_slow read.
-  mode: synth_fada
+  # Production: live SNAP UDP capture via dsart_capture_manythread.
+  # M7.4 noise test used mode `synth_fada` (bench/replay_voltage_dump
+  # --synthesize → fada). Flip back to `synth_fada` for repeatable
+  # pure-Gaussian validation without on-sky data.
+  mode: real
 
 buffers:
   - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)

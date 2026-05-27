@@ -441,13 +441,44 @@ def decode_topk_argmax_lowmem(
     flat = score.contiguous().reshape(-1)
     k = int(min(max(1, n_top), flat.numel()))
     top_vals, top_indices = torch.topk(flat, k=k)
+    winner_flat = winner_kernel_idx.contiguous().reshape(-1)
+    # Batch GPU→CPU sync: gather winner-kernel + (optional)
+    # fine→coarse DM + fine DM lookups into one async transfer per
+    # tensor instead of per-candidate ``.item()`` calls (~24 stalls
+    # → 3 stalls / cube on the search-side hot path).
+    top_winner_kidx = winner_flat[top_indices]
+    if fine_to_coarse is not None or fine_dm_pc_cm3 is not None:
+        # fdm-index extraction mirrors the per-candidate loop:
+        #   t  = ix // (N_fdm * H * W)
+        #   f  = (ix // (H * W)) % N_fdm
+        # (The earlier draft used ``// (N_fdm*H*W)`` which yielded ``t``
+        # and indexed into the (N_fdm,)-long lookups out-of-bounds,
+        # triggering a CUDA device-side assert in ``index_select``.)
+        hw = H * W
+        top_fdm_idx_gpu = (top_indices // hw) % N_fdm
+    else:
+        top_fdm_idx_gpu = None
     top_vals_np = top_vals.detach().cpu().numpy()
     top_indices_np = top_indices.detach().cpu().numpy()
-    winner_flat = winner_kernel_idx.contiguous().reshape(-1)
+    top_winner_kidx_np = top_winner_kidx.detach().cpu().numpy()
+    if fine_to_coarse is not None:
+        top_dm_coarse_np = (
+            fine_to_coarse.index_select(0, top_fdm_idx_gpu)
+            .detach().cpu().numpy()
+        )
+    else:
+        top_dm_coarse_np = None
+    if fine_dm_pc_cm3 is not None:
+        top_dm_fine_np = (
+            fine_dm_pc_cm3.index_select(0, top_fdm_idx_gpu)
+            .detach().cpu().numpy()
+        )
+    else:
+        top_dm_fine_np = None
 
     out: List[Candidate] = []
     accepted: List[Tuple[int, int, int, int]] = []  # (t, fdm, l, m)
-    for v, ix in zip(top_vals_np, top_indices_np):
+    for idx_i, (v, ix) in enumerate(zip(top_vals_np, top_indices_np)):
         v_f = float(v)
         if v_f <= threshold:
             break
@@ -472,15 +503,15 @@ def decode_topk_argmax_lowmem(
             continue
         accepted.append((t, f, l_, m_))
 
-        k_idx = int(winner_flat[int(ix)].item())
+        k_idx = int(top_winner_kidx_np[idx_i])
         if k_idx < 0 or k_idx >= len(kernel_ids):
             continue
-        if fine_to_coarse is not None:
-            dm_idx = int(fine_to_coarse[f].item())
+        if top_dm_coarse_np is not None:
+            dm_idx = int(top_dm_coarse_np[idx_i])
         else:
             dm_idx = int(f)
-        if fine_dm_pc_cm3 is not None:
-            dm_fine = float(fine_dm_pc_cm3[f].item())
+        if top_dm_fine_np is not None:
+            dm_fine = float(top_dm_fine_np[idx_i])
         else:
             dm_fine = float(f)
         out.append(

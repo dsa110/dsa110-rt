@@ -62,7 +62,7 @@ routines:
       --so-rcvbuf-bytes 268435456
       --shm-name /dsart-rxring-CN
       --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 4096 --n-filled 5000
+      --t-buf-samples 32768 --n-filled 5000
       --bytes-per-cell 2
       --status-interval-s 5.0
       --log-level INFO
@@ -159,7 +159,7 @@ routines:
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
       --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 4096 --n-filled 5000
+      --t-buf-samples 32768 --n-filled 5000
       --bytes-per-cell 2
       --n-fdm 34 --t-det 192 --n-grid 256
       --cube-cadence-samples 128
@@ -232,7 +232,7 @@ routines:
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
       --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 4096 --n-filled 5000
+      --t-buf-samples 32768 --n-filled 5000
       --bytes-per-cell 2
       --n-fdm 34 --t-det 192 --n-grid 256
       --cube-cadence-samples 128
@@ -297,7 +297,7 @@ routines:
 #             is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 6.0                       # Phase 1a noise test: low floor to sweep σ ∈ [6, 7, 8, 9, 10] in one run; restore to 8.0 after.
+  snr_min: 8.0                       # Production: 8σ floor (Phase 1a noise test used 6.0 to characterise FA distribution).
   cube_ring_depth: 8                 # CPU-side cube tensors retained per half
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
@@ -360,13 +360,12 @@ noise:
 #       detector defaults (production-tuned). Override to shorten
 #       burn-in on short replays.
 detector:
-  # M7.4 noise test: relax from 0.9 to 0.0 so Layer-2 σ_k EMA learns
-  # even when cap_synth_fada throttles the producer below native cadence
-  # (the consumer's seek-forward outpaces the heterogeneous per-corr
-  # producer rates → most t's flag invalid via OR-across-corrs even
-  # though the underlying noise statistics are still valid Gaussian).
-  # Restore to 0.9 before resuming on-sky operations.
-  layer2_valid_min_fraction: 0.0
+  # Production: require ≥ 90 % of (T_det, N_fdm) cells valid before
+  # updating Layer-2 σ_k. Drop to 0.0 only when running the M7.4
+  # synth_fada noise test (the slow synth-side cadence keeps the
+  # validity mask sparse, but the underlying noise statistics are
+  # still gaussian, so we want σ_k to keep learning).
+  layer2_valid_min_fraction: 0.9
   layer2_sigma_floor: 0.5
   # cube_cadence_s: 0.13421772
   # layer2_tau_s: 30.0
