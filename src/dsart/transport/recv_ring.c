@@ -671,6 +671,7 @@ rx_ring_assemble_validity_block(
     uint32_t   t_det,
     uint32_t   compute_half,
     uint32_t   coarse_dm_mask,
+    uint32_t   n_active_dms_per_corr,
     uint8_t   *out_validity_per_t,
     uint64_t  *out_n_overrun,
     uint64_t  *out_n_pattern_mismatch,
@@ -725,11 +726,23 @@ rx_ring_assemble_validity_block(
             uint8_t *col_base = data_base
                 + ((size_t)corr * n_coarse_dm + dm) * t_buf * slot_stride;
 
+            /* M7.4 amend (2026-05-26): wseq is in slot-write units
+             * (1 increment per rx_ring_write_slot call), but t_abs is
+             * in sample units. With n_active_dms_per_corr writes per
+             * sample, wseq grows ``n_active_dms_per_corr`` × faster
+             * than t_abs; comparing them directly trips overrun for
+             * any t_abs > t_buf / (n_active_dms_per_corr - 1) which
+             * collapses validity to 0 for the entire run. Scale the
+             * lap threshold accordingly. */
+            const uint64_t n_active_safe =
+                n_active_dms_per_corr > 0 ? n_active_dms_per_corr : 1;
+            const uint64_t wseq_lap_threshold =
+                (t_buf + (uint64_t)t_det) * n_active_safe;
             for (uint32_t t = 0; t < t_det; t++) {
                 const uint64_t t_abs = specnum_start + (uint64_t)t;
                 int bad = 0;
 
-                if (wseq > t_abs + t_buf) {
+                if (wseq > t_abs * n_active_safe + wseq_lap_threshold) {
                     /* Slot was lapped by the writer (or never written
                      * within the ring window). Mirror
                      * rx_ring_read_slot's overrun semantics: bump the
@@ -859,6 +872,7 @@ rx_ring_assemble_dense_block(
     uint32_t        n_grid,
     uint32_t        owned_dm,
     uint32_t        compute_half,
+    uint32_t        n_active_dms_per_corr,
     const int32_t  *n_filled_per_corr,
     const int32_t  *linear_lut_strided,
     uint32_t        lut_stride,
@@ -958,10 +972,18 @@ rx_ring_assemble_dense_block(
         float  *offim_corr  = out_offset_im_per_t
                               + (size_t)corr * out_t_stride;
 
+        /* M7.4 amend (2026-05-26): wseq is in slot-write units; t_abs
+         * is in sample units. See rx_ring_assemble_validity_block for
+         * the full rationale. Scale the lap threshold by
+         * ``n_active_dms_per_corr``. */
+        const uint64_t n_active_safe =
+            n_active_dms_per_corr > 0 ? n_active_dms_per_corr : 1;
+        const uint64_t wseq_lap_threshold =
+            (t_buf + (uint64_t)t_det) * n_active_safe;
         for (uint32_t t = 0; t < t_det; t++) {
             const uint64_t t_abs = specnum_start + (uint64_t)t;
 
-            if (wseq > t_abs + t_buf) {
+            if (wseq > t_abs * n_active_safe + wseq_lap_threshold) {
                 /* Slot was lapped. Same overrun semantics as
                  * rx_ring_read_slot / assemble_validity_block. */
                 n_overrun++;

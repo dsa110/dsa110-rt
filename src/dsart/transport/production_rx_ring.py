@@ -567,6 +567,20 @@ class ProductionRxRingSource:
             raise RuntimeError("ProductionRxRingSource.ring is None after start()")
 
         last_cube_seq_boundary = 0
+        # Seek the consumer to the newest cube boundary on first iteration.
+        # During cold start (NVRTC compile + GpuImager build + Triton JIT
+        # ≈ 3 min) the producer (search_rx) is writing at the full
+        # ~32500 slots/s while the consumer is asleep. If we start at
+        # ``last_cube_seq_boundary=0`` after warmup, the consumer is
+        # 1000+ cubes behind a ring that only holds ~32 cubes of
+        # headroom — every single read is VF_RX_OVERRUN and the
+        # validity mask is 0/6528 forever. Seeking forward to the
+        # newest committed boundary (leaving ``cube_cadence_samples``
+        # of safety so the detector window is fully in-ring) lets the
+        # consumer actually see live data from cube #1. We only do
+        # this ONCE at start; subsequent ring laps are caller's
+        # problem (a steady-state lag means cubes/s is below target).
+        consumer_armed = False
         while not self._stopped:
             if self._max_cubes is not None and self._cubes_emitted >= self._max_cubes:
                 break
@@ -618,6 +632,54 @@ class ProductionRxRingSource:
             if n_at_target < self._fan_in_min_corrs:
                 await asyncio.sleep(self._poll_interval_s)
                 continue
+
+            # Adaptive lag-recovery seek:
+            # --------------------------
+            # If the consumer falls more than ``safe_horizon`` samples
+            # behind the slowest producer's current write position,
+            # every per-slot read returns VF_RX_OVERRUN and the entire
+            # validity mask collapses to 0. This happens both at cold
+            # start (producer running for minutes during NVRTC compile
+            # + GpuImager build) and during transient consumer stalls.
+            # We re-arm the consumer at most once every
+            # ``seek_min_interval_s`` to avoid thrashing — once seeked
+            # the consumer walks naturally; only the next big gap
+            # re-triggers it. ``safe_horizon`` is set to
+            # ``t_buf_samples - 2 * t_det`` (we want 2 detector windows
+            # of headroom so the assemble can complete cleanly without
+            # the producer lapping mid-read).
+            min_wseq_samples = min(wseqs) // max(
+                1, self._n_active_dms_per_corr
+            )
+            t_buf_samples = int(self._ring_dims.t_buf_samples)
+            safe_horizon = t_buf_samples - 2 * self._t_det
+            consumer_lag = min_wseq_samples - last_cube_seq_boundary
+            if consumer_lag > safe_horizon:
+                # Seek consumer forward to producer-minus-2*t_det so the
+                # detector window has 2 cubes of headroom before the
+                # producer laps it.
+                newest_boundary = (
+                    (min_wseq_samples // self._cube_cadence_samples)
+                    * self._cube_cadence_samples
+                )
+                back_off = 2 * self._t_det
+                seek_target = max(0, newest_boundary - back_off)
+                if seek_target > last_cube_seq_boundary:
+                    LOG.warning(
+                        "ProductionRxRingSource: lag-recovery seek "
+                        "from boundary %d → %d (consumer_lag=%d > "
+                        "safe_horizon=%d; min_wseq_samples=%d, "
+                        "t_buf_samples=%d, t_det=%d)",
+                        last_cube_seq_boundary,
+                        seek_target,
+                        consumer_lag,
+                        safe_horizon,
+                        min_wseq_samples,
+                        t_buf_samples,
+                        self._t_det,
+                    )
+                    last_cube_seq_boundary = seek_target
+                    consumer_armed = True
 
             cube_specnum_start = last_cube_seq_boundary
             slot = self._assemble_cube(
@@ -733,6 +795,9 @@ class ProductionRxRingSource:
                 n_filled_per_corr=self._n_filled_per_corr,
                 linear_lut_strided=self._linear_lut,
                 compute_half=int(self._compute_half),
+                n_active_dms_per_corr=int(
+                    self._n_active_dms_per_corr
+                ),
                 out_t_stride=int(self._t_stream),
                 out_cint8=self._scatter_cint8_buf,
                 out_scale=self._scatter_scale_buf,
@@ -801,6 +866,9 @@ class ProductionRxRingSource:
                     t_det=int(self._t_det),
                     compute_half=int(self._compute_half),
                     coarse_dm_mask=int(walk_mask),
+                    n_active_dms_per_corr=int(
+                        self._n_active_dms_per_corr
+                    ),
                 )
             )
             self._n_slots_read += (
