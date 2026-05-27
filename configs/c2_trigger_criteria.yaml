@@ -3,11 +3,20 @@
 # Hot-reloadable on SIGHUP (the C2 service watches mtime).  See
 # docs/c1c2/C1C2_DESIGN.md §3.4 for action semantics.
 #
-# Defaults below are starter values for the M7.4 burst-replay
-# shake-down; operator is expected to retune based on the
-# 250924mptq run.
+# Layout (top-to-bottom; first match wins):
+#   1. bright_frb_extragalactic   — DM/gal_dm_max_los >= 0.75
+#   2. bright_galactic            — DM/gal_dm_max_los <  0.75
+#   3. bright_pulsar              — tight-DM repeats (e.g. Crab)
+#   4. log_only                   — fallback
 #
 # Notes on semantics (see src/dsart/coinc/criteria.py):
+#   * ``dm_galactic_fraction_{max,min}`` reference the NE2001 max-LOS
+#     galactic DM from /mon/array/gal_dm (declination.service, h23).
+#     A cluster with dm_median = D and gal_dm_max_los = G is
+#     classified Galactic when D/G < 0.75 and extragalactic otherwise.
+#     If gal_dm_max_los is unavailable (cold boot, etcd outage), both
+#     predicates return False and these classes silently no-op — the
+#     trailing log_only entry still fires.
 #   * ``dm_iqr_max_pc_cc`` is SNR-scaled: the value here is the cap
 #     applied at snr_max=12; the effective cap grows hyperbolically
 #     and is infinity at snr_max>=50. This lets very-bright bursts
@@ -17,10 +26,14 @@
 #     bounding box, in radians; ~0 for a true point source.
 
 trigger_classes:
-  - name: bright_frb
-    description: "high-S/N, multi-half coincident, tight DM/width/lm — FRB candidate"
+  - name: bright_frb_extragalactic
+    description: >-
+      Extragalactic FRB candidate: dm_median >= 0.75 * NE2001 max-LOS
+      galactic DM, so even the most-pessimistic line-of-sight cannot
+      account for it. Permissive SNR threshold (we lose nothing if a
+      Galactic source straggles into this bin) so the floor is 8 σ.
     require:
-      snr_max_min: 12.0
+      snr_max_min: 8.0
       n_events_min: 3
       n_search_nodes_min: 2
       dm_median_min_pc_cc: 50.0
@@ -28,6 +41,25 @@ trigger_classes:
       dm_iqr_max_pc_cc: 30.0
       width_median_max_samples: 32
       lm_diag_max_rad: 0.1
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
+  - name: bright_galactic
+    description: >-
+      Galactic-disk burst (dm_median < 0.75 * NE2001 max-LOS DM).
+      Tighter SNR threshold (12 σ) — Galactic events at low DM are
+      almost always known pulsars and we want a higher bar before
+      taking a 64-cube dump.
+    require:
+      snr_max_min: 12.0
+      n_events_min: 3
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 1.0
+      dm_iqr_max_pc_cc: 30.0
+      width_median_max_samples: 32
+      lm_diag_max_rad: 0.1
+      dm_galactic_fraction_max: 0.75
     action: dump_all_gpus
     holdoff_s: 30.0
 

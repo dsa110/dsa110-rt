@@ -135,3 +135,62 @@ def test_compute_stats_kernel_ids_distinct_sorted() -> None:
     ]
     s = compute_stats(es)
     assert s.kernel_ids_distinct == ("unit:d1:b1", "unit:d1:b2", "unit:d1:b4")
+
+
+# ---------------------------------------------------------------------------
+# Galactic-DM discriminant (added 2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_stats_no_gal_dm_max_los_yields_nan() -> None:
+    """Default behaviour: no gal_dm provided → both fields are NaN."""
+    s = compute_stats([_e(snr=10.0, dm=100.0)])
+    assert math.isnan(s.gal_dm_max_los)
+    assert math.isnan(s.dm_galactic_fraction)
+
+
+def test_compute_stats_galactic_fraction_when_dm_below_threshold() -> None:
+    """DM = 30, gal_dm = 100 → fraction = 0.3 (Galactic disk)."""
+    s = compute_stats([_e(snr=10.0, dm=30.0)], gal_dm_max_los=100.0)
+    assert s.gal_dm_max_los == pytest.approx(100.0)
+    assert s.dm_galactic_fraction == pytest.approx(0.30)
+
+
+def test_compute_stats_galactic_fraction_when_dm_above_threshold() -> None:
+    """DM = 1500, gal_dm = 100 → fraction = 15 (extragalactic)."""
+    s = compute_stats([_e(snr=10.0, dm=1500.0)], gal_dm_max_los=100.0)
+    assert s.dm_galactic_fraction == pytest.approx(15.0)
+
+
+def test_compute_stats_galactic_fraction_uses_median() -> None:
+    """Computed against ``dm_median``, not the peak's DM."""
+    es = [
+        _e(snr=10.0, dm=20.0, event_specnum=0),
+        _e(snr=20.0, dm=200.0, event_specnum=1),  # peak
+        _e(snr=10.0, dm=30.0, event_specnum=2),
+    ]
+    s = compute_stats(es, gal_dm_max_los=100.0)
+    # median([20, 200, 30]) = 30 → fraction = 0.30
+    assert s.dm_median == pytest.approx(30.0)
+    assert s.dm_galactic_fraction == pytest.approx(0.30)
+
+
+def test_compute_stats_zero_or_negative_gal_dm_falls_back_to_nan() -> None:
+    """Non-physical (zero/negative) gal_dm → fraction stays NaN."""
+    s_zero = compute_stats([_e(snr=10.0, dm=100.0)], gal_dm_max_los=0.0)
+    assert math.isnan(s_zero.gal_dm_max_los)
+    assert math.isnan(s_zero.dm_galactic_fraction)
+    s_neg = compute_stats([_e(snr=10.0, dm=100.0)], gal_dm_max_los=-1.0)
+    assert math.isnan(s_neg.dm_galactic_fraction)
+
+
+def test_compute_stats_nan_or_inf_gal_dm_falls_back_to_nan() -> None:
+    """Non-finite gal_dm → fraction stays NaN."""
+    s_nan = compute_stats(
+        [_e(snr=10.0, dm=100.0)], gal_dm_max_los=float("nan"),
+    )
+    assert math.isnan(s_nan.dm_galactic_fraction)
+    s_inf = compute_stats(
+        [_e(snr=10.0, dm=100.0)], gal_dm_max_los=float("inf"),
+    )
+    assert math.isnan(s_inf.dm_galactic_fraction)

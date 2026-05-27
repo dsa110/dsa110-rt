@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import signal
 import sys
@@ -122,6 +123,20 @@ class CoincidencerConfig:
     mon_etcd_key: str = "/mon/c2/h23"
     mon_publish_interval_s: float = 5.0
 
+    # Galactic-DM discriminant (added 2026-05-27).
+    # The C2 service polls /mon/array/gal_dm (written by
+    # declination.service on h23 from NE2001) every
+    # gal_dm_poll_interval_s seconds and threads the value through
+    # compute_stats so trigger classes can gate on the
+    # ``dm_galactic_fraction_*`` predicates. Set
+    # ``gal_dm_max_los_override`` to a positive number to pin the
+    # value (useful for offline replay tests or when the etcd
+    # pointing path is dark).
+    gal_dm_etcd_key: str = "/mon/array/gal_dm"
+    gal_dm_poll_interval_s: float = 30.0
+    gal_dm_max_los_override: Optional[float] = None
+    gal_dm_max_age_s: float = 600.0
+
     @classmethod
     def from_yaml(cls, path: Path, *, override: Optional[Mapping[str, Any]] = None
                  ) -> "CoincidencerConfig":
@@ -182,6 +197,20 @@ class CoincidencerConfig:
             mon_publish_interval_s=float(
                 coinc.get("mon_publish_interval_s", 5.0),
             ),
+            gal_dm_etcd_key=str(coinc.get(
+                "gal_dm_etcd_key", "/mon/array/gal_dm",
+            )),
+            gal_dm_poll_interval_s=float(
+                coinc.get("gal_dm_poll_interval_s", 30.0),
+            ),
+            gal_dm_max_los_override=(
+                float(coinc["gal_dm_max_los_override"])
+                if coinc.get("gal_dm_max_los_override") is not None
+                else None
+            ),
+            gal_dm_max_age_s=float(
+                coinc.get("gal_dm_max_age_s", 600.0),
+            ),
         )
 
 
@@ -210,6 +239,10 @@ class _StoreWrapper:
             self._store = None
             self._available = False
 
+    @property
+    def available(self) -> bool:
+        return self._available and self._store is not None
+
     def put_dict(self, key: str, value: Mapping[str, Any]) -> None:
         if not self._available or self._store is None:
             return
@@ -217,6 +250,21 @@ class _StoreWrapper:
             self._store.put_dict(key, dict(value))
         except Exception:  # noqa: BLE001
             _LOG.exception("etcd put_dict(%s) failed", key)
+
+    def get_dict(self, key: str) -> Optional[Mapping[str, Any]]:
+        """Best-effort etcd read; returns None on outage / missing key.
+
+        Used by the galactic-DM poll loop (which expects to fail
+        silently when /mon/array/gal_dm hasn't been written yet on a
+        cold boot).
+        """
+        if not self._available or self._store is None:
+            return None
+        try:
+            return self._store.get_dict(key)
+        except Exception:  # noqa: BLE001
+            _LOG.exception("etcd get_dict(%s) failed", key)
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +357,23 @@ class CoincidencerService:
         self._tasks: List[asyncio.Task] = []
         self._started_unix: float = 0.0
 
+        # Galactic-DM discriminant cache (refreshed by
+        # _gal_dm_poll_loop). ``_gal_dm_value_pc_cc`` is None until the
+        # first successful poll OR an operator override is in place;
+        # ``_gal_dm_fetched_at_mono`` is used to age out a stale value
+        # (declination.service hiccup → gal_dm_max_age_s elapsed → fall
+        # back to None and emit nan into ClusterStats).
+        if config.gal_dm_max_los_override is not None:
+            self._gal_dm_value_pc_cc: Optional[float] = float(
+                config.gal_dm_max_los_override,
+            )
+            self._gal_dm_fetched_at_mono: Optional[float] = float("inf")
+        else:
+            self._gal_dm_value_pc_cc = None
+            self._gal_dm_fetched_at_mono = None
+        self._gal_dm_polls_ok = 0
+        self._gal_dm_polls_fail = 0
+
     # ----- public API ---------------------------------------------------
 
     async def run(self) -> int:
@@ -334,6 +399,15 @@ class CoincidencerService:
             asyncio.create_task(self._mon_publish_loop(),
                                 name="c2-mon-publish"),
         )
+        # Galactic-DM poll loop: refreshes /mon/array/gal_dm so each
+        # cluster is tagged with dm_galactic_fraction for the
+        # gal/extragal C2 discriminant. No-op when the operator pinned
+        # an override.
+        if self._config.gal_dm_max_los_override is None:
+            self._tasks.append(
+                asyncio.create_task(self._gal_dm_poll_loop(),
+                                    name="c2-gal-dm-poll"),
+            )
 
         _LOG.info(
             "coincidencer up: bind=%s:%d window=%.1fs criteria=%s "
@@ -395,12 +469,13 @@ class CoincidencerService:
             )
 
         # Walk only the components touched by this batch.
+        gal_dm = self._current_gal_dm_max_los()
         touched = self._graph.components_touched(new_entries)
         for comp_id in touched:
             members = self._graph.component_members(comp_id)
             if not members:
                 continue
-            stats = compute_stats(members)
+            stats = compute_stats(members, gal_dm_max_los=gal_dm)
             self._counters["components_evaluated"] += 1
             tc = self._criteria.evaluate(stats)
             if tc is None:
@@ -558,6 +633,7 @@ class CoincidencerService:
         try:
             while True:
                 await asyncio.sleep(self._config.mon_publish_interval_s)
+                gal_dm = self._current_gal_dm_max_los()
                 payload: Dict[str, Any] = {
                     "ts_unix": time.time(),
                     "uptime_s": time.time() - self._started_unix,
@@ -569,10 +645,87 @@ class CoincidencerService:
                     "last_event_mjd": self._last_event_mjd,
                     "receiver": self._receiver.counters.snapshot(),
                     "counters": dict(self._counters),
+                    "gal_dm_max_los_pc_cc": (
+                        float(gal_dm) if gal_dm is not None else None
+                    ),
+                    "gal_dm_polls_ok": self._gal_dm_polls_ok,
+                    "gal_dm_polls_fail": self._gal_dm_polls_fail,
                 }
                 self._mon_store.put_dict(
                     self._config.mon_etcd_key, payload,
                 )
+        except asyncio.CancelledError:
+            return
+
+    # ----- galactic-DM poller ------------------------------------------
+
+    def _current_gal_dm_max_los(self) -> Optional[float]:
+        """Return the freshest gal_dm_max_los value (pc/cc), or None.
+
+        Falls back to None when the cached poll value is older than
+        ``gal_dm_max_age_s``; in that case ClusterStats records nan and
+        criteria predicates that gate on the fraction don't match.
+        Operator-pinned overrides bypass the age check entirely.
+        """
+        if self._config.gal_dm_max_los_override is not None:
+            return float(self._config.gal_dm_max_los_override)
+        if (
+            self._gal_dm_value_pc_cc is None
+            or self._gal_dm_fetched_at_mono is None
+        ):
+            return None
+        age = time.monotonic() - self._gal_dm_fetched_at_mono
+        if age > self._config.gal_dm_max_age_s:
+            return None
+        return self._gal_dm_value_pc_cc
+
+    async def _gal_dm_poll_loop(self) -> None:
+        """Refresh ``/mon/array/gal_dm`` periodically.
+
+        On every successful poll, replaces the in-memory value. Failures
+        (etcd outage, missing key, malformed payload) just bump the
+        ``gal_dm_polls_fail`` counter — the existing cached value is
+        kept until it ages out via ``_current_gal_dm_max_los``. The
+        very first poll runs immediately so the operator can confirm
+        the wiring on startup.
+        """
+        if not self._mon_store.available:
+            _LOG.warning(
+                "gal_dm poll loop: DsaStore unavailable; "
+                "dm_galactic_fraction will stay nan",
+            )
+            return
+        key = self._config.gal_dm_etcd_key
+        interval = float(self._config.gal_dm_poll_interval_s)
+        try:
+            while True:
+                doc = self._mon_store.get_dict(key)
+                ok = False
+                if doc is not None and isinstance(doc, Mapping):
+                    val = doc.get("gal_dm")
+                    try:
+                        v = float(val) if val is not None else None
+                    except (TypeError, ValueError):
+                        v = None
+                    if v is not None and math.isfinite(v) and v > 0.0:
+                        self._gal_dm_value_pc_cc = v
+                        self._gal_dm_fetched_at_mono = time.monotonic()
+                        self._gal_dm_polls_ok += 1
+                        ok = True
+                if not ok:
+                    self._gal_dm_polls_fail += 1
+                    _LOG.debug(
+                        "gal_dm poll: bad/missing value at %s (doc=%r)",
+                        key, doc,
+                    )
+                # First poll is logged at INFO so the operator sees the
+                # wiring on startup; subsequent polls are DEBUG.
+                if self._gal_dm_polls_ok == 1:
+                    _LOG.info(
+                        "gal_dm: first successful poll, value=%.3f pc/cc",
+                        self._gal_dm_value_pc_cc,
+                    )
+                await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
 

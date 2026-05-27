@@ -278,5 +278,120 @@ def test_criteria_starter_yaml_loads(tmp_path: Path) -> None:
     starter = Path(__file__).resolve().parents[1] / "configs" / "c2_trigger_criteria.yaml"
     ev = CriteriaEvaluator(starter)
     names = [c.name for c in ev.classes]
-    assert "bright_frb" in names
+    assert "bright_frb_extragalactic" in names
+    assert "bright_galactic" in names
     assert "log_only" in names
+
+
+# ---------------------------------------------------------------------------
+# Galactic-DM discriminant (added 2026-05-27)
+# ---------------------------------------------------------------------------
+
+
+def test_criteria_dm_galactic_fraction_max_gates_galactic(
+    tmp_path: Path,
+) -> None:
+    """``dm_galactic_fraction_max`` accepts clusters with DM/gal_dm < t."""
+    p = tmp_path / "c.yaml"
+    _write(p, """
+trigger_classes:
+  - name: gal
+    require:
+      dm_galactic_fraction_max: 0.75
+    action: dump_all_gpus
+""")
+    ev = CriteriaEvaluator(p)
+    assert ev.evaluate(_stats(dm_galactic_fraction=0.30)) is not None
+    assert ev.evaluate(_stats(dm_galactic_fraction=0.74)) is not None
+    assert ev.evaluate(_stats(dm_galactic_fraction=0.76)) is None
+    assert ev.evaluate(_stats(dm_galactic_fraction=15.0)) is None
+
+
+def test_criteria_dm_galactic_fraction_min_gates_extragalactic(
+    tmp_path: Path,
+) -> None:
+    """``dm_galactic_fraction_min`` accepts clusters with DM/gal_dm >= t."""
+    p = tmp_path / "c.yaml"
+    _write(p, """
+trigger_classes:
+  - name: egal
+    require:
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+""")
+    ev = CriteriaEvaluator(p)
+    assert ev.evaluate(_stats(dm_galactic_fraction=0.74)) is None
+    assert ev.evaluate(_stats(dm_galactic_fraction=0.75)) is not None
+    assert ev.evaluate(_stats(dm_galactic_fraction=15.0)) is not None
+
+
+def test_criteria_dm_galactic_fraction_nan_does_not_match(
+    tmp_path: Path,
+) -> None:
+    """A cluster with no gal_dm (NaN fraction) never matches either gate.
+
+    This protects existing behaviour: on cold boot before the first
+    successful /mon/array/gal_dm poll, classes that gate on the
+    discriminant silently fall through to log_only.
+    """
+    p = tmp_path / "c.yaml"
+    _write(p, """
+trigger_classes:
+  - name: gal
+    require:
+      dm_galactic_fraction_max: 0.75
+    action: dump_all_gpus
+  - name: egal
+    require:
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+  - name: log_only
+    require:
+      n_events_min: 1
+    action: log_only
+""")
+    ev = CriteriaEvaluator(p)
+    # default _stats() has dm_galactic_fraction=nan (frozen-default)
+    s = _stats()
+    matched = ev.evaluate(s)
+    assert matched is not None
+    assert matched.name == "log_only"
+
+
+def test_criteria_two_class_galactic_split_yaml_loads(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: gal/egal first-match split routes by DM/gal_dm."""
+    p = tmp_path / "c.yaml"
+    _write(p, """
+trigger_classes:
+  - name: egal
+    require:
+      snr_max_min: 8.0
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+  - name: gal
+    require:
+      snr_max_min: 12.0
+      dm_galactic_fraction_max: 0.75
+    action: dump_all_gpus
+  - name: log_only
+    require:
+      n_events_min: 1
+    action: log_only
+""")
+    ev = CriteriaEvaluator(p)
+    # SNR=10, frac=10.0 (DM=1000/gal_dm=100) — passes egal (SNR>=8) so
+    # routes to egal.
+    m1 = ev.evaluate(_stats(snr_max=10.0, dm_galactic_fraction=10.0))
+    assert m1 is not None
+    assert m1.name == "egal"
+    # SNR=10, frac=0.3 — egal predicate fails (frac<0.75), gal fails
+    # SNR>=12 — falls to log_only.
+    m2 = ev.evaluate(_stats(snr_max=10.0, dm_galactic_fraction=0.30))
+    assert m2 is not None
+    assert m2.name == "log_only"
+    # SNR=15, frac=0.3 — gal passes, routes to gal.
+    m3 = ev.evaluate(_stats(snr_max=15.0, dm_galactic_fraction=0.30))
+    assert m3 is not None
+    assert m3.name == "gal"
