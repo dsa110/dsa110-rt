@@ -930,6 +930,13 @@ rx_ring_assemble_dense_block(
      * default to (0, 0, 0) — the GPU kernel treats zero scale as
      * "skip this (corr, t) contribution" so downstream sums stay
      * correct. */
+    /* M7.4 perf (2026-05-27): considered parallelising the per-corr
+     * memset + scatter with ``#pragma omp parallel for``, but the
+     * extra threads SIGSEGV when ctypes calls in from CPython on
+     * search nodes that own ``coarse_dm[7]`` (n13). Sticking with
+     * single-threaded scatter for now; the dense memset is the
+     * primary cost (~25 MiB/corr × 16 = 400 MiB of zero stores at
+     * ~20 GiB/s → ~20 ms / cube). */
     for (uint32_t corr = 0; corr < n_corr; corr++) {
         int8_t *dense_corr = out_cint8 + (size_t)corr * corr_stride;
         memset(dense_corr, 0, (size_t)t_det * t_stride * sizeof(int8_t));

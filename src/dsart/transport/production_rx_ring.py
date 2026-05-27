@@ -648,12 +648,47 @@ class ProductionRxRingSource:
             # ``t_buf_samples - 2 * t_det`` (we want 2 detector windows
             # of headroom so the assemble can complete cleanly without
             # the producer lapping mid-read).
-            min_wseq_samples = min(wseqs) // max(
+            # Bug fix (M7.4, 2026-05-27): the per-corr ``wseq`` from the
+            # rx ring covers ALL active dms, so the scalar ``min(wseqs)``
+            # is a per-corr write count. The lag check needs to compare
+            # against the SLOWEST corr that meets the fan-in criterion —
+            # NOT the absolute min, which is dominated by an absent /
+            # straggling corr and pins ``consumer_lag`` near zero
+            # forever (so the seek never fires and ``n_overrun`` climbs
+            # unbounded). Use ``sorted_wseqs[n_corr - fan_in_min_corrs]``
+            # — the slowest of the "ready" corrs that gate progression.
+            n_corr = int(self._ring_dims.n_corr)
+            drop_n = max(0, n_corr - self._fan_in_min_corrs)
+            sorted_wseqs = sorted(wseqs)
+            ready_min_wseq = sorted_wseqs[drop_n] if drop_n < n_corr else sorted_wseqs[-1]
+            min_wseq_samples = ready_min_wseq // max(
                 1, self._n_active_dms_per_corr
             )
             t_buf_samples = int(self._ring_dims.t_buf_samples)
-            safe_horizon = t_buf_samples - 2 * self._t_det
+            # Reduce safe_horizon to ``t_buf - 4*t_det`` to give a 2-cube
+            # safety margin (was 2*t_det = 1-cube). At t_buf=4096, t_det=192
+            # this drops safe_horizon from 3712 to 3328 — still ~26 cubes
+            # of headroom — and trims peak ``n_overrun`` accumulation
+            # before each seek.
+            safe_horizon = t_buf_samples - 4 * self._t_det
             consumer_lag = min_wseq_samples - last_cube_seq_boundary
+            # Periodic instrumentation: log lag every 200 cubes so the
+            # operator can verify the seek is firing in steady state.
+            if (last_cube_seq_boundary % (200 * self._cube_cadence_samples) == 0
+                    and last_cube_seq_boundary > 0):
+                LOG.info(
+                    "lag_state: consumer_boundary=%d ready_min_wseq=%d "
+                    "consumer_lag=%d safe_horizon=%d (n_corr=%d "
+                    "drop_n=%d fan_in_min=%d t_buf=%d)",
+                    last_cube_seq_boundary,
+                    min_wseq_samples,
+                    consumer_lag,
+                    safe_horizon,
+                    n_corr,
+                    drop_n,
+                    self._fan_in_min_corrs,
+                    t_buf_samples,
+                )
             if consumer_lag > safe_horizon:
                 # Seek consumer forward to producer-minus-2*t_det so the
                 # detector window has 2 cubes of headroom before the

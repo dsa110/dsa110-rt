@@ -1431,18 +1431,21 @@ class DeterministicDetector(torch.nn.Module):
             pad_left_full = int(amortise_max_width) // 2
             widths_host = [int(k.k_time_width) for k in self._kernel_bank]
             offsets_host = [pad_left_full - (w // 2) for w in widths_host]
-            sigma_inv_host = [
-                1.0 / max(float(s_k_decode[k].item()), 1e-30)
-                for k in range(K)
-            ]
             widths_t = torch.tensor(
                 widths_host, dtype=torch.int32, device=cube.device,
             )
             offsets_t = torch.tensor(
                 offsets_host, dtype=torch.int32, device=cube.device,
             )
-            sigma_inv_t = torch.tensor(
-                sigma_inv_host, dtype=torch.float32, device=cube.device,
+            # Compute sigma_inv on-device to avoid the ``[s_k_decode[k]
+            # .item() for k in range(K)]`` GPU→CPU sync loop (~K stalls
+            # / cube on the search-side hot path; with K=7 that was
+            # adding ~10-15 ms / cube).
+            s_k_slice = s_k_decode[:K]
+            if s_k_slice.device != cube.device:
+                s_k_slice = s_k_slice.to(cube.device)
+            sigma_inv_t = torch.reciprocal(
+                torch.clamp(s_k_slice.to(torch.float32), min=1e-30)
             )
 
             fused_result = multi_boxcar_argmax_triton(
