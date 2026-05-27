@@ -738,17 +738,63 @@ class CubePipeline:
         # default on the production GPU backend with a 1-cube lag
         # (same semantics as the single-pass Layer-2 σ_k EMA). Toggle
         # off via ``DSART_DISABLE_FUSED_LAYER1=1`` for A/B benches.
+        # M7.4.2 Layer-1 coverage correction (2026-05-27):
+        # ------------------------------------------------
+        # Without this fix, the per-fdm sigma_clipped_std estimator
+        # is biased low whenever dedispersion shifts cause the number
+        # of contributing chgroups (``n_chg_contrib``) to vary across
+        # the (T_det, H, W) slab. Symptom on pure-Gaussian synth_fada
+        # input at 8sigma: ~16-30 false-alarm cands/cube instead of
+        # the expected ~0 (FA rate ~6e-16 per cell, ~1.5e7 trials =>
+        # ~1e-8 cands/cube). Mechanism: with ``--include-coarse-offset-
+        # in-search-shifts`` the search-side shifts grow with absolute
+        # DM (up to ~1356 samples at owned_dm=7 vs t_det=192), so for
+        # any given cube cell (t, fdm) only a fraction of the 16
+        # chgroups contribute (the rest read zero out of the
+        # lookahead-zero rows [t_det, t_stream)). Per-cell variance is
+        # therefore proportional to ``n_chg_contrib[t, fdm]``, but the
+        # global per-fdm sigma estimator computes a single scalar over
+        # all cells; the cells with above-median n_chg_contrib then
+        # look like outliers in sigma units => spurious 8sigma+ hits.
+        #
+        # Fix: precompute coverage_factor[t, fdm] =
+        #      sqrt(n_chg_contrib[t, fdm] / n_chg_max[fdm])
+        # from the time-shift table. Pre-divide the cube by this
+        # factor BEFORE sigma estimation; the result has uniform
+        # variance across (t, fdm) so sigma_clipped_std is unbiased.
+        # The post-sigma per-cell SNR scales with sqrt(n_chg_contrib),
+        # which is the expected coherent-integration benefit for a
+        # properly-dedispersed source signal.
+        #
+        # Cells with n_chg_contrib == 0 are flagged with NaN coverage
+        # (cube becomes NaN there) and zeroed by _clamp_inf_to_finite
+        # so the detector ignores them. Toggle via
+        # ``DSART_LAYER1_COVERAGE_CORRECT=0`` (default 1).
+        self._coverage_correct_enabled = bool(
+            int(os.environ.get("DSART_LAYER1_COVERAGE_CORRECT", "1"))
+        )
+        self._coverage_factor: Optional[torch.Tensor] = None
+        self._coverage_factor_shifts_id: Optional[int] = None
+
+        # NOTE: the fused-imager Layer-1 path bakes 1/sigma_prev[fdm]
+        # into the imager kernel's per-fdm edge mask. It cannot be
+        # combined with the coverage correction (which needs a per-(t,
+        # fdm) mask) without a kernel signature change. Disable fused
+        # L1 whenever coverage correction is enabled; the resulting
+        # extra ~10 ms/cube broadcast-divide is well within the RT
+        # budget (M7.4.1 GPU-scatter freed ~70 ms of H2D time).
         self._fuse_layer1_into_imager = (
             self._device.type == "cuda"
             and config.image_backend == "gpu"
             and not bool(
                 int(os.environ.get("DSART_DISABLE_FUSED_LAYER1", "0"))
             )
+            and not self._coverage_correct_enabled
         )
-        # Per-fdm σ_layer1 from the previous cube, used to seed the
-        # imager's fused mask each cube. ``None`` means "no prev cube
-        # yet" → imager runs with the constant ``edge_mask_real``
-        # (effectively σ_prev = 1 for cube 0, which is also during
+        # Per-fdm sigma_layer1 from the previous cube, used to seed
+        # the imager's fused mask each cube. None means "no prev cube
+        # yet" -- imager runs with the constant edge_mask_real
+        # (effectively sigma_prev = 1 for cube 0, which is also during
         # Layer-1 burn-in so the warmup flag is set anyway).
         self._sigma_layer1_prev: Optional[torch.Tensor] = None
 
@@ -1313,7 +1359,91 @@ class CubePipeline:
             chgroup_offsets_re=staged.chgroup_offset_re_t if apply_cal else None,
             chgroup_offsets_im=staged.chgroup_offset_im_t if apply_cal else None,
         )
+        # M7.4.2: lazy-build the per-(t, fdm) coverage factor from the
+        # shifts tensor on first use (then cached until shifts change).
+        # cube shape is ``[T_det, N_fdm, H, W]`` so cube.shape[0] is
+        # the authoritative t_det (CubePipelineConfig.gpu_t_det may be
+        # ``None`` for benches that infer geometry from the first slot).
+        self._ensure_coverage_factor(staged.shifts_t, int(cube.shape[0]))
         return _clamp_inf_to_finite(cube)
+
+    def _ensure_coverage_factor(
+        self,
+        shifts_t: torch.Tensor,
+        t_det: int,
+    ) -> Optional[torch.Tensor]:
+        """Lazy-compute the per-(t, fdm) Layer-1 coverage factor.
+
+        ``coverage_factor[t, fdm] = sqrt(n_chg_contrib[t, fdm] /
+        n_chg_max[fdm])`` where ``n_chg_contrib`` counts chgroups g
+        whose dedispersed source row ``t - shifts[fdm, g]`` lands
+        inside the cube's data window ``[0, t_det)``. (Rows [t_det,
+        t_stream) of the dense plane are zero per the M7.4.1 scatter
+        contract, so the imager kernel emits zero contributions from
+        out-of-range chgroups; this is the same window the L1 sigma
+        estimator should normalise against.)
+
+        Cells with ``n_chg_contrib == 0`` are flagged with ``NaN``
+        coverage so dividing by it propagates ``NaN`` into the cube
+        and ``_clamp_inf_to_finite`` later zeroes them out (no
+        detector contribution).
+
+        Returns ``self._coverage_factor`` (shape [t_det, n_fdm]) when
+        enabled; ``None`` when disabled.
+        """
+        if not self._coverage_correct_enabled:
+            return None
+        shifts_id = int(shifts_t.data_ptr())
+        if (
+            self._coverage_factor is not None
+            and self._coverage_factor_shifts_id == shifts_id
+            and self._coverage_factor.shape[0] == int(t_det)
+        ):
+            return self._coverage_factor
+        # shifts_t: [n_fdm, n_chg] int32
+        n_fdm, n_chg = shifts_t.shape
+        ts = torch.arange(
+            int(t_det), dtype=torch.int32, device=shifts_t.device,
+        )
+        # t_src[fdm, g, t] = t - shifts[fdm, g]
+        t_src = ts[None, None, :] - shifts_t[:, :, None]
+        in_range = (t_src >= 0) & (t_src < int(t_det))
+        n_chg_contrib = in_range.sum(dim=1).to(torch.float32)  # [n_fdm, t_det]
+        n_chg_max = n_chg_contrib.amax(dim=1, keepdim=True).clamp(min=1.0)
+        cov = torch.sqrt(n_chg_contrib / n_chg_max)  # [n_fdm, t_det], in [0, 1]
+        # Replace cov==0 (fully-uncovered cells) with NaN so the L1
+        # sigma estimator drops them AND the cube becomes NaN at those
+        # positions (zeroed downstream by _clamp_inf_to_finite).
+        cov = torch.where(
+            cov > 0, cov, torch.full_like(cov, float("nan")),
+        )
+        # Cube is laid out as [T_det, N_fdm, H, W]; pre-transpose so
+        # the broadcast against cube needs no .permute() per call.
+        self._coverage_factor = cov.t().contiguous()  # [t_det, n_fdm]
+        self._coverage_factor_shifts_id = shifts_id
+        # Diagnostic stats; ``torch.nanmin``/``nanmax`` doesn't exist on
+        # this PyTorch build, so we mask NaNs by hand to avoid spurious
+        # +/-inf when any cell is NaN.
+        nan_mask = torch.isnan(cov)
+        n_total = int(cov.numel())
+        n_nan = int(nan_mask.sum().item()) if n_total else 0
+        if n_total > 0 and n_nan < n_total:
+            finite = cov[~nan_mask]
+            min_cov = float(finite.min().item())
+            max_cov = float(finite.max().item())
+            frac_full = float((finite >= 0.999).float().mean().item())
+        else:
+            min_cov = 0.0
+            max_cov = 0.0
+            frac_full = 0.0
+        frac_zero = (float(n_nan) / float(n_total)) if n_total else 0.0
+        _LOG.info(
+            "Layer-1 coverage factor built: n_fdm=%d t_det=%d "
+            "min_cov=%.4f max_cov=%.4f frac_full_cov=%.4f frac_zero_cov=%.4f",
+            int(n_fdm), int(t_det),
+            min_cov, max_cov, frac_full, frac_zero,
+        )
+        return self._coverage_factor
 
     def _build_validity_mask(self, slot: CubeRingSlot) -> torch.Tensor:
         """Materialise the [T_det, N_fdm] bool validity mask on the
@@ -1417,11 +1547,28 @@ class CubePipeline:
             and self.config.image_backend == "gpu"
         ):
             return self._layer1_normalise_fused(cube)
-        sigma = self.layer1_state.update_and_query(cube=cube)
+        # M7.4.2: pre-divide by sqrt(n_chg_contrib / n_chg_max) so per-
+        # cell variance is uniform across (t, fdm) before sigma_clipped
+        # estimation. See _ensure_coverage_factor() docstring for the
+        # full rationale; without this, owned_dm>=4 search nodes report
+        # ~16-30 false-alarm cands/cube on pure Gaussian noise.
+        if (
+            self._coverage_correct_enabled
+            and self._coverage_factor is not None
+            and self._coverage_factor.shape[0] == cube.shape[0]
+            and self._coverage_factor.shape[1] == cube.shape[1]
+        ):
+            cov = self._coverage_factor.to(cube.dtype)
+            cube_for_sigma = cube / cov[:, :, None, None]
+        else:
+            cube_for_sigma = cube
+        sigma = self.layer1_state.update_and_query(cube=cube_for_sigma)
         if sigma.device != cube.device:
             sigma = sigma.to(cube.device)
         # Broadcast-divide. cube is [T_det, N_fdm, H, W]; sigma is [N_fdm].
-        cube_normalised = cube / sigma[None, :, None, None].to(cube.dtype)
+        # We divide the coverage-corrected cube so the detector sees
+        # SNR in standard units (each cell has unit variance).
+        cube_normalised = cube_for_sigma / sigma[None, :, None, None].to(cube.dtype)
         return _clamp_inf_to_finite(cube_normalised), sigma
 
     def _layer1_normalise_fused(
