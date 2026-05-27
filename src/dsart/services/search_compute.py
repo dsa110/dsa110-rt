@@ -785,6 +785,12 @@ class SearchComputeService:
         C2 trigger listener is configured (saves the ~3 GiB copy on
         legacy-only deployments)."""
         cfg = self._config
+        # depth<=0 means the operator has explicitly disabled cube
+        # retention -- treat as a hard skip even when the C2 trigger
+        # listener is wired, so we can run hot perf benches without
+        # the 3.2 GiB DtoH per cube. (Burst dumps still require depth>=1.)
+        if cfg.cube_ring_depth <= 0:
+            return
         wants_ring = (
             cfg.c2_trigger_listener_config is not None
             or cfg.cube_ring_depth > 0
