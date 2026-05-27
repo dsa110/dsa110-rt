@@ -784,12 +784,21 @@ class SearchComputeService:
             or self._cube_ring.n_grid != slot.n_grid
         )
         if need_rebuild:
+            # Pinned host destination is REQUIRED for the production
+            # GPU→CPU stage_cube copy to use cudaMemcpyAsync over a
+            # DMA-able buffer. With pinned=False the buffer is plain
+            # np.empty (pageable), forcing a slow kernel-bounce DMA
+            # that BLOCKS the main thread for ~700 ms per 815 MiB cube
+            # — measured 1.0 cubes/s vs. the 7.45 cubes/s target on
+            # n01 (M7.4 C1 deploy, 2026-05-26). The CubeRetentionRing
+            # lazily allocates the ring slots, so the pin cost is paid
+            # ``depth`` times at warmup and amortised forever after.
             self._cube_ring = CubeRetentionRing(
                 depth=int(cfg.cube_ring_depth),
                 t_det=int(slot.t_det),
                 n_fdm=int(slot.n_fdm_in_cube),
                 n_grid=int(slot.n_grid),
-                pinned=False,  # production: keep host-pinned; tests pass np
+                pinned=True,
             )
             # Re-point the C2 trigger listener at the rebuilt ring.
             if self._c2_trigger is not None:

@@ -212,6 +212,7 @@ def _bind_c_api(lib: ctypes.CDLL) -> None:
             ctypes.c_uint32,                  # t_det
             ctypes.c_uint32,                  # compute_half
             ctypes.c_uint32,                  # coarse_dm_mask
+            ctypes.c_uint32,                  # n_active_dms_per_corr
             ctypes.POINTER(ctypes.c_uint8),   # out_validity_per_t
             ctypes.POINTER(ctypes.c_uint64),  # out_n_overrun
             ctypes.POINTER(ctypes.c_uint64),  # out_n_pattern_mismatch
@@ -232,6 +233,7 @@ def _bind_c_api(lib: ctypes.CDLL) -> None:
             ctypes.c_uint32,                  # n_grid
             ctypes.c_uint32,                  # owned_dm
             ctypes.c_uint32,                  # compute_half
+            ctypes.c_uint32,                  # n_active_dms_per_corr
             ctypes.POINTER(ctypes.c_int32),   # n_filled_per_corr [n_corr]
             ctypes.POINTER(ctypes.c_int32),   # linear_lut_strided [n_corr * lut_stride]
             ctypes.c_uint32,                  # lut_stride
@@ -548,6 +550,7 @@ class RxRing:
         t_det: int,
         compute_half: int = 0,
         coarse_dm_mask: int | None = None,
+        n_active_dms_per_corr: int | None = None,
     ) -> tuple[np.ndarray, int, int, int]:
         """Batched validity-walk over a cube's worth of ring slots.
 
@@ -610,6 +613,14 @@ class RxRing:
         if coarse_dm_mask is None:
             coarse_dm_mask = (1 << self.dims.n_coarse_dm) - 1
 
+        # Default n_active_dms_per_corr to popcount(coarse_dm_mask) —
+        # the producer wrote each dm bit, so popcount is the per-corr
+        # per-sample write-slot count.
+        if n_active_dms_per_corr is None:
+            n_active_dms_per_corr = bin(int(coarse_dm_mask)).count("1")
+        if n_active_dms_per_corr <= 0:
+            n_active_dms_per_corr = 1
+
         # The C function writes ``t_det`` validity bytes (one per
         # detector-window sample). Size the output buffer accordingly.
         out = np.ones(int(t_det), dtype=np.uint8)
@@ -623,6 +634,7 @@ class RxRing:
             ctypes.c_uint32(int(t_det)),
             ctypes.c_uint32(int(compute_half)),
             ctypes.c_uint32(int(coarse_dm_mask)),
+            ctypes.c_uint32(int(n_active_dms_per_corr)),
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             ctypes.byref(n_over),
             ctypes.byref(n_pat),
@@ -649,6 +661,7 @@ class RxRing:
         n_filled_per_corr: np.ndarray,
         linear_lut_strided: np.ndarray,
         compute_half: int = 0,
+        n_active_dms_per_corr: int = 1,
         out_t_stride: int | None = None,
         out_cint8: np.ndarray | None = None,
         out_scale: np.ndarray | None = None,
@@ -785,6 +798,7 @@ class RxRing:
         n_pat = ctypes.c_uint64(0)
         n_nodp = ctypes.c_uint64(0)
 
+        n_active_safe = int(n_active_dms_per_corr) if n_active_dms_per_corr > 0 else 1
         ret = lib.rx_ring_assemble_dense_block(
             ctypes.c_void_p(self._handle),
             ctypes.c_uint64(int(specnum_start)),
@@ -793,6 +807,7 @@ class RxRing:
             ctypes.c_uint32(n_grid),
             ctypes.c_uint32(int(owned_dm)),
             ctypes.c_uint32(int(compute_half)),
+            ctypes.c_uint32(n_active_safe),
             n_filled_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             lut.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             ctypes.c_uint32(lut_stride),

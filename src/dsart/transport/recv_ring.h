@@ -129,6 +129,7 @@ rx_ring_assemble_dense_block(
     uint32_t        n_grid,
     uint32_t        owned_dm,
     uint32_t        compute_half,
+    uint32_t        n_active_dms_per_corr,
     const int32_t  *n_filled_per_corr,
     const int32_t  *linear_lut_strided,
     uint32_t        lut_stride,
