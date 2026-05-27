@@ -208,12 +208,23 @@ class PipelineConfig:
 def _evaluate_when(expr: str, raw_cfg: dict[str, Any]) -> bool:
     """Tiny predicate evaluator for ``RoutineSpec.when``.
 
-    Supports only ``"<dotted.path> == <literal>"`` where literal is a
-    bare word (e.g. ``junkdb``, ``real``) or a quoted string. No
-    operators beyond ``==``; keep the language small to keep etcd
-    YAMLs predictable.
+    Supports ``"<dotted.path> == <literal>"`` and the negated form
+    ``"<dotted.path> != <literal>"`` where literal is a bare word
+    (e.g. ``junkdb``, ``real``, ``synth_fada``) or a quoted string. No
+    operators beyond ``==`` / ``!=``; keep the language small to keep
+    etcd YAMLs predictable.
+
+    Note: split on the 2-char operators first; we check ``!=`` before
+    ``==`` so the ``==`` branch isn't accidentally taken when the
+    predicate uses ``!=`` (since ``"a != b".split("==")`` returns the
+    whole string).
     """
-    parts = expr.split("==")
+    negate = False
+    if "!=" in expr:
+        parts = expr.split("!=")
+        negate = True
+    else:
+        parts = expr.split("==")
     if len(parts) != 2:
         LOG.warning("unparseable `when` predicate %r; defaulting to False", expr)
         return False
@@ -224,7 +235,8 @@ def _evaluate_when(expr: str, raw_cfg: dict[str, Any]) -> bool:
         if not isinstance(node, dict) or seg not in node:
             return False
         node = node[seg]
-    return str(node) == rhs
+    eq = str(node) == rhs
+    return (not eq) if negate else eq
 
 
 def _mjd_now() -> float:
