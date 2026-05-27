@@ -26,6 +26,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import tempfile
 from dataclasses import asdict
@@ -105,6 +106,8 @@ C2_CLUSTER_CSV_FIELDS: tuple[str, ...] = (
     "t_start_mjd",
     "t_end_mjd",
     "kernel_ids_distinct",
+    "gal_dm_max_los_pc_cc",
+    "dm_galactic_fraction",
     "trigger_class",
     "trigger",
 )
@@ -160,6 +163,15 @@ def stats_to_csv_row(
     trigger: str = "",
 ) -> dict[str, object]:
     t_span_s = (stats.t_end_mjd - stats.t_start_mjd) * 86400.0
+    # NaN-safe stringification: write empty string instead of "nan" so
+    # downstream consumers (pandas read_csv with default NaN sentinel,
+    # hiplot) treat them as missing rather than the string literal.
+    gal_dm = ""
+    if math.isfinite(stats.gal_dm_max_los):
+        gal_dm = f"{stats.gal_dm_max_los:.6f}"
+    dm_frac = ""
+    if math.isfinite(stats.dm_galactic_fraction):
+        dm_frac = f"{stats.dm_galactic_fraction:.6f}"
     return {
         "mjd_peak": f"{stats.t_peak_mjd:.11f}",
         "snr_max": f"{stats.snr_max:.6e}",
@@ -182,6 +194,8 @@ def stats_to_csv_row(
         "t_start_mjd": f"{stats.t_start_mjd:.11f}",
         "t_end_mjd": f"{stats.t_end_mjd:.11f}",
         "kernel_ids_distinct": ";".join(stats.kernel_ids_distinct),
+        "gal_dm_max_los_pc_cc": gal_dm,
+        "dm_galactic_fraction": dm_frac,
         "trigger_class": trigger_class,
         "trigger": trigger,
     }
@@ -344,5 +358,15 @@ def stats_to_l3_metadata(
             "t_peak_mjd": stats.t_peak_mjd,
             "peak_event_specnum": stats.peak_event_specnum,
             "kernel_ids_distinct": list(stats.kernel_ids_distinct),
+            # Galactic-DM discriminant (None when /mon/array/gal_dm
+            # was unavailable at the time of the trigger).
+            "gal_dm_max_los_pc_cc": (
+                stats.gal_dm_max_los
+                if math.isfinite(stats.gal_dm_max_los) else None
+            ),
+            "dm_galactic_fraction": (
+                stats.dm_galactic_fraction
+                if math.isfinite(stats.dm_galactic_fraction) else None
+            ),
         },
     }

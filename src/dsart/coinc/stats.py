@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -56,8 +56,39 @@ class ClusterStats:
     kernel_ids_distinct: Tuple[str, ...]
     peak_event_specnum: int
 
+    # Galactic-DM discriminant (added 2026-05-27).
+    #
+    # ``gal_dm_max_los`` is the NE2001 disk DM at the current pointing
+    # direction, served by /mon/array/gal_dm (declination.service on
+    # h23). When the C2 service has a fresh value, every cluster is
+    # tagged with the ratio ``dm_median / gal_dm_max_los`` as
+    # ``dm_galactic_fraction``:
+    #
+    #   * < 0.75  → almost certainly inside the Galactic disk
+    #   * >= 0.75 → almost certainly extragalactic / extra-disk
+    #
+    # ``dm_galactic_fraction = nan`` means we did not have a usable
+    # gal_dm_max_los at evaluation time (etcd outage or fresh boot
+    # before the first poll); criteria predicates that gate on this
+    # field treat nan as "do not match" so existing classes that don't
+    # use the discriminant are unaffected.
+    gal_dm_max_los: float = float("nan")
+    dm_galactic_fraction: float = float("nan")
 
-def compute_stats(members: Sequence[WindowEntry]) -> ClusterStats:
+
+def compute_stats(
+    members: Sequence[WindowEntry],
+    *,
+    gal_dm_max_los: Optional[float] = None,
+) -> ClusterStats:
+    """Reduce a clustered component to :class:`ClusterStats`.
+
+    ``gal_dm_max_los`` is the NE2001 max-LOS galactic DM (pc/cc) at the
+    current pointing — passed in by the coincidencer service from
+    ``/mon/array/gal_dm``. When provided and finite & positive, the
+    cluster is tagged with ``dm_galactic_fraction = dm_median /
+    gal_dm_max_los``; otherwise both fields are NaN.
+    """
     if not members:
         raise ValueError("compute_stats requires at least one member")
 
@@ -85,6 +116,19 @@ def compute_stats(members: Sequence[WindowEntry]) -> ClusterStats:
 
     kernel_ids = sorted({m.kernel_id for m in members})
 
+    dm_med = float(np.median(dms))
+
+    if (
+        gal_dm_max_los is not None
+        and math.isfinite(float(gal_dm_max_los))
+        and float(gal_dm_max_los) > 0.0
+    ):
+        gal_dm_los_f = float(gal_dm_max_los)
+        dm_galactic_fraction = dm_med / gal_dm_los_f
+    else:
+        gal_dm_los_f = float("nan")
+        dm_galactic_fraction = float("nan")
+
     return ClusterStats(
         n_events=len(members),
         n_search_nodes=len({m.search_node_id for m in members}),
@@ -94,7 +138,7 @@ def compute_stats(members: Sequence[WindowEntry]) -> ClusterStats:
         snr_mean=float(snrs.mean()),
         dm_min=float(dms.min()),
         dm_max=float(dms.max()),
-        dm_median=float(np.median(dms)),
+        dm_median=dm_med,
         dm_iqr=q3 - q1,
         l_median=float(np.median(ls)),
         m_median=float(np.median(ms)),
@@ -109,4 +153,6 @@ def compute_stats(members: Sequence[WindowEntry]) -> ClusterStats:
         t_peak_mjd=float(peak.mjd),
         kernel_ids_distinct=tuple(kernel_ids),
         peak_event_specnum=int(peak.event_specnum),
+        gal_dm_max_los=gal_dm_los_f,
+        dm_galactic_fraction=dm_galactic_fraction,
     )

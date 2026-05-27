@@ -42,6 +42,16 @@ Recognised require keys (all optional, ANDed):
     keeping the tight cap for low-SNR candidates.
   * ``width_median_max_samples`` / ``width_median_min_samples``
   * ``lm_diag_max_rad`` / ``lm_diag_min_rad``
+  * ``dm_galactic_fraction_max`` / ``dm_galactic_fraction_min`` —
+    cluster DM median expressed as a fraction of the NE2001 max-LOS
+    galactic DM at the current pointing (provided by
+    ``/mon/array/gal_dm``, refreshed by the C2 service every
+    ``coinc.gal_dm_poll_interval_s`` seconds, default 30). Used as
+    the *sole* galactic / extragalactic discriminant:
+    ``frac < 0.75 → Galactic disk; frac >= 0.75 → extragalactic``.
+    Predicates return False when ``dm_galactic_fraction`` is NaN
+    (i.e. /mon/array/gal_dm has never been read), so classes that
+    don't gate on this key keep their existing behaviour.
 
 Action values are opaque to this module; the service interprets
 ``dump_all_gpus`` and ``log_only`` (other values are returned through
@@ -117,6 +127,28 @@ def _dm_iqr_max_snr_scaled(stats: ClusterStats, t: float) -> bool:
     return float(stats.dm_iqr) <= cap
 
 
+def _dm_galactic_fraction_max(stats: ClusterStats, t: float) -> bool:
+    """``dm_galactic_fraction_max`` — Galactic-disk gate.
+
+    Returns True iff ``stats.dm_galactic_fraction`` is finite AND
+    ``<= t``. NaN → False so classes that gate on the galactic-DM
+    discriminant simply don't match when /mon/array/gal_dm is
+    unavailable; the operator gets log_only fallback.
+    """
+    frac = float(stats.dm_galactic_fraction)
+    if not math.isfinite(frac):
+        return False
+    return frac <= t
+
+
+def _dm_galactic_fraction_min(stats: ClusterStats, t: float) -> bool:
+    """``dm_galactic_fraction_min`` — extragalactic gate."""
+    frac = float(stats.dm_galactic_fraction)
+    if not math.isfinite(frac):
+        return False
+    return frac >= t
+
+
 # Lookup table mapping a require-key to:
 #   (predicate)
 # Predicate is a callable ``(stats, threshold) -> bool`` that returns
@@ -145,6 +177,8 @@ _REQUIRE_PREDICATES: Tuple[
     ("width_median_min_samples", lambda s, t: s.width_median >= t),
     ("lm_diag_max_rad", lambda s, t: s.lm_diag_rad <= t),
     ("lm_diag_min_rad", lambda s, t: s.lm_diag_rad >= t),
+    ("dm_galactic_fraction_max", _dm_galactic_fraction_max),
+    ("dm_galactic_fraction_min", _dm_galactic_fraction_min),
 )
 _REQUIRE_KEYS = {key for key, _ in _REQUIRE_PREDICATES}
 
