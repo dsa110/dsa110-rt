@@ -320,7 +320,7 @@ routines:
 #             is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 8.0                       # Production: 8σ floor (Phase 1a noise test used 6.0 to characterise FA distribution).
+  snr_min: 8.0                       # Production: 8σ floor (Phase 1a FA test: at 6sigma we measured ~6 cands/cube/half on pure Gaussian, matching Q(6)~9.9e-10 x 6.4e9 trials = 6.3 cands/cube. Coverage correction is required for this to hold; see cube_pipeline.py M7.4.2 notes).
   cube_ring_depth: 8                 # Production: 8 slots ~ 1.1s retention at 7.45 cubes/s -- enough for the C2 trigger window (Galactic-DM clustering + slow-fast pipeline jitter). Each slot is t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16; 8 slots = 26 GiB per gpu_half (n01: 50 GiB pinned across 2 halves, within the 256 GiB host budget). DtoH burden per cube is amortised by overlapping with the next cube's L1/detector work; M7.4.1 GPU-scatter freed up ~50 ms of H2D budget which more than compensates for the ~25 ms/cube DtoH cost.
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
