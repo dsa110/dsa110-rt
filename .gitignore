@@ -8,3 +8,11 @@ __pycache__/
 src/dsart.egg-info/
 build/
 src/dsart/transport/_recv_ring*.so
+# Vendored capture binary + object files built on each node by
+# `setup.py build_ext` / the capture Makefile. These are per-host build
+# artifacts (not source); leaving them untracked made `git status
+# --porcelain` non-empty, which tripped the dsa_monitor update_dsart
+# dirty-worktree gate on all fleet nodes (2026-05-28). Ignore them so
+# fleet updates stay clean without needing force=true.
+src/dsart/capture/dsart_capture_manythread
+src/dsart/capture/*.o
