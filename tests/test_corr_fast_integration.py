@@ -14,6 +14,7 @@ through the full 16-chgroup pipeline) lives in chunk 5/6.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1542,13 +1543,13 @@ def test_phase6_build_context_accepts_multiple_configs() -> None:
 def test_phase6_inject_modifies_voltages_in_corr_phase() -> None:
     """End-to-end wiring pin: at the block whose native window
     overlaps the injection peak, ``_process_block_corr_phase`` adds a
-    non-zero contribution to the voltages BEFORE the RFI flagger.
+    non-zero contribution to the voltages (M7.4 Phase 8: now applied
+    AFTER RFI excision + calibration; see
+    ``test_phase8_injection_is_applied_after_cal`` for the ordering
+    assertion).
 
     Strategy: build two identical contexts (same seed, same raw bytes,
-    static-sky disabled, RFI disabled — the RFI flagger gates on a
-    flagger object, but the *injection itself* is exercised even with
-    RFI on, since the injection-then-RFI ordering is a deliberate
-    Phase 6 invariant we test downstream). The injection-on context
+    static-sky disabled, RFI disabled). The injection-on context
     should produce a meaningfully different Stokes-I cube at the
     target block; the injection-off context returns the baseline.
     """
@@ -1612,4 +1613,86 @@ def test_phase6_inject_no_op_outside_target_block() -> None:
     assert torch.equal(vis_inj, vis_no_inj), (
         "Phase 6: injection contributed to a block outside its "
         "native footprint (auto-purge / footprint-skip broken?)"
+    )
+
+
+class _RecordingInjector:
+    """Stub injector that records the magnitude of the voltages it is
+    handed at ``apply_block`` time, without modifying them. Used to
+    assert WHERE in the pipeline the injection hook fires relative to
+    calibration."""
+
+    def __init__(self) -> None:
+        self.recorded_mean_abs: float | None = None
+        self.n_calls = 0
+
+    def apply_block(self, real_v, imag_v, block_specnum_start):  # noqa: ANN001
+        self.n_calls += 1
+        mag = (
+            real_v.abs().to(torch.float64).mean().item()
+            + imag_v.abs().to(torch.float64).mean().item()
+        )
+        self.recorded_mean_abs = mag
+        # Mimic the real injector's log contract; empty so the caller's
+        # ``if inject_log["active_inj_ids"]:`` branch is skipped.
+        return {"active_inj_ids": [], "n_purged": 0}
+
+
+def test_phase8_injection_is_applied_after_cal() -> None:
+    """M7.4 Phase 8 ordering invariant: the online injector must see
+    voltages that have ALREADY been calibrated.
+
+    Method: drive ``_process_block_corr_phase`` twice with a recording
+    stub injector that captures the mean |voltage| at the moment
+    ``apply_block`` is called, but does not mutate the data.
+
+      * Scenario A: ``ctx.cal is None`` (no cal) -> the injector sees
+        the raw unpacked voltages; record mean_abs_A.
+      * Scenario B: ``ctx.cal`` is a constant scalar gain k -> if (and
+        only if) injection runs AFTER cal, the injector sees voltages
+        scaled by k, so mean_abs_B == k * mean_abs_A.
+
+    If the injection had remained pre-cal (the Phase 6/7 bug), the
+    injector would see the same raw voltages in both scenarios and
+    mean_abs_B would equal mean_abs_A. The k-scaling assertion fails
+    closed against any regression that moves injection back upstream
+    of cal.
+    """
+    k = 3.0
+    raw = _synthetic_fada_block(seed=20260628)
+    block_n = 2
+
+    # Scenario A: no cal.
+    ctx_a = _build_test_context(_make_cfg())
+    assert ctx_a.cal is None
+    rec_a = _RecordingInjector()
+    ctx_a.injector = rec_a  # type: ignore[assignment]
+    _process_block_corr_phase(raw, ctx=ctx_a, block_n=block_n)
+    assert rec_a.n_calls == 1
+    assert rec_a.recorded_mean_abs is not None
+    assert rec_a.recorded_mean_abs > 0.0
+
+    # Scenario B: constant scalar gain k applied to all (ant, pol).
+    ctx_b = _build_test_context(_make_cfg())
+    dtype = ctx_b.voltage_dtype
+    device = ctx_b.device
+    cal_shape = (1, 1, NPOL, 1, NANTS)
+    cal_real = torch.full(cal_shape, float(k), dtype=dtype, device=device)
+    cal_imag = torch.zeros(cal_shape, dtype=dtype, device=device)
+    ctx_b.cal = SimpleNamespace(cal_real=cal_real, cal_imag=cal_imag)  # type: ignore[assignment]
+    rec_b = _RecordingInjector()
+    ctx_b.injector = rec_b  # type: ignore[assignment]
+    _process_block_corr_phase(raw, ctx=ctx_b, block_n=block_n)
+    assert rec_b.n_calls == 1
+    assert rec_b.recorded_mean_abs is not None
+
+    # The injector in scenario B must have seen k-scaled voltages,
+    # proving injection runs after cal. Tolerance covers fp16 rounding
+    # on the cal multiply (CPU debug dtype may be fp32; either is fine).
+    ratio = rec_b.recorded_mean_abs / rec_a.recorded_mean_abs
+    assert abs(ratio - k) < 0.05 * k, (
+        f"injection appears to run BEFORE cal: scenario-B/scenario-A "
+        f"voltage-magnitude ratio={ratio:.4f}, expected ~{k} (the "
+        f"cal scalar). A ratio near 1.0 means the injector saw "
+        f"pre-cal voltages -- the Phase 6/7 ordering bug."
     )
