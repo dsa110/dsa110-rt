@@ -149,6 +149,19 @@ DEFAULT_REGISTRY_REFRESH_S: float = 1.0
 #: sweeps through cubes) and keeps the etcd payload under 8 KB.
 DEFAULT_HISTORY_DEPTH: int = 16
 
+#: Grace period beyond ``ttl_s`` before the matcher actively deletes an
+#: expired ``/cnf/inject/active/<inj_id>`` row from etcd.
+#:
+#: The matcher already skips expired rows in :meth:`try_match`, so this
+#: grace is purely about giving a late C1 candidate (one that arrives a
+#: few seconds after the dashboard's TTL) the chance to land before the
+#: registry entry vanishes. 5 s comfortably bounds the worst-case
+#: corr_fast → search → C2 path latency at steady state.
+#:
+#: Set to ``None`` to disable eviction entirely (operator-visible
+#: stale-entry accumulation; useful only in tests / forensic replays).
+DEFAULT_EXPIRY_GRACE_S: float = 5.0
+
 
 def build_active_inject_key(inj_id: str) -> str:
     """Canonical ``/cnf/inject/active/<inj_id>`` key."""
@@ -407,6 +420,7 @@ class InjectionMatcher:
         history_depth: int = DEFAULT_HISTORY_DEPTH,
         time_fn: Any = time.time,
         active_inject_prefix: str = ACTIVE_INJECT_PREFIX,
+        expiry_grace_s: Optional[float] = DEFAULT_EXPIRY_GRACE_S,
     ) -> None:
         if refresh_s <= 0.0:
             raise ValueError(f"refresh_s={refresh_s} must be positive")
@@ -416,6 +430,10 @@ class InjectionMatcher:
             raise ValueError(f"lm_tol_rad={lm_tol_rad} must be positive")
         if history_depth < 1:
             raise ValueError(f"history_depth={history_depth} must be >= 1")
+        if expiry_grace_s is not None and float(expiry_grace_s) < 0.0:
+            raise ValueError(
+                f"expiry_grace_s={expiry_grace_s} must be >= 0 or None"
+            )
         self._store = store
         self._refresh_s = float(refresh_s)
         self._dm_tol_frac = float(dm_tol_frac)
@@ -423,6 +441,9 @@ class InjectionMatcher:
         self._history_depth = int(history_depth)
         self._time = time_fn
         self._active_inject_prefix = str(active_inject_prefix)
+        self._expiry_grace_s: Optional[float] = (
+            None if expiry_grace_s is None else float(expiry_grace_s)
+        )
         # Per-(inj_id) state — guarded by _lock.
         self._lock = threading.Lock()
         self._active: Dict[str, ActiveInjection] = {}
@@ -437,6 +458,8 @@ class InjectionMatcher:
         self._n_publish_fail: int = 0
         self._n_refresh_ok: int = 0
         self._n_refresh_fail: int = 0
+        self._n_evicted_expired: int = 0
+        self._n_evict_fail: int = 0
 
     # ---- public hot-path ----
 
@@ -462,15 +485,90 @@ class InjectionMatcher:
             return False
         self._n_refresh_ok += 1
         self._last_refresh_unix = now
+
+        # Garbage-collect expired-with-grace ``/cnf/inject/active/<inj_id>``
+        # keys. The dashboard's ``publish_active_inject`` writes the entry
+        # without an etcd lease (DsaStore.put_dict has no lease surface),
+        # so without this sweep the registry accumulates dead probes
+        # indefinitely. ``try_match`` already skips expired entries, but
+        # the etcd key itself lingers and pollutes the snapshot. We use
+        # ``ttl_s + expiry_grace_s`` as the eviction threshold so a C1
+        # row that arrives a few seconds after TTL still has a chance to
+        # match before its registry entry is removed.
+        retained: list[ActiveInjection] = []
+        if self._expiry_grace_s is None:
+            retained = list(entries)
+        else:
+            grace = self._expiry_grace_s
+            stale: list[ActiveInjection] = []
+            for inj in entries:
+                if now > inj.fired_at_unix + inj.ttl_s + grace:
+                    stale.append(inj)
+                else:
+                    retained.append(inj)
+            if stale:
+                self._evict_keys(stale)
+
         with self._lock:
             old_ids = set(self._active.keys())
-            new_ids = {e.inj_id for e in entries}
-            self._active = {e.inj_id: e for e in entries}
+            new_ids = {e.inj_id for e in retained}
+            self._active = {e.inj_id: e for e in retained}
             # Drop best/history for ids no longer in the registry.
             for inj_id in old_ids - new_ids:
                 self._best.pop(inj_id, None)
                 self._history.pop(inj_id, None)
         return True
+
+    def _evict_keys(self, stale: list[ActiveInjection]) -> None:
+        """Best-effort delete of expired-with-grace ``/cnf/inject/active/``
+        keys; failures are logged + counted but never raised.
+
+        Uses the same ``store.get_etcd().delete(key)`` surface the
+        active-injection prefix is read through, so the duck-typed
+        ``FakeEtcd`` in tests just needs a ``delete`` method.
+        """
+        # Resolve the etcd client through the same indirection used for
+        # the prefix read (ControlStore-style lazy ``_ensure``/``_store``).
+        es = self._store
+        if hasattr(self._store, "_ensure") and hasattr(self._store, "_store"):
+            try:
+                self._store._ensure()
+                es = self._store._store
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "InjectionMatcher eviction: _ensure failed: %s; "
+                    "skipping this sweep (will retry next refresh)",
+                    exc,
+                )
+                self._n_evict_fail += len(stale)
+                return
+        try:
+            client = es.get_etcd()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(
+                "InjectionMatcher eviction: get_etcd() failed: %s; "
+                "skipping this sweep",
+                exc,
+            )
+            self._n_evict_fail += len(stale)
+            return
+        for inj in stale:
+            key = build_active_inject_key(inj.inj_id)
+            try:
+                client.delete(key)
+                self._n_evicted_expired += 1
+                LOG.info(
+                    "InjectionMatcher: evicted expired %s "
+                    "(age=%.0fs ttl=%.0fs)",
+                    key,
+                    float(self._time()) - inj.fired_at_unix,
+                    inj.ttl_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._n_evict_fail += 1
+                LOG.warning(
+                    "InjectionMatcher: delete(%s) failed: %s", key, exc,
+                )
 
     def try_match(
         self,
@@ -617,6 +715,8 @@ class InjectionMatcher:
             "publish_fail": int(self._n_publish_fail),
             "refresh_ok": int(self._n_refresh_ok),
             "refresh_fail": int(self._n_refresh_fail),
+            "evicted_expired": int(self._n_evicted_expired),
+            "evict_fail": int(self._n_evict_fail),
             "last_refresh_unix": float(self._last_refresh_unix),
         }
 

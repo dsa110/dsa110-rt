@@ -40,11 +40,17 @@ def _make_inj_payload(
     width: int = 32,
     fluence: float = 100.0,
     apply_at: int = 1_000_000,
-    fired_at: float = 1_700_000_000.0,
+    fired_at: float | None = None,
     ttl: float = 60.0,
     fired_by: str = "test",
     target_snr: Any = None,
 ) -> Dict[str, Any]:
+    # Default to "now" so the eviction-grace sweep in
+    # InjectionMatcher.refresh_if_due treats the entry as fresh. Tests
+    # that need a specific age (TTL / expiry / grace) pass an explicit
+    # ``fired_at`` and use a ``time_fn`` to anchor the matcher's clock.
+    if fired_at is None:
+        fired_at = time.time()
     payload: Dict[str, Any] = {
         "inj_id": inj_id,
         "dm_pc_cm3": dm,
@@ -63,17 +69,29 @@ def _make_inj_payload(
 
 
 class FakeEtcd:
-    """Minimal stand-in for the etcd3 client's ``get_prefix`` surface."""
+    """Minimal stand-in for the etcd3 client's ``get_prefix`` /
+    ``delete`` surface used by :class:`InjectionMatcher`.
+
+    ``delete`` removes the key from the in-memory store and records
+    the call in :attr:`deletes` so eviction tests can assert on it.
+    Inject a custom ``delete`` by overwriting the attribute to simulate
+    transport errors.
+    """
 
     def __init__(self, payloads: Mapping[str, Mapping[str, Any]]):
         self._payloads = {
             k: json.dumps(v).encode("utf-8") for k, v in payloads.items()
         }
+        self.deletes: List[str] = []
 
     def get_prefix(self, prefix: str):
-        for k, v in self._payloads.items():
+        for k, v in list(self._payloads.items()):
             if k.startswith(prefix):
                 yield v, None
+
+    def delete(self, key: str) -> None:
+        self.deletes.append(key)
+        self._payloads.pop(key, None)
 
 
 class FakeStore:
@@ -281,6 +299,128 @@ class TestRefresh:
         assert m.refresh_if_due(force=True) is False
         snap = m.snapshot()
         assert snap["refresh_fail"] == 1
+
+    # ---- expiry-grace eviction sweep (M7.4 Phase 6c follow-up) ----
+
+    def test_evicts_expired_after_grace(self):
+        """An entry past ``fired_at + ttl + grace`` is deleted from etcd
+        and dropped from the matcher's in-memory ``_active``.
+
+        Mirrors the production sweep that keeps stale ``cal_probe_*``
+        rows from accumulating in ``/cnf/inject/active/*`` after the
+        dashboard fires + the C2 matcher consumes the result.
+        """
+        fired = 1_000.0
+        ttl = 5.0
+        grace = 2.0
+        store = FakeStore({
+            ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                inj_id="aa", fired_at=fired, ttl=ttl,
+            ),
+        })
+        # Anchor matcher clock past ttl + grace.
+        now = [fired + ttl + grace + 0.001]
+        m = InjectionMatcher(
+            store=store,
+            refresh_s=0.1,
+            time_fn=lambda: now[0],
+            expiry_grace_s=grace,
+        )
+        m.refresh_if_due(force=True)
+
+        snap = m.snapshot()
+        assert snap["active_count"] == 0
+        assert snap["evicted_expired"] == 1
+        assert snap["evict_fail"] == 0
+        assert store.get_etcd().deletes == [build_active_inject_key("aa")]
+
+    def test_does_not_evict_within_grace(self):
+        """An entry past ``ttl`` but still within the grace window is
+        excluded from new matches by ``try_match`` (via ``is_expired``)
+        but its etcd key is NOT deleted yet — gives a late C1 candidate
+        a chance to surface before the row vanishes."""
+        fired = 1_000.0
+        ttl = 5.0
+        grace = 2.0
+        store = FakeStore({
+            ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                inj_id="aa", fired_at=fired, ttl=ttl,
+            ),
+        })
+        now = [fired + ttl + grace - 0.001]   # within grace, just under
+        m = InjectionMatcher(
+            store=store,
+            refresh_s=0.1,
+            time_fn=lambda: now[0],
+            expiry_grace_s=grace,
+        )
+        m.refresh_if_due(force=True)
+
+        snap = m.snapshot()
+        assert snap["active_count"] == 1
+        assert snap["evicted_expired"] == 0
+        assert store.get_etcd().deletes == []
+
+    def test_evict_fail_counted_when_delete_raises(self):
+        """``delete`` failures are swallowed + counted: the row is still
+        excluded from the new ``_active`` snapshot, but the etcd key
+        survives so the next refresh can re-try."""
+        fired = 1_000.0
+        ttl = 5.0
+        grace = 2.0
+        store = FakeStore({
+            ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                inj_id="aa", fired_at=fired, ttl=ttl,
+            ),
+        })
+
+        def _boom(key):
+            raise RuntimeError("etcd refused")
+
+        store._etcd.delete = _boom
+
+        now = [fired + ttl + grace + 1.0]
+        m = InjectionMatcher(
+            store=store,
+            refresh_s=0.1,
+            time_fn=lambda: now[0],
+            expiry_grace_s=grace,
+        )
+        m.refresh_if_due(force=True)
+
+        snap = m.snapshot()
+        assert snap["evict_fail"] == 1
+        assert snap["evicted_expired"] == 0
+        assert snap["active_count"] == 0    # still filtered out of _active
+
+    def test_eviction_disabled_when_grace_none(self):
+        """Operators can pin ``expiry_grace_s=None`` to disable eviction
+        (e.g. forensic replay where we want to keep every fired probe
+        visible regardless of TTL)."""
+        fired = 1_000.0
+        ttl = 5.0
+        store = FakeStore({
+            ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                inj_id="aa", fired_at=fired, ttl=ttl,
+            ),
+        })
+        now = [fired + ttl + 100.0]   # well past TTL
+        m = InjectionMatcher(
+            store=store,
+            refresh_s=0.1,
+            time_fn=lambda: now[0],
+            expiry_grace_s=None,
+        )
+        m.refresh_if_due(force=True)
+
+        snap = m.snapshot()
+        assert snap["active_count"] == 1
+        assert snap["evicted_expired"] == 0
+        assert store.get_etcd().deletes == []
+
+    def test_eviction_negative_grace_rejected(self):
+        with pytest.raises(ValueError, match="expiry_grace_s"):
+            InjectionMatcher(store=FakeStore(), expiry_grace_s=-1.0)
 
 
 # ---------------------------------------------------------------------------
