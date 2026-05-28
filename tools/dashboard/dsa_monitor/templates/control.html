@@ -249,9 +249,15 @@
                            value="500" step="0.1" required />
                 </div>
                 <div class="verb-row">
+                    <label for="target_snr">target SNR</label>
+                    <input type="number" id="target_snr" name="target_snr"
+                           step="0.1" min="0.1"
+                           placeholder="(set to inject by SNR)" />
+                </div>
+                <div class="verb-row">
                     <label for="fluence_jy_ms">fluence (Jy·ms)</label>
                     <input type="number" id="fluence_jy_ms" name="fluence_jy_ms"
-                           value="50" step="0.1" required />
+                           value="50" step="0.1" />
                 </div>
                 <div class="verb-row">
                     <label for="width_samples">width (samples)</label>
@@ -311,6 +317,15 @@
             ahead of the fleet's current block_n at the chosen
             steady-state cubes/s rate.
             <br>
+            Set <code>target_snr</code> to inject at a specific SNR;
+            the dashboard reads the stored K for the (DM, width)
+            bucket and derives <code>fluence_jy_ms</code> via
+            <code>fluence = width × (target_snr / K)²</code>. The
+            <code>fluence_jy_ms</code> field is ignored when
+            <code>target_snr</code> is set. If no K is stored for the
+            bucket the inject returns <code>412 Precondition Failed</code>
+            — run the Calibrate panel below first.
+            <br>
             Defaults shown produce a 50 Jy·ms / DM=500 / width=32-
             sample test pulse at boresight — good first smoke test
             once <code>--inject-watch</code> is active on the fleet.
@@ -318,6 +333,127 @@
         <div id="resp-inject" class="response"></div>
     </form>
 </div>
+
+<!-- M7.4 Phase 6c.A: bootstrap SNR calibration -->
+<div class="panel" style="margin-top: 24px;">
+    <h3>Injection SNR calibration (M7.4 Phase 6c.A)</h3>
+    <p class="muted">
+        Fires one known-fluence probe at the chosen <code>(DM,
+        width)</code> bucket and reads the resulting C1-candidate
+        SNR back via <code>/mon/dsart/inject/matches/&lt;inj_id&gt;</code>.
+        From that pair the dashboard computes
+        <code>K = observed_snr × √(width / fluence)</code> and stores
+        it at <code>/cnf/inject/snr_calibration/&lt;bucket&gt;</code>.
+        Subsequent injections at a <code>target_snr</code> derive
+        their fluence from this <code>K</code>.
+        <br>
+        <strong>Disable cube dumps</strong> with the dumps gate above
+        before calibrating so that bright probes don't trigger the
+        dump pipeline while you titrate the calibration.
+    </p>
+    <form id="form-calibrate"
+          onsubmit="return submitVerb(event, '/control/inject_calibrate', 'resp-calibrate');">
+        <div class="control-wrap" style="gap: 16px;">
+            <div>
+                <div class="verb-row">
+                    <label for="cal_dm_pc_cm3">DM (pc/cc)</label>
+                    <input type="number" id="cal_dm_pc_cm3" name="dm_pc_cm3"
+                           value="500" step="0.1" required />
+                </div>
+                <div class="verb-row">
+                    <label for="cal_width_samples">width (samples)</label>
+                    <input type="number" id="cal_width_samples" name="width_samples"
+                           value="32" step="1" min="1" required />
+                </div>
+                <div class="verb-row">
+                    <label for="cal_fluence_jy_ms">probe fluence (Jy·ms)</label>
+                    <input type="number" id="cal_fluence_jy_ms" name="fluence_jy_ms"
+                           value="100" step="0.1" min="0.001" />
+                </div>
+                <div class="verb-row">
+                    <label for="cal_profile">profile</label>
+                    <select id="cal_profile" name="profile">
+                        <option value="gaussian" selected>gaussian</option>
+                        <option value="boxcar">boxcar</option>
+                    </select>
+                </div>
+            </div>
+            <div>
+                <div class="verb-row">
+                    <label for="cal_l_rad">l_rad</label>
+                    <input type="number" id="cal_l_rad" name="l_rad"
+                           value="0.0" step="0.001" />
+                </div>
+                <div class="verb-row">
+                    <label for="cal_m_rad">m_rad</label>
+                    <input type="number" id="cal_m_rad" name="m_rad"
+                           value="0.0" step="0.001" />
+                </div>
+                <div class="verb-row">
+                    <label for="cal_poll_timeout">match timeout (s)</label>
+                    <input type="number" id="cal_poll_timeout" name="poll_timeout_s"
+                           value="30" step="1" min="5" />
+                </div>
+                <div class="verb-row">
+                    <button type="submit">Calibrate probe</button>
+                    <button type="button" onclick="refreshCalibrations();"
+                            style="margin-left: 6px;">Refresh table</button>
+                </div>
+            </div>
+        </div>
+        <div id="resp-calibrate" class="response"></div>
+    </form>
+    <h4 style="margin-top: 12px;">Stored calibrations</h4>
+    <div id="calibration-table" class="muted">
+        <em>(click "Refresh table" to load)</em>
+    </div>
+</div>
+
+<script>
+async function refreshCalibrations() {
+    const tgt = document.getElementById("calibration-table");
+    tgt.textContent = "Loading...";
+    try {
+        const resp = await fetch("/control/inject_calibrations");
+        const data = await resp.json();
+        if (!data.ok) {
+            tgt.textContent = "Error: " + (data.error || "unknown");
+            return;
+        }
+        if (!data.entries || data.entries.length === 0) {
+            tgt.innerHTML = "<em>(no calibrations stored yet)</em>";
+            return;
+        }
+        let html = '<table style="border-collapse: collapse;">';
+        html += '<tr style="border-bottom: 1px solid #888;">';
+        html += '<th style="padding: 4px 8px; text-align: left;">bucket</th>';
+        html += '<th style="padding: 4px 8px; text-align: right;">K</th>';
+        html += '<th style="padding: 4px 8px; text-align: right;">last fluence</th>';
+        html += '<th style="padding: 4px 8px; text-align: right;">last SNR</th>';
+        html += '<th style="padding: 4px 8px; text-align: left;">last inj_id</th>';
+        html += '<th style="padding: 4px 8px; text-align: left;">actor</th>';
+        html += '<th style="padding: 4px 8px; text-align: left;">calibrated</th>';
+        html += '</tr>';
+        for (const e of data.entries) {
+            const dt = new Date(e.last_calibrated_at_unix * 1000)
+                          .toISOString().slice(0, 19) + "Z";
+            html += '<tr style="border-bottom: 1px dotted #444;">';
+            html += '<td style="padding: 4px 8px;"><code>' + e.bucket + '</code></td>';
+            html += '<td style="padding: 4px 8px; text-align: right;">' + e.K.toFixed(3) + '</td>';
+            html += '<td style="padding: 4px 8px; text-align: right;">' + e.last_fluence_jy_ms.toFixed(1) + '</td>';
+            html += '<td style="padding: 4px 8px; text-align: right;">' + e.last_observed_snr.toFixed(2) + '</td>';
+            html += '<td style="padding: 4px 8px;"><code>' + e.last_inj_id + '</code></td>';
+            html += '<td style="padding: 4px 8px;">' + e.actor + '</td>';
+            html += '<td style="padding: 4px 8px;"><code>' + dt + '</code></td>';
+            html += '</tr>';
+        }
+        html += '</table>';
+        tgt.innerHTML = html;
+    } catch (err) {
+        tgt.textContent = "Fetch error: " + err;
+    }
+}
+</script>
 
 <!-- M7.4 Phase 6c: Dump Now (one-shot diagnostic) -->
 <div class="panel" style="margin-top: 24px;" id="panel-dump-now">

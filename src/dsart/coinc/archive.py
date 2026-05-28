@@ -62,6 +62,9 @@ EVENT_SUBDIRS: tuple[str, ...] = (
 
 
 # C1 per-row CSV schema. Order matches docs/c1c2/C1C2_DESIGN.md §3.6.
+# M7.4 Phase 6c.A appends ``inj_id`` at the end so existing hiplot /
+# pandas readers that index by column-name still work; the new column
+# is empty for non-injection rows.
 C1_WINDOW_CSV_FIELDS: tuple[str, ...] = (
     "mjd",
     "event_specnum",
@@ -80,6 +83,7 @@ C1_WINDOW_CSV_FIELDS: tuple[str, ...] = (
     "gpu_half",
     "cube_id",
     "trigger",
+    "inj_id",
 )
 
 
@@ -133,7 +137,7 @@ def _atomic_write(path: Path, body: str) -> None:
 
 
 def entry_to_csv_row(
-    entry: WindowEntry, *, trigger: str = "",
+    entry: WindowEntry, *, trigger: str = "", inj_id: str = "",
 ) -> dict[str, object]:
     return {
         "mjd": f"{entry.mjd:.11f}",
@@ -153,6 +157,7 @@ def entry_to_csv_row(
         "gpu_half": entry.gpu_half,
         "cube_id": entry.cube_id,
         "trigger": trigger,
+        "inj_id": inj_id,
     }
 
 
@@ -281,9 +286,23 @@ class EventArchiveWriter:
         members: Iterable[WindowEntry],
         *,
         trigger: str = "",
+        inj_ids: Optional[Mapping[int, str]] = None,
     ) -> Path:
+        """Write the per-event C1 window CSV.
+
+        ``inj_ids`` (optional) maps a member's ``id(entry)`` to the
+        injection id it matched (Phase 6c.A label-as-injection path).
+        Members not in the map default to empty ``inj_id`` so the CSV
+        is fully populated for non-injection rows.
+        """
         path = event_dir / "Level2" / f"C1_window_{event_name}.csv"
-        rows = [entry_to_csv_row(m, trigger=trigger) for m in members]
+        id_map: Mapping[int, str] = inj_ids or {}
+        rows = [
+            entry_to_csv_row(
+                m, trigger=trigger, inj_id=id_map.get(id(m), ""),
+            )
+            for m in members
+        ]
         body = self._render_csv(C1_WINDOW_CSV_FIELDS, rows)
         _atomic_write(path, body)
         return path

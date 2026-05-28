@@ -66,6 +66,10 @@ from ..coinc.broadcast import TriggerBroadcaster
 from ..coinc.components import CoincidenceGraph
 from ..coinc.criteria import CriteriaEvaluator
 from ..coinc.csv_rotator import RollingCsvWriter
+from ..coinc.inject_match import (
+    DEFAULT_REGISTRY_REFRESH_S as INJECT_REGISTRY_REFRESH_S,
+    InjectionMatcher,
+)
 from ..coinc.names import EventNameAllocator
 from ..coinc.plotter import PlotWorker, enqueue_event
 from ..coinc.receiver import C1BatchReceiver
@@ -412,6 +416,20 @@ class _StoreWrapper:
             _LOG.exception("etcd get_dict(%s) failed", key)
             return None
 
+    def get_etcd(self) -> Any:
+        """Passthrough to the underlying ``DsaStore.get_etcd()`` so
+        consumers needing the raw ``etcd3`` client (e.g.
+        :class:`dsart.coinc.inject_match.InjectionMatcher` walking the
+        ``/cnf/inject/active/`` prefix) can use it.
+
+        Raises ``RuntimeError`` when etcd is unavailable so the caller
+        can fall back to a degraded mode (the matcher counts this as
+        a refresh failure).
+        """
+        if not self._available or self._store is None:
+            raise RuntimeError("etcd unavailable")
+        return self._store.get_etcd()
+
 
 # ---------------------------------------------------------------------------
 # Pending plot bookkeeping
@@ -442,6 +460,7 @@ class CoincidencerService:
         name_allocator: Optional[EventNameAllocator] = None,
         broadcaster: Optional[TriggerBroadcaster] = None,
         dumps_gate: Optional[DumpsGate] = None,
+        inject_matcher: Optional[InjectionMatcher] = None,
     ) -> None:
         self._config = config
 
@@ -487,6 +506,22 @@ class CoincidencerService:
         self._dumps_gate: DumpsGate = (
             dumps_gate if dumps_gate is not None
             else DumpsGate(self._mon_store)
+        )
+
+        # M7.4 Phase 6c.A: C1-row ↔ active-injection matcher. The
+        # matcher reads /cnf/inject/active/<inj_id> from etcd via the
+        # same DsaStore the rest of the service uses; on a row that
+        # matches an active injection it (a) publishes the running
+        # best to /mon/dsart/inject/matches/<inj_id> for the
+        # dashboard's bootstrap-SNR calibration to consume, and (b)
+        # stamps the C1 CSV's inj_id column so injection candidates
+        # are visibly labelled.
+        self._inject_matcher: InjectionMatcher = (
+            inject_matcher if inject_matcher is not None
+            else InjectionMatcher(
+                store=self._mon_store,
+                refresh_s=INJECT_REGISTRY_REFRESH_S,
+            )
         )
 
         self._receiver = C1BatchReceiver(
@@ -604,6 +639,11 @@ class CoincidencerService:
     # ----- batch handler ------------------------------------------------
 
     async def _on_batch(self, batch: wire.C1Batch, peer_repr: str) -> None:
+        # M7.4 Phase 6c.A: refresh the active-injection registry on
+        # every batch (heartbeat or non-empty); the matcher's
+        # refresh_if_due gates on its own cadence so this is a cheap
+        # no-op when the cadence hasn't elapsed.
+        self._inject_matcher.refresh_if_due()
         if batch.header.n_candidates == 0:
             # Empty heartbeat; nothing to do for the graph but record.
             return
@@ -640,6 +680,29 @@ class CoincidencerService:
         # Hot-reload criteria if the file mtime changed under us.
         self._criteria.reload_if_changed()
 
+        # M7.4 Phase 6c.A: run each new C1 row through the matcher
+        # against the active-injection registry (already refreshed at
+        # batch entry). Match hits update the per-id best, publish to
+        # /mon/dsart/inject/matches/<id>, and produce an ``inj_id``
+        # label we stamp into both the rolling hiplot CSV and (later,
+        # on a dump_all_gpus trigger) the per-event C1 window CSV.
+        inj_id_by_entry_id: Dict[int, str] = {}
+        for e in new_entries:
+            label = self._inject_matcher.try_match(
+                snr=e.snr,
+                dm_pc_cc=e.dm_pc_cc,
+                l_rad=e.l_rad,
+                m_rad=e.m_rad,
+                width_samples=e.width_samples,
+                event_specnum=e.event_specnum,
+                kernel_id=e.kernel_id,
+                search_node_id=e.search_node_id,
+                gpu_half=e.gpu_half,
+                mjd=e.mjd,
+            )
+            if label is not None:
+                inj_id_by_entry_id[id(e)] = label.inj_id
+
         # Write the per-row C1 hiplot CSV for *every* received candidate
         # (independent of triggering) — including late arrivals, so the
         # csv is a faithful record of what hit the wire even when those
@@ -647,7 +710,10 @@ class CoincidencerService:
         now_utc = datetime.now(timezone.utc)
         for e in new_entries:
             self._c1_csv.append_row(
-                entry_to_csv_row(e, trigger=""),
+                entry_to_csv_row(
+                    e, trigger="",
+                    inj_id=inj_id_by_entry_id.get(id(e), ""),
+                ),
                 now_utc=now_utc,
             )
 
@@ -714,8 +780,20 @@ class CoincidencerService:
                 ev_dir, event_name, stats,
                 trigger_class=trigger_class.name, trigger=event_name,
             )
+            # M7.4 Phase 6c.A: tag injection-matching members so the
+            # per-event C1 window CSV labels them. matched_inj_id is
+            # side-effect-free and walks the same registry the
+            # batch-time try_match consults.
+            member_inj_ids: Dict[int, str] = {}
+            for m in members:
+                label = self._inject_matcher.matched_inj_id(
+                    dm_pc_cc=m.dm_pc_cc, l_rad=m.l_rad, m_rad=m.m_rad,
+                )
+                if label is not None:
+                    member_inj_ids[id(m)] = label
             self._archive.write_c1_window_csv(
                 ev_dir, event_name, members, trigger=event_name,
+                inj_ids=member_inj_ids,
             )
             self._archive.write_l3_metadata(
                 ev_dir, event_name,
@@ -882,6 +960,7 @@ class CoincidencerService:
                     "dumps_enabled": bool(self._dumps_gate.enabled()),
                     "dumps_gate_reads": int(self._dumps_gate.read_count),
                     "dumps_gate_fails": int(self._dumps_gate.fail_count),
+                    "inject_match": self._inject_matcher.snapshot(),
                 }
                 self._mon_store.put_dict(
                     self._config.mon_etcd_key, payload,
