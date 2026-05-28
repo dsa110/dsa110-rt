@@ -13,6 +13,8 @@ PRODUCTION pipeline:
      fed forward; the fast-vis tile already reflects the F18 sign
      convention so no further correction is needed.
   4. ``apply_cal_split`` (with F21 DEC-phase cal; M3 chunk 1)
+  4b. ``OnlineInjector.apply_block`` — voltage-domain injection AFTER
+      RFI + cal (M7.4 Phase 8; no-op unless an injector is configured)
   5. ``FastCorrKernel.compute_split`` (M3 chunk 2a)
   6. ``stokes_i_pol_sum``                                          (chunk 2a)
   7. ``FastVisGridder.compute``                                    (chunk 3a)
@@ -1398,12 +1400,13 @@ class FastIntegrationConfig:
     non-empty, ``build_context`` constructs an :class:`OnlineInjector`
     for this chgroup and queues each :class:`InjectionConfig` via
     :meth:`OnlineInjector.add_pending`. The injector is then called
-    from :func:`_process_block_corr_phase` immediately after
-    ``unpack_int4_split`` and **before** the RFI flagger, so injected
-    pulses exercise the full corr → grid → coarse-DM → static-sky →
-    transport → search chain end-to-end. Default ``()`` = injection
-    disabled (zero hot-path overhead — the runtime check is a single
-    ``is None`` test in ``_process_block_corr_phase``).
+    via :func:`_apply_online_injection` **after** RFI excision and
+    calibration (M7.4 Phase 8; was pre-RFI through Phase 6/7), so
+    injected pulses model a calibrated-frame point source and exercise
+    the full grid → coarse-DM → static-sky → transport → search chain
+    end-to-end. Default ``()`` = injection disabled (zero hot-path
+    overhead — the runtime check is a single ``is None`` test in
+    ``_apply_online_injection``).
 
     Operator workflow (Phase 6):
 
@@ -1455,9 +1458,9 @@ class IntegrationContext:
 
     injector: OnlineInjector | None = None
     """M7.4 Phase 6: voltage-domain online injector. When set,
-    :func:`_process_block_corr_phase` calls
-    :meth:`OnlineInjector.apply_block` after the int4 unpack and
-    before the RFI flagger. ``None`` = injection disabled (no
+    :func:`_apply_online_injection` calls
+    :meth:`OnlineInjector.apply_block` AFTER RFI excision and
+    calibration (M7.4 Phase 8). ``None`` = injection disabled (no
     runtime cost). Built in :func:`build_context` from
     :attr:`FastIntegrationConfig.inject_configs`."""
 
@@ -1628,6 +1631,8 @@ def process_block(
         2. RFI flag_block(real, imag) → FlagBlockResult (if cfg.rfi_enabled)
         3. Apply RFI mask to voltages (if cfg.rfi_mask_voltage_zero_fill)
         4. apply_cal_split (if ctx.cal is not None)
+        4b. _apply_online_injection — post-cal voltage injection
+            (M7.4 Phase 8; no-op unless ctx.injector is set)
         5. + 6. **Streamed** per-``n_fv_chunk`` slab: FastCorrKernel.compute_split
               → stokes_i_pol_sum → write into the pre-allocated
               ``(n_fv_total, NBASE, NCHAN)`` Stokes-I cube. F31b
@@ -1695,6 +1700,57 @@ def _process_block_unpack_phase(
     )
 
 
+def _apply_online_injection(
+    real_v: torch.Tensor,
+    imag_v: torch.Tensor,
+    *,
+    ctx: IntegrationContext,
+    block_n: int,
+) -> None:
+    """M7.4 Phase 8 (2026-05-28): voltage-domain online injection,
+    applied **AFTER** RFI excision and calibration.
+
+    Physics rationale for the post-cal placement: an injected signal
+    models an astrophysical point source whose per-antenna fringe is
+    defined in the *calibrated* array frame (the (l, m) the operator
+    requests is where the source should land in the calibrated image).
+    Applying the injection to pre-cal voltages — as the pipeline did
+    through Phase 6/7 — meant ``apply_cal_split`` then rotated each
+    antenna's injected phase by that antenna's calibration solution,
+    smearing the intended fringe and shifting / decohering the source
+    away from the requested (l, m). Injecting after cal makes the
+    injected source appear exactly where intended, independent of the
+    calibration table. (RFI excision is also upstream now, so injected
+    bursts are never mistaken for narrowband CW and flagged out — the
+    desired behaviour for an injection validation signal.)
+
+    The call mutates ``real_v`` / ``imag_v`` in place via
+    ``OnlineInjector.apply_block`` (``torch.Tensor.add_``); no tensor
+    is returned and no extra allocation/copy is introduced, so the
+    relocation is RT-cost-neutral vs the pre-cal placement (it is the
+    same single ``apply_block`` call, just sequenced after cal).
+
+    No-op (single ``is None`` test) when ``ctx.injector is None``.
+
+    The native-sample reference for ``apply_at_specnum`` is the block
+    counter ``block_n`` × ``NPACKETS_PER_BLOCK`` (1-indexed from
+    service start).
+    """
+    if ctx.injector is None:
+        return
+    block_specnum_start = int(block_n) * NPACKETS_PER_BLOCK
+    inject_log = ctx.injector.apply_block(
+        real_v, imag_v, block_specnum_start,
+    )
+    if inject_log["active_inj_ids"]:
+        LOG.info(
+            "M7.4 inject (post-cal): block_n=%d specnum_start=%d "
+            "active=%s n_purged=%d",
+            block_n, block_specnum_start,
+            inject_log["active_inj_ids"], inject_log["n_purged"],
+        )
+
+
 def _process_block_corr_phase(
     raw: np.ndarray,
     *,
@@ -1714,32 +1770,6 @@ def _process_block_corr_phase(
     """
     # 1. Unpack
     real_v, imag_v = _process_block_unpack_phase(raw, ctx=ctx)
-
-    # 1b. M7.4 Phase 6: voltage-domain online injection (BEFORE RFI).
-    # Adds a dispersion-aware additive complex contribution to the
-    # GEMM-layout voltage tensors in-place. No-op (single `is None`
-    # test) when ``ctx.injector is None``. Production wiring: the
-    # injector is built once in :func:`build_context` from
-    # :attr:`FastIntegrationConfig.inject_configs`; runtime-pending
-    # add/remove via the etcd watcher (M7.6) is a future drop-in.
-    #
-    # The native-sample reference for ``apply_at_specnum`` is the
-    # block counter ``block_n`` × ``NPACKETS_PER_BLOCK`` (1-indexed
-    # from service start). SNAP-header-sourced absolute specnum is
-    # the M7.2.8 corner-turn work; until then the operator picks
-    # ``apply_at_specnum`` relative to service start.
-    if ctx.injector is not None:
-        block_specnum_start = int(block_n) * NPACKETS_PER_BLOCK
-        inject_log = ctx.injector.apply_block(
-            real_v, imag_v, block_specnum_start,
-        )
-        if inject_log["active_inj_ids"]:
-            LOG.info(
-                "M7.4 inject: block_n=%d specnum_start=%d active=%s "
-                "n_purged=%d",
-                block_n, block_specnum_start,
-                inject_log["active_inj_ids"], inject_log["n_purged"],
-            )
 
     # 2. RFI flag (before cal — flags should be on raw data + DC pol
     # so that any cal-induced dynamic range shifts can't mask them).
@@ -1763,6 +1793,11 @@ def _process_block_corr_phase(
         )
         del real_v, imag_v
         real_v, imag_v = real_v_c, imag_v_c
+
+    # 4b. M7.4 Phase 8: voltage-domain online injection, AFTER RFI +
+    # cal (was step 1b / pre-RFI through Phase 6/7 — see
+    # _apply_online_injection docstring for the post-cal rationale).
+    _apply_online_injection(real_v, imag_v, ctx=ctx, block_n=block_n)
 
     # 5. + 6. Streamed kernel + Stokes-I.
     #
@@ -1877,6 +1912,14 @@ def _process_block_compute_phase(
         )
         del real_v, imag_v
         real_v, imag_v = real_v_c, imag_v_c
+
+    # 4b. M7.4 Phase 8: voltage-domain online injection, AFTER RFI +
+    # cal. The 3-stream pipeliner path (--pipeliner-3s) previously did
+    # NOT inject at all (apply_block lived only in the non-pipeliner
+    # _process_block_corr_phase); this adds parity so injection works
+    # identically regardless of the streaming mode, and always lands
+    # post-cal. See _apply_online_injection docstring.
+    _apply_online_injection(real_v, imag_v, ctx=ctx, block_n=block_n)
 
     # 5. + 6. Streamed kernel + Stokes-I (production fused fast path).
     ppfv = ctx.cfg.t_int_fast_native // NTIMES_PER_PACKET

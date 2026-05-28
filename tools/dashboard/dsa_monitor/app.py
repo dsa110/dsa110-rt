@@ -59,11 +59,15 @@ from cands_panel_funcs import ArchiveBrowser, DEFAULT_ARCHIVE_ROOT
 from control_store import (
     CORR_CN_IDS,
     DEFAULT_ARM_SEQ_MARGIN,
+    DEFAULT_BOUNCE_SLEEP_S,
     DEFAULT_INJECT_CHGROUPS,
     DEFAULT_INJECT_MARGIN_BLOCKS,
     SEARCH_CN_IDS,
     ControlStore,
     audit_log,
+    bounce_search,
+    c2_journal_tail_local,
+    c2_mon_snapshot,
     compute_arm_seq,
     compute_inject_apply_at,
     control_inject_pulse,
@@ -74,6 +78,7 @@ from control_store import (
     fleet_restart_all,
     fleet_service_status,
     list_recent_audit,
+    restart_c2_service_local,
 )
 from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
 
@@ -352,6 +357,7 @@ def control_page():
         recent_audit=recent,
         default_arm_margin=DEFAULT_ARM_SEQ_MARGIN,
         default_inject_margin_blocks=DEFAULT_INJECT_MARGIN_BLOCKS,
+        default_bounce_sleep_s=DEFAULT_BOUNCE_SLEEP_S,
     )
 
 
@@ -925,6 +931,214 @@ def control_recent_audit():
         limit = 20
     rows = list_recent_audit(control_store, limit=limit)
     return jsonify({"rows": rows})
+
+
+# ---------- Control tab (M7.4 Phase 8 v3): quick recovery + live C2 -------
+#
+# Three actions + three read-only views, all surfaced on the new
+# "C2 / search quick recovery" + "Recent C2 activity" panels:
+#
+#   POST /control/bounce_search   — stop+sleep+start on selected sids,
+#                                   repairs the c1_emit wedge.
+#   POST /control/restart_c2      — local systemctl --user restart of
+#                                   dsart_c2.service.
+#   GET  /control/c2_snapshot     — /mon/c2/h23 counters + matcher
+#                                   snapshot for the live mini-panel.
+#   GET  /control/c2_journal      — recent FIRE/WOULD-DUMP/LOG class /
+#                                   inject_match lines from journalctl.
+#   GET  /control/recent_events   — last N candidate dirs (compact
+#                                   JSON for inline display).
+#
+# Every POST is confirm-gated to mirror the existing stop / restart_all
+# / dump_now speed-bumps.
+
+
+@app.route("/control/bounce_search", methods=["POST"])
+def control_bounce_search_post():
+    """Bounce (stop+sleep+start) one or more search cn_ids.
+
+    Repairs the recurring c1_emit-queue-wedge failure mode where the
+    TCP socket to C2 looks connected but the send thread is blocked
+    and ``total_dropped`` climbs without bound.
+
+    Form fields:
+
+      confirm    Must literally equal ``bounce_search``.
+      cn_ids     Comma-separated sid list (e.g. ``1`` or ``1,2``).
+                 Blank → bounce every search cn (SEARCH_CN_IDS).
+      sleep_s    Optional float; default ``DEFAULT_BOUNCE_SLEEP_S``.
+
+    Returns the dict :func:`bounce_search` returns, plus a ``user``
+    field with the recorded actor.
+    """
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "bounce_search":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "bounce_search requires confirm=bounce_search in the "
+                "POST body — this is a deliberate safety speed bump."
+            ),
+        }), 400
+
+    cn_ids_raw = (request.form.get("cn_ids") or "").strip()
+    cn_ids: Optional[list[int]]
+    if cn_ids_raw == "":
+        cn_ids = None
+    else:
+        try:
+            cn_ids = [int(c.strip()) for c in cn_ids_raw.split(",") if c.strip()]
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": f"cn_ids={cn_ids_raw!r}: not a CSV of ints",
+            }), 400
+        if not cn_ids:
+            return jsonify({
+                "ok": False,
+                "error": "cn_ids was empty after parsing",
+            }), 400
+        bad = [c for c in cn_ids if c not in SEARCH_CN_IDS]
+        if bad:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"cn_ids {bad} not in search SEARCH_CN_IDS="
+                    f"{list(SEARCH_CN_IDS)}"
+                ),
+            }), 400
+
+    sleep_raw = (request.form.get("sleep_s") or "").strip()
+    try:
+        sleep_s = float(sleep_raw) if sleep_raw else DEFAULT_BOUNCE_SLEEP_S
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "error": f"sleep_s={sleep_raw!r}: not a float",
+        }), 400
+    if sleep_s < 0.0 or sleep_s > 30.0:
+        return jsonify({
+            "ok": False,
+            "error": f"sleep_s={sleep_s} outside [0, 30]",
+        }), 400
+
+    return _control_json_or_error(
+        bounce_search, cn_ids=cn_ids, sleep_s=sleep_s,
+    )
+
+
+@app.route("/control/restart_c2", methods=["POST"])
+def control_restart_c2_post():
+    """Local ``systemctl --user restart dsart_c2.service`` on h23.
+
+    Form fields:
+
+      confirm    Must literally equal ``restart_c2``.
+
+    Returns the dict :func:`restart_c2_service_local` returns.
+    """
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "restart_c2":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "restart_c2 requires confirm=restart_c2 in the POST "
+                "body — this is a deliberate safety speed bump."
+            ),
+        }), 400
+    user = request.form.get("user") or request.remote_addr or "anon"
+    try:
+        result = restart_c2_service_local(control_store, user=user)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("restart_c2_service_local failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(result)
+
+
+@app.route("/control/c2_snapshot", methods=["GET"])
+def control_c2_snapshot():
+    """Read /mon/c2/h23 + return a compact JSON snapshot."""
+    try:
+        snap = c2_mon_snapshot(control_store)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("c2_mon_snapshot failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(snap)
+
+
+@app.route("/control/c2_journal", methods=["GET"])
+def control_c2_journal():
+    """Return recent decision lines from dsart_c2.service's user
+    journal.
+
+    Query params:
+
+      ``limit``   int, 1..500 (default 50).
+      ``since``   journalctl --since string (default ``"10 min ago"``).
+      ``all``     ``true`` returns every line; default keeps only the
+                  FIRE / WOULD-DUMP / LOG class / inject_match lines.
+    """
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 500))
+    since = request.args.get("since", "10 min ago").strip() or "10 min ago"
+    all_lines = (request.args.get("all", "false").lower()
+                 in ("1", "true", "yes"))
+    try:
+        snap = c2_journal_tail_local(
+            limit=limit, since=since,
+            grep_re=None if all_lines else None,
+        ) if all_lines else c2_journal_tail_local(
+            limit=limit, since=since,
+        )
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("c2_journal_tail_local failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(snap)
+
+
+@app.route("/control/recent_events", methods=["GET"])
+def control_recent_events():
+    """Return up to N most recent candidate dirs (newest first) as a
+    compact JSON list for the Control-tab "Recent C2 activity" panel.
+
+    The full per-event view lives at ``/bursts/<name>``; this endpoint
+    just gives the operator an at-a-glance "did my injection land?"
+    view without leaving the Control tab.
+    """
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 50))
+    try:
+        events = cands_browser.list_events()
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("cands_browser.list_events failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    out = []
+    for e in events[:limit]:
+        out.append({
+            "name": e.name,
+            "mtime_unix": e.mtime_unix,
+            "mjd_peak": e.mjd_peak,
+            "trigger_class": e.trigger_class,
+            "n_events": e.n_events,
+            "snr_max": e.snr_max,
+            "dm_median": e.dm_median,
+            "l_median": e.l_median,
+            "m_median": e.m_median,
+            "n_cubes": e.n_cubes,
+            "n_plots": e.n_plots,
+        })
+    return jsonify({
+        "ok": True,
+        "archive_root": str(cands_browser.root),
+        "archive_available": cands_browser.is_available,
+        "events": out,
+    })
 
 
 # ---------- Control tab (M7.4 Phase 8 v2) ----------------------------------

@@ -15,6 +15,8 @@ Key shapes covered (cardinalities per the M7.5 phase-B fleet):
   - ``/mon/service/corr_rt/<cn>``          → ``corr_rt_heartbeat``
   - ``/mon/search_rt/<cn>``                → ``search_rt_routine`` (3/cn)
   - ``/mon/service/search_rt/<cn>``        → ``search_rt_heartbeat``
+  - ``/mon/c2/<host>``                     → ``c2_service`` + ``c2_inject_match``
+                                              (1, h23 in production)
 
 The four ``search_rt`` per-routine keys called out as "planned" in
 ``M7.6-MONITOR-POINTS-SEARCH.md`` §7 (``/mon/search_rt/<cn>/rx``,
@@ -93,6 +95,7 @@ PREFIXES: Tuple[str, ...] = (
     "/mon/search_rt/",
     "/mon/service/corr_rt/",
     "/mon/service/search_rt/",
+    "/mon/c2/",
 )
 
 # Per-key-shape regexes.  Order matters: ``_route_key`` tries them in
@@ -108,6 +111,13 @@ KEY_SEARCH_COMPUTE = re.compile(r"^/mon/search_rt/(\d+)/compute/(\d+)$")
 KEY_SEARCH_CANDS = re.compile(r"^/mon/search_rt/(\d+)/cands$")
 KEY_SEARCH_CN = re.compile(r"^/mon/search_rt/(\d+)$")
 KEY_SEARCH_HEARTBEAT = re.compile(r"^/mon/service/search_rt/(\d+)$")
+
+# C2 (cross-node coincidencer, h23) — written by
+# ``dsart.services.coincidencer.RtOrchestrator._mon_publish_loop``
+# every ``mon_publish_interval_s`` (default 5 s).  Single node today
+# (``/mon/c2/h23``); the ``<host>`` capture group is preserved so a
+# future fan-out is just a new key, not a new schema.
+KEY_C2 = re.compile(r"^/mon/c2/([^/]+)$")
 
 # Capture-key cumulative-counter fields (corr doc §3.1) for delta math.
 CAPTURE_CUMULATIVE_FIELDS: Tuple[str, ...] = (
@@ -775,6 +785,123 @@ def make_rfi_points(
     return out
 
 
+def make_c2_points(
+    payload: Dict[str, Any], *, host: str,
+) -> List[Point]:
+    """Fan ``/mon/c2/<host>`` into 3 measurement families.
+
+    The C2 service rollup (see ``dsart.services.coincidencer.
+    _mon_publish_loop``) is the only mon-key that is *not* per-cn —
+    cross-fleet coincidence is single-instance on h23.  The payload
+    bundles four logically-distinct subgroups; we keep them as
+    separate measurements so Grafana queries don't have to filter
+    by field name to disentangle them:
+
+      ``c2_service``       — per-tick state + counters (1 row).
+      ``c2_receiver``      — C1 batch-receiver counters (1 row).
+      ``c2_inject_match``  — inject-match scalars + last_refresh (1 row).
+
+    The ``inject_match.active`` list and ``inject_match.best`` dict
+    carry per-injection nested objects; we deliberately do *not* fan
+    those out here (cardinality is operator-driven and unbounded
+    across a long campaign).  An operator who needs per-injection
+    panels can subscribe to ``/mon/dsart/inject/matches/*`` directly.
+
+    Strings (``last_event_name``, ``last_trigger_class``) are emitted
+    as InfluxDB string fields so a Grafana ``last()`` stat panel can
+    display the most recent trigger name; they will not appear on
+    numeric graphs.
+    """
+    ts_unix = payload.get("ts_unix")
+    if not isinstance(ts_unix, (int, float)) or isinstance(ts_unix, bool):
+        return []
+    ts_ns = int(float(ts_unix) * 1e9)
+
+    base_tags = {"host": str(host)}
+
+    # ---------- c2_service: top-level scalars + counters ----------
+    svc_fields: Dict[str, Any] = {}
+    for k in ("uptime_s", "window_size", "graph_size", "pending_plots",
+              "last_event_mjd", "gal_dm_max_los_pc_cc",
+              "gal_dm_polls_ok", "gal_dm_polls_fail",
+              "dumps_gate_reads", "dumps_gate_fails"):
+        v = payload.get(k)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            # gal_dm fields and last_event_mjd are floats; counters
+            # are ints in source — keep them as ints when possible
+            # so derivative() in Grafana sees a tidy integer series.
+            if k in ("uptime_s", "last_event_mjd",
+                     "gal_dm_max_los_pc_cc"):
+                svc_fields[k] = float(v)
+            else:
+                svc_fields[k] = int(v)
+    de = payload.get("dumps_enabled")
+    if isinstance(de, bool):
+        svc_fields["dumps_enabled"] = 1 if de else 0
+    # last_event_name / last_trigger_class are nullable strings;
+    # only emit when populated so the InfluxDB field type stays str
+    # (not "null"-typed first sample) and the graph stays sparse.
+    for k in ("last_event_name", "last_trigger_class"):
+        v = payload.get(k)
+        if isinstance(v, str) and v:
+            svc_fields[k] = v
+    counters = payload.get("counters") or {}
+    if isinstance(counters, dict):
+        for k, v in counters.items():
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                svc_fields[k] = int(v)
+
+    out: List[Point] = []
+    if svc_fields:
+        out.append(Point(
+            measurement="c2_service",
+            tags=base_tags, fields=svc_fields, timestamp_ns=ts_ns,
+        ))
+
+    # ---------- c2_receiver: C1 batch-RX counters ----------
+    receiver = payload.get("receiver") or {}
+    if isinstance(receiver, dict):
+        rx_fields: Dict[str, Any] = {}
+        for k, v in receiver.items():
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                rx_fields[k] = int(v)
+        if rx_fields:
+            out.append(Point(
+                measurement="c2_receiver",
+                tags=base_tags, fields=rx_fields, timestamp_ns=ts_ns,
+            ))
+
+    # ---------- c2_inject_match: scalars + last_refresh_unix ----------
+    im = payload.get("inject_match") or {}
+    if isinstance(im, dict):
+        im_fields: Dict[str, Any] = {}
+        for k in ("active_count", "rows_checked", "matches",
+                  "best_improved", "publish_ok", "publish_fail",
+                  "refresh_ok", "refresh_fail", "evicted_expired",
+                  "evict_fail"):
+            v = im.get(k)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                im_fields[k] = int(v)
+        v = im.get("last_refresh_unix")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            im_fields["last_refresh_unix"] = float(v)
+        if im_fields:
+            out.append(Point(
+                measurement="c2_inject_match",
+                tags=base_tags, fields=im_fields, timestamp_ns=ts_ns,
+            ))
+
+    return out
+
+
 def make_heartbeat_points(
     payload: Dict[str, Any], *, cn_id: int, namespace: str,
 ) -> List[Point]:
@@ -1012,6 +1139,9 @@ class InfluxPusherService:
                 return make_heartbeat_points(
                     payload, cn_id=int(m.group(1)), namespace="search_rt",
                 )
+            m = KEY_C2.match(key)
+            if m:
+                return make_c2_points(payload, host=str(m.group(1)))
 
             # Planned but not-yet-defined: per search doc §7.4 we want
             # to fail loudly here so a new publisher landing on the

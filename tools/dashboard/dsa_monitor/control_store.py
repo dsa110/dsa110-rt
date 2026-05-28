@@ -37,7 +37,9 @@ import datetime as _dt
 import json
 import logging
 import os
+import re
 import socket
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -1195,3 +1197,325 @@ def list_recent_audit(
             rows.append(payload)
     rows.sort(key=lambda r: r.get("iso_ts", ""), reverse=True)
     return rows[: int(limit)]
+
+
+# ---------------------------------------------------------------------------
+# M7.4 Phase 8 v3: search / C2 quick-recovery helpers
+#
+# These address two recurring "things are stuck" patterns that came out
+# of the Phase 6c soaks:
+#
+# * ``bounce_search`` cycles ``stop`` → ``start`` on one or more search
+#   cn_ids. Repairs the common "c1_emit queue full, total_dropped
+#   climbs but no reconnect" wedge where the TCP socket to C2 looks
+#   connected but the send thread is blocked.
+#
+# * ``restart_c2_service_local`` is a local ``systemctl --user restart
+#   dsart_c2.service`` on h23 — the dashboard host. Used when C2 is
+#   itself wedged (rare but happens after some etcd hiccups).
+#
+# Both write a single audit row on success/failure. They never raise:
+# the caller gets ``{ok: bool, ...}`` and the Flask layer surfaces it
+# as JSON. Tests mock ``time.sleep`` + ``subprocess.run`` so the unit
+# tests stay sub-second.
+# ---------------------------------------------------------------------------
+
+
+#: Pause between the ``stop`` and ``start`` fanouts when bouncing
+#: search. 2 s is enough for the search orchestrator to tear down its
+#: child processes and for the c1_emit TCP socket to enter TIME_WAIT
+#: cleanly. The matching ``test_bounce_search_waits_between_stop_and_start``
+#: assertion pins this default.
+DEFAULT_BOUNCE_SLEEP_S: float = 2.0
+
+#: Local dsart_c2 service unit. Used by
+#: :func:`restart_c2_service_local` and
+#: :func:`c2_journal_tail_local`. Kept here (rather than imported from
+#: services_inventory) so the unit tests can patch it cheaply.
+C2_SERVICE_UNIT: str = "dsart_c2.service"
+
+
+def bounce_search(
+    store: ControlStore,
+    *,
+    cn_ids: Iterable[int] | None = None,
+    sleep_s: float = DEFAULT_BOUNCE_SLEEP_S,
+    user: str | None = None,
+    sleep_fn: Any = None,
+) -> dict[str, Any]:
+    """Cycle ``stop`` → wait ``sleep_s`` → ``start`` across the given
+    search cn_ids (default: every search cn).
+
+    Returns a JSON-ready dict matching the other control_store verbs:
+
+        {
+          "ok": bool,
+          "cmd": "bounce_search",
+          "cn_ids": [1, 2, 9, 13],
+          "stop_keys":  ["/cmd/search_rt/1", ...],
+          "start_keys": ["/cmd/search_rt/1", ...],
+          "sleep_s": 2.0,
+        }
+
+    The start verb is sent with ``val=None`` — the search orchestrator
+    falls back to ``/mon/array/dec`` per the M7.4 CUSTOMDEC contract,
+    so a bounce does not require the operator to re-supply the
+    declination. Audit row carries the list of cn_ids touched.
+    """
+    cn_list: list[int] = (
+        [int(c) for c in cn_ids] if cn_ids is not None
+        else list(SEARCH_CN_IDS)
+    )
+    if not cn_list:
+        raise ValueError("bounce_search requires at least one cn_id")
+    sleep_s = float(sleep_s)
+    if sleep_s < 0.0:
+        raise ValueError(f"sleep_s={sleep_s} must be ≥ 0")
+
+    _sleep = sleep_fn if sleep_fn is not None else time.sleep
+
+    stop_keys = fanout_search(store, cmd="stop", val=None, cn_ids=cn_list)
+    _sleep(sleep_s)
+    start_keys = fanout_search(store, cmd="start", val=None, cn_ids=cn_list)
+
+    audit_log(
+        store, namespace="search_rt",
+        cn_target=",".join(str(c) for c in cn_list),
+        cmd="bounce_search", val={"cn_ids": cn_list, "sleep_s": sleep_s},
+        ok=True,
+        note=f"stop+sleep({sleep_s:.1f}s)+start on cn_ids={cn_list}",
+        user=user,
+    )
+    return {
+        "ok": True,
+        "cmd": "bounce_search",
+        "cn_ids": cn_list,
+        "stop_keys": stop_keys,
+        "start_keys": start_keys,
+        "sleep_s": sleep_s,
+    }
+
+
+def restart_c2_service_local(
+    store: ControlStore,
+    *,
+    unit: str = C2_SERVICE_UNIT,
+    timeout_s: float = 10.0,
+    user: str | None = None,
+) -> dict[str, Any]:
+    """Run ``systemctl --user restart <unit>`` on the local host.
+
+    The dsa_monitor process runs on h23 as the same user that owns
+    ``dsart_c2.service``, so no ssh is required. Returns
+    ``{ok, rc, stdout, stderr, err, elapsed_s, unit}``. Never raises;
+    a missing systemctl binary or a non-zero exit shows up as
+    ``ok=False`` with a descriptive ``err``.
+    """
+    argv = ["systemctl", "--user", "restart", unit]
+    started = time.monotonic()
+    try:
+        cp = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s,
+        )
+        ok = cp.returncode == 0
+        result = {
+            "ok": ok,
+            "rc": cp.returncode,
+            "stdout": cp.stdout or "",
+            "stderr": cp.stderr or "",
+            "err": "" if ok else f"rc={cp.returncode}",
+            "elapsed_s": round(time.monotonic() - started, 3),
+            "unit": unit,
+        }
+    except subprocess.TimeoutExpired as exc:
+        result = {
+            "ok": False,
+            "rc": None,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+            "err": f"timeout after {timeout_s:.1f}s",
+            "elapsed_s": round(time.monotonic() - started, 3),
+            "unit": unit,
+        }
+    except (FileNotFoundError, OSError) as exc:
+        result = {
+            "ok": False,
+            "rc": None,
+            "stdout": "",
+            "stderr": "",
+            "err": f"{type(exc).__name__}: {exc}",
+            "elapsed_s": round(time.monotonic() - started, 3),
+            "unit": unit,
+        }
+
+    audit_log(
+        store, namespace="services",
+        cn_target="local",
+        cmd="restart_c2",
+        val={"unit": unit, "elapsed_s": result["elapsed_s"]},
+        ok=bool(result["ok"]),
+        note=(
+            f"systemctl --user restart {unit} → "
+            f"rc={result.get('rc')} elapsed_s={result['elapsed_s']}"
+            + (f" err={result['err']!r}" if result.get("err") else "")
+        ),
+        user=user,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Read-side helpers — for the Control tab's live "what's happening
+# right now" mini-panels. Local subprocess + local etcd reads only.
+# ---------------------------------------------------------------------------
+
+
+#: Default etcd key for the C2 mon snapshot. Mirrors
+#: ``dsart.services.coincidencer._mon_publish_loop``'s publish target.
+C2_MON_KEY: str = "/mon/c2/h23"
+
+#: Regex that matches each meaningful per-cluster decision line in the
+#: dsart_c2 journal. Kept here so tests can pin it (an upstream
+#: refactor that changes the log shape will fail the matching test).
+C2_DECISION_RE: re.Pattern[str] = re.compile(
+    r"(FIRE class|WOULD-DUMP|LOG class|inject_match)",
+)
+
+
+def c2_mon_snapshot(store: ControlStore) -> dict[str, Any]:
+    """Read ``/mon/c2/h23`` and return a stripped-down view suited for
+    a small live panel.
+
+    Returns:
+
+        {
+          "ok": bool,
+          "key": "/mon/c2/h23",
+          "raw": <full dict or None>,
+          "counters": <counters dict or {}>,
+          "dumps_enabled": bool | None,
+          "inject_match": {
+            "active_count", "rows_checked", "matches",
+            "evicted_expired", "last_refresh_age_s", "active",
+          } or {},
+        }
+
+    A missing key returns ``ok=False`` with ``raw=None`` — the UI
+    treats that as "C2 hasn't published yet" rather than a hard error.
+    """
+    try:
+        raw = store.get_dict(C2_MON_KEY)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.warning("c2_mon_snapshot: get_dict failed: %s", exc)
+        return {
+            "ok": False, "key": C2_MON_KEY, "raw": None,
+            "counters": {}, "dumps_enabled": None, "inject_match": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(raw, dict):
+        return {
+            "ok": False, "key": C2_MON_KEY, "raw": None,
+            "counters": {}, "dumps_enabled": None, "inject_match": {},
+        }
+    counters = raw.get("counters") if isinstance(raw.get("counters"), dict) else {}
+    im_raw = raw.get("inject_match") if isinstance(raw.get("inject_match"), dict) else {}
+    last_refresh_unix = im_raw.get("last_refresh_unix")
+    if isinstance(last_refresh_unix, (int, float)):
+        last_refresh_age_s = float(time.time() - float(last_refresh_unix))
+    else:
+        last_refresh_age_s = None
+    im_view = {
+        "active_count": im_raw.get("active_count"),
+        "rows_checked": im_raw.get("rows_checked"),
+        "matches": im_raw.get("matches"),
+        "evicted_expired": im_raw.get("evicted_expired"),
+        "last_refresh_age_s": last_refresh_age_s,
+        "active": im_raw.get("active") if isinstance(im_raw.get("active"), list) else [],
+    }
+    return {
+        "ok": True,
+        "key": C2_MON_KEY,
+        "raw": raw,
+        "counters": counters,
+        "dumps_enabled": raw.get("dumps_enabled"),
+        "last_event_name": raw.get("last_event_name"),
+        "last_trigger_class": raw.get("last_trigger_class"),
+        "inject_match": im_view,
+    }
+
+
+def c2_journal_tail_local(
+    *,
+    limit: int = 50,
+    since: str = "10 min ago",
+    unit: str = C2_SERVICE_UNIT,
+    grep_re: re.Pattern[str] | None = C2_DECISION_RE,
+    timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    """Return the last ``limit`` decision lines from the C2 user
+    journal, optionally filtered by ``grep_re`` (default: FIRE /
+    WOULD-DUMP / LOG class / inject_match lines).
+
+    Output dict:
+
+        {
+          "ok": bool,
+          "unit": "dsart_c2.service",
+          "since": "...",
+          "lines": ["<line>", ...],   # newest last
+          "raw_lines_scanned": int,
+          "err": str,                  # empty on success
+        }
+
+    No stdin is consumed; safe to call from any thread. Errors
+    (missing journalctl, permission, timeout) come back as
+    ``ok=False`` with an explanatory ``err`` — they NEVER raise.
+    """
+    argv = [
+        "journalctl",
+        "--user", "-u", unit,
+        "--no-pager",
+        "--since", str(since),
+        "-n", str(int(limit * 4 if grep_re is not None else limit)),
+    ]
+    started = time.monotonic()
+    try:
+        cp = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False, "unit": unit, "since": since,
+            "lines": [], "raw_lines_scanned": 0,
+            "err": f"timeout after {timeout_s:.1f}s",
+            "elapsed_s": round(time.monotonic() - started, 3),
+            "stdout": exc.stdout or "", "stderr": exc.stderr or "",
+        }
+    except (FileNotFoundError, OSError) as exc:
+        return {
+            "ok": False, "unit": unit, "since": since,
+            "lines": [], "raw_lines_scanned": 0,
+            "err": f"{type(exc).__name__}: {exc}",
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+    if cp.returncode != 0:
+        return {
+            "ok": False, "unit": unit, "since": since,
+            "lines": [], "raw_lines_scanned": 0,
+            "err": f"journalctl rc={cp.returncode} stderr={cp.stderr.strip()[:200]!r}",
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+    raw_lines = (cp.stdout or "").splitlines()
+    if grep_re is None:
+        kept = raw_lines
+    else:
+        kept = [ln for ln in raw_lines if grep_re.search(ln)]
+    return {
+        "ok": True,
+        "unit": unit,
+        "since": since,
+        "lines": kept[-int(limit):],
+        "raw_lines_scanned": len(raw_lines),
+        "err": "",
+        "elapsed_s": round(time.monotonic() - started, 3),
+    }

@@ -175,10 +175,33 @@ routines:
   #   We use the per-host `hostargs:` mechanism (see search_rt.yaml
   #   bind-host example) to pin the right NIC IP without parameterising
   #   the YAML via tokens. IPs verified live on each node 2026-05-20.
+  #
+  # gate_on_paths (M7.4 Phase 8, 2026-05-28): mirrors the cap_a_junkdb /
+  # cap_b_junkdb gating (see lines 78-85). InfluxDB analysis on
+  # 2026-05-28 of the post-restart corr_rt_buffer history showed
+  # fada steady-state pinned at nfull=68/70 (~9 s of latency =
+  # exactly 68 buffers / 7.97 buffers-per-s) for the entire 25 min
+  # post-restart window. Root cause: cap_a_real spawned in the same
+  # wave-1 spawn as corr_fast / corr_slow, so once utc_start armed
+  # the SNAPs the capture binary wrote into dada/eada faster than
+  # the consumers reached their main loop (Python + GPU + Triton
+  # cold start = several seconds before the first fada page is
+  # consumed). The resulting offset persists indefinitely because
+  # writer rate (SNAP cadence) == reader rate (Triton steady state)
+  # to within ~0.1 buffer/s. Gating capture on the two consumer
+  # ready-sentinels removes the offset at the source: capture only
+  # starts binding/writing once both consumers are deep enough into
+  # init to be ready to drain. utc_start should still be issued by
+  # the operator AFTER /control/start completes (the gate adds at
+  # most 30-60 s to the start verb's wall-clock; the gate timeout
+  # is DSART_RT_GATE_TIMEOUT_S = 240 s default, plenty of headroom).
   - name: cap_a_real
     when: captures.mode == real
     cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
     args: -o dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
+    gate_on_paths:
+      - /tmp/dsart-corr-fast-CN.ready
+      - /tmp/dsart-corr-slow-CN.ready
     hostargs:
       lxd110h03: -j 10.41.0.224
       lxd110h04: -j 10.41.0.138
@@ -200,6 +223,9 @@ routines:
     when: captures.mode == real
     cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
     args: -o eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+    gate_on_paths:
+      - /tmp/dsart-corr-fast-CN.ready
+      - /tmp/dsart-corr-slow-CN.ready
     hostargs:
       lxd110h03: -j 10.41.0.224
       lxd110h04: -j 10.41.0.138

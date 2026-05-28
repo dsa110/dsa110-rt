@@ -68,6 +68,20 @@ class C1EmitConfig:
         connect_backoff_max_s: cap on the reconnect sleep.
         send_timeout_s: per-batch ``asyncio.wait_for`` deadline for the
             ``writer.drain()`` call. None disables.
+        connect_timeout_s: per-attempt ``asyncio.wait_for`` deadline for
+            ``asyncio.open_connection``. Without this, the Linux TCP
+            connect retransmit timer (RTO doubling: 1, 2, 4, ..., capped
+            at ~2 min on stock Ubuntu) can keep the connect task hung
+            for the full retry sequence when SYN packets are dropped
+            silently by conntrack / a bridge / a stuck CLOSE-WAIT in the
+            peer's listen queue. Concretely seen 2026-05-28 on
+            ``n01 gpu_half=0``: the c1_emit run() coroutine logged
+            "c1_emit connecting" but neither success nor "connection
+            failed" for 6+ minutes despite the peer being reachable
+            from the same host on a different source port. A short
+            per-attempt deadline forces the outer retry loop to fire,
+            which observably self-healed every prior backpressure /
+            broken-pipe transient.
     """
 
     host: str
@@ -78,6 +92,7 @@ class C1EmitConfig:
     connect_backoff_initial_s: float = 0.25
     connect_backoff_max_s: float = 30.0
     send_timeout_s: Optional[float] = 5.0
+    connect_timeout_s: Optional[float] = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -348,15 +363,33 @@ class C1TcpEmitter:
 
     async def _connect_once(self) -> None:
         _LOG.info(
-            "c1_emit connecting to %s:%d (sid=%d, gpu_half=%d)",
+            "c1_emit connecting to %s:%d (sid=%d, gpu_half=%d, timeout=%ss)",
             self._config.host,
             self._config.port,
             self._config.search_node_id,
             self._config.gpu_half,
+            self._config.connect_timeout_s,
         )
-        self._reader, self._writer = await asyncio.open_connection(
-            host=self._config.host, port=self._config.port,
-        )
+        # Wrap asyncio.open_connection in wait_for so a SYN-blackhole
+        # path (silently-dropped SYNs at conntrack / bridge / peer
+        # listen queue) cannot wedge run() indefinitely. The outer
+        # run() loop catches asyncio.TimeoutError as part of its
+        # generic Exception handler, logs "connection failed
+        # (TimeoutError)", and retries with exponential backoff -- the
+        # observable self-heal pattern. See C1EmitConfig docstring for
+        # the 2026-05-28 n01 gpu_half=0 incident this guards.
+        timeout = self._config.connect_timeout_s
+        if timeout is not None and timeout > 0:
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    host=self._config.host, port=self._config.port,
+                ),
+                timeout=float(timeout),
+            )
+        else:
+            self._reader, self._writer = await asyncio.open_connection(
+                host=self._config.host, port=self._config.port,
+            )
         self._mon["connected"] = True
         self._mon["reconnects"] = int(self._mon["reconnects"]) + 1
         self._mon["last_connect_error"] = None

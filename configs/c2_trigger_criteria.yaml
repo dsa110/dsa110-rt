@@ -42,11 +42,11 @@ trigger_classes:
       once the clusterer is sharpened (graph DM-proximity threshold
       or HDBSCAN-style re-clustering on the cluster's row set).
     require:
-      snr_max_min: 8.0
+      snr_max_min: 15.0
       n_events_min: 3
-      n_search_nodes_min: 2
-      dm_median_min_pc_cc: 50.0
-      dm_median_max_pc_cc: 4000.0
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 100.0
+      dm_median_max_pc_cc: 3000.0
       dm_iqr_max_pc_cc: 250.0
       width_median_max_samples: 64
       lm_diag_max_rad: 0.1
