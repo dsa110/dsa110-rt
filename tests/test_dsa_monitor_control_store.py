@@ -810,3 +810,361 @@ class TestTopologyConstants:
         # cn 9, 13 host search_rt; must NOT appear in corr.
         assert 9 not in control_store.CORR_CN_IDS
         assert 13 not in control_store.CORR_CN_IDS
+
+
+# ---------------------------------------------------------------------------
+# M7.4 Phase 8 v3: quick-recovery helpers
+# ---------------------------------------------------------------------------
+
+
+class TestBounceSearch:
+    """``bounce_search`` cycles stop → sleep → start across the
+    selected search cn_ids. The unit test pins the call order (sleep
+    happens between the two fanouts) + the audit shape.
+    """
+
+    def test_default_hits_all_search_cn_ids(self, fake_store_pair):
+        cs, fake = fake_store_pair
+        sleeps: list[float] = []
+        out = control_store.bounce_search(
+            cs, user="ops", sleep_fn=sleeps.append,
+        )
+        assert out["ok"] is True
+        assert out["cmd"] == "bounce_search"
+        assert out["cn_ids"] == list(control_store.SEARCH_CN_IDS)
+        assert out["stop_keys"] == [
+            f"/cmd/search_rt/{c}" for c in control_store.SEARCH_CN_IDS
+        ]
+        assert out["start_keys"] == [
+            f"/cmd/search_rt/{c}" for c in control_store.SEARCH_CN_IDS
+        ]
+        # 4 stop + 4 start + 1 audit = 9 writes.
+        assert len(fake.puts) == 9
+        assert sleeps == [control_store.DEFAULT_BOUNCE_SLEEP_S]
+
+    def test_custom_cn_ids_only_bounces_those(self, fake_store_pair):
+        cs, fake = fake_store_pair
+        sleeps: list[float] = []
+        out = control_store.bounce_search(
+            cs, cn_ids=(1,), user="ops", sleep_fn=sleeps.append,
+        )
+        assert out["cn_ids"] == [1]
+        assert out["stop_keys"] == ["/cmd/search_rt/1"]
+        assert out["start_keys"] == ["/cmd/search_rt/1"]
+        # 1 stop + 1 start + 1 audit = 3 writes.
+        assert len(fake.puts) == 3
+
+    def test_sleep_runs_between_stop_and_start(self, fake_store_pair):
+        """Record the ordering of put_dict + sleep calls and assert
+        the sleep falls strictly between the two fanouts."""
+        cs, fake = fake_store_pair
+        events: list[tuple[str, str]] = []
+
+        original_put = fake.put_dict
+
+        def record_put(key, payload):
+            events.append(("put", key))
+            return original_put(key, payload)
+
+        fake.put_dict = record_put
+
+        def record_sleep(s):
+            events.append(("sleep", str(s)))
+
+        control_store.bounce_search(
+            cs, cn_ids=(1, 2), user="ops", sleep_fn=record_sleep,
+        )
+        # Expected order: 2x put (stop), 1x sleep, 2x put (start), 1x put (audit).
+        kinds = [e[0] for e in events]
+        assert kinds == ["put", "put", "sleep", "put", "put", "put"]
+        # First two puts are stop fanout.
+        assert events[0][1] == "/cmd/search_rt/1"
+        assert events[1][1] == "/cmd/search_rt/2"
+        # Next two are start fanout.
+        assert events[3][1] == "/cmd/search_rt/1"
+        assert events[4][1] == "/cmd/search_rt/2"
+        # Last is the audit row.
+        assert events[5][1].startswith("/mon/audit/control/")
+
+    def test_audit_row_carries_cn_ids(self, fake_store_pair):
+        cs, fake = fake_store_pair
+        control_store.bounce_search(
+            cs, cn_ids=(2,), user="alice", sleep_fn=lambda _s: None,
+        )
+        audit_writes = [p for p in fake.puts
+                        if p[0].startswith("/mon/audit/control/")]
+        assert len(audit_writes) == 1
+        payload = audit_writes[0][1]
+        assert payload["cmd"] == "bounce_search"
+        assert payload["val"]["cn_ids"] == [2]
+        assert payload["ok"] is True
+        assert payload["user"] == "alice"
+
+    def test_empty_cn_ids_raises(self, fake_store_pair):
+        cs, _ = fake_store_pair
+        with pytest.raises(ValueError, match="at least one cn_id"):
+            control_store.bounce_search(
+                cs, cn_ids=[], sleep_fn=lambda _s: None,
+            )
+
+    def test_negative_sleep_raises(self, fake_store_pair):
+        cs, _ = fake_store_pair
+        with pytest.raises(ValueError, match="sleep_s"):
+            control_store.bounce_search(
+                cs, sleep_s=-1.0, sleep_fn=lambda _s: None,
+            )
+
+    def test_payload_carries_val_none_on_start_and_stop(self, fake_store_pair):
+        """Both fanouts MUST use val=None so the search orchestrator
+        falls back to /mon/array/dec per the M7.4 CUSTOMDEC contract."""
+        cs, fake = fake_store_pair
+        control_store.bounce_search(
+            cs, cn_ids=(1,), sleep_fn=lambda _s: None,
+        )
+        verb_writes = [p for p in fake.puts if p[0].startswith("/cmd/")]
+        assert len(verb_writes) == 2
+        for _, payload in verb_writes:
+            assert payload["val"] is None
+
+
+class TestRestartC2ServiceLocal:
+    """``restart_c2_service_local`` is the only Control-tab verb that
+    shells out locally (every other write goes through etcd). The
+    tests pin the argv it calls + audit-row shape on success / failure
+    / timeout / missing binary.
+    """
+
+    def test_success_returns_ok_true_and_audits(
+        self, fake_store_pair, monkeypatch
+    ):
+        cs, fake = fake_store_pair
+        captured: dict[str, Any] = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured["kwargs"] = dict(kwargs)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_c2_service_local(cs, user="ops")
+        assert out["ok"] is True
+        assert out["rc"] == 0
+        assert captured["argv"] == [
+            "systemctl", "--user", "restart", "dsart_c2.service",
+        ]
+        assert captured["kwargs"]["capture_output"] is True
+        assert captured["kwargs"]["text"] is True
+        # Audit row recorded.
+        audit_writes = [p for p in fake.puts
+                        if p[0].startswith("/mon/audit/control/")]
+        assert len(audit_writes) == 1
+        assert audit_writes[0][1]["cmd"] == "restart_c2"
+        assert audit_writes[0][1]["ok"] is True
+
+    def test_non_zero_rc_returns_ok_false(self, fake_store_pair, monkeypatch):
+        cs, fake = fake_store_pair
+
+        def fake_run(argv, **kwargs):
+            return mock.Mock(
+                returncode=5, stdout="oops\n", stderr="bad service",
+            )
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_c2_service_local(cs, user="ops")
+        assert out["ok"] is False
+        assert out["rc"] == 5
+        assert out["err"] == "rc=5"
+        # Audit row still written, ok=False.
+        audit_writes = [p for p in fake.puts
+                        if p[0].startswith("/mon/audit/control/")]
+        assert len(audit_writes) == 1
+        assert audit_writes[0][1]["ok"] is False
+
+    def test_timeout_returns_ok_false(self, fake_store_pair, monkeypatch):
+        cs, _ = fake_store_pair
+        import subprocess as _sp
+
+        def fake_run(argv, **kwargs):
+            raise _sp.TimeoutExpired(cmd=argv, timeout=10.0)
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_c2_service_local(cs, timeout_s=10.0)
+        assert out["ok"] is False
+        assert "timeout" in out["err"]
+
+    def test_missing_binary_returns_ok_false(
+        self, fake_store_pair, monkeypatch
+    ):
+        cs, _ = fake_store_pair
+
+        def fake_run(argv, **kwargs):
+            raise FileNotFoundError(2, "no such file", "systemctl")
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_c2_service_local(cs)
+        assert out["ok"] is False
+        assert "FileNotFoundError" in out["err"]
+
+
+class TestC2MonSnapshot:
+    """``c2_mon_snapshot`` derives a compact JSON-ready view of
+    ``/mon/c2/h23``. Missing key → ok=False, present key → broken
+    down into counters / dumps_enabled / inject_match buckets.
+    """
+
+    def test_missing_key_returns_ok_false(self, fake_store_pair):
+        cs, _ = fake_store_pair
+        out = control_store.c2_mon_snapshot(cs)
+        assert out["ok"] is False
+        assert out["raw"] is None
+        assert out["counters"] == {}
+        assert out["dumps_enabled"] is None
+
+    def test_present_key_returns_compact_view(self):
+        now = time.time()
+        responses = {
+            "/mon/c2/h23": {
+                "dumps_enabled": True,
+                "last_event_name": "260528ddsg",
+                "last_trigger_class": "bright_frb_extragalactic",
+                "counters": {
+                    "rows_in": 12345,
+                    "triggers_dump": 7,
+                    "triggers_suppressed": 0,
+                    "triggers_log_only": 42,
+                },
+                "inject_match": {
+                    "active_count": 1,
+                    "rows_checked": 12340,
+                    "matches": 3,
+                    "evicted_expired": 5,
+                    "last_refresh_unix": now - 1.5,
+                    "active": [{"inj_id": "test_bright"}],
+                },
+            },
+        }
+        fake = FakeDsaStore(get_dict_responses=responses)
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.c2_mon_snapshot(cs)
+        assert out["ok"] is True
+        assert out["dumps_enabled"] is True
+        assert out["last_event_name"] == "260528ddsg"
+        assert out["counters"]["rows_in"] == 12345
+        assert out["counters"]["triggers_dump"] == 7
+        im = out["inject_match"]
+        assert im["active_count"] == 1
+        assert im["matches"] == 3
+        assert im["evicted_expired"] == 5
+        # last_refresh_age_s should be a small positive float.
+        assert im["last_refresh_age_s"] is not None
+        assert 0.0 < im["last_refresh_age_s"] < 60.0
+        assert im["active"] == [{"inj_id": "test_bright"}]
+
+    def test_etcd_failure_surfaces_as_ok_false(
+        self, fake_store_pair, monkeypatch
+    ):
+        cs, fake = fake_store_pair
+
+        def bad_get(_key):
+            raise RuntimeError("etcd down")
+
+        # Monkey-patch the FakeDsaStore.get_dict to raise.
+        monkeypatch.setattr(fake, "get_dict", bad_get)
+        out = control_store.c2_mon_snapshot(cs)
+        assert out["ok"] is False
+        assert "etcd down" in out["error"]
+
+
+class TestC2JournalTailLocal:
+    """``c2_journal_tail_local`` shells out to journalctl. We mock
+    subprocess.run so the test stays fast + deterministic.
+    """
+
+    _SAMPLE_OUT = (
+        "May 28 19:20:44 lxd110h23 dsart_c2[9292]: WOULD-DUMP class=bright n=5\n"
+        "May 28 19:28:26 lxd110h23 dsart_c2[37721]: LOG class=log_only n=3 snr_max=14.12\n"
+        "May 28 19:30:00 lxd110h23 dsart_c2[37721]: client connected /127.0.0.1:55432\n"
+        "May 28 19:31:00 lxd110h23 dsart_c2[37721]: FIRE class=bright name=260528abcd snr_max=18.5\n"
+        "May 28 19:32:00 lxd110h23 dsart_c2[37721]: inject_match: matched test_bright\n"
+    )
+
+    def test_default_filter_keeps_only_decision_lines(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            assert argv[0] == "journalctl"
+            assert "--user" in argv
+            assert "-u" in argv
+            assert "dsart_c2.service" in argv
+            return mock.Mock(
+                returncode=0, stdout=self._SAMPLE_OUT, stderr="",
+            )
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.c2_journal_tail_local(limit=10)
+        assert out["ok"] is True
+        # 5 raw lines, 4 match the decision regex (WOULD-DUMP, LOG class,
+        # FIRE class, inject_match). The "client connected" line is dropped.
+        assert out["raw_lines_scanned"] == 5
+        assert len(out["lines"]) == 4
+        joined = "\n".join(out["lines"])
+        assert "client connected" not in joined
+        assert "WOULD-DUMP" in joined
+        assert "FIRE class" in joined
+        assert "inject_match" in joined
+
+    def test_unfiltered_keeps_every_line(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            return mock.Mock(
+                returncode=0, stdout=self._SAMPLE_OUT, stderr="",
+            )
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.c2_journal_tail_local(limit=100, grep_re=None)
+        assert out["ok"] is True
+        assert len(out["lines"]) == 5
+
+    def test_limit_caps_returned_lines(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            return mock.Mock(
+                returncode=0, stdout=self._SAMPLE_OUT, stderr="",
+            )
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.c2_journal_tail_local(limit=2)
+        # Default decision regex keeps 4 lines, limit=2 trims to 2
+        # (keeping the newest, i.e. FIRE + inject_match).
+        assert len(out["lines"]) == 2
+        assert "inject_match" in out["lines"][-1]
+        assert "FIRE class" in out["lines"][-2]
+
+    def test_journalctl_failure_returns_ok_false(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            return mock.Mock(
+                returncode=1, stdout="", stderr="permission denied",
+            )
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.c2_journal_tail_local()
+        assert out["ok"] is False
+        assert "rc=1" in out["err"]
+        assert out["lines"] == []
+
+    def test_missing_journalctl_returns_ok_false(self, monkeypatch):
+        def fake_run(argv, **kwargs):
+            raise FileNotFoundError(2, "no journalctl", "journalctl")
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.c2_journal_tail_local()
+        assert out["ok"] is False
+        assert "FileNotFoundError" in out["err"]
+
+    def test_timeout_returns_ok_false(self, monkeypatch):
+        import subprocess as _sp
+
+        def fake_run(argv, **kwargs):
+            raise _sp.TimeoutExpired(cmd=argv, timeout=5.0)
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.c2_journal_tail_local(timeout_s=5.0)
+        assert out["ok"] is False
+        assert "timeout" in out["err"]

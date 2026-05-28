@@ -151,6 +151,118 @@
     </div>
 </div>
 
+<!-- M7.4 Phase 8 v3: C2 / search quick recovery -->
+<div class="panel" style="margin-top: 24px;" id="panel-c2-quickops">
+    <h3>C2 / search quick recovery</h3>
+    <p class="muted">
+        Two recurring "things are stuck" repairs: <strong>bounce search</strong>
+        cycles <code>stop</code> + sleep + <code>start</code> on selected
+        search cn_ids and is the canonical fix for the <em>c1_emit queue
+        full, total_dropped climbs without a reconnect</em> wedge.
+        <strong>Restart C2</strong> is a local
+        <code>systemctl --user restart dsart_c2.service</code> on h23 for
+        when the coincidencer itself is unresponsive. Both are audited
+        to <code>/mon/audit/control/&lt;iso_ts&gt;</code>.
+    </p>
+
+    <!-- live counters mini-block -->
+    <div class="info-blob" id="c2-counters-blob"
+         style="margin-bottom: 12px;">loading C2 counters…</div>
+
+    <!-- bounce search -->
+    <form id="form-bounce" onsubmit="return submitBounceSearch(event);">
+        <div class="verb-row">
+            <label>bounce sids</label>
+            {% for cn in search_cn_ids %}
+            <label style="min-width:auto;margin-right:8px;">
+                <input type="checkbox" name="cn_id_{{ cn }}" value="{{ cn }}"
+                       {% if cn == 1 %}checked{% endif %} />
+                <code>{{ cn }}</code>
+            </label>
+            {% endfor %}
+            <label for="bounce_sleep_s" style="min-width:auto;margin-left:16px;">
+                sleep (s)
+            </label>
+            <input type="number" id="bounce_sleep_s" name="sleep_s"
+                   value="{{ default_bounce_sleep_s }}" step="0.5"
+                   min="0" max="30" style="width: 70px;" />
+        </div>
+        <div class="verb-row">
+            <label for="bounce_confirm">type "bounce_search"</label>
+            <input type="text" id="bounce_confirm" name="confirm"
+                   placeholder="bounce_search" autocomplete="off" />
+            <button type="submit" class="danger">Bounce selected search</button>
+        </div>
+        <div class="muted">
+            Sends <code>stop</code> to <code>/cmd/search_rt/&lt;cn&gt;</code>
+            for each ticked sid, waits <em>sleep</em> seconds, then sends
+            <code>start</code> with <code>val=null</code> (the search
+            orchestrator resolves declination from <code>/mon/array/dec</code>).
+            Default ticks <code>n01</code> because that's the typical
+            wedge target. Type <code>bounce_search</code> to confirm.
+        </div>
+        <div id="resp-bounce" class="response"></div>
+    </form>
+
+    <hr style="border-color:#34495e;margin:16px 0;">
+
+    <!-- restart c2 -->
+    <form id="form-restart-c2" onsubmit="return submitRestartC2(event);">
+        <div class="verb-row">
+            <label for="restart_c2_confirm">type "restart_c2"</label>
+            <input type="text" id="restart_c2_confirm" name="confirm"
+                   placeholder="restart_c2" autocomplete="off" />
+            <button type="submit" class="danger">Restart C2 (local)</button>
+        </div>
+        <div class="muted">
+            Local <code>systemctl --user restart dsart_c2.service</code>
+            on h23. The C1 receiver on port 11500 goes down for ~1 s; the
+            search-side <code>c1_emit</code> sockets auto-reconnect on
+            their next batch. <strong>Active injection registry</strong>
+            in <code>/cnf/inject/active/</code> is unaffected (it's
+            persistent etcd state); <strong>in-process matcher
+            counters</strong> reset (rows_in, matches, best, history).
+        </div>
+        <div id="resp-restart-c2" class="response"></div>
+    </form>
+</div>
+
+<!-- M7.4 Phase 8 v3: Recent C2 activity -->
+<div class="panel" style="margin-top: 24px;" id="panel-recent-c2">
+    <h3>Recent C2 activity</h3>
+    <p class="muted">
+        <strong>Recent candidates</strong> lists the last few event dirs
+        under <code>/dataz/dsa110/candidates/</code> (only FIRE /
+        WOULD-DUMP-class events get an entry — clusters classified as
+        <code>log_only</code> live only in the journal + rolling C2
+        CSV at <code>/dataz/dsa110/operations/C2/cluster_output/</code>).
+        <strong>C2 decision log</strong> below shows every
+        <code>FIRE</code> / <code>WOULD-DUMP</code> / <code>LOG class</code>
+        / <code>inject_match</code> line from the last 10 min of the
+        dsart_c2 user journal — that's where you find "did my injection
+        get classified, and to what".
+        Auto-refreshes every 10 s.
+    </p>
+    <h4 style="margin-top: 8px;">Recent candidates
+        (<a href="/bursts" style="color:#3498db;">full list →</a>)</h4>
+    <table class="audit-table" id="recent-events-table">
+        <thead>
+            <tr>
+                <th>event</th><th>age</th><th>class</th>
+                <th>snr_max</th><th>dm_med</th><th>l, m</th>
+                <th>cubes</th><th>plots</th>
+            </tr>
+        </thead>
+        <tbody id="recent-events-tbody">
+            <tr><td colspan="8" class="muted">loading…</td></tr>
+        </tbody>
+    </table>
+
+    <h4 style="margin-top: 16px;">C2 decision log (last 10 min)</h4>
+    <pre id="c2-journal-pre" class="info-blob"
+         style="max-height: 280px; overflow-y: auto;">loading…</pre>
+</div>
+
 <!-- M7.4 Phase 8 v2: fleet services status panel -->
 <div class="panel" style="margin-top: 24px;" id="panel-services">
     <h3>Fleet services</h3>
@@ -1093,5 +1205,226 @@ async function submitUpdateDsart(ev, dryRun) {
     btns.forEach(function (b) { b.disabled = false; });
     return false;
 }
+
+// ---- M7.4 Phase 8 v3: C2 / search quick recovery -----------------------
+async function submitBounceSearch(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-bounce");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>bouncing search…</span>";
+    // Collect ticked sids into a single csv field.
+    const sids = [];
+    form.querySelectorAll("input[type=checkbox]:checked").forEach(function (cb) {
+        if (cb.value) sids.push(cb.value);
+    });
+    if (sids.length === 0) {
+        respEl.innerHTML = "<span class='err'>no sids selected</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const fd = new FormData(form);
+    fd.set("cn_ids", sids.join(","));
+    let r, j;
+    try {
+        r = await fetch("/control/bounce_search", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    respEl.innerHTML =
+        "<span class='" + cls + "'>" + (j.ok ? "OK" : "FAIL") + "</span>" +
+        "<div class='info-blob'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    btn.disabled = false;
+    // After a bounce, refresh the counters mini-panel + recent activity
+    // so the operator sees rows_in start ticking back up.
+    setTimeout(refreshC2Counters, 1500);
+    setTimeout(refreshC2Journal, 2500);
+    return false;
+}
+
+async function submitRestartC2(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-restart-c2");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>restarting dsart_c2.service…</span>";
+    const fd = new FormData(form);
+    let r, j;
+    try {
+        r = await fetch("/control/restart_c2", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    respEl.innerHTML =
+        "<span class='" + cls + "'>" + (j.ok ? "OK" : "FAIL") + "</span>" +
+        "<div class='info-blob'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    btn.disabled = false;
+    setTimeout(refreshC2Counters, 2000);
+    return false;
+}
+
+function _fmtAgeS(unixTs) {
+    if (unixTs === null || unixTs === undefined) return "n/a";
+    const ageS = Math.round(Date.now() / 1000 - unixTs);
+    if (ageS < 60) return ageS + "s";
+    if (ageS < 3600) return Math.round(ageS / 60) + "m";
+    if (ageS < 86400) return Math.round(ageS / 3600) + "h";
+    return Math.round(ageS / 86400) + "d";
+}
+
+async function refreshC2Counters() {
+    const tgt = document.getElementById("c2-counters-blob");
+    if (!tgt) return;
+    let j;
+    try {
+        const r = await fetch("/control/c2_snapshot", {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        tgt.textContent = "fetch error: " + e;
+        return;
+    }
+    if (!j.ok) {
+        tgt.innerHTML = "<span class='err'>C2 has not published " +
+            "/mon/c2/h23 yet (cold-boot / wedged?)</span>";
+        return;
+    }
+    const c = j.counters || {};
+    const im = j.inject_match || {};
+    const dumpsTxt = (j.dumps_enabled === true) ? "ENABLED"
+                   : (j.dumps_enabled === false) ? "SUPPRESSED"
+                   : "(unknown)";
+    const dumpsCls = (j.dumps_enabled === true) ? "ok"
+                   : (j.dumps_enabled === false) ? "err"
+                   : "muted";
+    const lastEv = j.last_event_name || "(none since restart)";
+    const lastCls = j.last_trigger_class || "-";
+    const refreshAge = im.last_refresh_age_s === null ||
+                       im.last_refresh_age_s === undefined
+        ? "n/a" : Math.round(im.last_refresh_age_s) + "s ago";
+    tgt.innerHTML =
+        "<span class='" + dumpsCls + "'>dumps=" + dumpsTxt + "</span> | " +
+        "rows_in=<span class='stat'>" + (c.rows_in || 0) + "</span> | " +
+        "components=" + (c.components_evaluated || 0) + " | " +
+        "<span class='ok'>triggers_dump=" + (c.triggers_dump || 0) + "</span> | " +
+        "<span class='err'>triggers_suppressed=" + (c.triggers_suppressed || 0) + "</span> | " +
+        "triggers_log_only=" + (c.triggers_log_only || 0) + " | " +
+        "broadcast_send_ok=" + (c.broadcast_send_ok || 0) + " | " +
+        "plots_dispatched=" + (c.plots_dispatched || 0) +
+        "<br>" +
+        "last_event=<code>" + lastEv + "</code> class=<code>" + lastCls + "</code>" +
+        "<br>" +
+        "inject_match: active=" + (im.active_count || 0) +
+        " rows_checked=" + (im.rows_checked || 0) +
+        " matches=<span class='stat'>" + (im.matches || 0) + "</span>" +
+        " evicted_expired=" + (im.evicted_expired || 0) +
+        " | last_refresh=" + refreshAge +
+        ((im.active && im.active.length > 0)
+            ? "<br>active: " + im.active.map(function (a) {
+                return "<code>" + a.inj_id + "</code> (dm=" + a.dm_pc_cm3 +
+                       " w=" + a.width_samples +
+                       " ttl_remaining=" +
+                       Math.max(0, Math.round(
+                           a.fired_at_unix + a.ttl_s -
+                           Date.now() / 1000)) + "s)";
+              }).join(", ")
+            : "");
+}
+
+async function refreshRecentEvents() {
+    const tbody = document.getElementById("recent-events-tbody");
+    if (!tbody) return;
+    let j;
+    try {
+        const r = await fetch("/control/recent_events?limit=10",
+                              {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        tbody.innerHTML =
+            "<tr><td colspan='8' class='err'>fetch error: " + e + "</td></tr>";
+        return;
+    }
+    if (!j.ok) {
+        tbody.innerHTML =
+            "<tr><td colspan='8' class='err'>" +
+            (j.error || "unknown error") + "</td></tr>";
+        return;
+    }
+    const events = j.events || [];
+    if (events.length === 0) {
+        tbody.innerHTML =
+            "<tr><td colspan='8' class='muted'>no events under " +
+            (j.archive_root || "?") + " (yet)</td></tr>";
+        return;
+    }
+    tbody.innerHTML = events.map(function (e) {
+        const lm = (e.l_median !== null && e.m_median !== null)
+            ? e.l_median.toFixed(3) + ", " + e.m_median.toFixed(3)
+            : "-";
+        const snr = (e.snr_max !== null && e.snr_max !== undefined)
+            ? e.snr_max.toFixed(2) : "-";
+        const dm = (e.dm_median !== null && e.dm_median !== undefined)
+            ? e.dm_median.toFixed(1) : "-";
+        return "<tr>" +
+            "<td><a href='/bursts/" + e.name + "' style='color:#3498db;'>" +
+            "<code>" + e.name + "</code></a></td>" +
+            "<td>" + _fmtAgeS(e.mtime_unix) + "</td>" +
+            "<td><code>" + (e.trigger_class || "-") + "</code></td>" +
+            "<td>" + snr + "</td>" +
+            "<td>" + dm + "</td>" +
+            "<td>" + lm + "</td>" +
+            "<td>" + e.n_cubes + "</td>" +
+            "<td>" + e.n_plots + "</td>" +
+            "</tr>";
+    }).join("");
+}
+
+async function refreshC2Journal() {
+    const pre = document.getElementById("c2-journal-pre");
+    if (!pre) return;
+    let j;
+    try {
+        const r = await fetch("/control/c2_journal?limit=30&since=10+min+ago",
+                              {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        pre.textContent = "fetch error: " + e;
+        return;
+    }
+    if (!j.ok) {
+        pre.textContent = "journal read failed: " + (j.err || j.error || "?");
+        return;
+    }
+    if (!j.lines || j.lines.length === 0) {
+        pre.textContent =
+            "(no FIRE / WOULD-DUMP / LOG class lines in the last 10 min " +
+            "— either no clusters formed, or C2 is wedged. " +
+            "Scanned " + (j.raw_lines_scanned || 0) + " raw lines.)";
+        return;
+    }
+    pre.textContent = j.lines.join("\n");
+    // Pin scroll to the bottom so the newest line is visible.
+    pre.scrollTop = pre.scrollHeight;
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    refreshC2Counters();
+    refreshRecentEvents();
+    refreshC2Journal();
+    setInterval(refreshC2Counters, 5000);
+    setInterval(refreshRecentEvents, 10000);
+    setInterval(refreshC2Journal, 10000);
+});
 </script>
 {% endblock %}

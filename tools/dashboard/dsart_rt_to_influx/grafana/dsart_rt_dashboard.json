@@ -7,7 +7,7 @@
   "graphTooltip": 0,
   "id": null,
   "uid": "dsartRtMpV1",
-  "title": "dsart-rt (corr_rt + search_rt)",
+  "title": "dsart-rt (corr_rt + search_rt + c2)",
   "tags": [
     "dsart-rt",
     "M7.6"
@@ -50,13 +50,399 @@
   "panels": [
     {
       "id": 1,
-      "type": "graph",
-      "title": "corr_rt heartbeat \u2014 alive per cn",
-      "datasource": "InfluxDB",
-      "description": "1 = control plane saw a heartbeat for that cn in the last bucket. 0/null = stale; per /mon/service/corr_rt cadence is 2 s, so any gap >5 s is meaningful.",
+      "type": "row",
+      "title": "A. Fleet at-a-glance",
+      "collapsed": false,
       "gridPos": {
         "x": 0,
         "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "singlestat",
+      "title": "Corr nodes alive (heartbeat last 30 s)",
+      "datasource": "InfluxDB",
+      "description": "Heartbeats in the last 30 s. Healthy target = 16; <16 means a node is dark.",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT count(distinct(\"cn_id\")) FROM (SELECT last(\"alive\") AS \"alive\" FROM \"corr_rt_heartbeat\" WHERE time > now() - 30s GROUP BY \"cn_id\")",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "14,15",
+      "colors": [
+        "#d44a3a",
+        "rgba(237, 129, 40, 0.89)",
+        "#299c46"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 3,
+      "type": "singlestat",
+      "title": "Search nodes alive (heartbeat last 30 s)",
+      "datasource": "InfluxDB",
+      "description": "Healthy target = 4 (cn 1, 2, 9, 13).",
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT count(distinct(\"cn_id\")) FROM (SELECT last(\"alive\") AS \"alive\" FROM \"search_rt_heartbeat\" WHERE time > now() - 30s GROUP BY \"cn_id\")",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "3,4",
+      "colors": [
+        "#d44a3a",
+        "rgba(237, 129, 40, 0.89)",
+        "#299c46"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 4,
+      "type": "singlestat",
+      "title": "Fleet capture rate (Gb/s) -- 30s mean across 32 ports",
+      "datasource": "InfluxDB",
+      "description": "Mean recv rate over all 32 (cn,port) capture instances. Healthy ~9.4-9.6 Gb/s.",
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"rate_gbps\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "Gbits",
+      "valueName": "current",
+      "decimals": 2,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 5,
+      "type": "singlestat",
+      "title": "Last C2 trigger MJD (24h window)",
+      "datasource": "InfluxDB",
+      "description": "MJD of most recent C2 trigger over the last 24 h. Compare to current MJD to gauge staleness.",
+      "gridPos": {
+        "x": 18,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"last_event_mjd\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 24h",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "none",
+      "valueName": "current",
+      "decimals": 4,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "B. Service heartbeats",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "graph",
+      "title": "corr_rt heartbeat -- alive per cn",
+      "datasource": "InfluxDB",
+      "description": "1 = control plane saw a heartbeat in the last bucket. 0/null = stale; cadence is 2 s so gap >5 s is meaningful.",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
         "w": 12,
         "h": 7
       },
@@ -130,14 +516,14 @@
       "timeShift": null
     },
     {
-      "id": 2,
+      "id": 8,
       "type": "graph",
-      "title": "search_rt heartbeat \u2014 alive per cn",
+      "title": "search_rt heartbeat -- alive per cn",
       "datasource": "InfluxDB",
       "description": "Same as corr but for the search_rt service heartbeat.",
       "gridPos": {
         "x": 12,
-        "y": 0,
+        "y": 6,
         "w": 12,
         "h": 7
       },
@@ -211,1148 +597,14 @@
       "timeShift": null
     },
     {
-      "id": 3,
-      "type": "graph",
-      "title": "corr_rt routine \u2014 mean(alive) per routine (fleet)",
-      "datasource": "InfluxDB",
-      "description": "Fraction of the 16 cn that report each routine as 'running'. 1.0 means the whole fleet is happy with that routine; anything <1 flags a node that is failed/dead.",
-      "gridPos": {
-        "x": 0,
-        "y": 7,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_routine",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"alive\") FROM \"corr_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1.05",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 4,
-      "type": "graph",
-      "title": "corr_rt routine \u2014 max(last_verb_age_s) per routine",
-      "datasource": "InfluxDB",
-      "description": "Worst-case staleness of last verbose state-change across the fleet for each routine. Spikes here usually mean a hung node.",
-      "gridPos": {
-        "x": 12,
-        "y": 7,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_routine",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT max(\"last_verb_age_s\") FROM \"corr_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "s",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 5,
-      "type": "graph",
-      "title": "Capture rate (Gb/s) per (cn,port)",
-      "datasource": "InfluxDB",
-      "description": "Wire-rate per UDP capture port. Healthy operating point is ~9.6 Gb/s per port; sustained drops below 8 are suspicious.",
-      "gridPos": {
-        "x": 0,
-        "y": 14,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "cn $tag_cn_id port $tag_udp_port",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT last(\"rate_gbps\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "Gbits",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 6,
-      "type": "graph",
-      "title": "Recv packet rate (pps) per (cn,port)",
-      "datasource": "InfluxDB",
-      "description": "Per-port received packet rate computed from the cumulative n_recv_packets counter (pusher also publishes n_recv_packets_delta directly; this query rebuilds the rate from the raw counter so it survives publisher restarts cleanly).",
-      "gridPos": {
-        "x": 12,
-        "y": 14,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "cn $tag_cn_id port $tag_udp_port",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT non_negative_derivative(last(\"n_recv_packets\"), 1s) FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "pps",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 7,
-      "type": "graph",
-      "title": "Kernel drop rate (pps) per (cn,port)",
-      "datasource": "InfluxDB",
-      "description": "Per-port kernel-level packet drops from /proc-style n_kernel_drop_packets cumulative counter. Any sustained non-zero value is bad.",
-      "gridPos": {
-        "x": 0,
-        "y": 21,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "cn $tag_cn_id port $tag_udp_port",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT non_negative_derivative(last(\"n_kernel_drop_packets\"), 1s) FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "pps",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 8,
-      "type": "graph",
-      "title": "PSRDADA fill fraction \u2014 fleet mean per buffer",
-      "datasource": "InfluxDB",
-      "description": "M7.4 Phase 7 buffer-health summary: fraction of the ring currently holding unread data, averaged across the 16 corr nodes per buffer (dada, eada, fada, bada). A buffer sustained > ~0.85 means the downstream consumer is falling behind (back-pressure). Source: /mon/corr_rt/<cn>.buffers.<k>.metric (filled by dada_dbmetric on the corr node).",
-      "gridPos": {
-        "x": 12,
-        "y": 21,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_buffer",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"nfull\") / mean(\"nbufs\") FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"buffer\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "percentunit",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
       "id": 9,
       "type": "graph",
-      "title": "Capture degraded count (per cn,port)",
-      "datasource": "InfluxDB",
-      "description": "Number of /mon/corr_rt/<cn>/capture/<port> publishes that came in with state != UNAVAILABLE-style degraded=1 per bucket. Should be flat zero in normal ops.",
-      "gridPos": {
-        "x": 0,
-        "y": 28,
-        "w": 12,
-        "h": 6
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "cn $tag_cn_id port $tag_udp_port",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT sum(\"degraded\") FROM \"corr_rt_capture\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(0)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": true,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 10,
-      "type": "graph",
-      "title": "Capture arm_state_int (per cn,port)",
-      "datasource": "InfluxDB",
-      "description": "Integer encoding of arm_state (CTRL_RUN=2 in normal ops; 0=OFF, 1=ARMING, 3=DISARMING). Any drop off 2 means we lost the live correlator pipeline.",
-      "gridPos": {
-        "x": 12,
-        "y": 28,
-        "w": 12,
-        "h": 6
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "cn $tag_cn_id port $tag_udp_port",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT last(\"arm_state_int\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "4",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 11,
-      "type": "graph",
-      "title": "RFI total_flag_fraction \u2014 fleet mean per pol",
-      "datasource": "InfluxDB",
-      "description": "Mean fraction of (chan, time) cells flagged in the RFI rollup, averaged across the 16 cn. Tracks both polarisations plus the combined 'both' channel-axis OR.",
-      "gridPos": {
-        "x": 0,
-        "y": 34,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_pol",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"total_flag_fraction\") FROM \"corr_rt_rfi\" WHERE $timeFilter GROUP BY time($__interval), \"pol\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "percentunit",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 12,
-      "type": "graph",
-      "title": "RFI total_flag_fraction per cn (pol=both)",
-      "datasource": "InfluxDB",
-      "description": "Same metric broken out per cn (combined-pol view), to spot single nodes that are seeing much more RFI than the fleet.",
-      "gridPos": {
-        "x": 12,
-        "y": 34,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "cn $tag_cn_id",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"total_flag_fraction\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "percentunit",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 13,
-      "type": "graph",
-      "title": "RFI frac_sk \u2014 fleet mean per pol",
-      "datasource": "InfluxDB",
-      "description": "Spectral-kurtosis flag fraction per polarisation, fleet mean.",
-      "gridPos": {
-        "x": 0,
-        "y": 41,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_pol",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"frac_sk\") FROM \"corr_rt_rfi\" WHERE $timeFilter GROUP BY time($__interval), \"pol\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "percentunit",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 14,
-      "type": "graph",
-      "title": "RFI frac_kurt / frac_var \u2014 fleet mean per pol",
-      "datasource": "InfluxDB",
-      "description": "Note: this panel shows frac_kurt only; frac_var is on a sister panel below if you want to overlay them with a custom query.",
-      "gridPos": {
-        "x": 12,
-        "y": 41,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "frac_kurt $tag_pol",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"frac_kurt\") FROM \"corr_rt_rfi\" WHERE $timeFilter GROUP BY time($__interval), \"pol\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "percentunit",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 15,
-      "type": "graph",
-      "title": "search_rt routine \u2014 mean(alive) per routine (fleet)",
-      "datasource": "InfluxDB",
-      "description": "Fraction of the 4 search nodes that report each routine (search_rx, search_compute_0, search_compute_1) as running.",
-      "gridPos": {
-        "x": 0,
-        "y": 48,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_routine",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT mean(\"alive\") FROM \"search_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": "0",
-          "max": "1.05",
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 16,
-      "type": "graph",
-      "title": "search_rt routine \u2014 max(last_verb_age_s) per routine",
-      "datasource": "InfluxDB",
-      "description": "Worst-case staleness of the last verbose state-change across the fleet for each search_rt routine.",
-      "gridPos": {
-        "x": 12,
-        "y": 48,
-        "w": 12,
-        "h": 7
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "alias": "$tag_routine",
-          "policy": "default",
-          "resultFormat": "time_series",
-          "orderByTime": "ASC",
-          "rawQuery": true,
-          "query": "SELECT max(\"last_verb_age_s\") FROM \"search_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
-          "tags": [],
-          "groupBy": [],
-          "select": [],
-          "measurement": ""
-        }
-      ],
-      "yaxes": [
-        {
-          "format": "s",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        },
-        {
-          "format": "short",
-          "label": null,
-          "logBase": 1,
-          "min": null,
-          "max": null,
-          "show": true
-        }
-      ],
-      "xaxis": {
-        "buckets": null,
-        "mode": "time",
-        "name": null,
-        "show": true,
-        "values": []
-      },
-      "legend": {
-        "avg": false,
-        "current": false,
-        "max": false,
-        "min": false,
-        "rightSide": true,
-        "show": true,
-        "total": false,
-        "values": false,
-        "hideEmpty": true,
-        "hideZero": false
-      },
-      "lines": true,
-      "linewidth": 1,
-      "points": false,
-      "pointradius": 2,
-      "fill": 1,
-      "stack": false,
-      "nullPointMode": "null",
-      "renderer": "flot",
-      "tooltip": {
-        "shared": true,
-        "sort": 0,
-        "value_type": "individual"
-      },
-      "thresholds": [],
-      "timeFrom": null,
-      "timeShift": null
-    },
-    {
-      "id": 17,
-      "type": "graph",
-      "title": "corr_rt service heartbeat cadence (s)",
+      "title": "corr_rt heartbeat cadence (s)",
       "datasource": "InfluxDB",
       "description": "Self-reported publish cadence; nominally 2 s.",
       "gridPos": {
         "x": 0,
-        "y": 55,
+        "y": 13,
         "w": 12,
         "h": 6
       },
@@ -1426,14 +678,14 @@
       "timeShift": null
     },
     {
-      "id": 18,
+      "id": 10,
       "type": "graph",
-      "title": "search_rt service heartbeat cadence (s)",
+      "title": "search_rt heartbeat cadence (s)",
       "datasource": "InfluxDB",
       "description": "Self-reported publish cadence; nominally 2 s.",
       "gridPos": {
         "x": 12,
-        "y": 55,
+        "y": 13,
         "w": 12,
         "h": 6
       },
@@ -1507,26 +759,39 @@
       "timeShift": null
     },
     {
-      "id": 19,
-      "type": "graph",
-      "title": "PSRDADA nfull per (cn, buffer) \u2014 fada (corr\u2192search merge)",
-      "datasource": "InfluxDB",
-      "description": "Blocks currently full in the fada ring per corr node. fada is the merge output (dada + eada \u2192 fada) consumed by corr_slow + corr_fast. Sustained near nbufs (= 70) means the search-side pipeline is backed up and dropping cubes. Healthy: 0\u20135 blocks lingering.",
+      "id": 11,
+      "type": "row",
+      "title": "C. Routine state",
+      "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 61,
+        "y": 19,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "graph",
+      "title": "corr_rt routine -- mean(alive) per routine (fleet)",
+      "datasource": "InfluxDB",
+      "description": "Fraction of 16 cn reporting each routine as alive. 1.0 means whole fleet happy.",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
         "w": 12,
         "h": 7
       },
       "targets": [
         {
           "refId": "A",
-          "alias": "cn $tag_cn_id",
+          "alias": "$tag_routine",
           "policy": "default",
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT last(\"nfull\") FROM \"corr_rt_buffer\" WHERE \"buffer\" = 'fada' AND $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
+          "query": "SELECT mean(\"alive\") FROM \"corr_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
           "tags": [],
           "groupBy": [],
           "select": [],
@@ -1536,6 +801,505 @@
       "yaxes": [
         {
           "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1.05",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 13,
+      "type": "graph",
+      "title": "corr_rt routine -- max(last_verb_age_s) per routine",
+      "datasource": "InfluxDB",
+      "description": "Worst-case staleness of last verbose state-change across fleet.",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_routine",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT max(\"last_verb_age_s\") FROM \"corr_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "s",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 14,
+      "type": "graph",
+      "title": "search_rt routine -- mean(alive) per routine",
+      "datasource": "InfluxDB",
+      "description": "Fraction of 4 search nodes reporting each routine as running.",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_routine",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"alive\") FROM \"search_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1.05",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 15,
+      "type": "graph",
+      "title": "search_rt routine -- max(last_verb_age_s) per routine",
+      "datasource": "InfluxDB",
+      "description": "Worst-case staleness across the search_rt fleet.",
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_routine",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT max(\"last_verb_age_s\") FROM \"search_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"routine\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "s",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 16,
+      "type": "graph",
+      "title": "corr_rt routines alive -- count per cn (target 8)",
+      "datasource": "InfluxDB",
+      "description": "Number of routines reporting alive per corr node. Healthy: 8.",
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT sum(\"alive\") FROM \"corr_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "8.5",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 17,
+      "type": "graph",
+      "title": "search_rt routines alive -- count per cn (target 3)",
+      "datasource": "InfluxDB",
+      "description": "Number of routines reporting alive per search node. Healthy: 3.",
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT sum(\"alive\") FROM \"search_rt_routine\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "3.5",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "D. Capture pipeline (link rate + pps)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "graph",
+      "title": "Capture rate (Gb/s) per (cn,port)",
+      "datasource": "InfluxDB",
+      "description": "Wire-rate per UDP capture port. Healthy ~9.6 Gb/s per port.",
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"rate_gbps\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "Gbits",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -1590,24 +1354,455 @@
     {
       "id": 20,
       "type": "graph",
-      "title": "PSRDADA nfull per (cn, buffer) \u2014 dada / eada (SNAP capture)",
+      "title": "Recv packet rate (pps) per (cn,port)",
       "datasource": "InfluxDB",
-      "description": "Blocks currently full in dada / eada (the per-port SNAP capture rings, 20 blocks each). Sustained > ~10 means the merge stage is falling behind the kernel-side capture. A spike to 18-19 typically precedes kernel_drops_total > 0.",
+      "description": "Per-port received packet rate from cumulative counter.",
       "gridPos": {
         "x": 12,
-        "y": 61,
+        "y": 41,
         "w": 12,
         "h": 7
       },
       "targets": [
         {
           "refId": "A",
-          "alias": "cn $tag_cn_id $tag_buffer",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
           "policy": "default",
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT last(\"nfull\") FROM \"corr_rt_buffer\" WHERE (\"buffer\" = 'dada' OR \"buffer\" = 'eada') AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"n_recv_packets\"), 1s) FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "pps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "E. Capture integrity (drops, arm state, errors)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 22,
+      "type": "graph",
+      "title": "Kernel drop rate (pps) per (cn,port) -- target 0",
+      "datasource": "InfluxDB",
+      "description": "Per-port kernel-level packet drops from /proc/net/udp via n_dropped_kernel cumulative counter. Sustained non-zero = SO_RCVBUF (512 MiB) exhausted.",
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"n_dropped_kernel\"), 1s) FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "pps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 23,
+      "type": "graph",
+      "title": "Dropped payload rate (MB/s) per (cn,port)",
+      "datasource": "InfluxDB",
+      "description": "Pre-derived combined drop rate (kernel + payload + too-late). Healthy <1 MB/s; warn >10; page >50.",
+      "gridPos": {
+        "x": 12,
+        "y": 49,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"rate_drop_mb_s\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "MBs",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 24,
+      "type": "graph",
+      "title": "Capture degraded count (per cn,port) -- stacked",
+      "datasource": "InfluxDB",
+      "description": "Publishes that came in with degraded=1. Should be flat zero in normal ops.",
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT sum(\"degraded\") FROM \"corr_rt_capture\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(0)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": true,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 25,
+      "type": "graph",
+      "title": "Capture arm_state_int (per cn,port)",
+      "datasource": "InfluxDB",
+      "description": "Integer encoding of arm_state (CTRL_RUN=2 in normal ops; 0=OFF, 1=ARMING, 3=DISARMING).",
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"arm_state_int\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "4",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 26,
+      "type": "graph",
+      "title": "Cumulative n_wrong_size + n_recv_errors (per cn,port)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative malformed UDP frames + recv errors since capture binary start. Both should be flat zero; growth = page.",
+      "gridPos": {
+        "x": 0,
+        "y": 62,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "wrong_size cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"n_wrong_size\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "recv_err cn $tag_cn_id port $tag_udp_port",
+          "query": "SELECT last(\"n_recv_errors\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
           "tags": [],
           "groupBy": [],
           "select": [],
@@ -1669,14 +1864,407 @@
       "timeShift": null
     },
     {
-      "id": 21,
+      "id": 27,
       "type": "graph",
-      "title": "PSRDADA free_blocks per (cn, buffer) \u2014 fleet view",
+      "title": "Cumulative n_seq_skipped + n_too_late (per cn,port)",
       "datasource": "InfluxDB",
-      "description": "free_blocks = nbufs - nfull (the operationally useful headroom). A buffer dropping toward 0 is the back-pressure alarm \u2014 pair with the fill-fraction summary in row 3 to tell which buffer + node is choking first.",
+      "description": "Cumulative seq-no gaps and after-block-close arrivals. Small slow growth normal; sudden jumps = wire congestion.",
+      "gridPos": {
+        "x": 12,
+        "y": 62,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "seq_skip cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"n_seq_skipped\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "too_late cn $tag_cn_id port $tag_udp_port",
+          "query": "SELECT last(\"n_too_late\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "F. Cube cadence (block writes + specnum tracking)",
+      "collapsed": false,
       "gridPos": {
         "x": 0,
         "y": 68,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 29,
+      "type": "graph",
+      "title": "Block-write rate (blocks/s) per (cn,port) -- target ~7.45 Hz",
+      "datasource": "InfluxDB",
+      "description": "Cumulative-derivative block-write rate per port. Production cadence 7.45 Hz; sustained <7.0 = back-pressure.",
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"n_block_writes\"), 1s) FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [
+        {
+          "value": 7.0,
+          "colorMode": "critical",
+          "fill": false,
+          "line": true,
+          "op": "lt"
+        },
+        {
+          "value": 7.45,
+          "colorMode": "ok",
+          "fill": false,
+          "line": true,
+          "op": "gt"
+        }
+      ],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 30,
+      "type": "graph",
+      "title": "Fleet specnum spread -- max-min(last_seq_no)",
+      "datasource": "InfluxDB",
+      "description": "Per-bucket max-min of last_seq_no across the 32 capture instances. Healthy in steady state <~30; >300 means one node is far behind.",
+      "gridPos": {
+        "x": 12,
+        "y": 69,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "fleet (max-min) specnum spread",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT max(\"last_seq_no\") - min(\"last_seq_no\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 31,
+      "type": "row",
+      "title": "G. PSRDADA buffer health",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 76,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 32,
+      "type": "text",
+      "title": "",
+      "datasource": null,
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 24,
+        "h": 6
+      },
+      "mode": "markdown",
+      "content": "**Status: panels below depend on the `corr_rt_buffer` measurement, which is currently empty across the fleet.** Cause: corr nodes are running an old `dsart_rt.py` (pre-M7.4 Phase 7) whose `_dada_dbmetric` only tries `dada_dbmetric` on PATH (systemd-unit PATH does not include `/usr/local/bin`) and only reads stdout (the on-cluster `/usr/local/bin/dada_dbmetric` writes to **stderr**). The orchestrator therefore publishes `buffers.<k>.metric = {}` for every ring, and `pusher.make_buffer_points` correctly drops empty payloads.\n\nFix (deploy + restart corr fleet, ~30 s downtime):\n1. dsa_monitor Control tab \u2192 **update_dsart**: dry-run preview, then apply (force=true if any corr node has dirty `/home/ubuntu/proj/dsa110-rt`).\n2. dsa_monitor Control tab \u2192 **stop fleet** (corr_too=true) then **start fleet**. This is the only way to load the new `_dada_dbmetric` into the running corr_rt orchestrators.\n3. Within ~2 s the pusher will start emitting `corr_rt_buffer` rows and these panels populate automatically (no dashboard edit needed).\n\nReference: M7.6-MONITOR-POINTS.md \u00a72.3; commit `c758672` (\"M7.4 Phase 7: fix dada_dbmetric stderr parsing\").",
+      "links": []
+    },
+    {
+      "id": 33,
+      "type": "graph",
+      "title": "PSRDADA fill fraction -- fleet mean per buffer (nfull/nbufs)",
+      "datasource": "InfluxDB",
+      "description": "Fraction of ring currently holding unread data, averaged across 16 corr nodes per buffer (dada, eada, fada, bada). Sustained >0.85 = consumer falling behind.",
+      "gridPos": {
+        "x": 0,
+        "y": 83,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"nfull\") / mean(\"nbufs\") FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percentunit",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 34,
+      "type": "graph",
+      "title": "PSRDADA free_blocks per (cn, buffer)",
+      "datasource": "InfluxDB",
+      "description": "free_blocks = nbufs - nfull. Dropping toward 0 = back-pressure alarm.",
+      "gridPos": {
+        "x": 12,
+        "y": 83,
         "w": 12,
         "h": 7
       },
@@ -1750,26 +2338,26 @@
       "timeShift": null
     },
     {
-      "id": 22,
+      "id": 35,
       "type": "graph",
-      "title": "PSRDADA n_written rate (blocks/s) per (cn, buffer)",
+      "title": "PSRDADA nfull per cn -- fada (corr->search merge)",
       "datasource": "InfluxDB",
-      "description": "Throughput rate of each ring (blocks/s). At the M7.4 production op-point dada/eada should run at ~9.6 blocks/s (one block per 4 specnums \u00d7 4096 native samples) and fada at ~7.45 blocks/s. A drop in fada below 7 cubes/s is the search-side gate alarm.",
+      "description": "fada blocks currently full per corr node. Sustained near nbufs (=70) means search-side pipeline is backed up.",
       "gridPos": {
-        "x": 12,
-        "y": 68,
+        "x": 0,
+        "y": 90,
         "w": 12,
         "h": 7
       },
       "targets": [
         {
           "refId": "A",
-          "alias": "cn $tag_cn_id $tag_buffer",
+          "alias": "cn $tag_cn_id",
           "policy": "default",
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT non_negative_derivative(last(\"n_written\"), 1s) FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "query": "SELECT last(\"nfull\") FROM \"corr_rt_buffer\" WHERE \"buffer\" = 'fada' AND $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
           "tags": [],
           "groupBy": [],
           "select": [],
@@ -1807,6 +2395,3616 @@
         "max": false,
         "min": false,
         "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 36,
+      "type": "graph",
+      "title": "PSRDADA nfull per cn -- dada / eada (SNAP capture)",
+      "datasource": "InfluxDB",
+      "description": "Per-port SNAP capture rings (20 blocks each). >10 = merge stage falling behind.",
+      "gridPos": {
+        "x": 12,
+        "y": 90,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id $tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"nfull\") FROM \"corr_rt_buffer\" WHERE (\"buffer\" = 'dada' OR \"buffer\" = 'eada') AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 37,
+      "type": "graph",
+      "title": "PSRDADA n_written rate (blocks/s) per (cn, buffer)",
+      "datasource": "InfluxDB",
+      "description": "dada/eada nominal ~9.6 blocks/s, fada/bada ~7.45 blocks/s. fada below 7 = search-side gate alarm.",
+      "gridPos": {
+        "x": 0,
+        "y": 97,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id $tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"n_written\"), 1s) FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 38,
+      "type": "graph",
+      "title": "PSRDADA n_read rate (blocks/s) per (cn, buffer)",
+      "datasource": "InfluxDB",
+      "description": "Block-read rate (consumer side). Steady-state should match n_written; persistent gap means reader is slower than writer.",
+      "gridPos": {
+        "x": 12,
+        "y": 97,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id $tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"n_read\"), 1s) FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 39,
+      "type": "row",
+      "title": "H. RFI flagger summary",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 104,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 40,
+      "type": "graph",
+      "title": "RFI total_flag_fraction -- fleet mean per pol",
+      "datasource": "InfluxDB",
+      "description": "Mean fraction of (chan, time) cells flagged in the RFI rollup, averaged across the 16 cn.",
+      "gridPos": {
+        "x": 0,
+        "y": 105,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_pol",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"total_flag_fraction\") FROM \"corr_rt_rfi\" WHERE $timeFilter GROUP BY time($__interval), \"pol\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percentunit",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 41,
+      "type": "graph",
+      "title": "RFI total_flag_fraction per cn (pol=both)",
+      "datasource": "InfluxDB",
+      "description": "Same metric broken out per cn (combined-pol view), to spot nodes seeing much more RFI than the fleet.",
+      "gridPos": {
+        "x": 12,
+        "y": 105,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"total_flag_fraction\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percentunit",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 42,
+      "type": "graph",
+      "title": "RFI bandpass_channel_fraction -- fleet mean (per pol)",
+      "datasource": "InfluxDB",
+      "description": "Fraction of channels flagged by the bandpass-outlier detector. Multiply by 96 for per-cn channel count after 4x freq-downsample.",
+      "gridPos": {
+        "x": 0,
+        "y": 112,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_pol",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"bandpass_channel_fraction\") FROM \"corr_rt_rfi\" WHERE $timeFilter GROUP BY time($__interval), \"pol\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percentunit",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 43,
+      "type": "graph",
+      "title": "RFI ant_fraction_flagged -- fleet mean (per pol)",
+      "datasource": "InfluxDB",
+      "description": "Fraction of antennas classified as whole-antenna-bad. Multiply by 96 for per-cn count.",
+      "gridPos": {
+        "x": 12,
+        "y": 112,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "$tag_pol",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"ant_fraction_flagged\") FROM \"corr_rt_rfi\" WHERE $timeFilter GROUP BY time($__interval), \"pol\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percentunit",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 44,
+      "type": "graph",
+      "title": "RFI per-detector breakdown -- fleet mean (pol=both)",
+      "datasource": "InfluxDB",
+      "description": "Per-detector flag fractions overlaid. Detectors are non-exclusive; total_flag_fraction is the OR (<= sum).",
+      "gridPos": {
+        "x": 0,
+        "y": 118,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "frac_sk",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"frac_sk\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "frac_bp",
+          "query": "SELECT mean(\"frac_bp\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "C",
+          "alias": "frac_grp",
+          "query": "SELECT mean(\"frac_grp\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "D",
+          "alias": "frac_sumthr",
+          "query": "SELECT mean(\"frac_sumthr\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "E",
+          "alias": "frac_fa",
+          "query": "SELECT mean(\"frac_fa\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percentunit",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 45,
+      "type": "graph",
+      "title": "RFI publish age (s) -- per cn (pol=both)",
+      "datasource": "InfluxDB",
+      "description": "age_s = publish_unix - time_unix. Healthy <=~2.2 s. Spikes mean rfi_monitor_export is behind the corr_fast shm producer.",
+      "gridPos": {
+        "x": 12,
+        "y": 118,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"age_s\") FROM \"corr_rt_rfi\" WHERE \"pol\" = 'both' AND $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "s",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 46,
+      "type": "row",
+      "title": "I. C1 batch receiver (C2 ingress on h23)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 125,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 47,
+      "type": "singlestat",
+      "title": "C1 batch receiver -- connections_open",
+      "datasource": "InfluxDB",
+      "description": "TCP connections to C2 batch receiver. Expected = 1 per search-compute half = 8 in phase-B.",
+      "gridPos": {
+        "x": 0,
+        "y": 126,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"connections_open\") FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "7,8",
+      "colors": [
+        "#d44a3a",
+        "rgba(237, 129, 40, 0.89)",
+        "#299c46"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 48,
+      "type": "singlestat",
+      "title": "C1 batches OK (cumulative; includes heartbeats)",
+      "datasource": "InfluxDB",
+      "description": "All well-formed C1 batches decoded since C2 start, INCLUDING `n_candidates=0` heartbeats. Restart resets. In a quiet sky almost every batch is a heartbeat -- see Section J for the heartbeat vs candidate split.",
+      "gridPos": {
+        "x": 6,
+        "y": 126,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"batches_ok\") FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 49,
+      "type": "singlestat",
+      "title": "C1 batches malformed (bad_schema + torn + bad_batch)",
+      "datasource": "InfluxDB",
+      "description": "Should be 0 in steady state. Growth = producer-side schema bug or socket corruption.",
+      "gridPos": {
+        "x": 12,
+        "y": 126,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"bad_schema\") + last(\"torn_batch\") + last(\"bad_batch\") FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "1,5",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 50,
+      "type": "singlestat",
+      "title": "C1 bytes received (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative bytes pulled off the C1 sockets since C2 service start.",
+      "gridPos": {
+        "x": 18,
+        "y": 126,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"bytes_read\") FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "bytes",
+      "valueName": "current",
+      "decimals": 2,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 51,
+      "type": "graph",
+      "title": "C1 batch rate (batches/s) into C2",
+      "datasource": "InfluxDB",
+      "description": "Rate of well-formed C1 batches into C2. Matches search-side detector cadence in normal ops.",
+      "gridPos": {
+        "x": 0,
+        "y": 130,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "batches/s",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"batches_ok\"), 1s) FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 52,
+      "type": "graph",
+      "title": "C1 batch RX bandwidth (B/s)",
+      "datasource": "InfluxDB",
+      "description": "Aggregate TCP bandwidth into C2's batch receiver. Modest -- each C1 batch is a few hundred cand rows + header.",
+      "gridPos": {
+        "x": 12,
+        "y": 130,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "bytes/s",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"bytes_read\"), 1s) FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "Bps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 53,
+      "type": "row",
+      "title": "J. C1 -> C2 candidate flow",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 136,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 54,
+      "type": "text",
+      "title": "",
+      "datasource": null,
+      "gridPos": {
+        "x": 0,
+        "y": 137,
+        "w": 24,
+        "h": 3
+      },
+      "mode": "markdown",
+      "content": "**Read this if `rows_in/s = 0` while `batches_ok/s > 0`:** C2's `_on_batch` short-circuits on `n_candidates == 0` (empty heartbeat batches) and does NOT increment `rows_in`. Search nodes send a heartbeat every cube whether or not a cluster fires, so in a quiet sky almost every batch is a heartbeat. The overlay below puts `batches_ok/s` on top of `rows_in/s`: a flat gap between the two means \"pipeline up, no candidates this window\" (good). A `batches_ok/s` that ALSO collapses to 0 means \"no search-side production\" (check Row I connections_open, then n01 c1_emit queue).",
+      "links": []
+    },
+    {
+      "id": 55,
+      "type": "graph",
+      "title": "C1 -> C2 flow -- batches_ok/s vs rows_in/s (heartbeat vs candidate)",
+      "datasource": "InfluxDB",
+      "description": "batches_ok counts EVERY decoded C1 batch (incl. n_candidates=0 heartbeats). rows_in counts only candidate rows landed in the graph. A wide gap is normal in a quiet sky; convergence means a candidate-bearing window is in progress.",
+      "gridPos": {
+        "x": 0,
+        "y": 140,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "batches_ok/s (heartbeats + candidates)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"batches_ok\"), 1s) FROM \"c2_receiver\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "rows_in/s (candidate rows only)",
+          "query": "SELECT non_negative_derivative(last(\"rows_in\"), 1s) FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 56,
+      "type": "graph",
+      "title": "C2 components evaluated -- rate (components/s)",
+      "datasource": "InfluxDB",
+      "description": "Rate at which C2 evaluates connected components in the cross-node coincidence graph. Each = candidate trigger tested against criteria. Flat 0 in a quiet sky is expected.",
+      "gridPos": {
+        "x": 12,
+        "y": 140,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "components_evaluated/s",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"components_evaluated\"), 1s) FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 57,
+      "type": "graph",
+      "title": "C1 rows arriving at C2 -- rate (rows/s, candidate-only)",
+      "datasource": "InfluxDB",
+      "description": "Rate of candidate rows (non-heartbeat) ingested by C2. Zero is the normal quiet-sky value -- compare with batches_ok/s in the overlay above.",
+      "gridPos": {
+        "x": 0,
+        "y": 147,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "rows_in/s",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"rows_in\"), 1s) FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 58,
+      "type": "graph",
+      "title": "C2 rows_late_drop -- cumulative",
+      "datasource": "InfluxDB",
+      "description": "Cumulative C1 rows dropped because they arrived after their batch window closed. Should stay flat at 0.",
+      "gridPos": {
+        "x": 12,
+        "y": 147,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "rows_late_drop",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"rows_late_drop\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 59,
+      "type": "row",
+      "title": "K. C2 trigger pipeline",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 153,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 60,
+      "type": "graph",
+      "title": "C2 triggers -- cumulative by class",
+      "datasource": "InfluxDB",
+      "description": "Cumulative C2 triggers by outcome: dump (issued cube-dump UDP), log_only (recorded but no dump), suppressed (dedupe / gate).",
+      "gridPos": {
+        "x": 0,
+        "y": 154,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "triggers_dump",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"triggers_dump\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "triggers_log_only",
+          "query": "SELECT last(\"triggers_log_only\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "C",
+          "alias": "triggers_suppressed",
+          "query": "SELECT last(\"triggers_suppressed\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 61,
+      "type": "graph",
+      "title": "C2 trigger rate -- per hour, by class",
+      "datasource": "InfluxDB",
+      "description": "Per-hour trigger rate. Useful for spotting RFI storms.",
+      "gridPos": {
+        "x": 12,
+        "y": 154,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "triggers_dump /hr",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"triggers_dump\"), 1h) FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "triggers_log_only /hr",
+          "query": "SELECT non_negative_derivative(last(\"triggers_log_only\"), 1h) FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "C",
+          "alias": "triggers_suppressed /hr",
+          "query": "SELECT non_negative_derivative(last(\"triggers_suppressed\"), 1h) FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 62,
+      "type": "graph",
+      "title": "C2 broadcast results -- cumulative",
+      "datasource": "InfluxDB",
+      "description": "Cumulative UDP broadcasts of C2 triggers to cube_dump subscribers. broadcast_send_fail growth = corr not receiving dump cmds.",
+      "gridPos": {
+        "x": 0,
+        "y": 161,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "broadcast_send_ok",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"broadcast_send_ok\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "broadcast_send_fail",
+          "query": "SELECT last(\"broadcast_send_fail\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 63,
+      "type": "graph",
+      "title": "C2 plot pipeline (pending + dispatched)",
+      "datasource": "InfluxDB",
+      "description": "pending_plots = post-trigger plot worker queue. Drops back to 0 within tens of seconds; climbing = plotter saturated.",
+      "gridPos": {
+        "x": 12,
+        "y": 161,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "pending_plots (gauge)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"pending_plots\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "plots_dispatched (cumulative)",
+          "query": "SELECT last(\"plots_dispatched\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 64,
+      "type": "row",
+      "title": "L. Last C2 trigger",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 167,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 65,
+      "type": "singlestat",
+      "title": "Last trigger -- event name",
+      "datasource": "InfluxDB",
+      "description": "Most recent C2 event name (canonical TNS-style identifier). Long stretches with no update = quiet sky.",
+      "gridPos": {
+        "x": 0,
+        "y": 168,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"last_event_name\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 24h",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "none",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "-",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 66,
+      "type": "singlestat",
+      "title": "Last trigger -- class",
+      "datasource": "InfluxDB",
+      "description": "Most recent C2 trigger class (dump / log_only / suppressed).",
+      "gridPos": {
+        "x": 8,
+        "y": 168,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"last_trigger_class\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 24h",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "none",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "-",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 67,
+      "type": "singlestat",
+      "title": "Last trigger -- MJD",
+      "datasource": "InfluxDB",
+      "description": "MJD of the most recent C2 trigger. Match against wall-clock to gauge staleness.",
+      "gridPos": {
+        "x": 16,
+        "y": 168,
+        "w": 8,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"last_event_mjd\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 24h",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "none",
+      "valueName": "current",
+      "decimals": 6,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 68,
+      "type": "row",
+      "title": "M. C2 housekeeping",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 172,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 69,
+      "type": "singlestat",
+      "title": "C2 dumps gate enabled",
+      "datasource": "InfluxDB",
+      "description": "Operator gate at /cnf/c2/dumps_enabled. When off, C2 still evaluates components but skips broadcasting cube_dump verbs.",
+      "gridPos": {
+        "x": 0,
+        "y": 173,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"dumps_enabled\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "0.5,1",
+      "colors": [
+        "#d44a3a",
+        "rgba(237, 129, 40, 0.89)",
+        "#299c46"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "OFF",
+          "value": "0"
+        },
+        {
+          "op": "=",
+          "text": "ON",
+          "value": "1"
+        },
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 70,
+      "type": "singlestat",
+      "title": "C2 dumps gate read fails (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative errors reading the gate from etcd. Should stay 0.",
+      "gridPos": {
+        "x": 4,
+        "y": 173,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"dumps_gate_fails\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "1,10",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 71,
+      "type": "singlestat",
+      "title": "C2 uptime (s)",
+      "datasource": "InfluxDB",
+      "description": "Seconds since the coincidencer service entered run().",
+      "gridPos": {
+        "x": 8,
+        "y": 173,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"uptime_s\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "s",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": false,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 72,
+      "type": "singlestat",
+      "title": "Galactic-DM (max LoS, pc cm^-3)",
+      "datasource": "InfluxDB",
+      "description": "Latest line-of-sight Galactic DM cached by C2 from /mon/array/gal_dm (written by declination.service).",
+      "gridPos": {
+        "x": 12,
+        "y": 173,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"gal_dm_max_los_pc_cc\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "none",
+      "valueName": "current",
+      "decimals": 1,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 73,
+      "type": "singlestat",
+      "title": "Gal-DM poll fails (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative failures fetching /mon/array/gal_dm. Growth = dm_galactic_fraction discriminant falls back to nan.",
+      "gridPos": {
+        "x": 16,
+        "y": 173,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"gal_dm_polls_fail\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "1,10",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 74,
+      "type": "singlestat",
+      "title": "CSV rotations (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative C1/C2 cand-CSV rotations (hourly roll).",
+      "gridPos": {
+        "x": 20,
+        "y": 173,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"csv_rotations\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 75,
+      "type": "graph",
+      "title": "C2 service queues -- window_size + graph_size + pending_plots",
+      "datasource": "InfluxDB",
+      "description": "Three internal queue depths overlaid. All should be modest; sustained climb = saturation.",
+      "gridPos": {
+        "x": 0,
+        "y": 177,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "window_size",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"window_size\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "graph_size",
+          "query": "SELECT last(\"graph_size\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "C",
+          "alias": "pending_plots",
+          "query": "SELECT last(\"pending_plots\") FROM \"c2_service\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 76,
+      "type": "row",
+      "title": "N. Voltage-injection match (M7.4 Phase 6c)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 183,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 77,
+      "type": "singlestat",
+      "title": "Active injections",
+      "datasource": "InfluxDB",
+      "description": "Currently-armed voltage injections in /cnf/inject/active/. 0 in quiet ops.",
+      "gridPos": {
+        "x": 0,
+        "y": 184,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"active_count\") FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 78,
+      "type": "singlestat",
+      "title": "Matches (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative C2 rows matched against active injections (DM and l/m within tolerance).",
+      "gridPos": {
+        "x": 6,
+        "y": 184,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"matches\") FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 79,
+      "type": "singlestat",
+      "title": "Best-improved (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative matches that bested the previous best-SNR record for their injection.",
+      "gridPos": {
+        "x": 12,
+        "y": 184,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"best_improved\") FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": false,
+      "colorBackground": false,
+      "thresholds": "",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 80,
+      "type": "singlestat",
+      "title": "Publish failures",
+      "datasource": "InfluxDB",
+      "description": "Cumulative failures publishing /mon/dsart/inject/matches/* to etcd. Should stay 0.",
+      "gridPos": {
+        "x": 18,
+        "y": 184,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"publish_fail\") FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND time > now() - 30s",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "format": "short",
+      "valueName": "current",
+      "decimals": 0,
+      "sparkline": {
+        "fillColor": "rgba(31, 118, 189, 0.18)",
+        "full": false,
+        "lineColor": "rgb(31, 120, 193)",
+        "show": true,
+        "ymin": null,
+        "ymax": null
+      },
+      "colorValue": true,
+      "colorBackground": false,
+      "thresholds": "1,5",
+      "colors": [
+        "#299c46",
+        "rgba(237, 129, 40, 0.89)",
+        "#d44a3a"
+      ],
+      "valueFontSize": "100%",
+      "prefixFontSize": "50%",
+      "postfixFontSize": "50%",
+      "prefix": "",
+      "postfix": "",
+      "nullText": null,
+      "nullPointMode": "connected",
+      "valueMaps": [
+        {
+          "op": "=",
+          "text": "N/A",
+          "value": "null"
+        }
+      ],
+      "mappingType": 1,
+      "mappingTypes": [
+        {
+          "name": "value to text",
+          "value": 1
+        },
+        {
+          "name": "range to text",
+          "value": 2
+        }
+      ],
+      "rangeMaps": [
+        {
+          "from": "null",
+          "to": "null",
+          "text": "N/A"
+        }
+      ],
+      "gauge": {
+        "maxValue": 100,
+        "minValue": 0,
+        "show": false,
+        "thresholdLabels": false,
+        "thresholdMarkers": true
+      },
+      "tableColumn": "",
+      "timeFrom": null,
+      "timeShift": null,
+      "links": []
+    },
+    {
+      "id": 81,
+      "type": "graph",
+      "title": "Inject-match -- rows_checked rate (rows/s)",
+      "datasource": "InfluxDB",
+      "description": "Rate of C2 rows passed through the inject-matcher. Mirrors rows_in/s when an injection is active.",
+      "gridPos": {
+        "x": 0,
+        "y": 188,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "rows_checked/s",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"rows_checked\"), 1s) FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "cps",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 82,
+      "type": "graph",
+      "title": "Inject-match -- evictions (cumulative)",
+      "datasource": "InfluxDB",
+      "description": "Cumulative TTL evictions vs failed eviction attempts. Healthy: evict_fail flat at 0.",
+      "gridPos": {
+        "x": 12,
+        "y": 188,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "evicted_expired",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"evicted_expired\") FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        },
+        {
+          "refId": "B",
+          "alias": "evict_fail",
+          "query": "SELECT last(\"evict_fail\") FROM \"c2_inject_match\" WHERE \"host\" = 'h23' AND $timeFilter GROUP BY time($__interval) fill(null)",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": false,
         "show": true,
         "total": false,
         "values": false,
