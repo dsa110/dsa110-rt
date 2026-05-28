@@ -151,6 +151,75 @@
     </div>
 </div>
 
+<!-- M7.4 Phase 8 v2: fleet services status panel -->
+<div class="panel" style="margin-top: 24px;" id="panel-services">
+    <h3>Fleet services</h3>
+    <p class="muted">
+        Live status of every systemd unit + <code>dsart_rt</code>
+        orchestrator process across the fleet. Refreshes automatically
+        every 10 s; click <a href="#panel-services" id="refresh-services">refresh now</a>
+        to force a re-poll. <code>lxd110h20</code> services
+        (grafana / influxdb / telegraf) are read-only — they appear
+        in this table but are NEVER touched by the "Restart all"
+        button below.
+    </p>
+    <div class="muted" id="services-summary">loading…</div>
+    <table class="audit-table" id="services-table">
+        <thead>
+            <tr>
+                <th>tier</th>
+                <th>host</th>
+                <th>service</th>
+                <th>kind</th>
+                <th>state</th>
+                <th>age (s)</th>
+                <th>err</th>
+            </tr>
+        </thead>
+        <tbody id="services-tbody">
+            <tr><td colspan="7" class="muted">loading…</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<!-- M7.4 Phase 8 v2: fleet restart panel -->
+<div class="panel" style="margin-top: 24px;" id="panel-restart-all">
+    <h3>Fleet restart (cold recovery from stop)</h3>
+    <p class="muted">
+        Runs the full "broadcast stop → pkill dsart → wipe PSRDADA +
+        shm → restart local systemd units → restart hiplot in LXC →
+        re-spawn dsart_rt → defer self-restart of dsa_monitor" sequence.
+        <strong>Excludes <code>lxd110h20</code> entirely</strong>
+        (grafana / influxdb / telegraf are never touched). The
+        operator must press <em>start</em> + <em>utc_start</em> from
+        the verb panel above once the orchestrators are back online —
+        this button only puts <code>dsart_rt</code> back on the etcd
+        watch line.
+    </p>
+    <form id="form-restart-all" onsubmit="return submitRestartAll(event);">
+        <div class="verb-row">
+            <label for="restart_confirm">type "restart_all"</label>
+            <input type="text" id="restart_confirm" name="confirm"
+                   placeholder="restart_all" autocomplete="off" />
+            <label for="restart_dry_run" style="min-width:auto;margin-left:16px;">
+                <input type="checkbox" id="restart_dry_run" name="dry_run" value="true" />
+                dry run
+            </label>
+            <button type="submit" class="danger">
+                Restart everything (except lxd110h20)
+            </button>
+        </div>
+        <div class="muted">
+            Audited to <code>/mon/audit/control/&lt;iso_ts&gt;</code> as
+            <code>cmd=restart_all</code> with per-host pass/fail.
+            The dashboard process will be killed by the deferred
+            self-restart ~2 s after step 6 completes; the page will
+            need a manual reload after that.
+        </div>
+        <div id="resp-restart-all" class="response"></div>
+    </form>
+</div>
+
 <!-- M7.4 Phase 6: signal injection panel -->
 <div class="panel" style="margin-top: 24px;">
     <h3>Signal injection (M7.4 Phase 6)</h3>
@@ -250,6 +319,62 @@
     </form>
 </div>
 
+<!-- M7.4 Phase 6c+: update dsa110-rt on every corr + search node -->
+<div class="panel" style="margin-top: 24px;" id="panel-update-dsart">
+    <h3>Update dsa110-rt on corr + search nodes</h3>
+    <p class="muted">
+        Fetches origin and fast-forwards each corr / search node's
+        <code>/home/ubuntu/proj/dsa110-rt</code> checkout to match
+        <code>h23</code>. Use this between sessions to keep the
+        deployed code in sync with the workspace.
+        <br>
+        <strong>Dirty worktrees abort that host</strong> (the
+        deploy-skew safety from Bug 0 of M7.4_PHASE6_E2E_REPORT.md).
+        Tick <em>force</em> to override the abort AND use
+        <code>git reset --hard origin/&lt;branch&gt;</code> instead
+        of <code>git pull --ff-only</code> — this will discard any
+        local edits on the node.
+    </p>
+    <form id="form-update-dsart">
+        <div class="verb-row">
+            <label for="update_branch">branch</label>
+            <input type="text" id="update_branch" name="branch"
+                   placeholder="(blank → per-host current branch)"
+                   autocomplete="off" />
+        </div>
+        <div class="verb-row">
+            <label for="update_force" style="min-width:auto;">
+                <input type="checkbox" id="update_force" name="force" value="true" />
+                force (git reset --hard, discards local edits)
+            </label>
+        </div>
+        <div class="verb-row">
+            <label for="update_confirm">type "update_dsart"</label>
+            <input type="text" id="update_confirm" name="confirm"
+                   placeholder="update_dsart" autocomplete="off" />
+        </div>
+        <div class="verb-row">
+            <button type="button"
+                    onclick="submitUpdateDsart(event, true);">
+                Dry run (preview)
+            </button>
+            <button type="button" class="danger"
+                    onclick="submitUpdateDsart(event, false);">
+                Apply update
+            </button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/&lt;iso_ts&gt;</code> as
+            <code>cmd=update_dsart</code> with per-host pass / fail.
+            Apply requires the literal text
+            <code>update_dsart</code> in the confirm box; dry run
+            does not (it never pulls / resets).
+        </div>
+        <div id="resp-update-dsart" class="response"></div>
+    </form>
+</div>
+
 <!-- BOTTOM: audit log -->
 <div class="panel" style="margin-top: 24px;">
     <h3>Recent actions ({{ recent_audit|length }})</h3>
@@ -316,6 +441,219 @@ async function submitVerb(ev, url, respId) {
     btn.disabled = false;
     // Refresh the audit table so the operator sees their action.
     setTimeout(() => location.reload(), 1500);
+    return false;
+}
+
+// ---- M7.4 Phase 8 v2: services-status auto-refresh ---------------------
+function stateClass(state) {
+    if (state === "active") return "ok";
+    if (state === "failed") return "err";
+    if (state === "unreachable") return "stat";
+    return "muted";
+}
+function stateColor(state) {
+    if (state === "active") return "#2ecc71";
+    if (state === "failed") return "#e74c3c";
+    if (state === "inactive") return "#7f8c8d";
+    if (state === "unreachable") return "#e67e22";
+    return "#bdc3c7";
+}
+async function refreshServicesStatus() {
+    const tbody = document.getElementById("services-tbody");
+    const summary = document.getElementById("services-summary");
+    let r, j;
+    try {
+        r = await fetch("/control/services_status", {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        summary.textContent = "fetch error: " + e;
+        return;
+    }
+    if (!j || !j.rows) {
+        summary.textContent = "bad response: " + JSON.stringify(j);
+        return;
+    }
+    summary.innerHTML =
+        "polled " + j.rows.length + " | " +
+        "<span style='color:" + stateColor("active") + "'>active=" + j.n_active + "</span> " +
+        "<span style='color:" + stateColor("inactive") + "'>inactive=" + j.n_inactive + "</span> " +
+        "<span style='color:" + stateColor("failed") + "'>failed=" + j.n_failed + "</span> " +
+        "<span style='color:" + stateColor("unreachable") + "'>unreachable=" + j.n_unreachable + "</span> " +
+        "unknown=" + j.n_unknown +
+        " | h20 excluded: " + (j.h20_hostnames_excluded || []).join(", ");
+    const rows = j.rows.map(function (r) {
+        const age = (r.age_s === null || r.age_s === undefined) ? "n/a" : Math.round(r.age_s);
+        const color = stateColor(r.state);
+        const err = (r.err || "").replace(/</g, "&lt;").slice(0, 80);
+        return "<tr>" +
+            "<td>" + r.tier + "</td>" +
+            "<td>" + r.host + "</td>" +
+            "<td><code>" + r.service + "</code></td>" +
+            "<td>" + r.kind + "</td>" +
+            "<td style='color:" + color + ";font-weight:600'>" + r.state + "</td>" +
+            "<td>" + age + "</td>" +
+            "<td class='muted'>" + err + "</td>" +
+            "</tr>";
+    }).join("");
+    tbody.innerHTML = rows || "<tr><td colspan='7' class='muted'>no rows</td></tr>";
+}
+document.addEventListener("DOMContentLoaded", function () {
+    refreshServicesStatus();
+    setInterval(refreshServicesStatus, 10000);
+    const link = document.getElementById("refresh-services");
+    if (link) {
+        link.addEventListener("click", function (ev) {
+            ev.preventDefault();
+            refreshServicesStatus();
+        });
+    }
+});
+
+// ---- M7.4 Phase 8 v2: restart-all submit + polling ---------------------
+async function submitRestartAll(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-restart-all");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>kicking off fleet restart…</span>";
+    const fd = new FormData(form);
+    let r, j;
+    try {
+        r = await fetch("/control/restart_all", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    if (!j.ok) {
+        respEl.innerHTML =
+            "<span class='err'>FAIL</span>" +
+            "<div class='info-blob'>" +
+            JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+        btn.disabled = false;
+        return false;
+    }
+    const pollUrl = j.poll_url;
+    respEl.innerHTML =
+        "<span class='ok'>job " + j.job_id + " accepted</span>" +
+        "<div class='info-blob' id='restart-poll-blob'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    let attempts = 0;
+    const poll = async function () {
+        attempts += 1;
+        let p, q;
+        try {
+            p = await fetch(pollUrl, {cache: "no-store"});
+            q = await p.json();
+        } catch (e) {
+            // The dashboard process is being restarted by step 7
+            // (deferred self-restart). Bail out gracefully.
+            document.getElementById("restart-poll-blob").innerHTML +=
+                "\n[poll #" + attempts + "] dashboard restart in progress (fetch failed). Reload manually.";
+            btn.disabled = false;
+            return;
+        }
+        const blob = document.getElementById("restart-poll-blob");
+        blob.textContent = JSON.stringify(q, null, 2);
+        if (q.done) {
+            btn.disabled = false;
+            return;
+        }
+        if (attempts < 60) {
+            setTimeout(poll, 2000);
+        } else {
+            blob.textContent += "\n[gave up polling after 60 attempts]";
+            btn.disabled = false;
+        }
+    };
+    setTimeout(poll, 1500);
+    return false;
+}
+
+// ---- M7.4 Phase 6c+: update dsa110-rt fan-out --------------------------
+async function submitUpdateDsart(ev, dryRun) {
+    ev.preventDefault();
+    const form = document.getElementById("form-update-dsart");
+    const respEl = document.getElementById("resp-update-dsart");
+    const btns = form.querySelectorAll("button");
+    btns.forEach(function (b) { b.disabled = true; });
+    const label = dryRun ? "dry run" : "apply update";
+    respEl.innerHTML = "<span class='muted'>" + label + " in progress (parallel ssh to 20 hosts)…</span>";
+
+    const fd = new FormData(form);
+    fd.set("dry_run", dryRun ? "true" : "false");
+    if (!fd.has("force")) { fd.set("force", "false"); }
+    let r, j;
+    try {
+        r = await fetch("/control/update_dsart", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btns.forEach(function (b) { b.disabled = false; });
+        return false;
+    }
+    if (!j) {
+        respEl.innerHTML = "<span class='err'>empty response</span>";
+        btns.forEach(function (b) { b.disabled = false; });
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    const status = j.ok ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j.error) {
+        html += "<div class='info-blob'>" +
+            String(j.error).replace(/</g, "&lt;") + "</div>";
+    }
+    if (j.summary) {
+        const s = j.summary;
+        html += "<div class='muted'>" +
+            "n_hosts=" + s.n_hosts + " | " +
+            "<span class='ok'>n_ok=" + s.n_ok + "</span> | " +
+            "<span class='err'>n_failed=" + s.n_failed + "</span> | " +
+            "n_dirty=" + s.n_dirty + " | " +
+            "n_changed=" + s.n_changed + " | " +
+            "dry_run=" + s.dry_run + " | " +
+            "force=" + s.force + " | " +
+            "branch=" + (s.branch || "per-host") +
+            "</div>";
+    }
+    if (Array.isArray(j.hosts) && j.hosts.length > 0) {
+        let rows = "";
+        j.hosts.forEach(function (h) {
+            const okCls = h.ok ? "ok" : "err";
+            const preShort = (h.pre_sha || "").slice(0, 10);
+            const postShort = (h.post_sha || "").slice(0, 10);
+            const changedTxt = h.changed ? "<span class='ok'>yes</span>" : "no";
+            const dirtyTxt = (h.dirty_files && h.dirty_files.length > 0)
+                ? "<span class='err'>" + h.dirty_files.length + ": " +
+                  h.dirty_files.join(", ").replace(/</g, "&lt;").slice(0, 80) +
+                  "</span>"
+                : "-";
+            const errTxt = h.error
+                ? "<span class='err'>" + String(h.error).replace(/</g, "&lt;").slice(0, 120) + "</span>"
+                : "-";
+            rows += "<tr>" +
+                "<td>" + h.host + "</td>" +
+                "<td class='" + okCls + "'>" + (h.ok ? "OK" : "FAIL") + "</td>" +
+                "<td>" + (h.branch || "-") + "</td>" +
+                "<td><code>" + preShort + "</code></td>" +
+                "<td><code>" + postShort + "</code></td>" +
+                "<td>" + changedTxt + "</td>" +
+                "<td>" + dirtyTxt + "</td>" +
+                "<td>" + errTxt + "</td>" +
+                "</tr>";
+        });
+        html += "<table class='audit-table' style='margin-top:8px;'>" +
+            "<thead><tr>" +
+            "<th>host</th><th>ok</th><th>branch</th>" +
+            "<th>pre</th><th>post</th><th>changed</th>" +
+            "<th>dirty</th><th>error</th>" +
+            "</tr></thead><tbody>" + rows + "</tbody></table>";
+    }
+    respEl.innerHTML = html;
+    btns.forEach(function (b) { b.disabled = false; });
     return false;
 }
 </script>

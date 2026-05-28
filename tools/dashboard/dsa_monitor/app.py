@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
@@ -71,8 +71,11 @@ from control_store import (
     control_stop_fleet,
     control_utc_start_now,
     control_utc_stop_now,
+    fleet_restart_all,
+    fleet_service_status,
     list_recent_audit,
 )
+from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +534,234 @@ def control_recent_audit():
         limit = 20
     rows = list_recent_audit(control_store, limit=limit)
     return jsonify({"rows": rows})
+
+
+# ---------- Control tab (M7.4 Phase 8 v2) ----------------------------------
+#
+# Two new operator actions:
+#
+#   * GET  /control/services_status — fleet-wide systemd / process
+#     status table. Cheap (5 s timeout × 8-way fanout), called every
+#     10 s by the dashboard JS for auto-refresh.
+#   * POST /control/restart_all    — "cold recovery from stop" button.
+#     Heavy (etcd + ssh fanout + lxc + local systemctl + deferred
+#     self-restart). Runs in a background thread; the response is
+#     202 + a job_id, the client polls
+#     GET /control/restart_all/<job_id> for progress.
+#
+# The lxd110h20 host is excluded from EVERY restart fanout — see
+# services_inventory.H20_HOSTNAMES + the unit-test pins in
+# tests/test_fleet_services.py.
+
+
+@app.route("/control/services_status", methods=["GET"])
+def control_services_status():
+    """Fleet services status JSON (one row per ServiceEntry)."""
+    try:
+        timeout_raw = request.args.get("timeout_s", "").strip()
+        timeout_s = float(timeout_raw) if timeout_raw else None
+    except ValueError:
+        timeout_s = None
+    user = request.remote_addr or "anon"
+    try:
+        result = fleet_service_status(
+            control_store, user=user, timeout_s=timeout_s,
+        )
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("fleet_service_status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    result.setdefault("ok", True)
+    result["h20_hostnames_excluded"] = sorted(H20_HOSTNAMES)
+    result["inventory_size"] = len(SERVICE_INVENTORY)
+    return jsonify(result)
+
+
+# ---- Restart-all job registry (in-memory) ---------------------------------
+#
+# A POST /control/restart_all spins up a worker thread + returns
+# immediately. The job's progress is published into this dict,
+# keyed by a short job_id, and the client polls GET
+# /control/restart_all/<job_id> until ``done`` flips True.
+#
+# In-memory is fine: the registry only needs to survive long enough
+# for the operator to read the last status, and the dsa_monitor
+# process restart in step 7 wipes it. (We log the result to etcd
+# audit too, so a hard reload doesn't lose history.)
+
+_restart_jobs: dict[str, dict[str, Any]] = {}
+_restart_jobs_lock = threading.Lock()
+
+
+def _new_job_id() -> str:
+    import secrets
+    return secrets.token_hex(6)
+
+
+def _restart_worker(job_id: str, *, dry_run: bool, user: str) -> None:
+    """Background thread body: run fleet_restart_all + stash the
+    result + log it. Never raises (the worker is detached)."""
+    try:
+        result = fleet_restart_all(
+            control_store, user=user, dry_run=dry_run,
+        )
+        with _restart_jobs_lock:
+            _restart_jobs[job_id].update({
+                "ok": bool(result.get("ok")),
+                "done": True,
+                "result": result,
+                "finished_unix": int(__import__("time").time()),
+            })
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("restart_worker job=%s failed", job_id)
+        with _restart_jobs_lock:
+            _restart_jobs[job_id].update({
+                "ok": False,
+                "done": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "finished_unix": int(__import__("time").time()),
+            })
+
+
+@app.route("/control/restart_all", methods=["POST"])
+def control_restart_all_post():
+    """Kick off a fleet restart in a background thread.
+
+    Body fields:
+
+    ``confirm``      Must literally be the string ``restart_all`` —
+                     a deliberate speed-bump on the destructive verb.
+    ``dry_run``      Optional; ``"true"`` / ``"1"`` short-circuits the
+                     actual ssh / systemctl / Popen calls and returns
+                     a JSON summary of what *would* have been done.
+
+    Returns 202 + ``{job_id, poll_url}`` so the client can poll for
+    completion. The dashboard process will be killed by step 7 (the
+    deferred ``systemctl --user restart dsa_monitor.service``); the
+    client should expect the next poll after ~2 s to fail and the
+    page to need a manual reload.
+    """
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "restart_all":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "restart_all requires confirm=restart_all in the "
+                "POST body — this is a deliberate safety speed bump."
+            ),
+        }), 400
+    dry_raw = request.form.get("dry_run", "").strip().lower()
+    dry_run = dry_raw in ("1", "true", "yes")
+    user = request.form.get("user") or request.remote_addr or "anon"
+
+    job_id = _new_job_id()
+    with _restart_jobs_lock:
+        _restart_jobs[job_id] = {
+            "job_id": job_id,
+            "started_unix": int(__import__("time").time()),
+            "user": user,
+            "dry_run": dry_run,
+            "done": False,
+            "ok": None,
+        }
+    th = threading.Thread(
+        target=_restart_worker,
+        kwargs={"job_id": job_id, "dry_run": dry_run, "user": user},
+        name=f"restart_all_{job_id}",
+        daemon=True,
+    )
+    th.start()
+    return jsonify({
+        "ok": True,
+        "accepted": True,
+        "job_id": job_id,
+        "dry_run": dry_run,
+        "poll_url": f"/control/restart_all/{job_id}",
+        "note": (
+            "Background fanout started. Poll the poll_url for the "
+            "step-by-step result. The deferred dsa_monitor.service "
+            "self-restart will kill this process ~2 s after step 6 "
+            "completes; expect the next poll to fail and the page "
+            "to need a manual reload."
+        ),
+    }), 202
+
+
+@app.route("/control/restart_all/<job_id>", methods=["GET"])
+def control_restart_all_poll(job_id: str):
+    """Poll a previously-started restart_all job."""
+    with _restart_jobs_lock:
+        job = _restart_jobs.get(job_id)
+        if job is None:
+            return jsonify({"ok": False, "error": "unknown job_id"}), 404
+        # Copy so we can return outside the lock.
+        snapshot = dict(job)
+    return jsonify(snapshot)
+
+
+# ---------- M7.4 Phase 6c+: pull-and-install dsa110-rt on every node -------
+#
+# Added in a separate file (``fleet_update.py``) so the ssh fan-out
+# logic stays decoupled from ``control_store.py``. The route below
+# is the only entry point into that module from Flask.
+
+
+@app.route("/control/update_dsart", methods=["POST"])
+def control_update_dsart_post():
+    """Pull (or hard-reset) ``/home/ubuntu/proj/dsa110-rt`` on every
+    corr + search node and report per-host pre/post SHAs.
+
+    Form fields:
+
+      dry_run     "true"/"false" (default "true"). When true,
+                  runs only step 1 (pre-SHA + branch + porcelain) +
+                  ``git fetch``; never calls ``git pull`` or
+                  ``git reset``.
+      force       "true"/"false" (default "false"). When true,
+                  overrides dirty-worktree gate AND uses
+                  ``git reset --hard origin/<branch>`` instead of
+                  ``git pull --ff-only``.
+      confirm     Must equal ``update_dsart`` when ``dry_run=false``.
+      branch      Optional branch to fetch/pull. Blank → use whichever
+                  branch each host is currently on (typical case).
+      hosts       Optional comma-separated host list. Blank → all 20
+                  corr + search hosts.
+    """
+    import fleet_update                                              # local
+
+    f = request.form
+    dry_run = (f.get("dry_run", "true").lower() != "false")
+    force = (f.get("force", "false").lower() == "true")
+    branch_raw = (f.get("branch") or "").strip()
+    branch = branch_raw or None
+
+    if not dry_run:
+        confirm = (f.get("confirm") or "").strip()
+        if confirm != "update_dsart":
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "apply update_dsart requires confirm=update_dsart in "
+                    "the POST body — this is a deliberate safety speed bump."
+                ),
+            }), 400
+
+    raw_hosts = (f.get("hosts") or "").strip()
+    hosts: Optional[list[str]]
+    if raw_hosts:
+        hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+    else:
+        hosts = None
+
+    # Per-host timeout × 4 ssh calls / max_workers across 20 hosts is
+    # well under the spec's 60 s synchronous-response ceiling at the
+    # default max_workers=8.
+    return _control_json_or_error(
+        fleet_update.update_fleet,
+        dry_run=dry_run,
+        force=force,
+        hosts=hosts,
+        branch=branch,
+    )
 
 
 # ---------- API ------------------------------------------------------------

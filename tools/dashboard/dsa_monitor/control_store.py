@@ -795,6 +795,109 @@ def control_inject_pulse(
     return out
 
 
+# ---------------------------------------------------------------------------
+# M7.4 Phase 8 v2: fleet service status + restart-all
+# ---------------------------------------------------------------------------
+#
+# Thin wrappers around :mod:`fleet_services` that audit the call to
+# ``/mon/audit/control/<iso_ts>`` and translate the result dict into
+# the same JSON-ready shape the verb-senders above use. The heavy
+# lifting (ssh fanout, lxc exec, ThreadPoolExecutor) lives in
+# fleet_services so it can be unit-tested in isolation by mocking
+# ``subprocess.run`` / ``subprocess.Popen``.
+
+
+def fleet_service_status(
+    store: "ControlStore",
+    *,
+    user: str | None = None,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """Query the status of every entry in
+    :data:`fleet_services.SERVICE_INVENTORY`.
+
+    Returns the dict :func:`fleet_services.query_all_services_status`
+    returns, with one additional ``audit_iso_ts`` field for the
+    audit-row pointer. The audit row is logged with
+    ``cmd="services_status"`` and ``ok=True`` iff no rows came back
+    as ``unreachable``/``unknown``.
+    """
+    import fleet_services as _fleet
+    kwargs: dict[str, Any] = {}
+    if timeout_s is not None:
+        kwargs["timeout"] = float(timeout_s)
+    res = _fleet.query_all_services_status(**kwargs)
+    ok = res["n_unreachable"] == 0 and res["n_unknown"] == 0
+    action = audit_log(
+        store, namespace="services",
+        cn_target="fleet", cmd="services_status",
+        val={
+            "n_active": res["n_active"],
+            "n_inactive": res["n_inactive"],
+            "n_failed": res["n_failed"],
+            "n_unreachable": res["n_unreachable"],
+            "n_unknown": res["n_unknown"],
+        },
+        ok=ok,
+        note=f"{len(res['rows'])} entries polled",
+        user=user,
+    )
+    res["audit_iso_ts"] = action.iso_ts
+    return res
+
+
+def fleet_restart_all(
+    store: "ControlStore",
+    *,
+    user: str | None = None,
+    dry_run: bool = False,
+    self_restart_delay_s: float = 2.0,
+) -> dict[str, Any]:
+    """Run the "Restart everything (except lxd110h20)" sequence.
+
+    Wraps :func:`fleet_services.restart_all_services`. Bridges the
+    etcd ``stop`` broadcast (step 1) into the existing
+    :func:`control_stop_fleet` helper by passing it in as
+    ``stop_broadcast`` (which keeps :mod:`fleet_services` free of
+    any dsautils import).
+
+    Always writes one audit row at the end summarising per-host
+    success / failure.
+    """
+    import fleet_services as _fleet
+
+    def _stop_bcast() -> dict[str, Any]:
+        return control_stop_fleet(store, user=user)
+
+    summary = _fleet.restart_all_services(
+        dry_run=bool(dry_run),
+        stop_broadcast=None if dry_run else _stop_bcast,
+        self_restart_delay_s=float(self_restart_delay_s),
+    )
+
+    # Per-host pass/fail rollup is the most useful audit val — the
+    # operator can scan it to see which corr nodes failed without
+    # diffing 20 sub-dicts.
+    host_summary: dict[str, bool] = {
+        host: all(step["ok"] for step in steps.values())
+        for host, steps in summary.get("host_results", {}).items()
+    }
+    action = audit_log(
+        store, namespace="services",
+        cn_target="fleet",
+        cmd="restart_all",
+        val=host_summary,
+        ok=bool(summary.get("ok")),
+        note=(
+            f"dry_run={dry_run} elapsed_s={summary.get('elapsed_s')} "
+            f"hosts={len(host_summary)}"
+        ),
+        user=user,
+    )
+    summary["audit_iso_ts"] = action.iso_ts
+    return summary
+
+
 def _iso_ts_utc() -> str:
     """ISO-8601 UTC stamp with microseconds, used as audit-row key."""
     return _dt.datetime.now(_dt.timezone.utc).strftime(
