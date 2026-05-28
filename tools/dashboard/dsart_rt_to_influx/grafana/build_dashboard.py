@@ -287,19 +287,24 @@ def panels() -> List[Dict[str, Any]]:
         ),
     ))
     out.append(graph_panel(
-        title="Free PSRDADA blocks in capture ring per (cn,port)",
+        title="PSRDADA fill fraction — fleet mean per buffer",
         raw_query=(
-            'SELECT last("n_blocks_free") FROM "corr_rt_capture" '
-            'WHERE "degraded" = 0 AND $timeFilter '
-            'GROUP BY time($__interval), "cn_id", "udp_port" fill(null)'
+            'SELECT mean("nfull") / mean("nbufs") FROM "corr_rt_buffer" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "buffer" fill(null)'
         ),
-        alias="cn $tag_cn_id port $tag_udp_port",
+        alias="$tag_buffer",
         w=12, x=12, h=7,
-        unit="short", y_min=0,
+        unit="percentunit", y_min=0, y_max=1,
         legend_right=True,
         description=(
-            "Number of empty (writable) blocks in the capture PSRDADA buffer "
-            "per port. A buffer near zero means downstream is backed up."
+            "M7.4 Phase 7 buffer-health summary: fraction of the ring "
+            "currently holding unread data, averaged across the 16 corr "
+            "nodes per buffer (dada, eada, fada, bada). A buffer "
+            "sustained > ~0.85 means the downstream consumer is "
+            "falling behind (back-pressure). Source: "
+            "/mon/corr_rt/<cn>.buffers.<k>.metric (filled by "
+            "dada_dbmetric on the corr node)."
         ),
     ))
     _bump_y(7)
@@ -472,6 +477,89 @@ def panels() -> List[Dict[str, Any]]:
         description="Self-reported publish cadence; nominally 2 s.",
     ))
     _bump_y(6)
+
+    # === Row 8: M7.4 Phase 7 — PSRDADA buffer health =======================
+    # Source: /mon/corr_rt/<cn>.buffers.{dada,eada,fada,bada}.metric, filled
+    # by dsart_rt._dada_dbmetric() every 2 s. The Influx pusher routes
+    # numeric fields (nbufs, nfull, nclear, n_written, n_read, free_blocks)
+    # onto the ``corr_rt_buffer`` measurement tagged (cn_id, host, buffer).
+    out.append(graph_panel(
+        title="PSRDADA nfull per (cn, buffer) — fada (corr→search merge)",
+        raw_query=(
+            'SELECT last("nfull") FROM "corr_rt_buffer" '
+            "WHERE \"buffer\" = 'fada' AND $timeFilter "
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=0, h=7,
+        unit="short", y_min=0,
+        legend_right=True,
+        description=(
+            "Blocks currently full in the fada ring per corr node. "
+            "fada is the merge output (dada + eada → fada) consumed by "
+            "corr_slow + corr_fast. Sustained near nbufs (= 70) means "
+            "the search-side pipeline is backed up and dropping cubes. "
+            "Healthy: 0–5 blocks lingering."
+        ),
+    ))
+    out.append(graph_panel(
+        title="PSRDADA nfull per (cn, buffer) — dada / eada (SNAP capture)",
+        raw_query=(
+            'SELECT last("nfull") FROM "corr_rt_buffer" '
+            "WHERE (\"buffer\" = 'dada' OR \"buffer\" = 'eada') AND $timeFilter "
+            'GROUP BY time($__interval), "cn_id", "buffer" fill(null)'
+        ),
+        alias="cn $tag_cn_id $tag_buffer",
+        w=12, x=12, h=7,
+        unit="short", y_min=0,
+        legend_right=True,
+        description=(
+            "Blocks currently full in dada / eada (the per-port SNAP "
+            "capture rings, 20 blocks each). Sustained > ~10 means the "
+            "merge stage is falling behind the kernel-side capture. A "
+            "spike to 18-19 typically precedes kernel_drops_total > 0."
+        ),
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="PSRDADA free_blocks per (cn, buffer) — fleet view",
+        raw_query=(
+            'SELECT last("free_blocks") FROM "corr_rt_buffer" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "buffer" fill(null)'
+        ),
+        alias="cn $tag_cn_id $tag_buffer",
+        w=12, x=0, h=7,
+        unit="short", y_min=0,
+        legend_right=True,
+        description=(
+            "free_blocks = nbufs - nfull (the operationally useful "
+            "headroom). A buffer dropping toward 0 is the back-pressure "
+            "alarm — pair with the fill-fraction summary in row 3 to "
+            "tell which buffer + node is choking first."
+        ),
+    ))
+    out.append(graph_panel(
+        title="PSRDADA n_written rate (blocks/s) per (cn, buffer)",
+        raw_query=(
+            'SELECT non_negative_derivative(last("n_written"), 1s) '
+            'FROM "corr_rt_buffer" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "buffer" fill(null)'
+        ),
+        alias="cn $tag_cn_id $tag_buffer",
+        w=12, x=12, h=7,
+        unit="short", y_min=0,
+        legend_right=True,
+        description=(
+            "Throughput rate of each ring (blocks/s). At the M7.4 "
+            "production op-point dada/eada should run at ~9.6 blocks/s "
+            "(one block per 4 specnums × 4096 native samples) and fada "
+            "at ~7.45 blocks/s. A drop in fada below 7 cubes/s is the "
+            "search-side gate alarm."
+        ),
+    ))
+    _bump_y(7)
 
     return out
 

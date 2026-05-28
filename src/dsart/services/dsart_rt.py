@@ -246,35 +246,118 @@ def _mjd_now() -> float:
     return 40587.0 + time.time() / 86400.0
 
 
+#: Legacy PSRDADA ``dada_dbmetric`` CSV column order (`/usr/local/bin/dada_dbmetric`
+#: build that ships on the dsa110 corr nodes). Maps positional CSV
+#: indices to canonical field names so M7.4 Phase 7 Grafana panels have a
+#: stable schema regardless of which CLI flavour the node ships.
+#:
+#: See ``/home/ubuntu/vishnu/dev/dsa110-xengine/scripts/corr.py:166-186``
+#: (``get_buf_info``) for the legacy correlator's interpretation of the
+#: same CSV.
+_DBMETRIC_CSV_FIELDS: tuple[str, ...] = (
+    "nbufs",        # total blocks in the ring
+    "nfull",        # blocks currently containing unread data
+    "nclear",       # blocks that are written + cleared (legacy "n_cleared")
+    "n_written",    # cumulative blocks written since ring open
+    "n_read",       # cumulative blocks read since ring open
+)
+
+
+def _normalise_dbmetric(counters: dict[str, Any]) -> dict[str, Any]:
+    """Add derived fields + legacy-name aliases to a raw dbmetric dict.
+
+    Operationally the single most useful number is ``free_blocks`` =
+    ``nbufs - nfull``; older snapshot scripts also look for ``free`` /
+    ``full`` (no ``n``-prefix) so we alias those in too. We never
+    overwrite an existing key.
+    """
+    if not counters:
+        return counters
+    try:
+        nbufs = int(counters["nbufs"])
+        nfull = int(counters["nfull"])
+        counters.setdefault("free_blocks", nbufs - nfull)
+        counters.setdefault("free", nbufs - nfull)
+        counters.setdefault("full", nfull)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return counters
+
+
 def _dada_dbmetric(key: str) -> dict[str, Any]:
     """Read full / clear / written / read counters for one PSRDADA ring.
 
-    Returns an empty dict on any failure (buffer doesn't exist, binary
-    missing, parse fail). Don't let mon-dict publish crash on a
+    Returns an empty dict on a true failure (buffer doesn't exist,
+    binary missing, parse fail). Don't let mon-dict publish crash on a
     transient buffer-create race.
 
-    The on-disk dada_dbmetric ships in two output flavours: older PSRDADA
-    builds print positional CSV ``<nbufs>,<nfull>,<nclear>,<nclear>,...``,
-    newer ones print ``key=value`` tokens. We accept both: parse k=v
-    when present, fall back to storing the raw CSV under ``"raw_csv"``.
-    Mon-dict consumers (M7.1+ soak validators, web UI) can refine the
-    interpretation as needed — the legacy column meanings live in the
-    PSRDADA dada_db source (search REALTIME_FRB_SEARCH.md §8 +
-    ``ipcio_query`` for the canonical interpretation).
+    The on-disk ``dada_dbmetric`` ships in two output flavours: older
+    PSRDADA builds print positional CSV
+    ``<nbufs>,<nfull>,<nclear>,<n_written>,<n_read>``, newer ones print
+    ``key=value`` tokens. We accept both: parse k=v when present, fall
+    back to mapping positional CSV via :data:`_DBMETRIC_CSV_FIELDS`. The
+    output dict always has the canonical names so downstream consumers
+    (the influx pusher's ``corr_rt_buffer`` measurement, Grafana panels,
+    snapshot scripts) get stable field names. We also derive
+    ``free_blocks = nbufs - nfull`` (and the ``free`` / ``full`` aliases
+    for the legacy snapshot scripts).
+
+    The binary is looked up via two paths so the orchestrator works
+    both from a login shell with PATH set and from a systemd service
+    unit with the default minimal PATH: ``dada_dbmetric`` (PATH) and
+    ``/usr/local/bin/dada_dbmetric`` (DSA-110 cluster canonical install
+    location).
+
+    On a parse / binary failure we still return a non-empty dict carrying
+    a ``_error`` field so Grafana can distinguish "buffer momentarily
+    locked / racy" from "binary missing"; the influx pusher's
+    ``make_buffer_points`` skips dicts whose only field is ``_error``
+    (no numeric fields ⇒ no time-series point).
     """
-    try:
-        proc = subprocess.run(
-            ["dada_dbmetric", "-k", key],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {}
-    out = (proc.stdout or "").strip()
-    if not out:
-        return {}
+    bin_candidates = ("dada_dbmetric", "/usr/local/bin/dada_dbmetric")
+    last_err: str | None = None
+    proc: subprocess.CompletedProcess[str] | None = None
+    for binary in bin_candidates:
+        try:
+            proc = subprocess.run(
+                [binary, "-k", key],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            break
+        except FileNotFoundError as e:
+            last_err = f"FileNotFoundError({binary}): {e}"
+            continue
+        except subprocess.TimeoutExpired:
+            return {"_error": "dada_dbmetric timeout after 2.0s"}
+    if proc is None:
+        return {"_error": last_err or "dada_dbmetric binary not found"}
+    # Critical: the dsa110-cluster ``/usr/local/bin/dada_dbmetric`` build
+    # writes the metric line to **STDERR**, not STDOUT (only the
+    # ``ipc_alloc/ipcsync_get/ipcbuf_connect`` error chain on a missing
+    # ring goes to stderr too, but those are well-formed prefixed lines
+    # we can filter out). Newer builds write the same line to STDOUT.
+    # Coalesce both streams and let the parser figure it out — this is
+    # the fix for M7.4 Phase 7 ``metric: {}`` everywhere on the live
+    # fleet.
+    raw_out = (proc.stdout or "")
+    raw_err = (proc.stderr or "")
+    combined_lines: list[str] = []
+    for line in (raw_out + raw_err).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # Filter ipc_alloc / ipcsync_get / ipcbuf_connect error chain
+        # so they don't get misread as a CSV row of nonsense.
+        if s.startswith(("ipc_alloc:", "ipcsync_get:", "ipcbuf_connect:")):
+            continue
+        combined_lines.append(s)
+    if not combined_lines:
+        err_first = (raw_err.strip().splitlines() or [""])[0]
+        return {"_error": err_first or "empty stdout+stderr"}
+    out = combined_lines[0]
     counters: dict[str, Any] = {}
     for tok in out.replace(",", " ").split():
         if "=" not in tok:
@@ -285,11 +368,29 @@ def _dada_dbmetric(key: str) -> dict[str, Any]:
         except ValueError:
             continue
     if not counters and "," in out:
-        # Positional CSV. Trim trailing newline / whitespace; expose
-        # both the raw line and a parsed list for consumer convenience.
-        fields = [f.strip() for f in out.splitlines()[0].split(",")]
-        counters = {"raw_csv": out.splitlines()[0], "fields": fields}
-    return counters
+        # Positional CSV. Map by index to canonical names so the
+        # downstream Grafana panels have a stable schema (legacy
+        # builds don't emit k=v).
+        csv_line = out.splitlines()[0]
+        raw_fields = [f.strip() for f in csv_line.split(",")]
+        for i, name in enumerate(_DBMETRIC_CSV_FIELDS):
+            if i >= len(raw_fields):
+                break
+            try:
+                counters[name] = int(raw_fields[i])
+            except ValueError:
+                continue
+        if any(isinstance(v, int) for v in counters.values()):
+            counters["raw_csv"] = csv_line
+        else:
+            counters = {"_error": f"unparseable: {csv_line!r}"}
+    if not counters:
+        # Output was non-empty but neither k=v nor CSV-numbers. Surface
+        # the first line as a diagnostic so an operator can see what
+        # the binary actually produced (e.g. "could not parse key from
+        # xxxx" on a typoed key).
+        counters = {"_error": out[:200]}
+    return _normalise_dbmetric(counters)
 
 
 # ---------------------------------------------------------------------------

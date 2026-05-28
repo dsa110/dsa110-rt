@@ -618,9 +618,9 @@
     {
       "id": 8,
       "type": "graph",
-      "title": "Free PSRDADA blocks in capture ring per (cn,port)",
+      "title": "PSRDADA fill fraction \u2014 fleet mean per buffer",
       "datasource": "InfluxDB",
-      "description": "Number of empty (writable) blocks in the capture PSRDADA buffer per port. A buffer near zero means downstream is backed up.",
+      "description": "M7.4 Phase 7 buffer-health summary: fraction of the ring currently holding unread data, averaged across the 16 corr nodes per buffer (dada, eada, fada, bada). A buffer sustained > ~0.85 means the downstream consumer is falling behind (back-pressure). Source: /mon/corr_rt/<cn>.buffers.<k>.metric (filled by dada_dbmetric on the corr node).",
       "gridPos": {
         "x": 12,
         "y": 21,
@@ -630,12 +630,12 @@
       "targets": [
         {
           "refId": "A",
-          "alias": "cn $tag_cn_id port $tag_udp_port",
+          "alias": "$tag_buffer",
           "policy": "default",
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT last(\"n_blocks_free\") FROM \"corr_rt_capture\" WHERE \"degraded\" = 0 AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"udp_port\" fill(null)",
+          "query": "SELECT mean(\"nfull\") / mean(\"nbufs\") FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"buffer\" fill(null)",
           "tags": [],
           "groupBy": [],
           "select": [],
@@ -644,11 +644,11 @@
       ],
       "yaxes": [
         {
-          "format": "short",
+          "format": "percentunit",
           "label": null,
           "logBase": 1,
           "min": "0",
-          "max": null,
+          "max": "1",
           "show": true
         },
         {
@@ -1455,6 +1455,330 @@
       "yaxes": [
         {
           "format": "s",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 19,
+      "type": "graph",
+      "title": "PSRDADA nfull per (cn, buffer) \u2014 fada (corr\u2192search merge)",
+      "datasource": "InfluxDB",
+      "description": "Blocks currently full in the fada ring per corr node. fada is the merge output (dada + eada \u2192 fada) consumed by corr_slow + corr_fast. Sustained near nbufs (= 70) means the search-side pipeline is backed up and dropping cubes. Healthy: 0\u20135 blocks lingering.",
+      "gridPos": {
+        "x": 0,
+        "y": 61,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"nfull\") FROM \"corr_rt_buffer\" WHERE \"buffer\" = 'fada' AND $timeFilter GROUP BY time($__interval), \"cn_id\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 20,
+      "type": "graph",
+      "title": "PSRDADA nfull per (cn, buffer) \u2014 dada / eada (SNAP capture)",
+      "datasource": "InfluxDB",
+      "description": "Blocks currently full in dada / eada (the per-port SNAP capture rings, 20 blocks each). Sustained > ~10 means the merge stage is falling behind the kernel-side capture. A spike to 18-19 typically precedes kernel_drops_total > 0.",
+      "gridPos": {
+        "x": 12,
+        "y": 61,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id $tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"nfull\") FROM \"corr_rt_buffer\" WHERE (\"buffer\" = 'dada' OR \"buffer\" = 'eada') AND $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 21,
+      "type": "graph",
+      "title": "PSRDADA free_blocks per (cn, buffer) \u2014 fleet view",
+      "datasource": "InfluxDB",
+      "description": "free_blocks = nbufs - nfull (the operationally useful headroom). A buffer dropping toward 0 is the back-pressure alarm \u2014 pair with the fill-fraction summary in row 3 to tell which buffer + node is choking first.",
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id $tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT last(\"free_blocks\") FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 22,
+      "type": "graph",
+      "title": "PSRDADA n_written rate (blocks/s) per (cn, buffer)",
+      "datasource": "InfluxDB",
+      "description": "Throughput rate of each ring (blocks/s). At the M7.4 production op-point dada/eada should run at ~9.6 blocks/s (one block per 4 specnums \u00d7 4096 native samples) and fada at ~7.45 blocks/s. A drop in fada below 7 cubes/s is the search-side gate alarm.",
+      "gridPos": {
+        "x": 12,
+        "y": 68,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id $tag_buffer",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT non_negative_derivative(last(\"n_written\"), 1s) FROM \"corr_rt_buffer\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"buffer\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
           "label": null,
           "logBase": 1,
           "min": "0",
