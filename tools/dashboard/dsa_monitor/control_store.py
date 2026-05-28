@@ -722,6 +722,9 @@ def control_inject_pulse(
     margin_blocks: int = DEFAULT_INJECT_MARGIN_BLOCKS,
     chgroups: Iterable[int] = DEFAULT_INJECT_CHGROUPS,
     user: str | None = None,
+    publish_active_registry: bool = True,
+    inject_label_ttl_s: float = 60.0,
+    target_snr: float | None = None,
 ) -> dict[str, Any]:
     """High-level helper for the Control tab.
 
@@ -792,6 +795,40 @@ def control_inject_pulse(
     )
     out["arm_info"] = info
     out["auto_arm"] = apply_at_specnum is None
+
+    # M7.4 Phase 6c.A: also publish the active-injection registry row
+    # so the C2 coincidencer's InjectionMatcher can pair incoming C1
+    # candidates with this injection (labels them in the C1 CSV and
+    # publishes /mon/dsart/inject/matches/<inj_id> for the dashboard
+    # calibration loop to consume).
+    if publish_active_registry and out.get("ok"):
+        try:
+            import inject_calibration as _ic   # local; avoid import cycle
+            _ic.publish_active_inject(
+                store,
+                inj_id=inj_id,
+                dm_pc_cm3=float(dm_pc_cm3),
+                l_rad=float(l_rad),
+                m_rad=float(m_rad),
+                width_samples=int(width_samples),
+                fluence_jy_ms=float(fluence_jy_ms),
+                apply_at_specnum=int(derived_specnum),
+                ttl_s=float(inject_label_ttl_s),
+                fired_by=str(user or "anon"),
+                target_snr=(
+                    float(target_snr) if target_snr is not None else None
+                ),
+            )
+            out["active_inject_key"] = (
+                _ic.build_active_inject_key(inj_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Don't fail the verb just because the registry PUT
+            # failed — the underlying inject already succeeded.
+            LOG.warning(
+                "publish_active_inject(%s) failed: %s", inj_id, exc,
+            )
+            out["active_inject_warning"] = str(exc)
     return out
 
 

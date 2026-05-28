@@ -443,13 +443,19 @@ def control_inject_post():
     """M7.4 Phase 6: push a runtime injection to one or more chgroups.
 
     Form fields (all required except ``apply_at_specnum``,
-    ``margin_blocks``, and ``chgroups``):
+    ``margin_blocks``, ``chgroups``, ``target_snr``, and
+    ``fluence_jy_ms`` when ``target_snr`` is set):
 
       inj_id          str (e.g. "phase6c_extragal_t1")
       l_rad           float, |l| < 1
       m_rad           float, |m| < 1 and l^2 + m^2 < 1
       dm_pc_cm3       float
-      fluence_jy_ms   float
+      fluence_jy_ms   float — required iff ``target_snr`` is unset
+      target_snr      float (optional). When set, the dashboard
+                      derives ``fluence_jy_ms`` from the stored K
+                      calibration for the (dm_band, width) bucket
+                      and uses that instead of any operator-supplied
+                      fluence. Returns 412 if K is missing.
       width_samples   int, 1..MAX_WIDTH_SAMPLES
       profile         "gaussian" | "boxcar"
       apply_at_specnum   int (omit → auto-arm via
@@ -462,13 +468,13 @@ def control_inject_post():
                       (omit → all 16)
     """
     f = request.form
+    target_snr_raw = (f.get("target_snr") or "").strip()
     try:
         kwargs: dict[str, object] = {
             "inj_id": (f.get("inj_id") or "").strip() or None,
             "l_rad": float(f.get("l_rad", "0")),
             "m_rad": float(f.get("m_rad", "0")),
             "dm_pc_cm3": float(f.get("dm_pc_cm3", "0")),
-            "fluence_jy_ms": float(f.get("fluence_jy_ms", "0")),
             "width_samples": int(f.get("width_samples", "1")),
             "profile": (f.get("profile") or "gaussian").strip(),
             "margin_blocks": int(
@@ -479,6 +485,56 @@ def control_inject_post():
         return jsonify({"ok": False, "error": f"bad numeric field: {exc}"}), 400
     if not kwargs["inj_id"]:
         return jsonify({"ok": False, "error": "inj_id is required"}), 400
+
+    # Resolve fluence: either explicit OR derived from target_snr via K.
+    target_snr: float | None = None
+    if target_snr_raw:
+        try:
+            target_snr = float(target_snr_raw)
+            if not (target_snr > 0):
+                raise ValueError("must be > 0")
+        except ValueError as exc:
+            return jsonify({
+                "ok": False,
+                "error": f"target_snr={target_snr_raw!r}: {exc}",
+            }), 400
+        import inject_calibration as ic  # local
+        cs = ic.CalibrationStore(control_store)
+        entry = cs.get(
+            dm_pc_cm3=float(kwargs["dm_pc_cm3"]),
+            width_samples=int(kwargs["width_samples"]),
+        )
+        if entry is None or not (entry.K > 0):
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"No K calibration for bucket "
+                    f"{ic.bucket_key(float(kwargs['dm_pc_cm3']), int(kwargs['width_samples']))}; "
+                    f"run /control/inject_calibrate first."
+                ),
+                "bucket": ic.bucket_key(
+                    float(kwargs["dm_pc_cm3"]),
+                    int(kwargs["width_samples"]),
+                ),
+            }), 412
+        try:
+            fluence = ic.snr_to_fluence(
+                target_snr=target_snr, K=entry.K,
+                width_samples=int(kwargs["width_samples"]),
+            )
+        except ValueError as exc:
+            return jsonify({
+                "ok": False, "error": f"snr_to_fluence: {exc}",
+            }), 400
+        kwargs["fluence_jy_ms"] = float(fluence)
+        kwargs["target_snr"] = target_snr
+    else:
+        try:
+            kwargs["fluence_jy_ms"] = float(f.get("fluence_jy_ms", "0"))
+        except ValueError as exc:
+            return jsonify({
+                "ok": False, "error": f"bad fluence_jy_ms: {exc}",
+            }), 400
 
     raw_specnum = (f.get("apply_at_specnum") or "").strip()
     if raw_specnum:
@@ -523,6 +579,118 @@ def control_inject_post():
         return jsonify({"ok": False, "error": str(exc)}), 400
 
     return _control_json_or_error(control_inject_pulse, **kwargs)
+
+
+@app.route("/control/inject_calibrate", methods=["POST"])
+def control_inject_calibrate_post():
+    """M7.4 Phase 6c.A: fire one calibration probe and store the
+    resulting K for the (DM, width) bucket.
+
+    Form fields (all optional except ``dm_pc_cm3``):
+
+      dm_pc_cm3       float — required
+      l_rad, m_rad    floats (default 0, boresight)
+      width_samples   int (default 32)
+      fluence_jy_ms   float (default 100.0)
+      profile         "gaussian" | "boxcar" (default gaussian)
+      poll_timeout_s  float (default 30.0)
+      chgroups        comma-separated ints (default all 16)
+      margin_blocks   int (default DEFAULT_INJECT_MARGIN_BLOCKS)
+
+    Returns a JSON :class:`inject_calibration.ProbeResult` dict.
+    """
+    import inject_calibration as ic   # local
+    f = request.form
+    try:
+        kwargs: dict[str, Any] = {
+            "dm_pc_cm3": float(f["dm_pc_cm3"]),
+            "l_rad": float(f.get("l_rad", "0")),
+            "m_rad": float(f.get("m_rad", "0")),
+            "width_samples": int(
+                f.get("width_samples", str(ic.DEFAULT_CALIBRATION_WIDTH)),
+            ),
+            "fluence_jy_ms": float(
+                f.get("fluence_jy_ms", str(ic.DEFAULT_CALIBRATION_FLUENCE)),
+            ),
+            "profile": (f.get("profile") or ic.DEFAULT_CALIBRATION_PROFILE).strip(),
+            "poll_timeout_s": float(
+                f.get("poll_timeout_s", str(ic.DEFAULT_POLL_TIMEOUT_S)),
+            ),
+        }
+    except (KeyError, ValueError) as exc:
+        return jsonify({
+            "ok": False, "error": f"bad form field: {exc}",
+        }), 400
+
+    raw_chg = (f.get("chgroups") or "").strip()
+    if raw_chg:
+        try:
+            kwargs["chgroups"] = tuple(
+                int(s) for s in raw_chg.split(",") if s.strip()
+            )
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": f"chgroups={raw_chg!r}: must be comma-separated ints",
+            }), 400
+
+    raw_margin = (f.get("margin_blocks") or "").strip()
+    if raw_margin:
+        try:
+            kwargs["margin_blocks"] = int(raw_margin)
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": f"margin_blocks={raw_margin!r}: not an int",
+            }), 400
+
+    user = request.form.get("user") or request.remote_addr or "anon"
+    kwargs["user"] = user
+    # Re-use the existing inject helper so the per-chgroup PUT path
+    # (with its audit row + active-registry side effect) is shared
+    # between the calibration probe and the operator's manual inject.
+    kwargs["inject_fn"] = control_inject_pulse
+    try:
+        result = ic.fire_calibration_probe(control_store, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("fire_calibration_probe failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    audit_log(
+        control_store,
+        namespace="dsart.inject",
+        cn_target="fleet",
+        cmd="inject_calibrate",
+        val={
+            "dm_pc_cm3": kwargs["dm_pc_cm3"],
+            "width_samples": kwargs["width_samples"],
+            "fluence_jy_ms": kwargs["fluence_jy_ms"],
+            "observed_snr": result.observed_snr,
+            "K": result.K,
+            "bucket": result.bucket,
+            "reason": result.reason,
+        },
+        ok=bool(result.ok),
+        note=f"elapsed={result.elapsed_s:.1f}s inj_id={result.inj_id}",
+        user=user,
+    )
+    return jsonify(result.to_dict())
+
+
+@app.route("/control/inject_calibrations", methods=["GET"])
+def control_inject_calibrations_get():
+    """List every persisted (DM, width) calibration bucket."""
+    import inject_calibration as ic   # local
+    cs = ic.CalibrationStore(control_store)
+    try:
+        entries = cs.list_all()
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("CalibrationStore.list_all failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({
+        "ok": True,
+        "entries": [e.to_dict() for e in entries],
+    })
 
 
 @app.route("/control/dump_now", methods=["POST"])

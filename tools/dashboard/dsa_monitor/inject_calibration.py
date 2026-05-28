@@ -1,0 +1,744 @@
+"""dsa_monitor Phase 6c.A: bootstrap-SNR injection calibration.
+
+The corr-side injector consumes ``fluence_jy_ms`` directly, but we
+have no absolute flux calibration on a freshly-restarted fleet — so
+"50 Jy·ms" really means "whatever SNR the matched filter pulls out
+of that voltage scale". The operator wants to drive injections at a
+*target SNR* (e.g. SNR=20) instead.
+
+This module provides the two halves of a bootstrap calibration:
+
+1. :class:`CalibrationStore` — persists a per-``(dm_band, width)``
+   calibration constant ``K`` in etcd at
+   ``/cnf/inject/snr_calibration/<bucket>``. ``K`` parameterises
+
+       observed_snr ≈ K × sqrt(fluence_jy_ms / width_samples)
+
+   so the inverse is
+
+       fluence_jy_ms = width_samples × (target_snr / K)^2.
+
+   ``K`` depends on the search-side DM band (the coarse + fine
+   de-disperser path the injection drives) and the matched-filter
+   kernel width; we bucket by ``round(dm / 50) × 50`` and integer
+   width to give the operator a small, predictable table.
+
+2. :func:`fire_calibration_probe` — fires one known-fluence injection
+   with the existing :func:`control_store.control_inject_pulse`
+   helper, records the corresponding ``/cnf/inject/active/<inj_id>``
+   payload the C2 matcher consumes, then polls
+   ``/mon/dsart/inject/matches/<inj_id>`` for the observed SNR. On a
+   match it computes ``K = observed_snr × sqrt(width / fluence)``
+   and stores it. On no-match it returns a structured error so the
+   UI can surface "calibration failed: no C1 candidate within
+   tolerance".
+
+The Control tab uses both halves:
+
+  * "Calibrate" button: caller picks (DM, l, m, width); the dashboard
+    fires a probe with a generous default fluence (100 Jy·ms — bright
+    enough to land at SNR ~ 30 at DM=500) and stores the resulting
+    ``K``.
+  * "Inject at target SNR": the dashboard reads K for the requested
+    DM bucket, computes the implied fluence, and fires through the
+    existing inject helper. If K is missing for the bucket the
+    dashboard returns 412 Precondition Failed so the UI can prompt
+    the operator to calibrate first.
+
+All etcd surface is stdlib-only; the heavy
+:class:`control_store.ControlStore` does the actual ``put_dict`` /
+``get_dict`` so transport errors fail consistently with the rest of
+the dashboard.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import socket
+import time
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+LOG = logging.getLogger("dsa_monitor.inject_calibration")
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: Active-injection registry prefix. Mirrors
+#: :data:`dsart.coinc.inject_match.ACTIVE_INJECT_PREFIX`. Drift is
+#: caught by the unit tests in
+#: ``tests/test_dsa_monitor_inject_calibration.py``.
+ACTIVE_INJECT_PREFIX: str = "/cnf/inject/active/"
+
+#: Match-event prefix the C2 matcher publishes to. Mirrors
+#: :data:`dsart.coinc.inject_match.MATCH_EVENT_PREFIX`.
+MATCH_EVENT_PREFIX: str = "/mon/dsart/inject/matches/"
+
+#: Per-bucket calibration store prefix.
+CALIBRATION_PREFIX: str = "/cnf/inject/snr_calibration/"
+
+#: DM bucket size (pc/cc). The operator-supplied DM is rounded to the
+#: nearest multiple of this when computing the bucket key. 50 pc/cc
+#: is wide enough that small DM mis-quantisations land in the same
+#: bucket while still letting us distinguish the three commissioning
+#: DMs (150, 500, 1500) cleanly.
+DM_BUCKET_PC_CC: float = 50.0
+
+#: Default fluence used by an explicit calibration probe (Jy·ms).
+#: 100 Jy·ms with width 32 samples produces an injected voltage
+#: amplitude of √(100/32) ≈ 1.77 — well above the per-channel noise
+#: at the GPU input. The dashboard caller can override this in the
+#: form if the operator wants to titrate the calibration brightness.
+DEFAULT_CALIBRATION_FLUENCE: float = 100.0
+
+#: Default probe width (native samples). 32 ≈ 1 ms; matches the
+#: typical FRB injected width in the M6 acceptance tests.
+DEFAULT_CALIBRATION_WIDTH: int = 32
+
+#: Default probe profile.
+DEFAULT_CALIBRATION_PROFILE: str = "gaussian"
+
+#: How long after fired_at_unix the matcher accepts rows for this
+#: injection (seconds). Long enough to cover startup-jitter, NUMA
+#: pinning hiccups, and the cube emission cadence at DM=1500 (which
+#: takes ~3.5 cubes to fully de-disperse).
+DEFAULT_INJECT_TTL_S: float = 60.0
+
+#: Polling cadence for the match-event key (seconds).
+DEFAULT_POLL_INTERVAL_S: float = 0.5
+
+#: Default per-probe poll timeout (seconds). The probe waits this long
+#: for the first match; if no match arrives the probe returns
+#: ``ok=False`` with ``reason="no_match"``.
+DEFAULT_POLL_TIMEOUT_S: float = 30.0
+
+
+# ---------------------------------------------------------------------------
+# Bucket key
+# ---------------------------------------------------------------------------
+
+
+def bucket_key(dm_pc_cm3: float, width_samples: int) -> str:
+    """Return the calibration bucket key for ``(dm, width)``.
+
+    Format: ``dm{rounded_dm:04d}_w{width:04d}``. Rounded DM is
+    ``round(dm / 50) × 50`` (clamped to ≥ 0). Width is the integer
+    sample count.
+
+    Examples
+    --------
+    >>> bucket_key(500.0, 32)
+    'dm0500_w0032'
+    >>> bucket_key(150.0, 64)
+    'dm0150_w0064'
+    >>> bucket_key(1500.0, 32)
+    'dm1500_w0032'
+    """
+    if width_samples < 1:
+        raise ValueError(f"width_samples={width_samples} must be >= 1")
+    if not math.isfinite(dm_pc_cm3):
+        raise ValueError(f"dm_pc_cm3={dm_pc_cm3} is not finite")
+    dm_round = max(
+        0, int(round(float(dm_pc_cm3) / DM_BUCKET_PC_CC) * int(DM_BUCKET_PC_CC)),
+    )
+    return f"dm{dm_round:04d}_w{int(width_samples):04d}"
+
+
+def calibration_key(dm_pc_cm3: float, width_samples: int) -> str:
+    """Return the full etcd key for a ``(dm, width)`` bucket."""
+    return f"{CALIBRATION_PREFIX}{bucket_key(dm_pc_cm3, width_samples)}"
+
+
+def build_active_inject_key(inj_id: str) -> str:
+    if not inj_id:
+        raise ValueError("inj_id must be non-empty")
+    return f"{ACTIVE_INJECT_PREFIX}{inj_id}"
+
+
+def build_match_event_key(inj_id: str) -> str:
+    if not inj_id:
+        raise ValueError("inj_id must be non-empty")
+    return f"{MATCH_EVENT_PREFIX}{inj_id}"
+
+
+# ---------------------------------------------------------------------------
+# CalibrationStore
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CalibrationEntry:
+    """One row of the per-bucket calibration table."""
+    bucket: str
+    dm_pc_cm3_rounded: int
+    width_samples: int
+    K: float
+    last_fluence_jy_ms: float
+    last_observed_snr: float
+    last_inj_id: str
+    last_calibrated_at_unix: float
+    last_target_snr: Optional[float] = None
+    actor: str = "unknown"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "CalibrationEntry":
+        return cls(
+            bucket=str(d["bucket"]),
+            dm_pc_cm3_rounded=int(d["dm_pc_cm3_rounded"]),
+            width_samples=int(d["width_samples"]),
+            K=float(d["K"]),
+            last_fluence_jy_ms=float(d["last_fluence_jy_ms"]),
+            last_observed_snr=float(d["last_observed_snr"]),
+            last_inj_id=str(d["last_inj_id"]),
+            last_calibrated_at_unix=float(d["last_calibrated_at_unix"]),
+            last_target_snr=(
+                float(d["last_target_snr"])
+                if d.get("last_target_snr") is not None else None
+            ),
+            actor=str(d.get("actor", "unknown")),
+        )
+
+
+class CalibrationStore:
+    """Persists per-``(dm_band, width)`` ``K`` constants in etcd.
+
+    The operator builds the table empirically by firing one
+    :func:`fire_calibration_probe` per (DM, width) bucket they care
+    about. The store is the single source of truth the SNR → fluence
+    translation reads from at inject-time.
+    """
+
+    def __init__(self, control_store: Any) -> None:
+        self._store = control_store
+
+    def get(
+        self, *, dm_pc_cm3: float, width_samples: int,
+    ) -> Optional[CalibrationEntry]:
+        """Return the entry for the ``(dm, width)`` bucket, or None."""
+        key = calibration_key(dm_pc_cm3, width_samples)
+        try:
+            raw = self._store.get_dict(key)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("CalibrationStore.get(%s) failed: %s", key, exc)
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            return CalibrationEntry.from_dict(raw)
+        except (KeyError, TypeError, ValueError) as exc:
+            LOG.warning(
+                "CalibrationStore.get(%s) bad payload: %s", key, exc,
+            )
+            return None
+
+    def put(self, entry: CalibrationEntry) -> str:
+        """Persist an entry; returns the etcd key written."""
+        key = f"{CALIBRATION_PREFIX}{entry.bucket}"
+        self._store.put_dict(key, entry.to_dict())
+        return key
+
+    def list_all(self) -> List[CalibrationEntry]:
+        """Return every present calibration entry, sorted by bucket."""
+        # Use the raw etcd3 client via the same path
+        # control_store.list_recent_audit walks.
+        if hasattr(self._store, "_ensure"):
+            try:
+                self._store._ensure()
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("CalibrationStore.list_all _ensure: %s", exc)
+                return []
+        client_owner = getattr(self._store, "_store", self._store)
+        try:
+            client = client_owner.get_etcd()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("CalibrationStore.list_all get_etcd: %s", exc)
+            return []
+        try:
+            pairs = list(client.get_prefix(CALIBRATION_PREFIX))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("CalibrationStore.list_all get_prefix: %s", exc)
+            return []
+        out: List[CalibrationEntry] = []
+        for value, _meta in pairs:
+            try:
+                if isinstance(value, (bytes, bytearray)):
+                    payload = json.loads(value.decode("utf-8"))
+                elif isinstance(value, str):
+                    payload = json.loads(value)
+                elif isinstance(value, Mapping):
+                    payload = dict(value)
+                else:
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "CalibrationStore.list_all bad JSON: %s", exc,
+                )
+                continue
+            try:
+                out.append(CalibrationEntry.from_dict(payload))
+            except (KeyError, TypeError, ValueError) as exc:
+                LOG.warning(
+                    "CalibrationStore.list_all bad entry: %s", exc,
+                )
+                continue
+        out.sort(key=lambda e: e.bucket)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# SNR ↔ fluence math
+# ---------------------------------------------------------------------------
+
+
+def snr_to_fluence(
+    *, target_snr: float, K: float, width_samples: int,
+) -> float:
+    """Return the fluence (Jy·ms) needed to hit ``target_snr``.
+
+    Inverts ``observed_snr = K × sqrt(fluence / width_samples)``:
+
+        fluence = width_samples × (target_snr / K)^2.
+
+    Raises :class:`ValueError` on non-positive K / width / target.
+    """
+    if not (math.isfinite(target_snr) and math.isfinite(K)):
+        raise ValueError(
+            f"target_snr={target_snr}, K={K}: must be finite"
+        )
+    if target_snr <= 0.0:
+        raise ValueError(f"target_snr={target_snr} must be > 0")
+    if K <= 0.0:
+        raise ValueError(f"K={K} must be > 0")
+    if width_samples < 1:
+        raise ValueError(f"width_samples={width_samples} must be >= 1")
+    ratio = float(target_snr) / float(K)
+    return float(width_samples) * ratio * ratio
+
+
+# ---------------------------------------------------------------------------
+# Active-injection registry helpers
+# ---------------------------------------------------------------------------
+
+
+def publish_active_inject(
+    store: Any,
+    *,
+    inj_id: str,
+    dm_pc_cm3: float,
+    l_rad: float,
+    m_rad: float,
+    width_samples: int,
+    fluence_jy_ms: float,
+    apply_at_specnum: int,
+    fired_at_unix: Optional[float] = None,
+    ttl_s: float = DEFAULT_INJECT_TTL_S,
+    fired_by: str = "unknown",
+    target_snr: Optional[float] = None,
+) -> str:
+    """PUT one ``/cnf/inject/active/<inj_id>`` row.
+
+    The C2 matcher polls this prefix and uses the payload to match
+    incoming C1 candidates. Returns the etcd key written.
+    """
+    fired = float(fired_at_unix) if fired_at_unix is not None else time.time()
+    payload: Dict[str, Any] = {
+        "inj_id": str(inj_id),
+        "dm_pc_cm3": float(dm_pc_cm3),
+        "l_rad": float(l_rad),
+        "m_rad": float(m_rad),
+        "width_samples": int(width_samples),
+        "fluence_jy_ms": float(fluence_jy_ms),
+        "apply_at_specnum": int(apply_at_specnum),
+        "fired_at_unix": fired,
+        "ttl_s": float(ttl_s),
+        "fired_by": str(fired_by),
+    }
+    if target_snr is not None:
+        payload["target_snr"] = float(target_snr)
+    key = build_active_inject_key(inj_id)
+    store.put_dict(key, payload)
+    return key
+
+
+def get_match_event(store: Any, inj_id: str) -> Optional[Dict[str, Any]]:
+    """Return the current ``/mon/dsart/inject/matches/<inj_id>`` payload."""
+    key = build_match_event_key(inj_id)
+    try:
+        raw = store.get_dict(key)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("get_match_event(%s) failed: %s", key, exc)
+        return None
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Fire-calibration-probe orchestrator
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Return value of :func:`fire_calibration_probe`."""
+    ok: bool
+    inj_id: str
+    bucket: str
+    K: Optional[float]
+    observed_snr: Optional[float]
+    observed_event_specnum: Optional[int]
+    matched_at_unix: Optional[float]
+    n_matches: int
+    elapsed_s: float
+    reason: str
+    inject_response: Optional[Dict[str, Any]] = None
+    active_key: Optional[str] = None
+    calibration_key: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def fire_calibration_probe(
+    store: Any,
+    *,
+    inject_fn: Any,
+    dm_pc_cm3: float,
+    l_rad: float = 0.0,
+    m_rad: float = 0.0,
+    width_samples: int = DEFAULT_CALIBRATION_WIDTH,
+    fluence_jy_ms: float = DEFAULT_CALIBRATION_FLUENCE,
+    profile: str = DEFAULT_CALIBRATION_PROFILE,
+    margin_blocks: Optional[int] = None,
+    chgroups: Optional[Iterable[int]] = None,
+    inj_id_prefix: str = "cal_probe",
+    user: Optional[str] = None,
+    poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    ttl_s: float = DEFAULT_INJECT_TTL_S,
+    inj_id_override: Optional[str] = None,
+    cal_store: Optional[CalibrationStore] = None,
+    time_fn: Any = time.time,
+    sleep_fn: Any = time.sleep,
+) -> ProbeResult:
+    """Fire a single calibration injection and read back K.
+
+    Workflow
+
+      1. Build a synthetic ``inj_id`` (or use ``inj_id_override``).
+      2. PUT ``/cnf/inject/active/<inj_id>`` with the probe metadata
+         so the C2 matcher matches incoming candidates against it.
+      3. Call ``inject_fn(...)`` (typically
+         :func:`control_store.control_inject_pulse`) which arms +
+         broadcasts the injection.
+      4. Poll ``/mon/dsart/inject/matches/<inj_id>`` every
+         ``poll_interval_s`` until the first match arrives or
+         ``poll_timeout_s`` elapses.
+      5. On a match, compute K = observed_snr × sqrt(width / fluence)
+         and persist it via :class:`CalibrationStore`.
+      6. Return :class:`ProbeResult`.
+
+    Parameters
+    ----------
+    store:
+        DsaStore-like object (typically the dashboard's
+        :class:`control_store.ControlStore`).
+    inject_fn:
+        Callable with the same signature as
+        :func:`control_store.control_inject_pulse`. Tests inject a
+        fake that just returns ``{"ok": True, ...}`` without
+        actually contacting corr_fast.
+    dm_pc_cm3, l_rad, m_rad, width_samples, fluence_jy_ms, profile:
+        Standard injection parameters.
+    margin_blocks, chgroups:
+        Forwarded to ``inject_fn``.
+    inj_id_prefix:
+        Becomes part of ``inj_id`` if ``inj_id_override`` is unset.
+    user:
+        Operator label, forwarded to ``inject_fn`` + audit row.
+    poll_timeout_s, poll_interval_s, ttl_s:
+        Tunables for the wait + the registry TTL.
+    inj_id_override:
+        Force a specific inj_id (handy for tests).
+    cal_store:
+        Optional pre-built :class:`CalibrationStore`. Default
+        constructs one wrapping ``store``.
+    time_fn, sleep_fn:
+        Tests inject deterministic clock + sleep helpers.
+
+    Returns
+    -------
+    ProbeResult
+        ``ok=True`` iff a match arrived and K is finite and positive.
+        On failure ``reason`` is one of ``no_match``, ``inject_failed``,
+        ``bad_K``, ``etcd_failure``.
+    """
+    t0 = float(time_fn())
+    cs = cal_store if cal_store is not None else CalibrationStore(store)
+    bucket = bucket_key(dm_pc_cm3, width_samples)
+    inj_id = inj_id_override or _build_probe_inj_id(
+        prefix=inj_id_prefix, dm=dm_pc_cm3, width=width_samples,
+        timestamp=t0,
+    )
+    # 1. Publish the active-injection registry row BEFORE arming the
+    #    pulse so the matcher already has the entry by the time the
+    #    coincidencer sees the corresponding C1 batch. The matcher's
+    #    refresh cadence is 1 s; the corr_fast → search → C2 latency
+    #    is ~1-3 s at steady state, comfortably wider.
+    try:
+        active_key = publish_active_inject(
+            store,
+            inj_id=inj_id,
+            dm_pc_cm3=float(dm_pc_cm3),
+            l_rad=float(l_rad),
+            m_rad=float(m_rad),
+            width_samples=int(width_samples),
+            fluence_jy_ms=float(fluence_jy_ms),
+            apply_at_specnum=0,           # placeholder; rewritten below
+            fired_at_unix=t0,
+            ttl_s=float(ttl_s),
+            fired_by=str(user or "calibration_probe"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("publish_active_inject(%s) failed: %s", inj_id, exc)
+        return ProbeResult(
+            ok=False, inj_id=inj_id, bucket=bucket,
+            K=None, observed_snr=None, observed_event_specnum=None,
+            matched_at_unix=None, n_matches=0,
+            elapsed_s=float(time_fn()) - t0,
+            reason=f"etcd_failure_active: {exc}",
+        )
+    # 2. Fire the injection.
+    inject_kwargs: Dict[str, Any] = {
+        "inj_id": inj_id,
+        "l_rad": float(l_rad),
+        "m_rad": float(m_rad),
+        "dm_pc_cm3": float(dm_pc_cm3),
+        "fluence_jy_ms": float(fluence_jy_ms),
+        "width_samples": int(width_samples),
+        "profile": str(profile),
+        "apply_at_specnum": None,         # auto-arm
+        "user": user,
+    }
+    if margin_blocks is not None:
+        inject_kwargs["margin_blocks"] = int(margin_blocks)
+    if chgroups is not None:
+        inject_kwargs["chgroups"] = tuple(int(c) for c in chgroups)
+    try:
+        inject_response = inject_fn(store, **inject_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("inject_fn(%s) failed: %s", inj_id, exc)
+        return ProbeResult(
+            ok=False, inj_id=inj_id, bucket=bucket,
+            K=None, observed_snr=None, observed_event_specnum=None,
+            matched_at_unix=None, n_matches=0,
+            elapsed_s=float(time_fn()) - t0,
+            reason=f"inject_failed: {exc}",
+            active_key=active_key,
+        )
+    if not isinstance(inject_response, Mapping):
+        inject_response = {"raw": str(inject_response)}
+    if not inject_response.get("ok"):
+        return ProbeResult(
+            ok=False, inj_id=inj_id, bucket=bucket,
+            K=None, observed_snr=None, observed_event_specnum=None,
+            matched_at_unix=None, n_matches=0,
+            elapsed_s=float(time_fn()) - t0,
+            reason=f"inject_failed: {inject_response.get('error', 'unknown')}",
+            inject_response=dict(inject_response),
+            active_key=active_key,
+        )
+    # 3. Update the active-inject row with the derived apply_at_specnum
+    #    so the registry is self-describing for the dashboard's UI.
+    derived_apply_at = _extract_apply_at(inject_response)
+    if derived_apply_at is not None:
+        try:
+            publish_active_inject(
+                store,
+                inj_id=inj_id,
+                dm_pc_cm3=float(dm_pc_cm3),
+                l_rad=float(l_rad),
+                m_rad=float(m_rad),
+                width_samples=int(width_samples),
+                fluence_jy_ms=float(fluence_jy_ms),
+                apply_at_specnum=int(derived_apply_at),
+                fired_at_unix=t0,
+                ttl_s=float(ttl_s),
+                fired_by=str(user or "calibration_probe"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(
+                "publish_active_inject re-write for %s failed: %s",
+                inj_id, exc,
+            )
+    # 4. Poll the match-event key.
+    deadline = t0 + float(poll_timeout_s)
+    while True:
+        now = float(time_fn())
+        match = get_match_event(store, inj_id)
+        if isinstance(match, Mapping):
+            best = match.get("best")
+            n_matches = int(match.get("n_matches", 0) or 0)
+            if isinstance(best, Mapping):
+                observed_snr = best.get("observed_snr")
+                observed_specnum = best.get("observed_event_specnum")
+                matched_at = best.get("matched_at_unix")
+                if isinstance(observed_snr, (int, float)) and observed_snr > 0:
+                    K = float(best.get("K_inferred", 0.0) or 0.0)
+                    if not (math.isfinite(K) and K > 0.0):
+                        # Best didn't compute a usable K (e.g. fluence
+                        # was zero). Bail.
+                        return ProbeResult(
+                            ok=False, inj_id=inj_id, bucket=bucket,
+                            K=K if math.isfinite(K) else None,
+                            observed_snr=float(observed_snr),
+                            observed_event_specnum=(
+                                int(observed_specnum)
+                                if isinstance(observed_specnum, int)
+                                else None
+                            ),
+                            matched_at_unix=(
+                                float(matched_at)
+                                if isinstance(matched_at, (int, float))
+                                else None
+                            ),
+                            n_matches=n_matches,
+                            elapsed_s=now - t0,
+                            reason="bad_K",
+                            inject_response=dict(inject_response),
+                            active_key=active_key,
+                        )
+                    entry = CalibrationEntry(
+                        bucket=bucket,
+                        dm_pc_cm3_rounded=int(
+                            round(float(dm_pc_cm3) / DM_BUCKET_PC_CC)
+                            * int(DM_BUCKET_PC_CC),
+                        ),
+                        width_samples=int(width_samples),
+                        K=K,
+                        last_fluence_jy_ms=float(fluence_jy_ms),
+                        last_observed_snr=float(observed_snr),
+                        last_inj_id=inj_id,
+                        last_calibrated_at_unix=(
+                            float(matched_at)
+                            if isinstance(matched_at, (int, float))
+                            else now
+                        ),
+                        actor=str(user or "calibration_probe"),
+                    )
+                    try:
+                        cal_key = cs.put(entry)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.error(
+                            "CalibrationStore.put(%s) failed: %s",
+                            entry.bucket, exc,
+                        )
+                        return ProbeResult(
+                            ok=False, inj_id=inj_id, bucket=bucket,
+                            K=K, observed_snr=float(observed_snr),
+                            observed_event_specnum=(
+                                int(observed_specnum)
+                                if isinstance(observed_specnum, int)
+                                else None
+                            ),
+                            matched_at_unix=(
+                                float(matched_at)
+                                if isinstance(matched_at, (int, float))
+                                else None
+                            ),
+                            n_matches=n_matches,
+                            elapsed_s=now - t0,
+                            reason=f"etcd_failure_store: {exc}",
+                            inject_response=dict(inject_response),
+                            active_key=active_key,
+                        )
+                    return ProbeResult(
+                        ok=True, inj_id=inj_id, bucket=bucket,
+                        K=K,
+                        observed_snr=float(observed_snr),
+                        observed_event_specnum=(
+                            int(observed_specnum)
+                            if isinstance(observed_specnum, int)
+                            else None
+                        ),
+                        matched_at_unix=(
+                            float(matched_at)
+                            if isinstance(matched_at, (int, float))
+                            else None
+                        ),
+                        n_matches=n_matches,
+                        elapsed_s=now - t0,
+                        reason="ok",
+                        inject_response=dict(inject_response),
+                        active_key=active_key,
+                        calibration_key=cal_key,
+                    )
+        if now >= deadline:
+            return ProbeResult(
+                ok=False, inj_id=inj_id, bucket=bucket,
+                K=None, observed_snr=None, observed_event_specnum=None,
+                matched_at_unix=None, n_matches=0,
+                elapsed_s=now - t0,
+                reason="no_match",
+                inject_response=dict(inject_response),
+                active_key=active_key,
+            )
+        sleep_fn(float(poll_interval_s))
+
+
+def _build_probe_inj_id(
+    *, prefix: str, dm: float, width: int, timestamp: float,
+) -> str:
+    """Build a unique-ish inj_id for a probe.
+
+    Format: ``{prefix}_dm{rounded}_w{width}_t{unix_int}``.
+    """
+    dm_int = int(round(float(dm)))
+    return (
+        f"{prefix}_dm{dm_int}_w{int(width)}_t{int(round(float(timestamp)))}"
+    )
+
+
+def _extract_apply_at(inject_response: Mapping[str, Any]) -> Optional[int]:
+    """Pull the corr-side apply_at_specnum out of a
+    ``control_inject_pulse`` response (or ``None`` if absent).
+    """
+    val = inject_response.get("val")
+    if isinstance(val, Mapping):
+        apply_at = val.get("apply_at_specnum")
+        if isinstance(apply_at, int):
+            return apply_at
+    return None
+
+
+__all__ = [
+    "ACTIVE_INJECT_PREFIX",
+    "MATCH_EVENT_PREFIX",
+    "CALIBRATION_PREFIX",
+    "DM_BUCKET_PC_CC",
+    "DEFAULT_CALIBRATION_FLUENCE",
+    "DEFAULT_CALIBRATION_WIDTH",
+    "DEFAULT_CALIBRATION_PROFILE",
+    "DEFAULT_INJECT_TTL_S",
+    "DEFAULT_POLL_INTERVAL_S",
+    "DEFAULT_POLL_TIMEOUT_S",
+    "CalibrationEntry",
+    "CalibrationStore",
+    "ProbeResult",
+    "bucket_key",
+    "calibration_key",
+    "build_active_inject_key",
+    "build_match_event_key",
+    "publish_active_inject",
+    "get_match_event",
+    "snr_to_fluence",
+    "fire_calibration_probe",
+]

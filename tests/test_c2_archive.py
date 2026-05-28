@@ -136,12 +136,40 @@ def test_archive_writes_c1_window_csv(tmp_path: Path) -> None:
     )
     assert p == ev / "Level2" / "C1_window_260521abcd.csv"
     lines = p.read_text().splitlines()
-    assert tuple(lines[0].split(",")) == C1_WINDOW_CSV_FIELDS
+    fields = tuple(lines[0].split(","))
+    assert fields == C1_WINDOW_CSV_FIELDS
     # Header + 2 rows.
     assert len(lines) == 3
-    # Each row's trigger field reads "260521abcd"
+    # Each row's trigger field carries the event name. (The schema
+    # appended ``inj_id`` after ``trigger`` for M7.4 Phase 6c.A; both
+    # columns are looked up by name so the assertion is robust to
+    # future schema appends.)
+    trigger_idx = fields.index("trigger")
+    inj_id_idx = fields.index("inj_id")
     for ln in lines[1:]:
-        assert ln.split(",")[-1] == "260521abcd"
+        cells = ln.split(",")
+        assert cells[trigger_idx] == "260521abcd"
+        # No active-injection registry in this test → empty inj_id.
+        assert cells[inj_id_idx] == ""
+
+
+def test_archive_writes_c1_window_csv_with_inj_ids(tmp_path: Path) -> None:
+    """Members tagged via ``inj_ids`` map carry the label in the CSV."""
+    wr = EventArchiveWriter(tmp_path / "candidates")
+    ev = wr.create("260521efgh")
+    members = [
+        _entry(event_specnum=10, search_node_id=1, gpu_half=0),
+        _entry(event_specnum=20, search_node_id=2, gpu_half=1),
+    ]
+    inj_ids = {id(members[0]): "phase6c_dm500"}
+    p = wr.write_c1_window_csv(
+        ev, "260521efgh", members, trigger="260521efgh", inj_ids=inj_ids,
+    )
+    text = p.read_text().splitlines()
+    fields = tuple(text[0].split(","))
+    inj_idx = fields.index("inj_id")
+    assert text[1].split(",")[inj_idx] == "phase6c_dm500"
+    assert text[2].split(",")[inj_idx] == ""
 
 
 def test_archive_writes_l3_metadata(tmp_path: Path) -> None:
