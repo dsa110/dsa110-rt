@@ -341,6 +341,7 @@ class CoincidencerService:
         # Bookkeeping / mon-points.
         self._counters: Dict[str, int] = {
             "rows_in": 0,
+            "rows_late_drop": 0,
             "components_evaluated": 0,
             "triggers_dump": 0,
             "triggers_log_only": 0,
@@ -450,17 +451,41 @@ class CoincidencerService:
             return
         new_entries = self._window.add(batch.header, batch.candidates)
         aged = self._window.aged_out()
-        if aged:
-            self._graph.remove_many(aged)
-        for e in new_entries:
+        # Split aged into "really aged" entries (were already in the window
+        # at the start of this batch) and "late arrivals" (rows that came in
+        # with mjd already below the window cutoff and were inserted then
+        # immediately popped by the same age-out pass). Without this split
+        # we'd graph.add the late arrivals (since they appear in new_entries)
+        # which makes the components graph diverge from the window: the
+        # window correctly drops them but the graph would carry them
+        # forever, producing the graph_size >> window_size leak observed
+        # in /mon/c2/h23. The leak is triggered any time the search side
+        # restarts with mjd_at_specnum_0=0 (so a fresh session's batches
+        # arrive with mjd values older than the C2 window's anchor) — but
+        # the contract belongs here regardless: graph membership must
+        # mirror window membership.
+        new_id_to_entry = {id(e): e for e in new_entries}
+        late_arrivals_ids = {id(e) for e in aged if id(e) in new_id_to_entry}
+        really_aged = [e for e in aged if id(e) not in new_id_to_entry]
+        if really_aged:
+            self._graph.remove_many(really_aged)
+        survivors = [e for e in new_entries if id(e) not in late_arrivals_ids]
+        for e in survivors:
             self._graph.add(e)
         self._counters["rows_in"] += len(new_entries)
+        if late_arrivals_ids:
+            self._counters["rows_late_drop"] = (
+                self._counters.get("rows_late_drop", 0)
+                + len(late_arrivals_ids)
+            )
 
         # Hot-reload criteria if the file mtime changed under us.
         self._criteria.reload_if_changed()
 
         # Write the per-row C1 hiplot CSV for *every* received candidate
-        # (independent of triggering).
+        # (independent of triggering) — including late arrivals, so the
+        # csv is a faithful record of what hit the wire even when those
+        # rows didn't make it into the in-window graph.
         now_utc = datetime.now(timezone.utc)
         for e in new_entries:
             self._c1_csv.append_row(
@@ -468,9 +493,12 @@ class CoincidencerService:
                 now_utc=now_utc,
             )
 
-        # Walk only the components touched by this batch.
+        # Walk only the components touched by this batch. ``survivors`` are
+        # the new_entries that actually made it into the graph; passing
+        # late arrivals here would be harmless (components_touched skips
+        # ids not in the graph) but ``survivors`` is the clearer contract.
         gal_dm = self._current_gal_dm_max_los()
-        touched = self._graph.components_touched(new_entries)
+        touched = self._graph.components_touched(survivors)
         for comp_id in touched:
             members = self._graph.component_members(comp_id)
             if not members:
