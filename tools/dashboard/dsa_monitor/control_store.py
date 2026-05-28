@@ -39,6 +39,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -327,6 +328,152 @@ def compute_arm_seq(
 
 
 # ---------------------------------------------------------------------------
+# M7.4 Phase 6c: corr_fast service-start epoch arm for injection
+# ---------------------------------------------------------------------------
+#
+# ``compute_arm_seq`` above derives the *SNAP-header* epoch (the
+# ``last_seq_no`` published by capture_control). That epoch is the
+# right one for ``utc_start``, but the corr_fast hot path's
+# ``OnlineInjector.apply_block`` consumes the *service-start* epoch
+# (``block_n × NPACKETS_PER_BLOCK``). The two differ by ~3 orders of
+# magnitude (Bug 1 in M7.4_PHASE6_E2E_REPORT.md). Until M7.2.8 lifts
+# corr_fast onto the SNAP-header epoch, we publish the service-start
+# epoch from corr_fast via :mod:`dsart.services.corr_fast_mon` and
+# consume it here.
+# ---------------------------------------------------------------------------
+
+#: Default margin in *blocks* (NPACKETS_PER_BLOCK = 2048 specnums each)
+#: ahead of the fleet's current ``block_n`` to schedule the injection.
+#: 16 blocks ≈ 2 s at the production 8 cubes/s rate, plenty of head-
+#: room for the etcd watch + ``OnlineInjector.add_pending`` round-trip
+#: while still landing the pulse in the next ~few cubes.
+DEFAULT_INJECT_MARGIN_BLOCKS: int = 16
+
+#: Local copy of ``corr_fast_integration.NPACKETS_PER_BLOCK``. Pinned
+#: here so the dashboard doesn't need to import torch via dsart.
+#: Drift would be caught by the
+#: :func:`tests/test_dsa_monitor_control_store.py::TestComputeInjectApplyAt`
+#: assertions.
+NPACKETS_PER_BLOCK: int = 2048
+
+
+def _corr_fast_mon_key(chgroup: int) -> str:
+    """Canonical etcd key the corr_fast service-start mon-publisher
+    writes to. Duplicated from
+    :func:`dsart.services.corr_fast_mon.build_corr_fast_mon_key`
+    because the dashboard env does not import dsart.
+    """
+    return f"/mon/corr_rt/{int(chgroup)}/corr_fast"
+
+
+def compute_inject_apply_at(
+    store: ControlStore,
+    *,
+    margin_blocks: int = DEFAULT_INJECT_MARGIN_BLOCKS,
+    chgroups: Iterable[int] = tuple(range(16)),
+    max_age_s: float = 10.0,
+) -> dict[str, Any]:
+    """Compute ``apply_at_specnum`` in the corr_fast service-start
+    epoch.
+
+    Walks ``/mon/corr_rt/<cn>/corr_fast`` for each requested chgroup,
+    reads ``block_specnum_start`` + ``ts_mono``, drops entries older
+    than ``max_age_s`` (stale publishers from a previous routine), and
+    returns ``max(block_specnum_start) + margin_blocks * NPACKETS_PER_BLOCK``.
+
+    We pick the *max* (not min) so even the latest-running corr_fast
+    has caught up to the target block by the time the inject fires.
+    The margin then absorbs the per-chgroup clock skew across the
+    fleet (typically a handful of blocks at steady state, more during
+    startup).
+
+    Returns a dict matching :func:`compute_arm_seq`'s shape:
+
+    .. code-block:: python
+
+        {
+            "apply_at_specnum": int | None,
+            "margin_blocks": int,
+            "npackets_per_block": int,
+            "max_block_specnum_start": int | None,
+            "max_source": str | None,
+            "max_block_n": int | None,
+            "polled": list[str],
+            "answered": list[str],
+            "missing": list[str],
+            "stale": list[str],
+        }
+
+    ``apply_at_specnum`` is ``None`` iff no corr_fast publishers are
+    answering — the caller (UI / API) should refuse to broadcast.
+
+    Implementation note: the per-publisher ``ts_mono`` field is the
+    publisher's local monotonic clock — comparing it to *our* wall
+    clock is nonsense across hosts. We compare ``ts_wall_unix`` (UTC
+    wall-clock) against the current wall-clock and reject anything
+    older than ``max_age_s``. NTP keeps the cluster within ~ms of
+    each other so a 10 s threshold is safe.
+    """
+    out: dict[str, Any] = {
+        "apply_at_specnum": None,
+        "margin_blocks": int(margin_blocks),
+        "npackets_per_block": int(NPACKETS_PER_BLOCK),
+        "max_block_specnum_start": None,
+        "max_source": None,
+        "max_block_n": None,
+        "polled": [],
+        "answered": [],
+        "missing": [],
+        "stale": [],
+    }
+    cg_list = list(chgroups)
+    keys = [_corr_fast_mon_key(cg) for cg in cg_list]
+    out["polled"] = list(keys)
+    now_wall = time.time()
+    max_bss: int | None = None
+    max_block_n: int | None = None
+    max_src: str | None = None
+    for k in keys:
+        try:
+            d = store.get_dict(k)
+        except Exception as exc:                              # noqa: BLE001
+            LOG.warning(
+                "compute_inject_apply_at get_dict(%s) failed: %s", k, exc,
+            )
+            out["missing"].append(k)
+            continue
+        if not isinstance(d, dict):
+            out["missing"].append(k)
+            continue
+        bss = d.get("block_specnum_start")
+        if not isinstance(bss, int):
+            out["missing"].append(k)
+            continue
+        ts_wall = d.get("ts_wall_unix")
+        if isinstance(ts_wall, (int, float)):
+            age_s = float(now_wall - float(ts_wall))
+            if age_s > max_age_s:
+                out["stale"].append(k)
+                continue
+        out["answered"].append(k)
+        if max_bss is None or bss > max_bss:
+            max_bss = int(bss)
+            max_src = k
+            blk_n = d.get("block_n")
+            if isinstance(blk_n, int):
+                max_block_n = int(blk_n)
+    if max_bss is None:
+        return out
+    out["max_block_specnum_start"] = max_bss
+    out["max_source"] = max_src
+    out["max_block_n"] = max_block_n
+    out["apply_at_specnum"] = (
+        max_bss + int(margin_blocks) * int(NPACKETS_PER_BLOCK)
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------------------
 
@@ -572,37 +719,44 @@ def control_inject_pulse(
     width_samples: int,
     profile: str,
     apply_at_specnum: int | None,
-    margin: int = DEFAULT_ARM_SEQ_MARGIN,
+    margin_blocks: int = DEFAULT_INJECT_MARGIN_BLOCKS,
     chgroups: Iterable[int] = DEFAULT_INJECT_CHGROUPS,
     user: str | None = None,
 ) -> dict[str, Any]:
     """High-level helper for the Control tab.
 
-    Same surface as :func:`send_inject` but ``apply_at_specnum``
-    may be ``None`` — in which case we compute it as
-    ``max(last_seq_no across captures) + margin`` (the same
-    computation :func:`compute_arm_seq` uses for ``utc_start``).
-    This is the operator's "inject as soon as possible" path: the
-    pulse lands ``margin`` specnums (~32.768 µs each) after the
-    current capture front-edge, which gives the corr-fast pipeline
-    enough headroom to receive + queue the injection before the
-    target block arrives.
+    Same surface as :func:`send_inject` but ``apply_at_specnum`` may
+    be ``None`` — in which case we compute it via
+    :func:`compute_inject_apply_at` (corr_fast service-start epoch
+    ``max(block_specnum_start) + margin_blocks × NPACKETS_PER_BLOCK``).
+
+    Why not :func:`compute_arm_seq` (which mirrors ``utc_start``)? The
+    corr_fast hot path's ``OnlineInjector.apply_block`` consumes the
+    *service-start* epoch (``block_n × NPACKETS_PER_BLOCK`` ≈ 10⁷
+    after 17 min) while ``last_seq_no`` runs in the *SNAP-header*
+    epoch (≈ 10¹⁰ after months of uptime). Until M7.2.8 lifts
+    corr_fast onto the SNAP-header epoch, the inject path needs the
+    publisher set up by ``dsart.services.corr_fast_mon`` (active
+    whenever corr_fast was launched with ``--inject-watch``).
 
     Returns the dict :func:`send_inject` returns, plus an extra
     ``arm_info`` key describing how ``apply_at_specnum`` was derived
     (handy for the UI to confirm what the auto-pick produced).
     """
     if apply_at_specnum is None:
-        info = compute_arm_seq(store, margin=margin)
-        if info["arm_seq"] is None:
+        info = compute_inject_apply_at(
+            store, margin_blocks=margin_blocks, chgroups=chgroups,
+        )
+        if info["apply_at_specnum"] is None:
             audit_log(
                 store, namespace="dsart.inject",
                 cn_target=",".join(str(c) for c in chgroups),
                 cmd="inject", val=None, ok=False,
                 note=(
-                    f"refused (auto-arm): no captures answering "
-                    f"({len(info['missing'])} missing, "
-                    f"{len(info['answered'])} answered)"
+                    f"refused (auto-arm): no corr_fast publishers "
+                    f"answering ({len(info['missing'])} missing, "
+                    f"{len(info['answered'])} answered, "
+                    f"{len(info['stale'])} stale)"
                 ),
                 user=user,
             )
@@ -610,14 +764,15 @@ def control_inject_pulse(
                 "ok": False,
                 "cmd": "inject",
                 "error": (
-                    "apply_at_specnum=null requested but no captures "
-                    "are answering last_seq_no — cannot derive a safe "
-                    "specnum. Either start the capture fleet first or "
-                    "pass apply_at_specnum explicitly."
+                    "apply_at_specnum=null requested but no "
+                    "/mon/corr_rt/<cn>/corr_fast publishers are "
+                    "answering — is the fleet up with --inject-watch "
+                    "enabled? Either start the corr_fast routines "
+                    "first or pass apply_at_specnum explicitly."
                 ),
                 "info": info,
             }
-        derived_specnum = int(info["arm_seq"])
+        derived_specnum = int(info["apply_at_specnum"])
     else:
         info = None
         derived_specnum = int(apply_at_specnum)

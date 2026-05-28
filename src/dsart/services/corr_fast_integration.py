@@ -3216,6 +3216,7 @@ def run(
         # ``{cmd: "inject", val: <InjectionConfig dict>}`` PUTs into
         # the running service without a restart.
         inject_watch: RuntimeInjectWatch | None = None
+        mon_publisher: "CorrFastMonPublisher | None" = None
         if cfg.inject_watch_enabled:
             if ctx.injector is None:
                 raise RuntimeError(
@@ -3227,6 +3228,16 @@ def run(
                 injector=ctx.injector, chgroup=int(cfg.chgroup),
             )
             inject_watch.start()
+            # M7.4 Phase 6c: publish corr_fast service-start epoch to
+            # /mon/corr_rt/<chgroup>/corr_fast so the dashboard's Control
+            # tab "Send injection" can derive apply_at_specnum in the
+            # SAME epoch the hot path uses (block_n × NPACKETS_PER_BLOCK).
+            # Fixes Bug 1 from the 2026-05-28 E2E.
+            from dsart.services.corr_fast_mon import CorrFastMonPublisher
+            mon_publisher = CorrFastMonPublisher(
+                chgroup=int(cfg.chgroup),
+                npackets_per_block=NPACKETS_PER_BLOCK,
+            )
 
         # ── M7.2 production async TX path ─────────────────────────────
         # Spawn AsyncTransportTx workers now that gridder.pattern is
@@ -3601,6 +3612,14 @@ def run(
                     "last_block=%.1fms",
                     n_in, n_processed, n_drop, n_tx_total, per_block_ms[-1],
                 )
+                if mon_publisher is not None:
+                    mon_publisher.publish(
+                        block_n=n_in,
+                        n_processed=n_processed,
+                        n_drop=n_drop,
+                        n_tx=n_tx_total,
+                        last_block_ms=per_block_ms[-1],
+                    )
 
             if max_blocks is not None and n_in >= max_blocks:
                 LOG.info("hit --max-blocks=%d; stopping", max_blocks)

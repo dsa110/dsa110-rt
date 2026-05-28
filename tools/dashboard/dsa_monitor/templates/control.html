@@ -212,12 +212,12 @@
                 <div class="verb-row">
                     <label for="apply_at_specnum">apply_at_specnum</label>
                     <input type="text" id="apply_at_specnum" name="apply_at_specnum"
-                           placeholder="(blank → auto-arm now+margin)" />
+                           placeholder="(blank → auto-arm now+margin_blocks)" />
                 </div>
                 <div class="verb-row">
-                    <label for="inject_margin">margin (auto)</label>
-                    <input type="number" id="inject_margin" name="margin"
-                           value="{{ default_arm_margin }}" min="0" step="1000" />
+                    <label for="inject_margin_blocks">margin (blocks)</label>
+                    <input type="number" id="inject_margin_blocks" name="margin_blocks"
+                           value="{{ default_inject_margin_blocks }}" min="1" step="1" />
                 </div>
                 <div class="verb-row">
                     <label for="chgroups">chgroups</label>
@@ -231,12 +231,20 @@
         </div>
         <div class="muted">
             Leave <code>apply_at_specnum</code> blank for "as soon as
-            possible" (computes current ARM_SEQ + margin from the 32
-            capture mon-keys, same as the Arm-now button). Defaults
-            shown produce a 50 Jy·ms / DM=500 / width=32-sample
-            extragalactic test pulse at boresight — good first smoke
-            test once <code>--inject-watch</code> is active on the
-            fleet.
+            possible" — the dashboard reads
+            <code>/mon/corr_rt/&lt;cn&gt;/corr_fast.block_specnum_start</code>
+            from every running corr_fast (published every 16 blocks
+            by the M7.4 Phase 6c publisher) and arms the inject at
+            <code>max(block_specnum_start) + margin_blocks ×
+            NPACKETS_PER_BLOCK</code>. Default margin
+            <code>{{ default_inject_margin_blocks }}</code> blocks ≈
+            {{ '%.2f'|format(default_inject_margin_blocks * 2048 * 32.768e-6) }} s
+            ahead of the fleet's current block_n at the chosen
+            steady-state cubes/s rate.
+            <br>
+            Defaults shown produce a 50 Jy·ms / DM=500 / width=32-
+            sample test pulse at boresight — good first smoke test
+            once <code>--inject-watch</code> is active on the fleet.
         </div>
         <div id="resp-inject" class="response"></div>
     </form>

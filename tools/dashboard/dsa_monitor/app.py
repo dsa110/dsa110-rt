@@ -60,10 +60,12 @@ from control_store import (
     CORR_CN_IDS,
     DEFAULT_ARM_SEQ_MARGIN,
     DEFAULT_INJECT_CHGROUPS,
+    DEFAULT_INJECT_MARGIN_BLOCKS,
     SEARCH_CN_IDS,
     ControlStore,
     audit_log,
     compute_arm_seq,
+    compute_inject_apply_at,
     control_inject_pulse,
     control_start_fleet,
     control_stop_fleet,
@@ -346,6 +348,7 @@ def control_page():
         arm_info=arm_info,
         recent_audit=recent,
         default_arm_margin=DEFAULT_ARM_SEQ_MARGIN,
+        default_inject_margin_blocks=DEFAULT_INJECT_MARGIN_BLOCKS,
     )
 
 
@@ -436,19 +439,24 @@ def control_utc_stop_post():
 def control_inject_post():
     """M7.4 Phase 6: push a runtime injection to one or more chgroups.
 
-    Form fields (all required except ``apply_at_specnum`` and
-    ``chgroups``):
+    Form fields (all required except ``apply_at_specnum``,
+    ``margin_blocks``, and ``chgroups``):
 
-      inj_id          str (e.g. "phase6_extragal_t1")
+      inj_id          str (e.g. "phase6c_extragal_t1")
       l_rad           float, |l| < 1
       m_rad           float, |m| < 1 and l^2 + m^2 < 1
       dm_pc_cm3       float
       fluence_jy_ms   float
       width_samples   int, 1..MAX_WIDTH_SAMPLES
       profile         "gaussian" | "boxcar"
-      apply_at_specnum   int (omit → auto-arm via compute_arm_seq+margin)
-      margin          int (auto-arm only; default ``DEFAULT_ARM_SEQ_MARGIN``)
-      chgroups        comma-separated ints, e.g. "0,1,2" (omit → all 16)
+      apply_at_specnum   int (omit → auto-arm via
+                            ``compute_inject_apply_at`` reading
+                            ``/mon/corr_rt/<cn>/corr_fast``)
+      margin_blocks   int blocks ahead of fleet ``block_n`` for
+                      auto-arm (default
+                      ``DEFAULT_INJECT_MARGIN_BLOCKS = 16``)
+      chgroups        comma-separated ints, e.g. "0,1,2"
+                      (omit → all 16)
     """
     f = request.form
     try:
@@ -460,7 +468,9 @@ def control_inject_post():
             "fluence_jy_ms": float(f.get("fluence_jy_ms", "0")),
             "width_samples": int(f.get("width_samples", "1")),
             "profile": (f.get("profile") or "gaussian").strip(),
-            "margin": int(f.get("margin") or DEFAULT_ARM_SEQ_MARGIN),
+            "margin_blocks": int(
+                f.get("margin_blocks") or DEFAULT_INJECT_MARGIN_BLOCKS
+            ),
         }
     except ValueError as exc:
         return jsonify({"ok": False, "error": f"bad numeric field: {exc}"}), 400
