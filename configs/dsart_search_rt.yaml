@@ -320,8 +320,32 @@ routines:
 #             is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 8.0                       # Production: 8σ floor (Phase 1a FA test: at 6sigma we measured ~6 cands/cube/half on pure Gaussian, matching Q(6)~9.9e-10 x 6.4e9 trials = 6.3 cands/cube. Coverage correction is required for this to hold; see cube_pipeline.py M7.4.2 notes).
-  cube_ring_depth: 8                 # Production: 8 slots ~ 1.1s retention at 7.45 cubes/s -- enough for the C2 trigger window (Galactic-DM clustering + slow-fast pipeline jitter). Each slot is t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16; 8 slots = 26 GiB per gpu_half (n01: 50 GiB pinned across 2 halves, within the 256 GiB host budget). DtoH burden per cube is amortised by overlapping with the next cube's L1/detector work; M7.4.1 GPU-scatter freed up ~50 ms of H2D budget which more than compensates for the ~25 ms/cube DtoH cost.
+  snr_min: 12.0                      # Phase 6c (M7.4 commissioning): raised from 8.0 → 12.0 to suppress
+                                     # the persistent on-sky RFI floor that was generating ~6.8 cluster windows/s
+                                     # at C2 (10260 LOG / 25 min in the 2026-05-28 soak), with up to ~3300 cands per
+                                     # window from a stable RFI source at DM≈1655 pc/cc, snr_max≈12.92. That
+                                     # volume saturated the search→h23 C1 emit (n01-g0 dropped 99.8% of batches,
+                                     # total_dropped=7800/7815) and lagged C2 windowing by ~25s, so all dump
+                                     # triggers reached search nodes as ``too_late`` and zero cubes were dumped.
+                                     # 12.0 is consistent with the floor of the ``bright_galactic`` C2 trigger
+                                     # criterion, and on-sky injections (fluence ≥ 50 Jy·ms) will sit well above
+                                     # it. Lower back toward 8.0 for production once the RFI source is
+                                     # mitigated (NUMA-pinned imager / RFI mask refinement / Phase 6c.E zero-
+                                     # fill).
+                                     # Phase 1a FA reference: at 6σ we measured ~6 cands/cube/half on pure
+                                     # Gaussian, matching Q(6)~9.9e-10 × 6.4e9 trials = 6.3 cands/cube.
+                                     # Coverage correction is required for this to hold; see cube_pipeline.py
+                                     # M7.4.2 notes.
+  cube_ring_depth: 16                # Phase 6c: doubled from 8 → 16 (≈2.2s retention at 7.45 cubes/s) to widen
+                                     # the cube-retention window we present to C2-triggered dumps. With C2
+                                     # trigger latency under load occasionally reaching several seconds, the
+                                     # prior 8-slot ring was too tight: many real DUMP triggers landed
+                                     # ``too_late``. 16 slots = ~52 GiB pinned per gpu_half (~104 GiB per
+                                     # 2-GPU search node, comfortably inside the 256 GiB host budget). Each
+                                     # slot is t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16. DtoH burden per cube is
+                                     # amortised by overlapping with the next cube's L1/detector work; M7.4.1
+                                     # GPU-scatter freed up ~50 ms of H2D budget which more than compensates
+                                     # for the ~25 ms/cube DtoH cost.
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index
@@ -336,7 +360,7 @@ c1:
     base_port: 11227                 # actual port = base_port + gpu_half
   dump_root: /home/ubuntu/data/c2/cube_dump
   uploader:
-    remote_root: ubuntu@lxd110h23:/dataz/dsa110/candidates
+    remote_root: ubuntu@lxd110h23.pro.pvt:/dataz/dsa110/candidates   # FQDN: search nodes can't resolve bare 'lxd110h23'
     bandwidth_limit_kbps: 0          # 0 = unlimited
 
 # Cube geometry knobs shared with the merger block. The merger reads

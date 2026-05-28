@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from typing import Any
 from unittest import mock
 
@@ -544,30 +545,41 @@ class TestControlInjectPulse:
         else:
             pytest.fail("inject PUT not found")
 
-    def test_auto_arm_uses_compute_arm_seq(self):
+    def test_auto_arm_uses_compute_inject_apply_at(self):
+        """Phase 6c: auto-arm walks /mon/corr_rt/<cn>/corr_fast (NOT
+        /capture/...) and arms at max(block_specnum_start) +
+        margin_blocks × NPACKETS_PER_BLOCK."""
+        now = time.time()
         responses = {
-            "/mon/corr_rt/3/capture/4011": {"last_seq_no": 5_000_000},
+            "/mon/corr_rt/0/corr_fast": {
+                "block_n": 1000,
+                "block_specnum_start": 1000 * 2048,
+                "ts_wall_unix": now,
+            },
         }
         fake = FakeDsaStore(get_dict_responses=responses)
         cs = control_store.ControlStore()
         cs._store = fake
         out = control_store.control_inject_pulse(
-            cs, apply_at_specnum=None, margin=60_000,
+            cs, apply_at_specnum=None, margin_blocks=16,
             chgroups=(0,), **self._valid,
         )
         assert out["ok"] is True
         assert out["auto_arm"] is True
-        # max=5_000_000, margin=60_000 → 5_060_000
-        assert out["val"]["apply_at_specnum"] == 5_060_000
-        assert out["arm_info"]["max_last_seq_no"] == 5_000_000
+        # max=1000*2048=2_048_000, +16*2048=32_768 → 2_080_768
+        assert out["val"]["apply_at_specnum"] == 1000 * 2048 + 16 * 2048
+        assert out["arm_info"]["max_block_specnum_start"] == 1000 * 2048
+        assert out["arm_info"]["max_block_n"] == 1000
 
-    def test_auto_arm_refuses_when_no_captures_answer(self, fake_store_pair):
+    def test_auto_arm_refuses_when_no_corr_fast_publishers(
+        self, fake_store_pair,
+    ):
         cs, fake = fake_store_pair
         out = control_store.control_inject_pulse(
             cs, apply_at_specnum=None, chgroups=(0,), **self._valid,
         )
         assert out["ok"] is False
-        assert "no captures" in out["error"].lower()
+        assert "no /mon/corr_rt" in out["error"]
         # Only an audit row, no inject PUT.
         inject_puts = [
             p for p in fake.puts if p[0].startswith("/cmd/dsart/corr/")
@@ -580,6 +592,129 @@ class TestControlInjectPulse:
         assert audit_puts[0][1]["ok"] is False
 
 
+class TestComputeInjectApplyAt:
+    """M7.4 Phase 6c: compute_inject_apply_at walks
+    /mon/corr_rt/<cn>/corr_fast and arms at
+    max(block_specnum_start) + margin_blocks × NPACKETS_PER_BLOCK."""
+
+    def test_single_chgroup_arms_at_max_plus_margin(self):
+        now = time.time()
+        responses = {
+            "/mon/corr_rt/0/corr_fast": {
+                "block_n": 500,
+                "block_specnum_start": 500 * 2048,
+                "ts_wall_unix": now,
+            },
+        }
+        fake = FakeDsaStore(get_dict_responses=responses)
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.compute_inject_apply_at(
+            cs, margin_blocks=16, chgroups=(0,),
+        )
+        assert out["apply_at_specnum"] == 500 * 2048 + 16 * 2048
+        assert out["max_block_specnum_start"] == 500 * 2048
+        assert out["max_block_n"] == 500
+        assert out["max_source"] == "/mon/corr_rt/0/corr_fast"
+        assert out["answered"] == ["/mon/corr_rt/0/corr_fast"]
+        assert out["stale"] == []
+
+    def test_max_across_chgroups(self):
+        now = time.time()
+        # cg=0 at block 1000 (latest), cg=1 at block 980 (lagger).
+        responses = {
+            "/mon/corr_rt/0/corr_fast": {
+                "block_n": 1000, "block_specnum_start": 1000 * 2048,
+                "ts_wall_unix": now,
+            },
+            "/mon/corr_rt/1/corr_fast": {
+                "block_n": 980, "block_specnum_start": 980 * 2048,
+                "ts_wall_unix": now,
+            },
+        }
+        fake = FakeDsaStore(get_dict_responses=responses)
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.compute_inject_apply_at(
+            cs, margin_blocks=16, chgroups=(0, 1),
+        )
+        # Pick MAX (1000), not min (980), so the lagger reaches it.
+        assert out["max_block_specnum_start"] == 1000 * 2048
+        assert out["apply_at_specnum"] == 1000 * 2048 + 16 * 2048
+        assert out["max_source"] == "/mon/corr_rt/0/corr_fast"
+        assert sorted(out["answered"]) == [
+            "/mon/corr_rt/0/corr_fast",
+            "/mon/corr_rt/1/corr_fast",
+        ]
+
+    def test_returns_none_when_no_publishers(self):
+        fake = FakeDsaStore(get_dict_responses={})
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.compute_inject_apply_at(
+            cs, margin_blocks=16, chgroups=(0, 1, 2),
+        )
+        assert out["apply_at_specnum"] is None
+        assert out["max_block_specnum_start"] is None
+        assert out["max_source"] is None
+        assert sorted(out["missing"]) == [
+            "/mon/corr_rt/0/corr_fast",
+            "/mon/corr_rt/1/corr_fast",
+            "/mon/corr_rt/2/corr_fast",
+        ]
+        assert out["answered"] == []
+
+    def test_stale_entries_rejected(self):
+        """A publisher whose ts_wall_unix is older than max_age_s
+        (default 10 s) does NOT contribute to the max."""
+        now = time.time()
+        responses = {
+            "/mon/corr_rt/0/corr_fast": {
+                "block_n": 1000, "block_specnum_start": 1000 * 2048,
+                "ts_wall_unix": now - 60,           # 60 s old → stale
+            },
+            "/mon/corr_rt/1/corr_fast": {
+                "block_n": 50, "block_specnum_start": 50 * 2048,
+                "ts_wall_unix": now,                # fresh
+            },
+        }
+        fake = FakeDsaStore(get_dict_responses=responses)
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.compute_inject_apply_at(
+            cs, margin_blocks=16, chgroups=(0, 1),
+        )
+        # Only chgroup=1 (fresh) contributes — block 50 not block 1000.
+        assert out["max_block_specnum_start"] == 50 * 2048
+        assert out["apply_at_specnum"] == 50 * 2048 + 16 * 2048
+        assert out["stale"] == ["/mon/corr_rt/0/corr_fast"]
+        assert out["answered"] == ["/mon/corr_rt/1/corr_fast"]
+
+    def test_payload_without_block_specnum_start_is_missing(self):
+        """If a corr_fast wrote ts_wall_unix but no
+        block_specnum_start (old format), treat as missing."""
+        now = time.time()
+        responses = {
+            "/mon/corr_rt/0/corr_fast": {
+                "ts_wall_unix": now,
+            },
+        }
+        fake = FakeDsaStore(get_dict_responses=responses)
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.compute_inject_apply_at(
+            cs, margin_blocks=16, chgroups=(0,),
+        )
+        assert out["apply_at_specnum"] is None
+        assert out["missing"] == ["/mon/corr_rt/0/corr_fast"]
+
+    def test_npackets_per_block_constant_matches_corr_fast(self):
+        """Pin the NPACKETS_PER_BLOCK constant in control_store
+        against the canonical value in corr_fast_integration."""
+        assert control_store.NPACKETS_PER_BLOCK == 2048
+        assert control_store.DEFAULT_INJECT_MARGIN_BLOCKS == 16
+
+
 class TestInjectKey:
     def test_canonical_key_layout(self):
         assert control_store._inject_key(0) == "/cmd/dsart/corr/0/inject"
@@ -587,6 +722,19 @@ class TestInjectKey:
 
     def test_default_chgroups_covers_all_sixteen(self):
         assert control_store.DEFAULT_INJECT_CHGROUPS == tuple(range(16))
+
+    def test_corr_fast_mon_key_matches_dsart_publisher(self):
+        """The dashboard's local key builder must match what
+        dsart.services.corr_fast_mon.build_corr_fast_mon_key writes.
+        """
+        assert (
+            control_store._corr_fast_mon_key(0)
+            == "/mon/corr_rt/0/corr_fast"
+        )
+        assert (
+            control_store._corr_fast_mon_key(15)
+            == "/mon/corr_rt/15/corr_fast"
+        )
 
 
 class TestListRecentAudit:

@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
@@ -60,17 +60,22 @@ from control_store import (
     CORR_CN_IDS,
     DEFAULT_ARM_SEQ_MARGIN,
     DEFAULT_INJECT_CHGROUPS,
+    DEFAULT_INJECT_MARGIN_BLOCKS,
     SEARCH_CN_IDS,
     ControlStore,
     audit_log,
     compute_arm_seq,
+    compute_inject_apply_at,
     control_inject_pulse,
     control_start_fleet,
     control_stop_fleet,
     control_utc_start_now,
     control_utc_stop_now,
+    fleet_restart_all,
+    fleet_service_status,
     list_recent_audit,
 )
+from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +351,7 @@ def control_page():
         arm_info=arm_info,
         recent_audit=recent,
         default_arm_margin=DEFAULT_ARM_SEQ_MARGIN,
+        default_inject_margin_blocks=DEFAULT_INJECT_MARGIN_BLOCKS,
     )
 
 
@@ -436,19 +442,24 @@ def control_utc_stop_post():
 def control_inject_post():
     """M7.4 Phase 6: push a runtime injection to one or more chgroups.
 
-    Form fields (all required except ``apply_at_specnum`` and
-    ``chgroups``):
+    Form fields (all required except ``apply_at_specnum``,
+    ``margin_blocks``, and ``chgroups``):
 
-      inj_id          str (e.g. "phase6_extragal_t1")
+      inj_id          str (e.g. "phase6c_extragal_t1")
       l_rad           float, |l| < 1
       m_rad           float, |m| < 1 and l^2 + m^2 < 1
       dm_pc_cm3       float
       fluence_jy_ms   float
       width_samples   int, 1..MAX_WIDTH_SAMPLES
       profile         "gaussian" | "boxcar"
-      apply_at_specnum   int (omit → auto-arm via compute_arm_seq+margin)
-      margin          int (auto-arm only; default ``DEFAULT_ARM_SEQ_MARGIN``)
-      chgroups        comma-separated ints, e.g. "0,1,2" (omit → all 16)
+      apply_at_specnum   int (omit → auto-arm via
+                            ``compute_inject_apply_at`` reading
+                            ``/mon/corr_rt/<cn>/corr_fast``)
+      margin_blocks   int blocks ahead of fleet ``block_n`` for
+                      auto-arm (default
+                      ``DEFAULT_INJECT_MARGIN_BLOCKS = 16``)
+      chgroups        comma-separated ints, e.g. "0,1,2"
+                      (omit → all 16)
     """
     f = request.form
     try:
@@ -460,7 +471,9 @@ def control_inject_post():
             "fluence_jy_ms": float(f.get("fluence_jy_ms", "0")),
             "width_samples": int(f.get("width_samples", "1")),
             "profile": (f.get("profile") or "gaussian").strip(),
-            "margin": int(f.get("margin") or DEFAULT_ARM_SEQ_MARGIN),
+            "margin_blocks": int(
+                f.get("margin_blocks") or DEFAULT_INJECT_MARGIN_BLOCKS
+            ),
         }
     except ValueError as exc:
         return jsonify({"ok": False, "error": f"bad numeric field: {exc}"}), 400
@@ -512,6 +525,229 @@ def control_inject_post():
     return _control_json_or_error(control_inject_pulse, **kwargs)
 
 
+@app.route("/control/dump_now", methods=["POST"])
+def control_dump_now_post():
+    """M7.4 Phase 6c: broadcast a one-shot synthetic C2 trigger to
+    every search-half so the operator can capture the cubes currently
+    in flight on every gpu_half (offline RFI-source debugging).
+
+    Form fields:
+
+      confirm    Must literally equal the string ``dump_now`` — a
+                 deliberate speed bump on the fan-out verb. Anything
+                 else returns 400.
+
+    Returns:
+
+      200 with the :class:`cube_dump_now.FleetDumpNowResult` dict
+      (``event_name``, ``event_specnum``, per-half status, pass /
+      fail counts) on every path where we actually broadcast.
+
+      503 with ``{ok: false, error: "no corr_fast mon-keys; is the
+      fleet up?"}`` when no ``/mon/corr_rt/<cn>/corr_fast`` publisher
+      is answering — same shape ``compute_inject_apply_at`` uses.
+
+      400 on missing / wrong confirm field.
+
+      500 (via :func:`_control_json_or_error` fallback) on
+      unexpected exceptions.
+    """
+    import cube_dump_now                                          # local
+
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "dump_now":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "dump_now requires confirm=dump_now in the POST body — "
+                "this is a deliberate safety speed bump."
+            ),
+        }), 400
+
+    user = request.form.get("user") or request.remote_addr or "anon"
+    try:
+        result = cube_dump_now.fleet_dump_now(control_store, user=user)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("control_dump_now failed")
+        try:
+            audit_log(
+                control_store, namespace="dsa_monitor.cube_dump_now",
+                cn_target="search-halves",
+                cmd="dump_now", val=None, ok=False,
+                note=f"exception: {exc!r}", user=user,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    # No corr_fast mon-keys / cold-boot → 503-equivalent payload.
+    if result.error is not None:
+        try:
+            audit_log(
+                control_store, namespace="dsa_monitor.cube_dump_now",
+                cn_target="search-halves",
+                cmd="dump_now", val=result.to_dict(), ok=False,
+                note=f"refused: {result.error}", user=user,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log failed (continuing)")
+        return jsonify(result.to_dict()), 503
+
+    try:
+        audit_log(
+            control_store, namespace="dsa_monitor.cube_dump_now",
+            cn_target="search-halves",
+            cmd="dump_now", val=result.to_dict(),
+            ok=bool(result.ok),
+            note=(
+                f"event={result.event_name} "
+                f"specnum={result.event_specnum} "
+                f"pass={result.pass_count} fail={result.fail_count}"
+            ),
+            user=user,
+        )
+    except Exception:                                              # noqa: BLE001
+        LOG.exception("audit_log failed (continuing)")
+    return jsonify(result.to_dict())
+
+
+@app.route("/control/dumps_enabled", methods=["GET", "POST"])
+def control_dumps_enabled():
+    """M7.4 Phase 6c: read or flip the C2 dump-broadcast kill-switch.
+
+    The C2 coincidencer polls ``/cmd/c2/dumps_enabled`` via a small
+    in-process cache (``dsart.services.coincidencer.DumpsGate``) and
+    skips the UDP fan-out into the C1 listeners when ``enabled=False``
+    while still writing the per-event archive rows + logging
+    ``WOULD-DUMP …`` lines. Missing key ⇒ enabled=True (fail-OPEN).
+
+    GET
+        Returns the current state ``{"enabled", "ts", "actor",
+        "reason", "default"}`` (default=True iff the key is missing).
+
+    POST form fields:
+
+      ``enabled``  ``true`` / ``false`` (required).
+      ``reason``   free text, 1..240 chars (required, audited).
+      ``confirm``  must be the literal word ``suppress`` when
+                   ``enabled=false``, ``enable`` when ``enabled=true``
+                   — deliberate speed-bump on the flip.
+
+    Returns:
+
+      200 + new state on a successful flip (or on GET).
+      400 on missing / wrong confirm, missing / empty / over-long
+        reason, or unparseable ``enabled`` value.
+      500 (with audit row) on unexpected etcd transport errors.
+    """
+    import dumps_gate                                            # local
+
+    if request.method == "GET":
+        try:
+            state = dumps_gate.get_dumps_state(control_store)
+        except Exception as exc:                                  # noqa: BLE001
+            LOG.exception("get_dumps_state failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, **state})
+
+    # ---- POST ----
+    f = request.form
+    enabled_raw = (f.get("enabled") or "").strip().lower()
+    if enabled_raw in ("true", "1", "yes", "on"):
+        new_enabled = True
+    elif enabled_raw in ("false", "0", "no", "off"):
+        new_enabled = False
+    else:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"enabled={enabled_raw!r}: must be true / false "
+                f"(true / 1 / yes / on or false / 0 / no / off)"
+            ),
+        }), 400
+
+    reason_raw = (f.get("reason") or "").strip()
+    if not reason_raw:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "reason is required (non-empty string, max "
+                f"{dumps_gate.MAX_REASON_LEN} chars)"
+            ),
+        }), 400
+    if len(reason_raw) > dumps_gate.MAX_REASON_LEN:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"reason too long: {len(reason_raw)} chars (max "
+                f"{dumps_gate.MAX_REASON_LEN})"
+            ),
+        }), 400
+
+    confirm_raw = (f.get("confirm") or "").strip().lower()
+    expected_confirm = "enable" if new_enabled else "suppress"
+    if confirm_raw != expected_confirm:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"confirm={confirm_raw!r} does not match the requested "
+                f"direction — type the literal word "
+                f"{expected_confirm!r} to arm the flip"
+            ),
+        }), 400
+
+    actor = (
+        f.get("user") or request.remote_addr or "anon"
+    )
+    try:
+        new_state = dumps_gate.set_dumps_state(
+            control_store,
+            enabled=new_enabled,
+            reason=reason_raw,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("set_dumps_state failed")
+        try:
+            audit_log(
+                control_store,
+                namespace="c2.dumps_toggle",
+                cn_target="h23",
+                cmd="dumps_toggle",
+                val={"enabled": new_enabled},
+                ok=False,
+                note=f"exception: {exc!r}",
+                user=actor,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log fallback also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, **new_state})
+
+
+@app.route("/control/dumps_audit", methods=["GET"])
+def control_dumps_audit():
+    """Most recent dumps_toggle audit rows (JSON), newest first.
+
+    Powers the Control tab's per-toggle history panel. Limit defaults
+    to 5 (the panel size) and is capped at 100 to keep the response
+    small.
+    """
+    import dumps_gate                                            # local
+    try:
+        limit = max(1, min(int(request.args.get("limit", "5")), 100))
+    except ValueError:
+        limit = 5
+    try:
+        rows = dumps_gate.list_recent_toggles(control_store, limit=limit)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("list_recent_toggles failed")
+        return jsonify({"ok": False, "error": str(exc), "rows": []}), 500
+    return jsonify({"ok": True, "rows": rows})
+
+
 @app.route("/control/recent_audit", methods=["GET"])
 def control_recent_audit():
     """JSON GET for the audit-log panel (used by manual refresh)."""
@@ -521,6 +757,234 @@ def control_recent_audit():
         limit = 20
     rows = list_recent_audit(control_store, limit=limit)
     return jsonify({"rows": rows})
+
+
+# ---------- Control tab (M7.4 Phase 8 v2) ----------------------------------
+#
+# Two new operator actions:
+#
+#   * GET  /control/services_status — fleet-wide systemd / process
+#     status table. Cheap (5 s timeout × 8-way fanout), called every
+#     10 s by the dashboard JS for auto-refresh.
+#   * POST /control/restart_all    — "cold recovery from stop" button.
+#     Heavy (etcd + ssh fanout + lxc + local systemctl + deferred
+#     self-restart). Runs in a background thread; the response is
+#     202 + a job_id, the client polls
+#     GET /control/restart_all/<job_id> for progress.
+#
+# The lxd110h20 host is excluded from EVERY restart fanout — see
+# services_inventory.H20_HOSTNAMES + the unit-test pins in
+# tests/test_fleet_services.py.
+
+
+@app.route("/control/services_status", methods=["GET"])
+def control_services_status():
+    """Fleet services status JSON (one row per ServiceEntry)."""
+    try:
+        timeout_raw = request.args.get("timeout_s", "").strip()
+        timeout_s = float(timeout_raw) if timeout_raw else None
+    except ValueError:
+        timeout_s = None
+    user = request.remote_addr or "anon"
+    try:
+        result = fleet_service_status(
+            control_store, user=user, timeout_s=timeout_s,
+        )
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("fleet_service_status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    result.setdefault("ok", True)
+    result["h20_hostnames_excluded"] = sorted(H20_HOSTNAMES)
+    result["inventory_size"] = len(SERVICE_INVENTORY)
+    return jsonify(result)
+
+
+# ---- Restart-all job registry (in-memory) ---------------------------------
+#
+# A POST /control/restart_all spins up a worker thread + returns
+# immediately. The job's progress is published into this dict,
+# keyed by a short job_id, and the client polls GET
+# /control/restart_all/<job_id> until ``done`` flips True.
+#
+# In-memory is fine: the registry only needs to survive long enough
+# for the operator to read the last status, and the dsa_monitor
+# process restart in step 7 wipes it. (We log the result to etcd
+# audit too, so a hard reload doesn't lose history.)
+
+_restart_jobs: dict[str, dict[str, Any]] = {}
+_restart_jobs_lock = threading.Lock()
+
+
+def _new_job_id() -> str:
+    import secrets
+    return secrets.token_hex(6)
+
+
+def _restart_worker(job_id: str, *, dry_run: bool, user: str) -> None:
+    """Background thread body: run fleet_restart_all + stash the
+    result + log it. Never raises (the worker is detached)."""
+    try:
+        result = fleet_restart_all(
+            control_store, user=user, dry_run=dry_run,
+        )
+        with _restart_jobs_lock:
+            _restart_jobs[job_id].update({
+                "ok": bool(result.get("ok")),
+                "done": True,
+                "result": result,
+                "finished_unix": int(__import__("time").time()),
+            })
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("restart_worker job=%s failed", job_id)
+        with _restart_jobs_lock:
+            _restart_jobs[job_id].update({
+                "ok": False,
+                "done": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "finished_unix": int(__import__("time").time()),
+            })
+
+
+@app.route("/control/restart_all", methods=["POST"])
+def control_restart_all_post():
+    """Kick off a fleet restart in a background thread.
+
+    Body fields:
+
+    ``confirm``      Must literally be the string ``restart_all`` —
+                     a deliberate speed-bump on the destructive verb.
+    ``dry_run``      Optional; ``"true"`` / ``"1"`` short-circuits the
+                     actual ssh / systemctl / Popen calls and returns
+                     a JSON summary of what *would* have been done.
+
+    Returns 202 + ``{job_id, poll_url}`` so the client can poll for
+    completion. The dashboard process will be killed by step 7 (the
+    deferred ``systemctl --user restart dsa_monitor.service``); the
+    client should expect the next poll after ~2 s to fail and the
+    page to need a manual reload.
+    """
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "restart_all":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "restart_all requires confirm=restart_all in the "
+                "POST body — this is a deliberate safety speed bump."
+            ),
+        }), 400
+    dry_raw = request.form.get("dry_run", "").strip().lower()
+    dry_run = dry_raw in ("1", "true", "yes")
+    user = request.form.get("user") or request.remote_addr or "anon"
+
+    job_id = _new_job_id()
+    with _restart_jobs_lock:
+        _restart_jobs[job_id] = {
+            "job_id": job_id,
+            "started_unix": int(__import__("time").time()),
+            "user": user,
+            "dry_run": dry_run,
+            "done": False,
+            "ok": None,
+        }
+    th = threading.Thread(
+        target=_restart_worker,
+        kwargs={"job_id": job_id, "dry_run": dry_run, "user": user},
+        name=f"restart_all_{job_id}",
+        daemon=True,
+    )
+    th.start()
+    return jsonify({
+        "ok": True,
+        "accepted": True,
+        "job_id": job_id,
+        "dry_run": dry_run,
+        "poll_url": f"/control/restart_all/{job_id}",
+        "note": (
+            "Background fanout started. Poll the poll_url for the "
+            "step-by-step result. The deferred dsa_monitor.service "
+            "self-restart will kill this process ~2 s after step 6 "
+            "completes; expect the next poll to fail and the page "
+            "to need a manual reload."
+        ),
+    }), 202
+
+
+@app.route("/control/restart_all/<job_id>", methods=["GET"])
+def control_restart_all_poll(job_id: str):
+    """Poll a previously-started restart_all job."""
+    with _restart_jobs_lock:
+        job = _restart_jobs.get(job_id)
+        if job is None:
+            return jsonify({"ok": False, "error": "unknown job_id"}), 404
+        # Copy so we can return outside the lock.
+        snapshot = dict(job)
+    return jsonify(snapshot)
+
+
+# ---------- M7.4 Phase 6c+: pull-and-install dsa110-rt on every node -------
+#
+# Added in a separate file (``fleet_update.py``) so the ssh fan-out
+# logic stays decoupled from ``control_store.py``. The route below
+# is the only entry point into that module from Flask.
+
+
+@app.route("/control/update_dsart", methods=["POST"])
+def control_update_dsart_post():
+    """Pull (or hard-reset) ``/home/ubuntu/proj/dsa110-rt`` on every
+    corr + search node and report per-host pre/post SHAs.
+
+    Form fields:
+
+      dry_run     "true"/"false" (default "true"). When true,
+                  runs only step 1 (pre-SHA + branch + porcelain) +
+                  ``git fetch``; never calls ``git pull`` or
+                  ``git reset``.
+      force       "true"/"false" (default "false"). When true,
+                  overrides dirty-worktree gate AND uses
+                  ``git reset --hard origin/<branch>`` instead of
+                  ``git pull --ff-only``.
+      confirm     Must equal ``update_dsart`` when ``dry_run=false``.
+      branch      Optional branch to fetch/pull. Blank → use whichever
+                  branch each host is currently on (typical case).
+      hosts       Optional comma-separated host list. Blank → all 20
+                  corr + search hosts.
+    """
+    import fleet_update                                              # local
+
+    f = request.form
+    dry_run = (f.get("dry_run", "true").lower() != "false")
+    force = (f.get("force", "false").lower() == "true")
+    branch_raw = (f.get("branch") or "").strip()
+    branch = branch_raw or None
+
+    if not dry_run:
+        confirm = (f.get("confirm") or "").strip()
+        if confirm != "update_dsart":
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "apply update_dsart requires confirm=update_dsart in "
+                    "the POST body — this is a deliberate safety speed bump."
+                ),
+            }), 400
+
+    raw_hosts = (f.get("hosts") or "").strip()
+    hosts: Optional[list[str]]
+    if raw_hosts:
+        hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+    else:
+        hosts = None
+
+    # Per-host timeout × 4 ssh calls / max_workers across 20 hosts is
+    # well under the spec's 60 s synchronous-response ceiling at the
+    # default max_workers=8.
+    return _control_json_or_error(
+        fleet_update.update_fleet,
+        dry_run=dry_run,
+        force=force,
+        hosts=hosts,
+        branch=branch,
+    )
 
 
 # ---------- API ------------------------------------------------------------
