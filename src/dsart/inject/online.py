@@ -780,7 +780,16 @@ class OnlineInjector:
         )                                                       # (NTIMES, NPACKETS)
 
         purged: list[str] = []
-        for inj_id, active in self.pending.items():
+        # M7.4 Phase 6: snapshot pending.items() before iteration so a
+        # concurrent ``add_pending`` from RuntimeInjectWatch (DsaStore
+        # watch thread) cannot mutate the dict mid-loop. Without this
+        # snapshot CPython raises ``RuntimeError: dictionary changed
+        # size during iteration`` and crashes corr_fast (observed on
+        # 2026-05-28 E2E test). The snapshot may miss a brand-new
+        # injection added by the watch thread during this block; it
+        # will be picked up on the next ``apply_block`` call — at most
+        # one block (~125 ms) of latency.
+        for inj_id, active in list(self.pending.items()):
             # Footprint test on integer native positions: if no overlap,
             # skip cheaply (no large tensor allocation).
             footprint_first = active.first_native_in_window

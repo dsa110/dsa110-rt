@@ -364,6 +364,7 @@ routines:
       --rfi-mon-window-size 16
       --rfi-mon-freq-downsample 4
       --rfi-mon-shm-slots 64
+      --inject-watch
     env:
       CUDA_VISIBLE_DEVICES: "1"
 

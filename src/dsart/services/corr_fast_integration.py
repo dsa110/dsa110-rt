@@ -118,6 +118,7 @@ from dsart.services.slow_corr_kernel import (
     unpack_int4_split,
 )
 from dsart.inject.online import InjectionConfig, OnlineInjector
+from dsart.inject.runtime_watch import RuntimeInjectWatch
 from dsart.coarse_dm.dm_plan import DMPlan
 from dsart.coarse_dm.stage1 import (
     apply_stage1_shifts,
@@ -1380,6 +1381,17 @@ class FastIntegrationConfig:
     1.6 GB fp32 split ≈ 9 GB), chunk=4 OOMs (~15.5 GB peak).
     ``dm_chunk_size = 1`` recovers the legacy (pre-Phase-2) one-DM-
     per-call path."""
+
+    inject_watch_enabled: bool = False
+    """M7.4 Phase 6 runtime: when True, ``build_context`` always
+    constructs an :class:`OnlineInjector` (even when
+    :attr:`inject_configs` is empty) so :class:`RuntimeInjectWatch`
+    can ``add_pending`` configs delivered via etcd at runtime. The
+    Control-tab "Send injection" button in dsa_monitor produces these
+    runtime writes; the dsart_rt orchestrator forwards them to the
+    per-chgroup ``/cmd/dsart/corr/<chgroup>/inject`` key the watch
+    listens on. Default ``False`` = startup-only injection (CLI
+    ``--inject-spec`` is still honoured)."""
 
     inject_configs: tuple[InjectionConfig, ...] = ()
     """M7.4 Phase 6: live voltage-domain signal injection. When
@@ -2743,7 +2755,7 @@ def build_context(
         LOG.info("StaticSkyEMA DISABLED (cfg.static_sky_disabled=True)")
 
     injector: OnlineInjector | None = None
-    if cfg.inject_configs:
+    if cfg.inject_configs or cfg.inject_watch_enabled:
         injector = OnlineInjector(
             antpos_e=antpos_e,
             antpos_n=antpos_n,
@@ -2764,9 +2776,10 @@ def build_context(
             )
         LOG.info(
             "OnlineInjector ready: chgroup=%d device=%s dtype=%s "
-            "n_pending=%d (hot path: in-place add after unpack, "
-            "before RFI)",
+            "n_pending=%d watch_enabled=%s (hot path: in-place add "
+            "after unpack, before RFI)",
             cfg.chgroup, device, voltage_dtype, len(injector.pending),
+            cfg.inject_watch_enabled,
         )
 
     return IntegrationContext(
@@ -3194,6 +3207,26 @@ def run(
             transport_tx=transport_tx,
             dm_plan=dm_plan,
         )
+
+        # ── M7.4 Phase 6 runtime: per-chgroup inject watch ──────────────
+        # When ``--inject-watch`` was passed (cfg.inject_watch_enabled),
+        # build_context guarantees ctx.injector is a real OnlineInjector;
+        # we open a DsaStore watch on /cmd/dsart/corr/<chgroup>/inject
+        # so the dashboard's Control tab (or any operator) can push
+        # ``{cmd: "inject", val: <InjectionConfig dict>}`` PUTs into
+        # the running service without a restart.
+        inject_watch: RuntimeInjectWatch | None = None
+        if cfg.inject_watch_enabled:
+            if ctx.injector is None:
+                raise RuntimeError(
+                    "inject_watch_enabled is True but build_context did "
+                    "not build an OnlineInjector (this is a bug — both "
+                    "should imply the other)"
+                )
+            inject_watch = RuntimeInjectWatch(
+                injector=ctx.injector, chgroup=int(cfg.chgroup),
+            )
+            inject_watch.start()
 
         # ── M7.2 production async TX path ─────────────────────────────
         # Spawn AsyncTransportTx workers now that gridder.pattern is
@@ -3623,6 +3656,15 @@ def run(
             reader.disconnect()
         except Exception:
             LOG.exception("reader.disconnect failed (non-fatal)")
+        # M7.4 Phase 6: cancel the runtime inject watch (idempotent).
+        _inject_watch = locals().get("inject_watch")
+        if _inject_watch is not None:
+            try:
+                _inject_watch.stop()
+            except Exception:
+                LOG.exception(
+                    "inject_watch.stop failed (non-fatal)"
+                )
         # M7.2 async TX: clean shutdown of worker subprocesses + shm.
         # ``async_tx`` is defined only inside the ``try`` block above
         # (after build_context); guard with locals() since the
@@ -3739,6 +3781,16 @@ def main(argv: list[str] | None = None) -> int:
                          "lands at block_n=apply_at_specnum/2048 from "
                          "service start (1 block = 2048 specnums = "
                          "4096 native samples). Default: no injection."))
+    p.add_argument("--inject-watch", action="store_true",
+                   help=("M7.4 Phase 6 runtime: subscribe to the etcd "
+                         "key /cmd/dsart/corr/<chgroup>/inject (DsaStore "
+                         "watch) and route any "
+                         "{cmd: \"inject\", val: <InjectionConfig>} "
+                         "writes into the live OnlineInjector via "
+                         "add_pending. This is what the dashboard's "
+                         "Control-tab \"Send injection\" button drives. "
+                         "Always builds the injector even when "
+                         "--inject-spec is empty. Default off."))
     # ---- RFI tuning knobs (M7.6) ----
     # All optional; when omitted the library defaults from dsart.rfi.*
     # are used. The defaults live in dsart.rfi.{sk, bandpass_outlier,
@@ -4084,6 +4136,7 @@ def main(argv: list[str] | None = None) -> int:
         cell_lambda_mode=args.cell_lambda_mode,
         dm_plan_path=args.dm_plan_path,
         inject_configs=inject_configs,
+        inject_watch_enabled=bool(getattr(args, "inject_watch", False)),
     )
 
     dm_plan: DMPlan | None = None

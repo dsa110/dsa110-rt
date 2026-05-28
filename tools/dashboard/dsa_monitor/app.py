@@ -56,6 +56,21 @@ from ant_table import (
     ant_idx_to_ant_num,
 )
 from cands_panel_funcs import ArchiveBrowser, DEFAULT_ARCHIVE_ROOT
+from control_store import (
+    CORR_CN_IDS,
+    DEFAULT_ARM_SEQ_MARGIN,
+    DEFAULT_INJECT_CHGROUPS,
+    SEARCH_CN_IDS,
+    ControlStore,
+    audit_log,
+    compute_arm_seq,
+    control_inject_pulse,
+    control_start_fleet,
+    control_stop_fleet,
+    control_utc_start_now,
+    control_utc_stop_now,
+    list_recent_audit,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +108,13 @@ class _LazyEtcd:
 
 
 etcd_store = _LazyEtcd()
+
+
+# M7.4 Phase 8: write-side etcd surface for the Control tab. Built
+# lazily so the dashboard still boots if etcd is briefly down. Kept
+# separate from ``_LazyEtcd`` so the read-only path is provably
+# write-free.
+control_store = ControlStore()
 
 
 # Burst-candidates archive browser (h23 reads /dataz/dsa110/candidates/).
@@ -285,6 +307,220 @@ def plot_thumb_grid():
     snap = store.snapshot()
     png = render_thumb_grid(snap, ant_nums=all_ant_nums_in_cube_order())
     return _png_response(png)
+
+
+# ---------- Control tab (M7.4 Phase 8) -------------------------------------
+#
+# The Control tab is the dashboard's first write surface. Every POST
+# below goes through ``control_store.audit_log`` so the action is
+# replayable from any etcd reader. The default network ACL on h23 is
+# the only "auth" today — see docs/M7.4_PHASE8_CONTROL.md for the
+# operational risk posture (network-bound + audited).
+
+
+@app.route("/control", methods=["GET"])
+def control_page():
+    """Render the Control tab: state-summary panel + verb form."""
+    # Pull a quick fleet snapshot so the operator can see what they're
+    # about to act on. We don't block on etcd; failures render as
+    # "unknown" in the template.
+    try:
+        arm_info = compute_arm_seq(control_store)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.warning("compute_arm_seq: %s", exc)
+        arm_info = {
+            "arm_seq": None, "polled": [], "answered": [], "missing": [],
+            "max_last_seq_no": None, "max_source": None,
+            "margin": DEFAULT_ARM_SEQ_MARGIN, "_error": str(exc),
+        }
+    try:
+        recent = list_recent_audit(control_store, limit=20)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.warning("list_recent_audit: %s", exc)
+        recent = []
+    return render_template(
+        "control.html",
+        active_tab="control",
+        corr_cn_ids=list(CORR_CN_IDS),
+        search_cn_ids=list(SEARCH_CN_IDS),
+        arm_info=arm_info,
+        recent_audit=recent,
+        default_arm_margin=DEFAULT_ARM_SEQ_MARGIN,
+    )
+
+
+def _control_json_or_error(handler, **kwargs):
+    """Wrap a control_store helper, converting exceptions into a
+    JSON error payload + audit row so the UI doesn't blow up on a
+    transient etcd hiccup.
+    """
+    user = request.form.get("user") or request.remote_addr or "anon"
+    try:
+        result = handler(control_store, user=user, **kwargs)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("control verb %s failed", handler.__name__)
+        try:
+            audit_log(
+                control_store,
+                namespace="control",
+                cn_target="-",
+                cmd=handler.__name__,
+                val=kwargs,
+                ok=False,
+                note=f"exception: {exc!r}",
+                user=user,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(result)
+
+
+@app.route("/control/start", methods=["POST"])
+def control_start_post():
+    dec_raw = request.form.get("obs_dec_deg", "").strip()
+    obs_dec: Optional[float]
+    if dec_raw == "":
+        obs_dec = None
+    else:
+        try:
+            obs_dec = float(dec_raw)
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": f"obs_dec_deg={dec_raw!r}: not a float",
+            }), 400
+    return _control_json_or_error(
+        control_start_fleet, obs_dec_deg=obs_dec,
+    )
+
+
+@app.route("/control/stop", methods=["POST"])
+def control_stop_post():
+    confirm = request.form.get("confirm", "").strip().lower()
+    if confirm != "stop":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "stop requires confirm=stop in the POST body — "
+                "this is a deliberate safety speed bump."
+            ),
+        }), 400
+    fanout = request.form.get("fanout_corr_too", "true").lower() != "false"
+    return _control_json_or_error(
+        control_stop_fleet, fanout_corr_too=fanout,
+    )
+
+
+@app.route("/control/utc_start", methods=["POST"])
+def control_utc_start_post():
+    margin_raw = request.form.get("margin", "").strip()
+    try:
+        margin = int(margin_raw) if margin_raw else DEFAULT_ARM_SEQ_MARGIN
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "error": f"margin={margin_raw!r}: not an int",
+        }), 400
+    return _control_json_or_error(
+        control_utc_start_now, margin=margin,
+    )
+
+
+@app.route("/control/utc_stop", methods=["POST"])
+def control_utc_stop_post():
+    return _control_json_or_error(control_utc_stop_now)
+
+
+@app.route("/control/inject", methods=["POST"])
+def control_inject_post():
+    """M7.4 Phase 6: push a runtime injection to one or more chgroups.
+
+    Form fields (all required except ``apply_at_specnum`` and
+    ``chgroups``):
+
+      inj_id          str (e.g. "phase6_extragal_t1")
+      l_rad           float, |l| < 1
+      m_rad           float, |m| < 1 and l^2 + m^2 < 1
+      dm_pc_cm3       float
+      fluence_jy_ms   float
+      width_samples   int, 1..MAX_WIDTH_SAMPLES
+      profile         "gaussian" | "boxcar"
+      apply_at_specnum   int (omit → auto-arm via compute_arm_seq+margin)
+      margin          int (auto-arm only; default ``DEFAULT_ARM_SEQ_MARGIN``)
+      chgroups        comma-separated ints, e.g. "0,1,2" (omit → all 16)
+    """
+    f = request.form
+    try:
+        kwargs: dict[str, object] = {
+            "inj_id": (f.get("inj_id") or "").strip() or None,
+            "l_rad": float(f.get("l_rad", "0")),
+            "m_rad": float(f.get("m_rad", "0")),
+            "dm_pc_cm3": float(f.get("dm_pc_cm3", "0")),
+            "fluence_jy_ms": float(f.get("fluence_jy_ms", "0")),
+            "width_samples": int(f.get("width_samples", "1")),
+            "profile": (f.get("profile") or "gaussian").strip(),
+            "margin": int(f.get("margin") or DEFAULT_ARM_SEQ_MARGIN),
+        }
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": f"bad numeric field: {exc}"}), 400
+    if not kwargs["inj_id"]:
+        return jsonify({"ok": False, "error": "inj_id is required"}), 400
+
+    raw_specnum = (f.get("apply_at_specnum") or "").strip()
+    if raw_specnum:
+        try:
+            kwargs["apply_at_specnum"] = int(raw_specnum)
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": f"apply_at_specnum={raw_specnum!r}: not an int",
+            }), 400
+    else:
+        kwargs["apply_at_specnum"] = None
+
+    raw_chg = (f.get("chgroups") or "").strip()
+    if raw_chg:
+        try:
+            cg = tuple(int(s) for s in raw_chg.split(",") if s.strip())
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": f"chgroups={raw_chg!r}: must be comma-separated ints",
+            }), 400
+        kwargs["chgroups"] = cg
+
+    # Validate the InjectionConfig payload BEFORE doing any etcd
+    # writes so a malformed payload (l^2 + m^2 >= 1, unknown
+    # profile, etc.) surfaces as a clean 400 — _control_json_or_error
+    # would otherwise wrap the ValueError into an opaque 500.
+    from control_store import _validate_inject_payload          # local
+    try:
+        _validate_inject_payload({
+            "inj_id": kwargs["inj_id"],
+            "l_rad": kwargs["l_rad"],
+            "m_rad": kwargs["m_rad"],
+            "dm_pc_cm3": kwargs["dm_pc_cm3"],
+            "fluence_jy_ms": kwargs["fluence_jy_ms"],
+            "width_samples": kwargs["width_samples"],
+            "profile": kwargs["profile"],
+            "apply_at_specnum": kwargs["apply_at_specnum"] or 0,
+        })
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    return _control_json_or_error(control_inject_pulse, **kwargs)
+
+
+@app.route("/control/recent_audit", methods=["GET"])
+def control_recent_audit():
+    """JSON GET for the audit-log panel (used by manual refresh)."""
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    rows = list_recent_audit(control_store, limit=limit)
+    return jsonify({"rows": rows})
 
 
 # ---------- API ------------------------------------------------------------
