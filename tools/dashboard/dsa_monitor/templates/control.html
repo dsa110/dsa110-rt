@@ -319,6 +319,73 @@
     </form>
 </div>
 
+<!-- M7.4 Phase 6c: dumps-enabled runtime toggle -->
+<div class="panel" style="margin-top: 24px;" id="panel-dumps-enabled">
+    <h3>Dumps Enabled (C2 broadcast kill-switch)</h3>
+    <p class="muted">
+        Flips <code>/cmd/c2/dumps_enabled</code> — the C2
+        coincidencer's runtime gate. When SUPPRESSED, C2 still runs
+        the trigger criteria + writes the per-event archive row
+        under <code>/dataz/dsa110/candidates/&lt;event&gt;/</code>
+        and emits a <code>WOULD-DUMP …</code> log line, but
+        <strong>does NOT</strong> send the UDP fan-out into the
+        per-half C1 listeners. Use during RFI bursts, fleet warmup,
+        or any known-bad-data window to keep the audit trail without
+        triggering downstream cube dumps. Default (missing key) is
+        ENABLED (fail-OPEN) so a cold etcd never silently suppresses
+        production dumps.
+    </p>
+    <div class="verb-row">
+        <span id="dumps-pill"
+              style="font-weight:700; padding:4px 10px; border-radius:4px;
+                     background:#7f8c8d; color:#ecf0f1;">
+            Dumps: …
+        </span>
+        <span id="dumps-meta" class="muted" style="margin-left:8px;"></span>
+    </div>
+    <form id="form-dumps-toggle" onsubmit="return submitDumpsToggle(event);">
+        <div class="verb-row">
+            <label for="dumps_reason">reason (audited)</label>
+            <input type="text" id="dumps_reason" name="reason"
+                   maxlength="240"
+                   placeholder="e.g. RFI burst — known-bad-data window"
+                   autocomplete="off"
+                   style="width: 360px;" required />
+        </div>
+        <div class="verb-row">
+            <label for="dumps_confirm">
+                type "<span id="dumps-confirm-expected">suppress</span>"
+            </label>
+            <input type="text" id="dumps_confirm" name="confirm"
+                   autocomplete="off" />
+            <button type="submit" id="dumps-toggle-btn" class="danger">
+                Suppress dumps
+            </button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/dumps_toggle/&lt;unix_ms&gt;</code>.
+            The coincidencer's in-process cache (200 ms TTL) picks
+            the new value up within a single
+            <code>_housekeep_loop</code> tick. Holdoff timers are
+            <strong>NOT</strong> advanced while suppressed — flipping
+            dumps back on lets the very next match fire immediately.
+        </div>
+        <div id="resp-dumps-toggle" class="response"></div>
+    </form>
+    <h4 style="margin-top:16px;">Recent toggles (last 5)</h4>
+    <table class="audit-table" id="dumps-audit-table">
+        <thead>
+            <tr>
+                <th>ts</th><th>user</th><th>enabled</th><th>reason</th>
+            </tr>
+        </thead>
+        <tbody id="dumps-audit-tbody">
+            <tr><td colspan="4" class="muted">loading…</td></tr>
+        </tbody>
+    </table>
+</div>
+
 <!-- M7.4 Phase 6c+: update dsa110-rt on every corr + search node -->
 <div class="panel" style="margin-top: 24px;" id="panel-update-dsart">
     <h3>Update dsa110-rt on corr + search nodes</h3>
@@ -571,6 +638,145 @@ async function submitRestartAll(ev) {
     setTimeout(poll, 1500);
     return false;
 }
+
+// ---- M7.4 Phase 6c: dumps-enabled runtime toggle -----------------------
+// Owns the small "Dumps: ENABLED|SUPPRESSED" pill, the confirm-direction
+// label, the recent-toggles audit table, and the POST submission. Kept
+// self-contained so it doesn't depend on (or break) the Dump Now or
+// Restart All JS above. Page-load refresh + 5 s interval to pick up
+// flips made by other operators / other tabs.
+let _dumpsCurrentEnabled = null;       // null = unknown; True/False once polled.
+
+function _renderDumpsPill(state) {
+    const pill = document.getElementById("dumps-pill");
+    const meta = document.getElementById("dumps-meta");
+    const btn = document.getElementById("dumps-toggle-btn");
+    const expected = document.getElementById("dumps-confirm-expected");
+    const confirm = document.getElementById("dumps_confirm");
+    if (!pill || !meta || !btn || !expected || !confirm) { return; }
+    const enabled = !!state.enabled;
+    _dumpsCurrentEnabled = enabled;
+    if (enabled) {
+        pill.textContent = "Dumps: ENABLED" + (state.default ? " (default)" : "");
+        pill.style.background = "#27ae60";
+        btn.textContent = "Suppress dumps";
+        expected.textContent = "suppress";
+    } else {
+        pill.textContent = "Dumps: SUPPRESSED";
+        pill.style.background = "#e67e22";
+        btn.textContent = "Re-enable dumps";
+        expected.textContent = "enable";
+    }
+    confirm.value = "";
+    const tsTxt = (state.ts === null || state.ts === undefined)
+        ? "(never set)"
+        : new Date(state.ts * 1000).toISOString();
+    const actorTxt = state.actor || "(none)";
+    const reasonTxt = state.reason || "(no reason on file)";
+    meta.innerHTML =
+        "last flip: <code>" + tsTxt + "</code>" +
+        " by <code>" + String(actorTxt).replace(/</g, "&lt;") + "</code>" +
+        " — " + String(reasonTxt).replace(/</g, "&lt;");
+}
+
+async function refreshDumpsState() {
+    try {
+        const r = await fetch("/control/dumps_enabled", {cache: "no-store"});
+        const j = await r.json();
+        if (j && (j.enabled === true || j.enabled === false)) {
+            _renderDumpsPill(j);
+        }
+    } catch (e) {
+        const pill = document.getElementById("dumps-pill");
+        if (pill) {
+            pill.textContent = "Dumps: (read error)";
+            pill.style.background = "#7f8c8d";
+        }
+    }
+}
+
+async function refreshDumpsAudit() {
+    const tbody = document.getElementById("dumps-audit-tbody");
+    if (!tbody) { return; }
+    let j;
+    try {
+        const r = await fetch("/control/dumps_audit?limit=5", {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        tbody.innerHTML =
+            "<tr><td colspan='4' class='err'>fetch error: " + e + "</td></tr>";
+        return;
+    }
+    const rows = (j && j.rows) || [];
+    if (rows.length === 0) {
+        tbody.innerHTML = "<tr><td colspan='4' class='muted'>no toggles yet</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+        const enabled = r.val && r.val.enabled;
+        const cls = enabled ? "ok" : "err";
+        const lbl = enabled ? "ENABLED" : "SUPPRESSED";
+        const note = (r.note || "").replace(/</g, "&lt;");
+        const user = (r.user || "").replace(/</g, "&lt;");
+        return "<tr>" +
+            "<td class='ts'>" + (r.iso_ts || "?") + "</td>" +
+            "<td>" + user + "</td>" +
+            "<td class='" + cls + "'>" + lbl + "</td>" +
+            "<td>" + note + "</td>" +
+            "</tr>";
+    }).join("");
+}
+
+async function submitDumpsToggle(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-dumps-toggle");
+    const btn = document.getElementById("dumps-toggle-btn");
+    if (_dumpsCurrentEnabled === null) {
+        respEl.innerHTML = "<span class='err'>state not yet loaded; refresh first</span>";
+        return false;
+    }
+    // The button always requests the OPPOSITE of the current state.
+    const desired = !_dumpsCurrentEnabled;
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>flipping dumps gate…</span>";
+    const fd = new FormData(form);
+    fd.set("enabled", desired ? "true" : "false");
+    let r, j;
+    try {
+        r = await fetch("/control/dumps_enabled", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    const status = j.ok ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j.error) {
+        html += "<div class='info-blob'><span class='err'>" +
+            String(j.error).replace(/</g, "&lt;") + "</span></div>";
+    }
+    html += "<div class='info-blob' style='margin-top:8px;'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    respEl.innerHTML = html;
+    btn.disabled = false;
+    if (j.ok) {
+        // Refresh pill + audit immediately so the operator sees the
+        // flip + new audit row without waiting for the 5 s tick.
+        await refreshDumpsState();
+        await refreshDumpsAudit();
+    }
+    return false;
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    refreshDumpsState();
+    refreshDumpsAudit();
+    setInterval(refreshDumpsState, 5000);
+    setInterval(refreshDumpsAudit, 15000);
+});
 
 // ---- M7.4 Phase 6c+: update dsa110-rt fan-out --------------------------
 async function submitUpdateDsart(ev, dryRun) {

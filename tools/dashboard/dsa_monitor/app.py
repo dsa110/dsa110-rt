@@ -525,6 +525,143 @@ def control_inject_post():
     return _control_json_or_error(control_inject_pulse, **kwargs)
 
 
+@app.route("/control/dumps_enabled", methods=["GET", "POST"])
+def control_dumps_enabled():
+    """M7.4 Phase 6c: read or flip the C2 dump-broadcast kill-switch.
+
+    The C2 coincidencer polls ``/cmd/c2/dumps_enabled`` via a small
+    in-process cache (``dsart.services.coincidencer.DumpsGate``) and
+    skips the UDP fan-out into the C1 listeners when ``enabled=False``
+    while still writing the per-event archive rows + logging
+    ``WOULD-DUMP …`` lines. Missing key ⇒ enabled=True (fail-OPEN).
+
+    GET
+        Returns the current state ``{"enabled", "ts", "actor",
+        "reason", "default"}`` (default=True iff the key is missing).
+
+    POST form fields:
+
+      ``enabled``  ``true`` / ``false`` (required).
+      ``reason``   free text, 1..240 chars (required, audited).
+      ``confirm``  must be the literal word ``suppress`` when
+                   ``enabled=false``, ``enable`` when ``enabled=true``
+                   — deliberate speed-bump on the flip.
+
+    Returns:
+
+      200 + new state on a successful flip (or on GET).
+      400 on missing / wrong confirm, missing / empty / over-long
+        reason, or unparseable ``enabled`` value.
+      500 (with audit row) on unexpected etcd transport errors.
+    """
+    import dumps_gate                                            # local
+
+    if request.method == "GET":
+        try:
+            state = dumps_gate.get_dumps_state(control_store)
+        except Exception as exc:                                  # noqa: BLE001
+            LOG.exception("get_dumps_state failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, **state})
+
+    # ---- POST ----
+    f = request.form
+    enabled_raw = (f.get("enabled") or "").strip().lower()
+    if enabled_raw in ("true", "1", "yes", "on"):
+        new_enabled = True
+    elif enabled_raw in ("false", "0", "no", "off"):
+        new_enabled = False
+    else:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"enabled={enabled_raw!r}: must be true / false "
+                f"(true / 1 / yes / on or false / 0 / no / off)"
+            ),
+        }), 400
+
+    reason_raw = (f.get("reason") or "").strip()
+    if not reason_raw:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "reason is required (non-empty string, max "
+                f"{dumps_gate.MAX_REASON_LEN} chars)"
+            ),
+        }), 400
+    if len(reason_raw) > dumps_gate.MAX_REASON_LEN:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"reason too long: {len(reason_raw)} chars (max "
+                f"{dumps_gate.MAX_REASON_LEN})"
+            ),
+        }), 400
+
+    confirm_raw = (f.get("confirm") or "").strip().lower()
+    expected_confirm = "enable" if new_enabled else "suppress"
+    if confirm_raw != expected_confirm:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"confirm={confirm_raw!r} does not match the requested "
+                f"direction — type the literal word "
+                f"{expected_confirm!r} to arm the flip"
+            ),
+        }), 400
+
+    actor = (
+        f.get("user") or request.remote_addr or "anon"
+    )
+    try:
+        new_state = dumps_gate.set_dumps_state(
+            control_store,
+            enabled=new_enabled,
+            reason=reason_raw,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("set_dumps_state failed")
+        try:
+            audit_log(
+                control_store,
+                namespace="c2.dumps_toggle",
+                cn_target="h23",
+                cmd="dumps_toggle",
+                val={"enabled": new_enabled},
+                ok=False,
+                note=f"exception: {exc!r}",
+                user=actor,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log fallback also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, **new_state})
+
+
+@app.route("/control/dumps_audit", methods=["GET"])
+def control_dumps_audit():
+    """Most recent dumps_toggle audit rows (JSON), newest first.
+
+    Powers the Control tab's per-toggle history panel. Limit defaults
+    to 5 (the panel size) and is capped at 100 to keep the response
+    small.
+    """
+    import dumps_gate                                            # local
+    try:
+        limit = max(1, min(int(request.args.get("limit", "5")), 100))
+    except ValueError:
+        limit = 5
+    try:
+        rows = dumps_gate.list_recent_toggles(control_store, limit=limit)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("list_recent_toggles failed")
+        return jsonify({"ok": False, "error": str(exc), "rows": []}), 500
+    return jsonify({"ok": True, "rows": rows})
+
+
 @app.route("/control/recent_audit", methods=["GET"])
 def control_recent_audit():
     """JSON GET for the audit-log panel (used by manual refresh)."""

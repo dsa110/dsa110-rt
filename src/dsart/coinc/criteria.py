@@ -364,3 +364,33 @@ class CriteriaEvaluator:
 
     def last_fired_at(self, name: str) -> Optional[float]:
         return self._last_fired_at.get(name)
+
+    def last_fired_at_snapshot(self) -> Dict[str, float]:
+        """Return a shallow copy of the per-class last-fired timestamps.
+
+        Used by callers that need to roll back :meth:`evaluate`'s
+        holdoff side-effect — notably the C2 coincidencer's dump-gate
+        path: ``evaluate`` mutates ``_last_fired_at[name] = now`` on
+        every match, but if the matched trigger ends up being
+        suppressed by ``/cmd/c2/dumps_enabled`` we want to leave the
+        holdoff state exactly as it was so the next genuine trigger
+        fires immediately rather than being eaten by a stale holdoff.
+        """
+        return dict(self._last_fired_at)
+
+    def restore_last_fired_at(
+        self, name: str, prev_value: Optional[float],
+    ) -> None:
+        """Roll back ``_last_fired_at[name]`` to ``prev_value``.
+
+        Pairs with :meth:`last_fired_at_snapshot`. ``prev_value=None``
+        means "the class had never fired before" — we pop the entry
+        entirely so the next match treats it as a cold start. This is
+        the only public mutator on the holdoff map; the C2 service
+        uses it from the dumps-suppression path. The evaluator stays
+        single-threaded otherwise.
+        """
+        if prev_value is None:
+            self._last_fired_at.pop(name, None)
+        else:
+            self._last_fired_at[name] = float(prev_value)

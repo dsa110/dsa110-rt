@@ -49,7 +49,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
@@ -75,11 +75,157 @@ from ..coinc.window import TimeWindow, WindowEntry
 __all__ = [
     "CoincidencerConfig",
     "CoincidencerService",
+    "DumpsGate",
+    "DUMPS_ENABLED_KEY",
     "main",
 ]
 
 
 _LOG = logging.getLogger("dsart.services.coincidencer")
+
+
+# ---------------------------------------------------------------------------
+# Dumps-enabled etcd gate (M7.4 Phase 6c)
+# ---------------------------------------------------------------------------
+#
+# Operator-controlled runtime kill-switch for UDP dump triggers. The
+# dashboard's Control tab writes ``/cmd/c2/dumps_enabled`` as
+# ``{"enabled": bool, "ts": float, "actor": str, "reason": str}``; the
+# coincidencer consults this key on every classification through the
+# small in-process cache implemented below. When ``enabled=False`` C2
+# still runs the criteria + writes the per-event archive rows, but
+# skips the UDP fan-out into ``broadcast.broadcast_triggers`` AND does
+# NOT advance the per-class holdoff timer — so flipping dumps back on
+# makes the next match fire immediately rather than being eaten by a
+# stale holdoff.
+#
+# Default (missing key) is fail-OPEN: ``enabled=True``. Any etcd error
+# (outage, dropped connection, malformed payload) is also treated as
+# enabled — we never want a transient etcd hiccup to silently suppress
+# dumps in production. Errors are logged at WARNING rate-limited to
+# 1/min so the operator sees the problem in the dashboard without
+# flooding the journal.
+#
+# See ``docs/c1c2/C1C2_DESIGN.md`` §6c for the operational contract.
+# ---------------------------------------------------------------------------
+
+
+#: etcd key the dashboard writes; the coincidencer polls.
+DUMPS_ENABLED_KEY: str = "/cmd/c2/dumps_enabled"
+
+#: Default cache TTL: 200 ms. Bigger than a single batch's eval time
+#: (microseconds) so back-to-back classifications share the same etcd
+#: read, but small enough that an operator flip is honoured within
+#: ~one ``_housekeep_loop`` tick (~1 Hz).
+DEFAULT_DUMPS_CACHE_TTL_S: float = 0.2
+
+
+class DumpsGate:
+    """Polled etcd cache for the dump-enabled runtime gate.
+
+    Construction is cheap and side-effect free; the first call to
+    :meth:`enabled` reads etcd. Subsequent calls within ``cache_ttl_s``
+    serve the cached answer.
+
+    All failure modes are fail-OPEN (returns True + logs WARNING on
+    the first failure of a window). The coincidencer never sees an
+    exception out of :meth:`enabled`.
+
+    Parameters
+    ----------
+    store:
+        A duck-typed DsaStore-like object exposing ``get_dict(key)``.
+        ``None`` is allowed (e.g. the dsa_store import failed on
+        boot); :meth:`enabled` then permanently returns True.
+    key:
+        etcd key to poll; defaults to :data:`DUMPS_ENABLED_KEY`.
+    cache_ttl_s:
+        Maximum age of the cached value before the next
+        :meth:`enabled` triggers a re-read.
+    now:
+        Monotonic clock function; injected by tests to drive the TTL
+        deterministically.
+    warn_rate_limit_s:
+        Minimum interval between WARNING logs on repeated etcd failure
+        (default 60 s).
+    """
+
+    def __init__(
+        self,
+        store: Optional[Any],
+        *,
+        key: str = DUMPS_ENABLED_KEY,
+        cache_ttl_s: float = DEFAULT_DUMPS_CACHE_TTL_S,
+        now: Optional[Callable[[], float]] = None,
+        warn_rate_limit_s: float = 60.0,
+    ) -> None:
+        self._store = store
+        self._key = str(key)
+        self._ttl = float(cache_ttl_s)
+        self._now = now if now is not None else time.monotonic
+        self._warn_rate_limit_s = float(warn_rate_limit_s)
+        # Start fail-OPEN so the very first eval (before the first
+        # refresh) cannot accidentally suppress.
+        self._cached_value: bool = True
+        self._cached_at: float = -math.inf
+        self._last_warn_at: float = -math.inf
+        self._read_count: int = 0
+        self._fail_count: int = 0
+
+    @property
+    def key(self) -> str:
+        return self._key
+
+    @property
+    def cache_ttl_s(self) -> float:
+        return self._ttl
+
+    @property
+    def read_count(self) -> int:
+        return self._read_count
+
+    @property
+    def fail_count(self) -> int:
+        return self._fail_count
+
+    def enabled(self) -> bool:
+        """Return the current dump-enabled state (cached)."""
+        now = self._now()
+        if (now - self._cached_at) < self._ttl:
+            return self._cached_value
+        self._refresh(now=now)
+        return self._cached_value
+
+    def invalidate(self) -> None:
+        """Force the next :meth:`enabled` call to re-read etcd."""
+        self._cached_at = -math.inf
+
+    def _refresh(self, *, now: float) -> None:
+        self._read_count += 1
+        if self._store is None:
+            self._cached_value = True
+            self._cached_at = now
+            return
+        try:
+            doc = self._store.get_dict(self._key)
+        except Exception as exc:  # noqa: BLE001
+            self._fail_count += 1
+            self._cached_value = True              # fail-OPEN
+            self._cached_at = now
+            if (now - self._last_warn_at) > self._warn_rate_limit_s:
+                _LOG.warning(
+                    "dumps_gate: etcd read of %s failed (%s); "
+                    "fail-OPEN (dumps stay enabled)",
+                    self._key, exc,
+                )
+                self._last_warn_at = now
+            return
+        if isinstance(doc, Mapping) and "enabled" in doc:
+            self._cached_value = bool(doc["enabled"])
+        else:
+            # Missing / malformed payload — fail-OPEN.
+            self._cached_value = True
+        self._cached_at = now
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +441,7 @@ class CoincidencerService:
         mon_store: Optional[Any] = None,
         name_allocator: Optional[EventNameAllocator] = None,
         broadcaster: Optional[TriggerBroadcaster] = None,
+        dumps_gate: Optional[DumpsGate] = None,
     ) -> None:
         self._config = config
 
@@ -332,6 +479,16 @@ class CoincidencerService:
 
         self._mon_store = _StoreWrapper(mock=mon_store)
 
+        # M7.4 Phase 6c: operator-controlled dump kill-switch. Wired
+        # against the same DsaStore wrapper that drives the mon-points
+        # export so a single etcd outage has a single failure mode
+        # (the wrapper's get_dict() returns None on outage; the gate
+        # then fail-OPENs by design).
+        self._dumps_gate: DumpsGate = (
+            dumps_gate if dumps_gate is not None
+            else DumpsGate(self._mon_store)
+        )
+
         self._receiver = C1BatchReceiver(
             host=config.bind_host,
             port=config.bind_port,
@@ -344,6 +501,7 @@ class CoincidencerService:
             "rows_late_drop": 0,
             "components_evaluated": 0,
             "triggers_dump": 0,
+            "triggers_suppressed": 0,
             "triggers_log_only": 0,
             "broadcast_send_ok": 0,
             "broadcast_send_fail": 0,
@@ -505,27 +663,52 @@ class CoincidencerService:
                 continue
             stats = compute_stats(members, gal_dm_max_los=gal_dm)
             self._counters["components_evaluated"] += 1
+            # Snapshot per-class holdoff state BEFORE evaluate (which
+            # mutates ``_last_fired_at[name] = now`` on every match).
+            # If the resulting trigger is suppressed by the dumps gate
+            # we restore that one entry so the next eval still sees a
+            # cold (or pre-suppression) holdoff and fires immediately
+            # when the operator flips dumps back on.
+            holdoff_snapshot = self._criteria.last_fired_at_snapshot()
             tc = self._criteria.evaluate(stats)
             if tc is None:
                 continue
-            await self._fire(stats, members, tc)
+            prev_holdoff = holdoff_snapshot.get(tc.name)
+            await self._fire(
+                stats, members, tc, prev_holdoff=prev_holdoff,
+            )
 
     async def _fire(
         self,
         stats: ClusterStats,
         members: List[WindowEntry],
         trigger_class,
+        *,
+        prev_holdoff: Optional[float] = None,
     ) -> None:
-        """Dispatch on the trigger-class action."""
+        """Dispatch on the trigger-class action.
+
+        ``prev_holdoff`` is the per-class ``last_fired_at`` snapshot
+        captured before :meth:`CriteriaEvaluator.evaluate` advanced it.
+        When ``action == "dump_all_gpus"`` and
+        :attr:`_dumps_gate` reports ``enabled=False`` we use it to
+        roll the timer back to its pre-evaluate value, so the very
+        next match after the operator flips dumps on fires
+        immediately rather than being eaten by a stale holdoff.
+        """
         action = trigger_class.action
         now_utc = datetime.now(timezone.utc)
 
         if action == "dump_all_gpus":
+            dumps_enabled = self._dumps_gate.enabled()
             event_name = self._allocator.allocate(stats.t_peak_mjd)
             self._last_event_name = event_name
             self._last_trigger_class = trigger_class.name
             self._last_event_mjd = stats.t_peak_mjd
 
+            # Audit-trail writes happen unconditionally so the operator
+            # can replay a suppressed event from /dataz/dsa110/candidates
+            # exactly as they would a triggered one.
             ev_dir = self._archive.create(event_name)
             self._archive.write_c2_cluster_csv(
                 ev_dir, event_name, stats,
@@ -551,6 +734,24 @@ class CoincidencerService:
                 ),
                 now_utc=now_utc,
             )
+
+            if not dumps_enabled:
+                # Suppressed path: NO UDP fan-out, NO plot scheduling
+                # (there will be no cubes to plot), and roll back the
+                # per-class holdoff so the next genuine trigger after
+                # dumps re-enable fires immediately.
+                self._counters["triggers_suppressed"] += 1
+                self._criteria.restore_last_fired_at(
+                    trigger_class.name, prev_holdoff,
+                )
+                _LOG.info(
+                    "WOULD-DUMP class=%s name=%s n=%d snr_max=%.2f "
+                    "dm_med=%.2f suppressed=dumps_disabled",
+                    trigger_class.name, event_name, stats.n_events,
+                    stats.snr_max, stats.dm_median,
+                )
+                return
+
             result = self._broadcaster.broadcast(
                 event_name=event_name,
                 event_specnum=stats.peak_event_specnum,
@@ -678,6 +879,9 @@ class CoincidencerService:
                     ),
                     "gal_dm_polls_ok": self._gal_dm_polls_ok,
                     "gal_dm_polls_fail": self._gal_dm_polls_fail,
+                    "dumps_enabled": bool(self._dumps_gate.enabled()),
+                    "dumps_gate_reads": int(self._dumps_gate.read_count),
+                    "dumps_gate_fails": int(self._dumps_gate.fail_count),
                 }
                 self._mon_store.put_dict(
                     self._config.mon_etcd_key, payload,
