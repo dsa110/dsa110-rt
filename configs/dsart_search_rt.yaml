@@ -360,7 +360,7 @@ c1:
     base_port: 11227                 # actual port = base_port + gpu_half
   dump_root: /home/ubuntu/data/c2/cube_dump
   uploader:
-    remote_root: ubuntu@lxd110h23:/dataz/dsa110/candidates
+    remote_root: ubuntu@lxd110h23.pro.pvt:/dataz/dsa110/candidates   # FQDN: search nodes can't resolve bare 'lxd110h23'
     bandwidth_limit_kbps: 0          # 0 = unlimited
 
 # Cube geometry knobs shared with the merger block. The merger reads

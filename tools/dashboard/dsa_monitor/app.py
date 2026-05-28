@@ -525,6 +525,92 @@ def control_inject_post():
     return _control_json_or_error(control_inject_pulse, **kwargs)
 
 
+@app.route("/control/dump_now", methods=["POST"])
+def control_dump_now_post():
+    """M7.4 Phase 6c: broadcast a one-shot synthetic C2 trigger to
+    every search-half so the operator can capture the cubes currently
+    in flight on every gpu_half (offline RFI-source debugging).
+
+    Form fields:
+
+      confirm    Must literally equal the string ``dump_now`` — a
+                 deliberate speed bump on the fan-out verb. Anything
+                 else returns 400.
+
+    Returns:
+
+      200 with the :class:`cube_dump_now.FleetDumpNowResult` dict
+      (``event_name``, ``event_specnum``, per-half status, pass /
+      fail counts) on every path where we actually broadcast.
+
+      503 with ``{ok: false, error: "no corr_fast mon-keys; is the
+      fleet up?"}`` when no ``/mon/corr_rt/<cn>/corr_fast`` publisher
+      is answering — same shape ``compute_inject_apply_at`` uses.
+
+      400 on missing / wrong confirm field.
+
+      500 (via :func:`_control_json_or_error` fallback) on
+      unexpected exceptions.
+    """
+    import cube_dump_now                                          # local
+
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "dump_now":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "dump_now requires confirm=dump_now in the POST body — "
+                "this is a deliberate safety speed bump."
+            ),
+        }), 400
+
+    user = request.form.get("user") or request.remote_addr or "anon"
+    try:
+        result = cube_dump_now.fleet_dump_now(control_store, user=user)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("control_dump_now failed")
+        try:
+            audit_log(
+                control_store, namespace="dsa_monitor.cube_dump_now",
+                cn_target="search-halves",
+                cmd="dump_now", val=None, ok=False,
+                note=f"exception: {exc!r}", user=user,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    # No corr_fast mon-keys / cold-boot → 503-equivalent payload.
+    if result.error is not None:
+        try:
+            audit_log(
+                control_store, namespace="dsa_monitor.cube_dump_now",
+                cn_target="search-halves",
+                cmd="dump_now", val=result.to_dict(), ok=False,
+                note=f"refused: {result.error}", user=user,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log failed (continuing)")
+        return jsonify(result.to_dict()), 503
+
+    try:
+        audit_log(
+            control_store, namespace="dsa_monitor.cube_dump_now",
+            cn_target="search-halves",
+            cmd="dump_now", val=result.to_dict(),
+            ok=bool(result.ok),
+            note=(
+                f"event={result.event_name} "
+                f"specnum={result.event_specnum} "
+                f"pass={result.pass_count} fail={result.fail_count}"
+            ),
+            user=user,
+        )
+    except Exception:                                              # noqa: BLE001
+        LOG.exception("audit_log failed (continuing)")
+    return jsonify(result.to_dict())
+
+
 @app.route("/control/dumps_enabled", methods=["GET", "POST"])
 def control_dumps_enabled():
     """M7.4 Phase 6c: read or flip the C2 dump-broadcast kill-switch.

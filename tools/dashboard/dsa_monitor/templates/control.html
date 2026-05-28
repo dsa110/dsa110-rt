@@ -319,6 +319,47 @@
     </form>
 </div>
 
+<!-- M7.4 Phase 6c: Dump Now (one-shot diagnostic) -->
+<div class="panel" style="margin-top: 24px;" id="panel-dump-now">
+    <h3>Dump Now (one-shot diagnostic)</h3>
+    <p class="muted">
+        Captures the cube currently in flight on every search half.
+        Use to inspect persistent RFI sources during commissioning.
+        Sends a synthetic <code>C2TriggerPacket</code>
+        (<code>dumpnow_&lt;rand&gt;</code>) to every
+        <code>(search_node, gpu_half)</code> on the
+        <code>coinc.dump_broadcast</code> fan-out list. The
+        <code>event_specnum</code> is auto-picked a few blocks behind
+        the fleet's latest <code>block_specnum_start</code> so the
+        trigger lands inside every cube_ring's retention window —
+        not <code>too_late</code> / <code>too_early</code>. NO
+        production data-plumbing changes; this just feeds an extra
+        UDP packet to the existing
+        <code>C2TriggerListener</code> on each half.
+    </p>
+    <form id="form-dump-now" onsubmit="return submitDumpNow(event);">
+        <div class="verb-row">
+            <label for="dump_confirm">type "dump_now"</label>
+            <input type="text" id="dump_confirm" name="confirm"
+                   pattern="dump_now"
+                   placeholder="dump_now"
+                   autocomplete="off" />
+            <button type="submit" class="danger">Dump Now</button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/&lt;iso_ts&gt;</code> as
+            <code>cmd=dump_now</code> with per-half pass/fail. Each
+            search-half ends up with a fresh dump under
+            <code>${c1.dump_root}/&lt;event_name&gt;/cube_s&lt;sid&gt;_g&lt;g&gt;_&lt;event_specnum&gt;.npz</code>.
+            Refuses to broadcast (HTTP 503) if no
+            <code>/mon/corr_rt/&lt;cn&gt;/corr_fast</code> publisher
+            is answering.
+        </div>
+        <div id="resp-dump-now" class="response"></div>
+    </form>
+</div>
+
 <!-- M7.4 Phase 6c: dumps-enabled runtime toggle -->
 <div class="panel" style="margin-top: 24px;" id="panel-dumps-enabled">
     <h3>Dumps Enabled (C2 broadcast kill-switch)</h3>
@@ -636,6 +677,60 @@ async function submitRestartAll(ev) {
         }
     };
     setTimeout(poll, 1500);
+    return false;
+}
+
+// ---- M7.4 Phase 6c: Dump Now (one-shot diagnostic) ---------------------
+async function submitDumpNow(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-dump-now");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>broadcasting dump trigger to every search-half…</span>";
+    const fd = new FormData(form);
+    let r, j;
+    try {
+        r = await fetch("/control/dump_now", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    const status = j.ok ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j.error) {
+        html += "<div class='info-blob'><span class='err'>" +
+            String(j.error).replace(/</g, "&lt;") + "</span></div>";
+    }
+    html += "<div class='muted'>" +
+        "event_name=<code>" + (j.event_name || "-") + "</code> | " +
+        "event_specnum=<code>" + (j.event_specnum === null ? "-" : j.event_specnum) + "</code> | " +
+        "<span class='ok'>pass=" + (j.pass_count || 0) + "</span> | " +
+        "<span class='err'>fail=" + (j.fail_count || 0) + "</span> | " +
+        "latency_ms=" + (j.latency_ms || 0) +
+        "</div>";
+    if (j.per_half && Object.keys(j.per_half).length > 0) {
+        const rows = Object.keys(j.per_half).sort().map(function (k) {
+            const v = j.per_half[k];
+            const okHalf = (v === "ok");
+            const halfCls = okHalf ? "ok" : "err";
+            return "<tr>" +
+                "<td><code>" + k + "</code></td>" +
+                "<td class='" + halfCls + "'>" +
+                String(v).replace(/</g, "&lt;") +
+                "</td></tr>";
+        }).join("");
+        html += "<table class='audit-table' style='margin-top:8px;'>" +
+            "<thead><tr><th>half (sid_g)</th><th>status</th></tr></thead>" +
+            "<tbody>" + rows + "</tbody></table>";
+    }
+    html += "<div class='info-blob' style='margin-top:8px;'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    respEl.innerHTML = html;
+    btn.disabled = false;
     return false;
 }
 

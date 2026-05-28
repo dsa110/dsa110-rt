@@ -85,6 +85,7 @@ from ..dump import (
 from ..common.contracts import CubeDumpManifest
 from ..noise_norm.layer1 import Layer1State
 from .c1_emit import C1EmitConfig, C1TcpEmitter, candidate_to_c1_row
+from .search_ring_mon import SearchRingMonPublisher
 from .cube_pipeline import (
     CubePipeline,
     CubePipelineConfig,
@@ -348,6 +349,16 @@ class SearchComputeService:
         self._c2_trigger: Optional[C2TriggerListener] = None
         self._c1_batches_submitted = 0
         self._c1_batches_dropped = 0
+        # M7.4 Phase 6c: publish cube_ring window to etcd so the dsa_monitor
+        # "Dump Now" button can pick an event_specnum that lands inside the
+        # search-side retention window (corr_fast's block_specnum_start is in
+        # a different domain — see ``search_ring_mon`` docstring).
+        self._ring_mon: Optional[SearchRingMonPublisher] = (
+            SearchRingMonPublisher(
+                search_node_id=int(config.search_node_id),
+                gpu_half=int(config.gpu_half),
+            )
+        )
 
         # M7.4 fix (2026-05-27): when ``config.mjd_at_specnum_0`` is the
         # placeholder default (0.0), every restart of search_compute
@@ -1079,6 +1090,22 @@ class SearchComputeService:
             _scatter_t["count"],
             getattr(self._source, "stats", {}),
         )
+        # Phase 6c: best-effort publish of the cube_ring window to
+        # ``/mon/search/<sid>/<g>/ring`` so the Control-tab "Dump Now"
+        # button can pick an event_specnum that's guaranteed to land
+        # inside this half's retention window. Failures are silent
+        # past the first warning so etcd hiccups never block the loop.
+        if self._ring_mon is not None and self._cube_ring is not None:
+            try:
+                self._ring_mon.publish_from_ring(self._cube_ring)
+            except Exception:                                  # noqa: BLE001
+                # publish_from_ring is itself best-effort, but
+                # belt-and-braces here so no exception escapes into
+                # the progress-logging path.
+                _LOG.exception(
+                    "SearchRingMonPublisher.publish_from_ring failed "
+                    "(swallowed; will retry next cycle)"
+                )
 
     async def run(self) -> None:
         """Main loop. Iterates over RX-ring slots until source exhausts
