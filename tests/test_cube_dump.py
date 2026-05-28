@@ -327,6 +327,17 @@ def test_writer_happy_round_trip(tmp_path: Path) -> None:
     with np.load(npz_path, allow_pickle=False) as data:
         np.testing.assert_array_equal(data["cube"], cube)
         assert data["cube"].dtype == np.float16
+        # Writer-side precomputed peak_grid (consumed by the C2 plotter
+        # to skip the dominant per-cube max-reduction stage).
+        assert "peak_grid" in data.files, (
+            "writer must precompute peak_grid for plotter fast path"
+        )
+        peak_grid = data["peak_grid"]
+        assert peak_grid.shape == (cube.shape[0], cube.shape[1])
+        assert peak_grid.dtype == np.float16
+        np.testing.assert_array_equal(
+            peak_grid, cube.astype(np.float16).max(axis=(2, 3)),
+        )
         assert float(data["mjd_start"]) == pytest.approx(manifest.mjd_start)
         assert int(data["event_specnum_start"]) == manifest.event_specnum_start
         assert int(data["t_det"]) == manifest.t_det

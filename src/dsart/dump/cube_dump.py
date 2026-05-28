@@ -287,12 +287,27 @@ class CubeDumpWriter:
     shutdown to drain pending dumps and shut the executor down.
     """
 
-    def __init__(self, config: CubeDumpWriterConfig) -> None:
+    def __init__(
+        self,
+        config: CubeDumpWriterConfig,
+        *,
+        on_dump_complete: Optional[
+            Callable[[Path, CubeDumpManifest], None]
+        ] = None,
+    ) -> None:
         if config.queue_maxsize <= 0:
             raise ValueError(
                 f"queue_maxsize={config.queue_maxsize}, expected > 0"
             )
         self._config = config
+        # M7.4 cube-uploader hook: invoked from the writer thread AFTER
+        # a successful ``np.savez`` and the ``n_dumped`` increment, with
+        # the on-disk path that was actually written plus the manifest.
+        # The hook is wrapped in try/except inside ``_drain_loop`` so
+        # it can never poison the writer thread. Production binds it
+        # to :func:`dsart.coinc.cube_uploader.upload_event_cubes` via
+        # ``services.search_compute.SearchComputeService.start``.
+        self._on_dump_complete = on_dump_complete
         self._queue: queue.Queue[Any] = queue.Queue(
             maxsize=config.queue_maxsize
         )
@@ -303,6 +318,11 @@ class CubeDumpWriter:
         self._n_dumped = 0
         self._n_dropped = 0
         self._n_failed = 0
+        # M7.4 cube-uploader hook bookkeeping: count successful hook
+        # invocations and exception swallows so operators can sanity-
+        # check the rsync wiring without grovelling through logs.
+        self._n_hook_ok = 0
+        self._n_hook_failed = 0
         # Writer-time ring buffer. Each entry is the wall-clock duration
         # of a single ``np.savez`` call in milliseconds. Sized small so
         # the per-instance footprint is negligible (~2 KiB at the
@@ -418,6 +438,16 @@ class CubeDumpWriter:
         return self._n_failed
 
     @property
+    def n_hook_ok(self) -> int:
+        """Number of times the ``on_dump_complete`` hook ran to completion."""
+        return self._n_hook_ok
+
+    @property
+    def n_hook_failed(self) -> int:
+        """Number of times the ``on_dump_complete`` hook raised (swallowed)."""
+        return self._n_hook_failed
+
+    @property
     def queue_depth(self) -> int:
         """Approximate current depth of the writer queue.
 
@@ -456,8 +486,9 @@ class CubeDumpWriter:
                     return
                 cube, manifest = item
                 try:
-                    self._write_one(cube, manifest)
+                    path = self._write_one(cube, manifest)
                     self._n_dumped += 1
+                    self._invoke_on_dump_complete(path, manifest)
                 except OSError as exc:
                     _log.error(
                         "cube_dump write failed (cube_id=%d, "
@@ -477,11 +508,35 @@ class CubeDumpWriter:
             finally:
                 self._queue.task_done()
 
+    def _invoke_on_dump_complete(
+        self, path: Path, manifest: CubeDumpManifest,
+    ) -> None:
+        """Fire the optional post-write hook, swallowing any error.
+
+        Counts successes / failures so an operator can confirm the hook
+        ran without grepping logs. The wrapper is private because the
+        writer thread is the only legitimate caller (the FD-level
+        write has already returned and ``n_dumped`` is incremented).
+        """
+        cb = self._on_dump_complete
+        if cb is None:
+            return
+        try:
+            cb(path, manifest)
+            self._n_hook_ok += 1
+        except Exception as exc:  # noqa: BLE001 — never poison the worker
+            _log.warning(
+                "cube_dump on_dump_complete hook failed "
+                "(cube_id=%d, path=%s): %r",
+                manifest.cube_id, path, exc,
+            )
+            self._n_hook_failed += 1
+
     def _write_one(
         self,
         cube: Any,
         manifest: CubeDumpManifest,
-    ) -> None:
+    ) -> Path:
         """Convert + persist a single (cube, manifest) pair to NPZ.
 
         Times the inner ``np.savez`` call with ``time.perf_counter`` and
@@ -503,10 +558,23 @@ class CubeDumpWriter:
         cube_np = _coerce_cube_to_float16_ndarray(cube)
         path = self._resolve_path(manifest)
         cluster_record_json = _cluster_record_to_json(manifest.cluster_record)
+        # Precompute the (n_fdm, n_t) peak grid that the C2 plotter
+        # otherwise rebuilds by streaming the full ~855 MB cube on h23.
+        # Doing it here — once, on the writer thread, with the cube
+        # already in L3 from the float16 coerce — turns the plotter's
+        # dominant 8 × ~9 s reduction into 8 × <50 ms .npz lookups.
+        # The reduction itself is fp16 numpy, ~1–2 s for a 4D cube of
+        # shape (n_fdm, n_t, n_grid, n_grid); the np.savez stage stays
+        # the writer-thread budget bottleneck.
+        if cube_np.ndim == 4 and cube_np.size > 0:
+            peak_grid = cube_np.max(axis=(2, 3))
+        else:
+            peak_grid = np.zeros((0, 0), dtype=cube_np.dtype)
         t_savez_start = time.perf_counter()
         np.savez(
             str(path),
             cube=cube_np,
+            peak_grid=peak_grid,
             mjd_start=np.asarray(manifest.mjd_start, dtype="float64"),
             event_specnum_start=np.asarray(
                 manifest.event_specnum_start, dtype="int64"
@@ -526,6 +594,7 @@ class CubeDumpWriter:
         # CPython (single-element atomic op); reads via ``tuple(deque)``
         # snapshot a consistent state. No explicit lock needed.
         self._recent_write_ms.append(write_ms)
+        return path
 
     def _compose_path(self, manifest: CubeDumpManifest) -> Path:
         """Build the canonical NPZ path for ``manifest``."""
