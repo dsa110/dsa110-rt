@@ -465,6 +465,14 @@ class RtOrchestrator:
             if self._state == "running":
                 LOG.info("verb start: already running; ignoring")
                 return
+            # If the operator didn't supply an observing-dec value with
+            # the verb (val is None / missing), fall back to the
+            # canonical declination service at /mon/array/dec.dec_deg
+            # (same key the meridian-fringestop pipeline reads via
+            # dsa110-meridian-fs/dsamfs/utils.get_pointing_declination).
+            # Lets routine startup proceed without an out-of-band --dec.
+            if val is None:
+                val = self._resolve_dec_from_etcd()
             self._state = "starting"
             self._reload_config()
             assert self._config is not None
@@ -473,6 +481,44 @@ class RtOrchestrator:
             self._start_time = time.time()
             self._state = "running"
             LOG.info("verb start: %d routines spawned", len(self._children))
+
+    def _resolve_dec_from_etcd(self) -> Optional[float]:
+        """Read /mon/array/dec.dec_deg from etcd as a CUSTOMDEC fallback.
+
+        Returns None if the key is missing / malformed / unreachable;
+        the caller treats that as "no substitution" and routines that
+        reference CUSTOMDEC will fail to start with the literal token
+        (deliberately loud — better than silently using a stale or zero
+        declination).
+        """
+        try:
+            d = self._store.get_dict("/mon/array/dec")
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning(
+                "verb start: /mon/array/dec read failed: %s; "
+                "CUSTOMDEC unresolved", exc,
+            )
+            return None
+        if not isinstance(d, dict) or "dec_deg" not in d:
+            LOG.warning(
+                "verb start: /mon/array/dec has no dec_deg field "
+                "(got %r); CUSTOMDEC unresolved", d,
+            )
+            return None
+        try:
+            v = float(d["dec_deg"])
+        except (TypeError, ValueError) as exc:
+            LOG.warning(
+                "verb start: /mon/array/dec.dec_deg not a float "
+                "(%r): %s; CUSTOMDEC unresolved", d.get("dec_deg"), exc,
+            )
+            return None
+        LOG.info(
+            "verb start: CUSTOMDEC fallback from "
+            "/mon/array/dec.dec_deg = %.4f (mtime_mjd=%s)",
+            v, d.get("time", "?"),
+        )
+        return v
 
     def _verb_stop(self, val: Any) -> None:
         with self._lock:
