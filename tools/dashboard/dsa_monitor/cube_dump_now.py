@@ -335,26 +335,53 @@ def _resolve_event_specnum_from_search_ring(
     max_age_s: float = DEFAULT_MAX_PUBLISHER_AGE_S,
 ) -> tuple[int | None, dict[str, Any]]:
     """Primary auto-pick path: poll ``/mon/search/<sid>/<g>/ring``
-    for every search-half in the fleet, pick
-    ``min(newest_event_specnum_start)`` (= the *laggard's* newest
-    cube, so every faster half also has it in its ring), and
-    subtract ``lookback_cubes × t_det × sample_period_specnum`` to
-    land squarely inside every half's [oldest, newest) retention
-    window.
+    for every search-half in the fleet, pick a target_specnum that
+    lands inside every half's [oldest, newest_end) retention
+    window even after publisher-cadence staleness + broadcast
+    latency.
 
     Returns ``(event_specnum, arm_info)``. ``event_specnum`` is
     ``None`` iff no fresh search-ring mon-key answered — the caller
     falls back to the legacy corr_fast path (or returns 503).
 
-    Why ``min(newest)`` and not ``max(newest)`` like the corr_fast
-    path? The corr_fast path picks the leader because the search
-    ring keys retain *fewer* cubes than corr_fast publishes blocks
-    (depth=16 vs hundreds of blocks), so we want to err toward the
-    laggard. ``cube_ring_depth=16`` gives every half ~16 × 1/7.45 ≈
-    2.1 s of retention, and the publishers refresh every ~1.3 s,
-    so a target = ``min_newest - 4 cubes`` lands ~half a second
-    behind the leader of every half — comfortably inside everyone's
-    window.
+    Where to land:
+        The C2 listener accepts triggers in
+        ``[oldest_start, newest_start + t_det × spp)`` (the union of
+        all 16 cubes' time windows). The freshness of the picked
+        target is bounded by:
+        * Publisher cadence (≈ 1.3 s at 7.45 cubes/s) makes the
+          stored ``newest_event_specnum_start`` up to 1.3 s stale.
+        * Broadcast + asyncio dispatch latency adds another fraction
+          of a second.
+        Rings advance at ``cube_cadence_samples = 128 search
+        samples per cube × 7.45 cubes/s = 985 samples/s``.
+
+        The *deepest* lookback that still lands forward of all
+        halves' rings is exactly ``min_newest + t_det × spp / 2`` —
+        halfway through the laggard half's newest cube. That gives
+        ~3.5 s of forward-drift tolerance before the laggard's
+        oldest slides past our pick.
+
+        Picking forward of ``min_newest`` (rather than the obvious
+        "back from newest, like corr_fast") is the right move
+        because:
+        * ``event_specnum_start`` in the ring is in *search-sample*
+          units (not raw specnums) — adjacent cubes are
+          ``cube_cadence_samples = 128`` apart, not
+          ``t_det × spp = 3072`` apart. So a lookback "in cubes"
+          using the cube_span as step lands ridiculously far back
+          (96 cubes back, well outside the depth=16 ring).
+        * The listener's per-cube window is ``t_det × spp = 3072``
+          search samples wide, so a single offset of half that span
+          inside the newest cube is always accepted.
+
+    The ``lookback_cubes`` arg is kept for backward compatibility
+    but only affects an optional *additional* backward offset; the
+    default (``DEFAULT_LOOKBACK_CUBES = 4``) was originally meant
+    to land inside the ring but in fact landed 96 cubes back. We
+    now interpret it as "additional cube_cadence_samples to
+    subtract on top of the natural mid-newest pick" — set to 0 to
+    disable.
     """
     info: dict[str, Any] = {
         "source": "search_ring",
@@ -427,11 +454,57 @@ def _resolve_event_specnum_from_search_ring(
     )
     info["newest_t_det"] = t_det_ref
     info["newest_sample_period_specnum"] = spp_ref
-    # Subtract a few cubes behind the laggard's newest. At depth=16
-    # and lookback=4, the target lands ~0.5 s behind the leader of
-    # every half — well inside every [oldest, newest) window.
+    # See docstring for the math. Net result:
+    #   target = min_newest_start + (t_det × spp) // 2
+    # so the synthetic specnum lands halfway through the laggard's
+    # NEWEST cube. The listener's per-cube acceptance window is
+    # [start, start + t_det × spp), so mid-newest always lands
+    # inside, leaving ~3.5 s of forward-drift tolerance before the
+    # laggard's oldest slot slides past us.
     cube_span = int(t_det_ref) * int(spp_ref)
-    target = min_newest - int(lookback_cubes) * cube_span
+    target = int(min_newest) + cube_span // 2
+    # Backward-compat: lookback_cubes>0 nudges the target further
+    # into the past in cube-cadence units (≈128 samples each).
+    # Default (4) is harmless margin; tests can pass 0 to disable.
+    # Note: this is NOT scaled by cube_span — the ring's start
+    # values advance by cube_cadence_samples (≈128) per cube, not
+    # by t_det × spp.
+    info["target_cube_span"] = cube_span
+    info["target_offset_from_min_newest"] = (
+        cube_span // 2
+    )  # informational; the actual subtraction is below.
+    if int(lookback_cubes) > 0 and len(info["answered"]) >= 1:
+        # Derive cube cadence from the freshest answered half by
+        # assuming the ring is in steady state: if a half has
+        # n_committed cubes and (newest - oldest) start delta,
+        # the cube cadence is delta / (n_committed - 1).
+        ring_cadence_specnums: int | None = None
+        for k in info["answered"]:
+            try:
+                d = store.get_dict(k)
+            except Exception:                                # noqa: BLE001
+                continue
+            if not isinstance(d, dict):
+                continue
+            nc = d.get("n_committed")
+            ns = d.get("newest_event_specnum_start")
+            os_ = d.get("oldest_event_specnum_start")
+            if (
+                isinstance(nc, int) and nc >= 2
+                and isinstance(ns, int) and isinstance(os_, int)
+                and ns > os_
+            ):
+                ring_cadence_specnums = max(
+                    1, int((ns - os_) // (nc - 1)),
+                )
+                break
+        if ring_cadence_specnums is not None:
+            extra = int(lookback_cubes) * ring_cadence_specnums
+            target -= extra
+            info["ring_cadence_specnums"] = ring_cadence_specnums
+            info["target_offset_from_min_newest"] = (
+                cube_span // 2 - extra
+            )
     if target < 0:
         target = 0
     return int(target), info
