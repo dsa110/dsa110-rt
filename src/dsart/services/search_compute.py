@@ -252,6 +252,16 @@ class SearchComputeConfig:
     # writer agree on where files land.
     c1_dump_root: Optional[Path] = None
 
+    # --- M7.4 cube uploader (search-node → h23 rsync) -----------------
+    # When both ``cube_upload_dest_host`` and ``cube_upload_dest_root``
+    # are set the ``CubeDumpWriter`` fires an ``rsync`` after every
+    # successful per-event NPZ write. ``None`` (default) disables the
+    # uploader (legacy / bench paths). Production wires it from
+    # ``c1.uploader.remote_root`` in ``dsart_search_rt.yaml``.
+    cube_upload_dest_host: Optional[str] = None
+    cube_upload_dest_root: Optional[str] = None
+    cube_upload_bandwidth_limit_kbps: int = 0
+
 
 # ---------------------------------------------------------------------------
 # SearchComputeService
@@ -338,6 +348,85 @@ class SearchComputeService:
         self._c2_trigger: Optional[C2TriggerListener] = None
         self._c1_batches_submitted = 0
         self._c1_batches_dropped = 0
+
+        # M7.4 fix (2026-05-27): when ``config.mjd_at_specnum_0`` is the
+        # placeholder default (0.0), every restart of search_compute
+        # would tag cubes with ``mjd_start ≈ 0`` (= MJD 0 = year 1858),
+        # which collapses every restart's batches into the same
+        # signal-time window on the C2 side and creates an immortal
+        # cluster. ``_geom_from_slot`` checks this override first; the
+        # value is latched once on the very first cube using the
+        # wall-clock at that moment minus the first cube's specnum
+        # offset (good to a few ms — well under C2's window of 5 s).
+        # An operator that sets ``mjd_at_specnum_0`` explicitly (i.e.
+        # not 0.0) wins; the override is only filled when the cfg is
+        # at the placeholder.
+        self._mjd_at_specnum_0_override: Optional[float] = None
+
+    @staticmethod
+    def _build_cube_uploader_callback(
+        config: SearchComputeConfig,
+    ):
+        """Return a ``CubeDumpWriter`` post-write callback that fires
+        ``rsync`` to the configured h23 destination, or ``None`` if
+        the uploader is disabled.
+
+        The callback signature is ``(path, manifest)``. The event name
+        is extracted from ``path.parent.name`` — by contract the C2
+        trigger listener composes
+        ``${c1.dump_root}/<event_name>/cube_s<sid>_g<g>_<spec>.npz``
+        so the parent directory IS the event archive name. If the
+        path's parent IS the writer's flat ``dump_root`` (legacy M6
+        auto / udp paths with no event subdir), the upload is skipped
+        — no event archive to populate on h23.
+        """
+        dest_host = config.cube_upload_dest_host
+        dest_root = config.cube_upload_dest_root
+        if not dest_host or not dest_root:
+            return None
+        # Local import keeps the dump-writer module decoupled from the
+        # coinc package; the import happens once at service start.
+        from ..coinc.cube_uploader import upload_event_cubes
+
+        # Resolve the flat ``dump_root`` once so the callback can skip
+        # legacy non-per-event writes without re-resolving each call.
+        flat_dump_root: Optional[Path] = None
+        if config.cube_dump_writer_config is not None:
+            try:
+                flat_dump_root = Path(
+                    config.cube_dump_writer_config.dump_root
+                ).resolve()
+            except (OSError, RuntimeError):
+                flat_dump_root = Path(
+                    config.cube_dump_writer_config.dump_root
+                )
+        bwlimit = int(config.cube_upload_bandwidth_limit_kbps or 0)
+
+        def _on_dump_complete(path: Path, manifest) -> None:  # noqa: ANN001
+            event_dir = Path(path).parent
+            try:
+                resolved = event_dir.resolve()
+            except (OSError, RuntimeError):
+                resolved = event_dir
+            if flat_dump_root is not None and resolved == flat_dump_root:
+                # Legacy flat write (no event subdir) — nothing to upload.
+                return
+            event_name = event_dir.name
+            if not event_name:
+                _LOG.warning(
+                    "cube_uploader: skipping empty event_name for path=%s",
+                    path,
+                )
+                return
+            upload_event_cubes(
+                event_name=event_name,
+                src_dir=event_dir,
+                dest_host=dest_host,
+                dest_root=dest_root,
+                bandwidth_limit_kbps=bwlimit,
+            )
+
+        return _on_dump_complete
 
     @staticmethod
     def _build_detector(config: SearchComputeConfig) -> DeterministicDetector:
@@ -507,7 +596,19 @@ class SearchComputeService:
             Path(cfg.cube_dump_writer_config.dump_root).mkdir(
                 parents=True, exist_ok=True
             )
-            self._cube_dump = CubeDumpWriter(config=cfg.cube_dump_writer_config)
+            # M7.4 cube uploader (search-node → h23 rsync). When both
+            # ``cube_upload_dest_host`` and ``cube_upload_dest_root``
+            # are set in the service config (default-wired from
+            # ``c1.uploader.remote_root`` in ``dsart_search_rt.yaml``),
+            # bind a per-write callback that spawns a detached rsync
+            # next to each NPZ. The callback is a closure capturing
+            # the destination config so the writer module stays free
+            # of any uploader knowledge.
+            on_dump_complete = self._build_cube_uploader_callback(cfg)
+            self._cube_dump = CubeDumpWriter(
+                config=cfg.cube_dump_writer_config,
+                on_dump_complete=on_dump_complete,
+            )
             self._cube_dump.start()
         if cfg.udp_trigger_listener_config is not None:
             # Legacy "dump next cube" listener; kept for the M6 path so
@@ -627,7 +728,31 @@ class SearchComputeService:
         # mjd_start = mjd_at_specnum_0 + specnum_start * t_int_fast_us / 1e6 / 86400.
         # t_int_fast_us = sample_period_us / sample_period_specnum.
         t_int_fast_us = cfg.cube_sample_period_us / cfg.cube_sample_period_specnum
-        mjd_start = cfg.mjd_at_specnum_0 + (
+        # Latch the per-run wall-clock anchor on the first cube when the
+        # operator didn't pin ``mjd_at_specnum_0`` explicitly. The shift
+        # by ``-specnum_start * t_int_fast_us`` puts the anchor at the
+        # MJD that specnum 0 would have hit IF the run had started at
+        # specnum 0 at the same wall-clock cadence. UNIX epoch 1970-01-01
+        # = MJD 40587.0 exactly.
+        if self._mjd_at_specnum_0_override is None and cfg.mjd_at_specnum_0 == 0.0:
+            wall_mjd_now = 40587.0 + time.time() / 86400.0
+            self._mjd_at_specnum_0_override = float(
+                wall_mjd_now
+                - slot.specnum_start * t_int_fast_us * 1e-6 / 86400.0
+            )
+            _LOG.info(
+                "mjd_at_specnum_0 wall-clock latch: %.9f "
+                "(slot.specnum_start=%d, t_int_fast_us=%.6f)",
+                self._mjd_at_specnum_0_override,
+                int(slot.specnum_start),
+                t_int_fast_us,
+            )
+        mjd_at_specnum_0 = (
+            self._mjd_at_specnum_0_override
+            if self._mjd_at_specnum_0_override is not None
+            else cfg.mjd_at_specnum_0
+        )
+        mjd_start = mjd_at_specnum_0 + (
             slot.specnum_start * t_int_fast_us * 1e-6 / 86400.0
         )
         return CubeGeometry(
@@ -1330,6 +1455,22 @@ def _build_search_config_from_yaml(
     c1_dump_root = (
         Path(c1["dump_root"]) if "dump_root" in c1 else None
     )
+    # M7.4 cube uploader (search-node → h23 rsync). Parsed from
+    # ``c1.uploader.remote_root`` (rsync ``user@host:/path`` shape)
+    # plus an optional ``bandwidth_limit_kbps``. When unset, the
+    # uploader stays disabled (the writer's post-write hook is None).
+    uploader_yaml = c1.get("uploader", {}) or {}
+    cube_upload_dest_host: Optional[str] = None
+    cube_upload_dest_root: Optional[str] = None
+    cube_upload_bwlimit_kbps = int(
+        uploader_yaml.get("bandwidth_limit_kbps", 0) or 0
+    )
+    remote_root_raw = uploader_yaml.get("remote_root", "")
+    if remote_root_raw:
+        from ..coinc.cube_uploader import parse_remote_root
+        cube_upload_dest_host, cube_upload_dest_root = parse_remote_root(
+            str(remote_root_raw)
+        )
     c2_listener_cfg: Optional[C2TriggerListenerConfig] = None
     if enable_c1 and dump_listener_yaml:
         bind_host = c1_bind_host_override or str(
@@ -1430,6 +1571,9 @@ def _build_search_config_from_yaml(
         c1_emit_config=c1_emit_cfg,
         c2_trigger_listener_config=c2_listener_cfg,
         c1_dump_root=c1_dump_root,
+        cube_upload_dest_host=cube_upload_dest_host,
+        cube_upload_dest_root=cube_upload_dest_root,
+        cube_upload_bandwidth_limit_kbps=cube_upload_bwlimit_kbps,
     )
 
 
