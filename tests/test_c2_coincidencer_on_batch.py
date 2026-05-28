@@ -317,3 +317,143 @@ async def test_no_leak_under_many_restart_cycles(tmp_path: Path) -> None:
         f"restart cycles (each shipping 10 late rows)"
     )
     assert svc._counters["rows_late_drop"] == 50 * 10
+
+
+# ---------------------------------------------------------------------------
+# Noise-warmup filter (M7.4 Phase 8, 2026-05-28)
+# ---------------------------------------------------------------------------
+
+
+def _batch_with_flags(
+    mjd_start: float,
+    flag_pattern: tuple[int, ...],
+    *,
+    event_specnum_start: int = 0,
+    cube_id: int = 0,
+) -> wire.C1Batch:
+    """Build a batch where each row carries the flag value at the
+    matching index in ``flag_pattern``. Used to drive the C2 warmup
+    filter with a known mix of warmup-flagged + clean rows.
+    """
+    n = len(flag_pattern)
+    header = wire.build_header(
+        cube_id=cube_id,
+        event_specnum_start=event_specnum_start,
+        mjd_start=mjd_start,
+        sample_period_specnum=1,
+        sample_period_us=100_000.0,
+        n_grid=256,
+        n_fdm_in_cube=34,
+        search_node_id=1,
+        gpu_half=0,
+        n_candidates=n,
+    )
+    rows = tuple(
+        wire.C1CandidateRow(
+            snr=9.0 + 0.1 * i,
+            l_rad=0.0, m_rad=0.0, l_pix=0, m_pix=0,
+            dm_pc_cc=100.0, dm_idx_global=0, fine_dm_idx=0,
+            event_specnum=event_specnum_start + i,
+            width_samples=4, kernel_id="unit:d1:b4",
+            flags=int(flag_pattern[i]),
+        )
+        for i in range(n)
+    )
+    return wire.C1Batch(header=header, candidates=rows)
+
+
+@asyncio_test
+async def test_warmup_flagged_rows_skip_graph_and_window(tmp_path: Path) -> None:
+    """The C2 batch handler must drop rows whose flags include
+    ``CandidateFlags.NOISE_WARMUP`` (bit 3 = 8) before they hit the
+    window or graph.
+
+    Regression for the 2026-05-28 false-burst incident: during the
+    Layer-2 σ_k EMA burn-in (30 cubes at production cadence) every
+    emitted Candidate carries this flag, but C2 ingested them all,
+    producing 407 spurious rows_in across 50 s with peak 107 rows/s
+    and 25 false log_only triggers/s -- all post-burnin readings
+    showed 0 rows/s with the same sky/RFI environment.
+    """
+    svc = _make_service(tmp_path, window_s=5.0)
+    # Mix: 5 warmup-flagged + 3 clean rows in one batch.
+    NOISE_WARMUP = 1 << 3  # CandidateFlags.NOISE_WARMUP
+    pattern = (NOISE_WARMUP,) * 5 + (0, 0, 0)
+    await svc._on_batch(
+        _batch_with_flags(mjd_start=60781.0, flag_pattern=pattern),
+        peer_repr="warmup-test",
+    )
+    # Only the 3 clean rows should be in the window + graph.
+    assert len(svc._window) == 3
+    assert len(svc._graph) == 3
+    # Counters: rows_in counts only the survivors (warmup-dropped never
+    # enter the window/graph accounting); rows_warmup_drop tracks the
+    # filtered total separately for the monitor surface.
+    assert svc._counters["rows_in"] == 3
+    assert svc._counters["rows_warmup_drop"] == 5
+
+
+@asyncio_test
+async def test_all_warmup_batch_is_full_skip(tmp_path: Path) -> None:
+    """A batch where every row is warmup-flagged must produce a full
+    skip: no graph add, no window mutation, no late_drop accounting
+    fired."""
+    svc = _make_service(tmp_path, window_s=5.0)
+    NOISE_WARMUP = 1 << 3
+    # First push a real (clean) batch so the window/graph aren't empty.
+    await svc._on_batch(
+        _batch_with_flags(mjd_start=60781.0, flag_pattern=(0,) * 4),
+        peer_repr="warm-up-pre",
+    )
+    w0, g0 = len(svc._window), len(svc._graph)
+    assert w0 == g0 == 4
+    # Then push 7 all-warmup rows.
+    await svc._on_batch(
+        _batch_with_flags(
+            mjd_start=60781.0 + 0.1 / 86400.0,
+            flag_pattern=(NOISE_WARMUP,) * 7,
+            event_specnum_start=100,
+        ),
+        peer_repr="all-warmup",
+    )
+    # Nothing should have changed in the graph / window.
+    assert len(svc._window) == w0
+    assert len(svc._graph) == g0
+    assert svc._counters["rows_warmup_drop"] == 7
+    assert svc._counters.get("rows_late_drop", 0) == 0
+
+
+@asyncio_test
+async def test_warmup_filter_preserves_late_drop_semantics(tmp_path: Path) -> None:
+    """The warmup filter runs BEFORE the window age-out, so warmup-
+    flagged rows are not counted as late drops. Mixed batches with
+    both old + warmup-flagged rows should attribute the drop to the
+    right counter."""
+    svc = _make_service(tmp_path, window_s=2.0)
+    NOISE_WARMUP = 1 << 3
+    # Anchor the window at +10 s with one fresh row so window_s=2 has
+    # a clear cutoff at 8 s.
+    anchor_mjd = 60781.0 + 10.0 / 86400.0
+    await svc._on_batch(
+        _batch_with_flags(mjd_start=anchor_mjd, flag_pattern=(0,)),
+        peer_repr="anchor",
+    )
+    assert len(svc._graph) == 1
+    # Now send 3 warmup rows at the same anchor (would have been in-
+    # window if not warmup-flagged) plus 2 clean late rows (mjd 9 s
+    # below cutoff). Expectation:
+    #   rows_warmup_drop += 3
+    #   rows_late_drop += 2
+    #   graph_size unchanged
+    late_mjd = 60781.0 + 1.0 / 86400.0
+    await svc._on_batch(
+        _batch_with_flags(
+            mjd_start=late_mjd,
+            flag_pattern=(NOISE_WARMUP, NOISE_WARMUP, NOISE_WARMUP, 0, 0),
+            event_specnum_start=50,
+        ),
+        peer_repr="mixed",
+    )
+    assert svc._counters["rows_warmup_drop"] == 3
+    assert svc._counters["rows_late_drop"] == 2
+    assert len(svc._graph) == 1

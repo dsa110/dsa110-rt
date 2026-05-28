@@ -384,3 +384,83 @@ async def test_reconnect_after_server_drop() -> None:
         except asyncio.TimeoutError:
             task.cancel()
         await srv.stop()
+
+
+@asyncio_test
+async def test_connect_timeout_fires_on_syn_blackhole() -> None:
+    """The run() loop must self-heal when asyncio.open_connection hangs
+    (e.g. SYN dropped by conntrack / firewall / a stuck peer listen
+    queue). Without an upstream timeout the TCP stack retransmits SYN
+    for ~2 min before giving up; the c1_emit task would silently wedge
+    that entire window while the cube ring fills and total_dropped
+    climbs unbounded. With connect_timeout_s the wait_for raises
+    TimeoutError which the outer except logs as "connection failed"
+    and the backoff retries -- the same self-heal path every other
+    transient already exercises.
+
+    Reproduces the symptom by pointing at TEST-NET-1 (RFC 5737:
+    192.0.2.0/24 reserved for docs, guaranteed unrouted). The kernel
+    never gets a SYN-ACK; without the wait_for the open_connection
+    call would hang until the SYN retransmit timer gives up.
+    """
+    cfg = C1EmitConfig(
+        host="192.0.2.1",  # TEST-NET-1 -- guaranteed-unrouted RFC 5737
+        port=11500,
+        search_node_id=0,
+        gpu_half=0,
+        queue_depth=8,
+        connect_backoff_initial_s=0.05,
+        connect_backoff_max_s=0.05,
+        send_timeout_s=2.0,
+        connect_timeout_s=0.3,  # short for test; production default 10s
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    task = asyncio.create_task(emitter.run())
+    try:
+        # The first wait_for should fire at ~0.3s; with the 0.05s
+        # backoff cap, by 2.0s we should have at least 3-4 attempts
+        # logged on last_connect_error.
+        await asyncio.sleep(2.0)
+        assert not emitter.mon["connected"], (
+            "should never connect to TEST-NET-1"
+        )
+        # The last error should be a TimeoutError, and we should have
+        # cycled through the run() loop several times. If the wait_for
+        # is missing or its timeout is None, we'd be stuck on the very
+        # first open_connection call with last_connect_error == None.
+        last_err = emitter.mon["last_connect_error"] or ""
+        assert "Timeout" in last_err or "timeout" in last_err, (
+            f"expected TimeoutError-class last_connect_error; "
+            f"got {last_err!r}. The connect_timeout_s watchdog is "
+            f"not firing. mon={dict(emitter.mon)}"
+        )
+    finally:
+        await emitter.stop()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+
+
+@asyncio_test
+async def test_connect_timeout_disabled_when_none() -> None:
+    """Setting connect_timeout_s=None disables the wait_for wrapper.
+    Used by callers that want the OS TCP RTO sequence (rare, e.g.
+    bench scripts that simulate long-haul WAN connects)."""
+    cfg = C1EmitConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        search_node_id=0,
+        gpu_half=0,
+        queue_depth=8,
+        connect_backoff_initial_s=0.05,
+        connect_backoff_max_s=0.05,
+        send_timeout_s=2.0,
+        connect_timeout_s=None,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    # Just verify the config accepts None and the emitter constructs
+    # without raising. Full no-timeout dynamics are hard to test
+    # without injecting OS-level packet drops.
+    assert emitter._config.connect_timeout_s is None
+    assert emitter is not None

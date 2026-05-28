@@ -534,6 +534,15 @@ class CoincidencerService:
         self._counters: Dict[str, int] = {
             "rows_in": 0,
             "rows_late_drop": 0,
+            # M7.4 Phase 8 (2026-05-28): rows dropped because the
+            # search-side Layer-2 σ_k EMA was still in burn-in
+            # (CandidateFlags.NOISE_WARMUP). Exposed in the mon-dict
+            # for Grafana so the operator can see the warmup-filter
+            # activity during the first ~30 cubes after each search
+            # restart and after the first ~50 s of every cold start
+            # (slow ramp from 0.96 -> 7.55 cubes/s in search_compute
+            # gives ~30 cubes spread over ~30 s).
+            "rows_warmup_drop": 0,
             "components_evaluated": 0,
             "triggers_dump": 0,
             "triggers_suppressed": 0,
@@ -647,7 +656,49 @@ class CoincidencerService:
         if batch.header.n_candidates == 0:
             # Empty heartbeat; nothing to do for the graph but record.
             return
-        new_entries = self._window.add(batch.header, batch.candidates)
+
+        # M7.4 Phase 8 (2026-05-28): drop noise-warmup-flagged candidate
+        # rows before they hit the window/graph. The search-side
+        # Layer-2 σ_k EMA is in burn-in for the first N_burnin cubes
+        # (default 30 cubes = ~4 s at production cadence); during this
+        # window σ_k is computed by a Welford running mean that has not
+        # yet absorbed enough samples to be a reliable estimator. The
+        # detector sets ``flags & NOISE_WARMUP`` on every Candidate
+        # emitted while ``Layer2State.is_warming_up`` is True (see
+        # ``detector/forward.py``); we filter on that bit here so the
+        # coincidencer's window count, graph membership, MJD-key gate,
+        # triggers_log_only counter, and per-event archives all reflect
+        # ONLY post-burn-in (statistically valid) candidates. Without
+        # this filter the cold-start burst at 2026-05-28T21:29:30Z
+        # produced 407 rows_in over 50 s (peak 107 rows/s vs ~0/s
+        # steady state) and 25 false log_only triggers/s — exactly
+        # matching the L2 burn-in (30 cubes) × the slow-start
+        # (~0.96 cubes/s during the first ~30 cubes) = ~30 s of
+        # rolling false-positive rate per search half. Dropped rows
+        # are counted in self._counters["rows_warmup_drop"] for the
+        # /mon/c2 monitor surface so the operator can see warmup
+        # filtering activity. The full row list is still streamed
+        # into the rolling C1 CSV further down (faithful wire log of
+        # everything received); only the trigger pipeline skips them.
+        # Per the wire schema the bit set is
+        # ``CandidateFlags.NOISE_WARMUP = 1 << 3 = 8``.
+        warmup_mask = 1 << 3  # CandidateFlags.NOISE_WARMUP -- see contracts.py
+        all_candidates = tuple(batch.candidates)
+        candidates_post_warmup = tuple(
+            r for r in all_candidates if (int(r.flags) & warmup_mask) == 0
+        )
+        warmup_dropped = len(all_candidates) - len(candidates_post_warmup)
+        if warmup_dropped:
+            self._counters["rows_warmup_drop"] = (
+                self._counters.get("rows_warmup_drop", 0) + warmup_dropped
+            )
+        if not candidates_post_warmup:
+            # All rows were warmup-flagged; nothing to graph. Still
+            # bump rows_in by zero (no-op) and skip the rest of the
+            # heavy graph/trigger path.
+            return
+
+        new_entries = self._window.add(batch.header, candidates_post_warmup)
         aged = self._window.aged_out()
         # Split aged into "really aged" entries (were already in the window
         # at the start of this batch) and "late arrivals" (rows that came in
