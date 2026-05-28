@@ -1463,3 +1463,153 @@ class TestF28CellLambdaMode:
             int(ctx_common.gridder.pattern.pattern_id)
             != int(ctx_per.gridder.pattern.pattern_id)
         )
+
+
+# ---------------------------------------------------------------------------
+# M7.4 Phase 6: voltage-domain online signal injection wiring
+#
+# These tests pin the corr_fast → OnlineInjector hook itself. The
+# physics-grade dispersion / phasor / fluence tests live in
+# tests/test_online_injector.py; here we only assert that the wiring
+# from FastIntegrationConfig → IntegrationContext → _process_block_corr_phase
+# is correct.
+# ---------------------------------------------------------------------------
+
+
+from dsart.inject.online import InjectionConfig
+from dsart.services.corr_fast_integration import _process_block_corr_phase
+
+
+def _phase6_inject_cfg(*, inj_id: str = "phase6_test_v1") -> InjectionConfig:
+    """One sensible injection config for the wiring tests.
+
+    Mid-band DM (200 pc/cc), boresight (l=m=0) so phasor=1 across the
+    band (the gridder still uses the synthetic antpos for the cell-λ
+    pin), 1 ms width (~30 native samples), fluence 50 Jy·ms, peak at
+    specnum=4096 (= block 2 if NPACKETS_PER_BLOCK=2048).
+    """
+    return InjectionConfig(
+        inj_id=inj_id,
+        l_rad=0.0,
+        m_rad=0.0,
+        dm_pc_cm3=200.0,
+        fluence_jy_ms=50.0,
+        width_samples=32,
+        profile="gaussian",
+        apply_at_specnum=4096,
+    )
+
+
+def test_phase6_build_context_no_injector_when_configs_empty() -> None:
+    """Default cfg ⇒ ctx.injector is None ⇒ zero hot-path overhead.
+
+    Sanity-pins the M7.4 Phase 6 default-off behaviour: gate-soak runs
+    that don't pass --inject-spec must not pay the OnlineInjector
+    construction or per-block apply cost.
+    """
+    cfg = _make_cfg()
+    assert cfg.inject_configs == ()
+    ctx = _build_test_context(cfg)
+    assert ctx.injector is None
+
+
+def test_phase6_build_context_builds_injector_from_configs() -> None:
+    """Non-empty inject_configs ⇒ injector built, pending queue
+    populated, dtype/device match the integration context.
+    """
+    inj = _phase6_inject_cfg()
+    cfg = _make_cfg(inject_configs=(inj,))
+    ctx = _build_test_context(cfg)
+
+    assert ctx.injector is not None
+    assert list(ctx.injector.pending.keys()) == [inj.inj_id]
+    assert ctx.injector.chgroup == int(cfg.chgroup)
+    assert ctx.injector.dtype == ctx.voltage_dtype
+    assert torch.device(ctx.injector.device) == torch.device("cpu")
+
+
+def test_phase6_build_context_accepts_multiple_configs() -> None:
+    """Phase 6 supports >1 simultaneous injection (multiple
+    --inject-spec). Tests that all are queued."""
+    a = _phase6_inject_cfg(inj_id="phase6_test_a")
+    b = _phase6_inject_cfg(inj_id="phase6_test_b")
+    cfg = _make_cfg(inject_configs=(a, b))
+    ctx = _build_test_context(cfg)
+    assert ctx.injector is not None
+    assert set(ctx.injector.pending.keys()) == {a.inj_id, b.inj_id}
+
+
+def test_phase6_inject_modifies_voltages_in_corr_phase() -> None:
+    """End-to-end wiring pin: at the block whose native window
+    overlaps the injection peak, ``_process_block_corr_phase`` adds a
+    non-zero contribution to the voltages BEFORE the RFI flagger.
+
+    Strategy: build two identical contexts (same seed, same raw bytes,
+    static-sky disabled, RFI disabled — the RFI flagger gates on a
+    flagger object, but the *injection itself* is exercised even with
+    RFI on, since the injection-then-RFI ordering is a deliberate
+    Phase 6 invariant we test downstream). The injection-on context
+    should produce a meaningfully different Stokes-I cube at the
+    target block; the injection-off context returns the baseline.
+    """
+    inj = _phase6_inject_cfg()
+    cfg_inj = _make_cfg(inject_configs=(inj,))
+    cfg_no_inj = _make_cfg()
+
+    ctx_inj = _build_test_context(cfg_inj)
+    ctx_no_inj = _build_test_context(cfg_no_inj)
+
+    raw = _synthetic_fada_block(seed=20260605)
+
+    # The injection peak lands at specnum=4096 ⇒ block_n = 2 (since 1
+    # block = 2048 specnums). Process block 2 and verify voltage delta.
+    target_block_n = 2
+
+    vis_inj, _ = _process_block_corr_phase(
+        raw, ctx=ctx_inj, block_n=target_block_n,
+    )
+    vis_no_inj, _ = _process_block_corr_phase(
+        raw, ctx=ctx_no_inj, block_n=target_block_n,
+    )
+
+    # The Stokes-I cube on the injection-on path must differ from the
+    # no-inject baseline (≥ a few quanta of fp16 in some bin).
+    delta = (vis_inj - vis_no_inj).abs().to(torch.float32)
+    assert delta.max().item() > 0.0, (
+        "Phase 6 wiring did not modify the Stokes-I cube at the "
+        "target block (injector hook not firing?)"
+    )
+
+
+def test_phase6_inject_no_op_outside_target_block() -> None:
+    """At blocks far before the injection's footprint, the cube is
+    bit-identical to the no-injection baseline (the OnlineInjector
+    footprint test correctly skips out-of-window blocks).
+    """
+    inj = _phase6_inject_cfg()
+    cfg_inj = _make_cfg(inject_configs=(inj,))
+    cfg_no_inj = _make_cfg()
+
+    ctx_inj = _build_test_context(cfg_inj)
+    ctx_no_inj = _build_test_context(cfg_no_inj)
+
+    raw = _synthetic_fada_block(seed=20260606)
+
+    # block_n=1 ⇒ specnum_start=2048 ⇒ block native window [4096, 8191).
+    # apply_at_specnum=4096 ⇒ peak_native=8192. Width 32 samples puts
+    # the earliest contributing native at 8192 - max_width_samples = ~4096,
+    # which DOES brush the tail of block_n=1. So pick block_n=200 (far
+    # past) for the strict no-touch assertion.
+    far_block_n = 200
+
+    vis_inj, _ = _process_block_corr_phase(
+        raw, ctx=ctx_inj, block_n=far_block_n,
+    )
+    vis_no_inj, _ = _process_block_corr_phase(
+        raw, ctx=ctx_no_inj, block_n=far_block_n,
+    )
+
+    assert torch.equal(vis_inj, vis_no_inj), (
+        "Phase 6: injection contributed to a block outside its "
+        "native footprint (auto-purge / footprint-skip broken?)"
+    )
