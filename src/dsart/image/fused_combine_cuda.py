@@ -99,7 +99,15 @@ extern "C" __global__ void fused_combine_per_fdm_cf16(
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int chg_stride     = t_stream * n_grid_sq;
+    // 64-bit strides: n_chg*t_stream*n_grid_sq overflows int32 at the
+    // production owned_dm=7 op-point (n_chg=16, t_stream~1548, N=256:
+    // 16 * 1548 * 65536 = 3.24e9 > INT_MAX). The MMU faults observed
+    // on n13/n09 (owned_dm 5..7) were the canonical symptom; lower
+    // owned_dm cases worked because the product stayed under 2.1e9.
+    // NOTE: keep the CUDA source strictly ASCII -- NVRTC + the CuPy
+    // compile-cache write the source as bytes via the C-locale and
+    // will UnicodeEncodeError on em-dash / mu / superscript chars.
+    const long long chg_stride = (long long)t_stream * n_grid_sq;
 
     // Plan section 3.6.3 sign convention: at output cube-time t,
     // chgroup g contributes streams[g, t - shifts[g]]. Out-of-range
@@ -112,13 +120,14 @@ extern "C" __global__ void fused_combine_per_fdm_cf16(
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const __half2 val = streams[
-                g * chg_stride + t_src * n_grid_sq + spatial_offset
-            ];
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * n_grid_sq
+                                 + spatial_offset;
+            const __half2 val = streams[base];
             acc = __hadd2(acc, val);
         }
     }
-    output[t * n_grid_sq + spatial_offset] = acc;
+    output[(long long)t * n_grid_sq + spatial_offset] = acc;
 }
 """
 
@@ -136,7 +145,7 @@ extern "C" __global__ void fused_combine_per_fdm_cf32(
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int chg_stride     = t_stream * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * n_grid_sq;
 
     // Plan section 3.6.3 sign convention:
     //   out[t] = sum_g streams[g, t - shifts[g]].
@@ -145,14 +154,15 @@ extern "C" __global__ void fused_combine_per_fdm_cf32(
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const float2 val = streams[
-                g * chg_stride + t_src * n_grid_sq + spatial_offset
-            ];
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * n_grid_sq
+                                 + spatial_offset;
+            const float2 val = streams[base];
             acc.x += val.x;
             acc.y += val.y;
         }
     }
-    output[t * n_grid_sq + spatial_offset] = acc;
+    output[(long long)t * n_grid_sq + spatial_offset] = acc;
 }
 """
 
@@ -198,8 +208,9 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16(
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int t_stride       = 2 * n_grid_sq;       // re plane + im plane
-    const int chg_stride     = t_stream * t_stride;
+    // 64-bit strides -- see CF16/CF32 kernels above for the rationale.
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
 
     // Plan section 3.6.3 sign convention:
     //   out[t] = sum_g streams[g, t - shifts[g]].
@@ -209,12 +220,14 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16(
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
-            acc_re += (int)streams[base];                      // re plane
-            acc_im += (int)streams[base + n_grid_sq];          // im plane
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * t_stride
+                                 + spatial_offset;
+            acc_re += (int)streams[base];                       // re plane
+            acc_im += (int)streams[base + n_grid_sq];           // im plane
         }
     }
-    output[t * n_grid_sq + spatial_offset] = __floats2half2_rn(
+    output[(long long)t * n_grid_sq + spatial_offset] = __floats2half2_rn(
         (float)acc_re, (float)acc_im
     );
 }
@@ -234,8 +247,8 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf32(
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int t_stride       = 2 * n_grid_sq;
-    const int chg_stride     = t_stream * t_stride;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
 
     // Plan section 3.6.3 sign convention:
     //   out[t] = sum_g streams[g, t - shifts[g]].
@@ -245,12 +258,14 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf32(
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * t_stride
+                                 + spatial_offset;
             acc_re += (int)streams[base];
             acc_im += (int)streams[base + n_grid_sq];
         }
     }
-    output[t * n_grid_sq + spatial_offset] = make_float2(
+    output[(long long)t * n_grid_sq + spatial_offset] = make_float2(
         (float)acc_re, (float)acc_im
     );
 }
@@ -302,8 +317,8 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int t_stride       = 2 * n_grid_sq;
-    const int chg_stride     = t_stream * t_stride;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
 
     // Plan section 3.6.3 sign convention:
     //   out[t] = sum_g (scale[g] * cint8[g, t - shifts[g]] + offset[g])
@@ -314,7 +329,9 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * t_stride
+                                 + spatial_offset;
             const float c_re = (float)streams[base];
             const float c_im = (float)streams[base + n_grid_sq];
             const float sc   = scales[g];
@@ -322,7 +339,7 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[g];
         }
     }
-    output[t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
+    output[(long long)t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
 }
 """
 
@@ -343,8 +360,8 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int t_stride       = 2 * n_grid_sq;
-    const int chg_stride     = t_stream * t_stride;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
 
     // Plan section 3.6.3 sign convention:
     //   out[t] = sum_g (scale[g] * cint8[g, t - shifts[g]] + offset[g])
@@ -355,7 +372,9 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * t_stride
+                                 + spatial_offset;
             const float c_re = (float)streams[base];
             const float c_im = (float)streams[base + n_grid_sq];
             const float sc   = scales[g];
@@ -363,7 +382,7 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[g];
         }
     }
-    output[t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
+    output[(long long)t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
 }
 """
 
@@ -393,7 +412,7 @@ _CUDA_SOURCE_CF16_DEQUANT_CALIB_PER_T = r"""
 extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16(
     const signed char* __restrict__ streams,    // [N_chg, T, 2, N, N] int8
     const int*         __restrict__ shifts,     // [N_chg] int32
-    const float*       __restrict__ scales,     // [N_chg, T] fp32 — per-(g, t_src)
+    const float*       __restrict__ scales,     // [N_chg, T] fp32 -- per-(g, t_src)
     const float*       __restrict__ offset_re,  // [N_chg, T] fp32
     const float*       __restrict__ offset_im,  // [N_chg, T] fp32
     __half2*           __restrict__ output,     // [T_det, N, N] cfp16
@@ -406,8 +425,8 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int t_stride       = 2 * n_grid_sq;
-    const int chg_stride     = t_stream * t_stride;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
 
     // out[t] = sum_g (scale[g, t_src] * cint8[g, t_src] + offset[g, t_src]).
     // scale==0 from the assembler signals "skip this (g, t_src) slot"
@@ -419,7 +438,9 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * t_stride
+                                 + spatial_offset;
             const float c_re = (float)streams[base];
             const float c_im = (float)streams[base + n_grid_sq];
             const int   gt   = g * t_stream + t_src;
@@ -428,7 +449,7 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[gt];
         }
     }
-    output[t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
+    output[(long long)t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
 }
 """
 
@@ -449,8 +470,8 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
 
     const int n_grid_sq      = n_grid * n_grid;
     const int spatial_offset = u * n_grid + v;
-    const int t_stride       = 2 * n_grid_sq;
-    const int chg_stride     = t_stream * t_stride;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
 
     float acc_re = 0.0f;
     float acc_im = 0.0f;
@@ -458,7 +479,9 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
         const int s = shifts[g];
         const int t_src = t - s;
         if (t_src >= 0 && t_src < t_stream) {
-            const int base = g * chg_stride + t_src * t_stride + spatial_offset;
+            const long long base = (long long)g * chg_stride
+                                 + (long long)t_src * t_stride
+                                 + spatial_offset;
             const float c_re = (float)streams[base];
             const float c_im = (float)streams[base + n_grid_sq];
             const int   gt   = g * t_stream + t_src;
@@ -467,7 +490,7 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[gt];
         }
     }
-    output[t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
+    output[(long long)t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
 }
 """
 

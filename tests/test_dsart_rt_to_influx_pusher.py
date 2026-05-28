@@ -504,6 +504,59 @@ class TestMakeBufferPoints:
         assert p.tags == {"cn_id": "6", "host": "lxd110h06", "buffer": "dada"}
         assert p.fields == {"nbufs": 70, "nfull": 12, "nclear": 58}
 
+    def test_phase7_canonical_fields_with_free_blocks_emits_point(self):
+        """M7.4 Phase 7: when _dada_dbmetric() succeeds it emits the full
+        canonical set (nbufs / nfull / nclear / n_written / n_read /
+        free_blocks / free / full). The pusher MUST forward all numeric
+        fields onto the corr_rt_buffer measurement.
+        """
+        payload = json.loads(json.dumps(CORR_ROLLUP_N06))
+        payload["buffers"]["fada"]["metric"] = {
+            "nbufs": 70, "nfull": 3, "nclear": 67,
+            "n_written": 12516, "n_read": 12513,
+            "free_blocks": 67, "free": 67, "full": 3,
+        }
+        pts = pusher.make_buffer_points(payload, cn_id=6)
+        assert len(pts) == 1
+        p = pts[0]
+        assert p.measurement == "corr_rt_buffer"
+        assert p.tags == {"cn_id": "6", "host": "lxd110h06", "buffer": "fada"}
+        # All eight numeric fields land on the point.
+        for k in (
+            "nbufs", "nfull", "nclear", "n_written", "n_read",
+            "free_blocks", "free", "full",
+        ):
+            assert k in p.fields, f"missing {k}"
+        assert p.fields["free_blocks"] == 67
+
+    def test_phase7_error_only_metric_emits_nothing(self):
+        """M7.4 Phase 7: when ``_dada_dbmetric`` fails it returns
+        ``{"_error": "<reason>"}``. The pusher MUST skip that buffer
+        (no numeric fields ⇒ no Grafana time-series point), even though
+        the dict is non-empty.
+        """
+        payload = json.loads(json.dumps(CORR_ROLLUP_N06))
+        payload["buffers"]["bada"]["metric"] = {
+            "_error": "FileNotFoundError(dada_dbmetric): ...",
+        }
+        pts = pusher.make_buffer_points(payload, cn_id=6)
+        assert pts == []
+
+    def test_phase7_mixed_buffers_only_numeric_emit_points(self):
+        """Mixed payload: one buffer has good metric, one has error-only.
+        Exactly one point is emitted (the good one)."""
+        payload = json.loads(json.dumps(CORR_ROLLUP_N06))
+        payload["buffers"]["fada"]["metric"] = {
+            "nbufs": 70, "nfull": 4, "free_blocks": 66,
+        }
+        payload["buffers"]["bada"]["metric"] = {
+            "_error": "shmget: No such file or directory",
+        }
+        pts = pusher.make_buffer_points(payload, cn_id=6)
+        assert len(pts) == 1
+        assert pts[0].tags["buffer"] == "fada"
+        assert pts[0].fields["free_blocks"] == 66
+
 
 # ===========================================================================
 # 6. make_capture_points

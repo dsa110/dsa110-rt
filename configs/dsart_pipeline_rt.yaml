@@ -33,6 +33,12 @@ captures:
   # M7.4 noise test used mode `synth_fada` (bench/replay_voltage_dump
   # --synthesize → fada). Flip back to `synth_fada` for repeatable
   # pure-Gaussian validation without on-sky data.
+  # `replay_burst` is the M7.4 burst-correctness mode: bench/
+  # replay_voltage_dump --run-id 250924mptq → fada. Loops the 15-block
+  # burst capture indefinitely so a soak picks the burst up multiple
+  # times. Default stays at `real` (production SNAP); operators flip
+  # to `replay_burst` via local edit + ``push_dsart_to_etcd.py`` when
+  # they need to repeat the M7.4 burst correctness check.
   mode: real
 
 buffers:
@@ -120,6 +126,32 @@ routines:
     # Back-pressure is naturally bounded by fada n=70 buffers ≈ 9.4 s
     # and PSRDADA flow control.
 
+  # ---- replay_burst (M7.4 burst correctness mode) --------------------
+  # Reads the 250924mptq voltage dump (15 native blocks ~ 2 s) and
+  # writes them straight into fada via bench/replay_voltage_dump.py in
+  # manifest mode. Per-node chgroup is set via the CHGROUP substitution
+  # token (n03→0, n04→1, …, n22→15). DSART_VOLTAGE_FIXTURE_ROOT points
+  # at the on-node 250924mptq fixture tree (manifest.yaml +
+  # fl_burst_chgroup<g>.out symlink pointing at the actual
+  # 250924mptq_sb<g>_data.out file).
+  #
+  # 2026-05-27 (M7.4): --repeat-fixture 1 (single pass, the
+  # replay_voltage_dump default). The earlier looped mode (--repeat-
+  # fixture 0) was useful for soaks but created a "burst at the same
+  # signal-time over and over" pathology that, combined with the now-
+  # fixed graph leak + mjd_at_specnum_0=0 anchor bug, produced an
+  # immortal C2 cluster firing thousands of stale-specnum dumps. A
+  # single pass exercises C1 emit → C2 cluster → broadcast → cube
+  # dump → plot generation end-to-end; the corr fleet re-arms via
+  # dsart_rt's reap loop if more passes are needed.
+  - name: cap_replay_burst
+    when: captures.mode == replay_burst
+    cmd: /home/ubuntu/miniforge3/envs/dsa110-rt/bin/python
+    args: -u -m bench.replay_voltage_dump --run-id 250924mptq --fada-key fada --rate native --chgroups CHGROUP --repeat-fixture 1
+    env:
+      PYTHONPATH: /home/ubuntu/proj/dsa110-rt
+      DSART_VOLTAGE_FIXTURE_ROOT: /home/ubuntu/data/voltages
+
   # Vendored dsart capture binary (built by setup.py build_ext, lives
   # inside the dsa110-rt package tree). Improvements vs upstream
   # legacy dsaX_capture_manythread: recvmmsg(64) batch receive,
@@ -204,8 +236,18 @@ routines:
   # the merge isn't competing with corr_fast (NUMA 1 GPU 1 = CUDA :1)
   # for cache, but is on the same NUMA node as fada (per
   # configs/config_corr.yaml: fada.numa_cluster = 1).
-  - name: merge
-    when: captures.mode != synth_fada
+  # `merge` runs only in `real` and `junkdb` modes -- the modes that
+  # actually fill dada/eada via the capture binaries. In synth_fada
+  # and replay_burst the writers target fada directly so merge would
+  # produce a fada double-writer race; we omit it. The when-predicate
+  # parser only supports ==/!=, so two clones (one per mode) is the
+  # simplest way to express the OR.
+  - name: merge_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
+    args: -i dada -j eada -o fada -m -c 12
+  - name: merge_junkdb
+    when: captures.mode == junkdb
     cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
     args: -i dada -j eada -o fada -m -c 12
 
@@ -322,6 +364,7 @@ routines:
       --rfi-mon-window-size 16
       --rfi-mon-freq-downsample 4
       --rfi-mon-shm-slots 64
+      --inject-watch
     env:
       CUDA_VISIBLE_DEVICES: "1"
 

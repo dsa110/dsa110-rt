@@ -483,12 +483,19 @@ def make_buffer_points(
 ) -> List[Point]:
     """One ``corr_rt_buffer`` Point per non-empty ``buffers.<k>.metric``.
 
-    On the live fleet (May 2026) ``metric`` is always ``{}`` because
-    ``dada_dbmetric`` isn't on the orchestrator PATH (corr doc §2.3).
-    Per the doc rule ("do not emit InfluxDB points for empty metrics"),
-    we silently skip those.  Search-side rollups always have
-    ``buffers: {}`` so this returns an empty list there too — exactly
-    matching the search doc §5.1 instruction.
+    M7.4 Phase 7: when ``_dada_dbmetric()`` successfully parses
+    PSRDADA's CLI output the ``metric`` dict carries canonical
+    integers (``nbufs``, ``nfull``, ``nclear``, ``n_written``,
+    ``n_read``, ``free_blocks``, ``free``, ``full``); we emit each as
+    an InfluxDB field on a ``corr_rt_buffer`` measurement tagged by
+    (``cn_id``, ``host``, ``buffer``). If the parser failed and the
+    dict only carries the diagnostic ``_error`` string, we skip the
+    point (no numeric series ⇒ no Grafana value) but still record the
+    failure shape into the ``_error`` string field so an operator who
+    queries the measurement directly can see *why* the buffer is dark.
+
+    Search-side rollups always have ``buffers: {}`` so this returns
+    an empty list there too — exactly matching the search doc §5.1.
     """
     buffers = payload.get("buffers") or {}
     if not isinstance(buffers, dict) or not buffers:
@@ -522,6 +529,16 @@ def make_buffer_points(
             # Skip anything else (lists, nested dicts, etc.) — none of
             # the documented ``dada_dbmetric`` keys produce them.
         if not fields:
+            continue
+        # If the ONLY field is the parser-diagnostic ``_error`` string,
+        # skip the point so we don't pollute the time-series with a
+        # non-numeric singleton. Operators querying the measurement at
+        # the raw level still see the error string when there is a
+        # successful parse mixed with a transient race.
+        numeric_fields = {
+            k: v for k, v in fields.items() if isinstance(v, (int, float))
+        }
+        if not numeric_fields:
             continue
         out.append(Point(
             measurement="corr_rt_buffer",

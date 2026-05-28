@@ -606,19 +606,34 @@ def _load_manifest(run_id: str, root: Path) -> tuple[dict[str, object], Path]:
     return manifest, fixture_dir
 
 
-def _iter_fixture_blocks(vol_path: Path) -> Iterator[np.ndarray]:
-    """Yield FADA_BYTES_PER_BLOCK-sized uint8 arrays from the fixture file."""
-    with vol_path.open("rb") as f:
-        while True:
-            chunk = f.read(FADA_BYTES_PER_BLOCK)
-            if not chunk:
-                break
-            if len(chunk) != FADA_BYTES_PER_BLOCK:
-                raise RuntimeError(
-                    f"truncated block at end of {vol_path.name}: "
-                    f"got {len(chunk)} bytes, expected {FADA_BYTES_PER_BLOCK}"
-                )
-            yield np.frombuffer(chunk, dtype=np.uint8)
+def _iter_fixture_blocks(vol_path: Path, *, repeats: int = 1) -> Iterator[np.ndarray]:
+    """Yield FADA_BYTES_PER_BLOCK-sized uint8 arrays from the fixture file.
+
+    ``repeats`` controls how many times the file is replayed within a
+    single PSRDADA observation (header set once, markEndOfData called
+    once at the very end by ``write_blocks_to_fada``). repeats=0 means
+    "infinite" (caller bounds via n_blocks). The same file handle is
+    reopened on each pass so the in-tree seek position is reset cleanly.
+    """
+    if repeats < 0:
+        raise ValueError(f"repeats must be >= 0, got {repeats}")
+    pass_idx = 0
+    while True:
+        with vol_path.open("rb") as f:
+            while True:
+                chunk = f.read(FADA_BYTES_PER_BLOCK)
+                if not chunk:
+                    break
+                if len(chunk) != FADA_BYTES_PER_BLOCK:
+                    raise RuntimeError(
+                        f"truncated block at end of {vol_path.name}: "
+                        f"got {len(chunk)} bytes, expected "
+                        f"{FADA_BYTES_PER_BLOCK}"
+                    )
+                yield np.frombuffer(chunk, dtype=np.uint8)
+        pass_idx += 1
+        if repeats != 0 and pass_idx >= repeats:
+            return
 
 
 def _run_manifest(ns: argparse.Namespace, chgroups: list[int],
@@ -638,14 +653,26 @@ def _run_manifest(ns: argparse.Namespace, chgroups: list[int],
         return 0
 
     n_blocks_manifest = int(manifest.get("n_blocks", 15))
+    repeats = max(0, int(getattr(ns, "repeat_fixture", 1)))
     n_blocks = ns.n_blocks if ns.n_blocks > 0 else n_blocks_manifest
-    if n_blocks > n_blocks_manifest:
-        print(
-            f"WARNING: --n-blocks {n_blocks} > manifest n_blocks "
-            f"{n_blocks_manifest}; capping",
-            file=sys.stderr,
-        )
-        n_blocks = n_blocks_manifest
+    # When repeats != 1 the fixture file is replayed multiple times in
+    # a single PSRDADA observation (no markEndOfData between passes).
+    # The total block budget grows linearly so callers can run a long
+    # soak without re-arming corr_fast across observation boundaries.
+    if repeats == 0:
+        # "infinite repeats": let n_blocks dominate.
+        if n_blocks <= n_blocks_manifest:
+            n_blocks = n_blocks_manifest * 1024  # 15 * 1024 = ~34 minutes default soak
+    else:
+        cap = n_blocks_manifest * repeats
+        if n_blocks > cap:
+            print(
+                f"WARNING: --n-blocks {n_blocks} > manifest n_blocks "
+                f"{n_blocks_manifest} * --repeat-fixture {repeats} "
+                f"= {cap}; capping",
+                file=sys.stderr,
+            )
+            n_blocks = cap
 
     fixture_kind = str(manifest.get("fixture_kind", "?"))
     dec_deg = float(manifest.get("dec_deg", 0.0))
@@ -669,7 +696,7 @@ def _run_manifest(ns: argparse.Namespace, chgroups: list[int],
           f"file={vol_path.name} ({vol_path.stat().st_size} B) "
           f"n_blocks={n_blocks} pace_ms={pace_ms}")
     summary = write_blocks_to_fada(
-        _iter_fixture_blocks(vol_path),
+        _iter_fixture_blocks(vol_path, repeats=repeats),
         fada_key=fada_key, header=header, n_blocks=n_blocks, pace_ms=pace_ms,
     )
     print(f"manifest replay summary: {summary}")
@@ -745,6 +772,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rate", default="native", help="native | fast | N×")
     ap.add_argument("--inject-noise", action="store_true",
                     help="(reserved) annotate dry-run report only")
+    ap.add_argument(
+        "--repeat-fixture", type=int, default=1,
+        help="manifest mode: replay the fixture file N times in a "
+             "single PSRDADA observation (no markEndOfData between "
+             "passes). 0 = infinite (n_blocks dominates, default "
+             "n_blocks_manifest * 1024). Used by the M7.4 burst-replay "
+             "captures.mode so the search side gets many chances to "
+             "lock onto the burst inside one observation.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--fada-key", default="fada", help="4-char fada IPC key")
     ap.add_argument("--n-blocks", type=int, default=15,

@@ -1,0 +1,314 @@
+{% extends "base.html" %}
+{% block head_extra %}
+<style>
+    .control-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .panel { background: #1e2729; border: 1px solid #34495e; border-radius: 6px; padding: 16px; }
+    .panel h3 { margin-top: 0; }
+    .verb-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+    .verb-row label { min-width: 130px; color: #bdc3c7; }
+    .verb-row input[type="text"], .verb-row input[type="number"] {
+        background: #0f1416; color: #ecf0f1; border: 1px solid #34495e;
+        padding: 4px 8px; width: 140px; font-family: monospace;
+    }
+    .verb-row button {
+        background: #2980b9; color: white; border: 0; padding: 6px 14px;
+        cursor: pointer; font-weight: 600;
+    }
+    .verb-row button.danger { background: #c0392b; }
+    .verb-row button:disabled { background: #7f8c8d; cursor: not-allowed; }
+    .info-blob { background: #0f1416; border: 1px solid #34495e;
+                 padding: 10px; font-family: monospace; font-size: 12px;
+                 white-space: pre-wrap; overflow-x: auto; }
+    .stat { color: #f1c40f; font-family: monospace; }
+    .ok    { color: #2ecc71; }
+    .err   { color: #e74c3c; }
+    .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .audit-table th, .audit-table td {
+        padding: 4px 6px; border-bottom: 1px solid #34495e; text-align: left;
+    }
+    .audit-table th { background: #1e2729; }
+    .audit-table .ts { white-space: nowrap; font-family: monospace; }
+    .response { margin-top: 8px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h2>Fleet Control</h2>
+<p class="muted">
+    M7.4 Phase 8 v1: <strong>4 verbs</strong> (start / stop / utc_start /
+    utc_stop) wired against the dsart-rt orchestrator's etcd command
+    surface. Every action is audited at <code>/mon/audit/control/</code>.
+    Network ACL on h23 is the only authentication today —
+    <a href="/static/about" style="color:#3498db;">see docs/M7.4_PHASE8_CONTROL.md</a>.
+    Partial-restart + auto-arm are v2 (require new orchestrator verb).
+</p>
+
+<div class="control-wrap">
+
+    <!-- LEFT COLUMN: state summary -->
+    <div class="panel">
+        <h3>Fleet readiness</h3>
+        <p class="muted">
+            corr cn_ids ({{ corr_cn_ids|length }}): {{ corr_cn_ids|join(', ') }}<br>
+            search cn_ids ({{ search_cn_ids|length }}): {{ search_cn_ids|join(', ') }}<br>
+            broadcast key: <code>/cmd/corr_rt/0</code> (corr only;
+            search uses per-cn fanout)
+        </p>
+        <h4>Next ARM_SEQ candidate</h4>
+        {% if arm_info.arm_seq is not none %}
+            <p>
+                <span class="stat">ARM_SEQ = {{ arm_info.arm_seq }}</span>
+                = max_last_seq_no ({{ arm_info.max_last_seq_no }}) +
+                margin ({{ arm_info.margin }})<br>
+                <span class="muted">source: <code>{{ arm_info.max_source }}</code></span><br>
+                {{ arm_info.answered|length }} capture(s) reporting,
+                {{ arm_info.missing|length }} missing
+            </p>
+        {% else %}
+            <p class="err">
+                No captures reporting last_seq_no — the orchestrator(s)
+                are either stopped or pre-arm. Start the fleet first,
+                then refresh.
+            </p>
+        {% endif %}
+    </div>
+
+    <!-- RIGHT COLUMN: verb buttons -->
+    <div class="panel">
+        <h3>Verbs</h3>
+
+        <!-- start -->
+        <form id="form-start" onsubmit="return submitVerb(event, '/control/start', 'resp-start');">
+            <div class="verb-row">
+                <label for="obs_dec_deg">obs_dec_deg</label>
+                <input type="text" id="obs_dec_deg" name="obs_dec_deg"
+                       placeholder="(auto from etcd)" />
+                <button type="submit">Start fleet</button>
+            </div>
+            <div class="muted">
+                Broadcasts <code>start</code> to <code>/cmd/corr_rt/0</code>
+                + per-cn fanout to <code>/cmd/search_rt/{1,2,9,13}</code>.
+                Leave dec blank to use <code>/mon/array/dec</code> (M7.4
+                CUSTOMDEC fallback).
+            </div>
+            <div id="resp-start" class="response"></div>
+        </form>
+
+        <hr style="border-color:#34495e;margin:16px 0;">
+
+        <!-- utc_start -->
+        <form id="form-arm" onsubmit="return submitVerb(event, '/control/utc_start', 'resp-arm');">
+            <div class="verb-row">
+                <label for="margin">margin (specnums)</label>
+                <input type="number" id="margin" name="margin"
+                       value="{{ default_arm_margin }}" min="0" step="1000" />
+                <button type="submit">Arm now (utc_start)</button>
+            </div>
+            <div class="muted">
+                Reads 32 capture mon-keys, computes
+                <code>max(last_seq_no) + margin</code>, broadcasts to
+                <code>/cmd/corr_rt/0</code>. Default margin
+                {{ default_arm_margin }} ≈
+                {{ '%.2f'|format(default_arm_margin * 32.768e-6) }} s
+                headroom. Phase B fleet typically uses 60000.
+            </div>
+            <div id="resp-arm" class="response"></div>
+        </form>
+
+        <hr style="border-color:#34495e;margin:16px 0;">
+
+        <!-- utc_stop -->
+        <form id="form-disarm" onsubmit="return submitVerb(event, '/control/utc_stop', 'resp-disarm');">
+            <div class="verb-row">
+                <label></label>
+                <button type="submit">Disarm (utc_stop)</button>
+            </div>
+            <div class="muted">
+                Broadcasts <code>utc_stop</code> at the current ARM_SEQ
+                (margin=0). Captures stop emitting voltages at the
+                requested specnum.
+            </div>
+            <div id="resp-disarm" class="response"></div>
+        </form>
+
+        <hr style="border-color:#34495e;margin:16px 0;">
+
+        <!-- stop -->
+        <form id="form-stop" onsubmit="return submitVerb(event, '/control/stop', 'resp-stop');">
+            <div class="verb-row">
+                <label for="confirm">type "stop"</label>
+                <input type="text" id="confirm" name="confirm" />
+                <button type="submit" class="danger">Stop fleet</button>
+            </div>
+            <div class="muted">
+                Tears down corr + search orchestrators. Belt-and-braces:
+                broadcast on <code>/cmd/corr_rt/0</code> AND per-cn
+                fanout. Type the literal word <code>stop</code> in the
+                confirm box first.
+            </div>
+            <div id="resp-stop" class="response"></div>
+        </form>
+    </div>
+</div>
+
+<!-- M7.4 Phase 6: signal injection panel -->
+<div class="panel" style="margin-top: 24px;">
+    <h3>Signal injection (M7.4 Phase 6)</h3>
+    <p class="muted">
+        Pushes <code>{cmd:&nbsp;"inject", val:&nbsp;&lt;config&gt;}</code>
+        to <code>/cmd/dsart/corr/&lt;chgroup&gt;/inject</code> for each
+        selected chgroup. Each corr-fast service (launched with
+        <code>--inject-watch</code>) picks up the PUT via its
+        <code>DsaStore.add_watch</code>, validates the config, and
+        calls <code>OnlineInjector.add_pending</code>. The injection
+        is added in-place to the voltage tensor between
+        <code>unpack_int4_split</code> and the RFI flagger, so the
+        full corr → RFI → cal → gridder → coarse-DM → static-sky →
+        transport → search → C2 chain sees it.
+    </p>
+    <form id="form-inject" onsubmit="return submitVerb(event, '/control/inject', 'resp-inject');">
+        <div class="control-wrap" style="gap: 16px;">
+            <div>
+                <div class="verb-row">
+                    <label for="inj_id">inj_id</label>
+                    <input type="text" id="inj_id" name="inj_id"
+                           placeholder="e.g. phase6c_extragal_t1" required />
+                </div>
+                <div class="verb-row">
+                    <label for="dm_pc_cm3">DM (pc/cc)</label>
+                    <input type="number" id="dm_pc_cm3" name="dm_pc_cm3"
+                           value="500" step="0.1" required />
+                </div>
+                <div class="verb-row">
+                    <label for="fluence_jy_ms">fluence (Jy·ms)</label>
+                    <input type="number" id="fluence_jy_ms" name="fluence_jy_ms"
+                           value="50" step="0.1" required />
+                </div>
+                <div class="verb-row">
+                    <label for="width_samples">width (samples)</label>
+                    <input type="number" id="width_samples" name="width_samples"
+                           value="32" step="1" min="1" required />
+                </div>
+                <div class="verb-row">
+                    <label for="profile">profile</label>
+                    <select id="profile" name="profile">
+                        <option value="gaussian" selected>gaussian</option>
+                        <option value="boxcar">boxcar</option>
+                    </select>
+                </div>
+            </div>
+
+            <div>
+                <div class="verb-row">
+                    <label for="l_rad">l_rad</label>
+                    <input type="number" id="l_rad" name="l_rad"
+                           value="0.0" step="0.001" required />
+                </div>
+                <div class="verb-row">
+                    <label for="m_rad">m_rad</label>
+                    <input type="number" id="m_rad" name="m_rad"
+                           value="0.0" step="0.001" required />
+                </div>
+                <div class="verb-row">
+                    <label for="apply_at_specnum">apply_at_specnum</label>
+                    <input type="text" id="apply_at_specnum" name="apply_at_specnum"
+                           placeholder="(blank → auto-arm now+margin)" />
+                </div>
+                <div class="verb-row">
+                    <label for="inject_margin">margin (auto)</label>
+                    <input type="number" id="inject_margin" name="margin"
+                           value="{{ default_arm_margin }}" min="0" step="1000" />
+                </div>
+                <div class="verb-row">
+                    <label for="chgroups">chgroups</label>
+                    <input type="text" id="chgroups" name="chgroups"
+                           placeholder="(blank → all 16) e.g. 0,1,2" />
+                </div>
+                <div class="verb-row">
+                    <button type="submit">Send injection</button>
+                </div>
+            </div>
+        </div>
+        <div class="muted">
+            Leave <code>apply_at_specnum</code> blank for "as soon as
+            possible" (computes current ARM_SEQ + margin from the 32
+            capture mon-keys, same as the Arm-now button). Defaults
+            shown produce a 50 Jy·ms / DM=500 / width=32-sample
+            extragalactic test pulse at boresight — good first smoke
+            test once <code>--inject-watch</code> is active on the
+            fleet.
+        </div>
+        <div id="resp-inject" class="response"></div>
+    </form>
+</div>
+
+<!-- BOTTOM: audit log -->
+<div class="panel" style="margin-top: 24px;">
+    <h3>Recent actions ({{ recent_audit|length }})</h3>
+    {% if recent_audit %}
+    <table class="audit-table">
+        <thead>
+            <tr>
+                <th>ts</th><th>user</th><th>host</th>
+                <th>namespace</th><th>cn</th>
+                <th>cmd</th><th>val</th><th>ok</th><th>note</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in recent_audit %}
+            <tr>
+                <td class="ts">{{ r.iso_ts }}</td>
+                <td>{{ r.user }}</td>
+                <td>{{ r.host }}</td>
+                <td>{{ r.namespace }}</td>
+                <td>{{ r.cn_target }}</td>
+                <td><code>{{ r.cmd }}</code></td>
+                <td>{{ r.val }}</td>
+                <td class="{{ 'ok' if r.ok else 'err' }}">{{ 'YES' if r.ok else 'NO' }}</td>
+                <td>{{ r.note }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="muted">No audit rows yet (or audit read failed —
+        see server log).</p>
+    {% endif %}
+</div>
+
+<script>
+async function submitVerb(ev, url, respId) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById(respId);
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>sending…</span>";
+
+    const fd = new FormData(form);
+    let r;
+    try {
+        r = await fetch(url, { method: "POST", body: fd });
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    let j;
+    try { j = await r.json(); } catch (e) {
+        respEl.innerHTML = "<span class='err'>non-JSON response from server</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    respEl.innerHTML =
+        "<span class='" + cls + "'>" + (j.ok ? "OK" : "FAIL") +
+        "</span><div class='info-blob'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    btn.disabled = false;
+    // Refresh the audit table so the operator sees their action.
+    setTimeout(() => location.reload(), 1500);
+    return false;
+}
+</script>
+{% endblock %}

@@ -225,6 +225,21 @@ routines:
       # M7.4: tag cube-dump filenames so the two compute halves don't
       # race-overwrite each other's ``cube_{cid:06d}.pt``.
       DSART_M74_DUMP_TAG: "h0"
+      # M7.3 baseline RE-BENCH (2026-05-27): set DSART_DISABLE_SCATTER=
+      # "1" to force the M7.2 zero-stub validity path so we can confirm
+      # the non-scatter pipeline still hits 7.45 cubes/s with all the
+      # M7.4 C1/C2/Option-A bolt-ons. Leave at "0" for production.
+      DSART_DISABLE_SCATTER: "0"
+      # M7.4.1 GPU-scatter (2026-05-27): when set to "1", the CPU-side
+      # scatter writes the COMPACT ~30 MiB COO buffer instead of the
+      # ~565 MiB dense plane; the CubePipeline expands it GPU-side via
+      # gpu_scatter. Eliminates 565 MiB CPU memset + 565 MiB H2D per
+      # cube (the dominant bottleneck identified by the M7.4 diagnosis
+      # 2026-05-27: H2D=75 ms, ~50% of the 134 ms RT budget). Byte-
+      # identical dense plane vs the dense path (parity tested in
+      # tests/transport/test_recv_ring_assemble_compact.py). Flip to
+      # "0" to A/B the dense path on the same binary.
+      DSART_GPU_SCATTER: "1"
 
   - name: search_compute_1
     cmd: python
@@ -280,6 +295,14 @@ routines:
       DSART_ENABLE_GPU_BUF_REUSE: "1"
       # M7.4: tag cube-dump filenames per-half to prevent collisions.
       DSART_M74_DUMP_TAG: "h1"
+      # M7.3 baseline RE-BENCH (2026-05-27): see search_compute_0
+      # rationale. Set to "0" to restore the M7.4 active-scatter
+      # production path.
+      DSART_DISABLE_SCATTER: "0"
+      # M7.4.1 GPU-scatter (2026-05-27): see search_compute_0 for
+      # rationale + parity / perf evidence. Flip to "0" to A/B the
+      # M7.4 dense-CPU-scatter path on the same binary.
+      DSART_GPU_SCATTER: "1"
 
 # ---------------------------------------------------------------------------
 # M7.4 C1 stage config (locked schema; see docs/c1c2/C1C2_WIRE_SCHEMA.md §3
@@ -297,8 +320,8 @@ routines:
 #             is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 8.0                       # Production: 8σ floor (Phase 1a noise test used 6.0 to characterise FA distribution).
-  cube_ring_depth: 8                 # CPU-side cube tensors retained per half
+  snr_min: 8.0                       # Production: 8σ floor (Phase 1a FA test: at 6sigma we measured ~6 cands/cube/half on pure Gaussian, matching Q(6)~9.9e-10 x 6.4e9 trials = 6.3 cands/cube. Coverage correction is required for this to hold; see cube_pipeline.py M7.4.2 notes).
+  cube_ring_depth: 8                 # Production: 8 slots ~ 1.1s retention at 7.45 cubes/s -- enough for the C2 trigger window (Galactic-DM clustering + slow-fast pipeline jitter). Each slot is t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16; 8 slots = 26 GiB per gpu_half (n01: 50 GiB pinned across 2 halves, within the 256 GiB host budget). DtoH burden per cube is amortised by overlapping with the next cube's L1/detector work; M7.4.1 GPU-scatter freed up ~50 ms of H2D budget which more than compensates for the ~25 ms/cube DtoH cost.
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index

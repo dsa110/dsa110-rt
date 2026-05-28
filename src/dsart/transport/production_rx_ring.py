@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import warnings
 from typing import AsyncIterator, Mapping, Optional
@@ -221,6 +222,12 @@ class ProductionRxRingSource:
         self._n_overrun: int = 0
         self._n_pattern_mismatch: int = 0
         self._n_no_data_present: int = 0
+        # Per-cube scatter timing accumulator (M7.4 real-SNAP RT debug,
+        # 2026-05-27). ``get_scatter_timing_and_reset`` is called from
+        # the progress logger.
+        self._scatter_ns_accum: int = 0
+        self._scatter_ns_count: int = 0
+        self._scatter_ns_max: int = 0
 
         # Pre-allocated zero-filled per_chgroup_streams cache.
         # ----------------------------------------------------
@@ -345,6 +352,18 @@ class ProductionRxRingSource:
         self._scatter_offim_buf: np.ndarray | None = None
         self._scatter_validity_buf: np.ndarray | None = None
 
+        # M7.4.1 GPU-scatter mode (2026-05-27): when set, the C scatter
+        # writes a compact ~30 MiB COO buffer instead of the dense
+        # ~565 MiB plane; the CubePipeline runs `gpu_scatter` to expand
+        # it on-GPU before the imager. Eliminates ~80 ms / cube from
+        # the H2D + CPU scatter cost. Gated by env var initially so we
+        # can A/B benchmark vs the M7.4 dense path on the same node.
+        self._gpu_scatter_enabled: bool = (
+            self._scatter_enabled
+            and os.environ.get("DSART_GPU_SCATTER", "0") == "1"
+        )
+        self._compact_cells_buf: np.ndarray | None = None
+
         if self._scatter_enabled:
             if not 0 <= self._owned_coarse_dm < self._ring_dims.n_coarse_dm:
                 raise ValueError(
@@ -372,30 +391,73 @@ class ProductionRxRingSource:
             # out of bounds. The scatter ONLY fills [0, t_det) rows; rows
             # [t_det, T_stream) stay zero (their wire slots may not yet
             # be committed when the cube is emitted — see comment above).
-            self._scatter_cint8_buf = np.zeros(
-                (n_corr, self._t_stream, 2,
-                 self._n_grid_cached, self._n_grid_cached),
-                dtype=np.int8,
-            )
-            self._scatter_scale_buf = np.zeros(
-                (n_corr, self._t_stream), dtype=np.float32,
-            )
-            self._scatter_offre_buf = np.zeros(
-                (n_corr, self._t_stream), dtype=np.float32,
-            )
-            self._scatter_offim_buf = np.zeros(
-                (n_corr, self._t_stream), dtype=np.float32,
-            )
-            self._scatter_validity_buf = np.zeros(
-                (self._t_det,), dtype=np.uint8,
-            )
-            LOG.info(
-                "M7.4 scatter enabled: owned_coarse_dm=%d, "
-                "n_filled_per_corr=%s, lut_stride=%d",
-                self._owned_coarse_dm,
-                self._n_filled_per_corr.tolist(),
-                int(self._linear_lut.shape[1]),
-            )
+            #
+            # M7.4.1 GPU-scatter: when DSART_GPU_SCATTER=1 we skip the
+            # huge dense cint8 buffer (~565 MiB) and allocate the small
+            # compact COO buffer (~30 MiB) instead. The dense plane is
+            # built GPU-side by ``gpu_scatter`` after a tiny H2D.
+            n_filled_max = int(self._ring_dims.n_filled_per_corr)
+            if self._gpu_scatter_enabled:
+                self._compact_cells_buf = np.zeros(
+                    (n_corr, self._t_det, n_filled_max * 2),
+                    dtype=np.int8,
+                )
+                # Sidecars stay T_STREAM-sized so the GPU dequant kernel's
+                # per-(g, t_src) lookup (stride = T_stream) lands in-bounds
+                # even for lookahead samples beyond t_det. Tail rows are
+                # zero, which the kernel interprets as "skip this slot".
+                self._scatter_scale_buf = np.zeros(
+                    (n_corr, self._t_stream), dtype=np.float32,
+                )
+                self._scatter_offre_buf = np.zeros(
+                    (n_corr, self._t_stream), dtype=np.float32,
+                )
+                self._scatter_offim_buf = np.zeros(
+                    (n_corr, self._t_stream), dtype=np.float32,
+                )
+                self._scatter_validity_buf = np.zeros(
+                    (self._t_det,), dtype=np.uint8,
+                )
+                LOG.info(
+                    "M7.4.1 GPU-scatter ENABLED: owned_coarse_dm=%d, "
+                    "n_filled_per_corr=%s, lut_stride=%d; "
+                    "compact buf %.1f MiB, sidecars %.2f MiB (vs dense "
+                    "buf %.1f MiB)",
+                    self._owned_coarse_dm,
+                    self._n_filled_per_corr.tolist(),
+                    int(self._linear_lut.shape[1]),
+                    self._compact_cells_buf.nbytes / (1 << 20),
+                    3 * self._scatter_scale_buf.nbytes / (1 << 20),
+                    (
+                        n_corr * self._t_stream * 2
+                        * self._n_grid_cached ** 2
+                    ) / (1 << 20),
+                )
+            else:
+                self._scatter_cint8_buf = np.zeros(
+                    (n_corr, self._t_stream, 2,
+                     self._n_grid_cached, self._n_grid_cached),
+                    dtype=np.int8,
+                )
+                self._scatter_scale_buf = np.zeros(
+                    (n_corr, self._t_stream), dtype=np.float32,
+                )
+                self._scatter_offre_buf = np.zeros(
+                    (n_corr, self._t_stream), dtype=np.float32,
+                )
+                self._scatter_offim_buf = np.zeros(
+                    (n_corr, self._t_stream), dtype=np.float32,
+                )
+                self._scatter_validity_buf = np.zeros(
+                    (self._t_det,), dtype=np.uint8,
+                )
+                LOG.info(
+                    "M7.4 dense scatter enabled: owned_coarse_dm=%d, "
+                    "n_filled_per_corr=%s, lut_stride=%d",
+                    self._owned_coarse_dm,
+                    self._n_filled_per_corr.tolist(),
+                    int(self._linear_lut.shape[1]),
+                )
 
     @property
     def time_shift_table(self) -> TimeShiftSearchTable:
@@ -418,6 +480,30 @@ class ProductionRxRingSource:
             "n_overrun": int(self._n_overrun),
             "n_pattern_mismatch": int(self._n_pattern_mismatch),
             "n_no_data_present": int(self._n_no_data_present),
+        }
+
+    def get_scatter_timing_and_reset(self) -> dict:
+        """Return + zero the scatter wall-time accumulator. Reported
+        in microseconds: ``mean_us``, ``max_us``, ``count``. Used by
+        ``search_compute._log_progress`` to surface the C scatter cost
+        alongside ``cubes/s`` for the M7.4 real-SNAP RT debug.
+
+        Safe to call from any thread (single accumulator, GIL-protected
+        reads/writes of int counters); the small race on ``count``/
+        ``accum`` is acceptable for a debug-level number.
+        """
+        n = int(self._scatter_ns_count)
+        accum = int(self._scatter_ns_accum)
+        mx = int(self._scatter_ns_max)
+        self._scatter_ns_count = 0
+        self._scatter_ns_accum = 0
+        self._scatter_ns_max = 0
+        if n == 0:
+            return {"mean_us": 0.0, "max_us": 0.0, "count": 0}
+        return {
+            "mean_us": (accum / n) / 1000.0,
+            "max_us": mx / 1000.0,
+            "count": n,
         }
 
     @property
@@ -791,34 +877,90 @@ class ProductionRxRingSource:
         if self._scatter_enabled:
             assert self._linear_lut is not None
             assert self._n_filled_per_corr is not None
-            assert self._scatter_cint8_buf is not None
             assert self._scatter_scale_buf is not None
             assert self._scatter_offre_buf is not None
             assert self._scatter_offim_buf is not None
             assert self._scatter_validity_buf is not None
             assert self._owned_coarse_dm is not None
 
-            # M7.4: the scatter helper takes ``out_t_stride=T_stream``
-            # so it knows the corr-axis stride of the dense buffer is
-            # ``T_stream * 2 * N_grid^2`` even though only rows
-            # ``[0, t_det)`` are actually written. Rows [t_det, T_stream)
-            # are left untouched — the GPU dequant kernel sees them as
-            # zero (cold start; previous cubes also only fill [0, t_det)
-            # AND we ``fill(0)`` the buffer at the top of every cube
-            # except the cold start to clear any carry-over from the
-            # previous cube's [0, t_det) writes).
-            if cube_id > 0:
-                # The C helper re-zeros rows [0, t_det) on every call,
-                # but the LOOKAHEAD tail [t_det, T_stream) from the
-                # previous cube may still hold stale data. Clear it.
-                # (At T_stream≈t_det+max_shift the tail is small, so
-                # this is sub-millisecond.)
-                if self._t_stream > self._t_det:
-                    self._scatter_cint8_buf[:, self._t_det:].fill(0)
-                    self._scatter_scale_buf[:, self._t_det:].fill(0)
-                    self._scatter_offre_buf[:, self._t_det:].fill(0)
-                    self._scatter_offim_buf[:, self._t_det:].fill(0)
+            if self._gpu_scatter_enabled:
+                # M7.4.1 GPU-scatter (2026-05-27): ship the compact COO
+                # wire payload (~30 MiB) to the GPU and expand it
+                # on-device via gpu_scatter. Eliminates the dense
+                # 565 MiB CPU memset + 565 MiB H2D from the cube hot
+                # path.
+                assert self._compact_cells_buf is not None
+                _t0_scatter_ns = time.perf_counter_ns()
+                (
+                    _cells_out, _scale_out, _offre_out, _offim_out,
+                    valid_per_t, dn_over, dn_pat, dn_nodp,
+                ) = self._ring.assemble_compact_block(
+                    specnum_start=int(specnum_start),
+                    t_det=int(self._t_det),
+                    sidecar_t_stride=int(self._t_stream),
+                    owned_dm=int(self._owned_coarse_dm),
+                    n_filled_per_corr=self._n_filled_per_corr,
+                    n_filled_max=int(
+                        self._ring_dims.n_filled_per_corr
+                    ),
+                    compute_half=int(self._compute_half),
+                    n_active_dms_per_corr=int(
+                        self._n_active_dms_per_corr
+                    ),
+                    out_cells_packed=self._compact_cells_buf,
+                    out_scale=self._scatter_scale_buf,
+                    out_offset_re=self._scatter_offre_buf,
+                    out_offset_im=self._scatter_offim_buf,
+                    out_validity=self._scatter_validity_buf,
+                )
+                _dt_scatter_ns = time.perf_counter_ns() - _t0_scatter_ns
+                self._scatter_ns_accum += _dt_scatter_ns
+                self._scatter_ns_count += 1
+                if _dt_scatter_ns > self._scatter_ns_max:
+                    self._scatter_ns_max = _dt_scatter_ns
+                self._n_slots_read += n_corr * self._t_det
+                self._n_overrun += dn_over
+                self._n_pattern_mismatch += dn_pat
+                self._n_no_data_present += dn_nodp
 
+                validity_mask = np.broadcast_to(
+                    valid_per_t[:, None],
+                    (self._t_det, self._n_fdm_in_cube),
+                ).copy()
+
+                return CubeRingSlot(
+                    cube_id=cube_id,
+                    specnum_start=specnum_start,
+                    per_chgroup_streams=self._per_chgroup_streams_zero,
+                    time_shift_table=self._time_shift_table,
+                    validity_mask=validity_mask,
+                    n_fdm_in_cube=self._n_fdm_in_cube,
+                    t_det=self._t_det,
+                    n_grid=n_grid,
+                    # M7.4.1 GPU-scatter: ship compact + LUT + n_filled
+                    # to the CubePipeline; it expands GPU-side before
+                    # the imager kernel. No dense cint8 stack here.
+                    per_chgroup_cint8_stack=None,
+                    per_chgroup_scale=None,
+                    per_chgroup_offset_re=None,
+                    per_chgroup_offset_im=None,
+                    per_chgroup_scale_per_t=self._scatter_scale_buf,
+                    per_chgroup_offset_re_per_t=self._scatter_offre_buf,
+                    per_chgroup_offset_im_per_t=self._scatter_offim_buf,
+                    compact_cells_packed=self._compact_cells_buf,
+                    compact_n_filled_per_corr=self._n_filled_per_corr,
+                    compact_lut=self._linear_lut,
+                )
+
+            # M7.4 dense path (unchanged below).
+            # The scatter helper takes ``out_t_stride=T_stream`` so it
+            # knows the corr-axis stride of the dense buffer is
+            # ``T_stream * 2 * N_grid^2`` even though only rows
+            # ``[0, t_det)`` are actually written. Rows
+            # ``[t_det, T_stream)`` are NEVER touched — see the M7.4
+            # soak fix comment above the buffer allocation.
+            assert self._scatter_cint8_buf is not None
+            _t0_scatter_ns = time.perf_counter_ns()
             (
                 _cint8_out, _scale_out, _offre_out, _offim_out,
                 valid_per_t, dn_over, dn_pat, dn_nodp,
@@ -840,6 +982,17 @@ class ProductionRxRingSource:
                 out_offset_im=self._scatter_offim_buf,
                 out_validity=self._scatter_validity_buf,
             )
+            # M7.4 RT instrumentation (2026-05-27): track per-cube wall
+            # of the C scatter so the search_compute log line gets a
+            # ``scatter_ms`` field. Cost is one perf_counter_ns pair so
+            # negligible (~80 ns). The accumulator is read + reset by
+            # :meth:`get_scatter_timing_and_reset` and logged in the
+            # cube_progress block alongside cubes/s.
+            _dt_scatter_ns = time.perf_counter_ns() - _t0_scatter_ns
+            self._scatter_ns_accum += _dt_scatter_ns
+            self._scatter_ns_count += 1
+            if _dt_scatter_ns > self._scatter_ns_max:
+                self._scatter_ns_max = _dt_scatter_ns
             self._n_slots_read += n_corr * self._t_det
             self._n_overrun += dn_over
             self._n_pattern_mismatch += dn_pat

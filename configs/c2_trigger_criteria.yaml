@@ -32,14 +32,23 @@ trigger_classes:
       galactic DM, so even the most-pessimistic line-of-sight cannot
       account for it. Permissive SNR threshold (we lose nothing if a
       Galactic source straggles into this bin) so the floor is 8 σ.
+      
+      2026-05-27: dm_iqr_max relaxed from 30 → 250 (yaml-side) because
+      the connected-components clusterer in M7.4 absorbs candidates
+      across multiple DM trials that share the same (l, m, t) coords.
+      With the SNR-scaling at snr_max=39.69 (effective cap = t*38/10.3
+      ≈ t*3.7), 250 → ~920 pc/cc which comfortably accommodates the
+      250924mptq replay's natural dm_iqr (~170 pc/cc). Tune downward
+      once the clusterer is sharpened (graph DM-proximity threshold
+      or HDBSCAN-style re-clustering on the cluster's row set).
     require:
       snr_max_min: 8.0
       n_events_min: 3
       n_search_nodes_min: 2
       dm_median_min_pc_cc: 50.0
       dm_median_max_pc_cc: 4000.0
-      dm_iqr_max_pc_cc: 30.0
-      width_median_max_samples: 32
+      dm_iqr_max_pc_cc: 250.0
+      width_median_max_samples: 64
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
