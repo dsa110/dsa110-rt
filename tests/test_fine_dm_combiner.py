@@ -24,10 +24,14 @@ import pytest
 os.environ.setdefault("DSART_TEST", "1")
 
 from dsart.common.constants import (  # noqa: E402
+    K_DM_MS_GHZ2_PC,
+    NCHAN_PER_CHGROUP,
     NU_BOT_PROC_GHZ,
     NU_CHGROUP_BOT_GHZ,
+    NU_TOP_PROC_GHZ,
     N_CHGROUP,
     T_INT_SEARCH_US_DEFAULT,
+    freq_GHz,
 )
 from dsart.common.dispersion import delta_tau_us  # noqa: E402
 from dsart.fine_dm.combiner import (  # noqa: E402
@@ -64,6 +68,56 @@ def test_compute_time_shift_search_chgroup15_row_is_zero() -> None:
     assert table.shifts.dtype == np.int32
     assert table.shifts.shape == (len(fine), N_CHGROUP)
     assert np.all(table.shifts[:, N_CHGROUP - 1] == 0)
+
+
+def test_include_coarse_offset_uses_chgroup_top_reference_zero_dm_offset() -> None:
+    """DM-offset fix (2026-05-29): the include_coarse_offset escape hatch
+    must reference each chgroup's TOP channel (matching the Convention-A
+    corr-side stage-1 output), NOT its bottom.
+
+    Regression for the constant -2.45% detected-vs-injected DM bias: a
+    delay-arithmetic forward model that dedisperses a signal at DM_inj
+    using corr's actual per-chgroup TOP reference (chan-summed top-channel
+    band-center) + the escape-hatch shift table must recover DM_inj to
+    well within one fine-DM step. Also pins that chgroup-15 is no longer
+    zero (its TOP freq sits above ν_bot_proc) and the table flags
+    ``coarse_offset_baked``.
+    """
+    # corr Convention-A per-chgroup reference under chan_sum_factor=8:
+    # band-center of the top 8 fine channels in each chgroup.
+    fine_freqs = np.array(
+        [[freq_GHz(g, ch) for ch in range(NCHAN_PER_CHGROUP)] for g in range(N_CHGROUP)]
+    )
+    nu_sum_top = fine_freqs[:, 0:8].mean(axis=1)  # (16,)
+    t_int_ms = T_INT_SEARCH_US_DEFAULT / 1000.0
+
+    def arrival_samples(nu, dm):
+        return K_DM_MS_GHZ2_PC * dm * (1.0 / nu**2 - 1.0 / NU_TOP_PROC_GHZ**2) / t_int_ms
+
+    for dm_inj in (258.0, 576.0, 1300.0, 3000.0):
+        grid = np.linspace(dm_inj * 0.9, dm_inj * 1.1, 4001)
+        table = compute_time_shift_search(
+            coarse_dm_pc_cm3=np.array([dm_inj]),
+            fine_dm_pc_cm3=grid,
+            fine_to_coarse=np.zeros(len(grid), dtype=np.int64),
+            include_coarse_offset=True,
+        )
+        assert table.coarse_offset_baked is True
+        # chgroup-15 carries a real (nonzero) alignment shift now.
+        assert table.shifts[len(grid) // 2, N_CHGROUP - 1] != 0
+        # Forward model: corr emits chgroup g peak at arrival_samples(top[g]);
+        # escape-hatch shift advances it. Coherent sum peaks at the fine-DM
+        # that minimises the cross-chgroup time variance.
+        tpeak = arrival_samples(nu_sum_top, dm_inj)  # (16,)
+        var = (tpeak[None, :] + table.shifts.astype(float)).var(axis=1)
+        dm_det = float(grid[int(np.argmin(var))])
+        # recovered within 0.4% (integer-sample rounding dominates at low
+        # DM; vs the -2.45% bottom-reference bias this is a >6x improvement
+        # and far below the 5% injection-match tolerance / fine-DM step).
+        assert abs(dm_det - dm_inj) / dm_inj < 0.004, (
+            f"DM={dm_inj}: detected {dm_det:.2f} "
+            f"({100 * (dm_det - dm_inj) / dm_inj:+.3f}%)"
+        )
 
 
 def test_compute_time_shift_search_zero_at_dm_zero_offset() -> None:
