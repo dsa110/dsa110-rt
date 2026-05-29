@@ -71,6 +71,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import signal
 import sys
 import time
@@ -3020,6 +3021,102 @@ def _serialise_block(
     (block_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
 
+def _warmup_pipeline_jit(
+    ctx: IntegrationContext,
+    *,
+    expected_fada_bytes: int,
+    n_blocks: int,
+) -> None:
+    """Pre-compile every Triton / Inductor kernel in the fast path BEFORE
+    the ready-sentinel is touched.
+
+    Why this exists (M7.4 Phase 8b, 2026-05-28 — fada data-loss fix):
+    --------------------------------------------------------------------
+    The fast path JIT-compiles its GPU kernels (unpack_int4_split,
+    FastCorrKernel.compute_split, the fused dedispersion kernels, the
+    sparse gridder, static-sky subtract, RFI SK) on their *first* call.
+    On a cold 2080 Ti that first block costs multiple seconds (Inductor
+    cal-apply compile alone can be 10-60 s). Previously the ready
+    sentinel was touched immediately *before* the read loop, so the
+    orchestrator started the SNAP capture binaries while those first
+    blocks were still compiling.
+
+    ``fada`` is an ``r=2`` multi-reader ring (corr_slow + corr_fast),
+    written by ``dsaX_merge`` which is in turn fed by the *non-blockable*
+    SNAP UDP capture. While corr_fast (or corr_slow) is stalled in JIT,
+    merge cannot retire fada pages, fada fills to 70/70, merge blocks on
+    the write side, dada/eada back-fill, and the capture binary's UDP
+    socket overflows -> **silent packet loss on sky**. Once the ring is
+    pinned near full it only drains if the consumer runs *faster* than
+    the SNAP cadence, which is why operators saw a ~20 min crawl back to
+    a low-occupancy steady state (or never).
+
+    Running a handful of dummy blocks here forces all compiles to happen
+    *before* the sentinel, so when capture finally starts the consumer is
+    already at steady-state speed and fada stays near empty.
+
+    The pass is side-effect-free: transport TX and the stage-2 FIFO are
+    swapped for no-ops (no zero-cubes hit the search nodes, no FIFO
+    accumulation), the injector is detached, and every stateful detector
+    (static-sky EMA, RFI warmup counter, multi-DM sliding window) is
+    reset afterwards so real block #1 starts from a pristine cold state.
+    """
+    if n_blocks <= 0:
+        return
+    LOG.info(
+        "kernel warmup: compiling fast-path kernels with %d dummy block(s) "
+        "before ready-sentinel (avoids fada fill / UDP loss on cold start)",
+        n_blocks,
+    )
+    t0 = time.monotonic()
+    # Seeded pseudo-random fill: unpacks to varied non-zero int4 voltages
+    # so the RFI spectral-kurtosis / variance kernels see non-degenerate
+    # statistics (a constant fill can drive SK to 0/0). The values are
+    # irrelevant -- all outputs are discarded -- we only want the kernels
+    # to compile.
+    dummy = np.random.default_rng(0xDADA).integers(
+        0, 256, size=int(expected_fada_bytes), dtype=np.uint8,
+    )
+
+    saved_tx = ctx.transport_tx
+    saved_fifo = ctx.stage2_fifo
+    saved_injector = ctx.injector
+    ctx.transport_tx = NoOpTransportTx()
+    ctx.stage2_fifo = NoOpStage2Fifo()
+    ctx.injector = None
+    try:
+        for i in range(int(n_blocks)):
+            try:
+                _ = process_block(dummy, ctx=ctx, block_n=i)
+            except Exception:
+                # Warmup must never sink startup: log and bail out of the
+                # pass (the first real block will pay the JIT cost as it
+                # did before this hook existed).
+                LOG.exception(
+                    "kernel warmup: dummy block %d raised; aborting warmup "
+                    "(falling back to in-loop JIT)", i,
+                )
+                break
+        if ctx.device.type == "cuda":
+            torch.cuda.synchronize(ctx.device)
+    finally:
+        ctx.transport_tx = saved_tx
+        ctx.stage2_fifo = saved_fifo
+        ctx.injector = saved_injector
+        # Reset all per-cube state so the real stream starts cold-clean.
+        if ctx.static_sky is not None:
+            ctx.static_sky.reset()
+        if ctx.rfi_flagger is not None:
+            ctx.rfi_flagger.reset_warmup()
+        if ctx.multi_dm_coarse_dm is not None:
+            ctx.multi_dm_coarse_dm._prev_vis_stokes_i = None
+            ctx.multi_dm_coarse_dm._prev_block_n = -1
+    LOG.info(
+        "kernel warmup: done in %.1fs; fast-path kernels hot, detector "
+        "state reset", time.monotonic() - t0,
+    )
+
+
 def run(
     fada_key: int,
     output_dir: Path,
@@ -3572,15 +3669,31 @@ def run(
                         "M7.6 rfi monitor publish failed (continuing)"
                     )
 
+        # M7.4 Phase 8b (2026-05-28): pre-compile the fast-path Triton /
+        # Inductor kernels on dummy blocks BEFORE touching the ready
+        # sentinel. The orchestrator gates the SNAP capture binaries on
+        # this sentinel, so by warming the kernels here the consumer is
+        # already at steady-state speed when capture starts -> fada never
+        # fills to 70/70 -> no merge back-pressure -> no UDP packet loss.
+        # See :func:`_warmup_pipeline_jit` for the full rationale.
+        # Tunable via DSART_FAST_WARMUP_BLOCKS (0 disables; default 4).
+        try:
+            _warmup_n = int(os.environ.get("DSART_FAST_WARMUP_BLOCKS", "4"))
+        except (TypeError, ValueError):
+            _warmup_n = 4
+        _warmup_pipeline_jit(
+            ctx, expected_fada_bytes=expected_fada_bytes, n_blocks=_warmup_n,
+        )
+
         # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator
         # that Python imports + GPU init + Triton modules import + cal
         # loading + DM plan loading + pipeliner construction are all
-        # complete. Triton JIT itself still fires on the first kernel
-        # call inside the loop (a few seconds of warmup), but that's
-        # ~10× shorter than the pre-loop init we've already finished.
-        # The orchestrator gates capture routines (dada_junkdb) on this
-        # file so they don't pre-fill dada/eada to ~19/20 during this
-        # process's multi-second cold start.
+        # complete. As of Phase 8b the fast-path kernels are also already
+        # JIT-compiled (see _warmup_pipeline_jit above), so the first real
+        # block runs at steady-state speed instead of paying the compile.
+        # The orchestrator gates capture routines (cap_a_real/cap_b_real,
+        # dada_junkdb) on this file so they don't pre-fill dada/eada (and
+        # hence fada) during this process's cold start.
         if ready_sentinel_path is not None:
             try:
                 ready_sentinel_path.parent.mkdir(parents=True, exist_ok=True)

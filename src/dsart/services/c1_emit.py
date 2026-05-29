@@ -25,7 +25,9 @@ in-process TCP echo server.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -93,6 +95,29 @@ class C1EmitConfig:
     connect_backoff_max_s: float = 30.0
     send_timeout_s: Optional[float] = 5.0
     connect_timeout_s: Optional[float] = 10.0
+    idle_heartbeat_s: Optional[float] = 20.0
+    """When the outbound queue is idle for this long, the drain loop
+    proactively (a) probes for a half-closed peer (``reader.at_eof()`` /
+    ``transport.is_closing()``) so a connection the C2 receiver dropped is
+    detected and reconnected instead of wedging in CLOSE-WAIT forever, and
+    (b) ships a 0-row keepalive heartbeat so C2's ``idle_timeout_s``
+    (default 60 s — see ``coinc/receiver.py``) never fires on a search half
+    that is briefly not producing cubes.
+
+    This is the fix for the recurring "7 of 8 connections" symptom (seen on
+    ``n01 gpu_half=0``): the search side only writes to C2 on a per-cube
+    ``submit()``; the ``_drain_loop`` otherwise blocks on ``queue.get()``
+    and never reads the socket, so when C2 idle-closed a quiet half the
+    search side parked in CLOSE-WAIT and never reconnected. Must be < C2's
+    ``idle_timeout_s``. None disables the idle behaviour (legacy)."""
+    tcp_keepalive: bool = True
+    """Enable SO_KEEPALIVE + aggressive TCP keepalive timers on the
+    connected socket so the kernel surfaces a dead/half-open peer as a
+    socket error even when neither side has app-level traffic. Defence in
+    depth behind ``idle_heartbeat_s``."""
+    tcp_keepidle_s: int = 20
+    tcp_keepintvl_s: int = 5
+    tcp_keepcnt: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +243,11 @@ class C1TcpEmitter:
         self._stopping = asyncio.Event()
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader: Optional[asyncio.StreamReader] = None
+        # Last real batch header seen by the drain loop, reused (with
+        # n_candidates=0) as the keepalive-heartbeat template. None until
+        # the first cube flows; idle keepalive then relies on at_eof +
+        # TCP keepalive only.
+        self._last_header: Optional[C1BatchHeader] = None
         # Rate-limiter for the queue-full drop warning. Initialise to
         # -inf so the very first drop logs immediately; subsequent
         # drops are batched per the policy in ``submit``.
@@ -228,6 +258,7 @@ class C1TcpEmitter:
             "batches_sent": 0,
             "batches_dropped": 0,
             "batches_send_failed": 0,
+            "heartbeats_sent": 0,
             "reconnects": 0,
             "queue_depth": 0,
             "last_connect_error": None,
@@ -390,6 +421,7 @@ class C1TcpEmitter:
             self._reader, self._writer = await asyncio.open_connection(
                 host=self._config.host, port=self._config.port,
             )
+        self._apply_keepalive()
         self._mon["connected"] = True
         self._mon["reconnects"] = int(self._mon["reconnects"]) + 1
         self._mon["last_connect_error"] = None
@@ -403,38 +435,125 @@ class C1TcpEmitter:
             int(self._mon["reconnects"]),
         )
 
+    def _apply_keepalive(self) -> None:
+        """Enable SO_KEEPALIVE + aggressive timers on the connected socket.
+
+        Lets the kernel detect a dead / half-open peer (e.g. a C2 that went
+        away without a clean FIN) and surface it as a socket error on the
+        next drain, even when the application is idle. Best-effort: missing
+        sockopts (non-Linux) are ignored.
+        """
+        if not self._config.tcp_keepalive or self._writer is None:
+            return
+        sock = self._writer.get_extra_info("socket")
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,
+                    int(self._config.tcp_keepidle_s),
+                )
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
+                    int(self._config.tcp_keepintvl_s),
+                )
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(
+                    socket.IPPROTO_TCP, socket.TCP_KEEPCNT,
+                    int(self._config.tcp_keepcnt),
+                )
+        except OSError as exc:  # noqa: BLE001
+            _LOG.debug("c1_emit keepalive sockopt failed: %r", exc)
+
     async def _drain_loop(self) -> None:
         assert self._writer is not None
-        writer = self._writer
+        idle = self._config.idle_heartbeat_s
         while not self._stopping.is_set():
-            item = await self._queue.get()
+            if idle is not None and idle > 0:
+                try:
+                    item = await asyncio.wait_for(
+                        self._queue.get(), timeout=float(idle),
+                    )
+                except asyncio.TimeoutError:
+                    # No cube traffic for `idle` s. Probe for a peer that
+                    # closed on us and keep the connection warm so C2's
+                    # idle_timeout never idle-closes a cube-drought half.
+                    # Raises on a dead/half-closed peer → outer loop
+                    # reconnects (clears the CLOSE-WAIT socket).
+                    await self._idle_keepalive()
+                    continue
+            else:
+                item = await self._queue.get()
             self._mon["queue_depth"] = self._queue.qsize()
             if item is _SHUTDOWN_SENTINEL:
                 return
+            # Seed / refresh the heartbeat template from real traffic.
+            self._last_header = item.header
             try:
-                payload = C1BatchEncoder.encode(item.header, item.rows)
-                writer.write(payload)
-                if self._config.send_timeout_s is not None:
-                    await asyncio.wait_for(
-                        writer.drain(),
-                        timeout=self._config.send_timeout_s,
-                    )
-                else:
-                    await writer.drain()
-                self._mon["bytes_sent"] = int(self._mon["bytes_sent"]) + len(payload)
-                self._mon["batches_sent"] = int(self._mon["batches_sent"]) + 1
-            except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
-                self._mon["batches_send_failed"] = (
-                    int(self._mon["batches_send_failed"]) + 1
-                )
-                _LOG.warning(
-                    "c1_emit send failed (cube_id=%d): %r; tearing connection",
-                    int(item.header.cube_id), exc,
-                )
-                raise  # outer loop reconnects
+                await self._send_batch(item.header, item.rows)
             finally:
                 # The asyncio.Queue tracks unfinished tasks; signal done.
                 self._queue.task_done()
+
+    async def _send_batch(
+        self,
+        header: C1BatchHeader,
+        rows: Tuple[C1CandidateRow, ...],
+    ) -> None:
+        """Encode + write one batch; raise on socket error so the outer
+        run() loop reconnects."""
+        assert self._writer is not None
+        writer = self._writer
+        try:
+            payload = C1BatchEncoder.encode(header, rows)
+            writer.write(payload)
+            if self._config.send_timeout_s is not None:
+                await asyncio.wait_for(
+                    writer.drain(), timeout=self._config.send_timeout_s,
+                )
+            else:
+                await writer.drain()
+            self._mon["bytes_sent"] = int(self._mon["bytes_sent"]) + len(payload)
+            self._mon["batches_sent"] = int(self._mon["batches_sent"]) + 1
+        except (ConnectionError, asyncio.TimeoutError, OSError) as exc:
+            self._mon["batches_send_failed"] = (
+                int(self._mon["batches_send_failed"]) + 1
+            )
+            _LOG.warning(
+                "c1_emit send failed (cube_id=%d): %r; tearing connection",
+                int(header.cube_id), exc,
+            )
+            raise  # outer loop reconnects
+
+    async def _idle_keepalive(self) -> None:
+        """Idle-period connection health-check + keepalive heartbeat.
+
+        Called when the outbound queue has been empty for
+        ``idle_heartbeat_s``. First detects a peer that closed on us (the
+        C2 idle_timeout path leaves us in CLOSE-WAIT); a closed peer raises
+        so run() reconnects. Then ships a 0-row heartbeat (if we have a
+        header template) so C2 never idle-closes a quiet-but-healthy half.
+        """
+        reader = self._reader
+        writer = self._writer
+        if reader is not None and reader.at_eof():
+            raise ConnectionResetError(
+                "c1_emit: peer closed connection (EOF on idle probe)"
+            )
+        if writer is not None and writer.transport.is_closing():
+            raise ConnectionResetError(
+                "c1_emit: transport closing (idle probe)"
+            )
+        hb = self._last_header
+        if hb is not None:
+            hb_header = dataclasses.replace(hb, n_candidates=0)
+            await self._send_batch(hb_header, ())
+            self._mon["heartbeats_sent"] = (
+                int(self._mon["heartbeats_sent"]) + 1
+            )
 
     async def _close_writer(self) -> None:
         w = self._writer

@@ -464,3 +464,117 @@ async def test_connect_timeout_disabled_when_none() -> None:
     # without injecting OS-level packet drops.
     assert emitter._config.connect_timeout_s is None
     assert emitter is not None
+
+
+# ---------------------------------------------------------------------------
+# Idle keepalive heartbeat + peer-close (CLOSE-WAIT) self-heal
+# ---------------------------------------------------------------------------
+
+
+@asyncio_test
+async def test_idle_heartbeat_keeps_connection_warm() -> None:
+    """With no cube traffic the drain loop must ship 0-row keepalive
+    heartbeats so C2's idle_timeout never idle-closes a quiet half. This
+    is the proactive half of the 7/8-connections fix.
+
+    Seeds the header template with one real batch, then idles and asserts
+    a heartbeat (n_candidates=0) lands at the server within a couple of
+    idle intervals.
+    """
+    srv = _EchoServer()
+    port = await srv.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=3, gpu_half=1, queue_depth=64,
+        connect_backoff_initial_s=0.05, connect_backoff_max_s=0.05,
+        send_timeout_s=2.0,
+        idle_heartbeat_s=0.2,  # tiny for test; production 20s
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    task = asyncio.create_task(emitter.run())
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if emitter.mon["connected"]:
+                break
+        assert emitter.mon["connected"]
+        # Seed the heartbeat template with one real cube.
+        emitter.submit(_header(emitter, n_candidates=1, cube_id=7),
+                       [_cand(snr=10.0)], geom=_geom())
+        # Now idle: heartbeats must accrue without any further submit().
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if emitter.mon["heartbeats_sent"] >= 2:
+                break
+        assert emitter.mon["heartbeats_sent"] >= 2, emitter.mon
+        # The server should have received at least one 0-candidate batch.
+        await asyncio.sleep(0.1)
+        text = srv.bytes_seen.decode("utf-8")
+        lines = [ln for ln in text.splitlines() if ln]
+        # Header lines look like "# C1 <schema> <cube> ... <n_candidates>"
+        # (n_candidates is the last whitespace token). A heartbeat is a
+        # header whose n_candidates == 0.
+        n_zero = sum(
+            1 for ln in lines
+            if ln.startswith("# C1") and ln.split()[-1] == "0"
+        )
+        assert n_zero >= 1, f"no heartbeat batch seen; lines={lines!r}"
+    finally:
+        await emitter.stop()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+        await srv.stop()
+
+
+@asyncio_test
+async def test_idle_probe_reconnects_on_peer_close() -> None:
+    """If the peer closes the connection during a cube drought (C2's
+    idle_timeout path -> FIN -> our socket parks in CLOSE-WAIT), the idle
+    probe must detect the EOF and force run() to reconnect, instead of
+    wedging forever. This is the reactive half of the 7/8 fix.
+    """
+    srv = _EchoServer()
+    port = await srv.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=0, gpu_half=0, queue_depth=64,
+        connect_backoff_initial_s=0.05, connect_backoff_max_s=0.05,
+        send_timeout_s=2.0,
+        idle_heartbeat_s=0.15,
+        # Disable the heartbeat-template path for this test by never
+        # seeding a header: relies purely on at_eof detection.
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    task = asyncio.create_task(emitter.run())
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if emitter.mon["connected"]:
+                break
+        assert emitter.mon["connected"]
+        reconnects_before = int(emitter.mon["reconnects"])
+        # Server closes its client sockets (clean FIN) -> our side EOF.
+        for w in list(srv._conns):
+            try:
+                w.close()
+            except Exception:
+                pass
+        srv._conns.clear()
+        # Within a few idle intervals the probe must notice + reconnect.
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if int(emitter.mon["reconnects"]) > reconnects_before:
+                break
+        assert int(emitter.mon["reconnects"]) > reconnects_before, (
+            f"idle probe did not reconnect after peer close; mon="
+            f"{dict(emitter.mon)}"
+        )
+    finally:
+        await emitter.stop()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+        await srv.stop()

@@ -75,7 +75,9 @@ trigger_classes:
     return p
 
 
-def _make_service(tmp_path: Path, window_s: float = 5.0) -> CoincidencerService:
+def _make_service(
+    tmp_path: Path, window_s: float = 5.0, startup_grace_s: float = 0.0,
+) -> CoincidencerService:
     cfg = CoincidencerConfig(
         bind_host="127.0.0.1",
         bind_port=0,
@@ -86,6 +88,7 @@ def _make_service(tmp_path: Path, window_s: float = 5.0) -> CoincidencerService:
         trigger_criteria_path=_criteria_file(tmp_path),
         name_allocator_offline=True,
         gal_dm_poll_interval_s=60.0,
+        startup_grace_s=startup_grace_s,
     )
     return CoincidencerService(
         config=cfg,
@@ -457,3 +460,58 @@ async def test_warmup_filter_preserves_late_drop_semantics(tmp_path: Path) -> No
     assert svc._counters["rows_warmup_drop"] == 3
     assert svc._counters["rows_late_drop"] == 2
     assert len(svc._graph) == 1
+
+
+# ---------------------------------------------------------------------------
+# Startup grace window (Phase 8c) — suppress the corr-RFI-warmup false burst
+# ---------------------------------------------------------------------------
+
+
+@asyncio_test
+async def test_startup_grace_suppresses_triggers(tmp_path: Path) -> None:
+    """Within the startup grace window, a coincidence that would fire a
+    trigger is suppressed: the action does not run, triggers_log_only
+    stays 0, and triggers_startup_grace counts the would-be trigger.
+
+    This is the fix for the ~3-minute post-restart false-trigger burst
+    caused by the corr-side RFI bandpass warmup (~150 s) leaking RFI into
+    cubes -- those candidates reach C2 UNFLAGGED so the NOISE_WARMUP
+    filter can't catch them.
+    """
+    svc = _make_service(tmp_path, window_s=5.0, startup_grace_s=600.0)
+    # n_events_min=1 in the criteria → a single clean row fires log_only.
+    await svc._on_batch(
+        _batch(mjd_start=60781.0, n=1, event_specnum_start=0),
+        peer_repr="grace",
+    )
+    assert svc._counters["triggers_startup_grace"] >= 1
+    assert svc._counters["triggers_log_only"] == 0
+
+
+@asyncio_test
+async def test_after_grace_triggers_fire_normally(tmp_path: Path) -> None:
+    """Once the grace window has elapsed, triggers fire as usual."""
+    svc = _make_service(tmp_path, window_s=5.0, startup_grace_s=600.0)
+    # Pre-set the first-batch anchor far in the past so we're past grace
+    # (the handler only sets it when None, so this sticks).
+    import time as _t
+    svc._first_batch_mono = _t.monotonic() - 100_000.0
+    await svc._on_batch(
+        _batch(mjd_start=60781.0, n=1, event_specnum_start=0),
+        peer_repr="post-grace",
+    )
+    assert svc._counters["triggers_log_only"] == 1
+    assert svc._counters["triggers_startup_grace"] == 0
+
+
+@asyncio_test
+async def test_startup_grace_disabled_when_zero(tmp_path: Path) -> None:
+    """startup_grace_s=0 disables the window: triggers fire immediately
+    from the very first batch."""
+    svc = _make_service(tmp_path, window_s=5.0, startup_grace_s=0.0)
+    await svc._on_batch(
+        _batch(mjd_start=60781.0, n=1, event_specnum_start=0),
+        peer_repr="no-grace",
+    )
+    assert svc._counters["triggers_log_only"] == 1
+    assert svc._counters["triggers_startup_grace"] == 0
