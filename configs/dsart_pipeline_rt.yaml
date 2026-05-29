@@ -75,25 +75,25 @@ routines:
     # cleaner producer in the multi-reader (r=2) fada → corr_slow +
     # corr_fast topology.
     #
-    # gate_on_paths (M7.2, 2026-05-19): junkdb is gated on the corr_fast
-    # and corr_slow ready-sentinels so it does not stuff dada/eada to
-    # 19/20 + fada to 70/70 during the ~90 s of Python + GPU + Triton
-    # cold start on those consumers. Without the gate the soak first
-    # 90 s is a back-pressured ring-fill transient (rings drain to
-    # steady state in 1-2 s after corr_fast starts reading fada, but
-    # the operator sees a misleading "rings near full" snapshot in
-    # mon-dict during the warmup window).
+    # NO gate_on_paths (M7.4 Phase 8b, 2026-05-29 — reverts the M7.2
+    # gating). junkdb is the head of the fada-chain writer (junkdb ->
+    # dada/eada header -> dsaX_merge -> fada header -> corr_fast.Reader
+    # (fada)), so gating it on the corr ready-sentinels deadlocks the
+    # same way cap_a_real did (corr_fast can't reach ready without the
+    # header; the header can't arrive until junkdb runs; junkdb won't
+    # run until corr_fast is ready). The M7.2 gate only "worked" for
+    # junkdb because the 240 s gate-timeout force-spawned it anyway —
+    # i.e. it cost 240 s of dead time and still produced the very
+    # ring-fill transient it was meant to avoid. The fill is harmless
+    # for junkdb (a synthetic generator has no real SNAP packets to
+    # drop; back-pressure just throttles the generator) and is the
+    # cosmetic warmup transient noted below; the kernel-warmup pass in
+    # corr_fast/corr_slow keeps the steady state clean.
     args: -k dada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
-    gate_on_paths:
-      - /tmp/dsart-corr-fast-CN.ready
-      - /tmp/dsart-corr-slow-CN.ready
   - name: cap_b_junkdb
     when: captures.mode == junkdb
     cmd: /usr/local/bin/dada_junkdb
     args: -k eada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
-    gate_on_paths:
-      - /tmp/dsart-corr-fast-CN.ready
-      - /tmp/dsart-corr-slow-CN.ready
 
   # ---- synth_fada (M7.4 noise test) ---------------------------------
   # The legacy /usr/local/bin/dada_junkdb has a known bug: its gaussian
@@ -176,32 +176,38 @@ routines:
   #   bind-host example) to pin the right NIC IP without parameterising
   #   the YAML via tokens. IPs verified live on each node 2026-05-20.
   #
-  # gate_on_paths (M7.4 Phase 8, 2026-05-28): mirrors the cap_a_junkdb /
-  # cap_b_junkdb gating (see lines 78-85). InfluxDB analysis on
-  # 2026-05-28 of the post-restart corr_rt_buffer history showed
-  # fada steady-state pinned at nfull=68/70 (~9 s of latency =
-  # exactly 68 buffers / 7.97 buffers-per-s) for the entire 25 min
-  # post-restart window. Root cause: cap_a_real spawned in the same
-  # wave-1 spawn as corr_fast / corr_slow, so once utc_start armed
-  # the SNAPs the capture binary wrote into dada/eada faster than
-  # the consumers reached their main loop (Python + GPU + Triton
-  # cold start = several seconds before the first fada page is
-  # consumed). The resulting offset persists indefinitely because
-  # writer rate (SNAP cadence) == reader rate (Triton steady state)
-  # to within ~0.1 buffer/s. Gating capture on the two consumer
-  # ready-sentinels removes the offset at the source: capture only
-  # starts binding/writing once both consumers are deep enough into
-  # init to be ready to drain. utc_start should still be issued by
-  # the operator AFTER /control/start completes (the gate adds at
-  # most 30-60 s to the start verb's wall-clock; the gate timeout
-  # is DSART_RT_GATE_TIMEOUT_S = 240 s default, plenty of headroom).
+  # NO gate_on_paths on cap_a_real / cap_b_real. (M7.4 Phase 8b,
+  # 2026-05-29 — reverts the Phase 8 gating from 2026-05-28.)
+  #
+  # The Phase 8 change gated real capture on the corr_fast / corr_slow
+  # ready-sentinels to chase a fada nfull=68/70 reading. That gating
+  # DEADLOCKS real mode, for exactly the reason the synth_fada block
+  # above (see "NOTE: no gate_on_paths here") documents: cap_a_real is
+  # the head of the only chain that produces the PSRDADA *header* that
+  # corr_fast's Reader(fada) blocks on at init:
+  #     cap_a_real -> dada header -> dsaX_merge -> fada header
+  #         -> corr_fast.Reader(fada) unblocks -> warmup -> ready sentinel
+  # Gating cap_a_real on the corr ready-sentinels makes corr_fast wait
+  # for a header that can only come once cap_a_real runs, which only
+  # runs once corr_fast is ready: a hard deadlock (observed 2026-05-29
+  # fleet-wide — merge + corr_fast both parked in do_semtimedop, gate
+  # timed out at 300 s, capture force-spawned but still WAITING_FOR_ARM
+  # so no header was ever written).
+  #
+  # The fada nfull=68/70 cold-start fill that Phase 8 tried to fix is
+  # instead solved at the source by the kernel-warmup pass added to
+  # corr_fast_integration.py / corr_slow_compute.py: both consumers
+  # JIT-compile their GPU kernels on dummy blocks BEFORE touching the
+  # ready sentinel, so by the time the operator issues utc_start (which
+  # is the real "data starts flowing" signal — capture writes only the
+  # header on start, no data blocks until armed) the consumers are
+  # already at steady-state speed and drain fada from the first block.
+  # Verified on-sky 2026-05-29 (n04): n_dropped_kernel=0, 7.4 blocks/s,
+  # fada backlog (n_written - n_read) ~0-1 from the first armed block.
   - name: cap_a_real
     when: captures.mode == real
     cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
     args: -o dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
-    gate_on_paths:
-      - /tmp/dsart-corr-fast-CN.ready
-      - /tmp/dsart-corr-slow-CN.ready
     hostargs:
       lxd110h03: -j 10.41.0.224
       lxd110h04: -j 10.41.0.138
@@ -223,9 +229,7 @@ routines:
     when: captures.mode == real
     cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
     args: -o eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
-    gate_on_paths:
-      - /tmp/dsart-corr-fast-CN.ready
-      - /tmp/dsart-corr-slow-CN.ready
+    # NO gate_on_paths — see cap_a_real above (deadlock; warmup solves fill).
     hostargs:
       lxd110h03: -j 10.41.0.224
       lxd110h04: -j 10.41.0.138
