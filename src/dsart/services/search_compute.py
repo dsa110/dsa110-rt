@@ -1149,6 +1149,16 @@ class SearchComputeService:
                 )
                 await self._process_one_cube(slot, prefetched=pending)
                 await self._source.release(slot.cube_id)
+                # Cooperative yield: _process_one_cube + release run to
+                # completion without ever suspending the event loop when
+                # the RX ring has data ready, so the co-resident C1 emitter
+                # task (c1_emit.run drain loop) would otherwise be starved
+                # under heavy candidate load -- it could not drain its queue,
+                # send heartbeats, or reconnect, which dropped that half's
+                # C1->C2 connection (observed 2026-05-29 as the recurring
+                # n01 gpu_half=0 7/8). sleep(0) forces one scheduler cycle
+                # per cube so the emitter always makes progress.
+                await asyncio.sleep(0)
                 slot, pending = next_slot, next_pending
                 if self._cubes_processed >= next_status:
                     self._log_cube_progress(now_loop_start=loop_start,
@@ -1163,6 +1173,10 @@ class SearchComputeService:
                     break
                 await self._process_one_cube(slot)
                 await self._source.release(slot.cube_id)
+                # Cooperative yield so the co-resident C1 emitter task is
+                # not starved under heavy candidate load (see overlap branch
+                # above; the recurring n01 gpu_half=0 7/8 root cause).
+                await asyncio.sleep(0)
                 if self._cubes_processed >= next_status:
                     self._log_cube_progress(now_loop_start=loop_start,
                                             last_log_mono=last_log,
