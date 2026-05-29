@@ -115,6 +115,21 @@ class RFIWindowStore:
         with self._lock:
             ring = self._rings[cn_id]
             last_seq = self._last_seq.get(cn_id, 0)
+            # Producer restart detection. The exporter's seq counter is
+            # monotonic only within a single process lifetime; a corr-node
+            # restart (every fleet relaunch) resets it to ~0. If the newest
+            # incoming seq is below our high-water mark the producer
+            # restarted, so the stale mark + stale ring must be dropped or
+            # every post-restart record would be deduped away (windows=0).
+            max_in = max(r.seq for r in recs)
+            if max_in < last_seq:
+                LOG.warning(
+                    "cn=%d producer restart detected (incoming seq<=%d < "
+                    "last_seq=%d); clearing %d stale records",
+                    cn_id, max_in, last_seq, len(ring),
+                )
+                ring.clear()
+                last_seq = 0
             for r in recs:
                 if r.seq <= last_seq:
                     continue
@@ -131,6 +146,11 @@ class RFIWindowStore:
         with self._lock:
             self._last_fetch_unix[cn_id] = time.time()
             self._last_fetch_ok[cn_id] = False
+
+    def last_seq_for(self, cn_id: int) -> int:
+        """Current dedup high-water mark for a cn (0 = never observed)."""
+        with self._lock:
+            return self._last_seq.get(cn_id, 0)
 
     # ------------------------------------------------------------------
     # Consumer API (called by render path)
@@ -254,6 +274,18 @@ class RFIPoller:
             if rec is None:
                 self._store.mark_fetch_failed(cn_id)
                 return
+            # If the producer restarted (seq counter reset below our
+            # high-water mark), re-pull /api/recent so the ring repopulates
+            # immediately instead of dribbling in one window per tick.
+            if rec.seq < self._store.last_seq_for(cn_id):
+                LOG.info(
+                    "cn=%d producer restart (seq=%d < %d); re-backfilling",
+                    cn_id, rec.seq, self._store.last_seq_for(cn_id),
+                )
+                recs = client.get_recent(self._backfill_n)
+                if recs:
+                    self._store.append(recs, cn_id=cn_id)
+                    return
             self._store.append([rec], cn_id=cn_id)
         except Exception:
             LOG.exception("poll cn=%d failed", cn_id)
