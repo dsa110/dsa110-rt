@@ -573,13 +573,18 @@ class C1TcpEmitter:
         early on n_candidates==0, so the geometry fields are never read)."""
         if self._last_header is not None:
             return dataclasses.replace(self._last_header, n_candidates=0)
+        # sample_period_specnum / sample_period_us MUST be > 0: the C2
+        # parser (_parse_header) rejects <= 0 as a BadBatch, which would
+        # tear the connection on every heartbeat. For a 0-candidate batch
+        # C2 returns before reading any geometry, so these are placeholders
+        # (1 / 1.0); only the > 0 validity matters.
         return C1BatchHeader(
             schema_version=SCHEMA_VERSION,
             cube_id=-1,
             event_specnum_start=0,
             mjd_start=0.0,
-            sample_period_specnum=0,
-            sample_period_us=0.0,
+            sample_period_specnum=1,
+            sample_period_us=1.0,
             n_grid=0,
             n_fdm_in_cube=0,
             search_node_id=int(self._config.search_node_id),

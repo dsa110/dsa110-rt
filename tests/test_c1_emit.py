@@ -528,6 +528,27 @@ async def test_idle_heartbeat_keeps_connection_warm() -> None:
         await srv.stop()
 
 
+def test_synthetic_heartbeat_header_parses() -> None:
+    """The synthetic (no prior batch) heartbeat header must round-trip
+    through the real C2 parser without BadBatch. Regression for the
+    2026-05-29 bug where sample_period_specnum/us=0 made every
+    candidate-less heartbeat a BadBatch -> connection torn in a loop ->
+    n01 dropped to 0 connections."""
+    from dsart.coinc.wire import C1BatchEncoder, parse_c1_batch
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=1, search_node_id=1, gpu_half=0,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    hb = emitter._heartbeat_header()
+    assert hb.n_candidates == 0
+    assert hb.search_node_id == 1 and hb.gpu_half == 0
+    payload = C1BatchEncoder.encode(hb, ())
+    batch = parse_c1_batch(payload.decode("utf-8").splitlines())
+    assert batch.header.n_candidates == 0
+    assert batch.header.search_node_id == 1
+    assert batch.header.gpu_half == 0
+
+
 @asyncio_test
 async def test_idle_heartbeat_without_prior_batch() -> None:
     """A half that has NEVER emitted a candidate (e.g. n01 gpu_half=0 in a
