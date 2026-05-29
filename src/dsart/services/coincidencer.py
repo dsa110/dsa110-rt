@@ -302,10 +302,11 @@ class CoincidencerConfig:
     # burn-in, ~4 s). This produced the observed ~3-minute post-restart
     # burst (437 rows / 150 false log_only triggers in the first 3 min,
     # then ~0/min steady state, with rows_warmup_drop=0). The grace
-    # window is keyed on the first batch (not C2 start) so it tracks the
-    # fleet's synchronized utc_start RFI warmup, and is set ONCE (never
-    # re-armed on reconnects). Default 180 s > the ~150 s RFI warmup.
-    # Set to 0 to disable.
+    # window is keyed on the first CANDIDATE-bearing batch (not C2 start,
+    # and explicitly NOT the continuous 0-row heartbeats idle halves now
+    # send) so it tracks the fleet's synchronized utc_start RFI warmup,
+    # and is set ONCE (never re-armed on reconnects). Default 180 s >
+    # the ~150 s RFI warmup. Set to 0 to disable.
     startup_grace_s: float = 180.0
 
     @classmethod
@@ -684,15 +685,21 @@ class CoincidencerService:
         # refresh_if_due gates on its own cadence so this is a cheap
         # no-op when the cadence hasn't elapsed.
         self._inject_matcher.refresh_if_due()
-        # Anchor the startup grace window on the first batch we ever see
-        # (heartbeat or not). Keying on first-batch rather than C2 start
-        # tracks the fleet's synchronized utc_start RFI warmup even if C2
-        # was launched well before the search nodes. Set exactly once.
-        if self._first_batch_mono is None:
-            self._first_batch_mono = time.monotonic()
         if batch.header.n_candidates == 0:
             # Empty heartbeat; nothing to do for the graph but record.
+            # NOTE: heartbeats are emitted continuously by idle C1 halves
+            # (including before utc_start), so they must NOT anchor the
+            # startup grace window — otherwise the window would open at
+            # connect time and expire before the post-utc_start RFI-warmup
+            # candidate burst it is meant to absorb.
             return
+        # Anchor the startup grace window on the first CANDIDATE-bearing
+        # batch we ever see. Keying on first-candidate (rather than C2 start
+        # or first heartbeat) tracks the fleet's synchronized utc_start RFI
+        # warmup even if C2 was launched well before the search nodes. Set
+        # exactly once.
+        if self._first_batch_mono is None:
+            self._first_batch_mono = time.monotonic()
 
         # M7.4 Phase 8 (2026-05-28): drop noise-warmup-flagged candidate
         # rows before they hit the window/graph. The search-side

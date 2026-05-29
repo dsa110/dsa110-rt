@@ -547,13 +547,45 @@ class C1TcpEmitter:
             raise ConnectionResetError(
                 "c1_emit: transport closing (idle probe)"
             )
-        hb = self._last_header
-        if hb is not None:
-            hb_header = dataclasses.replace(hb, n_candidates=0)
-            await self._send_batch(hb_header, ())
-            self._mon["heartbeats_sent"] = (
-                int(self._mon["heartbeats_sent"]) + 1
-            )
+        # Always ship a 0-row heartbeat so C2's idle_timeout never reaps a
+        # quiet-but-healthy half. CRITICAL: do NOT gate this on having seen
+        # a real batch (_last_header). A half that owns a coarse-DM range
+        # with no candidates yet (e.g. n01 gpu_half=0 at startup) would
+        # otherwise never heartbeat, C2 would idle-close it every 60 s, and
+        # the subsequent reconnect/dead-socket-send race can wedge the drain
+        # loop (observed 2026-05-29: n01 half-0 stuck in perpetual queue-full
+        # with no reconnect). We always know our sid/gpu_half, so a synthetic
+        # 0-candidate header is sufficient to keep the connection warm.
+        hb_header = self._heartbeat_header()
+        await self._send_batch(hb_header, ())
+        self._mon["heartbeats_sent"] = (
+            int(self._mon["heartbeats_sent"]) + 1
+        )
+
+    def _heartbeat_header(self) -> C1BatchHeader:
+        """0-candidate header for an idle keepalive.
+
+        Reuses the last real batch header (n_candidates forced to 0) when
+        available so C2 sees a consistent cube_id stream; otherwise
+        synthesises a minimal header from our static (sid, gpu_half) so a
+        half that has not yet emitted a single candidate can still keep the
+        connection warm. cube_id=-1 marks a synthetic heartbeat (C2 returns
+        early on n_candidates==0, so the geometry fields are never read)."""
+        if self._last_header is not None:
+            return dataclasses.replace(self._last_header, n_candidates=0)
+        return C1BatchHeader(
+            schema_version=SCHEMA_VERSION,
+            cube_id=-1,
+            event_specnum_start=0,
+            mjd_start=0.0,
+            sample_period_specnum=0,
+            sample_period_us=0.0,
+            n_grid=0,
+            n_fdm_in_cube=0,
+            search_node_id=int(self._config.search_node_id),
+            gpu_half=int(self._config.gpu_half),
+            n_candidates=0,
+        )
 
     async def _close_writer(self) -> None:
         w = self._writer

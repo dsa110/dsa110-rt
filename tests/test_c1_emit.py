@@ -529,6 +529,60 @@ async def test_idle_heartbeat_keeps_connection_warm() -> None:
 
 
 @asyncio_test
+async def test_idle_heartbeat_without_prior_batch() -> None:
+    """A half that has NEVER emitted a candidate (e.g. n01 gpu_half=0 in a
+    cube drought at startup) must still ship 0-row heartbeats so C2 does
+    not idle-close it every 60 s. Regression for the 2026-05-29 n01 half-0
+    wedge: previously the heartbeat was gated on a seeded _last_header, so
+    a candidate-less half never heartbeated -> repeated 60 s idle-close ->
+    drain-loop wedge. The synthetic header must carry our sid/gpu_half.
+    """
+    srv = _EchoServer()
+    port = await srv.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=1, gpu_half=0, queue_depth=64,
+        connect_backoff_initial_s=0.05, connect_backoff_max_s=0.05,
+        send_timeout_s=2.0,
+        idle_heartbeat_s=0.2,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    task = asyncio.create_task(emitter.run())
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if emitter.mon["connected"]:
+                break
+        assert emitter.mon["connected"]
+        # No submit() ever: heartbeats must still accrue.
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if emitter.mon["heartbeats_sent"] >= 2:
+                break
+        assert emitter.mon["heartbeats_sent"] >= 2, emitter.mon
+        await asyncio.sleep(0.1)
+        text = srv.bytes_seen.decode("utf-8")
+        lines = [ln for ln in text.splitlines() if ln.startswith("# C1")]
+        assert lines, f"no batch header seen; bytes={text!r}"
+        # Every header here is a 0-candidate heartbeat carrying sid=1,
+        # gpu_half=0 (header tokens: # C1 <schema> <cube> <specnum>
+        # <mjd> <samp_specnum> <samp_us> <n_grid> <n_fdm> <sid> <half> <ncand>).
+        for ln in lines:
+            toks = ln.split()
+            assert toks[-1] == "0", f"non-heartbeat header: {ln!r}"
+            assert toks[-3] == "1" and toks[-2] == "0", (
+                f"heartbeat header missing sid/gpu_half: {ln!r}"
+            )
+    finally:
+        await emitter.stop()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+        await srv.stop()
+
+
+@asyncio_test
 async def test_idle_probe_reconnects_on_peer_close() -> None:
     """If the peer closes the connection during a cube drought (C2's
     idle_timeout path -> FIN -> our socket parks in CLOSE-WAIT), the idle
