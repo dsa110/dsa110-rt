@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
@@ -239,13 +240,52 @@ def run(
         per_block_ms: list[float] = []
         t_start = time.monotonic()
 
+        # M7.4 Phase 8b (2026-05-28): pre-compile the slow-corr GPU
+        # kernels on dummy blocks BEFORE touching the ready sentinel.
+        # fada is an r=2 multi-reader ring: dsaX_merge cannot retire a
+        # fada page until BOTH corr_slow and corr_fast have cleared it,
+        # so if corr_slow stalls in first-block JIT while capture is
+        # already running, fada fills to 70/70 just as surely as if
+        # corr_fast had stalled -> merge back-pressure -> SNAP UDP drop.
+        # Warming here (capture is gated on this sentinel) keeps fada
+        # near empty from the first real block. Tunable via
+        # DSART_SLOW_WARMUP_BLOCKS (0 disables; default 3).
+        try:
+            _warmup_n = int(os.environ.get("DSART_SLOW_WARMUP_BLOCKS", "3"))
+        except (TypeError, ValueError):
+            _warmup_n = 3
+        if _warmup_n > 0:
+            LOG.info("kernel warmup: compiling slow-corr kernels with %d "
+                     "dummy block(s) before ready-sentinel", _warmup_n)
+            _t_warm = time.monotonic()
+            _dummy = np.random.default_rng(0xDADA).integers(
+                0, 256, size=int(expected_fada_bytes), dtype=np.uint8,
+            )
+            try:
+                for _i in range(_warmup_n):
+                    _rv, _iv = unpack_int4_split(
+                        _dummy, device=device, out_dtype=voltage_dtype,
+                    )
+                    if cal_real_b is not None:
+                        _rv, _iv = apply_cal_split(
+                            _rv, _iv, cal_real_b, cal_imag_b,
+                        )
+                    _ = kernel.compute_split(_rv, _iv)
+                    del _rv, _iv
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                LOG.info("kernel warmup: done in %.1fs (slow-corr kernels hot)",
+                         time.monotonic() - _t_warm)
+            except Exception:
+                LOG.exception("kernel warmup: dummy block raised; aborting "
+                              "warmup (first real block will pay JIT cost)")
+
         # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator
         # that Python imports + GPU init + kernel construction + cal
-        # tensor load are complete. Triton JIT still fires on the first
-        # kernel call (first block), but that warmup is short (~1 s on
-        # corr_slow's small kernel set) vs. the ~10 s of pre-loop init
-        # we've already done — gating junkdb here cuts the ring fill-up
-        # transient by an order of magnitude.
+        # tensor load are complete. As of Phase 8b the slow-corr kernels
+        # are also already JIT-compiled (see warmup above), so the first
+        # real block runs at steady-state speed. The orchestrator gates
+        # capture routines on this sentinel.
         if ready_sentinel_path is not None:
             try:
                 ready_sentinel_path.parent.mkdir(parents=True, exist_ok=True)

@@ -351,6 +351,7 @@ def _make_service(
         ),
         name_allocator_offline=True,
         gal_dm_poll_interval_s=60.0,
+        startup_grace_s=0.0,  # disable startup grace for dumps-gate tests
     )
     if dumps_enabled is None:
         responses: Dict[str, Any] = {}
@@ -556,6 +557,7 @@ async def test_log_only_path_unchanged_regardless_of_gate(tmp_path: Path) -> Non
             ),
             name_allocator_offline=True,
             gal_dm_poll_interval_s=60.0,
+            startup_grace_s=0.0,  # disable startup grace for these tests
         )
         store = _FakeStore(responses={
             DUMPS_ENABLED_KEY: {"enabled": enabled},

@@ -46,7 +46,9 @@ from dsart.services.corr_fast_integration import (
     process_block,
     process_blocks_pipelined,
     _build_core_baseline_mask,
+    _warmup_pipeline_jit,
 )
+import dsart.services.corr_fast_integration as _cfi
 
 
 # ---------------------------------------------------------------------------
@@ -1696,3 +1698,172 @@ def test_phase8_injection_is_applied_after_cal() -> None:
         f"cal scalar). A ratio near 1.0 means the injector saw "
         f"pre-cal voltages -- the Phase 6/7 ordering bug."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8b: kernel warmup pass (fada cold-start / UDP-loss fix)
+# ---------------------------------------------------------------------------
+
+
+class _ResettableStaticSky:
+    """Minimal StaticSkyEMA stand-in recording reset() calls."""
+
+    def __init__(self) -> None:
+        self.reset_calls = 0
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+class _ResettableRFI:
+    def __init__(self) -> None:
+        self.reset_warmup_calls = 0
+
+    def reset_warmup(self) -> None:
+        self.reset_warmup_calls += 1
+
+
+class _FakeMultiDM:
+    def __init__(self) -> None:
+        # Simulate dirtied sliding-window state after warmup blocks.
+        self._prev_vis_stokes_i = object()
+        self._prev_block_n = 7
+
+
+def _make_warmup_ctx() -> SimpleNamespace:
+    """A duck-typed ctx that _warmup_pipeline_jit can drive without a GPU."""
+    return SimpleNamespace(
+        transport_tx=NoOpTransportTx(),
+        stage2_fifo=NoOpStage2Fifo(),
+        injector=object(),  # sentinel; must be restored, detached during pass
+        static_sky=_ResettableStaticSky(),
+        rfi_flagger=_ResettableRFI(),
+        multi_dm_coarse_dm=_FakeMultiDM(),
+        device=torch.device("cpu"),
+    )
+
+
+def test_warmup_runs_n_blocks_and_neutralizes_side_effects(monkeypatch) -> None:
+    """The warmup pass must (a) call process_block exactly n_blocks times
+    with sequential block_n, (b) swap TX + FIFO for no-ops AND detach the
+    injector for the duration of the pass so no zero-cubes reach the search
+    nodes, and (c) restore all three originals afterwards.
+    """
+    ctx = _make_warmup_ctx()
+    orig_tx = ctx.transport_tx
+    orig_fifo = ctx.stage2_fifo
+    orig_injector = ctx.injector
+
+    seen: list = []
+
+    def _fake_process_block(page_arr, *, ctx, block_n):  # noqa: ANN001
+        # Capture what the hot path would see mid-warmup.
+        seen.append(
+            (block_n, type(ctx.transport_tx), type(ctx.stage2_fifo),
+             ctx.injector),
+        )
+        return None
+
+    monkeypatch.setattr(_cfi, "process_block", _fake_process_block)
+
+    _warmup_pipeline_jit(ctx, expected_fada_bytes=FADA_BYTES_PER_BLOCK,
+                         n_blocks=4)
+
+    # (a) exactly 4 calls, block_n 0,1,2,3
+    assert [s[0] for s in seen] == [0, 1, 2, 3]
+    # (b) during the pass: NoOp TX + FIFO, injector detached (None)
+    for _, tx_type, fifo_type, inj in seen:
+        assert tx_type is NoOpTransportTx
+        assert fifo_type is NoOpStage2Fifo
+        assert inj is None
+    # (c) originals restored after the pass
+    assert ctx.transport_tx is orig_tx
+    assert ctx.stage2_fifo is orig_fifo
+    assert ctx.injector is orig_injector
+
+
+def test_warmup_resets_detector_state(monkeypatch) -> None:
+    """After warming on dummy data the detector state must be reset so the
+    first real block starts cold-clean (no zero-block residue in the EMA /
+    RFI warmup counter / multi-DM sliding window)."""
+    ctx = _make_warmup_ctx()
+    monkeypatch.setattr(_cfi, "process_block",
+                        lambda page_arr, *, ctx, block_n: None)
+
+    _warmup_pipeline_jit(ctx, expected_fada_bytes=FADA_BYTES_PER_BLOCK,
+                         n_blocks=3)
+
+    assert ctx.static_sky.reset_calls == 1
+    assert ctx.rfi_flagger.reset_warmup_calls == 1
+    assert ctx.multi_dm_coarse_dm._prev_vis_stokes_i is None
+    assert ctx.multi_dm_coarse_dm._prev_block_n == -1
+
+
+def test_warmup_zero_blocks_is_noop(monkeypatch) -> None:
+    """n_blocks=0 (DSART_FAST_WARMUP_BLOCKS=0) disables the pass entirely:
+    process_block is never called and state is left untouched."""
+    ctx = _make_warmup_ctx()
+    calls = []
+    monkeypatch.setattr(
+        _cfi, "process_block",
+        lambda page_arr, *, ctx, block_n: calls.append(block_n),
+    )
+
+    _warmup_pipeline_jit(ctx, expected_fada_bytes=FADA_BYTES_PER_BLOCK,
+                         n_blocks=0)
+
+    assert calls == []
+    assert ctx.static_sky.reset_calls == 0
+    assert ctx.rfi_flagger.reset_warmup_calls == 0
+
+
+def test_warmup_real_process_block_runs_and_resets_state() -> None:
+    """End-to-end (CPU) smoke: drive the REAL process_block through the
+    warmup pass on random dummy data and confirm (a) it does not raise on
+    the constant/random fill, and (b) the real detector state is reset to
+    cold afterwards (static-sky cubes_seen back to 0, RFI warmup counter
+    back to 0). Guards the reset wiring against attribute drift."""
+    ctx = _build_test_context(_make_cfg())
+    # Pre-condition: fresh context, nothing seen yet.
+    if ctx.static_sky is not None:
+        assert int(ctx.static_sky.cubes_seen) == 0
+    if ctx.rfi_flagger is not None:
+        assert int(ctx.rfi_flagger.cubes_seen) == 0
+
+    _warmup_pipeline_jit(ctx, expected_fada_bytes=FADA_BYTES_PER_BLOCK,
+                         n_blocks=3)
+
+    # Post-condition: warmup ran (would have advanced counters) but reset
+    # put them back to cold, so the first real block starts clean.
+    if ctx.static_sky is not None:
+        assert int(ctx.static_sky.cubes_seen) == 0
+    if ctx.rfi_flagger is not None:
+        assert int(ctx.rfi_flagger.cubes_seen) == 0
+    if ctx.multi_dm_coarse_dm is not None:
+        assert ctx.multi_dm_coarse_dm._prev_vis_stokes_i is None
+        assert ctx.multi_dm_coarse_dm._prev_block_n == -1
+
+
+def test_warmup_restores_state_even_if_process_block_raises(monkeypatch) -> None:
+    """A crash inside process_block during warmup must NOT leak the NoOp
+    TX/FIFO into the live run -- the finally-block restores originals and
+    still resets detector state."""
+    ctx = _make_warmup_ctx()
+    orig_tx = ctx.transport_tx
+    orig_fifo = ctx.stage2_fifo
+    orig_injector = ctx.injector
+
+    def _boom(page_arr, *, ctx, block_n):  # noqa: ANN001
+        raise RuntimeError("simulated JIT failure")
+
+    monkeypatch.setattr(_cfi, "process_block", _boom)
+
+    # Must not propagate (warmup never sinks startup).
+    _warmup_pipeline_jit(ctx, expected_fada_bytes=FADA_BYTES_PER_BLOCK,
+                         n_blocks=4)
+
+    assert ctx.transport_tx is orig_tx
+    assert ctx.stage2_fifo is orig_fifo
+    assert ctx.injector is orig_injector
+    assert ctx.static_sky.reset_calls == 1
+    assert ctx.rfi_flagger.reset_warmup_calls == 1

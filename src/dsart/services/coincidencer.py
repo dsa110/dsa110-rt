@@ -287,6 +287,27 @@ class CoincidencerConfig:
     gal_dm_max_los_override: Optional[float] = None
     gal_dm_max_age_s: float = 600.0
 
+    # Startup trigger-grace window (M7.4 Phase 8c, 2026-05-29). For this
+    # many seconds after the FIRST C1 batch arrives, C2 evaluates
+    # coincidences as usual but SUPPRESSES the trigger action (no UDP
+    # dump fan-out, no log_only record, no plot) and counts the would-be
+    # triggers in ``triggers_startup_grace``. Rationale: the corr-side
+    # RFI bandpass-outlier excisor is bypassed during its cold-start
+    # warmup (``RFI_BANDPASS_WARMUP_CUBES_DEFAULT ≈ 1118 cubes ≈ 5·τ_B ≈
+    # 150 s`` at the canonical τ_B=30 s). During that window persistent
+    # narrowband RFI leaks into the gridded cubes and the search detector
+    # fires on it — but the warmup state is collapsed to a boolean
+    # validity mask at the search RX boundary, so those candidates reach
+    # C2 UNFLAGGED (NOISE_WARMUP only covers the search-side Layer-2 σ_k
+    # burn-in, ~4 s). This produced the observed ~3-minute post-restart
+    # burst (437 rows / 150 false log_only triggers in the first 3 min,
+    # then ~0/min steady state, with rows_warmup_drop=0). The grace
+    # window is keyed on the first batch (not C2 start) so it tracks the
+    # fleet's synchronized utc_start RFI warmup, and is set ONCE (never
+    # re-armed on reconnects). Default 180 s > the ~150 s RFI warmup.
+    # Set to 0 to disable.
+    startup_grace_s: float = 180.0
+
     @classmethod
     def from_yaml(cls, path: Path, *, override: Optional[Mapping[str, Any]] = None
                  ) -> "CoincidencerConfig":
@@ -361,6 +382,7 @@ class CoincidencerConfig:
             gal_dm_max_age_s=float(
                 coinc.get("gal_dm_max_age_s", 600.0),
             ),
+            startup_grace_s=float(coinc.get("startup_grace_s", 180.0)),
         )
 
 
@@ -546,6 +568,11 @@ class CoincidencerService:
             "components_evaluated": 0,
             "triggers_dump": 0,
             "triggers_suppressed": 0,
+            # M7.4 Phase 8c (2026-05-29): would-be triggers suppressed
+            # because they fired inside the startup grace window (corr
+            # RFI bandpass warmup leaks RFI -> false candidates that
+            # reach C2 unflagged). See CoincidencerConfig.startup_grace_s.
+            "triggers_startup_grace": 0,
             "triggers_log_only": 0,
             "broadcast_send_ok": 0,
             "broadcast_send_fail": 0,
@@ -556,6 +583,10 @@ class CoincidencerService:
         self._last_event_name: Optional[str] = None
         self._last_trigger_class: Optional[str] = None
         self._last_event_mjd: Optional[float] = None
+        # Monotonic time of the first C1 batch ever received; anchors the
+        # startup grace window (see CoincidencerConfig.startup_grace_s).
+        # None until the first batch arrives.
+        self._first_batch_mono: Optional[float] = None
         self._stop_event: Optional[asyncio.Event] = None
         self._tasks: List[asyncio.Task] = []
         self._started_unix: float = 0.0
@@ -653,6 +684,12 @@ class CoincidencerService:
         # refresh_if_due gates on its own cadence so this is a cheap
         # no-op when the cadence hasn't elapsed.
         self._inject_matcher.refresh_if_due()
+        # Anchor the startup grace window on the first batch we ever see
+        # (heartbeat or not). Keying on first-batch rather than C2 start
+        # tracks the fleet's synchronized utc_start RFI warmup even if C2
+        # was launched well before the search nodes. Set exactly once.
+        if self._first_batch_mono is None:
+            self._first_batch_mono = time.monotonic()
         if batch.header.n_candidates == 0:
             # Empty heartbeat; nothing to do for the graph but record.
             return
@@ -795,6 +832,15 @@ class CoincidencerService:
                 stats, members, tc, prev_holdoff=prev_holdoff,
             )
 
+    def _in_startup_grace(self) -> bool:
+        """True while inside the post-first-batch startup grace window
+        (see CoincidencerConfig.startup_grace_s). Disabled when
+        startup_grace_s <= 0 or before the first batch arrives."""
+        grace = self._config.startup_grace_s
+        if grace <= 0 or self._first_batch_mono is None:
+            return False
+        return (time.monotonic() - self._first_batch_mono) < grace
+
     async def _fire(
         self,
         stats: ClusterStats,
@@ -815,6 +861,32 @@ class CoincidencerService:
         """
         action = trigger_class.action
         now_utc = datetime.now(timezone.utc)
+
+        # M7.4 Phase 8c: startup grace window. During the corr-side RFI
+        # bandpass warmup (~150 s) un-excised RFI leaks into the cubes and
+        # the search detector fires on it, producing a burst of false
+        # coincident triggers that reach C2 UNFLAGGED. Suppress the
+        # trigger ACTION here (no dump fan-out / log_only record / plot /
+        # event-dir), count it, and roll back the per-class holdoff so the
+        # first genuine trigger after the window fires immediately.
+        if self._in_startup_grace():
+            self._counters["triggers_startup_grace"] += 1
+            if prev_holdoff is not None:
+                self._criteria.restore_last_fired_at(
+                    trigger_class.name, prev_holdoff,
+                )
+            elapsed = (
+                time.monotonic() - self._first_batch_mono
+                if self._first_batch_mono is not None else 0.0
+            )
+            _LOG.info(
+                "WOULD-FIRE class=%s action=%s n=%d snr_max=%.2f "
+                "dm_med=%.2f suppressed=startup_grace (%.0fs/%.0fs)",
+                trigger_class.name, action, stats.n_events,
+                stats.snr_max, stats.dm_median,
+                elapsed, self._config.startup_grace_s,
+            )
+            return
 
         if action == "dump_all_gpus":
             dumps_enabled = self._dumps_gate.enabled()
