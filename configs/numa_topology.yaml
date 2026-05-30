@@ -3,13 +3,16 @@ schema_version: 1
 hosts:
   h22:
     role_template: corr
-    notes: Prototypical corr node (§6.1).
+    notes: >-
+      Prototypical corr node (§6.1). CPU ranges verified against `lscpu` on
+      n03 (2 sockets x 10 cores x 2 threads = 40 logical): NUMA 0 = 0-9,20-29
+      and NUMA 1 = 10-19,30-39 (NOT a contiguous 0-15/16-31 split).
     numa:
       "0":
-        cpus: "0-15"
+        cpus: "0-9,20-29"
         dram_gb: 96
       "1":
-        cpus: "16-31"
+        cpus: "10-19,30-39"
         dram_gb: 96
     gpu:
       slow:
@@ -20,6 +23,15 @@ hosts:
         device_id: 1
         numa_node: 1
         canonical_role: corr_fast_compute
+    service_pinning:
+      # Consumed as documentation only; dsart_rt does not auto-apply this --
+      # the taskset mask is baked into each routine's `cmd` in
+      # configs/dsart_pipeline_rt.yaml. corr_slow holds NUMA-0 4-5,24-25;
+      # corr_fast is NUMA 1; merge is -c 12 (NUMA 1).
+      meridian_fringestop:
+        numa_node: 0                 # co-located with the bada ring + corr_slow writer
+        cpu_affinity: "8-9,28-29"     # 2 phys cores + HT siblings, away from corr_slow/capture
+        notes: casa38 process; sole bada reader (replaces bada_drain).
     nic:
       snap:
         - iface: eth_snap0

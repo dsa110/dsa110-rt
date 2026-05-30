@@ -103,6 +103,44 @@ def _collect_params(corr_setup_yaml: Path, config_mfs_yaml: Path) -> dict[str, A
     }
 
 
+def _collect_params_etcd() -> dict[str, Any]:
+    """Read the same fields from live etcd (``/cnf/corr`` + ``/cnf/fringe``).
+
+    This is the authoritative source: ``meridian_fringestop``'s
+    ``load_visibility_model`` asserts the cached table's ``antenna_order``,
+    ``nint``, ``tsamp``, ``outrigger_delays`` and ``refmjd`` all match what
+    ``parse_params`` derives from etcd -- so building the cache from etcd
+    guarantees a cache *hit* at runtime. The static yamls can drift from etcd;
+    prefer ``--from-etcd`` for the production bank.
+    """
+    from dsautils.dsa_store import DsaStore
+
+    store = DsaStore()
+    corr = store.get_dict("/cnf/corr")
+    fringe = store.get_dict("/cnf/fringe")
+    if not isinstance(corr, dict) or not isinstance(fringe, dict):
+        raise RuntimeError("/cnf/corr or /cnf/fringe missing/empty in etcd")
+
+    ant_od = corr["antenna_order"]
+    antenna_order = [int(v) for v in list(ant_od.values())]
+    nant = int(corr.get("nant", len(antenna_order)))
+    if len(antenna_order) != nant:
+        raise ValueError(
+            f"/cnf/corr nant={nant} disagrees with len(antenna_order)={len(antenna_order)}"
+        )
+
+    return {
+        "nant": nant,
+        "antenna_order": antenna_order,
+        "nint": int(fringe["nint"]),
+        "tsamp": float(corr["tsamp"]),
+        "outrigger_delays": {str(k): v for k, v in dict(fringe["outrigger_delays"]).items()},
+        "refmjd": float(fringe["refmjd"]),
+        "_corr_yaml": "etcd:/cnf/corr",
+        "_mfs_yaml": "etcd:/cnf/fringe",
+    }
+
+
 def _baseline_geometry(antenna_order: list[int], refmjd: float):
     """Compute baseline names + ITRF lengths once. Independent of pt_dec."""
     from dsamfs.utils import baseline_uvw
@@ -184,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="legacy dsa110-cnf/corr_setup.yaml (provides antenna_order, tsamp, nant)")
     p.add_argument("--config-mfs-yaml", type=Path, default=DEFAULT_CONFIG_MFS_YAML,
                    help="legacy dsa110-cnf/config_mfs.yaml (provides nint, outrigger_delays, refmjd)")
+    p.add_argument("--from-etcd", action="store_true",
+                   help="source params from live etcd (/cnf/corr + /cnf/fringe) instead of the "
+                        "static yamls. RECOMMENDED for the production bank: it guarantees the "
+                        "cached table matches meridian_fringestop's runtime asserts (cache hit).")
     p.add_argument("--force", action="store_true",
                    help="overwrite existing tables; default is to skip files that exist")
     p.add_argument("--dry-run", action="store_true",
@@ -197,14 +239,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     _check_env()
 
-    if not args.corr_setup_yaml.exists():
-        LOG.error("corr_setup yaml not found: %s", args.corr_setup_yaml)
-        return 2
-    if not args.config_mfs_yaml.exists():
-        LOG.error("config_mfs yaml not found: %s", args.config_mfs_yaml)
-        return 2
-
-    params = _collect_params(args.corr_setup_yaml, args.config_mfs_yaml)
+    if args.from_etcd:
+        params = _collect_params_etcd()
+    else:
+        if not args.corr_setup_yaml.exists():
+            LOG.error("corr_setup yaml not found: %s", args.corr_setup_yaml)
+            return 2
+        if not args.config_mfs_yaml.exists():
+            LOG.error("config_mfs yaml not found: %s", args.config_mfs_yaml)
+            return 2
+        params = _collect_params(args.corr_setup_yaml, args.config_mfs_yaml)
+    LOG.info("param source: corr=%s fringe=%s", params["_corr_yaml"], params["_mfs_yaml"])
     LOG.info("params: nant=%d nint=%d tsamp=%.6fs refmjd=%.6f outriggers=%d",
              params["nant"], params["nint"], params["tsamp"],
              params["refmjd"], len(params["outrigger_delays"]))

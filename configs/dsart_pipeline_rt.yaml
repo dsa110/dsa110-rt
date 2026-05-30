@@ -293,34 +293,37 @@ routines:
     env:
       CUDA_VISIBLE_DEVICES: "0"
 
-  # ---- bada_drain (always-on; reads bada -> /dev/null) -------------
-  # Without a bada reader, corr_slow fills bada (300 buffers ~= 40 s of
-  # slow-vis) and then deadlocks on the 301st write. That back-pressures
-  # merge (which can't free fada slots because corr_slow as a fada
-  # reader stops advancing) and the whole pipeline hangs. The legacy
-  # /cnf/pipeline (corr.py-compatible) has a dada_dbnull on bada
-  # always-on for exactly this reason: a "drain of last resort" that
-  # keeps the back-pressure chain unblocked even before the real bada
-  # consumers (meridian_fringestop, dsaX_nsfrb) come up.
+  # ---- meridian_fringestop (M7.4 Phase 9; reads bada -> UVH5) ------
+  # The legacy slow-vis fringe-stopper, run UNMODIFIED from the casa38
+  # env (dsamfs / dsa110-meridian-fs) via the operator-side wrapper
+  # tools/ops/meridian_fringestop_rt.py. It is the SINGLE bada reader
+  # (option A): it REPLACES the old `bada_drain` stand-in. bada is r:1,
+  # so corr_slow's back-pressure chain is held open by meridian itself.
   #
-  # Bug repro (M7.1 / n06, both 13:30 + 14:26 soaks of May 17, 2026):
-  #   corr_slow halts at n_in=301 n_out=301 -> emits
-  #   "ipcbuf_get_next_write: error decrement CLEAR" -> merge
-  #   silently stops emitting "written block N" syslog entries
-  #   shortly thereafter (n_blocks ≈ 360, ≈ corr_slow.r_buf + fada.nbufs)
-  #   -> corr_fast drains the buffered fada blocks (last n_in=368)
-  #   then blocks on getNextPage() with "ipcbuf_get_next_read: error
-  #   decrement FULL". Adding this routine fixes the deadlock at
-  #   the source. See M7-1-REPORT.md for the full diagnosis.
-  - name: bada_drain
-    # We use the in-tree Python drain ``dsart.services.dada_drain``
-    # instead of the legacy /usr/local/bin/dada_dbnull. See the
-    # module docstring for the three blocking bugs that disqualified
-    # dada_dbnull for our use (no -S without OBS_XFER, -X int overflow
-    # past ~2 GiB, default 64 MiB transfer + respawn jitter costing
-    # ~35 ms/block of corr_fast latency).
-    cmd: python
-    args: -u -m dsart.services.dada_drain --key bada --log-level INFO
+  # bada (300 buffers ~= 40 s of slow-vis) gives meridian ~40 s of
+  # headroom to absorb hdf5 file-close jitter; legacy sustained this
+  # cadence. CAUTION: dsart_rt does NOT auto-restart routines, so if
+  # meridian crashes corr_slow fills bada and deadlocks at the 301st
+  # write within ~40 s -- back-pressuring merge and stalling corr_fast
+  # (the M7.1/n06 deadlock). Watch /mon/corr_rt/<cn>/meridian_ready
+  # (the wrapper's heartbeat) and re-issue `start` to recover. The old
+  # dada_dbnull/dada_drain drain-of-last-resort is intentionally gone:
+  # legacy also ran meridian as the de-facto sole consumer.
+  #
+  # Env: casa38 python (cannot import dsart). taskset pins to NUMA 0
+  # cores 8-9,28-29 -- same socket as bada + corr_slow (NUMA 0 =
+  # 0-9,20-29 per lscpu on the corr nodes; corr_slow holds 4-5,24-25,
+  # corr_fast is on NUMA 1), away from capture/corr_slow. CUSTOMDEC is
+  # substituted by dsart_rt with the observing dec at `start`; the
+  # wrapper snaps it to the 0.25 deg fstable-cache grid and pins
+  # dsamfs.get_pointing_declination to the snapped value so the cached
+  # table (built per-dec by tools/build_fstable_cache.py --from-etcd)
+  # is a guaranteed hit. PREREQUISITE: the fstable cache must exist at
+  # /home/ubuntu/data/fstables for the observing dec, else the wrapper
+  # fails fast with the exact build command (no silent slow regen).
+  - name: meridian_fringestop
+    cmd: taskset
+    args: -c 8-9,28-29 /home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-rt/tools/ops/meridian_fringestop_rt.py --cn-id CN --pt-dec-deg CUSTOMDEC --fstable-cache /home/ubuntu/data/fstables --working-dir /home/ubuntu/data --output-dir /home/ubuntu/data --log-level INFO
 
   # ---- corr_fast (M3 production integration; reads fada -> TX) -----
   # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +
