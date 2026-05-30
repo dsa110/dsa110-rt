@@ -355,6 +355,14 @@ c1:
     host: lxd110h23.pro.pvt          # FQDN (search nodes can't resolve bare 'lxd110h23')
     port: 11500
   emit_queue_depth: 16
+  max_c1c2_width_samples: 16         # M7.6: drop candidates wider than this (boxcar samples)
+                                     # BEFORE transmitting to C2. Wide boxcars (>=32) are the
+                                     # on-sky false-positive floor (2026-05-29 analysis: 95-100%
+                                     # of spurious-candidate volume at width>=32); capping at 16
+                                     # strips that floor while preserving genuine narrow FRBs,
+                                     # keeps the C2 coincidence peak_event_specnum on fresh cubes
+                                     # (fixes too_late dump misses), and unloads the C1->C2 path.
+                                     # Set to 0 / remove to disable the filter (ship every survivor).
   dump_listener:
     bind_host: ""                    # filled per-host via --c1-bind-host above
     base_port: 11227                 # actual port = base_port + gpu_half

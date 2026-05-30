@@ -118,6 +118,18 @@ class C1EmitConfig:
     tcp_keepidle_s: int = 20
     tcp_keepintvl_s: int = 5
     tcp_keepcnt: int = 3
+    max_width_samples: Optional[int] = None
+    """Drop any candidate whose boxcar ``width_samples`` exceeds this
+    before it is transmitted to C2. ``None`` disables the filter (legacy:
+    every survivor is shipped). Wide boxcars (≥32) over-respond to
+    correlated sky / low-level broadband RFI and dominate the on-sky
+    false-positive floor (2026-05-29 analysis: 95-100 % of the spurious
+    candidate volume sat at width ≥ 32), saturating the C1→C2 path and
+    skewing the coincidence ``peak_event_specnum`` toward stale cubes
+    (→ ``too_late`` dump misses). Real FRBs are predominantly narrow, so a
+    width cap of 16 strips the false-positive floor while preserving
+    genuine narrow events. Configured via ``c1.max_c1c2_width_samples`` in
+    ``dsart_search_rt.yaml``."""
 
 
 # ---------------------------------------------------------------------------

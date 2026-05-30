@@ -150,6 +150,7 @@ class ProductionRxRingSource:
         fan_in_min_corrs: int = 1,
         attach_timeout_s: float = 30.0,
         n_active_dms_per_corr: int = 1,
+        max_realtime_lag_samples: Optional[int] = None,
         # M7.4 scatter wiring (all optional — when omitted the source
         # falls back to the M7.2 zero-stub cint8 stack path):
         owned_coarse_dm: int | None = None,
@@ -195,6 +196,24 @@ class ProductionRxRingSource:
         self._fan_in_min_corrs = int(fan_in_min_corrs)
         self._n_active_dms_per_corr = int(n_active_dms_per_corr)
         self._attach_timeout_s = float(attach_timeout_s)
+        # M7.6 real-time freshness re-seek bound. The overrun-protection
+        # ``safe_horizon`` (≈ t_buf − 4·t_det ≈ 32000 samples ≈ 250 cubes)
+        # is far wider than C2's coincidence window (5 s ≈ 37 cubes), so a
+        # half that anchors its cold-start boundary behind the live edge
+        # (observed 2026-05-29 on n01 gpu_half=0: a persistent ~14080-sample
+        # / ~14 s lag, well under safe_horizon) never re-seeks — and ships
+        # candidates whose event_specnum is ~14 s stale, landing outside
+        # C2's window (→ ~84 % C1→C2 drop) and skewing dump specnums to
+        # ``too_late`` cubes. When set, the consumer additionally re-seeks
+        # to the live edge whenever it lags more than this many samples,
+        # keeping every half within a few cubes of real time. ``None``
+        # preserves legacy (overrun-only) behaviour.
+        self._max_realtime_lag_samples = (
+            int(max_realtime_lag_samples)
+            if max_realtime_lag_samples is not None
+            and int(max_realtime_lag_samples) > 0
+            else None
+        )
 
         self._time_shift_table = compute_time_shift_search(
             coarse_dm_pc_cm3=coarse_dm_pc_cm3,
@@ -757,6 +776,20 @@ class ProductionRxRingSource:
             # of headroom — and trims peak ``n_overrun`` accumulation
             # before each seek.
             safe_horizon = t_buf_samples - 4 * self._t_det
+            # M7.6: tighten the re-seek trigger to keep this half within
+            # real time (within C2's coincidence window), not just within
+            # the ring's overrun horizon. ``effective_horizon`` is the
+            # smaller of the overrun-safe bound and the configured
+            # real-time lag bound, so a half that anchored behind the live
+            # edge at cold start (e.g. n01 gpu_half=0) snaps forward to the
+            # live edge on its next iteration instead of carrying a
+            # multi-second stale lag forever.
+            if self._max_realtime_lag_samples is not None:
+                effective_horizon = min(
+                    safe_horizon, self._max_realtime_lag_samples
+                )
+            else:
+                effective_horizon = safe_horizon
             consumer_lag = min_wseq_samples - last_cube_seq_boundary
             # Periodic instrumentation: log lag every 200 cubes so the
             # operator can verify the seek is firing in steady state.
@@ -775,7 +808,7 @@ class ProductionRxRingSource:
                     self._fan_in_min_corrs,
                     t_buf_samples,
                 )
-            if consumer_lag > safe_horizon:
+            if consumer_lag > effective_horizon:
                 # Seek consumer forward to producer-minus-2*t_det so the
                 # detector window has 2 cubes of headroom before the
                 # producer laps it.
@@ -789,12 +822,14 @@ class ProductionRxRingSource:
                     LOG.warning(
                         "ProductionRxRingSource: lag-recovery seek "
                         "from boundary %d → %d (consumer_lag=%d > "
-                        "safe_horizon=%d; min_wseq_samples=%d, "
-                        "t_buf_samples=%d, t_det=%d)",
+                        "effective_horizon=%d [safe=%d, rt=%s]; "
+                        "min_wseq_samples=%d, t_buf_samples=%d, t_det=%d)",
                         last_cube_seq_boundary,
                         seek_target,
                         consumer_lag,
+                        effective_horizon,
                         safe_horizon,
+                        self._max_realtime_lag_samples,
                         min_wseq_samples,
                         t_buf_samples,
                         self._t_det,

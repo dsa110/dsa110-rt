@@ -349,6 +349,9 @@ class SearchComputeService:
         self._c2_trigger: Optional[C2TriggerListener] = None
         self._c1_batches_submitted = 0
         self._c1_batches_dropped = 0
+        # M7.6: cumulative candidates dropped pre-transmit by the C1→C2
+        # width cap (c1.max_c1c2_width_samples).
+        self._c1_cands_dropped_width = 0
         # M7.4 Phase 6c: publish cube_ring window to etcd so the dsa_monitor
         # "Dump Now" button can pick an event_specnum that lands inside the
         # search-side retention window (corr_fast's block_specnum_start is in
@@ -563,6 +566,7 @@ class SearchComputeService:
             "cluster_timeouts": int(self._cluster_timeouts),
             "c1_batches_submitted": int(self._c1_batches_submitted),
             "c1_batches_dropped": int(self._c1_batches_dropped),
+            "c1_cands_dropped_width": int(self._c1_cands_dropped_width),
             "search_node_id": int(self._config.search_node_id),
             "gpu_half": int(self._config.gpu_half),
         }
@@ -987,6 +991,23 @@ class SearchComputeService:
         via the emitter's mon-points + the service's own counters."""
         assert self._c1_emit is not None
         cfg = self._config
+        # M7.6: drop candidates wider than the configured C1→C2 width cap
+        # BEFORE they are transmitted. Wide boxcars (≥32) are the on-sky
+        # false-positive floor; capping at ``max_width_samples`` keeps the
+        # coincidence peak_event_specnum on fresh cubes (fixes too_late
+        # dump misses) and unloads the C1→C2 path. Cube dump + retention
+        # are unaffected (this only gates what we ship to C2).
+        max_w = (
+            cfg.c1_emit_config.max_width_samples
+            if cfg.c1_emit_config is not None
+            else None
+        )
+        if max_w is not None and candidates:
+            kept = [c for c in candidates if int(c.width_samples) <= int(max_w)]
+            n_dropped = len(candidates) - len(kept)
+            if n_dropped:
+                self._c1_cands_dropped_width += n_dropped
+            candidates = kept
         rows = tuple(
             candidate_to_c1_row(c, geom=geom) for c in candidates
         )
@@ -1485,12 +1506,18 @@ def _build_search_config_from_yaml(
     c2_endpoint = c1.get("c2_endpoint", {}) or {}
     c1_emit_cfg: Optional[C1EmitConfig] = None
     if enable_c1 and c2_endpoint:
+        _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
         c1_emit_cfg = C1EmitConfig(
             host=str(c2_endpoint.get("host", "h23")),
             port=int(c2_endpoint.get("port", 11500)),
             search_node_id=int(search_node_id),
             gpu_half=int(gpu_half),
             queue_depth=int(c1.get("emit_queue_depth", 16)),
+            max_width_samples=(
+                int(_max_c1c2_width)
+                if _max_c1c2_width is not None and int(_max_c1c2_width) > 0
+                else None
+            ),
         )
     dump_listener_yaml = c1.get("dump_listener", {}) or {}
     c1_dump_root = (
@@ -1824,6 +1851,14 @@ async def _run_async(args: argparse.Namespace) -> int:
         fan_in_min_corrs=args.fan_in_min_corrs,
         attach_timeout_s=args.attach_timeout_s,
         n_active_dms_per_corr=args.n_active_dms_per_corr,
+        # M7.6: keep this half within ~real time of the producer so its
+        # candidate event_specnums land inside C2's coincidence window
+        # (fixes n01 gpu_half=0 stale-lag → C1→C2 drops + too_late dumps).
+        max_realtime_lag_samples=(
+            int(args.max_realtime_lag_cubes) * int(args.cube_cadence_samples)
+            if int(args.max_realtime_lag_cubes) > 0
+            else None
+        ),
         # M7.4 fix: in the M7.2 fallback path (no scatter wiring) the
         # validity walk in production_rx_ring uses this to know which
         # coarse_dm to expect data in. Without it the walker marks
@@ -1995,6 +2030,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "we emit a cube (default 16 = production "
                         "strict all-chgroups-required; M7.2 smoke "
                         "should pass 1 to allow partial fan-in).")
+    p.add_argument("--max-realtime-lag-cubes", type=int, default=20,
+                   help="M7.6: re-seek this half to the live edge "
+                        "whenever it lags the producer by more than this "
+                        "many cubes, so every gpu_half stays within C2's "
+                        "coincidence window (5 s ≈ 37 cubes). Fixes the "
+                        "persistent cold-start anchor lag (n01 gpu_half=0 "
+                        "~14 s behind) that pushed candidate event_specnums "
+                        "outside the C2 window and caused too_late dump "
+                        "misses. 0 disables (overrun-only legacy seek).")
     p.add_argument("--attach-timeout-s", type=float, default=30.0,
                    help="wait up to this long for search_rx to create "
                         "the shm ring before giving up (default 30s; "
