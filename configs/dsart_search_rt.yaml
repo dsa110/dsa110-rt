@@ -364,6 +364,20 @@ c1:
                                      # keeps the C2 coincidence peak_event_specnum on fresh cubes
                                      # (fixes too_late dump misses), and unloads the C1->C2 path.
                                      # Set to 0 / remove to disable the filter (ship every survivor).
+  max_candidates_per_block: 8        # M7.6 C1->C2 metering: cap candidates shipped per cube (block).
+                                     # When more than this survive the width cap in one cube, only the
+                                     # top-N are sent, ordered narrow-first (width asc) then bright-first
+                                     # (snr desc) -- e.g. if there are too many width-1/2 cands, keep the
+                                     # highest-SNR width-2 ones. Bounds the worst-case C1->C2 + C2 clustering
+                                     # load during RFI floods (the 2026-05-28 soak saw ~3300 cands/window
+                                     # lag C2 ~25s -> every dump trigger arrived too_late). With 8 halves x
+                                     # ~7.45 cubes/s ~= 60 batches/s into one C2, a cap of 8 bounds the fleet
+                                     # worst-case at ~480 rows/s while never biting normal load (a few
+                                     # cands/cube/half at snr_min) or a real burst (a handful of narrow
+                                     # cands near the peak). Per-half metering state is rolled up over 16
+                                     # blocks and published to /mon/search_rt/<cn>/compute/<half> -> influx
+                                     # -> grafana. Set to 0 / remove to disable (ship every survivor).
+                                     # RT-safe: selection is O(k log N) and skipped entirely under the cap.
   dump_listener:
     bind_host: ""                    # filled per-host via --c1-bind-host above
     base_port: 11227                 # actual port = base_port + gpu_half
@@ -449,6 +463,13 @@ coinc:
   csv_retention_hours: 48
   csv_dir_c1: /dataz/dsa110/operations/C1/cluster_output
   csv_dir_c2: /dataz/dsa110/operations/C2/cluster_output
+  write_c1_csv: false                # M7.6: per-candidate C1 hiplot CSV is opt-in. Off by default
+                                     # (every received candidate incl. late arrivals -> large + rarely
+                                     # useful). C2 cluster rows + the rolling 24h view below are the
+                                     # operator-facing hiplot surfaces. Flip true for C1 debugging.
+  c2_rolling_window_hours: 24        # M7.6: maintain a single c2_last24h.csv (concatenation of the recent
+                                     # hourly C2 CSVs) so the C2 hiplot always shows ~the last day in one
+                                     # experiment. Regenerated each housekeep tick. 0 disables.
   event_archive_root: /dataz/dsa110/candidates
   trigger_criteria_path: /home/ubuntu/vikram/dev/dsa110-rt/configs/c2_trigger_criteria.yaml
   dump_broadcast:

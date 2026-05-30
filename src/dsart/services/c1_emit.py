@@ -130,6 +130,25 @@ class C1EmitConfig:
     width cap of 16 strips the false-positive floor while preserving
     genuine narrow events. Configured via ``c1.max_c1c2_width_samples`` in
     ``dsart_search_rt.yaml``."""
+    max_candidates_per_block: Optional[int] = None
+    """C1→C2 metering: cap the number of candidates transmitted per cube
+    (block). ``None`` / ``<= 0`` disables (ship every width-survivor).
+
+    When more than this many candidates survive the width cap in a single
+    cube, only the top ``max_candidates_per_block`` are shipped, selected
+    narrow-first (``width_samples`` ascending) and then bright-first
+    (``snr`` descending) — i.e. if there are too many width-1/2 candidates
+    we keep the highest-SNR width-2 ones. This bounds the worst-case
+    C1→C2 + C2-clustering load during RFI floods (the 2026-05-28 soak saw
+    a single source emit ~3300 cands/window and lag C2 ~25 s, so every
+    dump trigger arrived ``too_late``). With 8 search halves × ~7.45
+    cubes/s ≈ 60 batches/s into one C2, a cap of 8 bounds the fleet
+    worst-case at ~480 rows/s while never biting normal load (a few
+    cands/cube/half at ``snr_min``) or a real burst (a handful of narrow
+    candidates near the peak). RT-safe: selection is O(k log N) via
+    ``heapq.nsmallest`` and is skipped entirely when under the cap.
+    Configured via ``c1.max_candidates_per_block`` in
+    ``dsart_search_rt.yaml``."""
 
 
 # ---------------------------------------------------------------------------

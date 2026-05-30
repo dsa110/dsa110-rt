@@ -10,7 +10,73 @@ from pathlib import Path
 
 import pytest
 
-from dsart.coinc.csv_rotator import RollingCsvWriter, rotation_key
+from dsart.coinc.csv_rotator import (
+    RollingCsvWriter,
+    concat_recent_hourly,
+    rotation_key,
+)
+
+
+def _write_hourly(dir_path: Path, prefix: str, key: str,
+                  rows: list[str]) -> Path:
+    p = dir_path / f"{prefix}_{key}.csv"
+    with p.open("w", encoding="utf-8") as f:
+        f.write("a,b\n")
+        for r in rows:
+            f.write(r + "\n")
+    return p
+
+
+def test_concat_recent_hourly_concatenates_window(tmp_path: Path) -> None:
+    now = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    # Three consecutive hours present; one older hour outside the window.
+    _write_hourly(tmp_path, "c2", "20260521_10", ["1,x"])
+    _write_hourly(tmp_path, "c2", "20260521_11", ["2,y"])
+    _write_hourly(tmp_path, "c2", "20260521_12", ["3,z"])
+    _write_hourly(tmp_path, "c2", "20260521_08", ["9,old"])  # out of 3h window
+    out = concat_recent_hourly(
+        tmp_path, "c2", now_utc=now, window_hours=3,
+        out_name="c2_last24h.csv",
+    )
+    assert out == tmp_path / "c2_last24h.csv"
+    lines = out.read_text().splitlines()
+    assert lines[0] == "a,b"            # single header
+    assert lines.count("a,b") == 1      # no repeated headers
+    assert lines[1:] == ["1,x", "2,y", "3,z"]  # oldest->newest, no old hour
+
+
+def test_concat_recent_hourly_skips_missing_hours(tmp_path: Path) -> None:
+    now = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    _write_hourly(tmp_path, "c2", "20260521_12", ["3,z"])  # only newest hour
+    out = concat_recent_hourly(
+        tmp_path, "c2", now_utc=now, window_hours=24,
+        out_name="c2_last24h.csv",
+    )
+    assert out is not None
+    assert out.read_text().splitlines()[1:] == ["3,z"]
+
+
+def test_concat_recent_hourly_no_inputs_returns_none(tmp_path: Path) -> None:
+    now = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    assert concat_recent_hourly(
+        tmp_path, "c2", now_utc=now, window_hours=24,
+        out_name="c2_last24h.csv",
+    ) is None
+
+
+def test_concat_recent_hourly_excludes_rolling_file_itself(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 5, 21, 12, 0, 0, tzinfo=timezone.utc)
+    _write_hourly(tmp_path, "c2", "20260521_12", ["3,z"])
+    # A stale rolling file must never be folded back into itself.
+    (tmp_path / "c2_last24h.csv").write_text("a,b\n999,stale\n")
+    out = concat_recent_hourly(
+        tmp_path, "c2", now_utc=now, window_hours=24,
+        out_name="c2_last24h.csv",
+    )
+    assert out is not None
+    assert "999,stale" not in out.read_text()
 
 
 def test_rotation_key_format() -> None:

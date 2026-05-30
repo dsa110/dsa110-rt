@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import heapq
 import logging
 import os
 import signal
@@ -86,6 +87,7 @@ from ..common.contracts import CubeDumpManifest
 from ..noise_norm.layer1 import Layer1State
 from .c1_emit import C1EmitConfig, C1TcpEmitter, candidate_to_c1_row
 from .search_ring_mon import SearchRingMonPublisher
+from .search_compute_mon import SearchComputeMonPublisher
 from .cube_pipeline import (
     CubePipeline,
     CubePipelineConfig,
@@ -97,8 +99,43 @@ from .rx_ring import CubeRingSlot, RxRingSource
 __all__ = [
     "SearchComputeConfig",
     "SearchComputeService",
+    "meter_candidates",
     "main",
 ]
+
+#: M7.6 C1→C2 metering: number of cubes (blocks) to average before
+#: publishing the metering rollup to etcd. 16 ≈ 2.1 s at 7.45 cubes/s,
+#: keeping the etcd/influx PUT rate low (per the operator's request).
+_METER_WINDOW_BLOCKS = 16
+
+
+def meter_candidates(
+    candidates: List[Candidate],
+    cap: Optional[int],
+) -> "tuple[List[Candidate], int]":
+    """C1→C2 metering selection: keep at most ``cap`` candidates, ordered
+    narrow-first (``width_samples`` ascending) then bright-first (``snr``
+    descending). Returns ``(kept, n_dropped)``.
+
+    ``cap`` of ``None`` / ``<= 0`` disables metering (returns the input
+    unchanged with ``n_dropped == 0``). RT-safe: when at or under the cap
+    we return immediately without sorting; above the cap we use
+    ``heapq.nsmallest`` (O(k log cap), cap ≪ k during RFI floods) so the
+    hot loop never pays an O(k log k) full sort. Selection is a no-op on
+    the candidates' identity/order when not over the cap, so cube dump +
+    retention (which run off the full candidate list upstream) are
+    unaffected — this only bounds what is shipped to C2."""
+    if cap is None or cap <= 0:
+        return candidates, 0
+    n = len(candidates)
+    if n <= cap:
+        return candidates, 0
+    kept = heapq.nsmallest(
+        int(cap),
+        candidates,
+        key=lambda c: (int(c.width_samples), -float(c.snr)),
+    )
+    return kept, n - len(kept)
 
 
 _LOG = logging.getLogger("dsart.services.search_compute")
@@ -352,6 +389,22 @@ class SearchComputeService:
         # M7.6: cumulative candidates dropped pre-transmit by the C1→C2
         # width cap (c1.max_c1c2_width_samples).
         self._c1_cands_dropped_width = 0
+        # M7.6: C1→C2 metering (cap candidates/block, narrow-then-bright).
+        # ``_c1_cands_dropped_meter`` is cumulative; the ``_meter_*`` window
+        # accumulators roll up every ``_METER_WINDOW_BLOCKS`` cubes into a
+        # single low-rate etcd publish (see ``_publish_c1_metering``).
+        self._c1_cands_dropped_meter = 0
+        self._meter_window_blocks = 0
+        self._meter_window_metered_blocks = 0
+        self._meter_window_dropped_sum = 0
+        self._meter_window_dropped_max = 0
+        self._meter_window_cands_sum = 0
+        self._compute_mon: Optional[SearchComputeMonPublisher] = (
+            SearchComputeMonPublisher(
+                search_node_id=int(config.search_node_id),
+                gpu_half=int(config.gpu_half),
+            )
+        )
         # M7.4 Phase 6c: publish cube_ring window to etcd so the dsa_monitor
         # "Dump Now" button can pick an event_specnum that lands inside the
         # search-side retention window (corr_fast's block_specnum_start is in
@@ -567,6 +620,7 @@ class SearchComputeService:
             "c1_batches_submitted": int(self._c1_batches_submitted),
             "c1_batches_dropped": int(self._c1_batches_dropped),
             "c1_cands_dropped_width": int(self._c1_cands_dropped_width),
+            "c1_cands_dropped_meter": int(self._c1_cands_dropped_meter),
             "search_node_id": int(self._config.search_node_id),
             "gpu_half": int(self._config.gpu_half),
         }
@@ -1008,6 +1062,30 @@ class SearchComputeService:
             if n_dropped:
                 self._c1_cands_dropped_width += n_dropped
             candidates = kept
+        # M7.6 C1→C2 metering: cap candidates/block, narrow-first
+        # (width asc) then bright-first (snr desc). RT-safe — we only pay
+        # the selection cost when the cap actually bites, and
+        # ``heapq.nsmallest`` is O(k log N) (N = cap ≪ k during floods).
+        cap = (
+            cfg.c1_emit_config.max_candidates_per_block
+            if cfg.c1_emit_config is not None
+            else None
+        )
+        n_cands_pre_meter = len(candidates)
+        candidates, n_metered = meter_candidates(candidates, cap)
+        if n_metered:
+            self._c1_cands_dropped_meter += n_metered
+        # Roll the metering state up over a window of blocks so the etcd
+        # publish (→ influx → grafana) stays at a low rate.
+        self._meter_window_blocks += 1
+        self._meter_window_cands_sum += n_cands_pre_meter
+        if n_metered:
+            self._meter_window_metered_blocks += 1
+            self._meter_window_dropped_sum += n_metered
+            if n_metered > self._meter_window_dropped_max:
+                self._meter_window_dropped_max = n_metered
+        if self._meter_window_blocks >= _METER_WINDOW_BLOCKS:
+            self._publish_c1_metering(int(cap or 0))
         rows = tuple(
             candidate_to_c1_row(c, geom=geom) for c in candidates
         )
@@ -1028,6 +1106,30 @@ class SearchComputeService:
             self._c1_batches_submitted += 1
         else:
             self._c1_batches_dropped += 1
+
+    def _publish_c1_metering(self, cap: int) -> None:
+        """Flush the C1→C2 metering window to etcd and reset accumulators.
+
+        Best-effort: a publish failure (etcd hiccup, dsautils missing) is
+        swallowed by the publisher so the search hot loop never blocks."""
+        pub = self._compute_mon
+        if pub is not None:
+            try:
+                pub.publish_metering(
+                    n_blocks=self._meter_window_blocks,
+                    n_metered_blocks=self._meter_window_metered_blocks,
+                    dropped_sum=self._meter_window_dropped_sum,
+                    dropped_max=self._meter_window_dropped_max,
+                    cands_sum=self._meter_window_cands_sum,
+                    cap=int(cap),
+                )
+            except Exception:  # noqa: BLE001 — mon must never sink the pipe
+                LOG.warning("C1 metering publish failed", exc_info=True)
+        self._meter_window_blocks = 0
+        self._meter_window_metered_blocks = 0
+        self._meter_window_dropped_sum = 0
+        self._meter_window_dropped_max = 0
+        self._meter_window_cands_sum = 0
 
     def _cube_dump_path(self, source: str, key_specnum: int) -> str:
         """Build the canonical per-cube NPZ path.
@@ -1507,6 +1609,7 @@ def _build_search_config_from_yaml(
     c1_emit_cfg: Optional[C1EmitConfig] = None
     if enable_c1 and c2_endpoint:
         _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
+        _max_cands_block = c1.get("max_candidates_per_block", None)
         c1_emit_cfg = C1EmitConfig(
             host=str(c2_endpoint.get("host", "h23")),
             port=int(c2_endpoint.get("port", 11500)),
@@ -1516,6 +1619,11 @@ def _build_search_config_from_yaml(
             max_width_samples=(
                 int(_max_c1c2_width)
                 if _max_c1c2_width is not None and int(_max_c1c2_width) > 0
+                else None
+            ),
+            max_candidates_per_block=(
+                int(_max_cands_block)
+                if _max_cands_block is not None and int(_max_cands_block) > 0
                 else None
             ),
         )

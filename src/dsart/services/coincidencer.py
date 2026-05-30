@@ -65,7 +65,7 @@ from ..coinc.archive import (
 from ..coinc.broadcast import TriggerBroadcaster
 from ..coinc.components import CoincidenceGraph
 from ..coinc.criteria import CriteriaEvaluator
-from ..coinc.csv_rotator import RollingCsvWriter
+from ..coinc.csv_rotator import RollingCsvWriter, concat_recent_hourly
 from ..coinc.inject_match import (
     DEFAULT_REGISTRY_REFRESH_S as INJECT_REGISTRY_REFRESH_S,
     InjectionMatcher,
@@ -246,6 +246,16 @@ class CoincidencerConfig:
     csv_retention_hours: int = 48
     csv_dir_c1: Path = Path("/dataz/dsa110/operations/C1/cluster_output")
     csv_dir_c2: Path = Path("/dataz/dsa110/operations/C2/cluster_output")
+    #: M7.6: write the per-candidate C1 hiplot CSV. Default off — the C1
+    #: row volume is large and rarely useful (every received candidate,
+    #: including late arrivals). C2 cluster rows + the rolling 24h C2 view
+    #: are the operator-facing hiplot surfaces.
+    write_c1_csv: bool = False
+    #: M7.6: hours of C2 cluster history to expose as a single rolling
+    #: ``c2_last24h.csv`` (concatenation of the recent hourly C2 CSVs) so
+    #: the C2 hiplot always shows ~the last day in one experiment. 0
+    #: disables the rolling file.
+    c2_rolling_window_hours: int = 24
     event_archive_root: Path = Path("/dataz/dsa110/candidates")
     trigger_criteria_path: Path = Path(
         "/home/ubuntu/vikram/dev/dsa110-rt/configs/c2_trigger_criteria.yaml"
@@ -335,6 +345,10 @@ class CoincidencerConfig:
                 "csv_dir_c2",
                 "/dataz/dsa110/operations/C2/cluster_output",
             )),
+            write_c1_csv=bool(coinc.get("write_c1_csv", False)),
+            c2_rolling_window_hours=int(
+                coinc.get("c2_rolling_window_hours", 24)
+            ),
             event_archive_root=Path(coinc.get(
                 "event_archive_root", "/dataz/dsa110/candidates",
             )),
@@ -491,9 +505,15 @@ class CoincidencerService:
         self._graph = CoincidenceGraph()
         self._criteria = CriteriaEvaluator(config.trigger_criteria_path)
 
-        self._c1_csv = RollingCsvWriter(
-            config.csv_dir_c1, "c1", C1_WINDOW_CSV_FIELDS,
-            retention_hours=config.csv_retention_hours,
+        # M7.6: the per-candidate C1 hiplot CSV is opt-in (large + rarely
+        # useful). Default off — see ``CoincidencerConfig.write_c1_csv``.
+        self._c1_csv: Optional[RollingCsvWriter] = (
+            RollingCsvWriter(
+                config.csv_dir_c1, "c1", C1_WINDOW_CSV_FIELDS,
+                retention_hours=config.csv_retention_hours,
+            )
+            if config.write_c1_csv
+            else None
         )
         self._c2_csv = RollingCsvWriter(
             config.csv_dir_c2, "c2", C2_CLUSTER_CSV_FIELDS,
@@ -803,14 +823,15 @@ class CoincidencerService:
         # csv is a faithful record of what hit the wire even when those
         # rows didn't make it into the in-window graph.
         now_utc = datetime.now(timezone.utc)
-        for e in new_entries:
-            self._c1_csv.append_row(
-                entry_to_csv_row(
-                    e, trigger="",
-                    inj_id=inj_id_by_entry_id.get(id(e), ""),
-                ),
-                now_utc=now_utc,
-            )
+        if self._c1_csv is not None:
+            for e in new_entries:
+                self._c1_csv.append_row(
+                    entry_to_csv_row(
+                        e, trigger="",
+                        inj_id=inj_id_by_entry_id.get(id(e), ""),
+                    ),
+                    now_utc=now_utc,
+                )
 
         # Walk only the components touched by this batch. ``survivors`` are
         # the new_entries that actually made it into the graph; passing
@@ -1014,14 +1035,28 @@ class CoincidencerService:
             while True:
                 await asyncio.sleep(60.0)
                 now_utc = datetime.now(timezone.utc)
-                rotated_c1 = self._c1_csv.maybe_rotate(now_utc)
-                rotated_c2 = self._c2_csv.maybe_rotate(now_utc)
-                self._counters["csv_rotations"] += int(rotated_c1) + int(rotated_c2)
-                removed = (
-                    self._c1_csv.housekeep(now_utc)
-                    + self._c2_csv.housekeep(now_utc)
-                )
+                rotated = int(self._c2_csv.maybe_rotate(now_utc))
+                removed = self._c2_csv.housekeep(now_utc)
+                if self._c1_csv is not None:
+                    rotated += int(self._c1_csv.maybe_rotate(now_utc))
+                    removed += self._c1_csv.housekeep(now_utc)
+                self._counters["csv_rotations"] += rotated
                 self._counters["csv_removed"] += removed
+                # M7.6: refresh the rolling ~24h C2 view (single file the
+                # C2 hiplot can pin) by concatenating the recent hourly
+                # C2 CSVs. Best-effort; never let it sink the loop.
+                win = int(self._config.c2_rolling_window_hours)
+                if win > 0:
+                    try:
+                        concat_recent_hourly(
+                            self._config.csv_dir_c2, "c2",
+                            now_utc=now_utc, window_hours=win,
+                            out_name="c2_last24h.csv",
+                        )
+                    except Exception:                          # noqa: BLE001
+                        _LOG.warning(
+                            "c2 rolling-24h concat failed", exc_info=True,
+                        )
         except asyncio.CancelledError:
             return
 

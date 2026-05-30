@@ -958,6 +958,68 @@ def test_capture_delta_field_appears_in_line_protocol():
 
 
 # ===========================================================================
+# 10b. make_search_compute_points (M7.6 C1→C2 metering rollup)
+# ===========================================================================
+
+
+SEARCH_COMPUTE_N02_G0 = {
+    "search_node_id": 2,
+    "gpu_half": 0,
+    "c1_metering_active": 1,
+    "c1_metering_frac": 0.25,
+    "c1_metered_dropped_mean": 1.25,
+    "c1_metered_dropped_max": 8,
+    "c1_cands_per_block_mean": 10.0,
+    "c1_max_candidates_per_block": 8,
+    "n_blocks": 16,
+    "ts_wall_unix": 1769000000.0,
+    "host": "lxd110h02",
+}
+
+
+def test_make_search_compute_points_fields_and_tags():
+    pts = pusher.make_search_compute_points(
+        SEARCH_COMPUTE_N02_G0, cn_id=2, gpu_half=0,
+        coarse_dm_owner={(2, 0): 4},
+    )
+    assert len(pts) == 1
+    p = pts[0]
+    assert p.measurement == "search_rt_compute"
+    assert p.tags["cn_id"] == "2"
+    assert p.tags["host"] == "lxd110h02"
+    assert p.tags["gpu_half"] == "0"
+    assert p.tags["coarse_dm"] == "4"
+    assert p.fields["c1_metering_active"] == 1
+    assert p.fields["c1_metering_frac"] == 0.25
+    assert p.fields["c1_metered_dropped_mean"] == 1.25
+    assert p.fields["c1_max_candidates_per_block"] == 8
+    assert p.timestamp_ns == int(1769000000.0 * 1e9)
+    # int fields encode with an 'i' suffix; floats without.
+    line = p.to_line()
+    assert "c1_metering_active=1i" in line
+    assert "c1_metering_frac=0.25" in line
+
+
+def test_make_search_compute_points_empty_payload_drops():
+    assert pusher.make_search_compute_points(
+        {"search_node_id": 2, "gpu_half": 0}, cn_id=2, gpu_half=0,
+    ) == []
+
+
+def test_route_search_compute_key():
+    svc = pusher.InfluxPusherService.__new__(pusher.InfluxPusherService)
+    svc._warned_unknown_keys = set()
+    svc.n_planned_key_hits = 0
+    svc.n_route_errors = 0
+    svc.coarse_dm_owner = {(2, 0): 4}
+    pts = svc._route("/mon/search_rt/2/compute/0", SEARCH_COMPUTE_N02_G0)
+    assert len(pts) == 1
+    assert pts[0].measurement == "search_rt_compute"
+    # The compute key must NOT fall through to the planned-key warn path.
+    assert svc.n_planned_key_hits == 0
+
+
+# ===========================================================================
 # 11. CLI argument parsing
 # ===========================================================================
 

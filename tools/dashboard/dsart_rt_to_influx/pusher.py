@@ -14,15 +14,17 @@ Key shapes covered (cardinalities per the M7.5 phase-B fleet):
   - ``/mon/corr_rt/<cn>/rfi``              → ``corr_rt_rfi`` (3/cn, per-pol fan-out)
   - ``/mon/service/corr_rt/<cn>``          → ``corr_rt_heartbeat``
   - ``/mon/search_rt/<cn>``                → ``search_rt_routine`` (3/cn)
+  - ``/mon/search_rt/<cn>/compute/<half>`` → ``search_rt_compute`` (2/cn,
+                                              M7.6 C1→C2 metering rollup)
   - ``/mon/service/search_rt/<cn>``        → ``search_rt_heartbeat``
   - ``/mon/c2/<host>``                     → ``c2_service`` + ``c2_inject_match``
                                               (1, h23 in production)
 
-The four ``search_rt`` per-routine keys called out as "planned" in
+The remaining ``search_rt`` per-routine keys called out as "planned" in
 ``M7.6-MONITOR-POINTS-SEARCH.md`` §7 (``/mon/search_rt/<cn>/rx``,
-``.../compute/<half>``, ``.../cands``) are matched but currently
-**raise** at routing time so the pusher fails loudly the day a
-publisher lands without a corresponding pusher update.
+``.../cands``) are matched but currently **raise** at routing time so the
+pusher fails loudly the day a publisher lands without a corresponding
+pusher update.
 
 Side-channel behaviour mandated by the spec docs:
 
@@ -785,6 +787,71 @@ def make_rfi_points(
     return out
 
 
+#: Numeric fields lifted off the ``/mon/search_rt/<cn>/compute/<g>``
+#: payload onto the ``search_rt_compute`` measurement. ``c1_metering_*``
+#: is the M7.6 C1→C2 metering rollup (16-block average).
+_SEARCH_COMPUTE_INT_FIELDS = (
+    "c1_metering_active",
+    "c1_metered_dropped_max",
+    "c1_max_candidates_per_block",
+    "n_blocks",
+)
+_SEARCH_COMPUTE_FLOAT_FIELDS = (
+    "c1_metering_frac",
+    "c1_metered_dropped_mean",
+    "c1_cands_per_block_mean",
+)
+
+
+def make_search_compute_points(
+    payload: Dict[str, Any], *, cn_id: int, gpu_half: int,
+    coarse_dm_owner: Optional[Dict[Tuple[int, int], int]] = None,
+) -> List[Point]:
+    """Project ``/mon/search_rt/<cn>/compute/<g>`` into one
+    ``search_rt_compute`` Point (per search half).
+
+    Carries the M7.6 C1→C2 metering rollup so Grafana can show, at a
+    glance, whether *any* search half is shedding candidates
+    (``max(c1_metering_active)`` across halves) plus how hard
+    (``c1_metered_dropped_mean``). Tagged ``cn_id, host, gpu_half`` and,
+    when known, the owned ``coarse_dm`` trial (mirrors
+    ``make_routine_points``)."""
+    host = str(payload.get("host") or _host_for_cn(cn_id))
+    ts_unix = payload.get("ts_wall_unix")
+    ts_ns = (
+        int(float(ts_unix) * 1e9)
+        if isinstance(ts_unix, (int, float)) and not isinstance(ts_unix, bool)
+        else int(time.time() * 1e9)
+    )
+    tags: Dict[str, str] = {
+        "cn_id": str(int(cn_id)),
+        "host": host,
+        "gpu_half": str(int(gpu_half)),
+    }
+    if coarse_dm_owner is not None:
+        cd = coarse_dm_owner.get((int(cn_id), int(gpu_half)))
+        if cd is not None:
+            tags["coarse_dm"] = str(int(cd))
+
+    fields: Dict[str, Any] = {}
+    for k in _SEARCH_COMPUTE_INT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, bool):
+            fields[k] = int(v)
+        elif isinstance(v, (int, float)):
+            fields[k] = int(v)
+    for k in _SEARCH_COMPUTE_FLOAT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[k] = float(v)
+    if not fields:
+        return []
+    return [Point(
+        measurement="search_rt_compute",
+        tags=tags, fields=fields, timestamp_ns=ts_ns,
+    )]
+
+
 def make_c2_points(
     payload: Dict[str, Any], *, host: str,
 ) -> List[Point]:
@@ -1143,11 +1210,18 @@ class InfluxPusherService:
             if m:
                 return make_c2_points(payload, host=str(m.group(1)))
 
+            m = KEY_SEARCH_COMPUTE.match(key)
+            if m:
+                return make_search_compute_points(
+                    payload, cn_id=int(m.group(1)), gpu_half=int(m.group(2)),
+                    coarse_dm_owner=self.coarse_dm_owner,
+                )
+
             # Planned but not-yet-defined: per search doc §7.4 we want
             # to fail loudly here so a new publisher landing on the
             # fleet doesn't silently drop on the floor.  Log-once per
             # key to avoid log spam.
-            if (KEY_SEARCH_RX.match(key) or KEY_SEARCH_COMPUTE.match(key)
+            if (KEY_SEARCH_RX.match(key)
                     or KEY_SEARCH_CANDS.match(key)):
                 self.n_planned_key_hits += 1
                 if key not in self._warned_unknown_keys:

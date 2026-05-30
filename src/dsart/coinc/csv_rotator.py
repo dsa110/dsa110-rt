@@ -29,10 +29,89 @@ from typing import List, Mapping, Optional, Sequence
 __all__ = [
     "RollingCsvWriter",
     "rotation_key",
+    "concat_recent_hourly",
 ]
 
 
 _LOG = logging.getLogger("dsart.coinc.csv_rotator")
+
+
+def concat_recent_hourly(
+    dir_path: Path,
+    prefix: str,
+    *,
+    now_utc: datetime,
+    window_hours: int,
+    out_name: str,
+) -> Optional[Path]:
+    """Concatenate the last ``window_hours`` hourly ``${prefix}_*.csv``
+    files into a single ``out_name`` so a hiplot experiment can show a
+    rolling window in one file.
+
+    Selection is by the ``${prefix}_YYYYMMDD_HH.csv`` rotation key (UTC
+    hour buckets), not mtime, so a quiet hour with no rows is still
+    represented (its file simply may not exist). The output is written
+    atomically (``out_name.tmp`` → rename) with a single header row
+    (taken from the newest contributing file, else the writer that owns
+    this prefix). ``out_name`` itself is skipped as an input so we never
+    fold the rolling file into itself.
+
+    Returns the output path on success, or ``None`` if there were no
+    contributing files (the stale rolling file, if any, is left in place).
+    """
+    if now_utc.tzinfo is None or now_utc.utcoffset() != timedelta(0):
+        raise ValueError("now_utc must be tz-aware UTC")
+    if window_hours <= 0:
+        raise ValueError(f"window_hours={window_hours} must be > 0")
+
+    d = Path(dir_path)
+    # Build the set of candidate hourly files for the window, oldest→newest.
+    keys = [
+        rotation_key(now_utc - timedelta(hours=h))
+        for h in range(window_hours - 1, -1, -1)
+    ]
+    paths: List[Path] = []
+    for k in keys:
+        p = d / f"{prefix}_{k}.csv"
+        if p.name == out_name:
+            continue
+        if p.is_file():
+            paths.append(p)
+    if not paths:
+        return None
+
+    out_path = d / out_name
+    tmp_path = d / f"{out_name}.tmp"
+    header: Optional[str] = None
+    try:
+        with tmp_path.open("w", encoding="utf-8") as out:
+            for p in paths:
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                except OSError as exc:
+                    _LOG.warning("concat_recent_hourly: read %s failed: %s",
+                                 p, exc)
+                    continue
+                if not lines:
+                    continue
+                if header is None:
+                    header = lines[0]
+                    out.write(header)
+                # Skip each file's own header row; append data rows only.
+                body = lines[1:] if lines and lines[0] == header else lines
+                for ln in body:
+                    out.write(ln)
+        tmp_path.replace(out_path)
+    except OSError as exc:
+        _LOG.warning("concat_recent_hourly: write %s failed: %s",
+                     out_path, exc)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return out_path
 
 
 def rotation_key(now_utc: datetime) -> str:

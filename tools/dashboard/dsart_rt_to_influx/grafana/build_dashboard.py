@@ -479,6 +479,39 @@ def panels() -> List[Dict[str, Any]]:
         description="Number of routines reporting alive per search node. Healthy: 3.",
     ))
     _bump_y(6)
+    out.append(graph_panel(
+        title="C1->C2 metering active -- per search half (0=ok, 1=shedding)",
+        raw_query=(
+            'SELECT max("c1_metering_active") FROM "search_rt_compute" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="short", y_min=0, y_max=1.1, legend_right=True,
+        description=(
+            "M7.6 C1->C2 metering. 1 = this search half hit the per-block "
+            "candidate cap (c1.max_candidates_per_block) and shed the "
+            "lowest-priority candidates (widest, then faintest) in the last "
+            "16-block window to protect the C1->C2 path + C2 clustering. "
+            "Sustained 1 on any half => RFI flood or cap set too low."
+        ),
+    ))
+    out.append(graph_panel(
+        title="C1->C2 metered drop -- mean cands/block shed per half",
+        raw_query=(
+            'SELECT mean("c1_metered_dropped_mean") FROM "search_rt_compute" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Mean number of candidates dropped per block by the C1->C2 "
+            "metering cap (16-block average). 0 = cap never bit. Rising "
+            "values quantify how hard a half is shedding."
+        ),
+    ))
+    _bump_y(7)
 
     out.append(row_panel("D. Capture pipeline (link rate + pps)"))
     _bump_y(1)

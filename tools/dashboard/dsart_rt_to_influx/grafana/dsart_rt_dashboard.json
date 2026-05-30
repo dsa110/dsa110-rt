@@ -1259,26 +1259,188 @@
     },
     {
       "id": 18,
+      "type": "graph",
+      "title": "C1->C2 metering active -- per search half (0=ok, 1=shedding)",
+      "datasource": "InfluxDB",
+      "description": "M7.6 C1->C2 metering. 1 = this search half hit the per-block candidate cap (c1.max_candidates_per_block) and shed the lowest-priority candidates (widest, then faintest) in the last 16-block window to protect the C1->C2 path + C2 clustering. Sustained 1 on any half => RFI flood or cap set too low.",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id g$tag_gpu_half",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT max(\"c1_metering_active\") FROM \"search_rt_compute\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"gpu_half\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": "1.1",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 19,
+      "type": "graph",
+      "title": "C1->C2 metered drop -- mean cands/block shed per half",
+      "datasource": "InfluxDB",
+      "description": "Mean number of candidates dropped per block by the C1->C2 metering cap (16-block average). 0 = cap never bit. Rising values quantify how hard a half is shedding.",
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "alias": "cn $tag_cn_id g$tag_gpu_half",
+          "policy": "default",
+          "resultFormat": "time_series",
+          "orderByTime": "ASC",
+          "rawQuery": true,
+          "query": "SELECT mean(\"c1_metered_dropped_mean\") FROM \"search_rt_compute\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"gpu_half\" fill(null)",
+          "tags": [],
+          "groupBy": [],
+          "select": [],
+          "measurement": ""
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": "0",
+          "max": null,
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "min": null,
+          "max": null,
+          "show": true
+        }
+      ],
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "rightSide": true,
+        "show": true,
+        "total": false,
+        "values": false,
+        "hideEmpty": true,
+        "hideZero": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "points": false,
+      "pointradius": 2,
+      "fill": 1,
+      "stack": false,
+      "nullPointMode": "null",
+      "renderer": "flot",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null
+    },
+    {
+      "id": 20,
       "type": "row",
       "title": "D. Capture pipeline (link rate + pps)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 40,
+        "y": 47,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 19,
+      "id": 21,
       "type": "graph",
       "title": "Capture rate (Gb/s) per (cn,port)",
       "datasource": "InfluxDB",
       "description": "Wire-rate per UDP capture port. Healthy ~9.6 Gb/s per port.",
       "gridPos": {
         "x": 0,
-        "y": 41,
+        "y": 48,
         "w": 12,
         "h": 7
       },
@@ -1352,14 +1514,14 @@
       "timeShift": null
     },
     {
-      "id": 20,
+      "id": 22,
       "type": "graph",
       "title": "Recv packet rate (pps) per (cn,port)",
       "datasource": "InfluxDB",
       "description": "Per-port received packet rate from cumulative counter.",
       "gridPos": {
         "x": 12,
-        "y": 41,
+        "y": 48,
         "w": 12,
         "h": 7
       },
@@ -1433,27 +1595,27 @@
       "timeShift": null
     },
     {
-      "id": 21,
+      "id": 23,
       "type": "row",
       "title": "E. Capture integrity (drops, arm state, errors)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 48,
+        "y": 55,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 22,
+      "id": 24,
       "type": "graph",
       "title": "Kernel drop rate (pps) per (cn,port) -- target 0",
       "datasource": "InfluxDB",
       "description": "Per-port kernel-level packet drops from /proc/net/udp via n_dropped_kernel cumulative counter. Sustained non-zero = SO_RCVBUF (512 MiB) exhausted.",
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 56,
         "w": 12,
         "h": 7
       },
@@ -1527,14 +1689,14 @@
       "timeShift": null
     },
     {
-      "id": 23,
+      "id": 25,
       "type": "graph",
       "title": "Dropped payload rate (MB/s) per (cn,port)",
       "datasource": "InfluxDB",
       "description": "Pre-derived combined drop rate (kernel + payload + too-late). Healthy <1 MB/s; warn >10; page >50.",
       "gridPos": {
         "x": 12,
-        "y": 49,
+        "y": 56,
         "w": 12,
         "h": 7
       },
@@ -1608,14 +1770,14 @@
       "timeShift": null
     },
     {
-      "id": 24,
+      "id": 26,
       "type": "graph",
       "title": "Capture degraded count (per cn,port) -- stacked",
       "datasource": "InfluxDB",
       "description": "Publishes that came in with degraded=1. Should be flat zero in normal ops.",
       "gridPos": {
         "x": 0,
-        "y": 56,
+        "y": 63,
         "w": 12,
         "h": 6
       },
@@ -1689,14 +1851,14 @@
       "timeShift": null
     },
     {
-      "id": 25,
+      "id": 27,
       "type": "graph",
       "title": "Capture arm_state_int (per cn,port)",
       "datasource": "InfluxDB",
       "description": "Integer encoding of arm_state (CTRL_RUN=2 in normal ops; 0=OFF, 1=ARMING, 3=DISARMING).",
       "gridPos": {
         "x": 12,
-        "y": 56,
+        "y": 63,
         "w": 12,
         "h": 6
       },
@@ -1770,14 +1932,14 @@
       "timeShift": null
     },
     {
-      "id": 26,
+      "id": 28,
       "type": "graph",
       "title": "Cumulative n_wrong_size + n_recv_errors (per cn,port)",
       "datasource": "InfluxDB",
       "description": "Cumulative malformed UDP frames + recv errors since capture binary start. Both should be flat zero; growth = page.",
       "gridPos": {
         "x": 0,
-        "y": 62,
+        "y": 69,
         "w": 12,
         "h": 6
       },
@@ -1864,14 +2026,14 @@
       "timeShift": null
     },
     {
-      "id": 27,
+      "id": 29,
       "type": "graph",
       "title": "Cumulative n_seq_skipped + n_too_late (per cn,port)",
       "datasource": "InfluxDB",
       "description": "Cumulative seq-no gaps and after-block-close arrivals. Small slow growth normal; sudden jumps = wire congestion.",
       "gridPos": {
         "x": 12,
-        "y": 62,
+        "y": 69,
         "w": 12,
         "h": 6
       },
@@ -1958,27 +2120,27 @@
       "timeShift": null
     },
     {
-      "id": 28,
+      "id": 30,
       "type": "row",
       "title": "F. Cube cadence (block writes + specnum tracking)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 68,
+        "y": 75,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 29,
+      "id": 31,
       "type": "graph",
       "title": "Block-write rate (blocks/s) per (cn,port) -- target ~7.45 Hz",
       "datasource": "InfluxDB",
       "description": "Cumulative-derivative block-write rate per port. Production cadence 7.45 Hz; sustained <7.0 = back-pressure.",
       "gridPos": {
         "x": 0,
-        "y": 69,
+        "y": 76,
         "w": 12,
         "h": 7
       },
@@ -2067,14 +2229,14 @@
       "timeShift": null
     },
     {
-      "id": 30,
+      "id": 32,
       "type": "graph",
       "title": "Fleet specnum spread -- max-min(last_seq_no)",
       "datasource": "InfluxDB",
       "description": "Per-bucket max-min of last_seq_no across the 32 capture instances. Healthy in steady state <~30; >300 means one node is far behind.",
       "gridPos": {
         "x": 12,
-        "y": 69,
+        "y": 76,
         "w": 12,
         "h": 7
       },
@@ -2148,26 +2310,26 @@
       "timeShift": null
     },
     {
-      "id": 31,
+      "id": 33,
       "type": "row",
       "title": "G. PSRDADA buffer health",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 76,
+        "y": 83,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 32,
+      "id": 34,
       "type": "text",
       "title": "",
       "datasource": null,
       "gridPos": {
         "x": 0,
-        "y": 77,
+        "y": 84,
         "w": 24,
         "h": 6
       },
@@ -2176,14 +2338,14 @@
       "links": []
     },
     {
-      "id": 33,
+      "id": 35,
       "type": "graph",
       "title": "PSRDADA fill fraction -- fleet mean per buffer (nfull/nbufs)",
       "datasource": "InfluxDB",
       "description": "Fraction of ring currently holding unread data, averaged across 16 corr nodes per buffer (dada, eada, fada, bada). Sustained >0.85 = consumer falling behind.",
       "gridPos": {
         "x": 0,
-        "y": 83,
+        "y": 90,
         "w": 12,
         "h": 7
       },
@@ -2257,14 +2419,14 @@
       "timeShift": null
     },
     {
-      "id": 34,
+      "id": 36,
       "type": "graph",
       "title": "PSRDADA free_blocks per (cn, buffer)",
       "datasource": "InfluxDB",
       "description": "free_blocks = nbufs - nfull. Dropping toward 0 = back-pressure alarm.",
       "gridPos": {
         "x": 12,
-        "y": 83,
+        "y": 90,
         "w": 12,
         "h": 7
       },
@@ -2338,14 +2500,14 @@
       "timeShift": null
     },
     {
-      "id": 35,
+      "id": 37,
       "type": "graph",
       "title": "PSRDADA nfull per cn -- fada (corr->search merge)",
       "datasource": "InfluxDB",
       "description": "fada blocks currently full per corr node. Sustained near nbufs (=70) means search-side pipeline is backed up.",
       "gridPos": {
         "x": 0,
-        "y": 90,
+        "y": 97,
         "w": 12,
         "h": 7
       },
@@ -2419,14 +2581,14 @@
       "timeShift": null
     },
     {
-      "id": 36,
+      "id": 38,
       "type": "graph",
       "title": "PSRDADA nfull per cn -- dada / eada (SNAP capture)",
       "datasource": "InfluxDB",
       "description": "Per-port SNAP capture rings (20 blocks each). >10 = merge stage falling behind.",
       "gridPos": {
         "x": 12,
-        "y": 90,
+        "y": 97,
         "w": 12,
         "h": 7
       },
@@ -2500,14 +2662,14 @@
       "timeShift": null
     },
     {
-      "id": 37,
+      "id": 39,
       "type": "graph",
       "title": "PSRDADA n_written rate (blocks/s) per (cn, buffer)",
       "datasource": "InfluxDB",
       "description": "dada/eada nominal ~9.6 blocks/s, fada/bada ~7.45 blocks/s. fada below 7 = search-side gate alarm.",
       "gridPos": {
         "x": 0,
-        "y": 97,
+        "y": 104,
         "w": 12,
         "h": 7
       },
@@ -2581,14 +2743,14 @@
       "timeShift": null
     },
     {
-      "id": 38,
+      "id": 40,
       "type": "graph",
       "title": "PSRDADA n_read rate (blocks/s) per (cn, buffer)",
       "datasource": "InfluxDB",
       "description": "Block-read rate (consumer side). Steady-state should match n_written; persistent gap means reader is slower than writer.",
       "gridPos": {
         "x": 12,
-        "y": 97,
+        "y": 104,
         "w": 12,
         "h": 7
       },
@@ -2662,27 +2824,27 @@
       "timeShift": null
     },
     {
-      "id": 39,
+      "id": 41,
       "type": "row",
       "title": "H. RFI flagger summary",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 104,
+        "y": 111,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 40,
+      "id": 42,
       "type": "graph",
       "title": "RFI total_flag_fraction -- fleet mean per pol",
       "datasource": "InfluxDB",
       "description": "Mean fraction of (chan, time) cells flagged in the RFI rollup, averaged across the 16 cn.",
       "gridPos": {
         "x": 0,
-        "y": 105,
+        "y": 112,
         "w": 12,
         "h": 7
       },
@@ -2756,14 +2918,14 @@
       "timeShift": null
     },
     {
-      "id": 41,
+      "id": 43,
       "type": "graph",
       "title": "RFI total_flag_fraction per cn (pol=both)",
       "datasource": "InfluxDB",
       "description": "Same metric broken out per cn (combined-pol view), to spot nodes seeing much more RFI than the fleet.",
       "gridPos": {
         "x": 12,
-        "y": 105,
+        "y": 112,
         "w": 12,
         "h": 7
       },
@@ -2837,14 +2999,14 @@
       "timeShift": null
     },
     {
-      "id": 42,
+      "id": 44,
       "type": "graph",
       "title": "RFI bandpass_channel_fraction -- fleet mean (per pol)",
       "datasource": "InfluxDB",
       "description": "Fraction of channels flagged by the bandpass-outlier detector. Multiply by 96 for per-cn channel count after 4x freq-downsample.",
       "gridPos": {
         "x": 0,
-        "y": 112,
+        "y": 119,
         "w": 12,
         "h": 6
       },
@@ -2918,14 +3080,14 @@
       "timeShift": null
     },
     {
-      "id": 43,
+      "id": 45,
       "type": "graph",
       "title": "RFI ant_fraction_flagged -- fleet mean (per pol)",
       "datasource": "InfluxDB",
       "description": "Fraction of antennas classified as whole-antenna-bad. Multiply by 96 for per-cn count.",
       "gridPos": {
         "x": 12,
-        "y": 112,
+        "y": 119,
         "w": 12,
         "h": 6
       },
@@ -2999,14 +3161,14 @@
       "timeShift": null
     },
     {
-      "id": 44,
+      "id": 46,
       "type": "graph",
       "title": "RFI per-detector breakdown -- fleet mean (pol=both)",
       "datasource": "InfluxDB",
       "description": "Per-detector flag fractions overlaid. Detectors are non-exclusive; total_flag_fraction is the OR (<= sum).",
       "gridPos": {
         "x": 0,
-        "y": 118,
+        "y": 125,
         "w": 12,
         "h": 7
       },
@@ -3132,14 +3294,14 @@
       "timeShift": null
     },
     {
-      "id": 45,
+      "id": 47,
       "type": "graph",
       "title": "RFI publish age (s) -- per cn (pol=both)",
       "datasource": "InfluxDB",
       "description": "age_s = publish_unix - time_unix. Healthy <=~2.2 s. Spikes mean rfi_monitor_export is behind the corr_fast shm producer.",
       "gridPos": {
         "x": 12,
-        "y": 118,
+        "y": 125,
         "w": 12,
         "h": 7
       },
@@ -3213,27 +3375,27 @@
       "timeShift": null
     },
     {
-      "id": 46,
+      "id": 48,
       "type": "row",
       "title": "I. C1 batch receiver (C2 ingress on h23)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 125,
+        "y": 132,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 47,
+      "id": 49,
       "type": "singlestat",
       "title": "C1 batch receiver -- connections_open",
       "datasource": "InfluxDB",
       "description": "TCP connections to C2 batch receiver. Expected = 1 per search-compute half = 8 in phase-B.",
       "gridPos": {
         "x": 0,
-        "y": 126,
+        "y": 133,
         "w": 6,
         "h": 4
       },
@@ -3316,14 +3478,14 @@
       "links": []
     },
     {
-      "id": 48,
+      "id": 50,
       "type": "singlestat",
       "title": "C1 batches OK (cumulative; includes heartbeats)",
       "datasource": "InfluxDB",
       "description": "All well-formed C1 batches decoded since C2 start, INCLUDING `n_candidates=0` heartbeats. Restart resets. In a quiet sky almost every batch is a heartbeat -- see Section J for the heartbeat vs candidate split.",
       "gridPos": {
         "x": 6,
-        "y": 126,
+        "y": 133,
         "w": 6,
         "h": 4
       },
@@ -3406,14 +3568,14 @@
       "links": []
     },
     {
-      "id": 49,
+      "id": 51,
       "type": "singlestat",
       "title": "C1 batches malformed (bad_schema + torn + bad_batch)",
       "datasource": "InfluxDB",
       "description": "Should be 0 in steady state. Growth = producer-side schema bug or socket corruption.",
       "gridPos": {
         "x": 12,
-        "y": 126,
+        "y": 133,
         "w": 6,
         "h": 4
       },
@@ -3496,14 +3658,14 @@
       "links": []
     },
     {
-      "id": 50,
+      "id": 52,
       "type": "singlestat",
       "title": "C1 bytes received (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative bytes pulled off the C1 sockets since C2 service start.",
       "gridPos": {
         "x": 18,
-        "y": 126,
+        "y": 133,
         "w": 6,
         "h": 4
       },
@@ -3586,14 +3748,14 @@
       "links": []
     },
     {
-      "id": 51,
+      "id": 53,
       "type": "graph",
       "title": "C1 batch rate (batches/s) into C2",
       "datasource": "InfluxDB",
       "description": "Rate of well-formed C1 batches into C2. Matches search-side detector cadence in normal ops.",
       "gridPos": {
         "x": 0,
-        "y": 130,
+        "y": 137,
         "w": 12,
         "h": 6
       },
@@ -3667,14 +3829,14 @@
       "timeShift": null
     },
     {
-      "id": 52,
+      "id": 54,
       "type": "graph",
       "title": "C1 batch RX bandwidth (B/s)",
       "datasource": "InfluxDB",
       "description": "Aggregate TCP bandwidth into C2's batch receiver. Modest -- each C1 batch is a few hundred cand rows + header.",
       "gridPos": {
         "x": 12,
-        "y": 130,
+        "y": 137,
         "w": 12,
         "h": 6
       },
@@ -3748,26 +3910,26 @@
       "timeShift": null
     },
     {
-      "id": 53,
+      "id": 55,
       "type": "row",
       "title": "J. C1 -> C2 candidate flow",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 136,
+        "y": 143,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 54,
+      "id": 56,
       "type": "text",
       "title": "",
       "datasource": null,
       "gridPos": {
         "x": 0,
-        "y": 137,
+        "y": 144,
         "w": 24,
         "h": 3
       },
@@ -3776,14 +3938,14 @@
       "links": []
     },
     {
-      "id": 55,
+      "id": 57,
       "type": "graph",
       "title": "C1 -> C2 flow -- batches_ok/s vs rows_in/s (heartbeat vs candidate)",
       "datasource": "InfluxDB",
       "description": "batches_ok counts EVERY decoded C1 batch (incl. n_candidates=0 heartbeats). rows_in counts only candidate rows landed in the graph. A wide gap is normal in a quiet sky; convergence means a candidate-bearing window is in progress.",
       "gridPos": {
         "x": 0,
-        "y": 140,
+        "y": 147,
         "w": 12,
         "h": 7
       },
@@ -3870,14 +4032,14 @@
       "timeShift": null
     },
     {
-      "id": 56,
+      "id": 58,
       "type": "graph",
       "title": "C2 components evaluated -- rate (components/s)",
       "datasource": "InfluxDB",
       "description": "Rate at which C2 evaluates connected components in the cross-node coincidence graph. Each = candidate trigger tested against criteria. Flat 0 in a quiet sky is expected.",
       "gridPos": {
         "x": 12,
-        "y": 140,
+        "y": 147,
         "w": 12,
         "h": 7
       },
@@ -3951,14 +4113,14 @@
       "timeShift": null
     },
     {
-      "id": 57,
+      "id": 59,
       "type": "graph",
       "title": "C1 rows arriving at C2 -- rate (rows/s, candidate-only)",
       "datasource": "InfluxDB",
       "description": "Rate of candidate rows (non-heartbeat) ingested by C2. Zero is the normal quiet-sky value -- compare with batches_ok/s in the overlay above.",
       "gridPos": {
         "x": 0,
-        "y": 147,
+        "y": 154,
         "w": 12,
         "h": 6
       },
@@ -4032,14 +4194,14 @@
       "timeShift": null
     },
     {
-      "id": 58,
+      "id": 60,
       "type": "graph",
       "title": "C2 rows_late_drop -- cumulative",
       "datasource": "InfluxDB",
       "description": "Cumulative C1 rows dropped because they arrived after their batch window closed. Should stay flat at 0.",
       "gridPos": {
         "x": 12,
-        "y": 147,
+        "y": 154,
         "w": 12,
         "h": 6
       },
@@ -4113,27 +4275,27 @@
       "timeShift": null
     },
     {
-      "id": 59,
+      "id": 61,
       "type": "row",
       "title": "K. C2 trigger pipeline",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 153,
+        "y": 160,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 60,
+      "id": 62,
       "type": "graph",
       "title": "C2 triggers -- cumulative by class",
       "datasource": "InfluxDB",
       "description": "Cumulative C2 triggers by outcome: dump (issued cube-dump UDP), log_only (recorded but no dump), suppressed (dedupe / gate).",
       "gridPos": {
         "x": 0,
-        "y": 154,
+        "y": 161,
         "w": 12,
         "h": 7
       },
@@ -4233,14 +4395,14 @@
       "timeShift": null
     },
     {
-      "id": 61,
+      "id": 63,
       "type": "graph",
       "title": "C2 trigger rate -- per hour, by class",
       "datasource": "InfluxDB",
       "description": "Per-hour trigger rate. Useful for spotting RFI storms.",
       "gridPos": {
         "x": 12,
-        "y": 154,
+        "y": 161,
         "w": 12,
         "h": 7
       },
@@ -4340,14 +4502,14 @@
       "timeShift": null
     },
     {
-      "id": 62,
+      "id": 64,
       "type": "graph",
       "title": "C2 broadcast results -- cumulative",
       "datasource": "InfluxDB",
       "description": "Cumulative UDP broadcasts of C2 triggers to cube_dump subscribers. broadcast_send_fail growth = corr not receiving dump cmds.",
       "gridPos": {
         "x": 0,
-        "y": 161,
+        "y": 168,
         "w": 12,
         "h": 6
       },
@@ -4434,14 +4596,14 @@
       "timeShift": null
     },
     {
-      "id": 63,
+      "id": 65,
       "type": "graph",
       "title": "C2 plot pipeline (pending + dispatched)",
       "datasource": "InfluxDB",
       "description": "pending_plots = post-trigger plot worker queue. Drops back to 0 within tens of seconds; climbing = plotter saturated.",
       "gridPos": {
         "x": 12,
-        "y": 161,
+        "y": 168,
         "w": 12,
         "h": 6
       },
@@ -4528,27 +4690,27 @@
       "timeShift": null
     },
     {
-      "id": 64,
+      "id": 66,
       "type": "row",
       "title": "L. Last C2 trigger",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 167,
+        "y": 174,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 65,
+      "id": 67,
       "type": "singlestat",
       "title": "Last trigger -- event name",
       "datasource": "InfluxDB",
       "description": "Most recent C2 event name (canonical TNS-style identifier). Long stretches with no update = quiet sky.",
       "gridPos": {
         "x": 0,
-        "y": 168,
+        "y": 175,
         "w": 8,
         "h": 4
       },
@@ -4631,14 +4793,14 @@
       "links": []
     },
     {
-      "id": 66,
+      "id": 68,
       "type": "singlestat",
       "title": "Last trigger -- class",
       "datasource": "InfluxDB",
       "description": "Most recent C2 trigger class (dump / log_only / suppressed).",
       "gridPos": {
         "x": 8,
-        "y": 168,
+        "y": 175,
         "w": 8,
         "h": 4
       },
@@ -4721,14 +4883,14 @@
       "links": []
     },
     {
-      "id": 67,
+      "id": 69,
       "type": "singlestat",
       "title": "Last trigger -- MJD",
       "datasource": "InfluxDB",
       "description": "MJD of the most recent C2 trigger. Match against wall-clock to gauge staleness.",
       "gridPos": {
         "x": 16,
-        "y": 168,
+        "y": 175,
         "w": 8,
         "h": 4
       },
@@ -4811,27 +4973,27 @@
       "links": []
     },
     {
-      "id": 68,
+      "id": 70,
       "type": "row",
       "title": "M. C2 housekeeping",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 172,
+        "y": 179,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 69,
+      "id": 71,
       "type": "singlestat",
       "title": "C2 dumps gate enabled",
       "datasource": "InfluxDB",
       "description": "Operator gate at /cnf/c2/dumps_enabled. When off, C2 still evaluates components but skips broadcasting cube_dump verbs.",
       "gridPos": {
         "x": 0,
-        "y": 173,
+        "y": 180,
         "w": 4,
         "h": 4
       },
@@ -4924,14 +5086,14 @@
       "links": []
     },
     {
-      "id": 70,
+      "id": 72,
       "type": "singlestat",
       "title": "C2 dumps gate read fails (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative errors reading the gate from etcd. Should stay 0.",
       "gridPos": {
         "x": 4,
-        "y": 173,
+        "y": 180,
         "w": 4,
         "h": 4
       },
@@ -5014,14 +5176,14 @@
       "links": []
     },
     {
-      "id": 71,
+      "id": 73,
       "type": "singlestat",
       "title": "C2 uptime (s)",
       "datasource": "InfluxDB",
       "description": "Seconds since the coincidencer service entered run().",
       "gridPos": {
         "x": 8,
-        "y": 173,
+        "y": 180,
         "w": 4,
         "h": 4
       },
@@ -5104,14 +5266,14 @@
       "links": []
     },
     {
-      "id": 72,
+      "id": 74,
       "type": "singlestat",
       "title": "Galactic-DM (max LoS, pc cm^-3)",
       "datasource": "InfluxDB",
       "description": "Latest line-of-sight Galactic DM cached by C2 from /mon/array/gal_dm (written by declination.service).",
       "gridPos": {
         "x": 12,
-        "y": 173,
+        "y": 180,
         "w": 4,
         "h": 4
       },
@@ -5194,14 +5356,14 @@
       "links": []
     },
     {
-      "id": 73,
+      "id": 75,
       "type": "singlestat",
       "title": "Gal-DM poll fails (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative failures fetching /mon/array/gal_dm. Growth = dm_galactic_fraction discriminant falls back to nan.",
       "gridPos": {
         "x": 16,
-        "y": 173,
+        "y": 180,
         "w": 4,
         "h": 4
       },
@@ -5284,14 +5446,14 @@
       "links": []
     },
     {
-      "id": 74,
+      "id": 76,
       "type": "singlestat",
       "title": "CSV rotations (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative C1/C2 cand-CSV rotations (hourly roll).",
       "gridPos": {
         "x": 20,
-        "y": 173,
+        "y": 180,
         "w": 4,
         "h": 4
       },
@@ -5374,14 +5536,14 @@
       "links": []
     },
     {
-      "id": 75,
+      "id": 77,
       "type": "graph",
       "title": "C2 service queues -- window_size + graph_size + pending_plots",
       "datasource": "InfluxDB",
       "description": "Three internal queue depths overlaid. All should be modest; sustained climb = saturation.",
       "gridPos": {
         "x": 0,
-        "y": 177,
+        "y": 184,
         "w": 24,
         "h": 6
       },
@@ -5481,27 +5643,27 @@
       "timeShift": null
     },
     {
-      "id": 76,
+      "id": 78,
       "type": "row",
       "title": "N. Voltage-injection match (M7.4 Phase 6c)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 183,
+        "y": 190,
         "w": 24,
         "h": 1
       },
       "panels": []
     },
     {
-      "id": 77,
+      "id": 79,
       "type": "singlestat",
       "title": "Active injections",
       "datasource": "InfluxDB",
       "description": "Currently-armed voltage injections in /cnf/inject/active/. 0 in quiet ops.",
       "gridPos": {
         "x": 0,
-        "y": 184,
+        "y": 191,
         "w": 6,
         "h": 4
       },
@@ -5584,14 +5746,14 @@
       "links": []
     },
     {
-      "id": 78,
+      "id": 80,
       "type": "singlestat",
       "title": "Matches (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative C2 rows matched against active injections (DM and l/m within tolerance).",
       "gridPos": {
         "x": 6,
-        "y": 184,
+        "y": 191,
         "w": 6,
         "h": 4
       },
@@ -5674,14 +5836,14 @@
       "links": []
     },
     {
-      "id": 79,
+      "id": 81,
       "type": "singlestat",
       "title": "Best-improved (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative matches that bested the previous best-SNR record for their injection.",
       "gridPos": {
         "x": 12,
-        "y": 184,
+        "y": 191,
         "w": 6,
         "h": 4
       },
@@ -5764,14 +5926,14 @@
       "links": []
     },
     {
-      "id": 80,
+      "id": 82,
       "type": "singlestat",
       "title": "Publish failures",
       "datasource": "InfluxDB",
       "description": "Cumulative failures publishing /mon/dsart/inject/matches/* to etcd. Should stay 0.",
       "gridPos": {
         "x": 18,
-        "y": 184,
+        "y": 191,
         "w": 6,
         "h": 4
       },
@@ -5854,14 +6016,14 @@
       "links": []
     },
     {
-      "id": 81,
+      "id": 83,
       "type": "graph",
       "title": "Inject-match -- rows_checked rate (rows/s)",
       "datasource": "InfluxDB",
       "description": "Rate of C2 rows passed through the inject-matcher. Mirrors rows_in/s when an injection is active.",
       "gridPos": {
         "x": 0,
-        "y": 188,
+        "y": 195,
         "w": 12,
         "h": 6
       },
@@ -5935,14 +6097,14 @@
       "timeShift": null
     },
     {
-      "id": 82,
+      "id": 84,
       "type": "graph",
       "title": "Inject-match -- evictions (cumulative)",
       "datasource": "InfluxDB",
       "description": "Cumulative TTL evictions vs failed eviction attempts. Healthy: evict_fail flat at 0.",
       "gridPos": {
         "x": 12,
-        "y": 188,
+        "y": 195,
         "w": 12,
         "h": 6
       },
