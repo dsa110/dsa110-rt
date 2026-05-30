@@ -266,6 +266,23 @@ class CoincidencerConfig:
 
     plotter_n_workers: int = 2
     plotter_per_event_timeout_s: float = 30.0
+    plotter_use_process_pool: bool = True
+    """2026-05-30 resilience: render plots in a separate PROCESS, not a
+    thread. Plotting touches ~855 MB cubes + matplotlib (both GIL-heavy);
+    in a ThreadPoolExecutor that work serialises against the single
+    asyncio event loop in THIS process and can starve the C1 receiver —
+    the observed failure mode where a dump storm (one noisy high-DM half
+    matching ``bright_pulsar`` every 5 s) wedged the loop for ~34 min and
+    flatlined C1->C2. A ProcessPoolExecutor isolates that CPU/IO so the
+    receiver always drains its sockets. Set false to fall back to threads
+    (e.g. in restricted sandboxes where fork/spawn is unavailable)."""
+
+    # 2026-05-30 dump-rate cap: bound how often a dump-class trigger can
+    # fire a full 8-GPU broadcast, regardless of candidate volume, so a
+    # single persistently-noisy source cannot drive a cube-dump storm
+    # (the proximate cause of the C2 stall). 0 disables the cap.
+    dump_rate_max_per_window: int = 6
+    dump_rate_window_s: float = 60.0
 
     # Event-name allocator config.
     etcd_lastname_key: str = "/mon/corr/1/trigger"
@@ -361,6 +378,15 @@ class CoincidencerConfig:
             plotter_n_workers=int(plotter.get("n_workers", 2)),
             plotter_per_event_timeout_s=float(
                 plotter.get("per_event_timeout_s", 30.0),
+            ),
+            plotter_use_process_pool=bool(
+                plotter.get("use_process_pool", True),
+            ),
+            dump_rate_max_per_window=int(
+                coinc.get("dump_rate_max_per_window", 6),
+            ),
+            dump_rate_window_s=float(
+                coinc.get("dump_rate_window_s", 60.0),
             ),
             etcd_lastname_key=str(coinc.get(
                 "etcd_lastname_key", "/mon/corr/1/trigger",
@@ -536,8 +562,12 @@ class CoincidencerService:
         self._plot_worker = PlotWorker(
             max_workers=config.plotter_n_workers,
             per_event_timeout_s=config.plotter_per_event_timeout_s,
+            use_process_pool=config.plotter_use_process_pool,
         )
         self._pending_plots: Dict[str, _PendingPlot] = {}
+        # 2026-05-30 dump-rate cap: monotonic timestamps of recent dump
+        # broadcasts, trimmed to the rolling window on each check.
+        self._dump_fire_times: List[float] = []
 
         self._mon_store = _StoreWrapper(mock=mon_store)
 
@@ -589,6 +619,11 @@ class CoincidencerService:
             "components_evaluated": 0,
             "triggers_dump": 0,
             "triggers_suppressed": 0,
+            # 2026-05-30: dump broadcasts skipped by the rolling-window
+            # dump-rate cap (CoincidencerConfig.dump_rate_max_per_window).
+            # A persistent rise here means a noisy source is hammering a
+            # dump class -- check the C1 DM-smearing-floor filter / criteria.
+            "dumps_rate_capped": 0,
             # M7.4 Phase 8c (2026-05-29): would-be triggers suppressed
             # because they fired inside the startup grace window (corr
             # RFI bandpass warmup leaks RFI -> false candidates that
@@ -869,6 +904,25 @@ class CoincidencerService:
             return False
         return (time.monotonic() - self._first_batch_mono) < grace
 
+    def _dump_rate_exceeded(self) -> bool:
+        """True if firing another dump broadcast now would exceed the
+        configured rolling-window cap. Trims the timestamp buffer to the
+        window as a side effect. A cap of ``<= 0`` disables (always
+        False)."""
+        cap = self._config.dump_rate_max_per_window
+        if cap <= 0:
+            return False
+        window = float(self._config.dump_rate_window_s)
+        now = time.monotonic()
+        self._dump_fire_times = [
+            t for t in self._dump_fire_times if (now - t) < window
+        ]
+        return len(self._dump_fire_times) >= cap
+
+    def _record_dump_fire(self) -> None:
+        """Record a dump broadcast against the rate-cap window."""
+        self._dump_fire_times.append(time.monotonic())
+
     async def _fire(
         self,
         stats: ClusterStats,
@@ -980,6 +1034,25 @@ class CoincidencerService:
                     stats.snr_max, stats.dm_median,
                 )
                 return
+
+            # 2026-05-30 dump-rate cap: even with dumps enabled, bound how
+            # many full-fleet dump broadcasts fire per rolling window so a
+            # persistently-noisy source cannot drive a cube-dump storm (the
+            # proximate cause of the C2 stall). The audit trail above is
+            # still written; we skip only the UDP fan-out + plot scheduling.
+            # Holdoff stays advanced so normal per-class backoff applies.
+            if self._dump_rate_exceeded():
+                self._counters["dumps_rate_capped"] += 1
+                _LOG.warning(
+                    "DUMP RATE-CAPPED class=%s name=%s n=%d snr_max=%.2f "
+                    "dm_med=%.2f (>%d dumps / %.0fs) -- skipping broadcast",
+                    trigger_class.name, event_name, stats.n_events,
+                    stats.snr_max, stats.dm_median,
+                    self._config.dump_rate_max_per_window,
+                    self._config.dump_rate_window_s,
+                )
+                return
+            self._record_dump_fire()
 
             result = self._broadcaster.broadcast(
                 event_name=event_name,

@@ -145,10 +145,32 @@ class C1EmitConfig:
     cubes/s ≈ 60 batches/s into one C2, a cap of 8 bounds the fleet
     worst-case at ~480 rows/s while never biting normal load (a few
     cands/cube/half at ``snr_min``) or a real burst (a handful of narrow
-    candidates near the peak). RT-safe: selection is O(k log N) via
+    candidates near the peak).     RT-safe: selection is O(k log N) via
     ``heapq.nsmallest`` and is skipped entirely when under the cap.
     Configured via ``c1.max_candidates_per_block`` in
     ``dsart_search_rt.yaml``."""
+    dm_width_floor_frac: Optional[float] = None
+    """C1→C2 physical-plausibility filter: drop any candidate whose
+    boxcar ``width_samples`` is below ``dm_width_floor_frac`` × the
+    intra-channel dispersion-smearing floor for its DM, evaluated at the
+    ACTUAL per-cube sample period (see ``search_compute.dm_smear_samples``;
+    the service passes ``geom.sample_period_us``). ``None`` / ``<= 0``
+    disables.
+
+    At the production cadence (t_int_search = 1048.576 µs) the smearing
+    floor at DM≈2500 is ~1.8 samples, so width-2 high-DM detections are
+    *consistent* with smearing and are kept; only clearly-narrow (width-1)
+    high-DM detections are rejected. ``0.6`` sheds width-1 above DM≈2330
+    while never touching low-DM narrow events (the floor is sub-sample at
+    low DM) or real high-DM bursts (whose matched-filter width sits at the
+    floor, i.e. boxcar ≥2). Background: 2026-05-30 a single search half
+    flooded C2 with field-filling, time-incoherent width-1 spikes at
+    DM≈2538, which matched the ``bright_pulsar`` class and drove a dump
+    storm. Width alone is not a strong discriminator at the production
+    cadence — the trigger criteria + C2 dump-rate cap do the heavy lifting;
+    this filter is cheap defense-in-depth that removes the unphysical
+    width-1 tail at the source. Configured via ``c1.dm_width_floor_frac``
+    in ``dsart_search_rt.yaml``."""
 
 
 # ---------------------------------------------------------------------------

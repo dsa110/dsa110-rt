@@ -46,9 +46,9 @@ trigger_classes:
       n_events_min: 3
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 100.0
-      dm_median_max_pc_cc: 3000.0
-      dm_iqr_max_pc_cc: 250.0
-      width_median_max_samples: 64
+      dm_median_max_pc_cc: 2000.0
+      dm_iqr_max_pc_cc: 100.0
+      width_median_max_samples: 16
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
@@ -69,7 +69,7 @@ trigger_classes:
       width_median_max_samples: 32
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_max: 0.75
-    action: dump_all_gpus
+    action: log_only
     holdoff_s: 30.0
 
   - name: bright_pulsar
@@ -78,7 +78,7 @@ trigger_classes:
       snr_max_min: 10.0
       n_events_min: 5
       dm_iqr_max_pc_cc: 2.0
-    action: dump_all_gpus
+    action: log_only
     holdoff_s: 5.0
 
   - name: log_only

@@ -9,16 +9,22 @@ import os
 os.environ.setdefault("DSART_TEST", "1")
 
 from dsart.common.contracts import Candidate  # noqa: E402
-from dsart.services.search_compute import meter_candidates  # noqa: E402
+from dsart.services.search_compute import (  # noqa: E402
+    dm_smear_samples,
+    filter_unphysical_narrow,
+    meter_candidates,
+)
 from dsart.services.search_compute_mon import (  # noqa: E402
     SearchComputeMonPublisher,
     build_search_compute_mon_key,
 )
 
 
-def _cand(width: int, snr: float, *, dm_idx: int = 0) -> Candidate:
+def _cand(
+    width: int, snr: float, *, dm_idx: int = 0, dm_fine: float = 1.0,
+) -> Candidate:
     return Candidate(
-        l=0.0, m=0.0, dm_fine=1.0, dm_idx=dm_idx, event_specnum=100,
+        l=0.0, m=0.0, dm_fine=dm_fine, dm_idx=dm_idx, event_specnum=100,
         width_samples=width, kernel_id="unit:d1:b4", snr=snr,
         detector_version="t", flags=0, search_node_id=0, gpu_half=0,
     )
@@ -68,6 +74,71 @@ def test_meter_ties_keep_count_exact() -> None:
     assert dropped == 15
     # All width 1 → top-5 by snr desc.
     assert sorted((c.snr for c in kept), reverse=True) == [19, 18, 17, 16, 15]
+
+
+# ---------------------------------------------------------------------------
+# DM-smearing-floor filter (2026-05-30)
+# ---------------------------------------------------------------------------
+
+
+# Production detection-sample period (32 native samples = 1048.576 us);
+# the service passes this via geom.sample_period_us.
+_T_SEARCH_PROD_US = 1048.576
+
+
+def test_dm_smear_samples_scales_and_floor_at_zero() -> None:
+    # Non-positive DM => 0; smearing grows ~linearly with DM.
+    assert dm_smear_samples(0.0) == 0.0
+    assert dm_smear_samples(-5.0) == 0.0
+    # At the PRODUCTION op-point (1048.576 us/sample) the band-averaged
+    # smear at DM 2500 is ~1.8 search-samples (8x chan sum). (At the
+    # legacy 524.288 default it is ~3.6 — twice as many samples.)
+    s_prod = dm_smear_samples(2500.0, t_search_us=_T_SEARCH_PROD_US)
+    assert 1.5 < s_prod < 2.3
+    assert abs(dm_smear_samples(524.288) / dm_smear_samples(
+        524.288, t_search_us=_T_SEARCH_PROD_US) - 2.0) < 0.01
+    # Linear in DM.
+    assert abs(dm_smear_samples(5000.0) - 2.0 * dm_smear_samples(2500.0)) < (
+        0.2 * dm_smear_samples(2500.0)
+    )
+
+
+def test_filter_disabled_passthrough() -> None:
+    cands = [_cand(1, 20.0, dm_fine=2500.0)]
+    for frac in (None, 0.0, -1.0):
+        kept, dropped = filter_unphysical_narrow(
+            cands, frac, t_search_us=_T_SEARCH_PROD_US,
+        )
+        assert kept is cands
+        assert dropped == 0
+
+
+def test_filter_drops_width1_highdm_keeps_width2() -> None:
+    # At the production cadence the smear floor at DM~2538 is ~1.8 samples;
+    # with frac 0.6 the threshold is ~1.1, so only the width-1 high-DM
+    # detection is unphysical and dropped. Width-2 is CONSISTENT with
+    # smearing there (so kept), as is width-4.
+    cands = [
+        _cand(1, 13.0, dm_fine=2538.0),   # unphysically narrow (drop)
+        _cand(2, 12.6, dm_fine=2538.0),   # consistent w/ smearing (keep)
+        _cand(4, 11.0, dm_fine=2538.0),   # plausible real burst (keep)
+    ]
+    kept, dropped = filter_unphysical_narrow(
+        cands, 0.6, t_search_us=_T_SEARCH_PROD_US,
+    )
+    assert dropped == 1
+    assert [c.width_samples for c in kept] == [2, 4]
+
+
+def test_filter_keeps_low_dm_narrow_events() -> None:
+    # At low DM the smear floor is sub-sample, so genuine narrow low-DM
+    # events must pass untouched even at strict frac.
+    cands = [_cand(1, 25.0, dm_fine=50.0), _cand(1, 18.0, dm_fine=200.0)]
+    kept, dropped = filter_unphysical_narrow(
+        cands, 0.8, t_search_us=_T_SEARCH_PROD_US,
+    )
+    assert dropped == 0
+    assert kept == cands
 
 
 class _MockStore:

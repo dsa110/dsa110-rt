@@ -16,7 +16,13 @@ import pytest
 from dsart.coinc.plotter import (
     PlotJob,
     PlotWorker,
+    _burst_coords,
+    _burst_waterfall,
+    _load_cubes,
+    _resolve_burst,
+    _select_burst_chunk,
     enqueue_event,
+    regenerate_recent_events,
     render_event_plots,
 )
 from dsart.coinc.stats import ClusterStats
@@ -25,6 +31,17 @@ from dsart.coinc.window import WindowEntry
 
 # Ensure matplotlib never tries to open a display window during tests.
 os.environ["MPLBACKEND"] = "Agg"
+
+
+# Cube layout under test: axis 0 = time (T_DET), axis 1 = fine-DM
+# (N_FDM), axes 2/3 = the (l, m) image grid. The burst is planted in
+# the s2_g1 cube at (t=BURST_T, fdm=BURST_FDM, l=BURST_L, m=BURST_M);
+# a *brighter* low-DM "continuum/RFI" blob is planted at fdm=0 so a
+# naïve cube-argmax would mis-pick it — the metadata path must not.
+T_DET, N_FDM, N_GRID = 8, 4, 16
+BURST_SID, BURST_G = 2, 1
+BURST_T, BURST_FDM, BURST_L, BURST_M = 5, 2, 10, 4
+BURST_SNR = 20.0
 
 
 def _stats() -> ClusterStats:
@@ -54,18 +71,19 @@ def _stats() -> ClusterStats:
 
 
 def _members() -> list[WindowEntry]:
+    """Cluster members whose peak (max SNR) targets the planted burst."""
     out = []
-    for i in range(6):
+    for i in range(5):
         out.append(WindowEntry(
             mjd=60781.0 + i * 1e-6,
-            snr=10.0 + i,
+            snr=10.0 + i,  # plain ascending; the peak is appended below
             l_rad=1.5e-3,
             m_rad=-2.5e-3,
-            l_pix=120,
-            m_pix=130,
+            l_pix=3,
+            m_pix=3,
             dm_pc_cc=100.0 + i,
             dm_idx_global=10 + i,
-            fine_dm_idx=i,
+            fine_dm_idx=0,
             event_specnum=100 + i,
             width_samples=4,
             kernel_id="unit:d1:b4" if i % 2 == 0 else "unit:d1:b8",
@@ -75,22 +93,45 @@ def _members() -> list[WindowEntry]:
             cube_id=7,
             sample_period_us=1048.576,
         ))
+    # The actual burst peak (highest SNR) → s2_g1, fdm=2, (l,m)=(10,4).
+    out.append(WindowEntry(
+        mjd=60781.0 + 5e-6,
+        snr=BURST_SNR,
+        l_rad=1.5e-3,
+        m_rad=-2.5e-3,
+        l_pix=BURST_L,
+        m_pix=BURST_M,
+        dm_pc_cc=312.0,
+        dm_idx_global=22,
+        fine_dm_idx=BURST_FDM,
+        event_specnum=200,
+        width_samples=2,
+        kernel_id="unit:d1:b2",
+        flags=0,
+        search_node_id=BURST_SID,
+        gpu_half=BURST_G,
+        cube_id=7,
+        sample_period_us=1048.576,
+    ))
     return out
 
 
-def _write_fake_cubes(cubes_dir: Path, n_fdm: int = 4, n_t: int = 8,
-                       n_grid: int = 16) -> None:
+def _write_fake_cubes(cubes_dir: Path) -> None:
     cubes_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
     for sid in (1, 2, 9, 13):
         for g in (0, 1):
-            cube = rng.standard_normal(
-                (n_fdm, n_t, n_grid, n_grid), dtype=np.float32,
-            ).astype(np.float16)
-            # Plant a small bright spot at (fdm=1, t=3, pix=8, pix=8)
-            cube[1, 3, 8, 8] = 10.0
+            cube = (rng.standard_normal(
+                (T_DET, N_FDM, N_GRID, N_GRID),
+            ) * 0.5).astype(np.float16)
+            # Bright low-DM "continuum/RFI" column present in every cube:
+            # all-time at fdm=0, pixel (2,2). This is the trap a naïve
+            # cube-argmax falls into.
+            cube[:, 0, 2, 2] = np.float16(9.0)
+            if sid == BURST_SID and g == BURST_G:
+                # The (fainter) real burst at the detected DM/time/pixel.
+                cube[BURST_T, BURST_FDM, BURST_L, BURST_M] = np.float16(7.0)
             manifest = {
-                "fine_dm_pc_cc": np.linspace(90.0, 110.0, n_fdm),
                 "mjd_start": 60781.0,
                 "sample_period_us": 1048.576,
                 "search_node_id": sid,
@@ -98,6 +139,31 @@ def _write_fake_cubes(cubes_dir: Path, n_fdm: int = 4, n_t: int = 8,
             }
             path = cubes_dir / f"cube_s{sid}_g{g}_100.npz"
             np.savez(path, cube=cube, manifest=manifest)
+
+
+_C1_WINDOW_HEADER = (
+    "mjd,event_specnum,snr,dm_pc_cc,dm_idx_global,fine_dm_idx,l_rad,m_rad,"
+    "l_pix,m_pix,width_samples,kernel_id,flags,search_node_id,gpu_half,"
+    "cube_id,trigger,inj_id"
+)
+
+
+def _write_c1_window_csv(archive_root: Path, ev: str) -> None:
+    """Write a per-event C1-window CSV mirroring the production schema,
+    with the max-SNR row pointing at the planted burst."""
+    lev2 = archive_root / ev / "Level2"
+    lev2.mkdir(parents=True, exist_ok=True)
+    rows = [
+        # low-SNR decoys at low DM
+        f"60781.0,100,10.5,100.0,10,0,2.7e-3,2.1e-2,3,3,4,unit:d1:b4,0,1,0,7,{ev},",
+        f"60781.0,101,11.0,101.0,11,0,2.7e-3,2.1e-2,3,3,4,unit:d1:b8,0,9,0,7,{ev},",
+        # the burst peak (max SNR)
+        f"60781.0,200,{BURST_SNR},312.0,22,{BURST_FDM},2.7e-3,2.1e-2,"
+        f"{BURST_L},{BURST_M},2,unit:d1:b2,0,{BURST_SID},{BURST_G},7,{ev},",
+    ]
+    (lev2 / f"C1_window_{ev}.csv").write_text(
+        _C1_WINDOW_HEADER + "\n" + "\n".join(rows) + "\n"
+    )
 
 
 def test_render_event_plots_produces_four_pngs(tmp_path: Path) -> None:
@@ -126,102 +192,81 @@ def test_render_event_plots_produces_four_pngs(tmp_path: Path) -> None:
         assert p.stat().st_size > 100
 
 
-def _write_fake_cubes_with_peak_grid(
-    cubes_dir: Path, n_fdm: int = 4, n_t: int = 8, n_grid: int = 16,
-) -> None:
-    """Same fixture as ``_write_fake_cubes`` but each NPZ carries a
-    writer-side-precomputed ``peak_grid``. Lets us test the plotter's
-    fast path (CubeDumpWriter precompute landed 2026-05-27).
-    """
-    cubes_dir.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(0)
-    for sid in (1, 2, 9, 13):
-        for g in (0, 1):
-            cube = rng.standard_normal(
-                (n_fdm, n_t, n_grid, n_grid), dtype=np.float32,
-            ).astype(np.float16)
-            cube[1, 3, 8, 8] = 10.0
-            peak_grid = cube.max(axis=(2, 3))  # shape (n_fdm, n_t)
-            manifest = {
-                "fine_dm_pc_cc": np.linspace(90.0, 110.0, n_fdm),
-                "mjd_start": 60781.0,
-                "sample_period_us": 1048.576,
-                "search_node_id": sid,
-                "gpu_half": g,
-            }
-            path = cubes_dir / f"cube_s{sid}_g{g}_100.npz"
-            np.savez(
-                path, cube=cube, peak_grid=peak_grid, manifest=manifest,
-            )
-
-
-def test_populate_peak_grids_uses_cache_when_present(
-    tmp_path: Path,
-) -> None:
-    """The plotter must consume ``peak_grid`` from the NPZ when the
-    writer pre-computed it, instead of re-running the (expensive)
-    cube.max(axis=(2,3)) reduction.
-
-    We verify by writing a fixture where the cube is all-zeros but
-    the stored ``peak_grid`` has a distinctive sentinel value. The
-    fast path returns the sentinel; the slow path would return zeros.
-    """
-    from dsart.coinc.plotter import _load_cubes, _populate_peak_grids
-
+def test_burst_resolved_from_metadata_not_argmax(tmp_path: Path) -> None:
+    """The burst panels must be placed from detection metadata, NOT a
+    cube argmax. The fixture plants a *brighter* low-DM blob (fdm=0)
+    than the real burst (fdm=2), so an argmax would mis-pick fdm=0."""
     cubes_dir = tmp_path / "cubes"
-    cubes_dir.mkdir(parents=True, exist_ok=True)
-    n_fdm, n_t, n_grid = 4, 8, 16
-    sentinel = np.float16(7.5)
-    for sid in (1, 2, 9, 13):
-        for g in (0, 1):
-            cube = np.zeros(
-                (n_fdm, n_t, n_grid, n_grid), dtype=np.float16,
-            )
-            peak_grid = np.full(
-                (n_fdm, n_t), sentinel, dtype=np.float16,
-            )
-            manifest = {
-                "fine_dm_pc_cc": np.linspace(90.0, 110.0, n_fdm),
-                "mjd_start": 60781.0,
-                "sample_period_us": 1048.576,
-                "search_node_id": sid,
-                "gpu_half": g,
-            }
-            path = cubes_dir / f"cube_s{sid}_g{g}_100.npz"
-            np.savez(
-                path, cube=cube, peak_grid=peak_grid, manifest=manifest,
-            )
-
-    chunks = _load_cubes(cubes_dir)
-    assert len(chunks) == 8
-
-    _populate_peak_grids(chunks)
-
-    for c in chunks:
-        assert c.peak_grid is not None
-        assert c.peak_grid.shape == (n_fdm, n_t)
-        assert c.peak_grid.dtype == np.float32
-        # Fast path used the sentinel from the NPZ. If the slow path
-        # had run, every entry would be 0 (cube is all zeros).
-        np.testing.assert_allclose(c.peak_grid, float(sentinel))
+    _write_fake_cubes(cubes_dir)
+    cubes = _load_cubes(cubes_dir)
+    try:
+        job = PlotJob(
+            event_name="260521abcd", archive_root=tmp_path,
+            stats=_stats(), members=tuple(_members()),
+        )
+        peak, kernels = _resolve_burst(job)
+        assert peak is not None and peak.source == "members"
+        assert (peak.search_node_id, peak.gpu_half) == (BURST_SID, BURST_G)
+        burst = _select_burst_chunk(cubes, peak)
+        assert burst is not None
+        assert (burst.search_node_id, burst.gpu_half) == (BURST_SID, BURST_G)
+        wf = _burst_waterfall(burst)
+        assert wf is not None and wf.shape == (T_DET, N_FDM)
+        coords = _burst_coords(burst, wf, peak)
+        assert coords is not None and coords.from_metadata
+        # Metadata-driven: detected DM row + (l, m), time at the DM-slice
+        # argmax — NOT the brighter fdm=0 continuum the argmax would grab.
+        assert coords.fdm_idx == BURST_FDM
+        assert (coords.l_pix, coords.m_pix) == (BURST_L, BURST_M)
+        assert coords.t_idx == BURST_T
+        # Sanity: the cube's global argmax really is the fdm=0 trap.
+        assert int(np.argmax(wf)) // N_FDM != coords.t_idx or (
+            int(np.argmax(wf)) % N_FDM == 0
+        )
+        assert any(k == "unit:d1:b2" for k, _ in kernels)
+    finally:
+        for c in cubes:
+            c.close()
 
 
-def test_populate_peak_grids_falls_back_when_cache_absent(
-    tmp_path: Path,
-) -> None:
-    """Cubes without ``peak_grid`` (older NPZs / non-writer test
-    fixtures) must still work via the full reduction path."""
-    from dsart.coinc.plotter import _load_cubes, _populate_peak_grids
+def test_offline_regeneration_from_csv(tmp_path: Path) -> None:
+    """With no live members, render must resolve the burst from the
+    archived C1-window CSV and still produce 4 correct PNGs."""
+    archive_root = tmp_path / "candidates"
+    ev = "260521csv0"
+    _write_fake_cubes(archive_root / ev / "cubes")
+    _write_c1_window_csv(archive_root, ev)
 
-    cubes_dir = tmp_path / "cubes"
-    _write_fake_cubes(cubes_dir)  # no peak_grid in NPZ
+    # The CSV-only path must resolve the same burst as the members path.
+    job = PlotJob(event_name=ev, archive_root=archive_root)  # members=()
+    peak, kernels = _resolve_burst(job)
+    assert peak is not None and peak.source == "csv"
+    assert (peak.search_node_id, peak.gpu_half) == (BURST_SID, BURST_G)
+    assert peak.fine_dm_idx == BURST_FDM
+    assert (peak.l_pix, peak.m_pix) == (BURST_L, BURST_M)
 
-    chunks = _load_cubes(cubes_dir)
-    assert len(chunks) == 8
-    _populate_peak_grids(chunks)
-    for c in chunks:
-        assert c.peak_grid is not None
-        assert c.peak_grid.shape == (c.cube.shape[0], c.cube.shape[1])
+    written = render_event_plots(job)
+    assert len(written) == 4
+    for p in written:
+        assert p.is_file() and p.stat().st_size > 100
+
+
+def test_regenerate_recent_events_scans_for_cubes(tmp_path: Path) -> None:
+    """``regenerate_recent_events`` discovers archived events that have
+    cubes and rewrites their plots."""
+    archive_root = tmp_path / "candidates"
+    for ev in ("260521aaaa", "260521bbbb"):
+        _write_fake_cubes(archive_root / ev / "cubes")
+        _write_c1_window_csv(archive_root, ev)
+    # A dir without cubes must be skipped.
+    (archive_root / "260521nope").mkdir(parents=True)
+
+    done = regenerate_recent_events(archive_root)
+    assert set(done) == {"260521aaaa", "260521bbbb"}
+    for ev in done:
+        plots = archive_root / ev / "Level2" / "plots"
+        assert (plots / f"dm_time_{ev}.png").is_file()
+        assert (plots / f"image_peak_{ev}.png").is_file()
 
 
 def test_render_event_plots_handles_missing_cubes(tmp_path: Path) -> None:

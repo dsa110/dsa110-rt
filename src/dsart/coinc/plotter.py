@@ -7,24 +7,60 @@ NPZs (one per ``(search_node, gpu_half)``) along DM, then renders
 four PNGs into ``Level2/plots/`` (see ``docs/c1c2/C1C2_DESIGN.md``
 §3.7):
 
-  1. ``dm_time_<name>.png``        — DM vs time waterfall, max-projected
-     over (l, m) in a window around the peak.
-  2. ``image_peak_<name>.png``     — image plane at (DM_peak, t_peak).
-  3. ``lightcurve_<name>.png``     — time series at the peak (l, m, DM).
+  1. ``dm_time_<name>.png``        — DM vs time waterfall (burst cube),
+     max-projected over (l, m), with a crosshair at the detected
+     (t_peak, DM_peak).
+  2. ``image_peak_<name>.png``     — image plane at the detected
+     (DM_peak, t_peak), with a reticle at the detected (l, m).
+  3. ``lightcurve_<name>.png``     — time series at the detected DM,
+     with a vertical reticle at the detected burst time.
   4. ``kernel_snrs_<name>.png``    — bar plot of cluster SNR by kernel_id.
 
 The first three need the NPZ cubes; the fourth (`kernel_snrs`) only
 needs the cluster's member list and can be drawn even if the cubes
 haven't arrived yet.
 
-NPZ schema (matches the existing ``CubeDumpWriter``):
+Burst selection (why we don't argmax the cube)
+----------------------------------------------
 
-  * ``cube``   — fp16 array of shape (n_fdm, n_t, n_grid, n_grid),
-    stored uncompressed (``np.savez``, not ``np.savez_compressed``).
+The dumped cube is dominated by steady continuum + low-DM RFI, so a
+naïve ``cube.argmax`` lands on the brightest *image* pixel — which is
+**not** the burst (a real high-DM transient is fainter than the
+brightest steady source in any single image plane). We therefore pick
+the panel coordinates from the C2 **detection metadata**:
+
+  * live: the cluster's ``WindowEntry`` members (``PlotJob.members``);
+  * offline / re-render: the per-event ``Level2/C1_window_<name>.csv``
+    rows (same fields), so ``render_event_plots`` can rebuild correct
+    plots for any archived event with no live state.
+
+The peak member (max ``snr``) gives the owning ``(search_node, gpu_half)``
+cube, the fine-DM trial (``fine_dm_idx``), and the image pixel
+(``l_pix, m_pix``). The burst time within the cube is the argmax of the
+DM-sliced light curve (the cube's ``event_specnum_start`` is the dump
+*key*, not the cube's first-sample specnum, so specnum arithmetic can't
+locate the burst in time — the per-DM time profile can).
+
+NPZ schema (matches the production ``CubeDumpWriter``)
+------------------------------------------------------
+
+  * ``cube`` — fp16 array of shape **(t_det, n_fdm, n_grid, n_grid)**,
+    i.e. axis 0 = time, axis 1 = fine-DM trial, axes 2/3 = the (l, m)
+    image grid (``cube[t, fdm, l_pix, m_pix]`` — matches the detector
+    score tensor ``[T_det, N_fdm, H=l, W=m]``). Stored uncompressed
+    (``np.savez``).
   * Either a top-level pickled ``manifest`` dict (older test fixture
     format) **or** individual top-level scalar arrays (production
     writer in ``dsart.dump.cube_dump``: ``mjd_start``,
     ``event_specnum_start``, ``t_det``, …). We accept both.
+
+.. note::
+
+   The writer also stores a ``peak_grid`` array, but it has been
+   observed to be **inconsistent** with the stored ``cube`` (its argmax
+   lands at low DM while ``cube.argmax`` lands on the burst DM), so the
+   plotter no longer trusts it: it recomputes ``cube.max(axis=(2, 3))``
+   for the single burst cube.
 
 If the NPZs are missing keys we degrade gracefully — the plotter
 writes a placeholder PNG that says "no cube data".
@@ -37,26 +73,20 @@ Performance notes
 -----------------
 
 The cubes are ~855 MB each (192 × 34 × 256 × 256 fp16) and there are
-8 per event, so naïvely loading + 3×-reducing them through
-``astype(float32)`` blows past 20 GB of RAM and takes >5 minutes. The
-optimised pipeline:
+8 per event. Rather than reduce all 8, we resolve the burst cube from
+metadata and touch **only** that one:
 
-  1. Memory-maps each ``cube.npy`` from inside its (uncompressed) zip
+  1. Memory-map each ``cube.npy`` from inside its (uncompressed) zip
      by parsing the local file header ourselves —
      ``np.load(path, mmap_mode='r')`` silently ignores ``mmap_mode``
      for ``.npz`` inputs (numpy ≤ 2.4 NpzFile.__getitem__ doesn't
      forward it to ``format.read_array``), so the OS-level mmap has
      to be set up by hand.
-  2. Streams a single ``cube.max(axis=(2, 3))`` reduction per cube and
-     caches the result on ``_CubeChunk.peak_grid`` (shape
-     ``(n_fdm, n_t)``, fp32, ~26 KB). All three render passes read
-     this cached array; none of them re-touch the full cube.
-  3. For ``image_peak``, after peak-picking we materialise just the
-     single ``(n_grid, n_grid)`` image at ``cube[best_fdm, best_t]``
-     (~128 KB).
-  4. For ``lightcurve``, ``cube[best_fdm].max(axis=(1, 2))`` is
-     algebraically equivalent to ``peak_grid[best_fdm]``, so we don't
-     touch the cube at all.
+  2. Stream a single ``cube.max(axis=(2, 3))`` reduction on the burst
+     cube → ``waterfall`` (shape ``(t_det, n_fdm)``, fp32). The DM/time
+     panel uses it directly and the light curve is just its DM column.
+  3. For ``image_peak`` we materialise the single ``(n_grid, n_grid)``
+     plane at ``cube[t_peak, fine_dm_idx]`` (~128 KB).
 
 Each major step logs its wall-clock cost at INFO level so operators
 can correlate slow plot runs with disk-cache state.
@@ -65,13 +95,14 @@ can correlate slow plot runs with disk-cache state.
 from __future__ import annotations
 
 import ast
+import csv
 import logging
 import os
 import re
 import struct
 import time
 import zipfile
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
@@ -91,6 +122,7 @@ __all__ = [
     "PlotWorker",
     "PlotJob",
     "render_event_plots",
+    "regenerate_recent_events",
 ]
 
 
@@ -113,13 +145,53 @@ class PlotJob:
     members: Tuple[WindowEntry, ...] = ()
 
 
-class PlotWorker:
-    """ThreadPoolExecutor-backed dispatcher for plot jobs."""
+def _render_job(job: "PlotJob") -> List[Path]:
+    """Module-level plot-render entry point.
 
-    def __init__(self, max_workers: int = 2, *, per_event_timeout_s: float = 30.0) -> None:
-        self._pool = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="c2-plot",
-        )
+    Must be a top-level function (not a bound method) so it is picklable
+    for ``ProcessPoolExecutor`` dispatch. Returns the list of PNG paths
+    written. Exceptions propagate into the returned Future, where the
+    enqueuer's done-callback logs them."""
+    return render_event_plots(job)
+
+
+class PlotWorker:
+    """Executor-backed dispatcher for plot jobs.
+
+    Plot rendering touches ~855 MB cubes + matplotlib, both of which hold
+    the GIL for long stretches. When run in a ``ThreadPoolExecutor`` this
+    serialises against the C2 service's single asyncio event loop and can
+    starve the C1 receiver (observed 2026-05-30: a dump storm wedged the
+    loop ~34 min, flatlining C1->C2). The default ``use_process_pool=True``
+    isolates that work in a separate process so the receiver always drains
+    its sockets. ``use_process_pool=False`` keeps the legacy thread pool
+    for environments where fork/spawn is unavailable (restricted sandboxes,
+    some test rigs)."""
+
+    def __init__(
+        self,
+        max_workers: int = 2,
+        *,
+        per_event_timeout_s: float = 30.0,
+        use_process_pool: bool = True,
+    ) -> None:
+        self._use_process_pool = use_process_pool
+        if use_process_pool:
+            try:
+                self._pool: Any = ProcessPoolExecutor(max_workers=max_workers)
+            except Exception:  # noqa: BLE001 — fall back to threads
+                _LOG.warning(
+                    "PlotWorker: ProcessPoolExecutor unavailable; "
+                    "falling back to ThreadPoolExecutor", exc_info=True,
+                )
+                self._use_process_pool = False
+                self._pool = ThreadPoolExecutor(
+                    max_workers=max_workers, thread_name_prefix="c2-plot",
+                )
+        else:
+            self._pool = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="c2-plot",
+            )
         self._per_event_timeout_s = per_event_timeout_s
         self._inflight: dict[str, Future] = {}
 
@@ -130,20 +202,24 @@ class PlotWorker:
         """Queue a plot job; returns the future for it.
 
         If a job for the same event_name is already in flight, the
-        existing future is returned (no duplicate work).
-        """
+        existing future is returned (no duplicate work). Bookkeeping for
+        ``_inflight`` is done via a done-callback (so it works for both
+        thread- and process-pool futures, where the worker can't mutate
+        the parent's dict)."""
         existing = self._inflight.get(job.event_name)
         if existing is not None and not existing.done():
             return existing
-        fut = self._pool.submit(self._run, job)
+        fut = self._pool.submit(_render_job, job)
         self._inflight[job.event_name] = fut
-        return fut
 
-    def _run(self, job: PlotJob) -> List[Path]:
-        try:
-            return render_event_plots(job)
-        finally:
-            self._inflight.pop(job.event_name, None)
+        def _done(_f: Future, name: str = job.event_name) -> None:
+            self._inflight.pop(name, None)
+            exc = _f.exception() if not _f.cancelled() else None
+            if exc is not None:
+                _LOG.error("plot job failed for %s: %r", name, exc)
+
+        fut.add_done_callback(_done)
+        return fut
 
 
 def enqueue_event(
@@ -191,18 +267,39 @@ def render_event_plots(job: PlotJob) -> List[Path]:
         len(cubes), t_load, job.event_name,
     )
 
+    # Resolve the burst from detection metadata (live members or the
+    # archived C1-window CSV), then reduce ONLY the burst cube.
+    peak, kernels = _resolve_burst(job)
+    burst = _select_burst_chunk(cubes, peak)
+    if peak is not None:
+        _LOG.info(
+            "plotter: burst peak s%s_g%s fdm=%d (l,m)=(%d,%d) "
+            "DM=%.1f SNR=%.1f (event=%s, source=%s)",
+            peak.search_node_id, peak.gpu_half, peak.fine_dm_idx,
+            peak.l_pix, peak.m_pix, peak.dm_pc_cc, peak.snr,
+            job.event_name, peak.source,
+        )
+    else:
+        _LOG.warning(
+            "plotter: no detection metadata for %s — falling back to "
+            "cube argmax (may latch onto low-DM RFI)", job.event_name,
+        )
+
     t0 = time.perf_counter()
-    _populate_peak_grids(cubes)
+    waterfall = _burst_waterfall(burst)  # (t_det, n_fdm) fp32, or None
     t_reduce = time.perf_counter() - t0
     _LOG.info(
-        "plotter: reduced %d cubes in %.1fs (event=%s)",
-        len(cubes), t_reduce, job.event_name,
+        "plotter: reduced burst cube in %.1fs (event=%s)",
+        t_reduce, job.event_name,
     )
+
+    # Burst coords resolved against the cube we actually have.
+    coords = _burst_coords(burst, waterfall, peak)
 
     try:
         t0 = time.perf_counter()
         written.append(
-            _render_dm_time(plots_dir, job.event_name, cubes, job.stats),
+            _render_dm_time(plots_dir, job.event_name, waterfall, coords),
         )
         _LOG.info(
             "plotter: dm_time rendered in %.1fs (event=%s)",
@@ -211,7 +308,7 @@ def render_event_plots(job: PlotJob) -> List[Path]:
 
         t0 = time.perf_counter()
         written.append(
-            _render_image_peak(plots_dir, job.event_name, cubes, job.stats),
+            _render_image_peak(plots_dir, job.event_name, burst, coords),
         )
         _LOG.info(
             "plotter: image_peak rendered in %.1fs (event=%s)",
@@ -220,7 +317,7 @@ def render_event_plots(job: PlotJob) -> List[Path]:
 
         t0 = time.perf_counter()
         written.append(
-            _render_lightcurve(plots_dir, job.event_name, cubes, job.stats),
+            _render_lightcurve(plots_dir, job.event_name, waterfall, coords),
         )
         _LOG.info(
             "plotter: lightcurve rendered in %.1fs (event=%s)",
@@ -229,7 +326,7 @@ def render_event_plots(job: PlotJob) -> List[Path]:
 
         t0 = time.perf_counter()
         written.append(
-            _render_kernel_snrs(plots_dir, job.event_name, job.members),
+            _render_kernel_snrs(plots_dir, job.event_name, kernels),
         )
         _LOG.info(
             "plotter: kernel_snrs rendered in %.1fs (event=%s)",
@@ -266,7 +363,7 @@ class _CubeChunk:
     search_node_id: int
     gpu_half: int
     event_specnum: int
-    cube: np.ndarray  # shape (n_fdm, n_t, n_grid, n_grid), fp16, mmap'd
+    cube: np.ndarray  # shape (t_det, n_fdm, n_grid, n_grid), fp16, mmap'd
     fine_dm_pc_cc: np.ndarray  # shape (n_fdm,)
     mjd_start: float
     sample_period_us: float
@@ -432,9 +529,14 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
             npz = np.load(p, allow_pickle=True)
             manifest = _read_manifest(npz)
 
+            # Fine-DM axis: production NPZs don't store the per-trial
+            # DM grid, so fall back to the trial *index* along the cube's
+            # DM axis (axis 1). Real DM values, when needed, come from a
+            # linear fit over the detection metadata (see _fit_dm_axis).
             fine_dm = manifest.get("fine_dm_pc_cc")
+            n_fdm = cube.shape[1] if cube.ndim == 4 else cube.shape[0]
             if fine_dm is None:
-                fine_dm = np.arange(cube.shape[0], dtype=np.float64)
+                fine_dm = np.arange(n_fdm, dtype=np.float64)
             else:
                 fine_dm = np.asarray(fine_dm, dtype=np.float64)
 
@@ -472,80 +574,247 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
     return chunks
 
 
-def _populate_peak_grids(cubes: List[_CubeChunk]) -> None:
-    """Populate ``peak_grid = cube.max(axis=(2, 3))`` once per chunk.
+# ---------------------------------------------------------------------------
+# Burst resolution (from detection metadata, not cube argmax)
+# ---------------------------------------------------------------------------
 
-    Fast path: if the NPZ already carries a ``peak_grid`` array
-    (CubeDumpWriter precomputes it as of 2026-05-27), we skip the
-    reduction entirely and just up-cast the cached ``(n_fdm, n_t)``
-    fp16 array to fp32 (~26 KB per cube). This drops the plotter's
-    dominant cost stage from ~10 s/cube to <50 ms/cube on h23.
 
-    Slow path (backwards compatibility with cubes dumped before the
-    writer-side precompute landed): we run ``cube.max(axis=(2, 3))``
-    on the mmap'd cube, streaming it once through the OS page cache.
-    The fp16 reduction result is up-cast to fp32; downstream rendering
-    stays fp32 without any further full-cube copies.
+@dataclass(frozen=True, slots=True)
+class _BurstPeak:
+    """Detected peak of the C2 cluster, used to place every panel.
 
-    Done in a second pass (rather than inside ``_load_cubes``) so the
-    timing log line can attribute disk-IO + reduction cost cleanly.
+    Sourced from the live cluster members (``WindowEntry``) or the
+    archived ``Level2/C1_window_<name>.csv`` rows — never from a raw
+    cube argmax (which would latch onto bright steady continuum / RFI).
     """
-    n_fast = 0
-    n_slow = 0
-    for c in cubes:
-        # Fast path: writer-side precomputed peak_grid.
-        cached = _try_read_cached_peak_grid(c)
-        if cached is not None:
-            c.peak_grid = cached
-            n_fast += 1
-            continue
-        if c.cube.ndim != 4:
-            continue
+
+    search_node_id: int
+    gpu_half: int
+    fine_dm_idx: int
+    l_pix: int
+    m_pix: int
+    dm_pc_cc: float
+    snr: float
+    width_samples: int
+    kernel_id: str
+    source: str  # "members" | "csv"
+
+
+@dataclass(frozen=True, slots=True)
+class _BurstCoords:
+    """Resolved panel coordinates within the burst cube.
+
+    ``t_idx`` is the cube time sample of the burst (argmax of the DM
+    light curve); ``fdm_idx`` the fine-DM trial row; ``(l_pix, m_pix)``
+    the image pixel. ``from_metadata`` distinguishes the trustworthy
+    metadata path from the cube-argmax fallback (flagged on the plots).
+    """
+
+    t_idx: Optional[int]
+    fdm_idx: int
+    l_pix: int
+    m_pix: int
+    dm_pc_cc: float
+    snr: float
+    width_samples: int
+    n_fdm: int
+    t_det: int
+    from_metadata: bool
+
+
+def _read_window_csv_rows(archive_root: Path, event_name: str) -> List[dict]:
+    """Read ``Level2/C1_window_<name>.csv`` rows (empty list if absent)."""
+    csv_path = (
+        archive_root / event_name / "Level2" / f"C1_window_{event_name}.csv"
+    )
+    if not csv_path.is_file():
+        return []
+    try:
+        with open(csv_path, newline="") as fh:
+            return list(csv.DictReader(fh))
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("plotter: failed to read %s: %s", csv_path, exc)
+        return []
+
+
+def _peak_from_members(
+    members: Sequence[WindowEntry],
+) -> Optional[_BurstPeak]:
+    if not members:
+        return None
+    m = max(members, key=lambda e: float(e.snr))
+    return _BurstPeak(
+        search_node_id=int(m.search_node_id),
+        gpu_half=int(m.gpu_half),
+        fine_dm_idx=int(m.fine_dm_idx),
+        l_pix=int(m.l_pix),
+        m_pix=int(m.m_pix),
+        dm_pc_cc=float(m.dm_pc_cc),
+        snr=float(m.snr),
+        width_samples=int(m.width_samples),
+        kernel_id=str(m.kernel_id),
+        source="members",
+    )
+
+
+def _peak_from_csv_rows(rows: Sequence[dict]) -> Optional[_BurstPeak]:
+    best = None
+    best_snr = -np.inf
+    for r in rows:
         try:
-            peaks = c.cube.max(axis=(2, 3))
-        except (TypeError, ValueError) as exc:
-            _LOG.warning(
-                "plotter: max-reduce failed on cube s%d_g%d: %s; skipping",
-                c.search_node_id, c.gpu_half, exc,
-            )
+            snr = float(r["snr"])
+        except (KeyError, TypeError, ValueError):
             continue
-        c.peak_grid = np.asarray(peaks, dtype=np.float32)
-        n_slow += 1
-    if n_fast or n_slow:
-        _LOG.info(
-            "plotter: peak_grid populated fast=%d (cached) slow=%d (computed)",
-            n_fast, n_slow,
-        )
-
-
-def _try_read_cached_peak_grid(c: "_CubeChunk") -> Optional[np.ndarray]:
-    """Return cached ``peak_grid`` from the NPZ as fp32, or None.
-
-    The cached array is shape ``(n_fdm, n_t)``, dtype fp16 (matches the
-    cube). Validation: ndim==2, non-empty, leading axis matches
-    ``c.cube.shape[0]``. Anything off → return None so the caller
-    falls back to the full reduction.
-    """
-    if c._npz is None or "peak_grid" not in c._npz.files:
+        if snr > best_snr:
+            best_snr = snr
+            best = r
+    if best is None:
         return None
     try:
-        peaks = c._npz["peak_grid"]
-    except Exception:  # noqa: BLE001
+        return _BurstPeak(
+            search_node_id=int(best["search_node_id"]),
+            gpu_half=int(best["gpu_half"]),
+            fine_dm_idx=int(best["fine_dm_idx"]),
+            l_pix=int(best["l_pix"]),
+            m_pix=int(best["m_pix"]),
+            dm_pc_cc=float(best["dm_pc_cc"]),
+            snr=float(best["snr"]),
+            width_samples=int(best["width_samples"]),
+            kernel_id=str(best["kernel_id"]),
+            source="csv",
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        _LOG.warning("plotter: malformed C1-window peak row: %s", exc)
         return None
-    if not isinstance(peaks, np.ndarray) or peaks.ndim != 2 or peaks.size == 0:
+
+
+def _resolve_burst(
+    job: PlotJob,
+) -> Tuple[Optional[_BurstPeak], List[Tuple[str, float]]]:
+    """Resolve the burst peak + per-kernel SNRs from detection metadata.
+
+    Prefers the live cluster members; falls back to the archived
+    ``C1_window`` CSV so offline re-renders work with no live state.
+    Returns ``(peak_or_None, [(kernel_id, snr), ...])``.
+    """
+    if job.members:
+        peak = _peak_from_members(job.members)
+        kernels = [(str(m.kernel_id), float(m.snr)) for m in job.members]
+        return peak, kernels
+    rows = _read_window_csv_rows(job.archive_root, job.event_name)
+    peak = _peak_from_csv_rows(rows)
+    kernels: List[Tuple[str, float]] = []
+    for r in rows:
+        try:
+            kernels.append((str(r["kernel_id"]), float(r["snr"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return peak, kernels
+
+
+def _select_burst_chunk(
+    cubes: Sequence[_CubeChunk],
+    peak: Optional[_BurstPeak],
+) -> Optional[_CubeChunk]:
+    """The cube owning the burst (matching the peak's (s, g)).
+
+    Falls back to the first valid 4-D cube when there's no metadata, so
+    the cube-argmax path can still produce a (clearly flagged) plot.
+    """
+    valid = [c for c in cubes if c.cube.ndim == 4 and c.cube.size]
+    if not valid:
         return None
-    if c.cube.ndim == 4 and peaks.shape[0] != c.cube.shape[0]:
+    if peak is not None:
+        for c in valid:
+            if (c.search_node_id == peak.search_node_id
+                    and c.gpu_half == peak.gpu_half):
+                return c
         _LOG.warning(
-            "plotter: cached peak_grid axis-0 (%d) doesn't match cube "
-            "n_fdm (%d) for s%d_g%d; ignoring cache",
-            peaks.shape[0], c.cube.shape[0],
-            c.search_node_id, c.gpu_half,
+            "plotter: burst cube s%d_g%d not found among %d cubes; "
+            "using first available",
+            peak.search_node_id, peak.gpu_half, len(valid),
+        )
+    return valid[0]
+
+
+def _burst_waterfall(chunk: Optional[_CubeChunk]) -> Optional[np.ndarray]:
+    """``cube.max(axis=(2, 3))`` → ``(t_det, n_fdm)`` fp32 for the burst
+    cube only (one full streaming reduction; ~25 MB working set)."""
+    if chunk is None or chunk.cube.ndim != 4 or not chunk.cube.size:
+        return None
+    try:
+        wf = chunk.cube.max(axis=(2, 3))
+    except (TypeError, ValueError) as exc:
+        _LOG.warning(
+            "plotter: waterfall reduce failed on s%d_g%d: %s",
+            chunk.search_node_id, chunk.gpu_half, exc,
         )
         return None
-    return np.asarray(peaks, dtype=np.float32)
+    return np.asarray(wf, dtype=np.float32)
+
+
+def _burst_coords(
+    chunk: Optional[_CubeChunk],
+    waterfall: Optional[np.ndarray],
+    peak: Optional[_BurstPeak],
+) -> Optional[_BurstCoords]:
+    """Resolve in-cube panel coordinates.
+
+    cube axes are ``(t_det, n_fdm, l, m)``. With metadata we take the
+    DM row + (l, m) from the peak and the *time* from the argmax of the
+    DM light curve (``waterfall[:, fdm]``), because the cube's stored
+    ``event_specnum_start`` is the dump key, not the cube's first-sample
+    specnum. Without metadata we fall back to the waterfall global
+    argmax (flagged ``from_metadata=False``).
+    """
+    if waterfall is None or waterfall.ndim != 2 or not waterfall.size:
+        if peak is None:
+            return None
+        # Metadata but no usable cube: still emit DM/(l,m) for context.
+        return _BurstCoords(
+            t_idx=None, fdm_idx=int(peak.fine_dm_idx),
+            l_pix=int(peak.l_pix), m_pix=int(peak.m_pix),
+            dm_pc_cc=peak.dm_pc_cc, snr=peak.snr,
+            width_samples=peak.width_samples,
+            n_fdm=0, t_det=0, from_metadata=True,
+        )
+    t_det, n_fdm = int(waterfall.shape[0]), int(waterfall.shape[1])
+    if peak is not None:
+        fdm = int(np.clip(peak.fine_dm_idx, 0, n_fdm - 1))
+        t_idx = int(np.argmax(waterfall[:, fdm]))
+        l_pix, m_pix = int(peak.l_pix), int(peak.m_pix)
+        return _BurstCoords(
+            t_idx=t_idx, fdm_idx=fdm, l_pix=l_pix, m_pix=m_pix,
+            dm_pc_cc=peak.dm_pc_cc, snr=peak.snr,
+            width_samples=peak.width_samples,
+            n_fdm=n_fdm, t_det=t_det, from_metadata=True,
+        )
+    # Fallback: global argmax of the waterfall, (l, m) from that plane.
+    flat = int(np.argmax(waterfall))
+    t_idx, fdm = (int(v) for v in np.unravel_index(flat, waterfall.shape))
+    dm_val = float(chunk.fine_dm_pc_cc[fdm]) if (
+        chunk is not None and fdm < len(chunk.fine_dm_pc_cc)
+    ) else float(fdm)
+    l_pix = m_pix = 0
+    if chunk is not None:
+        try:
+            plane = np.asarray(chunk.cube[t_idx, fdm], dtype=np.float32)
+            l_pix, m_pix = (
+                int(v) for v in np.unravel_index(int(plane.argmax()), plane.shape)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return _BurstCoords(
+        t_idx=t_idx, fdm_idx=fdm, l_pix=l_pix, m_pix=m_pix,
+        dm_pc_cc=dm_val, snr=float(waterfall.flat[flat]),
+        width_samples=0, n_fdm=n_fdm, t_det=t_det, from_metadata=False,
+    )
 
 
 # ----- panel renderers ----------------------------------------------------
+
+
+_RETICLE = "#ff2d55"  # high-contrast reticle colour over magma/viridis
 
 
 def _placeholder(path: Path, title: str, msg: str) -> Path:
@@ -564,112 +833,88 @@ def _placeholder(path: Path, title: str, msg: str) -> Path:
     return path
 
 
-def _peak_chunks(
-    cubes: Sequence[_CubeChunk],
-) -> List[_CubeChunk]:
-    """Subset of ``cubes`` whose ``peak_grid`` was populated successfully."""
-    return [c for c in cubes if c.peak_grid is not None]
+def _provenance(coords: Optional[_BurstCoords]) -> str:
+    if coords is None:
+        return ""
+    return "" if coords.from_metadata else "  [no metadata: cube argmax]"
 
 
 def _render_dm_time(
     plots_dir: Path,
     event_name: str,
-    cubes: Sequence[_CubeChunk],
-    stats: Optional[ClusterStats],
+    waterfall: Optional[np.ndarray],
+    coords: Optional[_BurstCoords],
 ) -> Path:
     path = plots_dir / f"dm_time_{event_name}.png"
-    if not cubes:
-        return _placeholder(
-            path, f"DM × time — {event_name}", "no cube data",
-        )
-    usable = _peak_chunks(cubes)
-    if not usable:
-        return _placeholder(
-            path, f"DM × time — {event_name}", "cube data malformed",
-        )
+    if waterfall is None or waterfall.size == 0:
+        return _placeholder(path, f"DM × time — {event_name}", "no cube data")
     import matplotlib.pyplot as plt
-    # Concatenate DM axis across chunks (assumes disjoint slices).
-    # Each peak_grid is already shape (n_fdm, n_t), fp32 — no further
-    # cube data is touched here.
-    panels = [c.peak_grid for c in usable]
-    dms: List[float] = []
-    for c in usable:
-        dms.extend(c.fine_dm_pc_cc.tolist())
-    img = np.concatenate(panels, axis=0)
+    # waterfall is (t_det, n_fdm); display DM (y) vs time (x).
+    img = waterfall.T  # (n_fdm, t_det)
     fig, ax = plt.subplots(figsize=(8.0, 4.5))
-    extent = (
-        0, img.shape[1],
-        min(dms) if dms else 0, max(dms) if dms else img.shape[0],
-    )
-    ax.imshow(
-        img, aspect="auto", origin="lower", extent=extent,
-        cmap="viridis",
-    )
-    ax.set_xlabel("time sample")
-    ax.set_ylabel("DM (pc cm⁻³)")
+    im = ax.imshow(img, aspect="auto", origin="lower", cmap="viridis")
+    fig.colorbar(im, ax=ax, label="image-max amplitude")
+    ax.set_xlabel("time sample (within cube)")
+    ax.set_ylabel("fine-DM trial index")
     title = f"DM × time waterfall — {event_name}"
-    if stats is not None:
-        title += f" — SNR_max={stats.snr_max:.1f}, DM_med={stats.dm_median:.1f}"
-    ax.set_title(title)
+    if coords is not None:
+        # Crosshair at the detected (t_peak, DM_peak).
+        if coords.t_idx is not None:
+            ax.axvline(coords.t_idx, color=_RETICLE, lw=1.0, ls="--", alpha=0.9)
+        ax.axhline(coords.fdm_idx, color=_RETICLE, lw=1.0, ls="--", alpha=0.9)
+        if coords.t_idx is not None:
+            ax.plot(
+                coords.t_idx, coords.fdm_idx, marker="+",
+                color=_RETICLE, ms=16, mew=2.0,
+            )
+        title += (
+            f" — burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
+            f"SNR={coords.snr:.1f}" + _provenance(coords)
+        )
+    ax.set_title(title, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=100)
     plt.close(fig)
     return path
 
 
-def _argmax_across_chunks(
-    usable: Sequence[_CubeChunk],
-) -> Tuple[_CubeChunk, int, int, float]:
-    """Return ``(best_chunk, best_fdm, best_t, best_score)`` from cached
-    peak grids — never touches the full cube data."""
-    best_chunk = usable[0]
-    best_fdm = 0
-    best_t = 0
-    best_score = -np.inf
-    for c in usable:
-        pg = c.peak_grid
-        assert pg is not None  # filtered by caller
-        idx = int(np.argmax(pg))
-        score = float(pg.flat[idx])
-        if score > best_score:
-            best_score = score
-            best_chunk = c
-            fdm, t = np.unravel_index(idx, pg.shape)
-            best_fdm, best_t = int(fdm), int(t)
-    return best_chunk, best_fdm, best_t, best_score
-
-
 def _render_image_peak(
     plots_dir: Path,
     event_name: str,
-    cubes: Sequence[_CubeChunk],
-    stats: Optional[ClusterStats],
+    chunk: Optional[_CubeChunk],
+    coords: Optional[_BurstCoords],
 ) -> Path:
     path = plots_dir / f"image_peak_{event_name}.png"
-    if not cubes:
+    if chunk is None or chunk.cube.ndim != 4 or not chunk.cube.size:
         return _placeholder(
             path, f"image at peak — {event_name}", "no cube data",
         )
-    usable = _peak_chunks(cubes)
-    if not usable:
+    if coords is None or coords.t_idx is None:
         return _placeholder(
-            path, f"image at peak — {event_name}", "cube data malformed",
+            path, f"image at peak — {event_name}", "no detection metadata",
         )
     import matplotlib.pyplot as plt
-    best_chunk, best_fdm, best_t, _ = _argmax_across_chunks(usable)
-    # Materialise *only* the single (n_grid, n_grid) image plane —
-    # ~128 KB, vs ~1.7 GB for ``cube.astype(float32)``.
-    img = np.asarray(
-        best_chunk.cube[best_fdm, best_t], dtype=np.float32,
+    # cube[t, fdm] → (l, m) image plane (~128 KB). axis 0 = l, axis 1 = m.
+    t_idx = int(np.clip(coords.t_idx, 0, chunk.cube.shape[0] - 1))
+    fdm = int(np.clip(coords.fdm_idx, 0, chunk.cube.shape[1] - 1))
+    img = np.asarray(chunk.cube[t_idx, fdm], dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(6.2, 5.6))
+    im = ax.imshow(img, origin="lower", cmap="magma")
+    fig.colorbar(im, ax=ax, label="amplitude")
+    # Reticle at the detected (l, m): x = m (cols), y = l (rows).
+    ax.axhline(coords.l_pix, color=_RETICLE, lw=0.8, ls="--", alpha=0.8)
+    ax.axvline(coords.m_pix, color=_RETICLE, lw=0.8, ls="--", alpha=0.8)
+    ax.add_patch(plt.Circle(
+        (coords.m_pix, coords.l_pix), radius=8.0,
+        fill=False, edgecolor=_RETICLE, lw=1.8,
+    ))
+    ax.set_xlabel("m (pix)")
+    ax.set_ylabel("l (pix)")
+    title = (
+        f"image at (DM={coords.dm_pc_cc:.1f}, t={t_idx}) — {event_name} — "
+        f"burst (l,m)=({coords.l_pix},{coords.m_pix})" + _provenance(coords)
     )
-    fig, ax = plt.subplots(figsize=(6.0, 5.5))
-    ax.imshow(img, origin="lower", cmap="magma")
-    ax.set_xlabel("l (pix)")
-    ax.set_ylabel("m (pix)")
-    title = f"image at peak — {event_name}"
-    if stats is not None:
-        title += f" — DM={best_chunk.fine_dm_pc_cc[best_fdm]:.1f}"
-    ax.set_title(title)
+    ax.set_title(title, fontsize=9)
     fig.tight_layout()
     fig.savefig(path, dpi=100)
     plt.close(fig)
@@ -679,38 +924,35 @@ def _render_image_peak(
 def _render_lightcurve(
     plots_dir: Path,
     event_name: str,
-    cubes: Sequence[_CubeChunk],
-    stats: Optional[ClusterStats],
+    waterfall: Optional[np.ndarray],
+    coords: Optional[_BurstCoords],
 ) -> Path:
     path = plots_dir / f"lightcurve_{event_name}.png"
-    if not cubes:
+    if waterfall is None or waterfall.size == 0:
+        return _placeholder(path, f"lightcurve — {event_name}", "no cube data")
+    if coords is None:
         return _placeholder(
-            path, f"lightcurve — {event_name}", "no cube data",
-        )
-    usable = _peak_chunks(cubes)
-    if not usable:
-        return _placeholder(
-            path, f"lightcurve — {event_name}", "cube data malformed",
+            path, f"lightcurve — {event_name}", "no detection metadata",
         )
     import matplotlib.pyplot as plt
-    best_chunk, best_fdm, _, _ = _argmax_across_chunks(usable)
-    # ``cube[fdm].max(axis=(1, 2))`` == ``peak_grid[fdm]`` because max
-    # commutes with axis-aligned slicing. No cube touch needed —
-    # peak_grid is already cached.
-    pg = best_chunk.peak_grid
-    assert pg is not None
-    lc = np.asarray(pg[best_fdm], dtype=np.float32)
-    fig, ax = plt.subplots(figsize=(8.0, 3.5))
+    # Light curve = image-max time series at the detected DM row.
+    fdm = int(np.clip(coords.fdm_idx, 0, waterfall.shape[1] - 1))
+    lc = np.asarray(waterfall[:, fdm], dtype=np.float32)
+    fig, ax = plt.subplots(figsize=(8.0, 3.6))
     ax.plot(lc, color="#0984e3", lw=1.5)
-    ax.set_xlabel("time sample")
+    if coords.t_idx is not None:
+        ax.axvline(
+            coords.t_idx, color=_RETICLE, lw=1.4, ls="--",
+            label=f"burst t={coords.t_idx}",
+        )
+        ax.legend(loc="upper right", fontsize=9)
+    ax.set_xlabel("time sample (within cube)")
     ax.set_ylabel("peak amplitude (image max)")
     title = (
-        f"lightcurve — {event_name} — "
-        f"DM={best_chunk.fine_dm_pc_cc[best_fdm]:.1f}"
+        f"lightcurve at DM={coords.dm_pc_cc:.1f} pc cm⁻³ — {event_name} — "
+        f"SNR={coords.snr:.1f}" + _provenance(coords)
     )
-    if stats is not None:
-        title += f", SNR_max={stats.snr_max:.1f}"
-    ax.set_title(title)
+    ax.set_title(title, fontsize=10)
     fig.tight_layout()
     fig.savefig(path, dpi=100)
     plt.close(fig)
@@ -720,18 +962,18 @@ def _render_lightcurve(
 def _render_kernel_snrs(
     plots_dir: Path,
     event_name: str,
-    members: Sequence[WindowEntry],
+    kernels: Sequence[Tuple[str, float]],
 ) -> Path:
     path = plots_dir / f"kernel_snrs_{event_name}.png"
-    if not members:
+    if not kernels:
         return _placeholder(
             path, f"kernel SNR distribution — {event_name}",
             "no cluster members",
         )
     import matplotlib.pyplot as plt
     by_kernel: dict[str, List[float]] = {}
-    for m in members:
-        by_kernel.setdefault(m.kernel_id, []).append(m.snr)
+    for kid, snr in kernels:
+        by_kernel.setdefault(kid, []).append(float(snr))
     labels = sorted(by_kernel.keys())
     maxes = [max(by_kernel[k]) for k in labels]
     counts = [len(by_kernel[k]) for k in labels]
@@ -751,3 +993,93 @@ def _render_kernel_snrs(
     fig.savefig(path, dpi=100)
     plt.close(fig)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Offline re-render (remake plots for archived events with cubes)
+# ---------------------------------------------------------------------------
+
+
+def regenerate_recent_events(
+    archive_root: Path,
+    *,
+    event_names: Optional[Sequence[str]] = None,
+    limit: Optional[int] = None,
+) -> List[str]:
+    """Re-render plots for archived events that have dumped cubes.
+
+    Resolves the burst from each event's ``Level2/C1_window_<name>.csv``
+    (no live state needed) and rewrites the 4 PNGs into
+    ``Level2/plots/``. When ``event_names`` is omitted, scans
+    ``archive_root`` for event dirs containing ``cubes/*.npz``, newest
+    first, optionally capped at ``limit``. Returns the event names
+    processed.
+    """
+    archive_root = Path(archive_root)
+    if event_names is None:
+        candidates: List[Tuple[float, str]] = []
+        for d in archive_root.iterdir():
+            if not d.is_dir():
+                continue
+            cubes_dir = d / "cubes"
+            if not cubes_dir.is_dir():
+                continue
+            npzs = list(cubes_dir.glob("cube_s*_g*_*.npz"))
+            if not npzs:
+                continue
+            mtime = max(p.stat().st_mtime for p in npzs)
+            candidates.append((mtime, d.name))
+        candidates.sort(reverse=True)
+        names = [name for _, name in candidates]
+        if limit is not None:
+            names = names[: int(limit)]
+    else:
+        names = list(event_names)
+
+    done: List[str] = []
+    for name in names:
+        try:
+            render_event_plots(PlotJob(event_name=name, archive_root=archive_root))
+            done.append(name)
+            _LOG.info("plotter: regenerated plots for %s", name)
+        except Exception:  # noqa: BLE001
+            _LOG.exception("plotter: regeneration failed for %s", name)
+    return done
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Re-render C2 cube event plots from the archive.",
+    )
+    parser.add_argument(
+        "--archive-root", default="/dataz/dsa110/candidates",
+        help="event archive root (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--event", action="append", dest="events", default=None,
+        help="event name(s) to re-render; repeatable. Default: scan for "
+             "recent events that have cubes.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="when scanning, cap to the N most recent events with cubes.",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="debug logging",
+    )
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    done = regenerate_recent_events(
+        Path(args.archive_root), event_names=args.events, limit=args.limit,
+    )
+    print(f"regenerated {len(done)} event(s): {', '.join(done) or '(none)'}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(_main())

@@ -378,6 +378,20 @@ c1:
                                      # blocks and published to /mon/search_rt/<cn>/compute/<half> -> influx
                                      # -> grafana. Set to 0 / remove to disable (ship every survivor).
                                      # RT-safe: selection is O(k log N) and skipped entirely under the cap.
+  dm_width_floor_frac: 0.6           # 2026-05-30 physical-plausibility filter: drop candidates whose
+                                     # boxcar width is below this fraction of the DM-smearing floor for
+                                     # their DM (intra-8ch-summed-channel dispersion smearing), using the
+                                     # ACTUAL per-cube sample period (prod t_int_search = 1048.576 us =>
+                                     # smear ~1.8 samples at DM2500). The search flooded C2 with field-
+                                     # filling, time-incoherent width-1 spikes at DM~2538 that matched
+                                     # bright_pulsar and drove a dump storm (-> GIL-starved C2, 34-min
+                                     # C1->C2 stall). At 0.6 a candidate is dropped when width < 0.6 x
+                                     # smear(DM): at prod cadence this sheds width-1 above DM~2330 (the
+                                     # clearly-unphysical set) while KEEPING width-2 high-DM detections
+                                     # (which are consistent with smearing there) and all low-DM narrow
+                                     # events (floor is sub-sample at low DM). Width alone is not a strong
+                                     # artifact discriminator at prod cadence -- the criteria + dump-rate
+                                     # cap do the heavy lifting; this is cheap defense-in-depth. 0=off.
   dump_listener:
     bind_host: ""                    # filled per-host via --c1-bind-host above
     base_port: 11227                 # actual port = base_port + gpu_half
@@ -485,6 +499,16 @@ coinc:
   plotter:
     n_workers: 2
     per_event_timeout_s: 30.0
+    use_process_pool: true           # 2026-05-30 resilience: render plots in a separate PROCESS, not a
+                                     # thread. Cubes (~855 MB) + matplotlib are GIL-heavy; in a thread they
+                                     # serialise against C2's single asyncio loop and can starve the C1
+                                     # receiver (observed: a dump storm wedged the loop ~34 min, flatlining
+                                     # C1->C2). A process pool isolates that CPU/IO. false = legacy threads.
+  dump_rate_max_per_window: 6        # 2026-05-30 resilience: max full-fleet dump broadcasts per rolling
+  dump_rate_window_s: 60.0           # window. Bounds a cube-dump storm from a single persistently-noisy
+                                     # source regardless of candidate volume (the proximate cause of the C2
+                                     # stall). Audit trail is still written for capped events; only the UDP
+                                     # fan-out + plot scheduling are skipped. Set max=0 to disable the cap.
   # Event-name allocator (event.names + etcd /mon/corr/1/trigger):
   etcd_lastname_key: "/mon/corr/1/trigger"
   event_pkg_path: "/home/ubuntu/proj/dsa110-shell/dsa110-event"

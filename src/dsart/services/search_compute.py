@@ -64,9 +64,13 @@ from ..cluster import (
 from ..coinc.wire import build_header
 from ..common.constants import (
     CUBE_CADENCE_SAMPLES_DEFAULT,
+    DELTA_NU_CH_GHZ,
     DETECTOR_IMAGE_KERNELS,
     DETECTOR_DM_KERNELS,
     DETECTOR_TIME_KERNELS,
+    K_DM_MS_GHZ2_PC,
+    NU_BOT_PROC_GHZ,
+    NU_TOP_PROC_GHZ,
     T_INT_SEARCH_US_DEFAULT,
 )
 from ..common.contracts import Candidate, CubeGeometry
@@ -136,6 +140,81 @@ def meter_candidates(
         key=lambda c: (int(c.width_samples), -float(c.snr)),
     )
     return kept, n - len(kept)
+
+
+# corr_fast F33 op-point: fine channels collapsed into one effective
+# channel BEFORE dedispersion (``CorrFastConfig.chan_sum_factor``). The
+# intra-summed-channel dispersion smearing — the irreducible pulse
+# broadening a genuine dispersed burst suffers — scales with this.
+_DEDISP_CHAN_SUM_FACTOR = 8
+
+
+def dm_smear_samples(
+    dm_pc_cc: float,
+    *,
+    chan_sum_factor: int = _DEDISP_CHAN_SUM_FACTOR,
+    t_search_us: float = T_INT_SEARCH_US_DEFAULT,
+) -> float:
+    """Band-averaged intra-(summed-)channel dispersion smearing at
+    ``dm_pc_cc``, in search-sample units.
+
+    A real cold-plasma-dispersed burst at this DM cannot be narrower
+    than ~this many samples: each summed channel (``chan_sum_factor`` ×
+    the native 30.5 kHz channel) smears the pulse by the differential
+    dispersion delay across its own width, an irreducible floor that
+    incoherent dedispersion does not remove. Verified against the
+    codebase's own characterisation (corr_fast note: ~2.7 ms at DM 3000,
+    ν = 1.31 GHz). Returns 0.0 for non-positive DM. Pure + RT-cheap."""
+    if dm_pc_cc <= 0.0:
+        return 0.0
+    dnu = DELTA_NU_CH_GHZ * float(chan_sum_factor)  # summed-channel BW (GHz)
+
+    def _smear_ms(nu: float) -> float:
+        lo = nu - dnu / 2.0
+        hi = nu + dnu / 2.0
+        return K_DM_MS_GHZ2_PC * dm_pc_cc * (lo ** -2 - hi ** -2)
+
+    avg_ms = 0.5 * (_smear_ms(NU_BOT_PROC_GHZ) + _smear_ms(NU_TOP_PROC_GHZ))
+    return avg_ms * 1000.0 / float(t_search_us)
+
+
+def filter_unphysical_narrow(
+    candidates: List[Candidate],
+    floor_frac: Optional[float],
+    *,
+    t_search_us: float = T_INT_SEARCH_US_DEFAULT,
+) -> "tuple[List[Candidate], int]":
+    """Drop candidates far narrower than the DM-smearing floor permits.
+
+    A candidate is rejected when its boxcar ``width_samples`` is below
+    ``floor_frac × dm_smear_samples(dm_fine, t_search_us=...)`` — i.e.
+    much narrower than intra-channel dispersion smearing allows for its
+    DM. Returns ``(kept, n_dropped)``.
+
+    ``t_search_us`` MUST be the actual detection-sample period (the
+    production op-point is 1048.576 µs = 32 native samples; the service
+    passes the per-cube ``geom.sample_period_us``). At that cadence the
+    smearing floor at DM≈2500 is ~1.8 samples, so width-2 high-DM
+    detections are *consistent* with smearing and only clearly-narrow
+    (width-1) high-DM detections are rejected — the safely-discardable
+    set. (The decisive artifact discriminator is spatial/temporal
+    incoherence, handled by the trigger criteria + dump-rate cap, not by
+    width alone.)
+
+    ``floor_frac`` of ``None`` / ``<= 0`` disables the filter. RT-safe:
+    a single linear pass with no sort/heap. The floor is sub-sample at
+    low DM, so low-DM candidates are never affected (genuine narrow
+    low-DM events pass untouched)."""
+    if floor_frac is None or floor_frac <= 0.0 or not candidates:
+        return candidates, 0
+    kept = [
+        c
+        for c in candidates
+        if float(c.width_samples) >= floor_frac * dm_smear_samples(
+            float(c.dm_fine), t_search_us=t_search_us,
+        )
+    ]
+    return kept, len(candidates) - len(kept)
 
 
 _LOG = logging.getLogger("dsart.services.search_compute")
@@ -389,6 +468,10 @@ class SearchComputeService:
         # M7.6: cumulative candidates dropped pre-transmit by the C1→C2
         # width cap (c1.max_c1c2_width_samples).
         self._c1_cands_dropped_width = 0
+        # 2026-05-30: cumulative candidates dropped pre-transmit by the
+        # DM-smearing-floor filter (c1.dm_width_floor_frac) — unphysically
+        # narrow high-DM detections (impulsive RFI on a high-DM trial).
+        self._c1_cands_dropped_dmfloor = 0
         # M7.6: C1→C2 metering (cap candidates/block, narrow-then-bright).
         # ``_c1_cands_dropped_meter`` is cumulative; the ``_meter_*`` window
         # accumulators roll up every ``_METER_WINDOW_BLOCKS`` cubes into a
@@ -620,6 +703,7 @@ class SearchComputeService:
             "c1_batches_submitted": int(self._c1_batches_submitted),
             "c1_batches_dropped": int(self._c1_batches_dropped),
             "c1_cands_dropped_width": int(self._c1_cands_dropped_width),
+            "c1_cands_dropped_dmfloor": int(self._c1_cands_dropped_dmfloor),
             "c1_cands_dropped_meter": int(self._c1_cands_dropped_meter),
             "search_node_id": int(self._config.search_node_id),
             "gpu_half": int(self._config.gpu_half),
@@ -1045,6 +1129,25 @@ class SearchComputeService:
         via the emitter's mon-points + the service's own counters."""
         assert self._c1_emit is not None
         cfg = self._config
+        # 2026-05-30: drop candidates far narrower than the DM-smearing
+        # floor permits BEFORE the width cap. These are impulsive RFI
+        # mis-assigned to a high-DM trial (cannot be genuine dispersed
+        # signals); rejecting them at the source stops the C2 dump-storm
+        # failure mode without touching real (low-DM-narrow or high-DM-
+        # smeared) events. Cube dump + retention run off the full list
+        # upstream and are unaffected.
+        dm_floor_frac = (
+            cfg.c1_emit_config.dm_width_floor_frac
+            if cfg.c1_emit_config is not None
+            else None
+        )
+        if dm_floor_frac is not None and candidates:
+            candidates, n_dm_dropped = filter_unphysical_narrow(
+                candidates, dm_floor_frac,
+                t_search_us=float(geom.sample_period_us),
+            )
+            if n_dm_dropped:
+                self._c1_cands_dropped_dmfloor += n_dm_dropped
         # M7.6: drop candidates wider than the configured C1→C2 width cap
         # BEFORE they are transmitted. Wide boxcars (≥32) are the on-sky
         # false-positive floor; capping at ``max_width_samples`` keeps the
@@ -1610,6 +1713,7 @@ def _build_search_config_from_yaml(
     if enable_c1 and c2_endpoint:
         _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
         _max_cands_block = c1.get("max_candidates_per_block", None)
+        _dm_width_floor = c1.get("dm_width_floor_frac", None)
         c1_emit_cfg = C1EmitConfig(
             host=str(c2_endpoint.get("host", "h23")),
             port=int(c2_endpoint.get("port", 11500)),
@@ -1624,6 +1728,11 @@ def _build_search_config_from_yaml(
             max_candidates_per_block=(
                 int(_max_cands_block)
                 if _max_cands_block is not None and int(_max_cands_block) > 0
+                else None
+            ),
+            dm_width_floor_frac=(
+                float(_dm_width_floor)
+                if _dm_width_floor is not None and float(_dm_width_floor) > 0.0
                 else None
             ),
         )
