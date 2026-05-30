@@ -3021,6 +3021,56 @@ def _serialise_block(
     (block_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
 
+def _publish_corr_fast_ready(
+    cn_id: "int | None",
+    *,
+    ready: bool,
+    warmup_s: "float | None" = None,
+    n_blocks: "int | None" = None,
+) -> None:
+    """Publish corr_fast warmup/readiness state to etcd.
+
+    The dashboard system-state banner uses this to tell operators when
+    it is safe to arm (utc_start). It MUST NOT arm until every corr_fast
+    has finished its kernel warmup -- arming earlier lets capture data
+    flow into fada while the consumer is still JIT-compiling, which pins
+    fada at 70/70 and drops packets on sky (see _warmup_pipeline_jit).
+
+    The orchestrator's ``state`` flips to "running" as soon as the
+    routines are spawned -- i.e. *before* this warmup completes -- so it
+    is not a usable "ready to arm" signal. This per-process record is.
+
+    Keyed at ``/mon/corr_rt/<cn>/corr_fast_ready`` and stamped with the
+    current PID so the dashboard can reject a stale record left by a
+    previous run (it only trusts a record whose pid matches the live
+    ``routines["corr_fast"].pid`` the orchestrator publishes).
+
+    Two one-shot writes per process (warmup start + completion); never on
+    the hot path. Best-effort: any etcd error is logged and swallowed so
+    a monitoring hiccup can never sink the search pipeline.
+    """
+    if cn_id is None:
+        return
+    try:
+        from dsautils.dsa_store import DsaStore
+
+        payload = {
+            "ready": bool(ready),
+            "pid": os.getpid(),
+            "time_mjd": time.time() / 86400.0 + 40587.0,
+            "warmup_blocks": n_blocks,
+            "warmup_s": round(warmup_s, 2) if warmup_s is not None else None,
+        }
+        DsaStore().put_dict(
+            f"/mon/corr_rt/{int(cn_id)}/corr_fast_ready", payload
+        )
+    except Exception:  # noqa: BLE001 — monitoring must never sink the pipe
+        LOG.warning(
+            "corr_fast readiness publish failed (cn=%s ready=%s)",
+            cn_id, ready, exc_info=True,
+        )
+
+
 def _warmup_pipeline_jit(
     ctx: IntegrationContext,
     *,
@@ -3681,8 +3731,17 @@ def run(
             _warmup_n = int(os.environ.get("DSART_FAST_WARMUP_BLOCKS", "4"))
         except (TypeError, ValueError):
             _warmup_n = 4
+        # Publish "warming" so the dashboard shows PREPARING (not safe to
+        # arm yet) for the full JIT window, then "ready" once kernels are
+        # hot so the operator knows it is safe to utc_start.
+        _publish_corr_fast_ready(rfi_mon_cn_id, ready=False, n_blocks=_warmup_n)
+        _warmup_t0 = time.time()
         _warmup_pipeline_jit(
             ctx, expected_fada_bytes=expected_fada_bytes, n_blocks=_warmup_n,
+        )
+        _publish_corr_fast_ready(
+            rfi_mon_cn_id, ready=True,
+            warmup_s=time.time() - _warmup_t0, n_blocks=_warmup_n,
         )
 
         # M7.2 (2026-05-19) ready-sentinel hook: signal the orchestrator

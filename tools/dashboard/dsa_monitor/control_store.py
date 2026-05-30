@@ -330,6 +330,167 @@ def compute_arm_seq(
 
 
 # ---------------------------------------------------------------------------
+# System state (the Control-tab banner)
+# ---------------------------------------------------------------------------
+#
+# One rolled-up lifecycle state for the whole fleet, so the operator
+# knows -- at a glance -- whether it is safe to arm. The crucial
+# distinction is PREPARING vs PREPARED: arming (utc_start) during the
+# corr_fast kernel warmup floods fada to 70/70 and drops packets on sky
+# (see corr_fast_integration._warmup_pipeline_jit). The orchestrator
+# ``state`` flips to "running" *before* warmup finishes, so we rely on
+# the per-process ``corr_fast_ready`` record (pid-matched to the live
+# routine) for the "warmed, safe to arm" signal.
+
+_STATE_STALE_S: float = 25.0  # heartbeat older than this == not reporting
+
+# Machine-state -> (display label, css class, one-line meaning).
+SYSTEM_STATES: dict[str, dict[str, str]] = {
+    "offline":   {"label": "OFFLINE",   "meaning": "orchestrators not reachable"},
+    "ready":     {"label": "READY",     "meaning": "services up, pipeline stopped"},
+    "preparing": {"label": "PREPARING", "meaning": "pipeline warming up — do NOT arm yet"},
+    "prepared":  {"label": "PREPARED",  "meaning": "warmed — safe to arm (utc_start)"},
+    "observing": {"label": "OBSERVING", "meaning": "armed — capture writing voltages"},
+}
+
+
+def _is_fresh(payload: Any, now_mjd: float, stale_s: float = _STATE_STALE_S) -> bool:
+    """True if a /mon heartbeat dict carries a ``time_mjd`` within
+    ``stale_s`` of now. A stale or missing stamp == not reporting."""
+    if not isinstance(payload, dict):
+        return False
+    try:
+        age_s = (now_mjd - float(payload["time_mjd"])) * 86400.0
+    except (KeyError, TypeError, ValueError):
+        return False
+    return -5.0 <= age_s <= stale_s
+
+
+def compute_system_state(
+    store: ControlStore,
+    *,
+    corr_cn_ids: Iterable[int] = CORR_CN_IDS,
+    search_cn_ids: Iterable[int] = SEARCH_CN_IDS,
+    ports: Iterable[int] = CAPTURE_UDP_PORTS,
+) -> dict[str, Any]:
+    """Roll the fleet up into one lifecycle state for the Control banner.
+
+    Returns ``{state, label, meaning, detail, safe_to_arm, counts}``.
+    Precedence: offline > observing > preparing > prepared > ready.
+    Best-effort: any etcd error degrades that node to "not reporting"
+    rather than raising.
+    """
+    import time as _time
+
+    now_mjd = _time.time() / 86400.0 + 40587.0
+    corr_cn_ids = list(corr_cn_ids)
+    search_cn_ids = list(search_cn_ids)
+
+    def _get(key: str) -> Any:
+        try:
+            return store.get_dict(key)
+        except Exception as exc:                                   # noqa: BLE001
+            LOG.debug("system_state get_dict(%s) failed: %s", key, exc)
+            return None
+
+    # ---- reachability ---------------------------------------------------
+    corr_mon = {cn: _get(f"/mon/corr_rt/{cn}") for cn in corr_cn_ids}
+    reachable = {
+        cn: d for cn, d in corr_mon.items() if _is_fresh(d, now_mjd)
+    }
+    n_search_up = sum(
+        1 for cn in search_cn_ids
+        if _is_fresh(_get(f"/mon/search_rt/{cn}"), now_mjd)
+    )
+
+    counts: dict[str, Any] = {
+        "corr_total": len(corr_cn_ids),
+        "corr_up": len(reachable),
+        "search_total": len(search_cn_ids),
+        "search_up": n_search_up,
+    }
+
+    def _result(state: str, detail: str, *, safe: bool = False) -> dict[str, Any]:
+        meta = SYSTEM_STATES[state]
+        return {
+            "state": state,
+            "label": meta["label"],
+            "meaning": meta["meaning"],
+            "detail": detail,
+            "safe_to_arm": safe,
+            "counts": counts,
+        }
+
+    if not reachable and n_search_up == 0:
+        return _result(
+            "offline",
+            "No corr/search orchestrators are reporting to etcd. "
+            "Start the orchestrators (or run the fleet launch).",
+        )
+
+    # ---- running vs stopped --------------------------------------------
+    running = {
+        cn: d for cn, d in reachable.items()
+        if str(d.get("state")) in ("running", "starting")
+    }
+    if not running:
+        return _result(
+            "ready",
+            f"{len(reachable)}/{len(corr_cn_ids)} corr orchestrators up, "
+            f"pipeline stopped. Send start to spin up the pipeline.",
+        )
+
+    # ---- observing? (any capture actively writing voltages) ------------
+    n_writing = 0
+    for cn in running:
+        for p in ports:
+            c = _get(f"/mon/corr_rt/{cn}/capture/{p}")
+            if isinstance(c, dict) and str(c.get("arm_state", "")).upper() == "WRITING":
+                n_writing += 1
+    counts["captures_writing"] = n_writing
+    if n_writing > 0:
+        return _result(
+            "observing",
+            f"{n_writing} capture(s) writing voltages; "
+            f"{len(running)}/{len(corr_cn_ids)} corr nodes running"
+            + ("" if len(running) == len(corr_cn_ids)
+               else f" ({len(corr_cn_ids) - len(running)} not running)"),
+        )
+
+    # ---- preparing vs prepared (corr_fast kernel warmup) ---------------
+    warmed: list[int] = []
+    warming: list[int] = []
+    for cn, d in running.items():
+        live_pid = ((d.get("routines") or {}).get("corr_fast") or {}).get("pid")
+        rd = _get(f"/mon/corr_rt/{cn}/corr_fast_ready")
+        is_warm = bool(
+            isinstance(rd, dict)
+            and rd.get("ready") is True
+            and live_pid is not None
+            and rd.get("pid") == live_pid
+        )
+        (warmed if is_warm else warming).append(cn)
+    counts["corr_running"] = len(running)
+    counts["corr_warmed"] = len(warmed)
+
+    if warming:
+        return _result(
+            "preparing",
+            f"{len(warmed)}/{len(running)} corr_fast warmed — wait before "
+            f"arming. Warming: {sorted(warming)}.",
+        )
+    return _result(
+        "prepared",
+        f"all {len(running)} running corr_fast warmed — safe to arm "
+        "(utc_start)."
+        + ("" if len(running) == len(corr_cn_ids)
+           else f" Note: {len(corr_cn_ids) - len(running)} corr node(s) "
+                "not running."),
+        safe=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # M7.4 Phase 6c: corr_fast service-start epoch arm for injection
 # ---------------------------------------------------------------------------
 #

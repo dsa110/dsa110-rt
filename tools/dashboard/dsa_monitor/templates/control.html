@@ -1,79 +1,113 @@
 {% extends "base.html" %}
 {% block head_extra %}
 <style>
+    /* ---- Control tab: high-contrast dark panels on the light app ---- */
     .control-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-    .panel { background: #1e2729; border: 1px solid #34495e; border-radius: 6px; padding: 16px; }
-    .panel h3 { margin-top: 0; }
-    .verb-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
-    .verb-row label { min-width: 130px; color: #bdc3c7; }
+    @media (max-width: 1100px) { .control-wrap { grid-template-columns: 1fr; } }
+
+    .panel {
+        background: #1b2630; border: 1px solid #33485a; border-radius: 10px;
+        padding: 18px 20px; color: #e8edf1;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+    }
+    .panel h3 {
+        margin-top: 0; color: #ffffff; font-size: 13px;
+        text-transform: uppercase; letter-spacing: .05em;
+        border-bottom: 1px solid #33485a; padding-bottom: 8px; margin-bottom: 12px;
+    }
+    .panel h4 { color: #cfd8e0; margin: 10px 0 6px; font-size: 13px; }
+    .panel p, .panel li, .panel td, .panel label, .panel div { color: #d4dde4; }
+    .panel .muted, .muted { color: #9fb0bd; font-size: 12px; }
+    .panel code {
+        color: #ffd479; background: rgba(255,255,255,0.07);
+        padding: 0 4px; border-radius: 3px; font-size: 0.92em;
+        font-family: 'Menlo','Consolas',monospace;
+    }
+    .panel a { color: #5fb0ef; }
+    .panel a:hover { color: #8fc8f5; }
+
+    .verb-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+    .verb-row label { min-width: 130px; color: #cfd8e0; font-weight: 600; }
     .verb-row input[type="text"], .verb-row input[type="number"] {
-        background: #0f1416; color: #ecf0f1; border: 1px solid #34495e;
-        padding: 4px 8px; width: 140px; font-family: monospace;
+        background: #0d1419; color: #f4f8fb; border: 1px solid #3a5266;
+        padding: 5px 9px; width: 150px; font-family: monospace; border-radius: 4px;
     }
+    .verb-row input:focus { outline: none; border-color: #5fb0ef; }
     .verb-row button {
-        background: #2980b9; color: white; border: 0; padding: 6px 14px;
-        cursor: pointer; font-weight: 600;
+        background: #2e86de; color: white; border: 0; padding: 7px 16px;
+        cursor: pointer; font-weight: 700; border-radius: 5px;
     }
-    .verb-row button.danger { background: #c0392b; }
-    .verb-row button:disabled { background: #7f8c8d; cursor: not-allowed; }
-    .info-blob { background: #0f1416; border: 1px solid #34495e;
-                 padding: 10px; font-family: monospace; font-size: 12px;
-                 white-space: pre-wrap; overflow-x: auto; }
-    .stat { color: #f1c40f; font-family: monospace; }
-    .ok    { color: #2ecc71; }
-    .err   { color: #e74c3c; }
+    .verb-row button:hover { background: #1f6fc0; }
+    .verb-row button.danger { background: #d63031; }
+    .verb-row button.danger:hover { background: #b71c1c; }
+    .verb-row button:disabled { background: #5a6b78; cursor: not-allowed; }
+
+    .info-blob {
+        background: #0d1419; border: 1px solid #33485a; color: #cdd9e1;
+        padding: 10px 12px; font-family: 'Menlo','Consolas',monospace; font-size: 12px;
+        white-space: pre-wrap; overflow-x: auto; border-radius: 6px;
+    }
+    .stat { color: #ffd479; font-family: monospace; font-weight: 700; }
+    .ok    { color: #4cd97b; }
+    .err   { color: #ff6b6b; }
     .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; }
     .audit-table th, .audit-table td {
-        padding: 4px 6px; border-bottom: 1px solid #34495e; text-align: left;
+        padding: 5px 7px; border-bottom: 1px solid #2c3e4c; text-align: left; color: #d4dde4;
     }
-    .audit-table th { background: #1e2729; }
+    .audit-table th {
+        background: #22323f; color: #aebcc7; text-transform: uppercase;
+        font-size: 11px; letter-spacing: .04em;
+    }
     .audit-table .ts { white-space: nowrap; font-family: monospace; }
     .response { margin-top: 8px; }
+
+    /* ---- System-state banner (top of Control) ---------------------- */
+    .sysstate {
+        display: flex; align-items: center; gap: 16px;
+        border-radius: 12px; padding: 16px 22px; margin: 4px 0 22px;
+        background: #1b2630; border: 1px solid #33485a;
+        border-left: 10px solid #7f8c8d;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.20);
+    }
+    .sysstate .dot {
+        width: 16px; height: 16px; border-radius: 50%;
+        background: #7f8c8d; flex: 0 0 auto;
+        box-shadow: 0 0 0 4px rgba(127,140,141,0.25);
+    }
+    .sysstate .txt { display: flex; flex-direction: column; gap: 2px; }
+    .sysstate .label { font-size: 24px; font-weight: 800; letter-spacing: .04em; color: #fff; line-height: 1.1; }
+    .sysstate .meaning { font-size: 13px; color: #cfd8e0; font-weight: 600; }
+    .sysstate .detail { font-size: 12px; color: #9fb0bd; }
+    .sysstate .counts { margin-left: auto; font-size: 12px; color: #aebcc7; font-family: 'Menlo','Consolas',monospace; text-align: right; white-space: nowrap; }
+
+    .ss-offline   { border-left-color:#e74c3c; } .ss-offline   .dot{background:#e74c3c;box-shadow:0 0 0 4px rgba(231,76,60,.25);} .ss-offline   .label{color:#ff8b7e;}
+    .ss-ready     { border-left-color:#3498db; } .ss-ready     .dot{background:#3498db;box-shadow:0 0 0 4px rgba(52,152,219,.25);} .ss-ready     .label{color:#7fc4f5;}
+    .ss-preparing { border-left-color:#f39c12; } .ss-preparing .dot{background:#f39c12;box-shadow:0 0 0 4px rgba(243,156,18,.30);animation:sspulse 1.2s infinite;} .ss-preparing .label{color:#ffc861;}
+    .ss-prepared  { border-left-color:#2ecc71; } .ss-prepared  .dot{background:#2ecc71;box-shadow:0 0 0 4px rgba(46,204,113,.30);} .ss-prepared  .label{color:#67e29a;}
+    .ss-observing { border-left-color:#1abc9c; } .ss-observing .dot{background:#1dd1a1;box-shadow:0 0 0 4px rgba(29,209,161,.35);animation:sspulse 1.6s infinite;} .ss-observing .label{color:#5ee7c8;}
+    @keyframes sspulse { 0%{opacity:1;} 50%{opacity:.30;} 100%{opacity:1;} }
 </style>
 {% endblock %}
 
 {% block content %}
 <h2>Fleet Control</h2>
-<p class="muted">
-    M7.4 Phase 8 v1: <strong>4 verbs</strong> (start / stop / utc_start /
-    utc_stop) wired against the dsart-rt orchestrator's etcd command
-    surface. Every action is audited at <code>/mon/audit/control/</code>.
-    Network ACL on h23 is the only authentication today —
-    <a href="/static/about" style="color:#3498db;">see docs/M7.4_PHASE8_CONTROL.md</a>.
-    Partial-restart + auto-arm are v2 (require new orchestrator verb).
-</p>
 
-<div class="control-wrap">
-
-    <!-- LEFT COLUMN: state summary -->
-    <div class="panel">
-        <h3>Fleet readiness</h3>
-        <p class="muted">
-            corr cn_ids ({{ corr_cn_ids|length }}): {{ corr_cn_ids|join(', ') }}<br>
-            search cn_ids ({{ search_cn_ids|length }}): {{ search_cn_ids|join(', ') }}<br>
-            broadcast key: <code>/cmd/corr_rt/0</code> (corr only;
-            search uses per-cn fanout)
-        </p>
-        <h4>Next ARM_SEQ candidate</h4>
-        {% if arm_info.arm_seq is not none %}
-            <p>
-                <span class="stat">ARM_SEQ = {{ arm_info.arm_seq }}</span>
-                = max_last_seq_no ({{ arm_info.max_last_seq_no }}) +
-                margin ({{ arm_info.margin }})<br>
-                <span class="muted">source: <code>{{ arm_info.max_source }}</code></span><br>
-                {{ arm_info.answered|length }} capture(s) reporting,
-                {{ arm_info.missing|length }} missing
-            </p>
-        {% else %}
-            <p class="err">
-                No captures reporting last_seq_no — the orchestrator(s)
-                are either stopped or pre-arm. Start the fleet first,
-                then refresh.
-            </p>
-        {% endif %}
+<!-- System state banner: one rolled-up lifecycle state for the fleet.
+     The crucial cue is PREPARING (warming — do NOT arm) vs PREPARED
+     (warmed — safe to utc_start). Polls /control/system_state. -->
+<div id="sysstate" class="sysstate ss-unknown">
+    <div class="dot"></div>
+    <div class="txt">
+        <div class="label" id="ss-label">… loading</div>
+        <div class="meaning" id="ss-meaning">querying fleet state…</div>
+        <div class="detail" id="ss-detail"></div>
     </div>
+    <div class="counts" id="ss-counts"></div>
+</div>
 
-    <!-- RIGHT COLUMN: verb buttons -->
+<div>
+
+    <!-- Verb buttons -->
     <div class="panel">
         <h3>Verbs</h3>
 
@@ -103,6 +137,7 @@
                 <input type="number" id="margin" name="margin"
                        value="{{ default_arm_margin }}" min="0" step="1000" />
                 <button type="submit">Arm now (utc_start)</button>
+                <span id="arm-safety-hint" style="font-weight:700;"></span>
             </div>
             <div class="muted">
                 Reads 32 capture mon-keys, computes
@@ -1548,6 +1583,69 @@ document.addEventListener("DOMContentLoaded", function () {
     setInterval(refreshC2Counters, 5000);
     setInterval(refreshRecentEvents, 10000);
     setInterval(refreshC2Journal, 10000);
+});
+</script>
+
+<!-- ---- System-state banner poller -------------------------------- -->
+<script>
+const _SS_CLASSES = ["ss-unknown","ss-offline","ss-ready","ss-preparing","ss-prepared","ss-observing"];
+
+function _renderSystemState(j) {
+    const box = document.getElementById("sysstate");
+    if (!box) return;
+    const state = (j && j.state) || "offline";
+    _SS_CLASSES.forEach(c => box.classList.remove(c));
+    box.classList.add("ss-" + state);
+
+    document.getElementById("ss-label").textContent = (j && j.label) || state.toUpperCase();
+    document.getElementById("ss-meaning").textContent = (j && j.meaning) || "";
+    document.getElementById("ss-detail").textContent = (j && j.detail) || "";
+
+    let counts = "";
+    if (j && j.counts) {
+        const c = j.counts;
+        const parts = [];
+        if (c.corr_up !== undefined)  parts.push("corr " + c.corr_up + "/" + c.corr_total + " up");
+        if (c.corr_warmed !== undefined && c.corr_running !== undefined)
+            parts.push("warmed " + c.corr_warmed + "/" + c.corr_running);
+        if (c.captures_writing) parts.push(c.captures_writing + " writing");
+        if (c.search_up !== undefined) parts.push("search " + c.search_up + "/" + c.search_total);
+        counts = parts.join("<br>");
+    }
+    document.getElementById("ss-counts").innerHTML = counts;
+
+    // Mirror onto the Arm button hint so the operator gets the cue
+    // exactly where they click.
+    const hint = document.getElementById("arm-safety-hint");
+    if (hint) {
+        if (state === "prepared") {
+            hint.textContent = "✓ safe to arm"; hint.style.color = "#67e29a";
+        } else if (state === "observing") {
+            hint.textContent = "already observing"; hint.style.color = "#5ee7c8";
+        } else if (state === "preparing") {
+            hint.textContent = "⚠ warming — wait"; hint.style.color = "#ffc861";
+        } else if (state === "ready") {
+            hint.textContent = "start the pipeline first"; hint.style.color = "#7fc4f5";
+        } else {
+            hint.textContent = ""; hint.style.color = "";
+        }
+    }
+}
+
+async function refreshSystemState() {
+    try {
+        const r = await fetch("/control/system_state", {cache: "no-store"});
+        _renderSystemState(await r.json());
+    } catch (e) {
+        _renderSystemState({state: "offline", label: "OFFLINE",
+                            meaning: "dashboard could not reach the state endpoint",
+                            detail: String(e)});
+    }
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    refreshSystemState();
+    setInterval(refreshSystemState, 4000);
 });
 </script>
 {% endblock %}

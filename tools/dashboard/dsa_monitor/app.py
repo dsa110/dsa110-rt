@@ -70,6 +70,7 @@ from control_store import (
     c2_mon_snapshot,
     compute_arm_seq,
     compute_inject_apply_at,
+    compute_system_state,
     control_inject_pulse,
     control_start_fleet,
     control_stop_fleet,
@@ -361,6 +362,25 @@ def control_page():
         default_bounce_sleep_s=DEFAULT_BOUNCE_SLEEP_S,
         kcal_run=fleet_kcal.KCAL_RUN,
     )
+
+
+@app.route("/control/system_state", methods=["GET"])
+def control_system_state():
+    """One rolled-up fleet lifecycle state for the Control banner
+    (Ready / Preparing / Prepared / Observing / Offline)."""
+    try:
+        st = compute_system_state(control_store)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("compute_system_state failed")
+        return jsonify({
+            "ok": False,
+            "state": "offline",
+            "label": "OFFLINE",
+            "detail": f"state poll failed: {exc}",
+            "safe_to_arm": False,
+        }), 200
+    st["ok"] = True
+    return jsonify(st)
 
 
 def _control_json_or_error(handler, **kwargs):
