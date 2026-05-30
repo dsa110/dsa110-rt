@@ -501,8 +501,8 @@ class _ActiveInjection:
     """Cached per-injection state (built once at ``add_pending`` time)."""
 
     cfg: InjectionConfig
-    phasor_real: torch.Tensor           # (NANTS, NCHAN_PER_CHGROUP) dtype
-    phasor_imag: torch.Tensor           # (NANTS, NCHAN_PER_CHGROUP) dtype
+    phasor_real: torch.Tensor           # (NPOL, NANTS, NCHAN_PER_CHGROUP) dtype
+    phasor_imag: torch.Tensor           # (NPOL, NANTS, NCHAN_PER_CHGROUP) dtype
     dispersion_offset_samples: torch.Tensor  # (NCHAN_PER_CHGROUP,) int64
     profile: torch.Tensor               # (2 * MAX_WIDTH_SAMPLES + 1,) dtype
     amplitude: float                    # √(fluence / width)
@@ -587,6 +587,7 @@ class OnlineInjector:
         device: torch.device,
         dtype: torch.dtype,
         antpos_u: np.ndarray | None = None,
+        cal_gain: np.ndarray | None = None,
     ) -> None:
         if antpos_e.shape != (NANTS,):
             raise ValueError(
@@ -617,6 +618,28 @@ class OnlineInjector:
         self.chgroup = int(chgroup)
         self.device = dev
         self.dtype = dtype
+        # Optional per-(pol, ant, ch) complex cal gain folded into the
+        # injection phasor at add_pending time. When provided, the
+        # voltage-domain injection — added AFTER apply_cal_split — is
+        # multiplied by the SAME gain the pipeline applied to the sky,
+        # so it is mathematically identical to injecting BEFORE cal and
+        # letting apply_cal_split multiply it (which is the placement
+        # that detected cleanly through M7.4 Phase 6/7). This restores
+        # the F21 DEC-fringe-stop fold (and the bandpass/per-ant cal
+        # phase) onto the injection so it lands at the imager's
+        # fringe-stopped phase center rather than the array zenith.
+        # None ⇒ legacy pol-independent geometric phasor (tests).
+        if cal_gain is not None:
+            if cal_gain.shape != (NPOL, NANTS, NCHAN_PER_CHGROUP):
+                raise ValueError(
+                    f"cal_gain shape {cal_gain.shape}, expected "
+                    f"({NPOL}, {NANTS}, {NCHAN_PER_CHGROUP})"
+                )
+            self.cal_gain = np.ascontiguousarray(
+                cal_gain, dtype=np.complex128,
+            )
+        else:
+            self.cal_gain = None
         self.pending: dict[str, _ActiveInjection] = {}
 
     # ---- public hot-path API ----
@@ -666,12 +689,27 @@ class OnlineInjector:
             delay_ms / (NATIVE_SAMPLE_US * 1.0e-3)
         ).astype(np.int64)                                      # (NCHAN,) int64
 
+        # Fold the per-(pol, ant, ch) cal gain into the geometric phasor
+        # so the post-cal injection matches the calibrated sky frame
+        # (F21 DEC fringe-stop + per-ant/bandpass cal). Done once here at
+        # queue time (NOT in the hot path) → RT-irrelevant. When no cal
+        # gain is supplied, both pol slots share the bare geometric
+        # phasor (legacy behaviour; bit-identical for the test path).
+        if self.cal_gain is not None:
+            folded = phasor_c64[None, :, :].astype(np.complex128) * self.cal_gain
+        else:
+            folded = np.broadcast_to(
+                phasor_c64[None, :, :].astype(np.complex128),
+                (NPOL, NANTS, NCHAN_PER_CHGROUP),
+            )
+        folded = np.ascontiguousarray(folded)       # (NPOL, NANTS, NCHAN)
+
         # Materialise on device with the kernel's dtype.
         phasor_real_t = torch.as_tensor(
-            phasor_c64.real.astype(np.float32), device=self.device,
+            folded.real.astype(np.float32), device=self.device,
         ).to(self.dtype)
         phasor_imag_t = torch.as_tensor(
-            phasor_c64.imag.astype(np.float32), device=self.device,
+            folded.imag.astype(np.float32), device=self.device,
         ).to(self.dtype)
         delay_t = torch.as_tensor(
             delay_samples, device=self.device, dtype=torch.int64,
@@ -892,39 +930,44 @@ class OnlineInjector:
         if not bool(in_window.any()):
             return None
 
-        # Per-(ch, t, p, pkt, ant) contribution =
-        #   phasor[ant, ch] * envelope[t, pkt, ch].
-        # Re-arrange envelope to (ch, t, pkt) → broadcast against
-        # phasor (ch, ant) into the (ch, t, pkt, ant) plane; then
-        # broadcast across the NPOL pol slots in the GEMM layout.
+        # Per-(ch, t, pkt, ant) contribution per pol =
+        #   phasor[pol, ant, ch] * envelope[t, pkt, ch].
+        # Re-arrange envelope to (ch, t, pkt) → broadcast against the
+        # per-pol phasor (pol, ch, ant). The phasor now carries the
+        # folded cal gain, which differs per pol, so each pol slot of
+        # the GEMM layout gets its own complex contribution (a real
+        # source's two pols see different cal). The per-pol loop runs
+        # only while an injection is actively overlapping a block (a
+        # handful of blocks per injection), so it is RT-irrelevant.
         env_ctp = envelope.permute(2, 0, 1).contiguous()         # (C, T, P)
-        # phasor (ant, ch) → (ch, ant)
-        phasor_real_ca = active.phasor_real.transpose(0, 1).contiguous()  # (C, A)
-        phasor_imag_ca = active.phasor_imag.transpose(0, 1).contiguous()
-        # contrib_real[ch, t, pkt, ant] =
-        #     env_ctp[ch, t, pkt] * phasor_real_ca[ch, ant]
-        # Use torch broadcasting + an explicit batched outer-product to
-        # keep the per-ch FLOPs in a tight cuBLAS-bound kernel.
-        contrib_real = env_ctp[..., None] * phasor_real_ca[:, None, None, :]
-        contrib_imag = env_ctp[..., None] * phasor_imag_ca[:, None, None, :]
-        # contrib_real now (C, T, P, A); insert NPOL singleton.
-        contrib_real_5d = contrib_real.unsqueeze(2)              # (C, T, 1, P, A)
-        contrib_imag_5d = contrib_imag.unsqueeze(2)
+        # phasor (pol, ant, ch) → (pol, ch, ant)
+        phasor_real_pca = active.phasor_real.transpose(1, 2).contiguous()
+        phasor_imag_pca = active.phasor_imag.transpose(1, 2).contiguous()
+        npol = phasor_real_pca.shape[0]
 
-        # Snapshot the contribution RMS for the log BEFORE the in-place
-        # add; expand to the full broadcast shape so the RMS is
-        # NPOL-aware (= same value, but the count includes the pol
-        # axis to match the voltage tensor's element count).
-        rms_real = float(torch.sqrt(
-            (contrib_real_5d.to(torch.float32) ** 2).mean()
-        ).item())
-        rms_imag = float(torch.sqrt(
-            (contrib_imag_5d.to(torch.float32) ** 2).mean()
-        ).item())
+        sq_real_sum = 0.0
+        sq_imag_sum = 0.0
+        n_elem = 0
+        for pol in range(npol):
+            # contrib_real[ch, t, pkt, ant] =
+            #     env_ctp[ch, t, pkt] * phasor_real_pca[pol, ch, ant]
+            contrib_real = (
+                env_ctp[..., None] * phasor_real_pca[pol][:, None, None, :]
+            )
+            contrib_imag = (
+                env_ctp[..., None] * phasor_imag_pca[pol][:, None, None, :]
+            )
+            voltages_real[:, :, pol, :, :].add_(contrib_real)
+            voltages_imag[:, :, pol, :, :].add_(contrib_imag)
+            cr32 = contrib_real.to(torch.float32)
+            ci32 = contrib_imag.to(torch.float32)
+            sq_real_sum += float((cr32 ** 2).sum().item())
+            sq_imag_sum += float((ci32 ** 2).sum().item())
+            n_elem += cr32.numel()
 
-        # In-place add to both pol slots.
-        voltages_real.add_(contrib_real_5d.expand(_GEMM_LAYOUT_SHAPE))
-        voltages_imag.add_(contrib_imag_5d.expand(_GEMM_LAYOUT_SHAPE))
+        # Contribution RMS across the full (ch, t, pol, pkt, ant) grid.
+        rms_real = math.sqrt(sq_real_sum / n_elem) if n_elem else 0.0
+        rms_imag = math.sqrt(sq_imag_sum / n_elem) if n_elem else 0.0
 
         n_in = int(in_window.sum().item())
         # Diagnostic: which absolute native positions actually got hit?

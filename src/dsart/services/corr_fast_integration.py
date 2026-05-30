@@ -1711,19 +1711,26 @@ def _apply_online_injection(
     """M7.4 Phase 8 (2026-05-28): voltage-domain online injection,
     applied **AFTER** RFI excision and calibration.
 
-    Physics rationale for the post-cal placement: an injected signal
-    models an astrophysical point source whose per-antenna fringe is
-    defined in the *calibrated* array frame (the (l, m) the operator
-    requests is where the source should land in the calibrated image).
-    Applying the injection to pre-cal voltages — as the pipeline did
-    through Phase 6/7 — meant ``apply_cal_split`` then rotated each
-    antenna's injected phase by that antenna's calibration solution,
-    smearing the intended fringe and shifting / decohering the source
-    away from the requested (l, m). Injecting after cal makes the
-    injected source appear exactly where intended, independent of the
-    calibration table. (RFI excision is also upstream now, so injected
-    bursts are never mistaken for narrowband CW and flagged out — the
-    desired behaviour for an injection validation signal.)
+    Physics rationale (CORRECTED 2026-05-30): the injector builds its
+    per-antenna fringe in the **raw geometric** array frame, but the
+    imager/search operate in the **calibrated** frame — the data has
+    the F21 DEC fringe-stop (``compute_dec_phase``) and the per-ant /
+    bandpass cal phase folded in by ``apply_cal_split``, which moves
+    the imaging phase center from the array zenith to the observation
+    declination at transit. A bare geometric injection added *after*
+    cal therefore lands ~(φ_lat − δ_obs) off the phase center —
+    outside the search's (l, m) grid — and is never detected, no
+    matter how bright (confirmed empirically with a fluence-5e4 pulse).
+
+    Fix: the injection is still added post-cal (so RFI excision can't
+    flag the burst as narrowband CW), but ``OnlineInjector`` now folds
+    the SAME complex cal gain ``G`` (incl. the DEC fringe-stop) into
+    its phasor at queue time. Adding ``phasor · G · envelope`` post-cal
+    is algebraically identical to adding the bare ``phasor · envelope``
+    *pre*-cal and letting ``apply_cal_split`` multiply by ``G`` — i.e.
+    it reproduces the Phase 6/7 placement that detected cleanly, while
+    keeping the burst out of the RFI flagger. The gain is folded once
+    at ``add_pending`` time, so the relocation stays RT-cost-neutral.
 
     The call mutates ``real_v`` / ``imag_v`` in place via
     ``OnlineInjector.apply_block`` (``torch.Tensor.add_``); no tensor
@@ -2800,12 +2807,35 @@ def build_context(
 
     injector: OnlineInjector | None = None
     if cfg.inject_configs or cfg.inject_watch_enabled:
+        # Reconstruct the per-(pol, ant, ch) complex cal gain that
+        # apply_cal_split applies, so the post-cal voltage injection is
+        # folded with the SAME gain (incl. the F21 DEC fringe-stop) the
+        # sky sees. cal_real/cal_imag broadcast shape is
+        # (NCHAN, 1, NPOL, 1, NANTS); squeeze the singleton time/packet
+        # axes and reorder to (NPOL, NANTS, NCHAN). None when no cal.
+        cal_gain: np.ndarray | None = None
+        if cal is not None:
+            cr = cal.cal_real.detach().to("cpu", torch.float32).numpy()
+            ci = cal.cal_imag.detach().to("cpu", torch.float32).numpy()
+            cr = cr[:, 0, :, 0, :]                    # (NCHAN, NPOL, NANTS)
+            ci = ci[:, 0, :, 0, :]
+            cal_gain = (
+                np.transpose(cr, (1, 2, 0))           # (NPOL, NANTS, NCHAN)
+                + 1j * np.transpose(ci, (1, 2, 0))
+            ).astype(np.complex128)
+            LOG.info(
+                "OnlineInjector cal-gain fold ENABLED: shape=%s "
+                "mean|G|=%.4g (post amp-norm; injection added post-cal "
+                "is now equivalent to pre-cal inject × G)",
+                cal_gain.shape, float(np.abs(cal_gain).mean()),
+            )
         injector = OnlineInjector(
             antpos_e=antpos_e,
             antpos_n=antpos_n,
             chgroup=int(cfg.chgroup),
             device=device,
             dtype=voltage_dtype,
+            cal_gain=cal_gain,
         )
         for inj_cfg in cfg.inject_configs:
             injector.add_pending(inj_cfg)

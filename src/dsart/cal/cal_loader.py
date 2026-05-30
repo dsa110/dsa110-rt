@@ -366,6 +366,26 @@ def load_cal_with_dec_phase(
     if cal_mode == CalMode.PHASE_ONLY:
         gains = normalize_phase_only(gains)
     gains = maybe_swap_pol(gains, swap=pol_swap)
+
+    # Amplitude normalization: rescale the gain magnitudes so the MEAN
+    # |G| over all non-zero (antenna, channel, pol) cells is exactly 1.
+    # This keeps the calibrated voltage dynamic range — and therefore
+    # the relative scale of any voltage-domain online injection that is
+    # folded with the same gains (see OnlineInjector) — independent of
+    # the cal blob's absolute gain. Phase-only cal already has |G| = 1
+    # per cell, so the mean is 1 and this is a no-op there; full-mode
+    # cal (which retains per-cell magnitudes) gets globally rescaled to
+    # mean-1 without changing any relative antenna/channel/pol structure
+    # or phase. A single scalar divide is RT-irrelevant (load-time only).
+    gain_mag = np.abs(gains)
+    gain_nonzero = gain_mag > 0.0
+    if gain_nonzero.any():
+        mean_gain_mag = float(gain_mag[gain_nonzero].mean())
+    else:
+        mean_gain_mag = 0.0
+    if mean_gain_mag > 0.0:
+        gains = (gains / mean_gain_mag).astype(np.complex64)
+
     gains_fine = upsample_coarse_to_fine(gains)             # (96, 384, 2)
 
     dec_phase = compute_dec_phase(                          # (96, 384) complex128
@@ -394,6 +414,7 @@ def load_cal_with_dec_phase(
         "cal_mode": cal_mode,
         "pol_swap": pol_swap,
         "n_flagged": bfw.n_flagged,
+        "amp_norm_factor": mean_gain_mag,
         **{f"cal_{k}": v for k, v in bfw.magnitude_summary.items()},
     }
     return FastCorrCalTensors(
