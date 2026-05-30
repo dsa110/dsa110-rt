@@ -2161,7 +2161,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -2690,7 +2690,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -2771,7 +2771,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -3776,7 +3776,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -3979,7 +3979,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -4060,7 +4060,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -4141,7 +4141,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",
@@ -6044,7 +6044,7 @@
       ],
       "yaxes": [
         {
-          "format": "cps",
+          "format": "ops",
           "label": null,
           "logBase": 1,
           "min": "0",

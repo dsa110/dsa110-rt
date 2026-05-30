@@ -642,7 +642,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval), "cn_id", "udp_port" fill(null)'
         ),
         alias="cn $tag_cn_id port $tag_udp_port",
-        w=12, x=0, h=7, unit="cps", y_min=0, legend_right=True,
+        w=12, x=0, h=7, unit="ops", y_min=0, legend_right=True,
         thresholds=[
             {"value": 7.0, "colorMode": "critical", "fill": False, "line": True, "op": "lt"},
             {"value": 7.45, "colorMode": "ok", "fill": False, "line": True, "op": "gt"},
@@ -748,7 +748,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval), "cn_id", "buffer" fill(null)'
         ),
         alias="cn $tag_cn_id $tag_buffer",
-        w=12, x=0, h=7, unit="cps", y_min=0, legend_right=True,
+        w=12, x=0, h=7, unit="ops", y_min=0, legend_right=True,
         description="dada/eada nominal ~9.6 blocks/s, fada/bada ~7.45 blocks/s. fada below 7 = search-side gate alarm.",
     ))
     out.append(graph_panel(
@@ -760,7 +760,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval), "cn_id", "buffer" fill(null)'
         ),
         alias="cn $tag_cn_id $tag_buffer",
-        w=12, x=12, h=7, unit="cps", y_min=0, legend_right=True,
+        w=12, x=12, h=7, unit="ops", y_min=0, legend_right=True,
         description="Block-read rate (consumer side). Steady-state should match n_written; persistent gap means reader is slower than writer.",
     ))
     _bump_y(7)
@@ -914,7 +914,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval) fill(null)'
         ),
         alias="batches/s",
-        w=12, x=0, h=6, unit="cps", y_min=0,
+        w=12, x=0, h=6, unit="ops", y_min=0,
         description="Rate of well-formed C1 batches into C2. Matches search-side detector cadence in normal ops.",
     ))
     out.append(graph_panel(
@@ -958,7 +958,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval) fill(null)'
         ),
         alias="batches_ok/s (heartbeats + candidates)",
-        w=12, x=0, h=7, unit="cps", y_min=0, legend_right=True,
+        w=12, x=0, h=7, unit="ops", y_min=0, legend_right=True,
         extra_targets=[{
             "refId": "B", "alias": "rows_in/s (candidate rows only)",
             "query": (
@@ -979,7 +979,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval) fill(null)'
         ),
         alias="components_evaluated/s",
-        w=12, x=12, h=7, unit="cps", y_min=0,
+        w=12, x=12, h=7, unit="ops", y_min=0,
         description="Rate at which C2 evaluates connected components in the cross-node coincidence graph. Each = candidate trigger tested against criteria. Flat 0 in a quiet sky is expected.",
     ))
     _bump_y(7)
@@ -992,7 +992,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval) fill(null)'
         ),
         alias="rows_in/s",
-        w=12, x=0, h=6, unit="cps", y_min=0,
+        w=12, x=0, h=6, unit="ops", y_min=0,
         description="Rate of candidate rows (non-heartbeat) ingested by C2. Zero is the normal quiet-sky value -- compare with batches_ok/s in the overlay above.",
     ))
     out.append(graph_panel(
@@ -1280,7 +1280,7 @@ def panels() -> List[Dict[str, Any]]:
             'GROUP BY time($__interval) fill(null)'
         ),
         alias="rows_checked/s",
-        w=12, x=0, h=6, unit="cps", y_min=0,
+        w=12, x=0, h=6, unit="ops", y_min=0,
         description="Rate of C2 rows passed through the inject-matcher. Mirrors rows_in/s when an injection is active.",
     ))
     out.append(graph_panel(
