@@ -187,7 +187,7 @@ routines:
       --config-yaml /home/ubuntu/proj/dsa110-rt/configs/dsart_search_rt.yaml
       --enable-cube-dump
       --cal-blob-path /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
-      --obs-dec-deg 53.848986
+      --obs-dec-deg CUSTOMDEC
       --kernel-support 1
       --chan-sum-factor 8
       --cell-lambda-mode common
@@ -260,7 +260,7 @@ routines:
       --gpu-half 1 --search-node-id CN
       --device cuda:0 --image-backend gpu
       --cal-blob-path /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
-      --obs-dec-deg 53.848986
+      --obs-dec-deg CUSTOMDEC
       --kernel-support 1
       --chan-sum-factor 8
       --cell-lambda-mode common
