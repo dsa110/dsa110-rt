@@ -731,6 +731,129 @@ async function refreshCalibrations() {
     </form>
 </div>
 
+<!-- Delete the K-cal table on the corr nodes -->
+<div class="panel" style="margin-top: 24px;" id="panel-delete-kcal">
+    <h3>Delete K-cal table (corr nodes)</h3>
+    <p class="muted">
+        Removes the per-node K-calibration (beamformer-weights) table
+        each corr_fast applies via
+        <code>--apply-cal .../cals/beamformer_weights_sb&lt;NN&gt;.dat</code>
+        (run <code>{{ kcal_run }}</code>). The blobs live on the corr
+        nodes — this fans out over ssh and <code>rm -rf</code>'s each
+        node's <code>sb&lt;chgroup&gt;</code> blob (so a CASA-style K
+        table staged as a directory is removed too).
+        <br>
+        <strong>Destructive:</strong> once deleted, corr_fast cannot
+        re-apply cal until the bundle is re-staged. A missing blob is
+        reported as <code>not_found</code> (not an error). Preview is
+        a dry-run probe and never removes anything.
+    </p>
+    <form id="form-delete-kcal">
+        <div class="verb-row">
+            <label for="delete_kcal_confirm">type "delete_kcal"</label>
+            <input type="text" id="delete_kcal_confirm" name="confirm"
+                   placeholder="delete_kcal" autocomplete="off" />
+        </div>
+        <div class="verb-row">
+            <button type="button"
+                    onclick="submitDeleteKcal(event, true);">
+                Preview (dry run)
+            </button>
+            <button type="button" class="danger"
+                    onclick="submitDeleteKcal(event, false);">
+                Delete K-cal table
+            </button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/&lt;iso_ts&gt;</code> as
+            <code>cmd=delete_kcal</code> with per-host pass / fail.
+            Delete requires the literal text <code>delete_kcal</code>
+            in the confirm box; preview does not (it never removes).
+        </div>
+        <div id="resp-delete-kcal" class="response"></div>
+    </form>
+</div>
+
+<script>
+async function submitDeleteKcal(ev, dryRun) {
+    ev.preventDefault();
+    const form = document.getElementById("form-delete-kcal");
+    const respEl = document.getElementById("resp-delete-kcal");
+    const btns = form.querySelectorAll("button");
+    if (!dryRun && !window.confirm(
+            "Delete the K-cal (beamformer-weights) table on every corr " +
+            "node? corr_fast cannot re-apply cal until it is re-staged.")) {
+        return false;
+    }
+    btns.forEach(function (b) { b.disabled = true; });
+    const label = dryRun ? "previewing" : "deleting K-cal";
+    respEl.innerHTML = "<span class='muted'>" + label +
+        " (parallel ssh to corr nodes)…</span>";
+
+    const fd = new FormData(form);
+    fd.set("dry_run", dryRun ? "true" : "false");
+    let r, j;
+    try {
+        r = await fetch("/control/delete_kcal", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btns.forEach(function (b) { b.disabled = false; });
+        return false;
+    }
+    if (!j) {
+        respEl.innerHTML = "<span class='err'>empty response</span>";
+        btns.forEach(function (b) { b.disabled = false; });
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    const status = j.ok ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j.error) {
+        html += "<div class='info-blob'>" +
+            String(j.error).replace(/</g, "&lt;") + "</div>";
+    }
+    if (j.summary) {
+        const s = j.summary;
+        html += "<div class='muted'>" +
+            "n_hosts=" + s.n_hosts + " | " +
+            "<span class='ok'>n_deleted=" + s.n_deleted + "</span> | " +
+            "n_present=" + s.n_present + " | " +
+            "n_not_found=" + s.n_not_found + " | " +
+            "<span class='err'>n_failed=" + s.n_failed + "</span> | " +
+            "dry_run=" + s.dry_run + " | " +
+            "run=" + s.run +
+            "</div>";
+    }
+    if (Array.isArray(j.hosts) && j.hosts.length > 0) {
+        let rows = "";
+        j.hosts.forEach(function (h) {
+            const okCls = h.ok ? "ok" : "err";
+            const errTxt = h.error
+                ? "<span class='err'>" +
+                  String(h.error).replace(/</g, "&lt;").slice(0, 120) + "</span>"
+                : "-";
+            rows += "<tr>" +
+                "<td>" + h.host + "</td>" +
+                "<td>" + h.chgroup + "</td>" +
+                "<td><code>" + (h.path || "").replace(/</g, "&lt;") + "</code></td>" +
+                "<td class='" + okCls + "'>" + (h.status || "?") + "</td>" +
+                "<td>" + errTxt + "</td>" +
+                "</tr>";
+        });
+        html += "<table class='audit-table' style='margin-top:8px;'>" +
+            "<thead><tr>" +
+            "<th>host</th><th>chgroup</th><th>path</th>" +
+            "<th>status</th><th>error</th>" +
+            "</tr></thead><tbody>" + rows + "</tbody></table>";
+    }
+    respEl.innerHTML = html;
+    btns.forEach(function (b) { b.disabled = false; });
+    return false;
+}
+</script>
+
 <!-- BOTTOM: audit log -->
 <div class="panel" style="margin-top: 24px;">
     <h3>Recent actions ({{ recent_audit|length }})</h3>

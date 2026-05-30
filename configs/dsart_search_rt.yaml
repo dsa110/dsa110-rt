@@ -336,12 +336,13 @@ c1:
                                      # Gaussian, matching Q(6)~9.9e-10 × 6.4e9 trials = 6.3 cands/cube.
                                      # Coverage correction is required for this to hold; see cube_pipeline.py
                                      # M7.4.2 notes.
-  cube_ring_depth: 16                # Phase 6c: doubled from 8 → 16 (≈2.2s retention at 7.45 cubes/s) to widen
-                                     # the cube-retention window we present to C2-triggered dumps. With C2
-                                     # trigger latency under load occasionally reaching several seconds, the
-                                     # prior 8-slot ring was too tight: many real DUMP triggers landed
-                                     # ``too_late``. 16 slots = ~52 GiB pinned per gpu_half (~104 GiB per
-                                     # 2-GPU search node, comfortably inside the 256 GiB host budget). Each
+  cube_ring_depth: 24                # M7.6: raised 16 → 24 (≈3.2s retention at 7.45 cubes/s). C2's coincidence
+                                     # rolling buffer is window_s=5.0, so a cluster's peak_event_specnum can
+                                     # sit several seconds behind a search node's live edge before the dump
+                                     # trigger lands; the prior 16-slot (~2.2s) ring let those triggers arrive
+                                     # ``too_late``. 24 slots = ~78 GiB pinned per gpu_half (~156 GiB per
+                                     # 2-GPU search node). Search nodes run no corr_fast, so the full 256 GiB
+                                     # host budget is available — 156 GiB leaves comfortable headroom. Each
                                      # slot is t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16. DtoH burden per cube is
                                      # amortised by overlapping with the next cube's L1/detector work; M7.4.1
                                      # GPU-scatter freed up ~50 ms of H2D budget which more than compensates

@@ -348,6 +348,7 @@ def control_page():
     except Exception as exc:                                       # noqa: BLE001
         LOG.warning("list_recent_audit: %s", exc)
         recent = []
+    import fleet_kcal                                               # local
     return render_template(
         "control.html",
         active_tab="control",
@@ -358,6 +359,7 @@ def control_page():
         default_arm_margin=DEFAULT_ARM_SEQ_MARGIN,
         default_inject_margin_blocks=DEFAULT_INJECT_MARGIN_BLOCKS,
         default_bounce_sleep_s=DEFAULT_BOUNCE_SLEEP_S,
+        kcal_run=fleet_kcal.KCAL_RUN,
     )
 
 
@@ -1366,6 +1368,49 @@ def control_update_dsart_post():
         force=force,
         hosts=hosts,
         branch=branch,
+    )
+
+
+# ---------- Control tab: delete the K-cal table on the corr nodes ----------
+#
+# The K-cal (beamformer-weights) table is applied per-node by corr_fast
+# via ``--apply-cal .../beamformer_weights_sb<NN>.dat`` (see
+# configs/dsart_pipeline_rt.yaml). The blobs live on the corr nodes, so
+# deletion is a parallel ssh fan-out (fleet_kcal.py), mirroring the
+# update_dsart path above.
+
+
+@app.route("/control/delete_kcal", methods=["POST"])
+def control_delete_kcal_post():
+    """Delete the per-node K-cal (beamformer-weights) table on every
+    corr node and report per-host pass/fail.
+
+    Form fields:
+
+      dry_run     "true"/"false" (default "true"). When true, only
+                  probes each node for the blob's presence; never
+                  removes anything.
+      confirm     Must equal ``delete_kcal`` when ``dry_run=false``.
+    """
+    import fleet_kcal                                                # local
+
+    f = request.form
+    dry_run = (f.get("dry_run", "true").lower() != "false")
+
+    if not dry_run:
+        confirm = (f.get("confirm") or "").strip()
+        if confirm != "delete_kcal":
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "delete_kcal requires confirm=delete_kcal in the "
+                    "POST body — this is a deliberate safety speed bump."
+                ),
+            }), 400
+
+    return _control_json_or_error(
+        fleet_kcal.delete_kcal_fleet,
+        dry_run=dry_run,
     )
 
 

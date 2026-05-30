@@ -112,19 +112,19 @@ def graph_panel(
     thresholds: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     targets = [
-        {
-            "refId": "A",
-            "alias": alias,
-            "policy": "default",
-            "resultFormat": "time_series",
-            "orderByTime": "ASC",
-            "rawQuery": True,
-            "query": raw_query,
-            "tags": [],
-            "groupBy": [],
-            "select": [],
-            "measurement": "",
-        }
+            {
+                "refId": "A",
+                "alias": alias,
+                "policy": "default",
+                "resultFormat": "time_series",
+                "orderByTime": "ASC",
+                "rawQuery": True,
+                "query": raw_query,
+                "tags": [],
+                "groupBy": [],
+                "select": [],
+                "measurement": "",
+            }
     ]
     if extra_targets:
         for i, t in enumerate(extra_targets, start=1):
