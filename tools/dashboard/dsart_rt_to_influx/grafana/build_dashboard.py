@@ -765,6 +765,67 @@ def panels() -> List[Dict[str, Any]]:
     ))
     _bump_y(7)
 
+    out.append(row_panel(
+        "G2. Meridian fringestop (legacy UVH5 writer, casa38 -- bada reader)"
+    ))
+    _bump_y(1)
+    out.append(graph_panel(
+        title="Meridian ready nodes -- fleet sum (target 16)",
+        raw_query=(
+            'SELECT sum("ready") FROM '
+            '(SELECT last("ready") AS "ready" FROM "corr_rt_meridian" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id" fill(0))'
+            'GROUP BY time($__interval) fill(null)'
+        ),
+        alias="ready cn count",
+        w=12, x=0, h=7, unit="short", y_min=0, y_max=16, legend_right=True,
+        thresholds=[
+            {"value": 16, "colorMode": "ok", "fill": False, "line": True, "op": "ge"},
+            {"value": 16, "colorMode": "warning", "fill": False, "line": True, "op": "lt"},
+        ],
+        description="Number of corr nodes whose meridian_fringestop wrapper reports ready=1 (sole bada reader). Should pin at 16 while observing; a drop = a node's legacy fringestopper died/wedged.",
+    ))
+    out.append(graph_panel(
+        title="Meridian heartbeat freshness (age_s) per cn",
+        raw_query=(
+            'SELECT last("age_s") FROM "corr_rt_meridian" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=12, h=7, unit="s", y_min=0, legend_right=True,
+        thresholds=[
+            {"value": 60, "colorMode": "critical", "fill": False, "line": True, "op": "gt"},
+        ],
+        description="Seconds since each node's meridian_fringestop wrapper last published its heartbeat. Flat-low in normal ops; a climbing line = the routine stalled (no longer draining bada).",
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="Meridian UVH5 output rate (files/s) per cn",
+        raw_query=(
+            'SELECT non_negative_derivative(last("n_hdf5"), 1s) '
+            'FROM "corr_rt_meridian" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=0, h=7, unit="ops", y_min=0, legend_right=True,
+        description="Derivative of the monotonic n_hdf5 counter -- rate at which each node writes fringestopped UVH5 files. Flat zero while observing = no output being produced.",
+    ))
+    out.append(graph_panel(
+        title="Meridian snapped imaging declination (deg) per cn",
+        raw_query=(
+            'SELECT last("dec_deg") FROM "corr_rt_meridian" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=12, h=7, unit="degree", legend_right=True,
+        description="Declination (snapped to the 0.25 deg fstable cache grid) each node is fringestopping to. All 16 should agree; a divergent node has a stale/mismatched fstable cache.",
+    ))
+    _bump_y(7)
+
     out.append(row_panel("H. RFI flagger summary"))
     _bump_y(1)
     out.append(graph_panel(

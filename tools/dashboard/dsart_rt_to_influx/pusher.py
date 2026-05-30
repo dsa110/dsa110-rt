@@ -105,6 +105,7 @@ PREFIXES: Tuple[str, ...] = (
 # before the bare ``/mon/corr_rt/<cn>`` rollup.
 KEY_CORR_CAPTURE = re.compile(r"^/mon/corr_rt/(\d+)/capture/(\d+)$")
 KEY_CORR_RFI = re.compile(r"^/mon/corr_rt/(\d+)/rfi$")
+KEY_CORR_MERIDIAN = re.compile(r"^/mon/corr_rt/(\d+)/meridian_ready$")
 KEY_CORR_CN = re.compile(r"^/mon/corr_rt/(\d+)$")
 KEY_CORR_HEARTBEAT = re.compile(r"^/mon/service/corr_rt/(\d+)$")
 
@@ -557,6 +558,54 @@ def make_buffer_points(
             tags=tags, fields=fields, timestamp_ns=ts_ns,
         ))
     return out
+
+
+def make_meridian_points(
+    payload: Dict[str, Any], *, cn_id: int,
+) -> List[Point]:
+    """One ``corr_rt_meridian`` Point from the meridian-fringestop
+    heartbeat at ``/mon/corr_rt/<cn>/meridian_ready`` (published by
+    ``tools/ops/meridian_fringestop_rt.py``).
+
+    Surfaces the legacy fringestopper's per-node liveness so Grafana can
+    show, per corr node / subband: readiness (0/1), UVH5 output progress
+    (``n_hdf5`` monotonic counter), the snapped imaging declination, and
+    heartbeat freshness (``age_s`` — seconds since the wrapper last
+    published; a climbing value means the routine died / wedged).
+    """
+    host = payload.get("host") or _host_for_cn(cn_id)
+    tags: Dict[str, str] = {"cn_id": str(int(cn_id)), "host": str(host)}
+    sb = payload.get("subband")
+    if isinstance(sb, (int, float)) and not isinstance(sb, bool):
+        tags["subband"] = str(int(sb))
+
+    fields: Dict[str, Any] = {"ready": 1 if payload.get("ready") else 0}
+    for k in ("n_hdf5", "pid"):
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[k] = int(v)
+    dec = payload.get("dec_deg")
+    if isinstance(dec, (int, float)) and not isinstance(dec, bool):
+        fields["dec_deg"] = float(dec)
+
+    # Prefer the heartbeat's own wall-clock for the timestamp + derive a
+    # freshness gauge from it (climbs if the publisher thread stalls).
+    ts_wall = payload.get("ts_wall_unix")
+    if isinstance(ts_wall, (int, float)) and not isinstance(ts_wall, bool) \
+            and ts_wall > 0:
+        fields["age_s"] = max(0.0, time.time() - float(ts_wall))
+        ts_ns = int(float(ts_wall) * 1e9)
+    else:
+        ts_ns = int(time.time() * 1e9)
+
+    last = payload.get("last_hdf5")
+    if isinstance(last, str) and last:
+        fields["last_hdf5"] = last
+
+    return [Point(
+        measurement="corr_rt_meridian",
+        tags=tags, fields=fields, timestamp_ns=ts_ns,
+    )]
 
 
 def make_capture_points(
@@ -1181,6 +1230,9 @@ class InfluxPusherService:
             m = KEY_CORR_RFI.match(key)
             if m:
                 return make_rfi_points(payload, cn_id=int(m.group(1)))
+            m = KEY_CORR_MERIDIAN.match(key)
+            if m:
+                return make_meridian_points(payload, cn_id=int(m.group(1)))
             m = KEY_CORR_CN.match(key)
             if m:
                 cn = int(m.group(1))
