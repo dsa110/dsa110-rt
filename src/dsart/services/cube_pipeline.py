@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import os
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -450,6 +451,23 @@ class CubeRetentionRing:
         self._records: List[Optional[RetainedCube]] = [None] * self._depth
         self._write_pos: int = 0
         self._n_committed: int = 0
+        # Slot-pinning for in-flight C2 dumps (M7.6, 2026-05-31). A dump
+        # reads a slot's pinned buffer asynchronously on the writer
+        # thread; if the ring write head wraps back to that slot before
+        # the ~855 MB NPZ serialize finishes, ``stage_cube`` would
+        # overwrite the bytes mid-dump (the peak_grid/cube mismatch). To
+        # prevent that WITHOUT an upfront full-cube copy (which OOM-killed
+        # the memory-tight 93 GiB search nodes), the dispatcher marks the
+        # buffer in-flight; ``_ensure_buffer`` then allocates a FRESH
+        # buffer for that slot instead of reusing the checked-out one,
+        # leaving the old buffer alive (held by ``_inflight_refs``) until
+        # the writer releases it. Zero extra allocation in the common
+        # case (dump finishes before the ring wraps, e.g. depth=24 ≈
+        # 3.4 s wrap vs ~2 s serialize); at most one spare buffer per
+        # concurrently in-flight dump otherwise.
+        self._inflight_lock = threading.Lock()
+        self._inflight: Dict[int, int] = {}              # id(buf) -> refcount
+        self._inflight_refs: Dict[int, np.ndarray] = {}  # id(buf) -> buf (keepalive)
 
     @property
     def depth(self) -> int:
@@ -477,10 +495,42 @@ class CubeRetentionRing:
     def n_grid(self) -> int:
         return self._n_grid
 
+    def mark_inflight(self, buf: np.ndarray) -> None:
+        """Register ``buf`` (a slot's pinned host buffer) as being read
+        by an in-flight C2 dump so ``_ensure_buffer`` won't reuse it.
+        Refcounted: the same buffer may be dumped by >1 event."""
+        with self._inflight_lock:
+            k = id(buf)
+            self._inflight[k] = self._inflight.get(k, 0) + 1
+            self._inflight_refs[k] = buf
+
+    def release_inflight(self, buf: np.ndarray) -> None:
+        """Release a previously :meth:`mark_inflight` buffer once its
+        dump has finished. When the refcount hits zero the keepalive ref
+        is dropped so the buffer can be GC'd (if the ring already
+        replaced its slot) or reused."""
+        with self._inflight_lock:
+            k = id(buf)
+            c = self._inflight.get(k, 0) - 1
+            if c <= 0:
+                self._inflight.pop(k, None)
+                self._inflight_refs.pop(k, None)
+            else:
+                self._inflight[k] = c
+
+    def _is_inflight(self, buf: np.ndarray) -> bool:
+        with self._inflight_lock:
+            return id(buf) in self._inflight
+
     def _ensure_buffer(self, idx: int) -> np.ndarray:
         """Lazy-allocate the pinned host buffer at ring slot ``idx``."""
         buf = self._buffers[idx]
         shape = (self._t_det, self._n_fdm, self._n_grid, self._n_grid)
+        # Slot-pinning: never overwrite a buffer that a C2 dump is still
+        # reading. Force a fresh allocation; the checked-out buffer stays
+        # alive via ``_inflight_refs`` until the writer releases it.
+        if buf is not None and self._is_inflight(buf):
+            buf = None
         if buf is None or buf.shape != shape or buf.dtype != np.float16:
             if self._pinned:
                 # Pin via torch so the GPU-side ``cudaMemcpyAsync`` can

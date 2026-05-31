@@ -34,8 +34,6 @@ import dataclasses
 import logging
 import socket
 import threading
-
-import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -376,27 +374,30 @@ class C2TriggerListener:
         # :meth:`_build_manifest` points at
         # ``${dump_root}/<event_name>/cube_s<sid>_g<g>_<event_specnum>.npz``.
         #
-        # SNAPSHOT the cube out of the ring slot BEFORE enqueueing.
-        # ``retained.pinned_host_tensor`` ALIASES a CubeRetentionRing
-        # slot buffer that the live pipeline reuses every ``depth`` cubes
-        # (~1 s at production cadence). The writer thread serialises the
-        # ~855 MB NPZ asynchronously, which outlives that reuse window,
-        # so without this copy the slot is overwritten mid-dump: the
-        # writer reduces ``peak_grid`` from the still-intact buffer but
-        # the ``cube`` bytes ``np.savez`` streams out afterwards come
-        # from the clobbered next-cube data — the peak_grid(~60000) /
-        # cube(~noise) mismatch we observed on injection dumps. The copy
-        # runs synchronously here in the listener thread while the
-        # matched cube is guaranteed still live in the ring (we just
-        # found it via find_cube_for_specnum microseconds ago), so it
-        # captures the correct, self-consistent cube. ~855 MB memcpy
-        # (~0.3 s) is acceptable on the rare C2-dump path.
-        cube_snapshot = np.array(retained.pinned_host_tensor, copy=True)
-        return bool(
+        # SLOT-PINNING (M7.6, 2026-05-31): ``retained.pinned_host_tensor``
+        # aliases a CubeRetentionRing slot buffer the live pipeline reuses
+        # every ``depth`` cubes. The writer serialises the ~855 MB NPZ
+        # asynchronously; if the ring wraps back to that slot mid-dump it
+        # would clobber the bytes (the peak_grid/cube mismatch). We MARK
+        # the buffer in-flight so the ring allocates a fresh buffer for
+        # that slot on reuse instead of overwriting this one, and RELEASE
+        # it via ``on_complete`` once the writer is done. This is
+        # zero-copy — earlier we copied the whole 855 MB here, which
+        # OOM-killed the memory-tight 93 GiB search nodes (search_rx
+        # SIGKILL, 2026-05-31). On queue-full (submit -> False) we release
+        # immediately since no dump will run.
+        buf = retained.pinned_host_tensor
+        self._ring.mark_inflight(buf)
+        accepted = bool(
             self._cube_dump.submit(
-                cube=cube_snapshot, manifest=manifest,
+                cube=buf,
+                manifest=manifest,
+                on_complete=lambda b=buf: self._ring.release_inflight(b),
             )
         )
+        if not accepted:
+            self._ring.release_inflight(buf)
+        return accepted
 
     # ------------------------------------------------------------------
     # Introspection

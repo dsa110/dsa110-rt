@@ -377,6 +377,7 @@ class CubeDumpWriter:
         *,
         cube: Any,
         manifest: CubeDumpManifest,
+        on_complete: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Enqueue a cube for asynchronous NPZ dump.
 
@@ -408,7 +409,7 @@ class CubeDumpWriter:
         if self._stopped:
             raise RuntimeError("CubeDumpWriter.submit() after stop()")
         try:
-            self._queue.put_nowait((cube, manifest))
+            self._queue.put_nowait((cube, manifest, on_complete))
             return True
         except queue.Full:
             _log.warning(
@@ -484,7 +485,7 @@ class CubeDumpWriter:
             try:
                 if item is _DRAIN_SENTINEL:
                     return
-                cube, manifest = item
+                cube, manifest, on_complete = item
                 try:
                     path = self._write_one(cube, manifest)
                     self._n_dumped += 1
@@ -505,6 +506,18 @@ class CubeDumpWriter:
                         exc,
                     )
                     self._n_failed += 1
+                finally:
+                    # Release the ring slot-pin (if any) REGARDLESS of
+                    # write success, so a failed/short dump can never
+                    # permanently wedge a ring buffer out of reuse.
+                    if on_complete is not None:
+                        try:
+                            on_complete()
+                        except Exception:  # noqa: BLE001 - never poison worker
+                            _log.exception(
+                                "cube_dump on_complete (slot release) failed "
+                                "(cube_id=%d)", manifest.cube_id,
+                            )
             finally:
                 self._queue.task_done()
 
