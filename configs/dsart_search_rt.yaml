@@ -320,17 +320,19 @@ routines:
 # block in a way that breaks the loader.
 #
 # Memory cost of the cube ring (per gpu_half):
-#   per cube ≈ t_det * n_fdm * n_grid * n_grid * 2 bytes (fp16)
-#           = 192 * 34 * 256 * 256 * 2 = ~3.2 GiB at the production
-#             op-point. ``cube_ring_depth: 8`` → ~26 GiB per half →
-#             ~52 GiB per search node. NOTE (2026-05-31): the real
+#   per cube = t_det * n_fdm * n_grid * n_grid * 2 bytes (fp16)
+#           = 192 * 34 * 256 * 256 * 2 = 855 MiB ≈ 0.8 GiB at the
+#             production op-point (NOT 3.2 GiB — the old figure was 4×
+#             too big; on-disk cube dumps are 855 MB). ``cube_ring_depth:
+#             16`` → ~12.8 GiB per half → ~25.6 GiB per search node.
+#             NOTE (2026-05-31): the real
 #             production search nodes have ~93 GiB RAM (NOT 256 GiB —
 #             an earlier comment here was wrong). The cube ring is
 #             torch pin_memory=True (shared-anon, shows in Shmem) and
 #             LAZILY allocated, so an over-large depth silently grows
 #             into swap and wedges the node. Keep
-#             ``cube_ring_depth * 3.2 GiB * 2 halves`` + the rxring
-#             (``t_buf_samples / 32768 * 39 GiB``) + ~18 GiB base
+#             ``cube_ring_depth * 0.8 GiB * 2 halves`` + the rxring
+#             (``t_buf_samples / 32768 * 39 GiB``) + ~8 GiB base
 #             comfortably under 93 GiB. Drop depth further during
 #             shake-down if pinned memory is constrained.
 # ---------------------------------------------------------------------------
@@ -351,23 +353,24 @@ c1:
                                      # Gaussian, matching Q(6)~9.9e-10 × 6.4e9 trials = 6.3 cands/cube.
                                      # Coverage correction is required for this to hold; see cube_pipeline.py
                                      # M7.4.2 notes.
-  cube_ring_depth: 8                 # M7.6-mem (2026-05-31): LOWERED 24 → 8 to fit the REAL search-node
+  cube_ring_depth: 16                # M7.6-mem (2026-05-31): LOWERED 24 → 16 to fit the REAL search-node
                                      # RAM budget. The prior comment assumed a 256 GiB host; the production
                                      # search nodes actually have ~93 GiB. Each slot is
-                                     # t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16, allocated via torch
-                                     # pin_memory=True → shared-anon (counts in Shmem, NOT Mlocked). The
-                                     # ring is LAZILY allocated, so a depth-24 ring slowly grows toward
-                                     # 2*24*3.2 = 154 GiB per node as distinct cubes flow — which is what
-                                     # drove the 15–20 min swap-thrash death spiral (n01/n09/n13 wedging).
-                                     # depth=8 caps pinned retention at 2*8*3.2 = 51 GiB; combined with the
-                                     # t_buf_samples 32768→8192 rxring cut (39→9.8 GiB) the node ceiling is
-                                     # ~79 GiB → fits 93 GiB with headroom, no swap. Trade-off (per user
-                                     # 2026-05-31 "discard rather than buffer"): retention window shrinks to
-                                     # ~1.1 s, so on-sky C2 dump triggers that lag the live edge by >1.1 s
-                                     # will arrive ``too_late`` and be dropped. Acceptable: a sustainable
-                                     # depth-8 system beats a depth-24 config the hardware cannot hold.
-                                     # Injection dumps (inj_dump2.py) fire the moment the target sample
-                                     # lands in the ring window, so they are unaffected.
+                                     # t_det*n_fdm*n_grid^2*2 = 192*34*256*256*2 = 855 MiB ≈ 0.8 GiB fp16
+                                     # (the old "3.2 GiB" figure was wrong by 4×; the on-disk cube dumps
+                                     # are 855 MB, confirming 0.8 GiB). Buffers are torch pin_memory=True →
+                                     # shared-anon (counts in Shmem, NOT Mlocked) and LAZILY allocated, so
+                                     # a depth-24 ring grew toward 2*24*0.8 = 38 GiB/node which — on top of
+                                     # the 39 GiB rxring tmpfs — pushed past 93 GiB into swap and drove the
+                                     # 15–20 min thrash death spiral (n01/n09/n13 wedging). The dominant
+                                     # fix is the rxring cut (t_buf 32768→8192 = 39→9.8 GiB); on top of
+                                     # that, depth=16 (2.2 s retention) caps pinned retention at 2*16*0.8 =
+                                     # 25.6 GiB. Node ceiling ≈ 9.8 (rxring) + 25.6 (retention) + ~8 (base)
+                                     # ≈ 43 GiB → ~2× under the prior ~85 GiB working set, ~50 GiB headroom,
+                                     # no swap (measured: avail 56–61 GiB, RSS 10.1 GiB/half, cubes at full
+                                     # rate). 16 keeps the pre-M7.6 retention value to minimise behaviour
+                                     # change (per user 2026-05-31 "as little as possible"); drop toward 8
+                                     # if a future op-point needs the RAM ("discard rather than buffer").
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index
