@@ -2256,9 +2256,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "~14 s behind) that pushed candidate event_specnums "
                         "outside the C2 window and caused too_late dump "
                         "misses. 0 disables (overrun-only legacy seek).")
-    p.add_argument("--attach-timeout-s", type=float, default=30.0,
+    p.add_argument("--attach-timeout-s", type=float, default=180.0,
                    help="wait up to this long for search_rx to create "
-                        "the shm ring before giving up (default 30s; "
+                        "the shm ring before giving up (default 180s; "
                         "covers the search_rx 16-port bind + ring "
                         "init lag when both routines are fork-execed "
                         "by dsart_rt in the same verb dispatch).")
