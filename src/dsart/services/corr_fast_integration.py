@@ -1722,15 +1722,18 @@ def _apply_online_injection(
     outside the search's (l, m) grid — and is never detected, no
     matter how bright (confirmed empirically with a fluence-5e4 pulse).
 
-    Fix: the injection is still added post-cal (so RFI excision can't
-    flag the burst as narrowband CW), but ``OnlineInjector`` now folds
-    the SAME complex cal gain ``G`` (incl. the DEC fringe-stop) into
-    its phasor at queue time. Adding ``phasor · G · envelope`` post-cal
-    is algebraically identical to adding the bare ``phasor · envelope``
-    *pre*-cal and letting ``apply_cal_split`` multiply by ``G`` — i.e.
-    it reproduces the Phase 6/7 placement that detected cleanly, while
-    keeping the burst out of the RFI flagger. The gain is folded once
-    at ``add_pending`` time, so the relocation stays RT-cost-neutral.
+    Fix (RESTORED 2026-05-31, commit f6c2512): the injection is still
+    added post-cal (so RFI excision can't flag the burst as narrowband
+    CW), but ``OnlineInjector`` folds the SAME complex cal gain ``G``
+    (incl. the DEC fringe-stop) into its phasor at queue time. Adding
+    ``phasor · G · envelope`` post-cal is algebraically identical to
+    adding the bare ``phasor · envelope`` *pre*-cal and letting
+    ``apply_cal_split`` multiply by ``G`` — i.e. it images the injected
+    source exactly where a real sky source at (l, m) lands. A bare
+    (no-fold) injection was confirmed by dump_now to image as a NEGATIVE
+    point at the aliased ~sin(δ_obs−φ_lat) position (px 172 vs requested
+    67), undetected; the prior fluence-independent "SNR plateau" was
+    background RFI grabbed by the matcher, not the injection.
 
     The call mutates ``real_v`` / ``imag_v`` in place via
     ``OnlineInjector.apply_block`` (``torch.Tensor.add_``); no tensor
@@ -2807,35 +2810,47 @@ def build_context(
 
     injector: OnlineInjector | None = None
     if cfg.inject_configs or cfg.inject_watch_enabled:
-        # Reconstruct the per-(pol, ant, ch) complex cal gain that
-        # apply_cal_split applies, so the post-cal voltage injection is
-        # folded with the SAME gain (incl. the F21 DEC fringe-stop) the
-        # sky sees. cal_real/cal_imag broadcast shape is
-        # (NCHAN, 1, NPOL, 1, NANTS); squeeze the singleton time/packet
-        # axes and reorder to (NPOL, NANTS, NCHAN). None when no cal.
-        cal_gain: np.ndarray | None = None
-        if cal is not None:
-            cr = cal.cal_real.detach().to("cpu", torch.float32).numpy()
-            ci = cal.cal_imag.detach().to("cpu", torch.float32).numpy()
-            cr = cr[:, 0, :, 0, :]                    # (NCHAN, NPOL, NANTS)
-            ci = ci[:, 0, :, 0, :]
-            cal_gain = (
-                np.transpose(cr, (1, 2, 0))           # (NPOL, NANTS, NCHAN)
-                + 1j * np.transpose(ci, (1, 2, 0))
-            ).astype(np.complex128)
-            LOG.info(
-                "OnlineInjector cal-gain fold ENABLED: shape=%s "
-                "mean|G|=%.4g (post amp-norm; injection added post-cal "
-                "is now equivalent to pre-cal inject × G)",
-                cal_gain.shape, float(np.abs(cal_gain).mean()),
-            )
+        # NO cal-gain fold (cal_gain=None) — 2026-05-31.
+        #
+        # The injection is added POST-cal (step 4b), i.e. into the
+        # already-calibrated + fringe-stopped voltage stream. In that
+        # frame a REAL source at offset (l, m) from the phase center is
+        # exactly the bare geometric phasor exp(+2πiν(E_a·l + N_a·m)/c)
+        # (and phase-flat at (0,0)): ``apply_cal_split`` has already
+        # multiplied by G_a to STRIP the per-antenna instrumental phase
+        # and fringe-stop to δ_obs, so the instrumental gains are gone
+        # from the data. To make a fake source identical to a calibrated
+        # real source we therefore add precisely that bare phasor with NO
+        # G multiplication.
+        #
+        # Folding G (the previous "RESTORED" path) instead added
+        # ``phasor · G · envelope`` = (calibrated-real-source) × G_a,
+        # i.e. it RE-IMPOSED the per-antenna instrumental phase that cal
+        # had just removed, scrambling the source across antennas so it
+        # decorrelated / smeared instead of forming a clean point. The
+        # "ground-truth dump" that had motivated the fold was confounded
+        # by (a) the search-domain dump-timing miss — search_specnum =
+        # corr_specnum/16 while dump_now targets the NEWEST cube, so the
+        # dumps did not contain the burst — and (b) the inject matcher
+        # grabbing background events; both make a working bare injection
+        # look absent / mislocated. The fold's algebra ("bare pre-cal × G
+        # ≡ a real source") is wrong because a real source does not enter
+        # as a bare pre-cal phasor; it enters as (bare phasor) ×
+        # (instrument ≈ G^-1), and cal's ×G cancels the instrument to
+        # leave the bare phasor — so the matching injection is bare
+        # POST-cal, never folded.
         injector = OnlineInjector(
             antpos_e=antpos_e,
             antpos_n=antpos_n,
             chgroup=int(cfg.chgroup),
             device=device,
             dtype=voltage_dtype,
-            cal_gain=cal_gain,
+            cal_gain=None,
+        )
+        LOG.info(
+            "OnlineInjector cal-gain fold DISABLED (bare geometric phasor; "
+            "post-cal injection matches a calibrated real source at (l,m) "
+            "relative to the δ_obs phase center)",
         )
         for inj_cfg in cfg.inject_configs:
             injector.add_pending(inj_cfg)

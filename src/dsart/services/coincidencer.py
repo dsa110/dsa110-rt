@@ -589,12 +589,23 @@ class CoincidencerService:
         # dashboard's bootstrap-SNR calibration to consume, and (b)
         # stamps the C1 CSV's inj_id column so injection candidates
         # are visibly labelled.
+        # DIAGNOSTIC (2026-05-31): allow widening the match tolerances
+        # via env so an operator can discover WHERE an injection images
+        # (and whether it images at all) without redeploying. Defaults
+        # fall back to the production constants in inject_match.
+        _lm_tol_env = os.environ.get("DSART_INJECT_LM_TOL_RAD")
+        _dm_tol_env = os.environ.get("DSART_INJECT_DM_TOL_FRAC")
+        _matcher_kwargs: dict = {
+            "store": self._mon_store,
+            "refresh_s": INJECT_REGISTRY_REFRESH_S,
+        }
+        if _lm_tol_env:
+            _matcher_kwargs["lm_tol_rad"] = float(_lm_tol_env)
+        if _dm_tol_env:
+            _matcher_kwargs["dm_tol_frac"] = float(_dm_tol_env)
         self._inject_matcher: InjectionMatcher = (
             inject_matcher if inject_matcher is not None
-            else InjectionMatcher(
-                store=self._mon_store,
-                refresh_s=INJECT_REGISTRY_REFRESH_S,
-            )
+            else InjectionMatcher(**_matcher_kwargs)
         )
 
         self._receiver = C1BatchReceiver(

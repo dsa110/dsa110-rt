@@ -908,13 +908,25 @@ class RtOrchestrator:
         self._children.clear()
 
     def _reap_dead_children(self) -> None:
-        """Notice if a routine exited on its own; log RC."""
-        for name in list(self._children):
-            proc = self._children[name]
-            rc = proc.poll()
-            if rc is not None:
-                LOG.warning("routine %s exited rc=%d", name, rc)
-                del self._children[name]
+        """Notice if a routine exited on its own; log RC.
+
+        Runs on the main loop while ``_verb_start`` / ``_verb_stop``
+        mutate ``self._children`` from the etcd watch thread. Take the
+        same ``self._lock`` they hold and pop defensively so a verb that
+        clears/respawns routines between the snapshot and the removal can
+        no longer crash the orchestrator with ``KeyError`` (the recurring
+        ``KeyError: 'search_compute_0'`` that silently killed the n02/n13
+        orchestrators — they were ``setsid nohup`` so never restarted).
+        """
+        with self._lock:
+            for name in list(self._children):
+                proc = self._children.get(name)
+                if proc is None:
+                    continue
+                rc = proc.poll()
+                if rc is not None:
+                    LOG.warning("routine %s exited rc=%d", name, rc)
+                    self._children.pop(name, None)
 
     # ---- utc UDP poke -------------------------------------------------
 

@@ -34,6 +34,8 @@ import dataclasses
 import logging
 import socket
 import threading
+
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -373,9 +375,26 @@ class C2TriggerListener:
         # canonical compose. The manifest we built in
         # :meth:`_build_manifest` points at
         # ``${dump_root}/<event_name>/cube_s<sid>_g<g>_<event_specnum>.npz``.
+        #
+        # SNAPSHOT the cube out of the ring slot BEFORE enqueueing.
+        # ``retained.pinned_host_tensor`` ALIASES a CubeRetentionRing
+        # slot buffer that the live pipeline reuses every ``depth`` cubes
+        # (~1 s at production cadence). The writer thread serialises the
+        # ~855 MB NPZ asynchronously, which outlives that reuse window,
+        # so without this copy the slot is overwritten mid-dump: the
+        # writer reduces ``peak_grid`` from the still-intact buffer but
+        # the ``cube`` bytes ``np.savez`` streams out afterwards come
+        # from the clobbered next-cube data — the peak_grid(~60000) /
+        # cube(~noise) mismatch we observed on injection dumps. The copy
+        # runs synchronously here in the listener thread while the
+        # matched cube is guaranteed still live in the ring (we just
+        # found it via find_cube_for_specnum microseconds ago), so it
+        # captures the correct, self-consistent cube. ~855 MB memcpy
+        # (~0.3 s) is acceptable on the rare C2-dump path.
+        cube_snapshot = np.array(retained.pinned_host_tensor, copy=True)
         return bool(
             self._cube_dump.submit(
-                cube=retained.pinned_host_tensor, manifest=manifest,
+                cube=cube_snapshot, manifest=manifest,
             )
         )
 
