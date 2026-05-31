@@ -41,9 +41,17 @@ routines:
   # exactly between owner and consumer or the ctypes header check
   # rejects at attach time).
   #
-  # Op-point (M7.2 production): n_corr=16, n_coarse_dm=8,
-  # bytes_per_cell=2 (cint8 complex), t_buf_samples=4096 (~16 cube
-  # cadences of headroom — safe for a momentary compute-half stall).
+  # Op-point (M7.6-mem production): n_corr=16, n_coarse_dm=8,
+  # bytes_per_cell=2 (cint8 complex), t_buf_samples=8192 (~64 cube
+  # cadences ≈ 8.6 s of headroom — safe for a momentary compute-half
+  # stall). LOWERED from 32768 (2026-05-31): 32768 was ~256 cadences
+  # ≈ 34 s and made the rxring a 39 GiB tmpfs segment, which together
+  # with the lazily-growing depth-24 cube ring blew past the 93 GiB
+  # node RAM into swap. 8192 = 9.8 GiB rxring (still 4× the prior
+  # 4096 design point). The two search_compute halves MUST be
+  # launched with the SAME --t-buf-samples or the ring header check
+  # rejects them at attach (all three routines below are kept in
+  # lock-step).
   #
   # SO_RCVBUF=256 MiB matches corner_turn.sh and the M7.PREP socket
   # buffer note (/proc/sys/net/core/rmem_max must be ≥ 268435456 on
@@ -62,7 +70,7 @@ routines:
       --so-rcvbuf-bytes 268435456
       --shm-name /dsart-rxring-CN
       --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 32768 --n-filled 5000
+      --t-buf-samples 8192 --n-filled 5000
       --bytes-per-cell 2
       --status-interval-s 5.0
       --log-level INFO
@@ -159,7 +167,7 @@ routines:
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
       --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 32768 --n-filled 5000
+      --t-buf-samples 8192 --n-filled 5000
       --bytes-per-cell 2
       --n-fdm 34 --t-det 192 --n-grid 256
       --cube-cadence-samples 128
@@ -247,7 +255,7 @@ routines:
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
       --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 32768 --n-filled 5000
+      --t-buf-samples 8192 --n-filled 5000
       --bytes-per-cell 2
       --n-fdm 34 --t-det 192 --n-grid 256
       --cube-cadence-samples 128
@@ -315,9 +323,16 @@ routines:
 #   per cube ≈ t_det * n_fdm * n_grid * n_grid * 2 bytes (fp16)
 #           = 192 * 34 * 256 * 256 * 2 = ~3.2 GiB at the production
 #             op-point. ``cube_ring_depth: 8`` → ~26 GiB per half →
-#             ~52 GiB per search node (well inside the 256 GiB host
-#             budget). Drop to 2 during shake-down if pinned memory
-#             is constrained.
+#             ~52 GiB per search node. NOTE (2026-05-31): the real
+#             production search nodes have ~93 GiB RAM (NOT 256 GiB —
+#             an earlier comment here was wrong). The cube ring is
+#             torch pin_memory=True (shared-anon, shows in Shmem) and
+#             LAZILY allocated, so an over-large depth silently grows
+#             into swap and wedges the node. Keep
+#             ``cube_ring_depth * 3.2 GiB * 2 halves`` + the rxring
+#             (``t_buf_samples / 32768 * 39 GiB``) + ~18 GiB base
+#             comfortably under 93 GiB. Drop depth further during
+#             shake-down if pinned memory is constrained.
 # ---------------------------------------------------------------------------
 c1:
   snr_min: 12.0                      # Phase 6c (M7.4 commissioning): raised from 8.0 → 12.0 to suppress
@@ -336,17 +351,23 @@ c1:
                                      # Gaussian, matching Q(6)~9.9e-10 × 6.4e9 trials = 6.3 cands/cube.
                                      # Coverage correction is required for this to hold; see cube_pipeline.py
                                      # M7.4.2 notes.
-  cube_ring_depth: 24                # M7.6: raised 16 → 24 (≈3.2s retention at 7.45 cubes/s). C2's coincidence
-                                     # rolling buffer is window_s=5.0, so a cluster's peak_event_specnum can
-                                     # sit several seconds behind a search node's live edge before the dump
-                                     # trigger lands; the prior 16-slot (~2.2s) ring let those triggers arrive
-                                     # ``too_late``. 24 slots = ~78 GiB pinned per gpu_half (~156 GiB per
-                                     # 2-GPU search node). Search nodes run no corr_fast, so the full 256 GiB
-                                     # host budget is available — 156 GiB leaves comfortable headroom. Each
-                                     # slot is t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16. DtoH burden per cube is
-                                     # amortised by overlapping with the next cube's L1/detector work; M7.4.1
-                                     # GPU-scatter freed up ~50 ms of H2D budget which more than compensates
-                                     # for the ~25 ms/cube DtoH cost.
+  cube_ring_depth: 8                 # M7.6-mem (2026-05-31): LOWERED 24 → 8 to fit the REAL search-node
+                                     # RAM budget. The prior comment assumed a 256 GiB host; the production
+                                     # search nodes actually have ~93 GiB. Each slot is
+                                     # t_det*n_fdm*n_grid^2*2 = 3.2 GiB fp16, allocated via torch
+                                     # pin_memory=True → shared-anon (counts in Shmem, NOT Mlocked). The
+                                     # ring is LAZILY allocated, so a depth-24 ring slowly grows toward
+                                     # 2*24*3.2 = 154 GiB per node as distinct cubes flow — which is what
+                                     # drove the 15–20 min swap-thrash death spiral (n01/n09/n13 wedging).
+                                     # depth=8 caps pinned retention at 2*8*3.2 = 51 GiB; combined with the
+                                     # t_buf_samples 32768→8192 rxring cut (39→9.8 GiB) the node ceiling is
+                                     # ~79 GiB → fits 93 GiB with headroom, no swap. Trade-off (per user
+                                     # 2026-05-31 "discard rather than buffer"): retention window shrinks to
+                                     # ~1.1 s, so on-sky C2 dump triggers that lag the live edge by >1.1 s
+                                     # will arrive ``too_late`` and be dropped. Acceptable: a sustainable
+                                     # depth-8 system beats a depth-24 config the hardware cannot hold.
+                                     # Injection dumps (inj_dump2.py) fire the moment the target sample
+                                     # lands in the ring window, so they are unaffected.
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index
