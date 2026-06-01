@@ -343,15 +343,18 @@ routines:
   # F34) this op-point sustains realtime with comfortable headroom
   # on a single 2080Ti.
   #
-  # Per-node cal blob: CALSB is substituted by dsart_rt at spawn-time
-  # to "sb%02d" of the corr-node's chgroup (n06 -> sb03, n03 -> sb00,
-  # n22 -> sb15). One YAML line, all 16 corr nodes.
-  #
-  # Each corr node must have the 250924mptq cal bundle staged at the
-  # canonical location before M7.1 / M7.4 (M7.PREP distributes the
-  # voltages; the much smaller cal bundle is staged separately by
-  # `dsart-rt services install` once that bake-in lands; M7.1 stages
-  # n06 by hand for the smoke).
+  # Per-node cal blob: each corr node applies its OWN local
+  # `antennas.out` — the legacy x-engine beamformer-weights binary the
+  # upstream cal pipeline (calibration23 / update_bfweights.py) writes
+  # to `~/proj/dsa110-shell/dsa110-xengine/utils/antennas.out` on every
+  # corr node. Because the file is already node-local (it carries that
+  # node's own subband solution), the path is identical on all 16 corr
+  # nodes and needs no CALSB substitution. The blob is the same legacy
+  # format `dsart.cal.bf_weights.load_bf_weights` reads (the old
+  # `beamformer_weights_sb<NN>.dat` files were this same format), so the
+  # fast-corr cal loader consumes it unchanged. Hot-reload via
+  # `cmd: reload_cal`. (CALSB is still substituted by dsart_rt for any
+  # other per-node args that want it; it is just no longer used here.)
   #
   # GPU isolation: CUDA_VISIBLE_DEVICES=1 hides GPU 0 from this
   # process; the post-mask logical device 0 == physical GPU 1, which
@@ -368,7 +371,7 @@ routines:
       --chgroup CHGROUP
       --obs-dec-deg CUSTOMDEC
       --device cuda:0
-      --apply-cal /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_CALSB.dat
+      --apply-cal /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --cal-mode phase_only
       --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
       --sk-far 1e-4

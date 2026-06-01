@@ -292,6 +292,35 @@ class CalibrationStore:
         out.sort(key=lambda e: e.bucket)
         return out
 
+    def _client(self) -> Any:
+        """Return the raw etcd3 client (same path :meth:`list_all`
+        walks), or ``None`` if it cannot be reached."""
+        if hasattr(self._store, "_ensure"):
+            try:
+                self._store._ensure()
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("CalibrationStore._client _ensure: %s", exc)
+                return None
+        client_owner = getattr(self._store, "_store", self._store)
+        try:
+            return client_owner.get_etcd()
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("CalibrationStore._client get_etcd: %s", exc)
+            return None
+
+    def delete(self, bucket: str) -> bool:
+        """Delete one calibration bucket key.
+
+        Returns ``True`` when etcd reports a key was removed,
+        ``False`` when it was already absent. Raises on transport
+        failure so the caller can record a per-bucket error.
+        """
+        client = self._client()
+        if client is None:
+            raise RuntimeError("etcd client unavailable")
+        key = f"{CALIBRATION_PREFIX}{bucket}"
+        return bool(client.delete(key))
+
 
 # ---------------------------------------------------------------------------
 # SNR ↔ fluence math
@@ -719,6 +748,140 @@ def _extract_apply_at(inject_response: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Delete the fluence/SNR calibration table (Control-tab verb)
+# ---------------------------------------------------------------------------
+
+
+def delete_snr_calibrations(
+    store: Any,
+    *,
+    dry_run: bool = True,
+    user: Optional[str] = None,
+    cal_store: Optional[CalibrationStore] = None,
+) -> Dict[str, Any]:
+    """Preview or delete the per-``(DM, width)`` injection fluence→SNR
+    ``K`` calibration table at ``/cnf/inject/snr_calibration/*``.
+
+    This is the bootstrap table the operator builds with
+    :func:`fire_calibration_probe` (Control-tab "Calibrate"); wiping it
+    lets them re-measure the fluence/SNR relation from scratch. It does
+    **NOT** touch the on-sky beamformer-weights K-cal table (that lives
+    on the corr nodes and is handled by :mod:`fleet_kcal`).
+
+    Parameters
+    ----------
+    store:
+        DsaStore-like object (the dashboard's ``ControlStore``).
+    dry_run:
+        When ``True`` (default), only enumerates the present buckets;
+        nothing is removed.
+    user:
+        Operator label for the audit row.
+    cal_store:
+        Optional pre-built :class:`CalibrationStore` (tests inject a fake).
+
+    Returns
+    -------
+    dict
+        ``{"ok", "dry_run", "buckets": [...], "summary": {...}}`` where
+        each bucket row carries ``status`` ∈ ``{exists, deleted,
+        not_found, error}``.
+    """
+    cs = cal_store if cal_store is not None else CalibrationStore(store)
+    try:
+        entries = cs.list_all()
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("delete_snr_calibrations: list_all failed")
+        summary = {
+            "n_buckets": 0, "n_deleted": 0, "n_present": 0, "n_failed": 0,
+            "dry_run": bool(dry_run), "prefix": CALIBRATION_PREFIX,
+        }
+        return {
+            "ok": False, "dry_run": bool(dry_run),
+            "error": f"list_failed: {exc}", "buckets": [], "summary": summary,
+        }
+
+    buckets: List[Dict[str, Any]] = []
+    for e in entries:
+        row: Dict[str, Any] = {
+            "bucket": e.bucket,
+            "dm_pc_cm3_rounded": e.dm_pc_cm3_rounded,
+            "width_samples": e.width_samples,
+            "K": e.K,
+            "last_fluence_jy_ms": e.last_fluence_jy_ms,
+            "last_observed_snr": e.last_observed_snr,
+            "status": "exists",
+            "error": None,
+        }
+        if not dry_run:
+            try:
+                removed = cs.delete(e.bucket)
+                row["status"] = "deleted" if removed else "not_found"
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "delete_snr_calibrations: delete(%s) failed: %s",
+                    e.bucket, exc,
+                )
+                row["status"] = "error"
+                row["error"] = f"{exc!r}"[:200]
+        buckets.append(row)
+
+    summary = {
+        "n_buckets": len(buckets),
+        "n_deleted": sum(1 for b in buckets if b["status"] == "deleted"),
+        "n_present": sum(1 for b in buckets if b["status"] == "exists"),
+        "n_not_found": sum(1 for b in buckets if b["status"] == "not_found"),
+        "n_failed": sum(1 for b in buckets if b["status"] == "error"),
+        "dry_run": bool(dry_run),
+        "prefix": CALIBRATION_PREFIX,
+    }
+    overall_ok = summary["n_failed"] == 0
+    _audit_snr_cal_delete(store, summary=summary, ok=overall_ok, user=user)
+    return {
+        "ok": overall_ok,
+        "dry_run": bool(dry_run),
+        "buckets": buckets,
+        "summary": summary,
+    }
+
+
+def _audit_snr_cal_delete(
+    store: Any, *, summary: Dict[str, Any], ok: bool, user: Optional[str],
+) -> None:
+    """Write one audit row for a fluence/SNR calibration wipe. Swallows
+    failures so they can't break the operator-visible response."""
+    if store is None:
+        return
+    try:
+        from control_store import audit_log  # local import (test-friendly)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(
+            "delete_snr_calibrations: control_store import failed: %s", exc,
+        )
+        return
+    try:
+        audit_log(
+            store,
+            namespace="dsa_monitor.inject_calibration",
+            cn_target="-",
+            cmd="delete_snr_cal",
+            val=summary,
+            ok=bool(ok),
+            note=(
+                f"dry_run={summary.get('dry_run')} "
+                f"n_buckets={summary.get('n_buckets')} "
+                f"n_deleted={summary.get('n_deleted')} "
+                f"n_failed={summary.get('n_failed')}"
+            ),
+            user=user,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(
+            "delete_snr_calibrations: audit_log failed (continuing): %s", exc,
+        )
+
+
 __all__ = [
     "ACTIVE_INJECT_PREFIX",
     "MATCH_EVENT_PREFIX",
@@ -741,4 +904,5 @@ __all__ = [
     "get_match_event",
     "snr_to_fluence",
     "fire_calibration_probe",
+    "delete_snr_calibrations",
 ]

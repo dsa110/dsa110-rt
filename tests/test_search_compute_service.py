@@ -526,10 +526,12 @@ async def test_chunk5_geom_from_slot_uses_config(tmp_path) -> None:
             assert geom.cube_id == slot.cube_id
             assert geom.specnum_start == slot.specnum_start
             assert geom.fine_dm_pc_cc.shape == (slot.n_fdm_in_cube,)
-            # mjd_start = 60942.0 + specnum_start * (sample_period_us /
-            #             sample_period_specnum) * 1e-6 / 86400
-            t_int_fast_us = 131.072 / 16
-            expected_mjd = 60942.0 + slot.specnum_start * t_int_fast_us * 1e-6 / 86400.0
+            # mjd_start = 60942.0 + specnum_start * sample_period_us * 1e-6 / 86400
+            # specnum_start is in SEARCH-SAMPLE units, so the per-specnum MJD
+            # step is the FULL search-sample period (NOT divided by
+            # sample_period_specnum).
+            t_int_sample_us = 131.072
+            expected_mjd = 60942.0 + slot.specnum_start * t_int_sample_us * 1e-6 / 86400.0
             np.testing.assert_allclose(geom.mjd_start, expected_mjd)
             break
     finally:

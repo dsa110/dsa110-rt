@@ -436,3 +436,84 @@ class TestFireCalibrationProbe:
         # the inject response (1_000_000), not the placeholder 0.
         active = store.kv[ic.ACTIVE_INJECT_PREFIX + result.inj_id]
         assert active["apply_at_specnum"] == 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# delete_snr_calibrations
+# ---------------------------------------------------------------------------
+
+
+class _FakeEtcdRW:
+    """Read/write fake bound to a shared kv dict: supports the
+    ``get_prefix`` walk :meth:`CalibrationStore.list_all` uses and the
+    ``delete`` :meth:`CalibrationStore.delete` calls."""
+
+    def __init__(self, kv: Dict[str, Dict[str, Any]]):
+        self._kv = kv  # live reference, not a snapshot
+
+    def get_prefix(self, prefix: str):
+        for k, v in list(self._kv.items()):
+            if k.startswith(prefix):
+                yield json.dumps(v).encode("utf-8"), None
+
+    def delete(self, key: str) -> bool:
+        return self._kv.pop(key, None) is not None
+
+
+class _FakeStoreRW(FakeStore):
+    """FakeStore whose etcd client mutates the same kv (so deletes stick)."""
+
+    def get_etcd(self) -> Any:
+        return _FakeEtcdRW(self.kv)
+
+
+class TestDeleteSnrCalibrations:
+    def _seed(self, store: "_FakeStoreRW") -> None:
+        cs = ic.CalibrationStore(store)
+        for dm, width, K in [(150.0, 32, 9.5), (500.0, 64, 12.0)]:
+            cs.put(ic.CalibrationEntry(
+                bucket=ic.bucket_key(dm, width),
+                dm_pc_cm3_rounded=int(round(dm / 50.0) * 50),
+                width_samples=width,
+                K=K,
+                last_fluence_jy_ms=100.0,
+                last_observed_snr=K * math.sqrt(100.0 / width),
+                last_inj_id="seed",
+                last_calibrated_at_unix=1.0,
+            ))
+
+    def test_dry_run_lists_without_deleting(self):
+        store = _FakeStoreRW()
+        self._seed(store)
+        out = ic.delete_snr_calibrations(store, dry_run=True, user="t")
+        assert out["ok"] is True
+        assert out["dry_run"] is True
+        assert out["summary"]["n_buckets"] == 2
+        assert out["summary"]["n_deleted"] == 0
+        assert out["summary"]["n_present"] == 2
+        assert all(b["status"] == "exists" for b in out["buckets"])
+        # Nothing actually removed.
+        assert ic.CalibrationStore(store).get(
+            dm_pc_cm3=150.0, width_samples=32) is not None
+
+    def test_delete_removes_all_buckets(self):
+        store = _FakeStoreRW()
+        self._seed(store)
+        out = ic.delete_snr_calibrations(store, dry_run=False, user="t")
+        assert out["ok"] is True
+        assert out["dry_run"] is False
+        assert out["summary"]["n_buckets"] == 2
+        assert out["summary"]["n_deleted"] == 2
+        assert out["summary"]["n_failed"] == 0
+        assert all(b["status"] == "deleted" for b in out["buckets"])
+        # Both buckets gone.
+        cs = ic.CalibrationStore(store)
+        assert cs.get(dm_pc_cm3=150.0, width_samples=32) is None
+        assert cs.get(dm_pc_cm3=500.0, width_samples=64) is None
+
+    def test_empty_table_is_ok(self):
+        store = _FakeStoreRW()
+        out = ic.delete_snr_calibrations(store, dry_run=False, user="t")
+        assert out["ok"] is True
+        assert out["summary"]["n_buckets"] == 0
+        assert out["buckets"] == []

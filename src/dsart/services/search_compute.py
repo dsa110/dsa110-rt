@@ -71,6 +71,7 @@ from ..common.constants import (
     K_DM_MS_GHZ2_PC,
     NU_BOT_PROC_GHZ,
     NU_TOP_PROC_GHZ,
+    SPECNUM_PERIOD_US,
     T_INT_SEARCH_US_DEFAULT,
 )
 from ..common.contracts import Candidate, CubeGeometry
@@ -252,14 +253,19 @@ class SearchComputeConfig:
             (production: derived from λ / (n_grid · cell_λ); for v1
             we let the operator pin a constant per-deployment).
         cube_l0_rad, cube_m0_rad: (l, m) at pixel index 0. Default 0.0.
-        cube_sample_period_us: time between adjacent samples in µs
-            (defaults to ``T_INT_SEARCH_US_DEFAULT`` from constants).
-        cube_sample_period_specnum: spec-nums per detector sample
-            (default 16 = ``t_int_search_us / t_int_fast_us`` at
-            production ops point).
+        cube_sample_period_us: search-sample period in µs (= the
+            detector cadence ``t_int_search_us``; 1048.576 at the prod
+            op-point). Wired from ``--t-int-search-us`` in
+            ``_build_search_config_from_yaml``; defaults to
+            ``T_INT_SEARCH_US_DEFAULT``. ``slot.specnum_start`` is in
+            THESE (search-sample) units, so this is the per-specnum
+            MJD step (NOT divided by ``cube_sample_period_specnum``).
+        cube_sample_period_specnum: native spec-nums per detector
+            sample (16 at the prod op-point). Carried on the C1→C2 wire
+            header; no longer used in the ``mjd_start`` math.
         mjd_at_specnum_0: MJD at specnum 0 of this run; ``mjd_start``
             for cube N is computed as ``mjd_at_specnum_0 +
-            (specnum_start * t_int_fast_us / 1e6 / 86400)``. v1
+            (specnum_start * cube_sample_period_us / 1e6 / 86400)``. v1
             placeholder is 0.0; production must override.
         fine_dm_pc_cc_full: full fine-DM grid (``DmPlan.fine_dm``);
             required if ``clusterer_config`` is set so the per-cube
@@ -328,7 +334,7 @@ class SearchComputeConfig:
     cube_cell_m_rad: float = 1.5e-4
     cube_l0_rad: float = 0.0
     cube_m0_rad: float = 0.0
-    cube_sample_period_us: float = 131.072
+    cube_sample_period_us: float = T_INT_SEARCH_US_DEFAULT
     cube_sample_period_specnum: int = 16
     mjd_at_specnum_0: float = 0.0
     fine_dm_pc_cc_full: Optional[np.ndarray] = None
@@ -878,12 +884,20 @@ class SearchComputeService:
             fine_dm = np.linspace(
                 50.0, 800.0, slot.n_fdm_in_cube, dtype=np.float64
             )
-        # mjd_start = mjd_at_specnum_0 + specnum_start * t_int_fast_us / 1e6 / 86400.
-        # t_int_fast_us = sample_period_us / sample_period_specnum.
-        t_int_fast_us = cfg.cube_sample_period_us / cfg.cube_sample_period_specnum
+        # mjd_start = mjd_at_specnum_0 + specnum_start * t_int_sample_us / 1e6 / 86400.
+        # ``slot.specnum_start`` is in SEARCH-SAMPLE units (it advances by
+        # cube_cadence_samples per cube — measured 128/cube at the prod
+        # op-point), so the per-specnum MJD step is the FULL search-sample
+        # period ``cube_sample_period_us`` (= t_int_search_us = 1048.576 µs).
+        # It must NOT be divided by ``cube_sample_period_specnum``: doing so
+        # treated specnum_start as if it counted native (65.536 µs) specnums
+        # and made the MJD clock 16× too slow; combined with the old stale
+        # 131.072 µs default that compounded to 128× slow, stretching the C2
+        # 5 s coincidence window to ~11 min (graph_size ≈ 300 instead of ~3).
+        t_int_sample_us = cfg.cube_sample_period_us
         # Latch the per-run wall-clock anchor on the first cube when the
         # operator didn't pin ``mjd_at_specnum_0`` explicitly. The shift
-        # by ``-specnum_start * t_int_fast_us`` puts the anchor at the
+        # by ``-specnum_start * t_int_sample_us`` puts the anchor at the
         # MJD that specnum 0 would have hit IF the run had started at
         # specnum 0 at the same wall-clock cadence. UNIX epoch 1970-01-01
         # = MJD 40587.0 exactly.
@@ -891,14 +905,14 @@ class SearchComputeService:
             wall_mjd_now = 40587.0 + time.time() / 86400.0
             self._mjd_at_specnum_0_override = float(
                 wall_mjd_now
-                - slot.specnum_start * t_int_fast_us * 1e-6 / 86400.0
+                - slot.specnum_start * t_int_sample_us * 1e-6 / 86400.0
             )
             _LOG.info(
                 "mjd_at_specnum_0 wall-clock latch: %.9f "
-                "(slot.specnum_start=%d, t_int_fast_us=%.6f)",
+                "(slot.specnum_start=%d, t_int_sample_us=%.6f)",
                 self._mjd_at_specnum_0_override,
                 int(slot.specnum_start),
-                t_int_fast_us,
+                t_int_sample_us,
             )
         mjd_at_specnum_0 = (
             self._mjd_at_specnum_0_override
@@ -906,7 +920,7 @@ class SearchComputeService:
             else cfg.mjd_at_specnum_0
         )
         mjd_start = mjd_at_specnum_0 + (
-            slot.specnum_start * t_int_fast_us * 1e-6 / 86400.0
+            slot.specnum_start * t_int_sample_us * 1e-6 / 86400.0
         )
         return CubeGeometry(
             cube_id=slot.cube_id,
@@ -1559,6 +1573,7 @@ def _build_search_config_from_yaml(
     layer1_max_samples: Optional[int],
     layer1_sigma_floor: float,
     fine_dm_pc_cc_full: Optional[np.ndarray],
+    t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
     enable_c1: bool = True,
     c1_bind_host_override: Optional[str] = None,
 ) -> SearchComputeConfig:
@@ -1859,6 +1874,16 @@ def _build_search_config_from_yaml(
         cube_upload_dest_host=cube_upload_dest_host,
         cube_upload_dest_root=cube_upload_dest_root,
         cube_upload_bandwidth_limit_kbps=cube_upload_bwlimit_kbps,
+        # Wire the MJD/time geometry to the ACTUAL search cadence
+        # (--t-int-search-us, 1048.576 µs at the prod op-point) instead
+        # of leaving the stale class default. ``specnum_start`` is in
+        # search-sample units, so cube_sample_period_us IS the per-specnum
+        # MJD step; cube_sample_period_specnum (native specnums per search
+        # sample) is carried on the wire header only.
+        cube_sample_period_us=float(t_int_search_us),
+        cube_sample_period_specnum=max(
+            1, int(round(float(t_int_search_us) / SPECNUM_PERIOD_US))
+        ),
     )
 
 
@@ -2143,6 +2168,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         layer1_max_samples=args.layer1_max_samples,
         layer1_sigma_floor=args.layer1_sigma_floor,
         fine_dm_pc_cc_full=fine_dm,
+        t_int_search_us=args.t_int_search_us,
         enable_c1=not args.disable_c1,
         c1_bind_host_override=args.c1_bind_host,
     )
