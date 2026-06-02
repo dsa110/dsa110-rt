@@ -37,7 +37,12 @@ Verbs (JSON ``{"cmd": "<verb>", "val": <any>}`` posted to the cmd key):
 * ``stop`` — kill routines, destroy buffers.
 * ``utc_start`` (val: int = first specnum to record) — UDP-poke each
   capture process on ``127.0.0.1:11223`` and ``:11224`` with the
-  legacy ``UTC_START-<seq>`` string. Persisted to ``/mon/snap/1/utc_start``.
+  legacy ``UTC_START-<seq>`` string. Persists the SNAP-wall specnum to
+  ``/mon/snap/1/utc_start_rt``; also refreshes the legacy keys
+  ``/mon/snap/1/armed_mjd`` (= now MJD) and ``/mon/snap/1/utc_start``
+  (= 0) so the slow-vis writer (``dsamfs``) anchors UVH5 time tags on
+  the current wall clock instead of the long-frozen pre-M7-cutover
+  values.
 * ``utc_stop`` (val: int) — same shape, ``UTC_STOP-<seq>``.
 
 Heartbeat is written every ``--mon-cadence-s`` seconds to
@@ -637,13 +642,55 @@ class RtOrchestrator:
     def _verb_utc_start(self, val: Any) -> None:
         seq = int(val) if val is not None else 0
         self._send_utc_udp(f"UTC_START-{seq}")
-        # Persist the trigger sequence into the mon namespace so other
-        # consumers (legacy snap monitor, web UIs) can read it. Mirrors
-        # the legacy corr.py behaviour of writing /mon/snap/1/utc_start.
+        # Persist the trigger sequence into the mon namespace.
+        #
+        # Two keyspaces, two consumer populations:
+        #
+        # 1) /mon/snap/1/utc_start_rt -- the dsa110-rt key, value is the
+        #    SNAP-wall specnum at which capture was armed to begin
+        #    recording.  Read by the modern dashboard / Influx pusher.
+        #
+        # 2) /mon/snap/1/armed_mjd + /mon/snap/1/utc_start -- the legacy
+        #    keys read by dsamfs.utils.get_time (slow-vis UVH5 writer,
+        #    docs/overview Section 8) and dsacalib.config (K-cal time
+        #    stamps). The legacy SNAP arm script that used to keep these
+        #    fresh was retired at the M7 cutover, leaving both keys
+        #    frozen at their last-pre-cutover values; with no bridge the
+        #    slow-vis archive grows wall-clock-wrong UVH5 files anchored
+        #    on the stale armed_mjd. Their formula is
+        #        get_time() = armed_mjd + utc_start * 4 * 8.192e-6 / 86400
+        #    so writing armed_mjd = now and utc_start = 0 evaluates the
+        #    anchor to "now" -- the wall-clock moment of this verb, which
+        #    is the right MJD for the next slow-vis frame (the unit of
+        #    `seq` in dsa110-rt is the SNAP-wall specnum, while the
+        #    legacy `utc_start` formula treats its value as native
+        #    samples, so writing seq verbatim would be unit-wrong; the
+        #    armed_mjd=now / utc_start=0 pair is unambiguous).
         try:
             self._store.put_dict(f"/mon/snap/1/utc_start_rt", {"val": seq})
         except Exception:  # noqa: BLE001
             LOG.exception("could not publish utc_start mirror to etcd")
+        if _HAVE_ASTROPY:
+            try:
+                now_mjd = float(Time.now().mjd)
+                self._store.put_dict(
+                    f"/mon/snap/1/armed_mjd", {"armed_mjd": now_mjd}
+                )
+                self._store.put_dict(
+                    f"/mon/snap/1/utc_start", {"utc_start": 0}
+                )
+            except Exception:  # noqa: BLE001
+                LOG.exception(
+                    "could not refresh legacy /mon/snap/1/armed_mjd + "
+                    "/mon/snap/1/utc_start (slow-vis anchor); dsamfs may "
+                    "continue writing stale time tags"
+                )
+        else:
+            LOG.warning(
+                "astropy unavailable: cannot refresh legacy "
+                "/mon/snap/1/armed_mjd + /mon/snap/1/utc_start; the "
+                "slow-vis UVH5 writer (dsamfs) will write stale time tags"
+            )
 
     def _verb_utc_stop(self, val: Any) -> None:
         seq = int(val) if val is not None else 0
