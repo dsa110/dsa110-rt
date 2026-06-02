@@ -416,6 +416,33 @@ c1:
                                      # events (floor is sub-sample at low DM). Width alone is not a strong
                                      # artifact discriminator at prod cadence -- the criteria + dump-rate
                                      # cap do the heavy lifting; this is cheap defense-in-depth. 0=off.
+  noise_color_strength: 4.0          # 2026-06-02 DM-aware noise-color SNR de-rating. s13.1 (lxd110h13
+                                     # gpu_half=1, coarse-DM owner 7) emitted ~98% of all C2 candidates:
+                                     # steady single-half noise singles at DM>=2300, median SNR~13.8,
+                                     # width 2, saturating its C1 metering budget. Cause: the detector's
+                                     # sigma-clipped per-kernel sigma_k under-counts the true noise where
+                                     # the dedispersed series is correlated by intra-channel dispersion
+                                     # smearing (the clip rejects the correlation-broadened tail), so
+                                     # width-2 noise blobs at the highest DM (where smear~1.8 samples
+                                     # matches width-2) read 12-14 sigma. De-rates each candidate's SNR by
+                                     # 1 + strength*(color_factor-1) where color_factor =
+                                     # boxcar_noise_color_factor(dm_fine, width) at the per-cube sample
+                                     # period; survivors carry the corrected SNR downstream. Factor is 1.0
+                                     # at low DM and for width-1, so low/mid-DM and width-1 detections are
+                                     # PROVABLY untouched. strength=1.0 = full theoretical Gaussian-color
+                                     # correction (factor~1.20 at DM2538 width-2). 4.0 is calibrated so the
+                                     # observed median-13.8-sigma high-DM noise (applied factor ~1.8) drops
+                                     # below the 8-sigma floor; it compensates for the sigma-clip rejecting
+                                     # more tail than the pure-Gaussian model predicts. Cost: real high-DM
+                                     # width-2 bursts now need true SNR >= ~14.4 to survive (correct, given
+                                     # the smearing-aware noise scale). Tune vs the observed high-DM rate
+                                     # via the c1_cands_dropped_color mon-point. 0 / remove = disable.
+  noise_color_snr_floor: 8.0         # Drop candidates whose DE-RATED SNR falls below this (BEFORE the
+                                     # width cap + metering, so the freed budget goes to real candidates).
+                                     # Set to the detector emit threshold (detector.threshold_sigma=8.0):
+                                     # the de-rating re-applies the sigma-threshold against the corrected
+                                     # (smearing-aware) noise scale. Remove to keep every de-rated
+                                     # candidate (SNR corrected but nothing dropped on this account).
   dump_listener:
     bind_host: ""                    # filled per-host via --c1-bind-host above
     base_port: 11227                 # actual port = base_port + gpu_half

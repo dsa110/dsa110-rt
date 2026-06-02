@@ -10,6 +10,8 @@ os.environ.setdefault("DSART_TEST", "1")
 
 from dsart.common.contracts import Candidate  # noqa: E402
 from dsart.services.search_compute import (  # noqa: E402
+    boxcar_noise_color_factor,
+    derate_noise_color,
     dm_smear_samples,
     filter_unphysical_narrow,
     meter_candidates,
@@ -139,6 +141,97 @@ def test_filter_keeps_low_dm_narrow_events() -> None:
     )
     assert dropped == 0
     assert kept == cands
+
+
+# ---------------------------------------------------------------------------
+# DM-aware noise-color SNR de-rating (2026-06-02 s13.1 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_color_factor_unity_low_dm_and_width1() -> None:
+    # Width-1 is never inflated (boxcar SUM over a single sample has no
+    # cross-correlation term), regardless of DM.
+    assert boxcar_noise_color_factor(2538.0, 1, t_search_us=_T_SEARCH_PROD_US) == 1.0
+    # At low DM the smear floor is sub-sample (L <= 1) => no correlation =>
+    # factor 1.0 even for wide boxcars. Low/mid-DM detections untouched.
+    assert boxcar_noise_color_factor(50.0, 8, t_search_us=_T_SEARCH_PROD_US) == 1.0
+    assert boxcar_noise_color_factor(200.0, 4, t_search_us=_T_SEARCH_PROD_US) == 1.0
+    # Non-positive DM => 1.0.
+    assert boxcar_noise_color_factor(0.0, 4) == 1.0
+
+
+def test_color_factor_inflates_high_dm_width2() -> None:
+    # At DM~2538 the smear floor is ~1.8 samples, so a width-2 boxcar sums
+    # correlated samples => score scatter inflated above the white-noise
+    # (sqrt(w)) expectation that the sigma-clipped sigma_k converges to.
+    f2 = boxcar_noise_color_factor(2538.0, 2, t_search_us=_T_SEARCH_PROD_US)
+    assert f2 > 1.0
+    # Closed form: L = dm_smear_samples(2538); inflation = 1 + (L-1)/L for
+    # w=2 (single k=1 term, weight w-k=1, /w=2 => 2*1*(L-1)/L / 2).
+    L = dm_smear_samples(2538.0, t_search_us=_T_SEARCH_PROD_US)
+    expected = (1.0 + (L - 1.0) / L) ** 0.5
+    assert abs(f2 - expected) < 1e-9
+    # Inflation grows with DM (longer correlation length).
+    assert boxcar_noise_color_factor(
+        5000.0, 2, t_search_us=_T_SEARCH_PROD_US,
+    ) > f2
+
+
+def test_derate_disabled_passthrough() -> None:
+    cands = [_cand(2, 13.8, dm_fine=2538.0)]
+    for strength in (None, 0.0, -1.0):
+        kept, dropped = derate_noise_color(
+            cands, strength, 8.0, t_search_us=_T_SEARCH_PROD_US,
+        )
+        assert kept is cands
+        assert dropped == 0
+
+
+def test_derate_drops_inflated_highdm_noise() -> None:
+    # The s13.1 noise family: width-2 high-DM singles whose sigma-clip-
+    # inflated SNR sits a little above the floor. De-rating drops them
+    # below the floor; a genuinely bright high-DM burst survives, carrying
+    # the corrected (lower-but-still-significant) SNR. Magnitudes are
+    # derived from the factor itself so the test is robust to the exact
+    # smearing length.
+    strength = 4.0
+    factor = boxcar_noise_color_factor(2538.0, 2, t_search_us=_T_SEARCH_PROD_US)
+    applied = 1.0 + strength * (factor - 1.0)
+    assert applied > 1.0
+    noise = _cand(2, 8.0 * applied * 0.9, dm_fine=2538.0)    # de-rated -> 7.2
+    bright = _cand(2, 8.0 * applied * 3.0, dm_fine=2538.0)   # de-rated -> 24
+    kept, dropped = derate_noise_color(
+        [noise, bright], strength, 8.0, t_search_us=_T_SEARCH_PROD_US,
+    )
+    assert dropped == 1
+    assert len(kept) == 1
+    # Survivor is the bright burst with the CORRECTED (lower) SNR.
+    assert abs(kept[0].snr - 8.0 * 3.0) < 1e-6
+    assert kept[0].snr >= 8.0
+
+
+def test_derate_leaves_low_dm_and_width1_untouched() -> None:
+    # Factor is 1.0 here => SNR unchanged, nothing dropped (identity values).
+    cands = [
+        _cand(1, 13.8, dm_fine=2538.0),   # width-1 high-DM: factor 1.0
+        _cand(4, 9.0, dm_fine=100.0),     # low-DM: factor 1.0
+    ]
+    kept, dropped = derate_noise_color(
+        cands, 2.0, 8.0, t_search_us=_T_SEARCH_PROD_US,
+    )
+    assert dropped == 0
+    assert [c.snr for c in kept] == [13.8, 9.0]
+
+
+def test_derate_no_floor_keeps_all_but_corrects_snr() -> None:
+    # snr_floor None => nothing dropped, but high-DM width-2 SNR is still
+    # corrected downward (so C2 sees the true significance).
+    cands = [_cand(2, 13.8, dm_fine=2538.0)]
+    kept, dropped = derate_noise_color(
+        cands, 2.0, None, t_search_us=_T_SEARCH_PROD_US,
+    )
+    assert dropped == 0
+    assert kept[0].snr < 13.8
 
 
 class _MockStore:

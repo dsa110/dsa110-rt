@@ -171,6 +171,43 @@ class C1EmitConfig:
     this filter is cheap defense-in-depth that removes the unphysical
     width-1 tail at the source. Configured via ``c1.dm_width_floor_frac``
     in ``dsart_search_rt.yaml``."""
+    noise_color_strength: Optional[float] = None
+    """C1→C2 DM-aware noise-color SNR de-rating strength. ``None`` /
+    ``<= 0`` disables (legacy: SNR shipped as the detector reported it).
+
+    Background — 2026-06-02 s13.1 (lxd110h13 gpu_half=1, coarse-DM owner
+    7) emitted by far the most noise-like candidates: ~98 % of all C2
+    candidates were single-half noise singles at DM >= 2300 with median
+    SNR ~13.8 and width 2, a steady (non-bursty) flood that saturated the
+    half's C1 metering budget. Root cause: the detector's σ-clipped
+    per-kernel σ_k under-estimates the true noise scale where the
+    dedispersed series is correlated by intra-channel dispersion
+    smearing (the clip rejects the correlation-broadened tail), inflating
+    the SNR of width-2 noise blobs whose scale matches the smearing floor
+    only at the highest DM. The fix de-rates each candidate's SNR by
+    ``1 + strength·(color_factor − 1)`` where ``color_factor`` is
+    :func:`search_compute.boxcar_noise_color_factor` for its
+    ``(dm_fine, width_samples)`` at the per-cube sample period; survivors
+    carry the corrected SNR downstream. The factor is 1.0 at low DM and
+    for width-1, so low/mid-DM and width-1 detections are provably
+    untouched. ``strength`` of ``1.0`` applies the full theoretical
+    Gaussian-color correction (factor ≈1.20 at DM 2538, width-2); the
+    production default ``4.0`` (applied factor ≈1.8) is calibrated so the
+    observed median-13.8 σ high-DM noise drops below the 8 σ floor — it
+    compensates for the σ-clip rejecting more tail than the pure-Gaussian
+    model predicts (tune via the ``c1_cands_dropped_color`` mon-point).
+    Configured via ``c1.noise_color_strength`` in
+    ``dsart_search_rt.yaml``."""
+    noise_color_snr_floor: Optional[float] = None
+    """SNR floor applied AFTER the :attr:`noise_color_strength` de-rating:
+    a candidate whose de-rated SNR falls below this is dropped before
+    transmission (and before metering, so the freed budget goes to real
+    candidates). ``None`` keeps every de-rated candidate (SNR corrected
+    but nothing dropped on this account). Normally set equal to the
+    detector emit threshold (``detector.threshold_sigma``, default 8.0)
+    so the de-rating simply re-applies the σ-threshold against the
+    corrected noise scale. Configured via ``c1.noise_color_snr_floor`` in
+    ``dsart_search_rt.yaml``."""
 
 
 # ---------------------------------------------------------------------------

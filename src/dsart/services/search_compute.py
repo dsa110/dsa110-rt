@@ -44,11 +44,12 @@ import argparse
 import asyncio
 import heapq
 import logging
+import math
 import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -215,6 +216,115 @@ def filter_unphysical_narrow(
             float(c.dm_fine), t_search_us=t_search_us,
         )
     ]
+    return kept, len(candidates) - len(kept)
+
+
+def boxcar_noise_color_factor(
+    dm_pc_cc: float,
+    width_samples: int,
+    *,
+    chan_sum_factor: int = _DEDISP_CHAN_SUM_FACTOR,
+    t_search_us: float = T_INT_SEARCH_US_DEFAULT,
+) -> float:
+    """Theoretical std-inflation (``>= 1.0``) of a width-``width_samples``
+    matched-filter (boxcar) score caused by the intra-(summed-)channel
+    dispersion-smearing autocorrelation at ``dm_pc_cc``.
+
+    Why this exists — 2026-06-02 s13.1 high-DM noise flood (owner-7,
+    DM >= 2300): the detector's per-kernel σ_k is a σ-clipped
+    (tail-rejecting) robust std. At high DM the dedispersed time series
+    is no longer white — the irreducible intra-channel smearing acts
+    like a moving-average of length ``L ≈ dm_smear_samples(dm)`` and
+    correlates adjacent samples. A width-``w`` boxcar SUM over noise with
+    unit per-sample variance and that correlation has variance
+    ``w · inflation`` (not ``w``), so its score scatter is
+    ``sqrt(inflation)`` × the white-noise expectation that σ_k's σ-clip
+    converges to — the clip rejects the correlation-broadened tail as
+    "outliers" and so *under-estimates* the true noise scale. The result
+    is a DM-dependent SNR inflation that floods the highest-DM owner with
+    12–14 σ width-2 noise singles. Dividing the per-candidate SNR by this
+    factor removes that inflation.
+
+    Model: noise smoothed by a normalised length-``L`` boxcar has
+    triangular autocorrelation ``ρ(k) = max(0, (L − |k|) / L)``. For a
+    width-``w`` detection boxcar,
+
+        inflation = 1 + (2 / w) · Σ_{k=1}^{w-1} (w − k) · ρ(k)
+        factor    = sqrt(inflation)
+
+    Returns ``1.0`` (no inflation) when ``L <= 1`` (sub-sample smearing,
+    i.e. low DM) or ``width <= 1``, so low-DM and width-1 candidates are
+    *provably* unaffected. Pure + RT-cheap (a few-term sum). The caller
+    scales the correction strength — see :func:`derate_noise_color`."""
+    w = int(width_samples)
+    if w <= 1 or dm_pc_cc <= 0.0:
+        return 1.0
+    smear_len = dm_smear_samples(
+        float(dm_pc_cc),
+        chan_sum_factor=chan_sum_factor,
+        t_search_us=t_search_us,
+    )
+    if smear_len <= 1.0:
+        return 1.0
+    acc = 0.0
+    k_max = min(w - 1, int(math.ceil(smear_len)) - 1)
+    for k in range(1, k_max + 1):
+        rho = (smear_len - k) / smear_len
+        if rho <= 0.0:
+            break
+        acc += (w - k) * rho
+    inflation = 1.0 + (2.0 / w) * acc
+    if inflation <= 1.0:
+        return 1.0
+    return math.sqrt(inflation)
+
+
+def derate_noise_color(
+    candidates: List[Candidate],
+    strength: Optional[float],
+    snr_floor: Optional[float],
+    *,
+    chan_sum_factor: int = _DEDISP_CHAN_SUM_FACTOR,
+    t_search_us: float = T_INT_SEARCH_US_DEFAULT,
+) -> "tuple[List[Candidate], int]":
+    """DM-aware noise-color SNR de-rating (2026-06-02 s13.1 fix).
+
+    For each candidate, divide its SNR by the dispersion-smearing
+    noise-color factor for its ``(dm_fine, width_samples)`` — scaled by
+    ``strength`` via ``applied = 1 + strength · (factor − 1)`` — then drop
+    it when the de-rated SNR falls below ``snr_floor``. Survivors carry
+    the *corrected* (de-rated) SNR downstream so C2 clustering /
+    triggering see the true significance. Returns ``(kept, n_dropped)``.
+
+    ``strength`` scales the theoretical correction: ``1.0`` applies the
+    full :func:`boxcar_noise_color_factor`; larger values compensate for
+    the σ-clip rejecting more of the correlation-broadened tail than the
+    pure-Gaussian-color model predicts (calibrate against the observed
+    high-DM emit rate). ``None`` / ``<= 0`` disables the de-rating
+    entirely (returns the input unchanged). The factor is ``1.0`` at low
+    DM and for width <= 1, so this only ever touches high-DM, width >= 2
+    candidates — exactly the s13.1 noise family — and never desensitises
+    low/mid-DM or width-1 detections. RT-safe: a single linear pass over
+    the (already metered) candidate list."""
+    if strength is None or strength <= 0.0 or not candidates:
+        return candidates, 0
+    floor = float(snr_floor) if snr_floor is not None else None
+    kept: List[Candidate] = []
+    for c in candidates:
+        factor = boxcar_noise_color_factor(
+            float(c.dm_fine),
+            int(c.width_samples),
+            chan_sum_factor=chan_sum_factor,
+            t_search_us=t_search_us,
+        )
+        applied = 1.0 + float(strength) * (factor - 1.0)
+        if applied <= 1.0:
+            kept.append(c)
+            continue
+        new_snr = float(c.snr) / applied
+        if floor is not None and new_snr < floor:
+            continue
+        kept.append(_dc_replace(c, snr=new_snr))
     return kept, len(candidates) - len(kept)
 
 
@@ -478,6 +588,12 @@ class SearchComputeService:
         # DM-smearing-floor filter (c1.dm_width_floor_frac) — unphysically
         # narrow high-DM detections (impulsive RFI on a high-DM trial).
         self._c1_cands_dropped_dmfloor = 0
+        # 2026-06-02: cumulative candidates dropped pre-transmit by the
+        # DM-aware noise-color SNR de-rating (c1.noise_color_strength /
+        # c1.noise_color_snr_floor) — high-DM width>=2 noise singles whose
+        # σ-clip-inflated SNR falls below the floor once corrected for the
+        # intra-channel-smearing noise color. Fixes the s13.1 owner-7 flood.
+        self._c1_cands_dropped_color = 0
         # M7.6: C1→C2 metering (cap candidates/block, narrow-then-bright).
         # ``_c1_cands_dropped_meter`` is cumulative; the ``_meter_*`` window
         # accumulators roll up every ``_METER_WINDOW_BLOCKS`` cubes into a
@@ -710,6 +826,7 @@ class SearchComputeService:
             "c1_batches_dropped": int(self._c1_batches_dropped),
             "c1_cands_dropped_width": int(self._c1_cands_dropped_width),
             "c1_cands_dropped_dmfloor": int(self._c1_cands_dropped_dmfloor),
+            "c1_cands_dropped_color": int(self._c1_cands_dropped_color),
             "c1_cands_dropped_meter": int(self._c1_cands_dropped_meter),
             "search_node_id": int(self._config.search_node_id),
             "gpu_half": int(self._config.gpu_half),
@@ -1143,6 +1260,33 @@ class SearchComputeService:
         via the emitter's mon-points + the service's own counters."""
         assert self._c1_emit is not None
         cfg = self._config
+        # 2026-06-02: DM-aware noise-color SNR de-rating FIRST, so the
+        # corrected SNR feeds every downstream gate (dm-floor, width cap,
+        # metering) and the freed budget goes to real candidates. The
+        # σ-clipped per-kernel σ_k under-counts the true noise where the
+        # dedispersed series is correlated by intra-channel smearing, so
+        # high-DM width>=2 noise singles read 12-14 σ and starved s13.1's
+        # C1 metering budget. De-rating by the smearing noise-color factor
+        # (1.0 at low DM / width-1 — those are provably untouched) drops
+        # the inflated noise below ``noise_color_snr_floor`` while leaving
+        # real low/mid-DM and bright high-DM bursts intact.
+        nc_strength = (
+            cfg.c1_emit_config.noise_color_strength
+            if cfg.c1_emit_config is not None
+            else None
+        )
+        if nc_strength is not None and candidates:
+            nc_floor = (
+                cfg.c1_emit_config.noise_color_snr_floor
+                if cfg.c1_emit_config is not None
+                else None
+            )
+            candidates, n_color_dropped = derate_noise_color(
+                candidates, nc_strength, nc_floor,
+                t_search_us=float(geom.sample_period_us),
+            )
+            if n_color_dropped:
+                self._c1_cands_dropped_color += n_color_dropped
         # 2026-05-30: drop candidates far narrower than the DM-smearing
         # floor permits BEFORE the width cap. These are impulsive RFI
         # mis-assigned to a high-DM trial (cannot be genuine dispersed
@@ -1729,6 +1873,8 @@ def _build_search_config_from_yaml(
         _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
         _max_cands_block = c1.get("max_candidates_per_block", None)
         _dm_width_floor = c1.get("dm_width_floor_frac", None)
+        _noise_color_strength = c1.get("noise_color_strength", None)
+        _noise_color_floor = c1.get("noise_color_snr_floor", None)
         c1_emit_cfg = C1EmitConfig(
             host=str(c2_endpoint.get("host", "h23")),
             port=int(c2_endpoint.get("port", 11500)),
@@ -1748,6 +1894,17 @@ def _build_search_config_from_yaml(
             dm_width_floor_frac=(
                 float(_dm_width_floor)
                 if _dm_width_floor is not None and float(_dm_width_floor) > 0.0
+                else None
+            ),
+            noise_color_strength=(
+                float(_noise_color_strength)
+                if _noise_color_strength is not None
+                and float(_noise_color_strength) > 0.0
+                else None
+            ),
+            noise_color_snr_floor=(
+                float(_noise_color_floor)
+                if _noise_color_floor is not None
                 else None
             ),
         )
