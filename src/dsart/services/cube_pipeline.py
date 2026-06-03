@@ -772,6 +772,14 @@ class CubePipeline:
         # full rationale.
         self._validity_host_pinned: Optional[torch.Tensor] = None
         self._last_shifts_host_id: Optional[int] = None
+        # M7.7 symmetric-shift padding cache: the H2D shifts table is
+        # offset-adjusted by ``slot.stream_origin_offset_samples``
+        # before upload. Cache the transformed array on this pipeline
+        # (keyed by original-shifts ``id()`` + offset) so its data
+        # pointer is stable across cubes and the H2D buffer-reuse
+        # cache lower-down hits every cube.
+        self._shifts_transformed_cache: Optional[np.ndarray] = None
+        self._shifts_transformed_cache_key: Optional[Tuple[int, int]] = None
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
         # Separate stream dedicated to the cint8 H2D copy in the narrow
         # overlap path. The H2D engine is independent from the GPU's
@@ -1207,17 +1215,23 @@ class CubePipeline:
                 )
                 self._compact_nfp_host_id = nfp_host_id
 
-            # Zero rows [0, t_det) of the dense plane, then scatter the
-            # compact cells into the zeroed region. Tail rows
-            # [t_det, t_stream) stay at the original zero from buffer
-            # allocation, matching the M7.4 dense scatter convention.
-            zero_dense_rows(dense=cint8_t, t_det=t_det)
+            # M7.7 symmetric padding: the compact scatter walks
+            # ``n_rows = compact.shape[1]`` rows, not just ``t_det``.
+            # In the asymmetric (legacy) path ``n_rows == t_det`` so
+            # the legacy semantics (rows [t_det, t_stream) stay zero
+            # from buffer allocation) are preserved bit-for-bit. In
+            # the symmetric path ``n_rows == t_det + pad_left +
+            # pad_right`` and the dense plane is fully populated;
+            # the imager kernel then has in-range source rows for
+            # every (cube_t, fdm, g) tuple (100 % coverage).
+            n_rows_compact = int(compact.shape[1])
+            zero_dense_rows(dense=cint8_t, t_det=n_rows_compact)
             scatter_compact_to_dense(
                 cells_packed=self._compact_gpu_buf,
                 lut=self._compact_lut_gpu,
                 n_filled_per_corr=self._compact_nfp_gpu,
                 dense=cint8_t,
-                t_det=t_det,
+                t_det=n_rows_compact,
                 n_grid=cfg.n_grid,
                 n_filled_max=n_filled_max,
             )
@@ -1309,7 +1323,39 @@ class CubePipeline:
                     (n_chg,), inv_scale,
                     dtype=torch.float32, device=self._device,
                 )
-        shifts_host_np = np.ascontiguousarray(slot.time_shift_table.shifts.astype(np.int32))
+        # M7.7 symmetric-shift padding (2026-06-03)
+        # -----------------------------------------
+        # When the rx_ring pre-pads the per-chgroup stream with
+        # ``stream_origin_offset_samples`` samples BEFORE ``cube_t=0``,
+        # the kernel's read for cube cell ``(t, fdm)`` needs to land at
+        # ``streams[g, (t + offset) - shifts[fdm, g], ...]`` so the
+        # leading + trailing padding rows actually get used. The fused
+        # imager kernel's formula is ``streams[g, t - effective_shifts
+        # [fdm, g], ...]``, so we bake the offset into the H2D shifts
+        # table: ``effective_shifts = shifts - offset``. The kernel
+        # itself is unchanged.
+        #
+        # For the legacy asymmetric path
+        # (stream_origin_offset_samples == 0) this is a no-op
+        # (effective_shifts == shifts) so behaviour is bit-identical.
+        #
+        # We cache the offset-adjusted array on ``self`` (keyed by
+        # original-shifts ``id()`` + offset) so its data-pointer is
+        # stable across cubes and the H2D buffer-reuse cache below
+        # hits every cube as it did pre-M7.7.
+        offset_samples = int(slot.stream_origin_offset_samples)
+        raw_shifts = slot.time_shift_table.shifts
+        cache_key = (id(raw_shifts), offset_samples)
+        if (
+            getattr(self, "_shifts_transformed_cache_key", None) != cache_key
+            or getattr(self, "_shifts_transformed_cache", None) is None
+        ):
+            adjusted = raw_shifts.astype(np.int32, copy=offset_samples != 0)
+            if offset_samples != 0:
+                adjusted -= np.int32(offset_samples)
+            self._shifts_transformed_cache = np.ascontiguousarray(adjusted)
+            self._shifts_transformed_cache_key = cache_key
+        shifts_host_np = self._shifts_transformed_cache
         shifts_host_id = int(shifts_host_np.__array_interface__["data"][0])
         if enable_gpu_buf_reuse or use_pp:
             if (
@@ -1409,13 +1455,108 @@ class CubePipeline:
             chgroup_offsets_re=staged.chgroup_offset_re_t if apply_cal else None,
             chgroup_offsets_im=staged.chgroup_offset_im_t if apply_cal else None,
         )
+        # M7.7 symmetric-shift padding: when the rx_ring pre-pads the
+        # per-chgroup stream symmetrically, the imager kernel has
+        # in-range source rows for every (t, fdm, g) tuple — coverage
+        # is identically 1 across the whole cube and Layer-1 needs no
+        # correction. Disable the now-redundant correction (which also
+        # re-enables the fused Layer-1 imager path) the FIRST time we
+        # see such a slot. Optionally (DSART_VERIFY_FULL_COVERAGE=1)
+        # assert n_chg_contrib == N_chg in every cell before disabling
+        # — useful as a one-shot rollout guard but skipped after.
+        if (
+            self._coverage_correct_enabled
+            and int(staged.slot.stream_origin_offset_samples) > 0
+        ):
+            if int(os.environ.get("DSART_VERIFY_FULL_COVERAGE", "0")):
+                self._verify_full_coverage_or_raise(
+                    staged.shifts_t, int(cube.shape[0]),
+                    offset=int(staged.slot.stream_origin_offset_samples),
+                    t_stream=int(staged.cint8_t.shape[1]),
+                )
+            _LOG.info(
+                "CubePipeline: detected symmetric-shift padding "
+                "(stream_origin_offset_samples=%d) → disabling Layer-1 "
+                "coverage correction (now a no-op; coverage ≡ 1) and "
+                "freeing the fused-imager Layer-1 path.",
+                int(staged.slot.stream_origin_offset_samples),
+            )
+            self._coverage_correct_enabled = False
+            self._coverage_factor = None
+            self._coverage_factor_shifts_id = None
+            # Re-enable the fused-imager Layer-1 path if it would have
+            # been enabled absent the coverage correction. Mirrors the
+            # ``__init__`` gate exactly so any other env-var off-switch
+            # still wins.
+            self._fuse_layer1_into_imager = (
+                self._device.type == "cuda"
+                and self.config.image_backend == "gpu"
+                and not bool(
+                    int(os.environ.get("DSART_DISABLE_FUSED_LAYER1", "0"))
+                )
+            )
         # M7.4.2: lazy-build the per-(t, fdm) coverage factor from the
         # shifts tensor on first use (then cached until shifts change).
         # cube shape is ``[T_det, N_fdm, H, W]`` so cube.shape[0] is
         # the authoritative t_det (CubePipelineConfig.gpu_t_det may be
         # ``None`` for benches that infer geometry from the first slot).
+        # ``_ensure_coverage_factor`` returns None early when coverage
+        # correction is disabled (the symmetric-pad path above sets
+        # this on the first matching slot).
         self._ensure_coverage_factor(staged.shifts_t, int(cube.shape[0]))
         return _clamp_inf_to_finite(cube)
+
+    def _verify_full_coverage_or_raise(
+        self,
+        shifts_t: torch.Tensor,
+        t_det: int,
+        *,
+        offset: int,
+        t_stream: int,
+    ) -> None:
+        """Assert that the symmetric-padding geometry actually yields
+        100 % coverage (n_chg_contrib == N_chg in every cell).
+
+        Gated on ``DSART_VERIFY_FULL_COVERAGE=1`` (debug / rollout
+        guard, off by default). Runs once on the first symmetric-pad
+        slot the pipeline sees, then the caller flips
+        ``_coverage_correct_enabled`` off so we don't re-enter.
+
+        Uses the SAME read-index formula as the imager kernel after
+        the M7.7 offset bake:
+            t_src[f, g, t] = (t + offset) - shifts[f, g]
+        and checks ``0 <= t_src < t_stream`` for every (t, fdm, g).
+        Raises RuntimeError on the first miss so the pipeline stops
+        loud rather than silently regressing coverage.
+        """
+        n_fdm, n_chg = shifts_t.shape
+        ts = torch.arange(int(t_det), dtype=torch.int32, device=shifts_t.device)
+        t_src = (ts[None, None, :] + int(offset)) - shifts_t[:, :, None]
+        in_range = (t_src >= 0) & (t_src < int(t_stream))
+        n_chg_contrib = in_range.sum(dim=1)              # [n_fdm, t_det]
+        n_chg_min = int(n_chg_contrib.min().item())
+        if n_chg_min != int(n_chg):
+            shifts_min = int(shifts_t.min().item())
+            shifts_max = int(shifts_t.max().item())
+            raise RuntimeError(
+                f"M7.7 symmetric-padding coverage check FAILED: "
+                f"min(n_chg_contrib)={n_chg_min} < N_chg={int(n_chg)} "
+                f"with offset={offset} t_stream={t_stream} "
+                f"shifts.min={shifts_min} shifts.max={shifts_max} "
+                f"t_det={int(t_det)}. Expected n_chg_contrib==N_chg in "
+                f"every cell. Geometry: stream_origin_offset_samples "
+                f"must equal max(0, shifts.max()) AND t_stream must "
+                f"equal t_det + max(0, shifts.max()) + max(0, "
+                f"-shifts.min())."
+            )
+        _LOG.info(
+            "M7.7 symmetric-padding coverage verified: "
+            "n_chg_contrib == N_chg=%d in every (t=%d, fdm=%d) cell "
+            "(offset=%d t_stream=%d shifts.min=%d shifts.max=%d).",
+            int(n_chg), int(t_det), int(n_fdm),
+            int(offset), int(t_stream),
+            int(shifts_t.min().item()), int(shifts_t.max().item()),
+        )
 
     def _ensure_coverage_factor(
         self,
@@ -1440,6 +1581,14 @@ class CubePipeline:
 
         Returns ``self._coverage_factor`` (shape [t_det, n_fdm]) when
         enabled; ``None`` when disabled.
+
+        M7.7 symmetric padding: when the upstream source pre-pads the
+        per-chgroup stream symmetrically (slot.stream_origin_offset_
+        samples > 0) the kernel has in-range source rows for EVERY
+        (t, fdm, g) tuple — n_chg_contrib ≡ N_chg, coverage_factor
+        ≡ 1, and the correction is a no-op. The caller in
+        ``_run_imager_from_staged`` disables ``_coverage_correct_
+        enabled`` on first such slot and we return None here.
         """
         if not self._coverage_correct_enabled:
             return None

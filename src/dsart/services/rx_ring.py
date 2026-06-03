@@ -167,6 +167,29 @@ class CubeRingSlot:
     compact_cells_packed: Optional[np.ndarray] = None
     compact_n_filled_per_corr: Optional[np.ndarray] = None
     compact_lut: Optional[np.ndarray] = None
+    # M7.7 symmetric-shift padding (2026-06-03): when the assembler
+    # pre-pads the per-chgroup stream with ``stream_origin_offset_samples``
+    # samples BEFORE ``cube_t=0``, this field tells the imager how to
+    # shift its read origin. With the pad in place, the kernel's read
+    # for cube cell ``(t, fdm)`` becomes
+    #     ``streams[g, (t + stream_origin_offset_samples) - shifts[fdm, g]]``
+    # which lands in-range for all ``(t, fdm, g)`` provided
+    #     ``stream_origin_offset_samples == max(0, shifts.max())``  AND
+    #     ``T_stream == t_det + max(0, shifts.max()) + max(0, -shifts.min())``.
+    # CubePipeline subtracts this offset from the shifts table at H2D
+    # so the existing kernel formula ``streams[g, t - effective_shifts[g]]``
+    # produces the same result. Default 0 preserves the legacy
+    # (asymmetric, partial-coverage) geometry exactly.
+    #
+    # Semantics:
+    #     ``streams[g, 0]`` corresponds to wall-time
+    #     ``cube_specnum_start - stream_origin_offset_samples * sample_period``.
+    #     ``streams[g, T_stream - 1]`` corresponds to wall-time
+    #     ``cube_specnum_start - stream_origin_offset_samples + T_stream - 1``.
+    #     The cube's detector window is rows
+    #     ``[stream_origin_offset_samples, stream_origin_offset_samples + t_det)``
+    #     of the stream.
+    stream_origin_offset_samples: int = 0
 
     def __post_init__(self) -> None:
         if self.cube_id < 0:
@@ -196,6 +219,11 @@ class CubeRingSlot:
             raise ValueError(
                 f"time_shift_table covers {self.time_shift_table.shifts.shape[0]} "
                 f"fine-DM trials != n_fdm_in_cube={self.n_fdm_in_cube}"
+            )
+        if self.stream_origin_offset_samples < 0:
+            raise ValueError(
+                f"stream_origin_offset_samples="
+                f"{self.stream_origin_offset_samples}, expected ≥ 0"
             )
         if self.per_chgroup_cint8_stack is not None:
             cint8 = self.per_chgroup_cint8_stack

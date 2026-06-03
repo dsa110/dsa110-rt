@@ -161,6 +161,26 @@ class ProductionRxRingSource:
         # shifts (see ``compute_time_shift_search`` docstring). Used
         # while the corr-side stage-2 application is not yet wired.
         include_coarse_offset_in_search_shifts: bool = False,
+        # M7.7 symmetric-shift padding (2026-06-03): when True, the
+        # assembler pre-pads the per-chgroup stream with
+        # ``pad_left = max(0, shifts.max())`` samples BEFORE
+        # ``cube_t=0`` AND ``pad_right = max(0, -shifts.min())``
+        # samples AFTER ``cube_t=t_det`` so the imager kernel has
+        # in-range source rows for EVERY (cube_t, fdm, g) tuple.
+        # Equivalent to "100% Layer-1 coverage": every cube cell
+        # gets contributions from all 16 chgroups, removing the
+        # n_chg_contrib variability that today's Layer-1 coverage-
+        # correction divides out. T_stream grows from
+        # ``t_det + max(0, shifts.max())`` to
+        # ``t_det + max(0, shifts.max()) + max(0, -shifts.min())``
+        # (under Option A: 192 + 83 → 192 + 83 + 83 = 358 samples,
+        # ~30 % more H2D bytes and ring history per cube). The
+        # CubePipeline subtracts ``slot.stream_origin_offset_samples``
+        # from the shifts table at H2D so the imager kernel formula
+        # is unchanged. Default False preserves the legacy (asymmetric,
+        # partial-coverage) geometry. See ``CubeRingSlot.stream_origin
+        # _offset_samples`` for the full contract.
+        symmetric_shift_padding: bool = False,
     ) -> None:
         if n_fdm_in_cube <= 0:
             raise ValueError(f"n_fdm_in_cube={n_fdm_in_cube}, expected > 0")
@@ -268,8 +288,66 @@ class ProductionRxRingSource:
         # payload only carries cell values, not coordinates or quant
         # metadata). See M4a_PLAN_FIXES.md note re: "dequant on
         # compute reader".
-        self._t_stream = self._t_det + int(
-            self._time_shift_table.shifts.max(initial=0)
+        #
+        # M7.7 symmetric-shift padding (2026-06-03)
+        # -----------------------------------------
+        # Two geometries, gated on ``symmetric_shift_padding``:
+        #
+        #   ASYMMETRIC (legacy, default):
+        #     pad_left  = max(0, shifts.max())  # absorbs positive shifts
+        #     pad_right = 0
+        #     T_stream  = t_det + pad_left
+        #     stream[0] corresponds to cube_t=0 — kernel's negative-shift
+        #     reads at high cube_t end overflow into rows [t_det, T_stream)
+        #     which the dense scatter never fills (zero-contribution).
+        #     Per-cell variance varies with n_chg_contrib(t, fdm); the
+        #     Layer-1 coverage-correction (see CubePipeline._ensure_
+        #     coverage_factor) divides this out.
+        #
+        #   SYMMETRIC (M7.7):
+        #     pad_left  = max(0, shifts.max())
+        #     pad_right = max(0, -shifts.min())
+        #     T_stream  = t_det + pad_left + pad_right
+        #     stream[0] corresponds to cube_t = -pad_left — the scatter
+        #     fills ALL rows [0, T_stream) with real data, the kernel
+        #     reads at ``(cube_t + pad_left) - shifts[g]`` ∈ [0, T_stream)
+        #     for every (cube_t, fdm, g), and n_chg_contrib ≡ 16. The
+        #     coverage-correction becomes a no-op (cov ≡ 1) and can be
+        #     disabled (DSART_LAYER1_COVERAGE_CORRECT=0) which re-enables
+        #     the fused Layer-1 path in the imager.
+        #
+        # The legacy formula ``t_det + max(0, shifts.max())`` happens to
+        # also cover the negative-shift read side for Option A because
+        # the fine-DM grid is δdm-symmetric around each coarse_dm so
+        # ``max(0, shifts.max()) ≈ max(0, -shifts.min())``. The
+        # symmetric path makes this guarantee explicit AND adds the
+        # leading ``pad_left`` lookback that legacy never had.
+        shifts = self._time_shift_table.shifts
+        self._symmetric_shift_padding = bool(symmetric_shift_padding)
+        max_pos = int(max(0, int(shifts.max(initial=0))))
+        max_neg = int(max(0, int(-shifts.min(initial=0))))
+        if self._symmetric_shift_padding:
+            self._pad_left = max_pos
+            self._pad_right = max_neg
+            self._t_stream = self._t_det + self._pad_left + self._pad_right
+        else:
+            # Legacy / asymmetric path: NO leading lookback (kernel
+            # reads stream[t - shifts] for cube_t=0 and out-of-range
+            # positive-shift cells silently get zero contribution; the
+            # CubePipeline Layer-1 coverage correction divides out the
+            # resulting per-cell variance). Trailing buffer is sized
+            # by max(0, shifts.max()) per the legacy ``t_det + max
+            # (positive shift)`` formula — preserved bit-for-bit.
+            self._pad_left = 0
+            self._pad_right = 0
+            self._t_stream = self._t_det + max_pos
+        LOG.info(
+            "ProductionRxRingSource geometry: t_det=%d pad_left=%d "
+            "pad_right=%d t_stream=%d (symmetric_shift_padding=%s; "
+            "shifts.min=%d shifts.max=%d)",
+            self._t_det, self._pad_left, self._pad_right,
+            self._t_stream, self._symmetric_shift_padding,
+            int(shifts.min(initial=0)), int(shifts.max(initial=0)),
         )
         self._n_grid_cached = self._n_grid_override
         # M7.2-amend (2026-05-20): emit a pre-built ZERO cint8 stack
@@ -293,6 +371,13 @@ class ProductionRxRingSource:
         # so the CPU-fallback dense-stack path still has a sane
         # shape descriptor when run by tests.
         n_corr = self._ring_dims.n_corr
+        # M7.7 symmetric padding note: ``_t_stream`` already accounts
+        # for both ``pad_left`` and ``pad_right`` so this zero-stub
+        # buffer is the right size whether or not symmetric padding
+        # is enabled. The bring-up TX ships all-zero payloads, so the
+        # "physically correct" stream is zero everywhere — the imager
+        # kernel sees zeros regardless of which row the padded read
+        # lands on.
         self._per_chgroup_cint8_stack_zero: np.ndarray = np.zeros(
             (n_corr, self._t_stream, 2,
              self._n_grid_cached, self._n_grid_cached),
@@ -416,15 +501,28 @@ class ProductionRxRingSource:
             # compact COO buffer (~30 MiB) instead. The dense plane is
             # built GPU-side by ``gpu_scatter`` after a tiny H2D.
             n_filled_max = int(self._ring_dims.n_filled_per_corr)
+            # M7.7 symmetric padding: scatter buffers must cover all
+            # ``n_rows = t_det + pad_left + pad_right`` walked rows so
+            # the leading/trailing padding samples carry real data and
+            # the imager kernel's [0, T_stream) reads stay in-range for
+            # every (cube_t, fdm, g) tuple. In the asymmetric (legacy)
+            # case ``pad_right == 0`` so ``n_rows == t_det`` and these
+            # allocations match the prior sizes exactly.
+            n_rows = self._t_det + self._pad_left + self._pad_right
             if self._gpu_scatter_enabled:
+                # The compact COO buffer carries one (corr, t)-row per
+                # scattered slot. Sized at ``n_rows`` so the GPU
+                # scatter kernel writes the full padded stream.
                 self._compact_cells_buf = np.zeros(
-                    (n_corr, self._t_det, n_filled_max * 2),
+                    (n_corr, n_rows, n_filled_max * 2),
                     dtype=np.int8,
                 )
-                # Sidecars stay T_STREAM-sized so the GPU dequant kernel's
-                # per-(g, t_src) lookup (stride = T_stream) lands in-bounds
-                # even for lookahead samples beyond t_det. Tail rows are
-                # zero, which the kernel interprets as "skip this slot".
+                # Sidecars are T_STREAM-sized (== n_rows under M7.7)
+                # so the GPU dequant kernel's per-(g, t_src) lookup
+                # (stride = T_stream) lands in-bounds across the full
+                # padded stream. Asymmetric path: sidecars carry
+                # ``pad_left == max(positive shifts)`` of trailing
+                # zeros that the kernel interprets as "skip this slot".
                 self._scatter_scale_buf = np.zeros(
                     (n_corr, self._t_stream), dtype=np.float32,
                 )
@@ -435,7 +533,7 @@ class ProductionRxRingSource:
                     (n_corr, self._t_stream), dtype=np.float32,
                 )
                 self._scatter_validity_buf = np.zeros(
-                    (self._t_det,), dtype=np.uint8,
+                    (n_rows,), dtype=np.uint8,
                 )
                 LOG.info(
                     "M7.4.1 GPU-scatter ENABLED: owned_coarse_dm=%d, "
@@ -467,8 +565,11 @@ class ProductionRxRingSource:
                 self._scatter_offim_buf = np.zeros(
                     (n_corr, self._t_stream), dtype=np.float32,
                 )
+                # M7.7 symmetric padding: validity walk covers all
+                # n_rows rows. With asymmetric padding (pad_right == 0)
+                # this is == t_det so the shape matches the legacy.
                 self._scatter_validity_buf = np.zeros(
-                    (self._t_det,), dtype=np.uint8,
+                    (n_rows,), dtype=np.uint8,
                 )
                 LOG.info(
                     "M7.4 dense scatter enabled: owned_coarse_dm=%d, "
@@ -671,7 +772,21 @@ class ProductionRxRingSource:
         if self._ring is None:
             raise RuntimeError("ProductionRxRingSource.ring is None after start()")
 
-        last_cube_seq_boundary = 0
+        # M7.7 symmetric padding: the very first cube needs to read
+        # ``pad_left`` samples BEFORE its ``specnum_start`` — i.e.
+        # cube_specnum_start must be ≥ pad_left or the C scatter would
+        # underflow into uint64 garbage. Start the consumer at
+        # ``pad_left`` (snapped UP to a full cube cadence) so the first
+        # emitted cube has well-defined leading padding. For the legacy
+        # asymmetric path ``pad_left == 0`` so this is the original
+        # start-from-zero behaviour.
+        if self._pad_left > 0:
+            cadence = self._cube_cadence_samples
+            last_cube_seq_boundary = (
+                (self._pad_left + cadence - 1) // cadence
+            ) * cadence
+        else:
+            last_cube_seq_boundary = 0
         # Seek the consumer to the newest cube boundary on first iteration.
         # During cold start (NVRTC compile + GpuImager build + Triton JIT
         # ≈ 3 min) the producer (search_rx) is writing at the full
@@ -729,8 +844,16 @@ class ProductionRxRingSource:
             # emits cubes whose detector-window slots have not yet
             # arrived (their validity bytes remain zero → "no data
             # present"), which collapses detection sensitivity.
+            # M7.7 symmetric padding: gate on samples through
+            # ``last + t_det + pad_right`` so the trailing padding
+            # samples (read by negative-shift chgroups at high cube_t)
+            # are guaranteed to be in-ring. The leading ``pad_left``
+            # samples are read at ``specnum_start - pad_left`` which
+            # was committed many cubes ago (the consumer trails the
+            # producer by at least pad_left + cadence) so no extra
+            # gate is needed there.
             target_seq = (
-                (last_cube_seq_boundary + self._t_det)
+                (last_cube_seq_boundary + self._t_det + self._pad_right)
                 * self._n_active_dms_per_corr
             )
             n_at_target = sum(1 for w in wseqs if w >= target_seq)
@@ -817,7 +940,10 @@ class ProductionRxRingSource:
                     * self._cube_cadence_samples
                 )
                 back_off = 2 * self._t_det
-                seek_target = max(0, newest_boundary - back_off)
+                # M7.7 symmetric padding: clamp to ≥ pad_left so the
+                # first scatter call after a seek doesn't underflow
+                # specnum_start - pad_left.
+                seek_target = max(self._pad_left, newest_boundary - back_off)
                 if seek_target > last_cube_seq_boundary:
                     LOG.warning(
                         "ProductionRxRingSource: lag-recovery seek "
@@ -918,6 +1044,23 @@ class ProductionRxRingSource:
             assert self._scatter_validity_buf is not None
             assert self._owned_coarse_dm is not None
 
+            # M7.7 symmetric padding: walk ``n_rows = t_det + pad_left
+            # + pad_right`` slots starting ``pad_left`` samples BEFORE
+            # the cube's specnum_start. The output buffers carry the
+            # leading + trailing padding rows; we slice the central
+            # ``[pad_left, pad_left + t_det)`` window for the per-t
+            # validity mask. In the asymmetric (legacy) path
+            # ``pad_left == pad_right == 0`` and these reduce to the
+            # original ``specnum_start`` / ``t_det`` semantics
+            # bit-for-bit.
+            n_rows = self._t_det + self._pad_left + self._pad_right
+            assert specnum_start >= self._pad_left, (
+                f"cube_specnum_start={specnum_start} < pad_left="
+                f"{self._pad_left}; _iter startup boundary must clamp "
+                f"to ≥ pad_left to avoid C scatter underflow"
+            )
+            scatter_specnum_start = int(specnum_start) - self._pad_left
+
             if self._gpu_scatter_enabled:
                 # M7.4.1 GPU-scatter (2026-05-27): ship the compact COO
                 # wire payload (~30 MiB) to the GPU and expand it
@@ -928,10 +1071,10 @@ class ProductionRxRingSource:
                 _t0_scatter_ns = time.perf_counter_ns()
                 (
                     _cells_out, _scale_out, _offre_out, _offim_out,
-                    valid_per_t, dn_over, dn_pat, dn_nodp,
+                    valid_per_t_all, dn_over, dn_pat, dn_nodp,
                 ) = self._ring.assemble_compact_block(
-                    specnum_start=int(specnum_start),
-                    t_det=int(self._t_det),
+                    specnum_start=scatter_specnum_start,
+                    t_det=int(n_rows),
                     sidecar_t_stride=int(self._t_stream),
                     owned_dm=int(self._owned_coarse_dm),
                     n_filled_per_corr=self._n_filled_per_corr,
@@ -953,11 +1096,18 @@ class ProductionRxRingSource:
                 self._scatter_ns_count += 1
                 if _dt_scatter_ns > self._scatter_ns_max:
                     self._scatter_ns_max = _dt_scatter_ns
-                self._n_slots_read += n_corr * self._t_det
+                self._n_slots_read += n_corr * n_rows
                 self._n_overrun += dn_over
                 self._n_pattern_mismatch += dn_pat
                 self._n_no_data_present += dn_nodp
 
+                # Cube validity covers the central t_det rows. Padding
+                # rows' validity doesn't gate Layer-2 EMA updates —
+                # they're stream lookahead/lookbehind, not detector
+                # cells.
+                valid_per_t = valid_per_t_all[
+                    self._pad_left:self._pad_left + self._t_det
+                ]
                 validity_mask = np.broadcast_to(
                     valid_per_t[:, None],
                     (self._t_det, self._n_fdm_in_cube),
@@ -985,23 +1135,26 @@ class ProductionRxRingSource:
                     compact_cells_packed=self._compact_cells_buf,
                     compact_n_filled_per_corr=self._n_filled_per_corr,
                     compact_lut=self._linear_lut,
+                    stream_origin_offset_samples=self._pad_left,
                 )
 
-            # M7.4 dense path (unchanged below).
+            # M7.4 dense path (M7.7 symmetric padding amend).
             # The scatter helper takes ``out_t_stride=T_stream`` so it
             # knows the corr-axis stride of the dense buffer is
-            # ``T_stream * 2 * N_grid^2`` even though only rows
-            # ``[0, t_det)`` are actually written. Rows
-            # ``[t_det, T_stream)`` are NEVER touched — see the M7.4
-            # soak fix comment above the buffer allocation.
+            # ``T_stream * 2 * N_grid^2``. Under symmetric padding it
+            # walks rows ``[0, n_rows)`` where ``n_rows = t_det +
+            # pad_left + pad_right`` and writes ALL of those rows;
+            # under the legacy asymmetric path (pad_right == 0) only
+            # rows ``[0, t_det)`` are written and rows ``[t_det,
+            # T_stream)`` stay zero — the original M7.4 contract.
             assert self._scatter_cint8_buf is not None
             _t0_scatter_ns = time.perf_counter_ns()
             (
                 _cint8_out, _scale_out, _offre_out, _offim_out,
-                valid_per_t, dn_over, dn_pat, dn_nodp,
+                valid_per_t_all, dn_over, dn_pat, dn_nodp,
             ) = self._ring.assemble_dense_block(
-                specnum_start=int(specnum_start),
-                t_det=int(self._t_det),
+                specnum_start=scatter_specnum_start,
+                t_det=int(n_rows),
                 n_grid=int(n_grid),
                 owned_dm=int(self._owned_coarse_dm),
                 n_filled_per_corr=self._n_filled_per_corr,
@@ -1028,11 +1181,16 @@ class ProductionRxRingSource:
             self._scatter_ns_count += 1
             if _dt_scatter_ns > self._scatter_ns_max:
                 self._scatter_ns_max = _dt_scatter_ns
-            self._n_slots_read += n_corr * self._t_det
+            self._n_slots_read += n_corr * n_rows
             self._n_overrun += dn_over
             self._n_pattern_mismatch += dn_pat
             self._n_no_data_present += dn_nodp
 
+            # Cube validity covers the central t_det rows (see compact
+            # path for full rationale).
+            valid_per_t = valid_per_t_all[
+                self._pad_left:self._pad_left + self._t_det
+            ]
             validity_mask = np.broadcast_to(
                 valid_per_t[:, None], (self._t_det, self._n_fdm_in_cube)
             ).copy()
@@ -1058,6 +1216,7 @@ class ProductionRxRingSource:
                 per_chgroup_scale_per_t=self._scatter_scale_buf,
                 per_chgroup_offset_re_per_t=self._scatter_offre_buf,
                 per_chgroup_offset_im_per_t=self._scatter_offim_buf,
+                stream_origin_offset_samples=self._pad_left,
             )
 
         # M7.2 zero-stub path (no scatter wired):
@@ -1118,6 +1277,13 @@ class ProductionRxRingSource:
                 specnum_start=specnum_start
             )
 
+        # M7.2 zero-stub path: the cint8 stack is pre-allocated zeros at
+        # full T_stream size (post symmetric-padding allocation in
+        # __init__), so the imager kernel reads zero contributions from
+        # every (g, t, fdm) tuple regardless of pad geometry. We
+        # propagate ``stream_origin_offset_samples`` so the CubePipeline
+        # applies the H2D shift-offset consistently if anyone exercises
+        # this path with symmetric padding enabled (tests / dev).
         return CubeRingSlot(
             cube_id=cube_id,
             specnum_start=specnum_start,
@@ -1131,6 +1297,7 @@ class ProductionRxRingSource:
             per_chgroup_scale=self._per_chgroup_scale_unit,
             per_chgroup_offset_re=self._per_chgroup_offset_zero,
             per_chgroup_offset_im=self._per_chgroup_offset_zero,
+            stream_origin_offset_samples=self._pad_left,
         )
 
     def _assemble_validity_python_fallback(

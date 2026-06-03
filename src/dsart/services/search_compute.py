@@ -2288,6 +2288,14 @@ async def _run_async(args: argparse.Namespace) -> int:
         include_coarse_offset_in_search_shifts=bool(
             args.include_coarse_offset_in_search_shifts
         ),
+        # M7.7 100 %-coverage symmetric-shift padding. See the
+        # CLI flag help text and ProductionRxRingSource.__init__
+        # docstring for the full geometry. When True the rx_ring
+        # pre-pads BOTH ends of the per-chgroup stream, the cube
+        # pipeline subtracts the leading offset from the shifts at
+        # H2D, and the (now redundant) Layer-1 coverage correction
+        # is auto-disabled on first such slot.
+        symmetric_shift_padding=bool(args.symmetric_shift_padding),
     )
 
     if args.config_yaml is not None and args.config_yaml.exists():
@@ -2560,6 +2568,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "from t_det + ~76 to t_det + ~210 samples; the "
                         "RX cint8 history window grows correspondingly. "
                         "Default False once corr-side stage-2 lands.")
+    p.add_argument("--symmetric-shift-padding",
+                   action="store_true", default=False,
+                   help="M7.7 (2026-06-03): pre-pad the per-chgroup "
+                        "stream with max(0, shifts.max()) samples BEFORE "
+                        "cube_t=0 AND max(0, -shifts.min()) samples "
+                        "AFTER cube_t=t_det so the imager kernel has "
+                        "in-range source rows for EVERY (cube_t, fdm, g) "
+                        "tuple — 100 %% Layer-1 coverage. The CubePipeline "
+                        "subtracts the offset from the shifts table at "
+                        "H2D so the kernel formula is unchanged; on first "
+                        "such slot it also disables the now-redundant "
+                        "Layer-1 coverage correction (cov ≡ 1) and "
+                        "re-enables the fused Layer-1 imager path. "
+                        "T_stream grows by max(0, -shifts.min()) (~30 %% "
+                        "for Option A at ±83 samples) so streams_cint8 "
+                        "H2D and ring history grow accordingly. Pairs "
+                        "naturally with Option A (small shifts ⇒ small "
+                        "extra padding); avoid stacking with "
+                        "--include-coarse-offset-in-search-shifts which "
+                        "drives shifts to ±1400 samples.")
 
     # --- DM plan source -----------------------------------------------
     p.add_argument("--dm-plan-path", type=Path, default=None,
