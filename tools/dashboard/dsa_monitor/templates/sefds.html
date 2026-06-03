@@ -1,14 +1,268 @@
 {% extends "base.html" %}
 {% block title %}SEFDs – DSA Monitor{% endblock %}
 
+{% block head_extra %}
+<style>
+    /* Native SEFD rendering: per-day x per-source grid + per-cell
+       inline metrics. Keeps the dsa_monitor base.html visual style
+       (card-on-grey, monospace tables) instead of the legacy
+       sefd_dashboard look. */
+    .sefd-summary-table {
+        width: 100%;
+        border-collapse: collapse;
+        background: white;
+        border-radius: 6px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .sefd-summary-table th,
+    .sefd-summary-table td {
+        padding: 10px 14px;
+        text-align: center;
+        border-bottom: 1px solid #eef0f2;
+        font-size: 13px;
+        vertical-align: top;
+    }
+    .sefd-summary-table th {
+        background: #636e72;
+        color: white;
+        font-weight: 600;
+        font-size: 12px;
+    }
+    .sefd-summary-table td:first-child,
+    .sefd-summary-table th:first-child {
+        text-align: left;
+        font-family: 'Menlo', 'Consolas', monospace;
+    }
+    .sefd-summary-table tr:hover { background: #f8f9fa; }
+    .sefd-summary-table td a { text-decoration: none; color: #0984e3; }
+    .sefd-summary-table td a:hover { text-decoration: underline; }
+
+    .sefd-cell-metric {
+        font-size: 11px;
+        color: #636e72;
+        margin-top: 3px;
+        font-family: 'Menlo', 'Consolas', monospace;
+    }
+    .sefd-cell-metric .value { color: #2d3436; font-weight: 700; }
+    .sefd-cell-metric .warn  { color: #d63031; font-weight: 700; }
+    .sefd-empty { color: #b2bec3; }
+
+    .sefd-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: white;
+        margin-bottom: 4px;
+    }
+    .sefd-badge.pending           { background: #b2bec3; }
+    .sefd-badge.light_processing,
+    .sefd-badge.full_processing   { background: #0984e3; }
+    .sefd-badge.light_done        { background: #74b9ff; color: #1e3a52; }
+    .sefd-badge.complete          { background: #00b894; }
+    .sefd-badge.light_error,
+    .sefd-badge.full_error,
+    .sefd-badge.error             { background: #d63031; }
+
+    .sefd-error-line {
+        color: #d63031;
+        font-size: 11px;
+        margin-top: 3px;
+        max-width: 240px;
+        word-break: break-word;
+    }
+
+    .sefd-status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 600;
+        background: #d8f3dc;
+        color: #2d6a4f;
+    }
+    .sefd-status-pill.stale {
+        background: #ffeaa7;
+        color: #7c5c0f;
+    }
+    .sefd-status-pill.missing {
+        background: #fab1a0;
+        color: #79190e;
+    }
+    .sefd-status-pill .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #2d6a4f;
+    }
+    .sefd-status-pill.stale .dot   { background: #d4a017; }
+    .sefd-status-pill.missing .dot { background: #d63031; }
+</style>
+{% endblock %}
+
 {% block content %}
 <h1>SEFDs</h1>
+
+<!-- Scanner freshness pill: state.json is the scanner's heartbeat;
+     if it's > SCANNER_STALE_S old the scanner probably stalled. -->
+<div style="display: flex; align-items: center; gap: 12px;
+            margin-bottom: 14px; flex-wrap: wrap;">
+    {% if summary.state_mtime_unix is none %}
+        <span class="sefd-status-pill missing"><span class="dot"></span>
+            scanner state file missing
+        </span>
+    {% elif summary.scanner_alive %}
+        <span class="sefd-status-pill"><span class="dot"></span>
+            scanner state {{ '%.0f'|format(summary.scanner_age_s or 0) }}s old
+        </span>
+    {% else %}
+        <span class="sefd-status-pill stale"><span class="dot"></span>
+            scanner stale ({{ '%.0f'|format((summary.scanner_age_s or 0) / 60.0) }} min)
+        </span>
+    {% endif %}
+    {% if summary.currently_processing %}
+        <span class="muted">processing:
+            <code>{{ summary.currently_processing }}</code>
+        </span>
+    {% endif %}
+    <span class="muted">scanner runs in
+        <code>sefd_dashboard.service</code> (casa38);
+        state file: <code>{{ sefd_state_path }}</code>
+    </span>
+</div>
+
+{% if sefd_state_error %}
+<div class="banner error">
+    <strong>state.json read error:</strong> {{ sefd_state_error }}
+    &mdash; check <code>journalctl --user -u sefd_dashboard.service</code>
+    on h23.
+</div>
+{% endif %}
+
+<div class="controls">
+    <label for="days">Lookback:</label>
+    <select id="days" onchange="window.location='/sefds?days='+this.value">
+        {% for d in [7, 14, 30, 60, 90] %}
+        <option value="{{ d }}"
+                {% if d == summary.lookback_days %}selected{% endif %}>
+            {{ d }} days
+        </option>
+        {% endfor %}
+    </select>
+    <span class="muted">
+        click a date for the per-day view, a source header for the
+        per-source comparison
+    </span>
+</div>
+
+{% if summary.dates|length == 0 %}
 <div class="banner info">
-    SEFD dashboard is the existing service on port 5777 (managed by
-    <code>sefd_dashboard.service</code>). Embedded below for convenience;
-    click here to open standalone: <a href="{{ sefd_url }}" target="_blank">{{ sefd_url }}</a>
+    No calibrator observations in the last
+    {{ summary.lookback_days }} days yet
+    (scanner produces an entry once the MS at
+    <code>/dataz/dsa110/operations/calibration/</code> finishes
+    writing).
 </div>
-<div class="iframe-wrap">
-    <iframe src="{{ sefd_url }}" title="SEFD dashboard"></iframe>
+{% else %}
+<div class="card" style="padding: 0;">
+<table class="sefd-summary-table">
+    <thead>
+        <tr>
+            <th>Date</th>
+            {% for source in summary.sources %}
+            <th>
+                <a href="/sefds/source/{{ source }}?days={{ summary.lookback_days }}"
+                   style="color: white;">{{ source }}</a><br>
+                <small style="font-weight: 500;">
+                    {{ summary.source_flux[source].flux_jy }} Jy
+                </small>
+            </th>
+            {% endfor %}
+        </tr>
+    </thead>
+    <tbody>
+        {% for date in summary.dates %}
+        <tr>
+            <td><a href="/sefds/day/{{ date }}">{{ date }}</a></td>
+            {% for source in summary.sources %}
+            {% set entry = summary.grid[date][source] %}
+            <td>
+                {% if entry is none %}
+                <span class="sefd-empty">---</span>
+                {% else %}
+                <span class="sefd-badge {{ entry.status }}">
+                    {% if entry.status == 'pending'           %}Pending
+                    {% elif entry.status == 'light_processing'%}Light…
+                    {% elif entry.status == 'light_done'      %}Light Done
+                    {% elif entry.status == 'full_processing' %}Full…
+                    {% elif entry.status == 'complete'        %}Complete
+                    {% elif entry.is_error                    %}Error
+                    {% else %}{{ entry.status }}
+                    {% endif %}
+                </span>
+                {% if entry.error %}
+                <div class="sefd-error-line"
+                     title="{{ entry.error }}">
+                    {{ entry.error[:80] }}{% if entry.error|length > 80 %}…{% endif %}
+                </div>
+                {% endif %}
+                {% if entry.has_metrics %}
+                {% set m = entry.metrics %}
+                {% if m.get('median_amplitude') is not none %}
+                <div class="sefd-cell-metric">amp:
+                    <span class="value">{{ '%.3f'|format(m.median_amplitude) }}</span>
+                </div>
+                {% endif %}
+                {% if m.get('median_noise') is not none %}
+                <div class="sefd-cell-metric">noise:
+                    <span class="value">{{ '%.5f'|format(m.median_noise) }}</span>
+                </div>
+                {% endif %}
+                {% if m.get('median_coherence') is not none %}
+                <div class="sefd-cell-metric">coh:
+                    <span class="{% if m.median_coherence < 0.8 %}warn{% else %}value{% endif %}">
+                        {{ '%.3f'|format(m.median_coherence) }}
+                    </span>
+                </div>
+                {% endif %}
+                {% if m.get('median_hi_peak_db') is not none %}
+                <div class="sefd-cell-metric">HI:
+                    <span class="{% if m.median_hi_peak_db < 0.05 %}warn{% else %}value{% endif %}">
+                        {{ '%.2f'|format(m.median_hi_peak_db) }}&nbsp;dB
+                    </span>
+                </div>
+                {% endif %}
+                {% endif %}
+                {% if entry.full_metrics %}
+                {% set fm = entry.full_metrics %}
+                {% if fm.get('median_sefd') is not none %}
+                <div class="sefd-cell-metric">SEFD:
+                    <span class="{% if fm.median_sefd > 5000 %}warn{% else %}value{% endif %}">
+                        {{ '%.0f'|format(fm.median_sefd) }}&nbsp;Jy
+                    </span>
+                </div>
+                {% endif %}
+                {% endif %}
+                {% endif %}
+            </td>
+            {% endfor %}
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
 </div>
+{% endif %}
+
+<p class="muted" style="margin-top: 14px;">
+    Calibrator MS files are scanned from
+    <code>/dataz/dsa110/operations/calibration/*_&lt;src&gt;.ms</code> by
+    <code>sefd_dashboard.service</code>; per-day plots are written to
+    <code>{{ summary.state_path|replace('/state.json','/results/') }}&lt;src&gt;/&lt;date&gt;/</code>
+    and served back here through this dashboard's
+    <code>/sefds/results/&lt;path&gt;</code> route.
+</p>
 {% endblock %}

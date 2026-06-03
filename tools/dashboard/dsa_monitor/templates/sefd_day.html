@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block title %}SEFD: {{ date }} – DSA Monitor{% endblock %}
+
+{% block head_extra %}
+<style>
+    .sefd-plot-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+        gap: 12px;
+        margin: 12px 0;
+    }
+    .sefd-source-section {
+        margin-bottom: 24px;
+        padding: 16px;
+        background: white;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .sefd-source-section h2 {
+        margin-top: 0;
+        padding-bottom: 8px;
+        border-bottom: 2px solid #eef0f2;
+        display: flex;
+        gap: 10px;
+        align-items: baseline;
+    }
+    .sefd-metric-row {
+        display: flex;
+        gap: 22px;
+        margin: 12px 0;
+        flex-wrap: wrap;
+        font-family: 'Menlo', 'Consolas', monospace;
+        font-size: 12px;
+    }
+    .sefd-metric-row > div { color: #636e72; }
+    .sefd-metric-row .value { color: #2d3436; font-weight: 700; }
+    .sefd-metric-row .warn  { color: #d63031; font-weight: 700; }
+
+    .sefd-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: white;
+    }
+    .sefd-badge.pending           { background: #b2bec3; }
+    .sefd-badge.light_processing,
+    .sefd-badge.full_processing   { background: #0984e3; }
+    .sefd-badge.light_done        { background: #74b9ff; color: #1e3a52; }
+    .sefd-badge.complete          { background: #00b894; }
+    .sefd-badge.light_error,
+    .sefd-badge.full_error,
+    .sefd-badge.error             { background: #d63031; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>{{ date }}</h1>
+
+<div class="controls">
+    <a href="/sefds" class="btn">Back to summary</a>
+    {% for source in sources %}
+    <a href="/sefds/source/{{ source }}" class="btn"
+       style="background: #636e72;">{{ source }}</a>
+    {% endfor %}
+</div>
+
+{% if entries|length == 0 %}
+<div class="banner info">
+    No observations processed for this date.  Either the calibrator
+    MSes haven't landed in
+    <code>/dataz/dsa110/operations/calibration/</code> yet, or the
+    date is outside the scanner's
+    <code>DEFAULT_LOOKBACK_DAYS=7</code> window.
+</div>
+{% endif %}
+
+{% for source, entry in entries.items() %}
+<div class="sefd-source-section">
+    <h2>
+        <a href="/sefds/source/{{ source }}">{{ source }}</a>
+        <small style="color: #636e72; font-size: 13px;">
+            ({{ sources[source].flux_jy }} Jy)
+        </small>
+        <span class="sefd-badge {{ entry.status }}">{{ entry.status }}</span>
+    </h2>
+
+    {% if entry.error %}
+    <div class="banner error">
+        <strong>error:</strong> {{ entry.error }}
+    </div>
+    {% endif %}
+
+    {% if entry.has_metrics %}
+    {% set m = entry.metrics %}
+    <div class="sefd-metric-row">
+        {% if m.get('median_amplitude') is not none %}
+        <div>median amplitude:
+            <span class="value">{{ '%.4f'|format(m.median_amplitude) }}</span>
+        </div>
+        {% endif %}
+        {% if m.get('median_noise') is not none %}
+        <div>median noise:
+            <span class="value">{{ '%.5f'|format(m.median_noise) }}</span>
+        </div>
+        {% endif %}
+        {% if m.get('median_coherence') is not none %}
+        <div>median coherence:
+            <span class="{% if m.median_coherence < 0.8 %}warn{% else %}value{% endif %}">
+                {{ '%.3f'|format(m.median_coherence) }}
+            </span>
+        </div>
+        {% endif %}
+        {% if m.get('median_hi_peak_db') is not none %}
+        <div>HI peak:
+            <span class="{% if m.median_hi_peak_db < 0.05 %}warn{% else %}value{% endif %}">
+                {{ '%.2f'|format(m.median_hi_peak_db) }} dB
+            </span>
+        </div>
+        {% endif %}
+        {% if m.get('median_autocorr_xx') is not none %}
+        <div>autocorr XX:
+            <span class="value">{{ '%.1f'|format(m.median_autocorr_xx) }}</span>
+        </div>
+        {% endif %}
+        {% if m.get('median_autocorr_yy') is not none %}
+        <div>autocorr YY:
+            <span class="value">{{ '%.1f'|format(m.median_autocorr_yy) }}</span>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {% if entry.full_metrics %}
+    {% set fm = entry.full_metrics %}
+    <div class="sefd-metric-row">
+        {% if fm.get('median_sefd') is not none %}
+        <div>median SEFD:
+            <span class="{% if fm.median_sefd > 5000 %}warn{% else %}value{% endif %}">
+                {{ '%.0f'|format(fm.median_sefd) }} Jy
+            </span>
+        </div>
+        {% endif %}
+        {% if fm.get('mean_sefd') is not none %}
+        <div>mean SEFD:
+            <span class="value">{{ '%.0f'|format(fm.mean_sefd) }} Jy</span>
+        </div>
+        {% endif %}
+        {% if fm.get('std_sefd') is not none %}
+        <div>std SEFD:
+            <span class="value">{{ '%.0f'|format(fm.std_sefd) }} Jy</span>
+        </div>
+        {% endif %}
+        {% if fm.get('n_baselines') is not none %}
+        <div>N baselines:
+            <span class="value">{{ fm.n_baselines }}</span>
+        </div>
+        {% endif %}
+        {% for k in ['sefd_0-200m','sefd_200-400m','sefd_400-800m','sefd_800-2500m'] %}
+        {% if fm.get(k) is not none %}
+        <div>{{ k.replace('sefd_','') }}:
+            <span class="value">{{ '%.0f'|format(fm[k]) }} Jy</span>
+        </div>
+        {% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {% set plots = plots_by_source.get(source, {}) %}
+    {% if plots|length > 0 %}
+    <div class="sefd-plot-grid">
+        {% for fname, url in plots.items() %}
+        <div class="plot-card">
+            <h2 style="margin-bottom: 8px; font-size: 13px; color: #636e72;">
+                {{ fname.replace('.png','').replace('_',' ').replace('/',' / ') }}
+            </h2>
+            <img src="{{ url }}" alt="{{ fname }}" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <p class="muted">No plot files on disk yet for {{ source }} / {{ date }}.</p>
+    {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

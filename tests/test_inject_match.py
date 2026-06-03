@@ -16,6 +16,7 @@ from dsart.coinc.inject_match import (
     DEFAULT_DM_TOL_FRAC,
     DEFAULT_HISTORY_DEPTH,
     DEFAULT_LM_TOL_RAD,
+    DEFAULT_MAX_OBSERVED_SNR,
     MATCH_EVENT_PREFIX,
     ActiveInjection,
     InjectionMatcher,
@@ -587,6 +588,102 @@ class TestTryMatch:
         out = m.matched_inj_id(dm_pc_cc=999.0, l_rad=0.0, m_rad=0.0)
         assert out is None
 
+    def test_rejects_sigma_scaling_glitch_by_snr_ceiling(self):
+        """A width-1 60kσ hot-pixel glitch must NOT calibrate a probe,
+        but the rejection comes from the SNR ceiling — not a width gate
+        (injection width is native ~32µs, observed width is search ~1ms,
+        so they are not comparable)."""
+        m, store = self._matcher(
+            payloads={
+                ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                    inj_id="aa", dm=150.0, width=32, fluence=10.0,
+                    fired_at=1_000.0, ttl=60.0,
+                ),
+            },
+            now=1_001.0,
+        )
+        mr = m.try_match(
+            **self._row_args(
+                dm_pc_cc=146.68,
+                snr=60448.0,
+                width_samples=1,
+                l_rad=0.0192,
+                m_rad=0.01905,
+            ),
+        )
+        assert mr is None
+        assert store.puts == []
+        assert m.snapshot()["rows_rejected_quality"] == 1
+
+    def test_accepts_real_injection_at_fleet_lm_offset(self):
+        """A boresight-declared injection imaging at the documented
+        fleet l/m≈0.019 offset with a low search-width must MATCH
+        (regression: earlier width-ratio + l/m gates rejected these)."""
+        m, store = self._matcher(
+            payloads={
+                ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                    inj_id="aa", dm=900.0, l=0.0, m=0.0, width=32,
+                    fluence=100.0, fired_at=1_000.0, ttl=60.0,
+                ),
+            },
+            now=1_001.0,
+        )
+        mr = m.try_match(
+            **self._row_args(
+                dm_pc_cc=903.8,
+                snr=20.34,
+                width_samples=4,   # search samples; inj is 32 native
+                l_rad=0.0192,
+                m_rad=0.0191,
+            ),
+        )
+        assert mr is not None
+        assert mr.inj_id == "aa"
+        assert mr.observed_snr == pytest.approx(20.34)
+        assert len(store.puts) == 1
+
+    def test_rejects_snr_above_ceiling(self):
+        m, _ = self._matcher(max_observed_snr=500.0)
+        mr = m.try_match(**self._row_args(snr=600.0))
+        assert mr is None
+
+    def test_prefers_closer_lm_over_higher_snr(self):
+        """Quality ordering: boresight moderate SNR beats off-axis bright."""
+        m, store = self._matcher()
+        m.try_match(**self._row_args(snr=50.0, l_rad=0.03, m_rad=0.03))
+        m.try_match(**self._row_args(snr=25.0, l_rad=0.0, m_rad=0.0))
+        snap = m.snapshot()
+        assert snap["best"]["aa"]["observed_snr"] == 25.0
+        _, payload = store.puts[-1]
+        assert payload["best"]["observed_l_rad"] == 0.0
+
+    def test_width_not_gated(self):
+        """Width is no longer a match gate (native-vs-search units)."""
+        m, _ = self._matcher()
+        assert m.try_match(**self._row_args(width_samples=16)) is not None
+        assert m.try_match(**self._row_args(width_samples=1)) is not None
+
+    def test_matched_inj_id_with_quality_gates(self):
+        m, _ = self._matcher(
+            payloads={
+                ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                    inj_id="aa", dm=150.0, width=32,
+                    fired_at=1_000.0, ttl=60.0,
+                ),
+            },
+            now=1_001.0,
+        )
+        # Real low-search-width injection match qualifies.
+        assert m.matched_inj_id(
+            dm_pc_cc=146.0, l_rad=0.0, m_rad=0.0,
+            width_samples=4, snr=20.0,
+        ) == "aa"
+        # σ-scaling glitch rejected by SNR ceiling.
+        assert m.matched_inj_id(
+            dm_pc_cc=146.0, l_rad=0.0, m_rad=0.0,
+            width_samples=1, snr=60448.0,
+        ) is None
+
 
 # ---------------------------------------------------------------------------
 # Constructor validation
@@ -607,3 +704,14 @@ class TestCtor:
     def test_bad_history_raises(self):
         with pytest.raises(ValueError):
             InjectionMatcher(store=FakeStore(), history_depth=0)
+
+    def test_bad_snr_band_raises(self):
+        with pytest.raises(ValueError):
+            InjectionMatcher(
+                store=FakeStore(),
+                min_observed_snr=100.0,
+                max_observed_snr=10.0,
+            )
+
+    def test_default_quality_constants(self):
+        assert DEFAULT_MAX_OBSERVED_SNR == 2000.0

@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}SEFD: {{ source_name }} – DSA Monitor{% endblock %}
+
+{% block head_extra %}
+<style>
+    .sefd-metric-table {
+        width: 100%;
+        border-collapse: collapse;
+        background: white;
+        border-radius: 6px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        margin-bottom: 16px;
+    }
+    .sefd-metric-table th,
+    .sefd-metric-table td {
+        padding: 8px 12px;
+        text-align: right;
+        font-family: 'Menlo', 'Consolas', monospace;
+        font-size: 12px;
+        border-bottom: 1px solid #eef0f2;
+    }
+    .sefd-metric-table th {
+        background: #636e72;
+        color: white;
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .sefd-metric-table td:first-child,
+    .sefd-metric-table th:first-child {
+        text-align: left;
+    }
+    .sefd-metric-table td a { color: #0984e3; text-decoration: none; }
+    .sefd-metric-table td a:hover { text-decoration: underline; }
+    .sefd-metric-table tr:hover { background: #f8f9fa; }
+
+    .sefd-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: white;
+    }
+    .sefd-badge.pending           { background: #b2bec3; }
+    .sefd-badge.light_processing,
+    .sefd-badge.full_processing   { background: #0984e3; }
+    .sefd-badge.light_done        { background: #74b9ff; color: #1e3a52; }
+    .sefd-badge.complete          { background: #00b894; }
+    .sefd-badge.light_error,
+    .sefd-badge.full_error,
+    .sefd-badge.error             { background: #d63031; }
+
+    .sefd-plot-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+        gap: 12px;
+        margin: 12px 0;
+    }
+    .sefd-day-section {
+        margin-bottom: 24px;
+        padding: 16px;
+        background: white;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .sefd-day-section h2 {
+        margin-top: 0;
+        padding-bottom: 8px;
+        border-bottom: 2px solid #eef0f2;
+        display: flex;
+        gap: 10px;
+        align-items: baseline;
+    }
+    .sefd-metric-warn  { color: #d63031; font-weight: 700; }
+    .sefd-metric-value { color: #2d3436; font-weight: 700; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>{{ source_name }}
+    <small style="color: #636e72; font-size: 14px;">
+        ({{ source_flux.flux_jy }} Jy)
+    </small>
+</h1>
+
+<div class="controls">
+    <label for="days">Lookback:</label>
+    <select id="days"
+            onchange="window.location='/sefds/source/{{ source_name }}?days='+this.value">
+        {% for d in [7, 14, 30, 60, 90] %}
+        <option value="{{ d }}" {% if d == lookback %}selected{% endif %}>
+            {{ d }} days
+        </option>
+        {% endfor %}
+    </select>
+    <a href="/sefds?days={{ lookback }}" class="btn">Back to summary</a>
+</div>
+
+{% if entries|length == 0 %}
+<div class="banner info">
+    No processed observations for {{ source_name }} in the last
+    {{ lookback }} days.
+</div>
+{% else %}
+<h2>Metrics summary ({{ entries|length }} observations)</h2>
+<table class="sefd-metric-table">
+    <thead>
+        <tr>
+            <th>Date</th>
+            <th>Status</th>
+            <th>Med. amp</th>
+            <th>Med. noise</th>
+            <th>Med. coh</th>
+            <th>HI peak (dB)</th>
+            <th>Med. SEFD (Jy)</th>
+            <th>N baselines</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for entry in entries %}
+        <tr>
+            <td><a href="/sefds/day/{{ entry.date }}">{{ entry.date }}</a></td>
+            <td><span class="sefd-badge {{ entry.status }}">{{ entry.status }}</span></td>
+            {% if entry.is_error %}
+            <td colspan="6" style="text-align: left; color: #d63031;">
+                {{ entry.error or 'unknown error' }}
+            </td>
+            {% else %}
+            {% set m = entry.metrics %}
+            {% set fm = entry.full_metrics %}
+            <td>{% if m.get('median_amplitude') is not none %}{{ '%.3f'|format(m.median_amplitude) }}{% else %}---{% endif %}</td>
+            <td>{% if m.get('median_noise') is not none %}{{ '%.5f'|format(m.median_noise) }}{% else %}---{% endif %}</td>
+            <td>
+                {% if m.get('median_coherence') is not none %}
+                <span class="{% if m.median_coherence < 0.8 %}sefd-metric-warn{% else %}sefd-metric-value{% endif %}">
+                    {{ '%.3f'|format(m.median_coherence) }}
+                </span>
+                {% else %}---{% endif %}
+            </td>
+            <td>
+                {% if m.get('median_hi_peak_db') is not none %}
+                <span class="{% if m.median_hi_peak_db < 0.05 %}sefd-metric-warn{% else %}sefd-metric-value{% endif %}">
+                    {{ '%.2f'|format(m.median_hi_peak_db) }}
+                </span>
+                {% else %}---{% endif %}
+            </td>
+            <td>
+                {% if fm.get('median_sefd') is not none %}
+                <span class="{% if fm.median_sefd > 5000 %}sefd-metric-warn{% else %}sefd-metric-value{% endif %}">
+                    {{ '%.0f'|format(fm.median_sefd) }}
+                </span>
+                {% else %}---{% endif %}
+            </td>
+            <td>{% if fm.get('n_baselines') is not none %}{{ fm.n_baselines }}{% else %}---{% endif %}</td>
+            {% endif %}
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Per-day diagnostic plots</h2>
+{% for entry in entries %}
+<div class="sefd-day-section">
+    <h2>
+        <a href="/sefds/day/{{ entry.date }}">{{ entry.date }}</a>
+        <span class="sefd-badge {{ entry.status }}">{{ entry.status }}</span>
+    </h2>
+    {% set plots = entry_plots[entry.date] %}
+    {% if plots|length == 0 %}
+    <p class="muted">No plot files on disk for this date yet.</p>
+    {% else %}
+    <div class="sefd-plot-grid">
+        {% for fname, url in plots.items() %}
+        <div class="plot-card">
+            <h2 style="margin-bottom: 8px; font-size: 13px; color: #636e72;">
+                {{ fname.replace('.png','').replace('_',' ').replace('/',' / ') }}
+            </h2>
+            <img src="{{ url }}" alt="{{ fname }}" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

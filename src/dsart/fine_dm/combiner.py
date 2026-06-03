@@ -118,14 +118,14 @@ class TimeShiftSearchTable:
                 f"fine_to_coarse.shape[0]={self.fine_to_coarse.shape[0]} != "
                 f"shifts.shape[0]={self.shifts.shape[0]} (N_fine)"
             )
-        if not self.coarse_offset_baked and not np.all(
-            self.shifts[:, N_CHGROUP - 1] == 0
-        ):
-            raise ValueError(
-                "time_shift_search[:, 15] must be 0 for every fine-DM row by "
-                "§3.6.3 sign convention (chgroup 15 is the reference; "
-                "ν_chgroup_bot[15] == ν_bot_proc)"
-            )
+        # As of 2026-06-03 BOTH the include_coarse_offset=True (M7.4
+        # escape hatch) and include_coarse_offset=False (Option A
+        # post-stage-2) paths reference each chgroup's TOP channel
+        # (Convention A — matches the corr-side stage-1 output). With
+        # chgroup-15's TOP at 1.32297 GHz vs ν_bot_proc 1.31128 GHz,
+        # chgroup-15 carries a real (small, DM-dependent) shift. The
+        # pre-2026-06-03 "[:,15] == 0" invariant is therefore retired;
+        # we no longer enforce it.
         # Shifts are SIGNED int32 under the v2 DM-plan convention (per
         # user clarification 2026-05-18). With the even-K-around-coarse
         # GPU partitioning, each GPU owns K = N_fine/8 fine DMs that sit
@@ -181,42 +181,40 @@ def compute_time_shift_search(
             Δτ_us(ν_bot_proc, ν_chgroup_REF_g, fine_dm[f]) / t_int_search_us
         )
 
-    DM-OFFSET FIX (2026-05-29): the per-chgroup reference frequency
-    ``ν_chgroup_REF_g`` for this escape-hatch path is the chgroup's TOP
-    channel (``NU_CHGROUP_TOP_GHZ``), NOT its bottom. The corr-side
+    Per-chgroup reference frequency convention (2026-06-03 unified):
+    BOTH the ``include_coarse_offset=True`` escape hatch and the
+    ``include_coarse_offset=False`` Option-A residual path reference
+    each chgroup's TOP channel (``NU_CHGROUP_TOP_GHZ``). The corr-side
     coarse-DM stage-1 (``coarse_dm/dm_plan.py``, "Convention A") aligns
-    each chgroup's channels to the chgroup TOP and the uniform stage-2
-    ring applies no per-chgroup realignment, so each chgroup stream
-    arrives at the search referenced to its TOP freq. Referencing the
-    escape-hatch shifts to ν_chgroup_BOT (the pre-2026-05-29 behaviour)
-    therefore mis-modelled the per-chgroup delay by the within-chgroup
-    dispersion span, producing a constant ``-2.45%`` bias in the
-    DETECTED vs injected DM (detected ≈ 0.9755 × injected; verified by
-    delay-arithmetic forward model + on-sky injections). Using the TOP
-    reference zeroes the offset (residual ``+0.023%`` ≪ one fine-DM step
-    from the chan-summed top-channel band-center vs band-top; pass the
-    exact summed-channel top via ``nu_chgroup_top_GHz`` to zero even
-    that). Because chgroup-15's TOP (1.32297 GHz) is above ν_bot_proc,
-    its row is NO LONGER identically zero here — the returned table sets
-    ``coarse_offset_baked=True`` and the §3.6.3 chgroup-15-zero invariant
-    is skipped (it only holds for the bottom-referenced table).
+    each chgroup's channels to that chgroup's TOP, so stage-1's output
+    represents the signal as it arrived at ``ν_chgroup_TOP[g]``. Stage-2
+    (``coarse_dm/stage2_shifts.py``) likewise uses TOP, so when its
+    per-(g, c) FIFO is enabled the resulting stream is referenced to
+    ``ν_bot_proc``; the search-side fine-DM residual then only adds
+    ``Δτ(ν_bot_proc, ν_chgroup_TOP[g], δdm)``. The cancellation between
+    stage-2 (corr) and stage-3 (search) is bit-for-bit modulo ±0.5
+    sample rint() noise — pinned by
+    ``test_stage2_shifts.test_cross_stage_residual_against_baked_search_shifts``.
 
-    Max shift is comparable to the prior bottom-referenced escape hatch
-    (per-chgroup ν_top vs ν_bot differ < 1%); ``ProductionRxRing._t_stream
-    = t_det + max(shifts)`` auto-grows the cint8 history window
-    accordingly. Default ``include_coarse_offset=False`` keeps the
-    bottom-referenced stage-3-differential-only behaviour for the
-    production pipeline once corr-side stage-2 lands (NOTE: when stage-2
-    IS enabled, ``coarse_dm/stage2_shifts.py`` will likewise need a
-    chgroup-TOP reference to compose with Convention-A stage-1).
+    Before the unification, the include_coarse_offset=False path used a
+    BOT reference. Composed with the TOP-referenced stage-2 (or with
+    the TOP-referenced include_coarse_offset=True path) that produced a
+    constant -2.45% detected-vs-injected DM bias (the within-chgroup
+    dispersion span). The 2026-05-29 fix corrected the
+    include_coarse_offset=True path; the 2026-06-03 unification extends
+    the TOP reference to the include_coarse_offset=False path so the
+    corr-side stage-2 Option-A wire-in composes correctly.
 
-    Sign convention (v2, 2026-05-18): shifts are SIGNED int32. δdm can be
-    positive (fine above coarse → POSITIVE shift, advance/read-FUTURE) or
-    negative (fine below coarse → NEGATIVE shift, retreat/read-PAST).
-    Both signs are required under the v2 even-K-around-coarse partition
-    where each search GPU owns K fine DMs SYMMETRIC about coarse_dm[i].
-    The chgroup-15 row is identically zero (chgroup-15's band-bottom IS
-    ``ν_bot_proc`` by construction; see ``common/constants.py::NU_CHGROUP_BOT_GHZ``).
+    Because chgroup-15's TOP (1.32297 GHz) is above ν_bot_proc (1.31128
+    GHz, the band bottom = chgroup-15's BOT), chgroup-15 carries a
+    real (small, DM-dependent) shift in both paths and the §3.6.3
+    "[:,15] == 0" invariant is retired. ``ProductionRxRing._t_stream =
+    t_det + max(|shifts|)`` auto-sizes the history window.
+
+    Sign convention (v2, 2026-05-18): shifts are SIGNED int32. δdm can
+    be positive (fine above coarse → POSITIVE shift, advance/read-FUTURE)
+    or negative (fine below coarse → NEGATIVE shift, retreat/read-PAST).
+    Both signs are required under the v2 even-K-around-coarse partition.
 
     Args:
         coarse_dm_pc_cm3: ``[N_coarse] float64`` coarse-DM trial table.
@@ -278,10 +276,17 @@ def compute_time_shift_search(
             f"shape {chgroup_top.shape}"
         )
 
-    # Per-chgroup reference: TOP for the stage-2-absent escape hatch
-    # (matches Convention-A corr stage-1), BOTTOM for the differential
-    # stage-2-present path.
-    nu_chgroup_ref = chgroup_top if include_coarse_offset else chgroup_bot
+    # Per-chgroup reference: TOP for BOTH paths as of 2026-06-03. Stage-1
+    # output is TOP-referenced (Convention A); ``include_coarse_offset=True``
+    # (M7.4 escape hatch) absorbs the full ν_TOP_g→ν_bot_proc delay on
+    # the search side; ``include_coarse_offset=False`` (Option A) lets
+    # the corr-side stage-2 FIFO apply the same delay (referenced to
+    # TOP) and the search side then only applies the δdm-residual.
+    # Either way, using a TOP reference on the search side is required
+    # for the cross-stage cancellation to be bit-for-bit (mod ±0.5
+    # rint() noise).
+    del chgroup_bot  # retained for back-compat argument; no longer used
+    nu_chgroup_ref = chgroup_top
 
     n_fine = fine_dm_pc_cm3.shape[0]
     shifts = np.zeros((n_fine, N_CHGROUP), dtype=np.int32)
@@ -292,23 +297,10 @@ def compute_time_shift_search(
         else:
             ddm = float(fine_dm_pc_cm3[f] - coarse_dm_pc_cm3[c])
         for g in range(N_CHGROUP):
-            # Argument order: (nu_low, nu_high). nu_bot_proc is the LOW
-            # frequency (band bottom = chgroup-15 bottom); nu_chgroup_ref[g]
-            # is the chgroup's reference (≥ nu_bot_proc). δdm > 0 then
-            # yields Δτ > 0; chgroup g leads ν_bot_proc by Δτ and must be
-            # advanced by ``+rint(Δτ / t_int)`` samples to align.
             d_us = delta_tau_us(
                 float(nu_bot_proc_GHz), float(nu_chgroup_ref[g]), ddm
             )
             shifts[f, g] = int(np.rint(d_us / t_int_search_us))
-    if not include_coarse_offset:
-        # Bottom-referenced table: chgroup-15 bot == ν_bot_proc, so its
-        # row is identically zero. Force it (paranoia: floating-point
-        # noise in delta_tau at the construction frequency could yield
-        # ±1-sample noise away from zero on some platforms). For the
-        # TOP-referenced escape hatch chgroup-15 carries a real shift
-        # (its TOP freq is above ν_bot_proc) — do NOT zero it there.
-        shifts[:, N_CHGROUP - 1] = 0
     # v2 (2026-05-18): shifts are SIGNED — δdm < 0 (fine below coarse)
     # yields negative shifts (read PAST data from the rolling RX ring).
     # See TimeShiftSearchTable docstring for the full convention.

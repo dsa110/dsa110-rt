@@ -66,10 +66,21 @@ def test_returns_stage2_shift_table_with_int32_shape():
     assert t.max_shift == int(t.shifts_samples.max())
 
 
-def test_band_bottom_chgroup_is_identically_zero():
+def test_band_bottom_chgroup_carries_top_to_bot_within_chgroup_delay():
+    """Post-2026-06-03 unification: stage-2 references chgroup TOP, so
+    chgroup-15 (whose TOP is ~12 MHz ABOVE ν_bot_proc) has a real
+    DM-dependent (small) shift. The pre-fix "chgroup-15 is identically
+    zero" invariant was a relic of the BOT-referenced math and has been
+    retired."""
     coarse = np.array([100.0, 500.0, 4000.0], dtype=np.float64)
     t = compute_stage2_shifts(chgroup=N_CHGROUP - 1, coarse_dm_pc_cm3=coarse)
-    assert np.all(t.shifts_samples == 0)
+    # Must remain non-negative; scales with DM (small but non-zero at
+    # high DM thanks to the within-chgroup-15 dispersion span).
+    assert (t.shifts_samples >= 0).all()
+    assert int(t.shifts_samples[-1]) > 0, (
+        f"chgroup-15 high-DM shift expected non-zero (TOP→ν_bot_proc "
+        f"residual); got {t.shifts_samples.tolist()}"
+    )
 
 
 def test_all_shifts_non_negative_for_every_chgroup():
@@ -110,20 +121,6 @@ def test_shift_monotonic_in_chgroup_for_fixed_dm():
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "DM-offset fix (2026-05-29): compute_time_shift_search's "
-        "include_coarse_offset=True escape hatch was corrected to reference "
-        "each chgroup's TOP channel (matching the Convention-A corr-side "
-        "stage-1 output) instead of its bottom — this removed a constant "
-        "-2.45% detected-vs-injected DM bias. The stage-2 path tested here "
-        "(coarse_dm/stage2_shifts.py, Option A) still references chgroup "
-        "BOTTOM and so no longer matches Option B. stage2_shifts.py needs the "
-        "same chgroup-TOP correction before corr-side stage-2 is enabled; "
-        "this test is the tracking marker for that follow-up."
-    ),
-    strict=False,
-)
 def test_cross_stage_residual_against_baked_search_shifts():
     """Pin Option A ≡ Option B up to ±1-sample rounding.
 
@@ -133,8 +130,11 @@ def test_cross_stage_residual_against_baked_search_shifts():
     For the same (g, fine_dm) pair the TOTAL inter-band delay applied
     must be the same, modulo banker's-rounding noise.
 
-    NOTE (2026-05-29): now xfail — see decorator. Option B is TOP-referenced
-    after the DM-offset fix; Option A (stage2_shifts) is still BOTTOM.
+    NOTE (2026-06-03): both Option A (stage-2 corr-side + stage-3
+    search-side with ``include_coarse_offset=False``) and Option B
+    (``include_coarse_offset=True``, search-side baked) now reference
+    chgroup TOP. The residual is bounded by ±0.5 sample of the coarser
+    cadence (search) — pinned here.
     """
     coarse = COARSE_DM_PROD.copy()
     # Build a 4-fine-per-coarse fdm grid so each coarse DM has both
@@ -208,26 +208,26 @@ def test_compute_all_chgroups_returns_16():
     tables = compute_stage2_shifts_all_chgroups(coarse_dm_pc_cm3=coarse)
     assert len(tables) == N_CHGROUP
     assert all(t.chgroup == g for g, t in enumerate(tables))
-    # band-top has the largest delays; band-bottom is zero.
+    # band-top has the largest delays; band-bottom now also has a
+    # (small, DM-dependent) delay because TOP[15] > ν_bot_proc (within-
+    # chgroup span). chgroup-0's delay must still dominate.
     assert tables[0].max_shift > tables[-1].max_shift
-    assert tables[-1].max_shift == 0
+    # chgroup-15 carries the within-chgroup-15-span residual at high DM.
+    assert tables[-1].max_shift > 0
 
 
-def test_chgroup0_top_delay_matches_bench_summary():
+def test_chgroup0_top_delay_matches_expected_top_referenced():
     """At chgroup=0, coarse_dm=258.74 (250924mptq coarse_dm[0]) the
-    stage-2 delay (in NATIVE samples = 32 corr-fast samples * 32 native
-    per corr-fast sample) should match the bench's published
-    inter_chgroup_top_delay_native[0] of 0 — chgroup 0 IS the chgroup-0
-    reference frame. Inter-chgroup delay at chgroup g vs chgroup 0 is
-    what the bench reports; here we sanity-check that the chgroup=0
-    self-delay relative to ν_bot_proc is what we expect from
-    delta_tau_us directly.
+    stage-2 delay (in corr-fast samples) is the Δτ from ν_chgroup_TOP[0]
+    down to ν_bot_proc at coarse_dm[0] (Convention A; matches what
+    Convention-A stage-1 leaves at chgroup-0's output).
     """
+    from dsart.common.constants import NU_CHGROUP_TOP_GHZ
     coarse = COARSE_DM_PROD[:1]
     t = compute_stage2_shifts(chgroup=0, coarse_dm_pc_cm3=coarse)
     expected_us = delta_tau_us(
         NU_CHGROUP_BOT_GHZ[N_CHGROUP - 1],
-        NU_CHGROUP_BOT_GHZ[0],
+        NU_CHGROUP_TOP_GHZ[0],
         258.740,
     )
     expected_samples = int(round(expected_us / 262.144))
@@ -273,22 +273,13 @@ def test_rejects_zero_t_int_corr():
 def test_table_round_trip_invariants_assertions():
     """The Stage2ShiftTable __post_init__ should refuse to construct
     invalid tables (smoke test for the invariants)."""
-    # Try to forge a chgroup-15 with a non-zero shift; should raise.
-    with pytest.raises(ValueError, match="band-bottom"):
-        Stage2ShiftTable(
-            chgroup=N_CHGROUP - 1,
-            coarse_dm_pc_cm3=np.array([100.0]),
-            nu_chgroup_bot_GHz=float(NU_CHGROUP_BOT_GHZ[N_CHGROUP - 1]),
-            nu_bot_proc_GHz=float(NU_CHGROUP_BOT_GHZ[N_CHGROUP - 1]),
-            t_int_corr_us=262.144,
-            shifts_samples=np.array([5], dtype=np.int32),
-        )
+    from dsart.common.constants import NU_CHGROUP_TOP_GHZ
     # Try to forge a negative-shift table; should raise.
     with pytest.raises(ValueError, match=">= 0"):
         Stage2ShiftTable(
             chgroup=0,
             coarse_dm_pc_cm3=np.array([100.0]),
-            nu_chgroup_bot_GHz=float(NU_CHGROUP_BOT_GHZ[0]),
+            nu_chgroup_ref_GHz=float(NU_CHGROUP_TOP_GHZ[0]),
             nu_bot_proc_GHz=float(NU_CHGROUP_BOT_GHZ[N_CHGROUP - 1]),
             t_int_corr_us=262.144,
             shifts_samples=np.array([-3], dtype=np.int32),

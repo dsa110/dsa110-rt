@@ -42,31 +42,27 @@ def _identity_cube(
     return torch.from_numpy(arr)
 
 
-def test_chgroup15_is_identity():
-    """The band-bottom chgroup has zero shift for every coarse-DM: every
-    push emits the input cube unchanged (no warm-up)."""
-    coarse = COARSE_DM_PROD.copy()
+def test_chgroup15_carries_within_chgroup_residual():
+    """Post-2026-06-03 unification: stage-2 references chgroup TOP, so
+    chgroup-15 carries the TOP→ν_bot_proc within-chgroup-15 residual.
+    Even at moderate DM that residual is many corr-fast samples
+    (dispersion ∝ 1/ν², strongest at the band BOTTOM), so chgroup-15
+    is NOT an identity — it warms up like the other chgroups."""
     f = Stage2InterChgroupShiftFifo(
         chgroup=N_CHGROUP - 1,
-        coarse_dm_pc_cm3=coarse,
-        t_dedisp=8,
-    )
-    for blk in range(4):
-        cube = _identity_cube(coarse.size, 8, 4, block_offset=blk)
-        out = f.push(cube, block_n=blk)
-        assert len(out) == 1, f"chgroup-15 should emit on every push; got len={len(out)} at blk={blk}"
-        assert torch.equal(out[0], cube)
-
-
-def test_chgroup15_warmed_up_immediately():
-    f = Stage2InterChgroupShiftFifo(
-        chgroup=N_CHGROUP - 1,
-        coarse_dm_pc_cm3=np.array([100.0]),
+        coarse_dm_pc_cm3=np.array([100.0, 1000.0, 4000.0], dtype=np.float64),
         t_dedisp=4,
     )
-    cube = _identity_cube(1, 4, 2, block_offset=0)
-    f.push(cube, block_n=0)
-    assert f.warmed_up() is True
+    # All shifts should be > 0 (TOP > ν_bot_proc → real delay).
+    assert (f.shifts_samples > 0).all(), (
+        f"chgroup-15 shifts should be > 0 post-unification; got "
+        f"{f.shifts_samples.tolist()}"
+    )
+    cube = _identity_cube(3, 4, 2, block_offset=0)
+    out = f.push(cube, block_n=0)
+    # First push doesn't warm up (max shift > 0).
+    assert f.warmed_up() is False
+    assert out == []
 
 
 def test_synthetic_pure_block_shift():
@@ -81,7 +77,7 @@ def test_synthetic_pure_block_shift():
     table = Stage2ShiftTable(
         chgroup=0,
         coarse_dm_pc_cm3=np.array([100.0], dtype=np.float64),
-        nu_chgroup_bot_GHz=1.5,
+        nu_chgroup_ref_GHz=1.5,
         nu_bot_proc_GHz=1.4,
         t_int_corr_us=262.144,
         shifts_samples=np.array([t_dedisp], dtype=np.int32),
@@ -119,7 +115,7 @@ def test_synthetic_sub_block_shift_crosses_boundary():
     table = Stage2ShiftTable(
         chgroup=0,
         coarse_dm_pc_cm3=np.array([100.0], dtype=np.float64),
-        nu_chgroup_bot_GHz=1.5,
+        nu_chgroup_ref_GHz=1.5,
         nu_bot_proc_GHz=1.4,
         t_int_corr_us=262.144,
         shifts_samples=np.array([r], dtype=np.int32),
@@ -164,7 +160,7 @@ def test_per_coarse_dm_shifts_are_independent():
     table = Stage2ShiftTable(
         chgroup=0,
         coarse_dm_pc_cm3=np.array([100.0, 200.0], dtype=np.float64),
-        nu_chgroup_bot_GHz=1.5,
+        nu_chgroup_ref_GHz=1.5,
         nu_bot_proc_GHz=1.4,
         t_int_corr_us=262.144,
         shifts_samples=np.array([2, 5], dtype=np.int32),
@@ -204,7 +200,7 @@ def test_zero_shift_coarse_dm_passthrough_after_warmup():
     table = Stage2ShiftTable(
         chgroup=N_CHGROUP - 1,   # band-bottom: shifts must be zero
         coarse_dm_pc_cm3=np.array([100.0, 200.0], dtype=np.float64),
-        nu_chgroup_bot_GHz=1.4,
+        nu_chgroup_ref_GHz=1.4,
         nu_bot_proc_GHz=1.4,
         t_int_corr_us=262.144,
         shifts_samples=np.array([0, 0], dtype=np.int32),
@@ -317,7 +313,7 @@ def test_rejects_shift_table_mismatch():
     bad_table = Stage2ShiftTable(
         chgroup=1,   # different from constructor arg
         coarse_dm_pc_cm3=np.array([100.0], dtype=np.float64),
-        nu_chgroup_bot_GHz=1.5,
+        nu_chgroup_ref_GHz=1.5,
         nu_bot_proc_GHz=1.4,
         t_int_corr_us=262.144,
         shifts_samples=np.array([5], dtype=np.int32),
@@ -342,7 +338,7 @@ def test_partial_emit_when_some_coarse_dms_warmed():
     table = Stage2ShiftTable(
         chgroup=0,
         coarse_dm_pc_cm3=np.array([100.0, 200.0], dtype=np.float64),
-        nu_chgroup_bot_GHz=1.5,
+        nu_chgroup_ref_GHz=1.5,
         nu_bot_proc_GHz=1.4,
         t_int_corr_us=262.144,
         # shift 2 (warm at depth 2) vs shift 30 (k=3 r=6 → depth 5).

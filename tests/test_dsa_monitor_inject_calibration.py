@@ -279,6 +279,9 @@ class TestFireCalibrationProbe:
         self, store: FakeStore, inj_id: str, *,
         observed_snr: float, K: float, observed_specnum: int = 12345,
         matched_at: float = 100.0,
+        observed_l_rad: float = 0.0,
+        observed_m_rad: float = 0.0,
+        observed_width_samples: int = 32,
     ) -> None:
         store.kv[ic.MATCH_EVENT_PREFIX + inj_id] = {
             "best": {
@@ -286,6 +289,9 @@ class TestFireCalibrationProbe:
                 "K_inferred": K,
                 "observed_event_specnum": observed_specnum,
                 "matched_at_unix": matched_at,
+                "observed_l_rad": observed_l_rad,
+                "observed_m_rad": observed_m_rad,
+                "observed_width_samples": observed_width_samples,
             },
             "n_matches": 1,
         }
@@ -339,6 +345,48 @@ class TestFireCalibrationProbe:
         assert got.K == pytest.approx(result.K)
         assert got.last_fluence_jy_ms == 100.0
         assert got.last_observed_snr == 20.0
+
+    def test_fleet_lm_offset_match_still_stores_K(self):
+        """Regression: a boresight-declared probe matched at the
+        documented fleet l/m≈0.019 offset (with a low search-width)
+        must still store K — the dashboard no longer re-gates on l/m
+        or width (the C2 matcher owns those tolerances)."""
+        store = FakeStore()
+        now = [700.0]
+        sleep_calls: List[float] = []
+
+        def sleep_fn(s):
+            sleep_calls.append(s)
+            now[0] += s
+            if len(sleep_calls) == 1:
+                inj_id = ic._build_probe_inj_id(
+                    prefix="cal_probe", dm=900.0, width=32, timestamp=700.0,
+                )
+                self._seed_match(
+                    store, inj_id, observed_snr=20.34,
+                    K=20.34 * math.sqrt(32.0 / 100.0),
+                    observed_l_rad=0.0192,
+                    observed_m_rad=0.0191,
+                    observed_width_samples=4,
+                )
+
+        result = ic.fire_calibration_probe(
+            store,
+            inject_fn=self._good_inject,
+            dm_pc_cm3=900.0,
+            width_samples=32,
+            fluence_jy_ms=100.0,
+            l_rad=0.0,
+            m_rad=0.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+        )
+        assert result.ok is True
+        assert result.reason == "ok"
+        assert result.bucket == "dm0900_w0032"
+        assert ic.CalibrationStore(store).get(
+            dm_pc_cm3=900.0, width_samples=32,
+        ) is not None
 
     def test_no_match_returns_failure(self):
         store = FakeStore()

@@ -187,7 +187,15 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
-      --include-coarse-offset-in-search-shifts
+      # Option A (2026-06-03): corr-side stage-2 inter-chgroup alignment
+      # is wired in (--stage2-mode per_coarse_dm in dsart_pipeline_rt.yaml),
+      # so the search-side `compute_time_shift_search` runs in default
+      # `include_coarse_offset=False` mode (stage-3 differential only).
+      # Search-side per-chgroup shifts shrink from ±1432 → ±83 samples,
+      # auto-shrinking _t_stream from 1624 → 275 (3 GB → 520 MB per
+      # search node). DO NOT re-add --include-coarse-offset-in-search-shifts
+      # unless corr-side stage-2 is disabled (which would also undo the
+      # full-band coherence recovery at high DM).
       --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
@@ -280,7 +288,7 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
-      --include-coarse-offset-in-search-shifts
+      # Option A (2026-06-03): see search_compute_0 above.
       --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0

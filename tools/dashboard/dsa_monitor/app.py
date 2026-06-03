@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """DSA-110 monitoring dashboard (h23).
 
-Flask web app exposing three tabs:
+Flask web app exposing four tabs:
 
   * **Antennas/RFI** — per-antenna bandpass + flag spectrum + 30-min
     waterfalls + monitor-points table.
-  * **SEFDs** — existing SEFD dashboard running on the same host at
-    port 5777; surfaced here as an external link / iframe.
-  * **Burst candidates** — placeholder (architecture TBD).
+  * **SEFDs** — native rendering of the SEFD scanner's outputs
+    (``state.json`` + ``results/`` PNG tree); the scanner itself
+    still runs in ``sefd_dashboard.service`` (casa38 conda env) but
+    no longer serves a Flask app on port 5777 (see
+    :mod:`sefd_view`).
+  * **Burst candidates** — h23 candidate / cube archive browser.
+  * **Control** — Phase 8 fleet verbs, injections, dumps gate, SNR
+    calibration, fleet-recovery ops.
 
 Architecture (M7.6, see ``REPO/configs/dsart_pipeline_rt.yaml`` for
 the producer side):
@@ -82,6 +87,11 @@ from control_store import (
     restart_c2_service_local,
 )
 from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
+from sefd_view import (
+    DEFAULT_RESULTS_DIR as SEFD_DEFAULT_RESULTS_DIR,
+    DEFAULT_STATE_FILE as SEFD_DEFAULT_STATE_FILE,
+    SefdView,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +100,16 @@ from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
 
 LOG = logging.getLogger("dsa_monitor.app")
 
-SEFD_DASHBOARD_URL = os.environ.get(
-    "SEFD_DASHBOARD_URL", "http://lxd110h23:5777/",
+# Where the SEFD scanner (``sefd_dashboard.service``) puts its outputs.
+# We read these two paths read-only — the scanner is the sole writer.
+SEFD_STATE_FILE = os.environ.get(
+    "SEFD_STATE_FILE", SEFD_DEFAULT_STATE_FILE,
+)
+SEFD_RESULTS_DIR = os.environ.get(
+    "SEFD_RESULTS_DIR", SEFD_DEFAULT_RESULTS_DIR,
+)
+sefd_view = SefdView(
+    state_file=SEFD_STATE_FILE, results_dir=SEFD_RESULTS_DIR,
 )
 
 store: RFIWindowStore
@@ -204,17 +222,107 @@ def antennas_rfi():
         table=table,
         nodes_status=nodes_status,
         snapshot_unix=snap.snapshot_unix,
-        sefd_url=SEFD_DASHBOARD_URL,
     )
 
 
 @app.route("/sefds")
 def sefds():
+    """SEFD landing page: per-day x per-source grid with the headline
+    metrics inline.  Reads the scanner's ``state.json`` directly via
+    the :class:`SefdView` singleton; no iframe."""
+    try:
+        lookback = int(request.args.get("days", "7"))
+    except ValueError:
+        lookback = 7
+    summary = sefd_view.summary(lookback_days=lookback)
     return render_template(
         "sefds.html",
         active_tab="sefds",
-        sefd_url=SEFD_DASHBOARD_URL,
+        summary=summary,
+        sefd_state_path=SEFD_STATE_FILE,
+        sefd_state_error=sefd_view.state_error(),
     )
+
+
+@app.route("/sefds/source/<source_name>")
+def sefds_source(source_name: str):
+    """Per-source comparison: metrics table + diagnostic plots for
+    every recent observation of one calibrator."""
+    try:
+        lookback = int(request.args.get("days", "7"))
+    except ValueError:
+        lookback = 7
+    if source_name not in sefd_view.sources:
+        abort(404)
+    entries = sefd_view.source_entries(source_name, lookback_days=lookback)
+    # Pre-resolve plot URLs once so the template only does dict
+    # lookups; this also makes the absent-PNG case visible to the
+    # template's ``onerror`` handler.
+    entry_plots = {
+        e.date: sefd_view.list_day_plots(source_name, e.date)
+        for e in entries
+    }
+    return render_template(
+        "sefd_source.html",
+        active_tab="sefds",
+        source_name=source_name,
+        source_flux=sefd_view.sources[source_name],
+        entries=entries,
+        entry_plots=entry_plots,
+        lookback=lookback,
+    )
+
+
+@app.route("/sefds/day/<date>")
+def sefds_day(date: str):
+    """Per-day detail: every source's status + metrics + plots for one
+    observation date."""
+    entries = sefd_view.day_entries(date)
+    if not entries:
+        # Render with an empty banner rather than 404 so the operator
+        # can land on the page from a stale link without a hard error.
+        pass
+    plots_by_source = {
+        src: sefd_view.list_day_plots(src, date) for src in entries
+    }
+    return render_template(
+        "sefd_day.html",
+        active_tab="sefds",
+        date=date,
+        sources=sefd_view.sources,
+        entries=entries,
+        plots_by_source=plots_by_source,
+    )
+
+
+@app.route("/sefds/results/<path:rel_path>")
+def sefds_result(rel_path: str):
+    """Serve one PNG out of the scanner's ``results/`` tree.
+
+    Path-traversal is enforced by
+    :meth:`SefdView.resolve_plot_path` — anything that resolves
+    outside ``SEFD_RESULTS_DIR`` returns 404.
+    """
+    abs_path = sefd_view.resolve_plot_path(rel_path)
+    if abs_path is None:
+        abort(404)
+    return send_file(abs_path, mimetype="image/png")
+
+
+@app.route("/api/sefd_status")
+def api_sefd_status():
+    """JSON status for the SEFD scanner.  Used by the SEFD landing
+    page's freshness pill (so the operator immediately sees a stale
+    scanner without having to read mtimes off disk)."""
+    summary = sefd_view.summary(lookback_days=1)
+    return jsonify({
+        "state_path": SEFD_STATE_FILE,
+        "state_mtime_unix": summary.state_mtime_unix,
+        "state_error": sefd_view.state_error(),
+        "scanner_alive": summary.scanner_alive,
+        "scanner_age_s": summary.scanner_age_s,
+        "currently_processing": summary.currently_processing,
+    })
 
 
 @app.route("/bursts")
@@ -223,7 +331,6 @@ def bursts():
     return render_template(
         "bursts.html",
         active_tab="bursts",
-        sefd_url=SEFD_DASHBOARD_URL,
         events=events,
         archive_root=str(cands_browser.root),
         archive_available=cands_browser.is_available,
@@ -243,7 +350,6 @@ def burst_event(name: str):
         metadata_pretty=_json.dumps(
             detail.metadata, indent=2, sort_keys=True, default=str,
         ),
-        sefd_url=SEFD_DASHBOARD_URL,
     )
 
 
@@ -424,9 +530,51 @@ def control_start_post():
                 "ok": False,
                 "error": f"obs_dec_deg={dec_raw!r}: not a float",
             }), 400
-    return _control_json_or_error(
-        control_start_fleet, obs_dec_deg=obs_dec,
-    )
+
+    user = request.form.get("user") or request.remote_addr or "anon"
+
+    # Start-time housekeeping: wipe the accumulated "safe to delete on
+    # restart" ephemera on every corr + search node BEFORE the start
+    # verb fans out. h23 (the candidate/CSV archive) is never touched.
+    # Best-effort — a cleanup failure must never block the start.
+    import fleet_services                                            # local
+    try:
+        node_cleanup = fleet_services.cleanup_nodes_for_start()
+    except Exception as exc:                                         # noqa: BLE001
+        LOG.exception("start-time node cleanup failed (continuing)")
+        node_cleanup = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        audit_log(
+            control_store, namespace="corr_rt+search_rt", cn_target="all",
+            cmd="start_cleanup", val=None, ok=bool(node_cleanup.get("ok")),
+            note=(
+                f"n_ok={node_cleanup.get('n_ok')} "
+                f"n_failed={node_cleanup.get('n_failed')}"
+            ),
+            user=user,
+        )
+    except Exception:                                               # noqa: BLE001
+        LOG.exception("start_cleanup audit_log failed (continuing)")
+
+    try:
+        result = control_start_fleet(
+            control_store, obs_dec_deg=obs_dec, user=user,
+        )
+    except Exception as exc:                                         # noqa: BLE001
+        LOG.exception("control verb control_start_fleet failed")
+        try:
+            audit_log(
+                control_store, namespace="control", cn_target="-",
+                cmd="control_start_fleet", val={"obs_dec_deg": obs_dec},
+                ok=False, note=f"exception: {exc!r}", user=user,
+            )
+        except Exception:                                           # noqa: BLE001
+            LOG.exception("audit_log also failed (continuing)")
+        return jsonify({
+            "ok": False, "error": str(exc), "node_cleanup": node_cleanup,
+        }), 500
+    result["node_cleanup"] = node_cleanup
+    return jsonify(result)
 
 
 @app.route("/control/stop", methods=["POST"])
@@ -1475,8 +1623,9 @@ def main():
     port = int(os.environ.get("DSA_MONITOR_PORT", "5778"))
     bind = os.environ.get("DSA_MONITOR_BIND", "0.0.0.0")
     LOG.info(
-        "dsa_monitor up on %s:%d (sefd_url=%s)",
-        bind, port, SEFD_DASHBOARD_URL,
+        "dsa_monitor up on %s:%d "
+        "(sefd_state=%s sefd_results=%s)",
+        bind, port, SEFD_STATE_FILE, SEFD_RESULTS_DIR,
     )
     app.run(host=bind, port=port, debug=False, use_reloader=False)
 

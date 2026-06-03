@@ -1,5 +1,5 @@
 [Unit]
-Description=DSA-110 Monitor Dashboard (Antennas/RFI + SEFDs + Bursts)
+Description=DSA-110 Monitor Dashboard (Antennas/RFI + SEFDs + Bursts + Control)
 After=network.target
 
 [Service]
@@ -9,8 +9,12 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src:/home/ubuntu/vikram/dev/dsa110-rt/tools/dashboard/dsa_monitor
 Environment=DSA_MONITOR_PORT=5778
 Environment=DSA_MONITOR_BIND=0.0.0.0
-Environment=SEFD_DASHBOARD_URL=http://lxd110h23:5777/
-ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u app.py
+# SEFD scanner outputs consumed read-only by the /sefds tab. The
+# scanner itself runs in sefd_dashboard.service (casa38 env) and
+# writes these paths.
+Environment=SEFD_STATE_FILE=/media/ubuntu/ssd/vikram/sefd/sefd_dashboard/state.json
+Environment=SEFD_RESULTS_DIR=/media/ubuntu/ssd/vikram/sefd/sefd_dashboard/results
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u app.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

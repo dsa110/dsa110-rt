@@ -57,8 +57,12 @@ def _coarse_fine_grid(n_coarse: int = 4, n_fine_per_coarse: int = 8):
     return coarse, fine, fine_to_coarse
 
 
-def test_compute_time_shift_search_chgroup15_row_is_zero() -> None:
-    """Sign convention: chgroup-15 row is identically zero (it IS ν_bot_proc)."""
+def test_compute_time_shift_search_chgroup15_carries_within_chgroup_residual() -> None:
+    """Post-2026-06-03 unification: BOTH ``include_coarse_offset`` paths
+    reference each chgroup's TOP channel (matching Convention-A
+    corr-side stage-1). chgroup-15's TOP sits ~12 MHz above ν_bot_proc,
+    so chgroup-15 carries a small DM-dependent shift — the pre-fix
+    "[:,15] == 0" invariant is retired."""
     coarse, fine, f2c = _coarse_fine_grid()
     table = compute_time_shift_search(
         coarse_dm_pc_cm3=coarse,
@@ -67,7 +71,15 @@ def test_compute_time_shift_search_chgroup15_row_is_zero() -> None:
     )
     assert table.shifts.dtype == np.int32
     assert table.shifts.shape == (len(fine), N_CHGROUP)
-    assert np.all(table.shifts[:, N_CHGROUP - 1] == 0)
+    # chgroup-15 column is zero for fines at the coarse cell (δdm = 0)
+    # and non-zero elsewhere (TOP→ν_bot_proc within-chgroup-15 residual
+    # is non-zero at non-zero δdm). The diagonal blocks (fines that ARE
+    # coarse) sit at the start of each fine block via _coarse_fine_grid().
+    n_fine_per_coarse = len(fine) // len(coarse)
+    diag = np.arange(len(coarse)) * n_fine_per_coarse
+    nondiag = np.setdiff1d(np.arange(len(fine)), diag)
+    assert np.all(table.shifts[diag, N_CHGROUP - 1] == 0)
+    assert (table.shifts[nondiag, N_CHGROUP - 1] != 0).any()
 
 
 def test_include_coarse_offset_uses_chgroup_top_reference_zero_dm_offset() -> None:
@@ -134,23 +146,26 @@ def test_compute_time_shift_search_zero_at_dm_zero_offset() -> None:
 
 
 def test_compute_time_shift_search_matches_closed_form() -> None:
-    """Element-wise match against ``rint(Δτ_us / t_int)`` for a few cells."""
+    """Element-wise match against ``rint(Δτ_us / t_int)`` for a few cells.
+
+    Post-2026-06-03 unification: both ``include_coarse_offset`` paths
+    reference each chgroup's TOP channel (Convention A). The closed
+    form is ``rint(Δτ(ν_bot_proc, ν_TOP[g], δdm) / t_int)``.
+    """
+    from dsart.common.constants import NU_CHGROUP_TOP_GHZ
     coarse, fine, f2c = _coarse_fine_grid()
     table = compute_time_shift_search(
         coarse_dm_pc_cm3=coarse,
         fine_dm_pc_cm3=fine,
         fine_to_coarse=f2c,
     )
-    # Check a handful of cells explicitly. delta_tau_us takes
-    # (nu_low, nu_high, dm); for g < 15 chgroup_bot[g] > nu_bot_proc,
-    # so nu_low IS nu_bot_proc and shift = +rint(Δτ / t_int).
     for f_idx in (0, 5, 17, len(fine) - 1):
         c_idx = int(f2c[f_idx])
         ddm = float(fine[f_idx] - coarse[c_idx])
-        for g in range(N_CHGROUP - 1):
+        for g in range(N_CHGROUP):
             d_us = delta_tau_us(
                 float(NU_BOT_PROC_GHZ),
-                float(NU_CHGROUP_BOT_GHZ[g]),
+                float(NU_CHGROUP_TOP_GHZ[g]),
                 ddm,
             )
             expected = int(np.rint(d_us / T_INT_SEARCH_US_DEFAULT))
@@ -160,9 +175,11 @@ def test_compute_time_shift_search_matches_closed_form() -> None:
 
 
 def test_compute_time_shift_search_monotone_in_chgroup() -> None:
-    """For δdm > 0 the per-chgroup shift increases with ν_bot_proc separation:
-    chgroup 0 (top of band) requires the largest forward-shift; chgroup 15
-    is zero by construction. Equivalently shifts decrease with chgroup index.
+    """For δdm > 0 the per-chgroup shift increases with ν_bot_proc
+    separation: chgroup 0 (top of band) requires the largest
+    forward-shift. Post-2026-06-03 chgroup-15 also carries a small
+    (within-chgroup-15) shift; shifts must still be monotone-decreasing
+    in chgroup index (TOP[15] < TOP[14] < ... < TOP[0]).
     """
     coarse = np.array([100.0], dtype=np.float64)
     fine = np.array([110.0], dtype=np.float64)
@@ -218,15 +235,18 @@ def test_time_shift_search_table_accepts_signed_shifts() -> None:
     assert int(table.shifts.max()) == +11
 
 
-def test_time_shift_search_table_rejects_chgroup15_nonzero() -> None:
-    bad = np.zeros((4, N_CHGROUP), dtype=np.int32)
-    bad[2, N_CHGROUP - 1] = 1
-    with pytest.raises(ValueError, match="chgroup 15"):
-        TimeShiftSearchTable(
-            shifts=bad,
-            fine_to_coarse=np.zeros(4, dtype=np.int64),
-            t_int_search_us=T_INT_SEARCH_US_DEFAULT,
-        )
+def test_time_shift_search_table_accepts_nonzero_chgroup15() -> None:
+    """Post-2026-06-03 unification: chgroup-15 carries a real
+    TOP→ν_bot_proc residual at non-zero δdm. The table validator no
+    longer rejects non-zero chgroup-15 entries."""
+    ok = np.zeros((4, N_CHGROUP), dtype=np.int32)
+    ok[2, N_CHGROUP - 1] = 3  # small residual at high DM is normal
+    table = TimeShiftSearchTable(
+        shifts=ok,
+        fine_to_coarse=np.zeros(4, dtype=np.int64),
+        t_int_search_us=T_INT_SEARCH_US_DEFAULT,
+    )
+    assert int(table.shifts[2, N_CHGROUP - 1]) == 3
 
 
 def test_time_shift_search_table_rejects_wrong_dtype() -> None:

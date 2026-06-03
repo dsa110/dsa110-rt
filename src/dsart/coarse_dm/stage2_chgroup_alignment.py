@@ -83,9 +83,11 @@ class Stage2InterChgroupShiftFifo:
     Parameters
     ----------
     chgroup : int
-        Local chgroup index (0..15). chgroup-15 is a degenerate
-        identity (all shifts zero); the FIFO still works there and
-        just emits the input cube unchanged.
+        Local chgroup index (0..15). All chgroups (including the
+        band-bottom chgroup-15) reference their TOP channel under the
+        Convention-A 2026-06-03 unification, so chgroup-15 carries a
+        small within-chgroup TOP→ν_bot_proc residual at high DM and
+        only behaves as an identity at low DMs where rint() rounds to 0.
     coarse_dm_pc_cm3 : np.ndarray
         ``(N_coarse,)`` coarse-DM trial values; identifies the
         per-coarse-DM shifts via

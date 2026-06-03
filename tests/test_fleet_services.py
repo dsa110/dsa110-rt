@@ -366,6 +366,49 @@ class TestRestartAllH20Exclusion:
         assert all("lxd110h20" not in h for h in ssh_hosts)
 
 
+class TestCleanupNodesForStart:
+    def test_fanout_targets_corr_and_search_not_h20_or_h23(self):
+        recorder = _CallRecorder(default_rc=0)
+        with mock.patch.object(subprocess, "run", side_effect=recorder):
+            summary = fleet_services.cleanup_nodes_for_start()
+        ssh_hosts = set()
+        for argv in recorder.calls:
+            if argv and argv[0] == "ssh":
+                for a in argv:
+                    if isinstance(a, str) and a.endswith(".pro.pvt"):
+                        ssh_hosts.add(a)
+                        break
+        # corr (16) + search (4) = 20 unique hosts; all succeed.
+        assert len(ssh_hosts) == 20
+        assert summary["n_hosts"] == 20
+        assert summary["n_ok"] == 20
+        assert summary["ok"] is True
+        all_argv = " ".join(" ".join(a) for a in recorder.calls)
+        # h20 (read-only) + h23 (archive) are NEVER in the fanout.
+        assert "lxd110h20" not in all_argv
+        assert "lxd110h23" not in all_argv
+        # On a START we never wipe shm rings / PSRDADA — the starting
+        # processes own those.
+        assert "/dev/shm" not in all_argv
+        assert "dada_db" not in all_argv
+        # corr clears ready sentinels + debug grid; search clears the
+        # local cube_dump tree (already rsynced to h23).
+        assert "dsart-corr-*.ready" in all_argv
+        assert "dsart-fast-grid" in all_argv
+        assert "/home/ubuntu/data/c2/cube_dump" in all_argv
+
+    def test_partial_failure_reported_not_raised(self):
+        recorder = _CallRecorder(default_rc=0, fail_hosts={"n03.pro.pvt"})
+        with mock.patch.object(subprocess, "run", side_effect=recorder):
+            summary = fleet_services.cleanup_nodes_for_start()
+        # One host failed; the call still returns (never raises).
+        assert summary["ok"] is False
+        assert summary["n_failed"] == 1
+        assert summary["per_host"]["n03.pro.pvt"]["rc"] == 2
+        # The other 19 still succeeded.
+        assert summary["n_ok"] == 19
+
+
 class TestRestartAllPartialFailure:
     def test_one_host_failure_doesnt_abort_other_fanout(self):
         # n03.pro.pvt simulates a non-zero ssh exit; the other 19

@@ -33,20 +33,28 @@ A C1 row matches an :class:`ActiveInjection` when
      quantisation residual the search-side de-disperser leaves), AND
 
   2. ``hypot(row.l_rad - inj.l_rad, row.m_rad - inj.m_rad) <
-     lm_tol_rad`` (default 0.005 rad ≈ 17 arcmin — much wider than one
-     image pixel so the C1 peak that doesn't quite land on the
-     injection grid cell still matches), AND
+     lm_tol_rad`` (default 0.04 rad — wide enough for fleet l/m
+     residuals at boresight while still rejecting most off-axis RFI),
+     AND
 
-  3. The injection has not yet expired
+  3. ``min_observed_snr <= row.snr <= max_observed_snr`` (defaults
+     6–2000 σ — blocks σ-scaling glitches at 60k+ without clipping
+     bright replay injections), AND
+
+  4. The injection has not yet expired
      (``now_unix - inj.fired_at_unix < inj.ttl_s``).
 
-Multiple matching rows for the same injection are allowed; the matcher
-keeps a per-``inj_id`` "best so far" (max ``snr``) and a rolling
-history of the most recent N (default 16) matches. The published
-payload at ``/mon/dsart/inject/matches/<inj_id>`` carries both, so the
-dashboard can either read the brightest match (calibration) or scan
-the history (sanity check that the injection produced a coherent
-spike rather than just one outlier).
+Width is deliberately NOT a match criterion: the injection
+``width_samples`` is in NATIVE samples (32.768 µs) while the C1 row's
+``width_samples`` is in SEARCH samples (~1 ms ≈ 32 native), and DM
+smearing widens the observed core independently of the injected width.
+Comparing the two units previously rejected every real match.
+
+Multiple qualifying rows for the same injection are allowed; the matcher
+keeps a per-``inj_id`` "best so far" by **closest (l, m)**, then
+**highest SNR** — not raw max-SNR alone. The published payload at
+``/mon/dsart/inject/matches/<inj_id>`` carries best + history so the
+dashboard calibration loop reads a physically consistent spike.
 
 The matcher is **thread-safe** for the single-producer (C2's batch
 handler) + single-refresher (mon-publish loop) pattern the
@@ -100,6 +108,8 @@ __all__ = [
     "MATCH_EVENT_PREFIX",
     "DEFAULT_DM_TOL_FRAC",
     "DEFAULT_LM_TOL_RAD",
+    "DEFAULT_MAX_OBSERVED_SNR",
+    "DEFAULT_MIN_OBSERVED_SNR",
     "DEFAULT_REGISTRY_REFRESH_S",
     "DEFAULT_HISTORY_DEPTH",
     "ActiveInjection",
@@ -136,6 +146,16 @@ DEFAULT_DM_TOL_FRAC: float = 0.05
 #: the bulk of off-axis RFI (the RFI cluster sits at l~0.025, m~0.035
 #: and dm>1500, which is outside the dm_tol_frac window anyway).
 DEFAULT_LM_TOL_RAD: float = 0.04
+
+#: Reject match candidates above this SNR (σ). Width-1 σ-scaling
+#: glitches on the live fleet have produced 60k+ σ artifacts that
+#: poison bootstrap calibration; real injections and replay bursts
+#: stay well below 2000 σ.
+DEFAULT_MAX_OBSERVED_SNR: float = 2000.0
+
+#: Minimum observed SNR for a match. Below the C1 emit floor (~8 σ
+#: after noise-color de-rating) calibration would read noise anyway.
+DEFAULT_MIN_OBSERVED_SNR: float = 6.0
 
 #: How often the matcher refreshes its registry snapshot from etcd.
 #: 1 s keeps the matcher responsive to the dashboard's PUT without
@@ -417,6 +437,8 @@ class InjectionMatcher:
         refresh_s: float = DEFAULT_REGISTRY_REFRESH_S,
         dm_tol_frac: float = DEFAULT_DM_TOL_FRAC,
         lm_tol_rad: float = DEFAULT_LM_TOL_RAD,
+        max_observed_snr: float = DEFAULT_MAX_OBSERVED_SNR,
+        min_observed_snr: float = DEFAULT_MIN_OBSERVED_SNR,
         history_depth: int = DEFAULT_HISTORY_DEPTH,
         time_fn: Any = time.time,
         active_inject_prefix: str = ACTIVE_INJECT_PREFIX,
@@ -428,6 +450,19 @@ class InjectionMatcher:
             raise ValueError(f"dm_tol_frac={dm_tol_frac} must be positive")
         if lm_tol_rad <= 0.0:
             raise ValueError(f"lm_tol_rad={lm_tol_rad} must be positive")
+        if max_observed_snr <= 0.0:
+            raise ValueError(
+                f"max_observed_snr={max_observed_snr} must be positive"
+            )
+        if min_observed_snr < 0.0:
+            raise ValueError(
+                f"min_observed_snr={min_observed_snr} must be >= 0"
+            )
+        if min_observed_snr > max_observed_snr:
+            raise ValueError(
+                f"min_observed_snr={min_observed_snr} > "
+                f"max_observed_snr={max_observed_snr}"
+            )
         if history_depth < 1:
             raise ValueError(f"history_depth={history_depth} must be >= 1")
         if expiry_grace_s is not None and float(expiry_grace_s) < 0.0:
@@ -438,6 +473,8 @@ class InjectionMatcher:
         self._refresh_s = float(refresh_s)
         self._dm_tol_frac = float(dm_tol_frac)
         self._lm_tol_rad = float(lm_tol_rad)
+        self._max_observed_snr = float(max_observed_snr)
+        self._min_observed_snr = float(min_observed_snr)
         self._history_depth = int(history_depth)
         self._time = time_fn
         self._active_inject_prefix = str(active_inject_prefix)
@@ -452,6 +489,7 @@ class InjectionMatcher:
         self._last_refresh_unix: float = 0.0
         # Counters — exposed via snapshot() for the coincidencer mon-points.
         self._n_rows_checked: int = 0
+        self._n_rows_rejected_quality: int = 0
         self._n_matches: int = 0
         self._n_best_improved: int = 0
         self._n_publish_ok: int = 0
@@ -603,11 +641,13 @@ class InjectionMatcher:
         for inj in actives:
             if inj.is_expired(now):
                 continue
-            if not self._row_matches(
+            if not self._row_qualifies(
                 inj=inj,
+                snr=snr,
                 dm_pc_cc=dm_pc_cc,
                 l_rad=l_rad,
                 m_rad=m_rad,
+                width_samples=width_samples,
             ):
                 continue
             K = compute_k_inferred(
@@ -639,9 +679,7 @@ class InjectionMatcher:
             improved = self._update_best_and_history(mr)
             if improved:
                 self._publish_match(inj.inj_id)
-                if best_match is None or mr.observed_snr > best_match.observed_snr:
-                    best_match = mr
-            elif best_match is None:
+            if best_match is None or self._is_better_match(mr, best_match):
                 best_match = mr
         return best_match
 
@@ -651,27 +689,71 @@ class InjectionMatcher:
         dm_pc_cc: float,
         l_rad: float,
         m_rad: float,
+        width_samples: Optional[int] = None,
+        snr: Optional[float] = None,
     ) -> Optional[str]:
-        """Return the first matching inj_id (no SNR / best update).
+        """Return the best-quality matching ``inj_id`` (no publish).
 
         Cheap, side-effect-free helper used by the coincidencer to
-        stamp the C1 CSV's ``inj_id`` column without re-running the
-        full :meth:`try_match` pipeline.
+        stamp the C1 CSV's ``inj_id`` column. When ``width_samples``
+        and ``snr`` are both supplied (production path), the same
+        width/SNR gates and quality ordering as :meth:`try_match`
+        apply; otherwise only DM + l/m are checked (legacy/tests).
         """
         now = float(self._time())
+        use_quality = width_samples is not None and snr is not None
         with self._lock:
             actives = list(self._active.values())
+        best_id: Optional[str] = None
+        best_mr: Optional[MatchResult] = None
         for inj in actives:
             if inj.is_expired(now):
                 continue
-            if self._row_matches(
+            if use_quality:
+                if not self._row_qualifies(
+                    inj=inj,
+                    snr=float(snr),  # type: ignore[arg-type]
+                    dm_pc_cc=dm_pc_cc,
+                    l_rad=l_rad,
+                    m_rad=m_rad,
+                    width_samples=int(width_samples),  # type: ignore[arg-type]
+                ):
+                    continue
+            elif not self._row_matches_dm_lm(
                 inj=inj,
                 dm_pc_cc=dm_pc_cc,
                 l_rad=l_rad,
                 m_rad=m_rad,
             ):
+                continue
+            mr = MatchResult(
+                inj_id=inj.inj_id,
+                observed_snr=float(snr if use_quality else 0.0),
+                observed_dm_pc_cm3=float(dm_pc_cc),
+                observed_l_rad=float(l_rad),
+                observed_m_rad=float(m_rad),
+                observed_width_samples=int(
+                    width_samples if use_quality else 0,
+                ),
+                observed_event_specnum=0,
+                observed_kernel_id="",
+                observed_search_node_id=0,
+                observed_gpu_half=0,
+                observed_mjd=0.0,
+                matched_at_unix=now,
+                fluence_used_jy_ms=float(inj.fluence_jy_ms),
+                K_inferred=float("nan"),
+                inject_dm_pc_cm3=float(inj.dm_pc_cm3),
+                inject_l_rad=float(inj.l_rad),
+                inject_m_rad=float(inj.m_rad),
+                inject_width_samples=int(inj.width_samples),
+            )
+            if not use_quality:
                 return inj.inj_id
-        return None
+            if best_mr is None or self._is_better_match(mr, best_mr):
+                best_mr = mr
+                best_id = inj.inj_id
+        return best_id
 
     def snapshot(self) -> Dict[str, Any]:
         """Return a JSON-ready snapshot of matcher state + counters.
@@ -709,7 +791,10 @@ class InjectionMatcher:
             "active": active,
             "best": best,
             "rows_checked": int(self._n_rows_checked),
+            "rows_rejected_quality": int(self._n_rows_rejected_quality),
             "matches": int(self._n_matches),
+            "max_observed_snr": float(self._max_observed_snr),
+            "min_observed_snr": float(self._min_observed_snr),
             "best_improved": int(self._n_best_improved),
             "publish_ok": int(self._n_publish_ok),
             "publish_fail": int(self._n_publish_fail),
@@ -722,7 +807,7 @@ class InjectionMatcher:
 
     # ---- internals ----
 
-    def _row_matches(
+    def _row_matches_dm_lm(
         self,
         *,
         inj: ActiveInjection,
@@ -747,8 +832,69 @@ class InjectionMatcher:
             return False
         return lm_dist <= self._lm_tol_rad
 
+    def _row_qualifies(
+        self,
+        *,
+        inj: ActiveInjection,
+        snr: float,
+        dm_pc_cc: float,
+        l_rad: float,
+        m_rad: float,
+        width_samples: int,
+    ) -> bool:
+        """Full match gate: DM/l/m proximity + SNR band.
+
+        Note on width: the injection ``width_samples`` is in NATIVE
+        samples (32.768 µs) while the C1/detector ``width_samples`` is
+        in SEARCH samples (~1 ms ≈ 32 native). They are NOT comparable,
+        and DM smearing widens the observed core independently of the
+        injected width — so we do NOT gate on width here. The SNR
+        ceiling below is what rejects the σ-scaling glitches (width-1
+        60k+ σ hot pixels) that previously poisoned calibration.
+        """
+        if not self._row_matches_dm_lm(
+            inj=inj,
+            dm_pc_cc=dm_pc_cc,
+            l_rad=l_rad,
+            m_rad=m_rad,
+        ):
+            return False
+        try:
+            snr_f = float(snr)
+        except (TypeError, ValueError):
+            self._n_rows_rejected_quality += 1
+            return False
+        if not math.isfinite(snr_f):
+            self._n_rows_rejected_quality += 1
+            return False
+        if snr_f < self._min_observed_snr or snr_f > self._max_observed_snr:
+            self._n_rows_rejected_quality += 1
+            return False
+        return True
+
+    def _match_quality_key(self, mr: MatchResult) -> tuple[float, float]:
+        """Sort key for best-match selection (lower is better).
+
+        Prefer the row closest to the injection's declared (l, m), then
+        the brightest. Width is intentionally excluded (native-vs-search
+        unit mismatch + DM-smear dependence; see :meth:`_row_qualifies`).
+        """
+        lm_dist = math.hypot(
+            mr.observed_l_rad - mr.inject_l_rad,
+            mr.observed_m_rad - mr.inject_m_rad,
+        )
+        return (lm_dist, -mr.observed_snr)
+
+    def _is_better_match(
+        self, candidate: MatchResult, incumbent: MatchResult,
+    ) -> bool:
+        """True iff ``candidate`` should replace ``incumbent`` as best."""
+        return self._match_quality_key(candidate) < self._match_quality_key(
+            incumbent,
+        )
+
     def _update_best_and_history(self, mr: MatchResult) -> bool:
-        """Push ``mr`` into history; bump best if SNR improved.
+        """Push ``mr`` into history; bump best on quality improvement.
 
         Returns True iff the per-``inj_id`` best changed.
         """
@@ -758,7 +904,7 @@ class InjectionMatcher:
             )
             hist.append(mr)
             prev = self._best.get(mr.inj_id)
-            if prev is None or mr.observed_snr > prev.observed_snr:
+            if prev is None or self._is_better_match(mr, prev):
                 self._best[mr.inj_id] = mr
                 self._n_best_improved += 1
                 return True

@@ -58,7 +58,11 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-from dsart.common.constants import N_CHGROUP, NU_CHGROUP_BOT_GHZ
+from dsart.common.constants import (
+    N_CHGROUP,
+    NU_CHGROUP_BOT_GHZ,
+    NU_CHGROUP_TOP_GHZ,
+)
 from dsart.common.dispersion import delta_tau_us
 
 
@@ -87,8 +91,12 @@ class Stage2ShiftTable:
     coarse_dm_pc_cm3 : np.ndarray
         ``(N_coarse,) float64`` coarse-DM trial values the shifts were
         computed against. Kept for provenance + downstream sanity checks.
-    nu_chgroup_bot_GHz : float
-        The chgroup's band-bottom frequency used in the math.
+    nu_chgroup_ref_GHz : float
+        The chgroup's reference frequency the shifts were computed
+        against. Convention A (corr-side stage-1 output): the chgroup's
+        TOP channel frequency. See :func:`compute_stage2_shifts` for
+        the rationale and the 2026-06-03 fix that aligned this with the
+        actual stage-1 output reference.
     nu_bot_proc_GHz : float
         The processed-band bottom frequency = chgroup-15's band-bottom.
     t_int_corr_us : float
@@ -97,11 +105,11 @@ class Stage2ShiftTable:
         ``(N_coarse,) int32`` integer-sample shifts. ``shifts_samples[c]``
         is the non-negative number of corr-side fast-vis samples that
         chgroup ``g`` must DELAY its coarse-DM-``c`` output by so the
-        signal at ``ν_bot_g`` lines up with the signal at
+        signal at ``ν_chgroup_TOP[g]`` lines up with the signal at
         ``ν_bot_proc`` after the delay. Sign: chgroup-0 (band top)
         sees a high-DM burst BEFORE chgroup-15 (band bottom), so it
-        must DELAY (positive shift) by ``round(Δτ(ν_bot_proc, ν_bot_g,
-        coarse_dm[c]) / t_int_corr_us)``.
+        must DELAY (positive shift) by ``round(Δτ(ν_bot_proc,
+        ν_chgroup_TOP[g], coarse_dm[c]) / t_int_corr_us)``.
 
     Invariants
     ----------
@@ -109,13 +117,20 @@ class Stage2ShiftTable:
     * ``shifts_samples[c] >= 0`` for every ``c`` (chgroup ``g`` sees the
       burst first; the alignment direction is always a delay, never an
       advance, when shifting toward ``ν_bot_proc``).
-    * For ``chgroup == N_CHGROUP - 1`` (band-bottom chgroup) every entry
-      is identically zero (``ν_bot_g == ν_bot_proc`` by construction).
+    * ``shifts_samples`` is monotonically non-decreasing in ``DM`` (delay
+      scales with DM at fixed reference frequency).
+    * For ``chgroup == N_CHGROUP - 1``, ``ν_chgroup_TOP[15] = 1.323 GHz``
+      is ABOVE ``ν_bot_proc = 1.311 GHz`` (by ~12 MHz, the within-chgroup
+      span), so chgroup-15 carries a real (small, DM-dependent) delay
+      that is NOT identically zero. The plan §3.2 line 577 / §3.6.2
+      ``time_shift_corr_stage2[15, c] == 0`` invariant only held under
+      the pre-2026-06-03 BOT-referenced convention which has been
+      retired (see :func:`compute_stage2_shifts` docstring).
     """
 
     chgroup: int
     coarse_dm_pc_cm3: np.ndarray
-    nu_chgroup_bot_GHz: float
+    nu_chgroup_ref_GHz: float
     nu_bot_proc_GHz: float
     t_int_corr_us: float
     shifts_samples: np.ndarray
@@ -141,14 +156,6 @@ class Stage2ShiftTable:
                 "stage-2 shifts must all be >= 0 (delays toward "
                 f"ν_bot_proc); got min={int(self.shifts_samples.min())}"
             )
-        if self.chgroup == N_CHGROUP - 1:
-            if not np.all(self.shifts_samples == 0):
-                bad = self.shifts_samples[self.shifts_samples != 0]
-                raise ValueError(
-                    f"chgroup={self.chgroup} is the band-bottom; all "
-                    f"stage-2 shifts must be zero. Found {bad.size} "
-                    f"non-zero entries (first: {int(bad[0])})."
-                )
 
     @property
     def n_coarse(self) -> int:
@@ -165,40 +172,73 @@ def compute_stage2_shifts(
     chgroup: int,
     coarse_dm_pc_cm3: np.ndarray,
     t_int_corr_us: float = T_INT_CORR_US_DEFAULT,
-    nu_chgroup_bot_GHz: Optional[Sequence[float]] = None,
+    nu_chgroup_top_GHz: Optional[Sequence[float]] = None,
+    nu_chgroup_bot_GHz: Optional[Sequence[float]] = None,  # noqa: ARG001  (retained for back-compat callers)
     nu_bot_proc_GHz: Optional[float] = None,
 ) -> Stage2ShiftTable:
     """Build the per-coarse-DM stage-2 delay table for a single chgroup.
 
-    Math (plan §3.6.2):
+    Math (plan §3.6.2, Convention-A reference fix 2026-06-03):
 
         Δt_samples_corr_stage2[g, c] = rint(
-            Δτ_us(ν_bot_proc, ν_chgroup_bot[g], coarse_dm[c]) / t_int_corr_us
+            Δτ_us(ν_bot_proc, ν_chgroup_TOP[g], coarse_dm[c]) / t_int_corr_us
         )
 
+    Reference-frequency convention
+    ==============================
+
+    The corr-side coarse-DM stage-1 dedisperser
+    (:func:`dsart.coarse_dm.dm_plan.compute_delay_native_samples_table`)
+    ALIGNS each chgroup's 384 channels to that chgroup's TOP channel
+    (Convention A — ``delay_native_samples(g, ch=0, dm) == 0``). So
+    the stream emerging from stage-1 for chgroup ``g`` represents the
+    astrophysical signal as it arrived at ``ν_chgroup_TOP[g]``.
+
+    Stage-2 must therefore delay each chgroup by the dispersion span
+    from ``ν_chgroup_TOP[g]`` down to ``ν_bot_proc`` so that the
+    emerging stream is aligned to ``ν_bot_proc`` for the search side.
+
+    Prior to 2026-06-03 this module used ``ν_chgroup_BOT[g]`` as the
+    reference, which mismatched stage-1's TOP convention by the
+    within-chgroup dispersion span (~12 MHz / chgroup). When composed
+    with the search-side stage-3 differential, that produced a
+    constant -2.45% bias in detected-vs-injected DM. The bias was
+    isolated and patched in :func:`compute_time_shift_search`'s
+    escape-hatch (``include_coarse_offset=True``) on 2026-05-29; this
+    module mirrors that fix so the corr-side Option A wire-in
+    (search-side ``include_coarse_offset=False``) composes correctly
+    end-to-end.
+
+    The same TOP reference is used by
+    :func:`dsart.fine_dm.combiner.compute_time_shift_search` (both
+    ``include_coarse_offset`` paths, as of 2026-06-03), so the
+    cross-stage cancellation is bit-for-bit (modulo ±0.5-sample
+    rint() noise) for any (chgroup, coarse_dm, fine_dm) triple.
+
     Rounding rule: ``numpy.rint`` (half-to-even) to match
-    :func:`dsart.fine_dm.combiner.compute_time_shift_search`. This pins
-    the search-side stage-3 differentials to the same rounding lattice
-    as the corr-side stage-2 delays, so the cross-stage residual stays
-    bounded by ±0.5 sample regardless of DM.
+    :func:`compute_time_shift_search`.
 
     Parameters
     ----------
     chgroup : int
         Local chgroup index for the corr node calling this. ``0..15``;
-        chgroup-0 is the top of the band, chgroup-15 the bottom
-        (= ``ν_bot_proc`` by construction).
+        chgroup-0 is the top of the band, chgroup-15 the bottom.
     coarse_dm_pc_cm3 : np.ndarray
         ``(N_coarse,)`` coarse-DM trial values (pc / cm³).
     t_int_corr_us : float, optional
         Corr-side fast-vis sample period in µs. Default 262.144 µs
         (the M7.4 production cadence).
+    nu_chgroup_top_GHz : sequence of float, optional
+        Per-chgroup TOP channel frequencies (16-tuple). Default uses
+        :data:`dsart.common.constants.NU_CHGROUP_TOP_GHZ`.
     nu_chgroup_bot_GHz : sequence of float, optional
-        Per-chgroup band-bottom frequencies (16-tuple). Default uses
-        :data:`dsart.common.constants.NU_CHGROUP_BOT_GHZ`.
+        Deprecated — accepted for backward-compat with the
+        pre-2026-06-03 BOT-referenced signature, but IGNORED. Stage-2
+        now references chgroup TOP per the Convention-A fix above.
     nu_bot_proc_GHz : float, optional
         Processed-band bottom frequency. Default is
-        ``nu_chgroup_bot_GHz[N_CHGROUP - 1]`` (chgroup-15's band-bottom).
+        :data:`dsart.common.constants.NU_CHGROUP_BOT_GHZ[N_CHGROUP - 1]`
+        which equals ``NU_BOT_PROC_GHZ`` by construction.
 
     Returns
     -------
@@ -230,36 +270,38 @@ def compute_stage2_shifts(
             f"t_int_corr_us={t_int_corr_us} must be > 0"
         )
 
-    chgroup_bot = np.asarray(
-        nu_chgroup_bot_GHz
-        if nu_chgroup_bot_GHz is not None
-        else NU_CHGROUP_BOT_GHZ,
+    chgroup_top = np.asarray(
+        nu_chgroup_top_GHz
+        if nu_chgroup_top_GHz is not None
+        else NU_CHGROUP_TOP_GHZ,
         dtype=np.float64,
     )
-    if chgroup_bot.shape != (N_CHGROUP,):
+    if chgroup_top.shape != (N_CHGROUP,):
         raise ValueError(
-            f"nu_chgroup_bot_GHz must be a {N_CHGROUP}-tuple; got "
-            f"shape {chgroup_bot.shape}"
+            f"nu_chgroup_top_GHz must be a {N_CHGROUP}-tuple; got "
+            f"shape {chgroup_top.shape}"
         )
 
     nu_bot_proc = (
         float(nu_bot_proc_GHz)
         if nu_bot_proc_GHz is not None
-        else float(chgroup_bot[N_CHGROUP - 1])
+        else float(NU_CHGROUP_BOT_GHZ[N_CHGROUP - 1])
     )
-    nu_g = float(chgroup_bot[chgroup])
+    nu_g = float(chgroup_top[chgroup])
 
     n_coarse = int(coarse_dm_pc_cm3.shape[0])
     shifts = np.zeros(n_coarse, dtype=np.int32)
     for c in range(n_coarse):
         # delta_tau_us(nu_low, nu_high, dm): positive when nu_high > nu_low.
-        # We want: how much does ν_bot_g lead ν_bot_proc for a given DM?
-        # Since nu_g >= nu_bot_proc (chgroup-0 ≥ chgroup-15), the higher-
-        # frequency chgroup sees the signal FIRST and must DELAY by the
-        # interval Δτ(ν_bot_proc, ν_g, DM) ≥ 0 to align with chgroup-15.
+        # Stage-1 (Convention A) leaves chgroup g's stream referenced to
+        # ν_chgroup_TOP[g]. Since chgroup_TOP[g] >= ν_bot_proc (with
+        # equality only when chgroup-15's TOP coincides with ν_bot_proc,
+        # which it does not — there's a ~12 MHz within-chgroup span at
+        # chgroup-15), the higher-frequency reference sees the signal
+        # FIRST and must DELAY by Δτ(ν_bot_proc, ν_TOP_g, DM) ≥ 0 to
+        # align with the band bottom.
         d_us = delta_tau_us(nu_bot_proc, nu_g, float(coarse_dm_pc_cm3[c]))
         if d_us < 0:
-            # Sanity: should not happen given nu_g >= nu_bot_proc and DM >= 0.
             raise ValueError(
                 f"compute_stage2_shifts: negative Δτ={d_us:.6g} µs at "
                 f"chgroup={chgroup} coarse_dm={float(coarse_dm_pc_cm3[c])} "
@@ -268,17 +310,10 @@ def compute_stage2_shifts(
             )
         shifts[c] = int(np.rint(d_us / t_int_corr_us))
 
-    # Force chgroup-15 row to zero (paranoia: floating-point noise in
-    # delta_tau at the construction frequency could yield ±1-sample
-    # noise away from zero on some platforms; matches the same
-    # treatment in compute_time_shift_search).
-    if chgroup == N_CHGROUP - 1:
-        shifts[:] = 0
-
     return Stage2ShiftTable(
         chgroup=int(chgroup),
         coarse_dm_pc_cm3=np.ascontiguousarray(coarse_dm_pc_cm3, dtype=np.float64),
-        nu_chgroup_bot_GHz=nu_g,
+        nu_chgroup_ref_GHz=nu_g,
         nu_bot_proc_GHz=nu_bot_proc,
         t_int_corr_us=float(t_int_corr_us),
         shifts_samples=shifts,
@@ -289,7 +324,7 @@ def compute_stage2_shifts_all_chgroups(
     *,
     coarse_dm_pc_cm3: np.ndarray,
     t_int_corr_us: float = T_INT_CORR_US_DEFAULT,
-    nu_chgroup_bot_GHz: Optional[Sequence[float]] = None,
+    nu_chgroup_top_GHz: Optional[Sequence[float]] = None,
     nu_bot_proc_GHz: Optional[float] = None,
 ) -> Tuple[Stage2ShiftTable, ...]:
     """Convenience: compute :func:`compute_stage2_shifts` for all 16 chgroups.
@@ -303,7 +338,7 @@ def compute_stage2_shifts_all_chgroups(
             chgroup=g,
             coarse_dm_pc_cm3=coarse_dm_pc_cm3,
             t_int_corr_us=t_int_corr_us,
-            nu_chgroup_bot_GHz=nu_chgroup_bot_GHz,
+            nu_chgroup_top_GHz=nu_chgroup_top_GHz,
             nu_bot_proc_GHz=nu_bot_proc_GHz,
         )
         for g in range(N_CHGROUP)

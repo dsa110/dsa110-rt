@@ -148,6 +148,35 @@ _PKILL_DSART_CMD = (
     "echo PKILL_OK"
 )
 
+#: Start-time housekeeping: the "safe to delete on restart" cleanup,
+#: fanned out to corr + search nodes when the operator issues ``start``.
+#: CRITICAL: on a *start* the node processes are coming UP and own the
+#: PSRDADA rings + ``/dev/shm`` segments, so these commands NEVER touch
+#: shm / dada (that is the ``stop`` / restart-all path's job). They only
+#: remove accumulated ephemera that no running process holds an fd on:
+#: stale orchestrator/routine logs, ready sentinels, and (corr) debug
+#: block dumps. h23 (the candidate/CSV archive) is never in the fanout.
+_START_CLEANUP_CORR_CMD = (
+    "rm -f $HOME/tmp/dsart-rt/*.log 2>/dev/null; "
+    "rm -f /tmp/dsart-corr-*.ready 2>/dev/null; "
+    "rm -rf /home/ubuntu/tmp/dsart-fast-grid 2>/dev/null; "
+    "echo CLEAN_OK"
+)
+
+#: Search-node variant. In addition to the stale logs it clears the
+#: LOCAL cube-dump tree: every triggered NPZ under ``c1.dump_root``
+#: (default ``/home/ubuntu/data/c2/cube_dump``) is rsynced to h23 by
+#: ``cube_uploader`` but never deleted locally, so it accumulates
+#: unbounded. h23 holds the archived copy under
+#: ``/dataz/dsa110/candidates/<event>/cubes/`` — the local copy is
+#: redundant once a run starts. Also drops the per-event ``upload.log``.
+_START_CLEANUP_SEARCH_CMD = (
+    "rm -f $HOME/tmp/dsart-rt/*.log 2>/dev/null; "
+    "rm -f /home/ubuntu/data/c2/cube_dump/*/upload.log 2>/dev/null; "
+    "rm -rf /home/ubuntu/data/c2/cube_dump/* 2>/dev/null; "
+    "echo CLEAN_OK"
+)
+
 
 # ---------------------------------------------------------------------------
 # Thin subprocess helpers — every caller goes through these so the
@@ -539,6 +568,50 @@ def _fanout(
                     "elapsed_s": 0.0,
                 }
     return out
+
+
+def cleanup_nodes_for_start(
+    *,
+    timeout: float = DEFAULT_SSH_TIMEOUT_S,
+    max_workers: int = DEFAULT_FANOUT_WORKERS,
+) -> dict[str, Any]:
+    """Start-time housekeeping fanned out to every corr + search host.
+
+    Deletes the "safe to delete on restart" ephemera identified in the
+    2026-06-02 disk-write audit:
+
+      corr   : ``~/tmp/dsart-rt/*.log`` (stale routine/orchestrator
+               logs), ``/tmp/dsart-corr-*.ready`` sentinels,
+               ``/home/ubuntu/tmp/dsart-fast-grid`` (debug block dumps).
+      search : ``~/tmp/dsart-rt/*.log`` + the local
+               ``/home/ubuntu/data/c2/cube_dump`` tree (NPZs already
+               rsynced to h23) and its ``upload.log`` files.
+
+    NEVER touches **h23** (the candidate / rolling-CSV archive) or
+    **h20** (read-only grafana/influx — :func:`_fanout` filters it),
+    and NEVER removes ``/dev/shm`` rings or PSRDADA buffers (on a
+    *start* the node processes own those). Best-effort: per-host
+    failures are reported in ``per_host`` but never raise. Returns a
+    JSON-ready summary.
+    """
+    corr_res = _fanout(
+        CORR_HOSTS, _START_CLEANUP_CORR_CMD,
+        timeout=timeout, max_workers=max_workers, label="start_cleanup_corr",
+    )
+    search_res = _fanout(
+        SEARCH_HOSTS, _START_CLEANUP_SEARCH_CMD,
+        timeout=timeout, max_workers=max_workers, label="start_cleanup_search",
+    )
+    per_host = {**corr_res, **search_res}
+    n_ok = sum(1 for v in per_host.values() if v.get("ok"))
+    n_failed = len(per_host) - n_ok
+    return {
+        "ok": n_failed == 0,
+        "n_hosts": len(per_host),
+        "n_ok": n_ok,
+        "n_failed": n_failed,
+        "per_host": per_host,
+    }
 
 
 def _orch_relaunch_cmd(instance: str, cn_id: int) -> str:

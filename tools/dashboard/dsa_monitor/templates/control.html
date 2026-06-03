@@ -9,6 +9,28 @@
         background: #1b2630; border: 1px solid #33485a; border-radius: 10px;
         padding: 18px 20px; color: #e8edf1;
         box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+        scroll-margin-top: 16px;   /* anchor jumps clear the page top */
+    }
+
+    /* ---- Table of contents (top nav) ---- */
+    .toc {
+        background: #16202a; border: 1px solid #33485a; border-radius: 10px;
+        padding: 12px 18px; margin: 4px 0 18px; color: #cfd8e0;
+    }
+    .toc h3 {
+        margin: 0 0 8px; color: #aebcc7; font-size: 11px;
+        text-transform: uppercase; letter-spacing: .06em;
+    }
+    .toc ul {
+        list-style: none; margin: 0; padding: 0;
+        display: flex; flex-wrap: wrap; gap: 6px 18px;
+    }
+    .toc li { margin: 0; }
+    .toc a { color: #5fb0ef; text-decoration: none; font-size: 13px; font-weight: 600; }
+    .toc a:hover { color: #8fc8f5; text-decoration: underline; }
+    .verb-subhead {
+        color: #aebcc7; font-size: 11px; text-transform: uppercase;
+        letter-spacing: .05em; margin: 4px 0 8px; font-weight: 700;
     }
     .panel h3 {
         margin-top: 0; color: #ffffff; font-size: 13px;
@@ -92,6 +114,22 @@
 {% block content %}
 <h2>Fleet Control</h2>
 
+<!-- Table of contents: quick-jump to every panel on this tab. -->
+<nav class="toc">
+    <h3>Jump to</h3>
+    <ul>
+        <li><a href="#panel-verbs">Verbs (start / arm / stop / restart / update)</a></li>
+        <li><a href="#panel-c2-quickops">C2 recovery &amp; activity</a></li>
+        <li><a href="#panel-services">Fleet services</a></li>
+        <li><a href="#panel-inject">Signal injection</a></li>
+        <li><a href="#panel-calibrate">Injection SNR calibration</a></li>
+        <li><a href="#panel-dump-now">Dump now</a></li>
+        <li><a href="#panel-dumps-enabled">Dumps enabled (kill-switch)</a></li>
+        <li><a href="#panel-delete-snr-cal">Delete fluence/SNR calibration</a></li>
+        <li><a href="#panel-audit">Recent actions</a></li>
+    </ul>
+</nav>
+
 <!-- System state banner: one rolled-up lifecycle state for the fleet.
      The crucial cue is PREPARING (warming — do NOT arm) vs PREPARED
      (warmed — safe to utc_start). Polls /control/system_state. -->
@@ -108,7 +146,7 @@
 <div>
 
     <!-- Verb buttons -->
-    <div class="panel">
+    <div class="panel" id="panel-verbs">
         <h3>Verbs</h3>
 
         <!-- start -->
@@ -120,10 +158,17 @@
                 <button type="submit">Start fleet</button>
             </div>
             <div class="muted">
-                Broadcasts <code>start</code> to <code>/cmd/corr_rt/0</code>
-                + per-cn fanout to <code>/cmd/search_rt/{1,2,9,13}</code>.
-                Leave dec blank to use <code>/mon/array/dec</code> (M7.4
-                CUSTOMDEC fallback).
+                First runs <strong>node housekeeping</strong> — ssh-fanout
+                deletes the "safe to delete on restart" ephemera on every
+                corr + search node (stale <code>~/tmp/dsart-rt/*.log</code>,
+                <code>.ready</code> sentinels, corr debug block dumps, and
+                the local <code>cube_dump</code> tree already rsynced to
+                h23). <strong>h23 is never touched</strong>; <code>/dev/shm</code>
+                rings + PSRDADA buffers are left alone (the starting
+                processes own them). Then broadcasts <code>start</code> to
+                <code>/cmd/corr_rt/0</code> + per-cn fanout to
+                <code>/cmd/search_rt/{1,2,9,13}</code>. Leave dec blank to
+                use <code>/mon/array/dec</code> (M7.4 CUSTOMDEC fallback).
             </div>
             <div id="resp-start" class="response"></div>
         </form>
@@ -183,63 +228,97 @@
             </div>
             <div id="resp-stop" class="response"></div>
         </form>
+
+        <hr style="border-color:#34495e;margin:16px 0;">
+
+        <!-- fleet restart (cold recovery from stop) — merged in -->
+        <div class="verb-subhead">Fleet restart (cold recovery from stop)</div>
+        <form id="form-restart-all" onsubmit="return submitRestartAll(event);">
+            <div class="verb-row">
+                <label for="restart_confirm">type "restart_all"</label>
+                <input type="text" id="restart_confirm" name="confirm"
+                       placeholder="restart_all" autocomplete="off" />
+                <label for="restart_dry_run" style="min-width:auto;margin-left:16px;">
+                    <input type="checkbox" id="restart_dry_run" name="dry_run" value="true" />
+                    dry run
+                </label>
+                <button type="submit" class="danger">
+                    Restart everything (except lxd110h20)
+                </button>
+            </div>
+            <div class="muted">
+                Runs the full "broadcast stop → pkill dsart → wipe PSRDADA +
+                shm → restart local systemd units → restart hiplot in LXC →
+                re-spawn dsart_rt → defer self-restart of dsa_monitor"
+                sequence. <strong>Excludes <code>lxd110h20</code></strong>
+                (grafana / influxdb / telegraf are never touched). After it
+                completes, press <em>Start fleet</em> + <em>Arm now</em>
+                above — this button only puts <code>dsart_rt</code> back on
+                the etcd watch line. The dashboard process is killed by the
+                deferred self-restart ~2 s after step 6; reload the page
+                after that.
+            </div>
+            <div id="resp-restart-all" class="response"></div>
+        </form>
+
+        <hr style="border-color:#34495e;margin:16px 0;">
+
+        <!-- update dsa110-rt on corr + search nodes — merged in -->
+        <div class="verb-subhead">Update dsa110-rt on corr + search nodes</div>
+        <form id="form-update-dsart">
+            <div class="verb-row">
+                <label for="update_branch">branch</label>
+                <input type="text" id="update_branch" name="branch"
+                       placeholder="(blank → per-host current branch)"
+                       autocomplete="off" />
+                <label for="update_force" style="min-width:auto;margin-left:16px;">
+                    <input type="checkbox" id="update_force" name="force" value="true" />
+                    force (git reset --hard, discards local edits)
+                </label>
+            </div>
+            <div class="verb-row">
+                <label for="update_confirm">type "update_dsart"</label>
+                <input type="text" id="update_confirm" name="confirm"
+                       placeholder="update_dsart" autocomplete="off" />
+                <button type="button"
+                        onclick="submitUpdateDsart(event, true);">
+                    Dry run (preview)
+                </button>
+                <button type="button" class="danger"
+                        onclick="submitUpdateDsart(event, false);">
+                    Apply update
+                </button>
+            </div>
+            <div class="muted">
+                Fetches origin and fast-forwards each corr / search node's
+                <code>/home/ubuntu/proj/dsa110-rt</code> checkout to match
+                <code>h23</code>. <strong>Dirty worktrees abort that
+                host</strong>; tick <em>force</em> to override the abort AND
+                use <code>git reset --hard origin/&lt;branch&gt;</code>
+                (discards local edits on the node). Apply requires the
+                literal text <code>update_dsart</code> in the confirm box;
+                dry run does not.
+            </div>
+            <div id="resp-update-dsart" class="response"></div>
+        </form>
     </div>
 </div>
 
-<!-- M7.4 Phase 8 v3: C2 / search quick recovery -->
+<!-- M7.4 Phase 8 v3: C2 recovery & activity -->
 <div class="panel" style="margin-top: 24px;" id="panel-c2-quickops">
-    <h3>C2 / search quick recovery</h3>
+    <h3>C2 recovery &amp; activity</h3>
     <p class="muted">
-        Two recurring "things are stuck" repairs: <strong>bounce search</strong>
-        cycles <code>stop</code> + sleep + <code>start</code> on selected
-        search cn_ids and is the canonical fix for the <em>c1_emit queue
-        full, total_dropped climbs without a reconnect</em> wedge.
         <strong>Restart C2</strong> is a local
         <code>systemctl --user restart dsart_c2.service</code> on h23 for
-        when the coincidencer itself is unresponsive. Both are audited
-        to <code>/mon/audit/control/&lt;iso_ts&gt;</code>.
+        when the coincidencer itself is unresponsive (audited to
+        <code>/mon/audit/control/&lt;iso_ts&gt;</code>). Below it, live
+        counters + the recent-candidate list + the C2 decision log show
+        what the coincidencer is doing right now. Auto-refreshes.
     </p>
 
     <!-- live counters mini-block -->
     <div class="info-blob" id="c2-counters-blob"
          style="margin-bottom: 12px;">loading C2 counters…</div>
-
-    <!-- bounce search -->
-    <form id="form-bounce" onsubmit="return submitBounceSearch(event);">
-        <div class="verb-row">
-            <label>bounce sids</label>
-            {% for cn in search_cn_ids %}
-            <label style="min-width:auto;margin-right:8px;">
-                <input type="checkbox" name="cn_id_{{ cn }}" value="{{ cn }}"
-                       {% if cn == 1 %}checked{% endif %} />
-                <code>{{ cn }}</code>
-            </label>
-            {% endfor %}
-            <label for="bounce_sleep_s" style="min-width:auto;margin-left:16px;">
-                sleep (s)
-            </label>
-            <input type="number" id="bounce_sleep_s" name="sleep_s"
-                   value="{{ default_bounce_sleep_s }}" step="0.5"
-                   min="0" max="30" style="width: 70px;" />
-        </div>
-        <div class="verb-row">
-            <label for="bounce_confirm">type "bounce_search"</label>
-            <input type="text" id="bounce_confirm" name="confirm"
-                   placeholder="bounce_search" autocomplete="off" />
-            <button type="submit" class="danger">Bounce selected search</button>
-        </div>
-        <div class="muted">
-            Sends <code>stop</code> to <code>/cmd/search_rt/&lt;cn&gt;</code>
-            for each ticked sid, waits <em>sleep</em> seconds, then sends
-            <code>start</code> with <code>val=null</code> (the search
-            orchestrator resolves declination from <code>/mon/array/dec</code>).
-            Default ticks <code>n01</code> because that's the typical
-            wedge target. Type <code>bounce_search</code> to confirm.
-        </div>
-        <div id="resp-bounce" class="response"></div>
-    </form>
-
-    <hr style="border-color:#34495e;margin:16px 0;">
 
     <!-- restart c2 -->
     <form id="form-restart-c2" onsubmit="return submitRestartC2(event);">
@@ -260,11 +339,10 @@
         </div>
         <div id="resp-restart-c2" class="response"></div>
     </form>
-</div>
 
-<!-- M7.4 Phase 8 v3: Recent C2 activity -->
-<div class="panel" style="margin-top: 24px;" id="panel-recent-c2">
-    <h3>Recent C2 activity</h3>
+    <hr style="border-color:#34495e;margin:16px 0;">
+
+    <h4 style="margin-top: 8px;">Recent C2 activity</h4>
     <p class="muted">
         <strong>Recent candidates</strong> lists the last few event dirs
         under <code>/dataz/dsa110/candidates/</code> (only FIRE /
@@ -329,46 +407,8 @@
     </table>
 </div>
 
-<!-- M7.4 Phase 8 v2: fleet restart panel -->
-<div class="panel" style="margin-top: 24px;" id="panel-restart-all">
-    <h3>Fleet restart (cold recovery from stop)</h3>
-    <p class="muted">
-        Runs the full "broadcast stop → pkill dsart → wipe PSRDADA +
-        shm → restart local systemd units → restart hiplot in LXC →
-        re-spawn dsart_rt → defer self-restart of dsa_monitor" sequence.
-        <strong>Excludes <code>lxd110h20</code> entirely</strong>
-        (grafana / influxdb / telegraf are never touched). The
-        operator must press <em>start</em> + <em>utc_start</em> from
-        the verb panel above once the orchestrators are back online —
-        this button only puts <code>dsart_rt</code> back on the etcd
-        watch line.
-    </p>
-    <form id="form-restart-all" onsubmit="return submitRestartAll(event);">
-        <div class="verb-row">
-            <label for="restart_confirm">type "restart_all"</label>
-            <input type="text" id="restart_confirm" name="confirm"
-                   placeholder="restart_all" autocomplete="off" />
-            <label for="restart_dry_run" style="min-width:auto;margin-left:16px;">
-                <input type="checkbox" id="restart_dry_run" name="dry_run" value="true" />
-                dry run
-            </label>
-            <button type="submit" class="danger">
-                Restart everything (except lxd110h20)
-            </button>
-        </div>
-        <div class="muted">
-            Audited to <code>/mon/audit/control/&lt;iso_ts&gt;</code> as
-            <code>cmd=restart_all</code> with per-host pass/fail.
-            The dashboard process will be killed by the deferred
-            self-restart ~2 s after step 6 completes; the page will
-            need a manual reload after that.
-        </div>
-        <div id="resp-restart-all" class="response"></div>
-    </form>
-</div>
-
 <!-- M7.4 Phase 6: signal injection panel -->
-<div class="panel" style="margin-top: 24px;">
+<div class="panel" style="margin-top: 24px;" id="panel-inject">
     <h3>Signal injection (M7.4 Phase 6)</h3>
     <p class="muted">
         Pushes <code>{cmd:&nbsp;"inject", val:&nbsp;&lt;config&gt;}</code>
@@ -482,7 +522,7 @@
 </div>
 
 <!-- M7.4 Phase 6c.A: bootstrap SNR calibration -->
-<div class="panel" style="margin-top: 24px;">
+<div class="panel" style="margin-top: 24px;" id="panel-calibrate">
     <h3>Injection SNR calibration (M7.4 Phase 6c.A)</h3>
     <p class="muted">
         Fires one known-fluence probe at the chosen <code>(DM,
@@ -710,62 +750,6 @@ async function refreshCalibrations() {
     </table>
 </div>
 
-<!-- M7.4 Phase 6c+: update dsa110-rt on every corr + search node -->
-<div class="panel" style="margin-top: 24px;" id="panel-update-dsart">
-    <h3>Update dsa110-rt on corr + search nodes</h3>
-    <p class="muted">
-        Fetches origin and fast-forwards each corr / search node's
-        <code>/home/ubuntu/proj/dsa110-rt</code> checkout to match
-        <code>h23</code>. Use this between sessions to keep the
-        deployed code in sync with the workspace.
-        <br>
-        <strong>Dirty worktrees abort that host</strong> (the
-        deploy-skew safety from Bug 0 of M7.4_PHASE6_E2E_REPORT.md).
-        Tick <em>force</em> to override the abort AND use
-        <code>git reset --hard origin/&lt;branch&gt;</code> instead
-        of <code>git pull --ff-only</code> — this will discard any
-        local edits on the node.
-    </p>
-    <form id="form-update-dsart">
-        <div class="verb-row">
-            <label for="update_branch">branch</label>
-            <input type="text" id="update_branch" name="branch"
-                   placeholder="(blank → per-host current branch)"
-                   autocomplete="off" />
-        </div>
-        <div class="verb-row">
-            <label for="update_force" style="min-width:auto;">
-                <input type="checkbox" id="update_force" name="force" value="true" />
-                force (git reset --hard, discards local edits)
-            </label>
-        </div>
-        <div class="verb-row">
-            <label for="update_confirm">type "update_dsart"</label>
-            <input type="text" id="update_confirm" name="confirm"
-                   placeholder="update_dsart" autocomplete="off" />
-        </div>
-        <div class="verb-row">
-            <button type="button"
-                    onclick="submitUpdateDsart(event, true);">
-                Dry run (preview)
-            </button>
-            <button type="button" class="danger"
-                    onclick="submitUpdateDsart(event, false);">
-                Apply update
-            </button>
-        </div>
-        <div class="muted">
-            Audited to
-            <code>/mon/audit/control/&lt;iso_ts&gt;</code> as
-            <code>cmd=update_dsart</code> with per-host pass / fail.
-            Apply requires the literal text
-            <code>update_dsart</code> in the confirm box; dry run
-            does not (it never pulls / resets).
-        </div>
-        <div id="resp-update-dsart" class="response"></div>
-    </form>
-</div>
-
 <!-- Delete the injection fluence/SNR (K) calibration table -->
 <div class="panel" style="margin-top: 24px;" id="panel-delete-snr-cal">
     <h3>Delete fluence/SNR calibration (re-cal fluence↔SNR)</h3>
@@ -890,7 +874,7 @@ async function submitDeleteSnrCal(ev, dryRun) {
 </script>
 
 <!-- BOTTOM: audit log -->
-<div class="panel" style="margin-top: 24px;">
+<div class="panel" style="margin-top: 24px;" id="panel-audit">
     <h3>Recent actions ({{ recent_audit|length }})</h3>
     {% if recent_audit %}
     <table class="audit-table">
@@ -1364,48 +1348,7 @@ async function submitUpdateDsart(ev, dryRun) {
     return false;
 }
 
-// ---- M7.4 Phase 8 v3: C2 / search quick recovery -----------------------
-async function submitBounceSearch(ev) {
-    ev.preventDefault();
-    const form = ev.target;
-    const respEl = document.getElementById("resp-bounce");
-    const btn = form.querySelector("button[type=submit]");
-    btn.disabled = true;
-    respEl.innerHTML = "<span class='muted'>bouncing search…</span>";
-    // Collect ticked sids into a single csv field.
-    const sids = [];
-    form.querySelectorAll("input[type=checkbox]:checked").forEach(function (cb) {
-        if (cb.value) sids.push(cb.value);
-    });
-    if (sids.length === 0) {
-        respEl.innerHTML = "<span class='err'>no sids selected</span>";
-        btn.disabled = false;
-        return false;
-    }
-    const fd = new FormData(form);
-    fd.set("cn_ids", sids.join(","));
-    let r, j;
-    try {
-        r = await fetch("/control/bounce_search", {method: "POST", body: fd});
-        j = await r.json();
-    } catch (e) {
-        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
-        btn.disabled = false;
-        return false;
-    }
-    const cls = j.ok ? "ok" : "err";
-    respEl.innerHTML =
-        "<span class='" + cls + "'>" + (j.ok ? "OK" : "FAIL") + "</span>" +
-        "<div class='info-blob'>" +
-        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
-    btn.disabled = false;
-    // After a bounce, refresh the counters mini-panel + recent activity
-    // so the operator sees rows_in start ticking back up.
-    setTimeout(refreshC2Counters, 1500);
-    setTimeout(refreshC2Journal, 2500);
-    return false;
-}
-
+// ---- M7.4 Phase 8 v3: C2 recovery & activity ---------------------------
 async function submitRestartC2(ev) {
     ev.preventDefault();
     const form = ev.target;

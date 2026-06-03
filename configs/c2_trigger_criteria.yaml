@@ -26,20 +26,6 @@
 #     bounding box, in radians; ~0 for a true point source.
 
 trigger_classes:
-  # TEMP DIAGNOSTIC (agent): dump + plot a bright dm150 injection burst so
-  # the C2 plotter renders 4-panel PNGs. Remove after.
-  - name: diag_inject_capture
-    description: "TEMP diagnostic dump+plot of the dm150 injection burst"
-    require:
-      snr_max_min: 20.0
-      n_events_min: 1
-      n_search_nodes_min: 1
-      dm_median_min_pc_cc: 135.0
-      dm_median_max_pc_cc: 175.0
-      lm_diag_max_rad: 1.0
-    action: dump_all_gpus
-    holdoff_s: 60.0
-
   - name: bright_frb_extragalactic
     description: >-
       Extragalactic FRB candidate: dm_median >= 0.75 * NE2001 max-LOS
@@ -57,7 +43,7 @@ trigger_classes:
       or HDBSCAN-style re-clustering on the cluster's row set).
     require:
       snr_max_min: 15.0
-      n_events_min: 3
+      n_events_min: 1
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 100.0
       dm_median_max_pc_cc: 2000.0

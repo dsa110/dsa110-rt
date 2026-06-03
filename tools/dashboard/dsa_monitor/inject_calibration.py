@@ -431,6 +431,10 @@ class ProbeResult:
     inject_response: Optional[Dict[str, Any]] = None
     active_key: Optional[str] = None
     calibration_key: Optional[str] = None
+    observed_l_rad: Optional[float] = None
+    observed_m_rad: Optional[float] = None
+    observed_width_samples: Optional[int] = None
+    match_lm_dist_rad: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -645,6 +649,12 @@ def fire_calibration_probe(
                             inject_response=dict(inject_response),
                             active_key=active_key,
                         )
+                    obs_l = float(best.get("observed_l_rad", 0.0))
+                    obs_m = float(best.get("observed_m_rad", 0.0))
+                    obs_w = int(best.get("observed_width_samples", 0))
+                    lm_dist = math.hypot(
+                        obs_l - float(l_rad), obs_m - float(m_rad),
+                    )
                     entry = CalibrationEntry(
                         bucket=bucket,
                         dm_pc_cm3_rounded=int(
@@ -709,6 +719,10 @@ def fire_calibration_probe(
                         inject_response=dict(inject_response),
                         active_key=active_key,
                         calibration_key=cal_key,
+                        observed_l_rad=obs_l,
+                        observed_m_rad=obs_m,
+                        observed_width_samples=obs_w,
+                        match_lm_dist_rad=lm_dist,
                     )
         if now >= deadline:
             return ProbeResult(

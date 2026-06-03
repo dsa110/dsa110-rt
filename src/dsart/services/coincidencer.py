@@ -595,6 +595,8 @@ class CoincidencerService:
         # fall back to the production constants in inject_match.
         _lm_tol_env = os.environ.get("DSART_INJECT_LM_TOL_RAD")
         _dm_tol_env = os.environ.get("DSART_INJECT_DM_TOL_FRAC")
+        _max_snr_env = os.environ.get("DSART_INJECT_MAX_OBSERVED_SNR")
+        _min_snr_env = os.environ.get("DSART_INJECT_MIN_OBSERVED_SNR")
         _matcher_kwargs: dict = {
             "store": self._mon_store,
             "refresh_s": INJECT_REGISTRY_REFRESH_S,
@@ -603,6 +605,10 @@ class CoincidencerService:
             _matcher_kwargs["lm_tol_rad"] = float(_lm_tol_env)
         if _dm_tol_env:
             _matcher_kwargs["dm_tol_frac"] = float(_dm_tol_env)
+        if _max_snr_env:
+            _matcher_kwargs["max_observed_snr"] = float(_max_snr_env)
+        if _min_snr_env:
+            _matcher_kwargs["min_observed_snr"] = float(_min_snr_env)
         self._inject_matcher: InjectionMatcher = (
             inject_matcher if inject_matcher is not None
             else InjectionMatcher(**_matcher_kwargs)
@@ -1003,7 +1009,11 @@ class CoincidencerService:
             member_inj_ids: Dict[int, str] = {}
             for m in members:
                 label = self._inject_matcher.matched_inj_id(
-                    dm_pc_cc=m.dm_pc_cc, l_rad=m.l_rad, m_rad=m.m_rad,
+                    dm_pc_cc=m.dm_pc_cc,
+                    l_rad=m.l_rad,
+                    m_rad=m.m_rad,
+                    width_samples=m.width_samples,
+                    snr=m.snr,
                 )
                 if label is not None:
                     member_inj_ids[id(m)] = label
