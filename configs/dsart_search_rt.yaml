@@ -202,7 +202,17 @@ routines:
       --log-level INFO
       --config-yaml /home/ubuntu/proj/dsa110-rt/configs/dsart_search_rt.yaml
       --enable-cube-dump
-      --cal-blob-path /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
+      # 2026-06-03: source-of-truth for cal is the per-node legacy
+      # x-engine blob written by the upstream cal pipeline (the user
+      # updates these on each corr node after every cal source pass).
+      # The search side only reads ANTPOS + the core-baseline mask
+      # from this blob (no cal coefficients applied), and the antpos
+      # block is identical across all nodes' antennas.out, so the
+      # gridder LUT / antpos_hash match the corr-side gridder exactly.
+      # Search nodes (n01/n02/n09/n13) get the file mirrored from a
+      # corr node by tools/ops/sync_antennas_out_to_search.sh, which
+      # should be invoked at the end of the user's cal-update script.
+      --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
       --chan-sum-factor 8
@@ -275,7 +285,10 @@ routines:
       --coarse-dm-owners-half-1 1
       --gpu-half 1 --search-node-id CN
       --device cuda:0 --image-backend gpu
-      --cal-blob-path /home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_sb00.dat
+      # 2026-06-03: see search_compute_0 above — both halves read
+      # antpos from the per-node antennas.out (mirrored from corr by
+      # tools/ops/sync_antennas_out_to_search.sh).
+      --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
       --chan-sum-factor 8
