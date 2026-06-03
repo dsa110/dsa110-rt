@@ -363,6 +363,18 @@ routines:
   # JIT in corr_fast + corr_slow on the same node crashes one of
   # them with "Triton Error [CUDA]: context is destroyed" — see
   # M7-1-REPORT.md for the bisect.
+  # Option A (2026-06-03): corr-side stage-2 inter-chgroup alignment
+  # FIFO is enabled via --stage2-mode per_coarse_dm below. Each chgroup
+  # applies a per-coarse-DM integer-sample delay
+  # (Δτ(ν_bot_proc, ν_chgroup_TOP[g], coarse_dm)) so the wire-frame data
+  # is already aligned to ν_bot_proc at the search receiver. Pairs with
+  # the search side dropping --include-coarse-offset-in-search-shifts
+  # (default include_coarse_offset=False; see dsart_search_rt.yaml).
+  # Per-chgroup FIFO depth ≤ 11 cubes worst case (chgroup-0 at DM=2500);
+  # steady-state per-cube cost ≈ 1 ms (<1% of 130 ms budget); per-node
+  # FIFO memory peaks at ~1.1 GiB on chgroup-0. NB: comments MUST live
+  # outside the args: >- folded scalar (`#` characters inside it become
+  # literal argv tokens that argparse rejects — see 2026-06-03 incident).
   - name: corr_fast
     cmd: python
     args: >-
@@ -391,16 +403,6 @@ routines:
       --transport-tx-base-port 6625
       --transport-tx-coarse-dm-mask 0xFF
       --transport-tx-worker-hosts 10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238
-      # Option A (2026-06-03): corr-side stage-2 inter-chgroup
-      # alignment FIFO. Each chgroup applies a per-coarse-DM integer-
-      # sample delay (Δτ(ν_bot_proc, ν_chgroup_TOP[g], coarse_dm)) so
-      # the wire-frame data is already aligned to ν_bot_proc at the
-      # search receiver. Pairs with the search side dropping
-      # --include-coarse-offset-in-search-shifts (default
-      # include_coarse_offset=False; see dsart_search_rt.yaml).
-      # Per-chgroup FIFO depth ≤ 11 cubes worst case (chgroup-0 at
-      # DM=2500); steady-state per-cube cost ≈ 1 ms (<1% of 130 ms
-      # budget); per-node FIFO memory peaks at ~1.1 GiB on chgroup-0.
       --stage2-mode per_coarse_dm
       --max-blocks 0
       --output-dir /home/ubuntu/tmp/dsart-fast-grid
