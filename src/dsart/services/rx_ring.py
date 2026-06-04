@@ -485,6 +485,7 @@ class SyntheticRxRingSource:
         t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
         pre_quantise: bool = False,
         prequantise_target_max: int = 120,
+        symmetric_shift_padding: bool = False,
     ) -> None:
         if n_cubes <= 0:
             raise ValueError(f"n_cubes={n_cubes}, expected > 0")
@@ -501,10 +502,32 @@ class SyntheticRxRingSource:
             fine_to_coarse=fine_to_coarse,
             t_int_search_us=t_int_search_us,
         )
-        # T_stream covers the cube + the worst-case shift, so the
-        # combiner can safely read [t - shift] for every (t, fdm) pair.
-        self._max_shift = int(self._time_shift_table.shifts.max(initial=0))
-        self._t_stream = self._t_det + self._max_shift
+        # M7.7 (2026-06-04): when symmetric_shift_padding is on, mimic
+        # the ProductionRxRingSource padded buffer geometry — widen the
+        # stream by ``pad_left = max(0, shifts.max())`` AND
+        # ``pad_right = max(0, -shifts.min())``, and stamp
+        # ``CubeRingSlot.stream_origin_offset_samples = pad_left``. This
+        # exercises the M7.7 CubePipeline code path (subtract-offset in
+        # _stage_h2d, fused-L1 re-enable, coverage-correction off) in
+        # the bench + correctness fixtures, where the bench would
+        # otherwise emit slots with stream_origin_offset_samples=0 and
+        # silently bypass M7.7. With shifts all-positive (the bench
+        # default DM grid), pad_right=0 and the geometry exactly
+        # matches the asymmetric path *except* for the post-offset
+        # shifts table read in _stage_h2d — which is the path under test.
+        self._symmetric_shift_padding = bool(symmetric_shift_padding)
+        shifts = self._time_shift_table.shifts
+        if self._symmetric_shift_padding:
+            self._pad_left = int(max(0, int(shifts.max(initial=0))))
+            self._pad_right = int(max(0, -int(shifts.min(initial=0))))
+            self._t_stream = self._t_det + self._pad_left + self._pad_right
+        else:
+            self._pad_left = 0
+            self._pad_right = 0
+            # T_stream covers the cube + the worst-case shift, so the
+            # combiner can safely read [t - shift] for every (t, fdm) pair.
+            self._t_stream = self._t_det + int(shifts.max(initial=0))
+        self._max_shift = int(shifts.max(initial=0))
         self._cubes_emitted = 0
         self._started = False
         self._stopped = False
@@ -557,7 +580,12 @@ class SyntheticRxRingSource:
                 continue
             if not (0 <= inj.m_pix < self._n_grid):
                 continue
-            streams[N_CHGROUP - 1][inj.t_in_cube, inj.l_pix, inj.m_pix] += np.complex64(
+            # M7.7: detector window starts at row `pad_left` in the
+            # padded stream, so an injection at cube-time `t_in_cube`
+            # lands at stream row `t_in_cube + pad_left`. In legacy mode
+            # `pad_left == 0` so this collapses to the prior behaviour.
+            stream_t = int(inj.t_in_cube) + int(self._pad_left)
+            streams[N_CHGROUP - 1][stream_t, inj.l_pix, inj.m_pix] += np.complex64(
                 inj.amplitude + 0.0j
             )
         return streams
@@ -617,6 +645,11 @@ class SyntheticRxRingSource:
                 t_det=self._t_det,
                 n_grid=self._n_grid,
                 per_chgroup_cint8_stack=cint8_stack,
+                # M7.7: stamp the pre-pad on every slot so the
+                # CubePipeline takes the symmetric-padding fast path
+                # (offset-subtracted shifts in _stage_h2d + fused-L1
+                # re-enabled). In legacy mode this is 0 and a no-op.
+                stream_origin_offset_samples=self._pad_left,
             )
             self._cubes_emitted += 1
             yield slot

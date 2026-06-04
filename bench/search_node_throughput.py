@@ -83,6 +83,9 @@ from dsart.services.cube_pipeline import (  # noqa: E402
 from dsart.services.rx_ring import (  # noqa: E402
     SyntheticRxRingSource,
 )
+from dsart.services.search_compute import (  # noqa: E402
+    _dm_grids_from_npz,
+)
 
 
 _LOG = logging.getLogger("bench.search_node_throughput")
@@ -224,7 +227,49 @@ async def _bench_main(args: argparse.Namespace) -> int:
         n_kernels_total,
     )
 
-    coarse_dm, fine_dm, fine_to_coarse = _build_dm_grids(n_fdm)
+    # M7.7 (2026-06-04): if --dm-plan-path is given, load the EXACT
+    # production v2 plan + optionally select one coarse-DM owner so the
+    # bench sees the same shifts table (±83 samples for Option A) as
+    # the live search_compute. Without this, the synthetic linear DM
+    # grid produces all-positive shifts ≤ ~30 samples, which understates
+    # the H2D cost and doesn't exercise pad_right > 0.
+    dm_plan_path: Optional[str] = getattr(args, "dm_plan_path", None)
+    coarse_dm_owner_idx = int(getattr(args, "coarse_dm_owner_idx", -1))
+    if dm_plan_path is not None and Path(dm_plan_path).exists():
+        coarse_dm, fine_dm, fine_to_coarse = _dm_grids_from_npz(
+            Path(dm_plan_path), n_coarse=8
+        )
+        if coarse_dm_owner_idx >= 0:
+            mask = fine_to_coarse == coarse_dm_owner_idx
+            if not mask.any():
+                raise SystemExit(
+                    f"--coarse-dm-owner-idx {coarse_dm_owner_idx} not in "
+                    f"fine_to_coarse range "
+                    f"{int(fine_to_coarse.min())}..{int(fine_to_coarse.max())}"
+                )
+            fine_dm = fine_dm[mask]
+            fine_to_coarse = fine_to_coarse[mask]
+            # Remap surviving fine_to_coarse to local 0-based index, and
+            # keep only the owner's coarse_dm row so shifts compute
+            # cleanly. Mirrors `_select_dm_owner_half`'s local convention.
+            coarse_dm = coarse_dm[coarse_dm_owner_idx : coarse_dm_owner_idx + 1]
+            fine_to_coarse = np.zeros_like(fine_to_coarse, dtype=np.int32)
+        n_fdm = int(fine_dm.shape[0])
+        _LOG.info(
+            "DM plan loaded from %s: n_coarse=%d n_fdm=%d "
+            "(coarse_dm_owner_idx=%d)",
+            dm_plan_path, len(coarse_dm), n_fdm, coarse_dm_owner_idx,
+        )
+    else:
+        if dm_plan_path is not None:
+            _LOG.warning(
+                "--dm-plan-path %s does not exist; falling back to "
+                "synthetic linear DM grid (shifts will NOT match "
+                "production Option A geometry).",
+                dm_plan_path,
+            )
+        coarse_dm, fine_dm, fine_to_coarse = _build_dm_grids(n_fdm)
+
     src = SyntheticRxRingSource(
         n_cubes=n_cubes,
         t_det=t_det,
@@ -235,8 +280,18 @@ async def _bench_main(args: argparse.Namespace) -> int:
         fine_to_coarse=fine_to_coarse,
         rng=np.random.default_rng(int(args.rng_seed)),
         cube_cadence_s=cube_cadence_s,
+        t_int_search_us=float(getattr(args, "t_int_search_us", 1048.576)),
         pre_quantise=bool(args.prequantise),
+        symmetric_shift_padding=bool(getattr(args, "symmetric_shift_padding", False)),
     )
+    if bool(getattr(args, "symmetric_shift_padding", False)):
+        _LOG.info(
+            "SyntheticRxRingSource: --symmetric-shift-padding on (M7.7: "
+            "pad_left=%d pad_right=%d T_stream=%d; slots stamped with "
+            "stream_origin_offset_samples=%d so CubePipeline takes the "
+            "M7.7 fused-L1 fast path).",
+            src._pad_left, src._pad_right, src._t_stream, src._pad_left,
+        )
     if args.prequantise:
         _LOG.info(
             "SyntheticRxRingSource: --prequantise on (M3 RX-ring "
@@ -708,6 +763,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "at 1 M brings ``torch.median`` per iter from ~25 ms to "
              "~1 ms with σ̂ standard error ≈ 7e-4 σ. Set ≤ 0 or omit to "
              "disable (chunk-1 behaviour: full slab). Default 1_000_000.",
+    )
+    parser.add_argument(
+        "--symmetric-shift-padding", action="store_true",
+        help="M7.7 (2026-06-04): emit slots with stream_origin_offset_"
+             "samples = max(0, shifts.max()) and a buffer pre-padded by "
+             "pad_left + pad_right rows. Exercises the CubePipeline "
+             "fused-L1 fast path that the production search nodes run "
+             "(coverage correction off, fused-L1 imager re-enabled). "
+             "Without this flag the bench silently bypasses M7.7 so any "
+             "perf regression in the post-M7.7 path goes unnoticed.",
+    )
+    parser.add_argument(
+        "--dm-plan-path", type=str, default=None,
+        help="Path to the production DmPlan NPZ "
+             "(e.g. /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz). "
+             "When set the bench loads the SAME coarse/fine DM grids as "
+             "production search_compute, so the shifts table covers the "
+             "Option A ±83 sample range and the synthetic stream geometry "
+             "matches live. Without this the bench uses a tight synthetic "
+             "linear DM grid (shifts ~30 samples, all-positive).",
+    )
+    parser.add_argument(
+        "--coarse-dm-owner-idx", type=int, default=-1,
+        help="When --dm-plan-path is set, restrict the bench to the K "
+             "fine-DM trials owned by this coarse-DM index — exactly the "
+             "per-half slice that production search_compute_{0,1} run "
+             "with (matches --coarse-dm-owners-half-{0,1}). -1 (default) "
+             "= use the full plan's first N_fdm rows (legacy bench path).",
+    )
+    parser.add_argument(
+        "--t-int-search-us", type=float, default=1048.576,
+        help="Search-sample cadence in microseconds. Default 1048.576 "
+             "matches production (--t-int-search-us 1048.576). Used by "
+             "the synthetic source to compute the time_shift_table.",
     )
     parser.add_argument(
         "--out", type=str,
