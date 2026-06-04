@@ -161,6 +161,26 @@ routines:
   # ``--pipeline-overlap`` so the GPU pipeline benchmark numbers
   # (~105 ms p50 at production geometry) are an apples-to-apples
   # match only when the prod service runs with it on too.
+  #
+  # M7.7 (2026-06-04) — symmetric-shift padding is ENABLED on both
+  # halves via ``--symmetric-shift-padding`` in the ``args: >-``
+  # blocks below. The per-chgroup stream is pre-padded with
+  # ``max(0, shifts.max())`` leading + ``max(0, -shifts.min())``
+  # trailing samples, giving the imager kernel in-range source rows
+  # for every (cube_t, fdm, g) tuple. Auto-disables the Layer-1
+  # coverage correction (cov ≡ 1) and re-enables the fused-imager
+  # Layer-1 fast path, recovering the ~96 ms / cube L1 regression
+  # introduced in M7.4.2 / 131ca41. T_stream grows 275 → 358 samples
+  # (~30 % H2D + ring-history bump); ~+86 MiB / cube ×
+  # cube_ring_depth=16 × 2 halves ≈ +2.7 GiB / search node. Pairs
+  # naturally with Option A; do NOT stack with
+  # ``--include-coarse-offset-in-search-shifts`` (which drives the
+  # shifts table to ±1400 samples and would balloon the pad).
+  #
+  # CRITICAL: ``args: >-`` is a YAML folded scalar — DO NOT add
+  # ``#``-comments inside it; they become literal argv tokens
+  # (commit 14f0535 post-mortem). Keep both halves in lockstep when
+  # flipping this flag.
   - name: search_compute_0
     cmd: python
     args: >-
@@ -187,19 +207,7 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
-      # M7.7 100 %-coverage symmetric padding (2026-06-03, default OFF):
-      # uncomment to pre-pad the per-chgroup stream with max(0,
-      # shifts.max()) leading + max(0, -shifts.min()) trailing samples,
-      # giving the imager kernel in-range source rows for every
-      # (cube_t, fdm, g) tuple. Auto-disables the Layer-1 coverage
-      # correction (cov ≡ 1) and re-enables the fused-imager Layer-1
-      # path (recovers the ~93 ms / cube L1 regression from 131ca41).
-      # T_stream grows 275 → 358 samples (~30 % H2D + ring-history
-      # bump); ~+86 MiB / cube × cube_ring_depth=16 × 2 halves
-      # ≈ +2.7 GiB / search node. Pairs naturally with Option A;
-      # avoid stacking with --include-coarse-offset-in-search-shifts
-      # (which drives shifts to ±1400 samples).
-      # --symmetric-shift-padding
+      --symmetric-shift-padding
       --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
@@ -292,10 +300,7 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
-      # M7.7 100 %-coverage symmetric padding (default OFF) — see the
-      # search_compute_0 routine above for the full rollout note. Keep
-      # both halves in lockstep when flipping this on.
-      # --symmetric-shift-padding
+      --symmetric-shift-padding
       --pipeline-overlap
       --poll-interval-s 0.001
       --max-cubes 0
