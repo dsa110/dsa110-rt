@@ -260,12 +260,26 @@ class CubeRingSlot:
             if compact.ndim != 3:
                 raise ValueError(
                     f"compact_cells_packed.shape={compact.shape}, expected "
-                    "(N_corr, T_det, n_filled_max * 2)"
+                    "(N_corr, T_stream, n_filled_max * 2)"
                 )
-            if compact.shape[1] != self.t_det:
+            # M7.7: with symmetric-shift padding the compact buffer
+            # carries ``t_det + pad_left + pad_right`` rows (the imager
+            # kernel reads from the padded ranges; pad_left is exposed
+            # via ``stream_origin_offset_samples``). The detector
+            # window is rows ``[stream_origin_offset_samples,
+            # stream_origin_offset_samples + t_det)`` and must fit
+            # inside the buffer. In legacy (asymmetric / non-padded)
+            # mode, ``stream_origin_offset_samples == 0`` and the
+            # buffer is exactly ``t_det`` rows wide — this check
+            # reduces to the legacy equality.
+            min_rows = int(self.t_det) + int(self.stream_origin_offset_samples)
+            if compact.shape[1] < min_rows:
                 raise ValueError(
-                    f"compact_cells_packed.shape[1]={compact.shape[1]} != "
-                    f"t_det={self.t_det}"
+                    f"compact_cells_packed.shape[1]={compact.shape[1]} < "
+                    f"t_det + stream_origin_offset_samples="
+                    f"{self.t_det}+{self.stream_origin_offset_samples}"
+                    f"={min_rows}; detector window would underrun the "
+                    f"compact buffer"
                 )
             if self.compact_n_filled_per_corr is None:
                 raise ValueError(
