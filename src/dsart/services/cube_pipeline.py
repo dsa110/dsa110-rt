@@ -738,6 +738,18 @@ class CubePipeline:
         # sub-stages. Read + drained by
         # :meth:`get_build_event_timing_and_reset`.
         self._dbg_build_events: list = []
+        # M7.7.1 RT-perf debug (2026-06-04, Phase A.2): per-cube GPU
+        # event ring for the OVERLAP path (``process_h2d_prefetched``).
+        # The legacy ``_dbg_build_events`` only fires from
+        # ``_build_cube_gpu`` (sync path); the production search nodes
+        # + the speed gate use the overlap path which previously had
+        # no GPU-time instrumentation. Each ring entry is the
+        # 5-tuple of cuda Events ``(start, imager_done, validity_done,
+        # layer1_done, detector_done)`` recorded on the MAIN stream
+        # inside ``process_h2d_prefetched``. Read + drained by
+        # :meth:`get_overlap_substage_event_timing_and_reset`. Cost is
+        # ~5 µs per cube (5 × cudaEventRecord); always on.
+        self._dbg_overlap_events: list = []
         # Re-usable host pinned cint8 staging buffer for the GPU
         # backend; allocated on first cube.
         self._cint8_host_buf: Optional[np.ndarray] = None
@@ -1430,6 +1442,83 @@ class CubePipeline:
             "n": n_ok,
         }
 
+    def get_overlap_substage_event_timing_and_reset(self) -> dict:
+        """Drain the overlap-path GPU event ring and return mean
+        per-sub-stage GPU ms.
+
+        The events were issued at least ``len(ring)`` cubes ago on
+        the main stream, so by the time the bench calls this at end-
+        of-run they have long since completed and the wait_event /
+        elapsed_time calls are effectively non-blocking.
+
+        Returns the per-substage mean ms over the cubes in the ring,
+        plus aggregate ``n`` and ``total_gpu_ms`` (sum of the four
+        substage means; useful to compare with the wall-clock
+        ``total_pipeline`` from the bench's NDJSON to see how much
+        of the per-cube wall-clock is GPU SM time vs Python / sync /
+        cross-iteration overhead).
+
+        The 4 substages, all on the main stream:
+          * ``imager_ms``    — ``_run_imager_from_staged`` (fused
+            dequant+combine + cuFFT + edge mask + clamp).
+          * ``validity_ms``  — ``_build_validity_mask`` (mostly a
+            cached all-true tensor return; should be ~0 ms).
+          * ``layer1_ms``    — ``_layer1_normalise`` (σ_clipped_std
+            + optional broadcast divide, or the fused-imager fast
+            path's ``set_edge_mask_per_fdm``).
+          * ``detector_ms``  — ``detector.forward`` (boxcar +
+            threshold + topk decode).
+
+        Returns:
+            ``{"imager_ms", "validity_ms", "layer1_ms", "detector_ms",
+            "total_gpu_ms", "n"}`` where ``n`` is the count of cubes
+            actually included (may be < ring length if events failed
+            to time).
+        """
+        if not self._dbg_overlap_events:
+            return {
+                "imager_ms": 0.0, "validity_ms": 0.0,
+                "layer1_ms": 0.0, "detector_ms": 0.0,
+                "total_gpu_ms": 0.0, "n": 0,
+            }
+        events = list(self._dbg_overlap_events)
+        self._dbg_overlap_events = []
+        # Sync on the LAST event of the LAST tuple to ensure every
+        # earlier event has a valid elapsed_time.
+        try:
+            events[-1][4].synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        imager_ms = validity_ms = layer1_ms = detector_ms = 0.0
+        n_ok = 0
+        for (e_start, e_imager, e_validity, e_layer1, e_detector) in events:
+            try:
+                imager_ms += float(e_start.elapsed_time(e_imager))
+                validity_ms += float(e_imager.elapsed_time(e_validity))
+                layer1_ms += float(e_validity.elapsed_time(e_layer1))
+                detector_ms += float(e_layer1.elapsed_time(e_detector))
+                n_ok += 1
+            except Exception:  # noqa: BLE001
+                continue
+        if n_ok == 0:
+            return {
+                "imager_ms": 0.0, "validity_ms": 0.0,
+                "layer1_ms": 0.0, "detector_ms": 0.0,
+                "total_gpu_ms": 0.0, "n": 0,
+            }
+        imager_ms /= n_ok
+        validity_ms /= n_ok
+        layer1_ms /= n_ok
+        detector_ms /= n_ok
+        return {
+            "imager_ms": imager_ms,
+            "validity_ms": validity_ms,
+            "layer1_ms": layer1_ms,
+            "detector_ms": detector_ms,
+            "total_gpu_ms": imager_ms + validity_ms + layer1_ms + detector_ms,
+            "n": n_ok,
+        }
+
     def _run_imager_from_staged(self, staged: _H2dStaged) -> torch.Tensor:
         """Run the GPU imager on already-staged H2D tensors.
 
@@ -1880,13 +1969,33 @@ class CubePipeline:
             torch.cuda.current_stream(self._device).wait_event(
                 staged.h2d_event
             )
+        # M7.7.1 Phase A.2 (2026-06-04): per-cube GPU-event timing of
+        # the 4 main-stream sub-stages. Cost is ≈5 µs of host-side
+        # ``cudaEventRecord`` per cube — small enough to leave on
+        # unconditionally in prod. Events are stashed on ``self`` and
+        # drained later (when their GPU work has long since completed)
+        # by ``get_overlap_substage_event_timing_and_reset``.
+        gpu_profile = self._device.type == "cuda"
+        if gpu_profile:
+            _ev_start = torch.cuda.Event(enable_timing=True)
+            _ev_imager = torch.cuda.Event(enable_timing=True)
+            _ev_validity = torch.cuda.Event(enable_timing=True)
+            _ev_layer1 = torch.cuda.Event(enable_timing=True)
+            _ev_detector = torch.cuda.Event(enable_timing=True)
+            _ev_start.record()
         # Imager + validity mask are computed on the main stream so
         # they overlap with the NEXT cube's H2D prefetch (issued by
         # the caller before process_h2d_prefetched is invoked).
         cube = self._run_imager_from_staged(staged)
+        if gpu_profile:
+            _ev_imager.record()
         validity_mask = self._build_validity_mask(slot)
+        if gpu_profile:
+            _ev_validity.record()
         t1 = time.perf_counter_ns()
         cube_norm, sigma_layer1 = self._layer1_normalise(cube)
+        if gpu_profile:
+            _ev_layer1.record()
         t2 = time.perf_counter_ns()
         with torch.no_grad():
             cands = self.detector.forward(
@@ -1896,6 +2005,17 @@ class CubePipeline:
                 event_specnum=int(slot.specnum_start),
                 fine_dm_pc_cm3=self._fine_dm_pc_cm3,
             )
+        if gpu_profile:
+            _ev_detector.record()
+            self._dbg_overlap_events.append((
+                _ev_start, _ev_imager, _ev_validity,
+                _ev_layer1, _ev_detector,
+            ))
+            # Keep at most ~64 cubes so the ring doesn't grow unbounded
+            # for very long runs. The bench drains it at the end; live
+            # services drain periodically via the perf monitor.
+            if len(self._dbg_overlap_events) > 64:
+                self._dbg_overlap_events.pop(0)
         t3 = time.perf_counter_ns()
         timings = {
             "build_cube": t1 - staged.build_start_ns,

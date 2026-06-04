@@ -568,6 +568,37 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 await src.release(slot.cube_id)
     bench_wall_s = (time.perf_counter_ns() - bench_start_ns) / 1.0e9
 
+    # M7.7.1 Phase A.2 (2026-06-04): drain the overlap-path GPU
+    # substage event ring. The events were recorded on the main
+    # stream during ``process_h2d_prefetched`` and have long since
+    # completed; we read mean per-substage GPU ms here and add them
+    # to the summary so the speed gate can show wall vs GPU.
+    gpu_substage_ms: Dict[str, float] = {}
+    try:
+        gpu_substage_ms = pipeline.get_overlap_substage_event_timing_and_reset()
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning(
+            "overlap-path GPU substage drain failed: %s "
+            "(continuing without GPU breakdown)",
+            exc,
+        )
+
+    # Also drain the imager's per-cube substage event ring (combine /
+    # fft / mask). Lets the speed gate break down the imager's GPU
+    # cost — the biggest single contributor on the production
+    # op-point at M7.7.
+    imager_substage_ms: Dict[str, float] = {}
+    try:
+        gpu_imager = pipeline.gpu_imager
+        if gpu_imager is not None and hasattr(gpu_imager, "pop_substage_timings"):
+            imager_substage_ms = gpu_imager.pop_substage_timings()
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning(
+            "imager substage drain failed: %s "
+            "(continuing without combine/fft/mask breakdown)",
+            exc,
+        )
+
     # ---- Write outputs ----
     ndjson_path = out_dir / "stage_timings.ndjson"
     with ndjson_path.open("w") as fh:
@@ -616,6 +647,34 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 [r.total_pipeline_ns for r in records]
             ),
         },
+        # M7.7.1 Phase A.2 (2026-06-04): per-substage GPU-time
+        # breakdown from cuda Events recorded on the main stream
+        # during ``process_h2d_prefetched``. Reported as cube-mean
+        # (the events are too cheap to also percentile per-cube;
+        # cube-to-cube variation is dominated by the wall-clock
+        # stage timings already present above). Keys:
+        #   imager_ms    — _run_imager_from_staged GPU time
+        #   validity_ms  — _build_validity_mask GPU time
+        #   layer1_ms    — _layer1_normalise GPU time
+        #   detector_ms  — detector.forward GPU time
+        #   total_gpu_ms — sum of the four (= GPU busy time / cube)
+        #   n            — number of cubes contributing (= cubes in
+        #                  the overlap path; 0 for sync / skip-detector
+        #                  / CPU runs).
+        # Compare ``total_gpu_ms`` with ``percentiles_ms.total_pipeline.p50``
+        # to gauge how much of per-cube wall-clock is GPU SM time vs
+        # CPU sync / cross-iteration overhead.
+        "gpu_substage_ms": gpu_substage_ms,
+        # Per-cube imager substage GPU ms breakdown (combine /
+        # fft / mask). Same semantics as gpu_substage_ms above but
+        # narrowed to the fused GpuImager's per-batch inner sections.
+        # ``total_ms`` should approximately match
+        # ``gpu_substage_ms.imager_ms`` (any gap = launch / wait
+        # overhead between the per-batch loop iterations on the main
+        # stream); the per-substage breakdown is what tells the
+        # operator WHERE the imager's GPU time is going (D21 design
+        # estimate: combine 45% / fft 44% / mask 11%).
+        "imager_substage_ms": imager_substage_ms,
     }
     summary_path = out_dir / "summary.json"
     with summary_path.open("w") as fh:

@@ -121,6 +121,13 @@ class GpuImager:
     uv_batch: Optional[torch.Tensor] = None        # [B, T_det, N, N] complex_dtype
     img_batch_real: Optional[torch.Tensor] = None  # [B, T_det, N, N] cube_dtype
     _output_index: int = 0
+    # M7.7.1 Phase A.2 (2026-06-04): per-cube fused-imager substage
+    # event ring. Each ring entry is one cube's accumulated
+    # (combine_ms, fft_ms, mask_ms) measured via cuda Events recorded
+    # around the per-batch inner sections of ``process_cube``. Drained
+    # by :meth:`pop_substage_timings`. Cost is ~24 µs / cube (12 ×
+    # cudaEventRecord); always on.
+    _dbg_imager_substage_events: list = field(default_factory=list)
 
     @classmethod
     def build(cls, config: GpuImagerConfig) -> "GpuImager":
@@ -327,8 +334,18 @@ class GpuImager:
                 device=self.device,
             )
 
+        gpu_profile = self.device.type == "cuda"
+        per_cube_combine_evs: list = []
+        per_cube_fft_evs: list = []
+        per_cube_mask_evs: list = []
         for f0 in range(0, cfg.n_fdm, fft_batch):
             n_batch = min(fft_batch, cfg.n_fdm - f0)
+            if gpu_profile:
+                ev_b_start = torch.cuda.Event(enable_timing=True)
+                ev_b_combine_end = torch.cuda.Event(enable_timing=True)
+                ev_b_fft_end = torch.cuda.Event(enable_timing=True)
+                ev_b_mask_end = torch.cuda.Event(enable_timing=True)
+                ev_b_start.record()
             for j in range(n_batch):
                 fused_dequant_combine_per_fdm(
                     streams_cint8,
@@ -338,9 +355,12 @@ class GpuImager:
                     offsets_re=chgroup_offsets_re,
                     offsets_im=chgroup_offsets_im,
                 )
-
+            if gpu_profile:
+                ev_b_combine_end.record()
             img_complex = torch.fft.ifft2(self.uv_batch[:n_batch])
             img_complex = torch.fft.fftshift(img_complex, dim=(-2, -1))
+            if gpu_profile:
+                ev_b_fft_end.record()
             if self.edge_mask_per_fdm is not None:
                 # Per-fdm fused edge-mask × (1/σ_layer1_prev). Broadcasts
                 # ``[n_batch, 1, N, N]`` over the T_det axis of
@@ -367,6 +387,19 @@ class GpuImager:
             out_cube[:, f0:f0 + n_batch, :, :] = self.img_batch_real[
                 :n_batch
             ].permute(1, 0, 2, 3)
+            if gpu_profile:
+                ev_b_mask_end.record()
+                per_cube_combine_evs.append((ev_b_start, ev_b_combine_end))
+                per_cube_fft_evs.append((ev_b_combine_end, ev_b_fft_end))
+                per_cube_mask_evs.append((ev_b_fft_end, ev_b_mask_end))
+        if gpu_profile and per_cube_mask_evs:
+            self._dbg_imager_substage_events.append((
+                per_cube_combine_evs,
+                per_cube_fft_evs,
+                per_cube_mask_evs,
+            ))
+            if len(self._dbg_imager_substage_events) > 64:
+                self._dbg_imager_substage_events.pop(0)
         out_final = (
             self.output_cube
             if self._output_index == 0
@@ -374,6 +407,67 @@ class GpuImager:
         )
         self._output_index = 1 - self._output_index
         return out_final
+
+    def pop_substage_timings(self) -> dict:
+        """Drain the per-cube imager-substage event ring and return
+        mean per-substage GPU ms across all cubes in the ring.
+
+        Each entry in the ring is the per-cube (combine, fft, mask)
+        event-pair lists across the per-batch inner loop. We sum the
+        per-batch intervals within a cube (so the result is per-cube
+        total ms), then average across the cubes drained.
+
+        Returns:
+            ``{"combine_ms": float, "fft_ms": float, "mask_ms": float,
+            "total_ms": float, "n": int}`` where ``n`` is the number
+            of cubes contributing.
+        """
+        ring = list(self._dbg_imager_substage_events)
+        self._dbg_imager_substage_events = []
+        if not ring:
+            return {"combine_ms": 0.0, "fft_ms": 0.0, "mask_ms": 0.0,
+                    "total_ms": 0.0, "n": 0}
+        # Sync on the LAST event of the LAST cube so every prior event
+        # has a valid elapsed_time. The events were issued at least
+        # ``len(ring)`` cubes ago, so by the time the bench drains at
+        # end-of-run they have all completed and the synchronize is
+        # effectively a no-op.
+        try:
+            ring[-1][-1][-1][1].synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        combine_sum = fft_sum = mask_sum = 0.0
+        n_ok = 0
+        for (combine_pairs, fft_pairs, mask_pairs) in ring:
+            try:
+                c_ms = sum(
+                    float(e0.elapsed_time(e1)) for (e0, e1) in combine_pairs
+                )
+                f_ms = sum(
+                    float(e0.elapsed_time(e1)) for (e0, e1) in fft_pairs
+                )
+                m_ms = sum(
+                    float(e0.elapsed_time(e1)) for (e0, e1) in mask_pairs
+                )
+                combine_sum += c_ms
+                fft_sum += f_ms
+                mask_sum += m_ms
+                n_ok += 1
+            except Exception:  # noqa: BLE001
+                continue
+        if n_ok == 0:
+            return {"combine_ms": 0.0, "fft_ms": 0.0, "mask_ms": 0.0,
+                    "total_ms": 0.0, "n": 0}
+        combine_ms = combine_sum / n_ok
+        fft_ms = fft_sum / n_ok
+        mask_ms = mask_sum / n_ok
+        return {
+            "combine_ms": combine_ms,
+            "fft_ms": fft_ms,
+            "mask_ms": mask_ms,
+            "total_ms": combine_ms + fft_ms + mask_ms,
+            "n": n_ok,
+        }
 
     # ------------------------------------------------------------------
     # Per-fdm fused edge mask (Layer-1 fold-in)

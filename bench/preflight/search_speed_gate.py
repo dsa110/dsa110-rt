@@ -175,6 +175,42 @@ def _load_stage_timings(ndjson_path: Path) -> List[Dict[str, float]]:
     return rows
 
 
+def _load_gpu_substage_ms(summary_path: Path) -> Optional[Dict[str, float]]:
+    """Load the per-substage GPU-time breakdown from summary.json.
+
+    Returns the dict (with keys imager_ms / validity_ms / layer1_ms /
+    detector_ms / total_gpu_ms / n) when the bench produced it, or
+    None when the bench was older / ran without GPU profiling.
+    """
+    if not summary_path.exists():
+        return None
+    try:
+        with summary_path.open() as fh:
+            doc = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+    g = doc.get("gpu_substage_ms")
+    if not isinstance(g, dict) or int(g.get("n", 0)) <= 0:
+        return None
+    return g
+
+
+def _load_imager_substage_ms(summary_path: Path) -> Optional[Dict[str, float]]:
+    """Load the per-cube imager-substage GPU breakdown (combine / fft /
+    mask) from summary.json. Returns None when missing or n == 0."""
+    if not summary_path.exists():
+        return None
+    try:
+        with summary_path.open() as fh:
+            doc = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None
+    g = doc.get("imager_substage_ms")
+    if not isinstance(g, dict) or int(g.get("n", 0)) <= 0:
+        return None
+    return g
+
+
 def _run_bench(out_dir: Path, args: argparse.Namespace) -> int:
     """Invoke bench.search_node_throughput as a subprocess with the
     production op-point. Returns the subprocess exit code.
@@ -247,11 +283,148 @@ def _run_bench(out_dir: Path, args: argparse.Namespace) -> int:
     return int(proc.returncode)
 
 
+def _print_imager_substage_table(
+    imager: Dict[str, float],
+    *,
+    imager_total_gpu_ms: float,
+) -> None:
+    """Print the imager's per-substage breakdown (combine / fft / mask)
+    and call out which sub-stage is dominant."""
+    combine = float(imager.get("combine_ms", 0.0))
+    fft = float(imager.get("fft_ms", 0.0))
+    mask = float(imager.get("mask_ms", 0.0))
+    total = float(imager.get("total_ms", combine + fft + mask))
+    n = int(imager.get("n", 0))
+
+    print(
+        f"  Imager substage breakdown (cuda Events inside "
+        f"GpuImager.process_cube, mean over {n} cubes):"
+    )
+    print(
+        f"    combine_ms      {combine:8.2f}    "
+        f"(fused dequant+combine NVRTC kernel — chunk-8 D21)"
+    )
+    print(
+        f"    fft_ms          {fft:8.2f}    (cuFFT-cfp16 ifft2 + fftshift)"
+    )
+    print(
+        f"    mask_ms         {mask:8.2f}    "
+        f"(edge_mask multiply + permute + writeback)"
+    )
+    print(f"    total_ms        {total:8.2f}")
+    if imager_total_gpu_ms > 0 and total > 0:
+        coverage = 100.0 * total / imager_total_gpu_ms
+        gap = imager_total_gpu_ms - total
+        print(
+            f"    coverage        {coverage:8.1f}%   "
+            f"(of overlap-path imager_ms={imager_total_gpu_ms:.1f}; "
+            f"gap={gap:+.1f} ms is launch / wait between per-batch "
+            f"loop iterations)"
+        )
+    if total > 0:
+        substage = [("combine", combine), ("fft", fft), ("mask", mask)]
+        substage.sort(key=lambda kv: -kv[1])
+        worst_name, worst_val = substage[0]
+        worst_pct = 100.0 * worst_val / total
+        print(
+            f"    dominant        {worst_name:>8s}    "
+            f"({worst_val:.1f} ms = {worst_pct:.0f}% of imager GPU work)"
+        )
+    print()
+
+
+def _print_gpu_substage_table(
+    gpu: Dict[str, float],
+    *,
+    wall_p50_ms: float,
+) -> None:
+    """Print the GPU-time per-substage table and the wall-vs-GPU gap.
+
+    The GPU breakdown is a cube-mean (not a per-cube percentile) — the
+    cuda Events are too cheap to also percentile per-cube, and the
+    wall-clock stage timings already capture variability above.
+    """
+    imager = float(gpu.get("imager_ms", 0.0))
+    validity = float(gpu.get("validity_ms", 0.0))
+    layer1 = float(gpu.get("layer1_ms", 0.0))
+    detector = float(gpu.get("detector_ms", 0.0))
+    total_gpu = float(gpu.get("total_gpu_ms", imager + validity + layer1 + detector))
+    n = int(gpu.get("n", 0))
+
+    print(
+        f"  GPU SM busy time per cube (cuda Events, mean over {n} cubes "
+        f"in the overlap path):"
+    )
+    print(
+        f"    imager_ms       {imager:8.2f}    (fused dequant+combine "
+        f"+ cuFFT + edge mask + clamp)"
+    )
+    print(
+        f"    validity_ms     {validity:8.2f}    (all-true cached tensor → "
+        f"usually ~0 ms)"
+    )
+    print(
+        f"    layer1_ms       {layer1:8.2f}    (sigma_clipped_std + "
+        f"broadcast divide / fused-imager mask update)"
+    )
+    print(
+        f"    detector_ms     {detector:8.2f}    (boxcar + threshold + "
+        f"topk decode)"
+    )
+    print(f"    total_gpu_ms    {total_gpu:8.2f}")
+    print()
+
+    # Sustained-throughput interpretation. In ``--pipeline-overlap``
+    # mode the per-iteration wall clock UNDER-reports the steady-state
+    # cube cadence: iteration N's CPU work overlaps with iteration
+    # N-1's residual GPU drain, so a 137 ms iteration is consistent
+    # with 170 ms of GPU work per cube if the next iteration's CPU
+    # syncs at L1 / detector wait for the previous cube's GPU to
+    # finish. The true sustained throughput is therefore bounded by
+    # ``max(wall_p50, total_gpu_ms)`` — that's what the cube cadence
+    # will be in production where the CPU has no bench-overhead slack.
+    if wall_p50_ms > 0:
+        sustained_ms = max(wall_p50_ms, total_gpu)
+        cps = 1000.0 / max(1e-9, sustained_ms)
+        print(
+            f"  per-iter wall p50  : {wall_p50_ms:.1f} ms (CPU iteration time; "
+            f"underestimates steady-state because cube N+1's CPU work overlaps "
+            f"cube N's GPU drain)"
+        )
+        print(
+            f"  GPU main-stream    : {total_gpu:.1f} ms (genuine main-stream "
+            f"serial GPU work per cube — this gates steady-state)"
+        )
+        print(
+            f"  sustained estimate : {sustained_ms:.1f} ms / cube = "
+            f"{cps:.2f} cubes/s    [≈ max(wall, GPU)]"
+        )
+        if total_gpu > wall_p50_ms + 5.0:
+            print(
+                f"  HINT: GPU work ({total_gpu:.1f} ms) exceeds the CPU "
+                f"iter wall ({wall_p50_ms:.1f} ms). The bench's "
+                f"pipeline-overlap masks this — real production cadence "
+                f"will track total_gpu_ms above. Focus on the dominant "
+                f"GPU substage:"
+            )
+            substage_pairs = [
+                ("imager_ms", imager),
+                ("layer1_ms", layer1),
+                ("detector_ms", detector),
+            ]
+            substage_pairs.sort(key=lambda kv: -kv[1])
+            for name, val in substage_pairs:
+                print(f"             {name:14s} = {val:6.1f} ms")
+    print()
+
+
 def _print_summary(
     rows: List[Dict[str, float]],
     *,
     warmup_cubes: int,
     budget_ms: float,
+    gpu_substage_ms: Optional[Dict[str, float]] = None,
+    imager_substage_ms: Optional[Dict[str, float]] = None,
 ) -> int:
     """Print the per-stage summary table + PASS/FAIL banner. Returns
     the exit code (0=PASS, 1=FAIL).
@@ -301,15 +474,26 @@ def _print_summary(
     print()
 
     total = summary["total_pipeline"]
+    # Sustained per-cube cost in production = max(CPU iter wall, GPU
+    # main-stream work). The bench's --pipeline-overlap masks the GPU
+    # cost (next iter's CPU work overlaps prev iter's GPU drain), so
+    # the per-iter wall p50 alone under-reports steady-state. Use the
+    # GPU substage breakdown when available; fall back to wall for
+    # CPU runs / older benches that didn't emit gpu_substage_ms.
+    gpu_total_ms = 0.0
+    if gpu_substage_ms is not None:
+        gpu_total_ms = float(gpu_substage_ms.get("total_gpu_ms", 0.0))
+    sustained_ms = max(total["p50"], gpu_total_ms)
     target_cubes_per_s = 1000.0 / budget_ms
-    actual_cubes_per_s = 1000.0 / max(1e-9, total["p50"])
-    margin_ms = budget_ms - total["p50"]
+    actual_cubes_per_s = 1000.0 / max(1e-9, sustained_ms)
+    margin_ms = budget_ms - sustained_ms
     print(
         f"  RT budget: {budget_ms:.1f} ms / cube = {target_cubes_per_s:.2f} cubes/s"
     )
     print(
-        f"  achieved:  {total['p50']:.1f} ms / cube = {actual_cubes_per_s:.2f} cubes/s "
-        f"(margin {margin_ms:+.1f} ms)"
+        f"  sustained: {sustained_ms:.1f} ms / cube = {actual_cubes_per_s:.2f} cubes/s "
+        f"(margin {margin_ms:+.1f} ms)    "
+        f"[= max(wall p50 {total['p50']:.1f}, GPU {gpu_total_ms:.1f})]"
     )
 
     # Identify the dominant stage so the operator knows WHERE to
@@ -323,9 +507,27 @@ def _print_summary(
         )
 
     print()
-    if total["p50"] <= budget_ms:
+    # M7.7.1 Phase A.2: GPU SM busy time per cube. The wall-clock
+    # stage table above shows what the SCHEDULER sees (perf_counter_ns
+    # around CPU calls that mostly LAUNCH async GPU work, so the
+    # wall-clock includes the previous kernel's tail). The GPU table
+    # below shows what the GPU actually spent its time on. The
+    # difference is CPU + sync + cross-iteration overhead — the lever
+    # to pull when total_gpu_ms is well below budget.
+    if gpu_substage_ms is not None:
+        _print_gpu_substage_table(gpu_substage_ms, wall_p50_ms=total["p50"])
+
+    if imager_substage_ms is not None:
+        imager_total_gpu = 0.0
+        if gpu_substage_ms is not None:
+            imager_total_gpu = float(gpu_substage_ms.get("imager_ms", 0.0))
+        _print_imager_substage_table(
+            imager_substage_ms, imager_total_gpu_ms=imager_total_gpu,
+        )
+
+    if sustained_ms <= budget_ms:
         print(
-            f"  ✓ PASS — median cube cadence {total['p50']:.1f} ms ≤ "
+            f"  ✓ PASS — sustained cube cadence {sustained_ms:.1f} ms ≤ "
             f"budget {budget_ms:.1f} ms. Fleet-push is safe (from a "
             f"search-side compute standpoint; this gate does not "
             f"cover transport / dump / C1 / C2)."
@@ -333,9 +535,11 @@ def _print_summary(
         return 0
 
     print(
-        f"  ✗ FAIL — median cube cadence {total['p50']:.1f} ms > budget "
-        f"{budget_ms:.1f} ms ({-margin_ms:.1f} ms over). DO NOT fleet-push; "
-        f"iterate on the dominant stage above first."
+        f"  ✗ FAIL — sustained cube cadence {sustained_ms:.1f} ms > "
+        f"budget {budget_ms:.1f} ms ({-margin_ms:.1f} ms over). DO NOT "
+        f"fleet-push; iterate on the dominant GPU substage above first "
+        f"(sustained = max(wall p50, GPU main-stream); the larger of "
+        f"the two gates production cadence)."
     )
     return 1
 
@@ -440,12 +644,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     rows = _load_stage_timings(ndjson)
+    summary_json = out_dir / "summary.json"
+    gpu_substage_ms = _load_gpu_substage_ms(summary_json)
+    imager_substage_ms = _load_imager_substage_ms(summary_json)
     print()
     print(f"[gate] loaded {len(rows)} per-cube records from {ndjson}")
+    if gpu_substage_ms is not None:
+        print(
+            f"[gate] loaded GPU substage breakdown from {summary_json} "
+            f"({int(gpu_substage_ms.get('n', 0))} cubes timed)"
+        )
+    else:
+        print(
+            f"[gate] no GPU substage breakdown in {summary_json} "
+            f"(older bench, sync path, or CPU run)"
+        )
+    if imager_substage_ms is not None:
+        print(
+            f"[gate] loaded imager substage breakdown "
+            f"({int(imager_substage_ms.get('n', 0))} cubes timed)"
+        )
     print()
     return _print_summary(
-        rows, warmup_cubes=int(args.warmup_cubes),
+        rows,
+        warmup_cubes=int(args.warmup_cubes),
         budget_ms=float(args.budget_ms),
+        gpu_substage_ms=gpu_substage_ms,
+        imager_substage_ms=imager_substage_ms,
     )
 
 
