@@ -53,49 +53,96 @@ Code-side, the relevant compute-touching commits since M7.4 gate:
 Net expected change M7.4 → today: −10 ms / cube (faster). Net
 observed: **+30 to +40 ms / cube (slower)**.
 
-## What's unexplained
+## RESOLVED: the combine "regression" is a correctness fix
 
-The combine kernel's GPU SM time is **~64 ms at T_det=192 / N_fdm=34
-/ N_grid=256 today**, vs **~33 ms at T_det=192 / N_fdm=32 / N_grid=
-256 on May 6 (imager-only headline)**. Same kernel
-(`fused_dequant_combine_per_fdm_cf16`), nearly the same geometry
-(+6% N_fdm work), but the kernel is **~80% slower**.
+After A/B'ing on n01 (commit 8a218ab instrumentation), the source of
+the 33 ms → 64 ms combine "slowdown" is **shift-table magnitude**,
+not a code regression. Same kernel, same geometry, same GPU. The
+combine kernel reads `streams[g, t - shifts[g]]` and skips cells
+when `t - shifts[g]` falls out of `[0, T_stream)`. With smaller
+shifts, FEWER cells skip → MORE memory reads → SLOWER kernel.
 
-Per-cube combine memory traffic = 17 × t_det × n_fdm × N² bytes
-(read 16 chgroups + write 1, all cint8 → cfp16) = 27 GiB / cube.
-At 500 GB/s HBM peak achievable on a 2080 Ti → 54 ms theoretical
-floor. May 6 measurement (33 ms) is *below* the simple roofline →
-implies it benefited from cache reuse (T_stream there was ~600 with
-the larger shifts → bigger working set but more sequential reads).
-Today's measurement (64 ms) is *above* roofline → cache thrash from
-something we haven't isolated.
+A/B on n01 cuda:0 with the `fused_cuda_cint8` kernel at the exact
+production geometry (T_det=192, N_fdm=34, N_grid=256), varying only
+the synthetic-shift range:
 
-**Hypotheses to investigate (none confirmed):**
+| Shift range | Coverage / (cell, chgroup) | combine_ms | Era |
+|---|---|---|---|
+| `[0, 400)` | ~50 % (huge shifts skip half) | **24 ms** | emulates M7.4 gate (`--include-coarse-offset` shifts ±1400) |
+| `[0, 128)` | ~67 % | ~33 ms | matches the May 6 imager-only headline |
+| `[0, 83)` | ~70 – 80 % | **48 ms** | emulates Option A alone (shifts ≤83 post-corr-side dedispersion) |
+| pipeline today (M7.7 post-pad-subtract shifts) | **100 %** | **64 ms** | Option A + M7.7 — every cell contributes all 16 chgroups |
 
-* **GPU memory pool fragmentation**: the cube_ring_depth went
-  through 24 → 8 → 16; the imager workspace alloc patterns may
-  interact poorly. (Easy to test: a fresh `python` process should
-  reset.)
-* **Implicit kernel-launch fence** from the M7.4.1 GPU-scatter
-  (commit a98bda8): the dense cint8 buffer is written on the main
-  stream then consumed by the combine kernel. If the scatter doesn't
-  write the entire buffer cleanly, the combine reads might miss in
-  L2 cache for the lookahead rows.
-* **Compiler regression**: the kernel goes through NVRTC; cupy
-  version updates between May 6 and now could change codegen.
-* **Different GPU**: May 6 ran on cuda:1; our gate runs on cuda:0.
-  Need to A/B by flipping `CUDA_VISIBLE_DEVICES=1`.
+The ratio is exactly what kernel arithmetic predicts: combine cost
+∝ number of in-range `(cell, chgroup)` reads. Moving from ~50 %
+coverage (M7.4 gate) to 100 % coverage (today) doubles the work.
+
+### What this means for the May 28 M7.4 gate PASS
+
+The 7.45 cubes/s the fleet hit on May 28 was **achieved partly
+because the search side was skipping ~half its chgroup
+contributions at high DM** — exactly the bug the Option A enable
+commit (`7c6ee9a`) called out: *"Option A enablement going live in
+production: at high DM the search side now sees all 16 chgroups
+contributing coherently to every cube (previously ~2/16 at DM=900,
+search effectively blind for DM >~ 2000)."*
+
+So the M7.4 gate was passing the throughput target while being
+scientifically incomplete. Option A (Jun 2) fixed the correctness;
+M7.7 (Jun 3) closed the last cell-edge coverage gap. Each pulled the
+combine kernel toward the memory-bandwidth roofline (~54 ms
+theoretical at 500 GB/s on a 2080 Ti). Today we sit at 64 ms,
+within ~20 % of the roofline.
+
+### Implication for the 134 ms RT budget
+
+The 134 ms / cube budget was set when the kernel was effectively
+doing half the work. With 100 % coverage (the correct scientific
+behaviour) we need either:
+
+* a budget revision (acknowledge that correct-search is ~5.8 cubes
+  /s on the 2080 Ti, accept the resulting per-cube cadence change in
+  the downstream pipeline);
+* a structural change that lets the kernel do its full read budget
+  in less wall-clock time (carry-over re-imaging — only re-image
+  the new ``cube_cadence_samples=128`` of each cube instead of the
+  full T_det=192 — drops combine ~30 %, total GPU ~152 ms; still
+  not quite under 134, but closer);
+* an op-point change (smaller N_grid or N_fdm — physics tradeoff);
+* faster hardware (the A100 / H100 generation has ~3× the HBM
+  bandwidth of the 2080 Ti and would put combine well below
+  budget).
 
 ## What's *not* the cause
 
-* M7.7 / symmetric padding — A/B shows it saves 9 ms / cube vs OFF;
-  it's a net positive at the production op-point.
-* Option A — moved coarse-DM work corr-side; should be neutral or
-  faster for the search.
-* M7.4.2 coverage correction — measured 1.4 ms / cube, not 96 ms.
-* Detector kernel set — k_time and accum dtype haven't changed.
-* L1 sample cap — still 10 000 since M7.2 (line was 100k → 10k
-  *before* the M7.2 gate).
+* **The combine kernel itself** — unchanged code; the same NVRTC
+  binary runs faster or slower depending purely on shift-table
+  magnitude (see the A/B table above).
+* **GPU memory pool fragmentation, NVRTC codegen, cuda:0 vs cuda:1,
+  M7.4.1 GPU-scatter fence** — all tested / ruled out by the
+  imager-only A/B at exact pipeline geometry.
+* **M7.7 sym pad** — A/B shows it adds only 3 ms of combine vs M7.7
+  OFF (and saves 11 ms of L1 via the fused mask update — net
+  -8 ms / cube vs M7.7 OFF).
+* **M7.4.2 coverage correction** — measured 1.4 ms / cube, not 96
+  ms.
+* **Detector kernel set, L1 sample cap** — unchanged since M7.2.
+
+## What *is* the cause
+
+* **Option A enable (commit `7c6ee9a`, Jun 2)** — moved the coarse-
+  DM dedispersion corr-side, shrinking search-side shifts from
+  ±1400 → ±83. That's the correctness fix. The downstream perf
+  consequence (combine ~24 → ~62 ms because fewer cells skip
+  out-of-range) wasn't captured in the commit's "Net +1 ms / cube"
+  benchmark — that was the corr-side cost only.
+* **M7.7 sym pad (commit `ef6ffd5`, Jun 3)** — closed the last
+  ~5 % coverage gap at the leading time-edge of each cube. Adds
+  ~3 ms of combine on top of Option A's ~25 ms increment.
+
+Together these account for the entire ~25–40 ms / cube cost increase
+that moved the search from 7.45 cubes/s (M7.4 gate) to ~5.8 cubes/s
+(today bench) / ~6.4 cubes/s (today live).
 
 ## Reading guide for the discrepancy
 
@@ -117,26 +164,32 @@ So the bench's 5.77 cubes/s is a CONSERVATIVE estimate; live is
 
 ## What to do about it
 
-Phase A.2 found no quick perf win. The committed instrumentation
-(`bench/preflight/search_speed_gate.py`) now correctly reports
-sustained throughput so we won't be misled by the wall-clock again.
+The 134 ms budget was set against a *scientifically incomplete*
+search-side (M7.4 gate). The correct-search cost is ~5.8 cubes/s on
+the 2080 Ti. Options:
 
-Larger options that could close the gap (all out of A.2 scope):
-
-1. **Triage the combine 33→64 ms regression** — first confirm on
-   cuda:1 (does the regression persist? if not, GPU-specific). If
-   it does, bisect the commits between May 6 and today on the imager
-   path. Most actionable.
-2. **Detector overlap** — run detector on a separate stream so it
-   overlaps with the next cube's imager (the ping-pong output buffer
-   in `GpuImager` already supports this geometry). Highest reward
-   but biggest code change.
+1. **Acknowledge correctness > throughput** — re-baseline the
+   downstream pipeline against the new sustained cadence
+   (~155–175 ms / cube) and update the C1/C2 buffer assumptions to
+   match. Probably the right answer in the short term.
+2. **Carry-over re-imaging** — only re-image the new 128 samples
+   per cube cadence instead of all 192 (the previous 64 carry over
+   from the prior cube). Drops combine ~30 % (64 → ~45 ms), total
+   GPU ~152 ms. Gets us close to budget but requires a state-
+   machine rewrite of the imager workspace + a per-cube edge-
+   compensation pass for the carried-over samples. Moderate work,
+   moderate risk.
 3. **Cut detector kernel set** — drop from 7 to 4 time-kernels;
-   gains ~25 ms; operator decides on the C1 sensitivity tradeoff.
-4. **Move to a faster GPU** — out of band.
+   gains ~25 ms detector; total GPU ~148 ms. Single-flag change.
+   Operator decides on the resulting C1 sensitivity tradeoff.
+4. **Detector on its own stream** — runs concurrent with next
+   cube's imager via the existing `output_cube_alt` ping-pong.
+   Effective per-cube = max(imager, L1+detector) = max(110, 63) =
+   110 ms — well under budget. Bigger code change, biggest reward.
+5. **Move to A100/H100** — 3× HBM bandwidth puts combine well below
+   budget. Out of band.
 
-Recommend (1) as the first follow-up, paired with re-running the
-M7.4 gate to confirm whether the production system has actually
-regressed or whether the M7.4 numbers were transient (note the M7.4
-report measured "last 1.3 s window" steady-state, not long-term
-average).
+The committed instrumentation (`bench/preflight/search_speed_gate
+.py`) now correctly reports sustained throughput so we won't be
+misled by wall-clock again. The speed gate's PASS/FAIL semantics
+reflect the GPU-bound reality.
