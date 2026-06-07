@@ -869,6 +869,242 @@ def control_inject_calibrations_get():
     })
 
 
+# ---------------------------------------------------------------------------
+# Fringe-stopping table panel (M7.4 follow-up — surfaced 2026-06-03 after
+# the cold-start meridian_fringestop crash on dec=+54.5 deadlocked the
+# whole fast-corr → search path via bada → fada → corr_fast). The same
+# class of cryptic "stuck after ~300 cubes" symptom is now caught by an
+# explicit fstable-presence traffic light next to "Start fleet".
+# ---------------------------------------------------------------------------
+
+
+def _fstable_runtime_params() -> tuple[Optional[int], Optional[float], Optional[str]]:
+    """Pull ``(nant, refmjd)`` from etcd's ``/cnf/corr`` + ``/cnf/fringe``.
+
+    Returns ``(nant, refmjd, err)`` with ``err`` non-None when either
+    key is missing/malformed — the routes surface that as ``ok=False``
+    so the UI doesn't pretend to know the filename it would build.
+    """
+    try:
+        corr = etcd_store.get_dict("/cnf/corr")
+        fringe = etcd_store.get_dict("/cnf/fringe")
+    except Exception as exc:                                  # noqa: BLE001
+        LOG.warning("fstable: etcd read failed: %s", exc)
+        return None, None, f"etcd read failed: {exc!r}"
+    if not isinstance(corr, dict) or not isinstance(fringe, dict):
+        return None, None, "/cnf/corr or /cnf/fringe missing"
+    try:
+        ant_od = corr["antenna_order"]
+        nant = int(corr.get("nant", len(list(ant_od.values()))))
+        refmjd = float(fringe["refmjd"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return None, None, f"cnf parse error: {exc!r}"
+    return nant, refmjd, None
+
+
+def _fstable_pointing_dec() -> tuple[Optional[float], Optional[str]]:
+    """Best-effort pointing DEC for the traffic light.
+
+    Tries ``/mon/array/dec`` first (the M7.4 CUSTOMDEC fallback in
+    ``meridian_fringestop_rt`` reads the same key). Returns
+    ``(dec_deg, err)``; ``err`` non-None when the key is missing.
+    """
+    try:
+        d = etcd_store.get_dict("/mon/array/dec")
+    except Exception as exc:                                  # noqa: BLE001
+        return None, f"etcd read failed: {exc!r}"
+    if not isinstance(d, dict) or "dec_deg" not in d:
+        return None, "/mon/array/dec missing or malformed"
+    try:
+        return float(d["dec_deg"]), None
+    except (TypeError, ValueError) as exc:
+        return None, f"dec parse error: {exc!r}"
+
+
+@app.route("/control/fstables/list", methods=["GET"])
+def control_fstables_list():
+    """Fleet inventory: h23 master copy + every corr node's local
+    cache. Returns ``{ok, h23: [...], fleet: {host: {ok, entries, error}}}``.
+
+    The frontend renders this as a per-DEC table where each row has
+    one column per host (✓/✗ for presence).
+    """
+    import fstable_panel as fp                              # local
+    from services_inventory import CORR_HOSTS
+    try:
+        h23 = [e.to_dict() for e in fp.list_h23_tables()]
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("list_h23_tables failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    try:
+        fleet = fp.list_fleet_tables(list(CORR_HOSTS))
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("list_fleet_tables failed")
+        return jsonify({
+            "ok": False, "error": f"fleet inventory failed: {exc}",
+            "h23": h23, "fleet": {},
+        }), 500
+    return jsonify({"ok": True, "h23": h23, "fleet": fleet})
+
+
+@app.route("/control/fstables/current_status", methods=["GET"])
+def control_fstables_current_status():
+    """Traffic-light data for the operator's current pointing DEC.
+
+    Query params:
+
+      dec_deg   optional override (deg). When absent we read
+                ``/mon/array/dec``.
+
+    Response: see :func:`fstable_panel.current_dec_status`.
+    """
+    import fstable_panel as fp                              # local
+    from services_inventory import CORR_HOSTS
+    dec_raw_q = (request.args.get("dec_deg") or "").strip()
+    dec_deg: Optional[float]
+    if dec_raw_q:
+        try:
+            dec_deg = float(dec_raw_q)
+        except ValueError:
+            return jsonify({"ok": False, "error": f"bad dec_deg={dec_raw_q!r}"}), 400
+    else:
+        dec_deg, derr = _fstable_pointing_dec()
+        if dec_deg is None:
+            # Render as "unknown" rather than hard-failing — operator
+            # may simply not have set the pointing yet.
+            return jsonify(fp.current_dec_status(
+                dec_deg=None, nant=96, refmjd=58849.0,
+                corr_hosts=list(CORR_HOSTS),
+            ) | {"_note": derr or "no dec"})
+
+    nant, refmjd, perr = _fstable_runtime_params()
+    if nant is None or refmjd is None:
+        return jsonify({"ok": False, "error": perr or "cnf missing"}), 500
+
+    try:
+        status = fp.current_dec_status(
+            dec_deg=dec_deg, nant=nant, refmjd=refmjd,
+            corr_hosts=list(CORR_HOSTS),
+        )
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("current_dec_status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(status)
+
+
+@app.route("/control/fstables/build", methods=["POST"])
+def control_fstables_build_post():
+    """Build one per-DEC fringe-stopping table on h23 in casa38.
+
+    Form fields:
+
+      dec_deg     float, required — operator's raw pointing dec;
+                  snapped to the 0.25° grid before the build script
+                  is invoked.
+      force       optional "true"/"false" (default false). When true
+                  we pass ``--force`` so an existing master file is
+                  overwritten.
+
+    Synchronous; ~30 s per DEC. Audited.
+    """
+    import fstable_panel as fp                              # local
+    user = request.form.get("user") or request.remote_addr or "anon"
+    dec_raw = (request.form.get("dec_deg") or "").strip()
+    if not dec_raw:
+        return jsonify({"ok": False, "error": "dec_deg required"}), 400
+    try:
+        dec_deg = float(dec_raw)
+    except ValueError:
+        return jsonify({"ok": False, "error": f"bad dec_deg={dec_raw!r}"}), 400
+    force = (request.form.get("force") or "").strip().lower() in ("true", "1", "yes")
+
+    nant, refmjd, perr = _fstable_runtime_params()
+    if nant is None or refmjd is None:
+        return jsonify({"ok": False, "error": perr or "cnf missing"}), 500
+
+    try:
+        res = fp.build_table_for_dec(
+            dec_deg=dec_deg, nant=nant, refmjd=refmjd, force=force,
+        )
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("build_table_for_dec failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    try:
+        audit_log(
+            control_store,
+            namespace="control",
+            cn_target="h23",
+            cmd="fstable_build",
+            val={
+                "dec_deg_raw": res.dec_deg_raw,
+                "dec_deg_grid": res.dec_deg_grid,
+                "filename": res.expected_filename,
+                "nant": nant, "refmjd": refmjd, "force": force,
+            },
+            ok=bool(res.ok),
+            note=(
+                f"elapsed={res.elapsed_s:.1f}s rc={res.rc} "
+                f"err={res.error!r}"
+            ),
+            user=user,
+        )
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("audit_log fstable_build also failed (continuing)")
+    return jsonify(res.to_dict())
+
+
+@app.route("/control/fstables/deploy", methods=["POST"])
+def control_fstables_deploy_post():
+    """rsync one h23 master ``*.npz`` to every corr node.
+
+    Form fields:
+
+      filename   basename (e.g.
+                 ``fringestopping_table_dec_+54.5000deg_96ant_refmjd58849.000000.npz``),
+                 required. Must exist in
+                 :data:`fstable_panel.H23_MASTER_DIR`.
+
+    Returns per-host rsync results; ``all_ok=False`` if any host
+    failed. Audited.
+    """
+    import fstable_panel as fp                              # local
+    from services_inventory import CORR_HOSTS
+    user = request.form.get("user") or request.remote_addr or "anon"
+    filename = (request.form.get("filename") or "").strip()
+    if not filename:
+        return jsonify({"ok": False, "error": "filename required"}), 400
+    # Belt-and-braces: refuse anything with a path separator or '..'
+    # so a malformed/spoofed form can't ship arbitrary files out.
+    if "/" in filename or "\\" in filename or filename.startswith(".."):
+        return jsonify({"ok": False, "error": "filename must be a bare basename"}), 400
+
+    try:
+        result = fp.deploy_table_to_fleet(filename, list(CORR_HOSTS))
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("deploy_table_to_fleet failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    try:
+        audit_log(
+            control_store,
+            namespace="control",
+            cn_target="fleet",
+            cmd="fstable_deploy",
+            val={"filename": filename},
+            ok=bool(result.get("all_ok")),
+            note=(
+                "hosts ok="
+                f"{sum(1 for h in result.get('hosts', []) if h.get('ok'))}/"
+                f"{len(result.get('hosts', []))}"
+            ),
+            user=user,
+        )
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("audit_log fstable_deploy also failed (continuing)")
+    return jsonify(result)
+
+
 @app.route("/control/dump_now", methods=["POST"])
 def control_dump_now_post():
     """M7.4 Phase 6c: broadcast a one-shot synthetic C2 trigger to

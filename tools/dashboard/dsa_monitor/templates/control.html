@@ -108,6 +108,43 @@
     .ss-prepared  { border-left-color:#2ecc71; } .ss-prepared  .dot{background:#2ecc71;box-shadow:0 0 0 4px rgba(46,204,113,.30);} .ss-prepared  .label{color:#67e29a;}
     .ss-observing { border-left-color:#1abc9c; } .ss-observing .dot{background:#1dd1a1;box-shadow:0 0 0 4px rgba(29,209,161,.35);animation:sspulse 1.6s infinite;} .ss-observing .label{color:#5ee7c8;}
     @keyframes sspulse { 0%{opacity:1;} 50%{opacity:.30;} 100%{opacity:1;} }
+
+    /* ---- fstable traffic light (inline next to Start fleet) -------- */
+    .fst-light {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 3px 8px; border-radius: 999px;
+        font-family: 'Menlo','Consolas',monospace; font-size: 11px;
+        font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+        background: #0d1419; border: 1px solid #33485a; color: #aebcc7;
+        cursor: help;
+    }
+    .fst-light .dot {
+        width: 9px; height: 9px; border-radius: 50%;
+        background: #7f8c8d; box-shadow: 0 0 0 3px rgba(127,140,141,.25);
+    }
+    .fst-light.green  { color:#67e29a; border-color:#2ecc71; }
+    .fst-light.green  .dot { background:#2ecc71; box-shadow:0 0 0 3px rgba(46,204,113,.30); }
+    .fst-light.amber  { color:#ffc861; border-color:#f39c12; }
+    .fst-light.amber  .dot { background:#f39c12; box-shadow:0 0 0 3px rgba(243,156,18,.30); }
+    .fst-light.red    { color:#ff8b7e; border-color:#e74c3c; }
+    .fst-light.red    .dot { background:#e74c3c; box-shadow:0 0 0 3px rgba(231,76,60,.30); animation:sspulse 1.5s infinite; }
+    .fst-light.unknown { color:#aebcc7; }
+
+    /* ---- fstable inventory table -------------------------------- */
+    .fst-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .fst-table th, .fst-table td {
+        padding:4px 8px; border-bottom:1px solid #2c3e4c;
+        text-align:left; color:#d4dde4; vertical-align:middle;
+    }
+    .fst-table th {
+        background:#22323f; color:#aebcc7; text-transform:uppercase;
+        font-size:11px; letter-spacing:.04em; position:sticky; top:0;
+    }
+    .fst-table tr.current { background:rgba(52,152,219,0.08); }
+    .fst-table .cell-yes { color:#4cd97b; font-weight:700; text-align:center; }
+    .fst-table .cell-no  { color:#ff6b6b; font-weight:700; text-align:center; }
+    .fst-table .cell-na  { color:#7f8c8d; text-align:center; }
+    .fst-host-col { font-family:monospace; font-size:10px; }
 </style>
 {% endblock %}
 
@@ -119,6 +156,7 @@
     <h3>Jump to</h3>
     <ul>
         <li><a href="#panel-verbs">Verbs (start / arm / stop / restart / update)</a></li>
+        <li><a href="#panel-fstables">Fringe-stopping tables (per-DEC cache)</a></li>
         <li><a href="#panel-c2-quickops">C2 recovery &amp; activity</a></li>
         <li><a href="#panel-services">Fleet services</a></li>
         <li><a href="#panel-inject">Signal injection</a></li>
@@ -150,12 +188,24 @@
         <h3>Verbs</h3>
 
         <!-- start -->
-        <form id="form-start" onsubmit="return submitVerb(event, '/control/start', 'resp-start');">
+        <form id="form-start" onsubmit="return guardedStart(event);">
             <div class="verb-row">
                 <label for="obs_dec_deg">obs_dec_deg</label>
                 <input type="text" id="obs_dec_deg" name="obs_dec_deg"
-                       placeholder="(auto from etcd)" />
+                       placeholder="(auto from etcd)"
+                       oninput="scheduleFstStatusRefresh();" />
                 <button type="submit">Start fleet</button>
+                <!-- Traffic light: fringe-stopping table presence for
+                     the operator's (or etcd-derived) DEC. RED means
+                     meridian_fringestop will crash at startup; the
+                     2026-06-03 cold-start deadlock landed when the
+                     dashboard did not flag this. -->
+                <span id="fst-light" class="fst-light unknown"
+                      title="fringe-stopping table status"
+                      onclick="document.getElementById('panel-fstables').scrollIntoView({behavior:'smooth'});">
+                    <span class="dot"></span>
+                    <span id="fst-light-text">fstable: …</span>
+                </span>
             </div>
             <div class="muted">
                 First runs <strong>node housekeeping</strong> — ssh-fanout
@@ -303,6 +353,399 @@
         </form>
     </div>
 </div>
+
+<!-- Fringe-stopping table inventory + build + deploy. Surfaced
+     2026-06-03 after the missing dec=+54.5 cache file crashed
+     meridian_fringestop at cold-start and deadlocked corr_fast via
+     bada → fada back-pressure. The traffic light next to "Start fleet"
+     above flags this same condition. -->
+<div class="panel" style="margin-top: 24px;" id="panel-fstables">
+    <h3>Fringe-stopping tables (per-DEC cache)</h3>
+    <p class="muted">
+        <code>meridian_fringestop</code> refuses to start when its
+        per-DEC fringe-stopping table is missing. Once it crashes,
+        <code>corr_slow</code> blocks writing <code>bada</code> →
+        the multi-reader <code>fada</code> ring deadlocks against
+        <code>corr_slow</code>'s stall → <code>corr_fast</code> hangs
+        in <code>getNextPage()</code> ~300 cubes later. Build the
+        cache file for the current pointing DEC <strong>before</strong>
+        hitting Start. <em>h23 keeps the master copy under
+        <code>&lt;repo&gt;/var/fstables/</code> (gitignored). Deploy
+        rsyncs it to <code>/home/ubuntu/data/fstables/</code> on
+        every corr node.</em> Builds run in <code>casa38</code> on
+        h23 via <code>tools/build_fstable_cache.py --from-etcd</code>
+        (~4-5 min/DEC at nant=96).
+    </p>
+
+    <!-- Build form -->
+    <form id="form-fstable-build" onsubmit="return submitFstableBuild(event);">
+        <div class="verb-row">
+            <label for="fst_build_dec">obs_dec_deg</label>
+            <input type="number" id="fst_build_dec" name="dec_deg"
+                   step="0.0001" placeholder="(e.g. 54.5734)" required />
+            <label for="fst_build_force" style="min-width:auto;">
+                <input type="checkbox" id="fst_build_force" name="force" value="true" />
+                force (overwrite)
+            </label>
+            <button type="submit">Build for this DEC</button>
+            <button type="button" onclick="refreshFstables();">Refresh inventory</button>
+            <button type="button" onclick="refreshFstStatus();">Refresh traffic light</button>
+        </div>
+        <div class="muted">
+            DEC is snapped to the runtime grid step
+            (<code>0.25°</code>, see
+            <code>meridian_fringestop_rt.snap_dec_to_grid</code>)
+            before the build script is invoked, so passing
+            <code>54.5734</code> creates the table
+            <code>+54.5000deg</code>. Synchronous; the dashboard
+            worker blocks for ~4-5 min/DEC.
+        </div>
+        <div id="resp-fstable-build" class="response"></div>
+    </form>
+
+    <h4 style="margin-top: 14px;">Current pointing DEC</h4>
+    <div id="fst-current-status" class="info-blob"
+         style="font-size:12px;">
+        <em>(loading…)</em>
+    </div>
+
+    <h4 style="margin-top: 14px;">Inventory</h4>
+    <div id="fst-inventory" class="muted">
+        <em>(click "Refresh inventory" to load — fans ssh out to every corr node)</em>
+    </div>
+</div>
+
+<script>
+//
+// Fringe-stopping-table panel — list / build / deploy + traffic light
+// next to the Start fleet button. The traffic-light status is fetched
+// independently of the full inventory so the operator sees a snappy
+// red/amber/green update as soon as they type a DEC in the start form.
+//
+let _fstStatusTimer = null;
+let _fstInventoryCache = null;   // last /control/fstables/list payload
+
+function scheduleFstStatusRefresh() {
+    if (_fstStatusTimer !== null) {
+        clearTimeout(_fstStatusTimer);
+    }
+    _fstStatusTimer = setTimeout(() => {
+        _fstStatusTimer = null;
+        refreshFstStatus();
+    }, 350);
+}
+
+async function refreshFstStatus() {
+    const lightEl = document.getElementById("fst-light");
+    const lightTxtEl = document.getElementById("fst-light-text");
+    const detailEl = document.getElementById("fst-current-status");
+    const dec_raw = (document.getElementById("obs_dec_deg") || {}).value || "";
+    let url = "/control/fstables/current_status";
+    if (dec_raw.trim() !== "") {
+        url += "?dec_deg=" + encodeURIComponent(dec_raw.trim());
+    }
+    try {
+        const r = await fetch(url);
+        const d = await r.json();
+        if (!d.ok) {
+            lightEl.className = "fst-light unknown";
+            lightTxtEl.textContent = "fstable: error";
+            detailEl.innerHTML = "<span class='err'>error: " + (d.error || "unknown") + "</span>";
+            return;
+        }
+        lightEl.className = "fst-light " + (d.light || "unknown");
+        if (d.light === "green") {
+            lightTxtEl.textContent =
+                "fstable OK (" + d.dec_deg_grid.toFixed(4) + "°)";
+        } else if (d.light === "amber") {
+            lightTxtEl.textContent =
+                "fstable: deploy needed (" +
+                (d.corr_hosts_missing_table || []).length + " missing)";
+        } else if (d.light === "red") {
+            lightTxtEl.textContent =
+                "fstable MISSING (build needed)";
+        } else {
+            lightTxtEl.textContent = "fstable: " + (d.message || "—");
+        }
+        // Render the detail blob.
+        if (d.dec_deg_raw === null || d.dec_deg_raw === undefined) {
+            detailEl.innerHTML =
+                "<em>(no DEC set — type one above or set <code>/mon/array/dec</code>)</em>";
+            return;
+        }
+        let html = "<div><strong>raw DEC:</strong> " +
+            d.dec_deg_raw.toFixed(4) + "°" +
+            " &nbsp; <strong>grid-snapped:</strong> " +
+            d.dec_deg_grid.toFixed(4) + "°</div>" +
+            "<div><strong>expected file:</strong> <code>" +
+            d.expected_filename + "</code></div>" +
+            "<div style='margin-top:4px;'>" + d.message + "</div>";
+        if (d.corr_hosts_missing_table && d.corr_hosts_missing_table.length > 0) {
+            html += "<div><strong>missing on:</strong> <code>" +
+                d.corr_hosts_missing_table.join("</code> <code>") + "</code></div>";
+        }
+        if (d.corr_hosts_unreachable && d.corr_hosts_unreachable.length > 0) {
+            html += "<div class='err'><strong>unreachable:</strong> <code>" +
+                d.corr_hosts_unreachable.join("</code> <code>") + "</code></div>";
+        }
+        // Deploy-this-DEC convenience button (only useful when h23 has it).
+        if (d.h23_has_table) {
+            html += "<div style='margin-top:6px;'>" +
+                "<button type='button' onclick=\"deployFstable('" +
+                d.expected_filename + "');\">Deploy this table to fleet</button>" +
+                " <span id='resp-fstable-deploy-quick' class='response'></span>" +
+                "</div>";
+        }
+        detailEl.innerHTML = html;
+    } catch (err) {
+        lightEl.className = "fst-light unknown";
+        lightTxtEl.textContent = "fstable: fetch error";
+        detailEl.innerHTML = "<span class='err'>fetch error: " + err + "</span>";
+    }
+}
+
+async function submitFstableBuild(event) {
+    event.preventDefault();
+    const form = event.target;
+    const respEl = document.getElementById("resp-fstable-build");
+    respEl.innerHTML = "<em>building (~4-5 min in casa38; do not navigate away)…</em>";
+    const fd = new FormData(form);
+    try {
+        const r = await fetch("/control/fstables/build", {method: "POST", body: fd});
+        const d = await r.json();
+        if (d.ok) {
+            respEl.innerHTML = "<span class='ok'>built " +
+                d.expected_filename + " in " + d.elapsed_s.toFixed(1) + "s</span>" +
+                "<div class='muted'>output: <code>" + d.output_path + "</code></div>";
+        } else {
+            respEl.innerHTML = "<span class='err'>build failed: " +
+                (d.error || "rc=" + d.rc) + "</span>";
+            if (d.stderr_tail) {
+                respEl.innerHTML += "<pre class='info-blob'>" +
+                    d.stderr_tail.replace(/</g, "&lt;") + "</pre>";
+            }
+        }
+    } catch (err) {
+        respEl.innerHTML = "<span class='err'>fetch error: " + err + "</span>";
+    }
+    // Refresh both the inventory and the traffic light.
+    refreshFstables();
+    refreshFstStatus();
+    return false;
+}
+
+async function deployFstable(filename) {
+    const respEl = document.getElementById("resp-fstable-deploy-quick");
+    if (respEl) respEl.innerHTML = "<em>rsyncing…</em>";
+    try {
+        const fd = new FormData();
+        fd.append("filename", filename);
+        const r = await fetch("/control/fstables/deploy", {method: "POST", body: fd});
+        const d = await r.json();
+        if (d.ok && d.all_ok) {
+            if (respEl) respEl.innerHTML =
+                "<span class='ok'>deployed to all " + d.hosts.length + " corr nodes</span>";
+        } else {
+            const fails = (d.hosts || []).filter(h => !h.ok);
+            const failNames = fails.map(h => h.host).join(", ");
+            if (respEl) respEl.innerHTML =
+                "<span class='err'>deploy failed on " + fails.length +
+                " host(s): " + failNames + "</span>";
+        }
+    } catch (err) {
+        if (respEl) respEl.innerHTML = "<span class='err'>fetch error: " + err + "</span>";
+    }
+    refreshFstables();
+    refreshFstStatus();
+}
+
+async function refreshFstables() {
+    const tgt = document.getElementById("fst-inventory");
+    tgt.innerHTML = "<em>Loading… (parallel ssh ls to 16 corr nodes; ~3-5 s)</em>";
+    try {
+        const r = await fetch("/control/fstables/list");
+        const d = await r.json();
+        if (!d.ok) {
+            tgt.innerHTML = "<span class='err'>error: " + (d.error || "unknown") + "</span>";
+            return;
+        }
+        _fstInventoryCache = d;
+        tgt.innerHTML = renderFstableInventory(d);
+    } catch (err) {
+        tgt.innerHTML = "<span class='err'>fetch error: " + err + "</span>";
+    }
+}
+
+function renderFstableInventory(payload) {
+    // payload: { h23: [{filename, dec_deg, nant, refmjd, ...}],
+    //            fleet: {host: {ok, entries, error}} }
+    const hosts = Object.keys(payload.fleet || {}).sort();
+    if (hosts.length === 0 && (payload.h23 || []).length === 0) {
+        return "<em>(no tables anywhere yet — build one with the form above)</em>";
+    }
+
+    // Build a per-DEC index across h23 + all hosts.
+    // Key = (filename). Each row: filename, dec, nant, refmjd, h23_yes, per_host {host: yes/no/na}.
+    const rows = new Map();
+    const seedRow = (fname, parsed) => {
+        if (!rows.has(fname)) {
+            rows.set(fname, {
+                filename: fname,
+                dec_deg: parsed ? parsed.dec_deg : null,
+                nant:    parsed ? parsed.nant    : null,
+                refmjd:  parsed ? parsed.refmjd  : null,
+                h23: false,
+                per_host: {},
+            });
+        }
+        return rows.get(fname);
+    };
+
+    for (const e of (payload.h23 || [])) {
+        const r = seedRow(e.filename, e);
+        r.h23 = true;
+    }
+    for (const h of hosts) {
+        const info = payload.fleet[h];
+        if (!info.ok) continue;
+        for (const e of (info.entries || [])) {
+            const r = seedRow(e.filename, e);
+            r.per_host[h] = true;
+        }
+    }
+    // Sort rows by dec_deg ascending.
+    const sortedRows = [...rows.values()].sort((a, b) => {
+        if (a.dec_deg === null) return 1;
+        if (b.dec_deg === null) return -1;
+        return a.dec_deg - b.dec_deg;
+    });
+
+    // Header: dec | nant | refmjd | h23 | <per-host columns> | deploy.
+    let html = "<div style='max-height:520px; overflow:auto; border:1px solid #2c3e4c; border-radius:6px;'>";
+    html += "<table class='fst-table'>";
+    html += "<thead><tr>";
+    html += "<th>dec (°)</th><th>nant</th><th>refmjd</th>";
+    html += "<th>h23</th>";
+    for (const h of hosts) {
+        // Strip the .pro.pvt suffix for compactness.
+        const short = h.replace(/\.pro\.pvt$/, "");
+        const infoH = payload.fleet[h];
+        const cls = infoH.ok ? "fst-host-col" : "fst-host-col err";
+        const tt = infoH.ok ? h : (h + " — " + (infoH.error || "error"));
+        html += `<th class="${cls}" title="${tt}">${short}</th>`;
+    }
+    html += "<th>action</th>";
+    html += "</tr></thead><tbody>";
+
+    for (const row of sortedRows) {
+        html += "<tr>";
+        if (row.dec_deg === null) {
+            html += "<td><code>" + row.filename + "</code></td>";
+            html += "<td class='cell-na'>?</td><td class='cell-na'>?</td>";
+        } else {
+            html += "<td><code>" + row.dec_deg.toFixed(4) + "</code></td>";
+            html += "<td>" + (row.nant === null ? "?" : row.nant) + "</td>";
+            html += "<td><code>" + (row.refmjd === null ? "?" : row.refmjd.toFixed(6)) + "</code></td>";
+        }
+        html += row.h23
+            ? "<td class='cell-yes'>✓</td>"
+            : "<td class='cell-no'>✗</td>";
+        for (const h of hosts) {
+            const infoH = payload.fleet[h];
+            if (!infoH.ok) {
+                html += "<td class='cell-na' title='" + (infoH.error || "error") + "'>—</td>";
+            } else if (row.per_host[h]) {
+                html += "<td class='cell-yes'>✓</td>";
+            } else {
+                html += "<td class='cell-no'>✗</td>";
+            }
+        }
+        // Deploy button only enabled when h23 has it.
+        if (row.h23) {
+            html += "<td><button type='button' onclick=\"deployFstable('" + row.filename + "');\">Deploy</button></td>";
+        } else {
+            html += "<td class='cell-na'>build first</td>";
+        }
+        html += "</tr>";
+    }
+    html += "</tbody></table></div>";
+
+    // Per-host error footer.
+    const errored = hosts.filter(h => !payload.fleet[h].ok);
+    if (errored.length > 0) {
+        html += "<div class='muted' style='margin-top:6px;'>" +
+            "Unreachable / errored hosts: " +
+            errored.map(h => "<code>" + h + " — " +
+                (payload.fleet[h].error || "?") + "</code>").join(", ") +
+            "</div>";
+    }
+    return html;
+}
+
+// Fire the traffic light shortly after the page loads, then every 60 s
+// so it stays fresh while the operator is in the Control tab.
+window.addEventListener("DOMContentLoaded", () => {
+    refreshFstStatus();
+    setInterval(refreshFstStatus, 60000);
+});
+
+// Wrap "Start fleet" so a RED fstable light prompts the operator
+// before submitting. AMBER also warns but defaults to "OK"; GREEN /
+// UNKNOWN pass through silently (the dashboard can't fully verify
+// reachability on every page so we don't block on UNKNOWN). The
+// underlying /control/start verb is unchanged — this is purely a
+// client-side speed bump on the regression that landed 2026-06-03.
+async function guardedStart(event) {
+    const lightEl = document.getElementById("fst-light");
+    let cls = (lightEl && lightEl.className) || "";
+    // Pull fresh status synchronously so a stale 60-s-old light
+    // doesn't let a RED through.
+    try {
+        const dec_raw = (document.getElementById("obs_dec_deg") || {}).value || "";
+        const url = "/control/fstables/current_status" +
+            (dec_raw.trim() !== "" ? "?dec_deg=" + encodeURIComponent(dec_raw.trim()) : "");
+        const r = await fetch(url);
+        const d = await r.json();
+        if (d.ok) {
+            cls = "fst-light " + (d.light || "unknown");
+            if (lightEl) {
+                lightEl.className = cls;
+                const txt = document.getElementById("fst-light-text");
+                if (txt) {
+                    if (d.light === "green") {
+                        txt.textContent = "fstable OK (" + (d.dec_deg_grid !== null
+                            ? d.dec_deg_grid.toFixed(4) + "°" : "—") + ")";
+                    } else if (d.light === "red") {
+                        txt.textContent = "fstable MISSING (build needed)";
+                    } else {
+                        txt.textContent = "fstable: " + (d.light || "—");
+                    }
+                }
+            }
+            if (d.light === "red") {
+                const ok = window.confirm(
+                    "fstable traffic light is RED: " + (d.message || "no corr node has the table") +
+                    "\n\nStarting will almost certainly crash meridian_fringestop at startup, " +
+                    "which deadlocks corr_fast within ~300 cubes (2026-06-03 regression).\n\n" +
+                    "Proceed anyway?"
+                );
+                if (!ok) return false;
+            } else if (d.light === "amber") {
+                const ok = window.confirm(
+                    "fstable traffic light is AMBER: " + (d.message || "partial fleet coverage") +
+                    "\n\nSome corr nodes will fail to start. Proceed anyway?"
+                );
+                if (!ok) return false;
+            }
+        }
+    } catch (err) {
+        // Don't block start on a transient fetch failure of the
+        // status endpoint; surface it but proceed.
+        console.warn("guardedStart: status fetch failed:", err);
+    }
+    return submitVerb(event, '/control/start', 'resp-start');
+}
+</script>
 
 <!-- M7.4 Phase 8 v3: C2 recovery & activity -->
 <div class="panel" style="margin-top: 24px;" id="panel-c2-quickops">
