@@ -629,9 +629,11 @@ def control_inject_post():
       fluence_jy_ms   float — required iff ``target_snr`` is unset
       target_snr      float (optional). When set, the dashboard
                       derives ``fluence_jy_ms`` from the stored K
-                      calibration for the (dm_band, width) bucket
-                      and uses that instead of any operator-supplied
-                      fluence. Returns 412 if K is missing.
+                      calibration for the DM-band bucket (K is
+                      width-independent post-F-fix-injector-fluence-
+                      norm) and uses that instead of any operator-
+                      supplied fluence. Returns 412 if K is missing
+                      for the DM band.
       width_samples   int, 1..MAX_WIDTH_SAMPLES
       profile         "gaussian" | "boxcar"
       apply_at_specnum   int (omit → auto-arm via
@@ -676,22 +678,16 @@ def control_inject_post():
             }), 400
         import inject_calibration as ic  # local
         cs = ic.CalibrationStore(control_store)
-        entry = cs.get(
-            dm_pc_cm3=float(kwargs["dm_pc_cm3"]),
-            width_samples=int(kwargs["width_samples"]),
-        )
+        entry = cs.get(dm_pc_cm3=float(kwargs["dm_pc_cm3"]))
         if entry is None or not (entry.K > 0):
             return jsonify({
                 "ok": False,
                 "error": (
-                    f"No K calibration for bucket "
-                    f"{ic.bucket_key(float(kwargs['dm_pc_cm3']), int(kwargs['width_samples']))}; "
-                    f"run /control/inject_calibrate first."
+                    f"No K calibration for DM bucket "
+                    f"{ic.bucket_key(float(kwargs['dm_pc_cm3']))}; "
+                    f"run /control/inject_calibrate first (any width)."
                 ),
-                "bucket": ic.bucket_key(
-                    float(kwargs["dm_pc_cm3"]),
-                    int(kwargs["width_samples"]),
-                ),
+                "bucket": ic.bucket_key(float(kwargs["dm_pc_cm3"])),
             }), 412
         try:
             fluence = ic.snr_to_fluence(
@@ -760,7 +756,12 @@ def control_inject_post():
 @app.route("/control/inject_calibrate", methods=["POST"])
 def control_inject_calibrate_post():
     """M7.4 Phase 6c.A: fire one calibration probe and store the
-    resulting K for the (DM, width) bucket.
+    resulting K for the DM-band bucket.
+
+    K is width-independent post-F-fix-injector-fluence-norm — a probe
+    at any width pins K for every width within the band. The probe's
+    ``width_samples`` is recorded in the entry as informational
+    metadata only.
 
     Form fields (all optional except ``dm_pc_cm3``):
 
@@ -855,7 +856,13 @@ def control_inject_calibrate_post():
 
 @app.route("/control/inject_calibrations", methods=["GET"])
 def control_inject_calibrations_get():
-    """List every persisted (DM, width) calibration bucket."""
+    """List every persisted DM-band calibration bucket.
+
+    Legacy ``dmNNNN_wWWWW`` rows (pre-F-fix-injector-fluence-norm)
+    are returned alongside the new ``dmNNNN`` rows so the operator
+    can spot and wipe them via the "Delete fluence/SNR calibration"
+    Control verb.
+    """
     import inject_calibration as ic   # local
     cs = ic.CalibrationStore(control_store)
     try:

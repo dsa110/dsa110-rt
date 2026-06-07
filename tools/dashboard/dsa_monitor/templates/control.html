@@ -948,13 +948,14 @@ async function guardedStart(event) {
             steady-state cubes/s rate.
             <br>
             Set <code>target_snr</code> to inject at a specific SNR;
-            the dashboard reads the stored K for the (DM, width)
-            bucket and derives <code>fluence_jy_ms</code> via
-            <code>fluence = width × (target_snr / K)²</code>. The
+            the dashboard reads the stored K for the DM bucket
+            (width-independent) and derives <code>fluence_jy_ms</code>
+            via <code>fluence = width × (target_snr / K)²</code>. The
             <code>fluence_jy_ms</code> field is ignored when
             <code>target_snr</code> is set. If no K is stored for the
-            bucket the inject returns <code>412 Precondition Failed</code>
-            — run the Calibrate panel below first.
+            DM band the inject returns <code>412 Precondition Failed</code>
+            — run the Calibrate panel below first (any width pins K for
+            the band).
             <br>
             Defaults shown produce a 50 Jy·ms / DM=500 / width=32-
             sample test pulse at boresight — good first smoke test
@@ -968,14 +969,18 @@ async function guardedStart(event) {
 <div class="panel" style="margin-top: 24px;" id="panel-calibrate">
     <h3>Injection SNR calibration (M7.4 Phase 6c.A)</h3>
     <p class="muted">
-        Fires one known-fluence probe at the chosen <code>(DM,
-        width)</code> bucket and reads the resulting C1-candidate
-        SNR back via <code>/mon/dsart/inject/matches/&lt;inj_id&gt;</code>.
+        Fires one known-fluence probe at the chosen DM and reads the
+        resulting C1-candidate SNR back via
+        <code>/mon/dsart/inject/matches/&lt;inj_id&gt;</code>.
         From that pair the dashboard computes
         <code>K = observed_snr × √(width / fluence)</code> and stores
-        it at <code>/cnf/inject/snr_calibration/&lt;bucket&gt;</code>.
+        it at <code>/cnf/inject/snr_calibration/dmNNNN</code>.
         Subsequent injections at a <code>target_snr</code> derive
-        their fluence from this <code>K</code>.
+        their fluence from this <code>K</code>. <strong>K is
+        width-independent</strong> post-fix — one probe at any width
+        pins K for every width within the DM band; the
+        <code>width</code> field below is just the probe's own pulse
+        shape (informational metadata in the stored entry).
         <br>
         <strong>Disable cube dumps</strong> with the dumps gate above
         before calibrating so that bright probes don't trigger the
@@ -1304,7 +1309,7 @@ async function submitDeleteSnrCal(ev, dryRun) {
         });
         html += "<table class='audit-table' style='margin-top:8px;'>" +
             "<thead><tr>" +
-            "<th>bucket</th><th>DM</th><th>width</th><th>K</th>" +
+            "<th>bucket</th><th>DM</th><th>probe width</th><th>K</th>" +
             "<th>status</th><th>error</th>" +
             "</tr></thead><tbody>" + rows + "</tbody></table>";
     } else if (j.summary && j.summary.n_buckets === 0) {

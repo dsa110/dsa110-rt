@@ -84,36 +84,39 @@ class FakeStore:
 
 class TestBucketKey:
     @pytest.mark.parametrize(
-        "dm,width,expected",
+        "dm,expected",
         [
-            (500.0, 32, "dm0500_w0032"),
-            (150.0, 64, "dm0150_w0064"),
-            (1500.0, 32, "dm1500_w0032"),
-            (149.9, 32, "dm0150_w0032"),  # rounds to 150
-            (174.9, 32, "dm0150_w0032"),  # rounds to 150 (well below .5)
-            (526.0, 32, "dm0550_w0032"),  # 526 > 525, unambiguously rounds up
-            (524.0, 32, "dm0500_w0032"),  # 524 < 525, unambiguously rounds down
-            (1530.0, 32, "dm1550_w0032"),
+            (500.0, "dm0500"),
+            (150.0, "dm0150"),
+            (1500.0, "dm1500"),
+            (149.9, "dm0150"),  # rounds to 150
+            (174.9, "dm0150"),  # rounds to 150 (well below .5)
+            (526.0, "dm0550"),  # 526 > 525, unambiguously rounds up
+            (524.0, "dm0500"),  # 524 < 525, unambiguously rounds down
+            (1530.0, "dm1550"),
         ],
     )
-    def test_known_buckets(self, dm, width, expected):
+    def test_known_buckets(self, dm, expected):
         # Python's round() uses banker's rounding (round-half-to-even);
         # boundary values (n + 0.5) are avoided here to keep the test
         # deterministic across platforms.
-        assert ic.bucket_key(dm, width) == expected
-
-    def test_bad_width_raises(self):
-        with pytest.raises(ValueError):
-            ic.bucket_key(500.0, 0)
+        assert ic.bucket_key(dm) == expected
 
     def test_nan_dm_raises(self):
         with pytest.raises(ValueError):
-            ic.bucket_key(float("nan"), 32)
+            ic.bucket_key(float("nan"))
 
     def test_calibration_key_uses_prefix(self):
-        assert ic.calibration_key(500.0, 32) == (
-            ic.CALIBRATION_PREFIX + "dm0500_w0032"
-        )
+        assert ic.calibration_key(500.0) == ic.CALIBRATION_PREFIX + "dm0500"
+
+    def test_is_legacy_bucket(self):
+        # Pre-fix per-(DM, width) keys should be flagged as legacy so
+        # the operator can wipe them via delete_snr_calibrations.
+        assert ic.is_legacy_bucket("dm0500_w0032")
+        assert ic.is_legacy_bucket("dm1500_w0064")
+        # Post-fix DM-only keys are NOT legacy.
+        assert not ic.is_legacy_bucket("dm0500")
+        assert not ic.is_legacy_bucket("dm1500")
 
 
 class TestSnrToFluence:
@@ -148,49 +151,75 @@ class TestCalibrationStore:
         store = FakeStore()
         cs = ic.CalibrationStore(store)
         entry = ic.CalibrationEntry(
-            bucket="dm0500_w0032", dm_pc_cm3_rounded=500, width_samples=32,
+            bucket="dm0500", dm_pc_cm3_rounded=500, width_samples=32,
             K=7.5, last_fluence_jy_ms=100.0, last_observed_snr=12.34,
             last_inj_id="cal_x", last_calibrated_at_unix=1_700_000_000.0,
             actor="tester",
         )
         key = cs.put(entry)
-        assert key == ic.CALIBRATION_PREFIX + "dm0500_w0032"
-        roundtrip = cs.get(dm_pc_cm3=500.0, width_samples=32)
+        assert key == ic.CALIBRATION_PREFIX + "dm0500"
+        roundtrip = cs.get(dm_pc_cm3=500.0)
         assert roundtrip is not None
         assert roundtrip == entry
 
     def test_get_missing_returns_none(self):
         cs = ic.CalibrationStore(FakeStore())
-        assert cs.get(dm_pc_cm3=500.0, width_samples=32) is None
+        assert cs.get(dm_pc_cm3=500.0) is None
 
     def test_get_bad_payload_returns_none(self):
         store = FakeStore()
-        store.kv[ic.CALIBRATION_PREFIX + "dm0500_w0032"] = {"junk": True}
+        store.kv[ic.CALIBRATION_PREFIX + "dm0500"] = {"junk": True}
         cs = ic.CalibrationStore(store)
-        assert cs.get(dm_pc_cm3=500.0, width_samples=32) is None
+        assert cs.get(dm_pc_cm3=500.0) is None
+
+    def test_get_ignores_legacy_per_width_keys(self):
+        # Pre-fix entries lived under dmNNNN_wWWWW. The new DM-only
+        # lookup must NOT see them (they remain visible to list_all
+        # and delete_snr_calibrations so the operator can wipe them).
+        store = FakeStore()
+        store.kv[ic.CALIBRATION_PREFIX + "dm0500_w0032"] = ic.CalibrationEntry(
+            bucket="dm0500_w0032", dm_pc_cm3_rounded=500, width_samples=32,
+            K=99.0, last_fluence_jy_ms=100.0, last_observed_snr=99.0,
+            last_inj_id="legacy", last_calibrated_at_unix=1.0,
+        ).to_dict()
+        cs = ic.CalibrationStore(store)
+        assert cs.get(dm_pc_cm3=500.0) is None
+
+    def test_get_is_width_independent(self):
+        # K is stored under the DM bucket only; lookups for any width
+        # at the same DM must return the same K.
+        store = FakeStore()
+        cs = ic.CalibrationStore(store)
+        cs.put(ic.CalibrationEntry(
+            bucket="dm0500", dm_pc_cm3_rounded=500, width_samples=32,
+            K=7.5, last_fluence_jy_ms=100.0, last_observed_snr=13.27,
+            last_inj_id="cal_w32", last_calibrated_at_unix=1.0,
+        ))
+        # Different injection widths all hit the same K.
+        for _w in (1, 4, 16, 32, 64, 128, 256):
+            got = cs.get(dm_pc_cm3=500.0)
+            assert got is not None and got.K == 7.5
 
     def test_list_all_returns_sorted(self):
         store = FakeStore()
         cs = ic.CalibrationStore(store)
         cs.put(ic.CalibrationEntry(
-            bucket="dm1500_w0032", dm_pc_cm3_rounded=1500, width_samples=32,
+            bucket="dm1500", dm_pc_cm3_rounded=1500, width_samples=32,
             K=8.0, last_fluence_jy_ms=100.0, last_observed_snr=20.0,
             last_inj_id="x", last_calibrated_at_unix=1.0,
         ))
         cs.put(ic.CalibrationEntry(
-            bucket="dm0150_w0032", dm_pc_cm3_rounded=150, width_samples=32,
+            bucket="dm0150", dm_pc_cm3_rounded=150, width_samples=32,
             K=5.0, last_fluence_jy_ms=100.0, last_observed_snr=12.0,
             last_inj_id="y", last_calibrated_at_unix=2.0,
         ))
         cs.put(ic.CalibrationEntry(
-            bucket="dm0500_w0032", dm_pc_cm3_rounded=500, width_samples=32,
+            bucket="dm0500", dm_pc_cm3_rounded=500, width_samples=32,
             K=7.0, last_fluence_jy_ms=100.0, last_observed_snr=15.0,
             last_inj_id="z", last_calibrated_at_unix=3.0,
         ))
         out = cs.list_all()
-        assert [e.bucket for e in out] == [
-            "dm0150_w0032", "dm0500_w0032", "dm1500_w0032",
-        ]
+        assert [e.bucket for e in out] == ["dm0150", "dm0500", "dm1500"]
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +361,7 @@ class TestFireCalibrationProbe:
         )
         assert result.ok is True
         assert result.reason == "ok"
-        assert result.bucket == "dm0500_w0032"
+        assert result.bucket == "dm0500"
         # K should match what we seeded.
         assert result.K == pytest.approx(
             20.0 * math.sqrt(32.0 / 100.0), rel=1e-9,
@@ -340,11 +369,16 @@ class TestFireCalibrationProbe:
         assert result.observed_snr == 20.0
         # Calibration entry persisted.
         cs = ic.CalibrationStore(store)
-        got = cs.get(dm_pc_cm3=500.0, width_samples=32)
+        got = cs.get(dm_pc_cm3=500.0)
         assert got is not None
         assert got.K == pytest.approx(result.K)
         assert got.last_fluence_jy_ms == 100.0
         assert got.last_observed_snr == 20.0
+        # Width is recorded as probe metadata only — the bucket is
+        # DM-only, so a hypothetical injection at a different width
+        # would read back the SAME K.
+        assert got.width_samples == 32
+        assert got.bucket == "dm0500"
 
     def test_fleet_lm_offset_match_still_stores_K(self):
         """Regression: a boresight-declared probe matched at the
@@ -383,10 +417,8 @@ class TestFireCalibrationProbe:
         )
         assert result.ok is True
         assert result.reason == "ok"
-        assert result.bucket == "dm0900_w0032"
-        assert ic.CalibrationStore(store).get(
-            dm_pc_cm3=900.0, width_samples=32,
-        ) is not None
+        assert result.bucket == "dm0900"
+        assert ic.CalibrationStore(store).get(dm_pc_cm3=900.0) is not None
 
     def test_no_match_returns_failure(self):
         store = FakeStore()
@@ -411,7 +443,7 @@ class TestFireCalibrationProbe:
         assert result.reason == "no_match"
         # CalibrationStore should NOT have been written.
         cs = ic.CalibrationStore(store)
-        assert cs.get(dm_pc_cm3=500.0, width_samples=32) is None
+        assert cs.get(dm_pc_cm3=500.0) is None
 
     def test_inject_failure_returns_failure(self):
         store = FakeStore()
@@ -520,7 +552,7 @@ class TestDeleteSnrCalibrations:
         cs = ic.CalibrationStore(store)
         for dm, width, K in [(150.0, 32, 9.5), (500.0, 64, 12.0)]:
             cs.put(ic.CalibrationEntry(
-                bucket=ic.bucket_key(dm, width),
+                bucket=ic.bucket_key(dm),
                 dm_pc_cm3_rounded=int(round(dm / 50.0) * 50),
                 width_samples=width,
                 K=K,
@@ -541,8 +573,7 @@ class TestDeleteSnrCalibrations:
         assert out["summary"]["n_present"] == 2
         assert all(b["status"] == "exists" for b in out["buckets"])
         # Nothing actually removed.
-        assert ic.CalibrationStore(store).get(
-            dm_pc_cm3=150.0, width_samples=32) is not None
+        assert ic.CalibrationStore(store).get(dm_pc_cm3=150.0) is not None
 
     def test_delete_removes_all_buckets(self):
         store = _FakeStoreRW()
@@ -556,8 +587,8 @@ class TestDeleteSnrCalibrations:
         assert all(b["status"] == "deleted" for b in out["buckets"])
         # Both buckets gone.
         cs = ic.CalibrationStore(store)
-        assert cs.get(dm_pc_cm3=150.0, width_samples=32) is None
-        assert cs.get(dm_pc_cm3=500.0, width_samples=64) is None
+        assert cs.get(dm_pc_cm3=150.0) is None
+        assert cs.get(dm_pc_cm3=500.0) is None
 
     def test_empty_table_is_ok(self):
         store = _FakeStoreRW()
@@ -565,3 +596,36 @@ class TestDeleteSnrCalibrations:
         assert out["ok"] is True
         assert out["summary"]["n_buckets"] == 0
         assert out["buckets"] == []
+
+    def test_delete_cleans_up_legacy_per_width_buckets(self):
+        # Legacy dmNNNN_wWWWW entries (pre-F-fix-injector-fluence-norm)
+        # are stale but must remain visible to delete_snr_calibrations
+        # so the operator can wipe them. Mix them with new dmNNNN
+        # entries and confirm both are listed and removable.
+        store = _FakeStoreRW()
+        cs = ic.CalibrationStore(store)
+        # Legacy: per-(DM, width)
+        cs.put(ic.CalibrationEntry(
+            bucket="dm0500_w0032", dm_pc_cm3_rounded=500, width_samples=32,
+            K=99.0, last_fluence_jy_ms=100.0, last_observed_snr=99.0,
+            last_inj_id="legacy_w32", last_calibrated_at_unix=1.0,
+        ))
+        cs.put(ic.CalibrationEntry(
+            bucket="dm0500_w0064", dm_pc_cm3_rounded=500, width_samples=64,
+            K=12.0, last_fluence_jy_ms=100.0, last_observed_snr=15.0,
+            last_inj_id="legacy_w64", last_calibrated_at_unix=2.0,
+        ))
+        # New: DM-only
+        cs.put(ic.CalibrationEntry(
+            bucket="dm1500", dm_pc_cm3_rounded=1500, width_samples=32,
+            K=8.0, last_fluence_jy_ms=100.0, last_observed_snr=14.0,
+            last_inj_id="new", last_calibrated_at_unix=3.0,
+        ))
+        out = ic.delete_snr_calibrations(store, dry_run=False, user="t")
+        assert out["ok"] is True
+        assert out["summary"]["n_buckets"] == 3
+        assert out["summary"]["n_deleted"] == 3
+        # Inspecting the bucket rows directly confirms we hit both
+        # the legacy keys and the new key.
+        seen = sorted(b["bucket"] for b in out["buckets"])
+        assert seen == ["dm0500_w0032", "dm0500_w0064", "dm1500"]

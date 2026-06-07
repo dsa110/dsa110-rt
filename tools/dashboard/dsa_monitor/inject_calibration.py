@@ -8,8 +8,8 @@ of that voltage scale". The operator wants to drive injections at a
 
 This module provides the two halves of a bootstrap calibration:
 
-1. :class:`CalibrationStore` — persists a per-``(dm_band, width)``
-   calibration constant ``K`` in etcd at
+1. :class:`CalibrationStore` — persists a per-``dm_band`` calibration
+   constant ``K`` in etcd at
    ``/cnf/inject/snr_calibration/<bucket>``. ``K`` parameterises
 
        observed_snr ≈ K × sqrt(fluence_jy_ms / width_samples)
@@ -19,9 +19,15 @@ This module provides the two halves of a bootstrap calibration:
        fluence_jy_ms = width_samples × (target_snr / K)^2.
 
    ``K`` depends on the search-side DM band (the coarse + fine
-   de-disperser path the injection drives) and the matched-filter
-   kernel width; we bucket by ``round(dm / 50) × 50`` and integer
-   width to give the operator a small, predictable table.
+   de-disperser path the injection drives); we bucket by
+   ``round(dm / 50) × 50`` to give the operator a small, predictable
+   table. ``K`` is **width-independent** post-F-fix-injector-fluence-
+   norm — the voltage-domain injector now obeys the radiometer law
+   ``observed_snr ∝ fluence/√width`` exactly, so a single calibration
+   probe at any width pins K for that DM band and predicts SNR for
+   every other width. (Pre-fix, the injector violated the law by a
+   factor of 1/W², which would have leaked into K and forced per-
+   width calibration; that constraint is now removed.)
 
 2. :func:`fire_calibration_probe` — fires one known-fluence injection
    with the existing :func:`control_store.control_inject_pulse`
@@ -123,35 +129,53 @@ DEFAULT_POLL_TIMEOUT_S: float = 30.0
 # ---------------------------------------------------------------------------
 
 
-def bucket_key(dm_pc_cm3: float, width_samples: int) -> str:
-    """Return the calibration bucket key for ``(dm, width)``.
+#: Substring marker for legacy ``dmNNNN_wWWWW`` bucket keys produced
+#: by the pre-F-fix-injector-fluence-norm dashboard. Such entries are
+#: stale (their K absorbed the buggy injector's 1/W² scaling) and are
+#: invisible to the new DM-only lookup; they remain visible to
+#: :func:`delete_snr_calibrations` so the operator can wipe them.
+LEGACY_BUCKET_INFIX: str = "_w"
 
-    Format: ``dm{rounded_dm:04d}_w{width:04d}``. Rounded DM is
-    ``round(dm / 50) × 50`` (clamped to ≥ 0). Width is the integer
-    sample count.
+
+def bucket_key(dm_pc_cm3: float) -> str:
+    """Return the calibration bucket key for ``dm``.
+
+    Format: ``dm{rounded_dm:04d}``. Rounded DM is
+    ``round(dm / 50) × 50`` (clamped to ≥ 0).
+
+    The bucket is intentionally width-independent: post-F-fix-injector-
+    fluence-norm the injector obeys ``observed_snr ∝ fluence/√width``
+    exactly, so K depends only on the DM band's coarse+fine
+    de-disperser path. One probe at any width pins K for the band.
 
     Examples
     --------
-    >>> bucket_key(500.0, 32)
-    'dm0500_w0032'
-    >>> bucket_key(150.0, 64)
-    'dm0150_w0064'
-    >>> bucket_key(1500.0, 32)
-    'dm1500_w0032'
+    >>> bucket_key(500.0)
+    'dm0500'
+    >>> bucket_key(150.0)
+    'dm0150'
+    >>> bucket_key(1500.0)
+    'dm1500'
     """
-    if width_samples < 1:
-        raise ValueError(f"width_samples={width_samples} must be >= 1")
     if not math.isfinite(dm_pc_cm3):
         raise ValueError(f"dm_pc_cm3={dm_pc_cm3} is not finite")
     dm_round = max(
         0, int(round(float(dm_pc_cm3) / DM_BUCKET_PC_CC) * int(DM_BUCKET_PC_CC)),
     )
-    return f"dm{dm_round:04d}_w{int(width_samples):04d}"
+    return f"dm{dm_round:04d}"
 
 
-def calibration_key(dm_pc_cm3: float, width_samples: int) -> str:
-    """Return the full etcd key for a ``(dm, width)`` bucket."""
-    return f"{CALIBRATION_PREFIX}{bucket_key(dm_pc_cm3, width_samples)}"
+def calibration_key(dm_pc_cm3: float) -> str:
+    """Return the full etcd key for a DM-band bucket."""
+    return f"{CALIBRATION_PREFIX}{bucket_key(dm_pc_cm3)}"
+
+
+def is_legacy_bucket(bucket: str) -> bool:
+    """Return True if ``bucket`` is the pre-fix ``dmNNNN_wWWWW``
+    format. Such entries are kept around for the operator to delete
+    via :func:`delete_snr_calibrations` but are ignored by lookup.
+    """
+    return LEGACY_BUCKET_INFIX in str(bucket)
 
 
 def build_active_inject_key(inj_id: str) -> str:
@@ -208,22 +232,24 @@ class CalibrationEntry:
 
 
 class CalibrationStore:
-    """Persists per-``(dm_band, width)`` ``K`` constants in etcd.
+    """Persists per-``dm_band`` ``K`` constants in etcd.
 
     The operator builds the table empirically by firing one
-    :func:`fire_calibration_probe` per (DM, width) bucket they care
+    :func:`fire_calibration_probe` per DM-band bucket they care
     about. The store is the single source of truth the SNR → fluence
-    translation reads from at inject-time.
+    translation reads from at inject-time. K is width-independent
+    (see module docstring), so a probe at any width pins K for every
+    width within the band.
     """
 
     def __init__(self, control_store: Any) -> None:
         self._store = control_store
 
     def get(
-        self, *, dm_pc_cm3: float, width_samples: int,
+        self, *, dm_pc_cm3: float,
     ) -> Optional[CalibrationEntry]:
-        """Return the entry for the ``(dm, width)`` bucket, or None."""
-        key = calibration_key(dm_pc_cm3, width_samples)
+        """Return the entry for the DM-band bucket, or None."""
+        key = calibration_key(dm_pc_cm3)
         try:
             raw = self._store.get_dict(key)
         except Exception as exc:  # noqa: BLE001
@@ -516,7 +542,7 @@ def fire_calibration_probe(
     """
     t0 = float(time_fn())
     cs = cal_store if cal_store is not None else CalibrationStore(store)
-    bucket = bucket_key(dm_pc_cm3, width_samples)
+    bucket = bucket_key(dm_pc_cm3)
     inj_id = inj_id_override or _build_probe_inj_id(
         prefix=inj_id_prefix, dm=dm_pc_cm3, width=width_samples,
         timestamp=t0,
@@ -907,11 +933,13 @@ __all__ = [
     "DEFAULT_INJECT_TTL_S",
     "DEFAULT_POLL_INTERVAL_S",
     "DEFAULT_POLL_TIMEOUT_S",
+    "LEGACY_BUCKET_INFIX",
     "CalibrationEntry",
     "CalibrationStore",
     "ProbeResult",
     "bucket_key",
     "calibration_key",
+    "is_legacy_bucket",
     "build_active_inject_key",
     "build_match_event_key",
     "publish_active_inject",
