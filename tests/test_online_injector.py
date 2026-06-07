@@ -220,57 +220,64 @@ def test_dispersion_delay_table_matches_cold_plasma() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Profile vector — Gaussian unit-area normalisation
+# 3. Profile vector — √(φ(t)/g) "voltage-as-√flux" normalisation
 # ---------------------------------------------------------------------------
 
 
 def test_profile_vector_normalization_gaussian() -> None:
-    """Gaussian profile with FWHM=8 native samples sums to 1.0 over its support.
+    """Gaussian profile vector is √(φ/g) (voltage-as-√flux convention).
 
-    The continuous-time integral is 1.0 by construction (analytical
-    normalisation by σ √(2π)). The discrete sum at unit sample
-    spacing differs from the integral by ≤ 1e-6 for any FWHM ≥ 4
-    (the spacing-vs-σ ratio ≤ 4/(8/2.355) ≈ 1.18 keeps the trapezoid
-    error tiny).
+    The cached profile is ``√(φ(t)/g)`` where φ is the unit-PEAK
+    Gaussian and g = √(π/(4 ln 2)) is the family area-per-FWHM
+    constant. So the centre value is ``1/√g ≈ 0.969`` and the
+    discrete L²-sum (= ∫ profile² ≈ ∫ φ/g) equals
+    ``∫φ dt / g = (W·g)/g = W`` — i.e. the squared-profile area
+    equals the FWHM, regardless of W. (After ``√(fluence/W)``
+    apply-time scaling the per-cell signal is ``√F(t)`` and the
+    matched-filter SNR scales as ``fluence/√W``.)
     """
+    g_norm = math.sqrt(math.pi / (4.0 * math.log(2.0)))
     for width in (4, 8, 16, 64, 256):
         prof = build_profile_vector(
             width_samples=width, profile="gaussian",
         )
         assert prof.shape == (2 * MAX_WIDTH_SAMPLES + 1,)
         assert prof.dtype == np.float32
-        # FWHM = width ⇒ σ = width / (2√(2 ln 2)).
-        sigma = width / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-        # Peak at the centre with value 1 / (σ √(2π)).
-        peak_expected = 1.0 / (sigma * math.sqrt(2.0 * math.pi))
+        # Centre value = √(1/g) = (4 ln 2 / π)^¼.
+        peak_expected = 1.0 / math.sqrt(g_norm)
         peak_observed = float(prof[MAX_WIDTH_SAMPLES])
         rel_err_peak = abs(peak_observed - peak_expected) / peak_expected
         assert rel_err_peak < 1e-5, (
             f"width={width}: peak {peak_observed:.6e} vs expected "
             f"{peak_expected:.6e} (rel err {rel_err_peak:.3e})"
         )
-        # Discrete sum at unit spacing approximates the integral = 1.0.
-        sum_observed = float(prof.sum())
-        assert abs(sum_observed - 1.0) < 1e-5, (
-            f"width={width}: sum {sum_observed:.6e} != 1.0"
+        # ∑ profile² ≈ ∫ φ dt / g = W (FWHM in native samples).
+        sumsq_observed = float(np.sum(prof.astype(np.float64) ** 2))
+        rel_err_sumsq = abs(sumsq_observed - float(width)) / float(width)
+        assert rel_err_sumsq < 1e-3, (
+            f"width={width}: ∑profile² = {sumsq_observed:.6e} vs "
+            f"expected width = {width} (rel err {rel_err_sumsq:.3e})"
         )
 
 
 def test_profile_vector_boxcar_normalization() -> None:
-    """Boxcar profile sums to 1.0 exactly and has correct peak amplitude."""
+    """Boxcar profile vector is unit-PEAK √(φ/1) = φ inside the window."""
     for width in (1, 2, 7, 32, 128):
         prof = build_profile_vector(
             width_samples=width, profile="boxcar",
         )
-        # Boxcar peak = 1 / width over `width` samples.
-        peak_expected = 1.0 / width
-        # Centre cell is in the box (half-open interval [-w/2, +w/2) is
-        # symmetric around 0 only for odd widths; even widths centre on
-        # 0 too because we use t >= -half AND t < +half).
-        assert abs(float(prof[MAX_WIDTH_SAMPLES]) - peak_expected) < 1e-6
+        # Boxcar peak = 1 (g=1 ⇒ √(φ/g) = φ; φ = 1 in the window).
+        # Centre cell is in the half-open interval [-w/2, +w/2).
+        assert abs(float(prof[MAX_WIDTH_SAMPLES]) - 1.0) < 1e-6
+        # ∑ profile² = ∑ profile = width (every in-window sample is 1).
         np.testing.assert_allclose(
-            float(prof.sum()), 1.0, atol=1e-6,
-            err_msg=f"width={width}: boxcar sum != 1.0",
+            float(np.sum(prof.astype(np.float64) ** 2)),
+            float(width), atol=1e-6,
+            err_msg=f"width={width}: ∑profile² != width",
+        )
+        np.testing.assert_allclose(
+            float(prof.sum()), float(width), atol=1e-6,
+            err_msg=f"width={width}: boxcar sum != width",
         )
 
 
@@ -326,9 +333,10 @@ def test_apply_block_active_injection_adds_to_voltages() -> None:
         "imag voltages should be zero (zenith ⇒ pure-real phasor)"
     )
 
-    # Boxcar: every in-window cell holds the same value =
-    # (1 / width) * √(fluence / width).
-    expected_cell = (1.0 / cfg.width_samples) * math.sqrt(
+    # Boxcar (g = 1): every in-window cell holds peak-1 · √(fluence/W) =
+    # √(fluence/W). With the post-fix √(φ/g) profile convention this is
+    # the per-cell voltage = √F(t) for an in-window sample.
+    expected_cell = math.sqrt(
         cfg.fluence_jy_ms / cfg.width_samples,
     )
     np.testing.assert_allclose(
@@ -546,9 +554,10 @@ def test_apply_block_injection_at_block_boundary() -> None:
     assert "boundary_inj" in log1["active_inj_ids"]
 
     # Boxcar value per (ch, t, pol, pkt, ant) cell INSIDE the window =
-    #   phasor[ant, ch] * (1/width) * sqrt(fluence/width)
+    #   phasor[ant, ch] * 1.0 * sqrt(fluence/width)
+    # (post-fix √(φ/g) profile convention; boxcar peak = 1, g = 1).
     # At zenith with single-pol same-value, the per-cell magnitude is
-    # 1.0 * (1/W) * sqrt(F/W) = const. Count non-zero native samples
+    # 1.0 * 1.0 * sqrt(F/W) = const. Count non-zero native samples
     # per pol per ant per channel: should be width/2 in each block.
     # Pick ant=0, ch=0, pol=0, count non-zero entries over (pkt, t_sub).
     block0_nz_per_cell = (real_v0[0, :, 0, :, 0] != 0).sum().item()

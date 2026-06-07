@@ -34,9 +34,16 @@ The three cached tables that drive ``apply_block`` are:
 
   3. Intrinsic profile vector: float32 ``[2 · max_width_samples + 1]``
      centred at index ``max_width_samples``. Profile family selectable
-     (``"gaussian"`` | ``"boxcar"``); both unit-area-normalised over
-     their support so that ``√(fluence/width)`` is the peak amplitude
-     scale.
+     (``"gaussian"`` | ``"boxcar"``); the cached vector is
+     ``√(φ(t)/g)`` where φ is the unit-PEAK shape (φ(0) = 1) and g
+     is the family area-per-FWHM constant (``√(π/(4 ln 2))`` for
+     Gaussian, 1 for boxcar). Combined with the apply-time scale
+     ``√(fluence/width)`` this yields per-voltage-cell amplitude
+     ``√F(t)``, where ``F(t) = (fluence/(W·g))·φ(t)`` is the
+     instantaneous flux density at the source location — the physical
+     "voltage = √(instantaneous flux)" convention. See
+     :func:`build_profile_vector` for the history of the prior
+     unit-area normalisation.
 
 Per-block math:
 
@@ -51,7 +58,11 @@ Per-block math:
                                   · √(fluence_jy_ms / width_samples)
 
   added to *both* polarisation slots (intrinsic unpolarised source).
-  ``peak_native = 2 · apply_at_specnum``.
+  ``peak_native = 2 · apply_at_specnum``. With the
+  ``profile = √(φ/g)`` convention this delivers ``√F(t)`` per cell,
+  correlation produces a dirty-image peak ``F(t)`` in Jy, and the
+  detector matched-filter SNR scales as ``fluence_jy_ms / √W`` (the
+  standard radiometer law).
 
 The injector is **single-pol** (the same value goes into both pol
 slots). It is **single-band** (one chgroup per ``OnlineInjector``
@@ -118,12 +129,12 @@ __all__ = [
 # Module constants
 # ---------------------------------------------------------------------------
 
-#: Supported intrinsic profile families. ``"gaussian"`` is unit-area-
-#: normalised by the analytical Gaussian integral over the full
-#: ``[-max_width_samples, +max_width_samples]`` window (FWHM = width
-#: native samples). ``"boxcar"`` is unit-area-normalised by dividing by
-#: ``width``. Adding a new family is one branch in
-#: :func:`build_profile_vector`.
+#: Supported intrinsic profile families. The cached vector is
+#: ``√(φ(t)/g)`` where φ is the unit-PEAK family shape (φ(0) = 1) and
+#: g is the family area-per-FWHM constant: ``√(π/(4 ln 2)) ≈ 1.0645``
+#: for ``"gaussian"`` (FWHM = ``width_samples``), and 1 for
+#: ``"boxcar"`` (full width = ``width_samples``). Adding a new family
+#: is one branch in :func:`build_profile_vector`.
 PROFILE_FAMILIES: Final[tuple[str, ...]] = ("gaussian", "boxcar")
 
 #: Cap on the half-width (in native samples) of the cached profile
@@ -165,10 +176,16 @@ class InjectionConfig:
         DMs are accepted (some tests use negative DM to invert the
         chirp direction without changing the magnitude).
     fluence_jy_ms : float
-        Peak fluence at ``NU_TOP_PROC_GHZ`` (Jy · ms). The peak
-        amplitude scale applied to the intrinsic profile is
-        ``√(fluence / width_samples)``; the test suite confirms the
-        per-(ant, ch) RMS amplitude tracks this scaling.
+        Time-integrated flux density of the burst at
+        ``NU_TOP_PROC_GHZ`` (Jy · ms) — i.e. ``∫F(t)dt`` over the
+        intrinsic profile. With the ``√(φ/g)`` profile convention
+        (see :func:`build_profile_vector`), the apply-time amplitude
+        scale ``√(fluence / width_samples)`` makes the per-voltage-
+        cell value equal ``√F(t)`` and the detector matched-filter
+        SNR scale as the standard radiometer law
+        ``SNR ∝ fluence_jy_ms / √width``. Negative values are accepted
+        (sign carried by the amplitude only — the profile vector is
+        always non-negative).
     width_samples : int
         FWHM width in NATIVE samples (1 native sample = 32.768 µs).
         Must satisfy ``1 ≤ width_samples ≤ MAX_WIDTH_SAMPLES``.
@@ -428,22 +445,53 @@ def build_profile_vector(
     profile: str,
     max_width_samples: int = MAX_WIDTH_SAMPLES,
 ) -> np.ndarray:
-    """Centred unit-area intrinsic profile in NATIVE-sample units.
+    """Centred ``√(φ(t)/g)`` intrinsic profile in NATIVE-sample units.
 
     Returns an array of shape ``(2 · max_width_samples + 1,)`` float32
     centred at index ``max_width_samples`` (so ``profile[centre + k]``
     is the value ``k`` samples after the peak).
 
+    Convention
+    ----------
+    The injector deposits per-voltage-cell amplitude
+
+        voltage(t) = profile[t] · √(fluence_jy_ms / width_samples) · phasor
+
+    For this to match the physical "voltage = √(instantaneous flux)"
+    convention — which after ``conj(V_i)·V_j`` correlation produces a
+    dirty-image peak in Jy and a matched-filter SNR ∝ ``fluence/√width``
+    — the profile must be ``√(φ(t)/g)``, where φ is the unit-PEAK
+    intrinsic shape (φ(0) = 1) and ``g`` is the family
+    "area-per-FWHM" constant: ``g = √(π / (4 ln 2)) ≈ 1.0645`` for
+    Gaussian (so that a Gaussian with FWHM ``W`` has
+    ``∫φ dt = W·g``), and ``g = 1`` for boxcar (``∫φ dt = W``).
+
+    With this normalisation the per-cell voltage equals
+    ``√(fluence·φ(t) / (W·g)) = √F(t)``, where
+    ``F(t) = (fluence / (W·g)) · φ(t)`` is the instantaneous flux
+    density in Jy at the source location.
+
     Profile families:
-      - ``"gaussian"``: ``exp(-(t/σ)²/2)`` with σ = FWHM / (2√(2 ln 2));
-        unit-area-normalised by the analytical Gaussian integral
-        ``σ √(2π)``. Sums to ~1.0 over the full window for any
-        ``width_samples ≪ max_width_samples`` (the analytical
-        normalisation is exact in the limit; the discrete sum errors
-        scale as ``erfc(max_width_samples / (σ√2)) / 2`` which is
-        ≤ 1e-15 at default support widths).
-      - ``"boxcar"``: ``1/width`` over ``[-width/2, +width/2]`` (FWHM
-        = full width). Unit-area-normalised by construction.
+      - ``"gaussian"``: returned vector =
+        ``(4 ln 2 / π)^¼ · exp(-(t/σ)²/4)`` with
+        σ = FWHM / (2√(2 ln 2)). This is itself a Gaussian with
+        FWHM ``√2 · width_samples`` and peak ``1/√g ≈ 0.969``.
+      - ``"boxcar"``: peak-1 boxcar over ``[-width/2, +width/2)``
+        (g = 1, so ``√(φ/g)`` = φ).
+
+    History
+    -------
+    Prior to ``F-fix-injector-fluence-norm`` this function returned
+    the unit-AREA profile (peak ``1/(W·g)`` for Gaussian, ``1/W`` for
+    boxcar). That convention combined with ``√(fluence/W)`` placed an
+    extra ``1/W`` factor on the per-voltage-cell amplitude; after
+    ``conj·`` correlation that became an extra ``1/W²`` on the dirty
+    image, so the actually-delivered observable scaled as
+    ``fluence / W^(5/2)`` instead of the physical ``fluence / √W``.
+    Wide-burst injection campaigns relied on per-width empirical
+    fluence calibration (``inject_production_allgpu.py
+    :calibrate_fluence``) to compensate. The fix here makes the
+    documented convention match the delivered observable.
 
     Parameters
     ----------
@@ -472,13 +520,19 @@ def build_profile_vector(
 
     if profile == "gaussian":
         sigma = float(width_samples) / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-        norm = sigma * math.sqrt(2.0 * math.pi)
-        out = np.exp(-(t * t) / (2.0 * sigma * sigma)) / norm
+        # φ(t) = exp(-(t/σ)²/2) is the unit-PEAK Gaussian.
+        # g = √(π / (4 ln 2)) is the family area-per-FWHM constant
+        # (= sigma · √(2π) / FWHM, independent of FWHM).
+        # √(φ/g) = (1/√g) · exp(-(t/σ)²/4).
+        phi = np.exp(-(t * t) / (2.0 * sigma * sigma))
+        g = math.sqrt(math.pi / (4.0 * math.log(2.0)))
+        out = np.sqrt(phi / g)
     elif profile == "boxcar":
+        # φ(t) = 1 inside [-W/2, +W/2), 0 outside; g = 1 ⇒ √(φ/g) = φ.
         out = np.zeros(n, dtype=np.float64)
         half = float(width_samples) / 2.0
         in_box = (t >= -half) & (t < +half)
-        out[in_box] = 1.0 / float(width_samples)
+        out[in_box] = 1.0
     else:  # pragma: no cover — guarded above
         raise ValueError(profile)
 
