@@ -16,3 +16,23 @@ src/dsart/transport/_recv_ring*.so
 # fleet updates stay clean without needing force=true.
 src/dsart/capture/dsart_capture_manythread
 src/dsart/capture/*.o
+
+# Fringe-stopping table master copies. Built on h23 via the
+# Control-tab "Build for this DEC" button (tools/build_fstable_cache.py
+# in the casa38 env). The dashboard rsyncs them out to
+# /home/ubuntu/data/fstables/ on every corr node; the repo tree is
+# never the source of truth at runtime, so don't track them. See
+# tools/dashboard/dsa_monitor/fstable_panel.py:H23_MASTER_DIR.
+var/fstables/
+
+# Output artifacts from bench/preflight/inject_*_allgpu.py runs.
+# Quicklook PNGs + multi-GB owner cubes; stage to /dataz on h23
+# when sharing, never the repo tree.
+inject_cubes/
+
+# Generated preview assets for docs/overview/ (slide PNGs / PPMs).
+# Rebuilt locally from the LaTeX/Quarto sources on demand.
+docs/overview/preview/
+
+# Jupyter Notebook checkpoint snapshots.
+.ipynb_checkpoints/
