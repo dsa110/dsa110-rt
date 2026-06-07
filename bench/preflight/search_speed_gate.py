@@ -222,7 +222,7 @@ def _run_bench(out_dir: Path, args: argparse.Namespace) -> int:
     cmd = [
         sys.executable, "-m", "bench.search_node_throughput",
         "--n-cubes", str(int(args.n_cubes)),
-        "--t-det", str(PROD_T_DET),
+        "--t-det", str(int(args.t_det)),
         "--n-fdm", str(PROD_N_FDM),
         "--n-grid", str(PROD_N_GRID),
         "--device", str(args.device),
@@ -257,6 +257,20 @@ def _run_bench(out_dir: Path, args: argparse.Namespace) -> int:
             "--dm-plan-path", str(args.dm_plan_path),
             "--coarse-dm-owner-idx", str(int(args.owner_idx)),
         ]
+    # M7.7.2 carry-over re-imaging. Default OFF (preserves the
+    # M7.7 baseline that the speed gate has been measuring); set
+    # ``--carry-over`` to A/B the new path. ``--cube-cadence-samples
+    # 128`` makes the synthetic source advance specnums by the
+    # production cadence so the bench's per-cube state machine
+    # matches the live system; without this, carry-over still
+    # functions (the kernel work is data-independent) but the
+    # specnum stride is unrealistic.
+    cmd += [
+        "--cube-cadence-samples",
+        str(int(getattr(args, "cube_cadence_samples", 128))),
+    ]
+    if bool(getattr(args, "carry_over", False)):
+        cmd += ["--cube-pipeline-carry-over-re-imaging"]
 
     env = os.environ.copy()
     env.setdefault("DSART_ENABLE_GPU_BUF_REUSE", "1")
@@ -305,7 +319,8 @@ def _print_imager_substage_table(
         f"(fused dequant+combine NVRTC kernel — chunk-8 D21)"
     )
     print(
-        f"    fft_ms          {fft:8.2f}    (cuFFT-cfp16 ifft2 + fftshift)"
+        f"    fft_ms          {fft:8.2f}    (cuFFT-cfp16 ifft2; fftshift folded "
+        f"into combine for even N)"
     )
     print(
         f"    mask_ms         {mask:8.2f}    "
@@ -556,8 +571,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "drop; bump for tighter percentiles. Default 60.",
     )
     p.add_argument(
-        "--budget-ms", type=float, default=PROD_BUDGET_MS,
-        help=f"Cube-cadence budget (ms). Default {PROD_BUDGET_MS:.1f} ms "
+        "--budget-ms", type=float, default=-1.0,
+        help=f"Cube-cadence budget (ms). Default auto = "
+             f"cube_cadence_samples x t_int_search_us/1000 (={PROD_BUDGET_MS:.1f} "
+             f"ms at the prod cadence=128). Pass an explicit value to "
+             f"override. Old default was {PROD_BUDGET_MS:.1f} ms "
              "= 7.45 cubes/s (production op-point; t_int_search_us="
              "1048.576, cube_cadence_samples=128). PASS = p50 <= budget.",
     )
@@ -597,6 +615,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              f"percentiles (covers Layer-1 burn-in + GPU/NVRTC warmup). "
              f"Default {DEFAULT_WARMUP_CUBES}.",
     )
+    p.add_argument(
+        "--carry-over", action="store_true",
+        help="M7.7.2 (2026-06-04): enable cube-level carry-over "
+             "re-imaging in the CubePipeline (skips combine+FFT+mask "
+             "for the trailing t_det - cube_cadence_samples image-space "
+             "rows on cube N+1, copies them from cube N's output with "
+             "per-fdm sigma rescale). Default OFF -- operator A/B's "
+             "against the no-carry-over baseline first. See "
+             "docs/m7/M77_2_CARRYOVER_DESIGN.md.",
+    )
+    p.add_argument(
+        "--cube-cadence-samples", type=int, default=128,
+        help="Production cube cadence (samples). Default 128 matches "
+             "configs/dsart_search_rt.yaml. The synthetic source "
+             "advances specnum_start by this stride so the bench's "
+             "per-cube state machine matches the live system.",
+    )
+    p.add_argument(
+        "--t-det", type=int, default=PROD_T_DET,
+        help=f"Detector window length (samples). Default {PROD_T_DET} "
+             f"(prod). The cube-to-cube overlap is t_det - "
+             f"cube_cadence_samples and must be >= the largest boxcar "
+             f"width. Used for the M7.7.2 block-size sweep.",
+    )
     return p
 
 
@@ -614,6 +656,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    # Auto-scale the budget to the cadence unless explicitly set. The
+    # real-time constraint is per-sample (t_int_search_us); a cube of
+    # cube_cadence_samples NEW samples must complete in
+    # cube_cadence_samples x t_int_search_us. This makes the gate valid
+    # across the M7.7.2 block-size sweep, not just at cadence=128.
+    if float(args.budget_ms) <= 0.0:
+        args.budget_ms = (
+            float(args.cube_cadence_samples) * PROD_T_INT_SEARCH_US / 1000.0
+        )
+
     out_dir = Path(args.out).resolve()
     print(
         f"[gate] dsa110-rt search speed preflight "
@@ -621,7 +673,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(
         f"[gate] op-point: n_grid={PROD_N_GRID} n_fdm={PROD_N_FDM} "
-        f"t_det={PROD_T_DET} M7.7={'OFF' if args.no_m77 else 'ON'} "
+        f"t_det={args.t_det} cadence={args.cube_cadence_samples} "
+        f"overlap={args.t_det - args.cube_cadence_samples} "
+        f"M7.7={'OFF' if args.no_m77 else 'ON'} "
         f"budget={args.budget_ms:.1f}ms"
     )
     print()

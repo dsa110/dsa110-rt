@@ -27,7 +27,7 @@ fallback.
 
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from typing import Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -111,6 +111,7 @@ def quantise_per_chgroup_into_cint8(
     out_cint8: np.ndarray,
     target_max: int = 120,
     zero_fill_missing: bool = True,
+    fixed_scale: Optional[float] = None,
 ) -> float:
     """Streaming per-chgroup cf32 -> cint8 quantiser writing into a
     caller-supplied output buffer.
@@ -170,6 +171,9 @@ def quantise_per_chgroup_into_cint8(
             f"target_max must be in [1, 127]; got {target_max!r}"
         )
 
+    # Per-chgroup shape/dtype validation always runs (so callers get
+    # the same error semantics regardless of fixed_scale). The g_max
+    # scan is skipped when fixed_scale is provided.
     g_max = 0.0
     for g, stream in per_chgroup_streams.items():
         if not (0 <= int(g) < n_chg):
@@ -187,16 +191,23 @@ def quantise_per_chgroup_into_cint8(
                 f"per_chgroup_streams[{g}].shape={s.shape}; expected "
                 f"({t_stream}, {n_grid_h}, {n_grid_w})"
             )
-        re = s.real
-        im = s.imag
-        re_max = float(np.abs(re).max(initial=0.0))
-        im_max = float(np.abs(im).max(initial=0.0))
-        if re_max > g_max:
-            g_max = re_max
-        if im_max > g_max:
-            g_max = im_max
+        if fixed_scale is None:
+            re_max = float(np.abs(s.real).max(initial=0.0))
+            im_max = float(np.abs(s.imag).max(initial=0.0))
+            if re_max > g_max:
+                g_max = re_max
+            if im_max > g_max:
+                g_max = im_max
 
-    scale = (float(target_max) / g_max) if g_max > 0.0 else 1.0
+    if fixed_scale is not None:
+        # M7.7.2: caller supplies a constant scale so cint8 across
+        # consecutive cubes is mutually consistent (required for the
+        # carry-over numerical-equivalence gate, where overlapping
+        # absolute time must produce identical cint8 in both cubes).
+        # Out-of-range cells are clipped to ±127.
+        scale = float(fixed_scale)
+    else:
+        scale = (float(target_max) / g_max) if g_max > 0.0 else 1.0
     scale_dtype: np.dtype
     sample_stream = next(iter(per_chgroup_streams.values()), None)
     if sample_stream is not None and np.asarray(sample_stream).dtype == np.complex64:

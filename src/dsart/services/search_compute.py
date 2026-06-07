@@ -1717,6 +1717,9 @@ def _build_search_config_from_yaml(
     layer1_max_samples: Optional[int],
     layer1_sigma_floor: float,
     fine_dm_pc_cc_full: Optional[np.ndarray],
+    t_det: int,
+    cube_cadence_samples: int,
+    cube_pipeline_carry_over_re_imaging: bool = False,
     t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
     enable_c1: bool = True,
     c1_bind_host_override: Optional[str] = None,
@@ -1731,6 +1734,21 @@ def _build_search_config_from_yaml(
         n_grid=int(n_grid),
         image_backend=image_backend,   # "cpu" or "gpu"
         device=device,
+        # M7.7.2 (Phase 1a): pin the GPU imager geometry + carry-over
+        # re-imaging from the CLI so production stops re-imaging the
+        # cube-to-cube overlap. With carry-over ON the imager runs the
+        # fused-combine + cuFFT + mask only on the ``cube_cadence_samples``
+        # NEW rows; the first ``t_det - cube_cadence_samples`` rows are
+        # copied from the previous cube's output (σ-rescaled). gpu_t_det /
+        # gpu_n_fdm are pinned (instead of inferred from the first slot)
+        # so the imager workspace is sized deterministically for the
+        # configured block size.
+        gpu_t_det=int(t_det),
+        gpu_n_fdm=int(n_fdm),
+        cube_cadence_samples=int(cube_cadence_samples),
+        cube_pipeline_carry_over_re_imaging=bool(
+            cube_pipeline_carry_over_re_imaging
+        ),
     )
 
     clusterer_cfg: Optional[ClustererConfig] = None
@@ -2333,6 +2351,11 @@ async def _run_async(args: argparse.Namespace) -> int:
         layer1_max_samples=args.layer1_max_samples,
         layer1_sigma_floor=args.layer1_sigma_floor,
         fine_dm_pc_cc_full=fine_dm,
+        t_det=args.t_det,
+        cube_cadence_samples=args.cube_cadence_samples,
+        cube_pipeline_carry_over_re_imaging=bool(
+            args.cube_pipeline_carry_over_re_imaging
+        ),
         t_int_search_us=args.t_int_search_us,
         enable_c1=not args.disable_c1,
         c1_bind_host_override=args.c1_bind_host,
@@ -2406,6 +2429,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--cube-cadence-samples", type=int,
                    default=CUBE_CADENCE_SAMPLES_DEFAULT,
                    help=f"slots per cube (default: {CUBE_CADENCE_SAMPLES_DEFAULT})")
+    p.add_argument("--cube-pipeline-carry-over-re-imaging",
+                   action="store_true",
+                   help="M7.7.2: skip re-imaging the cube-to-cube overlap "
+                        "(the first t_det - cube_cadence_samples rows). The "
+                        "imager runs the fused-combine + cuFFT + mask only on "
+                        "the cube_cadence_samples NEW rows; the overlap rows "
+                        "are copied (σ-rescaled) from the previous cube's "
+                        "output. Numerically equivalent to full re-imaging "
+                        "under M7.7 symmetric-shift padding (validate with "
+                        "bench.preflight.search_carryover_equivalence). "
+                        "Default OFF.")
     p.add_argument("--t-int-search-us", type=float,
                    default=T_INT_SEARCH_US_DEFAULT,
                    help=f"search-cadence sample period in µs "

@@ -131,14 +131,27 @@ routines:
   #
   # Production op-point:
   #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan),
-  #   t_det=192, cube_cadence_samples=128
+  #   t_det=256, cube_cadence_samples=192
   #     ⇒ search overlap = t_det - cube_cadence_samples = 64 samples
   #       (= b_max, the minimum overlap that catches any pulse up to
-  #       64 samples wide straddling a cube boundary). M7.2 perf gate
-  #       (May 2026): drop from t_det=256 → 192 saved ~35 ms/cube
-  #       across imager + layer1 at the production op-point, bringing
-  #       the per-cube wall to ~105 ms inside the 134.218 ms RT budget.
+  #       64 samples wide straddling a cube boundary).
   #   t_int_search_us=1048.576 (matches corr t_int_fast at 32x native)
+  #   ⇒ cube cadence = 192 * 1.048576 = 201.327 ms wall per cube.
+  #
+  # M7.7.4 (2026-06-06): rfft-imager (real-output FFT via
+  # conjugate-fold half-grid combine) is default-on in GpuImager and
+  # halves both the FFT cost and the uv-batch transient memory. That
+  # made the big-block op-point (cube_cadence_samples=192/t_det=256)
+  # fit comfortably on the 11 GiB 2080 Ti (was OOM at 192/256 before),
+  # and the n01 GPU1 speed gate clears the 201.3 ms budget by 17.6%
+  # (sustained 166 ms / cube, full 7-boxcar octave bank preserved).
+  # The prior op-point (t_det=192 / cube_cadence_samples=128) was 5.6%
+  # over the matching 134.2 ms RT budget — and was the trigger for the
+  # M7.7 optimisation work. Set DSART_IMAGER_RFFT=0 in env to force the
+  # legacy ifft2+.real path (in-binary A/B). M7.2 perf-gate finding —
+  # that t_det=192 saved ~35 ms vs t_det=256 — is superseded by rfft:
+  # at t_det=256 the imager substages are smaller than they were at
+  # t_det=192 pre-rfft.
   #
   # The two halves run as independent processes so a crash in one
   # doesn't take down the other; dsart_rt restarts them on the
@@ -189,8 +202,8 @@ routines:
       --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 8192 --n-filled 5000
       --bytes-per-cell 2
-      --n-fdm 34 --t-det 192 --n-grid 256
-      --cube-cadence-samples 128
+      --n-fdm 34 --t-det 256 --n-grid 256
+      --cube-cadence-samples 192
       --t-int-search-us 1048.576
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --fan-in-min-corrs 15
@@ -277,8 +290,8 @@ routines:
       --n-corr 16 --n-coarse-dm 8
       --t-buf-samples 8192 --n-filled 5000
       --bytes-per-cell 2
-      --n-fdm 34 --t-det 192 --n-grid 256
-      --cube-cadence-samples 128
+      --n-fdm 34 --t-det 256 --n-grid 256
+      --cube-cadence-samples 192
       --t-int-search-us 1048.576
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --fan-in-min-corrs 15

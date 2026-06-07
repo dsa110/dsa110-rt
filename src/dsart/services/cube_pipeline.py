@@ -231,6 +231,33 @@ class CubePipelineConfig:
     # in the raw cube (e.g. ``bench/imager_only_gpu.py``).
     gpu_imager_apply_per_chgroup_calibration: bool = False
 
+    # M7.7.2 — Carry-over re-imaging
+    # ------------------------------
+    # When ``cube_pipeline_carry_over_re_imaging`` is True AND
+    # ``cube_cadence_samples`` < ``gpu_t_det``, each cube's first
+    # ``gpu_t_det - cube_cadence_samples`` image-space samples are
+    # carried over from the previous cube (rescaled per-fdm by the
+    # σ-ratio when the fused-L1 imager path is active), instead of
+    # being re-imaged. The imager runs the fused-combine + cuFFT +
+    # mask kernels only on the ``cube_cadence_samples`` NEW rows.
+    #
+    # Mathematically equivalent under M7.7 symmetric-shift padding
+    # (which guarantees every (cube_t, fdm, chgroup) read is in-range):
+    # cube_{N+1}[t', f, u, v] == cube_N[t'+cadence, f, u, v] for
+    # t' in [0, t_det-cadence). See docs/m7/M77_2_CARRYOVER_DESIGN.md
+    # for the full correctness proof + σ rescale derivation.
+    #
+    # The first cube emitted by the pipeline always falls back to the
+    # full re-image (no prior cube to carry from). Per-cube savings at
+    # the production op-point (t_det=192, cadence=128): ~21 ms / cube
+    # of GPU work (combine 64→43, fft 34→23, mask 8→6).
+    #
+    # Default OFF — operator enables explicitly after running the
+    # A/B numerical-equivalence gate
+    # (``bench/preflight/search_speed_gate.py --validate-carry-over-equivalence``).
+    cube_pipeline_carry_over_re_imaging: bool = False
+    cube_cadence_samples: Optional[int] = None
+
     def __post_init__(self) -> None:
         if self.n_grid <= 0 or self.n_grid & (self.n_grid - 1):
             raise ValueError(
@@ -867,6 +894,33 @@ class CubePipeline:
         # (effectively sigma_prev = 1 for cube 0, which is also during
         # Layer-1 burn-in so the warmup flag is set anyway).
         self._sigma_layer1_prev: Optional[torch.Tensor] = None
+
+        # M7.7.2 carry-over re-imaging state. Active only when the
+        # config flag is set AND the fused-L1 imager path is in use
+        # (the σ-rescale-on-carry-over math is keyed to the imager's
+        # fused-mask multiply).
+        self._carry_over_enabled = bool(
+            config.cube_pipeline_carry_over_re_imaging
+        )
+        self._carry_over_cube_cadence: Optional[int] = (
+            int(config.cube_cadence_samples)
+            if config.cube_cadence_samples is not None else None
+        )
+        # cube buffer emitted by the previous cube's imager (rows
+        # ``[cube_cadence:t_det]`` get carried into the next cube's
+        # ``[0:t_det-cube_cadence]``). Stays None until cube 1 has
+        # somewhere to look back. The ping-pong inside GpuImager
+        # guarantees consecutive cubes occupy DIFFERENT output
+        # buffers, so storing a raw reference (no clone) is safe.
+        self._prev_cube_for_carryover: Optional[torch.Tensor] = None
+        # The σ that was multiplied INTO the prev cube via fused-L1
+        # ``edge_mask_per_fdm`` (i.e. the value of
+        # ``_sigma_layer1_prev`` AT THE TIME the prev cube's imager
+        # ran). Needed to rescale the carry-over rows to the σ that
+        # was applied to the CURRENT cube. ``None`` means the prev
+        # cube was emitted in raw units (fused-L1 was disabled, or
+        # the prev cube was cube 0).
+        self._sigma_applied_to_prev_cube: Optional[torch.Tensor] = None
 
     @property
     def edge_mask(self) -> torch.Tensor:
@@ -1537,13 +1591,94 @@ class CubePipeline:
         apply_cal = bool(
             self.config.gpu_imager_apply_per_chgroup_calibration
         )
+
+        # M7.7.2 carry-over re-imaging
+        # ----------------------------
+        # When enabled AND we already have a prev cube, the imager
+        # computes only the new rows ``[t_lo : T_det)`` and we fill
+        # rows ``[0 : t_lo)`` from the prev cube (rescaled per-fdm
+        # by σ_prev / σ_now when fused-L1 is active). On cube 0 or
+        # when carry-over is disabled, ``t_lo == 0`` and the imager
+        # runs the full-cube path bit-for-bit unchanged.
+        prev_cube = self._prev_cube_for_carryover
+        sigma_applied_to_prev = self._sigma_applied_to_prev_cube
+        # Snapshot what the imager is ABOUT TO MULTIPLY INTO the new
+        # rows -- this is the value of ``_sigma_layer1_prev`` right
+        # now (set by the previous cube's ``_layer1_normalise_fused``
+        # via ``set_edge_mask_per_fdm(1/σ)``). May be ``None`` for
+        # cube 0 (the imager then writes raw units).
+        sigma_applied_now = self._sigma_layer1_prev
+
+        t_det_imager = int(self._gpu_imager.config.t_det)  # type: ignore[union-attr]
+        use_carry_over = (
+            self._carry_over_enabled
+            and prev_cube is not None
+            and self._carry_over_cube_cadence is not None
+            and 0 < int(self._carry_over_cube_cadence) < t_det_imager
+            and tuple(prev_cube.shape[:2]) == (
+                t_det_imager,
+                int(self._gpu_imager.config.n_fdm),  # type: ignore[union-attr]
+            )
+        )
+        if use_carry_over:
+            cadence = int(self._carry_over_cube_cadence)
+            t_lo = t_det_imager - cadence
+        else:
+            t_lo = 0
+
         cube = self._gpu_imager.process_cube(  # type: ignore[union-attr]
             streams_cint8=staged.cint8_t,
             time_shifts_gpu=staged.shifts_t,
             chgroup_scales=staged.chgroup_scale_t if apply_cal else None,
             chgroup_offsets_re=staged.chgroup_offset_re_t if apply_cal else None,
             chgroup_offsets_im=staged.chgroup_offset_im_t if apply_cal else None,
+            t_lo=t_lo,
         )
+
+        if use_carry_over:
+            # Fill rows ``[0 : t_lo)`` from ``prev_cube[cadence:t_det]``
+            # with the per-fdm σ rescale so the carry-over rows match
+            # the σ that's now baked into the new rows.
+            assert prev_cube is not None  # for type-checkers
+            cadence = int(self._carry_over_cube_cadence)  # type: ignore[arg-type]
+            carryover_src = prev_cube[cadence:t_det_imager, :, :, :]
+            tiny = torch.finfo(torch.float32).tiny
+            if sigma_applied_to_prev is not None and sigma_applied_now is not None:
+                ratio = (
+                    sigma_applied_to_prev
+                    / sigma_applied_now.clamp(min=tiny)
+                ).to(cube.dtype)
+                cube[:t_lo, :, :, :] = (
+                    carryover_src * ratio[None, :, None, None]
+                )
+            elif sigma_applied_to_prev is None and sigma_applied_now is not None:
+                # prev cube was raw (cube 0), current cube has 1/σ
+                # baked in -- rescale carry-over by 1/σ_now to match.
+                inv = (
+                    1.0 / sigma_applied_now.clamp(min=tiny)
+                ).to(cube.dtype)
+                cube[:t_lo, :, :, :] = (
+                    carryover_src * inv[None, :, None, None]
+                )
+            elif sigma_applied_to_prev is not None and sigma_applied_now is None:
+                # prev cube had 1/σ baked in, current cube is raw --
+                # multiply carry-over by σ to undo. Rare path (would
+                # require fused-L1 toggling mid-stream).
+                sig = sigma_applied_to_prev.to(cube.dtype)
+                cube[:t_lo, :, :, :] = (
+                    carryover_src * sig[None, :, None, None]
+                )
+            else:
+                # Both raw: straight copy.
+                cube[:t_lo, :, :, :] = carryover_src
+
+        # Update carry-over state for the NEXT cube. We capture the
+        # cube as-emitted from the imager (post-mask, pre-clamp); the
+        # GpuImager ping-pong guarantees the buffer survives one
+        # extra cube cycle, which is exactly what carry-over needs.
+        if self._carry_over_enabled:
+            self._prev_cube_for_carryover = cube
+            self._sigma_applied_to_prev_cube = sigma_applied_now
         # M7.7 symmetric-shift padding: when the rx_ring pre-pads the
         # per-chgroup stream symmetrically, the imager kernel has
         # in-range source rows for every (t, fdm, g) tuple — coverage

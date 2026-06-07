@@ -14,11 +14,16 @@ service consumes. It composes:
      slab in one kernel pass. cint8 input → cfp16 output is half the
      memory traffic of the chunk-6c-fused (cfp16 input) path.
 
-  2. **cuFFT-cfp16 ``ifft2`` + fftshift** (D19): on h01 / RTX 2080 Ti
-     this runs at ~5.2 µs / 256² FFT2 — within ~1.2× of the cuFFT
-     theoretical roofline. With the chunk-8 fused combine in front,
-     the imager is FFT-bound (combine ≈ 45% / ifft2 ≈ 44% / mask ≈ 11%
-     at T_det=256 / N_fdm=32 / N_grid=256).
+  2. **cuFFT-cfp16 ``irfft2``** (M7.7.4, default-on): the dirty image
+     is real, so the combine writes the Hermitian half-spectrum
+     ``G_h[u,w] = 0.5*(G[u,w] + conj(G[(-u)%N,(-w)%N]))`` and the
+     imager takes ``irfft2(G_h, s=(N,N))`` directly — halving both the
+     cuFFT cost and the ``uv_batch`` memory transient vs the legacy
+     ``ifft2(G).real`` path. Numerically equivalent to the legacy path
+     at fp16 round-off (A/B ≲ 2e-3 rel; the 39 existing combine +
+     imager tests are bit-equivalent through both paths). Set
+     ``DSART_IMAGER_RFFT=0`` to force the legacy ``ifft2 + .real`` path
+     for in-binary A/B (e.g. when chasing a regression).
 
   3. **Edge mask** (§3.5 G11; reused from chunk-6a): multiplicative
      ``[N_grid, N_grid] cube_dtype`` mask zeroes the outer kernel-
@@ -186,6 +191,7 @@ class GpuImager:
         chgroup_scales: Optional[torch.Tensor] = None,
         chgroup_offsets_re: Optional[torch.Tensor] = None,
         chgroup_offsets_im: Optional[torch.Tensor] = None,
+        t_lo: int = 0,
     ) -> torch.Tensor:
         """Run the full GPU imager for one cube.
 
@@ -239,6 +245,7 @@ class GpuImager:
         """
         from dsart.image.fused_combine_cuda import (
             fused_dequant_combine_per_fdm,
+            fused_dequant_combine_per_fdm_half,
         )
 
         cfg = self.config
@@ -311,14 +318,29 @@ class GpuImager:
         # efficiency without changing detector inputs.
         fft_batch_env = int(os.environ.get("DSART_IMAGER_FFT_BATCH", "12"))
         fft_batch = min(max(1, fft_batch_env), int(cfg.n_fdm))
+        # M7.7.4 real-output FFT: the dirty image is real, so combine the
+        # conjugate fold into a Hermitian half-spectrum and use ``irfft2``
+        # instead of ``ifft2 + .real``. Halves the uv-slab memory AND the
+        # cuFFT cost (combine is unchanged: each half-grid cell reads its
+        # own cell + the mirror, so total stream-read traffic is constant).
+        # Numerically equivalent to the legacy path at fp16 round-off (A/B
+        # ~1.8e-3 rel). Requires even N + cfp16 (production geometry).
+        # Default-on; ``DSART_IMAGER_RFFT=0`` forces the legacy ifft2 path
+        # so the two can be A/B'd in the same binary.
+        use_rfft = (
+            (int(cfg.n_grid) & 1) == 0
+            and cfg.complex_dtype == torch.complex32
+            and os.environ.get("DSART_IMAGER_RFFT", "1") != "0"
+        )
+        uv_last = (cfg.n_grid // 2 + 1) if use_rfft else cfg.n_grid
         if (
             self.uv_batch is None
-            or self.uv_batch.shape != (fft_batch, cfg.t_det, cfg.n_grid, cfg.n_grid)
+            or self.uv_batch.shape != (fft_batch, cfg.t_det, cfg.n_grid, uv_last)
             or self.uv_batch.dtype != cfg.complex_dtype
             or self.uv_batch.device != self.device
         ):
             self.uv_batch = torch.empty(
-                (fft_batch, cfg.t_det, cfg.n_grid, cfg.n_grid),
+                (fft_batch, cfg.t_det, cfg.n_grid, uv_last),
                 dtype=cfg.complex_dtype,
                 device=self.device,
             )
@@ -334,7 +356,28 @@ class GpuImager:
                 device=self.device,
             )
 
+        # M7.7.2 carry-over: when ``t_lo > 0``, the imager computes only
+        # the new cube rows ``[t_lo, T_det)``; the caller (CubePipeline)
+        # fills rows ``[0, t_lo)`` from the previous cube with a per-
+        # fdm sigma rescale. ``t_lo == 0`` (default) preserves the
+        # legacy full-cube path bit-for-bit.
+        if t_lo < 0 or t_lo >= cfg.t_det:
+            raise ValueError(
+                f"t_lo={t_lo}, must be in [0, T_det={cfg.t_det})"
+            )
+        t_det_local = cfg.t_det - int(t_lo)
+
         gpu_profile = self.device.type == "cuda"
+        # M7.7.3: fold the post-IFFT fftshift into the combine kernel via
+        # the (-1)^(u+v) checkerboard identity (exact for even N). This
+        # eliminates the ~9 ms/cube ``torch.fft.fftshift`` (aten::roll)
+        # data-movement pass. Odd N (non-production) falls back to roll.
+        # ``DSART_DISABLE_FFTSHIFT_FOLD=1`` forces the legacy roll path so
+        # the fold can be A/B'd against it in the same binary.
+        fftshift_in_combine = (
+            (int(cfg.n_grid) & 1) == 0
+            and os.environ.get("DSART_DISABLE_FFTSHIFT_FOLD") != "1"
+        )
         per_cube_combine_evs: list = []
         per_cube_fft_evs: list = []
         per_cube_mask_evs: list = []
@@ -347,46 +390,96 @@ class GpuImager:
                 ev_b_mask_end = torch.cuda.Event(enable_timing=True)
                 ev_b_start.record()
             for j in range(n_batch):
-                fused_dequant_combine_per_fdm(
-                    streams_cint8,
-                    time_shifts_gpu[f0 + j].contiguous(),
-                    self.uv_batch[j],
-                    scales=chgroup_scales,
-                    offsets_re=chgroup_offsets_re,
-                    offsets_im=chgroup_offsets_im,
-                )
+                # M7.7.2 carry-over: pass the sliced uv-batch view
+                # ``uv_batch[j, t_lo:T_det]`` (size ``t_det_local``)
+                # to the kernel. With ``t_lo=0`` this is just
+                # ``uv_batch[j]`` and the call is identical to the
+                # legacy code path.
+                if use_rfft:
+                    # M7.7.4: write the conjugate-fold half-spectrum
+                    # (0.5 baked in) so ``irfft2`` == ``real(ifft2(G))``.
+                    fused_dequant_combine_per_fdm_half(
+                        streams_cint8,
+                        time_shifts_gpu[f0 + j].contiguous(),
+                        self.uv_batch[j, t_lo:cfg.t_det],
+                        scales=chgroup_scales,
+                        offsets_re=chgroup_offsets_re,
+                        offsets_im=chgroup_offsets_im,
+                        t_lo=int(t_lo),
+                        fftshift=fftshift_in_combine,
+                    )
+                else:
+                    fused_dequant_combine_per_fdm(
+                        streams_cint8,
+                        time_shifts_gpu[f0 + j].contiguous(),
+                        self.uv_batch[j, t_lo:cfg.t_det],
+                        scales=chgroup_scales,
+                        offsets_re=chgroup_offsets_re,
+                        offsets_im=chgroup_offsets_im,
+                        t_lo=int(t_lo),
+                        fftshift=fftshift_in_combine,
+                    )
             if gpu_profile:
                 ev_b_combine_end.record()
-            img_complex = torch.fft.ifft2(self.uv_batch[:n_batch])
-            img_complex = torch.fft.fftshift(img_complex, dim=(-2, -1))
+            # M7.7.2 carry-over: FFT and mask operate only on the
+            # newly-imaged rows ``[t_lo : T_det]``. The image tensor
+            # has leading-time-axis size ``t_det_local`` (== T_det
+            # when ``t_lo == 0``).
+            if use_rfft:
+                # M7.7.4: real-output FFT directly yields the (already
+                # 0.5-scaled) real dirty image — no complex slab, no
+                # ``.real``, and the fftshift is folded into the combine
+                # write (even N only, enforced above).
+                img_real = torch.fft.irfft2(
+                    self.uv_batch[:n_batch, t_lo:cfg.t_det],
+                    s=(cfg.n_grid, cfg.n_grid),
+                )
+                if not fftshift_in_combine:
+                    # A/B parity with the legacy roll path (even N still
+                    # folds by default; this only fires under
+                    # DSART_DISABLE_FFTSHIFT_FOLD=1).
+                    img_real = torch.fft.fftshift(img_real, dim=(-2, -1))
+            else:
+                img_complex = torch.fft.ifft2(
+                    self.uv_batch[:n_batch, t_lo:cfg.t_det]
+                )
+                if not fftshift_in_combine:
+                    # Even-N folds the shift into the combine write (above);
+                    # only odd-N needs the explicit roll.
+                    img_complex = torch.fft.fftshift(img_complex, dim=(-2, -1))
+                img_real = img_complex.real
             if gpu_profile:
                 ev_b_fft_end.record()
             if self.edge_mask_per_fdm is not None:
                 # Per-fdm fused edge-mask × (1/σ_layer1_prev). Broadcasts
                 # ``[n_batch, 1, N, N]`` over the T_det axis of
-                # ``img_complex.real``. The output cube is then already
+                # ``img_real``. The output cube is then already
                 # Layer-1-normalised — the CubePipeline skips its
                 # explicit ``cube / σ`` divide.
                 mask_slice = self.edge_mask_per_fdm[f0:f0 + n_batch, None, :, :]
                 torch.mul(
-                    img_complex.real.to(cfg.cube_dtype),
+                    img_real.to(cfg.cube_dtype),
                     mask_slice,
-                    out=self.img_batch_real[:n_batch],
+                    out=self.img_batch_real[:n_batch, :t_det_local],
                 )
             else:
                 torch.mul(
-                    img_complex.real.to(cfg.cube_dtype),
+                    img_real.to(cfg.cube_dtype),
                     self.edge_mask_real[None, None, :, :],
-                    out=self.img_batch_real[:n_batch],
+                    out=self.img_batch_real[:n_batch, :t_det_local],
                 )
             out_cube = (
                 self.output_cube
                 if self._output_index == 0
                 else self.output_cube_alt
             )
-            out_cube[:, f0:f0 + n_batch, :, :] = self.img_batch_real[
-                :n_batch
-            ].permute(1, 0, 2, 3)
+            # M7.7.2 carry-over: write only the new rows
+            # ``out_cube[t_lo:T_det, f0:f0+n_batch]``; rows
+            # ``[0, t_lo)`` are left untouched here and filled by the
+            # caller from the previous cube.
+            out_cube[t_lo:cfg.t_det, f0:f0 + n_batch, :, :] = (
+                self.img_batch_real[:n_batch, :t_det_local].permute(1, 0, 2, 3)
+            )
             if gpu_profile:
                 ev_b_mask_end.record()
                 per_cube_combine_evs.append((ev_b_start, ev_b_combine_end))

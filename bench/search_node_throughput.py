@@ -270,6 +270,11 @@ async def _bench_main(args: argparse.Namespace) -> int:
             )
         coarse_dm, fine_dm, fine_to_coarse = _build_dm_grids(n_fdm)
 
+    cube_cadence_samples_arg = (
+        int(args.cube_cadence_samples)
+        if int(getattr(args, "cube_cadence_samples", 0)) > 0
+        else None
+    )
     src = SyntheticRxRingSource(
         n_cubes=n_cubes,
         t_det=t_det,
@@ -283,6 +288,7 @@ async def _bench_main(args: argparse.Namespace) -> int:
         t_int_search_us=float(getattr(args, "t_int_search_us", 1048.576)),
         pre_quantise=bool(args.prequantise),
         symmetric_shift_padding=bool(getattr(args, "symmetric_shift_padding", False)),
+        cube_cadence_samples=cube_cadence_samples_arg,
     )
     if bool(getattr(args, "symmetric_shift_padding", False)):
         _LOG.info(
@@ -383,6 +389,10 @@ async def _bench_main(args: argparse.Namespace) -> int:
         gpu_t_det=t_det if image_backend == "gpu" else None,
         gpu_n_fdm=n_fdm if image_backend == "gpu" else None,
         gpu_complex_dtype=gpu_complex_dtype,
+        cube_pipeline_carry_over_re_imaging=bool(
+            getattr(args, "cube_pipeline_carry_over_re_imaging", False)
+        ),
+        cube_cadence_samples=cube_cadence_samples_arg,
     )
     _LOG.info(
         "image_backend=%s gpu_complex_dtype=%s",
@@ -483,6 +493,21 @@ async def _bench_main(args: argparse.Namespace) -> int:
             # runs imager + Layer-1 + detector for cube N. Avoids the
             # SM contention that regressed the prior full-prefetch
             # overlap path; the H2D engine is independent of the SMs.
+            # M7.7.2 detector op-level profile: wrap a window of steady
+            # cubes in torch.profiler and dump the cuda_time breakdown.
+            prof_detector = bool(getattr(args, "torch_profile_detector", False))
+            prof_warmup_cubes = 25
+            prof_window_cubes = 15
+            _prof = None
+            _prof_started = False
+            if prof_detector:
+                from torch.profiler import profile, ProfilerActivity
+                _prof = profile(
+                    activities=[
+                        ProfilerActivity.CPU, ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=False,
+                )
             aiter = src.__aiter__()
             try:
                 slot = await aiter.__anext__()
@@ -490,6 +515,30 @@ async def _bench_main(args: argparse.Namespace) -> int:
                 slot = None
             pending = pipeline.prefetch_h2d(slot) if slot is not None else None
             while slot is not None and pending is not None:
+                if prof_detector and (not _prof_started) and (
+                    slot.cube_id >= prof_warmup_cubes
+                ):
+                    torch.cuda.synchronize()
+                    _prof.__enter__()
+                    _prof_started = True
+                    _LOG.info(
+                        "torch-profile-detector: started at cube=%d",
+                        slot.cube_id,
+                    )
+                if prof_detector and _prof_started and (
+                    slot.cube_id >= prof_warmup_cubes + prof_window_cubes
+                ):
+                    torch.cuda.synchronize()
+                    _prof.__exit__(None, None, None)
+                    _prof_started = False
+                    ka = _prof.key_averages()
+                    print(
+                        ka.table(
+                            sort_by="self_cuda_time_total", row_limit=35,
+                        ),
+                        flush=True,
+                    )
+                    return 0
                 t_dispatch_start = time.perf_counter_ns()
                 try:
                     next_slot = await aiter.__anext__()
@@ -685,6 +734,13 @@ async def _bench_main(args: argparse.Namespace) -> int:
         "throughput summary: %.2f cubes/s · total p50=%.2fms p99=%.2fms",
         summary["achieved_cubes_per_s"], pct["p50"], pct["p99"],
     )
+    if torch.cuda.is_available():
+        peak_alloc_gib = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        peak_reserved_gib = torch.cuda.max_memory_reserved() / (1024 ** 3)
+        _LOG.info(
+            "GPU peak memory: allocated=%.2f GiB reserved=%.2f GiB",
+            peak_alloc_gib, peak_reserved_gib,
+        )
     return 0
 
 
@@ -779,6 +835,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "(GPU backend only).",
     )
     parser.add_argument(
+        "--torch-profile-detector", action="store_true",
+        help="M7.7.2 detector profiling: after warmup, wrap a window of "
+             "steady-state cubes in torch.profiler (CUDA) and print the "
+             "op-level cuda_time breakdown (cumsum vs fused-boxcar vs "
+             "topk/sort decode vs Layer-2 sigma). Only honoured on the "
+             "--pipeline-overlap path. Exits after the window.",
+    )
+    parser.add_argument(
         "--detector-streaming-decoder-n-top", type=int, default=64,
         help="Per-kernel top-k budget used by streaming decoder "
         "(decode_topk_lowmem). Lower values reduce topk work; keep "
@@ -832,6 +896,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "(coverage correction off, fused-L1 imager re-enabled). "
              "Without this flag the bench silently bypasses M7.7 so any "
              "perf regression in the post-M7.7 path goes unnoticed.",
+    )
+    parser.add_argument(
+        "--cube-cadence-samples", type=int, default=0,
+        help="M7.7.2 (2026-06-04): production cube cadence in samples. "
+             "Default 0 keeps the legacy synthetic source behaviour "
+             "(specnum_start = cube_idx * t_det, no inter-cube overlap). "
+             "Pass 128 to mirror the production sampler (cubes advance "
+             "by 128 samples, share the trailing t_det - 128 samples). "
+             "Required for --cube-pipeline-carry-over-re-imaging to do "
+             "anything meaningful (the pipeline carries t_det - cadence "
+             "image-space rows from the prior cube).",
+    )
+    parser.add_argument(
+        "--cube-pipeline-carry-over-re-imaging", action="store_true",
+        help="M7.7.2 (2026-06-04): enable cube-level carry-over re-"
+             "imaging. The fused imager runs only on the new "
+             "cube_cadence_samples rows; the prior t_det - cadence rows "
+             "are copied from the previous cube's output (per-fdm sigma "
+             "rescale when fused-L1 is active). Default OFF -- operator "
+             "enables explicitly after the A/B equivalence gate passes. "
+             "See docs/m7/M77_2_CARRYOVER_DESIGN.md.",
     )
     parser.add_argument(
         "--dm-plan-path", type=str, default=None,

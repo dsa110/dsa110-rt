@@ -486,6 +486,8 @@ class SyntheticRxRingSource:
         pre_quantise: bool = False,
         prequantise_target_max: int = 120,
         symmetric_shift_padding: bool = False,
+        cube_cadence_samples: Optional[int] = None,
+        overlap_streams: bool = False,
     ) -> None:
         if n_cubes <= 0:
             raise ValueError(f"n_cubes={n_cubes}, expected > 0")
@@ -528,6 +530,66 @@ class SyntheticRxRingSource:
             # combiner can safely read [t - shift] for every (t, fdm) pair.
             self._t_stream = self._t_det + int(shifts.max(initial=0))
         self._max_shift = int(shifts.max(initial=0))
+        # M7.7.2 (2026-06-04): when ``cube_cadence_samples`` is set
+        # (production = 128), consecutive cubes are emitted with
+        # ``specnum_start = cube_idx * cube_cadence_samples`` so the
+        # CubePipeline's carry-over re-imaging path can be exercised
+        # in the synthetic bench. Default ``None`` preserves the
+        # legacy behaviour (``specnum_start = cube_idx * t_det``;
+        # consecutive cubes occupy non-overlapping absolute-time
+        # windows; carry-over rows are MATHEMATICALLY BOGUS — the
+        # carry-over savings still measure correctly in speed gates,
+        # but a numerical A/B equivalence test will FAIL until the
+        # caller passes a real cadence < t_det). The bench's
+        # synthetic streams are still drawn independently per cube
+        # (no inter-cube stream overlap); the cadence only affects
+        # the per-cube ``specnum_start`` stamp.
+        self._cube_cadence_samples: Optional[int] = (
+            int(cube_cadence_samples)
+            if cube_cadence_samples is not None
+            and int(cube_cadence_samples) > 0
+            else None
+        )
+        if self._cube_cadence_samples is not None:
+            if self._cube_cadence_samples > self._t_det:
+                raise ValueError(
+                    f"cube_cadence_samples={self._cube_cadence_samples}, "
+                    f"must be <= t_det={self._t_det}"
+                )
+        # M7.7.2 (2026-06-04): when ``overlap_streams=True`` AND a
+        # ``cube_cadence_samples`` is set, consecutive cubes' per-
+        # chgroup streams share the trailing
+        # ``t_stream - cube_cadence_samples`` rows. The shared rows
+        # represent the SAME absolute time range, so the carry-over
+        # re-imaging fast path (cube_{N+1}[0:t_det-cadence] copied
+        # from cube_N[cadence:t_det]) becomes mathematically exact.
+        # Required for the A/B equivalence test
+        # (carry-over OFF vs ON must agree to fp16 precision).
+        # Costs ~10 ms / cube of RNG work for the new ``cadence`` rows
+        # (vs ~30 ms for the full ``t_stream`` rows when independent).
+        # Ignored by the pre_quantise fast path (all cubes are
+        # identical there; "overlap" is trivially satisfied).
+        self._overlap_streams = bool(overlap_streams) and (
+            self._cube_cadence_samples is not None
+        )
+        # Rolling stream cache (per-chgroup) for the overlap-streams
+        # path. ``None`` until the FIRST cube is generated. Each
+        # entry has shape ``[t_stream, N_grid, N_grid] complex64``.
+        self._prev_streams_for_overlap: Optional[dict[int, np.ndarray]] = None
+        # M7.7.2: when ``overlap_streams=True``, the synthetic source
+        # ALSO pre-quantises each cube's streams into cint8 using a
+        # CONSTANT global scale (calibrated lazily from cube 0). This
+        # is required for the carry-over numerical-equivalence gate:
+        # if every cube re-derived its own per-cube quantise scale
+        # (which is what the CubePipeline fallback does), then cube N
+        # row 128 and cube N+1 row 0 — same absolute time, same raw
+        # stream values — would round to DIFFERENT cint8 codes,
+        # breaking the imager-output equality that the carry-over
+        # correctness proof depends on. Production has no such
+        # problem because the rx_ring delivers cint8 with a stable
+        # per-chgroup calibration that varies on minute timescales.
+        self._overlap_quantise_scale: Optional[float] = None
+        self._overlap_cint8_buf: Optional[np.ndarray] = None
         self._cubes_emitted = 0
         self._started = False
         self._stopped = False
@@ -564,13 +626,52 @@ class SyntheticRxRingSource:
         for ``cube_idx == self._cubes_emitted`` are splatted on top of
         chgroup 15 (the reference, no shift) at the requested cell —
         this is a minimal injection for latency/throughput benching.
+
+        With ``overlap_streams=True`` (M7.7.2), the trailing
+        ``t_stream - cube_cadence_samples`` rows of cube N's streams
+        are reused as the leading rows of cube N+1's streams. Only
+        the new ``cube_cadence_samples`` rows per chgroup are drawn
+        from the RNG, so consecutive cubes' streams represent the
+        same physical absolute-time window (which is what the
+        carry-over re-imaging path mathematically depends on for the
+        copied rows to equal the re-imaged rows).
         """
         streams: dict[int, np.ndarray] = {}
         shape = (self._t_stream, self._n_grid, self._n_grid)
+        cadence = (
+            int(self._cube_cadence_samples)
+            if self._overlap_streams
+            and self._cube_cadence_samples is not None
+            else None
+        )
         for g in range(N_CHGROUP):
-            re = self._rng.standard_normal(shape).astype(np.float32) * (1.0 / np.sqrt(2.0))
-            im = self._rng.standard_normal(shape).astype(np.float32) * (1.0 / np.sqrt(2.0))
-            streams[g] = (re + 1j * im).astype(np.complex64)
+            if (
+                cadence is not None
+                and self._prev_streams_for_overlap is not None
+                and g in self._prev_streams_for_overlap
+            ):
+                # Carry over the trailing (t_stream - cadence) rows
+                # from the prev cube to the leading rows here; only
+                # draw fresh RNG for the new ``cadence`` trailing
+                # rows.
+                prev = self._prev_streams_for_overlap[g]
+                buf = np.empty(shape, dtype=np.complex64)
+                buf[: self._t_stream - cadence] = prev[cadence:]
+                new_shape = (cadence, self._n_grid, self._n_grid)
+                re_new = self._rng.standard_normal(new_shape).astype(
+                    np.float32
+                ) * (1.0 / np.sqrt(2.0))
+                im_new = self._rng.standard_normal(new_shape).astype(
+                    np.float32
+                ) * (1.0 / np.sqrt(2.0))
+                buf[self._t_stream - cadence:] = (
+                    re_new + 1j * im_new
+                ).astype(np.complex64)
+                streams[g] = buf
+            else:
+                re = self._rng.standard_normal(shape).astype(np.float32) * (1.0 / np.sqrt(2.0))
+                im = self._rng.standard_normal(shape).astype(np.float32) * (1.0 / np.sqrt(2.0))
+                streams[g] = (re + 1j * im).astype(np.complex64)
         for inj in self._injections:
             if inj.cube_idx != cube_idx:
                 continue
@@ -633,9 +734,76 @@ class SyntheticRxRingSource:
             else:
                 streams = self._gen_cube_streams(cube_idx)
                 cint8_stack = None
+                if self._overlap_streams:
+                    # Stash a SNAPSHOT (not a view) of the streams so
+                    # the next cube can overlap correctly. Convert to
+                    # a plain dict to avoid Mapping[...] view shadows.
+                    self._prev_streams_for_overlap = {
+                        int(g): np.ascontiguousarray(streams[g])
+                        for g in streams
+                    }
+                    # M7.7.2: pre-quantise this cube's streams into
+                    # cint8 with a CONSTANT (cube-0-calibrated) scale,
+                    # then deliver the cint8 stack so the CubePipeline
+                    # takes its path-1 branch (no re-quantise per
+                    # cube). See comments at __init__ for the
+                    # carry-over rationale.
+                    from ..transport.quantize import (
+                        quantise_per_chgroup_into_cint8,
+                    )
+                    cint8_shape = (
+                        N_CHGROUP, self._t_stream, 2,
+                        self._n_grid, self._n_grid,
+                    )
+                    if (
+                        self._overlap_cint8_buf is None
+                        or self._overlap_cint8_buf.shape != cint8_shape
+                    ):
+                        self._overlap_cint8_buf = np.empty(
+                            cint8_shape, dtype=np.int8,
+                        )
+                    if self._overlap_quantise_scale is None:
+                        # First cube: compute the calibrated scale.
+                        scale_calibrated = quantise_per_chgroup_into_cint8(
+                            streams,
+                            out_cint8=self._overlap_cint8_buf,
+                            target_max=self._prequantise_target_max,
+                            zero_fill_missing=True,
+                        )
+                        self._overlap_quantise_scale = float(
+                            scale_calibrated
+                        )
+                    else:
+                        # Subsequent cubes: re-use the cube-0 scale so
+                        # cint8 across cubes is mutually consistent.
+                        quantise_per_chgroup_into_cint8(
+                            streams,
+                            out_cint8=self._overlap_cint8_buf,
+                            target_max=self._prequantise_target_max,
+                            zero_fill_missing=True,
+                            fixed_scale=self._overlap_quantise_scale,
+                        )
+                    # Emit a per-cube COPY of the cint8 stack so the
+                    # CubePipeline can hold it across cubes without
+                    # racing with the next cube's quantise into the
+                    # shared buffer.
+                    cint8_stack = np.ascontiguousarray(
+                        self._overlap_cint8_buf
+                    )
+            # M7.7.2: when ``cube_cadence_samples`` is set, cubes
+            # advance by that cadence (production = 128) so the
+            # CubePipeline's carry-over re-imaging path sees
+            # production-like specnum strides. Otherwise legacy
+            # behaviour (advance by t_det, no inter-cube overlap).
+            cadence_for_specnum = (
+                self._cube_cadence_samples
+                if self._cube_cadence_samples is not None
+                else self._t_det
+            )
+            specnum_start = cube_idx * int(cadence_for_specnum)
             slot = CubeRingSlot(
                 cube_id=cube_idx,
-                specnum_start=cube_idx * self._t_det,
+                specnum_start=specnum_start,
                 per_chgroup_streams=streams,
                 time_shift_table=self._time_shift_table,
                 validity_mask=np.ones(

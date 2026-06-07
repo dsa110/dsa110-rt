@@ -90,11 +90,19 @@ extern "C" __global__ void fused_combine_per_fdm_cf16(
     const __half2* __restrict__ streams,
     const int*     __restrict__ shifts,
     __half2*       __restrict__ output,
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over: kernel writes only output rows [t_lo, t_det).
+    // The caller launches grid_z covering (t_det - t_lo) rows; the
+    // local row index ``t_out`` becomes cube-time ``t = t_out + t_lo``.
+    // ``output`` is the sliced buffer ``[t_lo : t_det]`` (size
+    // ``t_det - t_lo`` rows); writes use ``t_out`` so the inner-loop
+    // streams reads use the absolute cube-time ``t``.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -127,7 +135,7 @@ extern "C" __global__ void fused_combine_per_fdm_cf16(
             acc = __hadd2(acc, val);
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = acc;
+    output[(long long)t_out * n_grid_sq + spatial_offset] = acc;
 }
 """
 
@@ -136,11 +144,15 @@ extern "C" __global__ void fused_combine_per_fdm_cf32(
     const float2* __restrict__ streams,
     const int*    __restrict__ shifts,
     float2*       __restrict__ output,
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -162,7 +174,7 @@ extern "C" __global__ void fused_combine_per_fdm_cf32(
             acc.y += val.y;
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = acc;
+    output[(long long)t_out * n_grid_sq + spatial_offset] = acc;
 }
 """
 
@@ -198,12 +210,16 @@ _CUDA_SOURCE_CF16_DEQUANT = r"""
 extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16(
     const signed char* __restrict__ streams,  // [N_chg, T, 2, N, N] int8
     const int*         __restrict__ shifts,   // [N_chg]
-    __half2*           __restrict__ output,   // [T_det, N, N] cfp16
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    __half2*           __restrict__ output,   // [T_det - t_lo, N, N] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -227,8 +243,12 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16(
             acc_im += (int)streams[base + n_grid_sq];           // im plane
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = __floats2half2_rn(
-        (float)acc_re, (float)acc_im
+    // M7.7.3 fold fftshift into the combine write -- see CF16 calib.
+    float out_re = (float)acc_re;
+    float out_im = (float)acc_im;
+    if (fftshift && ((u + v) & 1)) { out_re = -out_re; out_im = -out_im; }
+    output[(long long)t_out * n_grid_sq + spatial_offset] = __floats2half2_rn(
+        out_re, out_im
     );
 }
 """
@@ -238,11 +258,15 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf32(
     const signed char* __restrict__ streams,
     const int*         __restrict__ shifts,
     float2*            __restrict__ output,
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -265,8 +289,12 @@ extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf32(
             acc_im += (int)streams[base + n_grid_sq];
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = make_float2(
-        (float)acc_re, (float)acc_im
+    // M7.7.3 fold fftshift into the combine write -- see CF16 calib.
+    float out_re = (float)acc_re;
+    float out_im = (float)acc_im;
+    if (fftshift && ((u + v) & 1)) { out_re = -out_re; out_im = -out_im; }
+    output[(long long)t_out * n_grid_sq + spatial_offset] = make_float2(
+        out_re, out_im
     );
 }
 """
@@ -307,12 +335,16 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
     const float*       __restrict__ scales,     // [N_chg] fp32
     const float*       __restrict__ offset_re,  // [N_chg] fp32
     const float*       __restrict__ offset_im,  // [N_chg] fp32
-    __half2*           __restrict__ output,     // [T_det, N, N] cfp16
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    __half2*           __restrict__ output,     // [T_det - t_lo, N, N] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -339,7 +371,11 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[g];
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
+    // M7.7.3 fold fftshift into the combine write: fftshift(ifft2(uv))
+    // == ifft2(uv * (-1)^(u+v)) for even N, so a static checkerboard
+    // sign on the uv-plane write replaces the post-IFFT aten::roll.
+    if (fftshift && ((u + v) & 1)) { acc_re = -acc_re; acc_im = -acc_im; }
+    output[(long long)t_out * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
 }
 """
 
@@ -351,11 +387,15 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
     const float*       __restrict__ offset_re,
     const float*       __restrict__ offset_im,
     float2*            __restrict__ output,
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -382,7 +422,9 @@ extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_c
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[g];
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
+    // M7.7.3 fold fftshift into the combine write -- see CF16 calib.
+    if (fftshift && ((u + v) & 1)) { acc_re = -acc_re; acc_im = -acc_im; }
+    output[(long long)t_out * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
 }
 """
 
@@ -415,12 +457,16 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
     const float*       __restrict__ scales,     // [N_chg, T] fp32 -- per-(g, t_src)
     const float*       __restrict__ offset_re,  // [N_chg, T] fp32
     const float*       __restrict__ offset_im,  // [N_chg, T] fp32
-    __half2*           __restrict__ output,     // [T_det, N, N] cfp16
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    __half2*           __restrict__ output,     // [T_det - t_lo, N, N] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -449,7 +495,9 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[gt];
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
+    // M7.7.3 fold fftshift into the combine write -- see CF16 calib.
+    if (fftshift && ((u + v) & 1)) { acc_re = -acc_re; acc_im = -acc_im; }
+    output[(long long)t_out * n_grid_sq + spatial_offset] = __floats2half2_rn(acc_re, acc_im);
 }
 """
 
@@ -461,11 +509,15 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
     const float*       __restrict__ offset_re,  // [N_chg, T]
     const float*       __restrict__ offset_im,  // [N_chg, T]
     float2*            __restrict__ output,
-    int n_chgroup, int t_stream, int t_det, int n_grid)
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
 {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     const int u = blockIdx.y * blockDim.y + threadIdx.y;
-    const int t = blockIdx.z * blockDim.z + threadIdx.z;
+    // M7.7.2 carry-over -- see CF16 kernel for the full t_lo / t_out
+    // contract.
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
     if (v >= n_grid || u >= n_grid || t >= t_det) return;
 
     const int n_grid_sq      = n_grid * n_grid;
@@ -490,7 +542,189 @@ extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint
             acc_im = fmaf(sc, c_im, acc_im) + offset_im[gt];
         }
     }
-    output[(long long)t * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
+    // M7.7.3 fold fftshift into the combine write -- see CF16 calib.
+    if (fftshift && ((u + v) & 1)) { acc_re = -acc_re; acc_im = -acc_im; }
+    output[(long long)t_out * n_grid_sq + spatial_offset] = make_float2(acc_re, acc_im);
+}
+"""
+
+
+# M7.7.4 — conjugate-fold HALF-grid combine variants (real-output FFT)
+# ====================================================================
+# The dirty image is real, so the production imager only ever consumes
+# ``real(ifft2(G))``. The single-side uv grid ``G`` (no Hermitian mirror
+# cell; see grid/sparsity_pattern.py) is FFT'd full-size and the
+# imaginary half is then discarded by ``.real`` — wasting half the FFT
+# work AND a full N×N complex ``uv_batch`` slab.
+#
+# Identity (exact, no Hermitian precondition on G):
+#     real(ifft2(G)) == 0.5 * irfft2(G_h)
+# where the Hermitian half-spectrum is the conjugate fold
+#     G_h[u,w] = G[u,w] + conj(G[(-u) mod N, (-w) mod N]),   w in [0, N/2].
+# The mirror term reconstructs the (physically conjugate-symmetric but
+# never-gridded) Stokes-I conjugate visibility V(-u,-v)=conj(V(u,v)) —
+# i.e. the ``.real`` is moved from AFTER the FFT to BEFORE it.
+#
+# Each half-grid thread (u, w), w in [0, N/2], combines TWO source cells
+# (its own (u,w) and the mirror ((N-u)%N,(N-w)%N)) in one chgroup pass,
+# so total stream-read traffic is ~unchanged (each input cell is still
+# read once across the half output), while the output slab and the cuFFT
+# both shrink ~2×. The 0.5 scale is baked into the write (exact in fp16
+# for the |sum| <= 2032 integer range; sub-ULP for the calib fp32 path)
+# so ``0.5*irfft2`` collapses to a plain ``irfft2`` downstream.
+#
+# fftshift fold: (-1)^(u+w) is invariant under (u,w)->(-u,-w) for even N,
+# so it factors out of the conjugate fold and applies to G_h directly,
+# exactly as in the full-grid kernels (M7.7.3).
+_CUDA_SOURCE_CF16_DEQUANT_HALF = r"""
+#include <cuda_fp16.h>
+
+extern "C" __global__ void fused_dequant_combine_per_fdm_cint8_to_cf16_half(
+    const signed char* __restrict__ streams,  // [N_chg, T, 2, N, N] int8
+    const int*         __restrict__ shifts,   // [N_chg]
+    __half2*           __restrict__ output,   // [T_det - t_lo, N, N/2+1] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
+{
+    const int w = blockIdx.x * blockDim.x + threadIdx.x;  // half-axis col
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
+    const int n_half = n_grid / 2 + 1;
+    if (w >= n_half || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int um = (n_grid - u) % n_grid;
+    const int wm = (n_grid - w) % n_grid;
+    const int off_cell   = u  * n_grid + w;
+    const int off_mirror = um * n_grid + wm;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
+
+    int acc_re = 0,  acc_im = 0;
+    int accm_re = 0, accm_im = 0;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int t_src = t - shifts[g];
+        if (t_src >= 0 && t_src < t_stream) {
+            const long long b = (long long)g * chg_stride
+                              + (long long)t_src * t_stride;
+            acc_re  += (int)streams[b + off_cell];
+            acc_im  += (int)streams[b + off_cell + n_grid_sq];
+            accm_re += (int)streams[b + off_mirror];
+            accm_im += (int)streams[b + off_mirror + n_grid_sq];
+        }
+    }
+    // G_h = G[u,w] + conj(G[-u,-w]); 0.5 baked in so irfft2 == real(ifft2)
+    float out_re = 0.5f * (float)(acc_re + accm_re);
+    float out_im = 0.5f * (float)(acc_im - accm_im);
+    if (fftshift && ((u + w) & 1)) { out_re = -out_re; out_im = -out_im; }
+    output[(long long)t_out * (n_grid * n_half) + (long long)u * n_half + w] =
+        __floats2half2_rn(out_re, out_im);
+}
+"""
+
+_CUDA_SOURCE_CF16_DEQUANT_CALIB_HALF = r"""
+#include <cuda_fp16.h>
+
+extern "C" __global__ void fused_dequant_scale_offset_combine_per_fdm_cint8_to_cf16_half(
+    const signed char* __restrict__ streams,
+    const int*         __restrict__ shifts,
+    const float*       __restrict__ scales,     // [N_chg] fp32
+    const float*       __restrict__ offset_re,  // [N_chg] fp32
+    const float*       __restrict__ offset_im,  // [N_chg] fp32
+    __half2*           __restrict__ output,     // [T_det - t_lo, N, N/2+1] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
+{
+    const int w = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
+    const int n_half = n_grid / 2 + 1;
+    if (w >= n_half || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int um = (n_grid - u) % n_grid;
+    const int wm = (n_grid - w) % n_grid;
+    const int off_cell   = u  * n_grid + w;
+    const int off_mirror = um * n_grid + wm;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
+
+    float acc_re = 0.0f,  acc_im = 0.0f;
+    float accm_re = 0.0f, accm_im = 0.0f;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int t_src = t - shifts[g];
+        if (t_src >= 0 && t_src < t_stream) {
+            const long long b = (long long)g * chg_stride
+                              + (long long)t_src * t_stride;
+            const float sc  = scales[g];
+            const float ore = offset_re[g];
+            const float oim = offset_im[g];
+            acc_re  = fmaf(sc, (float)streams[b + off_cell],              acc_re)  + ore;
+            acc_im  = fmaf(sc, (float)streams[b + off_cell + n_grid_sq],  acc_im)  + oim;
+            accm_re = fmaf(sc, (float)streams[b + off_mirror],             accm_re) + ore;
+            accm_im = fmaf(sc, (float)streams[b + off_mirror + n_grid_sq], accm_im) + oim;
+        }
+    }
+    float out_re = 0.5f * (acc_re + accm_re);
+    float out_im = 0.5f * (acc_im - accm_im);
+    if (fftshift && ((u + w) & 1)) { out_re = -out_re; out_im = -out_im; }
+    output[(long long)t_out * (n_grid * n_half) + (long long)u * n_half + w] =
+        __floats2half2_rn(out_re, out_im);
+}
+"""
+
+_CUDA_SOURCE_CF16_DEQUANT_CALIB_PER_T_HALF = r"""
+#include <cuda_fp16.h>
+
+extern "C" __global__ void fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16_half(
+    const signed char* __restrict__ streams,
+    const int*         __restrict__ shifts,
+    const float*       __restrict__ scales,     // [N_chg, T] fp32
+    const float*       __restrict__ offset_re,  // [N_chg, T] fp32
+    const float*       __restrict__ offset_im,  // [N_chg, T] fp32
+    __half2*           __restrict__ output,     // [T_det - t_lo, N, N/2+1] cfp16
+    int n_chgroup, int t_stream, int t_det, int n_grid,
+    int t_lo, int fftshift)
+{
+    const int w = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    const int t_out = blockIdx.z * blockDim.z + threadIdx.z;
+    const int t = t_out + t_lo;
+    const int n_half = n_grid / 2 + 1;
+    if (w >= n_half || u >= n_grid || t >= t_det) return;
+
+    const int n_grid_sq      = n_grid * n_grid;
+    const int um = (n_grid - u) % n_grid;
+    const int wm = (n_grid - w) % n_grid;
+    const int off_cell   = u  * n_grid + w;
+    const int off_mirror = um * n_grid + wm;
+    const long long t_stride   = (long long)2 * n_grid_sq;
+    const long long chg_stride = (long long)t_stream * t_stride;
+
+    float acc_re = 0.0f,  acc_im = 0.0f;
+    float accm_re = 0.0f, accm_im = 0.0f;
+    for (int g = 0; g < n_chgroup; ++g) {
+        const int t_src = t - shifts[g];
+        if (t_src >= 0 && t_src < t_stream) {
+            const long long b = (long long)g * chg_stride
+                              + (long long)t_src * t_stride;
+            const int   gt  = g * t_stream + t_src;
+            const float sc  = scales[gt];
+            const float ore = offset_re[gt];
+            const float oim = offset_im[gt];
+            acc_re  = fmaf(sc, (float)streams[b + off_cell],              acc_re)  + ore;
+            acc_im  = fmaf(sc, (float)streams[b + off_cell + n_grid_sq],  acc_im)  + oim;
+            accm_re = fmaf(sc, (float)streams[b + off_mirror],             accm_re) + ore;
+            accm_im = fmaf(sc, (float)streams[b + off_mirror + n_grid_sq], accm_im) + oim;
+        }
+    }
+    float out_re = 0.5f * (acc_re + accm_re);
+    float out_im = 0.5f * (acc_im - accm_im);
+    if (fftshift && ((u + w) & 1)) { out_re = -out_re; out_im = -out_im; }
+    output[(long long)t_out * (n_grid * n_half) + (long long)u * n_half + w] =
+        __floats2half2_rn(out_re, out_im);
 }
 """
 
@@ -506,6 +740,10 @@ _KERNEL_CF16_DEQUANT_CALIB: Optional[object] = None
 _KERNEL_CF32_DEQUANT_CALIB: Optional[object] = None
 _KERNEL_CF16_DEQUANT_CALIB_PER_T: Optional[object] = None
 _KERNEL_CF32_DEQUANT_CALIB_PER_T: Optional[object] = None
+# M7.7.4 conjugate-fold half-grid (real-output FFT) variants
+_KERNEL_CF16_DEQUANT_HALF: Optional[object] = None
+_KERNEL_CF16_DEQUANT_CALIB_HALF: Optional[object] = None
+_KERNEL_CF16_DEQUANT_CALIB_PER_T_HALF: Optional[object] = None
 
 
 def _get_kernel_cf16():
@@ -644,6 +882,57 @@ def _get_kernel_cf32_dequant_calib_per_t():
     return _KERNEL_CF32_DEQUANT_CALIB_PER_T
 
 
+def _get_kernel_cf16_dequant_half():
+    global _KERNEL_CF16_DEQUANT_HALF
+    if _KERNEL_CF16_DEQUANT_HALF is not None:
+        return _KERNEL_CF16_DEQUANT_HALF
+    cp = _get_cupy()
+    _LOG.info("compiling fused_dequant_combine_per_fdm_cint8_to_cf16_half via NVRTC...")
+    _KERNEL_CF16_DEQUANT_HALF = cp.RawKernel(
+        code=_CUDA_SOURCE_CF16_DEQUANT_HALF,
+        name="fused_dequant_combine_per_fdm_cint8_to_cf16_half",
+        options=("--use_fast_math",),
+    )
+    _LOG.info("fused_dequant_combine_per_fdm_cint8_to_cf16_half ready")
+    return _KERNEL_CF16_DEQUANT_HALF
+
+
+def _get_kernel_cf16_dequant_calib_half():
+    global _KERNEL_CF16_DEQUANT_CALIB_HALF
+    if _KERNEL_CF16_DEQUANT_CALIB_HALF is not None:
+        return _KERNEL_CF16_DEQUANT_CALIB_HALF
+    cp = _get_cupy()
+    _LOG.info(
+        "compiling fused_dequant_scale_offset_combine_per_fdm_cint8_to_cf16_half via NVRTC..."
+    )
+    _KERNEL_CF16_DEQUANT_CALIB_HALF = cp.RawKernel(
+        code=_CUDA_SOURCE_CF16_DEQUANT_CALIB_HALF,
+        name="fused_dequant_scale_offset_combine_per_fdm_cint8_to_cf16_half",
+        options=("--use_fast_math",),
+    )
+    _LOG.info("fused_dequant_scale_offset_combine_per_fdm_cint8_to_cf16_half ready")
+    return _KERNEL_CF16_DEQUANT_CALIB_HALF
+
+
+def _get_kernel_cf16_dequant_calib_per_t_half():
+    global _KERNEL_CF16_DEQUANT_CALIB_PER_T_HALF
+    if _KERNEL_CF16_DEQUANT_CALIB_PER_T_HALF is not None:
+        return _KERNEL_CF16_DEQUANT_CALIB_PER_T_HALF
+    cp = _get_cupy()
+    _LOG.info(
+        "compiling fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16_half via NVRTC..."
+    )
+    _KERNEL_CF16_DEQUANT_CALIB_PER_T_HALF = cp.RawKernel(
+        code=_CUDA_SOURCE_CF16_DEQUANT_CALIB_PER_T_HALF,
+        name="fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16_half",
+        options=("--use_fast_math",),
+    )
+    _LOG.info(
+        "fused_dequant_scale_offset_per_t_combine_per_fdm_cint8_to_cf16_half ready"
+    )
+    return _KERNEL_CF16_DEQUANT_CALIB_PER_T_HALF
+
+
 # ---------------------------------------------------------------------------
 # Torch-to-cupy zero-copy view
 # ---------------------------------------------------------------------------
@@ -703,6 +992,8 @@ def fused_combine_per_fdm(
     streams: torch.Tensor,
     shifts: torch.Tensor,
     output: torch.Tensor,
+    *,
+    t_lo: int = 0,
 ) -> None:
     """Run the fused per-fdm combine kernel in place into ``output``.
 
@@ -759,9 +1050,19 @@ def fused_combine_per_fdm(
             f"shifts shape mismatch: got {tuple(shifts.shape)}, "
             f"expected ({n_chgroup},)"
         )
-    t_det, n_out_x, n_out_y = output.shape
+    t_det_out, n_out_x, n_out_y = output.shape
     if n_out_x != n_grid or n_out_y != n_grid:
         raise RuntimeError("output spatial dims must match streams")
+    # M7.7.2 carry-over: ``output`` is the sliced buffer
+    # ``[t_lo : t_det]``; its leading dim is ``t_det - t_lo``. The
+    # kernel takes ``t_det`` as the cube-time UPPER bound and
+    # ``t_lo`` as the cube-time LOWER bound. Callers passing the
+    # legacy full ``[t_det, N, N]`` output use ``t_lo=0`` (default),
+    # which makes the kernel cover all rows [0, t_det).
+    if t_lo < 0:
+        raise RuntimeError(f"t_lo={t_lo}, must be >= 0")
+    t_det = int(t_det_out) + int(t_lo)
+    t_det_local = int(t_det_out)
 
     cp = _get_cupy()
     streams_cp = _torch_to_cupy_view(streams)
@@ -779,10 +1080,13 @@ def fused_combine_per_fdm(
     # The 32-thread x-axis maps one warp's load to a 128 B coalesced
     # transaction (32 × 4 B per cfp16 element).
     block: Tuple[int, int, int] = (32, 4, 8)
+    # M7.7.2: grid_z covers ``t_det_local = t_det - t_lo`` cube-time
+    # rows; the kernel computes ``t = t_out + t_lo`` and skips
+    # ``t >= t_det`` so the partial trailing block in z is harmless.
     grid: Tuple[int, int, int] = (
         (n_grid + block[0] - 1) // block[0],
         (n_grid + block[1] - 1) // block[1],
-        (t_det  + block[2] - 1) // block[2],
+        (t_det_local + block[2] - 1) // block[2],
     )
 
     # Use the active torch CUDA stream so the kernel synchronises
@@ -792,7 +1096,8 @@ def fused_combine_per_fdm(
         kernel(
             grid, block,
             (streams_cp, shifts_cp, output_cp,
-             int(n_chgroup), int(t_stream), int(t_det), int(n_grid)),
+             int(n_chgroup), int(t_stream), int(t_det), int(n_grid),
+             int(t_lo)),
         )
 
 
@@ -804,6 +1109,8 @@ def fused_dequant_combine_per_fdm(
     scales: Optional[torch.Tensor] = None,
     offsets_re: Optional[torch.Tensor] = None,
     offsets_im: Optional[torch.Tensor] = None,
+    t_lo: int = 0,
+    fftshift: bool = False,
 ) -> None:
     """Run the fused cint8-input dequant+combine kernel into ``output``.
 
@@ -915,13 +1222,31 @@ def fused_dequant_combine_per_fdm(
             f"shifts shape mismatch: got {tuple(shifts.shape)}, "
             f"expected ({n_chgroup},)"
         )
-    t_det, n_out_x, n_out_y = output.shape
+    t_det_out, n_out_x, n_out_y = output.shape
     if n_out_x != n_grid or n_out_y != n_grid:
         raise RuntimeError("output spatial dims must match streams")
+    # M7.7.2 carry-over -- see ``fused_combine_per_fdm`` for the full
+    # contract. ``output`` is the sliced buffer ``[t_lo : t_det]``;
+    # leading dim is ``t_det - t_lo``.
+    if t_lo < 0:
+        raise RuntimeError(f"t_lo={t_lo}, must be >= 0")
+    t_det = int(t_det_out) + int(t_lo)
+    t_det_local = int(t_det_out)
 
     use_calib = (
         scales is not None or offsets_re is not None or offsets_im is not None
     )
+
+    # M7.7.3: ``fftshift`` folds the post-IFFT fftshift into the combine
+    # write via the (-1)^(u+v) checkerboard identity, which is exact only
+    # for even N. Supported on all cint8 dequant kernels (calib, per-t,
+    # and unit-scale). Reject odd N rather than emit a silently-wrong slab.
+    fftshift_flag = int(bool(fftshift))
+    if fftshift_flag and (int(n_grid) & 1) != 0:
+        raise RuntimeError(
+            "fused_dequant_combine_per_fdm: fftshift=True requires even "
+            f"n_grid (checkerboard identity); got n_grid={n_grid}"
+        )
 
     cp = _get_cupy()
     streams_cp = _torch_to_cupy_view(streams_cint8)
@@ -929,10 +1254,13 @@ def fused_dequant_combine_per_fdm(
     output_cp = _torch_to_cupy_view(output)
 
     block: Tuple[int, int, int] = (32, 4, 8)
+    # M7.7.2: grid_z covers ``t_det_local = t_det - t_lo`` cube-time
+    # rows; the kernel computes ``t = t_out + t_lo`` and skips
+    # ``t >= t_det`` so the partial trailing block in z is harmless.
     grid: Tuple[int, int, int] = (
         (n_grid + block[0] - 1) // block[0],
         (n_grid + block[1] - 1) // block[1],
-        (t_det  + block[2] - 1) // block[2],
+        (t_det_local + block[2] - 1) // block[2],
     )
     torch_stream = torch.cuda.current_stream()
 
@@ -950,7 +1278,8 @@ def fused_dequant_combine_per_fdm(
             kernel(
                 grid, block,
                 (streams_cp, shifts_cp, output_cp,
-                 int(n_chgroup), int(t_stream), int(t_det), int(n_grid)),
+                 int(n_chgroup), int(t_stream), int(t_det), int(n_grid),
+                 int(t_lo), fftshift_flag),
             )
         return
 
@@ -1022,7 +1351,144 @@ def fused_dequant_combine_per_fdm(
             (streams_cp, shifts_cp,
              scales_cp, offsets_re_cp, offsets_im_cp,
              output_cp,
-             int(n_chgroup), int(t_stream), int(t_det), int(n_grid)),
+             int(n_chgroup), int(t_stream), int(t_det), int(n_grid),
+             int(t_lo), fftshift_flag),
+        )
+
+
+def fused_dequant_combine_per_fdm_half(
+    streams_cint8: torch.Tensor,
+    shifts: torch.Tensor,
+    output_half: torch.Tensor,
+    *,
+    scales: Optional[torch.Tensor] = None,
+    offsets_re: Optional[torch.Tensor] = None,
+    offsets_im: Optional[torch.Tensor] = None,
+    t_lo: int = 0,
+    fftshift: bool = False,
+) -> None:
+    """M7.7.4 conjugate-fold HALF-grid combine (real-output FFT path).
+
+    Identical contract to :func:`fused_dequant_combine_per_fdm` except the
+    output is the Hermitian half-spectrum
+
+        ``output_half[t, u, w] = 0.5 * (G[t,u,w] + conj(G[t,(-u)%N,(-w)%N]))``
+
+    of shape ``[T_det - t_lo, N_grid, N_grid//2 + 1]`` ``complex32``, where
+    ``G`` is the single-side combine this module's full-grid kernels emit.
+    Feeding ``output_half`` to ``torch.fft.irfft2(..., s=(N, N))`` yields
+    exactly ``real(ifft2(G))`` — the dirty image the imager consumes — at
+    ~half the FFT cost and ~half the uv-slab memory. ``cfp16`` output only
+    (production dtype); the calib/per-t dispatch matches the full-grid
+    wrapper.
+    """
+    if not (streams_cint8.is_cuda and shifts.is_cuda and output_half.is_cuda):
+        raise RuntimeError("fused_dequant_combine_per_fdm_half: all tensors must be cuda")
+    if streams_cint8.dtype != torch.int8:
+        raise RuntimeError(f"streams_cint8 must be int8; got {streams_cint8.dtype}")
+    if shifts.dtype != torch.int32:
+        raise RuntimeError(f"shifts must be int32; got {shifts.dtype}")
+    if streams_cint8.dim() != 5:
+        raise RuntimeError("streams_cint8 must be 5-D [N_chg, T_stream, 2, N, N]")
+    if output_half.dim() != 3:
+        raise RuntimeError("output_half must be 3-D [T_det, N, N//2+1]")
+    if output_half.dtype != torch.complex32:
+        raise RuntimeError(
+            "fused_dequant_combine_per_fdm_half: output_half must be complex32 "
+            f"(cfp16 real-FFT path); got {output_half.dtype}"
+        )
+
+    n_chgroup, t_stream, two, n_grid, n_grid_y = streams_cint8.shape
+    if two != 2 or n_grid_y != n_grid:
+        raise RuntimeError("streams_cint8 must be [N_chg, T_stream, 2, N, N] square")
+    if shifts.shape != (n_chgroup,):
+        raise RuntimeError(f"shifts shape mismatch: {tuple(shifts.shape)}")
+    n_half = n_grid // 2 + 1
+    t_det_out, n_out_x, n_out_y = output_half.shape
+    if n_out_x != n_grid or n_out_y != n_half:
+        raise RuntimeError(
+            f"output_half spatial dims must be (N={n_grid}, N//2+1={n_half}); "
+            f"got ({n_out_x}, {n_out_y})"
+        )
+    if t_lo < 0:
+        raise RuntimeError(f"t_lo={t_lo}, must be >= 0")
+    t_det = int(t_det_out) + int(t_lo)
+    t_det_local = int(t_det_out)
+
+    fftshift_flag = int(bool(fftshift))
+    if fftshift_flag and (int(n_grid) & 1) != 0:
+        raise RuntimeError(
+            "fused_dequant_combine_per_fdm_half: fftshift=True requires even n_grid"
+        )
+
+    use_calib = (
+        scales is not None or offsets_re is not None or offsets_im is not None
+    )
+
+    cp = _get_cupy()
+    streams_cp = _torch_to_cupy_view(streams_cint8)
+    shifts_cp = _torch_to_cupy_view(shifts)
+    output_cp = _torch_to_cupy_view(output_half)
+
+    block: Tuple[int, int, int] = (32, 4, 8)
+    grid: Tuple[int, int, int] = (
+        (n_half + block[0] - 1) // block[0],
+        (n_grid + block[1] - 1) // block[1],
+        (t_det_local + block[2] - 1) // block[2],
+    )
+    torch_stream = torch.cuda.current_stream()
+
+    if not use_calib:
+        kernel = _get_kernel_cf16_dequant_half()
+        with cp.cuda.ExternalStream(torch_stream.cuda_stream):
+            kernel(
+                grid, block,
+                (streams_cp, shifts_cp, output_cp,
+                 int(n_chgroup), int(t_stream), int(t_det), int(n_grid),
+                 int(t_lo), fftshift_flag),
+            )
+        return
+
+    if scales is None:
+        scales = torch.ones((n_chgroup,), dtype=torch.float32, device=output_half.device)
+    if offsets_re is None:
+        offsets_re = torch.zeros((n_chgroup,), dtype=torch.float32, device=output_half.device)
+    if offsets_im is None:
+        offsets_im = torch.zeros((n_chgroup,), dtype=torch.float32, device=output_half.device)
+
+    per_t_mode = all(t is not None and t.dim() == 2
+                     for t in (scales, offsets_re, offsets_im))
+    if any(t.dim() == 2 for t in (scales, offsets_re, offsets_im)) and not per_t_mode:
+        raise RuntimeError(
+            "fused_dequant_combine_per_fdm_half: scales/offsets must all be 1-D "
+            "[N_chg] OR all 2-D [N_chg, T_stream]"
+        )
+    expected_shape = (n_chgroup, t_stream) if per_t_mode else (n_chgroup,)
+    for name, t in (("scales", scales), ("offsets_re", offsets_re),
+                    ("offsets_im", offsets_im)):
+        if not t.is_cuda or t.dtype != torch.float32 or t.shape != expected_shape \
+                or not t.is_contiguous():
+            raise RuntimeError(
+                f"{name} must be contiguous cuda float32 of shape {expected_shape}; "
+                f"got device={t.device} dtype={t.dtype} shape={tuple(t.shape)}"
+            )
+
+    kernel = (
+        _get_kernel_cf16_dequant_calib_per_t_half()
+        if per_t_mode
+        else _get_kernel_cf16_dequant_calib_half()
+    )
+    scales_cp = _torch_to_cupy_view(scales)
+    offsets_re_cp = _torch_to_cupy_view(offsets_re)
+    offsets_im_cp = _torch_to_cupy_view(offsets_im)
+    with cp.cuda.ExternalStream(torch_stream.cuda_stream):
+        kernel(
+            grid, block,
+            (streams_cp, shifts_cp,
+             scales_cp, offsets_re_cp, offsets_im_cp,
+             output_cp,
+             int(n_chgroup), int(t_stream), int(t_det), int(n_grid),
+             int(t_lo), fftshift_flag),
         )
 
 
