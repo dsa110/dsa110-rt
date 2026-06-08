@@ -1020,6 +1020,130 @@ def test_route_search_compute_key():
 
 
 # ===========================================================================
+# 10c. make_search_noise_points (T1 2026-06-07)
+# ===========================================================================
+
+
+SEARCH_NOISE_N02_G0 = {
+    "search_node_id": 2,
+    "gpu_half": 0,
+    "s_k_median": 1.05,
+    "s_k_p95": 1.42,
+    "s_k_max": 1.95,
+    "s_k_min": 0.97,
+    "n_clamped_high_total": 17,
+    "n_clamped_high_max_per_kernel": 3,
+    "layer2_sigma_max_ratio": 4.0,
+    "layer2_cube_count": 200,
+    "layer2_is_warming_up": 0,
+    "ts_wall_unix": 1769000000.0,
+    "host": "lxd110h02",
+}
+
+
+def test_make_search_noise_points_fields_and_tags():
+    pts = pusher.make_search_noise_points(
+        SEARCH_NOISE_N02_G0, cn_id=2, gpu_half=0,
+        coarse_dm_owner={(2, 0): 4},
+    )
+    assert len(pts) == 1
+    p = pts[0]
+    assert p.measurement == "search_rt_noise"
+    assert p.tags["cn_id"] == "2"
+    assert p.tags["host"] == "lxd110h02"
+    assert p.tags["gpu_half"] == "0"
+    assert p.tags["coarse_dm"] == "4"
+    assert p.fields["s_k_median"] == 1.05
+    assert p.fields["s_k_p95"] == 1.42
+    assert p.fields["n_clamped_high_total"] == 17
+    assert p.fields["layer2_sigma_max_ratio"] == 4.0
+    line = p.to_line()
+    assert "n_clamped_high_total=17i" in line
+    assert "s_k_median=1.05" in line
+
+
+def test_make_search_noise_points_empty_payload_drops():
+    assert pusher.make_search_noise_points(
+        {"search_node_id": 2, "gpu_half": 0}, cn_id=2, gpu_half=0,
+    ) == []
+
+
+def test_route_search_noise_key():
+    svc = pusher.InfluxPusherService.__new__(pusher.InfluxPusherService)
+    svc._warned_unknown_keys = set()
+    svc.n_planned_key_hits = 0
+    svc.n_route_errors = 0
+    svc.coarse_dm_owner = {(2, 0): 4}
+    pts = svc._route("/mon/search_rt/2/noise/0", SEARCH_NOISE_N02_G0)
+    assert len(pts) == 1
+    assert pts[0].measurement == "search_rt_noise"
+    assert svc.n_planned_key_hits == 0
+
+
+# ===========================================================================
+# 10d. make_search_dump_health_points (T8 2026-06-07)
+# ===========================================================================
+
+
+SEARCH_DUMP_N02_G0 = {
+    "search_node_id": 2,
+    "gpu_half": 0,
+    "cube_dump_n_dumped": 12,
+    "cube_dump_n_dropped": 1,
+    "cube_dump_n_failed": 0,
+    "cube_dump_queue_depth": 2,
+    "cube_dump_queue_maxsize": 4,
+    "c2_trigger_received": 100,
+    "c2_trigger_hits": 90,
+    "c2_trigger_too_late": 5,
+    "c2_trigger_too_early": 0,
+    "c2_trigger_bad_magic": 0,
+    "c2_trigger_bad_schema": 0,
+    "c2_trigger_dispatch_dropped": 0,
+    "cube_ring_depth": 24,
+    "cube_ring_oldest_specnum": 1000,
+    "cube_ring_newest_end_specnum_excl": 1480,
+    "ts_wall_unix": 1769000000.0,
+    "host": "lxd110h02",
+}
+
+
+def test_make_search_dump_health_points_fields_and_tags():
+    pts = pusher.make_search_dump_health_points(
+        SEARCH_DUMP_N02_G0, cn_id=2, gpu_half=0,
+        coarse_dm_owner={(2, 0): 4},
+    )
+    assert len(pts) == 1
+    p = pts[0]
+    assert p.measurement == "search_rt_dump"
+    assert p.tags["cn_id"] == "2"
+    assert p.tags["host"] == "lxd110h02"
+    assert p.tags["gpu_half"] == "0"
+    assert p.tags["coarse_dm"] == "4"
+    assert p.fields["cube_dump_n_dropped"] == 1
+    assert p.fields["c2_trigger_too_late"] == 5
+    assert p.fields["cube_ring_depth"] == 24
+
+
+def test_make_search_dump_health_points_empty_payload_drops():
+    assert pusher.make_search_dump_health_points(
+        {"search_node_id": 2, "gpu_half": 0}, cn_id=2, gpu_half=0,
+    ) == []
+
+
+def test_route_search_dump_key():
+    svc = pusher.InfluxPusherService.__new__(pusher.InfluxPusherService)
+    svc._warned_unknown_keys = set()
+    svc.n_planned_key_hits = 0
+    svc.n_route_errors = 0
+    svc.coarse_dm_owner = {(2, 0): 4}
+    pts = svc._route("/mon/search_rt/2/dump/0", SEARCH_DUMP_N02_G0)
+    assert len(pts) == 1
+    assert pts[0].measurement == "search_rt_dump"
+    assert svc.n_planned_key_hits == 0
+
+
+# ===========================================================================
 # 11. CLI argument parsing
 # ===========================================================================
 

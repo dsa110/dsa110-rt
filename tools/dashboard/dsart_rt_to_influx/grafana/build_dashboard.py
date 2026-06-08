@@ -513,6 +513,165 @@ def panels() -> List[Dict[str, Any]]:
     ))
     _bump_y(7)
 
+    # ----- T1 (2026-06-07) Layer-2 sigma_k EMA noise health -----
+    out.append(row_panel(
+        "C2. Detector noise health (Layer-2 sigma_k EMA, T1 2026-06-07)"
+    ))
+    _bump_y(1)
+    out.append(graph_panel(
+        title="Layer-2 sigma_k median per search half",
+        raw_query=(
+            'SELECT mean("s_k_median") FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Median Layer-2 EMA sigma_k across the K=128 detector kernels "
+            "per search half. SNR = score / sigma_k, so sustained sigma_k "
+            "spikes (a single bright cube can lift the EMA for ~tau_s "
+            "= 30 s in the unclamped path) suppress detections fleet-wide. "
+            "T1 caps single-cube growth via layer2_sigma_max_ratio (default "
+            "4x); see 'sigma_k clamp_high rate' for clamp activations."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Layer-2 sigma_k clamp_high rate (T1) per search half",
+        raw_query=(
+            'SELECT non_negative_derivative('
+            'mean("n_clamped_high_total"), 1s) '
+            'FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "T1 (2026-06-07) per-kernel-update upper-bound clamps fired "
+            "per second. >0 means a half just received an anomalous "
+            "high-energy cube (RFI, over-fluence probe, glitch); rapidly "
+            "rising = a noisy band. Without T1 these would each have "
+            "inflated sigma_k for ~30 s and triggered the candidate "
+            "counter freeze observed 2026-06-07."
+        ),
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="Layer-2 sigma_k p95 / max per search half",
+        raw_query=(
+            'SELECT mean("s_k_p95") FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half p95",
+        w=12, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "p95 of sigma_k across kernels per half. Compared to the "
+            "median panel: a wide median<->p95 gap means a few kernels "
+            "have inflated EMA divisors (e.g. wide boxcars hit by RFI) "
+            "while most are healthy."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Layer-2 warm-up flag per search half",
+        raw_query=(
+            'SELECT max("layer2_is_warming_up") FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="short", y_min=0, y_max=1.1,
+        legend_right=True,
+        description=(
+            "1 while the Layer-2 EMA is in burn-in (first n_burnin cubes "
+            "after a search-compute restart). All emitted candidates "
+            "carry flags.bit3=noise_warmup during this window. Stuck at "
+            "1 for >> burn-in horizon = a half that's not completing "
+            "burn-in (e.g. validity gate keeps rejecting cubes)."
+        ),
+    ))
+    _bump_y(7)
+
+    # ----- T8 (2026-06-07) Cube-dump + C2 trigger listener health -----
+    out.append(row_panel(
+        "C3. Dump path health (cube_dump + C2 trigger listener, "
+        "T8 2026-06-07)"
+    ))
+    _bump_y(1)
+    out.append(graph_panel(
+        title="C2 trigger 'too_late' rate per search half",
+        raw_query=(
+            'SELECT non_negative_derivative('
+            'mean("c2_trigger_too_late"), 1s) '
+            'FROM "search_rt_dump" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Triggers from C2 that arrived after the corresponding cube "
+            "had rotated out of the retention ring. Sustained > 0 means "
+            "cube_ring_depth is too small for the current dump-trigger "
+            "latency (raise depth or fix the latency source). T4 raises "
+            "the ring depth from 16 to 24 (~3.2 s -> ~4.8 s retention)."
+        ),
+    ))
+    out.append(graph_panel(
+        title="cube_dump n_dropped (queue full) rate per half",
+        raw_query=(
+            'SELECT non_negative_derivative('
+            'mean("cube_dump_n_dropped"), 1s) '
+            'FROM "search_rt_dump" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Per-half cube-dump writer queue-full drops. Means the "
+            "writer thread couldn't keep up with the trigger fan-out "
+            "(slow disk, full /dataz, or the upstream BoundedCubeUploader "
+            "is back-pressuring). 0 is the only acceptable steady-state "
+            "value."
+        ),
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="cube_dump queue depth per half",
+        raw_query=(
+            'SELECT max("cube_dump_queue_depth") FROM "search_rt_dump" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Live cube-dump writer queue depth. Approach the maxsize "
+            "(default 4) for any sustained period -> the writer is the "
+            "bottleneck and queue-full drops will follow."
+        ),
+    ))
+    out.append(graph_panel(
+        title="C2 trigger hits / received ratio per half",
+        raw_query=(
+            'SELECT non_negative_derivative(mean("c2_trigger_hits"), 1s) '
+            'FROM "search_rt_dump" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half hits/s",
+        w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "C2 trigger UDP packets that successfully matched a retained "
+            "cube and dispatched a dump. Compare with the 'too_late' "
+            "panel to see whether C2 is firing triggers but the search "
+            "side is missing them, vs. C2 just isn't firing."
+        ),
+    ))
+    _bump_y(7)
+
     out.append(row_panel("D. Capture pipeline (link rate + pps)"))
     _bump_y(1)
     out.append(graph_panel(

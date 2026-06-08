@@ -111,6 +111,13 @@ KEY_CORR_HEARTBEAT = re.compile(r"^/mon/service/corr_rt/(\d+)$")
 
 KEY_SEARCH_RX = re.compile(r"^/mon/search_rt/(\d+)/rx$")
 KEY_SEARCH_COMPUTE = re.compile(r"^/mon/search_rt/(\d+)/compute/(\d+)$")
+# T1 (2026-06-07): Layer-2 σ_k EMA health rollup, published from
+# ``search_compute_mon.SearchComputeMonPublisher.publish_noise``.
+KEY_SEARCH_NOISE = re.compile(r"^/mon/search_rt/(\d+)/noise/(\d+)$")
+# T8 (2026-06-07): cube-dump + C2 trigger listener health rollup,
+# published from
+# ``search_compute_mon.SearchComputeMonPublisher.publish_dump_health``.
+KEY_SEARCH_DUMP = re.compile(r"^/mon/search_rt/(\d+)/dump/(\d+)$")
 KEY_SEARCH_CANDS = re.compile(r"^/mon/search_rt/(\d+)/cands$")
 KEY_SEARCH_CN = re.compile(r"^/mon/search_rt/(\d+)$")
 KEY_SEARCH_HEARTBEAT = re.compile(r"^/mon/service/search_rt/(\d+)$")
@@ -852,6 +859,137 @@ _SEARCH_COMPUTE_FLOAT_FIELDS = (
 )
 
 
+#: T1 (2026-06-07) — Layer-2 σ_k EMA health rollup. Published every
+#: ``cube_progress`` tick (~2 s) by the search-compute service so the
+#: dashboard can flag a half whose noise estimator is inflated or
+#: being repeatedly clamped from above.
+_SEARCH_NOISE_INT_FIELDS = (
+    "n_clamped_high_total",
+    "n_clamped_high_max_per_kernel",
+    "layer2_cube_count",
+    "layer2_is_warming_up",
+)
+_SEARCH_NOISE_FLOAT_FIELDS = (
+    "s_k_median",
+    "s_k_p95",
+    "s_k_max",
+    "s_k_min",
+    "layer2_sigma_max_ratio",
+)
+
+
+#: T8 (2026-06-07) — cube-dump writer + C2 trigger listener health
+#: rollup. Published every ``cube_progress`` tick.
+_SEARCH_DUMP_INT_FIELDS = (
+    "cube_dump_n_dumped",
+    "cube_dump_n_dropped",
+    "cube_dump_n_failed",
+    "cube_dump_queue_depth",
+    "cube_dump_queue_maxsize",
+    "c2_trigger_received",
+    "c2_trigger_hits",
+    "c2_trigger_too_late",
+    "c2_trigger_too_early",
+    "c2_trigger_bad_magic",
+    "c2_trigger_bad_schema",
+    "c2_trigger_dispatch_dropped",
+    "cube_ring_depth",
+    "cube_ring_oldest_specnum",
+    "cube_ring_newest_end_specnum_excl",
+)
+
+
+def make_search_noise_points(
+    payload: Dict[str, Any], *, cn_id: int, gpu_half: int,
+    coarse_dm_owner: Optional[Dict[Tuple[int, int], int]] = None,
+) -> List[Point]:
+    """Project ``/mon/search_rt/<cn>/noise/<g>`` into one
+    ``search_rt_noise`` Point per search half (T1).
+
+    The Layer-2 σ_k EMA divisor health (median, p95, max, min,
+    n_clamped_high) is the upstream signal for the post-2026-06-07
+    "candidate counter freeze" failure mode. Per-half tagging keeps
+    the cardinality identical to ``search_rt_compute``."""
+    host = str(payload.get("host") or _host_for_cn(cn_id))
+    ts_unix = payload.get("ts_wall_unix")
+    ts_ns = (
+        int(float(ts_unix) * 1e9)
+        if isinstance(ts_unix, (int, float)) and not isinstance(ts_unix, bool)
+        else int(time.time() * 1e9)
+    )
+    tags: Dict[str, str] = {
+        "cn_id": str(int(cn_id)),
+        "host": host,
+        "gpu_half": str(int(gpu_half)),
+    }
+    if coarse_dm_owner is not None:
+        cd = coarse_dm_owner.get((int(cn_id), int(gpu_half)))
+        if cd is not None:
+            tags["coarse_dm"] = str(int(cd))
+
+    fields: Dict[str, Any] = {}
+    for k in _SEARCH_NOISE_INT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, bool):
+            fields[k] = int(v)
+        elif isinstance(v, (int, float)):
+            fields[k] = int(v)
+    for k in _SEARCH_NOISE_FLOAT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[k] = float(v)
+    if not fields:
+        return []
+    return [Point(
+        measurement="search_rt_noise",
+        tags=tags, fields=fields, timestamp_ns=ts_ns,
+    )]
+
+
+def make_search_dump_health_points(
+    payload: Dict[str, Any], *, cn_id: int, gpu_half: int,
+    coarse_dm_owner: Optional[Dict[Tuple[int, int], int]] = None,
+) -> List[Point]:
+    """Project ``/mon/search_rt/<cn>/dump/<g>`` into one
+    ``search_rt_dump`` Point per search half (T8).
+
+    Surfaces the cube-dump writer + C2 trigger listener silent-failure
+    counters (writer queue full → ``cube_dump_n_dropped``, ring
+    rotated past trigger → ``c2_trigger_too_late``) so the dashboard
+    can call out a saturated dump path before operators notice
+    missing plots."""
+    host = str(payload.get("host") or _host_for_cn(cn_id))
+    ts_unix = payload.get("ts_wall_unix")
+    ts_ns = (
+        int(float(ts_unix) * 1e9)
+        if isinstance(ts_unix, (int, float)) and not isinstance(ts_unix, bool)
+        else int(time.time() * 1e9)
+    )
+    tags: Dict[str, str] = {
+        "cn_id": str(int(cn_id)),
+        "host": host,
+        "gpu_half": str(int(gpu_half)),
+    }
+    if coarse_dm_owner is not None:
+        cd = coarse_dm_owner.get((int(cn_id), int(gpu_half)))
+        if cd is not None:
+            tags["coarse_dm"] = str(int(cd))
+
+    fields: Dict[str, Any] = {}
+    for k in _SEARCH_DUMP_INT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, bool):
+            fields[k] = int(v)
+        elif isinstance(v, (int, float)):
+            fields[k] = int(v)
+    if not fields:
+        return []
+    return [Point(
+        measurement="search_rt_dump",
+        tags=tags, fields=fields, timestamp_ns=ts_ns,
+    )]
+
+
 def make_search_compute_points(
     payload: Dict[str, Any], *, cn_id: int, gpu_half: int,
     coarse_dm_owner: Optional[Dict[Tuple[int, int], int]] = None,
@@ -1265,6 +1403,22 @@ class InfluxPusherService:
             m = KEY_SEARCH_COMPUTE.match(key)
             if m:
                 return make_search_compute_points(
+                    payload, cn_id=int(m.group(1)), gpu_half=int(m.group(2)),
+                    coarse_dm_owner=self.coarse_dm_owner,
+                )
+
+            # T1 (2026-06-07) Layer-2 σ_k EMA noise health.
+            m = KEY_SEARCH_NOISE.match(key)
+            if m:
+                return make_search_noise_points(
+                    payload, cn_id=int(m.group(1)), gpu_half=int(m.group(2)),
+                    coarse_dm_owner=self.coarse_dm_owner,
+                )
+
+            # T8 (2026-06-07) cube-dump + C2 trigger listener health.
+            m = KEY_SEARCH_DUMP.match(key)
+            if m:
+                return make_search_dump_health_points(
                     payload, cn_id=int(m.group(1)), gpu_half=int(m.group(2)),
                     coarse_dm_owner=self.coarse_dm_owner,
                 )
