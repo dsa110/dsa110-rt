@@ -218,6 +218,69 @@ def test_layer2_state_reset_clears_state() -> None:
     assert torch.allclose(s.s_k, torch.ones(2))
 
 
+def test_layer2_state_sigma_max_ratio_clamps_high_outliers() -> None:
+    """T1 (2026-06-07): an anomalous high-σ cube must NOT lift σ_k by
+    more than ``sigma_max_ratio`` — the offending kernel's update is
+    rejected and ``n_clamped_high`` is bumped, so the post-anomaly
+    relaxation window collapses from ~τ_s to a single sample."""
+    s = Layer2State(n_kernels=3, n_burnin=2, sigma_max_ratio=4.0)
+    # Burn in at σ=1 so s_k = 1.
+    for _ in range(2):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0, 1.0, 1.0]))
+    assert not s.is_warming_up
+    assert s.n_clamped_high == 0
+    # Anomaly: kernel 1 gets σ=10 (10× s_k_prev — exceeds 4× ceiling).
+    # Kernel 0 gets σ=2 (within 4× — should be blended). Kernel 2 gets
+    # σ=4 (exactly at the ceiling — not strictly greater, blended).
+    pre = s.s_k.clone()
+    s_k, _ = s.update_and_query(
+        per_kernel_sigma=torch.tensor([2.0, 10.0, 4.0]),
+    )
+    # Kernel 0: blended.
+    expected_0 = pre[0] + s.gamma * (2.0 - pre[0])
+    assert abs(float(s_k[0]) - float(expected_0)) < 1e-5
+    # Kernel 1: clamped — s_k stays at the prior value.
+    assert float(s_k[1]) == float(pre[1])
+    # Kernel 2: at ceiling, NOT strictly greater → blended through.
+    expected_2 = pre[2] + s.gamma * (4.0 - pre[2])
+    assert abs(float(s_k[2]) - float(expected_2)) < 1e-5
+    assert s.n_clamped_high == 1
+    per_k = s.per_kernel_clamped_high
+    assert int(per_k[0]) == 0
+    assert int(per_k[1]) == 1
+    assert int(per_k[2]) == 0
+
+
+def test_layer2_state_sigma_max_ratio_disabled_by_default() -> None:
+    """Default ``sigma_max_ratio=0.0`` preserves bit-for-bit legacy
+    behaviour (no clamping, no counter increments)."""
+    s = Layer2State(n_kernels=1, n_burnin=2)
+    for _ in range(2):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0]))
+    pre = s.s_k.clone()
+    s_k, _ = s.update_and_query(per_kernel_sigma=torch.tensor([100.0]))
+    expected = pre + s.gamma * (100.0 - pre)
+    assert abs(float(s_k[0]) - float(expected)) < 1e-4
+    assert s.n_clamped_high == 0
+
+
+def test_layer2_state_reset_clears_clamp_counters() -> None:
+    """``reset()`` must clear the new T1 counters too."""
+    s = Layer2State(n_kernels=2, n_burnin=2, sigma_max_ratio=2.0)
+    for _ in range(2):
+        s.update_and_query(per_kernel_sigma=torch.tensor([1.0, 1.0]))
+    s.update_and_query(per_kernel_sigma=torch.tensor([10.0, 10.0]))
+    assert s.n_clamped_high == 2
+    s.reset()
+    assert s.n_clamped_high == 0
+    assert int(s.per_kernel_clamped_high.sum()) == 0
+
+
+def test_layer2_state_sigma_max_ratio_validates_input() -> None:
+    with pytest.raises(ValueError, match="sigma_max_ratio"):
+        Layer2State(n_kernels=1, sigma_max_ratio=-1.0)
+
+
 def test_layer2_state_rejects_bad_inputs() -> None:
     s = Layer2State(n_kernels=2, n_burnin=5)
     with pytest.raises(ValueError, match="exactly one"):

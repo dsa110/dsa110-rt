@@ -3873,12 +3873,26 @@ def run(
                     n_in, n_processed, n_drop, n_tx_total, per_block_ms[-1],
                 )
                 if mon_publisher is not None:
+                    # T2 (2026-06-07): include the inject-watch state in
+                    # every heartbeat so the dashboard can verify all
+                    # 16 corr nodes received an injection. Without this,
+                    # a partial fan-out is indistinguishable from a
+                    # search-side detector pathology and the operator
+                    # has to ssh+grep each corr_fast process manually
+                    # (the failure mode 2026-06-07 hit at 22:00 UTC).
+                    iw_state: dict | None = None
+                    if inject_watch is not None:
+                        try:
+                            iw_state = dict(inject_watch.state())
+                        except Exception:                   # noqa: BLE001
+                            iw_state = None
                     mon_publisher.publish(
                         block_n=n_in,
                         n_processed=n_processed,
                         n_drop=n_drop,
                         n_tx=n_tx_total,
                         last_block_ms=per_block_ms[-1],
+                        extra=iw_state,
                     )
 
             if max_blocks is not None and n_in >= max_blocks:

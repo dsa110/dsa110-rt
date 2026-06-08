@@ -256,6 +256,51 @@ class TestRuntimeInjectWatchDispatch:
         assert w.n_queued == 1
 
 
+class TestRuntimeInjectWatchState:
+    """T2 (2026-06-07): the ``state()`` snapshot reports both
+    counters AND the most recently queued probe's identifying
+    metadata. The corr_fast mon publisher ships this dict to etcd
+    so the dashboard can verify all 16 corr nodes received an
+    injection without ssh-ing into each one."""
+
+    def test_state_initial(self, real_injector):
+        w = RuntimeInjectWatch(injector=real_injector, chgroup=0, store=FakeStore())
+        snap = w.state()
+        assert snap["inject_n_events"] == 0
+        assert snap["inject_n_queued"] == 0
+        assert snap["inject_last_inj_id"] is None
+        assert snap["inject_last_apply_at_specnum"] is None
+        assert snap["inject_last_event_unix"] is None
+        assert snap["inject_last_queued_unix"] is None
+
+    def test_state_after_queue_records_inj_id_and_apply_at(self, real_injector):
+        store = FakeStore()
+        w = RuntimeInjectWatch(injector=real_injector, chgroup=0, store=store)
+        w.start()
+        store.fire(w._watch_id, json.loads(_VALID_CFG_JSON_WIRE))
+        snap = w.state()
+        assert snap["inject_n_events"] == 1
+        assert snap["inject_n_queued"] == 1
+        assert snap["inject_last_inj_id"] == "phase6_runtime_t1"
+        assert snap["inject_last_apply_at_specnum"] == 1_000_000
+        assert isinstance(snap["inject_last_event_unix"], float)
+        assert isinstance(snap["inject_last_queued_unix"], float)
+
+    def test_state_event_counter_advances_for_dropped_payloads(self, real_injector):
+        """A non-inject payload still bumps ``inject_n_events`` (the
+        operator can tell the watcher is alive) but leaves
+        ``inject_n_queued`` and ``inject_last_inj_id`` unchanged."""
+        store = FakeStore()
+        w = RuntimeInjectWatch(injector=real_injector, chgroup=0, store=store)
+        w.start()
+        store.fire(w._watch_id, {"cmd": "shutdown"})
+        snap = w.state()
+        assert snap["inject_n_events"] == 1
+        assert snap["inject_n_queued"] == 0
+        assert snap["inject_last_inj_id"] is None
+        assert snap["inject_last_apply_at_specnum"] is None
+
+
 # The wire payload the watcher actually sees: same shape the dashboard
 # writes (`{cmd: "inject", val: <InjectionConfig dict>}`).
 _VALID_CFG_JSON_WIRE = json.dumps({

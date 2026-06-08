@@ -776,6 +776,407 @@ def _build_probe_inj_id(
     )
 
 
+# ---------------------------------------------------------------------------
+# Health pre-flight + SNR ladder (T6 + T7 — 2026-06-07)
+# ---------------------------------------------------------------------------
+
+
+#: How recent the corr_fast service-state mon-key must be for the
+#: precheck to consider that chgroup "alive". Default 30 s comfortably
+#: outlasts the 16-block heartbeat at any sane block cadence.
+DEFAULT_CORR_FAST_MAX_AGE_S: float = 30.0
+
+
+#: How recent the search-compute mon-key must be for the precheck to
+#: consider a search half "alive". The publisher fires every
+#: ``cube_progress`` tick (≈ 2 s in production), so 30 s is generous.
+DEFAULT_SEARCH_MAX_AGE_S: float = 30.0
+
+
+#: Default SNR-ladder fluence multipliers for
+#: :func:`fire_calibration_probe_with_ladder`. The first attempt is at
+#: the requested ``fluence_jy_ms``; ``no_match`` falls back to ``×2``,
+#: then ``×4``. Bright probes punch through any latent C1 metering or
+#: noise-color de-rate without the operator having to hand-titrate
+#: fluence.
+DEFAULT_FLUENCE_LADDER: Tuple[float, ...] = (1.0, 2.0, 4.0)
+
+
+@dataclass(frozen=True)
+class HealthSnapshot:
+    """Pre-flight snapshot returned by :func:`precheck_calibration_health`."""
+    ok: bool
+    reason: str
+    inject_baselines: Dict[int, int]
+    corr_fast_seen_chgroups: Tuple[int, ...]
+    stale_chgroups: Tuple[int, ...]
+    sick_search_halves: Tuple[Tuple[int, int], ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _read_corr_fast_state(store: Any, chgroup: int) -> Optional[Mapping[str, Any]]:
+    """Best-effort read of ``/mon/corr_rt/<chgroup>/corr_fast``.
+
+    Returns ``None`` on any error / missing key (the caller treats that
+    as "stale / unknown", which is itself a precheck failure).
+    """
+    key = f"/mon/corr_rt/{int(chgroup)}/corr_fast"
+    try:
+        raw = store.get_dict(key)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("precheck: get_dict(%s) failed: %s", key, exc)
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    return raw
+
+
+def _read_search_compute_state(
+    store: Any, search_node_id: int, gpu_half: int,
+) -> Optional[Mapping[str, Any]]:
+    """Best-effort read of ``/mon/search_rt/<sid>/compute/<g>``."""
+    key = f"/mon/search_rt/{int(search_node_id)}/compute/{int(gpu_half)}"
+    try:
+        raw = store.get_dict(key)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("precheck: get_dict(%s) failed: %s", key, exc)
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    return raw
+
+
+def precheck_calibration_health(
+    store: Any,
+    *,
+    chgroups: Optional[Iterable[int]] = None,
+    search_halves: Iterable[Tuple[int, int]] = (
+        (1, 0), (1, 1), (2, 0), (2, 1),
+        (9, 0), (9, 1), (13, 0), (13, 1),
+    ),
+    corr_fast_max_age_s: float = DEFAULT_CORR_FAST_MAX_AGE_S,
+    search_max_age_s: float = DEFAULT_SEARCH_MAX_AGE_S,
+    require_metering_inactive: bool = True,
+    time_fn: Any = time.time,
+) -> HealthSnapshot:
+    """Pre-flight health check before firing a calibration probe.
+
+    Verifies, before any injection is queued, that:
+
+    * Every chgroup in ``chgroups`` has a recent
+      ``/mon/corr_rt/<chgroup>/corr_fast`` heartbeat (default <
+      30 s old). Stale chgroups are listed in ``stale_chgroups`` and
+      surfaced via the ``reason`` string.
+    * Every search half in ``search_halves`` has a recent
+      ``/mon/search_rt/<sid>/compute/<g>`` heartbeat. When
+      ``require_metering_inactive=True``, also asserts
+      ``c1_metering_active=0`` — running calibration into a metered
+      half is the failure mode the new T3 bypass guards against, but
+      pre-flight is still cheaper than a 30 s ``no_match`` poll.
+
+    Returns a :class:`HealthSnapshot` whose ``inject_baselines`` field
+    is a per-chgroup snapshot of the current ``inject_n_queued``
+    counter. The caller uses these baselines to detect partial
+    fan-out *after* firing (a genuine miss leaves
+    ``inject_n_queued`` unchanged on the affected chgroup).
+    """
+    chgroups_tuple = tuple(
+        int(c) for c in (chgroups if chgroups is not None else range(16))
+    )
+    now = float(time_fn())
+    seen: List[int] = []
+    stale: List[int] = []
+    inject_baselines: Dict[int, int] = {}
+    for cg in chgroups_tuple:
+        state = _read_corr_fast_state(store, cg)
+        if state is None:
+            stale.append(cg)
+            continue
+        ts_wall = state.get("ts_wall_unix")
+        if isinstance(ts_wall, (int, float)) and (
+            now - float(ts_wall) <= corr_fast_max_age_s
+        ):
+            seen.append(cg)
+            try:
+                baseline = int(state.get("inject_n_queued") or 0)
+            except (TypeError, ValueError):
+                baseline = 0
+            inject_baselines[cg] = baseline
+        else:
+            stale.append(cg)
+    sick: List[Tuple[int, int]] = []
+    for sid, g in search_halves:
+        state = _read_search_compute_state(store, sid, g)
+        if state is None:
+            sick.append((int(sid), int(g)))
+            continue
+        ts_wall = state.get("ts_wall_unix")
+        if not (
+            isinstance(ts_wall, (int, float))
+            and (now - float(ts_wall) <= search_max_age_s)
+        ):
+            sick.append((int(sid), int(g)))
+            continue
+        if require_metering_inactive:
+            metering_active = int(state.get("c1_metering_active") or 0)
+            if metering_active:
+                sick.append((int(sid), int(g)))
+
+    if stale:
+        return HealthSnapshot(
+            ok=False,
+            reason=(
+                "corr_fast_stale: chgroups="
+                + ",".join(str(c) for c in stale)
+            ),
+            inject_baselines=inject_baselines,
+            corr_fast_seen_chgroups=tuple(seen),
+            stale_chgroups=tuple(stale),
+            sick_search_halves=tuple(sick),
+        )
+    if sick:
+        return HealthSnapshot(
+            ok=False,
+            reason=(
+                "search_unhealthy: halves="
+                + ",".join(f"s{s}g{g}" for s, g in sick)
+            ),
+            inject_baselines=inject_baselines,
+            corr_fast_seen_chgroups=tuple(seen),
+            stale_chgroups=tuple(stale),
+            sick_search_halves=tuple(sick),
+        )
+    return HealthSnapshot(
+        ok=True,
+        reason="ok",
+        inject_baselines=inject_baselines,
+        corr_fast_seen_chgroups=tuple(seen),
+        stale_chgroups=tuple(stale),
+        sick_search_halves=tuple(sick),
+    )
+
+
+def precheck_inject_fan_out(
+    store: Any,
+    *,
+    baselines: Mapping[int, int],
+    poll_timeout_s: float = 5.0,
+    poll_interval_s: float = 0.5,
+    time_fn: Any = time.time,
+    sleep_fn: Any = time.sleep,
+) -> Tuple[bool, Tuple[int, ...]]:
+    """Verify each chgroup's ``inject_n_queued`` advanced past its
+    baseline within ``poll_timeout_s``.
+
+    Returns ``(ok, lagging_chgroups)``. ``ok=True`` iff every chgroup
+    in ``baselines`` saw at least one new queued event. ``ok=False``
+    surfaces the chgroups whose counter did NOT advance — the caller
+    converts that into a ``partial_fan_out`` reason string instead of
+    waiting the full match-poll timeout.
+    """
+    if not baselines:
+        return True, tuple()
+    deadline = float(time_fn()) + float(poll_timeout_s)
+    pending = dict(baselines)
+    while True:
+        next_pending: Dict[int, int] = {}
+        for cg, baseline in pending.items():
+            state = _read_corr_fast_state(store, cg)
+            if state is None:
+                next_pending[cg] = baseline
+                continue
+            try:
+                cur = int(state.get("inject_n_queued") or 0)
+            except (TypeError, ValueError):
+                cur = 0
+            if cur > int(baseline):
+                continue  # advanced — drop from pending
+            next_pending[cg] = baseline
+        if not next_pending:
+            return True, tuple()
+        if float(time_fn()) >= deadline:
+            return False, tuple(sorted(next_pending.keys()))
+        sleep_fn(float(poll_interval_s))
+        pending = next_pending
+
+
+def fire_calibration_probe_with_ladder(
+    store: Any,
+    *,
+    inject_fn: Any,
+    dm_pc_cm3: float,
+    l_rad: float = 0.0,
+    m_rad: float = 0.0,
+    width_samples: int = DEFAULT_CALIBRATION_WIDTH,
+    fluence_jy_ms: float = DEFAULT_CALIBRATION_FLUENCE,
+    profile: str = DEFAULT_CALIBRATION_PROFILE,
+    margin_blocks: Optional[int] = None,
+    chgroups: Optional[Iterable[int]] = None,
+    inj_id_prefix: str = "cal_probe",
+    user: Optional[str] = None,
+    poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S,
+    poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
+    ttl_s: float = DEFAULT_INJECT_TTL_S,
+    cal_store: Optional[CalibrationStore] = None,
+    health_check: bool = True,
+    fluence_ladder: Iterable[float] = DEFAULT_FLUENCE_LADDER,
+    fan_out_check_timeout_s: float = 5.0,
+    time_fn: Any = time.time,
+    sleep_fn: Any = time.sleep,
+) -> "List[ProbeResult]":
+    """Health-gated, SNR-laddered calibration probe (T6 + T7).
+
+    Workflow:
+
+      1. **T6 pre-flight**: when ``health_check`` is True (default),
+         call :func:`precheck_calibration_health` to verify every corr
+         node and search half is alive and not in active C1 metering.
+         If the precheck fails, return a single :class:`ProbeResult`
+         with ``ok=False`` and ``reason="health_check_failed:<details>"``
+         BEFORE firing any injection.
+
+      2. **First attempt**: fire :func:`fire_calibration_probe` at the
+         operator's requested ``fluence_jy_ms``.
+
+      3. **Post-fire fan-out check**: between the inject and the match
+         poll, call :func:`precheck_inject_fan_out` against the
+         baselines captured in step 1. If any chgroup did not see its
+         ``inject_n_queued`` advance, return ``ok=False`` with
+         ``reason="partial_fan_out:cn=[..]"`` instead of waiting the
+         full ``poll_timeout_s`` for a ``no_match`` that would have
+         been ambiguous.
+
+      4. **T7 SNR ladder**: on a ``no_match`` (the only retriable
+         class — partial_fan_out, inject_failed, etc. abort), retry
+         the probe at successive ``fluence_ladder`` multipliers
+         (default ×1, ×2, ×4). The first ``ok=True`` wins; the result
+         list contains every attempt for forensic auditing.
+
+    Returns a list of :class:`ProbeResult` (one per attempt). The
+    final entry is the operator-facing result. The list is intended
+    for the audit trail / dashboard "calibration log" pane so the
+    operator can see e.g. "first probe was metered, second succeeded
+    at 2× fluence".
+    """
+    ladder = tuple(float(m) for m in fluence_ladder)
+    if not ladder:
+        ladder = (1.0,)
+
+    snapshot: Optional[HealthSnapshot] = None
+    if health_check:
+        snapshot = precheck_calibration_health(
+            store, chgroups=chgroups, time_fn=time_fn,
+        )
+        if not snapshot.ok:
+            return [
+                ProbeResult(
+                    ok=False,
+                    inj_id="",
+                    bucket=bucket_key(dm_pc_cm3),
+                    K=None,
+                    observed_snr=None,
+                    observed_event_specnum=None,
+                    matched_at_unix=None,
+                    n_matches=0,
+                    elapsed_s=0.0,
+                    reason=f"health_check_failed: {snapshot.reason}",
+                )
+            ]
+    baselines: Dict[int, int] = (
+        dict(snapshot.inject_baselines) if snapshot is not None else {}
+    )
+
+    results: List[ProbeResult] = []
+    for step_idx, mult in enumerate(ladder):
+        attempt_fluence = float(fluence_jy_ms) * float(mult)
+        result = fire_calibration_probe(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=dm_pc_cm3,
+            l_rad=l_rad,
+            m_rad=m_rad,
+            width_samples=width_samples,
+            fluence_jy_ms=attempt_fluence,
+            profile=profile,
+            margin_blocks=margin_blocks,
+            chgroups=chgroups,
+            inj_id_prefix=inj_id_prefix,
+            user=user,
+            poll_timeout_s=poll_timeout_s,
+            poll_interval_s=poll_interval_s,
+            ttl_s=ttl_s,
+            cal_store=cal_store,
+            time_fn=time_fn,
+            sleep_fn=sleep_fn,
+        )
+
+        # Post-fire fan-out check: do this once per attempt before we
+        # accept ``no_match`` as a real failure. Skip when the inject
+        # itself failed (no fan-out to verify).
+        if (
+            health_check
+            and baselines
+            and not result.ok
+            and result.reason.startswith("inject_failed") is False
+        ):
+            ok_fan, lagging = precheck_inject_fan_out(
+                store,
+                baselines=baselines,
+                poll_timeout_s=fan_out_check_timeout_s,
+                poll_interval_s=poll_interval_s,
+                time_fn=time_fn,
+                sleep_fn=sleep_fn,
+            )
+            if not ok_fan:
+                # Replace the no_match reason with the more informative
+                # partial_fan_out reason; keep all other fields intact
+                # so the dashboard sees the actual inj_id we tried.
+                result = ProbeResult(
+                    ok=False,
+                    inj_id=result.inj_id,
+                    bucket=result.bucket,
+                    K=None,
+                    observed_snr=None,
+                    observed_event_specnum=None,
+                    matched_at_unix=None,
+                    n_matches=0,
+                    elapsed_s=result.elapsed_s,
+                    reason=(
+                        "partial_fan_out: cn=["
+                        + ",".join(str(c) for c in lagging)
+                        + "]"
+                    ),
+                    inject_response=result.inject_response,
+                    active_key=result.active_key,
+                )
+                results.append(result)
+                # Partial fan-out is a hard fail — escalating fluence
+                # won't help if some corr nodes never queued the probe.
+                return results
+            # Fan-out is fine; refresh baselines so the next ladder
+            # attempt's fan-out check measures advances against THIS
+            # attempt's queued state, not the very first.
+            for cg, baseline in baselines.items():
+                state = _read_corr_fast_state(store, cg)
+                if isinstance(state, Mapping):
+                    try:
+                        baselines[cg] = int(
+                            state.get("inject_n_queued") or baseline
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+        results.append(result)
+        if result.ok:
+            return results
+        # Only retry on no_match; everything else is a hard fail.
+        if not result.reason.startswith("no_match"):
+            return results
+    return results
+
+
 def _extract_apply_at(inject_response: Mapping[str, Any]) -> Optional[int]:
     """Pull the corr-side apply_at_specnum out of a
     ``control_inject_pulse`` response (or ``None`` if absent).
@@ -933,9 +1334,13 @@ __all__ = [
     "DEFAULT_INJECT_TTL_S",
     "DEFAULT_POLL_INTERVAL_S",
     "DEFAULT_POLL_TIMEOUT_S",
+    "DEFAULT_CORR_FAST_MAX_AGE_S",
+    "DEFAULT_SEARCH_MAX_AGE_S",
+    "DEFAULT_FLUENCE_LADDER",
     "LEGACY_BUCKET_INFIX",
     "CalibrationEntry",
     "CalibrationStore",
+    "HealthSnapshot",
     "ProbeResult",
     "bucket_key",
     "calibration_key",
@@ -946,5 +1351,8 @@ __all__ = [
     "get_match_event",
     "snr_to_fluence",
     "fire_calibration_probe",
+    "fire_calibration_probe_with_ladder",
+    "precheck_calibration_health",
+    "precheck_inject_fan_out",
     "delete_snr_calibrations",
 ]

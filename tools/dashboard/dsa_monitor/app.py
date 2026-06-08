@@ -827,8 +827,52 @@ def control_inject_calibrate_post():
     # (with its audit row + active-registry side effect) is shared
     # between the calibration probe and the operator's manual inject.
     kwargs["inject_fn"] = control_inject_pulse
+
+    # T6/T7 (2026-06-07): per-form opt-in for the health-gated, SNR-
+    # laddered calibration helper. Default ON so the operator-visible
+    # behaviour is "calibrate just works" without a 30 s no_match
+    # poll on a stale fleet. Pass ``health_check=0`` in the form to
+    # fall back to the legacy single-shot probe for forensic / replay
+    # use cases.
+    health_check = (f.get("health_check") or "1").strip()
+    use_ladder = (f.get("use_ladder") or "1").strip()
+    raw_ladder = (f.get("fluence_ladder") or "").strip()
+    if raw_ladder:
+        try:
+            ladder_steps = tuple(
+                float(s) for s in raw_ladder.split(",") if s.strip()
+            )
+        except ValueError:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"fluence_ladder={raw_ladder!r}: must be comma-"
+                    "separated floats"
+                ),
+            }), 400
+    else:
+        ladder_steps = ic.DEFAULT_FLUENCE_LADDER
+
     try:
-        result = ic.fire_calibration_probe(control_store, **kwargs)
+        if use_ladder not in ("0", "false", "False", "no", "off"):
+            ladder_kwargs = dict(kwargs)
+            ladder_kwargs["health_check"] = (
+                health_check not in ("0", "false", "False", "no", "off")
+            )
+            ladder_kwargs["fluence_ladder"] = ladder_steps
+            attempts = ic.fire_calibration_probe_with_ladder(
+                control_store, **ladder_kwargs,
+            )
+            result = attempts[-1] if attempts else None
+            if result is None:
+                return jsonify({
+                    "ok": False, "error": "no_attempts_made",
+                }), 500
+            payload = result.to_dict()
+            payload["attempts"] = [a.to_dict() for a in attempts]
+        else:
+            result = ic.fire_calibration_probe(control_store, **kwargs)
+            payload = result.to_dict()
     except Exception as exc:  # noqa: BLE001
         LOG.exception("fire_calibration_probe failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -846,12 +890,13 @@ def control_inject_calibrate_post():
             "K": result.K,
             "bucket": result.bucket,
             "reason": result.reason,
+            "n_attempts": len(payload.get("attempts", [])) or 1,
         },
         ok=bool(result.ok),
         note=f"elapsed={result.elapsed_s:.1f}s inj_id={result.inj_id}",
         user=user,
     )
-    return jsonify(result.to_dict())
+    return jsonify(payload)
 
 
 @app.route("/control/inject_calibrations", methods=["GET"])

@@ -94,6 +94,7 @@ from ..noise_norm.layer1 import Layer1State
 from .c1_emit import C1EmitConfig, C1TcpEmitter, candidate_to_c1_row
 from .search_ring_mon import SearchRingMonPublisher
 from .search_compute_mon import SearchComputeMonPublisher
+from ..inject.cal_probe_shadow import CalProbeShadow
 from .cube_pipeline import (
     CubePipeline,
     CubePipelineConfig,
@@ -118,6 +119,8 @@ _METER_WINDOW_BLOCKS = 16
 def meter_candidates(
     candidates: List[Candidate],
     cap: Optional[int],
+    *,
+    always_keep_predicate: Optional[Any] = None,
 ) -> "tuple[List[Candidate], int]":
     """C1→C2 metering selection: keep at most ``cap`` candidates, ordered
     narrow-first (``width_samples`` ascending) then bright-first (``snr``
@@ -130,10 +133,40 @@ def meter_candidates(
     hot loop never pays an O(k log k) full sort. Selection is a no-op on
     the candidates' identity/order when not over the cap, so cube dump +
     retention (which run off the full candidate list upstream) are
-    unaffected — this only bounds what is shipped to C2."""
+    unaffected — this only bounds what is shipped to C2.
+
+    T3 (2026-06-07) — ``always_keep_predicate``: optional callable
+    ``(Candidate) -> bool``. Candidates for which the predicate returns
+    True are split off and kept UNCONDITIONALLY (never counted against
+    the cap, never dropped). The cap is applied only to the rest. The
+    predicate runs in O(k) per cube on the hot path; the production
+    wiring (search-compute) passes a closure backed by the lazily-
+    refreshed :class:`dsart.inject.cal_probe_shadow.CalProbeShadow` so
+    operator-fired calibration probes always reach C2 regardless of
+    contemporaneous flood load. Pre-2026-06-07 the cap was content-blind
+    and a probe landing during a noisy window could be silently shed,
+    making ``fire_calibration_probe`` return ``no_match`` even when the
+    detector picked the probe up correctly."""
     if cap is None or cap <= 0:
         return candidates, 0
     n = len(candidates)
+    if always_keep_predicate is not None:
+        always_keep: List[Candidate] = []
+        rest: List[Candidate] = []
+        for c in candidates:
+            try:
+                hit = bool(always_keep_predicate(c))
+            except Exception:                                  # noqa: BLE001
+                hit = False
+            (always_keep if hit else rest).append(c)
+        if len(rest) <= int(cap):
+            return always_keep + rest, 0
+        kept_rest = heapq.nsmallest(
+            int(cap),
+            rest,
+            key=lambda c: (int(c.width_samples), -float(c.snr)),
+        )
+        return always_keep + kept_rest, len(rest) - len(kept_rest)
     if n <= cap:
         return candidates, 0
     kept = heapq.nsmallest(
@@ -419,6 +452,13 @@ class SearchComputeConfig:
     detector_layer2_n_burnin: Optional[int] = None
     detector_layer2_sigma_floor: float = 0.0
     detector_layer2_valid_min_fraction: float = 1.0
+    # 2026-06-07 (T1): per-kernel upper-bound clamp on the σ_k EMA
+    # update. ``0.0`` (default) preserves legacy unbounded EMA. Set to
+    # e.g. ``4.0`` so a single cube can never raise σ_k by more than
+    # 4× — bounding the post-anomaly recovery window from ~τ_s≈30 s
+    # back to one cube. Surfaced as ``n_clamped_high`` in the
+    # cube_progress log + the noise mon-key.
+    detector_layer2_sigma_max_ratio: float = 0.0
     pipeline_overlap: bool = False
     search_node_id: int = 1
     gpu_half: int = 1
@@ -494,6 +534,15 @@ class SearchComputeConfig:
     cube_upload_dest_host: Optional[str] = None
     cube_upload_dest_root: Optional[str] = None
     cube_upload_bandwidth_limit_kbps: int = 0
+    # T5 (2026-06-07) per-process upload concurrency cap. Each search
+    # half spawns one rsync per cube_dump completion; without a cap,
+    # 4 nodes × 2 halves × C2's 6-events/60-s dump-rate window can
+    # put 48 concurrent rsyncs on the corr-net, which starves SNAP
+    # ingress and feeds back into σ_k inflation. The bounded uploader
+    # holds this many simultaneous rsyncs per half (default 1) and
+    # queues the rest up to ``cube_upload_queue_maxsize``.
+    cube_upload_max_concurrent: int = 1
+    cube_upload_queue_maxsize: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +621,11 @@ class SearchComputeService:
         self._clusterer: Optional[ClustererService] = None
         self._predicate: Optional[BrightPulsePredicate] = None
         self._cube_dump: Optional[CubeDumpWriter] = None
+        # T5: bounded uploader (cube_dump's on_dump_complete hook routes
+        # through this when ``cube_upload_dest_host`` + dest_root are
+        # set in config). Owned by the service so ``_stop_subsystems``
+        # can drain it cleanly at shutdown.
+        self._cube_uploader: Optional["BoundedCubeUploader"] = None  # noqa: F821
         self._udp_listener: Optional[UdpTriggerListener] = None
         self._cands_logger: Optional[CandsLogger] = None
         # M7.4 C1 stage.
@@ -610,6 +664,17 @@ class SearchComputeService:
                 gpu_half=int(config.gpu_half),
             )
         )
+        # T3 (2026-06-07): per-process shadow of the dashboard's
+        # ``/cnf/inject/active/cal_probe_*`` registry. The C1 emit path
+        # consults this on every cube to exempt operator-fired
+        # calibration probes from the C1→C2 metering cap. Polled, not
+        # watched, on the existing cube_progress cadence — so no new
+        # background thread is added to the search hot loop. When etcd
+        # is unreachable the shadow stays empty (probes are NOT
+        # exempted) and the metering cap behaves exactly as before;
+        # the calibration helper's pre-flight checks will catch the
+        # broken path before the operator fires anything.
+        self._cal_probe_shadow: Optional[CalProbeShadow] = CalProbeShadow()
         # M7.4 Phase 6c: publish cube_ring window to etcd so the dsa_monitor
         # "Dump Now" button can pick an event_specnum that lands inside the
         # search-side retention window (corr_fast's block_specnum_start is in
@@ -635,8 +700,8 @@ class SearchComputeService:
         # at the placeholder.
         self._mjd_at_specnum_0_override: Optional[float] = None
 
-    @staticmethod
     def _build_cube_uploader_callback(
+        self,
         config: SearchComputeConfig,
     ):
         """Return a ``CubeDumpWriter`` post-write callback that fires
@@ -651,6 +716,17 @@ class SearchComputeService:
         path's parent IS the writer's flat ``dump_root`` (legacy M6
         auto / udp paths with no event subdir), the upload is skipped
         — no event archive to populate on h23.
+
+        T5 (2026-06-07): all uploads go through a per-process
+        :class:`BoundedCubeUploader` which serialises rsync via a
+        single worker thread and a bounded queue. Pre-2026-06-07 each
+        cube_dump.write fired ``upload_event_cubes`` directly, which
+        spawned a detached rsync per write — at C2's worst-case dump
+        rate (6 events/60 s × 4 nodes × 2 halves) this could put 48
+        rsyncs in flight simultaneously, starving the corr-net and
+        feeding back into the search-side detector freeze. Bounding
+        per-half concurrency to 1 caps the fleet at 8 concurrent
+        rsyncs.
         """
         dest_host = config.cube_upload_dest_host
         dest_root = config.cube_upload_dest_root
@@ -658,7 +734,7 @@ class SearchComputeService:
             return None
         # Local import keeps the dump-writer module decoupled from the
         # coinc package; the import happens once at service start.
-        from ..coinc.cube_uploader import upload_event_cubes
+        from ..coinc.cube_uploader import BoundedCubeUploader
 
         # Resolve the flat ``dump_root`` once so the callback can skip
         # legacy non-per-event writes without re-resolving each call.
@@ -673,6 +749,22 @@ class SearchComputeService:
                     config.cube_dump_writer_config.dump_root
                 )
         bwlimit = int(config.cube_upload_bandwidth_limit_kbps or 0)
+        # Build the bounded uploader and start its worker thread. The
+        # service stop path tears it down so detached rsyncs in flight
+        # at shutdown still get a chance to finish (the worker
+        # ``.wait()``s inside its loop).
+        uploader = BoundedCubeUploader(
+            dest_host=str(dest_host),
+            dest_root=str(dest_root),
+            max_concurrent=int(config.cube_upload_max_concurrent),
+            queue_maxsize=int(config.cube_upload_queue_maxsize),
+            bandwidth_limit_kbps=bwlimit,
+            thread_name=(
+                f"cube-upload-s{config.search_node_id}-g{config.gpu_half}"
+            ),
+        )
+        uploader.start()
+        self._cube_uploader = uploader
 
         def _on_dump_complete(path: Path, manifest) -> None:  # noqa: ANN001
             event_dir = Path(path).parent
@@ -690,13 +782,7 @@ class SearchComputeService:
                     path,
                 )
                 return
-            upload_event_cubes(
-                event_name=event_name,
-                src_dir=event_dir,
-                dest_host=dest_host,
-                dest_root=dest_root,
-                bandwidth_limit_kbps=bwlimit,
-            )
+            uploader.submit(event_name=event_name, src_dir=event_dir)
 
         return _on_dump_complete
 
@@ -736,6 +822,9 @@ class SearchComputeService:
             boxcar_accum_dtype=config.detector_boxcar_accum_dtype,
             layer2_sigma_max_samples=config.detector_layer2_max_samples,
             layer2_sigma_floor=float(config.detector_layer2_sigma_floor),
+            layer2_sigma_max_ratio=float(
+                config.detector_layer2_sigma_max_ratio
+            ),
             layer2_valid_min_fraction=float(
                 config.detector_layer2_valid_min_fraction
             ),
@@ -956,6 +1045,13 @@ class SearchComputeService:
             await self._udp_listener.stop()
         if self._cube_dump is not None:
             self._cube_dump.stop()
+        if self._cube_uploader is not None:
+            try:
+                self._cube_uploader.stop()
+            except Exception:                                    # noqa: BLE001
+                _LOG.exception(
+                    "BoundedCubeUploader.stop failed (non-fatal)"
+                )
         if self._clusterer is not None:
             self._clusterer.shutdown(wait=True)
         if self._cands_logger is not None:
@@ -1333,7 +1429,28 @@ class SearchComputeService:
             else None
         )
         n_cands_pre_meter = len(candidates)
-        candidates, n_metered = meter_candidates(candidates, cap)
+        # T3 (2026-06-07): exempt calibration-probe matches from the
+        # cap so operator-fired probes always reach C2 even during a
+        # candidate flood. The shadow is empty when etcd is unreachable
+        # so this is a strict superset of the legacy behaviour.
+        cal_probe_predicate = None
+        if self._cal_probe_shadow is not None:
+            shadow = self._cal_probe_shadow
+            now_unix = time.time()
+
+            def _is_cal_probe(c: Candidate, _now=now_unix) -> bool:
+                return shadow.is_cal_probe_match(
+                    dm_pc_cc=float(c.dm_fine),
+                    l_rad=float(c.l_rad),
+                    m_rad=float(c.m_rad),
+                    snr=float(c.snr),
+                    now_unix=_now,
+                ) is not None
+
+            cal_probe_predicate = _is_cal_probe
+        candidates, n_metered = meter_candidates(
+            candidates, cap, always_keep_predicate=cal_probe_predicate,
+        )
         if n_metered:
             self._c1_cands_dropped_meter += n_metered
         # Roll the metering state up over a window of blocks so the etcd
@@ -1455,12 +1572,44 @@ class SearchComputeService:
         for _k in self._stage_ns_accum:
             self._stage_ns_accum[_k] = 0
         self._stage_ns_count = 0
+        # T1 (2026-06-07): surface Layer-2 σ_k EMA health alongside the
+        # cube/cands counters so a single log line is enough to spot a
+        # half whose detector is stuck in post-anomaly recovery (median
+        # σ_k inflated, n_clamped_high climbing).
+        try:
+            l2 = self._detector.layer2_state
+            _s_k = l2.s_k
+            sk_med = float(torch.median(_s_k).item())
+            # ``torch.quantile`` requires float input; .float() is a
+            # no-op on float32 Layer-2 state.
+            sk_p95 = float(torch.quantile(_s_k.float(), 0.95).item())
+            sk_max = float(_s_k.max().item())
+            sk_min = float(_s_k.min().item())
+            n_clamped_total = int(l2.n_clamped_high)
+            per_kernel_clamped = l2.per_kernel_clamped_high
+            n_clamped_max = int(per_kernel_clamped.max().item()) if (
+                per_kernel_clamped.numel() > 0
+            ) else 0
+            sigma_max_ratio = float(l2.sigma_max_ratio)
+            l2_cube_count = int(l2.cube_count)
+            l2_warming = bool(l2.is_warming_up)
+        except Exception:                                      # noqa: BLE001
+            # Defence in depth: a stats glitch must never sink the
+            # progress log. Keep going with default values; the noise
+            # publish below also short-circuits.
+            sk_med = sk_p95 = sk_max = sk_min = float("nan")
+            n_clamped_total = 0
+            n_clamped_max = 0
+            sigma_max_ratio = 0.0
+            l2_cube_count = 0
+            l2_warming = False
         _LOG.info(
             "cube_progress: cubes=%d cands=%d clusters=%d "
             "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
             "stage_ms[build/l1/det/total]=%.1f/%.1f/%.1f/%.1f "
             "build_ms[h2d/imager/valid]=%.1f/%.1f/%.1f(n=%d) "
-            "scatter=%.1f/%.1f us(mean/max,n=%d) src=%s",
+            "scatter=%.1f/%.1f us(mean/max,n=%d) "
+            "sk[med/p95/max]=%.3f/%.3f/%.3f n_clamped_high=%d src=%s",
             self._cubes_processed,
             self._candidates_emitted,
             self._clusters_emitted,
@@ -1472,6 +1621,7 @@ class SearchComputeService:
             _build_t["n"],
             _scatter_t["mean_us"], _scatter_t["max_us"],
             _scatter_t["count"],
+            sk_med, sk_p95, sk_max, n_clamped_total,
             getattr(self._source, "stats", {}),
         )
         # Phase 6c: best-effort publish of the cube_ring window to
@@ -1488,6 +1638,119 @@ class SearchComputeService:
                 # the progress-logging path.
                 _LOG.exception(
                     "SearchRingMonPublisher.publish_from_ring failed "
+                    "(swallowed; will retry next cycle)"
+                )
+        # T1 (2026-06-07): publish σ_k EMA stats so the dashboard can
+        # show a "noise health" panel and call out a half whose σ_k is
+        # inflated or being repeatedly clamped from above.
+        if self._compute_mon is not None:
+            try:
+                self._compute_mon.publish_noise(
+                    s_k_median=sk_med,
+                    s_k_p95=sk_p95,
+                    s_k_max=sk_max,
+                    s_k_min=sk_min,
+                    n_clamped_high_total=n_clamped_total,
+                    n_clamped_high_max_per_kernel=n_clamped_max,
+                    sigma_max_ratio=sigma_max_ratio,
+                    cube_count=l2_cube_count,
+                    is_warming_up=l2_warming,
+                )
+            except Exception:                                  # noqa: BLE001
+                _LOG.exception(
+                    "SearchComputeMonPublisher.publish_noise failed "
+                    "(swallowed; will retry next cycle)"
+                )
+        # T3 (2026-06-07): refresh the calibration-probe shadow on the
+        # cube_progress cadence (every ~10 cubes ≈ 2 s at production
+        # cadence). The shadow throttles internally so calling this
+        # every progress tick costs at most one etcd round-trip per
+        # ``CalProbeShadow.refresh_interval_s`` window.
+        if self._cal_probe_shadow is not None:
+            try:
+                self._cal_probe_shadow.maybe_refresh()
+            except Exception:                                  # noqa: BLE001
+                _LOG.exception(
+                    "CalProbeShadow.maybe_refresh failed "
+                    "(swallowed; will retry next cycle)"
+                )
+        # T8 (2026-06-07): publish cube-dump + C2 trigger listener
+        # health so the dashboard surfaces silent dump-path failures
+        # (writer queue full -> n_dropped, ring rotated past trigger
+        # -> too_late) without grovelling through logs.
+        if self._compute_mon is not None and (
+            self._cube_dump is not None or self._c2_trigger is not None
+        ):
+            try:
+                cd_dumped = (
+                    int(self._cube_dump.n_dumped)
+                    if self._cube_dump is not None else 0
+                )
+                cd_dropped = (
+                    int(self._cube_dump.n_dropped)
+                    if self._cube_dump is not None else 0
+                )
+                cd_failed = (
+                    int(self._cube_dump.n_failed)
+                    if self._cube_dump is not None else 0
+                )
+                cd_qd = (
+                    int(self._cube_dump.queue_depth)
+                    if self._cube_dump is not None else 0
+                )
+                cd_qmax = 0
+                if self._cube_dump is not None and (
+                    self._config.cube_dump_writer_config is not None
+                ):
+                    cd_qmax = int(
+                        self._config.cube_dump_writer_config.queue_maxsize
+                    )
+                trig_mon = (
+                    dict(self._c2_trigger.mon)
+                    if self._c2_trigger is not None else {}
+                )
+                ring_depth = (
+                    int(self._cube_ring.depth)
+                    if self._cube_ring is not None else 0
+                )
+                # Pull the ring's outer specnum window from the ring
+                # snapshot so the dashboard can compute the live
+                # retention window without a separate etcd round-trip.
+                ring_oldest = 0
+                ring_newest_end = 0
+                if self._cube_ring is not None:
+                    snap = self._cube_ring.snapshot()
+                    if snap:
+                        newest = snap[0]
+                        oldest = snap[-1]
+                        ring_oldest = int(oldest.event_specnum_start)
+                        ring_newest_end = (
+                            int(newest.event_specnum_start)
+                            + int(newest.t_det)
+                            * int(newest.sample_period_specnum)
+                        )
+                self._compute_mon.publish_dump_health(
+                    cube_dump_n_dumped=cd_dumped,
+                    cube_dump_n_dropped=cd_dropped,
+                    cube_dump_n_failed=cd_failed,
+                    cube_dump_queue_depth=cd_qd,
+                    cube_dump_queue_maxsize=cd_qmax,
+                    c2_trigger_received=int(trig_mon.get("received", 0)),
+                    c2_trigger_hits=int(trig_mon.get("hits", 0)),
+                    c2_trigger_too_late=int(trig_mon.get("too_late", 0)),
+                    c2_trigger_too_early=int(trig_mon.get("too_early", 0)),
+                    c2_trigger_bad_magic=int(trig_mon.get("bad_magic", 0)),
+                    c2_trigger_bad_schema=int(trig_mon.get("bad_schema", 0)),
+                    c2_trigger_dispatch_dropped=int(
+                        trig_mon.get("dispatch_dropped", 0)
+                    ),
+                    cube_ring_depth=ring_depth,
+                    cube_ring_oldest_specnum=ring_oldest,
+                    cube_ring_newest_end_specnum_excl=ring_newest_end,
+                )
+            except Exception:                                  # noqa: BLE001
+                _LOG.exception(
+                    "SearchComputeMonPublisher.publish_dump_health failed "
                     "(swallowed; will retry next cycle)"
                 )
 
@@ -1940,6 +2203,12 @@ def _build_search_config_from_yaml(
     cube_upload_bwlimit_kbps = int(
         uploader_yaml.get("bandwidth_limit_kbps", 0) or 0
     )
+    cube_upload_max_concurrent_yaml = int(
+        uploader_yaml.get("max_concurrent", 1) or 1
+    )
+    cube_upload_queue_maxsize_yaml = int(
+        uploader_yaml.get("queue_maxsize", 8) or 8
+    )
     remote_root_raw = uploader_yaml.get("remote_root", "")
     if remote_root_raw:
         from ..coinc.cube_uploader import parse_remote_root
@@ -1981,6 +2250,9 @@ def _build_search_config_from_yaml(
     detector_layer2_tau_s_yaml = det.get("layer2_tau_s", None)
     detector_layer2_n_burnin_yaml = det.get("layer2_n_burnin", None)
     detector_layer2_sigma_floor_yaml = float(det.get("layer2_sigma_floor", 0.0))
+    detector_layer2_sigma_max_ratio_yaml = float(
+        det.get("layer2_sigma_max_ratio", 0.0)
+    )
     detector_layer2_valid_min_fraction_yaml = float(
         det.get("layer2_valid_min_fraction", 1.0)
     )
@@ -2015,6 +2287,7 @@ def _build_search_config_from_yaml(
             if detector_layer2_n_burnin_yaml is not None else None
         ),
         detector_layer2_sigma_floor=detector_layer2_sigma_floor_yaml,
+        detector_layer2_sigma_max_ratio=detector_layer2_sigma_max_ratio_yaml,
         detector_layer2_valid_min_fraction=detector_layer2_valid_min_fraction_yaml,
         detector_device=device,
         search_node_id=int(search_node_id),
@@ -2049,6 +2322,8 @@ def _build_search_config_from_yaml(
         cube_upload_dest_host=cube_upload_dest_host,
         cube_upload_dest_root=cube_upload_dest_root,
         cube_upload_bandwidth_limit_kbps=cube_upload_bwlimit_kbps,
+        cube_upload_max_concurrent=cube_upload_max_concurrent_yaml,
+        cube_upload_queue_maxsize=cube_upload_queue_maxsize_yaml,
         # Wire the MJD/time geometry to the ACTUAL search cadence
         # (--t-int-search-us, 1048.576 µs at the prod op-point) instead
         # of leaving the stale class default. ``specnum_start`` is in

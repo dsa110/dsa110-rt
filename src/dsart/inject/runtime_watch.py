@@ -56,6 +56,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Any, Optional
 
 from dsart.inject.etcd_watcher import handle_inject_payload
@@ -115,6 +116,17 @@ class RuntimeInjectWatch:
         self._lock = threading.Lock()
         self._n_events = 0
         self._n_queued = 0
+        # T2 (2026-06-07): keep the most recently queued inject's
+        # identifying metadata so the corr_fast mon publisher can ship
+        # it to etcd. Operators reading the dashboard then know not
+        # only "this corr node received N injects" but also which
+        # specific probe it last queued — the missing signal that made
+        # 2026-06-07 partial-fan-out failures indistinguishable from
+        # search-side detector pathology.
+        self._last_inj_id: Optional[str] = None
+        self._last_apply_at_specnum: Optional[int] = None
+        self._last_event_unix: Optional[float] = None
+        self._last_queued_unix: Optional[float] = None
 
     @property
     def key(self) -> str:
@@ -129,6 +141,55 @@ class RuntimeInjectWatch:
     def n_queued(self) -> int:
         """Total injection configs successfully ``add_pending``'d."""
         return self._n_queued
+
+    @property
+    def last_inj_id(self) -> Optional[str]:
+        """``inj_id`` of the most recently queued injection, or None."""
+        return self._last_inj_id
+
+    @property
+    def last_apply_at_specnum(self) -> Optional[int]:
+        """``apply_at_specnum`` of the most recently queued injection."""
+        return self._last_apply_at_specnum
+
+    @property
+    def last_event_unix(self) -> Optional[float]:
+        """Unix timestamp of the most recent watch event (raw or queued)."""
+        return self._last_event_unix
+
+    @property
+    def last_queued_unix(self) -> Optional[float]:
+        """Unix timestamp of the most recent successfully queued event."""
+        return self._last_queued_unix
+
+    def state(self) -> dict:
+        """Snapshot of the watch counters + last-event metadata.
+
+        Used by :class:`dsart.services.corr_fast_mon.CorrFastMonPublisher`
+        to ship the inject path's status to ``/mon/corr_rt/<chgroup>/
+        corr_fast`` so dashboard consumers can verify all 16 corr nodes
+        received an injection without ssh+grep on each one.
+        """
+        return {
+            "inject_n_events": int(self._n_events),
+            "inject_n_queued": int(self._n_queued),
+            "inject_last_inj_id": self._last_inj_id,
+            "inject_last_apply_at_specnum": (
+                int(self._last_apply_at_specnum)
+                if self._last_apply_at_specnum is not None
+                else None
+            ),
+            "inject_last_event_unix": (
+                float(self._last_event_unix)
+                if self._last_event_unix is not None
+                else None
+            ),
+            "inject_last_queued_unix": (
+                float(self._last_queued_unix)
+                if self._last_queued_unix is not None
+                else None
+            ),
+        }
 
     def start(self) -> None:
         """Open the DsaStore handle (if not provided) + register the
@@ -183,7 +244,9 @@ class RuntimeInjectWatch:
         bytes/str) we round-trip through ``json.dumps``; this is
         ~µs and keeps the parsing logic in one place.
         """
-        self._n_events += 1
+        with self._lock:
+            self._n_events += 1
+            self._last_event_unix = time.time()
         try:
             if isinstance(event, (bytes, bytearray, str)):
                 payload = event
@@ -196,4 +259,22 @@ class RuntimeInjectWatch:
             )
             return
         if cfg is not None:
-            self._n_queued += 1
+            with self._lock:
+                self._n_queued += 1
+                # T2: capture identifying metadata of the queued probe
+                # so the corr_fast mon publisher can ship it to etcd.
+                try:
+                    self._last_inj_id = (
+                        str(cfg.inj_id)
+                        if getattr(cfg, "inj_id", None) is not None
+                        else None
+                    )
+                    self._last_apply_at_specnum = (
+                        int(cfg.apply_at_specnum)
+                        if getattr(cfg, "apply_at_specnum", None) is not None
+                        else None
+                    )
+                except Exception:  # noqa: BLE001 — never sink the loop
+                    self._last_inj_id = None
+                    self._last_apply_at_specnum = None
+                self._last_queued_unix = time.time()

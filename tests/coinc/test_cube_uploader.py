@@ -38,6 +38,7 @@ from dsart.coinc.cube_uploader import (
     DEFAULT_DEST_HOST,
     DEFAULT_DEST_ROOT,
     DEFAULT_RSYNC_OPTS,
+    BoundedCubeUploader,
     build_rsync_argv,
     parse_remote_root,
     upload_event_cubes,
@@ -272,3 +273,159 @@ def test_upload_event_cubes_uses_custom_log_path(tmp_path) -> None:
     assert "event=evt" in body
     # The default log next to NPZs must NOT have been created.
     assert not (src / "upload.log").exists()
+
+
+# ---------------------------------------------------------------------------
+# BoundedCubeUploader (T5 — concurrency cap)
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """Stand-in for subprocess.Popen with an injectable wait()."""
+
+    def __init__(
+        self, *, rc: int = 0, on_wait=None, pid: int = 12345,
+    ) -> None:
+        self.pid = pid
+        self._rc = int(rc)
+        self._on_wait = on_wait
+
+    def wait(self):
+        if self._on_wait is not None:
+            self._on_wait()
+        return self._rc
+
+
+def _fake_upload_factory(
+    *, hold_event=None, exit_codes=None, log_calls=None,
+):
+    """Build a fake ``upload_fn`` for BoundedCubeUploader tests.
+
+    ``hold_event`` (threading.Event) — if set, ``proc.wait()`` blocks
+        until the event is set so the test can stall the worker and
+        observe queue backpressure.
+    ``exit_codes`` (list[int] | None) — per-call return codes for
+        ``proc.wait()``; defaults to all 0.
+    ``log_calls`` (list) — appended-to per spawn for assertions.
+    """
+    import threading
+
+    counter = {"n": 0}
+    log = log_calls if log_calls is not None else []
+
+    def fake_upload(*, event_name, src_dir, dest_host, dest_root, **kwargs):
+        log.append((event_name, str(src_dir), dest_host, dest_root))
+        if exit_codes is not None:
+            rc = exit_codes[counter["n"] % len(exit_codes)]
+        else:
+            rc = 0
+        counter["n"] += 1
+        on_wait = None
+        if hold_event is not None:
+            on_wait = lambda: hold_event.wait(timeout=10.0)
+        return _FakeProc(rc=rc, on_wait=on_wait)
+
+    return fake_upload, log
+
+
+def test_bounded_uploader_serialises_uploads(tmp_path) -> None:
+    """T5: with max_concurrent=1 every submitted event runs through
+    one worker, in submission order."""
+    log: list = []
+    fake_upload, _ = _fake_upload_factory(log_calls=log)
+    up = BoundedCubeUploader(
+        dest_host="ubuntu@h23",
+        dest_root="/dataz",
+        max_concurrent=1,
+        queue_maxsize=4,
+        upload_fn=fake_upload,
+    )
+    up.start()
+    try:
+        for i in range(3):
+            assert up.submit(f"evt{i}", tmp_path / f"evt{i}") is True
+        # Drain — give the worker time to process the submitted items.
+        for _ in range(50):
+            if up.n_uploaded >= 3:
+                break
+            import time as _t
+            _t.sleep(0.05)
+        assert up.n_uploaded == 3
+        assert up.n_submitted == 3
+        assert up.n_dropped_full == 0
+        # Submission order preserved.
+        assert [e for e, *_ in log] == ["evt0", "evt1", "evt2"]
+    finally:
+        up.stop()
+
+
+def test_bounded_uploader_evicts_oldest_on_full_queue(tmp_path) -> None:
+    """T5: a full queue evicts the OLDEST pending job in favour of the
+    new submission, and bumps ``n_dropped_full``."""
+    import threading
+    hold = threading.Event()
+    log: list = []
+    fake_upload, _ = _fake_upload_factory(hold_event=hold, log_calls=log)
+    up = BoundedCubeUploader(
+        dest_host="ubuntu@h23",
+        dest_root="/dataz",
+        max_concurrent=1,
+        queue_maxsize=2,
+        upload_fn=fake_upload,
+    )
+    up.start()
+    try:
+        # The first submit gets pulled by the worker immediately and
+        # blocks on hold. Subsequent submits sit in the queue (cap=2).
+        up.submit("evt-running", tmp_path / "evt-running")
+        # Give the worker a moment to dequeue the first item before
+        # we fill the queue, so cap=2 is the actual ceiling.
+        import time as _t
+        for _ in range(50):
+            if up.queue_depth == 0:
+                break
+            _t.sleep(0.02)
+        up.submit("evt-A", tmp_path / "evt-A")
+        up.submit("evt-B", tmp_path / "evt-B")
+        # Now the queue is full ([A, B]); the next submit must evict A.
+        up.submit("evt-C", tmp_path / "evt-C")
+        assert up.n_dropped_full == 1
+        # Release hold and let the worker drain the rest.
+        hold.set()
+        for _ in range(50):
+            if up.n_uploaded >= 3:
+                break
+            _t.sleep(0.05)
+        spawned = [e for e, *_ in log]
+        assert "evt-running" in spawned
+        assert "evt-B" in spawned
+        assert "evt-C" in spawned
+        # ``evt-A`` was evicted before being spawned.
+        assert "evt-A" not in spawned
+    finally:
+        hold.set()
+        up.stop()
+
+
+def test_bounded_uploader_counts_failures(tmp_path) -> None:
+    """T5: a non-zero rsync rc bumps ``n_failed`` (not n_uploaded)."""
+    fake_upload, _ = _fake_upload_factory(exit_codes=[12])
+    up = BoundedCubeUploader(
+        dest_host="ubuntu@h23",
+        dest_root="/dataz",
+        max_concurrent=1,
+        queue_maxsize=2,
+        upload_fn=fake_upload,
+    )
+    up.start()
+    try:
+        up.submit("evt", tmp_path / "evt")
+        import time as _t
+        for _ in range(50):
+            if up.n_failed >= 1:
+                break
+            _t.sleep(0.05)
+        assert up.n_failed == 1
+        assert up.n_uploaded == 0
+    finally:
+        up.stop()

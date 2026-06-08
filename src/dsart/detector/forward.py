@@ -554,6 +554,7 @@ class DeterministicDetector(torch.nn.Module):
         layer2_state: Optional[Layer2State] = None,
         layer2_seed_unit: bool = True,
         layer2_sigma_floor: float = 0.0,
+        layer2_sigma_max_ratio: float = 0.0,
         layer2_valid_min_fraction: float = 1.0,
         streaming: bool = False,
         streaming_tile_size: int = 64,
@@ -708,6 +709,7 @@ class DeterministicDetector(torch.nn.Module):
                 n_kernel_max_t=int(n_kernel_max_t),
                 sigma_max_samples=self._layer2_sigma_max_samples,
                 sigma_floor=float(layer2_sigma_floor),
+                sigma_max_ratio=float(layer2_sigma_max_ratio),
                 device=device,
             )
             if layer2_seed_unit:

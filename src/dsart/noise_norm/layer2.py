@@ -126,6 +126,7 @@ class Layer2State:
         n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
         sigma_max_samples: Optional[int] = None,
         sigma_floor: float = 0.0,
+        sigma_max_ratio: float = 0.0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -141,6 +142,8 @@ class Layer2State:
             raise ValueError(f"n_kernel_max_t={n_kernel_max_t}, expected ≥ 1")
         if sigma_floor < 0:
             raise ValueError(f"sigma_floor={sigma_floor}, expected ≥ 0")
+        if sigma_max_ratio < 0:
+            raise ValueError(f"sigma_max_ratio={sigma_max_ratio}, expected ≥ 0")
 
         self.n_kernels = int(n_kernels)
         self.cube_cadence_s = float(cube_cadence_s)
@@ -159,6 +162,19 @@ class Layer2State:
         # (no unbounded inflation when σ_k learning gets unlucky on one
         # node). Default 0.0 preserves legacy behaviour bit-for-bit.
         self.sigma_floor = float(sigma_floor)
+        # 2026-06-07 hardening (T1): cap how far a single cube can lift
+        # σ_k. Without an upper bound, a transient high-energy cube
+        # (bright RFI, an over-fluence calibration probe, a merger
+        # glitch) inflates σ_k and the τ_s≈30 s relaxation suppresses
+        # all detections on that half for ~30 s — observed 2026-06-07
+        # as the "candidate counter freeze" failure mode after a
+        # dump-storm + manual cal-probe burst. When ``sigma_max_ratio
+        # > 0`` and the post-EMA σ_k would exceed
+        # ``sigma_max_ratio × s_k_prev``, the update for that kernel is
+        # rejected (σ_k stays at the previous value) and
+        # ``n_clamped_high`` is incremented. ``0.0`` disables the
+        # clamp (preserves bit-for-bit legacy behaviour).
+        self.sigma_max_ratio = float(sigma_max_ratio)
         self.gamma = 1.0 - math.exp(-self.cube_cadence_s / self.tau_s)
 
         # State: per-kernel running mean / EMA value. Initialised to 1.0
@@ -170,6 +186,15 @@ class Layer2State:
             (self.n_kernels,), dtype=dtype, device=device,
         )
         self._cube_count = 0
+        # T1 mon-points: per-kernel count of cubes whose σ_k update was
+        # clamped from above by ``sigma_max_ratio``. Surfaced via
+        # ``n_clamped_high`` (scalar sum) and ``per_kernel_clamped_high``
+        # (per-kernel tensor) so operators can spot a single-kernel
+        # pathology vs. a fleet-wide noise event.
+        self._n_clamped_high_total = 0
+        self._per_kernel_clamped_high = torch.zeros(
+            (self.n_kernels,), dtype=torch.int64, device=device,
+        )
 
     @property
     def s_k(self) -> torch.Tensor:
@@ -186,10 +211,27 @@ class Layer2State:
         ``flags.bit3 = noise_warmup`` while True."""
         return self._cube_count < self.n_burnin
 
+    @property
+    def n_clamped_high(self) -> int:
+        """Total cube×kernel updates that were clamped from above by
+        ``sigma_max_ratio``. Aggregated across all kernels and cubes
+        since the last :meth:`reset`. Surfaces the inflation-protection
+        path firing rate."""
+        return int(self._n_clamped_high_total)
+
+    @property
+    def per_kernel_clamped_high(self) -> torch.Tensor:
+        """Per-kernel cumulative count of clamped-from-above updates
+        (clone). Useful for distinguishing a single-kernel hot spot
+        from a fleet-wide noise event."""
+        return self._per_kernel_clamped_high.detach().clone()
+
     def reset(self) -> None:
         """Clear state; reset cube_count. ``cmd: start --resume=false``."""
         self._s_k.fill_(1.0)
         self._cube_count = 0
+        self._n_clamped_high_total = 0
+        self._per_kernel_clamped_high.zero_()
 
     def update_and_query(
         self,
@@ -249,6 +291,28 @@ class Layer2State:
         zero_mask = sigma_this == 0
         if torch.any(zero_mask):
             sigma_this = torch.where(zero_mask, self._s_k, sigma_this)
+
+        # T1 (2026-06-07): per-kernel upper-bound clamp on the σ_this
+        # contribution. When ``sigma_max_ratio > 0`` and the candidate
+        # σ_this for a given kernel exceeds ``sigma_max_ratio ×
+        # s_k_prev``, that kernel's update is REJECTED (σ_this is
+        # replaced by the prior s_k so the blend below is a no-op for
+        # that kernel) and the per-kernel clamp counter is bumped. We
+        # apply this BEFORE the burn-in / EMA blend so a single bad
+        # cube can never lift σ_k beyond the configured factor —
+        # bounding the freeze duration after an anomalous cube to a
+        # single sample (vs. ~τ_s≈30 s recovery in the unclamped path).
+        if self.sigma_max_ratio > 0.0 and self._cube_count > 0:
+            ceiling = self.sigma_max_ratio * self._s_k
+            high_mask = sigma_this > ceiling
+            if torch.any(high_mask):
+                # Replace the offending kernels' σ_this with the prior
+                # s_k so the EMA blend is an identity for them.
+                sigma_this = torch.where(high_mask, self._s_k, sigma_this)
+                self._per_kernel_clamped_high += high_mask.to(
+                    self._per_kernel_clamped_high.dtype
+                )
+                self._n_clamped_high_total += int(high_mask.sum().item())
 
         if self._cube_count < self.n_burnin:
             count = float(self._cube_count)

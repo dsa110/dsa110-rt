@@ -48,15 +48,19 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import queue
 import shlex
 import subprocess
+import threading
 from pathlib import Path
-from typing import Iterable, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 __all__ = [
     "DEFAULT_DEST_HOST",
     "DEFAULT_DEST_ROOT",
     "DEFAULT_RSYNC_OPTS",
+    "DEFAULT_UPLOAD_QUEUE_MAXSIZE",
+    "BoundedCubeUploader",
     "build_rsync_argv",
     "parse_remote_root",
     "upload_event_cubes",
@@ -270,3 +274,267 @@ def upload_event_cubes(
         dest_root,
     )
     return proc
+
+
+# ---------------------------------------------------------------------------
+# Bounded uploader (T5 — concurrency cap)
+# ---------------------------------------------------------------------------
+
+
+#: Default backlog the per-process bounded uploader will absorb before
+#: dropping the oldest pending job. Sized to comfortably outlast a 60 s
+#: dump-rate window at the production cap (``c2.dump_rate_max_per_window:
+#: 6``) so a single short flood is queued losslessly; longer floods drop
+#: the oldest events (newer ones are more diagnostically useful) so a
+#: persistently-noisy source can never grow unbounded RAM/disk pressure.
+DEFAULT_UPLOAD_QUEUE_MAXSIZE: int = 8
+
+
+class BoundedCubeUploader:
+    """Per-process upload serializer with bounded backlog (T5, 2026-06-07).
+
+    Background
+    ----------
+
+    Pre-2026-06-07 every successful ``CubeDumpWriter._drain_loop`` write
+    fired ``upload_event_cubes`` directly, which spawned a *detached*
+    rsync via ``subprocess.Popen``. Each search node has 2 GPU halves;
+    each half can fire one rsync per cube_dump completion. With C2's
+    ``dump_rate_max_per_window: 6 / 60 s`` cap, the worst case is 6
+    events × 4 nodes × 2 halves = 48 concurrent rsyncs of ~1.06 GiB each
+    (the search-node side of an event archive). 48 simultaneous rsyncs
+    over the corr-net starve incoming SNAP traffic, bumping the RFI
+    flag fraction → flagged cubes → σ_k anomaly → search-side detector
+    freeze (the 2026-06-07 failure mode) — the dump-storm fan-out
+    closes the loop into the detector pathology.
+
+    This class fixes that by serializing uploads PER PROCESS through a
+    single worker thread bounded by ``max_concurrent`` parallel rsync
+    processes (default 1). The worker pops pending jobs, spawns the
+    rsync, ``proc.wait()``s for it to finish, and only then pops the
+    next. Each search-compute half therefore has at most
+    ``max_concurrent`` rsyncs in flight regardless of trigger rate; the
+    fleet ceiling collapses from 48 to 4 × 2 × ``max_concurrent``
+    concurrent rsyncs (= 8 at the default).
+
+    Submit semantics
+    ----------------
+
+    * :meth:`submit` is non-blocking: it puts on the bounded queue with
+      ``put_nowait`` and returns ``True`` on success or ``False`` on a
+      full queue. On a full-queue submission the OLDEST queued job is
+      evicted to make room (so newer / more diagnostically useful
+      events win over old ones during a sustained backlog).
+    * ``submit`` itself never spawns rsync — that runs on the worker
+      thread. The dispatch path (the ``CubeDumpWriter.on_dump_complete``
+      callback) returns in microseconds.
+    * Counters (``n_submitted``, ``n_uploaded``, ``n_dropped_full``,
+      ``n_failed``) are read-only properties, safe to inspect from
+      operator threads.
+
+    Lifecycle
+    ---------
+
+    Instantiate at service start, call :meth:`start` once, call
+    :meth:`submit` from the dispatch thread, call :meth:`stop` at
+    shutdown to drain the queue.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(
+        self,
+        *,
+        dest_host: str,
+        dest_root: str,
+        max_concurrent: int = 1,
+        queue_maxsize: int = DEFAULT_UPLOAD_QUEUE_MAXSIZE,
+        bandwidth_limit_kbps: int = 0,
+        rsync_path: str = "rsync",
+        extra_opts: Iterable[str] = (),
+        log_path_factory: Optional[
+            "Any"
+        ] = None,
+        popen: Any = subprocess.Popen,
+        upload_fn: Any = upload_event_cubes,
+        thread_name: str = "cube-upload",
+    ) -> None:
+        if max_concurrent < 1:
+            raise ValueError(
+                f"max_concurrent={max_concurrent}, expected >= 1"
+            )
+        if queue_maxsize < 1:
+            raise ValueError(
+                f"queue_maxsize={queue_maxsize}, expected >= 1"
+            )
+        self.dest_host = str(dest_host)
+        self.dest_root = str(dest_root)
+        self._max_concurrent = int(max_concurrent)
+        self._queue_maxsize = int(queue_maxsize)
+        self._bandwidth_limit_kbps = int(bandwidth_limit_kbps)
+        self._rsync_path = str(rsync_path)
+        self._extra_opts = tuple(extra_opts)
+        self._log_path_factory = log_path_factory
+        self._popen = popen
+        self._upload_fn = upload_fn
+        self._queue: queue.Queue = queue.Queue(maxsize=self._queue_maxsize)
+        self._lock = threading.Lock()
+        self._workers: list[threading.Thread] = []
+        self._thread_name = str(thread_name)
+        self._started = False
+        self._stopped = False
+        self._n_submitted = 0
+        self._n_uploaded = 0
+        self._n_dropped_full = 0
+        self._n_failed = 0
+
+    @property
+    def n_submitted(self) -> int:
+        return self._n_submitted
+
+    @property
+    def n_uploaded(self) -> int:
+        return self._n_uploaded
+
+    @property
+    def n_dropped_full(self) -> int:
+        """Submissions that evicted an older queued job (queue was
+        full at submit time)."""
+        return self._n_dropped_full
+
+    @property
+    def n_failed(self) -> int:
+        """Worker-side rsync exits with a non-zero return code or a
+        ``Popen`` exception."""
+        return self._n_failed
+
+    @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def queue_maxsize(self) -> int:
+        return self._queue_maxsize
+
+    def start(self) -> None:
+        if self._started:
+            return
+        for i in range(self._max_concurrent):
+            t = threading.Thread(
+                target=self._drain_loop,
+                name=f"{self._thread_name}-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._workers.append(t)
+        self._started = True
+        _LOG.info(
+            "BoundedCubeUploader started: dest=%s:%s max_concurrent=%d "
+            "queue_maxsize=%d",
+            self.dest_host, self.dest_root,
+            self._max_concurrent, self._queue_maxsize,
+        )
+
+    def stop(self) -> None:
+        if not self._started or self._stopped:
+            return
+        self._stopped = True
+        for _ in self._workers:
+            try:
+                self._queue.put_nowait(self._SENTINEL)
+            except queue.Full:
+                # Make room by popping one job — sentinel must land.
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self._queue.put_nowait(self._SENTINEL)
+        for t in self._workers:
+            t.join(timeout=10.0)
+
+    def submit(self, event_name: str, src_dir: Union[str, Path]) -> bool:
+        """Enqueue an event upload. Non-blocking; on a full queue the
+        oldest pending job is evicted to make room and ``False`` is
+        returned (the new job IS still queued)."""
+        if not self._started:
+            raise RuntimeError("BoundedCubeUploader.submit() before start()")
+        if self._stopped:
+            raise RuntimeError("BoundedCubeUploader.submit() after stop()")
+        item = (str(event_name), Path(src_dir))
+        with self._lock:
+            self._n_submitted += 1
+            try:
+                self._queue.put_nowait(item)
+                return True
+            except queue.Full:
+                # Evict the oldest job + replace it with the new one.
+                try:
+                    evicted = self._queue.get_nowait()
+                    if evicted is not self._SENTINEL:
+                        self._n_dropped_full += 1
+                        ev_name = (
+                            evicted[0] if isinstance(evicted, tuple)
+                            else "?"
+                        )
+                        _LOG.warning(
+                            "BoundedCubeUploader: queue full -> evicting "
+                            "oldest event=%s in favour of event=%s "
+                            "(dest=%s:%s queue_maxsize=%d)",
+                            ev_name, event_name,
+                            self.dest_host, self.dest_root,
+                            self._queue_maxsize,
+                        )
+                except queue.Empty:
+                    pass
+                try:
+                    self._queue.put_nowait(item)
+                except queue.Full:                                # noqa: BLE001
+                    self._n_dropped_full += 1
+                    return False
+                return False
+
+    def _drain_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is self._SENTINEL:
+                return
+            event_name, src_dir = item
+            try:
+                proc = self._upload_fn(
+                    event_name=event_name,
+                    src_dir=src_dir,
+                    dest_host=self.dest_host,
+                    dest_root=self.dest_root,
+                    rsync_path=self._rsync_path,
+                    extra_opts=self._extra_opts,
+                    bandwidth_limit_kbps=self._bandwidth_limit_kbps,
+                    popen=self._popen,
+                )
+            except Exception as exc:                              # noqa: BLE001
+                self._n_failed += 1
+                _LOG.warning(
+                    "BoundedCubeUploader: spawn failed for event=%s "
+                    "(src=%s dest=%s:%s): %s",
+                    event_name, src_dir,
+                    self.dest_host, self.dest_root, exc,
+                )
+                continue
+            try:
+                rc = proc.wait()
+            except Exception as exc:                              # noqa: BLE001
+                self._n_failed += 1
+                _LOG.warning(
+                    "BoundedCubeUploader: wait failed for event=%s "
+                    "pid=%s: %s",
+                    event_name, getattr(proc, "pid", "?"), exc,
+                )
+                continue
+            if rc != 0:
+                self._n_failed += 1
+                _LOG.warning(
+                    "BoundedCubeUploader: rsync exited rc=%d for event=%s "
+                    "pid=%s (see <src>/upload.log)",
+                    rc, event_name, getattr(proc, "pid", "?"),
+                )
+            else:
+                self._n_uploaded += 1

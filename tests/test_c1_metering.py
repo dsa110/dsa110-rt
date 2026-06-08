@@ -78,6 +78,64 @@ def test_meter_ties_keep_count_exact() -> None:
     assert sorted((c.snr for c in kept), reverse=True) == [19, 18, 17, 16, 15]
 
 
+def test_meter_always_keep_predicate_exempts_cal_probes() -> None:
+    """T3 (2026-06-07): a candidate matching ``always_keep_predicate``
+    bypasses the cap. Only the rest of the list is metered."""
+    # 5 cal-probe matches (wide+bright; would be dropped by the cap)
+    # plus 5 RFI singletons that under the legacy ordering would
+    # narrowly beat them out.
+    probes = [_cand(8, 99.0, dm_fine=500.0) for _ in range(5)]
+    rfi = [_cand(1, 20.0 + i, dm_fine=1500.0) for i in range(5)]
+    cands = rfi + probes
+    # Without the predicate, cap=4 keeps the 4 brightest narrow
+    # candidates and drops every probe.
+    kept_legacy, dropped_legacy = meter_candidates(cands, 4)
+    assert dropped_legacy == 6
+    assert all(c.width_samples == 1 for c in kept_legacy)
+
+    # With the predicate, every probe is kept AND the cap is applied
+    # to the rest (so we keep all 5 probes + the top 4 RFI singles).
+    def is_probe(c):
+        return abs(c.dm_fine - 500.0) < 1.0
+
+    kept_t3, dropped_t3 = meter_candidates(
+        cands, 4, always_keep_predicate=is_probe,
+    )
+    assert dropped_t3 == 1, "1 RFI single shed; all 5 probes kept"
+    n_probes_kept = sum(1 for c in kept_t3 if abs(c.dm_fine - 500.0) < 1.0)
+    n_rfi_kept = sum(1 for c in kept_t3 if abs(c.dm_fine - 1500.0) < 1.0)
+    assert n_probes_kept == 5
+    assert n_rfi_kept == 4
+
+
+def test_meter_always_keep_predicate_no_op_when_under_cap() -> None:
+    """When the post-split rest is under the cap, the entire list is
+    returned (no sort, no drops) regardless of the predicate."""
+    probes = [_cand(8, 99.0, dm_fine=500.0) for _ in range(2)]
+    rfi = [_cand(1, 20.0 + i, dm_fine=1500.0) for i in range(2)]
+    cands = rfi + probes
+
+    def is_probe(c):
+        return abs(c.dm_fine - 500.0) < 1.0
+
+    kept, dropped = meter_candidates(cands, 5, always_keep_predicate=is_probe)
+    assert dropped == 0
+    assert len(kept) == 4
+
+
+def test_meter_always_keep_predicate_swallows_predicate_errors() -> None:
+    """A buggy predicate must not sink the metering hot path —
+    candidates whose predicate raises are simply not exempted."""
+
+    def bad_predicate(c):
+        raise RuntimeError("operator-supplied predicate is broken")
+
+    cands = [_cand(1, float(i)) for i in range(6)]
+    kept, dropped = meter_candidates(cands, 3, always_keep_predicate=bad_predicate)
+    assert len(kept) == 3
+    assert dropped == 3
+
+
 # ---------------------------------------------------------------------------
 # DM-smearing-floor filter (2026-05-30)
 # ---------------------------------------------------------------------------

@@ -629,3 +629,317 @@ class TestDeleteSnrCalibrations:
         # the legacy keys and the new key.
         seen = sorted(b["bucket"] for b in out["buckets"])
         assert seen == ["dm0500_w0032", "dm0500_w0064", "dm1500"]
+
+
+# ---------------------------------------------------------------------------
+# T6/T7 — health-gated calibration probe + SNR ladder
+# ---------------------------------------------------------------------------
+
+
+def _seed_corr_fast_state(
+    store: FakeStore,
+    *,
+    chgroups=range(16),
+    inject_n_queued: int = 0,
+    ts_wall_unix: float | None = None,
+) -> None:
+    """Seed all 16 corr_fast mon-keys with a healthy heartbeat."""
+    if ts_wall_unix is None:
+        ts_wall_unix = time.time()
+    for cg in chgroups:
+        store.put_dict(
+            f"/mon/corr_rt/{cg}/corr_fast",
+            {
+                "chgroup": cg,
+                "block_n": 1000,
+                "n_processed": 1000,
+                "n_drop": 0,
+                "n_tx": 1000,
+                "last_block_ms": 50.0,
+                "ts_wall_unix": ts_wall_unix,
+                "inject_n_events": inject_n_queued,
+                "inject_n_queued": inject_n_queued,
+            },
+        )
+
+
+def _seed_search_compute_state(
+    store: FakeStore,
+    *,
+    halves=((1, 0), (1, 1), (2, 0), (2, 1), (9, 0), (9, 1), (13, 0), (13, 1)),
+    ts_wall_unix: float | None = None,
+    metering_active: int = 0,
+) -> None:
+    if ts_wall_unix is None:
+        ts_wall_unix = time.time()
+    for sid, g in halves:
+        store.put_dict(
+            f"/mon/search_rt/{sid}/compute/{g}",
+            {
+                "search_node_id": sid,
+                "gpu_half": g,
+                "c1_metering_active": metering_active,
+                "c1_metering_frac": 0.0,
+                "c1_metered_dropped_mean": 0.0,
+                "c1_max_candidates_per_block": 8,
+                "ts_wall_unix": ts_wall_unix,
+            },
+        )
+
+
+class TestPrecheckCalibrationHealth:
+    def test_healthy_fleet_returns_ok(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store, inject_n_queued=42)
+        _seed_search_compute_state(store)
+        snap = ic.precheck_calibration_health(store)
+        assert snap.ok is True
+        assert snap.reason == "ok"
+        # Baselines captured for fan-out check.
+        assert snap.inject_baselines[0] == 42
+        assert len(snap.inject_baselines) == 16
+
+    def test_stale_corr_fast_blocks_probe(self):
+        store = FakeStore()
+        # Half the fleet is stale (heartbeat too old).
+        _seed_corr_fast_state(
+            store, chgroups=range(8), ts_wall_unix=time.time(),
+        )
+        _seed_corr_fast_state(
+            store, chgroups=range(8, 16), ts_wall_unix=time.time() - 1000.0,
+        )
+        _seed_search_compute_state(store)
+        snap = ic.precheck_calibration_health(store)
+        assert snap.ok is False
+        assert "corr_fast_stale" in snap.reason
+        assert set(snap.stale_chgroups) == set(range(8, 16))
+
+    def test_active_metering_blocks_probe_when_required(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        # All search halves healthy except (1, 0), which is metering.
+        _seed_search_compute_state(
+            store, halves=((1, 1), (2, 0), (2, 1)),
+        )
+        store.put_dict(
+            "/mon/search_rt/1/compute/0",
+            {
+                "ts_wall_unix": time.time(),
+                "c1_metering_active": 1,
+                "c1_metering_frac": 0.5,
+                "c1_metered_dropped_mean": 12.0,
+                "c1_max_candidates_per_block": 8,
+            },
+        )
+        snap = ic.precheck_calibration_health(
+            store,
+            search_halves=((1, 0), (1, 1), (2, 0), (2, 1)),
+        )
+        assert snap.ok is False
+        assert "search_unhealthy" in snap.reason
+        assert (1, 0) in snap.sick_search_halves
+
+    def test_metering_check_can_be_disabled(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        store.put_dict(
+            "/mon/search_rt/1/compute/0",
+            {
+                "ts_wall_unix": time.time(),
+                "c1_metering_active": 1,  # would normally fail
+                "c1_metering_frac": 0.5,
+                "c1_metered_dropped_mean": 12.0,
+                "c1_max_candidates_per_block": 8,
+            },
+        )
+        snap = ic.precheck_calibration_health(
+            store,
+            search_halves=((1, 0),),
+            require_metering_inactive=False,
+        )
+        assert snap.ok is True
+
+
+class TestPrecheckInjectFanOut:
+    def test_advanced_baselines_pass(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store, inject_n_queued=10)
+        # Bump every chgroup's queued counter to simulate a successful
+        # fan-out.
+        _seed_corr_fast_state(store, inject_n_queued=11)
+        baselines = {cg: 10 for cg in range(16)}
+        ok, lagging = ic.precheck_inject_fan_out(
+            store, baselines=baselines, poll_timeout_s=0.0,
+            sleep_fn=lambda s: None,
+        )
+        assert ok is True
+        assert lagging == ()
+
+    def test_partial_fan_out_lists_laggards(self):
+        store = FakeStore()
+        # Half the fleet bumped, half didn't.
+        _seed_corr_fast_state(store, chgroups=range(8), inject_n_queued=11)
+        _seed_corr_fast_state(store, chgroups=range(8, 16), inject_n_queued=10)
+        baselines = {cg: 10 for cg in range(16)}
+        ok, lagging = ic.precheck_inject_fan_out(
+            store, baselines=baselines, poll_timeout_s=0.0,
+            sleep_fn=lambda s: None,
+        )
+        assert ok is False
+        assert sorted(lagging) == list(range(8, 16))
+
+
+class TestFireCalibrationProbeWithLadder:
+    @staticmethod
+    def _good_inject(store, **kwargs):
+        return TestFireCalibrationProbe._good_inject(store, **kwargs)
+
+    def _seed_match(self, *args, **kwargs):
+        return TestFireCalibrationProbe()._seed_match(*args, **kwargs)
+
+    def test_health_check_failure_aborts_before_inject(self):
+        # Empty store ⇒ no corr_fast heartbeats ⇒ all chgroups stale.
+        store = FakeStore()
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=self._good_inject,
+            dm_pc_cm3=500.0,
+            time_fn=lambda: 100.0,
+            sleep_fn=lambda s: None,
+        )
+        assert len(attempts) == 1
+        assert attempts[0].ok is False
+        assert attempts[0].reason.startswith("health_check_failed")
+        # Most importantly, no inject_fn / publish_active_inject calls.
+        assert all(
+            not k.startswith(ic.ACTIVE_INJECT_PREFIX)
+            for k, _ in store.put_calls
+        )
+
+    def test_first_attempt_succeeds(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [100.0]
+        sleep_calls: List[float] = []
+
+        def sleep_fn(s):
+            sleep_calls.append(s)
+            now[0] += s
+            if len(sleep_calls) == 1:
+                # Bump corr_fast counters so the post-fire fan-out
+                # check passes.
+                _seed_corr_fast_state(store, inject_n_queued=1)
+                inj_id = ic._build_probe_inj_id(
+                    prefix="cal_probe", dm=500.0, width=32, timestamp=100.0,
+                )
+                self._seed_match(
+                    store, inj_id, observed_snr=20.0,
+                    K=20.0 * math.sqrt(32.0 / 100.0),
+                )
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=self._good_inject,
+            dm_pc_cm3=500.0,
+            width_samples=32,
+            fluence_jy_ms=100.0,
+            poll_timeout_s=10.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        assert len(attempts) == 1
+        assert attempts[0].ok is True
+
+    def test_no_match_climbs_ladder(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        ladder_attempts: List[float] = []
+
+        # Inject_fn captures the fluence each attempt fires at.
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            ladder_attempts.append(float(kwargs["fluence_jy_ms"]))
+            # Bump counters so fan-out check passes.
+            _seed_corr_fast_state(store, inject_n_queued=len(ladder_attempts))
+            return good_inject(store, **kwargs)
+
+        # Sleep advances the clock; after the THIRD attempt is fired
+        # we seed the match so that attempt succeeds.
+        attempt_idx = [0]
+
+        def sleep_fn(s):
+            now[0] += s
+            # Once the third inject has been fired, seed its match.
+            if len(ladder_attempts) >= 3 and attempt_idx[0] < 1:
+                attempt_idx[0] += 1
+                inj_id = ic._build_probe_inj_id(
+                    prefix="cal_probe", dm=500.0, width=32,
+                    timestamp=now[0] - s,
+                )
+                # Match seeded under the inj_id of the most recent
+                # attempt — fire_calibration_probe rebuilds inj_id
+                # inside each call, so re-derive the timestamp it used.
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=32,
+            fluence_jy_ms=100.0,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        # All 3 attempts should have fired (at 100, 200, 400 Jy·ms).
+        assert ladder_attempts == [100.0, 200.0, 400.0]
+        # All attempts should ultimately fail ``no_match`` since we
+        # never actually seeded a match key.
+        assert len(attempts) == 3
+        assert all(not a.ok for a in attempts)
+        assert all(a.reason.startswith("no_match") for a in attempts)
+
+    def test_partial_fan_out_aborts_ladder(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store, chgroups=range(16), inject_n_queued=0)
+        _seed_search_compute_state(store)
+
+        # The inject helper writes its own active-inject row but does
+        # NOT bump per-chgroup inject_n_queued (simulating partial
+        # fan-out — some corr_fast nodes never receive the cmd).
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            return good_inject(store, **kwargs)
+
+        # Use an advancing clock so the no_match poll loop terminates
+        # inside fire_calibration_probe (poll_timeout_s = 1.0).
+        now = [300.0]
+
+        def sleep_fn(s):
+            now[0] += s
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=32,
+            fluence_jy_ms=100.0,
+            poll_timeout_s=1.0,
+            poll_interval_s=0.1,
+            fan_out_check_timeout_s=0.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            fluence_ladder=(1.0, 2.0),
+        )
+        # Should have ONE attempt followed by partial_fan_out abort —
+        # the ladder doesn't escalate past a partial fan-out (a missing
+        # corr node won't be cured by more fluence).
+        assert len(attempts) == 1
+        assert not attempts[0].ok
+        assert attempts[0].reason.startswith("partial_fan_out")

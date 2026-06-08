@@ -386,24 +386,29 @@ c1:
                                      # Gaussian, matching Q(6)~9.9e-10 × 6.4e9 trials = 6.3 cands/cube.
                                      # Coverage correction is required for this to hold; see cube_pipeline.py
                                      # M7.4.2 notes.
-  cube_ring_depth: 16                # M7.6-mem (2026-05-31): LOWERED 24 → 16 to fit the REAL search-node
-                                     # RAM budget. The prior comment assumed a 256 GiB host; the production
-                                     # search nodes actually have ~93 GiB. Each slot is
-                                     # t_det*n_fdm*n_grid^2*2 = 192*34*256*256*2 = 855 MiB ≈ 0.8 GiB fp16
-                                     # (the old "3.2 GiB" figure was wrong by 4×; the on-disk cube dumps
-                                     # are 855 MB, confirming 0.8 GiB). Buffers are torch pin_memory=True →
-                                     # shared-anon (counts in Shmem, NOT Mlocked) and LAZILY allocated, so
-                                     # a depth-24 ring grew toward 2*24*0.8 = 38 GiB/node which — on top of
-                                     # the 39 GiB rxring tmpfs — pushed past 93 GiB into swap and drove the
-                                     # 15–20 min thrash death spiral (n01/n09/n13 wedging). The dominant
-                                     # fix is the rxring cut (t_buf 32768→8192 = 39→9.8 GiB); on top of
-                                     # that, depth=16 (2.2 s retention) caps pinned retention at 2*16*0.8 =
-                                     # 25.6 GiB. Node ceiling ≈ 9.8 (rxring) + 25.6 (retention) + ~8 (base)
-                                     # ≈ 43 GiB → ~2× under the prior ~85 GiB working set, ~50 GiB headroom,
-                                     # no swap (measured: avail 56–61 GiB, RSS 10.1 GiB/half, cubes at full
-                                     # rate). 16 keeps the pre-M7.6 retention value to minimise behaviour
-                                     # change (per user 2026-05-31 "as little as possible"); drop toward 8
-                                     # if a future op-point needs the RAM ("discard rather than buffer").
+  cube_ring_depth: 24                # T4 (2026-06-07): RAISED 16 → 24 to widen the C2-trigger retention
+                                     # window from ~3.2 s to ~4.8 s at the production op-point. Under load
+                                     # (cube_dump rsync storm + GIL contention on C2) the trigger UDP can
+                                     # arrive ≥ 4 s after the candidate that fired it; with depth=16 the
+                                     # cube has rotated out and the listener emits ``too_late`` instead of
+                                     # dispatching the dump (observed 2026-06-07). Each slot at the new
+                                     # op-point (t_det=256, n_fdm=34, n_grid=256) is
+                                     # 256*34*256*256*2 = 1.06 GiB fp16; depth=24 × 2 halves = 51 GiB
+                                     # pinned. Combined with the 9.8 GiB rxring + ~8 GiB base ≈ 69 GiB out
+                                     # of 93 GiB → ~24 GiB headroom (vs ~12 GiB at depth=32 — too tight
+                                     # under transient memory spikes from concurrent rsyncs and the
+                                     # in-flight slot-pinning machinery in CubeRetentionRing). Cube
+                                     # cadence is 192 samples × 1.048576 ms = 201.3 ms, so depth=24
+                                     # buys 4.83 s retention; the legacy comment quoted t_det=192/192
+                                     # (cube=cadence, no overlap) where each slot was 855 MiB — the
+                                     # current op-point uses t_det=256 (with 64-sample overlap), which
+                                     # bumps slot size by 33 % and is reflected in the new headroom math.
+                                     # M7.6-mem (2026-05-31): the rxring cut (t_buf 32768→8192 = 39→9.8 GiB)
+                                     # remains the dominant safety margin; depth was capped at 16 then to
+                                     # play it safe during commissioning. The 2026-06-07 too_late stalls
+                                     # justify the bump now that we have steady-state working-set numbers
+                                     # (avail 56–61 GiB at depth=16). Drop toward 8 if a future op-point
+                                     # needs the RAM ("discard rather than buffer").
   merger:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index
@@ -483,6 +488,19 @@ c1:
   uploader:
     remote_root: ubuntu@lxd110h23.pro.pvt:/dataz/dsa110/candidates   # FQDN: search nodes can't resolve bare 'lxd110h23'
     bandwidth_limit_kbps: 0          # 0 = unlimited
+    # T5 (2026-06-07): per-process upload concurrency cap. Each search
+    # half spawns one rsync per cube_dump completion; without a cap,
+    # 4 nodes × 2 halves × C2's worst-case 6-events/60-s window can
+    # put 48 concurrent rsyncs on the corr-net, starving SNAP ingress
+    # and feeding back into σ_k inflation (the closed-loop failure
+    # mode behind the 2026-06-07 search-side detector freezes). The
+    # bounded uploader holds at most ``max_concurrent`` simultaneous
+    # rsyncs per half (=> fleet-wide 8 concurrent at default 1) and
+    # queues the rest up to ``queue_maxsize`` (oldest-evicting on a
+    # full queue, so newer events are preferred during sustained
+    # backlog).
+    max_concurrent: 1
+    queue_maxsize: 8
 
 # Cube geometry knobs shared with the merger block. The merger reads
 # ``cube.sample_period_specnum`` as the default for
@@ -535,6 +553,19 @@ detector:
   # still gaussian, so we want σ_k to keep learning).
   layer2_valid_min_fraction: 0.9
   layer2_sigma_floor: 0.5
+  # T1 (2026-06-07): per-kernel upper-bound clamp on the σ_k EMA
+  # update. Without it, a single high-energy cube (bright RFI, an
+  # over-fluence calibration probe, a merger glitch) inflates σ_k
+  # and the τ_s≈30 s relaxation suppresses every detection on that
+  # half for ~30 s — the "candidate counter freeze" failure mode
+  # observed 2026-06-07 after a dump-storm + manual cal-probe
+  # burst. With sigma_max_ratio=4.0 the post-EMA σ_k can never
+  # rise more than 4× above the previous cube's value (offending
+  # kernels' updates are rejected; n_clamped_high counter rolls
+  # up to /mon/search_rt/<cn>/noise/<g>). Bounds the freeze
+  # duration after an anomalous cube to a single sample. Set to
+  # 0.0 to disable (preserve bit-for-bit legacy behaviour).
+  layer2_sigma_max_ratio: 4.0
   # cube_cadence_s: 0.13421772
   # layer2_tau_s: 30.0
   # layer2_n_burnin: 8
