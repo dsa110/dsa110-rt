@@ -847,7 +847,8 @@ def control_inject_calibrate_post():
       dm_pc_cm3       float — required
       l_rad, m_rad    floats (default 0, boresight)
       width_samples   int (default 32)
-      fluence_jy_ms   float (default 100.0)
+      fluence_jy_ms   float (default DEFAULT_CALIBRATION_FLUENCE,
+                      0.01 Jy·ms after the 2026-06-09 rescale)
       profile         "gaussian" | "boxcar" (default gaussian)
       poll_timeout_s  float (default 30.0)
       chgroups        comma-separated ints (default all 16)

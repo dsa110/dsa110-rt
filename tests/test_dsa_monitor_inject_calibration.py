@@ -890,19 +890,94 @@ class TestFireCalibrationProbeWithLadder:
             inject_fn=inject_fn,
             dm_pc_cm3=500.0,
             width_samples=32,
-            fluence_jy_ms=100.0,
+            fluence_jy_ms=0.01,
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
             fluence_ladder=(1.0, 2.0, 4.0),
         )
-        # All 3 attempts should have fired (at 100, 200, 400 Jy·ms).
-        assert ladder_attempts == [100.0, 200.0, 400.0]
+        # All 3 attempts should have fired (at 0.01, 0.02, 0.04 Jy·ms
+        # — all below the saturation clamp).
+        assert ladder_attempts == [0.01, 0.02, 0.04]
         # All attempts should ultimately fail ``no_match`` since we
         # never actually seeded a match key.
         assert len(attempts) == 3
         assert all(not a.ok for a in attempts)
         assert all(a.reason.startswith("no_match") for a in attempts)
+
+    def test_ladder_clamps_to_max_probe_fluence_and_stops(self):
+        """2026-06-09 saturation guard: a base fluence above
+        ``max_probe_fluence`` is clamped, and the ladder does NOT
+        escalate past the clamp (every further attempt would refire
+        at the same fluence)."""
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        ladder_attempts: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            ladder_attempts.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(
+                store, inject_n_queued=len(ladder_attempts),
+            )
+            return good_inject(store, **kwargs)
+
+        def sleep_fn(s):
+            now[0] += s
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=32,
+            fluence_jy_ms=100.0,   # pre-2026-06-09 default: saturates
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        assert ladder_attempts == [ic.DEFAULT_MAX_PROBE_FLUENCE]
+        assert len(attempts) == 1
+        assert not attempts[0].ok
+
+    def test_ladder_sleeps_between_attempts(self):
+        """sigma_k-recovery delay: ladder attempt N>1 is preceded by a
+        ``ladder_step_delay_s`` sleep."""
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        ladder_attempts: List[float] = []
+        sleeps: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            ladder_attempts.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(
+                store, inject_n_queued=len(ladder_attempts),
+            )
+            return good_inject(store, **kwargs)
+
+        def sleep_fn(s):
+            sleeps.append(float(s))
+            now[0] += s
+
+        ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=32,
+            fluence_jy_ms=0.01,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            fluence_ladder=(1.0, 2.0),
+            ladder_step_delay_s=60.0,
+        )
+        assert ladder_attempts == [0.01, 0.02]
+        assert sleeps.count(60.0) == 1
 
     def test_partial_fan_out_aborts_ladder(self):
         store = FakeStore()

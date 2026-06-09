@@ -1002,8 +1002,10 @@ async function guardedStart(event) {
                 </div>
                 <div class="verb-row">
                     <label for="cal_fluence_jy_ms">probe fluence (Jy·ms)</label>
+                    <!-- 2026-06-09: post-5f1997d injector rescale; >~1
+                         Jy·ms saturates the search-side fp16 cubes. -->
                     <input type="number" id="cal_fluence_jy_ms" name="fluence_jy_ms"
-                           value="100" step="0.1" min="0.001" />
+                           value="0.01" step="0.001" min="0.000001" />
                 </div>
                 <div class="verb-row">
                     <label for="cal_profile">profile</label>

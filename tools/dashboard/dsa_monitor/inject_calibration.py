@@ -96,11 +96,18 @@ CALIBRATION_PREFIX: str = "/cnf/inject/snr_calibration/"
 DM_BUCKET_PC_CC: float = 50.0
 
 #: Default fluence used by an explicit calibration probe (Jy·ms).
-#: 100 Jy·ms with width 32 samples produces an injected voltage
-#: amplitude of √(100/32) ≈ 1.77 — well above the per-channel noise
-#: at the GPU input. The dashboard caller can override this in the
-#: form if the operator wants to titrate the calibration brightness.
-DEFAULT_CALIBRATION_FLUENCE: float = 100.0
+#:
+#: 2026-06-09 rescale: after the 5f1997d voltage-domain normalisation
+#: fix the injector is ~4 orders of magnitude "hotter" per Jy·ms than
+#: before — live-fleet sweeps show even 1 Jy·ms drives the search-side
+#: fp16 cubes into saturation (±65504 rails + sliding-mean ghost),
+#: while fluences in the 1e-3..1e-2 range land at SNR ~100-400
+#: (K ≈ 8000 at DM=500). 0.01 Jy·ms at width 32 targets SNR ≈ 140:
+#: comfortably above the ambient junk-candidate floor (SNR ≲ 45 near
+#: boresight) and far below both fp16 saturation and the matcher's
+#: 2000 σ ceiling. The dashboard caller can override this in the form
+#: if the operator wants to titrate the calibration brightness.
+DEFAULT_CALIBRATION_FLUENCE: float = 0.01
 
 #: Default probe width (native samples). 32 ≈ 1 ms; matches the
 #: typical FRB injected width in the M6 acceptance tests.
@@ -796,10 +803,28 @@ DEFAULT_SEARCH_MAX_AGE_S: float = 30.0
 #: Default SNR-ladder fluence multipliers for
 #: :func:`fire_calibration_probe_with_ladder`. The first attempt is at
 #: the requested ``fluence_jy_ms``; ``no_match`` falls back to ``×2``,
-#: then ``×4``. Bright probes punch through any latent C1 metering or
-#: noise-color de-rate without the operator having to hand-titrate
-#: fluence.
+#: then ``×4``. Escalating is only safe because the 2026-06-09 default
+#: fluence rescale (see :data:`DEFAULT_CALIBRATION_FLUENCE`) keeps
+#: even the ×4 step ~3 orders of magnitude below fp16 saturation;
+#: with the old 100 Jy·ms base the ladder drove probes deeper INTO
+#: saturation, which is why it never rescued a no_match.
 DEFAULT_FLUENCE_LADDER: Tuple[float, ...] = (1.0, 2.0, 4.0)
+
+#: Hard ceiling on any single laddered probe fluence (Jy·ms).
+#: Live-fleet sweeps (2026-06-09) show the search-side fp16 cube rails
+#: at ±65504 somewhere below ~1 Jy·ms; a saturated probe is useless
+#: for calibration (clipped SNR + a railed negative sliding-mean ghost
+#: that poisons the next ~1 s). The ladder clamps each attempt to this
+#: value and stops escalating once it is reached.
+DEFAULT_MAX_PROBE_FLUENCE: float = 0.2
+
+#: Pause between ladder attempts (seconds). A probe absorbed into the
+#: detector's sigma_k EMA locally inflates the noise estimate at its
+#: own (DM, pixel) for ~minutes; an immediate brighter refire at the
+#: SAME DM/position fights its predecessor's inflation. 60 s lets
+#: sigma_k partially recover (live sweeps showed back-to-back probes
+#: 45 s apart suppressing each other even at 10× the fluence).
+DEFAULT_LADDER_STEP_DELAY_S: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1047,8 @@ def fire_calibration_probe_with_ladder(
     cal_store: Optional[CalibrationStore] = None,
     health_check: bool = True,
     fluence_ladder: Iterable[float] = DEFAULT_FLUENCE_LADDER,
+    max_probe_fluence: float = DEFAULT_MAX_PROBE_FLUENCE,
+    ladder_step_delay_s: float = DEFAULT_LADDER_STEP_DELAY_S,
     fan_out_check_timeout_s: float = 5.0,
     time_fn: Any = time.time,
     sleep_fn: Any = time.sleep,
@@ -1054,6 +1081,14 @@ def fire_calibration_probe_with_ladder(
          (default ×1, ×2, ×4). The first ``ok=True`` wins; the result
          list contains every attempt for forensic auditing.
 
+         2026-06-09 saturation + sigma_k guards: every attempt's
+         fluence is clamped to ``max_probe_fluence`` (a saturated
+         probe clips its own SNR and leaves a railed sliding-mean
+         ghost), the ladder stops escalating once the clamp engages,
+         and ``ladder_step_delay_s`` is slept between attempts so the
+         previous probe's sigma_k inflation at the same (DM, pixel)
+         partially decays before the refire.
+    
     Returns a list of :class:`ProbeResult` (one per attempt). The
     final entry is the operator-facing result. The list is intended
     for the audit trail / dashboard "calibration log" pane so the
@@ -1089,8 +1124,25 @@ def fire_calibration_probe_with_ladder(
     )
 
     results: List[ProbeResult] = []
+    clamp = float(max_probe_fluence)
     for step_idx, mult in enumerate(ladder):
+        if step_idx > 0 and ladder_step_delay_s > 0.0:
+            LOG.info(
+                "calibration ladder: sleeping %.0fs before attempt %d "
+                "(sigma_k recovery)",
+                float(ladder_step_delay_s), step_idx + 1,
+            )
+            sleep_fn(float(ladder_step_delay_s))
         attempt_fluence = float(fluence_jy_ms) * float(mult)
+        clamped = clamp > 0.0 and attempt_fluence > clamp
+        if clamped:
+            LOG.warning(
+                "calibration ladder: attempt %d fluence %.4g Jy*ms "
+                "exceeds max_probe_fluence=%.4g; clamping (saturation "
+                "guard)",
+                step_idx + 1, attempt_fluence, clamp,
+            )
+            attempt_fluence = clamp
         result = fire_calibration_probe(
             store,
             inject_fn=inject_fn,
@@ -1173,6 +1225,11 @@ def fire_calibration_probe_with_ladder(
             return results
         # Only retry on no_match; everything else is a hard fail.
         if not result.reason.startswith("no_match"):
+            return results
+        # Once the saturation clamp engages, escalating further is
+        # pointless (every subsequent attempt would fire at the same
+        # clamped fluence).
+        if clamped:
             return results
     return results
 
@@ -1337,6 +1394,8 @@ __all__ = [
     "DEFAULT_CORR_FAST_MAX_AGE_S",
     "DEFAULT_SEARCH_MAX_AGE_S",
     "DEFAULT_FLUENCE_LADDER",
+    "DEFAULT_MAX_PROBE_FLUENCE",
+    "DEFAULT_LADDER_STEP_DELAY_S",
     "LEGACY_BUCKET_INFIX",
     "CalibrationEntry",
     "CalibrationStore",
