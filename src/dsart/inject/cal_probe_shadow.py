@@ -60,11 +60,12 @@ the observed core).
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
 import time
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from dsart.coinc.inject_match import (
     ACTIVE_INJECT_PREFIX,
@@ -73,6 +74,33 @@ from dsart.coinc.inject_match import (
     DEFAULT_MIN_OBSERVED_SNR,
     ActiveInjection,
 )
+
+
+def _pairs_to_payloads(pairs: Iterable[Any]) -> List[Mapping[str, Any]]:
+    """Decode the ``(value, meta)`` pair iterable returned by
+    ``etcd3.Client.get_prefix`` into a flat list of dict payloads.
+
+    Bad rows (non-JSON, non-dict) are skipped silently — the dashboard
+    PUTs the active-inject registry, and a single malformed entry must
+    not poison the search-side cal-probe bypass. Returns an empty list
+    if the prefix has no live keys.
+    """
+    out: List[Mapping[str, Any]] = []
+    for value, _meta in pairs:
+        try:
+            if isinstance(value, (bytes, bytearray)):
+                payload = json.loads(value.decode("utf-8"))
+            elif isinstance(value, str):
+                payload = json.loads(value)
+            elif isinstance(value, Mapping):
+                payload = dict(value)
+            else:
+                continue
+        except Exception:                                       # noqa: BLE001
+            continue
+        if isinstance(payload, Mapping):
+            out.append(payload)
+    return out
 
 
 __all__ = [
@@ -257,18 +285,41 @@ class CalProbeShadow:
         return self._store
 
     def _refresh_now(self) -> None:
-        """Read the prefix from etcd and rebuild the snapshot."""
+        """Read the prefix from etcd and rebuild the snapshot.
+
+        :class:`dsautils.dsa_store.DsaStore` exposes only the per-key
+        ``get_dict``; bulk prefix reads go through the raw etcd3 client
+        via ``store.get_etcd().get_prefix(...)`` (this is the same
+        pattern :class:`dsart.coinc.inject_match.InjectionMatcher` uses).
+        Tests can hand us either:
+
+        * a real ``DsaStore``-like object exposing ``get_etcd()`` →
+          etcd3 client with ``get_prefix(prefix)`` yielding
+          ``(value, meta)`` pairs (value is JSON bytes/str), OR
+        * a mock that exposes ``get_dict_prefix(prefix)`` directly
+          (legacy test shape; preserved so existing fixtures keep
+          working).
+        """
         store = self._ensure_store()
         if store is None:
             self._n_refresh_fail += 1
             return
+        raw = None
         try:
-            raw = store.get_dict_prefix(ACTIVE_INJECT_PREFIX)
+            if hasattr(store, "get_dict_prefix"):
+                # Test-fixture path: already-parsed mapping or iterable
+                # of dicts. Preserved so the unit tests don't need to
+                # know about the etcd3 client layout.
+                raw = store.get_dict_prefix(ACTIVE_INJECT_PREFIX)
+            else:
+                client = store.get_etcd()
+                pairs = list(client.get_prefix(ACTIVE_INJECT_PREFIX))
+                raw = _pairs_to_payloads(pairs)
         except Exception as exc:                                # noqa: BLE001
             self._n_refresh_fail += 1
             if not self._first_failure_logged:
                 _LOG.warning(
-                    "CalProbeShadow: get_dict_prefix(%s) failed: %s "
+                    "CalProbeShadow: get_prefix(%s) failed: %s "
                     "(subsequent failures silent)",
                     ACTIVE_INJECT_PREFIX, exc,
                 )
