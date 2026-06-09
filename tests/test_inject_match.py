@@ -456,7 +456,10 @@ class TestTryMatch:
             l_rad=0.0,
             m_rad=0.0,
             width_samples=32,
-            event_specnum=12345,
+            # Consistent with the default payload's apply_at=1_000_000
+            # specnums: expected arrival = 1_000_000 / 16 = 62_500
+            # search samples (the 2026-06-09 specnum-proximity gate).
+            event_specnum=62_500,
             kernel_id="k0",
             search_node_id=1,
             gpu_half=0,
@@ -683,6 +686,106 @@ class TestTryMatch:
             dm_pc_cc=146.0, l_rad=0.0, m_rad=0.0,
             width_samples=1, snr=60448.0,
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# Specnum-proximity gate (2026-06-09)
+# ---------------------------------------------------------------------------
+
+
+class TestSpecnumGate(TestTryMatch):
+    """The 2026-06-09 cross-attribution fix: a row only matches an
+    injection whose expected arrival (apply_at_specnum / 16) is within
+    ``specnum_tol_samples`` SEARCH samples of the row's event_specnum.
+
+    Reproduces the live-fleet failure: probes fired 30-50 s apart all
+    stayed inside the 60 s TTL, so one candidate was attributed to
+    every live inj_id (bogus K_inferred for all but the true one).
+    """
+
+    # Default payload: apply_at = 1_000_000 ⇒ expected sample 62_500.
+
+    def test_row_inside_window_matches(self):
+        m, _ = self._matcher()
+        # +1300 samples ≈ DM-2500 dispersion sweep; inside ±2048.
+        mr = m.try_match(**self._row_args(event_specnum=62_500 + 1_300))
+        assert mr is not None
+
+    def test_row_outside_window_rejected(self):
+        m, _ = self._matcher()
+        # ~42 s late (the live cross-attribution case) ⇒ rejected.
+        mr = m.try_match(**self._row_args(event_specnum=62_500 + 39_000))
+        assert mr is None
+        assert m.snapshot()["rows_rejected_specnum"] == 1
+
+    def test_concurrent_probes_attributed_separately(self):
+        """Two live probes 30 s apart: the candidate near probe bb's
+        arrival matches ONLY bb, even though aa is also unexpired."""
+        spp = 16
+        aa_apply, bb_apply = 1_000_000, 1_000_000 + 30 * 938 * spp
+        m, _ = self._matcher(
+            payloads={
+                ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                    inj_id="aa", dm=500.0, apply_at=aa_apply,
+                    fired_at=1_000.0, ttl=60.0,
+                ),
+                ACTIVE_INJECT_PREFIX + "bb": _make_inj_payload(
+                    inj_id="bb", dm=500.0, apply_at=bb_apply,
+                    fired_at=1_030.0, ttl=60.0,
+                ),
+            },
+            now=1_031.0,
+        )
+        mr = m.try_match(
+            **self._row_args(event_specnum=bb_apply // spp + 140),
+        )
+        assert mr is not None
+        assert mr.inj_id == "bb"
+        assert set(m.snapshot()["best"].keys()) == {"bb"}
+
+    def test_gate_disabled_with_none(self):
+        m, _ = self._matcher(specnum_tol_samples=None)
+        mr = m.try_match(**self._row_args(event_specnum=62_500 + 39_000))
+        assert mr is not None
+
+    def test_legacy_payload_without_specnum_skips_gate(self):
+        """apply_at_specnum <= 0 (legacy/manual rows) skips the gate."""
+        m, _ = self._matcher(
+            payloads={
+                ACTIVE_INJECT_PREFIX + "aa": _make_inj_payload(
+                    inj_id="aa", dm=500.0, apply_at=0,
+                    fired_at=1_000.0, ttl=60.0,
+                ),
+            },
+        )
+        mr = m.try_match(**self._row_args(event_specnum=999_999))
+        assert mr is not None
+
+    def test_matched_inj_id_applies_gate_when_specnum_given(self):
+        m, _ = self._matcher()
+        assert m.matched_inj_id(
+            dm_pc_cc=500.0, l_rad=0.0, m_rad=0.0,
+            width_samples=32, snr=20.0,
+            event_specnum=62_500 + 100,
+        ) == "aa"
+        assert m.matched_inj_id(
+            dm_pc_cc=500.0, l_rad=0.0, m_rad=0.0,
+            width_samples=32, snr=20.0,
+            event_specnum=62_500 + 39_000,
+        ) is None
+        # No specnum supplied (legacy callers): gate skipped.
+        assert m.matched_inj_id(
+            dm_pc_cc=500.0, l_rad=0.0, m_rad=0.0,
+            width_samples=32, snr=20.0,
+        ) == "aa"
+
+    def test_bad_tol_raises(self):
+        with pytest.raises(ValueError):
+            InjectionMatcher(store=FakeStore(), specnum_tol_samples=0.0)
+        with pytest.raises(ValueError):
+            InjectionMatcher(
+                store=FakeStore(), specnums_per_search_sample=0,
+            )
 
 
 # ---------------------------------------------------------------------------

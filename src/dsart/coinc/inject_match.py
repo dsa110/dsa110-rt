@@ -42,7 +42,20 @@ A C1 row matches an :class:`ActiveInjection` when
      bright replay injections), AND
 
   4. The injection has not yet expired
-     (``now_unix - inj.fired_at_unix < inj.ttl_s``).
+     (``now_unix - inj.fired_at_unix < inj.ttl_s``), AND
+
+  5. (2026-06-09) the row's ``event_specnum`` (SEARCH samples) lies
+     within ``specnum_tol_samples`` of the injection's expected
+     arrival ``apply_at_specnum / specnums_per_search_sample``. The
+     60 s TTL alone is far too coarse: probes fired ~30-50 s apart
+     all stayed "active" simultaneously, so a single candidate was
+     attributed to EVERY live ``inj_id`` (and unrelated candidates
+     up to a TTL away were attributed to probes that never produced
+     them), poisoning every K_inferred but the true one. ±2048
+     search samples (~2.2 s) comfortably covers the full dispersion
+     sweep at DM 2500 (~1300 samples) + pipeline jitter while
+     rejecting anything from a different probe. Rows/injections
+     without usable specnums (≤ 0) skip the gate (legacy payloads).
 
 Width is deliberately NOT a match criterion: the injection
 ``width_samples`` is in NATIVE samples (32.768 µs) while the C1 row's
@@ -112,6 +125,8 @@ __all__ = [
     "DEFAULT_MIN_OBSERVED_SNR",
     "DEFAULT_REGISTRY_REFRESH_S",
     "DEFAULT_HISTORY_DEPTH",
+    "DEFAULT_SPECNUM_TOL_SAMPLES",
+    "DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE",
     "ActiveInjection",
     "MatchResult",
     "compute_k_inferred",
@@ -168,6 +183,21 @@ DEFAULT_REGISTRY_REFRESH_S: float = 1.0
 #: ~32-sample-wide injection typically produces 1-4 candidates as it
 #: sweeps through cubes) and keeps the etcd payload under 8 KB.
 DEFAULT_HISTORY_DEPTH: int = 16
+
+#: Specnum-proximity gate half-width, in SEARCH samples (~1.05 ms each).
+#: A C1 row only matches an injection when its ``event_specnum`` lies
+#: within this many search samples of the injection's expected arrival
+#: (``apply_at_specnum / specnums_per_search_sample``). 2048 samples
+#: ≈ 2.2 s: covers the DM-2500 dispersion sweep (~1300 samples) plus
+#: cube-cadence/pipeline jitter, while cleanly separating probes fired
+#: ≥ 30 s (~28k samples) apart that the TTL window alone conflated.
+DEFAULT_SPECNUM_TOL_SAMPLES: float = 2048.0
+
+#: Unit conversion: corr-side specnums per SEARCH sample. One specnum
+#: = 2 native samples (65.536 µs); one search sample = 32 native
+#: samples ⇒ 16 specnums. ``ActiveInjection.apply_at_specnum`` is in
+#: specnums; C1 ``event_specnum`` is in search samples.
+DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE: int = 16
 
 #: Grace period beyond ``ttl_s`` before the matcher actively deletes an
 #: expired ``/cnf/inject/active/<inj_id>`` row from etcd.
@@ -440,6 +470,10 @@ class InjectionMatcher:
         max_observed_snr: float = DEFAULT_MAX_OBSERVED_SNR,
         min_observed_snr: float = DEFAULT_MIN_OBSERVED_SNR,
         history_depth: int = DEFAULT_HISTORY_DEPTH,
+        specnum_tol_samples: Optional[float] = DEFAULT_SPECNUM_TOL_SAMPLES,
+        specnums_per_search_sample: int = (
+            DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE
+        ),
         time_fn: Any = time.time,
         active_inject_prefix: str = ACTIVE_INJECT_PREFIX,
         expiry_grace_s: Optional[float] = DEFAULT_EXPIRY_GRACE_S,
@@ -465,6 +499,16 @@ class InjectionMatcher:
             )
         if history_depth < 1:
             raise ValueError(f"history_depth={history_depth} must be >= 1")
+        if specnum_tol_samples is not None and specnum_tol_samples <= 0.0:
+            raise ValueError(
+                f"specnum_tol_samples={specnum_tol_samples} must be "
+                f"positive or None (None disables the gate)"
+            )
+        if specnums_per_search_sample < 1:
+            raise ValueError(
+                f"specnums_per_search_sample={specnums_per_search_sample} "
+                f"must be >= 1"
+            )
         if expiry_grace_s is not None and float(expiry_grace_s) < 0.0:
             raise ValueError(
                 f"expiry_grace_s={expiry_grace_s} must be >= 0 or None"
@@ -476,6 +520,11 @@ class InjectionMatcher:
         self._max_observed_snr = float(max_observed_snr)
         self._min_observed_snr = float(min_observed_snr)
         self._history_depth = int(history_depth)
+        self._specnum_tol_samples: Optional[float] = (
+            None if specnum_tol_samples is None
+            else float(specnum_tol_samples)
+        )
+        self._specnums_per_search_sample = int(specnums_per_search_sample)
         self._time = time_fn
         self._active_inject_prefix = str(active_inject_prefix)
         self._expiry_grace_s: Optional[float] = (
@@ -490,6 +539,7 @@ class InjectionMatcher:
         # Counters — exposed via snapshot() for the coincidencer mon-points.
         self._n_rows_checked: int = 0
         self._n_rows_rejected_quality: int = 0
+        self._n_rows_rejected_specnum: int = 0
         self._n_matches: int = 0
         self._n_best_improved: int = 0
         self._n_publish_ok: int = 0
@@ -648,6 +698,7 @@ class InjectionMatcher:
                 l_rad=l_rad,
                 m_rad=m_rad,
                 width_samples=width_samples,
+                event_specnum=event_specnum,
             ):
                 continue
             K = compute_k_inferred(
@@ -691,14 +742,17 @@ class InjectionMatcher:
         m_rad: float,
         width_samples: Optional[int] = None,
         snr: Optional[float] = None,
+        event_specnum: Optional[int] = None,
     ) -> Optional[str]:
         """Return the best-quality matching ``inj_id`` (no publish).
 
         Cheap, side-effect-free helper used by the coincidencer to
         stamp the C1 CSV's ``inj_id`` column. When ``width_samples``
         and ``snr`` are both supplied (production path), the same
-        width/SNR gates and quality ordering as :meth:`try_match`
-        apply; otherwise only DM + l/m are checked (legacy/tests).
+        width/SNR/specnum gates and quality ordering as
+        :meth:`try_match` apply (``event_specnum=None`` skips the
+        specnum gate); otherwise only DM + l/m are checked
+        (legacy/tests).
         """
         now = float(self._time())
         use_quality = width_samples is not None and snr is not None
@@ -717,6 +771,9 @@ class InjectionMatcher:
                     l_rad=l_rad,
                     m_rad=m_rad,
                     width_samples=int(width_samples),  # type: ignore[arg-type]
+                    event_specnum=(
+                        0 if event_specnum is None else int(event_specnum)
+                    ),
                 ):
                     continue
             elif not self._row_matches_dm_lm(
@@ -792,6 +849,11 @@ class InjectionMatcher:
             "best": best,
             "rows_checked": int(self._n_rows_checked),
             "rows_rejected_quality": int(self._n_rows_rejected_quality),
+            "rows_rejected_specnum": int(self._n_rows_rejected_specnum),
+            "specnum_tol_samples": (
+                None if self._specnum_tol_samples is None
+                else float(self._specnum_tol_samples)
+            ),
             "matches": int(self._n_matches),
             "max_observed_snr": float(self._max_observed_snr),
             "min_observed_snr": float(self._min_observed_snr),
@@ -832,6 +894,32 @@ class InjectionMatcher:
             return False
         return lm_dist <= self._lm_tol_rad
 
+    def _row_matches_specnum(
+        self,
+        *,
+        inj: ActiveInjection,
+        event_specnum: int,
+    ) -> bool:
+        """Specnum-proximity gate (2026-06-09).
+
+        True iff the row's ``event_specnum`` (SEARCH samples) lies
+        within ``specnum_tol_samples`` of the injection's expected
+        arrival. Permissive when the gate is disabled or either side
+        lacks a usable specnum (≤ 0 — legacy payloads / unit tests).
+        """
+        if self._specnum_tol_samples is None:
+            return True
+        if inj.apply_at_specnum <= 0 or event_specnum <= 0:
+            return True
+        expected = (
+            float(inj.apply_at_specnum)
+            / float(self._specnums_per_search_sample)
+        )
+        return (
+            abs(float(event_specnum) - expected)
+            <= self._specnum_tol_samples
+        )
+
     def _row_qualifies(
         self,
         *,
@@ -841,8 +929,9 @@ class InjectionMatcher:
         l_rad: float,
         m_rad: float,
         width_samples: int,
+        event_specnum: int = 0,
     ) -> bool:
-        """Full match gate: DM/l/m proximity + SNR band.
+        """Full match gate: DM/l/m proximity + SNR band + specnum window.
 
         Note on width: the injection ``width_samples`` is in NATIVE
         samples (32.768 µs) while the C1/detector ``width_samples`` is
@@ -869,6 +958,11 @@ class InjectionMatcher:
             return False
         if snr_f < self._min_observed_snr or snr_f > self._max_observed_snr:
             self._n_rows_rejected_quality += 1
+            return False
+        if not self._row_matches_specnum(
+            inj=inj, event_specnum=event_specnum,
+        ):
+            self._n_rows_rejected_specnum += 1
             return False
         return True
 
