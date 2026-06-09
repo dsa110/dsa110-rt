@@ -1,26 +1,26 @@
 """Static-sky snapshot exporter (corr → h23 sky monitor).
 
 E2E correctness test 1 ("always seeing the sky"): every
-``interval_s`` seconds, snapshot the slot-0 :class:`StaticSkyEMA`
-running mean — the corr node's live estimate of the static-sky
+``interval_s`` seconds, snapshot the slot-0 :class:`StaticSkyMean`
+window mean — the corr node's live estimate of the static-sky
 gridded visibilities, in exactly the UV geometry the search-side
 imager uses — and HTTP-POST it to the h23 dashboard's
 ``/sky/ingest`` endpoint. h23 combines the 16 chgroup snapshots
 into one dirty image and serves a scrubbable greyscale movie on
 the Sky tab.
 
-Why slot 0: the per-coarse-DM EMA states differ only in the
+Why slot 0: the per-coarse-DM window states differ only in the
 stage-1 dedispersion shifts applied upstream; a static continuum
 source is constant in time, so its time-averaged gridded
 visibility is the same in every slot. Slot 0 (lowest coarse DM,
 smallest shifts) is the cleanest choice.
 
-EMA timescale: ``apply()`` runs once per fada block (134.218 ms)
-per slot, with ``alpha = 0.001`` → half-life ``0.69/alpha ≈ 693``
-blocks ≈ **93 s** (time constant 1/alpha = 1000 blocks ≈ 134 s).
-A 30 s export cadence therefore samples the EMA ~3× per half-life;
-adjacent movie frames are correlated, which is what you want for a
-"is the sky still there" monitor.
+Averaging timescale (2026-06-09 fix): the static-sky estimate is a
+strict sliding boxcar over the past ``window_blocks`` cubes
+(default 8 × 134.218 ms ≈ **1.07 s**), kept short relative to the
+~6.9 s/2π max core-baseline fringe rate so the estimate stays
+coherent with the winding sky. Each 30 s movie frame is therefore
+a ~1 s sky snapshot, not a long average.
 
 Hot-path safety contract
 ========================
@@ -29,7 +29,7 @@ Hot-path safety contract
   loop. In the common case (interval not yet elapsed) it is a
   single ``time.monotonic()`` compare — nanoseconds.
 * On an export tick the only main-thread work is one D2H copy of
-  the ``(N_filled,)`` complex64 EMA (~40 KB → sub-ms) plus an
+  the ``(N_filled,)`` complex64 window mean (~40 KB → sub-ms) plus an
   in-memory npz serialise (~100 µs). The HTTP POST happens on a
   daemon worker thread with a bounded queue; if the worker is
   behind (h23 slow/down) the snapshot is dropped, never queued
@@ -38,12 +38,12 @@ Hot-path safety contract
   down dashboard doesn't spam the corr_fast log at 2 lines/min
   forever.
 
-Snapshot-consistency note: in the 3-stream pipeliner the EMA
-tensor is updated on the dedisp stream while we read it from the
-main thread without a sync. A torn read mixes values that differ
-by at most one ``alpha = 0.1%`` blend step — irrelevant for a
-monitoring image, and not worth a cross-stream sync on the hot
-path.
+Snapshot-consistency note: in the 3-stream pipeliner the window
+state is updated on the dedisp stream while we read it from the
+main thread without a sync. A torn read mixes window sums that
+differ by at most one cube's contribution (~1/8 of the mean) —
+acceptable for a monitoring image, and not worth a cross-stream
+sync on the hot path.
 """
 from __future__ import annotations
 
@@ -60,7 +60,14 @@ from typing import Any, Optional
 
 import numpy as np
 
+from dsart.common.constants import NATIVE_SAMPLE_US
+from dsart.services.slow_corr_kernel import NPACKETS_PER_BLOCK
+
 LOG = logging.getLogger("dsart.sky_export")
+
+#: Seconds per fada block (134.218 ms) — converts window_blocks to
+#: the window_s stamped into snapshot metadata.
+BLOCK_S: float = NPACKETS_PER_BLOCK * NATIVE_SAMPLE_US * 1e-6
 
 #: Wire-format version stamped into every payload so the h23 ingest
 #: can reject snapshots from an incompatible corr build.
@@ -81,7 +88,7 @@ def build_snapshot_npz(
     """Serialise one chgroup sky snapshot to in-memory ``.npz`` bytes.
 
     Args:
-        vis: ``(N_filled,)`` complex64 — slot-0 EMA running mean.
+        vis: ``(N_filled,)`` complex64 — slot-0 static-sky window mean.
         ix_row, ix_col: ``(N_filled,)`` uint16 — grid (row, col) of
             each filled cell (:class:`SparsityPattern` contract).
         meta: JSON-serialisable scalars (chgroup, n_grid,
@@ -141,7 +148,7 @@ def parse_snapshot_npz(body: bytes) -> dict[str, Any]:
 
 
 class SkySnapshotExporter:
-    """Periodic, fail-soft EMA snapshot push (see module docstring).
+    """Periodic, fail-soft static-sky snapshot push (see module docstring).
 
     Args:
         url: h23 ingest endpoint, e.g.
@@ -161,8 +168,8 @@ class SkySnapshotExporter:
             antenna gains) so the 16-chgroup band sum is bandpass-
             flattened. 1.0 when no cal is loaded.
         timeout_s: per-POST HTTP timeout.
-        min_cubes_seen: suppress export until the slot-0 EMA has seen
-            at least this many cubes (a cold EMA is just the first
+        min_cubes_seen: suppress export until slot 0 has seen at
+            least this many cubes (a cold window is just the first
             cube — not a sky estimate). Default 64 (~8.6 s).
     """
 
@@ -229,7 +236,7 @@ class SkySnapshotExporter:
     def maybe_export(self, static_sky, *, block_n: int) -> bool:
         """Called once per block. Returns True iff a snapshot was taken.
 
-        ``static_sky`` is the :class:`StaticSkyEMA` (or None — no-op).
+        ``static_sky`` is the :class:`StaticSkyMean` (or None — no-op).
         Never raises; never blocks on network.
         """
         now = time.monotonic()
@@ -241,11 +248,12 @@ class SkySnapshotExporter:
             cubes_seen = int(static_sky.cubes_seen_for(0))
             if cubes_seen < self.min_cubes_seen:
                 return False
-            mean = static_sky._running_mean_per_dm[0]
+            mean = static_sky.running_mean_for(0)
             if mean is None:
                 return False
             self._last_export_monotonic = now
             vis = mean.detach().to("cpu", copy=True).numpy()
+            window_blocks = int(static_sky.window_blocks)
             meta = {
                 "chgroup": self.chgroup,
                 "hostname": self.hostname,
@@ -254,7 +262,8 @@ class SkySnapshotExporter:
                 "pattern_id": f"0x{self.pattern_id:016x}",
                 "dec_deg": self.dec_deg,
                 "amp_scale": self.amp_scale,
-                "alpha": float(static_sky.alpha),
+                "window_blocks": window_blocks,
+                "window_s": window_blocks * BLOCK_S,
                 "cubes_seen": cubes_seen,
                 "block_n": int(block_n),
                 "unix_ts": time.time(),

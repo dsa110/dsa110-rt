@@ -16,7 +16,7 @@ Implements the §8.M3 ``bench/static_sky_subtract.py`` line item:
     thereafter**.
 
 This bench wires the production
-:class:`dsart.services.corr_fast_integration.StaticSkyEMA` into the
+:class:`dsart.services.corr_fast_integration.StaticSkyMean` into the
 chunk-4 :func:`process_block` orchestrator and reports per-cube
 metrics over a synthetic block-stream that contains:
 
@@ -29,7 +29,7 @@ Pipeline
 ========
 
 1. Build a ``FastIntegrationConfig`` with ``static_sky_disabled=False``
-   and the requested ``static_sky_alpha``.
+   and the requested ``static_sky_window_s``.
 2. Run ``--n-blocks`` blocks through :func:`process_block`. Pre-burst
    blocks contain only the static continuum + thermal noise; the
    burst block adds a deterministic injection at one fast-vis tile.
@@ -51,7 +51,7 @@ CLI
         [--n-blocks 24] \\
         [--t-int-fast-native 32] \\
         [--n-grid 64] \\
-        [--alpha 0.05] \\
+        [--window-s 1.0] \\
         [--burst-block-idx 12] \\
         [--report-dir bench/reports/<UTC>/M3-static-sky] \\
         [--device auto]
@@ -60,8 +60,8 @@ References
 ==========
 
 * Plan §8.M3 line 2273 — ``bench/static_sky_subtract.py``.
-* :class:`dsart.services.corr_fast_integration.StaticSkyEMA` — the EMA
-  module under test.
+* :class:`dsart.services.corr_fast_integration.StaticSkyMean` — the
+  sliding-mean module under test.
 """
 
 from __future__ import annotations
@@ -179,7 +179,7 @@ class _StaticSkySummary:
     snr_lift_db: float
     snr_lift_db_target: float = 20.0
     snr_lift_db_pass: bool = False
-    alpha: float = 0.0
+    window_s: float = 0.0
     t_int_fast_us: float = 0.0
     n_grid: int = 0
     device: str = ""
@@ -219,7 +219,7 @@ def _write_report(
         ax0.set_xlabel("block index")
         ax0.set_ylabel("cint8 quant SNR proxy (dB)")
         ax0.set_title(
-            f"Static-sky subtract | α={summary.alpha:.4g} | "
+            f"Static-sky subtract | window={summary.window_s:.3g}s | "
             f"lift {summary.snr_lift_db:+.1f} dB "
             f"({'PASS' if summary.snr_lift_db_pass else 'INFO'} "
             f"vs ≥{summary.snr_lift_db_target:.0f} dB target)"
@@ -262,7 +262,7 @@ def _write_report(
 <p>{pass_label}: post-subtract per-cell quant-SNR proxy (median)
 improves by <b>{summary.snr_lift_db:+.1f} dB</b>
 (target ≥ {summary.snr_lift_db_target:.0f} dB).</p>
-<p><b>α</b>: {summary.alpha:.4g}
+<p><b>window</b>: {summary.window_s:.3g} s
 &nbsp;&nbsp;<b>n_blocks</b>: {summary.n_blocks}
 &nbsp;&nbsp;<b>t_int</b>: {summary.t_int_fast_us:.3f} µs
 &nbsp;&nbsp;<b>n_grid</b>: {summary.n_grid}
@@ -301,7 +301,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument("--n-grid", type=int, default=64)
-    p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument("--window-s", type=float, default=1.0)
     p.add_argument("--warmup-cubes", type=int, default=8)
     p.add_argument("--burst-block-idx", type=int, default=-1)
     p.add_argument(
@@ -347,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         rfi_enabled=False,                 # synthetic noise; flag fraction
                                            # would otherwise be ~100%
         static_sky_disabled=False,
-        static_sky_alpha=args.alpha,
+        static_sky_window_s=args.window_s,
         static_sky_warmup_cubes=args.warmup_cubes,
     )
     ctx = build_context(
@@ -355,9 +355,9 @@ def main(argv: list[str] | None = None) -> int:
         antpos_e=antpos_e, antpos_n=antpos_n,
     )
     LOG.info(
-        "ready: n_filled=%d alpha=%.4g warmup_cubes=%d t_int=%.3f µs",
+        "ready: n_filled=%d window_s=%.3g warmup_cubes=%d t_int=%.3f µs",
         ctx.gridder.pattern.n_filled,
-        ctx.cfg.static_sky_alpha,
+        ctx.cfg.static_sky_window_s,
         ctx.cfg.static_sky_warmup_cubes,
         args.t_int_fast_native * NATIVE_SAMPLE_US,
     )
@@ -423,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
         snr_post_db_p50=snr_post_p50,
         snr_lift_db=snr_lift,
         snr_lift_db_pass=bool(snr_lift >= 20.0),
-        alpha=args.alpha,
+        window_s=args.window_s,
         t_int_fast_us=args.t_int_fast_native * NATIVE_SAMPLE_US,
         n_grid=args.n_grid,
         device=str(device),

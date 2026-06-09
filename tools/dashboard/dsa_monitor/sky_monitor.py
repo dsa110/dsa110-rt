@@ -3,7 +3,9 @@ the 16 chgroups in the UV plane, image, and serve a scrubbable movie.
 
 E2E correctness test 1 ("always seeing the sky"). Each corr node's
 ``corr_fast`` (with ``--sky-export-url``) POSTs its slot-0
-:class:`StaticSkyEMA` running mean — ``(N_filled,)`` complex64 gridded
+:class:`StaticSkyMean` window mean (a ~1 s sliding boxcar, kept short
+relative to the ~6.9 s/2π max core fringe rate) — ``(N_filled,)``
+complex64 gridded
 visibilities plus the sparsity-pattern indices — to ``/sky/ingest``
 every 30 s. This module:
 

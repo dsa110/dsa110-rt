@@ -371,7 +371,7 @@ def burst_event_plot(name: str, plot_name: str):
 # ---------- Sky monitor (E2E test 1: "always seeing the sky") -------------
 #
 # Each corr node's corr_fast (--sky-export-url) POSTs its slot-0
-# StaticSkyEMA running mean every 30 s; sky_monitor combines the 16
+# StaticSkyMean ~1 s window mean every 30 s; sky_monitor combines the 16
 # chgroups in the UV plane, images, sigma-normalises, and writes
 # greyscale frames to /dataz/dsa110/operations/sky_monitor/. The /sky
 # tab serves a manual-refresh scrubbable movie (30 min default, 24 h

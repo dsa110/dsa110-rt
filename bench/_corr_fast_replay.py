@@ -581,7 +581,7 @@ class ReplayDefaults:
     cal_pol_swap: bool = False
     rfi_enabled: bool = False                                        # benches keep RFI off by default; brief covers
     static_sky_disabled: bool = False
-    static_sky_alpha: float = 0.001
+    static_sky_window_s: float = 1.0
     static_sky_warmup_cubes: int = 8
 
     def to_cfg(
@@ -602,7 +602,7 @@ class ReplayDefaults:
             cal_pol_swap=self.cal_pol_swap,
             flagants_path=flagants_path,
             rfi_enabled=self.rfi_enabled,
-            static_sky_alpha=self.static_sky_alpha,
+            static_sky_window_s=self.static_sky_window_s,
             static_sky_warmup_cubes=self.static_sky_warmup_cubes,
             static_sky_disabled=self.static_sky_disabled,
         )

@@ -40,7 +40,7 @@ from dsart.services.corr_fast_integration import (
     NoOpStage2Fifo,
     NoOpTransportTx,
     Stage1MultiDMCoarseDM,
-    StaticSkyEMA,
+    StaticSkyMean,
     apply_rfi_mask_to_voltages,
     build_context,
     process_block,
@@ -163,64 +163,105 @@ def test_apply_rfi_mask_all_flagged_zeros_everything() -> None:
 
 
 # ---------------------------------------------------------------------------
-# StaticSkyEMA
+# StaticSkyMean
 # ---------------------------------------------------------------------------
 
 
 def test_static_sky_cold_start_passthrough() -> None:
-    """First cube goes through unchanged; the EMA is initialised from it."""
-    ema = StaticSkyEMA(alpha=0.1, warmup_cubes=0)
+    """First cube goes through unchanged; the window is seeded from it."""
+    ssm = StaticSkyMean(window_blocks=4, warmup_cubes=0)
     cube = torch.complex(torch.ones(2, 5), torch.zeros(2, 5))            # (n_fv=2, N_filled=5)
-    out = ema.apply(cube)
+    out = ssm.apply(cube)
     assert torch.allclose(out, cube)
-    assert ema.cubes_seen == 1
+    assert ssm.cubes_seen == 1
 
 
 def test_static_sky_warmup_no_subtract() -> None:
-    """During warmup, the EMA is built but the cube is NOT subtracted."""
-    ema = StaticSkyEMA(alpha=0.5, warmup_cubes=3)
+    """During warmup, the window is built but the cube is NOT subtracted."""
+    ssm = StaticSkyMean(window_blocks=4, warmup_cubes=3)
     for i in range(3):
         cube = torch.complex(
             torch.full((1, 4), float(i + 1)),
             torch.zeros(1, 4),
         )
-        out = ema.apply(cube)
+        out = ssm.apply(cube)
         # In warmup → output equals input (modulo cold-start clone).
         assert torch.allclose(out, cube)
-    assert ema.cubes_seen == 3
-    assert not ema.in_warmup
+    assert ssm.cubes_seen == 3
+    assert not ssm.in_warmup
 
 
 def test_static_sky_subtracts_after_warmup() -> None:
-    """After warmup, EMA is subtracted from each new cube."""
-    ema = StaticSkyEMA(alpha=0.001, warmup_cubes=2)
+    """After warmup, the past-window mean is subtracted from each new cube."""
+    ssm = StaticSkyMean(window_blocks=4, warmup_cubes=2)
     constant_value = 5.0 + 3.0j
     constant = torch.full((1, 4), constant_value, dtype=torch.complex64)
     for _ in range(2):
-        ema.apply(constant)
-    # Now in subtract mode. EMA ≈ 5+3j, so subtraction should be ~0.
-    out = ema.apply(constant)
+        ssm.apply(constant)
+    # Now in subtract mode. Past-window mean = 5+3j → subtraction ~0.
+    out = ssm.apply(constant)
     assert torch.allclose(out, torch.zeros_like(out), atol=1e-4)
 
 
-def test_static_sky_disabled_via_apply_false() -> None:
-    """Construction with alpha out of (0, 1] raises."""
-    with pytest.raises(ValueError, match="alpha"):
-        StaticSkyEMA(alpha=0.0)
-    with pytest.raises(ValueError, match="alpha"):
-        StaticSkyEMA(alpha=1.5)
+def test_static_sky_window_is_strictly_bounded() -> None:
+    """The subtracted mean covers ONLY the past ``window_blocks`` cubes —
+    older history is fully evicted (this is the 2026-06-09 fringe-rate
+    fix: the old EMA never forgot)."""
+    ssm = StaticSkyMean(window_blocks=2, warmup_cubes=0)
+    def cube(v: float) -> torch.Tensor:
+        return torch.full((1, 3), v, dtype=torch.complex64)
+    ssm.apply(cube(100.0))                    # cold seed (will be evicted)
+    ssm.apply(cube(2.0))
+    ssm.apply(cube(4.0))                      # evicts the 100.0 cube
+    # Window now holds {2.0, 4.0} → mean 3.0; the 100.0 must be gone.
+    out = ssm.apply(cube(10.0))
+    assert torch.allclose(out, cube(10.0 - 3.0), atol=1e-5)
+
+
+def test_static_sky_subtraction_is_causal() -> None:
+    """The current cube is excluded from its own subtracted mean — a
+    burst arriving now must not subtract itself."""
+    ssm = StaticSkyMean(window_blocks=4, warmup_cubes=1)
+    base = torch.full((1, 3), 1.0 + 0.0j, dtype=torch.complex64)
+    ssm.apply(base)
+    burst = torch.full((1, 3), 11.0 + 0.0j, dtype=torch.complex64)
+    out = ssm.apply(burst)
+    # Past mean is 1.0 (the burst itself contributes nothing).
+    assert torch.allclose(out, burst - base, atol=1e-5)
+
+
+def test_static_sky_running_mean_accessor() -> None:
+    """``running_mean_for`` (the sky-export feed) is the boxcar mean of
+    the cubes pushed so far, capped at window_blocks."""
+    ssm = StaticSkyMean(window_blocks=2, warmup_cubes=0)
+    assert ssm.running_mean_for(0) is None
+    for v in (2.0, 4.0, 6.0):
+        ssm.apply(torch.full((1, 3), v, dtype=torch.complex64))
+    # Window holds {4.0, 6.0} → mean 5.0.
+    mean = ssm.running_mean_for(0)
+    assert torch.allclose(
+        mean, torch.full((3,), 5.0 + 0.0j, dtype=torch.complex64),
+        atol=1e-5,
+    )
+
+
+def test_static_sky_constructor_validation() -> None:
+    with pytest.raises(ValueError, match="window_blocks"):
+        StaticSkyMean(window_blocks=0)
     with pytest.raises(ValueError, match="warmup_cubes"):
-        StaticSkyEMA(warmup_cubes=-1)
+        StaticSkyMean(warmup_cubes=-1)
+    with pytest.raises(ValueError, match="n_dm"):
+        StaticSkyMean(n_dm=0)
 
 
 def test_static_sky_input_validation() -> None:
-    ema = StaticSkyEMA()
+    ssm = StaticSkyMean()
     real_cube = torch.zeros(2, 4)
     with pytest.raises(TypeError, match="must be complex"):
-        ema.apply(real_cube)
+        ssm.apply(real_cube)
     bad_shape = torch.complex(torch.zeros(2, 4, 5), torch.zeros(2, 4, 5))
     with pytest.raises(ValueError, match="must be 2D"):
-        ema.apply(bad_shape)
+        ssm.apply(bad_shape)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +285,11 @@ def test_build_context_rfi_and_static_sky_enabled() -> None:
     ctx = _build_test_context(cfg)
     assert ctx.rfi_flagger is not None
     assert ctx.static_sky is not None
-    assert ctx.static_sky.alpha == cfg.static_sky_alpha
+    # window_s → whole blocks (134.218 ms each), min 1.
+    expected_blocks = max(
+        1, round(cfg.static_sky_window_s / 0.134217728),
+    )
+    assert ctx.static_sky.window_blocks == expected_blocks
     assert ctx.static_sky.warmup_cubes == cfg.static_sky_warmup_cubes
 
 
@@ -322,13 +367,13 @@ def test_process_block_with_rfi_enabled_returns_flag_result() -> None:
 
 
 def test_process_block_static_sky_subtracts_continuum() -> None:
-    """Run several blocks of the SAME synthetic raw → static-sky EMA
+    """Run several blocks of the SAME synthetic raw → static-sky mean
     learns the per-cell mean and subtracts it. The 4th cube (after
     warmup_cubes=3) should have magnitude << the 1st cube.
     """
     cfg = _make_cfg(
         static_sky_disabled=False,
-        static_sky_alpha=0.5,                                               # fast-learn for test
+        static_sky_window_s=1.0,
         static_sky_warmup_cubes=3,
     )
     ctx = _build_test_context(cfg)
@@ -1706,7 +1751,7 @@ def test_phase8_injection_is_applied_after_cal() -> None:
 
 
 class _ResettableStaticSky:
-    """Minimal StaticSkyEMA stand-in recording reset() calls."""
+    """Minimal StaticSkyMean stand-in recording reset() calls."""
 
     def __init__(self) -> None:
         self.reset_calls = 0

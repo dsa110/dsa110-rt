@@ -57,7 +57,7 @@ CLI:
         [--flagants /path/to/flagants.dat]
         [--n-grid 256]
         [--kernel-support 1]
-        [--static-sky-alpha 0.001]
+        [--static-sky-window-s 1.0]
         [--static-sky-disabled]
         [--n-fv-chunk N]               # F31b: bound peak GPU memory
         [--output-dir /tmp/dsart-fast-grid]
@@ -77,7 +77,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Optional, Protocol
+from typing import Any, ClassVar, Final, Optional, Protocol
 
 import numpy as np
 import torch
@@ -996,75 +996,96 @@ class Stage1MultiDMCoarseDM:
 
 
 # ---------------------------------------------------------------------------
-# Static-sky EMA subtraction
+# Static-sky sliding-mean subtraction
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class StaticSkyEMA:
-    """Per-cell exponential moving average of the gridded cube.
+class StaticSkyMean:
+    """Per-cell sliding-window moving average of the gridded cube.
 
-    Subtracts the running mean from each new cube before forwarding,
-    then updates the running mean with the (post-subtraction) cube
-    blended in at rate ``alpha``.
+    Subtracts the mean of the previous ``window_blocks`` cubes from
+    each new cube before forwarding, then pushes the new cube's
+    per-cell mean into the window ring.
 
-    The EMA is computed in **complex** to preserve the F20-aligned
+    The mean is computed in **complex** to preserve the F20-aligned
     visibility phase; the subtraction is therefore complex too.
-    Continuum sources at fixed sky positions decorrelate to a
-    near-constant per-cell value across cubes (modulo Earth-rotation
-    fringe winding, which the F21 DEC-phase cal already partially
-    de-rotates), so the EMA learns + subtracts them.
+
+    Window-length physics (2026-06-09 fix): the original
+    implementation was an EMA with ``alpha = 0.001`` per 134 ms
+    block → ~134 s time constant. That is FAR longer than the
+    fastest core-baseline fringe winding (~6.9 s per 2π turn), so
+    the "static sky" estimate decorrelated against the live sky:
+    an EMA with time constant τ sees a fringing source attenuated
+    by ``1/√(1+(ωτ)²)`` and phase-lagged by ``atan(ωτ)`` — at
+    τ = 134 s and ω = 2π/6.9 s the estimate was essentially
+    uncorrelated noise, leaving the source largely UNsubtracted
+    (and smearing 2-minute-old sky into every cube). The fix is a
+    strict boxcar over only the past ~1 s (default 8 blocks =
+    1.07 s), short relative to the fringe winding, so the estimate
+    tracks the winding sky with high coherence.
 
     Multi-DM mode (M7.4 fix): set ``n_dm > 1`` to maintain ``n_dm``
-    independent EMA states. The :meth:`apply` ``dm_slot`` argument
-    selects which state to read+update. This is required when the
-    same EMA is fed multiple dedispersion trials in one block — a
-    single shared state would have each trial's residuals leak into
-    the others, leaving comparable burst energy in every trial.
+    independent window states. The :meth:`apply` ``dm_slot``
+    argument selects which state to read+update. This is required
+    when the same instance is fed multiple dedispersion trials in
+    one block — a single shared state would have each trial's
+    residuals leak into the others, leaving comparable burst energy
+    in every trial.
+
+    Implementation: per slot, a lazily-allocated ring buffer
+    ``(window_blocks, N_filled)`` complex64 on the data's device,
+    plus an incrementally-maintained running sum (add newest,
+    subtract evicted). The sum is recomputed exactly from the ring
+    every ``_RESUM_EVERY`` pushes to bound fp32 accumulation drift.
+    Memory: 8 × ~5k cells × 8 B × n_dm(8) ≈ 2.6 MB — negligible.
 
     Args:
-        alpha: EMA smoothing factor in (0, 1]. The EMA half-life is
-            ``ln(0.5) / ln(1-alpha) ≈ 0.69 / alpha`` cubes. Default
-            ``0.001`` → ~700-cube half-life (~7 s at 134 ms cube
-            cadence).
+        window_blocks: boxcar length in cubes (134.218 ms each).
+            Default 8 → 1.07 s, comfortably inside the ~6.9 s/2π
+            max core fringe rate.
         warmup_cubes: number of cubes at the start during which we
-            BUILD the EMA but do NOT subtract (so the first few
-            cubes are not artificially zeroed by the cold EMA).
-        n_dm: number of independent EMA states to keep. Default 1
-            (legacy single-DM path). Set to ``plan.n_coarse`` (or
+            BUILD the window but do NOT subtract (so the first few
+            cubes are not artificially zeroed by a half-empty
+            window).
+        n_dm: number of independent window states to keep. Default
+            1 (legacy single-DM path). Set to ``plan.n_coarse`` (or
             ``multi_dm.n_dm``) to make each dedispersion trial own
-            its own running mean. Backward-compatible: ``dm_slot=0``
-            with ``n_dm=1`` reproduces the legacy single-slot
-            behaviour bit-for-bit.
+            its own window.
     """
 
-    alpha: float = 0.001
+    window_blocks: int = 8
     warmup_cubes: int = 8
     n_dm: int = 1
 
-    _running_mean_per_dm: list = field(
-        default_factory=list, init=False, repr=False,
-    )
+    #: Recompute the running sum exactly from the ring every this
+    #: many pushes (per slot) to bound incremental fp32 drift.
+    _RESUM_EVERY: ClassVar[int] = 1024
+
+    _ring_per_dm: list = field(default_factory=list, init=False, repr=False)
+    _sum_per_dm: list = field(default_factory=list, init=False, repr=False)
+    _count_per_dm: list = field(default_factory=list, init=False, repr=False)
+    _head_per_dm: list = field(default_factory=list, init=False, repr=False)
     _cubes_seen_per_dm: list = field(
         default_factory=list, init=False, repr=False,
     )
 
     def __post_init__(self) -> None:
-        if not (0.0 < self.alpha <= 1.0):
+        if self.window_blocks < 1:
             raise ValueError(
-                f"StaticSkyEMA.alpha={self.alpha}, expected (0, 1]"
+                f"StaticSkyMean.window_blocks={self.window_blocks}, "
+                f"expected >= 1"
             )
         if self.warmup_cubes < 0:
             raise ValueError(
-                f"StaticSkyEMA.warmup_cubes={self.warmup_cubes}, "
+                f"StaticSkyMean.warmup_cubes={self.warmup_cubes}, "
                 f"expected >= 0"
             )
         if self.n_dm < 1:
             raise ValueError(
-                f"StaticSkyEMA.n_dm={self.n_dm}, expected >= 1"
+                f"StaticSkyMean.n_dm={self.n_dm}, expected >= 1"
             )
-        self._running_mean_per_dm = [None] * int(self.n_dm)
-        self._cubes_seen_per_dm = [0] * int(self.n_dm)
+        self.reset()
 
     @property
     def cubes_seen(self) -> int:
@@ -1083,63 +1104,95 @@ class StaticSkyEMA:
         return self.cubes_seen_for(dm_slot) < self.warmup_cubes
 
     def reset(self) -> None:
-        self._running_mean_per_dm = [None] * int(self.n_dm)
-        self._cubes_seen_per_dm = [0] * int(self.n_dm)
+        n = int(self.n_dm)
+        self._ring_per_dm = [None] * n
+        self._sum_per_dm = [None] * n
+        self._count_per_dm = [0] * n
+        self._head_per_dm = [0] * n
+        self._cubes_seen_per_dm = [0] * n
+
+    def running_mean_for(self, dm_slot: int = 0) -> "torch.Tensor | None":
+        """Current window mean ``(N_filled,)`` complex64, or None if
+        the slot has not seen any cubes yet. This is what the sky
+        exporter snapshots."""
+        slot = int(dm_slot)
+        count = int(self._count_per_dm[slot])
+        if count == 0:
+            return None
+        return self._sum_per_dm[slot] / count
 
     def apply(
         self, gridded: torch.Tensor, dm_slot: int = 0,
     ) -> torch.Tensor:
-        """Subtract the running mean from ``gridded`` and update the EMA.
+        """Subtract the past-window mean from ``gridded``, then push
+        ``gridded``'s per-cell mean into the window.
 
-        ``gridded`` is expected to be ``(n_fast_vis, N_filled)`` complex64
-        (the output of :meth:`FastVisGridder.compute`). The EMA is
-        kept at ``(N_filled,)`` complex64 — averaged over the
-        ``n_fast_vis`` axis on the way in, broadcast back on the way
-        out.
+        ``gridded`` is expected to be ``(n_fast_vis, N_filled)``
+        complex64 (the output of :meth:`FastVisGridder.compute`). The
+        window state is kept at ``(N_filled,)`` complex64 — averaged
+        over the ``n_fast_vis`` axis on the way in, broadcast back on
+        the way out. The subtracted mean EXCLUDES the current cube
+        (strictly causal), so a burst arriving now does not subtract
+        itself.
 
-        ``dm_slot``: which of ``n_dm`` independent EMA states to
-        read+update. Default 0 for backwards-compat with the
-        legacy single-DM call sites.
+        ``dm_slot``: which of ``n_dm`` independent window states to
+        read+update. Default 0 for backwards-compat with the legacy
+        single-DM call sites.
         """
         if not gridded.is_complex():
             raise TypeError(
-                f"StaticSkyEMA.apply: gridded must be complex; got "
+                f"StaticSkyMean.apply: gridded must be complex; got "
                 f"{gridded.dtype}"
             )
         if gridded.ndim != 2:
             raise ValueError(
-                f"StaticSkyEMA.apply: gridded must be 2D "
+                f"StaticSkyMean.apply: gridded must be 2D "
                 f"(n_fast_vis, N_filled); got "
                 f"{tuple(gridded.shape)}"
             )
         slot = int(dm_slot)
         if slot < 0 or slot >= self.n_dm:
             raise IndexError(
-                f"StaticSkyEMA.apply: dm_slot={slot} out of range "
+                f"StaticSkyMean.apply: dm_slot={slot} out of range "
                 f"[0, {self.n_dm})"
             )
 
         per_cell_mean = gridded.mean(dim=0)                              # (N_filled,)
-        running_mean = self._running_mean_per_dm[slot]
+        ring = self._ring_per_dm[slot]
+        if ring is None:
+            ring = torch.zeros(
+                (int(self.window_blocks), per_cell_mean.shape[0]),
+                dtype=per_cell_mean.dtype, device=per_cell_mean.device,
+            )
+            self._ring_per_dm[slot] = ring
+            self._sum_per_dm[slot] = torch.zeros_like(per_cell_mean)
+
+        count = int(self._count_per_dm[slot])
         cubes_seen = int(self._cubes_seen_per_dm[slot])
 
-        if running_mean is None:
-            self._running_mean_per_dm[slot] = per_cell_mean.clone().detach()
-            out = gridded.clone()                                        # cold start: pass through
-        elif cubes_seen < self.warmup_cubes:
-            out = gridded.clone()                                        # build EMA, don't subtract
-            self._running_mean_per_dm[slot] = (
-                (1.0 - self.alpha) * running_mean
-                + self.alpha * per_cell_mean
-            )
+        # 1. Subtract the mean of the PAST window (excluding this cube).
+        if count == 0 or cubes_seen < self.warmup_cubes:
+            out = gridded.clone()                                        # warmup: pass through
         else:
-            out = gridded - running_mean.unsqueeze(0)                    # subtract, then update
-            self._running_mean_per_dm[slot] = (
-                (1.0 - self.alpha) * running_mean
-                + self.alpha * per_cell_mean
-            )
+            out = gridded - (self._sum_per_dm[slot] / count).unsqueeze(0)
+
+        # 2. Push this cube's per-cell mean into the ring.
+        head = int(self._head_per_dm[slot])
+        if count == self.window_blocks:
+            self._sum_per_dm[slot] -= ring[head]                         # evict oldest
+        else:
+            self._count_per_dm[slot] = count + 1
+        ring[head] = per_cell_mean.detach()
+        self._sum_per_dm[slot] += per_cell_mean.detach()
+        self._head_per_dm[slot] = (head + 1) % int(self.window_blocks)
 
         self._cubes_seen_per_dm[slot] = cubes_seen + 1
+        # 3. Bound incremental fp32 drift: exact re-sum periodically.
+        if self._cubes_seen_per_dm[slot] % self._RESUM_EVERY == 0:
+            n_valid = int(self._count_per_dm[slot])
+            self._sum_per_dm[slot] = ring[:n_valid].sum(dim=0) if (
+                n_valid < self.window_blocks
+            ) else ring.sum(dim=0)
         return out
 
 
@@ -1227,10 +1280,14 @@ class FastIntegrationConfig:
         rfi_enabled: kill-switch for the whole RFI flagger stage
             (default True). Useful for synth-data tests where the RFI
             flagger would mistake injected signals for narrowband CW.
-        static_sky_alpha / static_sky_warmup_cubes / static_sky_disabled:
-            EMA controls. ``static_sky_disabled=True`` is a kill-
-            switch (useful for tests + the chunk-5 0319 continuum
-            bench where the brightest source IS the static sky).
+        static_sky_window_s / static_sky_warmup_cubes / static_sky_disabled:
+            sliding-mean controls. ``static_sky_window_s`` is the
+            boxcar length in seconds (converted to whole 134 ms
+            blocks at build time; default 1.0 s ≈ 8 blocks — must
+            stay well under the ~6.9 s/2π max core fringe rate).
+            ``static_sky_disabled=True`` is a kill-switch (useful
+            for tests + the chunk-5 0319 continuum bench where the
+            brightest source IS the static sky).
         rfi_mask_voltage_zero_fill: route RFI mask through the
             voltage zero-fill (default True). Set to False for tests
             that want to verify the RFI flagger fired without
@@ -1283,7 +1340,7 @@ class FastIntegrationConfig:
     rfi_m_values: tuple[int, ...] | None = None
     rfi_warmup_cubes: int | None = None
     rfi_sumthr_enabled: bool = True
-    static_sky_alpha: float = 0.001
+    static_sky_window_s: float = 1.0
     static_sky_warmup_cubes: int = 8
     static_sky_disabled: bool = False
     dm_plan_path: Path | None = None
@@ -1444,7 +1501,7 @@ class IntegrationContext:
     cal: FastCorrCalTensors | None
     rfi_flagger: RFIFlagger | None
     gridder: FastVisGridder
-    static_sky: StaticSkyEMA | None
+    static_sky: StaticSkyMean | None
 
     coarse_dm: CoarseDMStage = field(default_factory=NoOpCoarseDM)
     stage2_fifo: Stage2FifoStage = field(default_factory=NoOpStage2Fifo)
@@ -1642,7 +1699,7 @@ def process_block(
               full-block at ``t_int_fast_native=8``) so the pipeline
               fits on the 11 GB 2080Ti production GPU.
         7. FastVisGridder.compute → (n_fv, N_filled) complex64
-        8. StaticSkyEMA.apply (if cfg.static_sky_disabled is False)
+        8. StaticSkyMean.apply (if cfg.static_sky_disabled is False)
         9. coarse_dm.dedisperse → (N_DM, n_fv, N_filled)
        10. stage2_fifo.push → list[evictees]
        11. transport_tx.transmit → n_sent
@@ -2725,7 +2782,7 @@ def build_context(
     # benches that synthesise a custom plan (e.g. chunk-6 single-DM
     # burst, chunk-9 throughput).
     #
-    # M7.4 fix: we load the plan *before* the StaticSkyEMA so the EMA
+    # M7.4 fix: we load the plan *before* the StaticSkyMean so it
     # can be sized with one independent state per coarse-DM trial
     # (``n_dm=plan.n_coarse``). The pre-M7.4 single-slot EMA leaked
     # residuals across DM trials and made bursts appear at comparable
@@ -2790,23 +2847,28 @@ def build_context(
             cfg.sliding_window, multi_dm.dm_chunk_size,
         )
 
-    # StaticSkyEMA — one independent state per coarse-DM trial when
+    # StaticSkyMean — one independent state per coarse-DM trial when
     # the multi-DM path is active; legacy single-DM path uses one
-    # slot (the default). See class docstring for the M7.4 motivation.
+    # slot (the default). See class docstring for the M7.4 motivation
+    # and the 2026-06-09 ~1 s window-length physics.
     n_static_sky_slots = int(multi_dm.n_dm) if multi_dm is not None else 1
-    static_sky: StaticSkyEMA | None = None
+    static_sky: StaticSkyMean | None = None
     if not cfg.static_sky_disabled:
-        static_sky = StaticSkyEMA(
-            alpha=cfg.static_sky_alpha,
+        block_s = NPACKETS_PER_BLOCK * NATIVE_SAMPLE_US * 1e-6
+        window_blocks = max(1, round(float(cfg.static_sky_window_s) / block_s))
+        static_sky = StaticSkyMean(
+            window_blocks=window_blocks,
             warmup_cubes=cfg.static_sky_warmup_cubes,
             n_dm=n_static_sky_slots,
         )
         LOG.info(
-            "StaticSkyEMA ready: alpha=%.4g warmup_cubes=%d n_dm=%d",
-            static_sky.alpha, static_sky.warmup_cubes, static_sky.n_dm,
+            "StaticSkyMean ready: window=%.2fs (%d blocks) "
+            "warmup_cubes=%d n_dm=%d",
+            window_blocks * block_s, window_blocks,
+            static_sky.warmup_cubes, static_sky.n_dm,
         )
     else:
-        LOG.info("StaticSkyEMA DISABLED (cfg.static_sky_disabled=True)")
+        LOG.info("StaticSkyMean DISABLED (cfg.static_sky_disabled=True)")
 
     injector: OnlineInjector | None = None
     if cfg.inject_configs or cfg.inject_watch_enabled:
@@ -3478,7 +3540,7 @@ def run(
             )
 
         # ── E2E test 1: static-sky snapshot exporter ────────────────────
-        # Snapshots the slot-0 StaticSkyEMA running mean every
+        # Snapshots the slot-0 StaticSkyMean window mean every
         # ``sky_export_interval_s`` and POSTs it to the h23 sky monitor.
         # Fail-soft by design: a down dashboard costs one queue-drop per
         # interval, never a stalled block. See dsart.services.sky_export.
@@ -4167,11 +4229,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="grid side length (default: 256)")
     p.add_argument("--kernel-support", type=int, default=1,
                    help="gridding kernel half-width in cells (default: 1 → 3x3)")
-    p.add_argument("--static-sky-alpha", type=float, default=0.001,
-                   help="static-sky EMA smoothing factor (default: 0.001 → "
-                        "~700-cube half-life)")
+    p.add_argument("--static-sky-window-s", type=float, default=1.0,
+                   help="static-sky sliding-mean window length in seconds "
+                        "(default: 1.0 → 8 blocks). Must stay well under "
+                        "the ~6.9 s/2pi max core-baseline fringe rate or "
+                        "the sky estimate decorrelates (the pre-2026-06-09 "
+                        "EMA had an effective ~134 s window — see "
+                        "StaticSkyMean docstring).")
     p.add_argument("--static-sky-warmup-cubes", type=int, default=8,
-                   help="cubes during which to BUILD the EMA but not subtract")
+                   help="cubes during which to BUILD the window but not "
+                        "subtract")
     p.add_argument("--static-sky-disabled", action="store_true",
                    help="disable static-sky subtraction entirely (useful for "
                         "the 0319 continuum bench where the brightest source "
@@ -4269,15 +4336,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sky-export-url", type=str, default="",
                    help=("E2E test 1 ('always seeing the sky'): when set "
                          "(e.g. http://lxd110h23.pro.pvt:5778/sky/ingest), "
-                         "snapshot the slot-0 StaticSkyEMA running mean "
+                         "snapshot the slot-0 StaticSkyMean window mean "
                          "every --sky-export-interval-s and HTTP-POST it "
                          "to the h23 sky monitor. Empty (default) = OFF. "
                          "Fail-soft: a down dashboard never stalls the "
                          "RT loop."))
     p.add_argument("--sky-export-interval-s", type=float, default=30.0,
                    help="sky-monitor snapshot cadence in seconds "
-                        "(default 30; the EMA half-life is ~93 s so "
-                        "adjacent frames are correlated by design)")
+                        "(default 30; each snapshot is the ~1 s "
+                        "static-sky window mean at export time)")
     p.add_argument("--transport-tx-host", type=str, default="",
                    help=("M7.2: when set, enables the real Stage2FIFO + "
                          "TransportTx path (replaces the NoOp stubs). "
@@ -4481,7 +4548,7 @@ def main(argv: list[str] | None = None) -> int:
         rfi_m_values=rfi_m_values_parsed,
         rfi_warmup_cubes=args.rfi_warmup_cubes,
         rfi_sumthr_enabled=not args.sumthr_disabled,
-        static_sky_alpha=args.static_sky_alpha,
+        static_sky_window_s=args.static_sky_window_s,
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,
         n_fv_chunk=args.n_fv_chunk,

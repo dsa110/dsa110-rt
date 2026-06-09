@@ -77,9 +77,9 @@
 {% block content %}
 <h2>Static-sky continuum monitor</h2>
 <p style="max-width: 760px;">
-    Fleet-combined dirty image of the <b>static-sky EMA</b> (the running
-    mean each corr node subtracts before the burst search; half-life
-    ≈ 93 s). One frame every ~30 s, greyscale, stretched
+    Fleet-combined dirty image of the <b>static-sky mean</b> (the ~1 s
+    sliding boxcar each corr node subtracts before the burst search).
+    One frame every ~30 s, greyscale, stretched
     −3σ…+10σ where σ is a robust (MAD) per-image noise estimate.
     If bright continuum sources are not visible here, the search is not
     seeing the sky. <b>Manual refresh only.</b>

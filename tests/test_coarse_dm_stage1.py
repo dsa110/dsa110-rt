@@ -849,7 +849,7 @@ def test_process_block_multi_dm_static_sky_subtraction(tmp_path):
         t_int_fast_native=32,
         rfi_enabled=False,
         static_sky_disabled=False,         # ENABLE static-sky
-        static_sky_alpha=0.5,              # fast EMA so warmup completes quickly
+        static_sky_window_s=1.0,           # default ~8-block boxcar
         static_sky_warmup_cubes=1,
     )
     ctx = build_context(
