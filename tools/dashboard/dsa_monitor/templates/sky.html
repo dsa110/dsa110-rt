@@ -18,7 +18,9 @@
     .sky-viewer img {
         width: 512px;
         height: 512px;
-        image-rendering: pixelated;
+        /* Frames are 512×512 (2× UV-padded oversample) — render 1:1,
+           smooth scaling if the layout ever resizes them. */
+        image-rendering: auto;
         background: #000;
         display: block;
         border: 1px solid #333;
@@ -81,6 +83,9 @@
     sliding boxcar each corr node subtracts before the burst search).
     One frame every ~30 s, greyscale, stretched
     −3σ…+10σ where σ is a robust (MAD) per-image noise estimate.
+    Frames are 2× oversampled (UV zero-padding — exact band-limited
+    interpolation, same FOV) and pillbox grid-corrected so edge sources
+    show at true relative strength.
     If bright continuum sources are not visible here, the search is not
     seeing the sky. <b>Manual refresh only.</b>
     Frames live under <code>{{ sky_root }}</code>.

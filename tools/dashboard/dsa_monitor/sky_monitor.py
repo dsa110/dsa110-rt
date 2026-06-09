@@ -15,7 +15,16 @@ every 30 s. This module:
    grid, weight by ``1/amp_scale²`` to flatten the bandpass, sum,
    then ``Re(fftshift(ifft2(ifftshift(grid))))`` — the exact
    convention of ``bench/_corr_fast_replay.dirty_image_from_dense_grid``
-   and the search-side imager),
+   and the search-side imager), with two h23-only anti-aliasing steps
+   (2026-06-09): 2× UV zero-padding (exact band-limited oversampling
+   of the same FOV → 512×512 frames, the ~1-px PSF main lobe renders
+   smoothly instead of as single hard pixels) and pillbox grid
+   correction (divides out the nearest-cell-gridding sinc envelope so
+   edge-of-FOV sources show at true relative strength). True gridding
+   anti-aliasing (suppressing out-of-FOV aliases) is NOT possible
+   post-gridding — that would need the corr-side G7 Gaussian kernel
+   (``kernel_support ∈ {3,5}``), which changes ``pattern_id``
+   fleet-wide and the search-side scatter cost,
 3. sigma-normalises (robust MAD noise estimate over image pixels) and
    writes a greyscale PNG + a float32 NPZ to
    ``/dataz/dsa110/operations/sky_monitor/frames/YYYYMMDD/``,
@@ -160,15 +169,72 @@ def combine_chgroups_to_uv(
     return uv, sorted(used)
 
 
-def dirty_image_from_uv(uv: np.ndarray) -> np.ndarray:
+def pillbox_grid_correction(n_pix: int, *, cap: float = 2.5) -> np.ndarray:
+    """``(n_pix, n_pix)`` image-plane correction for K=1 gridding.
+
+    The production corr_fast gridder snaps each (baseline, channel)
+    visibility to its NEAREST grid cell (``kernel_support=1`` pillbox;
+    the G7 Gaussian kernel exists but is not enabled — flipping it
+    would change ``pattern_id`` fleet-wide). Nearest-cell snapping is
+    convolution with a one-cell-wide pillbox followed by sampling, so
+    the dirty image is multiplied by the pillbox's transform: a
+    separable ``sinc(f)`` envelope with ``f ∈ [-1/2, 1/2)`` across the
+    field of view. Sources at the FOV edge are attenuated to
+    ``sinc(1/2) ≈ 0.64`` (corners ``≈ 0.41``).
+
+    This returns ``1 / (sinc(fx) · sinc(fy))`` — the standard imaging
+    "grid correction" — so edge sources display at their true relative
+    strength. Noise is amplified by the same factor, so SNR is
+    unchanged; the per-image sigma stretch just shows slightly more
+    texture toward the corners. ``cap`` bounds the correction (the
+    geometric max is ``(π/2)² ≈ 2.47`` in the corners).
+    """
+    f = (np.arange(n_pix, dtype=np.float64) - n_pix // 2) / float(n_pix)
+    c1 = 1.0 / np.sinc(f)                  # np.sinc is sin(πf)/(πf)
+    corr = np.outer(c1, c1)
+    return np.minimum(corr, cap).astype(np.float32)
+
+
+def dirty_image_from_uv(
+    uv: np.ndarray,
+    *,
+    oversample: int = 1,
+    grid_correct: bool = False,
+) -> np.ndarray:
     """``Re(fftshift(ifft2(ifftshift(uv))))`` — byte-matches
     ``bench/_corr_fast_replay.dirty_image_from_dense_grid`` (M2-
     validated convention; the F20 (u, v) negation is already applied
-    inside the corr-side gridder).
+    inside the corr-side gridder) at the defaults.
+
+    Anti-aliasing options (2026-06-09, h23-side only):
+
+    * ``oversample > 1``: zero-pad the centred UV grid by the given
+      factor before the iFFT. Because the UV data have finite support
+      (256² cells), this is EXACT band-limited (Dirichlet)
+      interpolation of the same dirty image over the same FOV — the
+      ~1-px PSF main lobe of the critically-sampled 256² image is
+      rendered smoothly instead of aliasing into single hard pixels.
+      No information is added or lost.
+    * ``grid_correct``: divide out the pillbox (nearest-cell) gridding
+      envelope — see :func:`pillbox_grid_correction`.
     """
+    n = int(uv.shape[0])
+    oversample = max(1, int(oversample))
+    if oversample > 1:
+        n_os = n * oversample
+        big = np.zeros((n_os, n_os), dtype=np.complex64)
+        lo = (n_os - n) // 2                  # centred DC stays at n_os/2
+        big[lo:lo + n, lo:lo + n] = uv
+        uv = big
     g = np.fft.ifftshift(uv)
-    img = np.fft.fftshift(np.fft.ifft2(g))
-    return np.ascontiguousarray(img.real.astype(np.float32))
+    img = np.fft.fftshift(np.fft.ifft2(g)).real.astype(np.float32)
+    if oversample > 1:
+        # ifft2 normalises by n_os² not n²; restore the 256²-grid scale
+        # so recorded medians/sigmas stay comparable across oversample.
+        img *= np.float32(oversample * oversample)
+    if grid_correct:
+        img *= pillbox_grid_correction(img.shape[0])
+    return np.ascontiguousarray(img)
 
 
 def robust_sigma(img: np.ndarray) -> tuple[float, float]:
@@ -349,6 +415,14 @@ class SkyMonitor:
             frame. 1 by default — a partial sky is more useful than
             no sky, and the per-frame chgroup count is surfaced in
             the UI.
+        oversample: UV zero-padding factor before the iFFT (exact
+            band-limited interpolation; see
+            :func:`dirty_image_from_uv`). 2 ⇒ 512×512 frames over the
+            same FOV. Display-only anti-aliasing; the gridding itself
+            is untouched (corr-side, kernel_support=1).
+        grid_correct: divide out the nearest-cell (pillbox) gridding
+            envelope so edge-of-FOV sources display at true relative
+            strength (:func:`pillbox_grid_correction`).
     """
 
     def __init__(
@@ -359,12 +433,16 @@ class SkyMonitor:
         freshness_s: float = 90.0,
         min_chgroups: int = 1,
         n_grid: int = 256,
+        oversample: int = 2,
+        grid_correct: bool = True,
     ) -> None:
         self.store = store if store is not None else SkyFrameStore()
         self.frame_interval_s = float(frame_interval_s)
         self.freshness_s = float(freshness_s)
         self.min_chgroups = int(min_chgroups)
         self.n_grid = int(n_grid)
+        self.oversample = max(1, int(oversample))
+        self.grid_correct = bool(grid_correct)
 
         self._lock = threading.Lock()
         self._latest: dict[int, dict[str, Any]] = {}     # chgroup → snapshot
@@ -426,8 +504,19 @@ class SkyMonitor:
         uv, used = combine_chgroups_to_uv(fresh, n_grid=self.n_grid)
         if not used:
             return
-        image = dirty_image_from_uv(uv)
+        # Sigma is estimated on the UNCORRECTED image: grid correction
+        # amplifies edge/corner noise (×π/2 .. ×2.47), and folding that
+        # into a global MAD would dim phase-center sources in the σ
+        # stretch. Estimating first keeps center-source σ values
+        # comparable to pre-correction frames; corrected edge sources
+        # then display at their true relative strength.
+        image = dirty_image_from_uv(uv, oversample=self.oversample)
         median, sigma = robust_sigma(image)
+        if self.grid_correct:
+            # Correct the median-subtracted signal so the stored median
+            # stays valid and σ-units scale exactly by the correction.
+            corr = pillbox_grid_correction(image.shape[0])
+            image = (image - np.float32(median)) * corr + np.float32(median)
 
         # Frame metadata: enough to re-derive pixel scale + provenance.
         cell_lambdas = sorted({
@@ -441,6 +530,9 @@ class SkyMonitor:
             "ts": now,
             "used_chgroups": used,
             "n_grid": self.n_grid,
+            "oversample": self.oversample,
+            "grid_correct": self.grid_correct,
+            "n_pix": int(image.shape[0]),
             "cell_lambda": cell_lambdas,
             "dec_deg": dec_degs,
             "median": median,
@@ -512,5 +604,6 @@ __all__ = [
     "parse_snapshot_npz",
     "combine_chgroups_to_uv",
     "dirty_image_from_uv",
+    "pillbox_grid_correction",
     "robust_sigma",
 ]

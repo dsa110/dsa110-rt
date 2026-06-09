@@ -132,6 +132,93 @@ def test_dirty_image_point_source_at_phase_center():
     assert abs(img.sum() - 1.0) < 1e-4
 
 
+def _uv_for_point_source(row: int, col: int) -> np.ndarray:
+    """UV grid whose dirty image (under the module's
+    fftshift(ifft2(ifftshift(·))) convention) is a unit delta at
+    (row, col)."""
+    img = np.zeros((N_GRID, N_GRID), dtype=np.complex64)
+    img[row, col] = 1.0
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(img))).astype(
+        np.complex64
+    )
+
+
+def test_pillbox_correction_envelope():
+    corr = sm.pillbox_grid_correction(N_GRID)
+    c = N_GRID // 2
+    assert corr[c, c] == pytest.approx(1.0)
+    # FOV edge: 1/sinc(1/2) = π/2 per axis.
+    assert corr[0, c] == pytest.approx(np.pi / 2.0, rel=1e-3)
+    assert corr[c, 0] == pytest.approx(np.pi / 2.0, rel=1e-3)
+    # Corner ≈ (π/2)² ≈ 2.47, under the 2.5 cap.
+    assert corr[0, 0] == pytest.approx((np.pi / 2.0) ** 2, rel=1e-3)
+    assert float(corr.max()) <= 2.5 + 1e-6
+    # Symmetric about the center on the open interval.
+    assert corr[c + 10, c] == pytest.approx(corr[c - 10, c], rel=1e-6)
+
+
+def test_dirty_image_oversample_is_exact_interpolation():
+    """2× UV zero-padding: same FOV, 2× pixel coordinates, peak
+    amplitude preserved (after the oversample² renormalisation) —
+    exact band-limited interpolation of the same dirty image."""
+    row, col = N_GRID // 2 + 18, N_GRID // 2 - 11    # off-center source
+    uv = _uv_for_point_source(row, col)
+    img1 = sm.dirty_image_from_uv(uv)
+    img2 = sm.dirty_image_from_uv(uv, oversample=2)
+    assert img2.shape == (2 * N_GRID, 2 * N_GRID)
+    assert img1[row, col] == pytest.approx(1.0, abs=1e-4)
+    # The on-grid samples are reproduced exactly at even pixels.
+    assert img2[2 * row, 2 * col] == pytest.approx(1.0, abs=1e-3)
+    peak = np.unravel_index(np.argmax(img2), img2.shape)
+    assert peak == (2 * row, 2 * col)
+
+
+def test_dirty_image_grid_correct_boosts_edge_sources():
+    """Grid correction multiplies a source near the FOV edge by the
+    inverse pillbox envelope; a phase-center source is untouched."""
+    c = N_GRID // 2
+    # Center source: correction = 1.
+    uv_c = _uv_for_point_source(c, c)
+    img_c = sm.dirty_image_from_uv(uv_c, grid_correct=True)
+    assert img_c[c, c] == pytest.approx(1.0, abs=1e-4)
+    # Near-edge source: boosted by 1/sinc(f) on the offset axis.
+    row, col = c, 4
+    f = (col - c) / float(N_GRID)
+    expected = 1.0 / float(np.sinc(f))
+    uv_e = _uv_for_point_source(row, col)
+    plain = sm.dirty_image_from_uv(uv_e)
+    corrected = sm.dirty_image_from_uv(uv_e, grid_correct=True)
+    assert corrected[row, col] / plain[row, col] == pytest.approx(
+        expected, rel=1e-4,
+    )
+
+
+def test_monitor_frame_is_oversampled_by_default(tmp_path):
+    """SkyMonitor production defaults: 2× oversample + grid correct,
+    surfaced in the frame metadata and the written NPZ image shape."""
+    mon = sm.SkyMonitor(
+        store=sm.SkyFrameStore(root=tmp_path, retention_h=48.0),
+        frame_interval_s=30.0,
+        freshness_s=90.0,
+        min_chgroups=1,
+        n_grid=N_GRID,
+    )
+    assert mon.oversample == 2 and mon.grid_correct
+    ack = mon.ingest(_snapshot_bytes(0), now=1_750_000_000.0)
+    assert ack["frame_written"]
+    frames = mon.store.list_frames(since_unix=0)
+    npz_path = (
+        mon.store.frames_dir / frames[0]["day"]
+        / frames[0]["png"].replace(".png", ".npz")
+    )
+    with np.load(npz_path, allow_pickle=False) as z:
+        assert z["image"].shape == (2 * N_GRID, 2 * N_GRID)
+        meta = json.loads(bytes(z["meta_json"]).decode("utf-8"))
+    assert meta["oversample"] == 2
+    assert meta["grid_correct"] is True
+    assert meta["n_pix"] == 2 * N_GRID
+
+
 def test_robust_sigma_ignores_bright_sources():
     rng = np.random.default_rng(11)
     img = rng.standard_normal((N_GRID, N_GRID)).astype(np.float32)
