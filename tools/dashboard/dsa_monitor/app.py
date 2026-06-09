@@ -151,6 +151,13 @@ control_store = ControlStore()
 cands_browser = ArchiveBrowser()
 
 
+# Sky monitor (E2E test 1): ingest + frame builder. Cheap to construct;
+# all heavy work (combine + iFFT + PNG) happens per ~30 s frame inside
+# ingest requests.
+from sky_monitor import SkyMonitor
+sky_mon = SkyMonitor()
+
+
 def _init_store_and_poller() -> None:
     """Module-level init. Spinning up here means the poller starts
     immediately on Flask import (so the first page render isn't empty
@@ -359,6 +366,78 @@ def burst_event_plot(name: str, plot_name: str):
     if p is None:
         abort(404)
     return send_file(str(p), mimetype="image/png")
+
+
+# ---------- Sky monitor (E2E test 1: "always seeing the sky") -------------
+#
+# Each corr node's corr_fast (--sky-export-url) POSTs its slot-0
+# StaticSkyEMA running mean every 30 s; sky_monitor combines the 16
+# chgroups in the UV plane, images, sigma-normalises, and writes
+# greyscale frames to /dataz/dsa110/operations/sky_monitor/. The /sky
+# tab serves a manual-refresh scrubbable movie (30 min default, 24 h
+# reach-back).
+
+
+@app.route("/sky")
+def sky_tab():
+    return render_template(
+        "sky.html",
+        active_tab="sky",
+        sky_root=str(sky_mon.store.root),
+    )
+
+
+@app.route("/sky/ingest", methods=["POST"])
+def sky_ingest():
+    """Corr-node snapshot ingest. Body = npz bytes (see
+    dsart.services.sky_export.build_snapshot_npz)."""
+    body = request.get_data(cache=False)
+    if not body:
+        return jsonify({"ok": False, "error": "empty body"}), 400
+    try:
+        ack = sky_mon.ingest(body)
+    except ValueError as exc:
+        LOG.warning("sky ingest rejected from %s: %s",
+                    request.remote_addr, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                            # noqa: BLE001
+        LOG.exception("sky ingest failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(ack)
+
+
+@app.route("/sky/frames", methods=["GET"])
+def sky_frames():
+    """JSON frame index. Query param ``hours`` (float, default 0.5,
+    max 24) — how far back to list."""
+    try:
+        hours = float(request.args.get("hours", "0.5"))
+    except ValueError:
+        return jsonify({"ok": False, "error": "bad hours"}), 400
+    hours = max(0.0, min(hours, 24.0))
+    import time as _time
+    since = _time.time() - hours * 3600.0
+    try:
+        frames = sky_mon.store.list_frames(since_unix=since)
+    except Exception as exc:                            # noqa: BLE001
+        LOG.exception("sky frame listing failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "hours": hours, "frames": frames})
+
+
+@app.route("/sky/frame/<day>/<name>")
+def sky_frame_png(day: str, name: str):
+    p = sky_mon.store.resolve_png(day, name)
+    if p is None:
+        abort(404)
+    return send_file(str(p), mimetype="image/png")
+
+
+@app.route("/sky/status", methods=["GET"])
+def sky_status():
+    """Per-chgroup snapshot freshness + frame counters (debugging
+    which corr nodes are reporting)."""
+    return jsonify(sky_mon.status())
 
 
 # ---------- Plot endpoints (PNG) ------------------------------------------

@@ -3244,6 +3244,9 @@ def run(
     rfi_mon_window_size: int | None = None,
     rfi_mon_freq_downsample: int | None = None,
     rfi_mon_shm_slots: int = 64,
+    # E2E test 1 ("always seeing the sky"): empty URL disables.
+    sky_export_url: str = "",
+    sky_export_interval_s: float = 30.0,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -3472,6 +3475,37 @@ def run(
             mon_publisher = CorrFastMonPublisher(
                 chgroup=int(cfg.chgroup),
                 npackets_per_block=NPACKETS_PER_BLOCK,
+            )
+
+        # ── E2E test 1: static-sky snapshot exporter ────────────────────
+        # Snapshots the slot-0 StaticSkyEMA running mean every
+        # ``sky_export_interval_s`` and POSTs it to the h23 sky monitor.
+        # Fail-soft by design: a down dashboard costs one queue-drop per
+        # interval, never a stalled block. See dsart.services.sky_export.
+        sky_exporter: "SkySnapshotExporter | None" = None
+        if sky_export_url:
+            from dsart.services.sky_export import SkySnapshotExporter
+            pat_sky = ctx.gridder.pattern
+            # amp_scale: median |G| of this chgroup's cal solutions.
+            # phase_only cal leaves the instrumental gain magnitudes in
+            # the vis; h23 divides by amp_scale**2 to flatten the
+            # bandpass across the 16-chgroup sum.
+            amp_scale = 1.0
+            if ctx.cal is not None:
+                amp_scale = float(
+                    ctx.cal.info.get("cal_mag_p50", 1.0) or 1.0
+                )
+            sky_exporter = SkySnapshotExporter(
+                sky_export_url,
+                interval_s=float(sky_export_interval_s),
+                chgroup=int(cfg.chgroup),
+                n_grid=int(pat_sky.n_grid),
+                cell_lambda=float(pat_sky.cell_lambda),
+                pattern_id=int(pat_sky.pattern_id),
+                ix_row=pat_sky.ix_row,
+                ix_col=pat_sky.ix_col,
+                dec_deg=math.degrees(cfg.obs_dec_rad),
+                amp_scale=amp_scale,
             )
 
         # ── M7.2 production async TX path ─────────────────────────────
@@ -3866,6 +3900,12 @@ def run(
             t_block_end = time.monotonic()
             per_block_ms.append((t_block_end - t_block_start) * 1000.0)
 
+            # E2E test 1: periodic static-sky snapshot → h23 sky monitor.
+            # Cheap monotonic compare per block; D2H + npz only on the
+            # ~30 s tick; POST on a daemon thread (never blocks here).
+            if sky_exporter is not None:
+                sky_exporter.maybe_export(ctx.static_sky, block_n=n_in)
+
             if n_in % 16 == 0:
                 LOG.info(
                     "processed n_in=%d n_processed=%d n_drop=%d n_tx=%d "
@@ -3968,6 +4008,15 @@ def run(
                 _async_tx.close()
             except Exception:
                 LOG.exception("async_tx.close failed (non-fatal)")
+        # E2E test 1: stop the sky-export worker thread (daemon anyway,
+        # but a clean join keeps logs tidy + flushes counters).
+        _sky_exporter = locals().get("sky_exporter")
+        if _sky_exporter is not None:
+            try:
+                LOG.info("sky export stats: %s", _sky_exporter.stats())
+                _sky_exporter.close()
+            except Exception:
+                LOG.exception("sky_exporter.close failed (non-fatal)")
         # M7.6 RFI monitor: close + unlink the shm. Leaving the segment
         # behind would confuse the sidecar + h23 dashboard on the next
         # spawn (stale writer pid, stale magic if ABI ever bumps).
@@ -4217,6 +4266,18 @@ def main(argv: list[str] | None = None) -> int:
             "Requires --dm-plan-path."
         ),
     )
+    p.add_argument("--sky-export-url", type=str, default="",
+                   help=("E2E test 1 ('always seeing the sky'): when set "
+                         "(e.g. http://lxd110h23.pro.pvt:5778/sky/ingest), "
+                         "snapshot the slot-0 StaticSkyEMA running mean "
+                         "every --sky-export-interval-s and HTTP-POST it "
+                         "to the h23 sky monitor. Empty (default) = OFF. "
+                         "Fail-soft: a down dashboard never stalls the "
+                         "RT loop."))
+    p.add_argument("--sky-export-interval-s", type=float, default=30.0,
+                   help="sky-monitor snapshot cadence in seconds "
+                        "(default 30; the EMA half-life is ~93 s so "
+                        "adjacent frames are correlated by design)")
     p.add_argument("--transport-tx-host", type=str, default="",
                    help=("M7.2: when set, enables the real Stage2FIFO + "
                          "TransportTx path (replaces the NoOp stubs). "
@@ -4488,6 +4549,8 @@ def main(argv: list[str] | None = None) -> int:
             rfi_mon_window_size=args.rfi_mon_window_size,
             rfi_mon_freq_downsample=args.rfi_mon_freq_downsample,
             rfi_mon_shm_slots=args.rfi_mon_shm_slots,
+            sky_export_url=args.sky_export_url,
+            sky_export_interval_s=args.sky_export_interval_s,
         )
     except _StopRequested:
         LOG.info("clean stop")

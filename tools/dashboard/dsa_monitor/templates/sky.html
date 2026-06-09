@@ -1,0 +1,239 @@
+{% extends "base.html" %}
+{% block title %}Sky – DSA Monitor{% endblock %}
+
+{% block head_extra %}
+<style>
+    .sky-wrap {
+        display: flex;
+        gap: 24px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+    }
+    .sky-viewer {
+        background: #111;
+        border-radius: 8px;
+        padding: 16px;
+        color: #dfe6e9;
+    }
+    .sky-viewer img {
+        width: 512px;
+        height: 512px;
+        image-rendering: pixelated;
+        background: #000;
+        display: block;
+        border: 1px solid #333;
+    }
+    .sky-meta {
+        font-family: "SF Mono", Menlo, Consolas, monospace;
+        font-size: 12px;
+        margin-top: 8px;
+        color: #b2bec3;
+        min-height: 2.4em;
+    }
+    .sky-controls {
+        margin-top: 10px;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+    .sky-controls input[type="range"] { width: 360px; }
+    .sky-controls button, .sky-side button {
+        padding: 6px 14px;
+        border: 1px solid #555;
+        border-radius: 5px;
+        background: #2d3436;
+        color: #dfe6e9;
+        cursor: pointer;
+        font-size: 13px;
+    }
+    .sky-controls button:hover, .sky-side button:hover { background: #3d4446; }
+    .sky-side {
+        max-width: 420px;
+        font-size: 13px;
+    }
+    .sky-side table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    .sky-side th, .sky-side td {
+        border: 1px solid #dfe6e9;
+        padding: 3px 8px;
+        font-size: 12px;
+        text-align: left;
+    }
+    .sky-badge {
+        display: inline-block;
+        padding: 1px 8px;
+        border-radius: 9px;
+        font-size: 11px;
+        font-weight: 600;
+        background: #00b894;
+        color: white;
+    }
+    .sky-badge.partial { background: #fdcb6e; color: #2d3436; }
+    .sky-badge.stale { background: #d63031; }
+    select.sky-window { padding: 4px 6px; font-size: 13px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h2>Static-sky continuum monitor</h2>
+<p style="max-width: 760px;">
+    Fleet-combined dirty image of the <b>static-sky EMA</b> (the running
+    mean each corr node subtracts before the burst search; half-life
+    ≈ 93 s). One frame every ~30 s, greyscale, stretched
+    −3σ…+10σ where σ is a robust (MAD) per-image noise estimate.
+    If bright continuum sources are not visible here, the search is not
+    seeing the sky. <b>Manual refresh only.</b>
+    Frames live under <code>{{ sky_root }}</code>.
+</p>
+
+<div class="sky-wrap">
+    <div class="sky-viewer">
+        <img id="sky-img" alt="(no frame loaded)" />
+        <div class="sky-meta" id="sky-meta">loading…</div>
+        <div class="sky-controls">
+            <button id="sky-play" title="play / pause">&#9654;</button>
+            <input type="range" id="sky-slider" min="0" max="0" value="0" />
+            <span id="sky-pos" style="font-size:12px;"></span>
+        </div>
+        <div class="sky-controls">
+            <label>Window:
+                <select class="sky-window" id="sky-window">
+                    <option value="0.5" selected>30 min</option>
+                    <option value="2">2 h</option>
+                    <option value="6">6 h</option>
+                    <option value="12">12 h</option>
+                    <option value="24">24 h</option>
+                </select>
+            </label>
+            <button id="sky-refresh">Refresh</button>
+            <span id="sky-count" style="font-size:12px;"></span>
+        </div>
+    </div>
+
+    <div class="sky-side">
+        <h3 style="margin-top:0;">Fleet snapshot status</h3>
+        <p>Which corr nodes (chgroups) have posted a snapshot recently.
+           Updated on Refresh.</p>
+        <div id="sky-status">–</div>
+    </div>
+</div>
+
+<script>
+(function () {
+    "use strict";
+
+    let frames = [];          // [{ts, n_chgroups, day, png}]
+    let idx = 0;
+    let playing = false;
+    let playTimer = null;
+
+    const img = document.getElementById("sky-img");
+    const meta = document.getElementById("sky-meta");
+    const slider = document.getElementById("sky-slider");
+    const pos = document.getElementById("sky-pos");
+    const count = document.getElementById("sky-count");
+    const playBtn = document.getElementById("sky-play");
+
+    function fmtUtc(ts) {
+        return new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+    }
+
+    function show(i) {
+        if (!frames.length) {
+            img.removeAttribute("src");
+            meta.textContent = "no frames in window — check fleet status / corr_fast --sky-export-url";
+            pos.textContent = "";
+            return;
+        }
+        idx = Math.max(0, Math.min(i, frames.length - 1));
+        const f = frames[idx];
+        img.src = "/sky/frame/" + f.day + "/" + f.png;
+        const badge = f.n_chgroups >= 16 ? "" :
+            ' <span class="sky-badge partial">' + f.n_chgroups + "/16 chgroups</span>";
+        meta.innerHTML = fmtUtc(f.ts) + badge;
+        slider.value = idx;
+        pos.textContent = (idx + 1) + " / " + frames.length;
+    }
+
+    function stopPlay() {
+        playing = false;
+        playBtn.innerHTML = "&#9654;";
+        if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    }
+
+    playBtn.addEventListener("click", function () {
+        if (playing) { stopPlay(); return; }
+        if (!frames.length) return;
+        playing = true;
+        playBtn.innerHTML = "&#10074;&#10074;";
+        if (idx >= frames.length - 1) idx = 0;
+        playTimer = setInterval(function () {
+            if (idx >= frames.length - 1) { stopPlay(); return; }
+            show(idx + 1);
+        }, 200);                                  /* 5 fps */
+    });
+
+    slider.addEventListener("input", function () {
+        stopPlay();
+        show(parseInt(slider.value, 10));
+    });
+
+    async function refreshFrames() {
+        stopPlay();
+        const hours = document.getElementById("sky-window").value;
+        try {
+            const r = await fetch("/sky/frames?hours=" + encodeURIComponent(hours));
+            const j = await r.json();
+            if (!j.ok) throw new Error(j.error || "frame list failed");
+            frames = j.frames || [];
+            slider.max = Math.max(0, frames.length - 1);
+            count.textContent = frames.length + " frame(s)";
+            show(frames.length - 1);              /* land on the newest */
+        } catch (e) {
+            meta.textContent = "frame list error: " + e;
+        }
+    }
+
+    async function refreshStatus() {
+        const el = document.getElementById("sky-status");
+        try {
+            const r = await fetch("/sky/status");
+            const j = await r.json();
+            const cgs = j.chgroups || {};
+            let rows = "";
+            for (let cg = 0; cg < 16; cg++) {
+                const s = cgs[String(cg)];
+                if (s) {
+                    const cls = s.age_s <= 90 ? "sky-badge" : "sky-badge stale";
+                    rows += "<tr><td>" + cg + "</td><td>" + (s.hostname || "?") +
+                        '</td><td><span class="' + cls + '">' +
+                        s.age_s.toFixed(0) + " s</span></td></tr>";
+                } else {
+                    rows += "<tr><td>" + cg + "</td><td>–</td>" +
+                        '<td><span class="sky-badge stale">never</span></td></tr>';
+                }
+            }
+            el.innerHTML =
+                "<div>frames written: " + j.n_frames +
+                (j.last_frame_age_s != null
+                    ? " (last " + j.last_frame_age_s.toFixed(0) + " s ago)" : "") +
+                "</div>" +
+                "<table><tr><th>chgroup</th><th>host</th><th>snapshot age</th></tr>" +
+                rows + "</table>";
+        } catch (e) {
+            el.textContent = "status error: " + e;
+        }
+    }
+
+    document.getElementById("sky-refresh").addEventListener("click", function () {
+        refreshFrames();
+        refreshStatus();
+    });
+    document.getElementById("sky-window").addEventListener("change", refreshFrames);
+
+    /* Initial load only — NO polling (manual refresh by design). */
+    refreshFrames();
+    refreshStatus();
+})();
+</script>
+{% endblock %}

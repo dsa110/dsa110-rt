@@ -375,6 +375,11 @@ routines:
   # FIFO memory peaks at ~1.1 GiB on chgroup-0. NB: comments MUST live
   # outside the args: >- folded scalar (`#` characters inside it become
   # literal argv tokens that argparse rejects — see 2026-06-03 incident).
+  # Sky monitor (E2E test 1, 2026-06-09): --sky-export-url makes each
+  # corr_fast POST its slot-0 StaticSkyEMA running mean (~60 KB npz) to
+  # the h23 dashboard every 30 s; h23 combines the 16 chgroups into a
+  # fleet dirty image on the /sky tab. Fail-soft: a down dashboard
+  # never stalls the RT loop (bounded queue + daemon POST thread).
   - name: corr_fast
     cmd: python
     args: >-
@@ -414,6 +419,8 @@ routines:
       --rfi-mon-freq-downsample 4
       --rfi-mon-shm-slots 64
       --inject-watch
+      --sky-export-url http://lxd110h23.pro.pvt:5778/sky/ingest
+      --sky-export-interval-s 30
     env:
       CUDA_VISIBLE_DEVICES: "1"
 
