@@ -1068,6 +1068,37 @@ def test_make_search_noise_points_empty_payload_drops():
     ) == []
 
 
+def test_make_search_noise_points_per_kernel_and_escape_fields():
+    """2026-06-09: per-kernel σ_k fields (``s_k_<kernel_id>``) and the
+    clamp-escape counters are forwarded; the static rollup names keep
+    their existing semantics; non-numeric junk is dropped."""
+    payload = dict(SEARCH_NOISE_N02_G0)
+    payload.update({
+        "n_clamp_escapes_total": 2,
+        "clamp_streak_max": 64,
+        "s_k_unit_d1_b1": 1.01,
+        "s_k_unit_d1_b16": 7.73,
+        "s_k_unit_d1_b64": 1.38,
+        "s_k_bogus_str": "not-a-number",   # dropped
+    })
+    pts = pusher.make_search_noise_points(
+        payload, cn_id=2, gpu_half=0,
+    )
+    assert len(pts) == 1
+    f = pts[0].fields
+    assert f["n_clamp_escapes_total"] == 2
+    assert f["clamp_streak_max"] == 64
+    assert f["s_k_unit_d1_b1"] == 1.01
+    assert f["s_k_unit_d1_b16"] == 7.73
+    assert f["s_k_unit_d1_b64"] == 1.38
+    assert "s_k_bogus_str" not in f
+    # Rollup fields are still floats with their original names.
+    assert f["s_k_median"] == 1.05
+    line = pts[0].to_line()
+    assert "n_clamp_escapes_total=2i" in line
+    assert "s_k_unit_d1_b16=7.73" in line
+
+
 def test_route_search_noise_key():
     svc = pusher.InfluxPusherService.__new__(pusher.InfluxPusherService)
     svc._warned_unknown_keys = set()

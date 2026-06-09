@@ -592,6 +592,63 @@ def panels() -> List[Dict[str, Any]]:
         ),
     ))
     _bump_y(7)
+    # ----- 2026-06-09: per-kernel sigma_k + clamp escape hatch -----
+    out.append(graph_panel(
+        title="Layer-2 sigma_k per kernel (all search halves)",
+        raw_query=(
+            # Per-kernel fields are flattened by publish_noise as
+            # s_k_<image>_<dm>_<time> (e.g. s_k_unit_d1_b16); the
+            # trailing _b<N> time-token anchors the regex so the
+            # s_k_median/p95/max/min rollup fields never match.
+            'SELECT mean(/^s_k_.*_b[0-9]+$/) FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half $col",
+        w=12, x=0, h=8, unit="short", y_min=0, legend_right=True,
+        description=(
+            "2026-06-09: per-kernel Layer-2 sigma_k (one series per "
+            "kernel per half; field s_k_<kernel_id>). The med/p95/max "
+            "rollup hid the clamp-deadlock failure mode where 1-2 "
+            "kernels sat stuck-low (their sigma_max_ratio clamp "
+            "rejected every update) while the median looked healthy -- "
+            "those kernels then normalised scores against a stale "
+            "divisor and flooded C2 with inflated-SNR junk. Watch for "
+            "any single series flatlining while its siblings move."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Layer-2 sigma_k clamp-escape rate + max clamp streak",
+        raw_query=(
+            'SELECT non_negative_derivative('
+            'mean("n_clamp_escapes_total"), 1s) '
+            'FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half escapes/s",
+        extra_targets=[{
+            "alias": "cn $tag_cn_id g$tag_gpu_half streak_max",
+            "query": (
+                'SELECT max("clamp_streak_max") '
+                'FROM "search_rt_noise" '
+                'WHERE $timeFilter '
+                'GROUP BY time($__interval), "cn_id", "gpu_half" '
+                'fill(null)'
+            ),
+        }],
+        w=12, x=12, h=8, unit="short", y_min=0, legend_right=True,
+        description=(
+            "2026-06-09 clamp escape hatch: a kernel clamped for "
+            "layer2_clamp_escape_cubes CONSECUTIVE cubes (64 = ~8.6 s) "
+            "rebaselines -- sigma_k jumps to the live estimate instead "
+            "of deadlocking. escapes/s > 0 means the noise level "
+            "genuinely moved past sigma_max_ratio x s_k somewhere; "
+            "streak_max pinned near 64 (or unbounded with the hatch "
+            "disabled) is the live deadlock signature."
+        ),
+    ))
+    _bump_y(8)
 
     # ----- T8 (2026-06-07) Cube-dump + C2 trigger listener health -----
     out.append(row_panel(

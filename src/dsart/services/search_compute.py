@@ -459,6 +459,15 @@ class SearchComputeConfig:
     # back to one cube. Surfaced as ``n_clamped_high`` in the
     # cube_progress log + the noise mon-key.
     detector_layer2_sigma_max_ratio: float = 0.0
+    # 2026-06-09: σ_k clamp ESCAPE HATCH. The T1 ratio clamp alone
+    # deadlocks when the noise level legitimately rises past
+    # ``sigma_max_ratio × s_k`` (every update rejected forever →
+    # stuck-low σ_k → inflated SNRs → junk-candidate floor; observed
+    # live 2026-06-09). When > 0 and a kernel's update has been
+    # clamped for that many CONSECUTIVE cubes, the next update is
+    # accepted as a rebaseline (σ_k jumps to the live estimate).
+    # ``0`` (default) preserves the bare-clamp T1 behaviour.
+    detector_layer2_clamp_escape_cubes: int = 0
     pipeline_overlap: bool = False
     search_node_id: int = 1
     gpu_half: int = 1
@@ -824,6 +833,9 @@ class SearchComputeService:
             layer2_sigma_floor=float(config.detector_layer2_sigma_floor),
             layer2_sigma_max_ratio=float(
                 config.detector_layer2_sigma_max_ratio
+            ),
+            layer2_clamp_escape_cubes=int(
+                config.detector_layer2_clamp_escape_cubes
             ),
             layer2_valid_min_fraction=float(
                 config.detector_layer2_valid_min_fraction
@@ -1593,6 +1605,24 @@ class SearchComputeService:
             sigma_max_ratio = float(l2.sigma_max_ratio)
             l2_cube_count = int(l2.cube_count)
             l2_warming = bool(l2.is_warming_up)
+            # 2026-06-09: per-kernel σ_k mon point. The med/p95/max
+            # rollup hides exactly the failure mode we hit live — two
+            # kernels deadlocked at a stuck-low σ_k while the median
+            # looked healthy. Keyed by the canonical kernel_id so the
+            # influx pusher / Grafana can plot each kernel's divisor
+            # as its own series. K is small (7 at production geometry)
+            # so the payload cost is negligible.
+            kernel_ids = self._detector.kernels()
+            s_k_list = _s_k.detach().cpu().tolist()
+            s_k_per_kernel = {
+                str(kid): float(v)
+                for kid, v in zip(kernel_ids, s_k_list)
+            }
+            n_escapes_total = int(getattr(l2, "n_clamp_escapes", 0))
+            _streak = getattr(l2, "per_kernel_clamp_streak", None)
+            clamp_streak_max = int(_streak.max().item()) if (
+                _streak is not None and _streak.numel() > 0
+            ) else 0
         except Exception:                                      # noqa: BLE001
             # Defence in depth: a stats glitch must never sink the
             # progress log. Keep going with default values; the noise
@@ -1603,13 +1633,17 @@ class SearchComputeService:
             sigma_max_ratio = 0.0
             l2_cube_count = 0
             l2_warming = False
+            s_k_per_kernel = {}
+            n_escapes_total = 0
+            clamp_streak_max = 0
         _LOG.info(
             "cube_progress: cubes=%d cands=%d clusters=%d "
             "(%.2f cubes/s last %.1fs; %.2f cubes/s overall) "
             "stage_ms[build/l1/det/total]=%.1f/%.1f/%.1f/%.1f "
             "build_ms[h2d/imager/valid]=%.1f/%.1f/%.1f(n=%d) "
             "scatter=%.1f/%.1f us(mean/max,n=%d) "
-            "sk[med/p95/max]=%.3f/%.3f/%.3f n_clamped_high=%d src=%s",
+            "sk[med/p95/max]=%.3f/%.3f/%.3f n_clamped_high=%d "
+            "n_clamp_escapes=%d clamp_streak_max=%d src=%s",
             self._cubes_processed,
             self._candidates_emitted,
             self._clusters_emitted,
@@ -1622,6 +1656,7 @@ class SearchComputeService:
             _scatter_t["mean_us"], _scatter_t["max_us"],
             _scatter_t["count"],
             sk_med, sk_p95, sk_max, n_clamped_total,
+            n_escapes_total, clamp_streak_max,
             getattr(self._source, "stats", {}),
         )
         # Phase 6c: best-effort publish of the cube_ring window to
@@ -1655,6 +1690,9 @@ class SearchComputeService:
                     sigma_max_ratio=sigma_max_ratio,
                     cube_count=l2_cube_count,
                     is_warming_up=l2_warming,
+                    s_k_per_kernel=s_k_per_kernel,
+                    n_clamp_escapes_total=n_escapes_total,
+                    clamp_streak_max=clamp_streak_max,
                 )
             except Exception:                                  # noqa: BLE001
                 _LOG.exception(
@@ -2256,6 +2294,9 @@ def _build_search_config_from_yaml(
     detector_layer2_valid_min_fraction_yaml = float(
         det.get("layer2_valid_min_fraction", 1.0)
     )
+    detector_layer2_clamp_escape_cubes_yaml = int(
+        det.get("layer2_clamp_escape_cubes", 0)
+    )
 
     return SearchComputeConfig(
         pipeline=pipe_cfg,
@@ -2288,6 +2329,9 @@ def _build_search_config_from_yaml(
         ),
         detector_layer2_sigma_floor=detector_layer2_sigma_floor_yaml,
         detector_layer2_sigma_max_ratio=detector_layer2_sigma_max_ratio_yaml,
+        detector_layer2_clamp_escape_cubes=(
+            detector_layer2_clamp_escape_cubes_yaml
+        ),
         detector_layer2_valid_min_fraction=detector_layer2_valid_min_fraction_yaml,
         detector_device=device,
         search_node_id=int(search_node_id),

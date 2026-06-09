@@ -868,6 +868,10 @@ _SEARCH_NOISE_INT_FIELDS = (
     "n_clamped_high_max_per_kernel",
     "layer2_cube_count",
     "layer2_is_warming_up",
+    # 2026-06-09 clamp escape hatch: cumulative rebaseline count +
+    # current worst consecutive-clamped streak across kernels.
+    "n_clamp_escapes_total",
+    "clamp_streak_max",
 )
 _SEARCH_NOISE_FLOAT_FIELDS = (
     "s_k_median",
@@ -876,6 +880,13 @@ _SEARCH_NOISE_FLOAT_FIELDS = (
     "s_k_min",
     "layer2_sigma_max_ratio",
 )
+#: 2026-06-09 — per-kernel σ_k. The publisher flattens each kernel's
+#: divisor into a ``s_k_<kernel_id with ':'→'_'>`` payload field
+#: (e.g. ``s_k_unit_d1_b16``); match by prefix so a kernel-bank shape
+#: change never requires a pusher schema edit. The static rollup
+#: fields above are excluded so they keep their existing names.
+_SEARCH_NOISE_PER_KERNEL_PREFIX = "s_k_"
+_SEARCH_NOISE_PER_KERNEL_EXCLUDE = frozenset(_SEARCH_NOISE_FLOAT_FIELDS)
 
 
 #: T8 (2026-06-07) — cube-dump writer + C2 trigger listener health
@@ -937,6 +948,18 @@ def make_search_noise_points(
     for k in _SEARCH_NOISE_FLOAT_FIELDS:
         v = payload.get(k)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[k] = float(v)
+    # Per-kernel σ_k (2026-06-09): forward every ``s_k_<kernel_id>``
+    # payload field as a float so Grafana can plot one series per
+    # kernel and surface a single deadlocked kernel that the
+    # med/p95/max rollup hides.
+    for k, v in payload.items():
+        if (
+            k.startswith(_SEARCH_NOISE_PER_KERNEL_PREFIX)
+            and k not in _SEARCH_NOISE_PER_KERNEL_EXCLUDE
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
+        ):
             fields[k] = float(v)
     if not fields:
         return []

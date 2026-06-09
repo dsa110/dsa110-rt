@@ -127,6 +127,7 @@ class Layer2State:
         sigma_max_samples: Optional[int] = None,
         sigma_floor: float = 0.0,
         sigma_max_ratio: float = 0.0,
+        clamp_escape_cubes: int = 0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -144,6 +145,10 @@ class Layer2State:
             raise ValueError(f"sigma_floor={sigma_floor}, expected ≥ 0")
         if sigma_max_ratio < 0:
             raise ValueError(f"sigma_max_ratio={sigma_max_ratio}, expected ≥ 0")
+        if clamp_escape_cubes < 0:
+            raise ValueError(
+                f"clamp_escape_cubes={clamp_escape_cubes}, expected ≥ 0"
+            )
 
         self.n_kernels = int(n_kernels)
         self.cube_cadence_s = float(cube_cadence_s)
@@ -175,6 +180,23 @@ class Layer2State:
         # ``n_clamped_high`` is incremented. ``0.0`` disables the
         # clamp (preserves bit-for-bit legacy behaviour).
         self.sigma_max_ratio = float(sigma_max_ratio)
+        # 2026-06-09 (clamp escape hatch): the T1 clamp alone can
+        # DEADLOCK — if the live noise legitimately rises above
+        # ``sigma_max_ratio × s_k``, every subsequent update is
+        # rejected and s_k can never follow (observed on the live
+        # fleet as ``n_clamped_high`` incrementing on every cube for
+        # hours, a stuck-low σ_k for ≥ 2 kernels, an SNR-inflated
+        # junk-candidate floor on the affected kernels, and probe
+        # candidates normalised against the wrong divisor). When
+        # ``clamp_escape_cubes > 0`` and a kernel's update has been
+        # clamped for that many CONSECUTIVE cubes, the next update is
+        # accepted as a REBASELINE: s_k jumps directly to that cube's
+        # σ_this (the EMA blend would take ~1/gamma escapes ≈ hours
+        # to converge otherwise). The streak requirement preserves the
+        # clamp's original purpose — a transient (probe / RFI burst /
+        # dump storm) spanning < clamp_escape_cubes cubes still never
+        # lifts σ_k. ``0`` disables the hatch (legacy T1 behaviour).
+        self.clamp_escape_cubes = int(clamp_escape_cubes)
         self.gamma = 1.0 - math.exp(-self.cube_cadence_s / self.tau_s)
 
         # State: per-kernel running mean / EMA value. Initialised to 1.0
@@ -193,6 +215,16 @@ class Layer2State:
         # pathology vs. a fleet-wide noise event.
         self._n_clamped_high_total = 0
         self._per_kernel_clamped_high = torch.zeros(
+            (self.n_kernels,), dtype=torch.int64, device=device,
+        )
+        # Clamp-escape state: per-kernel CONSECUTIVE-clamped-cube
+        # streak (reset to 0 whenever a kernel's update is accepted)
+        # and rebaseline counters.
+        self._per_kernel_clamp_streak = torch.zeros(
+            (self.n_kernels,), dtype=torch.int64, device=device,
+        )
+        self._n_clamp_escapes_total = 0
+        self._per_kernel_clamp_escapes = torch.zeros(
             (self.n_kernels,), dtype=torch.int64, device=device,
         )
 
@@ -226,12 +258,36 @@ class Layer2State:
         from a fleet-wide noise event."""
         return self._per_kernel_clamped_high.detach().clone()
 
+    @property
+    def n_clamp_escapes(self) -> int:
+        """Total clamp-escape rebaselines (kernel was clamped for
+        ``clamp_escape_cubes`` consecutive cubes, then σ_k jumped to
+        the live estimate). A non-zero value means the noise level
+        genuinely moved past the ``sigma_max_ratio`` ceiling."""
+        return int(self._n_clamp_escapes_total)
+
+    @property
+    def per_kernel_clamp_escapes(self) -> torch.Tensor:
+        """Per-kernel cumulative clamp-escape rebaseline count (clone)."""
+        return self._per_kernel_clamp_escapes.detach().clone()
+
+    @property
+    def per_kernel_clamp_streak(self) -> torch.Tensor:
+        """Per-kernel CURRENT consecutive-clamped-cube streak (clone).
+        A streak pinned near ``clamp_escape_cubes`` (or growing without
+        bound when the hatch is disabled) is the live signature of the
+        clamp deadlock."""
+        return self._per_kernel_clamp_streak.detach().clone()
+
     def reset(self) -> None:
         """Clear state; reset cube_count. ``cmd: start --resume=false``."""
         self._s_k.fill_(1.0)
         self._cube_count = 0
         self._n_clamped_high_total = 0
         self._per_kernel_clamped_high.zero_()
+        self._per_kernel_clamp_streak.zero_()
+        self._n_clamp_escapes_total = 0
+        self._per_kernel_clamp_escapes.zero_()
 
     def update_and_query(
         self,
@@ -306,13 +362,56 @@ class Layer2State:
             ceiling = self.sigma_max_ratio * self._s_k
             high_mask = sigma_this > ceiling
             if torch.any(high_mask):
-                # Replace the offending kernels' σ_this with the prior
-                # s_k so the EMA blend is an identity for them.
-                sigma_this = torch.where(high_mask, self._s_k, sigma_this)
-                self._per_kernel_clamped_high += high_mask.to(
-                    self._per_kernel_clamped_high.dtype
+                # 2026-06-09 escape hatch: kernels that have been
+                # clamped for ``clamp_escape_cubes`` CONSECUTIVE cubes
+                # rebaseline — σ_k jumps to this cube's estimate —
+                # instead of being clamped forever (deadlock; see
+                # __init__ docs). Transients shorter than the streak
+                # threshold are still fully clamped.
+                if self.clamp_escape_cubes > 0:
+                    escape_mask = high_mask & (
+                        self._per_kernel_clamp_streak
+                        >= self.clamp_escape_cubes
+                    )
+                else:
+                    escape_mask = torch.zeros_like(high_mask)
+                clamp_mask = high_mask & ~escape_mask
+                if torch.any(escape_mask):
+                    # Rebaseline: write σ_this into s_k directly. The
+                    # EMA blend below then leaves these kernels at
+                    # σ_this exactly (gamma·x + (1-gamma)·x = x).
+                    self._s_k = torch.where(
+                        escape_mask, sigma_this, self._s_k,
+                    )
+                    self._per_kernel_clamp_escapes += escape_mask.to(
+                        self._per_kernel_clamp_escapes.dtype
+                    )
+                    self._n_clamp_escapes_total += int(
+                        escape_mask.sum().item()
+                    )
+                if torch.any(clamp_mask):
+                    # Replace the offending kernels' σ_this with the
+                    # prior s_k so the EMA blend is an identity for
+                    # them.
+                    sigma_this = torch.where(
+                        clamp_mask, self._s_k, sigma_this,
+                    )
+                    self._per_kernel_clamped_high += clamp_mask.to(
+                        self._per_kernel_clamped_high.dtype
+                    )
+                    self._n_clamped_high_total += int(
+                        clamp_mask.sum().item()
+                    )
+                # Streak bookkeeping: clamped kernels extend their
+                # streak; accepted kernels (escaped or under the
+                # ceiling) reset to zero.
+                self._per_kernel_clamp_streak = torch.where(
+                    clamp_mask,
+                    self._per_kernel_clamp_streak + 1,
+                    torch.zeros_like(self._per_kernel_clamp_streak),
                 )
-                self._n_clamped_high_total += int(high_mask.sum().item())
+            else:
+                self._per_kernel_clamp_streak.zero_()
 
         if self._cube_count < self.n_burnin:
             count = float(self._cube_count)

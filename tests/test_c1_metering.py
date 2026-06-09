@@ -341,3 +341,58 @@ def test_mon_publisher_inactive_window() -> None:
     assert payload["c1_metering_active"] == 0
     assert payload["c1_metering_frac"] == 0.0
     assert payload["c1_metered_dropped_mean"] == 0.0
+
+
+def test_mon_publisher_noise_per_kernel_flattening() -> None:
+    """2026-06-09: ``publish_noise`` flattens per-kernel σ_k into
+    ``s_k_<kernel_id with ':'→'_'>`` payload fields and carries the
+    clamp-escape counters."""
+    store = _MockStore()
+    pub = SearchComputeMonPublisher(
+        search_node_id=2, gpu_half=0, store=store,
+    )
+    ok = pub.publish_noise(
+        s_k_median=1.05, s_k_p95=1.42, s_k_max=7.7, s_k_min=0.97,
+        n_clamped_high_total=17, n_clamped_high_max_per_kernel=9,
+        sigma_max_ratio=4.0, cube_count=200, is_warming_up=False,
+        s_k_per_kernel={
+            "unit:d1:b1": 1.01,
+            "unit:d1:b16": 7.7,
+        },
+        n_clamp_escapes_total=2,
+        clamp_streak_max=64,
+    )
+    assert ok
+    key, payload = store.puts[0]
+    assert key == "/mon/search_rt/2/noise/0"
+    assert payload["s_k_unit_d1_b1"] == 1.01
+    assert payload["s_k_unit_d1_b16"] == 7.7
+    assert payload["n_clamp_escapes_total"] == 2
+    assert payload["clamp_streak_max"] == 64
+    # Rollup fields unchanged.
+    assert payload["s_k_median"] == 1.05
+    assert payload["n_clamped_high_total"] == 17
+
+
+def test_mon_publisher_noise_defaults_omit_per_kernel() -> None:
+    """Calling publish_noise without the new kwargs (legacy call
+    shape) stays valid: no s_k_<kernel> fields, zeroed counters."""
+    store = _MockStore()
+    pub = SearchComputeMonPublisher(
+        search_node_id=2, gpu_half=0, store=store,
+    )
+    pub.publish_noise(
+        s_k_median=1.0, s_k_p95=1.0, s_k_max=1.0, s_k_min=1.0,
+        n_clamped_high_total=0, n_clamped_high_max_per_kernel=0,
+        sigma_max_ratio=4.0, cube_count=10, is_warming_up=False,
+    )
+    _, payload = store.puts[0]
+    assert payload["n_clamp_escapes_total"] == 0
+    assert payload["clamp_streak_max"] == 0
+    per_kernel = [
+        k for k in payload
+        if k.startswith("s_k_") and k not in (
+            "s_k_median", "s_k_p95", "s_k_max", "s_k_min",
+        )
+    ]
+    assert per_kernel == []

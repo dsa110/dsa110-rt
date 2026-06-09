@@ -190,11 +190,23 @@ class SearchComputeMonPublisher:
         sigma_max_ratio: float,
         cube_count: int,
         is_warming_up: bool,
+        s_k_per_kernel: Optional[dict[str, float]] = None,
+        n_clamp_escapes_total: int = 0,
+        clamp_streak_max: int = 0,
     ) -> bool:
         """Publish the Layer-2 σ_k EMA health rollup.
 
         Best-effort: an etcd error is swallowed so the search hot loop
         never blocks. Returns True on a successful publish.
+
+        ``s_k_per_kernel`` (2026-06-09) maps the canonical kernel_id
+        (e.g. ``"unit:d1:b16"``) to that kernel's current σ_k. Each
+        entry is flattened into the payload as ``s_k_<kernel_id with
+        ':' → '_'>`` (e.g. ``s_k_unit_d1_b16``) so the influx pusher
+        can forward one field per kernel without schema changes for
+        every new bank shape. The med/p95/max rollup alone hid the
+        2026-06-09 clamp-deadlock failure mode (two kernels stuck low
+        while the median looked healthy).
         """
         payload: dict[str, Any] = {
             "search_node_id": self.search_node_id,
@@ -210,10 +222,18 @@ class SearchComputeMonPublisher:
             "layer2_sigma_max_ratio": float(sigma_max_ratio),
             "layer2_cube_count": int(cube_count),
             "layer2_is_warming_up": bool(is_warming_up),
+            "n_clamp_escapes_total": int(n_clamp_escapes_total),
+            "clamp_streak_max": int(clamp_streak_max),
             "ts_mono": time.monotonic(),
             "ts_wall_unix": time.time(),
             "time_mjd": time.time() / 86400.0 + 40587.0,
         }
+        if s_k_per_kernel:
+            for kid, val in s_k_per_kernel.items():
+                field = "s_k_" + str(kid).replace(":", "_").replace(
+                    "-", "_"
+                )
+                payload[field] = float(val)
         return self._put(payload, key=self.noise_key, counter="noise")
 
     def publish_dump_health(

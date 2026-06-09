@@ -281,6 +281,110 @@ def test_layer2_state_sigma_max_ratio_validates_input() -> None:
         Layer2State(n_kernels=1, sigma_max_ratio=-1.0)
 
 
+# ---------------------------------------------------------------------------
+# σ_k clamp escape hatch (2026-06-09)
+# ---------------------------------------------------------------------------
+
+
+def _burned_in_state(**kwargs) -> Layer2State:
+    """Layer2State burned in at σ=1 for every kernel."""
+    n_kernels = kwargs.pop("n_kernels", 1)
+    s = Layer2State(n_kernels=n_kernels, n_burnin=2, **kwargs)
+    for _ in range(2):
+        s.update_and_query(per_kernel_sigma=torch.ones(n_kernels))
+    assert not s.is_warming_up
+    return s
+
+
+def test_clamp_escape_rebaselines_after_n_consecutive_clamps() -> None:
+    """A kernel clamped for ``clamp_escape_cubes`` CONSECUTIVE cubes
+    rebaselines on the next cube: σ_k jumps directly to the live
+    estimate instead of staying deadlocked at the stale value."""
+    s = _burned_in_state(sigma_max_ratio=4.0, clamp_escape_cubes=3)
+    high = torch.tensor([10.0])
+    # Cubes 1..3: clamped (streak builds to 3).
+    for i in range(3):
+        s_k, _ = s.update_and_query(per_kernel_sigma=high)
+        assert float(s_k[0]) == 1.0, f"cube {i}: expected clamp"
+    assert s.n_clamped_high == 3
+    assert s.n_clamp_escapes == 0
+    assert int(s.per_kernel_clamp_streak[0]) == 3
+    # Cube 4: streak ≥ 3 → escape. σ_k rebaselines to the live 10.0.
+    s_k, _ = s.update_and_query(per_kernel_sigma=high)
+    assert abs(float(s_k[0]) - 10.0) < 1e-5
+    assert s.n_clamp_escapes == 1
+    assert int(s.per_kernel_clamp_escapes[0]) == 1
+    # Streak resets after the accepted update.
+    assert int(s.per_kernel_clamp_streak[0]) == 0
+    # n_clamped_high did NOT increment on the escape cube.
+    assert s.n_clamped_high == 3
+
+
+def test_clamp_escape_streak_resets_on_accepted_update() -> None:
+    """A transient shorter than ``clamp_escape_cubes`` never escapes:
+    one in-range cube resets the consecutive-clamp streak."""
+    s = _burned_in_state(sigma_max_ratio=4.0, clamp_escape_cubes=3)
+    high = torch.tensor([10.0])
+    ok = torch.tensor([1.0])
+    for _ in range(10):
+        # 2 clamped cubes, then 1 accepted cube — streak never hits 3.
+        s.update_and_query(per_kernel_sigma=high)
+        s.update_and_query(per_kernel_sigma=high)
+        s.update_and_query(per_kernel_sigma=ok)
+    assert s.n_clamp_escapes == 0
+    assert float(s.s_k[0]) < 2.0
+    assert int(s.per_kernel_clamp_streak[0]) == 0
+
+
+def test_clamp_escape_disabled_by_default() -> None:
+    """``clamp_escape_cubes=0`` (default) preserves the bare-clamp T1
+    behaviour: the deadlock persists indefinitely."""
+    s = _burned_in_state(sigma_max_ratio=4.0)
+    high = torch.tensor([10.0])
+    for _ in range(50):
+        s_k, _ = s.update_and_query(per_kernel_sigma=high)
+        assert float(s_k[0]) == 1.0
+    assert s.n_clamped_high == 50
+    assert s.n_clamp_escapes == 0
+    assert int(s.per_kernel_clamp_streak[0]) == 50
+
+
+def test_clamp_escape_is_per_kernel() -> None:
+    """Escape state is tracked per kernel: a deadlocked kernel
+    rebaselines while a healthy kernel keeps blending normally."""
+    s = _burned_in_state(
+        n_kernels=2, sigma_max_ratio=4.0, clamp_escape_cubes=2,
+    )
+    # Kernel 0 healthy at σ=1; kernel 1 deadlocked at σ=10.
+    sig = torch.tensor([1.0, 10.0])
+    s.update_and_query(per_kernel_sigma=sig)   # streak k1 → 1
+    s.update_and_query(per_kernel_sigma=sig)   # streak k1 → 2
+    s_k, _ = s.update_and_query(per_kernel_sigma=sig)  # k1 escapes
+    assert float(s_k[0]) < 2.0
+    assert abs(float(s_k[1]) - 10.0) < 1e-5
+    assert s.n_clamp_escapes == 1
+    per_k = s.per_kernel_clamp_escapes
+    assert int(per_k[0]) == 0
+    assert int(per_k[1]) == 1
+
+
+def test_clamp_escape_reset_clears_state() -> None:
+    s = _burned_in_state(sigma_max_ratio=4.0, clamp_escape_cubes=2)
+    high = torch.tensor([10.0])
+    for _ in range(3):
+        s.update_and_query(per_kernel_sigma=high)
+    assert s.n_clamp_escapes == 1
+    s.reset()
+    assert s.n_clamp_escapes == 0
+    assert int(s.per_kernel_clamp_escapes.sum()) == 0
+    assert int(s.per_kernel_clamp_streak.sum()) == 0
+
+
+def test_clamp_escape_validates_input() -> None:
+    with pytest.raises(ValueError, match="clamp_escape_cubes"):
+        Layer2State(n_kernels=1, clamp_escape_cubes=-1)
+
+
 def test_layer2_state_rejects_bad_inputs() -> None:
     s = Layer2State(n_kernels=2, n_burnin=5)
     with pytest.raises(ValueError, match="exactly one"):
