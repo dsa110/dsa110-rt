@@ -162,6 +162,18 @@ class RoutineSpec:
     # orchestrator deletes any pre-existing sentinels at the start
     # of ``_verb_start`` so a re-start doesn't see stale files.
     gate_on_paths: tuple[str, ...] = field(default_factory=tuple)
+    # 2026-06-09 startup-stagger: when > 0, sleep this many seconds
+    # AFTER spawning this routine before spawning the NEXT one in the
+    # same wave. Used to keep two CUDA workers on the same node from
+    # simultaneously racing the kernel for ~17 GiB of mlock'd pinned
+    # host pages (each search_compute half does its own cudaHostAlloc
+    # storm during pipeline build, and on the 93 GiB nodes the
+    # combined startup transient OOM-killed n09/n13 halves on
+    # 2026-06-09 even though each half's steady state fit fine). 5 s
+    # is comfortably longer than a single half's pinned-pool warmup
+    # without meaningfully delaying the "start" verb (search_compute
+    # cold-start is ~2.5 min total to first cube anyway).
+    spawn_delay_s: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +206,7 @@ class PipelineConfig:
                 gate_on_paths=tuple(
                     str(p) for p in (r.get("gate_on_paths") or [])
                 ),
+                spawn_delay_s=float(r.get("spawn_delay_s", 0.0)),
             )
             for r in (raw.get("routines") or [])
         )
@@ -776,9 +789,26 @@ class RtOrchestrator:
                 except OSError as e:
                     LOG.warning("could not remove stale sentinel %s: %s", p, e)
 
-        # Wave 1: spawn ungated routines (compute path).
-        for r in wave1:
+        # Wave 1: spawn ungated routines (compute path). Honors
+        # per-routine ``spawn_delay_s`` so two CUDA workers can be
+        # staggered to avoid a combined pinned-host-pool startup
+        # transient that would OOM the node (2026-06-09 n09 / n13
+        # search_compute halves).
+        wave1_last = len(wave1) - 1
+        for idx, r in enumerate(wave1):
             self._spawn_one_routine(r, val)
+            if idx < wave1_last and r.spawn_delay_s > 0.0:
+                LOG.info(
+                    "spawn-stagger: sleeping %.1fs after %s before "
+                    "next routine",
+                    r.spawn_delay_s, r.name,
+                )
+                if self._stop_evt.wait(r.spawn_delay_s):
+                    LOG.info(
+                        "spawn-stagger: interrupted by stop signal "
+                        "(remaining wave-1 routines NOT spawned)"
+                    )
+                    return
         if wave2:
             LOG.info(
                 "wave-1 spawned (%d routines); waiting for sentinels: %s",
