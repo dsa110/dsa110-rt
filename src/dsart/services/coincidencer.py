@@ -14,11 +14,17 @@ Lifecycle (matches docs/c1c2/C1C2_DESIGN.md §3):
   5. Per accepted C1 batch: push to TimeWindow + CoincidenceGraph,
      evaluate each touched component, on ``dump_all_gpus``:
        - allocate a name (EventNameAllocator);
-       - create the per-event archive directory;
-       - write Level2/C2_<name>.csv + Level2/C1_window_<name>.csv +
-         Level3/<name>.json;
+       - append the hourly C2 CSV row (unconditional audit trail);
        - UDP-broadcast the trigger to the 8 C1 listeners;
-       - schedule the plot job (deferred until cubes land or 60 s).
+       - wait for the cube set. ONLY once all
+         ``plot_expected_cube_count`` cubes have landed (2026-06-09):
+         create the per-event archive directory, write
+         Level2/C2_<name>.csv + Level2/C1_window_<name>.csv +
+         Level3/<name>.json, and dispatch the plot job. If the
+         deadline (``plot_cube_wait_s``) expires with an incomplete
+         set, the event is discarded and any partial cubes/ dir is
+         deleted — dumps disabled / rate-capped / under-delivered
+         events never leave a directory in candidates/.
   6. Hourly housekeeping: CSV rotation + retention enforcement +
      stale-pending-plot reaper.
   7. SIGHUP → ``CriteriaEvaluator.force_reload``.
@@ -43,6 +49,7 @@ import asyncio
 import logging
 import math
 import os
+import shutil
 import signal
 import sys
 import time
@@ -501,10 +508,25 @@ class _StoreWrapper:
 
 @dataclass
 class _PendingPlot:
+    """One in-flight ``dump_all_gpus`` event awaiting its cube set.
+
+    2026-06-09: this now carries everything needed to write the
+    per-event archive directory AFTER the full cube set lands, so
+    ``/dataz/dsa110/candidates/<name>/`` is only ever created for
+    events whose cubes all arrived (no dirs at all when dumping is
+    off / rate-capped / the fleet under-delivers).
+    """
+
     event_name: str
     submitted_at_monotonic: float
     stats: ClusterStats
     members: Tuple[WindowEntry, ...]
+    trigger_class_name: str = ""
+    trigger_action: str = ""
+    trigger_holdoff_s: float = 0.0
+    #: id(member) → inj_id labels, computed at fire time (the inject
+    #: registry is time-sensitive; matching later would miss).
+    member_inj_ids: Dict[int, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +536,11 @@ class _PendingPlot:
 
 class CoincidencerService:
     """C2 orchestrator. Construct, then call :meth:`run`."""
+
+    #: Seconds after an incomplete-event discard before the partial
+    #: dir is checked (and removed) once more — covers straggler cube
+    #: rsyncs that land just after the deadline cleanup.
+    _DISCARD_RESWEEP_S: float = 300.0
 
     def __init__(
         self,
@@ -565,6 +592,10 @@ class CoincidencerService:
             use_process_pool=config.plotter_use_process_pool,
         )
         self._pending_plots: Dict[str, _PendingPlot] = {}
+        # Names discarded for an incomplete cube set, re-swept once
+        # more after _DISCARD_RESWEEP_S in case a straggler rsync
+        # re-created the partial dir after the deadline cleanup.
+        self._discarded_events: Dict[str, float] = {}
         # 2026-05-30 dump-rate cap: monotonic timestamps of recent dump
         # broadcasts, trimmed to the rolling window on each check.
         self._dump_fire_times: List[float] = []
@@ -650,6 +681,14 @@ class CoincidencerService:
             "broadcast_send_ok": 0,
             "broadcast_send_fail": 0,
             "plots_dispatched": 0,
+            # 2026-06-09: per-event archive dirs are written only when
+            # the FULL cube set lands. events_archived counts dirs
+            # materialised; events_incomplete_discarded counts dump
+            # events dropped (and partial cubes deleted) because fewer
+            # than plot_expected_cube_count cubes arrived in
+            # plot_cube_wait_s.
+            "events_archived": 0,
+            "events_incomplete_discarded": 0,
             "csv_rotations": 0,
             "csv_removed": 0,
         }
@@ -994,43 +1033,12 @@ class CoincidencerService:
             self._last_trigger_class = trigger_class.name
             self._last_event_mjd = stats.t_peak_mjd
 
-            # Audit-trail writes happen unconditionally so the operator
-            # can replay a suppressed event from /dataz/dsa110/candidates
-            # exactly as they would a triggered one.
-            ev_dir = self._archive.create(event_name)
-            self._archive.write_c2_cluster_csv(
-                ev_dir, event_name, stats,
-                trigger_class=trigger_class.name, trigger=event_name,
-            )
-            # M7.4 Phase 6c.A: tag injection-matching members so the
-            # per-event C1 window CSV labels them. matched_inj_id is
-            # side-effect-free and walks the same registry the
-            # batch-time try_match consults.
-            member_inj_ids: Dict[int, str] = {}
-            for m in members:
-                label = self._inject_matcher.matched_inj_id(
-                    dm_pc_cc=m.dm_pc_cc,
-                    l_rad=m.l_rad,
-                    m_rad=m.m_rad,
-                    width_samples=m.width_samples,
-                    snr=m.snr,
-                )
-                if label is not None:
-                    member_inj_ids[id(m)] = label
-            self._archive.write_c1_window_csv(
-                ev_dir, event_name, members, trigger=event_name,
-                inj_ids=member_inj_ids,
-            )
-            self._archive.write_l3_metadata(
-                ev_dir, event_name,
-                stats_to_l3_metadata(
-                    event_name=event_name,
-                    stats=stats,
-                    trigger_class_name=trigger_class.name,
-                    trigger_action=trigger_class.action,
-                    holdoff_s=trigger_class.holdoff_s,
-                ),
-            )
+            # The hourly C2 CSV (csv_dir_c2, OUTSIDE the candidates
+            # tree) is the unconditional audit trail. The per-event
+            # directory under /dataz/dsa110/candidates is written ONLY
+            # once the full cube set has landed (2026-06-09 operator
+            # request): suppressed / rate-capped / under-delivered
+            # events never leave a directory behind.
             self._c2_csv.append_row(
                 stats_to_csv_row(
                     stats, trigger_class=trigger_class.name,
@@ -1040,10 +1048,10 @@ class CoincidencerService:
             )
 
             if not dumps_enabled:
-                # Suppressed path: NO UDP fan-out, NO plot scheduling
-                # (there will be no cubes to plot), and roll back the
-                # per-class holdoff so the next genuine trigger after
-                # dumps re-enable fires immediately.
+                # Suppressed path: NO UDP fan-out, NO event dir, NO
+                # plot scheduling (there will be no cubes), and roll
+                # back the per-class holdoff so the next genuine
+                # trigger after dumps re-enable fires immediately.
                 self._counters["triggers_suppressed"] += 1
                 self._criteria.restore_last_fired_at(
                     trigger_class.name, prev_holdoff,
@@ -1059,8 +1067,9 @@ class CoincidencerService:
             # 2026-05-30 dump-rate cap: even with dumps enabled, bound how
             # many full-fleet dump broadcasts fire per rolling window so a
             # persistently-noisy source cannot drive a cube-dump storm (the
-            # proximate cause of the C2 stall). The audit trail above is
-            # still written; we skip only the UDP fan-out + plot scheduling.
+            # proximate cause of the C2 stall). The hourly C2 CSV row above
+            # is still written; we skip the UDP fan-out + plot scheduling
+            # (and hence the event dir — no cubes, no dir).
             # Holdoff stays advanced so normal per-class backoff applies.
             if self._dump_rate_exceeded():
                 self._counters["dumps_rate_capped"] += 1
@@ -1087,13 +1096,35 @@ class CoincidencerService:
             self._counters["broadcast_send_fail"] += fail
             self._counters["triggers_dump"] += 1
 
-            # Schedule the plot job; the dispatcher loop watches for
-            # cubes to arrive (or the 60-second deadline).
+            # M7.4 Phase 6c.A: tag injection-matching members NOW (the
+            # inject registry is time-sensitive; matching at archive
+            # time would miss). matched_inj_id is side-effect-free and
+            # walks the same registry the batch-time try_match consults.
+            member_inj_ids: Dict[int, str] = {}
+            for m in members:
+                label = self._inject_matcher.matched_inj_id(
+                    dm_pc_cc=m.dm_pc_cc,
+                    l_rad=m.l_rad,
+                    m_rad=m.m_rad,
+                    width_samples=m.width_samples,
+                    snr=m.snr,
+                )
+                if label is not None:
+                    member_inj_ids[id(m)] = label
+
+            # Schedule the event; the dispatcher loop watches for the
+            # FULL cube set to arrive (or the deadline). The per-event
+            # archive directory + CSVs + L3 metadata are written there,
+            # only on a complete cube set.
             self._pending_plots[event_name] = _PendingPlot(
                 event_name=event_name,
                 submitted_at_monotonic=time.monotonic(),
                 stats=stats,
                 members=tuple(members),
+                trigger_class_name=trigger_class.name,
+                trigger_action=trigger_class.action,
+                trigger_holdoff_s=trigger_class.holdoff_s,
+                member_inj_ids=member_inj_ids,
             )
             _LOG.info(
                 "DUMP class=%s name=%s n=%d snr_max=%.2f dm_med=%.2f "
@@ -1154,46 +1185,133 @@ class CoincidencerService:
         except asyncio.CancelledError:
             return
 
+    def _write_event_archive(self, pp: _PendingPlot) -> Path:
+        """Materialise ``<archive_root>/<event_name>/`` (dir tree +
+        Level2 CSVs + Level3 metadata) for a completed cube set.
+
+        Deferred from fire time (2026-06-09) so the directory only
+        ever exists for events whose full cube set landed. The
+        ``cubes/`` subdir typically already exists — the search-node
+        uploaders rsync straight into it — and ``create()`` is
+        idempotent over it.
+        """
+        name = pp.event_name
+        ev_dir = self._archive.create(name)
+        self._archive.write_c2_cluster_csv(
+            ev_dir, name, pp.stats,
+            trigger_class=pp.trigger_class_name, trigger=name,
+        )
+        self._archive.write_c1_window_csv(
+            ev_dir, name, list(pp.members), trigger=name,
+            inj_ids=pp.member_inj_ids,
+        )
+        self._archive.write_l3_metadata(
+            ev_dir, name,
+            stats_to_l3_metadata(
+                event_name=name,
+                stats=pp.stats,
+                trigger_class_name=pp.trigger_class_name,
+                trigger_action=pp.trigger_action,
+                holdoff_s=pp.trigger_holdoff_s,
+            ),
+        )
+        return ev_dir
+
+    def _discard_partial_event_dir(self, name: str) -> None:
+        """Remove a partial ``<archive_root>/<name>/`` left behind by
+        cube rsyncs for an event that never completed. Validated +
+        best-effort; never raises."""
+        if not name or "/" in name or name.startswith("."):
+            return
+        ev_dir = self._config.event_archive_root / name
+        if not ev_dir.is_dir():
+            return
+        try:
+            shutil.rmtree(ev_dir)
+            _LOG.info("removed partial event dir %s", ev_dir)
+        except OSError as exc:
+            _LOG.warning("could not remove partial dir %s: %s", ev_dir, exc)
+
     async def _plot_dispatcher_loop(self) -> None:
-        """Periodically scan pending plot jobs; dispatch when cubes land
-        or the deadline expires."""
+        """Periodically scan pending events.
+
+        * Full cube set arrived → write the per-event archive dir +
+          CSVs + L3 metadata, then dispatch the plot job.
+        * Deadline expired with an incomplete set → discard: no
+          archive dir is written and any partial ``cubes/`` rsynced
+          by the search nodes is deleted (2026-06-09: a burst dir in
+          /dataz/dsa110/candidates exists iff ALL cubes were dumped).
+
+        A straggler rsync can re-create a partial dir moments after
+        the deadline discard; ``_discarded_events`` re-sweeps each
+        discarded name once more after ``_DISCARD_RESWEEP_S``.
+        """
         try:
             while True:
                 await asyncio.sleep(self._config.plot_dispatch_poll_s)
-                if not self._pending_plots:
-                    continue
-                now_mono = time.monotonic()
-                ready: List[str] = []
-                for name, pp in list(self._pending_plots.items()):
-                    cubes_dir = (
-                        self._config.event_archive_root / name / "cubes"
-                    )
-                    n_cubes = 0
-                    if cubes_dir.is_dir():
-                        n_cubes = sum(
-                            1 for p in cubes_dir.glob("cube_s*_g*_*.npz")
-                            if p.is_file()
-                        )
-                    age = now_mono - pp.submitted_at_monotonic
-                    if (
-                        n_cubes >= self._config.plot_expected_cube_count
-                        or age >= self._config.plot_cube_wait_s
-                    ):
-                        ready.append(name)
-                for name in ready:
-                    pp = self._pending_plots.pop(name)
-                    enqueue_event(
-                        self._plot_worker, name,
-                        self._config.event_archive_root,
-                        stats=pp.stats, members=list(pp.members),
-                    )
-                    self._counters["plots_dispatched"] += 1
-                    _LOG.info(
-                        "plot dispatched for %s (waited %.1fs)",
-                        name, now_mono - pp.submitted_at_monotonic,
-                    )
+                self._scan_pending_events(time.monotonic())
         except asyncio.CancelledError:
             return
+
+    def _scan_pending_events(self, now_mono: float) -> None:
+        """One dispatcher pass (factored out of the loop for tests)."""
+        # Re-sweep straggler partial dirs from earlier discards.
+        for name, t_disc in list(self._discarded_events.items()):
+            if now_mono - t_disc >= self._DISCARD_RESWEEP_S:
+                self._discard_partial_event_dir(name)
+                del self._discarded_events[name]
+
+        if not self._pending_plots:
+            return
+        ready: List[str] = []
+        expired: List[Tuple[str, int]] = []
+        for name, pp in list(self._pending_plots.items()):
+            cubes_dir = (
+                self._config.event_archive_root / name / "cubes"
+            )
+            n_cubes = 0
+            if cubes_dir.is_dir():
+                n_cubes = sum(
+                    1 for p in cubes_dir.glob("cube_s*_g*_*.npz")
+                    if p.is_file()
+                )
+            age = now_mono - pp.submitted_at_monotonic
+            if n_cubes >= self._config.plot_expected_cube_count:
+                ready.append(name)
+            elif age >= self._config.plot_cube_wait_s:
+                expired.append((name, n_cubes))
+        for name in ready:
+            pp = self._pending_plots.pop(name)
+            try:
+                self._write_event_archive(pp)
+                self._counters["events_archived"] += 1
+            except Exception:                              # noqa: BLE001
+                _LOG.exception(
+                    "event archive write failed for %s "
+                    "(plot still dispatched)", name,
+                )
+            enqueue_event(
+                self._plot_worker, name,
+                self._config.event_archive_root,
+                stats=pp.stats, members=list(pp.members),
+            )
+            self._counters["plots_dispatched"] += 1
+            _LOG.info(
+                "plot dispatched for %s (waited %.1fs)",
+                name, now_mono - pp.submitted_at_monotonic,
+            )
+        for name, n_cubes in expired:
+            self._pending_plots.pop(name, None)
+            self._counters["events_incomplete_discarded"] += 1
+            _LOG.warning(
+                "DISCARD %s: %d/%d cubes after %.0fs -- no "
+                "event dir written; partial cubes removed",
+                name, n_cubes,
+                self._config.plot_expected_cube_count,
+                self._config.plot_cube_wait_s,
+            )
+            self._discard_partial_event_dir(name)
+            self._discarded_events[name] = now_mono
 
     async def _mon_publish_loop(self) -> None:
         try:

@@ -387,18 +387,24 @@ async def test_dumps_enabled_path_broadcasts_normally(tmp_path: Path) -> None:
     assert len(bc.calls) == 1
     assert svc._counters["triggers_dump"] == 1
     assert svc._counters["triggers_suppressed"] == 0
-    # Archive directory + C2 CSV row must exist on the dumped path.
+    # 2026-06-09: the event dir is deferred until the full cube set
+    # lands — at fire time only a pending event exists, NO directory.
     events_root = tmp_path / "events"
-    assert events_root.exists()
-    assert any(events_root.iterdir()), "no event archive directory created"
+    assert not events_root.exists() or not any(events_root.iterdir()), (
+        "event dir must not be created at fire time"
+    )
+    assert len(svc._pending_plots) == 1
 
 
 @asyncio_test
-async def test_suppressed_path_writes_archive_but_no_broadcast(
+async def test_suppressed_path_no_archive_dir_no_broadcast(
     tmp_path: Path, caplog,
 ) -> None:
-    """Suppression: archive row written, NO broadcast, WOULD-DUMP logged
-    instead of DUMP, suppressed counter incremented.
+    """Suppression: NO broadcast, NO event dir (2026-06-09: dirs only
+    exist for events whose full cube set landed — dumps off means no
+    cubes, so no dir, ever), WOULD-DUMP logged instead of DUMP,
+    suppressed counter incremented. The hourly C2 CSV row is still
+    written as the audit trail.
     """
     svc, bc, _ = _make_service(tmp_path, dumps_enabled=False)
     with caplog.at_level(logging.INFO, logger="dsart.services.coincidencer"):
@@ -411,9 +417,15 @@ async def test_suppressed_path_writes_archive_but_no_broadcast(
     # Counters: suppressed bumped, dump not bumped.
     assert svc._counters["triggers_dump"] == 0
     assert svc._counters["triggers_suppressed"] == 1
-    # Archive row still written.
+    # No event dir, and no pending event either (nothing to wait for).
     events_root = tmp_path / "events"
-    assert any(events_root.iterdir()), "archive should still be created"
+    assert not events_root.exists() or not any(events_root.iterdir()), (
+        "suppressed events must not leave a directory in candidates/"
+    )
+    assert svc._pending_plots == {}
+    # The hourly C2 CSV audit row was still appended.
+    csv_files = list((tmp_path / "c2").rglob("*.csv"))
+    assert csv_files, "hourly C2 CSV audit row should still be written"
     # Log line is WOULD-DUMP, not DUMP. The exact format is
     # documented to the operator (their grep patterns key off it).
     msgs = [rec.message for rec in caplog.records]
@@ -593,3 +605,112 @@ def _log_only_criteria_file(tmp_path: Path, *, suffix: str) -> Path:
         "    holdoff_s: 30.0\n"
     )
     return p
+
+
+# ---------------------------------------------------------------------------
+# Deferred event-dir semantics (2026-06-09): a burst dir under
+# event_archive_root exists iff the FULL cube set arrived. These tests
+# drive the fire path with the gate enabled, then exercise
+# _scan_pending_events directly (the dispatcher loop's single pass).
+# ---------------------------------------------------------------------------
+
+
+def _drop_cubes(events_root: Path, name: str, n: int) -> None:
+    """Simulate search-node rsyncs landing n cubes for an event."""
+    cubes = events_root / name / "cubes"
+    cubes.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        sid = 1 + (i // 2)
+        g = i % 2
+        (cubes / f"cube_s{sid}_g{g}_12345.npz").write_bytes(b"\x00")
+
+
+@asyncio_test
+async def test_complete_cube_set_writes_archive_and_dispatches_plot(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Once all plot_expected_cube_count cubes have landed, the
+    dispatcher pass writes the per-event dir (Level2 CSVs + Level3
+    metadata) and dispatches the plot.
+    """
+    import time as _time
+
+    import dsart.services.coincidencer as c2mod
+
+    enqueued: List[str] = []
+    monkeypatch.setattr(
+        c2mod, "enqueue_event",
+        lambda worker, name, root, **kw: enqueued.append(name),
+    )
+    svc, bc, _ = _make_service(tmp_path, dumps_enabled=True)
+    await svc._on_batch(
+        _batch(mjd_start=60781.0, n=2, snr=20.0), peer_repr="x",
+    )
+    assert len(bc.calls) == 1
+    name = svc._last_event_name
+    assert name is not None
+    events_root = tmp_path / "events"
+
+    # Not enough cubes yet → nothing happens.
+    _drop_cubes(events_root, name, svc._config.plot_expected_cube_count - 1)
+    svc._scan_pending_events(_time.monotonic())
+    assert name in svc._pending_plots
+    assert not (events_root / name / "Level3").exists()
+    assert enqueued == []
+
+    # Full set lands → archive written + plot dispatched.
+    _drop_cubes(events_root, name, svc._config.plot_expected_cube_count)
+    svc._scan_pending_events(_time.monotonic())
+    assert svc._pending_plots == {}
+    assert enqueued == [name]
+    assert svc._counters["events_archived"] == 1
+    assert svc._counters["plots_dispatched"] == 1
+    ev = events_root / name
+    assert (ev / "Level2" / f"C2_{name}.csv").is_file()
+    assert (ev / "Level2" / f"C1_window_{name}.csv").is_file()
+    assert (ev / "Level3" / f"{name}.json").is_file()
+
+
+@asyncio_test
+async def test_incomplete_cube_set_discards_and_removes_partial_dir(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Deadline expiry with a partial cube set: the event is dropped,
+    the partial dir is deleted, no plot is dispatched, and a straggler
+    rsync re-creating the dir is swept again after _DISCARD_RESWEEP_S.
+    """
+    import time as _time
+
+    import dsart.services.coincidencer as c2mod
+
+    enqueued: List[str] = []
+    monkeypatch.setattr(
+        c2mod, "enqueue_event",
+        lambda worker, name, root, **kw: enqueued.append(name),
+    )
+    svc, bc, _ = _make_service(tmp_path, dumps_enabled=True)
+    await svc._on_batch(
+        _batch(mjd_start=60781.0, n=2, snr=20.0), peer_repr="x",
+    )
+    name = svc._last_event_name
+    assert name is not None
+    events_root = tmp_path / "events"
+    _drop_cubes(events_root, name, 3)               # partial only
+
+    now = _time.monotonic() + svc._config.plot_cube_wait_s + 1.0
+    svc._scan_pending_events(now)
+    assert svc._pending_plots == {}
+    assert enqueued == []
+    assert svc._counters["events_incomplete_discarded"] == 1
+    assert svc._counters["events_archived"] == 0
+    assert not (events_root / name).exists(), (
+        "partial event dir must be removed on discard"
+    )
+
+    # Straggler rsync re-creates the partial dir after the discard...
+    _drop_cubes(events_root, name, 1)
+    assert (events_root / name).exists()
+    # ...and the re-sweep removes it once _DISCARD_RESWEEP_S elapses.
+    svc._scan_pending_events(now + svc._DISCARD_RESWEEP_S + 1.0)
+    assert not (events_root / name).exists()
+    assert svc._discarded_events == {}
