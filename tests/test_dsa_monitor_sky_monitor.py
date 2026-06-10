@@ -346,6 +346,11 @@ def test_annotated_frame_with_nvss(tmp_path, monkeypatch):
     assert src["row"] == pytest.approx(n_pix // 2, abs=1.0)
     assert src["col"] == pytest.approx(n_pix // 2, abs=1.0)
     assert src["snr"] is not None
+    # JSON sidecar drives the page-side source table.
+    sidecar = json.loads(png_path.with_suffix(".json").read_text())
+    assert sidecar["ra0_deg"] == pytest.approx(10.0)
+    assert [s["name"] for s in sidecar["nvss"]] == ["NVSS JX"]
+    assert mon.store.resolve_sidecar(day, png) is not None
 
 
 def test_robust_sigma_ignores_bright_sources():

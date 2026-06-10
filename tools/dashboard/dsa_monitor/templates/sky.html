@@ -16,9 +16,9 @@
         color: #dfe6e9;
     }
     .sky-viewer img {
-        /* Annotated figures (RA/Dec grid + NVSS overlay) are
-           740×780 px; older bare frames scale up smoothly. */
-        width: 740px;
+        /* Annotated figures (RA/Dec grid + colorbar) are 800×780 px;
+           older bare frames scale up smoothly. */
+        width: 780px;
         height: auto;
         image-rendering: auto;
         background: #000;
@@ -86,9 +86,9 @@
     Frames are 2× oversampled (UV zero-padding — exact band-limited
     interpolation, same FOV) and pillbox grid-corrected so edge sources
     show at true relative strength. The RA/Dec graticule assumes the
-    meridian phase center (α₀ = LST, δ₀ = obs dec); yellow circles mark
-    NVSS sources ≥ 100 mJy, labelled with catalog flux and the measured
-    S/N (peak pixel within a 90″ aperture). North up, east <b>right</b>.
+    meridian phase center (α₀ = LST, δ₀ = obs dec); NVSS sources
+    ≥ 100 mJy inside the field are listed beside the image.
+    North up, east <b>right</b>.
     If bright continuum sources are not visible here, the search is not
     seeing the sky. <b>Manual refresh only.</b>
     Frames live under <code>{{ sky_root }}</code>.
@@ -119,7 +119,12 @@
     </div>
 
     <div class="sky-side">
-        <h3 style="margin-top:0;">Fleet snapshot status</h3>
+        <h3 style="margin-top:0;">NVSS sources in field</h3>
+        <p style="margin:4px 0;">Catalog sources ≥ 100 mJy inside the
+           displayed frame's FOV (brightest first).</p>
+        <div id="sky-nvss">–</div>
+
+        <h3>Fleet snapshot status</h3>
         <p>Which corr nodes (chgroups) have posted a snapshot recently.
            Updated on Refresh.</p>
         <div id="sky-status">–</div>
@@ -146,6 +151,34 @@
         return new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC";
     }
 
+    let nvssToken = 0;
+    async function refreshNvss(f) {
+        const el = document.getElementById("sky-nvss");
+        const token = ++nvssToken;
+        try {
+            const r = await fetch("/sky/frame_meta/" + f.day + "/" + f.png);
+            const j = await r.json();
+            if (token !== nvssToken) return;   /* stale (user scrubbed on) */
+            const srcs = (j.nvss || []);
+            if (!srcs.length) {
+                el.textContent = "none in field";
+                return;
+            }
+            let rows = "";
+            srcs.forEach(function (s) {
+                rows += "<tr><td>" + s.name + "</td><td>" +
+                    s.flux_mjy.toFixed(0) + "</td><td>" +
+                    s.ra_deg.toFixed(4) + "</td><td>" +
+                    s.dec_deg.toFixed(4) + "</td></tr>";
+            });
+            el.innerHTML =
+                "<table><tr><th>Name</th><th>S<sub>1.4</sub> (mJy)</th>" +
+                "<th>RA (°)</th><th>Dec (°)</th></tr>" + rows + "</table>";
+        } catch (e) {
+            if (token === nvssToken) el.textContent = "source list error: " + e;
+        }
+    }
+
     function show(i) {
         if (!frames.length) {
             img.removeAttribute("src");
@@ -161,12 +194,14 @@
         meta.innerHTML = fmtUtc(f.ts) + badge;
         slider.value = idx;
         pos.textContent = (idx + 1) + " / " + frames.length;
+        if (!playing) refreshNvss(f);          /* skip fetch storm at 5 fps */
     }
 
     function stopPlay() {
         playing = false;
         playBtn.innerHTML = "&#9654;";
         if (playTimer) { clearInterval(playTimer); playTimer = null; }
+        if (frames.length) refreshNvss(frames[idx]);
     }
 
     playBtn.addEventListener("click", function () {

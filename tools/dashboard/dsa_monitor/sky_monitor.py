@@ -91,7 +91,7 @@ PNG_VMAX_SIGMA: float = 10.0
 #: Frame filename: sky_<unix_ts:int>_n<chgroups>.png / .npz. The ts and
 #: chgroup count are encoded in the name so the index endpoint never
 #: has to open the NPZ.
-_FRAME_RE = re.compile(r"^sky_(?P<ts>\d+)_n(?P<ncg>\d+)\.(?:png|npz)$")
+_FRAME_RE = re.compile(r"^sky_(?P<ts>\d+)_n(?P<ncg>\d+)\.(?:png|npz|json)$")
 
 
 def parse_snapshot_npz(body: bytes) -> dict[str, Any]:
@@ -312,12 +312,12 @@ def render_annotated_png(
     ra0_deg: float,
     dec0_deg: float,
     fov_rad: float,
-    nvss_rows: list[dict[str, Any]],
     ts: float,
     used_chgroups: list[int],
 ) -> None:
     """Write the sigma-stretched greyscale frame with an RA/Dec grid
-    and NVSS source markers (2026-06-09 request).
+    and a colorbar (2026-06-09 request, source markers removed
+    2026-06-10 — in-FOV NVSS sources are listed on the page instead).
 
     Axes are (l, m) offsets in degrees about the meridian phase center
     (origin='lower': north up, east RIGHT — instrument frame). The
@@ -328,14 +328,17 @@ def render_annotated_png(
     half = fov_deg / 2.0
     img_sigma = (image - median) / sigma
 
-    fig = Figure(figsize=(7.4, 7.8), dpi=100)
+    fig = Figure(figsize=(8.0, 7.8), dpi=100)
     ax = fig.add_subplot(111)
-    ax.imshow(
+    im = ax.imshow(
         img_sigma, cmap="gray",
         vmin=PNG_VMIN_SIGMA, vmax=PNG_VMAX_SIGMA,
         origin="lower", extent=(-half, half, -half, half),
         interpolation="nearest",
     )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    cbar.set_label("σ (robust per-frame MAD)", fontsize=8)
+    cbar.ax.tick_params(labelsize=8)
     ax.set_xlim(-half, half)
     ax.set_ylim(-half, half)
     ax.set_xlabel("l offset (deg) — east →")
@@ -388,29 +391,12 @@ def render_annotated_png(
             ax.text(ld[i], max(md[i], -half * 0.99), f"{hh:02d}h{mm:04.1f}m",
                     va="bottom", ha="center", rotation=90, **lbl_kw)
 
-    # ---- NVSS sources ------------------------------------------------------
-    for src in nvss_rows:
-        ld = float(np.rad2deg(src["l_rad"]))
-        md = float(np.rad2deg(src["m_rad"]))
-        ax.plot(
-            ld, md, "o", mfc="none", mec="#ffe066", mew=1.1,
-            ms=11.0, alpha=0.95, zorder=5,
-        )
-        snr = src.get("snr")
-        snr_txt = "—" if snr is None or not np.isfinite(snr) else f"{snr:.1f}σ"
-        ax.annotate(
-            f"{src['flux_mjy']:.0f} mJy / {snr_txt}",
-            xy=(ld, md), xytext=(5, 5), textcoords="offset points",
-            color="#ffe066", fontsize=7, zorder=5,
-        )
-
     utc = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S",
     )
     ax.set_title(
         f"{utc} UTC   |   center RA {ra0_deg / 15.0:.4f} h  "
-        f"Dec {dec0_deg:+.3f}°   |   {len(used_chgroups)}/16 chgroups   |   "
-        f"NVSS ≥ {NVSS_MIN_MJY:.0f} mJy",
+        f"Dec {dec0_deg:+.3f}°   |   {len(used_chgroups)}/16 chgroups",
         fontsize=9,
     )
     fig.tight_layout()
@@ -456,10 +442,11 @@ class SkyFrameStore:
 
         ``annotate`` (2026-06-09): when provided
         (``{ra0_deg, dec0_deg, fov_rad, nvss_rows}``), the PNG becomes
-        an annotated figure with an RA/Dec graticule + NVSS markers
-        (:func:`render_annotated_png`); falls back to the bare
-        greyscale dump if the figure render throws. The NPZ raw image
-        is unchanged either way.
+        an annotated figure with an RA/Dec graticule + colorbar
+        (:func:`render_annotated_png`) and a ``<stem>.json`` sidecar is
+        written carrying the in-FOV NVSS source list for the page-side
+        table; falls back to the bare greyscale dump if the figure
+        render throws. The NPZ raw image is unchanged either way.
         """
         day_dir = self.frames_dir / self._day(ts)
         day_dir.mkdir(parents=True, exist_ok=True)
@@ -476,7 +463,6 @@ class SkyFrameStore:
                     ra0_deg=float(annotate["ra0_deg"]),
                     dec0_deg=float(annotate["dec0_deg"]),
                     fov_rad=float(annotate["fov_rad"]),
-                    nvss_rows=annotate.get("nvss_rows", []),
                     ts=ts, used_chgroups=used_chgroups,
                 )
                 wrote_png = True
@@ -485,6 +471,19 @@ class SkyFrameStore:
                     "annotated frame render failed; falling back to "
                     "bare greyscale",
                 )
+            try:
+                sidecar = {
+                    "ra0_deg": float(annotate["ra0_deg"]),
+                    "dec0_deg": float(annotate["dec0_deg"]),
+                    "fov_deg": float(np.rad2deg(float(annotate["fov_rad"]))),
+                    "nvss_min_mjy": NVSS_MIN_MJY,
+                    "nvss": annotate.get("nvss_rows", []),
+                }
+                (day_dir / f"{stem}.json").write_text(
+                    json.dumps(sidecar), encoding="utf-8",
+                )
+            except OSError:
+                LOG.warning("could not write frame sidecar %s.json", stem)
         if not wrote_png:
             img_sigma = (image - median) / sigma
             # origin='lower' so +m (north) is up, matching the cube
@@ -545,6 +544,15 @@ class SkyFrameStore:
         if not name.endswith(".png"):
             return None
         p = self.frames_dir / day / name
+        return p if p.is_file() else None
+
+    def resolve_sidecar(self, day: str, png_name: str) -> Optional[Path]:
+        """Validated path of the ``.json`` sidecar for a frame PNG.
+        Returns None when missing (e.g. pre-overlay frames)."""
+        png = self.resolve_png(day, png_name)
+        if png is None:
+            return None
+        p = png.with_suffix(".json")
         return p if p.is_file() else None
 
     def prune(self, *, now: float) -> int:

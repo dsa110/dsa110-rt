@@ -433,6 +433,22 @@ def sky_frame_png(day: str, name: str):
     return send_file(str(p), mimetype="image/png")
 
 
+@app.route("/sky/frame_meta/<day>/<name>")
+def sky_frame_meta(day: str, name: str):
+    """JSON sidecar of a frame (in-FOV NVSS source list + astrometry).
+    ``{"ok": true, "nvss": []}`` for pre-overlay frames so the page
+    table just renders empty."""
+    p = sky_mon.store.resolve_sidecar(day, name)
+    if p is None:
+        return jsonify({"ok": True, "nvss": []})
+    try:
+        import json as _json
+        return jsonify({"ok": True, **_json.loads(p.read_text())})
+    except Exception as exc:                            # noqa: BLE001
+        LOG.exception("sky frame_meta failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/sky/status", methods=["GET"])
 def sky_status():
     """Per-chgroup snapshot freshness + frame counters (debugging
