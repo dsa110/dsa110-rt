@@ -7,12 +7,17 @@ NPZs (one per ``(search_node, gpu_half)``) along DM, then renders
 four PNGs into ``Level2/plots/`` (see ``docs/c1c2/C1C2_DESIGN.md``
 §3.7):
 
-  1. ``dm_time_<name>.png``        — DM vs time waterfalls for ALL
-     dumped cubes (one panel per (search_node, gpu_half), 2026-06-10),
-     each max-projected over (l, m), on a shared colour scale so the
-     dispersed bowtie tails in the non-owning halves are visible
-     alongside the owning half. Crosshair at the detected
-     (t_peak, DM_peak) on the burst panel.
+  1. ``dm_time_<name>.png``        — ONE DM vs time waterfall built by
+     stacking ALL dumped cubes' fine-DM rows in (search_node,
+     gpu_half) order (2026-06-10), i.e. contiguous DM coverage over
+     the whole searched range, each cube max-projected over (l, m).
+     Every fine-DM row is robustly re-normalised (median/MAD over
+     time) so rows from different halves — whose image-max baselines
+     and Layer-1/2 calibrations differ slightly — share one σ-unit
+     colour scale, keeping the dispersed bowtie tails in the
+     non-owning halves visible alongside the owning half. Crosshair
+     at the detected (t_peak, DM_peak); dashed separators mark the
+     half boundaries.
   2. ``image_peak_<name>.png``     — image plane at the detected
      (DM_peak, t_peak), with a reticle at the detected (l, m).
   3. ``lightcurve_<name>.png``     — time series at the detected DM,
@@ -879,6 +884,26 @@ def _provenance(coords: Optional[_BurstCoords]) -> str:
     return "" if coords.from_metadata else "  [no metadata: cube argmax]"
 
 
+def _robust_row_normalise(img: np.ndarray) -> np.ndarray:
+    """Per-row (fine-DM) robust z-score of a ``(n_rows, t)`` waterfall.
+
+    Each row is the time series of the per-plane image MAX, so its
+    baseline is an extreme-value statistic (≈4–5 σ for a 256×256
+    Gaussian plane) whose level/spread varies slightly per fine-DM
+    trial and — when stacking cubes from different halves — per
+    (search_node, gpu_half) Layer-1/2 calibration. Subtracting the
+    per-row median and dividing by 1.4826×MAD puts every row in
+    comparable "σ above its own quiescent max" units without letting
+    the burst itself bias the scale (median/MAD ignore a few bright
+    samples). Rows with zero MAD (constant) fall back to σ=1.
+    """
+    med = np.nanmedian(img, axis=1, keepdims=True)
+    mad = np.nanmedian(np.abs(img - med), axis=1, keepdims=True)
+    sigma = 1.4826 * mad
+    sigma[~np.isfinite(sigma) | (sigma <= 0.0)] = 1.0
+    return (img - med) / sigma
+
+
 def _render_dm_time(
     plots_dir: Path,
     event_name: str,
@@ -886,104 +911,105 @@ def _render_dm_time(
     burst: Optional[_CubeChunk],
     coords: Optional[_BurstCoords],
 ) -> Path:
-    """8-panel (one per (search_node, gpu_half)) DM × time figure.
+    """Single stacked DM × time waterfall over ALL dumped cubes.
 
-    2026-06-10 redesign: previously this rendered only the burst
-    cube's waterfall; now every dumped cube gets a panel, on a SHARED
-    colour scale, so the dispersed bowtie tails in the non-owning
-    halves are visible alongside the owning half. The burst panel
-    carries the detection crosshair and a highlighted border.
+    2026-06-10 redesign (v2): one panel, with every cube's fine-DM
+    rows stacked in (search_node, gpu_half) order — contiguous DM
+    coverage over the whole searched range, so the full dispersion
+    bowtie (owning half + non-owning tails) reads as one figure.
+    Rows are robustly re-normalised (see :func:`_robust_row_normalise`)
+    so all halves share one σ colour scale. Dashed lines mark half
+    boundaries; the crosshair marks the detected (t_peak, DM_peak).
     """
     path = plots_dir / f"dm_time_{event_name}.png"
     if not waterfalls:
         return _placeholder(path, f"DM × time — {event_name}", "no cube data")
     import matplotlib.pyplot as plt
 
-    n = len(waterfalls)
-    ncols = min(4, n)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(4.4 * ncols, 3.4 * nrows),
-        squeeze=False, sharex=False, sharey=False,
+    # Stack to (n_rows_total, t): waterfalls arrive (t_det, n_fdm)
+    # sorted by (sid, g) == ascending DM coverage. Crop to the common
+    # time length in case a half dumped a different-geometry cube.
+    t_common = min(int(wf.shape[0]) for _, wf in waterfalls)
+    blocks = [
+        np.asarray(wf[:t_common, :].T, dtype=np.float32)
+        for _, wf in waterfalls
+    ]
+    stacked = _robust_row_normalise(np.concatenate(blocks, axis=0))
+
+    # Per-half row offsets (for boundary lines, labels, crosshair).
+    offsets: List[int] = []
+    labels: List[str] = []
+    row0 = 0
+    burst_row: Optional[int] = None
+    for (chunk, _), blk in zip(waterfalls, blocks):
+        offsets.append(row0)
+        labels.append(f"s{chunk.search_node_id}g{chunk.gpu_half}")
+        if burst is not None and chunk is burst and coords is not None:
+            burst_row = row0 + int(
+                np.clip(coords.fdm_idx, 0, blk.shape[0] - 1)
+            )
+        row0 += blk.shape[0]
+    n_rows = row0
+
+    # Colour scale in robust-σ units: floor a little below baseline,
+    # ceiling at the brighter of the p99.9 tail and half the true
+    # peak so the detected burst can't be normalised off the page.
+    finite = stacked[np.isfinite(stacked)]
+    if finite.size:
+        vmax = float(np.percentile(finite, 99.9))
+        vmax = max(vmax, 0.5 * float(finite.max()), 1.0)
+    else:
+        vmax = 1.0
+    vmin = -2.0
+
+    fig, ax = plt.subplots(figsize=(10.0, 9.0))
+    im = ax.imshow(
+        stacked, aspect="auto", origin="lower", cmap="viridis",
+        vmin=vmin, vmax=vmax, interpolation="nearest",
+    )
+    fig.colorbar(
+        im, ax=ax, label="image-max amplitude (robust σ per DM row)",
+        pad=0.01,
     )
 
-    # Shared colour scale across all panels: each half is Layer-1/2
-    # σ-normalised, so amplitudes are directly comparable. A robust
-    # low anchor (median) with the global max keeps the bowtie tails
-    # (few σ) visible without letting one hot pixel crush the rest.
-    stack = np.concatenate([wf.ravel() for _, wf in waterfalls])
-    vmin = float(np.percentile(stack, 50.0))
-    vmax = float(np.percentile(stack, 99.98))
-    peak_amp = float(stack.max())
-    if coords is not None and np.isfinite(peak_amp):
-        # Never clip the detected burst's own amplitude off the scale
-        # by more than ~2×; lift vmax toward the true peak.
-        vmax = max(vmax, 0.5 * peak_amp)
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-        vmin, vmax = None, None  # matplotlib autoscale fallback
+    # Half boundaries + per-half band labels on the y axis.
+    for off in offsets[1:]:
+        ax.axhline(off - 0.5, color="w", lw=0.7, ls=":", alpha=0.7)
+    next_offsets = offsets[1:] + [n_rows]
+    band_centres = [
+        (off + nxt) / 2.0 for off, nxt in zip(offsets, next_offsets)
+    ]
+    ax.set_yticks(band_centres)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_ylabel(
+        "fine-DM trials, stacked by (search node, gpu half) — "
+        "increasing DM ↑",
+        fontsize=10,
+    )
+    ax.set_xlabel("time sample (within cube)", fontsize=10)
 
-    im = None
-    for idx, (chunk, wf) in enumerate(waterfalls):
-        ax = axes[idx // ncols][idx % ncols]
-        img = wf.T  # (n_fdm, t_det): DM (y) vs time (x)
-        im = ax.imshow(
-            img, aspect="auto", origin="lower", cmap="viridis",
-            vmin=vmin, vmax=vmax,
-        )
-        is_burst = burst is not None and chunk is burst
-        label = f"s{chunk.search_node_id} g{chunk.gpu_half}"
-        if is_burst:
-            label += "  (burst)"
-            for spine in ax.spines.values():
-                spine.set_edgecolor(_RETICLE)
-                spine.set_linewidth(2.0)
-            if coords is not None:
-                if coords.t_idx is not None:
-                    ax.axvline(
-                        coords.t_idx, color=_RETICLE, lw=1.0,
-                        ls="--", alpha=0.9,
-                    )
-                ax.axhline(
-                    coords.fdm_idx, color=_RETICLE, lw=1.0,
-                    ls="--", alpha=0.9,
-                )
-                if coords.t_idx is not None:
-                    ax.plot(
-                        coords.t_idx, coords.fdm_idx, marker="+",
-                        color=_RETICLE, ms=14, mew=2.0,
-                    )
-        ax.set_title(label, fontsize=10)
-        # Outer-edge labels only — the grid stays readable.
-        if idx // ncols == nrows - 1:
-            ax.set_xlabel("time sample", fontsize=9)
-        if idx % ncols == 0:
-            ax.set_ylabel("fine-DM trial", fontsize=9)
-        ax.tick_params(labelsize=8)
-
-    # Hide unused grid slots (when fewer than nrows*ncols cubes).
-    for idx in range(n, nrows * ncols):
-        axes[idx // ncols][idx % ncols].set_axis_off()
-
-    title = f"DM × time waterfalls — {event_name}"
+    title = f"DM × time waterfall (all cubes) — {event_name}"
     if coords is not None:
+        if coords.t_idx is not None:
+            ax.axvline(
+                coords.t_idx, color=_RETICLE, lw=1.0, ls="--", alpha=0.9,
+            )
+        if burst_row is not None:
+            ax.axhline(
+                burst_row, color=_RETICLE, lw=1.0, ls="--", alpha=0.9,
+            )
+            if coords.t_idx is not None:
+                ax.plot(
+                    coords.t_idx, burst_row, marker="+",
+                    color=_RETICLE, ms=16, mew=2.0,
+                )
         title += (
             f" — burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
             f"SNR={coords.snr:.1f}" + _provenance(coords)
         )
-    fig.suptitle(title, fontsize=11)
-    if im is not None:
-        fig.colorbar(
-            im, ax=[a for row in axes for a in row],
-            label="image-max amplitude (σ)", shrink=0.85, pad=0.012,
-        )
-    # NOTE: no tight_layout — it is incompatible with the shared
-    # colorbar across a 2-D axes grid; rely on constrained spacing.
-    fig.subplots_adjust(
-        left=0.05, right=0.88, top=0.90, bottom=0.08,
-        hspace=0.32, wspace=0.22,
-    )
-    fig.savefig(path, dpi=100)
+    ax.set_title(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
     plt.close(fig)
     return path
 
