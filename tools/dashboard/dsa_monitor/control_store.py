@@ -507,10 +507,28 @@ def compute_system_state(
 
 #: Default margin in *blocks* (NPACKETS_PER_BLOCK = 2048 specnums each)
 #: ahead of the fleet's current ``block_n`` to schedule the injection.
-#: 16 blocks ≈ 2 s at the production 8 cubes/s rate, plenty of head-
-#: room for the etcd watch + ``OnlineInjector.add_pending`` round-trip
-#: while still landing the pulse in the next ~few cubes.
-DEFAULT_INJECT_MARGIN_BLOCKS: int = 16
+#:
+#: 2026-06-10 root-cause fix (16 → 32 blocks + staleness
+#: extrapolation, see below): the corr_fast mon-point is only
+#: published every 16 blocks (~2.1 s), and the old margin was ALSO
+#: 16 blocks (~2.1 s) — so the *effective* lead time was
+#: ``2.1 s − (publish-cycle staleness ∈ [0, 2.1 s]) ≈ 0–2.1 s``:
+#: pure luck of the publish phase. When it landed near zero, the
+#: command reached the corr nodes after their pipelines had already
+#: passed ``apply_at`` and ``OnlineInjector.apply_block`` silently
+#: dropped every channel whose dispersed window was in the past —
+#: only the band-bottom chgroups (largest dispersion delay, e.g.
+#: +280 ms at DM 500, +1.4 s at DM 2500) still contributed.
+#: Confirmed in events 260610snoe/mamv: the dumped cubes show a
+#: thin constant-width DM-time track whose slope implies an
+#: emitting frequency of 1.313 GHz = the band bottom, i.e. a
+#: partial-band injection. 32 blocks (~4.3 s) + the staleness
+#: extrapolation in :func:`compute_inject_apply_at` makes the
+#: effective lead deterministic (~4.3 s regardless of publish
+#: phase), still well inside the matcher TTL (60 s) and specnum
+#: gate (±4096 search samples ≈ ±4.3 s, measured from apply_at
+#: itself so the margin does not eat into it).
+DEFAULT_INJECT_MARGIN_BLOCKS: int = 32
 
 #: Local copy of ``corr_fast_integration.NPACKETS_PER_BLOCK``. Pinned
 #: here so the dashboard doesn't need to import torch via dsart.
@@ -518,6 +536,13 @@ DEFAULT_INJECT_MARGIN_BLOCKS: int = 16
 #: :func:`tests/test_dsa_monitor_control_store.py::TestComputeInjectApplyAt`
 #: assertions.
 NPACKETS_PER_BLOCK: int = 2048
+
+#: Wall-clock seconds per specnum (one specnum = one SNAP packet
+#: sequence number = 2 native samples = 2 × 32.768 µs). Used to
+#: extrapolate stale corr_fast mon-points to the live stream
+#: position. One block = 2048 specnums ≈ 134.2 ms (matches the
+#: observed production ``last_block_ms`` ≈ 120–137 ms).
+_SPECNUM_SECONDS: float = 65.536e-6
 
 
 def _corr_fast_mon_key(chgroup: int) -> str:
@@ -542,13 +567,29 @@ def compute_inject_apply_at(
     Walks ``/mon/corr_rt/<cn>/corr_fast`` for each requested chgroup,
     reads ``block_specnum_start`` + ``ts_mono``, drops entries older
     than ``max_age_s`` (stale publishers from a previous routine), and
-    returns ``max(block_specnum_start) + margin_blocks * NPACKETS_PER_BLOCK``.
+    returns ``max(extrapolated block_specnum_start) + margin_blocks *
+    NPACKETS_PER_BLOCK``.
 
     We pick the *max* (not min) so even the latest-running corr_fast
     has caught up to the target block by the time the inject fires.
     The margin then absorbs the per-chgroup clock skew across the
     fleet (typically a handful of blocks at steady state, more during
     startup).
+
+    2026-06-10 staleness extrapolation: the publisher only PUTs every
+    16 blocks (~2.1 s), so the raw ``block_specnum_start`` lags the
+    live pipeline by 0–2.1 s depending on where we land in the
+    publish cycle. We advance each publisher's value by
+    ``(now − ts_wall_unix) / SPECNUM_SECONDS`` specnums (the stream
+    runs in real time: one specnum = 2 native samples = 65.536 µs)
+    before taking the max, which makes the *effective* lead time
+    deterministic. Without this, an unlucky publish phase silently
+    consumed the entire old 16-block margin and the corr nodes
+    received commands whose ``apply_at`` was already in the past —
+    the band-top channels were then dropped on the floor (partial-
+    band injection, see ``DEFAULT_INJECT_MARGIN_BLOCKS`` docstring).
+    The extrapolation diagnostic is returned per-answer in
+    ``extrapolated_specnums`` (max over answered publishers).
 
     Returns a dict matching :func:`compute_arm_seq`'s shape:
 
@@ -584,6 +625,7 @@ def compute_inject_apply_at(
         "max_block_specnum_start": None,
         "max_source": None,
         "max_block_n": None,
+        "extrapolated_specnums": 0,
         "polled": [],
         "answered": [],
         "missing": [],
@@ -596,6 +638,7 @@ def compute_inject_apply_at(
     max_bss: int | None = None
     max_block_n: int | None = None
     max_src: str | None = None
+    max_extrap: int = 0
     for k in keys:
         try:
             d = store.get_dict(k)
@@ -612,16 +655,29 @@ def compute_inject_apply_at(
         if not isinstance(bss, int):
             out["missing"].append(k)
             continue
+        extrap = 0
         ts_wall = d.get("ts_wall_unix")
         if isinstance(ts_wall, (int, float)):
             age_s = float(now_wall - float(ts_wall))
             if age_s > max_age_s:
                 out["stale"].append(k)
                 continue
+            # Advance to the publisher's *live* position: the stream
+            # runs in real time at one specnum per SPECNUM_SECONDS,
+            # and the mon-point is only refreshed every ~16 blocks
+            # (~2.1 s). Round up to whole blocks so we never target a
+            # block boundary that has already started.
+            if age_s > 0.0:
+                blocks_elapsed = int(
+                    age_s / (_SPECNUM_SECONDS * NPACKETS_PER_BLOCK)
+                ) + 1
+                extrap = blocks_elapsed * NPACKETS_PER_BLOCK
         out["answered"].append(k)
-        if max_bss is None or bss > max_bss:
-            max_bss = int(bss)
+        live_bss = int(bss) + extrap
+        if max_bss is None or live_bss > max_bss:
+            max_bss = live_bss
             max_src = k
+            max_extrap = extrap
             blk_n = d.get("block_n")
             if isinstance(blk_n, int):
                 max_block_n = int(blk_n)
@@ -630,6 +686,7 @@ def compute_inject_apply_at(
     out["max_block_specnum_start"] = max_bss
     out["max_source"] = max_src
     out["max_block_n"] = max_block_n
+    out["extrapolated_specnums"] = max_extrap
     out["apply_at_specnum"] = (
         max_bss + int(margin_blocks) * int(NPACKETS_PER_BLOCK)
     )

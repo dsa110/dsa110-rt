@@ -988,6 +988,22 @@ def _render_dm_time(
     )
     ax.set_xlabel("time sample (within cube)", fontsize=10)
 
+    # Data apex (independent of the detector): global max of the
+    # stacked, row-normalised waterfall. When detection is healthy the
+    # white × lands on the red + (the C1 candidate); a separation
+    # means the detector did NOT report the bowtie centre (e.g. the
+    # fp16 boxcar overflow vanishing the apex candidate, 2026-06-10).
+    if finite.size:
+        apex_row, apex_t = (
+            int(v) for v in np.unravel_index(
+                int(np.nanargmax(stacked)), stacked.shape,
+            )
+        )
+        ax.plot(
+            apex_t, apex_row, marker="x", color="w", ms=12, mew=2.0,
+            ls="none", label="data apex",
+        )
+
     title = f"DM × time waterfall (all cubes) — {event_name}"
     if coords is not None:
         if coords.t_idx is not None:

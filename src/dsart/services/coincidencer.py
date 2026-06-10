@@ -728,6 +728,16 @@ class CoincidencerService:
         self._install_signal_handlers(loop)
         self._started_unix = time.time()
 
+        # 2026-06-10: pre-expire the startup grace window when the corr
+        # fleet has already been streaming longer than the grace. The
+        # grace exists to mask the corr-side RFI bandpass warmup after a
+        # FLEET start — but it was keyed on "first batch after C2
+        # start", so a C2-only restart (code deploy, plotter bounce)
+        # re-armed it against a long-warm fleet and silently suppressed
+        # the first 180 s of genuine triggers (observed 2026-06-10
+        # 05:09: operator injections produced WOULD-FIRE/suppressed).
+        self._maybe_pre_expire_startup_grace()
+
         await self._receiver.start()
         self._tasks.append(
             asyncio.create_task(self._receiver.serve_forever(),
@@ -959,6 +969,57 @@ class CoincidencerService:
         if grace <= 0 or self._first_batch_mono is None:
             return False
         return (time.monotonic() - self._first_batch_mono) < grace
+
+    def _maybe_pre_expire_startup_grace(self) -> None:
+        """Disarm the startup grace when the corr fleet is already warm.
+
+        The grace window masks candidates produced while the corr-side
+        RFI bandpass excisor is in cold-start warmup (~150 s after a
+        fleet utc_start). That warmup is a property of the CORR fleet,
+        not of C2 — so when C2 alone restarts mid-run we must not
+        suppress trigger actions for another 180 s. We read the
+        fleet's ``/mon/corr_rt/<cn>/corr_fast`` heartbeat (published
+        every ~2 s): ``block_n × NPACKETS_PER_BLOCK × 65.536 µs`` is
+        the corr service uptime. If the freshest publisher has been up
+        longer than the grace, pre-expire the window by back-dating
+        the first-batch anchor. Best-effort: any etcd problem leaves
+        the conservative (armed) behaviour in place.
+        """
+        grace = float(self._config.startup_grace_s)
+        if grace <= 0 or not self._mon_store.available:
+            return
+        specnum_seconds = 65.536e-6
+        now_wall = time.time()
+        best_uptime_s: Optional[float] = None
+        for cn in range(16):
+            doc = self._mon_store.get_dict(f"/mon/corr_rt/{cn}/corr_fast")
+            if not isinstance(doc, Mapping):
+                continue
+            ts_wall = doc.get("ts_wall_unix")
+            if not isinstance(ts_wall, (int, float)):
+                continue
+            if (now_wall - float(ts_wall)) > 30.0:
+                continue  # stale publisher from a previous run
+            bss = doc.get("block_specnum_start")
+            if not isinstance(bss, int):
+                continue
+            uptime_s = float(bss) * specnum_seconds
+            if best_uptime_s is None or uptime_s > best_uptime_s:
+                best_uptime_s = uptime_s
+        if best_uptime_s is not None and best_uptime_s > grace:
+            self._first_batch_mono = time.monotonic() - grace
+            _LOG.info(
+                "startup grace pre-expired: corr fleet has been "
+                "streaming for ~%.0f s (> grace %.0f s) — C2-only "
+                "restart detected, triggers will NOT be suppressed",
+                best_uptime_s, grace,
+            )
+        elif best_uptime_s is not None:
+            _LOG.info(
+                "startup grace stays armed: corr fleet uptime ~%.0f s "
+                "<= grace %.0f s (fresh fleet start)",
+                best_uptime_s, grace,
+            )
 
     def _dump_rate_exceeded(self) -> bool:
         """True if firing another dump broadcast now would exceed the

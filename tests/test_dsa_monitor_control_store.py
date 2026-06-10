@@ -566,9 +566,12 @@ class TestControlInjectPulse:
         )
         assert out["ok"] is True
         assert out["auto_arm"] is True
-        # max=1000*2048=2_048_000, +16*2048=32_768 → 2_080_768
-        assert out["val"]["apply_at_specnum"] == 1000 * 2048 + 16 * 2048
-        assert out["arm_info"]["max_block_specnum_start"] == 1000 * 2048
+        # 2026-06-10 staleness extrapolation: a fresh publisher
+        # (age ≈ 0⁺) is rounded UP one whole block so we never target
+        # a block boundary that has already started. So:
+        # max = (1000 + 1) blocks, + 16-block margin.
+        assert out["val"]["apply_at_specnum"] == (1000 + 1 + 16) * 2048
+        assert out["arm_info"]["max_block_specnum_start"] == (1000 + 1) * 2048
         assert out["arm_info"]["max_block_n"] == 1000
 
     def test_auto_arm_refuses_when_no_corr_fast_publishers(
@@ -612,9 +615,11 @@ class TestComputeInjectApplyAt:
         out = control_store.compute_inject_apply_at(
             cs, margin_blocks=16, chgroups=(0,),
         )
-        assert out["apply_at_specnum"] == 500 * 2048 + 16 * 2048
-        assert out["max_block_specnum_start"] == 500 * 2048
+        # 2026-06-10: fresh publisher (age ≈ 0⁺) extrapolates +1 block.
+        assert out["apply_at_specnum"] == (500 + 1 + 16) * 2048
+        assert out["max_block_specnum_start"] == (500 + 1) * 2048
         assert out["max_block_n"] == 500
+        assert out["extrapolated_specnums"] == 2048
         assert out["max_source"] == "/mon/corr_rt/0/corr_fast"
         assert out["answered"] == ["/mon/corr_rt/0/corr_fast"]
         assert out["stale"] == []
@@ -639,8 +644,9 @@ class TestComputeInjectApplyAt:
             cs, margin_blocks=16, chgroups=(0, 1),
         )
         # Pick MAX (1000), not min (980), so the lagger reaches it.
-        assert out["max_block_specnum_start"] == 1000 * 2048
-        assert out["apply_at_specnum"] == 1000 * 2048 + 16 * 2048
+        # (+1 block: fresh-publisher extrapolation round-up.)
+        assert out["max_block_specnum_start"] == (1000 + 1) * 2048
+        assert out["apply_at_specnum"] == (1000 + 1 + 16) * 2048
         assert out["max_source"] == "/mon/corr_rt/0/corr_fast"
         assert sorted(out["answered"]) == [
             "/mon/corr_rt/0/corr_fast",
@@ -685,10 +691,41 @@ class TestComputeInjectApplyAt:
             cs, margin_blocks=16, chgroups=(0, 1),
         )
         # Only chgroup=1 (fresh) contributes — block 50 not block 1000.
-        assert out["max_block_specnum_start"] == 50 * 2048
-        assert out["apply_at_specnum"] == 50 * 2048 + 16 * 2048
+        # (+1 block: fresh-publisher extrapolation round-up.)
+        assert out["max_block_specnum_start"] == (50 + 1) * 2048
+        assert out["apply_at_specnum"] == (50 + 1 + 16) * 2048
         assert out["stale"] == ["/mon/corr_rt/0/corr_fast"]
         assert out["answered"] == ["/mon/corr_rt/1/corr_fast"]
+
+    def test_stale_within_window_is_extrapolated(self):
+        """2026-06-10 root-cause regression (260610snoe/mamv): the
+        corr_fast mon-point publishes every 16 blocks (~2.1 s), so a
+        2.0-s-old (but accepted) entry must be advanced ~15 blocks to
+        the live stream position before the margin is added —
+        otherwise the entire margin is silently consumed by staleness
+        and the corr nodes receive an apply_at already in the past
+        (→ partial-band injection)."""
+        now = time.time()
+        age_s = 2.0
+        responses = {
+            "/mon/corr_rt/0/corr_fast": {
+                "block_n": 1000, "block_specnum_start": 1000 * 2048,
+                "ts_wall_unix": now - age_s,
+            },
+        }
+        fake = FakeDsaStore(get_dict_responses=responses)
+        cs = control_store.ControlStore()
+        cs._store = fake
+        out = control_store.compute_inject_apply_at(
+            cs, margin_blocks=32, chgroups=(0,),
+        )
+        block_s = control_store._SPECNUM_SECONDS * 2048   # ≈ 0.1342 s
+        expect_blocks = int(age_s / block_s) + 1          # 14 + 1 = 15
+        assert out["extrapolated_specnums"] == expect_blocks * 2048
+        assert out["max_block_specnum_start"] == (1000 + expect_blocks) * 2048
+        assert out["apply_at_specnum"] == (
+            (1000 + expect_blocks + 32) * 2048
+        )
 
     def test_payload_without_block_specnum_start_is_missing(self):
         """If a corr_fast wrote ts_wall_unix but no
@@ -712,7 +749,11 @@ class TestComputeInjectApplyAt:
         """Pin the NPACKETS_PER_BLOCK constant in control_store
         against the canonical value in corr_fast_integration."""
         assert control_store.NPACKETS_PER_BLOCK == 2048
-        assert control_store.DEFAULT_INJECT_MARGIN_BLOCKS == 16
+        # 2026-06-10: 16 → 32 blocks (~4.3 s). The corr_fast mon-point
+        # is published every 16 blocks, so a 16-block margin gave an
+        # effective lead of 0–2.1 s depending on publish phase →
+        # partial-band injections (260610snoe/mamv).
+        assert control_store.DEFAULT_INJECT_MARGIN_BLOCKS == 32
 
 
 class TestInjectKey:

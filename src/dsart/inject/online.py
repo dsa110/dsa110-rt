@@ -91,12 +91,15 @@ sentence is the bug.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Final
 
 import numpy as np
 import torch
+
+_LOG = logging.getLogger(__name__)
 
 from dsart.common.constants import (
     K_DM_MS_GHZ2_PC,
@@ -562,6 +565,12 @@ class _ActiveInjection:
     amplitude: float                    # √(fluence / width)
     peak_native: int                    # 2 · apply_at_specnum
     max_width_samples: int
+    # 2026-06-10 late-command instrumentation: set True the first time
+    # this injection contributes to a block, so apply_block can tell a
+    # "purged after fully contributing" (normal) from a "purged without
+    # ever contributing" (command arrived entirely too late) and can
+    # detect a PARTIAL first application (leading channels lost).
+    applied_any: bool = False
 
     @property
     def first_native_in_window(self) -> int:
@@ -695,6 +704,19 @@ class OnlineInjector:
         else:
             self.cal_gain = None
         self.pending: dict[str, _ActiveInjection] = {}
+        # 2026-06-10 late-command instrumentation (root cause of the
+        # 260610snoe/mamv "narrow-band thin line" events): when the
+        # inject command reaches this node after the pipeline has
+        # passed apply_at_specnum, the leading (high-frequency, small
+        # dispersion-delay) channels are silently dropped and only the
+        # band-bottom channels contribute — a PARTIAL-band injection.
+        # These counters make that failure observable; they ride to
+        # etcd via RuntimeInjectWatch.state() → CorrFastMonPublisher.
+        self.n_applied_clean: int = 0       # first overlap fully future
+        self.n_applied_partial: int = 0     # first overlap lost leading samples
+        self.n_never_applied: int = 0       # purged with zero contribution
+        self.last_partial_lost_channels: int = 0
+        self.last_late_native_samples: int = 0
 
     # ---- public hot-path API ----
 
@@ -888,11 +910,76 @@ class OnlineInjector:
             footprint_last = active.last_native_in_window      # inclusive
             if footprint_last < block_native_start:
                 # entirely past — purge.
+                if not active.applied_any:
+                    # Command arrived after the pipeline had passed the
+                    # ENTIRE dispersed footprint: zero contribution. The
+                    # operator-visible symptom is an injection that
+                    # simply never shows up downstream.
+                    self.n_never_applied += 1
+                    self.last_late_native_samples = (
+                        block_native_start - footprint_last
+                    )
+                    _LOG.warning(
+                        "OnlineInjector[cg=%d]: inj %s purged with ZERO "
+                        "contribution — command arrived %d native samples "
+                        "(%.0f ms) after its dispersed footprint ended "
+                        "(apply_at_specnum=%d). The inject command was "
+                        "issued too late for this node; see "
+                        "compute_inject_apply_at margin.",
+                        self.chgroup, inj_id,
+                        block_native_start - footprint_last,
+                        (block_native_start - footprint_last)
+                        * NATIVE_SAMPLE_US * 1e-3,
+                        active.cfg.apply_at_specnum,
+                    )
                 purged.append(inj_id)
                 continue
             if footprint_first >= block_native_end:
                 # entirely future — keep, no contribution this block.
                 continue
+
+            if not active.applied_any:
+                # First block this injection touches: detect a LATE
+                # arrival. NOTE: footprint_first includes a generous
+                # ±MAX_WIDTH_SAMPLES pad, so the meaningful test is
+                # against the actual per-channel SIGNAL extent: a
+                # channel's dispersed signal spans roughly
+                # ``peak + offset ± 2·width`` native samples. Channels
+                # whose entire signal window predates this block are
+                # fully lost → partial-band injection.
+                width_pad = 2 * int(active.cfg.width_samples)
+                lost_ch = int(
+                    (
+                        active.peak_native
+                        + active.dispersion_offset_samples
+                        + width_pad
+                        < block_native_start
+                    ).sum().item()
+                )
+                if lost_ch > 0:
+                    self.n_applied_partial += 1
+                    self.last_partial_lost_channels = lost_ch
+                    self.last_late_native_samples = (
+                        block_native_start - footprint_first
+                    )
+                    _LOG.warning(
+                        "OnlineInjector[cg=%d]: inj %s PARTIAL first "
+                        "application — command arrived late; %d/%d "
+                        "channels fully lost (burst will appear "
+                        "narrow-band / low-SNR downstream). "
+                        "apply_at_specnum=%d dm=%.0f late_by=%.0f ms.",
+                        self.chgroup, inj_id,
+                        lost_ch, NCHAN_PER_CHGROUP,
+                        active.cfg.apply_at_specnum,
+                        active.cfg.dm_pc_cm3,
+                        max(
+                            0,
+                            block_native_start - footprint_first,
+                        ) * NATIVE_SAMPLE_US * 1e-3,
+                    )
+                else:
+                    self.n_applied_clean += 1
+                active.applied_any = True
 
             contrib = self._add_one_injection(
                 voltages_real, voltages_imag, native_pos, active,

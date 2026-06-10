@@ -170,9 +170,27 @@ class RuntimeInjectWatch:
         corr_fast`` so dashboard consumers can verify all 16 corr nodes
         received an injection without ssh+grep on each one.
         """
+        # 2026-06-10: late/partial-application counters from the
+        # injector itself (see OnlineInjector.apply_block). A non-zero
+        # inject_n_partial / inject_n_never_applied is the smoking gun
+        # for "injection fired but appeared narrow-band / never showed
+        # up" (the 260610snoe/mamv failure mode).
+        inj = self.injector
         return {
             "inject_n_events": int(self._n_events),
             "inject_n_queued": int(self._n_queued),
+            "inject_n_applied_clean": int(
+                getattr(inj, "n_applied_clean", 0)
+            ),
+            "inject_n_applied_partial": int(
+                getattr(inj, "n_applied_partial", 0)
+            ),
+            "inject_n_never_applied": int(
+                getattr(inj, "n_never_applied", 0)
+            ),
+            "inject_last_partial_lost_channels": int(
+                getattr(inj, "last_partial_lost_channels", 0)
+            ),
             "inject_last_inj_id": self._last_inj_id,
             "inject_last_apply_at_specnum": (
                 int(self._last_apply_at_specnum)

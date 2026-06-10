@@ -508,6 +508,85 @@ def test_apply_block_injection_far_past_is_purged() -> None:
     assert log["active_inj_ids"] == []
     assert log["n_purged"] == 1
     assert "past_inj" not in inj.pending
+    # 2026-06-10 late-command instrumentation: purged with zero
+    # contribution → counted as never_applied (the "injection never
+    # showed up" smoking gun).
+    assert inj.n_never_applied == 1
+    assert inj.n_applied_clean == 0
+    assert inj.n_applied_partial == 0
+
+
+# ---------------------------------------------------------------------------
+# 7b. 2026-06-10 late-command instrumentation (260610snoe/mamv root
+#     cause): a command arriving after the pipeline passed apply_at
+#     loses its leading (high-frequency, small-dispersion-delay)
+#     channels → partial-band injection. The injector must count and
+#     classify clean / partial / never-applied first applications.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_block_on_time_injection_counts_clean() -> None:
+    inj = _make_injector(chgroup=0, device="cpu", dtype=torch.float32)
+    cfg = InjectionConfig(
+        inj_id="clean_inj",
+        l_rad=0.0, m_rad=0.0,
+        dm_pc_cm3=0.0,
+        fluence_jy_ms=10.0, width_samples=4,
+        profile="gaussian",
+        apply_at_specnum=128,
+    )
+    inj.add_pending(cfg)
+    real_v, imag_v = _zero_voltages(device="cpu", dtype=torch.float32)
+    log = inj.apply_block(real_v, imag_v, block_specnum_start=0)
+    assert "clean_inj" in log["active_inj_ids"]
+    assert inj.n_applied_clean == 1
+    assert inj.n_applied_partial == 0
+    assert inj.n_never_applied == 0
+
+
+def test_apply_block_late_command_counts_partial_band() -> None:
+    """A dispersed (high-DM) injection whose apply_at is already past
+    when the first block arrives: the band-top channels' windows have
+    passed (lost) but the band-bottom channels' dispersion delay keeps
+    their windows in the future — the injection still contributes,
+    but PARTIALLY. The instrumentation must classify it as partial
+    and report the number of fully-lost channels."""
+    inj = _make_injector(chgroup=0, device="cpu", dtype=torch.float32)
+    # DM 2500 at chgroup 0: per-channel delays span ~0 (top channel)
+    # to a few thousand native samples within the chgroup — enough to
+    # straddle a block boundary.
+    # Place the peak so the dispersed window straddles the boundary
+    # between block 0 and block 1 (native position 4096): at DM 2500
+    # the chgroup-0 in-band dispersion spans ~2200 native samples, so
+    # peak_native = 3000 puts roughly the top half of the band's
+    # windows before 4096 (lost when the command arrives at block 1)
+    # and the bottom half after (still injectable).
+    block_native = NPACKETS_PER_BLOCK * NTIMES_PER_PACKET   # 4096
+    cfg = InjectionConfig(
+        inj_id="late_inj",
+        l_rad=0.0, m_rad=0.0,
+        dm_pc_cm3=2500.0,
+        fluence_jy_ms=10.0, width_samples=4,
+        profile="gaussian",
+        apply_at_specnum=(block_native - 1096) // 2,   # peak_native = 3000
+    )
+    inj.add_pending(cfg)
+    active = inj.pending["late_inj"]
+    disp = active.dispersion_offset_samples
+    # Sanity: the dispersed signal really does straddle native 4096.
+    assert active.peak_native + int(disp.min().item()) < block_native
+    assert active.peak_native + int(disp.max().item()) > block_native
+    real_v, imag_v = _zero_voltages(device="cpu", dtype=torch.float32)
+    # Command "arrives" only at block 1 — block 0 was never offered.
+    log = inj.apply_block(
+        real_v, imag_v, block_specnum_start=NPACKETS_PER_BLOCK,
+    )
+    # Still contributes (band-bottom channels in window)…
+    assert "late_inj" in log["active_inj_ids"]
+    # …but classified PARTIAL with a non-trivial channel loss.
+    assert inj.n_applied_partial == 1
+    assert inj.n_applied_clean == 0
+    assert inj.last_partial_lost_channels > 0
 
 
 # ---------------------------------------------------------------------------
