@@ -184,21 +184,30 @@ def test_candidate_to_c1_row_basic_mapping() -> None:
     assert row.event_specnum == cand.event_specnum
     assert row.width_samples == cand.width_samples
     assert row.kernel_id == cand.kernel_id
-    # Radian conversion uses the float l/m, not the int pixel.
-    assert row.l_rad == pytest.approx(geom.cell_l_rad * 32.4)
-    assert row.m_rad == pytest.approx(geom.cell_m_rad * 48.7)
+    # Radian conversion: CENTRED image (origin at n_grid//2 = 128) and
+    # row/col → (m, l) axis swap — Candidate.l is the cube ROW = sky
+    # m-axis; Candidate.m is the COLUMN = sky l-axis (2026-06-10 live
+    # injection sweep). Uses the float l/m, not the int pixel.
+    assert row.l_rad == pytest.approx(geom.cell_l_rad * (48.7 - 128))
+    assert row.m_rad == pytest.approx(geom.cell_m_rad * (32.4 - 128))
 
 
-def test_candidate_to_c1_row_top_half_pixel_maps_to_negative_rad() -> None:
-    """Pixels in the top half of the raw irfft2 layout are NEGATIVE sky
-    coordinates: pixel 196 of 256 is l = -60·cell, not +196·cell (live
-    2026-06-10 bug — l=-0.009 injections were reported at l=+0.030)."""
+def test_candidate_to_c1_row_centred_swapped_axes() -> None:
+    """The cube image is CENTRED (sky origin at pixel n_grid//2) and the
+    cube row axis is sky m while the column axis is sky l. Confirmed
+    live 2026-06-10: an injection at (l, m) = (+0.009, +0.0045) rad
+    landed at cube (row, col) = (164, 200) ≈ (0.0045/cell + 128,
+    0.009/cell + 128); injections at m=0 previously reported the
+    notorious ±0.0192 "corner" value (= (0-128)·1.5e-4) under the old
+    raw-FFT-layout interpretation."""
     geom = _geom()  # n_grid=256
     cand = _cand(l=196.0, m=60.0)
     row = candidate_to_c1_row(cand, geom=geom)
-    assert row.l_rad == pytest.approx(geom.cell_l_rad * (196 - 256))
-    assert row.m_rad == pytest.approx(geom.cell_m_rad * 60)
-    # Pixel indices stay in raw cube layout (they index dumped cubes).
+    # l_rad from the COLUMN (cand.m), m_rad from the ROW (cand.l).
+    assert row.l_rad == pytest.approx(geom.cell_l_rad * (60 - 128))
+    assert row.m_rad == pytest.approx(geom.cell_m_rad * (196 - 128))
+    # Pixel indices stay in raw cube (row, col) layout (they index
+    # dumped cubes).
     assert row.l_pix == 196
     assert row.m_pix == 60
 

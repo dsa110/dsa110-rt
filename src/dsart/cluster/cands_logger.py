@@ -56,7 +56,7 @@ from typing import IO, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..common.contracts import Candidate, ClusterRecord, CubeGeometry
-from .features import signed_centred_pix
+from .features import centred_pix_offset
 
 __all__ = [
     "CandsLoggerConfig",
@@ -471,12 +471,14 @@ class CandsLogger:
             cid = int(cluster_labels[i])
             l_pix = int(round(cand.l))
             m_pix = int(round(cand.m))
+            # Centred image + row/col → (m, l) axis swap — see
+            # cluster.features.centred_pix_offset (2026-06-10).
             l_rad = (
-                signed_centred_pix(l_pix, geom.n_grid) * geom.cell_l_rad
+                centred_pix_offset(m_pix, geom.n_grid) * geom.cell_l_rad
                 + geom.l0_rad
             )
             m_rad = (
-                signed_centred_pix(m_pix, geom.n_grid) * geom.cell_m_rad
+                centred_pix_offset(l_pix, geom.n_grid) * geom.cell_m_rad
                 + geom.m0_rad
             )
             # is_cluster_peak: 1 only for the peak of a cluster_id ≥ 0

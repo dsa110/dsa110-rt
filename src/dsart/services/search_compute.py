@@ -2490,6 +2490,14 @@ async def _run_async(args: argparse.Namespace) -> int:
     # for an unactivated pipeline).
     linear_lut_per_corr: Optional[np.ndarray] = None
     n_filled_per_corr_arr: Optional[np.ndarray] = None
+    # 2026-06-10: exact image-plane pixel pitch (rad) derived from the
+    # SAME cell_lambda the gridder/imager actually use, replacing the
+    # pinned 1.5e-4 default in SearchComputeConfig (true production
+    # value: 1/(256 × 31.4922) = 1.24039e-4 — a 21% error that put
+    # every reported l_rad/m_rad off by the same factor). Stays None
+    # when the cal blob is missing (stub path) so the pinned default
+    # still applies in tests/benches.
+    image_cell_rad: Optional[float] = None
     if args.cal_blob_path is not None and args.obs_dec_deg is not None:
         try:
             from ..grid.sparsity_pattern import (
@@ -2507,6 +2515,9 @@ async def _run_async(args: argparse.Namespace) -> int:
                     antpos_e, antpos_n,
                     n_grid=int(args.n_grid),
                     is_core_baseline_mask=is_core_mask,
+                )
+                image_cell_rad = 1.0 / (
+                    float(args.n_grid) * float(cell_lambda_used)
                 )
             else:
                 cell_lambda_used = None
@@ -2687,6 +2698,21 @@ async def _run_async(args: argparse.Namespace) -> int:
         enable_c1=not args.disable_c1,
         c1_bind_host_override=args.c1_bind_host,
     )
+
+    if image_cell_rad is not None:
+        # Exact gridder-derived pixel pitch overrides the pinned
+        # cube_cell_{l,m}_rad defaults (see image_cell_rad note above).
+        cfg = _dc_replace(
+            cfg,
+            cube_cell_l_rad=float(image_cell_rad),
+            cube_cell_m_rad=float(image_cell_rad),
+        )
+        _LOG.info(
+            "image-plane cell pitch from cell_lambda: %.6e rad/pix "
+            "(fov=%.6e rad at n_grid=%d)",
+            image_cell_rad, image_cell_rad * float(args.n_grid),
+            int(args.n_grid),
+        )
 
     service = SearchComputeService(config=cfg, source=source)
 

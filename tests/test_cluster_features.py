@@ -96,8 +96,11 @@ def test_real_mode_l_m_in_radians() -> None:
     cands = [_make_cand(l_pix=5, m_pix=7, fine_dm_idx=1, t_in_cube=10, width_samples=2)]
     out = candidates_to_features(cands, geom, mode=FeatureMode.REAL,
                                  weights=(1, 1, 1, 1, 1))
-    expected_l = 5 * 2.0e-4 + 1.0e-3
-    expected_m = 7 * 3.0e-4 + 2.0e-3
+    # CENTRED image + row/col → (m, l) axis swap (2026-06-10): l_rad
+    # comes from the COLUMN index (m_pix) and m_rad from the ROW index
+    # (l_pix), both relative to the centre pixel n_grid//2 = 128.
+    expected_l = (7 - 128) * 2.0e-4 + 1.0e-3
+    expected_m = (5 - 128) * 3.0e-4 + 2.0e-3
     expected_dm = float(geom.fine_dm_pc_cc[1])
     expected_t_s = 10 * geom.sample_period_us / 1e6
     np.testing.assert_allclose(out[0, 3], expected_l, rtol=1e-12)
@@ -107,16 +110,19 @@ def test_real_mode_l_m_in_radians() -> None:
     np.testing.assert_allclose(out[0, 0], math.log2(2), rtol=1e-12)
 
 
-def test_real_mode_top_half_pixels_map_to_negative_radians() -> None:
-    """Raw irfft2 layout: pixel ``n_grid - k`` is sky coordinate
-    ``-k × cell`` — NOT ``+(n_grid-k) × cell`` (live 2026-06-10 bug:
-    l=-0.009 rad injections reported at l=+0.030)."""
+def test_real_mode_centred_swapped_axes() -> None:
+    """The cube image is CENTRED (sky origin at pixel n_grid//2) and
+    the cube ROW axis is sky m while the COLUMN axis is sky l —
+    confirmed live 2026-06-10 with a 10-shot (l, m) injection sweep
+    (every dumped-cube apex at ``true_coord / cell + 128`` on the
+    swapped axes)."""
     geom = _make_geom()  # n_grid=256, cell=1.5e-4, l0=m0=0
     cands = [_make_cand(l_pix=196, m_pix=60, fine_dm_idx=1, t_in_cube=10)]
     out = candidates_to_features(cands, geom, mode=FeatureMode.REAL,
                                  weights=(1, 1, 1, 1, 1))
-    np.testing.assert_allclose(out[0, 3], (196 - 256) * 1.5e-4, rtol=1e-12)
-    np.testing.assert_allclose(out[0, 4], 60 * 1.5e-4, rtol=1e-12)
+    # l_rad from the COLUMN (m_pix=60), m_rad from the ROW (l_pix=196).
+    np.testing.assert_allclose(out[0, 3], (60 - 128) * 1.5e-4, rtol=1e-12)
+    np.testing.assert_allclose(out[0, 4], (196 - 128) * 1.5e-4, rtol=1e-12)
     # INT mode keeps raw cube-layout pixel indices untouched.
     out_int = candidates_to_features(cands, geom, mode=FeatureMode.INT,
                                      weights=(1, 1, 1, 1, 1))
@@ -124,8 +130,8 @@ def test_real_mode_top_half_pixels_map_to_negative_radians() -> None:
 
     coords = candidates_to_real_coords(cands, geom)
     l_rad, m_rad = coords[0][0], coords[0][1]
-    np.testing.assert_allclose(l_rad, (196 - 256) * 1.5e-4, rtol=1e-12)
-    np.testing.assert_allclose(m_rad, 60 * 1.5e-4, rtol=1e-12)
+    np.testing.assert_allclose(l_rad, (60 - 128) * 1.5e-4, rtol=1e-12)
+    np.testing.assert_allclose(m_rad, (196 - 128) * 1.5e-4, rtol=1e-12)
     assert coords[0][4] == 196  # l_pix stays raw
 
 
@@ -178,8 +184,9 @@ def test_candidates_to_real_coords_returns_aligned_tuples() -> None:
     assert len(coords) == 2
     (l_rad, m_rad, dm_pc, t_s, l_pix, m_pix, fdm_idx, t_in_cube) = coords[0]
     assert l_pix == 5 and m_pix == 7 and fdm_idx == 1 and t_in_cube == 10
-    np.testing.assert_allclose(l_rad, 5 * 2.0e-4)
-    np.testing.assert_allclose(m_rad, 7 * 3.0e-4)
+    # Centred + swapped axes: l from col (m_pix), m from row (l_pix).
+    np.testing.assert_allclose(l_rad, (7 - 128) * 2.0e-4)
+    np.testing.assert_allclose(m_rad, (5 - 128) * 3.0e-4)
     np.testing.assert_allclose(dm_pc, float(geom.fine_dm_pc_cc[1]))
 
 

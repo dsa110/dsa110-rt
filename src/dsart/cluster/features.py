@@ -60,29 +60,32 @@ DEFAULT_WEIGHTS: tuple[float, float, float, float, float] = (
 # ---------------------------------------------------------------------------
 
 
-def signed_centred_pix(pix: float, n_grid: int) -> float:
-    """Map a raw FFT-layout pixel index to its signed, zero-centred
-    equivalent: ``pix`` for ``pix < n_grid/2``, ``pix - n_grid`` otherwise.
+def centred_pix_offset(pix: float, n_grid: int) -> float:
+    """Signed pixel offset from the image centre: ``pix - n_grid // 2``.
 
-    2026-06-10: the production imager emits cubes in raw ``irfft2``
-    layout (the output fftshift was folded into downstream indexing for
-    speed), so pixel 0 is l=0 and NEGATIVE sky coordinates live in the
-    TOP half of the axis (pixel ``n_grid-1`` is l=-cell, not
-    l=+(n_grid-1)·cell). Every ``l_rad = pix × cell + l0`` conversion
-    must therefore re-centre the index first or negative-l/m bursts get
-    reported wrapped to ≈ +(n_grid-|pix|)·cell — confirmed live with
-    injections at l=-0.009 rad reported at l=+0.030 (= (256-60)·1.5e-4
-    truncated by the matcher's wide lm gate). Pixel indices themselves
-    (``l_pix``/``m_pix`` row fields, plot crosshairs) stay in raw cube
-    layout on purpose — they index into the dumped cube arrays.
+    2026-06-10 (supersedes the short-lived ``signed_centred_pix`` FFT-
+    wrap interpretation): the production cube images are CENTRED — the
+    sky origin (l, m) = (0, 0) sits at pixel ``n_grid // 2`` on both
+    spatial axes, exactly like the corr-side sky-export frames
+    (``bench/_corr_fast_replay.pixel_to_lm_radians``: centre pixel
+    ``n_grid // 2`` ⇔ (0, 0)). Confirmed live 2026-06-10 with a 10-shot
+    (l, m) injection sweep at DM 500: every dumped-cube apex landed at
+    ``true_coord / cell + 128`` to sub-pixel accuracy (e.g. l=+0.009 →
+    col 200.5 = 0.009/1.24039e-4 + 128; an injection at m=0 reported
+    pixel 0 − 128 → the notorious "corner" ±0.0192 rad value).
 
-    No-op for ``n_grid <= 0`` (test fixtures with no geometry).
+    The previous raw-irfft2-layout assumption (wrap negative
+    coordinates to the top half of the axis) double-corrected: bursts
+    in the top half were ALREADY at positive sky coordinates.
+
+    No-op (returns ``pix``) for ``n_grid <= 0`` (test fixtures with no
+    geometry).
     """
     p = float(pix)
     n = int(n_grid)
     if n <= 0:
         return p
-    return p - n if p >= n / 2.0 else p
+    return p - float(n // 2)
 
 
 def _candidate_to_int_indices(
@@ -207,12 +210,22 @@ def candidates_to_features(
             # t_seconds = (event_specnum - specnum_start) * sec_per_specnum.
             # Equivalently t_in_cube * sample_period_us / 1e6.
             out[i, 2] = (cand.event_specnum - geom.specnum_start) * sec_per_specnum
+            # 2026-06-10 axis fix: Candidate.l is the cube ROW index
+            # (H axis) and Candidate.m the COLUMN index (W axis) — but
+            # in the validated sky frame (sky_astrometry /
+            # _corr_fast_replay: row = m, col = l) the ROW is the
+            # m-axis and the COLUMN the l-axis. Confirmed live with the
+            # 2026-06-10 (l, m) injection sweep: a fixed injected m
+            # pinned the reported "l" while sweeping injected l moved
+            # the reported "m". Swap here (and at every l_rad/m_rad
+            # conversion site) so physical coordinates are true sky
+            # (l, m); raw l_pix/m_pix stay cube (row, col) indices.
             out[i, 3] = (
-                signed_centred_pix(l_pix, geom.n_grid) * geom.cell_l_rad
+                centred_pix_offset(m_pix, geom.n_grid) * geom.cell_l_rad
                 + geom.l0_rad
             )
             out[i, 4] = (
-                signed_centred_pix(m_pix, geom.n_grid) * geom.cell_m_rad
+                centred_pix_offset(l_pix, geom.n_grid) * geom.cell_m_rad
                 + geom.m0_rad
             )
 
@@ -248,12 +261,14 @@ def candidates_to_real_coords(
         l_pix, m_pix, fine_dm_idx, t_in_cube = _candidate_to_int_indices(
             cand, geom
         )
+        # Axis swap: row (l_pix) = sky m-axis, col (m_pix) = sky l-axis
+        # — see the conversion note in candidates_to_features.
         l_rad = (
-            signed_centred_pix(l_pix, geom.n_grid) * geom.cell_l_rad
+            centred_pix_offset(m_pix, geom.n_grid) * geom.cell_l_rad
             + geom.l0_rad
         )
         m_rad = (
-            signed_centred_pix(m_pix, geom.n_grid) * geom.cell_m_rad
+            centred_pix_offset(l_pix, geom.n_grid) * geom.cell_m_rad
             + geom.m0_rad
         )
         t_seconds = (cand.event_specnum - geom.specnum_start) * sec_per_specnum

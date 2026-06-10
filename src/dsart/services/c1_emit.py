@@ -38,7 +38,7 @@ from ..coinc.wire import (
     C1CandidateRow,
     SCHEMA_VERSION,
 )
-from ..cluster.features import signed_centred_pix
+from ..cluster.features import centred_pix_offset
 from ..common.contracts import Candidate, CubeGeometry
 
 __all__ = [
@@ -251,16 +251,19 @@ def candidate_to_c1_row(
         m_pix = 0
     elif m_pix >= n_grid:
         m_pix = n_grid - 1
-    # 2026-06-10: re-centre the raw irfft2-layout pixel index before the
-    # radian conversion (negative l/m live in the TOP half of the axis —
-    # see cluster.features.signed_centred_pix). Without this, bursts
-    # injected at l=-0.009 rad were reported at l=+0.030 and only
-    # matched because the inject matcher's lm gate is 0.04 rad wide.
-    l_rad = float(geom.l0_rad) + float(geom.cell_l_rad) * signed_centred_pix(
-        float(cand.l), n_grid
-    )
-    m_rad = float(geom.m0_rad) + float(geom.cell_m_rad) * signed_centred_pix(
+    # 2026-06-10 (v2, supersedes the raw-irfft2 wrap fix): the cube
+    # image is CENTRED — sky origin at pixel n_grid//2 — and the cube
+    # ROW axis (Candidate.l) is the sky m-axis while the COLUMN axis
+    # (Candidate.m) is the sky l-axis (validated sky frame: row = m,
+    # col = l; see cluster.features.centred_pix_offset). Confirmed live
+    # 2026-06-10 with a 10-shot (l, m) injection sweep: apex pixel =
+    # true_coord / cell + 128 on the swapped axes, sub-pixel, for every
+    # shot.
+    l_rad = float(geom.l0_rad) + float(geom.cell_l_rad) * centred_pix_offset(
         float(cand.m), n_grid
+    )
+    m_rad = float(geom.m0_rad) + float(geom.cell_m_rad) * centred_pix_offset(
+        float(cand.l), n_grid
     )
 
     # Recover per-cube fine_dm_idx via the geometry grid. We match on
