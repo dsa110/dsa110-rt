@@ -864,8 +864,15 @@ DEFAULT_FLUENCE_LADDER: Tuple[float, ...] = (1.0, 2.0, 4.0)
 #: overflow and the probe either vanishes (pre-hardening) or comes
 #: back as a saturated ~250σ candidate — useless for fitting K either
 #: way. Cap the ladder just below the cliff so escalation stays inside
-#: the clean linear window (4e-4 .. 1.2e-3).
-DEFAULT_MAX_PROBE_FLUENCE: float = 1.2e-3
+#: the clean linear window.
+#:
+#: 2026-06-10: lowered 1.2e-3 → 1.0e-3. The overnight K-grid showed
+#: the fp16-imager overflow cliff is STOCHASTIC right at 1.2e-3 for
+#: w=4: one DM-500 attempt at 1.2e-3 railed at the detector's 250σ
+#: input clip (expected ~76σ from K) while a DM-2500 attempt at the
+#: same fluence measured a clean 53σ. 1.0e-3 keeps the ladder's top
+#: step reliably below the cliff.
+DEFAULT_MAX_PROBE_FLUENCE: float = 1.0e-3
 
 #: Observed-SNR rail above which a match is treated as SATURATED and
 #: K is NOT stored. The search detector clips its σ-normalised input
