@@ -998,7 +998,16 @@ class CoincidencerService:
             ts_wall = doc.get("ts_wall_unix")
             if not isinstance(ts_wall, (int, float)):
                 continue
-            if (now_wall - float(ts_wall)) > 30.0:
+            # Freshness window: the publisher PUTs every ~2.1 s, so a
+            # LIVE fleet is never more than a few seconds stale. Keep
+            # this tight (≪ the restart_all pkill→C2-restart gap):
+            # with a generous 30 s window the first deploy of this fix
+            # mis-classified a FLEET restart as "fleet warm" because
+            # C2 came up within 30 s of the old corr processes dying,
+            # and their last mon-points still carried hours of uptime
+            # (observed 2026-06-10 06:37: warmup-junk dump 260610ejnr
+            # fired on the very first post-utc_start batch).
+            if (now_wall - float(ts_wall)) > 8.0:
                 continue  # stale publisher from a previous run
             bss = doc.get("block_specnum_start")
             if not isinstance(bss, int):
