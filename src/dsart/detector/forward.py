@@ -553,7 +553,7 @@ class DeterministicDetector(torch.nn.Module):
         cube_cadence_s: float = CUBE_CADENCE_S_DEFAULT,
         layer2_tau_s: float = NOISE_LAYER2_TAU_S_DEFAULT,
         layer2_n_burnin: int = NOISE_LAYER2_N_BURNIN_DEFAULT,
-        n_kernel_max_t: int = N_KERNEL_MAX_T_DEFAULT,
+        n_kernel_max_t: Optional[int] = None,
         layer2_state: Optional[Layer2State] = None,
         layer2_seed_unit: bool = True,
         layer2_sigma_floor: float = 0.0,
@@ -679,6 +679,27 @@ class DeterministicDetector(torch.nn.Module):
         self._merger_config: Optional[MergerConfig] = merger_config
         self._search_node_id = int(search_node_id)
         self._gpu_half = int(gpu_half)
+        # 2026-06-10 wing-decode root-cause fix: ``n_kernel_max_t`` sets
+        # the time-edge exclusion half-window (t_edge = n_kernel_max_t//2)
+        # for BOTH the interior-scoring optimisation in
+        # ``_streaming_forward`` and the canonical emit gate. It MUST
+        # track the widest time kernel actually in the bank. The old
+        # default pinned it to ``N_KERNEL_MAX_T_DEFAULT = 128`` (the
+        # full b1..b128 bank) even when production runs b1..b64 — at
+        # t_det=256 / cadence=192 that shrank the scored window to
+        # [64, 192) = 128 samples per 192-sample stride, silently
+        # dropping 64/192 = 33% of all stream samples from the search
+        # (bursts there decoded only as off-DM low-SNR "wing"
+        # candidates from bowtie flux leaking into the window).
+        # ``None`` (the new default) derives it from the bank — for the
+        # default b1..b128 bank this is still 128, so legacy callers
+        # see no change; the production b1..b64 bank now correctly
+        # scores [32, 224) which tiles the 192-sample cadence exactly.
+        bank_max_t = max(
+            int(k.k_time_width) for k in self._kernel_bank
+        )
+        if n_kernel_max_t is None:
+            n_kernel_max_t = bank_max_t
         self._n_kernel_max_t = int(n_kernel_max_t)
 
         # M7.4 hardening: validity-mask threshold for gating Layer-2
