@@ -969,12 +969,27 @@ class InjectionMatcher:
             snr_f = float(snr)
         except (TypeError, ValueError):
             self._n_rows_rejected_quality += 1
+            LOG.info(
+                "inject_match: quality reject inj_id=%s snr=%r "
+                "(unparseable)", inj.inj_id, snr,
+            )
             return False
-        if not math.isfinite(snr_f):
+        if (
+            not math.isfinite(snr_f)
+            or snr_f < self._min_observed_snr
+            or snr_f > self._max_observed_snr
+        ):
             self._n_rows_rejected_quality += 1
-            return False
-        if snr_f < self._min_observed_snr or snr_f > self._max_observed_snr:
-            self._n_rows_rejected_quality += 1
+            # 2026-06-10: same rationale as the specnum-gate logging —
+            # a DM-matched, position-matched, time-matched row dying on
+            # the SNR band was previously indistinguishable from the
+            # probe never being detected at all.
+            LOG.info(
+                "inject_match: quality reject inj_id=%s snr=%.6g "
+                "outside [%.1f, %.1f] (dm=%.0f)",
+                inj.inj_id, snr_f, self._min_observed_snr,
+                self._max_observed_snr, inj.dm_pc_cm3,
+            )
             return False
         if not self._row_matches_specnum(
             inj=inj, event_specnum=event_specnum,
