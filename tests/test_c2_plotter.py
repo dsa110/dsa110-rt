@@ -166,6 +166,50 @@ def _write_c1_window_csv(archive_root: Path, ev: str) -> None:
     )
 
 
+def test_all_waterfalls_ordered_and_complete(tmp_path: Path) -> None:
+    """2026-06-10 8-panel dm_time: every cube gets a waterfall, sorted
+    by (search_node_id, gpu_half) so the panel grid follows the fine-DM
+    coverage order."""
+    from dsart.coinc.plotter import _all_waterfalls
+
+    cubes_dir = tmp_path / "cubes"
+    _write_fake_cubes(cubes_dir)
+    cubes = _load_cubes(cubes_dir)
+    try:
+        wfs = _all_waterfalls(cubes)
+        assert len(wfs) == 8
+        order = [(c.search_node_id, c.gpu_half) for c, _ in wfs]
+        assert order == sorted(order)
+        for _, wf in wfs:
+            assert wf.shape == (T_DET, N_FDM)
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_dm_time_renders_partial_cube_set(tmp_path: Path) -> None:
+    """The 8-panel figure degrades gracefully when only some halves'
+    cubes made it to disk (e.g. a slow uploader)."""
+    from dsart.coinc.plotter import _all_waterfalls, _render_dm_time
+
+    cubes_dir = tmp_path / "cubes"
+    _write_fake_cubes(cubes_dir)
+    # Drop all but three cubes.
+    for p in sorted(cubes_dir.glob("cube_s*_g*_*.npz"))[3:]:
+        p.unlink()
+    cubes = _load_cubes(cubes_dir)
+    try:
+        wfs = _all_waterfalls(cubes)
+        assert len(wfs) == 3
+        out = _render_dm_time(
+            tmp_path, "260610test", wfs, burst=None, coords=None,
+        )
+        assert out.is_file() and out.stat().st_size > 100
+    finally:
+        for c in cubes:
+            c.close()
+
+
 def test_render_event_plots_produces_four_pngs(tmp_path: Path) -> None:
     archive_root = tmp_path / "candidates"
     ev = "260521abcd"

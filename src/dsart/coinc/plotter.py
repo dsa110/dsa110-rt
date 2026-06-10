@@ -7,9 +7,12 @@ NPZs (one per ``(search_node, gpu_half)``) along DM, then renders
 four PNGs into ``Level2/plots/`` (see ``docs/c1c2/C1C2_DESIGN.md``
 §3.7):
 
-  1. ``dm_time_<name>.png``        — DM vs time waterfall (burst cube),
-     max-projected over (l, m), with a crosshair at the detected
-     (t_peak, DM_peak).
+  1. ``dm_time_<name>.png``        — DM vs time waterfalls for ALL
+     dumped cubes (one panel per (search_node, gpu_half), 2026-06-10),
+     each max-projected over (l, m), on a shared colour scale so the
+     dispersed bowtie tails in the non-owning halves are visible
+     alongside the owning half. Crosshair at the detected
+     (t_peak, DM_peak) on the burst panel.
   2. ``image_peak_<name>.png``     — image plane at the detected
      (DM_peak, t_peak), with a reticle at the detected (l, m).
   3. ``lightcurve_<name>.png``     — time series at the detected DM,
@@ -73,8 +76,7 @@ Performance notes
 -----------------
 
 The cubes are ~855 MB each (192 × 34 × 256 × 256 fp16) and there are
-8 per event. Rather than reduce all 8, we resolve the burst cube from
-metadata and touch **only** that one:
+8 per event:
 
   1. Memory-map each ``cube.npy`` from inside its (uncompressed) zip
      by parsing the local file header ourselves —
@@ -82,9 +84,13 @@ metadata and touch **only** that one:
      for ``.npz`` inputs (numpy ≤ 2.4 NpzFile.__getitem__ doesn't
      forward it to ``format.read_array``), so the OS-level mmap has
      to be set up by hand.
-  2. Stream a single ``cube.max(axis=(2, 3))`` reduction on the burst
-     cube → ``waterfall`` (shape ``(t_det, n_fdm)``, fp32). The DM/time
-     panel uses it directly and the light curve is just its DM column.
+  2. Stream a ``cube.max(axis=(2, 3))`` reduction on EVERY cube →
+     per-cube ``waterfall`` (shape ``(t_det, n_fdm)``, fp32).
+     2026-06-10: this used to touch only the burst cube; the 8-panel
+     dm_time figure needs all of them. The reductions stream through
+     the mmap (page-cache backed, ~25 MB working set each) so the cost
+     is one sequential read of each NPZ (~7 GB/event cold, fast when
+     the dump is still in page cache). Per-cube timing is logged.
   3. For ``image_peak`` we materialise the single ``(n_grid, n_grid)``
      plane at ``cube[t_peak, fine_dm_idx]`` (~128 KB).
 
@@ -285,13 +291,23 @@ def render_event_plots(job: PlotJob) -> List[Path]:
             "cube argmax (may latch onto low-DM RFI)", job.event_name,
         )
 
+    # 2026-06-10: reduce EVERY cube (not just the burst one) so the
+    # dm_time figure can show all 8 halves at once — the dispersed
+    # bowtie tails in the non-owning halves are part of the burst's
+    # signature and operators want them on one page.
     t0 = time.perf_counter()
-    waterfall = _burst_waterfall(burst)  # (t_det, n_fdm) fp32, or None
+    waterfalls = _all_waterfalls(cubes)
     t_reduce = time.perf_counter() - t0
     _LOG.info(
-        "plotter: reduced burst cube in %.1fs (event=%s)",
-        t_reduce, job.event_name,
+        "plotter: reduced %d cube waterfalls in %.1fs (event=%s)",
+        len(waterfalls), t_reduce, job.event_name,
     )
+    waterfall = None  # burst cube's waterfall (for lightcurve/coords)
+    if burst is not None:
+        for c, wf in waterfalls:
+            if c is burst:
+                waterfall = wf
+                break
 
     # Burst coords resolved against the cube we actually have.
     coords = _burst_coords(burst, waterfall, peak)
@@ -299,7 +315,9 @@ def render_event_plots(job: PlotJob) -> List[Path]:
     try:
         t0 = time.perf_counter()
         written.append(
-            _render_dm_time(plots_dir, job.event_name, waterfall, coords),
+            _render_dm_time(
+                plots_dir, job.event_name, waterfalls, burst, coords,
+            ),
         )
         _LOG.info(
             "plotter: dm_time rendered in %.1fs (event=%s)",
@@ -738,8 +756,8 @@ def _select_burst_chunk(
 
 
 def _burst_waterfall(chunk: Optional[_CubeChunk]) -> Optional[np.ndarray]:
-    """``cube.max(axis=(2, 3))`` → ``(t_det, n_fdm)`` fp32 for the burst
-    cube only (one full streaming reduction; ~25 MB working set)."""
+    """``cube.max(axis=(2, 3))`` → ``(t_det, n_fdm)`` fp32 for one
+    cube (one full streaming reduction; ~25 MB working set)."""
     if chunk is None or chunk.cube.ndim != 4 or not chunk.cube.size:
         return None
     try:
@@ -751,6 +769,28 @@ def _burst_waterfall(chunk: Optional[_CubeChunk]) -> Optional[np.ndarray]:
         )
         return None
     return np.asarray(wf, dtype=np.float32)
+
+
+def _all_waterfalls(
+    cubes: Sequence[_CubeChunk],
+) -> List[Tuple[_CubeChunk, np.ndarray]]:
+    """Per-cube ``(t_det, n_fdm)`` waterfalls for every loadable cube,
+    sorted by ``(search_node_id, gpu_half)`` — i.e. in fine-DM-coverage
+    order at the production op-point (n01 g0 owns the lowest trials,
+    n13 g1 the highest). Cubes whose reduction fails are skipped.
+    """
+    out: List[Tuple[_CubeChunk, np.ndarray]] = []
+    for c in sorted(cubes, key=lambda c: (c.search_node_id, c.gpu_half)):
+        t0 = time.perf_counter()
+        wf = _burst_waterfall(c)
+        if wf is None:
+            continue
+        _LOG.info(
+            "plotter: waterfall s%d_g%d reduced in %.1fs",
+            c.search_node_id, c.gpu_half, time.perf_counter() - t0,
+        )
+        out.append((c, wf))
+    return out
 
 
 def _burst_coords(
@@ -842,37 +882,107 @@ def _provenance(coords: Optional[_BurstCoords]) -> str:
 def _render_dm_time(
     plots_dir: Path,
     event_name: str,
-    waterfall: Optional[np.ndarray],
+    waterfalls: Sequence[Tuple[_CubeChunk, np.ndarray]],
+    burst: Optional[_CubeChunk],
     coords: Optional[_BurstCoords],
 ) -> Path:
+    """8-panel (one per (search_node, gpu_half)) DM × time figure.
+
+    2026-06-10 redesign: previously this rendered only the burst
+    cube's waterfall; now every dumped cube gets a panel, on a SHARED
+    colour scale, so the dispersed bowtie tails in the non-owning
+    halves are visible alongside the owning half. The burst panel
+    carries the detection crosshair and a highlighted border.
+    """
     path = plots_dir / f"dm_time_{event_name}.png"
-    if waterfall is None or waterfall.size == 0:
+    if not waterfalls:
         return _placeholder(path, f"DM × time — {event_name}", "no cube data")
     import matplotlib.pyplot as plt
-    # waterfall is (t_det, n_fdm); display DM (y) vs time (x).
-    img = waterfall.T  # (n_fdm, t_det)
-    fig, ax = plt.subplots(figsize=(8.0, 4.5))
-    im = ax.imshow(img, aspect="auto", origin="lower", cmap="viridis")
-    fig.colorbar(im, ax=ax, label="image-max amplitude")
-    ax.set_xlabel("time sample (within cube)")
-    ax.set_ylabel("fine-DM trial index")
-    title = f"DM × time waterfall — {event_name}"
+
+    n = len(waterfalls)
+    ncols = min(4, n)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(4.4 * ncols, 3.4 * nrows),
+        squeeze=False, sharex=False, sharey=False,
+    )
+
+    # Shared colour scale across all panels: each half is Layer-1/2
+    # σ-normalised, so amplitudes are directly comparable. A robust
+    # low anchor (median) with the global max keeps the bowtie tails
+    # (few σ) visible without letting one hot pixel crush the rest.
+    stack = np.concatenate([wf.ravel() for _, wf in waterfalls])
+    vmin = float(np.percentile(stack, 50.0))
+    vmax = float(np.percentile(stack, 99.98))
+    peak_amp = float(stack.max())
+    if coords is not None and np.isfinite(peak_amp):
+        # Never clip the detected burst's own amplitude off the scale
+        # by more than ~2×; lift vmax toward the true peak.
+        vmax = max(vmax, 0.5 * peak_amp)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin, vmax = None, None  # matplotlib autoscale fallback
+
+    im = None
+    for idx, (chunk, wf) in enumerate(waterfalls):
+        ax = axes[idx // ncols][idx % ncols]
+        img = wf.T  # (n_fdm, t_det): DM (y) vs time (x)
+        im = ax.imshow(
+            img, aspect="auto", origin="lower", cmap="viridis",
+            vmin=vmin, vmax=vmax,
+        )
+        is_burst = burst is not None and chunk is burst
+        label = f"s{chunk.search_node_id} g{chunk.gpu_half}"
+        if is_burst:
+            label += "  (burst)"
+            for spine in ax.spines.values():
+                spine.set_edgecolor(_RETICLE)
+                spine.set_linewidth(2.0)
+            if coords is not None:
+                if coords.t_idx is not None:
+                    ax.axvline(
+                        coords.t_idx, color=_RETICLE, lw=1.0,
+                        ls="--", alpha=0.9,
+                    )
+                ax.axhline(
+                    coords.fdm_idx, color=_RETICLE, lw=1.0,
+                    ls="--", alpha=0.9,
+                )
+                if coords.t_idx is not None:
+                    ax.plot(
+                        coords.t_idx, coords.fdm_idx, marker="+",
+                        color=_RETICLE, ms=14, mew=2.0,
+                    )
+        ax.set_title(label, fontsize=10)
+        # Outer-edge labels only — the grid stays readable.
+        if idx // ncols == nrows - 1:
+            ax.set_xlabel("time sample", fontsize=9)
+        if idx % ncols == 0:
+            ax.set_ylabel("fine-DM trial", fontsize=9)
+        ax.tick_params(labelsize=8)
+
+    # Hide unused grid slots (when fewer than nrows*ncols cubes).
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_axis_off()
+
+    title = f"DM × time waterfalls — {event_name}"
     if coords is not None:
-        # Crosshair at the detected (t_peak, DM_peak).
-        if coords.t_idx is not None:
-            ax.axvline(coords.t_idx, color=_RETICLE, lw=1.0, ls="--", alpha=0.9)
-        ax.axhline(coords.fdm_idx, color=_RETICLE, lw=1.0, ls="--", alpha=0.9)
-        if coords.t_idx is not None:
-            ax.plot(
-                coords.t_idx, coords.fdm_idx, marker="+",
-                color=_RETICLE, ms=16, mew=2.0,
-            )
         title += (
             f" — burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
             f"SNR={coords.snr:.1f}" + _provenance(coords)
         )
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=11)
+    if im is not None:
+        fig.colorbar(
+            im, ax=[a for row in axes for a in row],
+            label="image-max amplitude (σ)", shrink=0.85, pad=0.012,
+        )
+    # NOTE: no tight_layout — it is incompatible with the shared
+    # colorbar across a 2-D axes grid; rely on constrained spacing.
+    fig.subplots_adjust(
+        left=0.05, right=0.88, top=0.90, bottom=0.08,
+        hspace=0.32, wspace=0.22,
+    )
     fig.savefig(path, dpi=100)
     plt.close(fig)
     return path
