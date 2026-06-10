@@ -707,9 +707,19 @@ class TestSpecnumGate(TestTryMatch):
 
     def test_row_inside_window_matches(self):
         m, _ = self._matcher()
-        # +1300 samples ≈ DM-2500 dispersion sweep; inside ±2048.
+        # +1300 samples ≈ DM-2500 dispersion sweep; inside ±4096.
         mr = m.try_match(**self._row_args(event_specnum=62_500 + 1_300))
         assert mr is not None
+
+    def test_dm2500_late_arrival_matches(self):
+        """2026-06-10 live regression: DM-2500 probes arrived ~2.5-3 k
+        samples late (band-bottom sweep + stage-2 FIFO + batching) and
+        were silently rejected by the old ±2048 gate. The widened
+        ±4096 default must accept them."""
+        m, _ = self._matcher()
+        mr = m.try_match(**self._row_args(event_specnum=62_500 + 3_000))
+        assert mr is not None
+        assert m.snapshot()["rows_rejected_specnum"] == 0
 
     def test_row_outside_window_rejected(self):
         m, _ = self._matcher()

@@ -231,6 +231,30 @@ class CubePipelineConfig:
     # in the raw cube (e.g. ``bench/imager_only_gpu.py``).
     gpu_imager_apply_per_chgroup_calibration: bool = False
 
+    # 2026-06-10 — Bright-burst / fp16-overflow hardening
+    # ---------------------------------------------------
+    # ``detector_input_clip_sigma``: symmetric clamp (in σ units)
+    # applied to the Layer-1-normalised cube immediately before
+    # ``Detector.forward()``. 0.0 disables (legacy behaviour).
+    #
+    # Why: very bright injections/bursts overflow the cuFFT-cfp16
+    # butterflies → ±inf at the burst pixels → ``_clamp_inf_to_finite``
+    # rewrites them to ±60000 (finite, fp16-safe in isolation). But the
+    # detector's boxcar stages SUM those cells: a w=4 time boxcar over
+    # 60000-valued cells is 240000 → fp16 inf in the score tensor, and
+    # the subsequent DM-axis boxcar computes inf − inf = NaN, silently
+    # poisoning the whole tile. Observed live 2026-06-10: probes at
+    # ≥1.4e-3 Jy·ms (peak ≳35σ) produce NO candidates at all while
+    # 0.5–1.0e-3 Jy·ms probes match cleanly at SNR 30–50.
+    #
+    # With a clip of C, the worst-case boxcar sum is
+    # ``C × k_time_width(64) × k_dm_width(3) = 192·C``; C = 250 keeps
+    # that at 48000 < 65504 (fp16 max), so every score stays finite and
+    # a >250σ burst degrades to a saturated-but-reported candidate
+    # instead of vanishing. 250σ is far above any calibratable signal
+    # and far below the 60000 artefact plateau.
+    detector_input_clip_sigma: float = 0.0
+
     # M7.7.2 — Carry-over re-imaging
     # ------------------------------
     # When ``cube_pipeline_carry_over_re_imaging`` is True AND
@@ -1964,7 +1988,7 @@ class CubePipeline:
             sigma = torch.ones(
                 (n_fdm,), dtype=torch.float32, device=cube.device
             )
-            return cube, sigma
+            return self._apply_detector_input_clip(cube), sigma
         if (
             self._fuse_layer1_into_imager
             and self.config.image_backend == "gpu"
@@ -1992,7 +2016,8 @@ class CubePipeline:
         # We divide the coverage-corrected cube so the detector sees
         # SNR in standard units (each cell has unit variance).
         cube_normalised = cube_for_sigma / sigma[None, :, None, None].to(cube.dtype)
-        return _clamp_inf_to_finite(cube_normalised), sigma
+        cube_normalised = _clamp_inf_to_finite(cube_normalised)
+        return self._apply_detector_input_clip(cube_normalised), sigma
 
     def _layer1_normalise_fused(
         self,
@@ -2048,7 +2073,29 @@ class CubePipeline:
         # redundant — drop it to save another ~6.4 ms / cube of
         # full-cube memory traffic. The non-fused path (see line ~1208)
         # still clamps because its broadcast-divide can introduce inf.
-        return cube, sigma_for_use
+        #
+        # 2026-06-10: the detector-input clip (if enabled) is NOT
+        # redundant here — ``_clamp_inf_to_finite`` only rewrites
+        # nan/±inf and leaves the finite ±60000 artefact plateau in
+        # place, which still poisons the boxcar sums (see
+        # ``CubePipelineConfig.detector_input_clip_sigma``).
+        return self._apply_detector_input_clip(cube), sigma_for_use
+
+    def _apply_detector_input_clip(self, cube: torch.Tensor) -> torch.Tensor:
+        """In-place symmetric clamp of the σ-normalised cube to
+        ``±detector_input_clip_sigma`` before ``Detector.forward()``.
+
+        Disabled when the config value is ≤ 0 (zero cost). When
+        enabled, costs one full-cube in-place elementwise pass
+        (~4-6 ms at production geometry) and guarantees every boxcar
+        sum downstream stays finite in fp16 (see config docstring).
+        In-place is safe for the same reason ``_clamp_inf_to_finite``
+        is: no caller re-uses the pre-clip tensor.
+        """
+        clip = float(self.config.detector_input_clip_sigma)
+        if clip > 0.0:
+            cube.clamp_(min=-clip, max=clip)
+        return cube
 
     def prefetch_h2d(self, slot: CubeRingSlot) -> PrefetchedH2dCube:
         """Stage the cube's H2D copies on the dedicated H2D stream.

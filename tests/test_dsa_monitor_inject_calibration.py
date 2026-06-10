@@ -890,15 +890,15 @@ class TestFireCalibrationProbeWithLadder:
             inject_fn=inject_fn,
             dm_pc_cm3=500.0,
             width_samples=32,
-            fluence_jy_ms=0.01,
+            fluence_jy_ms=2e-4,
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
             fluence_ladder=(1.0, 2.0, 4.0),
         )
-        # All 3 attempts should have fired (at 0.01, 0.02, 0.04 Jy·ms
-        # — all below the saturation clamp).
-        assert ladder_attempts == [0.01, 0.02, 0.04]
+        # All 3 attempts should have fired (at 2e-4, 4e-4, 8e-4 Jy·ms
+        # — all below the 1.2e-3 saturation clamp).
+        assert ladder_attempts == [2e-4, 4e-4, 8e-4]
         # All attempts should ultimately fail ``no_match`` since we
         # never actually seeded a match key.
         assert len(attempts) == 3
@@ -969,14 +969,14 @@ class TestFireCalibrationProbeWithLadder:
             inject_fn=inject_fn,
             dm_pc_cm3=500.0,
             width_samples=32,
-            fluence_jy_ms=0.01,
+            fluence_jy_ms=2e-4,
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
             fluence_ladder=(1.0, 2.0),
             ladder_step_delay_s=60.0,
         )
-        assert ladder_attempts == [0.01, 0.02]
+        assert ladder_attempts == [2e-4, 4e-4]
         assert sleeps.count(60.0) == 1
 
     def test_partial_fan_out_aborts_ladder(self):

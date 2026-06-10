@@ -187,11 +187,18 @@ DEFAULT_HISTORY_DEPTH: int = 16
 #: Specnum-proximity gate half-width, in SEARCH samples (~1.05 ms each).
 #: A C1 row only matches an injection when its ``event_specnum`` lies
 #: within this many search samples of the injection's expected arrival
-#: (``apply_at_specnum / specnums_per_search_sample``). 2048 samples
-#: ≈ 2.2 s: covers the DM-2500 dispersion sweep (~1300 samples) plus
-#: cube-cadence/pipeline jitter, while cleanly separating probes fired
-#: ≥ 30 s (~28k samples) apart that the TTL window alone conflated.
-DEFAULT_SPECNUM_TOL_SAMPLES: float = 2048.0
+#: (``apply_at_specnum / specnums_per_search_sample``).
+#:
+#: 2026-06-10 widened 2048 → 4096: the original 2048 (~2.2 s) was sized
+#: to "DM-2500 sweep ~1300 samples + jitter", but live DM-2500 probes
+#: were REJECTED by the gate (rows_rejected_specnum incremented twice
+#: for two probes whose C1 candidates arrived ~5 s after fire) — the
+#: full band-bottom dispersion delay + stage-2 coarse-DM FIFO alignment
+#: + cube-boundary/batching latency lands just past 2048 at the top of
+#: the DM grid. 4096 (~4.3 s) covers DM 3000 with margin while still
+#: separating consecutive probes ≥ 30 s (~28k samples) apart — the
+#: cross-attribution failure the gate exists to prevent.
+DEFAULT_SPECNUM_TOL_SAMPLES: float = 4096.0
 
 #: Unit conversion: corr-side specnums per SEARCH sample. One specnum
 #: = 2 native samples (65.536 µs); one search sample = 32 native
@@ -915,10 +922,20 @@ class InjectionMatcher:
             float(inj.apply_at_specnum)
             / float(self._specnums_per_search_sample)
         )
-        return (
-            abs(float(event_specnum) - expected)
-            <= self._specnum_tol_samples
+        residual = float(event_specnum) - expected
+        if abs(residual) <= self._specnum_tol_samples:
+            return True
+        # 2026-06-10: log the residual on rejection. The first live
+        # DM-2500 probes were silently dropped here (residual just over
+        # the old 2048-sample gate) and the only symptom was a bare
+        # no_match — make the next mis-sizing diagnosable from the log.
+        LOG.info(
+            "inject_match: specnum gate reject inj_id=%s residual=%.0f "
+            "samples (tol=%.0f, expected=%.0f, observed=%d, dm=%.0f)",
+            inj.inj_id, residual, self._specnum_tol_samples,
+            expected, int(event_specnum), inj.dm_pc_cm3,
         )
+        return False
 
     def _row_qualifies(
         self,

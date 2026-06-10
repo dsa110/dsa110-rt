@@ -97,21 +97,33 @@ DM_BUCKET_PC_CC: float = 50.0
 
 #: Default fluence used by an explicit calibration probe (Jy·ms).
 #:
-#: 2026-06-09 rescale: after the 5f1997d voltage-domain normalisation
-#: fix the injector is ~4 orders of magnitude "hotter" per Jy·ms than
-#: before — live-fleet sweeps show even 1 Jy·ms drives the search-side
-#: fp16 cubes into saturation (±65504 rails + sliding-mean ghost),
-#: while fluences in the 1e-3..1e-2 range land at SNR ~100-400
-#: (K ≈ 8000 at DM=500). 0.01 Jy·ms at width 32 targets SNR ≈ 140:
-#: comfortably above the ambient junk-candidate floor (SNR ≲ 45 near
-#: boresight) and far below both fp16 saturation and the matcher's
-#: 2000 σ ceiling. The dashboard caller can override this in the form
+#: 2026-06-10 rescale (supersedes the 2026-06-09 0.01 default): the
+#: live fluence-response sweep mapped the usable probe window
+#: precisely —
+#:
+#:   * < ~2e-4 Jy·ms  : in-cube peak below c1_snr_min (12σ) → no_match
+#:   * 4e-4 .. 1e-3   : clean, repeatable matches, SNR ≈ 25-50,
+#:                      K ≈ 2890-2980 across DM 150/500/1000 (w=4)
+#:   * ≥ ~1.4e-3      : the cuFFT-cfp16 butterflies overflow → ±inf →
+#:                      ±60000 plateau → boxcar scores go inf/NaN and
+#:                      the candidate VANISHES (pre-hardening) or
+#:                      saturates (post detector.input_clip_sigma).
+#:
+#: 7e-4 Jy·ms at width 4 lands at SNR ≈ 38: the middle of the clean
+#: window, ≳3× above the c1_snr_min floor and ~2× below the fp16
+#: overflow cliff. The dashboard caller can override this in the form
 #: if the operator wants to titrate the calibration brightness.
-DEFAULT_CALIBRATION_FLUENCE: float = 0.01
+DEFAULT_CALIBRATION_FLUENCE: float = 7e-4
 
-#: Default probe width (native samples). 32 ≈ 1 ms; matches the
-#: typical FRB injected width in the M6 acceptance tests.
-DEFAULT_CALIBRATION_WIDTH: int = 32
+#: Default probe width (NATIVE samples, 32.768 µs each). NOTE: any
+#: width ≲ 32 native is sub-search-sample (the search integrates to
+#: ~1.05 ms), so the burst energy lands in a single search sample and
+#: the observed SNR scales ∝ fluence (NOT ∝ √(fluence/width)). The
+#: stored K is therefore only self-consistent for probes fired at the
+#: SAME width — keep this pinned to 4 (matches the 2026-06-10
+#: calibration grid; a w=1 probe at the model-equivalent fluence
+#: measured K ≈ 977 vs 2890 at w=4).
+DEFAULT_CALIBRATION_WIDTH: int = 4
 
 #: Default probe profile.
 DEFAULT_CALIBRATION_PROFILE: str = "gaussian"
@@ -811,12 +823,13 @@ DEFAULT_SEARCH_MAX_AGE_S: float = 30.0
 DEFAULT_FLUENCE_LADDER: Tuple[float, ...] = (1.0, 2.0, 4.0)
 
 #: Hard ceiling on any single laddered probe fluence (Jy·ms).
-#: Live-fleet sweeps (2026-06-09) show the search-side fp16 cube rails
-#: at ±65504 somewhere below ~1 Jy·ms; a saturated probe is useless
-#: for calibration (clipped SNR + a railed negative sliding-mean ghost
-#: that poisons the next ~1 s). The ladder clamps each attempt to this
-#: value and stops escalating once it is reached.
-DEFAULT_MAX_PROBE_FLUENCE: float = 0.2
+#: 2026-06-10: the fluence-response sweep located the fp16-overflow
+#: cliff at ~1.4e-3 Jy·ms (w=4): above it the cuFFT-cfp16 butterflies
+#: overflow and the probe either vanishes (pre-hardening) or comes
+#: back as a saturated ~250σ candidate — useless for fitting K either
+#: way. Cap the ladder just below the cliff so escalation stays inside
+#: the clean linear window (4e-4 .. 1.2e-3).
+DEFAULT_MAX_PROBE_FLUENCE: float = 1.2e-3
 
 #: Pause between ladder attempts (seconds). A probe absorbed into the
 #: detector's sigma_k EMA locally inflates the noise estimate at its

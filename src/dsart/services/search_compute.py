@@ -2050,6 +2050,14 @@ def _build_search_config_from_yaml(
         cube_pipeline_carry_over_re_imaging=bool(
             cube_pipeline_carry_over_re_imaging
         ),
+        # 2026-06-10 fp16-overflow hardening: clamp the σ-normalised
+        # cube before the detector so bright-burst ±60000 artefacts
+        # can't poison the boxcar sums into inf/NaN. Default ON for
+        # yaml-driven production; set ``detector.input_clip_sigma: 0``
+        # to restore legacy behaviour.
+        detector_input_clip_sigma=float(
+            det.get("input_clip_sigma", 250.0)
+        ),
     )
 
     clusterer_cfg: Optional[ClustererConfig] = None

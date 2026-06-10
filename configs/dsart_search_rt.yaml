@@ -600,6 +600,18 @@ detector:
   # /mon/search_rt/<cn>/noise/<g> (n_clamp_escapes_total,
   # clamp_streak_max). 0 disables (bare-clamp legacy).
   layer2_clamp_escape_cubes: 64
+  # 2026-06-10: bright-burst / fp16-overflow hardening. Very bright
+  # bursts (probes ≳1.4e-3 Jy·ms, peak ≳35σ) overflow the cuFFT-cfp16
+  # butterflies → ±inf → rewritten to ±60000 by the post-imager
+  # nan_to_num. The detector's boxcar stages then SUM those cells:
+  # 4 × 60000 = 240000 → fp16 inf in the score tensor, and the DM-axis
+  # boxcar computes inf − inf = NaN — the burst (and its whole tile)
+  # silently VANISHES instead of being reported. This clamp bounds the
+  # σ-normalised cube to ±250σ right before Detector.forward(), so the
+  # worst-case boxcar sum (250 × 64 × 3 = 48000) stays finite in fp16
+  # and a >250σ burst degrades to a saturated-but-reported candidate.
+  # Costs one in-place full-cube pass (~4-6 ms/cube). 0 disables.
+  input_clip_sigma: 250.0
   # cube_cadence_s: 0.13421772
   # layer2_tau_s: 30.0
   # layer2_n_burnin: 8
