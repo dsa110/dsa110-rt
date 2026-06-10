@@ -754,6 +754,62 @@ class TestSpecnumGate(TestTryMatch):
         assert mr.inj_id == "bb"
         assert set(m.snapshot()["best"].keys()) == {"bb"}
 
+    def test_origin_mismatch_falls_back_to_wall_clock_accept(self):
+        """2026-06-10 live regression: a search-side bounce resets the
+        C1 sample counters, so event_specnum no longer shares the corr
+        specnum origin and the residual jumps by millions of samples.
+        The gate must recognise this as an origin mismatch (residual >
+        16 × tol) and fall back to MJD-vs-fired_at — here the row's
+        event time is 10 s after the fire, well inside the +20 s
+        window, so it matches."""
+        m, _ = self._matcher()
+        mjd_10s_after_fire = 40587.0 + (1_000.0 + 10.0) / 86400.0
+        mr = m.try_match(**self._row_args(
+            event_specnum=62_500 + 10_000_000,
+            mjd=mjd_10s_after_fire,
+        ))
+        assert mr is not None
+        assert m.snapshot()["rows_rejected_specnum"] == 0
+
+    def test_origin_mismatch_wall_clock_reject_outside_window(self):
+        """Origin mismatch AND the row's event time is 45 s after the
+        fire (outside the +20 s wall window) → still rejected; the
+        fallback must not reopen the cross-attribution hole."""
+        m, _ = self._matcher()
+        mjd_45s_after_fire = 40587.0 + (1_000.0 + 45.0) / 86400.0
+        mr = m.try_match(**self._row_args(
+            event_specnum=62_500 + 10_000_000,
+            mjd=mjd_45s_after_fire,
+        ))
+        assert mr is None
+        assert m.snapshot()["rows_rejected_specnum"] == 1
+
+    def test_origin_mismatch_wall_clock_reject_before_fire(self):
+        """Row event time 10 s BEFORE the fire cannot be the injection
+        (window floor is -2 s)."""
+        m, _ = self._matcher()
+        mjd_10s_before_fire = 40587.0 + (1_000.0 - 10.0) / 86400.0
+        mr = m.try_match(**self._row_args(
+            event_specnum=62_500 + 10_000_000,
+            mjd=mjd_10s_before_fire,
+        ))
+        assert mr is None
+        assert m.snapshot()["rows_rejected_specnum"] == 1
+
+    def test_in_origin_late_row_does_not_use_wall_fallback(self):
+        """A row ~42 s late but within the SAME specnum origin
+        (residual < 16 × tol) is a genuine timing miss — it must NOT be
+        rescued by the wall-clock fallback even if its MJD looks
+        plausible."""
+        m, _ = self._matcher()
+        mjd_5s_after_fire = 40587.0 + (1_000.0 + 5.0) / 86400.0
+        mr = m.try_match(**self._row_args(
+            event_specnum=62_500 + 39_000,
+            mjd=mjd_5s_after_fire,
+        ))
+        assert mr is None
+        assert m.snapshot()["rows_rejected_specnum"] == 1
+
     def test_gate_disabled_with_none(self):
         m, _ = self._matcher(specnum_tol_samples=None)
         mr = m.try_match(**self._row_args(event_specnum=62_500 + 39_000))

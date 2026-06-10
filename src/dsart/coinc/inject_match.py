@@ -206,6 +206,34 @@ DEFAULT_SPECNUM_TOL_SAMPLES: float = 4096.0
 #: specnums; C1 ``event_specnum`` is in search samples.
 DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE: int = 16
 
+#: Wall-clock fallback window for the specnum gate (seconds).
+#:
+#: 2026-06-10: the specnum comparison assumes C1 ``event_specnum``
+#: shares the corr fleet's specnum origin — true only when the search
+#: side and corr side were (re)started together. After a search-only
+#: ``bounce_search`` the C1 sample counters restart near 0 while
+#: ``apply_at_specnum`` stays on the corr clock (offset observed live:
+#: ~10.6 M search samples), so EVERY row failed the gate and four
+#: target-SNR validation shots went unmatched despite clean detections.
+#: When the specnum residual is grossly inconsistent (≫ tol, i.e. an
+#: origin mismatch rather than a timing miss) we fall back to comparing
+#: the row's absolute MJD against the injection's ``fired_at_unix``:
+#: accept iff ``row_time - fired_at ∈ [-2, +DEFAULT_WALL_TOL_S]``.
+#: +20 s covers arm margin (~4.3 s) + band-bottom dispersion + pipeline
+#: latency at DM 3000 with headroom; consecutive probes are ≥ 30 s
+#: apart so cross-attribution stays excluded. The -2 s floor tolerates
+#: specnum→UTC table skew while rejecting rows from before the fire.
+DEFAULT_WALL_TOL_S: float = 20.0
+
+#: Specnum residuals beyond ``tol × ORIGIN_MISMATCH_FACTOR`` are treated
+#: as origin mismatches (→ wall-clock fallback) rather than timing
+#: misses (→ reject). 16 × 4096 ≈ 70 s of search samples — no real
+#: in-origin row is that late within a 60 s TTL.
+ORIGIN_MISMATCH_FACTOR: float = 16.0
+
+#: Unix epoch in MJD (1970-01-01 00:00:00 UTC).
+_MJD_UNIX_EPOCH: float = 40587.0
+
 #: Grace period beyond ``ttl_s`` before the matcher actively deletes an
 #: expired ``/cnf/inject/active/<inj_id>`` row from etcd.
 #:
@@ -499,6 +527,7 @@ class InjectionMatcher:
         specnums_per_search_sample: int = (
             DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE
         ),
+        wall_tol_s: float = DEFAULT_WALL_TOL_S,
         time_fn: Any = time.time,
         active_inject_prefix: str = ACTIVE_INJECT_PREFIX,
         expiry_grace_s: Optional[float] = DEFAULT_EXPIRY_GRACE_S,
@@ -550,6 +579,9 @@ class InjectionMatcher:
             else float(specnum_tol_samples)
         )
         self._specnums_per_search_sample = int(specnums_per_search_sample)
+        if wall_tol_s <= 0.0:
+            raise ValueError(f"wall_tol_s={wall_tol_s} must be positive")
+        self._wall_tol_s = float(wall_tol_s)
         self._time = time_fn
         self._active_inject_prefix = str(active_inject_prefix)
         self._expiry_grace_s: Optional[float] = (
@@ -724,6 +756,7 @@ class InjectionMatcher:
                 m_rad=m_rad,
                 width_samples=width_samples,
                 event_specnum=event_specnum,
+                mjd=mjd,
             ):
                 continue
             K = compute_k_inferred(
@@ -768,6 +801,7 @@ class InjectionMatcher:
         width_samples: Optional[int] = None,
         snr: Optional[float] = None,
         event_specnum: Optional[int] = None,
+        mjd: float = 0.0,
     ) -> Optional[str]:
         """Return the best-quality matching ``inj_id`` (no publish).
 
@@ -799,6 +833,7 @@ class InjectionMatcher:
                     event_specnum=(
                         0 if event_specnum is None else int(event_specnum)
                     ),
+                    mjd=mjd,
                 ):
                     continue
             elif not self._row_matches_dm_lm(
@@ -924,13 +959,22 @@ class InjectionMatcher:
         *,
         inj: ActiveInjection,
         event_specnum: int,
+        mjd: float = 0.0,
     ) -> bool:
-        """Specnum-proximity gate (2026-06-09).
+        """Specnum-proximity gate (2026-06-09) with wall-clock fallback
+        (2026-06-10).
 
         True iff the row's ``event_specnum`` (SEARCH samples) lies
         within ``specnum_tol_samples`` of the injection's expected
         arrival. Permissive when the gate is disabled or either side
         lacks a usable specnum (≤ 0 — legacy payloads / unit tests).
+
+        When the residual indicates an ORIGIN MISMATCH (search side
+        bounced independently of the corr fleet, so C1 sample counters
+        no longer share the corr specnum origin — residual ≫ tol), the
+        gate falls back to the row's absolute MJD vs the injection's
+        ``fired_at_unix``: accept iff the row's event time is within
+        ``[-2 s, +wall_tol_s]`` of the fire. See DEFAULT_WALL_TOL_S.
         """
         if self._specnum_tol_samples is None:
             return True
@@ -943,6 +987,29 @@ class InjectionMatcher:
         residual = float(event_specnum) - expected
         if abs(residual) <= self._specnum_tol_samples:
             return True
+        origin_mismatch = (
+            abs(residual)
+            > self._specnum_tol_samples * ORIGIN_MISMATCH_FACTOR
+        )
+        if origin_mismatch and math.isfinite(mjd) and mjd > 0.0:
+            row_unix = (float(mjd) - _MJD_UNIX_EPOCH) * 86400.0
+            dt = row_unix - float(inj.fired_at_unix)
+            if -2.0 <= dt <= self._wall_tol_s:
+                LOG.info(
+                    "inject_match: specnum origin mismatch for "
+                    "inj_id=%s (residual=%.0f samples — search side "
+                    "bounced without the corr fleet?); accepted via "
+                    "wall-clock fallback dt=%.1f s",
+                    inj.inj_id, residual, dt,
+                )
+                return True
+            LOG.info(
+                "inject_match: specnum origin mismatch for inj_id=%s "
+                "AND wall-clock fallback reject dt=%.1f s "
+                "(window [-2, %.0f] s)",
+                inj.inj_id, dt, self._wall_tol_s,
+            )
+            return False
         # 2026-06-10: log the residual on rejection. The first live
         # DM-2500 probes were silently dropped here (residual just over
         # the old 2048-sample gate) and the only symptom was a bare
@@ -965,6 +1032,7 @@ class InjectionMatcher:
         m_rad: float,
         width_samples: int,
         event_specnum: int = 0,
+        mjd: float = 0.0,
     ) -> bool:
         """Full match gate: DM/l/m proximity + SNR band + specnum window.
 
@@ -1010,7 +1078,7 @@ class InjectionMatcher:
             )
             return False
         if not self._row_matches_specnum(
-            inj=inj, event_specnum=event_specnum,
+            inj=inj, event_specnum=event_specnum, mjd=mjd,
         ):
             self._n_rows_rejected_specnum += 1
             return False

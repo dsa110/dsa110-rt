@@ -1179,6 +1179,7 @@ class CoincidencerService:
                     width_samples=m.width_samples,
                     snr=m.snr,
                     event_specnum=m.event_specnum,
+                    mjd=m.mjd,
                 )
                 if label is not None:
                     member_inj_ids[id(m)] = label
