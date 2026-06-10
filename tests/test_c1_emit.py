@@ -189,6 +189,20 @@ def test_candidate_to_c1_row_basic_mapping() -> None:
     assert row.m_rad == pytest.approx(geom.cell_m_rad * 48.7)
 
 
+def test_candidate_to_c1_row_top_half_pixel_maps_to_negative_rad() -> None:
+    """Pixels in the top half of the raw irfft2 layout are NEGATIVE sky
+    coordinates: pixel 196 of 256 is l = -60·cell, not +196·cell (live
+    2026-06-10 bug — l=-0.009 injections were reported at l=+0.030)."""
+    geom = _geom()  # n_grid=256
+    cand = _cand(l=196.0, m=60.0)
+    row = candidate_to_c1_row(cand, geom=geom)
+    assert row.l_rad == pytest.approx(geom.cell_l_rad * (196 - 256))
+    assert row.m_rad == pytest.approx(geom.cell_m_rad * 60)
+    # Pixel indices stay in raw cube layout (they index dumped cubes).
+    assert row.l_pix == 196
+    assert row.m_pix == 60
+
+
 def test_candidate_to_c1_row_clamps_pixel_indices() -> None:
     geom = _geom(n_grid=64)
     # l = -3 should clamp to 0; m = 100 should clamp to 63.

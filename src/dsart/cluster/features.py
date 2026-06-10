@@ -60,6 +60,31 @@ DEFAULT_WEIGHTS: tuple[float, float, float, float, float] = (
 # ---------------------------------------------------------------------------
 
 
+def signed_centred_pix(pix: float, n_grid: int) -> float:
+    """Map a raw FFT-layout pixel index to its signed, zero-centred
+    equivalent: ``pix`` for ``pix < n_grid/2``, ``pix - n_grid`` otherwise.
+
+    2026-06-10: the production imager emits cubes in raw ``irfft2``
+    layout (the output fftshift was folded into downstream indexing for
+    speed), so pixel 0 is l=0 and NEGATIVE sky coordinates live in the
+    TOP half of the axis (pixel ``n_grid-1`` is l=-cell, not
+    l=+(n_grid-1)·cell). Every ``l_rad = pix × cell + l0`` conversion
+    must therefore re-centre the index first or negative-l/m bursts get
+    reported wrapped to ≈ +(n_grid-|pix|)·cell — confirmed live with
+    injections at l=-0.009 rad reported at l=+0.030 (= (256-60)·1.5e-4
+    truncated by the matcher's wide lm gate). Pixel indices themselves
+    (``l_pix``/``m_pix`` row fields, plot crosshairs) stay in raw cube
+    layout on purpose — they index into the dumped cube arrays.
+
+    No-op for ``n_grid <= 0`` (test fixtures with no geometry).
+    """
+    p = float(pix)
+    n = int(n_grid)
+    if n <= 0:
+        return p
+    return p - n if p >= n / 2.0 else p
+
+
 def _candidate_to_int_indices(
     cand: Candidate,
     geom: CubeGeometry,
@@ -182,8 +207,14 @@ def candidates_to_features(
             # t_seconds = (event_specnum - specnum_start) * sec_per_specnum.
             # Equivalently t_in_cube * sample_period_us / 1e6.
             out[i, 2] = (cand.event_specnum - geom.specnum_start) * sec_per_specnum
-            out[i, 3] = float(l_pix) * geom.cell_l_rad + geom.l0_rad
-            out[i, 4] = float(m_pix) * geom.cell_m_rad + geom.m0_rad
+            out[i, 3] = (
+                signed_centred_pix(l_pix, geom.n_grid) * geom.cell_l_rad
+                + geom.l0_rad
+            )
+            out[i, 4] = (
+                signed_centred_pix(m_pix, geom.n_grid) * geom.cell_m_rad
+                + geom.m0_rad
+            )
 
     w = np.asarray(weights, dtype=np.float64)
     out *= w[None, :]
@@ -217,8 +248,14 @@ def candidates_to_real_coords(
         l_pix, m_pix, fine_dm_idx, t_in_cube = _candidate_to_int_indices(
             cand, geom
         )
-        l_rad = float(l_pix) * geom.cell_l_rad + geom.l0_rad
-        m_rad = float(m_pix) * geom.cell_m_rad + geom.m0_rad
+        l_rad = (
+            signed_centred_pix(l_pix, geom.n_grid) * geom.cell_l_rad
+            + geom.l0_rad
+        )
+        m_rad = (
+            signed_centred_pix(m_pix, geom.n_grid) * geom.cell_m_rad
+            + geom.m0_rad
+        )
         t_seconds = (cand.event_specnum - geom.specnum_start) * sec_per_specnum
         out.append(
             (l_rad, m_rad, float(cand.dm_fine), t_seconds,

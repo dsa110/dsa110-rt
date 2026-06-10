@@ -107,6 +107,28 @@ def test_real_mode_l_m_in_radians() -> None:
     np.testing.assert_allclose(out[0, 0], math.log2(2), rtol=1e-12)
 
 
+def test_real_mode_top_half_pixels_map_to_negative_radians() -> None:
+    """Raw irfft2 layout: pixel ``n_grid - k`` is sky coordinate
+    ``-k × cell`` — NOT ``+(n_grid-k) × cell`` (live 2026-06-10 bug:
+    l=-0.009 rad injections reported at l=+0.030)."""
+    geom = _make_geom()  # n_grid=256, cell=1.5e-4, l0=m0=0
+    cands = [_make_cand(l_pix=196, m_pix=60, fine_dm_idx=1, t_in_cube=10)]
+    out = candidates_to_features(cands, geom, mode=FeatureMode.REAL,
+                                 weights=(1, 1, 1, 1, 1))
+    np.testing.assert_allclose(out[0, 3], (196 - 256) * 1.5e-4, rtol=1e-12)
+    np.testing.assert_allclose(out[0, 4], 60 * 1.5e-4, rtol=1e-12)
+    # INT mode keeps raw cube-layout pixel indices untouched.
+    out_int = candidates_to_features(cands, geom, mode=FeatureMode.INT,
+                                     weights=(1, 1, 1, 1, 1))
+    assert out_int[0, 3] == 196.0
+
+    coords = candidates_to_real_coords(cands, geom)
+    l_rad, m_rad = coords[0][0], coords[0][1]
+    np.testing.assert_allclose(l_rad, (196 - 256) * 1.5e-4, rtol=1e-12)
+    np.testing.assert_allclose(m_rad, 60 * 1.5e-4, rtol=1e-12)
+    assert coords[0][4] == 196  # l_pix stays raw
+
+
 def test_weights_applied_column_wise() -> None:
     geom = _make_geom()
     cand = _make_cand(l_pix=10, m_pix=20, fine_dm_idx=2, t_in_cube=64, width_samples=4)

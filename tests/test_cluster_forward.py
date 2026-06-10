@@ -222,8 +222,10 @@ def test_dbscan_record_carries_geometry_derived_real_units() -> None:
     labels, records = cluster_candidates(cands, geom, config=cfg)
     rec = records[0]
     assert rec.l_pix == 132 and rec.m_pix == 230
-    np.testing.assert_allclose(rec.l_rad, 132 * 2.5e-4)
-    np.testing.assert_allclose(rec.m_rad, 230 * 2.5e-4)
+    # 2026-06-10: top-half pixels (raw irfft2 layout) are NEGATIVE sky
+    # coordinates — see cluster.features.signed_centred_pix.
+    np.testing.assert_allclose(rec.l_rad, (132 - 256) * 2.5e-4)
+    np.testing.assert_allclose(rec.m_rad, (230 - 256) * 2.5e-4)
     assert rec.fine_dm_idx == 4
     np.testing.assert_allclose(rec.dm_fine_pc_cc, float(geom.fine_dm_pc_cc[4]))
     assert rec.t_in_cube == 64

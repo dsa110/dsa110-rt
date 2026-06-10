@@ -56,6 +56,7 @@ from typing import IO, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ..common.contracts import Candidate, ClusterRecord, CubeGeometry
+from .features import signed_centred_pix
 
 __all__ = [
     "CandsLoggerConfig",
@@ -470,8 +471,14 @@ class CandsLogger:
             cid = int(cluster_labels[i])
             l_pix = int(round(cand.l))
             m_pix = int(round(cand.m))
-            l_rad = float(l_pix) * geom.cell_l_rad + geom.l0_rad
-            m_rad = float(m_pix) * geom.cell_m_rad + geom.m0_rad
+            l_rad = (
+                signed_centred_pix(l_pix, geom.n_grid) * geom.cell_l_rad
+                + geom.l0_rad
+            )
+            m_rad = (
+                signed_centred_pix(m_pix, geom.n_grid) * geom.cell_m_rad
+                + geom.m0_rad
+            )
             # is_cluster_peak: 1 only for the peak of a cluster_id ≥ 0
             # (M6 D1; chunk-2 spec test 6 explicitly pins noise singletons
             # to is_cluster_peak=0 even though they are technically the
