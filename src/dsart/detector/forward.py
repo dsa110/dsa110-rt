@@ -41,6 +41,7 @@ chunk-2 decoder.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from typing import List, Optional, Protocol, Tuple, runtime_checkable
@@ -67,6 +68,8 @@ from .kernels import (
     Kernel,
     build_kernel_bank,
 )
+
+_LOG = logging.getLogger(__name__)
 from .merger import (
     DEFAULT_MERGE_RADIUS_FDM,
     DEFAULT_MERGE_RADIUS_LM,
@@ -1537,6 +1540,45 @@ class DeterministicDetector(torch.nn.Module):
                     fine_dm_pc_cm3=fine_dm_pc_cm3,
                     n_top=decoder_n_top * K,
                 )
+                # 2026-06-10 wing-decode diagnostic: live injections whose
+                # apex lands at cube-tail phases (t≈[192,224)) are decoded
+                # only as off-DM b16 "wings" even though the DUMPED cube
+                # (staged post-detector from the same tensor) contains a
+                # >30σ w4 apex that an offline replica of THIS exact fused
+                # path decodes trivially. Log (a) the fused max-SNR cell
+                # and (b) the σ-normalised input max over the tail slab so
+                # we can tell "detector input lacked the apex at detect
+                # time" apart from "decode lost it". Cheap (~1-2 ms) and
+                # only syncs/logs when something ≥ log_floor is present.
+                try:
+                    _log_floor = 12.0
+                    _mx_t = max_snr_cube.max()
+                    _tail_lo = min(192, int(cube.shape[0]) - 1)
+                    _tail_n = max(1, min(32, int(cube.shape[0]) - _tail_lo))
+                    _tail_mx_t = cube.narrow(0, _tail_lo, _tail_n).max()
+                    _mx = float(_mx_t.item())
+                    _tail_mx = float(_tail_mx_t.item())
+                    if _mx >= _log_floor or _tail_mx >= _log_floor:
+                        _flat_ix = int(torch.argmax(max_snr_cube).item())
+                        _F, _H, _W = (
+                            int(max_snr_cube.shape[1]),
+                            int(max_snr_cube.shape[2]),
+                            int(max_snr_cube.shape[3]),
+                        )
+                        _t = _flat_ix // (_F * _H * _W) + t_base
+                        _rem = _flat_ix % (_F * _H * _W)
+                        _f = _rem // (_H * _W)
+                        _r = (_rem % (_H * _W)) // _W
+                        _c = _rem % _W
+                        _LOG.info(
+                            "fused_decode_diag: specnum=%d max_snr=%.2f "
+                            "at(t=%d,f=%d,r=%d,c=%d) tail_input_max=%.2f "
+                            "n_cands=%d",
+                            int(event_specnum), _mx, _t, _f, _r, _c,
+                            _tail_mx, len(per_kernel_cands),
+                        )
+                except Exception:  # noqa: BLE001 — diag must never kill the hot path
+                    pass
                 del max_snr_cube, winner_cube
                 fused_done = True
 
