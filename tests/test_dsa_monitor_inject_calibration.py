@@ -942,6 +942,65 @@ class TestFireCalibrationProbeWithLadder:
         assert len(attempts) == 1
         assert not attempts[0].ok
 
+    def test_saturated_match_refuses_K_and_ladder_descends(self):
+        """2026-06-10 saturation guard: an observed SNR pinned at the
+        detector's ±250σ input-clip rail carries no amplitude
+        information — fire_calibration_probe must NOT store K
+        (observed live: DM-1000 probe at 1.2e-3 Jy·ms reported
+        snr=250.25 → bogus K=14448 stored). The ladder must then
+        retry DOWNWARD (×¼), not escalate."""
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        ladder_attempts: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            ladder_attempts.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(
+                store, inject_n_queued=len(ladder_attempts),
+            )
+            return good_inject(store, **kwargs)
+
+        def sleep_fn(s):
+            now[0] += s
+
+        # Seed a SATURATED match for attempt 1's inj_id (built at the
+        # initial clock value).
+        inj_id = ic._build_probe_inj_id(
+            prefix="cal_probe", dm=1000.0, width=4, timestamp=200.0,
+        )
+        self._seed_match(
+            store, inj_id, observed_snr=250.25,
+            K=250.25 * math.sqrt(4.0 / 7e-4),
+        )
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=1000.0,
+            width_samples=4,
+            fluence_jy_ms=7e-4,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        # Attempt 1: saturated, no K stored. Attempt 2: descended ×¼.
+        assert attempts[0].ok is False
+        assert attempts[0].reason.startswith("saturated")
+        assert attempts[0].K is None
+        assert store.get_dict(
+            f"{ic.CALIBRATION_PREFIX}dm1000"
+        ) is None, "saturated probe must NOT write the calibration"
+        assert len(ladder_attempts) == 2
+        assert ladder_attempts[1] == pytest.approx(7e-4 / 4.0)
+        # The descent went unmatched here (no seed) → no_match, and
+        # the ladder does NOT climb back up.
+        assert len(attempts) == 2
+        assert attempts[1].reason.startswith("no_match")
+
     def test_ladder_sleeps_between_attempts(self):
         """sigma_k-recovery delay: ladder attempt N>1 is preceded by a
         ``ladder_step_delay_s`` sleep."""

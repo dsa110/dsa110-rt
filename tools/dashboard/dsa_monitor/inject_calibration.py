@@ -670,6 +670,42 @@ def fire_calibration_probe(
                 observed_specnum = best.get("observed_event_specnum")
                 matched_at = best.get("matched_at_unix")
                 if isinstance(observed_snr, (int, float)) and observed_snr > 0:
+                    # 2026-06-10 saturation guard: the search-side
+                    # detector clips its σ-normalised input to ±250σ
+                    # (cube_pipeline detector_input_clip_sigma), so an
+                    # observed SNR at/above that rail carries NO
+                    # amplitude information — computing K from it
+                    # stores garbage (observed live: a DM-1000 probe
+                    # at 1.2e-3 Jy·ms reported snr=250.25 → K=14448 vs
+                    # the true ≈3300). Refuse to calibrate; the ladder
+                    # retries at LOWER fluence.
+                    if float(observed_snr) >= SATURATION_OBSERVED_SNR:
+                        return ProbeResult(
+                            ok=False, inj_id=inj_id, bucket=bucket,
+                            K=None,
+                            observed_snr=float(observed_snr),
+                            observed_event_specnum=(
+                                int(observed_specnum)
+                                if isinstance(observed_specnum, int)
+                                else None
+                            ),
+                            matched_at_unix=(
+                                float(matched_at)
+                                if isinstance(matched_at, (int, float))
+                                else None
+                            ),
+                            n_matches=n_matches,
+                            elapsed_s=now - t0,
+                            reason=(
+                                "saturated: observed_snr="
+                                f"{float(observed_snr):.1f} >= "
+                                f"{SATURATION_OBSERVED_SNR:.0f} (detector "
+                                "input clip rail) — K not stored; retry "
+                                "at lower fluence"
+                            ),
+                            inject_response=dict(inject_response),
+                            active_key=active_key,
+                        )
                     K = float(best.get("K_inferred", 0.0) or 0.0)
                     if not (math.isfinite(K) and K > 0.0):
                         # Best didn't compute a usable K (e.g. fluence
@@ -830,6 +866,13 @@ DEFAULT_FLUENCE_LADDER: Tuple[float, ...] = (1.0, 2.0, 4.0)
 #: way. Cap the ladder just below the cliff so escalation stays inside
 #: the clean linear window (4e-4 .. 1.2e-3).
 DEFAULT_MAX_PROBE_FLUENCE: float = 1.2e-3
+
+#: Observed-SNR rail above which a match is treated as SATURATED and
+#: K is NOT stored. The search detector clips its σ-normalised input
+#: to ±250σ (cube_pipeline detector_input_clip_sigma = 250), so any
+#: observed SNR at/near that value is amplitude-blind. 240 leaves a
+#: little headroom for boxcar/normalisation wiggle around the rail.
+SATURATION_OBSERVED_SNR: float = 240.0
 
 #: Pause between ladder attempts (seconds). A probe absorbed into the
 #: detector's sigma_k EMA locally inflates the noise estimate at its
@@ -1138,7 +1181,16 @@ def fire_calibration_probe_with_ladder(
 
     results: List[ProbeResult] = []
     clamp = float(max_probe_fluence)
-    for step_idx, mult in enumerate(ladder):
+    # 2026-06-10: dynamic multiplier queue so a SATURATED attempt
+    # (observed SNR pinned at the detector's ±250σ input-clip rail —
+    # see fire_calibration_probe) can retry DOWNWARD. The classic
+    # no_match path still walks the configured ascending ladder.
+    pending: List[float] = list(ladder)
+    descents = 0
+    step_idx = -1
+    while pending:
+        mult = pending.pop(0)
+        step_idx += 1
         if step_idx > 0 and ladder_step_delay_s > 0.0:
             LOG.info(
                 "calibration ladder: sleeping %.0fs before attempt %d "
@@ -1235,6 +1287,22 @@ def fire_calibration_probe_with_ladder(
 
         results.append(result)
         if result.ok:
+            return results
+        # SATURATED: the probe was detected but its SNR is pinned at
+        # the detector's input-clip rail — escalating would only
+        # saturate harder. Descend ×¼ (at most twice) instead.
+        if result.reason.startswith("saturated"):
+            if descents < 2:
+                descents += 1
+                down = float(mult) / 4.0
+                LOG.warning(
+                    "calibration ladder: attempt %d SATURATED "
+                    "(observed_snr at clip rail); descending to "
+                    "fluence multiplier %.3g",
+                    step_idx + 1, down,
+                )
+                pending = [down]
+                continue
             return results
         # Only retry on no_match; everything else is a hard fail.
         if not result.reason.startswith("no_match"):
