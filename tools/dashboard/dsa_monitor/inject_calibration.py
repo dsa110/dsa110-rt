@@ -1180,6 +1180,21 @@ def fire_calibration_probe_with_ladder(
     if not ladder:
         ladder = (1.0,)
 
+    # 2026-06-10 probe-position rotation: successive probes at the
+    # SAME pixel poison each other — the corr-side static-sky window
+    # mean learns the previous burst (and the detector's σ_k EMA
+    # inflates locally), suppressing a re-fire at the same (l, m) for
+    # the next couple of minutes. Observed all night as intermittent
+    # first-attempt no_match at fluences that measure 45σ+ when they
+    # land clean. When the caller leaves the position at the (0, 0)
+    # default we rotate each attempt through four diagonal offsets;
+    # an operator-specified position is respected untouched.
+    _PROBE_POSITIONS: tuple = (
+        (0.009, 0.009), (-0.009, 0.009), (-0.009, -0.009), (0.009, -0.009),
+    )
+    rotate_positions = (float(l_rad) == 0.0 and float(m_rad) == 0.0)
+    pos_seed = int(float(time_fn())) % len(_PROBE_POSITIONS)
+
     snapshot: Optional[HealthSnapshot] = None
     if health_check:
         snapshot = precheck_calibration_health(
@@ -1233,12 +1248,18 @@ def fire_calibration_probe_with_ladder(
                 step_idx + 1, attempt_fluence, clamp,
             )
             attempt_fluence = clamp
+        if rotate_positions:
+            attempt_l, attempt_m = _PROBE_POSITIONS[
+                (pos_seed + step_idx) % len(_PROBE_POSITIONS)
+            ]
+        else:
+            attempt_l, attempt_m = float(l_rad), float(m_rad)
         result = fire_calibration_probe(
             store,
             inject_fn=inject_fn,
             dm_pc_cm3=dm_pc_cm3,
-            l_rad=l_rad,
-            m_rad=m_rad,
+            l_rad=attempt_l,
+            m_rad=attempt_m,
             width_samples=width_samples,
             fluence_jy_ms=attempt_fluence,
             profile=profile,
