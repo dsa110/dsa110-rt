@@ -67,6 +67,9 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg", force=True)
 import matplotlib.image as mpimg                       # noqa: E402
+from matplotlib.figure import Figure                   # noqa: E402
+
+import sky_astrometry                                  # noqa: E402  (local)
 
 LOG = logging.getLogger("dsa_monitor.sky_monitor")
 
@@ -253,6 +256,167 @@ def robust_sigma(img: np.ndarray) -> tuple[float, float]:
     return med, sigma
 
 
+#: NVSS overlay: flux cut and S/N aperture (peak pixel within this
+#: radius of the predicted position; ~7 px at the 12.8″ scale of the
+#: 512² frames — generous vs the ~1′ dirty-beam core + pointing slop).
+NVSS_MIN_MJY: float = 100.0
+NVSS_APERTURE_ARCSEC: float = 90.0
+NVSS_MAX_SOURCES: int = 40
+
+
+def measure_source_snr(
+    image: np.ndarray,
+    *,
+    row: float,
+    col: float,
+    median: float,
+    sigma: float,
+    radius_pix: float,
+) -> float:
+    """(peak pixel within ``radius_pix`` of (row, col) − median) / sigma.
+
+    Returns NaN when the aperture is entirely off-frame.
+    """
+    n_pix = image.shape[0]
+    r = int(np.ceil(radius_pix))
+    r0, r1 = int(np.floor(row)) - r, int(np.floor(row)) + r + 1
+    c0, c1 = int(np.floor(col)) - r, int(np.floor(col)) + r + 1
+    r0, c0 = max(r0, 0), max(c0, 0)
+    r1, c1 = min(r1, n_pix), min(c1, n_pix)
+    if r0 >= r1 or c0 >= c1:
+        return float("nan")
+    win = image[r0:r1, c0:c1]
+    rr, cc = np.mgrid[r0:r1, c0:c1]
+    mask = (rr - row) ** 2 + (cc - col) ** 2 <= radius_pix ** 2
+    if not mask.any():
+        return float("nan")
+    return float((win[mask].max() - median) / sigma)
+
+
+def _nice_step(span_deg: float, *, n_target: int = 4) -> float:
+    """Pick a 1/2/2.5/5×10ⁿ step giving ~n_target divisions of span."""
+    raw = span_deg / max(n_target, 1)
+    mag = 10.0 ** np.floor(np.log10(raw))
+    for mult in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if mult * mag >= raw:
+            return float(mult * mag)
+    return float(10.0 * mag)
+
+
+def render_annotated_png(
+    png_path: Path,
+    image: np.ndarray,
+    *,
+    median: float,
+    sigma: float,
+    ra0_deg: float,
+    dec0_deg: float,
+    fov_rad: float,
+    nvss_rows: list[dict[str, Any]],
+    ts: float,
+    used_chgroups: list[int],
+) -> None:
+    """Write the sigma-stretched greyscale frame with an RA/Dec grid
+    and NVSS source markers (2026-06-09 request).
+
+    Axes are (l, m) offsets in degrees about the meridian phase center
+    (origin='lower': north up, east RIGHT — instrument frame). The
+    RA/Dec graticule is SIN-deprojected through
+    :mod:`sky_astrometry`; labels are RA hh:mm and Dec degrees.
+    """
+    fov_deg = float(np.rad2deg(fov_rad))
+    half = fov_deg / 2.0
+    img_sigma = (image - median) / sigma
+
+    fig = Figure(figsize=(7.4, 7.8), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.imshow(
+        img_sigma, cmap="gray",
+        vmin=PNG_VMIN_SIGMA, vmax=PNG_VMAX_SIGMA,
+        origin="lower", extent=(-half, half, -half, half),
+        interpolation="nearest",
+    )
+    ax.set_xlim(-half, half)
+    ax.set_ylim(-half, half)
+    ax.set_xlabel("l offset (deg) — east →")
+    ax.set_ylabel("m offset (deg) — north ↑")
+
+    # ---- RA/Dec graticule ------------------------------------------------
+    grid_kw = dict(color="#46d4ff", lw=0.6, alpha=0.55, zorder=3)
+    lbl_kw = dict(color="#46d4ff", fontsize=7, alpha=0.9, zorder=4)
+    cosd = max(np.cos(np.deg2rad(dec0_deg)), 1e-3)
+
+    dec_step = _nice_step(fov_deg)
+    dec_vals = np.arange(
+        np.floor((dec0_deg - half) / dec_step) * dec_step,
+        dec0_deg + half + dec_step, dec_step,
+    )
+    ra_span = fov_deg / cosd
+    ra_step = _nice_step(ra_span)
+    ra_vals = np.arange(
+        np.floor((ra0_deg - ra_span / 2.0) / ra_step) * ra_step,
+        ra0_deg + ra_span / 2.0 + ra_step, ra_step,
+    )
+    ra_samp = np.linspace(ra0_deg - ra_span, ra0_deg + ra_span, 241)
+    dec_samp = np.linspace(dec0_deg - fov_deg, dec0_deg + fov_deg, 241)
+
+    for dv in dec_vals:                                  # constant-Dec curves
+        l, m = sky_astrometry.radec_to_lm(
+            ra_samp, np.full_like(ra_samp, dv),
+            ra0_deg=ra0_deg, dec0_deg=dec0_deg,
+        )
+        ld, md = np.rad2deg(l), np.rad2deg(m)
+        ax.plot(ld, md, **grid_kw)
+        ok = (np.abs(ld) < half) & (np.abs(md) < half * 0.98)
+        if ok.any():
+            i = np.flatnonzero(ok)[0]                    # leftmost in-frame
+            ax.text(max(ld[i], -half * 0.99), md[i], f" {dv:+.2f}°",
+                    va="bottom", ha="left", **lbl_kw)
+    for rv in ra_vals:                                   # constant-RA curves
+        l, m = sky_astrometry.radec_to_lm(
+            np.full_like(dec_samp, rv), dec_samp,
+            ra0_deg=ra0_deg, dec0_deg=dec0_deg,
+        )
+        ld, md = np.rad2deg(l), np.rad2deg(m)
+        ax.plot(ld, md, **grid_kw)
+        ok = (np.abs(ld) < half * 0.98) & (np.abs(md) < half)
+        if ok.any():
+            i = np.flatnonzero(ok)[np.argmin(md[ok])]    # bottom-most
+            h = (rv % 360.0) / 15.0
+            hh = int(h)
+            mm = (h - hh) * 60.0
+            ax.text(ld[i], max(md[i], -half * 0.99), f"{hh:02d}h{mm:04.1f}m",
+                    va="bottom", ha="center", rotation=90, **lbl_kw)
+
+    # ---- NVSS sources ------------------------------------------------------
+    for src in nvss_rows:
+        ld = float(np.rad2deg(src["l_rad"]))
+        md = float(np.rad2deg(src["m_rad"]))
+        ax.plot(
+            ld, md, "o", mfc="none", mec="#ffe066", mew=1.1,
+            ms=11.0, alpha=0.95, zorder=5,
+        )
+        snr = src.get("snr")
+        snr_txt = "—" if snr is None or not np.isfinite(snr) else f"{snr:.1f}σ"
+        ax.annotate(
+            f"{src['flux_mjy']:.0f} mJy / {snr_txt}",
+            xy=(ld, md), xytext=(5, 5), textcoords="offset points",
+            color="#ffe066", fontsize=7, zorder=5,
+        )
+
+    utc = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S",
+    )
+    ax.set_title(
+        f"{utc} UTC   |   center RA {ra0_deg / 15.0:.4f} h  "
+        f"Dec {dec0_deg:+.3f}°   |   {len(used_chgroups)}/16 chgroups   |   "
+        f"NVSS ≥ {NVSS_MIN_MJY:.0f} mJy",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    fig.savefig(str(png_path), facecolor="white")
+
+
 # ---------------------------------------------------------------------------
 # Frame store
 # ---------------------------------------------------------------------------
@@ -285,9 +449,17 @@ class SkyFrameStore:
         sigma: float,
         used_chgroups: list[int],
         meta: dict[str, Any],
+        annotate: Optional[dict[str, Any]] = None,
     ) -> tuple[Path, Path]:
         """Write the PNG (sigma-stretched greyscale) + NPZ (raw float32
         image + full metadata). Returns ``(png_path, npz_path)``.
+
+        ``annotate`` (2026-06-09): when provided
+        (``{ra0_deg, dec0_deg, fov_rad, nvss_rows}``), the PNG becomes
+        an annotated figure with an RA/Dec graticule + NVSS markers
+        (:func:`render_annotated_png`); falls back to the bare
+        greyscale dump if the figure render throws. The NPZ raw image
+        is unchanged either way.
         """
         day_dir = self.frames_dir / self._day(ts)
         day_dir.mkdir(parents=True, exist_ok=True)
@@ -295,17 +467,36 @@ class SkyFrameStore:
         png_path = day_dir / f"{stem}.png"
         npz_path = day_dir / f"{stem}.npz"
 
-        img_sigma = (image - median) / sigma
-        # origin='lower' so +m (north) is up, matching the cube
-        # explorer notebook's imshow convention.
-        mpimg.imsave(
-            str(png_path),
-            img_sigma,
-            cmap="gray",
-            vmin=PNG_VMIN_SIGMA,
-            vmax=PNG_VMAX_SIGMA,
-            origin="lower",
-        )
+        wrote_png = False
+        if annotate is not None:
+            try:
+                render_annotated_png(
+                    png_path, image,
+                    median=median, sigma=sigma,
+                    ra0_deg=float(annotate["ra0_deg"]),
+                    dec0_deg=float(annotate["dec0_deg"]),
+                    fov_rad=float(annotate["fov_rad"]),
+                    nvss_rows=annotate.get("nvss_rows", []),
+                    ts=ts, used_chgroups=used_chgroups,
+                )
+                wrote_png = True
+            except Exception:                              # noqa: BLE001
+                LOG.exception(
+                    "annotated frame render failed; falling back to "
+                    "bare greyscale",
+                )
+        if not wrote_png:
+            img_sigma = (image - median) / sigma
+            # origin='lower' so +m (north) is up, matching the cube
+            # explorer notebook's imshow convention.
+            mpimg.imsave(
+                str(png_path),
+                img_sigma,
+                cmap="gray",
+                vmin=PNG_VMIN_SIGMA,
+                vmax=PNG_VMAX_SIGMA,
+                origin="lower",
+            )
         np.savez_compressed(
             npz_path,
             image=image.astype(np.float32),
@@ -435,6 +626,7 @@ class SkyMonitor:
         n_grid: int = 256,
         oversample: int = 2,
         grid_correct: bool = True,
+        nvss_enabled: bool = True,
     ) -> None:
         self.store = store if store is not None else SkyFrameStore()
         self.frame_interval_s = float(frame_interval_s)
@@ -443,6 +635,15 @@ class SkyMonitor:
         self.n_grid = int(n_grid)
         self.oversample = max(1, int(oversample))
         self.grid_correct = bool(grid_correct)
+        # NVSS overlay catalog: parsed once on a daemon thread (~10 s
+        # for the 260 MB tdat, then npz-cached under the store root);
+        # frames built before it lands simply omit the overlay.
+        self.nvss_enabled = bool(nvss_enabled)
+        self._nvss = sky_astrometry.NvssCatalog(
+            min_mjy=NVSS_MIN_MJY, cache_dir=self.store.root,
+        )
+        if self.nvss_enabled:
+            self._nvss.start_loading()
 
         self._lock = threading.Lock()
         self._latest: dict[int, dict[str, Any]] = {}     # chgroup → snapshot
@@ -526,6 +727,65 @@ class SkyMonitor:
         dec_degs = sorted({
             round(float(s["meta"].get("dec_deg", 0.0)), 4) for s in fresh
         })
+
+        # ---- Astrometry + NVSS overlay (2026-06-09) -------------------
+        # Un-fringestopped vis ⇒ phase center = meridian at obs_dec:
+        # (α₀, δ₀) = (LST(now), dec). FOV = 1/cell_lambda rad (square).
+        annotate: Optional[dict[str, Any]] = None
+        astro: dict[str, Any] = {}
+        try:
+            if cell_lambdas and cell_lambdas[0] > 0:
+                fov_rad = 1.0 / float(cell_lambdas[0])
+                dec0 = float(dec_degs[0]) if dec_degs else 0.0
+                ra0 = sky_astrometry.lst_deg(now)
+                n_pix = int(image.shape[0])
+                pix_arcsec = np.rad2deg(fov_rad / n_pix) * 3600.0
+                nvss_rows: list[dict[str, Any]] = []
+                cat = self._nvss.get() if self.nvss_enabled else None
+                if cat is not None:
+                    sel = sky_astrometry.select_in_fov(
+                        cat, ra0_deg=ra0, dec0_deg=dec0,
+                        fov_rad=fov_rad, max_sources=NVSS_MAX_SOURCES,
+                    )
+                    r_pix = NVSS_APERTURE_ARCSEC / pix_arcsec
+                    for i in range(sel["ra_deg"].size):
+                        row, col = sky_astrometry.lm_to_pix(
+                            sel["l_rad"][i], sel["m_rad"][i],
+                            n_pix=n_pix, fov_rad=fov_rad,
+                        )
+                        snr = measure_source_snr(
+                            image, row=float(row), col=float(col),
+                            median=median, sigma=sigma, radius_pix=r_pix,
+                        )
+                        nvss_rows.append({
+                            "name": str(sel["name"][i]),
+                            "ra_deg": float(sel["ra_deg"][i]),
+                            "dec_deg": float(sel["dec_deg"][i]),
+                            "flux_mjy": float(sel["flux_mjy"][i]),
+                            "l_rad": float(sel["l_rad"][i]),
+                            "m_rad": float(sel["m_rad"][i]),
+                            "row": float(row),
+                            "col": float(col),
+                            "snr": (float(snr) if np.isfinite(snr) else None),
+                        })
+                annotate = {
+                    "ra0_deg": ra0, "dec0_deg": dec0,
+                    "fov_rad": fov_rad, "nvss_rows": nvss_rows,
+                }
+                astro = {
+                    "ra0_deg": ra0,
+                    "dec0_deg": dec0,
+                    "lst_h": ra0 / 15.0,
+                    "fov_deg": float(np.rad2deg(fov_rad)),
+                    "pix_arcsec": pix_arcsec,
+                    "nvss_min_mjy": NVSS_MIN_MJY,
+                    "nvss_aperture_arcsec": NVSS_APERTURE_ARCSEC,
+                    "nvss": nvss_rows,
+                    "nvss_loaded": cat is not None,
+                }
+        except Exception:                                  # noqa: BLE001
+            LOG.exception("sky astrometry failed (frame without overlay)")
+            annotate = None
         meta = {
             "ts": now,
             "used_chgroups": used,
@@ -549,10 +809,11 @@ class SkyMonitor:
                 }
                 for s in fresh
             },
+            **astro,
         }
         self.store.write_frame(
             image, ts=now, median=median, sigma=sigma,
-            used_chgroups=used, meta=meta,
+            used_chgroups=used, meta=meta, annotate=annotate,
         )
         self._last_frame_unix = now
         self.n_frames += 1
@@ -599,11 +860,15 @@ __all__ = [
     "SKY_MONITOR_ROOT",
     "PNG_VMIN_SIGMA",
     "PNG_VMAX_SIGMA",
+    "NVSS_MIN_MJY",
+    "NVSS_APERTURE_ARCSEC",
     "SkyFrameStore",
     "SkyMonitor",
     "parse_snapshot_npz",
     "combine_chgroups_to_uv",
     "dirty_image_from_uv",
+    "measure_source_snr",
     "pillbox_grid_correction",
+    "render_annotated_png",
     "robust_sigma",
 ]

@@ -16,10 +16,10 @@
         color: #dfe6e9;
     }
     .sky-viewer img {
-        width: 512px;
-        height: 512px;
-        /* Frames are 512×512 (2× UV-padded oversample) — render 1:1,
-           smooth scaling if the layout ever resizes them. */
+        /* Annotated figures (RA/Dec grid + NVSS overlay) are
+           740×780 px; older bare frames scale up smoothly. */
+        width: 740px;
+        height: auto;
         image-rendering: auto;
         background: #000;
         display: block;
@@ -85,7 +85,10 @@
     −3σ…+10σ where σ is a robust (MAD) per-image noise estimate.
     Frames are 2× oversampled (UV zero-padding — exact band-limited
     interpolation, same FOV) and pillbox grid-corrected so edge sources
-    show at true relative strength.
+    show at true relative strength. The RA/Dec graticule assumes the
+    meridian phase center (α₀ = LST, δ₀ = obs dec); yellow circles mark
+    NVSS sources ≥ 100 mJy, labelled with catalog flux and the measured
+    S/N (peak pixel within a 90″ aperture). North up, east <b>right</b>.
     If bright continuum sources are not visible here, the search is not
     seeing the sky. <b>Manual refresh only.</b>
     Frames live under <code>{{ sky_root }}</code>.

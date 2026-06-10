@@ -34,6 +34,7 @@ def _snapshot_bytes(
     amp_scale: float = 1.0,
     n_grid: int = N_GRID,
     version: int | None = None,
+    dec_deg: float = 54.5,
 ) -> bytes:
     """Build a wire-format snapshot npz (mirrors sky_export)."""
     rng = np.random.default_rng(chgroup)
@@ -48,7 +49,7 @@ def _snapshot_bytes(
         "hostname": f"n{chgroup + 3:02d}",
         "n_grid": n_grid,
         "cell_lambda": 12.5,
-        "dec_deg": 54.5,
+        "dec_deg": dec_deg,
         "amp_scale": amp_scale,
         "cubes_seen": 1000,
         "block_n": 5000,
@@ -197,6 +198,7 @@ def test_monitor_frame_is_oversampled_by_default(tmp_path):
     """SkyMonitor production defaults: 2× oversample + grid correct,
     surfaced in the frame metadata and the written NPZ image shape."""
     mon = sm.SkyMonitor(
+        nvss_enabled=False,
         store=sm.SkyFrameStore(root=tmp_path, retention_h=48.0),
         frame_interval_s=30.0,
         freshness_s=90.0,
@@ -217,6 +219,133 @@ def test_monitor_frame_is_oversampled_by_default(tmp_path):
     assert meta["oversample"] == 2
     assert meta["grid_correct"] is True
     assert meta["n_pix"] == 2 * N_GRID
+
+
+# ---------------------------------------------------------------------------
+# Astrometry + NVSS overlay (sky_astrometry + annotated frames)
+# ---------------------------------------------------------------------------
+
+import sky_astrometry as sa                                  # noqa: E402
+
+
+def test_radec_lm_roundtrip_and_orientation():
+    ra0, dec0 = 123.4, 16.27
+    # Phase center maps to (0, 0).
+    l, m = sa.radec_to_lm(ra0, dec0, ra0_deg=ra0, dec0_deg=dec0)
+    assert abs(float(l)) < 1e-12 and abs(float(m)) < 1e-12
+    # East (increasing RA) → +l; north (increasing Dec) → +m. Matches
+    # bench/run_0319_pipeline._compute_expected_lm (l = -cosδ sinHA).
+    l, m = sa.radec_to_lm(ra0 + 0.5, dec0, ra0_deg=ra0, dec0_deg=dec0)
+    assert float(l) > 0 and abs(float(m)) < 1e-4
+    l, m = sa.radec_to_lm(ra0, dec0 + 0.5, ra0_deg=ra0, dec0_deg=dec0)
+    assert abs(float(l)) < 1e-12 and float(m) > 0
+    # Round-trip a grid of offsets.
+    ras = ra0 + np.linspace(-0.8, 0.8, 7)
+    decs = dec0 + np.linspace(-0.8, 0.8, 7)
+    l, m = sa.radec_to_lm(ras, decs, ra0_deg=ra0, dec0_deg=dec0)
+    ra2, dec2 = sa.lm_to_radec(l, m, ra0_deg=ra0, dec0_deg=dec0)
+    np.testing.assert_allclose(ra2, ras % 360.0, atol=1e-9)
+    np.testing.assert_allclose(dec2, decs, atol=1e-9)
+
+
+def test_lm_to_pix_matches_replay_convention():
+    # Mirrors bench/_corr_fast_replay.pixel_to_lm_radians: center pixel
+    # n_pix//2 ↔ (l, m) = (0, 0); pixel scale = fov / n_pix.
+    fov = 1.0 / 31.49                                    # rad, production-like
+    row, col = sa.lm_to_pix(0.0, 0.0, n_pix=512, fov_rad=fov)
+    assert (float(row), float(col)) == (256.0, 256.0)
+    l = 10 * fov / 512.0
+    row, col = sa.lm_to_pix(l, -l, n_pix=512, fov_rad=fov)
+    assert float(col) == pytest.approx(266.0)
+    assert float(row) == pytest.approx(246.0)
+
+
+def test_nvss_tdat_parse_and_select(tmp_path):
+    tdat = tmp_path / "mini.tdat"
+    tdat.write_text(
+        "<HEADER>\n"
+        "field[name] = char20\n"
+        "<DATA>\n"
+        # name|ra|dec|lii|bii|ra_err|dec_err|flux|...
+        "NVSS J1|10.0|16.0|0|0|1|1|250.0|1|\n"
+        "NVSS J2|10.2|16.1|0|0|1|1|99.9|1|\n"          # below cut
+        "NVSS J3|10.1|15.9|0|0|1|1|1500.0|1|\n"
+        "NVSS J4|200.0|-40.0|0|0|1|1|800.0|1|\n"       # out of FOV
+        "NVSS Jbad|x|y|0|0|1|1|500.0|1|\n"             # malformed
+        "<END>\n"
+    )
+    cat = sa.load_nvss(min_mjy=100.0, tdat_path=tdat, cache_dir=tmp_path)
+    assert cat is not None
+    assert sorted(cat["name"].tolist()) == ["NVSS J1", "NVSS J3", "NVSS J4"]
+    # Cache round-trip gives identical content.
+    cat2 = sa.load_nvss(min_mjy=100.0, tdat_path=tdat, cache_dir=tmp_path)
+    np.testing.assert_array_equal(cat["flux_mjy"], cat2["flux_mjy"])
+
+    sel = sa.select_in_fov(
+        cat, ra0_deg=10.0, dec0_deg=16.0, fov_rad=np.deg2rad(1.0),
+    )
+    # J1 + J3 in the 1° FOV, brightest first; J4 excluded.
+    assert sel["name"].tolist() == ["NVSS J3", "NVSS J1"]
+    assert abs(sel["l_rad"][1]) < 1e-9                   # J1 at center
+
+
+def test_measure_source_snr():
+    img = np.zeros((64, 64), dtype=np.float32)
+    img[40, 22] = 7.0                                     # source peak
+    snr = sm.measure_source_snr(
+        img, row=41.5, col=20.5, median=0.0, sigma=1.0, radius_pix=3.0,
+    )
+    assert snr == pytest.approx(7.0)
+    # Aperture misses the peak → 0σ here (empty field).
+    snr = sm.measure_source_snr(
+        img, row=10.0, col=10.0, median=0.0, sigma=1.0, radius_pix=3.0,
+    )
+    assert snr == pytest.approx(0.0)
+    # Fully off-frame → NaN.
+    assert np.isnan(sm.measure_source_snr(
+        img, row=-50.0, col=-50.0, median=0.0, sigma=1.0, radius_pix=3.0,
+    ))
+
+
+def test_annotated_frame_with_nvss(tmp_path, monkeypatch):
+    """End-to-end: stubbed catalog + stubbed LST → annotated PNG, and
+    the per-source measured S/N lands in the frame metadata."""
+    monkeypatch.setattr(sa, "lst_deg", lambda ts: 10.0)   # ra0 = 10°
+    mon = sm.SkyMonitor(
+        store=_store(tmp_path), min_chgroups=1, n_grid=N_GRID,
+        nvss_enabled=True,
+    )
+    # Inject the catalog directly (skip the loader thread): one source
+    # AT the phase center so it sits on the central pixel.
+    mon._nvss._cat = {
+        "name": np.array(["NVSS JX"], dtype="U20"),
+        "ra_deg": np.array([10.0]),
+        "dec_deg": np.array([16.0]),                      # = dec0 below
+        "flux_mjy": np.array([500.0]),
+    }
+    # dec_deg=16.0 must come through the snapshot meta.
+    ack = mon.ingest(
+        _snapshot_bytes(0, dec_deg=16.0), now=1_750_000_000.0,
+    )
+    assert ack["frame_written"]
+    frames = mon.store.list_frames(since_unix=0)
+    day, png = frames[0]["day"], frames[0]["png"]
+    png_path = mon.store.frames_dir / day / png
+    assert png_path.is_file() and png_path.stat().st_size > 10_000
+    npz_path = png_path.with_suffix(".npz")
+    with np.load(npz_path, allow_pickle=False) as z:
+        meta = json.loads(bytes(z["meta_json"]).decode("utf-8"))
+    assert meta["ra0_deg"] == pytest.approx(10.0)
+    assert meta["dec0_deg"] == pytest.approx(16.0)
+    assert meta["nvss_loaded"] is True
+    assert len(meta["nvss"]) == 1
+    src = meta["nvss"][0]
+    assert src["name"] == "NVSS JX"
+    # Central pixel of the oversampled frame, finite measured S/N.
+    n_pix = meta["n_pix"]
+    assert src["row"] == pytest.approx(n_pix // 2, abs=1.0)
+    assert src["col"] == pytest.approx(n_pix // 2, abs=1.0)
+    assert src["snr"] is not None
 
 
 def test_robust_sigma_ignores_bright_sources():
@@ -286,6 +415,7 @@ def test_store_prune_removes_old_frames(tmp_path):
 
 def test_ingest_builds_frame_when_due(tmp_path):
     mon = sm.SkyMonitor(
+        nvss_enabled=False,
         store=_store(tmp_path),
         frame_interval_s=30.0,
         freshness_s=90.0,
@@ -314,6 +444,7 @@ def test_ingest_builds_frame_when_due(tmp_path):
 
 def test_ingest_excludes_stale_chgroups(tmp_path):
     mon = sm.SkyMonitor(
+        nvss_enabled=False,
         store=_store(tmp_path),
         frame_interval_s=30.0,
         freshness_s=90.0,
@@ -331,7 +462,8 @@ def test_ingest_excludes_stale_chgroups(tmp_path):
 
 
 def test_ingest_rejects_bad_chgroup_and_garbage(tmp_path):
-    mon = sm.SkyMonitor(store=_store(tmp_path), n_grid=N_GRID)
+    mon = sm.SkyMonitor(store=_store(tmp_path), n_grid=N_GRID,
+                        nvss_enabled=False)
     with pytest.raises(ValueError):
         mon.ingest(_snapshot_bytes(99), now=time.time())
     with pytest.raises(ValueError):
@@ -340,7 +472,8 @@ def test_ingest_rejects_bad_chgroup_and_garbage(tmp_path):
 
 
 def test_status_reports_freshness(tmp_path):
-    mon = sm.SkyMonitor(store=_store(tmp_path), n_grid=N_GRID)
+    mon = sm.SkyMonitor(store=_store(tmp_path), n_grid=N_GRID,
+                        nvss_enabled=False)
     t0 = 1_750_000_000.0
     mon.ingest(_snapshot_bytes(2), now=t0)
     st = mon.status(now=t0 + 12)
