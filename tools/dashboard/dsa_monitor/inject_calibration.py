@@ -11,30 +11,37 @@ This module provides the two halves of a bootstrap calibration:
 1. :class:`CalibrationStore` — persists a per-``dm_band`` calibration
    constant ``K`` in etcd at
    ``/cnf/inject/snr_calibration/<bucket>``. ``K`` parameterises
+   (2026-06-10 LINEAR fluence model — see
+   :func:`dsart.coinc.inject_match.compute_k_inferred`)
 
-       observed_snr ≈ K × sqrt(fluence_jy_ms / width_samples)
+       observed_snr ≈ K × fluence_jy_ms / sqrt(width_samples)
 
    so the inverse is
 
-       fluence_jy_ms = width_samples × (target_snr / K)^2.
+       fluence_jy_ms = target_snr × sqrt(width_samples) / K.
+
+   The linearity in fluence follows from the injector adding VOLTAGE
+   amplitude √(fluence/width) while the imager works on correlated
+   POWER (image amplitude ∝ fluence/width; matched filter over W
+   samples ⇒ SNR ∝ fluence/√W). Confirmed live 2026-06-10 with a
+   DM-500 w=4 sweep: 2e-4→12.9σ … 7e-4→44.1σ (K constant ±4%).
 
    ``K`` depends on the search-side DM band (the coarse + fine
    de-disperser path the injection drives); we bucket by
    ``round(dm / 50) × 50`` to give the operator a small, predictable
    table. ``K`` is **width-independent** post-F-fix-injector-fluence-
-   norm — the voltage-domain injector now obeys the radiometer law
-   ``observed_snr ∝ fluence/√width`` exactly, so a single calibration
-   probe at any width pins K for that DM band and predicts SNR for
-   every other width. (Pre-fix, the injector violated the law by a
-   factor of 1/W², which would have leaked into K and forced per-
-   width calibration; that constraint is now removed.)
+   norm — a single calibration probe at any width pins K for that DM
+   band and predicts SNR for every other width. (Pre-fix, the
+   injector violated the law by a factor of 1/W², which would have
+   leaked into K and forced per-width calibration; that constraint is
+   now removed.)
 
 2. :func:`fire_calibration_probe` — fires one known-fluence injection
    with the existing :func:`control_store.control_inject_pulse`
    helper, records the corresponding ``/cnf/inject/active/<inj_id>``
    payload the C2 matcher consumes, then polls
    ``/mon/dsart/inject/matches/<inj_id>`` for the observed SNR. On a
-   match it computes ``K = observed_snr × sqrt(width / fluence)``
+   match it computes ``K = observed_snr × sqrt(width) / fluence``
    and stores it. On no-match it returns a structured error so the
    UI can surface "calibration failed: no C1 candidate within
    tolerance".
@@ -377,9 +384,17 @@ def snr_to_fluence(
 ) -> float:
     """Return the fluence (Jy·ms) needed to hit ``target_snr``.
 
-    Inverts ``observed_snr = K × sqrt(fluence / width_samples)``:
+    2026-06-10 LINEAR fluence model (see
+    :func:`dsart.coinc.inject_match.compute_k_inferred`): the imager
+    works on correlated POWER, so
 
-        fluence = width_samples × (target_snr / K)^2.
+        observed_snr = K × fluence / sqrt(width_samples)
+        ⇒ fluence    = target_snr × sqrt(width_samples) / K.
+
+    Confirmed live with a DM-500 w=4 fluence sweep (2e-4→12.9σ …
+    7e-4→44.1σ: K = snr·√w/F constant to ±4%). The previous √-model
+    made target-SNR injections undershoot: a requested SNR-20 came
+    out below the C1 threshold and vanished.
 
     Raises :class:`ValueError` on non-positive K / width / target.
     """
@@ -393,8 +408,11 @@ def snr_to_fluence(
         raise ValueError(f"K={K} must be > 0")
     if width_samples < 1:
         raise ValueError(f"width_samples={width_samples} must be >= 1")
-    ratio = float(target_snr) / float(K)
-    return float(width_samples) * ratio * ratio
+    return (
+        float(target_snr)
+        * math.sqrt(float(width_samples))
+        / float(K)
+    )
 
 
 # ---------------------------------------------------------------------------

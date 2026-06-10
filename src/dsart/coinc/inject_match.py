@@ -389,7 +389,23 @@ class MatchResult:
 def compute_k_inferred(
     *, observed_snr: float, fluence_jy_ms: float, width_samples: int,
 ) -> float:
-    """Return ``K = observed_snr × sqrt(width / fluence)``.
+    """Return ``K = observed_snr × sqrt(width) / fluence``.
+
+    2026-06-10 LINEAR fluence model. The injector adds VOLTAGE
+    amplitude ``√(fluence/width)``; the imager works on correlated
+    POWER, so the image-domain burst amplitude is ∝ ``fluence/width``
+    and the matched-filter SNR over ``width`` samples is
+
+        observed_snr = K × fluence / sqrt(width)        (linear in F!)
+
+    — NOT the previous ``K × sqrt(fluence/width)`` (a voltage-domain
+    heuristic that survived the injector-normalisation fix). Confirmed
+    live 2026-06-10 with a DM-500 w=4 fluence sweep:
+    2e-4→12.9σ, 3.2e-4→21.5σ, 5e-4→31.6σ, 7e-4→44.1σ
+    (K = snr·√w/F = 1.26–1.34e5, ±4%, while the √-model "K" drifted
+    ×1.9 across the same range). The √-model also made target-SNR
+    injections undershoot: a requested SNR-20 landed below the C1
+    threshold and silently vanished.
 
     Returns ``nan`` if any input is non-finite, non-positive, or the
     inferred K is non-finite. The dashboard treats a non-finite K as
@@ -401,8 +417,10 @@ def compute_k_inferred(
     if observed_snr <= 0.0 or fluence_jy_ms <= 0.0 or width_samples <= 0:
         return float("nan")
     try:
-        return float(observed_snr) * math.sqrt(
-            float(width_samples) / float(fluence_jy_ms)
+        return (
+            float(observed_snr)
+            * math.sqrt(float(width_samples))
+            / float(fluence_jy_ms)
         )
     except (ValueError, ZeroDivisionError):
         return float("nan")

@@ -121,10 +121,10 @@ class TestBucketKey:
 
 class TestSnrToFluence:
     def test_round_trip_with_K(self):
-        # observed_snr = K × sqrt(fluence / width)
-        # K=10, target_snr=20, width=32 ⇒ fluence = 32 × (20/10)^2 = 128
+        # 2026-06-10 linear model: observed_snr = K × fluence / sqrt(width)
+        # K=10, target_snr=20, width=32 ⇒ fluence = 20 × sqrt(32) / 10
         out = ic.snr_to_fluence(target_snr=20.0, K=10.0, width_samples=32)
-        assert out == pytest.approx(128.0)
+        assert out == pytest.approx(20.0 * math.sqrt(32.0) / 10.0)
 
     @pytest.mark.parametrize(
         "kw",

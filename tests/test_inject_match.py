@@ -132,8 +132,8 @@ class TestComputeKInferred:
         K_true = 7.5
         fluence = 50.0
         width = 32
-        # observed_snr = K * sqrt(fluence / width)
-        observed = K_true * math.sqrt(fluence / width)
+        # 2026-06-10 linear model: observed_snr = K * fluence / sqrt(width)
+        observed = K_true * fluence / math.sqrt(width)
         K_back = compute_k_inferred(
             observed_snr=observed,
             fluence_jy_ms=fluence,
@@ -474,9 +474,10 @@ class TestTryMatch:
         assert mr is not None
         assert mr.inj_id == "aa"
         assert mr.observed_snr == 20.0
-        # K = observed × sqrt(width/fluence) = 20 × sqrt(32/100)
+        # 2026-06-10 linear fluence model:
+        # K = observed × sqrt(width) / fluence = 20 × sqrt(32) / 100
         assert mr.K_inferred == pytest.approx(
-            20.0 * math.sqrt(32.0 / 100.0), rel=1e-9,
+            20.0 * math.sqrt(32.0) / 100.0, rel=1e-9,
         )
         # And a publish happened.
         assert len(store.puts) == 1
