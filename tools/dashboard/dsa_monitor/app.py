@@ -155,7 +155,35 @@ cands_browser = ArchiveBrowser()
 # all heavy work (combine + iFFT + PNG) happens per ~30 s frame inside
 # ingest requests.
 from sky_monitor import SkyMonitor
-sky_mon = SkyMonitor()
+
+
+def _active_sidereal_vetos() -> list:
+    """Active C2 sidereal (l,m) dump-veto regions for the sky overlay.
+
+    Reads the registry C2 publishes to ``/mon/c2/sidereal_vetos``.
+    Best-effort: any etcd problem yields no overlay (never raises into
+    the frame builder).
+    """
+    try:
+        doc = etcd_store.get_dict("/mon/c2/sidereal_vetos")
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(doc, dict):
+        return []
+    regions = doc.get("regions")
+    out = []
+    if isinstance(regions, list):
+        tol = doc.get("tol_rad", 0.0)
+        for r in regions:
+            if not isinstance(r, dict):
+                continue
+            r = dict(r)
+            r.setdefault("tol_rad", tol)
+            out.append(r)
+    return out
+
+
+sky_mon = SkyMonitor(veto_provider=_active_sidereal_vetos)
 
 
 def _init_store_and_poller() -> None:
@@ -454,6 +482,29 @@ def sky_status():
     """Per-chgroup snapshot freshness + frame counters (debugging
     which corr nodes are reporting)."""
     return jsonify(sky_mon.status())
+
+
+@app.route("/sky/vetos", methods=["GET"])
+def sky_vetos():
+    """Live C2 sidereal (l,m) dump-veto registry (active regions).
+
+    Reads ``/mon/c2/sidereal_vetos`` so the sky page lists the active
+    vetos independent of frame cadence.
+    """
+    try:
+        doc = etcd_store.get_dict("/mon/c2/sidereal_vetos")
+    except Exception as exc:                                # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc),
+                        "regions": [], "tol_arcsec": 0.0})
+    if not isinstance(doc, dict):
+        return jsonify({"ok": True, "regions": [], "tol_arcsec": 0.0})
+    return jsonify({
+        "ok": True,
+        "regions": doc.get("regions", []),
+        "tol_arcsec": doc.get("tol_arcsec", 0.0),
+        "n_active": doc.get("n_active", 0),
+        "ts": doc.get("ts"),
+    })
 
 
 # ---------- Plot endpoints (PNG) ------------------------------------------
@@ -1968,6 +2019,47 @@ def control_delete_snr_cal_post():
         ic.delete_snr_calibrations,
         dry_run=dry_run,
     )
+
+
+@app.route("/control/clear_sidereal_vetos", methods=["POST"])
+def control_clear_sidereal_vetos_post():
+    """Clear the C2 sidereal (l,m) dump-veto registry.
+
+    Writes ``/cmd/c2/sidereal_vetos_clear = {"ts", "actor"}``; the C2
+    service applies it within one mon-publish tick (~5 s), wiping the
+    in-memory registry and rewriting ``/cnf/c2/sidereal_vetos`` empty.
+
+    Form fields:
+      confirm   Must equal ``clear_vetos``.
+    """
+    import time as _time
+
+    f = request.form
+    confirm = (f.get("confirm") or "").strip()
+    if confirm != "clear_vetos":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "clear_sidereal_vetos requires confirm=clear_vetos in the "
+                "POST body — this is a deliberate safety speed bump."
+            ),
+        }), 400
+
+    ts = _time.time()
+    actor = (
+        request.headers.get("X-Forwarded-User")
+        or request.remote_addr
+        or "dashboard"
+    )
+    try:
+        control_store.put_dict(
+            "/cmd/c2/sidereal_vetos_clear",
+            {"ts": ts, "actor": str(actor)},
+        )
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("clear_sidereal_vetos: etcd put failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "ts": ts, "actor": str(actor)})
 
 
 # ---------- API ------------------------------------------------------------

@@ -2,30 +2,30 @@ DSA-110 dsa110-rt — DM-plan Monte-Carlo S/N-loss report
 ================================================================
 
 Inherited fine-DM plan (configs/dm_plan.npz):
-  dm_min          = 0.000 pc cm⁻³
-  dm_max          = 3000.000 pc cm⁻³
-  Levin tolerance = 1.500
-  N_fine          = 690 trials
-  spacing range   = 4.1788 .. 4.712 pc cm⁻³
-  N_coarse        = 16
+  dm_min          = 100.000 pc cm⁻³
+  dm_max          = 2652.981 pc cm⁻³
+  Levin tolerance = 1.600
+  N_fine          = 272 trials
+  spacing range   = 9.3368 .. 9.580 pc cm⁻³
+  N_coarse        = 8
 
 Channel-sum factor 1 (native Δν = 30.5 kHz)
 -------------------------------------------
-  |ΔDM|         median=   1.088  p90=   1.959  p99=   2.211   pc cm⁻³
-  w_chan        median=   0.169  p90=   0.304  p99=   0.334   ms
-  w_DM_miss     median=   0.616  p90=   1.108  p99=   1.251   ms
-  w_meas        median=   0.646  p90=   1.125  p99=   1.284   ms
-  loss (dB)     median=  -2.930  p90=  -6.224  p99= -11.168   dB
-  loss (%)      median=  49.068  p90=  76.144  p99=  92.359   %
+  |ΔDM|         median=   2.356  p90=   4.241  p99=   4.662   pc cm⁻³
+  w_chan        median=   0.155  p90=   0.270  p99=   0.295   ms
+  w_DM_miss     median=   1.333  p90=   2.400  p99=   2.638   ms
+  w_meas        median=   1.345  p90=   2.406  p99=   2.645   ms
+  loss (dB)     median=  -4.701  p90=  -7.633  p99= -10.313   dB
+  loss (%)      median=  66.122  p90=  82.755  p99=  90.695   %
 
 Channel-sum factor 8 (production Δν = 244 kHz)
 ----------------------------------------------
-  |ΔDM|         median=   1.088  p90=   1.959  p99=   2.211   pc cm⁻³
-  w_chan        median=   1.349  p90=   2.429  p99=   2.669   ms
-  w_DM_miss     median=   0.616  p90=   1.108  p99=   1.251   ms
-  w_meas        median=   1.531  p90=   2.544  p99=   2.843   ms
-  loss (dB)     median=  -0.213  p90=  -1.910  p99=  -6.655   dB
-  loss (%)      median=   4.783  p90=  35.586  p99=  78.398   %
+  |ΔDM|         median=   2.356  p90=   4.241  p99=   4.662   pc cm⁻³
+  w_chan        median=   1.238  p90=   2.157  p99=   2.362   ms
+  w_DM_miss     median=   1.333  p90=   2.400  p99=   2.638   ms
+  w_meas        median=   2.028  p90=   2.848  p99=   3.357   ms
+  loss (dB)     median=  -0.841  p90=  -3.177  p99=  -5.803   dB
+  loss (%)      median=  17.613  p90=  51.880  p99=  73.713   %
 
 Notes:
  * loss = 1 − sqrt(w_ideal / w_meas), where

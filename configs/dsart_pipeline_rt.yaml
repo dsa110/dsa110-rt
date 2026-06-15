@@ -405,6 +405,7 @@ routines:
       --t-int-fast-native 32
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz
       --chan-sum-factor 8
+      --cell-lambda-mode tee45
       --sliding-window
       --n-grid 256
       --transport-tx-mode prod

@@ -145,6 +145,81 @@ _CUBE_NPZ_RE = re.compile(
 )
 
 
+# --------------------------------------------------------------------------
+# Fine-DM axis from the production DM plan
+# --------------------------------------------------------------------------
+#
+# The dumped cube NPZs do NOT carry per-row DM values (CubeDumpWriter.savez
+# omits fine_dm_pc_cc), so the waterfall y-axis used to fall back to bare
+# fine-DM trial indices (0..33 per half). To label rows with real DMs we
+# read the production DM plan and map each (search_node_id, gpu_half) cube
+# to the coarse-DM bucket it owns.
+#
+# Source-of-truth path: the SAME plan the search fleet runs
+# (``--dm-plan-path`` in configs/dsart_search_rt.yaml). NOTE: configs/
+# dm_plan.npz is the stale v1 plan (690 fine / 16 coarse / 0–3000) and must
+# NOT be used here. Override with DSART_DM_PLAN_PATH if the fleet plan moves.
+_DEFAULT_DM_PLAN_PATH = (
+    "/home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz"
+)
+
+# Cache so a multi-event regenerate doesn't re-read the plan per event.
+_DM_PLAN_CACHE: dict[str, Optional[dict[int, np.ndarray]]] = {}
+
+
+def _dm_plan_path() -> str:
+    return os.environ.get("DSART_DM_PLAN_PATH", _DEFAULT_DM_PLAN_PATH)
+
+
+def _load_coarse_bucket_dms(
+    plan_path: Optional[str] = None,
+) -> Optional[dict[int, np.ndarray]]:
+    """Return ``{coarse_idx: ascending fine-DM array}`` from the DM plan.
+
+    Reads ``fine_dm`` + ``fine_to_coarse`` from the production plan NPZ and
+    groups the fine-DM trials by their owning coarse-DM bucket. Each search
+    half owns exactly one coarse bucket, so this is the per-half row→DM map.
+    Returns ``None`` (and the caller falls back to row indices) if the plan
+    is unreadable or missing the needed keys.
+    """
+    path = plan_path or _dm_plan_path()
+    if path in _DM_PLAN_CACHE:
+        return _DM_PLAN_CACHE[path]
+    buckets: Optional[dict[int, np.ndarray]] = None
+    try:
+        with np.load(path) as npz:
+            fine_key = next(
+                (k for k in ("fine_dm_pc_cm3", "fine_dm") if k in npz), None,
+            )
+            if fine_key is not None and "fine_to_coarse" in npz:
+                fine_dm = np.asarray(npz[fine_key], dtype=np.float64)
+                f2c = np.asarray(npz["fine_to_coarse"], dtype=np.int64)
+                if fine_dm.shape[0] == f2c.shape[0] and fine_dm.size:
+                    buckets = {
+                        int(c): np.sort(fine_dm[f2c == c])
+                        for c in np.unique(f2c)
+                    }
+    except (OSError, ValueError, KeyError) as exc:
+        _LOG.warning("plotter: DM plan %s unreadable (%s); "
+                     "waterfall y-axis falls back to trial index", path, exc)
+        buckets = None
+    _DM_PLAN_CACHE[path] = buckets
+    return buckets
+
+
+def _owner_coarse_idx(search_node_id: int, gpu_half: int,
+                      present_sids: Sequence[int]) -> int:
+    """Map a (search_node_id, gpu_half) cube to its coarse-DM bucket.
+
+    Production fan-out: each search node owns 2 consecutive coarse buckets
+    (one per GPU half), assigned in ascending node order — n01→{0,1},
+    n02→{2,3}, n09→{4,5}, n13→{6,7}. We rank the search nodes actually
+    present so the mapping degrades gracefully if a subset dumped.
+    """
+    ranks = {sid: i for i, sid in enumerate(sorted(set(present_sids)))}
+    return ranks.get(int(search_node_id), 0) * 2 + int(gpu_half)
+
+
 @dataclass(frozen=True, slots=True)
 class PlotJob:
     """Inputs to a plot job. ``stats`` and ``members`` may be empty;
@@ -936,20 +1011,44 @@ def _render_dm_time(
     ]
     stacked = _robust_row_normalise(np.concatenate(blocks, axis=0))
 
+    # Real DM per stacked row, pulled from the production DM plan and keyed
+    # by each cube's owned coarse-DM bucket (the dumped NPZ does not carry
+    # per-row DMs). row_dm[i] is None when the plan is unavailable or a
+    # bucket's size doesn't match the cube, so the y-axis can fall back.
+    bucket_dms = _load_coarse_bucket_dms()
+    present_sids = [int(c.search_node_id) for c, _ in waterfalls]
+
     # Per-half row offsets (for boundary lines, labels, crosshair).
     offsets: List[int] = []
     labels: List[str] = []
+    row_dm = np.full(stacked.shape[0], np.nan, dtype=np.float64)
     row0 = 0
     burst_row: Optional[int] = None
     for (chunk, _), blk in zip(waterfalls, blocks):
         offsets.append(row0)
         labels.append(f"s{chunk.search_node_id}g{chunk.gpu_half}")
-        if burst is not None and chunk is burst and coords is not None:
-            burst_row = row0 + int(
-                np.clip(coords.fdm_idx, 0, blk.shape[0] - 1)
+        n_blk = blk.shape[0]
+        dms = None
+        if bucket_dms is not None:
+            owner = _owner_coarse_idx(
+                chunk.search_node_id, chunk.gpu_half, present_sids,
             )
-        row0 += blk.shape[0]
+            cand = bucket_dms.get(owner)
+            if cand is not None and cand.shape[0] == n_blk:
+                dms = cand
+        if dms is None:
+            # Fall back to whatever the NPZ carried (real DMs if present,
+            # else trial indices) so the row is never left blank.
+            fb = np.asarray(chunk.fine_dm_pc_cc, dtype=np.float64)
+            if fb.shape[0] >= n_blk:
+                dms = fb[:n_blk]
+        if dms is not None:
+            row_dm[row0:row0 + n_blk] = dms
+        if burst is not None and chunk is burst and coords is not None:
+            burst_row = row0 + int(np.clip(coords.fdm_idx, 0, n_blk - 1))
+        row0 += n_blk
     n_rows = row0
+    have_dm_axis = bool(np.isfinite(row_dm).any())
 
     # Colour scale in robust-σ units: floor a little below baseline,
     # ceiling at the brighter of the p99.9 tail and half the true
@@ -972,20 +1071,45 @@ def _render_dm_time(
         pad=0.01,
     )
 
-    # Half boundaries + per-half band labels on the y axis.
+    # Half boundaries (dashed) so the (search node, gpu half) bands are
+    # still legible; the band id is annotated at the right edge.
+    next_offsets = offsets[1:] + [n_rows]
     for off in offsets[1:]:
         ax.axhline(off - 0.5, color="w", lw=0.7, ls=":", alpha=0.7)
-    next_offsets = offsets[1:] + [n_rows]
-    band_centres = [
-        (off + nxt) / 2.0 for off, nxt in zip(offsets, next_offsets)
-    ]
-    ax.set_yticks(band_centres)
-    ax.set_yticklabels(labels, fontsize=9)
-    ax.set_ylabel(
-        "fine-DM trials, stacked by (search node, gpu half) — "
-        "increasing DM ↑",
-        fontsize=10,
-    )
+    for lab, off, nxt in zip(labels, offsets, next_offsets):
+        # get_yaxis_transform: x in axes fraction, y in data (row) coords.
+        ax.text(
+            1.002, (off + nxt) / 2.0, lab,
+            transform=ax.get_yaxis_transform(), va="center", ha="left",
+            fontsize=7, color="0.35", clip_on=False,
+        )
+
+    if have_dm_axis:
+        # Label the y axis with real DMs from the plan. Place ticks at
+        # evenly spaced rows and read the DM at each row (rows are in
+        # ascending-DM order across stacked halves).
+        finite_rows = np.flatnonzero(np.isfinite(row_dm))
+        n_ticks = min(12, finite_rows.size)
+        tick_rows = np.linspace(
+            finite_rows[0], finite_rows[-1], n_ticks,
+        ).round().astype(int)
+        tick_rows = np.unique(tick_rows)
+        ax.set_yticks(tick_rows)
+        ax.set_yticklabels(
+            [f"{row_dm[r]:.0f}" for r in tick_rows], fontsize=8,
+        )
+        ax.set_ylabel("dispersion measure (pc cm⁻³)", fontsize=10)
+    else:
+        band_centres = [
+            (off + nxt) / 2.0 for off, nxt in zip(offsets, next_offsets)
+        ]
+        ax.set_yticks(band_centres)
+        ax.set_yticklabels(labels, fontsize=9)
+        ax.set_ylabel(
+            "fine-DM trials, stacked by (search node, gpu half) — "
+            "increasing DM ↑",
+            fontsize=10,
+        )
     ax.set_xlabel("time sample (within cube)", fontsize=10)
 
     # Data apex (independent of the detector): global max of the

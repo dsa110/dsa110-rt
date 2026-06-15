@@ -59,7 +59,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -314,6 +314,7 @@ def render_annotated_png(
     fov_rad: float,
     ts: float,
     used_chgroups: list[int],
+    veto_rows: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Write the sigma-stretched greyscale frame with an RA/Dec grid
     and a colorbar (2026-06-09 request, source markers removed
@@ -323,6 +324,11 @@ def render_annotated_png(
     (origin='lower': north up, east RIGHT — instrument frame). The
     RA/Dec graticule is SIN-deprojected through
     :mod:`sky_astrometry`; labels are RA hh:mm and Dec degrees.
+
+    ``veto_rows`` (2026-06-14): active sidereal (l,m) dump-veto regions
+    from the C2 registry (``/mon/c2/sidereal_vetos``). Each is drawn as
+    a red tolerance-radius circle + index label so the operator can see
+    which sky positions are currently suppressing dumps.
     """
     fov_deg = float(np.rad2deg(fov_rad))
     half = fov_deg / 2.0
@@ -390,6 +396,29 @@ def render_annotated_png(
             mm = (h - hh) * 60.0
             ax.text(ld[i], max(md[i], -half * 0.99), f"{hh:02d}h{mm:04.1f}m",
                     va="bottom", ha="center", rotation=90, **lbl_kw)
+
+    # ---- sidereal (l,m) dump-veto regions -------------------------------
+    if veto_rows:
+        from matplotlib.patches import Circle  # local; keep top-level light
+        for i, v in enumerate(veto_rows):
+            try:
+                lx = float(np.rad2deg(float(v["l_rad"])))
+                my = float(np.rad2deg(float(v["m_rad"])))
+                r_deg = float(np.rad2deg(float(v.get("tol_rad", 0.0))))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(lx) > half or abs(my) > half:
+                continue  # veto centre outside this FOV
+            ax.add_patch(Circle(
+                (lx, my), max(r_deg, 0.01),
+                fill=False, edgecolor="#ff5050", lw=1.2,
+                alpha=0.85, zorder=5,
+            ))
+            ax.plot([lx], [my], "+", color="#ff5050", ms=6,
+                    mew=1.2, zorder=6)
+            ax.text(lx, my + max(r_deg, 0.01),
+                    f"V{i + 1}", color="#ff5050", fontsize=7,
+                    va="bottom", ha="center", zorder=6)
 
     utc = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S",
@@ -464,6 +493,7 @@ class SkyFrameStore:
                     dec0_deg=float(annotate["dec0_deg"]),
                     fov_rad=float(annotate["fov_rad"]),
                     ts=ts, used_chgroups=used_chgroups,
+                    veto_rows=annotate.get("veto_rows"),
                 )
                 wrote_png = True
             except Exception:                              # noqa: BLE001
@@ -478,6 +508,7 @@ class SkyFrameStore:
                     "fov_deg": float(np.rad2deg(float(annotate["fov_rad"]))),
                     "nvss_min_mjy": NVSS_MIN_MJY,
                     "nvss": annotate.get("nvss_rows", []),
+                    "sidereal_vetos": annotate.get("veto_rows", []),
                 }
                 (day_dir / f"{stem}.json").write_text(
                     json.dumps(sidecar), encoding="utf-8",
@@ -635,8 +666,12 @@ class SkyMonitor:
         oversample: int = 2,
         grid_correct: bool = True,
         nvss_enabled: bool = True,
+        veto_provider: Optional[Callable[[], list[dict[str, Any]]]] = None,
     ) -> None:
         self.store = store if store is not None else SkyFrameStore()
+        # 2026-06-14: returns the active sidereal (l,m) dump-veto regions
+        # (from C2's /mon/c2/sidereal_vetos) to overlay on each frame.
+        self._veto_provider = veto_provider
         self.frame_interval_s = float(frame_interval_s)
         self.freshness_s = float(freshness_s)
         self.min_chgroups = int(min_chgroups)
@@ -776,9 +811,33 @@ class SkyMonitor:
                             "col": float(col),
                             "snr": (float(snr) if np.isfinite(snr) else None),
                         })
+                # Active sidereal (l,m) dump-veto regions (C2 registry).
+                veto_rows: list[dict[str, Any]] = []
+                if self._veto_provider is not None:
+                    try:
+                        for v in (self._veto_provider() or []):
+                            l_rad = float(v.get("l_rad"))
+                            m_rad = float(v.get("m_rad"))
+                            row, col = sky_astrometry.lm_to_pix(
+                                l_rad, m_rad, n_pix=n_pix, fov_rad=fov_rad,
+                            )
+                            veto_rows.append({
+                                "l_rad": l_rad,
+                                "m_rad": m_rad,
+                                "tol_rad": float(v.get("tol_rad", 0.0)),
+                                "n_hits": int(v.get("n_hits", 0)),
+                                "last_hit_unix": float(
+                                    v.get("last_hit_unix", 0.0)
+                                ),
+                                "row": float(row),
+                                "col": float(col),
+                            })
+                    except Exception:                       # noqa: BLE001
+                        LOG.exception("veto overlay build failed (skipped)")
                 annotate = {
                     "ra0_deg": ra0, "dec0_deg": dec0,
                     "fov_rad": fov_rad, "nvss_rows": nvss_rows,
+                    "veto_rows": veto_rows,
                 }
                 astro = {
                     "ra0_deg": ra0,
@@ -790,6 +849,7 @@ class SkyMonitor:
                     "nvss_aperture_arcsec": NVSS_APERTURE_ARCSEC,
                     "nvss": nvss_rows,
                     "nvss_loaded": cat is not None,
+                    "sidereal_vetos": veto_rows,
                 }
         except Exception:                                  # noqa: BLE001
             LOG.exception("sky astrometry failed (frame without overlay)")

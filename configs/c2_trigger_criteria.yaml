@@ -42,11 +42,21 @@ trigger_classes:
       once the clusterer is sharpened (graph DM-proximity threshold
       or HDBSCAN-style re-clustering on the cluster's row set).
     require:
-      snr_max_min: 15.0
+      # 2026-06-14: snr_max_min 15 → 12 (widen extragalactic FRB reach)
+      # and dm_median_min 100 → 115 (drop the DM≈100 pile-up at the
+      # search floor, which the 48h study showed is dominated by RFI /
+      # sub-threshold-DM events rather than real extragalactic bursts).
+      snr_max_min: 12.0
       n_events_min: 1
       n_search_nodes_min: 1
-      dm_median_min_pc_cc: 100.0
-      dm_median_max_pc_cc: 2000.0
+      dm_median_min_pc_cc: 115.0
+      # 2026-06-10: raised 2000 → 2700 so the full production v2 DM plan
+      # (dm_max ≈ 2653) is dump-eligible. The 2000 ceiling silently
+      # demoted DM≈2000 injections (recovered dm_median 2005–2014 after
+      # DM smearing) to log_only. The earlier 3000→2000 tighten was a
+      # false-positive defense; 2700 keeps a margin above the searched
+      # range without re-opening the >2653 unphysical tail.
+      dm_median_max_pc_cc: 2700.0
       dm_iqr_max_pc_cc: 100.0
       width_median_max_samples: 16
       lm_diag_max_rad: 0.1

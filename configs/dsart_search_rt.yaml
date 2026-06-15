@@ -245,7 +245,7 @@ routines:
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
       --chan-sum-factor 8
-      --cell-lambda-mode common
+      --cell-lambda-mode tee45
     hostargs:
       # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
       # per-host C1 trigger-listener bind addresses (M7.4). The
@@ -318,7 +318,7 @@ routines:
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
       --chan-sum-factor 8
-      --cell-lambda-mode common
+      --cell-lambda-mode tee45
       --detector-streaming-tile-size 256
       --detector-streaming-decoder-n-top 24
       --detector-boxcar-accum-dtype fp16
@@ -384,7 +384,11 @@ routines:
 #             shake-down if pinned memory is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 12.0                      # Phase 6c (M7.4 commissioning): raised from 8.0 → 12.0 to suppress
+  snr_min: 11.0                      # 2026-06-14: lowered 12.0 → 11.0 to widen FRB sensitivity. The C2 rate
+                                     # limiter (60s/100-cluster window) + extragalactic dm_median≥115/snr≥12 +
+                                     # sidereal (l,m) registry veto now backstop the extra C1→C2 volume at 11σ.
+                                     # Watch C2 windowing lag + C1 emit drops during the post-change soak.
+                                     # Phase 6c (M7.4 commissioning): raised from 8.0 → 12.0 to suppress
                                      # the persistent on-sky RFI floor that was generating ~6.8 cluster windows/s
                                      # at C2 (10260 LOG / 25 min in the 2026-05-28 soak), with up to ~3300 cands per
                                      # window from a stable RFI source at DM≈1655 pc/cc, snr_max≈12.92. That

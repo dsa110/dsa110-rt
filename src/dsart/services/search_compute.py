@@ -2501,7 +2501,9 @@ async def _run_async(args: argparse.Namespace) -> int:
     if args.cal_blob_path is not None and args.obs_dec_deg is not None:
         try:
             from ..grid.sparsity_pattern import (
+                IMAGE_PIXEL_ARCSEC_TEE,
                 build_pattern,
+                cell_lambda_for_pixel_arcsec,
                 compute_top_of_band_cell_lambda,
             )
             from ..services.corr_fast_integration import (
@@ -2515,6 +2517,15 @@ async def _run_async(args: argparse.Namespace) -> int:
                     antpos_e, antpos_n,
                     n_grid=int(args.n_grid),
                     is_core_baseline_mask=is_core_mask,
+                )
+                image_cell_rad = 1.0 / (
+                    float(args.n_grid) * float(cell_lambda_used)
+                )
+            elif args.cell_lambda_mode == "tee45":
+                # Fixed 45" image pixel; MUST match corr-side tee45 mode
+                # (same cell_lambda_for_pixel_arcsec + station Tee mask).
+                cell_lambda_used = cell_lambda_for_pixel_arcsec(
+                    IMAGE_PIXEL_ARCSEC_TEE, int(args.n_grid),
                 )
                 image_cell_rad = 1.0 / (
                     float(args.n_grid) * float(cell_lambda_used)
@@ -2872,10 +2883,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "corr-side --chan-sum-factor; default 8 to "
                         "match the M7.4 launcher).")
     p.add_argument("--cell-lambda-mode", default="common",
-                   choices=("common", "per_chgroup"),
+                   choices=("common", "tee45", "per_chgroup"),
                    help="F28 cell-lambda mode (must match corr; default "
                         "'common' = all chgroups share one image-pixel "
-                        "grid via compute_top_of_band_cell_lambda).")
+                        "grid via compute_top_of_band_cell_lambda). "
+                        "'tee45' = fixed 45\" image pixel (Tee mid-band "
+                        "critical sampling; cell_lambda_for_pixel_arcsec).")
 
     # --- SearchComputeService identity --------------------------------
     p.add_argument("--gpu-half", type=int, default=0, choices=(0, 1),

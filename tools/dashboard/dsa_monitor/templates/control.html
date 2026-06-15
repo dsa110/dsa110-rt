@@ -164,6 +164,7 @@
         <li><a href="#panel-dump-now">Dump now</a></li>
         <li><a href="#panel-dumps-enabled">Dumps enabled (kill-switch)</a></li>
         <li><a href="#panel-delete-snr-cal">Delete fluence/SNR calibration</a></li>
+        <li><a href="#panel-clear-sidereal-vetos">Clear sidereal (l,m) vetos</a></li>
         <li><a href="#panel-audit">Recent actions</a></li>
     </ul>
 </nav>
@@ -1247,6 +1248,80 @@ async function refreshCalibrations() {
         <div id="resp-delete-snr-cal" class="response"></div>
     </form>
 </div>
+
+<!-- Clear the C2 sidereal (l,m) dump-veto registry -->
+<div class="panel" style="margin-top: 24px;" id="panel-clear-sidereal-vetos">
+    <h3>Clear sidereal (l,m) dump vetos</h3>
+    <p class="muted">
+        Wipes the C2 sidereally-stationary dump-veto registry
+        (<code>/cnf/c2/sidereal_vetos</code>, published for the Sky tab at
+        <code>/mon/c2/sidereal_vetos</code>). These are sky positions that
+        kept producing dump-worthy clusters (stationary RFI / continuum)
+        and are currently suppressing dumps there. Clearing lets the
+        registry re-learn from scratch — use it after mitigating an RFI
+        source or if a real source was wrongly vetoed. Survives C2
+        restarts; this is the only way to reset it short of editing etcd.
+    </p>
+    <form id="form-clear-sidereal-vetos">
+        <div class="verb-row">
+            <label for="clear_vetos_confirm">type "clear_vetos"</label>
+            <input type="text" id="clear_vetos_confirm" name="confirm"
+                   placeholder="clear_vetos" autocomplete="off" />
+        </div>
+        <div class="verb-row">
+            <button type="button" class="danger"
+                    onclick="submitClearSiderealVetos(event);">
+                Clear sidereal vetos
+            </button>
+        </div>
+        <div class="muted">
+            Sends <code>/cmd/c2/sidereal_vetos_clear</code>; C2 applies it
+            within one mon-publish tick (~5 s) and rewrites the registry
+            empty. Requires the literal text <code>clear_vetos</code>.
+        </div>
+        <div id="resp-clear-sidereal-vetos" class="response"></div>
+    </form>
+</div>
+
+<script>
+async function submitClearSiderealVetos(ev) {
+    ev.preventDefault();
+    const form = document.getElementById("form-clear-sidereal-vetos");
+    const respEl = document.getElementById("resp-clear-sidereal-vetos");
+    const btns = form.querySelectorAll("button");
+    if (!window.confirm(
+            "Clear the C2 sidereal (l,m) dump-veto registry? The veto " +
+            "list resets and C2 re-learns stationary positions from scratch.")) {
+        return false;
+    }
+    btns.forEach(function (b) { b.disabled = true; });
+    respEl.innerHTML = "<span class='muted'>clearing sidereal vetos…</span>";
+    const fd = new FormData(form);
+    let r, j;
+    try {
+        r = await fetch("/control/clear_sidereal_vetos",
+                        {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btns.forEach(function (b) { b.disabled = false; });
+        return false;
+    }
+    const cls = (j && j.ok) ? "ok" : "err";
+    const status = (j && j.ok) ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j && j.error) {
+        html += "<div class='info-blob'>" +
+            String(j.error).replace(/</g, "&lt;") + "</div>";
+    } else if (j && j.ok) {
+        html += "<div class='muted'>clear command sent (ts=" +
+            (j.ts || "?") + "); C2 applies within ~5 s.</div>";
+    }
+    respEl.innerHTML = html;
+    btns.forEach(function (b) { b.disabled = false; });
+    return false;
+}
+</script>
 
 <script>
 async function submitDeleteSnrCal(ev, dryRun) {

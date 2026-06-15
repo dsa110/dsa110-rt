@@ -101,9 +101,11 @@ from dsart.common.constants import (
     T_INT_FAST_NATIVE,
 )
 from dsart.grid import (
+    IMAGE_PIXEL_ARCSEC_TEE,
     FastVisGridder,
     SparsityPattern,
     build_pattern,
+    cell_lambda_for_pixel_arcsec,
     compute_top_of_band_cell_lambda,
 )
 from dsart.rfi import (
@@ -2663,12 +2665,20 @@ def _build_gridder(
             n_grid=cfg.n_grid,
             is_core_baseline_mask=is_core_baseline_mask,
         )
+    elif cfg.cell_lambda_mode == "tee45":
+        # Fixed 45" image pixel (Tee mid-band critical sampling); the
+        # uv-cell pitch is baseline-independent so corr + search land on
+        # the identical pixel grid given the same (pixel_arcsec, n_grid).
+        cell_lambda_used = cell_lambda_for_pixel_arcsec(
+            IMAGE_PIXEL_ARCSEC_TEE, cfg.n_grid,
+        )
     elif cfg.cell_lambda_mode == "per_chgroup":
         cell_lambda_used = None                                       # legacy auto-fit in build_pattern
     else:
         raise ValueError(
             f"cfg.cell_lambda_mode={cfg.cell_lambda_mode!r}; expected "
-            f"'common' (F28 default) or 'per_chgroup' (legacy)."
+            f"'common' (F28 default), 'tee45' (fixed 45\") or "
+            f"'per_chgroup' (legacy)."
         )
     pattern = build_pattern(
         antpos_e, antpos_n,
@@ -2961,6 +2971,48 @@ def build_context(
 # ---------------------------------------------------------------------------
 
 
+def load_fleet_antenna_order(
+    corr_setup_path: Path | None = None,
+) -> list[int] | None:
+    """Per-fada-slot DSA-110 station numbers from ``corr_setup_96.yaml``.
+
+    This is the fleet-wide canonical fada-slot → station map (mirror of
+    etcd ``/cnf/corr``). It ships with the repo, so every corr + search
+    node resolves the SAME ordering package-relative to this module —
+    guaranteeing the station-number Tee core mask is byte-identical
+    fleet-wide (required for corr/search ``pattern_id`` parity) without
+    depending on the per-node cal yaml sibling (which is absent in
+    production).
+
+    Returns the station list in slot order, or ``None`` if the config
+    cannot be read (callers fall back to the radius heuristic).
+    """
+    if corr_setup_path is None:
+        corr_setup_path = (
+            Path(__file__).resolve().parents[3] / "configs"
+            / "corr_setup_96.yaml"
+        )
+    try:
+        corr_setup_path = Path(corr_setup_path)
+        if not corr_setup_path.is_file():
+            return None
+        import yaml as _yaml
+        doc = _yaml.safe_load(corr_setup_path.read_text())
+        order = doc.get("antenna_order")
+        if order is None:
+            return None
+        if isinstance(order, dict):
+            # {slot_int: station_int} → list in slot order.
+            order = [int(order[k]) for k in sorted(order, key=int)]
+        return [int(x) for x in order]
+    except Exception:
+        LOG.warning(
+            "load_fleet_antenna_order: could not read %s",
+            corr_setup_path, exc_info=True,
+        )
+        return None
+
+
 def load_antpos_from_cal_blob(
     cal_path: Path,
     *,
@@ -3022,12 +3074,31 @@ def load_antpos_from_cal_blob(
         antenna_order = ydoc["cal_solutions"]["antenna_order"]
         mask = core_baseline_mask_from_station_numbers(antenna_order)
     else:
-        # Legacy fallback (radius-based; F32 notes this is unreliable
-        # for DSA-110 — outriggers 103-115 overlap in radius with core
-        # 99-102). Kept here only for tests that don't have a yaml.
-        mask = core_baseline_mask_from_antpos(
-            antpos_e, antpos_n, n_core=N_CORE_DEFAULT,
-        )
+        # No per-node cal yaml sibling (production case). Use the
+        # fleet-wide station-number Tee mask from corr_setup_96.yaml
+        # (ships with the repo; identical on every corr + search node).
+        # This is the canonical core/outrigger discriminator (station ≤
+        # 102 = core); the radius heuristic below is a LAST resort kept
+        # only for synthetic-antpos tests (it cannot separate the Tee
+        # apex station 102 from outrigger 103 — see F32).
+        antenna_order = load_fleet_antenna_order()
+        if antenna_order is not None and len(antenna_order) == antpos_e.size:
+            mask = core_baseline_mask_from_station_numbers(antenna_order)
+            LOG.info(
+                "core mask: station-number Tee mask from corr_setup_96 "
+                "(%d ants → %d core baselines)",
+                antpos_e.size, int(np.count_nonzero(mask)),
+            )
+        else:
+            mask = core_baseline_mask_from_antpos(
+                antpos_e, antpos_n, n_core=N_CORE_DEFAULT,
+            )
+            LOG.warning(
+                "core mask: RADIUS fallback (%d ants; corr_setup_96 "
+                "unavailable or ant-count mismatch). Unreliable for "
+                "DSA-110 — Tee apex/outrigger may be miscategorised.",
+                antpos_e.size,
+            )
     return (antpos_e, antpos_n, mask)
 
 
@@ -4268,8 +4339,11 @@ def main(argv: list[str] | None = None) -> int:
                         "t_int_fast_native=8) are fully resolved. Adds one "
                         "block (~134 ms) of latency.")
     p.add_argument("--cell-lambda-mode", default="common",
-                   choices=("common", "per_chgroup"),
+                   choices=("common", "tee45", "per_chgroup"),
                    help="F28: per-cell (u, v) λ-extent selection. "
+                        "'tee45': fixed 45\" image pixel (Tee mid-band "
+                        "critical sampling; n_grid unchanged, finer uv "
+                        "cells / less zero-pad). MUST match search. "
                         "'common' (default; F28): a single cell_lambda "
                         "from the top-of-band frequency is shared across "
                         "all chgroups so a fixed (l, m) source lands at "

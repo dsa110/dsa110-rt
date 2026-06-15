@@ -842,6 +842,37 @@ def compute_top_of_band_cell_lambda(
     return max_baseline_lambda_top * 2.0 / n_grid
 
 
+# Production fixed-pixel imaging (DSA-110 Tee). The Tee array (442 m NS x
+# 400 m EW, max baseline ~483 m) has a PSF much coarser than the legacy
+# ~25.6" grid that critically sampled an ~806 m radius-mask baseline set.
+# "tee45" mode pins a fixed 45" image pixel (mid-band critical sampling of
+# the Tee) while keeping n_grid=256, so only the uv-cell pitch (amount of
+# zero-padding) changes — the PSF is set by the Tee baselines, unchanged.
+IMAGE_PIXEL_ARCSEC_TEE: float = 45.0
+_ARCSEC_TO_RAD: float = float(np.pi) / 180.0 / 3600.0
+
+
+def cell_lambda_for_pixel_arcsec(pixel_arcsec: float, n_grid: int) -> float:
+    """Fixed ``cell_lambda`` (λ per uv-cell) for a target image pixel.
+
+    The image-plane pixel pitch in radians is ``1/(n_grid * cell_lambda)``,
+    so to land a desired ``pixel_arcsec`` on an ``n_grid`` grid::
+
+        cell_lambda = 1 / (n_grid * pixel_arcsec_in_rad)
+
+    Unlike :func:`compute_top_of_band_cell_lambda` (which derives the cell
+    pitch from the longest kept baseline), this returns a *baseline-
+    independent* fixed pitch — the gridder simply uses finer uv-cells /
+    less zero-padding. Both corr + search MUST call this with identical
+    ``(pixel_arcsec, n_grid)`` for ``pattern_id`` parity.
+    """
+    if pixel_arcsec <= 0.0 or n_grid <= 0:
+        raise ValueError(
+            f"pixel_arcsec ({pixel_arcsec}) and n_grid ({n_grid}) must be >0"
+        )
+    return 1.0 / (float(n_grid) * float(pixel_arcsec) * _ARCSEC_TO_RAD)
+
+
 def build_pattern(
     antpos_e: np.ndarray,
     antpos_n: np.ndarray,

@@ -52,9 +52,9 @@
 % --- title block --------------------------------------------------------------
 \title{\textbf{The DSA-110 real-time FRB search pipeline}\\[2mm]
        \large A narrative reference for \texttt{dsa110-rt}\\[1mm]
-       \normalsize algorithms, data flow, control, monitoring,
-       and development pathway}
-\date{2026 June 2}
+       \normalsize algorithms, data flow, statistics and noise
+       estimation, control, monitoring, and development pathway}
+\date{2026 June 10}
 
 \pagestyle{fancy}
 \fancyhf{}
@@ -87,231 +87,98 @@
 \fbox{\parbox{0.93\linewidth}{\small
 \textbf{Scope.}  This is a narrative reference for the
 DSA-110 real-time FRB search pipeline as implemented in the
-\codeword{dsa110-rt} repository (HEAD on branches
-\codeword{main} / \codeword{m7/control-plane} /
-\codeword{m7/c1c2-coincidencer}, May 2026).  It describes the
-algorithms, mathematical operations on the data, control and
-monitoring infrastructure, and the development pathway that brought
-the system on-sky for the M7.4 acceptance gate.  It includes the
-\texttt{meridian\_fringestop} slow-vis re-integration (M7.4 Phase~9,
-landed 2026-05-30).  Tests, benchmarks, and acceptance reports are
-deliberately \emph{out of scope} of this document --- those live in
-\codeword{docs/M7.4_*.md} and \codeword{docs/m7/}.  A Monte-Carlo
-analysis of the FRB matched-filter S/N loss as a function of DM,
-given the locked DM plan in \codeword{configs/dm_plan.npz}, is given
-in~\Cref{sec:mcloss}.  A development pathway for adding intelligence
-to the C1 detector follows in~\Cref{sec:c1path}.
+\codeword{dsa110-rt} repository (HEAD of \codeword{main},
+2026 June 10).  It describes the algorithms, the mathematical
+operations on the data --- with particular attention to the
+statistics and noise-estimation chain (\Cref{sec:stats}) --- the
+control and monitoring infrastructure, and the development pathway
+that brought the system on-sky through the M7.4 acceptance gate, the
+M7.7 real-time performance campaign, and the June 2026
+injection-calibration commissioning.  Tests, benchmarks, and
+acceptance reports are deliberately \emph{out of scope} of this
+document --- those live in \codeword{docs/M7.4_*.md} and
+\codeword{docs/m7/}.  A Monte-Carlo analysis of the FRB
+matched-filter S/N loss as a function of DM, given the production v2
+DM plan, is given in~\Cref{sec:mcloss}.  A development pathway for
+adding intelligence to the C1 detector follows in~\Cref{sec:c1path}.
 }}
 \end{center}
 
 \begin{center}
 \fbox{\parbox{0.93\linewidth}{\small
-\textbf{Changes since 2026-05-28 (M7.4 Phase~8 + M7.6 follow-up).}
-The narrative now reflects the post-Phase-8 production state:
-voltage injection has moved from \emph{pre}-RFI/cal to \emph{post}-RFI
-+ post-cal in \texttt{corr\_fast} (Section~\ref{sec:inject-synthesis});
-\texttt{corr\_fast} and \texttt{corr\_slow} now JIT-compile every
-hot-path GPU kernel \emph{before} the orchestrator's ready-sentinel,
-fixing a fada cold-start packet-loss path
-(Section~\ref{sec:bringup}); the C2 coincidencer carries a 180\,s
-startup-grace window keyed on the first candidate-bearing batch and
-the C1 emit channel ships unconditional 0-row heartbeats every 20\,s
-to defeat C2's 60\,s idle-timeout reaper
-(Section~\ref{sec:bringup}); the search-side cube ring is deepened
-to 24 slots so dump triggers do not arrive \codeword{too_late}
-(Section~\ref{sec:c1}, since shrunk to 16 in the 2026-05-31 memory
-tuning --- see the second changelog box below); the C1$\to$C2 path
-is now
-metered with a width cap (\codeword{max_c1c2_width_samples=16}) and a
-narrow-first then bright-first per-block cap of 8 candidates
-(Section~\ref{sec:c1}); the dedispersion escape-hatch path was
-shifted from chgroup-bottom to chgroup-top reference frequency,
-removing a $-2.45\,\%$ DM bias in stage-2-absent mode
-(Section~\ref{sec:dedisp}); the dashboard now exposes a 5-state
-fleet lifecycle banner backed by a per-process
-\codeword{corr_fast_ready} key plus fleet-recovery operations
-(\codeword{update_dsart}, \codeword{restart_all}, \codeword{restart_c2},
-K-cal preview/delete --- Section~\ref{sec:control});
-and the C2 trigger criteria were rewritten to use the NE2001
-galactic-DM discriminant (Section~\ref{sec:c2}).  See
-Appendix~\ref{app:etcd-keys} for the full updated key catalog.
-}}
-\end{center}
-
-\begin{center}
-\fbox{\parbox{0.93\linewidth}{\small
-\textbf{Changes since 2026-05-30 (post-Phase-8 stabilisation +
-slow-vis re-integration).} A second wave of fixes lands on top of
-the M7.4 Phase~8 / M7.6 narrative above:
+\textbf{Changes since the 2026-06-02 edition.}  This revision folds
+in the June 3--10 wave of work; the body text has been rewritten
+in place, so this box is a map, not a diff:
 \begingroup\sloppy
 \begin{itemize}[topsep=2pt,itemsep=2pt,leftmargin=*]
-\item \texttt{meridian\_fringestop} (the legacy casa38 slow-vis
-      fringe-stopper) is now the sole \codeword{bada} reader, run
-      verbatim from its repo by the operator-side wrapper
-      \codeword{tools/ops/meridian_fringestop_rt.py} (snap dec to the
-      0.25$^\circ$ fstable-cache grid, validate the per-dec cache,
-      symlink it under the legacy filename, pin
-      \codeword{dsamfs.get_pointing_declination}, publish
-      \codeword{/mon/corr_rt/<cn>/meridian_ready}). Section~\ref{sec:mfs}.
-\item Slow-vis UVH5 timestamp regression: the legacy
-      \codeword{/mon/snap/1/armed_mjd} + \codeword{/mon/snap/1/utc_start}
-      anchors were frozen at their last pre-M7-cutover values, so dsamfs
-      was writing UVH5 files anchored on a stale MJD weeks in the past.
-      \codeword{dsart_rt._verb_utc_start} now refreshes both legacy
-      keys (\codeword{armed_mjd=now}, \codeword{utc_start=0}) every
-      time the \codeword{utc_start} verb fires; the new
-      \codeword{/mon/snap/1/utc_start_rt} key keeps the SNAP-wall
-      specnum for the dashboard. Section~\ref{sec:mfs},
-      Appendix~\ref{app:etcd-keys}.
-\item Search MJD clock was 128$\times$ slow: \codeword{search_compute}
-      was dividing the search-sample period by
-      \codeword{cube_sample_period_specnum} and treating
-      \codeword{slot.specnum_start} as if it counted native specnums,
-      giving an 8.192$\mu$s-per-specnum clock against a 1048.576$\mu$s
-      ground truth. C2's 5\,s coincidence window was effectively
-      $\sim$11 minutes, blowing the connected-component graph size by
-      $\sim$100$\times$. Fix: wire \codeword{cube_sample_period_us}
-      from the runtime \codeword{--t-int-search-us} and step the MJD by
-      the FULL search-sample period (Section~\ref{sec:search}).
-\item Search node memory: production search hosts have $\sim$93\,GiB
-      RAM (not 256\,GiB). \codeword{t_buf_samples} 32768$\to$8192
-      (rxring 39$\to$9.8\,GiB) and \codeword{cube_ring_depth}
-      24$\to$16 (retention 38$\to$25.6\,GiB) drop the node ceiling to
-      $\sim$43\,GiB. The per-cube size is 855\,MiB not 3.2\,GiB; the
-      configuration comments were 4$\times$ wrong (Section~\ref{sec:c1}).
-\item \codeword{search_compute} pulls its observing dec from
-      \codeword{CUSTOMDEC} (was hardcoded 53.848986$^\circ$); the
-      $\sim$37$^\circ$ search-vs-corr\_fast dec mismatch had been
-      decorrelating coherent sky signal at the gridder and wiping
-      injections from the C1 path (Section~\ref{sec:search}).
-\item C1$\to$C2 stall + dump storm (2026-05-30): one search half
-      flooded C2 with width-1/2 noise singles at DM$\approx$2538
-      matching the \codeword{bright_pulsar} class, driving an 8-GPU
-      cube dump every $\sim$5\,s; the plotter's in-process
-      \codeword{ThreadPoolExecutor} starved the C2 event loop for
-      $\sim$34 minutes. Fix: render plots in a
-      \codeword{ProcessPoolExecutor} (true CPU isolation); add a
-      rolling-window dump-rate cap
-      (\codeword{dump_rate_max_per_window=6}/\codeword{dump_rate_window_s=60});
-      relax \codeword{bright_pulsar} + \codeword{galactic} criteria to
-      \codeword{log_only}; tighten extragal bounds
-      (\codeword{dm_median_max_pc_cc} 3000$\to$2000,
-      \codeword{dm_iqr_max_pc_cc} 250$\to$100,
-      \codeword{width_median_max_samples} 64$\to$16). C1-side
-      defense-in-depth: \codeword{dm_width_floor_frac=0.6} rejects
-      candidates whose boxcar is below 0.6$\times$ the
-      intra-summed-channel dispersion-smearing floor for their DM
-      (Section~\ref{sec:c1}, Section~\ref{sec:c2}).
-\item C2 plotter rewrite: \codeword{src/dsart/coinc/plotter.py}
-      replaces the corrupted \codeword{cube.argmax} burst pick with a
-      metadata-driven selection (\codeword{Cluster} member list, or the
-      archived \codeword{Level2/C1_window_<name>.csv} for offline
-      regeneration); reduces only the matched burst cube via
-      \codeword{mmap} + \codeword{cube.max(axis=(2,3))}; adds reticles
-      to the dm-time / image / lightcurve panels; ships a
-      \codeword{regenerate_recent_events} CLI for archived events
-      (Section~\ref{sec:c2}).
-\item DM-aware noise-color SNR de-rating: high-DM dedispersed time
-      series are correlated by intra-summed-channel smearing, so the
-      $\sigma$-clipped per-kernel $\sigma_k$ under-estimates the true
-      noise scale and width-2 high-DM noise blobs over-clear the
-      8$\sigma$ floor. The C1 emit path now divides each candidate's
-      SNR by $1 + \mathrm{strength} (\mathcal{C}_{w,L}-1)$ where
-      $\mathcal{C}_{w,L}$ is the theoretical std-inflation of a width-$w$
-      boxcar over noise with the triangular autocorrelation of a
-      length-$L = \mathrm{dm\_smear}(\mathrm{DM})$ moving average;
-      survivors below \codeword{noise_color_snr_floor=8} are dropped
-      and the freed metering budget is reused
-      (Section~\ref{sec:search}).
-\item Voltage injection: 2026-05-30 briefly tried folding the
-      per-(pol,ant,ch) complex cal gain $G$ into the post-cal
-      injection phasor; 2026-05-31 reverted to the \emph{bare}
-      geometric phasor (with no $G$ multiplication) because cal has
-      \emph{stripped} the instrumental phase out of the calibrated
-      voltage stream, so a fake source matching a calibrated real
-      source at $(l, m)$ is exactly the bare phasor. The fold's algebra
-      ("bare $\cdot G \equiv$ real source") is wrong because a real
-      source does not enter as a bare pre-cal phasor
-      (Section~\ref{sec:inject-synthesis}).
-\item C2 dump pipeline: the retention-ring slot was being reused
-      ($\sim$1\,s wrap) before the asynchronous $\sim$855\,MB NPZ
-      serialize finished, so the \codeword{peak_grid} reduction was
-      taken from the matched burst while the cube bytes streamed out
-      came from clobbered next-cube noise. Fix: ring-slot pinning
-      (\codeword{CubeRetentionRing.mark_inflight}/\codeword{release_inflight})
-      forces \codeword{_ensure_buffer} to allocate a fresh buffer for
-      that slot on reuse; zero extra allocation in the common case, at
-      most one spare buffer per in-flight dump
-      (Section~\ref{sec:c2}).
-\item \codeword{dsart_rt._reap_dead_children} took the wrong lock
-      shape and raised \codeword{KeyError} on routine respawn races,
-      crashing the orchestrator (no auto-restart under
-      \codeword{setsid nohup}); fixed via \codeword{pop(name, None)}
-      under \codeword{self._lock} (Section~\ref{sec:control}).
-\item Fast-corr cal blob is now read from the node-local x-engine
-      path \codeword{~/proj/dsa110-shell/dsa110-xengine/utils/antennas.out}
-      (the legacy beamformer-weights binary the
-      \codeword{calibration23} pipeline already writes per-node);
-      \codeword{CALSB} substitution is no longer needed for this argv
-      (Section~\ref{sec:hot}).
-\item Dashboard \emph{Control}-tab K-cal verb swapped from "delete
-      K-cal (beamformer weights)" --- a fleet-wide footgun --- to
-      \codeword{delete_snr_cal}, which wipes the per-(DM, width)
-      bootstrap fluence$\to$SNR table at
-      \codeword{/cnf/inject/snr_calibration/*} so the operator can
-      re-measure it (Section~\ref{sec:control}).
-\item \codeword{search_compute} shared-memory rxring attach timeout
-      raised 30$\to$180\,s (n01-class hosts fault-initialise the
-      9.8\,GiB segment for $>$30\,s; the reader was crashing on
-      cold-start) (Section~\ref{sec:bringup}).
-\item Grafana dashboard rebuilt to 89 panels with a new
-      \emph{Meridian fringestop} row (ready-node fleet sum, heartbeat
-      freshness per cn, UVH5 output rate, snapped imaging dec) backed
-      by a new \codeword{corr_rt_meridian} InfluxDB measurement; rate
-      panels relabelled \codeword{ops/s} (Section~\ref{sec:control}).
-\item Dashboard \emph{Control} tab now does \emph{start-time
-      housekeeping} before broadcasting the \codeword{start} verb:
-      \codeword{fleet_services.cleanup_nodes_for_start} ssh-fans out a
-      bounded cleanup to every corr + search node that wipes the
-      ``safe to delete on restart'' ephemera (stale
-      \codeword{~/tmp/dsart-rt/*.log}, \codeword{/tmp/dsart-corr-*.ready}
-      sentinels, the corr debug \codeword{~/tmp/dsart-fast-grid} tree,
-      and the search-local \codeword{/home/ubuntu/data/c2/cube_dump}
-      tree that's already rsynced to h23). \codeword{h23} (candidate /
-      CSV archive) and \codeword{lxd110h20} (read-only grafana / influx)
-      are \emph{never} in the fanout; \codeword{/dev/shm} rings + PSRDADA
-      buffers are \emph{never} touched on a start (the starting
-      processes own them --- that's the \codeword{restart_all} path's
-      job). Best-effort: failures are reported in the response but never
-      block the start (Section~\ref{sec:control}).
-\item Control tab restructure: a sticky table-of-contents jump-nav at
-      the top of the tab; the standalone \emph{Restart all}
-      (\codeword{restart_all}) and \emph{Update dsa110-rt}
-      (\codeword{update_dsart}) panels are folded into the main
-      \emph{Verbs} panel; the \emph{Recent C2 activity} list is folded
-      into the \emph{C2 recovery \& activity} panel; the now-redundant
-      \emph{bounce search} verb (replaced by the 2026-05-30 C2 stall
-      defenses) was removed (Section~\ref{sec:control}).
-\item SEFD-dashboard merge: \codeword{dsa_monitor}'s SEFDs tab now
-      renders the calibrator-SEFD scanner's outputs natively (no
-      iframe) via the new read-only
-      \codeword{tools/dashboard/dsa_monitor/sefd_view.py} module,
-      with routes \codeword{/sefds}, \codeword{/sefds/source/<src>},
-      \codeword{/sefds/day/<date>}, \codeword{/sefds/results/<path>}
-      and a JSON freshness endpoint \codeword{/api/sefd_status}.  The
-      casa38 scanner side was extracted from the old standalone
-      \codeword{sefd_dashboard/app.py} into a dedicated
-      \codeword{sefd_scanner.py} entry point that runs the
-      \codeword{scanner_loop} without a Flask app; the
-      \codeword{sefd_dashboard.service} unit is retargeted at that
-      entry point and port 5777 is retired.  The scanner now writes a
-      \codeword{scanner_heartbeat} sidecar file on every poll cycle so
-      the dashboard's liveness pill stays green on quiet nights.  Two
-      new test files (\codeword{tests/test_dsa_monitor_sefd_view.py}
-      and \codeword{tests/test_dsa_monitor_sefd_routes.py}, 42 cases
-      total) exercise the cache, freshness, path-traversal guard, and
-      every Flask route on a tmp\_path sandbox
-      (Section~\ref{sec:control}).
+\item \emph{M7.7 search-side real-time campaign}
+      (Section~\ref{sec:search}, \ref{sec:perf}): Option-A corr-side
+      coarse-DM dedispersion, symmetric-shift padding (100\,\% fine-DM
+      coverage), the fftshift fold into the combine kernel, the
+      real-output \codeword{irfft2} imager, and the move to the
+      big-block op-point ($T_\mathrm{det}=256$, cadence 192 samples
+      $= 201.3$\,ms).  The fleet now sustains $\sim$166\,ms/cube
+      ($\sim$17\,\% real-time headroom) with the full b1..b64 boxcar
+      bank.  Carry-over re-imaging is implemented and validated but
+      OFF in production.
+\item \emph{Production DM plan v2}
+      (\codeword{dm_plan_N8_dmmin100_tol1.6_v2.npz}): 272 fine trials
+      over DM 100--2653\,pc\,cm$^{-3}$, 8 coarse trials, Levin
+      tolerance 1.6.  The Monte-Carlo S/N-loss study
+      (Section~\ref{sec:mcloss}) has been re-run against it.
+\item \emph{Statistics and noise estimation}
+      (new Section~\ref{sec:stats}): the full chain --- corr-side
+      requantisation, Layer-1 $\sigma$-clipped per-trial
+      normalisation, the fp16 overflow hazard and the
+      \codeword{input_clip_sigma} hardening, Layer-2 per-kernel EMA
+      with the $\sigma_\mathrm{max}$-ratio clamp + escape hatch,
+      decode thresholds and false-alarm budget, the DM-smear floor
+      and noise-colour de-rating, and the linear fluence$\to$S/N
+      calibration --- is now documented in one place.
+\item \emph{Static-sky removal} (Section~\ref{sec:corrfast}): the
+      one-pole EMA is replaced by \codeword{StaticSkyMean}, a strictly
+      causal $\sim$1.07\,s (8-block) sliding mean per coarse-DM trial
+      --- the EMA's $\tau\!\approx\!134$\,s lagged the $\sim$6.9\,s/2$\pi$
+      core fringe winding and left the sky largely unsubtracted.  A
+      30\,s-cadence \emph{sky monitor} export images the running mean
+      on the h23 dashboard with RA/Dec graticule + NVSS overlay.
+\item \emph{Detector wing-decode fix} (Sections~\ref{sec:c1},
+      \ref{sec:stats}): \codeword{n_kernel_max_t} is now derived from
+      the loaded kernel bank (64 for the production b1..b64 bank, was
+      hardcoded 128), restoring a $[32,224)$ scoring window that
+      tiles the 192-sample cadence exactly.  The stale value silently
+      dropped 33\,\% of all stream samples and produced low-S/N
+      off-DM ``wing'' decodes for bursts landing in the blind region.
+\item \emph{Candidate sky coordinates} (Section~\ref{sec:c1}):
+      reported $(l, m)$ now use centred pixel offsets (origin at
+      $n_\mathrm{grid}/2$), the row/column axes are correctly
+      interpreted as $(m, l)$, and the pixel scale is computed
+      exactly from the gridder's \codeword{cell_lambda}
+      ($1.240\times10^{-4}$\,rad/pix, was hardcoded
+      $1.5\times10^{-4}$).
+\item \emph{Injection system overhaul} (Section~\ref{sec:inject}):
+      the injector's profile normalisation now follows the physical
+      voltage $=\sqrt{\text{instantaneous flux}}$ convention (S/N
+      $\propto F/\sqrt{W}$; the old unit-area convention delivered
+      $F/W^{5/2}$); S/N calibration uses a \emph{linear} model
+      $\mathrm{S/N} = K F/\sqrt{W}$ with width-independent per-DM
+      buckets, a saturation-aware fluence ladder, probe-position
+      rotation, and a pre-flight health check; the C2 matcher gates
+      on specnum proximity with a wall-clock fallback; auto-arm uses
+      a 32-block margin with monitor-staleness extrapolation; the
+      \codeword{OnlineInjector} counts clean/partial/never-applied
+      injections.
+\item \emph{Search-side robustness (T1--T8, 2026-06-07/09)}:
+      $\sigma_k$ clamp + escape hatch with per-kernel monitor points,
+      bounded cube uploader, calibration-probe metering exemption,
+      dump-health monitor points, C2 startup-grace pre-expiry
+      tightening, event directories created only when the full cube
+      set lands, \codeword{cube_ring_depth} 16$\to$12 + staggered
+      spawn to fix the n09/n13 pinned-memory OOM.
+\item \emph{C2 plotter} (Section~\ref{sec:c2}): the per-event
+      \codeword{dm_time} figure is now a single contiguous-DM
+      waterfall stacking all eight cubes, with robust per-row
+      MAD normalisation.
 \end{itemize}
 \endgroup
 }}
@@ -327,22 +194,36 @@ The DSA-110 is a 110-element radio interferometer at the Owens
 Valley Radio Observatory operating in the 1.31--1.50\,GHz band.
 \codeword{dsa110-rt} is the real-time pipeline that turns the
 SNAP F-engine packet stream into FRB candidates with a continuously
-sustained, real-time-correct latency budget.  Throughout this
-document the controlling number is the \emph{block cadence}
+sustained, real-time-correct latency budget.  Two cadences govern
+the data plane.  On the \emph{corr side} the controlling number is
+the \emph{block cadence}
 \[
    T_\mathrm{blk} = 4096\,\text{native samples}
    = 4096 \times \tau_\mathrm{nat}
    = 4096 \times 32.768~\mu\mathrm{s}
    = 0.134217728~\mathrm{s},
 \]
-i.e.\ 134.218\,ms per block, corresponding to
-$f_\mathrm{cube}=7.451~\mathrm{cubes/s}$ at the production
-operating point.  Every routine in the data plane has to fit inside
-this window on the worst-tail percentile; the corr-side hot path
-(\codeword{corr_fast_integration}) currently runs at
+i.e.\ 134.218\,ms per block; the corr-side hot path
+(\codeword{corr_fast_integration}) runs at
 $\mathrm{p50}\!\approx\!110\,\mathrm{ms}$,
 $\mathrm{p99}\!\approx\!110.5\,\mathrm{ms}$ on the production fleet
-(\codeword{docs/m72/M72_MORNING_REPORT_2026-05-20.md}).
+(\codeword{docs/m72/M72_MORNING_REPORT_2026-05-20.md}).  On the
+\emph{search side} the controlling number is the \emph{cube
+cadence}: each detector cube spans $T_\mathrm{det}=256$ search
+samples and advances by 192 samples of
+$t_\mathrm{int}^\mathrm{search}=1048.576\,\mu$s, i.e.
+\[
+   T_\mathrm{cube} = 192 \times 1.048576~\mathrm{ms}
+   = 201.327~\mathrm{ms}
+   \quad\Longleftrightarrow\quad
+   f_\mathrm{cube} = 4.967~\mathrm{cubes/s}.
+\]
+After the M7.7 performance campaign (Option-A corr-side coarse-DM
+dedispersion, symmetric-shift padding, the fftshift fold, and the
+real-output \codeword{irfft2} imager --- Section~\ref{sec:perf}) a
+search half sustains $\sim$166\,ms/cube ($\sim$5.2--6.0 cubes/s
+measured live), i.e.\ $\sim$17\,\% of real-time headroom with the
+full 7-octave boxcar bank.
 
 The pipeline runs on 16 correlator nodes (\codeword{n03}--\codeword{n22},
 with gaps), 4 search nodes (\codeword{n01}, \codeword{n02},
@@ -374,7 +255,7 @@ of each host class.
 \node[box=corrcol, below=of bada] (mfs)
         {meridian\_fringestop\\ {\scriptsize casa38, sole \texttt{bada} reader}};
 \node[box=srchcol, right=of cf, xshift=10mm] (rx) {search\_rx\\(UDP, RX ring)};
-\node[box=srchcol, below=of rx] (sc) {search\_compute\\(GPU, K=128 conv)};
+\node[box=srchcol, below=of rx] (sc) {search\_compute\\(GPU, K=7 conv)};
 \node[box=srchcol, below=of sc] (c1) {C1 emit\\(TCP, ASCII)};
 \node[box=coordcol, right=of c1, xshift=15mm] (c2) {C2 coincidencer\\(h23)};
 \node[box=coordcol, above=of c2] (dash) {dsa\_monitor\\dashboard (h23)};
@@ -483,15 +364,16 @@ $N_\mathrm{bl} = 96\cdot97/2 = 4656$, fixed in
 \codeword{common.constants.NBASE}.
 
 \paragraph{Operating points.}
-Two operating points are in play.  The default (committed
-\codeword{configs/dm_plan.npz}) integrates fast-correlator output to
-$t_\mathrm{int}^\mathrm{fast} = 8 \cdot \tau_\mathrm{nat} = 262.144\,\mu$s
-and the search-side dedispersion samples to
-$t_\mathrm{int}^\mathrm{search} = 524.288\,\mu$s.  The M7.2 production
-override increases $t_\mathrm{int}^\mathrm{search}$ to $1048.576\,\mu$s
-and bakes a corr-side $8\times$ channel-sum into the wire format, so
-the search-side fine-DM combiner sees $768$ frequency channels of
-$\Delta\nu = 244.140$\,kHz each.  Both numbers matter for the S/N
+The production operating point integrates fast-correlator output to
+$t_\mathrm{int}^\mathrm{fast} = t_\mathrm{int}^\mathrm{search}
+= 1048.576\,\mu$s (32 $\times$ native) and bakes a corr-side
+$8\times$ channel-sum into the wire format, so the search-side
+fine-DM combiner sees $768$ frequency channels of
+$\Delta\nu = 244.140$\,kHz each.  The production DM plan is the v2
+\codeword{dm_plan_N8_dmmin100_tol1.6_v2.npz}: $N_\mathrm{fine}=272$
+trials over DM 100--2653\,pc\,cm$^{-3}$, $N_\mathrm{coarse}=8$
+(one per search GPU half), Levin tolerance $\theta=1.6$, fine-trial
+spacing 9.34--9.58\,pc\,cm$^{-3}$.  Both numbers matter for the S/N
 analysis in~\Cref{sec:mcloss}.
 
 
@@ -579,7 +461,7 @@ through a custom POSIX-shm ring (\codeword{/dev/shm/dsart-rfi-window-<cn>}).
 ]
 \node[srt] (rx) at (0,0)    {search\_rx\\ \scriptsize UDP, dequant};
 \node[shm,right=of rx] (ring) {RX ring\\ (pinned)};
-\node[srt,right=of ring] (sc0) {search\_compute\_0\\ \scriptsize K=128 conv};
+\node[srt,right=of ring] (sc0) {search\_compute\_0\\ \scriptsize K=7 conv};
 \node[srt,below=of sc0] (sc1) {search\_compute\_1};
 \node[srt,right=of sc0] (c1a) {C1 emit\,(g=0)\\ \scriptsize TCP h23:11500};
 \node[srt,right=of sc1] (c1b) {C1 emit\,(g=1)};
@@ -605,7 +487,7 @@ through a custom POSIX-shm ring (\codeword{/dev/shm/dsart-rfi-window-<cn>}).
 \draw[decorate,decoration={brace,amplitude=4pt}]
     ($(sc0.north east)+(0.1,0.1)$) -- ($(sc0.north west)+(-0.1,0.1)$)
     node[midway,above,font=\sffamily\scriptsize]
-    {N=8 cube ring (pinned host)};
+    {N=12 cube ring (pinned host)};
 
 \node[font=\sffamily\bfseries,anchor=south] at (current bounding box.north)
    {Search node: 4 routines per dsart-rt ($\times$4 hosts, 2 GPUs each)};
@@ -653,22 +535,22 @@ Stokes-I sum            & $V_I$         & cfp16       & $4656\!\times\!384 \time
    $V_I = V_\mathrm{XX}+V_\mathrm{YY}$ \\
 Chan-sum $\times 8$      & $V_I$         & cfp16       & $4656\!\times\!48 \times t/8$             &
    M7.3 production only \\
-Gridder accum           & $G_I(u,v)$    & cfp32        & $256\!\times\!256$                       &
+Coarse-DM dedispersion (Option A) & $V_I'$  & cfp32        & per coarse-DM trial                       &
+   per-(ch, $\DM_c$) integer shifts; 2-block sliding window \\
+Gridder accum           & $G_I(u,v)$    & cfp32        & sparse-COO $\sim$5800 cells              &
    meridian-transit (u,v) only; \textbf{no fringe-stop} on fast path \\
-Static-sky IIR          & $G_I - \langle G_I\rangle$ & cfp32 & $256\!\times\!256$ & $\tau=150$\,ms one-pole EMA \\
-Coarse-DM stage-1       & $G_I'$        & cfp32        & sparse-COO                                &
-   per-(chgroup,ch) integer shifts \\
-Sparse-COO gather       & nnz, $G_I'$   & cint8 + cfp16 stitch & $\sim$5800 cells $\times$ N\_coarse &
-   quantize per block, $\mathrm{scale} = 0.95 \cdot 4 \sigma / 127$ \\
+Static-sky mean         & $G_I - \overline{G_I}$ & cfp32 & per coarse-DM trial & strictly causal 8-block ($\approx$1.07\,s) sliding mean \\
+Sparse-COO gather       & nnz, $G_I'$   & cint8        & $\sim$5800 cells $\times$ 8 coarse DMs &
+   per-(dm, t)-tile quantise, $\mathrm{scale} = \max|x|/127$ \\
 UDP TX                  & on-wire      & cint8 + 72-B hdr & one packet per coarse-DM             &
    per-cube sequence numbering, sparse pattern id \\
 RX dequantise           & $G_I'$        & fp16 cplx   & $\sim$5800$\times 8$                       &
    reverse scale; assemble per-chgroup slabs \\
-Fine-DM combiner        & $G_{I,f}'$    & fp16 cplx   & $N_\mathrm{fine}\times256\times256\times t$ &
-   $\delta\!\DM$ integer shifts per chgroup, signed \\
+Fine-DM combiner        & $G_{I,f}'$    & fp16 cplx   & $34\times256\times256\times t$ per half &
+   $\delta\!\DM$ integer shifts per chgroup, signed; sym-shift padded \\
 Imager                  & $I(l,m)$     & fp16 real   & same                                       &
-   $I = \mathrm{Re}\,\mathrm{iFFT}_2(G_{I,f}')$, fftshift\\
-Detector                & $c_k$         & fp16 / fp32 score & $K=128$ kernels                       &
+   $I = \mathrm{irFFT}_2(G_{I,f}')$, fftshift folded into combine \\
+Detector                & $c_k$         & fp16 / fp32 score & $K=7$ kernels (b1..b64)              &
    per-kernel boxcar via cumsum diff \\
 \bottomrule
 \end{tabular}
@@ -788,6 +670,28 @@ steps, in order:
     $= 244.14$\,kHz and the channel count drops to 48 per chgroup
     (768 across the fleet).
 
+\item \textbf{Coarse-DM dedispersion (Option~A, 2026-06-02)}.  For
+    each of the 8 coarse-DM trials $\DM_c$ the per-channel integer
+    shift table
+    \begin{equation}
+       \Delta t^{(1)}[\mathrm{cg}, \nu, c]
+       = \mathrm{round}\Big(
+            \tfrac{\tau(\nu_\mathrm{cg,top}, \DM_c) - \tau(\nu, \DM_c)}
+                  {t_\mathrm{int}^\mathrm{fast}}\Big)
+       \label{eq:s1shift}
+    \end{equation}
+    is read from the committed DM plan, \emph{plus} the
+    cross-chgroup stage-2 alignment to the fleet reference frequency
+    --- under Option~A the corr side absorbs the \emph{entire}
+    coarse-DM shift so the residual search-side shift table spans
+    only $\pm 83$ samples (was $\pm 1432$ when the search side
+    carried the coarse offset).  A 2-block sliding window (F34)
+    joins the previous block's Stokes-I visibilities with the
+    current block before applying the shifts, so a pulse whose
+    dispersed tail crosses a block boundary is recovered with no
+    discontinuity; the fused Triton gather+scatter kernel applies
+    the shift and grids in one pass.
+
 \item \textbf{Gridding} onto a $N_\mathrm{grid}\!=\!256$ uv-grid.  This
     uses a static, prepare-time-sealed (u, v) projection valid at
     meridian transit (HA $= 0$):
@@ -804,55 +708,61 @@ steps, in order:
     frequency.  The fast path is \emph{not} fringe-stopped per element
     (in contrast to \codeword{meridian_fringestop}; see~\Cref{sec:mfs});
     the design accepts a $<0.01\,\%$ S/N loss at $\DM=100$ and
-    $\sim 6\,\%$ worst-case at $\DM=3000$ on the longest baselines,
-    in exchange for eliminating $\sim 5\,\mathrm{MFLOPs}$ per visibility
-    per block.
+    $\sim 6\,\%$ worst-case at the top of the searched DM range on
+    the longest baselines, in exchange for eliminating
+    $\sim 5\,\mathrm{MFLOPs}$ per visibility per block.
 
-\item \textbf{Static-sky removal} via a one-pole IIR with
-    $\tau_\mathrm{ssky} = 150$\,ms:
+\item \textbf{Static-sky removal} via \codeword{StaticSkyMean}
+    (2026-06-05, commit \codeword{373a037}), a strictly causal
+    sliding mean over the previous $W_\mathrm{ssky}=8$ blocks
+    ($\approx 1.07$\,s) of the gridded, dedispersed visibilities:
     \begin{equation}
-       \alpha = 1 - e^{-\Delta t / \tau_\mathrm{ssky}},
-       \qquad
-       \langle G\rangle \leftarrow (1-\alpha)\langle G\rangle + \alpha\,G,
-       \qquad
-       G' = G - \langle G\rangle.
+       G'_c(t) \;=\; G_c(t) \;-\;
+       \frac{1}{W_\mathrm{ssky}}\sum_{b=1}^{W_\mathrm{ssky}}
+            \overline{G_c}(t - b),
        \label{eq:ssky}
     \end{equation}
-    The result is unbiased by the sky on timescales $\gg \tau_\mathrm{ssky}$
-    and preserves any transient on timescales $\ll \tau_\mathrm{ssky}$.
+    where $\overline{G_c}(t-b)$ is block $t\!-\!b$'s per-uv-cell
+    complex time-mean and $c$ indexes the coarse-DM trial --- each
+    trial owns an independent window state, because the same sky
+    appears at a different dedispersion alignment in each trial.
+    The subtracted mean \emph{excludes} the current block (strictly
+    causal), so a burst arriving now never subtracts itself.  This
+    replaced the original one-pole EMA whose effective
+    $\tau\approx134$\,s lagged the fastest core-baseline fringe
+    winding ($\approx 6.9$\,s per $2\pi$): at that lag the EMA
+    estimate decorrelates from the live sky (attenuation
+    $1/\sqrt{1+(\omega\tau)^2}$, phase lag $\arctan\omega\tau$), so
+    the static sky was largely \emph{unsubtracted} and minutes-old
+    sky smeared into every cube.  The 1.07\,s window sits well
+    inside the fringe winding, tracks the sky coherently, and
+    preserves any transient shorter than $\sim$1\,s.  Knobs:
+    \codeword{--static-sky-window-s} (default 1.0),
+    \codeword{--static-sky-warmup-cubes} (8; build the window but do
+    not subtract), \codeword{--static-sky-disabled}.  The running
+    mean of slot~0 is also exported every 30\,s to the h23
+    \emph{sky monitor} (Section~\ref{sec:control}).
 
-\item \textbf{Coarse-DM stage-1} pre-dispersion.  For each
-    coarse-DM trial $\DM_c$, the per-channel integer shift table
-    \begin{equation}
-       \Delta t^{(1)}[\mathrm{cg}, \nu, c]
-       = \mathrm{round}\Big(
-            \tfrac{\tau(\nu_\mathrm{cg,bot}, \DM_c) - \tau(\nu, \DM_c)}
-                  {t_\mathrm{int}^\mathrm{fast}}\Big)
-       \label{eq:s1shift}
-    \end{equation}
-    is read from \codeword{configs/dm_plan.npz}; the GPU rolls each
-    channel by its integer shift so that, post-stage-1, all 384
-    channels are aligned at the \emph{bottom} of their chgroup band
-    for the coarse-DM trial.
-
-\item \textbf{Sparse-COO gather, quantise, transmit}.  After
-    static-sky removal the surviving uv-cells are gathered into a
-    SparseCOO record per coarse-DM trial; the in-block standard
-    deviation $\sigma_\mathrm{est}$ is computed once and a single
-    block-level quantisation factor
+\item \textbf{Sparse-COO gather, quantise, transmit}.  The
+    surviving uv-cells are gathered into a SparseCOO record per
+    coarse-DM trial and quantised to cint8 per (coarse-DM,
+    time)-tile over the filled cells:
     \begin{equation}
        \mathrm{scale}
-        = \frac{0.95\cdot 4\,\sigma_\mathrm{est}}{q_\mathrm{max}},
+        = \frac{\max\bigl(|\mathrm{Re}\,x|, |\mathrm{Im}\,x|\bigr)}
+               {q_\mathrm{max}},
        \qquad
        q = \mathrm{clip}\bigl(\mathrm{round}(x_\mathrm{cplx}/\mathrm{scale}),
-                              -q_\mathrm{max},\, q_\mathrm{max}\bigr),
+                              -128,\, q_\mathrm{max}\bigr),
        \label{eq:requant}
     \end{equation}
-    converts cfp16 to cint8 with $q_\mathrm{max}=127$ (16 bits per
-    cell, 8 real + 8 imag).  The block's scale + offset are written
-    into the 72-byte transport header, so RX can undo the
-    quantisation exactly.  The whole record fans out by UDP across
-    the 40\,GbE corner-turn to the assigned search node.
+    with $q_\mathrm{max}=127$ (16 bits per cell, 8 real + 8 imag).
+    Scaling by the tile max (rather than a $\sigma$-derived factor)
+    makes the quantiser saturation-free by construction; the
+    per-tile scale is written into the 72-byte transport header so
+    RX undoes the quantisation exactly.  The whole record fans out
+    by UDP across the 40\,GbE corner-turn to the assigned search
+    node.
 \end{enumerate}
 
 The 16-block window aggregator that runs in the same process is
@@ -940,28 +850,32 @@ historical lineage):
 \label{eq:levin}
 \end{equation}
 with $\alpha = 1/(16+n^2)$, $n$ the channel count of the relevant
-sub-band, $\Delta t$ the sample period, and $\theta = 1.5$ the
+sub-band, $\Delta t$ the sample period, and $\theta$ the
 acceptable per-trial S/N loss factor.  The recursion is applied
-twice: first on the bottom sub-band (chgroup~15, tightest spacing)
+twice: first on the bottom sub-band (tightest spacing)
 to determine $\DM_\mathrm{max}^\mathrm{eff}$ by counting out
 $N_\mathrm{coarse}=8$ steps; then on the full processed band to
 generate the fine-DM list, trimmed to a multiple of $N_\mathrm{GPU}=8$
 so the per-GPU split is exact and coarse-DM bucket midpoints align
 with their GPU's $K/2$ symmetric fine-DM trials.
 
-The committed plan (\codeword{configs/dm_plan.npz}, v1) has
-$N_\mathrm{fine} = 690$, $N_\mathrm{coarse} = 16$, $\DM_\mathrm{min} = 0$,
-$\DM_\mathrm{max} = 3000$\,pc\,cm$^{-3}$, $\theta = 1.5$,
-$t_\mathrm{int}^\mathrm{search} = 524.288\,\mu$s.  Adjacent fine-DM
-trial spacings sit in $[4.18,\,4.71]$\,pc\,cm$^{-3}$ across the
-range, almost uniform.
+The production plan
+(\codeword{dm_plan_N8_dmmin100_tol1.6_v2.npz}, version 2) has
+$N_\mathrm{fine} = 272$, $N_\mathrm{coarse} = 8$,
+$\DM_\mathrm{min} = 100$,
+$\DM_\mathrm{max} = 2653$\,pc\,cm$^{-3}$, $\theta = 1.6$,
+$t_\mathrm{int}^\mathrm{search} = 1048.576\,\mu$s.  Adjacent fine-DM
+trial spacings sit in $[9.34,\,9.58]$\,pc\,cm$^{-3}$ across the
+range, almost uniform; each GPU half owns one coarse-DM bucket of
+$K=34$ fine trials.  The 8 coarse trials sit at
+$\{259, 576, 895, 1213, 1533, 1854, 2176, 2500\}$\,pc\,cm$^{-3}$.
 
 The fine-DM combiner reads its per-chgroup, per-fine-DM \emph{signed}
 integer shift table
 \begin{equation}
    \Delta t^{(\mathrm{srch})}[f, \mathrm{cg}]
-   = \mathrm{round}\Big(\tfrac{\tau(\nu_\mathrm{cg,bot},\,\DM_c+\delta\DM_f)
-                       - \tau(\nu_\mathrm{bot}^\mathrm{proc},\,\DM_c)}
+   = \mathrm{round}\Big(\tfrac{\tau(\nu_\mathrm{cg,top},\,\DM_c+\delta\DM_f)
+                       - \tau(\nu_\mathrm{cg,top},\,\DM_c)}
                         {t_\mathrm{int}^\mathrm{search}}\Big),
    \label{eq:s2shift}
 \end{equation}
@@ -971,109 +885,163 @@ The combiner reads $\mathrm{stream}[t - \Delta t]$; past data is
 naturally available, future data via a one-sided rewind of the RX
 ring.
 
-\paragraph{Stage-2-absent escape hatch and the chgroup-TOP fix
-(2026-05-29).}
-The production search runs with
-\codeword{--include-coarse-offset-in-search-shifts}: corr-side
-stage-2 is disabled and the search-side combiner absorbs the residual
-within-chgroup dispersion span on top of the fine-DM offset.  Through
-mid-May 2026 the escape-hatch path referenced each chgroup's
-\emph{bottom} channel when aligning to $\nu_\mathrm{bot}^\mathrm{proc}$,
-but the corr-side coarse-DM stage-1 (Convention~A,
-\codeword{coarse_dm/dm_plan.py}) aligns each chgroup's channels to the
-chgroup \emph{top}, and the uniform stage-2 ring applies no per-chgroup
-realignment.  The bottom-vs-top mismatch equals the within-chgroup
-dispersion span, producing a constant $-2.45\,\%$ DM bias
-(detected $\approx 0.9755 \times \mathrm{injected}$) independent of
-DM, observed both in injection forward-modelling and in the on-sky
-``detected lower than injected'' pattern.  The fix
-(\codeword{src/dsart/fine_dm/combiner.py}, commit \codeword{fded338})
-is to reference each chgroup's TOP channel
-(\codeword{NU_CHGROUP_TOP_GHZ}); callers may pass the exact
-chan-summed top-channel band-centre via the new \codeword{nu_chgroup_top_GHz}
-arg for a $0.000\,\%$ residual.  The bottom-referenced
-(stage-2-present) path is unchanged; the regression test in
-\codeword{tests/test_fine_dm_combiner.py} pins $\sim\!0$ residual.
-Search-side only, computed once at startup, zero hot-path impact.
+\paragraph{Option A and symmetric-shift padding (2026-06-02/03).}
+Two changes locked in the production dedispersion geometry.  First,
+\emph{Option~A} (commit \codeword{7c6ee9a}) moved the entire
+coarse-DM dedispersion --- the within-chgroup stage-1 \emph{and} the
+cross-chgroup stage-2 alignment to the fleet reference frequency ---
+to the corr side, retiring the
+\codeword{--include-coarse-offset-in-search-shifts} escape hatch.
+The search-side shift table~(\ref{eq:s2shift}) now carries only the
+\emph{fine}-DM residual and spans $\pm 83$ samples (was $\pm 1432$),
+shrinking the per-chgroup stream history $T_\mathrm{stream}$ from
+1624 to 275 samples.  This was also a correctness fix: under the
+escape hatch, cells at high DM read out-of-window for most chgroups,
+so at $\DM\gtrsim 2000$ the search was effectively blind (only
+$\sim$2/16 chgroups contributed).  Second, \emph{symmetric-shift
+padding} (commit \codeword{ef6ffd5}, flag
+\codeword{--symmetric-shift-padding}, ON in production) pre-pads the
+per-chgroup stream with $\max(0, \max_g\Delta t)$ leading and
+$\max(0, -\min_g\Delta t)$ trailing samples ($T_\mathrm{stream}
+\to 358$) so the combine kernel has an in-range source row for
+\emph{every} $(t, f_\mathrm{dm}, \mathrm{cg})$ tuple --- 100\,\%
+fine-DM coverage, with no coverage-dependent variance structure left
+for Layer-1 to chase (Section~\ref{sec:stats}).
+
+\paragraph{Historical note: the chgroup-TOP fix (2026-05-29).}
+Under the now-retired escape hatch, the search-side shifts referenced
+each chgroup's \emph{bottom} channel while the corr-side stage-1
+aligned channels to the chgroup \emph{top}; the mismatch equals the
+within-chgroup dispersion span and produced a constant $-2.45\,\%$ DM
+bias (detected $\approx 0.9755\times$ injected) independent of DM.
+Fixed in \codeword{src/dsart/fine_dm/combiner.py} (commit
+\codeword{fded338}) by referencing \codeword{NU_CHGROUP_TOP_GHZ};
+the regression test in \codeword{tests/test_fine_dm_combiner.py}
+pins a $\sim\!0$ residual.  Option A inherits the top-referenced
+convention.
 
 \subsection{Imager}
+\label{sec:imager}
+\label{sec:perf}
 
 The fine-DM combiner emits a dense $256\times 256$ uv-grid per fine-DM
-trial per time sample.  The imager applies a single
-$256\times 256$ inverse 2-D FFT and takes the real part:
+trial per time sample; the imager inverts it to the image plane:
 \begin{equation}
-   I(l, m;\, f, t) = \mathrm{Re}\bigl[\mathrm{iFFT}_2\, G_{I,f}'(u,v;\,t)\bigr],
-   \quad \text{after fftshift}.
+   I(l, m;\, f, t) = \mathrm{Re}\bigl[\mathrm{iFFT}_2\, G_{I,f}'(u,v;\,t)\bigr].
    \label{eq:image}
 \end{equation}
 The output is a real fp16 image cube of shape
-$[T_\mathrm{det}, N_\mathrm{fine}, N_\mathrm{grid}, N_\mathrm{grid}]$
-with $T_\mathrm{det} = 512$ samples = 2 blocks.  An edge-mask zeroes
-the outer ring so the boxcar conv-bank in the next stage sees a clean
-input.
+$[T_\mathrm{det}, K, N_\mathrm{grid}, N_\mathrm{grid}]$
+with $T_\mathrm{det} = 256$ samples and $K=34$ fine-DM trials per
+GPU half.  An edge-mask zeroes the outer ring (and the DC cell) so
+the boxcar conv-bank in the next stage sees a clean input.  Three
+M7.7 optimisations shape the production implementation:
+
+\begin{itemize}[topsep=2pt,itemsep=2pt]
+\item \emph{fftshift fold (M7.7.3).}  The half-grid output roll that
+      centres the image used to be a separate
+      \codeword{torch.fft.fftshift} pass ($\sim$9\,ms/cube).  It is
+      now folded into the fused combine kernel as a
+      $(-1)^{u+v}$ checkerboard on the uv-grid (shift theorem), at
+      zero extra cost; \codeword{DSART_DISABLE_FFTSHIFT_FOLD=1}
+      restores the legacy path for A/B.  A matching
+      $(-1)^{i+j}$ correction is folded into the edge mask
+      (\codeword{apply_ifft2_dc_correction}) to compensate for the
+      omitted \codeword{ifftshift} on the input side.
+\item \emph{Real-output FFT (M7.7.4).}  Because the image is real,
+      the uv-grid is Hermitian; the imager folds the conjugate
+      half-spectrum and calls \codeword{torch.fft.irfft2} on the
+      half-grid, halving both the FFT cost and the transient
+      uv-batch memory.  Default ON (\codeword{DSART_IMAGER_RFFT=0}
+      forces the legacy \codeword{ifft2().real} path).  This is the
+      change that made the big-block op-point
+      ($T_\mathrm{det}=256$/cadence 192) fit on the 11\,GiB
+      2080\,Ti.
+\item \emph{Carry-over re-imaging (M7.7.2).}  Consecutive cubes
+      overlap by $T_\mathrm{det} - 192 = 64$ samples, and the
+      overlapped image rows are bit-identical re-computations
+      (the streams are the same physical data at a shifted origin;
+      symmetric padding guarantees in-range reads).  The
+      \codeword{cube_pipeline_carry_over_re_imaging} flag images
+      only the new 192 rows and copies the prior cube's last 64
+      rows forward with a per-fdm $\sigma$-ratio rescale
+      (the fused Layer-1 path bakes $1/\sigma_\mathrm{prev}$ into
+      the imager, so the carried rows must be re-scaled from
+      $\sigma^{N-1}$ to $\sigma^{N}$).  Validated bit-exact
+      (\codeword{--validate-carry-over-equivalence} in the speed
+      gate); $-21$\,ms/cube on the bench.  \textbf{OFF in
+      production} --- the rfft + big-block changes alone cleared the
+      real-time budget, and the simpler pipeline is preferred while
+      commissioning.
+\end{itemize}
 
 \subsection{Layer-1 noise normalisation}
+\label{sec:layer1}
 
 Before the detector, Layer-1 produces a per-cube, per-fine-DM global
-$\sigma$ via three iterations of $3\sigma$-clipped standard deviation
-over the $[T_\mathrm{det}, N_\mathrm{grid}, N_\mathrm{grid}]$ slab.
-Cold start uses the median of the most recent 5 cubes' Layer-1
-$\sigma$s to defend against single-cube RFI contamination; from cube 6
-onwards the current cube's $\sigma$ is used directly.  The image cube
-is divided by $\sigma$ so subsequent detector kernels operate on a
-unit-variance input under the null hypothesis.
+$\sigma$ via three iterations of median-centred $3\sigma$-clipped
+standard deviation over the
+$[T_\mathrm{det}, N_\mathrm{grid}, N_\mathrm{grid}]$ slab
+(subsampled to \codeword{layer1_max_samples}\,=\,10\,000 cells per
+trial; the estimator standard error is
+$\sigma/\sqrt{2\times10^4}\approx 0.7\%$).  The image cube is
+divided by $\sigma$ so subsequent detector kernels operate on a
+unit-variance input under the null hypothesis.  Production knobs
+(YAML \codeword{noise:} block): \codeword{layer1_n_burnin_cubes=1}
+(each cube normalised by its own $\sigma$; the historical 5-cube
+cold-start median ring is available for replays) and
+\codeword{layer1_sigma_floor=5e-3}, which clamps the divisor from
+below so the static-sky warm-up transient (where the subtracted
+window is half-empty and $\sigma$ collapses $\sim$200$\times$ below
+the steady-state floor) cannot manufacture $10^5\sigma$ false
+positives on the first cubes after a start.  The full statistical
+treatment is given in Section~\ref{sec:stats}.
 
-\paragraph{Coverage correction (M7.4.2, 2026-05-27).}
-With the stage-2-absent escape-hatch path enabled
-(Section~\ref{sec:dedisp}), per-chgroup search-side shifts grow with
-absolute DM (up to $\sim$1356 native samples at coarse-DM index 7
-versus $T_\mathrm{det}=192$).  For any given $(t,f_\mathrm{dm})$
-cell only a fraction of the 16 chgroups read in-window data, the rest
-contributing zero from the lookahead boundary $[T_\mathrm{det},
-T_\mathrm{stream})$.  The per-cell variance therefore scales with
-$n_\mathrm{chg\_contrib}[t, f_\mathrm{dm}]$, but the global per-fdm
-$\sigma_\mathrm{clipped}$ estimator returns a single scalar; cells
-with above-median coverage look like outliers and fire spurious
-$\ge 8\sigma$ candidates.  Pure-Gaussian \codeword{synth_fada} input
-produced $\sim$6000 false alarms per cube per half at the production
-threshold.  The fix (knob
-\codeword{DSART_LAYER1_COVERAGE_CORRECT=1}, default on) precomputes
-$c[t,f] = \sqrt{n_\mathrm{chg\_contrib}[t,f]\,/\,n_\mathrm{chg\_max}[f]}$
-from the time-shift table and pre-divides the cube by $c$ before the
-$\sigma$ estimate; cells with $n_\mathrm{chg\_contrib}=0$ become NaN
-and are zeroed downstream, so the detector ignores them entirely.
-Verified on the 4-search-node $\times$ 2-half PhaseB soak: the false-
-alarm rate drops from $\sim\!6000$/cube/half to $<\!0.1$/cube/half
-($>\!50\,000\times$ reduction).  The fused-imager Layer-1 path (which
-bakes $1/\sigma_\mathrm{prev}[f]$ into the imager kernel) cannot
-combine with a per-$(t,f)$ mask without a kernel-signature change, so
-it auto-disables when coverage correction is on; the resulting
-$\sim\!10$\,ms/cube broadcast-divide overhead is well within the RT
-budget after the M7.4.1 GPU-scatter freed $\sim\!70$\,ms of H2D.
+\paragraph{Fused Layer-1 and the coverage-correction retirement.}
+The production imager \emph{fuses} the Layer-1 divide into the
+imager kernel: the edge mask is multiplied by
+$1/\sigma_\mathrm{prev}[f]$ (the previous cube's estimate), the
+$\sigma$ of the current cube is then estimated on the pre-divided
+output and unwrapped as
+$\sigma_\mathrm{this}=\sigma_\mathrm{obs}\cdot\sigma_\mathrm{prev}$.
+This saves a full-cube broadcast divide ($\sim$11\,ms).  The
+M7.4.2 \emph{coverage correction} --- a per-$(t, f_\mathrm{dm})$
+pre-divide by $c[t,f] =
+\sqrt{n_\mathrm{chg\_contrib}[t,f]/n_\mathrm{chg\_max}[f]}$ that
+flattened the variance structure created when high-DM cells read
+out-of-window for some chgroups (a $>5\times10^4$-fold false-alarm
+reduction at the time) --- is \emph{automatically disabled} under
+symmetric-shift padding, because every cell now reads all 16
+chgroups and the coverage field is identically 1.  The code path
+remains (\codeword{DSART_LAYER1_COVERAGE_CORRECT}) for
+configurations without padding.
 
 \subsection{Detector v1 (the C1 path)}
 \label{sec:c1}
 
 The deterministic detector
 (\codeword{src/dsart/detector/forward.py::DeterministicDetector})
-applies a bank of $K=128$ separable 3-D kernels, the Cartesian
+applies a bank of $K=7$ separable 3-D kernels, the Cartesian
 product of $K_\mathrm{img}\times K_\mathrm{dm}\times K_\mathrm{time}
-= 4\times 4\times 8$ triples:
+= 1\times 1\times 7$ triples:
 \[
-   K_\mathrm{img}\in\{\text{unit, psf, psf\_shift\_lm, psf\_shift\_l}\}
+   K_\mathrm{img}\in\{\text{unit}\}
    \qquad
-   K_\mathrm{dm}\in\{1,3,5,7\}
+   K_\mathrm{dm}\in\{1\}
    \qquad
-   K_\mathrm{time}\in\{1,2,4,8,16,32,64,128\}.
+   K_\mathrm{time}\in\{1,2,4,8,16,32,64\}.
 \]
-The $K_\mathrm{img}$ axis is reserved for a v2 matched filter against
-the PSF; in v1 all four image kernels ship as the trivial $1\times 1$
-delta (\codeword{D10} in \codeword{M5_PLAN_FIXES.md}) because the
-production search\_compute consumes an image-domain cube where the
-PSF has already convolved the noise.
+The image and DM axes are placeholders for a v2 matched filter
+(Section~\ref{sec:c1v2}); in v1 they ship as the trivial $1\times1$
+delta because the production search\_compute consumes an image-domain
+cube where the PSF has already convolved the noise, and the fine-DM
+trial spacing is matched to the tolerance so adjacent-trial summing
+buys little.  The full octave time ladder b1..b64 is retained by
+explicit decision (M7.7 review): cutting wide boxcars was rejected
+as a speed lever.
 
-The K\_dm and K\_time axes are running boxcars.  By a pinned
-plan-§3.6.13 budget they are \emph{required} to be evaluated via the
+The K\_time axis is a running boxcar.  By a pinned plan-§3.6.13
+budget it is \emph{required} to be evaluated via the
 cumulative-sum-difference primitive:
 \begin{equation}
    \mathrm{boxcar}_w(x)[t]
@@ -1083,10 +1051,26 @@ cumulative-sum-difference primitive:
 \end{equation}
 which is $O(\text{cube})$ per kernel rather than $O(\text{cube}\cdot w)$
 for a strided conv.  Naïve \codeword{F.conv1d} along these axes fails
-the M5 FLOP gate by an order of magnitude.
+the M5 FLOP gate by an order of magnitude.  The cumsum runs in fp32
+even on an fp16 cube, so boxcar accumulation cannot overflow the
+fp16 dynamic range.
+
+\paragraph{Input clip.}  Before scoring, the production pipeline
+clamps the Layer-1-normalised cube symmetrically at
+\codeword{detector_input_clip_sigma}\,$=250$ (in $\sigma$ units).
+This is an fp16-overflow defence: a sufficiently bright injection
+(or RFI spike) drives intermediate FFT accumulations past the fp16
+maximum (65504), producing \codeword{inf}s that the earlier
+\codeword{nan_to_num} clamp turns into $\pm 60000$ blocks --- and a
+single such tile poisons the cumsum for its entire $(f_\mathrm{dm},
+l, m)$ column, killing detection across the tile.  Clipping at
+$250\sigma$ is invisible to astrophysical signals (the matched-filter
+S/N of a clipped top-hat is barely affected until far beyond any
+plausible single-sample amplitude) but keeps every downstream
+accumulation finite.
 
 The per-kernel score $c_k$ has shape
-$[T_\mathrm{det}, N_\mathrm{fine}, N_\mathrm{grid}, N_\mathrm{grid}]$;
+$[T_\mathrm{det}, K, N_\mathrm{grid}, N_\mathrm{grid}]$;
 \textbf{Layer-2} normalisation divides each $c_k$ by an EMA-tracked
 empirical $\sigma_k$ computed on cube interiors (margin
 $n_\mathrm{kernel\_max\_t}/2$ from each cube edge to keep the boxcar
@@ -1101,12 +1085,43 @@ output meaningful):
 \end{equation}
 The Layer-2 EMA renormalises any per-kernel structural scaling
 (the boxcar enlarges the effective integration so $\sigma_k$ grows as
-$\sqrt{K_\mathrm{dm}\,K_\mathrm{time}}$ in the white-noise limit)
-automatically; downstream sees a unit-variance score.
+$\sqrt{K_\mathrm{time}}$ in the white-noise limit) automatically;
+downstream sees a unit-variance score.  Two guard rails protect the
+EMA (full discussion in Section~\ref{sec:stats}): a per-cube update
+that would raise $s_k$ more than
+$\codeword{layer2_sigma_max_ratio}=4\times$ over the running value
+is rejected, so a bright burst or RFI flash cannot inflate $s_k$ and
+de-sensitise subsequent cubes; and
+\codeword{layer2_clamp_escape_cubes}\,$=64$ lets $s_k$ rebaseline if
+the clamp fires on that many consecutive cubes (a genuine noise-floor
+step, e.g.\ a calibration change, would otherwise pin the estimator
+forever).
+
+\paragraph{Scoring window and the wing-decode fix (2026-06-09,
+commit \codeword{5fb853a}).}  Boxcar scores within
+$t_\mathrm{edge} = n_\mathrm{kernel\_max\_t}/2$ of either cube edge
+are contaminated by the cumsum boundary, so the decoder only scans
+$t \in [t_\mathrm{edge},\, T_\mathrm{det} - t_\mathrm{edge})$.
+Through 2026-06-08, $n_\mathrm{kernel\_max\_t}$ was \emph{hard-coded}
+to 128 (the historical b1..b128 bank), giving a scoring window of
+$[64, 192)$ --- exactly 128 samples --- while consecutive cubes
+stride by 192 samples.  Samples landing in $[192, 256)$ of one cube
+(equivalently $[0, 64)$ of the next) were silently never scored: a
+\emph{periodic 64-sample blind spot covering exactly one third of
+the data stream}.  Bursts whose apex landed there were either lost
+or reported as low-S/N, wide, off-DM ``wing'' candidates --- the
+leakage of the bowtie's flanks into the valid window.  The fix
+derives $n_\mathrm{kernel\_max\_t}$ from the widest kernel actually
+present in the bank (64 for the production b1..b64 ladder), so the
+window becomes $[32, 224)$ --- exactly 192 samples, seamlessly
+tiling the 192-sample cadence with zero gap and zero double-count.
+A 12-point injection phase sweep across the cadence confirmed
+uniform apex recovery (11/12 matched; the single miss was a matcher
+TTL bookkeeping artifact, with the apex correctly detected).
 
 \paragraph{Per-kernel local-max NMS.}  Each $c_k / s_k$ is compared to
 its $\pm 1$-neighbours along $(t, f_\mathrm{dm}, l, m)$; local maxima
-above the threshold $\theta = \codeword{c1.snr_min} = 9.0$
+above the threshold $\theta = \codeword{c1.snr_min} = 12.0$
 (production) become raw candidates.  Multi-resolution overlap is
 allowed at this stage --- the merger collapses redundant detections
 next.
@@ -1126,9 +1141,31 @@ $c$ vs. each already-accepted survivor $s$ in the same cube,
 and $c$ is suppressed iff \emph{all three} predicates fire.  The OR
 over $(l, m)$ deliberately tracks the cross-shaped DSA-core PSF: a
 real burst leaves twin survivors at small $\Delta l$ or small
-$\Delta m$, and we want those merged into a single peak.  Defaults
-locked 2026-05-21: $\mathrm{lm\_cells}=3$, $\mathrm{dm\_max\_trials}=2$,
+$\Delta m$, and we want those merged into a single peak.  Production
+values: $\mathrm{lm\_cells}=5$, $\mathrm{dm\_max\_trials}=2$,
 $t_\mathrm{frac}=1.0$.
+
+\paragraph{Candidate sky coordinates (2026-06-08, commits
+\codeword{cf13ca0}, \codeword{3b2526d}).}  Each surviving candidate's
+pixel indices are converted to sky offsets $(l, m)$ in radians
+before emit.  A systematic injection sweep across image quadrants
+exposed --- and fixed --- three compounded conventions that had made
+reported coordinates wrong since bring-up: (i) the image is
+\emph{centred} (the fftshift fold places the phase centre at pixel
+$N_\mathrm{grid}/2$, not pixel 0), so the conversion uses
+$\mathrm{centred\_pix\_offset} = p - N_\mathrm{grid}/2$ rather than
+wrapping raw indices into $[0, \mathrm{FOV})$; (ii) the cube axes are
+\emph{transposed} relative to the naming --- the candidate row index
+runs along sky $m$ and the column index along sky $l$, so
+$l_\mathrm{rad}$ is computed from the $m$-pixel and vice versa; and
+(iii) the pixel scale is no longer a hard-coded $1.5\times10^{-4}$
+rad but is derived at startup from the actual gridding geometry,
+$\Delta l = 1/(N_\mathrm{grid}\,\Delta u_\lambda)$ with
+$\Delta u_\lambda$ from \codeword{compute_top_of_band_cell_lambda}
+($1.2404\times10^{-4}$ rad at the production cell size --- the
+hard-coded value was 21\,\% off).  Post-fix, injections at all four
+signed $(\pm l, \pm m)$ quadrants report their injected coordinates
+to within a pixel.
 
 \paragraph{Per-(search,~gpu) C1 emit.}  Survivors are pushed onto a
 bounded asyncio queue and fed onto a persistent TCP connection to
@@ -1199,7 +1236,7 @@ paragraph).  Through M7.6 the formula was
 with the class-default \codeword{cube_sample_period_us=131.072},
 which made the per-specnum step $131.072/16 = 8.192\,\mu$s.  But
 \codeword{slot.specnum_start} is in \emph{search-sample} units
-(advances by \codeword{cube_cadence_samples = 128} per cube at the
+(advances by \codeword{cube_cadence_samples = 192} per cube at the
 production op-point, where one search sample is
 $t_\mathrm{int}^\mathrm{search} = 1048.576\,\mu$s), so the true
 per-specnum step is the FULL search-sample period
@@ -1256,23 +1293,22 @@ ceiling into swap and wedged the nodes within 15--20 minutes:
       rejects them at attach.
 \item The pinned-host cube retention ring (Section~\ref{sec:c2}
       cube dump).  At depth 24 (the M7.6 ``deepen for stale C2''
-      value) the per-node retention grows toward
-      $2\!\times\!24\!\times\!0.8 = 38$\,GiB; combined with the
-      pre-shrink 39\,GiB rxring this consistently flipped the node
-      ceiling into swap.  Lowered to
-      \codeword{cube_ring_depth=16} (the pre-M7.6 value,
-      $\approx 2.2$\,s retention) for a $2\!\times\!16\!\times\!0.8
-      = 25.6$\,GiB pinned footprint.  Per-cube size is 855\,MiB
-      (the prior "$3.2$\,GiB" comment was 4$\times$ wrong; on-disk
-      dumps confirm 855\,MB).
+      value) the per-node retention grew toward 38\,GiB; combined
+      with the pre-shrink 39\,GiB rxring this consistently flipped
+      the node ceiling into swap.  First lowered to depth 16, then
+      to the current \codeword{cube_ring_depth=12} when the M7.7
+      big-block op-point grew the per-cube pinned slab to
+      $\approx 1.06$\,GiB ($256\times34\times256^2$ fp16).  Twelve
+      cubes $\times$ 192-sample cadence $\approx 2.4$\,s of
+      retention per half.
 \end{itemize}
-Steady-state node ceiling $\approx 43$\,GiB (9.8 rxring + 25.6
-retention + $\sim$8 base), comfortably inside 93\,GiB, no swap,
-measured avail 56--61\,GiB.  Trade-off (per the user-directed
-\emph{discard rather than buffer} policy): on-sky C2 dump triggers
-that lag the live edge by $>$2.2\,s arrive \codeword{too_late} and
-are dropped.  Injection dumps (\codeword{inj_dump2.py}) target the
-observed event specnum and fire promptly, so they are unaffected.
+Steady-state node ceiling $\approx 43$\,GiB (9.8 rxring +
+$\sim$25 retention + $\sim$8 base), comfortably inside 93\,GiB, no
+swap.  Trade-off (per the user-directed \emph{discard rather than
+buffer} policy): on-sky C2 dump triggers that lag the live edge by
+$>$2.4\,s arrive \codeword{too_late} and are dropped.  Injection
+dumps target the observed event specnum and fire promptly, so they
+are unaffected.
 
 \paragraph{DM-smear floor and noise-color de-rating (2026-05-30 /
 2026-06-02).}  Two cooperating C1-side defenses block a class of
@@ -1467,38 +1503,54 @@ synchronised \codeword{utc_start} RFI warmup and is immune to the
 constant 0-row keepalive heartbeats; it is set once and never re-armed
 on reconnects.
 
+Because the warmup is a property of the \emph{corr} fleet, not of
+C2, a C2-only restart mid-run must not suppress another 180\,s of
+genuine triggers.  \codeword{_maybe_pre_expire_startup_grace}
+(2026-06-10) reads the fleet's
+\codeword{/mon/corr_rt/<cn>/corr_fast} heartbeats at C2 startup and
+disarms the grace immediately when the corr processes are
+demonstrably warm; the freshness window for ``warm'' was tightened
+from 30\,s to 8\,s after a \codeword{restart_all} race in which C2
+came up before \codeword{corr_fast} and stale monitor points
+incorrectly disarmed the grace.
+
 \paragraph{Cube dump.}  On a \codeword{dump_all_gpus} action, C2
-allocates an event name via the legacy
-\codeword{event.names.increment_name}, creates the
-\codeword{/dataz/dsa110/candidates/<name>/} directory tree, and
-broadcasts a \codeword{C2TriggerPacket} UDP datagram to every
+first consults the operator dump gate
+(\codeword{/cmd/c2/dumps_enabled}, written by the dashboard Control
+tab and cached for 200\,ms): when dumps are off, the criteria still
+evaluate and the hourly C2 CSV audit row is still written, but there
+is \emph{no} UDP fan-out, \emph{no} event directory and no plot
+scheduling, and the per-class holdoff is rolled back so the next
+genuine trigger after re-enable fires immediately.  Since
+2026-06-10 the per-event directory under
+\codeword{/dataz/dsa110/candidates/<name>/} is created \emph{only}
+when dumps are enabled and cube payloads actually land --- C2 no
+longer litters empty event trees during dumps-off observing.
+
+When enabled, C2 allocates an event name via the legacy
+\codeword{event.names.increment_name} and broadcasts a
+\codeword{C2TriggerPacket} UDP datagram to every
 \codeword{(search_node, gpu_half)} listener (port
 \codeword{11227+g}).  Each search-half looks up the cube whose
 \codeword{specnum} window covers the requested \codeword{event_specnum}
-in its $N$-slot pinned-host \codeword{CubeRetentionRing}.  M7.6
-deepened this 16$\to$24 after observing \codeword{too_late} misses on
-slow C2 windows; the 2026-05-31 memory tuning then \emph{shrank} it
-back to 16 after the 24-deep ring was demonstrated to grow into swap
-on the 93\,GiB search hosts (see below).  Each slot is
+in its $N$-slot pinned-host \codeword{CubeRetentionRing}
+(\codeword{cube_ring_depth=12}; each slot is
 $T_\mathrm{det}\!\times\!N_\mathrm{fdm}\!\times\!N_\mathrm{grid}^2\!\times\!2$
-bytes $= 192\!\times\!34\!\times\!256^2\!\times\!2 = 855$\,MiB fp16
-(the prior "$\approx 3.2$\,GiB" figure was 4$\times$ wrong; the
-on-disk dumps confirm 855\,MB).  At depth\,16 a search node holds
-$2\!\times\!16\!\times\!0.8 = 25.6$\,GiB of pinned cube retention
-$\approx 2.2$\,s, well inside the 9.8\,GiB rxring + 25.6\,GiB
-retention + $\sim$8\,GiB base $\approx 43$\,GiB node ceiling
-(measured: avail 56--61\,GiB, RSS 10.1\,GiB/half, cubes at full
-rate).  The half submits a \codeword{CubeDumpWriter} job to write an
-NPZ archive and a \codeword{cube_uploader} sidecar (M7.4 commit
-\codeword{8335fd7}) auto-rsyncs the per-event directory to h23
-immediately after the write completes; all 8 NPZs land under
-\codeword{/dataz/dsa110/candidates/<name>/cubes/}.
+bytes $= 256\!\times\!34\!\times\!256^2\!\times\!2 \approx
+1.06$\,GiB fp16, $\approx 2.4$\,s of retention per half).  The half
+submits a \codeword{CubeDumpWriter} job to write an NPZ archive and
+a \codeword{cube_uploader} sidecar auto-rsyncs the per-event
+directory to h23 immediately after the write completes; all 8 NPZs
+land under \codeword{/dataz/dsa110/candidates/<name>/cubes/}.  The
+T5 hardening bounds upload concurrency
+(\codeword{BoundedCubeUploader}) so a burst of triggers cannot fork
+an unbounded rsync swarm against the 93\,GiB hosts.
 
 \emph{Zero-copy slot-pinning} (M7.6, 2026-05-31, commit
 \codeword{4c4a9d2}).  The retention-ring's pinned host buffers are
-reused every \codeword{depth} cubes ($\sim$2.1\,s at depth\,16,
-$\sim$1.1\,s at depth\,8 --- both shorter than the $\sim$2\,s
-$\approx 855$\,MB NPZ \codeword{np.savez} serialize).  Naively the
+reused every \codeword{depth} cubes ($\sim$2.4\,s at depth\,12 ---
+comparable to the $\sim$2\,s $\approx 1$\,GiB NPZ
+\codeword{np.savez} serialize).  Naively the
 slot would be overwritten mid-dump and the writer's
 \codeword{peak_grid} reduction (taken first) would disagree with the
 cube bytes streamed out next-cube --- exactly the symptom that
@@ -1526,18 +1578,37 @@ rarely useful) with 48-hour retention, plus a derived
 always shows the last day in one experiment.
 
 \paragraph{Per-event PNGs (the C2 plot worker).}  A plot worker pool
-(\codeword{src/dsart/coinc/plotter.py}, run in a thread/queue inside
-the C2 service) renders four PNGs per event into the archive
-directory \codeword{Level2/plots/}: \codeword{dm_time_<name>.png}
-(burst-cube DM-vs-time waterfall, max-projected over $(l,m)$, with a
-crosshair at the detected $(t_\mathrm{peak},\DM_\mathrm{peak})$);
-\codeword{image_peak_<name>.png} (the single $(n_g,n_g)$ image plane
-at $(\DM_\mathrm{peak}, t_\mathrm{peak})$, with a reticle on the
-detected pixel); \codeword{lightcurve_<name>.png} (time series at the
-detected DM with a vertical reticle on the burst time); and
-\codeword{kernel_snrs_<name>.png} (per-kernel S/N bar plot).  The
-fourth panel does not need the cubes and is emitted even before the
-NPZs arrive on h23.
+(\codeword{src/dsart/coinc/plotter.py}, run in the process pool
+described above) renders four PNGs per event into the archive
+directory \codeword{Level2/plots/}:
+
+\begin{itemize}[topsep=2pt,itemsep=2pt]
+\item \codeword{dm_time_<name>.png} --- redesigned 2026-06-10 at
+      operator request into a \emph{single stacked waterfall}: every
+      dumped cube's $(T_\mathrm{det}, K)$ max-over-$(l,m)$ reduction
+      is stacked in \codeword{(search_node, gpu_half)} order, giving
+      contiguous fine-DM coverage over the entire searched range
+      (n01\,g0 owns the lowest trials, n13\,g1 the highest), so the
+      full dispersion bowtie --- the apex in the owning half plus
+      the tails in the non-owning halves --- reads as one figure.
+      Each fine-DM row is robustly re-normalised (median/MAD over
+      time) into $\sigma$ units, because each row's baseline is an
+      extreme-value statistic of its image plane and the Layer-1/2
+      calibrations differ slightly across halves.  Dashed lines mark
+      half boundaries; a red crosshair marks the detected
+      $(t_\mathrm{peak}, \DM_\mathrm{peak})$ and an independent
+      white $\times$ marks the \emph{data apex} (global max of the
+      normalised stack) --- a separation between the two is a
+      one-glance detector-health diagnostic.
+\item \codeword{image_peak_<name>.png} --- the single $(n_g, n_g)$
+      image plane at $(\DM_\mathrm{peak}, t_\mathrm{peak})$, with a
+      reticle on the detected pixel and an inner-region zoom panel.
+\item \codeword{lightcurve_<name>.png} --- time series at the
+      detected DM with a vertical reticle on the burst time.
+\item \codeword{kernel_snrs_<name>.png} --- per-kernel S/N bar plot;
+      this panel does not need the cubes and is emitted even before
+      the NPZs arrive on h23.
+\end{itemize}
 
 The plotter does \emph{not} pick the panel coordinates from
 \codeword{cube.argmax}: the dumped cube is dominated by steady
@@ -1550,16 +1621,234 @@ alongside the trigger.  The metadata fixes the owning
 \codeword{(search_node, gpu_half)} cube, the fine-DM index, and the
 $(l_\mathrm{pix}, m_\mathrm{pix})$ pixel; only the burst time is
 recovered from the cube data, as the argmax of the DM-sliced light
-curve.  Because the writer's stored \codeword{peak_grid} array has
-been observed to disagree with the cube payload, the plotter
-re-reduces \codeword{cube.max(axis=(2,3))} on the single burst cube;
-the other seven NPZs are never opened, so each event costs one
-$\approx\!855$\,MB mmap read instead of eight.  The same
-metadata-driven selection lets \codeword{plotter.regenerate_recent_events}
+curve.  The stacked-waterfall redesign requires reducing \emph{all}
+eight NPZs (one sequential mmap-backed read each, $\sim$8.5\,GB per
+event cold); the uncompressed-NPZ layout lets the plotter
+memory-map each cube (\codeword{_mmap_npz_array}) rather than
+loading it, so the working set per reduction stays $\sim$25\,MB.
+The same metadata-driven selection lets
+\codeword{plotter.regenerate_recent_events}
 (exposed as a \codeword{python -m dsart.coinc.plotter} CLI) rebuild
 correct plots for any archived event with no live state, given just
 the on-disk \codeword{C1_window} CSV.
 
+
+% =============================================================================
+\section{Statistics and noise estimation}
+\label{sec:stats}
+
+This section collects, in one place, the complete statistical chain
+that turns raw correlated voltages into the calibrated S/N value a
+candidate carries to C2.  The chain has five rungs:
+
+\begin{center}
+\fbox{\parbox{0.93\linewidth}{\small
+\textbf{The noise chain.}\quad
+(1)~corr-side noise shaping: Stokes-I formation, chan-sum,
+static-sky subtraction, int8 requantisation;\quad
+(2)~\textbf{Layer-1}: per-cube, per-fine-DM global $\sigma$
+normalisation of the image cube;\quad
+(3)~\textbf{Layer-2}: per-kernel EMA $\sigma_k$ normalisation of the
+boxcar scores;\quad
+(4)~decode-time statistics: thresholds, NMS, physical-plausibility
+and noise-colour filters;\quad
+(5)~end-to-end empirical calibration: the injection-derived constant
+$K$ that anchors the whole chain to Jy\,ms.
+}}
+\end{center}
+
+\subsection{Corr-side noise shaping}
+
+\paragraph{Stokes-I and chan-sum.}  Each visibility sample entering
+the gridder is a sum over 2 polarisations, $\sim$30--33 native time
+samples and 8 native channels --- $\gtrsim 500$ independent
+complex-voltage products --- so by the central limit theorem the
+per-cell visibility noise is very nearly complex Gaussian, even
+though the underlying 4-bit voltages are coarsely quantised.  This
+Gaussianity is the foundation everything downstream relies on.
+
+\paragraph{Static-sky subtraction penalty.}  The
+\codeword{StaticSkyMean} subtraction (Section~\ref{sec:corrfast})
+removes the per-uv-cell mean of the previous $W_\mathrm{ssky}=8$
+blocks.  Subtracting an independent noisy estimate adds variance:
+\[
+   \mathrm{Var}\bigl[G - \overline{G}_{W}\bigr]
+   = \sigma^2\Bigl(1 + \tfrac{1}{W_\mathrm{ssky}}\Bigr)
+   = 1.125\,\sigma^2,
+\]
+a $\sqrt{1.125}\approx 6\,\%$ noise inflation --- the price of
+coherent sky removal at a 1\,s timescale.  Because the subtraction
+is strictly causal (current block excluded), a burst never subtracts
+itself; a burst \emph{does} linger in the window for the following
+$\sim$1\,s, depressing the local mean by at most $1/8$ of its
+amplitude --- relevant only to back-to-back injections at the same
+position, which is why calibration probes rotate positions
+(Section~\ref{sec:inject-calibration}).
+
+\paragraph{Requantisation.}  The cint8 wire format quantises each
+(coarse-DM, time) tile by its own max, eq.~(\ref{eq:requant}).
+For a Gaussian tile the max of $\sim$5800 cells sits near
+$4\sigma$--$5\sigma$, so the quantisation step is
+$\approx 4.5\sigma/127 \approx \sigma/28$, adding
+$\Delta^2/12 \approx (\sigma/28)^2/12$ of noise power ---
+a $\sim$0.005\,\% sensitivity hit, negligible.  Max-scaling makes
+the quantiser saturation-free by construction: a bright burst
+raises the scale for its own tile rather than clipping.
+
+\subsection{Layer-1: image-plane normalisation}
+
+Layer-1 (Section~\ref{sec:layer1}) estimates one $\sigma$ per
+(cube, fine-DM trial) by iterated $\sigma$-clipping: three rounds of
+[estimate median and std, reject $|x - \mathrm{med}| > 3\sigma$]
+over a 10\,000-cell subsample of the
+$[T_\mathrm{det}, 256, 256]$ slab.  Design points:
+
+\begin{itemize}[topsep=2pt,itemsep=2pt]
+\item \emph{Why per-fine-DM:} the fine-DM combiner sums the same 16
+      chgroup slabs with different alignments, so the per-trial
+      variance differs only through the (now eliminated) coverage
+      structure and through genuine sky/RFI leakage, which varies
+      with DM alignment.  A per-trial $\sigma$ absorbs both.
+\item \emph{Why clipped:} a burst, an injection, or an RFI flash
+      occupies $\ll 1\,\%$ of the slab; 3 rounds of $3\sigma$
+      clipping reject it from the estimate, so a bright event does
+      not deflate its own S/N.  For a pure Gaussian the $3\sigma$
+      clip biases $\hat\sigma$ low by a known factor
+      ($\approx 0.973$); the bias is constant and absorbed into the
+      empirical $K$.
+\item \emph{Why a floor:} \codeword{layer1_sigma_floor=5e-3}
+      prevents division blow-up during the static-sky warm-up, when
+      the half-empty subtraction window makes the cube variance
+      collapse $\sim$200$\times$ below steady state.  Without the
+      floor the first post-start cubes manufactured $10^5\sigma$
+      false positives.
+\item \emph{Cold start:} \codeword{layer1_n_burnin_cubes=1} ---
+      each cube is normalised by its own estimate from the first
+      cube onward.  (A 5-cube median ring for replays of
+      RFI-contaminated archives remains available.)
+\end{itemize}
+
+After Layer-1 the cube is, by construction, unit-variance per trial
+under the null hypothesis; all structure remaining is either signal
+or non-Gaussianity.
+
+\subsection{Layer-2: score normalisation}
+
+Each boxcar kernel $k$ integrates $w_k$ image samples, so under
+white noise the raw score std grows as $\sqrt{w_k}$.  Rather than
+asserting the white-noise scaling analytically, Layer-2
+(\codeword{src/dsart/noise_norm/layer2.py::Layer2State}) measures
+$\sigma_k$ empirically per kernel on the cube interior (a Welford
+burn-in over the first \codeword{layer2_n_burnin=8} cubes, then the
+EMA of eq.~\ref{eq:layer2} with $\tau_\sigma = 30$\,s).  This
+automatically absorbs every deterministic departure from the
+white-noise law: residual time correlation from dispersion
+alignment, the fp16 rounding floor, the PSF-induced spatial
+correlation, and any per-half calibration drift.  Updates are gated
+on cube validity (\codeword{layer2_valid_min_fraction=0.9} of cells
+must be valid) and the result is clamped from below by
+\codeword{layer2_sigma_floor=0.5} so a pathological cube can never
+depress the divisor enough to blow up the S/N.
+
+\paragraph{Clamp and escape (T1, 2026-06-07/09).}  The EMA is the
+pipeline's memory, and memory can be poisoned.  A single
+high-energy cube (bright RFI, an injection, a dump-storm transient)
+inflates the measured $\sigma_k$; absorbed at full weight it
+de-sensitises the following $\sim\tau_\sigma$ of data --- the
+``candidate counter freeze'' failure mode observed live on
+2026-06-07.  Production therefore rejects any per-kernel update
+whose post-EMA $\sigma_k$ would exceed
+$\codeword{layer2_sigma_max_ratio}=4.0$ times the previous value
+($\sigma_k$ holds at its prior value and \codeword{n_clamped_high}
+increments), bounding the inflation a single anomalous cube can
+cause.  The dual failure mode --- a \emph{genuine} upward step in
+the noise floor that the bare clamp would forever refuse to follow
+(observed 2026-06-09 as two kernels clamping on every cube for
+hours, with S/N inflated against a stuck-low divisor) --- is handled
+by \codeword{layer2_clamp_escape_cubes}\,$= 64$: a kernel clamped on
+64 \emph{consecutive} cubes ($\approx 13$\,s at the production
+cadence) rebaselines, jumping $\sigma_k$ directly to the live
+estimate on the next cube.  Transients shorter than the escape
+window remain fully clamped.  Per-kernel clamp/escape counters and
+$s_k$ values roll up to \codeword{/mon/search_rt/<cn>/noise/<g>}
+and Grafana.
+
+\paragraph{Interior margin.}  $\sigma_k$ is measured only on
+$t \in [n_\mathrm{kernel\_max\_t}/2,\; T_\mathrm{det} -
+n_\mathrm{kernel\_max\_t}/2)$, the same window the decoder scans, so
+the estimate and the scores it normalises see identical boundary
+conditions.
+
+\subsection{Decode-time statistics}
+
+A candidate is a local maximum of $c_k/s_k$ over the
+$(t, f_\mathrm{dm}, l, m)$ neighbourhood exceeding
+$\theta = 12.0$.  The trials budget per cube per half is
+\[
+   N_\mathrm{trials} \approx
+   192 \times 34 \times 254^2 \times 7
+   \;\approx\; 2.9\times 10^{9},
+\]
+(192 scored samples, 34 trials, interior pixels, 7 kernels --- an
+overcount since the kernels and neighbouring pixels are strongly
+correlated).  For ideal Gaussian noise the $12\sigma$ tail
+probability is $\sim\!2\times10^{-33}$: the threshold is \emph{not}
+set by Gaussian statistics but by the empirical non-Gaussian tail
+--- RFI leakage, calibration transients and fp16 artefacts ---
+observed on sky.  At $\theta=12$ with the M7.6/M7.7 filter stack the
+quiescent candidate rate is $\lesssim$ a few per cube per half,
+bounded above by the \codeword{max_candidates_per_block=8} meter.
+
+Between the threshold and the emit, three statistical filters
+(detailed in Section~\ref{sec:c1}) reshape the candidate stream: the
+DM-smear width floor (a candidate cannot be narrower than its own
+DM's intra-channel smearing), the noise-colour de-rating (the
+$\sigma$-clipped Layer-2 estimator under-estimates the noise of wide
+boxcars on smearing-correlated time series; the de-rating divides
+the S/N by the analytic inflation factor $\mathcal C_{w,L}$), and
+the width cap at 16 search samples.
+
+\subsection{fp16 numerics}
+
+The cube tensor is fp16 end-to-end on the search side (memory
+bandwidth is the binding constraint), with three protections:
+
+\begin{itemize}[topsep=2pt,itemsep=2pt]
+\item \emph{Post-imager clamp.}  \codeword{nan_to_num} replaces any
+      \codeword{inf}/\codeword{NaN} escaping the FFT with
+      $\pm\codeword{_FP16_CLIP_MAX} = \pm 60000$ (just inside the
+      fp16 max of 65504).  Without it, a single overflowed cell
+      propagates NaN through the cumsum and silently kills its
+      entire $(f_\mathrm{dm}, l, m)$ tile.
+\item \emph{Detector input clip} at $\pm 250\sigma$
+      (Section~\ref{sec:c1}) --- bounds what the boxcar cumsum can
+      accumulate, making the score finite for arbitrarily bright
+      inputs.  This defines the saturation rail that the
+      calibration ladder's saturation guard keys on
+      ($\mathrm{S/N}_\mathrm{obs} \ge 240 \Rightarrow$ no $K$
+      update).
+\item \emph{fp32 islands.}  The boxcar cumsum, the Layer-1/Layer-2
+      $\sigma$ estimates and the score comparisons run in fp32;
+      only the bulk cube storage and the FFT are fp16.
+\end{itemize}
+
+\subsection{End-to-end anchoring: the calibration constant $K$}
+
+The chain above guarantees \emph{relative} statistics (unit variance
+under the null) but says nothing absolute.  The injection system
+(Section~\ref{sec:inject}) closes the loop: a synthetic burst of
+known fluence $F$ and width $w$ yields an observed S/N, and the
+linear model $\mathrm{S/N} = K F/\sqrt{w}$
+(eq.~\ref{eq:kmodel}) is exact in both parameters --- linear in $F$
+because the injector adds voltage $\sqrt{F/w}$ and the imager
+correlates to power, and $\propto 1/\sqrt{w}$ by the radiometer law
+--- so a single matched probe per DM band measures $K$.  Live
+validation (2026-06-10): a DM-500 fluence sweep holds $K$ constant
+to $\pm 4\%$ over a $3.5\times$ fluence range, and a width grid
+$w\in\{2,4,8,16\}$ holds $K$ constant across widths.  The residual
+DM dependence of $K$ ($\sim\!4\!-\!7\times 10^4$ across bands) is
+the physical sensitivity loss of the discrete DM plan and smearing,
+quantified independently by the Monte-Carlo of \Cref{sec:mcloss}.
 
 % =============================================================================
 \section{Voltage injections}
@@ -1569,8 +1858,8 @@ End-to-end injection is the pipeline's continuous-on system test.  A
 synthetic FRB is added directly to the calibrated voltage timestream
 inside \codeword{corr_fast}, where it then propagates through every
 post-correlation algorithm the real sky goes through --- the GEMM,
-gridding, dedispersion, the static-sky IIR, requantisation, UDP
-transport, and the C1/C2 detector stack.  This is the only fleet
+gridding, dedispersion, the static-sky mean subtraction,
+requantisation, UDP transport, and the C1/C2 detector stack.  This is the only fleet
 exercise that closes the loop on \emph{absolute} sensitivity: the
 final S/N at C2 is compared against the injected fluence and the ratio
 calibrates the sensitivity constant $K$ used to translate operator
@@ -1595,7 +1884,8 @@ lands at the requested image-plane coordinates regardless of the
 calibration table; and an injected burst cannot be mistaken for
 narrowband CW and flagged out --- the desired behaviour for a
 pipeline-validation signal.  Static-sky subtraction, gridding,
-coarse-DM stage-1 and the search-side stack still see the injection.
+coarse-DM dedispersion and the search-side stack still see the
+injection.
 
 \subsection{Arming an injection}
 \label{sec:inject-arm}
@@ -1623,12 +1913,26 @@ arise:
         \codeword{/mon/corr_rt/<cg>/corr_fast} for every selected
         chgroup, takes
         $\max_\mathrm{cg}\,\mathrm{block\_specnum\_start} +
-        \mathrm{margin\_blocks}\times 2048$ (default 16-block margin),
-        and uses that value
-        (\codeword{control_store.compute_inject_apply_at},
-        \codeword{control_store.py:386--475}).  Stale corr\_fast
-        mon-points (\,$>\!10$\,s\,) are excluded from the max so a dark
-        node cannot pin the fleet behind its last reported block.
+        \mathrm{margin\_blocks}\times 2048$ (default \textbf{32-block}
+        margin, $\approx 4.3$\,s), and uses that value
+        (\codeword{control_store.compute_inject_apply_at}).  Stale
+        corr\_fast mon-points (\,$>\!10$\,s\,) are excluded from the
+        max so a dark node cannot pin the fleet behind its last
+        reported block.  Because corr\_fast publishes its monitor
+        point only every 16 blocks ($\sim$2.1\,s), the raw
+        \codeword{block_specnum_start} can be up to 2.1\,s stale; the
+        dashboard \emph{extrapolates} it forward by the monitor age
+        (at the known block rate) before adding the margin.  Before
+        this 2026-06-08 fix, the 16-block margin minus up-to-16-block
+        staleness left an effective lead of 0--2.1\,s, and commands
+        could arrive \emph{after} \codeword{apply_at} on the
+        high-frequency chgroups (whose dispersion delay is smallest)
+        --- producing partial-band injections that imaged as thin
+        narrow-band ``bowties''.  \codeword{OnlineInjector} now
+        counts \codeword{n_applied_clean} /
+        \codeword{n_applied_partial} / \codeword{n_never_applied} so
+        a late command is visible in the per-chgroup monitor stream
+        instead of silently truncating the band.
 \end{itemize}
 
 For each selected chgroup the dashboard then PUTs the same envelope to
@@ -1688,16 +1992,34 @@ the duration of its footprint:
         \nu_\mathrm{ch}^{-2} - \nu_\mathrm{top}^{-2}\bigr)$ converted
         to integer native-sample offsets
         (\codeword{build_dispersion_delay_table_ms()}, \codeword{online.py:381--422}).
-  \item \textbf{Unit-area profile vector.}  Gaussian or boxcar of
-        \codeword{width_samples} native samples
-        (\codeword{build_profile_vector()}, \codeword{online.py:425--485}).
-  \item \textbf{Peak amplitude.}
-        $A = \sqrt{|F| \,/\, w}\;$ where $F$ is the fluence in
-        Jy\,ms and $w$ is the width in native samples
-        (\codeword{online.py:683--685}); the sign of $A$ inherits the
+  \item \textbf{Profile vector} (\codeword{build_profile_vector()};
+        rewritten 2026-06-07, commit \codeword{5f19997d}).  The
+        cached vector is $\sqrt{\varphi(t)/g}$ where $\varphi$ is the
+        \emph{unit-peak} intrinsic shape ($\varphi(0)=1$; Gaussian
+        with FWHM $w$, or boxcar of full width $w$) and $g$ is the
+        family area-per-FWHM constant ($g = \sqrt{\pi/4\ln 2}\approx
+        1.0645$ for Gaussian, 1 for boxcar).
+  \item \textbf{Amplitude.}
+        $A = \sqrt{|F| \,/\, w}$ with $F$ the fluence in Jy\,ms and
+        $w$ the width in native samples; the sign of $A$ inherits the
         sign of $F$ so negative-fluence injections are supported for
         common-mode rejection tests.
 \end{enumerate}
+
+Together these implement the physical ``voltage $=$
+$\sqrt{\text{instantaneous flux}}$'' convention: the per-cell voltage
+is $\sqrt{F(t)}$ with $F(t) = \bigl(F/(w g)\bigr)\varphi(t)$ the
+instantaneous flux density, so after $\mathrm{conj}(V_i)V_j$
+correlation the dirty-image peak is in Jy and the matched-filter S/N
+follows the standard radiometer law
+$\mathrm{S/N}\propto F/\sqrt{w}$.  The previous convention
+normalised the profile to \emph{unit area}, which made the voltage
+amplitude scale as $1/w$ instead of $1/\sqrt{w}$ and the detected
+S/N fall as $F/w^{5/2}$ --- wide injections came out drastically
+fainter than requested, and the calibration constant $K$ was
+width-dependent.  Post-fix, $K$ is measured to be
+width-independent, which is what allows the calibration store to key
+on DM band alone (Section~\ref{sec:inject-calibration}).
 
 The pending dict is keyed by \codeword{inj_id} so duplicate arms with
 the same identifier are idempotent.
@@ -1749,8 +2071,8 @@ The mutation is a \codeword{torch.Tensor.add_} on the live fp16 voltage
 tensor; no copy or extra allocation, so the hook is RT-cost-neutral
 relative to the no-inject path.  The synthetic energy then enters the
 GEMM (\codeword{FastCorrKernel.compute_split}), Stokes-I sum,
-chan-sum, gridding, static-sky IIR, requantisation and UDP transport
-exactly like a real signal --- but \emph{not} the RFI flagger, since
+chan-sum, dedispersion, gridding, static-sky subtraction,
+requantisation and UDP transport exactly like a real signal --- but \emph{not} the RFI flagger, since
 that has already run upstream of the injection point in this block.
 
 \paragraph{Why post-cal (M7.4 Phase~8, 2026-05-28).}
@@ -1830,8 +2152,8 @@ cal scale) is retained, plus a logged
 \paragraph{Position in the pipeline.}  This post-cal voltage hook is
 the contract that lets injections exercise the whole post-correlation
 search-side algorithm: the GEMM, gridding, dedispersion, the
-static-sky IIR, the requantisation, the corner-turn, and the C1/C2
-detector stack.  An equivalent test path
+static-sky subtraction, the requantisation, the corner-turn, and the
+C1/C2 detector stack.  An equivalent test path
 \codeword{src/dsart/inject/cube_injection.py} adds energy directly to
 post-imager cubes for detector-only unit tests; it is \emph{not} on
 the hot path and is documented separately.
@@ -1846,9 +2168,10 @@ it against \emph{its own} corr\_fast service-start epoch.  Because the
 SNAP wire timestamps drive every chgroup's epoch consistently, the
 injection fires within one block on every node --- typically
 $\le\!125$\,ms apart, with the residual coming from watch-delivery
-latency.  The 16-block default margin used by the auto-arm path is
-$\gtrsim\!2.1$\,s, comfortably larger than any observed delivery
-spread.
+latency.  The 32-block default margin used by the auto-arm path is
+$\approx\!4.3$\,s (after the staleness extrapolation of
+Section~\ref{sec:inject-arm}), comfortably larger than any observed
+delivery spread.
 
 \paragraph{Specnum-epoch pitfall (corrected).}
 M7.4 Phase~6c.A surfaced a class of bug in which the dashboard used a
@@ -1878,7 +2201,31 @@ non-expired active injections and accepts the row when
 \end{align*}
 
 and the row's timestamp is within \codeword{ttl_s} of
-\codeword{fired_at_unix} (default TTL $=$ 60\,s).  When the row
+\codeword{fired_at_unix} (default TTL $=$ 60\,s).  Width is
+deliberately \emph{not} a match criterion: the injected width is in
+native samples while the C1 row's is in search samples, and DM
+smearing widens the observed core independently of the injected
+width.  Two quality gates bound the accepted S/N
+($6 \le \mathrm{S/N} \le 2000$) so junk rows and clip-rail artefacts
+cannot become ``best'' matches.
+
+\paragraph{Specnum proximity gate (2026-06-09).}  The TTL alone is
+far too coarse when probes fire $\sim$30--50\,s apart: every live
+\codeword{inj_id} would claim the same candidate, poisoning every
+$K_\mathrm{inferred}$ but the true one.  The matcher therefore also
+requires the row's \codeword{event_specnum} (search samples) to lie
+within \codeword{specnum_tol_samples}\,$= 4096$ ($\approx 4.3$\,s) of
+the injection's expected arrival
+$\codeword{apply_at_specnum}/\mathrm{SPP}$ (SPP = specnums per
+search sample); the tolerance covers the full dispersion sweep at
+DM\,2500 ($\sim$1300 samples) plus pipeline latency while rejecting
+anything from a different probe.  Because C1's specnum counter
+resets when the search fleet restarts, the gate falls back to a
+wall-clock comparison (the row's MJD against the injection's firing
+time) whenever the specnum epochs are inconsistent --- without the
+fallback, every post-restart injection failed to match.
+
+When the row
 improves the previously-seen best S/N for that injection,
 \codeword{_publish_match} writes
 \codeword{/mon/dsart/inject/matches/<inj_id>} with the new
@@ -1907,42 +2254,106 @@ out.
 \subsection{Bootstrap S/N calibration}
 \label{sec:inject-calibration}
 
-S/N calibration learns $K(\mathrm{DM\_bucket},\,w)$ empirically so
-that target-S/N injections can be issued without absolute Jy\,ms
-knowledge of the pipeline.  The model is
-\[
-   \mathrm{S/N}_\mathrm{observed} \;\approx\; K\,\sqrt{F\,/\,w}
-\]
-with $F$ in Jy\,ms and $w$ in native samples
-(\codeword{inject_calibration.py:14--19}).  Given a matched
-\codeword{MatchResult}, the inverse
-$K = \mathrm{S/N}_\mathrm{obs}\,\sqrt{w / F}$
-is computed in \codeword{compute_k_inferred}
-(\codeword{inject_match.py:332--351}) and stored on the
+S/N calibration learns $K(\mathrm{DM\ band})$ empirically so that
+target-S/N injections can be issued without absolute Jy\,ms knowledge
+of the pipeline.  The model (2026-06-10, \emph{linear} fluence model)
+is
+\begin{equation}
+   \mathrm{S/N}_\mathrm{observed} \;\approx\; K\,F\,/\sqrt{w}
+   \qquad\Longleftrightarrow\qquad
+   F = \mathrm{S/N}_\mathrm{target}\,\sqrt{w}\,/\,K,
+   \label{eq:kmodel}
+\end{equation}
+with $F$ in Jy\,ms and $w$ in native samples.  The linearity in $F$
+follows from the injector adding \emph{voltage} amplitude
+$\sqrt{F/w}$ while the imager works on correlated \emph{power}: the
+image-domain burst amplitude is $\propto F/w$ and the matched filter
+over $w$ samples recovers $\mathrm{S/N}\propto F/\sqrt{w}$.
+(The previous $\mathrm{S/N}\approx K\sqrt{F/w}$ voltage-domain model
+made target-S/N injections undershoot --- a requested S/N-20 came out
+below the C1 threshold and vanished.)  Confirmed live with a DM-500
+$w{=}4$ fluence sweep: $2\!\times\!10^{-4}\to 12.9\sigma$ through
+$7\!\times\!10^{-4}\to 44.1\sigma$, with $K = \mathrm{S/N}\sqrt{w}/F$
+constant to $\pm 4\%$.  Given a matched \codeword{MatchResult}, $K$
+is computed in \codeword{compute_k_inferred} and stored on the
 \codeword{best} record.
 
+The calibration store keys on DM band alone
+(\codeword{bucket = dm<round(DM/50)*50>}, e.g.\ \codeword{dm0500}):
+with the $\sqrt{F/w}$ injector convention the width dependence is
+exactly the analytic $\sqrt{w}$ of~(\ref{eq:kmodel}), verified
+width-independent on a $w\in\{2,4,8,16\}$ grid, so one probe at any
+width pins $K$ for the band.  $K$ does vary with DM band (the
+coarse+fine de-disperser path and the DM-smear losses differ), hence
+the per-band table.  Measured production values sit at
+$K\sim 4\!\times\!10^4$--$7\!\times\!10^4$ (e.g.\ $K\approx 6.8
+\times 10^4$ at DM 2500).
+
 A calibration probe is issued by
-\codeword{tools/dashboard/dsa_monitor/inject_calibration.fire_calibration_probe}
-(\codeword{inject_calibration.py:410--447}):
+\codeword{fire_calibration_probe_with_ladder}
+(\codeword{tools/dashboard/dsa_monitor/inject_calibration.py}):
 
 \begin{enumerate}
+  \item \textbf{Health precheck} (T6): a \codeword{HealthSnapshot}
+        verifies corr\_fast monitor freshness, search-half liveness
+        and C1$\to$C2 connectivity before firing, so a probe is never
+        burned against a half-up fleet.
   \item PUT a placeholder \codeword{/cnf/inject/active/<probe_inj_id>}
         so the matcher recognises the upcoming row.
   \item Call \codeword{control_inject_pulse} with a known fluence
-        (default 100\,Jy\,ms) and auto-arm.
+        (default $7\!\times\!10^{-4}$\,Jy\,ms at $w{=}4$ native
+        samples, gaussian) and auto-arm.
   \item Poll \codeword{/mon/dsart/inject/matches/<probe_inj_id>}
         every 0.5\,s for up to 30\,s.
   \item On match, read \codeword{best.K_inferred} (recomputed locally
         as a sanity check), then
         \codeword{CalibrationStore.put(bucket, K, ...)} writes
-        \codeword{/cnf/inject/snr_calibration/<bucket>} where
-        \codeword{bucket} is e.g.\ \codeword{dm0500_w0032}.
+        \codeword{/cnf/inject/snr_calibration/<bucket>}.
 \end{enumerate}
 
-Subsequent target-S/N injections at a matching DM/width bucket read
-the cached $K$ and convert
-$F = w \,(\mathrm{S/N}_\mathrm{target}/K)^2$
-\emph{before} broadcasting; corr\_fast never sees $K$ directly.
+\paragraph{S/N ladder, saturation guard, and position rotation.}
+Three defenses make unattended calibration reliable:
+\begin{itemize}[topsep=2pt,itemsep=2pt]
+\item \emph{Fluence ladder} (T7).  On \codeword{no_match} the probe
+      retries at $\{1, 2, 4\}\times$ the base fluence (capped at
+      \codeword{DEFAULT_MAX_PROBE_FLUENCE}\,$=10^{-3}$\,Jy\,ms), so a
+      band whose $K$ is lower than assumed still calibrates.  The
+      base fluence is deliberately $\sim$3 orders of magnitude below
+      fp16 saturation; the historical 100\,Jy\,ms base drove probes
+      \emph{into} saturation, which is why the old ladder never
+      rescued a \codeword{no_match}.
+\item \emph{Saturation guard.}  The detector clips its
+      $\sigma$-normalised input at $\pm 250\sigma$, so an observed
+      S/N at or above \codeword{SATURATION_OBSERVED_SNR}\,$=240$
+      carries no amplitude information; computing $K$ from it stores
+      garbage (observed live: a DM-1000 probe reported
+      $\mathrm{S/N}=250.25 \to K=14448$ vs.\ the true $\approx
+      3300$).  Saturated matches are refused and the ladder
+      \emph{descends} ($\times 1/4$ per step, max two descents)
+      until the probe lands on the linear part of the response.
+\item \emph{Position rotation.}  Successive auto-positioned probes
+      rotate through four $(\pm 0.009, \pm 0.009)$\,rad quadrant
+      positions.  A probe absorbed into the static-sky window (and
+      the detector's $\sigma_k$ EMA) locally suppresses/inflates the
+      response at its own (DM, pixel) for seconds-to-minutes;
+      re-firing at the same spot was the dominant cause of
+      back-to-back probe failures (live sweeps showed probes 45\,s
+      apart suppressing each other even at $10\times$ the fluence).
+      A 60\,s inter-attempt delay lets $\sigma_k$ partially
+      recover.
+\item \emph{Metering bypass} (T3, \codeword{CalProbeShadow}).  C2
+      mirrors the active probe set to the search halves so C1's
+      per-block candidate metering never sheds a calibration probe's
+      candidate during an RFI flood.
+\end{itemize}
+
+Subsequent target-S/N injections at a matching DM band read the
+cached $K$ and convert $F = \mathrm{S/N}_\mathrm{target}\sqrt{w}/K$
+\emph{before} broadcasting; corr\_fast never sees $K$ directly.  The
+Control tab refuses a target-S/N inject with HTTP 412 when no $K$
+exists for the band (any width is acceptable once the band is
+calibrated --- the width constraint was removed with the
+width-independent scheme).
 
 \subsection{Failure modes the code handles}
 
@@ -2832,26 +3243,50 @@ revamp plan (\codeword{dsa110-rt_revamp_*.plan.md}).
       SNR de-rating defenses (2026-05-30 / 2026-06-02); the search
       MJD clock fix (2026-06-01); and the slow-vis UVH5 time-anchor
       bridge (2026-06-02).
+\item \textbf{M7.7 (2026-06-02--10, real-time + correctness
+      campaign)}: Option~A coarse-DM consolidation onto the corr
+      side with the F34 2-block sliding window;
+      symmetric-shift padding for 100\,\% fine-DM coverage;
+      production DM plan v2 ($N_\mathrm{fine}=272$, $\theta=1.6$,
+      DM 100--2653); \codeword{StaticSkyMean} replacing the EMA
+      static-sky subtractor; the big-block op-point
+      ($T_\mathrm{det}=256$, cadence 192) with the fftshift fold and
+      the rfft imager --- a search half now sustains
+      $\sim$166\,ms/cube against the 201.3\,ms budget
+      ($\sim$17\,\% headroom); Layer-2 $\sigma_k$ clamp (T1) +
+      escape hatch; detector input clip (fp16 overflow hardening);
+      the wing-decode fix (dynamic \codeword{n_kernel_max_t},
+      closing a periodic 64-sample scoring blind spot);
+      candidate sky-coordinate fixes (centred layout, axis
+      transposition, exact \codeword{cell_lambda} pixel scale);
+      the injection-system overhaul ($\sqrt{\text{flux}}$ voltage
+      convention, linear $K$ model, width-independent per-DM-band
+      calibration, specnum proximity gate + wall-clock fallback,
+      saturation guard + descending ladder + position rotation,
+      32-block auto-arm margin with staleness extrapolation); the
+      T1--T8 robustness series (runtime-watch counters,
+      \codeword{CalProbeShadow} metering bypass,
+      \codeword{HealthSnapshot} pre-flight, bounded cube uploads,
+      C2 startup-grace pre-expiry); dumps-gated event directories;
+      and the C2 stacked-waterfall plotter.
 \end{itemize}
 
 \subsection{What is still pending}
 
 The M7.4 Phase plan (\codeword{docs/M7.4_PHASE_PLAN.md}) tracks the
-outstanding items.  As of 2026-06-02 the remaining work is:
+outstanding items.  As of 2026-06-10 the remaining work is:
 
 \begin{enumerate}[topsep=2pt,itemsep=2pt]
-\item \textbf{Phase 6c characterisation}: quantitative on-sky
-      post-injection recovery study (S/N + DM + width recovery
-      vs.\ ground truth) plus RFI-zero-fill quantification of the
-      total-power bias when the RFI flagger zeros a fraction $f$ of
-      cells in the same block as a burst.  The Phase~8 move of the
-      injection hook to post-cal makes this characterisation now
-      independent of the calibration table (Section~\ref{sec:inject}).
-      The 2026-05-31 reversal of the cal-gain-fold detour
-      (Section~\ref{sec:inject-synthesis}) closed an open question
-      on whether the injection ran in the right frame; the
-      \codeword{bare post-cal phasor} is now the production contract
-      and is what 6c should benchmark against.
+\item \textbf{Phase 6c characterisation}: the 2026-06-08--10
+      campaign delivered most of this --- fluence linearity
+      ($K$ constant to $\pm 4\%$ over $3.5\times$), width
+      independence ($w\in\{2,4,8,16\}$), a 12-point cadence phase
+      sweep (11/12 apex recovery post-wing-fix), four-quadrant
+      position recovery to within a pixel, and per-DM-band $K$
+      values across DM 150--2500.  Still open: RFI-zero-fill
+      quantification of the total-power bias when the flagger zeros
+      a fraction $f$ of cells in the same block as a burst, and a
+      systematic DM-recovery bias study against the v2 plan.
 \item \textbf{Slow-vis archive replay}: re-derive a sample of the
       legacy \codeword{calibration23} K-cal tables from the post-2026-05-30
       UVH5 archive (now anchored on correct timestamps; see
@@ -2882,12 +3317,12 @@ outstanding items.  As of 2026-06-02 the remaining work is:
 
 \subsection{Model}
 
-The DM plan is committed to the repository at
-\codeword{configs/dm_plan.npz}.  The v1 plan in this file has
-$N_\mathrm{fine}=690$, $N_\mathrm{coarse}=16$, $\DM_\mathrm{min}=0$,
-$\DM_\mathrm{max}=3000$\,pc\,cm$^{-3}$, and Levin tolerance
-$\theta=1.5$.  Adjacent fine-DM trial spacings sit in
-$[4.18,\,4.71]$\,pc\,cm$^{-3}$ across the whole range, essentially
+The production DM plan is
+\codeword{dm_plan_N8_dmmin100_tol1.6_v2.npz}:
+$N_\mathrm{fine}=272$, $N_\mathrm{coarse}=8$, $\DM_\mathrm{min}=100$,
+$\DM_\mathrm{max}=2653$\,pc\,cm$^{-3}$, and Levin tolerance
+$\theta=1.6$.  Adjacent fine-DM trial spacings sit in
+$[9.34,\,9.58]$\,pc\,cm$^{-3}$ across the whole range, essentially
 uniform.
 
 Consider a delta-function FRB at intrinsic DM $\DM_\mathrm{true}$.
@@ -2920,8 +3355,8 @@ where $\DM_\mathrm{trial}^\star$ is the closest fine-DM trial:
 This is the smear across the \emph{full} processed band introduced by
 incoherently dedispersing at the wrong DM.  At
 $\Delta\DM = 1\,$pc\,cm$^{-3}$ it is $\sim 0.57$\,ms; at the worst
-case $|\Delta\DM|=\theta\Delta\DM_\mathrm{spacing}/2 \approx 2.4$\,pc\,cm$^{-3}$
-it is $\sim 1.4$\,ms.
+case $|\Delta\DM|=\Delta\DM_\mathrm{spacing}/2 \approx
+4.7$\,pc\,cm$^{-3}$ it is $\sim 2.6$\,ms.
 
 The two add in quadrature.  The user-supplied formulae for the
 \emph{measured} and \emph{ideal} (perfectly matched DM) widths are
@@ -2941,15 +3376,15 @@ noise the S/N scales as $w^{-1/2}$, hence the S/N loss factor is
 We report the loss as both $\Delta\mathrm{SNR}_\mathrm{dB} = 10\log_{10}\eta$
 and a per-cent loss $1-\eta$.
 
-The DM-plan Levin tolerance $\theta=1.5$ implies a design-target loss
-of $\Delta\mathrm{SNR}_\mathrm{dB} = 10\log_{10}(1/\theta) = -1.76$\,dB
-$\approx 33\,\%$ S/N loss in the limit where channel smearing
+The DM-plan Levin tolerance $\theta=1.6$ implies a design-target loss
+of $\Delta\mathrm{SNR}_\mathrm{dB} = 10\log_{10}(1/\theta) = -2.04$\,dB
+$\approx 37\,\%$ S/N loss in the limit where channel smearing
 \emph{equals} DM-mismatch smearing at the spacing midpoint.
 
 \subsection{Monte-Carlo procedure}
 
 We draw $N=2\times 10^5$ values of $\DM_\mathrm{true}$ uniformly on
-$[0, 3000]$\,pc\,cm$^{-3}$, look up the closest fine-DM trial via a
+$[100, 2653]$\,pc\,cm$^{-3}$, look up the closest fine-DM trial via a
 nearest-neighbour search on the plan's \codeword{fine_dm} array,
 compute the two widths from \Cref{eq:wchan,eq:wmiss}, and form $\eta$
 from \Cref{eq:eta}.  We do this twice: once with the native channel
@@ -2966,23 +3401,29 @@ seeded for reproducibility.
 \begin{itemize}[topsep=2pt,itemsep=2pt]
 \item The fine-DM plan spacing is essentially uniform across the full
       DM range, so the $|\Delta\DM|$ distribution is uniform on $[0,
-      \,\Delta\DM_\mathrm{spacing}/2]$ with $\Delta\DM_\mathrm{spacing}\sim 4.5$\,pc\,cm$^{-3}$.
+      \,\Delta\DM_\mathrm{spacing}/2]$ with $\Delta\DM_\mathrm{spacing}\sim 9.4$\,pc\,cm$^{-3}$
+      (median $|\Delta\DM| = 2.36$, p99 $= 4.66$\,pc\,cm$^{-3}$).
 \item Because $w_\mathrm{chan} \propto \DM$ but $w_{\Delta\DM}$ is
-      independent of $\DM$, the loss is \emph{largest at small DM}
-      (where channel smearing is tiny so any mismatch dominates) and
-      drops to a few-per-cent floor at high DM.
+      independent of $\DM$, the loss is \emph{largest at the low end
+      of the searched range} (where channel smearing is smallest so
+      any mismatch dominates) and falls toward a floor at high DM.
+      Starting the plan at $\DM_\mathrm{min}=100$ deliberately cuts
+      off the catastrophic $\DM\lesssim 50$ tail that a 0-based plan
+      suffers.
 \end{itemize}
 
 In the production geometry (chan-sum 8, $\dnu = 244$\,kHz) the
-median S/N loss is \textbf{4.78\,\%} ($-0.21$\,dB), the
-worst-10-per-cent loss is \textbf{35.6\,\%} ($-1.91$\,dB), and the
-worst-1-per-cent (concentrated at $\DM < 50$\,pc\,cm$^{-3}$) reaches
-$\sim 78\,\%$ ($-6.7$\,dB).  The median is comfortably inside the
-design target of $-1.76$\,dB.
+median S/N loss is \textbf{17.6\,\%} ($-0.84$\,dB), the
+worst-10-per-cent loss is \textbf{51.9\,\%} ($-3.18$\,dB), and the
+worst-1-per-cent reaches $\sim 74\,\%$ ($-5.8$\,dB).  The median is
+comfortably inside the $\theta=1.6$ design target of $-2.04$\,dB;
+the tails reflect the coarser v2 trial spacing, accepted in exchange
+for the $2.5\times$ smaller per-GPU trial count that funds the
+real-time budget.
 
 In the native geometry (chan-sum 1, $\dnu = 30.5$\,kHz, used only
 during early commissioning / detector-bench replays) the median loss
-is \textbf{49.1\,\%} ($-2.93$\,dB).  This is far worse than the design
+is \textbf{66.1\,\%} ($-4.70$\,dB).  This is far worse than the design
 target and is the direct quantitative justification for the corr-side
 $8\times$ channel sum: the channel sum buys $\sqrt{8}\!\sim\!2.8\,$dB
 of headroom across the DM range simply by increasing
@@ -2991,9 +3432,9 @@ $w_\mathrm{chan}$ until it dominates the matched-filter width.
 \begin{figure}[ht]
 \centering
 \includegraphics[width=0.98\linewidth]{figs/dm_plan_snr_loss.pdf}
-\caption{Monte-Carlo S/N-loss summary against the committed v1 DM
+\caption{Monte-Carlo S/N-loss summary against the production v2 DM
 plan, $N=2\!\times\!10^5$ draws of $\DM_\mathrm{true}$ uniform on
-$[0, 3000]$\,pc\,cm$^{-3}$.
+$[100, 2653]$\,pc\,cm$^{-3}$.
 \textbf{(a)} Fine-DM trial spacing as a function of $\DM_\mathrm{trial}$.
 \textbf{(b)} Resulting $|\Delta\DM|$ distribution to the nearest
 trial; native and chan-sum-8 are identical because the trial grid is
@@ -3004,16 +3445,16 @@ geometry; the dotted horizontal line marks the search sample period.
 \textbf{(d, e)} S/N loss in dB and per cent, per-bin median (solid)
 $\pm$ 16/84 spread (shading) and worst-1\,\% tail (dashed); native
 $\dnu$ in green, production $\dnu$ in red.  The grey dotted line in (d)
-is the $\theta=1.5$ Levin design target ($-1.76$\,dB).
+is the $\theta=1.6$ Levin design target ($-2.04$\,dB).
 \textbf{(f)} Text summary.}
 \label{fig:mcloss}
 \end{figure}
 
 \begin{table}[ht]
 \centering
-\caption{Monte-Carlo S/N loss against the committed DM plan
-($N_\mathrm{fine}=690$, $\theta=1.5$, $\DM_\mathrm{min}=0$,
-$\DM_\mathrm{max}=3000$\,pc\,cm$^{-3}$).  The ``worst'' columns are the
+\caption{Monte-Carlo S/N loss against the production v2 DM plan
+($N_\mathrm{fine}=272$, $\theta=1.6$, $\DM_\mathrm{min}=100$,
+$\DM_\mathrm{max}=2653$\,pc\,cm$^{-3}$).  The ``worst'' columns are the
 $10\,\%$ and $1\,\%$ tails (most negative dB, largest per-cent).}
 \label{tab:mcloss}
 \small
@@ -3022,12 +3463,12 @@ $10\,\%$ and $1\,\%$ tails (most negative dB, largest per-cent).}
 Geometry           & median           & worst 10\,\%     & worst 1\,\% \\
 \midrule
 \multicolumn{4}{l}{\emph{Loss (dB)}} \\
-~~native, $\dnu = 30.5$\,kHz        & $-2.93$          & $-6.22$          & $-11.17$    \\
-~~production, $\dnu = 244$\,kHz     & $-0.21$          & $-1.91$          & $-6.66$     \\
+~~native, $\dnu = 30.5$\,kHz        & $-4.70$          & $-7.63$          & $-10.31$    \\
+~~production, $\dnu = 244$\,kHz     & $-0.84$          & $-3.18$          & $-5.80$     \\
 \midrule
 \multicolumn{4}{l}{\emph{Loss (per cent)}} \\
-~~native, $\dnu = 30.5$\,kHz        & $49.07\,\%$      & $76.14\,\%$      & $92.36\,\%$ \\
-~~production, $\dnu = 244$\,kHz     & $4.78\,\%$       & $35.59\,\%$      & $78.40\,\%$ \\
+~~native, $\dnu = 30.5$\,kHz        & $66.12\,\%$      & $82.76\,\%$      & $90.70\,\%$ \\
+~~production, $\dnu = 244$\,kHz     & $17.61\,\%$      & $51.88\,\%$      & $73.71\,\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -3044,20 +3485,20 @@ The model deliberately follows the user's stated formula
       ``ideal-versus-measured'' ratio toward unity at low DM (since
       $w_\mathrm{chan}$ is no longer the smallest contribution).
 \item The matched-filter floor at one $t_\mathrm{int}^\mathrm{search}$
-      sample ($\approx 524\,\mu$s).  Below that the boxcar bank
+      sample ($\approx 1049\,\mu$s).  Below that the boxcar bank
       cannot resolve a narrower pulse anyway, so $w_\mathrm{chan} <
       t_\mathrm{int}^\mathrm{search}$ does not buy any additional
-      S/N.  At $\DM<10$\,pc\,cm$^{-3}$ the production
-      $w_\mathrm{chan}\sim 10\,\mu$s is far below the floor and
-      $w_\mathrm{ideal}$ should be replaced by
+      S/N; $w_\mathrm{ideal}$ should be replaced by
       $\max(w_\mathrm{chan}, t_\mathrm{int}^\mathrm{search})$ if
-      one wants the absolute matched-filter S/N rather than
-      relative loss.
-\item The boxcar bank is discrete (\codeword{K_time}$\in\{1,2,\dots,128\}$,
-      \codeword{K_dm}$\in\{1,3,5,7\}$).  The closest matched filter
-      to a given width incurs an additional discretisation loss of
-      a few per cent on top of the dispersion-only loss reported
-      here.
+      one wants the absolute matched-filter S/N rather than the
+      relative loss --- this materially softens the reported
+      low-DM tail, since at $\DM \lesssim 800$ the channel smearing
+      is below the sample period anyway.
+\item The boxcar bank is discrete
+      (\codeword{K_time}$\in\{1,2,\dots,64\}$).  The closest matched
+      filter to a given width incurs an additional discretisation
+      loss of a few per cent on top of the dispersion-only loss
+      reported here.
 \item Pulse-profile and finite-bandwidth coherence effects (these
       are negligible at DSA-110's 187\,MHz band for incoherent
       dedispersion).
@@ -3067,6 +3508,7 @@ The model deliberately follows the user's stated formula
 % =============================================================================
 \section{Development pathway for adding intelligence to the C1 detector}
 \label{sec:c1path}
+\label{sec:c1v2}
 
 The v1 deterministic detector (\Cref{sec:c1}) is intentionally
 \emph{boring}: a separable conv-bank fed by an analytically
@@ -3266,9 +3708,10 @@ fresh decision:
 
 \begin{itemize}[topsep=2pt,itemsep=2pt]
 \item Putting a learned detector \emph{in place of} the corr-side
-      static-sky IIR (the v1 IIR is a guarantee-preserving
-      high-pass; replacing it with anything learned would couple
-      the corr and search nodes' state dicts in an unobservable way).
+      static-sky mean subtraction (the sliding mean is a
+      guarantee-preserving high-pass; replacing it with anything
+      learned would couple the corr and search nodes' state dicts in
+      an unobservable way).
 \item Replacing the v1 conv-bank with a single $K_\mathrm{img}$-only
       learned filter (this drops the explicit DM-and-width matching,
       which the deterministic bank gets for free at \codeword{boxcar_via_cumsum}

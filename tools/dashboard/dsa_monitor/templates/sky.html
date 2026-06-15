@@ -124,6 +124,12 @@
            displayed frame's FOV (brightest first).</p>
         <div id="sky-nvss">–</div>
 
+        <h3>Sidereal dump vetos (C2)</h3>
+        <p style="margin:4px 0;">Stationary (l,m) positions C2 is
+           currently suppressing dumps at (red circles on the frame,
+           labelled V1…). Cleared from the Control tab.</p>
+        <div id="sky-vetos">–</div>
+
         <h3>Fleet snapshot status</h3>
         <p>Which corr nodes (chgroups) have posted a snapshot recently.
            Updated on Refresh.</p>
@@ -176,6 +182,37 @@
                 "<th>RA (°)</th><th>Dec (°)</th></tr>" + rows + "</table>";
         } catch (e) {
             if (token === nvssToken) el.textContent = "source list error: " + e;
+        }
+    }
+
+    async function refreshVetos() {
+        const el = document.getElementById("sky-vetos");
+        try {
+            const r = await fetch("/sky/vetos");
+            const j = await r.json();
+            const regs = (j.regions || []);
+            const tolArcsec = (j.tol_arcsec || 0).toFixed(0);
+            if (!regs.length) {
+                el.textContent = "none active (tol " + tolArcsec + "\")";
+                return;
+            }
+            const now = Date.now() / 1000;
+            let rows = "";
+            regs.forEach(function (v, k) {
+                const lArcmin = (v.l_rad * 206264.8 / 60).toFixed(2);
+                const mArcmin = (v.m_rad * 206264.8 / 60).toFixed(2);
+                const ageH = ((now - (v.last_hit_unix || now)) / 3600).toFixed(1);
+                rows += "<tr><td>V" + (k + 1) + "</td><td>" + lArcmin +
+                    "</td><td>" + mArcmin + "</td><td>" + (v.n_hits || 0) +
+                    "</td><td>" + ageH + "</td></tr>";
+            });
+            el.innerHTML =
+                "<table><tr><th>#</th><th>l (')</th><th>m (')</th>" +
+                "<th>hits</th><th>age (h)</th></tr>" + rows + "</table>" +
+                "<p style='font-size:11px;'>tol " + tolArcsec +
+                "\", offsets from phase center.</p>";
+        } catch (e) {
+            el.textContent = "veto list error: " + e;
         }
     }
 
@@ -232,6 +269,7 @@
             slider.max = Math.max(0, frames.length - 1);
             count.textContent = frames.length + " frame(s)";
             show(frames.length - 1);              /* land on the newest */
+            refreshVetos();
         } catch (e) {
             meta.textContent = "frame list error: " + e;
         }

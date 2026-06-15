@@ -81,6 +81,11 @@ from ..coinc.names import EventNameAllocator
 from ..coinc.plotter import PlotWorker, enqueue_event
 from ..coinc.receiver import C1BatchReceiver
 from ..coinc.stats import ClusterStats, compute_stats
+from ..coinc.veto import (
+    ARCSEC_TO_RAD,
+    ClusterRateLimiter,
+    SiderealVetoRegistry,
+)
 from ..coinc.window import TimeWindow, WindowEntry
 
 __all__ = [
@@ -291,6 +296,37 @@ class CoincidencerConfig:
     dump_rate_max_per_window: int = 6
     dump_rate_window_s: float = 60.0
 
+    # 2026-06-14 C2 cluster-rate limiter (RFI-storm guard). Counts EVERY
+    # cluster the coincidencer evaluates (fleet-wide) in a sliding
+    # window; when the count reaches ``cluster_rate_max`` the sky is in
+    # an RFI storm and dump-triggering actions are suppressed until the
+    # rate falls back under the cap. 0 disables.
+    cluster_rate_window_s: float = 60.0
+    cluster_rate_max: int = 100
+
+    # 2026-06-14 sidereal (l, m) registry veto. Positions that keep
+    # producing dump-eligible clusters are almost always stationary RFI /
+    # continuum sources (real FRBs do not repeat at a fixed l,m). After
+    # ``sidereal_veto_min_hits`` dump-eligible clusters land within
+    # ``sidereal_veto_tol_arcsec`` spanning ``sidereal_veto_min_span_s``,
+    # the position is vetoed for ``sidereal_veto_expiry_s`` (rolling off
+    # the last hit). The registry persists to / loads from etcd so it
+    # survives a C2 restart, is published for the sky-monitor display,
+    # and is clearable from the dashboard Control tab.
+    #
+    # tol default 90" = 2 px at the new 45" Tee image scale (the spec's
+    # "~50\" / 2-px" was 2 px at the legacy ~25.6" grid; 2 px is the
+    # physically-motivated value and tracks the ~1-px centroid jitter of
+    # a stationary source).
+    sidereal_veto_enabled: bool = True
+    sidereal_veto_tol_arcsec: float = 90.0
+    sidereal_veto_min_hits: int = 3
+    sidereal_veto_min_span_s: float = 60.0
+    sidereal_veto_expiry_s: float = 86400.0
+    sidereal_veto_cnf_key: str = "/cnf/c2/sidereal_vetos"
+    sidereal_veto_mon_key: str = "/mon/c2/sidereal_vetos"
+    sidereal_veto_clear_key: str = "/cmd/c2/sidereal_vetos_clear"
+
     # Event-name allocator config.
     etcd_lastname_key: str = "/mon/corr/1/trigger"
     event_pkg_path: Optional[Path] = Path(
@@ -395,6 +431,34 @@ class CoincidencerConfig:
             dump_rate_window_s=float(
                 coinc.get("dump_rate_window_s", 60.0),
             ),
+            cluster_rate_window_s=float(
+                coinc.get("cluster_rate_window_s", 60.0),
+            ),
+            cluster_rate_max=int(coinc.get("cluster_rate_max", 100)),
+            sidereal_veto_enabled=bool(
+                coinc.get("sidereal_veto_enabled", True),
+            ),
+            sidereal_veto_tol_arcsec=float(
+                coinc.get("sidereal_veto_tol_arcsec", 90.0),
+            ),
+            sidereal_veto_min_hits=int(
+                coinc.get("sidereal_veto_min_hits", 3),
+            ),
+            sidereal_veto_min_span_s=float(
+                coinc.get("sidereal_veto_min_span_s", 60.0),
+            ),
+            sidereal_veto_expiry_s=float(
+                coinc.get("sidereal_veto_expiry_s", 86400.0),
+            ),
+            sidereal_veto_cnf_key=str(coinc.get(
+                "sidereal_veto_cnf_key", "/cnf/c2/sidereal_vetos",
+            )),
+            sidereal_veto_mon_key=str(coinc.get(
+                "sidereal_veto_mon_key", "/mon/c2/sidereal_vetos",
+            )),
+            sidereal_veto_clear_key=str(coinc.get(
+                "sidereal_veto_clear_key", "/cmd/c2/sidereal_vetos_clear",
+            )),
             etcd_lastname_key=str(coinc.get(
                 "etcd_lastname_key", "/mon/corr/1/trigger",
             )),
@@ -600,7 +664,38 @@ class CoincidencerService:
         # broadcasts, trimmed to the rolling window on each check.
         self._dump_fire_times: List[float] = []
 
+        # 2026-06-14 C2 cluster-rate limiter (RFI-storm guard): counts
+        # every evaluated cluster fleet-wide in a sliding window.
+        self._cluster_rate = ClusterRateLimiter(
+            window_s=config.cluster_rate_window_s,
+            max_clusters=config.cluster_rate_max,
+        )
+
+        # 2026-06-14 sidereal (l, m) registry veto.
+        self._veto = SiderealVetoRegistry(
+            tol_rad=config.sidereal_veto_tol_arcsec * ARCSEC_TO_RAD,
+            min_hits=config.sidereal_veto_min_hits,
+            min_span_s=config.sidereal_veto_min_span_s,
+            expiry_s=config.sidereal_veto_expiry_s,
+        )
+        self._veto_published_gen: int = -1
+        self._veto_clear_ts_applied: float = 0.0
+
         self._mon_store = _StoreWrapper(mock=mon_store)
+
+        # Load any persisted veto registry so it survives a C2 restart.
+        try:
+            doc = self._mon_store.get_dict(config.sidereal_veto_cnf_key)
+            n_loaded = self._veto.load_payload(doc)
+            if n_loaded:
+                _LOG.info(
+                    "sidereal veto registry: loaded %d region(s) from %s "
+                    "(%d active)",
+                    n_loaded, config.sidereal_veto_cnf_key,
+                    len(self._veto.active_regions()),
+                )
+        except Exception:  # noqa: BLE001
+            _LOG.exception("sidereal veto registry load failed (continuing)")
 
         # M7.4 Phase 6c: operator-controlled dump kill-switch. Wired
         # against the same DsaStore wrapper that drives the mon-points
@@ -672,6 +767,16 @@ class CoincidencerService:
             # A persistent rise here means a noisy source is hammering a
             # dump class -- check the C1 DM-smearing-floor filter / criteria.
             "dumps_rate_capped": 0,
+            # 2026-06-14: dump-eligible triggers suppressed by the C2
+            # cluster-rate limiter (RFI-storm guard, cluster_rate_max /
+            # cluster_rate_window_s).
+            "dumps_cluster_rate_limited": 0,
+            # 2026-06-14: dump-eligible triggers suppressed because the
+            # cluster (l,m) fell in an active sidereal veto region.
+            "dumps_sidereal_vetoed": 0,
+            # 2026-06-14: count of new sidereal veto regions promoted to
+            # active over the service lifetime.
+            "sidereal_vetos_added": 0,
             # M7.4 Phase 8c (2026-05-29): would-be triggers suppressed
             # because they fired inside the startup grace window (corr
             # RFI bandpass warmup leaks RFI -> false candidates that
@@ -946,6 +1051,9 @@ class CoincidencerService:
                 continue
             stats = compute_stats(members, gal_dm_max_los=gal_dm)
             self._counters["components_evaluated"] += 1
+            # RFI-storm guard: every evaluated cluster counts toward the
+            # sliding-window rate (checked at dump time in _fire).
+            self._cluster_rate.record()
             # Snapshot per-class holdoff state BEFORE evaluate (which
             # mutates ``_last_fired_at[name] = now`` on every match).
             # If the resulting trigger is suppressed by the dumps gate
@@ -1103,6 +1211,29 @@ class CoincidencerService:
             self._last_trigger_class = trigger_class.name
             self._last_event_mjd = stats.t_peak_mjd
 
+            # 2026-06-14: feed the sidereal (l,m) veto registry from EVERY
+            # dump-eligible cluster (independent of the dumps gate / other
+            # suppressions) so it keeps learning stationary-RFI positions
+            # during the dumps-off soak too. Then evaluate the two new
+            # guards so we can report how often each WOULD suppress even
+            # while the global dumps gate is off.
+            if self._config.sidereal_veto_enabled:
+                if self._veto.observe(stats.l_median, stats.m_median):
+                    self._counters["sidereal_vetos_added"] += 1
+                    _LOG.warning(
+                        "SIDEREAL VETO added: l=%.6g m=%.6g rad "
+                        "(n_active=%d, tol=%.0f\")",
+                        stats.l_median, stats.m_median,
+                        len(self._veto.active_regions()),
+                        self._config.sidereal_veto_tol_arcsec,
+                    )
+                sidereal_vetoed = self._veto.is_vetoed(
+                    stats.l_median, stats.m_median,
+                )
+            else:
+                sidereal_vetoed = False
+            cluster_rate_limited = self._cluster_rate.exceeded()
+
             # The hourly C2 CSV (csv_dir_c2, OUTSIDE the candidates
             # tree) is the unconditional audit trail. The per-event
             # directory under /dataz/dsa110/candidates is written ONLY
@@ -1116,6 +1247,44 @@ class CoincidencerService:
                 ),
                 now_utc=now_utc,
             )
+
+            # Sidereal (l,m) veto: a stationary RFI / continuum position.
+            # Suppress + roll back the per-class holdoff so a genuine
+            # (non-vetoed) trigger of this class still fires immediately.
+            # Checked before the global dumps gate so the soak logs show
+            # the veto working even while dumps are off.
+            if sidereal_vetoed:
+                self._counters["dumps_sidereal_vetoed"] += 1
+                self._criteria.restore_last_fired_at(
+                    trigger_class.name, prev_holdoff,
+                )
+                _LOG.warning(
+                    "DUMP SIDEREAL-VETOED class=%s name=%s n=%d "
+                    "snr_max=%.2f dm_med=%.2f l=%.6g m=%.6g -- stationary "
+                    "(l,m) veto",
+                    trigger_class.name, event_name, stats.n_events,
+                    stats.snr_max, stats.dm_median,
+                    stats.l_median, stats.m_median,
+                )
+                return
+
+            # Cluster-rate limiter: the sky is in an RFI storm
+            # (fleet-wide cluster rate over the cap). Suppress the
+            # dump-triggering action; holdoff stays advanced (transient
+            # volume guard, like the dump-rate cap).
+            if cluster_rate_limited:
+                self._counters["dumps_cluster_rate_limited"] += 1
+                _LOG.warning(
+                    "DUMP RATE-LIMITED class=%s name=%s n=%d snr_max=%.2f "
+                    "dm_med=%.2f (cluster rate %d >= %d / %.0fs) -- "
+                    "skipping broadcast",
+                    trigger_class.name, event_name, stats.n_events,
+                    stats.snr_max, stats.dm_median,
+                    self._cluster_rate.count(),
+                    self._config.cluster_rate_max,
+                    self._config.cluster_rate_window_s,
+                )
+                return
 
             if not dumps_enabled:
                 # Suppressed path: NO UDP fan-out, NO event dir, NO
@@ -1385,11 +1554,51 @@ class CoincidencerService:
             self._discard_partial_event_dir(name)
             self._discarded_events[name] = now_mono
 
+    def _sync_veto_registry(self) -> None:
+        """Per-tick veto-registry housekeeping: honour an operator clear
+        command, expire stale regions, and publish/persist to etcd when
+        the registry changed. Best-effort; never raises into the loop."""
+        try:
+            # 1. Operator clear command (dashboard Control tab). Mirrors
+            #    the dumps-gate command pattern: a newer ``ts`` than the
+            #    last we applied triggers a full wipe.
+            clr = self._mon_store.get_dict(self._config.sidereal_veto_clear_key)
+            if isinstance(clr, Mapping):
+                ts = clr.get("ts")
+                if (
+                    isinstance(ts, (int, float))
+                    and float(ts) > self._veto_clear_ts_applied
+                ):
+                    n = self._veto.clear()
+                    self._veto_clear_ts_applied = float(ts)
+                    _LOG.warning(
+                        "sidereal veto registry CLEARED by operator "
+                        "(actor=%s, dropped %d region(s))",
+                        clr.get("actor", "?"), n,
+                    )
+            # 2. Expire stale regions (rolling 24h off last hit).
+            self._veto.expire()
+            # 3. Publish + persist when the registry changed.
+            if self._veto.generation != self._veto_published_gen:
+                self._mon_store.put_dict(
+                    self._config.sidereal_veto_mon_key,
+                    self._veto.to_payload(),
+                )
+                self._mon_store.put_dict(
+                    self._config.sidereal_veto_cnf_key,
+                    self._veto.to_full_payload(),
+                )
+                self._veto_published_gen = self._veto.generation
+        except Exception:  # noqa: BLE001
+            _LOG.exception("sidereal veto registry sync failed (continuing)")
+
     async def _mon_publish_loop(self) -> None:
         try:
             while True:
                 await asyncio.sleep(self._config.mon_publish_interval_s)
+                self._sync_veto_registry()
                 gal_dm = self._current_gal_dm_max_los()
+                _veto_active = self._veto.active_regions()
                 payload: Dict[str, Any] = {
                     "ts_unix": time.time(),
                     "uptime_s": time.time() - self._started_unix,
@@ -1410,6 +1619,12 @@ class CoincidencerService:
                     "dumps_gate_reads": int(self._dumps_gate.read_count),
                     "dumps_gate_fails": int(self._dumps_gate.fail_count),
                     "inject_match": self._inject_matcher.snapshot(),
+                    "cluster_rate": int(self._cluster_rate.count()),
+                    "cluster_rate_max": int(self._config.cluster_rate_max),
+                    "sidereal_vetos_active": len(_veto_active),
+                    "sidereal_veto_tol_arcsec": float(
+                        self._config.sidereal_veto_tol_arcsec
+                    ),
                 }
                 self._mon_store.put_dict(
                     self._config.mon_etcd_key, payload,

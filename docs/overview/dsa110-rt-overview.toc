@@ -9,8 +9,8 @@
 \contentsline {subsection}{\numberline {4.1}From SNAP to \texttt {fada}}{5}{subsection.4.1}%
 \contentsline {subsection}{\numberline {4.2}\texttt {corr\_slow}: full-resolution visibilities}{6}{subsection.4.2}%
 \contentsline {subsection}{\numberline {4.3}\texttt {corr\_fast}: RFI, calibration, GEMM, gridding, dedispersion}{6}{subsection.4.3}%
-\contentsline {subsection}{\numberline {4.4}RFI flagging}{8}{subsection.4.4}%
-\contentsline {paragraph}{(1) Static \texttt {flagants.dat}.}{8}{subsection.4.4}%
+\contentsline {subsection}{\numberline {4.4}RFI flagging}{9}{subsection.4.4}%
+\contentsline {paragraph}{(1) Static \texttt {flagants.dat}.}{9}{subsection.4.4}%
 \contentsline {paragraph}{(2) Spectral kurtosis (SK)}{9}{subsection.4.4}%
 \contentsline {paragraph}{(3) Bandpass outlier}{9}{equation.7}%
 \contentsline {paragraph}{(4) Group outlier}{9}{equation.7}%
@@ -18,101 +18,119 @@
 \contentsline {section}{\numberline {5}The search-side hot path}{9}{section.5}%
 \contentsline {subsection}{\numberline {5.1}Receive, dequantise, ring}{9}{subsection.5.1}%
 \contentsline {subsection}{\numberline {5.2}Fine-DM combiner and dedispersion}{9}{subsection.5.2}%
-\contentsline {paragraph}{Stage-2-absent escape hatch and the chgroup-TOP fix (2026-05-29).}{10}{equation.9}%
+\contentsline {paragraph}{Option A and symmetric-shift padding (2026-06-02/03).}{10}{equation.9}%
+\contentsline {paragraph}{Historical note: the chgroup-TOP fix (2026-05-29).}{10}{equation.9}%
 \contentsline {subsection}{\numberline {5.3}Imager}{10}{subsection.5.3}%
-\contentsline {subsection}{\numberline {5.4}Layer-1 noise normalisation}{10}{subsection.5.4}%
-\contentsline {paragraph}{Coverage correction (M7.4.2, 2026-05-27).}{10}{subsection.5.4}%
+\contentsline {subsection}{\numberline {5.4}Layer-1 noise normalisation}{11}{subsection.5.4}%
+\contentsline {paragraph}{Fused Layer-1 and the coverage-correction retirement.}{11}{subsection.5.4}%
 \contentsline {subsection}{\numberline {5.5}Detector v1 (the C1 path)}{11}{subsection.5.5}%
-\contentsline {paragraph}{Per-kernel local-max NMS.}{11}{equation.12}%
-\contentsline {paragraph}{Cross-kernel merger}{11}{equation.12}%
-\contentsline {paragraph}{Per-(search,~gpu) C1 emit.}{11}{equation.13}%
-\contentsline {paragraph}{C1$\to $C2 metering and width cap (M7.6).}{12}{equation.13}%
-\contentsline {paragraph}{Real-time freshness re-seek (M7.6).}{12}{equation.13}%
-\contentsline {paragraph}{Sample-period / MJD clock fix (2026-06-01, commit \text {\ttfamily \small cb1bdcf}).}{12}{equation.13}%
-\contentsline {paragraph}{Observing dec via \text {\ttfamily \small CUSTOMDEC} (2026-05-30, commit \text {\ttfamily \small fd87af5}).}{12}{equation.13}%
-\contentsline {paragraph}{Memory shrink (2026-05-31, commits \text {\ttfamily \small 14a0b74}, \text {\ttfamily \small 666bcf5}).}{13}{equation.13}%
-\contentsline {paragraph}{DM-smear floor and noise-color de-rating (2026-05-30 / 2026-06-02).}{13}{equation.13}%
-\contentsline {subsection}{\numberline {5.6}C2 coincidencer on h23}{14}{subsection.5.6}%
-\contentsline {paragraph}{Connected components, time-only.}{14}{subsection.5.6}%
-\contentsline {paragraph}{Trigger criteria.}{14}{equation.14}%
-\contentsline {paragraph}{Process-pool plotter and dump-rate cap (2026-05-30 stall fix).}{14}{equation.14}%
-\contentsline {paragraph}{Startup grace (Phase 8c, 2026-05-29).}{15}{equation.14}%
-\contentsline {paragraph}{Cube dump.}{15}{equation.14}%
-\contentsline {paragraph}{Per-event PNGs (the C2 plot worker).}{16}{equation.14}%
-\contentsline {section}{\numberline {6}Voltage injections}{16}{section.6}%
-\contentsline {paragraph}{Where in the corr-side pipeline the injection lands.}{16}{section.6}%
-\contentsline {subsection}{\numberline {6.1}Arming an injection}{17}{subsection.6.1}%
-\contentsline {subsection}{\numberline {6.2}Per-node receipt}{17}{subsection.6.2}%
-\contentsline {subsection}{\numberline {6.3}Synthesis in the hot path}{18}{subsection.6.3}%
-\contentsline {paragraph}{Why post-cal (M7.4 Phase~8, 2026-05-28).}{18}{Item.19}%
-\contentsline {paragraph}{Cal-gain-fold detour and reversal (2026-05-30 $\to $ 2026-05-31).}{19}{Item.19}%
-\contentsline {paragraph}{Position in the pipeline.}{19}{Item.19}%
-\contentsline {subsection}{\numberline {6.4}Fleet timing and cross-node coordination}{19}{subsection.6.4}%
-\contentsline {paragraph}{Specnum-epoch pitfall (corrected).}{19}{subsection.6.4}%
-\contentsline {subsection}{\numberline {6.5}Match at C2}{20}{subsection.6.5}%
-\contentsline {paragraph}{TTL eviction.}{20}{subsection.6.5}%
-\contentsline {subsection}{\numberline {6.6}Bootstrap S/N calibration}{20}{subsection.6.6}%
-\contentsline {subsection}{\numberline {6.7}Failure modes the code handles}{20}{subsection.6.7}%
-\contentsline {section}{\numberline {7}Bring-up and cold-start}{21}{section.7}%
-\contentsline {subsection}{\numberline {7.1}Kernel JIT warmup (Phase~8b)}{21}{subsection.7.1}%
-\contentsline {subsection}{\numberline {7.2}Capture/consumer ordering (Phase~8b deadlock fix)}{22}{subsection.7.2}%
-\contentsline {subsection}{\numberline {7.3}C1$\leftrightarrow $C2 keepalive and startup grace (Phase~8c/8d)}{22}{subsection.7.3}%
-\contentsline {subsection}{\numberline {7.4}Operator lifecycle banner}{23}{subsection.7.4}%
-\contentsline {subsection}{\numberline {7.5}Cold-start resilience patches}{23}{subsection.7.5}%
-\contentsline {subsection}{\numberline {7.6}Start-time housekeeping (\texttt {cleanup\_nodes\_for\_start})}{23}{subsection.7.6}%
-\contentsline {section}{\numberline {8}The slow-vis path and \texttt {meridian\_fringestop}}{24}{section.8}%
-\contentsline {paragraph}{What the consumer does.}{24}{section.8}%
-\contentsline {paragraph}{The math.}{25}{Item.32}%
-\contentsline {paragraph}{How it is wired (M7.4 Phase~9, 2026-05-30).}{25}{equation.15}%
-\contentsline {section}{\numberline {9}Control and monitoring}{26}{section.9}%
-\contentsline {subsection}{\numberline {9.1}The orchestrator}{26}{subsection.9.1}%
-\contentsline {subsection}{\numberline {9.2}Per-block monitoring services}{27}{subsection.9.2}%
-\contentsline {paragraph}{\texttt {capture\_control}}{27}{subsection.9.2}%
-\contentsline {paragraph}{\texttt {meridian\_fringestop} heartbeat}{27}{subsection.9.2}%
-\contentsline {paragraph}{\texttt {rfi\_monitor\_export}}{27}{subsection.9.2}%
-\contentsline {paragraph}{\texttt {dsa\_monitor}}{28}{subsection.9.2}%
-\contentsline {subsection}{\numberline {9.3}InfluxDB pusher and Grafana}{29}{subsection.9.3}%
-\contentsline {section}{\numberline {10}Development pathway}{29}{section.10}%
-\contentsline {subsection}{\numberline {10.1}Where the project has been}{29}{subsection.10.1}%
-\contentsline {subsection}{\numberline {10.2}What is still pending}{30}{subsection.10.2}%
-\contentsline {section}{\numberline {11}Monte-Carlo S/N loss as a function of DM}{31}{section.11}%
-\contentsline {subsection}{\numberline {11.1}Model}{31}{subsection.11.1}%
-\contentsline {subsection}{\numberline {11.2}Monte-Carlo procedure}{32}{subsection.11.2}%
-\contentsline {subsection}{\numberline {11.3}Results}{32}{subsection.11.3}%
-\contentsline {subsection}{\numberline {11.4}Caveats}{32}{subsection.11.4}%
-\contentsline {section}{\numberline {12}Development pathway for adding intelligence to the C1 detector}{33}{section.12}%
-\contentsline {subsection}{\numberline {12.1}Phase~I: PSF-matched image kernels}{33}{subsection.12.1}%
-\contentsline {subsection}{\numberline {12.2}Phase~II: PSF-aware (l, m) merger geometry}{33}{subsection.12.2}%
-\contentsline {subsection}{\numberline {12.3}Phase~III: TriggerCondition extensions}{33}{subsection.12.3}%
-\contentsline {subsection}{\numberline {12.4}Phase~IV: a learned detector v2}{34}{subsection.12.4}%
-\contentsline {subsection}{\numberline {12.5}Phase~V: dedispersion-domain RFI features}{34}{subsection.12.5}%
-\contentsline {subsection}{\numberline {12.6}Phase~VI: multi-pulse and DM--position joint priors}{35}{subsection.12.6}%
-\contentsline {subsection}{\numberline {12.7}Suggested order, gating and risks}{35}{subsection.12.7}%
-\contentsline {subsection}{\numberline {12.8}What \emph {not} to do}{35}{subsection.12.8}%
-\contentsline {section}{\numberline {13}References and source-of-truth files}{35}{section.13}%
-\contentsline {paragraph}{Legacy reference.}{36}{section.13}%
-\contentsline {section}{\numberline {A}Etcd key catalog}{37}{section.A}%
-\contentsline {paragraph}{S1 --- Orchestrator command verb.}{37}{section.A}%
-\contentsline {paragraph}{S2 --- Service heartbeat.}{37}{section.A}%
-\contentsline {paragraph}{S3 --- Routine rollup.}{37}{section.A}%
-\contentsline {paragraph}{S4 --- Inject command envelope.}{37}{section.A}%
-\contentsline {paragraph}{S5 --- Audit row.}{38}{section.A}%
-\contentsline {paragraph}{Capture (\S A.1) --- \text {\ttfamily \small /mon/corr_rt/<cn>/capture/<udp_port>}.}{38}{section.A}%
-\contentsline {paragraph}{RFI (\S A.2) --- \text {\ttfamily \small /mon/corr_rt/<cn>/rfi}.}{38}{section.A}%
-\contentsline {paragraph}{Corr\_fast per-block (\S A.3) --- \text {\ttfamily \small /mon/corr_rt/<chgroup>/corr_fast}.}{38}{section.A}%
-\contentsline {paragraph}{Corr\_fast readiness (\S A.4) --- \text {\ttfamily \small /mon/corr_rt/<cn>/corr_fast_ready}.}{39}{section.A}%
-\contentsline {paragraph}{Meridian liveness (\S A.5) --- \text {\ttfamily \small /mon/corr_rt/<cn>/meridian_ready}.}{39}{section.A}%
-\contentsline {paragraph}{B.1 \text {\ttfamily \small compute/<half>} (M7.6 C1$\to $C2 metering).}{39}{section.A}%
-\contentsline {paragraph}{G.1 \text {\ttfamily \small /mon/dsart/inject/matches/<inj_id>}.}{41}{section.A}%
-\contentsline {paragraph}{G.2 \text {\ttfamily \small inject_match} sub-dict on /mon/c2/h23.}{42}{section.A}%
-\contentsline {paragraph}{H.1 \text {\ttfamily \small /cmd/c2/dumps_enabled}.}{42}{section.A}%
-\contentsline {paragraph}{H.2 Verb-value conventions.}{42}{section.A}%
-\contentsline {paragraph}{I.1 \text {\ttfamily \small /cnf/pipeline_rt} and \text {\ttfamily \small /cnf/search_rt}.}{42}{section.A}%
-\contentsline {paragraph}{I.2 \text {\ttfamily \small /cnf/inject/active/<inj_id>}.}{42}{section.A}%
-\contentsline {paragraph}{I.3 \text {\ttfamily \small /cnf/inject/snr_calibration/<bucket>}.}{43}{section.A}%
-\contentsline {paragraph}{J.1 Search-cube ring \text {\ttfamily \small /mon/search/<search_cn>/<gpu_half>/ring}.}{43}{section.A}%
-\contentsline {paragraph}{J.2 Dumps-toggle audit \text {\ttfamily \small /mon/audit/control/dumps_toggle/<unix_ms>}.}{43}{section.A}%
-\contentsline {paragraph}{J.3 SNAP arm / slow-vis time-anchor trio: \text {\ttfamily \small /mon/snap/1/utc_start_rt}, \text {\ttfamily \small /mon/snap/1/utc_start}, and \text {\ttfamily \small /mon/snap/1/armed_mjd}.}{43}{section.A}%
-\contentsline {paragraph}{J.4 Per-antenna hardware \text {\ttfamily \small /mon/ant/<ant_num>}.}{44}{section.A}%
-\contentsline {paragraph}{J.5 Legacy dev-only inject prefixes.}{44}{section.A}%
-\contentsline {paragraph}{J.6 Start-time housekeeping audit \text {\ttfamily \small /mon/audit/control/<iso_ts>} with \text {\ttfamily \small cmd=start_cleanup}.}{44}{section.A}%
+\contentsline {paragraph}{Input clip.}{12}{equation.11}%
+\contentsline {paragraph}{Scoring window and the wing-decode fix (2026-06-09, commit \text {\ttfamily \small 5fb853a}).}{12}{equation.12}%
+\contentsline {paragraph}{Per-kernel local-max NMS.}{12}{equation.12}%
+\contentsline {paragraph}{Cross-kernel merger}{12}{equation.12}%
+\contentsline {paragraph}{Candidate sky coordinates (2026-06-08, commits \text {\ttfamily \small cf13ca0}, \text {\ttfamily \small 3b2526d}).}{13}{equation.13}%
+\contentsline {paragraph}{Per-(search,~gpu) C1 emit.}{13}{equation.13}%
+\contentsline {paragraph}{C1$\to $C2 metering and width cap (M7.6).}{13}{equation.13}%
+\contentsline {paragraph}{Real-time freshness re-seek (M7.6).}{13}{equation.13}%
+\contentsline {paragraph}{Sample-period / MJD clock fix (2026-06-01, commit \text {\ttfamily \small cb1bdcf}).}{13}{equation.13}%
+\contentsline {paragraph}{Observing dec via \text {\ttfamily \small CUSTOMDEC} (2026-05-30, commit \text {\ttfamily \small fd87af5}).}{14}{equation.13}%
+\contentsline {paragraph}{Memory shrink (2026-05-31, commits \text {\ttfamily \small 14a0b74}, \text {\ttfamily \small 666bcf5}).}{14}{equation.13}%
+\contentsline {paragraph}{DM-smear floor and noise-color de-rating (2026-05-30 / 2026-06-02).}{14}{equation.13}%
+\contentsline {subsection}{\numberline {5.6}C2 coincidencer on h23}{15}{subsection.5.6}%
+\contentsline {paragraph}{Connected components, time-only.}{15}{subsection.5.6}%
+\contentsline {paragraph}{Trigger criteria.}{15}{equation.14}%
+\contentsline {paragraph}{Process-pool plotter and dump-rate cap (2026-05-30 stall fix).}{16}{equation.14}%
+\contentsline {paragraph}{Startup grace (Phase 8c, 2026-05-29).}{16}{equation.14}%
+\contentsline {paragraph}{Cube dump.}{17}{equation.14}%
+\contentsline {paragraph}{Per-event PNGs (the C2 plot worker).}{17}{equation.14}%
+\contentsline {section}{\numberline {6}Statistics and noise estimation}{18}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Corr-side noise shaping}{18}{subsection.6.1}%
+\contentsline {paragraph}{Stokes-I and chan-sum.}{18}{subsection.6.1}%
+\contentsline {paragraph}{Static-sky subtraction penalty.}{18}{subsection.6.1}%
+\contentsline {paragraph}{Requantisation.}{19}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Layer-1: image-plane normalisation}{19}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}Layer-2: score normalisation}{19}{subsection.6.3}%
+\contentsline {paragraph}{Clamp and escape (T1, 2026-06-07/09).}{19}{subsection.6.3}%
+\contentsline {paragraph}{Interior margin.}{20}{subsection.6.3}%
+\contentsline {subsection}{\numberline {6.4}Decode-time statistics}{20}{subsection.6.4}%
+\contentsline {subsection}{\numberline {6.5}fp16 numerics}{20}{subsection.6.5}%
+\contentsline {subsection}{\numberline {6.6}End-to-end anchoring: the calibration constant $K$}{20}{subsection.6.6}%
+\contentsline {section}{\numberline {7}Voltage injections}{21}{section.7}%
+\contentsline {paragraph}{Where in the corr-side pipeline the injection lands.}{21}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Arming an injection}{21}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Per-node receipt}{22}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Synthesis in the hot path}{23}{subsection.7.3}%
+\contentsline {paragraph}{Why post-cal (M7.4 Phase~8, 2026-05-28).}{23}{Item.19}%
+\contentsline {paragraph}{Cal-gain-fold detour and reversal (2026-05-30 $\to $ 2026-05-31).}{23}{Item.19}%
+\contentsline {paragraph}{Position in the pipeline.}{24}{Item.19}%
+\contentsline {subsection}{\numberline {7.4}Fleet timing and cross-node coordination}{24}{subsection.7.4}%
+\contentsline {paragraph}{Specnum-epoch pitfall (corrected).}{24}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Match at C2}{24}{subsection.7.5}%
+\contentsline {paragraph}{Specnum proximity gate (2026-06-09).}{25}{subsection.7.5}%
+\contentsline {paragraph}{TTL eviction.}{25}{subsection.7.5}%
+\contentsline {subsection}{\numberline {7.6}Bootstrap S/N calibration}{25}{subsection.7.6}%
+\contentsline {paragraph}{S/N ladder, saturation guard, and position rotation.}{26}{Item.24}%
+\contentsline {subsection}{\numberline {7.7}Failure modes the code handles}{26}{subsection.7.7}%
+\contentsline {section}{\numberline {8}Bring-up and cold-start}{27}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Kernel JIT warmup (Phase~8b)}{27}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Capture/consumer ordering (Phase~8b deadlock fix)}{27}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}C1$\leftrightarrow $C2 keepalive and startup grace (Phase~8c/8d)}{28}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}Operator lifecycle banner}{28}{subsection.8.4}%
+\contentsline {subsection}{\numberline {8.5}Cold-start resilience patches}{29}{subsection.8.5}%
+\contentsline {subsection}{\numberline {8.6}Start-time housekeeping (\texttt {cleanup\_nodes\_for\_start})}{29}{subsection.8.6}%
+\contentsline {section}{\numberline {9}The slow-vis path and \texttt {meridian\_fringestop}}{30}{section.9}%
+\contentsline {paragraph}{What the consumer does.}{30}{section.9}%
+\contentsline {paragraph}{The math.}{30}{Item.33}%
+\contentsline {paragraph}{How it is wired (M7.4 Phase~9, 2026-05-30).}{30}{equation.16}%
+\contentsline {section}{\numberline {10}Control and monitoring}{32}{section.10}%
+\contentsline {subsection}{\numberline {10.1}The orchestrator}{32}{subsection.10.1}%
+\contentsline {subsection}{\numberline {10.2}Per-block monitoring services}{33}{subsection.10.2}%
+\contentsline {paragraph}{\texttt {capture\_control}}{33}{subsection.10.2}%
+\contentsline {paragraph}{\texttt {meridian\_fringestop} heartbeat}{33}{subsection.10.2}%
+\contentsline {paragraph}{\texttt {rfi\_monitor\_export}}{33}{subsection.10.2}%
+\contentsline {paragraph}{\texttt {dsa\_monitor}}{33}{subsection.10.2}%
+\contentsline {subsection}{\numberline {10.3}InfluxDB pusher and Grafana}{34}{subsection.10.3}%
+\contentsline {section}{\numberline {11}Development pathway}{35}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Where the project has been}{35}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}What is still pending}{36}{subsection.11.2}%
+\contentsline {section}{\numberline {12}Monte-Carlo S/N loss as a function of DM}{37}{section.12}%
+\contentsline {subsection}{\numberline {12.1}Model}{37}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}Monte-Carlo procedure}{38}{subsection.12.2}%
+\contentsline {subsection}{\numberline {12.3}Results}{38}{subsection.12.3}%
+\contentsline {subsection}{\numberline {12.4}Caveats}{38}{subsection.12.4}%
+\contentsline {section}{\numberline {13}Development pathway for adding intelligence to the C1 detector}{39}{section.13}%
+\contentsline {subsection}{\numberline {13.1}Phase~I: PSF-matched image kernels}{39}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}Phase~II: PSF-aware (l, m) merger geometry}{39}{subsection.13.2}%
+\contentsline {subsection}{\numberline {13.3}Phase~III: TriggerCondition extensions}{40}{subsection.13.3}%
+\contentsline {subsection}{\numberline {13.4}Phase~IV: a learned detector v2}{40}{subsection.13.4}%
+\contentsline {subsection}{\numberline {13.5}Phase~V: dedispersion-domain RFI features}{40}{subsection.13.5}%
+\contentsline {subsection}{\numberline {13.6}Phase~VI: multi-pulse and DM--position joint priors}{41}{subsection.13.6}%
+\contentsline {subsection}{\numberline {13.7}Suggested order, gating and risks}{41}{subsection.13.7}%
+\contentsline {subsection}{\numberline {13.8}What \emph {not} to do}{41}{subsection.13.8}%
+\contentsline {section}{\numberline {14}References and source-of-truth files}{42}{section.14}%
+\contentsline {paragraph}{Legacy reference.}{43}{section.14}%
+\contentsline {section}{\numberline {A}Etcd key catalog}{43}{section.A}%
+\contentsline {paragraph}{S1 --- Orchestrator command verb.}{43}{section.A}%
+\contentsline {paragraph}{S2 --- Service heartbeat.}{43}{section.A}%
+\contentsline {paragraph}{S3 --- Routine rollup.}{43}{section.A}%
+\contentsline {paragraph}{S4 --- Inject command envelope.}{44}{section.A}%
+\contentsline {paragraph}{S5 --- Audit row.}{44}{section.A}%
+\contentsline {paragraph}{Capture (\S A.1) --- \text {\ttfamily \small /mon/corr_rt/<cn>/capture/<udp_port>}.}{44}{section.A}%
+\contentsline {paragraph}{RFI (\S A.2) --- \text {\ttfamily \small /mon/corr_rt/<cn>/rfi}.}{44}{section.A}%
+\contentsline {paragraph}{Corr\_fast per-block (\S A.3) --- \text {\ttfamily \small /mon/corr_rt/<chgroup>/corr_fast}.}{45}{section.A}%
+\contentsline {paragraph}{Corr\_fast readiness (\S A.4) --- \text {\ttfamily \small /mon/corr_rt/<cn>/corr_fast_ready}.}{45}{section.A}%
+\contentsline {paragraph}{Meridian liveness (\S A.5) --- \text {\ttfamily \small /mon/corr_rt/<cn>/meridian_ready}.}{45}{section.A}%
+\contentsline {paragraph}{B.1 \text {\ttfamily \small compute/<half>} (M7.6 C1$\to $C2 metering).}{45}{section.A}%
+\contentsline {paragraph}{G.1 \text {\ttfamily \small /mon/dsart/inject/matches/<inj_id>}.}{47}{section.A}%
+\contentsline {paragraph}{G.2 \text {\ttfamily \small inject_match} sub-dict on /mon/c2/h23.}{48}{section.A}%
+\contentsline {paragraph}{H.1 \text {\ttfamily \small /cmd/c2/dumps_enabled}.}{48}{section.A}%
+\contentsline {paragraph}{H.2 Verb-value conventions.}{48}{section.A}%
+\contentsline {paragraph}{I.1 \text {\ttfamily \small /cnf/pipeline_rt} and \text {\ttfamily \small /cnf/search_rt}.}{48}{section.A}%
+\contentsline {paragraph}{I.2 \text {\ttfamily \small /cnf/inject/active/<inj_id>}.}{49}{section.A}%
+\contentsline {paragraph}{I.3 \text {\ttfamily \small /cnf/inject/snr_calibration/<bucket>}.}{49}{section.A}%
+\contentsline {paragraph}{J.1 Search-cube ring \text {\ttfamily \small /mon/search/<search_cn>/<gpu_half>/ring}.}{49}{section.A}%
+\contentsline {paragraph}{J.2 Dumps-toggle audit \text {\ttfamily \small /mon/audit/control/dumps_toggle/<unix_ms>}.}{49}{section.A}%
+\contentsline {paragraph}{J.3 SNAP arm / slow-vis time-anchor trio: \text {\ttfamily \small /mon/snap/1/utc_start_rt}, \text {\ttfamily \small /mon/snap/1/utc_start}, and \text {\ttfamily \small /mon/snap/1/armed_mjd}.}{49}{section.A}%
+\contentsline {paragraph}{J.4 Per-antenna hardware \text {\ttfamily \small /mon/ant/<ant_num>}.}{50}{section.A}%
+\contentsline {paragraph}{J.5 Legacy dev-only inject prefixes.}{50}{section.A}%
+\contentsline {paragraph}{J.6 Start-time housekeeping audit \text {\ttfamily \small /mon/audit/control/<iso_ts>} with \text {\ttfamily \small cmd=start_cleanup}.}{50}{section.A}%
