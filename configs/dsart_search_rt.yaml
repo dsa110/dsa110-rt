@@ -674,6 +674,17 @@ coinc:
                                      # source regardless of candidate volume (the proximate cause of the C2
                                      # stall). Audit trail is still written for capped events; only the UDP
                                      # fan-out + plot scheduling are skipped. Set max=0 to disable the cap.
+  # 2026-06-15 broadband-RFI ("DM comb") veto. An impulsive terrestrial signal deposits power at every
+  # dispersion delay -> many trial DMs fire at the SAME (l,m)+time; the time-only clusterer splits the
+  # non-adjacent firing trials into several co-located clusters, so the per-cluster dm_iqr cap never sees
+  # the full spread. At dump time C2 scans the clusters in the window: if >= min_clusters sit within
+  # lm_tol_arcsec (box) and dt_s of the candidate AND their DM span exceeds dm_span_min_pc_cc, the dump is
+  # suppressed (holdoff rolled back). A single-DM repeater (pulsar) is safe -> its clusters share ~one DM.
+  dm_comb_veto_enabled: true
+  dm_comb_lm_tol_arcsec: 90.0        # 2 px at the 45" Tee image scale (matches the sidereal veto tol)
+  dm_comb_dt_s: 2.0                  # max time separation of comb fragments
+  dm_comb_min_clusters: 3            # >= this many co-located clusters to call it a comb (0 disables)
+  dm_comb_dm_span_min_pc_cc: 300.0   # required DM span (max-min) across the co-located clusters
   # Event-name allocator (event.names + etcd /mon/corr/1/trigger):
   etcd_lastname_key: "/mon/corr/1/trigger"
   event_pkg_path: "/home/ubuntu/proj/dsa110-shell/dsa110-event"

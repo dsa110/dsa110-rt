@@ -22,6 +22,22 @@ a ``dump_all_gpus`` action — they never create a trigger.
    survives a C2 restart, is published for the sky-monitor display, and
    is clearable from the dashboard Control tab. Uses wall-clock unix
    time (24 h expiry must survive process restarts).
+
+3. :func:`dm_comb_detected` — a broadband-RFI ("DM comb") veto. A real
+   dispersed burst occupies ONE dispersion measure (a single cluster,
+   possibly with a modest dm_iqr from adjacent trials). An impulsive
+   broadband terrestrial signal has power at every dispersion delay, so
+   it lights up many trial DMs *simultaneously at the same (l, m)* — and
+   because those firing DM trials are often non-adjacent, the time-only
+   connected-components clusterer splits them into several separate
+   clusters. The per-cluster dm_iqr cap therefore never sees the full
+   spread. This stateless predicate looks ACROSS the clusters currently
+   in the C2 window: if ``>= min_clusters`` of them sit within
+   ``lm_tol_rad`` (box metric) and ``dt_s`` of the candidate and their
+   DM span (max-min) exceeds ``dm_span_min``, the candidate is a comb
+   fragment and the dump is suppressed. Bright single-DM repeaters
+   (e.g. a pulsar) are NOT caught — all their clusters share ~one DM, so
+   the span condition never trips.
 """
 
 from __future__ import annotations
@@ -38,10 +54,63 @@ __all__ = [
     "ClusterRateLimiter",
     "VetoRegion",
     "SiderealVetoRegistry",
+    "dm_comb_detected",
     "ARCSEC_TO_RAD",
 ]
 
 ARCSEC_TO_RAD: float = math.pi / 180.0 / 3600.0
+
+
+# ---------------------------------------------------------------------------
+# Broadband-RFI ("DM comb") veto
+# ---------------------------------------------------------------------------
+
+
+def dm_comb_detected(
+    l_rad: float,
+    m_rad: float,
+    t_s: float,
+    sibling_clusters: "List[tuple]",
+    *,
+    lm_tol_rad: float,
+    dt_s: float,
+    min_clusters: int,
+    dm_span_min: float,
+) -> bool:
+    """True if ``(l_rad, m_rad, t_s)`` is part of a broadband DM comb.
+
+    ``sibling_clusters`` is an iterable of ``(l_rad, m_rad, dm_pc_cc,
+    t_s)`` 4-tuples describing EVERY cluster currently in the C2 window
+    (the candidate's own cluster is expected to be included — it matches
+    its own box at distance 0, so the caller need not special-case it).
+
+    The candidate is a comb fragment iff at least ``min_clusters``
+    clusters fall inside the ``lm_tol_rad`` (Chebyshev / box) +/- ``dt_s``
+    spatio-temporal box around it AND the DM span (max - min) across those
+    matched clusters exceeds ``dm_span_min``.
+
+    A real dispersed burst is a single (l, m, t, DM) peak, so it can
+    never gather ``>= min_clusters`` co-located clusters spanning a wide
+    DM range; a bright single-DM repeater (pulsar) gathers many clusters
+    but at ~one DM, so the span gate keeps it safe.
+    """
+    if min_clusters <= 0 or dm_span_min < 0.0:
+        return False
+    matched_dms: List[float] = []
+    for sib in sibling_clusters:
+        try:
+            sl, sm, sdm, st = sib
+        except (ValueError, TypeError):
+            continue
+        if (
+            abs(sl - l_rad) <= lm_tol_rad
+            and abs(sm - m_rad) <= lm_tol_rad
+            and abs(st - t_s) <= dt_s
+        ):
+            matched_dms.append(float(sdm))
+    if len(matched_dms) < min_clusters:
+        return False
+    return (max(matched_dms) - min(matched_dms)) > dm_span_min
 
 
 # ---------------------------------------------------------------------------

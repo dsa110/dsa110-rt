@@ -6,6 +6,7 @@ from dsart.coinc.veto import (
     ARCSEC_TO_RAD,
     ClusterRateLimiter,
     SiderealVetoRegistry,
+    dm_comb_detected,
 )
 
 
@@ -164,3 +165,78 @@ def test_veto_one_off_does_not_veto():
     assert not reg.is_vetoed(0.1, 0.1)
     assert reg.active_regions() == []
     assert len(reg.all_regions()) == 1
+
+
+# ---------------------------------------------------------------------------
+# dm_comb_detected
+# ---------------------------------------------------------------------------
+
+_LM_TOL = 90.0 * ARCSEC_TO_RAD
+
+
+def _comb_kw(**over):
+    kw = dict(
+        lm_tol_rad=_LM_TOL, dt_s=2.0, min_clusters=3, dm_span_min=300.0,
+    )
+    kw.update(over)
+    return kw
+
+
+def test_dm_comb_detected_broadband():
+    """7 co-located clusters spanning DM 165..1162 within 0.55 s -> comb
+    (the 2026-06-14 08:36:04 event)."""
+    l, m, t0 = 0.02, -0.01, 1000.0
+    dms = [165.0, 296.0, 430.0, 561.0, 800.0, 980.0, 1162.0]
+    sibs = [(l, m, dm, t0 + 0.08 * i) for i, dm in enumerate(dms)]
+    assert dm_comb_detected(l, m, t0, sibs, **_comb_kw())
+
+
+def test_dm_comb_single_dm_repeater_safe():
+    """Many co-located clusters at ~one DM (a bright pulsar) is NOT a
+    comb -> the DM-span gate keeps it safe."""
+    l, m, t0 = 0.02, -0.01, 1000.0
+    sibs = [(l, m, 158.0 + 5.0 * i, t0 + 0.05 * i) for i in range(8)]
+    assert not dm_comb_detected(l, m, t0, sibs, **_comb_kw())
+
+
+def test_dm_comb_isolated_burst_safe():
+    """A lone dispersed burst (its own cluster only) is never a comb."""
+    l, m, t0 = 0.02, -0.01, 1000.0
+    sibs = [(l, m, 700.0, t0)]
+    assert not dm_comb_detected(l, m, t0, sibs, **_comb_kw())
+
+
+def test_dm_comb_requires_min_clusters():
+    """Wide DM span but only 2 co-located clusters -> below min_clusters."""
+    l, m, t0 = 0.02, -0.01, 1000.0
+    sibs = [(l, m, 200.0, t0), (l, m, 900.0, t0 + 0.1)]
+    assert not dm_comb_detected(l, m, t0, sibs, **_comb_kw())
+
+
+def test_dm_comb_spatial_separation_excluded():
+    """Clusters far in (l,m) are not counted even with wide DM spread."""
+    l, m, t0 = 0.02, -0.01, 1000.0
+    far = m + 10.0 * _LM_TOL
+    sibs = [
+        (l, m, 200.0, t0),
+        (l, far, 600.0, t0 + 0.1),
+        (l, far, 1100.0, t0 + 0.2),
+    ]
+    assert not dm_comb_detected(l, m, t0, sibs, **_comb_kw())
+
+
+def test_dm_comb_temporal_separation_excluded():
+    """Clusters outside dt_s are not part of the same comb."""
+    l, m, t0 = 0.02, -0.01, 1000.0
+    sibs = [
+        (l, m, 200.0, t0),
+        (l, m, 600.0, t0 + 5.0),
+        (l, m, 1100.0, t0 + 9.0),
+    ]
+    assert not dm_comb_detected(l, m, t0, sibs, **_comb_kw())
+
+
+def test_dm_comb_disabled_by_zero_min_clusters():
+    l, m, t0 = 0.02, -0.01, 1000.0
+    sibs = [(l, m, 165.0 + 200.0 * i, t0 + 0.1 * i) for i in range(5)]
+    assert not dm_comb_detected(l, m, t0, sibs, **_comb_kw(min_clusters=0))

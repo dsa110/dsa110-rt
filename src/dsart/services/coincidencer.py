@@ -85,6 +85,7 @@ from ..coinc.veto import (
     ARCSEC_TO_RAD,
     ClusterRateLimiter,
     SiderealVetoRegistry,
+    dm_comb_detected,
 )
 from ..coinc.window import TimeWindow, WindowEntry
 
@@ -327,6 +328,23 @@ class CoincidencerConfig:
     sidereal_veto_mon_key: str = "/mon/c2/sidereal_vetos"
     sidereal_veto_clear_key: str = "/cmd/c2/sidereal_vetos_clear"
 
+    # 2026-06-15 broadband-RFI ("DM comb") veto. Impulsive terrestrial
+    # signals deposit power at every dispersion delay, lighting up many
+    # trial DMs at the SAME (l, m) and time. Because the firing trials are
+    # often non-adjacent, the time-only clusterer splits them into several
+    # separate clusters, so the per-cluster dm_iqr cap never sees the full
+    # spread. At dump time we scan the clusters currently in the C2 window:
+    # if >= dm_comb_min_clusters of them sit within dm_comb_lm_tol_arcsec
+    # (box) and dm_comb_dt_s of the candidate and their DM span exceeds
+    # dm_comb_dm_span_min_pc_cc, the dump is suppressed as a comb fragment.
+    # A single-DM repeater (pulsar) is safe: its clusters share ~one DM so
+    # the span gate never trips. 0 min_clusters disables.
+    dm_comb_veto_enabled: bool = True
+    dm_comb_lm_tol_arcsec: float = 90.0
+    dm_comb_dt_s: float = 2.0
+    dm_comb_min_clusters: int = 3
+    dm_comb_dm_span_min_pc_cc: float = 300.0
+
     # Event-name allocator config.
     etcd_lastname_key: str = "/mon/corr/1/trigger"
     event_pkg_path: Optional[Path] = Path(
@@ -459,6 +477,19 @@ class CoincidencerConfig:
             sidereal_veto_clear_key=str(coinc.get(
                 "sidereal_veto_clear_key", "/cmd/c2/sidereal_vetos_clear",
             )),
+            dm_comb_veto_enabled=bool(
+                coinc.get("dm_comb_veto_enabled", True),
+            ),
+            dm_comb_lm_tol_arcsec=float(
+                coinc.get("dm_comb_lm_tol_arcsec", 90.0),
+            ),
+            dm_comb_dt_s=float(coinc.get("dm_comb_dt_s", 2.0)),
+            dm_comb_min_clusters=int(
+                coinc.get("dm_comb_min_clusters", 3),
+            ),
+            dm_comb_dm_span_min_pc_cc=float(
+                coinc.get("dm_comb_dm_span_min_pc_cc", 300.0),
+            ),
             etcd_lastname_key=str(coinc.get(
                 "etcd_lastname_key", "/mon/corr/1/trigger",
             )),
@@ -777,6 +808,10 @@ class CoincidencerService:
             # 2026-06-14: count of new sidereal veto regions promoted to
             # active over the service lifetime.
             "sidereal_vetos_added": 0,
+            # 2026-06-15: dump-eligible triggers suppressed because the
+            # candidate is a fragment of a broadband DM comb (>= N
+            # co-located clusters spanning a wide DM range).
+            "dumps_dm_comb_vetoed": 0,
             # M7.4 Phase 8c (2026-05-29): would-be triggers suppressed
             # because they fired inside the startup grace window (corr
             # RFI bandpass warmup leaks RFI -> false candidates that
@@ -1157,6 +1192,38 @@ class CoincidencerService:
         """Record a dump broadcast against the rate-cap window."""
         self._dump_fire_times.append(time.monotonic())
 
+    def _dm_comb_vetoed(self, stats: ClusterStats) -> bool:
+        """True if ``stats`` is a fragment of a broadband DM comb.
+
+        Scans every cluster currently in the C2 window (all connected
+        components in the graph) and delegates the box / DM-span decision
+        to :func:`dsart.coinc.veto.dm_comb_detected`. Cheap because the
+        dump path is throttled by the per-class holdoff, so this runs at
+        most ~once per comb burst rather than per candidate.
+        """
+        if (
+            not self._config.dm_comb_veto_enabled
+            or self._config.dm_comb_min_clusters <= 0
+        ):
+            return False
+        siblings: List[tuple] = []
+        for comp in self._graph.components():
+            if not comp:
+                continue
+            cs = compute_stats(comp)
+            siblings.append((
+                cs.l_median, cs.m_median, cs.dm_median,
+                cs.t_peak_mjd * 86400.0,
+            ))
+        return dm_comb_detected(
+            stats.l_median, stats.m_median, stats.t_peak_mjd * 86400.0,
+            siblings,
+            lm_tol_rad=self._config.dm_comb_lm_tol_arcsec * ARCSEC_TO_RAD,
+            dt_s=self._config.dm_comb_dt_s,
+            min_clusters=self._config.dm_comb_min_clusters,
+            dm_span_min=self._config.dm_comb_dm_span_min_pc_cc,
+        )
+
     async def _fire(
         self,
         stats: ClusterStats,
@@ -1265,6 +1332,31 @@ class CoincidencerService:
                     trigger_class.name, event_name, stats.n_events,
                     stats.snr_max, stats.dm_median,
                     stats.l_median, stats.m_median,
+                )
+                return
+
+            # Broadband DM-comb veto: an impulsive terrestrial signal that
+            # lit up many trial DMs at this (l,m)+time, split by the
+            # time-only clusterer into several co-located clusters with a
+            # wide DM span. Suppress + roll back the per-class holdoff so a
+            # genuine (single-DM) trigger of this class still fires
+            # immediately afterwards.
+            if self._dm_comb_vetoed(stats):
+                self._counters["dumps_dm_comb_vetoed"] += 1
+                self._criteria.restore_last_fired_at(
+                    trigger_class.name, prev_holdoff,
+                )
+                _LOG.warning(
+                    "DUMP DM-COMB-VETOED class=%s name=%s n=%d snr_max=%.2f "
+                    "dm_med=%.2f l=%.6g m=%.6g -- broadband comb "
+                    "(>=%d clusters within %.0f\"/%.1fs, DM span >%.0f)",
+                    trigger_class.name, event_name, stats.n_events,
+                    stats.snr_max, stats.dm_median,
+                    stats.l_median, stats.m_median,
+                    self._config.dm_comb_min_clusters,
+                    self._config.dm_comb_lm_tol_arcsec,
+                    self._config.dm_comb_dt_s,
+                    self._config.dm_comb_dm_span_min_pc_cc,
                 )
                 return
 
@@ -1624,6 +1716,12 @@ class CoincidencerService:
                     "sidereal_vetos_active": len(_veto_active),
                     "sidereal_veto_tol_arcsec": float(
                         self._config.sidereal_veto_tol_arcsec
+                    ),
+                    "dm_comb_veto_enabled": bool(
+                        self._config.dm_comb_veto_enabled
+                    ),
+                    "dm_comb_dm_span_min_pc_cc": float(
+                        self._config.dm_comb_dm_span_min_pc_cc
                     ),
                 }
                 self._mon_store.put_dict(
