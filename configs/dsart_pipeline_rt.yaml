@@ -16,6 +16,16 @@
 #      same; called out here because new readers (a diagnostic tap, for
 #      example) MUST bump r before being added.
 #
+#   3. bada is ALSO multi-reader (r=2) as of the spectral-line (SPL)
+#      work. Reader 1 is always meridian_fringestop (the production
+#      slow-vis fringe-stopper). Reader 2 is EXACTLY ONE of two
+#      mutually-exclusive routines selected per-node at `start` from
+#      /cnf/spectral_line: meridian_fringestop_spl (when this sub-band
+#      has SPL enabled) or bada_null_drain (when it does not). Keeping
+#      the reader count constant at r=2 means corr_slow's writer never
+#      stalls waiting on an absent second reader regardless of the SPL
+#      toggle — the no-op drain stands in when SPL is off.
+#
 # Buffer byte/block math is physics-pinned by the legacy block layout —
 # see configs/config_corr.yaml comments for the derivation. Do NOT edit
 # without also editing the consumer services.
@@ -45,7 +55,7 @@ buffers:
   - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
   - {k: eada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 1)
   - {k: fada, b: 301989888, n: 70,  c: 1, r: 2}   # 288 MiB x 70 = 9.4 s merged voltage (slow + fast both read)
-  - {k: bada, b:  28606464, n: 300, c: 1, r: 1}   # 27.3 MiB x 300 = 40 s slow-vis (meridian_fringestop reads)
+  - {k: bada, b:  28606464, n: 300, c: 1, r: 2}   # 27.3 MiB x 300 = 40 s slow-vis (meridian_fringestop + SPL/drain second reader)
 
 routines:
   # ---- captures (mode-gated) ---------------------------------------
@@ -296,24 +306,27 @@ routines:
   # ---- meridian_fringestop (M7.4 Phase 9; reads bada -> UVH5) ------
   # The legacy slow-vis fringe-stopper, run UNMODIFIED from the casa38
   # env (dsamfs / dsa110-meridian-fs) via the operator-side wrapper
-  # tools/ops/meridian_fringestop_rt.py. It is the SINGLE bada reader
-  # (option A): it REPLACES the old `bada_drain` stand-in. bada is r:1,
-  # so corr_slow's back-pressure chain is held open by meridian itself.
+  # tools/ops/meridian_fringestop_rt.py. It is the FIRST of bada's two
+  # readers (bada is r:2); the second is selected per-node from
+  # /cnf/spectral_line (meridian_fringestop_spl OR bada_null_drain,
+  # below). corr_slow's back-pressure chain is held open by BOTH
+  # readers -- if either stalls for >40 s the ring fills and corr_slow
+  # deadlocks at the 301st write (see CAUTION below).
   #
   # bada (300 buffers ~= 40 s of slow-vis) gives meridian ~40 s of
   # headroom to absorb hdf5 file-close jitter; legacy sustained this
   # cadence. CAUTION: dsart_rt does NOT auto-restart routines, so if
-  # meridian crashes corr_slow fills bada and deadlocks at the 301st
-  # write within ~40 s -- back-pressuring merge and stalling corr_fast
-  # (the M7.1/n06 deadlock). Watch /mon/corr_rt/<cn>/meridian_ready
-  # (the wrapper's heartbeat) and re-issue `start` to recover. The old
-  # dada_dbnull/dada_drain drain-of-last-resort is intentionally gone:
-  # legacy also ran meridian as the de-facto sole consumer.
+  # EITHER bada reader crashes corr_slow fills bada and deadlocks at the
+  # 301st write within ~40 s -- back-pressuring merge and stalling
+  # corr_fast (the M7.1/n06 deadlock). Watch
+  # /mon/corr_rt/<cn>/meridian_ready + /mon/corr_rt/<cn>/meridian_spl_ready
+  # (the wrappers' heartbeats) and re-issue `start` to recover.
   #
   # Env: casa38 python (cannot import dsart). taskset pins to NUMA 0
   # cores 8-9,28-29 -- same socket as bada + corr_slow (NUMA 0 =
   # 0-9,20-29 per lscpu on the corr nodes; corr_slow holds 4-5,24-25,
-  # corr_fast is on NUMA 1), away from capture/corr_slow. CUSTOMDEC is
+  # corr_fast is on NUMA 1), away from capture/corr_slow and away from
+  # the SPL fringe-stopper (6-7,26-27 -- see below). CUSTOMDEC is
   # substituted by dsart_rt with the observing dec at `start`; the
   # wrapper snaps it to the 0.25 deg fstable-cache grid and pins
   # dsamfs.get_pointing_declination to the snapped value so the cached
@@ -324,6 +337,52 @@ routines:
   - name: meridian_fringestop
     cmd: taskset
     args: -c 8-9,28-29 /home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-rt/tools/ops/meridian_fringestop_rt.py --cn-id CN --pt-dec-deg CUSTOMDEC --fstable-cache /home/ubuntu/data/fstables --working-dir /home/ubuntu/data --output-dir /home/ubuntu/data --log-level INFO
+
+  # ---- bada second reader (SPL ON): spectral-line fringe-stopper ----
+  # Spawned ONLY when this node's sub-band has spectral-line mode
+  # enabled in /cnf/spectral_line (spl_gate: on -> dsart_rt selects it
+  # against the per-node chgroup entry). A SECOND meridian_fringestop
+  # over the SAME bada ring, run with --spl so dsamfs writes a
+  # *_sb<NN>_spl.hdf5 product with a different channelisation
+  # (nfreq_int) and integration time (nint). The per-sub-band
+  # integration time + channel averaging come from the Control-tab
+  # panel via the SPL_INTEGRATION_S / SPL_NFREQ_INT tokens (dsart_rt
+  # substitutes them from /cnf/spectral_line at `start`); the casa38
+  # wrapper converts integration_s -> nint using the /cnf/corr tsamp
+  # and monkeypatches dsamfs.parse_params so the dsamfs install stays
+  # untouched (constraint D14).
+  #
+  # CPU pinning: fringe-stopping is CPU-heavy, so this gets its OWN
+  # 2 phys cores + HT siblings on NUMA 0 (6-7,26-27) -- distinct from
+  # the production fringe-stopper (8-9,28-29), corr_slow (4-5,24-25)
+  # and merge (NUMA 1, core 12). Output + working dir is /home/ubuntu/
+  # data/spl so the staged fstable symlink (named only by dec+nant,
+  # NOT nint) does not collide with the production fringe-stopper's.
+  # --allow-regenerate: if the operator changes the integration time
+  # away from the production 12.88 s (nint=96), the bw fstable shape
+  # (nint, nbls) no longer matches the cached production table; dsamfs
+  # then regenerates it once at the SPL nint (~30 s, needs casatools,
+  # which casa38 has) into the spl working dir. With the default
+  # integration time the production cache is re-used (no regen).
+  - name: meridian_fringestop_spl
+    spl_gate: "on"
+    cmd: taskset
+    args: -c 6-7,26-27 /home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-rt/tools/ops/meridian_fringestop_rt.py --cn-id CN --pt-dec-deg CUSTOMDEC --fstable-cache /home/ubuntu/data/fstables --working-dir /home/ubuntu/data/spl --output-dir /home/ubuntu/data/spl --spl --integration-s SPL_INTEGRATION_S --nfreq-int-spl SPL_NFREQ_INT --allow-regenerate --log-level INFO
+
+  # ---- bada second reader (SPL OFF): no-op drain --------------------
+  # Spawned ONLY when this node's sub-band does NOT have spectral-line
+  # mode enabled (spl_gate: off). bada is r:2, so SOMETHING must hold
+  # the second reader slot open or corr_slow stalls at the 301st write;
+  # when SPL is off this no-op drain is that something. It reads every
+  # bada block and immediately markCleared()s it (see
+  # dsart.services.dada_drain for why the Python drain beats the buggy
+  # dada_dbnull). Light CPU (one memcpy-free release per 134 ms block),
+  # pinned to a single NUMA-0 core (6) it shares with the (never co-
+  # resident) SPL fringe-stopper.
+  - name: bada_null_drain
+    spl_gate: "off"
+    cmd: taskset
+    args: -c 6,26 python -u -m dsart.services.dada_drain --key bada --log-level INFO
 
   # ---- corr_fast (M3 production integration; reads fada -> TX) -----
   # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +

@@ -602,6 +602,17 @@ def control_page():
         LOG.warning("list_recent_audit: %s", exc)
         recent = []
     import inject_calibration as ic                                 # local
+    import spectral_line_gate as slg                                # local
+    try:
+        spl_state = slg.get_spectral_line_state(control_store)
+    except Exception as exc:                                        # noqa: BLE001
+        LOG.warning("get_spectral_line_state: %s", exc)
+        spl_state = {
+            "subbands": {}, "n_enabled": 0, "default": True,
+            "nfreq_int_choices": slg.divisors_of_nchan(),
+            "default_integration_s": slg.DEFAULT_INTEGRATION_S,
+            "_error": str(exc),
+        }
     return render_template(
         "control.html",
         active_tab="control",
@@ -613,6 +624,11 @@ def control_page():
         default_inject_margin_blocks=DEFAULT_INJECT_MARGIN_BLOCKS,
         default_bounce_sleep_s=DEFAULT_BOUNCE_SLEEP_S,
         snr_cal_prefix=ic.CALIBRATION_PREFIX,
+        corr_nodes=list(CORR_NODES),
+        spectral_line_state=spl_state,
+        spectral_line_key=slg.SPECTRAL_LINE_KEY,
+        spectral_line_max_integration_s=slg.MAX_INTEGRATION_S,
+        spectral_line_min_integration_s=slg.MIN_INTEGRATION_S,
     )
 
 
@@ -1523,6 +1539,120 @@ def control_dumps_audit():
         rows = dumps_gate.list_recent_toggles(control_store, limit=limit)
     except Exception as exc:                                       # noqa: BLE001
         LOG.exception("list_recent_toggles failed")
+        return jsonify({"ok": False, "error": str(exc), "rows": []}), 500
+    return jsonify({"ok": True, "rows": rows})
+
+
+@app.route("/control/spectral_line", methods=["GET", "POST"])
+def control_spectral_line():
+    """Read or write the per-sub-band spectral-line (SPL) config.
+
+    The ``dsart_rt`` orchestrators read ``/cnf/spectral_line`` at
+    ``start`` and, per node, spawn either ``meridian_fringestop_spl``
+    (SPL on) or ``bada_null_drain`` (SPL off) as the constant second
+    ``bada`` reader. Editing here does NOT hot-swap a running fleet —
+    it takes effect on the next ``restart_all`` + ``start``.
+
+    GET
+        Returns the full 16-chgroup state (``get_spectral_line_state``).
+
+    POST form fields:
+
+      ``subbands``  JSON object mapping chgroup → ``{"enabled",
+                    "integration_s", "nfreq_int"}`` (required).
+      ``reason``    free text, 1..240 chars (required, audited).
+      ``confirm``   must be the literal word ``spectral_line``.
+
+    Returns 200 + new state on success / GET; 400 on validation /
+    confirm errors; 500 (with audit row) on etcd transport errors.
+    """
+    import json                                                     # local
+    import spectral_line_gate as slg                                # local
+
+    if request.method == "GET":
+        try:
+            state = slg.get_spectral_line_state(control_store)
+        except Exception as exc:                                    # noqa: BLE001
+            LOG.exception("get_spectral_line_state failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, **state})
+
+    # ---- POST ----
+    f = request.form
+    confirm_raw = (f.get("confirm") or "").strip().lower()
+    if confirm_raw != "spectral_line":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "confirm must be the literal word 'spectral_line' "
+                "to save the SPL config (deliberate speed-bump)."
+            ),
+        }), 400
+
+    reason_raw = (f.get("reason") or "").strip()
+    if not reason_raw:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "reason is required (non-empty string, max "
+                f"{slg.MAX_REASON_LEN} chars)"
+            ),
+        }), 400
+
+    subbands_raw = f.get("subbands") or ""
+    try:
+        subbands = json.loads(subbands_raw)
+    except Exception as exc:                                        # noqa: BLE001
+        return jsonify({
+            "ok": False,
+            "error": f"subbands must be a JSON object: {exc}",
+        }), 400
+    if not isinstance(subbands, dict):
+        return jsonify({
+            "ok": False, "error": "subbands must be a JSON object",
+        }), 400
+
+    actor = f.get("user") or request.remote_addr or "anon"
+    try:
+        new_state = slg.set_spectral_line_state(
+            control_store,
+            subbands=subbands,
+            reason=reason_raw,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                        # noqa: BLE001
+        LOG.exception("set_spectral_line_state failed")
+        try:
+            audit_log(
+                control_store,
+                namespace="control.spectral_line",
+                cn_target="fleet",
+                cmd="spectral_line_set",
+                val={"raw_len": len(subbands_raw)},
+                ok=False,
+                note=f"exception: {exc!r}",
+                user=actor,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log fallback also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, **new_state})
+
+
+@app.route("/control/spectral_line_audit", methods=["GET"])
+def control_spectral_line_audit():
+    """Most recent spectral_line save audit rows (JSON), newest first."""
+    import spectral_line_gate as slg                                # local
+    try:
+        limit = max(1, min(int(request.args.get("limit", "5")), 100))
+    except ValueError:
+        limit = 5
+    try:
+        rows = slg.list_recent_changes(control_store, limit=limit)
+    except Exception as exc:                                        # noqa: BLE001
+        LOG.exception("list_recent_changes failed")
         return jsonify({"ok": False, "error": str(exc), "rows": []}), 500
     return jsonify({"ok": True, "rows": rows})
 

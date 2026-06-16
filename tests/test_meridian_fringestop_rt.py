@@ -185,3 +185,61 @@ def test_stage_legacy_symlink_creates_and_replaces(tmp_path):
     # Re-staging replaces a stale symlink without error.
     dest2 = mfs.stage_legacy_symlink(cache_file, work, 25.25, 96)
     assert dest2 == dest and dest2.is_symlink()
+
+
+# ---- SPL heartbeat (distinct key + file family) ---------------------------
+
+
+def test_heartbeat_key_differs_for_spl():
+    hb = mfs.Heartbeat(cn_id=6, working_dir=Path("/tmp"), subband=3, dec_deg=25.25)
+    hb_spl = mfs.Heartbeat(
+        cn_id=6, working_dir=Path("/tmp"), subband=3, dec_deg=25.25, spl=True,
+    )
+    assert hb._key == "/mon/corr_rt/6/meridian_ready"
+    assert hb_spl._key == "/mon/corr_rt/6/meridian_spl_ready"
+
+
+def test_heartbeat_newest_hdf5_separates_spl_and_prod(tmp_path):
+    # Production hdf5 + SPL hdf5 share a working dir here (in production
+    # they don't, but the glob must still pick the right family).
+    (tmp_path / "2026-06-16T00:00:00_sb03.hdf5").write_bytes(b"x")
+    (tmp_path / "2026-06-16T00:00:00_sb03_spl.hdf5").write_bytes(b"x")
+
+    prod = mfs.Heartbeat(cn_id=6, working_dir=tmp_path, subband=3, dec_deg=25.25)
+    spl = mfs.Heartbeat(
+        cn_id=6, working_dir=tmp_path, subband=3, dec_deg=25.25, spl=True,
+    )
+    prod_last, prod_n = prod._newest_hdf5()
+    spl_last, spl_n = spl._newest_hdf5()
+    assert prod_last == "2026-06-16T00:00:00_sb03.hdf5" and prod_n == 1
+    assert spl_last == "2026-06-16T00:00:00_sb03_spl.hdf5" and spl_n == 1
+
+
+# ---- SPL CLI override args (exercise the REAL main() parser) ---------------
+
+
+def test_main_parser_accepts_spl_override_args(monkeypatch):
+    """main()'s real argparse must accept the SPL override flags. We stub
+    _prepare (the only etcd-touching call before --prepare-only returns)
+    so the test stays offline and asserts on the parsed Namespace."""
+    import shlex
+
+    captured = {}
+
+    def _fake_prepare(args):
+        captured["args"] = args
+        return {"subband": 3, "dec_grid": 25.25, "working_dir": args.working_dir,
+                "cache_ok": True, "eff_nint": 96, "override_nfreq_int": 4}
+
+    monkeypatch.setattr(mfs, "_prepare", _fake_prepare)
+    argv = shlex.split(
+        "--cn-id 6 --pt-dec-deg 25.25 --spl --integration-s 12.884901888 "
+        "--nfreq-int-spl 4 --working-dir /home/ubuntu/data/spl --prepare-only"
+    )
+    rc = mfs.main(argv)
+    assert rc == 0
+    args = captured["args"]
+    assert args.spl is True
+    assert args.integration_s == pytest.approx(12.884901888)
+    assert args.nfreq_int_spl == 4
+    assert str(args.working_dir) == "/home/ubuntu/data/spl"

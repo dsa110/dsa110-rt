@@ -90,6 +90,38 @@ from dsautils.dsa_store import DsaStore
 
 LOG = logging.getLogger("dsart.services.dsart_rt")
 
+# ---------------------------------------------------------------------------
+# Spectral-line (SPL) mode
+# ---------------------------------------------------------------------------
+#: etcd key the dashboard's spectral-line panel writes and the
+#: orchestrator reads at ``start`` to decide, per sub-band, whether to
+#: spawn the SPL second fringe-stopper (``meridian_fringestop_spl``) or
+#: the no-op ``bada_null_drain`` as the constant second ``bada`` reader.
+#: Schema::
+#:
+#:   {"version": 1, "ts": <unix>, "actor": <str>,
+#:    "subbands": {"<chgroup 0..15>": {"enabled": bool,
+#:                                     "integration_s": float,
+#:                                     "nfreq_int": int}}}
+#:
+#: A missing key / missing sub-band entry ⇒ SPL disabled (fail-SAFE to
+#: the production single-fringe-stop topology).
+SPECTRAL_LINE_KEY: str = "/cnf/spectral_line"
+
+#: Slow-vis block cadence (s) — corr_slow writes one ``bada`` block this
+#: often (see configs/config_corr.yaml). Used only for the human-facing
+#: default integration time; the casa38 wrapper recomputes nint from the
+#: authoritative /cnf/corr tsamp at runtime.
+_SPL_TSAMP_S: float = 0.134217728
+
+#: Legacy production slow-vis integration (nint=96 in /cnf/fringe) → the
+#: default SPL integration time so an operator who only changes the
+#: channelisation keeps the same 12.88 s cadence (and re-uses the
+#: production fringe-stopping-table cache → no slow regen).
+_SPL_DEFAULT_NINT: int = 96
+_SPL_DEFAULT_INTEGRATION_S: float = _SPL_DEFAULT_NINT * _SPL_TSAMP_S
+_SPL_DEFAULT_NFREQ_INT: int = 1
+
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
@@ -174,6 +206,18 @@ class RoutineSpec:
     # without meaningfully delaying the "start" verb (search_compute
     # cold-start is ~2.5 min total to first cube anyway).
     spawn_delay_s: float = 0.0
+    # Spectral-line (SPL) gate. ``None`` → routine is unconditional
+    # (default). ``"on"``  → spawn ONLY when this node's sub-band has
+    # spectral-line mode enabled in /cnf/spectral_line. ``"off"`` →
+    # spawn ONLY when SPL is disabled for this node. This is how the
+    # ``bada`` ring keeps a constant reader count of r=2: with SPL on
+    # the second reader is ``meridian_fringestop_spl`` (a finer-
+    # channelisation second fringe-stopper); with SPL off the second
+    # reader is ``bada_null_drain`` (a no-op drain) so corr_slow's
+    # multi-reader back-pressure chain never stalls waiting on an
+    # absent reader. See configs/dsart_pipeline_rt.yaml + the
+    # spectral-line panel in the dashboard Control tab.
+    spl_gate: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +251,11 @@ class PipelineConfig:
                     str(p) for p in (r.get("gate_on_paths") or [])
                 ),
                 spawn_delay_s=float(r.get("spawn_delay_s", 0.0)),
+                spl_gate=(
+                    str(r["spl_gate"]).strip().lower()
+                    if r.get("spl_gate") is not None
+                    else None
+                ),
             )
             for r in (raw.get("routines") or [])
         )
@@ -461,6 +510,15 @@ class RtOrchestrator:
         self._stop_evt = threading.Event()
         self._watch_ids: list[int] = []
         self._lock = threading.RLock()
+        # Per-node spectral-line state, refreshed from /cnf/spectral_line
+        # at each ``start``. Default = SPL disabled so routine selection
+        # + token substitution have a sane value even before the first
+        # _load_spl_cfg() (e.g. mon publish racing a cold start).
+        self._spl: dict[str, Any] = {
+            "enabled": False,
+            "integration_s": _SPL_DEFAULT_INTEGRATION_S,
+            "nfreq_int": _SPL_DEFAULT_NFREQ_INT,
+        }
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -532,6 +590,50 @@ class RtOrchestrator:
                  len(cfg.buffers), len(cfg.routines), cfg.schema_version)
         self._config = cfg
 
+    def _load_spl_cfg(self) -> None:
+        """Refresh this node's spectral-line state from etcd.
+
+        Reads :data:`SPECTRAL_LINE_KEY` and resolves the entry for THIS
+        node's chgroup (sub-band). On any miss / malformed value /
+        transport error we fall back to SPL DISABLED — the production
+        single-fringe-stop topology — so a cold or partial etcd never
+        accidentally turns on the second fringe-stopper.
+        """
+        chgroup = self._cn_to_chgroup()
+        spl = {
+            "enabled": False,
+            "integration_s": _SPL_DEFAULT_INTEGRATION_S,
+            "nfreq_int": _SPL_DEFAULT_NFREQ_INT,
+        }
+        try:
+            raw = self._store.get_dict(SPECTRAL_LINE_KEY)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("spectral-line config read failed (%s); SPL disabled", exc)
+            self._spl = spl
+            return
+        if isinstance(raw, dict):
+            subbands = raw.get("subbands") or {}
+            sub = subbands.get(str(chgroup))
+            if isinstance(sub, dict):
+                spl["enabled"] = bool(sub.get("enabled", False))
+                try:
+                    spl["integration_s"] = float(
+                        sub.get("integration_s", _SPL_DEFAULT_INTEGRATION_S)
+                    )
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    spl["nfreq_int"] = int(
+                        sub.get("nfreq_int", _SPL_DEFAULT_NFREQ_INT)
+                    )
+                except (TypeError, ValueError):
+                    pass
+        self._spl = spl
+        LOG.info(
+            "spectral-line: chgroup=%d enabled=%s integration_s=%.6g nfreq_int=%d",
+            chgroup, spl["enabled"], spl["integration_s"], spl["nfreq_int"],
+        )
+
     # ---- command dispatch --------------------------------------------
 
     def _on_command_event(self, event: Any) -> None:
@@ -594,6 +696,7 @@ class RtOrchestrator:
                 val = self._resolve_dec_from_etcd()
             self._state = "starting"
             self._reload_config()
+            self._load_spl_cfg()
             assert self._config is not None
             self._create_buffers(self._config.buffers)
             self._spawn_routines(self._config.routines, val)
@@ -742,10 +845,19 @@ class RtOrchestrator:
         self, routines: tuple[RoutineSpec, ...]
     ) -> tuple[RoutineSpec, ...]:
         assert self._config is not None
-        return tuple(
-            r for r in routines
-            if r.when is None or _evaluate_when(r.when, self._config.raw)
-        )
+        spl_on = bool(self._spl.get("enabled"))
+        out: list[RoutineSpec] = []
+        for r in routines:
+            if r.when is not None and not _evaluate_when(r.when, self._config.raw):
+                continue
+            # Spectral-line gate: keep exactly one of the two bada
+            # second-reader routines depending on this node's SPL state.
+            if r.spl_gate == "on" and not spl_on:
+                continue
+            if r.spl_gate == "off" and spl_on:
+                continue
+            out.append(r)
+        return tuple(out)
 
     # ------------------------------------------------------------------
     # M7.2 (2026-05-19) warmup-aware spawn ordering
@@ -923,6 +1035,18 @@ class RtOrchestrator:
         return argv
 
     def _substitute(self, token: str, val: Any) -> str:
+        # Spectral-line tokens (substituted before CN/CHGROUP since the
+        # token names contain neither substring): the SPL second
+        # fringe-stopper's per-sub-band integration time + channel
+        # averaging come from /cnf/spectral_line (loaded at start).
+        if "SPL_INTEGRATION_S" in token:
+            token = token.replace(
+                "SPL_INTEGRATION_S", repr(float(self._spl["integration_s"]))
+            )
+        if "SPL_NFREQ_INT" in token:
+            token = token.replace(
+                "SPL_NFREQ_INT", str(int(self._spl["nfreq_int"]))
+            )
         # Legacy substitutions (match corr.py CUSTOMDEC semantics):
         if "CUSTOMDEC" in token and val is not None:
             token = token.replace("CUSTOMDEC", str(val))
@@ -1079,6 +1203,7 @@ class RtOrchestrator:
                 "routines": children_snap,
                 "buffers": buffers_snap,
                 "last_verb": last_verb,
+                "spectral_line": dict(self._spl),
             }
         finally:
             self._lock.release()

@@ -163,6 +163,7 @@
         <li><a href="#panel-calibrate">Injection SNR calibration</a></li>
         <li><a href="#panel-dump-now">Dump now</a></li>
         <li><a href="#panel-dumps-enabled">Dumps enabled (kill-switch)</a></li>
+        <li><a href="#panel-spectral-line">Spectral-line mode (SPL)</a></li>
         <li><a href="#panel-delete-snr-cal">Delete fluence/SNR calibration</a></li>
         <li><a href="#panel-clear-sidereal-vetos">Clear sidereal (l,m) vetos</a></li>
         <li><a href="#panel-audit">Recent actions</a></li>
@@ -1205,6 +1206,221 @@ async function refreshCalibrations() {
         </tbody>
     </table>
 </div>
+
+<!-- Spectral-line (SPL) per-sub-band config -->
+<div class="panel" style="margin-top: 24px;" id="panel-spectral-line">
+    <h3>Spectral-line mode (SPL)</h3>
+    <p class="muted">
+        Per sub-band (chgroup) toggle for spectral-line mode. When
+        enabled for a sub-band, that corr node runs a <strong>second</strong>
+        <code>meridian_fringestop</code> over the same <code>bada</code>
+        slow-vis ring (which is created with <code>r=2</code>) and writes a
+        finer-channelisation <code>&lt;UTC&gt;_sb&lt;NN&gt;_spl.hdf5</code>
+        product alongside the production slow-vis. When disabled, a no-op
+        <code>bada_null_drain</code> holds the second reader slot so
+        <code>corr_slow</code> never stalls. Config is written to
+        <code>{{ spectral_line_key }}</code>; the orchestrators read it at
+        <strong>start</strong>, so this takes effect on the next
+        <code>restart_all</code> + <code>Start fleet</code> (it does
+        <em>not</em> hot-swap a running fleet).
+    </p>
+    <p class="muted">
+        <strong>integration (s)</strong>: SPL output integration time;
+        converted to <code>nint</code> via the slow-vis cadence
+        (<code>tsamp = {{ spectral_line_state.tsamp_s if spectral_line_state.tsamp_s else 0.134217728 }} s</code>).
+        Leave at the default
+        (<code>{{ '%.3f'|format(spectral_line_state.default_integration_s) }} s</code>,
+        nint=96) to re-use the production fringe-table cache (no slow
+        regen). <strong>nfreq_int</strong>: channels to average; must
+        divide {{ spectral_line_state.nchan_spw if spectral_line_state.nchan_spw else 384 }}
+        (<code>nfreq_int=1</code> = full {{ spectral_line_state.nchan_spw if spectral_line_state.nchan_spw else 384 }}-channel resolution).
+        Range {{ '%.3f'|format(spectral_line_min_integration_s) }}–{{ '%.0f'|format(spectral_line_max_integration_s) }} s.
+    </p>
+    <div class="verb-row">
+        <span id="spl-pill"
+              style="font-weight:700; padding:4px 10px; border-radius:4px;
+                     background:#7f8c8d; color:#ecf0f1;">
+            SPL: …
+        </span>
+        <span id="spl-meta" class="muted" style="margin-left:8px;"></span>
+        <button type="button" onclick="splSelectAll(true);">Enable all</button>
+        <button type="button" onclick="splSelectAll(false);">Disable all</button>
+    </div>
+    <form id="form-spectral-line" onsubmit="return submitSpectralLine(event);">
+        <table class="audit-table" id="spl-table">
+            <thead>
+                <tr>
+                    <th>chgroup</th><th>cn</th><th>host</th>
+                    <th>SPL on</th><th>integration (s)</th><th>nfreq_int</th>
+                    <th>nint</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for n in corr_nodes %}
+                {% set sb = spectral_line_state.subbands.get(n.chgroup|string) %}
+                <tr data-chgroup="{{ n.chgroup }}">
+                    <td>{{ n.chgroup }}</td>
+                    <td>{{ n.cn_id }}</td>
+                    <td>{{ n.host }}</td>
+                    <td>
+                        <input type="checkbox" class="spl-enabled"
+                               {% if sb and sb.enabled %}checked{% endif %} />
+                    </td>
+                    <td>
+                        <input type="number" class="spl-integration" step="0.001"
+                               min="{{ spectral_line_min_integration_s }}"
+                               max="{{ spectral_line_max_integration_s }}"
+                               value="{{ '%.6f'|format(sb.integration_s) if sb else '%.6f'|format(spectral_line_state.default_integration_s) }}"
+                               style="width: 110px;" />
+                    </td>
+                    <td>
+                        <select class="spl-nfreq" style="width: 90px;">
+                            {% for d in spectral_line_state.nfreq_int_choices %}
+                            <option value="{{ d }}"
+                                {% if sb and sb.nfreq_int == d %}selected{% elif (not sb) and d == 1 %}selected{% endif %}>
+                                {{ d }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </td>
+                    <td class="spl-nint-cell muted">{{ sb.nint if sb else '' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <div class="verb-row" style="margin-top:10px;">
+            <label for="spl_reason">reason (audited)</label>
+            <input type="text" id="spl_reason" name="reason" maxlength="240"
+                   placeholder="e.g. HI line monitor on chgroups 6-9"
+                   autocomplete="off" style="width: 360px;" required />
+        </div>
+        <div class="verb-row">
+            <label for="spl_confirm">type "spectral_line"</label>
+            <input type="text" id="spl_confirm" name="confirm"
+                   placeholder="spectral_line" autocomplete="off" />
+            <button type="submit" id="spl-save-btn">Save SPL config</button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/spectral_line/&lt;unix_ms&gt;</code>.
+            Apply with <code>restart_all</code> then <code>Start fleet</code>;
+            verify per-node via <code>/mon/corr_rt/&lt;cn&gt;/meridian_spl_ready</code>.
+        </div>
+        <div id="resp-spectral-line" class="response"></div>
+    </form>
+</div>
+
+<script>
+// ---- Spectral-line (SPL) panel --------------------------------------
+// Live-update the nint hint as the operator edits the integration time,
+// build the subbands JSON on save, POST it, and render the result.
+const SPL_TSAMP_S = {{ spectral_line_state.tsamp_s if spectral_line_state.tsamp_s else 0.134217728 }};
+
+function splNintFromS(s) {
+    const n = Math.round(parseFloat(s) / SPL_TSAMP_S);
+    return (isFinite(n) && n >= 1) ? n : 1;
+}
+
+function splRefreshNintHints() {
+    document.querySelectorAll("#spl-table tbody tr").forEach(function (tr) {
+        const sEl = tr.querySelector(".spl-integration");
+        const cell = tr.querySelector(".spl-nint-cell");
+        if (sEl && cell) { cell.textContent = splNintFromS(sEl.value); }
+    });
+    splRefreshPill();
+}
+
+function splRefreshPill() {
+    let n = 0;
+    document.querySelectorAll("#spl-table .spl-enabled").forEach(function (cb) {
+        if (cb.checked) { n += 1; }
+    });
+    const pill = document.getElementById("spl-pill");
+    if (!pill) { return; }
+    if (n > 0) {
+        pill.textContent = "SPL: " + n + " sub-band" + (n === 1 ? "" : "s") + " ON";
+        pill.style.background = "#27ae60";
+    } else {
+        pill.textContent = "SPL: OFF (all sub-bands)";
+        pill.style.background = "#7f8c8d";
+    }
+}
+
+function splSelectAll(on) {
+    document.querySelectorAll("#spl-table .spl-enabled").forEach(function (cb) {
+        cb.checked = !!on;
+    });
+    splRefreshPill();
+}
+
+function splCollectSubbands() {
+    const out = {};
+    document.querySelectorAll("#spl-table tbody tr").forEach(function (tr) {
+        const cg = tr.getAttribute("data-chgroup");
+        const enabled = tr.querySelector(".spl-enabled").checked;
+        const integration_s = parseFloat(tr.querySelector(".spl-integration").value);
+        const nfreq_int = parseInt(tr.querySelector(".spl-nfreq").value, 10);
+        out[cg] = {
+            enabled: enabled,
+            integration_s: integration_s,
+            nfreq_int: nfreq_int,
+        };
+    });
+    return out;
+}
+
+async function submitSpectralLine(ev) {
+    ev.preventDefault();
+    const form = document.getElementById("form-spectral-line");
+    const respEl = document.getElementById("resp-spectral-line");
+    const btn = document.getElementById("spl-save-btn");
+    const subbands = splCollectSubbands();
+    const nOn = Object.values(subbands).filter(function (v) { return v.enabled; }).length;
+    if (!window.confirm(
+            "Save spectral-line config (" + nOn + " sub-band(s) enabled)? " +
+            "Takes effect on the next restart_all + Start fleet.")) {
+        return false;
+    }
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>saving SPL config…</span>";
+    const fd = new FormData(form);
+    fd.set("subbands", JSON.stringify(subbands));
+    let r, j;
+    try {
+        r = await fetch("/control/spectral_line", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = (j && j.ok) ? "ok" : "err";
+    const status = (j && j.ok) ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j && j.error) {
+        html += "<div class='info-blob'>" +
+            String(j.error).replace(/</g, "&lt;") + "</div>";
+    } else if (j && j.ok) {
+        html += "<div class='muted'>saved; " + j.n_enabled +
+            " sub-band(s) enabled (chgroups [" +
+            (j.enabled_chgroups || []).join(", ") +
+            "]). Apply with restart_all + Start fleet.</div>";
+    }
+    respEl.innerHTML = html;
+    btn.disabled = false;
+    return false;
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    document.querySelectorAll("#spl-table .spl-integration").forEach(function (el) {
+        el.addEventListener("input", splRefreshNintHints);
+    });
+    document.querySelectorAll("#spl-table .spl-enabled").forEach(function (el) {
+        el.addEventListener("change", splRefreshPill);
+    });
+    splRefreshNintHints();
+});
+</script>
 
 <!-- Delete the injection fluence/SNR (K) calibration table -->
 <div class="panel" style="margin-top: 24px;" id="panel-delete-snr-cal">

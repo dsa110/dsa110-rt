@@ -249,8 +249,13 @@ class Heartbeat:
     Never raises into the run loop; a publish failure is logged and ignored."""
 
     def __init__(self, cn_id: int, working_dir: Path, subband: int, dec_deg: float,
-                 interval_s: float = 10.0) -> None:
-        self._key = f"/mon/corr_rt/{int(cn_id)}/meridian_ready"
+                 interval_s: float = 10.0, spl: bool = False) -> None:
+        # SPL gets its OWN heartbeat key so the dashboard can show the
+        # two bada readers independently (a dead SPL fringe-stopper is
+        # just as fatal to corr_slow as a dead production one).
+        self._spl = bool(spl)
+        suffix = "meridian_spl_ready" if self._spl else "meridian_ready"
+        self._key = f"/mon/corr_rt/{int(cn_id)}/{suffix}"
         self._working_dir = working_dir
         self._subband = int(subband)
         self._dec_deg = float(dec_deg)
@@ -260,8 +265,13 @@ class Heartbeat:
         self._store: Any = None
 
     def _newest_hdf5(self) -> tuple[Optional[str], int]:
+        # SPL writes *_sb<NN>_spl.hdf5; production writes *_sb<NN>.hdf5.
+        # Match the right family so the file count is meaningful per
+        # reader (both can co-exist in different working dirs).
+        pat = (f"*_sb{self._subband:02d}_spl*.hdf5" if self._spl
+               else f"*_sb{self._subband:02d}.hdf5")
         try:
-            files = sorted(self._working_dir.glob(f"*_sb{self._subband:02d}*.hdf5"))
+            files = sorted(self._working_dir.glob(pat))
         except OSError:
             return None, 0
         return (files[-1].name if files else None), len(files)
@@ -325,14 +335,33 @@ def _prepare(args: argparse.Namespace) -> dict[str, Any]:
         dec_raw = float(args.pt_dec_deg)
     dec_grid = snap_dec_to_grid(dec_raw, args.dec_grid_step)
 
+    # Resolve the SPL nint/nfreq_int overrides (if any). The fringe-
+    # stopping table's bw array is shaped (nint, nbls), so the cache
+    # must be validated against the EFFECTIVE nint we will actually run
+    # at -- which for SPL may differ from the production /cnf/fringe
+    # nint. nint precedence: --nint-spl > --integration-s (converted via
+    # tsamp) > /cnf/fringe (left to dsamfs). nfreq_int: --nfreq-int-spl
+    # > /cnf/fringe.
+    override_nint: Optional[int] = None
+    override_nfreq_int: Optional[int] = None
+    if args.spl:
+        if args.nint_spl is not None:
+            override_nint = int(args.nint_spl)
+        elif args.integration_s is not None:
+            override_nint = max(1, int(round(float(args.integration_s) / cnf["tsamp"])))
+        if args.nfreq_int_spl is not None:
+            override_nfreq_int = int(args.nfreq_int_spl)
+    eff_nint = override_nint if override_nint is not None else cnf["nint"]
+
     cache_file = Path(args.fstable_cache) / cache_table_filename(
         dec_grid, cnf["nant"], cnf["refmjd"]
     )
     ok, reason = validate_cache_table(
-        cache_file, nbls=cnf["nbls"], nint=cnf["nint"], dec_deg_grid=dec_grid,
+        cache_file, nbls=cnf["nbls"], nint=eff_nint, dec_deg_grid=dec_grid,
         tsamp=cnf["tsamp"], refmjd=cnf["refmjd"],
     )
     working_dir = Path(args.working_dir)
+    working_dir.mkdir(parents=True, exist_ok=True)
     if ok:
         staged = stage_legacy_symlink(cache_file, working_dir, dec_grid, cnf["nant"])
         LOG.info("staged fstable cache %s -> %s", cache_file.name, staged)
@@ -366,14 +395,38 @@ def _prepare(args: argparse.Namespace) -> dict[str, Any]:
         return _grid_q
 
     dsamfs_utils.get_pointing_declination = _patched_get_pointing_declination
+
+    # SPL nint/nfreq_int overrides: dsamfs reads these from the
+    # /cnf/fringe nint_spl/nfreq_int_spl per-host maps inside
+    # parse_params. To drive them from the Control-tab panel WITHOUT
+    # editing /cnf/fringe (and without touching the casa38 dsamfs
+    # install -- constraint D14), we wrap parse_params in OUR process so
+    # the returned nint (tuple index 8) / nfreq_int (index 9) reflect
+    # the overrides. routines.run_fringestopping calls pu.parse_params
+    # where pu IS dsamfs.utils, so patching the module attr is enough.
+    if override_nint is not None or override_nfreq_int is not None:
+        _orig_parse = dsamfs_utils.parse_params
+
+        def _patched_parse_params(param_file=None, nsfrb=False, spl=False):  # noqa: WPS430
+            res = list(_orig_parse(param_file=param_file, nsfrb=nsfrb, spl=spl))
+            if override_nint is not None:
+                res[8] = int(override_nint)
+            if override_nfreq_int is not None:
+                res[9] = int(override_nfreq_int)
+            return tuple(res)
+
+        dsamfs_utils.parse_params = _patched_parse_params
+
     LOG.info(
         "host=%s subband=%d dec_raw=%+.4f -> grid=%+.4f (step=%.4f) nant=%d "
-        "nint=%d refmjd=%.6f", hostname, subband, dec_raw, dec_grid,
-        args.dec_grid_step, cnf["nant"], cnf["nint"], cnf["refmjd"],
+        "nint=%d (eff=%d) nfreq_int_override=%s spl=%s refmjd=%.6f",
+        hostname, subband, dec_raw, dec_grid, args.dec_grid_step, cnf["nant"],
+        cnf["nint"], eff_nint, override_nfreq_int, bool(args.spl), cnf["refmjd"],
     )
     return {
         "subband": subband, "dec_grid": dec_grid, "working_dir": working_dir,
-        "cache_ok": ok,
+        "cache_ok": ok, "eff_nint": eff_nint,
+        "override_nfreq_int": override_nfreq_int,
     }
 
 
@@ -390,8 +443,22 @@ def main(argv: list[str] | None = None) -> int:
                         "(MUST equal working-dir so the consumer finds the file)")
     p.add_argument("--dec-grid-step", type=float, default=DEFAULT_DEC_GRID_STEP)
     p.add_argument("--spl", action="store_true",
-                   help="spectral-line mode (per-host nfreq_int/nint from /cnf/fringe); "
-                        "default off matches legacy production")
+                   help="spectral-line mode: write a second *_sb<NN>_spl.hdf5 product "
+                        "with finer channelisation. Without the override flags below "
+                        "the per-host nfreq_int_spl/nint_spl maps in /cnf/fringe are "
+                        "used (legacy behaviour).")
+    p.add_argument("--integration-s", type=float, default=None,
+                   help="SPL integration time in seconds; converted to nint via the "
+                        "/cnf/corr tsamp (overrides /cnf/fringe nint_spl). Ignored "
+                        "unless --spl. --nint-spl takes precedence if both are set.")
+    p.add_argument("--nint-spl", type=int, default=None,
+                   help="SPL nint override (number of slow-vis frames to integrate). "
+                        "Overrides both --integration-s and /cnf/fringe nint_spl. "
+                        "Ignored unless --spl.")
+    p.add_argument("--nfreq-int-spl", type=int, default=None,
+                   help="SPL nfreq_int override (channels to average; must divide the "
+                        "384-channel sub-band). Overrides /cnf/fringe nfreq_int_spl. "
+                        "Ignored unless --spl.")
     p.add_argument("--allow-regenerate", action="store_true",
                    help="on cache miss, let dsamfs regenerate the table at runtime "
                         "(slow) instead of failing")
@@ -424,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     hb = Heartbeat(
         cn_id=args.cn_id, working_dir=Path(args.working_dir),
         subband=ctx["subband"], dec_deg=ctx["dec_grid"],
-        interval_s=args.heartbeat_interval_s,
+        interval_s=args.heartbeat_interval_s, spl=bool(args.spl),
     )
     hb.start()
     try:

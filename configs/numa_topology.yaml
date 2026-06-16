@@ -31,7 +31,21 @@ hosts:
       meridian_fringestop:
         numa_node: 0                 # co-located with the bada ring + corr_slow writer
         cpu_affinity: "8-9,28-29"     # 2 phys cores + HT siblings, away from corr_slow/capture
-        notes: casa38 process; sole bada reader (replaces bada_drain).
+        notes: casa38 process; bada reader 1 of 2 (production slow-vis).
+      meridian_fringestop_spl:
+        numa_node: 0                 # co-located with bada; only runs when SPL enabled for this sub-band
+        cpu_affinity: "6-7,26-27"     # OWN 2 phys cores + HT siblings (fringe-stop is CPU-heavy), distinct from meridian_fringestop/corr_slow
+        notes: >-
+          casa38 process; bada reader 2 of 2 when /cnf/spectral_line enables
+          this chgroup. Writes *_sb<NN>_spl.hdf5 with finer channelisation.
+          Mutually exclusive per-node with bada_null_drain.
+      bada_null_drain:
+        numa_node: 0
+        cpu_affinity: "6,26"          # light; shares cores with the (never co-resident) SPL fringe-stopper
+        notes: >-
+          dsa110-rt python no-op drain; bada reader 2 of 2 when SPL is OFF
+          for this chgroup. Holds the r=2 second reader slot so corr_slow
+          never stalls. Mutually exclusive per-node with meridian_fringestop_spl.
     nic:
       snap:
         - iface: eth_snap0
