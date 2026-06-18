@@ -1207,6 +1207,60 @@ async function refreshCalibrations() {
     </table>
 </div>
 
+<!-- operator-integration: human authority over the dsa110-operator agent -->
+<div class="panel" style="margin-top: 24px;" id="panel-operator">
+    <h3>Operator Agent Authority (dsa110-operator)</h3>
+    <p class="muted">
+        Writes <code>/cmd/operator/control</code> — the one-way human
+        override the external <code>dsa110-operator</code> agent reads but
+        can never write. Use this to <strong>lock out</strong> all agent
+        control, optionally <strong>pin</strong> the single executor to one
+        Google identity, and set a <strong>hard observation time cap</strong>.
+        The cap is enforced by a <code>dsart_rt</code> watchdog that
+        auto-<code>UTC_STOP</code>s after the limit — independent of the
+        agent, so even a runaway agent cannot exceed it.
+        <strong>Note:</strong> the cap applies to any observation armed
+        while it is set; leave it 0 to disable.
+    </p>
+    <div class="verb-row">
+        <span id="op-pill"
+              style="font-weight:700; padding:4px 10px; border-radius:4px;
+                     background:#7f8c8d; color:#ecf0f1;">
+            Agents: …
+        </span>
+        <span id="op-meta" class="muted" style="margin-left:8px;"></span>
+    </div>
+    <div class="verb-row muted" id="op-lease" style="margin-top:4px;">lease: …</div>
+    <form id="form-operator" onsubmit="return submitOperatorControl(event);">
+        <div class="verb-row">
+            <label for="op_agents_enabled">agents enabled</label>
+            <input type="checkbox" id="op_agents_enabled" name="agents_enabled" />
+        </div>
+        <div class="verb-row">
+            <label for="op_executor_email">executor email (optional pin)</label>
+            <input type="text" id="op_executor_email" name="executor_email"
+                   maxlength="254" placeholder="leave blank = agent self-arbitrates"
+                   autocomplete="off" style="width: 320px;" />
+        </div>
+        <div class="verb-row">
+            <label for="op_max_obs_seconds">max obs seconds (0 = no cap)</label>
+            <input type="number" id="op_max_obs_seconds" name="max_obs_seconds"
+                   min="0" max="86400" step="1" value="0" style="width: 120px;" />
+        </div>
+        <div class="verb-row">
+            <label for="op_confirm">type "operator"</label>
+            <input type="text" id="op_confirm" name="confirm" autocomplete="off" />
+            <button type="submit" class="danger">Apply authority</button>
+        </div>
+        <div class="muted">
+            Audited to <code>/mon/audit/control/&lt;ts&gt;</code>
+            (namespace <code>operator.control</code>). The agent re-reads on
+            its next gate check; the watchdog re-reads within 15 s.
+        </div>
+        <div id="resp-operator" class="response"></div>
+    </form>
+</div>
+
 <!-- Spectral-line (SPL) per-sub-band config -->
 <div class="panel" style="margin-top: 24px;" id="panel-spectral-line">
     <h3>Spectral-line mode (SPL)</h3>
@@ -2355,6 +2409,72 @@ async function refreshSystemState() {
 document.addEventListener("DOMContentLoaded", function () {
     refreshSystemState();
     setInterval(refreshSystemState, 4000);
+});
+
+// --- operator-integration: agent authority panel ---
+function _opAgo(ts) {
+    if (!ts) return "never";
+    const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    return Math.round(s / 3600) + "h ago";
+}
+async function refreshOperatorControl() {
+    try {
+        const r = await fetch("/control/operator", {cache: "no-store"});
+        const j = await r.json();
+        if (!j.ok) return;
+        const c = j.control || {};
+        const pill = document.getElementById("op-pill");
+        if (c.agents_enabled) {
+            pill.textContent = "Agents: ENABLED";
+            pill.style.background = "#1e8449";
+        } else {
+            pill.textContent = "Agents: LOCKED OUT";
+            pill.style.background = "#922b21";
+        }
+        const bits = [];
+        bits.push(c.executor_email ? ("pinned → " + c.executor_email) : "executor unpinned");
+        bits.push(c.max_obs_seconds ? ("cap " + c.max_obs_seconds + "s") : "no time cap");
+        if (c.by) bits.push("by " + c.by + " " + _opAgo(c.ts));
+        if (!c.present) bits.push("(key absent — defaults)");
+        document.getElementById("op-meta").textContent = bits.join(" · ");
+        const lease = j.lease;
+        document.getElementById("op-lease").textContent = lease
+            ? ("lease: " + (lease.holder || lease.email || JSON.stringify(lease)))
+            : "lease: nobody holding the executor lease";
+        // Reflect current state into the form controls.
+        document.getElementById("op_agents_enabled").checked = !!c.agents_enabled;
+        if (document.activeElement.id !== "op_executor_email")
+            document.getElementById("op_executor_email").value = c.executor_email || "";
+        if (document.activeElement.id !== "op_max_obs_seconds")
+            document.getElementById("op_max_obs_seconds").value = c.max_obs_seconds || 0;
+    } catch (e) { /* leave last-known render */ }
+}
+async function submitOperatorControl(event) {
+    event.preventDefault();
+    const form = document.getElementById("form-operator");
+    const out = document.getElementById("resp-operator");
+    const fd = new FormData();
+    fd.append("agents_enabled", document.getElementById("op_agents_enabled").checked ? "on" : "off");
+    fd.append("executor_email", document.getElementById("op_executor_email").value);
+    fd.append("max_obs_seconds", document.getElementById("op_max_obs_seconds").value || "0");
+    fd.append("confirm", document.getElementById("op_confirm").value);
+    try {
+        const r = await fetch("/control/operator", {method: "POST", body: fd});
+        const j = await r.json();
+        out.textContent = j.ok ? "applied ✓" : ("error: " + (j.error || "?"));
+        out.style.color = j.ok ? "#67e29a" : "#ff8a80";
+        if (j.ok) document.getElementById("op_confirm").value = "";
+    } catch (e) {
+        out.textContent = "error: " + e; out.style.color = "#ff8a80";
+    }
+    refreshOperatorControl();
+    return false;
+}
+document.addEventListener("DOMContentLoaded", function () {
+    refreshOperatorControl();
+    setInterval(refreshOperatorControl, 5000);
 });
 </script>
 {% endblock %}

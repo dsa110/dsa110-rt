@@ -1563,6 +1563,54 @@ def control_dumps_audit():
     return jsonify({"ok": True, "rows": rows})
 
 
+# --- operator-integration: human authority over the dsa110-operator agent ---
+@app.route("/control/operator", methods=["GET", "POST"])
+def control_operator():
+    """Read or write the operator-agent authority key ``/cmd/operator/control``.
+
+    GET  -> {ok, control: {...}, lease: {...}|null}
+    POST -> form: agents_enabled (on/off), executor_email (optional),
+            max_obs_seconds (int, 0=off), confirm (=operator), user.
+
+    The dsa110-operator agent treats this key as a one-way human override:
+    it can read it but never write it (its etcd write surface is confined to
+    /operator/ and /cmd/ant/). ``max_obs_seconds`` is enforced strictly by a
+    dsart_rt watchdog, not just the agent.
+    """
+    import operator_control as opc                              # local
+
+    if request.method == "GET":
+        try:
+            return jsonify({"ok": True,
+                            "control": opc.get_operator_control(control_store),
+                            "lease": opc.get_operator_lease(control_store)})
+        except Exception as exc:                                  # noqa: BLE001
+            LOG.exception("get operator control failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    f = request.form
+    confirm_raw = (f.get("confirm") or "").strip().lower()
+    if confirm_raw != "operator":
+        return jsonify({"ok": False,
+                        "error": "type the literal word 'operator' to confirm"}), 400
+    enabled_raw = (f.get("agents_enabled") or "").strip().lower()
+    agents_enabled = enabled_raw in ("true", "1", "yes", "on")
+    actor = f.get("user") or request.remote_addr or "anon"
+    try:
+        state = opc.set_operator_control(
+            control_store,
+            agents_enabled=agents_enabled,
+            executor_email=(f.get("executor_email") or "").strip(),
+            max_obs_seconds=(f.get("max_obs_seconds") or "0").strip() or "0",
+            actor=actor)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                      # noqa: BLE001
+        LOG.exception("set operator control failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "control": state})
+
+
 @app.route("/control/spectral_line", methods=["GET", "POST"])
 def control_spectral_line():
     """Read or write the per-sub-band spectral-line (SPL) config.

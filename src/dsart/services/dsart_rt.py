@@ -507,6 +507,14 @@ class RtOrchestrator:
         self._state = "stopped"  # "stopped" / "starting" / "running" / "stopping"
         self._start_time: Optional[float] = None
         self._last_verb: Optional[tuple[str, Any, float]] = None
+        # operator-integration: strict observation time cap. ``_armed_at``
+        # is the wall-clock moment this process last saw UTC_START; the
+        # watchdog (see _check_obs_watchdog) auto-stops once the elapsed
+        # time exceeds ``max_obs_seconds`` from /cmd/operator/control.
+        # Scoped to this process's lifetime so it bounds session/agent
+        # observations without surprising-stopping pre-existing recording.
+        self._armed_at: Optional[float] = None
+        self._obs_cap_cache: tuple[float, int] = (0.0, 0)
         self._stop_evt = threading.Event()
         self._watch_ids: list[int] = []
         self._lock = threading.RLock()
@@ -539,6 +547,10 @@ class RtOrchestrator:
                     self._publish_mon()
                 except Exception:  # noqa: BLE001
                     LOG.exception("mon publish failed (continuing)")
+                try:
+                    self._check_obs_watchdog()
+                except Exception:  # noqa: BLE001
+                    LOG.exception("obs watchdog tick failed (continuing)")
                 self._stop_evt.wait(self.mon_cadence_s)
         finally:
             self._on_shutdown()
@@ -752,12 +764,15 @@ class RtOrchestrator:
             if self._config is not None:
                 self._destroy_buffers(self._config.buffers)
             self._start_time = None
+            self._armed_at = None  # operator-integration: disarm watchdog
             self._state = "stopped"
             LOG.info("verb stop: clean")
 
     def _verb_utc_start(self, val: Any) -> None:
         seq = int(val) if val is not None else 0
         self._send_utc_udp(f"UTC_START-{seq}")
+        # operator-integration: arm the observation-time watchdog.
+        self._armed_at = time.time()
         # Persist the trigger sequence into the mon namespace.
         #
         # Two keyspaces, two consumer populations:
@@ -811,6 +826,64 @@ class RtOrchestrator:
     def _verb_utc_stop(self, val: Any) -> None:
         seq = int(val) if val is not None else 0
         self._send_utc_udp(f"UTC_STOP-{seq}")
+        # operator-integration: disarm the observation-time watchdog.
+        self._armed_at = None
+
+    # ---- operator-integration: observation-time watchdog --------------
+
+    def _operator_max_obs_s(self) -> int:
+        """Cached read of the human-set hard cap on observation length.
+
+        Reads ``/cmd/operator/control.max_obs_seconds`` at most every 15 s
+        so the 2 s mon loop never hammers etcd. Returns 0 (no cap) on any
+        problem or when unset — fail-open so a transient etcd hiccup can
+        never auto-stop a healthy observation.
+        """
+        now = time.time()
+        ts, cached = self._obs_cap_cache
+        if now - ts < 15.0:
+            return cached
+        cap = 0
+        try:
+            doc = self._store.get_dict("/cmd/operator/control")
+            if isinstance(doc, dict):
+                cap = max(0, int(doc.get("max_obs_seconds") or 0))
+        except Exception:  # noqa: BLE001
+            cap = cached  # keep last known value on a read error
+        self._obs_cap_cache = (now, cap)
+        return cap
+
+    def _check_obs_watchdog(self) -> None:
+        """Auto-``utc_stop`` once an armed observation exceeds the cap.
+
+        Independent of the dsa110-operator agent: even a runaway or
+        crashed agent cannot exceed this limit because enforcement lives
+        here, in the orchestrator. No-op unless this process armed
+        recording (``_armed_at``) and a positive cap is configured.
+        """
+        if self._armed_at is None:
+            return
+        cap = self._operator_max_obs_s()
+        if cap <= 0:
+            return
+        elapsed = time.time() - self._armed_at
+        if elapsed < cap:
+            return
+        LOG.warning(
+            "OBS WATCHDOG: elapsed %.0fs >= cap %ds -> auto UTC_STOP "
+            "(set via /cmd/operator/control max_obs_seconds)", elapsed, cap)
+        try:
+            self._verb_utc_stop(0)  # also clears _armed_at
+        except Exception:  # noqa: BLE001
+            LOG.exception("obs watchdog: auto utc_stop failed")
+            self._armed_at = None
+        try:
+            self._store.put_dict(
+                f"/mon/operator/watchdog/{self.instance}",
+                {"event": "auto_utc_stop", "elapsed_s": round(elapsed, 1),
+                 "cap_s": cap, "ts": time.time(), "host": self.fqdn})
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- buffer ops ---------------------------------------------------
 
