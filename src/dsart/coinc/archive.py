@@ -341,15 +341,28 @@ def stats_to_l3_metadata(
     trigger_action: str,
     holdoff_s: float,
     schema_version: int = 1,
+    inj_ids: Optional[Iterable[str]] = None,
 ) -> dict[str, object]:
     """Build the L3 JSON payload the legacy archive consumer expects.
 
     Mirrors the legacy tasktrigger shape where it's compatible; new
     keys are nested under ``c2`` so we don't fight the old consumer.
+
+    ``inj_ids`` (the distinct injection labels matched to this event's
+    members at FIRE time, when the time-sensitive inject registry was
+    still live) is recorded under a durable ``injection`` block so
+    downstream consumers — notably C3, which runs minutes later, long
+    after the registry's ~60 s TTL — can reliably exempt injections from
+    the cube veto without re-querying the registry.
     """
+    inj_list = sorted({str(i) for i in (inj_ids or ()) if str(i).strip()})
     return {
         "event_name": event_name,
         "schema_version": schema_version,
+        "injection": {
+            "is_injection": bool(inj_list),
+            "inj_ids": inj_list,
+        },
         "trigger": {
             "class": trigger_class_name,
             "action": trigger_action,

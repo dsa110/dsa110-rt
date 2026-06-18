@@ -661,6 +661,38 @@ coinc:
       "2": "10.41.0.222"           # n02 / lxd110h02
       "9": "10.41.0.253"           # n09 / lxd110h09
       "13": "10.41.0.238"          # n13 / lxd110h13
+  # M8 voltage-dump broadcast to the 16 corr nodes (corr-net 10.41.0.x —
+  # the same data NIC C2 already reaches for the cube dump_broadcast).
+  # One UDP packet per corr node, DUMP_VOLTAGE flag, port 11229 (matches
+  # the voltage_retention routine's --bind-port in dsart_pipeline_rt.yaml).
+  # Keyed by cn_id (3..22, skipping 9/13/17/20 — corr_topology.py); the
+  # packet payload is host-agnostic (event_specnum + mjd_target only), so
+  # each corr listener maps the shared specnum to its own block locally.
+  #
+  # GATED: this broadcast fires only when /cmd/c2/voltages_enabled is true
+  # (default OFF — voltage dumps are ~103 GiB/event) AND the event is not
+  # an injection. Leave `hosts` empty to disable the voltage path entirely
+  # (no VoltageBroadcaster is constructed).
+  voltage_broadcast:
+    port: 11229
+    enabled_key: "/cmd/c2/voltages_enabled"
+    hosts:
+      "3": "10.41.0.224"           # n03 / lxd110h03 / chgroup 0
+      "4": "10.41.0.138"           # n04 / lxd110h04 / chgroup 1
+      "5": "10.41.0.206"           # n05 / lxd110h05 / chgroup 2
+      "6": "10.41.0.203"           # n06 / lxd110h06 / chgroup 3
+      "7": "10.41.0.208"           # n07 / lxd110h07 / chgroup 4
+      "8": "10.41.0.209"           # n08 / lxd110h08 / chgroup 5
+      "10": "10.41.0.211"          # n10 / lxd110h10 / chgroup 6
+      "11": "10.41.0.216"          # n11 / lxd110h11 / chgroup 7
+      "12": "10.41.0.218"          # n12 / lxd110h12 / chgroup 8
+      "14": "10.41.0.212"          # n14 / lxd110h14 / chgroup 9
+      "15": "10.41.0.223"          # n15 / lxd110h15 / chgroup 10
+      "16": "10.41.0.220"          # n16 / lxd110h16 / chgroup 11
+      "18": "10.41.0.228"          # n18 / lxd110h18 / chgroup 12
+      "19": "10.41.0.227"          # n19 / lxd110h19 / chgroup 13
+      "21": "10.41.0.250"          # n21 / lxd110h21 / chgroup 14
+      "22": "10.41.0.233"          # n22 / lxd110h22 / chgroup 15
   plotter:
     n_workers: 2
     per_event_timeout_s: 30.0
@@ -696,3 +728,70 @@ coinc:
   # Mon-points export (every coinc.mon_publish_interval_s seconds):
   mon_etcd_key: "/mon/c2/h23"
   mon_publish_interval_s: 5.0
+
+# ---------------------------------------------------------------------------
+# M8 C3 (h23 voltage-dump collector + cube veto) config. Read by
+# ``src/dsart/services/c3.py`` via ``C3Config.from_yaml`` (defaults to this
+# file). C3 is the dsa110-rt replacement for legacy ``dsa110-T3``: it
+# watches the candidate archive C2 writes, runs the cube-morphology veto,
+# and for KEEP events rsyncs the 16 per-corr voltage fragments into the
+# candidate dir; for REJECT events it conservatively cleans up (delete
+# staged voltages + bulky cubes, MOVE metadata/plots to candidates_rejected).
+#
+# corr_nodes is keyed by CHGROUP (0..15) — the fragment identity the corr
+# voltage_retention service stages by. ssh_host is the br1 name C3 rsyncs
+# over (n<NN>.pro.pvt); udp_ip is the corr-net 10.41.0.x address C3 sends
+# the DELETE signal to (must match coinc.voltage_broadcast.hosts above).
+# ---------------------------------------------------------------------------
+c3:
+  archive_root: /dataz/dsa110/candidates
+  rejected_root: /dataz/dsa110/candidates_rejected
+  state_path: /dataz/dsa110/operations/c3/c3_state.json
+  # Durable fired-injection log (written by the dashboard at arm time).
+  # Registry-independent backstop so C3 exempts injections the live C2
+  # matcher missed at fire time. Empty string disables the fallback.
+  fired_injection_log: /dataz/dsa110/operations/inject/fired_injections.jsonl
+  staging_dir: /home/ubuntu/data/voltage_staging
+  voltage_port: 11229
+  expected_cube_count: 8
+  scan_interval_s: 10.0
+  collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger
+  collect_poll_s: 15.0
+  collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land
+  rsync_bwlimit_kbps: 0              # 0 = unthrottled; raise if collection saturates br1
+  cleanup_staging_after_keep: true   # free corr NVMe staging once fragments are safely on h23
+  # Rollout safety: flag_only logs every veto decision + writes the audit
+  # sidecar but performs NO destructive REJECT actions (still collects
+  # voltages). Per the FP-analysis plan: run flag-first for a few days,
+  # confirm zero real-burst losses, THEN flip to false to enable
+  # auto-delete. Override at launch with --no-flag-only.
+  flag_only: true
+  mon_key: "/mon/c3/h23"
+  mon_interval_s: 5.0
+  # Cube-morphology veto thresholds (injection-exempt; see
+  # dsart.coinc.cube_veto + the FP-analysis report). Tier-1 R1-R5 + R10.
+  veto:
+    r1_img_off_px: 40.0              # apex image >40 px (~30') from triggered pixel -> reject
+    r2_t_shift_samples: 30           # cube time apex shifted >30 samples from trigger -> reject
+    r3_dm_shift_trials: 8            # cube DM apex shifted >8 trials AND weak DM peak -> reject
+    r4_time_prom_sigma: 4.0          # require a >=4 sigma time-series peak
+    r4_image_prom_sigma: 4.0         # require a >=4 sigma image peak
+    r5_dm_shift_trials: 4            # DM apex shifted >4 trials AND no time/image peak -> reject
+    r10_tz_trig_sigma: 10.0          # global all-cube apex must be >=10 sigma at the triggered DM/time
+  corr_nodes:
+    0:  {ssh_host: n03.pro.pvt, udp_ip: 10.41.0.224}
+    1:  {ssh_host: n04.pro.pvt, udp_ip: 10.41.0.138}
+    2:  {ssh_host: n05.pro.pvt, udp_ip: 10.41.0.206}
+    3:  {ssh_host: n06.pro.pvt, udp_ip: 10.41.0.203}
+    4:  {ssh_host: n07.pro.pvt, udp_ip: 10.41.0.208}
+    5:  {ssh_host: n08.pro.pvt, udp_ip: 10.41.0.209}
+    6:  {ssh_host: n10.pro.pvt, udp_ip: 10.41.0.211}
+    7:  {ssh_host: n11.pro.pvt, udp_ip: 10.41.0.216}
+    8:  {ssh_host: n12.pro.pvt, udp_ip: 10.41.0.218}
+    9:  {ssh_host: n14.pro.pvt, udp_ip: 10.41.0.212}
+    10: {ssh_host: n15.pro.pvt, udp_ip: 10.41.0.223}
+    11: {ssh_host: n16.pro.pvt, udp_ip: 10.41.0.220}
+    12: {ssh_host: n18.pro.pvt, udp_ip: 10.41.0.228}
+    13: {ssh_host: n19.pro.pvt, udp_ip: 10.41.0.227}
+    14: {ssh_host: n21.pro.pvt, udp_ip: 10.41.0.250}
+    15: {ssh_host: n22.pro.pvt, udp_ip: 10.41.0.233}

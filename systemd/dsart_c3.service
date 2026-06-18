@@ -1,0 +1,39 @@
+[Unit]
+Description=DSA-110 dsart-rt C3 voltage-dump collector + cube veto (h23)
+Documentation=file:/home/ubuntu/vikram/dev/dsa110-rt/docs/voltage_dumps/VOLTAGE_DUMP_C3_DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs under the operator user (same env as C2). C3 rsyncs/ssh's into the
+# 16 corr nodes over br1, so the operator user's SSH key must be
+# authorized on every corr node (it already is for the legacy ops tools).
+WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
+# flag_only defaults to true in configs/dsart_search_rt.yaml (c3.flag_only):
+# C3 logs every veto decision + collects voltages but performs NO
+# destructive REJECT cleanup until an operator flips that to false (or
+# appends --no-flag-only here) after the flag-first soak.
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.services.c3 --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
+Environment=PATH=/home/ubuntu/anaconda3/envs/dsart_h23/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+# C3 is CPU-light (numpy cube morphology on ~8 small npz per event, a few
+# events/min at most). Keep BLAS pools small.
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+
+LimitNOFILE=16384
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsart_c3
+
+[Install]
+WantedBy=default.target

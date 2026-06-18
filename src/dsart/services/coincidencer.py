@@ -69,7 +69,7 @@ from ..coinc.archive import (
     stats_to_csv_row,
     stats_to_l3_metadata,
 )
-from ..coinc.broadcast import TriggerBroadcaster
+from ..coinc.broadcast import TriggerBroadcaster, VoltageBroadcaster
 from ..coinc.components import CoincidenceGraph
 from ..coinc.criteria import CriteriaEvaluator
 from ..coinc.csv_rotator import RollingCsvWriter, concat_recent_hourly
@@ -94,6 +94,7 @@ __all__ = [
     "CoincidencerService",
     "DumpsGate",
     "DUMPS_ENABLED_KEY",
+    "VOLTAGES_ENABLED_KEY",
     "main",
 ]
 
@@ -129,6 +130,12 @@ _LOG = logging.getLogger("dsart.services.coincidencer")
 
 #: etcd key the dashboard writes; the coincidencer polls.
 DUMPS_ENABLED_KEY: str = "/cmd/c2/dumps_enabled"
+
+#: etcd kill-switch for VOLTAGE dumps (corr-node retention). Separate from
+#: the cube dumps gate and fail-CLOSED by default: voltage dumps are a new,
+#: expensive (~103 GiB/event) capability that stays dark until an operator
+#: explicitly writes ``{"enabled": true}`` here from the dashboard.
+VOLTAGES_ENABLED_KEY: str = "/cmd/c2/voltages_enabled"
 
 #: Default cache TTL: 200 ms. Bigger than a single batch's eval time
 #: (microseconds) so back-to-back classifications share the same etcd
@@ -175,15 +182,20 @@ class DumpsGate:
         cache_ttl_s: float = DEFAULT_DUMPS_CACHE_TTL_S,
         now: Optional[Callable[[], float]] = None,
         warn_rate_limit_s: float = 60.0,
+        default_enabled: bool = True,
     ) -> None:
         self._store = store
         self._key = str(key)
         self._ttl = float(cache_ttl_s)
         self._now = now if now is not None else time.monotonic
         self._warn_rate_limit_s = float(warn_rate_limit_s)
-        # Start fail-OPEN so the very first eval (before the first
-        # refresh) cannot accidentally suppress.
-        self._cached_value: bool = True
+        # Default applied before the first refresh and on every missing /
+        # malformed / etcd-error read. Cube dumps fail-OPEN (True — never
+        # silently suppress on a transient etcd hiccup); voltage dumps
+        # fail-CLOSED (False — an expensive capability stays dark until the
+        # operator explicitly enables it).
+        self._default_enabled = bool(default_enabled)
+        self._cached_value: bool = bool(default_enabled)
         self._cached_at: float = -math.inf
         self._last_warn_at: float = -math.inf
         self._read_count: int = 0
@@ -220,28 +232,28 @@ class DumpsGate:
     def _refresh(self, *, now: float) -> None:
         self._read_count += 1
         if self._store is None:
-            self._cached_value = True
+            self._cached_value = self._default_enabled
             self._cached_at = now
             return
         try:
             doc = self._store.get_dict(self._key)
         except Exception as exc:  # noqa: BLE001
             self._fail_count += 1
-            self._cached_value = True              # fail-OPEN
+            self._cached_value = self._default_enabled   # fail to default
             self._cached_at = now
             if (now - self._last_warn_at) > self._warn_rate_limit_s:
                 _LOG.warning(
-                    "dumps_gate: etcd read of %s failed (%s); "
-                    "fail-OPEN (dumps stay enabled)",
-                    self._key, exc,
+                    "gate(%s): etcd read failed (%s); falling back to "
+                    "default_enabled=%s",
+                    self._key, exc, self._default_enabled,
                 )
                 self._last_warn_at = now
             return
         if isinstance(doc, Mapping) and "enabled" in doc:
             self._cached_value = bool(doc["enabled"])
         else:
-            # Missing / malformed payload — fail-OPEN.
-            self._cached_value = True
+            # Missing / malformed payload — fall back to the default.
+            self._cached_value = self._default_enabled
         self._cached_at = now
 
 
@@ -276,6 +288,15 @@ class CoincidencerConfig:
 
     dump_broadcast_port_base: int = 11227
     dump_broadcast_hosts: Mapping[int, str] = field(default_factory=dict)
+
+    # Voltage-dump broadcast to the 16 corr nodes (NEW). The voltage
+    # trigger is gated separately from cubes: it fires only when
+    # ``/cmd/c2/voltages_enabled`` is true (default-CLOSED) AND the event
+    # is not an injection. Empty ``voltage_broadcast_hosts`` disables the
+    # voltage path entirely (no broadcaster is constructed).
+    voltage_broadcast_port: int = 11229
+    voltage_broadcast_hosts: Mapping[int, str] = field(default_factory=dict)
+    voltages_enabled_key: str = VOLTAGES_ENABLED_KEY
 
     plotter_n_workers: int = 2
     plotter_per_event_timeout_s: float = 30.0
@@ -407,9 +428,14 @@ class CoincidencerConfig:
             coinc = {**coinc, **override}
         bind = coinc.get("bind", {}) or {}
         dump = coinc.get("dump_broadcast", {}) or {}
+        volt = coinc.get("voltage_broadcast", {}) or {}
         plotter = coinc.get("plotter", {}) or {}
         hosts_raw = dump.get("hosts", {}) or {}
         hosts: Dict[int, str] = {int(k): str(v) for k, v in hosts_raw.items()}
+        volt_hosts_raw = volt.get("hosts", {}) or {}
+        volt_hosts: Dict[int, str] = {
+            int(k): str(v) for k, v in volt_hosts_raw.items()
+        }
         return cls(
             bind_host=str(bind.get("host", "0.0.0.0")),
             bind_port=int(bind.get("port", 11500)),
@@ -436,6 +462,11 @@ class CoincidencerConfig:
             )),
             dump_broadcast_port_base=int(dump.get("port_base", 11227)),
             dump_broadcast_hosts=hosts,
+            voltage_broadcast_port=int(volt.get("port", 11229)),
+            voltage_broadcast_hosts=volt_hosts,
+            voltages_enabled_key=str(
+                volt.get("enabled_key", VOLTAGES_ENABLED_KEY)
+            ),
             plotter_n_workers=int(plotter.get("n_workers", 2)),
             plotter_per_event_timeout_s=float(
                 plotter.get("per_event_timeout_s", 30.0),
@@ -644,7 +675,9 @@ class CoincidencerService:
         mon_store: Optional[Any] = None,
         name_allocator: Optional[EventNameAllocator] = None,
         broadcaster: Optional[TriggerBroadcaster] = None,
+        voltage_broadcaster: Optional[VoltageBroadcaster] = None,
         dumps_gate: Optional[DumpsGate] = None,
+        voltages_gate: Optional[DumpsGate] = None,
         inject_matcher: Optional[InjectionMatcher] = None,
     ) -> None:
         self._config = config
@@ -674,6 +707,20 @@ class CoincidencerService:
             config.dump_broadcast_hosts,
             port_base=config.dump_broadcast_port_base,
         )
+
+        # Voltage broadcaster (NEW). Only constructed when corr hosts are
+        # configured; otherwise the voltage path is fully disabled and
+        # ``_fire`` skips it. Tests can inject a fake.
+        self._voltage_broadcaster: Optional[VoltageBroadcaster]
+        if voltage_broadcaster is not None:
+            self._voltage_broadcaster = voltage_broadcaster
+        elif config.voltage_broadcast_hosts:
+            self._voltage_broadcaster = VoltageBroadcaster(
+                config.voltage_broadcast_hosts,
+                port=config.voltage_broadcast_port,
+            )
+        else:
+            self._voltage_broadcaster = None
 
         self._allocator = name_allocator or EventNameAllocator(
             etcd_key=config.etcd_lastname_key,
@@ -736,6 +783,16 @@ class CoincidencerService:
         self._dumps_gate: DumpsGate = (
             dumps_gate if dumps_gate is not None
             else DumpsGate(self._mon_store)
+        )
+
+        # Voltage-dump kill-switch — fail-CLOSED (default disabled).
+        self._voltages_gate: DumpsGate = (
+            voltages_gate if voltages_gate is not None
+            else DumpsGate(
+                self._mon_store,
+                key=config.voltages_enabled_key,
+                default_enabled=False,
+            )
         )
 
         # M7.4 Phase 6c.A: C1-row ↔ active-injection matcher. The
@@ -820,6 +877,17 @@ class CoincidencerService:
             "triggers_log_only": 0,
             "broadcast_send_ok": 0,
             "broadcast_send_fail": 0,
+            # Voltage-dump broadcast to corr nodes (NEW).
+            "voltage_broadcast_ok": 0,
+            "voltage_broadcast_fail": 0,
+            # Voltage dumps skipped because the event is an injection
+            # (no voltages for synthetic events — legacy behaviour).
+            "voltages_skipped_injection": 0,
+            # Voltage dumps skipped because the /cmd/c2/voltages_enabled
+            # kill-switch is off (default).
+            "voltages_skipped_disabled": 0,
+            # Voltage triggers actually fanned out to the corr fleet.
+            "voltages_broadcast": 0,
             "plots_dispatched": 0,
             # 2026-06-09: per-event archive dirs are written only when
             # the FULL cube set lands. events_archived counts dirs
@@ -1192,6 +1260,62 @@ class CoincidencerService:
         """Record a dump broadcast against the rate-cap window."""
         self._dump_fire_times.append(time.monotonic())
 
+    def _maybe_broadcast_voltage(
+        self,
+        *,
+        event_name: str,
+        stats: ClusterStats,
+        trigger_class: Any,
+        is_injection: bool,
+    ) -> None:
+        """Best-effort voltage-dump trigger to the corr fleet.
+
+        Gated independently of the cube broadcast:
+
+        * no broadcaster configured  -> silent no-op (feature off);
+        * event is an injection       -> skip (no voltages for synthetics);
+        * ``voltages_enabled`` off    -> skip (default-CLOSED kill-switch).
+
+        Never raises: a failure here must not disturb the cube dump path,
+        which has already fired. Counters record every outcome for /mon.
+        """
+        if self._voltage_broadcaster is None:
+            return
+        if is_injection:
+            self._counters["voltages_skipped_injection"] += 1
+            _LOG.info(
+                "VOLTAGE-SKIP name=%s reason=injection", event_name,
+            )
+            return
+        if not self._voltages_gate.enabled():
+            self._counters["voltages_skipped_disabled"] += 1
+            _LOG.info(
+                "VOLTAGE-SKIP name=%s reason=voltages_disabled", event_name,
+            )
+            return
+        try:
+            result = self._voltage_broadcaster.broadcast(
+                event_name=event_name,
+                event_specnum=stats.peak_event_specnum,
+                mjd_target=stats.t_peak_mjd,
+                trigger_class_id=hash(trigger_class.name) & 0xFFFF,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._counters["voltage_broadcast_fail"] += 1
+            _LOG.warning(
+                "VOLTAGE-BROADCAST-ERR name=%s: %s", event_name, exc,
+            )
+            return
+        ok = sum(1 for v in result.values() if v)
+        fail = len(result) - ok
+        self._counters["voltage_broadcast_ok"] += ok
+        self._counters["voltage_broadcast_fail"] += fail
+        self._counters["voltages_broadcast"] += 1
+        _LOG.info(
+            "VOLTAGE-DUMP name=%s snr_max=%.2f dm_med=%.2f broadcast=%d/%d",
+            event_name, stats.snr_max, stats.dm_median, ok, len(result),
+        )
+
     def _dm_comb_vetoed(self, stats: ClusterStats) -> bool:
         """True if ``stats`` is a fragment of a broadband DM comb.
 
@@ -1445,6 +1569,21 @@ class CoincidencerService:
                 if label is not None:
                     member_inj_ids[id(m)] = label
 
+            # Voltage-dump broadcast to the 16 corr nodes (NEW). Fires only
+            # when (a) a voltage broadcaster is configured, (b) the
+            # /cmd/c2/voltages_enabled kill-switch is on (default off), and
+            # (c) the event is NOT an injection (synthetic events get no
+            # voltages — legacy behaviour, saves ~103 GiB/event). The corr
+            # VoltageTriggerListeners ignore the DUMP_VOLTAGE flag when off,
+            # so a stray packet to a node without the retention service is a
+            # harmless no-op. Best-effort, never blocks the cube path.
+            self._maybe_broadcast_voltage(
+                event_name=event_name,
+                stats=stats,
+                trigger_class=trigger_class,
+                is_injection=bool(member_inj_ids),
+            )
+
             # Schedule the event; the dispatcher loop watches for the
             # FULL cube set to arrive (or the deadline). The per-event
             # archive directory + CSVs + L3 metadata are written there,
@@ -1546,6 +1685,7 @@ class CoincidencerService:
                 trigger_class_name=pp.trigger_class_name,
                 trigger_action=pp.trigger_action,
                 holdoff_s=pp.trigger_holdoff_s,
+                inj_ids=pp.member_inj_ids.values(),
             ),
         )
         return ev_dir
@@ -1710,6 +1850,12 @@ class CoincidencerService:
                     "dumps_enabled": bool(self._dumps_gate.enabled()),
                     "dumps_gate_reads": int(self._dumps_gate.read_count),
                     "dumps_gate_fails": int(self._dumps_gate.fail_count),
+                    "voltages_enabled": bool(self._voltages_gate.enabled()),
+                    "voltages_gate_reads": int(self._voltages_gate.read_count),
+                    "voltages_gate_fails": int(self._voltages_gate.fail_count),
+                    "voltage_broadcast_configured": (
+                        self._voltage_broadcaster is not None
+                    ),
                     "inject_match": self._inject_matcher.snapshot(),
                     "cluster_rate": int(self._cluster_rate.count()),
                     "cluster_rate_max": int(self._config.cluster_rate_max),

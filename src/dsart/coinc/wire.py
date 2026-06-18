@@ -29,6 +29,7 @@ __all__ = [
     "C2_TRIGGER_PACKET_SIZE",
     "C2_TRIGGER_MAGIC",
     "C2_TRIGGER_FLAG_DUMP_CUBE",
+    "C2_TRIGGER_FLAG_DUMP_VOLTAGE",
     "C1CandidateRow",
     "C1BatchHeader",
     "C1Batch",
@@ -47,6 +48,12 @@ SCHEMA_VERSION: int = 1
 C2_TRIGGER_MAGIC: int = 0x54525344
 C2_TRIGGER_PACKET_SIZE: int = 64
 C2_TRIGGER_FLAG_DUMP_CUBE: int = 1 << 0
+#: Voltage-dump bit (corr-node retention service). Additive to the locked
+#: schema_version=1 wire struct — it merely gives meaning to a
+#: previously-always-zero ``flags`` bit, so no schema bump is required.
+#: The C2 cube broadcast sets DUMP_CUBE; the C2 voltage broadcast (to the
+#: 16 corr nodes) sets DUMP_VOLTAGE. See docs/voltage_dumps/.
+C2_TRIGGER_FLAG_DUMP_VOLTAGE: int = 1 << 1
 
 _TRIGGER_STRUCT = struct.Struct("<IHH16sqdII16s")
 assert _TRIGGER_STRUCT.size == C2_TRIGGER_PACKET_SIZE, (

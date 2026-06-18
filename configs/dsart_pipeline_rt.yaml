@@ -11,10 +11,20 @@
 #      capture binary. This is what the M7.1 / M7.3 stages of the on-sky
 #      bring-up use (production-rate plumbing without a telescope).
 #
-#   2. fada is multi-reader (r=2) so slow- and fast-corr can attach to
-#      the same ring without copying. The legacy /cnf/pipeline does the
-#      same; called out here because new readers (a diagnostic tap, for
-#      example) MUST bump r before being added.
+#   2. fada is multi-reader (r=3) so slow-corr, fast-corr AND the
+#      voltage-retention service can attach to the same ring without
+#      copying. The legacy /cnf/pipeline used r=2; the third reader is
+#      the M8 corr-node voltage retention tap. Like every PSRDADA reader
+#      it WILL back-pressure merge if it falls behind, so the retention
+#      reader's hot path is deliberately a single ~288 MiB memcpy into a
+#      private RAM ring followed by an immediate markCleared() — no NVMe
+#      I/O on the fada read path. The expensive part (extract window +
+#      write fragment to NVMe on a C2 trigger) runs in a SEPARATE worker
+#      thread that reads the decoupled RAM ring, never fada, so a slow
+#      disk can never stall merge. See the voltage_retention routine +
+#      docs/voltage_dumps/. Any NEW reader MUST bump r before being added
+#      or corr_fast's writer stalls at the (n+1)th block waiting on the
+#      absent reader.
 #
 #   3. bada is ALSO multi-reader (r=2) as of the spectral-line (SPL)
 #      work. Reader 1 is always meridian_fringestop (the production
@@ -54,7 +64,7 @@ captures:
 buffers:
   - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
   - {k: eada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 1)
-  - {k: fada, b: 301989888, n: 70,  c: 1, r: 2}   # 288 MiB x 70 = 9.4 s merged voltage (slow + fast both read)
+  - {k: fada, b: 301989888, n: 70,  c: 1, r: 3}   # 288 MiB x 70 = 9.4 s merged voltage (corr_slow + corr_fast + voltage_retention all read)
   - {k: bada, b:  28606464, n: 300, c: 1, r: 2}   # 27.3 MiB x 300 = 40 s slow-vis (meridian_fringestop + SPL/drain second reader)
 
 routines:
@@ -508,4 +518,53 @@ routines:
       --staleness-s 10.0
       --http-bind 0.0.0.0
       --http-port 5780
+      --log-level INFO
+
+  # ---- voltage_retention (M8; reads fada -> RAM ring -> NVMe on C2) --
+  # Third fada reader (see buffers.fada r:3 above). Maintains a private
+  # ~15 s (~32 GiB) RAM ring of raw FADA blocks so that when a C2 voltage
+  # trigger arrives (UDP, DUMP_VOLTAGE flag) — up to ~30 s after the burst
+  # in the worst case — the ~3 s window around the burst is still in RAM
+  # and can be staged to NVMe for C3 to pull. Decoupling:
+  #
+  #   fada --(reader thread: memcpy + markCleared, NUMA 1)--> RAM ring
+  #   RAM ring --(dump worker thread: extract window + write fragment)--> NVMe
+  #   UDP :11229 --(asyncio listener: decode trigger -> enqueue dump)
+  #
+  # The reader thread does NO disk I/O so it can never stall merge; the
+  # dump worker reads the decoupled ring, never fada. Injections get NO
+  # voltage dump (C2 suppresses the DUMP_VOLTAGE broadcast for synthetic
+  # events), so this service only ever stages real candidates.
+  #
+  # Sizing: --retention-s 15 at 288 MiB/block, 7.4 blocks/s ≈ 112 blocks
+  # ≈ 31.5 GiB resident (NUMA-1 DRAM is 96 GiB; corr_fast + fada n=70
+  # (~20 GiB) leave ample headroom). --n-pre 8 / --n-post 14 ≈ 1.07 s
+  # before + 1.88 s after the trigger block ≈ 3 s window per fragment.
+  #
+  # CPU pinning: NUMA 1 (same socket as fada, GPU 1, the 100GbE search
+  # NIC) cores 18-19,38-39 — 2 phys cores + HT siblings, clear of merge
+  # (-c 12) and corr_slow (NUMA 0). The memcpy is ~2.1 GiB/s on one core;
+  # the second core covers the dump worker's burst NVMe writes.
+  #
+  # --bind-host 0.0.0.0 so the listener accepts the C2 (h23) trigger on
+  # the 10.41.0.x corr-net NIC. --staging-dir is the local NVMe scratch
+  # C3 rsyncs fragments out of. NO gate_on_paths: the reader must attach
+  # to fada as soon as the ring exists (it is one of fada's three required
+  # readers; a late attach would back-pressure merge until it joins).
+  - name: voltage_retention
+    cmd: taskset
+    args: >-
+      -c 18-19,38-39 python -u -m dsart.services.voltage_retention
+      --fada-key fada
+      --cn-id CN
+      --chgroup CHGROUP
+      --bind-host 0.0.0.0
+      --bind-port 11229
+      --staging-dir /home/ubuntu/data/voltage_staging
+      --retention-s 15.0
+      --n-pre 8
+      --n-post 14
+      --dump-wait-s 5.0
+      --mon-interval-s 5.0
+      --ready-sentinel-path /tmp/dsart-voltage-retention-CN.ready
       --log-level INFO

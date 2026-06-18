@@ -29,7 +29,9 @@ from . import wire
 
 __all__ = [
     "TriggerBroadcaster",
+    "VoltageBroadcaster",
     "DEFAULT_PORT_BASE",
+    "DEFAULT_VOLTAGE_PORT",
     "GPU_HALVES",
 ]
 
@@ -37,6 +39,11 @@ __all__ = [
 _LOG = logging.getLogger("dsart.coinc.broadcast")
 
 DEFAULT_PORT_BASE: int = 11227
+#: Single UDP port the corr-node VoltageTriggerListener binds (corr-net
+#: interface). Distinct from the search-node cube-listener ports
+#: (DEFAULT_PORT_BASE + gpu_half) because corr nodes are different hosts
+#: and run a single listener per node (no gpu_half split).
+DEFAULT_VOLTAGE_PORT: int = 11229
 GPU_HALVES: tuple[int, ...] = (0, 1)
 
 
@@ -135,4 +142,99 @@ class TriggerBroadcaster:
                         sid, g, host, port, exc,
                     )
                     out[(sid, g)] = False
+        return out
+
+
+class VoltageBroadcaster:
+    """UDP fan-out of voltage-dump triggers to the corr nodes.
+
+    Differs from :class:`TriggerBroadcaster` in two ways:
+
+      * one packet per corr node (no ``gpu_half`` split — each corr node
+        runs a single :class:`~dsart.dump.voltage_trigger_listener` on
+        :data:`DEFAULT_VOLTAGE_PORT`), and
+      * the default ``flags`` is :data:`wire.C2_TRIGGER_FLAG_DUMP_VOLTAGE`
+        so a corr listener can distinguish a real voltage trigger from a
+        stray cube packet.
+
+    Parameters
+    ----------
+    hosts:
+        ``{cn_id: ipv4_str}`` map (corr-net interface IPs).
+    port:
+        UDP destination port (default :data:`DEFAULT_VOLTAGE_PORT`).
+    sock:
+        Optional pre-bound socket (tests).
+    """
+
+    def __init__(
+        self,
+        hosts: Mapping[int, str],
+        *,
+        port: int = DEFAULT_VOLTAGE_PORT,
+        sock: Optional[socket.socket] = None,
+    ) -> None:
+        if not hosts:
+            raise ValueError("hosts map must be non-empty")
+        self._hosts: Dict[int, str] = {int(k): str(v) for k, v in hosts.items()}
+        self._port = int(port)
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock = sock
+
+    @property
+    def hosts(self) -> Mapping[int, str]:
+        return self._hosts
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "VoltageBroadcaster":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+    def broadcast(
+        self,
+        event_name: str,
+        event_specnum: int,
+        mjd_target: float,
+        *,
+        trigger_class_id: int = 0,
+        flags: int = wire.C2_TRIGGER_FLAG_DUMP_VOLTAGE,
+    ) -> Dict[int, bool]:
+        """Send a voltage-dump trigger to every corr node.
+
+        Returns ``{cn_id: bool}``; True iff the send did not raise.
+        ``event_specnum == 0`` is the delete sentinel (C3 REJECT path) —
+        the corr listener routes it to its staged-voltage delete handler.
+        """
+        pkt = wire.C2TriggerPacket(
+            event_name=event_name,
+            event_specnum=event_specnum,
+            mjd_target=mjd_target,
+            trigger_class_id=trigger_class_id,
+            flags=flags,
+        )
+        blob = wire.encode_c2_trigger(pkt)
+        out: Dict[int, bool] = {}
+        for cn_id, host in self._hosts.items():
+            try:
+                self._sock.sendto(blob, (host, self._port))
+                out[cn_id] = True
+            except OSError as exc:
+                _LOG.warning(
+                    "voltage trigger send to cn=%d %s:%d failed: %s",
+                    cn_id, host, self._port, exc,
+                )
+                out[cn_id] = False
         return out

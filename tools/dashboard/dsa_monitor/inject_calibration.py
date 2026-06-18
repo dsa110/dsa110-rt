@@ -457,7 +457,42 @@ def publish_active_inject(
         payload["target_snr"] = float(target_snr)
     key = build_active_inject_key(inj_id)
     store.put_dict(key, payload)
+    _append_durable_fired_log(payload)
     return key
+
+
+def _append_durable_fired_log(payload: Mapping[str, Any]) -> None:
+    """Best-effort durable record of one armed injection.
+
+    In addition to the short-lived ``/cnf/inject/active/<inj_id>`` etcd
+    registry (which the C2 matcher evicts ~60 s after fire), append the
+    injection to a never-expiring JSONL log so **C3** — which runs
+    minutes later — can recognise an injection even if the live matcher
+    missed it at fire time and the event was archived without the L3
+    ``injection`` marker. A hit only EXEMPTS the event from C3's veto
+    (KEEP), so this is purely a conservative backstop.
+
+    Lazy-imported + fully swallowed: the dashboard deliberately stays
+    stdlib-only and arming an injection must never fail because the
+    durable log (or the dsart package) is unavailable. Path override via
+    ``$DSART_FIRED_INJECTION_LOG``.
+    """
+    try:
+        from dsart.coinc.inject_log import (
+            DEFAULT_FIRED_LOG_PATH,
+            FiredInjection,
+            append_fired_injection,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("durable fired-injection log unavailable: %s", exc)
+        return
+    try:
+        path = os.environ.get(
+            "DSART_FIRED_INJECTION_LOG", DEFAULT_FIRED_LOG_PATH,
+        )
+        append_fired_injection(path, FiredInjection.from_dict(payload))
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("durable fired-injection log append failed: %s", exc)
 
 
 def get_match_event(store: Any, inj_id: str) -> Optional[Dict[str, Any]]:
