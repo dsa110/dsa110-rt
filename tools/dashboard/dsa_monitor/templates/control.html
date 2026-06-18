@@ -232,7 +232,7 @@
             <div class="verb-row">
                 <label for="margin">margin (specnums)</label>
                 <input type="number" id="margin" name="margin"
-                       value="{{ default_arm_margin }}" min="0" step="1000" />
+                       value="{{ default_arm_margin }}" min="0" step="1" />
                 <button type="submit">Arm now (utc_start)</button>
                 <span id="arm-safety-hint" style="font-weight:700;"></span>
             </div>
@@ -384,7 +384,7 @@
         <div class="verb-row">
             <label for="fst_build_dec">obs_dec_deg</label>
             <input type="number" id="fst_build_dec" name="dec_deg"
-                   step="0.0001" placeholder="(e.g. 54.5734)" required />
+                   step="any" placeholder="(e.g. 54.5734)" required />
             <label for="fst_build_force" style="min-width:auto;">
                 <input type="checkbox" id="fst_build_force" name="force" value="true" />
                 force (overwrite)
@@ -878,18 +878,18 @@ async function guardedStart(event) {
                 <div class="verb-row">
                     <label for="dm_pc_cm3">DM (pc/cc)</label>
                     <input type="number" id="dm_pc_cm3" name="dm_pc_cm3"
-                           value="500" step="0.1" required />
+                           value="500" step="any" required />
                 </div>
                 <div class="verb-row">
                     <label for="target_snr">target SNR</label>
                     <input type="number" id="target_snr" name="target_snr"
-                           step="0.1" min="0.1"
+                           step="any" min="0.1"
                            placeholder="(set to inject by SNR)" />
                 </div>
                 <div class="verb-row">
                     <label for="fluence_jy_ms">fluence (Jy·ms)</label>
                     <input type="number" id="fluence_jy_ms" name="fluence_jy_ms"
-                           value="50" step="0.1" />
+                           value="50" step="any" />
                 </div>
                 <div class="verb-row">
                     <label for="width_samples">width (samples)</label>
@@ -909,12 +909,12 @@ async function guardedStart(event) {
                 <div class="verb-row">
                     <label for="l_rad">l_rad</label>
                     <input type="number" id="l_rad" name="l_rad"
-                           value="0.0" step="0.001" required />
+                           value="0.0" step="any" required />
                 </div>
                 <div class="verb-row">
                     <label for="m_rad">m_rad</label>
                     <input type="number" id="m_rad" name="m_rad"
-                           value="0.0" step="0.001" required />
+                           value="0.0" step="any" required />
                 </div>
                 <div class="verb-row">
                     <label for="apply_at_specnum">apply_at_specnum</label>
@@ -995,7 +995,7 @@ async function guardedStart(event) {
                 <div class="verb-row">
                     <label for="cal_dm_pc_cm3">DM (pc/cc)</label>
                     <input type="number" id="cal_dm_pc_cm3" name="dm_pc_cm3"
-                           value="500" step="0.1" required />
+                           value="500" step="any" required />
                 </div>
                 <div class="verb-row">
                     <label for="cal_width_samples">width (native samples)</label>
@@ -1012,7 +1012,7 @@ async function guardedStart(event) {
                          (SNR 25-50); >=1.4e-3 hits the cuFFT-cfp16
                          overflow cliff. 7e-4 targets SNR ~38. -->
                     <input type="number" id="cal_fluence_jy_ms" name="fluence_jy_ms"
-                           value="0.0007" step="0.0001" min="0.000001" />
+                           value="0.0007" step="any" min="0.000001" />
                 </div>
                 <div class="verb-row">
                     <label for="cal_profile">profile</label>
@@ -1026,12 +1026,12 @@ async function guardedStart(event) {
                 <div class="verb-row">
                     <label for="cal_l_rad">l_rad</label>
                     <input type="number" id="cal_l_rad" name="l_rad"
-                           value="0.0" step="0.001" />
+                           value="0.0" step="any" />
                 </div>
                 <div class="verb-row">
                     <label for="cal_m_rad">m_rad</label>
                     <input type="number" id="cal_m_rad" name="m_rad"
-                           value="0.0" step="0.001" />
+                           value="0.0" step="any" />
                 </div>
                 <div class="verb-row">
                     <label for="cal_poll_timeout">match timeout (s)</label>
@@ -1251,23 +1251,28 @@ async function refreshCalibrations() {
             <thead>
                 <tr>
                     <th>chgroup</th><th>cn</th><th>host</th>
+                    <th>freq range (MHz)</th>
                     <th>SPL on</th><th>integration (s)</th><th>nfreq_int</th>
-                    <th>nint</th>
+                    <th>nint</th><th>chan width</th>
                 </tr>
             </thead>
             <tbody>
                 {% for n in corr_nodes %}
                 {% set sb = spectral_line_state.subbands.get(n.chgroup|string) %}
+                {% set f = spl_chgroup_freqs.get(n.chgroup) %}
                 <tr data-chgroup="{{ n.chgroup }}">
                     <td>{{ n.chgroup }}</td>
                     <td>{{ n.cn_id }}</td>
                     <td>{{ n.host }}</td>
+                    <td class="muted" style="white-space:nowrap;">
+                        {% if f %}{{ '%.2f'|format(f.bot_mhz) }}–{{ '%.2f'|format(f.top_mhz) }}{% else %}—{% endif %}
+                    </td>
                     <td>
                         <input type="checkbox" class="spl-enabled"
                                {% if sb and sb.enabled %}checked{% endif %} />
                     </td>
                     <td>
-                        <input type="number" class="spl-integration" step="0.001"
+                        <input type="number" class="spl-integration" step="any"
                                min="{{ spectral_line_min_integration_s }}"
                                max="{{ spectral_line_max_integration_s }}"
                                value="{{ '%.6f'|format(sb.integration_s) if sb else '%.6f'|format(spectral_line_state.default_integration_s) }}"
@@ -1284,6 +1289,8 @@ async function refreshCalibrations() {
                         </select>
                     </td>
                     <td class="spl-nint-cell muted">{{ sb.nint if sb else '' }}</td>
+                    {% set cw = spl_raw_chan_khz * (sb.nfreq_int if sb else 1) %}
+                    <td class="spl-chanwidth-cell muted" style="white-space:nowrap;">{% if cw >= 1000 %}{{ '%.3f'|format(cw / 1000.0) }} MHz{% else %}{{ '%.2f'|format(cw) }} kHz{% endif %}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -1315,10 +1322,17 @@ async function refreshCalibrations() {
 // Live-update the nint hint as the operator edits the integration time,
 // build the subbands JSON on save, POST it, and render the result.
 const SPL_TSAMP_S = {{ spectral_line_state.tsamp_s if spectral_line_state.tsamp_s else 0.134217728 }};
+const SPL_RAW_CHAN_KHZ = {{ spl_raw_chan_khz if spl_raw_chan_khz else 30.517578125 }};
 
 function splNintFromS(s) {
     const n = Math.round(parseFloat(s) / SPL_TSAMP_S);
     return (isFinite(n) && n >= 1) ? n : 1;
+}
+
+function splFmtChanWidth(nfreqInt) {
+    const khz = SPL_RAW_CHAN_KHZ * (parseInt(nfreqInt, 10) || 1);
+    return (khz >= 1000) ? (khz / 1000).toFixed(3) + " MHz"
+                         : khz.toFixed(2) + " kHz";
 }
 
 function splRefreshNintHints() {
@@ -1326,6 +1340,9 @@ function splRefreshNintHints() {
         const sEl = tr.querySelector(".spl-integration");
         const cell = tr.querySelector(".spl-nint-cell");
         if (sEl && cell) { cell.textContent = splNintFromS(sEl.value); }
+        const nfEl = tr.querySelector(".spl-nfreq");
+        const cwCell = tr.querySelector(".spl-chanwidth-cell");
+        if (nfEl && cwCell) { cwCell.textContent = splFmtChanWidth(nfEl.value); }
     });
     splRefreshPill();
 }
@@ -1417,6 +1434,9 @@ document.addEventListener("DOMContentLoaded", function () {
     });
     document.querySelectorAll("#spl-table .spl-enabled").forEach(function (el) {
         el.addEventListener("change", splRefreshPill);
+    });
+    document.querySelectorAll("#spl-table .spl-nfreq").forEach(function (el) {
+        el.addEventListener("change", splRefreshNintHints);
     });
     splRefreshNintHints();
 });

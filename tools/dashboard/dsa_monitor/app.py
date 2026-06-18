@@ -613,6 +613,24 @@ def control_page():
             "default_integration_s": slg.DEFAULT_INTEGRATION_S,
             "_error": str(exc),
         }
+    # Per-chgroup sub-band frequency coverage + native channel width, from
+    # the authoritative band constants (band top f0=1.530 GHz, descending).
+    try:
+        from dsart.common.constants import (
+            freq_GHz, NCHAN_PER_CHGROUP, DELTA_NU_CH_GHZ, N_CHGROUP,
+        )
+        spl_chgroup_freqs = {
+            g: {
+                "top_mhz": freq_GHz(g, 0) * 1.0e3,
+                "bot_mhz": freq_GHz(g, NCHAN_PER_CHGROUP - 1) * 1.0e3,
+            }
+            for g in range(N_CHGROUP)
+        }
+        spl_raw_chan_khz = DELTA_NU_CH_GHZ * 1.0e6   # GHz -> kHz
+    except Exception as exc:                                        # noqa: BLE001
+        LOG.warning("spl freq map: %s", exc)
+        spl_chgroup_freqs = {}
+        spl_raw_chan_khz = 0.030517578125 * 1.0e3    # native Δν fallback
     return render_template(
         "control.html",
         active_tab="control",
@@ -629,6 +647,8 @@ def control_page():
         spectral_line_key=slg.SPECTRAL_LINE_KEY,
         spectral_line_max_integration_s=slg.MAX_INTEGRATION_S,
         spectral_line_min_integration_s=slg.MIN_INTEGRATION_S,
+        spl_chgroup_freqs=spl_chgroup_freqs,
+        spl_raw_chan_khz=spl_raw_chan_khz,
     )
 
 
