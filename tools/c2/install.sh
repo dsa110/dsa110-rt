@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# C2 systemd-user unit installer. Idempotent:
+# C2/C3 systemd-user unit installer. Idempotent:
 #
-#   * Symlinks the three unit files from the repo into
-#     ~/.config/systemd/user/.
+#   * Symlinks the unit files from the repo into ~/.config/systemd/user/.
 #   * systemctl --user daemon-reload.
-#   * systemctl --user enable --now {dsart_c2,hiplot_c1,hiplot_c2}.service
+#   * systemctl --user enable --now
+#       {dsart_c2,hiplot_c1,hiplot_c2,dsart_c3}.service
 #
 # Safe to re-run; symlinks are -sf'd, enable --now is a no-op if the
 # unit is already enabled + active.
+#
+# dsart_c3 (the voltage-dump collector + cube veto, the dsa110-T3
+# replacement) ships in flag_only mode by default — it logs every veto
+# decision and collects voltages but performs NO destructive REJECT
+# cleanup until an operator flips /cmd/c3/flag_only=false from the
+# dashboard (Control tab → "C3 reject mode") or appends --no-flag-only
+# to the unit. Enabling it here is therefore safe for the flag-first soak.
 
 set -euo pipefail
 
@@ -19,6 +26,7 @@ UNITS=(
   dsart_c2.service
   hiplot_c1.service
   hiplot_c2.service
+  dsart_c3.service
 )
 
 echo "[c2/install.sh] repo=${REPO_ROOT}"

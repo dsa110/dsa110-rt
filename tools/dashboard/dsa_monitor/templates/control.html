@@ -163,6 +163,8 @@
         <li><a href="#panel-calibrate">Injection SNR calibration</a></li>
         <li><a href="#panel-dump-now">Dump now</a></li>
         <li><a href="#panel-dumps-enabled">Dumps enabled (kill-switch)</a></li>
+        <li><a href="#panel-voltages-enabled">Voltage dumps (kill-switch)</a></li>
+        <li><a href="#panel-c3-mode">C3 reject mode (keep/delete)</a></li>
         <li><a href="#panel-spectral-line">Spectral-line mode (SPL)</a></li>
         <li><a href="#panel-delete-snr-cal">Delete fluence/SNR calibration</a></li>
         <li><a href="#panel-clear-sidereal-vetos">Clear sidereal (l,m) vetos</a></li>
@@ -1207,6 +1209,134 @@ async function refreshCalibrations() {
     </table>
 </div>
 
+<!-- M8 voltage dumps: voltages-enabled runtime kill-switch -->
+<div class="panel" style="margin-top: 24px;" id="panel-voltages-enabled">
+    <h3>Voltage Dumps Enabled (C2 broadcast kill-switch)</h3>
+    <p class="muted">
+        Flips <code>/cmd/c2/voltages_enabled</code> — the C2
+        coincidencer's runtime gate for the corr-node <em>voltage</em>
+        dumps (the <code>DUMP_VOLTAGE</code> UDP fan-out to all 16 corr
+        nodes' <code>voltage_retention</code> readers). This is the
+        expensive (~103&nbsp;GiB/event) capability, separate from the
+        cube "Dumps enabled" switch above. Injections never dump
+        voltages regardless of this switch. Default (missing key) is
+        <strong>DISABLED</strong> (fail-CLOSED) so a cold etcd or a
+        fresh deploy never silently fills the corr-node NVMe staging —
+        an operator must explicitly enable it here.
+    </p>
+    <div class="verb-row">
+        <span id="volt-pill"
+              style="font-weight:700; padding:4px 10px; border-radius:4px;
+                     background:#7f8c8d; color:#ecf0f1;">
+            Voltages: …
+        </span>
+        <span id="volt-meta" class="muted" style="margin-left:8px;"></span>
+    </div>
+    <form id="form-volt-toggle" onsubmit="return submitVoltToggle(event);">
+        <div class="verb-row">
+            <label for="volt_reason">reason (audited)</label>
+            <input type="text" id="volt_reason" name="reason"
+                   maxlength="240"
+                   placeholder="e.g. enabling voltage dumps for FRB follow-up"
+                   autocomplete="off"
+                   style="width: 360px;" required />
+        </div>
+        <div class="verb-row">
+            <label for="volt_confirm">
+                type "<span id="volt-confirm-expected">enable</span>"
+            </label>
+            <input type="text" id="volt_confirm" name="confirm"
+                   autocomplete="off" />
+            <button type="submit" id="volt-toggle-btn" class="danger">
+                Enable voltage dumps
+            </button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/voltages_toggle/&lt;unix_ms&gt;</code>.
+            The coincidencer's in-process cache (200&nbsp;ms TTL) picks
+            the new value up within a single housekeeping tick.
+        </div>
+        <div id="resp-volt-toggle" class="response"></div>
+    </form>
+    <h4 style="margin-top:16px;">Recent toggles (last 5)</h4>
+    <table class="audit-table" id="volt-audit-table">
+        <thead>
+            <tr>
+                <th>ts</th><th>user</th><th>enabled</th><th>reason</th>
+            </tr>
+        </thead>
+        <tbody id="volt-audit-tbody">
+            <tr><td colspan="4" class="muted">loading…</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<!-- M8 voltage dumps: C3 keep/delete mode (flag_only) -->
+<div class="panel" style="margin-top: 24px;" id="panel-c3-mode">
+    <h3>C3 Reject Mode (keep vs delete dumps)</h3>
+    <p class="muted">
+        Flips <code>/cmd/c3/flag_only</code> — the C3 collector's
+        keep/delete mode, read per event. <strong>KEEP-ONLY</strong>
+        (<code>flag_only=true</code>, the safe default) collects voltages
+        and logs every cube-veto decision but performs
+        <strong>NO</strong> destructive cleanup on rejected events.
+        <strong>DELETE</strong> (<code>flag_only=false</code>) enables
+        the conservative REJECT path: delete the staged voltages + bulky
+        <code>cubes/*.npz</code> and MOVE the metadata/plots to
+        <code>candidates_rejected/&lt;event&gt;/</code> with a full
+        audit — never an <code>rm -rf</code>. Injections and ambiguous
+        events are always KEPT. Run KEEP-ONLY for the flag-first soak,
+        confirm zero real losses, then switch to DELETE.
+    </p>
+    <div class="verb-row">
+        <span id="c3-pill"
+              style="font-weight:700; padding:4px 10px; border-radius:4px;
+                     background:#7f8c8d; color:#ecf0f1;">
+            C3: …
+        </span>
+        <span id="c3-meta" class="muted" style="margin-left:8px;"></span>
+    </div>
+    <form id="form-c3-toggle" onsubmit="return submitC3Toggle(event);">
+        <div class="verb-row">
+            <label for="c3_reason">reason (audited)</label>
+            <input type="text" id="c3_reason" name="reason"
+                   maxlength="240"
+                   placeholder="e.g. flag-first soak clean — enabling auto-delete"
+                   autocomplete="off"
+                   style="width: 360px;" required />
+        </div>
+        <div class="verb-row">
+            <label for="c3_confirm">
+                type "<span id="c3-confirm-expected">delete</span>"
+            </label>
+            <input type="text" id="c3_confirm" name="confirm"
+                   autocomplete="off" />
+            <button type="submit" id="c3-toggle-btn" class="danger">
+                Enable auto-delete
+            </button>
+        </div>
+        <div class="muted">
+            Audited to
+            <code>/mon/audit/control/c3_mode_toggle/&lt;unix_ms&gt;</code>.
+            C3 re-reads the key on every event, so the new mode takes
+            effect on the next candidate it processes.
+        </div>
+        <div id="resp-c3-toggle" class="response"></div>
+    </form>
+    <h4 style="margin-top:16px;">Recent toggles (last 5)</h4>
+    <table class="audit-table" id="c3-audit-table">
+        <thead>
+            <tr>
+                <th>ts</th><th>user</th><th>mode</th><th>reason</th>
+            </tr>
+        </thead>
+        <tbody id="c3-audit-tbody">
+            <tr><td colspan="4" class="muted">loading…</td></tr>
+        </tbody>
+    </table>
+</div>
+
 <!-- operator-integration: human authority over the dsa110-operator agent -->
 <div class="panel" style="margin-top: 24px;" id="panel-operator">
     <h3>Operator Agent Authority (dsa110-operator)</h3>
@@ -2081,6 +2211,269 @@ document.addEventListener("DOMContentLoaded", function () {
     refreshDumpsAudit();
     setInterval(refreshDumpsState, 5000);
     setInterval(refreshDumpsAudit, 15000);
+});
+
+// ---- M8 voltage dumps: voltages-enabled runtime kill-switch -------------
+// Owns the "Voltages: ENABLED|DISABLED" pill + confirm label + audit table.
+// Fail-CLOSED: default (missing key) renders DISABLED.
+let _voltCurrentEnabled = null;
+
+function _renderVoltPill(state) {
+    const pill = document.getElementById("volt-pill");
+    const meta = document.getElementById("volt-meta");
+    const btn = document.getElementById("volt-toggle-btn");
+    const expected = document.getElementById("volt-confirm-expected");
+    const confirm = document.getElementById("volt_confirm");
+    if (!pill || !meta || !btn || !expected || !confirm) { return; }
+    const enabled = !!state.enabled;
+    _voltCurrentEnabled = enabled;
+    if (enabled) {
+        pill.textContent = "Voltages: ENABLED";
+        pill.style.background = "#c0392b";   // red: expensive capability is live
+        btn.textContent = "Disable voltage dumps";
+        expected.textContent = "disable";
+    } else {
+        pill.textContent = "Voltages: DISABLED" + (state.default ? " (default)" : "");
+        pill.style.background = "#7f8c8d";
+        btn.textContent = "Enable voltage dumps";
+        expected.textContent = "enable";
+    }
+    confirm.value = "";
+    const tsTxt = (state.ts === null || state.ts === undefined)
+        ? "(never set)"
+        : new Date(state.ts * 1000).toISOString();
+    const actorTxt = state.actor || "(none)";
+    const reasonTxt = state.reason || "(no reason on file)";
+    meta.innerHTML =
+        "last flip: <code>" + tsTxt + "</code>" +
+        " by <code>" + String(actorTxt).replace(/</g, "&lt;") + "</code>" +
+        " — " + String(reasonTxt).replace(/</g, "&lt;");
+}
+
+async function refreshVoltState() {
+    try {
+        const r = await fetch("/control/voltages_enabled", {cache: "no-store"});
+        const j = await r.json();
+        if (j && (j.enabled === true || j.enabled === false)) {
+            _renderVoltPill(j);
+        }
+    } catch (e) {
+        const pill = document.getElementById("volt-pill");
+        if (pill) {
+            pill.textContent = "Voltages: (read error)";
+            pill.style.background = "#7f8c8d";
+        }
+    }
+}
+
+async function refreshVoltAudit() {
+    const tbody = document.getElementById("volt-audit-tbody");
+    if (!tbody) { return; }
+    let j;
+    try {
+        const r = await fetch("/control/voltages_audit?limit=5", {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        tbody.innerHTML =
+            "<tr><td colspan='4' class='err'>fetch error: " + e + "</td></tr>";
+        return;
+    }
+    const rows = (j && j.rows) || [];
+    if (rows.length === 0) {
+        tbody.innerHTML = "<tr><td colspan='4' class='muted'>no toggles yet</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+        const enabled = r.val && r.val.enabled;
+        const cls = enabled ? "err" : "ok";   // ENABLED voltages = attention
+        const lbl = enabled ? "ENABLED" : "DISABLED";
+        const note = (r.note || "").replace(/</g, "&lt;");
+        const user = (r.user || "").replace(/</g, "&lt;");
+        return "<tr>" +
+            "<td class='ts'>" + (r.iso_ts || "?") + "</td>" +
+            "<td>" + user + "</td>" +
+            "<td class='" + cls + "'>" + lbl + "</td>" +
+            "<td>" + note + "</td>" +
+            "</tr>";
+    }).join("");
+}
+
+async function submitVoltToggle(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-volt-toggle");
+    const btn = document.getElementById("volt-toggle-btn");
+    if (_voltCurrentEnabled === null) {
+        respEl.innerHTML = "<span class='err'>state not yet loaded; refresh first</span>";
+        return false;
+    }
+    const desired = !_voltCurrentEnabled;
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>flipping voltages gate…</span>";
+    const fd = new FormData(form);
+    fd.set("enabled", desired ? "true" : "false");
+    let r, j;
+    try {
+        r = await fetch("/control/voltages_enabled", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    const status = j.ok ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j.error) {
+        html += "<div class='info-blob'><span class='err'>" +
+            String(j.error).replace(/</g, "&lt;") + "</span></div>";
+    }
+    html += "<div class='info-blob' style='margin-top:8px;'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    respEl.innerHTML = html;
+    btn.disabled = false;
+    if (j.ok) {
+        await refreshVoltState();
+        await refreshVoltAudit();
+    }
+    return false;
+}
+
+// ---- M8 voltage dumps: C3 keep/delete mode (flag_only) -----------------
+// Owns the "C3: KEEP-ONLY|DELETE" pill. flag_only=true == KEEP-ONLY (safe).
+let _c3CurrentFlagOnly = null;
+
+function _renderC3Pill(state) {
+    const pill = document.getElementById("c3-pill");
+    const meta = document.getElementById("c3-meta");
+    const btn = document.getElementById("c3-toggle-btn");
+    const expected = document.getElementById("c3-confirm-expected");
+    const confirm = document.getElementById("c3_confirm");
+    if (!pill || !meta || !btn || !expected || !confirm) { return; }
+    const flagOnly = !!state.flag_only;
+    _c3CurrentFlagOnly = flagOnly;
+    if (flagOnly) {
+        pill.textContent = "C3: KEEP-ONLY" + (state.default ? " (default)" : "");
+        pill.style.background = "#27ae60";
+        btn.textContent = "Enable auto-delete";
+        expected.textContent = "delete";
+    } else {
+        pill.textContent = "C3: DELETE (auto-cleanup)";
+        pill.style.background = "#c0392b";
+        btn.textContent = "Back to keep-only";
+        expected.textContent = "keep";
+    }
+    confirm.value = "";
+    const tsTxt = (state.ts === null || state.ts === undefined)
+        ? "(never set)"
+        : new Date(state.ts * 1000).toISOString();
+    const actorTxt = state.actor || "(none)";
+    const reasonTxt = state.reason || "(no reason on file)";
+    meta.innerHTML =
+        "last flip: <code>" + tsTxt + "</code>" +
+        " by <code>" + String(actorTxt).replace(/</g, "&lt;") + "</code>" +
+        " — " + String(reasonTxt).replace(/</g, "&lt;");
+}
+
+async function refreshC3State() {
+    try {
+        const r = await fetch("/control/c3_mode", {cache: "no-store"});
+        const j = await r.json();
+        if (j && (j.flag_only === true || j.flag_only === false)) {
+            _renderC3Pill(j);
+        }
+    } catch (e) {
+        const pill = document.getElementById("c3-pill");
+        if (pill) {
+            pill.textContent = "C3: (read error)";
+            pill.style.background = "#7f8c8d";
+        }
+    }
+}
+
+async function refreshC3Audit() {
+    const tbody = document.getElementById("c3-audit-tbody");
+    if (!tbody) { return; }
+    let j;
+    try {
+        const r = await fetch("/control/c3_mode_audit?limit=5", {cache: "no-store"});
+        j = await r.json();
+    } catch (e) {
+        tbody.innerHTML =
+            "<tr><td colspan='4' class='err'>fetch error: " + e + "</td></tr>";
+        return;
+    }
+    const rows = (j && j.rows) || [];
+    if (rows.length === 0) {
+        tbody.innerHTML = "<tr><td colspan='4' class='muted'>no toggles yet</td></tr>";
+        return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+        const flagOnly = r.val && r.val.flag_only;
+        const cls = flagOnly ? "ok" : "err";   // DELETE = attention
+        const lbl = flagOnly ? "KEEP-ONLY" : "DELETE";
+        const note = (r.note || "").replace(/</g, "&lt;");
+        const user = (r.user || "").replace(/</g, "&lt;");
+        return "<tr>" +
+            "<td class='ts'>" + (r.iso_ts || "?") + "</td>" +
+            "<td>" + user + "</td>" +
+            "<td class='" + cls + "'>" + lbl + "</td>" +
+            "<td>" + note + "</td>" +
+            "</tr>";
+    }).join("");
+}
+
+async function submitC3Toggle(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-c3-toggle");
+    const btn = document.getElementById("c3-toggle-btn");
+    if (_c3CurrentFlagOnly === null) {
+        respEl.innerHTML = "<span class='err'>state not yet loaded; refresh first</span>";
+        return false;
+    }
+    // Button always requests the OPPOSITE flag_only of the current state.
+    const desiredFlagOnly = !_c3CurrentFlagOnly;
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>flipping C3 mode…</span>";
+    const fd = new FormData(form);
+    fd.set("flag_only", desiredFlagOnly ? "true" : "false");
+    let r, j;
+    try {
+        r = await fetch("/control/c3_mode", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    const status = j.ok ? "OK" : "FAIL";
+    let html = "<span class='" + cls + "'>" + status + "</span>";
+    if (j.error) {
+        html += "<div class='info-blob'><span class='err'>" +
+            String(j.error).replace(/</g, "&lt;") + "</span></div>";
+    }
+    html += "<div class='info-blob' style='margin-top:8px;'>" +
+        JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    respEl.innerHTML = html;
+    btn.disabled = false;
+    if (j.ok) {
+        await refreshC3State();
+        await refreshC3Audit();
+    }
+    return false;
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    refreshVoltState();
+    refreshVoltAudit();
+    setInterval(refreshVoltState, 5000);
+    setInterval(refreshVoltAudit, 15000);
+    refreshC3State();
+    refreshC3Audit();
+    setInterval(refreshC3State, 5000);
+    setInterval(refreshC3Audit, 15000);
 });
 
 // ---- M7.4 Phase 6c+: update dsa110-rt fan-out --------------------------

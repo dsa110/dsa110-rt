@@ -56,7 +56,19 @@ from ..coinc.voltage_collect import (
 
 LOG = logging.getLogger("dsart.services.c3")
 
-__all__ = ["C3Config", "C3Service", "main"]
+__all__ = ["C3Config", "C3Service", "C3_FLAG_ONLY_KEY", "main"]
+
+#: Runtime override key for the keep/delete mode, written by the
+#: dashboard Control tab ("C3 reject mode" panel) as
+#: ``{"flag_only": bool, "ts": float, "actor": str, "reason": str}``.
+#: When the key is present C3 uses its ``flag_only`` value on every
+#: event; when it is absent (or malformed, or etcd is unreachable) C3
+#: falls back to the configured / CLI default (which itself defaults to
+#: the safe ``flag_only=True``). This makes the destructive REJECT path
+#: a deliberate, audited, fail-safe flip rather than a config redeploy.
+#: Mirrored by ``tools/dashboard/dsa_monitor/voltage_controls.py``;
+#: drift is caught by ``tests/test_voltage_controls.py``.
+C3_FLAG_ONLY_KEY: str = "/cmd/c3/flag_only"
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,12 @@ class C3Config:
     collect_timeout_s: float = 1800.0
     collect_poll_s: float = 15.0
     collect_min_fragments: int = 8       # legacy MIN_CT
+    # Give-up window when NO fragment shows up at all (event was never
+    # dumped — e.g. voltages disabled, or trigger predates the corr
+    # retention window). Bounds the per-event wait so the scan loop can
+    # never wedge on an uncollectable KEEP. Once >=1 fragment lands the
+    # full collect_timeout_s / collect_min_fragments logic takes over.
+    collect_no_show_grace_s: float = 120.0
     rsync_bwlimit_kbps: int = 0
     cleanup_staging_after_keep: bool = True
     flag_only: bool = True               # conservative default
@@ -132,6 +150,8 @@ class C3Config:
             collect_timeout_s=float(c3.get("collect_timeout_s", 1800.0)),
             collect_poll_s=float(c3.get("collect_poll_s", 15.0)),
             collect_min_fragments=int(c3.get("collect_min_fragments", 8)),
+            collect_no_show_grace_s=float(
+                c3.get("collect_no_show_grace_s", 120.0)),
             rsync_bwlimit_kbps=int(c3.get("rsync_bwlimit_kbps", 0)),
             cleanup_staging_after_keep=bool(
                 c3.get("cleanup_staging_after_keep", True)),
@@ -161,6 +181,15 @@ class _StoreWrapper:
             self._store.put_dict(key, dict(value))
         except Exception:  # noqa: BLE001
             LOG.exception("etcd put_dict(%s) failed", key)
+
+    def get_dict(self, key: str) -> Optional[Any]:
+        if not self._available or self._store is None:
+            return None
+        try:
+            return self._store.get_dict(key)
+        except Exception:  # noqa: BLE001
+            LOG.exception("etcd get_dict(%s) failed", key)
+            return None
 
 
 class C3Service:
@@ -232,11 +261,37 @@ class C3Service:
                 out.append(name)
         return out
 
+    # ----- runtime mode ------------------------------------------------
+
+    def _effective_flag_only(self) -> bool:
+        """Resolve the live keep/delete mode.
+
+        Returns the dashboard's ``/cmd/c3/flag_only`` override when that
+        key is present and well-formed, else the configured / CLI default
+        (:attr:`C3Config.flag_only`). Fail-safe in every direction: a
+        missing key, a malformed payload, or an etcd read error all keep
+        the configured value — and since that defaults to ``True``, the
+        destructive REJECT path stays OFF unless an operator has
+        deliberately (and auditably) flipped the key to ``flag_only:
+        false``.
+        """
+        doc = self._mon_store.get_dict(C3_FLAG_ONLY_KEY)
+        if isinstance(doc, Mapping) and "flag_only" in doc:
+            return bool(doc["flag_only"])
+        return self._cfg.flag_only
+
     # ----- per-event processing ----------------------------------------
 
     def process_event(self, name: str) -> Dict[str, Any]:
         ev_dir = self._cfg.archive_root / name
         self._counters["scanned"] += 1
+        override = self._mon_store.get_dict(C3_FLAG_ONLY_KEY)
+        if isinstance(override, Mapping) and "flag_only" in override:
+            flag_only = bool(override["flag_only"])
+            flag_only_source = "etcd_override"
+        else:
+            flag_only = self._cfg.flag_only
+            flag_only_source = "config"
         is_inj = event_is_injection(
             ev_dir, name, fired_log_path=self._cfg.fired_injection_log,
         )
@@ -251,24 +306,25 @@ class C3Service:
             "action": decision.action,
             "rules_fired": list(decision.rules_fired),
             "notes": decision.notes,
+            "flag_only": flag_only,
+            "flag_only_source": flag_only_source,
             "metrics": metrics.__dict__,
-            "flag_only": self._cfg.flag_only,
         }
         if decision.keep:
             rec.update(self._do_keep(name, ev_dir))
             self._counters["kept"] += 1
         else:
-            rec.update(self._do_reject(name, ev_dir, decision))
+            rec.update(self._do_reject(name, ev_dir, decision, flag_only))
         # Always drop an audit sidecar in the (still-present or moved) dir.
         self._write_audit(name, ev_dir, rec)
         self._processed[name] = decision.action + (
-            "(flagged)" if (not decision.keep and self._cfg.flag_only) else ""
+            "(flagged)" if (not decision.keep and flag_only) else ""
         )
         self._save_state()
         LOG.info(
             "C3 %s name=%s inj=%s rules=%s%s",
             decision.action, name, is_inj, list(decision.rules_fired),
-            " [flag-only]" if (not decision.keep and self._cfg.flag_only) else "",
+            " [flag-only]" if (not decision.keep and flag_only) else "",
         )
         return rec
 
@@ -297,6 +353,7 @@ class C3Service:
                     n_present=n_present, n_total=n_total,
                     min_fragments=self._cfg.collect_min_fragments,
                     elapsed_s=elapsed, timeout_s=self._cfg.collect_timeout_s,
+                    no_show_grace_s=self._cfg.collect_no_show_grace_s,
                 ):
                     break
                 time.sleep(self._cfg.collect_poll_s)
@@ -321,10 +378,10 @@ class C3Service:
         return {"keep": report}
 
     def _do_reject(
-        self, name: str, ev_dir: Path, decision,
+        self, name: str, ev_dir: Path, decision, flag_only: bool,
     ) -> Dict[str, Any]:
-        """Conservative cleanup (gated by flag_only)."""
-        if self._cfg.flag_only:
+        """Conservative cleanup (gated by the live ``flag_only`` mode)."""
+        if flag_only:
             self._counters["rejected_flagged_only"] += 1
             return {"reject": {"flag_only": True, "no_action_taken": True}}
 
@@ -399,7 +456,8 @@ class C3Service:
                     "ts_unix": time.time(),
                     "counters": dict(self._counters),
                     "n_processed": len(self._processed),
-                    "flag_only": self._cfg.flag_only,
+                    "flag_only": self._effective_flag_only(),
+                    "flag_only_config": self._cfg.flag_only,
                     "n_corr_nodes": len(self._cfg.corr_nodes),
                 })
                 await asyncio.sleep(self._cfg.mon_interval_s)

@@ -758,6 +758,7 @@ c3:
   collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger
   collect_poll_s: 15.0
   collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land
+  collect_no_show_grace_s: 120.0     # give up if NO fragment shows up at all (event never dumped — e.g. voltages off); bounds the per-event wait so the scan loop can't wedge
   rsync_bwlimit_kbps: 0              # 0 = unthrottled; raise if collection saturates br1
   cleanup_staging_after_keep: true   # free corr NVMe staging once fragments are safely on h23
   # Rollout safety: flag_only logs every veto decision + writes the audit

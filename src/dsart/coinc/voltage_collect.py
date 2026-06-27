@@ -74,12 +74,29 @@ def collection_done(
     min_fragments: int,
     elapsed_s: float,
     timeout_s: float,
+    no_show_grace_s: float = float("inf"),
 ) -> bool:
-    """True when collection should stop: all fragments present, or the
-    timeout elapsed with at least ``min_fragments`` in hand."""
+    """True when collection should stop.
+
+    Stops when:
+
+    * all fragments are present (``n_present >= n_total``); or
+    * the timeout elapsed with at least ``min_fragments`` in hand
+      (legacy dsa110-T3 MIN_CT: proceed with a partial set); or
+    * **no fragment showed up at all** after ``no_show_grace_s`` —
+      the "this event was never dumped" early-out. Without it, an event
+      that never produced any staged voltages (e.g. voltage dumps are
+      disabled, or the trigger predates the corr retention window) would
+      spin the collect loop forever, because ``n_present`` stays 0 and
+      never reaches ``min_fragments``. ``no_show_grace_s`` defaults to
+      ``inf`` (disabled) so existing callers/tests are unaffected; C3
+      passes a finite value (``collect_no_show_grace_s``).
+    """
     if n_present >= n_total:
         return True
     if elapsed_s >= timeout_s and n_present >= min_fragments:
+        return True
+    if n_present == 0 and elapsed_s >= no_show_grace_s:
         return True
     return False
 

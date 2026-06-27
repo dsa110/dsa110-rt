@@ -55,6 +55,27 @@ def test_collection_done_timeout_with_min() -> None:
                                elapsed_s=10.0, timeout_s=100.0)
 
 
+def test_collection_done_no_show_grace() -> None:
+    # No fragment at all + grace elapsed → give up (event never dumped).
+    assert collection_done(n_present=0, n_total=16, min_fragments=8,
+                           elapsed_s=121.0, timeout_s=1800.0,
+                           no_show_grace_s=120.0)
+    # No fragment yet but still within the grace window → keep waiting.
+    assert not collection_done(n_present=0, n_total=16, min_fragments=8,
+                               elapsed_s=30.0, timeout_s=1800.0,
+                               no_show_grace_s=120.0)
+    # At least one fragment landed → the no-show early-out does NOT fire;
+    # fall back to the full timeout / min_fragments logic.
+    assert not collection_done(n_present=1, n_total=16, min_fragments=8,
+                               elapsed_s=200.0, timeout_s=1800.0,
+                               no_show_grace_s=120.0)
+    # Default (no no_show_grace_s) preserves legacy behaviour: 0 present
+    # after timeout but below min → still not done (infinite-wait guard
+    # only active when a finite grace is supplied).
+    assert not collection_done(n_present=0, n_total=16, min_fragments=8,
+                               elapsed_s=99999.0, timeout_s=100.0)
+
+
 def test_collect_fragments_uses_injected_puller(tmp_path: Path) -> None:
     plans = plan_fragments(
         event_name="ev", corr_nodes=_nodes(3),

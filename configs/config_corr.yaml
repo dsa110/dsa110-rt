@@ -20,9 +20,15 @@
 #                        = 4656 × 384 × 2 × 8
 #                        =  28,606,464  (==27.28 MiB)       slow visibilities
 #
-# fada multi-reader (num_readers=2) is for {corr_slow, corr_fast} attached
-# to the same fada ring; bada num_readers=1 = meridian_fringestop only
-# (M2 v1; M3 may add a sink reader for diagnostic taps).
+# fada multi-reader (num_readers=3) is for {corr_slow, corr_fast,
+# voltage_retention} attached to the same fada ring; bada num_readers=1 =
+# meridian_fringestop only (M2 v1; M3 may add a sink reader for diagnostic
+# taps). NOTE: the AUTHORITATIVE runtime ring config is the `buffers:` block
+# in configs/dsart_pipeline_rt.yaml (pushed to etcd /cnf/pipeline_rt and used
+# by dsart_rt to create the rings with `dada_db -r`); this file is the
+# physics-pinned reference. The M8 voltage-retention tap is fada's 3rd reader
+# — keep the two in lockstep (any new reader MUST bump r BEFORE being added or
+# corr_fast's writer stalls at the (n+1)th block waiting on the absent reader).
 #
 # num_blocks values mirror legacy production sizing: 70 fada blocks =
 # ≈ 9.4 s of voltage history at native cadence (134 ms/block); 300 bada
@@ -46,7 +52,7 @@ buffers:
     key: fada
     bytes_per_block: 301989888
     num_blocks: 70
-    num_readers: 2
+    num_readers: 3   # corr_slow + corr_fast + voltage_retention (M8 voltage tap)
     numa_cluster: 1
   bada:
     key: bada

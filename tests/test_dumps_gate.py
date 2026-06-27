@@ -207,8 +207,13 @@ class TestDumpsGateFailOpen:
             # First read: warns + returns True.
             assert gate.enabled() is True
         assert gate.fail_count == 1
+        # DumpsGate is generic (backs both /cmd/c2/dumps_enabled and the
+        # voltages key); its fail-to-default warning is keyed by the etcd
+        # key + the default it fell back to.
         assert any(
-            "dumps_gate" in rec.message and "fail-OPEN" in rec.message
+            "gate(" in rec.message
+            and "etcd read failed" in rec.message
+            and DUMPS_ENABLED_KEY in rec.message
             for rec in caplog.records
         )
 
@@ -233,7 +238,7 @@ class TestDumpsGateFailOpen:
         assert gate.fail_count == 3
         warns = [
             rec for rec in caplog.records
-            if "dumps_gate" in rec.message and "fail-OPEN" in rec.message
+            if "gate(" in rec.message and "etcd read failed" in rec.message
         ]
         assert len(warns) == 1, (
             f"expected 1 rate-limited warn, got {len(warns)}: "
@@ -245,7 +250,7 @@ class TestDumpsGateFailOpen:
             gate.enabled()
         warns = [
             rec for rec in caplog.records
-            if "dumps_gate" in rec.message and "fail-OPEN" in rec.message
+            if "gate(" in rec.message and "etcd read failed" in rec.message
         ]
         assert len(warns) == 2
 

@@ -239,6 +239,31 @@ the result.
 4. **Operator kill-switch** — `/cmd/c2/voltages_enabled` defaults CLOSED; the
    feature is dark until explicitly enabled.
 
+### 5.1 Runtime operator controls (dashboard Control tab)
+
+Two etcd-backed toggles drive the pipeline at runtime; both write an audited
+flip row under `/mon/audit/control/…` (who/why/when) and need a typed
+confirm word as a speed-bump. Implemented in
+`tools/dashboard/dsa_monitor/voltage_controls.py` + routes in `app.py`.
+
+* **Voltage dumps enabled** → `/cmd/c2/voltages_enabled`. The C2
+  voltage-broadcast kill-switch (separate from the cube `dumps_enabled`
+  switch). **Fail-CLOSED**: a missing key means DISABLED, so a cold etcd or a
+  fresh deploy never fills corr NVMe. C2 picks the new value up within its
+  ~200 ms gate-cache TTL.
+* **C3 reject mode (keep/delete)** → `/cmd/c3/flag_only`. C3 re-reads this on
+  every event: `flag_only=true` (the safe default) = collect + log only, NO
+  destructive cleanup; `flag_only=false` = enable the conservative REJECT
+  delete path. A missing/malformed key (or etcd error) falls back to C3's
+  configured `c3.flag_only` (also `true`). This makes the flag-first → soak →
+  auto-delete transition a deliberate, audited, fail-safe flip rather than a
+  config redeploy + restart.
+
+C3 ships installed-and-enabled (flag-only) via `tools/c2/install.sh`
+(`dsart_c3.service`); the corr-side `voltage_retention` reader is fada's 3rd
+reader (`fada num_readers: 3` — keep `configs/config_corr.yaml` and the
+authoritative `configs/dsart_pipeline_rt.yaml` `buffers:` block in lockstep).
+
 ---
 
 ## 6. Test plan

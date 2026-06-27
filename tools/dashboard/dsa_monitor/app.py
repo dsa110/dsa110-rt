@@ -1563,6 +1563,235 @@ def control_dumps_audit():
     return jsonify({"ok": True, "rows": rows})
 
 
+# --- M8 voltage dumps: /cmd/c2/voltages_enabled kill-switch -----------------
+@app.route("/control/voltages_enabled", methods=["GET", "POST"])
+def control_voltages_enabled():
+    """Read or flip the C2 voltage-broadcast kill-switch.
+
+    The C2 coincidencer polls ``/cmd/c2/voltages_enabled`` and only fans
+    out the ``DUMP_VOLTAGE`` UDP triggers to the 16 corr nodes when
+    ``enabled=True``. **Fail-CLOSED**: a missing key means voltages are
+    DISABLED (an expensive ~103 GiB/event capability stays dark until an
+    operator explicitly enables it). Injections never dump voltages
+    regardless of this switch.
+
+    GET  → ``{"enabled", "ts", "actor", "reason", "default"}``
+           (default=True iff the key is missing → enabled=False).
+    POST form fields:
+      ``enabled``  ``true`` / ``false`` (required).
+      ``reason``   free text, 1..240 chars (required, audited).
+      ``confirm``  literal ``enable`` when enabling, ``disable`` when
+                   disabling — deliberate speed-bump.
+    """
+    import voltage_controls                                       # local
+
+    if request.method == "GET":
+        try:
+            state = voltage_controls.get_voltages_state(control_store)
+        except Exception as exc:                                  # noqa: BLE001
+            LOG.exception("get_voltages_state failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, **state})
+
+    f = request.form
+    enabled_raw = (f.get("enabled") or "").strip().lower()
+    if enabled_raw in ("true", "1", "yes", "on"):
+        new_enabled = True
+    elif enabled_raw in ("false", "0", "no", "off"):
+        new_enabled = False
+    else:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"enabled={enabled_raw!r}: must be true / false "
+                f"(true / 1 / yes / on or false / 0 / no / off)"
+            ),
+        }), 400
+
+    reason_raw = (f.get("reason") or "").strip()
+    if not reason_raw:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "reason is required (non-empty string, max "
+                f"{voltage_controls.MAX_REASON_LEN} chars)"
+            ),
+        }), 400
+    if len(reason_raw) > voltage_controls.MAX_REASON_LEN:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"reason too long: {len(reason_raw)} chars (max "
+                f"{voltage_controls.MAX_REASON_LEN})"
+            ),
+        }), 400
+
+    confirm_raw = (f.get("confirm") or "").strip().lower()
+    expected_confirm = "enable" if new_enabled else "disable"
+    if confirm_raw != expected_confirm:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"confirm={confirm_raw!r} does not match the requested "
+                f"direction — type the literal word "
+                f"{expected_confirm!r} to arm the flip"
+            ),
+        }), 400
+
+    actor = f.get("user") or request.remote_addr or "anon"
+    try:
+        new_state = voltage_controls.set_voltages_state(
+            control_store, enabled=new_enabled, reason=reason_raw, actor=actor,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("set_voltages_state failed")
+        try:
+            audit_log(
+                control_store, namespace="c2.voltages_toggle",
+                cn_target="h23", cmd="voltages_toggle",
+                val={"enabled": new_enabled}, ok=False,
+                note=f"exception: {exc!r}", user=actor,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log fallback also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, **new_state})
+
+
+@app.route("/control/voltages_audit", methods=["GET"])
+def control_voltages_audit():
+    """Most recent voltages_toggle audit rows (JSON), newest first."""
+    import voltage_controls                                       # local
+    try:
+        limit = max(1, min(int(request.args.get("limit", "5")), 100))
+    except ValueError:
+        limit = 5
+    try:
+        rows = voltage_controls.list_recent_voltage_toggles(
+            control_store, limit=limit)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("list_recent_voltage_toggles failed")
+        return jsonify({"ok": False, "error": str(exc), "rows": []}), 500
+    return jsonify({"ok": True, "rows": rows})
+
+
+# --- M8 voltage dumps: /cmd/c3/flag_only keep-vs-delete mode ----------------
+@app.route("/control/c3_mode", methods=["GET", "POST"])
+def control_c3_mode():
+    """Read or flip the C3 keep/delete mode (``/cmd/c3/flag_only``).
+
+    C3 reads this per event. ``flag_only=True`` (the safe default) keeps
+    everything: it collects voltages + logs every veto decision but does
+    NO destructive REJECT cleanup. ``flag_only=False`` enables the
+    conservative delete path (delete staged voltages + cubes, MOVE
+    metadata/plots to ``candidates_rejected/``; never an ``rm -rf``).
+    Missing key ⇒ C3 falls back to its configured default (also True).
+
+    GET  → ``{"flag_only", "ts", "actor", "reason", "default"}``.
+    POST form fields:
+      ``flag_only``  ``true`` (keep) / ``false`` (delete) (required).
+      ``reason``     free text, 1..240 chars (required, audited).
+      ``confirm``    literal ``keep`` when flag_only=true, ``delete``
+                     when flag_only=false.
+    """
+    import voltage_controls                                       # local
+
+    if request.method == "GET":
+        try:
+            state = voltage_controls.get_c3_mode_state(control_store)
+        except Exception as exc:                                  # noqa: BLE001
+            LOG.exception("get_c3_mode_state failed")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": True, **state})
+
+    f = request.form
+    flag_raw = (f.get("flag_only") or "").strip().lower()
+    if flag_raw in ("true", "1", "yes", "on", "keep"):
+        new_flag_only = True
+    elif flag_raw in ("false", "0", "no", "off", "delete"):
+        new_flag_only = False
+    else:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"flag_only={flag_raw!r}: must be true (keep) / false "
+                f"(delete)"
+            ),
+        }), 400
+
+    reason_raw = (f.get("reason") or "").strip()
+    if not reason_raw:
+        return jsonify({
+            "ok": False,
+            "error": (
+                "reason is required (non-empty string, max "
+                f"{voltage_controls.MAX_REASON_LEN} chars)"
+            ),
+        }), 400
+    if len(reason_raw) > voltage_controls.MAX_REASON_LEN:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"reason too long: {len(reason_raw)} chars (max "
+                f"{voltage_controls.MAX_REASON_LEN})"
+            ),
+        }), 400
+
+    confirm_raw = (f.get("confirm") or "").strip().lower()
+    # Enabling DELETE (flag_only=false) is the dangerous direction.
+    expected_confirm = "keep" if new_flag_only else "delete"
+    if confirm_raw != expected_confirm:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"confirm={confirm_raw!r} does not match the requested "
+                f"direction — type the literal word "
+                f"{expected_confirm!r} to arm the flip"
+            ),
+        }), 400
+
+    actor = f.get("user") or request.remote_addr or "anon"
+    try:
+        new_state = voltage_controls.set_c3_mode_state(
+            control_store, flag_only=new_flag_only, reason=reason_raw,
+            actor=actor,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("set_c3_mode_state failed")
+        try:
+            audit_log(
+                control_store, namespace="c3.mode_toggle",
+                cn_target="h23", cmd="c3_mode_toggle",
+                val={"flag_only": new_flag_only}, ok=False,
+                note=f"exception: {exc!r}", user=actor,
+            )
+        except Exception:                                          # noqa: BLE001
+            LOG.exception("audit_log fallback also failed (continuing)")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, **new_state})
+
+
+@app.route("/control/c3_mode_audit", methods=["GET"])
+def control_c3_mode_audit():
+    """Most recent c3_mode_toggle audit rows (JSON), newest first."""
+    import voltage_controls                                       # local
+    try:
+        limit = max(1, min(int(request.args.get("limit", "5")), 100))
+    except ValueError:
+        limit = 5
+    try:
+        rows = voltage_controls.list_recent_c3_toggles(
+            control_store, limit=limit)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("list_recent_c3_toggles failed")
+        return jsonify({"ok": False, "error": str(exc), "rows": []}), 500
+    return jsonify({"ok": True, "rows": rows})
+
+
 # --- operator-integration: human authority over the dsa110-operator agent ---
 @app.route("/control/operator", methods=["GET", "POST"])
 def control_operator():
