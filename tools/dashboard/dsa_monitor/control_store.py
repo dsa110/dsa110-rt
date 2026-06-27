@@ -1452,6 +1452,19 @@ DEFAULT_BOUNCE_SLEEP_S: float = 2.0
 #: services_inventory) so the unit tests can patch it cheaply.
 C2_SERVICE_UNIT: str = "dsart_c2.service"
 
+#: The h23 systemd ``--user`` units that make up the dsa110-rt C2/C3
+#: stack — the same set ``tools/c2/install.sh`` installs + enables.
+#: Restarted in this order by :func:`restart_h23_services_local`.
+#: The dashboard's own unit (``dsa_monitor.service``) is deliberately
+#: NOT here: restarting it from inside a request would kill the very
+#: process serving the restart.
+H23_DSART_UNITS: tuple[str, ...] = (
+    "dsart_c2.service",
+    "dsart_c3.service",
+    "hiplot_c1.service",
+    "hiplot_c2.service",
+)
+
 
 def bounce_search(
     store: ControlStore,
@@ -1580,6 +1593,100 @@ def restart_c2_service_local(
         user=user,
     )
     return result
+
+
+def _systemctl_user_restart(unit: str, *, timeout_s: float) -> dict[str, Any]:
+    """Run ``systemctl --user restart <unit>`` once on the local host.
+
+    Returns ``{unit, ok, rc, stdout, stderr, err, elapsed_s}``. Never
+    raises — a missing systemctl binary, a timeout, or a non-zero exit
+    all surface as ``ok=False`` with a descriptive ``err``.
+    """
+    argv = ["systemctl", "--user", "restart", unit]
+    started = time.monotonic()
+    try:
+        cp = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s,
+        )
+        ok = cp.returncode == 0
+        return {
+            "unit": unit,
+            "ok": ok,
+            "rc": cp.returncode,
+            "stdout": cp.stdout or "",
+            "stderr": cp.stderr or "",
+            "err": "" if ok else f"rc={cp.returncode}",
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "unit": unit, "ok": False, "rc": None,
+            "stdout": exc.stdout or "", "stderr": exc.stderr or "",
+            "err": f"timeout after {timeout_s:.1f}s",
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+    except (FileNotFoundError, OSError) as exc:
+        return {
+            "unit": unit, "ok": False, "rc": None,
+            "stdout": "", "stderr": "",
+            "err": f"{type(exc).__name__}: {exc}",
+            "elapsed_s": round(time.monotonic() - started, 3),
+        }
+
+
+def restart_h23_services_local(
+    store: ControlStore,
+    *,
+    units: Iterable[str] = H23_DSART_UNITS,
+    timeout_s: float = 30.0,
+    user: str | None = None,
+) -> dict[str, Any]:
+    """Restart every h23 dsa110-rt ``systemctl --user`` unit, in order.
+
+    Walks :data:`H23_DSART_UNITS` (dsart_c2, dsart_c3, hiplot_c1,
+    hiplot_c2) and runs a local ``systemctl --user restart`` on each.
+    The dashboard runs on h23 as the same user that owns those units, so
+    no ssh is required. The dashboard's own unit is deliberately NOT in
+    the list (it would kill this request mid-flight).
+
+    Returns ``{ok, cmd, results, elapsed_s}`` where ``results`` is the
+    per-unit list from :func:`_systemctl_user_restart`. ``ok`` is True
+    iff every unit restarted cleanly. One summary audit row is written;
+    individual unit failures do NOT abort the rest (best-effort: a wedged
+    hiplot must not stop C2/C3 from cycling). Never raises.
+    """
+    unit_list = [str(u) for u in units]
+    started = time.monotonic()
+    results = [
+        _systemctl_user_restart(u, timeout_s=timeout_s) for u in unit_list
+    ]
+    ok = all(r["ok"] for r in results) and bool(results)
+    elapsed_s = round(time.monotonic() - started, 3)
+    n_ok = sum(1 for r in results if r["ok"])
+    audit_log(
+        store, namespace="services",
+        cn_target="h23",
+        cmd="restart_h23_services",
+        val={r["unit"]: bool(r["ok"]) for r in results},
+        ok=ok,
+        note=(
+            f"{n_ok}/{len(results)} h23 units restarted; "
+            f"elapsed_s={elapsed_s}"
+            + (
+                " failed: " + ",".join(
+                    r["unit"] for r in results if not r["ok"]
+                )
+                if n_ok != len(results) else ""
+            )
+        ),
+        user=user,
+    )
+    return {
+        "ok": ok,
+        "cmd": "restart_h23_services",
+        "results": results,
+        "elapsed_s": elapsed_s,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -85,7 +85,9 @@ from control_store import (
     fleet_service_status,
     list_recent_audit,
     restart_c2_service_local,
+    restart_h23_services_local,
 )
+from control_store import H23_DSART_UNITS
 from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
 from sefd_view import (
     DEFAULT_RESULTS_DIR as SEFD_DEFAULT_RESULTS_DIR,
@@ -649,6 +651,7 @@ def control_page():
         spectral_line_min_integration_s=slg.MIN_INTEGRATION_S,
         spl_chgroup_freqs=spl_chgroup_freqs,
         spl_raw_chan_khz=spl_raw_chan_khz,
+        h23_dsart_units=list(H23_DSART_UNITS),
     )
 
 
@@ -2083,6 +2086,40 @@ def control_restart_c2_post():
         result = restart_c2_service_local(control_store, user=user)
     except Exception as exc:                                       # noqa: BLE001
         LOG.exception("restart_c2_service_local failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(result)
+
+
+@app.route("/control/restart_h23", methods=["POST"])
+def control_restart_h23_post():
+    """Restart all dsa110-rt h23 ``systemctl --user`` units.
+
+    Cycles, in order, the units in
+    :data:`control_store.H23_DSART_UNITS` (dsart_c2, dsart_c3,
+    hiplot_c1, hiplot_c2) via local ``systemctl --user restart``. The
+    dashboard's own unit is excluded. Best-effort: one unit failing does
+    not abort the rest; ``ok`` is True only if every unit restarted.
+
+    Form fields:
+
+      confirm    Must literally equal ``restart_h23``.
+
+    Returns the dict :func:`restart_h23_services_local` returns.
+    """
+    confirm = request.form.get("confirm", "").strip()
+    if confirm != "restart_h23":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "restart_h23 requires confirm=restart_h23 in the POST "
+                "body — this is a deliberate safety speed bump."
+            ),
+        }), 400
+    user = request.form.get("user") or request.remote_addr or "anon"
+    try:
+        result = restart_h23_services_local(control_store, user=user)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("restart_h23_services_local failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify(result)
 

@@ -1047,6 +1047,84 @@ class TestRestartC2ServiceLocal:
         assert "FileNotFoundError" in out["err"]
 
 
+class TestRestartH23ServicesLocal:
+    """``restart_h23_services_local`` cycles every h23 dsa110-rt unit via
+    local ``systemctl --user restart`` and writes ONE summary audit row.
+    """
+
+    def test_all_units_restarted_in_order_ok(
+        self, fake_store_pair, monkeypatch
+    ):
+        cs, fake = fake_store_pair
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_h23_services_local(cs, user="ops")
+        assert out["ok"] is True
+        assert out["cmd"] == "restart_h23_services"
+        # One systemctl call per unit, in inventory order.
+        restarted = [c[-1] for c in calls]
+        assert restarted == list(control_store.H23_DSART_UNITS)
+        assert all(c[:3] == ["systemctl", "--user", "restart"] for c in calls)
+        assert [r["unit"] for r in out["results"]] == list(
+            control_store.H23_DSART_UNITS)
+        assert all(r["ok"] for r in out["results"])
+        # Exactly one summary audit row.
+        audit = [p for p in fake.puts
+                 if p[0].startswith("/mon/audit/control/")]
+        assert len(audit) == 1
+        assert audit[0][1]["cmd"] == "restart_h23_services"
+        assert audit[0][1]["ok"] is True
+        assert audit[0][1]["val"] == {
+            u: True for u in control_store.H23_DSART_UNITS}
+
+    def test_one_unit_fails_others_still_run_and_overall_not_ok(
+        self, fake_store_pair, monkeypatch
+    ):
+        cs, fake = fake_store_pair
+
+        def fake_run(argv, **kwargs):
+            unit = argv[-1]
+            rc = 5 if unit == "dsart_c3.service" else 0
+            return mock.Mock(returncode=rc, stdout="", stderr="boom")
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_h23_services_local(cs)
+        assert out["ok"] is False
+        # All units were still attempted (best-effort).
+        assert len(out["results"]) == len(control_store.H23_DSART_UNITS)
+        bad = [r for r in out["results"] if not r["ok"]]
+        assert [r["unit"] for r in bad] == ["dsart_c3.service"]
+        audit = [p for p in fake.puts
+                 if p[0].startswith("/mon/audit/control/")]
+        assert len(audit) == 1
+        assert audit[0][1]["ok"] is False
+        assert "dsart_c3.service" in audit[0][1]["note"]
+
+    def test_timeout_on_one_unit_is_contained(
+        self, fake_store_pair, monkeypatch
+    ):
+        cs, _ = fake_store_pair
+        import subprocess as _sp
+
+        def fake_run(argv, **kwargs):
+            if argv[-1] == "hiplot_c1.service":
+                raise _sp.TimeoutExpired(cmd=argv, timeout=30.0)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(control_store.subprocess, "run", fake_run)
+        out = control_store.restart_h23_services_local(cs)
+        assert out["ok"] is False
+        to = [r for r in out["results"] if r["unit"] == "hiplot_c1.service"][0]
+        assert "timeout" in to["err"]
+        # The other three still report a result.
+        assert len(out["results"]) == len(control_store.H23_DSART_UNITS)
+
+
 class TestC2MonSnapshot:
     """``c2_mon_snapshot`` derives a compact JSON-ready view of
     ``/mon/c2/h23``. Missing key → ok=False, present key → broken

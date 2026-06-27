@@ -158,6 +158,7 @@
         <li><a href="#panel-verbs">Verbs (start / arm / stop / restart / update)</a></li>
         <li><a href="#panel-fstables">Fringe-stopping tables (per-DEC cache)</a></li>
         <li><a href="#panel-c2-quickops">C2 recovery &amp; activity</a></li>
+        <li><a href="#panel-restart-h23">Restart h23 services</a></li>
         <li><a href="#panel-services">Fleet services</a></li>
         <li><a href="#panel-inject">Signal injection</a></li>
         <li><a href="#panel-calibrate">Injection SNR calibration</a></li>
@@ -821,6 +822,43 @@ async function guardedStart(event) {
     <h4 style="margin-top: 16px;">C2 decision log (last 10 min)</h4>
     <pre id="c2-journal-pre" class="info-blob"
          style="max-height: 280px; overflow-y: auto;">loading…</pre>
+</div>
+
+<!-- Restart all dsa110-rt h23 services -->
+<div class="panel" style="margin-top: 24px;" id="panel-restart-h23">
+    <h3>Restart h23 services (dsa110-rt)</h3>
+    <p class="muted">
+        Local <code>systemctl --user restart</code> of every dsa110-rt
+        h23 service, in order:
+        {% for u in h23_dsart_units %}<code>{{ u }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+        Use after a config push to etcd or when the C2/C3/hiplot stack
+        on h23 is wedged. This restarts the <strong>h23-local</strong>
+        services only — it does <strong>not</strong> touch the corr /
+        search orchestrators (use "Restart everything" below for the
+        full fleet). The dashboard's own service is deliberately
+        excluded so this never kills the page mid-request. Best-effort:
+        one unit failing does not stop the others; result is OK only if
+        every unit restarts. Audited to
+        <code>/mon/audit/control/&lt;iso_ts&gt;</code>.
+    </p>
+    <form id="form-restart-h23" onsubmit="return submitRestartH23(event);">
+        <div class="verb-row">
+            <label for="restart_h23_confirm">type "restart_h23"</label>
+            <input type="text" id="restart_h23_confirm" name="confirm"
+                   placeholder="restart_h23" autocomplete="off" />
+            <button type="submit" class="danger">Restart h23 services</button>
+        </div>
+        <div class="muted">
+            C2's C1 receiver (port 11500) blips for ~1&nbsp;s and the
+            search-side <code>c1_emit</code> sockets auto-reconnect; C3
+            re-reads its state file and resumes where it left off
+            (in-progress collections restart). In-process matcher
+            counters reset; the persistent etcd inject registry and the
+            <code>/cmd/c2/voltages_enabled</code> + <code>/cmd/c3/flag_only</code>
+            switches are unaffected.
+        </div>
+        <div id="resp-restart-h23" class="response"></div>
+    </form>
 </div>
 
 <!-- M7.4 Phase 8 v2: fleet services status panel -->
@@ -2586,6 +2624,49 @@ async function submitRestartC2(ev) {
         JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
     btn.disabled = false;
     setTimeout(refreshC2Counters, 2000);
+    return false;
+}
+
+// ---- Restart all dsa110-rt h23 services --------------------------------
+async function submitRestartH23(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-restart-h23");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>restarting h23 services…</span>";
+    const fd = new FormData(form);
+    let r, j;
+    try {
+        r = await fetch("/control/restart_h23", {method: "POST", body: fd});
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    const cls = j.ok ? "ok" : "err";
+    let html = "<span class='" + cls + "'>" + (j.ok ? "OK" : "FAIL") + "</span>";
+    if (Array.isArray(j.results)) {
+        html += "<table class='audit-table' style='margin-top:8px;'>" +
+            "<thead><tr><th>unit</th><th>result</th><th>elapsed</th>" +
+            "<th>err</th></tr></thead><tbody>";
+        html += j.results.map(function (u) {
+            const ucls = u.ok ? "ok" : "err";
+            return "<tr><td><code>" + (u.unit || "?") + "</code></td>" +
+                "<td class='" + ucls + "'>" + (u.ok ? "OK" : "FAIL") + "</td>" +
+                "<td>" + (u.elapsed_s != null ? u.elapsed_s + "s" : "?") + "</td>" +
+                "<td>" + String(u.err || "").replace(/</g, "&lt;") + "</td></tr>";
+        }).join("");
+        html += "</tbody></table>";
+    }
+    if (j.error) {
+        html += "<div class='info-blob'><span class='err'>" +
+            String(j.error).replace(/</g, "&lt;") + "</span></div>";
+    }
+    respEl.innerHTML = html;
+    btn.disabled = false;
+    setTimeout(refreshC2Counters, 2500);
     return false;
 }
 
