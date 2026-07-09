@@ -267,6 +267,8 @@ def sefds():
     """SEFD landing page: per-day x per-source grid with the headline
     metrics inline.  Reads the scanner's ``state.json`` directly via
     the :class:`SefdView` singleton; no iframe."""
+    import bfweights_update                                       # local
+
     try:
         lookback = int(request.args.get("days", "7"))
     except ValueError:
@@ -278,6 +280,7 @@ def sefds():
         summary=summary,
         sefd_state_path=SEFD_STATE_FILE,
         sefd_state_error=sefd_view.state_error(),
+        bf_latest=bfweights_update.latest_descriptors(summary.sources),
     )
 
 
@@ -360,6 +363,92 @@ def api_sefd_status():
         "scanner_age_s": summary.scanner_age_s,
         "currently_processing": summary.currently_processing,
     })
+
+
+# ---------- SEFD page: beamformer-weights (calibration) update -------------
+#
+# One button per calibrator on /sefds. The heavy lifting (descriptor
+# discovery + the calibration23 container run + audit) lives in
+# ``bfweights_update.py``; these routes are the only Flask entry points.
+
+
+@app.route("/control/update_bfweights", methods=["POST"])
+def control_update_bfweights_post():
+    """Kick off ``update_bfweights.py <SRC>_<ISOT>`` in the
+    calibration23 container, in a background thread.
+
+    Form fields:
+
+      ``source``   Calibrator name; must be one of the SEFD-tracked
+                   sources. The newest generated solution for that
+                   source is resolved server-side (the client also
+                   sees it via the page context, purely for display).
+      ``confirm``  Must literally equal ``update_bfweights``.
+      ``dry_run``  Optional "true"/"1" — exercises the container
+                   plumbing (env import + echo) without touching cals.
+
+    Returns 202 + ``{job_id, poll_url}``; poll for completion.
+    """
+    import bfweights_update                                       # local
+
+    confirm = (request.form.get("confirm") or "").strip()
+    if confirm != "update_bfweights":
+        return jsonify({
+            "ok": False,
+            "error": (
+                "update_bfweights requires confirm=update_bfweights "
+                "in the POST body — deliberate safety speed bump."
+            ),
+        }), 400
+    source = (request.form.get("source") or "").strip()
+    if source not in sefd_view.sources:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"source {source!r} is not an SEFD-tracked calibrator "
+                f"(expected one of {sorted(sefd_view.sources)})"
+            ),
+        }), 400
+    dry_raw = (request.form.get("dry_run") or "").strip().lower()
+    dry_run = dry_raw in ("1", "true", "yes")
+    user = request.form.get("user") or request.remote_addr or "anon"
+
+    latest = bfweights_update.latest_descriptor(source)
+    if latest is None:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"no beamformer_weights_{source}_*.yaml found under "
+                f"{bfweights_update.GENERATED_DIR}"
+            ),
+        }), 412
+    try:
+        started = bfweights_update.start_update(
+            latest["descriptor"], dry_run=dry_run, user=user,
+            store=control_store,
+        )
+    except RuntimeError as exc:          # single-flight: already running
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({
+        "ok": True,
+        "accepted": True,
+        **started,
+        "age_hours": latest.get("age_hours"),
+        "poll_url": f"/control/update_bfweights/{started['job_id']}",
+    }), 202
+
+
+@app.route("/control/update_bfweights/<job_id>", methods=["GET"])
+def control_update_bfweights_poll(job_id: str):
+    """Poll a previously-started update_bfweights job."""
+    import bfweights_update                                       # local
+
+    snap = bfweights_update.job_snapshot(job_id)
+    if snap is None:
+        return jsonify({"ok": False, "error": "unknown job_id"}), 404
+    return jsonify({"ok": True, **snap})
 
 
 @app.route("/bursts")

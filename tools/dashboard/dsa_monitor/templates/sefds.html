@@ -101,6 +101,27 @@
     }
     .sefd-status-pill.stale .dot   { background: #d4a017; }
     .sefd-status-pill.missing .dot { background: #d63031; }
+    /* Per-calibrator "Update cals" button (beamformer weights). */
+    .bf-update-btn {
+        margin-top: 5px;
+        padding: 3px 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: white;
+        background: #0984e3;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+    }
+    .bf-update-btn:hover:not(:disabled) { background: #74b9ff; }
+    .bf-update-btn:disabled { background: #b2bec3; cursor: wait; }
+    .bf-update-sub {
+        font-size: 10px;
+        font-weight: 400;
+        color: #dfe6e9;
+        margin-top: 3px;
+        font-family: 'Menlo', 'Consolas', monospace;
+    }
 </style>
 {% endblock %}
 
@@ -143,6 +164,8 @@
 </div>
 {% endif %}
 
+<div id="bf-update-banner" class="banner info" style="display: none;"></div>
+
 <div class="controls">
     <label for="days">Lookback:</label>
     <select id="days" onchange="window.location='/sefds?days='+this.value">
@@ -179,7 +202,22 @@
                    style="color: white;">{{ source }}</a><br>
                 <small style="font-weight: 500;">
                     {{ summary.source_flux[source].flux_jy }} Jy
-                </small>
+                </small><br>
+                {% set bf = bf_latest.get(source) if bf_latest else none %}
+                {% if bf %}
+                <button class="bf-update-btn"
+                        data-source="{{ source }}"
+                        data-descriptor="{{ bf.descriptor }}"
+                        data-age="{{ bf.age_hours }}"
+                        title="Run update_bfweights.py {{ bf.descriptor }} on calibration23">
+                    Update cals
+                </button>
+                <div class="bf-update-sub">
+                    {{ bf.isot }} ({{ bf.age_hours }}&nbsp;h old)
+                </div>
+                {% else %}
+                <div class="bf-update-sub">no generated solution</div>
+                {% endif %}
             </th>
             {% endfor %}
         </tr>
@@ -265,4 +303,110 @@
     and served back here through this dashboard's
     <code>/sefds/results/&lt;path&gt;</code> route.
 </p>
+
+<script>
+// ---- per-calibrator beamformer-weights update ---------------------------
+// Button → typed-confirm dialog → POST /control/update_bfweights →
+// poll the job until done. Server re-resolves the newest descriptor
+// itself; the one shown here is display-only.
+(function () {
+    const banner = document.getElementById("bf-update-banner");
+
+    function showBanner(cls, html) {
+        banner.className = "banner " + cls;
+        banner.innerHTML = html;
+        banner.style.display = "";
+    }
+
+    function setButtonsDisabled(disabled) {
+        document.querySelectorAll(".bf-update-btn").forEach(
+            (b) => { b.disabled = disabled; }
+        );
+    }
+
+    async function poll(pollUrl, source, descriptor) {
+        try {
+            const r = await fetch(pollUrl);
+            const d = await r.json();
+            if (!d.ok) {
+                showBanner("error",
+                    "<strong>update_bfweights:</strong> poll failed: "
+                    + (d.error || "unknown"));
+                setButtonsDisabled(false);
+                return;
+            }
+            if (!d.done) {
+                const secs = Math.round(Date.now() / 1000 - d.started_unix);
+                showBanner("info",
+                    "<strong>Updating cals from " + source + "</strong> "
+                    + "(<code>" + descriptor + "</code>) &mdash; running "
+                    + secs + " s (script takes ~2&ndash;5 min; it "
+                    + "re-averages, copies weights, then publishes "
+                    + "<code>update_weights</code>)&hellip;");
+                setTimeout(() => poll(pollUrl, source, descriptor), 3000);
+                return;
+            }
+            const tail = (d.output_tail || []).slice(-8).join("\n");
+            if (d.error === null) {
+                showBanner("info",
+                    "<strong>Cal update from " + source + " finished OK</strong> "
+                    + "(<code>" + descriptor + "</code>"
+                    + (d.dry_run ? ", DRY RUN" : "") + ").<br>"
+                    + "<pre style='margin:6px 0 0; font-size:11px; "
+                    + "white-space:pre-wrap;'>" + tail + "</pre>");
+            } else {
+                showBanner("error",
+                    "<strong>Cal update from " + source + " FAILED</strong> "
+                    + "(" + (d.error || "unknown error") + ").<br>"
+                    + "<pre style='margin:6px 0 0; font-size:11px; "
+                    + "white-space:pre-wrap;'>" + tail + "</pre>");
+            }
+            setButtonsDisabled(false);
+        } catch (e) {
+            showBanner("error",
+                "<strong>update_bfweights:</strong> poll error: " + e);
+            setButtonsDisabled(false);
+        }
+    }
+
+    document.querySelectorAll(".bf-update-btn").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+            const source = btn.dataset.source;
+            const descriptor = btn.dataset.descriptor;
+            const age = btn.dataset.age;
+            const msg =
+                "Update beamformer weights (calibrations) from:\n\n"
+                + "    " + descriptor + "   (" + age + " h old)\n\n"
+                + "This runs update_bfweights.py on calibration23 and "
+                + "pushes new weights to the LIVE system.\n\n"
+                + "Proceed?";
+            if (!window.confirm(msg)) return;
+            setButtonsDisabled(true);
+            showBanner("info",
+                "<strong>Starting cal update from " + source
+                + "</strong> (<code>" + descriptor + "</code>)&hellip;");
+            const fd = new FormData();
+            fd.append("source", source);
+            fd.append("confirm", "update_bfweights");
+            try {
+                const r = await fetch("/control/update_bfweights",
+                                      {method: "POST", body: fd});
+                const d = await r.json();
+                if (!d.ok) {
+                    showBanner("error",
+                        "<strong>update_bfweights refused:</strong> "
+                        + (d.error || "unknown"));
+                    setButtonsDisabled(false);
+                    return;
+                }
+                poll(d.poll_url, source, d.descriptor);
+            } catch (e) {
+                showBanner("error",
+                    "<strong>update_bfweights:</strong> request error: " + e);
+                setButtonsDisabled(false);
+            }
+        });
+    });
+})();
+</script>
 {% endblock %}
