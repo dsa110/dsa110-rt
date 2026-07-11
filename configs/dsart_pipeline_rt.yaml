@@ -421,9 +421,17 @@ routines:
   # nodes and needs no CALSB substitution. The blob is the same legacy
   # format `dsart.cal.bf_weights.load_bf_weights` reads (the old
   # `beamformer_weights_sb<NN>.dat` files were this same format), so the
-  # fast-corr cal loader consumes it unchanged. Hot-reload via
-  # `cmd: reload_cal`. (CALSB is still substituted by dsart_rt for any
-  # other per-node args that want it; it is just no longer used here.)
+  # fast-corr cal loader consumes it unchanged. `--apply-cal` is read
+  # ONCE at routine spawn (process startup) — there is no hot-reload:
+  # `cmd: reload_cal` is accepted-and-logged by dsart_rt
+  # (`_LOGGED_VERBS`) but is an unimplemented no-op ("no-op until
+  # later M7 chunk" — see dsart_rt.py). To pick up a new weights file
+  # an operator must `stop` then `start` this instance (a fresh spawn
+  # re-reads the file). dsart_rt publishes what it actually loaded to
+  # `/mon/corr_rt/<cn>/cal_file` on each `start` so this can be
+  # cross-checked against the latest distributed solution. (CALSB is
+  # still substituted by dsart_rt for any other per-node args that
+  # want it; it is just no longer used here.)
   #
   # GPU isolation: CUDA_VISIBLE_DEVICES=1 hides GPU 0 from this
   # process; the post-mask logical device 0 == physical GPU 1, which
