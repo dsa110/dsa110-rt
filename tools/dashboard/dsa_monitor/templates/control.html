@@ -701,6 +701,13 @@ window.addEventListener("DOMContentLoaded", () => {
 // underlying /control/start verb is unchanged — this is purely a
 // client-side speed bump on the regression that landed 2026-06-03.
 async function guardedStart(event) {
+    // Cancel the native form submission synchronously, before any
+    // await below — an async handler returns a Promise (truthy), so
+    // the browser is not guaranteed to honor a preventDefault() that
+    // only happens after the first await (it happens inside
+    // submitVerb() at the end of this function, calling it again here
+    // is harmless/idempotent).
+    event.preventDefault();
     const lightEl = document.getElementById("fst-light");
     let cls = (lightEl && lightEl.className) || "";
     // Pull fresh status synchronously so a stale 60-s-old light
