@@ -93,6 +93,13 @@
         background: #fab1a0;
         color: #79190e;
     }
+    /* Neutral/informational pill -- expected states that aren't errors
+       (e.g. older fleet nodes that haven't been restarted with the
+       cal-visibility code yet). Muted grey, no alarm color. */
+    .sefd-status-pill.info {
+        background: #eef0f2;
+        color: #636e72;
+    }
     .sefd-status-pill .dot {
         width: 8px;
         height: 8px;
@@ -101,6 +108,20 @@
     }
     .sefd-status-pill.stale .dot   { background: #d4a017; }
     .sefd-status-pill.missing .dot { background: #d63031; }
+    .sefd-status-pill.info .dot    { background: #b2bec3; }
+    /* Amber "due for update" note -- a soft heads-up, not an error. */
+    .cal-due-note {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 600;
+        background: #fff6df;
+        color: #8a6d00;
+        margin-top: 8px;
+    }
     /* Per-calibrator "Update cals" button (beamformer weights). */
     .bf-update-btn {
         margin-top: 5px;
@@ -121,6 +142,15 @@
         color: #dfe6e9;
         margin-top: 3px;
         font-family: 'Menlo', 'Consolas', monospace;
+    }
+    /* Age-in-brackets badges next to Pipeline-weights timestamps.
+       Mirrors .sefd-cell-metric's warn color for the stale case. */
+    .cal-age {
+        color: #636e72;
+    }
+    .cal-age.warn {
+        color: #d63031;
+        font-weight: 700;
     }
 </style>
 {% endblock %}
@@ -168,11 +198,25 @@
 
 {% if pipeline_weights %}
 <div class="card" style="padding: 12px 16px; margin-bottom: 14px;">
+    <div style="font-size: 13px; margin-bottom: 4px;">
+        <strong>Pipeline weights:</strong>
+        {% if pipeline_weights.transit_isot %}
+        <span>
+            solution: <code>{{ pipeline_weights.distributed_source or 'unknown source' }}</code>
+            transit <code>{{ pipeline_weights.transit_isot }}</code>
+            {% if pipeline_weights.transit_age_hours is not none %}
+            <span class="cal-age{% if pipeline_weights.due_for_update %} warn{% endif %}">({{ '%.1f'|format(pipeline_weights.transit_age_hours) }}&nbsp;h ago)</span>
+            {% endif %}
+        </span>
+        {% endif %}
+    </div>
     <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-        <strong style="font-size: 13px;">Pipeline weights:</strong>
         {% if pipeline_weights.distributed_isot %}
         <span class="muted">
             distributed <code>{{ pipeline_weights.distributed_isot }}</code>
+            {% if pipeline_weights.distributed_age_hours is not none %}
+            <span class="cal-age">({{ '%.1f'|format(pipeline_weights.distributed_age_hours) }}&nbsp;h ago)</span>
+            {% endif %}
             {% if pipeline_weights.distributed_source %}
             from <code>{{ pipeline_weights.distributed_source }}</code>
             {% endif %}
@@ -185,7 +229,7 @@
         {% endif %}
 
         {% if not pipeline_weights.any_reported %}
-        <span class="sefd-status-pill missing" title="dsart_rt on the corr fleet needs a stop/start with the cal-visibility code before this can report">
+        <span class="sefd-status-pill info" title="dsart_rt on the corr fleet needs a stop/start with the cal-visibility code before this can report">
             <span class="dot"></span>
             not reported by pipeline (needs restart with new dsart code)
         </span>
@@ -193,16 +237,31 @@
         <span class="sefd-status-pill stale">
             <span class="dot"></span>
             STALE &mdash; loaded {{ pipeline_weights.consensus_isot }}
+            {% if pipeline_weights.consensus_age_hours is not none %}
+            ({{ '%.1f'|format(pipeline_weights.consensus_age_hours) }}&nbsp;h ago)
+            {% endif %}
             ({{ pipeline_weights.n_reported }}/{{ pipeline_weights.n_total }} nodes reporting)
         </span>
         {% else %}
         <span class="sefd-status-pill">
             <span class="dot"></span>
             loaded {{ pipeline_weights.consensus_isot }}
+            {% if pipeline_weights.consensus_age_hours is not none %}
+            ({{ '%.1f'|format(pipeline_weights.consensus_age_hours) }}&nbsp;h ago)
+            {% endif %}
             ({{ pipeline_weights.n_reported }}/{{ pipeline_weights.n_total }} nodes reporting)
         </span>
         {% endif %}
     </div>
+
+    {% if pipeline_weights.due_for_update %}
+    <div>
+        <span class="cal-due-note">
+            due for update &mdash; apply a fresh solution
+            (expected cadence ~2 days)
+        </span>
+    </div>
+    {% endif %}
 
     {% if pipeline_weights.disagreeing %}
     <div class="sefd-error-line" style="max-width: none; margin-top: 8px;">

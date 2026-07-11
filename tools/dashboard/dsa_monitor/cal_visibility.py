@@ -25,7 +25,10 @@ code)" state, not an error.
 
 from __future__ import annotations
 
+import datetime
+import os
 import re
+import time
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
@@ -34,7 +37,35 @@ from corr_topology import CORR_NODES
 CAL_FILE_KEY_TMPL = "/mon/corr_rt/{cn}/cal_file"
 BFWEIGHTS_KEY = "/mon/cal/bfweights"
 
+#: h23 view of the fleet-YAML directories (same layout as
+#: bfweights_update.py's GENERATED_DIR) -- used only as a fallback to
+#: recover ``caltime`` (the calibrator TRANSIT epoch, MJD) for older
+#: ``/mon/cal/bfweights`` payloads that don't embed it directly.
+GENERATED_DIR = "/dataz/dsa110/operations/beamformer_weights/generated"
+APPLIED_DIR = "/dataz/dsa110/operations/beamformer_weights/applied"
+
+#: MJD of the Unix epoch (1970-01-01T00:00:00 UTC).
+_MJD_UNIX_EPOCH = 40587
+
 _ISOT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _age_hours_from_isot(isot: Optional[str]) -> Optional[float]:
+    """Hours since ``isot`` (a ``YYYY-MM-DDTHH:MM:SS`` UTC timestamp).
+
+    Same UTC-naive-parse convention as ``bfweights_update.py``'s
+    ``latest_descriptor`` age calc. Never raises -- an unparseable or
+    missing timestamp just means no age badge is shown.
+    """
+    if not isot:
+        return None
+    try:
+        dt = datetime.datetime.strptime(
+            isot, "%Y-%m-%dT%H:%M:%S"
+        ).replace(tzinfo=datetime.timezone.utc)
+        return round((time.time() - dt.timestamp()) / 3600.0, 1)
+    except (ValueError, TypeError):
+        return None
 
 
 def _distributed_isot(bfweights_doc: Optional[Any]) -> Optional[str]:
@@ -72,6 +103,73 @@ def _distributed_source(bfweights_doc: Optional[Any]) -> Optional[str]:
     return None
 
 
+def _mjd_to_isot(mjd: Any) -> Optional[str]:
+    """MJD (float) -> ``YYYY-MM-DDTHH:MM:SS`` UTC ISOT, or None."""
+    try:
+        unix = (float(mjd) - _MJD_UNIX_EPOCH) * 86400.0
+        dt = datetime.datetime.utcfromtimestamp(unix)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _caltime_mjd(doc: Optional[Any]) -> Optional[float]:
+    """Pull a ``caltime`` (MJD, possibly a 1-element list) out of a
+    bfweights ``val`` dict or a fleet YAML dict -- both use the same
+    key name."""
+    if not isinstance(doc, dict):
+        return None
+    ct = doc.get("caltime")
+    if isinstance(ct, list) and ct:
+        ct = ct[0]
+    if isinstance(ct, (int, float)):
+        return float(ct)
+    return None
+
+
+def _transit_isot_fallback(distributed_isot: Optional[str]) -> Optional[str]:
+    """Best-effort recovery of the transit ISOT from the on-disk fleet
+    YAML matching ``distributed_isot``, for bfweights payloads that
+    don't carry ``caltime`` directly. Never raises; missing/unreadable
+    files or a missing PyYAML just mean no transit line is shown.
+    """
+    if not distributed_isot:
+        return None
+    try:
+        import yaml  # local import -- optional dependency for this fallback only
+    except Exception:  # noqa: BLE001
+        return None
+    for directory in (APPLIED_DIR, GENERATED_DIR):
+        path = os.path.join(
+            directory, f"beamformer_weights_{distributed_isot}.yaml"
+        )
+        try:
+            with open(path, "r") as f:
+                doc = yaml.safe_load(f)
+        except Exception:  # noqa: BLE001
+            continue
+        mjd = _caltime_mjd(doc)
+        if mjd is not None:
+            return _mjd_to_isot(mjd)
+    return None
+
+
+def _transit_isot(
+    bfweights_doc: Optional[Any], distributed_isot: Optional[str]
+) -> Optional[str]:
+    """ISOT of the calibrator TRANSIT that produced the distributed
+    solution (the ``caltime`` MJD field) -- distinct from
+    ``distributed_isot``, which is when the fleet YAML was written.
+    Prefers the value embedded in the etcd payload; falls back to
+    reading it off the matching fleet YAML on disk.
+    """
+    val = bfweights_doc.get("val") if isinstance(bfweights_doc, dict) else None
+    mjd = _caltime_mjd(val) if isinstance(val, dict) else None
+    if mjd is not None:
+        return _mjd_to_isot(mjd)
+    return _transit_isot_fallback(distributed_isot)
+
+
 def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     """One-shot summary dict for the SEFDs page "Pipeline weights" panel.
 
@@ -84,12 +182,17 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     Returned shape::
 
         {
-          "distributed_isot": str | None,
+          "transit_isot": str | None,        # calibrator transit that produced the solution (caltime, UTC)
+          "transit_age_hours": float | None,  # hours since transit_isot (UTC) -- PRIMARY staleness clock
+          "due_for_update": bool,            # transit_age_hours > 48 (expected cadence ~2 days)
+          "distributed_isot": str | None,    # fleet-YAML write time (secondary clock)
+          "distributed_age_hours": float | None,  # hours since distributed_isot (UTC)
           "distributed_source": str | None,
           "n_total": int,            # 16 corr nodes
           "n_reported": int,         # nodes with a cal_file mon key
           "any_reported": bool,
           "consensus_isot": str | None,   # majority mtime_isot among reporting nodes
+          "consensus_age_hours": float | None,    # hours since consensus_isot (UTC)
           "stale": bool,             # consensus_isot < distributed_isot
           "disagreeing": [ {cn_id, host, mtime_isot, ...}, ... ],
           "nodes": [ {cn_id, host, reported, mtime_isot, path, ...}, ... ],
@@ -101,6 +204,8 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
         bfweights_doc = None
     distributed_isot = _distributed_isot(bfweights_doc)
     distributed_source = _distributed_source(bfweights_doc)
+    transit_isot = _transit_isot(bfweights_doc, distributed_isot)
+    transit_age_hours = _age_hours_from_isot(transit_isot)
 
     nodes: List[Dict[str, Any]] = []
     for cn in CORR_NODES:
@@ -145,12 +250,19 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     )
 
     return {
+        "transit_isot": transit_isot,
+        "transit_age_hours": transit_age_hours,
+        "due_for_update": bool(
+            transit_age_hours is not None and transit_age_hours > 48
+        ),
         "distributed_isot": distributed_isot,
+        "distributed_age_hours": _age_hours_from_isot(distributed_isot),
         "distributed_source": distributed_source,
         "n_total": len(nodes),
         "n_reported": n_reported,
         "any_reported": n_reported > 0,
         "consensus_isot": consensus_isot,
+        "consensus_age_hours": _age_hours_from_isot(consensus_isot),
         "stale": stale,
         "disagreeing": disagreeing,
         "nodes": nodes,
