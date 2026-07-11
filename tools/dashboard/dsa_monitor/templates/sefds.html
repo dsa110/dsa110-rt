@@ -166,6 +166,66 @@
 
 <div id="bf-update-banner" class="banner info" style="display: none;"></div>
 
+{% if pipeline_weights %}
+<div class="card" style="padding: 12px 16px; margin-bottom: 14px;">
+    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+        <strong style="font-size: 13px;">Pipeline weights:</strong>
+        {% if pipeline_weights.distributed_isot %}
+        <span class="muted">
+            distributed <code>{{ pipeline_weights.distributed_isot }}</code>
+            {% if pipeline_weights.distributed_source %}
+            from <code>{{ pipeline_weights.distributed_source }}</code>
+            {% endif %}
+        </span>
+        {% else %}
+        <span class="muted">
+            no distributed solution reported
+            (<code>/mon/cal/bfweights</code> unreadable/empty)
+        </span>
+        {% endif %}
+
+        {% if not pipeline_weights.any_reported %}
+        <span class="sefd-status-pill missing" title="dsart_rt on the corr fleet needs a stop/start with the cal-visibility code before this can report">
+            <span class="dot"></span>
+            not reported by pipeline (needs restart with new dsart code)
+        </span>
+        {% elif pipeline_weights.stale %}
+        <span class="sefd-status-pill stale">
+            <span class="dot"></span>
+            STALE &mdash; loaded {{ pipeline_weights.consensus_isot }}
+            ({{ pipeline_weights.n_reported }}/{{ pipeline_weights.n_total }} nodes reporting)
+        </span>
+        {% else %}
+        <span class="sefd-status-pill">
+            <span class="dot"></span>
+            loaded {{ pipeline_weights.consensus_isot }}
+            ({{ pipeline_weights.n_reported }}/{{ pipeline_weights.n_total }} nodes reporting)
+        </span>
+        {% endif %}
+    </div>
+
+    {% if pipeline_weights.disagreeing %}
+    <div class="sefd-error-line" style="max-width: none; margin-top: 8px;">
+        <strong>{{ pipeline_weights.disagreeing|length }} node(s) disagree
+            with the {{ pipeline_weights.n_reported - pipeline_weights.disagreeing|length }}-node consensus:</strong>
+        {% for n in pipeline_weights.disagreeing %}
+        <code>cn{{ n.cn_id }}</code>={{ n.mtime_isot or (n.stat_error or n.hash_error or 'unknown') }}{% if not loop.last %}, {% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if pipeline_weights.any_reported and pipeline_weights.n_reported < pipeline_weights.n_total %}
+    <div class="muted" style="margin-top: 6px; font-size: 11px;">
+        {{ pipeline_weights.n_total - pipeline_weights.n_reported }} node(s)
+        not reporting (needs restart with new dsart code):
+        {% for n in pipeline_weights.nodes if not n.reported %}
+        <code>cn{{ n.cn_id }}</code>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
 <div class="controls">
     <label for="days">Lookback:</label>
     <select id="days" onchange="window.location='/sefds?days='+this.value">

@@ -268,12 +268,19 @@ def sefds():
     metrics inline.  Reads the scanner's ``state.json`` directly via
     the :class:`SefdView` singleton; no iframe."""
     import bfweights_update                                       # local
+    import cal_visibility                                         # local
 
     try:
         lookback = int(request.args.get("days", "7"))
     except ValueError:
         lookback = 7
     summary = sefd_view.summary(lookback_days=lookback)
+    try:
+        pipeline_weights = cal_visibility.build_pipeline_weights_view(etcd_store)
+    except Exception:  # noqa: BLE001 — panel is best-effort, page must
+                        # still render if etcd is having a bad day.
+        LOG.exception("sefds: pipeline-weights view failed")
+        pipeline_weights = None
     return render_template(
         "sefds.html",
         active_tab="sefds",
@@ -281,6 +288,7 @@ def sefds():
         sefd_state_path=SEFD_STATE_FILE,
         sefd_state_error=sefd_view.state_error(),
         bf_latest=bfweights_update.latest_descriptors(summary.sources),
+        pipeline_weights=pipeline_weights,
     )
 
 

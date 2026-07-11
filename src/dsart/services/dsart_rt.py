@@ -67,6 +67,8 @@ M7 stagedown:
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
 import json
 import logging
 import os
@@ -311,6 +313,51 @@ def _mjd_now() -> float:
         return float(Time.now().mjd)
     # Fallback: UNIX -> MJD via the standard offset (40587.0 = MJD on 1970-01-01).
     return 40587.0 + time.time() / 86400.0
+
+
+def _extract_apply_cal_path(argv: list[str]) -> Optional[str]:
+    """Pull the ``--apply-cal <path>`` (or ``--apply-cal=<path>``) value
+    out of a routine's built argv, or ``None`` if the flag isn't
+    present (e.g. search-node routines, which don't apply a cal blob
+    directly). Pure / side-effect-free so it's cheap to unit test
+    independently of the rest of the orchestrator.
+    """
+    for i, tok in enumerate(argv):
+        if tok == "--apply-cal":
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if tok.startswith("--apply-cal="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _stat_cal_file(path: str) -> dict[str, Any]:
+    """Best-effort stat + hash of a cal-weights file for the
+    ``<mon_key>/cal_file`` mon publish (see :meth:`RtOrchestrator.
+    _publish_cal_file_mon`). Never raises: a stat/hash failure is
+    reported in the returned dict (``stat_error`` / ``hash_error``)
+    rather than propagated, since this must never block the ``start``
+    verb.
+    """
+    payload: dict[str, Any] = {"path": path}
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        payload["stat_error"] = str(exc)
+        return payload
+    payload["mtime_unix"] = st.st_mtime
+    payload["mtime_isot"] = datetime.datetime.fromtimestamp(
+        st.st_mtime, tz=datetime.timezone.utc
+    ).isoformat()
+    payload["size"] = st.st_size
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        payload["sha256_12"] = h.hexdigest()[:12]
+    except OSError as exc:
+        payload["hash_error"] = str(exc)
+    return payload
 
 
 #: Legacy PSRDADA ``dada_dbmetric`` CSV column order (`/usr/local/bin/dada_dbmetric`
@@ -712,9 +759,65 @@ class RtOrchestrator:
             assert self._config is not None
             self._create_buffers(self._config.buffers)
             self._spawn_routines(self._config.routines, val)
+            self._publish_cal_file_mon(val)
             self._start_time = time.time()
             self._state = "running"
             LOG.info("verb start: %d routines spawned", len(self._children))
+
+    def _publish_cal_file_mon(self, val: Any) -> None:
+        """Best-effort: publish which cal-weights file the ``corr_fast``
+        routine actually loaded on THIS start.
+
+        ``corr_fast_integration`` reads ``--apply-cal <path>`` exactly
+        once at process startup (see its module docstring) and
+        publishes nothing about it, so an operator has no way to tell
+        whether a node is running stale beamformer weights short of
+        SSH-ing in and checking the file mtime by hand (this bit the
+        fleet for 3 days — see the SEFDs "Pipeline weights" panel).
+        We stat+hash the file right after spawn and publish to
+        ``<mon_key>/cal_file`` (e.g. ``/mon/corr_rt/6/cal_file``) so the
+        dashboard can cross-check it against the last distributed
+        solution (``/mon/cal/bfweights``).
+
+        Schema published::
+
+            {"path": str, "mtime_unix": float, "mtime_isot": str,
+             "size": int, "sha256_12": str (first 12 hex chars),
+             "spawned_at_unix": float}
+
+        (``stat_error`` / ``hash_error`` instead of the corresponding
+        fields on a failure.) Search nodes (no ``corr_fast`` routine)
+        and any stat/hash failure are both handled without raising —
+        this must never block the ``start`` verb.
+        """
+        assert self._config is not None
+        routine = next(
+            (r for r in self._config.routines if r.name == "corr_fast"),
+            None,
+        )
+        if routine is None or "corr_fast" not in self._children:
+            LOG.debug(
+                "cal-file mon: no corr_fast routine on this node "
+                "(e.g. search node); skipping"
+            )
+            return
+        try:
+            argv = self._build_argv(routine, val)
+            path = _extract_apply_cal_path(argv)
+            if path is None:
+                LOG.debug(
+                    "cal-file mon: corr_fast argv has no --apply-cal "
+                    "flag; nothing to publish"
+                )
+                return
+            payload = _stat_cal_file(path)
+            payload["spawned_at_unix"] = time.time()
+            self._store.put_dict(f"{self.mon_key}/cal_file", payload)
+            LOG.info("cal-file mon published to %s/cal_file: %s",
+                      self.mon_key, payload)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never
+                                   # block the start verb on this.
+            LOG.warning("cal-file mon publish failed (non-fatal): %s", exc)
 
     def _resolve_dec_from_etcd(self) -> Optional[float]:
         """Read /mon/array/dec.dec_deg from etcd as a CUSTOMDEC fallback.
