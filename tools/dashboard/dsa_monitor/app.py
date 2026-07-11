@@ -448,7 +448,16 @@ def control_update_bfweights_poll(job_id: str):
     snap = bfweights_update.job_snapshot(job_id)
     if snap is None:
         return jsonify({"ok": False, "error": "unknown job_id"}), 404
-    return jsonify({"ok": True, **snap})
+    # snap's own "ok" is the JOB's success/failure (None while running,
+    # True/False once snap["done"]) -- it must NOT clobber the
+    # transport-level "ok" the client uses to detect a poll failure
+    # (see sefds.html's poll()). Keep the job's ok visible under
+    # "job_ok" and force the transport-level key to True since we did
+    # find and return the job.
+    payload = dict(snap)
+    payload["job_ok"] = payload.get("ok")
+    payload["ok"] = True
+    return jsonify(payload)
 
 
 @app.route("/bursts")
