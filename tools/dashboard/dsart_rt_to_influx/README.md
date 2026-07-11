@@ -181,7 +181,7 @@ python tools/dashboard/dsart_rt_to_influx/grafana/build_dashboard.py \
     --grafana-auth "$GRAFANA_AUTH"
 ```
 
-Export `GRAFANA_AUTH='user:pass'` from a local untracked secrets file; the real credential is never committed.
+Secrets live in `~/.dsart/secrets.env` on h23 (chmod 600, never committed). Retrieve the Grafana credential with `dsa-secret grafana` (helper in `tools/ops/dsa-secret`; install with `install -m 755 tools/ops/dsa-secret ~/.local/bin/`). To post the dashboard: `export GRAFANA_AUTH=$(dsa-secret grafana)` then run the command above with `--post`. Never paste the credential into chat, docs, or commits.
 
 ## File layout
 
