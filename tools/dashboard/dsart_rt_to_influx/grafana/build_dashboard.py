@@ -41,7 +41,9 @@ Usage::
 
     # Write + POST to the live Grafana instance on h20
     ./build_dashboard.py --post \
-        --grafana-url http://admin:adminLETmeIN@localhost:3000
+        --grafana-url http://$GRAFANA_AUTH@localhost:3000
+
+    # GRAFANA_AUTH holds user:pass; never commit real credentials.
 
 The generator is intentionally a single self-contained module so we can
 keep the dashboard JSON in version control and re-emit it deterministically.
@@ -53,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import os
 import json
 import pathlib
 import sys
@@ -1654,10 +1657,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     ap.add_argument(
         "--grafana-auth",
-        default="admin:adminLETmeIN",
+        default=os.environ.get("GRAFANA_AUTH", ""),
         help=(
-            "Basic-auth user:pass for the Grafana admin API "
-            "(default matches the existing lxd110h20 install)."
+            "Basic-auth user:pass for the Grafana admin API. Reads from "
+            "the GRAFANA_AUTH environment variable by default (format "
+            "user:pass); pass this flag to override. Empty means "
+            "unauthenticated."
         ),
     )
     args = ap.parse_args(argv)

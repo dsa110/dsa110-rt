@@ -178,8 +178,10 @@ python tools/dashboard/dsart_rt_to_influx/grafana/build_dashboard.py
 #    dashboard at uid dsartRtMpV1.
 python tools/dashboard/dsart_rt_to_influx/grafana/build_dashboard.py \
     --post --grafana-url http://localhost:3000 \
-    --grafana-auth admin:adminLETmeIN
+    --grafana-auth "$GRAFANA_AUTH"
 ```
+
+Export `GRAFANA_AUTH='user:pass'` from a local untracked secrets file; the real credential is never committed.
 
 ## File layout
 
