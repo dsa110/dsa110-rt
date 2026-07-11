@@ -154,6 +154,38 @@ def _transit_isot_fallback(distributed_isot: Optional[str]) -> Optional[str]:
     return None
 
 
+def _mtime_isot_sec(entry: Dict[str, Any]) -> Optional[str]:
+    """Whole-second-precision ``YYYY-MM-DDTHH:MM:SS`` UTC ISOT for a
+    per-node ``cal_file`` entry, used for consensus grouping/display.
+
+    rsync stamps each corr node's ``antennas.out`` with microsecond-level
+    jitter (e.g. ``...:00.487950`` vs ``...:00.491950``) even when every
+    node loaded the identical-vintage weights file, so grouping raw
+    ``mtime_isot`` values at full precision spuriously reports
+    near-universal disagreement. Truncating to whole seconds absorbs
+    that jitter while still flagging genuinely different weight
+    generations, which in practice differ by minutes or hours.
+
+    Prefers ``mtime_unix`` (exact, tz-aware via ``datetime.utcfromtimestamp``,
+    matching the producer's ``tz=utc`` convention in dsart_rt.py's
+    ``_stat_cal_file``); falls back to truncating the ``mtime_isot``
+    string to its first 19 characters (``YYYY-MM-DDTHH:MM:SS``) when
+    ``mtime_unix`` is missing or unparseable. Never raises.
+    """
+    mtime_unix = entry.get("mtime_unix")
+    if mtime_unix is not None:
+        try:
+            return datetime.datetime.utcfromtimestamp(
+                float(mtime_unix)
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    mtime_isot = entry.get("mtime_isot")
+    if isinstance(mtime_isot, str) and len(mtime_isot) >= 19:
+        return mtime_isot[:19]
+    return None
+
+
 def _transit_isot(
     bfweights_doc: Optional[Any], distributed_isot: Optional[str]
 ) -> Optional[str]:
@@ -191,12 +223,21 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
           "n_total": int,            # 16 corr nodes
           "n_reported": int,         # nodes with a cal_file mon key
           "any_reported": bool,
-          "consensus_isot": str | None,   # majority mtime_isot among reporting nodes
+          "consensus_isot": str | None,   # majority mtime_isot among reporting nodes,
+                                          # whole-second precision (see _mtime_isot_sec)
           "consensus_age_hours": float | None,    # hours since consensus_isot (UTC)
           "stale": bool,             # consensus_isot < distributed_isot
-          "disagreeing": [ {cn_id, host, mtime_isot, ...}, ... ],
-          "nodes": [ {cn_id, host, reported, mtime_isot, path, ...}, ... ],
+          "disagreeing": [ {cn_id, host, mtime_isot, mtime_isot_sec, ...}, ... ],
+          "nodes": [ {cn_id, host, reported, mtime_isot, mtime_isot_sec, path, ...}, ... ],
         }
+
+    Node ``mtime_isot`` retains the raw, full-microsecond value reported
+    by the pipeline; ``mtime_isot_sec`` is the whole-second-truncated
+    value used for consensus grouping, disagreement detection, the
+    stale-vs-``distributed_isot`` comparison, and the displayed
+    ``consensus_isot`` -- rsync jitter means two nodes with identical
+    weights can differ by a few hundred microseconds in ``mtime_isot``,
+    which would otherwise show up as spurious disagreement.
     """
     try:
         bfweights_doc = etcd_store.get_dict(BFWEIGHTS_KEY)
@@ -226,6 +267,8 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
             entry["stat_error"] = doc.get("stat_error")
             entry["hash_error"] = doc.get("hash_error")
             entry["spawned_at_unix"] = doc.get("spawned_at_unix")
+        if entry.get("reported"):
+            entry["mtime_isot_sec"] = _mtime_isot_sec(entry)
         nodes.append(entry)
 
     reported_nodes = [n for n in nodes if n.get("reported")]
@@ -234,12 +277,12 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     consensus_isot: Optional[str] = None
     disagreeing: List[Dict[str, Any]] = []
     if reported_nodes:
-        counts = Counter(n.get("mtime_isot") for n in reported_nodes)
+        counts = Counter(n.get("mtime_isot_sec") for n in reported_nodes)
         consensus_isot, _ = counts.most_common(1)[0]
         if len(counts) > 1:
             disagreeing = [
                 n for n in reported_nodes
-                if n.get("mtime_isot") != consensus_isot
+                if n.get("mtime_isot_sec") != consensus_isot
             ]
 
     # ISOT strings (``YYYY-MM-DDTHH:MM:SS``) sort lexically == chronologically.
