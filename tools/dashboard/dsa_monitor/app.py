@@ -897,8 +897,12 @@ def control_inject_post():
     ``fluence_jy_ms`` when ``target_snr`` is set):
 
       inj_id          str (e.g. "phase6c_extragal_t1")
-      l_rad           float, |l| < 1
-      m_rad           float, |m| < 1 and l^2 + m^2 < 1
+      l_rad           float, |l| < 1, |l| <= INJECT_LM_MAX_RAD (0.0279)
+      m_rad           float, |m| < 1 and l^2 + m^2 < 1,
+                      |m| <= INJECT_LM_MAX_RAD (0.0279). Beyond the
+                      imaged half-FoV the source FFT-aliases to the
+                      conjugate sky position; recommended |l|,|m| <=
+                      0.02 rad (primary-beam half-power ~0.025 rad).
       dm_pc_cm3       float
       fluence_jy_ms   float — required iff ``target_snr`` is unset
       target_snr      float (optional). When set, the dashboard

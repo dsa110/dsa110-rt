@@ -530,6 +530,15 @@ def compute_system_state(
 #: itself so the margin does not eat into it).
 DEFAULT_INJECT_MARGIN_BLOCKS: int = 32
 
+#: Hard per-axis reject bound for injection ``l_rad``/``m_rad``: image
+#: half-FoV = 256 px × 0.0002181661565 rad/px / 2 (n_grid=256,
+#: ``configs/dsart_search_rt.yaml``); beyond this the FFT image aliases
+#: the source to the conjugate position (confirmed live 2026-07-11:
+#: injected m=+0.04 was detected at m=-0.0159 = 0.04-0.05585). The
+#: primary-beam half-power radius is ~0.025 rad, so operators should
+#: stay within |l|,|m| <= 0.02 rad in practice.
+INJECT_LM_MAX_RAD: float = 0.0279
+
 #: Local copy of ``corr_fast_integration.NPACKETS_PER_BLOCK``. Pinned
 #: here so the dashboard doesn't need to import torch via dsart.
 #: Drift would be caught by the
@@ -791,6 +800,13 @@ def _validate_inject_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"l_rad={l_rad}, m_rad={m_rad}: l² + m² = {n2:.6f} ≥ 1.0 "
             f"(n would be imaginary)"
+        )
+    if abs(l_rad) > INJECT_LM_MAX_RAD or abs(m_rad) > INJECT_LM_MAX_RAD:
+        raise ValueError(
+            f"l_rad/m_rad must be within +/-{INJECT_LM_MAX_RAD} rad "
+            f"(imaged half-FoV); beyond that the source aliases to the "
+            f"wrong sky position. Recommended |l|,|m| <= 0.02 rad "
+            f"(primary-beam half-power ~0.025 rad)."
         )
 
     try:
