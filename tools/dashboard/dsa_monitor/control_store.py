@@ -473,11 +473,47 @@ def compute_system_state(
     counts["corr_running"] = len(running)
     counts["corr_warmed"] = len(warmed)
 
-    if warming:
+    # ---- SPL fringe-stopper fstable staged? (2026-07-14) ----------------
+    # On an fstable-cache miss dsamfs regenerates the table INSIDE
+    # run_fringestopping (~30 s, sometimes longer), which happens AFTER
+    # the SPL wrapper's heartbeat already publishes ready=True. The
+    # wrapper therefore also publishes ``fstable_staged`` (does the
+    # staged/regenerated table exist in the working dir yet); hold the
+    # banner at PREPARING until every SPL-running node has it. Nodes
+    # with SPL gated off (routine not spawned) are skipped. Heartbeats
+    # from wrappers predating the field are trusted on freshness+pid
+    # alone (fstable_staged missing != not staged).
+    spl_pending: list[int] = []
+    for cn, d in running.items():
+        spl_rt = (d.get("routines") or {}).get("meridian_fringestop_spl")
+        if not (isinstance(spl_rt, dict) and spl_rt.get("alive")):
+            continue
+        rd = _get(f"/mon/corr_rt/{cn}/meridian_spl_ready")
+        if not (
+            isinstance(rd, dict)
+            and _is_fresh(rd, now_mjd)
+            and rd.get("pid") == spl_rt.get("pid")
+        ):
+            spl_pending.append(cn)
+            continue
+        if rd.get("fstable_staged") is False:
+            spl_pending.append(cn)
+    counts["spl_pending"] = len(spl_pending)
+
+    if warming or spl_pending:
+        bits = []
+        if warming:
+            bits.append(
+                f"{len(warmed)}/{len(running)} corr_fast warmed "
+                f"(warming: {sorted(warming)})"
+            )
+        if spl_pending:
+            bits.append(
+                f"SPL fstable staging/regen pending on {sorted(spl_pending)}"
+            )
         return _result(
             "preparing",
-            f"{len(warmed)}/{len(running)} corr_fast warmed — wait before "
-            f"arming. Warming: {sorted(warming)}.",
+            "; ".join(bits) + " — wait before arming.",
         )
     return _result(
         "prepared",

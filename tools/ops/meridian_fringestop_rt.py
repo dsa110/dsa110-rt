@@ -249,7 +249,9 @@ class Heartbeat:
     Never raises into the run loop; a publish failure is logged and ignored."""
 
     def __init__(self, cn_id: int, working_dir: Path, subband: int, dec_deg: float,
-                 interval_s: float = 10.0, spl: bool = False) -> None:
+                 interval_s: float = 10.0, spl: bool = False,
+                 fstable_path: Optional[Path] = None,
+                 cache_ok: Optional[bool] = None) -> None:
         # SPL gets its OWN heartbeat key so the dashboard can show the
         # two bada readers independently (a dead SPL fringe-stopper is
         # just as fatal to corr_slow as a dead production one).
@@ -260,6 +262,15 @@ class Heartbeat:
         self._subband = int(subband)
         self._dec_deg = float(dec_deg)
         self._interval_s = float(interval_s)
+        # Warming signal for the Control banner (2026-07-14): on a
+        # cache miss dsamfs regenerates the fstable INSIDE
+        # run_fringestopping, i.e. after this heartbeat is already
+        # publishing ready=True — so ``ready`` alone can't tell the
+        # operator whether the table exists yet. We publish the staged
+        # table's existence every beat; compute_system_state holds the
+        # fleet in PREPARING until it flips True.
+        self._fstable_path = fstable_path
+        self._cache_ok = cache_ok
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="mfs-heartbeat", daemon=True)
         self._store: Any = None
@@ -281,7 +292,7 @@ class Heartbeat:
             if self._store is None:
                 self._store = _store()
             last, n = self._newest_hdf5()
-            self._store.put_dict(self._key, {
+            payload = {
                 "ready": bool(ready),
                 "pid": os.getpid(),
                 "host": socket.gethostname(),
@@ -291,7 +302,16 @@ class Heartbeat:
                 "time_mjd": _now_mjd(),
                 "last_hdf5": last,
                 "n_hdf5": n,
-            })
+            }
+            if self._fstable_path is not None:
+                try:
+                    staged = self._fstable_path.exists()
+                except OSError:
+                    staged = False
+                payload["fstable_staged"] = staged
+                payload["fstable_name"] = self._fstable_path.name
+                payload["fstable_cache_ok"] = self._cache_ok
+            self._store.put_dict(self._key, payload)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("heartbeat publish failed (continuing): %s", exc)
 
@@ -427,6 +447,7 @@ def _prepare(args: argparse.Namespace) -> dict[str, Any]:
         "subband": subband, "dec_grid": dec_grid, "working_dir": working_dir,
         "cache_ok": ok, "eff_nint": eff_nint,
         "override_nfreq_int": override_nfreq_int,
+        "nant": cnf["nant"],
     }
 
 
@@ -492,6 +513,11 @@ def main(argv: list[str] | None = None) -> int:
         cn_id=args.cn_id, working_dir=Path(args.working_dir),
         subband=ctx["subband"], dec_deg=ctx["dec_grid"],
         interval_s=args.heartbeat_interval_s, spl=bool(args.spl),
+        fstable_path=(
+            Path(args.working_dir)
+            / legacy_table_name(ctx["dec_grid"], ctx["nant"])
+        ),
+        cache_ok=bool(ctx["cache_ok"]),
     )
     hb.start()
     try:

@@ -243,3 +243,54 @@ def test_main_parser_accepts_spl_override_args(monkeypatch):
     assert args.integration_s == pytest.approx(12.884901888)
     assert args.nfreq_int_spl == 4
     assert str(args.working_dir) == "/home/ubuntu/data/spl"
+
+
+# ---- SPL warming signal: fstable_staged in the heartbeat (2026-07-14) -----
+
+
+def test_heartbeat_publishes_fstable_staged(tmp_path):
+    """The staged-table existence rides every beat so the Control
+    banner can hold PREPARING through a slow dsamfs regeneration."""
+
+    class _RecStore:
+        def __init__(self):
+            self.puts = []
+
+        def put_dict(self, key, val):
+            self.puts.append((key, val))
+
+    table = tmp_path / mfs.legacy_table_name(25.25, 96)
+    hb = mfs.Heartbeat(
+        cn_id=6, working_dir=tmp_path, subband=3, dec_deg=25.25, spl=True,
+        fstable_path=table, cache_ok=False,
+    )
+    hb._store = _RecStore()
+
+    hb._publish(ready=True)                      # table not written yet
+    _, before = hb._store.puts[-1]
+    assert before["fstable_staged"] is False
+    assert before["fstable_name"] == table.name
+    assert before["fstable_cache_ok"] is False
+
+    table.write_bytes(b"x")                       # dsamfs regen finished
+    hb._publish(ready=True)
+    _, after = hb._store.puts[-1]
+    assert after["fstable_staged"] is True
+
+
+def test_heartbeat_payload_backcompat_without_fstable_path(tmp_path):
+    """No fstable_path (old call sites / prod wrapper before rollout):
+    the new keys stay absent rather than publishing misleading False."""
+
+    class _RecStore:
+        def __init__(self):
+            self.puts = []
+
+        def put_dict(self, key, val):
+            self.puts.append((key, val))
+
+    hb = mfs.Heartbeat(cn_id=6, working_dir=tmp_path, subband=3, dec_deg=25.25)
+    hb._store = _RecStore()
+    hb._publish(ready=True)
+    _, payload = hb._store.puts[-1]
+    assert "fstable_staged" not in payload
