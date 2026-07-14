@@ -396,6 +396,12 @@ class TestCleanupNodesForStart:
         assert "dsart-corr-*.ready" in all_argv
         assert "dsart-fast-grid" in all_argv
         assert "/home/ubuntu/data/c2/cube_dump" in all_argv
+        # 2026-07-14 additions: SPL UVH5 outputs (n10/n11 disk-full
+        # culprit) + stale M8 voltage staging — hdf5-only for spl so
+        # the fstable *.npz cache in the same dir survives.
+        assert "/home/ubuntu/data/spl/*.hdf5" in all_argv
+        assert "rm -rf /home/ubuntu/data/spl" not in all_argv
+        assert "/home/ubuntu/data/voltage_staging/*" in all_argv
 
     def test_partial_failure_reported_not_raised(self):
         recorder = _CallRecorder(default_rc=0, fail_hosts={"n03.pro.pvt"})

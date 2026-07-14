@@ -156,10 +156,23 @@ _PKILL_DSART_CMD = (
 #: remove accumulated ephemera that no running process holds an fd on:
 #: stale orchestrator/routine logs, ready sentinels, and (corr) debug
 #: block dumps. h23 (the candidate/CSV archive) is never in the fanout.
+#: Corr additions (2026-07-14, after n10/n11 filled their NVMe):
+#:
+#: * ``data/spl/*.hdf5`` — meridian_fringestop_spl UVH5 outputs
+#:   (~238 MB per observation, accumulate unbounded; the
+#:   ``*_spl_incomplete.hdf5`` strays too). The ``*.npz``
+#:   fringestopping-table cache in the same dir is deliberately KEPT
+#:   (small, and deleting it forces a ~30 s casatools regen per dec).
+#: * ``data/voltage_staging/*`` — M8 staged voltage fragments
+#:   (~6.5 GiB each). Anything still staged at a *start* is stale:
+#:   C3 collects KEEP events promptly after the trigger, and
+#:   flag-only REJECTs are strays no collector will ever pull.
 _START_CLEANUP_CORR_CMD = (
     "rm -f $HOME/tmp/dsart-rt/*.log 2>/dev/null; "
     "rm -f /tmp/dsart-corr-*.ready 2>/dev/null; "
     "rm -rf /home/ubuntu/tmp/dsart-fast-grid 2>/dev/null; "
+    "rm -f /home/ubuntu/data/spl/*.hdf5 2>/dev/null; "
+    "rm -f /home/ubuntu/data/voltage_staging/* 2>/dev/null; "
     "echo CLEAN_OK"
 )
 
@@ -582,7 +595,14 @@ def cleanup_nodes_for_start(
 
       corr   : ``~/tmp/dsart-rt/*.log`` (stale routine/orchestrator
                logs), ``/tmp/dsart-corr-*.ready`` sentinels,
-               ``/home/ubuntu/tmp/dsart-fast-grid`` (debug block dumps).
+               ``/home/ubuntu/tmp/dsart-fast-grid`` (debug block dumps),
+               ``/home/ubuntu/data/spl/*.hdf5`` (SPL UVH5 outputs —
+               the 2026-07-14 n10/n11 disk-full culprit; the fstable
+               ``*.npz`` cache in that dir is kept), and
+               ``/home/ubuntu/data/voltage_staging/*`` (stale M8
+               voltage fragments — KEEPs are collected by C3 right
+               after the trigger, so anything left at start is dead
+               weight).
       search : ``~/tmp/dsart-rt/*.log`` + the local
                ``/home/ubuntu/data/c2/cube_dump`` tree (NPZs already
                rsynced to h23) and its ``upload.log`` files.
