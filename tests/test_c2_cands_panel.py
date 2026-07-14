@@ -150,3 +150,74 @@ def test_archive_browser_max_events_caps_list(tmp_path, cands_panel) -> None:
     ab = cands_panel.ArchiveBrowser(root, max_events=3)
     events = ab.list_events()
     assert len(events) == 3
+
+
+# ---- C3 decision + voltages + time-of-day (2026-07-14 candidates tab) -----
+
+
+def _write_c3(ev: Path, *, action: str, rules=(), notes: str = "",
+              is_injection: bool = False, flag_only: bool = True) -> None:
+    (ev / "C3_decision.json").write_text(json.dumps({
+        "event_name": ev.name,
+        "action": action,
+        "rules_fired": list(rules),
+        "notes": notes,
+        "is_injection": is_injection,
+        "flag_only": flag_only,
+    }))
+
+
+def _write_voltages(ev: Path, n: int) -> None:
+    vdir = ev / "Level2" / "voltages"
+    vdir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (vdir / f"{ev.name}_sb{i:02d}_data.out").write_text("v")
+
+
+def test_summary_carries_c3_keep_and_voltages(tmp_path, cands_panel) -> None:
+    ev = _layout_event(tmp_path, "260714aaaa")
+    _write_c3(ev, action="KEEP", notes="all clean")
+    _write_voltages(ev, 16)
+    (s,) = cands_panel.ArchiveBrowser(tmp_path).list_events()
+    assert s.c3_action == "KEEP"
+    assert s.c3_status == "pass"
+    assert s.c3_rules == ()
+    assert s.n_voltages == 16
+    # t_peak_mjd 60781.123456789 -> fractional day .123456789 ≈ 02:57:47
+    assert s.utc_hms == "02:57:46" or s.utc_hms == "02:57:47"
+
+
+def test_summary_carries_c3_reject_rules(tmp_path, cands_panel) -> None:
+    ev = _layout_event(tmp_path, "260714bbbb")
+    _write_c3(ev, action="REJECT",
+              rules=["R1_image_offset", "R10_cube_unconfirmed"],
+              notes="tier-1/R10 high-confidence false positive")
+    (s,) = cands_panel.ArchiveBrowser(tmp_path).list_events()
+    assert s.c3_status == "fail"
+    assert s.c3_rules == ("R1_image_offset", "R10_cube_unconfirmed")
+    assert s.n_voltages == 0
+    assert s.c3_flag_only is True
+
+
+def test_summary_pending_without_c3_file(tmp_path, cands_panel) -> None:
+    _layout_event(tmp_path, "260714cccc")
+    (s,) = cands_panel.ArchiveBrowser(tmp_path).list_events()
+    assert s.c3_action is None
+    assert s.c3_status == "pending"
+
+
+def test_summary_time_falls_back_to_mtime(tmp_path, cands_panel) -> None:
+    # No Level3 meta -> no t_peak_mjd -> mtime fallback marked '~'.
+    ev = _layout_event(tmp_path, "260714dddd", with_meta=False)
+    (ev / "Level3" / "260714dddd.json").write_text("{}")
+    (s,) = cands_panel.ArchiveBrowser(tmp_path).list_events()
+    assert s.utc_hms is not None and s.utc_hms.endswith("~")
+
+
+def test_event_detail_carries_c3_and_voltages(tmp_path, cands_panel) -> None:
+    ev = _layout_event(tmp_path, "260714eeee")
+    _write_c3(ev, action="KEEP")
+    _write_voltages(ev, 3)
+    d = cands_panel.ArchiveBrowser(tmp_path).event_detail("260714eeee")
+    assert d.c3_decision["action"] == "KEEP"
+    assert d.n_voltages == 3

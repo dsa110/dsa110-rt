@@ -1,6 +1,57 @@
 {% extends "base.html" %}
 {% block title %}Burst candidates – DSA Monitor{% endblock %}
 
+{% block head_extra %}
+<style>
+    /* C3 pass/fail sub-tabs */
+    .c3-tabs { display: flex; gap: 8px; margin: 14px 0 0; }
+    .c3-tab {
+        padding: 7px 18px;
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid #dfe6e9;
+        border-bottom: none;
+        border-radius: 8px 8px 0 0;
+        background: #eef0f2;
+        color: #636e72;
+        cursor: pointer;
+    }
+    .c3-tab.active { background: white; color: #2d3436; }
+    .c3-tab .count {
+        display: inline-block;
+        min-width: 20px;
+        padding: 1px 7px;
+        margin-left: 6px;
+        border-radius: 10px;
+        background: #b2bec3;
+        color: white;
+        font-size: 11px;
+    }
+    .c3-tab.active .count.pass { background: #00b894; }
+    .c3-tab.active .count.fail { background: #d63031; }
+
+    /* C3 decision badges in the table */
+    .c3-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: white;
+    }
+    .c3-badge.keep    { background: #00b894; }
+    .c3-badge.reject  { background: #d63031; }
+    .c3-badge.pending { background: #b2bec3; }
+    .c3-rules {
+        font-size: 11px;
+        color: #636e72;
+        font-family: 'Menlo', 'Consolas', monospace;
+    }
+    .volt-count.full { color: #00b894; font-weight: 700; }
+    .volt-count.partial { color: #d63031; font-weight: 700; }
+</style>
+{% endblock %}
+
 {% block content %}
 <h1>Burst candidates</h1>
 
@@ -15,20 +66,18 @@
 </div>
 {% endif %}
 
-<div class="card">
-    <h2>Recent events ({{ events|length }} shown)</h2>
-    <div class="muted">
-        Source: <code>{{ archive_root }}</code> · click an event for the
-        4-panel plots + Level3 metadata. Newest first by directory
-        mtime.
-    </div>
+{% macro event_table(events, tab) %}
     {% if events %}
     <table class="metric" style="margin-top: 12px;">
         <thead>
             <tr>
                 <th>event</th>
+                <th class="value">UTC time</th>
                 <th>class</th>
-                <th class="value">mjd peak</th>
+                <th>C3 decision</th>
+                {% if tab == 'pass' %}
+                <th class="value">voltages</th>
+                {% endif %}
                 <th class="value">n_events</th>
                 <th class="value">snr_max</th>
                 <th class="value">dm_median</th>
@@ -42,8 +91,41 @@
             {% for e in events %}
             <tr>
                 <td><a href="/bursts/{{ e.name }}">{{ e.name }}</a></td>
+                <td class="value"
+                    title="{{ 'mjd_peak %.6f'|format(e.mjd_peak) if e.mjd_peak is not none else 'no t_peak_mjd — dir mtime (~)' }}">
+                    {{ e.utc_hms or '—' }}</td>
                 <td>{{ e.trigger_class or '—' }}</td>
-                <td class="value">{{ '%.6f'|format(e.mjd_peak) if e.mjd_peak is not none else '—' }}</td>
+                <td>
+                    {% if e.c3_status == 'pass' %}
+                    <span class="c3-badge keep">KEEP</span>
+                    {% elif e.c3_status == 'fail' %}
+                    <span class="c3-badge reject">REJECT</span>
+                    {% else %}
+                    <span class="c3-badge pending"
+                          title="C3 has not judged this event yet (runs once the Level3 metadata is complete)">C3 pending</span>
+                    {% endif %}
+                    {% if e.c3_is_injection %}
+                    <span class="c3-badge" style="background:#0984e3;">INJ</span>
+                    {% endif %}
+                    {% if e.c3_rules %}
+                    <div class="c3-rules"
+                         title="{{ e.c3_notes or '' }}">{{ e.c3_rules|join(', ') }}</div>
+                    {% elif e.c3_status == 'pass' and e.c3_notes %}
+                    <div class="c3-rules" title="{{ e.c3_notes }}">
+                        {{ e.c3_notes[:48] }}{% if e.c3_notes|length > 48 %}…{% endif %}
+                    </div>
+                    {% endif %}
+                </td>
+                {% if tab == 'pass' %}
+                <td class="value">
+                    {% if e.c3_status == 'pass' %}
+                    <span class="volt-count {{ 'full' if e.n_voltages == n_voltage_total else 'partial' }}">
+                        {{ e.n_voltages }}/{{ n_voltage_total }}</span>
+                    {% else %}
+                    <span class="muted">{{ e.n_voltages }}/{{ n_voltage_total }}</span>
+                    {% endif %}
+                </td>
+                {% endif %}
                 <td class="value">{{ e.n_events if e.n_events is not none else '—' }}</td>
                 <td class="value">{{ '%.2f'|format(e.snr_max) if e.snr_max is not none else '—' }}</td>
                 <td class="value">{{ '%.2f'|format(e.dm_median) if e.dm_median is not none else '—' }}</td>
@@ -56,8 +138,38 @@
         </tbody>
     </table>
     {% else %}
-    <div class="muted" style="margin-top: 8px;">No events yet.</div>
+    <div class="muted" style="margin-top: 8px;">No events in this tab.</div>
     {% endif %}
+{% endmacro %}
+
+<div class="c3-tabs">
+    <div class="c3-tab active" id="tab-btn-pass" onclick="showTab('pass')">
+        C3 pass<span class="count pass">{{ events_pass|length }}</span>
+    </div>
+    <div class="c3-tab" id="tab-btn-fail" onclick="showTab('fail')">
+        C3 fail<span class="count fail">{{ events_fail|length }}</span>
+    </div>
+</div>
+
+<div class="card" id="tab-pass" style="border-top-left-radius: 0;">
+    <h2>C3-passing events ({{ events_pass|length }})</h2>
+    <div class="muted">
+        Source: <code>{{ archive_root }}</code> · KEEP decisions from the
+        C3 cube veto, plus events C3 hasn't judged yet ("C3 pending").
+        "voltages" counts staged fragments collected to h23 under
+        <code>Level2/voltages/</code> (one per corr node). Newest first.
+    </div>
+    {{ event_table(events_pass, 'pass') }}
+</div>
+
+<div class="card" id="tab-fail" style="display: none; border-top-left-radius: 0;">
+    <h2>C3-rejected events ({{ events_fail|length }})</h2>
+    <div class="muted">
+        High-confidence false positives per the C3 cube-morphology veto
+        (rules shown per event; hover for notes). In flag-only mode
+        nothing is deleted — cubes/metadata stay browsable.
+    </div>
+    {{ event_table(events_fail, 'fail') }}
 </div>
 
 <div class="card">
@@ -72,4 +184,20 @@
             <code>docs/c1c2/M7.4_BRINGUP.md</code></li>
     </ul>
 </div>
+
+<script>
+function showTab(which) {
+    document.getElementById("tab-pass").style.display =
+        (which === "pass") ? "" : "none";
+    document.getElementById("tab-fail").style.display =
+        (which === "fail") ? "" : "none";
+    document.getElementById("tab-btn-pass").classList.toggle(
+        "active", which === "pass");
+    document.getElementById("tab-btn-fail").classList.toggle(
+        "active", which === "fail");
+    try { history.replaceState(null, "", "#" + which); } catch (e) {}
+}
+// Deep-linkable: /bursts#fail opens the fail tab.
+if (window.location.hash === "#fail") { showTab("fail"); }
+</script>
 {% endblock %}

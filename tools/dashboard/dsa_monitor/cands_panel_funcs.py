@@ -48,6 +48,10 @@ _EVENT_NAME_RE = re.compile(r"^\d{6}[a-z]{4}$")
 _SAFE_EVENT_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
+#: Fragments a complete voltage collection holds (one per corr node).
+N_VOLTAGE_FRAGMENTS_TOTAL = 16
+
+
 @dataclass(frozen=True)
 class EventSummary:
     """One row in the events table."""
@@ -63,6 +67,27 @@ class EventSummary:
     m_median: Optional[float]
     n_cubes: int
     n_plots: int
+    # C3 cube-veto decision (from C3_decision.json; None = C3 has not
+    # processed the event yet).
+    c3_action: Optional[str] = None          # "KEEP" | "REJECT"
+    c3_rules: Tuple[str, ...] = ()
+    c3_notes: Optional[str] = None
+    c3_is_injection: Optional[bool] = None
+    c3_flag_only: Optional[bool] = None
+    # Voltage fragments actually on h23 under Level2/voltages/.
+    n_voltages: int = 0
+    # Event time of day (UTC HH:MM:SS), from t_peak_mjd with a
+    # dir-mtime fallback (suffixed '~' to mark it approximate).
+    utc_hms: Optional[str] = None
+
+    @property
+    def c3_status(self) -> str:
+        """'pass' (KEEP), 'fail' (REJECT) or 'pending' (no decision)."""
+        if self.c3_action == "KEEP":
+            return "pass"
+        if self.c3_action == "REJECT":
+            return "fail"
+        return "pending"
 
 
 @dataclass(frozen=True)
@@ -76,6 +101,8 @@ class EventDetail:
     cubes: Tuple[str, ...]  # filenames under cubes/
     has_c2_csv: bool
     has_c1_csv: bool
+    c3_decision: Optional[Mapping[str, Any]] = None
+    n_voltages: int = 0
 
 
 class ArchiveBrowser:
@@ -133,10 +160,12 @@ class ArchiveBrowser:
         trigger = (meta or {}).get("trigger", {}) if isinstance(meta, dict) else {}
         n_cubes = _count_files(event_dir / "cubes", "cube_s*_g*_*.npz")
         n_plots = _count_files(event_dir / "Level2" / "plots", "*.png")
+        c3 = self._read_c3(event_dir) or {}
+        mjd_peak = _as_optional_float(c2.get("t_peak_mjd"))
         return EventSummary(
             name=name,
             mtime_unix=mtime,
-            mjd_peak=_as_optional_float(c2.get("t_peak_mjd")),
+            mjd_peak=mjd_peak,
             trigger_class=_as_optional_str(trigger.get("class")),
             n_events=_as_optional_int(c2.get("n_events")),
             snr_max=_as_optional_float(c2.get("snr_max")),
@@ -145,6 +174,19 @@ class ArchiveBrowser:
             m_median=_as_optional_float(c2.get("m_median")),
             n_cubes=n_cubes,
             n_plots=n_plots,
+            c3_action=_as_optional_str(c3.get("action")),
+            c3_rules=tuple(str(r) for r in (c3.get("rules_fired") or [])),
+            c3_notes=_as_optional_str(c3.get("notes")) or None,
+            c3_is_injection=(
+                bool(c3["is_injection"]) if "is_injection" in c3 else None
+            ),
+            c3_flag_only=(
+                bool(c3["flag_only"]) if "flag_only" in c3 else None
+            ),
+            n_voltages=_count_files(
+                event_dir / "Level2" / "voltages", "*_data.out"
+            ),
+            utc_hms=_utc_hms(mjd_peak, mtime),
         )
 
     # ----- detail view ----------------------------------------------------
@@ -178,6 +220,10 @@ class ArchiveBrowser:
             has_c1_csv=(
                 event_dir / "Level2" / f"C1_window_{name}.csv"
             ).is_file(),
+            c3_decision=self._read_c3(event_dir),
+            n_voltages=_count_files(
+                event_dir / "Level2" / "voltages", "*_data.out"
+            ),
         )
 
     def plot_path(self, name: str, plot_name: str) -> Optional[Path]:
@@ -209,6 +255,21 @@ class ArchiveBrowser:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             _LOG.warning("read_l3 %s failed: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _read_c3(event_dir: Path) -> Optional[dict]:
+        """The C3 cube-veto audit sidecar (written by
+        ``dsart.services.c3.C3Service._write_audit``); absent until C3
+        processes the event (~minutes after the trigger)."""
+        path = event_dir / "C3_decision.json"
+        if not path.is_file():
+            return None
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            return doc if isinstance(doc, dict) else None
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOG.warning("read_c3 %s failed: %s", path, exc)
             return None
 
 
@@ -260,3 +321,23 @@ def _as_optional_str(v: Any) -> Optional[str]:
     if v is None:
         return None
     return str(v)
+
+
+def _utc_hms(mjd: Optional[float], mtime_unix: float) -> Optional[str]:
+    """UTC time-of-day for the table. Prefers the C2 peak MJD; falls
+    back to the directory mtime with a '~' suffix so the operator can
+    tell it's the archive-write time, not the burst time."""
+    from datetime import datetime, timezone
+    if mjd is not None:
+        try:
+            dt = datetime.fromtimestamp(
+                (float(mjd) - 40587.0) * 86400.0, tz=timezone.utc
+            )
+            return dt.strftime("%H:%M:%S")
+        except (ValueError, OverflowError, OSError):
+            pass
+    try:
+        dt = datetime.fromtimestamp(float(mtime_unix), tz=timezone.utc)
+        return dt.strftime("%H:%M:%S") + "~"
+    except (ValueError, OverflowError, OSError):
+        return None

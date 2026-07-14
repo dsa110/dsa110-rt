@@ -60,7 +60,11 @@ from ant_table import (
     all_ant_nums_in_cube_order,
     ant_idx_to_ant_num,
 )
-from cands_panel_funcs import ArchiveBrowser, DEFAULT_ARCHIVE_ROOT
+from cands_panel_funcs import (
+    ArchiveBrowser,
+    DEFAULT_ARCHIVE_ROOT,
+    N_VOLTAGE_FRAGMENTS_TOTAL,
+)
 from control_store import (
     CORR_CN_IDS,
     DEFAULT_ARM_SEQ_MARGIN,
@@ -471,10 +475,18 @@ def control_update_bfweights_poll(job_id: str):
 @app.route("/bursts")
 def bursts():
     events = cands_browser.list_events()
+    # Split by C3 cube-veto outcome. Events C3 has not judged yet
+    # (typically < a few min old) ride the PASS tab with a "pending"
+    # badge — the operator wants fresh events front and centre, and
+    # fail-open is C3's own default.
+    events_pass = [e for e in events if e.c3_status in ("pass", "pending")]
+    events_fail = [e for e in events if e.c3_status == "fail"]
     return render_template(
         "bursts.html",
         active_tab="bursts",
-        events=events,
+        events_pass=events_pass,
+        events_fail=events_fail,
+        n_voltage_total=N_VOLTAGE_FRAGMENTS_TOTAL,
         archive_root=str(cands_browser.root),
         archive_available=cands_browser.is_available,
     )
@@ -490,6 +502,12 @@ def burst_event(name: str):
         "burst_event.html",
         active_tab="bursts",
         event=detail,
+        n_voltage_total=N_VOLTAGE_FRAGMENTS_TOTAL,
+        c3_pretty=(
+            _json.dumps(detail.c3_decision, indent=2, sort_keys=True,
+                        default=str)
+            if detail.c3_decision else None
+        ),
         metadata_pretty=_json.dumps(
             detail.metadata, indent=2, sort_keys=True, default=str,
         ),

@@ -10,6 +10,39 @@
 </div>
 
 <div class="card">
+    <h2>C3 cube-veto decision</h2>
+    {% if event.c3_decision %}
+    {% set c3 = event.c3_decision %}
+    <div style="font-size: 14px; margin-bottom: 6px;">
+        <strong style="color: {{ '#00b894' if c3.action == 'KEEP' else '#d63031' }};">
+            {{ c3.action }}</strong>
+        {% if c3.is_injection %} · injection{% endif %}
+        {% if c3.rules_fired %} · rules:
+            <code>{{ c3.rules_fired|join(', ') }}</code>{% endif %}
+        {% if c3.flag_only and c3.action == 'REJECT' %}
+            · <span class="muted">flag-only (no deletion performed)</span>
+        {% endif %}
+    </div>
+    {% if c3.notes %}<div class="muted">{{ c3.notes }}</div>{% endif %}
+    <div style="margin-top: 6px; font-size: 13px;">
+        Voltage fragments on h23:
+        <strong>{{ event.n_voltages }}/{{ n_voltage_total }}</strong>
+        (<code>Level2/voltages/</code>)
+    </div>
+    <details style="margin-top: 8px;">
+        <summary style="cursor: pointer; font-size: 12px;" class="muted">
+            full C3_decision.json (incl. veto metrics)</summary>
+        <pre style="background:#2d3436;color:#dfe6e9;padding:12px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.45;font-family:'Menlo','Consolas',monospace;">{{ c3_pretty }}</pre>
+    </details>
+    {% else %}
+    <div class="muted">C3 has not judged this event yet
+        (<code>C3_decision.json</code> absent — the veto runs once the
+        Level3 metadata is complete, typically minutes after the
+        trigger).</div>
+    {% endif %}
+</div>
+
+<div class="card">
     <h2>Level3 metadata</h2>
     {% if event.metadata %}
     <pre style="background:#2d3436;color:#dfe6e9;padding:12px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.45;font-family:'Menlo','Consolas',monospace;">{{ metadata_pretty }}</pre>
