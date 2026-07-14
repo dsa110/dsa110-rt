@@ -54,6 +54,15 @@
 <div class="card">
     <h2>Plots</h2>
     {% if event.plots %}
+    <div class="muted" style="font-size: 12px; margin-bottom: 10px;">
+        Plot markers: the red + / red circle mark where the detector
+        reported the burst (DM, time, sky position). The white ×
+        marks the brightest point in the displayed data, computed
+        independently of the detector. The two should coincide; a
+        separation means the detector triggered on something other
+        than the data's apex (often benign — noise on the dispersion
+        bowtie arms — but large separations flag a suspect detection).
+    </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px;">
         {% for plot in event.plots %}
         <div class="plot-card">

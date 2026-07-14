@@ -1125,7 +1125,7 @@ def _render_dm_time(
         )
         ax.plot(
             apex_t, apex_row, marker="x", color="w", ms=12, mew=2.0,
-            ls="none", label="data apex",
+            ls="none", label="brightest point of displayed data",
         )
 
     title = f"DM × time waterfall (all cubes) — {event_name}"
@@ -1142,13 +1142,28 @@ def _render_dm_time(
                 ax.plot(
                     coords.t_idx, burst_row, marker="+",
                     color=_RETICLE, ms=16, mew=2.0,
+                    label="detector-reported burst",
                 )
         title += (
             f" — burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
             f"SNR={coords.snr:.1f}" + _provenance(coords)
         )
     ax.set_title(title, fontsize=10)
-    fig.tight_layout()
+    # Legend lives below the axes so it never overlaps the waterfall,
+    # title, axis labels, or colorbar. Renders correctly even when only
+    # the white × exists (coords/burst_row is None: matplotlib just
+    # emits the single handle). The frame is dark grey so the white ×
+    # glyph is legible on the white figure background (the red +
+    # #ff2d55 still contrasts fine on #404040).
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(
+            handles, labels, loc="upper center",
+            bbox_to_anchor=(0.5, -0.09), ncol=2, fontsize=9,
+            frameon=True, facecolor="#404040", edgecolor="none",
+            labelcolor="white",
+        )
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(path, dpi=110)
     plt.close(fig)
     return path
@@ -1191,7 +1206,11 @@ def _render_image_peak(
         f"burst (l,m)=({coords.l_pix},{coords.m_pix})" + _provenance(coords)
     )
     ax.set_title(title, fontsize=9)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
+    fig.text(
+        0.5, 0.01, "red circle = burst position reported by the detector",
+        ha="center", va="bottom", fontsize=8, color="0.4",
+    )
     fig.savefig(path, dpi=100)
     plt.close(fig)
     return path
