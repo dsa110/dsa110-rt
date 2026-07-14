@@ -17,6 +17,7 @@ from dsart.services.coincidencer import (
     CoincidencerService,
     DumpsGate,
 )
+from dsart.common.constants import T_INT_FACTOR_DEFAULT
 
 
 # --- DumpsGate default_enabled -----------------------------------------
@@ -141,7 +142,10 @@ def test_voltage_fires_when_enabled_and_real(tmp_path: Path) -> None:
     )
     assert len(vbc.calls) == 1
     assert vbc.calls[0]["event_name"] == "ev"
-    assert vbc.calls[0]["event_specnum"] == 42
+    # search-sample specnum is converted to NATIVE fada spectra
+    # (x T_INT_FACTOR_DEFAULT) so the corr ring lookup lands
+    # in-window (2026-07-13 empty-dump bug).
+    assert vbc.calls[0]["event_specnum"] == 42 * T_INT_FACTOR_DEFAULT
     assert svc._counters["voltages_broadcast"] == 1
     assert svc._counters["voltage_broadcast_ok"] == 2
     assert svc._counters["voltage_broadcast_fail"] == 1

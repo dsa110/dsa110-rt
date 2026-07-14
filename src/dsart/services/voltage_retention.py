@@ -250,9 +250,13 @@ class VoltageRetentionService:
 
     # ----- listener handlers (run on the asyncio loop) -----------------
 
-    def _enqueue_dump(self, event_name: str, event_specnum: int) -> bool:
+    def _enqueue_dump(
+        self, event_name: str, event_specnum: int, mjd_target: float = 0.0,
+    ) -> bool:
         try:
-            self._q.put_nowait(("dump", event_name, int(event_specnum), 0.0))
+            self._q.put_nowait(
+                ("dump", event_name, int(event_specnum), float(mjd_target))
+            )
             return True
         except queue.Full:
             return False
@@ -354,10 +358,26 @@ class VoltageRetentionService:
                     n_post=self._cfg.n_post,
                     mjd_target=mjd,
                 )
-                self._counters["dumps_done"] += 1
                 self._counters["blocks_dropped_total"] += int(
                     manifest["n_blocks_dropped"]
                 )
+                if int(manifest["n_blocks_written"]) == 0:
+                    # Every requested block missed the ring: the staged
+                    # file is empty and the dump is a FAILURE (e.g. a
+                    # trigger specnum in the wrong units/epoch), not a
+                    # success. Manifest + empty file are kept for
+                    # forensics.
+                    self._counters["dumps_failed"] += 1
+                    LOG.error(
+                        "voltage_retention: dump %s %s wrote 0 blocks "
+                        "(all %d dropped; target=%d ring=%s..%s) — FAILED",
+                        name, self._cfg.sb,
+                        manifest["n_blocks_dropped"], target,
+                        manifest["ring_oldest_block_n"],
+                        manifest["ring_newest_block_n"],
+                    )
+                    continue
+                self._counters["dumps_done"] += 1
                 LOG.info(
                     "voltage_retention: staged %s %s — %d blocks (%d dropped) "
                     "%.2f GiB",

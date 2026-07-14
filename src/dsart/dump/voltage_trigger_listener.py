@@ -69,8 +69,10 @@ class VoltageTriggerListener:
     config:
         bind host/port + node identity (for mon labelling).
     on_dump:
-        ``(event_name, event_specnum) -> bool`` — enqueue a dump; return
-        False if the queue was full (counted as ``queue_full``).
+        ``(event_name, event_specnum, mjd_target) -> bool`` — enqueue a
+        dump; return False if the queue was full (counted as
+        ``queue_full``). ``mjd_target`` is the packet's event MJD,
+        recorded in the staging manifest.
     on_delete:
         ``(event_name) -> bool`` — enqueue a staged-voltage delete.
     """
@@ -79,7 +81,7 @@ class VoltageTriggerListener:
         self,
         *,
         config: VoltageTriggerListenerConfig,
-        on_dump: Callable[[str, int], bool],
+        on_dump: Callable[[str, int, float], bool],
         on_delete: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self._config = config
@@ -173,7 +175,11 @@ class VoltageTriggerListener:
             return
         try:
             accepted = bool(
-                self._on_dump(str(pkt.event_name), int(pkt.event_specnum))
+                self._on_dump(
+                    str(pkt.event_name),
+                    int(pkt.event_specnum),
+                    float(pkt.mjd_target),
+                )
             )
         except Exception:  # noqa: BLE001
             _LOG.exception("on_dump handler raised")

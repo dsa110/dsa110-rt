@@ -88,6 +88,7 @@ from ..coinc.veto import (
     dm_comb_detected,
 )
 from ..coinc.window import TimeWindow, WindowEntry
+from ..common.constants import T_INT_FACTOR_DEFAULT
 
 __all__ = [
     "CoincidencerConfig",
@@ -1293,10 +1294,17 @@ class CoincidencerService:
                 "VOLTAGE-SKIP name=%s reason=voltages_disabled", event_name,
             )
             return
+        # Units: C1/C2 specnums count SEARCH samples (t_int_search =
+        # T_INT_FACTOR x native), but the corr-side voltage ring is
+        # keyed by NATIVE fada spectra (block = 2048 native). Convert
+        # here so the corr listener's specnum//2048 lands in-window
+        # (without this every dump requested a block ~16x in the past
+        # and staged 0 bytes — 2026-07-13 incident).
+        native_specnum = int(stats.peak_event_specnum) * T_INT_FACTOR_DEFAULT
         try:
             result = self._voltage_broadcaster.broadcast(
                 event_name=event_name,
-                event_specnum=stats.peak_event_specnum,
+                event_specnum=native_specnum,
                 mjd_target=stats.t_peak_mjd,
                 trigger_class_id=hash(trigger_class.name) & 0xFFFF,
             )

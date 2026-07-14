@@ -20,7 +20,7 @@ def _listener(on_dump=None, on_delete=None) -> VoltageTriggerListener:
         config=VoltageTriggerListenerConfig(
             bind_host="127.0.0.1", bind_port=11229, cn_id=3, chgroup=0,
         ),
-        on_dump=on_dump or (lambda name, spec: True),
+        on_dump=on_dump or (lambda name, spec, mjd: True),
         on_delete=on_delete,
     )
 
@@ -33,12 +33,12 @@ def _pkt(*, specnum: int, flags: int, name: str = "260610hulw") -> bytes:
 
 
 def test_dump_dispatched_on_voltage_flag() -> None:
-    seen: List[Tuple[str, int]] = []
-    lis = _listener(on_dump=lambda n, s: (seen.append((n, s)) or True))
+    seen: List[Tuple[str, int, float]] = []
+    lis = _listener(on_dump=lambda n, s, m: (seen.append((n, s, m)) or True))
     lis._on_datagram(
         _pkt(specnum=777, flags=wire.C2_TRIGGER_FLAG_DUMP_VOLTAGE), None,
     )
-    assert seen == [("260610hulw", 777)]
+    assert seen == [("260610hulw", 777, 60800.0)]
     assert lis.mon["enqueued"] == 1
     assert lis.mon["dump_flagged"] == 1
 
@@ -55,8 +55,8 @@ def test_delete_on_specnum_zero() -> None:
 
 
 def test_cube_only_packet_ignored() -> None:
-    seen: List[Tuple[str, int]] = []
-    lis = _listener(on_dump=lambda n, s: (seen.append((n, s)) or True))
+    seen: List[Tuple[str, int, float]] = []
+    lis = _listener(on_dump=lambda n, s, m: (seen.append((n, s, m)) or True))
     lis._on_datagram(
         _pkt(specnum=5, flags=wire.C2_TRIGGER_FLAG_DUMP_CUBE), None,
     )
@@ -65,7 +65,7 @@ def test_cube_only_packet_ignored() -> None:
 
 
 def test_queue_full_counts() -> None:
-    lis = _listener(on_dump=lambda n, s: False)   # queue always full
+    lis = _listener(on_dump=lambda n, s, m: False)   # queue always full
     lis._on_datagram(
         _pkt(specnum=9, flags=wire.C2_TRIGGER_FLAG_DUMP_VOLTAGE), None,
     )
