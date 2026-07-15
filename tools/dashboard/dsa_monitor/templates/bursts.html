@@ -104,6 +104,12 @@
     .src-chip a { color: #b2bec3; text-decoration: none; font-weight: 700;
         padding: 0 4px; border: none; }
     .src-chip a:hover { color: #fff; }
+    /* Refined-localization marker: superscript R, visually distinct from
+       the (NN) uncertainty parenthetical. */
+    sup.refined-mark {
+        color: #0984e3; font-weight: 700; font-size: 9px;
+        margin-left: 2px; cursor: help;
+    }
 </style>
 {% endblock %}
 
@@ -150,6 +156,10 @@
         <thead>
             <tr>
                 <th>event</th>
+                <th class="value"
+                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown; superscript R = operator-entered refined localization (hover for method/author)">RA (J2000)</th>
+                <th class="value"
+                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown; superscript R = operator-entered refined localization (hover for method/author)">Dec (J2000)</th>
                 <th class="value">UTC time</th>
                 <th>class</th>
                 <th>C3 decision</th>
@@ -161,10 +171,6 @@
                 <th class="value">dm_median</th>
                 <th class="value">l_median</th>
                 <th class="value">m_median</th>
-                <th class="value"
-                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown">RA (J2000)</th>
-                <th class="value"
-                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown">Dec (J2000)</th>
                 <th class="value">cubes</th>
                 <th class="value">plots</th>
             </tr>
@@ -193,6 +199,16 @@
                     </div>
                     {% endif %}
                 </td>
+                {% set rp = refined_positions.get(e.name) %}
+                {% set radec_extra = ' · uncertainty unknown (legacy value)' if e.radec_source == 'legacy' else '' %}
+                <td class="value" style="white-space: nowrap;"
+                    title="{{ rp.tooltip if rp else (('%.4f deg · ICRS J2000 · source: '|format(e.ra_deg) ~ e.radec_source ~ radec_extra) if e.ra_deg is not none else 'no pointing-dec record for this event') }}">
+                    {% if rp %}{{ rp.ra_hms }}<sup class="refined-mark" title="{{ rp.tooltip }}">R</sup>
+                    {% else %}{{ e.ra_hms if e.ra_hms is not none else '—' }}{% endif %}</td>
+                <td class="value" style="white-space: nowrap;"
+                    title="{{ rp.tooltip if rp else (('%.4f deg · ICRS J2000 · source: '|format(e.dec_deg) ~ e.radec_source ~ radec_extra) if e.dec_deg is not none else 'no pointing-dec record for this event') }}">
+                    {% if rp %}{{ rp.dec_dms }}<sup class="refined-mark" title="{{ rp.tooltip }}">R</sup>
+                    {% else %}{{ e.dec_dms if e.dec_dms is not none else '—' }}{% endif %}</td>
                 <td class="value"
                     title="{{ 'mjd_peak %.6f'|format(e.mjd_peak) if e.mjd_peak is not none else 'no t_peak_mjd — dir mtime (~)' }}">
                     {{ e.utc_hms or '—' }}</td>
@@ -233,13 +249,6 @@
                 <td class="value">{{ '%.2f'|format(e.dm_median) if e.dm_median is not none else '—' }}</td>
                 <td class="value">{{ '%.3e'|format(e.l_median) if e.l_median is not none else '—' }}</td>
                 <td class="value">{{ '%.3e'|format(e.m_median) if e.m_median is not none else '—' }}</td>
-                {% set radec_extra = ' · uncertainty unknown (legacy value)' if e.radec_source == 'legacy' else '' %}
-                <td class="value" style="white-space: nowrap;"
-                    title="{{ ('%.4f deg · ICRS J2000 · source: '|format(e.ra_deg) ~ e.radec_source ~ radec_extra) if e.ra_deg is not none else 'no pointing-dec record for this event' }}">
-                    {{ e.ra_hms if e.ra_hms is not none else '—' }}</td>
-                <td class="value" style="white-space: nowrap;"
-                    title="{{ ('%.4f deg · ICRS J2000 · source: '|format(e.dec_deg) ~ e.radec_source ~ radec_extra) if e.dec_deg is not none else 'no pointing-dec record for this event' }}">
-                    {{ e.dec_dms if e.dec_dms is not none else '—' }}</td>
                 <td class="value">{{ e.n_cubes }}/8</td>
                 <td class="value">{{ e.n_plots }}/4</td>
             </tr>

@@ -162,10 +162,35 @@ CREATE TABLE IF NOT EXISTS source_names_purged (
     purged_by    TEXT NOT NULL,
     purged_utc   TEXT NOT NULL
 );
+-- Operator-entered refined localizations (offline/outrigger follow-up).
+-- Append-only audit + current-value semantics like classifications:
+-- last-write-wins, the single current row per event has active=1; a
+-- 'clear' appends an audit row with NULL ra/dec and leaves no active
+-- row. Each row also snapshots the pipeline position as of entry time
+-- (pipe_*), so the DB backup is self-contained with both positions.
+-- CREATE TABLE IF NOT EXISTS upgrades existing live DBs transparently
+-- on first use (same precedent as source_names_purged).
+CREATE TABLE IF NOT EXISTS event_positions (
+    id              INTEGER PRIMARY KEY,
+    event           TEXT NOT NULL,
+    ra_deg          REAL,      -- NULL = 'cleared' audit row
+    dec_deg         REAL,
+    ra_err_arcsec   REAL,
+    dec_err_arcsec  REAL,
+    method          TEXT,
+    username        TEXT NOT NULL,
+    created_utc     TEXT NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 0,
+    pipe_ra_deg     REAL,
+    pipe_dec_deg    REAL,
+    pipe_source     TEXT
+);
 CREATE INDEX IF NOT EXISTS ix_class_event      ON classifications(event);
 CREATE INDEX IF NOT EXISTS ix_class_event_user ON classifications(event, user);
 CREATE INDEX IF NOT EXISTS ix_source_event     ON source_names(event);
 CREATE INDEX IF NOT EXISTS ix_source_name      ON source_names(source_name);
+CREATE INDEX IF NOT EXISTS ix_pos_event        ON event_positions(event);
+CREATE INDEX IF NOT EXISTS ix_pos_active       ON event_positions(active);
 """
 
 
@@ -589,6 +614,198 @@ def vocab(db_path: Optional[str] = None) -> Dict[str, Any]:
         "users": users,
         "source_names": sources,
     }
+
+
+# ---------------------------------------------------------------------------
+# Refined localizations (event_positions)
+# ---------------------------------------------------------------------------
+
+#: Refined-position error bounds (arcsec): finite, > 0, < 1 degree.
+MAX_POS_ERR_ARCSEC = 3600.0
+
+
+def validate_position(
+    ra_deg: float,
+    dec_deg: float,
+    ra_err_arcsec: float,
+    dec_err_arcsec: float,
+    method: Optional[str],
+    username: Optional[str],
+) -> None:
+    """Server-side validation shared by the store + Flask layer.
+
+    Raises ``ValueError`` with a human-readable message on the first
+    violated constraint. (Numeric-ness is asserted here too, so the
+    store never persists NaN/inf.)"""
+    import math
+
+    for label, v in (("ra", ra_deg), ("dec", dec_deg),
+                     ("ra_err_arcsec", ra_err_arcsec),
+                     ("dec_err_arcsec", dec_err_arcsec)):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} is not a number")
+        if not math.isfinite(f):
+            raise ValueError(f"{label} is not finite")
+    if not (0.0 <= float(ra_deg) < 360.0):
+        raise ValueError("ra out of range: need 0 <= ra < 360 deg")
+    if not (-90.0 <= float(dec_deg) <= 90.0):
+        raise ValueError("dec out of range: need -90 <= dec <= +90 deg")
+    for label, v in (("ra_err_arcsec", ra_err_arcsec),
+                     ("dec_err_arcsec", dec_err_arcsec)):
+        if not (0.0 < float(v) < MAX_POS_ERR_ARCSEC):
+            raise ValueError(
+                f"{label} out of range: need 0 < err < "
+                f"{MAX_POS_ERR_ARCSEC:g} arcsec"
+            )
+    if not (method or "").strip():
+        raise ValueError("method is empty")
+    normalize_user(username)  # raises ValueError on empty
+
+
+def _position_row(r: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": r["id"],
+        "event": r["event"],
+        "ra_deg": r["ra_deg"],
+        "dec_deg": r["dec_deg"],
+        "ra_err_arcsec": r["ra_err_arcsec"],
+        "dec_err_arcsec": r["dec_err_arcsec"],
+        "method": r["method"],
+        "username": r["username"],
+        "created_utc": r["created_utc"],
+        "active": bool(r["active"]),
+        "pipe_ra_deg": r["pipe_ra_deg"],
+        "pipe_dec_deg": r["pipe_dec_deg"],
+        "pipe_source": r["pipe_source"],
+    }
+
+
+def set_position(
+    event: Optional[str],
+    ra_deg: float,
+    dec_deg: float,
+    ra_err_arcsec: float,
+    dec_err_arcsec: float,
+    method: Optional[str],
+    username: Optional[str],
+    pipe_snapshot: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record a refined localization (last-write-wins).
+
+    Deactivates any prior active row for the event and inserts the new
+    one with ``active=1``. ``pipe_snapshot`` (``{"ra_deg", "dec_deg",
+    "source"}``, any of which may be None) is the contemporaneous
+    pipeline position, stored alongside so the backup is
+    self-contained. Returns the stored current row."""
+    e = _event_ok(event)
+    validate_position(ra_deg, dec_deg, ra_err_arcsec, dec_err_arcsec,
+                      method, username)
+    u = normalize_user(username)
+    snap = pipe_snapshot or {}
+    with _conn(db_path) as conn:
+        canon = _canonical_user(conn, u)
+        if canon is None:
+            raise UnknownUserError(f"unknown user: {u!r}")
+        conn.execute(
+            "UPDATE event_positions SET active = 0 "
+            "WHERE event = ? AND active = 1", (e,),
+        )
+        cur = conn.execute(
+            "INSERT INTO event_positions"
+            " (event, ra_deg, dec_deg, ra_err_arcsec, dec_err_arcsec,"
+            "  method, username, created_utc, active,"
+            "  pipe_ra_deg, pipe_dec_deg, pipe_source)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (
+                e, float(ra_deg), float(dec_deg),
+                float(ra_err_arcsec), float(dec_err_arcsec),
+                str(method).strip(), canon, _now_iso(),
+                snap.get("ra_deg"), snap.get("dec_deg"),
+                snap.get("source"),
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM event_positions WHERE id = ?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return _position_row(row)
+
+
+def clear_position(
+    event: Optional[str],
+    username: Optional[str],
+    db_path: Optional[str] = None,
+) -> bool:
+    """Clear the current refined position (audited).
+
+    Deactivates the active row and appends an audit row with NULL
+    coordinates (``active=0``) recording who cleared and when — the
+    history must show the clear. Returns True if there was an active
+    position to clear (the audit row is written either way)."""
+    e = _event_ok(event)
+    u = normalize_user(username)
+    with _conn(db_path) as conn:
+        canon = _canonical_user(conn, u)
+        if canon is None:
+            raise UnknownUserError(f"unknown user: {u!r}")
+        cur = conn.execute(
+            "UPDATE event_positions SET active = 0 "
+            "WHERE event = ? AND active = 1", (e,),
+        )
+        had_active = cur.rowcount > 0
+        conn.execute(
+            "INSERT INTO event_positions"
+            " (event, ra_deg, dec_deg, ra_err_arcsec, dec_err_arcsec,"
+            "  method, username, created_utc, active,"
+            "  pipe_ra_deg, pipe_dec_deg, pipe_source)"
+            " VALUES (?, NULL, NULL, NULL, NULL, NULL, ?, ?, 0,"
+            "         NULL, NULL, NULL)",
+            (e, canon, _now_iso()),
+        )
+        return had_active
+
+
+def get_position(
+    event: str, db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """The current (active) refined position for an event, or None."""
+    e = _event_ok(event)
+    with _conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM event_positions "
+            "WHERE event = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+            (e,),
+        ).fetchone()
+    return _position_row(row) if row else None
+
+
+def get_positions_bulk(
+    db_path: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """{event: current refined-position row} for every event that has
+    one — a single query, for the /bursts table page."""
+    with _conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM event_positions WHERE active = 1"
+        ).fetchall()
+    return {r["event"]: _position_row(r) for r in rows}
+
+
+def get_position_history(
+    event: str, db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Full audit trail for an event's refined positions, oldest first
+    (set rows carry coordinates; clear rows have NULL ra/dec)."""
+    e = _event_ok(event)
+    with _conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM event_positions WHERE event = ? ORDER BY id",
+            (e,),
+        ).fetchall()
+    return [_position_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

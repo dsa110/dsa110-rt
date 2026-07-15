@@ -64,9 +64,11 @@ from cands_panel_funcs import (
     ArchiveBrowser,
     DEFAULT_ARCHIVE_ROOT,
     N_VOLTAGE_FRAGMENTS_TOTAL,
+    _SAFE_EVENT_RE,
     partition_events_c3,
 )
 import annotations as ann
+import event_astrometry as ea
 from control_store import (
     CORR_CN_IDS,
     DEFAULT_ARM_SEQ_MARGIN,
@@ -521,6 +523,35 @@ def control_update_bfweights_poll(job_id: str):
     return jsonify(payload)
 
 
+def _refined_display(row: dict) -> dict:
+    """Template-ready view of a current refined-position row: the stored
+    fields + adaptive-precision sexagesimal strings + the table tooltip."""
+    ra_hms, dec_dms = ea.sexagesimal_refined(
+        row.get("ra_deg"), row.get("dec_deg"),
+        row.get("ra_err_arcsec"), row.get("dec_err_arcsec"),
+    )
+    out = dict(row)
+    out["ra_hms"] = ra_hms
+    out["dec_dms"] = dec_dms
+    out["tooltip"] = (
+        f"refined: {row.get('method')} by {row.get('username')} · "
+        f"{row.get('ra_deg'):.5f} {row.get('dec_deg'):+.5f} deg"
+    )
+    return out
+
+
+def _refined_positions_bulk() -> dict:
+    """{event: template-ready refined position} — ONE DB query.
+    Best-effort: a DB hiccup must never 500 the list page."""
+    try:
+        bulk = ann.get_positions_bulk()
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("get_positions_bulk failed (refined positions "
+                      "skipped)")
+        return {}
+    return {name: _refined_display(row) for name, row in bulk.items()}
+
+
 @app.route("/bursts")
 def bursts():
     events = cands_browser.list_events()
@@ -570,6 +601,7 @@ def bursts():
         source_filter_lc=source_filter_lc,
         annot_source_names=annot_source_names,
         events_zombie=events_zombie,
+        refined_positions=_refined_positions_bulk(),
     ))
 
 
@@ -595,6 +627,15 @@ def burst_event(name: str):
                        "custom_tags": [], "labels": list(ann.BUILTIN_LABELS),
                        "users": [], "source_names": []}
         next_unclassified = None
+    # Refined localization context. Best-effort, same policy as above.
+    try:
+        pos_row = ann.get_position(name)
+        refined = _refined_display(pos_row) if pos_row else None
+        pos_history = ann.get_position_history(name)
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("position context failed for %s", name)
+        refined = None
+        pos_history = []
     return _html_revalidate(render_template(
         "burst_event.html",
         active_tab="bursts",
@@ -613,6 +654,8 @@ def burst_event(name: str):
         annot_vocab=annot_vocab,
         annot_builtins=list(ann.BUILTIN_LABELS),
         next_unclassified=next_unclassified,
+        refined=refined,
+        pos_history=pos_history,
     ))
 
 
@@ -2927,6 +2970,83 @@ def api_annotations():
 @app.route("/api/annotations/vocab", methods=["GET"])
 def api_annotations_vocab():
     return _no_store(jsonify({"ok": True, **ann.vocab()}))
+
+
+# ---------- refined localizations ------------------------------------------
+# Operator-entered offline/outrigger positions. Stored in the same
+# annotations DB (append-only audit, active-row current value); the
+# pipeline position is snapshotted server-side at entry time so the DB
+# backup is self-contained.
+
+
+def _pipeline_position(name: str) -> Optional[dict]:
+    """Current pipeline position block for an event, or None. Reads the
+    archive via the cached ArchiveBrowser astrometry (cheap)."""
+    try:
+        det = cands_browser.event_detail(name)
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("pipeline position read failed for %s", name)
+        return None
+    if det is None or det.ra_deg is None or det.dec_deg is None:
+        return None
+    return {"ra_deg": det.ra_deg, "dec_deg": det.dec_deg,
+            "source": det.radec_source}
+
+
+@app.route("/api/position/<name>", methods=["GET"])
+def api_position_get(name: str):
+    if not _SAFE_EVENT_RE.match(name):
+        return jsonify({"ok": False, "error": "bad event name"}), 400
+    try:
+        pos_row = ann.get_position(name)
+        history = ann.get_position_history(name)
+    except Exception as exc:                                # noqa: BLE001
+        LOG.exception("get_position failed for %s", name)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return _no_store(jsonify({
+        "ok": True,
+        "refined": _refined_display(pos_row) if pos_row else None,
+        "pipeline": _pipeline_position(name),
+        "history": history,
+    }))
+
+
+@app.route("/api/position/<name>", methods=["POST"])
+def api_position_post(name: str):
+    if not _SAFE_EVENT_RE.match(name):
+        return jsonify({"ok": False, "error": "bad event name"}), 400
+    p = _annot_params()
+    try:
+        ra_deg = ea.parse_ra_str(p.get("ra"))
+        dec_deg = ea.parse_dec_str(p.get("dec"))
+        row = ann.set_position(
+            name, ra_deg, dec_deg,
+            p.get("ra_err_arcsec"), p.get("dec_err_arcsec"),
+            p.get("method"), p.get("user"),
+            pipe_snapshot=_pipeline_position(name),
+        )
+    except ann.UnknownUserError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return _no_store(jsonify({
+        "ok": True, "refined": _refined_display(row),
+    }))
+
+
+@app.route("/api/position/<name>", methods=["DELETE"])
+@app.route("/api/position/<name>/clear", methods=["POST"])
+def api_position_clear(name: str):
+    if not _SAFE_EVENT_RE.match(name):
+        return jsonify({"ok": False, "error": "bad event name"}), 400
+    p = _annot_params()
+    try:
+        had_active = ann.clear_position(name, p.get("user"))
+    except ann.UnknownUserError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return _no_store(jsonify({"ok": True, "cleared": had_active}))
 
 
 # ---------- API ------------------------------------------------------------

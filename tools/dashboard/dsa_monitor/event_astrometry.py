@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -79,7 +80,12 @@ __all__ = [
     "read_filterbank_dec",
     "format_ra_hms",
     "format_dec_dms",
+    "format_ra_hms_adaptive",
+    "format_dec_dms_adaptive",
     "sexagesimal_for",
+    "sexagesimal_refined",
+    "parse_ra_str",
+    "parse_dec_str",
 ]
 
 
@@ -469,3 +475,214 @@ def sexagesimal_for(rd: RaDec) -> Tuple[Optional[str], Optional[str]]:
         format_ra_hms(rd.ra_deg, sigma_arcsec=sigma, dec_deg=rd.dec_deg),
         format_dec_dms(rd.dec_deg, sigma_arcsec=sigma),
     )
+
+
+# ---------------------------------------------------------------------------
+# Adaptive-precision sexagesimal (refined localizations)
+# ---------------------------------------------------------------------------
+#
+# The fixed-digit formatters above pin the last digit at 0.1 s / 1 arcsec
+# — right for the pipeline's ~60 arcsec positions but wrong for refined
+# localizations whose errors span ~0.1..300 arcsec. The adaptive variants
+# choose the displayed precision so the psrcat-style parenthetical
+# (= round(sigma / last-digit unit)) lands in 1..99, dropping down to
+# whole-arcminute fields for very coarse errors:
+#
+#   sigma_dec 0.1 as -> +DD:MM:SS.ss(10)     1 as   -> +DD:MM:SS.s(10)
+#   sigma_dec 10 as  -> +DD:MM:SS(10)        60 as  -> +DD:MM:SS(60)
+#   sigma_dec 300 as -> +DD:MM(5)            (last digit = 1 arcmin)
+#
+# RA works identically in seconds of time, with sigma_ra_arcsec taken as
+# an ON-SKY great-circle error (converted via 15*cos(dec), same
+# convention as the pipeline's SIGMA_POS_ARCSEC).
+
+#: (n_decimals_on_seconds, last-digit unit). n_decimals -1 = drop the
+#: seconds field entirely (whole-minute precision, unit = 60 base
+#: seconds). Ordered finest -> coarsest; the chooser takes the finest
+#: level whose parenthetical is <= 99.
+_ADAPTIVE_LEVELS: Tuple[Tuple[int, float], ...] = (
+    (3, 0.001), (2, 0.01), (1, 0.1), (0, 1.0), (-1, 60.0),
+)
+
+
+def _choose_precision(sigma_units: float) -> Tuple[int, int, bool]:
+    """Pick (n_decimals, parenthetical, overflow) for a sigma expressed
+    in base units (seconds of time for RA, arcsec for Dec).
+
+    Finest level whose round(sigma/unit) <= 99 wins; the parenthetical
+    is clamped up to 1 at the finest level (a sub-0.0005-unit sigma
+    still shows "(1)" rather than "(0)"). overflow=True means even the
+    whole-minute level exceeds 99 -> caller renders "(>99)"."""
+    for n_dec, unit in _ADAPTIVE_LEVELS:
+        paren = int(round(sigma_units / unit))
+        if paren <= 99:
+            return n_dec, max(paren, 1), False
+    return -1, 99, True
+
+
+def _sexagesimal(value: float, n_decimals: int,
+                 base_per_unit: float) -> Tuple[int, int, str]:
+    """Split |value| (in base seconds: time-seconds for RA when
+    value = hours*3600, arcsec for Dec) into (big, mm, sec_str) with
+    carry-safe rounding at the displayed digit. ``n_decimals = -1``
+    drops the seconds field (rounds to whole minutes; sec_str = "")."""
+    if n_decimals < 0:
+        total_min = int(round(value / 60.0))
+        big, mm = divmod(total_min, 60)
+        return big, mm, ""
+    scale = 10 ** n_decimals
+    total = int(round(value * scale))
+    big, rem = divmod(total, 3600 * scale)
+    mm, rem = divmod(rem, 60 * scale)
+    if n_decimals == 0:
+        return big, mm, f"{rem:02d}"
+    ss = rem / scale
+    return big, mm, f"{ss:0{3 + n_decimals}.{n_decimals}f}"
+
+
+def format_ra_hms_adaptive(
+    ra_deg: Optional[float],
+    sigma_arcsec: float,
+    dec_deg: float,
+) -> Optional[str]:
+    """RA -> adaptive-precision "HH:MM:SS.ss(NN)" (psrcat style).
+
+    ``sigma_arcsec`` is the on-sky 1-sigma RA error; the last displayed
+    digit is chosen so the parenthetical lands in 1..99. None-safe on
+    ``ra_deg``."""
+    if ra_deg is None or not np.isfinite(ra_deg):
+        return None
+    cosd = np.cos(np.radians(dec_deg))
+    if abs(dec_deg) > 85.0 or cosd <= 0.0:
+        # Pole-adjacent cos blowup: whole-minute RA with an explicit cap.
+        sec = (float(ra_deg) % 360.0) / 15.0 * 3600.0
+        hh, mm, _ = _sexagesimal(sec, -1, 1.0)
+        return f"{hh % 24:02d}:{mm:02d}(>99)"
+    sigma_s = float(sigma_arcsec) / (15.0 * cosd)
+    n_dec, paren, overflow = _choose_precision(sigma_s)
+    sec = (float(ra_deg) % 360.0) / 15.0 * 3600.0
+    hh, mm, sstr = _sexagesimal(sec, n_dec, 1.0)
+    hh %= 24
+    body = f"{hh:02d}:{mm:02d}" + (f":{sstr}" if sstr else "")
+    return body + (f"(>{99})" if overflow else f"({paren})")
+
+
+def format_dec_dms_adaptive(
+    dec_deg: Optional[float],
+    sigma_arcsec: float,
+) -> Optional[str]:
+    """Dec -> adaptive-precision "+DD:MM:SS.s(NN)" (psrcat style).
+
+    Last displayed digit chosen so the parenthetical (sigma in units of
+    that digit) lands in 1..99; drops to whole arcminutes for very
+    coarse errors. None-safe on ``dec_deg``."""
+    if dec_deg is None or not np.isfinite(dec_deg):
+        return None
+    n_dec, paren, overflow = _choose_precision(float(sigma_arcsec))
+    d = float(dec_deg)
+    sign = "-" if d < 0 else "+"
+    dd, mm, sstr = _sexagesimal(abs(d) * 3600.0, n_dec, 1.0)
+    body = f"{sign}{dd:02d}:{mm:02d}" + (f":{sstr}" if sstr else "")
+    return body + ("(>99)" if overflow else f"({paren})")
+
+
+def sexagesimal_refined(
+    ra_deg: Optional[float],
+    dec_deg: Optional[float],
+    ra_err_arcsec: Optional[float],
+    dec_err_arcsec: Optional[float],
+) -> Tuple[Optional[str], Optional[str]]:
+    """(ra_hms, dec_dms) for an operator-entered refined localization,
+    with adaptive parentheticals from ITS errors. None-safe."""
+    if ra_deg is None or dec_deg is None:
+        return None, None
+    if ra_err_arcsec is None or dec_err_arcsec is None:
+        return format_ra_hms(ra_deg), format_dec_dms(dec_deg)
+    return (
+        format_ra_hms_adaptive(ra_deg, float(ra_err_arcsec),
+                               float(dec_deg)),
+        format_dec_dms_adaptive(dec_deg, float(dec_err_arcsec)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Coordinate-string parsing (operator input; pure, no astropy)
+# ---------------------------------------------------------------------------
+
+_SEX_RA_RE = re.compile(
+    r"^\s*(\d{1,2})\s*[:h]\s*(\d{1,2})\s*[:m]\s*"
+    r"(\d{1,2}(?:\.\d*)?)\s*s?\s*$", re.IGNORECASE,
+)
+_SEX_DEC_RE = re.compile(
+    r"^\s*([+-]?)\s*(\d{1,2})\s*[:d°]\s*(\d{1,2})\s*[:m'′]\s*"
+    r"(\d{1,2}(?:\.\d*)?)\s*(?:s|\"|″)?\s*$", re.IGNORECASE,
+)
+_DECIMAL_RE = re.compile(r"^\s*[+-]?\d+(?:\.\d*)?\s*$")
+
+
+def parse_ra_str(s: Optional[str]) -> float:
+    """Parse an operator RA string -> degrees in [0, 360).
+
+    Accepts decimal DEGREES ("234.0900") or sexagesimal HOURS
+    ("15:36:21.87", "15h36m21.87s"). Raises ``ValueError`` with a clear
+    message on anything else."""
+    txt = (s or "").strip()
+    if not txt:
+        raise ValueError("RA is empty")
+    if _DECIMAL_RE.match(txt):
+        v = float(txt)
+        if not (0.0 <= v < 360.0):
+            raise ValueError(
+                f"RA {v:g} out of range: need 0 <= ra < 360 deg")
+        return v
+    m = _SEX_RA_RE.match(txt)
+    if not m:
+        raise ValueError(
+            f"cannot parse RA {txt!r}: use decimal degrees "
+            "(e.g. 234.0900) or sexagesimal hours "
+            "(15:36:21.87 or 15h36m21.87s)"
+        )
+    hh, mm, ss = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    if hh > 23:
+        raise ValueError(f"RA hours {hh} out of range (0-23)")
+    if mm > 59:
+        raise ValueError(f"RA minutes {mm} out of range (0-59)")
+    if ss >= 60.0:
+        raise ValueError(f"RA seconds {ss:g} out of range (< 60)")
+    return (hh + mm / 60.0 + ss / 3600.0) * 15.0
+
+
+def parse_dec_str(s: Optional[str]) -> float:
+    """Parse an operator Dec string -> degrees in [-90, +90].
+
+    Accepts decimal degrees ("+17.5598", "-5.2") or sexagesimal
+    ("+17:33:35.3", "-05:12:00", "17d33m35.3s"). Raises ``ValueError``
+    with a clear message on anything else."""
+    txt = (s or "").strip()
+    if not txt:
+        raise ValueError("Dec is empty")
+    if _DECIMAL_RE.match(txt):
+        v = float(txt)
+        if not (-90.0 <= v <= 90.0):
+            raise ValueError(
+                f"Dec {v:g} out of range: need -90 <= dec <= +90 deg")
+        return v
+    m = _SEX_DEC_RE.match(txt)
+    if not m:
+        raise ValueError(
+            f"cannot parse Dec {txt!r}: use decimal degrees "
+            "(e.g. +17.5598) or sexagesimal "
+            "(+17:33:35.3 or 17d33m35.3s)"
+        )
+    sign = -1.0 if m.group(1) == "-" else 1.0
+    dd, mm, ss = int(m.group(2)), int(m.group(3)), float(m.group(4))
+    if dd > 90:
+        raise ValueError(f"Dec degrees {dd} out of range (0-90)")
+    if mm > 59:
+        raise ValueError(f"Dec arcminutes {mm} out of range (0-59)")
+    if ss >= 60.0:
+        raise ValueError(f"Dec arcseconds {ss:g} out of range (< 60)")
+    v = sign * (dd + mm / 60.0 + ss / 3600.0)
+    if not (-90.0 <= v <= 90.0):
+        raise ValueError(f"Dec {v:g} out of range: need -90 <= dec <= +90")
+    return v
