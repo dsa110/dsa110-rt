@@ -60,10 +60,9 @@
             <h3>{{ plot }}</h3>
             {% if plot.startswith('dm_time') %}
             <div class="muted" style="font-size:11px;line-height:1.35;margin:2px 0 6px;">
-                red + = burst reported by the detector; white × = brightest point
-                in the displayed data. They should coincide — a small offset (often
-                along the dispersion bowtie arms) is usually benign; a large offset
-                flags a suspect detection.
+                red + = detector-reported burst; white × = brightest point
+                in the data. Wide separation = a broad-pulse FRB or, more
+                likely, a suspect detection.
             </div>
             {% endif %}
             <img src="/bursts/{{ event.name }}/plot/{{ plot }}" alt="{{ plot }}">

@@ -1152,16 +1152,18 @@ def _render_dm_time(
     # Legend lives below the axes so it never overlaps the waterfall,
     # title, axis labels, or colorbar. Renders correctly even when only
     # the white × exists (coords/burst_row is None: matplotlib just
-    # emits the single handle). The frame is dark grey so the white ×
-    # glyph is legible on the white figure background (the red +
-    # #ff2d55 still contrasts fine on #404040).
+    # emits the single handle). The frame is deep slate-navy so the
+    # white × glyph is legible on the white figure background (the red
+    # + #ff2d55 still contrasts fine on #262b36).
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(
             handles, labels, loc="upper center",
             bbox_to_anchor=(0.5, -0.09), ncol=2, fontsize=9,
-            frameon=True, facecolor="#404040", edgecolor="none",
-            labelcolor="white",
+            frameon=True, fancybox=True, framealpha=0.95,
+            facecolor="#262b36", edgecolor="none",
+            labelcolor="#e6e8eb", borderpad=0.6,
+            handletextpad=0.5, columnspacing=1.4,
         )
     fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(path, dpi=110)
