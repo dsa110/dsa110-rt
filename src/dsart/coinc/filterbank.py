@@ -70,6 +70,11 @@ class FilterbankConfig:
     rfi_mode: str = "both"
     phase_only: bool = True
     timeout_s: float = 1800.0
+    #: etcd key holding the array pointing declination (deg). The
+    #: toolkit needs it for the F21 DEC fringe-stop - without it a
+    #: 2D coherent beamform is fully decorrelated (260715twmx
+    #: incident). Empty string disables the etcd read (tests).
+    dec_key: str = "/mon/array/dec"
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FilterbankConfig":
@@ -86,6 +91,7 @@ class FilterbankConfig:
             rfi_mode=str(d.get("rfi_mode", "both")),
             phase_only=bool(d.get("phase_only", True)),
             timeout_s=float(d.get("timeout_s", 1800.0)),
+            dec_key=str(d.get("dec_key", "/mon/array/dec")),
         )
 
 
@@ -159,13 +165,23 @@ def _run(cmd: List[str], timeout_s: float) -> Dict[str, Any]:
                 "elapsed_s": round(time.monotonic() - t0, 1)}
 
 
+#: The corr dump window is [target-8, target+14] blocks, so the sample
+#: the C2 specnum (and t_peak_mjd) references sits 8 blocks into the
+#: file; tstart = t_peak - 8 blocks.
+N_PRE_BLOCKS = 8
+BLOCK_S = 0.134217728
+
+
 def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
-                  c2row: Dict[str, Any]) -> Dict[str, Any]:
+                  c2row: Dict[str, Any],
+                  dec_deg: Optional[float] = None) -> Dict[str, Any]:
     """Generate filterbank(s) + inspection plot(s) for one KEEP event.
 
     ``c2row`` is the ``c2`` dict from ``Level3/<name>.json`` (l_median,
-    m_median, dm_median, width_median). Best-effort: returns a report
-    dict; never raises."""
+    m_median, dm_median, width_median). ``dec_deg`` is the pointing
+    declination for the F21 DEC fringe-stop (None -> toolkit warns and
+    beamforms without it, fully decorrelated; callers should always
+    supply it). Best-effort: returns a report dict; never raises."""
     report: Dict[str, Any] = {"ok": False}
     try:
         volt_dir = ev_dir / "Level2" / "voltages"
@@ -186,7 +202,11 @@ def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
         width_fil = max(1, round(width_search * T_INT_SEARCH_US /
                                  fil_tsamp_us))
         report.update({"n_fragments": n_frags, "l": l, "m": m, "dm": dm,
-                       "width_fil_samples": width_fil})
+                       "width_fil_samples": width_fil, "dec_deg": dec_deg})
+        t_peak_mjd = c2row.get("t_peak_mjd")
+        tstart_mjd = (
+            float(t_peak_mjd) - N_PRE_BLOCKS * BLOCK_S / 86400.0
+        ) if t_peak_mjd else None
 
         cal_sb00 = snapshot_cal(cfg.cal_applied_dir, fb_dir / "cal")
         if cal_sb00 is not None:
@@ -211,6 +231,10 @@ def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
                    "--core", cfg.core_antennas,
                    "--tscrunch", str(cfg.tscrunch),
                    "--gpu", str(cfg.gpu)]
+            if dec_deg is not None:
+                cmd += ["--dec-deg", repr(float(dec_deg))]
+            if tstart_mjd is not None:
+                cmd += ["--mjd", repr(tstart_mjd)]
             if cal_sb00 is not None:
                 cmd += ["-w", str(cal_sb00)]
                 if cfg.phase_only:

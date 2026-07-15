@@ -85,8 +85,15 @@ def test_run_for_event_produces_both_variants(tmp_path: Path) -> None:
     ev = _mk_event(tmp_path, "260715aaaa")
     rep = run_for_event(cfg, ev, "260715aaaa",
                         {"l_median": 0.001, "m_median": -0.002,
-                         "dm_median": 168.8, "width_median": 4.0})
+                         "dm_median": 168.8, "width_median": 4.0,
+                         "t_peak_mjd": 61236.5},
+                        dec_deg=16.2734)
     assert rep["ok"] is True, rep
+    assert rep["dec_deg"] == 16.2734
+    # the toolkit invocation must carry the F21 dec + tstart mjd
+    tk = rep["runs"][0]["cmd"]
+    assert "--dec-deg" in tk and "16.2734" in tk[tk.index("--dec-deg") + 1]
+    assert "--mjd" in tk
     fb = ev / "filterbank"
     assert (fb / "260715aaaa.fil").is_file()
     assert (fb / "260715aaaa_rfi.fil").is_file()

@@ -390,8 +390,20 @@ class C3Service:
             except (OSError, json.JSONDecodeError) as exc:
                 LOG.warning("filterbank %s: could not read %s: %s — "
                             "beamforming at (l,m)=(0,0)", name, l3p, exc)
+            dec_deg = None
+            if self._cfg.filterbank.dec_key:
+                try:
+                    dd = self._mon_store.get_dict(
+                        self._cfg.filterbank.dec_key) or {}
+                    dec_deg = float(dd["dec_deg"])
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning(
+                        "filterbank %s: no pointing dec from %s (%s) — "
+                        "the F21 DEC fringe-stop will be skipped and the "
+                        "beamform will be decorrelated", name,
+                        self._cfg.filterbank.dec_key, exc)
             fb_report = run_for_event(
-                self._cfg.filterbank, ev_dir, name, c2row)
+                self._cfg.filterbank, ev_dir, name, c2row, dec_deg=dec_deg)
             if fb_report.get("ok"):
                 self._counters["filterbanks_ok"] += 1
             else:
