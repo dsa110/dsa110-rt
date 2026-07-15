@@ -936,6 +936,16 @@ def _burst_coords(
 
 _RETICLE = "#ff2d55"  # high-contrast reticle colour over magma/viridis
 
+# Shared figure geometry for the dm_time and image_peak panels: both
+# figures are 10.0x9.0 in @ dpi 110 (1100x990 px) with the axes box,
+# colorbar, and caption/legend line at identical figure fractions, so
+# the two PNGs align pixel-for-pixel when the dashboard renders them
+# side by side at equal width — by construction, not tuning.
+_PANEL_RECT = (0.10, 0.115, 0.72, 0.80)   # left, bottom, width, height
+_CBAR_RECT = (0.845, 0.115, 0.022, 0.80)
+_CAPTION_Y = 0.03   # baseline of the marker-legend/caption line
+_CAPTION_X = 0.46   # horizontal centre = centre of the panel box
+
 
 def _placeholder(path: Path, title: str, msg: str) -> Path:
     import matplotlib.pyplot as plt
@@ -1061,14 +1071,15 @@ def _render_dm_time(
         vmax = 1.0
     vmin = -2.0
 
-    fig, ax = plt.subplots(figsize=(10.0, 9.0))
+    fig = plt.figure(figsize=(10.0, 9.0))
+    ax = fig.add_axes(_PANEL_RECT)
     im = ax.imshow(
         stacked, aspect="auto", origin="lower", cmap="viridis",
         vmin=vmin, vmax=vmax, interpolation="nearest",
     )
+    cax = fig.add_axes(_CBAR_RECT)
     fig.colorbar(
-        im, ax=ax, label="image-max amplitude (robust σ per DM row)",
-        pad=0.01,
+        im, cax=cax, label="image-max amplitude (robust σ per DM row)",
     )
 
     # Half boundaries (dashed) so the (search node, gpu half) bands are
@@ -1172,12 +1183,11 @@ def _render_dm_time(
             label="detector-reported burst",
         ))
     if proxy_handles:
-        ax.legend(
-            handles=proxy_handles, loc="upper center",
-            bbox_to_anchor=(0.5, -0.09), ncol=2, fontsize=9,
-            frameon=False, labelcolor="#3b4252",
+        fig.legend(
+            handles=proxy_handles, loc="lower center",
+            bbox_to_anchor=(_CAPTION_X, _CAPTION_Y - 0.016),
+            ncol=2, fontsize=9, frameon=False, labelcolor="#3b4252",
         )
-    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(path, dpi=110)
     plt.close(fig)
     return path
@@ -1203,9 +1213,11 @@ def _render_image_peak(
     t_idx = int(np.clip(coords.t_idx, 0, chunk.cube.shape[0] - 1))
     fdm = int(np.clip(coords.fdm_idx, 0, chunk.cube.shape[1] - 1))
     img = np.asarray(chunk.cube[t_idx, fdm], dtype=np.float32)
-    fig, ax = plt.subplots(figsize=(6.2, 5.6))
+    fig = plt.figure(figsize=(10.0, 9.0))
+    ax = fig.add_axes(_PANEL_RECT)
     im = ax.imshow(img, origin="lower", cmap="magma")
-    fig.colorbar(im, ax=ax, label="amplitude")
+    cax = fig.add_axes(_CBAR_RECT)
+    fig.colorbar(im, cax=cax, label="amplitude")
     # Reticle at the detected (l, m): x = m (cols), y = l (rows).
     ax.axhline(coords.l_pix, color=_RETICLE, lw=0.8, ls="--", alpha=0.8)
     ax.axvline(coords.m_pix, color=_RETICLE, lw=0.8, ls="--", alpha=0.8)
@@ -1213,24 +1225,23 @@ def _render_image_peak(
         (coords.m_pix, coords.l_pix), radius=8.0,
         fill=False, edgecolor=_RETICLE, lw=1.8,
     ))
-    ax.set_xlabel("m (pix)")
-    ax.set_ylabel("l (pix)")
+    ax.set_xlabel("m (pix)", fontsize=10)
+    ax.set_ylabel("l (pix)", fontsize=10)
     title = (
         f"image at (DM={coords.dm_pc_cc:.1f}, t={t_idx}) — {event_name} — "
         f"burst (l,m)=({coords.l_pix},{coords.m_pix})" + _provenance(coords)
     )
-    ax.set_title(title, fontsize=9)
-    # Caption y + rect bottom are tuned so the caption line sits on the
-    # same displayed horizontal as the dm_time legend line: the two PNGs
-    # (1100x990 @ dpi 110 and 620x560 @ dpi 100) render side by side at
-    # equal width on the dashboard, and their aspect ratios are ~equal,
-    # so equal figure-fraction height = equal on-screen line.
-    fig.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
+    ax.set_title(title, fontsize=10)
+    # Geometry is shared with _render_dm_time via _PANEL_RECT /
+    # _CBAR_RECT / _CAPTION_Y, so both figures align by construction
+    # (same 1100x990 PNG, same axes box, caption on the same line as
+    # the dm_time marker legend).
     fig.text(
-        0.5, 0.08, "red circle = burst position reported by the detector",
-        ha="center", va="bottom", fontsize=9, color="#3b4252",
+        _CAPTION_X, _CAPTION_Y,
+        "red circle = burst position reported by the detector",
+        ha="center", va="baseline", fontsize=9, color="#3b4252",
     )
-    fig.savefig(path, dpi=100)
+    fig.savefig(path, dpi=110)
     plt.close(fig)
     return path
 
