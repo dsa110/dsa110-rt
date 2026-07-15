@@ -583,9 +583,17 @@ def _fanout(
     return out
 
 
+#: Start-cleanup gets its own (much longer) per-host timeout: unlike the
+#: status polls, it deletes files — and after a long observing stretch a
+#: corr node can hold 10+ GB of staged voltage fragments. At the default
+#: 5 s SSH timeout the 2026-07-15T02:27 start "failed" cleanup on 13/20
+#: hosts (the remote rm actually completed; only the ssh wait died).
+START_CLEANUP_TIMEOUT_S: float = 60.0
+
+
 def cleanup_nodes_for_start(
     *,
-    timeout: float = DEFAULT_SSH_TIMEOUT_S,
+    timeout: float = START_CLEANUP_TIMEOUT_S,
     max_workers: int = DEFAULT_FANOUT_WORKERS,
 ) -> dict[str, Any]:
     """Start-time housekeeping fanned out to every corr + search host.
