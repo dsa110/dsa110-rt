@@ -34,9 +34,10 @@
   }
   function shortTs(ts) {
     if (!ts) return "";
-    // ISO-8601 → "MM-DD HH:MM" UTC, best-effort.
+    // ISO-8601 → "MM-DD HH:MM UTC" (stored timestamps are UTC; house
+    // rule: every human-visible timestamp is explicitly UTC).
     var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(ts);
-    return m ? (m[2] + "-" + m[3] + " " + m[4] + ":" + m[5]) : ts;
+    return m ? (m[2] + "-" + m[3] + " " + m[4] + ":" + m[5] + " UTC") : ts;
   }
 
   function currentLabelFor(user) {
