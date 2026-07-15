@@ -49,11 +49,46 @@
     }
     .volt-count.full { color: #00b894; font-weight: 700; }
     .volt-count.partial { color: #d63031; font-weight: 700; }
+
+    /* Human-annotation badges */
+    .annot-badges { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px; }
+    .annot-badge {
+        display: inline-block; padding: 1px 7px; border-radius: 9px;
+        font-size: 10px; font-weight: 700; color: #fff; letter-spacing: 0.02em;
+    }
+    .annot-badge.frb       { background: #00b894; }
+    .annot-badge.rfi       { background: #d63031; }
+    .annot-badge.noise     { background: #636e72; }
+    .annot-badge.pulsar    { background: #0984e3; }
+    .annot-badge.injection { background: #e17055; }
+    .annot-badge.custom    { background: #8395a7; }
+    .annot-badge.src       { background: #2d3436; font-weight: 600; }
+
+    .annot-filter {
+        margin: 10px 0 0; font-size: 12px; display: flex; flex-wrap: wrap;
+        gap: 6px; align-items: center;
+    }
+    .annot-filter .lbl { color: #636e72; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+    .annot-filter a {
+        text-decoration: none; color: #636e72; padding: 2px 9px;
+        border: 1px solid #dfe6e9; border-radius: 12px;
+    }
+    .annot-filter a:hover { border-color: #b2bec3; }
+    .annot-filter a.active { background: #2d3436; color: #fff; border-color: #2d3436; }
 </style>
 {% endblock %}
 
 {% block content %}
 <h1>Burst candidates</h1>
+
+<div class="annot-filter">
+    <span class="lbl">classification</span>
+    <a href="/bursts" class="{{ 'active' if not tag_filter or tag_filter == 'all' }}">All</a>
+    <a href="/bursts?tag=unclassified" class="{{ 'active' if tag_filter == 'unclassified' }}">Unclassified</a>
+    {% for lab in annot_filter_labels %}
+    <a href="/bursts?tag={{ lab }}" class="{{ 'active' if tag_filter == lab }}">{{ lab }}</a>
+    {% endfor %}
+</div>
 
 {% if not archive_available %}
 <div class="banner warn">
@@ -89,8 +124,26 @@
         </thead>
         <tbody>
             {% for e in events %}
+            {% set a = annot_current.get(e.name) %}
+            {% set show = (not tag_filter) or (tag_filter == 'all')
+               or (tag_filter == 'unclassified' and not (a and a.labels))
+               or (tag_filter not in ['all', 'unclassified'] and a and tag_filter in a.labels) %}
+            {% if show %}
             <tr>
-                <td><a href="/bursts/{{ e.name }}">{{ e.name }}</a></td>
+                <td>
+                    <a href="/bursts/{{ e.name }}">{{ e.name }}</a>
+                    {% if a and (a.source_name or a.labels) %}
+                    <div class="annot-badges">
+                        {% if a.source_name %}
+                        <span class="annot-badge src" title="source name">{{ a.source_name }}</span>
+                        {% endif %}
+                        {% for lab, cnt in a.labels.items() %}
+                        <span class="annot-badge {{ lab|lower if lab in annot_builtins else 'custom' }}">
+                            {{ lab }}{% if cnt > 1 %}×{{ cnt }}{% endif %}</span>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                </td>
                 <td class="value"
                     title="{{ 'mjd_peak %.6f'|format(e.mjd_peak) if e.mjd_peak is not none else 'no t_peak_mjd — dir mtime (~)' }}">
                     {{ e.utc_hms or '—' }}</td>
@@ -134,6 +187,7 @@
                 <td class="value">{{ e.n_cubes }}/8</td>
                 <td class="value">{{ e.n_plots }}/4</td>
             </tr>
+            {% endif %}
             {% endfor %}
         </tbody>
     </table>

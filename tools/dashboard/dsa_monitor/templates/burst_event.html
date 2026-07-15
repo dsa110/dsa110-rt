@@ -1,6 +1,49 @@
 {% extends "base.html" %}
 {% block title %}{{ event.name }} – burst – DSA Monitor{% endblock %}
 
+{% block head_extra %}
+<style>
+    .annot-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+    .annot-row .lbl { font-size: 12px; font-weight: 700; color: #636e72; text-transform: uppercase; letter-spacing: 0.04em; margin-right: 2px; }
+    .annot-user-btn, .annot-label-btn {
+        padding: 4px 13px; border-radius: 14px; border: 1px solid #b2bec3;
+        background: #f1f2f6; color: #2d3436; cursor: pointer;
+        font-size: 13px; font-weight: 600;
+    }
+    .annot-user-btn.active { background: #2d3436; color: #fff; border-color: #2d3436; }
+    .annot-label-btn.active { color: #fff; border-color: transparent; box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+    .annot-label-btn:hover { border-color: #636e72; }
+    .annot-input {
+        padding: 5px 9px; border: 1px solid #b2bec3; border-radius: 4px; font-size: 13px;
+    }
+    .annot-btn-sm {
+        padding: 5px 12px; font-size: 12px; border-radius: 4px; border: none;
+        background: #dfe6e9; color: #2d3436; cursor: pointer; font-weight: 600;
+    }
+    .annot-btn-sm:hover { background: #ced6da; }
+    .annot-btn-danger { background: #ffd6d0; color: #b02a1c; }
+    .annot-btn-danger:hover { background: #ffc2b8; }
+    .annot-sourcewrap { position: relative; }
+    .annot-dd {
+        position: absolute; top: 100%; left: 0; z-index: 50;
+        min-width: 240px; max-height: 240px; overflow-y: auto;
+        background: #fff; border: 1px solid #b2bec3; border-radius: 6px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.18); display: none; margin-top: 2px;
+    }
+    .annot-dd div { padding: 6px 12px; font-size: 13px; cursor: pointer; }
+    .annot-dd div.active, .annot-dd div:hover { background: #0984e3; color: #fff; }
+    .annot-msg { font-size: 13px; margin-top: 8px; min-height: 18px; }
+    .annot-msg.warn { color: #d63031; font-weight: 600; }
+    .annot-msg.ok { color: #00845a; }
+    .annot-hint { font-size: 12px; color: #b8860b; margin-top: 4px; min-height: 15px; }
+    .annot-badge { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; font-weight: 700; color: #fff; }
+    .annot-summary-src { font-weight: 700; color: #2d3436; }
+    #annot-history table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+    #annot-history td { padding: 3px 8px; border-bottom: 1px solid #eee; font-family: 'Menlo','Consolas',monospace; }
+    .annot-keys { font-size: 11px; color: #b2bec3; margin-top: 10px; }
+</style>
+{% endblock %}
+
 {% block content %}
 <h1>burst event — {{ event.name }}</h1>
 
@@ -73,6 +116,67 @@
     <div class="muted">No plots written yet — the C2 plot worker fires when cubes land in <code>{{ event.archive_dir }}/cubes/</code> (or after the 60 s wait expires).</div>
     {% endif %}
 </div>
+
+<div class="card" id="annot-card">
+    <h2>Human classification</h2>
+    <div id="annot-summary" class="muted" style="margin-bottom: 6px;"></div>
+
+    <div class="annot-row">
+        <span class="lbl">you</span>
+        <span id="annot-users"></span>
+        <input id="annot-newuser" class="annot-input" style="width: 130px;"
+               placeholder="add user…" autocomplete="off">
+        <button class="annot-btn-sm" id="annot-adduser" type="button">+ user</button>
+    </div>
+
+    <div class="annot-row" id="annot-labels"></div>
+
+    <div class="annot-row">
+        <button class="annot-btn-sm annot-btn-danger" id="annot-clear" type="button">clear (c)</button>
+        <input id="annot-newtag" class="annot-input" style="width: 130px;"
+               placeholder="+ new tag…" autocomplete="off">
+        <button class="annot-btn-sm" id="annot-addtag" type="button">+ tag &amp; apply</button>
+    </div>
+
+    <div class="annot-row annot-sourcewrap">
+        <span class="lbl">source</span>
+        <input id="annot-source" class="annot-input" style="width: 220px;"
+               placeholder="source name…" autocomplete="off">
+        <div id="annot-source-dd" class="annot-dd"></div>
+        <button class="annot-btn-sm" id="annot-source-set" type="button">set</button>
+        <button class="annot-btn-sm annot-btn-danger" id="annot-source-clear" type="button">clear</button>
+        <span id="annot-source-who" class="muted"></span>
+    </div>
+    <div id="annot-source-hint" class="annot-hint"></div>
+
+    <div id="annot-msg" class="annot-msg"></div>
+
+    <details style="margin-top: 10px;">
+        <summary style="cursor: pointer; font-size: 12px;" class="muted">
+            annotation history for this event</summary>
+        <div id="annot-history"></div>
+    </details>
+
+    <div class="annot-keys">
+        shortcuts: <strong>1</strong> FRB · <strong>2</strong> RFI ·
+        <strong>3</strong> NOISE · <strong>4</strong> PULSAR ·
+        <strong>5</strong> INJECTION · <strong>c</strong> clear ·
+        <strong>n</strong> next unclassified
+        (ignored while typing in a box)
+    </div>
+</div>
+
+<script>
+window.ANNOT = {
+    event: {{ event.name|tojson }},
+    block: {{ annot_block|tojson }},
+    vocab: {{ annot_vocab|tojson }},
+    builtins: {{ annot_builtins|tojson }},
+    history: {{ annot_history|tojson }},
+    nextUnclassified: {{ next_unclassified|tojson }},
+};
+</script>
+<script src="/static/annotations.js" defer></script>
 
 <div class="card">
     <h2>Coherent filterbank (bbproc)</h2>

@@ -490,6 +490,13 @@ def bursts():
         LOG.exception("annotations.all_current failed (list badges skipped)")
         annot_current = {}
     tag_filter = (request.args.get("tag") or "").strip()
+    # Filter dropdown options: built-ins always, plus any custom labels
+    # actually in use, so the operator can slice by them too.
+    present = set()
+    for blk in annot_current.values():
+        present.update((blk.get("labels") or {}).keys())
+    custom_present = sorted(present - set(ann.BUILTIN_LABELS))
+    annot_filter_labels = list(ann.BUILTIN_LABELS) + custom_present
     return render_template(
         "bursts.html",
         active_tab="bursts",
@@ -500,6 +507,7 @@ def bursts():
         archive_available=cands_browser.is_available,
         annot_current=annot_current,
         annot_builtins=list(ann.BUILTIN_LABELS),
+        annot_filter_labels=annot_filter_labels,
         tag_filter=tag_filter,
     )
 
