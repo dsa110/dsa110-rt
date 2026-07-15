@@ -161,6 +161,10 @@
                 <th class="value">dm_median</th>
                 <th class="value">l_median</th>
                 <th class="value">m_median</th>
+                <th class="value"
+                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown">RA (J2000)</th>
+                <th class="value"
+                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown">Dec (J2000)</th>
                 <th class="value">cubes</th>
                 <th class="value">plots</th>
             </tr>
@@ -229,6 +233,13 @@
                 <td class="value">{{ '%.2f'|format(e.dm_median) if e.dm_median is not none else '—' }}</td>
                 <td class="value">{{ '%.3e'|format(e.l_median) if e.l_median is not none else '—' }}</td>
                 <td class="value">{{ '%.3e'|format(e.m_median) if e.m_median is not none else '—' }}</td>
+                {% set radec_extra = ' · uncertainty unknown (legacy value)' if e.radec_source == 'legacy' else '' %}
+                <td class="value" style="white-space: nowrap;"
+                    title="{{ ('%.4f deg · ICRS J2000 · source: '|format(e.ra_deg) ~ e.radec_source ~ radec_extra) if e.ra_deg is not none else 'no pointing-dec record for this event' }}">
+                    {{ e.ra_hms if e.ra_hms is not none else '—' }}</td>
+                <td class="value" style="white-space: nowrap;"
+                    title="{{ ('%.4f deg · ICRS J2000 · source: '|format(e.dec_deg) ~ e.radec_source ~ radec_extra) if e.dec_deg is not none else 'no pointing-dec record for this event' }}">
+                    {{ e.dec_dms if e.dec_dms is not none else '—' }}</td>
                 <td class="value">{{ e.n_cubes }}/8</td>
                 <td class="value">{{ e.n_plots }}/4</td>
             </tr>

@@ -27,6 +27,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from event_astrometry import (
+    EventAstrometry,
+    RaDec,
+    sexagesimal_for,
+)
+
 __all__ = [
     "ArchiveBrowser",
     "EventSummary",
@@ -47,6 +53,10 @@ DEFAULT_ARCHIVE_ROOT = Path(
     os.environ.get("CANDS_ARCHIVE_ROOT", "/dataz/dsa110/candidates")
 )
 DEFAULT_MAX_EVENTS = int(os.environ.get("CANDS_MAX_EVENTS", "200"))
+
+
+#: Sentinel so _summarise can tell "meta not supplied" from "meta is None".
+_UNSET = object()
 
 
 _EVENT_NAME_RE = re.compile(r"^\d{6}[a-z]{4}$")
@@ -87,6 +97,17 @@ class EventSummary:
     # Whether Level3/<name>.json exists on h23. Used by the zombie
     # partition: a genuine zombie never received its Level3 metadata.
     has_l3: bool = False
+    # ICRS J2000 sky position (deg) + provenance of the pointing-dec used
+    # to derive it ("level3" | "filterbank" | "legacy" | None). None
+    # ra/dec means no
+    # pointing-dec source was available; the UI renders "—". The table
+    # shows the sexagesimal strings; the degrees stay for the per-cell
+    # tooltip and for API/test stability.
+    ra_deg: Optional[float] = None
+    dec_deg: Optional[float] = None
+    radec_source: Optional[str] = None
+    ra_hms: Optional[str] = None      # "HH:MM:SS.s(NN)"; no (NN) for legacy
+    dec_dms: Optional[str] = None     # "+DD:MM:SS(NN)"; no (NN) for legacy
 
     @property
     def c3_status(self) -> str:
@@ -196,6 +217,13 @@ class EventDetail:
     fil_plots: Tuple[str, ...] = ()   # inspection PNGs
     fil_files: Tuple[str, ...] = ()   # .fil filenames (size-linked only)
     fil_meta: Optional[Mapping[str, Any]] = None  # filterbank.json
+    # ICRS J2000 sky position (deg + sexagesimal) + pointing-dec
+    # provenance ("level3" | "filterbank" | "legacy" | None).
+    ra_deg: Optional[float] = None
+    dec_deg: Optional[float] = None
+    radec_source: Optional[str] = None
+    ra_hms: Optional[str] = None      # "HH:MM:SS.s(NN)"; no (NN) for legacy
+    dec_dms: Optional[str] = None     # "+DD:MM:SS(NN)"; no (NN) for legacy
 
 
 class ArchiveBrowser:
@@ -208,6 +236,10 @@ class ArchiveBrowser:
     ) -> None:
         self._root = Path(root)
         self._max_events = max_events
+        # Per-process astrometry cache + per-render batcher. Persists
+        # across list_events() calls so re-renders are free; keyed on the
+        # exact inputs so a later filterbank.json recomputes.
+        self._astro = EventAstrometry()
 
     @property
     def root(self) -> Path:
@@ -241,14 +273,34 @@ class ArchiveBrowser:
                 continue
             candidates.append((mtime, p))
         candidates.sort(reverse=True)
-        out: List[EventSummary] = []
-        for mtime, p in candidates[: self._max_events]:
-            out.append(self._summarise(p, mtime))
-        return out
+        picked = candidates[: self._max_events]
+        # Read Level3 once per event, then resolve every sky position in a
+        # single batched TETE->ICRS transform (see event_astrometry).
+        prepped: List[Tuple[Path, float, Optional[dict]]] = [
+            (p, mtime, self._read_l3(p, p.name)) for mtime, p in picked
+        ]
+        try:
+            radecs = self._astro.compute(
+                [(p.name, p, meta) for p, _, meta in prepped]
+            )
+        except Exception:                                      # noqa: BLE001
+            _LOG.exception("astrometry batch failed; positions blank")
+            radecs = {}
+        return [
+            self._summarise(p, mtime, meta=meta,
+                            radec=radecs.get(p.name))
+            for p, mtime, meta in prepped
+        ]
 
-    def _summarise(self, event_dir: Path, mtime: float) -> EventSummary:
+    def _summarise(
+        self, event_dir: Path, mtime: float,
+        meta: Any = _UNSET, radec: Optional[RaDec] = None,
+    ) -> EventSummary:
         name = event_dir.name
-        meta = self._read_l3(event_dir, name)
+        if meta is _UNSET:
+            meta = self._read_l3(event_dir, name)
+        rd = radec if radec is not None else RaDec(None, None, None)
+        rd_hms, rd_dms = sexagesimal_for(rd)
         c2 = (meta or {}).get("c2", {}) if isinstance(meta, dict) else {}
         trigger = (meta or {}).get("trigger", {}) if isinstance(meta, dict) else {}
         n_cubes = _count_files(event_dir / "cubes", "cube_s*_g*_*.npz")
@@ -281,6 +333,11 @@ class ArchiveBrowser:
             ),
             utc_hms=_utc_hms(mjd_peak, mtime),
             has_l3=meta is not None,
+            ra_deg=rd.ra_deg,
+            dec_deg=rd.dec_deg,
+            radec_source=rd.source,
+            ra_hms=rd_hms,
+            dec_dms=rd_dms,
         )
 
     # ----- detail view ----------------------------------------------------
@@ -320,6 +377,8 @@ class ArchiveBrowser:
                     fil_meta = json.loads(mpath.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     fil_meta = None
+        rd = self._astro.compute_one(name, event_dir, meta)
+        rd_hms, rd_dms = sexagesimal_for(rd)
         return EventDetail(
             name=name,
             archive_dir=event_dir,
@@ -337,6 +396,11 @@ class ArchiveBrowser:
             fil_plots=tuple(fil_plots),
             fil_files=tuple(fil_files),
             fil_meta=fil_meta,
+            ra_deg=rd.ra_deg,
+            dec_deg=rd.dec_deg,
+            radec_source=rd.source,
+            ra_hms=rd_hms,
+            dec_dms=rd_dms,
         )
 
     def fil_plot_path(self, name: str, plot_name: str) -> Optional[Path]:

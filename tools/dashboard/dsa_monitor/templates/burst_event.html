@@ -95,6 +95,34 @@
 </div>
 
 <div class="card">
+    <h2>Sky position <span class="muted" style="font-size:12px;font-weight:normal;">(ICRS J2000, ~1 arcmin)</span></h2>
+    {% if event.ra_deg is not none and event.dec_deg is not none %}
+    <div style="font-size: 15px;">
+        <strong>RA</strong>&nbsp; <strong>{{ event.ra_hms }}</strong>
+        &nbsp;<span class="muted">({{ '%.4f'|format(event.ra_deg) }}°)</span>
+        &nbsp;·&nbsp;
+        <strong>Dec</strong>&nbsp; <strong>{{ event.dec_dms }}</strong>
+        &nbsp;<span class="muted">({{ '%+.4f'|format(event.dec_deg) }}°)</span>
+    </div>
+    <div class="muted" style="margin-top: 6px; font-size: 12px;">
+        derived from image (l, m) + array pointing dec ·
+        pointing-dec source: <code>{{ event.radec_source }}</code>
+        {% if event.radec_source == 'legacy' %}
+        · uncertainty unknown (legacy value)
+        {% else %}
+        · ± 60 arcsec (1 sigma, conservative)
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="muted">No sky position: no pointing-declination record
+        for this event
+        (Level3 <code>c2.pointing_dec_deg</code>,
+        <code>filterbank.json</code> dec and legacy Level3 ra,dec all
+        absent). Positions are never guessed from the live pointing.</div>
+    {% endif %}
+</div>
+
+<div class="card">
     <h2>C3 cube-veto decision</h2>
     {% if event.c3_decision %}
     {% set c3 = event.c3_decision %}
