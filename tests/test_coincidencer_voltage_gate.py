@@ -17,7 +17,7 @@ from dsart.services.coincidencer import (
     CoincidencerService,
     DumpsGate,
 )
-from dsart.common.constants import T_INT_FACTOR_DEFAULT
+from dsart.services.coincidencer import search_to_snap_specnum
 
 
 # --- DumpsGate default_enabled -----------------------------------------
@@ -110,6 +110,7 @@ def _service(tmp_path: Path, *, vbc, vgate) -> CoincidencerService:
 
 _STATS = SimpleNamespace(
     peak_event_specnum=42, t_peak_mjd=60800.0, snr_max=30.0, dm_median=500.0,
+    peak_sample_period_us=1048.576,
 )
 _TC = SimpleNamespace(name="bright_frb")
 
@@ -142,10 +143,11 @@ def test_voltage_fires_when_enabled_and_real(tmp_path: Path) -> None:
     )
     assert len(vbc.calls) == 1
     assert vbc.calls[0]["event_name"] == "ev"
-    # search-sample specnum is converted to NATIVE fada spectra
-    # (x T_INT_FACTOR_DEFAULT) so the corr ring lookup lands
-    # in-window (2026-07-13 empty-dump bug).
-    assert vbc.calls[0]["event_specnum"] == 42 * T_INT_FACTOR_DEFAULT
+    # search-sample specnum converted to SNAP specnums using the peak
+    # member's own sample period (2026-07-13 empty-dump bug +
+    # VOLTAGE_DUMP_TIMING_FIX.md defect 2).
+    assert vbc.calls[0]["event_specnum"] == search_to_snap_specnum(
+        42, 1048.576) == 42 * 16
     assert svc._counters["voltages_broadcast"] == 1
     assert svc._counters["voltage_broadcast_ok"] == 2
     assert svc._counters["voltage_broadcast_fail"] == 1

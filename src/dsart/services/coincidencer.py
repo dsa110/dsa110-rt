@@ -88,7 +88,7 @@ from ..coinc.veto import (
     dm_comb_detected,
 )
 from ..coinc.window import TimeWindow, WindowEntry
-from ..common.constants import T_INT_FACTOR_DEFAULT
+from ..common.constants import SPECNUM_PERIOD_US
 
 __all__ = [
     "CoincidencerConfig",
@@ -659,6 +659,43 @@ class _PendingPlot:
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
+
+
+#: Fallback specnums-per-search-sample when the peak member's batch
+#: header is unusable (production t_int_search = 1048.576 us / 65.536).
+_SPECNUM_FACTOR_FALLBACK = 16
+
+
+def search_to_snap_specnum(event_specnum: int,
+                           sample_period_us: float) -> int:
+    """Convert a C1 search-sample specnum to SNAP specnums (65.536 us).
+
+    The factor comes from the peak member's own C1 batch header
+    (``WindowEntry.sample_period_us``), NOT from a compile-time
+    constant: with t_int_search = 524.288 us the factor is 8, at the
+    production 1048.576 us it is 16 — a fixed x16 stages 0 blocks the
+    moment the op-point changes (VOLTAGE_DUMP_TIMING_FIX.md §4).
+    Guards fall back to the production factor rather than raising:
+    this path runs inside the trigger flow and must never break the
+    cube dump.
+    """
+    factor = _SPECNUM_FACTOR_FALLBACK
+    if sample_period_us > 100.0:      # excludes heartbeat placeholder 1.0
+        cand = round(sample_period_us / SPECNUM_PERIOD_US)
+        if cand >= 1 and abs(cand * SPECNUM_PERIOD_US
+                             - sample_period_us) < 1e-6:
+            factor = int(cand)
+        else:
+            _LOG.warning(
+                "sample_period_us=%.6f is not an integer multiple of the "
+                "specnum period %.3f us — falling back to factor %d",
+                sample_period_us, SPECNUM_PERIOD_US,
+                _SPECNUM_FACTOR_FALLBACK)
+    else:
+        _LOG.warning(
+            "peak sample_period_us=%.3f unusable — falling back to "
+            "factor %d", sample_period_us, _SPECNUM_FACTOR_FALLBACK)
+    return int(event_specnum) * factor
 
 
 class CoincidencerService:
@@ -1294,13 +1331,14 @@ class CoincidencerService:
                 "VOLTAGE-SKIP name=%s reason=voltages_disabled", event_name,
             )
             return
-        # Units: C1/C2 specnums count SEARCH samples (t_int_search =
-        # T_INT_FACTOR x native), but the corr-side voltage ring is
-        # keyed by NATIVE fada spectra (block = 2048 native). Convert
-        # here so the corr listener's specnum//2048 lands in-window
-        # (without this every dump requested a block ~16x in the past
-        # and staged 0 bytes — 2026-07-13 incident).
-        native_specnum = int(stats.peak_event_specnum) * T_INT_FACTOR_DEFAULT
+        # Units: C1/C2 specnums count SEARCH samples but the corr-side
+        # voltage ring is keyed by SNAP specnums (block = 2048). The
+        # factor is derived from the peak member's own batch header so
+        # an op-point change (t_int_search 1048.576 -> 524.288 us)
+        # cannot silently stage 0 blocks (2026-07-13 incident +
+        # VOLTAGE_DUMP_TIMING_FIX.md §4).
+        native_specnum = search_to_snap_specnum(
+            stats.peak_event_specnum, stats.peak_sample_period_us)
         try:
             result = self._voltage_broadcaster.broadcast(
                 event_name=event_name,

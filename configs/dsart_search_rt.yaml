@@ -774,6 +774,19 @@ c3:
     rfi_mode: both                   # unflagged + SK-flagged versions
     phase_only: true                 # match the realtime cal convention
     timeout_s: 1800.0
+  # ---- correlator-HDF5 calibration archive (2026-07-15) ----------------
+  # T3 link_hdf5_files equivalent: when a KEEP carries voltages, C3
+  # hard-links the +-2 h correlator UVH5 window into <cand>/calibration/
+  # (zero disk cost; survives the 3.5-day delete_level1_data cron).
+  # The +2h half doesn't exist yet at KEEP time, so C3 re-runs the
+  # (idempotent) link pass after window end + settle_s.
+  cal_hdf5:
+    enabled: true
+    hours_each_side: 2.0
+    correlator_dir: /dataz/dsa110/operations/correlator
+    dest_subdir: calibration
+    settle_s: 600.0
+    max_late_s: 7200.0
   collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger
   collect_poll_s: 15.0
   collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land

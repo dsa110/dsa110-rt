@@ -127,3 +127,55 @@ def test_run_for_event_failure_is_contained(tmp_path: Path) -> None:
     ev = _mk_event(tmp_path, "260715cccc")
     rep = run_for_event(bad, ev, "260715cccc", {"dm_median": 100.0})
     assert rep["ok"] is False          # reported, not raised
+
+
+# ---- cal_hdf5 C3 integration helpers (2026-07-15) --------------------------
+
+
+def test_cal_hdf5_config_from_dict_defaults() -> None:
+    from dsart.coinc.cal_hdf5_archive import CalHdf5Config
+    c = CalHdf5Config.from_dict(None)
+    assert c.enabled and c.hours_each_side == 2.0
+    c2 = CalHdf5Config.from_dict({"enabled": False, "hours_each_side": 1.0})
+    assert not c2.enabled and c2.hours_each_side == 1.0
+
+
+def test_archive_event_idempotent_and_partial(tmp_path: Path) -> None:
+    """archive_event links what exists, reports incompleteness, and a
+    re-run picks up newly-arrived files without touching prior links."""
+    from dsart.coinc.cal_hdf5_archive import archive_event
+    corr = tmp_path / "correlator"
+    corr.mkdir()
+    cands = tmp_path / "cands"
+    ev = cands / "260715aaaa"
+    (ev / "Level3").mkdir(parents=True)
+    # burst at 2026-07-15T03:00:00 -> mjd
+    import datetime as _dt
+    t = _dt.datetime(2026, 7, 15, 3, 0, 0, tzinfo=_dt.timezone.utc)
+    mjd = t.timestamp() / 86400.0 + 40587.0
+    (ev / "Level3" / "260715aaaa.json").write_text(
+        json.dumps({"c2": {"t_peak_mjd": mjd}}))
+
+    def _mk(hh, mm, n_sb=16):
+        for sb in range(n_sb):
+            (corr / f"2026-07-15T{hh:02d}:{mm:02d}:00_sb{sb:02d}.hdf5"
+             ).write_bytes(b"h5")
+
+    # only the PRE half exists initially (01:00-03:00, 5-min cadence)
+    for k in range(24):
+        _mk(1 + (k * 5) // 60, (k * 5) % 60)
+    rep1 = archive_event("260715aaaa", candidates_root=cands,
+                         correlator_dir=corr, hours_each_side=2.0)
+    assert rep1["complete"] is False
+    assert rep1["n_linked"] == 24 * 16
+    # POST half arrives; re-run links only the new ones
+    for k in range(24):
+        _mk(3 + (k * 5) // 60, (k * 5) % 60)
+    rep2 = archive_event("260715aaaa", candidates_root=cands,
+                         correlator_dir=corr, hours_each_side=2.0)
+    assert rep2["complete"] is True
+    assert rep2["n_already_present"] == 24 * 16
+    assert rep2["n_linked"] == 24 * 16
+    # hard links, not copies
+    one = ev / "calibration" / "2026-07-15T01:00:00_sb00.hdf5"
+    assert one.stat().st_nlink == 2

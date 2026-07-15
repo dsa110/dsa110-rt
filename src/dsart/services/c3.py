@@ -33,6 +33,7 @@ import shutil
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -46,12 +47,15 @@ from ..coinc.cube_veto import (
     decide,
     event_is_injection,
 )
+from ..coinc.cal_hdf5_archive import CalHdf5Config
+from ..coinc.cal_hdf5_archive import archive_event as cal_hdf5_archive_event
 from ..coinc.filterbank import FilterbankConfig, run_for_event
 from ..coinc.voltage_collect import (
     CorrNode,
     collect_fragments,
     collection_done,
     plan_fragments,
+    plan_manifests,
     rsync_pull,
 )
 
@@ -109,6 +113,9 @@ class C3Config:
     # (dsa110-bbproc toolkit; runs synchronously in the scan loop so
     # filterbank jobs are strictly serialized).
     filterbank: FilterbankConfig = field(default_factory=FilterbankConfig)
+    # Correlator-HDF5 calibration archive per voltage-carrying KEEP
+    # (T3 link_hdf5_files equivalent; dsart/coinc/cal_hdf5_archive.py).
+    cal_hdf5: CalHdf5Config = field(default_factory=CalHdf5Config)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "C3Config":
@@ -165,6 +172,7 @@ class C3Config:
             mon_interval_s=float(c3.get("mon_interval_s", 5.0)),
             veto=th,
             filterbank=FilterbankConfig.from_dict(c3.get("filterbank")),
+            cal_hdf5=CalHdf5Config.from_dict(c3.get("cal_hdf5")),
         )
 
 
@@ -225,7 +233,14 @@ class C3Service:
             "fragments_collected": 0,
             "filterbanks_ok": 0,
             "filterbanks_failed": 0,
+            "cal_hdf5_complete": 0,
+            "cal_hdf5_partial": 0,
+            "cal_hdf5_failed": 0,
         }
+        # name -> {"due_unix": float, "attempts": int} — cal archives
+        # whose +window is still in the future (persisted; re-checked
+        # each scan tick until complete or too late).
+        self._cal_pending: Dict[str, Dict[str, Any]] = {}
         self._load_state()
 
     # ----- state -------------------------------------------------------
@@ -235,7 +250,9 @@ class C3Service:
         if p.is_file():
             try:
                 with p.open("r") as fh:
-                    self._processed = dict(json.load(fh).get("processed", {}))
+                    doc = json.load(fh)
+                self._processed = dict(doc.get("processed", {}))
+                self._cal_pending = dict(doc.get("cal_pending", {}))
             except (OSError, ValueError):
                 LOG.warning("could not read C3 state %s; starting fresh", p)
 
@@ -245,7 +262,8 @@ class C3Service:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(".tmp")
             with tmp.open("w") as fh:
-                json.dump({"processed": self._processed}, fh, indent=2)
+                json.dump({"processed": self._processed,
+                           "cal_pending": self._cal_pending}, fh, indent=2)
             tmp.replace(p)
         except OSError as exc:
             LOG.warning("could not write C3 state %s: %s", p, exc)
@@ -371,11 +389,43 @@ class C3Service:
             "n_fragments_total": n_total,
             "present_by_chgroup": {str(k): v for k, v in present.items()},
         }
+        # Staging manifests (<event>_sbNN.json: target/first/last block,
+        # drop list, mjd_target). Best-effort, single pass, NOT counted
+        # toward completion — but MUST land before the staging-cleanup
+        # broadcast below deletes the originals (260715twmx lost its
+        # dump provenance this way, 2026-07-15).
+        n_manifests = 0
+        if n_present > 0:
+            try:
+                man_plans = plan_manifests(
+                    event_name=name,
+                    corr_nodes=self._cfg.corr_nodes,
+                    staging_dir=self._cfg.staging_dir,
+                    dest_dir=dest,
+                )
+                _mp, n_manifests = collect_fragments(
+                    man_plans,
+                    pull_fn=lambda r, d: rsync_pull(
+                        r, d, bwlimit_kbps=self._cfg.rsync_bwlimit_kbps),
+                )
+            except Exception:  # noqa: BLE001
+                LOG.exception("manifest collection failed for %s", name)
+        report["n_manifests"] = n_manifests
+
         try:
             with (ev_dir / "Level3" / f"{name}_voltages.json").open("w") as fh:
                 json.dump(report, fh, indent=2)
         except OSError as exc:
             LOG.warning("could not write voltage report for %s: %s", name, exc)
+
+        # Correlator-HDF5 calibration archive (T3 link_hdf5_files
+        # equivalent) — only when this KEEP actually carries voltages.
+        # Phase 1 links whatever exists now (the future half of the
+        # window hasn't been written yet); the scan loop re-runs it
+        # after the window closes (idempotent hard links).
+        cal_report: Dict[str, Any] = {"skipped": "disabled"}
+        if self._cfg.cal_hdf5.enabled and n_present > 0:
+            cal_report = self._run_cal_archive(name, first_pass=True)
 
         # bbproc coherent filterbank + inspection plot (synchronous, so
         # events queue one after another; best-effort — a filterbank
@@ -416,7 +466,8 @@ class C3Service:
         ):
             # Voltages are safely in the candidate dir → free corr NVMe.
             self._broadcaster.broadcast(name, 0, 0.0)
-        return {"keep": report, "filterbank": fb_report}
+        return {"keep": report, "filterbank": fb_report,
+                "cal_hdf5": cal_report}
 
     def _do_reject(
         self, name: str, ev_dir: Path, decision, flag_only: bool,
@@ -463,6 +514,77 @@ class C3Service:
             actions["move_error"] = str(exc)
         return {"reject": actions}
 
+    def _run_cal_archive(self, name: str,
+                         first_pass: bool) -> Dict[str, Any]:
+        """One (idempotent) cal_hdf5 archive pass for one event.
+
+        On an incomplete first pass whose window extends into the
+        future, the event is queued in ``_cal_pending`` and re-run by
+        the scan loop after window-end + settle. Best-effort: never
+        raises into the KEEP path."""
+        cfg = self._cfg.cal_hdf5
+        try:
+            rep = cal_hdf5_archive_event(
+                name,
+                candidates_root=self._cfg.archive_root,
+                correlator_dir=Path(cfg.correlator_dir),
+                dest_subdir=cfg.dest_subdir,
+                hours_each_side=cfg.hours_each_side,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("cal_hdf5 archive failed for %s", name)
+            self._counters["cal_hdf5_failed"] += 1
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        t_center = (rep["t_peak_mjd"] - 40587.0) * 86400.0
+        due = t_center + cfg.hours_each_side * 3600.0 + cfg.settle_s
+        now = time.time()
+        if rep["complete"]:
+            self._counters["cal_hdf5_complete"] += 1
+            self._cal_pending.pop(name, None)
+        elif now < due:
+            # future half of the window not written yet — expected on
+            # the first pass; re-check after it closes.
+            ent = self._cal_pending.get(name, {"attempts": 0})
+            self._cal_pending[name] = {
+                "due_unix": due, "attempts": int(ent.get("attempts", 0))}
+            LOG.info("cal_hdf5 %s: %d/%d so far; re-check after %s",
+                     name, rep["n_files"], rep["n_expected"],
+                     datetime.fromtimestamp(
+                         due, timezone.utc).strftime("%H:%M:%SZ"))
+        else:
+            self._counters["cal_hdf5_partial"] += 1
+            self._cal_pending.pop(name, None)
+            LOG.warning("cal_hdf5 %s: incomplete after window close: "
+                        "%d/%d files", name, rep["n_files"],
+                        rep["n_expected"])
+        if not first_pass:
+            self._save_state()
+        return rep
+
+    def _recheck_cal_pending(self) -> None:
+        """Re-run due pending cal archives (scan-loop tick)."""
+        if not self._cal_pending:
+            return
+        now = time.time()
+        cfg = self._cfg.cal_hdf5
+        for name in list(self._cal_pending):
+            ent = self._cal_pending[name]
+            due = float(ent.get("due_unix", 0.0))
+            if now < due:
+                continue
+            ent["attempts"] = int(ent.get("attempts", 0)) + 1
+            rep = self._run_cal_archive(name, first_pass=False)
+            still = name in self._cal_pending
+            if still and (now > due + cfg.max_late_s
+                          or ent["attempts"] >= 5):
+                self._counters["cal_hdf5_partial"] += 1
+                self._cal_pending.pop(name, None)
+                LOG.warning("cal_hdf5 %s: giving up after %d attempts "
+                            "(%s files)", name, ent["attempts"],
+                            rep.get("n_files"))
+                self._save_state()
+
     def _write_audit(self, name: str, where: Path, rec: Dict[str, Any]) -> None:
         try:
             where.mkdir(parents=True, exist_ok=True)
@@ -486,6 +608,10 @@ class C3Service:
                         LOG.exception("C3 process_event(%s) failed", name)
                         self._processed[name] = "ERROR"
                         self._save_state()
+                try:
+                    await asyncio.to_thread(self._recheck_cal_pending)
+                except Exception:  # noqa: BLE001
+                    LOG.exception("cal_hdf5 pending re-check failed")
                 await asyncio.sleep(self._cfg.scan_interval_s)
         except asyncio.CancelledError:
             return
@@ -496,6 +622,7 @@ class C3Service:
                 self._mon_store.put_dict(self._cfg.mon_key, {
                     "ts_unix": time.time(),
                     "counters": dict(self._counters),
+                    "cal_hdf5_pending": len(self._cal_pending),
                     "n_processed": len(self._processed),
                     "flag_only": self._effective_flag_only(),
                     "flag_only_config": self._cfg.flag_only,

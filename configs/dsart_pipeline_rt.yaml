@@ -544,10 +544,23 @@ routines:
   # voltage dump (C2 suppresses the DUMP_VOLTAGE broadcast for synthetic
   # events), so this service only ever stages real candidates.
   #
-  # Sizing: --retention-s 15 at 288 MiB/block, 7.4 blocks/s ≈ 112 blocks
-  # ≈ 31.5 GiB resident (NUMA-1 DRAM is 96 GiB; corr_fast + fada n=70
-  # (~20 GiB) leave ample headroom). --n-pre 8 / --n-post 14 ≈ 1.07 s
-  # before + 1.88 s after the trigger block ≈ 3 s window per fragment.
+  # Sizing: --retention-s 25 at 288 MiB/block, 7.4 blocks/s ≈ 187 blocks
+  # ≈ 52.6 GiB resident (NUMA-1 DRAM is 96 GiB; corr_fast + fada n=70
+  # (~20 GiB) leave ~23 GiB headroom). Raised 15 → 25 s (2026-07-15)
+  # after the C1→C2 trigger latency (~10-17 s when the search pipeline
+  # is backlogged; it has only ~4% realtime headroom) cost two of the
+  # first night's three dumps (260715oeee/msyj staged 0 blocks).
+  #
+  # Window (2026-07-15 timing fix, docs/voltage_dumps/
+  # VOLTAGE_DUMP_TIMING_FIX.md): the C1/C2 event label is the pulse
+  # arrival at the BOTTOM of the band (ν_bot = 1.311 GHz; the corr
+  # stage-2 FIFO aligns all chgroups to it), so the burst lies BEFORE
+  # the target block, up to τ_sweep(DM) = 5.65916e-4 × DM seconds
+  # earlier (1.50 s at the deployed fine-DM max 2652.98). Hence:
+  #   n_pre  ≥ ceil(τ_sweep(DM_max_fine)/0.134217728) + 1  = 13 → 14
+  #   n_post ≥ pulse width + intra-chgroup smear (≤ ~0.1 s) + margin → 8
+  # If the deployed dm-plan's fine-DM max changes, re-derive n_pre
+  # (guarded by tests/test_voltage_dump_containment.py).
   #
   # CPU pinning: NUMA 1 (same socket as fada, GPU 1, the 100GbE search
   # NIC) cores 18-19,38-39 — 2 phys cores + HT siblings, clear of merge
@@ -569,9 +582,9 @@ routines:
       --bind-host 0.0.0.0
       --bind-port 11229
       --staging-dir /home/ubuntu/data/voltage_staging
-      --retention-s 15.0
-      --n-pre 8
-      --n-post 14
+      --retention-s 25.0
+      --n-pre 14
+      --n-post 8
       --dump-wait-s 5.0
       --mon-interval-s 5.0
       --ready-sentinel-path /tmp/dsart-voltage-retention-CN.ready

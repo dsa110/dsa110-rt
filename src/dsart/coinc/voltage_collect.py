@@ -29,6 +29,7 @@ __all__ = [
     "collection_done",
     "rsync_pull",
     "collect_fragments",
+    "plan_manifests",
 ]
 
 
@@ -60,6 +61,35 @@ def plan_fragments(
         node = corr_nodes[chgroup]
         sb = f"sb{int(chgroup):02d}"
         fname = f"{event_name}_{sb}_data.out"
+        remote = f"{node.ssh_host}:{staging_dir.rstrip('/')}/{fname}"
+        plans.append(
+            FragmentPlan(chgroup=chgroup, remote=remote, dest=dest_dir / fname)
+        )
+    return plans
+
+
+def plan_manifests(
+    *,
+    event_name: str,
+    corr_nodes: Mapping[int, CorrNode],
+    staging_dir: str,
+    dest_dir: Path,
+) -> List[FragmentPlan]:
+    """Per-chgroup plan for the staging MANIFEST sidecars
+    (``<event>_sbNN.json``: target/first/last block, drop list,
+    mjd_target — the dump-timing provenance).
+
+    Collected best-effort alongside the fragments; deliberately NOT
+    counted toward collection completeness. Added 2026-07-15: the
+    corr-side staging cleanup deletes the manifests with the data, so
+    260715twmx's dump provenance was lost — these must come to h23 too.
+    """
+    plans: List[FragmentPlan] = []
+    dest_dir = Path(dest_dir)
+    for chgroup in sorted(corr_nodes):
+        node = corr_nodes[chgroup]
+        sb = f"sb{int(chgroup):02d}"
+        fname = f"{event_name}_{sb}.json"
         remote = f"{node.ssh_host}:{staging_dir.rstrip('/')}/{fname}"
         plans.append(
             FragmentPlan(chgroup=chgroup, remote=remote, dest=dest_dir / fname)

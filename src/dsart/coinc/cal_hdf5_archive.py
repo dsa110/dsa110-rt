@@ -45,6 +45,38 @@ from typing import Any, Dict, List, Optional, Tuple
 LOG = logging.getLogger("dsart.coinc.cal_hdf5_archive")
 
 DEFAULT_CANDIDATES_ROOT = Path("/dataz/dsa110/candidates")
+
+
+# C3-integration config (c3.cal_hdf5 yaml section).
+from dataclasses import dataclass, field as _field  # noqa: E402
+
+
+@dataclass(frozen=True)
+class CalHdf5Config:
+    enabled: bool = True
+    hours_each_side: float = 2.0
+    correlator_dir: str = "/dataz/dsa110/operations/correlator"
+    dest_subdir: str = "calibration"
+    #: extra settle time past the window end before declaring the
+    #: archive complete-as-possible (files land ~5 min after their
+    #: start stamp; T3 waited window_end + 10 min).
+    settle_s: float = 600.0
+    #: give up re-checking a pending archive this long after its due
+    #: time (whatever was linked stays; manifest records completeness).
+    max_late_s: float = 7200.0
+
+    @classmethod
+    def from_dict(cls, d) -> "CalHdf5Config":
+        d = d or {}
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            hours_each_side=float(d.get("hours_each_side", 2.0)),
+            correlator_dir=str(d.get("correlator_dir",
+                                     cls.correlator_dir)),
+            dest_subdir=str(d.get("dest_subdir", "calibration")),
+            settle_s=float(d.get("settle_s", 600.0)),
+            max_late_s=float(d.get("max_late_s", 7200.0)),
+        )
 DEFAULT_CORRELATOR_DIR = Path("/dataz/dsa110/operations/correlator")
 DEFAULT_DEST_SUBDIR = "calibration"
 DEFAULT_HOURS_EACH_SIDE = 2.0

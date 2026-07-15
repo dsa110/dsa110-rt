@@ -117,3 +117,23 @@ def test_collect_fragments_skips_already_present(tmp_path: Path) -> None:
     # chgroup 0 was already present → puller only called for chgroup 1
     assert len(calls) == 1
     assert "sb01" in calls[0]
+
+
+def test_plan_manifests_naming(tmp_path: Path) -> None:
+    """Manifest sidecars (<event>_sbNN.json) — 2026-07-15: collected to
+    h23 so dump-timing provenance survives the staging cleanup."""
+    from dsart.coinc.voltage_collect import plan_manifests
+    plans = plan_manifests(
+        event_name="260715twmx",
+        corr_nodes={
+            0: CorrNode(0, "ubuntu@n03.pro.pvt", "10.41.0.224"),
+            15: CorrNode(15, "ubuntu@n22.pro.pvt", "10.41.0.233"),
+        },
+        staging_dir="/home/ubuntu/data/voltage_staging/",
+        dest_dir=tmp_path,
+    )
+    assert [p.chgroup for p in plans] == [0, 15]
+    assert plans[0].remote == (
+        "ubuntu@n03.pro.pvt:/home/ubuntu/data/voltage_staging/"
+        "260715twmx_sb00.json")
+    assert plans[1].dest == tmp_path / "260715twmx_sb15.json"

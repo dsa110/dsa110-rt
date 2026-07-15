@@ -506,13 +506,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--staging-dir",
                    default="/home/ubuntu/data/voltage_staging")
     grp = p.add_mutually_exclusive_group()
-    grp.add_argument("--retention-s", type=float, default=15.0)
+    grp.add_argument("--retention-s", type=float, default=25.0)
     grp.add_argument("--retention-blocks", type=int, default=0,
                      help="Overrides --retention-s when > 0.")
-    p.add_argument("--n-pre", type=int, default=8,
-                   help="Blocks before the trigger block (~1.07 s @ 8).")
-    p.add_argument("--n-post", type=int, default=14,
-                   help="Blocks after the trigger block (~1.88 s @ 14).")
+    # The C1/C2 event label is the pulse arrival at the BOTTOM of the
+    # band, so the dispersed burst lies BEFORE the target block —
+    # n_pre must cover the full-band sweep at the deployed fine-DM max
+    # (docs/voltage_dumps/VOLTAGE_DUMP_TIMING_FIX.md, 2026-07-15).
+    p.add_argument("--n-pre", type=int, default=14,
+                   help="Blocks before the trigger block (~1.88 s @ 14; "
+                        "must cover the full-band dispersion sweep — the "
+                        "event label is the arrival at the band BOTTOM).")
+    p.add_argument("--n-post", type=int, default=8,
+                   help="Blocks after the trigger block (~1.07 s @ 8; "
+                        "only pulse width + intra-chgroup smear land "
+                        "after the label).")
     p.add_argument("--dump-wait-s", type=float, default=5.0)
     p.add_argument("--queue-max", type=int, default=32)
     p.add_argument("--mon-interval-s", type=float, default=5.0)

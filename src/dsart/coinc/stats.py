@@ -55,6 +55,12 @@ class ClusterStats:
 
     kernel_ids_distinct: Tuple[str, ...]
     peak_event_specnum: int
+    #: Sample period (us) of the peak member's C1 batch — the
+    #: authoritative search-sample unit for converting
+    #: ``peak_event_specnum`` to SNAP specnums at the voltage-dump
+    #: broadcast (docs/voltage_dumps/VOLTAGE_DUMP_TIMING_FIX.md §4).
+    #: 0.0 when the entry predates this field.
+    peak_sample_period_us: float = 0.0
 
     # Galactic-DM discriminant (added 2026-05-27).
     #
@@ -153,6 +159,8 @@ def compute_stats(
         t_peak_mjd=float(peak.mjd),
         kernel_ids_distinct=tuple(kernel_ids),
         peak_event_specnum=int(peak.event_specnum),
+        peak_sample_period_us=float(
+            getattr(peak, "sample_period_us", 0.0) or 0.0),
         gal_dm_max_los=gal_dm_los_f,
         dm_galactic_fraction=dm_galactic_fraction,
     )
