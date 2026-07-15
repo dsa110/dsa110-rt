@@ -34,7 +34,8 @@ All timestamps are UTC ISO-8601.
 
 Labels
 ------
-Built-ins ``FRB, RFI, NOISE, PULSAR, INJECTION`` (uppercase) plus every
+Built-ins ``FRB, RFI, NOISE, PULSAR, INJECTION,
+CHECK_OFFLINE_VOLTAGES`` (uppercase) plus every
 custom tag. Custom tags/labels normalise to: strip → uppercase →
 spaces-to-underscores → keep only ``[A-Z0-9_+-]`` → truncate to 24
 chars. Empties and collisions with a built-in are rejected.
@@ -58,7 +59,12 @@ from typing import Any, Dict, List, Optional, Sequence
 # Constants
 # ---------------------------------------------------------------------------
 
-BUILTIN_LABELS: tuple[str, ...] = ("FRB", "RFI", "NOISE", "PULSAR", "INJECTION")
+BUILTIN_LABELS: tuple[str, ...] = (
+    "FRB", "RFI", "NOISE", "PULSAR", "INJECTION",
+    # Parking state for ambiguous events: "needs offline voltage
+    # analysis before a verdict" — users reclassify later.
+    "CHECK_OFFLINE_VOLTAGES",
+)
 _BUILTIN_SET = frozenset(BUILTIN_LABELS)
 
 MAX_TAG_LEN = 24

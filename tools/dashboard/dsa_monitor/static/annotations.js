@@ -17,6 +17,7 @@
     NOISE: "#636e72",
     PULSAR: "#0984e3",
     INJECTION: "#e17055",
+    CHECK_OFFLINE_VOLTAGES: "#6c5ce7",
   };
   function labelColor(l) { return LABEL_COLORS[l] || "#8395a7"; }
 
@@ -330,7 +331,8 @@
   }
 
   function wireShortcuts() {
-    var map = { "1": "FRB", "2": "RFI", "3": "NOISE", "4": "PULSAR", "5": "INJECTION" };
+    var map = { "1": "FRB", "2": "RFI", "3": "NOISE", "4": "PULSAR",
+                "5": "INJECTION", "6": "CHECK_OFFLINE_VOLTAGES" };
     document.addEventListener("keydown", function (e) {
       if (isTyping(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;

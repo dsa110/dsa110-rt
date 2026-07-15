@@ -99,6 +99,20 @@ def test_classify_clear_removes_current(db):
     assert labels == ["FRB", None]
 
 
+def test_check_offline_voltages_builtin(db):
+    """CHECK_OFFLINE_VOLTAGES is a first-class built-in label: present
+    in the vocabulary, classifiable, and reserved against custom tags."""
+    assert "CHECK_OFFLINE_VOLTAGES" in ann.BUILTIN_LABELS
+    ann.add_user("vishnu", db)
+    blk = ann.classify("EV1", "vishnu", "CHECK_OFFLINE_VOLTAGES", db)
+    assert blk["classifications"][0]["label"] == "CHECK_OFFLINE_VOLTAGES"
+    assert blk["labels"] == {"CHECK_OFFLINE_VOLTAGES": 1}
+    # Collides with the built-in -> custom-tag creation rejected
+    # (including via normalisation from a spaced lowercase form).
+    with pytest.raises(ValueError):
+        ann.create_tag("check offline voltages", "vishnu", db)
+
+
 def test_classify_unknown_label_rejected(db):
     ann.add_user("vishnu", db)
     with pytest.raises(ValueError):

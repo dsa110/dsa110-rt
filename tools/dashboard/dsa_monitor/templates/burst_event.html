@@ -41,6 +41,34 @@
     #annot-history table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
     #annot-history td { padding: 3px 8px; border-bottom: 1px solid #eee; font-family: 'Menlo','Consolas',monospace; }
     .annot-keys { font-size: 11px; color: #b2bec3; margin-top: 10px; }
+
+    /* Two-panel region: Plots (left, flexible) + Human classification
+       (right, fixed column). Below the breakpoint the region is a plain
+       block, so the cards stack in source order: plots first, then the
+       classification card, then metadata + everything else. */
+    #annot-history { overflow-x: auto; }
+    .event-two-col { display: block; min-width: 0; }
+    .event-two-col > .card { min-width: 0; }
+    @media (min-width: 1100px) {
+        .event-two-col {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 360px;
+            gap: 16px;
+            align-items: start;   /* items size to content so sticky can travel */
+        }
+        .event-two-col > .card { margin-bottom: 0; }
+        .event-two-col { margin-bottom: 16px; }
+        /* Keep the classification controls in view while scrolling the
+           plots. The top nav is not fixed, so a small offset suffices.
+           Cap the height so a long history <details> scrolls inside the
+           card instead of pushing the controls off-screen. */
+        #annot-card {
+            position: sticky;
+            top: 12px;
+            max-height: calc(100vh - 24px);
+            overflow-y: auto;
+        }
+    }
 </style>
 {% endblock %}
 
@@ -85,19 +113,11 @@
     {% endif %}
 </div>
 
-<div class="card">
-    <h2>Level3 metadata</h2>
-    {% if event.metadata %}
-    <pre style="background:#2d3436;color:#dfe6e9;padding:12px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.45;font-family:'Menlo','Consolas',monospace;">{{ metadata_pretty }}</pre>
-    {% else %}
-    <div class="banner warn">No <code>Level3/{{ event.name }}.json</code> on disk yet.</div>
-    {% endif %}
-</div>
-
+<div class="event-two-col">
 <div class="card">
     <h2>Plots</h2>
     {% if event.plots %}
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr));gap:12px;">
         {% for plot in event.plots %}
         <div class="plot-card">
             <h3>{{ plot }}</h3>
@@ -160,10 +180,21 @@
     <div class="annot-keys">
         shortcuts: <strong>1</strong> FRB · <strong>2</strong> RFI ·
         <strong>3</strong> NOISE · <strong>4</strong> PULSAR ·
-        <strong>5</strong> INJECTION · <strong>c</strong> clear ·
-        <strong>n</strong> next unclassified
+        <strong>5</strong> INJECTION ·
+        <strong>6</strong> CHECK_OFFLINE_VOLTAGES ·
+        <strong>c</strong> clear · <strong>n</strong> next unclassified
         (ignored while typing in a box)
     </div>
+</div>
+</div><!-- /.event-two-col -->
+
+<div class="card">
+    <h2>Level3 metadata</h2>
+    {% if event.metadata %}
+    <pre style="background:#2d3436;color:#dfe6e9;padding:12px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.45;font-family:'Menlo','Consolas',monospace;">{{ metadata_pretty }}</pre>
+    {% else %}
+    <div class="banner warn">No <code>Level3/{{ event.name }}.json</code> on disk yet.</div>
+    {% endif %}
 </div>
 
 <script>
@@ -193,7 +224,7 @@ window.ANNOT = {
         {% endif %}
     </div>
     {% endif %}
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(560px,1fr));gap:12px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(560px,100%),1fr));gap:12px;">
         {% for plot in event.fil_plots %}
         <div class="plot-card">
             <h3>{{ plot }}{% if '_rfi' in plot %} (SK RFI-flagged){% else %} (unflagged){% endif %}</h3>
