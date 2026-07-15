@@ -342,6 +342,68 @@ def test_level3_pointing_dec_out_of_range_falls_through(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 7b. Manual backfill provenance (tools/ops/backfill_pointing_dec.py)
+# ---------------------------------------------------------------------------
+
+
+def test_manual_backfill_meta_gives_manual_provenance(tmp_path) -> None:
+    """pointing_dec_meta.source = "manual_backfill" -> provenance
+    "manual", same computed position, sigma parenthetical present."""
+    meta = _modern_meta("260101rrrr")
+    meta["c2"]["pointing_dec_deg"] = WORKED["pointing_dec_deg"]
+    meta["c2"]["pointing_dec_meta"] = {
+        "etcd_key": None, "read_unix": 1784500000.0,
+        "source": "manual_backfill",
+        "note": "constant pointing 2026-07-09..15",
+    }
+    _layout(tmp_path, "260101rrrr", meta=meta)
+    (s,) = cpf.ArchiveBrowser(tmp_path).list_events()
+    assert s.radec_source == "manual"
+    assert s.ra_deg == pytest.approx(WORKED["exp_ra"], abs=0.01)
+    assert s.dec_deg == pytest.approx(WORKED["exp_dec"], abs=0.01)
+    # Computed source -> the 60-arcsec parenthetical applies identically.
+    assert s.ra_hms == "15:36:21.6(42)"
+    assert s.dec_dms == "+17:33:35(60)"
+
+
+def test_manual_in_computed_sources_sexagesimal() -> None:
+    rd = ea.RaDec(234.089979, 17.559814, "manual")
+    hms, dms = ea.sexagesimal_for(rd)
+    assert hms == "15:36:21.6(42)"
+    assert dms == "+17:33:35(60)"
+
+
+def test_meta_absent_provenance_stays_level3(tmp_path) -> None:
+    meta = _modern_meta("260101ssss")
+    meta["c2"]["pointing_dec_deg"] = WORKED["pointing_dec_deg"]
+    # No pointing_dec_meta at all.
+    _layout(tmp_path, "260101ssss", meta=meta)
+    (s,) = cpf.ArchiveBrowser(tmp_path).list_events()
+    assert s.radec_source == "level3"
+
+
+def test_meta_etcd_source_provenance_stays_level3(tmp_path) -> None:
+    """A coincidencer-written meta (etcd provenance) is NOT manual."""
+    meta = _modern_meta("260101tttt")
+    meta["c2"]["pointing_dec_deg"] = WORKED["pointing_dec_deg"]
+    meta["c2"]["pointing_dec_meta"] = {
+        "etcd_key": "/mon/array/dec", "read_unix": 1784100000.0,
+    }
+    _layout(tmp_path, "260101tttt", meta=meta)
+    (s,) = cpf.ArchiveBrowser(tmp_path).list_events()
+    assert s.radec_source == "level3"
+
+
+def test_meta_non_dict_provenance_stays_level3(tmp_path) -> None:
+    meta = _modern_meta("260101uuuu")
+    meta["c2"]["pointing_dec_deg"] = WORKED["pointing_dec_deg"]
+    meta["c2"]["pointing_dec_meta"] = "manual_backfill"  # not a dict
+    _layout(tmp_path, "260101uuuu", meta=meta)
+    (s,) = cpf.ArchiveBrowser(tmp_path).list_events()
+    assert s.radec_source == "level3"
+
+
+# ---------------------------------------------------------------------------
 # 7. filterbank present -> used, provenance filterbank, priority over legacy
 # ---------------------------------------------------------------------------
 

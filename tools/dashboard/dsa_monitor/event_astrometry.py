@@ -25,7 +25,12 @@ Pointing-declination sourcing (priority chain, provenance recorded)
   1. Level3 ``c2.pointing_dec_deg`` — stamped by the coincidencer from
      the live etcd pointing key minutes after the trigger; the earliest
      contemporaneous record, present on every future event (may be null
-     if the etcd read failed -> falls through). Provenance ``"level3"``.
+     if the etcd read failed -> falls through). Provenance ``"level3"``
+     — unless the sibling ``c2.pointing_dec_meta`` dict declares a
+     ``"source"`` starting with ``"manual"`` (operator backfill via
+     ``tools/ops/backfill_pointing_dec.py``), in which case provenance
+     is ``"manual"``. Same 60-arcsec sigma applies (identical recipe;
+     only how the pointing dec was recorded differs).
   2. ``filterbank/filterbank.json`` key ``dec_deg`` — present only for
      bbproc-processed (2026-07 transition-era) events.
      Provenance ``"filterbank"``.
@@ -89,7 +94,8 @@ class RaDec:
 
     ra_deg: Optional[float]
     dec_deg: Optional[float]
-    source: Optional[str]  # "level3" | "filterbank" | "legacy" | None
+    source: Optional[str]
+    # "level3" | "manual" | "filterbank" | "legacy" | None
 
 
 @dataclass(frozen=True)
@@ -175,10 +181,19 @@ def resolve_inputs(
     # pointing key (sibling provenance dict: c2.pointing_dec_meta). It may
     # be null when the etcd read failed at trigger time, and is absent on
     # all historical events — both fall through to the next source.
+    # Operator backfills (tools/ops/backfill_pointing_dec.py) write the
+    # same field with pointing_dec_meta.source = "manual_*"; those get
+    # provenance "manual" (the source is part of _Modern.key(), so the
+    # cache distinguishes it).
     if have_lm:
         pdec_c2 = _as_float(c2.get("pointing_dec_deg"))
         if pdec_c2 is not None and -90.0 <= pdec_c2 <= 90.0:
-            pend = _Modern(mjd, l, m, pdec_c2, "level3")
+            source = "level3"
+            pm = c2.get("pointing_dec_meta")
+            if isinstance(pm, Mapping) \
+                    and str(pm.get("source", "")).startswith("manual"):
+                source = "manual"
+            pend = _Modern(mjd, l, m, pdec_c2, source)
             return None, pend, pend.key()
 
     # Priority 2: filterbank pointing dec + modern (l, m, mjd) -> compute.
@@ -370,7 +385,7 @@ class EventAstrometry:
 # ---------------------------------------------------------------------------
 
 #: Conservative 1-sigma position uncertainty (arcsec) quoted for COMPUTED
-#: positions (sources "level3"/"filterbank"): half-pixel image
+#: positions (sources "level3"/"manual"/"filterbank"): half-pixel image
 #: quantization ~22.5 arcsec + end-to-end astrometric tie validated at
 #: ~1.2 arcmin on pulsar crossings. This is a fixed display figure, NOT a
 #: per-event statistical error. Legacy (stored T2) positions have unknown
@@ -440,9 +455,10 @@ def format_dec_dms(
 
 
 #: Provenances whose positions we computed ourselves (and therefore quote
-#: the fixed SIGMA_POS_ARCSEC for). Legacy/stored values have unknown
-#: uncertainty -> no parenthetical.
-_COMPUTED_SOURCES = frozenset({"level3", "filterbank"})
+#: the fixed SIGMA_POS_ARCSEC for). "manual" (operator-backfilled pointing
+#: dec) uses the identical recipe, so the same sigma applies. Legacy/stored
+#: values have unknown uncertainty -> no parenthetical.
+_COMPUTED_SOURCES = frozenset({"level3", "manual", "filterbank"})
 
 
 def sexagesimal_for(rd: RaDec) -> Tuple[Optional[str], Optional[str]]:
