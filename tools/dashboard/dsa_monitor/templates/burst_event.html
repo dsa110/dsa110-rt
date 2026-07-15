@@ -30,8 +30,22 @@
         background: #fff; border: 1px solid #b2bec3; border-radius: 6px;
         box-shadow: 0 4px 16px rgba(0,0,0,0.18); display: none; margin-top: 2px;
     }
-    .annot-dd div { padding: 6px 12px; font-size: 13px; cursor: pointer; }
-    .annot-dd div.active, .annot-dd div:hover { background: #0984e3; color: #fff; }
+    .annot-dd > div {
+        padding: 6px 12px; font-size: 13px; cursor: pointer;
+        display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
+    .annot-dd > div.active, .annot-dd > div:hover { background: #0984e3; color: #fff; }
+    .annot-dd-x {
+        color: #b2bec3; font-weight: 700; padding: 0 4px; border-radius: 3px;
+        line-height: 1;
+    }
+    .annot-dd-x:hover { color: #fff; background: #d63031; }
+    .annot-dd > div.annot-dd-confirm { cursor: default; font-size: 12px;
+        justify-content: flex-start; gap: 0; }
+    .annot-dd > div.annot-dd-confirm:hover { background: #fff; color: inherit; }
+    .annot-dd-yes, .annot-dd-no { cursor: pointer; font-weight: 700; padding: 0 3px; }
+    .annot-dd-yes { color: #d63031; }
+    .annot-dd-no { color: #0984e3; }
     .annot-msg { font-size: 13px; margin-top: 8px; min-height: 18px; }
     .annot-msg.warn { color: #d63031; font-weight: 600; }
     .annot-msg.ok { color: #00845a; }
@@ -207,6 +221,7 @@ window.ANNOT = {
     nextUnclassified: {{ next_unclassified|tojson }},
 };
 </script>
+<script src="/static/typeahead.js" defer></script>
 <script src="/static/annotations.js" defer></script>
 
 <div class="card">

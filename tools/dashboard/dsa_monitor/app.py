@@ -64,6 +64,7 @@ from cands_panel_funcs import (
     ArchiveBrowser,
     DEFAULT_ARCHIVE_ROOT,
     N_VOLTAGE_FRAGMENTS_TOTAL,
+    partition_events_c3,
 )
 import annotations as ann
 from control_store import (
@@ -476,20 +477,29 @@ def control_update_bfweights_poll(job_id: str):
 @app.route("/bursts")
 def bursts():
     events = cands_browser.list_events()
-    # Split by C3 cube-veto outcome. Events C3 has not judged yet
-    # (typically < a few min old) ride the PASS tab with a "pending"
-    # badge — the operator wants fresh events front and centre, and
-    # fail-open is C3's own default.
-    events_pass = [e for e in events if e.c3_status in ("pass", "pending")]
-    events_fail = [e for e in events if e.c3_status == "fail"]
+    # Split by C3 cube-veto outcome. Fresh events C3 has not judged yet
+    # (< 1 h old) ride the PASS tab with a "pending" badge — the
+    # operator wants new triggers front and centre, and fail-open is
+    # C3's own default. Events pending for > 1 h are zombies (the
+    # cube/metadata transfer to h23 failed; C3 will never judge them)
+    # and get their own tab so they stop cluttering PASS.
+    events_pass, events_fail, events_zombie = partition_events_c3(events)
     # Human-annotation badges: one bulk read (no per-event query),
     # joined to the event rows in the template by event name.
     try:
         annot_current = ann.all_current()
+        annot_source_names = ann.vocab().get("source_names", [])
     except Exception:                                       # noqa: BLE001
         LOG.exception("annotations.all_current failed (list badges skipped)")
         annot_current = {}
+        annot_source_names = []
     tag_filter = (request.args.get("tag") or "").strip()
+    # Current-source search (?source=): exact, case-insensitive match
+    # against each event's CURRENT source name (from the same bulk
+    # annot_current read — no per-event query). ANDs with ?tag= in the
+    # row-filter logic in the template.
+    source_filter = (request.args.get("source") or "").strip()
+    source_filter_lc = source_filter.lower()
     # Filter dropdown options: built-ins always, plus any custom labels
     # actually in use, so the operator can slice by them too.
     present = set()
@@ -509,6 +519,10 @@ def bursts():
         annot_builtins=list(ann.BUILTIN_LABELS),
         annot_filter_labels=annot_filter_labels,
         tag_filter=tag_filter,
+        source_filter=source_filter,
+        source_filter_lc=source_filter_lc,
+        annot_source_names=annot_source_names,
+        events_zombie=events_zombie,
     )
 
 
@@ -2804,6 +2818,22 @@ def annotations_source_post():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, **block})
+
+
+@app.route("/annotations/source/purge", methods=["POST"])
+def annotations_source_purge_post():
+    """Purge a source name from the vocabulary everywhere (typo
+    cleanup). Moves the matching source_names rows into the
+    source_names_purged graveyard; every affected event's current
+    source falls back to its latest surviving row."""
+    p = _annot_params()
+    try:
+        n_purged = ann.purge_source_name(p.get("name"), p.get("user"))
+    except ann.UnknownUserError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "n_purged": n_purged, "vocab": ann.vocab()})
 
 
 @app.route("/api/annotations", methods=["GET"])

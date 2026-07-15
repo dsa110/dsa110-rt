@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -32,6 +33,10 @@ __all__ = [
     "EventDetail",
     "DEFAULT_ARCHIVE_ROOT",
     "DEFAULT_MAX_EVENTS",
+    "ZOMBIE_PENDING_AGE_S",
+    "C3_ERA_START_UNIX",
+    "is_zombie",
+    "partition_events_c3",
 ]
 
 
@@ -79,6 +84,9 @@ class EventSummary:
     # Event time of day (UTC HH:MM:SS), from t_peak_mjd with a
     # dir-mtime fallback (suffixed '~' to mark it approximate).
     utc_hms: Optional[str] = None
+    # Whether Level3/<name>.json exists on h23. Used by the zombie
+    # partition: a genuine zombie never received its Level3 metadata.
+    has_l3: bool = False
 
     @property
     def c3_status(self) -> str:
@@ -88,6 +96,87 @@ class EventSummary:
         if self.c3_action == "REJECT":
             return "fail"
         return "pending"
+
+
+#: A "C3 pending" event older than this is a zombie: C1/C2 triggered but
+#: cubes/metadata never landed on h23, so C3 will never judge it.
+ZOMBIE_PENDING_AGE_S = 3600.0
+
+#: MJD of the unix epoch (1970-01-01).
+_MJD_UNIX_EPOCH = 40587.0
+
+#: When the C3 cube veto went live (2026-06-01 UTC). Dirs untouched
+#: since before this predate the veto entirely — "C3 pending" is not a
+#: meaningful (stuck) state for them, so they can never be zombies.
+C3_ERA_START_UNIX = 1780272000.0  # 2026-06-01T00:00:00Z
+
+
+def _event_age_s(event: "EventSummary", now_unix: float) -> float:
+    """Trigger age in seconds. Uses ``t_peak_mjd`` (via ``mjd_peak``)
+    when the Level3 metadata provided one; zombies typically have NO
+    Level3 on h23, so the realistic source is the event dir mtime
+    (``mtime_unix``), which C2 stamps at trigger time."""
+    if event.mjd_peak is not None:
+        return now_unix - (event.mjd_peak - _MJD_UNIX_EPOCH) * 86400.0
+    return now_unix - event.mtime_unix
+
+
+def is_zombie(event: "EventSummary", now_unix: float) -> bool:
+    """True iff C3 has not judged the event and it is old enough that
+    it never will (cube/metadata transfer to h23 failed).
+
+    Two gates keep non-events out (2026-07-15 archive audit):
+
+    * real event-name pattern (``YYMMDD`` + 4 lowercase letters,
+      :data:`_EVENT_NAME_RE`) — excludes calibrator scans (3C286\\*),
+      synthetic/manual test triggers (dtest, dumpnow_\\*, DUMP1-4)
+      and misc dirs (releases);
+    * no ``Level3/<name>.json`` on disk (``has_l3`` False) — a genuine
+      zombie is one whose metadata never landed. This excludes the
+      real-named pre-C3-era events whose legacy Level3 JSON is present
+      but which the C3 veto (which didn't exist then) never judged;
+    * dir touched since :data:`C3_ERA_START_UNIX` — legacy dirs
+      untouched since before the C3 veto existed were never going to be
+      judged, so "pending" is not a stuck state for them.
+
+    Everything excluded keeps today's behaviour (PASS tab).
+    """
+    return (
+        bool(_EVENT_NAME_RE.match(event.name))
+        and event.c3_status == "pending"
+        and not event.has_l3
+        and event.mtime_unix >= C3_ERA_START_UNIX
+        and _event_age_s(event, now_unix) > ZOMBIE_PENDING_AGE_S
+    )
+
+
+def partition_events_c3(
+    events: List["EventSummary"],
+    now_unix: Optional[float] = None,
+) -> Tuple[List["EventSummary"], List["EventSummary"], List["EventSummary"]]:
+    """Split events into the three /bursts tabs.
+
+    Returns ``(events_pass, events_fail, events_zombie)``:
+
+      * pass    — C3 KEEP, plus *fresh* pending events (< 1 h old): the
+                  operator wants new triggers front and centre while C3
+                  is still expected to judge them.
+      * fail    — C3 REJECT.
+      * zombie  — pending for > :data:`ZOMBIE_PENDING_AGE_S`: the
+                  transfer/copy path failed, C3 will never run.
+    """
+    now = time.time() if now_unix is None else now_unix
+    ev_pass: List[EventSummary] = []
+    ev_fail: List[EventSummary] = []
+    ev_zombie: List[EventSummary] = []
+    for e in events:
+        if e.c3_status == "fail":
+            ev_fail.append(e)
+        elif is_zombie(e, now):
+            ev_zombie.append(e)
+        else:
+            ev_pass.append(e)
+    return ev_pass, ev_fail, ev_zombie
 
 
 @dataclass(frozen=True)
@@ -191,6 +280,7 @@ class ArchiveBrowser:
                 event_dir / "Level2" / "voltages", "*_data.out"
             ),
             utc_hms=_utc_hms(mjd_peak, mtime),
+            has_l3=meta is not None,
         )
 
     # ----- detail view ----------------------------------------------------

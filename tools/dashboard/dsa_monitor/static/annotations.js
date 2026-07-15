@@ -244,11 +244,12 @@
       function (j) { applyBlock(j); setMsg("source cleared", "ok"); });
   }
 
-  // --- source typeahead (live substring dropdown) --------------------------
-  var ddIndex = -1;
-  var ddItems = [];
+  // --- source typeahead (shared dsaTypeahead + per-row purge ×) ------------
+  var sourceTa = null;   // set in wireSource(); {show, hide, refresh}
 
   function sourceNames() { return vocab.source_names || []; }
+
+  function hideDropdown() { if (sourceTa) sourceTa.hide(); }
 
   function updateHint() {
     var val = ($("annot-source").value || "").trim();
@@ -261,65 +262,76 @@
       : "new source name — check the suggestions above for an existing spelling.";
   }
 
-  function hideDropdown() {
-    $("annot-source-dd").style.display = "none";
-    ddIndex = -1; ddItems = [];
+  // Right-aligned "×" on each suggestion: purge that name everywhere
+  // (typo cleanup). Inline confirm — the row swaps to
+  // "delete 'NAME' everywhere? yes / no"; no browser alert().
+  function purgeRowExtra(name, row, api) {
+    var x = document.createElement("span");
+    x.className = "annot-dd-x";
+    x.textContent = "×";
+    x.title = "delete this source name everywhere (typo cleanup)";
+    x.onmousedown = function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      row.onmousedown = function (ev) { ev.preventDefault(); };  // disarm fill
+      row.innerHTML = "";
+      row.className = "annot-dd-confirm";
+      var q = document.createElement("span");
+      q.textContent = "delete ‘" + name + "’ everywhere? ";
+      var yes = document.createElement("span");
+      yes.className = "annot-dd-yes";
+      yes.textContent = "yes";
+      yes.onmousedown = function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        doPurgeSource(name, api);
+      };
+      var sep = document.createElement("span");
+      sep.textContent = " / ";
+      var no = document.createElement("span");
+      no.className = "annot-dd-no";
+      no.textContent = "no";
+      no.onmousedown = function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        api.refresh();
+      };
+      row.appendChild(q); row.appendChild(yes);
+      row.appendChild(sep); row.appendChild(no);
+    };
+    row.appendChild(x);
   }
 
-  function showDropdown() {
-    var val = ($("annot-source").value || "").trim().toLowerCase();
-    var dd = $("annot-source-dd");
-    var matches = sourceNames().filter(function (s) {
-      return val === "" ? true : s.toLowerCase().indexOf(val) !== -1;
-    }).slice(0, 10);
-    ddItems = matches;
-    ddIndex = -1;
-    if (!matches.length) { hideDropdown(); return; }
-    dd.innerHTML = "";
-    matches.forEach(function (s, i) {
-      var row = document.createElement("div");
-      row.textContent = s;
-      row.onmousedown = function (e) { e.preventDefault(); pickSuggestion(i); };
-      dd.appendChild(row);
-    });
-    dd.style.display = "block";
-  }
-
-  function highlightDd() {
-    var dd = $("annot-source-dd");
-    var kids = dd.children;
-    for (var i = 0; i < kids.length; i++) {
-      kids[i].className = (i === ddIndex) ? "active" : "";
-    }
-  }
-
-  function pickSuggestion(i) {
-    if (i < 0 || i >= ddItems.length) return;
-    $("annot-source").value = ddItems[i];
-    hideDropdown();
-    updateHint();
-    $("annot-source").focus();
+  function doPurgeSource(name, api) {
+    if (needUser()) { api.hide(); return; }
+    post("/annotations/source/purge", { name: name, user: activeUser },
+      function (j) {
+        if (j.vocab) vocab = j.vocab;
+        setMsg("purged ‘" + name + "’ (" + j.n_purged +
+               " record" + (j.n_purged === 1 ? "" : "s") + ")", "ok");
+        // The event's current source may have changed (fallback to the
+        // latest surviving row) — re-pull the block.
+        fetch("/api/annotations?event=" + encodeURIComponent(ANNOT.event))
+          .then(function (r) { return r.json(); })
+          .then(function (jj) {
+            var rows = (jj && jj.annotations) || [];
+            var blk = rows.length ? rows[0] : null;
+            block.source_name = blk ? blk.source_name : null;
+            if (!block.source_name) { $("annot-source").value = ""; }
+            renderSummary(); renderSource(); updateHint();
+          })
+          .catch(function () {});
+        api.refresh();
+      });
   }
 
   function wireSource() {
-    var inp = $("annot-source");
-    inp.addEventListener("input", function () { showDropdown(); updateHint(); });
-    inp.addEventListener("focus", function () { showDropdown(); });
-    inp.addEventListener("blur", function () { setTimeout(hideDropdown, 150); });
-    inp.addEventListener("keydown", function (e) {
-      var open = $("annot-source-dd").style.display === "block";
-      if (e.key === "ArrowDown") {
-        if (!open) { showDropdown(); return; }
-        e.preventDefault(); ddIndex = Math.min(ddIndex + 1, ddItems.length - 1); highlightDd();
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault(); ddIndex = Math.max(ddIndex - 1, 0); highlightDd();
-      } else if (e.key === "Enter") {
-        e.preventDefault();
-        if (open && ddIndex >= 0) { pickSuggestion(ddIndex); }
-        else { setSource(); }
-      } else if (e.key === "Escape") {
-        hideDropdown();
-      }
+    sourceTa = window.dsaTypeahead({
+      input: $("annot-source"),
+      dd: $("annot-source-dd"),
+      getNames: sourceNames,
+      onPick: updateHint,
+      onSubmit: setSource,
+      onInput: updateHint,
+      rowExtra: purgeRowExtra,
     });
   }
 

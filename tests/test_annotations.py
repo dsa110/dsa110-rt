@@ -185,6 +185,65 @@ def test_source_not_uppercased(db):
 
 
 # ---------------------------------------------------------------------------
+# Source-name purge (typo cleanup)
+# ---------------------------------------------------------------------------
+
+
+def test_purge_moves_rows_and_drops_vocab(db):
+    ann.add_user("vishnu", db)
+    ann.set_source("EV1", "vishnu", "B1913+I6", db)   # typo
+    ann.set_source("EV2", "vishnu", "b1913+i6", db)   # same typo, other case
+    n = ann.purge_source_name("B1913+I6", "vishnu", db)
+    assert n == 2
+    # Gone from the vocabulary...
+    assert ann.vocab(db)["source_names"] == []
+    # ...and from both events' current source.
+    assert ann.event_annotations("EV1", db)["source_name"] is None
+    assert ann.event_annotations("EV2", db)["source_name"] is None
+    # Rows preserved in the graveyard with the purger stamped.
+    import sqlite3
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT event, source_name, purged_by FROM source_names_purged "
+            "ORDER BY orig_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [(r[0], r[2]) for r in rows] == [("EV1", "vishnu"), ("EV2", "vishnu")]
+
+
+def test_purge_current_falls_back_to_latest_surviving_row(db):
+    """Purge removes the matching rows entirely, so an event's current
+    source becomes the latest SURVIVING row — an older different name
+    resurfaces."""
+    ann.add_user("vishnu", db)
+    ann.set_source("EV1", "vishnu", "3C48", db)       # older, different
+    ann.set_source("EV1", "vishnu", "3C48-typo", db)  # latest (typo)
+    assert ann.event_annotations("EV1", db)["source_name"]["source_name"] \
+        == "3C48-typo"
+    ann.purge_source_name("3C48-typo", "vishnu", db)
+    cur = ann.event_annotations("EV1", db)["source_name"]
+    assert cur is not None and cur["source_name"] == "3C48"
+
+
+def test_purge_rejects_unknown_user_and_empty(db):
+    ann.add_user("vishnu", db)
+    ann.set_source("EV1", "vishnu", "3C48", db)
+    with pytest.raises(ann.UnknownUserError):
+        ann.purge_source_name("3C48", "ghost", db)
+    with pytest.raises(ValueError):
+        ann.purge_source_name("   ", "vishnu", db)
+    # Nothing was purged by the failed attempts.
+    assert ann.vocab(db)["source_names"] == ["3C48"]
+
+
+def test_purge_nonexistent_name_is_noop(db):
+    ann.add_user("vishnu", db)
+    assert ann.purge_source_name("NEVER_USED", "vishnu", db) == 0
+
+
+# ---------------------------------------------------------------------------
 # Bulk current + unclassified filter
 # ---------------------------------------------------------------------------
 
@@ -280,6 +339,101 @@ def test_wal_mode_enabled(db):
 
 
 # ---------------------------------------------------------------------------
+# Zombie partition (bursts tab rule) — pure functions, no Flask
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+import cands_panel_funcs as cpf
+
+
+#: A "now" safely inside the C3 era for the zombie tests.
+_NOW = cpf.C3_ERA_START_UNIX + 30 * 86400.0
+
+
+def _ev(name, *, c3_action=None, mtime_unix=0.0, mjd_peak=None,
+        has_l3=False):
+    return cpf.EventSummary(
+        name=name, mtime_unix=mtime_unix, mjd_peak=mjd_peak,
+        trigger_class=None, n_events=None, snr_max=None, dm_median=None,
+        l_median=None, m_median=None, n_cubes=0, n_plots=0,
+        c3_action=c3_action, has_l3=has_l3,
+    )
+
+
+def test_zombie_name_pattern_gate():
+    """Only real event names (YYMMDD + 4 lowercase letters) can be
+    zombies; calibrator scans / test triggers / misc dirs keep today's
+    behaviour no matter how old and pending they are."""
+    now = _NOW
+    old = now - 2 * 3600.0                      # 2 h old, pending
+    assert cpf.is_zombie(_ev("260714nmeh", mtime_unix=old), now)
+    for bad in ("dumpnow_12345678", "3C286_a", "DUMP1", "releases",
+                "dtest2"):
+        assert not cpf.is_zombie(_ev(bad, mtime_unix=old), now), bad
+
+
+def test_zombie_age_and_status_rules():
+    now = _NOW
+    fresh = now - 0.5 * 3600.0
+    old = now - 2 * 3600.0
+    # Fresh pending -> not a zombie (stays in pass).
+    assert not cpf.is_zombie(_ev("260714aaaa", mtime_unix=fresh), now)
+    # Old pending -> zombie.
+    assert cpf.is_zombie(_ev("260714aaaa", mtime_unix=old), now)
+    # Judged events are never zombies, however old.
+    assert not cpf.is_zombie(
+        _ev("260714aaaa", c3_action="KEEP", mtime_unix=old), now)
+    assert not cpf.is_zombie(
+        _ev("260714aaaa", c3_action="REJECT", mtime_unix=old), now)
+    # mjd_peak wins over mtime when present: fresh t_peak, stale mtime.
+    mjd_fresh = (now - 0.25 * 3600.0) / 86400.0 + 40587.0
+    assert not cpf.is_zombie(
+        _ev("260714aaaa", mtime_unix=old, mjd_peak=mjd_fresh), now)
+
+
+def test_zombie_level3_gate():
+    """Real-named pre-C3-era events whose legacy Level3 JSON is on disk
+    are NOT zombies (their metadata landed; C3 simply never existed to
+    judge them). A genuine zombie has no Level3 at all."""
+    now = _NOW
+    old = now - 2 * 3600.0
+    assert cpf.is_zombie(_ev("240122aaag", mtime_unix=old, has_l3=False), now)
+    assert not cpf.is_zombie(
+        _ev("240119aacg", mtime_unix=old, has_l3=True), now)
+
+
+def test_zombie_c3_era_gate():
+    """Dirs untouched since before the C3 veto went live are legacy —
+    'pending' is not a stuck state for them, however old and however
+    real their names look."""
+    now = _NOW
+    pre_era = cpf.C3_ERA_START_UNIX - 86400.0     # touched before C3
+    in_era = cpf.C3_ERA_START_UNIX + 86400.0      # touched after C3
+    assert not cpf.is_zombie(
+        _ev("230913aaao", mtime_unix=pre_era), now)
+    assert cpf.is_zombie(_ev("260711irzt", mtime_unix=in_era), now)
+
+
+def test_partition_events_c3_buckets():
+    now = _NOW
+    old = now - 2 * 3600.0
+    fresh = now - 60.0
+    events = [
+        _ev("260714aaaa", c3_action="KEEP", mtime_unix=old),      # pass
+        _ev("260714bbbb", c3_action="REJECT", mtime_unix=old),    # fail
+        _ev("260714cccc", mtime_unix=fresh),                      # pass (fresh pending)
+        _ev("260714dddd", mtime_unix=old),                        # zombie
+        _ev("dumpnow_12345678", mtime_unix=old),                  # pass (name gate)
+    ]
+    ev_pass, ev_fail, ev_zomb = cpf.partition_events_c3(events, now_unix=now)
+    assert [e.name for e in ev_pass] == ["260714aaaa", "260714cccc",
+                                         "dumpnow_12345678"]
+    assert [e.name for e in ev_fail] == ["260714bbbb"]
+    assert [e.name for e in ev_zomb] == ["260714dddd"]
+
+
+# ---------------------------------------------------------------------------
 # Flask endpoint smoke tests (skip if app can't import outside prod)
 # ---------------------------------------------------------------------------
 
@@ -331,3 +485,54 @@ def test_endpoint_roundtrip(client):
     r = client.get("/api/annotations/vocab")
     assert r.status_code == 200
     assert "FRB" in r.get_json()["labels"]
+
+
+def test_endpoint_purge_roundtrip(client):
+    r = client.post("/annotations/user", json={"name": "purger"})
+    assert r.status_code == 200
+    r = client.post(
+        "/annotations/source",
+        json={"event": "EVP", "user": "purger", "source_name": "TYP0"},
+    )
+    assert r.status_code == 200
+    r = client.post(
+        "/annotations/source/purge", json={"name": "TYP0", "user": "purger"},
+    )
+    assert r.status_code == 200, r.get_data(as_text=True)
+    j = r.get_json()
+    assert j["n_purged"] == 1
+    assert "TYP0" not in j["vocab"]["source_names"]
+    # Unknown user -> 400.
+    r = client.post(
+        "/annotations/source/purge", json={"name": "x", "user": "ghost"},
+    )
+    assert r.status_code == 400
+    # Empty name -> 400.
+    r = client.post(
+        "/annotations/source/purge", json={"name": "  ", "user": "purger"},
+    )
+    assert r.status_code == 400
+
+
+def test_bursts_page_zombie_tab_and_source_filter(client):
+    """The list page renders the Zombies tab + source search and the
+    ?source= filter round-trips (mocked archive)."""
+    from unittest import mock
+    import app as app_mod
+
+    now = _time.time()
+    events = [
+        _ev("260714zzzz", c3_action="KEEP", mtime_unix=now - 60),
+        _ev("260713qqqq", mtime_unix=now - 7200),   # zombie
+    ]
+    with mock.patch.object(app_mod.cands_browser, "list_events",
+                           return_value=events):
+        r = client.get("/bursts")
+        html = r.get_data(as_text=True)
+        assert r.status_code == 200
+        assert "Zombies" in html
+        assert "260713qqqq" in html
+        assert 'id="src-search"' in html
+        r = client.get("/bursts?source=B1913%2B16")
+        assert r.status_code == 200
+        assert "src-chip" in r.get_data(as_text=True)

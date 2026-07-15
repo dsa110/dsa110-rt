@@ -147,6 +147,21 @@ CREATE TABLE IF NOT EXISTS custom_tags (
     created_by   TEXT NOT NULL,
     created_utc  TEXT NOT NULL
 );
+-- Graveyard for purged source names (typo cleanup). Rows keep their
+-- original columns (original source_names id in orig_id) plus who
+-- purged them and when, so a purge is auditable and reversible by
+-- hand. CREATE TABLE IF NOT EXISTS means existing live DBs upgrade
+-- transparently on first use.
+CREATE TABLE IF NOT EXISTS source_names_purged (
+    id           INTEGER PRIMARY KEY,
+    orig_id      INTEGER NOT NULL,
+    event        TEXT NOT NULL,
+    source_name  TEXT,
+    user         TEXT NOT NULL,
+    ts_utc       TEXT NOT NULL,
+    purged_by    TEXT NOT NULL,
+    purged_utc   TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_class_event      ON classifications(event);
 CREATE INDEX IF NOT EXISTS ix_class_event_user ON classifications(event, user);
 CREATE INDEX IF NOT EXISTS ix_source_event     ON source_names(event);
@@ -332,6 +347,48 @@ def set_source(
             (e, src, canon, _now_iso()),
         )
         return _event_current(conn, e)
+
+
+def purge_source_name(
+    name: Optional[str],
+    user: Optional[str],
+    db_path: Optional[str] = None,
+) -> int:
+    """Purge a source name from the vocabulary (typo cleanup).
+
+    Moves EVERY ``source_names`` row whose name matches
+    (case-insensitively) into ``source_names_purged`` (stamped with who
+    purged and when), then deletes them. The name vanishes from the
+    type-ahead vocabulary and from every event's current source; each
+    affected event's current source falls back to its latest
+    *surviving* row (an older different name, or nothing).
+
+    Returns the number of rows purged. Unknown user or empty name
+    raises (``UnknownUserError`` / ``ValueError``).
+    """
+    n = (name or "").strip()
+    if not n:
+        raise ValueError("source name is empty")
+    u = normalize_user(user)
+    with _conn(db_path) as conn:
+        canon = _canonical_user(conn, u)
+        if canon is None:
+            raise UnknownUserError(f"unknown user: {u!r}")
+        now = _now_iso()
+        cur = conn.execute(
+            "INSERT INTO source_names_purged"
+            " (orig_id, event, source_name, user, ts_utc,"
+            "  purged_by, purged_utc)"
+            " SELECT id, event, source_name, user, ts_utc, ?, ?"
+            " FROM source_names WHERE lower(source_name) = lower(?)",
+            (canon, now, n),
+        )
+        n_purged = cur.rowcount
+        conn.execute(
+            "DELETE FROM source_names WHERE lower(source_name) = lower(?)",
+            (n,),
+        )
+        return n_purged
 
 
 # ---------------------------------------------------------------------------

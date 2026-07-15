@@ -29,6 +29,7 @@
     }
     .c3-tab.active .count.pass { background: #00b894; }
     .c3-tab.active .count.fail { background: #d63031; }
+    .c3-tab.active .count.zomb { background: #636e72; }
 
     /* C3 decision badges in the table */
     .c3-badge {
@@ -76,19 +77,60 @@
     }
     .annot-filter a:hover { border-color: #b2bec3; }
     .annot-filter a.active { background: #2d3436; color: #fff; border-color: #2d3436; }
+
+    /* Source-name search (shared dsaTypeahead; dd styled as on the
+       event page) */
+    .src-searchwrap { position: relative; display: flex; gap: 6px; align-items: center; }
+    .src-input {
+        padding: 4px 9px; border: 1px solid #b2bec3; border-radius: 12px;
+        font-size: 12px; width: 190px;
+    }
+    .annot-dd {
+        position: absolute; top: 100%; left: 0; z-index: 50;
+        min-width: 240px; max-height: 240px; overflow-y: auto;
+        background: #fff; border: 1px solid #b2bec3; border-radius: 6px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.18); display: none; margin-top: 2px;
+    }
+    .annot-dd > div {
+        padding: 6px 12px; font-size: 13px; cursor: pointer;
+        display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
+    .annot-dd > div.active, .annot-dd > div:hover { background: #0984e3; color: #fff; }
+    .src-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: #2d3436; color: #fff; padding: 2px 6px 2px 10px;
+        border-radius: 12px; font-size: 12px; font-weight: 600;
+    }
+    .src-chip a { color: #b2bec3; text-decoration: none; font-weight: 700;
+        padding: 0 4px; border: none; }
+    .src-chip a:hover { color: #fff; }
 </style>
 {% endblock %}
 
 {% block content %}
 <h1>Burst candidates</h1>
 
+{% set src_qs = ('&source=' ~ (source_filter|urlencode)) if source_filter else '' %}
 <div class="annot-filter">
     <span class="lbl">classification</span>
-    <a href="/bursts" class="{{ 'active' if not tag_filter or tag_filter == 'all' }}">All</a>
-    <a href="/bursts?tag=unclassified" class="{{ 'active' if tag_filter == 'unclassified' }}">Unclassified</a>
+    <a href="/bursts{% if source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
+       class="{{ 'active' if not tag_filter or tag_filter == 'all' }}">All</a>
+    <a href="/bursts?tag=unclassified{{ src_qs }}" class="{{ 'active' if tag_filter == 'unclassified' }}">Unclassified</a>
     {% for lab in annot_filter_labels %}
-    <a href="/bursts?tag={{ lab }}" class="{{ 'active' if tag_filter == lab }}">{{ lab }}</a>
+    <a href="/bursts?tag={{ lab }}{{ src_qs }}" class="{{ 'active' if tag_filter == lab }}">{{ lab }}</a>
     {% endfor %}
+</div>
+
+<div class="annot-filter src-searchwrap">
+    <span class="lbl">source</span>
+    <input id="src-search" class="src-input" placeholder="search source name…"
+           value="{{ source_filter }}" autocomplete="off">
+    <div id="src-search-dd" class="annot-dd"></div>
+    {% if source_filter %}
+    <span class="src-chip">{{ source_filter }}
+        <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% endif %}"
+           title="clear source filter">×</a></span>
+    {% endif %}
 </div>
 
 {% if not archive_available %}
@@ -129,6 +171,8 @@
             {% set show = (not tag_filter) or (tag_filter == 'all')
                or (tag_filter == 'unclassified' and not (a and a.labels))
                or (tag_filter not in ['all', 'unclassified'] and a and tag_filter in a.labels) %}
+            {% set show = show and ((not source_filter_lc)
+               or (a and a.source_name and a.source_name|lower == source_filter_lc)) %}
             {% if show %}
             <tr>
                 <td>
@@ -204,6 +248,9 @@
     <div class="c3-tab" id="tab-btn-fail" onclick="showTab('fail')">
         C3 fail<span class="count fail">{{ events_fail|length }}</span>
     </div>
+    <div class="c3-tab" id="tab-btn-zombie" onclick="showTab('zombie')">
+        Zombies<span class="count zomb">{{ events_zombie|length }}</span>
+    </div>
 </div>
 
 <div class="card" id="tab-pass" style="border-top-left-radius: 0;">
@@ -227,6 +274,15 @@
     {{ event_table(events_fail, 'fail') }}
 </div>
 
+<div class="card" id="tab-zombie" style="display: none; border-top-left-radius: 0;">
+    <h2>Zombie events ({{ events_zombie|length }})</h2>
+    <div class="muted">
+        C1/C2 triggered but cubes/metadata never landed on h23
+        (C3 pending &gt; 1 h) — the transfer/copy path failed for these.
+    </div>
+    {{ event_table(events_zombie, 'zombie') }}
+</div>
+
 <div class="card">
     <h3>External tools</h3>
     <ul style="margin-left: 20px; font-size: 13px; line-height: 1.7;">
@@ -240,19 +296,42 @@
     </ul>
 </div>
 
+<script src="/static/typeahead.js"></script>
 <script>
+var C3_TABS = ["pass", "fail", "zombie"];
 function showTab(which) {
-    document.getElementById("tab-pass").style.display =
-        (which === "pass") ? "" : "none";
-    document.getElementById("tab-fail").style.display =
-        (which === "fail") ? "" : "none";
-    document.getElementById("tab-btn-pass").classList.toggle(
-        "active", which === "pass");
-    document.getElementById("tab-btn-fail").classList.toggle(
-        "active", which === "fail");
+    C3_TABS.forEach(function (t) {
+        document.getElementById("tab-" + t).style.display =
+            (which === t) ? "" : "none";
+        document.getElementById("tab-btn-" + t).classList.toggle(
+            "active", which === t);
+    });
     try { history.replaceState(null, "", "#" + which); } catch (e) {}
 }
-// Deep-linkable: /bursts#fail opens the fail tab.
-if (window.location.hash === "#fail") { showTab("fail"); }
+// Deep-linkable: /bursts#fail (or #zombie) opens that tab.
+var hashTab = (window.location.hash || "").replace("#", "");
+if (C3_TABS.indexOf(hashTab) > 0) { showTab(hashTab); }
+
+// Source-name search: same live type-ahead as the event page (shared
+// dsaTypeahead). Picking a suggestion — or pressing Enter with text —
+// reloads with ?source= (keeping ?tag=); empty Enter clears the filter.
+(function () {
+    var SRC_NAMES = {{ annot_source_names|tojson }};
+    var TAG = {{ tag_filter|tojson }};
+    function go(name) {
+        var qs = [];
+        if (TAG) { qs.push("tag=" + encodeURIComponent(TAG)); }
+        name = (name || "").trim();
+        if (name) { qs.push("source=" + encodeURIComponent(name)); }
+        window.location.href = "/bursts" + (qs.length ? "?" + qs.join("&") : "");
+    }
+    window.dsaTypeahead({
+        input: document.getElementById("src-search"),
+        dd: document.getElementById("src-search-dd"),
+        getNames: function () { return SRC_NAMES; },
+        onPick: go,
+        onSubmit: go,
+    });
+})();
 </script>
 {% endblock %}
