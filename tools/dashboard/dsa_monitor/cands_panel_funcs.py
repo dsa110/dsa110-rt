@@ -103,6 +103,10 @@ class EventDetail:
     has_c1_csv: bool
     c3_decision: Optional[Mapping[str, Any]] = None
     n_voltages: int = 0
+    # bbproc coherent-filterbank products under <cand>/filterbank/
+    fil_plots: Tuple[str, ...] = ()   # inspection PNGs
+    fil_files: Tuple[str, ...] = ()   # .fil filenames (size-linked only)
+    fil_meta: Optional[Mapping[str, Any]] = None  # filterbank.json
 
 
 class ArchiveBrowser:
@@ -210,6 +214,22 @@ class ArchiveBrowser:
             for p in sorted(cubes_dir.iterdir()):
                 if p.suffix.lower() == ".npz":
                     cubes.append(p.name)
+        fb_dir = event_dir / "filterbank"
+        fil_plots: List[str] = []
+        fil_files: List[str] = []
+        fil_meta = None
+        if fb_dir.is_dir():
+            for p in sorted(fb_dir.iterdir()):
+                if p.suffix.lower() == ".png":
+                    fil_plots.append(p.name)
+                elif p.suffix.lower() == ".fil":
+                    fil_files.append(p.name)
+            mpath = fb_dir / "filterbank.json"
+            if mpath.is_file():
+                try:
+                    fil_meta = json.loads(mpath.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    fil_meta = None
         return EventDetail(
             name=name,
             archive_dir=event_dir,
@@ -224,7 +244,28 @@ class ArchiveBrowser:
             n_voltages=_count_files(
                 event_dir / "Level2" / "voltages", "*_data.out"
             ),
+            fil_plots=tuple(fil_plots),
+            fil_files=tuple(fil_files),
+            fil_meta=fil_meta,
         )
+
+    def fil_plot_path(self, name: str, plot_name: str) -> Optional[Path]:
+        """Resolve a filterbank inspection PNG path, refusing traversal."""
+        if not _SAFE_EVENT_RE.match(name):
+            return None
+        if "/" in plot_name or ".." in plot_name:
+            return None
+        if not plot_name.endswith(".png"):
+            return None
+        p = self._root / name / "filterbank" / plot_name
+        try:
+            p_resolved = p.resolve()
+            root_resolved = (self._root / name).resolve()
+        except OSError:
+            return None
+        if not str(p_resolved).startswith(str(root_resolved)):
+            return None
+        return p_resolved if p_resolved.is_file() else None
 
     def plot_path(self, name: str, plot_name: str) -> Optional[Path]:
         """Resolve a plot PNG path, refusing traversal."""

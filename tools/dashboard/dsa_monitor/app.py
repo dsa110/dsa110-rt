@@ -522,6 +522,15 @@ def burst_event_plot(name: str, plot_name: str):
     return send_file(str(p), mimetype="image/png")
 
 
+@app.route("/bursts/<name>/filplot/<plot_name>")
+def burst_event_fil_plot(name: str, plot_name: str):
+    """bbproc coherent-filterbank inspection PNGs (<cand>/filterbank/)."""
+    p = cands_browser.fil_plot_path(name, plot_name)
+    if p is None:
+        abort(404)
+    return send_file(str(p), mimetype="image/png")
+
+
 # ---------- Sky monitor (E2E test 1: "always seeing the sky") -------------
 #
 # Each corr node's corr_fast (--sky-export-url) POSTs its slot-0

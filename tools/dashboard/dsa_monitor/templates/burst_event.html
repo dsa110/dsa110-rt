@@ -75,6 +75,37 @@
 </div>
 
 <div class="card">
+    <h2>Coherent filterbank (bbproc)</h2>
+    {% if event.fil_plots %}
+    {% if event.fil_meta %}
+    <div class="muted" style="margin-bottom: 8px;">
+        beamformed at (l, m) = ({{ '%.6f'|format(event.fil_meta.l or 0) }},
+        {{ '%.6f'|format(event.fil_meta.m or 0) }}) rad ·
+        DM {{ '%.2f'|format(event.fil_meta.dm or 0) }} ·
+        {{ event.fil_meta.n_fragments }}/16 fragments ·
+        cal: <code>{{ (event.fil_meta.cal_sb00 or 'none')|replace('/dataz/dsa110/operations/beamformer_weights/applied/','') }}</code>
+        {% if event.fil_files %} · files:
+        {% for f in event.fil_files %}<code>filterbank/{{ f }}</code> {% endfor %}
+        {% endif %}
+    </div>
+    {% endif %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(560px,1fr));gap:12px;">
+        {% for plot in event.fil_plots %}
+        <div class="plot-card">
+            <h3>{{ plot }}{% if '_rfi' in plot %} (SK RFI-flagged){% else %} (unflagged){% endif %}</h3>
+            <img src="/bursts/{{ event.name }}/filplot/{{ plot }}" alt="{{ plot }}">
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="muted">No filterbank products yet — C3 generates
+        <code>filterbank/&lt;event&gt;[_rfi].fil</code> + inspection PNGs
+        after voltage collection on KEEP events
+        (<code>c3.filterbank</code> in <code>dsart_search_rt.yaml</code>).</div>
+    {% endif %}
+</div>
+
+<div class="card">
     <h2>Cubes ({{ event.cubes|length }} / 8)</h2>
     {% if event.cubes %}
     <ul style="margin-left:20px;font-size:13px;font-family:'Menlo','Consolas',monospace;">

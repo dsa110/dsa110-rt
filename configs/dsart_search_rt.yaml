@@ -755,6 +755,25 @@ c3:
   voltage_port: 11229
   expected_cube_count: 8
   scan_interval_s: 10.0
+  # ---- bbproc coherent filterbank per KEEP event (2026-07-15) ----------
+  # After fragment collection C3 snapshots the newest complete
+  # per-subband cal set into <cand>/filterbank/cal/, then runs the
+  # dsa110-bbproc toolkit (coherent core-antenna beamform toward the
+  # cluster's (l_median, m_median)) and tools/plot_fil.py, writing
+  # <cand>/filterbank/<event>[_rfi].{fil,png} + filterbank.json
+  # provenance. Runs synchronously inside the scan loop -> events are
+  # processed strictly one after another (no GPU/disk contention).
+  filterbank:
+    enabled: true
+    toolkit_bin: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/toolkit
+    plot_script: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/tools/plot_fil.py
+    core_antennas: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/config/core_antennas.txt
+    cal_applied_dir: /dataz/dsa110/operations/beamformer_weights/applied
+    gpu: 0
+    tscrunch: 8                      # 262 us .fil samples
+    rfi_mode: both                   # unflagged + SK-flagged versions
+    phase_only: true                 # match the realtime cal convention
+    timeout_s: 1800.0
   collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger
   collect_poll_s: 15.0
   collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land

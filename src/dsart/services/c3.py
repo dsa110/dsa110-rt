@@ -46,6 +46,7 @@ from ..coinc.cube_veto import (
     decide,
     event_is_injection,
 )
+from ..coinc.filterbank import FilterbankConfig, run_for_event
 from ..coinc.voltage_collect import (
     CorrNode,
     collect_fragments,
@@ -104,6 +105,10 @@ class C3Config:
     mon_key: str = "/mon/c3/h23"
     mon_interval_s: float = 5.0
     veto: CubeVetoThresholds = field(default_factory=CubeVetoThresholds)
+    # M8+bbproc: coherent filterbank + inspection plot per KEEP event
+    # (dsa110-bbproc toolkit; runs synchronously in the scan loop so
+    # filterbank jobs are strictly serialized).
+    filterbank: FilterbankConfig = field(default_factory=FilterbankConfig)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "C3Config":
@@ -159,6 +164,7 @@ class C3Config:
             mon_key=str(c3.get("mon_key", "/mon/c3/h23")),
             mon_interval_s=float(c3.get("mon_interval_s", 5.0)),
             veto=th,
+            filterbank=FilterbankConfig.from_dict(c3.get("filterbank")),
         )
 
 
@@ -217,6 +223,8 @@ class C3Service:
             "rejected_flagged_only": 0,
             "veto_errors": 0,
             "fragments_collected": 0,
+            "filterbanks_ok": 0,
+            "filterbanks_failed": 0,
         }
         self._load_state()
 
@@ -368,6 +376,27 @@ class C3Service:
                 json.dump(report, fh, indent=2)
         except OSError as exc:
             LOG.warning("could not write voltage report for %s: %s", name, exc)
+
+        # bbproc coherent filterbank + inspection plot (synchronous, so
+        # events queue one after another; best-effort — a filterbank
+        # failure never affects the KEEP).
+        fb_report: Dict[str, Any] = {"skipped": "disabled"}
+        if self._cfg.filterbank.enabled and n_present > 0:
+            c2row: Dict[str, Any] = {}
+            l3p = ev_dir / "Level3" / f"{name}.json"
+            try:
+                with l3p.open("r") as fh:
+                    c2row = (json.load(fh) or {}).get("c2", {}) or {}
+            except (OSError, json.JSONDecodeError) as exc:
+                LOG.warning("filterbank %s: could not read %s: %s — "
+                            "beamforming at (l,m)=(0,0)", name, l3p, exc)
+            fb_report = run_for_event(
+                self._cfg.filterbank, ev_dir, name, c2row)
+            if fb_report.get("ok"):
+                self._counters["filterbanks_ok"] += 1
+            else:
+                self._counters["filterbanks_failed"] += 1
+
         if (
             n_present > 0
             and self._cfg.cleanup_staging_after_keep
@@ -375,7 +404,7 @@ class C3Service:
         ):
             # Voltages are safely in the candidate dir → free corr NVMe.
             self._broadcaster.broadcast(name, 0, 0.0)
-        return {"keep": report}
+        return {"keep": report, "filterbank": fb_report}
 
     def _do_reject(
         self, name: str, ev_dir: Path, decision, flag_only: bool,
