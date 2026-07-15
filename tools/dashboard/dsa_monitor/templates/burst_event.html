@@ -221,8 +221,8 @@ window.ANNOT = {
     nextUnclassified: {{ next_unclassified|tojson }},
 };
 </script>
-<script src="/static/typeahead.js" defer></script>
-<script src="/static/annotations.js" defer></script>
+<script src="{{ static_v('typeahead.js') }}" defer></script>
+<script src="{{ static_v('annotations.js') }}" defer></script>
 
 <div class="card">
     <h2>Coherent filterbank (bbproc)</h2>

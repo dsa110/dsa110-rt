@@ -213,6 +213,53 @@ _init_store_and_poller()
 
 app = Flask(__name__)
 app.jinja_env.auto_reload = False
+# Long-cache the static handler (annotations.js / typeahead.js): safe
+# because templates reference them via static_v() cache-busting URLs
+# (?v=<mtime>), so an edit changes the URL and busts the cache. In
+# Flask >= 2 this config is consulted by the /static handler; plain
+# send_file(...) calls with max_age unset stay uncached (verified in
+# tests + live headers: the in-memory RFI live plots at /plot/*.png
+# must never be browser-cached).
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 2592000          # 30 days
+
+
+@app.template_global()
+def static_v(filename: str) -> str:
+    """Cache-busting /static URL: appends ?v=<file mtime>.
+
+    Computed per-render (cheap stat); a deploy that touches the file
+    yields a new URL, so the 30-day static cache never serves stale JS.
+    """
+    path = os.path.join(HERE, "static", filename)
+    try:
+        v = int(os.stat(path).st_mtime)
+    except OSError:
+        v = 0
+    return f"/static/{filename}?v={v}"
+
+
+def _html_revalidate(html: str):
+    """ETag + no-cache wrapper for rendered HTML pages.
+
+    Content is always revalidated (no-cache), but an unchanged reload
+    costs ~0 bytes: md5 the body, and answer 304 with an empty body
+    when the client's If-None-Match already has it.
+    """
+    import hashlib
+    tag = hashlib.md5(html.encode("utf-8")).hexdigest()
+    if request.if_none_match.contains(tag):
+        resp = app.make_response(("", 304))
+    else:
+        resp = app.make_response(html)
+    resp.set_etag(tag)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+def _no_store(resp):
+    """Mark a (JSON) response explicitly uncacheable."""
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 def _clamp_ant_idx(s: Optional[str]) -> int:
@@ -507,7 +554,7 @@ def bursts():
         present.update((blk.get("labels") or {}).keys())
     custom_present = sorted(present - set(ann.BUILTIN_LABELS))
     annot_filter_labels = list(ann.BUILTIN_LABELS) + custom_present
-    return render_template(
+    return _html_revalidate(render_template(
         "bursts.html",
         active_tab="bursts",
         events_pass=events_pass,
@@ -523,7 +570,7 @@ def bursts():
         source_filter_lc=source_filter_lc,
         annot_source_names=annot_source_names,
         events_zombie=events_zombie,
-    )
+    ))
 
 
 @app.route("/bursts/<name>")
@@ -548,7 +595,7 @@ def burst_event(name: str):
                        "custom_tags": [], "labels": list(ann.BUILTIN_LABELS),
                        "users": [], "source_names": []}
         next_unclassified = None
-    return render_template(
+    return _html_revalidate(render_template(
         "burst_event.html",
         active_tab="bursts",
         event=detail,
@@ -566,7 +613,7 @@ def burst_event(name: str):
         annot_vocab=annot_vocab,
         annot_builtins=list(ann.BUILTIN_LABELS),
         next_unclassified=next_unclassified,
-    )
+    ))
 
 
 def _next_unclassified_event(current: str) -> Optional[str]:
@@ -595,12 +642,16 @@ def _next_unclassified_event(current: str) -> Optional[str]:
     return None
 
 
+# Event plot PNGs are immutable in practice but plotter.py's batch
+# re-render tool can rewrite the same paths in place, so: 7-day max-age
+# (NOT immutable) with the ETag/conditional defaults ON — a rewritten
+# PNG is caught by revalidation after expiry / hard refresh.
 @app.route("/bursts/<name>/plot/<plot_name>")
 def burst_event_plot(name: str, plot_name: str):
     p = cands_browser.plot_path(name, plot_name)
     if p is None:
         abort(404)
-    return send_file(str(p), mimetype="image/png")
+    return send_file(str(p), mimetype="image/png", max_age=604800)
 
 
 @app.route("/bursts/<name>/filplot/<plot_name>")
@@ -609,7 +660,7 @@ def burst_event_fil_plot(name: str, plot_name: str):
     p = cands_browser.fil_plot_path(name, plot_name)
     if p is None:
         abort(404)
-    return send_file(str(p), mimetype="image/png")
+    return send_file(str(p), mimetype="image/png", max_age=604800)
 
 
 # ---------- Sky monitor (E2E test 1: "always seeing the sky") -------------
@@ -727,13 +778,20 @@ def sky_vetos():
 
 
 def _png_response(png_bytes: bytes):
+    """In-memory per-request render — must NEVER be browser-cached
+    (these are the live RFI plots; a cached copy would freeze the
+    dashboard's live view). max_age=0 + no-store is explicit armour
+    against SEND_FILE_MAX_AGE_DEFAULT ever applying here."""
     import io
-    return send_file(
+    resp = send_file(
         io.BytesIO(png_bytes),
         mimetype="image/png",
         as_attachment=False,
         download_name="plot.png",
+        max_age=0,
     )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/plot/bandpass.png")
@@ -2770,7 +2828,8 @@ def annotations_user_post():
         name = ann.add_user(p.get("name"))
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, "user": name, "vocab": ann.vocab()})
+    return _no_store(
+        jsonify({"ok": True, "user": name, "vocab": ann.vocab()}))
 
 
 @app.route("/annotations/classify", methods=["POST"])
@@ -2785,7 +2844,7 @@ def annotations_classify_post():
         return jsonify({"ok": False, "error": str(exc)}), 400
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, **block})
+    return _no_store(jsonify({"ok": True, **block}))
 
 
 @app.route("/annotations/tag", methods=["POST"])
@@ -2803,7 +2862,7 @@ def annotations_tag_post():
     ev = (p.get("event") or "").strip() if p.get("event") else ""
     if ev:
         out["event_block"] = ann.event_annotations(ev)
-    return jsonify(out)
+    return _no_store(jsonify(out))
 
 
 @app.route("/annotations/source", methods=["POST"])
@@ -2817,7 +2876,7 @@ def annotations_source_post():
         return jsonify({"ok": False, "error": str(exc)}), 400
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, **block})
+    return _no_store(jsonify({"ok": True, **block}))
 
 
 @app.route("/annotations/source/purge", methods=["POST"])
@@ -2833,7 +2892,8 @@ def annotations_source_purge_post():
         return jsonify({"ok": False, "error": str(exc)}), 400
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, "n_purged": n_purged, "vocab": ann.vocab()})
+    return _no_store(
+        jsonify({"ok": True, "n_purged": n_purged, "vocab": ann.vocab()}))
 
 
 @app.route("/api/annotations", methods=["GET"])
@@ -2860,12 +2920,13 @@ def api_annotations():
         )
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, "history": history, "annotations": rows})
+    return _no_store(
+        jsonify({"ok": True, "history": history, "annotations": rows}))
 
 
 @app.route("/api/annotations/vocab", methods=["GET"])
 def api_annotations_vocab():
-    return jsonify({"ok": True, **ann.vocab()})
+    return _no_store(jsonify({"ok": True, **ann.vocab()}))
 
 
 # ---------- API ------------------------------------------------------------
@@ -2874,7 +2935,7 @@ def api_annotations_vocab():
 @app.route("/api/status")
 def api_status():
     snap = store.snapshot()
-    return jsonify({
+    return _no_store(jsonify({
         "snapshot_unix": snap.snapshot_unix,
         "per_chgroup": [
             {
@@ -2889,7 +2950,7 @@ def api_status():
             }
             for s in snap.per_chgroup
         ],
-    })
+    }))
 
 
 # ---------------------------------------------------------------------------
