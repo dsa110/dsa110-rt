@@ -71,7 +71,12 @@ trigger_classes:
       almost always known pulsars and we want a higher bar before
       taking a 64-cube dump.
     require:
-      snr_max_min: 15.0
+      # 2026-07-14: snr_max_min 15 → 35 (operator request): Galactic
+      # events dump voltages only for bright single pulses, so a
+      # transiting pulsar (e.g. B1913+16 at the current +16.27° dec)
+      # yields a handful of high-S/N M8 voltage dumps instead of
+      # rate-capping on every ≥15 σ pulse.
+      snr_max_min: 35.0
       n_events_min: 1
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 100.0
