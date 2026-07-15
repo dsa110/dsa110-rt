@@ -58,13 +58,13 @@
         {% for plot in event.plots %}
         <div class="plot-card">
             <h3>{{ plot }}</h3>
-            {% if plot.startswith('dm_time') %}
-            <div class="muted" style="font-size:11px;line-height:1.35;margin:2px 0 6px;">
+            <div class="muted" style="font-size:11px;line-height:1.35;margin:2px 0 6px;min-height:30px;">
+                {% if plot.startswith('dm_time') %}
                 red + = detector-reported burst; white × = brightest point
                 in the data. Wide separation = a broad-pulse FRB or, more
                 likely, a suspect detection.
+                {% endif %}
             </div>
-            {% endif %}
             <img src="/bursts/{{ event.name }}/plot/{{ plot }}" alt="{{ plot }}">
         </div>
         {% endfor %}
