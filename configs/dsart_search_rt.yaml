@@ -650,6 +650,12 @@ coinc:
                                      # hourly C2 CSVs) so the C2 hiplot always shows ~the last day in one
                                      # experiment. Regenerated each housekeep tick. 0 disables.
   event_archive_root: /dataz/dsa110/candidates
+  # Array pointing declination key, snapshotted into every event's
+  # Level3 c2.pointing_dec_deg at archive time so a historical event's
+  # absolute RA/Dec is recoverable (the l/m image offsets are relative
+  # to this pointing, and the live key has no history). Same key C3
+  # reads for the bbproc beamform (c3.filterbank.dec_key) — keep aligned.
+  pointing_dec_etcd_key: /mon/array/dec
   trigger_criteria_path: /home/ubuntu/vikram/dev/dsa110-rt/configs/c2_trigger_criteria.yaml
   dump_broadcast:
     port_base: 11227               # actual port = port_base + gpu_half

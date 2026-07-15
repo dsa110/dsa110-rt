@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import shutil
 import signal
 import sys
@@ -447,18 +448,7 @@ class C3Service:
             except (OSError, json.JSONDecodeError) as exc:
                 LOG.warning("filterbank %s: could not read %s: %s — "
                             "beamforming at (l,m)=(0,0)", name, l3p, exc)
-            dec_deg = None
-            if self._cfg.filterbank.dec_key:
-                try:
-                    dd = self._mon_store.get_dict(
-                        self._cfg.filterbank.dec_key) or {}
-                    dec_deg = float(dd["dec_deg"])
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning(
-                        "filterbank %s: no pointing dec from %s (%s) — "
-                        "the F21 DEC fringe-stop will be skipped and the "
-                        "beamform will be decorrelated", name,
-                        self._cfg.filterbank.dec_key, exc)
+            dec_deg = self._resolve_pointing_dec(name, c2row)
             fb_report = run_for_event(
                 self._cfg.filterbank, ev_dir, name, c2row, dec_deg=dec_deg)
             if fb_report.get("ok"):
@@ -475,6 +465,66 @@ class C3Service:
             self._broadcaster.broadcast(name, 0, 0.0)
         return {"keep": report, "filterbank": fb_report,
                 "cal_hdf5": cal_report}
+
+    def _resolve_pointing_dec(
+        self, name: str, c2row: Mapping[str, Any],
+    ) -> Optional[float]:
+        """Resolve the pointing declination (deg) for the bbproc beamform.
+
+        Prefer ``c2.pointing_dec_deg`` archived into the Level3 JSON by
+        the coincidencer at trigger time — a contemporaneous snapshot of
+        ``/mon/array/dec``. C3 can re-run days after a re-point, at which
+        point the live etcd key would be wrong; the archived snapshot is
+        the correct pointing for THIS event. Fall back to the live etcd
+        read (the historical behaviour) only when the archived value is
+        absent (old events, pre-provenance-fix) or null. Returns ``None``
+        when neither source yields a numeric value (bbproc then beamforms
+        at (l,m)=(0,0) with the DEC fringe-stop skipped).
+        """
+        archived = c2row.get("pointing_dec_deg")
+        if archived is not None:
+            try:
+                dec = float(archived)
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "filterbank %s: archived c2.pointing_dec_deg=%r is "
+                    "not numeric; falling back to live etcd", name, archived)
+            else:
+                # Non-finite or out-of-range dec is corrupt provenance
+                # (matches the gal_dm isfinite precedent in archive.py);
+                # treat as absent and fall through to the live read.
+                if not math.isfinite(dec) or not -90.0 <= dec <= 90.0:
+                    LOG.warning(
+                        "filterbank %s: archived c2.pointing_dec_deg=%r "
+                        "is non-finite or out of range [-90, 90]; "
+                        "falling back to live etcd", name, archived)
+                else:
+                    LOG.info(
+                        "filterbank %s: pointing dec %.6f deg from "
+                        "archived c2.pointing_dec_deg", name, dec)
+                    return dec
+        if self._cfg.filterbank.dec_key:
+            try:
+                dd = self._mon_store.get_dict(
+                    self._cfg.filterbank.dec_key) or {}
+                dec = float(dd["dec_deg"])
+                if not math.isfinite(dec) or not -90.0 <= dec <= 90.0:
+                    raise ValueError(
+                        f"dec_deg={dec!r} non-finite or out of "
+                        f"range [-90, 90]")
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "filterbank %s: no pointing dec from %s (%s) — "
+                    "the F21 DEC fringe-stop will be skipped and the "
+                    "beamform will be decorrelated", name,
+                    self._cfg.filterbank.dec_key, exc)
+            else:
+                LOG.info(
+                    "filterbank %s: pointing dec %.6f deg from live etcd "
+                    "%s (no archived c2.pointing_dec_deg)", name, dec,
+                    self._cfg.filterbank.dec_key)
+                return dec
+        return None
 
     def _do_reject(
         self, name: str, ev_dir: Path, decision, flag_only: bool,

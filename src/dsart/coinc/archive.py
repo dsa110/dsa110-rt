@@ -342,6 +342,8 @@ def stats_to_l3_metadata(
     holdoff_s: float,
     schema_version: int = 1,
     inj_ids: Optional[Iterable[str]] = None,
+    pointing_dec_deg: Optional[float] = None,
+    pointing_dec_meta: Optional[Mapping[str, object]] = None,
 ) -> dict[str, object]:
     """Build the L3 JSON payload the legacy archive consumer expects.
 
@@ -354,6 +356,18 @@ def stats_to_l3_metadata(
     downstream consumers — notably C3, which runs minutes later, long
     after the registry's ~60 s TTL — can reliably exempt injections from
     the cube veto without re-querying the registry.
+
+    ``pointing_dec_deg`` (degrees) is a contemporaneous snapshot of the
+    array pointing declination (``/mon/array/dec``) taken at archive
+    time. The ``c2.l_median``/``c2.m_median`` image offsets are RELATIVE
+    to this pointing, so it is required to recover the event's absolute
+    RA/Dec: the live etcd key carries no history and is overwritten on
+    every re-point. ``None`` when the read failed (never fabricated);
+    ``pointing_dec_meta`` records ``{"etcd_key", "read_unix"}`` for
+    provenance. Both fields are additive under ``c2`` — consumers must
+    tolerate their absence on pre-existing events — so ``schema_version``
+    is intentionally NOT bumped (matches the ``gal_dm`` additive
+    precedent above).
     """
     inj_list = sorted({str(i) for i in (inj_ids or ()) if str(i).strip()})
     return {
@@ -399,6 +413,14 @@ def stats_to_l3_metadata(
             "dm_galactic_fraction": (
                 stats.dm_galactic_fraction
                 if math.isfinite(stats.dm_galactic_fraction) else None
+            ),
+            # Array pointing declination (deg) at archive time; the
+            # l_median/m_median offsets above are relative to it. None
+            # when /mon/array/dec could not be read (never invented).
+            "pointing_dec_deg": pointing_dec_deg,
+            "pointing_dec_meta": (
+                dict(pointing_dec_meta)
+                if pointing_dec_meta is not None else None
             ),
         },
     }

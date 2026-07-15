@@ -395,6 +395,15 @@ class CoincidencerConfig:
     gal_dm_etcd_key: str = "/mon/array/gal_dm"
     gal_dm_poll_interval_s: float = 30.0
     gal_dm_max_los_override: Optional[float] = None
+
+    # Array pointing declination (deg), snapshotted into every event's
+    # Level3 ``c2.pointing_dec_deg`` at archive time (data-provenance
+    # gap fix, 2026-07-15). The l/m image offsets are RELATIVE to this
+    # pointing, and the live etcd key is overwritten (no history) on
+    # every re-point, so without a per-event snapshot a historical
+    # event's absolute RA/Dec is unrecoverable. Same key C3 reads for
+    # the bbproc beamform (filterbank.dec_key); keep the default aligned.
+    pointing_dec_etcd_key: str = "/mon/array/dec"
     gal_dm_max_age_s: float = 600.0
 
     # Startup trigger-grace window (M7.4 Phase 8c, 2026-05-29). For this
@@ -545,6 +554,9 @@ class CoincidencerConfig:
             ),
             gal_dm_etcd_key=str(coinc.get(
                 "gal_dm_etcd_key", "/mon/array/gal_dm",
+            )),
+            pointing_dec_etcd_key=str(coinc.get(
+                "pointing_dec_etcd_key", "/mon/array/dec",
             )),
             gal_dm_poll_interval_s=float(
                 coinc.get("gal_dm_poll_interval_s", 30.0),
@@ -1723,6 +1735,7 @@ class CoincidencerService:
             ev_dir, name, list(pp.members), trigger=name,
             inj_ids=pp.member_inj_ids,
         )
+        pointing_dec_deg, pointing_dec_meta = self._read_pointing_dec()
         self._archive.write_l3_metadata(
             ev_dir, name,
             stats_to_l3_metadata(
@@ -1732,9 +1745,58 @@ class CoincidencerService:
                 trigger_action=pp.trigger_action,
                 holdoff_s=pp.trigger_holdoff_s,
                 inj_ids=pp.member_inj_ids.values(),
+                pointing_dec_deg=pointing_dec_deg,
+                pointing_dec_meta=pointing_dec_meta,
             ),
         )
         return ev_dir
+
+    def _read_pointing_dec(self) -> Tuple[Optional[float], Dict[str, Any]]:
+        """Snapshot the array pointing declination for the L3 archive.
+
+        Reads ``/mon/array/dec`` (config ``pointing_dec_etcd_key``) ONCE
+        per event at archive time so the event's absolute sky position
+        stays recoverable: the ``c2.l_median``/``c2.m_median`` offsets are
+        relative to this pointing, and the live key is overwritten with no
+        history on every re-point. Mirrors the read pattern C3 uses for
+        the bbproc beamform (``c3._resolve_pointing_dec``).
+
+        Best-effort: any failure (store down, missing key, malformed doc,
+        non-numeric / non-finite / out-of-range ``dec_deg``) yields
+        ``(None, meta)`` and a WARNING so
+        the archive path never crashes on a hung / missing etcd. The
+        underlying ``DsaStore``/``etcd3`` client carries its own
+        connection timeout, so a single non-responsive read cannot stall
+        the archive path (same guarantee the gal_dm poll relies on).
+        Returns ``(dec_deg, meta)`` where ``meta`` is
+        ``{"etcd_key", "read_unix"}`` for provenance.
+        """
+        key = self._config.pointing_dec_etcd_key
+        meta: Dict[str, Any] = {"etcd_key": key, "read_unix": time.time()}
+        if not key or not self._mon_store.available:
+            _LOG.warning(
+                "pointing dec: store unavailable or no key configured; "
+                "c2.pointing_dec_deg will be null",
+            )
+            return None, meta
+        try:
+            dd = self._mon_store.get_dict(key) or {}
+            dec = float(dd["dec_deg"])
+            # Non-finite dec must never reach the archive: json.dumps
+            # would emit a literal NaN/Infinity token — invalid strict
+            # JSON that breaks non-Python consumers. Out-of-range dec is
+            # corrupt. Both → null (matches the gal_dm isfinite
+            # precedent in archive.py).
+            if not math.isfinite(dec) or not -90.0 <= dec <= 90.0:
+                raise ValueError(
+                    f"dec_deg={dec!r} non-finite or out of range [-90, 90]")
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "pointing dec: read of %s failed (%s); "
+                "c2.pointing_dec_deg will be null", key, exc,
+            )
+            return None, meta
+        return dec, meta
 
     def _discard_partial_event_dir(self, name: str) -> None:
         """Remove a partial ``<archive_root>/<name>/`` left behind by
