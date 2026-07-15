@@ -65,6 +65,7 @@ from cands_panel_funcs import (
     DEFAULT_ARCHIVE_ROOT,
     N_VOLTAGE_FRAGMENTS_TOTAL,
 )
+import annotations as ann
 from control_store import (
     CORR_CN_IDS,
     DEFAULT_ARM_SEQ_MARGIN,
@@ -481,6 +482,14 @@ def bursts():
     # fail-open is C3's own default.
     events_pass = [e for e in events if e.c3_status in ("pass", "pending")]
     events_fail = [e for e in events if e.c3_status == "fail"]
+    # Human-annotation badges: one bulk read (no per-event query),
+    # joined to the event rows in the template by event name.
+    try:
+        annot_current = ann.all_current()
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("annotations.all_current failed (list badges skipped)")
+        annot_current = {}
+    tag_filter = (request.args.get("tag") or "").strip()
     return render_template(
         "bursts.html",
         active_tab="bursts",
@@ -489,6 +498,9 @@ def bursts():
         n_voltage_total=N_VOLTAGE_FRAGMENTS_TOTAL,
         archive_root=str(cands_browser.root),
         archive_available=cands_browser.is_available,
+        annot_current=annot_current,
+        annot_builtins=list(ann.BUILTIN_LABELS),
+        tag_filter=tag_filter,
     )
 
 
@@ -498,6 +510,22 @@ def burst_event(name: str):
     detail = cands_browser.event_detail(name)
     if detail is None:
         abort(404)
+    # Human-annotation context for the classification card. Best-effort:
+    # a DB hiccup must never 500 the event page.
+    try:
+        annot_block = ann.event_annotations(name)
+        annot_history = ann.event_history(name)
+        annot_vocab = ann.vocab()
+        next_unclassified = _next_unclassified_event(name)
+    except Exception:                                       # noqa: BLE001
+        LOG.exception("annotations context failed for %s", name)
+        annot_block = {"event": name, "classifications": [],
+                       "labels": {}, "source_name": None}
+        annot_history = []
+        annot_vocab = {"builtin_labels": list(ann.BUILTIN_LABELS),
+                       "custom_tags": [], "labels": list(ann.BUILTIN_LABELS),
+                       "users": [], "source_names": []}
+        next_unclassified = None
     return render_template(
         "burst_event.html",
         active_tab="bursts",
@@ -511,7 +539,38 @@ def burst_event(name: str):
         metadata_pretty=_json.dumps(
             detail.metadata, indent=2, sort_keys=True, default=str,
         ),
+        annot_block=annot_block,
+        annot_history=annot_history,
+        annot_vocab=annot_vocab,
+        annot_builtins=list(ann.BUILTIN_LABELS),
+        next_unclassified=next_unclassified,
     )
+
+
+def _next_unclassified_event(current: str) -> Optional[str]:
+    """Name of the next event (in the newest-first list order, wrapping)
+    that has no current human classification. Returns None if every other
+    event is already classified. Best-effort — swallows archive errors."""
+    try:
+        events = cands_browser.list_events()
+    except Exception:                                       # noqa: BLE001
+        return None
+    names = [e.name for e in events]
+    if current not in names:
+        return None
+    try:
+        classified = ann.classified_events()
+    except Exception:                                       # noqa: BLE001
+        classified = set()
+    n = len(names)
+    start = names.index(current)
+    for off in range(1, n + 1):
+        cand = names[(start + off) % n]
+        if cand == current:
+            break
+        if cand not in classified:
+            return cand
+    return None
 
 
 @app.route("/bursts/<name>/plot/<plot_name>")
@@ -2661,6 +2720,114 @@ def control_clear_sidereal_vetos_post():
         LOG.exception("clear_sidereal_vetos: etcd put failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
     return jsonify({"ok": True, "ts": ts, "actor": str(actor)})
+
+
+# ---------- Human annotations (classification tagging) ---------------------
+#
+# No-login human classification of burst events. The storage layer lives
+# in ``annotations.py`` (pure sqlite, unit-tested). The DB is central on
+# h23 OUTSIDE the repo and OUTSIDE the candidate archive (default
+# ~/.dsa_monitor/annotations.db, override $DSA_MONITOR_ANNOT_DB) so tags
+# survive archive pruning. Per (event, user) last-click-wins; the source
+# name is event-level. Every POST returns the updated current-annotations
+# block for the event so the page can re-render without a reload.
+
+
+def _annot_params() -> dict:
+    """Pull params from a JSON body or form-encoded POST, uniformly."""
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+    return {k: request.form.get(k) for k in request.form}
+
+
+@app.route("/annotations/user", methods=["POST"])
+def annotations_user_post():
+    p = _annot_params()
+    try:
+        name = ann.add_user(p.get("name"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "user": name, "vocab": ann.vocab()})
+
+
+@app.route("/annotations/classify", methods=["POST"])
+def annotations_classify_post():
+    p = _annot_params()
+    label = p.get("label")
+    if isinstance(label, str) and label.strip() == "":
+        label = None
+    try:
+        block = ann.classify(p.get("event"), p.get("user"), label)
+    except ann.UnknownUserError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **block})
+
+
+@app.route("/annotations/tag", methods=["POST"])
+def annotations_tag_post():
+    p = _annot_params()
+    try:
+        tag = ann.create_tag(p.get("tag"), p.get("user"))
+    except ann.UnknownUserError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    # If an event was supplied, hand back its refreshed block too so the
+    # "+ tag then apply" flow can render in one round-trip.
+    out = {"ok": True, "tag": tag, "vocab": ann.vocab()}
+    ev = (p.get("event") or "").strip() if p.get("event") else ""
+    if ev:
+        out["event_block"] = ann.event_annotations(ev)
+    return jsonify(out)
+
+
+@app.route("/annotations/source", methods=["POST"])
+def annotations_source_post():
+    p = _annot_params()
+    try:
+        block = ann.set_source(
+            p.get("event"), p.get("user"), p.get("source_name")
+        )
+    except ann.UnknownUserError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, **block})
+
+
+@app.route("/api/annotations", methods=["GET"])
+def api_annotations():
+    """Read-only annotation query surface (the future agent-query API).
+
+    Query params: ``event``, ``user``, ``label``, ``source``, ``since``,
+    ``until``, ``history`` (0/1). Default returns CURRENT annotations
+    (latest per event/user + current source per event); ``history=1``
+    returns the full audit trail. Timestamps are UTC ISO-8601 and the
+    since/until bounds compare lexicographically against them.
+    """
+    def _q(name):
+        v = request.args.get(name)
+        return v if (v is not None and v != "") else None
+
+    history = (request.args.get("history", "0").strip().lower()
+               in ("1", "true", "yes"))
+    try:
+        rows = ann.query_annotations(
+            event=_q("event"), user=_q("user"), label=_q("label"),
+            source=_q("source"), since=_q("since"), until=_q("until"),
+            history=history,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "history": history, "annotations": rows})
+
+
+@app.route("/api/annotations/vocab", methods=["GET"])
+def api_annotations_vocab():
+    return jsonify({"ok": True, **ann.vocab()})
 
 
 # ---------- API ------------------------------------------------------------
