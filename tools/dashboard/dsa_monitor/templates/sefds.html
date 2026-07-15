@@ -207,6 +207,11 @@
             {% if pipeline_weights.transit_age_hours is not none %}
             <span class="cal-age{% if pipeline_weights.due_for_update %} warn{% endif %}">({{ '%.1f'|format(pipeline_weights.transit_age_hours) }}&nbsp;h ago)</span>
             {% endif %}
+            {% if pipeline_weights.solution_provenance == 'etcd' %}
+            <span class="muted"
+                  title="applied/ weights archive not visible on this host; /mon/cal/bfweights is republished by the auto-cal stack on every solved transit, so this may name a solution that was never distributed to the corr nodes">
+                (per <code>/mon/cal/bfweights</code> &mdash; unverified against the applied archive)</span>
+            {% endif %}
         </span>
         {% endif %}
     </div>
@@ -223,8 +228,9 @@
         </span>
         {% else %}
         <span class="muted">
-            no distributed solution reported
-            (<code>/mon/cal/bfweights</code> unreadable/empty)
+            no distributed solution found
+            (no fleet YAML in the <code>applied/</code> archive and
+            <code>/mon/cal/bfweights</code> unreadable/empty)
         </span>
         {% endif %}
 

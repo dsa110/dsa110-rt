@@ -6,16 +6,27 @@ nothing published *what a corr node actually loaded* -- fast-corr
 weights blob exactly once at process startup and never reports it
 again. This module cross-checks:
 
-* the last DISTRIBUTED solution, published by the calibration23
-  ``update_bfweights.py`` script to ``/mon/cal/bfweights``
-  (``{"cmd": "update_weights", "val": {"weight_files": [...],
-  "source": [...], ...}}`` -- ``weight_files`` entries embed the ISOT,
-  e.g. ``beamformer_weights_sb00_2026-07-11T19:17:00.dat``), against
+* the last DISTRIBUTED solution, read from the newest fleet YAML in
+  the ``applied/`` archive that ``update_bfweights.py`` writes at
+  distribution time (``beamformer_weights_<ISOT>.yaml`` with
+  ``source``/``caltime``/``weight_files``; the ``weight_files``
+  entries embed the exact ``.dat`` ISOT the corr nodes' rsynced
+  ``antennas.out`` carries, e.g.
+  ``beamformer_weights_sb00_2026-07-11T19:17:00.dat``), against
 
 * what each corr node's ``dsart_rt`` orchestrator actually LOADED at
   its last ``start`` verb, published to
   ``/mon/corr_rt/<cn>/cal_file`` (see
   ``dsart.services.dsart_rt.RtOrchestrator._publish_cal_file_mon``).
+
+The ``/mon/cal/bfweights`` etcd key is only a FALLBACK for hosts that
+can't see the ``applied/`` archive: the legacy auto-calibration stack
+republishes that key for every calibrator transit it solves (writing
+to ``generated/`` only, distributing nothing), so hours after a real
+distribution the key routinely names a newer, never-distributed
+solution -- e.g. 2026-07-15, where the fleet ran the 2253+161 night
+transit distributed at 14:13 UT while the key claimed the (solar
+contaminated) 0521+166 17:41 transit solved at 18:43.
 
 Older fleet nodes running dsart_rt from before this feature landed
 simply never write the ``cal_file`` sub-key -- that's the expected,
@@ -48,6 +59,13 @@ APPLIED_DIR = "/dataz/dsa110/operations/beamformer_weights/applied"
 _MJD_UNIX_EPOCH = 40587
 
 _ISOT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+#: A fleet YAML in ``applied/`` (no calibrator name in the filename --
+#: per-source solution YAMLs like ``beamformer_weights_0521+166_*.yaml``
+#: deliberately don't match).
+_FLEET_YAML_RE = re.compile(
+    r"^beamformer_weights_(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.yaml$"
+)
 
 
 def _age_hours_from_isot(isot: Optional[str]) -> Optional[float]:
@@ -154,6 +172,64 @@ def _transit_isot_fallback(distributed_isot: Optional[str]) -> Optional[str]:
     return None
 
 
+def _latest_applied_solution(
+    applied_dir: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """The last actually-distributed solution, from the ``applied/``
+    archive (ground truth: ``update_bfweights.py`` writes one fleet
+    YAML there per distribution, and ONLY per distribution).
+
+    Returns ``{"distributed_isot", "source", "caltime_mjd"}`` for the
+    newest fleet YAML, or None when the directory is absent/empty
+    (dev hosts without /dataz -> caller falls back to etcd).
+    ``distributed_isot`` prefers the ISOT embedded in the YAML's first
+    ``weight_files`` entry -- that is the mtime the rsynced
+    ``antennas.out`` carries on the corr nodes, so the stale
+    comparison against the per-node ``cal_file`` keys stays exact (the
+    YAML filename itself is written a few seconds later). ``source``
+    and ``caltime_mjd`` are None if the YAML is unreadable. Never
+    raises.
+    """
+    if applied_dir is None:
+        applied_dir = APPLIED_DIR
+    try:
+        names = os.listdir(applied_dir)
+    except OSError:
+        return None
+    latest: Optional[str] = None
+    for n in names:
+        m = _FLEET_YAML_RE.match(n)
+        # ISOT strings sort lexically == chronologically.
+        if m and (latest is None or m.group(1) > latest):
+            latest = m.group(1)
+    if latest is None:
+        return None
+    out: Dict[str, Any] = {
+        "distributed_isot": latest, "source": None, "caltime_mjd": None,
+    }
+    try:
+        import yaml  # local import -- same optionality as the fallback above
+        path = os.path.join(applied_dir, f"beamformer_weights_{latest}.yaml")
+        with open(path, "r") as f:
+            doc = yaml.safe_load(f)
+    except Exception:  # noqa: BLE001
+        return out
+    if not isinstance(doc, dict):
+        return out
+    src = doc.get("source")
+    if isinstance(src, list) and src:
+        src = src[0]
+    if isinstance(src, str):
+        out["source"] = src
+    out["caltime_mjd"] = _caltime_mjd(doc)
+    files = doc.get("weight_files")
+    if isinstance(files, list) and files:
+        m = _ISOT_RE.search(str(files[0]))
+        if m:
+            out["distributed_isot"] = m.group(0)
+    return out
+
+
 def _mtime_isot_sec(entry: Dict[str, Any]) -> Optional[str]:
     """Whole-second-precision ``YYYY-MM-DDTHH:MM:SS`` UTC ISOT for a
     per-node ``cal_file`` entry, used for consensus grouping/display.
@@ -214,10 +290,15 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     Returned shape::
 
         {
+          "solution_provenance": "applied_yaml" | "etcd" | None,
+                                     # where the solution identity came from:
+                                     # the applied/ archive (ground truth) or
+                                     # the /mon/cal/bfweights fallback (may name
+                                     # a never-distributed auto-cal solution)
           "transit_isot": str | None,        # calibrator transit that produced the solution (caltime, UTC)
           "transit_age_hours": float | None,  # hours since transit_isot (UTC) -- PRIMARY staleness clock
           "due_for_update": bool,            # transit_age_hours > 48 (expected cadence ~2 days)
-          "distributed_isot": str | None,    # fleet-YAML write time (secondary clock)
+          "distributed_isot": str | None,    # .dat ISOT of the distributed weights (secondary clock)
           "distributed_age_hours": float | None,  # hours since distributed_isot (UTC)
           "distributed_source": str | None,
           "n_total": int,            # 16 corr nodes
@@ -239,13 +320,33 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     weights can differ by a few hundred microseconds in ``mtime_isot``,
     which would otherwise show up as spurious disagreement.
     """
-    try:
-        bfweights_doc = etcd_store.get_dict(BFWEIGHTS_KEY)
-    except Exception:  # noqa: BLE001
-        bfweights_doc = None
-    distributed_isot = _distributed_isot(bfweights_doc)
-    distributed_source = _distributed_source(bfweights_doc)
-    transit_isot = _transit_isot(bfweights_doc, distributed_isot)
+    applied = _latest_applied_solution()
+    if applied is not None:
+        # Ground truth: the applied/ archive gains a fleet YAML only
+        # when update_bfweights actually distributed weights.
+        solution_provenance: Optional[str] = "applied_yaml"
+        distributed_isot = applied["distributed_isot"]
+        distributed_source = applied["source"]
+        mjd = applied["caltime_mjd"]
+        transit_isot = (
+            _mjd_to_isot(mjd) if mjd is not None
+            else _transit_isot_fallback(distributed_isot)
+        )
+    else:
+        # No applied/ archive visible (dev host): fall back to the
+        # /mon/cal/bfweights key -- which the auto-cal stack clobbers
+        # per solved transit, so it may name a never-distributed
+        # solution (see module docstring).
+        try:
+            bfweights_doc = etcd_store.get_dict(BFWEIGHTS_KEY)
+        except Exception:  # noqa: BLE001
+            bfweights_doc = None
+        solution_provenance = (
+            "etcd" if isinstance(bfweights_doc, dict) else None
+        )
+        distributed_isot = _distributed_isot(bfweights_doc)
+        distributed_source = _distributed_source(bfweights_doc)
+        transit_isot = _transit_isot(bfweights_doc, distributed_isot)
     transit_age_hours = _age_hours_from_isot(transit_isot)
 
     nodes: List[Dict[str, Any]] = []
@@ -293,6 +394,7 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
     )
 
     return {
+        "solution_provenance": solution_provenance,
         "transit_isot": transit_isot,
         "transit_age_hours": transit_age_hours,
         "due_for_update": bool(
