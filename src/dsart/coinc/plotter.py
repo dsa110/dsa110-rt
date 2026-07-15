@@ -1150,20 +1150,32 @@ def _render_dm_time(
         )
     ax.set_title(title, fontsize=10)
     # Legend lives below the axes so it never overlaps the waterfall,
-    # title, axis labels, or colorbar. Renders correctly even when only
-    # the white × exists (coords/burst_row is None: matplotlib just
-    # emits the single handle). The frame is deep slate-navy so the
-    # white × glyph is legible on the white figure background (the red
-    # + #ff2d55 still contrasts fine on #262b36).
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
+    # title, axis labels, or colorbar. No frame: plain text on the white
+    # figure margin. The in-axes × marker is pure white (legible on the
+    # waterfall), which would be invisible on the white margin, so the
+    # legend uses proxy handles only — a filled "X" with a grey edge for
+    # the apex marker; the data markers themselves are untouched.
+    from matplotlib.lines import Line2D
+    proxy_handles = []
+    if finite.size:
+        proxy_handles.append(Line2D(
+            [], [], linestyle="none", marker="X",
+            markerfacecolor="white", markeredgecolor="#555555",
+            markeredgewidth=0.8, markersize=9,
+            label="brightest point of displayed data",
+        ))
+    if coords is not None and burst_row is not None \
+            and coords.t_idx is not None:
+        proxy_handles.append(Line2D(
+            [], [], linestyle="none", marker="+",
+            color="#ff2d55", markeredgewidth=2, markersize=10,
+            label="detector-reported burst",
+        ))
+    if proxy_handles:
         ax.legend(
-            handles, labels, loc="upper center",
+            handles=proxy_handles, loc="upper center",
             bbox_to_anchor=(0.5, -0.09), ncol=2, fontsize=9,
-            frameon=True, fancybox=True, framealpha=0.95,
-            facecolor="#262b36", edgecolor="none",
-            labelcolor="#e6e8eb", borderpad=0.6,
-            handletextpad=0.5, columnspacing=1.4,
+            frameon=False, labelcolor="#3b4252",
         )
     fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(path, dpi=110)
@@ -1208,10 +1220,15 @@ def _render_image_peak(
         f"burst (l,m)=({coords.l_pix},{coords.m_pix})" + _provenance(coords)
     )
     ax.set_title(title, fontsize=9)
-    fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
+    # Caption y + rect bottom are tuned so the caption line sits on the
+    # same displayed horizontal as the dm_time legend line: the two PNGs
+    # (1100x990 @ dpi 110 and 620x560 @ dpi 100) render side by side at
+    # equal width on the dashboard, and their aspect ratios are ~equal,
+    # so equal figure-fraction height = equal on-screen line.
+    fig.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
     fig.text(
-        0.5, 0.01, "red circle = burst position reported by the detector",
-        ha="center", va="bottom", fontsize=8, color="0.4",
+        0.5, 0.08, "red circle = burst position reported by the detector",
+        ha="center", va="bottom", fontsize=9, color="#3b4252",
     )
     fig.savefig(path, dpi=100)
     plt.close(fig)
