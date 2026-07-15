@@ -268,8 +268,10 @@
     <h2>C3-rejected events ({{ events_fail|length }})</h2>
     <div class="muted">
         High-confidence false positives per the C3 cube-morphology veto
-        (rules shown per event; hover for notes). In flag-only mode
-        nothing is deleted — cubes/metadata stay browsable.
+        (rules shown per event; hover for notes). Since 2026-07-15 the
+        veto deletes rejected events' cubes and moves their metadata to
+        <code>candidates_rejected/</code> — the inspection plots stay
+        behind and remain viewable on each event page.
     </div>
     {{ event_table(events_fail, 'fail') }}
 </div>

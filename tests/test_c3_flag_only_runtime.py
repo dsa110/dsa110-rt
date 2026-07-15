@@ -111,6 +111,9 @@ def _seed_reject_event(svc, cfg, name: str = "260101abcd") -> Path:
     (ev_dir / "Level3" / f"{name}.json").write_text("{}")
     (ev_dir / "cubes").mkdir(parents=True, exist_ok=True)
     (ev_dir / "cubes" / "x.npz").write_bytes(b"\x00" * 8)
+    (ev_dir / "Level2" / "plots").mkdir(parents=True, exist_ok=True)
+    (ev_dir / "Level2" / "plots" / "panel.png").write_bytes(b"PNG")
+    (ev_dir / "Level2" / f"C2_{name}.csv").write_text("a\n1\n")
     return ev_dir
 
 
@@ -170,4 +173,10 @@ def test_reject_override_enables_delete(tmp_path, monkeypatch) -> None:
     # Cube deleted; metadata moved to rejected_root.
     assert not (ev_dir / "cubes" / "x.npz").exists()
     assert (cfg.rejected_root / name / "Level3").exists()
+    assert (cfg.rejected_root / name / "Level2" / f"C2_{name}.csv").exists()
+    # ...but the inspection plots stay with the tombstone so the
+    # dashboard event page keeps rendering them (2026-07-15).
+    assert (ev_dir / "Level2" / "plots" / "panel.png").exists()
+    assert not (cfg.rejected_root / name / "Level2" / "plots").exists()
+    assert rec["reject"]["plots_kept"] == 1
     assert svc._counters["rejected"] == 1

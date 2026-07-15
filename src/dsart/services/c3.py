@@ -61,6 +61,13 @@ from ..coinc.voltage_collect import (
 
 LOG = logging.getLogger("dsart.services.c3")
 
+
+def _count_pngs(d: Path) -> int:
+    try:
+        return sum(1 for _ in d.glob("*.png"))
+    except OSError:
+        return 0
+
 __all__ = ["C3Config", "C3Service", "C3_FLAG_ONLY_KEY", "main"]
 
 #: Runtime override key for the keep/delete mode, written by the
@@ -497,17 +504,30 @@ class C3Service:
                     LOG.warning("could not delete cube %s: %s", cf, exc)
         actions["cubes_deleted"] = n_cubes_deleted
 
-        # 3. move metadata + plots aside (never rm the dir)
+        # 3. move metadata aside (never rm the dir) — EXCEPT the
+        # inspection plots (Level2/plots/*.png, ~1 MB/event): those stay
+        # in the original candidate dir so the dashboard's event page
+        # keeps rendering them for rejected events (operator request
+        # 2026-07-15 — cheap artifacts for auditing the veto's
+        # judgment after the cubes are gone).
         rej_dir = self._cfg.rejected_root / name
         try:
             rej_dir.mkdir(parents=True, exist_ok=True)
-            for sub in ("Level2", "Level3"):
-                src = ev_dir / sub
-                if src.exists():
-                    shutil.move(str(src), str(rej_dir / sub))
+            l2_src = ev_dir / "Level2"
+            if l2_src.exists():
+                l2_dst = rej_dir / "Level2"
+                l2_dst.mkdir(parents=True, exist_ok=True)
+                for child in sorted(l2_src.iterdir()):
+                    if child.name == "plots":
+                        continue                # keep with the tombstone
+                    shutil.move(str(child), str(l2_dst / child.name))
+            l3_src = ev_dir / "Level3"
+            if l3_src.exists():
+                shutil.move(str(l3_src), str(rej_dir / "Level3"))
             # leave the (now cube-less / voltage-less) original dir as a
             # tombstone; remove only if it is empty of bulky data.
             actions["moved_to"] = str(rej_dir)
+            actions["plots_kept"] = _count_pngs(ev_dir / "Level2" / "plots")
             self._write_audit(name, rej_dir, {"event_name": name})
         except OSError as exc:
             LOG.warning("reject move failed for %s: %s", name, exc)
