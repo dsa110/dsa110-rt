@@ -480,7 +480,7 @@ routines:
       --sumthr-eta 1.5
       --rfi-m-values 64,256,1024,4096
       --t-int-fast-native 32
-      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_v3.npz
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --chan-sum-factor 8
       --cell-lambda-mode tee45
       --sliding-window

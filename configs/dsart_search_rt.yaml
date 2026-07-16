@@ -219,7 +219,7 @@ routines:
       --n-fdm 34 --t-det 256 --n-grid 256
       --cube-cadence-samples 192
       --t-int-search-us 1048.576
-      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_v3.npz
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --fan-in-min-corrs 15
       --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
@@ -307,7 +307,7 @@ routines:
       --n-fdm 34 --t-det 256 --n-grid 256
       --cube-cadence-samples 192
       --t-int-search-us 1048.576
-      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_v3.npz
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --fan-in-min-corrs 15
       --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
