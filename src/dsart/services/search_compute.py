@@ -700,13 +700,23 @@ class SearchComputeService:
         # would tag cubes with ``mjd_start ≈ 0`` (= MJD 0 = year 1858),
         # which collapses every restart's batches into the same
         # signal-time window on the C2 side and creates an immortal
-        # cluster. ``_geom_from_slot`` checks this override first; the
-        # value is latched once on the very first cube using the
-        # wall-clock at that moment minus the first cube's specnum
-        # offset (good to a few ms — well under C2's window of 5 s).
+        # cluster. ``_geom_from_slot`` checks this override first.
         # An operator that sets ``mjd_at_specnum_0`` explicitly (i.e.
         # not 0.0) wins; the override is only filled when the cfg is
-        # at the placeholder.
+        # at the placeholder, once, on the very first cube:
+        #
+        # 1. (2026-07-16) preferred: the capture arm record in etcd
+        #    (``/mon/snap/1/armed_mjd``) — search specnums are
+        #    zero-based at capture start, so ``mjd_at_specnum_0 ==
+        #    armed_mjd``. This puts C1/C2 labels on the SAME absolute
+        #    time base as the slow-vis (dsamfs) HDF5 archive.
+        # 2. fallback: the wall clock at the first cube minus the first
+        #    cube's specnum offset. Internally consistent (well under
+        #    C2's 5 s window) but ABSOLUTELY LATE by the capture→cube
+        #    pipeline fill latency — a per-restart constant of several
+        #    seconds (measured +4.9 s / +6.3 s on 2026-07-15/16 via
+        #    NVSS astrometry of voltage-dump images), which put a ~75"
+        #    RA bias on every voltage-derived localization.
         self._mjd_at_specnum_0_override: Optional[float] = None
 
     def _build_cube_uploader_callback(
@@ -1087,6 +1097,39 @@ class SearchComputeService:
     # Per-cube driver
     # -----------------------------------------------------------------
 
+    def _read_capture_anchor_mjd(self) -> Optional[float]:
+        """MJD of search-specnum 0 from the capture arm record in etcd.
+
+        ``/mon/snap/1/armed_mjd`` is stamped with the wall clock at the
+        ``utc_start`` verb (``dsart_rt._verb_utc_start``) — the same
+        anchor the slow-vis (dsamfs) UVH5 writer uses, so labels derived
+        from it land on the SAME absolute time base as the correlator
+        HDF5 archive. Search specnums are zero-based at capture start
+        (the corr-side readers attach before the arm and transport
+        carries the corr block numbering), so ``mjd_at_specnum_0 ==
+        armed_mjd``.
+
+        Returns None — caller falls back to the wall-clock latch — when
+        etcd/dsautils is unavailable or the stored value is implausible
+        (not within the last 30 days).
+        """
+        try:
+            from dsautils.dsa_store import DsaStore  # noqa: WPS433
+            doc = DsaStore().get_dict("/mon/snap/1/armed_mjd") or {}
+            val = float(doc.get("armed_mjd") or 0.0)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "capture-anchor etcd read failed (%s)", exc,
+            )
+            return None
+        now_mjd = 40587.0 + time.time() / 86400.0
+        if not (now_mjd - 30.0 < val <= now_mjd + 2.0 / 86400.0):
+            _LOG.warning(
+                "armed_mjd %.6f implausible (now %.6f)", val, now_mjd,
+            )
+            return None
+        return val
+
     def _geom_from_slot(self, slot: CubeRingSlot) -> CubeGeometry:
         """Build a ``CubeGeometry`` from the slot + the static config.
 
@@ -1120,20 +1163,54 @@ class SearchComputeService:
         # 131.072 µs default that compounded to 128× slow, stretching the C2
         # 5 s coincidence window to ~11 min (graph_size ≈ 300 instead of ~3).
         t_int_sample_us = cfg.cube_sample_period_us
-        # Latch the per-run wall-clock anchor on the first cube when the
-        # operator didn't pin ``mjd_at_specnum_0`` explicitly. The shift
-        # by ``-specnum_start * t_int_sample_us`` puts the anchor at the
-        # MJD that specnum 0 would have hit IF the run had started at
-        # specnum 0 at the same wall-clock cadence. UNIX epoch 1970-01-01
-        # = MJD 40587.0 exactly.
+        # Latch the per-run time anchor on the first cube when the
+        # operator didn't pin ``mjd_at_specnum_0`` explicitly. Preferred
+        # anchor is the capture arm record (armed_mjd, see __init__
+        # comment); fallback is the wall clock at this moment minus the
+        # first cube's specnum offset — internally consistent but LATE
+        # by the pipeline fill latency. UNIX epoch 1970-01-01 = MJD
+        # 40587.0 exactly.
         if self._mjd_at_specnum_0_override is None and cfg.mjd_at_specnum_0 == 0.0:
             wall_mjd_now = 40587.0 + time.time() / 86400.0
-            self._mjd_at_specnum_0_override = float(
+            wall_anchor = float(
                 wall_mjd_now
                 - slot.specnum_start * t_int_sample_us * 1e-6 / 86400.0
             )
+            etcd_anchor = self._read_capture_anchor_mjd()
+            if etcd_anchor is not None:
+                # Sanity: this first cube's implied label should lag the
+                # wall clock by the (positive, small) pipeline latency.
+                # A lag outside [-2, 120] s means the anchor is stale or
+                # the specnum zero-basing assumption is broken — fall
+                # back to the wall latch rather than mislabel by a lot.
+                lag_s = (wall_anchor - etcd_anchor) * 86400.0
+                if -2.0 <= lag_s <= 120.0:
+                    self._mjd_at_specnum_0_override = float(etcd_anchor)
+                    _LOG.info(
+                        "mjd_at_specnum_0 etcd anchor (armed_mjd): %.9f; "
+                        "first-cube label lags wall clock by %.2f s "
+                        "(pipeline fill latency; the wall latch would "
+                        "have run late by this much)",
+                        etcd_anchor, lag_s,
+                    )
+                else:
+                    _LOG.warning(
+                        "armed_mjd anchor %.9f inconsistent with wall "
+                        "latch %.9f (lag %.1f s outside [-2, 120]); "
+                        "using the wall-clock latch — absolute labels "
+                        "will be LATE by the pipeline fill latency",
+                        etcd_anchor, wall_anchor, lag_s,
+                    )
+                    self._mjd_at_specnum_0_override = wall_anchor
+            else:
+                _LOG.warning(
+                    "no capture arm record available; using the "
+                    "wall-clock latch — absolute labels will be LATE by "
+                    "the pipeline fill latency (seconds)"
+                )
+                self._mjd_at_specnum_0_override = wall_anchor
             _LOG.info(
-                "mjd_at_specnum_0 wall-clock latch: %.9f "
+                "mjd_at_specnum_0 latched: %.9f "
                 "(slot.specnum_start=%d, t_int_sample_us=%.6f)",
                 self._mjd_at_specnum_0_override,
                 int(slot.specnum_start),

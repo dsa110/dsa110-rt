@@ -536,3 +536,100 @@ async def test_chunk5_geom_from_slot_uses_config(tmp_path) -> None:
             break
     finally:
         await service.stop()
+
+
+@asyncio_test
+async def test_geom_mjd_anchor_prefers_capture_arm_record(tmp_path) -> None:
+    """With the placeholder mjd_at_specnum_0 (0.0), the first-cube latch
+    uses the etcd capture-arm anchor (armed_mjd) when available, so
+    labels land on the slow-vis absolute time base instead of running
+    late by the pipeline fill latency (2026-07-16 fix)."""
+    import time as _time
+
+    src = _build_synth_source(n_cubes=1, t_det=32, n_fdm=4, n_grid=8)
+    config = SearchComputeConfig(
+        pipeline=CubePipelineConfig(
+            n_grid=8, edge_mask_kernel_support=3,
+            cube_dtype=torch.float32, device="cpu",
+        ),
+        n_fdm=4,
+        cube_sample_period_us=131.072,
+        cube_sample_period_specnum=16,
+    )
+    service = SearchComputeService(config=config, source=src)
+    now_mjd = 40587.0 + _time.time() / 86400.0
+    anchor = now_mjd - 5.0 / 86400.0  # armed 5 s ago
+    service._read_capture_anchor_mjd = lambda: anchor  # type: ignore
+    await service.start()
+    try:
+        async for slot in src:
+            geom = service._geom_from_slot(slot)
+            expected = anchor + (
+                slot.specnum_start * 131.072e-6 / 86400.0
+            )
+            np.testing.assert_allclose(geom.mjd_start, expected)
+            assert service._mjd_at_specnum_0_override == anchor
+            break
+    finally:
+        await service.stop()
+
+
+@asyncio_test
+async def test_geom_mjd_anchor_falls_back_to_wall_latch(tmp_path) -> None:
+    """No etcd arm record -> the pre-existing wall-clock latch."""
+    import time as _time
+
+    src = _build_synth_source(n_cubes=1, t_det=32, n_fdm=4, n_grid=8)
+    config = SearchComputeConfig(
+        pipeline=CubePipelineConfig(
+            n_grid=8, edge_mask_kernel_support=3,
+            cube_dtype=torch.float32, device="cpu",
+        ),
+        n_fdm=4,
+        cube_sample_period_us=131.072,
+        cube_sample_period_specnum=16,
+    )
+    service = SearchComputeService(config=config, source=src)
+    service._read_capture_anchor_mjd = lambda: None  # type: ignore
+    await service.start()
+    try:
+        async for slot in src:
+            before = 40587.0 + _time.time() / 86400.0
+            geom = service._geom_from_slot(slot)
+            after = 40587.0 + _time.time() / 86400.0
+            assert before - 1e-6 <= geom.mjd_start <= after + 1e-6
+            break
+    finally:
+        await service.stop()
+
+
+@asyncio_test
+async def test_geom_mjd_anchor_rejects_stale_arm_record(tmp_path) -> None:
+    """An arm record inconsistent with the wall clock (lag outside
+    [-2, 120] s) is rejected in favour of the wall latch."""
+    import time as _time
+
+    src = _build_synth_source(n_cubes=1, t_det=32, n_fdm=4, n_grid=8)
+    config = SearchComputeConfig(
+        pipeline=CubePipelineConfig(
+            n_grid=8, edge_mask_kernel_support=3,
+            cube_dtype=torch.float32, device="cpu",
+        ),
+        n_fdm=4,
+        cube_sample_period_us=131.072,
+        cube_sample_period_specnum=16,
+    )
+    service = SearchComputeService(config=config, source=src)
+    now_mjd = 40587.0 + _time.time() / 86400.0
+    stale = now_mjd - 1000.0 / 86400.0  # armed "1000 s ago": lag > 120 s
+    service._read_capture_anchor_mjd = lambda: stale  # type: ignore
+    await service.start()
+    try:
+        async for slot in src:
+            before = 40587.0 + _time.time() / 86400.0
+            geom = service._geom_from_slot(slot)
+            after = 40587.0 + _time.time() / 86400.0
+            assert before - 1e-6 <= geom.mjd_start <= after + 1e-6
+            break
+    finally:
+        await service.stop()

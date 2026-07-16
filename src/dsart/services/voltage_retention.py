@@ -46,7 +46,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from ..common.constants import FADA_BYTES_PER_BLOCK
+from ..common.constants import BLOCK_DURATION_S, FADA_BYTES_PER_BLOCK
 from ..dump.voltage_ring import VoltageRing, specnum_to_block_n
 from ..dump.voltage_trigger_listener import (
     VoltageTriggerListener,
@@ -118,6 +118,8 @@ def write_window_to_staging(
     n_pre: int,
     n_post: int,
     mjd_target: float = 0.0,
+    utc_start_specnum: Optional[int] = None,
+    armed_mjd: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Extract the dump window from ``ring`` and write it to staging.
 
@@ -157,6 +159,26 @@ def write_window_to_staging(
         "bytes_per_block": int(ring.bytes_per_block),
         "total_bytes": int(n_written * ring.bytes_per_block),
         "mjd_target": float(mjd_target),
+        # 2026-07-16 absolute-time provenance: the capture arm record.
+        # armed_mjd (wall MJD at the utc_start verb) + block numbering
+        # gives sample times on the SAME base as the slow-vis HDF5
+        # archive, independent of the C2 label (which historically ran
+        # LATE by the search pipeline's first-cube fill latency).
+        # block_n counts from 1 for the first armed block, so
+        #   t(block N start) = armed_mjd + (N - 1) * BLOCK_DURATION_S.
+        "utc_start_specnum": (
+            int(utc_start_specnum) if utc_start_specnum is not None
+            else None
+        ),
+        "armed_mjd": (
+            float(armed_mjd) if armed_mjd is not None else None
+        ),
+        "block_mjd_first": (
+            float(armed_mjd)
+            + (extract.first_block_n - 1) * BLOCK_DURATION_S / 86400.0
+            if armed_mjd is not None and extract.first_block_n is not None
+            else None
+        ),
         "ring_newest_block_n": int(ring.newest_block_n),
         "ring_oldest_block_n": int(ring.oldest_block_n),
         "written_at_unix": time.time(),
@@ -211,6 +233,15 @@ class _StoreWrapper:
         except Exception:  # noqa: BLE001
             LOG.exception("etcd put_dict(%s) failed", key)
 
+    def get_dict(self, key: str) -> Optional[Dict[str, Any]]:
+        if not self._available or self._store is None:
+            return None
+        try:
+            return self._store.get_dict(key)
+        except Exception:  # noqa: BLE001
+            LOG.warning("etcd get_dict(%s) failed", key)
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Service
@@ -228,6 +259,13 @@ class VoltageRetentionService:
         ring: Optional[VoltageRing] = None,
     ) -> None:
         self._cfg = config
+        # absolute-time provenance for manifests (2026-07-16): the fada
+        # header's UTC_START (SNAP-wall specnum the capture armed at)
+        # captured by the reader thread, and armed_mjd from etcd read
+        # lazily at the first dump.
+        self._utc_start_specnum: Optional[int] = None
+        self._armed_mjd: Optional[float] = None
+        self._armed_mjd_read = False
         self._ring = ring or VoltageRing(
             n_blocks=config.retention_blocks,
             bytes_per_block=FADA_BYTES_PER_BLOCK,
@@ -283,6 +321,10 @@ class VoltageRetentionService:
                 "voltage_retention: fada attached (%d hdr keys, UTC_START=%s)",
                 len(hdr), hdr.get("UTC_START", "?"),
             )
+            try:
+                self._utc_start_specnum = int(hdr.get("UTC_START"))
+            except (TypeError, ValueError):
+                self._utc_start_specnum = None
             block_n = 0
             while not self._stop.is_set():
                 try:
@@ -347,6 +389,16 @@ class VoltageRetentionService:
                     continue
                 target = specnum_to_block_n(specnum)
                 self._wait_for_post(target)
+                if not self._armed_mjd_read:
+                    # once per process; the arm record is fixed for the
+                    # lifetime of this capture epoch
+                    self._armed_mjd_read = True
+                    doc = self._mon_store.get_dict("/mon/snap/1/armed_mjd") or {}
+                    try:
+                        v = float(doc.get("armed_mjd") or 0.0)
+                        self._armed_mjd = v if v > 40000.0 else None
+                    except (TypeError, ValueError):
+                        self._armed_mjd = None
                 manifest = write_window_to_staging(
                     ring=self._ring,
                     event_name=name,
@@ -357,6 +409,8 @@ class VoltageRetentionService:
                     n_pre=self._cfg.n_pre,
                     n_post=self._cfg.n_post,
                     mjd_target=mjd,
+                    utc_start_specnum=self._utc_start_specnum,
+                    armed_mjd=self._armed_mjd,
                 )
                 self._counters["blocks_dropped_total"] += int(
                     manifest["n_blocks_dropped"]
