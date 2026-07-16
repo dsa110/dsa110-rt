@@ -88,6 +88,25 @@ class GpuImagerConfig:
     cube_dtype: torch.dtype = torch.float16
     complex_dtype: torch.dtype = torch.complex32
     device: Optional[torch.device] = None
+    # Constant multiplied into the ``uv_batch`` immediately before the
+    # inverse FFT. At the default ``1.0`` the multiply is skipped
+    # entirely and the imager is bit-identical to the pre-prescale path.
+    #
+    # Physics: image-plane values ride at ~240 raw units per noise σ, so
+    # a burst ≳35σ drives the cfp16 ``irfft2``/``ifft2`` butterflies past
+    # the fp16 range (65504) to ±inf, which the cube-pipeline
+    # ``_clamp_inf_to_finite`` rewrites to the ±60000 plateau (see the
+    # 2026-06-10 fp16-overflow note in ``services/cube_pipeline.py``) —
+    # the recovered burst then saturates instead of scaling linearly.
+    # Setting ``imager_uv_prescale`` to ~1/256 moves the image-plane
+    # noise σ from ~240 raw units to ~1, so the FFT butterflies no longer
+    # overflow for bursts up to ~1e4 σ. Downstream is invariant: Layer-1
+    # re-estimates σ from the scaled cube every cube, so the detection
+    # statistic ``cube/σ`` is unchanged; only the raw dynamic range the
+    # fp16 FFT must represent shrinks. The multiply stays in the
+    # ``uv_batch`` dtype (a scalar multiply on complex32 is safe — the
+    # combine caps those values at ±2032).
+    imager_uv_prescale: float = 1.0
 
     def resolved_device(self) -> torch.device:
         """Return ``self.device`` or fall back to ``cuda`` / ``cpu``."""
@@ -318,6 +337,8 @@ class GpuImager:
         # efficiency without changing detector inputs.
         fft_batch_env = int(os.environ.get("DSART_IMAGER_FFT_BATCH", "12"))
         fft_batch = min(max(1, fft_batch_env), int(cfg.n_fdm))
+        prescale = float(cfg.imager_uv_prescale)
+        apply_prescale = prescale != 1.0
         # M7.7.4 real-output FFT: the dirty image is real, so combine the
         # conjugate fold into a Hermitian half-spectrum and use ``irfft2``
         # instead of ``ifft2 + .real``. Halves the uv-slab memory AND the
@@ -421,6 +442,13 @@ class GpuImager:
                     )
             if gpu_profile:
                 ev_b_combine_end.record()
+            # UV pre-scale (default 1.0 → skip): shrink the raw magnitude
+            # the fp16 FFT butterflies must carry so a bright burst no
+            # longer overflows to ±inf. Applied in the ``uv_batch`` dtype
+            # to the same ``[:n_batch, t_lo:T_det]`` slice both FFT paths
+            # read below. Guarded so prescale==1.0 adds zero ops.
+            if apply_prescale:
+                self.uv_batch[:n_batch, t_lo:cfg.t_det].mul_(prescale)
             # M7.7.2 carry-over: FFT and mask operate only on the
             # newly-imaged rows ``[t_lo : T_det]``. The image tensor
             # has leading-time-axis size ``t_det_local`` (== T_det

@@ -199,6 +199,7 @@ def dirty_image_from_uv_grid(
     uv_grid,
     *,
     out_dtype=None,
+    prescale: float = 1.0,
 ):
     """Compute the canonical Stokes-I dirty image.
 
@@ -217,6 +218,13 @@ def dirty_image_from_uv_grid(
             (typically float32 if input is complex64, float16 if
             complex32 — but torch doesn't expose complex32 ifft, so
             we compute in complex64 and downcast).
+        prescale: constant multiplied into ``uv_grid`` before the
+            inverse FFT (the reference-path mirror of
+            :attr:`dsart.image.imager_gpu.GpuImagerConfig.imager_uv_prescale`).
+            The FFT is linear, so ``dirty_image_from_uv_grid(c·V) ==
+            c·dirty_image_from_uv_grid(V)``; production uses ``c≈1/256``
+            to keep the fp16 FFT butterflies in range for bright bursts.
+            Default ``1.0`` skips the multiply (identity).
 
     Returns:
         Real ``[..., N_grid, N_grid]`` array/tensor of the same backend
@@ -228,11 +236,15 @@ def dirty_image_from_uv_grid(
         # complex64 once at the cuFFT plan boundary; we mirror that.
         if uv_grid.dtype == torch.complex32:
             uv_grid = uv_grid.to(torch.complex64)
+        if prescale != 1.0:
+            uv_grid = uv_grid * prescale
         out = _dirty_image_from_uv_grid_torch(uv_grid)
         if out_dtype is not None:
             out = out.to(out_dtype)
         return out
     arr = np.asarray(uv_grid)
+    if prescale != 1.0:
+        arr = arr * prescale
     out = _dirty_image_from_uv_grid_np(arr)
     if out_dtype is not None:
         out = out.astype(out_dtype, copy=False)

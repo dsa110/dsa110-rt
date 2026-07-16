@@ -173,6 +173,11 @@ class CubePipelineConfig:
             ``torch.complex64`` for the cf32 numerical-audit fallback).
             Must be compatible with ``cube_dtype``: complex32 →
             float16, complex64 → float32.
+        imager_uv_prescale: constant folded into the GPU imager's
+            uv_batch before the inverse FFT (see
+            ``GpuImagerConfig.imager_uv_prescale``). Default 1.0
+            (identity); ~1/256 keeps bright bursts inside the fp16 FFT
+            range without changing the σ-normalised detection statistic.
         quantise_target_max: clip target for the host-side
             cf → cint8 quantiser. The D25 default is 120 (leaves
             headroom for chgroup-summed roundoff).
@@ -200,6 +205,13 @@ class CubePipelineConfig:
     gpu_n_fdm: Optional[int] = None
     gpu_n_chgroup: int = N_CHGROUP
     gpu_complex_dtype: torch.dtype = torch.complex32
+    # Constant folded into the GPU imager's uv_batch before the inverse
+    # FFT (forwarded to ``GpuImagerConfig.imager_uv_prescale``). Default
+    # 1.0 is bit-identical to the pre-prescale path; production sets
+    # ~1/256 so bright bursts don't overflow the fp16 FFT butterflies.
+    # Layer-1 re-estimates σ from the scaled cube, so ``cube/σ`` (and
+    # therefore the detector) is invariant to this constant.
+    imager_uv_prescale: float = 1.0
     quantise_target_max: int = 120
     bake_quantise_scale: bool = True
     # M7.4 (fp16 imager safety):
@@ -1098,6 +1110,7 @@ class CubePipeline:
                 envelope_threshold=cfg.edge_mask_envelope_threshold,
                 cube_dtype=cfg.cube_dtype,
                 complex_dtype=cfg.gpu_complex_dtype,
+                imager_uv_prescale=cfg.imager_uv_prescale,
                 device=self._device,
             ))
             _LOG.info(

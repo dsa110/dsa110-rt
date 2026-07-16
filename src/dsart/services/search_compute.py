@@ -2118,6 +2118,7 @@ def _build_search_config_from_yaml(
     gpu_half: int,
     search_node_id: int,
     image_backend: str,
+    imager_uv_prescale: float,
     device: str,
     enable_clusterer: bool,
     enable_cube_dump: bool,
@@ -2150,6 +2151,10 @@ def _build_search_config_from_yaml(
     pipe_cfg = CubePipelineConfig(
         n_grid=int(n_grid),
         image_backend=image_backend,   # "cpu" or "gpu"
+        # UV pre-scale (default 1.0 → identity): keeps the cfp16 imager
+        # FFT linear for bright bursts. Layer-1 re-estimates σ from the
+        # scaled cube, so the detector's cube/σ statistic is invariant.
+        imager_uv_prescale=float(imager_uv_prescale),
         device=device,
         # M7.7.2 (Phase 1a): pin the GPU imager geometry + carry-over
         # re-imaging from the CLI so production stops re-imaging the
@@ -2830,6 +2835,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         gpu_half=args.gpu_half,
         search_node_id=args.search_node_id,
         image_backend=args.image_backend,
+        imager_uv_prescale=args.imager_uv_prescale,
         device=args.device,
         enable_clusterer=args.enable_clusterer,
         enable_cube_dump=args.enable_cube_dump,
@@ -3061,6 +3067,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="CubePipeline image backend (cpu / gpu). Default: cpu "
                         "for M7.2 bring-up; flip to gpu once a real GPU is "
                         "available on the search nodes.")
+    p.add_argument("--imager-uv-prescale", type=float, default=1.0,
+                   help="Constant folded into the GPU imager's uv_batch "
+                        "before the inverse FFT (GpuImagerConfig."
+                        "imager_uv_prescale). Default 1.0 (identity); set "
+                        "~0.00390625 (1/256) so bright bursts stay inside "
+                        "the fp16 FFT range. Layer-1 re-estimates sigma from "
+                        "the scaled cube, so cube/sigma is invariant.")
     p.add_argument("--detector-streaming-tile-size", type=int, default=256,
                    help="Streaming detector W-tile size (default 256 for "
                         "commissioning time-only bank on 2080 Ti).")
