@@ -712,6 +712,16 @@ coinc:
                                      # source regardless of candidate volume (the proximate cause of the C2
                                      # stall). Audit trail is still written for capped events; only the UDP
                                      # fan-out + plot scheduling are skipped. Set max=0 to disable the cap.
+  # 2026-07-17 RFI-storm guard headroom. The code default (100/60 s)
+  # is saturated by the nightly B1933+16 transit (~170-190 evaluated
+  # clusters/60 s at DM~158 for ~16 min), which suppressed EVERY
+  # dump-class trigger during the transit — including an unrelated
+  # 12.4-sigma DM-439 extragalactic candidate on 2026-07-17. 400/60 s
+  # is ~2x the observed transit peak. Dump volume stays bounded by
+  # dump_rate_max_per_window, per-class holdoffs, and the DM-comb +
+  # sidereal vetoes, so the storm guard is a last-resort backstop and
+  # can afford the headroom.
+  cluster_rate_max: 400
   # 2026-06-15 broadband-RFI ("DM comb") veto. An impulsive terrestrial signal deposits power at every
   # dispersion delay -> many trial DMs fire at the SAME (l,m)+time; the time-only clusterer splits the
   # non-adjacent firing trials into several co-located clusters, so the per-cluster dm_iqr cap never sees
