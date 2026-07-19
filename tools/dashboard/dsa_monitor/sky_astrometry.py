@@ -411,7 +411,11 @@ def select_in_fov(
     max_sources: int = 40,
 ) -> dict[str, np.ndarray]:
     """Subset of ``cat`` whose SIN-projected (l, m) fall inside the
-    square FOV, brightest-first, capped at ``max_sources``. Adds
+    square FOV, capped at ``max_sources``, ranked by APPARENT flux
+    (catalog flux × primary-beam attenuation at the source's offset —
+    monotonic in expected S/N since the image noise is uniform).
+    Ranking by raw catalog flux let bright far-off-beam sources
+    displace detectable near-center ones (2026-07-19). Adds
     ``l_rad`` / ``m_rad`` columns."""
     # Cheap pre-cut in dec (±FOV) before the trig.
     half_deg = np.rad2deg(fov_rad) / 2.0
@@ -423,7 +427,10 @@ def select_in_fov(
     half = fov_rad / 2.0
     inside = (np.abs(l) < half) & (np.abs(m) < half)
     idx = np.flatnonzero(pre)[inside]
-    order = np.argsort(-cat["flux_mjy"][idx])[:max_sources]
+    apparent = cat["flux_mjy"][idx] * pb_resp_power(
+        np.hypot(l[inside], m[inside]),
+    )
+    order = np.argsort(-apparent)[:max_sources]
     idx = idx[order]
     return {
         "name": cat["name"][idx],

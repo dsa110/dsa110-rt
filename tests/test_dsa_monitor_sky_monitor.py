@@ -764,3 +764,23 @@ def test_measure_source_peak_parabolic_recovers_subpixel_peak():
     assert peak > pix_peak                # refinement recovers
     assert peak == pytest.approx(true_peak, rel=0.1)
     assert abs(rr - (c + 0.5)) < 0.6 and abs(cc - (c + 0.5)) < 0.6
+
+
+def test_select_in_fov_ranks_by_apparent_flux():
+    """A bright source far off-beam must NOT displace a fainter source
+    near beam center: ranking is catalog flux x PB (expected S/N)."""
+    import sky_astrometry as sa2
+    # 3.2-deg FOV: J_edge at ~1.5 deg off-center (pb ≈ 0.147), J_center
+    # on-axis. 800 mJy × 0.147 ≈ 118 < 150 × 1.0 — apparent-flux
+    # ranking must pick the center source; raw-flux ranking would not.
+    cat = {
+        "name": np.array(["NVSS Jedge", "NVSS Jcenter"], dtype="U20"),
+        "ra_deg": np.array([10.0 + 1.5 / np.cos(np.deg2rad(16.0)), 10.0]),
+        "dec_deg": np.array([16.0, 16.0]),
+        "flux_mjy": np.array([800.0, 150.0]),
+    }
+    sel = sa2.select_in_fov(
+        cat, ra0_deg=10.0, dec0_deg=16.0, fov_rad=np.deg2rad(3.2),
+        max_sources=1,
+    )
+    assert sel["name"].tolist() == ["NVSS Jcenter"]
