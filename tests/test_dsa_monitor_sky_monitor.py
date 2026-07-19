@@ -735,4 +735,32 @@ def test_measure_astrometric_offset_finds_shift():
     res = sm.measure_astrometric_offset(
         img, median=0.0, sigma=1.0, nvss_rows=rows)
     assert res["z"] > 10
-    assert (res["drow_px"], res["dcol_px"]) == (4, -6)
+    assert res["drow_px"] == pytest.approx(4, abs=0.3)
+    assert res["dcol_px"] == pytest.approx(-6, abs=0.3)
+
+
+def test_measure_source_peak_parabolic_recovers_subpixel_peak():
+    """A band-limited PSF landing between pixels: the peak PIXEL
+    underestimates the continuous maximum; the parabolic refinement
+    recovers most of it (the critical-sampling S/N fix)."""
+    n = 64
+    # Band-limited point source at a half-pixel offset: build via the
+    # same UV route the frames use (uniform grid = sinc-like PSF), at
+    # 2x oversampling with a half-pixel shift baked into the phase.
+    uv = np.ones((n, n), dtype=np.complex64)
+    fx = np.fft.ifftshift(np.arange(n) - n // 2)
+    ramp = np.exp(-2j * np.pi * (0.5 / (2 * n)) *
+                  (fx[:, None] + fx[None, :]))
+    uv = (uv * np.fft.fftshift(ramp)).astype(np.complex64)
+    img = sm.dirty_image_from_uv(uv, oversample=2)
+    c = img.shape[0] // 2
+    true_peak = 1.0                       # unit source by construction
+    pix_peak = float(img.max())
+    assert pix_peak < 0.95 * true_peak    # pixel underestimates
+    snr, peak, rr, cc = sm.measure_source_peak(
+        img, row=c + 0.5, col=c + 0.5, median=0.0, sigma=0.1,
+        radius_pix=4.0,
+    )
+    assert peak > pix_peak                # refinement recovers
+    assert peak == pytest.approx(true_peak, rel=0.1)
+    assert abs(rr - (c + 0.5)) < 0.6 and abs(cc - (c + 0.5)) < 0.6

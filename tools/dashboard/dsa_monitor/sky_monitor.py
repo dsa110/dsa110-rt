@@ -388,11 +388,26 @@ def robust_sigma(img: np.ndarray) -> tuple[float, float]:
 
 
 #: NVSS overlay: flux cut and S/N aperture (peak pixel within this
-#: radius of the predicted position; ~7 px at the 12.8″ scale of the
-#: 512² frames — generous vs the ~1′ dirty-beam core + pointing slop).
-NVSS_MIN_MJY: float = 100.0
+#: radius of the predicted position). 2026-07-19: flux cut lowered
+#: 100 → 40 mJy (frame σ ≈ 8 mJy after the astrometry fixes, so
+#: ~40 mJy sources are detectable and were showing as unlabeled
+#: blobs) and the per-frame source cap raised 40 → 80 (a cap the
+#: FOV's bright-source count exceeded caused sources to drop in and
+#: out of the list — and their labels to flicker — as the field
+#: drifted).
+NVSS_MIN_MJY: float = 40.0
 NVSS_APERTURE_ARCSEC: float = 90.0
-NVSS_MAX_SOURCES: int = 40
+NVSS_MAX_SOURCES: int = 80
+
+#: Astrometric self-cal loop (2026-07-19): the per-frame xcorr
+#: self-check residual is fed back as an EMA'd (Δl, Δm) correction to
+#: the predicted positions (and the graticule), closing out the
+#: quasi-static ~(−4, −3) px residual (pointing / aberration / F21
+#: reference scale). Only updates on confident locks; hard-capped so
+#: a bad frame can't run the correction away.
+ASTROM_SELFCAL_MIN_Z: float = 15.0
+ASTROM_SELFCAL_GAIN: float = 0.5
+ASTROM_SELFCAL_MAX_PX: float = 15.0
 
 
 def measure_source_peak(
@@ -429,8 +444,34 @@ def measure_source_peak(
     vals = np.where(mask, win, -np.inf)
     flat = int(np.argmax(vals))
     pr, pc = np.unravel_index(flat, win.shape)
-    peak = float(win[pr, pc] - median)
-    return peak / sigma, peak, float(r0 + pr), float(c0 + pc)
+    gr, gc = r0 + int(pr), c0 + int(pc)
+    peak = float(image[gr, gc] - median)
+    row_pk, col_pk = float(gr), float(gc)
+    # Parabolic sub-pixel refinement (2026-07-19): at the frames' 2×
+    # oversampling the PSF main lobe is ~2-3 px wide, and the peak
+    # PIXEL underestimates a source landing between samples by up to
+    # ~10-20% depending on sub-pixel phase — a systematic S/N
+    # underestimate. A separable 3-point parabola through the peak
+    # recovers the continuous maximum to ~1-2%.
+    if 1 <= gr < n_pix - 1 and 1 <= gc < n_pix - 1:
+        v0 = float(image[gr, gc])
+        boost = 0.0
+        vr_m, vr_p = float(image[gr - 1, gc]), float(image[gr + 1, gc])
+        den = 2.0 * v0 - vr_m - vr_p
+        if den > 0:
+            dr_sub = 0.5 * (vr_p - vr_m) / den
+            if abs(dr_sub) <= 1.0:
+                boost += 0.25 * (vr_p - vr_m) * dr_sub
+                row_pk = gr + dr_sub
+        vc_m, vc_p = float(image[gr, gc - 1]), float(image[gr, gc + 1])
+        den = 2.0 * v0 - vc_m - vc_p
+        if den > 0:
+            dc_sub = 0.5 * (vc_p - vc_m) / den
+            if abs(dc_sub) <= 1.0:
+                boost += 0.25 * (vc_p - vc_m) * dc_sub
+                col_pk = gc + dc_sub
+        peak = v0 + boost - median
+    return peak / sigma, peak, row_pk, col_pk
 
 
 def measure_source_snr(
@@ -493,10 +534,21 @@ def measure_astrometric_offset(
     k = int(np.argmax(xc))
     r0, c0 = np.unravel_index(k, xc.shape)
     z = float((xc[r0, c0] - xc.mean()) / xc.std())
+    # Sub-pixel refinement of the correlation peak (3-point parabola
+    # per axis) so the self-cal feedback isn't quantised to whole px.
+    drow = float(r0 - n_pix // 2)
+    dcol = float(c0 - n_pix // 2)
+    if 1 <= r0 < n_pix - 1 and 1 <= c0 < n_pix - 1:
+        den = 2.0 * xc[r0, c0] - xc[r0 - 1, c0] - xc[r0 + 1, c0]
+        if den > 0:
+            drow += float(0.5 * (xc[r0 + 1, c0] - xc[r0 - 1, c0]) / den)
+        den = 2.0 * xc[r0, c0] - xc[r0, c0 - 1] - xc[r0, c0 + 1]
+        if den > 0:
+            dcol += float(0.5 * (xc[r0, c0 + 1] - xc[r0, c0 - 1]) / den)
     return {
         "z": z,
-        "drow_px": int(r0 - n_pix // 2),
-        "dcol_px": int(c0 - n_pix // 2),
+        "drow_px": round(drow, 2),
+        "dcol_px": round(dcol, 2),
         "n_sources": n_src,
     }
 
@@ -605,6 +657,7 @@ def render_annotated_png(
     veto_rows: Optional[list[dict[str, Any]]] = None,
     nvss_rows: Optional[list[dict[str, Any]]] = None,
     noise: Optional[dict[str, Any]] = None,
+    astrom_dlm_rad: Optional[tuple[float, float]] = None,
 ) -> None:
     """Write the sigma-stretched greyscale frame with an RA/Dec grid
     and a colorbar (2026-06-09 request; NVSS detection markers
@@ -645,6 +698,10 @@ def render_annotated_png(
     grid_kw = dict(color="#46d4ff", lw=0.6, alpha=0.55, zorder=3)
     lbl_kw = dict(color="#46d4ff", fontsize=7, alpha=0.9, zorder=4)
     cosd = max(np.cos(np.deg2rad(dec0_deg)), 1e-3)
+    # Astrometric self-cal offset, applied to the sky→image mapping
+    # (same correction the source predictions carry).
+    dl_off_deg = float(np.rad2deg((astrom_dlm_rad or (0.0, 0.0))[0]))
+    dm_off_deg = float(np.rad2deg((astrom_dlm_rad or (0.0, 0.0))[1]))
 
     dec_step = _nice_step(fov_deg)
     dec_vals = np.arange(
@@ -668,7 +725,8 @@ def render_annotated_png(
         l, m = sky_astrometry.sky_to_instrument_lm(
             l, m, dec0_deg=dec0_deg,
         )
-        ld, md = np.rad2deg(l), np.rad2deg(m)
+        ld = np.rad2deg(l) + dl_off_deg
+        md = np.rad2deg(m) + dm_off_deg
         ax.plot(ld, md, **grid_kw)
         ok = (np.abs(ld) < half) & (np.abs(md) < half * 0.98)
         if ok.any():
@@ -683,7 +741,8 @@ def render_annotated_png(
         l, m = sky_astrometry.sky_to_instrument_lm(
             l, m, dec0_deg=dec0_deg,
         )
-        ld, md = np.rad2deg(l), np.rad2deg(m)
+        ld = np.rad2deg(l) + dl_off_deg
+        md = np.rad2deg(m) + dm_off_deg
         ax.plot(ld, md, **grid_kw)
         ok = (np.abs(ld) < half * 0.98) & (np.abs(md) < half)
         if ok.any():
@@ -850,6 +909,7 @@ class SkyFrameStore:
                     veto_rows=annotate.get("veto_rows"),
                     nvss_rows=annotate.get("nvss_rows"),
                     noise=annotate.get("noise"),
+                    astrom_dlm_rad=annotate.get("astrom_dlm_rad"),
                 )
                 wrote_png = True
             except Exception:                              # noqa: BLE001
@@ -1087,6 +1147,10 @@ class SkyMonitor:
         from collections import deque
         self._hist: dict[int, Any] = {}
         self._deque = deque
+        # Astrometric self-cal state (rad, image-frame l/m): EMA of the
+        # per-frame xcorr residual, applied to predictions + graticule.
+        self._astrom_dl_rad: float = 0.0
+        self._astrom_dm_rad: float = 0.0
         try:
             self._seed_history_from_store()
         except Exception:                                # noqa: BLE001
@@ -1329,6 +1393,10 @@ class SkyMonitor:
                             sel["l_rad"][i], sel["m_rad"][i],
                             dec0_deg=dec0_apparent,
                         )
+                        # Astrometric self-cal correction (EMA of the
+                        # xcorr residual from previous frames).
+                        l_img = float(l_img) + self._astrom_dl_rad
+                        m_img = float(m_img) + self._astrom_dm_rad
                         if (abs(float(l_img)) > fov_rad / 2.0
                                 or abs(float(m_img)) > fov_rad / 2.0):
                             continue
@@ -1423,6 +1491,7 @@ class SkyMonitor:
                 # clock, pointing...) — this is the check that catches
                 # what apertures at wrong positions silently miss.
                 astrom_check: Optional[dict[str, Any]] = None
+                pix_rad = fov_rad / n_pix
                 if len(nvss_rows) >= 5:
                     try:
                         astrom_check = measure_astrometric_offset(
@@ -1431,6 +1500,34 @@ class SkyMonitor:
                         )
                     except Exception:                    # noqa: BLE001
                         LOG.exception("astrometric self-check failed")
+                # Self-cal feedback: fold a confident residual into the
+                # EMA correction (applied to NEXT frames' predictions;
+                # predictions in THIS frame already carry the previous
+                # correction, so astrom_check here is the residual).
+                if (
+                    astrom_check is not None
+                    and astrom_check["z"] >= ASTROM_SELFCAL_MIN_Z
+                    and astrom_check["drow_px"] is not None
+                    and abs(astrom_check["drow_px"]) <= ASTROM_SELFCAL_MAX_PX
+                    and abs(astrom_check["dcol_px"]) <= ASTROM_SELFCAL_MAX_PX
+                ):
+                    cap = ASTROM_SELFCAL_MAX_PX * pix_rad
+                    self._astrom_dl_rad = float(np.clip(
+                        self._astrom_dl_rad
+                        + ASTROM_SELFCAL_GAIN
+                        * astrom_check["dcol_px"] * pix_rad,
+                        -cap, cap,
+                    ))
+                    self._astrom_dm_rad = float(np.clip(
+                        self._astrom_dm_rad
+                        + ASTROM_SELFCAL_GAIN
+                        * astrom_check["drow_px"] * pix_rad,
+                        -cap, cap,
+                    ))
+                astrom_applied = {
+                    "dl_px": round(self._astrom_dl_rad / pix_rad, 2),
+                    "dm_px": round(self._astrom_dm_rad / pix_rad, 2),
+                }
                 noise = {
                     "static_sub_ready": static_sub_ready,
                     "sigma_mjy": sigma_mjy,
@@ -1449,6 +1546,9 @@ class SkyMonitor:
                     "veto_rows": veto_rows,
                     "noise": noise,
                     "astrom_check": astrom_check,
+                    "astrom_dlm_rad": (
+                        self._astrom_dl_rad, self._astrom_dm_rad,
+                    ),
                     "raw_snapshots": fresh,
                 }
                 astro = {
@@ -1457,6 +1557,7 @@ class SkyMonitor:
                     "radec_epoch": "ICRS/J2000",
                     "dec0_apparent_deg": dec0_apparent,
                     "astrom_check": astrom_check,
+                    "astrom_applied": astrom_applied,
                     "lst_h": sky_astrometry.lst_deg(t_ref) / 15.0,
                     "fov_deg": float(np.rad2deg(fov_rad)),
                     "pix_arcsec": pix_arcsec,
