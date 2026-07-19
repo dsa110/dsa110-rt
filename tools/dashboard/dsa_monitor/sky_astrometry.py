@@ -46,6 +46,14 @@ LOG = logging.getLogger("dsa_monitor.sky_astrometry")
 OVRO_LON_DEG: float = -118.283
 OVRO_LAT_DEG: float = 37.2334
 
+#: Sidereal rate (rad of RA per SI second). The drift-scan phase
+#: center advances at this rate; used to re-reference per-chgroup
+#: snapshots taken at different data times to a common frame time.
+SIDEREAL_RATE_RAD_PER_S: float = 7.292115855e-5
+
+#: DSA-110 dish diameter used by the canonical dsacalib beam model.
+DISH_DIA_M: float = 4.7
+
 #: Default HEASARC NVSS tdat dump on h23 (user-provided 2026-06-09).
 NVSS_TDAT_DEFAULT: str = (
     "/home/ubuntu/proj/dsa110-shell/dsa110-calib/dsacalib/data/"
@@ -134,6 +142,32 @@ def lm_to_pix(
     row = np.asarray(m, dtype=np.float64) / scale + n_pix // 2
     col = np.asarray(l, dtype=np.float64) / scale + n_pix // 2
     return row, col
+
+
+def pb_resp_power(
+    theta_rad: np.ndarray | float,
+    *,
+    freq_ghz: float = 1.405,
+    dish_dia_m: float = DISH_DIA_M,
+) -> np.ndarray:
+    """DSA-110 interferometric primary-beam attenuation vs offset.
+
+    Byte-matches ``dsacalib.fringestopping.pb_resp`` (tapered
+    illumination): ``(cos(π·x)/(1 − 4x²))⁴`` with
+    ``x = 1.2 · θ · D / λ``. The 4th power is the two-antenna
+    *visibility-domain* response (voltage² per dish, two dishes) —
+    the factor a source's flux is multiplied by in a dirty image made
+    from uncorrected drift-scan visibilities. FWHM ≈ 1.8° at band
+    center 1.405 GHz.
+    """
+    theta = np.abs(np.asarray(theta_rad, dtype=np.float64))
+    lam = 0.299792458 / float(freq_ghz)
+    x = 1.2 * theta * float(dish_dia_m) / lam
+    # The (1 − 4x²) denominator has a removable singularity at x=0.5
+    # (numerator cos(π/2)=0); nudge x off it.
+    x = np.where(np.abs(np.abs(x) - 0.5) < 1e-9, x + 1e-8, x)
+    resp = (np.cos(np.pi * x) / (1.0 - 4.0 * x * x)) ** 4
+    return np.clip(resp, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +348,9 @@ def select_in_fov(
 __all__ = [
     "OVRO_LON_DEG",
     "OVRO_LAT_DEG",
+    "SIDEREAL_RATE_RAD_PER_S",
+    "DISH_DIA_M",
+    "pb_resp_power",
     "NVSS_TDAT_DEFAULT",
     "NvssCatalog",
     "load_nvss",

@@ -102,7 +102,7 @@ def test_combine_applies_amp_scale_weight():
         "ix_col": np.array([1, 2, 3, 4], dtype=np.uint16),
         "meta": {"chgroup": 0, "n_grid": N_GRID, "amp_scale": 2.0},
     }
-    uv, used = sm.combine_chgroups_to_uv([snap], n_grid=N_GRID)
+    uv, used, _cs = sm.combine_chgroups_to_uv([snap], n_grid=N_GRID)
     assert used == [0]
     # weight = 1/amp_scale² = 0.25 → 2.0 * 0.25 = 0.5
     assert uv[1, 1] == pytest.approx(0.5)
@@ -115,7 +115,7 @@ def test_combine_skips_mismatched_n_grid():
         "ix_col": np.array([0, 1], dtype=np.uint16),
         "meta": {"chgroup": 4, "n_grid": 999, "amp_scale": 1.0},
     }
-    uv, used = sm.combine_chgroups_to_uv([snap], n_grid=N_GRID)
+    uv, used, _cs = sm.combine_chgroups_to_uv([snap], n_grid=N_GRID)
     assert used == []
     assert not uv.any()
 
@@ -485,3 +485,190 @@ def test_status_reports_freshness(tmp_path):
     assert st["chgroups"]["2"]["age_s"] == pytest.approx(12.0)
     assert st["chgroups"]["2"]["hostname"] == "n05"
     assert st["n_ingested"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-18: data-time alignment + noise / SEFD reporting
+# ---------------------------------------------------------------------------
+
+
+def _sparse_from_uv(uv: np.ndarray, *, chgroup: int, cell_lambda: float,
+                    dec_deg: float = 16.27) -> dict:
+    """Full-coverage sparse snapshot dict wrapping a dense UV grid."""
+    n = uv.shape[0]
+    rows, cols = np.mgrid[0:n, 0:n]
+    return {
+        "vis": uv.reshape(-1).astype(np.complex64),
+        "ix_row": rows.reshape(-1).astype(np.uint16),
+        "ix_col": cols.reshape(-1).astype(np.uint16),
+        "meta": {
+            "chgroup": chgroup,
+            "n_grid": n,
+            "amp_scale": 1.0,
+            "cell_lambda": cell_lambda,
+            "dec_deg": dec_deg,
+        },
+    }
+
+
+def test_combine_align_ramp_translates_image():
+    """The align phase ramp moves a chgroup's image by exactly +Δl.
+
+    Physics scenario: chgroup B's snapshot is Δt EARLIER in data time,
+    so its sources sit EAST (larger l / larger col) of the reference;
+    the builder passes Δl = −cosδ·ω·Δt (negative) which must pull them
+    WEST onto the reference position.
+    """
+    cell_lambda = 17.9
+    fov = 1.0 / cell_lambda
+    pix_rad = fov / N_GRID
+    ref_col, row = N_GRID // 2 + 5, N_GRID // 2
+
+    uv_ref = _uv_for_point_source(row, ref_col)
+    uv_east = _uv_for_point_source(row, ref_col + 3)      # 3 px east
+
+    snaps = [
+        _sparse_from_uv(uv_ref, chgroup=0, cell_lambda=cell_lambda),
+        _sparse_from_uv(uv_east, chgroup=1, cell_lambda=cell_lambda),
+    ]
+    # Unaligned: two separated unit peaks.
+    uv0, used0, _cs0 = sm.combine_chgroups_to_uv(snaps, n_grid=N_GRID)
+    img0 = sm.dirty_image_from_uv(uv0)
+    assert used0 == [0, 1]
+    assert img0[row, ref_col] == pytest.approx(1.0, abs=1e-3)
+    assert img0[row, ref_col + 3] == pytest.approx(1.0, abs=1e-3)
+
+    # Aligned: chgroup 1 shifted WEST by 3 px → single 2.0 peak.
+    align = {0: 0.0, 1: -3.0 * pix_rad}
+    uv1, _, _cs1 = sm.combine_chgroups_to_uv(
+        snaps, n_grid=N_GRID, align_dl_rad=align,
+    )
+    img1 = sm.dirty_image_from_uv(uv1)
+    assert img1[row, ref_col] == pytest.approx(2.0, abs=1e-2)
+    assert img1[row, ref_col + 3] < 0.1
+
+
+def test_snapshot_data_mid_unix_prefers_arm_anchor():
+    armed_unix = 1_784_000_000.0
+    wb = 8
+    meta = {
+        "block_n": 100_000,
+        "window_blocks": wb,
+        "unix_ts": armed_unix + 100_000 * sm.BLOCK_S + 1.96,  # 2 s lag
+    }
+    t = sm.snapshot_data_mid_unix(meta, armed_unix=armed_unix)
+    expect = armed_unix + 100_000 * sm.BLOCK_S - (wb - 1) / 2 * sm.BLOCK_S
+    assert t == pytest.approx(expect, abs=1e-6)
+
+    # No arm anchor → wall clock minus measured export lag.
+    t2 = sm.snapshot_data_mid_unix(meta, armed_unix=None)
+    expect2 = (meta["unix_ts"] - sm.EXPORT_LAG_FALLBACK_S
+               - (wb - 1) / 2 * sm.BLOCK_S)
+    assert t2 == pytest.approx(expect2, abs=1e-6)
+
+    # Stale arm anchor (re-arm happened): block time disagrees with the
+    # corr wall clock by minutes → fall back to the wall clock.
+    t3 = sm.snapshot_data_mid_unix(meta, armed_unix=armed_unix + 300.0)
+    assert t3 == pytest.approx(expect2, abs=1e-6)
+
+
+def test_pb_resp_power_shape():
+    import sky_astrometry as sa2
+    assert float(sa2.pb_resp_power(0.0)) == pytest.approx(1.0)
+    # Monotone decline over the main lobe; FWHM ~1.8 deg at 1.405 GHz.
+    th = np.deg2rad(np.array([0.4, 0.9, 1.3]))
+    pb = sa2.pb_resp_power(th)
+    assert 0.6 < pb[0] < 0.95
+    assert 0.35 < pb[1] < 0.65          # HWHM ≈ 0.9 deg
+    assert pb[2] < pb[1] < pb[0]
+
+
+def test_fit_flux_scale_and_sefd_math():
+    rows = [
+        {"snr": 40.0, "peak": 2.0e-3, "pb": 1.0, "flux_mjy": 1000.0},
+        {"snr": 16.0, "peak": 8.0e-4, "pb": 0.8, "flux_mjy": 500.0},
+        {"snr": 3.0, "peak": 1.0e-4, "pb": 1.0, "flux_mjy": 50.0},   # below snr
+        {"snr": 20.0, "peak": 5.0e-4, "pb": 0.05, "flux_mjy": 5000.0},  # low pb
+    ]
+    k, n = sm.fit_flux_scale(rows)
+    assert n == 2
+    assert k == pytest.approx(2.0e-6, rel=1e-6)   # exact: both rows on line
+
+    # SEFD radiometer line: 7000 Jy over ~1.07 s / 82 ant / 2 pol.
+    sig = sm.sefd_predicted_sigma_mjy(7000.0, window_s=8 * sm.BLOCK_S)
+    assert 3.5 < sig < 5.5
+
+    # A single detection is accepted as a (noisy) scale anchor.
+    k2, n2 = sm.fit_flux_scale(rows[:1])
+    assert n2 == 1 and k2 == pytest.approx(2.0e-6, rel=1e-6)
+    # No detections → None.
+    k3, n3 = sm.fit_flux_scale(rows[2:3])
+    assert k3 is None and n3 == 0
+
+
+def test_combine_uv_clip_zeroes_hot_cells():
+    """Cells with |V| >> median (static RFI / crosstalk) are zeroed;
+    ordinary cells survive untouched."""
+    n_filled = 64
+    rng = np.random.default_rng(7)
+    vis = (rng.normal(size=n_filled) + 1j * rng.normal(size=n_filled))
+    vis = vis.astype(np.complex64)
+    vis[5] = 500.0 + 0j                      # hot cell (RFI-like)
+    vis[17] = 0.0 - 300.0j                   # hot cell
+    rows = np.arange(n_filled, dtype=np.uint16)
+    cols = np.arange(n_filled, dtype=np.uint16)
+    snap = {
+        "vis": vis, "ix_row": rows, "ix_col": cols,
+        "meta": {"chgroup": 3, "n_grid": N_GRID, "amp_scale": 1.0,
+                 "cell_lambda": 17.9},
+    }
+    uv, used, cs = sm.combine_chgroups_to_uv([snap], n_grid=N_GRID)
+    assert used == [3]
+    assert cs[3]["n_clipped"] == 2
+    assert uv[5, 5] == 0 and uv[17, 17] == 0
+    assert uv[3, 3] == pytest.approx(vis[3], abs=1e-6)
+
+    # Clip disabled → hot cells pass through.
+    uv2, _, cs2 = sm.combine_chgroups_to_uv(
+        [snap], n_grid=N_GRID, uv_clip_k=0.0,
+    )
+    assert uv2[5, 5] == pytest.approx(500.0)
+    assert cs2[3]["n_clipped"] == 0
+
+
+def test_static_subtract_removes_instrument_baseline(tmp_path):
+    """A constant per-cell offset present in every snapshot is removed
+    once STATIC_SUB_MIN_HIST history has accumulated."""
+    mon = sm.SkyMonitor(
+        nvss_enabled=False,
+        store=sm.SkyFrameStore(root=tmp_path, retention_h=48.0),
+        frame_interval_s=1e9,          # never auto-build frames
+        n_grid=N_GRID,
+    )
+    rng = np.random.default_rng(1)
+    static = (rng.standard_normal(32) + 1j * rng.standard_normal(32)
+              ).astype(np.complex64) * 10.0
+    for i in range(sm.STATIC_SUB_MIN_HIST):
+        noise = (rng.standard_normal(32) + 1j * rng.standard_normal(32)
+                 ).astype(np.complex64) * 0.01
+        mon.ingest(_snapshot_bytes(2, vis=static + noise),
+                   now=1_750_000_000.0 + i)
+    snap = sm.parse_snapshot_npz(
+        _snapshot_bytes(2, vis=static + (0.5 + 0j)))
+    out, n_hist, ready = mon._static_subtract([snap])
+    assert ready
+    assert n_hist[2] >= sm.STATIC_SUB_MIN_HIST
+    # The 10.0-scale static baseline is gone; the 0.5 offset survives.
+    resid = out[0]["vis"]
+    assert float(np.median(np.abs(resid))) < 1.0
+    assert float(np.median(resid.real)) == pytest.approx(0.5, abs=0.1)
+
+    # Cold history → passthrough, flagged not-ready.
+    mon2 = sm.SkyMonitor(
+        nvss_enabled=False,
+        store=sm.SkyFrameStore(root=tmp_path / "b", retention_h=48.0),
+        frame_interval_s=1e9, n_grid=N_GRID,
+    )
+    out2, _, ready2 = mon2._static_subtract([snap])
+    assert not ready2
+    assert np.array_equal(out2[0]["vis"], snap["vis"])

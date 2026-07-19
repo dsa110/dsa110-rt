@@ -193,7 +193,28 @@ def _active_sidereal_vetos() -> list:
     return out
 
 
-sky_mon = SkyMonitor(veto_provider=_active_sidereal_vetos)
+def _capture_armed_mjd():
+    """Fleet capture-arm MJD from etcd (/mon/snap/1/armed_mjd) — the
+    absolute time base that turns a sky snapshot's ``block_n`` into
+    its exact capture time (2026-07-18 astrometry fix). Best-effort:
+    any etcd problem returns None and the sky monitor falls back to
+    corr wall clocks minus the measured export lag.
+    """
+    try:
+        doc = etcd_store.get_dict("/mon/snap/1/armed_mjd")
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(doc, dict):
+        v = doc.get("armed_mjd")
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return None
+
+
+sky_mon = SkyMonitor(
+    veto_provider=_active_sidereal_vetos,
+    armed_mjd_provider=_capture_armed_mjd,
+)
 
 
 def _init_store_and_poller() -> None:

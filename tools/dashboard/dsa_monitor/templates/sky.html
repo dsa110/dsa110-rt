@@ -85,9 +85,17 @@
     −3σ…+10σ where σ is a robust (MAD) per-image noise estimate.
     Frames are 2× oversampled (UV zero-padding — exact band-limited
     interpolation, same FOV) and pillbox grid-corrected so edge sources
-    show at true relative strength. The RA/Dec graticule assumes the
-    meridian phase center (α₀ = LST, δ₀ = obs dec); NVSS sources
-    ≥ 100 mJy inside the field are listed beside the image.
+    show at true relative strength. The 16 chgroup snapshots are
+    <b>drift-aligned to a common data time</b> before combining
+    (2026-07-18 fix; they arrive up to ~30 s apart), and the phase
+    center is the meridian at that <b>data</b> time (α₀ = LST(t<sub>data</sub>),
+    δ₀ = obs dec), so NVSS associations are pixel-accurate. Detected
+    NVSS sources (≥7σ) are circled in <span style="color:#3fae2a">
+    green</span> with names; bright sources that <i>should</i> be
+    visible but aren't are circled in <span style="color:#c77c22">
+    orange</span>. Per-frame noise is flux-calibrated against the NVSS
+    detections themselves (σ in mJy) and converted to an implied
+    per-antenna SEFD beside the image.
     North up, east <b>right</b>.
     If bright continuum sources are not visible here, the search is not
     seeing the sky. <b>Manual refresh only.</b>
@@ -166,19 +174,45 @@
             const j = await r.json();
             if (token !== nvssToken) return;   /* stale (user scrubbed on) */
             const srcs = (j.nvss || []);
+            const noise = j.noise || null;
+            let head = "";
+            if (noise && noise.sigma_mjy != null) {
+                head =
+                    "<div style='margin-bottom:6px;font-size:0.92em;'>" +
+                    "σ = <b>" + noise.sigma_mjy.toFixed(1) + " mJy</b>" +
+                    " &nbsp;|&nbsp; implied per-ant SEFD ≈ <b>" +
+                    (noise.sefd_implied_jy / 1e3).toFixed(1) + " kJy</b>" +
+                    " <span style='color:#888'>(ref " +
+                    (noise.ref_sefd_jy / 1e3).toFixed(0) + " kJy → " +
+                    noise.sigma_pred_mjy_at_ref_sefd.toFixed(1) +
+                    " mJy; scale from " + noise.n_flux_scale_sources +
+                    " NVSS src)</span></div>";
+            } else if (noise) {
+                head =
+                    "<div style='margin-bottom:6px;font-size:0.92em;color:#888'>" +
+                    "no flux scale (need an NVSS detection ≥" +
+                    (j.nvss_detect_snr || 7) + "σ in beam)</div>";
+            }
             if (!srcs.length) {
-                el.textContent = "none in field";
+                el.innerHTML = head + "none in field";
                 return;
             }
             let rows = "";
             srcs.forEach(function (s) {
-                rows += "<tr><td>" + s.name + "</td><td>" +
-                    s.flux_mjy.toFixed(0) + "</td><td>" +
+                const det = !!s.detected;
+                const snrTxt = (s.snr == null) ? "–" : s.snr.toFixed(1);
+                const pbTxt = (s.pb == null) ? "–" : s.pb.toFixed(2);
+                rows += "<tr style='" +
+                    (det ? "color:#3fae2a;font-weight:600;" : "") +
+                    "'><td>" + s.name + "</td><td>" +
+                    s.flux_mjy.toFixed(0) + "</td><td>" + pbTxt +
+                    "</td><td>" + snrTxt + (det ? " ✓" : "") + "</td><td>" +
                     s.ra_deg.toFixed(4) + "</td><td>" +
                     s.dec_deg.toFixed(4) + "</td></tr>";
             });
-            el.innerHTML =
+            el.innerHTML = head +
                 "<table><tr><th>Name</th><th>S<sub>1.4</sub> (mJy)</th>" +
+                "<th>PB</th><th>S/N</th>" +
                 "<th>RA (°)</th><th>Dec (°)</th></tr>" + rows + "</table>";
         } catch (e) {
             if (token === nvssToken) el.textContent = "source list error: " + e;
