@@ -97,6 +97,30 @@ class RetentionConfig:
 # ---------------------------------------------------------------------------
 
 
+def _utc_start_from_capture_mon() -> Optional[int]:
+    """Best-effort ``utc_start_specnum`` from the capture mon shm.
+
+    2026-07-19: the fada DADA header does not carry UTC_START in
+    production, so every dump manifest shipped ``utc_start_specnum:
+    null``. The capture processes (ports 4011/4012) publish the armed
+    specnum in their mon shm; either instance's value works (both
+    captures arm on the same verb). Provenance-only — never raises.
+    """
+    try:
+        from ..capture.mon_shm import MonShm
+    except Exception:                                             # noqa: BLE001
+        return None
+    for port in (4011, 4012):
+        try:
+            snap = MonShm.open(port).snapshot()
+            val = int(snap.utc_start_specnum)
+            if val > 0:
+                return val
+        except Exception:                                         # noqa: BLE001
+            continue
+    return None
+
+
 def staged_paths(
     staging_dir: Path, event_name: str, chgroup: int,
 ) -> Tuple[Path, Path]:
@@ -143,6 +167,15 @@ def write_window_to_staging(
     os.replace(tmp_path, out_path)
 
     manifest: Dict[str, Any] = {
+        # v2 (2026-07-19): block_n_* keys and ring block labels are now
+        # ZERO-based absolute block numbers (block N = specnums
+        # [2048N, 2048(N+1))), matching target_block_n's convention;
+        # block_mjd_first is armed_mjd + block_n_first*BLOCK. v1
+        # manifests had 1-based block_n_* (pages-since-attach) with
+        # block_mjd_first = armed + (N-1)*BLOCK — the recorded TIME was
+        # correct for the data in both versions; the window centering
+        # and label conventions changed.
+        "manifest_version": 2,
         "event_name": event_name,
         "cn_id": int(cn_id),
         "chgroup": int(chgroup),
@@ -164,8 +197,12 @@ def write_window_to_staging(
         # gives sample times on the SAME base as the slow-vis HDF5
         # archive, independent of the C2 label (which historically ran
         # LATE by the search pipeline's first-cube fill latency).
-        # block_n counts from 1 for the first armed block, so
-        #   t(block N start) = armed_mjd + (N - 1) * BLOCK_DURATION_S.
+        # v2 (2026-07-19): block_n is ZERO-based absolute, so
+        #   t(block N start) = armed_mjd + N * BLOCK_DURATION_S.
+        # This is the field the localization chain (dsavim.metadata
+        # .load_burst) anchors the voltage-MS time axis on — the C2
+        # label (mjd_target) carries per-event centroid jitter of
+        # ~0.1 s (~1.5 arcsec of RA) and must not be used for that.
         "utc_start_specnum": (
             int(utc_start_specnum) if utc_start_specnum is not None
             else None
@@ -175,7 +212,7 @@ def write_window_to_staging(
         ),
         "block_mjd_first": (
             float(armed_mjd)
-            + (extract.first_block_n - 1) * BLOCK_DURATION_S / 86400.0
+            + extract.first_block_n * BLOCK_DURATION_S / 86400.0
             if armed_mjd is not None and extract.first_block_n is not None
             else None
         ),
@@ -325,7 +362,27 @@ class VoltageRetentionService:
                 self._utc_start_specnum = int(hdr.get("UTC_START"))
             except (TypeError, ValueError):
                 self._utc_start_specnum = None
-            block_n = 0
+            if self._utc_start_specnum is None:
+                # 2026-07-19: production fada headers turned out not to
+                # carry UTC_START (every manifest shipped null). Fall
+                # back to the capture processes' mon shm, which always
+                # has the armed specnum.
+                self._utc_start_specnum = _utc_start_from_capture_mon()
+            # 2026-07-19 block-numbering reconciliation: label pages
+            # ZERO-based since attach so ring labels match the absolute
+            # ``specnum_to_block_n`` convention (block N holds specnums
+            # [2048N, 2048(N+1)); corr_fast/cube_pipeline anchor). The
+            # previous 1-based count made every C2-triggered window
+            # land one block EARLY in the data (the trigger specnum sat
+            # in ring label floor(spec/2048)+1, but we extracted
+            # floor(spec/2048)), and made the manifests' block_n_* keys
+            # 1-based while target_block_n was 0-based. NB the labels
+            # are absolute only when this service attaches at capture
+            # start (systemd orders it with the pipeline); a
+            # mid-capture attach offsets ALL labels and times, which is
+            # why the manifest carries armed_mjd for downstream
+            # cross-checks.
+            block_n = -1
             while not self._stop.is_set():
                 try:
                     page = reader.getNextPage()

@@ -49,8 +49,10 @@ def test_manifest_records_arm_anchor(tmp_path) -> None:
     )
     assert m["armed_mjd"] == armed
     assert m["utc_start_specnum"] == 21111787046
-    # block_n counts from 1 for the first armed block
-    expected = armed + (m["block_n_first"] - 1) * BLOCK_DURATION_S / 86400.0
+    # v2 (2026-07-19): block_n is ZERO-based absolute (block N holds
+    # specnums [2048N, 2048(N+1))), so t(block N) = armed + N*BLOCK.
+    assert m["manifest_version"] == 2
+    expected = armed + m["block_n_first"] * BLOCK_DURATION_S / 86400.0
     assert abs(m["block_mjd_first"] - expected) < 1e-12
     # round-trips through the JSON sidecar
     doc = json.loads((tmp_path / "testev_sb00.json").read_text())
