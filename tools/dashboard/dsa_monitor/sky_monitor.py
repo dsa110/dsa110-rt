@@ -617,6 +617,9 @@ def render_annotated_png(
             ra_samp, np.full_like(ra_samp, dv),
             ra0_deg=ra0_deg, dec0_deg=dec0_deg,
         )
+        l, m = sky_astrometry.sky_to_instrument_lm(
+            l, m, dec0_deg=dec0_deg,
+        )
         ld, md = np.rad2deg(l), np.rad2deg(m)
         ax.plot(ld, md, **grid_kw)
         ok = (np.abs(ld) < half) & (np.abs(md) < half * 0.98)
@@ -628,6 +631,9 @@ def render_annotated_png(
         l, m = sky_astrometry.radec_to_lm(
             np.full_like(dec_samp, rv), dec_samp,
             ra0_deg=ra0_deg, dec0_deg=dec0_deg,
+        )
+        l, m = sky_astrometry.sky_to_instrument_lm(
+            l, m, dec0_deg=dec0_deg,
         )
         ld, md = np.rad2deg(l), np.rad2deg(m)
         ax.plot(ld, md, **grid_kw)
@@ -672,8 +678,12 @@ def render_annotated_png(
         k = (noise or {}).get("flux_scale_units_per_mjy")
         for r in nvss_rows:
             try:
-                lx = float(np.rad2deg(float(r["l_rad"])))
-                my = float(np.rad2deg(float(r["m_rad"])))
+                # Instrument-frame coords (the image axes); fall back
+                # to true (l, m) for pre-2026-07-19 sidecars.
+                lx = float(np.rad2deg(float(
+                    r.get("l_img_rad", r["l_rad"]))))
+                my = float(np.rad2deg(float(
+                    r.get("m_img_rad", r["m_rad"]))))
             except (KeyError, TypeError, ValueError):
                 continue
             if abs(lx) > half or abs(my) > half:
@@ -1242,14 +1252,30 @@ class SkyMonitor:
                 nvss_rows: list[dict[str, Any]] = []
                 cat = self._nvss.get() if self.nvss_enabled else None
                 if cat is not None:
+                    # Select with a margin: the instrument m-axis is
+                    # COMPRESSED by cos(lat − dec), so sources with
+                    # |m_true| slightly beyond the nominal half-FOV
+                    # still land inside the image.
                     sel = sky_astrometry.select_in_fov(
                         cat, ra0_deg=ra0, dec0_deg=dec0,
-                        fov_rad=fov_rad, max_sources=NVSS_MAX_SOURCES,
+                        fov_rad=fov_rad * 1.08,
+                        max_sources=NVSS_MAX_SOURCES,
                     )
                     r_pix = NVSS_APERTURE_ARCSEC / pix_arcsec
                     for i in range(sel["ra_deg"].size):
-                        row, col = sky_astrometry.lm_to_pix(
+                        # True SIN (l, m) → instrument image frame
+                        # (m compressed by cos(lat−dec) + w-term;
+                        # 2026-07-19 fix — this was the varying-Dec
+                        # offset reported on the sky tab).
+                        l_img, m_img = sky_astrometry.sky_to_instrument_lm(
                             sel["l_rad"][i], sel["m_rad"][i],
+                            dec0_deg=dec0,
+                        )
+                        if (abs(float(l_img)) > fov_rad / 2.0
+                                or abs(float(m_img)) > fov_rad / 2.0):
+                            continue
+                        row, col = sky_astrometry.lm_to_pix(
+                            l_img, m_img,
                             n_pix=n_pix, fov_rad=fov_rad,
                         )
                         snr, peak, row_pk, col_pk = measure_source_peak(
@@ -1270,6 +1296,8 @@ class SkyMonitor:
                             "flux_mjy": float(sel["flux_mjy"][i]),
                             "l_rad": float(sel["l_rad"][i]),
                             "m_rad": float(sel["m_rad"][i]),
+                            "l_img_rad": float(l_img),
+                            "m_img_rad": float(m_img),
                             "row": float(row),
                             "col": float(col),
                             "snr": (float(snr) if np.isfinite(snr) else None),

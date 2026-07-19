@@ -144,6 +144,64 @@ def lm_to_pix(
     return row, col
 
 
+def sky_to_instrument_lm(
+    l: np.ndarray | float,
+    m: np.ndarray | float,
+    *,
+    dec0_deg: float,
+    lat_deg: float = OVRO_LAT_DEG,
+) -> tuple[np.ndarray, np.ndarray]:
+    """True SIN-projected (l, m) → the fast-vis IMAGE frame.
+
+    The corr gridder builds its (u, v) from RAW (ΔE, ΔN) antenna
+    offsets (``grid/sparsity_pattern._per_baseline_uv_meters``) with
+    no geometric projection, while the true meridian-pointing
+    projected baselines are ``u = ΔE`` and
+    ``v = ΔN·cos(lat − dec) [+ ΔU·sin(lat − dec)]``. The F21 DEC
+    fringe-stop puts the phase center at (H=0, dec); the residual
+    w-term is ``w = −ΔN·sin(lat − dec)``. Matching phase terms, a
+    source at true (l, m) lands in the image at::
+
+        l_img = l
+        m_img = m·cos(lat − dec) + sin(lat − dec)·(l² + m²)/2
+
+    — the m-axis is COMPRESSED by cos(lat − dec) (≈0.934 at
+    dec = +16.3°, i.e. ~4′ of Dec error at the field edge if
+    ignored) plus a small quadratic w-term warp (≲1′ in the field
+    corners). Discovered empirically 2026-07-19 (Dec offsets of NVSS
+    sources grew with |m|).
+
+    NOTE: the search-side imager uses the SAME grid, so detector /
+    C1 / C2 (l, m) are in this instrument frame too — sidereal-veto
+    overlays plot directly, but any (l, m) → (RA, Dec) conversion
+    (e.g. burst-event astrometry) must apply the inverse.
+    """
+    l = np.asarray(l, dtype=np.float64)
+    m = np.asarray(m, dtype=np.float64)
+    g = np.deg2rad(float(lat_deg) - float(dec0_deg))
+    m_img = m * np.cos(g) + np.sin(g) * (l * l + m * m) / 2.0
+    return l, m_img
+
+
+def instrument_to_sky_lm(
+    l_img: np.ndarray | float,
+    m_img: np.ndarray | float,
+    *,
+    dec0_deg: float,
+    lat_deg: float = OVRO_LAT_DEG,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of :func:`sky_to_instrument_lm` (one Newton refinement
+    of the small quadratic term — sub-milliarcsec residual)."""
+    l = np.asarray(l_img, dtype=np.float64)
+    mi = np.asarray(m_img, dtype=np.float64)
+    g = np.deg2rad(float(lat_deg) - float(dec0_deg))
+    cg, sg = np.cos(g), np.sin(g)
+    m = mi / cg
+    for _ in range(3):
+        m = (mi - sg * (l * l + m * m) / 2.0) / cg
+    return l, m
+
+
 def pb_resp_power(
     theta_rad: np.ndarray | float,
     *,

@@ -672,3 +672,27 @@ def test_static_subtract_removes_instrument_baseline(tmp_path):
     out2, _, ready2 = mon2._static_subtract([snap])
     assert not ready2
     assert np.array_equal(out2[0]["vis"], snap["vis"])
+
+
+def test_sky_to_instrument_lm_compression_and_roundtrip():
+    """The gridder's v = raw ΔN ⇒ image m is the sky m compressed by
+    cos(lat − dec) plus a small w-term warp; inverse round-trips."""
+    import sky_astrometry as sa2
+    dec0 = 16.2734
+    g = np.deg2rad(sa2.OVRO_LAT_DEG - dec0)
+    m_true = np.deg2rad(1.0)
+    l_img, m_img = sa2.sky_to_instrument_lm(0.0, m_true, dec0_deg=dec0)
+    # Compressed toward center (dec < lat) + small positive w-term.
+    assert float(m_img) < m_true
+    assert float(m_img) == pytest.approx(
+        m_true * np.cos(g) + np.sin(g) * m_true ** 2 / 2.0, rel=1e-12,
+    )
+    # ~4 arcmin at the 1-deg edge — the reported varying-Dec offset.
+    assert 3.0 < np.rad2deg(m_true - float(m_img)) * 60.0 < 5.0
+    l2, m2 = sa2.instrument_to_sky_lm(l_img, m_img, dec0_deg=dec0)
+    assert float(m2) == pytest.approx(m_true, abs=5e-11)  # ~10 uas
+    # At dec == lat (zenith) the mapping is identity.
+    _, mz = sa2.sky_to_instrument_lm(
+        0.0, m_true, dec0_deg=sa2.OVRO_LAT_DEG,
+    )
+    assert float(mz) == pytest.approx(m_true, rel=1e-12)
