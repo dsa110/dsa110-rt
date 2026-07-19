@@ -453,6 +453,54 @@ def measure_source_snr(
     return snr
 
 
+def measure_astrometric_offset(
+    image: np.ndarray,
+    *,
+    median: float,
+    sigma: float,
+    nvss_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Global (Δrow, Δcol) between the image and the NVSS predictions.
+
+    FFT cross-correlation of the σ-clipped image against a
+    flux-weighted delta map at the predicted source pixels. Returns
+    ``{z, drow_px, dcol_px, n_sources}``; ``z`` is the correlation
+    peak in std units of the correlation plane — ≳15 is a confident
+    lock, and then (drow, dcol) ≈ (0, 0) is the health condition.
+    This catches wholesale mapping errors that per-source apertures
+    at the (wrong) predicted positions are blind to (2026-07-19
+    lesson: a 26-yr precession offset read as "no detections").
+    """
+    n_pix = int(image.shape[0])
+    s = np.clip((np.asarray(image, dtype=np.float64) - median) / sigma,
+                -2.0, 30.0)
+    dmap = np.zeros((n_pix, n_pix))
+    n_src = 0
+    for r in nvss_rows:
+        row, col = r.get("row"), r.get("col")
+        if row is None or col is None:
+            continue
+        ri, ci = int(round(float(row))), int(round(float(col)))
+        if 0 <= ri < n_pix and 0 <= ci < n_pix:
+            dmap[ri, ci] += float(np.sqrt(max(r.get("flux_mjy", 0.0), 0.0)))
+            n_src += 1
+    if n_src < 3:
+        return {"z": 0.0, "drow_px": None, "dcol_px": None,
+                "n_sources": n_src}
+    F = np.fft.fft2(s - s.mean())
+    G = np.fft.fft2(dmap - dmap.mean())
+    xc = np.fft.fftshift(np.fft.ifft2(F * np.conj(G)).real)
+    k = int(np.argmax(xc))
+    r0, c0 = np.unravel_index(k, xc.shape)
+    z = float((xc[r0, c0] - xc.mean()) / xc.std())
+    return {
+        "z": z,
+        "drow_px": int(r0 - n_pix // 2),
+        "dcol_px": int(c0 - n_pix // 2),
+        "n_sources": n_src,
+    }
+
+
 def complex_median(stack: np.ndarray) -> np.ndarray:
     """Component-wise (re, im) median along axis 0 — the robust
     per-cell instrumental-baseline estimator."""
@@ -819,6 +867,7 @@ class SkyFrameStore:
                     "nvss": annotate.get("nvss_rows", []),
                     "sidereal_vetos": annotate.get("veto_rows", []),
                     "noise": annotate.get("noise"),
+                    "astrom_check": annotate.get("astrom_check"),
                 }
                 (day_dir / f"{stem}.json").write_text(
                     json.dumps(sidecar), encoding="utf-8",
@@ -1241,8 +1290,17 @@ class SkyMonitor:
         try:
             if cell_lambdas and cell_lambdas[0] > 0:
                 fov_rad = 1.0 / float(cell_lambdas[0])
-                dec0 = float(dec_degs[0]) if dec_degs else 0.0
-                ra0 = sky_astrometry.lst_deg(t_ref)
+                # Apparent-frame pointing dec: sets the instrument
+                # m-axis compression (geometry of the ΔN baselines).
+                dec0_apparent = float(dec_degs[0]) if dec_degs else 0.0
+                # J2000/ICRS phase center for the catalog + graticule
+                # (2026-07-19 fix: without the TETE→ICRS epoch
+                # transform, 26 yr of precession put every NVSS
+                # prediction ~45 px east + a cos(α)-drifting Dec
+                # offset).
+                ra0, dec0 = sky_astrometry.phase_center_icrs(
+                    t_ref, dec0_apparent,
+                )
                 n_pix = int(image.shape[0])
                 pix_arcsec = np.rad2deg(fov_rad / n_pix) * 3600.0
                 window_s = max(
@@ -1269,7 +1327,7 @@ class SkyMonitor:
                         # offset reported on the sky tab).
                         l_img, m_img = sky_astrometry.sky_to_instrument_lm(
                             sel["l_rad"][i], sel["m_rad"][i],
-                            dec0_deg=dec0,
+                            dec0_deg=dec0_apparent,
                         )
                         if (abs(float(l_img)) > fov_rad / 2.0
                                 or abs(float(m_img)) > fov_rad / 2.0):
@@ -1358,6 +1416,21 @@ class SkyMonitor:
                     sefd_implied_jy = float(
                         SEFD_REFERENCE_JY * sigma_mjy / sigma_pred_mjy
                     )
+                # Per-frame astrometric self-check: cross-correlate the
+                # image against a flux-weighted delta map at the
+                # predicted NVSS pixels. A significant peak away from
+                # (0, 0) means the mapping has drifted (bad cal epoch,
+                # clock, pointing...) — this is the check that catches
+                # what apertures at wrong positions silently miss.
+                astrom_check: Optional[dict[str, Any]] = None
+                if len(nvss_rows) >= 5:
+                    try:
+                        astrom_check = measure_astrometric_offset(
+                            image, median=median, sigma=sigma,
+                            nvss_rows=nvss_rows,
+                        )
+                    except Exception:                    # noqa: BLE001
+                        LOG.exception("astrometric self-check failed")
                 noise = {
                     "static_sub_ready": static_sub_ready,
                     "sigma_mjy": sigma_mjy,
@@ -1375,12 +1448,16 @@ class SkyMonitor:
                     "fov_rad": fov_rad, "nvss_rows": nvss_rows,
                     "veto_rows": veto_rows,
                     "noise": noise,
+                    "astrom_check": astrom_check,
                     "raw_snapshots": fresh,
                 }
                 astro = {
                     "ra0_deg": ra0,
                     "dec0_deg": dec0,
-                    "lst_h": ra0 / 15.0,
+                    "radec_epoch": "ICRS/J2000",
+                    "dec0_apparent_deg": dec0_apparent,
+                    "astrom_check": astrom_check,
+                    "lst_h": sky_astrometry.lst_deg(t_ref) / 15.0,
                     "fov_deg": float(np.rad2deg(fov_rad)),
                     "pix_arcsec": pix_arcsec,
                     "nvss_min_mjy": NVSS_MIN_MJY,

@@ -335,20 +335,30 @@ def test_annotated_frame_with_nvss(tmp_path, monkeypatch):
     npz_path = png_path.with_suffix(".npz")
     with np.load(npz_path, allow_pickle=False) as z:
         meta = json.loads(bytes(z["meta_json"]).decode("utf-8"))
-    assert meta["ra0_deg"] == pytest.approx(10.0)
-    assert meta["dec0_deg"] == pytest.approx(16.0)
+    # ra0/dec0 are the ICRS phase center: the (patched) apparent LST
+    # of 10.0 deg minus ~26 yr of precession (~0.3-0.4 deg of RA here),
+    # via the same TETE->ICRS transform the event pages use.
+    assert 0.2 < 10.0 - meta["ra0_deg"] < 0.5
+    assert meta["dec0_deg"] == pytest.approx(16.0, abs=0.2)
+    assert meta["dec0_apparent_deg"] == pytest.approx(16.0)
+    assert meta["radec_epoch"] == "ICRS/J2000"
     assert meta["nvss_loaded"] is True
     assert len(meta["nvss"]) == 1
     src = meta["nvss"][0]
     assert src["name"] == "NVSS JX"
-    # Central pixel of the oversampled frame, finite measured S/N.
+    # The catalog source sits at the APPARENT (ra=10, dec=16) frame
+    # center's J2000 counterpart... i.e. ~0.35 deg EAST of the ICRS
+    # center in l (the precession offset), so its predicted column is
+    # east of center by ~0.35 deg / pix_scale.
     n_pix = meta["n_pix"]
-    assert src["row"] == pytest.approx(n_pix // 2, abs=1.0)
-    assert src["col"] == pytest.approx(n_pix // 2, abs=1.0)
+    pix_deg = meta["fov_deg"] / n_pix
+    expect_dcol = (10.0 - meta["ra0_deg"]) * np.cos(np.deg2rad(16.0)) \
+        / pix_deg
+    assert src["col"] == pytest.approx(n_pix // 2 + expect_dcol, abs=3.0)
     assert src["snr"] is not None
     # JSON sidecar drives the page-side source table.
     sidecar = json.loads(png_path.with_suffix(".json").read_text())
-    assert sidecar["ra0_deg"] == pytest.approx(10.0)
+    assert sidecar["ra0_deg"] == pytest.approx(meta["ra0_deg"])
     assert [s["name"] for s in sidecar["nvss"]] == ["NVSS JX"]
     assert mon.store.resolve_sidecar(day, png) is not None
 
@@ -696,3 +706,33 @@ def test_sky_to_instrument_lm_compression_and_roundtrip():
         0.0, m_true, dec0_deg=sa2.OVRO_LAT_DEG,
     )
     assert float(mz) == pytest.approx(m_true, rel=1e-12)
+
+
+def test_phase_center_icrs_removes_precession():
+    """TETE(date) → ICRS: ~26 yr of precession is ~18-20 arcmin of RA
+    at these coordinates — the constant +45 px east offset measured on
+    2026-07-19. ICRS ra0 must be LOWER than the apparent LST."""
+    import sky_astrometry as sa2
+    unix = 1_784_438_491.0                     # 2026-07-19 05:21:31 UT
+    dec_app = 16.2734
+    lst = sa2.lst_deg(unix)
+    ra0, dec0 = sa2.phase_center_icrs(unix, dec_app)
+    dra_arcmin = ((lst - ra0 + 180.0) % 360.0 - 180.0) * 60.0
+    assert 12.0 < dra_arcmin < 25.0            # precession-scale, east
+    assert abs(dec0 - dec_app) < 12.0 / 60.0   # dec shift < 12 arcmin
+
+
+def test_measure_astrometric_offset_finds_shift():
+    rng = np.random.default_rng(3)
+    n = 128
+    img = rng.standard_normal((n, n)).astype(np.float32)
+    rows = []
+    # sources truly at predicted + (+4, -6)
+    for (r, c, f) in ((30, 40, 900.0), (70, 100, 400.0), (100, 20, 250.0),
+                      (55, 64, 150.0), (90, 80, 120.0)):
+        img[r + 4, c - 6] += 30.0
+        rows.append({"row": r, "col": c, "flux_mjy": f})
+    res = sm.measure_astrometric_offset(
+        img, median=0.0, sigma=1.0, nvss_rows=rows)
+    assert res["z"] > 10
+    assert (res["drow_px"], res["dcol_px"]) == (4, -6)

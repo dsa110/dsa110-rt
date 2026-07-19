@@ -85,6 +85,38 @@ def lst_deg(unix_ts: float) -> float:
     return float(t.sidereal_time("apparent").to_value(u.deg)) % 360.0
 
 
+def phase_center_icrs(
+    unix_ts: float, dec_apparent_deg: float,
+) -> tuple[float, float]:
+    """ICRS (J2000) coordinates of the drift-scan phase center.
+
+    The instrument phase center is (HA=0, pointing dec) in the TRUE
+    equator/equinox of DATE (LST is apparent sidereal time; the
+    pointing dec is an apparent-frame elevation setting). Comparing
+    against a J2000 catalog without transforming leaves ~26 yr of
+    precession: ~18-19 arcmin of RA (≈ +45 px of l at 22.5"/px, the
+    constant east offset measured 2026-07-19) and 8.85'·cos(α) of Dec
+    (the drift of the m offset across that night, −22 → −10 px as α₀
+    swept 14h → 17h). Same TETE→ICRS transform the burst event pages
+    use (event_astrometry.py). Annual aberration (~20", <1 px) is not
+    modelled.
+    """
+    from astropy.coordinates import SkyCoord, TETE
+    from astropy.time import Time
+    from astropy.utils import iers
+    import astropy.units as u
+
+    iers.conf.auto_download = False
+    iers.conf.auto_max_age = None
+    t = Time(unix_ts, format="unix", scale="utc")
+    ra_app = lst_deg(unix_ts)
+    c = SkyCoord(
+        ra=ra_app * u.deg, dec=dec_apparent_deg * u.deg,
+        frame=TETE(obstime=t),
+    ).icrs
+    return float(c.ra.deg) % 360.0, float(c.dec.deg)
+
+
 def radec_to_lm(
     ra_deg: np.ndarray | float,
     dec_deg: np.ndarray | float,
