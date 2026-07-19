@@ -552,6 +552,15 @@ class SearchComputeConfig:
     # queues the rest up to ``cube_upload_queue_maxsize``.
     cube_upload_max_concurrent: int = 1
     cube_upload_queue_maxsize: int = 8
+    # 2026-07-19 disk-full incident: when True the uploader deletes
+    # THIS HALF's NPZs (``cube_*_g<gpu_half>_*.npz``) after a verified
+    # (rc==0) rsync and appends an UPLOAD_OK marker to upload.log.
+    # Wired from ``c1.uploader.delete_after_upload``.
+    cube_upload_delete_after: bool = False
+    # 2026-07-19: last-resort age/size retention sweeper over
+    # ``c1.dump_root`` (see dsart/dump/cube_retention.py). Built from
+    # the ``c1.retention`` yaml block; None disables.
+    cube_retention_config: Optional["CubeRetentionConfig"] = None  # noqa: F821
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +644,8 @@ class SearchComputeService:
         # set in config). Owned by the service so ``_stop_subsystems``
         # can drain it cleanly at shutdown.
         self._cube_uploader: Optional["BoundedCubeUploader"] = None  # noqa: F821
+        # 2026-07-19: cube-staging retention backstop (see stop()).
+        self._cube_retention: Optional["CubeRetentionSweeper"] = None  # noqa: F821
         self._udp_listener: Optional[UdpTriggerListener] = None
         self._cands_logger: Optional[CandsLogger] = None
         # M7.4 C1 stage.
@@ -772,6 +783,13 @@ class SearchComputeService:
         # service stop path tears it down so detached rsyncs in flight
         # at shutdown still get a chance to finish (the worker
         # ``.wait()``s inside its loop).
+        # 2026-07-19: post-upload purge is scoped to THIS half's files
+        # so the two halves (which share the per-event dir) can never
+        # delete each other's not-yet-uploaded cubes.
+        purge_pattern = (
+            f"cube_*_g{config.gpu_half}_*.npz"
+            if config.cube_upload_delete_after else None
+        )
         uploader = BoundedCubeUploader(
             dest_host=str(dest_host),
             dest_root=str(dest_root),
@@ -781,6 +799,7 @@ class SearchComputeService:
             thread_name=(
                 f"cube-upload-s{config.search_node_id}-g{config.gpu_half}"
             ),
+            purge_pattern=purge_pattern,
         )
         uploader.start()
         self._cube_uploader = uploader
@@ -997,6 +1016,19 @@ class SearchComputeService:
                 on_dump_complete=on_dump_complete,
             )
             self._cube_dump.start()
+        if cfg.cube_retention_config is not None:
+            # 2026-07-19: age/size retention backstop over the cube
+            # staging dir. Both halves start one; the flock inside
+            # sweep_now() keeps their passes mutually exclusive.
+            from ..dump.cube_retention import CubeRetentionSweeper
+            self._cube_retention = CubeRetentionSweeper(
+                cfg.cube_retention_config,
+                thread_name=(
+                    f"cube-retention-s{cfg.search_node_id}"
+                    f"-g{cfg.gpu_half}"
+                ),
+            )
+            self._cube_retention.start()
         if cfg.udp_trigger_listener_config is not None:
             # Legacy "dump next cube" listener; kept for the M6 path so
             # operator scripts can still arm a one-shot dump while we
@@ -1073,6 +1105,13 @@ class SearchComputeService:
             except Exception:                                    # noqa: BLE001
                 _LOG.exception(
                     "BoundedCubeUploader.stop failed (non-fatal)"
+                )
+        if self._cube_retention is not None:
+            try:
+                self._cube_retention.stop()
+            except Exception:                                    # noqa: BLE001
+                _LOG.exception(
+                    "CubeRetentionSweeper.stop failed (non-fatal)"
                 )
         if self._clusterer is not None:
             self._clusterer.shutdown(wait=True)
@@ -2338,6 +2377,34 @@ def _build_search_config_from_yaml(
         cube_upload_dest_host, cube_upload_dest_root = parse_remote_root(
             str(remote_root_raw)
         )
+    # 2026-07-19 disk-full incident: purge-after-verified-upload knob.
+    cube_upload_delete_after_yaml = bool(
+        uploader_yaml.get("delete_after_upload", False)
+    )
+    # 2026-07-19: retention backstop over ``c1.dump_root``. Default-ON
+    # whenever a dump_root is configured (the incident showed that an
+    # opt-in backstop is no backstop); ``c1.retention.enabled: false``
+    # opts out for benches that inspect staged cubes after a run.
+    retention_yaml = c1.get("retention", {}) or {}
+    cube_retention_cfg = None
+    if c1_dump_root is not None and bool(
+        retention_yaml.get("enabled", True)
+    ):
+        from ..dump.cube_retention import CubeRetentionConfig
+        cube_retention_cfg = CubeRetentionConfig(
+            dump_root=Path(c1_dump_root),
+            max_age_h=float(retention_yaml.get("max_age_h", 96.0)),
+            max_total_gb=float(
+                retention_yaml.get("max_total_gb", 150.0)
+            ),
+            low_water_gb=float(
+                retention_yaml.get("low_water_gb", 120.0)
+            ),
+            tmp_age_h=float(retention_yaml.get("tmp_age_h", 2.0)),
+            sweep_interval_s=float(
+                retention_yaml.get("sweep_interval_s", 600.0)
+            ),
+        )
     c2_listener_cfg: Optional[C2TriggerListenerConfig] = None
     if enable_c1 and dump_listener_yaml:
         bind_host = c1_bind_host_override or str(
@@ -2453,6 +2520,8 @@ def _build_search_config_from_yaml(
         cube_upload_bandwidth_limit_kbps=cube_upload_bwlimit_kbps,
         cube_upload_max_concurrent=cube_upload_max_concurrent_yaml,
         cube_upload_queue_maxsize=cube_upload_queue_maxsize_yaml,
+        cube_upload_delete_after=cube_upload_delete_after_yaml,
+        cube_retention_config=cube_retention_cfg,
         # Wire the MJD/time geometry to the ACTUAL search cadence
         # (--t-int-search-us, 1048.576 µs at the prod op-point) instead
         # of leaving the stale class default. ``specnum_start`` is in

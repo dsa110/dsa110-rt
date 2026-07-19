@@ -429,3 +429,99 @@ def test_bounded_uploader_counts_failures(tmp_path) -> None:
         assert up.n_uploaded == 0
     finally:
         up.stop()
+
+
+# ---------------------------------------------------------------------------
+# purge_pattern (2026-07-19 disk-full incident)
+# ---------------------------------------------------------------------------
+
+
+def _drain(up, attr, want, timeout_s=3.0):
+    import time as _t
+    deadline = _t.monotonic() + timeout_s
+    while getattr(up, attr) < want and _t.monotonic() < deadline:
+        _t.sleep(0.02)
+
+
+def test_bounded_uploader_purges_own_half_after_success(tmp_path) -> None:
+    """rc==0 deletes THIS half's NPZs only, stamps UPLOAD_OK, keeps
+    the sibling half's cubes and upload.log."""
+    ev = tmp_path / "evt"
+    ev.mkdir()
+    mine = ev / "cube_s1_g0_123.npz"
+    theirs = ev / "cube_s1_g1_123.npz"
+    mine.write_bytes(b"x" * 8)
+    theirs.write_bytes(b"y" * 8)
+    fake_upload, _ = _fake_upload_factory()
+    up = BoundedCubeUploader(
+        dest_host="ubuntu@h23", dest_root="/dataz",
+        upload_fn=fake_upload, purge_pattern="cube_*_g0_*.npz",
+    )
+    up.start()
+    try:
+        up.submit("evt", ev)
+        _drain(up, "n_uploaded", 1)
+        assert up.n_uploaded == 1
+        assert not mine.exists()
+        assert theirs.exists()
+        assert up.n_purged_files == 1
+        assert "UPLOAD_OK" in (ev / "upload.log").read_text()
+    finally:
+        up.stop()
+
+
+def test_bounded_uploader_keeps_files_on_failed_upload(tmp_path) -> None:
+    """A non-zero rsync rc must never delete anything."""
+    ev = tmp_path / "evt"
+    ev.mkdir()
+    mine = ev / "cube_s1_g0_123.npz"
+    mine.write_bytes(b"x" * 8)
+    fake_upload, _ = _fake_upload_factory(exit_codes=[23])
+    up = BoundedCubeUploader(
+        dest_host="ubuntu@h23", dest_root="/dataz",
+        upload_fn=fake_upload, purge_pattern="cube_*_g0_*.npz",
+    )
+    up.start()
+    try:
+        up.submit("evt", ev)
+        _drain(up, "n_failed", 1)
+        assert mine.exists()
+        assert up.n_purged_files == 0
+        log = ev / "upload.log"
+        assert not log.exists() or "UPLOAD_OK" not in log.read_text()
+    finally:
+        up.stop()
+
+
+def test_bounded_uploader_purge_spares_files_landing_mid_upload(
+    tmp_path,
+) -> None:
+    """The purge set is snapshotted before the rsync spawns: a cube
+    that lands while the transfer is in flight (so it is NOT in the
+    rsync's file list) must survive."""
+    import threading
+
+    ev = tmp_path / "evt"
+    ev.mkdir()
+    early = ev / "cube_s1_g0_1.npz"
+    early.write_bytes(b"x" * 8)
+    hold = threading.Event()
+    fake_upload, _ = _fake_upload_factory(hold_event=hold)
+    up = BoundedCubeUploader(
+        dest_host="ubuntu@h23", dest_root="/dataz",
+        upload_fn=fake_upload, purge_pattern="cube_*_g0_*.npz",
+    )
+    up.start()
+    try:
+        up.submit("evt", ev)
+        import time as _t
+        _t.sleep(0.2)  # worker is now blocked inside proc.wait()
+        late = ev / "cube_s1_g0_2.npz"
+        late.write_bytes(b"z" * 8)
+        hold.set()
+        _drain(up, "n_uploaded", 1)
+        assert not early.exists()
+        assert late.exists()
+        assert up.n_purged_files == 1
+    finally:
+        up.stop()

@@ -358,7 +358,21 @@ class BoundedCubeUploader:
         popen: Any = subprocess.Popen,
         upload_fn: Any = upload_event_cubes,
         thread_name: str = "cube-upload",
+        purge_pattern: Optional[str] = None,
     ) -> None:
+        """``purge_pattern`` (2026-07-19 disk-full incident): when set,
+        the worker deletes the ``src_dir`` files matching this glob
+        after a *successful* (rc==0) rsync, and appends an
+        ``UPLOAD_OK`` marker line to the per-event ``upload.log`` (the
+        marker is what :mod:`dsart.dump.cube_retention` uses to prefer
+        already-uploaded dirs when the size cap bites). The set of
+        files to purge is snapshotted BEFORE the rsync is spawned so a
+        file that lands mid-transfer (and is therefore NOT in the
+        rsync's file list) is never deleted. Production wires the
+        pattern to THIS HALF's files only
+        (``cube_*_g<gpu_half>_*.npz``) so the two halves never delete
+        each other's not-yet-uploaded cubes. ``None`` (default)
+        preserves the historical keep-everything behaviour."""
         if max_concurrent < 1:
             raise ValueError(
                 f"max_concurrent={max_concurrent}, expected >= 1"
@@ -381,12 +395,16 @@ class BoundedCubeUploader:
         self._lock = threading.Lock()
         self._workers: list[threading.Thread] = []
         self._thread_name = str(thread_name)
+        self._purge_pattern = (
+            str(purge_pattern) if purge_pattern else None
+        )
         self._started = False
         self._stopped = False
         self._n_submitted = 0
         self._n_uploaded = 0
         self._n_dropped_full = 0
         self._n_failed = 0
+        self._n_purged_files = 0
 
     @property
     def n_submitted(self) -> int:
@@ -407,6 +425,11 @@ class BoundedCubeUploader:
         """Worker-side rsync exits with a non-zero return code or a
         ``Popen`` exception."""
         return self._n_failed
+
+    @property
+    def n_purged_files(self) -> int:
+        """Local NPZs deleted after a verified (rc==0) upload."""
+        return self._n_purged_files
 
     @property
     def queue_depth(self) -> int:
@@ -499,6 +522,19 @@ class BoundedCubeUploader:
             if item is self._SENTINEL:
                 return
             event_name, src_dir = item
+            # Snapshot the purge set BEFORE spawning rsync: rsync
+            # builds its file list at startup, so anything in this
+            # snapshot is transferred by an rc==0 run, and anything
+            # that lands later is left alone (it will ride the next
+            # submit for this event, or the retention sweeper).
+            purge_candidates: list[Path] = []
+            if self._purge_pattern:
+                try:
+                    purge_candidates = sorted(
+                        Path(src_dir).glob(self._purge_pattern)
+                    )
+                except OSError:
+                    purge_candidates = []
             try:
                 proc = self._upload_fn(
                     event_name=event_name,
@@ -538,3 +574,54 @@ class BoundedCubeUploader:
                 )
             else:
                 self._n_uploaded += 1
+                self._purge_after_upload(event_name, src_dir,
+                                         purge_candidates)
+
+    def _purge_after_upload(
+        self,
+        event_name: str,
+        src_dir: Union[str, Path],
+        purge_candidates: "list[Path]",
+    ) -> None:
+        """Delete the pre-snapshot files after a verified upload and
+        append an ``UPLOAD_OK`` marker to the per-event log.
+
+        2026-07-19: staged cubes were never deleted anywhere, so
+        ~2.2 GB/event/node accumulated until all four search nodes hit
+        100% disk. Deleting only after an rc==0 rsync keeps the
+        archive the single source of truth; the marker line lets the
+        retention sweeper distinguish uploaded from stranded dirs.
+        """
+        if not self._purge_pattern:
+            return
+        n = 0
+        for f in purge_candidates:
+            try:
+                f.unlink()
+                n += 1
+            except FileNotFoundError:
+                pass  # other-half sweeper / operator raced us: fine
+            except OSError as exc:
+                _LOG.warning(
+                    "BoundedCubeUploader: purge failed for %s: %r", f, exc
+                )
+        self._n_purged_files += n
+        marker = (
+            f"# {_dt.datetime.utcnow().isoformat(timespec='milliseconds')}Z "
+            f"UPLOAD_OK event={event_name} rc=0 purged={n}\n"
+        )
+        try:
+            with (Path(src_dir) / "upload.log").open(
+                "a", encoding="utf-8"
+            ) as fh:
+                fh.write(marker)
+        except OSError as exc:
+            _LOG.warning(
+                "BoundedCubeUploader: could not append UPLOAD_OK marker "
+                "for event=%s: %r", event_name, exc,
+            )
+        if n:
+            _LOG.info(
+                "BoundedCubeUploader: purged %d uploaded NPZ(s) for "
+                "event=%s", n, event_name,
+            )

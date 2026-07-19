@@ -525,6 +525,27 @@ c1:
     # backlog).
     max_concurrent: 1
     queue_maxsize: 8
+    # 2026-07-19 disk-full incident: staged cubes were never deleted
+    # anywhere, so ~2.2 GB/event/node accumulated until all four
+    # search nodes hit 100% root disk (~285 GB each in cube_dump).
+    # With this ON each half deletes ITS OWN NPZs after a verified
+    # (rc==0) rsync to h23 and stamps UPLOAD_OK into upload.log.
+    delete_after_upload: true
+  # 2026-07-19: last-resort retention backstop over dump_root — bounds
+  # the staging dir by age and size even when uploads fail (h23 down,
+  # network out) or events never get an archive dir (C2
+  # events_incomplete_discarded). Uploaded dirs are sacrificed first
+  # under the size cap; un-uploaded dirs only if that isn't enough
+  # (loud warning — those cubes exist nowhere else). Runs in both
+  # halves with an flock so passes never overlap. Default-enabled
+  # whenever c1.dump_root is set; enabled: false opts out.
+  retention:
+    enabled: true
+    max_age_h: 96          # 4 days: outlast a weekend h23/network outage
+    max_total_gb: 150      # sweep trigger (disk is 469 GB, shared with /)
+    low_water_gb: 120      # sweep target
+    tmp_age_h: 2           # *.tmp / 0-byte NPZ hygiene age
+    sweep_interval_s: 600
 
 # Cube geometry knobs shared with the merger block. The merger reads
 # ``cube.sample_period_specnum`` as the default for

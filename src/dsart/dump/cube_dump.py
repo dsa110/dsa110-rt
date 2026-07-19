@@ -52,6 +52,7 @@ import concurrent.futures
 import dataclasses
 import json
 import logging
+import os
 import queue
 import time
 from dataclasses import dataclass
@@ -584,24 +585,43 @@ class CubeDumpWriter:
         else:
             peak_grid = np.zeros((0, 0), dtype=cube_np.dtype)
         t_savez_start = time.perf_counter()
-        np.savez(
-            str(path),
-            cube=cube_np,
-            peak_grid=peak_grid,
-            mjd_start=np.asarray(manifest.mjd_start, dtype="float64"),
-            event_specnum_start=np.asarray(
-                manifest.event_specnum_start, dtype="int64"
-            ),
-            t_det=np.asarray(manifest.t_det, dtype="int32"),
-            n_fdm_in_cube=np.asarray(manifest.n_fdm_in_cube, dtype="int32"),
-            n_grid=np.asarray(manifest.n_grid, dtype="int32"),
-            cluster_record=np.asarray(cluster_record_json, dtype="U"),
-            trigger_source=np.asarray(manifest.trigger_source, dtype="U"),
-            search_node_id=np.asarray(
-                self._config.search_node_id, dtype="int32"
-            ),
-            gpu_half=np.asarray(self._config.gpu_half, dtype="int32"),
-        )
+        # Atomic publish (2026-07-19): write to a ``.tmp`` sibling and
+        # ``os.replace`` into the canonical name. The two GPU halves
+        # share the per-event dir, and each half's uploader rsyncs the
+        # WHOLE dir — a direct ``np.savez(path)`` exposes a partially
+        # written NPZ to the other half's in-flight rsync (and, post
+        # purge_pattern, to deletion races). ``np.savez`` is given an
+        # open file object so it can't append a second ``.npz`` suffix
+        # to the tmp name. The uploader/sweeper glob ``*.npz`` never
+        # matches ``*.npz.tmp``, so a crash mid-write leaves only a
+        # tmp file for the retention sweeper to reap.
+        tmp_path = path.with_name(path.name + ".tmp")
+        with open(tmp_path, "wb") as _fh:
+            np.savez(
+                _fh,
+                cube=cube_np,
+                peak_grid=peak_grid,
+                mjd_start=np.asarray(manifest.mjd_start, dtype="float64"),
+                event_specnum_start=np.asarray(
+                    manifest.event_specnum_start, dtype="int64"
+                ),
+                t_det=np.asarray(manifest.t_det, dtype="int32"),
+                n_fdm_in_cube=np.asarray(
+                    manifest.n_fdm_in_cube, dtype="int32"
+                ),
+                n_grid=np.asarray(manifest.n_grid, dtype="int32"),
+                cluster_record=np.asarray(cluster_record_json, dtype="U"),
+                trigger_source=np.asarray(
+                    manifest.trigger_source, dtype="U"
+                ),
+                search_node_id=np.asarray(
+                    self._config.search_node_id, dtype="int32"
+                ),
+                gpu_half=np.asarray(self._config.gpu_half, dtype="int32"),
+            )
+            _fh.flush()
+            os.fsync(_fh.fileno())
+        os.replace(tmp_path, path)
         write_ms = (time.perf_counter() - t_savez_start) * 1.0e3
         # ``collections.deque.append`` is documented thread-safe in
         # CPython (single-element atomic op); reads via ``tuple(deque)``
