@@ -758,6 +758,50 @@ class CubePipeline:
     instances bound to different GPU streams, but that's chunk-6b-prod).
     """
 
+    #: fp16 finite ceiling (largest representable magnitude before ±inf).
+    _FP16_MAX: float = 65504.0
+
+    @staticmethod
+    def _assert_boxcar_accum_headroom(
+        config: CubePipelineConfig, detector: DeterministicDetector,
+    ) -> None:
+        """Fail-fast guard against a boxcar-overflow misconfiguration.
+
+        The detector's DM-axis then time-axis boxcars SUM the
+        σ-normalised, ``±detector_input_clip_sigma``-clamped cube. The
+        largest value the accumulation can reach is
+
+            input_clip_sigma × max(k_dm_width) × max(k_time_width)
+
+        (the two summed axes, worst-case widths taken from the live
+        kernel bank). If that cumsum runs in fp16 it must stay below the
+        fp16 finite ceiling or it overflows to ±inf and the subsequent
+        DM-difference yields NaN, silently poisoning the tile. fp32/bf16
+        accum has the exponent range to hold it; only fp16 is at risk, so
+        the check only fires for an explicit fp16 accum override.
+        """
+        if getattr(detector, "boxcar_accum_dtype", None) is not torch.float16:
+            return
+        clip = float(config.detector_input_clip_sigma)
+        if clip <= 0.0:
+            return
+        bank = detector.kernel_bank
+        if not bank:
+            return
+        max_k_dm = max(int(k.k_dm_width) for k in bank)
+        max_k_time = max(int(k.k_time_width) for k in bank)
+        worst_case_sum = clip * max_k_dm * max_k_time
+        if worst_case_sum >= CubePipeline._FP16_MAX:
+            raise ValueError(
+                "boxcar accumulator overflow: detector boxcar_accum_dtype="
+                "fp16 with detector_input_clip_sigma="
+                f"{clip:g} and worst-case boxcar widths "
+                f"(k_dm={max_k_dm} × k_time={max_k_time}) gives a peak "
+                f"accumulation of {worst_case_sum:g} ≥ the fp16 ceiling "
+                f"{CubePipeline._FP16_MAX:g}. Use boxcar_accum_dtype=fp32 "
+                "(or bf16), or lower detector_input_clip_sigma."
+            )
+
     def __init__(
         self,
         config: CubePipelineConfig,
@@ -768,6 +812,7 @@ class CubePipeline:
     ) -> None:
         self.config = config
         self.detector = detector
+        self._assert_boxcar_accum_headroom(config, detector)
         self.layer1_state = layer1_state
         # M7.4 fix: detector.forward(..., fine_dm_pc_cm3=...) is what
         # makes the decoder write the actual physical DM (pc/cc) into

@@ -856,6 +856,15 @@ class DeterministicDetector(torch.nn.Module):
         """
         return self._kernel_bank
 
+    @property
+    def boxcar_accum_dtype(self) -> Optional[torch.dtype]:
+        """Cumsum-accumulation dtype override for the boxcar fast-path
+        (``None`` ⇒ the chunk-8 default: fp32 accum for fp16/bf16 cubes).
+        Exposed so the pipeline can fail-fast on an fp16-accum + high
+        input-clip combination that would overflow the boxcar sum (see
+        ``CubePipeline.__init__``)."""
+        return self._boxcar_accum_dtype
+
     def forward(
         self,
         cube: torch.Tensor,
