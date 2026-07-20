@@ -55,6 +55,56 @@ def _make_pipe(*, clip: float) -> CubePipeline:
     return CubePipeline(config=cfg, detector=det)
 
 
+def _make_pipe_with_accum(
+    *, clip: float, accum: "torch.dtype | None",
+) -> CubePipeline:
+    """Like ``_make_pipe`` but with an explicit boxcar accumulator dtype,
+    for the fp16-overflow fail-fast guard tests."""
+    cfg = CubePipelineConfig(
+        n_grid=16,
+        device="cpu",
+        cube_dtype=torch.float16,
+        image_backend="cpu",
+        detector_input_clip_sigma=clip,
+    )
+    det = DeterministicDetector(
+        threshold_sigma=999.0,
+        detector_version="v1.M5",
+        search_node_id=0,
+        gpu_half=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        boxcar_accum_dtype=accum,
+    )
+    return CubePipeline(config=cfg, detector=det)
+
+
+def test_fp16_accum_high_clip_raises() -> None:
+    """fp16 boxcar accum + a clip whose worst-case boxcar sum reaches the
+    fp16 ceiling must fail fast at pipeline construction."""
+    with pytest.raises(ValueError, match="boxcar accumulator overflow"):
+        _make_pipe_with_accum(clip=1000.0, accum=torch.float16)
+
+
+def test_fp32_accum_high_clip_ok() -> None:
+    """fp32 accum has the range: the same high clip must NOT raise."""
+    pipe = _make_pipe_with_accum(clip=1000.0, accum=torch.float32)
+    assert pipe.config.detector_input_clip_sigma == 1000.0
+
+
+def test_fp16_accum_low_clip_ok() -> None:
+    """fp16 accum with a small clip stays under the fp16 ceiling."""
+    pipe = _make_pipe_with_accum(clip=1.0, accum=torch.float16)
+    assert pipe.detector.boxcar_accum_dtype is torch.float16
+
+
+def test_default_accum_high_clip_ok() -> None:
+    """The default (None) accum uses fp32 for fp16 cubes, so the guard
+    (which only fires for an explicit fp16 override) does not trip."""
+    pipe = _make_pipe_with_accum(clip=1000.0, accum=None)
+    assert pipe.detector.boxcar_accum_dtype is None
+
+
 def _cube_with_plateau(value: float = 60000.0) -> torch.Tensor:
     """[T=8, F=2, 16, 16] fp16 cube: unit noise floor + a 4-sample
     ``value`` plateau at one pixel (the post-nan_to_num artefact

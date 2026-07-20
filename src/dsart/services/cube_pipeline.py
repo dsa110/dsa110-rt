@@ -173,6 +173,11 @@ class CubePipelineConfig:
             ``torch.complex64`` for the cf32 numerical-audit fallback).
             Must be compatible with ``cube_dtype``: complex32 →
             float16, complex64 → float32.
+        imager_uv_prescale: constant folded into the GPU imager's
+            uv_batch before the inverse FFT (see
+            ``GpuImagerConfig.imager_uv_prescale``). Default 1.0
+            (identity); ~1/256 keeps bright bursts inside the fp16 FFT
+            range without changing the σ-normalised detection statistic.
         quantise_target_max: clip target for the host-side
             cf → cint8 quantiser. The D25 default is 120 (leaves
             headroom for chgroup-summed roundoff).
@@ -200,6 +205,13 @@ class CubePipelineConfig:
     gpu_n_fdm: Optional[int] = None
     gpu_n_chgroup: int = N_CHGROUP
     gpu_complex_dtype: torch.dtype = torch.complex32
+    # Constant folded into the GPU imager's uv_batch before the inverse
+    # FFT (forwarded to ``GpuImagerConfig.imager_uv_prescale``). Default
+    # 1.0 is bit-identical to the pre-prescale path; production sets
+    # ~1/256 so bright bursts don't overflow the fp16 FFT butterflies.
+    # Layer-1 re-estimates σ from the scaled cube, so ``cube/σ`` (and
+    # therefore the detector) is invariant to this constant.
+    imager_uv_prescale: float = 1.0
     quantise_target_max: int = 120
     bake_quantise_scale: bool = True
     # M7.4 (fp16 imager safety):
@@ -231,28 +243,34 @@ class CubePipelineConfig:
     # in the raw cube (e.g. ``bench/imager_only_gpu.py``).
     gpu_imager_apply_per_chgroup_calibration: bool = False
 
-    # 2026-06-10 — Bright-burst / fp16-overflow hardening
+    # Bright-burst / fp16-overflow hardening — updated 2026-07 (SNR
+    # linearity change set)
     # ---------------------------------------------------
     # ``detector_input_clip_sigma``: symmetric clamp (in σ units)
     # applied to the Layer-1-normalised cube immediately before
     # ``Detector.forward()``. 0.0 disables (legacy behaviour).
     #
-    # Why: very bright injections/bursts overflow the cuFFT-cfp16
-    # butterflies → ±inf at the burst pixels → ``_clamp_inf_to_finite``
-    # rewrites them to ±60000 (finite, fp16-safe in isolation). But the
-    # detector's boxcar stages SUM those cells: a w=4 time boxcar over
-    # 60000-valued cells is 240000 → fp16 inf in the score tensor, and
-    # the subsequent DM-axis boxcar computes inf − inf = NaN, silently
-    # poisoning the whole tile. Observed live 2026-06-10: probes at
-    # ≥1.4e-3 Jy·ms (peak ≳35σ) produce NO candidates at all while
-    # 0.5–1.0e-3 Jy·ms probes match cleanly at SNR 30–50.
+    # History: the original (2026-06) failure was the cuFFT-cfp16
+    # imager butterflies overflowing on bright bursts (peak ≳35σ) →
+    # ±inf → ``_clamp_inf_to_finite`` rewrote them to ±60000; the
+    # detector boxcars then SUMMED those cells to fp16 inf, and the
+    # DM-axis difference computed inf − inf = NaN, silently poisoning
+    # the whole tile. The stop-gap was a 250σ input clip.
     #
-    # With a clip of C, the worst-case boxcar sum is
-    # ``C × k_time_width(64) × k_dm_width(3) = 192·C``; C = 250 keeps
-    # that at 48000 < 65504 (fp16 max), so every score stays finite and
-    # a >250σ burst degrades to a saturated-but-reported candidate
-    # instead of vanishing. 250σ is far above any calibratable signal
-    # and far below the 60000 artefact plateau.
+    # Current regime: the imager applies a constant UV pre-scale
+    # (``imager_uv_prescale`` = 1/256, see ``image/imager_gpu.py``)
+    # BEFORE the fp16 FFT, which shrinks the raw dynamic range the
+    # butterflies carry so the transform stays linear (no overflow) out
+    # to ~1000σ — far past the old ~35σ cliff. The pre-scale cancels
+    # exactly in the σ-normalised detection statistic, so SNR is
+    # unchanged. ``detector_input_clip_sigma`` = 1000 is now only a
+    # backstop against a pathological residual, not the primary defence.
+    #
+    # Given the raised clip, the boxcar accumulation MUST run in fp32
+    # (``detector_boxcar_accum_dtype = fp32``): the worst-case boxcar
+    # sum is ``C × k_dm_width × k_time_width`` and at C = 1000 that
+    # blows past the 65504 fp16 ceiling. ``CubePipeline.__init__``
+    # asserts this fp16-accum-vs-clip invariant at service start.
     detector_input_clip_sigma: float = 0.0
 
     # M7.7.2 — Carry-over re-imaging
@@ -746,6 +764,50 @@ class CubePipeline:
     instances bound to different GPU streams, but that's chunk-6b-prod).
     """
 
+    #: fp16 finite ceiling (largest representable magnitude before ±inf).
+    _FP16_MAX: float = 65504.0
+
+    @staticmethod
+    def _assert_boxcar_accum_headroom(
+        config: CubePipelineConfig, detector: DeterministicDetector,
+    ) -> None:
+        """Fail-fast guard against a boxcar-overflow misconfiguration.
+
+        The detector's DM-axis then time-axis boxcars SUM the
+        σ-normalised, ``±detector_input_clip_sigma``-clamped cube. The
+        largest value the accumulation can reach is
+
+            input_clip_sigma × max(k_dm_width) × max(k_time_width)
+
+        (the two summed axes, worst-case widths taken from the live
+        kernel bank). If that cumsum runs in fp16 it must stay below the
+        fp16 finite ceiling or it overflows to ±inf and the subsequent
+        DM-difference yields NaN, silently poisoning the tile. fp32/bf16
+        accum has the exponent range to hold it; only fp16 is at risk, so
+        the check only fires for an explicit fp16 accum override.
+        """
+        if getattr(detector, "boxcar_accum_dtype", None) is not torch.float16:
+            return
+        clip = float(config.detector_input_clip_sigma)
+        if clip <= 0.0:
+            return
+        bank = detector.kernel_bank
+        if not bank:
+            return
+        max_k_dm = max(int(k.k_dm_width) for k in bank)
+        max_k_time = max(int(k.k_time_width) for k in bank)
+        worst_case_sum = clip * max_k_dm * max_k_time
+        if worst_case_sum >= CubePipeline._FP16_MAX:
+            raise ValueError(
+                "boxcar accumulator overflow: detector boxcar_accum_dtype="
+                "fp16 with detector_input_clip_sigma="
+                f"{clip:g} and worst-case boxcar widths "
+                f"(k_dm={max_k_dm} × k_time={max_k_time}) gives a peak "
+                f"accumulation of {worst_case_sum:g} ≥ the fp16 ceiling "
+                f"{CubePipeline._FP16_MAX:g}. Use boxcar_accum_dtype=fp32 "
+                "(or bf16), or lower detector_input_clip_sigma."
+            )
+
     def __init__(
         self,
         config: CubePipelineConfig,
@@ -756,6 +818,7 @@ class CubePipeline:
     ) -> None:
         self.config = config
         self.detector = detector
+        self._assert_boxcar_accum_headroom(config, detector)
         self.layer1_state = layer1_state
         # M7.4 fix: detector.forward(..., fine_dm_pc_cm3=...) is what
         # makes the decoder write the actual physical DM (pc/cc) into
@@ -1098,6 +1161,7 @@ class CubePipeline:
                 envelope_threshold=cfg.edge_mask_envelope_threshold,
                 cube_dtype=cfg.cube_dtype,
                 complex_dtype=cfg.gpu_complex_dtype,
+                imager_uv_prescale=cfg.imager_uv_prescale,
                 device=self._device,
             ))
             _LOG.info(
