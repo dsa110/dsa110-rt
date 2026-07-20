@@ -272,6 +272,26 @@ def test_unclassified_set(db):
     # EV2 (cleared) and EV3 (source only) are NOT classified.
 
 
+def test_annotated_events_union_includes_cleared_and_sources(db):
+    """annotated_events() = every event a human ever touched (union of
+    classifications, source_names, event_positions) — including ones later
+    cleared, so the /bursts list keeps them forever."""
+    ann.add_user("vishnu", db)
+    ann.classify("EV1", "vishnu", "FRB", db)
+    ann.classify("EV2", "vishnu", "RFI", db)
+    ann.classify("EV2", "vishnu", None, db)          # cleared, still touched
+    ann.set_source("EV3", "vishnu", "B1913+16", db)  # source only
+    ann.set_position("EV4", 10.0, 20.0, 5.0, 5.0, "vlbi", "vishnu",
+                     db_path=db)                      # refined position only
+    assert ann.annotated_events(db) == {"EV1", "EV2", "EV3", "EV4"}
+    # classified_events() is the strict subset with a CURRENT label.
+    assert ann.classified_events(db) == {"EV1"}
+
+
+def test_annotated_events_empty_db(db):
+    assert ann.annotated_events(db) == set()
+
+
 # ---------------------------------------------------------------------------
 # Query surface: current vs history, B1913+16 count-by-date
 # ---------------------------------------------------------------------------
@@ -525,8 +545,12 @@ def test_bursts_page_zombie_tab_and_source_filter(client):
         _ev("260714zzzz", c3_action="KEEP", mtime_unix=now - 60),
         _ev("260713qqqq", mtime_unix=now - 7200),   # zombie
     ]
-    with mock.patch.object(app_mod.cands_browser, "list_events",
-                           return_value=events):
+    listing = cpf.EventListing(
+        events=events, n_total=len(events), n_newest=len(events),
+        n_annotated=0, truncated=False,
+    )
+    with mock.patch.object(app_mod.cands_browser, "list_events_detailed",
+                           return_value=listing):
         r = client.get("/bursts")
         html = r.get_data(as_text=True)
         assert r.status_code == 200

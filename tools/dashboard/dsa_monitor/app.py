@@ -575,7 +575,12 @@ def _refined_positions_bulk() -> dict:
 
 @app.route("/bursts")
 def bursts():
-    events = cands_browser.list_events()
+    # Annotation-aware listing: the newest-N-by-mtime window UNION every
+    # human-annotated event (so classified events / named sources stay
+    # visible + searchable forever, never ageing out of the cap). The
+    # counts drive the truncation notice below.
+    listing = cands_browser.list_events_detailed()
+    events = listing.events
     # Split by C3 cube-veto outcome. Fresh events C3 has not judged yet
     # (< 1 h old) ride the PASS tab with a "pending" badge — the
     # operator wants new triggers front and centre, and fail-open is
@@ -623,6 +628,10 @@ def bursts():
         annot_source_names=annot_source_names,
         events_zombie=events_zombie,
         refined_positions=_refined_positions_bulk(),
+        listing_truncated=listing.truncated,
+        listing_n_total=listing.n_total,
+        listing_n_newest=listing.n_newest,
+        listing_n_annotated=listing.n_annotated,
     ))
 
 

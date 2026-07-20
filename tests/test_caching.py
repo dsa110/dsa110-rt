@@ -115,9 +115,16 @@ def test_static_js_long_cache(client):
     assert "max-age=2592000" in r.headers.get("Cache-Control", "")
 
 
+def _listing(events):
+    return cpf.EventListing(
+        events=events, n_total=len(events), n_newest=len(events),
+        n_annotated=0, truncated=False,
+    )
+
+
 def test_templates_version_stamp_static(client, app_module):
-    with mock.patch.object(app_module.cands_browser, "list_events",
-                           return_value=[]):
+    with mock.patch.object(app_module.cands_browser, "list_events_detailed",
+                           return_value=_listing([])):
         html = client.get("/bursts").get_data(as_text=True)
     assert "/static/typeahead.js?v=" in html
 
@@ -129,8 +136,8 @@ def test_templates_version_stamp_static(client, app_module):
 
 def test_bursts_html_etag_304(client, app_module):
     events = [_ev("260714aaaa")]
-    with mock.patch.object(app_module.cands_browser, "list_events",
-                           return_value=events):
+    with mock.patch.object(app_module.cands_browser, "list_events_detailed",
+                           return_value=_listing(events)):
         r = client.get("/bursts")
         assert r.status_code == 200
         assert r.headers.get("Cache-Control") == "no-cache"
@@ -141,8 +148,8 @@ def test_bursts_html_etag_304(client, app_module):
         assert r2.get_data() == b""
         # Changed content -> full 200 again (stale ETag must not 304).
         events2 = [_ev("260714bbbb")]
-    with mock.patch.object(app_module.cands_browser, "list_events",
-                           return_value=events2):
+    with mock.patch.object(app_module.cands_browser, "list_events_detailed",
+                           return_value=_listing(events2)):
         r3 = client.get("/bursts", headers={"If-None-Match": etag})
         assert r3.status_code == 200
 

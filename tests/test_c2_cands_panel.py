@@ -13,6 +13,14 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_annot_db(tmp_path, monkeypatch):
+    """Never let list_events()/_fetch_annotated_ids() touch the live
+    ~/.dsa_monitor/annotations.db during tests — point it at a throwaway
+    path so the DB read is empty + side-effect-free."""
+    monkeypatch.setenv("DSA_MONITOR_ANNOT_DB", str(tmp_path / "annot.db"))
+
+
 @pytest.fixture(scope="module")
 def cands_panel():
     """Import the dashboard sibling module without polluting sys.modules."""
@@ -221,3 +229,105 @@ def test_event_detail_carries_c3_and_voltages(tmp_path, cands_panel) -> None:
     d = cands_panel.ArchiveBrowser(tmp_path).event_detail("260714eeee")
     assert d.c3_decision["action"] == "KEEP"
     assert d.n_voltages == 3
+
+
+# ---- annotation-aware listing: annotated events never age out -------------
+#
+# list_events_detailed() unions the newest max_events dirs with EVERY
+# annotated event, so a human-classified/named event stays visible +
+# searchable forever. annotated_ids is injected here so the union logic is
+# tested without touching the annotations DB.
+
+
+def _mk_events_by_age(root: Path, n: int) -> list:
+    """Create n event dirs, oldest → newest by mtime. Returns names in
+    newest-first order (matching list_events output order)."""
+    import os
+    names = [f"2605{i:02d}zzzz"[:10] for i in range(n)]
+    now = 1_700_000_000
+    for i, name in enumerate(names):
+        ev = _layout_event(root, name)
+        # i=0 oldest, i=n-1 newest.
+        os.utime(ev, (now + i, now + i))
+    return list(reversed(names))  # newest first
+
+
+def test_annotated_event_older_than_cap_is_still_returned(
+    tmp_path, cands_panel,
+) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    newest_first = _mk_events_by_age(root, 10)
+    old_annotated = newest_first[-1]   # the single oldest dir
+    ab = cands_panel.ArchiveBrowser(root, max_events=3)
+    # Without the annotation the cap drops it.
+    plain = ab.list_events_detailed(annotated_ids=set())
+    assert old_annotated not in [e.name for e in plain.events]
+    assert plain.truncated is True
+    assert plain.n_total == 10
+    assert plain.n_newest == 3
+    assert plain.n_annotated == 0
+    # With the annotation it is merged back — at its true (oldest) position,
+    # NOT pinned to the top.
+    detailed = ab.list_events_detailed(annotated_ids={old_annotated})
+    names = [e.name for e in detailed.events]
+    assert old_annotated in names
+    assert names[:3] == newest_first[:3]     # newest three unchanged, on top
+    assert names[-1] == old_annotated        # annotated one sits at the bottom
+    assert detailed.n_total == 10
+    assert detailed.n_newest == 3
+    assert detailed.n_annotated == 1
+    assert detailed.truncated is True
+
+
+def test_annotated_event_inside_window_not_double_counted(
+    tmp_path, cands_panel,
+) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    newest_first = _mk_events_by_age(root, 10)
+    inside = newest_first[0]  # newest dir, already inside the cap
+    ab = cands_panel.ArchiveBrowser(root, max_events=3)
+    detailed = ab.list_events_detailed(annotated_ids={inside})
+    names = [e.name for e in detailed.events]
+    assert names.count(inside) == 1          # no duplicate row
+    assert len(detailed.events) == 3
+    assert detailed.n_annotated == 0         # it was already in-window
+
+
+def test_annotation_pointing_at_missing_dir_is_skipped(
+    tmp_path, cands_panel,
+) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 5)
+    ab = cands_panel.ArchiveBrowser(root, max_events=3)
+    # An annotation whose candidate dir was deleted must not crash the page.
+    detailed = ab.list_events_detailed(annotated_ids={"260101dead"})
+    assert "260101dead" not in [e.name for e in detailed.events]
+    assert detailed.n_annotated == 0
+    assert len(detailed.events) == 3
+
+
+def test_listing_not_truncated_when_under_cap(tmp_path, cands_panel) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 2)
+    ab = cands_panel.ArchiveBrowser(root, max_events=10)
+    detailed = ab.list_events_detailed(annotated_ids=set())
+    assert detailed.truncated is False
+    assert detailed.n_total == 2
+    assert detailed.n_newest == 2
+    assert detailed.n_annotated == 0
+
+
+def test_list_events_wrapper_matches_detailed(tmp_path, cands_panel) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 4)
+    ab = cands_panel.ArchiveBrowser(root, max_events=2)
+    # list_events() reads annotated ids from the DB (empty here) — the row
+    # list must equal the detailed listing's events.
+    assert [e.name for e in ab.list_events()] == [
+        e.name for e in ab.list_events_detailed().events
+    ]

@@ -588,6 +588,30 @@ def classified_events(db_path: Optional[str] = None) -> set[str]:
     return {e for e, blk in cur.items() if blk.get("labels")}
 
 
+def annotated_events(db_path: Optional[str] = None) -> set[str]:
+    """Every event a human has ever touched: the UNION of event ids that
+    appear in ``classifications``, ``source_names`` or ``event_positions``.
+
+    This is deliberately *append-only aware* — it includes events whose
+    annotation was later cleared (a NULL-label classification, a cleared
+    source, a cleared position). Any human interaction, even one since
+    undone, means the event was worth a look, so the /bursts list keeps
+    it visible and searchable forever regardless of age (it never falls
+    out of the newest-N archive window). One cheap query per table over
+    the indexed ``event`` columns. Cleared-vs-active semantics stay in
+    :func:`all_current` / :func:`get_positions_bulk`, which power the
+    actual badges and the ``?source=`` / ``?tag=`` matching."""
+    with _conn(db_path) as conn:
+        out: set[str] = set()
+        for sql in (
+            "SELECT DISTINCT event FROM classifications",
+            "SELECT DISTINCT event FROM source_names",
+            "SELECT DISTINCT event FROM event_positions",
+        ):
+            out.update(r["event"] for r in conn.execute(sql).fetchall())
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary (autocomplete surface)
 # ---------------------------------------------------------------------------
