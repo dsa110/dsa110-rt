@@ -30,6 +30,18 @@
 #define UDP_DATA     4608           /* obs bytes per packet              */
 #define UDP_PAYLOAD  4616           /* header + datasize                 */
 
+/* The wire sequence field is 35 bits, ticking at 32.768 us (one tick
+ * per native time sample; 2 samples per packet), zeroed at the SNAP
+ * GPS-PPS arm. It therefore wraps every 2^35 ticks = 13.0312 days.
+ * DSART unwraps it at decode time (see recv_thread) so all block
+ * byte-math — and the armed_mjd + block_n * BLOCK_S absolute time
+ * tagging derived from it — stays monotonic across wraps within a
+ * capture run. (2026-07-20 incident: an un-handled wrap parked every
+ * packet in the too-late branch and silently stopped block writes
+ * fleet-wide at SNAP-sync + 13.031 d.) */
+#define DSART_SEQ_WRAP (1ULL << 35)
+#define DSART_SEQ_HALF (1ULL << 34)
+
 /* SNAP topology: 32 SNAPs per capture pair (16 per UDP port).
  * Each SNAP packet carries 3 antennas; 32 SNAPs * 3 ants = 96 ants
  * in the merged voltage tensor. */

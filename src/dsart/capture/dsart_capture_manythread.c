@@ -564,6 +564,30 @@ void control_thread(void *arg)
 
         if (strcmp(cmd, "UTC_START") == 0) {
             UTC_START = strtoull(val, &endptr, 0);
+            /* DSART wrap-awareness: the recv threads run on the
+             * UNWRAPPED sequence (raw + k * 2^35). If this process
+             * has already unwrapped past 2^35 and the operator arms
+             * with a value computed from a raw-era counter read,
+             * lift the arm value into the current era so the
+             * seq >= UTC_START - 50 gate can still be reached.
+             * (mon last_seq_no is stamped with the unwrapped value,
+             * so tools that arm via compute_arm_seq are already in
+             * the right era and the lift is a no-op for them.) */
+            if (MON != NULL) {
+                uint64_t cur = atomic_load_explicit(
+                    &MON->last_seq_no, memory_order_acquire);
+                uint64_t lifted = UTC_START;
+                while (lifted + DSART_SEQ_HALF < cur)
+                    lifted += DSART_SEQ_WRAP;
+                if (lifted != UTC_START) {
+                    syslog(LOG_NOTICE,
+                           "control_thread: lifted UTC_START %" PRIu64
+                           " -> %" PRIu64 " into the unwrapped era "
+                           "(last_seq_no=%" PRIu64 ")",
+                           UTC_START, lifted, cur);
+                    UTC_START = lifted;
+                }
+            }
             if (MON != NULL) {
                 atomic_store_explicit(&MON->utc_start_specnum, UTC_START,
                                       memory_order_release);
@@ -644,6 +668,14 @@ void recv_thread(void *arg)
     uint64_t act_seq_no = 0;
     uint64_t block_seq_no = 0;
     uint64_t seq_no = 0, prev_seq_no = 0;
+    /* DSART wrap-awareness (2026-07-20): per-thread unwrap state for
+     * the 35-bit wire sequence. Each recv thread sees a near-ordered
+     * subset of the stream, so per-thread hysteresis needs no shared
+     * lock; all threads converge on the same absolute unwrapped
+     * values because unwrapped = raw + k * 2^35. */
+    uint64_t seq_wrap_k = 0;         /* wraps seen by THIS thread     */
+    uint64_t seq_last_unwrapped = 0; /* newest unwrapped seq observed */
+    int      seq_unwrap_init = 0;
     uint64_t ant_id = 0, aid;
     int64_t  byte_offset = 0;
     uint64_t seq_byte = 0;
@@ -721,6 +753,40 @@ void recv_thread(void *arg)
             seq_no |= (((uint64_t)(pktbuf[2])) << 11) & 522240;
             seq_no |= (((uint64_t)(pktbuf[1])) << 19) & 133693440;
             seq_no |= (((uint64_t)(pktbuf[0])) << 27) & 34225520640ULL;
+
+            /* DSART wrap-awareness (see dsart_capture_def.h): unwrap
+             * the 35-bit wire sequence into a monotonic 64-bit
+             * sequence. A backwards jump of more than half the range
+             * is a wrap (k++); a forwards jump of more than half the
+             * range is a pre-wrap straggler decoded just after the
+             * wrap ticked (fold back one era). Everything downstream
+             * (arm gate, block byte-math, skip accounting, the mon
+             * last_seq_no the operator arms against) sees the
+             * unwrapped value, so block numbering — and the
+             * armed_mjd + block_n * BLOCK_S time tagging — stays
+             * exact across wraps within a run. */
+            {
+                uint64_t cand = seq_no + seq_wrap_k * DSART_SEQ_WRAP;
+                if (seq_unwrap_init) {
+                    if (cand + DSART_SEQ_HALF < seq_last_unwrapped) {
+                        seq_wrap_k++;
+                        cand += DSART_SEQ_WRAP;
+                        syslog(LOG_NOTICE,
+                               "recv_thread %d: seq wrap #%" PRIu64
+                               " (raw=%" PRIu64 " unwrapped=%" PRIu64
+                               ")", thread_id, seq_wrap_k, seq_no,
+                               cand);
+                    } else if (cand > seq_last_unwrapped + DSART_SEQ_HALF
+                               && cand >= DSART_SEQ_WRAP) {
+                        cand -= DSART_SEQ_WRAP;
+                    }
+                }
+                if (!seq_unwrap_init || cand > seq_last_unwrapped)
+                    seq_last_unwrapped = cand;
+                seq_unwrap_init = 1;
+                seq_no = cand;
+            }
+
             ant_id = 0;
             ant_id |= (unsigned char)(pktbuf[6]) << 8;
             ant_id |= (unsigned char)(pktbuf[7]);

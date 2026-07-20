@@ -88,6 +88,52 @@ try:
 except ImportError:  # pragma: no cover — dev hosts without astropy
     _HAVE_ASTROPY = False
 
+# ---------------------------------------------------------------------------
+# SNAP PPS arm anchoring (2026-07-20)
+# ---------------------------------------------------------------------------
+#: Wire sequence tick (one native time sample) and the 35-bit wrap.
+#: The SNAP counter is zeroed on a GPS-locked PPS edge at the SNAP arm
+#: and the wire seq field wraps every 2^35 ticks = 13.0312 days.
+SNAP_SEQ_TICK_US: float = 32.768
+SNAP_SEQ_WRAP: int = 1 << 35
+
+#: /mon/snap/<N>/armed_mjd keys written by the SNAP arm cycle hold the
+#: PPS epoch (MJD of seq 0). N=1 is EXCLUDED: that key is the legacy
+#: singleton this service overwrites as the capture-arm record.
+SNAP_PPS_EPOCH_IDS = tuple(range(2, 18))
+#: Minimum number of per-SNAP epochs that must agree for the PPS path.
+SNAP_PPS_MIN_AGREE: int = 3
+#: Agreement tolerance between per-SNAP epochs (10 ms in days).
+SNAP_PPS_TOL_DAYS: float = 10e-3 / 86400.0
+#: Sanity window: a PPS-derived armed_mjd farther than this from the
+#: wall clock means a stale/incoherent epoch — fall back to the latch.
+SNAP_PPS_SANITY_S: float = 600.0
+
+
+def compute_pps_armed_mjd(
+    pps_epoch_mjd: float, arm_seq: int, now_mjd: float,
+) -> "tuple[float, int]":
+    """MJD at which the SNAP counter reaches ``arm_seq`` (wrap-aware).
+
+    The SNAP wire sequence is zeroed on the GPS PPS recorded at
+    ``pps_epoch_mjd`` and ticks at 32.768 µs, wrapping every 2^35
+    ticks. ``arm_seq`` (the UTC_START value) is defined modulo the
+    wrap, so the absolute arm time is
+    ``epoch + (arm_seq + k·2^35)·tick`` with the wrap count ``k``
+    chosen so the result lands nearest the wall clock ``now_mjd``
+    (the verb is always issued within seconds of the arm moment,
+    vastly inside the ±6.5-day wrap ambiguity).
+
+    Returns ``(armed_mjd, k)``.
+    """
+    tick_days = SNAP_SEQ_TICK_US * 1e-6 / 86400.0
+    wrap_days = SNAP_SEQ_WRAP * tick_days
+    base = pps_epoch_mjd + (arm_seq % SNAP_SEQ_WRAP) * tick_days
+    k = int(round((now_mjd - base) / wrap_days))
+    if k < 0:
+        k = 0
+    return base + k * wrap_days, k
+
 from dsautils.dsa_store import DsaStore
 
 LOG = logging.getLogger("dsart.services.dsart_rt")
@@ -871,6 +917,40 @@ class RtOrchestrator:
             self._state = "stopped"
             LOG.info("verb stop: clean")
 
+    def _read_snap_pps_epoch(self) -> Optional[float]:
+        """The SNAP GPS-PPS arm epoch (MJD of wire-seq 0), or None.
+
+        Reads the per-SNAP ``/mon/snap/<N>/armed_mjd`` keys written by
+        the SNAP arm cycle (N ≥ 2 — N=1 is the legacy singleton this
+        service itself overwrites below) and returns their consensus
+        when at least ``SNAP_PPS_MIN_AGREE`` agree to
+        ``SNAP_PPS_TOL_DAYS``. Best-effort: any etcd trouble → None
+        (the caller falls back to the wall latch).
+        """
+        vals: list[float] = []
+        for n in SNAP_PPS_EPOCH_IDS:
+            try:
+                doc = self._store.get_dict(f"/mon/snap/{n}/armed_mjd")
+            except Exception:                          # noqa: BLE001
+                continue
+            if isinstance(doc, dict):
+                v = doc.get("armed_mjd")
+                if isinstance(v, (int, float)) and 50000.0 < v < 80000.0:
+                    vals.append(float(v))
+        if len(vals) < SNAP_PPS_MIN_AGREE:
+            return None
+        vals.sort()
+        med = vals[len(vals) // 2]
+        agree = [v for v in vals if abs(v - med) <= SNAP_PPS_TOL_DAYS]
+        if len(agree) < SNAP_PPS_MIN_AGREE:
+            LOG.warning(
+                "SNAP PPS epochs disagree (spread %.3f s over %d snaps); "
+                "not using PPS anchoring",
+                (max(vals) - min(vals)) * 86400.0, len(vals),
+            )
+            return None
+        return med
+
     def _verb_utc_start(self, val: Any) -> None:
         seq = int(val) if val is not None else 0
         self._send_utc_udp(f"UTC_START-{seq}")
@@ -893,37 +973,83 @@ class RtOrchestrator:
         #    slow-vis archive grows wall-clock-wrong UVH5 files anchored
         #    on the stale armed_mjd. Their formula is
         #        get_time() = armed_mjd + utc_start * 4 * 8.192e-6 / 86400
-        #    so writing armed_mjd = now and utc_start = 0 evaluates the
-        #    anchor to "now" -- the wall-clock moment of this verb, which
-        #    is the right MJD for the next slow-vis frame (the unit of
-        #    `seq` in dsa110-rt is the SNAP-wall specnum, while the
-        #    legacy `utc_start` formula treats its value as native
-        #    samples, so writing seq verbatim would be unit-wrong; the
-        #    armed_mjd=now / utc_start=0 pair is unambiguous).
+        #    so writing utc_start = 0 makes armed_mjd itself the anchor.
+        #    2026-07-20: armed_mjd is now derived from the SNAP GPS-PPS
+        #    arm epoch + arm_seq x 32.768 us (wrap-aware) when the
+        #    per-SNAP epochs are available -- GPS-grade and exactly the
+        #    moment capture begins -- with the previous wall latch as
+        #    the recorded fallback (see the anchor block below; the
+        #    "source" field in the arm record says which one you got).
         try:
             self._store.put_dict(f"/mon/snap/1/utc_start_rt", {"val": seq})
         except Exception:  # noqa: BLE001
             LOG.exception("could not publish utc_start mirror to etcd")
-        if _HAVE_ASTROPY:
-            try:
-                now_mjd = float(Time.now().mjd)
-                self._store.put_dict(
-                    f"/mon/snap/1/armed_mjd", {"armed_mjd": now_mjd}
+        # ---- capture-arm time anchor (2026-07-20 PPS upgrade) ---------
+        # Preferred: derive armed_mjd from the SNAP GPS-PPS arm epoch
+        # (per-SNAP /mon/snap/<N>/armed_mjd) + arm_seq × 32.768 µs,
+        # wrap-aware. This is exact: the SNAP counter is zeroed on a
+        # known GPS PPS edge, so the moment it reaches `seq` is known
+        # to the PPS. The previous wall latch (armed_mjd = Time.now()
+        # at this verb) was NTP-grade and systematically EARLY by the
+        # arm margin (~1.8 s measured 2026-07-20) because capture
+        # only begins when the counter reaches seq. Fallback: the wall
+        # latch, with provenance recorded either way in the arm record
+        # so downstream consumers (search anchor, voltage manifests,
+        # dsamfs bridge — all read "armed_mjd") can tell which they
+        # got via the "source" field.
+        now_mjd = time.time() / 86400.0 + 40587.0
+        pps_epoch = self._read_snap_pps_epoch()
+        armed_mjd: Optional[float] = None
+        wrap_k = 0
+        source = "wall_latch"
+        if pps_epoch is not None:
+            cand, wrap_k = compute_pps_armed_mjd(pps_epoch, seq, now_mjd)
+            if abs(cand - now_mjd) * 86400.0 <= SNAP_PPS_SANITY_S:
+                armed_mjd = cand
+                source = "pps_epoch"
+                LOG.info(
+                    "utc_start: PPS-anchored armed_mjd=%.8f "
+                    "(epoch=%.8f arm_seq=%d wrap_k=%d; wall-latch "
+                    "would be %+.2f s off)",
+                    armed_mjd, pps_epoch, seq, wrap_k,
+                    (now_mjd - armed_mjd) * 86400.0,
                 )
-                self._store.put_dict(
-                    f"/mon/snap/1/utc_start", {"utc_start": 0}
-                )
-            except Exception:  # noqa: BLE001
-                LOG.exception(
-                    "could not refresh legacy /mon/snap/1/armed_mjd + "
-                    "/mon/snap/1/utc_start (slow-vis anchor); dsamfs may "
-                    "continue writing stale time tags"
+            else:
+                LOG.warning(
+                    "utc_start: PPS-derived armed_mjd %.8f is %+.1f s "
+                    "from the wall clock — stale/incoherent SNAP epoch? "
+                    "Falling back to the wall latch",
+                    cand, (cand - now_mjd) * 86400.0,
                 )
         else:
             LOG.warning(
-                "astropy unavailable: cannot refresh legacy "
-                "/mon/snap/1/armed_mjd + /mon/snap/1/utc_start; the "
-                "slow-vis UVH5 writer (dsamfs) will write stale time tags"
+                "utc_start: no SNAP PPS epoch consensus in etcd; "
+                "using the wall-latch armed_mjd (NTP-grade, ~2 s early)"
+            )
+        if armed_mjd is None:
+            armed_mjd = now_mjd
+        try:
+            self._store.put_dict(
+                f"/mon/snap/1/armed_mjd",
+                {
+                    "armed_mjd": float(armed_mjd),
+                    # Provenance (2026-07-20): how this anchor was made.
+                    "source": source,
+                    "pps_epoch_mjd": pps_epoch,
+                    "arm_seq": int(seq),
+                    "wrap_k": int(wrap_k),
+                    "seq_tick_us": SNAP_SEQ_TICK_US,
+                    "verb_wall_mjd": float(now_mjd),
+                },
+            )
+            self._store.put_dict(
+                f"/mon/snap/1/utc_start", {"utc_start": 0}
+            )
+        except Exception:  # noqa: BLE001
+            LOG.exception(
+                "could not refresh legacy /mon/snap/1/armed_mjd + "
+                "/mon/snap/1/utc_start (slow-vis anchor); dsamfs may "
+                "continue writing stale time tags"
             )
 
     def _verb_utc_stop(self, val: Any) -> None:
