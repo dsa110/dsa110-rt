@@ -140,3 +140,82 @@ def test_cli_prescale_lands_in_pipeline_config() -> None:
         enable_c1=False,
     )
     assert cfg.pipeline.imager_uv_prescale == 0.00390625
+
+
+# ---------------------------------------------------------------------------
+# fp16-FFT overflow / linearity extension (GPU-only)
+# ---------------------------------------------------------------------------
+#
+# These exercise the ACTUAL failure the pre-scale exists to prevent: the
+# complex-half (``complex32``) inverse FFT accumulates the un-normalised
+# DFT sum over all N² grid points in fp16. For a bright point source every
+# one of the N²=65536 terms adds constructively at the source pixel, so the
+# intermediate reaches ``|uv| · N²`` — past the fp16 finite ceiling (65504)
+# well before the final 1/N² normalisation divides it back down. The result
+# is ±inf at the burst pixel (then ±60000 after nan_to_num). Scaling the uv
+# slab by 1/256 first shrinks that intermediate 256× while leaving the
+# σ-normalised detection statistic unchanged (the FFT is linear).
+
+
+def _cuda_or_skip() -> "torch.device":
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required: complex32 ifft2 is a GPU-only path")
+    return torch.device("cuda")
+
+
+def _point_source_uv(n_grid: int, mag: float, device: "torch.device"):
+    """UV slab of a single on-axis point source: constant complex value
+    ``mag`` across the whole grid (⇔ a δ at the image origin). All N²
+    terms add in phase at the origin pixel, which is where the fp16
+    butterfly accumulation overflows."""
+    return torch.full(
+        (n_grid, n_grid), mag, dtype=torch.complex64, device=device
+    )
+
+
+def test_fp16_ifft2_overflows_without_prescale() -> None:
+    """Without the pre-scale, a bright point source drives the complex32
+    ifft2 non-finite (the regime the change set targets)."""
+    device = _cuda_or_skip()
+    n_grid = 256
+    # mag·N² = 8·65536 ≫ 65504, so the on-axis accumulation overflows.
+    uv = _point_source_uv(n_grid, mag=8.0, device=device).to(torch.complex32)
+    img = torch.fft.ifft2(uv).real
+    assert not torch.isfinite(img).all(), (
+        "expected fp16 ifft2 overflow for the un-prescaled bright source; "
+        "if this passes the fp16 FFT no longer overflows and the pre-scale "
+        "rationale needs revisiting"
+    )
+
+
+def test_fp16_ifft2_stays_finite_with_prescale() -> None:
+    """The 1/256 pre-scale keeps the same bright source finite through the
+    complex32 ifft2."""
+    device = _cuda_or_skip()
+    n_grid = 256
+    c = 0.00390625  # 1/256, production value
+    uv = _point_source_uv(n_grid, mag=8.0, device=device)
+    uv.mul_(c)  # pre-scale, exactly as GpuImager does before the FFT
+    img = torch.fft.ifft2(uv.to(torch.complex32)).real
+    assert torch.isfinite(img).all(), (
+        "pre-scaled bright source must survive the fp16 ifft2 finite"
+    )
+
+
+def test_fp16_prescale_preserves_sigma_normalised_peak() -> None:
+    """End-to-end linearity extension: the σ-normalised peak of the
+    pre-scaled fp16 image matches the fp32 reference, while the
+    un-prescaled fp16 image does not (it saturates)."""
+    device = _cuda_or_skip()
+    n_grid = 256
+    c = 0.00390625
+    uv = _point_source_uv(n_grid, mag=8.0, device=device)
+
+    ref = torch.fft.ifft2(uv).real  # fp32 reference, no overflow
+    ref_norm_peak = float((ref / ref.std()).max())
+
+    pre = torch.fft.ifft2((uv * c).to(torch.complex32)).real
+    pre_norm_peak = float((pre / pre.std()).max())
+
+    # σ-normalised peak is scale-invariant → prescaled fp16 tracks fp32.
+    assert pre_norm_peak == pytest.approx(ref_norm_peak, rel=0.02)
