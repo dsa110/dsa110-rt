@@ -724,14 +724,16 @@ def fire_calibration_probe(
                 matched_at = best.get("matched_at_unix")
                 if isinstance(observed_snr, (int, float)) and observed_snr > 0:
                     # 2026-06-10 saturation guard: the search-side
-                    # detector clips its σ-normalised input to ±250σ
-                    # (cube_pipeline detector_input_clip_sigma), so an
-                    # observed SNR at/above that rail carries NO
-                    # amplitude information — computing K from it
-                    # stores garbage (observed live: a DM-1000 probe
-                    # at 1.2e-3 Jy·ms reported snr=250.25 → K=14448 vs
-                    # the true ≈3300). Refuse to calibrate; the ladder
-                    # retries at LOWER fluence.
+                    # detector clips its σ-normalised input to
+                    # ±detector_input_clip_sigma (cube_pipeline /
+                    # dsart_search_rt.yaml), so an observed SNR at/above
+                    # that rail carries NO amplitude information —
+                    # computing K from it stores garbage (observed live
+                    # under the old 250σ clip: a DM-1000 probe at
+                    # 1.2e-3 Jy·ms reported snr=250.25 → K=14448 vs the
+                    # true ≈3300). Refuse to calibrate; the ladder
+                    # retries at LOWER fluence. The rail value lives in
+                    # SATURATION_OBSERVED_SNR (≈5 % below the clip).
                     if float(observed_snr) >= SATURATION_OBSERVED_SNR:
                         return ProbeResult(
                             ok=False, inj_id=inj_id, bucket=bucket,
@@ -929,10 +931,17 @@ DEFAULT_MAX_PROBE_FLUENCE: float = 1.0e-3
 
 #: Observed-SNR rail above which a match is treated as SATURATED and
 #: K is NOT stored. The search detector clips its σ-normalised input
-#: to ±250σ (cube_pipeline detector_input_clip_sigma = 250), so any
-#: observed SNR at/near that value is amplitude-blind. 240 leaves a
-#: little headroom for boxcar/normalisation wiggle around the rail.
-SATURATION_OBSERVED_SNR: float = 240.0
+#: to ±``detector_input_clip_sigma`` (cube_pipeline / dsart_search_rt.
+#: yaml), so any observed SNR at/near that rail is amplitude-blind —
+#: computing K from it stores garbage.
+#:
+#: Derivation: sit this guard ~5 % below the detector rail so a
+#: boxcar/normalisation wiggle just under the clip is still caught.
+#: 2026-07 the SNR-linearity change set raised the clip 250 → 1000
+#: (the imager UV pre-scale keeps the fp16 FFT linear far past the old
+#: overflow cliff), so the guard moves 240 → 950. If the clip changes
+#: again, update BOTH numbers together (guard ≈ 0.95 × clip).
+SATURATION_OBSERVED_SNR: float = 950.0
 
 #: Pause between ladder attempts (seconds). A probe absorbed into the
 #: detector's sigma_k EMA locally inflates the noise estimate at its
@@ -1257,7 +1266,7 @@ def fire_calibration_probe_with_ladder(
     results: List[ProbeResult] = []
     clamp = float(max_probe_fluence)
     # 2026-06-10: dynamic multiplier queue so a SATURATED attempt
-    # (observed SNR pinned at the detector's ±250σ input-clip rail —
+    # (observed SNR pinned at the detector's ±input_clip_sigma rail —
     # see fire_calibration_probe) can retry DOWNWARD. The classic
     # no_match path still walks the configured ascending ladder.
     pending: List[float] = list(ladder)
