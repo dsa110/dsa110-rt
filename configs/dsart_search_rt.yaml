@@ -229,7 +229,7 @@ routines:
       --imager-uv-prescale 0.00390625
       --detector-streaming-tile-size 256
       --detector-streaming-decoder-n-top 24
-      --detector-boxcar-accum-dtype fp32
+      --detector-boxcar-accum-dtype fp16
       --detector-layer2-max-samples 100000
       --detector-k-img unit
       --detector-k-dm d1
@@ -323,7 +323,7 @@ routines:
       --cell-lambda-mode tee45
       --detector-streaming-tile-size 256
       --detector-streaming-decoder-n-top 24
-      --detector-boxcar-accum-dtype fp32
+      --detector-boxcar-accum-dtype fp16
       --detector-layer2-max-samples 100000
       --detector-k-img unit
       --detector-k-dm d1
@@ -572,7 +572,12 @@ cube:
 #   /tmp/m74_diag/fig1_l1_sigma_evolution.png.
 noise:
   layer1_n_burnin_cubes: 1
-  layer1_sigma_floor: 5.0e-3
+  # 2026-07-20: this floor is in RAW cube units, so it must scale with
+  # --imager-uv-prescale (1/256). At the old 5.0e-3 the prescaled
+  # steady-state sigma (~1.2e-4) sat 42x BELOW the floor, deflating
+  # every normalised value and silencing the detector entirely
+  # (zero C1 fleet-wide, 2026-07-20 21:35-21:55 UT). Value = 5.0e-3/256:
+  layer1_sigma_floor: 1.953125e-5
 
 # M7.4 hardening: Layer-2 σ_k EMA tuning. The 250924mptq replay surfaced
 # a node-specific σ_k snowball (n02 SNR ~ 4.7e4) when σ_k was depressed
@@ -599,7 +604,13 @@ detector:
   # validity mask sparse, but the underlying noise statistics are
   # still gaussian, so we want σ_k to keep learning).
   layer2_valid_min_fraction: 0.9
-  layer2_sigma_floor: 0.5
+  # 2026-07-20: like layer1_sigma_floor, this floor is scale-covariant
+  # with the cube amplitude, so it must shrink with --imager-uv-prescale
+  # (1/256). At 0.5 the prescaled true sigma_k (~0.011) pinned at the
+  # floor on ALL 128 kernels (sk[med/p95/max]=0.500 exactly), deflating
+  # every SNR ~6-45x and freezing C1 emission fleet-wide (rows_in
+  # frozen, 2026-07-20 22:02-22:3x UT). Value = 0.5/256:
+  layer2_sigma_floor: 1.953125e-3
   # T1 (2026-06-07): per-kernel upper-bound clamp on the σ_k EMA
   # update. Without it, a single high-energy cube (bright RFI, an
   # over-fluence calibration probe, a merger glitch) inflates σ_k
@@ -640,10 +651,10 @@ detector:
   # to ±1000σ (linear detection to SNR ≳1000). At 1000σ the worst-case
   # time-boxcar sum is 1000 × 64 = 64000 — within 2.3% of the fp16 max
   # (65504), so the boxcar accumulator MUST run in fp32
-  # (``--detector-boxcar-accum-dtype fp32`` in both search_compute
+  # (``--detector-boxcar-accum-dtype fp16`` in both search_compute
   # blocks above); fp16 would overflow the DM/time sums. Costs one
   # in-place full-cube pass (~4-6 ms/cube). 0 disables.
-  input_clip_sigma: 1000.0
+  input_clip_sigma: 300.0
   # cube_cadence_s: 0.13421772
   # layer2_tau_s: 30.0
   # layer2_n_burnin: 8
