@@ -243,28 +243,34 @@ class CubePipelineConfig:
     # in the raw cube (e.g. ``bench/imager_only_gpu.py``).
     gpu_imager_apply_per_chgroup_calibration: bool = False
 
-    # 2026-06-10 — Bright-burst / fp16-overflow hardening
+    # Bright-burst / fp16-overflow hardening — updated 2026-07 (SNR
+    # linearity change set)
     # ---------------------------------------------------
     # ``detector_input_clip_sigma``: symmetric clamp (in σ units)
     # applied to the Layer-1-normalised cube immediately before
     # ``Detector.forward()``. 0.0 disables (legacy behaviour).
     #
-    # Why: very bright injections/bursts overflow the cuFFT-cfp16
-    # butterflies → ±inf at the burst pixels → ``_clamp_inf_to_finite``
-    # rewrites them to ±60000 (finite, fp16-safe in isolation). But the
-    # detector's boxcar stages SUM those cells: a w=4 time boxcar over
-    # 60000-valued cells is 240000 → fp16 inf in the score tensor, and
-    # the subsequent DM-axis boxcar computes inf − inf = NaN, silently
-    # poisoning the whole tile. Observed live 2026-06-10: probes at
-    # ≥1.4e-3 Jy·ms (peak ≳35σ) produce NO candidates at all while
-    # 0.5–1.0e-3 Jy·ms probes match cleanly at SNR 30–50.
+    # History: the original (2026-06) failure was the cuFFT-cfp16
+    # imager butterflies overflowing on bright bursts (peak ≳35σ) →
+    # ±inf → ``_clamp_inf_to_finite`` rewrote them to ±60000; the
+    # detector boxcars then SUMMED those cells to fp16 inf, and the
+    # DM-axis difference computed inf − inf = NaN, silently poisoning
+    # the whole tile. The stop-gap was a 250σ input clip.
     #
-    # With a clip of C, the worst-case boxcar sum is
-    # ``C × k_time_width(64) × k_dm_width(3) = 192·C``; C = 250 keeps
-    # that at 48000 < 65504 (fp16 max), so every score stays finite and
-    # a >250σ burst degrades to a saturated-but-reported candidate
-    # instead of vanishing. 250σ is far above any calibratable signal
-    # and far below the 60000 artefact plateau.
+    # Current regime: the imager applies a constant UV pre-scale
+    # (``imager_uv_prescale`` = 1/256, see ``image/imager_gpu.py``)
+    # BEFORE the fp16 FFT, which shrinks the raw dynamic range the
+    # butterflies carry so the transform stays linear (no overflow) out
+    # to ~1000σ — far past the old ~35σ cliff. The pre-scale cancels
+    # exactly in the σ-normalised detection statistic, so SNR is
+    # unchanged. ``detector_input_clip_sigma`` = 1000 is now only a
+    # backstop against a pathological residual, not the primary defence.
+    #
+    # Given the raised clip, the boxcar accumulation MUST run in fp32
+    # (``detector_boxcar_accum_dtype = fp32``): the worst-case boxcar
+    # sum is ``C × k_dm_width × k_time_width`` and at C = 1000 that
+    # blows past the 65504 fp16 ceiling. ``CubePipeline.__init__``
+    # asserts this fp16-accum-vs-clip invariant at service start.
     detector_input_clip_sigma: float = 0.0
 
     # M7.7.2 — Carry-over re-imaging
