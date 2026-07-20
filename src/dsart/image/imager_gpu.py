@@ -92,15 +92,17 @@ class GpuImagerConfig:
     # inverse FFT. At the default ``1.0`` the multiply is skipped
     # entirely and the imager is bit-identical to the pre-prescale path.
     #
-    # Physics: image-plane values ride at ~240 raw units per noise σ, so
-    # a burst ≳35σ drives the cfp16 ``irfft2``/``ifft2`` butterflies past
-    # the fp16 range (65504) to ±inf, which the cube-pipeline
+    # Physics: the cfp16 ``irfft2``/``ifft2`` accumulates un-normalised
+    # sums over all N²=65536 grid cells before the final 1/N² scaling,
+    # so a burst whose FINAL pixel is ≳1 raw unit (≈35σ at the measured
+    # image-plane σ_raw ≈ 0.03) already drives intermediate butterflies
+    # past the fp16 range (65504) to ±inf, which the cube-pipeline
     # ``_clamp_inf_to_finite`` rewrites to the ±60000 plateau (see the
-    # 2026-06-10 fp16-overflow note in ``services/cube_pipeline.py``) —
-    # the recovered burst then saturates instead of scaling linearly.
-    # Setting ``imager_uv_prescale`` to ~1/256 moves the image-plane
-    # noise σ from ~240 raw units to ~1, so the FFT butterflies no longer
-    # overflow for bursts up to ~1e4 σ. Downstream is invariant: Layer-1
+    # fp16-overflow note in ``services/cube_pipeline.py``) — the
+    # recovered burst then saturates instead of scaling linearly.
+    # Setting ``imager_uv_prescale`` to ~1/256 shrinks every
+    # intermediate sum 256×, moving the overflow ceiling from ~35σ to
+    # ~9000σ. Downstream is invariant: Layer-1
     # re-estimates σ from the scaled cube every cube, so the detection
     # statistic ``cube/σ`` is unchanged; only the raw dynamic range the
     # fp16 FFT must represent shrinks. The multiply stays in the

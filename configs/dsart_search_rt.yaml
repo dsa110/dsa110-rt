@@ -633,9 +633,9 @@ detector:
   # SUM those cells, driving the score tensor to fp16 inf and the DM-axis
   # boxcar to inf − inf = NaN — the burst (and its whole tile) silently
   # VANISHED. The companion ``--imager-uv-prescale 0.00390625`` (1/256)
-  # keeps the imager itself linear: it shrinks the image-plane noise σ
-  # from ~240 raw units to ~1 so the FFT no longer overflows for bursts
-  # up to ~1e4 σ, and Layer-1 re-estimates σ from the scaled cube so
+  # keeps the imager itself linear: it shrinks every intermediate FFT
+  # sum 256× so the un-normalised butterflies no longer overflow for
+  # bursts out to ~9000σ, and Layer-1 re-estimates σ from the scaled cube so
   # cube/σ is unchanged. This clamp is the downstream backstop, now set
   # to ±1000σ (linear detection to SNR ≳1000). At 1000σ the worst-case
   # time-boxcar sum is 1000 × 64 = 64000 — within 2.3% of the fp16 max
