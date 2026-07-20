@@ -150,6 +150,16 @@
 </div>
 {% endif %}
 
+{% if listing_truncated %}
+<div class="banner info trunc-note">
+    Showing the newest {{ listing_n_newest }} of {{ listing_n_total }} events{% if listing_n_annotated %}
+    (plus {{ listing_n_annotated }} older annotated event{{ 's' if listing_n_annotated != 1 }}, always shown){% endif %}.
+    Older un-annotated events are hidden by the list cap, but every
+    human-annotated event stays here forever — search by
+    <em>source</em> or filter by <em>classification</em> above to find it.
+</div>
+{% endif %}
+
 {% macro event_table(events, tab) %}
     {% if events %}
     <table class="metric" style="margin-top: 12px;">

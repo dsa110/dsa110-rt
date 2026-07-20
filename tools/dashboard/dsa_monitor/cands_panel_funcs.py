@@ -37,6 +37,7 @@ __all__ = [
     "ArchiveBrowser",
     "EventSummary",
     "EventDetail",
+    "EventListing",
     "DEFAULT_ARCHIVE_ROOT",
     "DEFAULT_MAX_EVENTS",
     "ZOMBIE_PENDING_AGE_S",
@@ -226,6 +227,32 @@ class EventDetail:
     dec_dms: Optional[str] = None     # "+DD:MM:SS(NN)"; no (NN) for legacy
 
 
+@dataclass(frozen=True)
+class EventListing:
+    """Result of :meth:`ArchiveBrowser.list_events_detailed`.
+
+    ``events`` is the merged newest-first table (the newest ``max_events``
+    dirs by mtime, plus every human-annotated event that fell outside that
+    window, re-sorted into chronological position). The counts drive the
+    /bursts truncation notice:
+
+      * ``n_total`` (M)     — every event dir on disk.
+      * ``n_newest`` (N)    — how many of the newest-by-mtime dirs are
+                              shown (``min(max_events, n_total)``).
+      * ``n_annotated`` (K) — annotated events shown that are OLDER than
+                              the newest-N window (added back so they are
+                              never dropped by the cap).
+      * ``truncated``       — True iff the cap actually bit
+                              (``n_total > max_events``).
+    """
+
+    events: List[EventSummary]
+    n_total: int
+    n_newest: int
+    n_annotated: int
+    truncated: bool
+
+
 class ArchiveBrowser:
     """Filesystem-only browser for ``<root>/<name>/``."""
 
@@ -252,16 +279,43 @@ class ArchiveBrowser:
     # ----- table view -----------------------------------------------------
 
     def list_events(self) -> List[EventSummary]:
-        """Return up to ``max_events`` summaries, newest first."""
+        """Return the /bursts table rows, newest first.
+
+        Thin wrapper over :meth:`list_events_detailed`; keeps the old
+        signature for callers that only want the row list (the recent-
+        events widgets)."""
+        return self.list_events_detailed().events
+
+    def list_events_detailed(
+        self, annotated_ids: Optional[set] = None
+    ) -> EventListing:
+        """Return the events table + truncation counts.
+
+        The row list is the UNION of (a) the newest ``max_events`` dirs by
+        mtime and (b) EVERY event that carries a human annotation, so an
+        annotated event is *never* dropped by the cap no matter how old it
+        gets. The union is re-sorted newest-first, so old annotated events
+        sit at their true chronological position (deep in the list —
+        ``?source=`` / ``?tag=`` search finds them; they are NOT pinned to
+        the top).
+
+        ``annotated_ids`` is the set of annotated event names; when None it
+        is read from the annotations DB (best-effort). It is a parameter so
+        the union logic is unit-testable without a DB. Annotated ids with
+        no candidate dir on disk are skipped (logged at debug) so a deleted
+        archive dir never crashes the page. Cost stays at one readdir + one
+        stat per dir (today's budget) plus one small DB query: annotated
+        events outside the window reuse the stat already taken in the
+        readdir pass."""
         if not self.is_available:
-            return []
+            return EventListing([], 0, 0, 0, False)
         candidates: List[Tuple[float, Path]] = []
         try:
             entries = list(self._root.iterdir())
         except OSError as exc:
             _LOG.warning("list_events: %s readdir failed: %s",
                          self._root, exc)
-            return []
+            return EventListing([], 0, 0, 0, False)
         for p in entries:
             if not p.is_dir():
                 continue
@@ -273,11 +327,35 @@ class ArchiveBrowser:
                 continue
             candidates.append((mtime, p))
         candidates.sort(reverse=True)
+        n_total = len(candidates)
         picked = candidates[: self._max_events]
+        picked_names = {p.name for _, p in picked}
+
+        # (b) Merge back annotated events that fell outside the newest-N
+        # window. Reuse the mtimes already gathered above — no extra stat.
+        if annotated_ids is None:
+            annotated_ids = self._fetch_annotated_ids()
+        extra: List[Tuple[float, Path]] = []
+        if annotated_ids:
+            by_name = {p.name: (mtime, p) for mtime, p in candidates}
+            for eid in annotated_ids:
+                if eid in picked_names:
+                    continue
+                hit = by_name.get(eid)
+                if hit is None:
+                    _LOG.debug(
+                        "annotated event %s has no candidate dir under %s; "
+                        "skipping", eid, self._root,
+                    )
+                    continue
+                extra.append(hit)
+
+        merged = picked + extra
+        merged.sort(reverse=True)
         # Read Level3 once per event, then resolve every sky position in a
         # single batched TETE->ICRS transform (see event_astrometry).
         prepped: List[Tuple[Path, float, Optional[dict]]] = [
-            (p, mtime, self._read_l3(p, p.name)) for mtime, p in picked
+            (p, mtime, self._read_l3(p, p.name)) for mtime, p in merged
         ]
         try:
             radecs = self._astro.compute(
@@ -286,11 +364,34 @@ class ArchiveBrowser:
         except Exception:                                      # noqa: BLE001
             _LOG.exception("astrometry batch failed; positions blank")
             radecs = {}
-        return [
+        events = [
             self._summarise(p, mtime, meta=meta,
                             radec=radecs.get(p.name))
             for p, mtime, meta in prepped
         ]
+        return EventListing(
+            events=events,
+            n_total=n_total,
+            n_newest=len(picked),
+            n_annotated=len(extra),
+            truncated=n_total > self._max_events,
+        )
+
+    @staticmethod
+    def _fetch_annotated_ids() -> set:
+        """Event ids with any human annotation, from the annotations DB.
+
+        Best-effort + lazily imported so ``cands_panel_funcs`` stays
+        importable (and unit-testable) on hosts without the annotations
+        module or its DB — a failure just means no annotated events are
+        pinned, i.e. today's cap-only behaviour."""
+        try:
+            import annotations as _ann  # sibling module, pure sqlite
+            return _ann.annotated_events()
+        except Exception:                                      # noqa: BLE001
+            _LOG.exception(
+                "annotated_events() failed; annotated-event pinning skipped")
+            return set()
 
     def _summarise(
         self, event_dir: Path, mtime: float,
