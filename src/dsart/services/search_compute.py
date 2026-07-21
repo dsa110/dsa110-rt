@@ -86,6 +86,8 @@ from ..dump import (
     C2TriggerListenerConfig,
     CubeDumpWriter,
     CubeDumpWriterConfig,
+    ProactiveCubeStager,
+    ProactiveStagerConfig,
     UdpTriggerListener,
     UdpTriggerListenerConfig,
 )
@@ -636,6 +638,16 @@ class SearchComputeConfig:
     # ``c1.dump_root`` (see dsart/dump/cube_retention.py). Built from
     # the ``c1.retention`` yaml block; None disables.
     cube_retention_config: Optional["CubeRetentionConfig"] = None  # noqa: F821
+    # 2026-07-21: proactive cube staging for bright candidates. When set
+    # (and enabled), a cube whose peak candidate SNR clears the threshold
+    # is staged to disk under a provisional ``pending_g<g>_<specnum>/``
+    # dir at detection time; if the C2 dump request later arrives after
+    # the live ring rotated past the cube (``too_late``), the trigger
+    # listener claims the staged copy into the event dir. Fixes the
+    # structural burst→request-latency (7.8-9 s) vs ring-window (~6.5 s)
+    # race that lost 260721upyy (101.8σ) + 2 more on 2026-07-21. Built
+    # from the ``c1.proactive_stage`` yaml block; None disables.
+    proactive_stager_config: Optional[ProactiveStagerConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +740,8 @@ class SearchComputeService:
         self._c1_emit: Optional[C1TcpEmitter] = None
         self._c1_emit_task: Optional[asyncio.Task] = None
         self._c2_trigger: Optional[C2TriggerListener] = None
+        # 2026-07-21: proactive cube stager (bright-candidate pre-stage).
+        self._proactive_stager: Optional[ProactiveCubeStager] = None
         self._c1_batches_submitted = 0
         self._c1_batches_dropped = 0
         # M7.6: cumulative candidates dropped pre-transmit by the C1→C2
@@ -895,6 +909,14 @@ class SearchComputeService:
                     path,
                 )
                 return
+            # 2026-07-21: proactively-staged cubes land in a provisional
+            # ``pending_g<g>_<specnum>/`` dir with no event name yet — do
+            # NOT upload them. They are uploaded (with the real event
+            # name) only when the C2 trigger listener CLAIMS them, which
+            # renames the file into ``<event_name>/`` and fires the
+            # uploader itself via the stager's ``upload_fn``.
+            if event_name.startswith("pending_"):
+                return
             uploader.submit(event_name=event_name, src_dir=event_dir)
 
         return _on_dump_complete
@@ -1040,6 +1062,8 @@ class SearchComputeService:
             snap["c1_emit"] = dict(self._c1_emit.mon)
         if self._c2_trigger is not None:
             snap["c2_trigger"] = dict(self._c2_trigger.mon)
+        if self._proactive_stager is not None:
+            snap["proactive_stage"] = dict(self._proactive_stager.mon)
         if self._cube_ring is not None:
             snap["cube_ring"] = {
                 "depth": int(self._cube_ring.depth),
@@ -1118,6 +1142,48 @@ class SearchComputeService:
         if cfg.c1_emit_config is not None:
             self._c1_emit = C1TcpEmitter(config=cfg.c1_emit_config)
             self._c1_emit_task = asyncio.create_task(self._c1_emit.run())
+        # 2026-07-21 proactive cube stager. Built after the cube_dump
+        # writer + uploader (so it can reuse both) and BEFORE the C2
+        # trigger listener (which is handed the stager for its claim /
+        # drop hooks). Requires the writer; the pending dir must live
+        # under the WRITER's dump_root so the writer's ``_resolve_path``
+        # honours the provisional ``pending_g<g>_<specnum>/`` npz_path.
+        if (
+            cfg.proactive_stager_config is not None
+            and cfg.proactive_stager_config.enabled
+            and self._cube_dump is not None
+        ):
+            if cfg.cube_dump_writer_config is not None:
+                stage_root = Path(cfg.cube_dump_writer_config.dump_root)
+            elif cfg.c1_dump_root is not None:
+                stage_root = Path(cfg.c1_dump_root)
+            else:
+                stage_root = None
+            if stage_root is not None:
+                stage_root.mkdir(parents=True, exist_ok=True)
+                upload_fn = None
+                if self._cube_uploader is not None:
+                    _up = self._cube_uploader
+                    upload_fn = (
+                        lambda name, d: _up.submit(event_name=name, src_dir=d)
+                    )
+                self._proactive_stager = ProactiveCubeStager(
+                    cfg.proactive_stager_config,
+                    dump_root=stage_root,
+                    search_node_id=cfg.search_node_id,
+                    gpu_half=cfg.gpu_half,
+                    cube_dump_writer=self._cube_dump,
+                    upload_fn=upload_fn,
+                )
+                _LOG.info(
+                    "proactive cube stager enabled (snr>=%.1f, max_pending=%d, "
+                    "min_interval=%.1fs, ttl=%.0fs, root=%s)",
+                    cfg.proactive_stager_config.snr_threshold,
+                    cfg.proactive_stager_config.max_pending,
+                    cfg.proactive_stager_config.min_interval_s,
+                    cfg.proactive_stager_config.ttl_s,
+                    stage_root,
+                )
         # M7.4 C2 trigger listener (UDP from h23). Requires the ring
         # to be reachable; we defer ring construction to the first
         # cube but build the listener now bound to a placeholder ring
@@ -1138,6 +1204,7 @@ class SearchComputeService:
                 config=cfg.c2_trigger_listener_config,
                 ring=self._cube_ring,
                 cube_dump=self._cube_dump,
+                stager=self._proactive_stager,
             )
             await self._c2_trigger.start()
         _LOG.info(
@@ -1415,6 +1482,24 @@ class SearchComputeService:
         # ran (the GPU pipeline is done with the cube tensor) so the
         # ring copy doesn't compete for the compute stream.
         self._maybe_stage_cube_in_ring(slot, result.cube, geom)
+        # 2026-07-21 proactive stage: if this cube's peak candidate is
+        # bright enough, write it to a provisional pending dir NOW (while
+        # it's still local) so a ``too_late`` C2 trigger can later claim
+        # it. Non-blocking (hands off to the same CubeDumpWriter queue as
+        # the udp/auto paths); a no-op when the stager is disabled.
+        if self._proactive_stager is not None and result.candidates:
+            max_snr = max(float(c.snr) for c in result.candidates)
+            self._proactive_stager.maybe_stage(
+                cube_id=int(slot.cube_id),
+                specnum_start=int(slot.specnum_start),
+                t_det=int(slot.t_det),
+                sample_period_specnum=int(geom.sample_period_specnum),
+                n_fdm_in_cube=int(slot.n_fdm_in_cube),
+                n_grid=int(slot.n_grid),
+                mjd_start=float(geom.mjd_start),
+                max_snr=max_snr,
+                cube_tensor=result.cube,
+            )
         # C1 emit. Always invoked when the emitter is configured —
         # even on empty cubes, so the heartbeat / connectivity check
         # keeps flowing.
@@ -2522,6 +2607,22 @@ def _build_search_config_from_yaml(
             dump_root=listener_dump_root,
         )
 
+    # 2026-07-21 proactive cube staging (bright-candidate pre-stage).
+    # Parsed from ``c1.proactive_stage``. Default-ON whenever the C1
+    # stack is enabled (the whole point is to catch the bright events the
+    # C2 round-trip is structurally too slow to dump from the live ring);
+    # ``c1.proactive_stage.enabled: false`` opts out.
+    proactive_stager_cfg: Optional[ProactiveStagerConfig] = None
+    if enable_c1:
+        ps_yaml = c1.get("proactive_stage", {}) or {}
+        proactive_stager_cfg = ProactiveStagerConfig(
+            enabled=bool(ps_yaml.get("enabled", True)),
+            snr_threshold=float(ps_yaml.get("snr_threshold", 50.0)),
+            max_pending=int(ps_yaml.get("max_pending", 4)),
+            min_interval_s=float(ps_yaml.get("min_interval_s", 2.0)),
+            ttl_s=float(ps_yaml.get("ttl_s", 600.0)),
+        )
+
     # Honor a top-level YAML ``enable_legacy_clusterer`` knob as the
     # source of truth when present; falls back to the CLI flag when
     # absent (preserves legacy bench behavior).
@@ -2617,6 +2718,7 @@ def _build_search_config_from_yaml(
         cube_upload_queue_maxsize=cube_upload_queue_maxsize_yaml,
         cube_upload_delete_after=cube_upload_delete_after_yaml,
         cube_retention_config=cube_retention_cfg,
+        proactive_stager_config=proactive_stager_cfg,
         # Wire the MJD/time geometry to the ACTUAL search cadence
         # (--t-int-search-us, 1048.576 µs at the prod op-point) instead
         # of leaving the stale class default. ``specnum_start`` is in

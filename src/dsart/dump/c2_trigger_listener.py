@@ -156,11 +156,18 @@ class C2TriggerListener:
         dispatcher: Optional[
             Callable[[RetainedCube, C2TriggerPacket, CubeDumpManifest], bool]
         ] = None,
+        stager: Optional[Any] = None,
     ) -> None:
         self._config = config
         self._ring = ring
         self._cube_dump = cube_dump
         self._dispatcher = dispatcher or self._default_dispatcher
+        # Optional :class:`dsart.dump.proactive_stager.ProactiveCubeStager`.
+        # On a live-ring HIT we drop its now-redundant staged copy; on a
+        # ``too_late`` MISS we try to claim a proactively-staged cube for
+        # this specnum (converting the miss into a rescued dump). When
+        # None the listener behaves exactly as the M7.4 baseline.
+        self._stager = stager
         self._transport: Optional[asyncio.DatagramTransport] = None
         self._protocol: Optional[_C2TriggerDatagramProtocol] = None
         self._bound_port: int = 0
@@ -170,6 +177,9 @@ class C2TriggerListener:
             "hits": 0,
             "too_late": 0,
             "too_early": 0,
+            # Proactive-stage rescues: a ``too_late`` miss whose cube had
+            # been staged proactively and was claimed into the event dir.
+            "rescued": 0,
             "bad_magic": 0,
             "bad_schema": 0,
             "dispatched": 0,
@@ -308,9 +318,45 @@ class C2TriggerListener:
                 addr,
                 window_str,
             )
+            # Proactive-stage rescue (2026-07-21): the live ring rotated
+            # past the cube (measured burst→request latency 7.8-9 s vs a
+            # ~6.5 s ring), but if the detector proactively staged this
+            # cube when it fired bright, claim it into the event dir now.
+            # Only meaningful on ``too_late`` -- a ``too_early`` trigger
+            # names a cube that hasn't been produced (hence never staged).
+            if kind == "too_late" and self._stager is not None:
+                try:
+                    claimed = self._stager.claim(
+                        event_specnum=int(packet.event_specnum),
+                        event_name=str(packet.event_name),
+                    )
+                except Exception as exc:  # noqa: BLE001 - never poison loop
+                    _LOG.warning(
+                        "C2TriggerListener: proactive claim raised for "
+                        "event=%s specnum=%d: %r",
+                        packet.event_name, int(packet.event_specnum), exc,
+                    )
+                    claimed = None
+                if claimed is not None:
+                    with self._lock:
+                        self._mon["rescued"] = int(self._mon["rescued"]) + 1
+                    _LOG.info(
+                        "C2TriggerListener rescued too_late event=%s "
+                        "specnum=%d from proactive stage -> %s",
+                        packet.event_name, int(packet.event_specnum), claimed,
+                    )
             return
         with self._lock:
             self._mon["hits"] = int(self._mon["hits"]) + 1
+        # Live-ring dump wins: discard any redundant proactively-staged
+        # copy for this specnum so it isn't left to the TTL sweeper.
+        if self._stager is not None:
+            try:
+                self._stager.drop_pending(int(packet.event_specnum))
+            except Exception as exc:  # noqa: BLE001 - never poison loop
+                _LOG.warning(
+                    "C2TriggerListener: proactive drop_pending raised: %r", exc,
+                )
         manifest = self._build_manifest(packet, retained)
         accepted = self._dispatcher(retained, packet, manifest)
         with self._lock:

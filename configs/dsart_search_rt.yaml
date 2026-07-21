@@ -562,6 +562,45 @@ c1:
     low_water_gb: 120      # sweep target
     tmp_age_h: 2           # *.tmp / 0-byte NPZ hygiene age
     sweep_interval_s: 600
+  # 2026-07-21 proactive cube staging for bright candidates.
+  #
+  # The C2-triggered cube dump can only pull a cube while it is still in
+  # the search node's CPU retention ring (cube_ring_depth cubes). Measured
+  # live 2026-07-21, the burst->C2-dump-request round trip is 7.8-9 s
+  # (detect ~1.3 s + cube pipeline + C1 batch emit + C2 ingest + cluster
+  # eval + broadcast) while the ring window is only ~6.5 s -- a STRUCTURAL
+  # deficit. That night three consecutive bright triggers were lost as
+  # ``too_late`` misses: 260721upyy (101.8 sigma, 22:15:36, missed by
+  # ~1.3 s), 260721kfrt (22:22:22), 260721ypdw (22:29:38).
+  #
+  # The search node already has the detection cube locally the moment the
+  # detector fires. When a cube's peak candidate SNR clears snr_threshold
+  # we stage it to disk NOW under a provisional pending_g<half>_<specnum>/
+  # dir (no event name exists yet). If the C2 dump request for that
+  # specnum later arrives too_late for the live ring, the trigger listener
+  # CLAIMS the staged copy -- renaming it into <event_name>/ and firing
+  # the uploader -- turning the miss into a successful dump. If the ring
+  # still has the cube, the live-ring dump wins and the staged copy is
+  # dropped. The NPZ write reuses the same non-blocking CubeDumpWriter
+  # queue as the udp/auto dumps, so the hot loop never stalls.
+  proactive_stage:
+    enabled: true
+    snr_threshold: 50.0    # per-cube peak candidate SNR (sigma) that arms a
+                           # stage. Well above the C1 emit floor (snr_min~11)
+                           # and the RFI singles floor, so only genuinely
+                           # bright cubes stage; 260721upyy at 101.8 sigma is
+                           # ~2x this. Lower only if bright FRBs are still
+                           # being missed AND the pending budget/disk allow.
+    max_pending: 4         # LRU budget of concurrently-staged (unclaimed)
+                           # windows per half; oldest evicted (its pending
+                           # dir removed) when a new stage would exceed it.
+                           # Bounds staged footprint at ~4 x 1.1 GiB/half so
+                           # an RFI storm can't fill the disk.
+    min_interval_s: 2.0    # minimum wall gap between two stages on one half
+                           # (throttles a bright RFI run staging back-to-back).
+    ttl_s: 600.0           # unclaimed pending dirs older than this are GC'd
+                           # (a real C2 request lands within ~10 s; 600 s is a
+                           # generous backstop before the retention sweeper).
 
 # Cube geometry knobs shared with the merger block. The merger reads
 # ``cube.sample_period_specnum`` as the default for

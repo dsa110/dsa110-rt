@@ -36,11 +36,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         CubeDumpWriter,
         CubeDumpWriterConfig,
     )
+    from .proactive_stager import ProactiveCubeStager, ProactiveStagerConfig
     from .udp_listener import UdpTriggerListener, UdpTriggerListenerConfig
 
 _LAZY_EXPORTS = {
     "C2TriggerListener": ".c2_trigger_listener",
     "C2TriggerListenerConfig": ".c2_trigger_listener",
+    "ProactiveCubeStager": ".proactive_stager",
+    "ProactiveStagerConfig": ".proactive_stager",
     "BrightPulsePredicate": ".cube_dump",
     "BrightPulsePredicateConfig": ".cube_dump",
     "CubeDumpWriter": ".cube_dump",
