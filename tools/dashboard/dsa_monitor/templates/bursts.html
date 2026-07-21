@@ -143,7 +143,7 @@
     <span class="lbl">search</span>
     <form method="get" action="/bursts" style="display:flex; gap:6px; align-items:center; margin:0;">
         <input type="text" name="q" class="src-input" style="width: 200px;"
-               placeholder="event name (any time)…" value="{{ q }}"
+               placeholder="event name…" value="{{ q }}"
                autocomplete="off">
         {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
         {% if source_filter %}<input type="hidden" name="source" value="{{ source_filter }}">{% endif %}
