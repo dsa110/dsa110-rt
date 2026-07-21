@@ -47,11 +47,19 @@ def test_collection_done_all_present() -> None:
 def test_collection_done_timeout_with_min() -> None:
     assert collection_done(n_present=8, n_total=16, min_fragments=8,
                            elapsed_s=101.0, timeout_s=100.0)
-    # below min after timeout → not done
-    assert not collection_done(n_present=7, n_total=16, min_fragments=8,
-                               elapsed_s=101.0, timeout_s=100.0)
+    # 2026-07-21: timeout is UNCONDITIONAL — a partial set below min
+    # (1..min-1 fragments) must stop at timeout too. The old
+    # "elapsed >= timeout AND n_present >= min" form spun forever on
+    # partial sets (corr disk-full incident: some nodes staged, some
+    # ENOSPC'd) and wedged C3's single event worker twice in one night.
+    assert collection_done(n_present=7, n_total=16, min_fragments=8,
+                           elapsed_s=101.0, timeout_s=100.0)
+    assert collection_done(n_present=1, n_total=16, min_fragments=8,
+                           elapsed_s=101.0, timeout_s=100.0)
     # before timeout, incomplete → not done
     assert not collection_done(n_present=8, n_total=16, min_fragments=8,
+                               elapsed_s=10.0, timeout_s=100.0)
+    assert not collection_done(n_present=1, n_total=16, min_fragments=8,
                                elapsed_s=10.0, timeout_s=100.0)
 
 
@@ -65,15 +73,14 @@ def test_collection_done_no_show_grace() -> None:
                                elapsed_s=30.0, timeout_s=1800.0,
                                no_show_grace_s=120.0)
     # At least one fragment landed → the no-show early-out does NOT fire;
-    # fall back to the full timeout / min_fragments logic.
+    # fall back to the timeout logic (still waiting inside the window).
     assert not collection_done(n_present=1, n_total=16, min_fragments=8,
                                elapsed_s=200.0, timeout_s=1800.0,
                                no_show_grace_s=120.0)
-    # Default (no no_show_grace_s) preserves legacy behaviour: 0 present
-    # after timeout but below min → still not done (infinite-wait guard
-    # only active when a finite grace is supplied).
-    assert not collection_done(n_present=0, n_total=16, min_fragments=8,
-                               elapsed_s=99999.0, timeout_s=100.0)
+    # 2026-07-21: the unconditional timeout also bounds the 0-present
+    # default-grace case — nothing waits past timeout_s anymore.
+    assert collection_done(n_present=0, n_total=16, min_fragments=8,
+                           elapsed_s=99999.0, timeout_s=100.0)
 
 
 def test_collect_fragments_uses_injected_puller(tmp_path: Path) -> None:

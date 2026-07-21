@@ -121,10 +121,22 @@ def collection_done(
       never reaches ``min_fragments``. ``no_show_grace_s`` defaults to
       ``inf`` (disabled) so existing callers/tests are unaffected; C3
       passes a finite value (``collect_no_show_grace_s``).
+
+    2026-07-21: the timeout is now UNCONDITIONAL. The old form
+    (``elapsed >= timeout AND n_present >= min_fragments``) left a hole
+    for partial sets: 1..min_fragments-1 fragments satisfied neither the
+    timeout branch nor the no-show early-out, so the loop ran forever.
+    A corr-fleet disk-full incident produced exactly that (some nodes
+    staged their fragment before ENOSPC, others never did) and wedged
+    C3's single event worker twice in one night (19:12 and 23:01 UT) —
+    every subsequent event's decision queued behind the spin. At
+    timeout, proceed with whatever is in hand; downstream policy decides
+    what a partial set is worth (min_fragments remains the legacy
+    MIN_CT quality bar for the "proceed with partial" report field).
     """
     if n_present >= n_total:
         return True
-    if elapsed_s >= timeout_s and n_present >= min_fragments:
+    if elapsed_s >= timeout_s:
         return True
     if n_present == 0 and elapsed_s >= no_show_grace_s:
         return True
