@@ -62,6 +62,10 @@
         .banner.info { background: #dfe6e9; border-color: #b2bec3; }
         .banner.warn { background: #ffeaa7; border-color: #fdcb6e; }
         .banner.error { background: #fab1a0; border-color: #d63031; }
+        /* Cold-cache rebuild in progress (post-restart) — deliberately
+           calmer than .warn: this is expected, self-resolving behavior,
+           not a fault. Reassure, don't alarm. */
+        .banner.building { background: #dff9fb; border-color: #22a6b3; }
 
         .card {
             background: white;

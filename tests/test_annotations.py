@@ -563,3 +563,54 @@ def test_bursts_page_zombie_tab_and_source_filter(client):
         r = client.get("/bursts?source=B1913%2B16")
         assert r.status_code == 200
         assert "src-chip" in r.get_data(as_text=True)
+
+
+def test_bursts_page_warming_shows_rebuild_banner_not_empty_state(client):
+    """Post-restart, cold-cache case: EventIndexCache has never completed
+    a scan (warming=True, n_total=0). The page must show the reassuring
+    rebuild banner and auto-refresh meta tag, and must NOT show the
+    misleading "of 0 archived" / "All-time totals — C3 pass: 0" line that
+    looks like total data loss."""
+    from unittest import mock
+    import app as app_mod
+
+    snap = cpf.CacheSnapshot(
+        events=[], n_total=0, last_success_unix=None, stale=True,
+        error=None, warming=True, scan_progress=7,
+    )
+    with mock.patch.object(app_mod.cands_index, "snapshot",
+                           return_value=snap):
+        r = client.get("/bursts")
+        html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "rebuilding" in html.lower()
+    assert "nothing is lost" in html.lower()
+    assert "7 event dir" in html                    # scan_progress hint
+    assert '<meta http-equiv="refresh" content="30">' in html
+    assert "of 0 archived" not in html
+    assert "All-time totals" not in html
+    # The scary "stale" banner must not also render alongside it.
+    assert "is <strong>stale</strong>" not in html
+
+
+def test_bursts_page_warm_renders_normally_no_banner(client):
+    """A normal, already-warm snapshot renders the usual totals line and
+    carries no rebuild banner and no auto-refresh meta tag."""
+    from unittest import mock
+    import app as app_mod
+
+    now = _time.time()
+    events = [_ev("260714warm", c3_action="KEEP", mtime_unix=now - 60)]
+    snap = cpf.CacheSnapshot(
+        events=events, n_total=len(events), last_success_unix=now,
+        stale=False, error=None, warming=False, scan_progress=None,
+    )
+    with mock.patch.object(app_mod.cands_index, "snapshot",
+                           return_value=snap):
+        r = client.get("/bursts")
+        html = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert "rebuilding" not in html.lower()
+    assert '<meta http-equiv="refresh"' not in html
+    assert "All-time totals" in html
+    assert "of <strong>1</strong> archived" in html

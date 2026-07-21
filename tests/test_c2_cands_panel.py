@@ -451,6 +451,83 @@ def test_cache_active_window_rereads_young_events(tmp_path, cands_panel) -> None
     assert second.events[0].c3_status == "pass"
 
 
+def test_cache_warming_true_until_first_success(tmp_path, cands_panel) -> None:
+    """A cache that has never completed a scan reports warming=True — the
+    dashboard restart case where /bursts must show a "rebuilding" banner
+    instead of an empty "of 0 archived" table."""
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 3)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0, active_window_s=0,
+    )
+    # A cold cache never asked to scan yet is still "warming" (never
+    # succeeded); scan_progress is unknown before any attempt.
+    assert cache._last_success is None
+    snap = cache.snapshot()
+    # The single (synchronous, in this test) scan above succeeded, so the
+    # cache is now warm.
+    assert snap.warming is False
+    assert snap.scan_progress is None
+    assert snap.n_total == 3
+
+
+def test_cache_warming_stays_true_through_summarise_failure(
+    tmp_path, cands_panel,
+) -> None:
+    """If the *first ever* scan's summarise pass blows up (still no good
+    index), the snapshot must stay warming=True (not just stale=True) so
+    the caller renders the reassuring rebuild banner, not the scary stale
+    one. scan_progress reports how many dirs the (cheap) readdir found
+    before the (slow) per-event summarise pass failed."""
+    import unittest.mock as mock
+
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 4)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0, active_window_s=0,
+    )
+    with mock.patch.object(cache._browser, "summarise_pairs",
+                           side_effect=RuntimeError("boom")):
+        snap = cache.snapshot()
+    assert snap.warming is True
+    assert snap.stale is True
+    assert snap.n_total == 0
+    assert snap.events == []
+    assert snap.scan_progress == 4
+    assert snap.last_success_unix is None
+
+    # Once a real scan succeeds, warming clears and the progress hint is
+    # dropped (it's only meaningful for the in-flight cold build).
+    snap2 = cache.snapshot(force_refresh=True)
+    assert snap2.warming is False
+    assert snap2.scan_progress is None
+    assert snap2.n_total == 4
+
+
+def test_cache_nfs_failure_after_warm_is_stale_not_warming(
+    tmp_path, cands_panel,
+) -> None:
+    """Distinguish the two failure states: an already-warm cache that
+    fails to refresh is 'stale' (had a good index), never 'warming'."""
+    import unittest.mock as mock
+
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 2)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0, active_window_s=0,
+    )
+    good = cache.snapshot()
+    assert good.warming is False
+    with mock.patch.object(cache._browser, "scan_dirs",
+                           side_effect=OSError("stale NFS handle")):
+        stale = cache.snapshot()
+    assert stale.stale is True
+    assert stale.warming is False
+
+
 def test_cache_drops_deleted_event(tmp_path, cands_panel) -> None:
     import shutil
     root = tmp_path / "candidates"

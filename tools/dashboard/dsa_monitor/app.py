@@ -772,6 +772,8 @@ def bursts():
         # cache freshness
         cache_stale=snap.stale,
         cache_stale_since=stale_since,
+        cache_warming=snap.warming,
+        cache_scan_progress=snap.scan_progress,
     ))
 
 

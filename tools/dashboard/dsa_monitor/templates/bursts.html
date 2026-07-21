@@ -2,6 +2,13 @@
 {% block title %}Burst candidates – DSA Monitor{% endblock %}
 
 {% block head_extra %}
+{% if cache_warming %}
+{# Cold cache after a dashboard restart: the first (slow, NFS-bound) index
+   build is still running in a background thread. Auto-refresh so the
+   operator sees the archive populate without a manual reload — but ONLY
+   while warming; a normal, already-warm /bursts never auto-refreshes. #}
+<meta http-equiv="refresh" content="30">
+{% endif %}
 <style>
     /* C3 pass/fail sub-tabs */
     .c3-tabs { display: flex; gap: 8px; margin: 14px 0 0; }
@@ -178,7 +185,16 @@
 </div>
 {% endif %}
 
-{% if cache_stale %}
+{% if cache_warming %}
+<div class="banner building">
+    Archive index is <strong>rebuilding</strong> after a dashboard restart —
+    events will appear within a few minutes.{% if cache_scan_progress is not none %}
+    ({{ cache_scan_progress }} event dir{{ 's' if cache_scan_progress != 1 }} found so far,
+    reading details…){% endif %}
+    <strong>Nothing is lost</strong> — this page will refresh automatically
+    every 30 seconds until the index is ready.
+</div>
+{% elif cache_stale %}
 <div class="banner warn">
     Archive index is <strong>stale</strong>{% if cache_stale_since %} (last good refresh
     {{ cache_stale_since }}){% endif %} — the shared <code>/dataz</code> archive was
@@ -192,6 +208,7 @@
    links (so paging keeps your search/window). #}
 {% set filt_qs %}{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% if q %}&q={{ q|urlencode }}{% endif %}{% if days %}&days={{ days }}{% endif %}{% endset %}
 
+{% if not cache_warming %}
 <div class="banner info trunc-note">
     {% if searching %}
     <strong>{{ n_matched }}</strong> event{{ 's' if n_matched != 1 }} match your
@@ -204,6 +221,7 @@
     All-time totals — C3 pass: {{ total_pass }} ({{ total_pending }} pending),
     rejected: {{ total_fail }}, zombies: {{ total_zombie }}.
 </div>
+{% endif %}
 
 {% macro pager() %}
     {% if not searching and n_pages > 1 %}

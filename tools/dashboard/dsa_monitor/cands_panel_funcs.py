@@ -642,6 +642,23 @@ class CacheSnapshot:
     stale: bool
     #: Short reason string for the last failure (for the stale note), or None.
     error: Optional[str]
+    #: True when no scan has EVER succeeded since process start — e.g. right
+    #: after a dashboard restart, while the first (slow, NFS-bound) build is
+    #: still in flight on a background thread. Distinct from ``stale``: a
+    #: stale cache had a good index at some point and is failing to refresh
+    #: it; a warming cache has never had one, so the empty listing/"0
+    #: archived" totals below would otherwise look like data loss. Callers
+    #: should show a reassuring "still building" banner instead of the
+    #: normal empty-state / stale-state UI.
+    #: Defaults to False so existing call sites (tests constructing a
+    #: CacheSnapshot directly for a warm/mocked cache) don't need updating.
+    warming: bool = False
+    #: Best-effort progress hint for the in-flight cold build: number of
+    #: event dirs the directory scan has found so far (before the slower
+    #: per-event summarise pass). ``None`` if unknown (no build has reached
+    #: that point yet) or once the cache has gone warm. Purely cosmetic —
+    #: do not rely on it for correctness.
+    scan_progress: Optional[int] = None
 
 
 class EventIndexCache:
@@ -693,6 +710,9 @@ class EventIndexCache:
         self._last_success: Optional[float] = None
         self._stale = False
         self._error: Optional[str] = None
+        #: Dirs found by the most recent (possibly still in-flight) scan,
+        #: for the cold-build progress hint. See CacheSnapshot.scan_progress.
+        self._scan_progress: Optional[int] = None
 
     # ----- public API -----------------------------------------------------
 
@@ -708,12 +728,15 @@ class EventIndexCache:
                 key=lambda e: e.mtime_unix,
                 reverse=True,
             )
+            warming = self._last_success is None
             return CacheSnapshot(
                 events=events,
                 n_total=len(events),
                 last_success_unix=self._last_success,
                 stale=self._stale,
                 error=self._error,
+                warming=warming,
+                scan_progress=self._scan_progress if warming else None,
             )
 
     def invalidate(self) -> None:
@@ -771,6 +794,9 @@ class EventIndexCache:
                          self._browser.root, exc, len(prev_summaries))
             return
 
+        with self._data_lock:
+            self._scan_progress = len(pairs)
+
         current = {p.name: (mtime, p) for mtime, p in pairs}
         # Decide what needs the expensive per-event summarise: anything new,
         # anything whose dir mtime moved, and anything still young enough to
@@ -815,6 +841,7 @@ class EventIndexCache:
             self._stale = False
             self._error = None
             self._last_success = now
+            self._scan_progress = None
         _LOG.info("event index refreshed: %d events (%d re-read) from %s",
                   len(current), len(to_summarise), self._browser.root)
 
