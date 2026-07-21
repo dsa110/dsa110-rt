@@ -428,6 +428,33 @@ class CoincidencerConfig:
     # the ~150 s RFI warmup. Set to 0 to disable.
     startup_grace_s: float = 180.0
 
+    # 2026-07-21 C2 ingest queue (drain-collapse guard). Historically the
+    # C1BatchReceiver awaited the heavy per-batch processing (window +
+    # O(N^2) graph age-out + cluster eval) INLINE on the socket-reader
+    # coroutine. During a candidate storm (bright-burst sidelobes / RFI
+    # floods) each batch took long enough that the single asyncio loop
+    # could no longer drain the TCP sockets at the offered C1 rate
+    # (~1.1 batch/s serviced vs ~5/s offered per node-half). The kernel
+    # recv buffers then backpressured the search-side c1_emit, whose OWN
+    # bounded outbound queue (c1.queue_depth, default 16) silently dropped
+    # whole C1 batches (counted only as c1_emit.batches_dropped, invisible
+    # on the /mon/c2 surface). On 2026-07-21T20:36:55Z a 112.75-sigma
+    # injection's primary batch was lost this way.
+    #
+    # Fix: decouple receive from process with a bounded in-process queue
+    # drained by a dedicated worker, so the receiver always drains its
+    # sockets fast (removing the backpressure that caused the upstream
+    # drops). If C2 STILL cannot keep up and this queue overflows, drops
+    # are now (a) counted (ingest_batches_dropped) and rate-limited
+    # WARNING-logged with the dropped batch's max SNR, and (b) governed by
+    # a top-N-by-max-SNR admission policy: a batch whose max SNR exceeds
+    # ``priority_snr`` is never dropped in favour of a dimmer queued batch
+    # — the lowest-max-SNR queued batch is evicted instead. A dropped
+    # batch that itself exceeds ``priority_snr`` is logged at ERROR every
+    # time (detection-critical loss).
+    ingest_queue_depth: int = 512
+    priority_snr: float = 30.0
+
     @classmethod
     def from_yaml(cls, path: Path, *, override: Optional[Mapping[str, Any]] = None
                  ) -> "CoincidencerConfig":
@@ -570,6 +597,8 @@ class CoincidencerConfig:
                 coinc.get("gal_dm_max_age_s", 600.0),
             ),
             startup_grace_s=float(coinc.get("startup_grace_s", 180.0)),
+            ingest_queue_depth=int(coinc.get("ingest_queue_depth", 512)),
+            priority_snr=float(coinc.get("priority_snr", 30.0)),
         )
 
 
@@ -708,6 +737,23 @@ def search_to_snap_specnum(event_specnum: int,
             "peak sample_period_us=%.3f unusable — falling back to "
             "factor %d", sample_period_us, _SPECNUM_FACTOR_FALLBACK)
     return int(event_specnum) * factor
+
+
+@dataclass
+class _QueuedBatch:
+    """A C1 batch waiting in the C2 ingest queue.
+
+    ``max_snr`` is the max SNR over the batch's candidate rows (or
+    ``-1.0`` for a 0-row heartbeat) and drives the priority-admission
+    policy on overflow. ``seq`` is a monotonically-increasing arrival
+    sequence used both to preserve FIFO processing order and to break
+    ties deterministically when choosing an eviction victim.
+    """
+
+    batch: "wire.C1Batch"
+    peer_repr: str
+    max_snr: float
+    seq: int
 
 
 class CoincidencerService:
@@ -878,16 +924,45 @@ class CoincidencerService:
             else InjectionMatcher(**_matcher_kwargs)
         )
 
+        # 2026-07-21 drain-collapse guard: the receiver hands batches to
+        # the bounded ingest queue (``_ingest_batch``) and returns at
+        # once, so the socket-reader coroutine keeps draining TCP at line
+        # rate. The heavy per-batch processing (``_on_batch``) runs on a
+        # dedicated worker coroutine (``_ingest_worker``) that pops the
+        # queue. See CoincidencerConfig.ingest_queue_depth / priority_snr.
         self._receiver = C1BatchReceiver(
             host=config.bind_host,
             port=config.bind_port,
-            on_batch=self._on_batch,
+            on_batch=self._ingest_batch,
         )
+        # Bounded FIFO ingest buffer + wakeup event for the worker.
+        self._ingest_buf: List[_QueuedBatch] = []
+        self._ingest_max: int = max(1, int(config.ingest_queue_depth))
+        self._ingest_evt: asyncio.Event = asyncio.Event()
+        self._ingest_seq: int = 0
+        # Rate-limited overflow-warning bookkeeping.
+        self._ingest_drop_last_warn_mono: float = 0.0
+        self._ingest_drop_since_warn: int = 0
+        self._ingest_drop_max_snr_since_warn: float = -1.0
 
         # Bookkeeping / mon-points.
         self._counters: Dict[str, int] = {
             "rows_in": 0,
             "rows_late_drop": 0,
+            # 2026-07-21 drain-collapse guard: whole C1 batches dropped at
+            # the C2 ingest queue because C2 could not process the offered
+            # rate and the bounded queue overflowed. Non-zero here means
+            # C2 is the bottleneck (previously this loss was silent and
+            # only visible as c1_emit.batches_dropped on the search side).
+            "ingest_batches_dropped": 0,
+            # Subset of the above whose OWN max SNR exceeded
+            # config.priority_snr — a detection-critical loss (logged at
+            # ERROR every occurrence). Should stay 0 in normal operation.
+            "ingest_priority_dropped": 0,
+            # High-water mark of the ingest queue depth over the service
+            # lifetime; approaching ingest_queue_depth is the early-warning
+            # signal that C2 is falling behind the C1 rate.
+            "ingest_queue_hwm": 0,
             # M7.4 Phase 8 (2026-05-28): rows dropped because the
             # search-side Layer-2 σ_k EMA was still in burn-in
             # (CandidateFlags.NOISE_WARMUP). Exposed in the mon-dict
@@ -1001,6 +1076,13 @@ class CoincidencerService:
             asyncio.create_task(self._receiver.serve_forever(),
                                 name="c2-receiver"),
         )
+        # 2026-07-21 drain-collapse guard: dedicated worker that drains
+        # the bounded ingest queue and runs the heavy per-batch pipeline
+        # off the socket-reader path.
+        self._tasks.append(
+            asyncio.create_task(self._ingest_worker(),
+                                name="c2-ingest-worker"),
+        )
         self._tasks.append(
             asyncio.create_task(self._housekeep_loop(),
                                 name="c2-housekeep"),
@@ -1055,6 +1137,118 @@ class CoincidencerService:
         except Exception:  # noqa: BLE001
             pass
         _LOG.info("coincidencer shutdown done")
+
+    # ----- ingest queue (drain-collapse guard, 2026-07-21) --------------
+
+    #: Minimum seconds between aggregate ingest-overflow WARNING logs.
+    #: ERROR logs for dropped PRIORITY batches are never rate-limited.
+    _INGEST_DROP_WARN_INTERVAL_S: float = 2.0
+
+    async def _ingest_batch(
+        self, batch: wire.C1Batch, peer_repr: str,
+    ) -> None:
+        """Receiver callback: admit ``batch`` to the bounded queue.
+
+        Runs on the socket-reader coroutine and must be cheap so the
+        receiver keeps draining TCP. All heavy work happens later on the
+        ``_ingest_worker`` coroutine. This method never awaits, so it is
+        atomic w.r.t. the worker under asyncio's cooperative scheduling.
+        """
+        max_snr = max(
+            (float(c.snr) for c in batch.candidates), default=-1.0,
+        )
+        qb = _QueuedBatch(
+            batch=batch, peer_repr=peer_repr, max_snr=max_snr,
+            seq=self._ingest_seq,
+        )
+        self._ingest_seq += 1
+
+        buf = self._ingest_buf
+        if len(buf) < self._ingest_max:
+            buf.append(qb)
+        else:
+            # Queue full: keep the top-N batches by max SNR. Evict the
+            # lowest-max-SNR queued batch iff the newcomer is brighter;
+            # otherwise the newcomer is itself the dimmest and is dropped.
+            # Ties broken by arrival order (lower seq = older = evicted
+            # first). This guarantees a bright (>= priority_snr) batch is
+            # never dropped in favour of a dimmer queued one.
+            victim_idx = min(
+                range(len(buf)),
+                key=lambda i: (buf[i].max_snr, buf[i].seq),
+            )
+            victim = buf[victim_idx]
+            if (qb.max_snr, qb.seq) > (victim.max_snr, victim.seq):
+                buf.pop(victim_idx)
+                buf.append(qb)
+                self._record_ingest_drop(victim)
+            else:
+                self._record_ingest_drop(qb)
+
+        if len(buf) > self._counters["ingest_queue_hwm"]:
+            self._counters["ingest_queue_hwm"] = len(buf)
+        self._ingest_evt.set()
+
+    def _record_ingest_drop(self, dropped: _QueuedBatch) -> None:
+        """Count + log an ingest-overflow batch drop (never silent)."""
+        self._counters["ingest_batches_dropped"] += 1
+        n_cand = int(dropped.batch.header.n_candidates)
+        if dropped.max_snr >= self._config.priority_snr:
+            # Detection-critical loss: a bright batch could not be kept
+            # even after evicting the dimmest queued batch (the queue was
+            # full of equally/brighter batches). Log every occurrence.
+            self._counters["ingest_priority_dropped"] += 1
+            _LOG.error(
+                "C2 ingest overflow DROPPED a PRIORITY C1 batch: "
+                "max_snr=%.2f n_cand=%d peer=%s queue_depth=%d "
+                "(drain-collapse guard, incident 2026-07-21)",
+                dropped.max_snr, n_cand, dropped.peer_repr,
+                self._ingest_max,
+            )
+            return
+        # Ordinary (sub-priority) drop: aggregate + rate-limit the WARNING
+        # so a storm cannot itself flood the log.
+        self._ingest_drop_since_warn += 1
+        if dropped.max_snr > self._ingest_drop_max_snr_since_warn:
+            self._ingest_drop_max_snr_since_warn = dropped.max_snr
+        now = time.monotonic()
+        if (now - self._ingest_drop_last_warn_mono
+                >= self._INGEST_DROP_WARN_INTERVAL_S):
+            _LOG.warning(
+                "C2 ingest overflow: dropped %d C1 batch(es) since last "
+                "warning (max_snr among dropped=%.2f, queue_depth=%d); "
+                "C2 is not keeping up with the offered C1 rate "
+                "(drain-collapse guard, incident 2026-07-21)",
+                self._ingest_drop_since_warn,
+                self._ingest_drop_max_snr_since_warn,
+                self._ingest_max,
+            )
+            self._ingest_drop_last_warn_mono = now
+            self._ingest_drop_since_warn = 0
+            self._ingest_drop_max_snr_since_warn = -1.0
+
+    async def _ingest_worker(self) -> None:
+        """Drain the ingest queue, running ``_on_batch`` per batch.
+
+        FIFO over arrival order (``buf.pop(0)``) so window/graph age-out
+        still sees batches in roughly MJD-monotone order. The clear-then-
+        check-then-wait ordering below is lost-wakeup-safe.
+        """
+        while True:
+            self._ingest_evt.clear()
+            if self._ingest_buf:
+                qb = self._ingest_buf.pop(0)
+                try:
+                    await self._on_batch(qb.batch, qb.peer_repr)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    _LOG.exception(
+                        "C2 _on_batch raised (batch dropped): peer=%s",
+                        qb.peer_repr,
+                    )
+                continue
+            await self._ingest_evt.wait()
 
     # ----- batch handler ------------------------------------------------
 
@@ -1944,6 +2138,12 @@ class CoincidencerService:
                     "uptime_s": time.time() - self._started_unix,
                     "window_size": len(self._window),
                     "graph_size": len(self._graph),
+                    # 2026-07-21 drain-collapse guard: live ingest-queue
+                    # depth + capacity. ingest_queue_size approaching
+                    # ingest_queue_depth (and ingest_batches_dropped in
+                    # counters climbing) means C2 is the bottleneck.
+                    "ingest_queue_size": len(self._ingest_buf),
+                    "ingest_queue_depth": self._ingest_max,
                     "pending_plots": len(self._pending_plots),
                     "last_event_name": self._last_event_name,
                     "last_trigger_class": self._last_trigger_class,

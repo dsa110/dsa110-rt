@@ -14,12 +14,16 @@ and ``mjd_j ≥ mjd_new - dt_max`` (where ``dt_max`` is bounded by the
 maximum legal pair half-sum), so the per-add cost is linear in the
 number of neighbours, not in the window size.
 
-Removal (age-out) is rare relative to add, and naively re-deriving the
-components on remove is cheap enough at typical window depths
-(< 100k entries) — we run the full union-find scan over the surviving
-members rather than incrementally invalidate edges. The full rebuild
-is O(n²) in the worst case but is bounded by ``coinc.window_s`` and
-the per-half candidate rate; in practice the cluster scan dominates.
+Removal (age-out) re-derives the components over the survivors
+(union-find has no cheap delete). Rather than a brute O(n²) all-pairs
+edge scan, :meth:`CoincidenceGraph._rebuild` does a MJD-sorted sweep
+with a forward-probe cutoff at the widest survivor's half-window, which
+yields the identical components but collapses to ~O(n·k) for the common
+time-spread case. This matters: under a candidate storm the quadratic
+age-out term was the C2 drain bottleneck behind the 2026-07-21
+drain-collapse incident (whole C1 batches backing up and dropping).
+The absolute worst case (all entries at one instant) is still O(n²) —
+that set genuinely forms one component and cannot be derived cheaper.
 """
 
 from __future__ import annotations
@@ -139,23 +143,7 @@ class CoincidenceGraph:
         if eid not in self._entries:
             return
         del self._entries[eid]
-        # Rebuild union-find from scratch over survivors. Splitting a
-        # union-find on element removal is not free; a periodic rebuild
-        # is the simplest correct option and matches the design's
-        # complexity budget.
-        self._uf = _UnionFind()
-        members = list(self._entries.items())
-        for eid_a, _ in members:
-            self._uf.add(eid_a)
-        # Rebuild edges. n² over the surviving set; window depth keeps
-        # this bounded.
-        n = len(members)
-        for i in range(n):
-            eid_a, ea = members[i]
-            for j in range(i + 1, n):
-                eid_b, eb = members[j]
-                if edge_predicate(ea, eb):
-                    self._uf.union(eid_a, eid_b)
+        self._rebuild()
 
     def remove_many(self, entries: Iterable[WindowEntry]) -> None:
         """Drop a batch of entries and rebuild only once afterwards."""
@@ -167,15 +155,57 @@ class CoincidenceGraph:
                 any_removed = True
         if not any_removed:
             return
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        """Re-derive connected components over the current survivor set.
+
+        Union-find has no cheap delete, so age-out re-derives the graph
+        from the survivors. The naive form is a brute O(n²) all-pairs
+        edge scan; under a candidate storm (the 2026-07-21 C2 drain-
+        collapse incident) that quadratic term is the drain bottleneck
+        that let whole C1 batches back up and drop.
+
+        This form is a *sorted sweep*: sort survivors by MJD, then for
+        each entry only probe forward while the time gap can still
+        satisfy the edge predicate. The predicate is
+        ``|Δt| ≤ (w_i + w_j)/2``; the largest half-sum any pair can have
+        is ``(w_i + w_max)/2`` where ``w_max`` is the widest survivor, so
+        once ``t_j − t_i`` exceeds that bound no further ``j`` can edge to
+        ``i`` and the inner scan breaks. Because edges are symmetric,
+        probing forward from every ``i`` still finds every edge, so the
+        resulting components are IDENTICAL to the brute scan (covered by
+        ``tests/test_c2_components_ageout.py``). Worst case (all entries
+        at one instant, or one pathologically wide entry) is still O(n²)
+        — that set genuinely forms one component and cannot be cheaper —
+        but the common time-spread storm collapses to ~O(n·k).
+        """
         self._uf = _UnionFind()
         members = list(self._entries.items())
+        n = len(members)
         for eid_a, _ in members:
             self._uf.add(eid_a)
-        n = len(members)
+        if n < 2:
+            return
+        # Sort by MJD ascending; keep (eid, entry) paired.
+        members.sort(key=lambda kv: kv[1].mjd)
+        # Widest survivor half-window (seconds) bounds the forward probe.
+        w_max_sec = max(
+            m[1].width_samples * m[1].sample_period_us / 1.0e6
+            for m in members
+        )
         for i in range(n):
             eid_a, ea = members[i]
+            t_i = ea.mjd * _SECONDS_PER_DAY
+            w_i_sec = ea.width_samples * ea.sample_period_us / 1.0e6
+            # No pair's half-sum can exceed (w_i + w_max)/2, so once the
+            # forward time gap passes this bound we can stop probing i.
+            reach_sec = 0.5 * (w_i_sec + w_max_sec)
             for j in range(i + 1, n):
                 eid_b, eb = members[j]
+                dt_sec = eb.mjd * _SECONDS_PER_DAY - t_i
+                if dt_sec > reach_sec:
+                    break
                 if edge_predicate(ea, eb):
                     self._uf.union(eid_a, eid_b)
 
