@@ -331,3 +331,137 @@ def test_list_events_wrapper_matches_detailed(tmp_path, cands_panel) -> None:
     assert [e.name for e in ab.list_events()] == [
         e.name for e in ab.list_events_detailed().events
     ]
+
+
+# ---- EventIndexCache: server-side cached index -----------------------------
+#
+# The /bursts page now serves the whole event index from an in-process,
+# incrementally-refreshed cache instead of re-enumerating the NFS archive
+# per request. These tests exercise the cache directly against a fake
+# archive under tmp_path: cold build, incremental pickup, TTL gating and
+# the NFS-failure (serve-stale) path.
+
+
+def test_cache_cold_build_full_index(tmp_path, cands_panel) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    newest_first = _mk_events_by_age(root, 5)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=60, active_window_s=0,
+    )
+    snap = cache.snapshot()
+    # Whole index, newest-first — NOT a capped window.
+    assert snap.n_total == 5
+    assert [e.name for e in snap.events] == newest_first
+    assert snap.stale is False
+    assert snap.last_success_unix is not None
+
+
+def test_cache_incremental_picks_up_new_event(tmp_path, cands_panel) -> None:
+    import os
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 3)
+    # active_window_s=0 so ONLY genuinely new/changed dirs get re-read.
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0, active_window_s=0,
+    )
+    first = cache.snapshot()
+    assert first.n_total == 3
+    # A brand-new event dir lands, newer than everything cached.
+    now = 1_700_001_000
+    ev = _layout_event(root, "260601newv")
+    os.utime(ev, (now, now))
+    # ttl_s=0 → next access refreshes; the new dir is picked up + sorted in.
+    second = cache.snapshot()
+    assert second.n_total == 4
+    assert second.events[0].name == "260601newv"
+
+
+def test_cache_ttl_defers_rescan(tmp_path, cands_panel) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 2)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=9_999, active_window_s=0,
+    )
+    assert cache.snapshot().n_total == 2
+    # A new dir appears, but within the (huge) TTL the cache must NOT
+    # re-scan, so it stays at the cached count.
+    _layout_event(root, "260601aaab")
+    assert cache.snapshot().n_total == 2
+    # An explicit refresh bypasses the TTL and picks it up.
+    assert cache.snapshot(force_refresh=True).n_total == 3
+
+
+def test_cache_nfs_failure_serves_stale(tmp_path, cands_panel) -> None:
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 3)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0, active_window_s=0,
+    )
+    good = cache.snapshot()
+    assert good.n_total == 3 and good.stale is False
+    # Simulate the NFS mount going away: scan_dirs raises OSError. The
+    # cache must keep the last good index and flag it stale — never crash.
+    import unittest.mock as mock
+    with mock.patch.object(cache._browser, "scan_dirs",
+                           side_effect=OSError("stale NFS handle")):
+        stale = cache.snapshot()
+    assert stale.stale is True
+    assert stale.n_total == 3                    # last good index retained
+    assert stale.error and "scan failed" in stale.error
+    assert stale.last_success_unix == good.last_success_unix
+
+
+def test_cache_cold_failure_is_empty_not_500(tmp_path, cands_panel) -> None:
+    # Root that does not exist at all → is_available False → empty + stale,
+    # never an exception (the route degrades gracefully).
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(tmp_path / "nope"),
+    )
+    snap = cache.snapshot()
+    assert snap.events == []
+    assert snap.n_total == 0
+    assert snap.stale is True
+
+
+def test_cache_active_window_rereads_young_events(tmp_path, cands_panel) -> None:
+    """A young event whose dir mtime does NOT change still gets re-read
+    (C3 decision / voltage fragments land late under nested dirs that don't
+    bump the event-dir mtime)."""
+    import os
+    root = tmp_path / "candidates"
+    root.mkdir()
+    now = 1_700_002_000
+    ev = _layout_event(root, "260601cccc")
+    os.utime(ev, (now - 10, now - 10))           # "young"
+    # Wide active window so this event is always re-summarised.
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0,
+        active_window_s=1e12,
+    )
+    first = cache.snapshot()
+    assert first.events[0].c3_status == "pending"
+    # C3 lands its KEEP decision without touching the event-dir mtime.
+    _write_c3(ev, action="KEEP")
+    os.utime(ev, (now - 10, now - 10))           # pin mtime unchanged
+    second = cache.snapshot()
+    assert second.events[0].c3_status == "pass"
+
+
+def test_cache_drops_deleted_event(tmp_path, cands_panel) -> None:
+    import shutil
+    root = tmp_path / "candidates"
+    root.mkdir()
+    _mk_events_by_age(root, 3)
+    cache = cands_panel.EventIndexCache(
+        cands_panel.ArchiveBrowser(root), ttl_s=0, active_window_s=0,
+    )
+    names = [e.name for e in cache.snapshot().events]
+    assert len(names) == 3
+    shutil.rmtree(root / names[0])
+    after = cache.snapshot()
+    assert names[0] not in [e.name for e in after.events]
+    assert after.n_total == 2

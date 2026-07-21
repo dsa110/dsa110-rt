@@ -545,12 +545,15 @@ def test_bursts_page_zombie_tab_and_source_filter(client):
         _ev("260714zzzz", c3_action="KEEP", mtime_unix=now - 60),
         _ev("260713qqqq", mtime_unix=now - 7200),   # zombie
     ]
-    listing = cpf.EventListing(
-        events=events, n_total=len(events), n_newest=len(events),
-        n_annotated=0, truncated=False,
+    # The /bursts route now reads the whole index from the in-process
+    # EventIndexCache (incremental TTL refresh); mock the snapshot rather
+    # than the underlying per-request archive scan.
+    snap = cpf.CacheSnapshot(
+        events=events, n_total=len(events),
+        last_success_unix=now, stale=False, error=None,
     )
-    with mock.patch.object(app_mod.cands_browser, "list_events_detailed",
-                           return_value=listing):
+    with mock.patch.object(app_mod.cands_index, "snapshot",
+                           return_value=snap):
         r = client.get("/bursts")
         html = r.get_data(as_text=True)
         assert r.status_code == 200

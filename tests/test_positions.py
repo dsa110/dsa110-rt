@@ -445,8 +445,13 @@ def test_bursts_page_column_order_and_marker(client, app_module):
             "user": "vishnu"})
         assert r.status_code == 200
     events = [_summary(ev), _summary("260101kkkk")]
-    with mock.patch.object(app_module.cands_browser, "list_events",
-                           return_value=events):
+    # /bursts serves the whole index from the cache now; mock its snapshot.
+    import cands_panel_funcs as _cpf
+    snap = _cpf.CacheSnapshot(events=events, n_total=len(events),
+                              last_success_unix=1_700_000_000.0,
+                              stale=False, error=None)
+    with mock.patch.object(app_module.cands_index, "snapshot",
+                           return_value=snap):
         html = client.get("/bursts").get_data(as_text=True)
 
     # Header order: event, RA, Dec, UTC time, ... (RA/Dec moved up).

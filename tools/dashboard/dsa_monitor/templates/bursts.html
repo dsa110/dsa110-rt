@@ -139,6 +139,25 @@
     {% endif %}
 </div>
 
+<div class="annot-filter">
+    <span class="lbl">search</span>
+    <form method="get" action="/bursts" style="display:flex; gap:6px; align-items:center; margin:0;">
+        <input type="text" name="q" class="src-input" style="width: 200px;"
+               placeholder="event name (any time)…" value="{{ q }}"
+               autocomplete="off">
+        {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
+        {% if source_filter %}<input type="hidden" name="source" value="{{ source_filter }}">{% endif %}
+        <input type="number" name="days" class="src-input" style="width: 90px;"
+               min="0" step="1" placeholder="days" value="{{ days }}"
+               title="only events from the last N days (blank = all time)">
+        <button type="submit" style="padding:4px 12px; border:1px solid #b2bec3; border-radius:12px; background:#eef0f2; font-size:12px; cursor:pointer;">go</button>
+        {% if q or days %}
+        <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% elif source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
+           style="font-size:12px; color:#636e72;">clear</a>
+        {% endif %}
+    </form>
+</div>
+
 {% if not archive_available %}
 <div class="banner warn">
     Burst-candidates archive root <code>{{ archive_root }}</code> is
@@ -150,15 +169,52 @@
 </div>
 {% endif %}
 
-{% if listing_truncated %}
-<div class="banner info trunc-note">
-    Showing the newest {{ listing_n_newest }} of {{ listing_n_total }} events{% if listing_n_annotated %}
-    (plus {{ listing_n_annotated }} older annotated event{{ 's' if listing_n_annotated != 1 }}, always shown){% endif %}.
-    Older un-annotated events are hidden by the list cap, but every
-    human-annotated event stays here forever — search by
-    <em>source</em> or filter by <em>classification</em> above to find it.
+{% if cache_stale %}
+<div class="banner warn">
+    Archive index is <strong>stale</strong>{% if cache_stale_since %} (last good refresh
+    {{ cache_stale_since }}){% endif %} — the shared <code>/dataz</code> archive was
+    unreachable on the last refresh, so the counts and rows below are the
+    last cached snapshot. They will catch up automatically once the mount
+    responds.
 </div>
 {% endif %}
+
+{# Build the query-string that carries the active filters across page
+   links (so paging keeps your search/window). #}
+{% set filt_qs %}{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% if q %}&q={{ q|urlencode }}{% endif %}{% if days %}&days={{ days }}{% endif %}{% endset %}
+
+<div class="banner info trunc-note">
+    {% if searching %}
+    <strong>{{ n_matched }}</strong> event{{ 's' if n_matched != 1 }} match your
+    search (across all {{ listing_n_total }} archived).
+    {% else %}
+    Showing events <strong>{{ page_start + 1 if page_end else 0 }}–{{ page_end }}</strong>
+    of <strong>{{ listing_n_total }}</strong> archived
+    (page {{ page }} of {{ n_pages }}).
+    {% endif %}
+    All-time totals — C3 pass: {{ total_pass }} ({{ total_pending }} pending),
+    rejected: {{ total_fail }}, zombies: {{ total_zombie }}.
+    Every event is searchable by <em>name</em>, <em>source</em>, or
+    <em>classification</em> above, regardless of age.
+</div>
+
+{% macro pager() %}
+    {% if not searching and n_pages > 1 %}
+    <div class="annot-filter" style="justify-content: flex-end; margin-top: 10px;">
+        {% if page > 1 %}
+        <a href="/bursts?page={{ page - 1 }}{{ filt_qs }}">‹ newer</a>
+        {% else %}
+        <span style="color:#b2bec3; padding:2px 9px;">‹ newer</span>
+        {% endif %}
+        <span class="lbl" style="text-transform:none;">page {{ page }} / {{ n_pages }}</span>
+        {% if page < n_pages %}
+        <a href="/bursts?page={{ page + 1 }}{{ filt_qs }}">older ›</a>
+        {% else %}
+        <span style="color:#b2bec3; padding:2px 9px;">older ›</span>
+        {% endif %}
+    </div>
+    {% endif %}
+{% endmacro %}
 
 {% macro event_table(events, tab) %}
     {% if events %}
@@ -292,6 +348,7 @@
         <code>Level2/voltages/</code> (one per corr node). Newest first.
     </div>
     {{ event_table(events_pass, 'pass') }}
+    {{ pager() }}
 </div>
 
 <div class="card" id="tab-fail" style="display: none; border-top-left-radius: 0;">
@@ -304,6 +361,7 @@
         behind and remain viewable on each event page.
     </div>
     {{ event_table(events_fail, 'fail') }}
+    {{ pager() }}
 </div>
 
 <div class="card" id="tab-zombie" style="display: none; border-top-left-radius: 0;">
@@ -313,6 +371,7 @@
         (C3 pending &gt; 1 h) — the transfer/copy path failed for these.
     </div>
     {{ event_table(events_zombie, 'zombie') }}
+    {{ pager() }}
 </div>
 
 <div class="card">
