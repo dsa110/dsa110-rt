@@ -692,6 +692,21 @@ coinc:
     host: "0.0.0.0"
     port: 11500                    # mirrors c1.c2_endpoint.port
   window_s: 5.0                    # rolling buffer time depth
+  # 2026-07-21 C2 drain-collapse guard. The receiver now enqueues each C1
+  # batch onto a bounded in-process queue drained by a dedicated worker,
+  # instead of processing it inline on the socket-reader coroutine. This
+  # keeps the TCP sockets draining at line rate during candidate storms
+  # (bright-burst sidelobes / RFI floods) so the search-side c1_emit does
+  # NOT backpressure-drop whole batches. Incident: on 2026-07-21T20:36:55Z
+  # a 112.75-sigma injection's primary batch was dropped by c1_emit's
+  # outbound queue while C2 was wedged in the old O(N^2) inline age-out.
+  ingest_queue_depth: 512          # max C1 batches buffered before C2 must drop.
+                                   # On overflow, drops are counted (counters.ingest_batches_dropped),
+                                   # rate-limited WARNING-logged, and governed by top-N-by-max-SNR
+                                   # admission (see priority_snr). ~512 batches ~= 100 s at 5/s/half.
+  priority_snr: 30.0               # a batch whose max candidate SNR >= this is never dropped in favour
+                                   # of a dimmer queued batch (the lowest-max-SNR queued batch is evicted
+                                   # instead). A dropped batch above this threshold logs at ERROR every time.
   csv_retention_hours: 48
   csv_dir_c1: /dataz/dsa110/operations/C1/cluster_output
   csv_dir_c2: /dataz/dsa110/operations/C2/cluster_output
