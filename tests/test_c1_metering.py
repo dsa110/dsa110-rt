@@ -137,6 +137,156 @@ def test_meter_always_keep_predicate_swallows_predicate_errors() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SNR-protected metering (2026-07-21 silent-eviction fix)
+# ---------------------------------------------------------------------------
+
+
+def test_meter_snr_protected_survives_narrow_storm() -> None:
+    """(a) Storm: 12 narrow low-SNR junk + 1 width-4 bright, cap 8. With
+    the pre-2026-07-21 width-first metering the 8 narrowest evict the
+    bright one; with an SNR-protected slot it MUST survive."""
+    junk = [_cand(1, 11.0 + i * 0.4, dm_fine=2000.0) for i in range(12)]
+    bright = _cand(4, 109.6, dm_fine=500.0)
+    cands = junk + [bright]
+
+    # Pre-fix behaviour (protected=0) drops the bright width-4 candidate.
+    kept_old, _ = meter_candidates(cands, 8, snr_protected_slots=0)
+    assert bright not in kept_old, "confirms the bug: width-first evicts it"
+
+    # SNR-protected: the bright burst survives, kept count still <= cap.
+    kept, dropped = meter_candidates(cands, 8, snr_protected_slots=2)
+    assert bright in kept
+    assert len(kept) == 8
+    assert dropped == len(cands) - 8
+
+
+def test_meter_snr_protected_no_op_when_picks_coincide() -> None:
+    """(b) No storm: when the SNR-protected picks are candidates the
+    width-first heuristic would have kept anyway, the KEPT SET is
+    identical to the legacy behaviour (order may differ)."""
+    # All width-1: the top-cap by (width asc, snr desc) is exactly the
+    # top-cap by snr, so protected slots coincide with heuristic picks.
+    cands = [_cand(1, float(i), dm_fine=100.0) for i in range(20)]
+    kept_old, dropped_old = meter_candidates(cands, 8, snr_protected_slots=0)
+    kept_new, dropped_new = meter_candidates(cands, 8, snr_protected_slots=2)
+    assert dropped_new == dropped_old
+    assert {id(c) for c in kept_new} == {id(c) for c in kept_old}
+
+
+def test_meter_snr_protected_wide_junk_storm_unchanged() -> None:
+    """(b') No degradation of the genuine wide-junk storm case: when the
+    junk is WIDE, the narrow real candidates dominate BOTH keys, so the
+    kept set matches the legacy heuristic exactly."""
+    wide_junk = [_cand(8, 12.0 + i * 0.2, dm_fine=2500.0) for i in range(12)]
+    narrow_real = [_cand(1, 20.0 + i, dm_fine=300.0) for i in range(4)]
+    cands = wide_junk + narrow_real
+    kept_old, _ = meter_candidates(cands, 8, snr_protected_slots=0)
+    kept_new, _ = meter_candidates(cands, 8, snr_protected_slots=2)
+    assert {id(c) for c in kept_new} == {id(c) for c in kept_old}
+
+
+def test_meter_snr_protected_passthrough_under_cap() -> None:
+    """(c) Candidates <= cap: identity passthrough regardless of slots."""
+    cands = [_cand(1, 20.0), _cand(4, 99.0), _cand(2, 30.0)]
+    kept, dropped = meter_candidates(cands, 8, snr_protected_slots=2)
+    assert kept is cands
+    assert dropped == 0
+
+
+def test_meter_snr_protected_zero_reproduces_legacy() -> None:
+    """(d) protected_slots=0 is byte-for-byte the old heuristic (same
+    order, same drops) — verified against the un-parameterised call."""
+    cands = [
+        _cand(4, 50.0), _cand(1, 10.0), _cand(2, 40.0),
+        _cand(1, 30.0), _cand(2, 35.0), _cand(8, 99.0),
+    ]
+    kept_default, dropped_default = meter_candidates(cands, 3)
+    kept_zero, dropped_zero = meter_candidates(cands, 3, snr_protected_slots=0)
+    assert dropped_zero == dropped_default
+    assert [id(c) for c in kept_zero] == [id(c) for c in kept_default]
+
+
+def test_meter_snr_protected_never_exceeds_cap() -> None:
+    """(e) Cap interaction: kept never exceeds cap even when protected
+    slots >= cap (protected clamps to cap, remaining heuristic empty)."""
+    cands = [_cand(1, float(i), dm_fine=100.0) for i in range(30)]
+    for protected in (2, 8, 20):
+        kept, dropped = meter_candidates(
+            cands, 8, snr_protected_slots=protected,
+        )
+        assert len(kept) == 8
+        assert dropped == 22
+
+
+def test_meter_snr_protected_incident_replay_le_w64() -> None:
+    """(f) Incident replay: the le_w64-shaped list — a 109.6 σ width-4
+    candidate at DM 500 buried among 11 narrower 11-16 σ junk singles,
+    cap 8 — the bright one survives (and a 150.6 σ one alongside it)."""
+    junk = [
+        _cand(1, snr, dm_fine=2100.0 + j * 10.0)
+        for j, snr in enumerate(
+            [11.2, 12.1, 13.0, 14.4, 15.7, 16.0, 11.8, 12.9, 13.6, 14.1, 15.2]
+        )
+    ]
+    burst_1096 = _cand(4, 109.62, dm_fine=500.0)
+    burst_1506 = _cand(4, 150.62, dm_fine=500.0)
+    cands = junk[:5] + [burst_1096] + junk[5:] + [burst_1506]
+    kept, dropped = meter_candidates(cands, 8, snr_protected_slots=2)
+    assert burst_1096 in kept
+    assert burst_1506 in kept
+    assert len(kept) == 8
+    assert dropped == len(cands) - 8
+
+
+def test_meter_snr_protected_logs_displacement(caplog) -> None:
+    """A protected rescue that displaces a heuristic pick emits one INFO
+    line carrying snr/width/dm; the no-op case logs nothing."""
+    import logging as _logging
+
+    junk = [_cand(1, 11.0 + i * 0.3, dm_fine=2000.0) for i in range(12)]
+    bright = _cand(4, 109.6, dm_fine=500.0)
+    with caplog.at_level(_logging.INFO, logger="dsart.services.search_compute"):
+        meter_candidates(junk + [bright], 8, snr_protected_slots=2)
+    rescue_lines = [
+        r for r in caplog.records if "SNR-protected slot kept" in r.message
+    ]
+    assert len(rescue_lines) == 1
+    assert "snr=109.6" in rescue_lines[0].getMessage()
+
+    # No-op case (protected picks coincide): no rescue line.
+    caplog.clear()
+    allnarrow = [_cand(1, float(i), dm_fine=100.0) for i in range(20)]
+    with caplog.at_level(_logging.INFO, logger="dsart.services.search_compute"):
+        meter_candidates(allnarrow, 8, snr_protected_slots=2)
+    assert not [
+        r for r in caplog.records if "SNR-protected slot kept" in r.message
+    ]
+
+
+def test_meter_snr_protected_with_always_keep_predicate() -> None:
+    """SNR-protected slots compose with the cal-probe exemption: probes
+    are still kept unconditionally, and the metered rest gets an SNR-
+    protected slot on top of the width-first fill."""
+    probes = [_cand(8, 99.0, dm_fine=500.0) for _ in range(2)]
+    junk = [_cand(1, 11.0 + i * 0.3, dm_fine=2000.0) for i in range(12)]
+    bright = _cand(4, 140.0, dm_fine=800.0)
+    cands = probes + junk + [bright]
+
+    def is_probe(c):
+        return abs(c.dm_fine - 500.0) < 1.0
+
+    kept, dropped = meter_candidates(
+        cands, 8, always_keep_predicate=is_probe, snr_protected_slots=2,
+    )
+    # Both probes kept unconditionally (not counted against the cap).
+    assert sum(1 for c in kept if is_probe(c)) == 2
+    # The bright width-4 rescued into the metered rest (cap 8 over 'rest').
+    assert bright in kept
+    # Metered rest never exceeds cap.
+    assert sum(1 for c in kept if not is_probe(c)) == 8
+
+
+# ---------------------------------------------------------------------------
 # DM-smearing-floor filter (2026-05-30)
 # ---------------------------------------------------------------------------
 

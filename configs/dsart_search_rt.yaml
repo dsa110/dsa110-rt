@@ -466,6 +466,20 @@ c1:
                                      # blocks and published to /mon/search_rt/<cn>/compute/<half> -> influx
                                      # -> grafana. Set to 0 / remove to disable (ship every survivor).
                                      # RT-safe: selection is O(k log N) and skipped entirely under the cap.
+  snr_protected_slots: 2             # 2026-07-21 SNR-protected metering: reserve this many of the
+                                     # max_candidates_per_block slots for the top candidates by SNR ALONE
+                                     # (regardless of width); the rest are filled by the width-first
+                                     # heuristic above. Total kept never exceeds the cap. Fixes a silent
+                                     # eviction: width-ascending was the PRIMARY metering key and SNR only
+                                     # a within-width tie-break, so during a sidelobe/RFI storm >=8 narrow
+                                     # 11-16 sigma junk candidates unconditionally evicted a genuine width-4
+                                     # burst at 109.6 sigma (verified live -- the detector logged max_snr
+                                     # 109.62/150.62 but those candidates never reached the C2 coincidencer;
+                                     # a real bright FRB during an RFI storm would be lost the same way).
+                                     # Reserving 2 SNR-only slots guarantees the brightest few survive any
+                                     # width distribution while leaving the normal case (few cands/cube, or a
+                                     # genuine wide-junk storm) unchanged. 0 = exact pre-2026-07-21 behaviour.
+                                     # A rescue that displaces a heuristic pick is logged (INFO) for tracing.
   dm_width_floor_frac: 0.6           # 2026-05-30 physical-plausibility filter: drop candidates whose
                                      # boxcar width is below this fraction of the DM-smearing floor for
                                      # their DM (intra-8ch-summed-channel dispersion smearing), using the

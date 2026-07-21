@@ -116,40 +116,124 @@ __all__ = [
 _METER_WINDOW_BLOCKS = 16
 
 
+def _meter_over_cap(
+    items: List[Candidate],
+    cap: int,
+    snr_protected_slots: int,
+) -> "tuple[List[Candidate], int]":
+    """Select ``cap`` candidates from ``items`` (assumed ``len > cap``).
+
+    Legacy heuristic (``snr_protected_slots <= 0``): pick the ``cap``
+    candidates that are narrowest first (``width_samples`` ascending),
+    breaking width ties by brightest first (``snr`` descending).
+
+    SNR-protected metering (``snr_protected_slots > 0``): reserve up to
+    ``snr_protected_slots`` slots for the top candidates by SNR **alone**
+    (regardless of width), then fill the remaining ``cap - N`` slots with
+    the legacy width-first heuristic over the candidates not already kept.
+    Total kept never exceeds ``cap``. This closes the 2026-07-21 silent-
+    eviction hole: a narrow-junk RFI storm (≥ cap candidates at 11–16 σ,
+    width 1–2) would otherwise unconditionally evict a genuine bright
+    burst at higher width — verified live when the detector logged
+    max_snr 109.6/150.6 σ but those candidates never reached the C2
+    coincidencer. When a protected slot rescues a candidate the legacy
+    heuristic would have shed, one INFO line is emitted for traceability.
+    """
+    n = len(items)
+    if snr_protected_slots <= 0:
+        kept = heapq.nsmallest(
+            cap, items,
+            key=lambda c: (int(c.width_samples), -float(c.snr)),
+        )
+        return kept, n - len(kept)
+    n_protected = min(int(snr_protected_slots), cap)
+    # Top-N by SNR alone — the slots that survive any width distribution.
+    protected_kept = heapq.nlargest(
+        n_protected, items, key=lambda c: float(c.snr),
+    )
+    protected_ids = {id(c) for c in protected_kept}
+    remaining = cap - len(protected_kept)
+    if remaining > 0:
+        rest_pool = [c for c in items if id(c) not in protected_ids]
+        heuristic_kept = heapq.nsmallest(
+            remaining, rest_pool,
+            key=lambda c: (int(c.width_samples), -float(c.snr)),
+        )
+    else:
+        heuristic_kept = []
+    kept = protected_kept + heuristic_kept
+    # Traceability: log only when a protected slot actually DISPLACED
+    # what the legacy width-first heuristic would have kept (rare — only
+    # during a narrow-candidate flood carrying a wider bright burst). No
+    # log in the common case where the protected picks coincide with the
+    # heuristic's, so the normal path is untouched.
+    if _LOG.isEnabledFor(logging.INFO):
+        legacy_ids = {
+            id(c) for c in heapq.nsmallest(
+                cap, items,
+                key=lambda c: (int(c.width_samples), -float(c.snr)),
+            )
+        }
+        for c in protected_kept:
+            if id(c) not in legacy_ids:
+                _LOG.info(
+                    "C1 metering: SNR-protected slot kept candidate "
+                    "snr=%.2f width=%d dm=%.1f that width-first metering "
+                    "would have evicted (cap=%d snr_protected_slots=%d)",
+                    float(c.snr), int(c.width_samples), float(c.dm_fine),
+                    cap, n_protected,
+                )
+    return kept, n - len(kept)
+
+
 def meter_candidates(
     candidates: List[Candidate],
     cap: Optional[int],
     *,
     always_keep_predicate: Optional[Any] = None,
+    snr_protected_slots: int = 0,
 ) -> "tuple[List[Candidate], int]":
-    """C1→C2 metering selection: keep at most ``cap`` candidates, ordered
-    narrow-first (``width_samples`` ascending) then bright-first (``snr``
-    descending). Returns ``(kept, n_dropped)``.
+    """C1→C2 metering selection: keep at most ``cap`` candidates. Returns
+    ``(kept, n_dropped)``.
 
-    ``cap`` of ``None`` / ``<= 0`` disables metering (returns the input
-    unchanged with ``n_dropped == 0``). RT-safe: when at or under the cap
-    we return immediately without sorting; above the cap we use
-    ``heapq.nsmallest`` (O(k log cap), cap ≪ k during RFI floods) so the
-    hot loop never pays an O(k log k) full sort. Selection is a no-op on
-    the candidates' identity/order when not over the cap, so cube dump +
-    retention (which run off the full candidate list upstream) are
-    unaffected — this only bounds what is shipped to C2.
+    Base ordering is narrow-first (``width_samples`` ascending) then
+    bright-first (``snr`` descending). ``cap`` of ``None`` / ``<= 0``
+    disables metering (returns the input unchanged with ``n_dropped ==
+    0``). RT-safe: when at or under the cap we return immediately without
+    sorting; above the cap we use ``heapq.nsmallest`` (O(k log cap), cap ≪
+    k during RFI floods) so the hot loop never pays an O(k log k) full
+    sort. Selection is a no-op on the candidates' identity/order when not
+    over the cap, so cube dump + retention (which run off the full
+    candidate list upstream) are unaffected — this only bounds what is
+    shipped to C2.
+
+    2026-07-21 — ``snr_protected_slots``: reserve this many slots for the
+    top candidates by SNR ALONE (regardless of width), filling the rest of
+    the cap with the width-first heuristic (excluding the already-kept
+    protected candidates). Total kept never exceeds ``cap``. Fixes a silent
+    eviction: width-ascending is the PRIMARY key, so during a sidelobe/RFI
+    storm ≥ ``cap`` narrow 11–16 σ junk candidates unconditionally evicted
+    a genuine width-4 burst at 109.6 σ (and one at 150.6 σ) — the detector
+    saw them but they never reached the C2 coincidencer. ``0`` reproduces
+    the exact pre-2026-07-21 width-first behaviour. When a protected slot
+    displaces what the heuristic would have kept, one INFO line is emitted.
 
     T3 (2026-06-07) — ``always_keep_predicate``: optional callable
     ``(Candidate) -> bool``. Candidates for which the predicate returns
     True are split off and kept UNCONDITIONALLY (never counted against
-    the cap, never dropped). The cap is applied only to the rest. The
-    predicate runs in O(k) per cube on the hot path; the production
-    wiring (search-compute) passes a closure backed by the lazily-
-    refreshed :class:`dsart.inject.cal_probe_shadow.CalProbeShadow` so
-    operator-fired calibration probes always reach C2 regardless of
+    the cap, never dropped). The cap (+ SNR-protected slots) is applied
+    only to the rest. The predicate runs in O(k) per cube on the hot path;
+    the production wiring (search-compute) passes a closure backed by the
+    lazily-refreshed :class:`dsart.inject.cal_probe_shadow.CalProbeShadow`
+    so operator-fired calibration probes always reach C2 regardless of
     contemporaneous flood load. Pre-2026-06-07 the cap was content-blind
     and a probe landing during a noisy window could be silently shed,
     making ``fire_calibration_probe`` return ``no_match`` even when the
     detector picked the probe up correctly."""
     if cap is None or cap <= 0:
         return candidates, 0
-    n = len(candidates)
+    cap = int(cap)
+    protected = max(0, int(snr_protected_slots))
     if always_keep_predicate is not None:
         always_keep: List[Candidate] = []
         rest: List[Candidate] = []
@@ -159,22 +243,13 @@ def meter_candidates(
             except Exception:                                  # noqa: BLE001
                 hit = False
             (always_keep if hit else rest).append(c)
-        if len(rest) <= int(cap):
+        if len(rest) <= cap:
             return always_keep + rest, 0
-        kept_rest = heapq.nsmallest(
-            int(cap),
-            rest,
-            key=lambda c: (int(c.width_samples), -float(c.snr)),
-        )
-        return always_keep + kept_rest, len(rest) - len(kept_rest)
-    if n <= cap:
+        kept_rest, n_dropped = _meter_over_cap(rest, cap, protected)
+        return always_keep + kept_rest, n_dropped
+    if len(candidates) <= cap:
         return candidates, 0
-    kept = heapq.nsmallest(
-        int(cap),
-        candidates,
-        key=lambda c: (int(c.width_samples), -float(c.snr)),
-    )
-    return kept, n - len(kept)
+    return _meter_over_cap(candidates, cap, protected)
 
 
 # corr_fast F33 op-point: fine channels collapsed into one effective
@@ -1556,6 +1631,15 @@ class SearchComputeService:
             if cfg.c1_emit_config is not None
             else None
         )
+        # 2026-07-21: reserve a few slots for the top candidates by SNR
+        # alone so a bright burst is never evicted by a narrow-junk storm
+        # (width was the primary metering key). Safe default 2 even if the
+        # config object predates the field.
+        snr_protected_slots = (
+            getattr(cfg.c1_emit_config, "snr_protected_slots", 2)
+            if cfg.c1_emit_config is not None
+            else 2
+        )
         n_cands_pre_meter = len(candidates)
         # T3 (2026-06-07): exempt calibration-probe matches from the
         # cap so operator-fired probes always reach C2 even during a
@@ -1578,6 +1662,7 @@ class SearchComputeService:
             cal_probe_predicate = _is_cal_probe
         candidates, n_metered = meter_candidates(
             candidates, cap, always_keep_predicate=cal_probe_predicate,
+            snr_protected_slots=int(snr_protected_slots),
         )
         if n_metered:
             self._c1_cands_dropped_meter += n_metered
@@ -2320,6 +2405,10 @@ def _build_search_config_from_yaml(
     if enable_c1 and c2_endpoint:
         _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
         _max_cands_block = c1.get("max_candidates_per_block", None)
+        # 2026-07-21: default 2 even when the yaml key is absent, so the
+        # SNR-protected metering fix is live on nodes whose local config
+        # predates the key.
+        _snr_protected_slots = c1.get("snr_protected_slots", 2)
         _dm_width_floor = c1.get("dm_width_floor_frac", None)
         _noise_color_strength = c1.get("noise_color_strength", None)
         _noise_color_floor = c1.get("noise_color_snr_floor", None)
@@ -2339,6 +2428,7 @@ def _build_search_config_from_yaml(
                 if _max_cands_block is not None and int(_max_cands_block) > 0
                 else None
             ),
+            snr_protected_slots=max(0, int(_snr_protected_slots)),
             dm_width_floor_frac=(
                 float(_dm_width_floor)
                 if _dm_width_floor is not None and float(_dm_width_floor) > 0.0

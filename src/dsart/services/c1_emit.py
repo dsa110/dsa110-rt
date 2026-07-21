@@ -150,6 +150,24 @@ class C1EmitConfig:
     ``heapq.nsmallest`` and is skipped entirely when under the cap.
     Configured via ``c1.max_candidates_per_block`` in
     ``dsart_search_rt.yaml``."""
+    snr_protected_slots: int = 2
+    """C1→C2 metering: number of slots in ``max_candidates_per_block``
+    reserved for the top candidates by SNR ALONE (regardless of width),
+    with the remaining slots filled by the width-first heuristic. ``0``
+    reproduces the pre-2026-07-21 width-first behaviour.
+
+    Background — 2026-07-21: ``meter_candidates`` used width ascending as
+    the PRIMARY key and SNR only as a within-width tie-break, so during a
+    sidelobe/RFI storm ≥ ``max_candidates_per_block`` narrow 11–16 σ junk
+    candidates unconditionally evicted a genuine width-4 burst at 109.6 σ
+    (and one at 150.6 σ) — the detector logged those max SNRs but the
+    candidates never reached the C2 coincidencer, so a real bright FRB
+    arriving during an RFI storm would be silently lost the same way.
+    Reserving a couple of SNR-only slots guarantees the brightest few
+    survive any width distribution while leaving the normal case (few
+    cands/cube, or a genuine wide-junk storm) unchanged. Configured via
+    ``c1.snr_protected_slots`` in ``dsart_search_rt.yaml`` (default 2 even
+    when the key is absent)."""
     dm_width_floor_frac: Optional[float] = None
     """C1→C2 physical-plausibility filter: drop any candidate whose
     boxcar ``width_samples`` is below ``dm_width_floor_frac`` × the
