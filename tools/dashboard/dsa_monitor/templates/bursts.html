@@ -137,6 +137,18 @@
         <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% endif %}"
            title="clear source filter">×</a></span>
     {% endif %}
+    <form method="get" action="/bursts" style="display:flex; gap:6px; align-items:center; margin:0 0 0 12px;">
+        {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
+        {% if source_filter %}<input type="hidden" name="source" value="{{ source_filter }}">{% endif %}
+        <input type="number" name="days" class="src-input" style="width: 90px;"
+               min="0" step="1" placeholder="days" value="{{ days }}"
+               title="only events from the last N days (blank = all time)">
+        <button type="submit" style="padding:4px 12px; border:1px solid #b2bec3; border-radius:12px; background:#eef0f2; font-size:12px; cursor:pointer;">go</button>
+        {% if days %}
+        <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% elif source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
+           style="font-size:12px; color:#636e72;">clear</a>
+        {% endif %}
+    </form>
 </div>
 
 <div class="annot-filter">
@@ -147,11 +159,8 @@
                autocomplete="off">
         {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
         {% if source_filter %}<input type="hidden" name="source" value="{{ source_filter }}">{% endif %}
-        <input type="number" name="days" class="src-input" style="width: 90px;"
-               min="0" step="1" placeholder="days" value="{{ days }}"
-               title="only events from the last N days (blank = all time)">
         <button type="submit" style="padding:4px 12px; border:1px solid #b2bec3; border-radius:12px; background:#eef0f2; font-size:12px; cursor:pointer;">go</button>
-        {% if q or days %}
+        {% if q %}
         <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% elif source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
            style="font-size:12px; color:#636e72;">clear</a>
         {% endif %}
