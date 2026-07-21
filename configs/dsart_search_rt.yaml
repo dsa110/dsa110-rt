@@ -824,7 +824,11 @@ coinc:
   event_pkg_path: "/home/ubuntu/proj/dsa110-shell/dsa110-event"
   name_allocator_offline: false    # flip true on dev hosts w/o etcd
   # Plot dispatcher: wait for all 8 cubes or this many seconds, then plot.
-  plot_cube_wait_s: 60.0
+  # 2026-07-21: raised 60 -> 360. Cube rsync (2.3 GB/node -> /dataz NFS)
+  # measured ~4 min under load (voltage-dump collection + C3 catch-up);
+  # every trigger since 21:41 UT hit the 60 s deadline and was discarded
+  # 0/8 with its late-landing cubes deleted (le_w64_r4 103-sigma incl.).
+  plot_cube_wait_s: 360.0
   plot_dispatch_poll_s: 5.0
   plot_expected_cube_count: 8
   # Mon-points export (every coinc.mon_publish_interval_s seconds):
