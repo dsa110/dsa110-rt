@@ -110,6 +110,16 @@
         color: #0984e3; font-weight: 700; font-size: 9px;
         margin-left: 2px; cursor: help;
     }
+
+    /* Click-to-sort column headers */
+    th.sortable { padding: 0; }
+    th.sortable a.sort-link {
+        display: block; padding: 6px 8px; color: inherit; text-decoration: none;
+        cursor: pointer; white-space: nowrap;
+    }
+    th.sortable a.sort-link:hover { background: rgba(9, 132, 227, 0.08); }
+    th.sortable.sort-active a.sort-link { color: #0984e3; }
+    .sort-arrow { font-size: 9px; margin-left: 3px; }
 </style>
 {% endblock %}
 
@@ -190,7 +200,7 @@
 
 {# Build the query-string that carries the active filters across page
    links (so paging keeps your search/window). #}
-{% set filt_qs %}{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% if q %}&q={{ q|urlencode }}{% endif %}{% if days %}&days={{ days }}{% endif %}{% endset %}
+{% set filt_qs %}{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% if q %}&q={{ q|urlencode }}{% endif %}{% if days %}&days={{ days }}{% endif %}{% if sort %}&sort={{ sort }}&dir={{ dir }}{% endif %}{% endset %}
 
 <div class="banner info trunc-note">
     {% if searching %}
@@ -227,29 +237,52 @@
     {% endif %}
 {% endmacro %}
 
+{# Click-to-sort column header. 3-state cycle per column: descending ->
+   ascending -> default (newest-first). Clicking an inactive column jumps
+   straight to its first state (descending); clicking the already-desc
+   active column flips to ascending; clicking the already-asc active column
+   drops the ?sort=/&dir= params entirely (back to default newest-first).
+   All active filters (q/days/tag/source) ride along; ?page is intentionally
+   omitted so a sort change always lands on page 1. #}
+{% macro sort_th(key, label, css='value', title='') %}
+    {% set active = (sort == key) %}
+    {% set is_last_click = active and dir == 'asc' %}
+    {% set parts = [] %}
+    {% if not is_last_click %}
+        {% set next_dir = 'asc' if (active and dir == 'desc') else 'desc' %}
+        {% set _ = parts.append('sort=' ~ key) %}
+        {% set _ = parts.append('dir=' ~ next_dir) %}
+    {% endif %}
+    {% if tag_filter %}{% set _ = parts.append('tag=' ~ tag_filter) %}{% endif %}
+    {% if source_filter %}{% set _ = parts.append('source=' ~ (source_filter|urlencode)) %}{% endif %}
+    {% if q %}{% set _ = parts.append('q=' ~ (q|urlencode)) %}{% endif %}
+    {% if days %}{% set _ = parts.append('days=' ~ days) %}{% endif %}
+    <th class="{{ css }} sortable{{ ' sort-active' if active }}"{% if title %} title="{{ title }}"{% endif %}>
+        <a class="sort-link" href="/bursts{{ '?' ~ parts|join('&') if parts else '' }}">{{ label }}{% if active %}<span class="sort-arrow">{{ '▲' if dir == 'asc' else '▼' }}</span>{% endif %}</a>
+    </th>
+{% endmacro %}
+
 {% macro event_table(events, tab) %}
     {% if events %}
     <table class="metric" style="margin-top: 12px;">
         <thead>
             <tr>
-                <th>event</th>
-                <th class="value"
-                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown; superscript R = operator-entered refined localization (hover for method/author)">RA (J2000)</th>
-                <th class="value"
-                    title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown; superscript R = operator-entered refined localization (hover for method/author)">Dec (J2000)</th>
-                <th class="value">UTC time</th>
-                <th>class</th>
-                <th>C3 decision</th>
+                {{ sort_th('event', 'event', css='') }}
+                {{ sort_th('ra', 'RA (J2000)', title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown; superscript R = operator-entered refined localization (hover for method/author)") }}
+                {{ sort_th('dec', 'Dec (J2000)', title="ICRS J2000, from image l,m + array pointing; (NN) = 1-sigma uncertainty in units of the last digit (conservative 60 arcsec); legacy values as stored, uncertainty unknown; superscript R = operator-entered refined localization (hover for method/author)") }}
+                {{ sort_th('time', 'UTC time') }}
+                {{ sort_th('class', 'class', css='') }}
+                {{ sort_th('c3', 'C3 decision', css='') }}
                 {% if tab == 'pass' %}
-                <th class="value">voltages</th>
+                {{ sort_th('voltages', 'voltages') }}
                 {% endif %}
-                <th class="value">n_events</th>
-                <th class="value">snr_max</th>
-                <th class="value">dm_median</th>
-                <th class="value">l_median</th>
-                <th class="value">m_median</th>
-                <th class="value">cubes</th>
-                <th class="value">plots</th>
+                {{ sort_th('n_events', 'n_events') }}
+                {{ sort_th('snr', 'snr_max') }}
+                {{ sort_th('dm', 'dm_median') }}
+                {{ sort_th('l', 'l_median') }}
+                {{ sort_th('m', 'm_median') }}
+                {{ sort_th('cubes', 'cubes') }}
+                {{ sort_th('plots', 'plots') }}
             </tr>
         </thead>
         <tbody>
