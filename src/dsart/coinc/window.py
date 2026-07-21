@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import bisect
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Iterable, Iterator, List, Tuple
+from dataclasses import dataclass, replace
+from typing import Deque, Iterable, Iterator, List, Optional, Tuple
 
 from .wire import C1BatchHeader, C1CandidateRow
 
@@ -153,6 +153,32 @@ class TimeWindow:
         out = self._last_aged_out
         self._last_aged_out = []
         return out
+
+    def readd_clamped(self, entry: WindowEntry) -> Optional[WindowEntry]:
+        """Re-insert a just-aged-out ``entry`` with its MJD clamped to the
+        current window cutoff, so a late but detection-critical arrival
+        survives in-window instead of being silently dropped.
+
+        Returns the NEW (clamped) :class:`WindowEntry` actually inserted —
+        a distinct object the caller must graph-add so graph and window
+        membership stay in lock-step. Returns ``None`` if the window has
+        no cutoff yet (nothing ever added) — the caller should then not
+        rescue (there is no anchor to clamp to).
+
+        The clamp sets ``mjd = cutoff``; since :meth:`_age_out_below` drops
+        only entries strictly ``< cutoff``, the clamped entry survives this
+        and subsequent same-anchor age-outs, and ages out normally once the
+        anchor advances by another ``window_s`` (tail extension). It does
+        NOT move ``_latest_mjd`` (the anchor), so it cannot itself perturb
+        other rows' cutoff. Used for the 2026-07-21 late-priority rescue
+        (see :class:`CoincidencerConfig.rescue_late_priority`).
+        """
+        cutoff = self._cutoff_mjd()
+        if cutoff < 0.0:
+            return None
+        clamped = replace(entry, mjd=cutoff)
+        self._insert_sorted(clamped)
+        return clamped
 
     # ----- read -----------------------------------------------------------
 

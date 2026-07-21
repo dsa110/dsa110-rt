@@ -707,6 +707,24 @@ coinc:
   priority_snr: 30.0               # a batch whose max candidate SNR >= this is never dropped in favour
                                    # of a dimmer queued batch (the lowest-max-SNR queued batch is evicted
                                    # instead). A dropped batch above this threshold logs at ERROR every time.
+                                   # ALSO the threshold for the late-priority rescue below.
+  rescue_late_priority: true       # 2026-07-21 last silent-loss path. A C1 row whose mjd is already
+                                   # below the window cutoff on arrival was inserted then immediately aged
+                                   # out ("late arrival") and NEVER graph-added: the inject matcher still
+                                   # ran on it (so a MATCH was logged) but it could never cluster or trigger
+                                   # -- a SILENT loss (rows_late_drop counter only). Incident: le_w64_r3
+                                   # 111.75-sigma injection at 21:05 UT was matched but never clustered
+                                   # because a transient C2 event-loop stall (in-process plotter waterfall
+                                   # reduce, ~20s) burst-drained the sockets per-connection, advancing the
+                                   # window anchor before the primary's batch processed, so it landed >5s
+                                   # (window_s) behind the cutoff. When true, a late arrival with SNR >=
+                                   # priority_snr is re-admitted to the window with its mjd clamped to the
+                                   # cutoff (tail-extended, anchor untouched) and graph-added, so it is still
+                                   # clustered + can trigger a dump (counter rows_late_rescued). Dim late
+                                   # arrivals are dropped as before. Every late drop of a >= priority_snr row
+                                   # is WARNING-logged either way (never silent). false = exact pre-2026-07-21
+                                   # behaviour. NB the search-side plotter-blocks-the-loop stall that CAUSES
+                                   # the burst is a separate follow-up (owned by the plotter/search side).
   csv_retention_hours: 48
   csv_dir_c1: /dataz/dsa110/operations/C1/cluster_output
   csv_dir_c2: /dataz/dsa110/operations/C2/cluster_output

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -77,6 +78,7 @@ trigger_classes:
 
 def _make_service(
     tmp_path: Path, window_s: float = 5.0, startup_grace_s: float = 0.0,
+    *, rescue_late_priority: bool = True, priority_snr: float = 30.0,
 ) -> CoincidencerService:
     cfg = CoincidencerConfig(
         bind_host="127.0.0.1",
@@ -89,6 +91,8 @@ def _make_service(
         name_allocator_offline=True,
         gal_dm_poll_interval_s=60.0,
         startup_grace_s=startup_grace_s,
+        rescue_late_priority=rescue_late_priority,
+        priority_snr=priority_snr,
     )
     return CoincidencerService(
         config=cfg,
@@ -320,6 +324,139 @@ async def test_no_leak_under_many_restart_cycles(tmp_path: Path) -> None:
         f"restart cycles (each shipping 10 late rows)"
     )
     assert svc._counters["rows_late_drop"] == 50 * 10
+
+
+# ---------------------------------------------------------------------------
+# Late-priority rescue (2026-07-21 last silent-loss path)
+#
+# Incident: an le_w64_r3 111.75 sigma injection at 21:05 UT was matched by
+# the C2 inject matcher but never clustered — its C1 batch landed >5 s
+# (window_s) behind the anchor during a transient C2 event-loop stall, so
+# it was inserted+aged-out as a "late arrival" and never graph-added. A
+# bright (>= priority_snr) late arrival must instead SURVIVE (graph-added,
+# evaluated) and be WARNING-logged; a dim one is dropped-and-counted as
+# before; and graph/window membership must stay in lock-step throughout.
+# ---------------------------------------------------------------------------
+
+
+@asyncio_test
+async def test_late_bright_row_rescued_survives_and_warned(
+    tmp_path: Path, caplog,
+) -> None:
+    """A bright late arrival (snr >= priority_snr) is re-admitted with its
+    mjd clamped to the cutoff, graph-added, counted as rescued (not
+    dropped), and WARNING-logged. Graph and window stay in lock-step.
+    """
+    svc = _make_service(tmp_path, window_s=2.0)  # priority_snr=30, rescue on
+    # Anchor the window at +10 s with 3 dim in-window rows (offsets
+    # 0/0.1/0.2 s via sample_period_us=1e5 → all inside the 2 s window).
+    anchor_mjd = 60781.0 + 10.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=anchor_mjd, n=3, snr=9.0), peer_repr="x",
+    )
+    g0 = len(svc._graph)
+    assert len(svc._window) == g0 == 3
+
+    # Bright row anchored at +1 s (≈9 s old; cutoff = 10.2 − 2 = 8.2 s),
+    # i.e. ~7 s beyond the window tail — exactly the incident geometry.
+    late_mjd = 60781.0 + 1.0 / 86400.0
+    with caplog.at_level(logging.WARNING):
+        await svc._on_batch(
+            _batch(mjd_start=late_mjd, n=1, snr=111.75), peer_repr="y",
+        )
+
+    # Rescued, NOT dropped.
+    assert svc._counters["rows_late_rescued"] == 1
+    assert svc._counters["rows_late_drop"] == 0
+    # rows_in still tracks every received row.
+    assert svc._counters["rows_in"] == 3 + 1
+    # Graph grew by exactly the rescued row; window mirrors graph.
+    assert len(svc._graph) == g0 + 1
+    assert len(svc._window) == len(svc._graph)
+    # Never silent: WARNING carries snr for the operator.
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("RESCUED" in m and "111.75" in m for m in msgs), msgs
+
+
+@asyncio_test
+async def test_rescued_row_ages_out_of_both_graph_and_window(
+    tmp_path: Path,
+) -> None:
+    """Membership contract: a rescued (clamped) row must age out of BOTH
+    the window and the graph once the anchor advances past it — no leak.
+    """
+    svc = _make_service(tmp_path, window_s=2.0)
+    anchor_mjd = 60781.0 + 10.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=anchor_mjd, n=3, snr=9.0), peer_repr="x",
+    )
+    late_mjd = 60781.0 + 1.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=late_mjd, n=1, snr=111.75), peer_repr="y",
+    )
+    assert svc._counters["rows_late_rescued"] == 1
+    assert len(svc._window) == len(svc._graph) == 4
+
+    # Advance the anchor well past the clamped row's cutoff-mjd: a fresh
+    # in-window batch at +14 s → cutoff = 14 − 2 = 12 s ages out the
+    # clamped row (at 8.2 s) AND the three +10 s rows.
+    future_mjd = 60781.0 + 14.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=future_mjd, n=1, snr=9.0), peer_repr="z",
+    )
+    # Only the newest row survives; graph and window agree (no leak of the
+    # rescued row into the graph).
+    assert len(svc._window) == len(svc._graph) == 1
+
+
+@asyncio_test
+async def test_late_dim_row_dropped_and_counted_as_before(
+    tmp_path: Path,
+) -> None:
+    """A dim late arrival (snr < priority_snr) is dropped-and-counted
+    exactly as pre-2026-07-21 — rescue only ever protects bright rows.
+    """
+    svc = _make_service(tmp_path, window_s=2.0)
+    anchor_mjd = 60781.0 + 10.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=anchor_mjd, n=3, snr=9.0), peer_repr="x",
+    )
+    g0 = len(svc._graph)
+    late_mjd = 60781.0 + 1.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=late_mjd, n=4, snr=12.0), peer_repr="y",
+    )
+    assert svc._counters["rows_late_rescued"] == 0
+    assert svc._counters["rows_late_drop"] == 4
+    assert len(svc._graph) == g0            # no graph growth
+    assert len(svc._window) == len(svc._graph)
+
+
+@asyncio_test
+async def test_late_bright_row_dropped_when_rescue_disabled(
+    tmp_path: Path, caplog,
+) -> None:
+    """With rescue_late_priority=False the pre-2026-07-21 behaviour holds:
+    the bright late row is dropped-and-counted — but STILL WARNING-logged
+    (requirement (a): a bright loss is never silent, even without rescue).
+    """
+    svc = _make_service(tmp_path, window_s=2.0, rescue_late_priority=False)
+    anchor_mjd = 60781.0 + 10.0 / 86400.0
+    await svc._on_batch(
+        _batch(mjd_start=anchor_mjd, n=3, snr=9.0), peer_repr="x",
+    )
+    g0 = len(svc._graph)
+    late_mjd = 60781.0 + 1.0 / 86400.0
+    with caplog.at_level(logging.WARNING):
+        await svc._on_batch(
+            _batch(mjd_start=late_mjd, n=1, snr=111.75), peer_repr="y",
+        )
+    assert svc._counters["rows_late_rescued"] == 0
+    assert svc._counters["rows_late_drop"] == 1
+    assert len(svc._graph) == g0
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("DROPPED a bright late" in m and "111.75" in m
+               for m in msgs), msgs
 
 
 # ---------------------------------------------------------------------------

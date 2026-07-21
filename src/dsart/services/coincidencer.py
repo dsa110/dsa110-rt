@@ -455,6 +455,29 @@ class CoincidencerConfig:
     ingest_queue_depth: int = 512
     priority_snr: float = 30.0
 
+    # 2026-07-21 late-priority rescue. A C1 row whose mjd is already below
+    # the TimeWindow cutoff on arrival is inserted then immediately aged
+    # out ("late arrival", coincidencer.py ~L1330) and NEVER graph-added:
+    # the inject matcher still runs on it (so a match is recorded) but it
+    # can never form a cluster or trigger a dump. That path is SILENT
+    # (counter rows_late_drop only). Incident 2026-07-21 21:05: an
+    # le_w64_r3 111.75 sigma injection was matched but never clustered
+    # because a transient C2 event-loop stall (in-process plotter
+    # waterfall reduce, ~20 s) burst-drained the sockets per-connection,
+    # advancing the window anchor on one connection before the primary's
+    # batch was processed, so it landed >5 s (window_s) behind the cutoff.
+    # When rescue_late_priority is True, a late arrival whose SNR >=
+    # priority_snr is RE-ADMITTED to the window with its mjd clamped to
+    # the current cutoff (so it lives ~window_s longer at the window tail
+    # WITHOUT moving the anchor) and graph-added, so it is still clustered
+    # and can trigger — a slightly-stale bright component is vastly better
+    # than a silently-lost FRB. Graph membership still mirrors window
+    # membership (the clamped entry ages out normally later). Dim late
+    # arrivals are dropped-and-counted exactly as before. Every late drop
+    # of a >= priority_snr row is WARNING-logged either way (never silent).
+    # Set False to restore the exact pre-2026-07-21 late-drop behaviour.
+    rescue_late_priority: bool = True
+
     @classmethod
     def from_yaml(cls, path: Path, *, override: Optional[Mapping[str, Any]] = None
                  ) -> "CoincidencerConfig":
@@ -599,6 +622,9 @@ class CoincidencerConfig:
             startup_grace_s=float(coinc.get("startup_grace_s", 180.0)),
             ingest_queue_depth=int(coinc.get("ingest_queue_depth", 512)),
             priority_snr=float(coinc.get("priority_snr", 30.0)),
+            rescue_late_priority=bool(
+                coinc.get("rescue_late_priority", True),
+            ),
         )
 
 
@@ -949,6 +975,16 @@ class CoincidencerService:
         self._counters: Dict[str, int] = {
             "rows_in": 0,
             "rows_late_drop": 0,
+            # 2026-07-21 late-priority rescue: bright (>= priority_snr) rows
+            # that arrived with mjd already below the window cutoff (would
+            # otherwise be silently late-dropped) but were re-admitted with
+            # their mjd clamped to the cutoff so they still get graphed +
+            # evaluated. Incident: le_w64_r3 111.75 sigma injection at
+            # 2026-07-21 21:05 was matched by the inject matcher but never
+            # clustered because its C1 batch landed >5 s behind the anchor
+            # (C2 event-loop stall -> bursty per-connection socket drain ->
+            # anchor advanced on one connection before this row processed).
+            "rows_late_rescued": 0,
             # 2026-07-21 drain-collapse guard: whole C1 batches dropped at
             # the C2 ingest queue because C2 could not process the offered
             # rate and the bounded queue overflowed. Non-zero here means
@@ -1339,10 +1375,73 @@ class CoincidencerService:
         for e in survivors:
             self._graph.add(e)
         self._counters["rows_in"] += len(new_entries)
+
+        # 2026-07-21 late-priority rescue. ``late_arrivals`` are rows that
+        # landed with mjd already below the window cutoff and were popped
+        # by the same age-out pass. Historically ALL of them were silently
+        # dropped (rows_late_drop counter only) and never graph-added — the
+        # leak the block above guards against. But a BRIGHT late arrival is
+        # a detection-critical loss (a real FRB that reached C2 a few
+        # seconds late during an event-loop stall, e.g. the le_w64_r3
+        # 111.75 sigma injection on 2026-07-21 21:05). So:
+        #   * every late drop whose SNR >= priority_snr is WARNING-logged
+        #     with snr/dm/mjd/lateness (never silent), and
+        #   * when rescue_late_priority is on, such a row is RE-ADMITTED to
+        #     the window with its mjd clamped to the cutoff (tail-extended,
+        #     anchor untouched) and graph-added, so it is clustered +
+        #     evaluated this batch. Dim late arrivals are dropped exactly
+        #     as before. Graph membership still mirrors window membership:
+        #     the clamped entry is a real in-window row that ages out (and
+        #     is graph-removed) normally on a later batch.
+        rescued: List[WindowEntry] = []
+        n_dropped = 0
         if late_arrivals_ids:
+            latest = self._window.latest_mjd
+            window_s = self._config.window_s
+            prio = self._config.priority_snr
+            for e in new_entries:
+                if id(e) not in late_arrivals_ids:
+                    continue
+                is_bright = e.snr >= prio
+                if is_bright:
+                    lateness_s = (latest - e.mjd) * 86400.0
+                    beyond_s = lateness_s - window_s
+                    clamped = (
+                        self._window.readd_clamped(e)
+                        if self._config.rescue_late_priority
+                        else None
+                    )
+                    if clamped is not None:
+                        self._graph.add(clamped)
+                        rescued.append(clamped)
+                        self._counters["rows_late_rescued"] += 1
+                        _LOG.warning(
+                            "C2 late-priority RESCUED a bright C1 row: "
+                            "snr=%.2f dm=%.2f mjd=%.9f arrived %.2fs late "
+                            "(%.2fs beyond the %.1fs window; anchor "
+                            "mjd=%.9f) s%d_g%d specnum=%d — clamped to "
+                            "window cutoff and graphed (incident "
+                            "2026-07-21 21:05 le_w64_r3)",
+                            e.snr, e.dm_pc_cc, e.mjd, lateness_s, beyond_s,
+                            window_s, latest, e.search_node_id, e.gpu_half,
+                            e.event_specnum,
+                        )
+                    else:
+                        n_dropped += 1
+                        _LOG.warning(
+                            "C2 DROPPED a bright late C1 row (rescue "
+                            "disabled): snr=%.2f dm=%.2f mjd=%.9f arrived "
+                            "%.2fs late (%.2fs beyond the %.1fs window; "
+                            "anchor mjd=%.9f) s%d_g%d specnum=%d",
+                            e.snr, e.dm_pc_cc, e.mjd, lateness_s, beyond_s,
+                            window_s, latest, e.search_node_id, e.gpu_half,
+                            e.event_specnum,
+                        )
+                else:
+                    n_dropped += 1
+        if n_dropped:
             self._counters["rows_late_drop"] = (
-                self._counters.get("rows_late_drop", 0)
-                + len(late_arrivals_ids)
+                self._counters.get("rows_late_drop", 0) + n_dropped
             )
 
         # Hot-reload criteria if the file mtime changed under us.
@@ -1390,8 +1489,12 @@ class CoincidencerService:
         # the new_entries that actually made it into the graph; passing
         # late arrivals here would be harmless (components_touched skips
         # ids not in the graph) but ``survivors`` is the clearer contract.
+        # ``rescued`` are the clamped bright late arrivals (2026-07-21
+        # late-priority rescue) — they were graph-added above and MUST be
+        # walked here so a rescued bright row's component is evaluated (and
+        # can trigger a dump) on the very batch it arrived.
         gal_dm = self._current_gal_dm_max_los()
-        touched = self._graph.components_touched(survivors)
+        touched = self._graph.components_touched(survivors + rescued)
         for comp_id in touched:
             members = self._graph.component_members(comp_id)
             if not members:

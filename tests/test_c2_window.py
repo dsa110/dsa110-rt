@@ -155,3 +155,49 @@ def test_window_entry_from_row_preserves_provenance() -> None:
     assert e.width_samples == 8
     assert e.kernel_id == "unit:d1:b8"
     assert e.event_specnum == 100_000
+
+
+def test_readd_clamped_survives_and_does_not_move_anchor() -> None:
+    """readd_clamped re-inserts an aged-out entry at the current cutoff so
+    a bright late arrival survives in-window WITHOUT moving the anchor
+    (2026-07-21 late-priority rescue). sample_period_us=1e6 → 1 specnum
+    == 1 s of MJD offset.
+    """
+    win = TimeWindow(window_s=2.0)
+    h = _hdr(1, sample_period_us=1e6)
+    # Anchor at spn=10 (mjd = 60781 + 10 s); cutoff = 10 - 2 = 8 s.
+    win.add(h, [_row(event_specnum=10)])
+    anchor = win.latest_mjd
+    # A late row at spn=1 is inserted then immediately aged out.
+    inserted = win.add(h, [_row(event_specnum=1, snr=111.75)])
+    aged = win.aged_out()
+    assert [a.event_specnum for a in aged] == [1]
+    late = inserted[0]
+    assert late.event_specnum == 1
+
+    clamped = win.readd_clamped(late)
+    assert clamped is not None
+    # Clamped to the cutoff → survives this age-out (cutoff is not < cutoff)
+    # and does NOT advance the anchor.
+    assert win.latest_mjd == anchor
+    cutoff = anchor - 2.0 / 86400.0
+    assert clamped.mjd == pytest.approx(cutoff)
+    # Provenance preserved, only mjd changed.
+    assert clamped.event_specnum == 1
+    assert clamped.snr == pytest.approx(111.75)
+    # It is really in the window now.
+    assert clamped in win.snapshot()
+
+    # It ages out normally once the anchor advances past it.
+    win.add(h, [_row(event_specnum=13)])  # cutoff = 13 - 2 = 11 s
+    aged2 = win.aged_out()
+    assert 1 in [a.event_specnum for a in aged2]
+    assert clamped not in win.snapshot()
+
+
+def test_readd_clamped_none_when_no_anchor() -> None:
+    """With nothing ever added there is no cutoff to clamp to → None."""
+    win = TimeWindow(window_s=2.0)
+    h = _hdr(1, sample_period_us=1e6)
+    entry = WindowEntry.from_row(h, _row(event_specnum=5), mjd=60781.0)
+    assert win.readd_clamped(entry) is None
