@@ -67,9 +67,12 @@ from cands_panel_funcs import (
     EventIndexCache,
     DEFAULT_ARCHIVE_ROOT,
     DEFAULT_PAGE_SIZE,
+    DEFAULT_SORT_DIR,
     N_VOLTAGE_FRAGMENTS_TOTAL,
+    SORT_KEYS,
     _SAFE_EVENT_RE,
     partition_events_c3,
+    sort_events,
 )
 import annotations as ann
 import event_astrometry as ea
@@ -687,9 +690,23 @@ def bursts():
     now_ref = time.time()
     filtered = [e for e in all_events if _keep(e)] if searching else all_events
 
-    # ----- pagination (newest-first). A search shows ALL matches on one
-    # page (result sets are small and the operator wants every hit); an
-    # unfiltered browse pages through the archive newest-first. -----
+    # ----- column sort (?sort=/&dir=), applied over the WHOLE filtered
+    # index before pagination so it composes with paging rather than just
+    # reordering the visible page. An absent/unrecognised ?sort= is a no-op
+    # (sort_events returns the list unchanged) — that's what keeps the
+    # default (no sort params) render byte-identical to before this feature.
+    sort_key = (request.args.get("sort") or "").strip()
+    sort_dir = (request.args.get("dir") or DEFAULT_SORT_DIR).strip().lower()
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = DEFAULT_SORT_DIR
+    if sort_key not in SORT_KEYS:
+        sort_key = ""
+    if sort_key:
+        filtered = sort_events(filtered, sort_key, sort_dir)
+
+    # ----- pagination (newest-first, or by the active sort). A search shows
+    # ALL matches on one page (result sets are small and the operator wants
+    # every hit); an unfiltered browse pages through the archive. -----
     page_size = DEFAULT_PAGE_SIZE
     n_filtered = len(filtered)
     try:
@@ -756,6 +773,9 @@ def bursts():
         q=q,
         days=days_raw,
         searching=searching,
+        # column sort
+        sort=sort_key,
+        dir=sort_dir,
         # global (all-time) totals from the cached index
         listing_n_total=snap.n_total,
         total_pass=len(g_pass),

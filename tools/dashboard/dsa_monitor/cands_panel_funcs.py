@@ -50,6 +50,9 @@ __all__ = [
     "C3_ERA_START_UNIX",
     "is_zombie",
     "partition_events_c3",
+    "SORT_KEYS",
+    "DEFAULT_SORT_DIR",
+    "sort_events",
 ]
 
 
@@ -226,6 +229,69 @@ def partition_events_c3(
         else:
             ev_pass.append(e)
     return ev_pass, ev_fail, ev_zombie
+
+
+# ---------------------------------------------------------------------------
+# /bursts column sort (server-side, over the whole cached index)
+# ---------------------------------------------------------------------------
+
+#: Column key (``?sort=``) -> (accessor, is_lexical). Lexical columns sort
+#: case-insensitively; everything else is numeric. Keys map straight onto
+#: :class:`EventSummary` fields (``time`` uses ``mjd_peak``: the field that
+#: actually carries the full trigger epoch — ``utc_hms`` is a display-only
+#: time-of-day string and would sort wrong across UTC midnight/day
+#: boundaries).
+SORT_KEYS: Dict[str, Tuple[Any, bool]] = {
+    "event": (lambda e: e.name, True),
+    "ra": (lambda e: e.ra_deg, False),
+    "dec": (lambda e: e.dec_deg, False),
+    "time": (lambda e: e.mjd_peak, False),
+    "class": (lambda e: e.trigger_class, True),
+    "c3": (lambda e: e.c3_status, True),
+    "voltages": (lambda e: e.n_voltages, False),
+    "n_events": (lambda e: e.n_events, False),
+    "snr": (lambda e: e.snr_max, False),
+    "dm": (lambda e: e.dm_median, False),
+    "l": (lambda e: e.l_median, False),
+    "m": (lambda e: e.m_median, False),
+    "cubes": (lambda e: e.n_cubes, False),
+    "plots": (lambda e: e.n_plots, False),
+}
+
+DEFAULT_SORT_DIR = "desc"
+
+
+def sort_events(
+    events: List["EventSummary"],
+    sort_key: Optional[str],
+    direction: str = DEFAULT_SORT_DIR,
+) -> List["EventSummary"]:
+    """Reorder ``events`` by an :class:`EventSummary` field for ``/bursts``.
+
+    ``sort_key`` is one of :data:`SORT_KEYS`; anything else (``None``, empty
+    string, unrecognised key) is a no-op that returns ``events`` unchanged
+    (list copy) — this is what keeps the *no sort params* page byte-identical
+    to today's newest-first behaviour, since callers apply this over an
+    already newest-first list.
+
+    None/missing values always sort to the end, regardless of ``direction``
+    (an operator asking for "highest SNR first" or "lowest SNR first" both
+    want the events with no SNR at all out of the way, at the bottom).
+    Lexical columns (event name, class, C3 status) compare case-insensitively;
+    everything else compares numerically.
+    """
+    if not sort_key or sort_key not in SORT_KEYS:
+        return list(events)
+    getter, lexical = SORT_KEYS[sort_key]
+    reverse = direction != "asc"
+
+    present = [e for e in events if getter(e) is not None]
+    missing = [e for e in events if getter(e) is None]
+    if lexical:
+        present.sort(key=lambda e: str(getter(e)).lower(), reverse=reverse)
+    else:
+        present.sort(key=getter, reverse=reverse)
+    return present + missing
 
 
 @dataclass(frozen=True)
