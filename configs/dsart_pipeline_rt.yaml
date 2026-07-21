@@ -588,4 +588,25 @@ routines:
       --dump-wait-s 5.0
       --mon-interval-s 5.0
       --ready-sentinel-path /tmp/dsart-voltage-retention-CN.ready
+      --min-free-bytes-floor 17179869184
+      --staging-max-total-bytes 128849018880
       --log-level INFO
+  #
+  # --min-free-bytes-floor / --staging-max-total-bytes (2026-07-21 ENOSPC
+  # fleet stall): a C2 voltage-dump broadcast storm (dozens of triggers
+  # 19:20-21:42 UT, each staging ~6.47 GiB/corr node) filled the root
+  # filesystem on 9/16 corr nodes with NO free-space check anywhere in
+  # voltage_retention.py. The full disk stalled the meridian UVH5 writer
+  # sharing this filesystem -> bada back-pressure -> corr_slow blocked ->
+  # fada deadlock -> corr_fast TX froze on 3 nodes -> below
+  # --fan-in-min-corrs 15/16 -> all 8 search consumers stalled 25 min.
+  # A dump is now refused (logged once, counters
+  # dumps_skipped_disk_full / dumps_skipped_staging_cap on the mon
+  # payload) rather than written, whenever either guard trips; the RAM
+  # ring / reader thread are unaffected either way.
+  #   --min-free-bytes-floor: 16 GiB (17179869184 B). Refuse when free
+  #   space would drop below max(2 x expected fragment size ~12.9 GiB
+  #   at n_pre=14/n_post=8, this floor).
+  #   --staging-max-total-bytes: 120 GiB (128849018880 B). Cumulative
+  #   cap on --staging-dir; bounds the storm case even when the disk is
+  #   otherwise empty (~18 fragments at ~6.47 GiB before C3 catches up).

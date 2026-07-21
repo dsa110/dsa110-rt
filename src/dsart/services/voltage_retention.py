@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import json
 import logging
 import math
 import os
 import queue
+import shutil
 import signal
 import sys
 import threading
@@ -57,8 +59,10 @@ LOG = logging.getLogger("dsart.services.voltage_retention")
 
 __all__ = [
     "RetentionConfig",
+    "DiskFullError",
     "staged_paths",
     "write_window_to_staging",
+    "check_disk_headroom",
     "VoltageRetentionService",
     "main",
 ]
@@ -67,6 +71,28 @@ __all__ = [
 _SPECNUM_S: float = 2 * 32.768e-6
 #: Block cadence (s): 2048 specnums × 65.536 µs.
 _BLOCK_S: float = 2048 * _SPECNUM_S
+
+# 2026-07-21 ENOSPC fleet stall: a C2 voltage-dump broadcast storm
+# (dozens of triggers 19:20-21:42 UT) staged ~6.47 GiB/event/corr node
+# into --staging-dir with NO free-space check anywhere in this file,
+# filling the root filesystem on 9/16 corr nodes. The full disk stalled
+# the meridian UVH5 writer sharing the filesystem -> bada back-pressure
+# -> corr_slow blocked -> fada deadlock -> corr_fast TX froze on 3 nodes
+# -> below --fan-in-min-corrs -> all 8 search consumers stalled 25 min.
+# These are the code-side safe defaults for the disk-headroom guard
+# below; see configs/dsart_pipeline_rt.yaml for the deployed knobs.
+_DEFAULT_MIN_FREE_BYTES_FLOOR: int = 16 * (1 << 30)          # 16 GiB
+_DEFAULT_STAGING_MAX_TOTAL_BYTES: int = 120 * (1 << 30)      # 120 GiB
+
+
+class DiskFullError(OSError):
+    """Raised when a staging write hits ENOSPC mid-write.
+
+    Distinguishes the 2026-07-21 incident failure mode (disk filled
+    while writing a fragment) from generic dump failures so the worker
+    loop can count/log it separately and clean up the partial fragment,
+    while still surviving to process the next queued event.
+    """
 
 
 @dataclass(frozen=True)
@@ -86,10 +112,27 @@ class RetentionConfig:
     mon_interval_s: float = 5.0
     ready_sentinel_path: Optional[Path] = None
     max_blocks: int = 0          # 0 = run forever (tests cap it)
+    # 2026-07-21 disk-headroom guard (ENOSPC fleet stall). A dump is
+    # refused when free space < max(2 * expected_fragment_bytes,
+    # min_free_bytes_floor); expected_fragment_bytes is derived from
+    # n_pre/n_post below (no need to derive from window params — the
+    # fragment size IS the window size). min_free_bytes_floor is a
+    # fixed backstop for configs where 2x the fragment happens to be
+    # small.
+    min_free_bytes_floor: int = _DEFAULT_MIN_FREE_BYTES_FLOOR
+    # Cumulative cap on bytes resident in staging_dir. Bounds the storm
+    # case (many back-to-back real triggers) even when the disk has
+    # plenty of headroom otherwise.
+    staging_max_total_bytes: int = _DEFAULT_STAGING_MAX_TOTAL_BYTES
 
     @property
     def sb(self) -> str:
         return f"sb{self.chgroup:02d}"
+
+    @property
+    def expected_fragment_bytes(self) -> int:
+        """Bytes written per dump: (n_pre + n_post + 1) blocks."""
+        return (self.n_pre + self.n_post + 1) * FADA_BYTES_PER_BLOCK
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +174,58 @@ def staged_paths(
     return d / f"{base}_data.out", d / f"{base}.json"
 
 
+def _staging_dir_bytes(staging_dir: Path) -> int:
+    """Sum of file sizes currently in ``staging_dir``.
+
+    Startup baseline for the in-process cumulative-bytes counter (2026-
+    07-21 storm-containment guard) — cheap (one ``os.scandir`` pass, no
+    recursion) and tolerant of the directory not existing yet.
+    """
+    total = 0
+    try:
+        with os.scandir(staging_dir) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    except FileNotFoundError:
+        return 0
+    return total
+
+
+def _staged_fragment_bytes(
+    staging_dir: Path, event_name: str, chgroup: int,
+) -> int:
+    """Size of a previously-staged ``.out`` fragment, or 0 if absent."""
+    out_path, _json_path = staged_paths(staging_dir, event_name, chgroup)
+    try:
+        return out_path.stat().st_size
+    except OSError:
+        return 0
+
+
+def check_disk_headroom(
+    staging_dir: Path, required_bytes: int,
+) -> Tuple[bool, int]:
+    """Return ``(free_bytes >= required_bytes, free_bytes)``.
+
+    2026-07-21 ENOSPC fleet stall: the guard the dump worker consults
+    before writing a fragment. ``staging_dir`` is created if it does not
+    exist yet (a fresh node has no staging dir at all) so a never-
+    written corr node gets a real ``statvfs`` reading rather than an
+    ``OSError``.
+    """
+    staging_dir = Path(staging_dir)
+    try:
+        usage = shutil.disk_usage(staging_dir)
+    except OSError:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(staging_dir)
+    return usage.free >= required_bytes, usage.free
+
+
 def write_window_to_staging(
     *,
     ring: VoltageRing,
@@ -160,11 +255,30 @@ def write_window_to_staging(
 
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     n_written = 0
-    with open(tmp_path, "wb") as fh:
-        for _b, arr in extract.blocks:
-            fh.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
-            n_written += 1
-    os.replace(tmp_path, out_path)
+    try:
+        with open(tmp_path, "wb") as fh:
+            for _b, arr in extract.blocks:
+                fh.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
+                n_written += 1
+        os.replace(tmp_path, out_path)
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            # 2026-07-21 fleet stall: this is the exact traceback site
+            # (fh.write -> ENOSPC, logged 21:43:05 on n22). Clean up the
+            # partial .tmp fragment so a storm of failed dumps doesn't
+            # itself leave junk behind, then hand a typed error to the
+            # caller so the worker loop can count/log it once and keep
+            # going (the reader thread / RAM ring are unaffected either
+            # way — this is the disk-worker path only).
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise DiskFullError(
+                f"ENOSPC writing {tmp_path} "
+                f"({n_written} of {len(extract.blocks)} blocks written)"
+            ) from exc
+        raise
 
     manifest: Dict[str, Any] = {
         # v2 (2026-07-19): block_n_* keys and ring block labels are now
@@ -321,7 +435,19 @@ class VoltageRetentionService:
             "dumps_failed": 0,
             "deletes_done": 0,
             "blocks_dropped_total": 0,
+            # 2026-07-21 disk-headroom guard counters (ENOSPC fleet
+            # stall). Exposed on the same mon payload as the rest of
+            # _counters (see _mon_loop).
+            "dumps_skipped_disk_full": 0,
+            "dumps_skipped_staging_cap": 0,
+            "dumps_failed_enospc": 0,
         }
+        # In-process running total of bytes staged in config.staging_dir,
+        # seeded from disk at startup, kept current on every successful
+        # write/delete. Cheap stand-in for a full `du` on every dump —
+        # bounds the C2-storm case per plan (many real triggers, disk
+        # otherwise empty).
+        self._staged_bytes: int = _staging_dir_bytes(config.staging_dir)
 
     # ----- listener handlers (run on the asyncio loop) -----------------
 
@@ -435,9 +561,16 @@ class VoltageRetentionService:
                 continue
             try:
                 if kind == "delete":
+                    removed_bytes = _staged_fragment_bytes(
+                        self._cfg.staging_dir, name, self._cfg.chgroup,
+                    )
                     n = delete_staged(
                         self._cfg.staging_dir, name, self._cfg.chgroup,
                     )
+                    if n:
+                        self._staged_bytes = max(
+                            0, self._staged_bytes - removed_bytes,
+                        )
                     self._counters["deletes_done"] += 1
                     LOG.info(
                         "voltage_retention: deleted staged %s (%d files)",
@@ -446,6 +579,48 @@ class VoltageRetentionService:
                     continue
                 target = specnum_to_block_n(specnum)
                 self._wait_for_post(target)
+
+                # --- 2026-07-21 disk-headroom guard (ENOSPC fleet stall) ---
+                # Checked here, in the disk-worker path only, BEFORE any
+                # bytes are written. The reader thread / RAM ring are
+                # untouched by either branch below — the trigger is
+                # still absorbed off the queue exactly like a completed
+                # dump, it just isn't staged to NVMe.
+                expected = self._cfg.expected_fragment_bytes
+                required_free = max(
+                    2 * expected, self._cfg.min_free_bytes_floor,
+                )
+                free_ok, free_bytes = check_disk_headroom(
+                    self._cfg.staging_dir, required_free,
+                )
+                if not free_ok:
+                    self._counters["dumps_skipped_disk_full"] += 1
+                    LOG.warning(
+                        "voltage_retention: SKIPPING dump %s %s — disk "
+                        "headroom guard: %.2f GiB free < %.2f GiB "
+                        "required (2x expected fragment or floor); not "
+                        "writing (2026-07-21 ENOSPC fleet stall guard)",
+                        name, self._cfg.sb,
+                        free_bytes / (1 << 30), required_free / (1 << 30),
+                    )
+                    continue
+                if (
+                    self._staged_bytes + expected
+                    > self._cfg.staging_max_total_bytes
+                ):
+                    self._counters["dumps_skipped_staging_cap"] += 1
+                    LOG.warning(
+                        "voltage_retention: SKIPPING dump %s %s — "
+                        "cumulative staging cap: %.2f GiB staged + "
+                        "%.2f GiB fragment > %.2f GiB cap; not writing "
+                        "(2026-07-21 C2 storm containment guard)",
+                        name, self._cfg.sb,
+                        self._staged_bytes / (1 << 30),
+                        expected / (1 << 30),
+                        self._cfg.staging_max_total_bytes / (1 << 30),
+                    )
+                    continue
+
                 if not self._armed_mjd_read:
                     # once per process; the arm record is fixed for the
                     # lifetime of this capture epoch
@@ -489,12 +664,28 @@ class VoltageRetentionService:
                     )
                     continue
                 self._counters["dumps_done"] += 1
+                self._staged_bytes += int(manifest["total_bytes"])
                 LOG.info(
                     "voltage_retention: staged %s %s — %d blocks (%d dropped) "
                     "%.2f GiB",
                     name, self._cfg.sb,
                     manifest["n_blocks_written"], manifest["n_blocks_dropped"],
                     manifest["total_bytes"] / (1 << 30),
+                )
+            except DiskFullError:
+                # 2026-07-21 fleet stall: ENOSPC hit mid-write despite
+                # the pre-write headroom check (a concurrent writer, or
+                # the disk filling between the check and the write).
+                # write_window_to_staging already cleaned up the partial
+                # .tmp fragment. Count it separately from generic
+                # failures and keep the worker loop running — this is
+                # the behavior that survived the incident tonight; we're
+                # only adding cleanup + a dedicated counter.
+                self._counters["dumps_failed_enospc"] += 1
+                LOG.error(
+                    "voltage_retention: ENOSPC writing dump %s %s — "
+                    "partial fragment cleaned up, continuing",
+                    name, self._cfg.sb,
                 )
             except Exception:  # noqa: BLE001
                 self._counters["dumps_failed"] += 1
@@ -637,6 +828,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mon-interval-s", type=float, default=5.0)
     p.add_argument("--ready-sentinel-path", default=None)
     p.add_argument("--max-blocks", type=int, default=0)
+    # 2026-07-21 ENOSPC fleet stall (dozens of C2 dumps 19:20-21:42 UT
+    # filled the root filesystem on 9/16 corr nodes; see module
+    # docstring / RetentionConfig for the incident + cascade). These two
+    # knobs are the disk-headroom + storm-containment guard.
+    p.add_argument("--min-free-bytes-floor", type=int,
+                   default=_DEFAULT_MIN_FREE_BYTES_FLOOR,
+                   help="Refuse a dump if free space in --staging-dir "
+                        "would drop below max(2x expected fragment "
+                        "size, this floor). Bytes. Default 16 GiB.")
+    p.add_argument("--staging-max-total-bytes", type=int,
+                   default=_DEFAULT_STAGING_MAX_TOTAL_BYTES,
+                   help="Refuse a dump if it would push the cumulative "
+                        "bytes resident in --staging-dir over this cap "
+                        "(bounds a C2 trigger storm even with an "
+                        "otherwise-empty disk). Bytes. Default 120 GiB.")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return p
@@ -684,6 +890,8 @@ def main(argv: Optional[list] = None) -> int:
             if args.ready_sentinel_path else None
         ),
         max_blocks=int(args.max_blocks),
+        min_free_bytes_floor=int(args.min_free_bytes_floor),
+        staging_max_total_bytes=int(args.staging_max_total_bytes),
     )
     svc = VoltageRetentionService(cfg)
     return asyncio.run(svc.run())
