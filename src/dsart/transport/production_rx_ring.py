@@ -103,6 +103,36 @@ def _try_cuda_host_unregister(addr: int) -> None:
         pass
 
 
+def summarize_fan_in_shortfall(
+    wseqs: list[int],
+    target_seq: int,
+    fan_in_min_corrs: int,
+) -> tuple[int, int, list[int]]:
+    """Classify a fan-in gate check for the stall watchdog.
+
+    Pure (no ring / no I/O) so it is unit-testable off the search nodes.
+
+    Args:
+        wseqs: per-corr write-seq counts (producer's committed slots),
+            index == corr id.
+        target_seq: the write-seq a corr must reach for its data at the
+            consumer boundary to be present (already scaled by
+            ``n_active_dms_per_corr``).
+        fan_in_min_corrs: the minimum corrs required to emit a cube.
+
+    Returns:
+        ``(n_at_target, shortfall, behind_corrs)`` where ``n_at_target``
+        is how many corrs meet ``target_seq``, ``shortfall`` is
+        ``max(0, fan_in_min_corrs - n_at_target)`` (0 iff the gate would
+        pass), and ``behind_corrs`` is the sorted list of corr ids that
+        are below ``target_seq`` (the ones to check on the fabric).
+    """
+    behind = [i for i, w in enumerate(wseqs) if int(w) < int(target_seq)]
+    n_at_target = len(wseqs) - len(behind)
+    shortfall = max(0, int(fan_in_min_corrs) - n_at_target)
+    return n_at_target, shortfall, behind
+
+
 # ---------------------------------------------------------------------------
 # ProductionRxRingSource
 # ---------------------------------------------------------------------------
@@ -151,6 +181,19 @@ class ProductionRxRingSource:
         attach_timeout_s: float = 30.0,
         n_active_dms_per_corr: int = 1,
         max_realtime_lag_samples: Optional[int] = None,
+        # Fan-in stall watchdog (2026-07-21 fleet-wide freeze RCA). When
+        # fewer than ``fan_in_min_corrs`` corrs have data at the consumer
+        # boundary the source parks in ``await asyncio.sleep`` and emits
+        # NOTHING — correct ("insufficient data") but until now SILENT: the
+        # 2026-07-21 incident (a fleet-wide corr-group loss) presented as an
+        # unexplained permanent freeze on all 8 halves with no log output,
+        # and was initially misattributed to the C2 dump path. This knob is
+        # the minimum continuous stall (seconds) after which the gate-fail
+        # branch emits a rate-limited WARNING naming the shortfall + the
+        # behind corrs, so a corr-fabric outage is immediately diagnosable
+        # instead of looking like a hang. Pure observability — it never
+        # changes whether/what cubes are emitted. <= 0 disables.
+        fan_in_stall_warn_s: float = 3.0,
         # M7.4 scatter wiring (all optional — when omitted the source
         # falls back to the M7.2 zero-stub cint8 stack path):
         owned_coarse_dm: int | None = None,
@@ -261,6 +304,12 @@ class ProductionRxRingSource:
         self._n_overrun: int = 0
         self._n_pattern_mismatch: int = 0
         self._n_no_data_present: int = 0
+        # Fan-in stall watchdog (see ``fan_in_stall_warn_s`` above). Counts
+        # how many gate-poll iterations were spent with an unsatisfiable
+        # fan-in (surfaced in the status JSON so ``cube_progress`` shows a
+        # non-zero ``n_fan_in_stall`` the instant the pipeline goes quiet).
+        self._fan_in_stall_warn_s: float = float(fan_in_stall_warn_s)
+        self._n_fan_in_stall: int = 0
         # Per-cube scatter timing accumulator (M7.4 real-SNAP RT debug,
         # 2026-05-27). ``get_scatter_timing_and_reset`` is called from
         # the progress logger.
@@ -600,6 +649,7 @@ class ProductionRxRingSource:
             "n_overrun": int(self._n_overrun),
             "n_pattern_mismatch": int(self._n_pattern_mismatch),
             "n_no_data_present": int(self._n_no_data_present),
+            "n_fan_in_stall": int(self._n_fan_in_stall),
         }
 
     def get_scatter_timing_and_reset(self) -> dict:
@@ -801,6 +851,13 @@ class ProductionRxRingSource:
         # this ONCE at start; subsequent ring laps are caller's
         # problem (a steady-state lag means cubes/s is below target).
         consumer_armed = False
+        # Fan-in stall watchdog state (2026-07-21 RCA). ``_last_gate_pass``
+        # is the monotonic time we most recently had enough corrs to emit;
+        # ``_last_stall_warn`` rate-limits the WARNING to once per
+        # ``fan_in_stall_warn_s``. Kept as loop locals — the watchdog is
+        # pure observability and holds no cross-call state.
+        _last_gate_pass = time.monotonic()
+        _last_stall_warn = 0.0
         while not self._stopped:
             if self._max_cubes is not None and self._cubes_emitted >= self._max_cubes:
                 break
@@ -858,8 +915,52 @@ class ProductionRxRingSource:
             )
             n_at_target = sum(1 for w in wseqs if w >= target_seq)
             if n_at_target < self._fan_in_min_corrs:
+                # Insufficient fan-in: parking here is correct ("not enough
+                # data to emit a cube"), but a *permanent* shortfall (a
+                # corr-group outage) would otherwise freeze this half
+                # SILENTLY — the failure mode behind the 2026-07-21
+                # fleet-wide freeze (corr-group 15 lost on every search
+                # node; all 8 halves parked with no log line, initially
+                # misread as a C2 dump-path deadlock). Emit a rate-limited
+                # WARNING naming the shortfall + behind corrs so the corr
+                # fabric is the obvious suspect, and bump a status counter
+                # so ``cube_progress`` shows the stall the instant it
+                # starts. This branch NEVER emits a cube either way, so the
+                # watchdog cannot affect detection.
+                self._n_fan_in_stall += 1
+                now_mono = time.monotonic()
+                warn_s = self._fan_in_stall_warn_s
+                if (
+                    warn_s > 0.0
+                    and (now_mono - _last_gate_pass) >= warn_s
+                    and (now_mono - _last_stall_warn) >= warn_s
+                ):
+                    _, shortfall, behind = summarize_fan_in_shortfall(
+                        wseqs, target_seq, self._fan_in_min_corrs
+                    )
+                    LOG.warning(
+                        "fan_in stall: only %d/%d corrs at consumer "
+                        "boundary (need >=%d; short by %d) for %.1fs — "
+                        "pipeline is NOT emitting cubes. Behind corrs=%s "
+                        "(consumer_boundary=%d, target_seq=%d, "
+                        "n_active_dms=%d). Check the corr fabric / "
+                        "transport for a dropped chgroup; this is a "
+                        "data-starvation stall, not a search-node hang.",
+                        n_at_target,
+                        int(self._ring_dims.n_corr),
+                        self._fan_in_min_corrs,
+                        shortfall,
+                        now_mono - _last_gate_pass,
+                        behind,
+                        last_cube_seq_boundary,
+                        target_seq,
+                        self._n_active_dms_per_corr,
+                    )
+                    _last_stall_warn = now_mono
                 await asyncio.sleep(self._poll_interval_s)
                 continue
+            # Gate satisfied — reset the stall watchdog clock.
+            _last_gate_pass = time.monotonic()
 
             # Adaptive lag-recovery seek:
             # --------------------------

@@ -229,6 +229,85 @@ async def test_too_late_miss(tmp_path: Path) -> None:
 
 
 @asyncio_test
+async def test_too_late_storm_is_idempotent_and_never_wedges_ring(
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the 2026-07-21 fleet-wide freeze RCA.
+
+    A backlogged C2 can fire several late cube-dump requests in a row
+    (the ``plta`` incident: a dump request arriving ~86 s after the
+    burst, its specnum window already rotated out of every search
+    node's ring). The listener's ``too_late`` miss path must be a pure
+    no-op — it holds no lock, reserves no ring slot, and leaves the
+    retention ring in exactly the no-dump state — so that:
+
+      * repeated late requests are harmless (idempotent / re-entrant), and
+      * the cube driver (ring writer) keeps advancing afterwards.
+
+    This test asserts both, so a future edit that makes the miss path
+    take a ring reservation / lock (which WOULD wedge the hot loop, the
+    hazard this incident was first mis-attributed to) fails loudly.
+    """
+    ring = CubeRetentionRing(
+        depth=3, t_det=4, n_fdm=2, n_grid=4, pinned=False,
+    )
+    _stage(ring, cube_id=100, specnum=5000)
+    _stage(ring, cube_id=101, specnum=5064)
+    port = _free_udp_port()
+    cfg = C2TriggerListenerConfig(
+        bind_host="127.0.0.1",
+        base_port=port,
+        gpu_half=0,
+        search_node_id=1,
+        dump_root=tmp_path,
+    )
+    dispatched: List = []
+    listener = C2TriggerListener(
+        config=cfg, ring=ring,
+        dispatcher=lambda r, p, m: (dispatched.append(p), True)[1],
+    )
+    await listener.start()
+    try:
+        # A storm of late requests (all specnums below the ring's oldest
+        # start of 5000), interleaved with cube staging to mimic the hot
+        # loop running concurrently on the same thread.
+        n_storm = 5
+        for i in range(n_storm):
+            _send_udp(_trigger_packet(f"late{i}", 1000 + i), listener.bound_port)
+            ok = await _wait_for(
+                lambda i=i: listener.mon["too_late"] >= i + 1, timeout_s=2.0
+            )
+            assert ok, listener.mon
+            # Ring writer keeps advancing through the storm (the crux:
+            # the miss path must not have wedged it).
+            _stage(ring, cube_id=200 + i, specnum=6000 + 64 * i)
+
+        assert listener.mon["too_late"] == n_storm
+        assert listener.mon["hits"] == 0
+        assert len(dispatched) == 0
+
+        # The retention ring is fully usable after the storm — no lock
+        # left held, no slot pinned. mark/release/snapshot would block
+        # or raise if the miss path had leaked a reservation.
+        newest = ring.snapshot()[0]
+        ring.mark_inflight(newest.pinned_host_tensor)
+        ring.release_inflight(newest.pinned_host_tensor)
+
+        # And a genuinely in-window trigger still hits + dispatches, so
+        # the pipeline is not silently disabled by the preceding misses.
+        latest = ring.snapshot()[0]
+        _send_udp(
+            _trigger_packet("good_evt", int(latest.event_specnum_start)),
+            listener.bound_port,
+        )
+        ok = await _wait_for(lambda: listener.mon["hits"] >= 1, timeout_s=2.0)
+        assert ok, listener.mon
+        assert len(dispatched) == 1
+    finally:
+        await listener.stop()
+
+
+@asyncio_test
 async def test_too_early_miss(tmp_path: Path) -> None:
     ring = CubeRetentionRing(
         depth=2, t_det=4, n_fdm=2, n_grid=4, pinned=False,
