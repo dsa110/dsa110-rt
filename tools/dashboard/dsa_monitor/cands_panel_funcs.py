@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,11 +36,16 @@ from event_astrometry import (
 
 __all__ = [
     "ArchiveBrowser",
+    "EventIndexCache",
+    "CacheSnapshot",
     "EventSummary",
     "EventDetail",
     "EventListing",
     "DEFAULT_ARCHIVE_ROOT",
     "DEFAULT_MAX_EVENTS",
+    "DEFAULT_CACHE_TTL_S",
+    "DEFAULT_ACTIVE_WINDOW_S",
+    "DEFAULT_PAGE_SIZE",
     "ZOMBIE_PENDING_AGE_S",
     "C3_ERA_START_UNIX",
     "is_zombie",
@@ -54,6 +60,27 @@ DEFAULT_ARCHIVE_ROOT = Path(
     os.environ.get("CANDS_ARCHIVE_ROOT", "/dataz/dsa110/candidates")
 )
 DEFAULT_MAX_EVENTS = int(os.environ.get("CANDS_MAX_EVENTS", "200"))
+
+#: Server-side event-index cache tunables. The archive lives on slow NFS
+#: (/dataz); enumerating + reading metadata for every event dir on every
+#: /bursts render is what made the page crawl once the age cap was removed.
+#: The cache holds the WHOLE index in memory and refreshes it incrementally.
+#:
+#:  * TTL — max age of the cache before an access triggers a (cheap,
+#:    incremental) refresh. One readdir+stat per dir on a warm cache; the
+#:    expensive per-event reads run only for new/changed/active dirs.
+#:  * ACTIVE window — freshly-triggered events keep mutating after their
+#:    dir mtime settles (C3 writes its decision, voltage fragments stage in
+#:    under Level2/voltages/ which does NOT bump the event-dir mtime). Any
+#:    event younger than this is re-summarised on every refresh so those
+#:    late-arriving fields stay current; older events are immutable and stay
+#:    cached untouched.
+#:  * PAGE size — default rows rendered per /bursts page (newest-first).
+DEFAULT_CACHE_TTL_S = float(os.environ.get("CANDS_CACHE_TTL_S", "60"))
+DEFAULT_ACTIVE_WINDOW_S = float(
+    os.environ.get("CANDS_CACHE_ACTIVE_WINDOW_S", "21600")  # 6 h
+)
+DEFAULT_PAGE_SIZE = int(os.environ.get("CANDS_PAGE_SIZE", "200"))
 
 
 #: Sentinel so _summarise can tell "meta not supplied" from "meta is None".
@@ -286,6 +313,55 @@ class ArchiveBrowser:
         events widgets)."""
         return self.list_events_detailed().events
 
+    def scan_dirs(self) -> List[Tuple[float, Path]]:
+        """Cheap archive enumeration: one readdir + one stat per event dir.
+
+        Returns ``(mtime, path)`` for every dir that looks like an event
+        (unsorted). Raises ``OSError`` if the root readdir itself fails
+        (NFS down) — callers decide whether to serve a stale cache or an
+        empty listing. Per-dir stat failures are skipped, not fatal.
+
+        This is the only step that must touch NFS on a warm cache; the
+        expensive per-event metadata reads live in :meth:`summarise_pairs`
+        and are skipped for unchanged dirs by :class:`EventIndexCache`."""
+        out: List[Tuple[float, Path]] = []
+        for p in self._root.iterdir():          # OSError propagates
+            if not p.is_dir():
+                continue
+            if not _looks_like_event_dir(p):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            out.append((mtime, p))
+        return out
+
+    def summarise_pairs(
+        self, pairs: List[Tuple[float, Path]]
+    ) -> List[EventSummary]:
+        """Turn ``(mtime, path)`` pairs into :class:`EventSummary` rows.
+
+        This is the expensive path: per event it reads Level3/C3 JSON and
+        globs the cubes/plots/voltages dirs, then resolves every sky
+        position in a single batched TETE->ICRS transform (see
+        ``event_astrometry``). Order matches ``pairs``."""
+        prepped: List[Tuple[Path, float, Optional[dict]]] = [
+            (p, mtime, self._read_l3(p, p.name)) for mtime, p in pairs
+        ]
+        try:
+            radecs = self._astro.compute(
+                [(p.name, p, meta) for p, _, meta in prepped]
+            )
+        except Exception:                                      # noqa: BLE001
+            _LOG.exception("astrometry batch failed; positions blank")
+            radecs = {}
+        return [
+            self._summarise(p, mtime, meta=meta,
+                            radec=radecs.get(p.name))
+            for p, mtime, meta in prepped
+        ]
+
     def list_events_detailed(
         self, annotated_ids: Optional[set] = None
     ) -> EventListing:
@@ -309,23 +385,12 @@ class ArchiveBrowser:
         readdir pass."""
         if not self.is_available:
             return EventListing([], 0, 0, 0, False)
-        candidates: List[Tuple[float, Path]] = []
         try:
-            entries = list(self._root.iterdir())
+            candidates = self.scan_dirs()
         except OSError as exc:
             _LOG.warning("list_events: %s readdir failed: %s",
                          self._root, exc)
             return EventListing([], 0, 0, 0, False)
-        for p in entries:
-            if not p.is_dir():
-                continue
-            if not _looks_like_event_dir(p):
-                continue
-            try:
-                mtime = p.stat().st_mtime
-            except OSError:
-                continue
-            candidates.append((mtime, p))
         candidates.sort(reverse=True)
         n_total = len(candidates)
         picked = candidates[: self._max_events]
@@ -352,23 +417,7 @@ class ArchiveBrowser:
 
         merged = picked + extra
         merged.sort(reverse=True)
-        # Read Level3 once per event, then resolve every sky position in a
-        # single batched TETE->ICRS transform (see event_astrometry).
-        prepped: List[Tuple[Path, float, Optional[dict]]] = [
-            (p, mtime, self._read_l3(p, p.name)) for mtime, p in merged
-        ]
-        try:
-            radecs = self._astro.compute(
-                [(p.name, p, meta) for p, _, meta in prepped]
-            )
-        except Exception:                                      # noqa: BLE001
-            _LOG.exception("astrometry batch failed; positions blank")
-            radecs = {}
-        events = [
-            self._summarise(p, mtime, meta=meta,
-                            radec=radecs.get(p.name))
-            for p, mtime, meta in prepped
-        ]
+        events = self.summarise_pairs(merged)
         return EventListing(
             events=events,
             n_total=n_total,
@@ -567,6 +616,207 @@ class ArchiveBrowser:
         except (OSError, json.JSONDecodeError) as exc:
             _LOG.warning("read_c3 %s failed: %s", path, exc)
             return None
+
+
+# ---------------------------------------------------------------------------
+# Server-side cached event index
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CacheSnapshot:
+    """Immutable view of the cached index handed to a request.
+
+    ``events`` is the FULL index, newest-first (every event dir on disk,
+    not a capped window). Rendering/pagination/search all operate on this
+    in-memory list — no NFS access on the request path once warm."""
+
+    events: List[EventSummary]
+    n_total: int
+    #: Wall-clock of the last *successful* refresh (unix seconds), or None
+    #: on a cold cache that has never completed a scan.
+    last_success_unix: Optional[float]
+    #: True when the most recent refresh attempt failed (NFS down / readdir
+    #: error) so the caller is serving a stale index. The page shows a
+    #: "stale as of <time>" note instead of 500-ing.
+    stale: bool
+    #: Short reason string for the last failure (for the stale note), or None.
+    error: Optional[str]
+
+
+class EventIndexCache:
+    """Thread-safe, incrementally-refreshed in-memory index of the event
+    archive, layered over :class:`ArchiveBrowser`.
+
+    Motivation: with the age cap lifted, ``/bursts`` was enumerating and
+    reading metadata for the entire ``/dataz`` archive over NFS on every
+    render, growing linearly with the archive (~400 dirs now, tens of
+    thousands/yr expected). This cache does that work at most once per
+    ``ttl_s`` and, on a warm cache, only re-reads dirs that are new,
+    changed, or still "active" (young enough to still be mutating).
+
+    Refresh policy (incremental):
+
+      * Cold start / empty cache — full scan + summarise of every dir.
+      * Warm access past the TTL — one readdir+stat sweep; re-summarise
+        only dirs whose mtime changed or that are younger than the ACTIVE
+        window (freshly-triggered events still accreting C3 decisions and
+        voltage fragments). Everything else is served from cache.
+      * ``refresh(force=True)`` — same sweep, TTL ignored (explicit).
+
+    Failure policy: an NFS failure during a refresh never propagates and
+    never clears the cache — the last good index is kept and served with
+    :attr:`CacheSnapshot.stale` set. A cold cache that has never succeeded
+    degrades to an empty, stale listing (still no 500).
+
+    Concurrency: a single non-blocking refresh lock guarantees at most one
+    thread scans NFS at a time; the others serve the current snapshot
+    immediately rather than piling up behind the slow scan. A short-held
+    data lock guards the index dicts. This suits Flask's threaded server
+    (the dashboard serves requests on multiple worker threads)."""
+
+    def __init__(
+        self,
+        browser: ArchiveBrowser,
+        ttl_s: float = DEFAULT_CACHE_TTL_S,
+        active_window_s: float = DEFAULT_ACTIVE_WINDOW_S,
+    ) -> None:
+        self._browser = browser
+        self._ttl_s = float(ttl_s)
+        self._active_window_s = float(active_window_s)
+        self._data_lock = threading.RLock()
+        self._refresh_lock = threading.Lock()
+        self._by_name: Dict[str, EventSummary] = {}
+        self._dir_mtime: Dict[str, float] = {}
+        self._built = False
+        self._last_attempt = 0.0
+        self._last_success: Optional[float] = None
+        self._stale = False
+        self._error: Optional[str] = None
+
+    # ----- public API -----------------------------------------------------
+
+    def snapshot(self, *, force_refresh: bool = False) -> CacheSnapshot:
+        """Refresh if due (or forced), then return the full index.
+
+        Cheap to call per request: the refresh is TTL-gated and single-
+        flighted, so most calls just copy the in-memory index out."""
+        self._maybe_refresh(force=force_refresh)
+        with self._data_lock:
+            events = sorted(
+                self._by_name.values(),
+                key=lambda e: e.mtime_unix,
+                reverse=True,
+            )
+            return CacheSnapshot(
+                events=events,
+                n_total=len(events),
+                last_success_unix=self._last_success,
+                stale=self._stale,
+                error=self._error,
+            )
+
+    def invalidate(self) -> None:
+        """Force the next :meth:`snapshot` to do a full re-scan."""
+        with self._data_lock:
+            self._built = False
+            self._last_attempt = 0.0
+
+    # ----- refresh internals ---------------------------------------------
+
+    def _maybe_refresh(self, force: bool = False) -> None:
+        now = time.time()
+        with self._data_lock:
+            due = (
+                force
+                or not self._built
+                or (now - self._last_attempt) >= self._ttl_s
+            )
+        if not due:
+            return
+        # Single-flight: if another thread is already refreshing, don't
+        # block this request behind the slow NFS scan — serve what we have.
+        if not self._refresh_lock.acquire(blocking=False):
+            return
+        try:
+            self._do_refresh(now)
+        finally:
+            self._refresh_lock.release()
+
+    def _do_refresh(self, now: float) -> None:
+        # Take a lock-free copy of the current state to diff against, so the
+        # (slow, NFS-bound) scan/summarise below holds no lock.
+        with self._data_lock:
+            self._last_attempt = now
+            prev_summaries = dict(self._by_name)
+            prev_mtime = dict(self._dir_mtime)
+
+        if not self._browser.is_available:
+            with self._data_lock:
+                self._stale = True
+                self._error = "archive root not present"
+            _LOG.warning("event index: archive root %s not present; "
+                         "serving stale (%d cached)",
+                         self._browser.root, len(prev_summaries))
+            return
+
+        try:
+            pairs = self._browser.scan_dirs()
+        except OSError as exc:
+            with self._data_lock:
+                self._stale = True
+                self._error = f"archive scan failed: {exc}"
+            _LOG.warning("event index: scan of %s failed (%s); serving "
+                         "stale (%d cached)",
+                         self._browser.root, exc, len(prev_summaries))
+            return
+
+        current = {p.name: (mtime, p) for mtime, p in pairs}
+        # Decide what needs the expensive per-event summarise: anything new,
+        # anything whose dir mtime moved, and anything still young enough to
+        # be accreting late fields (C3 decision, staged voltages).
+        to_summarise: List[Tuple[float, Path]] = []
+        for name, (mtime, p) in current.items():
+            old = prev_mtime.get(name)
+            if (
+                old is None
+                or old != mtime
+                or (now - mtime) < self._active_window_s
+            ):
+                to_summarise.append((mtime, p))
+
+        try:
+            fresh = self._browser.summarise_pairs(to_summarise)
+        except Exception as exc:                               # noqa: BLE001
+            with self._data_lock:
+                self._stale = True
+                self._error = f"summarise failed: {exc}"
+            _LOG.exception("event index: summarise of %d dirs failed; "
+                           "serving stale", len(to_summarise))
+            return
+        fresh_by_name = {s.name: s for s in fresh}
+
+        # Commit: rebuild the index from the on-disk name set (drops deleted
+        # dirs), carrying forward cached summaries for untouched events.
+        with self._data_lock:
+            by_name: Dict[str, EventSummary] = {}
+            dir_mtime: Dict[str, float] = {}
+            for name, (mtime, _p) in current.items():
+                summ = fresh_by_name.get(name) or prev_summaries.get(name)
+                if summ is None:
+                    # New dir that somehow wasn't summarised — skip rather
+                    # than emit a half-built row.
+                    continue
+                by_name[name] = summ
+                dir_mtime[name] = mtime
+            self._by_name = by_name
+            self._dir_mtime = dir_mtime
+            self._built = True
+            self._stale = False
+            self._error = None
+            self._last_success = now
+        _LOG.info("event index refreshed: %d events (%d re-read) from %s",
+                  len(current), len(to_summarise), self._browser.root)
 
 
 # ---------------------------------------------------------------------------

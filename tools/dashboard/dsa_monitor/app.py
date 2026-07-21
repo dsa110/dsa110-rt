@@ -35,6 +35,8 @@ import logging
 import os
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
@@ -62,7 +64,9 @@ from ant_table import (
 )
 from cands_panel_funcs import (
     ArchiveBrowser,
+    EventIndexCache,
     DEFAULT_ARCHIVE_ROOT,
+    DEFAULT_PAGE_SIZE,
     N_VOLTAGE_FRAGMENTS_TOTAL,
     _SAFE_EVENT_RE,
     partition_events_c3,
@@ -157,8 +161,43 @@ control_store = ControlStore()
 
 
 # Burst-candidates archive browser (h23 reads /dataz/dsa110/candidates/).
-# Module-level singleton — cheap to construct, all I/O is per-request.
+# Module-level singleton — cheap to construct.
 cands_browser = ArchiveBrowser()
+# Server-side cached event index over the (slow, NFS) archive. Every
+# /bursts render + the recent-events widgets read the WHOLE index from
+# this in-process cache instead of re-enumerating /dataz per request; the
+# cache refreshes incrementally on a TTL (CANDS_CACHE_TTL_S). See
+# EventIndexCache for the refresh/failure policy.
+cands_index = EventIndexCache(cands_browser)
+
+
+def _cands_index_refresher() -> None:
+    """Background daemon that keeps the burst-index cache warm.
+
+    Building the index over the /dataz NFS archive can take tens of
+    seconds cold; doing it here — off the request path — means the first
+    /bursts render after a restart is instant instead of stalling one
+    unlucky user, and the cache is re-scanned incrementally every TTL so
+    no request ever pays the NFS latency. All failures are swallowed by
+    the cache (it serves the last good index, flagged stale)."""
+    interval = max(5.0, float(os.environ.get("CANDS_CACHE_TTL_S", "60")))
+    while True:
+        try:
+            cands_index.snapshot(force_refresh=True)
+        except Exception:                                  # noqa: BLE001
+            LOG.exception("cands_index background refresh failed")
+        time.sleep(interval)
+
+
+def _start_cands_index_refresher() -> None:
+    threading.Thread(
+        target=_cands_index_refresher,
+        name="cands_index_refresher",
+        daemon=True,
+    ).start()
+
+
+_start_cands_index_refresher()
 
 
 # Sky monitor (E2E test 1): ingest + frame builder. Cheap to construct;
@@ -573,23 +612,26 @@ def _refined_positions_bulk() -> dict:
     return {name: _refined_display(row) for name, row in bulk.items()}
 
 
+def _event_epoch_unix(e) -> float:
+    """Best trigger-time estimate for windowing/search: the C2 peak MJD
+    when present, else the archive-dir mtime (C2 stamps it at trigger)."""
+    if e.mjd_peak is not None:
+        return (float(e.mjd_peak) - 40587.0) * 86400.0
+    return e.mtime_unix
+
+
 @app.route("/bursts")
 def bursts():
-    # Annotation-aware listing: the newest-N-by-mtime window UNION every
-    # human-annotated event (so classified events / named sources stay
-    # visible + searchable forever, never ageing out of the cap). The
-    # counts drive the truncation notice below.
-    listing = cands_browser.list_events_detailed()
-    events = listing.events
-    # Split by C3 cube-veto outcome. Fresh events C3 has not judged yet
-    # (< 1 h old) ride the PASS tab with a "pending" badge — the
-    # operator wants new triggers front and centre, and fail-open is
-    # C3's own default. Events pending for > 1 h are zombies (the
-    # cube/metadata transfer to h23 failed; C3 will never judge them)
-    # and get their own tab so they stop cluttering PASS.
-    events_pass, events_fail, events_zombie = partition_events_c3(events)
-    # Human-annotation badges: one bulk read (no per-event query),
-    # joined to the event rows in the template by event name.
+    # The whole event index is served from the in-process EventIndexCache
+    # (incremental TTL refresh over the slow /dataz NFS archive), NOT a
+    # per-request re-enumeration. Everything below — global counts,
+    # search, pagination — operates on that cached in-memory list, so the
+    # page cost no longer grows with the archive.
+    snap = cands_index.snapshot()
+    all_events = snap.events                       # full index, newest-first
+
+    # Human-annotation badges + source vocab: one bulk read each (no
+    # per-event query), joined to rows in the template by event name.
     try:
         annot_current = ann.all_current()
         annot_source_names = ann.vocab().get("source_names", [])
@@ -597,13 +639,83 @@ def bursts():
         LOG.exception("annotations.all_current failed (list badges skipped)")
         annot_current = {}
         annot_source_names = []
+
+    # ----- filters (all applied server-side over the FULL cached index,
+    # so search/classification/source reach across all time, never just
+    # the rendered page) -----
     tag_filter = (request.args.get("tag") or "").strip()
-    # Current-source search (?source=): exact, case-insensitive match
-    # against each event's CURRENT source name (from the same bulk
-    # annot_current read — no per-event query). ANDs with ?tag= in the
-    # row-filter logic in the template.
     source_filter = (request.args.get("source") or "").strip()
     source_filter_lc = source_filter.lower()
+    # Free-text all-time event-name search (?q=): case-insensitive
+    # substring over the event name. Finds any event regardless of age or
+    # whether it carries a human annotation.
+    q = (request.args.get("q") or "").strip()
+    q_lc = q.lower()
+    # Optional time window (?days=N): keep only events triggered within the
+    # last N days. Blank/invalid → no window.
+    days_raw = (request.args.get("days") or "").strip()
+    try:
+        days = float(days_raw) if days_raw else None
+        if days is not None and days <= 0:
+            days = None
+    except ValueError:
+        days = None
+
+    tag_active = bool(tag_filter) and tag_filter != "all"
+    searching = bool(q) or bool(source_filter) or tag_active or days is not None
+
+    def _keep(e) -> bool:
+        if q_lc and q_lc not in e.name.lower():
+            return False
+        a = annot_current.get(e.name)
+        if source_filter_lc:
+            if not (a and a.get("source_name")
+                    and a["source_name"].lower() == source_filter_lc):
+                return False
+        if tag_active:
+            labels = (a or {}).get("labels") or {}
+            if tag_filter == "unclassified":
+                if labels:
+                    return False
+            elif tag_filter not in labels:
+                return False
+        if days is not None:
+            if (now_ref - _event_epoch_unix(e)) > days * 86400.0:
+                return False
+        return True
+
+    now_ref = time.time()
+    filtered = [e for e in all_events if _keep(e)] if searching else all_events
+
+    # ----- pagination (newest-first). A search shows ALL matches on one
+    # page (result sets are small and the operator wants every hit); an
+    # unfiltered browse pages through the archive newest-first. -----
+    page_size = DEFAULT_PAGE_SIZE
+    n_filtered = len(filtered)
+    try:
+        page = int(request.args.get("page", "1"))
+    except ValueError:
+        page = 1
+    page = max(1, page)
+    if searching:
+        page = 1
+        displayed = filtered
+        n_pages = 1
+        page_start = 0
+    else:
+        n_pages = max(1, (n_filtered + page_size - 1) // page_size)
+        page = min(page, n_pages)
+        page_start = (page - 1) * page_size
+        displayed = filtered[page_start:page_start + page_size]
+    page_end = page_start + len(displayed)
+
+    # Tabs partition only the rows actually shown on this page.
+    events_pass, events_fail, events_zombie = partition_events_c3(displayed)
+    # Global (all-time) totals for the summary line come straight from the
+    # full cached index — independent of the current page or filter.
+    g_pass, g_fail, g_zombie = partition_events_c3(all_events)
+    g_pending = sum(1 for e in all_events if e.c3_status == "pending")
+
     # Filter dropdown options: built-ins always, plus any custom labels
     # actually in use, so the operator can slice by them too.
     present = set()
@@ -611,6 +723,18 @@ def bursts():
         present.update((blk.get("labels") or {}).keys())
     custom_present = sorted(present - set(ann.BUILTIN_LABELS))
     annot_filter_labels = list(ann.BUILTIN_LABELS) + custom_present
+
+    # "Stale as of" note when a refresh failed and we're serving the last
+    # good index (NFS blip) — never a 500.
+    stale_since = None
+    if snap.stale and snap.last_success_unix:
+        try:
+            stale_since = datetime.fromtimestamp(
+                snap.last_success_unix, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%SZ")
+        except (ValueError, OSError, OverflowError):
+            stale_since = None
+
     return _html_revalidate(render_template(
         "bursts.html",
         active_tab="bursts",
@@ -628,10 +752,26 @@ def bursts():
         annot_source_names=annot_source_names,
         events_zombie=events_zombie,
         refined_positions=_refined_positions_bulk(),
-        listing_truncated=listing.truncated,
-        listing_n_total=listing.n_total,
-        listing_n_newest=listing.n_newest,
-        listing_n_annotated=listing.n_annotated,
+        # search / window
+        q=q,
+        days=days_raw,
+        searching=searching,
+        # global (all-time) totals from the cached index
+        listing_n_total=snap.n_total,
+        total_pass=len(g_pass),
+        total_fail=len(g_fail),
+        total_zombie=len(g_zombie),
+        total_pending=g_pending,
+        n_matched=n_filtered,
+        # pagination
+        page=page,
+        n_pages=n_pages,
+        page_size=page_size,
+        page_start=page_start,
+        page_end=page_end,
+        # cache freshness
+        cache_stale=snap.stale,
+        cache_stale_since=stale_since,
     ))
 
 
@@ -694,7 +834,7 @@ def _next_unclassified_event(current: str) -> Optional[str]:
     that has no current human classification. Returns None if every other
     event is already classified. Best-effort — swallows archive errors."""
     try:
-        events = cands_browser.list_events()
+        events = cands_index.snapshot().events
     except Exception:                                       # noqa: BLE001
         return None
     names = [e.name for e in events]
@@ -2532,9 +2672,9 @@ def control_recent_events():
         limit = 10
     limit = max(1, min(limit, 50))
     try:
-        events = cands_browser.list_events()
+        events = cands_index.snapshot().events
     except Exception as exc:                                       # noqa: BLE001
-        LOG.exception("cands_browser.list_events failed")
+        LOG.exception("cands_index.snapshot failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
     out = []
     for e in events[:limit]:
