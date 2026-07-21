@@ -209,15 +209,19 @@
     {% if not searching and n_pages > 1 %}
     <div class="annot-filter" style="justify-content: flex-end; margin-top: 10px;">
         {% if page > 1 %}
+        <a href="/bursts?page=1{{ filt_qs }}">« newest</a>
         <a href="/bursts?page={{ page - 1 }}{{ filt_qs }}">‹ newer</a>
         {% else %}
+        <span style="color:#b2bec3; padding:2px 9px;">« newest</span>
         <span style="color:#b2bec3; padding:2px 9px;">‹ newer</span>
         {% endif %}
         <span class="lbl" style="text-transform:none;">page {{ page }} / {{ n_pages }}</span>
         {% if page < n_pages %}
         <a href="/bursts?page={{ page + 1 }}{{ filt_qs }}">older ›</a>
+        <a href="/bursts?page={{ n_pages }}{{ filt_qs }}">oldest »</a>
         {% else %}
         <span style="color:#b2bec3; padding:2px 9px;">older ›</span>
+        <span style="color:#b2bec3; padding:2px 9px;">oldest »</span>
         {% endif %}
     </div>
     {% endif %}
