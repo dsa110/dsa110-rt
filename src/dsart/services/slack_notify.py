@@ -71,6 +71,20 @@ class SlackNotifyConfig:
     #: logs a warning and never fails the post. ``~`` is expanded at use
     #: time (see ``SlackNotifier._persist_post_map``).
     post_map_db: str = "~/.dsa_monitor/slack_candidate_posts.db"
+    #: Bounded wait for the C2 plot worker's four cube-panel PNGs before
+    #: rendering/posting the card. C3's KEEP decision routinely lands
+    #: ~1 min BEFORE Level2/plots/ is populated (first live post,
+    #: 260723pllz 2026-07-23 23:04 UT, went out all-placeholders: card
+    #: posted 23:04:19, plots arrived 23:05:14). Poll every plot_poll_s
+    #: until all four exist and have sat unmodified for >=2 s (never read
+    #: a half-written PNG); on timeout post with whatever exists (a late
+    #: card beats no card). 0 disables the wait. The staged voltages sit
+    #: durably on corr NVMe, so delaying _do_keep this long is safe.
+    plot_wait_s: float = 300.0
+    plot_poll_s: float = 5.0
+    #: cube count that makes an event "complete" for the readiness gate
+    #: (mirrors c3.expected_cube_count / the dashboard's "cubes 8/8").
+    expected_cubes: int = 8
 
     @classmethod
     def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "SlackNotifyConfig":
@@ -87,6 +101,9 @@ class SlackNotifyConfig:
                 d.get("dashboard_base_url", "http://localhost:5778")),
             post_map_db=str(
                 d.get("post_map_db", "~/.dsa_monitor/slack_candidate_posts.db")),
+            plot_wait_s=float(d.get("plot_wait_s", 300.0)),
+            plot_poll_s=float(d.get("plot_poll_s", 5.0)),
+            expected_cubes=int(d.get("expected_cubes", 8)),
         )
 
 
@@ -214,6 +231,53 @@ class SlackNotifier:
             return None
         return tok
 
+    _CUBE_PANELS = ("dm_time", "image_peak", "kernel_snrs", "lightcurve")
+
+    def _wait_for_event_ready(self, name: str, ev_dir: Path) -> bool:
+        """Block (bounded by ``plot_wait_s``) until the event is complete
+        the same way the dashboard's burst page counts it: all four
+        cube-panel PNGs in ``<ev_dir>/Level2/plots/`` (each unmodified
+        for >=2 s — never read a PNG the plot worker is still writing)
+        AND ``expected_cubes`` npz cubes in ``<ev_dir>/cubes/``. The
+        timeout is a fail-open bound, not the mechanism: a wedged plot
+        worker must degrade to a placeholder card, never to an unposted
+        candidate. Returns True when complete, False on timeout."""
+        wait_s = float(self._cfg.plot_wait_s)
+        if wait_s <= 0:
+            return True
+        plots_dir = Path(ev_dir) / "Level2" / "plots"
+        paths = [plots_dir / f"{p}_{name}.png" for p in self._CUBE_PANELS]
+        cubes_dir = Path(ev_dir) / "cubes"
+        want_cubes = int(self._cfg.expected_cubes)
+        deadline = time.monotonic() + wait_s
+        waited = False
+        while True:
+            try:
+                plots_ready = all(
+                    p.is_file() and (time.time() - p.stat().st_mtime) >= 2.0
+                    for p in paths
+                )
+                n_cubes = len(list(cubes_dir.glob("*.npz")))
+            except OSError:
+                plots_ready, n_cubes = False, 0
+            if plots_ready and n_cubes >= want_cubes:
+                if waited:
+                    LOG.info(
+                        "slack_notify %s: event complete after wait "
+                        "(plots 4/4, cubes %d/%d)", name, n_cubes, want_cubes)
+                return True
+            if time.monotonic() >= deadline:
+                missing = [p.name for p in paths if not p.is_file()]
+                LOG.warning(
+                    "slack_notify %s: event incomplete after %.0fs "
+                    "(missing plots: %s; cubes %d/%d) — posting card "
+                    "with what exists",
+                    name, wait_s, ", ".join(missing) or "none (unsettled)",
+                    n_cubes, want_cubes)
+                return False
+            waited = True
+            time.sleep(max(0.5, float(self._cfg.plot_poll_s)))
+
     def _post_keep_card(
         self,
         name: str,
@@ -238,6 +302,11 @@ class SlackNotifier:
         card_tmp_fd: Optional[int] = None
         try:
             if self._cfg.card and ev_dir is not None:
+                # The C2 plot worker populates Level2/plots/ AFTER C3's
+                # KEEP decision (typically ~1 min later) — wait until the
+                # event is complete as the dashboard counts it (plots
+                # 4/4, cubes 8/8), bounded by plot_wait_s (fail-open).
+                self._wait_for_event_ready(name, ev_dir)
                 # keep_report isn't known yet at card time — render_card
                 # treats keep_report=None as "n/a" fragments, never raises.
                 card_path, card_tmp_fd = self._render_card_tmp(

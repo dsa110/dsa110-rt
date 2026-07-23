@@ -927,6 +927,9 @@ c3:
     timeout_s: 10.0
     upload_plot: true
     card: true
+    plot_wait_s: 300.0   # readiness gate: wait until the event is complete as the dashboard counts it (plots 4/4 AND cubes 8/8) before posting the card — KEEP typically lands ~1 min before Level2/plots/ (first live post 260723pllz 2026-07-23 went out all-placeholders without this). Bounded fail-open: on timeout post with what exists; 0 disables
+    plot_poll_s: 5.0
+    expected_cubes: 8    # "cubes 8/8" half of the readiness gate (mirrors c3.expected_cube_count)
     dashboard_base_url: "http://localhost:5778"   # dsa_monitor web UI; KEEP messages link to /bursts/<name> (verified tools/dashboard/dsa_monitor/app.py:823-824); localhost assumes the reader's normal SSH port-forward to h23
     post_map_db: "~/.dsa_monitor/slack_candidate_posts.db"   # event -> (channel, ts) index consumed by slack_annotation_relay.py to thread classification updates onto the card message
   collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger

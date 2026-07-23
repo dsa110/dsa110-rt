@@ -86,6 +86,10 @@ def _cfg(tmp_path: Path, **kw) -> SlackNotifyConfig:
     kw.setdefault("enabled", True)
     kw.setdefault("channel", "C01NUV2M0HM")
     kw.setdefault("post_map_db", str(tmp_path / "posts.db"))
+    # readiness gate off by default in tests — fixture event dirs carry
+    # no plots/cubes and would otherwise block plot_wait_s per test
+    # (the gate has its own dedicated tests with explicit small waits).
+    kw.setdefault("plot_wait_s", 0.0)
     return SlackNotifyConfig(**kw)
 
 
@@ -876,3 +880,74 @@ def test_do_keep_injection_makes_zero_http_calls(monkeypatch, tmp_path) -> None:
     assert svc._counters["slack_failed"] == 0
     assert svc._counters["slack_followup_ok"] == 0
     assert svc._counters["slack_followup_failed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# readiness gate: wait for plots 4/4 + cubes 8/8 before posting the card
+# ---------------------------------------------------------------------------
+
+def _make_ready_event(tmp_path, name, n_plots=4, n_cubes=8, old=True):
+    import time as _t
+    ev = tmp_path / name
+    plots = ev / "Level2" / "plots"
+    cubes = ev / "cubes"
+    plots.mkdir(parents=True)
+    cubes.mkdir(parents=True)
+    panels = ("dm_time", "image_peak", "kernel_snrs", "lightcurve")
+    for p in panels[:n_plots]:
+        f = plots / f"{p}_{name}.png"
+        f.write_bytes(b"png")
+        if old:
+            past = _t.time() - 10
+            os.utime(f, (past, past))
+    for i in range(n_cubes):
+        (cubes / f"cube_{i}.npz").write_bytes(b"npz")
+    return ev
+
+
+def test_ready_gate_passes_when_complete(tmp_path) -> None:
+    ev = _make_ready_event(tmp_path, "evt1")
+    n = SlackNotifier(SlackNotifyConfig(
+        enabled=True, channel="C1", plot_wait_s=5.0, plot_poll_s=0.5))
+    assert n._wait_for_event_ready("evt1", ev) is True
+
+
+def test_ready_gate_times_out_when_plots_missing(tmp_path, caplog) -> None:
+    ev = _make_ready_event(tmp_path, "evt1", n_plots=2)
+    n = SlackNotifier(SlackNotifyConfig(
+        enabled=True, channel="C1", plot_wait_s=1.0, plot_poll_s=0.2))
+    import time as _t
+    t0 = _t.monotonic()
+    assert n._wait_for_event_ready("evt1", ev) is False
+    assert _t.monotonic() - t0 >= 0.9
+    assert any("incomplete" in r.message for r in caplog.records)
+
+
+def test_ready_gate_times_out_when_cubes_short(tmp_path) -> None:
+    ev = _make_ready_event(tmp_path, "evt1", n_cubes=5)
+    n = SlackNotifier(SlackNotifyConfig(
+        enabled=True, channel="C1", plot_wait_s=1.0, plot_poll_s=0.2))
+    assert n._wait_for_event_ready("evt1", ev) is False
+
+
+def test_ready_gate_waits_for_fresh_png_to_settle(tmp_path) -> None:
+    # plots exist but were written "just now" -> not settled -> must wait
+    ev = _make_ready_event(tmp_path, "evt1", old=False)
+    n = SlackNotifier(SlackNotifyConfig(
+        enabled=True, channel="C1", plot_wait_s=1.0, plot_poll_s=0.2))
+    assert n._wait_for_event_ready("evt1", ev) is False
+
+
+def test_ready_gate_disabled_by_zero_wait(tmp_path) -> None:
+    ev = _make_ready_event(tmp_path, "evt1", n_plots=0, n_cubes=0)
+    n = SlackNotifier(SlackNotifyConfig(
+        enabled=True, channel="C1", plot_wait_s=0.0))
+    assert n._wait_for_event_ready("evt1", ev) is True
+
+
+def test_config_parses_readiness_fields() -> None:
+    cfg = SlackNotifyConfig.from_dict(
+        {"plot_wait_s": 120.0, "plot_poll_s": 2.0, "expected_cubes": 4})
+    assert cfg.plot_wait_s == 120.0
+    assert cfg.plot_poll_s == 2.0
+    assert cfg.expected_cubes == 4
