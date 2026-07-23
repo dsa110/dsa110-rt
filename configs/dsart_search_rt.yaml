@@ -919,6 +919,16 @@ c3:
     dest_subdir: calibration
     settle_s: 600.0
     max_late_s: 7200.0
+  slack:            # C3 KEEP notifications -> Slack (best-effort; token from token_file, falls back to env SLACK_TOKEN_DSA)
+    enabled: true
+    channel: "C01NUV2M0HM"
+    token_file: "/home/ubuntu/.config/slack_api_dsa110"   # dedicated dsa110candidates bot, created 2026-07-23; legacy candplotter file (/home/ubuntu/.config/slack_api) kept as fallback reference, no longer read by default
+    token_env: "SLACK_TOKEN_DSA"                   # fallback if token_file is unset/unreadable
+    timeout_s: 10.0
+    upload_plot: true
+    card: true
+    dashboard_base_url: "http://localhost:5778"   # dsa_monitor web UI; KEEP messages link to /bursts/<name> (verified tools/dashboard/dsa_monitor/app.py:823-824); localhost assumes the reader's normal SSH port-forward to h23
+    post_map_db: "~/.dsa_monitor/slack_candidate_posts.db"   # event -> (channel, ts) index consumed by slack_annotation_relay.py to thread classification updates onto the card message
   collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger
   collect_poll_s: 15.0
   collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land
@@ -960,3 +970,32 @@ c3:
     13: {ssh_host: n19.pro.pvt, udp_ip: 10.41.0.227}
     14: {ssh_host: n21.pro.pvt, udp_ip: 10.41.0.250}
     15: {ssh_host: n22.pro.pvt, udp_ip: 10.41.0.233}
+
+# ---------------------------------------------------------------------------
+# Website -> Slack annotation relay (dsart.services.slack_annotation_relay).
+# Separate process/unit (systemd/dsart_slack_relay.service) from C3 — reads
+# the dashboard's SQLite annotations DB (operator burst classifications) and
+# posts each new/changed/cleared tag as a threaded reply on that event's
+# card message (looked up via c3.slack.post_map_db). Best-effort throughout;
+# never touches C3's KEEP/REJECT decision path.
+# ---------------------------------------------------------------------------
+slack_relay:
+  enabled: true
+  channel: "C01NUV2M0HM"
+  token_file: "/home/ubuntu/.config/slack_api_dsa110"   # same dedicated dsa110candidates bot as c3.slack
+  token_env: "SLACK_TOKEN_DSA110"
+  annotations_db: "~/.dsa_monitor/annotations.db"
+  post_map_db: "~/.dsa_monitor/slack_candidate_posts.db"   # must match c3.slack.post_map_db above
+  state_path: "~/.dsa_monitor/slack_relay_state.json"
+  poll_s: 15.0
+  timeout_s: 10.0
+  # Only FRB verdicts get reply_broadcast (channel-wide visibility);
+  # RFI/NOISE/PULSAR/INJECTION tags stay thread-only so the main channel
+  # isn't flooded by routine RFI/noise classification chatter. Use ["*"]
+  # to broadcast every label, or an explicit list for a different subset.
+  broadcast_labels: ["FRB"]
+  # Polling is mtime-gated: each cycle only os.stat()s annotations_db (+
+  # its "-wal" sibling) and queries sqlite ONLY if either changed since
+  # the last check. fallback_sweep_s is a safety-net unconditional full
+  # query, in case an mtime update is ever missed.
+  fallback_sweep_s: 600.0

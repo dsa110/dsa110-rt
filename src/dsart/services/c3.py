@@ -59,6 +59,7 @@ from ..coinc.voltage_collect import (
     plan_manifests,
     rsync_pull,
 )
+from .slack_notify import SlackNotifier, SlackNotifyConfig
 
 LOG = logging.getLogger("dsart.services.c3")
 
@@ -124,6 +125,9 @@ class C3Config:
     # Correlator-HDF5 calibration archive per voltage-carrying KEEP
     # (T3 link_hdf5_files equivalent; dsart/coinc/cal_hdf5_archive.py).
     cal_hdf5: CalHdf5Config = field(default_factory=CalHdf5Config)
+    # Slack KEEP notifications (best-effort; token from env var named by
+    # slack.token_env, never logged). See services/slack_notify.py.
+    slack: SlackNotifyConfig = field(default_factory=SlackNotifyConfig)
 
     @classmethod
     def from_yaml(cls, path: Path) -> "C3Config":
@@ -181,6 +185,7 @@ class C3Config:
             veto=th,
             filterbank=FilterbankConfig.from_dict(c3.get("filterbank")),
             cal_hdf5=CalHdf5Config.from_dict(c3.get("cal_hdf5")),
+            slack=SlackNotifyConfig.from_dict(c3.get("slack")),
         )
 
 
@@ -230,6 +235,7 @@ class C3Service:
                 {chg: n.udp_ip for chg, n in config.corr_nodes.items()},
                 port=config.voltage_port,
             )
+        self._slack = SlackNotifier(config.slack)
         self._processed: Dict[str, str] = {}   # event_name -> action
         self._stop = asyncio.Event()
         self._counters: Dict[str, int] = {
@@ -244,6 +250,10 @@ class C3Service:
             "cal_hdf5_complete": 0,
             "cal_hdf5_partial": 0,
             "cal_hdf5_failed": 0,
+            "slack_ok": 0,
+            "slack_failed": 0,
+            "slack_followup_ok": 0,
+            "slack_followup_failed": 0,
         }
         # name -> {"due_unix": float, "attempts": int} — cal archives
         # whose +window is still in the future (persisted; re-checked
@@ -345,7 +355,7 @@ class C3Service:
             "metrics": metrics.__dict__,
         }
         if decision.keep:
-            rec.update(self._do_keep(name, ev_dir))
+            rec.update(self._do_keep(name, ev_dir, is_inj))
             self._counters["kept"] += 1
         else:
             rec.update(self._do_reject(name, ev_dir, decision, flag_only))
@@ -362,8 +372,43 @@ class C3Service:
         )
         return rec
 
-    def _do_keep(self, name: str, ev_dir: Path) -> Dict[str, Any]:
-        """Collect voltage fragments (non-destructive)."""
+    def _do_keep(
+        self, name: str, ev_dir: Path, is_inj: bool = False,
+    ) -> Dict[str, Any]:
+        """Collect voltage fragments (non-destructive).
+
+        ``is_inj`` gates BOTH Slack calls: injections always KEEP (see
+        ``cube_veto.decide`` — exempt from the veto), so this is reached
+        for injection events too, but C3 must never post an injection to
+        Slack. Guarded here rather than upstream so the guard sits right
+        next to the two call sites it protects.
+        """
+        # c2 dict (from the Level3 JSON C2 writes) is needed immediately
+        # for the KEEP card, and again later for the filterbank beamform
+        # + followup message — read it once, up front.
+        c2row: Dict[str, Any] = {}
+        l3p = ev_dir / "Level3" / f"{name}.json"
+        try:
+            with l3p.open("r") as fh:
+                c2row = (json.load(fh) or {}).get("c2", {}) or {}
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("keep %s: could not read %s: %s — slack summary "
+                        "will be sparse; filterbank beamforms at "
+                        "(l,m)=(0,0)", name, l3p, exc)
+
+        # Slack KEEP card — posted IMMEDIATELY, before voltage collection
+        # / filterbank even start, so ops sees a candidate within
+        # seconds. Never posted for injections.
+        card_status: Dict[str, Any] = {"ok": False, "error": "injection"}
+        if not is_inj:
+            card_status = self._slack.post_keep_card(name, c2row, ev_dir=ev_dir)
+            if self._cfg.slack.enabled:
+                if card_status.get("ok"):
+                    self._counters["slack_ok"] += 1
+                else:
+                    self._counters["slack_failed"] += 1
+        thread_ts = card_status.get("ts")
+
         dest = ev_dir / "Level2" / "voltages"
         plans = plan_fragments(
             event_name=name,
@@ -440,14 +485,6 @@ class C3Service:
         # failure never affects the KEEP).
         fb_report: Dict[str, Any] = {"skipped": "disabled"}
         if self._cfg.filterbank.enabled and n_present > 0:
-            c2row: Dict[str, Any] = {}
-            l3p = ev_dir / "Level3" / f"{name}.json"
-            try:
-                with l3p.open("r") as fh:
-                    c2row = (json.load(fh) or {}).get("c2", {}) or {}
-            except (OSError, json.JSONDecodeError) as exc:
-                LOG.warning("filterbank %s: could not read %s: %s — "
-                            "beamforming at (l,m)=(0,0)", name, l3p, exc)
             dec_deg = self._resolve_pointing_dec(name, c2row)
             fb_report = run_for_event(
                 self._cfg.filterbank, ev_dir, name, c2row, dec_deg=dec_deg)
@@ -463,8 +500,26 @@ class C3Service:
         ):
             # Voltages are safely in the candidate dir → free corr NVMe.
             self._broadcaster.broadcast(name, 0, 0.0)
+
+        # Slack bbproc follow-up (best-effort; never affects the KEEP
+        # outcome above). Runs after the filterbank so the notifier can
+        # attach the inspection plot when one was produced; threads onto
+        # the card message via `thread_ts` (falls back to a fresh
+        # top-level message if the card post failed/was skipped — see
+        # SlackNotifier.post_keep_followup). Never posted for injections.
+        followup_status: Dict[str, Any] = {"ok": False, "error": "injection"}
+        if not is_inj:
+            followup_status = self._slack.post_keep_followup(
+                name, ev_dir, fb_report, report, thread_ts=thread_ts)
+            if self._cfg.slack.enabled:
+                if followup_status.get("ok"):
+                    self._counters["slack_followup_ok"] += 1
+                else:
+                    self._counters["slack_followup_failed"] += 1
+
         return {"keep": report, "filterbank": fb_report,
-                "cal_hdf5": cal_report}
+                "cal_hdf5": cal_report,
+                "slack": {"card": card_status, "followup": followup_status}}
 
     def _resolve_pointing_dec(
         self, name: str, c2row: Mapping[str, Any],

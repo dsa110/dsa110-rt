@@ -1,0 +1,35 @@
+[Unit]
+Description=DSA-110 dsart-rt website -> Slack annotation relay (h23)
+Documentation=file:/home/ubuntu/vikram/dev/dsa110-rt/docs/voltage_dumps/VOLTAGE_DUMP_C3_DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as a USER unit under the operator account (systemctl --user),
+# same as dsart_c2/c3/dashboard on h23 — no sudo required, no root
+# access to the dashboard's SQLite annotations DB needed either since
+# it's read-only from here. Modeled directly on dsart_c3.service.
+WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
+# Independent of C3: reads the dashboard's annotations DB and C3's
+# post-map DB (both best-effort, read-only) and relays classification
+# updates into the corresponding event's Slack thread. Never touches
+# C3's KEEP/REJECT decision path.
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.services.slack_annotation_relay --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
+Environment=PATH=/home/ubuntu/anaconda3/envs/dsart_h23/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+
+LimitNOFILE=16384
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsart_slack_relay
+
+[Install]
+WantedBy=default.target

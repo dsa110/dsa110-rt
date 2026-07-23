@@ -936,13 +936,53 @@ def _burst_coords(
 
 _RETICLE = "#ff2d55"  # high-contrast reticle colour over magma/viridis
 
+# v3.2: tick/colorbar-tick/axis-label/legend font sizes, bumped ~2x from
+# the prior ad hoc 7-10pt values so the archived PNGs stay legible once
+# the candidate card (and the dashboard) display them at ~800px panel
+# width. 13pt read as barely-larger against the old 8-10pt ticks at
+# that display width, so this went to 16pt (round-tripped visually via
+# font_comparison.png). Font sizes only — no layout/content changes.
+_TICK_FONTSIZE = 16
+_AXIS_LABEL_FONTSIZE = 18
+# v3.4: the embedded ax.set_title strings were still the original ad hoc
+# 10pt (or, for kernel_snrs, matplotlib's rc default) — nearly invisible
+# next to the v3.2 16-18pt ticks/axis-labels at the ~800px panel width
+# the candidate card displays these at. Bumped to 18pt (same size as the
+# axis-label tier) so the title reads as the most prominent text on the
+# panel. The small sub-annotations (per-kernel "n=" bar counts, and the
+# below-axes marker legends / captions — "brightest point of displayed
+# data", "detector-reported burst", "red circle = burst position
+# reported by the detector") are a distinct, smaller tier: dialed from
+# the prior ad hoc 17pt/9pt values down/up to a consistent ~14pt so the
+# hierarchy reads title > axis-label/ticks > sub-annotation. Font sizes
+# only — no layout/content changes (margins adjusted separately below
+# only where a bigger font newly clipped/collided; see v3.4 notes at
+# each such spot).
+_TITLE_FONTSIZE = 16
+_LEGEND_FONTSIZE = 14
+
+# v3.5: the two small panels (lightcurve, kernel_snrs — both drawn at a
+# compact ~8x3.6-4.0in figsize, versus dm_time/image_peak's 10x9in) read
+# as disproportionately dense at the shared 18pt axis-label size — e.g.
+# lightcurve's rotated "peak amplitude (image max)" ylabel visibly
+# crowded that panel's short y-axis. Axis labels on those two panels
+# only are dialed down a notch; ticks/legend are left alone (already a
+# smaller tier). dm_time/image_peak (the big panels) keep
+# _AXIS_LABEL_FONTSIZE as-is.
+_AXIS_LABEL_FONTSIZE_SMALL = 14
+
 # Shared figure geometry for the dm_time and image_peak panels: both
 # figures are 10.0x9.0 in @ dpi 110 (1100x990 px) with the axes box,
 # colorbar, and caption/legend line at identical figure fractions, so
 # the two PNGs align pixel-for-pixel when the dashboard renders them
 # side by side at equal width — by construction, not tuning.
-_PANEL_RECT = (0.10, 0.115, 0.72, 0.80)   # left, bottom, width, height
-_CBAR_RECT = (0.845, 0.115, 0.022, 0.80)
+# v3.3: bottom margin raised 0.115->0.19 (height 0.80->0.725, same top
+# edge 0.915) to make room below the axes for the bigger v3.2 tick/axis-
+# label/legend fonts — at the old 0.115 margin, dm_time's xlabel + its
+# fig-level marker legend (both now larger) collided with each other.
+# Top edge held fixed so dm_time/image_peak still align pixel-for-pixel.
+_PANEL_RECT = (0.10, 0.19, 0.72, 0.725)   # left, bottom, width, height
+_CBAR_RECT = (0.845, 0.19, 0.022, 0.725)
 _CAPTION_Y = 0.03   # baseline of the marker-legend/caption line
 _CAPTION_X = 0.46   # horizontal centre = centre of the panel box
 
@@ -1077,10 +1117,18 @@ def _render_dm_time(
         stacked, aspect="auto", origin="lower", cmap="viridis",
         vmin=vmin, vmax=vmax, interpolation="nearest",
     )
+    # v3.2: tick/axis-label/colorbar font sizes bumped ~1.5-2x across this
+    # module (dm_time, image_peak, lightcurve, kernel_snrs) so the
+    # archived PNGs are legible at the ~800px panel width the candidate
+    # card (and the dashboard) display them at. Font sizes only — no
+    # layout/content changes.
+    ax.tick_params(axis="x", labelsize=_TICK_FONTSIZE)
     cax = fig.add_axes(_CBAR_RECT)
-    fig.colorbar(
+    cb = fig.colorbar(
         im, cax=cax, label="image-max amplitude (robust σ per DM row)",
     )
+    cb.ax.tick_params(labelsize=_TICK_FONTSIZE)
+    cb.set_label(cb.ax.get_ylabel(), fontsize=_AXIS_LABEL_FONTSIZE)
 
     # Half boundaries (dashed) so the (search node, gpu half) bands are
     # still legible; the band id is annotated at the right edge.
@@ -1107,21 +1155,23 @@ def _render_dm_time(
         tick_rows = np.unique(tick_rows)
         ax.set_yticks(tick_rows)
         ax.set_yticklabels(
-            [f"{row_dm[r]:.0f}" for r in tick_rows], fontsize=8,
+            [f"{row_dm[r]:.0f}" for r in tick_rows],
+            fontsize=_TICK_FONTSIZE,
         )
-        ax.set_ylabel("dispersion measure (pc cm⁻³)", fontsize=10)
+        ax.set_ylabel("dispersion measure (pc cm⁻³)",
+                     fontsize=_AXIS_LABEL_FONTSIZE)
     else:
         band_centres = [
             (off + nxt) / 2.0 for off, nxt in zip(offsets, next_offsets)
         ]
         ax.set_yticks(band_centres)
-        ax.set_yticklabels(labels, fontsize=9)
+        ax.set_yticklabels(labels, fontsize=_TICK_FONTSIZE)
         ax.set_ylabel(
             "fine-DM trials, stacked by (search node, gpu half) — "
             "increasing DM ↑",
-            fontsize=10,
+            fontsize=_AXIS_LABEL_FONTSIZE,
         )
-    ax.set_xlabel("time sample (within cube)", fontsize=10)
+    ax.set_xlabel("time sample (within cube)", fontsize=_AXIS_LABEL_FONTSIZE)
 
     # Data apex (independent of the detector): global max of the
     # stacked, row-normalised waterfall. When detection is healthy the
@@ -1139,7 +1189,7 @@ def _render_dm_time(
             ls="none", label="brightest point of displayed data",
         )
 
-    title = f"DM × time waterfall (all cubes) — {event_name}"
+    title = f"DM × time (waterfall) — {event_name}"
     if coords is not None:
         if coords.t_idx is not None:
             ax.axvline(
@@ -1156,10 +1206,19 @@ def _render_dm_time(
                     label="detector-reported burst",
                 )
         title += (
-            f" — burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
+            f"\nburst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
             f"SNR={coords.snr:.1f}" + _provenance(coords)
         )
-    ax.set_title(title, fontsize=10)
+    # v3.5: explicit two-line title (event identity on line 1, burst
+    # DM/SNR on line 2) instead of one long line + wrap=True. A single
+    # long line at any legible font width overflows the axes box (the
+    # "shared figure geometry" note above _PANEL_RECT pixel-aligns
+    # dm_time/image_peak and can't grow per-title), and wrap=True's
+    # auto-reflow point didn't reliably land at a sensible semantic
+    # break. An explicit "\n" plus the dialed-down 16pt _TITLE_FONTSIZE
+    # keeps both lines within the axes width. The reserved margin above
+    # the axes (see _PANEL_RECT) already has room for two lines.
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
     # Legend lives below the axes so it never overlaps the waterfall,
     # title, axis labels, or colorbar. No frame: plain text on the white
     # figure margin. The in-axes × marker is pure white (legible on the
@@ -1186,7 +1245,8 @@ def _render_dm_time(
         fig.legend(
             handles=proxy_handles, loc="lower center",
             bbox_to_anchor=(_CAPTION_X, _CAPTION_Y - 0.016),
-            ncol=2, fontsize=9, frameon=False, labelcolor="#3b4252",
+            ncol=2, fontsize=_LEGEND_FONTSIZE, frameon=False,
+            labelcolor="#3b4252",
         )
     fig.savefig(path, dpi=110)
     plt.close(fig)
@@ -1216,8 +1276,11 @@ def _render_image_peak(
     fig = plt.figure(figsize=(10.0, 9.0))
     ax = fig.add_axes(_PANEL_RECT)
     im = ax.imshow(img, origin="lower", cmap="magma")
+    ax.tick_params(axis="both", labelsize=_TICK_FONTSIZE)
     cax = fig.add_axes(_CBAR_RECT)
-    fig.colorbar(im, cax=cax, label="amplitude")
+    cb = fig.colorbar(im, cax=cax, label="amplitude")
+    cb.ax.tick_params(labelsize=_TICK_FONTSIZE)
+    cb.set_label(cb.ax.get_ylabel(), fontsize=_AXIS_LABEL_FONTSIZE)
     # Reticle at the detected (l, m): x = m (cols), y = l (rows).
     ax.axhline(coords.l_pix, color=_RETICLE, lw=0.8, ls="--", alpha=0.8)
     ax.axvline(coords.m_pix, color=_RETICLE, lw=0.8, ls="--", alpha=0.8)
@@ -1225,13 +1288,16 @@ def _render_image_peak(
         (coords.m_pix, coords.l_pix), radius=8.0,
         fill=False, edgecolor=_RETICLE, lw=1.8,
     ))
-    ax.set_xlabel("m (pix)", fontsize=10)
-    ax.set_ylabel("l (pix)", fontsize=10)
+    ax.set_xlabel("m (pix)", fontsize=_AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel("l (pix)", fontsize=_AXIS_LABEL_FONTSIZE)
     title = (
-        f"image at (DM={coords.dm_pc_cc:.1f}, t={t_idx}) — {event_name} — "
+        f"image at (DM={coords.dm_pc_cc:.1f}, t={t_idx}) — {event_name}\n"
         f"burst (l,m)=({coords.l_pix},{coords.m_pix})" + _provenance(coords)
     )
-    ax.set_title(title, fontsize=10)
+    # v3.5: explicit two-line title — see the matching note in
+    # _render_dm_time. Event identity on line 1, burst (l, m) on line 2;
+    # keeps each line within the axes width at _TITLE_FONTSIZE (16pt).
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
     # Geometry is shared with _render_dm_time via _PANEL_RECT /
     # _CBAR_RECT / _CAPTION_Y, so both figures align by construction
     # (same 1100x990 PNG, same axes box, caption on the same line as
@@ -1239,7 +1305,8 @@ def _render_image_peak(
     fig.text(
         _CAPTION_X, _CAPTION_Y,
         "red circle = burst position reported by the detector",
-        ha="center", va="baseline", fontsize=9, color="#3b4252",
+        ha="center", va="baseline", fontsize=_LEGEND_FONTSIZE,
+        color="#3b4252",
     )
     fig.savefig(path, dpi=110)
     plt.close(fig)
@@ -1265,21 +1332,34 @@ def _render_lightcurve(
     lc = np.asarray(waterfall[:, fdm], dtype=np.float32)
     fig, ax = plt.subplots(figsize=(8.0, 3.6))
     ax.plot(lc, color="#0984e3", lw=1.5)
+    ax.tick_params(axis="both", labelsize=_TICK_FONTSIZE)
     if coords.t_idx is not None:
         ax.axvline(
             coords.t_idx, color=_RETICLE, lw=1.4, ls="--",
             label=f"burst t={coords.t_idx}",
         )
-        ax.legend(loc="upper right", fontsize=9)
-    ax.set_xlabel("time sample (within cube)")
-    ax.set_ylabel("peak amplitude (image max)")
-    title = (
-        f"lightcurve at DM={coords.dm_pc_cc:.1f} pc cm⁻³ — {event_name} — "
-        f"SNR={coords.snr:.1f}" + _provenance(coords)
-    )
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout()
-    fig.savefig(path, dpi=100)
+        ax.legend(loc="upper right", fontsize=_LEGEND_FONTSIZE)
+    ax.set_xlabel("time sample (within cube)",
+                 fontsize=_AXIS_LABEL_FONTSIZE_SMALL)
+    ax.set_ylabel("peak amplitude (image max)",
+                 fontsize=_AXIS_LABEL_FONTSIZE_SMALL)
+    # v3.7: single-line title — the old second line (DM+SNR) duplicated
+    # the dm_time title / card header and its extra line height pushed
+    # this panel's axes box out of alignment with its row-mate
+    # (kernel_snrs has a one-line title). Provenance marker stays (it is
+    # a data-quality warning, not duplicated info).
+    title = f"lightcurve — {event_name}" + _provenance(coords)
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
+    # v3.3: dropped fig.tight_layout() — with the bigger v3.2 ylabel font
+    # it was clipping the rotated ylabel's left edge (reproduced in
+    # isolation: tight_layout() pins subplot params from a pre-render
+    # estimate that undershoots for this rotated/enlarged label, and that
+    # pinned layout was NOT being corrected by the savefig-time bbox
+    # recompute below). bbox_inches="tight" alone measures the actual
+    # rendered artist extents and expands the saved canvas to fit them,
+    # which is sufficient (verified: no more clipping) and needs no
+    # separate layout call.
+    fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -1305,17 +1385,26 @@ def _render_kernel_snrs(
     fig, ax = plt.subplots(figsize=(8.0, 4.0))
     xs = np.arange(len(labels))
     bars = ax.bar(xs, maxes, color="#fdcb6e", edgecolor="#2d3436")
+    # 12% y-headroom so the above-bar "n=" annotations never clip against
+    # the axes top border when a bar spans nearly the full height.
+    if maxes and max(maxes) > 0:
+        ax.set_ylim(0, max(maxes) * 1.12)
     for x, c, b in zip(xs, counts, bars):
         ax.text(
             x, b.get_height(), f"n={c}",
-            ha="center", va="bottom", fontsize=9,
+            ha="center", va="bottom", fontsize=_LEGEND_FONTSIZE,
         )
     ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel("max SNR per kernel")
-    ax.set_title(f"kernel SNR distribution — {event_name}")
-    fig.tight_layout()
-    fig.savefig(path, dpi=100)
+    ax.set_xticklabels(labels, rotation=30, ha="right",
+                       fontsize=_TICK_FONTSIZE)
+    ax.tick_params(axis="y", labelsize=_TICK_FONTSIZE)
+    ax.set_ylabel("max SNR per kernel", fontsize=_AXIS_LABEL_FONTSIZE_SMALL)
+    ax.set_title(f"kernel SNR — {event_name}", fontsize=_TITLE_FONTSIZE)
+    # v3.3: dropped fig.tight_layout() — see the matching comment in
+    # _render_lightcurve; bbox_inches="tight" alone is sufficient and
+    # avoids the same clipping hazard for this panel's rotated xtick
+    # labels / ylabel.
+    fig.savefig(path, dpi=100, bbox_inches="tight")
     plt.close(fig)
     return path
 
