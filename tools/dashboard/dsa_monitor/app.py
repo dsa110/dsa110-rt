@@ -387,12 +387,30 @@ def sefds():
     the :class:`SefdView` singleton; no iframe."""
     import bfweights_update                                       # local
     import cal_visibility                                         # local
+    import sefd_sources                                           # local
 
     try:
         lookback = int(request.args.get("days", "7"))
     except ValueError:
         lookback = 7
-    summary = sefd_view.summary(lookback_days=lookback)
+
+    # DEC-dependent calibrator set: the VLA-manual sources the
+    # calibration23 service calibrates on at the current pointing dec
+    # (replicates generate_caltable) restricted to flux > 2 Jy. Falls
+    # back to the static catalog if the dec/manual is unavailable so
+    # the page always renders.
+    pt_dec = sefd_sources.pointing_dec_deg(etcd_store)
+    resolved_sources = None
+    resolve_error = None
+    if pt_dec is not None:
+        try:
+            resolved_sources = sefd_sources.resolve_sources_for_dec(pt_dec)
+        except Exception as exc:                                 # noqa: BLE001
+            LOG.exception("sefds: DEC source resolution failed")
+            resolve_error = f"{type(exc).__name__}: {exc}"
+    summary = sefd_view.summary(
+        lookback_days=lookback, sources=resolved_sources,
+    )
     try:
         pipeline_weights = cal_visibility.build_pipeline_weights_view(etcd_store)
     except Exception:  # noqa: BLE001 — panel is best-effort, page must
@@ -407,6 +425,11 @@ def sefds():
         sefd_state_error=sefd_view.state_error(),
         bf_latest=bfweights_update.latest_descriptors(summary.sources),
         pipeline_weights=pipeline_weights,
+        pointing_dec_deg=pt_dec,
+        dec_sources_active=(resolved_sources is not None),
+        dec_resolve_error=resolve_error,
+        dec_flux_min_jy=sefd_sources.PAGE_MIN_FLUX_JY,
+        dec_radius_deg=sefd_sources.SERVICE_RADIUS_DEG,
     )
 
 
