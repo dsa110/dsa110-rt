@@ -294,7 +294,11 @@ class SefdView:
 
     # ----- summary --------------------------------------------------------
 
-    def summary(self, lookback_days: int = 7) -> SefdSummary:
+    def summary(
+        self,
+        lookback_days: int = 7,
+        sources: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> SefdSummary:
         """Build the grid + nav payload for the ``/sefds`` landing page.
 
         ``lookback_days`` is clamped to ``[1, 365]``.  Only state.json
@@ -302,13 +306,20 @@ class SefdView:
         in the grid (malformed dates are dropped silently rather than
         crashing the page); these always remain in the per-source
         listing accessible via :meth:`source_entries`.
+
+        ``sources`` optionally overrides the catalog for this call
+        (name -> ``{"flux_jy": ...}`` dict). The ``/sefds`` route passes
+        the DEC-resolved calibrator set here so the grid follows the
+        pointing declination; when ``None`` the static
+        :data:`DEFAULT_SOURCES` catalog is used.
         """
         lookback_days = max(1, min(int(lookback_days), 365))
         raw = self._read_state()
         today = datetime.now(timezone.utc).date()
         cutoff_days = lookback_days
 
-        sources = sorted(self.sources.keys())
+        src_map = self.sources if sources is None else sources
+        sources = sorted(src_map.keys())
 
         kept_dates: Dict[str, bool] = {}
         entries_by_key: Dict[str, SefdEntry] = {}
@@ -372,7 +383,7 @@ class SefdView:
         return SefdSummary(
             dates=dates,
             sources=sources,
-            source_flux=dict(self.sources),
+            source_flux=dict(src_map),
             grid=grid,
             lookback_days=lookback_days,
             state_path=self.state_file,

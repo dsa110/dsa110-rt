@@ -158,6 +158,33 @@
 {% block content %}
 <h1>SEFDs</h1>
 
+<!-- DEC-dependent calibrator selection banner. The tracked sources
+     follow the pointing declination: the VLA-manual calibrators the
+     calibration23 service calibrates on at this dec, flux > 2 Jy. -->
+<div class="sefd-dec-banner"
+     style="margin-bottom: 12px; padding: 8px 12px; border-radius: 6px;
+            background: rgba(0,114,178,0.08);
+            border: 1px solid rgba(0,114,178,0.35); font-size: 0.9em;">
+    {% if pointing_dec_deg is not none %}
+        <strong>Pointing DEC {{ '%+.2f'|format(pointing_dec_deg) }}&deg;</strong>
+        &mdash;
+        {% if dec_sources_active %}
+            tracking {{ summary.sources|length }} calibrator(s) the
+            calibration23 service calibrates on at this dec (VLA manual,
+            flux &gt; {{ '%.0f'|format(dec_flux_min_jy) }} Jy, within
+            {{ '%.1f'|format(dec_radius_deg) }}&deg; of beam centre):
+            {{ summary.sources|join(', ') }}.
+        {% else %}
+            <span style="color:#b45309;">DEC-based selection unavailable
+            {% if dec_resolve_error %}({{ dec_resolve_error }}){% endif %}
+            &mdash; showing the static fallback catalog.</span>
+        {% endif %}
+    {% else %}
+        <span style="color:#b45309;">Pointing DEC unavailable from etcd
+        &mdash; showing the static fallback catalog.</span>
+    {% endif %}
+</div>
+
 <!-- Scanner freshness pill: state.json is the scanner's heartbeat;
      if it's > SCANNER_STALE_S old the scanner probably stalled. -->
 <div style="display: flex; align-items: center; gap: 12px;
