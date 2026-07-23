@@ -74,58 +74,115 @@ _ACTIVE_JOB_ID: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 
+# --- descriptor discovery (cached, non-blocking) -------------------------
+#
+# GENERATED_DIR lives on /dataz and can hold ~100k weight files; listing
+# it can take tens of seconds under I/O load. The /sefds page must never
+# block on it, so descriptor discovery is a single cached os.scandir()
+# refreshed in the background (single-flight). Requests always return the
+# current cache immediately — empty on a cold start, filled once the
+# first background scan completes. The prior per-source glob() (a full
+# dir scan PER source, on the request thread) hung the page (2026-07-23).
+# GENERATED_DIR (~100k files on /dataz) currently takes 30-60 s+ to scan;
+# descriptors only change when the cal service writes new weights (~daily),
+# so refresh sparingly to keep the background I/O off that degraded dir.
+_DESC_TTL_S = 900.0
+_desc_cache_lock = threading.Lock()
+_desc_cache: Dict[str, Any] = {"ts": 0.0, "by_source": {}}
+_desc_refresh_lock = threading.Lock()
+_desc_refreshing = False
+
+
+def _scan_all_descriptors() -> Dict[str, Dict[str, Any]]:
+    """One os.scandir() of GENERATED_DIR → newest descriptor per source.
+
+    No per-file stat (age comes from the ISOT in the filename), so the
+    cost is a single directory read regardless of source count.
+    """
+    import datetime
+    by_source: Dict[str, Dict[str, Any]] = {}
+    with os.scandir(GENERATED_DIR) as it:
+        for entry in it:
+            name = entry.name
+            if not (name.startswith("beamformer_weights_")
+                    and name.endswith(".yaml")):
+                continue
+            descriptor = name[len("beamformer_weights_"):-len(".yaml")]
+            m = _DESCRIPTOR_RE.match(descriptor)
+            if m is None:
+                continue
+            src, isot = m.group("src"), m.group("isot")
+            cur = by_source.get(src)
+            if cur is None or isot > cur["isot"]:
+                by_source[src] = {
+                    "descriptor": descriptor,
+                    "yaml_path": os.path.join(GENERATED_DIR, name),
+                    "isot": isot,
+                }
+    now = time.time()
+    for info in by_source.values():
+        try:
+            dt = datetime.datetime.strptime(
+                info["isot"], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=datetime.timezone.utc)
+            info["age_hours"] = round((now - dt.timestamp()) / 3600.0, 1)
+        except ValueError:
+            info["age_hours"] = None
+    return by_source
+
+
+def _refresh_descriptors_async() -> None:
+    """Kick a single-flight background scan; never blocks the caller."""
+    global _desc_refreshing
+    with _desc_refresh_lock:
+        if _desc_refreshing:
+            return
+        _desc_refreshing = True
+
+    def _work() -> None:
+        global _desc_refreshing
+        try:
+            data = _scan_all_descriptors()
+            with _desc_cache_lock:
+                _desc_cache["by_source"] = data
+                _desc_cache["ts"] = time.time()
+        except Exception:                                  # noqa: BLE001
+            LOG.exception("bfweights descriptor scan failed")
+        finally:
+            with _desc_refresh_lock:
+                _desc_refreshing = False
+
+    threading.Thread(
+        target=_work, name="bfweights-desc-scan", daemon=True
+    ).start()
+
+
+def _cached_by_source() -> Dict[str, Dict[str, Any]]:
+    """Current descriptor cache; triggers a background refresh if stale.
+    Returns immediately with whatever is cached (possibly empty)."""
+    with _desc_cache_lock:
+        age = time.time() - _desc_cache["ts"]
+        data = dict(_desc_cache["by_source"])
+    if age > _DESC_TTL_S:
+        _refresh_descriptors_async()
+    return data
+
+
 def latest_descriptor(source: str) -> Optional[Dict[str, Any]]:
     """Newest ``<SRC>_<ISOT>`` descriptor for one calibrator, or None.
 
-    Scans ``GENERATED_DIR`` for ``beamformer_weights_<source>_*.yaml``
-    and picks the lexically-greatest ISOT (the timestamp format makes
-    lexical == chronological). Returns
-    ``{descriptor, yaml_path, isot, age_hours}``.
+    Served from the cached scan (non-blocking); ``None`` until the first
+    background scan of GENERATED_DIR completes.
     """
-    pattern = os.path.join(
-        GENERATED_DIR, f"beamformer_weights_{source}_*.yaml"
-    )
-    best: Optional[Dict[str, Any]] = None
-    for path in glob.glob(pattern):
-        stem = os.path.basename(path)
-        if not (stem.startswith("beamformer_weights_")
-                and stem.endswith(".yaml")):
-            continue
-        descriptor = stem[len("beamformer_weights_"):-len(".yaml")]
-        m = _DESCRIPTOR_RE.match(descriptor)
-        if m is None or m.group("src") != source:
-            continue
-        if best is None or m.group("isot") > best["isot"]:
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                mtime = 0.0
-            best = {
-                "descriptor": descriptor,
-                "yaml_path": path,
-                "isot": m.group("isot"),
-                "mtime_unix": mtime,
-            }
-    if best is not None:
-        # Age from the solution timestamp in the name (UTC), not file
-        # mtime — regenerated/copied files shouldn't look fresher than
-        # the solution they hold.
-        try:
-            import datetime
-            dt = datetime.datetime.strptime(
-                best["isot"], "%Y-%m-%dT%H:%M:%S"
-            ).replace(tzinfo=datetime.timezone.utc)
-            best["age_hours"] = round(
-                (time.time() - dt.timestamp()) / 3600.0, 1
-            )
-        except ValueError:
-            best["age_hours"] = None
-    return best
+    return _cached_by_source().get(source)
 
 
-def latest_descriptors(sources: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+def latest_descriptors(
+    sources: List[str],
+) -> Dict[str, Optional[Dict[str, Any]]]:
     """:func:`latest_descriptor` for each source, keyed by source."""
-    return {s: latest_descriptor(s) for s in sources}
+    data = _cached_by_source()
+    return {s: data.get(s) for s in sources}
 
 
 # ---------------------------------------------------------------------------
