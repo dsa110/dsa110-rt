@@ -395,6 +395,33 @@ class SefdView:
 
     # ----- per-source / per-day -------------------------------------------
 
+    def known_sources(self) -> Dict[str, Dict[str, float]]:
+        """The static catalog UNION every source present in state.json.
+
+        The static :data:`DEFAULT_SOURCES` catalog only covers the
+        historical +16 deg calibrators. When the array points elsewhere
+        the DEC-resolved set (used for the landing grid) brings in other
+        calibrators — e.g. 1459+716 / 0841+708 at dec +71 — that have
+        real MSes, metrics and diagnostic PNGs but are not in the static
+        catalog. Gating the per-source / per-day / plot paths on the
+        static catalog alone made those pages 404 / show "no
+        observations" with the plots unreachable. Unioning in whatever
+        actually appears in state.json lets any observed calibrator
+        resolve. Sources known only from state get a ``flux_jy`` of
+        ``None`` (the landing grid still sources flux from the DEC
+        catalog).
+        """
+        merged: Dict[str, Dict[str, float]] = dict(self.sources)
+        for key, val in self._read_state().items():
+            if not isinstance(val, dict):
+                continue
+            src = str(val.get("source") or "")
+            if not src and "_" in key:
+                src = key.partition("_")[2]
+            if src and src not in merged:
+                merged[src] = {"flux_jy": None}
+        return merged
+
     def source_entries(
         self, source_name: str, lookback_days: int = 7,
     ) -> List[SefdEntry]:
@@ -404,7 +431,7 @@ class SefdView:
         page can show errors too).  ``lookback_days`` is applied to
         ``entry.date``.
         """
-        if source_name not in self.sources:
+        if source_name not in self.known_sources():
             return []
         lookback_days = max(1, min(int(lookback_days), 365))
         raw = self._read_state()
@@ -437,6 +464,7 @@ class SefdView:
         """
         if not _is_iso_date(date):
             return {}
+        known = self.known_sources()
         raw = self._read_state()
         out: Dict[str, SefdEntry] = {}
         for key, val in raw.items():
@@ -445,7 +473,7 @@ class SefdView:
             entry = self._entry_from_raw(key, val)
             if entry.date != date:
                 continue
-            if entry.source not in self.sources:
+            if entry.source not in known:
                 continue
             out[entry.source] = entry
         return out
@@ -460,7 +488,7 @@ class SefdView:
 
         Returns an empty dict if the directory doesn't exist.
         """
-        if source not in self.sources or not _is_iso_date(date):
+        if source not in self.known_sources() or not _is_iso_date(date):
             return {}
         base = os.path.join(self.results_dir, source, date)
         if not os.path.isdir(base):

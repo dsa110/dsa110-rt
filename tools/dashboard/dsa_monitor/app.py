@@ -441,7 +441,8 @@ def sefds_source(source_name: str):
         lookback = int(request.args.get("days", "7"))
     except ValueError:
         lookback = 7
-    if source_name not in sefd_view.sources:
+    known = sefd_view.known_sources()
+    if source_name not in known:
         abort(404)
     entries = sefd_view.source_entries(source_name, lookback_days=lookback)
     # Pre-resolve plot URLs once so the template only does dict
@@ -455,7 +456,9 @@ def sefds_source(source_name: str):
         "sefd_source.html",
         active_tab="sefds",
         source_name=source_name,
-        source_flux=sefd_view.sources[source_name],
+        source_flux={
+            "flux_jy": (known.get(source_name) or {}).get("flux_jy") or "—"
+        },
         entries=entries,
         entry_plots=entry_plots,
         lookback=lookback,
@@ -478,7 +481,7 @@ def sefds_day(date: str):
         "sefd_day.html",
         active_tab="sefds",
         date=date,
-        sources=sefd_view.sources,
+        sources=sefd_view.known_sources(),
         entries=entries,
         plots_by_source=plots_by_source,
     )
@@ -550,12 +553,13 @@ def control_update_bfweights_post():
             ),
         }), 400
     source = (request.form.get("source") or "").strip()
-    if source not in sefd_view.sources:
+    known_srcs = sefd_view.known_sources()
+    if source not in known_srcs:
         return jsonify({
             "ok": False,
             "error": (
                 f"source {source!r} is not an SEFD-tracked calibrator "
-                f"(expected one of {sorted(sefd_view.sources)})"
+                f"(expected one of {sorted(known_srcs)})"
             ),
         }), 400
     dry_raw = (request.form.get("dry_run") or "").strip().lower()
