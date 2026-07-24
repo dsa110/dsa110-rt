@@ -44,7 +44,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -83,6 +83,23 @@ _BLOCK_S: float = 2048 * _SPECNUM_S
 # below; see configs/dsart_pipeline_rt.yaml for the deployed knobs.
 _DEFAULT_MIN_FREE_BYTES_FLOOR: int = 16 * (1 << 30)          # 16 GiB
 _DEFAULT_STAGING_MAX_TOTAL_BYTES: int = 120 * (1 << 30)      # 120 GiB
+
+# 2026-07-24 orphan-eviction guard. The 2026-07-21 storm-containment cap
+# above has NO eviction: C3 only ever deletes events it adjudicates
+# (KEEP-collect cleanup or REJECT), so a C2 dump-trigger whose event C2
+# then DISCARDS (cube-incomplete under an RFI storm — the common case)
+# strands its ~6.5 GiB/node fragment in staging forever. On 2026-07-23
+# 31 such orphans (~1.81 TiB fleet-wide) accumulated over one evening and
+# pinned the cap, so voltage_retention skipped ~half of every dump for
+# ~18 h (dumps_skipped_staging_cap) — voltage capability was effectively
+# dead. Fix: a periodic sweep that evicts staged fragments older than
+# _DEFAULT_STAGING_ORPHAN_TTL_S. The TTL MUST exceed the worst-case time
+# a legitimate KEEP fragment lives in staging before C3 collects+deletes
+# it (c3.collect_timeout_s, currently 1800 s) with generous margin — a
+# fragment older than the TTL was provably never collected, so it is an
+# orphan and safe to drop.
+_DEFAULT_STAGING_ORPHAN_TTL_S: float = 7200.0                # 2 h (4x c3 collect_timeout)
+_DEFAULT_ORPHAN_SWEEP_INTERVAL_S: float = 300.0             # scan every 5 min
 
 
 class DiskFullError(OSError):
@@ -124,6 +141,13 @@ class RetentionConfig:
     # case (many back-to-back real triggers) even when the disk has
     # plenty of headroom otherwise.
     staging_max_total_bytes: int = _DEFAULT_STAGING_MAX_TOTAL_BYTES
+    # 2026-07-24 orphan-eviction guard. A staged fragment older than
+    # staging_orphan_ttl_s is evicted by the periodic sweeper (a C2-
+    # discarded event C3 never adjudicates, so it is never cleaned
+    # otherwise — it would pin the cap above forever). TTL must exceed
+    # c3.collect_timeout_s with margin. 0 disables the sweep.
+    staging_orphan_ttl_s: float = _DEFAULT_STAGING_ORPHAN_TTL_S
+    orphan_sweep_interval_s: float = _DEFAULT_ORPHAN_SWEEP_INTERVAL_S
 
     @property
     def sb(self) -> str:
@@ -204,6 +228,35 @@ def _staged_fragment_bytes(
         return out_path.stat().st_size
     except OSError:
         return 0
+
+
+def scan_staged_events(
+    staging_dir: Path, chgroup: int,
+) -> List[Tuple[str, float]]:
+    """List this node's staged events as ``(event_name, out_mtime_unix)``.
+
+    Derives the event name from each ``{event}_{sb}_data.out`` fragment
+    for this chgroup's ``sb`` (the ``.out`` mtime is the dump-completion
+    time — writes land atomically via a ``.tmp`` rename). Used by the
+    orphan sweeper; tolerant of a missing dir. Never raises.
+    """
+    sb = f"sb{int(chgroup):02d}"
+    suffix = f"_{sb}_data.out"
+    out: List[Tuple[str, float]] = []
+    try:
+        with os.scandir(staging_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not name.endswith(suffix):
+                    continue
+                try:
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+                out.append((name[: -len(suffix)], mtime))
+    except FileNotFoundError:
+        return []
+    return out
 
 
 def check_disk_headroom(
@@ -428,6 +481,7 @@ class VoltageRetentionService:
         self._stop = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
         self._worker_thread: Optional[threading.Thread] = None
+        self._sweeper_thread: Optional[threading.Thread] = None
         self._listener: Optional[VoltageTriggerListener] = None
         self._counters: Dict[str, int] = {
             "blocks_read": 0,
@@ -441,6 +495,11 @@ class VoltageRetentionService:
             "dumps_skipped_disk_full": 0,
             "dumps_skipped_staging_cap": 0,
             "dumps_failed_enospc": 0,
+            # 2026-07-24 orphan-eviction guard: fragments the periodic
+            # sweeper dropped because they outlived staging_orphan_ttl_s
+            # (C2-discarded events C3 never adjudicates; counted apart
+            # from C3-driven deletes_done for observability).
+            "orphans_evicted": 0,
         }
         # In-process running total of bytes staged in config.staging_dir,
         # seeded from disk at startup, kept current on every successful
@@ -465,6 +524,13 @@ class VoltageRetentionService:
     def _enqueue_delete(self, event_name: str) -> bool:
         try:
             self._q.put_nowait(("delete", event_name, 0, 0.0))
+            return True
+        except queue.Full:
+            return False
+
+    def _enqueue_evict(self, event_name: str) -> bool:
+        try:
+            self._q.put_nowait(("evict", event_name, 0, 0.0))
             return True
         except queue.Full:
             return False
@@ -560,7 +626,13 @@ class VoltageRetentionService:
             except queue.Empty:
                 continue
             try:
-                if kind == "delete":
+                if kind in ("delete", "evict"):
+                    # Both remove a staged .out/.json pair and decrement
+                    # the cap counter through this single (worker-thread)
+                    # path so _staged_bytes stays race-free. "delete" is
+                    # C3-driven (KEEP-collect cleanup / REJECT); "evict"
+                    # is the TTL sweeper dropping an orphan. Counted
+                    # separately for observability.
                     removed_bytes = _staged_fragment_bytes(
                         self._cfg.staging_dir, name, self._cfg.chgroup,
                     )
@@ -571,11 +643,21 @@ class VoltageRetentionService:
                         self._staged_bytes = max(
                             0, self._staged_bytes - removed_bytes,
                         )
-                    self._counters["deletes_done"] += 1
-                    LOG.info(
-                        "voltage_retention: deleted staged %s (%d files)",
-                        name, n,
-                    )
+                    if kind == "evict":
+                        self._counters["orphans_evicted"] += 1
+                        LOG.warning(
+                            "voltage_retention: evicted ORPHAN staged %s "
+                            "(%d files, %.2f GiB) — older than TTL %.0f s; "
+                            "C2-discarded event never collected by C3",
+                            name, n, removed_bytes / (1 << 30),
+                            self._cfg.staging_orphan_ttl_s,
+                        )
+                    else:
+                        self._counters["deletes_done"] += 1
+                        LOG.info(
+                            "voltage_retention: deleted staged %s (%d files)",
+                            name, n,
+                        )
                     continue
                 target = specnum_to_block_n(specnum)
                 self._wait_for_post(target)
@@ -694,6 +776,57 @@ class VoltageRetentionService:
                     name, specnum,
                 )
 
+    # ----- orphan sweeper thread ---------------------------------------
+
+    def _sweep_orphans(self) -> int:
+        """Enqueue an ``evict`` for every staged fragment older than the
+        TTL. Returns the number enqueued this pass.
+
+        C3 only ever deletes events it adjudicates, so a C2 dump-trigger
+        whose event C2 later discards (cube-incomplete, the RFI-storm
+        common case) strands its fragment forever and eventually pins the
+        cumulative-staging cap (2026-07-23: 31 orphans / ~1.81 TiB killed
+        dumping for ~18 h). Any fragment older than ``staging_orphan_ttl_s``
+        was provably never collected (>> c3.collect_timeout_s), so it is
+        an orphan. Evicts run through the worker queue so the single
+        worker thread owns every ``_staged_bytes`` mutation; a full queue
+        just defers the rest to the next sweep.
+        """
+        ttl = float(self._cfg.staging_orphan_ttl_s)
+        if ttl <= 0:
+            return 0
+        cutoff = time.time() - ttl
+        n = 0
+        for name, mtime in scan_staged_events(
+            self._cfg.staging_dir, self._cfg.chgroup,
+        ):
+            if mtime < cutoff:
+                if not self._enqueue_evict(name):
+                    break                        # queue full; next pass
+                n += 1
+        if n:
+            LOG.info(
+                "voltage_retention: orphan sweep enqueued %d eviction(s) "
+                "(> %.0f s old) on %s", n, ttl, self._cfg.sb,
+            )
+        return n
+
+    def _sweeper_loop(self) -> None:
+        interval = max(1.0, float(self._cfg.orphan_sweep_interval_s))
+        if float(self._cfg.staging_orphan_ttl_s) <= 0:
+            LOG.info("voltage_retention: orphan sweep disabled (ttl<=0)")
+            return
+        # small initial delay so a fresh start doesn't race the reader
+        # attach / first mon publish
+        if self._stop.wait(min(interval, 30.0)):
+            return
+        while not self._stop.is_set():
+            try:
+                self._sweep_orphans()
+            except Exception:  # noqa: BLE001 — never let the sweep kill the thread
+                LOG.exception("voltage_retention: orphan sweep failed")
+            self._stop.wait(interval)
+
     # ----- mon publish (asyncio) ---------------------------------------
 
     async def _mon_loop(self) -> None:
@@ -711,6 +844,8 @@ class VoltageRetentionService:
                     "window_s": (
                         (self._cfg.n_pre + self._cfg.n_post + 1) * _BLOCK_S
                     ),
+                    "staging_orphan_ttl_s": self._cfg.staging_orphan_ttl_s,
+                    "staged_bytes": self._staged_bytes,
                 }
                 if self._listener is not None:
                     payload["listener"] = self._listener.mon
@@ -740,8 +875,12 @@ class VoltageRetentionService:
         self._worker_thread = threading.Thread(
             target=self._worker_loop, name="vret-worker", daemon=True,
         )
+        self._sweeper_thread = threading.Thread(
+            target=self._sweeper_loop, name="vret-sweeper", daemon=True,
+        )
         self._reader_thread.start()
         self._worker_thread.start()
+        self._sweeper_thread.start()
 
         self._listener = VoltageTriggerListener(
             config=VoltageTriggerListenerConfig(
@@ -843,6 +982,20 @@ def _build_parser() -> argparse.ArgumentParser:
                         "bytes resident in --staging-dir over this cap "
                         "(bounds a C2 trigger storm even with an "
                         "otherwise-empty disk). Bytes. Default 120 GiB.")
+    # 2026-07-24 orphan-eviction guard: without it, C2-discarded events
+    # (never adjudicated by C3) strand their fragments and eventually
+    # pin --staging-max-total-bytes forever (2026-07-23: killed dumping
+    # ~18 h). TTL must exceed c3.collect_timeout_s with margin.
+    p.add_argument("--staging-orphan-ttl-s", type=float,
+                   default=_DEFAULT_STAGING_ORPHAN_TTL_S,
+                   help="Evict a staged fragment older than this (a "
+                        "C2-discarded orphan C3 never collected). Must "
+                        "exceed c3.collect_timeout_s. 0 disables. "
+                        "Seconds. Default 7200 (2 h).")
+    p.add_argument("--orphan-sweep-interval-s", type=float,
+                   default=_DEFAULT_ORPHAN_SWEEP_INTERVAL_S,
+                   help="How often the orphan sweeper scans --staging-dir. "
+                        "Seconds. Default 300.")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return p
@@ -892,6 +1045,8 @@ def main(argv: Optional[list] = None) -> int:
         max_blocks=int(args.max_blocks),
         min_free_bytes_floor=int(args.min_free_bytes_floor),
         staging_max_total_bytes=int(args.staging_max_total_bytes),
+        staging_orphan_ttl_s=float(args.staging_orphan_ttl_s),
+        orphan_sweep_interval_s=float(args.orphan_sweep_interval_s),
     )
     svc = VoltageRetentionService(cfg)
     return asyncio.run(svc.run())

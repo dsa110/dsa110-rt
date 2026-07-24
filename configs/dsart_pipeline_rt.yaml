@@ -590,6 +590,8 @@ routines:
       --ready-sentinel-path /tmp/dsart-voltage-retention-CN.ready
       --min-free-bytes-floor 17179869184
       --staging-max-total-bytes 128849018880
+      --staging-orphan-ttl-s 7200
+      --orphan-sweep-interval-s 300
       --log-level INFO
   #
   # --min-free-bytes-floor / --staging-max-total-bytes (2026-07-21 ENOSPC
@@ -610,3 +612,15 @@ routines:
   #   --staging-max-total-bytes: 120 GiB (128849018880 B). Cumulative
   #   cap on --staging-dir; bounds the storm case even when the disk is
   #   otherwise empty (~18 fragments at ~6.47 GiB before C3 catches up).
+  #
+  # --staging-orphan-ttl-s / --orphan-sweep-interval-s (2026-07-24 orphan
+  # eviction): the cap above has NO eviction, and C3 only deletes events
+  # it adjudicates. A C2 dump-trigger whose event C2 then DISCARDS
+  # (cube-incomplete under an RFI storm — the common case) strands its
+  # ~6.5 GiB/node fragment forever. On 2026-07-23, 31 such orphans
+  # (~1.81 TiB fleet-wide) pinned the cap and voltage_retention skipped
+  # ~half of every dump for ~18 h (dead voltage capability). The sweeper
+  # evicts any fragment older than the TTL (counter orphans_evicted on
+  # the mon payload). TTL 7200 s (2 h) >> c3.collect_timeout_s (1800 s),
+  # so a legitimate KEEP fragment awaiting C3 collection is never
+  # touched. Raise the TTL if c3.collect_timeout_s is raised.
