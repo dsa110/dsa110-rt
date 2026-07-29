@@ -89,18 +89,20 @@ h23** — none of it comes back from MaaS.
 - Netplan: `br2` = `enp129s0f0`, `10.41.0.5/24`, gw `10.41.0.4`, **MTU 9000**
   (the data fabric); `br1` = `eno1`, DHCP.
 
-### 3.2 Secrets — the genuinely unrecoverable part
-These exist in exactly one place each. **Back them up off-host now; if the
-NVMe dies before you do, they must be re-issued.**
+### 3.2 Credentials
+h23 needs a number of credentials restored before its services will run: SSH
+identities (GitHub push, and the key authorised on the corr nodes), plus API
+tokens and webhooks for the alert/notification and monitoring integrations.
 
-| Path | Contents |
-| --- | --- |
-| `~/.ssh/` (7 private keys) | incl. **`vr_dsa_ed25519`** = the GitHub push identity for all `dsa110/*` repos, and the key authorised on all 16 corr nodes that C3 needs. Plus `authorized_keys` (60 keys) and the `ovro`→`dsa110maas`→`dsastorage` ProxyJump chain in `~/.ssh/config`. |
-| `~/.config/systemd/user/environment.conf` | `RELAY_KEY` + 8 GCN client id/secret pairs |
-| `~/.config/dsa110-operator/operator.env` | `ANTHROPIC_API_KEY`, `DSA_OPERATOR_SECRET_KEY`, Slack webhook |
-| `~/.dsart/secrets.env` | `GRAFANA_AUTH` |
-| `~/.config/slack_api`, `~/.config/slack_api_dsa110`, `~/.slack_monitor` | Slack tokens |
-| `~/.bashrc` | env setup **and** plaintext `CASJOBS_PW`, `RDMTOK`, `DATACITEPWD`, `TNSBOTID`, GCN ids — this is itself a standing exposure worth fixing |
+**This repository is public, so the inventory of what lives where is kept out
+of it.** See the private companion:
+`/dataz/dsa110/dr_archive/SECRETS_INVENTORY.md` (mode 600), which lists each
+path, what it holds, and whether it can be restored or must be re-issued —
+plus a rotation priority list.
+
+Operationally: none of these are recoverable from git or from MaaS. If h23's
+root disk is lost before they are copied to a secret store off-host, each one
+must be re-issued from its provider and re-enrolled.
 
 ### 3.3 Conda environments
 **Neither production env has a spec in git** (this is the largest rebuild
@@ -203,11 +205,12 @@ single most valuable next step.
 2. `dataz` is raidz1 on six same-age 14 TB disks — one failure from the edge.
 3. h23 root NVMe has no redundancy; both LXD containers live on it with
    **zero snapshots**.
-4. Secrets (§3.2) exist in exactly one place each.
+4. Credentials (§3.2) exist in exactly one place each, and some need
+   hardening/rotation — tracked in the private inventory, not here.
 5. Conda envs are snapshots-of-a-snapshot; `casa38` may not solve from scratch.
-6. `lxd110maas` is unmanaged and undiscoverable; its API key is served in
-   cleartext over unauthenticated HTTP (`config/lxd/lxd_node.yml`) and should
-   be rotated along with the `ubuntu` and LXD trust passwords.
+6. `lxd110maas` is unmanaged and undiscoverable (absent from both MaaS and
+   DNS, referenced only by hardcoded IP), and the artifact store it serves has
+   no access control. See the private inventory for the follow-up actions.
 7. MaaS postgres has no *scheduled* backup — only the manual dump in §5.
 8. `dsart_c2` is not `enable`d; `/media/ubuntu/data` is not in fstab; sysctl
    tuning does not persist.

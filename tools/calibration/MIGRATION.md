@@ -392,11 +392,11 @@ Verify all 16 afterwards:
   `calibration23-sh`, a keychain-managed file exporting `SSH_AUTH_SOCK` /
   `SSH_AGENT_PID`. It was written 2022-06-16 and points at a long-dead agent,
   so in practice rsync is already falling back to the on-disk key.
-* The container key is `~/.ssh/id_rsa` (2048-bit RSA,
-  `SHA256:FZbes…`, comment `ubuntu@calibration23`) and is **not**
-  passphrase-protected.
+* The container authenticates with its on-disk key in `~/.ssh/`. Key details
+  (type, fingerprint, passphrase status) are recorded in the private notes
+  rather than here, since this repo is public.
 * h23 already has an equivalent keychain file at `~/.keychain/lxd110h23-sh`
-  and several passphrase-less keys. **h23's existing key is already
+  and a usable key. **h23's existing key is already
   authorized on the corr nodes** — verified by a BatchMode SSH to all three
   sampled corr IPs.
 
