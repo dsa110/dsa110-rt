@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}SEFD Dashboard - Summary{% endblock %}
+{% block content %}
+
+<h1>SEFD Monitoring Summary</h1>
+
+{% if currently_processing %}
+<div class="banner">
+    Processing: <strong>{{ currently_processing }}</strong>
+</div>
+{% endif %}
+
+<div class="controls">
+    <label for="days">Lookback:</label>
+    <select id="days" onchange="window.location='/?days='+this.value">
+        {% for d in [7, 14, 30, 60, 90] %}
+        <option value="{{ d }}" {% if d == lookback %}selected{% endif %}>{{ d }} days</option>
+        {% endfor %}
+    </select>
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Date</th>
+            {% for source in sources %}
+            <th>{{ source }}<br><small>{{ source_flux[source].flux_jy }} Jy</small></th>
+            {% endfor %}
+        </tr>
+    </thead>
+    <tbody>
+        {% for date in dates %}
+        <tr>
+            <td><a href="/day/{{ date }}">{{ date }}</a></td>
+            {% for source in sources %}
+            <td>
+                {% set entry = grid[date][source] %}
+                {% if entry is none %}
+                    <span style="color: #b2bec3;">---</span>
+                {% else %}
+                    <span class="status-badge status-{{ entry.status }}">
+                        {% if entry.status == 'pending' %}Pending
+                        {% elif entry.status == 'light_processing' %}Light...
+                        {% elif entry.status == 'light_done' %}Light Done
+                        {% elif entry.status == 'full_processing' %}Full...
+                        {% elif entry.status == 'complete' %}Complete
+                        {% elif 'error' in entry.status %}Error
+                        {% else %}{{ entry.status }}
+                        {% endif %}
+                    </span>
+                    {% if entry.get('error') %}
+                        <div class="metric" style="color: #d63031;" title="{{ entry.error }}">{{ entry.error[:60] }}{% if entry.error|length > 60 %}...{% endif %}</div>
+                    {% endif %}
+                    {% if entry.get('metrics') %}
+                        {% set m = entry.metrics %}
+                        {% if m.get('median_amplitude') is not none %}
+                        <div class="metric">Amp: <span class="metric-value">{{ "%.3f"|format(m.median_amplitude) }}</span></div>
+                        {% endif %}
+                        {% if m.get('median_noise') is not none %}
+                        <div class="metric">Noise: <span class="metric-value">{{ "%.5f"|format(m.median_noise) }}</span></div>
+                        {% endif %}
+                        {% if m.get('median_coherence') is not none %}
+                        <div class="metric">Coh:
+                            <span class="{% if m.median_coherence < 0.8 %}metric-warn{% else %}metric-value{% endif %}">
+                                {{ "%.3f"|format(m.median_coherence) }}
+                            </span>
+                        </div>
+                        {% endif %}
+                        {% if m.get('median_hi_peak_db') is not none %}
+                        <div class="metric">HI:
+                            <span class="{% if m.median_hi_peak_db < 0.05 %}metric-warn{% else %}metric-value{% endif %}">
+                                {{ "%.2f"|format(m.median_hi_peak_db) }} dB
+                            </span>
+                        </div>
+                        {% endif %}
+                    {% endif %}
+                    {% if entry.get('full_metrics') %}
+                        {% set fm = entry.full_metrics %}
+                        {% if fm.get('median_sefd') is not none %}
+                        <div class="metric">SEFD:
+                            <span class="{% if fm.median_sefd > 5000 %}metric-warn{% else %}metric-value{% endif %}">
+                                {{ "%.0f"|format(fm.median_sefd) }} Jy
+                            </span>
+                        </div>
+                        {% endif %}
+                    {% endif %}
+                {% endif %}
+            </td>
+            {% endfor %}
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{% endblock %}

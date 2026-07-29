@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}SEFD Dashboard{% endblock %}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f6fa;
+            color: #2d3436;
+            line-height: 1.5;
+        }
+        nav {
+            background: #2d3436;
+            color: white;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            gap: 32px;
+        }
+        nav a { color: #dfe6e9; text-decoration: none; font-size: 14px; }
+        nav a:hover { color: white; }
+        nav .brand { font-size: 18px; font-weight: 700; color: white; }
+        nav .sources { display: flex; gap: 16px; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        h1 { margin-bottom: 16px; font-size: 24px; }
+        h2 { margin: 24px 0 12px; font-size: 20px; }
+
+        .banner {
+            background: #ffeaa7;
+            border: 1px solid #fdcb6e;
+            padding: 10px 16px;
+            border-radius: 6px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+        .banner.info { background: #dfe6e9; border-color: #b2bec3; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 10px 14px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+        }
+        th { background: #636e72; color: white; font-weight: 600; }
+        td a { text-decoration: none; }
+        tr:hover { background: #f8f9fa; }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            color: white;
+        }
+        .status-pending { background: #b2bec3; }
+        .status-light_processing, .status-full_processing { background: #0984e3; }
+        .status-light_done { background: #00b894; }
+        .status-complete { background: #00b894; }
+        .status-light_error, .status-full_error, .status-error { background: #d63031; }
+
+        .metric { font-size: 13px; color: #636e72; margin-top: 4px; }
+        .metric-value { font-weight: 700; color: #2d3436; }
+        .metric-warn { color: #d63031; font-weight: 700; }
+
+        .plot-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(500px, 1fr));
+            gap: 16px;
+            margin: 16px 0;
+        }
+        .plot-card {
+            background: white;
+            border-radius: 8px;
+            padding: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .plot-card h3 { font-size: 14px; margin-bottom: 8px; color: #636e72; }
+        .plot-card img { width: 100%; height: auto; border-radius: 4px; }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .controls label { font-size: 14px; font-weight: 600; }
+        .controls select, .controls input {
+            padding: 6px 10px;
+            border: 1px solid #b2bec3;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .btn {
+            padding: 6px 16px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            background: #0984e3;
+            color: white;
+        }
+        .btn:hover { background: #0873c4; }
+
+        .source-section {
+            margin-bottom: 32px;
+            padding: 16px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .source-section h2 {
+            margin-top: 0;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #eee;
+        }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="/" class="brand">SEFD Dashboard</a>
+        <div class="sources">
+            <a href="/">Summary</a>
+            <a href="/source/0318+164">0318+164</a>
+            <a href="/source/0521+166">0521+166</a>
+            <a href="/source/2253+161">2253+161</a>
+        </div>
+    </nav>
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    <script>
+        // Auto-refresh every 30 seconds
+        setTimeout(function() { location.reload(); }, 30000);
+    </script>
+</body>
+</html>

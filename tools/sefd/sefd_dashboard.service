@@ -1,0 +1,20 @@
+[Unit]
+# SEFD calibrator scanner (casa38). The web UI is no longer served
+# from here: dsa_monitor (h23:5778) renders state.json + results/
+# natively at the /sefds tab via sefd_view.py (see
+# dsa110-rt/tools/dashboard/dsa_monitor/sefd_view.py).
+Description=SEFD calibrator scanner (writes state.json + results/ for dsa_monitor)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/media/ubuntu/ssd/vikram/sefd/sefd_dashboard
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u sefd_scanner.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

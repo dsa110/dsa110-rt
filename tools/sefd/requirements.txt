@@ -1,0 +1,7 @@
+# SEFD Dashboard dependencies
+# All should already be available in the casa38 conda environment
+flask>=3.0
+numpy
+matplotlib
+casatools
+casatasks

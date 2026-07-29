@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}SEFD Dashboard - {{ source_name }}{% endblock %}
+{% block content %}
+
+<h1>{{ source_name }} <small style="color: #636e72;">({{ source_flux.flux_jy }} Jy)</small></h1>
+
+<div class="controls">
+    <label for="days">Lookback:</label>
+    <select id="days" onchange="window.location='/source/{{ source_name }}?days='+this.value">
+        {% for d in [7, 14, 30, 60, 90] %}
+        <option value="{{ d }}" {% if d == lookback %}selected{% endif %}>{{ d }} days</option>
+        {% endfor %}
+    </select>
+    <a href="/" class="btn">Back to Summary</a>
+</div>
+
+{% if entries|length == 0 %}
+<div class="banner info">No processed observations found for this source in the selected time range.</div>
+{% endif %}
+
+<!-- Metrics table -->
+{% if entries|length > 0 %}
+<h2>Metrics Summary</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Date</th>
+            <th>Status</th>
+            <th>Med. Amplitude</th>
+            <th>Med. Noise</th>
+            <th>Med. Coherence</th>
+            <th>HI Peak (dB)</th>
+            <th>Med. SEFD (Jy)</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for entry in entries %}
+        <tr>
+            <td><a href="/day/{{ entry.date }}">{{ entry.date }}</a></td>
+            <td><span class="status-badge status-{{ entry.status }}">{{ entry.status }}</span></td>
+            {% if 'error' in entry.status %}
+            <td colspan="5" style="text-align: left; color: #d63031; font-size: 12px;">{{ entry.get('error', 'Unknown error') }}</td>
+            {% else %}
+            {% set m = entry.get('metrics', {}) %}
+            <td>{{ "%.3f"|format(m.median_amplitude) if m.get('median_amplitude') is not none else '---' }}</td>
+            <td>{{ "%.5f"|format(m.median_noise) if m.get('median_noise') is not none else '---' }}</td>
+            <td>
+                {% if m.get('median_coherence') is not none %}
+                <span class="{% if m.median_coherence < 0.8 %}metric-warn{% else %}metric-value{% endif %}">
+                    {{ "%.3f"|format(m.median_coherence) }}
+                </span>
+                {% else %}---{% endif %}
+            </td>
+            <td>{{ "%.2f"|format(m.median_hi_peak_db) if m.get('median_hi_peak_db') is not none else '---' }}</td>
+            {% set fm = entry.get('full_metrics', {}) %}
+            <td>
+                {% if fm.get('median_sefd') is not none %}
+                <span class="{% if fm.median_sefd > 5000 %}metric-warn{% else %}metric-value{% endif %}">
+                    {{ "%.0f"|format(fm.median_sefd) }}
+                </span>
+                {% else %}---{% endif %}
+            </td>
+            {% endif %}
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+<!-- Comparison plots (per-day) -->
+{% if entries|length > 0 %}
+<h2>Per-Day Diagnostic Plots</h2>
+{% for entry in entries %}
+<div class="source-section">
+    <h2><a href="/day/{{ entry.date }}">{{ entry.date }}</a>
+        <span class="status-badge status-{{ entry.status }}">{{ entry.status }}</span>
+    </h2>
+    <div class="plot-grid">
+        {% set base = '/results/' + source_name + '/' + entry.date + '/' %}
+
+        <div class="plot-card">
+            <h3>Amplitude vs Baseline Length</h3>
+            <img src="{{ base }}amp_vs_baseline.png" alt="Amplitude vs Baseline" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>Noise vs Baseline Length</h3>
+            <img src="{{ base }}noise_vs_baseline.png" alt="Noise vs Baseline" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>Coherence vs Frequency</h3>
+            <img src="{{ base }}coherence_vs_freq.png" alt="Coherence" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>HI Spectrum</h3>
+            <img src="{{ base }}hi_spectrum.png" alt="HI Spectrum" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>Autocorrelation (XX)</h3>
+            <img src="{{ base }}autocorr_XX.png" alt="Autocorr XX" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>Autocorrelation (YY)</h3>
+            <img src="{{ base }}autocorr_YY.png" alt="Autocorr YY" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+
+        <!-- SEFD plots (if full pipeline complete) -->
+        {% if entry.status == 'complete' %}
+        <div class="plot-card">
+            <h3>SEFD Results</h3>
+            <img src="{{ base }}sefd/sefd_results.png" alt="SEFD Results" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>SEFD Bimodal Threshold</h3>
+            <img src="{{ base }}sefd/sefd_bimodal_threshold.png" alt="SEFD Bimodal" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>SEFD vs Time</h3>
+            <img src="{{ base }}sefd/sefd_vs_time.png" alt="SEFD vs Time" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>Bandpass Solutions</h3>
+            <img src="{{ base }}sefd/bandpass_solutions.png" alt="Bandpass Solutions" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        <div class="plot-card">
+            <h3>Flag Summary</h3>
+            <img src="{{ base }}sefd/flag_summary.png" alt="Flag Summary" loading="lazy"
+                 onerror="this.parentElement.style.display='none'">
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+
+{% endblock %}
