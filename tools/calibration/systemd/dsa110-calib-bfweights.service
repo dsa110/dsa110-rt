@@ -1,0 +1,65 @@
+[Unit]
+# DRAFT -- NOT INSTALLED. See MIGRATION.md in this directory.
+#
+# Bare-metal h23 replacement for the container's `bfweights_copy.service`.
+#
+# What it does: watches etcd /mon/cal/bfweights for {"cmd": "update_weights"},
+# then for each entry of CONFIG corr `ch0` rsyncs
+#   <beamformer_dir>/<weight_files[i]>  ->  <corr>.pro.pvt:<weightfile>
+#   antenna_flags.txt                   ->  <corr>.pro.pvt:<flagfile>
+# and archives a copy + the fleet YAML into <bfarchivedir> (the
+# `applied/` directory that dsa_monitor's cal_visibility.py treats as
+# ground truth for "last distributed solution").
+# Heartbeats /mon/service/bfweightcopy.
+#
+# IMPORTANT -- this is an ON-DEMAND unit, not a boot service. The operator
+# workflow (~/dsa-notebooks/update_bfweights.py, and the /sefds "Update cals"
+# button that drives it) does:
+#     systemctl --user start bfweights_copy.service
+#     ... publish /mon/cal/bfweights ... sleep 63 ...
+#     systemctl --user stop  bfweights_copy.service
+# The [Install] Alias below preserves that exact name so the operator script
+# and the dashboard need no change. `systemctl --user enable` this unit to
+# materialise the alias symlink; because there is no WantedBy=, enabling it
+# does NOT make it start at boot.
+Description=DSA-110 beamformer-weight distribution to corr nodes (on demand)
+Documentation=file:/home/ubuntu/vikram/dev/_dr_staging/calib-migration/MIGRATION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# CRITICAL: beamformerweights.py writes `antenna_flags.txt` with a RELATIVE
+# path and then rsyncs that relative name to every corr node. The working
+# directory therefore has to be writable AND stable -- if it changes, the
+# flag file silently goes somewhere else and the rsync ships whatever stale
+# antenna_flags.txt happens to be in the new CWD.
+WorkingDirectory=/home/ubuntu/servicewd
+
+EnvironmentFile=-%h/.config/dsa110-calib/dsa110-calib.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MPLBACKEND=Agg
+Environment=PATH=/home/ubuntu/anaconda3/envs/casa38/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+
+ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-shell/dsa110-calib/services/beamformerweights.py
+
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+KillMode=control-group
+# Must outlive an in-flight 16-node rsync so a `stop` never truncates a
+# weight file on a corr node.
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsa110-calib-bfweights
+
+[Install]
+# No WantedBy= on purpose: on-demand only. The alias keeps
+# `systemctl --user start bfweights_copy.service` working verbatim.
+Alias=bfweights_copy.service

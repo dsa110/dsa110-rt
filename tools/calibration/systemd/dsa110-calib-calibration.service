@@ -1,0 +1,61 @@
+[Unit]
+# DRAFT -- NOT INSTALLED. See MIGRATION.md in this directory.
+#
+# Bare-metal h23 replacement for the container's `calibration.service`.
+#
+# What it does: watches etcd /cmd/cal for {"cmd": "calibrate"}, then for each
+# calibrator pass builds a measurement set (convert_calibrator_pass_to_ms ->
+# CONFIG.msdir), runs the CASA delay/bandpass/gain calibration, publishes
+# solutions + status to /mon/cal/calibration and the caltable keys, writes
+# per-subband beamformer solutions into CONFIG.beamformer_dir, averages the
+# last 24 h of solutions, and publishes /mon/cal/bfweights
+# {"cmd": "update_weights"} -- which dsa110-calib-bfweights.service consumes.
+# Heartbeats /mon/service/calibration.
+Description=DSA-110 calibration service (measurement sets + CASA calibration)
+Documentation=file:/home/ubuntu/vikram/dev/_dr_staging/calib-migration/MIGRATION.md
+After=network-online.target
+Wants=network-online.target
+# Not a hard dependency: this service is driven purely by etcd, so it is
+# perfectly happy to start before/without the preprocessor. Ordering only.
+After=dsa110-calib-preprocess.service
+
+[Service]
+Type=simple
+
+# MUST be a writable scratch dir: CASA writes casa-<timestamp>.log into $CWD
+# on every task. In the container this accumulated ~200 GB of casa logs in
+# the services/ directory precisely because CWD was the git checkout.
+WorkingDirectory=/home/ubuntu/servicewd
+
+EnvironmentFile=-%h/.config/dsa110-calib/dsa110-calib.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MPLBACKEND=Agg
+Environment=PATH=/home/ubuntu/anaconda3/envs/casa38/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# CASA gaincal/bandpass and the beamformer averaging are the heavy step.
+# h23 also runs dsart_c2/c3 + dsa_monitor; cap the pools so a calibration
+# burst cannot starve the realtime services.
+Environment=OPENBLAS_NUM_THREADS=8
+Environment=OMP_NUM_THREADS=8
+Environment=MKL_NUM_THREADS=8
+
+ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-shell/dsa110-calib/services/calibration_service.py
+
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+KillMode=control-group
+# A calibration pass in flight can hold a partially written .ms. Give the
+# CASA child a long grace period so it is not SIGKILLed mid-write.
+TimeoutStopSec=300
+
+# Nice it below the realtime search services.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsa110-calib-calibration
+
+[Install]
+WantedBy=default.target

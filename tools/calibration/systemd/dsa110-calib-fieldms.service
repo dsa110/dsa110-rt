@@ -1,0 +1,51 @@
+[Unit]
+# DRAFT -- NOT INSTALLED. See MIGRATION.md in this directory.
+#
+# Replaces the container's crontab entry:
+#     0 */8 * * * /home/ubuntu/anaconda3/envs/casa38/bin/python \
+#         ~/proj/dsa110-shell/dsa110-calib/scripts/trigger_field_ms.py
+#
+# !! That cron job has been BROKEN: the path it names does not exist in the
+# !! container. The only copy of trigger_field_ms.py is at
+# !!   /home/ubuntu/dana/code/dsa110-calib/scripts/trigger_field_ms.py
+# !! so every 8-hourly run has been failing with "No such file or directory"
+# !! (silently -- cron mails nobody). The migration is the moment to fix it:
+# !! MIGRATION.md step 3 installs the script at the path below.
+#
+# What it does: a one-shot etcd put of
+#   /cmd/cal  {"cmd": "field", "val": {"trigname": "field<HH:MM:SS>",
+#                                      "mjds": <now mjd>}}
+# to request an off-transit "field" measurement set. Runs in ~1 s.
+#
+# NOTE: neither preprocess_service.py nor calibration_service.py handles
+# cmd == "field" -- preprocess ignores everything that is not "rsync" and
+# calibration ignores everything that is not "calibrate". The consumer is
+# realtime_calibration.py (container unit realtime_calibration.service,
+# from the /home/ubuntu/dana/code checkout), which is NOT part of this
+# migration. Enable the timer only once you have confirmed a consumer for
+# the "field" verb is running, otherwise it is a no-op put.
+Description=DSA-110 field measurement-set trigger (8-hourly, replaces cron)
+Documentation=file:/home/ubuntu/vikram/dev/_dr_staging/calib-migration/MIGRATION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/servicewd
+
+EnvironmentFile=-%h/.config/dsa110-calib/dsa110-calib.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/ubuntu/anaconda3/envs/casa38/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-shell/dsa110-calib/scripts/trigger_field_ms.py
+
+# A single etcd put. If etcd is down, fail loudly in the journal rather
+# than retrying -- the timer will try again in 8 h.
+TimeoutStartSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsa110-calib-fieldms
+
+# No [Install] section: this unit is driven exclusively by
+# dsa110-calib-fieldms.timer. Enable the TIMER, not the service.

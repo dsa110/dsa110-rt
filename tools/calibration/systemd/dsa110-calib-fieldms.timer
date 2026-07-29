@@ -1,0 +1,27 @@
+[Unit]
+# DRAFT -- NOT INSTALLED. See MIGRATION.md in this directory.
+#
+# systemd equivalent of the container crontab line "0 */8 * * *", i.e.
+# 00:00, 08:00 and 16:00. Cron ran in the container's local timezone; this
+# unit pins UTC explicitly so the trigger times cannot drift with DST --
+# everything else in the observatory (MJD, ISOT filenames) is UTC.
+Description=Run the DSA-110 field measurement-set trigger every 8 hours
+Documentation=file:/home/ubuntu/vikram/dev/_dr_staging/calib-migration/MIGRATION.md
+
+[Timer]
+Unit=dsa110-calib-fieldms.service
+OnCalendar=*-*-* 00,08,16:00:00 UTC
+
+# Spread the load off the exact minute boundary; the corr nodes and dsart
+# already do bookkeeping on the hour.
+RandomizedDelaySec=120
+AccuracySec=30s
+
+# cron silently skips runs missed while the host is down. Persistent=true
+# fires once on boot if the last window was missed -- generally what you
+# want for a calibration trigger, but set it false if a burst of catch-up
+# field MS requests after a long outage would be harmful.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

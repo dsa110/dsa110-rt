@@ -1,0 +1,54 @@
+[Unit]
+# DRAFT -- NOT INSTALLED. See MIGRATION.md in this directory.
+#
+# Bare-metal h23 replacement for the `calibration_preprocessing.service`
+# user unit that lives inside the calibration23 LXD container (and which,
+# in practice, was launched by hand inside a `screen` and therefore lost on
+# every container restart).
+#
+# What it does: watches etcd /cmd/cal for {"cmd": "rsync"} events, rsyncs
+# the named hdf5 off <hostname>.pro.pvt into CONFIG.hdf5dir, gathers the 16
+# per-subband files belonging to one timestamp, decides whether a calibrator
+# transit is contained in them, and republishes /cmd/cal with
+# {"cmd": "calibrate"} for dsa110-calib-calibration.service to pick up.
+# Also heartbeats /mon/service/calpreprocess and /mon/cal/<stage>_process.
+Description=DSA-110 calibration preprocessing (hdf5 pull + transit trigger)
+Documentation=file:/home/ubuntu/vikram/dev/_dr_staging/calib-migration/MIGRATION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# CASA drops casa-<timestamp>.log into $CWD and dsacalib writes a few
+# relative-path scratch files; servicewd keeps that mess out of the git
+# checkout (this mirrors the container units, which all used servicewd).
+WorkingDirectory=/home/ubuntu/servicewd
+
+EnvironmentFile=-%h/.config/dsa110-calib/dsa110-calib.env
+Environment=PYTHONUNBUFFERED=1
+Environment=MPLBACKEND=Agg
+Environment=PATH=/home/ubuntu/anaconda3/envs/casa38/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Preprocessing is I/O bound (rsync + h5py header reads). Keep BLAS pools
+# tiny so this never competes with dsart_c2/c3 or the calibration service.
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+
+ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-shell/dsa110-calib/services/preprocess_service.py
+
+Restart=on-failure
+RestartSec=15
+# The service spawns three non-daemon multiprocessing children (rsync /
+# gather / assess). KillMode=control-group ensures they die with the unit
+# instead of being reparented to PID 1 on restart.
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsa110-calib-preprocess
+
+[Install]
+WantedBy=default.target
