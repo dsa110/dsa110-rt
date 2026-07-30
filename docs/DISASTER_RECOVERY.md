@@ -21,7 +21,7 @@ things that are not in git.
 | `/media/ubuntu/data` (sdg) | that disk's contents | no parity |
 | **h23 root NVMe** | **the whole control plane** — see §3 | only with this runbook |
 | A corr/search node NVMe | that node's pipeline | yes — reprovision, see `dsa110-shell/deploy/` |
-| `lxd110h20` (what just happened) | etcd, InfluxDB, Grafana; DNS records for `n20`/etcd vanish | yes, but nothing on it was backed up |
+| `lxd110h20` (what just happened) | etcd, InfluxDB, Grafana, webserverUI; **all four service DNS aliases go NXDOMAIN** | yes — rebuilt 2026-07-30, see §7 |
 | **`lxd110maas`** | **all node rebuilds break silently** | now mirrored — see §5 |
 | **`dsa110maas`** | MaaS/DNS/DHCP for the whole cluster | now backed up — see §5 |
 
@@ -64,10 +64,32 @@ Disk redundancy as measured 2026-07-28:
    `dsart_c2`, `dsart_c3`, and `dsa110-operator-supervisor-h23` all exit or
    crash-loop on `etcd3.exceptions.ConnectionFailedError`. That is a symptom,
    not the disease.
-5. **DNS**: MaaS drops A records for machines not in `Deployed` state. When a
-   host is in Rescue mode its name stops resolving cluster-wide. Known
-   addresses: `lxd110h20` = 10.42.0.249 (pro) / 10.41.0.145 (sas),
-   etcd = 10.42.0.126, influx = 10.42.0.127, `lxd110h17` = 10.42.0.148.
+5. **DNS**: when a host leaves `Deployed` state its name stops resolving
+   cluster-wide. The mechanism, established 2026-07-30, is worse than "MaaS
+   drops A records":
+
+   - MaaS's **default** domain is `sas.pvt`, which is `authoritative=False` and
+     is **not served by BIND at all**. Every machine MaaS commissions gets a
+     name that can never resolve — which is also why `corrNN.sas.pvt` in the
+     legacy `deploy` scripts is dead.
+   - So every operational name is a hand-created `pro.pvt` **dnsresource**, and
+     those were bound to `alloc_type: Observed` (DHCP-discovered) addresses on a
+     specific machine interface. When the machine left `Deployed`, the address
+     went null and **the alias itself disappeared** — `etcdv3service.pro.pvt`,
+     `influxdbservice.pro.pvt`, `grafanaservice.pro.pvt` and
+     `webserverUIservice.pro.pvt` all went NXDOMAIN together.
+
+   They are now **CNAMEs to `lxd110h20.pro.pvt`**, a single literal A record —
+   one place to change, and reboots/rescue/redeploy no longer delete the names.
+   Verify with `dig +noall +answer etcdv3service.pro.pvt`, which should show
+   `CNAME lxd110h20.pro.pvt` → `A`.
+
+   Current addresses: `lxd110h20` (the new one, ex-h24) = 10.42.0.228 (pro) /
+   10.41.0.254 (sas), `lxd110h23` = 10.42.0.232, `lxd110h17` = 10.42.0.148.
+   10.42.0.126/.127 are *legacy LXD container* device reservations
+   (`etcdv3service2`, `influxdbservice2`) and are **not** the bare-metal
+   services. `dsa110maas` = 10.42.0.4 (also the resolver), `lxd110maas` =
+   10.42.0.3.
 
 ---
 
@@ -214,3 +236,57 @@ single most valuable next step.
 7. MaaS postgres has no *scheduled* backup — only the manual dump in §5.
 8. `dsart_c2` is not `enable`d; `/media/ubuntu/data` is not in fstab; sysctl
    tuning does not persist.
+9. `etcdWx` (weather → etcd `/mon/wx` → influx `wxmon`) ran on the old h20 and
+   **no binary, unit or source for it survives** anywhere we have looked — not
+   in the staged install artifacts, not on the upstream artifact server. `wxmon`
+   stays empty until it is rebuilt. (It was already crash-looping before the
+   outage, so this is not a regression.)
+10. Several `dsa110-cnf` YAMLs are **uncommitted** in git
+    (`config_dsa96_corr.yaml`, `config_dsa96_search.yaml`, `corr_setup_96.yaml`,
+    `config_dsa64_search_normal.yaml`), so the live legacy configs exist only on
+    disk. There is also no recorded mapping from `/cnf/<key>` to source YAML —
+    `dsautils/conf/cnfConfig.yml` lists the keys but not their files.
+
+---
+
+## 7. Rebuilding the monitoring host (lxd110h20)
+
+Done 2026-07-30 by promoting the spare `lxd110h24` after the original h20's
+NVMe died. **Full procedure, fixed start scripts, systemd units and configs are
+in `dsa110-shell/deploy/h20-services/`** — read that README first; it documents
+six real defects in the container-era scripts.
+
+Outline:
+
+1. **Retire the dead machine in MaaS**: exit rescue mode → release (with disk
+   erasing **off**; `enable_disk_erasing_on_release` is already `false`) →
+   rename aside (`lxd110h20-deadnvme`) rather than delete, so its hardware,
+   power and MAC inventory survive. MaaS hostnames are unique, so the rename is
+   what frees the name.
+2. **Rename the replacement** to `lxd110h20` in MaaS, then `hostnamectl` +
+   `/etc/hosts` on the host. `preserve_hostname: false`, so cloud-init would
+   also set it from MaaS metadata on the next boot.
+3. **Rebuild the DNS aliases as CNAMEs** onto one literal A record (see §2.5).
+4. **Authorise h23's key.** Only h23's *passphrase-less* key works
+   non-interactively — `id_ed25519` is passphrase-protected, so BatchMode SSH
+   and any cron/tooling path silently fails with `Permission denied (publickey)`
+   even though the server accepts the key. Also clear the old host key:
+   `ssh-keygen -R lxd110h20.pro.pvt`, or every connection aborts with
+   `POSSIBLE DNS SPOOFING DETECTED`.
+   ⚠ Append with a leading newline — the shipped `authorized_keys` had **no
+   trailing newline**, so a naive `echo >>` corrupts the last key *and* yours.
+5. **Install the services** per the `deploy/h20-services/` README.
+6. **Repopulate etcd**: `python tools/ops/push_dsart_to_etcd.py --instance all`
+   for `/cnf/pipeline_rt` and `/cnf/search_rt`. Round-trip differs only by
+   integer dict keys becoming strings through JSON, which consumers cast back
+   (`c3.py`: `corr[int(chg)]`). `/cnf/inject/active/*`, `/cnf/spectral_line` and
+   `/cnf/c2/*` are runtime/operator state, not version-controlled config, and
+   default correctly when absent.
+7. **Grafana**: the tarball ships a 2019 `grafana.db`, so the legacy dashboards
+   (`DSA110-WX`, `Antenna Monitor`, `DSA119`, `Etcd`, `calibration`, …) survive
+   a total host loss — but the instance does **not** start at `admin/admin`, and
+   its datasources point at the long-dead `dsahead.ovro.pvt`. Repoint the
+   `InfluxDB` datasource at `127.0.0.1:8086` and set a new admin password
+   (`GRAFANA_AUTH` in `~/.dsart/secrets.env` on h23). The `dsartRtMpV1`
+   dashboard re-imports from
+   `tools/dashboard/dsart_rt_to_influx/grafana/dsart_rt_dashboard.json`.
