@@ -3292,6 +3292,153 @@ def api_status():
     }))
 
 
+# ---------- Control tab: antenna + SNAP control -----------------------------
+#
+# Replaces the antenna/SNAP surfaces of the retired webserverUIservice on
+# lxd110h20 (its scheduling half is deliberately not carried over). Both are
+# plain etcd writes; see antenna_snap_control for the payload contracts and
+# the reasons they are shaped the way they are.
+
+
+@app.route("/control/antenna", methods=["POST"])
+def control_antenna():
+    """Command antenna elevation / noise diodes.
+
+    Form fields:
+      ``antennas``  free text: ``"24"``, ``"1,5,7-9"``, or **empty for all**
+                    (empty writes the single broadcast key /cmd/ant/0).
+      ``action``    ``move`` | ``noise_a_on`` | ``noise_b_on`` | ``halt``
+      ``elevation`` degrees, required for ``move`` (guarded 0-143 here
+                    because hwmc does no range checking whatsoever)
+      ``state``     ``true``/``false`` for the noise-diode actions
+      ``confirm``   literal ``move`` for every move, single-antenna included
+                    (operator's choice 2026-07-31)
+    """
+    import antenna_snap_control as asc                            # local
+
+    f = request.form if request.form else (request.get_json(silent=True) or {})
+    action = (f.get("action") or "").strip().lower()
+    if action not in asc.ANT_VERBS:
+        return jsonify({"ok": False, "error":
+                        f"action must be one of {list(asc.ANT_VERBS)}"}), 400
+
+    try:
+        antennas = asc.parse_antennas(f.get("antennas"))
+    except asc.SelectionError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    val = None
+    if action == "move":
+        # Confirmation on EVERY move, not just broadcast: dishes are heavy.
+        if (f.get("confirm") or "").strip().lower() != "move":
+            return jsonify({"ok": False, "error":
+                            "type the literal word 'move' to confirm — this "
+                            "slews real dishes"}), 400
+        try:
+            val = asc.validate_elevation(f.get("elevation"))
+        except asc.SelectionError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+    elif action in ("noise_a_on", "noise_b_on"):
+        raw = (f.get("state") or "").strip().lower()
+        if raw not in ("true", "false", "on", "off", "1", "0"):
+            return jsonify({"ok": False, "error":
+                            "state must be true/false"}), 400
+        val = raw in ("true", "on", "1")
+
+    scope = "ALL (broadcast /cmd/ant/0)" if not antennas else \
+            ",".join(str(a) for a in antennas)
+    actor = f.get("user") or request.remote_addr or "anon"
+    try:
+        keys = asc.send_ant_command(control_store, antennas, action, val)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("send_ant_command failed")
+        try:
+            audit_log(control_store, namespace="ant.command", cn_target="h23",
+                      cmd=action, val={"antennas": scope, "val": val},
+                      ok=False, note=str(exc), user=actor)
+        except Exception:                                          # noqa: BLE001
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    try:
+        audit_log(control_store, namespace="ant.command", cn_target="h23",
+                  cmd=action, val={"antennas": scope, "val": val},
+                  ok=True, note=f"{len(keys)} key(s)", user=actor)
+    except Exception:                                              # noqa: BLE001
+        LOG.warning("audit_log failed for antenna command", exc_info=True)
+
+    return jsonify({"ok": True, "action": action, "val": val,
+                    "scope": scope, "keys": keys})
+
+
+@app.route("/control/snap", methods=["POST"])
+def control_snap():
+    """Send one of the five permitted SNAP verbs.
+
+    Form fields:
+      ``snaps``   free text: ``"3"``, ``"1-8"``, or **empty for all 1-32**
+                  (SNAPs have no broadcast key, so empty really is 32 writes)
+      ``action``  ``arm`` | ``progonly`` | ``prong`` | ``set_delay`` | ``level``
+    """
+    import antenna_snap_control as asc                            # local
+
+    f = request.form if request.form else (request.get_json(silent=True) or {})
+    action = (f.get("action") or "").strip().lower()
+    if action not in asc.SNAP_VERBS:
+        return jsonify({"ok": False, "error":
+                        f"action must be one of {list(asc.SNAP_VERBS)}"}), 400
+    try:
+        snaps = asc.parse_snaps(f.get("snaps"))
+    except asc.SelectionError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    scope = "ALL 1-32" if not snaps else ",".join(str(s) for s in snaps)
+    actor = f.get("user") or request.remote_addr or "anon"
+    try:
+        keys = asc.send_snap_command(control_store, snaps, action)
+    except asc.SelectionError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.exception("send_snap_command failed")
+        try:
+            audit_log(control_store, namespace="snap.command", cn_target="h23",
+                      cmd=action, val={"snaps": scope}, ok=False,
+                      note=str(exc), user=actor)
+        except Exception:                                          # noqa: BLE001
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    try:
+        audit_log(control_store, namespace="snap.command", cn_target="h23",
+                  cmd=action, val={"snaps": scope}, ok=True,
+                  note=f"{len(keys)} key(s)", user=actor)
+    except Exception:                                              # noqa: BLE001
+        LOG.warning("audit_log failed for SNAP command", exc_info=True)
+
+    return jsonify({"ok": True, "action": action, "scope": scope,
+                    "keys": keys})
+
+
+@app.route("/control/snap_armed", methods=["GET"])
+def control_snap_armed():
+    """armed_mjd for every SNAP, with elapsed time — polled by the panel.
+
+    55000.0 is dsaX_snap's "never armed" sentinel, not a timestamp, so it is
+    reported as not-armed. A missing key (snap.py not running) is reported
+    distinctly from the sentinel so the operator can tell them apart.
+    """
+    import antenna_snap_control as asc                            # local
+    try:
+        rows = asc.get_snap_armed(control_store)
+    except Exception as exc:                                      # noqa: BLE001
+        LOG.exception("get_snap_armed failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    for r in rows:
+        r["age_human"] = asc.format_age(r.get("age_s"))
+    return jsonify({"ok": True, "rows": rows,
+                    "armed_count": sum(1 for r in rows if r["armed"])})
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------

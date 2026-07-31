@@ -169,6 +169,8 @@
         <li><a href="#panel-spectral-line">Spectral-line mode (SPL)</a></li>
         <li><a href="#panel-delete-snr-cal">Delete fluence/SNR calibration</a></li>
         <li><a href="#panel-clear-sidereal-vetos">Clear sidereal (l,m) vetos</a></li>
+        <li><a href="#panel-antenna">Antenna control (elevation / noise diode)</a></li>
+        <li><a href="#panel-snap">SNAP control (arm / prog / delay / level)</a></li>
         <li><a href="#panel-audit">Recent actions</a></li>
     </ul>
 </nav>
@@ -1878,6 +1880,183 @@ async function submitDeleteSnrCal(ev, dryRun) {
 </script>
 
 <!-- BOTTOM: audit log -->
+<!-- ===================== Antenna control ===================================
+     Replaces the antenna half of the retired webserverUIservice. Plain etcd
+     writes to /cmd/ant/<n>; an EMPTY antenna box writes the single broadcast
+     key /cmd/ant/0, which every antenna in hwmc already watches.
+     Elevation is guarded 0-143 here because hwmc does no range check at all. -->
+<div class="panel" style="margin-top: 24px;" id="panel-antenna">
+    <h3>Antenna control (elevation / noise diode)</h3>
+    <p style="margin-top:0;">
+        Antenna numbers: <code>24</code>, <code>1,5,7-9</code>, or
+        <strong>leave empty for ALL antennas</strong>
+        (writes the broadcast key <code>/cmd/ant/0</code>).
+    </p>
+
+    <div style="margin-bottom:10px;">
+        <label>Antennas
+            <input type="text" id="ant-sel" placeholder="empty = all"
+                   size="22" autocomplete="off">
+        </label>
+        <span id="ant-scope" style="margin-left:10px; font-weight:bold;"></span>
+    </div>
+
+    <fieldset style="margin-bottom:10px;">
+        <legend>Elevation</legend>
+        <label>Degrees
+            <input type="number" id="ant-el" step="0.1" min="0" max="143"
+                   size="8" placeholder="0-143">
+        </label>
+        <label style="margin-left:10px;">Type <code>move</code> to confirm
+            <input type="text" id="ant-confirm" size="8" autocomplete="off">
+        </label>
+        <button type="button" onclick="sendAnt('move')">Move</button>
+        <button type="button" onclick="sendAnt('halt')"
+                style="margin-left:14px;">Halt</button>
+        <div style="font-size:90%; color:#a00; margin-top:4px;">
+            Every move needs the confirm word — including a single antenna.
+            Allowed range 0&ndash;143&deg;; hwmc itself does not check.
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Noise diodes</legend>
+        <button type="button" onclick="sendAnt('noise_a_on','true')">A on</button>
+        <button type="button" onclick="sendAnt('noise_a_on','false')">A off</button>
+        <button type="button" onclick="sendAnt('noise_b_on','true')"
+                style="margin-left:14px;">B on</button>
+        <button type="button" onclick="sendAnt('noise_b_on','false')">B off</button>
+    </fieldset>
+
+    <pre id="ant-result" style="margin-top:10px; min-height:1.2em;"></pre>
+</div>
+
+<!-- ===================== SNAP control ======================================
+     /cmd/snap/<n> for n in 1..32. All five verbs are zero-argument.
+     There is NO broadcast key for SNAPs, so "empty" fans out to 32 writes.
+     armed_mjd comes from /mon/snap/<n>/armed_mjd; 55000.0 is dsaX_snap's
+     "never armed" sentinel, not a timestamp. -->
+<div class="panel" style="margin-top: 24px;" id="panel-snap">
+    <h3>SNAP control (arm / prog / delay / level)</h3>
+    <p style="margin-top:0;">
+        SNAP numbers 1&ndash;32: <code>3</code>, <code>1-8</code>, or
+        <strong>leave empty for ALL 32</strong>
+        (no broadcast key exists, so this sends 32 separate commands).
+    </p>
+
+    <div style="margin-bottom:10px;">
+        <label>SNAPs
+            <input type="text" id="snap-sel" placeholder="empty = all 1-32"
+                   size="22" autocomplete="off">
+        </label>
+        <button type="button" onclick="sendSnap('arm')">arm</button>
+        <button type="button" onclick="sendSnap('progonly')">progonly</button>
+        <button type="button" onclick="sendSnap('prong')">prong</button>
+        <button type="button" onclick="sendSnap('set_delay')">set_delay</button>
+        <button type="button" onclick="sendSnap('level')">level</button>
+    </div>
+    <pre id="snap-result" style="min-height:1.2em;"></pre>
+
+    <h4 style="margin-bottom:4px;">
+        armed_mjd
+        <span id="snap-armed-count" style="font-weight:normal;"></span>
+    </h4>
+    <div style="font-size:90%; color:#555; margin-bottom:6px;">
+        Age is time since <code>arm</code>. &ldquo;no key&rdquo; means nothing has
+        published for that SNAP (snap.py not running); &ldquo;sentinel&rdquo;
+        means it has been programmed but never armed.
+    </div>
+    <table id="snap-armed-table" style="font-size:92%;">
+        <thead><tr><th>SNAP</th><th>armed_mjd</th><th>age</th><th>state</th></tr></thead>
+        <tbody></tbody>
+    </table>
+</div>
+
+<script>
+function _antScopeLabel() {
+    var v = (document.getElementById("ant-sel").value || "").trim();
+    return v === "" ? "ALL antennas (broadcast)" : v;
+}
+document.addEventListener("DOMContentLoaded", function () {
+    var sel = document.getElementById("ant-sel");
+    if (sel) {
+        var upd = function () {
+            document.getElementById("ant-scope").textContent =
+                "→ " + _antScopeLabel();
+        };
+        sel.addEventListener("input", upd); upd();
+    }
+});
+
+function sendAnt(action, state) {
+    var out = document.getElementById("ant-result");
+    var body = new URLSearchParams();
+    body.append("action", action);
+    body.append("antennas", document.getElementById("ant-sel").value || "");
+    if (action === "move") {
+        body.append("elevation", document.getElementById("ant-el").value || "");
+        body.append("confirm", document.getElementById("ant-confirm").value || "");
+    }
+    if (state !== undefined) { body.append("state", state); }
+    out.textContent = "sending " + action + " to " + _antScopeLabel() + " ...";
+    fetch("/control/antenna", {method: "POST", body: body})
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+            if (j.ok) {
+                out.textContent = "OK  " + j.action +
+                    (j.val !== null && j.val !== undefined ? " val=" + j.val : "") +
+                    "  scope=" + j.scope + "  keys=" + j.keys.length;
+                document.getElementById("ant-confirm").value = "";
+            } else {
+                out.textContent = "REFUSED: " + j.error;
+            }
+        })
+        .catch(function (e) { out.textContent = "error: " + e; });
+}
+
+function sendSnap(action) {
+    var out = document.getElementById("snap-result");
+    var body = new URLSearchParams();
+    body.append("action", action);
+    body.append("snaps", document.getElementById("snap-sel").value || "");
+    out.textContent = "sending " + action + " ...";
+    fetch("/control/snap", {method: "POST", body: body})
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+            out.textContent = j.ok
+                ? "OK  " + j.action + "  scope=" + j.scope + "  keys=" + j.keys.length
+                : "REFUSED: " + j.error;
+            if (j.ok) { refreshSnapArmed(); }
+        })
+        .catch(function (e) { out.textContent = "error: " + e; });
+}
+
+function refreshSnapArmed() {
+    fetch("/control/snap_armed")
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+            var tb = document.querySelector("#snap-armed-table tbody");
+            if (!tb) { return; }
+            if (!j.ok) { tb.innerHTML = "<tr><td colspan=4>" + j.error + "</td></tr>"; return; }
+            document.getElementById("snap-armed-count").textContent =
+                "(" + j.armed_count + " of " + j.rows.length + " armed)";
+            tb.innerHTML = j.rows.map(function (r) {
+                var state = r.armed ? "armed" : (r.reason || "-");
+                var col = r.armed ? "#060" : "#a00";
+                return "<tr><td>" + r.snap + "</td><td>" +
+                    (r.armed_mjd === null ? "--" : r.armed_mjd.toFixed(5)) +
+                    "</td><td>" + r.age_human + "</td>" +
+                    "<td style='color:" + col + "'>" + state + "</td></tr>";
+            }).join("");
+        })
+        .catch(function () {});
+}
+document.addEventListener("DOMContentLoaded", function () {
+    refreshSnapArmed();
+    setInterval(refreshSnapArmed, 10000);
+});
+</script>
+
 <div class="panel" style="margin-top: 24px;" id="panel-audit">
     <h3>Recent actions ({{ recent_audit|length }})</h3>
     {% if recent_audit %}
