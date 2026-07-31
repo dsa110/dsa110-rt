@@ -48,9 +48,17 @@ LOG = logging.getLogger("dsa_monitor.bfweights_update")
 #: ``/operations/beamformer_weights/generated/``).
 GENERATED_DIR = "/dataz/dsa110/operations/beamformer_weights/generated"
 
-CONTAINER = "calibration23"
-CONTAINER_WORKDIR = "/home/ubuntu/dsa-notebooks"
-CONTAINER_PYTHON = "/home/ubuntu/anaconda3/envs/casa38/bin/python"
+# 2026-07-31: the calibration23 LXC container is gone -- the calibration
+# services now run as native systemd --user units on h23 (see
+# tools/calibration/MIGRATION.md), so `lxc exec calibration23` would now fail
+# outright. The update runs locally instead.
+#
+# The dashboard already runs as `ubuntu` with a live user session (linger on),
+# so the XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS the container invocation had
+# to inject by hand are inherited -- update_bfweights.py can reach
+# `systemctl --user` for bfweights_copy.service without them.
+UPDATE_WORKDIR = "/home/ubuntu/vikram/dev/dsa110-rt/tools/calibration/scripts"
+UPDATE_PYTHON = "/home/ubuntu/anaconda3/envs/casa38/bin/python"
 UPDATE_SCRIPT = "update_bfweights.py"
 
 #: The script itself sleeps ~63 s and the averaging step reads/writes
@@ -193,29 +201,23 @@ def latest_descriptors(
 def _build_cmd(descriptor: str, *, dry_run: bool) -> List[str]:
     """The full h23-side argv for one update run.
 
-    Runs as ``ubuntu`` inside the container with the user-session env
-    the script needs (``systemctl --user`` for bfweights_copy.service
-    requires XDG_RUNTIME_DIR / the user bus; ubuntu has linger on).
+    Runs directly on h23 in the casa38 env. This was previously wrapped in
+    ``lxc exec calibration23 -- sudo -u ubuntu ...``; that container no longer
+    exists, so the wrapper is removed rather than retargeted.
     """
     inner = (
-        f"cd {CONTAINER_WORKDIR} && "
-        f"exec {CONTAINER_PYTHON} -u {UPDATE_SCRIPT} "
+        f"cd {UPDATE_WORKDIR} && "
+        f"exec {UPDATE_PYTHON} -u {UPDATE_SCRIPT} "
         f"{shlex.quote(descriptor)}"
     )
     if dry_run:
         inner = (
-            f"cd {CONTAINER_WORKDIR} && ls -l {UPDATE_SCRIPT} && "
-            f"{CONTAINER_PYTHON} -c 'print(\"casa38 import check\")' && "
-            f"echo 'DRY-RUN: would exec {CONTAINER_PYTHON} -u "
+            f"cd {UPDATE_WORKDIR} && ls -l {UPDATE_SCRIPT} && "
+            f"{UPDATE_PYTHON} -c 'print(\"casa38 import check\")' && "
+            f"echo 'DRY-RUN: would exec {UPDATE_PYTHON} -u "
             f"{UPDATE_SCRIPT} {descriptor}'"
         )
-    return [
-        "lxc", "exec", CONTAINER, "--",
-        "sudo", "-u", "ubuntu",
-        "XDG_RUNTIME_DIR=/run/user/1000",
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
-        "bash", "-c", inner,
-    ]
+    return ["bash", "-c", inner]
 
 
 def _audit(store: Any, *, user: str, note: str, val: Dict[str, Any]) -> None:
