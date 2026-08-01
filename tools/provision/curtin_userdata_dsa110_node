@@ -1,0 +1,167 @@
+#cloud-config
+#
+# MaaS curtin userdata for a DSA-110 corr or search node.
+#
+# Scope is deliberately narrow: only what must exist before first boot.
+# Packages, the ubuntu user, NTP, sysctl and the netplan/MTU. Everything
+# else -- CUDA, conda, repos, native builds, dsart -- is done by
+# tools/provision/provision_node.sh, which is idempotent, re-runnable
+# and has a dry-run mode. A cloud-init per-once hook has none of those
+# properties and fails into a log nobody reads.
+#
+# Differences from the legacy curtin_userdata_ubuntu_amd64_generic_bionic
+# this replaces for dsart nodes:
+#
+#   * no LXD. The cluster join and `lxc launch ubuntu:16.04 corrNN` steps
+#     are gone: dsart runs on bare metal, not in a corr container.
+#   * no `apt-get install cuda`. That floats to whatever is newest and
+#     would give a node a different CUDA from the other 15.
+#   * no anaconda3. dsart runs from miniforge3.
+#   * every URL uses the literal MaaS IP. The legacy file mixed
+#     http://10.42.0.3/maas with http://lxd110maas.ovro.pvt/maas, and
+#     that hostname does not resolve -- steps using it fetched nothing
+#     and carried on silently.
+#
+# SSH keys and accounts are NOT here. MaaS injects the keys registered
+# against the deploying user on every deploy; nothing key-shaped belongs
+# in a file that is mirrored to a public repo.
+#
+# Install to the MaaS region controller's preseed directory as
+# curtin_userdata_ubuntu_amd64_generic_bionic_<hostname> to scope it to
+# one machine, or without the suffix to apply fleet-wide. Confirm the
+# path with `maas $PROFILE maas get-config name=...` before installing --
+# it differs between deb and snap installs.
+
+debconf_selections:
+ maas: |
+  {{for line in str(curtin_preseed).splitlines()}}
+  {{line}}
+  {{endfor}}
+
+early_commands:
+  driver_00: ["sh", "-c", "echo 'third party drivers not required at install time'"]
+
+late_commands:
+  maas: [wget, '--no-proxy', {{node_disable_pxe_url|escape.json}}, '--post-data', {{node_disable_pxe_data|escape.json}}, '-O', '/dev/null']
+
+  00_start:   ["curtin", "in-target", "--", "echo", "#### DSA-110 node: base packages ####"]
+
+  # Build toolchain + libraries the native stack needs. gcc stays at the
+  # distro default (7): CUDA 11.1's nvcc rejects gcc >= 10.
+  10_pkgs: ["curtin", "in-target", "--", "apt", "-y", "install",
+            "build-essential", "gcc", "g++", "gfortran", "make", "autoconf",
+            "automake", "libtool", "pkg-config", "git", "curl", "wget",
+            "myrepos", "csh", "emacs25-nox", "libnuma-dev", "ethtool",
+            "zfsutils-linux", "syslog-ng", "prometheus-node-exporter"]
+
+  # Time. The fabric needs the fleet on one clock; MaaS's default
+  # systemd-timesyncd is replaced by ntp against the observatory server.
+  20_ntp:      ["curtin", "in-target", "--", "apt", "-y", "install", "ntp"]
+  21_ntp_pool: ["curtin", "in-target", "--", "sed", "-i", "s/^pool/#pool/", "/etc/ntp.conf"]
+  22_ntp_srv:  ["curtin", "in-target", "--", "sed", "-i", "-e", "$aserver 192.168.0.10", "/etc/ntp.conf"]
+  23_ntp_en:   ["curtin", "in-target", "--", "systemctl", "enable", "ntp"]
+  24_tsd_dis:  ["curtin", "in-target", "--", "systemctl", "disable", "systemd-timesyncd"]
+  25_tsd_stop: ["curtin", "in-target", "--", "systemctl", "stop", "systemd-timesyncd"]
+
+  # LXD is not used on a dsart node and its bridge would collide with
+  # the data fabric.
+  30_lxd_rm:   ["curtin", "in-target", "--", "apt", "-y", "remove", "--purge", "lxd"]
+  31_autorm:   ["curtin", "in-target", "--", "apt", "-y", "autoremove"]
+
+  # The ubuntu user owns everything under /home/ubuntu/proj. MaaS adds
+  # the deploying user's registered SSH keys itself.
+  40_user:     ["curtin", "in-target", "--", "sh", "-c",
+                "id ubuntu >/dev/null 2>&1 || useradd -m -d /home/ubuntu -s /bin/bash ubuntu"]
+  41_projdir:  ["curtin", "in-target", "--", "mkdir", "-p", "/home/ubuntu/proj", "/home/ubuntu/data"]
+  42_owner:    ["curtin", "in-target", "--", "chown", "-R", "ubuntu:ubuntu", "/home/ubuntu"]
+
+  99_done:     ["curtin", "in-target", "--", "echo", "#### DSA-110 node: base done ####"]
+
+write_files:
+  # --- kernel tuning --------------------------------------------------
+  # Applied at first boot so the capture has its buffers before anything
+  # tries to use them. Same values as config/sysctl/set_sysctl, written
+  # to their own file so re-provisioning cannot duplicate lines in
+  # /etc/sysctl.conf the way the append-based legacy script does.
+  sysctl:
+    path: /etc/sysctl.d/99-dsa110-node.conf
+    permissions: '0644'
+    content: |
+      # DSA-110 node tuning. Managed by tools/provision.
+      #
+      # rmem_max gates SO_RCVBUF: search_rx asks for 256 MB and the
+      # kernel silently clamps to this value. At the 208 KB default the
+      # capture drops packets with nothing in any log to explain it.
+      net.core.rmem_max = 536870912
+      net.core.wmem_max = 536870912
+      net.core.rmem_default = 16777216
+      net.core.wmem_default = 16777216
+      net.core.optmem_max = 16777216
+      net.core.netdev_max_backlog = 250000
+      # PSRDADA allocates ~33 GiB of SysV shm across ~450 segments.
+      kernel.shmmax = 68719476736
+      kernel.shmall = 4294967296
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.tcp_timestamps = 0
+      net.ipv4.tcp_sack = 0
+      net.ipv4.tcp_low_latency = 1
+      net.ipv4.tcp_adv_win_scale = 1
+      net.ipv4.tcp_mem = 16777216 16777216 16777216
+      net.ipv4.tcp_rmem = 4096 87380 16777216
+      net.ipv4.tcp_wmem = 4096 87380 16777216
+
+  apply_sysctl:
+    path: /var/lib/cloud/scripts/per-once/10_sysctl.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "applying DSA-110 sysctl tuning"
+      sysctl -p /etc/sysctl.d/99-dsa110-node.conf
+
+  # --- data-fabric MTU -------------------------------------------------
+  mtu9000:
+    path: /var/lib/cloud/scripts/per-once/20_mtu9000.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      #
+      # Jumbo frames on the 10.41 data fabric. SNAP packets assume 9000;
+      # at 1500 they fragment and the capture falls apart.
+      #
+      # Per-host netplan, because the interface differs by role: corr
+      # carries the fabric on the raw Mellanox port (enp129s0f0), search
+      # on a bridge (br2). Fetch the file named for this host; if there
+      # isn't one, leave netplan alone and say so rather than guessing.
+      WEB_MAAS="http://10.42.0.3/maas"
+      hn=$(hostname -s)
+      fn="${hn}-50-cloud-init.yaml"
+      cd /run || exit 0
+      if curl -fsSLO "$WEB_MAAS/config/netplan/$fn"; then
+          echo "installing netplan $fn"
+          mv -f "/run/$fn" /etc/netplan/50-cloud-init.yaml
+          netplan apply
+      else
+          echo "WARNING: no per-host netplan at $WEB_MAAS/config/netplan/$fn"
+          echo "WARNING: data fabric MTU left at default; fix before observing"
+      fi
+
+  # --- hand-off note ----------------------------------------------------
+  next_steps:
+    path: /home/ubuntu/PROVISION_NEXT_STEPS.txt
+    permissions: '0644'
+    content: |
+      This node has the base install only: packages, user, NTP, sysctl,
+      netplan/MTU.
+
+      CUDA, conda, the repos, the native builds and dsart are NOT
+      installed yet. To finish, from the node as root:
+
+        git clone https://github.com/dsa110/dsa110-rt.git /home/ubuntu/proj/dsa110-rt
+        cd /home/ubuntu/proj/dsa110-rt/tools/provision
+        ./provision_node.sh --role corr   --dry-run     # or --role search
+        ./provision_node.sh --role corr   --apply --log /var/log/dsa-provision.log
+        ./provision_node.sh --role corr   --only verify
+
+      dsart_rt is NOT started by provisioning. Bring the node into the
+      fleet with tools/ops/_m75_phaseB_16x4_launch.sh from h23 when
+      ready.
