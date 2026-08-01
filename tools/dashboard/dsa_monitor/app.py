@@ -342,8 +342,8 @@ def _clamp_ant_idx(s: Optional[str]) -> int:
 
 @app.route("/")
 def index():
-    # Default tab = Antennas/RFI.
-    return antennas_rfi()
+    # Default tab = Control.
+    return control_page()
 
 
 @app.route("/antennas", methods=["GET"])
