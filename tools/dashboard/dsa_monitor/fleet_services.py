@@ -376,6 +376,26 @@ def _query_systemd_unit(
     }
 
 
+def _parse_etimes_age(stdout: str) -> float | None:
+    """Age in seconds from an ``AGE_S=<elapsed>`` marker line.
+
+    Emitted by the process-kind probe from ``ps -o etimes=``. Returns
+    None when the marker is absent or unparseable, so a shell that
+    lacks ``xargs``/``ps`` degrades to a blank age rather than an error.
+    """
+    if not stdout:
+        return None
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("AGE_S="):
+            continue
+        try:
+            return max(0.0, float(line.split("=", 1)[1].strip()))
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
 def _parse_active_enter_age(stdout: str) -> float | None:
     """Parse ``ActiveEnterTimestamp=... UTC`` lines into a wall-clock
     age in seconds. Returns None if the unit never entered active
@@ -423,14 +443,34 @@ def _query_process(
     # argv from _m75_phaseB_16x4_launch.sh.
     if entry.instance:
         pattern = f"{entry.service}.*-in {entry.instance}"
-    remote = f"pgrep -af {pattern!r}"
+    # Bracket the first character ("dsart_rt" -> "[d]sart_rt"). ssh runs
+    # this through a shell whose own argv contains the pattern, so a bare
+    # pgrep -f matches that wrapper: liveness came back active even when
+    # the real process was gone, and the PID lookup below picked the
+    # freshly-spawned wrapper (age 0) instead of the service. The
+    # bracketed form still matches the real argv but never the literal
+    # pattern text the wrapper carries.
+    probe = f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
+    # Report an age too. pgrep gives liveness but no start time, so every
+    # process-kind row returned age_s=None -- and with the orchestrators
+    # making up 20 of the inventory's rows, most of the table's Age
+    # column was blank by construction. Emit the matching PID's elapsed
+    # seconds on an AGE_S= marker while preserving pgrep's exit code,
+    # which carries the active/inactive distinction used below.
+    remote = (
+        f"pgrep -af {probe!r}; rc=$?; "
+        f"pgrep -f {probe!r} | head -1 "
+        f"| xargs -r ps -o etimes= -p 2>/dev/null "
+        f"| tr -d ' ' | sed 's/^/AGE_S=/'; exit $rc"
+    )
     r = _ssh_run(entry.host, remote, timeout=timeout)
     if not r["ok"] and "timeout" in (r.get("err") or "").lower():
         return {"state": "unreachable", "age_s": None, "raw": r, "err": r["err"]}
     if r.get("rc") is None:
         return {"state": "unreachable", "age_s": None, "raw": r, "err": r["err"]}
+    age_s = _parse_etimes_age(r.get("stdout", ""))
     if r["rc"] == 0:
-        return {"state": "active", "age_s": None, "raw": r, "err": ""}
+        return {"state": "active", "age_s": age_s, "raw": r, "err": ""}
     if r["rc"] == 1:
         return {"state": "inactive", "age_s": None, "raw": r, "err": ""}
     return {"state": "unknown", "age_s": None, "raw": r, "err": r["err"]}

@@ -1,4 +1,4 @@
-"""M7.4 Phase 8 v2: pinned fleet-services inventory.
+"""Pinned fleet-services inventory.
 
 Single source of truth for *which* services live on *which* hosts on
 the DSA-110 real-time fleet, and the restart policy for each tier.
@@ -13,12 +13,16 @@ Tiers
 
 ``dsa_monitor_h23``      lxd110h23 systemd --user units: ``dsa_monitor.service``,
                          ``sefd_dashboard.service``. The dashboard itself.
-``coincidencer_h23``     lxd110h23 systemd --user unit: ``dsart_c2.service``
-                         (the M7.4 Phase 6 C2 coincidencer).
-``hiplot_calibration23`` calibration23 (LXC on lxd110h23) systemd --user
-                         unit: ``hiplot.service``.
-``grafana_h20``          lxd110h20 systemd --system units: ``grafana-server``,
-                         ``influxdb``, ``telegraf``. **Never restarted by
+``coincidencer_h23``     lxd110h23 systemd --user units: ``dsart_c2.service``
+                         (coincidencer) and ``dsart_c3.service`` (voltage-dump
+                         collector).
+``support_h23``          lxd110h23 systemd --user units backing observing:
+                         calibration preprocess + calibration, the Slack
+                         relay, copydata, the C2 hiplots and declination.
+                         These ran in the calibration23 LXC container until
+                         it was retired (2026-07-31).
+``grafana_h20``          lxd110h20 systemd --system units: ``etcdv3``,
+                         ``influxdb``, ``grafana``. **Never restarted by
                          the dashboard** (see ``H20_HOSTNAMES``).
 ``dsart_orch_corr``      n03..n22 (16 hosts): ``dsart_rt`` Python process
                          (NOT a systemd unit; spawned by
@@ -57,7 +61,7 @@ from typing import Final
 
 TIER_DSA_MONITOR_H23: Final[str] = "dsa_monitor_h23"
 TIER_COINCIDENCER_H23: Final[str] = "coincidencer_h23"
-TIER_HIPLOT_CALIBRATION23: Final[str] = "hiplot_calibration23"
+TIER_SUPPORT_H23: Final[str] = "support_h23"
 TIER_GRAFANA_H20: Final[str] = "grafana_h20"
 TIER_DSART_ORCH_CORR: Final[str] = "dsart_orch_corr"
 TIER_DSART_ORCH_SEARCH: Final[str] = "dsart_orch_search"
@@ -173,21 +177,38 @@ def _build_inventory() -> tuple[ServiceEntry, ...]:
         tier=TIER_DSA_MONITOR_H23, host=HOST_H23,
         service="sefd_dashboard.service", kind=KIND_SYSTEMD_USER,
     ))
-    # Tier 2: C2 coincidencer on h23.
-    rows.append(ServiceEntry(
-        tier=TIER_COINCIDENCER_H23, host=HOST_H23,
-        service="dsart_c2.service", kind=KIND_SYSTEMD_USER,
-    ))
-    # Tier 3: hiplot inside the calibration23 LXC container.
-    rows.append(ServiceEntry(
-        tier=TIER_HIPLOT_CALIBRATION23, host=HOST_CALIBRATION23,
-        service="hiplot.service", kind=KIND_LXC_SYSTEMD_USER,
-    ))
-    # Tier 4: grafana / influx / telegraf on h20. READ-ONLY tier.
+    # Tier 2: C2 coincidencer + C3 voltage collector on h23.
+    for unit in ("dsart_c2.service", "dsart_c3.service"):
+        rows.append(ServiceEntry(
+            tier=TIER_COINCIDENCER_H23, host=HOST_H23,
+            service=unit, kind=KIND_SYSTEMD_USER,
+        ))
+    # Tier 3: the observing-support services on h23. These moved off the
+    # calibration23 LXC container when it was retired (2026-07-31) and are
+    # now plain systemd --user units alongside everything else.
     for unit in (
-        "grafana-server.service",
+        "dsa110-calib-preprocess.service",
+        "dsa110-calib-calibration.service",
+        "dsart_slack_relay.service",
+        "copydata.service",
+        "hiplot_c2.service",
+        "declination.service",
+    ):
+        rows.append(ServiceEntry(
+            tier=TIER_SUPPORT_H23, host=HOST_H23,
+            service=unit, kind=KIND_SYSTEMD_USER,
+        ))
+    # Tier 4: etcd / influx / grafana on h20. READ-ONLY tier.
+    #
+    # etcdv3 is the control plane every other tier depends on, so its
+    # absence here was the most consequential gap in the table. The unit
+    # is "grafana.service" on this host, not "grafana-server.service" --
+    # the old name matched nothing and the row could only ever report a
+    # not-found state. telegraf is not installed and has been dropped.
+    for unit in (
+        "etcdv3.service",
         "influxdb.service",
-        "telegraf.service",
+        "grafana.service",
     ):
         rows.append(ServiceEntry(
             tier=TIER_GRAFANA_H20, host=HOST_H20,

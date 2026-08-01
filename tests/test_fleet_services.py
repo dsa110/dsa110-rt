@@ -92,17 +92,32 @@ class TestInventoryShape:
 
     def test_coincidencer_h23_tier(self):
         rows = inv.entries_by_tier(inv.TIER_COINCIDENCER_H23)
-        assert len(rows) == 1
-        assert rows[0].service == "dsart_c2.service"
-        assert rows[0].kind == inv.KIND_SYSTEMD_USER
-        assert rows[0].host == "lxd110h23"
+        assert len(rows) == 2
+        assert sorted(r.service for r in rows) == [
+            "dsart_c2.service",
+            "dsart_c3.service",
+        ]
+        for r in rows:
+            assert r.kind == inv.KIND_SYSTEMD_USER
+            assert r.host == "lxd110h23"
 
-    def test_hiplot_calibration23_uses_lxc_kind(self):
-        rows = inv.entries_by_tier(inv.TIER_HIPLOT_CALIBRATION23)
-        assert len(rows) == 1
-        assert rows[0].host == "calibration23"
-        assert rows[0].kind == inv.KIND_LXC_SYSTEMD_USER
-        assert rows[0].service == "hiplot.service"
+    def test_support_h23_tier(self):
+        """The observing-support units, which moved to h23 --user when the
+        calibration23 LXC container was retired (2026-07-31)."""
+        rows = inv.entries_by_tier(inv.TIER_SUPPORT_H23)
+        assert len(rows) == 6
+        for r in rows:
+            assert r.host == "lxd110h23"
+            assert r.kind == inv.KIND_SYSTEMD_USER
+            assert r.is_restartable() is True
+        assert sorted(r.service for r in rows) == [
+            "copydata.service",
+            "declination.service",
+            "dsa110-calib-calibration.service",
+            "dsa110-calib-preprocess.service",
+            "dsart_slack_relay.service",
+            "hiplot_c2.service",
+        ]
 
     def test_grafana_h20_tier_has_three_units_and_is_not_restartable(self):
         rows = inv.entries_by_tier(inv.TIER_GRAFANA_H20)
@@ -112,10 +127,14 @@ class TestInventoryShape:
             assert r.kind == inv.KIND_SYSTEMD_SYSTEM
             assert r.is_restartable() is False
         names = sorted(r.service for r in rows)
+        # etcdv3 is the control plane the whole fleet depends on and was
+        # absent here; grafana's unit is "grafana.service" on this host,
+        # so the old "grafana-server.service" row matched nothing;
+        # telegraf is not installed.
         assert names == [
-            "grafana-server.service",
+            "etcdv3.service",
+            "grafana.service",
             "influxdb.service",
-            "telegraf.service",
         ]
 
     def test_dsart_orch_corr_has_16_entries(self):
@@ -147,9 +166,9 @@ class TestInventoryShape:
         assert "lxd110h20" not in restartable_hosts    # …but not restartable.
 
     def test_inventory_total_size_matches_components(self):
-        # 2 (dsa_monitor_h23) + 1 (dsart_c2) + 1 (hiplot) + 3 (grafana)
-        # + 16 (corr orch) + 4 (search orch) = 27
-        assert len(inv.SERVICE_INVENTORY) == 27
+        # 2 (dsa_monitor_h23) + 2 (dsart_c2/c3) + 6 (support_h23)
+        # + 3 (etcd/influx/grafana) + 16 (corr orch) + 4 (search orch) = 33
+        assert len(inv.SERVICE_INVENTORY) == 33
 
 
 # ---------------------------------------------------------------------------
