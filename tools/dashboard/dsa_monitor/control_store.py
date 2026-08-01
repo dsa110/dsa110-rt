@@ -1504,15 +1504,28 @@ DEFAULT_BOUNCE_SLEEP_S: float = 2.0
 #: services_inventory) so the unit tests can patch it cheaply.
 C2_SERVICE_UNIT: str = "dsart_c2.service"
 
-#: The h23 systemd ``--user`` units that make up the dsa110-rt C2/C3
-#: stack — the same set ``tools/c2/install.sh`` installs + enables.
-#: Restarted in this order by :func:`restart_h23_services_local`.
+#: The h23 systemd ``--user`` units restarted, in this order, by
+#: :func:`restart_h23_services_local`. Beyond the C2/C3 stack this now
+#: covers the observing-support services, which ran in the calibration23
+#: LXC container until it was retired (2026-07-31) and are plain
+#: ``--user`` units on h23 since.
+#:
+#: Order is deliberate: the C2/C3 data path first, then the calibration
+#: chain, then the support services, then the plotters — so a restart
+#: never leaves a consumer running against a producer that is still
+#: coming up.
+#:
 #: The dashboard's own unit (``dsa_monitor.service``) is deliberately
 #: NOT here: restarting it from inside a request would kill the very
 #: process serving the restart.
 H23_DSART_UNITS: tuple[str, ...] = (
     "dsart_c2.service",
     "dsart_c3.service",
+    "dsa110-calib-preprocess.service",
+    "dsa110-calib-calibration.service",
+    "copydata.service",
+    "declination.service",
+    "dsart_slack_relay.service",
     "hiplot_c1.service",
     "hiplot_c2.service",
 )
@@ -1695,8 +1708,9 @@ def restart_h23_services_local(
 ) -> dict[str, Any]:
     """Restart every h23 dsa110-rt ``systemctl --user`` unit, in order.
 
-    Walks :data:`H23_DSART_UNITS` (dsart_c2, dsart_c3, hiplot_c1,
-    hiplot_c2) and runs a local ``systemctl --user restart`` on each.
+    Walks :data:`H23_DSART_UNITS` -- the C2/C3 data path, the calibration
+    chain, the support services and the plotters -- and runs a local
+    ``systemctl --user restart`` on each.
     The dashboard runs on h23 as the same user that owns those units, so
     no ssh is required. The dashboard's own unit is deliberately NOT in
     the list (it would kill this request mid-flight).

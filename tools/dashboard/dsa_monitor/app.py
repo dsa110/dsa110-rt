@@ -1132,11 +1132,6 @@ def control_page():
             "max_last_seq_no": None, "max_source": None,
             "margin": DEFAULT_ARM_SEQ_MARGIN, "_error": str(exc),
         }
-    try:
-        recent = list_recent_audit(control_store, limit=20)
-    except Exception as exc:                                       # noqa: BLE001
-        LOG.warning("list_recent_audit: %s", exc)
-        recent = []
     import inject_calibration as ic                                 # local
     import spectral_line_gate as slg                                # local
     try:
@@ -1173,7 +1168,6 @@ def control_page():
         corr_cn_ids=list(CORR_CN_IDS),
         search_cn_ids=list(SEARCH_CN_IDS),
         arm_info=arm_info,
-        recent_audit=recent,
         default_arm_margin=DEFAULT_ARM_SEQ_MARGIN,
         default_inject_margin_blocks=DEFAULT_INJECT_MARGIN_BLOCKS,
         default_bounce_sleep_s=DEFAULT_BOUNCE_SLEEP_S,
@@ -1189,10 +1183,78 @@ def control_page():
     )
 
 
+#: Antennas sampled for the banner's elevation readout. A median over a
+#: handful is robust to one dish being parked or stale without the cost
+#: of polling all 117 on a 4 s cadence.
+_BANNER_EL_ANTS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8)
+
+
+def _banner_extras() -> dict[str, Any]:
+    """Live switch positions + pointing for the Control banner.
+
+    Every field is best-effort and independent: one unreadable key must
+    not blank the rest of the banner, so each lookup is guarded on its
+    own and simply omits its field on failure.
+    """
+    out: dict[str, Any] = {}
+    try:
+        import dumps_gate                                          # local
+        out["dumps_enabled"] = bool(
+            dumps_gate.get_dumps_state(control_store).get("enabled"))
+    except Exception:                                              # noqa: BLE001
+        pass
+    try:
+        import voltage_controls                                    # local
+        out["voltages_enabled"] = bool(
+            voltage_controls.get_voltages_state(control_store).get("enabled"))
+    except Exception:                                              # noqa: BLE001
+        pass
+    try:
+        import voltage_controls                                    # local
+        # flag_only=True keeps rejected events; False deletes them.
+        out["reject_keeps"] = bool(
+            voltage_controls.get_c3_mode_state(control_store).get("flag_only"))
+    except Exception:                                              # noqa: BLE001
+        pass
+    try:
+        import spectral_line_gate as _slg                          # local
+        spl = _slg.get_spectral_line_state(control_store)
+        # get_spectral_line_state always returns all 16 chgroups under
+        # "subbands", each a dict carrying its own "enabled" flag.
+        subs = spl.get("subbands") or {}
+        if isinstance(subs, dict) and subs:
+            out["spl_on"] = sum(
+                1 for v in subs.values()
+                if isinstance(v, dict) and v.get("enabled"))
+            out["spl_total"] = len(subs)
+    except Exception:                                              # noqa: BLE001
+        pass
+    try:
+        els = []
+        for ant in _BANNER_EL_ANTS:
+            doc = etcd_store.get_dict(f"/mon/ant/{ant}") or {}
+            val = doc.get("ant_el")
+            if isinstance(val, (int, float)):
+                els.append(float(val))
+        if els:
+            els.sort()
+            out["elevation_deg"] = els[len(els) // 2]
+            out["elevation_n"] = len(els)
+    except Exception:                                              # noqa: BLE001
+        pass
+    try:
+        from sky_astrometry import lst_deg                         # local
+        out["lst_deg"] = float(lst_deg(time.time())) % 360.0
+    except Exception:                                              # noqa: BLE001
+        pass
+    return out
+
+
 @app.route("/control/system_state", methods=["GET"])
 def control_system_state():
     """One rolled-up fleet lifecycle state for the Control banner
-    (Ready / Preparing / Prepared / Observing / Offline)."""
+    (Ready / Preparing / Prepared / Observing / Offline), plus the live
+    switch positions and pointing the banner displays alongside it."""
     try:
         st = compute_system_state(control_store)
     except Exception as exc:                                       # noqa: BLE001
@@ -1205,6 +1267,7 @@ def control_system_state():
             "safe_to_arm": False,
         }), 200
     st["ok"] = True
+    st.update(_banner_extras())
     return jsonify(st)
 
 
@@ -2333,54 +2396,6 @@ def control_c3_mode_audit():
     return jsonify({"ok": True, "rows": rows})
 
 
-# --- operator-integration: human authority over the dsa110-operator agent ---
-@app.route("/control/operator", methods=["GET", "POST"])
-def control_operator():
-    """Read or write the operator-agent authority key ``/cmd/operator/control``.
-
-    GET  -> {ok, control: {...}, lease: {...}|null}
-    POST -> form: agents_enabled (on/off), executor_email (optional),
-            max_obs_seconds (int, 0=off), confirm (=operator), user.
-
-    The dsa110-operator agent treats this key as a one-way human override:
-    it can read it but never write it (its etcd write surface is confined to
-    /operator/ and /cmd/ant/). ``max_obs_seconds`` is enforced strictly by a
-    dsart_rt watchdog, not just the agent.
-    """
-    import operator_control as opc                              # local
-
-    if request.method == "GET":
-        try:
-            return jsonify({"ok": True,
-                            "control": opc.get_operator_control(control_store),
-                            "lease": opc.get_operator_lease(control_store)})
-        except Exception as exc:                                  # noqa: BLE001
-            LOG.exception("get operator control failed")
-            return jsonify({"ok": False, "error": str(exc)}), 500
-
-    f = request.form
-    confirm_raw = (f.get("confirm") or "").strip().lower()
-    if confirm_raw != "operator":
-        return jsonify({"ok": False,
-                        "error": "type the literal word 'operator' to confirm"}), 400
-    enabled_raw = (f.get("agents_enabled") or "").strip().lower()
-    agents_enabled = enabled_raw in ("true", "1", "yes", "on")
-    actor = f.get("user") or request.remote_addr or "anon"
-    try:
-        state = opc.set_operator_control(
-            control_store,
-            agents_enabled=agents_enabled,
-            executor_email=(f.get("executor_email") or "").strip(),
-            max_obs_seconds=(f.get("max_obs_seconds") or "0").strip() or "0",
-            actor=actor)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:                                      # noqa: BLE001
-        LOG.exception("set operator control failed")
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, "control": state})
-
-
 @app.route("/control/spectral_line", methods=["GET", "POST"])
 def control_spectral_line():
     """Read or write the per-sub-band spectral-line (SPL) config.
@@ -2633,8 +2648,9 @@ def control_restart_h23_post():
     """Restart all dsa110-rt h23 ``systemctl --user`` units.
 
     Cycles, in order, the units in
-    :data:`control_store.H23_DSART_UNITS` (dsart_c2, dsart_c3,
-    hiplot_c1, hiplot_c2) via local ``systemctl --user restart``. The
+    :data:`control_store.H23_DSART_UNITS` -- the C2/C3 data path, the
+    calibration chain, the support services and the plotters -- via
+    local ``systemctl --user restart``. The
     dashboard's own unit is excluded. Best-effort: one unit failing does
     not abort the rest; ``ok`` is True only if every unit restarted.
 
