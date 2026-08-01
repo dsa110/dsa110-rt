@@ -93,7 +93,11 @@ HOST_CALIBRATION23: Final[str] = "calibration23"
 #: The grafana / influx / telegraf central host. Read-only from the
 #: dashboard's perspective: status queries are allowed (over ssh)
 #: but **never restarted**. See :data:`H20_HOSTNAMES`.
-HOST_H20: Final[str] = "lxd110h20"
+#: FQDN, not the bare name: h23 has no DNS or /etc/hosts entry for
+#: "lxd110h20", so the ssh probe failed to resolve it and every row in
+#: this tier reported "unknown" with no age. Only ".pro.pvt" is served
+#: (see DISASTER_RECOVERY.md §7).
+HOST_H20: Final[str] = "lxd110h20.pro.pvt"
 
 #: Hostnames the dashboard MUST NEVER restart. Pinned as a frozenset
 #: for O(1) lookup + immutability across the call sites.

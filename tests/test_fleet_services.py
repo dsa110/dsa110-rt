@@ -123,7 +123,7 @@ class TestInventoryShape:
         rows = inv.entries_by_tier(inv.TIER_GRAFANA_H20)
         assert len(rows) == 3
         for r in rows:
-            assert r.host == "lxd110h20"
+            assert r.host == "lxd110h20.pro.pvt"
             assert r.kind == inv.KIND_SYSTEMD_SYSTEM
             assert r.is_restartable() is False
         names = sorted(r.service for r in rows)
@@ -157,11 +157,11 @@ class TestInventoryShape:
 
     def test_h20_hostnames_is_frozenset_with_only_h20(self):
         assert isinstance(inv.H20_HOSTNAMES, frozenset)
-        assert inv.H20_HOSTNAMES == frozenset({"lxd110h20"})
+        assert inv.H20_HOSTNAMES == frozenset({"lxd110h20.pro.pvt"})
 
     def test_restartable_entries_excludes_h20(self):
         all_hosts = {e.host for e in inv.SERVICE_INVENTORY}
-        assert "lxd110h20" in all_hosts                # in inventory…
+        assert "lxd110h20.pro.pvt" in all_hosts                # in inventory…
         restartable_hosts = {e.host for e in inv.restartable_entries()}
         assert "lxd110h20" not in restartable_hosts    # …but not restartable.
 
