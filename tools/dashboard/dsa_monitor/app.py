@@ -203,6 +203,30 @@ def _start_cands_index_refresher() -> None:
 _start_cands_index_refresher()
 
 
+def _start_bfweights_desc_primer() -> None:
+    """Warm the bfweights descriptor cache at startup.
+
+    latest_descriptor() is served from a cache that returns None until
+    the first background scan of GENERATED_DIR completes, and nothing
+    populated it except a request that then rendered without waiting.
+    So the first /sefds load after any restart showed no generated
+    solution for any calibrator -- indistinguishable, to a reader, from
+    the weights never having been produced.
+    """
+    def _work() -> None:
+        try:
+            import bfweights_update                            # local
+            bfweights_update.prime_descriptor_cache()
+        except Exception:                                      # noqa: BLE001
+            LOG.exception("bfweights descriptor prime failed")
+    threading.Thread(
+        target=_work, name="bfweights_desc_primer", daemon=True,
+    ).start()
+
+
+_start_bfweights_desc_primer()
+
+
 # Sky monitor (E2E test 1): ingest + frame builder. Cheap to construct;
 # all heavy work (combine + iFFT + PNG) happens per ~30 s frame inside
 # ingest requests.
