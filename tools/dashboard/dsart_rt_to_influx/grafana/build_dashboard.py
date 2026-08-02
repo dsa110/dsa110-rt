@@ -44,10 +44,18 @@ Usage::
     ./build_dashboard.py
 
     # Write + POST to the live Grafana instance on h20
+    source ~/.dsart/secrets.env          # exports GRAFANA_AUTH=user:pass
     ./build_dashboard.py --post \
-        --grafana-url http://$GRAFANA_AUTH@localhost:3000
+        --grafana-url http://lxd110h20.pro.pvt:3000
 
-    # GRAFANA_AUTH holds user:pass; never commit real credentials.
+    # GRAFANA_AUTH holds user:pass; never commit real credentials. It is
+    # read by --grafana-auth's default and sent as a Basic header.
+    #
+    # Do NOT put the credentials inline in the URL
+    # (http://$GRAFANA_AUTH@host:3000) as this docstring used to say:
+    # urllib.request does not strip userinfo from the netloc, so it
+    # tries to resolve "user:pass@host" as a hostname and dies with
+    # "Name or service not known".
 
 The generator is intentionally a single self-contained module so we can
 keep the dashboard JSON in version control and re-emit it deterministically.
