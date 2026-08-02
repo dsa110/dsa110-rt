@@ -109,8 +109,13 @@ from dsart.grid import (
     compute_top_of_band_cell_lambda,
 )
 from dsart.rfi import (
+    HOLD_S_DEFAULT as RFI_PERSIST_HOLD_S_DEFAULT,
+    LATCH_FRAC_DEFAULT as RFI_PERSIST_LATCH_FRAC_DEFAULT,
+    LATCH_WINDOW_S_DEFAULT as RFI_PERSIST_LATCH_WINDOW_S_DEFAULT,
     FlagBlockResult,
+    FlagPersistence,
     RFIFlagger,
+    seconds_to_cubes,
 )
 from dsart.services.corr_fast_kernel import (
     FastCorrKernel,
@@ -1342,6 +1347,16 @@ class FastIntegrationConfig:
     rfi_m_values: tuple[int, ...] | None = None
     rfi_warmup_cubes: int | None = None
     rfi_sumthr_enabled: bool = True
+    # ---- RFI time persistence (M8.1) ----
+    # A cell the detectors flag for a whole `persist_window_s` trailing
+    # window is latched and stays flagged for `persist_hold_s` after
+    # they stop firing. Off by default: enabling it changes what reaches
+    # the fast-corr GEMM, so it is an explicit operator decision (see
+    # dsart.rfi.persistence).
+    rfi_persist_enabled: bool = False
+    rfi_persist_window_s: float = RFI_PERSIST_LATCH_WINDOW_S_DEFAULT
+    rfi_persist_hold_s: float = RFI_PERSIST_HOLD_S_DEFAULT
+    rfi_persist_frac: float = RFI_PERSIST_LATCH_FRAC_DEFAULT
     static_sky_window_s: float = 1.0
     static_sky_warmup_cubes: int = 8
     static_sky_disabled: bool = False
@@ -2768,6 +2783,12 @@ def build_context(
             rfi_kwargs["m_values"] = cfg.rfi_m_values
         if cfg.rfi_warmup_cubes is not None:
             rfi_kwargs["warmup_cubes"] = cfg.rfi_warmup_cubes
+        if cfg.rfi_persist_enabled:
+            rfi_kwargs["persistence"] = FlagPersistence(
+                latch_window_cubes=seconds_to_cubes(cfg.rfi_persist_window_s),
+                hold_cubes=seconds_to_cubes(cfg.rfi_persist_hold_s),
+                latch_frac=cfg.rfi_persist_frac,
+            )
         rfi_flagger = RFIFlagger(**rfi_kwargs)
         LOG.info(
             "RFIFlagger ready: warmup_cubes=%d sk_far=%.3g "
@@ -2777,6 +2798,18 @@ def build_context(
             "on" if cfg.rfi_sumthr_enabled else "OFF",
             rfi_flagger._m_values,
         )
+        pers = rfi_flagger.persistence
+        if pers is not None:
+            LOG.info(
+                "RFI persistence ON: latch after %d cubes (%.1f s) at "
+                "frac=%.3g, hold %d cubes (%.1f s), mode=%s",
+                pers.latch_window_cubes, cfg.rfi_persist_window_s,
+                pers.latch_frac, pers.hold_cubes, cfg.rfi_persist_hold_s,
+                "rolling-window ring" if pers.uses_ring
+                else "consecutive-run counter (O(1) state)",
+            )
+        else:
+            LOG.info("RFI persistence OFF (cfg.rfi_persist_enabled=False)")
     else:
         LOG.info("RFIFlagger DISABLED (cfg.rfi_enabled=False)")
 
@@ -3192,6 +3225,9 @@ def _serialise_block(
         ),
         "rfi_warmup": (
             bool(out.rfi.warmup) if out.rfi is not None else None
+        ),
+        "rfi_persist_latched": (
+            int(out.rfi.n_persist_latched) if out.rfi is not None else None
         ),
         "n_tx": out.n_tx,
         "blocks_output_mode": blocks_output_mode,
@@ -3802,6 +3838,11 @@ def run(
 
         per_block_ms: list[float] = []
         per_block_flag_frac: list[float] = []
+        # Latest RFI-persistence latch counts (cells held, cells latched
+        # this cube). Surfaced on the 16-block progress line so an
+        # operator can see the latch converge without attaching a
+        # debugger. [held, new_this_cube, new_cumulative]
+        persist_counts: list[int] = [0, 0, 0]
         t_start = time.monotonic()
 
         # ── M7.6 RFI window aggregator + shm writer ───────────────────
@@ -3900,6 +3941,9 @@ def run(
                 per_block_flag_frac.append(
                     float(out.rfi.flag_fraction_total)
                 )
+                persist_counts[0] = int(out.rfi.n_persist_latched)
+                persist_counts[1] = int(out.rfi.n_persist_new)
+                persist_counts[2] += int(out.rfi.n_persist_new)
 
             # M7.6: feed the RFI window aggregator + shm publisher.
             # Only active when both --rfi-mon-cn-id was supplied (so
@@ -4045,6 +4089,15 @@ def run(
                     "last_block=%.1fms",
                     n_in, n_processed, n_drop, n_tx_total, per_block_ms[-1],
                 )
+                if cfg.rfi_persist_enabled:
+                    LOG.info(
+                        "rfi-persist: held=%d (%.3f%% of cells) "
+                        "new_last_cube=%d new_total=%d",
+                        persist_counts[0],
+                        100.0 * persist_counts[0]
+                        / float(NANTS * NCHAN_PER_CHGROUP * NPOL),
+                        persist_counts[1], persist_counts[2],
+                    )
                 if mon_publisher is not None:
                     # T2 (2026-06-07): include the inject-watch state in
                     # every heartbeat so the dashboard can verify all
@@ -4296,6 +4349,29 @@ def main(argv: list[str] | None = None) -> int:
                         "bandpass-outlier is bypassed and rfi_warming_up "
                         "is asserted in the transport header. Library "
                         "default ~1118 cubes (~150 s).")
+    # ---- RFI time persistence (M8.1) ----
+    p.add_argument("--rfi-persist", action="store_true",
+                   help="latch persistently-bad (ant, ch, pol) cells: once "
+                        "the detectors have flagged a cell for a whole "
+                        "--rfi-persist-window-s, keep it flagged for "
+                        "--rfi-persist-hold-s after they stop firing. "
+                        "Costs ~0.6 MB of device state and a handful of "
+                        "elementwise kernels per cube. Default off.")
+    p.add_argument("--rfi-persist-window-s", type=float,
+                   default=RFI_PERSIST_LATCH_WINDOW_S_DEFAULT,
+                   help="trailing window a cell must stay flagged before "
+                        "it latches (default: %(default)s s)")
+    p.add_argument("--rfi-persist-hold-s", type=float,
+                   default=RFI_PERSIST_HOLD_S_DEFAULT,
+                   help="how long a latched cell stays flagged after the "
+                        "detectors stop firing (default: %(default)s s)")
+    p.add_argument("--rfi-persist-frac", type=float,
+                   default=RFI_PERSIST_LATCH_FRAC_DEFAULT,
+                   help="flag fraction within the window required to latch. "
+                        "1.0 (default) means every cube, which needs no "
+                        "ring buffer; < 1.0 tolerates gaps but allocates a "
+                        "[W, 96, 384, 2] uint8 rolling window (~16.5 MB at "
+                        "the 30 s default).")
     p.add_argument("--n-grid", type=int, default=256,
                    help="grid side length (default: 256)")
     p.add_argument("--kernel-support", type=int, default=1,
@@ -4622,6 +4698,10 @@ def main(argv: list[str] | None = None) -> int:
         rfi_m_values=rfi_m_values_parsed,
         rfi_warmup_cubes=args.rfi_warmup_cubes,
         rfi_sumthr_enabled=not args.sumthr_disabled,
+        rfi_persist_enabled=args.rfi_persist,
+        rfi_persist_window_s=args.rfi_persist_window_s,
+        rfi_persist_hold_s=args.rfi_persist_hold_s,
+        rfi_persist_frac=args.rfi_persist_frac,
         static_sky_window_s=args.static_sky_window_s,
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,

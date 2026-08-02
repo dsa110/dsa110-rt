@@ -403,3 +403,115 @@ def test_plot_worker_dedupes_inflight(tmp_path: Path) -> None:
         fut2.result(timeout=30.0)
     finally:
         worker.shutdown(wait=True)
+
+
+# ---------------------------------------------------------------------------
+# Detector-matched boxcar smoothing (2026-08-02)
+# ---------------------------------------------------------------------------
+
+
+def test_boxcar_is_unit_variance_and_pass_through_at_w1() -> None:
+    """The 1/sqrt(w) normalisation keeps white noise at unit variance, so
+    the smoothed series stays in the detector's sigma units."""
+    from dsart.coinc.plotter import _boxcar
+
+    rng = np.random.default_rng(20260802)
+    x = rng.normal(size=20000).astype(np.float32)
+    assert _boxcar(x, 1) is not x or True          # w<=1 is a pass-through
+    np.testing.assert_allclose(_boxcar(x, 1), x, rtol=0, atol=0)
+    for w in (2, 8, 16):
+        y = _boxcar(x, w)
+        # Trim the convolution edges before measuring.
+        assert abs(float(np.std(y[w:-w])) - 1.0) < 0.05, w
+
+
+def test_boxcar_recovers_a_wide_burst_the_raw_argmax_smears() -> None:
+    """A w-sample burst buried in noise: the width-matched series must
+    both find it and score it far above the unsmoothed one."""
+    from dsart.coinc.plotter import _boxcar, _robust_z
+
+    rng = np.random.default_rng(7)
+    n, w, t0 = 512, 16, 200
+    x = rng.normal(size=n).astype(np.float32)
+    x[t0:t0 + w] += 1.2                       # 1.2 sigma/sample => ~4.8 total
+    z_raw = _robust_z(x)
+    z_box = _robust_z(_boxcar(x, w))
+    # The matched peak lands inside the burst; the raw argmax need not.
+    assert t0 <= int(np.argmax(z_box)) < t0 + w
+    # Matched filter recovers ~1.2 * sqrt(16) = 4.8 sigma; the raw series
+    # can only ever show one sample's worth (1.2 sigma) plus whatever
+    # noise sample happens to sit highest inside the burst (~2 sigma for
+    # 16 draws), so the gap is real but not the full sqrt(w).
+    assert float(z_box.max()) > 4.3
+    assert float(z_box.max()) > 1.3 * float(z_raw[t0:t0 + w].max())
+
+
+def test_robust_z_survives_a_degenerate_mad() -> None:
+    """A mostly-constant series (sparse synthetic cube) must still yield
+    a usable argmax instead of collapsing to all-zeros."""
+    from dsart.coinc.plotter import _robust_z
+
+    x = np.zeros(16, dtype=np.float32)
+    x[9] = 5.0
+    z = _robust_z(x)
+    assert int(np.argmax(z)) == 9
+    assert float(z.max()) > 0.0
+    # Genuinely constant -> zeros, no spurious peak.
+    assert not np.any(_robust_z(np.full(16, 3.0, dtype=np.float32)))
+
+
+def test_burst_coords_reports_detector_and_cube_snrs(tmp_path: Path) -> None:
+    """`_burst_coords` must carry BOTH the detector's SNR and its own
+    cube re-measurement (smoothed and unsmoothed) so the panels can
+    print the difference."""
+    cubes_dir = tmp_path / "cubes"
+    _write_fake_cubes(cubes_dir)
+    cubes = _load_cubes(cubes_dir)
+    try:
+        job = PlotJob(
+            event_name="260802snr0", archive_root=tmp_path,
+            stats=_stats(), members=tuple(_members()),
+        )
+        peak, _ = _resolve_burst(job)
+        burst = _select_burst_chunk(cubes, peak)
+        coords = _burst_coords(burst, _burst_waterfall(burst), peak)
+        assert coords is not None
+        # Detector value is passed through untouched...
+        assert coords.snr == pytest.approx(BURST_SNR)
+        # ...and the cube re-measurement is a separate, finite number.
+        assert np.isfinite(coords.snr_measured)
+        assert np.isfinite(coords.snr_measured_raw)
+        assert coords.snr_delta == pytest.approx(
+            BURST_SNR - coords.snr_measured
+        )
+        # The boxcar is the detector's own width for the peak member.
+        assert coords.boxcar == 2
+        assert coords.t_idx_raw is not None
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_smoothing_can_be_disabled_by_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSART_PLOTTER_SMOOTH=0 restores the pre-2026-08-02 raw argmax."""
+    cubes_dir = tmp_path / "cubes"
+    _write_fake_cubes(cubes_dir)
+    cubes = _load_cubes(cubes_dir)
+    try:
+        job = PlotJob(
+            event_name="260802nosm", archive_root=tmp_path,
+            stats=_stats(), members=tuple(_members()),
+        )
+        peak, _ = _resolve_burst(job)
+        burst = _select_burst_chunk(cubes, peak)
+        wf = _burst_waterfall(burst)
+        monkeypatch.setenv("DSART_PLOTTER_SMOOTH", "0")
+        coords = _burst_coords(burst, wf, peak)
+        assert coords is not None and coords.boxcar == 1
+        # With no smoothing the two measurements coincide.
+        assert coords.snr_measured == pytest.approx(coords.snr_measured_raw)
+    finally:
+        for c in cubes:
+            c.close()

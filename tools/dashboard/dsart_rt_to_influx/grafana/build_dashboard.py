@@ -11,6 +11,10 @@ Layout (top to bottom):
 
   Row A. Fleet at-a-glance stats (corr/search alive count, fleet
          capture rate, time since last C2 trigger).
+  Row A2. Search GPU health -- one tile per (cn, gpu_half) showing that
+         half's ingest as a multiple of real time, plus the ingest /
+         detector-throughput / freshness / sigma_k-agreement graphs
+         behind them. See _search_gpu_health_panels for the derivation.
   Row B. Service heartbeats (corr + search alive matrix, cadence).
   Row C. Routine state (corr + search, fraction of fleet alive and
          worst verb age).
@@ -307,6 +311,194 @@ def text_panel(
     }
 
 
+# ---------------------------------------------------------------------------
+# Search-GPU health (row A2)
+# ---------------------------------------------------------------------------
+#
+# The 8 search GPUs are (cn_id, gpu_half) for cn in {1, 2, 9, 13}, half in
+# {0, 1}. Nothing publishes a per-GPU "am I receiving data" key
+# (``/mon/search_rt/<cn>/rx`` is in M7.6-MONITOR-POINTS-SEARCH.md §7 but is
+# not written, and the pusher logs it as a planned-but-unbuilt key), so the
+# diagnostic is derived from two counters that only advance when real data
+# flows through that half:
+#
+#   search_rt_dump.cube_ring_newest_end_specnum_excl
+#       Newest specnum staged into the half's cube retention ring, in
+#       SEARCH-SAMPLE units. Multiply its time derivative by the search
+#       sample period and you get "seconds of sky ingested per second of
+#       wall clock" — 1.0 when the half is keeping up with real time.
+#       Measured 2026-08-02 across all 8 halves over a 30 min baseline:
+#       951.5-954.6 samples/s => 0.998-1.001x real time.
+#
+#   search_rt_noise.layer2_cube_count
+#       Cubes the Layer-2 normaliser has seen. Same 30 min baseline:
+#       4.90-4.96 cubes/s on every half (cube stride = 192 search samples,
+#       so real time is 1/(192 * 1.048576 ms) = 4.96 cubes/s).
+#
+# The pair separates two distinct failure modes: the ring advancing while
+# layer2_cube_count sticks is the detector wedging (the fan-in gate freeze
+# / c1_emit wedge signature), whereas both stalling together is the half
+# losing its corr->search feed.
+_SEARCH_HALVES: List[tuple] = [
+    (cn, g) for cn in (1, 2, 9, 13) for g in (0, 1)
+]
+
+#: Search sample period in SECONDS (t_int_search_us = 1048.576 us). One
+#: unit of cube_ring_newest_end_specnum_excl.
+_SEARCH_SAMPLE_S: float = 1.048576e-3
+
+#: Cube stride in search samples (measured: 953 samples/s / 4.96 cubes/s).
+_CUBE_STRIDE_SAMPLES: int = 192
+
+#: Real-time cube rate, cubes/s.
+_NOMINAL_CUBES_PER_S: float = 1.0 / (_CUBE_STRIDE_SAMPLES * _SEARCH_SAMPLE_S)
+
+
+def _search_gpu_health_panels() -> List[Dict[str, Any]]:
+    """Row A2: one tile per search GPU + the two rate graphs behind them."""
+    out: List[Dict[str, Any]] = []
+    out.append(row_panel(
+        "A2. Search GPU health -- all 8 halves receiving + processing?"
+    ))
+    _bump_y(1)
+
+    # --- 8 tiles, 3 grid columns each = one full-width strip -----------
+    # Each shows the half's ingest rate as a fraction of real time.
+    #
+    # Deliberately NOT derivative() + GROUP BY time($__interval): the
+    # trailing bucket of such a query is always partial, so its derivative
+    # reads low (0.34 instead of 1.0 was reproducible on 2026-08-02) and a
+    # tile keyed on "current" or on the window average would flap orange
+    # for no reason. A first/last difference over a FIXED window has no
+    # bucket edges to trip over. It does undercount by one publish
+    # interval out of the window (2 s in 300 s = 0.7%, measured 0.9932 on
+    # a healthy half), which the 0.97 green threshold absorbs.
+    tile_window_s = 300
+    tile_scale = _SEARCH_SAMPLE_S / float(tile_window_s)
+    for i, (cn, g) in enumerate(_SEARCH_HALVES):
+        out.append(singlestat_panel(
+            title=f"n{cn:02d} g{g}",
+            raw_query=(
+                'SELECT (last("cube_ring_newest_end_specnum_excl") - '
+                'first("cube_ring_newest_end_specnum_excl")) '
+                f'* {tile_scale:.13f} '
+                'FROM "search_rt_dump" '
+                f'WHERE time > now() - {tile_window_s}s '
+                f"AND \"cn_id\" = '{cn}' AND \"gpu_half\" = '{g}'"
+            ),
+            w=3, h=4, x=3 * i, unit="percentunit", decimals=1,
+            value_name="current",
+            thresholds="0.90,0.97",
+            colors=["#d44a3a", "rgba(237, 129, 40, 0.89)", "#299c46"],
+            color_background=True, sparkline_show=False,
+            description=(
+                f"Search half cn{cn} gpu_half {g}: sky seconds ingested "
+                "into the cube retention ring per wall second, over a "
+                f"fixed {tile_window_s} s lookback (independent of the "
+                "dashboard time range). 1.0 = keeping up with real time. "
+                "N/A = the half published nothing in the last "
+                f"{tile_window_s} s -- process down, or the etcd->influx "
+                "pusher stopped. Source: "
+                "search_rt_dump.cube_ring_newest_end_specnum_excl."
+            ),
+        ))
+    _bump_y(4)
+
+    # --- the two rate graphs -------------------------------------------
+    out.append(graph_panel(
+        title="Search ingest -- x real time per GPU half (target 1.0)",
+        raw_query=(
+            'SELECT derivative(last("cube_ring_newest_end_specnum_excl"), 1s) '
+            f'* {_SEARCH_SAMPLE_S:.9f} '
+            'FROM "search_rt_dump" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="percentunit", y_min=0, y_max=1.2,
+        legend_right=True, legend_values=True, fill=0, line_width=2,
+        description=(
+            "Per-GPU-half data ingest, expressed as a multiple of real "
+            "time. All 8 traces should sit flat on 1.0. One trace "
+            "dropping while the others hold is that half losing its "
+            "corr->search feed (the hash-dependent switch-fabric loss "
+            "signature); all 8 dropping together is upstream (corr TX or "
+            "capture). A trace vanishing means the half stopped "
+            "publishing entirely."
+        ),
+    ))
+    out.append(graph_panel(
+        title=(
+            "Detector throughput -- Layer-2 cubes/s per GPU half "
+            f"(target {_NOMINAL_CUBES_PER_S:.2f})"
+        ),
+        raw_query=(
+            'SELECT derivative(last("layer2_cube_count"), 1s) '
+            'FROM "search_rt_noise" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="short", y_min=0,
+        legend_right=True, legend_values=True, fill=0, line_width=2,
+        description=(
+            "Cubes per second through each half's Layer-2 normaliser. "
+            "Pair it with the ingest panel to the left: ring advancing "
+            "but cubes/s stuck = the DETECTOR wedged on that half; both "
+            "stalled = no data arriving. Real time is "
+            f"{_NOMINAL_CUBES_PER_S:.2f} cubes/s (192-sample cube stride "
+            "at 1048.576 us)."
+        ),
+    ))
+    _bump_y(7)
+
+    out.append(graph_panel(
+        title="Telemetry freshness -- points published per interval per half",
+        raw_query=(
+            'SELECT count("s_k_median") FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(0)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=6, unit="short", y_min=0,
+        legend_right=True, fill=0, line_width=2,
+        description=(
+            "Liveness that survives a half going dark: fill(0) draws an "
+            "explicit zero instead of dropping the series, so a silent "
+            "half reads as a line on the floor rather than a missing "
+            "legend entry. Publish cadence is 2 s, so expect "
+            "interval_seconds/2 points per bucket."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Noise agreement -- sigma_k median spread across the 8 halves",
+        raw_query=(
+            'SELECT max("s_k_median") - min("s_k_median") '
+            'FROM "search_rt_noise" WHERE $timeFilter '
+            'GROUP BY time($__interval) fill(null)'
+        ),
+        alias="max - min sigma_k median",
+        w=12, x=12, h=6, unit="short", y_min=0,
+        legend_right=True, fill=1, line_width=2,
+        extra_targets=[{
+            "alias": "cn $tag_cn_id g$tag_gpu_half",
+            "query": (
+                'SELECT mean("s_k_median") FROM "search_rt_noise" '
+                'WHERE $timeFilter '
+                'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+            ),
+        }],
+        description=(
+            "The 8 halves see statistically identical sky, so their "
+            "Layer-2 sigma_k medians track each other closely (2.847-2.850 "
+            "on 2026-08-02). The spread trace is the cheap scalar alarm: "
+            "one half drifting away means it is being fed different data "
+            "(partial fabric loss, stale cal, or a stuck buffer) even "
+            "though its cube counters still advance."
+        ),
+    ))
+    _bump_y(6)
+    return out
+
+
 def panels() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     out.append(row_panel("A. Fleet at-a-glance"))
@@ -357,6 +549,8 @@ def panels() -> List[Dict[str, Any]]:
         description="MJD of most recent C2 trigger over the last 24 h. Compare to current MJD to gauge staleness.",
     ))
     _bump_y(4)
+
+    out.extend(_search_gpu_health_panels())
 
     out.append(row_panel("B. Service heartbeats"))
     _bump_y(1)

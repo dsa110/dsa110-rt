@@ -12,6 +12,9 @@ Public surface:
   bitfield.
 * :class:`MockTransportHeader` — chunk-3c stand-in for the live
   transport header used by :mod:`bench.rfi_warmup`.
+* :class:`FlagPersistence` — optional latch that keeps a cell flagged
+  for ``hold_s`` once the detectors have flagged it for a whole
+  ``latch_window_s`` (see :mod:`dsart.rfi.persistence`).
 * :func:`load_flagants` / :func:`load_flagants_torch` — legacy
   ``flagants.dat`` loader.
 
@@ -47,6 +50,14 @@ from dsart.rfi.flagants_loader import (
     parse_flagants_text,
 )
 from dsart.rfi.group_outlier import DEFAULT_GROUP_K, group_outlier_mask
+from dsart.rfi.persistence import (
+    HOLD_S_DEFAULT,
+    LATCH_FRAC_DEFAULT,
+    LATCH_WINDOW_S_DEFAULT,
+    FlagPersistence,
+    PersistenceStats,
+    seconds_to_cubes,
+)
 from dsart.rfi.sk import (
     DEFAULT_SK_FAR,
     compute_sk,
@@ -97,4 +108,11 @@ __all__ = [
     "MockTransportHeader",
     "RFIFlagger",
     "flag_block",
+    # time persistence
+    "FlagPersistence",
+    "PersistenceStats",
+    "HOLD_S_DEFAULT",
+    "LATCH_FRAC_DEFAULT",
+    "LATCH_WINDOW_S_DEFAULT",
+    "seconds_to_cubes",
 ]

@@ -462,6 +462,22 @@ routines:
   # 8 blocks), NOT the old alpha=0.001 EMA whose ~134 s time constant
   # decorrelated against the ~6.9 s/2pi max core-baseline fringe
   # winding (leaving bright sources largely unsubtracted).
+  # RFI time persistence (--rfi-persist, 2026-08-02): the four detectors
+  # are memoryless, so a transmitter sitting on a detector threshold
+  # blinks in and out at the 7.45 Hz cube cadence and leaves partly-
+  # excised RFI in the fast-vis stream. --rfi-persist latches any
+  # (ant, ch, pol) cell the detectors flag for a whole
+  # --rfi-persist-window-s (30 s = 224 cubes) and holds it flagged for
+  # --rfi-persist-hold-s (900 s = 6706 cubes) after they stop firing.
+  # --rfi-persist-frac 1.0 means "flagged in EVERY cube of the window",
+  # which needs only a consecutive-run counter: 2 int32 cube-shaped
+  # tensors (576 KB) and ~4 elementwise kernels per cube, no host sync.
+  # Lower it (e.g. 0.9) to tolerate gaps, at the cost of a
+  # [224, 96, 384, 2] uint8 ring (~16.5 MB). NOT YET EXERCISED ON SKY:
+  # to revert, delete the four --rfi-persist* lines, re-push with
+  # tools/ops/push_dsart_to_etcd.py and restart corr_fast. Watch the
+  # "rfi-persist: held=..." line in the corr_fast log (every 16 blocks)
+  # and total_flag_fraction on the dashboard's RFI row.
   - name: corr_fast
     cmd: python
     args: >-
@@ -479,6 +495,10 @@ routines:
       --sumthr-max-m 8
       --sumthr-eta 1.5
       --rfi-m-values 64,256,1024,4096
+      --rfi-persist
+      --rfi-persist-window-s 30
+      --rfi-persist-hold-s 900
+      --rfi-persist-frac 1.0
       --t-int-fast-native 32
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --chan-sum-factor 8

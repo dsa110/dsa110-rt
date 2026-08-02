@@ -333,6 +333,34 @@ generates four PNGs into `Level2/plots/`:
 Worker is a `concurrent.futures.ThreadPoolExecutor(max_workers=2)` so
 plots don't block the receive loop.  Per-event plot timeout 30 s.
 
+**Matching the detector's boxcar (2026-08-02).** Panels 1-3 place
+themselves at the burst's cube time, which the plotter has to relocate
+because the dumped NPZ carries no usable first-sample anchor (see the
+note below). That relocation used to argmax the *raw* per-sample
+series while the detector thresholds a boxcar match-filtered one, so
+the panels landed several samples off a wide burst (3 samples on
+260801rmep at `width_samples=16`, 7 on 260801bdga) and the re-measured
+significance understated it. The DM light curve is now convolved with
+the candidate's own `width_samples` boxcar (normalised `1/sqrt(w)`)
+before the argmax, `dm_time` renders the smoothed cube, `image_peak`
+averages the plane over the same boxcar, and every title prints the
+detector's SNR alongside the cube re-measurement. Panels 1 and 3 also
+work from the **detected pixel** rather than the image max, whose
+extreme-value distribution over 65 536 pixels is not a point-source
+sigma scale. `DSART_PLOTTER_SMOOTH=0` reverts to the raw behaviour.
+
+**Known gap — no in-cube time anchor.**
+`dump/c2_trigger_listener._build_manifest` writes
+`event_specnum_start = packet.event_specnum` (the trigger specnum,
+which is also the NPZ filename key) rather than the retained cube's
+sample-0 specnum, while `mjd_start` keeps the cube's real sample-0
+MJD. The two anchors in every archived NPZ therefore disagree and
+`(event_specnum - event_specnum_start) / sample_period_specnum` is 0
+for every event, so the detector's own time index cannot be recovered
+offline. Fixing it means ADDING a field (`cube_specnum_start` /
+`cube_mjd_start`); repurposing `event_specnum_start` would change the
+NPZ filenames that C3 and the dashboard glob on.
+
 
 ## 4. C2 → C1 dump broadcast
 
