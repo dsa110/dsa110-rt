@@ -531,6 +531,11 @@ class _CubeChunk:
     fine_dm_pc_cc: np.ndarray  # shape (n_fdm,)
     mjd_start: float
     sample_period_us: float
+    # TRUE sample-0 anchor (dumps from 2026-08-04 on). -1 / 0 when the
+    # NPZ predates it, in which case _metadata_t_idx declines and the
+    # width-matched argmax is used instead. See that function.
+    cube_specnum_start: int = -1
+    sample_period_specnum: int = 0
     # Populated by _populate_peak_grids after _load_cubes returns.
     peak_grid: Optional[np.ndarray] = None  # (n_fdm, n_t), fp32
     # Keep the NpzFile reference alive so the metadata zip handle stays
@@ -723,6 +728,12 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
                 fine_dm_pc_cc=fine_dm,
                 mjd_start=mjd_start,
                 sample_period_us=sample_period_us,
+                cube_specnum_start=int(
+                    _scalar_or(npz, "cube_specnum_start", -1)
+                ),
+                sample_period_specnum=int(
+                    _scalar_or(npz, "sample_period_specnum", 0)
+                ),
                 _npz=npz,
             ))
         except Exception as exc:  # noqa: BLE001
@@ -762,6 +773,9 @@ class _BurstPeak:
     width_samples: int
     kernel_id: str
     source: str  # "members" | "csv"
+    #: the candidate's absolute spec num, for _metadata_t_idx. 0 when the
+    #: source row did not carry it.
+    event_specnum: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -796,6 +810,9 @@ class _BurstCoords:
     snr_measured_raw: float = float("nan")
     t_idx_raw: Optional[int] = None
     boxcar: int = 1
+    #: True when t_idx came from the cube's sample-0 anchor (the
+    #: detector's own index) rather than from a re-located peak.
+    t_from_anchor: bool = False
 
     @property
     def snr_delta(self) -> float:
@@ -870,6 +887,42 @@ def _robust_z(series: np.ndarray) -> np.ndarray:
     return (x - med) / sigma
 
 
+def _metadata_t_idx(
+    chunk: Optional[_CubeChunk],
+    peak: Optional[_BurstPeak],
+) -> Optional[int]:
+    """The detector's own in-cube time index, or ``None`` if unknowable.
+
+    ``t = (event_specnum - cube_specnum_start) / sample_period_specnum``.
+    Only usable when the NPZ carries ``cube_specnum_start`` (dumps from
+    2026-08-04 on) — before that the only anchor was
+    ``event_specnum_start``, which the C2-trigger path overwrote with the
+    trigger specnum, making the expression identically 0. Verified on
+    260801rmep/bdga/pekd/oooi and 260802totk/unoj/gunl: every one gave
+    0, while the burst was really at t=110/139/183.
+
+    Returns None on absent/sentinel anchors or an out-of-range result, so
+    the caller falls back to the width-matched argmax.
+    """
+    if chunk is None or peak is None:
+        return None
+    anchor = getattr(chunk, "cube_specnum_start", None)
+    if anchor is None or int(anchor) < 0:
+        return None
+    period = int(getattr(chunk, "sample_period_specnum", 0) or 0)
+    if period <= 0:
+        return None
+    t = (int(peak.event_specnum) - int(anchor)) // period
+    t_det = int(chunk.cube.shape[0]) if chunk.cube.ndim == 4 else 0
+    if t_det and not (0 <= t < t_det):
+        _LOG.warning(
+            "plotter: metadata t_idx=%d outside the cube [0, %d) — "
+            "falling back to the matched argmax", t, t_det,
+        )
+        return None
+    return int(t)
+
+
 def _pixel_lightcurve(
     chunk: Optional[_CubeChunk],
     fdm: int,
@@ -927,6 +980,7 @@ def _peak_from_members(
         width_samples=int(m.width_samples),
         kernel_id=str(m.kernel_id),
         source="members",
+        event_specnum=int(getattr(m, "event_specnum", 0) or 0),
     )
 
 
@@ -955,6 +1009,7 @@ def _peak_from_csv_rows(rows: Sequence[dict]) -> Optional[_BurstPeak]:
             width_samples=int(best["width_samples"]),
             kernel_id=str(best["kernel_id"]),
             source="csv",
+            event_specnum=int(float(best.get("event_specnum", 0) or 0)),
         )
     except (KeyError, TypeError, ValueError) as exc:
         _LOG.warning("plotter: malformed C1-window peak row: %s", exc)
@@ -1069,6 +1124,15 @@ def _burst_coords(
     peak, with and without the boxcar, so callers can print the gap
     against the detector's reported SNR.
     """
+    # 2026-08-04: if the cube carries the TRUE sample-0 anchor
+    # (`cube_specnum_start`, added alongside this), the detector's own
+    # time index is directly computable and we no longer have to relocate
+    # the burst at all. Older dumps have only `event_specnum_start`,
+    # which the C2-trigger path overwrote with the trigger specnum, so
+    # `_metadata_t_idx` returns None for them and we fall back to the
+    # width-matched argmax below.
+    t_meta = _metadata_t_idx(chunk, peak)
+
     if waterfall is None or waterfall.ndim != 2 or not waterfall.size:
         if peak is None:
             return None
@@ -1100,8 +1164,15 @@ def _burst_coords(
         # When the two disagree the residual is correlated on the boxcar
         # scale — logged as the whiteness ratio in render_event_plots.
         z_smooth = _robust_z(_boxcar(series, box)) if box > 1 else z_raw
-        t_idx = int(np.argmax(z_smooth))
         t_raw = int(np.argmax(z_raw))
+        if t_meta is not None:
+            # The cube carries a trustworthy sample-0 anchor, so this IS
+            # the detector's own time index -- use it directly rather than
+            # relocating the burst. This is what the panels were always
+            # supposed to show.
+            t_idx = int(t_meta)
+        else:
+            t_idx = int(np.argmax(z_smooth))
         return _BurstCoords(
             t_idx=t_idx, fdm_idx=fdm, l_pix=l_pix, m_pix=m_pix,
             dm_pc_cc=peak.dm_pc_cc, snr=peak.snr,
@@ -1110,6 +1181,7 @@ def _burst_coords(
             snr_measured=float(z_smooth[t_idx]),
             snr_measured_raw=float(z_raw[t_raw]),
             t_idx_raw=t_raw, boxcar=box,
+            t_from_anchor=(t_meta is not None),
         )
     # Fallback: global argmax of the waterfall, (l, m) from that plane.
     flat = int(np.argmax(waterfall))
@@ -1225,6 +1297,8 @@ def _snr_note(coords: Optional[_BurstCoords]) -> str:
         return ""
     note = (f" | cube w{coords.boxcar} {coords.snr_measured:.1f}σ "
             f"Δ{coords.snr_delta:+.1f}")
+    if coords.t_from_anchor:
+        note += " [t from anchor]"
     if coords.boxcar > 1 and np.isfinite(coords.snr_measured_raw):
         note += f" (raw {coords.snr_measured_raw:.1f}σ)"
     return note

@@ -605,6 +605,23 @@ class CubeDumpWriter:
                 event_specnum_start=np.asarray(
                     manifest.event_specnum_start, dtype="int64"
                 ),
+                # TRUE sample-0 anchor (2026-08-04). Distinct from
+                # event_specnum_start, which the C2-trigger path
+                # overwrites with the trigger specnum because the
+                # filename is built from it. -1 / NaN when the manifest
+                # predates the field, so readers can detect absence.
+                cube_specnum_start=np.asarray(
+                    -1 if manifest.cube_specnum_start is None
+                    else manifest.cube_specnum_start, dtype="int64",
+                ),
+                cube_mjd_start=np.asarray(
+                    float("nan") if manifest.cube_mjd_start is None
+                    else manifest.cube_mjd_start, dtype="float64",
+                ),
+                sample_period_specnum=np.asarray(
+                    -1 if manifest.sample_period_specnum is None
+                    else manifest.sample_period_specnum, dtype="int32",
+                ),
                 t_det=np.asarray(manifest.t_det, dtype="int32"),
                 n_fdm_in_cube=np.asarray(
                     manifest.n_fdm_in_cube, dtype="int32"

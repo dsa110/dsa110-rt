@@ -1462,6 +1462,11 @@ class SearchComputeService:
                 cube_id=slot.cube_id,
                 event_specnum_start=slot.specnum_start,
                 mjd_start=geom.mjd_start,
+                # already sample 0 on this path; set explicitly so every
+                # dump carries the anchor whatever built it.
+                cube_specnum_start=slot.specnum_start,
+                cube_mjd_start=geom.mjd_start,
+                sample_period_specnum=geom.sample_period_specnum,
                 t_det=slot.t_det,
                 n_fdm_in_cube=slot.n_fdm_in_cube,
                 n_grid=slot.n_grid,
@@ -1536,6 +1541,9 @@ class SearchComputeService:
                             cube_id=slot.cube_id,
                             event_specnum_start=slot.specnum_start,
                             mjd_start=geom.mjd_start,
+                            cube_specnum_start=slot.specnum_start,
+                            cube_mjd_start=geom.mjd_start,
+                            sample_period_specnum=geom.sample_period_specnum,
                             t_det=slot.t_det,
                             n_fdm_in_cube=slot.n_fdm_in_cube,
                             n_grid=slot.n_grid,

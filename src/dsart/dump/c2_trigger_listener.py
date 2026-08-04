@@ -389,8 +389,15 @@ class C2TriggerListener:
         )
         return CubeDumpManifest(
             cube_id=int(retained.cube_id),
+            # NOTE: deliberately the TRIGGER specnum, not sample 0 --
+            # the writer composes the NPZ filename from this and C3 +
+            # the dashboards glob on cube_s*_g*_<trigger_specnum>.npz.
+            # The real anchor goes in cube_specnum_start below.
             event_specnum_start=int(packet.event_specnum),
             mjd_start=float(retained.mjd_start),
+            cube_specnum_start=int(retained.event_specnum_start),
+            cube_mjd_start=float(retained.mjd_start),
+            sample_period_specnum=int(retained.sample_period_specnum),
             t_det=int(retained.t_det),
             n_fdm_in_cube=int(retained.n_fdm),
             n_grid=int(retained.n_grid),

@@ -515,3 +515,118 @@ def test_smoothing_can_be_disabled_by_env(
     finally:
         for c in cubes:
             c.close()
+
+
+# ---------------------------------------------------------------------------
+# Cube sample-0 anchor (2026-08-04)
+# ---------------------------------------------------------------------------
+
+
+def _write_anchored_cube(
+    cubes_dir: Path, *, sid: int, g: int, trigger_specnum: int,
+    cube_specnum_start: int, sample_period_specnum: int, burst_t: int,
+) -> None:
+    """One NPZ carrying the TRUE sample-0 anchor, with the burst planted
+    somewhere OTHER than where the anchor points, so a test can tell
+    which route placed the panels."""
+    cubes_dir.mkdir(parents=True, exist_ok=True)
+    cube = np.full((T_DET, N_FDM, N_GRID, N_GRID), 0.1, dtype=np.float16)
+    cube[burst_t, BURST_FDM, BURST_L, BURST_M] = 40.0
+    np.savez(
+        cubes_dir / f"cube_s{sid}_g{g}_{trigger_specnum}.npz",
+        cube=cube,
+        peak_grid=cube.max(axis=(2, 3)),
+        mjd_start=np.asarray(60781.0, dtype="float64"),
+        event_specnum_start=np.asarray(trigger_specnum, dtype="int64"),
+        cube_specnum_start=np.asarray(cube_specnum_start, dtype="int64"),
+        cube_mjd_start=np.asarray(60781.0, dtype="float64"),
+        sample_period_specnum=np.asarray(sample_period_specnum, dtype="int32"),
+        t_det=np.asarray(T_DET, dtype="int32"),
+        n_fdm_in_cube=np.asarray(N_FDM, dtype="int32"),
+        n_grid=np.asarray(N_GRID, dtype="int32"),
+        cluster_record=np.asarray("null", dtype="U"),
+        trigger_source=np.asarray("udp", dtype="U"),
+        search_node_id=np.asarray(sid, dtype="int32"),
+        gpu_half=np.asarray(g, dtype="int32"),
+    )
+
+
+def test_anchor_is_read_off_the_npz(tmp_path: Path) -> None:
+    from dsart.coinc.plotter import _load_cubes
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G, trigger_specnum=500,
+        cube_specnum_start=468, sample_period_specnum=4, burst_t=3,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        assert len(cubes) == 1
+        assert cubes[0].cube_specnum_start == 468
+        assert cubes[0].sample_period_specnum == 4
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_uses_the_anchor_when_present(tmp_path: Path) -> None:
+    """t = (event_specnum - cube_specnum_start) / sample_period_specnum.
+    488 - 468 = 20, / 4 => sample 5 (inside the T_DET=8 fixture cube)."""
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G, trigger_specnum=488,
+        cube_specnum_start=468, sample_period_specnum=4, burst_t=3,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        import dataclasses
+        # the fixture's peak member carries event_specnum=200; point it at
+        # the value this cube was written for
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=488,
+        )
+        # 5, NOT the planted burst at t=3: the anchor must win over the
+        # re-located peak when it is available.
+        assert _metadata_t_idx(cubes[0], peak) == 5
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_declines_on_pre_anchor_dumps(tmp_path: Path) -> None:
+    """Older NPZs have no cube_specnum_start; the sentinel must make the
+    plotter fall back to the width-matched argmax rather than silently
+    placing every panel at t=0."""
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    _write_fake_cubes(tmp_path / "cubes")          # legacy writer, no anchor
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        peak = _peak_from_members(_members())
+        for c in cubes:
+            assert c.cube_specnum_start == -1
+            assert _metadata_t_idx(c, peak) is None
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_rejects_an_out_of_range_index(tmp_path: Path) -> None:
+    """A corrupt or mismatched anchor must not place a panel outside the
+    cube — it should decline and let the argmax path run."""
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G, trigger_specnum=999999,
+        cube_specnum_start=0, sample_period_specnum=1, burst_t=3,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        import dataclasses
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=999999,
+        )
+        assert _metadata_t_idx(cubes[0], peak) is None
+    finally:
+        for c in cubes:
+            c.close()

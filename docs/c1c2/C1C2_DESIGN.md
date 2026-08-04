@@ -430,7 +430,43 @@ Before launching the new stack:
 A `tools/c2/legacy_shutdown.sh` script automates 1–4 with idempotent
 checks.
 
-## 6b. Zero-filled cube edges — root cause (2026-08-04)
+## 6b. "End-of-cube weirdness" — THREE distinct phenomena (2026-08-04)
+
+**Read this before §6c.** Waterfalls showing something odd late in the
+cube have at least three unrelated causes, and an earlier revision of
+§6c confidently attributed all of them to the first. They are:
+
+1. **Missing data (zeros).** `260803wsxt`: a hard zero block from
+   t=192 in the lowest-DM half. §6c below. **The mechanism there is a
+   hypothesis, not a confirmed diagnosis** — see the caveat at its end.
+2. **Diffuse RFI power.** `260804jbpj`: no zeros anywhere (all 34 rows
+   × 8 halves fully populated), but fine-DM rows 1–11 of `s9g1` step by
+   −18 % … +54 % at t=203 (33σ on the strongest row). Averaging the
+   images over that window gives a brightest pixel of 4.7σ with **not
+   one pixel above 5σ** — there is no source; the whole image floor
+   lifts. That is incoherent power from a bright narrowband burst
+   (the voltages show 1361–1377 MHz at z=134 and 1314–1315 MHz at
+   z=98, each ~1 ms) redistributing across DM trials. Per-row σ
+   normalisation in the `dm_time` panel then renders a 54 % floor rise
+   as a dramatic stripe, and the rows that *dropped* as the dark band
+   beside it.
+3. **Corr-block seams (hypothesised, NOT observed).** A corr fada block
+   is exactly 128 search samples (4096 native ÷ 32) while the cube is
+   256 and strides 192, so *if* cubes were phase-locked to block
+   boundaries, odd-indexed cubes would carry internal seams at t=64 and
+   t=192 — where the RFI flag mask, the per-block cint8 quantise
+   scale/offset and the static-sky estimate all change. Tested on
+   `260804jbpj`: the steps at t=64/128/192 are ≤2.4 % in all 8 halves
+   while the real break is at 203. **No evidence for this mechanism**,
+   and it cannot be tested properly until the anchor in §6d lands,
+   because the cube's phase relative to corr blocks is currently
+   unrecoverable.
+
+The lesson: t=192 is the cube stride *and* a plausible corr-block seam
+*and* where one event's zeros began, so it attracts false attribution.
+Measure the change-point per DM row before assuming which one you have.
+
+## 6c. Zero-filled cube edges — mechanism (2026-08-04)
 
 Dumped cubes intermittently show a hard zero block at the end, most
 visibly at low DM: `260803wsxt`'s DM×time waterfall goes dead from
@@ -499,6 +535,86 @@ produces an edge response at the end of the cube.
 Until (1)/(2) land, `dsart/coinc/cube_veto.py` computes every statistic
 on `live_span()` so at least the *offline* adjudication is not corrupted
 by the zeros; that is a mitigation, not a fix.
+
+**Caveat on the fan-in attribution above — it is unconfirmed.** Two
+things argue against it and neither has been resolved:
+
+* A missing corr removes 1 of 16 chgroups, which should give a ~6 %
+  amplitude deficit, not the *zeros* observed in `260803wsxt`. Zeros
+  need every chgroup absent in that region.
+* The fan-in gate DOES go short routinely, but it costs nothing. On
+  n01 g0 over 47.3 h / 841,730 cubes, `n_fan_in_stall` grew by
+  **4,611,842** and **40 of 48 hourly buckets** saw at least one failed
+  check — yet cubes emitted per hour stayed at **17,750–17,880** against
+  a 17,880 nominal, i.e. ~100 % in every hour, including the worst
+  (256,375 failed checks). `n_fan_in_stall` counts poll-loop
+  *iterations* spent parked, not lost cubes: the consumer parks
+  sub-cadence, re-polls, and still emits on time. So a shortfall at the
+  15-corr threshold is currently free.
+* Ongoing slot loss is real but small: `n_no_data_present` is
+  **0.0982 %** of slots read, **6.0 slots per cube** — consistent with
+  the "1–2 % of UV cells fail per cube" that motivated relaxing
+  `layer2_valid_min_fraction` below 1.0. That is nowhere near enough to
+  zero a whole 64-sample block across every chgroup.
+
+`260803wsxt`'s cubes were deleted before the mechanism could be tested,
+so this stands as the leading hypothesis only. Confirming it needs the
+near-miss instrumentation in §6e.
+
+## 6d. Cube sample-0 anchor (2026-08-04)
+
+`CubeDumpManifest.event_specnum_start` is documented as sample 0, and is
+that on the auto/udp paths — but `dump/c2_trigger_listener._build_
+manifest` overwrites it with `packet.event_specnum` (the trigger
+specnum) because the writer composes the NPZ filename from it and C3 +
+the dashboard glob on `cube_s*_g*_<trigger_specnum>.npz`.
+
+Consequence: in every archived C2-triggered dump,
+`(event_specnum - event_specnum_start) / sample_period_specnum == 0`.
+Verified on 260801rmep/bdga/pekd/oooi and 260802totk/unoj/gunl — all
+gave 0, while the burst was really at t=110/139/183. So the detector's
+own in-cube time index has been unrecoverable offline, which is why
+`plotter._burst_coords` had to relocate the burst by argmax at all, and
+why the corr-block-seam test in §6b could not be run.
+
+Fixed by *adding* fields rather than repurposing the filename key:
+
+| field | meaning |
+| --- | --- |
+| `cube_specnum_start` | TRUE spec num at cube sample 0 |
+| `cube_mjd_start` | TRUE MJD at cube sample 0 |
+| `sample_period_specnum` | spec-nums per detector sample |
+
+All four manifest builders populate them; the writer stores them in the
+NPZ (`-1` / NaN sentinels when absent). `plotter._metadata_t_idx` uses
+them when present and declines otherwise, so pre-2026-08-04 dumps keep
+the width-matched-argmax behaviour and panels placed from the anchor are
+tagged `[t from anchor]`.
+
+`sample_period_specnum` is recorded rather than assumed because it is
+derived from the live op-point (`t_int_search_us / t_int_fast_us`).
+`CubeGeometry`'s docstring still says "= 16 in production", which was
+true when `t_int_fast_native` was 2; at the current 32 it is 1.
+Hard-coding 16 would silently scale every offline time index by 16×.
+
+## 6e. Fan-in near-miss instrumentation (2026-08-04)
+
+`ProductionRxRingSource.stats` (`cubes_emitted`, `n_slots_read`,
+`n_overrun`, `n_pattern_mismatch`, `n_no_data_present`,
+`n_fan_in_stall`) **is** already logged — it is the `src={...}` field of
+every `cube_progress` line. It is easy to miss: the keys are printed as
+a repr'd dict (`'n_no_data_present': 5037142`), so a grep for
+`n_no_data_present=` finds nothing and the field sits past ~220 columns.
+`/mon/search_rt/<cn>/rx` is still in the influx pusher's
+*planned-but-unbuilt* list, so none of it reaches Grafana.
+
+What was genuinely missing is the **distribution of how many corrs were
+at the boundary when the gate PASSED**. `n_fan_in_stall` counts only
+failed checks, so a cube scraping through at exactly `fan_in_min_corrs`
+was indistinguishable from one with all 16 present — and that ratio is
+precisely what sets the cost of `--fan-in-min-corrs 16`.
+`stats["n_at_target"]` now carries `{n_corrs: n_gate_passes}`, so after
+a day's running the 15-vs-16 split can be read straight off the log.
 
 ## 7. References (in-tree)
 
