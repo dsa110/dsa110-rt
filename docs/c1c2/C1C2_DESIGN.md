@@ -430,6 +430,76 @@ Before launching the new stack:
 A `tools/c2/legacy_shutdown.sh` script automates 1–4 with idempotent
 checks.
 
+## 6b. Zero-filled cube edges — root cause (2026-08-04)
+
+Dumped cubes intermittently show a hard zero block at the end, most
+visibly at low DM: `260803wsxt`'s DM×time waterfall goes dead from
+**t=192** in its lowest-DM half (`s1g0`) and from **t≈205** in its
+highest. This is not cosmetic — it is the mechanism behind a family of
+end-of-cube false positives, and it corrupts the C3 veto's own metrics.
+
+**It is not the inter-cube overlap.** `t_det=256`,
+`cube_cadence_samples=192` ⇒ 64 samples of designed overlap, and 192
+coincides with the boundary, which is misleading. The M7.7 wait gate
+*does* cover the trailing padding:
+
+```python
+target_seq = (last_cube_seq_boundary + t_det + pad_right) * n_active_dms_per_corr
+```
+
+and the scatter buffers *are* sized `t_stream`, not `t_det` (the
+"we deliberately size at T_det" comment above
+`_scatter_cint8_buf` is stale, pre-M7.7).
+
+**The cause is the fan-in gate emitting incomplete cubes.** The gate
+passes once `fan_in_min_corrs` corrs reach `target_seq` — production
+runs `--fan-in-min-corrs 15`, so a cube is emitted with **15 of 16**
+corrs present. The absent corr's chgroup rows stay zero in the scatter
+buffer. The fine-DM combiner then sums 16 chgroups at per-`(fdm,
+chgroup)` time shifts, so a missing chgroup depresses
+`n_chg_contrib(t, fdm)` in a pattern set by the shift table —
+concentrated at the cube's time edges and varying with DM trial, which
+is exactly the observed ragged, DM-dependent tail. Under a persistently
+late corr (the known ~8–11 % hash-dependent corr→search fabric loss)
+this is chronic rather than occasional.
+
+Two downstream layers then fail to correct it:
+
+* **Layer-1 coverage correction** divides by expected coverage. Under
+  symmetric padding (enabled in production) it is designed to be a
+  no-op because `n_chg_contrib ≡ 16` — an assumption a genuinely
+  missing corr violates, so the short cells are never corrected.
+* **`validity_mask` cannot express it.** It is `[t_det, n_fdm]` but is
+  *broadcast* from a per-`t` vector, so "this DM trial's edge is short a
+  chgroup" is unrepresentable. Worse, the detector never masks the data
+  with it at all — `_compute_per_kernel_scores`' own docstring says the
+  mask "is validated here but not used to mask the data"; it only gates
+  the Layer-2 σ_k EMA, and `layer2_valid_min_fraction` was relaxed from
+  1.0 so the EMA keeps learning off partly-zero cubes.
+
+The boxcar bank therefore convolves straight across the zero step and
+produces an edge response at the end of the cube.
+
+**Real fixes, in order of value:**
+
+1. **Make the coverage correction honour actual coverage.** Compute
+   `n_chg_contrib(t, fdm)` from which corrs were really present this
+   cube — the RX already knows, it has per-corr `wseq` at gate time —
+   and divide by that instead of assuming 16. This makes a 15/16 cube
+   statistically correct rather than subtly wrong at the edges.
+2. **Make `validity_mask` per-`(t, fdm)`** and have the detector exclude
+   invalid cells from the boxcar, not just from the EMA gate.
+3. **Operational lever:** `--fan-in-min-corrs 16` removes the artefact
+   outright, at the cost of dropping a cube whenever any corr is late.
+   Not obviously the right trade, but it is one config token and it
+   makes the artefact vanish, so it is the cheapest way to confirm this
+   diagnosis on sky.
+4. Fix the underlying fabric loss so 16/16 is the norm.
+
+Until (1)/(2) land, `dsart/coinc/cube_veto.py` computes every statistic
+on `live_span()` so at least the *offline* adjudication is not corrupted
+by the zeros; that is a mitigation, not a fix.
+
 ## 7. References (in-tree)
 
 - Detector + merger code: `src/dsart/detector/{forward.py, merger.py,
