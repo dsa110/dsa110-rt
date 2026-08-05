@@ -439,7 +439,7 @@
       "type": "singlestat",
       "title": "n01 g0",
       "datasource": "InfluxDB",
-      "description": "Search half cn1 gpu_half 0: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn1 gpu_half 0: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 0,
         "y": 6,
@@ -454,16 +454,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '1' AND \"gpu_half\" = '0'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '1' AND \"gpu_half\" = '0'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -474,11 +474,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -529,7 +529,7 @@
       "type": "singlestat",
       "title": "n01 g1",
       "datasource": "InfluxDB",
-      "description": "Search half cn1 gpu_half 1: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn1 gpu_half 1: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 3,
         "y": 6,
@@ -544,16 +544,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '1' AND \"gpu_half\" = '1'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '1' AND \"gpu_half\" = '1'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -564,11 +564,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -619,7 +619,7 @@
       "type": "singlestat",
       "title": "n02 g0",
       "datasource": "InfluxDB",
-      "description": "Search half cn2 gpu_half 0: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn2 gpu_half 0: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 6,
         "y": 6,
@@ -634,16 +634,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '2' AND \"gpu_half\" = '0'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '2' AND \"gpu_half\" = '0'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -654,11 +654,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -709,7 +709,7 @@
       "type": "singlestat",
       "title": "n02 g1",
       "datasource": "InfluxDB",
-      "description": "Search half cn2 gpu_half 1: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn2 gpu_half 1: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 9,
         "y": 6,
@@ -724,16 +724,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '2' AND \"gpu_half\" = '1'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '2' AND \"gpu_half\" = '1'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -744,11 +744,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -799,7 +799,7 @@
       "type": "singlestat",
       "title": "n09 g0",
       "datasource": "InfluxDB",
-      "description": "Search half cn9 gpu_half 0: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn9 gpu_half 0: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 12,
         "y": 6,
@@ -814,16 +814,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '9' AND \"gpu_half\" = '0'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '9' AND \"gpu_half\" = '0'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -834,11 +834,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -889,7 +889,7 @@
       "type": "singlestat",
       "title": "n09 g1",
       "datasource": "InfluxDB",
-      "description": "Search half cn9 gpu_half 1: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn9 gpu_half 1: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 15,
         "y": 6,
@@ -904,16 +904,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '9' AND \"gpu_half\" = '1'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '9' AND \"gpu_half\" = '1'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -924,11 +924,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -979,7 +979,7 @@
       "type": "singlestat",
       "title": "n13 g0",
       "datasource": "InfluxDB",
-      "description": "Search half cn13 gpu_half 0: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn13 gpu_half 0: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 18,
         "y": 6,
@@ -994,16 +994,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '13' AND \"gpu_half\" = '0'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '13' AND \"gpu_half\" = '0'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -1014,11 +1014,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -1069,7 +1069,7 @@
       "type": "singlestat",
       "title": "n13 g1",
       "datasource": "InfluxDB",
-      "description": "Search half cn13 gpu_half 1: sky seconds ingested into the cube retention ring per wall second, over a fixed 300 s lookback (independent of the dashboard time range). 1.0 = keeping up with real time. N/A = the half published nothing in the last 300 s -- process down, or the etcd->influx pusher stopped. Source: search_rt_dump.cube_ring_newest_end_specnum_excl.",
+      "description": "Search half cn13 gpu_half 1: percentage of real time this half was NOT processing cubes, over a fixed 1800 s lookback (independent of the dashboard time range). 0% = keeping up; every percent here is a percent of the sky in which an FRB could not have been found. Green below 0.5%, red above 2.0%. A healthy fleet measured 0.000-0.235% on 2026-08-05. A value in the thousands means the process restarted inside the window (counter reset); it clears itself. N/A = published nothing at all -- process down, or the etcd->influx pusher stopped. Source: search_rt_noise.layer2_cube_count against a 4.96705 cubes/s real-time target.",
       "gridPos": {
         "x": 21,
         "y": 6,
@@ -1084,16 +1084,16 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT (last(\"cube_ring_newest_end_specnum_excl\") - first(\"cube_ring_newest_end_specnum_excl\")) * 0.0000034952533 FROM \"search_rt_dump\" WHERE time > now() - 300s AND \"cn_id\" = '13' AND \"gpu_half\" = '1'",
+          "query": "SELECT 100 - (last(\"layer2_cube_count\") - first(\"layer2_cube_count\")) * 0.0111972520578 FROM \"search_rt_noise\" WHERE time > now() - 1800s AND \"cn_id\" = '13' AND \"gpu_half\" = '1'",
           "tags": [],
           "groupBy": [],
           "select": [],
           "measurement": ""
         }
       ],
-      "format": "percentunit",
+      "format": "percent",
       "valueName": "current",
-      "decimals": 1,
+      "decimals": 2,
       "sparkline": {
         "fillColor": "rgba(31, 118, 189, 0.18)",
         "full": false,
@@ -1104,11 +1104,11 @@
       },
       "colorValue": false,
       "colorBackground": true,
-      "thresholds": "0.90,0.97",
+      "thresholds": "0.5,2.0",
       "colors": [
-        "#d44a3a",
+        "#299c46",
         "rgba(237, 129, 40, 0.89)",
-        "#299c46"
+        "#d44a3a"
       ],
       "valueFontSize": "100%",
       "prefixFontSize": "50%",
@@ -1159,7 +1159,7 @@
       "type": "graph",
       "title": "Search ingest -- x real time per GPU half (target 1.0)",
       "datasource": "InfluxDB",
-      "description": "Per-GPU-half data ingest, expressed as a multiple of real time. All 8 traces should sit flat on 1.0. One trace dropping while the others hold is that half losing its corr->search feed (the hash-dependent switch-fabric loss signature); all 8 dropping together is upstream (corr TX or capture). A trace vanishing means the half stopped publishing entirely.",
+      "description": "Per-GPU-half SKY CLOCK advance, expressed as a multiple of real time. Kept alongside the blind-fraction panel because it answers a different question: this one goes flat only when a half stops being fed or stops publishing at all, so it is the hard-stall detector. It cannot see a partial deficit -- the counter tracks where the sky has got to, not how much of it was processed -- which is why the tiles above are keyed on the cube count instead. All 8 traces should sit flat on 1.0; all 8 dropping together is upstream (corr TX or capture).",
       "gridPos": {
         "x": 0,
         "y": 10,
@@ -1238,9 +1238,9 @@
     {
       "id": 16,
       "type": "graph",
-      "title": "Detector throughput -- Layer-2 cubes/s per GPU half (target 4.97)",
+      "title": "Blind fraction -- % of real time not processed, per GPU half",
       "datasource": "InfluxDB",
-      "description": "Cubes per second through each half's Layer-2 normaliser. Pair it with the ingest panel to the left: ring advancing but cubes/s stuck = the DETECTOR wedged on that half; both stalled = no data arriving. Real time is 4.97 cubes/s (192-sample cube stride at 1048.576 us).",
+      "description": "The history behind the tiles: percent of real time each half failed to process, against a 4.96705 cubes/s target. Flat on 0 is healthy. The y-axis is deliberately clamped to 6% -- the whole point of this panel is that a 3% deficit must be visible, and it is not on an axis that also has to show a hard stall at 100%. Traces do leave the top; that is what the tiles and the ingest panel are for.\n\nnon_negative_derivative, not derivative, so a process restart (counter back to 0) is dropped rather than drawn as a single enormous spike that flattens the interesting range. Smoothed over 5 x 60 s because the cube counter is an integer and the unsmoothed trace steps by +/-2.7% on a healthy half.\n\nThe right-most point always reads high: the trailing bucket is partial, so its derivative is short. That artefact is inherent to any bucketed rate and is why the tiles above use a boundary-free first/last difference instead. Judge the trend here, and the tiles for the current number.",
       "gridPos": {
         "x": 12,
         "y": 10,
@@ -1255,7 +1255,7 @@
           "resultFormat": "time_series",
           "orderByTime": "ASC",
           "rawQuery": true,
-          "query": "SELECT derivative(last(\"layer2_cube_count\"), 1s) FROM \"search_rt_noise\" WHERE $timeFilter GROUP BY time($__interval), \"cn_id\", \"gpu_half\" fill(null)",
+          "query": "SELECT 100 - moving_average(non_negative_derivative(last(\"layer2_cube_count\"), 1s), 5) * 20.1326592000000 FROM \"search_rt_noise\" WHERE $timeFilter GROUP BY time(60s), \"cn_id\", \"gpu_half\" fill(null)",
           "tags": [],
           "groupBy": [],
           "select": [],
@@ -1264,11 +1264,11 @@
       ],
       "yaxes": [
         {
-          "format": "short",
+          "format": "percent",
           "label": null,
           "logBase": 1,
-          "min": "0",
-          "max": null,
+          "min": "-0.5",
+          "max": "6",
           "show": true
         },
         {
@@ -1312,7 +1312,24 @@
         "sort": 0,
         "value_type": "individual"
       },
-      "thresholds": [],
+      "thresholds": [
+        {
+          "colorMode": "warning",
+          "fill": false,
+          "line": true,
+          "op": "gt",
+          "value": 0.5,
+          "yaxis": "left"
+        },
+        {
+          "colorMode": "critical",
+          "fill": false,
+          "line": true,
+          "op": "gt",
+          "value": 2.0,
+          "yaxis": "left"
+        }
+      ],
       "timeFrom": null,
       "timeShift": null
     },
