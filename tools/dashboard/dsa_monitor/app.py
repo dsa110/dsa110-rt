@@ -32,6 +32,7 @@ The poller thread starts at import-time; Flask serves HTTP requests.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import threading
@@ -1454,6 +1455,14 @@ def control_inject_post():
                       ``DEFAULT_INJECT_MARGIN_BLOCKS = 16``)
       chgroups        comma-separated ints, e.g. "0,1,2"
                       (omit → all 16)
+      allow_bright    truthy → bypass the imager brightness guard.
+                      By default an injection whose predicted observed
+                      SNR (K·F/√w, from the bucket's stored K) exceeds
+                      ``IMAGER_SAFE_OBSERVED_SNR``, or whose fluence
+                      exceeds ``DEFAULT_MAX_PROBE_FLUENCE_NO_K`` when
+                      the bucket has no K, is rejected with 400. The
+                      guard never silently clamps — the operator
+                      decides.
     """
     f = request.form
     target_snr_raw = (f.get("target_snr") or "").strip()
@@ -1475,6 +1484,10 @@ def control_inject_post():
         return jsonify({"ok": False, "error": "inj_id is required"}), 400
 
     # Resolve fluence: either explicit OR derived from target_snr via K.
+    import inject_calibration as ic                              # local
+    cal_entry = ic.CalibrationStore(control_store).get(
+        dm_pc_cm3=float(kwargs["dm_pc_cm3"]),
+    )
     target_snr: float | None = None
     if target_snr_raw:
         try:
@@ -1486,9 +1499,7 @@ def control_inject_post():
                 "ok": False,
                 "error": f"target_snr={target_snr_raw!r}: {exc}",
             }), 400
-        import inject_calibration as ic  # local
-        cs = ic.CalibrationStore(control_store)
-        entry = cs.get(dm_pc_cm3=float(kwargs["dm_pc_cm3"]))
+        entry = cal_entry
         if entry is None or not (entry.K > 0):
             return jsonify({
                 "ok": False,
@@ -1516,6 +1527,64 @@ def control_inject_post():
         except ValueError as exc:
             return jsonify({
                 "ok": False, "error": f"bad fluence_jy_ms: {exc}",
+            }), 400
+
+    # 2026-08-06 brightness guard. The fp16 imager's dead zone starts
+    # at an observed SNR of only ~35–60σ; injections above it either
+    # vanish (overflow → NaN → scrubbed) or rail at the detector's
+    # ±250σ input clip and spray sidelobe candidates fleet-wide (the
+    # 2026-08-06 353σ incident). Unlike the calibration prober we never
+    # silently clamp here — an operator-authored inject is rejected so
+    # the operator decides, and ``allow_bright=1`` deliberately
+    # bypasses the guard for intentional saturation probes.
+    allow_bright = (
+        (f.get("allow_bright") or "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if not allow_bright:
+        fluence_val = float(kwargs["fluence_jy_ms"])
+        width_val = int(kwargs["width_samples"])
+        bucket = ic.bucket_key(float(kwargs["dm_pc_cm3"]))
+        cap = ic.max_safe_fluence(
+            cal_entry.K if cal_entry is not None else None, width_val,
+        )
+        if cap is not None:
+            predicted_snr = (
+                float(cal_entry.K) * fluence_val / math.sqrt(max(width_val, 1))
+            )
+            if predicted_snr > ic.IMAGER_SAFE_OBSERVED_SNR:
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        f"fluence {fluence_val:.4g} Jy·ms at width "
+                        f"{width_val} predicts observed SNR "
+                        f"{predicted_snr:.1f} for bucket {bucket} "
+                        f"(K={cal_entry.K:.4g}), above the imager-safe "
+                        f"ceiling of {ic.IMAGER_SAFE_OBSERVED_SNR:.0f}σ — "
+                        f"the fp16 imager saturates from ~35σ up and the "
+                        f"injection would vanish or rail at the 250σ "
+                        f"detector clip. Use fluence <= {cap:.4g} Jy·ms "
+                        f"(target_snr <= {ic.IMAGER_SAFE_OBSERVED_SNR:.0f}), "
+                        f"or pass allow_bright=1 to override."
+                    ),
+                    "bucket": bucket,
+                    "predicted_observed_snr": predicted_snr,
+                    "max_safe_fluence_jy_ms": cap,
+                }), 400
+        elif fluence_val > ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"fluence {fluence_val:.4g} Jy·ms exceeds the no-K "
+                    f"ceiling of {ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K:.4g} "
+                    f"Jy·ms: bucket {bucket} has no stored K, so the "
+                    f"observed SNR cannot be predicted and the fp16 "
+                    f"imager's saturation dead zone (~35σ and up) cannot "
+                    f"be ruled out. Calibrate the bucket first, or pass "
+                    f"allow_bright=1 to override."
+                ),
+                "bucket": bucket,
+                "max_safe_fluence_jy_ms": ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K,
             }), 400
 
     raw_specnum = (f.get("apply_at_specnum") or "").strip()
@@ -1584,6 +1653,15 @@ def control_inject_calibrate_post():
       poll_timeout_s  float (default 30.0)
       chgroups        comma-separated ints (default all 16)
       margin_blocks   int (default DEFAULT_INJECT_MARGIN_BLOCKS)
+      ladder          truthy → allow the ×2/×4 fluence escalation on a
+                      no_match. Default OFF (2026-08-06): exactly one
+                      probe at the requested fluence. Every rung —
+                      including the first — is capped by the
+                      imager-safety guard (K-derived
+                      ``max_safe_fluence``, else
+                      ``DEFAULT_MAX_PROBE_FLUENCE_NO_K``); a clamped
+                      probe reports ``fluence_clamped`` /
+                      ``fluence_requested`` / ``fluence_used``.
 
     Returns a JSON :class:`inject_calibration.ProbeResult` dict.
     """
@@ -1647,6 +1725,15 @@ def control_inject_calibrate_post():
     # use cases.
     health_check = (f.get("health_check") or "1").strip()
     use_ladder = (f.get("use_ladder") or "1").strip()
+    # 2026-08-06: fluence ESCALATION is now opt-in (``ladder=1``).
+    # ``use_ladder`` above still selects the health-gated helper (the
+    # pre-flight + fan-out check are always wanted); ``ladder`` selects
+    # whether that helper is allowed to climb ×2/×4 on a no_match.
+    # Default OFF after the escalated rungs walked probes into the fp16
+    # imager's dead zone (see IMAGER_SAFE_OBSERVED_SNR).
+    ladder_escalate = (
+        (f.get("ladder") or "").strip().lower() in ("1", "true", "yes", "on")
+    )
     raw_ladder = (f.get("fluence_ladder") or "").strip()
     if raw_ladder:
         try:
@@ -1670,6 +1757,7 @@ def control_inject_calibrate_post():
             ladder_kwargs["health_check"] = (
                 health_check not in ("0", "false", "False", "no", "off")
             )
+            ladder_kwargs["ladder"] = ladder_escalate
             ladder_kwargs["fluence_ladder"] = ladder_steps
             attempts = ic.fire_calibration_probe_with_ladder(
                 control_store, **ladder_kwargs,
@@ -1682,8 +1770,36 @@ def control_inject_calibrate_post():
             payload = result.to_dict()
             payload["attempts"] = [a.to_dict() for a in attempts]
         else:
-            result = ic.fire_calibration_probe(control_store, **kwargs)
+            # Legacy single-shot path (``use_ladder=0``) bypasses the
+            # health-gated helper, so apply the same brightness cap
+            # here — no calibration path may fire into the fp16 dead
+            # zone.
+            legacy_kwargs = dict(kwargs)
+            entry = ic.CalibrationStore(control_store).get(
+                dm_pc_cm3=float(kwargs["dm_pc_cm3"]),
+            )
+            cap = ic.max_safe_fluence(
+                entry.K if entry is not None else None,
+                int(kwargs["width_samples"]),
+            )
+            if cap is None:
+                cap = ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K
+            requested = float(kwargs["fluence_jy_ms"])
+            clamped = requested > cap
+            if clamped:
+                LOG.warning(
+                    "inject_calibrate (single-shot): fluence %.4g Jy*ms "
+                    "exceeds the imager-safe ceiling %.4g; clamping",
+                    requested, cap,
+                )
+                legacy_kwargs["fluence_jy_ms"] = float(cap)
+            result = ic.fire_calibration_probe(
+                control_store, **legacy_kwargs,
+            )
             payload = result.to_dict()
+            payload["fluence_requested"] = requested
+            payload["fluence_used"] = float(legacy_kwargs["fluence_jy_ms"])
+            payload["fluence_clamped"] = bool(clamped)
     except Exception as exc:  # noqa: BLE001
         LOG.exception("fire_calibration_probe failed")
         return jsonify({"ok": False, "error": str(exc)}), 500

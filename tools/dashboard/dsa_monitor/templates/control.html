@@ -880,8 +880,13 @@ async function guardedStart(event) {
                 </div>
                 <div class="verb-row">
                     <label for="fluence_jy_ms">fluence (Jy·ms)</label>
+                    <!-- 2026-08-06: was 50 Jy·ms — five orders of
+                         magnitude above the imager-safe ceiling after
+                         the 2026-06-09 fluence rescale, so it now
+                         always trips the brightness guard. 5e-4 is the
+                         no-K ceiling itself. -->
                     <input type="number" id="fluence_jy_ms" name="fluence_jy_ms"
-                           value="50" step="any" />
+                           value="0.0005" step="any" />
                 </div>
                 <div class="verb-row">
                     <label for="width_samples">width (samples)</label>
@@ -933,6 +938,11 @@ async function guardedStart(event) {
                            placeholder="(blank → all 16) e.g. 0,1,2" />
                 </div>
                 <div class="verb-row">
+                    <label for="inj_allow_bright">allow bright (override)</label>
+                    <input type="checkbox" id="inj_allow_bright"
+                           name="allow_bright" value="1" />
+                </div>
+                <div class="verb-row">
                     <button type="submit">Send injection</button>
                 </div>
             </div>
@@ -953,14 +963,26 @@ async function guardedStart(event) {
             Set <code>target_snr</code> to inject at a specific SNR;
             the dashboard reads the stored K for the DM bucket
             (width-independent) and derives <code>fluence_jy_ms</code>
-            via <code>fluence = width × (target_snr / K)²</code>. The
+            via <code>fluence = target_snr × √width / K</code>. The
             <code>fluence_jy_ms</code> field is ignored when
             <code>target_snr</code> is set. If no K is stored for the
             DM band the inject returns <code>412 Precondition Failed</code>
             — run the Calibrate panel below first (any width pins K for
             the band).
             <br>
-            Defaults shown produce a 50 Jy·ms / DM=500 / width=32-
+            <strong>Brightness guard (2026-08-06):</strong> an inject
+            whose predicted observed SNR
+            (<code>K·fluence/√width</code>) exceeds <code>30σ</code> is
+            rejected with <code>400</code>, as is any fluence above
+            <code>5e-4 Jy·ms</code> in a DM bucket with no stored
+            <code>K</code>. Nothing is silently clamped here — you
+            either lower the brightness or tick <em>allow bright</em>
+            (<code>allow_bright=1</code>) to fire it anyway. The fp16
+            imager saturates from ≈35σ up: above that an injection
+            either vanishes or rails at the detector's 250σ clip and
+            sprays sidelobe candidates fleet-wide.
+            <br>
+            Defaults shown produce a 5e-4 Jy·ms / DM=500 / width=32-
             sample test pulse at boresight — good first smoke test
             once <code>--inject-watch</code> is active on the fleet.
         </div>
@@ -976,7 +998,7 @@ async function guardedStart(event) {
         resulting C1-candidate SNR back via
         <code>/mon/dsart/inject/matches/&lt;inj_id&gt;</code>.
         From that pair the dashboard computes
-        <code>K = observed_snr × √(width / fluence)</code> and stores
+        <code>K = observed_snr × √width / fluence</code> and stores
         it at <code>/cnf/inject/snr_calibration/dmNNNN</code>.
         Subsequent injections at a <code>target_snr</code> derive
         their fluence from this <code>K</code>. <strong>K is
@@ -988,6 +1010,20 @@ async function guardedStart(event) {
         <strong>Disable cube dumps</strong> with the dumps gate above
         before calibrating so that bright probes don't trigger the
         dump pipeline while you titrate the calibration.
+        <br>
+        <strong>Ladder escalation is opt-in and OFF by default</strong>
+        (2026-08-06). Unchecked, exactly one probe is fired at the
+        fluence you type — still health-gated and still match-polled.
+        Checked, a <code>no_match</code> is retried at ×2 then ×4, 60 s
+        apart. Either way every probe is capped so its predicted
+        observed SNR stays at or below <code>30σ</code>
+        (<code>fluence ≤ 30·√width / K</code>, or ≤
+        <code>5e-4 Jy·ms</code> when the bucket has no <code>K</code>
+        yet): the fp16 imager saturates from ≈35σ up, where probes
+        either vanish outright or come back railed at the detector's
+        250σ clip. A capped probe reports
+        <code>fluence_clamped</code> with the requested and used
+        values.
     </p>
     <form id="form-calibrate"
           onsubmit="return submitVerb(event, '/control/inject_calibrate', 'resp-calibrate');">
@@ -1040,6 +1076,16 @@ async function guardedStart(event) {
                            value="30" step="1" min="5" />
                 </div>
                 <div class="verb-row">
+                    <label for="cal_ladder">ladder escalation</label>
+                    <!-- 2026-08-06: OFF by default. Escalating ×2/×4 on a
+                         no_match walked probes into the fp16 imager's
+                         saturation dead zone (observed SNR ~35σ and up):
+                         rungs either vanished or railed at the detector's
+                         250σ clip and sprayed sidelobe candidates. -->
+                    <input type="checkbox" id="cal_ladder" name="ladder"
+                           value="1" />
+                </div>
+                <div class="verb-row">
                     <button type="submit">Calibrate probe</button>
                     <button type="button" onclick="refreshCalibrations();"
                             style="margin-left: 6px;">Refresh table</button>
@@ -1060,7 +1106,7 @@ async function guardedStart(event) {
         "Calibrate" button builds — the <code>K</code> constants in etcd
         under <code>{{ snr_cal_prefix }}*</code> that map
         <code>fluence_jy_ms → observed SNR</code> via
-        <code>SNR ≈ K·√(fluence/width)</code>. Clearing it lets you
+        <code>SNR ≈ K·fluence/√width</code>. Clearing it lets you
         re-measure the fluence/SNR relation from scratch.
         <br>
         <strong>Note:</strong> this does <em>not</em> touch the on-sky

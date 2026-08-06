@@ -894,11 +894,15 @@ class TestFireCalibrationProbeWithLadder:
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
+            ladder=True,
             fluence_ladder=(1.0, 2.0, 4.0),
         )
-        # All 3 attempts should have fired (at 2e-4, 4e-4, 8e-4 Jy·ms
-        # — all below the 1.2e-3 saturation clamp).
-        assert ladder_attempts == [2e-4, 4e-4, 8e-4]
+        # All 3 attempts should have fired. The ×4 rung would be 8e-4
+        # Jy·ms, but dm0500 has no stored K here so the 2026-08-06
+        # brightness guard caps it at DEFAULT_MAX_PROBE_FLUENCE_NO_K.
+        assert ladder_attempts == [
+            2e-4, 4e-4, ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K,
+        ]
         # All attempts should ultimately fail ``no_match`` since we
         # never actually seeded a match key.
         assert len(attempts) == 3
@@ -936,11 +940,17 @@ class TestFireCalibrationProbeWithLadder:
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
+            ladder=True,
             fluence_ladder=(1.0, 2.0, 4.0),
         )
-        assert ladder_attempts == [ic.DEFAULT_MAX_PROBE_FLUENCE]
+        # dm0500 has no stored K, so the ceiling is the no-K absolute
+        # cap (below max_probe_fluence, which it supersedes).
+        assert ladder_attempts == [ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K]
         assert len(attempts) == 1
         assert not attempts[0].ok
+        assert attempts[0].fluence_clamped is True
+        assert attempts[0].fluence_requested == 100.0
+        assert attempts[0].fluence_used == ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K
 
     def test_saturated_match_refuses_K_and_ladder_descends(self):
         """2026-06-10 saturation guard: an observed SNR pinned at the
@@ -985,6 +995,7 @@ class TestFireCalibrationProbeWithLadder:
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
+            ladder=True,
             fluence_ladder=(1.0, 2.0, 4.0),
         )
         # Attempt 1: saturated, no K stored. Attempt 2: descended ×¼.
@@ -1032,6 +1043,7 @@ class TestFireCalibrationProbeWithLadder:
             poll_timeout_s=2.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
+            ladder=True,
             fluence_ladder=(1.0, 2.0),
             ladder_step_delay_s=60.0,
         )
@@ -1069,6 +1081,7 @@ class TestFireCalibrationProbeWithLadder:
             fan_out_check_timeout_s=0.0,
             time_fn=lambda: now[0],
             sleep_fn=sleep_fn,
+            ladder=True,
             fluence_ladder=(1.0, 2.0),
         )
         # Should have ONE attempt followed by partial_fan_out abort —
@@ -1077,3 +1090,473 @@ class TestFireCalibrationProbeWithLadder:
         assert len(attempts) == 1
         assert not attempts[0].ok
         assert attempts[0].reason.startswith("partial_fan_out")
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-06 — opt-in ladder + imager-safe brightness guard
+# ---------------------------------------------------------------------------
+
+
+class TestMaxSafeFluence:
+    def test_inverts_the_linear_snr_model(self):
+        # K = 1.5e5 at w=4 is the current fleet's typical gain: the
+        # imager-safe ceiling lands at 30·2/1.5e5 = 4e-4 Jy·ms, i.e.
+        # just below the 5-9e-4 fp16 overflow onset.
+        cap = ic.max_safe_fluence(1.5e5, 4)
+        assert cap == pytest.approx(4.0e-4, rel=1e-9)
+        # Round-trips through snr_to_fluence at the ceiling SNR.
+        assert cap == pytest.approx(
+            ic.snr_to_fluence(
+                target_snr=ic.IMAGER_SAFE_OBSERVED_SNR, K=1.5e5,
+                width_samples=4,
+            ),
+            rel=1e-9,
+        )
+
+    @pytest.mark.parametrize("bad_K", [None, 0.0, -3.0, float("nan")])
+    def test_unknown_or_bad_K_returns_none(self, bad_K):
+        assert ic.max_safe_fluence(bad_K, 4) is None
+
+    def test_guard_sits_below_the_detector_rail_guard(self):
+        # The two guards protect different rails; the fp16 dead-zone
+        # guard must be the lower of the pair by a wide margin.
+        assert ic.IMAGER_SAFE_OBSERVED_SNR < ic.SATURATION_OBSERVED_SNR
+        assert ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K < ic.DEFAULT_MAX_PROBE_FLUENCE
+
+
+class TestLadderIsOptIn:
+    """2026-08-06: escalation must not happen unless asked for."""
+
+    @staticmethod
+    def _good_inject(store, **kwargs):
+        return TestFireCalibrationProbe._good_inject(store, **kwargs)
+
+    def test_no_match_fires_exactly_one_probe_by_default(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        fired: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            fired.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(store, inject_n_queued=len(fired))
+            return good_inject(store, **kwargs)
+
+        def sleep_fn(s):
+            now[0] += s
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=4,
+            fluence_jy_ms=2e-4,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+            # ladder defaults to False — no fluence_ladder override.
+        )
+        assert fired == [2e-4]
+        assert len(attempts) == 1
+        assert attempts[0].reason.startswith("no_match")
+        # Nothing was clamped: 2e-4 is under every ceiling.
+        assert attempts[0].fluence_clamped is False
+        assert attempts[0].fluence_used == 2e-4
+
+    def test_explicit_fluence_ladder_is_ignored_when_ladder_false(self):
+        """A stale ``fluence_ladder`` kwarg must not resurrect
+        escalation — only ``ladder=True`` does."""
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        fired: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            fired.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(store, inject_n_queued=len(fired))
+            return good_inject(store, **kwargs)
+
+        ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=4,
+            fluence_jy_ms=1e-4,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+            ladder=False,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        assert fired == [1e-4]
+
+    def test_saturated_probe_does_not_descend_without_ladder(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        fired: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            fired.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(store, inject_n_queued=len(fired))
+            return good_inject(store, **kwargs)
+
+        inj_id = ic._build_probe_inj_id(
+            prefix="cal_probe", dm=1000.0, width=4, timestamp=200.0,
+        )
+        TestFireCalibrationProbe()._seed_match(
+            store, inj_id, observed_snr=250.25, K=1.0,
+        )
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=1000.0,
+            width_samples=4,
+            fluence_jy_ms=3e-4,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+        )
+        assert len(fired) == 1
+        assert len(attempts) == 1
+        assert attempts[0].reason.startswith("saturated")
+
+
+class TestBrightnessGuardClampsLadderRungs:
+    @staticmethod
+    def _good_inject(store, **kwargs):
+        return TestFireCalibrationProbe._good_inject(store, **kwargs)
+
+    def test_stored_K_caps_every_rung_at_max_safe_fluence(self):
+        """With a stored K the ceiling is K-derived, not the blunt
+        absolute cap: rungs above ``30σ`` clamp down and the ladder
+        stops rather than refiring the same fluence."""
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        # K = 1.5e5 at w=4 ⇒ ceiling 4e-4 Jy·ms.
+        cs = ic.CalibrationStore(store)
+        cs.put(ic.CalibrationEntry(
+            bucket="dm0500", dm_pc_cm3_rounded=500, width_samples=4,
+            K=1.5e5, last_fluence_jy_ms=2e-4, last_observed_snr=15.0,
+            last_inj_id="seed", last_calibrated_at_unix=1.0,
+        ))
+        now = [200.0]
+        fired: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            fired.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(store, inject_n_queued=len(fired))
+            return good_inject(store, **kwargs)
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=4,
+            fluence_jy_ms=3e-4,
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+            ladder=True,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        cap = ic.max_safe_fluence(1.5e5, 4)
+        assert cap == pytest.approx(4.0e-4)
+        # ×1 = 3e-4 (clean), ×2 = 6e-4 → clamped to 4e-4, then stop.
+        assert fired == [pytest.approx(3e-4), pytest.approx(cap)]
+        assert len(attempts) == 2
+        assert attempts[0].fluence_clamped is False
+        assert attempts[1].fluence_clamped is True
+        assert attempts[1].fluence_requested == pytest.approx(6e-4)
+        assert attempts[1].fluence_used == pytest.approx(cap)
+        # Every fired rung stays inside the fp16 linear window.
+        for f in fired:
+            assert 1.5e5 * f / math.sqrt(4) <= ic.IMAGER_SAFE_OBSERVED_SNR
+
+    def test_clamped_first_rung_stops_the_ladder_immediately(self):
+        """When the very first rung is already clamped, the ×2 rung
+        would repeat it — fire once and stop."""
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        cs = ic.CalibrationStore(store)
+        cs.put(ic.CalibrationEntry(
+            bucket="dm0500", dm_pc_cm3_rounded=500, width_samples=4,
+            K=1.5e5, last_fluence_jy_ms=2e-4, last_observed_snr=15.0,
+            last_inj_id="seed", last_calibrated_at_unix=1.0,
+        ))
+        now = [200.0]
+        fired: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            fired.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(store, inject_n_queued=len(fired))
+            return good_inject(store, **kwargs)
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=500.0,
+            width_samples=4,
+            fluence_jy_ms=2.8e-3,   # the 2026-08-06 railed rung
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+            ladder=True,
+            fluence_ladder=(1.0, 2.0, 4.0),
+        )
+        assert fired == [pytest.approx(4.0e-4)]
+        assert len(attempts) == 1
+        assert attempts[0].fluence_clamped is True
+
+    def test_no_K_bucket_uses_the_absolute_cap(self):
+        store = FakeStore()
+        _seed_corr_fast_state(store)
+        _seed_search_compute_state(store)
+        now = [200.0]
+        fired: List[float] = []
+        good_inject = self._good_inject
+
+        def inject_fn(store, **kwargs):
+            fired.append(float(kwargs["fluence_jy_ms"]))
+            _seed_corr_fast_state(store, inject_n_queued=len(fired))
+            return good_inject(store, **kwargs)
+
+        attempts = ic.fire_calibration_probe_with_ladder(
+            store,
+            inject_fn=inject_fn,
+            dm_pc_cm3=2500.0,       # never calibrated
+            width_samples=4,
+            fluence_jy_ms=9e-4,     # inside the fp16 dead zone
+            poll_timeout_s=2.0,
+            time_fn=lambda: now[0],
+            sleep_fn=lambda s: now.__setitem__(0, now[0] + s),
+        )
+        assert fired == [ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K]
+        assert attempts[0].fluence_clamped is True
+        assert attempts[0].fluence_requested == pytest.approx(9e-4)
+
+
+# ---------------------------------------------------------------------------
+# Flask routes — /control/inject brightness guard + /control/inject_calibrate
+# ladder plumbing (2026-08-06)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def flask_client(monkeypatch):
+    """Flask app under test with a fake DsaStore behind the module-level
+    ``control_store``. Mirrors the fixture in test_cube_dump_now.py — no
+    real etcd, no real fleet."""
+    import app                                                   # noqa: E402
+    fake = FakeStore()
+    app.control_store._store = fake        # type: ignore[attr-defined]
+    app.app.config["TESTING"] = True
+    yield app.app.test_client(), app, fake
+
+
+def _seed_K(store: FakeStore, *, dm: float, K: float, width: int = 4) -> None:
+    ic.CalibrationStore(store).put(ic.CalibrationEntry(
+        bucket=ic.bucket_key(dm), dm_pc_cm3_rounded=int(round(dm)),
+        width_samples=width, K=K, last_fluence_jy_ms=2e-4,
+        last_observed_snr=15.0, last_inj_id="seed",
+        last_calibrated_at_unix=1.0,
+    ))
+
+
+class TestInjectRouteBrightnessGuard:
+    _BASE = {
+        "inj_id": "guard_test",
+        "l_rad": "0.0",
+        "m_rad": "0.0",
+        "dm_pc_cm3": "500",
+        "width_samples": "4",
+        "profile": "gaussian",
+    }
+
+    def test_over_bright_target_snr_rejected_with_400(self, flask_client):
+        client, _app, fake = flask_client
+        _seed_K(fake, dm=500.0, K=1.5e5)
+        # 100σ requested; the ceiling is 30σ.
+        r = client.post(
+            "/control/inject", data={**self._BASE, "target_snr": "100"},
+        )
+        assert r.status_code == 400
+        body = r.get_json()
+        assert body["ok"] is False
+        assert "allow_bright" in body["error"]
+        assert body["predicted_observed_snr"] == pytest.approx(100.0, rel=1e-6)
+        assert body["max_safe_fluence_jy_ms"] == pytest.approx(4.0e-4)
+
+    def test_safe_target_snr_passes_the_guard(self, flask_client, monkeypatch):
+        client, app_mod, fake = flask_client
+        _seed_K(fake, dm=500.0, K=1.5e5)
+        seen: Dict[str, Any] = {}
+
+        def fake_pulse(store, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "inj_id": kwargs["inj_id"]}
+
+        monkeypatch.setattr(app_mod, "control_inject_pulse", fake_pulse)
+        r = client.post(
+            "/control/inject", data={**self._BASE, "target_snr": "20"},
+        )
+        assert r.status_code == 200
+        assert r.get_json()["ok"] is True
+        # 20σ ⇒ 20·√4/1.5e5 Jy·ms.
+        assert seen["fluence_jy_ms"] == pytest.approx(20.0 * 2.0 / 1.5e5)
+
+    def test_allow_bright_overrides_the_guard(self, flask_client, monkeypatch):
+        client, app_mod, fake = flask_client
+        _seed_K(fake, dm=500.0, K=1.5e5)
+        seen: Dict[str, Any] = {}
+
+        def fake_pulse(store, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "inj_id": kwargs["inj_id"]}
+
+        monkeypatch.setattr(app_mod, "control_inject_pulse", fake_pulse)
+        r = client.post("/control/inject", data={
+            **self._BASE, "target_snr": "100", "allow_bright": "1",
+        })
+        assert r.status_code == 200
+        assert r.get_json()["ok"] is True
+        assert seen["fluence_jy_ms"] == pytest.approx(100.0 * 2.0 / 1.5e5)
+
+    def test_explicit_fluence_over_ceiling_rejected(self, flask_client):
+        client, _app, fake = flask_client
+        _seed_K(fake, dm=500.0, K=1.5e5)
+        r = client.post("/control/inject", data={
+            **self._BASE, "fluence_jy_ms": "0.0028",   # tonight's rung
+        })
+        assert r.status_code == 400
+        body = r.get_json()
+        assert "allow_bright" in body["error"]
+        # K·F/√w = 1.5e5 × 2.8e-3 / 2 = 210σ.
+        assert body["predicted_observed_snr"] == pytest.approx(210.0, rel=1e-6)
+
+    def test_no_K_bucket_enforces_absolute_cap(self, flask_client):
+        client, _app, _fake = flask_client
+        r = client.post("/control/inject", data={
+            **self._BASE, "dm_pc_cm3": "2500", "fluence_jy_ms": "0.0009",
+        })
+        assert r.status_code == 400
+        body = r.get_json()
+        assert body["ok"] is False
+        assert "allow_bright" in body["error"]
+        assert body["max_safe_fluence_jy_ms"] == pytest.approx(
+            ic.DEFAULT_MAX_PROBE_FLUENCE_NO_K,
+        )
+
+    def test_no_K_bucket_under_absolute_cap_passes(
+        self, flask_client, monkeypatch,
+    ):
+        client, app_mod, _fake = flask_client
+        seen: Dict[str, Any] = {}
+
+        def fake_pulse(store, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "inj_id": kwargs["inj_id"]}
+
+        monkeypatch.setattr(app_mod, "control_inject_pulse", fake_pulse)
+        r = client.post("/control/inject", data={
+            **self._BASE, "dm_pc_cm3": "2500", "fluence_jy_ms": "0.0003",
+        })
+        assert r.status_code == 200
+        assert seen["fluence_jy_ms"] == pytest.approx(3e-4)
+
+
+class TestInjectCalibrateRouteLadderField:
+    def _patch_prober(self, app_mod, monkeypatch) -> Dict[str, Any]:
+        seen: Dict[str, Any] = {}
+
+        def fake_ladder(store, **kwargs):
+            seen.update(kwargs)
+            return [ic.ProbeResult(
+                ok=True, inj_id="x", bucket="dm0500", K=1.0,
+                observed_snr=20.0, observed_event_specnum=1,
+                matched_at_unix=1.0, n_matches=1, elapsed_s=0.1,
+                reason="ok",
+            )]
+
+        monkeypatch.setattr(
+            ic, "fire_calibration_probe_with_ladder", fake_ladder,
+        )
+        monkeypatch.setattr(app_mod, "audit_log", lambda *a, **k: None)
+        return seen
+
+    def test_ladder_defaults_to_false(self, flask_client, monkeypatch):
+        client, app_mod, _fake = flask_client
+        seen = self._patch_prober(app_mod, monkeypatch)
+        r = client.post("/control/inject_calibrate", data={
+            "dm_pc_cm3": "500", "width_samples": "4",
+            "fluence_jy_ms": "0.0003",
+        })
+        assert r.status_code == 200
+        assert seen["ladder"] is False
+
+    @pytest.mark.parametrize("raw", ["1", "true", "yes", "on"])
+    def test_truthy_ladder_field_enables_escalation(
+        self, flask_client, monkeypatch, raw,
+    ):
+        client, app_mod, _fake = flask_client
+        seen = self._patch_prober(app_mod, monkeypatch)
+        r = client.post("/control/inject_calibrate", data={
+            "dm_pc_cm3": "500", "width_samples": "4",
+            "fluence_jy_ms": "0.0003", "ladder": raw,
+        })
+        assert r.status_code == 200
+        assert seen["ladder"] is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "no", ""])
+    def test_falsy_ladder_field_keeps_escalation_off(
+        self, flask_client, monkeypatch, raw,
+    ):
+        client, app_mod, _fake = flask_client
+        seen = self._patch_prober(app_mod, monkeypatch)
+        r = client.post("/control/inject_calibrate", data={
+            "dm_pc_cm3": "500", "width_samples": "4",
+            "fluence_jy_ms": "0.0003", "ladder": raw,
+        })
+        assert r.status_code == 200
+        assert seen["ladder"] is False
+
+    def test_legacy_single_shot_path_is_also_capped(
+        self, flask_client, monkeypatch,
+    ):
+        """``use_ladder=0`` bypasses the health-gated helper — it must
+        still clamp, or it would be an unguarded brightness hole."""
+        client, app_mod, fake = flask_client
+        _seed_K(fake, dm=500.0, K=1.5e5)
+        seen: Dict[str, Any] = {}
+
+        def fake_probe(store, **kwargs):
+            seen.update(kwargs)
+            return ic.ProbeResult(
+                ok=False, inj_id="x", bucket="dm0500", K=None,
+                observed_snr=None, observed_event_specnum=None,
+                matched_at_unix=None, n_matches=0, elapsed_s=0.1,
+                reason="no_match",
+            )
+
+        monkeypatch.setattr(ic, "fire_calibration_probe", fake_probe)
+        monkeypatch.setattr(app_mod, "audit_log", lambda *a, **k: None)
+        r = client.post("/control/inject_calibrate", data={
+            "dm_pc_cm3": "500", "width_samples": "4",
+            "fluence_jy_ms": "0.0028", "use_ladder": "0",
+        })
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["fluence_clamped"] is True
+        assert body["fluence_requested"] == pytest.approx(2.8e-3)
+        assert body["fluence_used"] == pytest.approx(4.0e-4)
+        assert seen["fluence_jy_ms"] == pytest.approx(4.0e-4)

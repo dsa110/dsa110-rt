@@ -72,7 +72,7 @@ import math
 import os
 import socket
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace as dc_replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 LOG = logging.getLogger("dsa_monitor.inject_calibration")
@@ -533,6 +533,15 @@ class ProbeResult:
     observed_m_rad: Optional[float] = None
     observed_width_samples: Optional[int] = None
     match_lm_dist_rad: Optional[float] = None
+    #: Brightness-guard bookkeeping (2026-08-06). ``fluence_requested``
+    #: is what the operator/ladder asked for, ``fluence_used`` is what
+    #: was actually fired, and ``fluence_clamped`` is True iff the two
+    #: differ because the imager-safety guard engaged. Only the
+    #: laddered entry point fills these in; a bare
+    #: :func:`fire_calibration_probe` leaves them None/False.
+    fluence_requested: Optional[float] = None
+    fluence_used: Optional[float] = None
+    fluence_clamped: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -927,12 +936,39 @@ DEFAULT_FLUENCE_LADDER: Tuple[float, ...] = (1.0, 2.0, 4.0)
 #: step reliably below the cliff.
 DEFAULT_MAX_PROBE_FLUENCE: float = 1.0e-3
 
+#: Absolute ceiling (Jy·ms) on any probe fired into a DM bucket that
+#: has NO stored K yet, i.e. when the brightness guard cannot predict
+#: the observed SNR. Half the old 1.0e-3
+#: :data:`DEFAULT_MAX_PROBE_FLUENCE`: deliberately conservative,
+#: because at the K≈1.5e5 (w=4) typical of the current fleet the fp16
+#: overflow onset already sits at ≈5–9e-4 Jy·ms, so 1.0e-3 was itself
+#: inside the dead zone for a plain bucket.
+DEFAULT_MAX_PROBE_FLUENCE_NO_K: float = 5.0e-4
+
+#: Observed-SNR ceiling the brightness guard aims for. The fp16 imager
+#: (cuFFT-cfp16 butterflies) starts to overflow at an *observed* SNR
+#: of roughly 35–60σ — measured in the July 2026 linearity audit and
+#: confirmed by the 2026-08-06 ladder incident, where escalated rungs
+#: either vanished entirely (overflowed to NaN, then scrubbed) or came
+#: back railed. The onset is stochastic across DM/width/position, so
+#: 30σ sits deliberately BELOW the lowest observed onset, leaving the
+#: probe in the clean linear window where K is actually fittable.
+#:
+#: Distinct from :data:`SATURATION_OBSERVED_SNR` (240σ), which guards a
+#: different and much higher rail: the search detector's ±250σ input
+#: clip. A probe can be well past the fp16 dead-zone onset and still
+#: nowhere near the detector rail, so both guards are needed.
+IMAGER_SAFE_OBSERVED_SNR: float = 30.0
+
 #: Observed-SNR rail above which a match is treated as SATURATED and
 #: K is NOT stored. The search detector clips its σ-normalised input
 #: to ±250σ (cube_pipeline detector_input_clip_sigma = 250), so any
 #: observed SNR at/near that value is amplitude-blind. 240 leaves a
 #: little headroom for boxcar/normalisation wiggle around the rail.
+#: This is the HIGH rail; the fp16-imager dead zone guarded by
+#: :data:`IMAGER_SAFE_OBSERVED_SNR` starts far below it.
 SATURATION_OBSERVED_SNR: float = 240.0
+
 
 #: Pause between ladder attempts (seconds). A probe absorbed into the
 #: detector's sigma_k EMA locally inflates the noise estimate at its
@@ -941,6 +977,38 @@ SATURATION_OBSERVED_SNR: float = 240.0
 #: sigma_k partially recover (live sweeps showed back-to-back probes
 #: 45 s apart suppressing each other even at 10× the fluence).
 DEFAULT_LADDER_STEP_DELAY_S: float = 60.0
+
+
+def max_safe_fluence(
+    K: Optional[float],
+    width_samples: int,
+    *,
+    safe_observed_snr: float = IMAGER_SAFE_OBSERVED_SNR,
+) -> Optional[float]:
+    """Largest fluence (Jy·ms) that stays inside the imager's linear
+    window for a bucket whose calibration constant is ``K``.
+
+    Inverts the linear fluence model of :func:`snr_to_fluence`::
+
+        observed_snr = K × fluence / sqrt(width_samples)
+        ⇒ fluence_max = safe_observed_snr × sqrt(width) / K
+
+    Returns ``None`` when ``K`` is unknown / non-positive / non-finite
+    — the caller must then fall back to the K-less absolute ceiling
+    :data:`DEFAULT_MAX_PROBE_FLUENCE_NO_K`.
+    """
+    if K is None:
+        return None
+    try:
+        k_val = float(K)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(k_val) or k_val <= 0.0:
+        return None
+    w = int(width_samples)
+    if w < 1:
+        w = 1
+    return float(safe_observed_snr) * math.sqrt(float(w)) / k_val
 
 
 @dataclass(frozen=True)
@@ -1162,6 +1230,7 @@ def fire_calibration_probe_with_ladder(
     ttl_s: float = DEFAULT_INJECT_TTL_S,
     cal_store: Optional[CalibrationStore] = None,
     health_check: bool = True,
+    ladder: bool = False,
     fluence_ladder: Iterable[float] = DEFAULT_FLUENCE_LADDER,
     max_probe_fluence: float = DEFAULT_MAX_PROBE_FLUENCE,
     ladder_step_delay_s: float = DEFAULT_LADDER_STEP_DELAY_S,
@@ -1191,29 +1260,58 @@ def fire_calibration_probe_with_ladder(
          full ``poll_timeout_s`` for a ``no_match`` that would have
          been ambiguous.
 
-      4. **T7 SNR ladder**: on a ``no_match`` (the only retriable
-         class — partial_fan_out, inject_failed, etc. abort), retry
-         the probe at successive ``fluence_ladder`` multipliers
-         (default ×1, ×2, ×4). The first ``ok=True`` wins; the result
-         list contains every attempt for forensic auditing.
+      4. **T7 SNR ladder — OPT-IN** (``ladder=True``): on a
+         ``no_match`` (the only retriable class — partial_fan_out,
+         inject_failed, etc. abort), retry the probe at successive
+         ``fluence_ladder`` multipliers (default ×1, ×2, ×4). The
+         first ``ok=True`` wins; the result list contains every
+         attempt for forensic auditing.
+
+         2026-08-06: ``ladder`` now defaults to **False** — exactly
+         one probe at the requested fluence, still health-gated and
+         still match-polled. Escalation was doing active harm: the
+         fp16 imager's dead zone starts at an observed SNR of only
+         ~35–60σ, so the ×2/×4 rungs walked probes straight into it,
+         either vanishing (overflow → NaN → scrubbed) or railing at
+         the detector's 250σ input clip. On 2026-08-06 an escalated
+         2.8e-3 Jy·ms rung came back at snr=352.75 (= 250·√2) and
+         sprayed sidelobe candidates across the whole fleet.
 
          2026-06-09 saturation + sigma_k guards: every attempt's
-         fluence is clamped to ``max_probe_fluence`` (a saturated
-         probe clips its own SNR and leaves a railed sliding-mean
-         ghost), the ladder stops escalating once the clamp engages,
-         and ``ladder_step_delay_s`` is slept between attempts so the
-         previous probe's sigma_k inflation at the same (DM, pixel)
-         partially decays before the refire.
-    
+         fluence is clamped (see below), the ladder stops escalating
+         once the clamp engages, and ``ladder_step_delay_s`` is slept
+         between attempts so the previous probe's sigma_k inflation at
+         the same (DM, pixel) partially decays before the refire.
+
+      5. **Brightness guard (2026-08-06)**: the effective per-attempt
+         fluence ceiling is the smaller of ``max_probe_fluence`` and
+
+         * ``max_safe_fluence(K, width_samples)`` — i.e.
+           ``IMAGER_SAFE_OBSERVED_SNR × √width / K`` — when the target
+           DM bucket already has a stored K, so the guard can predict
+           the observed SNR; or
+         * ``DEFAULT_MAX_PROBE_FLUENCE_NO_K`` when it cannot.
+
+         An attempt above the ceiling is clamped down to it (and the
+         ladder stops, since every further rung would refire at the
+         same clamped fluence). The returned :class:`ProbeResult`
+         records ``fluence_requested`` / ``fluence_used`` /
+         ``fluence_clamped``.
+
     Returns a list of :class:`ProbeResult` (one per attempt). The
     final entry is the operator-facing result. The list is intended
     for the audit trail / dashboard "calibration log" pane so the
     operator can see e.g. "first probe was metered, second succeeded
     at 2× fluence".
     """
-    ladder = tuple(float(m) for m in fluence_ladder)
-    if not ladder:
-        ladder = (1.0,)
+    if ladder:
+        ladder_mults = tuple(float(m) for m in fluence_ladder)
+        if not ladder_mults:
+            ladder_mults = (1.0,)
+    else:
+        # Opt-in escalation (2026-08-06): a single probe at exactly
+        # what the operator asked for.
+        ladder_mults = (1.0,)
 
     # 2026-06-10 probe-position rotation: successive probes at the
     # SAME pixel poison each other — the corr-side static-sky window
@@ -1255,16 +1353,66 @@ def fire_calibration_probe_with_ladder(
     )
 
     results: List[ProbeResult] = []
+    cs = cal_store if cal_store is not None else CalibrationStore(store)
+
+    # 2026-08-06 brightness guard. Prefer the K-derived ceiling (it
+    # knows this bucket's actual fluence→SNR gain); fall back to the
+    # conservative absolute ceiling when the bucket has no K yet.
+    stored_entry = cs.get(dm_pc_cm3=dm_pc_cm3)
+    stored_K = (
+        stored_entry.K
+        if stored_entry is not None and stored_entry.K > 0.0
+        else None
+    )
+    k_cap = max_safe_fluence(stored_K, width_samples)
+    if k_cap is None:
+        brightness_cap = float(DEFAULT_MAX_PROBE_FLUENCE_NO_K)
+        cap_kind = (
+            f"no-K absolute cap {DEFAULT_MAX_PROBE_FLUENCE_NO_K:.4g} Jy*ms"
+        )
+    else:
+        brightness_cap = float(k_cap)
+        cap_kind = (
+            f"K={stored_K:.4g} w={int(width_samples)} => observed SNR "
+            f"{IMAGER_SAFE_OBSERVED_SNR:.0f} at {brightness_cap:.4g} Jy*ms"
+        )
     clamp = float(max_probe_fluence)
+    if clamp <= 0.0 or brightness_cap < clamp:
+        clamp = brightness_cap
+
     # 2026-06-10: dynamic multiplier queue so a SATURATED attempt
     # (observed SNR pinned at the detector's ±250σ input-clip rail —
     # see fire_calibration_probe) can retry DOWNWARD. The classic
     # no_match path still walks the configured ascending ladder.
-    pending: List[float] = list(ladder)
+    pending: List[float] = list(ladder_mults)
+    fired_fluences: List[float] = []
     descents = 0
     step_idx = -1
     while pending:
         mult = pending.pop(0)
+        requested_fluence = float(fluence_jy_ms) * float(mult)
+        attempt_fluence = requested_fluence
+        clamped = clamp > 0.0 and attempt_fluence > clamp
+        if clamped:
+            LOG.warning(
+                "calibration probe: fluence %.4g Jy*ms exceeds the "
+                "imager-safe ceiling %.4g Jy*ms (%s); clamping",
+                requested_fluence, clamp, cap_kind,
+            )
+            attempt_fluence = clamp
+        # A clamped rung that repeats an already-fired fluence would
+        # just re-run the same experiment (and re-inflate sigma_k at
+        # the same pixel). Stop instead.
+        if any(
+            abs(attempt_fluence - prev) <= 1e-12 * max(1.0, abs(prev))
+            for prev in fired_fluences
+        ):
+            LOG.warning(
+                "calibration ladder: clamped rung %.4g Jy*ms repeats a "
+                "previously-fired attempt; stopping ladder",
+                attempt_fluence,
+            )
+            return results
         step_idx += 1
         if step_idx > 0 and ladder_step_delay_s > 0.0:
             LOG.info(
@@ -1273,16 +1421,6 @@ def fire_calibration_probe_with_ladder(
                 float(ladder_step_delay_s), step_idx + 1,
             )
             sleep_fn(float(ladder_step_delay_s))
-        attempt_fluence = float(fluence_jy_ms) * float(mult)
-        clamped = clamp > 0.0 and attempt_fluence > clamp
-        if clamped:
-            LOG.warning(
-                "calibration ladder: attempt %d fluence %.4g Jy*ms "
-                "exceeds max_probe_fluence=%.4g; clamping (saturation "
-                "guard)",
-                step_idx + 1, attempt_fluence, clamp,
-            )
-            attempt_fluence = clamp
         if rotate_positions:
             attempt_l, attempt_m = _PROBE_POSITIONS[
                 (pos_seed + step_idx) % len(_PROBE_POSITIONS)
@@ -1305,9 +1443,16 @@ def fire_calibration_probe_with_ladder(
             poll_timeout_s=poll_timeout_s,
             poll_interval_s=poll_interval_s,
             ttl_s=ttl_s,
-            cal_store=cal_store,
+            cal_store=cs,
             time_fn=time_fn,
             sleep_fn=sleep_fn,
+        )
+        fired_fluences.append(attempt_fluence)
+        result = dc_replace(
+            result,
+            fluence_requested=requested_fluence,
+            fluence_used=attempt_fluence,
+            fluence_clamped=bool(clamped),
         )
 
         # Post-fire fan-out check: do this once per attempt before we
@@ -1348,6 +1493,9 @@ def fire_calibration_probe_with_ladder(
                     ),
                     inject_response=result.inject_response,
                     active_key=result.active_key,
+                    fluence_requested=requested_fluence,
+                    fluence_used=attempt_fluence,
+                    fluence_clamped=bool(clamped),
                 )
                 results.append(result)
                 # Partial fan-out is a hard fail — escalating fluence
@@ -1373,7 +1521,7 @@ def fire_calibration_probe_with_ladder(
         # the detector's input-clip rail — escalating would only
         # saturate harder. Descend ×¼ (at most twice) instead.
         if result.reason.startswith("saturated"):
-            if descents < 2:
+            if ladder and descents < 2:
                 descents += 1
                 down = float(mult) / 4.0
                 LOG.warning(
@@ -1557,7 +1705,10 @@ __all__ = [
     "DEFAULT_SEARCH_MAX_AGE_S",
     "DEFAULT_FLUENCE_LADDER",
     "DEFAULT_MAX_PROBE_FLUENCE",
+    "DEFAULT_MAX_PROBE_FLUENCE_NO_K",
     "DEFAULT_LADDER_STEP_DELAY_S",
+    "IMAGER_SAFE_OBSERVED_SNR",
+    "SATURATION_OBSERVED_SNR",
     "LEGACY_BUCKET_INFIX",
     "CalibrationEntry",
     "CalibrationStore",
@@ -1571,6 +1722,7 @@ __all__ = [
     "publish_active_inject",
     "get_match_event",
     "snr_to_fluence",
+    "max_safe_fluence",
     "fire_calibration_probe",
     "fire_calibration_probe_with_ladder",
     "precheck_calibration_health",
