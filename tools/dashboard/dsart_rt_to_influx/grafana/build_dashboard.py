@@ -960,11 +960,15 @@ def panels() -> List[Dict[str, Any]]:
         alias="cn $tag_cn_id g$tag_gpu_half",
         w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
         description=(
-            "Per-half cube-dump writer queue-full drops. Means the "
-            "writer thread couldn't keep up with the trigger fan-out "
-            "(slow disk, full /dataz, or the upstream BoundedCubeUploader "
-            "is back-pressuring). 0 is the only acceptable steady-state "
-            "value."
+            "Per-half cube-dump writer queue-full losses: the writer thread "
+            "couldn't keep up with the trigger fan-out (slow disk, full "
+            "/dataz, or the upstream BoundedCubeUploader back-pressuring).\n\n"
+            "Since 2026-08-06 this counts BOTH kinds of loss -- a displaced "
+            "dump is still a dump that never got written, so it appears "
+            "here too. Use the 'displaced vs plain drops' panel below to "
+            "tell them apart before reacting: a burst of drops that are all "
+            "auto-into-auto costs no vetted candidates, whereas displacement "
+            "means udp arrivals are contending for slots."
         ),
     ))
     _bump_y(7)
@@ -1001,6 +1005,62 @@ def panels() -> List[Dict[str, Any]]:
         ),
     ))
     _bump_y(7)
+    out.append(graph_panel(
+        title="cube_dump lost dumps: displaced (recoverable) vs plain drops",
+        raw_query=(
+            'SELECT non_negative_derivative('
+            'mean("cube_dump_n_displaced"), 1s) '
+            'FROM "search_rt_dump" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="DISPLACED cn $tag_cn_id g$tag_gpu_half",
+        extra_targets=[{
+            "alias": "dropped cn $tag_cn_id g$tag_gpu_half",
+            "query": (
+                'SELECT non_negative_derivative('
+                'mean("cube_dump_n_dropped"), 1s) '
+                'FROM "search_rt_dump" '
+                'WHERE $timeFilter '
+                'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+            ),
+        }],
+        w=24, x=0, h=8, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Which kind of dump is being lost when the writer queue fills. "
+            "Read the two traces together -- DISPLACED is a SUBSET of "
+            "dropped, not a separate population, so displaced == dropped "
+            "means every loss was the good case and displaced == 0 with "
+            "dropped > 0 means every loss was the bad-ish case.\n\n"
+            "Background: each queue slot pins a whole ~1.1 GiB cube, so the "
+            "depth of 4 is a memory budget rather than a tuning knob and "
+            "cannot simply be raised. What matters is WHICH request loses. "
+            "A 'udp' dump has been through C1 -> C2 coincidence and survived "
+            "the cross-node vetoes, so it is a real multi-node candidate; an "
+            "'auto' dump is one half's local bright-pulse predicate firing "
+            "with no corroboration. Until 2026-08-06 a full queue dropped "
+            "the ARRIVAL, so a coincidence-confirmed candidate could be "
+            "discarded to keep four unvetted local ones -- and an "
+            "auto-trigger storm is exactly what fills the queue.\n\n"
+            "DISPLACED counts the times the writer instead evicted a queued "
+            "lower-value dump to admit a higher-value arrival. Those are "
+            "cheap losses: an unvetted auto cube gave way to a C2-confirmed "
+            "one.\n\n"
+            "Plain drops (dropped with displaced flat) mean there was "
+            "nothing cheaper to give up -- an auto arriving into a queue of "
+            "autos. That costs no vetted candidates and is normal during a "
+            "storm; 213 such drops with 0 displacements were recorded across "
+            "the fleet in the 25 min after the 2026-08-06 14:05 restart.\n\n"
+            "What to act on: a NON-ZERO displaced rate is the queue doing "
+            "its job, but a sustained one says udp arrivals are routinely "
+            "contending, which is the case where depth (and the memory to "
+            "pay for it) is worth revisiting. A high plain-drop rate points "
+            "at the auto-trigger side instead -- the bright-pulse "
+            "predicate's holdoff_ms throttles how fast autos can fire, and "
+            "that is the cheaper lever than a bigger queue."
+        ),
+    ))
+    _bump_y(8)
 
     out.append(row_panel("D. Capture pipeline (link rate + pps)"))
     _bump_y(1)
