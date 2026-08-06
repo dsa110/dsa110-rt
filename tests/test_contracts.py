@@ -670,3 +670,95 @@ def test_cube_dump_manifest_is_frozen() -> None:
     m = _make_cube_dump_manifest()
     with pytest.raises((AttributeError, Exception)):
         m.cube_id = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Cross-module units invariant: the in-cube time index (2026-08-06)
+# ---------------------------------------------------------------------------
+#
+# Three independent consumers recover "how far into the cube was this
+# candidate" from the SAME two numbers -- the cube's sample-0 anchor and
+# the C1 row's event_specnum, both in SEARCH-sample units:
+#
+#   coinc/plotter._metadata_t_idx      -> the plotted time index
+#   cluster/features._candidate_to_int_indices -> t_in_cube
+#   coinc/wire.C1BatchHeader.candidate_mjd     -> the reported event MJD
+#
+# All three had independently acquired a `// sample_period_specnum`,
+# which is native SNAP specnums per search sample and belongs only to
+# native-specnum conversion (services/coincidencer.search_to_snap_specnum;
+# see services/search_compute.py:1338-1345). This test plants ONE offset
+# and requires all three to report it, so the next person who adds a
+# divisor to any one of them breaks a contract test rather than a night
+# of observing.
+
+
+def test_in_cube_offset_agrees_across_plotter_features_and_wire() -> None:
+    import dataclasses
+
+    from dsart.cluster.features import _candidate_to_int_indices
+    from dsart.coinc import wire
+    from dsart.coinc.plotter import _BurstPeak, _CubeChunk
+
+    PLANTED_T = 118          # ground truth, in search samples
+    ANCHOR = 82_556_992      # cube sample-0 specnum (search samples)
+    PERIOD_SPECNUM = 16      # native specnums per search sample
+    PERIOD_US = 1048.576     # search-sample period
+    T_DET = 192
+    MJD_START = 60781.5
+
+    event_specnum = ANCHOR + PLANTED_T
+
+    # --- plotter -----------------------------------------------------
+    chunk = _CubeChunk(
+        search_node_id=2, gpu_half=1, event_specnum=event_specnum,
+        cube=np.zeros((T_DET, 1, 1, 1), dtype=np.float16),
+        fine_dm_pc_cc=np.asarray([500.0], dtype=np.float64),
+        mjd_start=MJD_START, sample_period_us=PERIOD_US,
+        cube_specnum_start=ANCHOR, sample_period_specnum=PERIOD_SPECNUM,
+        cube_mjd_start=MJD_START,
+    )
+    peak = _BurstPeak(
+        search_node_id=2, gpu_half=1, fine_dm_idx=0, l_pix=0, m_pix=0,
+        dm_pc_cc=500.0, snr=12.0, width_samples=4,
+        kernel_id="psf:d3:b16", source="members",
+        event_specnum=event_specnum,
+    )
+    from dsart.coinc.plotter import _metadata_t_idx
+    plotter_t = _metadata_t_idx(chunk, peak)
+
+    # --- legacy clusterer --------------------------------------------
+    geom = _make_cube_geometry(
+        specnum_start=ANCHOR,
+        sample_period_specnum=PERIOD_SPECNUM,
+        sample_period_us=PERIOD_US,
+        t_det=T_DET,
+        mjd_start=MJD_START,
+    )
+    cand = _make_candidate(
+        event_specnum=event_specnum,
+        dm_fine=float(geom.fine_dm_pc_cc[0]),
+    )
+    _, _, _, features_t = _candidate_to_int_indices(cand, geom)
+
+    # --- wire (implied offset, back out of the MJD) -------------------
+    header = wire.build_header(
+        cube_id=7, event_specnum_start=ANCHOR, mjd_start=MJD_START,
+        sample_period_specnum=PERIOD_SPECNUM, sample_period_us=PERIOD_US,
+        n_grid=256, n_fdm_in_cube=34, search_node_id=1, gpu_half=0,
+        n_candidates=0,
+    )
+    wire_t = (
+        (header.candidate_mjd(event_specnum) - MJD_START) * 86400.0
+        / (PERIOD_US * 1e-6)
+    )
+
+    assert plotter_t == PLANTED_T
+    assert features_t == PLANTED_T
+    # Loose absolute tolerance: an MJD near 60781 has ~1 µs of float64
+    # granularity, i.e. ~1e-3 of a 1048.576 µs search sample. The bug
+    # this guards against is a factor of 16, not a rounding.
+    assert wire_t == pytest.approx(PLANTED_T, abs=1e-3)
+    # And none of them is the divided-by-period answer.
+    assert PLANTED_T // PERIOD_SPECNUM != PLANTED_T
+    assert dataclasses.is_dataclass(chunk)  # (chunk kept alive to here)

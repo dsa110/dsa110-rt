@@ -100,10 +100,26 @@ class C1BatchHeader:
         """Convert a candidate's ``event_specnum`` to MJD using this header.
 
         Mirrors the recipe in ``docs/c1c2/C1C2_WIRE_SCHEMA.md §1.1``.
+
+        Units contract: ``event_specnum_start`` is ``slot.specnum_start``
+        (``services/search_compute.py:1776-1782``) and the row's
+        ``event_specnum`` is ``specnum_start + t_idx``
+        (``detector/decoder.py:216``) — **both count SEARCH samples**, so
+        their difference is already a detector-sample count.
+        ``sample_period_us`` is the SEARCH-sample period (1048.576 µs at
+        the production op-point), so the product is straight
+        microseconds. Dividing the delta by ``sample_period_specnum``
+        first — as this did until 2026-08-06 — made every reported event
+        MJD early by up to ~0.25 s; the same trap is called out at
+        ``services/search_compute.py:1338-1345``, where it was fixed for
+        the cube MJD clock.
+
+        ``sample_period_specnum`` is native SNAP specnums per search
+        sample and belongs to native-specnum conversion only; the one
+        canonical converter for that is
+        ``services.coincidencer.search_to_snap_specnum``.
         """
-        samples_since_start = (
-            (event_specnum - self.event_specnum_start) // self.sample_period_specnum
-        )
+        samples_since_start = event_specnum - self.event_specnum_start
         return (
             self.mjd_start
             + samples_since_start * self.sample_period_us / 1e6 / 86400.0

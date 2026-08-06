@@ -62,9 +62,19 @@ Lines:
   Candidate MJD recovery on the C2 side:
 
   ```
-  samples_since_cube_start = (row.event_specnum - header.event_specnum_start) // header.sample_period_specnum
+  samples_since_cube_start = row.event_specnum - header.event_specnum_start
   candidate_mjd            = header.mjd_start + samples_since_cube_start * header.sample_period_us / 1e6 / 86400.0
   ```
+
+  Both `event_specnum_start` and the row's `event_specnum` count
+  **search samples** (one per detector sample), so the delta is
+  already a sample count and `sample_period_us` — itself the
+  search-sample period — turns it straight into microseconds. Do
+  **not** divide by `sample_period_specnum`: that field is native
+  SNAP specnums per search sample, for consumers that need native
+  units (`services/coincidencer.search_to_snap_specnum`). Dividing
+  here made every reported event MJD early by up to ~0.25 s until
+  2026-08-06.
 - Candidate row schema (one space between fields, no trailing
   space, terminated `\n`):
 

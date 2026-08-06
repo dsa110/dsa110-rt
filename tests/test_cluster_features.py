@@ -51,8 +51,11 @@ def _make_cand(*, l_pix=10, m_pix=20, fine_dm_idx=2, t_in_cube=64, snr=8.5,
 
     The detector emits ``Candidate.l = float(l_idx)``,
     ``Candidate.m = float(m_idx)``, ``Candidate.dm_fine`` resolved
-    through ``DmPlan``; ``event_specnum = specnum_start + t_in_cube *
-    sample_period_specnum``.
+    through ``DmPlan``; ``event_specnum = specnum_start + t_in_cube``
+    (``detector/decoder.py:216``) — both terms in SEARCH-sample units,
+    so ``sample_period_specnum`` does NOT appear here. It did until
+    2026-08-06, which made this fixture self-consistent with the
+    matching divisor bug in ``_candidate_to_int_indices`` and hid it.
     """
     geom = _make_geom()
     return Candidate(
@@ -60,7 +63,7 @@ def _make_cand(*, l_pix=10, m_pix=20, fine_dm_idx=2, t_in_cube=64, snr=8.5,
         m=float(m_pix),
         dm_fine=float(geom.fine_dm_pc_cc[fine_dm_idx]),
         dm_idx=0,
-        event_specnum=geom.specnum_start + t_in_cube * geom.sample_period_specnum,
+        event_specnum=geom.specnum_start + t_in_cube,
         width_samples=width_samples,
         kernel_id=kernel_id,
         snr=snr,

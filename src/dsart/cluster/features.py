@@ -123,7 +123,15 @@ def _candidate_to_int_indices(
         left = abs(geom.fine_dm_pc_cc[insert - 1] - cand.dm_fine)
         right = abs(geom.fine_dm_pc_cc[insert] - cand.dm_fine)
         fine_dm_idx = (insert - 1) if left <= right else insert
-    t_in_cube = (cand.event_specnum - geom.specnum_start) // geom.sample_period_specnum
+    # Plain subtraction: cand.event_specnum is specnum_start + t_idx
+    # (detector/decoder.py:216) and geom.specnum_start is the cube's
+    # sample-0 anchor, both in SEARCH-sample units, so the difference IS
+    # the cube time index. geom.sample_period_specnum is native SNAP
+    # specnums per search sample and is not a divisor here (see
+    # services/search_compute.py:1338-1345). Legacy-clusterer path — off
+    # by default — fixed for offline-tooling honesty alongside the same
+    # bug in coinc/wire.candidate_mjd and coinc/plotter._metadata_t_idx.
+    t_in_cube = cand.event_specnum - geom.specnum_start
     return l_pix, m_pix, fine_dm_idx, int(t_in_cube)
 
 
@@ -200,16 +208,17 @@ def candidates_to_features(
             out[i, 3] = float(l_pix)
             out[i, 4] = float(m_pix)
     else:  # REAL
-        sec_per_specnum = geom.sample_period_us / 1e6 / geom.sample_period_specnum
         for i, cand in enumerate(cands):
             l_pix, m_pix, fine_dm_idx, t_in_cube = _candidate_to_int_indices(
                 cand, geom
             )
             out[i, 0] = _log2_width(cand.width_samples)
             out[i, 1] = float(cand.dm_fine)
-            # t_seconds = (event_specnum - specnum_start) * sec_per_specnum.
-            # Equivalently t_in_cube * sample_period_us / 1e6.
-            out[i, 2] = (cand.event_specnum - geom.specnum_start) * sec_per_specnum
+            # t_in_cube counts SEARCH samples and sample_period_us is the
+            # SEARCH-sample period, so this is the whole conversion; see
+            # _candidate_to_int_indices for why sample_period_specnum is
+            # not involved.
+            out[i, 2] = t_in_cube * geom.sample_period_us / 1e6
             # 2026-06-10 axis fix: Candidate.l is the cube ROW index
             # (H axis) and Candidate.m the COLUMN index (W axis) — but
             # in the validated sky frame (sky_astrometry /
@@ -256,7 +265,6 @@ def candidates_to_real_coords(
     if not cands:
         return []
     out: List[tuple[float, float, float, float, int, int, int, int]] = []
-    sec_per_specnum = geom.sample_period_us / 1e6 / geom.sample_period_specnum
     for cand in cands:
         l_pix, m_pix, fine_dm_idx, t_in_cube = _candidate_to_int_indices(
             cand, geom
@@ -271,7 +279,9 @@ def candidates_to_real_coords(
             centred_pix_offset(l_pix, geom.n_grid) * geom.cell_m_rad
             + geom.m0_rad
         )
-        t_seconds = (cand.event_specnum - geom.specnum_start) * sec_per_specnum
+        # Search samples x the search-sample period — no
+        # sample_period_specnum, see _candidate_to_int_indices.
+        t_seconds = t_in_cube * geom.sample_period_us / 1e6
         out.append(
             (l_rad, m_rad, float(cand.dm_fine), t_seconds,
              l_pix, m_pix, fine_dm_idx, t_in_cube)

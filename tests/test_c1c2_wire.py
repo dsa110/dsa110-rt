@@ -7,6 +7,8 @@ these tests passing.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from dsart.coinc import wire
@@ -52,14 +54,34 @@ def _make_header(n_candidates: int) -> wire.C1BatchHeader:
     )
 
 
-def test_c1_header_candidate_mjd_round_trips_specnum() -> None:
+def test_c1_header_candidate_mjd_is_search_samples_times_the_period() -> None:
+    """Ground truth from first principles, not from the expression under
+    test: a row 100 SEARCH samples after the cube's sample-0 anchor is
+    100 * 1048.576 µs later, full stop.
+
+    The header carries sample_period_specnum=16 (native SNAP specnums
+    per search sample). It must not appear anywhere in this arithmetic:
+    dividing by it made every reported MJD 16x too close to mjd_start.
+    """
     header = _make_header(0)
-    spn = header.event_specnum_start + 5 * header.sample_period_specnum
-    mjd = header.candidate_mjd(spn)
-    expected = header.mjd_start + 5 * header.sample_period_us / 1e6 / 86400.0
-    assert abs(mjd - expected) < 1e-15
-    # zero offset -> mjd_start exactly
+    assert header.sample_period_specnum == 16
+    assert header.sample_period_us == 1048.576
+    spn = header.event_specnum_start + 100
+    expected = header.mjd_start + 100 * 1048.576e-6 / 86400.0
+    assert header.candidate_mjd(spn) == pytest.approx(expected, abs=1e-15)
+    # zero offset -> mjd_start exactly. Units-blind on its own (any
+    # divisor satisfies it), kept only as an anchor-identity check.
     assert header.candidate_mjd(header.event_specnum_start) == header.mjd_start
+
+
+def test_c1_header_candidate_mjd_ignores_sample_period_specnum() -> None:
+    """Invariant: sample_period_specnum describes NATIVE-specnum
+    conversion and has no bearing on the event clock. Two headers that
+    differ only in it must date the same candidate identically."""
+    hdr16 = _make_header(0)
+    hdr1 = dataclasses.replace(hdr16, sample_period_specnum=1)
+    spn = hdr16.event_specnum_start + 118
+    assert hdr1.candidate_mjd(spn) == hdr16.candidate_mjd(spn)
 
 
 @pytest.mark.parametrize("n_candidates", [0, 1, 5, 25])
