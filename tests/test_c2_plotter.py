@@ -795,3 +795,51 @@ def test_load_cubes_prefers_cube_mjd_start_over_mjd_start(
     finally:
         for c in cubes:
             c.close()
+
+
+def test_title_line_is_fitted_to_the_pinned_axes_box() -> None:
+    """The diagnostic title line shrinks to fit, but stays legible.
+
+    The dm_time/image_peak axes box is pinned (``_PANEL_RECT``) so the
+    two panels align pixel-for-pixel, so the second title line — which
+    grows as ``_snr_note`` gains diagnostics — has to be fitted to it
+    rather than clipped at the figure edge.
+    """
+    import matplotlib.pyplot as plt
+
+    from dsart.coinc.plotter import (
+        _PANEL_RECT,
+        _SUBTITLE_FONTSIZE,
+        _SUBTITLE_FONTSIZE_MIN,
+        _fit_title_line,
+    )
+
+    short = "burst (l,m)=(128,131)"
+    long = (
+        "burst DM=1702.6 pc cm⁻³, SNR=135.7 | cube w32 138.4σ Δ-12.6 "
+        "[t from anchor] (raw 125.1σ)"
+    )
+    absurd = long + " " + long + " " + long
+
+    fig = plt.figure(figsize=(10.0, 9.0))
+    try:
+        ax = fig.add_axes(_PANEL_RECT)
+        renderer = fig.canvas.get_renderer()
+        avail = ax.get_window_extent(renderer).width
+
+        # A short line is left at the maximum size.
+        artist = _fit_title_line(fig, ax, short)
+        assert artist.get_fontsize() == _SUBTITLE_FONTSIZE
+        artist.remove()
+
+        # A realistic worst-case line is shrunk, and it fits.
+        artist = _fit_title_line(fig, ax, long)
+        assert artist.get_fontsize() < _SUBTITLE_FONTSIZE
+        assert artist.get_window_extent(renderer).width <= avail
+        artist.remove()
+
+        # Nothing shrinks past the legibility floor.
+        artist = _fit_title_line(fig, ax, absurd)
+        assert artist.get_fontsize() == _SUBTITLE_FONTSIZE_MIN
+    finally:
+        plt.close(fig)

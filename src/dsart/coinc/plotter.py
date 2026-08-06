@@ -1328,6 +1328,65 @@ _CBAR_RECT = (0.845, 0.19, 0.022, 0.725)
 _CAPTION_Y = 0.03   # baseline of the marker-legend/caption line
 _CAPTION_X = 0.46   # horizontal centre = centre of the panel box
 
+# v3.6: the dm_time/image_peak title is drawn as two visual tiers rather
+# than one two-line ax.set_title (see _fit_title_line and the notes at
+# each call site). Line 1 is the short event identity at
+# _TITLE_FONTSIZE; line 2 is the burst parameters plus the growing
+# _snr_note diagnostic, drawn separately so its font size can be fitted
+# to the axes width. _SUBTITLE_Y is the line-2 baseline in axes
+# fractions (just above the axes top edge); _TITLE_PAD is the
+# ax.set_title pad, in points, that lifts line 1 clear of line 2.
+_SUBTITLE_FONTSIZE = _LEGEND_FONTSIZE   # line-2 starting (maximum) size
+_SUBTITLE_FONTSIZE_MIN = 10             # never shrink below this
+_SUBTITLE_Y = 1.018                     # axes fraction, line-2 baseline
+_TITLE_PAD = 26.0                       # points, axes top → line-1 bottom
+
+
+def _fit_title_line(
+    fig,
+    ax,
+    text: str,
+    y: float = _SUBTITLE_Y,
+    max_fontsize: int = _SUBTITLE_FONTSIZE,
+    min_fontsize: int = _SUBTITLE_FONTSIZE_MIN,
+):
+    """Draw ``text`` centred above ``ax``, shrunk until it fits its width.
+
+    The dm_time/image_peak axes box is pinned (``_PANEL_RECT``) so the
+    two panels align pixel-for-pixel, and the diagnostic second title
+    line (burst parameters + ``_snr_note``) has grown past what fits at
+    ``_TITLE_FONTSIZE``. Rather than tune a font size to today's longest
+    string, measure the rendered text against the axes box with the
+    figure's own renderer and step down 1pt at a time (floor
+    ``min_fontsize``) until it fits. Future additions to ``_snr_note``
+    therefore shrink the line instead of silently clipping it.
+
+    ``min_fontsize`` is a legibility floor, so a pathologically long
+    string can still exceed the axes width — but the fitted target is
+    the axes box (720 px at the panel geometry), while the hard clip
+    boundary is the figure edge (1100 px), so hitting the floor looks
+    wide rather than truncated.
+
+    Returns the ``Text`` artist (its ``get_fontsize()`` is the size the
+    line landed at).
+    """
+    artist = ax.text(
+        0.5, y, text, transform=ax.transAxes, ha="center", va="baseline",
+        fontsize=max_fontsize, color="#2e3440",
+    )
+    try:
+        renderer = fig.canvas.get_renderer()
+    except AttributeError:      # backend without a cached renderer
+        return artist
+    avail = ax.get_window_extent(renderer).width
+    size = max_fontsize
+    while size > min_fontsize:
+        if artist.get_window_extent(renderer).width <= avail:
+            break
+        size -= 1
+        artist.set_fontsize(size)
+    return artist
+
 
 def _placeholder(path: Path, title: str, msg: str) -> Path:
     import matplotlib.pyplot as plt
@@ -1574,6 +1633,7 @@ def _render_dm_time(
         )
 
     title = f"DM × time (waterfall) — {event_name}"
+    subtitle = ""
     if coords is not None:
         if coords.t_idx is not None:
             ax.axvline(
@@ -1589,21 +1649,27 @@ def _render_dm_time(
                     color=_RETICLE, ms=16, mew=2.0,
                     label="detector-reported burst",
                 )
-        title += (
-            f"\nburst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
+        subtitle = (
+            f"burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
             f"SNR={coords.snr:.1f}" + _snr_note(coords)
             + _provenance(coords)
         )
-    # v3.5: explicit two-line title (event identity on line 1, burst
-    # DM/SNR on line 2) instead of one long line + wrap=True. A single
-    # long line at any legible font width overflows the axes box (the
-    # "shared figure geometry" note above _PANEL_RECT pixel-aligns
-    # dm_time/image_peak and can't grow per-title), and wrap=True's
-    # auto-reflow point didn't reliably land at a sensible semantic
-    # break. An explicit "\n" plus the dialed-down 16pt _TITLE_FONTSIZE
-    # keeps both lines within the axes width. The reserved margin above
-    # the axes (see _PANEL_RECT) already has room for two lines.
-    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
+    # v3.6: two visual tiers, not one two-line set_title. v3.5 put the
+    # event identity on line 1 and the burst parameters on line 2 of a
+    # single 16pt title; since then line 2 has grown the _snr_note
+    # diagnostic (cube re-measurement, Δ, "[t from anchor]", raw σ) and
+    # at 16pt it overflowed the axes box at both figure edges. The box
+    # cannot grow: the "shared figure geometry" note above _PANEL_RECT
+    # pixel-aligns dm_time/image_peak, so the text has to yield. Line 1
+    # stays an ax.set_title at _TITLE_FONTSIZE (lifted by _TITLE_PAD to
+    # clear line 2); line 2 is drawn by _fit_title_line, which measures
+    # the rendered string against the axes width and steps the font size
+    # down until it fits — fitted by measurement, not tuned to today's
+    # longest string, so a future _snr_note addition shrinks rather than
+    # clips. The margin above the axes still holds both tiers.
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE, pad=_TITLE_PAD)
+    if subtitle:
+        _fit_title_line(fig, ax, subtitle)
     # Legend lives below the axes so it never overlaps the waterfall,
     # title, axis labels, or colorbar. No frame: plain text on the white
     # figure margin. The in-axes × marker is pure white (legible on the
@@ -1690,15 +1756,18 @@ def _render_image_peak(
     ax.set_xlabel("m (pix)", fontsize=_AXIS_LABEL_FONTSIZE)
     ax.set_ylabel("l (pix)", fontsize=_AXIS_LABEL_FONTSIZE)
     tlabel = f"t={t_idx}" + (f", mean of w={box}" if box > 1 else "")
-    title = (
-        f"image at (DM={coords.dm_pc_cc:.1f}, {tlabel}) — {event_name}\n"
+    title = f"image at (DM={coords.dm_pc_cc:.1f}, {tlabel}) — {event_name}"
+    subtitle = (
         f"burst (l,m)=({coords.l_pix},{coords.m_pix})"
         + _snr_note(coords) + _provenance(coords)
     )
-    # v3.5: explicit two-line title — see the matching note in
-    # _render_dm_time. Event identity on line 1, burst (l, m) on line 2;
-    # keeps each line within the axes width at _TITLE_FONTSIZE (16pt).
-    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
+    # v3.6: two visual tiers — see the matching note in _render_dm_time.
+    # Event identity on line 1 at _TITLE_FONTSIZE; burst (l, m) plus the
+    # _snr_note diagnostic on line 2, fitted to the pinned axes width by
+    # _fit_title_line. Both panels share the helper so the two tiers
+    # read the same size side by side whenever the strings are.
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE, pad=_TITLE_PAD)
+    _fit_title_line(fig, ax, subtitle)
     # Geometry is shared with _render_dm_time via _PANEL_RECT /
     # _CBAR_RECT / _CAPTION_Y, so both figures align by construction
     # (same 1100x990 PNG, same axes box, caption on the same line as
