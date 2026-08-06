@@ -13,9 +13,14 @@ M7.4 listener:
     :class:`CubeRetentionRing` via :func:`find_cube_for_specnum`.
   * On a hit, dispatches a ``CubeDumpWriter`` job at
     ``${c1.dump_root}/<event_name>/cube_s<sid>_g<g>_<event_specnum>.npz``.
-  * On a miss (ring rotated past the cube or trigger arrived before
-    the cube), increments the corresponding mon-point counter and
-    logs a WARNING with the current ring window.
+  * On a ``too_late`` miss (ring rotated past the cube), increments
+    the corresponding mon-point counter and logs a WARNING with the
+    current ring window.
+  * On a ``too_early`` miss (the request names a cube this half has
+    not produced yet), PARKS the request and re-checks the ring until
+    the half's frontier reaches the event or
+    ``too_early_retry_timeout_s`` elapses (2026-08-06, see
+    :class:`C2TriggerListener`).
 
 The wire schema + cube-lookup semantics live in
 ``docs/c1c2/C1C2_WIRE_SCHEMA.md`` §2.
@@ -34,9 +39,10 @@ import dataclasses
 import logging
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..coinc.wire import (
     BadBatch,
@@ -81,6 +87,15 @@ class C2TriggerListenerConfig:
         search_node_id: 0..N_SEARCH-1.
         dump_root: directory under which event subdirs are created
             (one ``<event_name>/`` per fired event).
+        too_early_retry_timeout_s: how long a ``too_early`` request is
+            parked and retried against the advancing ring before it is
+            written off as a miss. Default 120 s: it covers the
+            observed post-restart inter-half frontier spread of up to
+            ~60 s with margin, and since the ring passes over every
+            specnum exactly once a parked request either fulfils
+            within that spread or the fleet is genuinely wedged.
+            ``0.0`` restores the pre-2026-08-06 behaviour (a
+            ``too_early`` request is an immediate terminal miss).
     """
 
     bind_host: str
@@ -88,6 +103,7 @@ class C2TriggerListenerConfig:
     gpu_half: int
     search_node_id: int
     dump_root: Path
+    too_early_retry_timeout_s: float = 120.0
 
     @property
     def bind_port(self) -> int:
@@ -117,6 +133,34 @@ class _C2TriggerDatagramProtocol(asyncio.DatagramProtocol):
 
 
 # ---------------------------------------------------------------------------
+# Parked (too_early) requests
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _ParkedRequest:
+    """A ``too_early`` request awaiting this half's frontier.
+
+    Args:
+        packet: the decoded trigger, replayed verbatim on fulfilment so
+            the dump is byte-identical to an in-window request.
+        addr: sender address, kept only for the log lines.
+        t_park_s: ``time.monotonic()`` at park time (for the wait
+            duration in the fulfilment log).
+        deadline_s: ``t_park_s + too_early_retry_timeout_s``.
+    """
+
+    packet: C2TriggerPacket
+    addr: Any
+    t_park_s: float
+    deadline_s: float
+
+    @property
+    def key(self) -> Tuple[str, int]:
+        return (str(self.packet.event_name), int(self.packet.event_specnum))
+
+
+# ---------------------------------------------------------------------------
 # Listener
 # ---------------------------------------------------------------------------
 
@@ -133,6 +177,27 @@ class C2TriggerListener:
         with no shared state mutation, so no lock is required.
       * Mon-points are protected by a ``threading.Lock`` so external
         monitor pushers can read consistent counters.
+      * ``too_early`` requests are parked on a list serviced by a
+        small daemon thread (started lazily on the first park), so
+        the socket-serving path never blocks and other requests keep
+        being answered while parks are outstanding.
+
+    ``too_early`` retry (2026-08-06)
+    --------------------------------
+    Tonight's dedicated-C1-sender fix cut the C1 → C2 → dump-request
+    round trip from many seconds to ~1 s, so a request now routinely
+    arrives BEFORE the slower halves have processed the cube holding
+    the event: after a restart, halves' frontiers are frozen 1-60 s
+    apart (every half runs at ≈realtime pace, so nothing ever catches
+    up). With the old all-or-nothing behaviour those halves logged a
+    terminal ``too_early`` miss ~4 s before they would have had the
+    cube, events landed 4/8-5/8 cubes, and C2 DISCARDed the whole
+    event dir. A ``too_early`` request is therefore parked and
+    re-checked against the ring every
+    :data:`_RETRY_POLL_INTERVAL_S`; when the frontier reaches the
+    event it is dispatched exactly as a fresh in-window request would
+    be (same manifest, same staging path). ``too_late`` is unchanged:
+    the data really is gone and retrying cannot help.
 
     Args:
         config: bind + dispatch config.
@@ -145,7 +210,22 @@ class C2TriggerListener:
             (``(retained, packet, manifest) -> bool``). Defaults to a
             wrapper around ``cube_dump.submit``. Tests use this to
             assert dispatch without actually writing NPZs.
+        retry_poll_interval_s: how often the parked-request servicer
+            re-checks the ring. Tests shorten it; production keeps
+            the :data:`_RETRY_POLL_INTERVAL_S` default.
     """
+
+    #: Ring re-check cadence for parked ``too_early`` requests. Cheap
+    #: (a snapshot walk over ~12 cubes) and well under the ~2.5 s the
+    #: ring retains, so no cube can appear and rotate out between polls.
+    _RETRY_POLL_INTERVAL_S: float = 0.25
+
+    #: Hard cap on simultaneously parked requests. C2 fires at most a
+    #: handful of events per minute; anything beyond this means C2 is
+    #: storming us, and parking without bound would grow the list (and
+    #: each packet's retry work) forever. Overflow degrades to the old
+    #: terminal-miss behaviour.
+    _MAX_PARKED: int = 64
 
     def __init__(
         self,
@@ -157,6 +237,7 @@ class C2TriggerListener:
             Callable[[RetainedCube, C2TriggerPacket, CubeDumpManifest], bool]
         ] = None,
         stager: Optional[Any] = None,
+        retry_poll_interval_s: Optional[float] = None,
     ) -> None:
         self._config = config
         self._ring = ring
@@ -172,11 +253,28 @@ class C2TriggerListener:
         self._protocol: Optional[_C2TriggerDatagramProtocol] = None
         self._bound_port: int = 0
         self._lock = threading.Lock()
+        # Parked ``too_early`` requests + the daemon thread that
+        # services them (started lazily on the first park).
+        self._retry_poll_interval_s = float(
+            self._RETRY_POLL_INTERVAL_S
+            if retry_poll_interval_s is None
+            else retry_poll_interval_s
+        )
+        self._park_lock = threading.Lock()
+        self._parked: List[_ParkedRequest] = []
+        self._retry_stop = threading.Event()
+        self._retry_thread: Optional[threading.Thread] = None
         self._mon: Dict[str, Any] = {
             "received": 0,
             "hits": 0,
             "too_late": 0,
+            # ``too_early`` counts only TERMINAL too_early misses, i.e.
+            # requests whose retry timed out (pre-2026-08-06 this was
+            # every too_early request).
             "too_early": 0,
+            "too_early_parked": 0,
+            "too_early_fulfilled": 0,
+            "too_early_parked_now": 0,
             # Proactive-stage rescues: a ``too_late`` miss whose cube had
             # been staged proactively and was claimed into the event dir.
             "rescued": 0,
@@ -234,6 +332,7 @@ class C2TriggerListener:
 
     async def stop(self) -> None:
         if self._transport is None:
+            self._stop_retry_thread()
             return
         try:
             self._transport.close()
@@ -241,8 +340,34 @@ class C2TriggerListener:
             self._transport = None
             self._protocol = None
             self._bound_port = 0
+        self._stop_retry_thread()
         await asyncio.sleep(0)
         _LOG.info("C2TriggerListener stopped")
+
+    def _stop_retry_thread(self) -> None:
+        """Join the parked-request servicer and abandon any parks.
+
+        Bounded join (the thread only ever sleeps ``poll_interval``
+        between passes) so shutdown can't hang on it; the thread is a
+        daemon anyway.
+        """
+        thread = self._retry_thread
+        self._retry_thread = None
+        self._retry_stop.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0 + self._retry_poll_interval_s)
+        with self._park_lock:
+            abandoned = list(self._parked)
+            self._parked = []
+        with self._lock:
+            self._mon["too_early_parked_now"] = 0
+        for parked in abandoned:
+            _LOG.warning(
+                "C2TriggerListener: abandoning parked too_early request "
+                "at shutdown: event=%s specnum=%d",
+                parked.packet.event_name,
+                int(parked.packet.event_specnum),
+            )
 
     # ------------------------------------------------------------------
     # Datagram handling
@@ -283,35 +408,39 @@ class C2TriggerListener:
             self._mon["last_event_specnum"] = int(packet.event_specnum)
         self._handle_trigger(packet, addr)
 
+    def _classify_miss(self, event_specnum: int) -> Tuple[str, str]:
+        """Classify a ring miss as ``too_late`` / ``too_early`` and
+        render the ring window for the log line."""
+        snapshot = self._ring.snapshot()
+        if not snapshot:
+            return "too_early", "ring empty"
+        newest = snapshot[0]  # newest-first iter
+        oldest = snapshot[-1]
+        oldest_start = int(oldest.event_specnum_start)
+        # SEARCH samples on both sides — a cube spans exactly
+        # t_det of them, not t_det * sample_period_specnum (see
+        # cube_pipeline.find_cube_for_specnum). The old form
+        # reported a ring window 16x wider than the ring really
+        # covers, so a genuine too_early miss could be logged
+        # with a window that appeared to contain it.
+        newest_end_excl = int(newest.event_specnum_start) + int(newest.t_det)
+        kind = "too_late" if int(event_specnum) < oldest_start else "too_early"
+        return kind, f"[{oldest_start}, {newest_end_excl})"
+
     def _handle_trigger(self, packet: C2TriggerPacket, addr) -> None:  # noqa: ANN001
         retained = find_cube_for_specnum(self._ring, packet.event_specnum)
         if retained is None:
             # Miss: classify too_late vs too_early using the ring's
             # oldest / newest specnum window.
-            snapshot = self._ring.snapshot()
-            if not snapshot:
-                kind = "too_early"
-                window_str = "ring empty"
-            else:
-                newest = snapshot[0]  # newest-first iter
-                oldest = snapshot[-1]
-                oldest_start = int(oldest.event_specnum_start)
-                # SEARCH samples on both sides — a cube spans exactly
-                # t_det of them, not t_det * sample_period_specnum (see
-                # cube_pipeline.find_cube_for_specnum). The old form
-                # reported a ring window 16x wider than the ring really
-                # covers, so a genuine too_early miss could be logged
-                # with a window that appeared to contain it.
-                newest_end_excl = (
-                    int(newest.event_specnum_start) + int(newest.t_det)
-                )
-                if int(packet.event_specnum) < oldest_start:
-                    kind = "too_late"
-                else:
-                    kind = "too_early"
-                window_str = (
-                    f"[{oldest_start}, {newest_end_excl})"
-                )
+            kind, window_str = self._classify_miss(packet.event_specnum)
+            if (
+                kind == "too_early"
+                and float(self._config.too_early_retry_timeout_s) > 0.0
+            ):
+                # The cube isn't gone, it hasn't been produced yet:
+                # park the request and let the ring come to it.
+                self._park_too_early(packet, addr, window_str)
+                return
             with self._lock:
                 self._mon[kind] = int(self._mon[kind]) + 1
             _LOG.warning(
@@ -351,6 +480,167 @@ class C2TriggerListener:
                         packet.event_name, int(packet.event_specnum), claimed,
                     )
             return
+        self._dispatch_hit(packet, retained)
+
+    # ------------------------------------------------------------------
+    # too_early parking / retry
+    # ------------------------------------------------------------------
+
+    def _park_too_early(
+        self,
+        packet: C2TriggerPacket,
+        addr,  # noqa: ANN001
+        window_str: str,
+    ) -> None:
+        """Park a ``too_early`` request for retry against the ring.
+
+        Runs on the event-loop thread; it only appends to a list and
+        (once) starts the servicer thread, so the socket-serving path
+        stays non-blocking.
+        """
+        timeout_s = float(self._config.too_early_retry_timeout_s)
+        now = time.monotonic()
+        parked = _ParkedRequest(
+            packet=packet,
+            addr=addr,
+            t_park_s=now,
+            deadline_s=now + timeout_s,
+        )
+        with self._park_lock:
+            # A resent trigger for an already-parked event must not
+            # park (and therefore dump) twice.
+            if any(p.key == parked.key for p in self._parked):
+                _LOG.debug(
+                    "C2TriggerListener: too_early request already parked "
+                    "(event=%s specnum=%d)",
+                    packet.event_name, int(packet.event_specnum),
+                )
+                return
+            overflow = len(self._parked) >= int(self._MAX_PARKED)
+            if not overflow:
+                self._parked.append(parked)
+                n_parked = len(self._parked)
+        if overflow:
+            with self._lock:
+                self._mon["too_early"] = int(self._mon["too_early"]) + 1
+            _LOG.warning(
+                "C2TriggerListener miss (too_early, park queue full at %d): "
+                "event=%s specnum=%d from %s; ring window %s",
+                int(self._MAX_PARKED),
+                packet.event_name,
+                int(packet.event_specnum),
+                addr,
+                window_str,
+            )
+            return
+        with self._lock:
+            self._mon["too_early_parked"] = (
+                int(self._mon["too_early_parked"]) + 1
+            )
+            self._mon["too_early_parked_now"] = int(n_parked)
+        _LOG.info(
+            "C2TriggerListener parked too_early request: event=%s "
+            "specnum=%d from %s; ring window %s; retrying up to %.0fs",
+            packet.event_name,
+            int(packet.event_specnum),
+            addr,
+            window_str,
+            timeout_s,
+        )
+        self._ensure_retry_thread()
+
+    def _ensure_retry_thread(self) -> None:
+        thread = self._retry_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._retry_stop.clear()
+        thread = threading.Thread(
+            target=self._retry_loop,
+            name="c2trig-retry",
+            daemon=True,
+        )
+        self._retry_thread = thread
+        thread.start()
+
+    def _retry_loop(self) -> None:
+        while not self._retry_stop.wait(self._retry_poll_interval_s):
+            try:
+                self._service_parked()
+            except Exception:  # noqa: BLE001 - never kill the servicer
+                _LOG.exception(
+                    "C2TriggerListener: parked-request servicer pass failed"
+                )
+
+    def _service_parked(self) -> None:
+        """One retry pass: fulfil parked requests the ring now covers,
+        expire those past their deadline."""
+        now = time.monotonic()
+        ready: List[Tuple[_ParkedRequest, RetainedCube]] = []
+        expired: List[_ParkedRequest] = []
+        with self._park_lock:
+            if not self._parked:
+                return
+            keep: List[_ParkedRequest] = []
+            # Oldest park first, so parks fulfil in arrival order as the
+            # frontier sweeps past them.
+            for parked in self._parked:
+                retained = find_cube_for_specnum(
+                    self._ring, parked.packet.event_specnum,
+                )
+                if retained is not None:
+                    ready.append((parked, retained))
+                elif now >= parked.deadline_s:
+                    expired.append(parked)
+                else:
+                    keep.append(parked)
+            self._parked = keep
+            n_parked = len(keep)
+        with self._lock:
+            self._mon["too_early_parked_now"] = int(n_parked)
+        for parked, retained in ready:
+            waited_s = now - parked.t_park_s
+            with self._lock:
+                self._mon["too_early_fulfilled"] = (
+                    int(self._mon["too_early_fulfilled"]) + 1
+                )
+            _LOG.info(
+                "C2TriggerListener too_early request fulfilled after %.1fs "
+                "wait (event=%s, specnum=%d)",
+                waited_s,
+                parked.packet.event_name,
+                int(parked.packet.event_specnum),
+            )
+            # Identical to the in-window path: same manifest, same
+            # stager drop_pending, same dispatcher.
+            self._dispatch_hit(parked.packet, retained)
+        for parked in expired:
+            kind, window_str = self._classify_miss(
+                parked.packet.event_specnum
+            )
+            with self._lock:
+                self._mon["too_early"] = int(self._mon["too_early"]) + 1
+            _LOG.warning(
+                "C2TriggerListener miss (too_early, retry timed out after "
+                "%.0fs): event=%s specnum=%d from %s; ring window %s",
+                float(self._config.too_early_retry_timeout_s),
+                parked.packet.event_name,
+                int(parked.packet.event_specnum),
+                parked.addr,
+                window_str,
+            )
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    def _dispatch_hit(
+        self,
+        packet: C2TriggerPacket,
+        retained: RetainedCube,
+    ) -> None:
+        """Dump ``retained`` for ``packet``. Shared by the in-window
+        path (event-loop thread) and the parked-retry path (servicer
+        thread)."""
         with self._lock:
             self._mon["hits"] = int(self._mon["hits"]) + 1
         # Live-ring dump wins: discard any redundant proactively-staged
@@ -465,6 +755,13 @@ class C2TriggerListener:
     def mon(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self._mon)
+
+    @property
+    def n_parked(self) -> int:
+        """Number of ``too_early`` requests currently awaiting the
+        half's frontier."""
+        with self._park_lock:
+            return len(self._parked)
 
     @property
     def bound_port(self) -> int:

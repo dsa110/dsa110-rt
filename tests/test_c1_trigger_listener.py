@@ -321,6 +321,11 @@ async def test_too_early_miss(tmp_path: Path) -> None:
         gpu_half=0,
         search_node_id=1,
         dump_root=tmp_path,
+        # 2026-08-06: a too_early request is now parked and retried
+        # against the advancing ring; this ring never advances, so a
+        # short timeout exercises the terminal-miss accounting the
+        # rest of this test asserts.
+        too_early_retry_timeout_s=0.2,
     )
     dispatched: List = []
     listener = C2TriggerListener(
@@ -350,6 +355,9 @@ async def test_empty_ring_miss_counts_as_too_early(tmp_path: Path) -> None:
         gpu_half=0,
         search_node_id=1,
         dump_root=tmp_path,
+        # See test_too_early_miss: short retry timeout so the parked
+        # request expires into the terminal miss this test asserts.
+        too_early_retry_timeout_s=0.2,
     )
     listener = C2TriggerListener(config=cfg, ring=ring)
     await listener.start()

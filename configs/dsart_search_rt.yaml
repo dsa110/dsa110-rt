@@ -522,6 +522,21 @@ c1:
   dump_listener:
     bind_host: ""                    # filled per-host via --c1-bind-host above
     base_port: 11227                 # actual port = base_port + gpu_half
+    # 2026-08-06: how long a ``too_early`` cube request (one naming a
+    # cube this half has NOT produced yet) is parked and retried
+    # against the advancing retention ring before it is written off as
+    # a miss. Since the c1_emit sender fix cut the C1->C2->request
+    # round trip to ~1 s, requests routinely arrive before the slower
+    # halves' frontiers, which sit 1-60 s behind the detecting half
+    # after a restart and never catch up (every half runs at
+    # ~realtime). Without this the halves logged a terminal miss
+    # seconds before they had the cube, events landed 4/8-5/8 cubes,
+    # and C2's all-or-nothing policy DISCARDed the whole event dir.
+    # 120 s covers the observed spread with margin; the ring passes
+    # over every specnum, so a parked request either fulfils or the
+    # fleet is genuinely wedged. 0 = old terminal-miss behaviour.
+    # ``too_late`` requests are never retried (the data is gone).
+    too_early_retry_timeout_s: 120.0
   dump_root: /home/ubuntu/data/c2/cube_dump
   uploader:
     remote_root: ubuntu@lxd110h23.pro.pvt:/dataz/dsa110/candidates   # FQDN: search nodes can't resolve bare 'lxd110h23'

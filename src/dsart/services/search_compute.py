@@ -2617,6 +2617,9 @@ def _build_search_config_from_yaml(
             gpu_half=int(gpu_half),
             search_node_id=int(search_node_id),
             dump_root=listener_dump_root,
+            too_early_retry_timeout_s=float(
+                dump_listener_yaml.get("too_early_retry_timeout_s", 120.0)
+            ),
         )
 
     # 2026-07-21 proactive cube staging (bright-candidate pre-stage).
