@@ -618,6 +618,31 @@ c1:
 # Cube geometry knobs shared with the merger block. The merger reads
 # ``cube.sample_period_specnum`` as the default for
 # ``merger.sample_period_specnum`` when the latter is omitted.
+# --- cube-dump writer -------------------------------------------------
+cube_dump:
+  # 2026-08-06: writer queue depth between the dispatch path and the
+  # single cube-dump writer thread. This is a MEMORY budget, not a
+  # tuning knob -- each slot pins a whole [256, 34, 256, 256] float16
+  # cube, ~1.1 GiB, so depth 4 is already ~4.4 GiB per half and there
+  # are two halves per node. Do not raise it to chase drops.
+  #
+  # Drops are bursty, not steady: on 2026-08-06 every half sat pinned at
+  # depth 4 through the 08:00-10:10 window (the dashboard injection
+  # ladder spraying sidelobe candidates fleet-wide, then the restart)
+  # and shed hundreds of requests, while the rest of the day and every
+  # window since the 10:12 restart drop nothing and peak at depth 2.
+  #
+  # What was wrong was not the depth but WHICH request lost. put_nowait
+  # dropped the arrival, so a ``udp`` dump -- one that had already been
+  # through C1 -> C2 coincidence and survived cross-node vetoes -- could
+  # be discarded to keep four unvetted local ``auto`` bright-pulse
+  # cubes. The writer now displaces the oldest strictly-lower-value
+  # queued dump instead, releasing its ring pin, and reports the split
+  # as cube_dump_n_displaced (a subset of cube_dump_n_dropped). Watch
+  # the two together: displacements mean the queue is doing its job,
+  # plain drops with a udp arrival mean it is genuinely oversubscribed.
+  queue_maxsize: 4
+
 cube:
   sample_period_specnum: 16
 

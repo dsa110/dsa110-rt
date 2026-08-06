@@ -2031,6 +2031,10 @@ class SearchComputeService:
                     int(self._cube_dump.queue_depth)
                     if self._cube_dump is not None else 0
                 )
+                cd_displaced = (
+                    int(self._cube_dump.n_displaced)
+                    if self._cube_dump is not None else 0
+                )
                 cd_qmax = 0
                 if self._cube_dump is not None and (
                     self._config.cube_dump_writer_config is not None
@@ -2065,6 +2069,7 @@ class SearchComputeService:
                 self._compute_mon.publish_dump_health(
                     cube_dump_n_dumped=cd_dumped,
                     cube_dump_n_dropped=cd_dropped,
+                    cube_dump_n_displaced=cd_displaced,
                     cube_dump_n_failed=cd_failed,
                     cube_dump_queue_depth=cd_qd,
                     cube_dump_queue_maxsize=cd_qmax,

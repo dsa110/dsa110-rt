@@ -16,10 +16,12 @@ dumper described in ``M6_PLAN_FIXES.md`` D7/D8:
      drain loop and writes a ``[T_det, N_fine_DM, N_grid, N_grid]``
      float16 cube as an NPZ archive at
      ``${DUMP_ROOT}/cube_s${sid}_g${g}_${event_specnum_start}.npz``
-     with a sidecar manifest. When the queue is full ``put_nowait``
-     raises and the dispatch path logs a WARNING, increments the
-     ``n_dropped`` counter, and returns ``False`` — the real-time hot
-     path is non-blocking.
+     with a sidecar manifest. When the queue is full the dispatch path
+     first tries to displace a strictly lower-value queued dump (a
+     C2-confirmed ``udp`` dump outranks a local ``auto`` one, see
+     ``_DUMP_PRIORITY``); failing that it logs a WARNING, increments
+     ``n_dropped`` and returns ``False``. Either way the real-time hot
+     path never blocks.
 
 The auto-trigger path fires on the CURRENT cube (the GPU cube tensor
 is still in scope right after clustering); the UDP path (chunk 4
@@ -54,6 +56,7 @@ import json
 import logging
 import os
 import queue
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,6 +250,45 @@ class CubeDumpWriterConfig:
 _DRAIN_SENTINEL = object()
 
 
+# --------------------------------------------------------------------------- #
+# Dump value ordering, used only when the writer queue is full
+# --------------------------------------------------------------------------- #
+#
+# The queue is deliberately shallow (D7 default 4) because each slot pins a
+# whole cube in memory -- [256, 34, 256, 256] float16 is ~1.1 GiB, so depth 4
+# is already ~4.4 GiB per half and raising it is not free. Depth is therefore
+# NOT the lever. The lever is which request loses when a burst arrives.
+#
+# Until now ``put_nowait`` dropped the INCOMING request, which gets the
+# priority backwards: a ``udp`` dump has been through C1 -> C2 coincidence and
+# survived cross-node vetoes, i.e. it is a real multi-node candidate, whereas
+# an ``auto`` dump is one half's local bright-pulse predicate firing with no
+# corroboration. During the 2026-08-06 08:00-10:10 bursts (the dashboard
+# injection ladder spraying sidelobe candidates fleet-wide, then the restart)
+# every half sat pinned at depth 4 and shed requests without regard to which
+# kind they were, so a coincidence-confirmed candidate could be discarded to
+# keep four unvetted local ones.
+#
+# So on a full queue we now displace one strictly-lower-value queued dump
+# rather than refuse the arrival. This mirrors the cube uploader, which is
+# already documented as "oldest-evicting on a full queue, so newer events are
+# preferred during sustained backlog".
+_DUMP_PRIORITY = {
+    "udp": 2,    # C2-triggered: passed coincidence + vetoes
+    "auto": 1,   # local bright-pulse predicate only
+}
+
+#: Lowest value in :data:`_DUMP_PRIORITY`. A submit at this level can never
+#: displace anything, so it skips the scan entirely and keeps the hot path
+#: free of pointless queue churn during an auto-trigger storm.
+_MIN_DUMP_PRIORITY = min(_DUMP_PRIORITY.values())
+
+
+def _dump_priority(manifest: "CubeDumpManifest") -> int:
+    """Relative value of a queued dump. Unknown sources sort lowest."""
+    return _DUMP_PRIORITY.get(getattr(manifest, "trigger_source", ""), 0)
+
+
 # Default ring-buffer depth for ``CubeDumpWriter`` writer-time history.
 # 256 samples is enough to smooth a few seconds of bursty production
 # dumps for the cube-dump-e2e bench's writer_p99_ms metric while keeping
@@ -262,8 +304,10 @@ class CubeDumpWriter:
     ``queue.Queue(maxsize=queue_maxsize)``. The dispatch path calls
     ``submit`` with the cube tensor and a fully-built
     ``CubeDumpManifest``; ``submit`` pushes onto the queue with
-    ``put_nowait`` and returns ``True`` on success or ``False`` if the
-    queue is full (with a WARNING log and ``n_dropped`` increment).
+    ``put_nowait`` and returns ``True`` on success. On a full queue it
+    displaces a strictly lower-value queued dump if one is waiting
+    (``n_displaced``); otherwise it returns ``False`` with a WARNING log
+    and an ``n_dropped`` increment.
 
     The drain loop:
 
@@ -279,7 +323,7 @@ class CubeDumpWriter:
     thread, not in the dispatch path, so the real-time GPU pipeline
     doesn't pay the ``.cpu()`` synchronization cost.
 
-    Counters (``n_dumped``, ``n_dropped``, ``n_failed``,
+    Counters (``n_dumped``, ``n_dropped``, ``n_displaced``, ``n_failed``,
     ``queue_depth``) are read-only properties safe to inspect from
     the operator process.
 
@@ -319,6 +363,11 @@ class CubeDumpWriter:
         self._n_dumped = 0
         self._n_dropped = 0
         self._n_failed = 0
+        # Serialises producers against each other during the full-queue
+        # displacement dance below. The writer thread never takes it, so a
+        # displacing submit can never stall a write in progress.
+        self._evict_lock = threading.Lock()
+        self._n_displaced = 0
         # M7.4 cube-uploader hook bookkeeping: count successful hook
         # invocations and exception swallows so operators can sanity-
         # check the rsync wiring without grovelling through logs.
@@ -409,16 +458,102 @@ class CubeDumpWriter:
             raise RuntimeError("CubeDumpWriter.submit() before start()")
         if self._stopped:
             raise RuntimeError("CubeDumpWriter.submit() after stop()")
+        item = (cube, manifest, on_complete)
         try:
-            self._queue.put_nowait((cube, manifest, on_complete))
+            self._queue.put_nowait(item)
             return True
         except queue.Full:
-            _log.warning(
-                "cube_dump_dropped: queue full (cube_id=%d)",
-                manifest.cube_id,
-            )
-            self._n_dropped += 1
+            pass
+        # Queue full. Rather than reflexively discarding the arrival, see
+        # whether something less valuable is already waiting (see
+        # _DUMP_PRIORITY): a C2-confirmed dump should not lose to a queued
+        # local auto-trigger.
+        if self._try_displace(item):
+            return True
+        _log.warning(
+            "cube_dump_dropped: queue full (cube_id=%d, source=%s, "
+            "nothing lower-value queued to displace)",
+            manifest.cube_id,
+            manifest.trigger_source,
+        )
+        self._n_dropped += 1
+        return False
+
+    def _try_displace(self, item: Any) -> bool:
+        """Enqueue ``item`` by discarding the oldest lower-value queued dump.
+
+        Looks at the head of the queue only -- the item that has been waiting
+        longest -- rather than scanning for the globally cheapest victim. That
+        keeps this bounded and easy to reason about on a real-time path, and at
+        the default depth of 4 the head is overwhelmingly the stale
+        auto-trigger we want gone. If the head is not cheaper than ``item``, we
+        decline and the caller drops the arrival as before, so behaviour is
+        never worse than it was.
+
+        Returns:
+            ``True`` if ``item`` is now queued (and a victim was released).
+        """
+        incoming = _dump_priority(item[1])
+        if incoming <= _MIN_DUMP_PRIORITY:
             return False
+        victim: Any = None
+        with self._evict_lock:
+            try:
+                head = self._queue.get_nowait()
+            except queue.Empty:
+                # The writer drained it between our put and now; the caller's
+                # retry path is the next submit, so just decline.
+                return False
+            # Balance the unfinished-task count for the get() we just did; each
+            # put_nowait below re-increments it. Nothing calls join() today,
+            # but leaving the count skewed would silently break one later.
+            self._queue.task_done()
+            if head is _DRAIN_SENTINEL or _dump_priority(head[1]) >= incoming:
+                # Never displace shutdown, and never displace an equal-or-
+                # better dump. Put it back exactly where it was.
+                try:
+                    self._queue.put_nowait(head)
+                except queue.Full:  # pragma: no cover - we just freed a slot
+                    _log.error(
+                        "cube_dump_displace: could not restore queued dump, "
+                        "releasing its ring slot",
+                    )
+                    self._release_pin(head)
+                return False
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:  # pragma: no cover - we just freed a slot
+                self._queue.put_nowait(head)
+                return False
+            victim = head
+        # Outside the lock: the victim's ring slot MUST be released or that
+        # slot stays pinned for the life of the process. The drain loop does
+        # this in a finally for the same reason.
+        self._n_displaced += 1
+        self._n_dropped += 1
+        _log.warning(
+            "cube_dump_displaced: queue full, dropped %s cube_id=%d to make "
+            "room for %s cube_id=%d",
+            victim[1].trigger_source,
+            victim[1].cube_id,
+            item[1].trigger_source,
+            item[1].cube_id,
+        )
+        self._release_pin(victim)
+        return True
+
+    def _release_pin(self, item: Any) -> None:
+        """Run a discarded item's ``on_complete`` so its ring slot is freed."""
+        on_complete = item[2] if len(item) > 2 else None
+        if on_complete is None:
+            return
+        try:
+            on_complete()
+        except Exception:  # noqa: BLE001 - never poison the caller
+            _log.exception(
+                "cube_dump_displaced: on_complete (slot release) failed "
+                "(cube_id=%d)", item[1].cube_id,
+            )
 
     # ------------------------------------------------------------------
     # Counters
@@ -428,6 +563,17 @@ class CubeDumpWriter:
     def n_dumped(self) -> int:
         """Number of NPZ dumps successfully written."""
         return self._n_dumped
+
+    @property
+    def n_displaced(self) -> int:
+        """Dumps evicted to make room for a higher-value one.
+
+        A subset of :attr:`n_dropped` -- a displaced dump is still a dump that
+        did not get written, so it counts in both. The split tells an operator
+        whether a full queue is costing them unvetted auto-triggers (fine) or
+        C2-confirmed candidates (not fine).
+        """
+        return self._n_displaced
 
     @property
     def n_dropped(self) -> int:

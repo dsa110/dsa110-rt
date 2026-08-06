@@ -893,6 +893,7 @@ _SEARCH_NOISE_PER_KERNEL_EXCLUDE = frozenset(_SEARCH_NOISE_FLOAT_FIELDS)
 #: rollup. Published every ``cube_progress`` tick.
 _SEARCH_DUMP_INT_FIELDS = (
     "cube_dump_n_dumped",
+    "cube_dump_n_displaced",
     "cube_dump_n_dropped",
     "cube_dump_n_failed",
     "cube_dump_queue_depth",
