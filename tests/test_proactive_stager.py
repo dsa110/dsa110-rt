@@ -32,7 +32,13 @@ T_DET = 192
 SAMPLE_PERIOD_SPECNUM = 16
 N_FDM = 4
 N_GRID = 8
-WINDOW = T_DET * SAMPLE_PERIOD_SPECNUM  # specnum span of one cube
+# Specnum span of one cube. event_specnum and the cube anchor are both
+# in SEARCH-sample units (detector/decoder.py:216,
+# services/search_compute.py:1338-1345), so a cube covers exactly t_det
+# of them. This was T_DET * SAMPLE_PERIOD_SPECNUM, matching the 16x-too-
+# wide claim window in the stager, so the pair was self-consistent and
+# neither could fail.
+WINDOW = T_DET
 
 
 class _FakeWriter:

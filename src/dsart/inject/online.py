@@ -192,6 +192,14 @@ class InjectionConfig:
     width_samples : int
         FWHM width in NATIVE samples (1 native sample = 32.768 µs).
         Must satisfy ``1 ≤ width_samples ≤ MAX_WIDTH_SAMPLES``.
+
+        CROSS-READING HAZARD: a C1 row's ``width_samples``
+        (``coinc/wire.C1CandidateRow``) is the detector's boxcar index
+        in SEARCH samples (1048.576 µs at the production op-point), so
+        the two differ by a factor of 32 there — an injection fired at
+        ``width_samples=4`` is reported by the detector at w≈2. Verified
+        on the 2026-08 campaign shots. Convert through the sample
+        periods rather than comparing the integers.
     profile : str
         Intrinsic profile family; one of :data:`PROFILE_FAMILIES`.
     apply_at_specnum : int

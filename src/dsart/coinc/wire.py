@@ -77,6 +77,16 @@ class C1CandidateRow:
     dm_idx_global: int
     fine_dm_idx: int
     event_specnum: int
+    #: Matched-filter boxcar width in SEARCH samples (1048.576 µs each
+    #: at the production op-point) — the detector's own boxcar index,
+    #: ``Candidate.width_samples`` from ``detector/decoder.py``.
+    #:
+    #: CROSS-READING HAZARD: the injector's ``width_samples``
+    #: (``inject/online.py``, ``InjectionRequest``) is a FWHM in NATIVE
+    #: samples of 32.768 µs, so the two differ by a factor of 32 at the
+    #: production op-point — a shot fired at injector w=4 is reported
+    #: here at w≈2, not w=4. Never compare the two numbers directly;
+    #: convert through the sample periods.
     width_samples: int
     kernel_id: str
     flags: int

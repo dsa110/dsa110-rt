@@ -22,9 +22,21 @@ This module ships two SNR-sorted suppression scans:
     survivors at small Δl or small Δm respectively, and we want to
     collapse those into a single peak. The time predicate is
     width-aware: the half-overlap edge between the two boxcars'
-    matched-filter widths, scaled by ``sample_period_specnum`` so
-    ``event_specnum`` (raw SNAP units) directly compares to the
-    sample-scale window.
+    matched-filter widths, scaled by ``sample_period_specnum``.
+
+    .. note:: **Deliberate non-fix (2026-08-06).** That scaling is the
+       same units error fixed elsewhere on this branch:
+       ``Candidate.event_specnum`` is ``specnum_start + t_idx``
+       (``detector/decoder.py:216``), i.e. SEARCH samples, not raw SNAP
+       specnums, so ``width_samples`` already compares to it directly
+       and the ``× sample_period_specnum`` makes the merge window 16×
+       wider than this docstring's formula describes. It is left in
+       place because the fleet's C1 emit rate has been tuned against
+       the wide window — it acts as a tuned suppression radius, and
+       narrowing it raises the number of survivors per cube. Narrowing
+       is deferred pending a C1-rate / metering bench (see
+       ``services/c1_emit`` metering counters). Do not "fix" this
+       without that measurement.
 
   * :func:`merge_across_kernels` — the **legacy axis-AND box merger**
     (plan §4.4 line 1589). Per-axis half-window radii on (l, m, fdm,
@@ -151,6 +163,12 @@ def merge_across_kernels_c1(
     for cand in sorted_cands:
         suppressed = False
         for s in survivors:
+            # NOTE: `* sps` is the search-vs-native specnum units error
+            # documented in the module docstring — event_specnum is in
+            # SEARCH samples, so this window is sps× (16× in production)
+            # wider than the width-aware rule it implements. Retained
+            # deliberately as a tuned suppression radius; narrowing it
+            # needs a C1-rate bench first. Behaviour unchanged here.
             dt_specnum_max = (
                 t_frac
                 * 0.5

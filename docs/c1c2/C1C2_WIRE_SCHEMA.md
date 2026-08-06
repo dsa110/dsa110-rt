@@ -95,9 +95,17 @@ Lines:
   | dm_idx_global    | int    | `%d`               | absolute index into the full plan fine_dm grid  |
   | fine_dm_idx      | int    | `%d`               | per-cube local fine-DM index ∈ [0, n_fdm)       |
   | event_specnum    | int    | `%d`               | absolute spec num of the candidate's t          |
-  | width_samples    | int    | `%d`               | matched-filter width in detector samples        |
+  | width_samples    | int    | `%d`               | matched-filter width in SEARCH (detector) samples — NOT the injector's native-sample width, see below |
   | kernel_id        | string | `k_img:k_dm:k_time`| no spaces, see Candidate._check_kernel_id       |
   | flags            | int    | `%d`               | CandidateFlags bit mask                         |
+
+  `width_samples` cross-reading hazard: the injector's
+  `width_samples` (`inject/online.InjectionRequest`) is an FWHM in
+  **native** samples of 32.768 µs, while this field is the detector
+  boxcar index in **search** samples (1048.576 µs at the production
+  op-point) — a factor of 32 apart. A shot fired at injector `w=4`
+  is reported here at `w≈2`. Convert through the sample periods; do
+  not compare the integers.
 
 - `# END` line terminates the batch.
 

@@ -296,9 +296,14 @@ class C2TriggerListener:
                 newest = snapshot[0]  # newest-first iter
                 oldest = snapshot[-1]
                 oldest_start = int(oldest.event_specnum_start)
+                # SEARCH samples on both sides — a cube spans exactly
+                # t_det of them, not t_det * sample_period_specnum (see
+                # cube_pipeline.find_cube_for_specnum). The old form
+                # reported a ring window 16x wider than the ring really
+                # covers, so a genuine too_early miss could be logged
+                # with a window that appeared to contain it.
                 newest_end_excl = (
-                    int(newest.event_specnum_start)
-                    + int(newest.t_det) * int(newest.sample_period_specnum)
+                    int(newest.event_specnum_start) + int(newest.t_det)
                 )
                 if int(packet.event_specnum) < oldest_start:
                     kind = "too_late"
