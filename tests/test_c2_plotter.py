@@ -797,6 +797,49 @@ def test_load_cubes_prefers_cube_mjd_start_over_mjd_start(
             c.close()
 
 
+def test_provenance_is_silent_on_the_healthy_anchor_path() -> None:
+    """The default/healthy path (time from the cube's own anchor) gets
+    no placement tag at all — only the two fallbacks are flagged."""
+    import dataclasses
+
+    from dsart.coinc.plotter import _BurstCoords, _provenance
+
+    healthy = _BurstCoords(
+        t_idx=10, fdm_idx=0, l_pix=1, m_pix=1, dm_pc_cc=100.0, snr=10.0,
+        width_samples=4, n_fdm=1, t_det=20, from_metadata=True,
+        t_from_anchor=True,
+    )
+    assert _provenance(healthy) == ""
+
+    relocated = dataclasses.replace(healthy, t_from_anchor=False)
+    assert _provenance(relocated) == " · re-searched in cube"
+
+    no_meta = dataclasses.replace(healthy, from_metadata=False)
+    assert _provenance(no_meta) == (
+        " · no detector info — showing brightest pixel"
+    )
+
+
+def test_snr_note_reports_the_cube_re_measurement_and_delta() -> None:
+    """``Δ`` is detector SNR minus the cube re-measurement, with a
+    proper minus sign for negative deltas; omitted when there is no
+    cube re-measurement to compare against."""
+    from dsart.coinc.plotter import _BurstCoords, _snr_note
+
+    coords = _BurstCoords(
+        t_idx=10, fdm_idx=0, l_pix=1, m_pix=1, dm_pc_cc=100.0, snr=35.7,
+        width_samples=2, n_fdm=1, t_det=20, from_metadata=True,
+        snr_measured=38.4, snr_measured_raw=25.1, boxcar=2,
+    )
+    assert _snr_note(coords) == " · 38.4σ (archived cube) · Δ = −2.7σ"
+
+    no_measurement = _BurstCoords(
+        t_idx=10, fdm_idx=0, l_pix=1, m_pix=1, dm_pc_cc=100.0, snr=10.0,
+        width_samples=0, n_fdm=1, t_det=20, from_metadata=False,
+    )
+    assert _snr_note(no_measurement) == ""
+
+
 def test_title_line_is_fitted_to_the_pinned_axes_box() -> None:
     """The diagnostic title line shrinks to fit, but stays legible.
 
@@ -814,10 +857,10 @@ def test_title_line_is_fitted_to_the_pinned_axes_box() -> None:
         _fit_title_line,
     )
 
-    short = "burst (l,m)=(128,131)"
+    short = "detected pixel (l,m)=(128,131)"
     long = (
-        "burst DM=1702.6 pc cm⁻³, SNR=135.7 | cube w32 138.4σ Δ-12.6 "
-        "[t from anchor] (raw 125.1σ)"
+        "DM 1702.6 pc cm⁻³ · SNR 135.7 (detector) · 138.4σ "
+        "(archived cube) · Δ = −12.6σ · re-searched in cube"
     )
     absurd = long + " " + long + " " + long
 

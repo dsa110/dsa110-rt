@@ -1404,31 +1404,57 @@ def _placeholder(path: Path, title: str, msg: str) -> Path:
     return path
 
 
+def _signed_sigma(x: float) -> str:
+    """``+13.6σ`` / ``−12.6σ`` — a proper minus sign, not a hyphen."""
+    sign = "+" if x >= 0.0 else "−"
+    return f"{sign}{abs(x):.1f}σ"
+
+
 def _provenance(coords: Optional[_BurstCoords]) -> str:
+    """" · re-searched in cube" / " · no detector info — showing
+    brightest pixel" — flags the two fallback placements.
+
+    The healthy/default path — the cube carries a trustworthy sample-0
+    anchor, so the panel shows the detector's own time index directly —
+    prints nothing: that is what every panel is supposed to show, and a
+    tag on it would just be noise. The two fallbacks each get a plain-
+    English flag: metadata is present but the cube has no anchor, so
+    the burst time was relocated by a width-matched search of the
+    dumped cube (not the detector's own index); or there is no
+    detection metadata at all, so the panel falls back to the cube's
+    single brightest pixel, which can just as easily be bright steady
+    continuum or RFI as the burst. ("re-searched in cube" is the short
+    form of "burst time re-searched in the cube" — the panel titles are
+    two fixed-width lines inside a pinned axes box (see ``_PANEL_RECT``)
+    and the long form doesn't fit a worst-case (4-digit-DM, wide-boxcar)
+    title even at the font-size floor.)
+    """
     if coords is None:
         return ""
-    return "" if coords.from_metadata else "  [no metadata: cube argmax]"
+    if not coords.from_metadata:
+        return " · no detector info — showing brightest pixel"
+    if coords.t_from_anchor:
+        return ""
+    return " · re-searched in cube"
 
 
 def _snr_note(coords: Optional[_BurstCoords]) -> str:
-    """" | cube w16 6.1σ Δ+13.6 (raw 6.5σ)" — the cube re-measurement.
-
-    Printed next to the detector's SNR on every panel so the two are
-    never silently conflated. ``Δ`` is detector − width-matched cube
-    re-measurement; ``raw`` is the same measurement without the boxcar,
-    i.e. what the pre-2026-08-02 plotter reported. Kept terse: these
-    titles are two fixed-width lines inside a pinned axes box (see
-    ``_PANEL_RECT``) and a long line silently overflows.
+    """" · 6.1σ (archived cube) · Δ = +13.6σ" — the cube
+    re-measurement, printed next to the detector's SNR on every panel
+    so the two are never silently conflated. ``Δ`` is the detector's
+    SNR minus this re-measurement (positive means the detector read
+    higher). The boxcar width and the unsmoothed re-measurement behind
+    this number are still written to the log (see the "cube
+    re-measurement" INFO/WARNING lines in ``render_event_plots``) —
+    only the title itself has been trimmed to the plain essentials.
+    Omitted entirely when there is no cube to re-measure against.
     """
     if coords is None or not np.isfinite(coords.snr_measured):
         return ""
-    note = (f" | cube w{coords.boxcar} {coords.snr_measured:.1f}σ "
-            f"Δ{coords.snr_delta:+.1f}")
-    if coords.t_from_anchor:
-        note += " [t from anchor]"
-    if coords.boxcar > 1 and np.isfinite(coords.snr_measured_raw):
-        note += f" (raw {coords.snr_measured_raw:.1f}σ)"
-    return note
+    return (
+        f" · {coords.snr_measured:.1f}σ (archived cube) · "
+        f"Δ = {_signed_sigma(coords.snr_delta)}"
+    )
 
 
 def _robust_row_normalise(img: np.ndarray) -> np.ndarray:
@@ -1650,16 +1676,16 @@ def _render_dm_time(
                     label="detector-reported burst",
                 )
         subtitle = (
-            f"burst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
-            f"SNR={coords.snr:.1f}" + _snr_note(coords)
+            f"DM {coords.dm_pc_cc:.1f} pc cm⁻³ · "
+            f"SNR {coords.snr:.1f} (detector)" + _snr_note(coords)
             + _provenance(coords)
         )
     # v3.6: two visual tiers, not one two-line set_title. v3.5 put the
     # event identity on line 1 and the burst parameters on line 2 of a
     # single 16pt title; since then line 2 has grown the _snr_note
-    # diagnostic (cube re-measurement, Δ, "[t from anchor]", raw σ) and
-    # at 16pt it overflowed the axes box at both figure edges. The box
-    # cannot grow: the "shared figure geometry" note above _PANEL_RECT
+    # diagnostic (cube re-measurement, agreement Δ, a fallback-placement
+    # flag) and at 16pt it overflowed the axes box at both figure edges.
+    # The box cannot grow: the "shared figure geometry" note above _PANEL_RECT
     # pixel-aligns dm_time/image_peak, so the text has to yield. Line 1
     # stays an ax.set_title at _TITLE_FONTSIZE (lifted by _TITLE_PAD to
     # clear line 2); line 2 is drawn by _fit_title_line, which measures
@@ -1758,7 +1784,7 @@ def _render_image_peak(
     tlabel = f"t={t_idx}" + (f", mean of w={box}" if box > 1 else "")
     title = f"image at (DM={coords.dm_pc_cc:.1f}, {tlabel}) — {event_name}"
     subtitle = (
-        f"burst (l,m)=({coords.l_pix},{coords.m_pix})"
+        f"detected pixel (l,m)=({coords.l_pix},{coords.m_pix})"
         + _snr_note(coords) + _provenance(coords)
     )
     # v3.6: two visual tiers — see the matching note in _render_dm_time.

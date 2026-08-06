@@ -588,8 +588,9 @@ Fixed by *adding* fields rather than repurposing the filename key:
 All four manifest builders populate them; the writer stores them in the
 NPZ (`-1` / NaN sentinels when absent). `plotter._metadata_t_idx` uses
 them when present and declines otherwise, so pre-2026-08-04 dumps keep
-the width-matched-argmax behaviour and panels placed from the anchor are
-tagged `[t from anchor]`.
+the width-matched-argmax behaviour — those panels are tagged
+`re-searched in cube`, while panels placed from the anchor (the
+healthy/default path) carry no tag at all.
 
 **Units (binding).** `cube_specnum_start` is in **search-sample** units,
 identical to `Candidate.event_specnum` (which is
