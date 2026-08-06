@@ -2061,10 +2061,20 @@ class SearchComputeService:
                         newest = snap[0]
                         oldest = snap[-1]
                         ring_oldest = int(oldest.event_specnum_start)
+                        # A retained cube's event_specnum_start counts SEARCH
+                        # samples (see the specnum_start note above and
+                        # RetainedCube), so the cube covers exactly t_det of
+                        # them and the ring's exclusive end is start + t_det.
+                        # This used to multiply by sample_period_specnum,
+                        # which is the fourth instance of that units error --
+                        # f5da9f3 fixed the other three, in
+                        # cube_pipeline.find_cube_for_specnum,
+                        # c2_trigger_listener._handle_trigger and
+                        # proactive_stager -- and made the published window
+                        # 16x too wide at the production op-point.
                         ring_newest_end = (
                             int(newest.event_specnum_start)
                             + int(newest.t_det)
-                            * int(newest.sample_period_specnum)
                         )
                 self._compute_mon.publish_dump_health(
                     cube_dump_n_dumped=cd_dumped,
