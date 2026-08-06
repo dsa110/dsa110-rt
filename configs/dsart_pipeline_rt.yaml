@@ -478,6 +478,13 @@ routines:
   # tools/ops/push_dsart_to_etcd.py and restart corr_fast. Watch the
   # "rfi-persist: held=..." line in the corr_fast log (every 16 blocks)
   # and total_flag_fraction on the dashboard's RFI row.
+  #
+  # PAIRING INVARIANT: --flagants must come from the SAME calibration
+  # solve as --apply-cal. The cal push writes both files together
+  # (utils/antennas.out + scripts/flagants.dat); pointing --flagants at
+  # a frozen per-event snapshot lets a new cal flag antennas that stay
+  # in the beam (2026-08-06: 49/59/89 flagged at 14:01 UT, still
+  # beamformed for hours -- RFI-like candidate spray + decohered sky).
   - name: corr_fast
     cmd: python
     args: >-
@@ -488,7 +495,7 @@ routines:
       --device cuda:0
       --apply-cal /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --cal-mode phase_only
-      --flagants /home/ubuntu/data/voltages/250924mptq/cals/flagants.dat
+      --flagants /home/ubuntu/proj/dsa110-shell/dsa110-xengine/scripts/flagants.dat
       --sk-far 1e-4
       --bandpass-k 5.0
       --group-k 5.0
