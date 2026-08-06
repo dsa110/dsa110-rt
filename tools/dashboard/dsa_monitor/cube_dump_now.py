@@ -345,35 +345,43 @@ def _resolve_event_specnum_from_search_ring(
     falls back to the legacy corr_fast path (or returns 503).
 
     Where to land:
-        The C2 listener accepts triggers in
-        ``[oldest_start, newest_start + t_det × spp)`` (the union of
-        all 16 cubes' time windows). The freshness of the picked
-        target is bounded by:
-        * Publisher cadence (≈ 1.3 s at 7.45 cubes/s) makes the
-          stored ``newest_event_specnum_start`` up to 1.3 s stale.
+        The C2 listener accepts a trigger for a given cube in
+        ``[start, start + t_det)``. Both the ring anchor and the
+        queried event_specnum count SEARCH samples, so a cube spans
+        exactly ``t_det`` of them — NOT ``t_det × spp``. That was the
+        units error f5da9f3 fixed in the listener,
+        cube_pipeline.find_cube_for_specnum and proactive_stager, and
+        this auto-pick was built against the old, 16×-too-wide window
+        (2026-08-06).
+
+        The freshness of the picked target is bounded by:
+        * Publisher cadence (≈ 1.3 s) makes the stored
+          ``newest_event_specnum_start`` up to 1.3 s stale.
         * Broadcast + asyncio dispatch latency adds another fraction
           of a second.
-        Rings advance at ``cube_cadence_samples = 128 search
-        samples per cube × 7.45 cubes/s = 985 samples/s``.
+        Rings advance at ``cube_cadence_samples`` search samples per
+        cube × the cube rate ≈ 950 samples/s.
 
-        The *deepest* lookback that still lands forward of all
-        halves' rings is exactly ``min_newest + t_det × spp / 2`` —
-        halfway through the laggard half's newest cube. That gives
-        ~3.5 s of forward-drift tolerance before the laggard's
-        oldest slides past our pick.
+        So we aim at ``min_newest + t_det // 2`` — halfway through the
+        laggard half's newest KNOWN cube. Counter-intuitively this is
+        safer than the old ``+ t_det × spp / 2``, not tighter: because
+        the stored anchor is ~1.3 s stale, +t_det//2 lands roughly
+        1100 samples BEHIND the true leading edge, i.e. a few cubes
+        back, comfortably inside the ~2.5 s retention ring and on a
+        cube whose slot has finished being written. The old offset of
+        ``+ t_det × spp / 2`` = +2048 landed ~800 samples AHEAD of the
+        true edge — eight cubes past the newest cube's real window —
+        so every dump_now was classified too_early and only succeeded
+        because f9ca4b3 parks such a request and the ring sweeps over
+        it a couple of seconds later. That worked by accident and
+        would break outright at ``too_early_retry_timeout_s = 0``.
 
         Picking forward of ``min_newest`` (rather than the obvious
-        "back from newest, like corr_fast") is the right move
-        because:
-        * ``event_specnum_start`` in the ring is in *search-sample*
-          units (not raw specnums) — adjacent cubes are
-          ``cube_cadence_samples = 128`` apart, not
-          ``t_det × spp = 3072`` apart. So a lookback "in cubes"
-          using the cube_span as step lands ridiculously far back
-          (96 cubes back, well outside the depth=16 ring).
-        * The listener's per-cube window is ``t_det × spp = 3072``
-          search samples wide, so a single offset of half that span
-          inside the newest cube is always accepted.
+        "back from newest, like corr_fast") is still right, because
+        ``event_specnum_start`` in the ring is in *search-sample*
+        units: adjacent cubes are ``cube_cadence_samples`` apart, so a
+        lookback expressed "in cubes" using a cube's own span as the
+        step would land far outside the ring.
 
     The ``lookback_cubes`` arg is kept for backward compatibility
     but only affects an optional *additional* backward offset; the
@@ -455,20 +463,22 @@ def _resolve_event_specnum_from_search_ring(
     info["newest_t_det"] = t_det_ref
     info["newest_sample_period_specnum"] = spp_ref
     # See docstring for the math. Net result:
-    #   target = min_newest_start + (t_det × spp) // 2
+    #   target = min_newest_start + t_det // 2
     # so the synthetic specnum lands halfway through the laggard's
-    # NEWEST cube. The listener's per-cube acceptance window is
-    # [start, start + t_det × spp), so mid-newest always lands
-    # inside, leaving ~3.5 s of forward-drift tolerance before the
-    # laggard's oldest slot slides past us.
-    cube_span = int(t_det_ref) * int(spp_ref)
+    # newest KNOWN cube. A cube spans exactly t_det SEARCH samples --
+    # the listener accepts [start, start + t_det) -- so this was
+    # t_det * spp until 2026-08-06, i.e. 16x too far forward, which
+    # put every pick past the newest cube's real window and left
+    # dump_now depending on the f9ca4b3 too_early retry to land.
+    cube_span = int(t_det_ref)
     target = int(min_newest) + cube_span // 2
     # Backward-compat: lookback_cubes>0 nudges the target further
-    # into the past in cube-cadence units (≈128 samples each).
-    # Default (4) is harmless margin; tests can pass 0 to disable.
-    # Note: this is NOT scaled by cube_span — the ring's start
-    # values advance by cube_cadence_samples (≈128) per cube, not
-    # by t_det × spp.
+    # into the past in cube-cadence units. Default (4) is harmless
+    # margin; tests can pass 0 to disable. Note: this is NOT scaled by
+    # cube_span -- the ring's start values advance by
+    # cube_cadence_samples per cube, which is smaller than t_det
+    # (192 vs 256 at the production op-point, hence the 64-sample
+    # inter-cube overlap).
     info["target_cube_span"] = cube_span
     info["target_offset_from_min_newest"] = (
         cube_span // 2
@@ -585,9 +595,10 @@ def _resolve_event_specnum(
     # Subtract a few blocks so the synthetic trigger lands a few
     # cubes BEHIND the latest cube_ring slot. find_cube_for_specnum
     # walks newest → oldest and matches the freshest cube whose
-    # [start, start + t_det * sample_period_specnum) window contains
-    # event_specnum; landing a few blocks behind the leading edge
-    # guarantees the leader has finished writing the slot we hit.
+    # [start, start + t_det) window contains event_specnum (search
+    # samples; it was t_det * sample_period_specnum before f5da9f3);
+    # landing a few blocks behind the leading edge guarantees the
+    # leader has finished writing the slot we hit.
     target = max_bss - int(lookback_blocks) * int(npackets_per_block)
     if target < 0:
         target = 0
