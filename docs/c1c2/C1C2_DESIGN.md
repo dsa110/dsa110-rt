@@ -570,7 +570,7 @@ specnum) because the writer composes the NPZ filename from it and C3 +
 the dashboard glob on `cube_s*_g*_<trigger_specnum>.npz`.
 
 Consequence: in every archived C2-triggered dump,
-`(event_specnum - event_specnum_start) / sample_period_specnum == 0`.
+`event_specnum - event_specnum_start == 0`.
 Verified on 260801rmep/bdga/pekd/oooi and 260802totk/unoj/gunl — all
 gave 0, while the burst was really at t=110/139/183. So the detector's
 own in-cube time index has been unrecoverable offline, which is why
@@ -579,11 +579,11 @@ why the corr-block-seam test in §6b could not be run.
 
 Fixed by *adding* fields rather than repurposing the filename key:
 
-| field | meaning |
-| --- | --- |
-| `cube_specnum_start` | TRUE spec num at cube sample 0 |
-| `cube_mjd_start` | TRUE MJD at cube sample 0 |
-| `sample_period_specnum` | spec-nums per detector sample |
+| field | meaning | units |
+| --- | --- | --- |
+| `cube_specnum_start` | TRUE spec num at cube sample 0 | SEARCH samples |
+| `cube_mjd_start` | TRUE MJD at cube sample 0 | days |
+| `sample_period_specnum` | native SNAP spec-nums per detector sample | — |
 
 All four manifest builders populate them; the writer stores them in the
 NPZ (`-1` / NaN sentinels when absent). `plotter._metadata_t_idx` uses
@@ -591,11 +591,26 @@ them when present and declines otherwise, so pre-2026-08-04 dumps keep
 the width-matched-argmax behaviour and panels placed from the anchor are
 tagged `[t from anchor]`.
 
-`sample_period_specnum` is recorded rather than assumed because it is
-derived from the live op-point (`t_int_search_us / t_int_fast_us`).
-`CubeGeometry`'s docstring still says "= 16 in production", which was
-true when `t_int_fast_native` was 2; at the current 32 it is 1.
-Hard-coding 16 would silently scale every offline time index by 16×.
+**Units (binding).** `cube_specnum_start` is in **search-sample** units,
+identical to `Candidate.event_specnum` (which is
+`slot.specnum_start + t_idx`, `detector/decoder.py:216`). The offline
+time index is therefore a plain subtraction:
+
+```
+t_in_cube = event_specnum - cube_specnum_start      # no division
+```
+
+`sample_period_specnum` is **not** a scale factor for this expression —
+it is native SNAP specnums per detector sample (`t_int_search_us /
+t_int_fast_us`), recorded rather than assumed because the op-point
+moves (it was 16 when `t_int_fast_native` was 2; at the current 32 it is
+1). It exists for consumers that must reach *native* specnums, for
+which the canonical converter is
+`services/coincidencer.search_to_snap_specnum`. Dividing the anchor delta
+by it treats a search-sample count as a native-specnum count and
+collapses every plotted burst towards the cube start by that factor —
+exactly the regression fixed on 2026-08-06, and the same trap called
+out in `services/search_compute.py:1338-1345` for the MJD clock.
 
 ## 6e. Fan-in near-miss instrumentation (2026-08-04)
 

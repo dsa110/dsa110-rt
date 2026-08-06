@@ -518,30 +518,63 @@ def test_smoothing_can_be_disabled_by_env(
 
 
 # ---------------------------------------------------------------------------
-# Cube sample-0 anchor (2026-08-04)
+# Cube sample-0 anchor (2026-08-04; units corrected 2026-08-06)
 # ---------------------------------------------------------------------------
+#
+# Units contract under test (plotter._metadata_t_idx):
+#
+#     t_in_cube = event_specnum - cube_specnum_start
+#
+# BOTH operands count SEARCH samples, so this is a plain subtraction.
+# `sample_period_specnum` is native SNAP specnums per search sample (16 at
+# the production op-point) and is NOT a divisor.
+#
+# These fixtures are deliberately production-shaped — period 16, ~9.18e6
+# anchors, t_det >= the 192-sample production cube — and every expectation
+# is derived from the PLANTED offset, never from the expression under
+# test. The pre-2026-08-06 tests synthesised `event_specnum = anchor +
+# t * period`, i.e. they encoded the buggy convention on both sides and
+# so could not fail.
+
+# Production op-point: 16 native 65.536 µs specnums per 1048.576 µs search
+# sample; cubes are 192 search samples long and advance by
+# cube_cadence_samples = 192.
+PROD_PERIOD_SPECNUM = 16
+PROD_T_DET = 192
+# A realistic sample-0 anchor: search-sample counts on a live node are
+# O(1e7) a couple of hours into a run.
+PROD_ANCHOR = 9_180_416
 
 
 def _write_anchored_cube(
     cubes_dir: Path, *, sid: int, g: int, trigger_specnum: int,
     cube_specnum_start: int, sample_period_specnum: int, burst_t: int,
+    t_det: int = T_DET, mjd_start: float = 60781.0,
+    cube_mjd_start: float | None = 60781.0,
 ) -> None:
     """One NPZ carrying the TRUE sample-0 anchor, with the burst planted
     somewhere OTHER than where the anchor points, so a test can tell
-    which route placed the panels."""
+    which route placed the panels.
+
+    ``cube_mjd_start=None`` writes the NaN sentinel the writer uses for
+    a dump that has no honest sample-0 MJD.
+    """
     cubes_dir.mkdir(parents=True, exist_ok=True)
-    cube = np.full((T_DET, N_FDM, N_GRID, N_GRID), 0.1, dtype=np.float16)
+    cube = np.full((t_det, N_FDM, N_GRID, N_GRID), 0.1, dtype=np.float16)
     cube[burst_t, BURST_FDM, BURST_L, BURST_M] = 40.0
     np.savez(
         cubes_dir / f"cube_s{sid}_g{g}_{trigger_specnum}.npz",
         cube=cube,
         peak_grid=cube.max(axis=(2, 3)),
-        mjd_start=np.asarray(60781.0, dtype="float64"),
+        mjd_start=np.asarray(mjd_start, dtype="float64"),
         event_specnum_start=np.asarray(trigger_specnum, dtype="int64"),
         cube_specnum_start=np.asarray(cube_specnum_start, dtype="int64"),
-        cube_mjd_start=np.asarray(60781.0, dtype="float64"),
+        cube_mjd_start=np.asarray(
+            float("nan") if cube_mjd_start is None else cube_mjd_start,
+            dtype="float64",
+        ),
         sample_period_specnum=np.asarray(sample_period_specnum, dtype="int32"),
-        t_det=np.asarray(T_DET, dtype="int32"),
+        t_det=np.asarray(t_det, dtype="int32"),
         n_fdm_in_cube=np.asarray(N_FDM, dtype="int32"),
         n_grid=np.asarray(N_GRID, dtype="int32"),
         cluster_record=np.asarray("null", dtype="U"),
@@ -555,27 +588,37 @@ def test_anchor_is_read_off_the_npz(tmp_path: Path) -> None:
     from dsart.coinc.plotter import _load_cubes
 
     _write_anchored_cube(
-        tmp_path / "cubes", sid=BURST_SID, g=BURST_G, trigger_specnum=500,
-        cube_specnum_start=468, sample_period_specnum=4, burst_t=3,
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=PROD_ANCHOR + 3,
+        cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=3,
     )
     cubes = _load_cubes(tmp_path / "cubes")
     try:
         assert len(cubes) == 1
-        assert cubes[0].cube_specnum_start == 468
-        assert cubes[0].sample_period_specnum == 4
+        assert cubes[0].cube_specnum_start == PROD_ANCHOR
+        assert cubes[0].sample_period_specnum == PROD_PERIOD_SPECNUM
     finally:
         for c in cubes:
             c.close()
 
 
 def test_metadata_t_idx_uses_the_anchor_when_present(tmp_path: Path) -> None:
-    """t = (event_specnum - cube_specnum_start) / sample_period_specnum.
-    488 - 468 = 20, / 4 => sample 5 (inside the T_DET=8 fixture cube)."""
+    """t = event_specnum - cube_specnum_start, no division.
+
+    Ground truth: the trigger is planted BURST_T samples after the
+    anchor, so the answer must be BURST_T — and explicitly not
+    BURST_T // sample_period_specnum, which is what the divisor bug
+    (c60556b .. 2026-08-06) returned.
+    """
     from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
 
+    burst_t = BURST_T
+    trigger = PROD_ANCHOR + burst_t
     _write_anchored_cube(
-        tmp_path / "cubes", sid=BURST_SID, g=BURST_G, trigger_specnum=488,
-        cube_specnum_start=468, sample_period_specnum=4, burst_t=3,
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=trigger, cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=burst_t,
     )
     cubes = _load_cubes(tmp_path / "cubes")
     try:
@@ -583,11 +626,95 @@ def test_metadata_t_idx_uses_the_anchor_when_present(tmp_path: Path) -> None:
         # the fixture's peak member carries event_specnum=200; point it at
         # the value this cube was written for
         peak = dataclasses.replace(
-            _peak_from_members(_members()), event_specnum=488,
+            _peak_from_members(_members()), event_specnum=trigger,
         )
-        # 5, NOT the planted burst at t=3: the anchor must win over the
-        # re-located peak when it is available.
-        assert _metadata_t_idx(cubes[0], peak) == 5
+        assert _metadata_t_idx(cubes[0], peak) == burst_t
+        # The divisor reading would have collapsed this to 0.
+        assert _metadata_t_idx(cubes[0], peak) != burst_t // PROD_PERIOD_SPECNUM
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_anchor_places_the_panels_on_the_planted_burst(tmp_path: Path) -> None:
+    """End-to-end regression for the 2026-08-04..06 misplacement.
+
+    A production-shaped cube (t_det=192, period=16) with the burst planted
+    at t=118 and the trigger specnum at anchor+118. The full
+    load -> waterfall -> _burst_coords path must land on 118, and the cube
+    value there must be the planted amplitude — the divisor bug placed it
+    at 118 // 16 = 7, on a noise plane.
+    """
+    from dsart.coinc.plotter import (
+        _burst_coords, _burst_waterfall, _load_cubes, _peak_from_members,
+        _select_burst_chunk,
+    )
+    import dataclasses
+
+    anchor = 82_556_992
+    burst_t = 118
+    trigger = 82_557_110          # = anchor + 118, planted, not computed
+    assert trigger - anchor == burst_t
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=trigger, cube_specnum_start=anchor,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=burst_t,
+        t_det=PROD_T_DET,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=trigger,
+        )
+        chunk = _select_burst_chunk(cubes, peak)
+        coords = _burst_coords(chunk, _burst_waterfall(chunk), peak)
+        assert coords is not None
+        assert coords.t_from_anchor is True
+        assert coords.t_idx == burst_t
+        assert coords.t_idx != burst_t // PROD_PERIOD_SPECNUM
+        # ...and the panel really is pointed at the planted signal.
+        assert float(
+            chunk.cube[coords.t_idx, coords.fdm_idx,
+                       coords.l_pix, coords.m_pix]
+        ) == pytest.approx(40.0, abs=0.1)
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_declines_on_a_native_specnum_anchor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If a future writer ever emits NATIVE SNAP specnums, the delta comes
+    out ~16x too large. That is a units-contract change, not something to
+    paper over with a divisor — decline loudly and let the argmax run."""
+    import logging
+    import dataclasses
+
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    anchor = 82_556_992
+    burst_t = 118
+    # Native units: the delta is period x the true sample offset.
+    trigger = anchor + burst_t * PROD_PERIOD_SPECNUM
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=trigger, cube_specnum_start=anchor,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=burst_t,
+        t_det=PROD_T_DET,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=trigger,
+        )
+        with caplog.at_level(logging.ERROR, logger="dsart.coinc.plotter"):
+            assert _metadata_t_idx(cubes[0], peak) is None
+        assert any(
+            r.levelno >= logging.ERROR and "NATIVE" in r.getMessage()
+            for r in caplog.records
+        ), caplog.text
     finally:
         for c in cubes:
             c.close()
@@ -627,6 +754,44 @@ def test_metadata_t_idx_rejects_an_out_of_range_index(tmp_path: Path) -> None:
             _peak_from_members(_members()), event_specnum=999999,
         )
         assert _metadata_t_idx(cubes[0], peak) is None
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_load_cubes_prefers_cube_mjd_start_over_mjd_start(
+    tmp_path: Path,
+) -> None:
+    """`mjd_start` in a C2-triggered dump tracks the TRIGGER specnum;
+    `cube_mjd_start` is the honest sample-0 MJD, so a finite value of it
+    must win. NaN (pre-2026-08-04 dumps) falls back."""
+    from dsart.coinc.plotter import _load_cubes
+
+    true_sample0_mjd = 60781.25
+    _write_anchored_cube(
+        tmp_path / "finite", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=PROD_ANCHOR + 3, cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=3,
+        mjd_start=60781.0, cube_mjd_start=true_sample0_mjd,
+    )
+    cubes = _load_cubes(tmp_path / "finite")
+    try:
+        assert cubes[0].cube_mjd_start == pytest.approx(true_sample0_mjd)
+        assert cubes[0].mjd_start == pytest.approx(true_sample0_mjd)
+    finally:
+        for c in cubes:
+            c.close()
+
+    _write_anchored_cube(
+        tmp_path / "nan", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=PROD_ANCHOR + 3, cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=3,
+        mjd_start=60781.0, cube_mjd_start=None,
+    )
+    cubes = _load_cubes(tmp_path / "nan")
+    try:
+        assert np.isnan(cubes[0].cube_mjd_start)
+        assert cubes[0].mjd_start == pytest.approx(60781.0)
     finally:
         for c in cubes:
             c.close()

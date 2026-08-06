@@ -44,10 +44,21 @@ the panel coordinates from the C2 **detection metadata**:
 
 The peak member (max ``snr``) gives the owning ``(search_node, gpu_half)``
 cube, the fine-DM trial (``fine_dm_idx``), and the image pixel
-(``l_pix, m_pix``). The burst time within the cube is the argmax of the
-DM-sliced light curve (the cube's ``event_specnum_start`` is the dump
-*key*, not the cube's first-sample specnum, so specnum arithmetic can't
-locate the burst in time — the per-DM time profile can).
+(``l_pix, m_pix``).
+
+The burst *time* comes from the cube's sample-0 anchor when the NPZ
+carries one (``cube_specnum_start``, dumps from 2026-08-04 on):
+
+    t_in_cube = event_specnum - cube_specnum_start
+
+Both operands count SEARCH samples (one per detector sample), so this
+is a plain subtraction — ``sample_period_specnum`` is native specnums
+per search sample and must NOT be divided out here; see
+:func:`_metadata_t_idx` for the full units contract and the archive
+evidence. Older NPZs carry only ``event_specnum_start``, which is the
+dump *key* (the trigger specnum), not the cube's first-sample specnum,
+so specnum arithmetic can't locate the burst in them — for those we
+fall back to the argmax of the DM-sliced light curve.
 
 Matching the detector's boxcar (2026-08-02)
 -------------------------------------------
@@ -531,11 +542,17 @@ class _CubeChunk:
     fine_dm_pc_cc: np.ndarray  # shape (n_fdm,)
     mjd_start: float
     sample_period_us: float
-    # TRUE sample-0 anchor (dumps from 2026-08-04 on). -1 / 0 when the
-    # NPZ predates it, in which case _metadata_t_idx declines and the
+    # TRUE sample-0 anchor (dumps from 2026-08-04 on). -1 / 0 / NaN when
+    # the NPZ predates it, in which case _metadata_t_idx declines and the
     # width-matched argmax is used instead. See that function.
+    #
+    # cube_specnum_start is in SEARCH-SAMPLE units — the SAME units as a
+    # C1 row's event_specnum — so their difference is directly an index
+    # along axis 0. sample_period_specnum (native specnums per search
+    # sample, 16 in production) is metadata, NOT a divisor.
     cube_specnum_start: int = -1
     sample_period_specnum: int = 0
+    cube_mjd_start: float = float("nan")
     # Populated by _populate_peak_grids after _load_cubes returns.
     peak_grid: Optional[np.ndarray] = None  # (n_fdm, n_t), fp32
     # Keep the NpzFile reference alive so the metadata zip handle stays
@@ -719,6 +736,15 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
                 if "sample_period_us" in manifest
                 else _scalar_or(npz, "sample_period_us", 1048.576)
             )
+            # `mjd_start` in a C2-triggered dump mirrors the manifest's
+            # `event_specnum_start`, which that path overwrites with the
+            # TRIGGER specnum (c2_trigger_listener._build_manifest). The
+            # separately-recorded `cube_mjd_start` is the honest MJD of
+            # cube sample 0, so prefer it whenever it is finite; NaN is
+            # the writer's sentinel for "pre-2026-08-04 dump".
+            cube_mjd_start = _scalar_or(npz, "cube_mjd_start", float("nan"))
+            if np.isfinite(cube_mjd_start):
+                mjd_start = float(cube_mjd_start)
 
             chunks.append(_CubeChunk(
                 search_node_id=int(m.group("sid")),
@@ -734,6 +760,7 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
                 sample_period_specnum=int(
                     _scalar_or(npz, "sample_period_specnum", 0)
                 ),
+                cube_mjd_start=float(cube_mjd_start),
                 _npz=npz,
             ))
         except Exception as exc:  # noqa: BLE001
@@ -893,13 +920,41 @@ def _metadata_t_idx(
 ) -> Optional[int]:
     """The detector's own in-cube time index, or ``None`` if unknowable.
 
-    ``t = (event_specnum - cube_specnum_start) / sample_period_specnum``.
+    ``t = event_specnum - cube_specnum_start`` — a plain subtraction, no
+    division.
+
+    Units contract. BOTH operands count **search samples**, one per
+    detector sample, so their difference is already an index along the
+    cube's time axis:
+
+      * ``cube_specnum_start`` is the retained cube's
+        ``slot.specnum_start`` (``dump/c2_trigger_listener.py``
+        ``_build_manifest``), which advances by ``cube_cadence_samples``
+        per cube. ``services/search_compute.py:1338-1345`` states the
+        rule outright: "specnum_start is in SEARCH-SAMPLE units … must
+        NOT be divided by cube_sample_period_specnum" — the same trap,
+        fixed once before for the MJD clock.
+      * ``event_specnum`` is ``specnum_start + t_idx`` where ``t_idx``
+        is the detector's in-cube sample index
+        (``detector/decoder.py:216``).
+
+    ``sample_period_specnum`` is native-SNAP-specnums per search sample
+    (16 at the production op-point). It is emphatically **not** a
+    divisor here; it is read only so a mis-scaled anchor can be named in
+    the log. Dividing by it — as this function did from its
+    introduction (c60556b) until 2026-08-06 — plots every burst at
+    ``t_true // 16``, i.e. collapsed towards the cube start, always in
+    range so the guard below never fires.
+
+    Archive evidence for the units (Δ = event_specnum − anchor, all well
+    inside one cube cadence of 192 samples): 260804xpnp Δ=10,
+    260805pabq Δ=118, 260805tldd Δ=182. Under the divisor reading those
+    same events would have plotted at t=0, 7 and 11.
+
     Only usable when the NPZ carries ``cube_specnum_start`` (dumps from
     2026-08-04 on) — before that the only anchor was
     ``event_specnum_start``, which the C2-trigger path overwrote with the
-    trigger specnum, making the expression identically 0. Verified on
-    260801rmep/bdga/pekd/oooi and 260802totk/unoj/gunl: every one gave
-    0, while the burst was really at t=110/139/183.
+    trigger specnum, making the delta identically 0.
 
     Returns None on absent/sentinel anchors or an out-of-range result, so
     the caller falls back to the width-matched argmax.
@@ -909,12 +964,24 @@ def _metadata_t_idx(
     anchor = getattr(chunk, "cube_specnum_start", None)
     if anchor is None or int(anchor) < 0:
         return None
+    # Diagnostics only — see the units contract above. Never a divisor.
     period = int(getattr(chunk, "sample_period_specnum", 0) or 0)
-    if period <= 0:
-        return None
-    t = (int(peak.event_specnum) - int(anchor)) // period
+    t = int(peak.event_specnum) - int(anchor)
     t_det = int(chunk.cube.shape[0]) if chunk.cube.ndim == 4 else 0
     if t_det and not (0 <= t < t_det):
+        if period > 1 and 0 <= t // period < t_det:
+            # The delta is ~period× too large: the writer handed us
+            # NATIVE SNAP specnums where the contract says search
+            # samples. That is a schema change, not a plotting problem —
+            # guessing a divisor is exactly how the original bug got in.
+            _LOG.error(
+                "plotter: anchor delta %d is outside the cube [0, %d) but "
+                "%d/%d = %d is inside — the anchor looks like NATIVE "
+                "specnums, i.e. the writer's units contract changed. "
+                "Refusing to guess; falling back to the matched argmax.",
+                t, t_det, t, period, t // period,
+            )
+            return None
         _LOG.warning(
             "plotter: metadata t_idx=%d outside the cube [0, %d) — "
             "falling back to the matched argmax", t, t_det,
@@ -1111,11 +1178,12 @@ def _burst_coords(
     """Resolve in-cube panel coordinates.
 
     cube axes are ``(t_det, n_fdm, l, m)``. With metadata we take the
-    DM row + (l, m) from the peak and the *time* from the argmax of the
-    DM light curve, because the cube's stored ``event_specnum_start`` is
-    the dump key, not the cube's first-sample specnum. Without metadata
-    we fall back to the waterfall global argmax (flagged
-    ``from_metadata=False``).
+    DM row + (l, m) from the peak, and the *time* from the cube's
+    sample-0 anchor when it carries one; failing that, from the argmax
+    of the DM light curve (the stored ``event_specnum_start`` is the
+    dump key, not the cube's first-sample specnum, so it cannot serve
+    as an anchor). Without metadata at all we fall back to the
+    waterfall global argmax (flagged ``from_metadata=False``).
 
     The DM light curve is the **detected pixel's** series when the cube
     is readable, match-filtered with the detector's own
@@ -1125,12 +1193,12 @@ def _burst_coords(
     against the detector's reported SNR.
     """
     # 2026-08-04: if the cube carries the TRUE sample-0 anchor
-    # (`cube_specnum_start`, added alongside this), the detector's own
-    # time index is directly computable and we no longer have to relocate
-    # the burst at all. Older dumps have only `event_specnum_start`,
-    # which the C2-trigger path overwrote with the trigger specnum, so
-    # `_metadata_t_idx` returns None for them and we fall back to the
-    # width-matched argmax below.
+    # (`cube_specnum_start`), the detector's own time index is directly
+    # computable — `event_specnum - anchor`, both in search samples —
+    # and we no longer have to relocate the burst at all. Older dumps
+    # have only `event_specnum_start`, which the C2-trigger path
+    # overwrote with the trigger specnum, so `_metadata_t_idx` returns
+    # None for them and we fall back to the width-matched argmax below.
     t_meta = _metadata_t_idx(chunk, peak)
 
     if waterfall is None or waterfall.ndim != 2 or not waterfall.size:

@@ -421,7 +421,14 @@ class RetainedCube:
 
     Args:
         cube_id: monotonic cube counter (= ``CubeRingSlot.cube_id``).
-        event_specnum_start: spec num at sample 0 of this cube.
+        event_specnum_start: spec num at sample 0 of this cube, in
+            SEARCH-sample units (1 per detector/search sample, advancing
+            by ``cube_cadence_samples`` per cube); NOT native SNAP
+            specnums. A C1 row's ``event_specnum`` counts the same
+            units, so ``event_specnum - event_specnum_start`` is
+            directly an index along the cube's time axis — never divide
+            by ``sample_period_specnum`` (see
+            ``services/search_compute.py:1338-1345``).
         mjd_start: double-precision MJD at sample 0.
         t_det: number of time samples in the cube.
         n_fdm: number of fine-DM trials in the cube
