@@ -2519,6 +2519,19 @@ The triad of fixes:
       after each cube on both loop branches gives the emitter at
       least one scheduler cycle so it can drain its backlog, ship
       heartbeats, and reconnect after C2's idle close.
+      \emph{Superseded 2026-08-06}: one yield per cube is not a
+      schedulability guarantee.  On the fleet's slowest half
+      (\codeword{lxd110h02} \codeword{gpu_half=1}, 4.77 cubes/s vs
+      4.93 elsewhere) the gaps closed entirely: the half went deaf at
+      22:21 and dropped $\sim$47\,k batches over 9\,h --- including a
+      real injected candidate --- while py-spy showed the main thread
+      inside \codeword{sigma_clipped_std_batched} and the C1 socket
+      sat \codeword{app_limited} with an empty send queue.  The C1
+      emitter now runs on a \emph{dedicated thread} with a private
+      event loop and a \codeword{queue.Queue}, matching
+      \codeword{cube_uploader} and \codeword{cube_dump}; the per-cube
+      yield is retained for the other loop residents but no longer
+      carries the C1 stream.
 \end{enumerate}
 
 A separate Phase~8c-fix (\codeword{faee479}) made the synthetic

@@ -738,7 +738,6 @@ class SearchComputeService:
         # M7.4 C1 stage.
         self._cube_ring: Optional[CubeRetentionRing] = None
         self._c1_emit: Optional[C1TcpEmitter] = None
-        self._c1_emit_task: Optional[asyncio.Task] = None
         self._c2_trigger: Optional[C2TriggerListener] = None
         # 2026-07-21: proactive cube stager (bright-candidate pre-stage).
         self._proactive_stager: Optional[ProactiveCubeStager] = None
@@ -1138,10 +1137,15 @@ class SearchComputeService:
             await self._udp_listener.start()
         if cfg.enable_legacy_clusterer and cfg.cands_logger_config is not None:
             self._cands_logger = CandsLogger(config=cfg.cands_logger_config)
-        # M7.4 C1 emitter (TCP → h23).
+        # M7.4 C1 emitter (TCP → h23). Runs on its OWN thread (2026-08-06):
+        # as an asyncio task co-resident with this service's loop it was
+        # starved by the ~350 ms blocking per-cube work in
+        # _process_one_cube and silently dropped every batch on the
+        # slowest node (h02 gpu_half=1: 47 k drops in 9 h). See
+        # c1_emit's module docstring.
         if cfg.c1_emit_config is not None:
             self._c1_emit = C1TcpEmitter(config=cfg.c1_emit_config)
-            self._c1_emit_task = asyncio.create_task(self._c1_emit.run())
+            self._c1_emit.start()
         # 2026-07-21 proactive cube stager. Built after the cube_dump
         # writer + uploader (so it can reuse both) and BEFORE the C2
         # trigger listener (which is handed the stager for its claim /
@@ -1227,16 +1231,13 @@ class SearchComputeService:
         if self._c2_trigger is not None:
             await self._c2_trigger.stop()
         if self._c1_emit is not None:
-            await self._c1_emit.stop()
-            if self._c1_emit_task is not None:
-                try:
-                    await asyncio.wait_for(self._c1_emit_task, timeout=5.0)
-                except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-                    self._c1_emit_task.cancel()
-                    try:
-                        await self._c1_emit_task
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                        pass
+            # Sentinel + bounded join on the sender thread; the thread is
+            # a daemon and the join is capped by stop_join_timeout_s, so
+            # a dead C2 socket can never hang service shutdown.
+            try:
+                self._c1_emit.stop()
+            except Exception:                                # noqa: BLE001
+                _LOG.exception("c1_emit.stop failed (non-fatal)")
         if self._udp_listener is not None:
             await self._udp_listener.stop()
         if self._cube_dump is not None:
@@ -2130,13 +2131,16 @@ class SearchComputeService:
                 await self._source.release(slot.cube_id)
                 # Cooperative yield: _process_one_cube + release run to
                 # completion without ever suspending the event loop when
-                # the RX ring has data ready, so the co-resident C1 emitter
-                # task (c1_emit.run drain loop) would otherwise be starved
-                # under heavy candidate load -- it could not drain its queue,
-                # send heartbeats, or reconnect, which dropped that half's
-                # C1->C2 connection (observed 2026-05-29 as the recurring
-                # n01 gpu_half=0 7/8). sleep(0) forces one scheduler cycle
-                # per cube so the emitter always makes progress.
+                # the RX ring has data ready, so any co-resident task on
+                # this loop is starved under heavy candidate load
+                # (observed 2026-05-29 as the recurring n01 gpu_half=0
+                # 7/8, and again 2026-08-06 on h02 where ~350 ms of
+                # blocking per-cube work left no gap at all). sleep(0)
+                # forces one scheduler cycle per cube so the remaining
+                # loop residents make progress. NOTE: this is no longer
+                # what keeps the C1 stream alive -- since 2026-08-06 the
+                # C1 emitter owns a dedicated thread precisely because a
+                # single yield per cube is not a schedulability guarantee.
                 await asyncio.sleep(0)
                 slot, pending = next_slot, next_pending
                 if self._cubes_processed >= next_status:

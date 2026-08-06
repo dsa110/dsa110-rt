@@ -11,11 +11,37 @@ drains the queue, encodes each batch via the locked
 ``coinc.wire.C1BatchEncoder``, and ``sendall``s it onto the socket.
 
 Backpressure semantics:
-  * Outbound queue is bounded (default depth = 16).
+  * Outbound queue is bounded (default depth = 16, ``c1.emit_queue_depth``).
   * ``submit`` is non-blocking: queue-full drops are counted as
     ``batches_dropped`` and surfaced via :attr:`mon`.
-  * The connection task reconnects on socket-level failures with
-    exponential backoff (250 ms → 30 s cap) per the wire schema.
+  * The sender reconnects on socket-level failures with exponential
+    backoff (250 ms → 30 s cap) per the wire schema.
+
+Threading (2026-08-06)
+----------------------
+The connection lifecycle runs on a DEDICATED THREAD with its own
+private asyncio event loop (``asyncio.run(self.run())`` inside
+:meth:`C1TcpEmitter.start`), and the outbound queue is a thread-safe
+``queue.Queue``. It used to be an ``asyncio.Task`` co-resident with the
+whole GPU cube pipeline on the search-compute service loop, which meant
+the drain coroutine only ran in the gaps between cubes. On the fleet's
+slowest host those gaps close: ``search_compute._process_one_cube``
+blocks the loop for ~350 ms per cube inside ``run_forever``, the drain
+coroutine is never scheduled, the 16-deep queue overflows and
+``submit`` drops every batch — including real candidates. Observed
+2026-08-06 on ``lxd110h02`` gpu_half=1: deaf from 22:21, ~47 k dropped
+batches over 9 h, py-spy showing MainThread inside
+``sigma_clipped_std_batched`` while the C1 socket sat ``app_limited``
+with an empty send queue (the consumer was simply never scheduled).
+
+Owning a thread puts this output path on the same footing as the two
+other search-node output paths, which have always used a worker thread
+plus ``queue.Queue``: ``coinc.cube_uploader.BoundedCubeUploader`` and
+``dump.cube_dump.CubeDumpWriter``. Keeping a private asyncio loop (as
+opposed to synchronous sockets) preserves the StreamReader/Writer
+connect / drain / heartbeat / backoff code verbatim, so the wire
+protocol and every self-heal behaviour learned the hard way in
+2026-05/06 are unchanged.
 
 The module imports asyncio + socket only (no torch / numpy). The
 encoder is pure (no I/O) so unit tests round-trip through a local
@@ -25,9 +51,12 @@ in-process TCP echo server.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
+import queue
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -65,8 +94,15 @@ class C1EmitConfig:
         port: C2 server TCP port (default 11500 per wire schema).
         search_node_id: 0..N_SEARCH-1.
         gpu_half: 0 or 1.
-        queue_depth: outbound asyncio queue depth (per design doc
-            default 16).
+        queue_depth: outbound (thread-safe) queue depth, per design doc
+            default 16. Wired from ``c1.emit_queue_depth``. Deliberately
+            left at 16 by the 2026-08-06 sender-thread change: the fix
+            is to drain the queue reliably, not to paper over a stalled
+            consumer with a deeper buffer.
+        stop_join_timeout_s: how long :meth:`C1TcpEmitter.stop` waits
+            for the sender thread to exit before giving up and logging.
+            The thread is a daemon, so a wedged socket can delay but
+            never block service shutdown.
         connect_backoff_initial_s: first reconnect sleep on failure.
         connect_backoff_max_s: cap on the reconnect sleep.
         send_timeout_s: per-batch ``asyncio.wait_for`` deadline for the
@@ -95,6 +131,7 @@ class C1EmitConfig:
     connect_backoff_initial_s: float = 0.25
     connect_backoff_max_s: float = 30.0
     send_timeout_s: Optional[float] = 5.0
+    stop_join_timeout_s: float = 5.0
     connect_timeout_s: Optional[float] = 10.0
     idle_heartbeat_s: Optional[float] = 20.0
     """When the outbound queue is idle for this long, the drain loop
@@ -323,20 +360,28 @@ class _OutboundBatch:
 
 
 class C1TcpEmitter:
-    """Asyncio-driven persistent TCP client for the C1 → C2 path.
+    """Persistent TCP client for the C1 → C2 path, on its own thread.
 
     Lifecycle:
         ``emitter = C1TcpEmitter(config=cfg)``
-        ``task = asyncio.create_task(emitter.run())``
+        ``emitter.start()``
         ``... emitter.submit(header, candidates) ...``
-        ``await emitter.stop()``
-        ``await task``
+        ``emitter.stop()``
 
-    The :meth:`run` coroutine owns the connection lifecycle; it
-    reconnects on any socket-level error with exponential backoff. The
-    :meth:`submit` method is synchronous and non-blocking so the
-    per-cube driver can call it directly without yielding to the
-    event loop.
+    :meth:`start` spawns a daemon thread that runs :meth:`run` on a
+    PRIVATE asyncio event loop (``asyncio.run``); :meth:`stop` pushes a
+    shutdown sentinel and joins it. The :meth:`run` coroutine owns the
+    connection lifecycle and reconnects on any socket-level error with
+    exponential backoff, exactly as it did when it was a task on the
+    caller's loop. :meth:`submit` is synchronous, thread-safe and
+    non-blocking, so the per-cube driver can call it directly from the
+    pipeline coroutine — and, crucially, the sender now makes progress
+    even when that coroutine never yields (see the module docstring for
+    the 2026-08-06 h02 starvation incident).
+
+    ``run()`` remains a public coroutine so tests (and benches) can
+    drive the emitter on an existing loop; production always goes
+    through :meth:`start`.
 
     Mon-points exposed via :attr:`mon`:
         * ``connected`` (bool) — True while a writer is open.
@@ -358,10 +403,24 @@ class C1TcpEmitter:
                 f"queue_depth={config.queue_depth}, expected > 0"
             )
         self._config = config
-        self._queue: "asyncio.Queue[_OutboundBatch]" = asyncio.Queue(
+        # Thread-safe: the producer is the search-compute pipeline
+        # thread/coroutine, the consumer is our own sender thread.
+        self._queue: "queue.Queue[Any]" = queue.Queue(
             maxsize=config.queue_depth
         )
-        self._stopping = asyncio.Event()
+        self._stopping = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # Single worker used by the drain loop to await the blocking
+        # ``queue.Queue.get`` without freezing the private event loop
+        # (the loop must keep running so the peer's FIN is processed and
+        # ``reader.at_eof()`` stays truthful for the idle probe).
+        self._get_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=(
+                f"c1-emit-q-s{int(config.search_node_id)}"
+                f"g{int(config.gpu_half)}"
+            ),
+        )
         self._writer: Optional[asyncio.StreamWriter] = None
         self._reader: Optional[asyncio.StreamReader] = None
         # Last real batch header seen by the drain loop, reused (with
@@ -433,7 +492,7 @@ class C1TcpEmitter:
             self._queue.put_nowait(_OutboundBatch(header=header, rows=rows_tuple))
             self._mon["queue_depth"] = self._queue.qsize()
             return True
-        except asyncio.QueueFull:
+        except queue.Full:
             self._mon["batches_dropped"] = int(self._mon["batches_dropped"]) + 1
             # Rate-limited drop log: a stuck C2 emitter would otherwise
             # flood every cube (steady-state ~5–7 lines / s × 8 halves
@@ -457,16 +516,76 @@ class C1TcpEmitter:
                 self._last_drop_log_mono = time.monotonic()
             return False
 
-    async def stop(self) -> None:
-        """Signal the run loop to drain + exit. Idempotent."""
+    def start(self) -> None:
+        """Spawn the dedicated sender thread. Idempotent.
+
+        The thread owns a private asyncio loop running :meth:`run`; it
+        is a daemon so a wedged socket can never keep the search-compute
+        process alive after :meth:`stop` gives up on the join.
+        """
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name=(
+                f"c1-emit-s{int(self._config.search_node_id)}"
+                f"g{int(self._config.gpu_half)}"
+            ),
+            daemon=True,
+        )
+        self._thread.start()
+        _LOG.info(
+            "c1_emit sender thread started (%s -> %s:%d, sid=%d, "
+            "gpu_half=%d, queue_depth=%d)",
+            self._thread.name, self._config.host, int(self._config.port),
+            int(self._config.search_node_id), int(self._config.gpu_half),
+            int(self._config.queue_depth),
+        )
+
+    def _thread_main(self) -> None:
+        """Sender-thread entry point: private event loop + run()."""
+        try:
+            asyncio.run(self.run())
+        except Exception:                                     # noqa: BLE001
+            _LOG.exception("c1_emit sender thread died unexpectedly")
+        finally:
+            self._get_executor.shutdown(wait=False)
+            _LOG.info("c1_emit sender thread exited")
+
+    def stop(self) -> None:
+        """Signal the run loop to exit and join the sender thread.
+
+        Idempotent, and bounded: the queue-get worker polls, the send
+        path is capped by ``send_timeout_s`` and the join by
+        ``stop_join_timeout_s``, so a dead peer delays shutdown by at
+        most a few seconds and never hangs it.
+        """
         self._stopping.set()
-        # Push a sentinel so the queue-await wakes up promptly.
+        # Push a sentinel so a blocked queue-get wakes up promptly. On a
+        # full queue, evict one pending batch to make room -- we are
+        # shutting down, and a wedged sender must not outlive the
+        # service (cf. BoundedCubeUploader.stop).
         try:
             self._queue.put_nowait(_SHUTDOWN_SENTINEL)
-        except asyncio.QueueFull:
-            # Queue is full; loop will check _stopping after the next
-            # drain.
-            pass
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(_SHUTDOWN_SENTINEL)
+            except queue.Full:
+                pass
+        t = self._thread
+        if t is None:
+            return
+        t.join(timeout=float(self._config.stop_join_timeout_s))
+        if t.is_alive():
+            _LOG.warning(
+                "c1_emit sender thread still alive %.1fs after stop() "
+                "(daemon; abandoning). mon=%s",
+                float(self._config.stop_join_timeout_s), dict(self._mon),
+            )
 
     @property
     def mon(self) -> Dict[str, Any]:
@@ -502,16 +621,27 @@ class C1TcpEmitter:
                 await self._close_writer()
             if self._stopping.is_set():
                 break
-            try:
-                await asyncio.wait_for(
-                    self._stopping.wait(), timeout=backoff
-                )
-            except asyncio.TimeoutError:
-                pass
+            await self._sleep_backoff(backoff)
             backoff = min(
                 backoff * 2.0,
                 float(self._config.connect_backoff_max_s),
             )
+
+    async def _sleep_backoff(self, backoff: float) -> None:
+        """Interruptible reconnect sleep.
+
+        ``_stopping`` is a ``threading.Event`` (set from the service
+        thread), so it cannot be awaited directly; poll it on the
+        private loop instead. The loop is otherwise idle here, so the
+        50 ms tick costs nothing and keeps ``stop()`` snappy even in the
+        middle of a 30 s backoff.
+        """
+        deadline = time.monotonic() + float(backoff)
+        while not self._stopping.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            await asyncio.sleep(min(remaining, 0.05))
 
     async def _connect_once(self) -> None:
         _LOG.info(
@@ -589,25 +719,52 @@ class C1TcpEmitter:
         except OSError as exc:  # noqa: BLE001
             _LOG.debug("c1_emit keepalive sockopt failed: %r", exc)
 
+    def _queue_get(self, timeout: float) -> Any:
+        """Blocking queue pop, run on :attr:`_get_executor`.
+
+        Returns the batch, ``None`` on timeout (→ idle keepalive), or
+        :data:`_SHUTDOWN_SENTINEL` when ``stop()`` fired. Polls in short
+        slices so the worker is never parked for the full idle interval
+        — that bounds both ``stop()`` latency and interpreter-exit
+        latency (``ThreadPoolExecutor`` threads are joined at exit).
+        """
+        deadline = time.monotonic() + float(timeout)
+        while not self._stopping.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            try:
+                return self._queue.get(
+                    timeout=min(remaining, _QUEUE_POLL_S)
+                )
+            except queue.Empty:
+                continue
+        return _SHUTDOWN_SENTINEL
+
     async def _drain_loop(self) -> None:
         assert self._writer is not None
+        loop = asyncio.get_running_loop()
         idle = self._config.idle_heartbeat_s
+        heartbeat = idle is not None and idle > 0
+        # With the idle heartbeat disabled we still wake periodically so
+        # the loop can notice ``_stopping``; nothing is sent on wake.
+        wait_s = float(idle) if heartbeat else _IDLE_DISABLED_WAIT_S
         while not self._stopping.is_set():
-            if idle is not None and idle > 0:
-                try:
-                    item = await asyncio.wait_for(
-                        self._queue.get(), timeout=float(idle),
-                    )
-                except asyncio.TimeoutError:
+            # The get blocks on a helper thread, NOT on this loop, so the
+            # transport keeps reading while we wait -- that is what makes
+            # reader.at_eof() below meaningful.
+            item = await loop.run_in_executor(
+                self._get_executor, self._queue_get, wait_s,
+            )
+            if item is None:
+                if heartbeat:
                     # No cube traffic for `idle` s. Probe for a peer that
                     # closed on us and keep the connection warm so C2's
                     # idle_timeout never idle-closes a cube-drought half.
                     # Raises on a dead/half-closed peer → outer loop
                     # reconnects (clears the CLOSE-WAIT socket).
                     await self._idle_keepalive()
-                    continue
-            else:
-                item = await self._queue.get()
+                continue
             self._mon["queue_depth"] = self._queue.qsize()
             if item is _SHUTDOWN_SENTINEL:
                 return
@@ -729,3 +886,12 @@ class C1TcpEmitter:
 
 # Sentinel used to wake the queue.get() in the run loop on stop().
 _SHUTDOWN_SENTINEL: Any = object()
+
+#: Slice length for the blocking ``queue.Queue.get`` in the drain loop's
+#: helper thread. Bounds how long that thread can stay parked after
+#: ``stop()`` (and therefore at interpreter exit).
+_QUEUE_POLL_S: float = 0.25
+
+#: Wake interval used when ``idle_heartbeat_s`` is disabled — the drain
+#: loop still needs to re-check ``_stopping`` periodically.
+_IDLE_DISABLED_WAIT_S: float = 1.0
