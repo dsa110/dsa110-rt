@@ -995,7 +995,15 @@ c3:
     r4_time_prom_sigma: 4.0          # require a >=4 sigma time-series peak
     r4_image_prom_sigma: 4.0         # require a >=4 sigma image peak
     r5_dm_shift_trials: 4            # DM apex shifted >4 trials AND no time/image peak -> reject
-    r10_tz_trig_sigma: 10.0          # global all-cube apex must be >=10 sigma at the triggered DM/time
+    # 2026-08-07: was 10.0 with a coherence exemption that R2/R3 made
+    # vacuous, so R10 never fired -- 15 of 31 KEEPs on the night of
+    # 08-06 met its conditions and all 15 were spared, at tz_trig down
+    # to 2.7. Rule is now the single condition below. 8.0 rather than
+    # 10.0 because tz_trig tracks detector SNR at ratio 1.15-1.88, so 10
+    # would correspond to ~8.7 sigma detector -- above the trigger floor
+    # and able to cut genuine faint bursts. At 8.0: 0 of 47 injections
+    # lost, 88% of sky KEEPs removed.
+    r10_tz_trig_sigma: 8.0           # cube must show >= this at the triggered DM/time
   corr_nodes:
     0:  {ssh_host: n03.pro.pvt, udp_ip: 10.41.0.224}
     1:  {ssh_host: n04.pro.pvt, udp_ip: 10.41.0.138}

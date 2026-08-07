@@ -64,14 +64,26 @@ class CubeVetoThresholds:
     r4_time_prom_sigma: float = 4.0
     r4_image_prom_sigma: float = 4.0
     r5_dm_shift_trials: int = 4        # edge rail AND > this many trials off
-    r10_tz_trig_sigma: float = 10.0    # trigger feature "weak" below this
-
-    # 2026-08-04: R10 coherence exemption. When the cube's apex sits on
-    # the trigger's own time and DM, the cube HAS confirmed the trigger
-    # and R10 must not fire regardless of which half happens to hold the
-    # global apex. See the R10 note in `decide` for why.
-    r10_coherent_t_samples: int = 2
-    r10_coherent_dm_trials: int = 1
+    # R10: the cube must actually show the trigger. Calibrated 2026-08-07
+    # against 47 injections (the only ground truth for a burst of known
+    # strength) and 72 sky KEEPs:
+    #
+    #     injections  min 10.3   median 30.4
+    #     sky KEEPs   max 14.6   median  4.5
+    #     REJECTs     max  9.6   median  3.9
+    #
+    # tz_trig tracks the detector SNR closely (r=0.978, ratio 1.15-1.88),
+    # which is what sets the floor: at the pessimistic 1.15 ratio a
+    # threshold of 10 corresponds to a detector SNR of 8.7 -- ABOVE the
+    # ~8 sigma trigger floor -- so 10 could cut genuine faint bursts. 8.0
+    # keeps 0/47 injections out while still removing 88% of sky KEEPs,
+    # and even a burst at the 8 sigma floor with the worst-case ratio
+    # lands at tz=9.2 and survives.
+    #
+    # Caveat for whoever retunes this: the faintest injection is detector
+    # SNR 11.4, so injections do NOT probe the 8-11 sigma band. The
+    # threshold is set from the tz/SNR ratio, not measured there.
+    r10_tz_trig_sigma: float = 8.0     # cube must confirm at >= this
 
     # R11 non-Gaussian-noise veto. Thresholds sit an order of magnitude
     # above the clean-half population (0.00 +/- 0.03 and ~5e-4) and well
@@ -236,32 +248,39 @@ def decide(
         and metrics.dm_shift_trials > th.r5_dm_shift_trials
     ):
         fired.append("R5_dm_edge_rail")
-    # R10 cube doesn't confirm the trigger.
+    # R10 the cube doesn't confirm the trigger.
     #
-    # 2026-08-04: added the coherence exemption. g_apex_cube_same is 1
-    # only when the single brightest row-normalised cell across ALL
-    # dumped halves (~560k cells) lands in the trigger's half. Every
-    # event measured carries one half with an 11-13 sigma interference
-    # spike while the others top out at 5-8, so that argmax tracks
-    # "which half holds the worst RFI", not "is the candidate real".
-    # 260803qmub and 260804ncon were KEPT because they triggered at
-    # DM 156 -- inside their own contaminated lowest-DM half -- while
-    # 260803doen was REJECTED for triggering at DM 339 in a clean half.
-    # Same width (1 sample), same perfect coherence (t_shift 0,
-    # dm_shift 0); the only difference was where the RFI happened to be.
+    # One condition, deliberately: does the cube show >= r10_tz_trig_sigma
+    # at the DM and time the detector triggered on? If not, the detection
+    # is not corroborated by the data it was made from.
     #
-    # So R10 now requires actual incoherence: if the cube's apex is on
-    # the trigger's own time and DM, the cube has confirmed the trigger
-    # and a louder feature elsewhere is not evidence against it.
-    r10_coherent = (
-        metrics.t_shift <= th.r10_coherent_t_samples
-        and metrics.dm_shift_trials <= th.r10_coherent_dm_trials
-    )
-    if (
-        metrics.g_apex_cube_same == 0
-        and metrics.tz_trig < th.r10_tz_trig_sigma
-        and not r10_coherent
-    ):
+    # 2026-08-04 added two extra terms and 2026-08-07 removed both, for
+    # separate reasons. Keeping the history because each is a trap:
+    #
+    # ``g_apex_cube_same`` was the original gate: 1 only when the single
+    # brightest row-normalised cell across ALL dumped halves (~560k cells)
+    # lands in the trigger's half. That argmax tracks "which half holds
+    # the worst RFI", not "is the candidate real" -- every event measured
+    # carries one half with an 11-13 sigma interference spike while the
+    # others top out at 5-8. 260803qmub and 260804ncon were KEPT for
+    # triggering at DM 156 inside their own contaminated half while
+    # 260803doen was REJECTED at DM 339 in a clean one, same width, same
+    # perfect coherence. It is not evidence and it is gone.
+    #
+    # The coherence exemption added in its place (skip R10 when
+    # t_shift and dm_shift are small) was WORSE, because it was vacuous:
+    # R2 and R3 reject anything shifted BEFORE R10 is reached, so every
+    # surviving candidate has t_shift == 0 and dm_shift_trials == 0 by
+    # construction and the exemption was always true. Measured on the
+    # night of 2026-08-06: 15 of 31 KEEPs met R10's conditions and the
+    # exemption spared 100% of them, at tz_trig as low as 2.7. R10 was
+    # dead code for three days.
+    #
+    # The lesson generalises: an exemption predicated on a quantity an
+    # upstream rule has already constrained is not an exemption, it is a
+    # deletion. test_r10_fires_on_a_coherent_but_unconfirmed_trigger
+    # guards this specific case.
+    if metrics.tz_trig < th.r10_tz_trig_sigma:
         fired.append("R10_cube_unconfirmed")
 
     # R11 broad candidate in a demonstrably non-Gaussian half.
@@ -278,9 +297,14 @@ def decide(
             or metrics.frac_z5_trig > th.r11_frac_z5
         )
         # ...unless the candidate stands on its own: a strong trigger
-        # feature, or an apex sitting on the trigger's time and DM.
+        # feature. The "or an apex on the trigger's time and DM" half of
+        # this exemption carried the same vacuous ``not r10_coherent``
+        # term as R10 and is removed for the same reason (2026-08-07) --
+        # R2/R3 force those to zero upstream, so it always held and R11
+        # could never fire. R11 is disabled pending calibration, so the
+        # only visible effect is that its "would fire" note starts
+        # appearing, which is the whole point of collecting it.
         and metrics.tz_trig < th.r11_exempt_tz_trig
-        and not r10_coherent
     )
     if r11_would_fire and th.r11_enabled:
         fired.append("R11_nongaussian_cube")

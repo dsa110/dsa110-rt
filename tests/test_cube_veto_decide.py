@@ -81,14 +81,7 @@ def test_r5_dm_edge_rail() -> None:
 
 
 def test_r10_cube_unconfirmed() -> None:
-    # 2026-08-04: t_shift/dm_shift must be outside the coherence
-    # exemption, otherwise the cube HAS confirmed the trigger and R10 is
-    # deliberately suppressed (see test_r10_exempts_... below).
-    d = decide(
-        _clean_metrics(g_apex_cube_same=0, tz_trig=9.9,
-                       t_shift=40, dm_shift_trials=5),
-        is_injection=False,
-    )
+    d = decide(_clean_metrics(tz_trig=7.9), is_injection=False)
     assert not d.keep and "R10_cube_unconfirmed" in d.rules_fired
 
 
@@ -174,47 +167,77 @@ def _r10_only(**ov) -> CubeMetrics:
     return _clean_metrics(**base)
 
 
-def test_r10_exempts_a_temporally_and_spectrally_coherent_trigger():
-    """260803doen: the cube's apex sits exactly on the trigger's time and
-    DM, so the cube HAS confirmed it — a louder feature in another half
-    (which just means that half has worse RFI) must not reject it."""
-    d = decide(_r10_only(), is_injection=False)
-    assert d.keep, d.rules_fired
-    assert "R10_cube_unconfirmed" not in d.rules_fired
+def test_r10_fires_on_a_coherent_but_unconfirmed_trigger():
+    """REGRESSION GUARD — do not weaken without reading this.
 
+    Every candidate that reaches R10 has t_shift == 0 and
+    dm_shift_trials == 0, because R2 and R3 reject anything shifted
+    first. So any R10 exemption predicated on those quantities is
+    vacuous: it does not soften the rule, it deletes it. That is exactly
+    what happened between 2026-08-04 and 2026-08-07, when 15 of 31 KEEPs
+    on a single night met R10's conditions and an exemption spared all
+    15, at tz_trig as low as 2.7.
 
-def test_r10_still_fires_when_the_cube_is_incoherent():
-    """260803szgu: apex 82 samples and 25 DM trials away — the exemption
-    must not rescue that."""
-    d = decide(_r10_only(t_shift=82, dm_shift_trials=25), is_injection=False)
-    assert not d.keep
+    This asserts the state EVERY surviving candidate is in -- perfectly
+    coherent, weak cube confirmation -- still fires R10. If someone
+    reintroduces a coherence carve-out, this test fails.
+    """
+    d = decide(_r10_only(t_shift=0, dm_shift_trials=0), is_injection=False)
+    assert not d.keep, "a vacuous R10 exemption has been reintroduced"
     assert "R10_cube_unconfirmed" in d.rules_fired
 
 
-def test_r10_exemption_is_bounded_by_its_thresholds():
+def test_r10_does_not_fire_when_the_cube_confirms():
     th = CubeVetoThresholds()
-    # just inside on both axes -> exempt
-    assert decide(
-        _r10_only(t_shift=th.r10_coherent_t_samples,
-                  dm_shift_trials=th.r10_coherent_dm_trials),
-        is_injection=False,
-    ).keep
-    # one sample too far in time -> R10 bites again
-    assert "R10_cube_unconfirmed" in decide(
-        _r10_only(t_shift=th.r10_coherent_t_samples + 1), is_injection=False,
-    ).rules_fired
-    # one trial too far in DM -> likewise
-    assert "R10_cube_unconfirmed" in decide(
-        _r10_only(dm_shift_trials=th.r10_coherent_dm_trials + 1),
-        is_injection=False,
-    ).rules_fired
+    d = decide(_r10_only(tz_trig=th.r10_tz_trig_sigma + 0.1),
+               is_injection=False)
+    assert d.keep, d.rules_fired
+
+
+def test_r10_ignores_which_half_holds_the_global_apex():
+    """g_apex_cube_same is an argmax over ~560k cells across all halves,
+    so it tracks which half has the worst RFI rather than whether the
+    candidate is real (260803doen vs 260803qmub). R10 must not depend on
+    it in either direction."""
+    weak = {"tz_trig": 4.0}
+    assert (
+        decide(_r10_only(g_apex_cube_same=0, **weak),
+               is_injection=False).rules_fired
+        == decide(_r10_only(g_apex_cube_same=1, **weak),
+                  is_injection=False).rules_fired
+    )
+    strong = {"tz_trig": 30.0}
+    assert (
+        decide(_r10_only(g_apex_cube_same=0, **strong),
+               is_injection=False).rules_fired
+        == decide(_r10_only(g_apex_cube_same=1, **strong),
+                  is_injection=False).rules_fired
+    )
+
+
+def test_r10_threshold_stays_below_the_faintest_injection():
+    """Calibration guard. Across 47 injections (2026-08, the only ground
+    truth for a burst of known strength) the minimum tz_trig was 10.3.
+    The threshold must stay under that or the rule starts eating real
+    bursts; the margin also covers the 8 sigma detector floor given the
+    measured tz/SNR ratio of 1.15 at the pessimistic end."""
+    faintest_injection_tz = 10.3
+    th = CubeVetoThresholds()
+    assert th.r10_tz_trig_sigma < faintest_injection_tz
+    assert decide(_r10_only(tz_trig=faintest_injection_tz),
+                  is_injection=False).keep
 
 
 def _streaky(**ov) -> CubeMetrics:
-    """A broad candidate in a demonstrably non-Gaussian half, weak and
-    incoherent enough that no exemption applies."""
+    """A broad candidate in a demonstrably non-Gaussian half, weak enough
+    for R11 but not so weak that R10 fires first.
+
+    tz_trig must sit in [r10_tz_trig_sigma, r11_exempt_tz_trig) = [8, 10)
+    to exercise R11 in isolation: below 8 R10 rejects it and R11 is moot;
+    at or above 10 R11's own strong-trigger exemption spares it.
+    """
     base = dict(width_samples=16, streak_ac1_trig=0.28, frac_z5_trig=0.012,
-                tz_trig=6.0, t_shift=10, dm_shift_trials=3)
+                tz_trig=9.0, t_shift=10, dm_shift_trials=3)
     base.update(ov)
     return _clean_metrics(**base)
 
@@ -251,10 +274,10 @@ def test_r11_spares_a_strong_trigger_in_a_streaky_half():
     assert "R11_nongaussian_cube" not in decide(
         _streaky(tz_trig=11.6), is_injection=False, thresholds=th,
     ).rules_fired
-    assert "R11_nongaussian_cube" not in decide(
-        _streaky(t_shift=0, dm_shift_trials=0), is_injection=False,
-        thresholds=th,
-    ).rules_fired
+    # The second half of this exemption used to be "or the apex sits on
+    # the trigger's time and DM". Removed 2026-08-07: R2/R3 force those
+    # to zero upstream, so that term was always true and R11 could never
+    # fire at all. Only the strong-trigger exemption above is real.
 
 
 def test_r11_needs_a_width_to_fire():

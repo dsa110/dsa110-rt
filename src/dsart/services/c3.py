@@ -150,7 +150,7 @@ class C3Config:
             r4_time_prom_sigma=float(vt.get("r4_time_prom_sigma", 4.0)),
             r4_image_prom_sigma=float(vt.get("r4_image_prom_sigma", 4.0)),
             r5_dm_shift_trials=int(vt.get("r5_dm_shift_trials", 4)),
-            r10_tz_trig_sigma=float(vt.get("r10_tz_trig_sigma", 10.0)),
+            r10_tz_trig_sigma=float(vt.get("r10_tz_trig_sigma", 8.0)),
         )
         fired_log_raw = c3.get(
             "fired_injection_log",
