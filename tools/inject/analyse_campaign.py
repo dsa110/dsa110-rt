@@ -115,6 +115,50 @@ def join(fired: List[dict], matches: Dict[str, dict]) -> List[dict]:
     return rows
 
 
+def fit_width_exponent(rows: List[dict]) -> Optional[dict]:
+    """Fit ``observed_snr = A x fluence x width^(-alpha)`` and return alpha.
+
+    The injector's own model assumes alpha = 0.5 (``observed = K F / sqrt(w)``),
+    which is where ``snr_to_fluence`` and the brightness guard both come from.
+    But injection ``width_samples`` are NATIVE 32.768 us samples while the
+    detector integrates a 1048.576 us search sample, so every width below 32
+    native is narrower than the shortest boxcar. Below that the pulse cannot
+    get any more concentrated in the detector's eyes and the sqrt(w) benefit
+    should vanish, i.e. alpha -> 0. Fitting it is the honest way to find out
+    which regime we are in rather than assuming either.
+    """
+    pts = [(r["fluence"], r["width"], r["obs_snr"], r["dm"]) for r in rows
+           if r.get("detected") and r.get("obs_snr") and r.get("fluence")]
+    if len(pts) < 8:
+        return None
+    F = np.array([p[0] for p in pts]); W = np.array([p[1] for p in pts], float)
+    S = np.array([p[2] for p in pts]); D = np.array([p[3] for p in pts])
+    # One intercept PER DM BAND. K is a property of the band's
+    # coarse+fine dedisperser path, so a single global intercept would
+    # dump the (large) band-to-band differences in K into the residual
+    # and hide the width term we are actually trying to measure.
+    dms = sorted(set(D.tolist()))
+    if len(pts) < len(dms) + 3:
+        return None
+    y = np.log(S) - np.log(F)
+    cols = [(D == d).astype(float) for d in dms] + [-np.log(W)]
+    X = np.vstack(cols).T
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    pred = X @ coef
+    ss = 1.0 - np.sum((y - pred) ** 2) / max(1e-12, np.sum((y - y.mean()) ** 2))
+    # standard error on alpha, for an honest "is it 0 or 0.5" statement
+    dof = max(1, len(y) - X.shape[1])
+    resid_var = float(np.sum((y - pred) ** 2) / dof)
+    try:
+        cov = resid_var * np.linalg.inv(X.T @ X)
+        se = float(np.sqrt(max(cov[-1, -1], 0.0)))
+    except np.linalg.LinAlgError:
+        se = float("nan")
+    return {"alpha": float(coef[-1]), "alpha_se": se, "r2": float(ss),
+            "n": len(pts), "K_per_dm": {float(d): float(np.exp(c))
+                                        for d, c in zip(dms, coef[:-1])}}
+
+
 def _fmt(x: Optional[float], w: int = 8, p: int = 2) -> str:
     return ("%*.*f" % (w, p, x)) if isinstance(x, (int, float)) else " " * (w - 1) + "-"
 
@@ -164,6 +208,27 @@ def report(rows: List[dict]) -> None:
                 o = np.median([r["obs_snr"] for r in sub])
                 print("  %-6.0f %-7d %8.1f %9.2f %8.2f %8d"
                       % (dm, w, s, o, o / s, len(sub)))
+
+    fit = fit_width_exponent(grid)
+    if fit:
+        print("\n=== WIDTH SCALING (is the injector's sqrt(w) model right?) ===")
+        print("  fit observed_snr = A x fluence x width^(-alpha)")
+        print("    alpha = %.3f +/- %.3f   (injector model assumes 0.5)"
+              % (fit["alpha"], fit["alpha_se"]))
+        print("    R^2   = %.3f   over n=%d detections, per-DM intercepts"
+              % (fit["r2"], fit["n"]))
+        print("    fitted K by DM band: %s"
+              % {int(k): round(v, -2) for k, v in sorted(fit["K_per_dm"].items())})
+        if fit["alpha"] < 0.25:
+            print("  --> alpha is near 0, NOT 0.5: observed S/N tracks fluence")
+            print("      alone. Injection width_samples are NATIVE 32.768 us")
+            print("      samples, so every width here is below one 1048.576 us")
+            print("      search sample and cannot concentrate the pulse further.")
+            print("      Consequence: 'requested S/N' is only truthful at the")
+            print("      width K was fitted at, and snr_to_fluence /")
+            print("      max_safe_fluence mis-scale away from it.")
+        elif fit["alpha"] > 0.4:
+            print("  --> consistent with the injector's sqrt(w) model.")
 
     railed = [r for r in det if r["obs_snr"] >= 0.95 * DETECTOR_CLIP_SIGMA]
     print("\n  probes at/near the %.0f sigma detector clip: %d"
