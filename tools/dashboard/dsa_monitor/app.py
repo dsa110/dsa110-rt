@@ -278,9 +278,21 @@ def _capture_armed_mjd():
     return None
 
 
+def _publish_sky_sefd(key: str, payload: dict) -> None:
+    """Write the sky monitor's implied-SEFD rollup to etcd.
+
+    Uses the same write-side ControlStore as the Control tab (lazy DsaStore,
+    so a briefly-down etcd doesn't stop the dashboard booting). The sky
+    monitor calls this once per frame (~30 s); the influx pusher on h20
+    scans /mon/sky/ and turns it into the ``sky_sefd`` measurement.
+    """
+    control_store.put_dict(key, payload)
+
+
 sky_mon = SkyMonitor(
     veto_provider=_active_sidereal_vetos,
     armed_mjd_provider=_capture_armed_mjd,
+    sefd_publisher=_publish_sky_sefd,
 )
 
 

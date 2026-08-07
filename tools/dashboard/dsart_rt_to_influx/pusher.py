@@ -98,6 +98,7 @@ PREFIXES: Tuple[str, ...] = (
     "/mon/service/corr_rt/",
     "/mon/service/search_rt/",
     "/mon/c2/",
+    "/mon/sky/",
 )
 
 # Per-key-shape regexes.  Order matters: ``_route_key`` tries them in
@@ -128,6 +129,11 @@ KEY_SEARCH_HEARTBEAT = re.compile(r"^/mon/service/search_rt/(\d+)$")
 # (``/mon/c2/h23``); the ``<host>`` capture group is preserved so a
 # future fan-out is just a new key, not a new schema.
 KEY_C2 = re.compile(r"^/mon/c2/([^/]+)$")
+
+# 2026-08-07: static-sky image noise + implied per-antenna SEFD, published
+# by the sky monitor's frame loop (tools/dashboard/dsa_monitor/sky_monitor.py).
+# Single-instance on h23 like /mon/c2, so no cn tag.
+KEY_SKY_SEFD = re.compile(r"^/mon/sky/sefd$")
 
 # Capture-key cumulative-counter fields (corr doc §3.1) for delta math.
 CAPTURE_CUMULATIVE_FIELDS: Tuple[str, ...] = (
@@ -1063,6 +1069,81 @@ def make_search_compute_points(
     )]
 
 
+#: Fields carried from the sky monitor's ``noise`` block. All floats;
+#: ``sefd_implied_jy`` is the headline number and the rest are what you
+#: need to decide whether to believe it on any given frame.
+_SKY_SEFD_FLOAT_FIELDS = (
+    "sefd_implied_jy",
+    "sigma_mjy",
+    "sigma_pred_mjy_at_ref_sefd",
+    "ref_sefd_jy",
+    "flux_scale_units_per_mjy",
+    "window_s",
+    "bw_eff_hz",
+)
+
+#: Integer/derived context fields.
+_SKY_SEFD_INT_FIELDS = (
+    "n_flux_scale_sources",
+    "n_ant_assumed",
+)
+
+
+def make_sky_sefd_points(payload: Dict[str, Any]) -> List[Point]:
+    """``/mon/sky/sefd`` -> the ``sky_sefd`` measurement (one row).
+
+    This is the SEFD implied by the *static-sky image* path, which is a
+    different measurement from the calibrator-based SEFD the scanner
+    reports and should not be confused with it. It is derived by taking
+    the MAD noise of the static-sky-subtracted image, converting to mJy
+    via a flux scale fitted against detected NVSS sources in the same
+    frame, and inverting the radiometer equation:
+
+        sigma_I = SEFD / sqrt(N_ant (N_ant - 1) n_pol dnu tau)
+
+    so it is an *effective system* SEFD: it absorbs any imaging loss,
+    calibration error or residual structure into the number, and is
+    therefore a conservative upper bound on the true per-antenna
+    radiometric SEFD rather than an estimate of it.
+
+    Two guards, because a frame can be published before the pipeline is
+    in a state where the number means anything:
+
+      * ``static_sub_ready`` false -> the instrumental baseline has not
+        been subtracted, the image is structure-dominated, and the flux
+        scale fit against it is meaningless. sky_monitor already returns
+        ``sefd_implied_jy = None`` in that case; we drop the point
+        entirely rather than emit a zero, so Grafana shows a gap instead
+        of a cliff.
+      * ``n_flux_scale_sources`` small -> the flux scale rests on a
+        handful of NVSS detections and the SEFD inherits their scatter.
+        It is emitted as a field so a panel can filter or shade on it.
+    """
+    ts_unix = payload.get("ts_unix")
+    if not isinstance(ts_unix, (int, float)) or isinstance(ts_unix, bool):
+        return []
+    sefd = payload.get("sefd_implied_jy")
+    if not isinstance(sefd, (int, float)) or isinstance(sefd, bool):
+        return []
+    fields: Dict[str, Any] = {}
+    for k in _SKY_SEFD_FLOAT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[k] = float(v)
+    for k in _SKY_SEFD_INT_FIELDS:
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            fields[k] = int(v)
+    if not fields:
+        return []
+    return [Point(
+        measurement="sky_sefd",
+        tags={},
+        fields=fields,
+        timestamp_ns=int(float(ts_unix) * 1e9),
+    )]
+
+
 def make_c2_points(
     payload: Dict[str, Any], *, host: str,
 ) -> List[Point]:
@@ -1423,6 +1504,9 @@ class InfluxPusherService:
             m = KEY_C2.match(key)
             if m:
                 return make_c2_points(payload, host=str(m.group(1)))
+
+            if KEY_SKY_SEFD.match(key):
+                return make_sky_sefd_points(payload)
 
             m = KEY_SEARCH_COMPUTE.match(key)
             if m:
