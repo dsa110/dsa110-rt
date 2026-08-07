@@ -379,7 +379,10 @@ def test_recovered_cycle_end_to_end(tmp_path):
     assert rec["cubes"] == 8
     assert rec["c3_decision"] == "KEEP"
     assert rec["inj_id"] == fired["inj_id"]
-    assert rec["inj_id"].startswith("sentinel_")
+    assert rec["inj_id"].startswith("inj_")
+    assert len(rec["inj_id"]) <= 14  # short id: inj_MMDD_HHMM
+    # Recovered message links the event to its dashboard burst page.
+    assert "/bursts/260807test|260807test>" in notifier.texts[1]["text"]
     assert rec["snr_ratio"] == pytest.approx(19.0 / 20.0)
     assert rec["offset_arcsec"] == pytest.approx(
         1e-4 * 180 / math.pi * 3600, rel=1e-6)

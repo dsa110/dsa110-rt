@@ -501,9 +501,13 @@ class InjectSentinel:
         }
 
     def _make_inj_id(self, dm: float) -> str:
+        """Short, readable, unique at one shot/hour: ``inj_0807_0315``
+        (UTC month-day + hour-minute). DM and the rest of the
+        parameters live in the Slack message / JSONL row, not the id."""
+        del dm
         stamp = datetime.fromtimestamp(
-            self._time(), timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        return f"sentinel_{stamp}_{bucket_key(dm)}"
+            self._time(), timezone.utc).strftime("%m%d_%H%M")
+        return f"inj_{stamp}"
 
     def run_cycle(self) -> Dict[str, Any]:
         """One full attempt. Returns the JSONL record (also appended to
@@ -617,8 +621,15 @@ class InjectSentinel:
         outcome = record.get("outcome")
         if outcome == Outcome.RECOVERED:
             dm_obs = record.get("observed_dm_pc_cm3")
+            event = record.get("event")
+            if event:
+                # Same burst-page link the candidate cards carry.
+                event_ref = "<{base}/bursts/{ev}|{ev}>".format(
+                    base=self._cfg.dashboard_base_url.rstrip("/"), ev=event)
+            else:
+                event_ref = "(pending archive)"
             text = (
-                "recovered: `{inj_id}` -> event `{event}`\n"
+                "recovered: `{inj_id}` -> {event}\n"
                 "SNR {osnr:.1f} (target {tsnr:.1f}, ratio {ratio:.2f}) | "
                 "DM {odm} (injected {idm:.0f}, delta {ddm}) | "
                 "(l, m) = ({ol:+.5f}, {om:+.5f}) rad, offset {off} arcsec "
@@ -626,7 +637,7 @@ class InjectSentinel:
                 "found by s{sid}g{g} | cubes {cubes} | C3 {c3}"
             ).format(
                 inj_id=record.get("inj_id"),
-                event=record.get("event") or "(pending archive)",
+                event=event_ref,
                 osnr=float(record.get("observed_snr") or 0),
                 tsnr=float(record.get("target_snr") or 0),
                 ratio=float(record.get("snr_ratio") or 0),
@@ -916,15 +927,18 @@ class InjectSentinel:
         try:
             import matplotlib
             matplotlib.use("Agg", force=True)
+            import matplotlib.dates as mdates
             from matplotlib.figure import Figure
             from matplotlib.lines import Line2D
         except Exception as exc:  # noqa: BLE001
             LOG.warning("matplotlib unavailable: %s", exc)
             return False
         try:
-            # Fixed identity encoding per DM bucket (Okabe-Ito hues,
-            # CVD-safe; marker shape doubles the encoding so identity
-            # never rides on color alone).
+            # Publication styling: no grid, top/right spines removed,
+            # thin remaining spines, outward ticks, muted ink. Fixed
+            # identity encoding per DM bucket (Okabe-Ito hues, CVD-safe;
+            # marker shape doubles the encoding so identity never rides
+            # on color alone).
             dm_style = {
                 500.0: ("#0072B2", "o"),
                 1000.0: ("#E69F00", "s"),
@@ -933,15 +947,29 @@ class InjectSentinel:
             }
             miss_color = "#C62828"
             neutral = "#9E9E9E"
+            ink = "#333333"
+
+            def _despine(ax):
+                for side in ("top", "right"):
+                    ax.spines[side].set_visible(False)
+                for side in ("left", "bottom"):
+                    ax.spines[side].set_linewidth(0.8)
+                    ax.spines[side].set_color(ink)
+                ax.tick_params(direction="out", length=3, width=0.8,
+                               colors=ink, labelsize=9)
+                ax.yaxis.label.set_color(ink)
+                ax.xaxis.label.set_color(ink)
 
             fired = [
                 r for r in rows
                 if r.get("outcome") in (Outcome.RECOVERED,) + Outcome.MISSES
             ]
-            fig = Figure(figsize=(12, 9), constrained_layout=True)
+            fig = Figure(figsize=(9.5, 8.5), constrained_layout=True)
+            fig.suptitle("Injection sentinel, last 24 h", fontsize=13,
+                         color=ink, x=0.02, ha="left")
             axes = fig.subplots(3, 1)
 
-            # Panel 1: observed vs target SNR over time.
+            # Panel 1: recovered vs target S/N over time.
             ax = axes[0]
             for r in fired:
                 t = datetime.fromtimestamp(
@@ -951,33 +979,42 @@ class InjectSentinel:
                 target = _as_float(r.get("target_snr"))
                 observed = _as_float(r.get("observed_snr"))
                 if target is not None:
-                    ax.plot([t], [target], marker="_", ms=14, mew=1.5,
+                    ax.plot([t], [target], marker="_", ms=11, mew=1.2,
                             color=neutral, ls="none")
                 if observed is not None:
                     if target is not None:
                         ax.plot([t, t], [target, observed],
-                                color=color, lw=1, alpha=0.6)
-                    ax.plot([t], [observed], marker=marker, ms=7,
+                                color=color, lw=0.8, alpha=0.5)
+                    ax.plot([t], [observed], marker=marker, ms=6,
                             color=color, ls="none")
                 elif target is not None:
-                    ax.plot([t], [0.0], marker="x", ms=9, mew=2,
+                    ax.plot([t], [0.0], marker="x", ms=7, mew=1.6,
                             color=miss_color, ls="none")
-            ax.set_ylabel("SNR")
-            ax.set_title(
-                "injections, last 24 h: observed SNR (marker, by DM) vs "
-                "target (gray tick); misses at 0")
+            ax.set_ylabel("S/N")
+            ax.set_xlabel("time (UTC)")
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            ax.set_title("Recovered vs target S/N", fontsize=11,
+                         color=ink, loc="left")
             handles = [
-                Line2D([], [], marker=m, color=c, ls="none", ms=7,
+                Line2D([], [], marker=m, color=c, ls="none", ms=6,
                        label=f"DM {dm:.0f}")
                 for dm, (c, m) in sorted(dm_style.items())
             ]
+            handles.append(Line2D([], [], marker="_", color=neutral,
+                                  ls="none", ms=10, mew=1.2,
+                                  label="target"))
             handles.append(Line2D([], [], marker="x", color=miss_color,
-                                  ls="none", ms=8, label="missed"))
-            ax.legend(handles=handles, loc="upper left", ncol=5,
-                      frameon=False, fontsize=9)
-            ax.grid(True, alpha=0.2)
+                                  ls="none", ms=7, mew=1.6, label="missed"))
+            # Above the axes, right-aligned: clear of the data and of
+            # the left-aligned panel title.
+            ax.legend(handles=handles, loc="lower right",
+                      bbox_to_anchor=(1.0, 1.0), ncol=6, frameon=False,
+                      fontsize=8.5, handletextpad=0.3, columnspacing=1.1)
+            ax.set_ylim(bottom=-1.5)
+            _despine(ax)
 
-            # Panel 2: outcome counts (status colors; one bar per outcome).
+            # Panel 2: outcome counts (horizontal, direct-labeled, no
+            # count axis — the numbers ARE the axis).
             ax = axes[1]
             outcome_colors = {
                 Outcome.RECOVERED: "#2E7D32",
@@ -995,20 +1032,25 @@ class InjectSentinel:
                     counts[o] += 1
             labels = [o for o in Outcome.ALL if counts[o] > 0] or [
                 Outcome.RECOVERED]
+            labels = labels[::-1]  # recovered on top
             vals = [counts[o] for o in labels]
-            bars = ax.bar(
+            bars = ax.barh(
                 range(len(labels)), vals,
-                color=[outcome_colors[o] for o in labels], width=0.55)
+                color=[outcome_colors[o] for o in labels], height=0.55)
             for rect, v in zip(bars, vals):
                 ax.annotate(
-                    str(v), (rect.get_x() + rect.get_width() / 2, v),
-                    ha="center", va="bottom", fontsize=10)
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels(
-                [o.replace("_", " ") for o in labels], fontsize=9)
-            ax.set_ylabel("count")
-            ax.set_title("outcomes")
-            ax.grid(True, axis="y", alpha=0.2)
+                    f" {v}",
+                    (v, rect.get_y() + rect.get_height() / 2),
+                    ha="left", va="center", fontsize=10, color=ink)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(
+                [o.replace("_", " ") for o in labels], fontsize=9.5)
+            ax.set_title("Outcomes", fontsize=11, color=ink, loc="left")
+            ax.set_xlim(0, max(vals) * 1.15 if vals else 1)
+            ax.xaxis.set_visible(False)
+            _despine(ax)
+            ax.spines["bottom"].set_visible(False)
+            ax.tick_params(axis="y", length=0)
 
             # Panel 3: recovery accuracy — position offset vs DM error.
             ax = axes[2]
@@ -1019,16 +1061,17 @@ class InjectSentinel:
                     continue
                 dm = float(r.get("dm_pc_cm3") or 0)
                 color, marker = dm_style.get(dm, (neutral, "o"))
-                ax.plot([ddm], [off], marker=marker, ms=7, color=color,
+                ax.plot([ddm], [off], marker=marker, ms=6, color=color,
                         ls="none", alpha=0.85)
-            ax.axvline(0.0, color=neutral, lw=1, alpha=0.5)
-            ax.set_xlabel("recovered DM - injected DM (pc/cc)")
+            ax.axvline(0.0, color=neutral, lw=0.8, alpha=0.6, zorder=0)
+            ax.set_xlabel("recovered DM $-$ injected DM (pc cm$^{-3}$)")
             ax.set_ylabel("position offset (arcsec)")
-            ax.set_title("recovery accuracy (recovered shots)")
-            ax.grid(True, alpha=0.2)
+            ax.set_title("Recovery accuracy", fontsize=11, color=ink,
+                         loc="left")
+            _despine(ax)
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(str(out_path), dpi=110, facecolor="white")
+            fig.savefig(str(out_path), dpi=150, facecolor="white")
             return True
         except Exception as exc:  # noqa: BLE001
             LOG.warning("summary plot render failed: %s", exc, exc_info=True)
