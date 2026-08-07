@@ -1050,3 +1050,44 @@ slack_relay:
   # the last check. fallback_sweep_s is a safety-net unconditional full
   # query, in case an mtime update is ever missed.
   fallback_sweep_s: 600.0
+
+# ---------------------------------------------------------------------------
+# Injection sentinel (dsart.services.inject_sentinel). Separate process/unit
+# (systemd/dsart_inject_sentinel.service) on h23: fires one test injection
+# roughly every interval_s through the dashboard's /control/inject (sharing
+# its K lookup + fp16-imager brightness guard), auto-refreshes each DM
+# bucket's K when stale (> k_max_age_s) or measured at a different pointing
+# dec, posts per-injection sent/recovered text messages to Slack, and posts
+# one daily summary plot. Never writes etcd; never touches candidate dirs.
+# C2 skips voltage dumps for matcher-tagged injections
+# (coincidencer._maybe_broadcast_voltage), so sentinel shots cost cube dumps
+# only.
+# ---------------------------------------------------------------------------
+inject_sentinel:
+  enabled: true
+  # REQUIRED before starting the unit: Slack channel ID for injection
+  # traffic. Deliberately NOT the candidates channel — this posts ~24
+  # sent + recovered pairs/day. Create/choose e.g. #dsa110-injections
+  # and put its channel ID here; with it empty the loop still runs and
+  # logs, but no Slack messages are posted.
+  channel: ""
+  token_file: "/home/ubuntu/.config/slack_api_dsa110"   # same dsa110candidates bot
+  token_env: "SLACK_TOKEN_DSA110"
+  dashboard_base_url: "http://localhost:5778"
+  interval_s: 3600.0          # one injection per hour...
+  jitter_s: 300.0             # ...plus/minus 5 min so it never beats with other cadences
+  dm_choices: [500.0, 1000.0, 1500.0, 2000.0]
+  # Target SNR window: comfortably above the 12-sigma C1 floor, and below
+  # the dashboard's 30-sigma-predicted brightness guard even with the
+  # ~25% pixel-straddle scatter. The sentinel never passes allow_bright.
+  target_snr_min: 15.0
+  target_snr_max: 25.0
+  width_samples: 4            # MUST match the K-calibration probe width
+  lm_max_rad: 0.02            # inner FoV; dashboard hard limit is 0.0279
+  k_max_age_s: 86400.0        # daily K refresh per DM bucket
+  k_dec_tol_deg: 0.5          # recalibrate K after a re-point
+  recovery_timeout_s: 720.0
+  summary_hour_utc: 16
+  results_path: "/dataz/dsa110/operations/inject/sentinel_results.jsonl"
+  state_path: "~/.dsa_monitor/inject_sentinel_state.json"
+  summary_dir: "~/.dsa_monitor/inject_sentinel"

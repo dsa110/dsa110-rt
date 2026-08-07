@@ -1,0 +1,1159 @@
+"""Injection sentinel: hourly end-to-end test injections + Slack reporting.
+
+Standalone h23 service (``systemd/dsart_inject_sentinel.service``,
+modeled on the annotation relay). Every ``interval_s`` (default 1 h,
+jittered) it:
+
+1. pre-checks fleet health (mirrors
+   ``tools/dashboard/dsa_monitor/inject_calibration.precheck_calibration_health``
+   — corr_fast heartbeats on all 16 chgroups, search-compute heartbeats
+   on all 8 halves, ``c1_metering_active`` clear);
+2. picks a random DM from ``dm_choices`` and a random target SNR in
+   ``[target_snr_min, target_snr_max]`` — deliberately below the
+   dashboard's ``IMAGER_SAFE_OBSERVED_SNR`` (30σ predicted) brightness
+   guard, which this service never overrides (``allow_bright`` is
+   intentionally not plumbed);
+3. refreshes the DM bucket's K calibration first when it is older than
+   ``k_max_age_s``, missing, or was measured at a pointing declination
+   more than ``k_dec_tol_deg`` away from the current one (the K store
+   itself carries no dec provenance — the sentinel records the dec it
+   observed at calibration time in its own state file);
+4. fires the injection through the dashboard's ``POST /control/inject``
+   (so the K lookup, payload validation, and the fp16-imager brightness
+   guard are shared with operator-fired injections), posts a plain-text
+   "injection sent" Slack message with the full parameter set, and
+   threads a "recovered / NOT recovered" reply once the C2 matcher's
+   ``/mon/dsart/inject/matches/<inj_id>`` doc and the archived event
+   settle;
+5. appends one JSON line per attempt to ``results_path`` and, once a
+   day at ``summary_hour_utc``, posts a summary (counts, per-stage miss
+   attribution, SNR recovery accuracy) with a single PNG — the only
+   image this service ever uploads.
+
+Loss-stage attribution (see ``Outcome``):
+
+* ``missed_search_or_c1`` — the C2 matcher never published a match doc:
+  the search nodes never emitted a coincident C1 row (or C1->C2 transport
+  failed).
+* ``missed_c2`` — a match doc exists (C1 rows arrived and matched) but
+  no archived event referenced the ``inj_id`` within the recovery
+  window: the coincidencer matched members but never fired/archived an
+  event.
+* ``missed_c3`` — an archived, injection-tagged event exists but C3
+  decided something other than KEEP. ``cube_veto.decide`` always KEEPs
+  known injections, so this should never fire; it is logged loudly as
+  an anomaly (it means the injection marker failed to propagate).
+
+Everything is best-effort: a failure in any one cycle (Slack down,
+dashboard restarting, etcd hiccup) is recorded and never aborts the
+loop. The service never writes to etcd and never touches
+``/dataz/dsa110/candidates`` — its only writes are its own JSONL/state/
+PNG files and HTTP POSTs to the dashboard, which owns the etcd side.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import random
+import signal
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import yaml
+
+from dsart.services.slack_notify import SlackNotifier, SlackNotifyConfig
+
+LOG = logging.getLogger("dsart.services.inject_sentinel")
+
+# ---------------------------------------------------------------------------
+# Constants mirrored from the dashboard's inject_calibration module.
+# tools/dashboard/dsa_monitor is not an importable package from the
+# service env, so the handful of values the sentinel needs are pinned
+# here; ``tests/test_inject_sentinel.py`` cross-checks them against the
+# dashboard source so drift is caught in CI, same pattern the matcher
+# uses for ACTIVE_INJECT_PREFIX.
+# ---------------------------------------------------------------------------
+
+#: C2 matcher's per-injection match doc (inject_match.MATCH_EVENT_PREFIX).
+MATCH_EVENT_PREFIX = "/mon/dsart/inject/matches/"
+
+#: DM bucket granularity of the K store (inject_calibration.DM_BUCKET_PC_CC).
+DM_BUCKET_PC_CC = 50.0
+
+#: Probe width every K in the store was measured at
+#: (inject_calibration.DEFAULT_CALIBRATION_WIDTH, NATIVE 32.768 us
+#: samples). Sub-search-sample widths make observed SNR scale linearly
+#: with fluence, so target-SNR shots are only self-consistent at the
+#: calibration width — the sentinel pins its width to this.
+CALIBRATION_WIDTH_SAMPLES = 4
+
+#: Search halves the health gate checks (sid, gpu_half) — mirrors
+#: inject_calibration.precheck_calibration_health's default.
+SEARCH_HALVES: Tuple[Tuple[int, int], ...] = (
+    (1, 0), (1, 1), (2, 0), (2, 1), (9, 0), (9, 1), (13, 0), (13, 1),
+)
+
+#: Heartbeat staleness bounds (inject_calibration.DEFAULT_CORR_FAST_MAX_AGE_S
+#: / DEFAULT_SEARCH_MAX_AGE_S).
+CORR_FAST_MAX_AGE_S = 30.0
+SEARCH_MAX_AGE_S = 30.0
+
+#: Dashboard hard limit is INJECT_LM_MAX_RAD = 0.0279; beyond ~0.02 the
+#: primary beam attenuates and FFT aliasing risk grows (see the
+#: /control/inject docstring), so the sentinel default stays inside it.
+DEFAULT_LM_MAX_RAD = 0.02
+
+
+def bucket_key(dm_pc_cm3: float) -> str:
+    """Mirror of ``inject_calibration.bucket_key`` (``dm{round/50*50:04d}``)."""
+    if not math.isfinite(dm_pc_cm3):
+        raise ValueError(f"dm_pc_cm3={dm_pc_cm3} is not finite")
+    dm_round = max(
+        0, int(round(float(dm_pc_cm3) / DM_BUCKET_PC_CC) * int(DM_BUCKET_PC_CC)),
+    )
+    return f"dm{dm_round:04d}"
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SentinelConfig:
+    enabled: bool = False
+    #: Slack channel + token plumbing (SlackNotifyConfig subset).
+    channel: str = ""
+    token_file: str = ""
+    token_env: str = "SLACK_TOKEN_DSA"
+    slack_timeout_s: float = 10.0
+
+    dashboard_base_url: str = "http://localhost:5778"
+    #: HTTP timeout for dashboard POSTs. /control/inject_calibrate
+    #: blocks through arm + a 30 s match poll, so this must comfortably
+    #: exceed calibrate_poll_timeout_s.
+    http_timeout_s: float = 180.0
+
+    interval_s: float = 3600.0
+    jitter_s: float = 300.0
+
+    dm_choices: Tuple[float, ...] = (500.0, 1000.0, 1500.0, 2000.0)
+    target_snr_min: float = 15.0
+    target_snr_max: float = 25.0
+    width_samples: int = CALIBRATION_WIDTH_SAMPLES
+    profile: str = "gaussian"
+    lm_max_rad: float = DEFAULT_LM_MAX_RAD
+
+    k_max_age_s: float = 86400.0
+    k_dec_tol_deg: float = 0.5
+    calibrate_poll_timeout_s: float = 30.0
+
+    recovery_timeout_s: float = 720.0
+    recovery_poll_s: float = 10.0
+
+    summary_hour_utc: int = 16
+
+    results_path: str = (
+        "/dataz/dsa110/operations/inject/sentinel_results.jsonl"
+    )
+    state_path: str = "~/.dsa_monitor/inject_sentinel_state.json"
+    summary_dir: str = "~/.dsa_monitor/inject_sentinel"
+    candidates_root: str = "/dataz/dsa110/candidates"
+
+    pointing_dec_etcd_key: str = "/mon/array/dec"
+    #: Throttle for repeated "fleet unhealthy, skipping" Slack warnings.
+    unhealthy_warn_interval_s: float = 21600.0
+
+    @classmethod
+    def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "SentinelConfig":
+        d = d or {}
+        dms = d.get("dm_choices", [500.0, 1000.0, 1500.0, 2000.0])
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            channel=str(d.get("channel", "")),
+            token_file=str(d.get("token_file", "")),
+            token_env=str(d.get("token_env", "SLACK_TOKEN_DSA")),
+            slack_timeout_s=float(d.get("slack_timeout_s", 10.0)),
+            dashboard_base_url=str(
+                d.get("dashboard_base_url", "http://localhost:5778")),
+            http_timeout_s=float(d.get("http_timeout_s", 180.0)),
+            interval_s=float(d.get("interval_s", 3600.0)),
+            jitter_s=float(d.get("jitter_s", 300.0)),
+            dm_choices=tuple(float(x) for x in dms),
+            target_snr_min=float(d.get("target_snr_min", 15.0)),
+            target_snr_max=float(d.get("target_snr_max", 25.0)),
+            width_samples=int(
+                d.get("width_samples", CALIBRATION_WIDTH_SAMPLES)),
+            profile=str(d.get("profile", "gaussian")),
+            lm_max_rad=float(d.get("lm_max_rad", DEFAULT_LM_MAX_RAD)),
+            k_max_age_s=float(d.get("k_max_age_s", 86400.0)),
+            k_dec_tol_deg=float(d.get("k_dec_tol_deg", 0.5)),
+            calibrate_poll_timeout_s=float(
+                d.get("calibrate_poll_timeout_s", 30.0)),
+            recovery_timeout_s=float(d.get("recovery_timeout_s", 720.0)),
+            recovery_poll_s=float(d.get("recovery_poll_s", 10.0)),
+            summary_hour_utc=int(d.get("summary_hour_utc", 16)),
+            results_path=str(d.get(
+                "results_path",
+                "/dataz/dsa110/operations/inject/sentinel_results.jsonl")),
+            state_path=str(d.get(
+                "state_path", "~/.dsa_monitor/inject_sentinel_state.json")),
+            summary_dir=str(d.get(
+                "summary_dir", "~/.dsa_monitor/inject_sentinel")),
+            candidates_root=str(d.get(
+                "candidates_root", "/dataz/dsa110/candidates")),
+            pointing_dec_etcd_key=str(d.get(
+                "pointing_dec_etcd_key", "/mon/array/dec")),
+            unhealthy_warn_interval_s=float(
+                d.get("unhealthy_warn_interval_s", 21600.0)),
+        )
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "SentinelConfig":
+        with Path(path).open("r", encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh) or {}
+        return cls.from_dict(doc.get("inject_sentinel"))
+
+
+# ---------------------------------------------------------------------------
+# Outcomes
+# ---------------------------------------------------------------------------
+
+
+class Outcome:
+    """String constants for the per-attempt ``outcome`` field."""
+    RECOVERED = "recovered"
+    MISSED_SEARCH_OR_C1 = "missed_search_or_c1"
+    MISSED_C2 = "missed_c2"
+    MISSED_C3 = "missed_c3"
+    SKIPPED_UNHEALTHY = "skipped_unhealthy"
+    GUARD_REJECTED = "guard_rejected"
+    FIRE_FAILED = "fire_failed"
+
+    MISSES = (MISSED_SEARCH_OR_C1, MISSED_C2, MISSED_C3)
+    ALL = (
+        RECOVERED, MISSED_SEARCH_OR_C1, MISSED_C2, MISSED_C3,
+        SKIPPED_UNHEALTHY, GUARD_REJECTED, FIRE_FAILED,
+    )
+
+
+_MISS_EXPLANATIONS = {
+    Outcome.MISSED_SEARCH_OR_C1: (
+        "lost at search/C1: the C2 matcher never saw a coincident "
+        "candidate from any search half"
+    ),
+    Outcome.MISSED_C2: (
+        "lost at C2: matcher saw candidate rows but the coincidencer "
+        "never archived an event"
+    ),
+    Outcome.MISSED_C3: (
+        "ANOMALY at C3: event archived and injection-tagged but C3 did "
+        "not KEEP it (injections are always kept - marker propagation "
+        "failure, investigate)"
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Sentinel
+# ---------------------------------------------------------------------------
+
+
+class InjectSentinel:
+    """One instance == one poll loop. All collaborators injectable for
+    tests: ``store`` needs ``get_dict(key)``; ``http_post_form`` /
+    ``http_get`` mimic the two ``requests`` calls; ``notifier`` needs
+    ``post_text`` / ``post_file``."""
+
+    def __init__(
+        self,
+        config: SentinelConfig,
+        *,
+        store: Optional[Any] = None,
+        notifier: Optional[Any] = None,
+        http_post_form: Optional[Callable[..., Tuple[int, Dict[str, Any]]]] = None,
+        http_get: Optional[Callable[..., Tuple[int, Dict[str, Any]]]] = None,
+        rng: Optional[random.Random] = None,
+        time_fn: Callable[[], float] = time.time,
+    ) -> None:
+        self._cfg = config
+        self._store = store
+        self._notifier = notifier or SlackNotifier(SlackNotifyConfig(
+            enabled=bool(config.enabled and config.channel),
+            channel=config.channel,
+            token_file=config.token_file,
+            token_env=config.token_env,
+            timeout_s=config.slack_timeout_s,
+        ))
+        self._http_post_form = http_post_form or self._requests_post_form
+        self._http_get = http_get or self._requests_get
+        self._rng = rng or random.Random()
+        self._time = time_fn
+        self._state: Dict[str, Any] = {}
+        self._state_loaded = False
+
+    # ----- plumbing --------------------------------------------------------
+
+    def _get_store(self) -> Any:
+        if self._store is None:
+            from dsautils.dsa_store import DsaStore  # heavy; deferred
+            self._store = DsaStore()
+        return self._store
+
+    def _requests_post_form(
+        self, url: str, fields: Mapping[str, Any],
+    ) -> Tuple[int, Dict[str, Any]]:
+        import requests
+        r = requests.post(
+            url, data={k: str(v) for k, v in fields.items()},
+            timeout=self._cfg.http_timeout_s,
+        )
+        try:
+            doc = r.json()
+        except ValueError:
+            doc = {"ok": False, "error": f"non-json response ({r.status_code})"}
+        return r.status_code, doc
+
+    def _requests_get(self, url: str) -> Tuple[int, Dict[str, Any]]:
+        import requests
+        r = requests.get(url, timeout=self._cfg.http_timeout_s)
+        try:
+            doc = r.json()
+        except ValueError:
+            doc = {"ok": False, "error": f"non-json response ({r.status_code})"}
+        return r.status_code, doc
+
+    def _get_dict(self, key: str) -> Optional[Mapping[str, Any]]:
+        try:
+            raw = self._get_store().get_dict(key)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("etcd get_dict(%s) failed: %s", key, exc)
+            return None
+        return raw if isinstance(raw, Mapping) else None
+
+    # ----- persistent state (last-calibration dec, throttles, summary) ----
+
+    def _load_state(self) -> Dict[str, Any]:
+        if not self._state_loaded:
+            p = Path(self._cfg.state_path).expanduser()
+            try:
+                self._state = json.loads(p.read_text())
+            except (OSError, ValueError):
+                self._state = {}
+            self._state_loaded = True
+        return self._state
+
+    def _save_state(self) -> None:
+        p = Path(self._cfg.state_path).expanduser()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(self._state, indent=1, sort_keys=True))
+            tmp.replace(p)
+        except OSError as exc:
+            LOG.warning("state save to %s failed: %s", p, exc)
+
+    # ----- health gate -----------------------------------------------------
+
+    def check_health(self) -> Tuple[bool, str]:
+        """Mirror of the dashboard's ``precheck_calibration_health``
+        (read-only etcd; see the constants block for provenance)."""
+        now = self._time()
+        stale: List[int] = []
+        for cg in range(16):
+            state = self._get_dict(f"/mon/corr_rt/{cg}/corr_fast")
+            ts = (state or {}).get("ts_wall_unix")
+            if not (
+                isinstance(ts, (int, float))
+                and now - float(ts) <= CORR_FAST_MAX_AGE_S
+            ):
+                stale.append(cg)
+        if stale:
+            return False, "corr_fast_stale: chgroups=" + ",".join(
+                str(c) for c in stale)
+        sick: List[str] = []
+        for sid, g in SEARCH_HALVES:
+            state = self._get_dict(f"/mon/search_rt/{sid}/compute/{g}")
+            ts = (state or {}).get("ts_wall_unix")
+            if not (
+                isinstance(ts, (int, float))
+                and now - float(ts) <= SEARCH_MAX_AGE_S
+            ):
+                sick.append(f"s{sid}g{g}")
+                continue
+            if int((state or {}).get("c1_metering_active") or 0):
+                sick.append(f"s{sid}g{g}")
+        if sick:
+            return False, "search_unhealthy: halves=" + ",".join(sick)
+        return True, "ok"
+
+    def read_pointing_dec(self) -> Optional[float]:
+        """Live pointing dec (deg); mirrors coincidencer._read_pointing_dec."""
+        doc = self._get_dict(self._cfg.pointing_dec_etcd_key)
+        try:
+            dec = float((doc or {})["dec_deg"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(dec) or not -90.0 <= dec <= 90.0:
+            return None
+        return dec
+
+    # ----- K freshness -----------------------------------------------------
+
+    def _get_calibration_entry(self, dm: float) -> Optional[Dict[str, Any]]:
+        url = f"{self._cfg.dashboard_base_url}/control/inject_calibrations"
+        status, doc = self._http_get(url)
+        if status != 200 or not doc.get("ok"):
+            LOG.warning("inject_calibrations GET failed: %s %s", status, doc)
+            return None
+        want = bucket_key(dm)
+        for entry in doc.get("entries") or []:
+            if entry.get("bucket") == want:
+                return dict(entry)
+        return None
+
+    def ensure_k_fresh(self, dm: float) -> Tuple[bool, Dict[str, Any]]:
+        """Recalibrate the DM bucket when K is missing, stale, or was
+        measured at a different pointing dec. Returns ``(usable,
+        info)``; ``usable`` False means the bucket still has no valid K
+        (the cycle is then recorded as fire_failed with the reason)."""
+        cfg = self._cfg
+        bucket = bucket_key(dm)
+        info: Dict[str, Any] = {"bucket": bucket, "recalibrated": False}
+        entry = self._get_calibration_entry(dm)
+        now = self._time()
+        dec_now = self.read_pointing_dec()
+        info["pointing_dec_deg"] = dec_now
+
+        cal_decs = self._load_state().setdefault("k_calibration_dec", {})
+        reasons: List[str] = []
+        if entry is None or not (float(entry.get("K") or 0) > 0):
+            reasons.append("no_k")
+        else:
+            age = now - float(entry.get("last_calibrated_at_unix") or 0)
+            info["k_age_s"] = age
+            if age > cfg.k_max_age_s:
+                reasons.append(f"stale({age / 3600.0:.1f}h)")
+            cal_dec = cal_decs.get(bucket)
+            if (
+                dec_now is not None and cal_dec is not None
+                and abs(float(cal_dec) - dec_now) > cfg.k_dec_tol_deg
+            ):
+                reasons.append(
+                    f"dec_changed({float(cal_dec):.2f}->{dec_now:.2f})")
+
+        if reasons:
+            info["recal_reasons"] = reasons
+            LOG.info("K recal for %s: %s", bucket, ",".join(reasons))
+            status, doc = self._http_post_form(
+                f"{cfg.dashboard_base_url}/control/inject_calibrate",
+                {
+                    "dm_pc_cm3": dm,
+                    "width_samples": cfg.width_samples,
+                    "poll_timeout_s": cfg.calibrate_poll_timeout_s,
+                    "user": "inject_sentinel",
+                },
+            )
+            info["recalibrated"] = bool(doc.get("ok"))
+            info["recal_response_status"] = status
+            if not doc.get("ok"):
+                info["recal_error"] = doc.get(
+                    "error") or doc.get("reason") or f"http {status}"
+                LOG.warning("K recal for %s failed: %s", bucket, info)
+            entry = self._get_calibration_entry(dm)
+            if info["recalibrated"] and dec_now is not None:
+                cal_decs[bucket] = dec_now
+                self._save_state()
+        elif dec_now is not None and bucket not in cal_decs:
+            # First sighting of an already-fresh bucket: adopt the
+            # current dec as its provenance baseline.
+            cal_decs[bucket] = dec_now
+            self._save_state()
+
+        if entry is None or not (float(entry.get("K") or 0) > 0):
+            info["error"] = "no usable K after recalibration attempt"
+            return False, info
+        info["K"] = float(entry["K"])
+        return True, info
+
+    # ----- one injection cycle ---------------------------------------------
+
+    def _pick_params(self) -> Dict[str, Any]:
+        cfg = self._cfg
+        r = self._rng
+        # Uniform over the inner disc-ish box; both axes independently
+        # bounded well inside the dashboard's 0.0279 rad hard limit.
+        return {
+            "dm_pc_cm3": r.choice(cfg.dm_choices),
+            "target_snr": round(
+                r.uniform(cfg.target_snr_min, cfg.target_snr_max), 2),
+            "l_rad": round(r.uniform(-cfg.lm_max_rad, cfg.lm_max_rad), 6),
+            "m_rad": round(r.uniform(-cfg.lm_max_rad, cfg.lm_max_rad), 6),
+            "width_samples": cfg.width_samples,
+            "profile": cfg.profile,
+        }
+
+    def _make_inj_id(self, dm: float) -> str:
+        stamp = datetime.fromtimestamp(
+            self._time(), timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"sentinel_{stamp}_{bucket_key(dm)}"
+
+    def run_cycle(self) -> Dict[str, Any]:
+        """One full attempt. Returns the JSONL record (also appended to
+        ``results_path``). Never raises."""
+        try:
+            record = self._run_cycle_inner()
+        except Exception as exc:  # noqa: BLE001 — the loop must survive
+            LOG.exception("sentinel cycle failed unexpectedly")
+            record = {
+                "ts_unix": self._time(),
+                "outcome": Outcome.FIRE_FAILED,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        record.setdefault("ts_unix", self._time())
+        record["ts_utc"] = datetime.fromtimestamp(
+            record["ts_unix"], timezone.utc).isoformat()
+        self._append_result(record)
+        return record
+
+    def _run_cycle_inner(self) -> Dict[str, Any]:
+        cfg = self._cfg
+        record: Dict[str, Any] = {"ts_unix": self._time()}
+
+        ok, reason = self.check_health()
+        if not ok:
+            record["outcome"] = Outcome.SKIPPED_UNHEALTHY
+            record["reason"] = reason
+            LOG.warning("cycle skipped: %s", reason)
+            self._warn_unhealthy(reason)
+            return record
+
+        params = self._pick_params()
+        record.update(params)
+        dm = params["dm_pc_cm3"]
+
+        usable, k_info = self.ensure_k_fresh(dm)
+        record["k_info"] = k_info
+        record["pointing_dec_deg"] = k_info.get("pointing_dec_deg")
+        if not usable:
+            record["outcome"] = Outcome.FIRE_FAILED
+            record["reason"] = k_info.get("error", "no_k")
+            return record
+
+        inj_id = self._make_inj_id(dm)
+        record["inj_id"] = inj_id
+        status, doc = self._http_post_form(
+            f"{cfg.dashboard_base_url}/control/inject",
+            {
+                "inj_id": inj_id,
+                "l_rad": params["l_rad"],
+                "m_rad": params["m_rad"],
+                "dm_pc_cm3": dm,
+                "target_snr": params["target_snr"],
+                "width_samples": params["width_samples"],
+                "profile": params["profile"],
+            },
+        )
+        record["fire_response_status"] = status
+        if not doc.get("ok"):
+            record["reason"] = doc.get("error") or f"http {status}"
+            record["outcome"] = (
+                Outcome.GUARD_REJECTED
+                if status == 400 and "imager-safe" in str(doc.get("error"))
+                else Outcome.FIRE_FAILED
+            )
+            LOG.warning("inject POST failed (%s): %s", status, record["reason"])
+            return record
+        fired_at = self._time()
+        record["fired_at_unix"] = fired_at
+        record["fluence_jy_ms"] = (doc.get("val") or {}).get("fluence_jy_ms")
+
+        sent_ts = self._post_sent_message(record)
+
+        recovery = self.watch_recovery(inj_id, fired_at)
+        record.update(recovery)
+
+        self._post_recovery_message(record, thread_ts=sent_ts)
+        return record
+
+    # ----- Slack messages (plain text only) ---------------------------------
+
+    def _post_sent_message(self, record: Mapping[str, Any]) -> Optional[str]:
+        dec = record.get("pointing_dec_deg")
+        text = (
+            "injection sent: `{inj_id}`\n"
+            "DM {dm:.0f} pc/cc | target SNR {snr:.1f} | "
+            "fluence {fl} Jy*ms | width {w} native | "
+            "(l, m) = ({l:+.5f}, {m:+.5f}) rad | pointing dec {dec}"
+        ).format(
+            inj_id=record.get("inj_id"),
+            dm=float(record.get("dm_pc_cm3") or 0),
+            snr=float(record.get("target_snr") or 0),
+            fl=(
+                f"{float(record['fluence_jy_ms']):.3g}"
+                if record.get("fluence_jy_ms") is not None else "n/a"
+            ),
+            w=record.get("width_samples"),
+            l=float(record.get("l_rad") or 0),
+            m=float(record.get("m_rad") or 0),
+            dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
+        )
+        resp = self._notifier.post_text(text)
+        if not resp.get("ok"):
+            LOG.warning("slack sent-post failed: %s", resp)
+            return None
+        return resp.get("ts")
+
+    def _post_recovery_message(
+        self, record: Mapping[str, Any], *, thread_ts: Optional[str],
+    ) -> None:
+        outcome = record.get("outcome")
+        if outcome == Outcome.RECOVERED:
+            dm_obs = record.get("observed_dm_pc_cm3")
+            text = (
+                "recovered: `{inj_id}` -> event `{event}`\n"
+                "SNR {osnr:.1f} (target {tsnr:.1f}, ratio {ratio:.2f}) | "
+                "DM {odm} (injected {idm:.0f}, delta {ddm}) | "
+                "(l, m) = ({ol:+.5f}, {om:+.5f}) rad, offset {off} arcsec "
+                "(injected ({il:+.5f}, {im:+.5f})) | "
+                "found by s{sid}g{g} | cubes {cubes} | C3 {c3}"
+            ).format(
+                inj_id=record.get("inj_id"),
+                event=record.get("event") or "(pending archive)",
+                osnr=float(record.get("observed_snr") or 0),
+                tsnr=float(record.get("target_snr") or 0),
+                ratio=float(record.get("snr_ratio") or 0),
+                odm=(f"{float(dm_obs):.1f}" if dm_obs is not None else "n/a"),
+                idm=float(record.get("dm_pc_cm3") or 0),
+                ddm=(
+                    f"{float(record['delta_dm_pc_cm3']):+.1f}"
+                    if record.get("delta_dm_pc_cm3") is not None else "n/a"
+                ),
+                ol=float(record.get("observed_l_rad") or 0),
+                om=float(record.get("observed_m_rad") or 0),
+                off=(
+                    f"{float(record['offset_arcsec']):.0f}"
+                    if record.get("offset_arcsec") is not None else "n/a"
+                ),
+                il=float(record.get("l_rad") or 0),
+                im=float(record.get("m_rad") or 0),
+                sid=record.get("observed_search_node_id"),
+                g=record.get("observed_gpu_half"),
+                cubes=record.get("cubes", "n/a"),
+                c3=record.get("c3_decision", "pending"),
+            )
+        else:
+            text = (
+                "NOT recovered: `{inj_id}` (DM {dm:.0f}, target SNR "
+                "{snr:.1f})\n{why}"
+            ).format(
+                inj_id=record.get("inj_id"),
+                dm=float(record.get("dm_pc_cm3") or 0),
+                snr=float(record.get("target_snr") or 0),
+                why=_MISS_EXPLANATIONS.get(
+                    str(outcome), f"outcome={outcome}"),
+            )
+            if outcome == Outcome.MISSED_C3:
+                LOG.error(
+                    "C3 rejected a tagged injection (%s) - marker "
+                    "propagation failure, investigate", record.get("inj_id"),
+                )
+        resp = self._notifier.post_text(text, thread_ts=thread_ts)
+        if not resp.get("ok"):
+            LOG.warning("slack recovery-post failed: %s", resp)
+
+    def _warn_unhealthy(self, reason: str) -> None:
+        state = self._load_state()
+        last = float(state.get("last_unhealthy_warn_unix") or 0)
+        if self._time() - last < self._cfg.unhealthy_warn_interval_s:
+            return
+        resp = self._notifier.post_text(
+            f"injection sentinel: fleet unhealthy, skipping cycle ({reason})",
+        )
+        if resp.get("ok"):
+            state["last_unhealthy_warn_unix"] = self._time()
+            self._save_state()
+
+    # ----- recovery watch ---------------------------------------------------
+
+    def watch_recovery(
+        self, inj_id: str, fired_at: float,
+    ) -> Dict[str, Any]:
+        """Poll the matcher doc + candidate archive until the injection
+        settles or ``recovery_timeout_s`` elapses. Returns the fields to
+        merge into the attempt record (``outcome`` + observed values)."""
+        cfg = self._cfg
+        deadline = fired_at + cfg.recovery_timeout_s
+        match_doc: Optional[Mapping[str, Any]] = None
+        event: Optional[str] = None
+        out: Dict[str, Any] = {}
+        while True:
+            if match_doc is None:
+                match_doc = self._get_dict(MATCH_EVENT_PREFIX + inj_id)
+            if match_doc is not None and event is None:
+                event = self._find_event_for_inj(inj_id, fired_at)
+            if event is not None:
+                break
+            if self._time() >= deadline:
+                break
+            self._sleep(cfg.recovery_poll_s)
+
+        if match_doc is None:
+            out["outcome"] = Outcome.MISSED_SEARCH_OR_C1
+            return out
+
+        best = match_doc.get("best") or {}
+        out["observed_snr"] = _as_float(best.get("observed_snr"))
+        out["observed_dm_pc_cm3"] = _as_float(best.get("observed_dm_pc_cm3"))
+        out["observed_l_rad"] = _as_float(best.get("observed_l_rad"))
+        out["observed_m_rad"] = _as_float(best.get("observed_m_rad"))
+        out["observed_search_node_id"] = best.get("observed_search_node_id")
+        out["observed_gpu_half"] = best.get("observed_gpu_half")
+        out["n_matches"] = match_doc.get("n_matches")
+        inj = match_doc.get("active") or {}
+        self._compute_deltas(out, inj)
+
+        if event is None:
+            out["outcome"] = Outcome.MISSED_C2
+            return out
+        out["event"] = event
+        out.update(self._read_event_details(event))
+        if out.get("c3_keep") is False:
+            out["outcome"] = Outcome.MISSED_C3
+        else:
+            out["outcome"] = Outcome.RECOVERED
+        return out
+
+    def _compute_deltas(
+        self, out: Dict[str, Any], inj: Mapping[str, Any],
+    ) -> None:
+        il, im = _as_float(inj.get("l_rad")), _as_float(inj.get("m_rad"))
+        idm = _as_float(inj.get("dm_pc_cm3"))
+        tsnr = _as_float(inj.get("target_snr"))
+        ol, om = out.get("observed_l_rad"), out.get("observed_m_rad")
+        if None not in (il, im, ol, om):
+            out["delta_l_rad"] = ol - il
+            out["delta_m_rad"] = om - im
+            out["offset_arcsec"] = math.hypot(
+                ol - il, om - im) * 180.0 / math.pi * 3600.0
+        if idm is not None and out.get("observed_dm_pc_cm3") is not None:
+            out["delta_dm_pc_cm3"] = out["observed_dm_pc_cm3"] - idm
+        if tsnr and out.get("observed_snr") is not None:
+            out["snr_ratio"] = out["observed_snr"] / tsnr
+
+    def _find_event_for_inj(
+        self, inj_id: str, fired_at: float,
+    ) -> Optional[str]:
+        """Scan recently-modified candidate dirs for a Level3 JSON whose
+        ``injection.inj_ids`` names this injection. Read-only."""
+        root = Path(self._cfg.candidates_root)
+        try:
+            entries = list(root.iterdir())
+        except OSError as exc:
+            LOG.warning("candidates root %s unreadable: %s", root, exc)
+            return None
+        for d in entries:
+            try:
+                if not d.is_dir() or d.stat().st_mtime < fired_at - 60.0:
+                    continue
+                l3 = d / "Level3" / f"{d.name}.json"
+                if not l3.is_file():
+                    continue
+                doc = json.loads(l3.read_text())
+            except (OSError, ValueError):
+                continue
+            inj_ids = ((doc.get("injection") or {}).get("inj_ids")) or []
+            if inj_id in inj_ids:
+                return d.name
+        return None
+
+    def _read_event_details(self, event: str) -> Dict[str, Any]:
+        """Cube count + C3 decision for an archived event (read-only)."""
+        out: Dict[str, Any] = {}
+        ev_dir = Path(self._cfg.candidates_root) / event
+        try:
+            out["cubes"] = len(list((ev_dir / "cubes").glob("*.npz")))
+        except OSError:
+            out["cubes"] = None
+        c3_path = ev_dir / "C3_decision.json"
+        if c3_path.is_file():
+            try:
+                c3 = json.loads(c3_path.read_text())
+                out["c3_keep"] = bool(c3.get("keep"))
+                out["c3_decision"] = "KEEP" if c3.get("keep") else "REJECT"
+            except (OSError, ValueError):
+                pass
+        return out
+
+    # ----- results log -------------------------------------------------------
+
+    def _append_result(self, record: Mapping[str, Any]) -> None:
+        p = Path(self._cfg.results_path)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            LOG.warning("results append to %s failed: %s", p, exc)
+
+    def load_results_since(self, since_unix: float) -> List[Dict[str, Any]]:
+        p = Path(self._cfg.results_path)
+        rows: List[Dict[str, Any]] = []
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if float(row.get("ts_unix") or 0) >= since_unix:
+                        rows.append(row)
+        except OSError:
+            pass
+        return rows
+
+    # ----- daily summary -----------------------------------------------------
+
+    def summary_due(self) -> bool:
+        now = datetime.fromtimestamp(self._time(), timezone.utc)
+        if now.hour < int(self._cfg.summary_hour_utc):
+            return False
+        last = str(self._load_state().get("last_summary_date") or "")
+        return last != now.strftime("%Y-%m-%d")
+
+    def compute_summary_stats(
+        self, rows: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        by_outcome: Dict[str, int] = {}
+        by_dm: Dict[str, Dict[str, int]] = {}
+        ratios: List[float] = []
+        for r in rows:
+            outcome = str(r.get("outcome") or "unknown")
+            by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+            dm = r.get("dm_pc_cm3")
+            if dm is not None:
+                key = f"{float(dm):.0f}"
+                slot = by_dm.setdefault(key, {"injected": 0, "recovered": 0})
+                if outcome not in (
+                    Outcome.SKIPPED_UNHEALTHY, Outcome.GUARD_REJECTED,
+                    Outcome.FIRE_FAILED,
+                ):
+                    slot["injected"] += 1
+                if outcome == Outcome.RECOVERED:
+                    slot["recovered"] += 1
+            if r.get("snr_ratio") is not None:
+                ratios.append(float(r["snr_ratio"]))
+        injected = sum(
+            v for k, v in by_outcome.items()
+            if k in (Outcome.RECOVERED,) + Outcome.MISSES
+        )
+        recovered = by_outcome.get(Outcome.RECOVERED, 0)
+        stats: Dict[str, Any] = {
+            "injected": injected,
+            "recovered": recovered,
+            "by_outcome": by_outcome,
+            "by_dm": by_dm,
+        }
+        if ratios:
+            ratios.sort()
+            stats["snr_ratio_median"] = ratios[len(ratios) // 2]
+            stats["snr_ratio_min"] = ratios[0]
+            stats["snr_ratio_max"] = ratios[-1]
+        return stats
+
+    def _summary_text(self, stats: Mapping[str, Any]) -> str:
+        lines = [
+            "injection sentinel: 24 h summary",
+            "{inj} injected, {rec} recovered".format(
+                inj=stats.get("injected", 0), rec=stats.get("recovered", 0)),
+        ]
+        by_dm = stats.get("by_dm") or {}
+        if by_dm:
+            lines.append("per DM: " + " | ".join(
+                f"DM {dm}: {v['recovered']}/{v['injected']}"
+                for dm, v in sorted(by_dm.items(), key=lambda kv: float(kv[0]))
+            ))
+        by_outcome = dict(stats.get("by_outcome") or {})
+        misses = {
+            k: v for k, v in by_outcome.items() if k in Outcome.MISSES and v
+        }
+        if misses:
+            lines.append("missed: " + ", ".join(
+                f"{v} {k}" for k, v in sorted(misses.items())))
+        skipped = by_outcome.get(Outcome.SKIPPED_UNHEALTHY, 0)
+        failed = (
+            by_outcome.get(Outcome.FIRE_FAILED, 0)
+            + by_outcome.get(Outcome.GUARD_REJECTED, 0)
+        )
+        if skipped or failed:
+            lines.append(
+                f"{skipped} cycles skipped (fleet unhealthy), "
+                f"{failed} fire failures")
+        if stats.get("snr_ratio_median") is not None:
+            lines.append(
+                "observed/target SNR: median {med:.2f} "
+                "(range {lo:.2f}-{hi:.2f})".format(
+                    med=stats["snr_ratio_median"],
+                    lo=stats["snr_ratio_min"], hi=stats["snr_ratio_max"]))
+        return "\n".join(lines)
+
+    def render_summary_plot(
+        self, rows: Sequence[Mapping[str, Any]], out_path: Path,
+    ) -> bool:
+        """Three-panel PNG: SNR recovery timeline, outcome counts,
+        DM/position accuracy. Same headless idiom as sky_monitor.py
+        (Figure + Agg, no pyplot). Returns False on any failure."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg", force=True)
+            from matplotlib.figure import Figure
+            from matplotlib.lines import Line2D
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("matplotlib unavailable: %s", exc)
+            return False
+        try:
+            # Fixed identity encoding per DM bucket (Okabe-Ito hues,
+            # CVD-safe; marker shape doubles the encoding so identity
+            # never rides on color alone).
+            dm_style = {
+                500.0: ("#0072B2", "o"),
+                1000.0: ("#E69F00", "s"),
+                1500.0: ("#009E73", "^"),
+                2000.0: ("#CC79A7", "D"),
+            }
+            miss_color = "#C62828"
+            neutral = "#9E9E9E"
+
+            fired = [
+                r for r in rows
+                if r.get("outcome") in (Outcome.RECOVERED,) + Outcome.MISSES
+            ]
+            fig = Figure(figsize=(12, 9), constrained_layout=True)
+            axes = fig.subplots(3, 1)
+
+            # Panel 1: observed vs target SNR over time.
+            ax = axes[0]
+            for r in fired:
+                t = datetime.fromtimestamp(
+                    float(r["ts_unix"]), timezone.utc)
+                dm = float(r.get("dm_pc_cm3") or 0)
+                color, marker = dm_style.get(dm, (neutral, "o"))
+                target = _as_float(r.get("target_snr"))
+                observed = _as_float(r.get("observed_snr"))
+                if target is not None:
+                    ax.plot([t], [target], marker="_", ms=14, mew=1.5,
+                            color=neutral, ls="none")
+                if observed is not None:
+                    if target is not None:
+                        ax.plot([t, t], [target, observed],
+                                color=color, lw=1, alpha=0.6)
+                    ax.plot([t], [observed], marker=marker, ms=7,
+                            color=color, ls="none")
+                elif target is not None:
+                    ax.plot([t], [0.0], marker="x", ms=9, mew=2,
+                            color=miss_color, ls="none")
+            ax.set_ylabel("SNR")
+            ax.set_title(
+                "injections, last 24 h: observed SNR (marker, by DM) vs "
+                "target (gray tick); misses at 0")
+            handles = [
+                Line2D([], [], marker=m, color=c, ls="none", ms=7,
+                       label=f"DM {dm:.0f}")
+                for dm, (c, m) in sorted(dm_style.items())
+            ]
+            handles.append(Line2D([], [], marker="x", color=miss_color,
+                                  ls="none", ms=8, label="missed"))
+            ax.legend(handles=handles, loc="upper left", ncol=5,
+                      frameon=False, fontsize=9)
+            ax.grid(True, alpha=0.2)
+
+            # Panel 2: outcome counts (status colors; one bar per outcome).
+            ax = axes[1]
+            outcome_colors = {
+                Outcome.RECOVERED: "#2E7D32",
+                Outcome.MISSED_SEARCH_OR_C1: "#C62828",
+                Outcome.MISSED_C2: "#E65100",
+                Outcome.MISSED_C3: "#6A1B9A",
+                Outcome.SKIPPED_UNHEALTHY: neutral,
+                Outcome.GUARD_REJECTED: neutral,
+                Outcome.FIRE_FAILED: neutral,
+            }
+            counts = {o: 0 for o in Outcome.ALL}
+            for r in rows:
+                o = str(r.get("outcome") or "")
+                if o in counts:
+                    counts[o] += 1
+            labels = [o for o in Outcome.ALL if counts[o] > 0] or [
+                Outcome.RECOVERED]
+            vals = [counts[o] for o in labels]
+            bars = ax.bar(
+                range(len(labels)), vals,
+                color=[outcome_colors[o] for o in labels], width=0.55)
+            for rect, v in zip(bars, vals):
+                ax.annotate(
+                    str(v), (rect.get_x() + rect.get_width() / 2, v),
+                    ha="center", va="bottom", fontsize=10)
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(
+                [o.replace("_", " ") for o in labels], fontsize=9)
+            ax.set_ylabel("count")
+            ax.set_title("outcomes")
+            ax.grid(True, axis="y", alpha=0.2)
+
+            # Panel 3: recovery accuracy — position offset vs DM error.
+            ax = axes[2]
+            for r in fired:
+                off = _as_float(r.get("offset_arcsec"))
+                ddm = _as_float(r.get("delta_dm_pc_cm3"))
+                if off is None or ddm is None:
+                    continue
+                dm = float(r.get("dm_pc_cm3") or 0)
+                color, marker = dm_style.get(dm, (neutral, "o"))
+                ax.plot([ddm], [off], marker=marker, ms=7, color=color,
+                        ls="none", alpha=0.85)
+            ax.axvline(0.0, color=neutral, lw=1, alpha=0.5)
+            ax.set_xlabel("recovered DM - injected DM (pc/cc)")
+            ax.set_ylabel("position offset (arcsec)")
+            ax.set_title("recovery accuracy (recovered shots)")
+            ax.grid(True, alpha=0.2)
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(str(out_path), dpi=110, facecolor="white")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("summary plot render failed: %s", exc, exc_info=True)
+            return False
+
+    def post_daily_summary(self) -> Dict[str, Any]:
+        """Compute stats + render + upload; stamps state so it runs once
+        per UTC day. Never raises."""
+        now = self._time()
+        rows = self.load_results_since(now - 86400.0)
+        stats = self.compute_summary_stats(rows)
+        text = self._summary_text(stats)
+        day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+        png = Path(self._cfg.summary_dir).expanduser() / (
+            f"inject_summary_{day}.png")
+        plotted = self.render_summary_plot(rows, png)
+        if plotted:
+            resp = self._notifier.post_file(
+                png, title=f"injection summary {day}",
+                initial_comment=text,
+            )
+        else:
+            resp = self._notifier.post_text(
+                text + "\n(summary plot render failed - see journal)")
+        if resp.get("ok"):
+            self._load_state()["last_summary_date"] = day
+            self._save_state()
+        else:
+            LOG.warning("daily summary post failed: %s", resp)
+        return {"ok": bool(resp.get("ok")), "stats": stats, "png": str(png)}
+
+    # ----- loop --------------------------------------------------------------
+
+    _stop_event: Optional[threading.Event] = None
+
+    def _sleep(self, seconds: float) -> None:
+        ev = self._stop_event
+        if ev is not None:
+            ev.wait(seconds)
+        else:
+            time.sleep(seconds)
+
+    def run_forever(self, stop_event: Optional[threading.Event] = None) -> None:
+        cfg = self._cfg
+        stop_event = stop_event or threading.Event()
+        self._stop_event = stop_event
+        LOG.info(
+            "inject_sentinel: starting (interval=%.0fs jitter=%.0fs "
+            "dms=%s snr=[%.1f, %.1f] channel=%s)",
+            cfg.interval_s, cfg.jitter_s, list(cfg.dm_choices),
+            cfg.target_snr_min, cfg.target_snr_max, cfg.channel or "(none)",
+        )
+        while not stop_event.is_set():
+            record = self.run_cycle()
+            LOG.info(
+                "cycle done: outcome=%s inj_id=%s",
+                record.get("outcome"), record.get("inj_id"),
+            )
+            if self.summary_due():
+                summary = self.post_daily_summary()
+                LOG.info("daily summary posted: ok=%s", summary.get("ok"))
+            delay = cfg.interval_s + self._rng.uniform(
+                -cfg.jitter_s, cfg.jitter_s)
+            stop_event.wait(max(60.0, delay))
+        LOG.info("inject_sentinel: stopped")
+
+
+def _as_float(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Hourly injection sentinel with Slack reporting")
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument(
+        "--summary-now", action="store_true",
+        help="render + post the 24 h summary immediately and exit")
+    parser.add_argument(
+        "--once", action="store_true",
+        help="run a single injection cycle and exit (smoke test)")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    cfg = SentinelConfig.from_yaml(args.config)
+    if not cfg.enabled and not (args.summary_now or args.once):
+        LOG.error(
+            "inject_sentinel: disabled in config (inject_sentinel.enabled); "
+            "refusing to start the loop")
+        return 2
+    sentinel = InjectSentinel(cfg)
+
+    if args.summary_now:
+        result = sentinel.post_daily_summary()
+        print(json.dumps(result.get("stats", {}), indent=1, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    if args.once:
+        record = sentinel.run_cycle()
+        print(json.dumps(record, indent=1, sort_keys=True, default=str))
+        return 0
+
+    stop_event = threading.Event()
+
+    def _handle_signal(signum: int, frame: Any) -> None:
+        LOG.info("inject_sentinel: received signal %s, shutting down", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    sentinel.run_forever(stop_event)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

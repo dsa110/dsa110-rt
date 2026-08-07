@@ -1,0 +1,31 @@
+[Unit]
+Description=DSA-110 dsart-rt hourly injection sentinel with Slack reporting (h23)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# USER unit under the operator account (systemctl --user), same as
+# dsart_c2/c3/slack_relay on h23. Fires test injections through the
+# dashboard's /control/inject (localhost:5778), reads etcd + the
+# candidates archive read-only, and appends to its own JSONL under
+# /dataz/dsa110/operations/inject/. Modeled on dsart_slack_relay.service.
+WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.services.inject_sentinel --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
+Environment=PATH=/home/ubuntu/anaconda3/envs/dsart_h23/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+KillMode=mixed
+
+LimitNOFILE=16384
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsart_inject_sentinel
+
+[Install]
+WantedBy=default.target
