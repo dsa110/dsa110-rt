@@ -1065,12 +1065,11 @@ slack_relay:
 # ---------------------------------------------------------------------------
 inject_sentinel:
   enabled: true
-  # REQUIRED before starting the unit: Slack channel ID for injection
-  # traffic. Deliberately NOT the candidates channel — this posts ~24
-  # sent + recovered pairs/day. Create/choose e.g. #dsa110-injections
-  # and put its channel ID here; with it empty the loop still runs and
-  # logs, but no Slack messages are posted.
-  channel: ""
+  # Same channel as the candidate cards (operator decision 2026-08-07:
+  # keep injection traffic where the team already looks, ~48 short
+  # messages/day, recovered/miss replies threaded). With it empty the
+  # loop still runs and logs, but no Slack messages are posted.
+  channel: "C01NUV2M0HM"
   token_file: "/home/ubuntu/.config/slack_api_dsa110"   # same dsa110candidates bot
   token_env: "SLACK_TOKEN_DSA110"
   dashboard_base_url: "http://localhost:5778"
