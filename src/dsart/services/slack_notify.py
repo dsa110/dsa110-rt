@@ -195,6 +195,85 @@ class SlackNotifier:
                 "slack_notify %s: unexpected failure (followup)", name)
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    def post_text(
+        self,
+        text: str,
+        *,
+        thread_ts: Optional[str] = None,
+        reply_broadcast: bool = False,
+    ) -> Dict[str, Any]:
+        """Post a plain text message to the configured channel.
+
+        General-purpose entry point for non-C3 producers (e.g. the
+        injection sentinel). ``thread_ts`` threads the message onto an
+        existing one. Returns ``{"ok": True, "ts": <message ts>}`` on
+        success, ``{"ok": False, "error": ...}`` otherwise. Always
+        returns a status dict, never raises.
+        """
+        if not self._cfg.enabled:
+            return {"ok": False, "error": "disabled"}
+        try:
+            token = self._token()
+            if not token:
+                return {"ok": False, "error": "no_token"}
+            payload: Dict[str, Any] = {
+                "channel": self._cfg.channel,
+                "text": text,
+            }
+            if thread_ts:
+                payload["thread_ts"] = thread_ts
+                if reply_broadcast:
+                    payload["reply_broadcast"] = True
+            resp = self._api_post("chat.postMessage", token, payload)
+            if not resp or not resp.get("ok"):
+                return {
+                    "ok": False,
+                    "error": (resp or {}).get("error", "request_failed"),
+                }
+            return {"ok": True, "ts": resp.get("ts")}
+        except Exception as exc:  # noqa: BLE001 — never break the caller
+            LOG.exception("slack_notify: unexpected failure (post_text)")
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def post_file(
+        self,
+        path: Path,
+        *,
+        title: Optional[str] = None,
+        initial_comment: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Upload a file (e.g. a summary plot PNG) to the configured
+        channel via the external-upload flow, optionally into a thread
+        and with a leading comment. Returns ``{"ok": True, "ts": <share
+        message ts or None>}`` on success. Always returns a status
+        dict, never raises."""
+        if not self._cfg.enabled:
+            return {"ok": False, "error": "disabled"}
+        try:
+            token = self._token()
+            if not token:
+                return {"ok": False, "error": "no_token"}
+            p = Path(path)
+            if not p.is_file():
+                return {"ok": False, "error": f"not_a_file: {p}"}
+            ok, doc = self._upload_file(
+                token, p,
+                title=title,
+                channel=self._cfg.channel,
+                thread_ts=thread_ts,
+                initial_comment=initial_comment,
+            )
+            if not ok or not doc:
+                return {"ok": False, "error": "upload_failed"}
+            ts = self._poll_file_share_ts(
+                token, doc["file_id"], self._cfg.channel,
+            )
+            return {"ok": True, "ts": ts, "file_id": doc["file_id"]}
+        except Exception as exc:  # noqa: BLE001 — never break the caller
+            LOG.exception("slack_notify: unexpected failure (post_file)")
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     # ----- internals -------------------------------------------------------
 
     def _token(self) -> Optional[str]:
