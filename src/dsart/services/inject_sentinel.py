@@ -26,9 +26,10 @@ jittered) it:
    ``/mon/dsart/inject/matches/<inj_id>`` doc and the archived event
    settle;
 5. appends one JSON line per attempt to ``results_path`` and, once a
-   day at ``summary_hour_utc``, posts a summary (counts, per-stage miss
-   attribution, SNR recovery accuracy) with a single PNG — the only
-   image this service ever uploads.
+   day at ``summary_hour_utc``, posts a summary text (counts, per-stage
+   miss attribution, SNR recovery stats) with the publication-style
+   summary figures threaded under it — the only images this service
+   ever uploads.
 
 Loss-stage attribution (see ``Outcome``):
 
@@ -501,12 +502,13 @@ class InjectSentinel:
         }
 
     def _make_inj_id(self, dm: float) -> str:
-        """Short, readable, unique at one shot/hour: ``inj_0807_0315``
-        (UTC month-day + hour-minute). DM and the rest of the
-        parameters live in the Slack message / JSONL row, not the id."""
+        """Short, readable, unique at one shot/hour:
+        ``inj_070826_0315`` (UTC day-month-2-digit-year + hour-minute).
+        DM and the rest of the parameters live in the Slack message /
+        JSONL row, not the id."""
         del dm
         stamp = datetime.fromtimestamp(
-            self._time(), timezone.utc).strftime("%m%d_%H%M")
+            self._time(), timezone.utc).strftime("%d%m%y_%H%M")
         return f"inj_{stamp}"
 
     def run_cycle(self) -> Dict[str, Any]:
@@ -930,216 +932,285 @@ class InjectSentinel:
                     lo=stats["snr_ratio_min"], hi=stats["snr_ratio_max"]))
         return "\n".join(lines)
 
-    def render_summary_plot(
-        self, rows: Sequence[Mapping[str, Any]], out_path: Path,
-    ) -> bool:
-        """Three-panel PNG: SNR recovery timeline, outcome counts,
-        DM/position accuracy. Same headless idiom as sky_monitor.py
-        (Figure + Agg, no pyplot). Returns False on any failure."""
+    # ----- daily summary figures ---------------------------------------------
+
+    #: Fixed identity encoding per DM bucket (Okabe-Ito hues, CVD-safe;
+    #: marker shape doubles the encoding so identity never rides on
+    #: color alone).
+    _DM_STYLE = {
+        500.0: ("#0072B2", "o"),
+        1000.0: ("#E69F00", "s"),
+        1500.0: ("#009E73", "^"),
+        2000.0: ("#CC79A7", "D"),
+    }
+    _MISS_COLOR = "#C62828"
+    _NEUTRAL = "#9E9E9E"
+    _INK = "#262626"
+
+    @staticmethod
+    def _pub_rc() -> Dict[str, Any]:
+        """Publication-style rcParams (applied via rc_context so
+        nothing leaks into other users of matplotlib in-process)."""
+        return {
+            "font.family": "serif",
+            "font.serif": ["DejaVu Serif"],
+            "mathtext.fontset": "dejavuserif",
+            "font.size": 11.0,
+            "axes.labelsize": 11.5,
+            "axes.linewidth": 0.8,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.major.size": 4.0,
+            "ytick.major.size": 4.0,
+            "xtick.minor.size": 2.2,
+            "ytick.minor.size": 2.2,
+            "xtick.minor.visible": True,
+            "ytick.minor.visible": True,
+            "xtick.top": False,
+            "ytick.right": False,
+            "legend.frameon": False,
+            "legend.fontsize": 10.0,
+            "savefig.dpi": 200,
+            "savefig.facecolor": "white",
+            "figure.constrained_layout.use": True,
+        }
+
+    def _despine(self, ax: Any) -> None:
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(self._INK)
+        ax.tick_params(colors=self._INK, labelsize=10)
+        ax.yaxis.label.set_color(self._INK)
+        ax.xaxis.label.set_color(self._INK)
+
+    def _date_span(self, rows: Sequence[Mapping[str, Any]]) -> str:
+        ts_list = [float(r["ts_unix"]) for r in rows
+                   if r.get("ts_unix") is not None]
+        if not ts_list:
+            return "last 24 h"
+        d0 = datetime.fromtimestamp(min(ts_list), timezone.utc)
+        d1 = datetime.fromtimestamp(max(ts_list), timezone.utc)
+        if d0.date() == d1.date():
+            return f"{d0:%Y-%m-%d} {d0:%H:%M}–{d1:%H:%M} UTC"
+        return f"{d0:%Y-%m-%d %H:%M} – {d1:%Y-%m-%d %H:%M} UTC"
+
+    def _dm_legend_handles(self, line2d: Any, with_miss: bool) -> List[Any]:
+        handles = [
+            line2d([], [], marker=m, color=c, ls="none", ms=7,
+                   mec="white", mew=0.7, label=f"DM {dm:.0f}")
+            for dm, (c, m) in sorted(self._DM_STYLE.items())
+        ]
+        if with_miss:
+            handles.append(line2d(
+                [], [], marker="x", color=self._MISS_COLOR, ls="none",
+                ms=7, mew=1.6, label="missed"))
+        return handles
+
+    def render_summary_plots(
+        self, rows: Sequence[Mapping[str, Any]], out_dir: Path,
+    ) -> List[Tuple[Path, str]]:
+        """Render the daily summary as SEPARATE publication-style
+        figures (serif, inward ticks, despined, white-edged markers,
+        legends outside the data area). Returns ``[(path, title), ...]``
+        for the figures that rendered; empty list if matplotlib is
+        unavailable or everything failed."""
         try:
             import matplotlib
             matplotlib.use("Agg", force=True)
+            from matplotlib import rc_context
             from matplotlib.figure import Figure
             from matplotlib.lines import Line2D
         except Exception as exc:  # noqa: BLE001
             LOG.warning("matplotlib unavailable: %s", exc)
-            return False
-        try:
-            # Publication styling: no grid, top/right spines removed,
-            # thin remaining spines, outward ticks, muted ink. Fixed
-            # identity encoding per DM bucket (Okabe-Ito hues, CVD-safe;
-            # marker shape doubles the encoding so identity never rides
-            # on color alone).
-            dm_style = {
-                500.0: ("#0072B2", "o"),
-                1000.0: ("#E69F00", "s"),
-                1500.0: ("#009E73", "^"),
-                2000.0: ("#CC79A7", "D"),
-            }
-            miss_color = "#C62828"
-            neutral = "#9E9E9E"
-            ink = "#333333"
+            return []
 
-            def _despine(ax):
-                for side in ("top", "right"):
+        fired = [
+            r for r in rows
+            if r.get("outcome") in (Outcome.RECOVERED,) + Outcome.MISSES
+        ]
+        span = self._date_span(fired or rows)
+        out_dir = Path(out_dir)
+        out: List[Tuple[Path, str]] = []
+
+        def _save(fig: Any, name: str, title: str) -> None:
+            path = out_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(str(path))
+            out.append((path, title))
+
+        with rc_context(self._pub_rc()):
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                # Figure 1: recovered vs injected S/N against the 1:1
+                # line. Square axes, equal limits, legend fully outside
+                # (a horizontal row above the axes) so it can never
+                # touch the data or the reference line.
+                fig = Figure(figsize=(6.4, 5.4))
+                ax = fig.add_subplot(111)
+                targets = [_as_float(r.get("target_snr")) for r in fired]
+                targets = [t for t in targets if t is not None]
+                observed = [_as_float(r.get("observed_snr")) for r in fired]
+                observed = [o for o in observed if o is not None]
+                lo = min(targets) - 2 if targets else 10.0
+                hi = max(targets + observed) + 2 if targets else 30.0
+                ax.plot([lo, hi], [lo, hi], color=self._NEUTRAL, lw=0.9,
+                        ls=(0, (5, 3)), zorder=1)
+                lbl = lo + 0.93 * (hi - lo)
+                ax.annotate("1:1", (lbl, lbl),
+                            xytext=(5, -6), textcoords="offset points",
+                            fontsize=9.5, color=self._NEUTRAL,
+                            ha="left", va="top")
+                for r in fired:
+                    dm = float(r.get("dm_pc_cm3") or 0)
+                    color, marker = self._DM_STYLE.get(
+                        dm, (self._NEUTRAL, "o"))
+                    t = _as_float(r.get("target_snr"))
+                    o = _as_float(r.get("observed_snr"))
+                    if t is None:
+                        continue
+                    if o is not None:
+                        ax.scatter([t], [o], s=52, marker=marker,
+                                   facecolor=color, edgecolor="white",
+                                   linewidth=0.7, alpha=0.95, zorder=3)
+                    else:
+                        ax.scatter([t], [0.0], s=46, marker="x",
+                                   color=self._MISS_COLOR, linewidth=1.6,
+                                   zorder=3)
+                ax.set_xlim(lo, hi)
+                ax.set_ylim(-1.0, hi)
+                ax.set_box_aspect(1)
+                ax.set_xlabel("injected S/N")
+                ax.set_ylabel("recovered S/N")
+                ax.set_title(f"Injection recovery, {span}",
+                             fontsize=11.5, color=self._INK,
+                             loc="left", pad=10)
+                fig.legend(
+                    handles=self._dm_legend_handles(Line2D, True),
+                    loc="outside right upper", ncol=1,
+                    handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
+                self._despine(ax)
+                _save(fig, "snr_recovery.png",
+                      f"recovered vs injected S/N, {span}")
+
+                # Figure 2: outcome counts (horizontal, direct-labeled;
+                # the numbers are the axis).
+                fig = Figure(figsize=(6.2, 3.2))
+                ax = fig.add_subplot(111)
+                outcome_colors = {
+                    Outcome.RECOVERED: "#2E7D32",
+                    Outcome.MISSED_SEARCH_OR_C1: "#C62828",
+                    Outcome.MISSED_C2: "#E65100",
+                    Outcome.MISSED_C3: "#6A1B9A",
+                    Outcome.SKIPPED_UNHEALTHY: self._NEUTRAL,
+                    Outcome.GUARD_REJECTED: self._NEUTRAL,
+                    Outcome.FIRE_FAILED: self._NEUTRAL,
+                }
+                counts = {o: 0 for o in Outcome.ALL}
+                for r in rows:
+                    o = str(r.get("outcome") or "")
+                    if o in counts:
+                        counts[o] += 1
+                labels = [o for o in Outcome.ALL if counts[o] > 0] or [
+                    Outcome.RECOVERED]
+                labels = labels[::-1]  # recovered on top
+                vals = [counts[o] for o in labels]
+                bars = ax.barh(
+                    range(len(labels)), vals,
+                    color=[outcome_colors[o] for o in labels],
+                    height=0.6, zorder=3)
+                for rect, v in zip(bars, vals):
+                    ax.annotate(
+                        f" {v}",
+                        (v, rect.get_y() + rect.get_height() / 2),
+                        ha="left", va="center", fontsize=11,
+                        color=self._INK)
+                ax.set_yticks(range(len(labels)))
+                ax.set_yticklabels(
+                    [o.replace("_", " ") for o in labels])
+                ax.set_xlim(0, max(vals) * 1.15 if vals else 1)
+                ax.xaxis.set_visible(False)
+                ax.minorticks_off()
+                ax.tick_params(axis="y", length=0)
+                for side in ("top", "right", "bottom"):
                     ax.spines[side].set_visible(False)
-                for side in ("left", "bottom"):
-                    ax.spines[side].set_linewidth(0.8)
-                    ax.spines[side].set_color(ink)
-                ax.tick_params(direction="out", length=3, width=0.8,
-                               colors=ink, labelsize=9)
-                ax.yaxis.label.set_color(ink)
-                ax.xaxis.label.set_color(ink)
+                ax.spines["left"].set_color(self._INK)
+                ax.tick_params(colors=self._INK, labelsize=10.5)
+                ax.set_title(f"Outcomes, {span}", fontsize=11.5,
+                             color=self._INK, loc="left", pad=10)
+                _save(fig, "outcomes.png", f"outcomes, {span}")
 
-            fired = [
-                r for r in rows
-                if r.get("outcome") in (Outcome.RECOVERED,) + Outcome.MISSES
-            ]
-            fig = Figure(figsize=(10.0, 7.6), constrained_layout=True)
-            ts_list = [float(r["ts_unix"]) for r in fired
-                       if r.get("ts_unix") is not None]
-            if ts_list:
-                d0 = datetime.fromtimestamp(min(ts_list), timezone.utc)
-                d1 = datetime.fromtimestamp(max(ts_list), timezone.utc)
-                if d0.date() == d1.date():
-                    span = (f"{d0:%Y-%m-%d} {d0:%H:%M}"
-                            f"–{d1:%H:%M} UTC")
-                else:
-                    span = (f"{d0:%Y-%m-%d %H:%M} – "
-                            f"{d1:%Y-%m-%d %H:%M} UTC")
-                title = f"Test injections, {span}"
-            else:
-                title = "Test injections, last 24 h"
-            fig.suptitle(title, fontsize=13, color=ink, x=0.02, ha="left")
-            # Square S/N panel top-left, outcomes top-right, accuracy
-            # full-width below.
-            gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.25])
-            ax_snr = fig.add_subplot(gs[0, 0])
-            ax_out = fig.add_subplot(gs[0, 1])
-            ax_acc = fig.add_subplot(gs[1, :])
-
-            # Panel 1: recovered vs injected S/N, one point per shot,
-            # with the 1:1 line as the reference — distance from the
-            # line IS the recovery error, no connectors needed. Misses
-            # sit on the floor at their injected S/N.
-            ax = ax_snr
-            targets = [_as_float(r.get("target_snr")) for r in fired]
-            targets = [t for t in targets if t is not None]
-            lo = min(targets) - 2 if targets else 10.0
-            hi = max(
-                [t for t in targets] +
-                [_as_float(r.get("observed_snr")) or 0 for r in fired] +
-                [0.0]
-            ) + 2 if fired else 30.0
-            ax.plot([lo, hi], [lo, hi], color=neutral, lw=0.8, ls="--",
-                    zorder=0)
-            ax.annotate("1:1", (hi, hi), fontsize=8.5, color=neutral,
-                        ha="right", va="bottom")
-            for r in fired:
-                dm = float(r.get("dm_pc_cm3") or 0)
-                color, marker = dm_style.get(dm, (neutral, "o"))
-                target = _as_float(r.get("target_snr"))
-                observed = _as_float(r.get("observed_snr"))
-                if target is None:
-                    continue
-                if observed is not None:
-                    ax.plot([target], [observed], marker=marker, ms=6,
-                            color=color, ls="none", alpha=0.85)
-                else:
-                    ax.plot([target], [0.0], marker="x", ms=7, mew=1.6,
-                            color=miss_color, ls="none")
-            ax.set_xlabel("injected (target) S/N")
-            ax.set_ylabel("recovered S/N")
-            ax.set_title("Recovered vs injected S/N", fontsize=11,
-                         color=ink, loc="left")
-            handles = [
-                Line2D([], [], marker=m, color=c, ls="none", ms=6,
-                       label=f"DM {dm:.0f}")
-                for dm, (c, m) in sorted(dm_style.items())
-            ]
-            handles.append(Line2D([], [], marker="x", color=miss_color,
-                                  ls="none", ms=7, mew=1.6, label="missed"))
-            # Single column in the empty triangle above the 1:1 line
-            # (recoveries more than ~5 sigma above target don't happen).
-            ax.legend(handles=handles, loc="upper left", ncol=1,
-                      frameon=False, fontsize=8.5, handletextpad=0.3,
-                      labelspacing=0.35, borderaxespad=0.2)
-            ax.set_ylim(-1.5, hi)
-            ax.set_xlim(lo, hi)
-            # Square box so the 1:1 reference renders at ~45 degrees —
-            # the whole point of the panel.
-            ax.set_box_aspect(1)
-            _despine(ax)
-
-            # Panel 2: outcome counts (horizontal, direct-labeled, no
-            # count axis — the numbers ARE the axis).
-            ax = ax_out
-            outcome_colors = {
-                Outcome.RECOVERED: "#2E7D32",
-                Outcome.MISSED_SEARCH_OR_C1: "#C62828",
-                Outcome.MISSED_C2: "#E65100",
-                Outcome.MISSED_C3: "#6A1B9A",
-                Outcome.SKIPPED_UNHEALTHY: neutral,
-                Outcome.GUARD_REJECTED: neutral,
-                Outcome.FIRE_FAILED: neutral,
-            }
-            counts = {o: 0 for o in Outcome.ALL}
-            for r in rows:
-                o = str(r.get("outcome") or "")
-                if o in counts:
-                    counts[o] += 1
-            labels = [o for o in Outcome.ALL if counts[o] > 0] or [
-                Outcome.RECOVERED]
-            labels = labels[::-1]  # recovered on top
-            vals = [counts[o] for o in labels]
-            bars = ax.barh(
-                range(len(labels)), vals,
-                color=[outcome_colors[o] for o in labels], height=0.55)
-            for rect, v in zip(bars, vals):
-                ax.annotate(
-                    f" {v}",
-                    (v, rect.get_y() + rect.get_height() / 2),
-                    ha="left", va="center", fontsize=10, color=ink)
-            ax.set_yticks(range(len(labels)))
-            ax.set_yticklabels(
-                [o.replace("_", " ") for o in labels], fontsize=9.5)
-            ax.set_title("Outcomes", fontsize=11, color=ink, loc="left")
-            ax.set_xlim(0, max(vals) * 1.15 if vals else 1)
-            ax.xaxis.set_visible(False)
-            _despine(ax)
-            ax.spines["bottom"].set_visible(False)
-            ax.tick_params(axis="y", length=0)
-
-            # Panel 3: recovery accuracy — position offset vs DM error.
-            ax = ax_acc
-            for r in fired:
-                off = _as_float(r.get("offset_arcsec"))
-                ddm = _as_float(r.get("delta_dm_pc_cm3"))
-                if off is None or ddm is None:
-                    continue
-                dm = float(r.get("dm_pc_cm3") or 0)
-                color, marker = dm_style.get(dm, (neutral, "o"))
-                ax.plot([ddm], [off], marker=marker, ms=6, color=color,
-                        ls="none", alpha=0.85)
-            ax.axvline(0.0, color=neutral, lw=0.8, alpha=0.6, zorder=0)
-            ax.set_xlabel("recovered DM $-$ injected DM (pc cm$^{-3}$)")
-            ax.set_ylabel("position offset (arcsec)")
-            ax.set_title("Recovery accuracy", fontsize=11, color=ink,
-                         loc="left")
-            _despine(ax)
-
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(str(out_path), dpi=150, facecolor="white")
-            return True
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("summary plot render failed: %s", exc, exc_info=True)
-            return False
+                # Figure 3: recovery accuracy — position offset between
+                # injection and detection vs DM error.
+                fig = Figure(figsize=(6.6, 4.9))
+                ax = fig.add_subplot(111)
+                for r in fired:
+                    off = _as_float(r.get("offset_arcsec"))
+                    ddm = _as_float(r.get("delta_dm_pc_cm3"))
+                    if off is None or ddm is None:
+                        continue
+                    dm = float(r.get("dm_pc_cm3") or 0)
+                    color, marker = self._DM_STYLE.get(
+                        dm, (self._NEUTRAL, "o"))
+                    ax.scatter([ddm], [off], s=52, marker=marker,
+                               facecolor=color, edgecolor="white",
+                               linewidth=0.7, alpha=0.95, zorder=3)
+                ax.axvline(0.0, color=self._NEUTRAL, lw=0.8, alpha=0.7,
+                           zorder=1)
+                ax.set_xlabel(
+                    "DM error, detection $-$ injection (pc cm$^{-3}$)")
+                ax.set_ylabel(
+                    "position offset, injection $\\rightarrow$ "
+                    "detection (arcsec)")
+                ax.set_ylim(bottom=0)
+                ax.set_title(f"Recovery accuracy, {span}",
+                             fontsize=11.5, color=self._INK,
+                             loc="left", pad=10)
+                fig.legend(
+                    handles=self._dm_legend_handles(Line2D, False),
+                    loc="outside right upper", ncol=1,
+                    handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
+                self._despine(ax)
+                _save(fig, "accuracy.png", f"recovery accuracy, {span}")
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "summary figure render failed: %s", exc, exc_info=True)
+        return out
 
     def post_daily_summary(self) -> Dict[str, Any]:
-        """Compute stats + render + upload; stamps state so it runs once
-        per UTC day. Never raises."""
+        """Compute stats, render the separate summary figures, post the
+        stats text and thread the figures under it; stamps state so it
+        runs once per UTC day. Never raises."""
         now = self._time()
         rows = self.load_results_since(now - 86400.0)
         stats = self.compute_summary_stats(rows)
         text = self._summary_text(stats)
         day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
-        png = Path(self._cfg.summary_dir).expanduser() / (
-            f"inject_summary_{day}.png")
-        plotted = self.render_summary_plot(rows, png)
-        if plotted:
-            resp = self._notifier.post_file(
-                png, title=f"injection summary {day}",
-                initial_comment=text,
-            )
-        else:
-            resp = self._notifier.post_text(
-                text + "\n(summary plot render failed - see journal)")
+        out_dir = Path(self._cfg.summary_dir).expanduser() / day
+        figures = self.render_summary_plots(rows, out_dir)
+        if not figures:
+            text += "\n(summary figures failed to render - see journal)"
+        resp = self._notifier.post_text(text)
+        thread_ts = resp.get("ts") if resp.get("ok") else None
+        n_uploaded = 0
+        for path, title in figures:
+            fresp = self._notifier.post_file(
+                path, title=title, thread_ts=thread_ts)
+            if fresp.get("ok"):
+                n_uploaded += 1
+            else:
+                LOG.warning("summary figure upload failed: %s", fresp)
         if resp.get("ok"):
             self._load_state()["last_summary_date"] = day
             self._save_state()
         else:
             LOG.warning("daily summary post failed: %s", resp)
-        return {"ok": bool(resp.get("ok")), "stats": stats, "png": str(png)}
+        return {
+            "ok": bool(resp.get("ok")), "stats": stats,
+            "figures": [str(p) for p, _ in figures],
+            "n_uploaded": n_uploaded,
+        }
 
     # ----- loop --------------------------------------------------------------
 

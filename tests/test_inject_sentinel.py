@@ -64,7 +64,7 @@ class FakeNotifier:
                   thread_ts=None):
         self.files.append({
             "path": str(path), "title": title,
-            "initial_comment": initial_comment,
+            "initial_comment": initial_comment, "thread_ts": thread_ts,
         })
         return {"ok": True, "ts": "fts1"}
 
@@ -380,7 +380,8 @@ def test_recovered_cycle_end_to_end(tmp_path):
     assert rec["c3_decision"] == "KEEP"
     assert rec["inj_id"] == fired["inj_id"]
     assert rec["inj_id"].startswith("inj_")
-    assert len(rec["inj_id"]) <= 14  # short id: inj_MMDD_HHMM
+    assert len(rec["inj_id"]) == 15  # inj_DDMMYY_HHMM
+    assert rec["inj_id"][8:10] == "26"  # two-digit year present
     # Recovered message links the event to its dashboard burst page.
     assert "/bursts/260807test|260807test>" in notifier.texts[1]["text"]
     assert rec["snr_ratio"] == pytest.approx(19.0 / 20.0)
@@ -507,16 +508,20 @@ def test_summary_stats_counts_and_attribution(tmp_path):
     assert "missed_search_or_c1" in text.replace(" ", "_") or "missed" in text
 
 
-def test_summary_plot_renders(tmp_path):
+def test_summary_plots_render_as_separate_figures(tmp_path):
     pytest.importorskip("matplotlib")
     now = time.time()
     cfg = make_config(tmp_path)
     s = InjectSentinel(cfg, store=FakeStore(), notifier=FakeNotifier(),
                        http_post_form=lambda *a: (200, {}),
                        http_get=lambda *a: (200, {}))
-    out = tmp_path / "plots" / "summary.png"
-    assert s.render_summary_plot(_rows_for_summary(now), out)
-    assert out.stat().st_size > 10_000
+    out_dir = tmp_path / "plots"
+    figures = s.render_summary_plots(_rows_for_summary(now), out_dir)
+    names = sorted(p.name for p, _ in figures)
+    assert names == ["accuracy.png", "outcomes.png", "snr_recovery.png"]
+    for p, title in figures:
+        assert p.stat().st_size > 10_000
+        assert "UTC" in title  # date range in every figure title
 
 
 def test_daily_summary_once_per_day_gate(tmp_path):
@@ -531,8 +536,12 @@ def test_daily_summary_once_per_day_gate(tmp_path):
     assert s.summary_due()
     result = s.post_daily_summary()
     assert result["ok"]
-    assert len(notifier.files) == 1
-    assert "injected" in notifier.files[0]["initial_comment"]
+    assert result["n_uploaded"] == 3
+    # Stats text posted top-level; every figure threaded under it.
+    assert "injected" in notifier.texts[-1]["text"]
+    assert len(notifier.files) == 3
+    summary_ts = f"ts{len(notifier.texts)}"
+    assert all(f["thread_ts"] == summary_ts for f in notifier.files)
     assert not s.summary_due()  # stamped for today
 
 
