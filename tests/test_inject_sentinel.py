@@ -395,7 +395,8 @@ def test_recovered_cycle_end_to_end(tmp_path):
     assert "injection sent" in notifier.texts[0]["text"]
     body = notifier.texts[1]["text"]
     assert "recovered" in body and "260807test" in body
-    assert "(l, m)" in body and "DM" in body and "SNR" in body
+    assert "(l,m)" in body and "mrad" in body
+    assert "DM" in body and "SNR" in body
 
 
 def test_c3_reject_is_missed_c3(tmp_path):

@@ -590,24 +590,27 @@ class InjectSentinel:
     # ----- Slack messages (plain text only) ---------------------------------
 
     def _post_sent_message(self, record: Mapping[str, Any]) -> Optional[str]:
+        # NBSP joins every number to its unit so Slack's line wrapping
+        # can never split them; (l, m) are reported in mrad at two
+        # decimals (0.01 mrad ~ 2 arcsec, ample for a message).
         dec = record.get("pointing_dec_deg")
         text = (
             "injection sent: `{inj_id}`\n"
-            "DM {dm:.0f} pc/cc | target SNR {snr:.1f} | "
-            "fluence {fl} Jy*ms | width {w} native | "
-            "(l, m) = ({l:+.5f}, {m:+.5f}) rad | pointing dec {dec}"
+            "DM {dm:.0f} pc/cc | target SNR {snr:.1f} | "
+            "fluence {fl} | width {w} native | "
+            "(l,m) = ({l:+.2f}, {m:+.2f}) mrad | pointing dec {dec}"
         ).format(
             inj_id=record.get("inj_id"),
             dm=float(record.get("dm_pc_cm3") or 0),
             snr=float(record.get("target_snr") or 0),
             fl=(
-                f"{float(record['fluence_jy_ms']):.3g}"
+                f"{float(record['fluence_jy_ms']):.3g} Jy*ms"
                 if record.get("fluence_jy_ms") is not None else "n/a"
             ),
             w=record.get("width_samples"),
-            l=float(record.get("l_rad") or 0),
-            m=float(record.get("m_rad") or 0),
-            dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
+            l=float(record.get("l_rad") or 0) * 1e3,
+            m=float(record.get("m_rad") or 0) * 1e3,
+            dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
         )
         resp = self._notifier.post_text(text)
         if not resp.get("ok"):
@@ -628,12 +631,14 @@ class InjectSentinel:
                     base=self._cfg.dashboard_base_url.rstrip("/"), ev=event)
             else:
                 event_ref = "(pending archive)"
+            # Same NBSP-joined number+unit convention as the sent post;
+            # (l, m) in mrad at two decimals.
             text = (
                 "recovered: `{inj_id}` -> {event}\n"
                 "SNR {osnr:.1f} (target {tsnr:.1f}, ratio {ratio:.2f}) | "
                 "DM {odm} (injected {idm:.0f}, delta {ddm}) | "
-                "(l, m) = ({ol:+.5f}, {om:+.5f}) rad, offset {off} arcsec "
-                "(injected ({il:+.5f}, {im:+.5f})) | "
+                "(l,m) = ({ol:+.2f}, {om:+.2f}) mrad, "
+                "offset {off} (injected ({il:+.2f}, {im:+.2f})) | "
                 "found by s{sid}g{g} | cubes {cubes} | C3 {c3}"
             ).format(
                 inj_id=record.get("inj_id"),
@@ -647,14 +652,14 @@ class InjectSentinel:
                     f"{float(record['delta_dm_pc_cm3']):+.1f}"
                     if record.get("delta_dm_pc_cm3") is not None else "n/a"
                 ),
-                ol=float(record.get("observed_l_rad") or 0),
-                om=float(record.get("observed_m_rad") or 0),
+                ol=float(record.get("observed_l_rad") or 0) * 1e3,
+                om=float(record.get("observed_m_rad") or 0) * 1e3,
                 off=(
-                    f"{float(record['offset_arcsec']):.0f}"
+                    f"{float(record['offset_arcsec']):.0f} arcsec"
                     if record.get("offset_arcsec") is not None else "n/a"
                 ),
-                il=float(record.get("l_rad") or 0),
-                im=float(record.get("m_rad") or 0),
+                il=float(record.get("l_rad") or 0) * 1e3,
+                im=float(record.get("m_rad") or 0) * 1e3,
                 sid=record.get("observed_search_node_id"),
                 g=record.get("observed_gpu_half"),
                 cubes=record.get("cubes", "n/a"),
@@ -752,8 +757,15 @@ class InjectSentinel:
         if None not in (il, im, ol, om):
             out["delta_l_rad"] = ol - il
             out["delta_m_rad"] = om - im
+            # (l, m) are direction cosines; near beam centre (|l|,|m| <=
+            # 0.028) the offset angle is hypot(dl, dm) radians to O(l^3),
+            # converted at 206264.8 arcsec/rad. Both values live in the
+            # corr gridder's INSTRUMENT frame (see sky_astrometry.py), so
+            # this measures injection->recovery self-consistency; the
+            # true-sky m-offset is larger by 1/cos(lat - dec) (~1.21x at
+            # dec 71.6).
             out["offset_arcsec"] = math.hypot(
-                ol - il, om - im) * 180.0 / math.pi * 3600.0
+                ol - il, om - im) * (180.0 / math.pi * 3600.0)
         if idm is not None and out.get("observed_dm_pc_cm3") is not None:
             out["delta_dm_pc_cm3"] = out["observed_dm_pc_cm3"] - idm
         if tsnr and out.get("observed_snr") is not None:
@@ -927,7 +939,6 @@ class InjectSentinel:
         try:
             import matplotlib
             matplotlib.use("Agg", force=True)
-            import matplotlib.dates as mdates
             from matplotlib.figure import Figure
             from matplotlib.lines import Line2D
         except Exception as exc:  # noqa: BLE001
@@ -964,58 +975,85 @@ class InjectSentinel:
                 r for r in rows
                 if r.get("outcome") in (Outcome.RECOVERED,) + Outcome.MISSES
             ]
-            fig = Figure(figsize=(9.5, 8.5), constrained_layout=True)
-            fig.suptitle("Injection sentinel, last 24 h", fontsize=13,
-                         color=ink, x=0.02, ha="left")
-            axes = fig.subplots(3, 1)
+            fig = Figure(figsize=(10.0, 7.6), constrained_layout=True)
+            ts_list = [float(r["ts_unix"]) for r in fired
+                       if r.get("ts_unix") is not None]
+            if ts_list:
+                d0 = datetime.fromtimestamp(min(ts_list), timezone.utc)
+                d1 = datetime.fromtimestamp(max(ts_list), timezone.utc)
+                if d0.date() == d1.date():
+                    span = (f"{d0:%Y-%m-%d} {d0:%H:%M}"
+                            f"–{d1:%H:%M} UTC")
+                else:
+                    span = (f"{d0:%Y-%m-%d %H:%M} – "
+                            f"{d1:%Y-%m-%d %H:%M} UTC")
+                title = f"Test injections, {span}"
+            else:
+                title = "Test injections, last 24 h"
+            fig.suptitle(title, fontsize=13, color=ink, x=0.02, ha="left")
+            # Square S/N panel top-left, outcomes top-right, accuracy
+            # full-width below.
+            gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.25])
+            ax_snr = fig.add_subplot(gs[0, 0])
+            ax_out = fig.add_subplot(gs[0, 1])
+            ax_acc = fig.add_subplot(gs[1, :])
 
-            # Panel 1: recovered vs target S/N over time.
-            ax = axes[0]
+            # Panel 1: recovered vs injected S/N, one point per shot,
+            # with the 1:1 line as the reference — distance from the
+            # line IS the recovery error, no connectors needed. Misses
+            # sit on the floor at their injected S/N.
+            ax = ax_snr
+            targets = [_as_float(r.get("target_snr")) for r in fired]
+            targets = [t for t in targets if t is not None]
+            lo = min(targets) - 2 if targets else 10.0
+            hi = max(
+                [t for t in targets] +
+                [_as_float(r.get("observed_snr")) or 0 for r in fired] +
+                [0.0]
+            ) + 2 if fired else 30.0
+            ax.plot([lo, hi], [lo, hi], color=neutral, lw=0.8, ls="--",
+                    zorder=0)
+            ax.annotate("1:1", (hi, hi), fontsize=8.5, color=neutral,
+                        ha="right", va="bottom")
             for r in fired:
-                t = datetime.fromtimestamp(
-                    float(r["ts_unix"]), timezone.utc)
                 dm = float(r.get("dm_pc_cm3") or 0)
                 color, marker = dm_style.get(dm, (neutral, "o"))
                 target = _as_float(r.get("target_snr"))
                 observed = _as_float(r.get("observed_snr"))
-                if target is not None:
-                    ax.plot([t], [target], marker="_", ms=11, mew=1.2,
-                            color=neutral, ls="none")
+                if target is None:
+                    continue
                 if observed is not None:
-                    if target is not None:
-                        ax.plot([t, t], [target, observed],
-                                color=color, lw=0.8, alpha=0.5)
-                    ax.plot([t], [observed], marker=marker, ms=6,
-                            color=color, ls="none")
-                elif target is not None:
-                    ax.plot([t], [0.0], marker="x", ms=7, mew=1.6,
+                    ax.plot([target], [observed], marker=marker, ms=6,
+                            color=color, ls="none", alpha=0.85)
+                else:
+                    ax.plot([target], [0.0], marker="x", ms=7, mew=1.6,
                             color=miss_color, ls="none")
-            ax.set_ylabel("S/N")
-            ax.set_xlabel("time (UTC)")
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-            ax.set_title("Recovered vs target S/N", fontsize=11,
+            ax.set_xlabel("injected (target) S/N")
+            ax.set_ylabel("recovered S/N")
+            ax.set_title("Recovered vs injected S/N", fontsize=11,
                          color=ink, loc="left")
             handles = [
                 Line2D([], [], marker=m, color=c, ls="none", ms=6,
                        label=f"DM {dm:.0f}")
                 for dm, (c, m) in sorted(dm_style.items())
             ]
-            handles.append(Line2D([], [], marker="_", color=neutral,
-                                  ls="none", ms=10, mew=1.2,
-                                  label="target"))
             handles.append(Line2D([], [], marker="x", color=miss_color,
                                   ls="none", ms=7, mew=1.6, label="missed"))
-            # Above the axes, right-aligned: clear of the data and of
-            # the left-aligned panel title.
-            ax.legend(handles=handles, loc="lower right",
-                      bbox_to_anchor=(1.0, 1.0), ncol=6, frameon=False,
-                      fontsize=8.5, handletextpad=0.3, columnspacing=1.1)
-            ax.set_ylim(bottom=-1.5)
+            # Single column in the empty triangle above the 1:1 line
+            # (recoveries more than ~5 sigma above target don't happen).
+            ax.legend(handles=handles, loc="upper left", ncol=1,
+                      frameon=False, fontsize=8.5, handletextpad=0.3,
+                      labelspacing=0.35, borderaxespad=0.2)
+            ax.set_ylim(-1.5, hi)
+            ax.set_xlim(lo, hi)
+            # Square box so the 1:1 reference renders at ~45 degrees —
+            # the whole point of the panel.
+            ax.set_box_aspect(1)
             _despine(ax)
 
             # Panel 2: outcome counts (horizontal, direct-labeled, no
             # count axis — the numbers ARE the axis).
-            ax = axes[1]
+            ax = ax_out
             outcome_colors = {
                 Outcome.RECOVERED: "#2E7D32",
                 Outcome.MISSED_SEARCH_OR_C1: "#C62828",
@@ -1053,7 +1091,7 @@ class InjectSentinel:
             ax.tick_params(axis="y", length=0)
 
             # Panel 3: recovery accuracy — position offset vs DM error.
-            ax = axes[2]
+            ax = ax_acc
             for r in fired:
                 off = _as_float(r.get("offset_arcsec"))
                 ddm = _as_float(r.get("delta_dm_pc_cm3"))
