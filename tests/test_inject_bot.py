@@ -573,3 +573,20 @@ def test_bucket_key_matches_dashboard_examples():
     assert bucket_key(1500.0) == "dm1500"
     assert bucket_key(2000.0) == "dm2000"
     assert bucket_key(1024.0) == "dm1000"
+
+
+# ---------------------------------------------------------------------------
+# Startup crash-loop guard
+# ---------------------------------------------------------------------------
+
+
+def test_last_attempt_unix_reads_jsonl_tail(tmp_path):
+    cfg = make_config(tmp_path)
+    s = InjectBot(cfg, store=FakeStore(), notifier=FakeNotifier(),
+                  http_post_form=lambda *a: (200, {}),
+                  http_get=lambda *a: (200, {}))
+    assert s._last_attempt_unix() is None  # no file yet
+    now = time.time()
+    s._append_result({"ts_unix": now - 100, "outcome": Outcome.RECOVERED})
+    s._append_result({"ts_unix": now - 5, "outcome": Outcome.MISSED_C2})
+    assert s._last_attempt_unix() == pytest.approx(now - 5)

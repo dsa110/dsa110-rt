@@ -848,6 +848,30 @@ class InjectBot:
             pass
         return rows
 
+    def _last_attempt_unix(self) -> Optional[float]:
+        """Timestamp of the most recent attempt in the results JSONL,
+        or None if there is none / the file is unreadable. Used by the
+        startup crash-loop guard; reads only the file's tail."""
+        p = Path(self._cfg.results_path)
+        try:
+            with p.open("rb") as fh:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 65536))
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return None
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ts = float(json.loads(line).get("ts_unix") or 0)
+            except (ValueError, TypeError):
+                continue
+            if ts > 0:
+                return ts
+        return None
+
     # ----- daily summary -----------------------------------------------------
 
     def summary_due(self) -> bool:
@@ -1261,7 +1285,24 @@ class InjectBot:
         # perturbs each tick but does not accumulate. If a cycle ever
         # overruns its whole slot, the anchor is re-based (no backlog
         # of instant catch-up shots).
+        # First shot fires immediately on startup (an end-to-end check
+        # right after a (re)start is the point of this service) —
+        # UNLESS the previous attempt was less than half an interval
+        # ago, in which case wait out the remainder of its slot. This
+        # keeps a crash-looping unit (Restart=on-failure, 10 s) from
+        # firing an injection per restart.
         next_fire = self._time()
+        last = self._last_attempt_unix()
+        if last is not None:
+            since = self._time() - last
+            if 0.0 <= since < cfg.interval_s / 2.0:
+                next_fire = last + cfg.interval_s
+                LOG.info(
+                    "startup: previous attempt %.0fs ago; first shot "
+                    "delayed to its slot in %.0fs",
+                    since, next_fire - self._time(),
+                )
+                stop_event.wait(max(0.0, next_fire - self._time()))
         while not stop_event.is_set():
             record = self.run_cycle()
             LOG.info(
