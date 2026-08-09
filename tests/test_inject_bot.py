@@ -103,6 +103,7 @@ def make_config(tmp_path, **over):
         recovery_timeout_s=2.0,
         recovery_poll_s=0.01,
         post_calibration_settle_s=0.0,
+        weights_applied_dir=str(tmp_path / "weights_applied"),
     )
     base.update(over)
     return InjectBotConfig.from_dict(base)
@@ -169,6 +170,10 @@ def make_bot(cfg, store, dash, notifier=None, now=None, dm=1000.0):
         rng=rng,
         time_fn=time_fn,
     )
+    # Never read the real host's C2 journal from tests: with wall-clock
+    # timestamps a genuine trigger can land in the holdoff window and
+    # flip the missed_c2 wording.
+    s._c2_trigger_reader = lambda t0, t1: []
     return s, clock
 
 
@@ -288,6 +293,42 @@ def test_stale_k_triggers_recalibration(tmp_path):
     assert usable
     assert info["recalibrated"]
     assert any(r.startswith("stale") for r in info["recal_reasons"])
+
+
+def test_weights_newer_than_k_triggers_recalibration(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    wdir = tmp_path / "weights_applied"
+    wdir.mkdir()
+    wfile = wdir / "beamformer_weights_sb00.dat"
+    wfile.write_bytes(b"x")
+    b, entry = fresh_entry(now, 1000.0, age_s=600.0)  # fresh by age
+    os.utime(wfile, (now - 60, now - 60))  # weights applied after the cal
+    dash = FakeDash(now, {b: entry})
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    usable, info = s.ensure_k_fresh(1000.0)
+    assert usable
+    assert info["recalibrated"]
+    assert "weights_newer_than_k" in info["recal_reasons"]
+
+    # Recal stamped the entry at now: a second cycle must NOT re-probe.
+    usable, info = s.ensure_k_fresh(1000.0)
+    assert usable and not info["recalibrated"]
+
+
+def test_weights_older_than_k_do_not_trigger_recalibration(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    wdir = tmp_path / "weights_applied"
+    wdir.mkdir()
+    wfile = wdir / "beamformer_weights_sb00.dat"
+    wfile.write_bytes(b"x")
+    os.utime(wfile, (now - 7200, now - 7200))
+    b, entry = fresh_entry(now, 1000.0, age_s=600.0)  # cal after weights
+    dash = FakeDash(now, {b: entry})
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    usable, info = s.ensure_k_fresh(1000.0)
+    assert usable and not info["recalibrated"]
 
 
 def test_fresh_k_is_not_recalibrated_and_dec_baseline_adopted(tmp_path):

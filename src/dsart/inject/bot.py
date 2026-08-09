@@ -58,6 +58,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import random
 import signal
 import threading
@@ -163,6 +164,14 @@ class InjectBotConfig:
     #: probe's sigma_k EMA self-inflation (see the dashboard ladder's
     #: 60 s step delay).
     post_calibration_settle_s: float = 90.0
+    #: Beamformer-weights provenance: a K measured before the currently
+    #: applied weights is stale regardless of age (new weights change
+    #: the fluence -> SNR gain; 2026-08-09 update shifted buckets by
+    #: 5-25%). Newest file mtime in this directory is compared against
+    #: last_calibrated_at_unix. Empty string disables the check.
+    weights_applied_dir: str = (
+        "/dataz/dsa110/operations/beamformer_weights/applied"
+    )
 
     recovery_timeout_s: float = 720.0
     recovery_poll_s: float = 10.0
@@ -214,6 +223,9 @@ class InjectBotConfig:
                 d.get("calibrate_poll_timeout_s", 30.0)),
             post_calibration_settle_s=float(
                 d.get("post_calibration_settle_s", 90.0)),
+            weights_applied_dir=str(d.get(
+                "weights_applied_dir",
+                "/dataz/dsa110/operations/beamformer_weights/applied")),
             recovery_timeout_s=float(d.get("recovery_timeout_s", 720.0)),
             recovery_poll_s=float(d.get("recovery_poll_s", 10.0)),
             summary_hour_utc=int(d.get("summary_hour_utc", 16)),
@@ -442,6 +454,21 @@ class InjectBot:
                 return dict(entry)
         return None
 
+    def _weights_mtime(self) -> Optional[float]:
+        """Newest file mtime in the applied beamformer-weights dir, or
+        None when the directory is unset, missing, or empty. Best-effort:
+        a filesystem hiccup must never block an injection cycle."""
+        path = self._cfg.weights_applied_dir
+        if not path:
+            return None
+        try:
+            mtimes = [
+                e.stat().st_mtime for e in os.scandir(path) if e.is_file()
+            ]
+            return max(mtimes) if mtimes else None
+        except OSError:
+            return None
+
     def ensure_k_fresh(self, dm: float) -> Tuple[bool, Dict[str, Any]]:
         """Recalibrate the DM bucket when K is missing, stale, or was
         measured at a different pointing dec. Returns ``(usable,
@@ -471,6 +498,13 @@ class InjectBot:
             ):
                 reasons.append(
                     f"dec_changed({float(cal_dec):.2f}->{dec_now:.2f})")
+            weights_mtime = self._weights_mtime()
+            if (
+                weights_mtime is not None
+                and float(entry.get("last_calibrated_at_unix") or 0)
+                < weights_mtime
+            ):
+                reasons.append("weights_newer_than_k")
 
         if reasons:
             info["recal_reasons"] = reasons
