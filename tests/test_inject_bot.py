@@ -1,4 +1,4 @@
-"""Unit tests for the hourly injection sentinel.
+"""Unit tests for the hourly injection bot.
 
 All collaborators are faked (etcd store, dashboard HTTP, Slack
 notifier) — no network, no observatory env. Covers: health-gated
@@ -27,11 +27,11 @@ DSART_SRC = os.path.join(REPO_ROOT, "src")
 if DSART_SRC not in sys.path:
     sys.path.insert(0, DSART_SRC)
 
-from dsart.services import inject_sentinel as isent  # noqa: E402
-from dsart.services.inject_sentinel import (  # noqa: E402
-    InjectSentinel,
+from dsart.inject import bot as isent  # noqa: E402
+from dsart.inject.bot import (  # noqa: E402
+    InjectBot,
     Outcome,
-    SentinelConfig,
+    InjectBotConfig,
     bucket_key,
 )
 
@@ -93,7 +93,7 @@ def make_config(tmp_path, **over):
         recovery_poll_s=0.01,
     )
     base.update(over)
-    return SentinelConfig.from_dict(base)
+    return InjectBotConfig.from_dict(base)
 
 
 class FakeDash:
@@ -139,7 +139,7 @@ def fresh_entry(now, dm, k=170000.0, age_s=0.0):
     }
 
 
-def make_sentinel(cfg, store, dash, notifier=None, now=None, dm=1000.0):
+def make_bot(cfg, store, dash, notifier=None, now=None, dm=1000.0):
     rng = random.Random(42)
     t0 = now if now is not None else time.time()
     clock = {"t": t0}
@@ -148,7 +148,7 @@ def make_sentinel(cfg, store, dash, notifier=None, now=None, dm=1000.0):
         clock["t"] += 0.05
         return clock["t"]
 
-    s = InjectSentinel(
+    s = InjectBot(
         cfg,
         store=store,
         notifier=notifier or FakeNotifier(),
@@ -206,7 +206,7 @@ def test_unhealthy_fleet_skips_cycle_and_throttles_warning(tmp_path):
     cfg = make_config(tmp_path)
     dash = FakeDash(now)
     notifier = FakeNotifier()
-    s, _ = make_sentinel(cfg, FakeStore(docs), dash, notifier, now=now)
+    s, _ = make_bot(cfg, FakeStore(docs), dash, notifier, now=now)
 
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.NOT_SEARCHING
@@ -230,7 +230,7 @@ def test_metering_active_counts_as_unhealthy(tmp_path):
         "ts_wall_unix": now, "c1_metering_active": 1,
     }
     cfg = make_config(tmp_path)
-    s, _ = make_sentinel(cfg, FakeStore(docs), FakeDash(now), now=now)
+    s, _ = make_bot(cfg, FakeStore(docs), FakeDash(now), now=now)
     ok, reason = s.check_health()
     assert not ok and "s1g0" in reason
 
@@ -244,7 +244,7 @@ def test_missing_k_triggers_recalibration(tmp_path):
     now = time.time()
     cfg = make_config(tmp_path)
     dash = FakeDash(now)  # no entries
-    s, _ = make_sentinel(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     usable, info = s.ensure_k_fresh(1000.0)
     assert usable
     assert info["recalibrated"]
@@ -258,7 +258,7 @@ def test_stale_k_triggers_recalibration(tmp_path):
     cfg = make_config(tmp_path)
     b, entry = fresh_entry(now, 500.0, age_s=90000.0)  # > 24 h
     dash = FakeDash(now, {b: entry})
-    s, _ = make_sentinel(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     usable, info = s.ensure_k_fresh(500.0)
     assert usable
     assert info["recalibrated"]
@@ -270,7 +270,7 @@ def test_fresh_k_is_not_recalibrated_and_dec_baseline_adopted(tmp_path):
     cfg = make_config(tmp_path)
     b, entry = fresh_entry(now, 1500.0, age_s=600.0)
     dash = FakeDash(now, {b: entry})
-    s, _ = make_sentinel(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     usable, info = s.ensure_k_fresh(1500.0)
     assert usable and not info["recalibrated"]
     assert dash.calibrate_calls == []
@@ -283,11 +283,11 @@ def test_dec_change_triggers_recalibration(tmp_path):
     cfg = make_config(tmp_path)
     b, entry = fresh_entry(now, 2000.0, age_s=600.0)
     dash = FakeDash(now, {b: entry})
-    # K was measured at dec 16.27 per the sentinel's own provenance.
+    # K was measured at dec 16.27 per the bot's own provenance.
     (tmp_path / "state.json").write_text(json.dumps({
         "k_calibration_dec": {b: 16.27},
     }))
-    s, _ = make_sentinel(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     usable, info = s.ensure_k_fresh(2000.0)
     assert usable and info["recalibrated"]
     assert any(r.startswith("dec_changed") for r in info["recal_reasons"])
@@ -308,7 +308,7 @@ def test_recal_failure_yields_fire_failed_cycle(tmp_path):
             return super().post(url, fields)
 
     dash = DeadDash(now)
-    s, _ = make_sentinel(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.FIRE_FAILED
     assert dash.inject_calls == []
@@ -321,7 +321,7 @@ def test_recal_failure_yields_fire_failed_cycle(tmp_path):
 
 def test_picked_params_respect_bounds(tmp_path):
     cfg = make_config(tmp_path)
-    s = InjectSentinel(cfg, store=FakeStore(), notifier=FakeNotifier(),
+    s = InjectBot(cfg, store=FakeStore(), notifier=FakeNotifier(),
                        http_post_form=lambda *a: (200, {"ok": True}),
                        http_get=lambda *a: (200, {"ok": True, "entries": []}),
                        rng=random.Random(7))
@@ -348,7 +348,7 @@ def _run_recovered_cycle(tmp_path, *, keep=True, c3_written=True):
         dash.k_entries[bb] = ee
     store = FakeStore(healthy_docs(now))
     notifier = FakeNotifier()
-    s, clock = make_sentinel(cfg, store, dash, notifier, now=now)
+    s, clock = make_bot(cfg, store, dash, notifier, now=now)
 
     fired = {}
     orig_post = dash.post
@@ -420,7 +420,7 @@ def test_no_match_doc_is_missed_search_or_c1(tmp_path):
         b, e = fresh_entry(now, dm, age_s=100.0)
         dash.k_entries[b] = e
     notifier = FakeNotifier()
-    s, _ = make_sentinel(
+    s, _ = make_bot(
         cfg, FakeStore(healthy_docs(now)), dash, notifier, now=now)
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.MISSED_SEARCH_OR_C1
@@ -437,7 +437,7 @@ def test_match_without_event_is_missed_c2(tmp_path):
         dash.k_entries[b] = e
     store = FakeStore(healthy_docs(now))
     notifier = FakeNotifier()
-    s, _ = make_sentinel(cfg, store, dash, notifier, now=now)
+    s, _ = make_bot(cfg, store, dash, notifier, now=now)
 
     orig_post = dash.post
 
@@ -466,7 +466,7 @@ def test_guard_rejection_is_classified(tmp_path):
         "ok": False,
         "error": "predicted SNR 41 above the imager-safe ceiling",
     })
-    s, _ = make_sentinel(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.GUARD_REJECTED
 
@@ -494,7 +494,7 @@ def _rows_for_summary(now):
 def test_summary_stats_counts_and_attribution(tmp_path):
     now = time.time()
     cfg = make_config(tmp_path)
-    s = InjectSentinel(cfg, store=FakeStore(), notifier=FakeNotifier(),
+    s = InjectBot(cfg, store=FakeStore(), notifier=FakeNotifier(),
                        http_post_form=lambda *a: (200, {}),
                        http_get=lambda *a: (200, {}))
     stats = s.compute_summary_stats(_rows_for_summary(now))
@@ -512,7 +512,7 @@ def test_summary_plots_render_as_separate_figures(tmp_path):
     pytest.importorskip("matplotlib")
     now = time.time()
     cfg = make_config(tmp_path)
-    s = InjectSentinel(cfg, store=FakeStore(), notifier=FakeNotifier(),
+    s = InjectBot(cfg, store=FakeStore(), notifier=FakeNotifier(),
                        http_post_form=lambda *a: (200, {}),
                        http_get=lambda *a: (200, {}))
     out_dir = tmp_path / "plots"
@@ -529,7 +529,7 @@ def test_daily_summary_once_per_day_gate(tmp_path):
     now = time.time()
     cfg = make_config(tmp_path, summary_hour_utc=0)  # always past the hour
     notifier = FakeNotifier()
-    s, _ = make_sentinel(
+    s, _ = make_bot(
         cfg, FakeStore(healthy_docs(now)), FakeDash(now), notifier, now=now)
     for r in _rows_for_summary(now):
         s._append_result(r)
@@ -561,10 +561,10 @@ def test_mirrored_constants_match_dashboard_source():
         f"{isent.CALIBRATION_WIDTH_SAMPLES}" in src
     )
     assert f"DEFAULT_CORR_FAST_MAX_AGE_S" in src
-    # The sentinel's ceiling assumptions: guard constant present and the
+    # The bot's ceiling assumptions: guard constant present and the
     # config default target range sits below it.
     assert "IMAGER_SAFE_OBSERVED_SNR: float = 30.0" in src
-    assert SentinelConfig().target_snr_max < 30.0
+    assert InjectBotConfig().target_snr_max < 30.0
 
 
 def test_bucket_key_matches_dashboard_examples():

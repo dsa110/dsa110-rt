@@ -1052,18 +1052,18 @@ slack_relay:
   fallback_sweep_s: 600.0
 
 # ---------------------------------------------------------------------------
-# Injection sentinel (dsart.services.inject_sentinel). Separate process/unit
-# (systemd/dsart_inject_sentinel.service) on h23: fires one test injection
+# Injection bot (dsart.inject.bot). Separate process/unit
+# (systemd/dsart_inject_bot.service) on h23: fires one test injection
 # roughly every interval_s through the dashboard's /control/inject (sharing
 # its K lookup + fp16-imager brightness guard), auto-refreshes each DM
 # bucket's K when stale (> k_max_age_s) or measured at a different pointing
 # dec, posts per-injection sent/recovered text messages to Slack, and posts
 # one daily summary plot. Never writes etcd; never touches candidate dirs.
 # C2 skips voltage dumps for matcher-tagged injections
-# (coincidencer._maybe_broadcast_voltage), so sentinel shots cost cube dumps
+# (coincidencer._maybe_broadcast_voltage), so bot shots cost cube dumps
 # only.
 # ---------------------------------------------------------------------------
-inject_sentinel:
+inject_bot:
   enabled: true
   # Same channel as the candidate cards (operator decision 2026-08-07:
   # keep injection traffic where the team already looks, ~48 short
@@ -1078,7 +1078,7 @@ inject_sentinel:
   dm_choices: [500.0, 1000.0, 1500.0, 2000.0]
   # Target SNR window: comfortably above the 12-sigma C1 floor, and below
   # the dashboard's 30-sigma-predicted brightness guard even with the
-  # ~25% pixel-straddle scatter. The sentinel never passes allow_bright.
+  # ~25% pixel-straddle scatter. The bot never passes allow_bright.
   target_snr_min: 15.0
   target_snr_max: 25.0
   width_samples: 4            # MUST match the K-calibration probe width
@@ -1087,6 +1087,6 @@ inject_sentinel:
   k_dec_tol_deg: 0.5          # recalibrate K after a re-point
   recovery_timeout_s: 720.0
   summary_hour_utc: 16
-  results_path: "/dataz/dsa110/operations/inject/sentinel_results.jsonl"
-  state_path: "~/.dsa_monitor/inject_sentinel_state.json"
-  summary_dir: "~/.dsa_monitor/inject_sentinel"
+  results_path: "/dataz/dsa110/operations/inject/inject_bot_results.jsonl"
+  state_path: "~/.dsa_monitor/inject_bot_state.json"
+  summary_dir: "~/.dsa_monitor/inject_bot"

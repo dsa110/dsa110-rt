@@ -1,6 +1,6 @@
-"""Injection sentinel: hourly end-to-end test injections + Slack reporting.
+"""Injection bot: hourly end-to-end test injections + Slack reporting.
 
-Standalone h23 service (``systemd/dsart_inject_sentinel.service``,
+Standalone h23 service (``systemd/dsart_inject_bot.service``,
 modeled on the annotation relay). Every ``interval_s`` (default 1 h,
 jittered) it:
 
@@ -16,7 +16,7 @@ jittered) it:
 3. refreshes the DM bucket's K calibration first when it is older than
    ``k_max_age_s``, missing, or was measured at a pointing declination
    more than ``k_dec_tol_deg`` away from the current one (the K store
-   itself carries no dec provenance — the sentinel records the dec it
+   itself carries no dec provenance — the bot records the dec it
    observed at calibration time in its own state file);
 4. fires the injection through the dashboard's ``POST /control/inject``
    (so the K lookup, payload validation, and the fp16-imager brightness
@@ -71,13 +71,13 @@ import yaml
 
 from dsart.services.slack_notify import SlackNotifier, SlackNotifyConfig
 
-LOG = logging.getLogger("dsart.services.inject_sentinel")
+LOG = logging.getLogger("dsart.inject.bot")
 
 # ---------------------------------------------------------------------------
 # Constants mirrored from the dashboard's inject_calibration module.
 # tools/dashboard/dsa_monitor is not an importable package from the
-# service env, so the handful of values the sentinel needs are pinned
-# here; ``tests/test_inject_sentinel.py`` cross-checks them against the
+# service env, so the handful of values the bot needs are pinned
+# here; ``tests/test_inject_bot.py`` cross-checks them against the
 # dashboard source so drift is caught in CI, same pattern the matcher
 # uses for ACTIVE_INJECT_PREFIX.
 # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ DM_BUCKET_PC_CC = 50.0
 #: (inject_calibration.DEFAULT_CALIBRATION_WIDTH, NATIVE 32.768 us
 #: samples). Sub-search-sample widths make observed SNR scale linearly
 #: with fluence, so target-SNR shots are only self-consistent at the
-#: calibration width — the sentinel pins its width to this.
+#: calibration width — the bot pins its width to this.
 CALIBRATION_WIDTH_SAMPLES = 4
 
 #: Search halves the health gate checks (sid, gpu_half) — mirrors
@@ -108,7 +108,7 @@ SEARCH_MAX_AGE_S = 30.0
 
 #: Dashboard hard limit is INJECT_LM_MAX_RAD = 0.0279; beyond ~0.02 the
 #: primary beam attenuates and FFT aliasing risk grows (see the
-#: /control/inject docstring), so the sentinel default stays inside it.
+#: /control/inject docstring), so the bot default stays inside it.
 DEFAULT_LM_MAX_RAD = 0.02
 
 
@@ -128,7 +128,7 @@ def bucket_key(dm_pc_cm3: float) -> str:
 
 
 @dataclass(frozen=True)
-class SentinelConfig:
+class InjectBotConfig:
     enabled: bool = False
     #: Slack channel + token plumbing (SlackNotifyConfig subset).
     channel: str = ""
@@ -162,10 +162,10 @@ class SentinelConfig:
     summary_hour_utc: int = 16
 
     results_path: str = (
-        "/dataz/dsa110/operations/inject/sentinel_results.jsonl"
+        "/dataz/dsa110/operations/inject/inject_bot_results.jsonl"
     )
-    state_path: str = "~/.dsa_monitor/inject_sentinel_state.json"
-    summary_dir: str = "~/.dsa_monitor/inject_sentinel"
+    state_path: str = "~/.dsa_monitor/inject_bot_state.json"
+    summary_dir: str = "~/.dsa_monitor/inject_bot"
     candidates_root: str = "/dataz/dsa110/candidates"
 
     pointing_dec_etcd_key: str = "/mon/array/dec"
@@ -173,7 +173,7 @@ class SentinelConfig:
     unhealthy_warn_interval_s: float = 21600.0
 
     @classmethod
-    def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "SentinelConfig":
+    def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "InjectBotConfig":
         d = d or {}
         dms = d.get("dm_choices", [500.0, 1000.0, 1500.0, 2000.0])
         return cls(
@@ -203,11 +203,11 @@ class SentinelConfig:
             summary_hour_utc=int(d.get("summary_hour_utc", 16)),
             results_path=str(d.get(
                 "results_path",
-                "/dataz/dsa110/operations/inject/sentinel_results.jsonl")),
+                "/dataz/dsa110/operations/inject/inject_bot_results.jsonl")),
             state_path=str(d.get(
-                "state_path", "~/.dsa_monitor/inject_sentinel_state.json")),
+                "state_path", "~/.dsa_monitor/inject_bot_state.json")),
             summary_dir=str(d.get(
-                "summary_dir", "~/.dsa_monitor/inject_sentinel")),
+                "summary_dir", "~/.dsa_monitor/inject_bot")),
             candidates_root=str(d.get(
                 "candidates_root", "/dataz/dsa110/candidates")),
             pointing_dec_etcd_key=str(d.get(
@@ -217,10 +217,10 @@ class SentinelConfig:
         )
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "SentinelConfig":
+    def from_yaml(cls, path: Path) -> "InjectBotConfig":
         with Path(path).open("r", encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
-        return cls.from_dict(doc.get("inject_sentinel"))
+        return cls.from_dict(doc.get("inject_bot"))
 
 
 # ---------------------------------------------------------------------------
@@ -263,11 +263,11 @@ _MISS_EXPLANATIONS = {
 
 
 # ---------------------------------------------------------------------------
-# Sentinel
+# bot
 # ---------------------------------------------------------------------------
 
 
-class InjectSentinel:
+class InjectBot:
     """One instance == one poll loop. All collaborators injectable for
     tests: ``store`` needs ``get_dict(key)``; ``http_post_form`` /
     ``http_get`` mimic the two ``requests`` calls; ``notifier`` needs
@@ -275,7 +275,7 @@ class InjectSentinel:
 
     def __init__(
         self,
-        config: SentinelConfig,
+        config: InjectBotConfig,
         *,
         store: Optional[Any] = None,
         notifier: Optional[Any] = None,
@@ -459,7 +459,7 @@ class InjectSentinel:
                     "dm_pc_cm3": dm,
                     "width_samples": cfg.width_samples,
                     "poll_timeout_s": cfg.calibrate_poll_timeout_s,
-                    "user": "inject_sentinel",
+                    "user": "inject_bot",
                 },
             )
             info["recalibrated"] = bool(doc.get("ok"))
@@ -517,7 +517,7 @@ class InjectSentinel:
         try:
             record = self._run_cycle_inner()
         except Exception as exc:  # noqa: BLE001 — the loop must survive
-            LOG.exception("sentinel cycle failed unexpectedly")
+            LOG.exception("bot cycle failed unexpectedly")
             record = {
                 "ts_unix": self._time(),
                 "outcome": Outcome.FIRE_FAILED,
@@ -1248,7 +1248,7 @@ class InjectSentinel:
         stop_event = stop_event or threading.Event()
         self._stop_event = stop_event
         LOG.info(
-            "inject_sentinel: starting (interval=%.0fs jitter=%.0fs "
+            "inject_bot: starting (interval=%.0fs jitter=%.0fs "
             "dms=%s snr=[%.1f, %.1f] channel=%s)",
             cfg.interval_s, cfg.jitter_s, list(cfg.dm_choices),
             cfg.target_snr_min, cfg.target_snr_max, cfg.channel or "(none)",
@@ -1281,7 +1281,7 @@ class InjectSentinel:
                     -cfg.jitter_s, cfg.jitter_s),
             )
             stop_event.wait(delay)
-        LOG.info("inject_sentinel: stopped")
+        LOG.info("inject_bot: stopped")
 
 
 def _as_float(v: Any) -> Optional[float]:
@@ -1299,7 +1299,7 @@ def _as_float(v: Any) -> Optional[float]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Hourly injection sentinel with Slack reporting")
+        description="Hourly injection bot with Slack reporting")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument(
         "--summary-now", action="store_true",
@@ -1313,33 +1313,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    cfg = SentinelConfig.from_yaml(args.config)
+    cfg = InjectBotConfig.from_yaml(args.config)
     if not cfg.enabled and not (args.summary_now or args.once):
         LOG.error(
-            "inject_sentinel: disabled in config (inject_sentinel.enabled); "
+            "inject_bot: disabled in config (inject_bot.enabled); "
             "refusing to start the loop")
         return 2
-    sentinel = InjectSentinel(cfg)
+    bot = InjectBot(cfg)
 
     if args.summary_now:
-        result = sentinel.post_daily_summary()
+        result = bot.post_daily_summary()
         print(json.dumps(result.get("stats", {}), indent=1, sort_keys=True))
         return 0 if result.get("ok") else 1
     if args.once:
-        record = sentinel.run_cycle()
+        record = bot.run_cycle()
         print(json.dumps(record, indent=1, sort_keys=True, default=str))
         return 0
 
     stop_event = threading.Event()
 
     def _handle_signal(signum: int, frame: Any) -> None:
-        LOG.info("inject_sentinel: received signal %s, shutting down", signum)
+        LOG.info("inject_bot: received signal %s, shutting down", signum)
         stop_event.set()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    sentinel.run_forever(stop_event)
+    bot.run_forever(stop_event)
     return 0
 
 

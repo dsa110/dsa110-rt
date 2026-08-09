@@ -1,5 +1,5 @@
 [Unit]
-Description=DSA-110 dsart-rt hourly injection sentinel with Slack reporting (h23)
+Description=DSA-110 dsart-rt hourly injection bot with Slack reporting (h23)
 After=network-online.target
 Wants=network-online.target
 
@@ -11,7 +11,7 @@ Type=simple
 # candidates archive read-only, and appends to its own JSONL under
 # /dataz/dsa110/operations/inject/. Modeled on dsart_slack_relay.service.
 WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
-ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.services.inject_sentinel --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.inject.bot --config /home/ubuntu/vikram/dev/dsa110-rt/configs/dsart_search_rt.yaml
 Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
 Environment=PATH=/home/ubuntu/anaconda3/envs/dsart_h23/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
@@ -25,7 +25,7 @@ LimitNOFILE=16384
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=dsart_inject_sentinel
+SyslogIdentifier=dsart_inject_bot
 
 [Install]
 WantedBy=default.target
