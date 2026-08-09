@@ -1253,6 +1253,15 @@ class InjectSentinel:
             cfg.interval_s, cfg.jitter_s, list(cfg.dm_choices),
             cfg.target_snr_min, cfg.target_snr_max, cfg.channel or "(none)",
         )
+        # Wall-clock anchored cadence: the next shot is scheduled one
+        # interval after the PREVIOUS shot's scheduled time, not after
+        # the cycle finished — a cycle spends up to ~13 min in the
+        # recovery watch (plus K recals), and sleep-after-finish would
+        # yield ~20-23 attempts/day instead of the expected 24. Jitter
+        # perturbs each tick but does not accumulate. If a cycle ever
+        # overruns its whole slot, the anchor is re-based (no backlog
+        # of instant catch-up shots).
+        next_fire = self._time()
         while not stop_event.is_set():
             record = self.run_cycle()
             LOG.info(
@@ -1262,9 +1271,16 @@ class InjectSentinel:
             if self.summary_due():
                 summary = self.post_daily_summary()
                 LOG.info("daily summary posted: ok=%s", summary.get("ok"))
-            delay = cfg.interval_s + self._rng.uniform(
-                -cfg.jitter_s, cfg.jitter_s)
-            stop_event.wait(max(60.0, delay))
+            next_fire += cfg.interval_s
+            now = self._time()
+            if next_fire < now + 60.0:
+                next_fire = now + 60.0
+            delay = max(
+                60.0,
+                next_fire - now + self._rng.uniform(
+                    -cfg.jitter_s, cfg.jitter_s),
+            )
+            stop_event.wait(delay)
         LOG.info("inject_sentinel: stopped")
 
 
