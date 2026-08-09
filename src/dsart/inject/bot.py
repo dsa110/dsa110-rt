@@ -623,7 +623,7 @@ class InjectBot:
             dm=float(record.get("dm_pc_cm3") or 0),
             snr=float(record.get("target_snr") or 0),
             fl=(
-                f"{float(record['fluence_jy_ms']):.3g} Jy*ms"
+                f"{float(record['fluence_jy_ms']):.3g} Jy ms"
                 if record.get("fluence_jy_ms") is not None else "n/a"
             ),
             w=record.get("width_samples"),
