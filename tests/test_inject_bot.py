@@ -231,7 +231,7 @@ def test_unhealthy_fleet_alerts_only_after_streak(tmp_path):
 
     s.run_cycle()  # fifth consecutive skip: ONE attention message
     assert len(notifier.texts) == 1
-    assert "attention" in notifier.texts[0]["text"]
+    assert "ATTENTION" in notifier.texts[0]["text"]
     assert "not searching" in notifier.texts[0]["text"]
     assert "chgroups=7" in notifier.texts[0]["text"]
 
@@ -474,14 +474,14 @@ def test_no_match_doc_is_missed_search_or_c1(tmp_path):
     # Five consecutive misses -> exactly ONE attention message.
     for _ in range(4):
         s.run_cycle()
-    attention = [t for t in notifier.texts if "attention" in t["text"]]
+    attention = [t for t in notifier.texts if "ATTENTION" in t["text"]]
     assert len(attention) == 1
     assert "5 consecutive test injections missed" in attention[0]["text"]
     assert "inj_" in attention[0]["text"]
 
     # Streak continues: no repeat alert.
     s.run_cycle()
-    attention = [t for t in notifier.texts if "attention" in t["text"]]
+    attention = [t for t in notifier.texts if "ATTENTION" in t["text"]]
     assert len(attention) == 1
 
 
