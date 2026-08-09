@@ -745,7 +745,7 @@ class InjectBot:
             state["miss_streak_ids"] = ids[-10:]
             if streak == self._cfg.miss_alert_streak:
                 text = (
-                    "\U0001F6A8 *ATTENTION*: {n} consecutive test injections missed "
+                    "*ATTENTION*: {n} consecutive test injections missed "
                     "({ids}). The search pipeline may be missing real "
                     "FRBs; latest loss stage: {why}"
                 ).format(
@@ -766,7 +766,7 @@ class InjectBot:
             if streak == self._cfg.unhealthy_alert_streak:
                 hours = streak * self._cfg.interval_s / 3600.0
                 text = (
-                    "\U0001F6A8 *ATTENTION*: pipeline not searching for {n} "
+                    "*ATTENTION*: pipeline not searching for {n} "
                     "consecutive test-injection cycles (~{h:.0f} h); "
                     "no shots attempted. Latest reason: {reason}"
                 ).format(n=streak, h=hours,
