@@ -743,7 +743,13 @@ class InjectBot:
             ids = list(state.get("miss_streak_ids") or [])
             ids.append(str(record.get("inj_id")))
             state["miss_streak_ids"] = ids[-10:]
-            if streak == self._cfg.miss_alert_streak:
+            # Re-alert at every multiple of the threshold (5, 10, 15,
+            # ...): a persisting failure re-pings every ~threshold
+            # cycles with the updated count, but never per-cycle.
+            if (
+                self._cfg.miss_alert_streak > 0
+                and streak % self._cfg.miss_alert_streak == 0
+            ):
                 text = (
                     "*ATTENTION*: {n} consecutive test injections missed "
                     "({ids}). The search pipeline may be missing real "
@@ -763,7 +769,10 @@ class InjectBot:
         elif outcome == Outcome.NOT_SEARCHING:
             streak = int(state.get("unhealthy_streak") or 0) + 1
             state["unhealthy_streak"] = streak
-            if streak == self._cfg.unhealthy_alert_streak:
+            if (
+                self._cfg.unhealthy_alert_streak > 0
+                and streak % self._cfg.unhealthy_alert_streak == 0
+            ):
                 hours = streak * self._cfg.interval_s / 3600.0
                 text = (
                     "*ATTENTION*: pipeline not searching for {n} "

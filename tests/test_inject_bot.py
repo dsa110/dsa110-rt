@@ -235,11 +235,16 @@ def test_unhealthy_fleet_alerts_only_after_streak(tmp_path):
     assert "not searching" in notifier.texts[0]["text"]
     assert "chgroups=7" in notifier.texts[0]["text"]
 
-    s.run_cycle()  # streak continues: no repeat
+    s.run_cycle()  # sixth skip: no repeat yet
     assert len(notifier.texts) == 1
 
+    for _ in range(4):
+        s.run_cycle()  # tenth consecutive skip: re-alert with new count
+    assert len(notifier.texts) == 2
+    assert "10" in notifier.texts[1]["text"]
+
     # All attempts landed in the JSONL.
-    assert len(s.load_results_since(0)) == 6
+    assert len(s.load_results_since(0)) == 10
 
 
 def test_metering_active_counts_as_unhealthy(tmp_path):
@@ -479,10 +484,16 @@ def test_no_match_doc_is_missed_search_or_c1(tmp_path):
     assert "5 consecutive test injections missed" in attention[0]["text"]
     assert "inj_" in attention[0]["text"]
 
-    # Streak continues: no repeat alert.
+    # Streak continues: no repeat until the next threshold multiple.
     s.run_cycle()
     attention = [t for t in notifier.texts if "ATTENTION" in t["text"]]
     assert len(attention) == 1
+
+    for _ in range(4):
+        s.run_cycle()  # 10 consecutive misses: re-alert
+    attention = [t for t in notifier.texts if "ATTENTION" in t["text"]]
+    assert len(attention) == 2
+    assert "10 consecutive test injections missed" in attention[1]["text"]
 
 
 def test_match_without_event_is_missed_c2(tmp_path):
