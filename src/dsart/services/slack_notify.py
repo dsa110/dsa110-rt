@@ -201,14 +201,17 @@ class SlackNotifier:
         *,
         thread_ts: Optional[str] = None,
         reply_broadcast: bool = False,
+        attachments: Optional[List[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Post a plain text message to the configured channel.
 
         General-purpose entry point for non-C3 producers (e.g. the
-        injection sentinel). ``thread_ts`` threads the message onto an
-        existing one. Returns ``{"ok": True, "ts": <message ts>}`` on
-        success, ``{"ok": False, "error": ...}`` otherwise. Always
-        returns a status dict, never raises.
+        injection bot). ``thread_ts`` threads the message onto an
+        existing one; ``attachments`` passes Slack attachment dicts
+        through verbatim (the color-bar mechanism the annotation relay
+        uses). Returns ``{"ok": True, "ts": <message ts>}`` on success,
+        ``{"ok": False, "error": ...}`` otherwise. Always returns a
+        status dict, never raises.
         """
         if not self._cfg.enabled:
             return {"ok": False, "error": "disabled"}
@@ -220,6 +223,8 @@ class SlackNotifier:
                 "channel": self._cfg.channel,
                 "text": text,
             }
+            if attachments:
+                payload["attachments"] = [dict(a) for a in attachments]
             if thread_ts:
                 payload["thread_ts"] = thread_ts
                 if reply_broadcast:
@@ -233,6 +238,39 @@ class SlackNotifier:
             return {"ok": True, "ts": resp.get("ts")}
         except Exception as exc:  # noqa: BLE001 — never break the caller
             LOG.exception("slack_notify: unexpected failure (post_text)")
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def update_text(
+        self,
+        ts: str,
+        text: str,
+        *,
+        attachments: Optional[List[Mapping[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Edit a previously posted message (``chat.update`` on this
+        bot's own message ``ts`` in the configured channel), optionally
+        replacing its attachments. Returns ``{"ok": True, "ts": ts}``
+        on success; never raises."""
+        if not self._cfg.enabled:
+            return {"ok": False, "error": "disabled"}
+        try:
+            token = self._token()
+            if not token:
+                return {"ok": False, "error": "no_token"}
+            payload: Dict[str, Any] = {
+                "channel": self._cfg.channel, "ts": ts, "text": text,
+            }
+            if attachments:
+                payload["attachments"] = [dict(a) for a in attachments]
+            resp = self._api_post("chat.update", token, payload)
+            if not resp or not resp.get("ok"):
+                return {
+                    "ok": False,
+                    "error": (resp or {}).get("error", "request_failed"),
+                }
+            return {"ok": True, "ts": resp.get("ts", ts)}
+        except Exception as exc:  # noqa: BLE001 — never break the caller
+            LOG.exception("slack_notify: unexpected failure (update_text)")
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def post_file(

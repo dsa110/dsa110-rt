@@ -52,13 +52,24 @@ class FakeStore:
 class FakeNotifier:
     def __init__(self):
         self.texts = []
+        self.updates = []
         self.files = []
         self._ts = 0
 
-    def post_text(self, text, thread_ts=None, reply_broadcast=False):
+    def post_text(self, text, thread_ts=None, reply_broadcast=False,
+                  attachments=None):
         self._ts += 1
-        self.texts.append({"text": text, "thread_ts": thread_ts})
+        self.texts.append({
+            "text": text, "thread_ts": thread_ts,
+            "attachments": attachments,
+        })
         return {"ok": True, "ts": f"ts{self._ts}"}
+
+    def update_text(self, ts, text, attachments=None):
+        self.updates.append({
+            "ts": ts, "text": text, "attachments": attachments,
+        })
+        return {"ok": True, "ts": ts}
 
     def post_file(self, path, title=None, initial_comment=None,
                   thread_ts=None):
@@ -339,7 +350,7 @@ def test_picked_params_respect_bounds(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _run_recovered_cycle(tmp_path, *, keep=True, c3_written=True):
+def _run_recovered_cycle(tmp_path, *, keep=True, c3_written=True, ncubes=8):
     now = time.time()
     cfg = make_config(tmp_path)
     dash = FakeDash(now)
@@ -362,7 +373,7 @@ def _run_recovered_cycle(tmp_path, *, keep=True, c3_written=True):
                           l=float(fields["l_rad"]),
                           m=float(fields["m_rad"]))
             add_event(tmp_path, cfg, "260807test", inj_id,
-                      keep=keep, c3_written=c3_written)
+                      keep=keep, c3_written=c3_written, ncubes=ncubes)
             # Event dir mtime must be >= fired_at - 60 (it is: just made).
             fired["inj_id"] = inj_id
         return status, doc
@@ -382,34 +393,55 @@ def test_recovered_cycle_end_to_end(tmp_path):
     assert rec["inj_id"].startswith("inj_")
     assert len(rec["inj_id"]) == 15  # inj_DDMMYY_HHMM
     assert rec["inj_id"][8:10] == "26"  # two-digit year present
-    # Recovered message links the event to its dashboard burst page.
-    assert "/bursts/260807test|260807test>" in notifier.texts[1]["text"]
     assert rec["snr_ratio"] == pytest.approx(19.0 / 20.0)
     assert rec["offset_arcsec"] == pytest.approx(
         1e-4 * 180 / math.pi * 3600, rel=1e-6)
     # allow_bright must never be sent.
     assert all("allow_bright" not in c for c in dash.inject_calls)
-    # Two Slack texts: sent + threaded recovered.
-    assert len(notifier.texts) == 2
-    assert notifier.texts[0]["thread_ts"] is None
-    assert notifier.texts[1]["thread_ts"] == "ts1"
+    # One Slack text (the sent message), then an in-place edit of it.
+    assert len(notifier.texts) == 1
     assert "injection sent" in notifier.texts[0]["text"]
-    body = notifier.texts[1]["text"]
-    assert "recovered" in body and "260807test" in body
-    assert "(l,m)" in body and "mrad" in body
-    assert "DM" in body and "SNR" in body
+    assert "awaiting recovery" in notifier.texts[0]["text"]
+    assert "(l,m)" in notifier.texts[0]["text"]
+    assert len(notifier.updates) == 1
+    up = notifier.updates[0]
+    assert up["ts"] == "ts1"
+    assert "awaiting recovery" not in up["text"]
+    att = up["attachments"][0]
+    assert att["color"] == "#2E7D32"  # green bar for recovered
+    body = att["text"]
+    # Outcome line links the event to its dashboard burst page, and
+    # holds SNR/DM/offset. No emojis, no C3, no found-by; cube count
+    # absent when complete (8/8).
+    assert "/bursts/260807test|260807test>" in body
+    assert "recovered ->" in body and "SNR" in body and "DM" in body
+    assert "offset" in body and "arcsec" in body
+    assert "cubes" not in body
+    assert "C3" not in body and "found by" not in body
+
+
+def test_incomplete_cubes_surface_in_outcome_line(tmp_path):
+    rec, notifier, _, _ = _run_recovered_cycle(tmp_path, ncubes=6)
+    assert rec["outcome"] == Outcome.RECOVERED
+    assert "cubes 6/8" in notifier.updates[0]["attachments"][0]["text"]
 
 
 def test_c3_reject_is_missed_c3(tmp_path):
     rec, notifier, _, _ = _run_recovered_cycle(tmp_path, keep=False)
     assert rec["outcome"] == Outcome.MISSED_C3
-    assert "ANOMALY" in notifier.texts[1]["text"]
+    # Edit shows the red outcome; the loud alert is a second text.
+    assert "ANOMALY" in notifier.updates[0]["attachments"][0]["text"]
+    assert notifier.updates[0]["attachments"][0]["color"] == "#C62828"
+    assert "MISSED" in notifier.texts[1]["text"]
 
 
 def test_c3_pending_still_counts_recovered(tmp_path):
+    # C3 decision not yet written: still a recovery (C3 always keeps
+    # injections; its verdict is deliberately absent from the line).
     rec, notifier, _, _ = _run_recovered_cycle(tmp_path, c3_written=False)
     assert rec["outcome"] == Outcome.RECOVERED
-    assert "pending" in notifier.texts[1]["text"]
+    body = notifier.updates[0]["attachments"][0]["text"]
+    assert "recovered ->" in body and "260807test" in body
 
 
 def test_no_match_doc_is_missed_search_or_c1(tmp_path):
@@ -424,7 +456,11 @@ def test_no_match_doc_is_missed_search_or_c1(tmp_path):
         cfg, FakeStore(healthy_docs(now)), dash, notifier, now=now)
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.MISSED_SEARCH_OR_C1
-    assert "NOT recovered" in notifier.texts[1]["text"]
+    # Edit carries the red outcome line; a separate loud alert follows.
+    up = notifier.updates[0]
+    assert "NOT recovered" in up["attachments"][0]["text"]
+    assert up["attachments"][0]["color"] == "#C62828"
+    assert "MISSED" in notifier.texts[1]["text"]
     assert "search/C1" in notifier.texts[1]["text"]
 
 
@@ -452,6 +488,7 @@ def test_match_without_event_is_missed_c2(tmp_path):
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.MISSED_C2
     assert rec["observed_snr"] == pytest.approx(19.0)
+    assert "lost at C2" in notifier.updates[0]["attachments"][0]["text"]
     assert "lost at C2" in notifier.texts[1]["text"]
 
 

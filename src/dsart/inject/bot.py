@@ -586,17 +586,22 @@ class InjectBot:
         recovery = self.watch_recovery(inj_id, fired_at)
         record.update(recovery)
 
-        self._post_recovery_message(record, thread_ts=sent_ts)
+        self._post_recovery_message(record, sent_ts=sent_ts)
         return record
 
     # ----- Slack messages (plain text only) ---------------------------------
 
-    def _post_sent_message(self, record: Mapping[str, Any]) -> Optional[str]:
+    #: Outcome colors for the Slack attachment bar (same mechanism the
+    #: annotation relay uses; actual color without emoji).
+    _COLOR_RECOVERED = "#2E7D32"
+    _COLOR_MISSED = "#C62828"
+
+    def _sent_text(self, record: Mapping[str, Any]) -> str:
         # NBSP joins every number to its unit so Slack's line wrapping
         # can never split them; (l, m) are reported in mrad at two
         # decimals (0.01 mrad ~ 2 arcsec, ample for a message).
         dec = record.get("pointing_dec_deg")
-        text = (
+        return (
             "injection sent: `{inj_id}`\n"
             "DM {dm:.0f} pc/cc | target SNR {snr:.1f} | "
             "fluence {fl} | width {w} native | "
@@ -614,18 +619,12 @@ class InjectBot:
             m=float(record.get("m_rad") or 0) * 1e3,
             dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
         )
-        resp = self._notifier.post_text(text)
-        if not resp.get("ok"):
-            LOG.warning("slack sent-post failed: %s", resp)
-            return None
-        return resp.get("ts")
 
-    def _post_recovery_message(
-        self, record: Mapping[str, Any], *, thread_ts: Optional[str],
-    ) -> None:
+    def _outcome_line(self, record: Mapping[str, Any]) -> str:
+        """One line describing how the shot resolved (goes into the
+        colored attachment of the edited sent message)."""
         outcome = record.get("outcome")
         if outcome == Outcome.RECOVERED:
-            dm_obs = record.get("observed_dm_pc_cm3")
             event = record.get("event")
             if event:
                 # Same burst-page link the candidate cards carry.
@@ -633,44 +632,84 @@ class InjectBot:
                     base=self._cfg.dashboard_base_url.rstrip("/"), ev=event)
             else:
                 event_ref = "(pending archive)"
-            # Same NBSP-joined number+unit convention as the sent post;
-            # (l, m) in mrad at two decimals.
-            text = (
-                "recovered: `{inj_id}` -> {event}\n"
-                "SNR {osnr:.1f} (target {tsnr:.1f}, ratio {ratio:.2f}) | "
-                "DM {odm} (injected {idm:.0f}, delta {ddm}) | "
-                "(l,m) = ({ol:+.2f}, {om:+.2f}) mrad, "
-                "offset {off} (injected ({il:+.2f}, {im:+.2f})) | "
-                "found by s{sid}g{g} | cubes {cubes} | C3 {c3}"
+            dm_obs = record.get("observed_dm_pc_cm3")
+            line = (
+                "recovered -> {event} | SNR {osnr:.1f} (ratio {ratio:.2f})"
+                " | DM {odm} (delta {ddm}) | offset {off}"
             ).format(
-                inj_id=record.get("inj_id"),
                 event=event_ref,
                 osnr=float(record.get("observed_snr") or 0),
-                tsnr=float(record.get("target_snr") or 0),
                 ratio=float(record.get("snr_ratio") or 0),
-                odm=(f"{float(dm_obs):.1f}" if dm_obs is not None else "n/a"),
-                idm=float(record.get("dm_pc_cm3") or 0),
+                odm=(f"{float(dm_obs):.1f}"
+                     if dm_obs is not None else "n/a"),
                 ddm=(
                     f"{float(record['delta_dm_pc_cm3']):+.1f}"
                     if record.get("delta_dm_pc_cm3") is not None else "n/a"
                 ),
-                ol=float(record.get("observed_l_rad") or 0) * 1e3,
-                om=float(record.get("observed_m_rad") or 0) * 1e3,
                 off=(
                     f"{float(record['offset_arcsec']):.0f} arcsec"
                     if record.get("offset_arcsec") is not None else "n/a"
                 ),
-                il=float(record.get("l_rad") or 0) * 1e3,
-                im=float(record.get("m_rad") or 0) * 1e3,
-                sid=record.get("observed_search_node_id"),
-                g=record.get("observed_gpu_half"),
-                cubes=record.get("cubes", "n/a"),
-                c3=record.get("c3_decision", "pending"),
             )
+            # Cube count is printed ONLY when incomplete: a recovered
+            # shot archived with < 8 cubes flags dump-path trouble;
+            # a healthy 8/8 stays silent.
+            cubes = record.get("cubes")
+            if isinstance(cubes, int) and cubes < 8:
+                line += f" | cubes {cubes}/8"
+            return line
+        return "NOT recovered: " + _MISS_EXPLANATIONS.get(
+            str(outcome), f"outcome={outcome}")
+
+    def _post_sent_message(self, record: Mapping[str, Any]) -> Optional[str]:
+        resp = self._notifier.post_text(
+            self._sent_text(record) + "\n_awaiting recovery..._")
+        if not resp.get("ok"):
+            LOG.warning("slack sent-post failed: %s", resp)
+            return None
+        return resp.get("ts")
+
+    def _post_recovery_message(
+        self, record: Mapping[str, Any], *, sent_ts: Optional[str],
+    ) -> None:
+        """Resolve the shot in Slack: EDIT the sent message in place so
+        the channel holds exactly one message per injection, outcome
+        readable at a skim (colored attachment bar, no thread click).
+        A miss additionally posts its own fresh top-level alert: quiet
+        on success, loud on failure."""
+        outcome = record.get("outcome")
+        recovered = outcome == Outcome.RECOVERED
+        line = self._outcome_line(record)
+        attachment = {
+            "color": (self._COLOR_RECOVERED if recovered
+                      else self._COLOR_MISSED),
+            "text": line,
+            "fallback": line,
+        }
+        if sent_ts:
+            resp = self._notifier.update_text(
+                sent_ts, self._sent_text(record),
+                attachments=[attachment])
+            if not resp.get("ok"):
+                LOG.warning("slack sent-edit failed: %s", resp)
+                # Degrade to a fresh message so the outcome is never lost.
+                self._notifier.post_text(
+                    f"`{record.get('inj_id')}`: {line}",
+                    attachments=[attachment])
         else:
-            text = (
-                "NOT recovered: `{inj_id}` (DM {dm:.0f}, target SNR "
-                "{snr:.1f})\n{why}"
+            self._notifier.post_text(
+                f"`{record.get('inj_id')}`: {line}",
+                attachments=[attachment])
+
+        if not recovered:
+            if outcome == Outcome.MISSED_C3:
+                LOG.error(
+                    "C3 rejected a tagged injection (%s): marker "
+                    "propagation failure, investigate", record.get("inj_id"),
+                )
+            alert = (
+                "test injection MISSED: `{inj_id}` (DM {dm:.0f}, "
+                "target SNR {snr:.1f})\n{why}"
             ).format(
                 inj_id=record.get("inj_id"),
                 dm=float(record.get("dm_pc_cm3") or 0),
@@ -678,14 +717,13 @@ class InjectBot:
                 why=_MISS_EXPLANATIONS.get(
                     str(outcome), f"outcome={outcome}"),
             )
-            if outcome == Outcome.MISSED_C3:
-                LOG.error(
-                    "C3 rejected a tagged injection (%s) - marker "
-                    "propagation failure, investigate", record.get("inj_id"),
-                )
-        resp = self._notifier.post_text(text, thread_ts=thread_ts)
-        if not resp.get("ok"):
-            LOG.warning("slack recovery-post failed: %s", resp)
+            resp = self._notifier.post_text(
+                alert, attachments=[{
+                    "color": self._COLOR_MISSED,
+                    "text": "", "fallback": alert,
+                }])
+            if not resp.get("ok"):
+                LOG.warning("slack miss-alert failed: %s", resp)
 
     def _warn_unhealthy(self, reason: str) -> None:
         state = self._load_state()
@@ -928,8 +966,10 @@ class InjectBot:
         return stats
 
     def _summary_text(self, stats: Mapping[str, Any]) -> str:
+        day = datetime.fromtimestamp(
+            self._time(), timezone.utc).strftime("%B %-d %Y")
         lines = [
-            "test injections: 24 h summary",
+            f"test injections: 24 h summary, {day}",
             "{inj} injected, {rec} recovered".format(
                 inj=stats.get("injected", 0), rec=stats.get("recovered", 0)),
         ]
@@ -1029,7 +1069,7 @@ class InjectBot:
         when the individual shots landed."""
         d1 = datetime.fromtimestamp(end_unix, timezone.utc)
         d0 = datetime.fromtimestamp(end_unix - 86400.0, timezone.utc)
-        return f"{d0:%Y-%m-%d %H:%M} – {d1:%Y-%m-%d %H:%M} UTC"
+        return f"{d0:%Y-%m-%d %H:%M} to {d1:%Y-%m-%d %H:%M} UTC"
 
     def _dm_legend_handles(self, line2d: Any, with_miss: bool) -> List[Any]:
         handles = [
