@@ -102,6 +102,7 @@ def make_config(tmp_path, **over):
         candidates_root=str(tmp_path / "candidates"),
         recovery_timeout_s=2.0,
         recovery_poll_s=0.01,
+        post_calibration_settle_s=0.0,
     )
     base.update(over)
     return InjectBotConfig.from_dict(base)
@@ -642,6 +643,25 @@ def test_bucket_key_matches_dashboard_examples():
     assert bucket_key(1500.0) == "dm1500"
     assert bucket_key(2000.0) == "dm2000"
     assert bucket_key(1024.0) == "dm1000"
+
+
+def test_post_calibration_settle_before_shot(tmp_path):
+    # A recalibration must be followed by the settle sleep (the probe's
+    # trigger holdoff would otherwise demote the shot to log_only).
+    now = time.time()
+    cfg = make_config(tmp_path, post_calibration_settle_s=90.0)
+    dash = FakeDash(now)  # no K entries -> recal fires
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    sleeps = []
+    s._sleep = lambda sec: sleeps.append(sec)
+    s.run_cycle()
+    assert len(dash.calibrate_calls) == 1
+    assert 90.0 in sleeps
+    # Fresh K -> no recal -> no settle sleep.
+    sleeps.clear()
+    s.run_cycle()
+    assert not dash.calibrate_calls[1:]
+    assert 90.0 not in sleeps
 
 
 # ---------------------------------------------------------------------------

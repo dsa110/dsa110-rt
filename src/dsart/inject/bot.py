@@ -155,6 +155,14 @@ class InjectBotConfig:
     k_max_age_s: float = 86400.0
     k_dec_tol_deg: float = 0.5
     calibrate_poll_timeout_s: float = 30.0
+    #: Wait after a K-calibration probe before firing the shot. The
+    #: probe fires a real C2 trigger whose class holdoff (30 s,
+    #: configs/c2_trigger_criteria.yaml) suppresses the next event —
+    #: on first start the shot followed the probe by 6 s and was
+    #: demoted to log_only (a false missed_c2). 90 s also clears the
+    #: probe's sigma_k EMA self-inflation (see the dashboard ladder's
+    #: 60 s step delay).
+    post_calibration_settle_s: float = 90.0
 
     recovery_timeout_s: float = 720.0
     recovery_poll_s: float = 10.0
@@ -204,6 +212,8 @@ class InjectBotConfig:
             k_dec_tol_deg=float(d.get("k_dec_tol_deg", 0.5)),
             calibrate_poll_timeout_s=float(
                 d.get("calibrate_poll_timeout_s", 30.0)),
+            post_calibration_settle_s=float(
+                d.get("post_calibration_settle_s", 90.0)),
             recovery_timeout_s=float(d.get("recovery_timeout_s", 720.0)),
             recovery_poll_s=float(d.get("recovery_poll_s", 10.0)),
             summary_hour_utc=int(d.get("summary_hour_utc", 16)),
@@ -564,6 +574,14 @@ class InjectBot:
             record["outcome"] = Outcome.FIRE_FAILED
             record["reason"] = k_info.get("error", "no_k")
             return record
+        if k_info.get("recalibrated") and cfg.post_calibration_settle_s > 0:
+            # The probe fired a real trigger; wait out its class
+            # holdoff (and sigma_k settling) or the shot lands as
+            # log_only and reads as a false missed_c2.
+            LOG.info(
+                "post-calibration settle: %.0fs before firing the shot",
+                cfg.post_calibration_settle_s)
+            self._sleep(cfg.post_calibration_settle_s)
 
         inj_id = self._make_inj_id(dm)
         record["inj_id"] = inj_id
