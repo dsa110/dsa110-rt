@@ -1086,6 +1086,12 @@ inject_bot:
   k_max_age_s: 86400.0        # daily K refresh per DM bucket
   k_dec_tol_deg: 0.5          # recalibrate K after a re-point
   recovery_timeout_s: 720.0
+  # Attention messages are streak-gated (single events only edit the
+  # shot's own message, so misses are never double-counted in the
+  # channel): 5 consecutive missed shots, or 5 consecutive
+  # not-searching cycles (~5 h), post ONE alert per streak.
+  miss_alert_streak: 5
+  unhealthy_alert_streak: 5
   summary_hour_utc: 16
   results_path: "/dataz/dsa110/operations/inject/inject_bot_results.jsonl"
   state_path: "~/.dsa_monitor/inject_bot_state.json"

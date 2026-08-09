@@ -210,11 +210,11 @@ def add_event(tmp_path, cfg, name, inj_id, *, keep=True, ncubes=8,
 # ---------------------------------------------------------------------------
 
 
-def test_unhealthy_fleet_skips_cycle_and_throttles_warning(tmp_path):
+def test_unhealthy_fleet_alerts_only_after_streak(tmp_path):
     now = time.time()
     docs = healthy_docs(now)
     docs["/mon/corr_rt/7/corr_fast"] = {"ts_wall_unix": now - 3600}
-    cfg = make_config(tmp_path)
+    cfg = make_config(tmp_path, unhealthy_alert_streak=5)
     dash = FakeDash(now)
     notifier = FakeNotifier()
     s, _ = make_bot(cfg, FakeStore(docs), dash, notifier, now=now)
@@ -223,15 +223,23 @@ def test_unhealthy_fleet_skips_cycle_and_throttles_warning(tmp_path):
     assert rec["outcome"] == Outcome.NOT_SEARCHING
     assert "chgroups=7" in rec["reason"]
     assert dash.inject_calls == []
-    assert len(notifier.texts) == 1  # warn posted once
+    assert notifier.texts == []  # single skip: silent
 
-    rec2 = s.run_cycle()
-    assert rec2["outcome"] == Outcome.NOT_SEARCHING
-    assert len(notifier.texts) == 1  # throttled
+    for _ in range(3):
+        s.run_cycle()
+    assert notifier.texts == []  # four skips: still below streak
 
-    # Both attempts landed in the JSONL.
-    rows = s.load_results_since(0)
-    assert len(rows) == 2
+    s.run_cycle()  # fifth consecutive skip: ONE attention message
+    assert len(notifier.texts) == 1
+    assert "attention" in notifier.texts[0]["text"]
+    assert "not searching" in notifier.texts[0]["text"]
+    assert "chgroups=7" in notifier.texts[0]["text"]
+
+    s.run_cycle()  # streak continues: no repeat
+    assert len(notifier.texts) == 1
+
+    # All attempts landed in the JSONL.
+    assert len(s.load_results_since(0)) == 6
 
 
 def test_metering_active_counts_as_unhealthy(tmp_path):
@@ -429,10 +437,10 @@ def test_incomplete_cubes_surface_in_outcome_line(tmp_path):
 def test_c3_reject_is_missed_c3(tmp_path):
     rec, notifier, _, _ = _run_recovered_cycle(tmp_path, keep=False)
     assert rec["outcome"] == Outcome.MISSED_C3
-    # Edit shows the red outcome; the loud alert is a second text.
+    # Edit shows the red outcome; no per-miss alert.
     assert "ANOMALY" in notifier.updates[0]["attachments"][0]["text"]
     assert notifier.updates[0]["attachments"][0]["color"] == "#C62828"
-    assert "MISSED" in notifier.texts[1]["text"]
+    assert len(notifier.texts) == 1
 
 
 def test_c3_pending_still_counts_recovered(tmp_path):
@@ -446,7 +454,7 @@ def test_c3_pending_still_counts_recovered(tmp_path):
 
 def test_no_match_doc_is_missed_search_or_c1(tmp_path):
     now = time.time()
-    cfg = make_config(tmp_path)
+    cfg = make_config(tmp_path, miss_alert_streak=5)
     dash = FakeDash(now)
     for dm in cfg.dm_choices:
         b, e = fresh_entry(now, dm, age_s=100.0)
@@ -456,12 +464,25 @@ def test_no_match_doc_is_missed_search_or_c1(tmp_path):
         cfg, FakeStore(healthy_docs(now)), dash, notifier, now=now)
     rec = s.run_cycle()
     assert rec["outcome"] == Outcome.MISSED_SEARCH_OR_C1
-    # Edit carries the red outcome line; a separate loud alert follows.
+    # Edit carries the red outcome line; a single miss posts NO alert
+    # (misses must never be double-countable in the channel).
     up = notifier.updates[0]
     assert "NOT recovered" in up["attachments"][0]["text"]
     assert up["attachments"][0]["color"] == "#C62828"
-    assert "MISSED" in notifier.texts[1]["text"]
-    assert "search/C1" in notifier.texts[1]["text"]
+    assert len(notifier.texts) == 1  # only the sent message
+
+    # Five consecutive misses -> exactly ONE attention message.
+    for _ in range(4):
+        s.run_cycle()
+    attention = [t for t in notifier.texts if "attention" in t["text"]]
+    assert len(attention) == 1
+    assert "5 consecutive test injections missed" in attention[0]["text"]
+    assert "inj_" in attention[0]["text"]
+
+    # Streak continues: no repeat alert.
+    s.run_cycle()
+    attention = [t for t in notifier.texts if "attention" in t["text"]]
+    assert len(attention) == 1
 
 
 def test_match_without_event_is_missed_c2(tmp_path):
@@ -489,7 +510,7 @@ def test_match_without_event_is_missed_c2(tmp_path):
     assert rec["outcome"] == Outcome.MISSED_C2
     assert rec["observed_snr"] == pytest.approx(19.0)
     assert "lost at C2" in notifier.updates[0]["attachments"][0]["text"]
-    assert "lost at C2" in notifier.texts[1]["text"]
+    assert len(notifier.texts) == 1  # no per-miss alert
 
 
 def test_guard_rejection_is_classified(tmp_path):

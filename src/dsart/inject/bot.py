@@ -171,6 +171,12 @@ class InjectBotConfig:
     pointing_dec_etcd_key: str = "/mon/array/dec"
     #: Throttle for repeated "fleet unhealthy, skipping" Slack warnings.
     unhealthy_warn_interval_s: float = 21600.0
+    #: Attention-message streak thresholds: N consecutive missed shots
+    #: (a single miss can be threshold luck at the low end of the
+    #: target range) / N consecutive not-searching cycles. One message
+    #: per streak, re-armed when the condition clears.
+    miss_alert_streak: int = 5
+    unhealthy_alert_streak: int = 5
 
     @classmethod
     def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "InjectBotConfig":
@@ -214,6 +220,9 @@ class InjectBotConfig:
                 "pointing_dec_etcd_key", "/mon/array/dec")),
             unhealthy_warn_interval_s=float(
                 d.get("unhealthy_warn_interval_s", 21600.0)),
+            miss_alert_streak=int(d.get("miss_alert_streak", 5)),
+            unhealthy_alert_streak=int(
+                d.get("unhealthy_alert_streak", 5)),
         )
 
     @classmethod
@@ -527,6 +536,10 @@ class InjectBot:
         record["ts_utc"] = datetime.fromtimestamp(
             record["ts_unix"], timezone.utc).isoformat()
         self._append_result(record)
+        try:
+            self._update_streaks_and_escalate(record)
+        except Exception:  # noqa: BLE001 — escalation must never kill a cycle
+            LOG.exception("streak escalation failed")
         return record
 
     def _run_cycle_inner(self) -> Dict[str, Any]:
@@ -538,7 +551,6 @@ class InjectBot:
             record["outcome"] = Outcome.NOT_SEARCHING
             record["reason"] = reason
             LOG.warning("cycle skipped: %s", reason)
-            self._warn_unhealthy(reason)
             return record
 
         params = self._pick_params()
@@ -701,42 +713,73 @@ class InjectBot:
                 f"`{record.get('inj_id')}`: {line}",
                 attachments=[attachment])
 
-        if not recovered:
-            if outcome == Outcome.MISSED_C3:
-                LOG.error(
-                    "C3 rejected a tagged injection (%s): marker "
-                    "propagation failure, investigate", record.get("inj_id"),
-                )
-            alert = (
-                "test injection MISSED: `{inj_id}` (DM {dm:.0f}, "
-                "target SNR {snr:.1f})\n{why}"
-            ).format(
-                inj_id=record.get("inj_id"),
-                dm=float(record.get("dm_pc_cm3") or 0),
-                snr=float(record.get("target_snr") or 0),
-                why=_MISS_EXPLANATIONS.get(
-                    str(outcome), f"outcome={outcome}"),
+        if outcome == Outcome.MISSED_C3:
+            LOG.error(
+                "C3 rejected a tagged injection (%s): marker "
+                "propagation failure, investigate", record.get("inj_id"),
             )
-            resp = self._notifier.post_text(
-                alert, attachments=[{
-                    "color": self._COLOR_MISSED,
-                    "text": "", "fallback": alert,
-                }])
-            if not resp.get("ok"):
-                LOG.warning("slack miss-alert failed: %s", resp)
 
-    def _warn_unhealthy(self, reason: str) -> None:
+    def _update_streaks_and_escalate(self, record: Mapping[str, Any]) -> None:
+        """Streak-based attention messages: a single miss (or one
+        skipped cycle) never posts anything beyond the edited shot
+        message — one miss at the low end of the target range can be
+        threshold luck, and a per-miss alert would double-count misses
+        for anyone skimming the channel. When ``miss_alert_streak``
+        consecutive shots are missed, or the pipeline stays
+        not-searching for ``unhealthy_alert_streak`` consecutive
+        cycles, ONE attention message posts (per streak — it re-arms
+        only after the condition clears). Streaks persist in the state
+        file across restarts."""
         state = self._load_state()
-        last = float(state.get("last_unhealthy_warn_unix") or 0)
-        if self._time() - last < self._cfg.unhealthy_warn_interval_s:
-            return
-        resp = self._notifier.post_text(
-            f"test injections: pipeline not searching, skipping this "
-            f"cycle ({reason})",
-        )
-        if resp.get("ok"):
-            state["last_unhealthy_warn_unix"] = self._time()
-            self._save_state()
+        outcome = record.get("outcome")
+        if outcome == Outcome.RECOVERED:
+            state["miss_streak"] = 0
+            state["miss_streak_ids"] = []
+            state["unhealthy_streak"] = 0
+        elif outcome in Outcome.MISSES:
+            state["unhealthy_streak"] = 0
+            streak = int(state.get("miss_streak") or 0) + 1
+            state["miss_streak"] = streak
+            ids = list(state.get("miss_streak_ids") or [])
+            ids.append(str(record.get("inj_id")))
+            state["miss_streak_ids"] = ids[-10:]
+            if streak == self._cfg.miss_alert_streak:
+                text = (
+                    "attention: {n} consecutive test injections missed "
+                    "({ids}). The search pipeline may be missing real "
+                    "FRBs; latest loss stage: {why}"
+                ).format(
+                    n=streak,
+                    ids=", ".join(f"`{i}`" for i in state["miss_streak_ids"]),
+                    why=_MISS_EXPLANATIONS.get(
+                        str(outcome), f"outcome={outcome}"),
+                )
+                resp = self._notifier.post_text(text, attachments=[{
+                    "color": self._COLOR_MISSED,
+                    "text": "", "fallback": text,
+                }])
+                if not resp.get("ok"):
+                    LOG.warning("slack miss-streak alert failed: %s", resp)
+        elif outcome == Outcome.NOT_SEARCHING:
+            streak = int(state.get("unhealthy_streak") or 0) + 1
+            state["unhealthy_streak"] = streak
+            if streak == self._cfg.unhealthy_alert_streak:
+                hours = streak * self._cfg.interval_s / 3600.0
+                text = (
+                    "attention: pipeline not searching for {n} "
+                    "consecutive test-injection cycles (~{h:.0f} h); "
+                    "no shots attempted. Latest reason: {reason}"
+                ).format(n=streak, h=hours,
+                         reason=record.get("reason", "unknown"))
+                resp = self._notifier.post_text(text, attachments=[{
+                    "color": self._COLOR_MISSED,
+                    "text": "", "fallback": text,
+                }])
+                if not resp.get("ok"):
+                    LOG.warning("slack unhealthy alert failed: %s", resp)
+        # guard_rejected / fire_failed leave both streaks unchanged:
+        # they are bot-side plumbing, not pipeline sensitivity signals.
+        self._save_state()
 
     # ----- recovery watch ---------------------------------------------------
 
