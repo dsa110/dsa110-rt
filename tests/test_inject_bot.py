@@ -645,6 +645,37 @@ def test_bucket_key_matches_dashboard_examples():
     assert bucket_key(1024.0) == "dm1000"
 
 
+def test_missed_c2_names_holdoff_suspect(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    dash = FakeDash(now)
+    for dm in cfg.dm_choices:
+        b, e = fresh_entry(now, dm, age_s=100.0)
+        dash.k_entries[b] = e
+    store = FakeStore(healthy_docs(now))
+    notifier = FakeNotifier()
+    s, _ = make_bot(cfg, store, dash, notifier, now=now)
+    # A trigger fired 5 s before our shot: the classic holdoff swallow.
+    s._c2_trigger_reader = lambda t0, t1: [(now - 5.0, "260809twnm")]
+
+    orig_post = dash.post
+
+    def post_and_match_only(url, fields):
+        status, doc = orig_post(url, fields)
+        if url.endswith("/control/inject") and doc.get("ok"):
+            add_match_doc(store, fields["inj_id"],
+                          dm=float(fields["dm_pc_cm3"]))
+        return status, doc
+
+    s._http_post_form = post_and_match_only
+    rec = s.run_cycle()
+    assert rec["outcome"] == Outcome.MISSED_C2
+    assert rec["holdoff_suspect"] == "260809twnm"
+    body = notifier.updates[0]["attachments"][0]["text"]
+    assert "30 s post-trigger holdoff after `260809twnm`" in body
+    assert "19.0 sigma" in body  # fake matcher's observed_snr
+
+
 def test_post_calibration_settle_before_shot(tmp_path):
     # A recalibration must be followed by the settle sleep (the probe's
     # trigger holdoff would otherwise demote the shot to log_only).

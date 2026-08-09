@@ -302,9 +302,12 @@ class InjectBot:
         http_get: Optional[Callable[..., Tuple[int, Dict[str, Any]]]] = None,
         rng: Optional[random.Random] = None,
         time_fn: Callable[[], float] = time.time,
+        c2_trigger_reader: Optional[
+            Callable[[float, float], List[Tuple[float, str]]]] = None,
     ) -> None:
         self._cfg = config
         self._store = store
+        self._c2_trigger_reader = c2_trigger_reader or self._read_c2_triggers
         self._notifier = notifier or SlackNotifier(SlackNotifyConfig(
             enabled=bool(config.enabled and config.channel),
             channel=config.channel,
@@ -688,6 +691,21 @@ class InjectBot:
             if isinstance(cubes, int) and cubes < 8:
                 line += f" | cubes {cubes}/8"
             return line
+        if (
+            outcome == Outcome.MISSED_C2
+            and record.get("holdoff_suspect")
+        ):
+            return (
+                "NOT recovered: detected by the search (matched at "
+                "{snr}) but no event archived, likely the 30 s "
+                "post-trigger holdoff after `{ev}`"
+            ).format(
+                snr=(
+                    f"{float(record['observed_snr']):.1f} sigma"
+                    if record.get("observed_snr") is not None else "C1"
+                ),
+                ev=record["holdoff_suspect"],
+            )
         return "NOT recovered: " + _MISS_EXPLANATIONS.get(
             str(outcome), f"outcome={outcome}")
 
@@ -849,6 +867,20 @@ class InjectBot:
 
         if event is None:
             out["outcome"] = Outcome.MISSED_C2
+            # Matched at search but no event archived: the most common
+            # benign cause is another event's 30 s post-trigger holdoff
+            # (c2_trigger_criteria.yaml) swallowing our shot. Name the
+            # suspect so the Slack line diagnoses itself.
+            try:
+                triggers = self._c2_trigger_reader(
+                    fired_at - 35.0, fired_at + 25.0)
+            except Exception as exc:  # noqa: BLE001 — diagnosis only
+                LOG.warning("holdoff-suspect lookup failed: %s", exc)
+                triggers = []
+            if triggers:
+                ts, name = max(triggers, key=lambda t: t[0])
+                out["holdoff_suspect"] = name
+                out["holdoff_suspect_unix"] = ts
             return out
         out["event"] = event
         out.update(self._read_event_details(event))
@@ -907,6 +939,34 @@ class InjectBot:
             if inj_id in inj_ids:
                 return d.name
         return None
+
+    @staticmethod
+    def _read_c2_triggers(t0: float, t1: float) -> List[Tuple[float, str]]:
+        """C2 trigger broadcasts in ``[t0, t1]`` as ``(unix_ts, event)``,
+        parsed from the dsart_c2 user-unit journal (same host, same
+        user — the bot runs beside C2 on h23). Best-effort: any failure
+        returns an empty list."""
+        import re
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["journalctl", "--user", "-u", "dsart_c2",
+                 "--since", "@%d" % int(t0), "--until", "@%d" % (int(t1) + 1),
+                 "--no-pager", "-o", "short-unix"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("journalctl read failed: %s", exc)
+            return []
+        triggers: List[Tuple[float, str]] = []
+        for line in out.splitlines():
+            if "DUMP class=" not in line:
+                continue
+            m_ts = re.match(r"^(\d+\.\d+)", line)
+            m_name = re.search(r"name=(\S+)", line)
+            if m_ts and m_name:
+                triggers.append((float(m_ts.group(1)), m_name.group(1)))
+        return triggers
 
     def _read_event_details(self, event: str) -> Dict[str, Any]:
         """Cube count + C3 decision for an archived event (read-only)."""
