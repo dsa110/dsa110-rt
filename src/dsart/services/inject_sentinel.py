@@ -234,14 +234,14 @@ class Outcome:
     MISSED_SEARCH_OR_C1 = "missed_search_or_c1"
     MISSED_C2 = "missed_c2"
     MISSED_C3 = "missed_c3"
-    SKIPPED_UNHEALTHY = "skipped_unhealthy"
+    NOT_SEARCHING = "not_searching"
     GUARD_REJECTED = "guard_rejected"
     FIRE_FAILED = "fire_failed"
 
     MISSES = (MISSED_SEARCH_OR_C1, MISSED_C2, MISSED_C3)
     ALL = (
         RECOVERED, MISSED_SEARCH_OR_C1, MISSED_C2, MISSED_C3,
-        SKIPPED_UNHEALTHY, GUARD_REJECTED, FIRE_FAILED,
+        NOT_SEARCHING, GUARD_REJECTED, FIRE_FAILED,
     )
 
 
@@ -535,7 +535,7 @@ class InjectSentinel:
 
         ok, reason = self.check_health()
         if not ok:
-            record["outcome"] = Outcome.SKIPPED_UNHEALTHY
+            record["outcome"] = Outcome.NOT_SEARCHING
             record["reason"] = reason
             LOG.warning("cycle skipped: %s", reason)
             self._warn_unhealthy(reason)
@@ -693,7 +693,8 @@ class InjectSentinel:
         if self._time() - last < self._cfg.unhealthy_warn_interval_s:
             return
         resp = self._notifier.post_text(
-            f"test injections: fleet unhealthy, skipping cycle ({reason})",
+            f"test injections: pipeline not searching, skipping this "
+            f"cycle ({reason})",
         )
         if resp.get("ok"):
             state["last_unhealthy_warn_unix"] = self._time()
@@ -875,7 +876,7 @@ class InjectSentinel:
                 key = f"{float(dm):.0f}"
                 slot = by_dm.setdefault(key, {"injected": 0, "recovered": 0})
                 if outcome not in (
-                    Outcome.SKIPPED_UNHEALTHY, Outcome.GUARD_REJECTED,
+                    Outcome.NOT_SEARCHING, Outcome.GUARD_REJECTED,
                     Outcome.FIRE_FAILED,
                 ):
                     slot["injected"] += 1
@@ -926,14 +927,14 @@ class InjectSentinel:
                 at = f" (DM {', '.join(dms)})" if dms else ""
                 parts.append(f"{v} {k}{at}")
             lines.append("missed: " + "; ".join(parts))
-        skipped = by_outcome.get(Outcome.SKIPPED_UNHEALTHY, 0)
+        skipped = by_outcome.get(Outcome.NOT_SEARCHING, 0)
         failed = (
             by_outcome.get(Outcome.FIRE_FAILED, 0)
             + by_outcome.get(Outcome.GUARD_REJECTED, 0)
         )
         if skipped or failed:
             lines.append(
-                f"{skipped} cycles skipped (fleet unhealthy), "
+                f"{skipped} not attempted (pipeline not searching), "
                 f"{failed} fire failures")
         if stats.get("snr_ratio_median") is not None:
             lines.append(
@@ -948,9 +949,10 @@ class InjectSentinel:
     #: Fixed identity encoding per DM bucket: (fill, marker, edge).
     #: Open-Color vivid hues with a darker same-hue edge (reads richer
     #: than a white outline on a white ground); marker shape doubles
-    #: the encoding so identity never rides on color alone. Misses are
-    #: drawn as an "x" IN THE DM's COLOR so a lost shot still says
-    #: which DM it was; the legend shows the x in neutral ink.
+    #: the encoding so identity never rides on color alone. Misses use
+    #: the SAME marker but OPEN (hollow) at recovered S/N = 0 — the
+    #: standard filled-vs-open detection/non-detection convention — so
+    #: a lost shot still says which DM it was.
     _DM_STYLE = {
         500.0: ("#4C6EF5", "o", "#364FC7"),
         1000.0: ("#F59F00", "s", "#E67700"),
@@ -1013,8 +1015,8 @@ class InjectSentinel:
         ]
         if with_miss:
             handles.append(line2d(
-                [], [], marker="x", color=self._INK, ls="none",
-                ms=7, mew=1.6, label="missed (DM color)"))
+                [], [], marker="o", mfc="none", mec=self._INK, ls="none",
+                ms=8, mew=1.1, label="open = missed"))
         return handles
 
     def render_summary_plots(
@@ -1092,10 +1094,11 @@ class InjectSentinel:
                                    facecolor=color, edgecolor=edge,
                                    linewidth=0.9, alpha=0.9, zorder=3)
                     else:
-                        # Miss: x in the DM's own color so a lost shot
-                        # still identifies its DM.
-                        ax.scatter([t], [0.0], s=60, marker="x",
-                                   color=edge, linewidth=1.8, zorder=3)
+                        # Miss: same DM marker, OPEN, at recovered
+                        # S/N = 0 (filled = recovered, open = missed).
+                        ax.scatter([t], [0.0], s=70, marker=marker,
+                                   facecolor="none", edgecolor=edge,
+                                   linewidth=1.4, zorder=3)
                 ax.set_xlim(lo, hi)
                 ax.set_ylim(-1.0, hi)
                 ax.set_xlabel("injected S/N")
@@ -1120,7 +1123,7 @@ class InjectSentinel:
                     Outcome.MISSED_SEARCH_OR_C1: "#C62828",
                     Outcome.MISSED_C2: "#E65100",
                     Outcome.MISSED_C3: "#6A1B9A",
-                    Outcome.SKIPPED_UNHEALTHY: self._NEUTRAL,
+                    Outcome.NOT_SEARCHING: self._NEUTRAL,
                     Outcome.GUARD_REJECTED: self._NEUTRAL,
                     Outcome.FIRE_FAILED: self._NEUTRAL,
                 }

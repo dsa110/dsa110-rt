@@ -209,13 +209,13 @@ def test_unhealthy_fleet_skips_cycle_and_throttles_warning(tmp_path):
     s, _ = make_sentinel(cfg, FakeStore(docs), dash, notifier, now=now)
 
     rec = s.run_cycle()
-    assert rec["outcome"] == Outcome.SKIPPED_UNHEALTHY
+    assert rec["outcome"] == Outcome.NOT_SEARCHING
     assert "chgroups=7" in rec["reason"]
     assert dash.inject_calls == []
     assert len(notifier.texts) == 1  # warn posted once
 
     rec2 = s.run_cycle()
-    assert rec2["outcome"] == Outcome.SKIPPED_UNHEALTHY
+    assert rec2["outcome"] == Outcome.NOT_SEARCHING
     assert len(notifier.texts) == 1  # throttled
 
     # Both attempts landed in the JSONL.
@@ -486,7 +486,7 @@ def _rows_for_summary(now):
             (Outcome.RECOVERED, 1000.0),
             (Outcome.MISSED_SEARCH_OR_C1, 1500.0),
             (Outcome.MISSED_C2, 2000.0),
-            (Outcome.SKIPPED_UNHEALTHY, None),
+            (Outcome.NOT_SEARCHING, None),
         ])
     ]
 
