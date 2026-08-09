@@ -693,7 +693,7 @@ class InjectSentinel:
         if self._time() - last < self._cfg.unhealthy_warn_interval_s:
             return
         resp = self._notifier.post_text(
-            f"injection sentinel: fleet unhealthy, skipping cycle ({reason})",
+            f"test injections: fleet unhealthy, skipping cycle ({reason})",
         )
         if resp.get("ok"):
             state["last_unhealthy_warn_unix"] = self._time()
@@ -898,7 +898,7 @@ class InjectSentinel:
 
     def _summary_text(self, stats: Mapping[str, Any]) -> str:
         lines = [
-            "injection sentinel: 24 h summary",
+            "test injections: 24 h summary",
             "{inj} injected, {rec} recovered".format(
                 inj=stats.get("injected", 0), rec=stats.get("recovered", 0)),
         ]
@@ -934,16 +934,16 @@ class InjectSentinel:
 
     # ----- daily summary figures ---------------------------------------------
 
-    #: Fixed identity encoding per DM bucket (Okabe-Ito hues, CVD-safe;
-    #: marker shape doubles the encoding so identity never rides on
-    #: color alone).
+    #: Fixed identity encoding per DM bucket (Tol "vibrant"-derived
+    #: hues, CVD-safe; marker shape doubles the encoding so identity
+    #: never rides on color alone).
     _DM_STYLE = {
-        500.0: ("#0072B2", "o"),
-        1000.0: ("#E69F00", "s"),
-        1500.0: ("#009E73", "^"),
-        2000.0: ("#CC79A7", "D"),
+        500.0: ("#0077BB", "o"),
+        1000.0: ("#EE7733", "s"),
+        1500.0: ("#009988", "^"),
+        2000.0: ("#AA4499", "D"),
     }
-    _MISS_COLOR = "#C62828"
+    _MISS_COLOR = "#CC3311"
     _NEUTRAL = "#9E9E9E"
     _INK = "#262626"
 
@@ -984,15 +984,12 @@ class InjectSentinel:
         ax.yaxis.label.set_color(self._INK)
         ax.xaxis.label.set_color(self._INK)
 
-    def _date_span(self, rows: Sequence[Mapping[str, Any]]) -> str:
-        ts_list = [float(r["ts_unix"]) for r in rows
-                   if r.get("ts_unix") is not None]
-        if not ts_list:
-            return "last 24 h"
-        d0 = datetime.fromtimestamp(min(ts_list), timezone.utc)
-        d1 = datetime.fromtimestamp(max(ts_list), timezone.utc)
-        if d0.date() == d1.date():
-            return f"{d0:%Y-%m-%d} {d0:%H:%M}–{d1:%H:%M} UTC"
+    def _window_span(self, end_unix: float) -> str:
+        """Fixed 24 h summary window ending at ``end_unix`` — the
+        summary always covers exactly the past 24 h, independent of
+        when the individual shots landed."""
+        d1 = datetime.fromtimestamp(end_unix, timezone.utc)
+        d0 = datetime.fromtimestamp(end_unix - 86400.0, timezone.utc)
         return f"{d0:%Y-%m-%d %H:%M} – {d1:%Y-%m-%d %H:%M} UTC"
 
     def _dm_legend_handles(self, line2d: Any, with_miss: bool) -> List[Any]:
@@ -1009,12 +1006,14 @@ class InjectSentinel:
 
     def render_summary_plots(
         self, rows: Sequence[Mapping[str, Any]], out_dir: Path,
+        *, window_end_unix: Optional[float] = None,
     ) -> List[Tuple[Path, str]]:
         """Render the daily summary as SEPARATE publication-style
         figures (serif, inward ticks, despined, white-edged markers,
-        legends outside the data area). Returns ``[(path, title), ...]``
-        for the figures that rendered; empty list if matplotlib is
-        unavailable or everything failed."""
+        legends outside the data area). Figure titles carry the fixed
+        24 h window ending at ``window_end_unix`` (default: now).
+        Returns ``[(path, title), ...]`` for the figures that rendered;
+        empty list if matplotlib is unavailable or everything failed."""
         try:
             import matplotlib
             matplotlib.use("Agg", force=True)
@@ -1029,7 +1028,8 @@ class InjectSentinel:
             r for r in rows
             if r.get("outcome") in (Outcome.RECOVERED,) + Outcome.MISSES
         ]
-        span = self._date_span(fired or rows)
+        span = self._window_span(
+            self._time() if window_end_unix is None else window_end_unix)
         out_dir = Path(out_dir)
         out: List[Tuple[Path, str]] = []
 
@@ -1047,7 +1047,11 @@ class InjectSentinel:
                 # line. Square axes, equal limits, legend fully outside
                 # (a horizontal row above the axes) so it can never
                 # touch the data or the reference line.
-                fig = Figure(figsize=(6.4, 5.4))
+                # Square-ish axes without box_aspect: constrained
+                # layout mis-measures a box-aspect axes and clips the
+                # y-label, so the figure geometry itself carries the
+                # near-square shape instead.
+                fig = Figure(figsize=(6.3, 5.2))
                 ax = fig.add_subplot(111)
                 targets = [_as_float(r.get("target_snr")) for r in fired]
                 targets = [t for t in targets if t is not None]
@@ -1080,7 +1084,6 @@ class InjectSentinel:
                                    zorder=3)
                 ax.set_xlim(lo, hi)
                 ax.set_ylim(-1.0, hi)
-                ax.set_box_aspect(1)
                 ax.set_xlabel("injected S/N")
                 ax.set_ylabel("recovered S/N")
                 ax.set_title(f"Injection recovery, {span}",
@@ -1188,7 +1191,8 @@ class InjectSentinel:
         text = self._summary_text(stats)
         day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
         out_dir = Path(self._cfg.summary_dir).expanduser() / day
-        figures = self.render_summary_plots(rows, out_dir)
+        figures = self.render_summary_plots(
+            rows, out_dir, window_end_unix=now)
         if not figures:
             text += "\n(summary figures failed to render - see journal)"
         resp = self._notifier.post_text(text)
