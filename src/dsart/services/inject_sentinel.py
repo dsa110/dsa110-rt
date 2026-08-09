@@ -861,10 +861,15 @@ class InjectSentinel:
     ) -> Dict[str, Any]:
         by_outcome: Dict[str, int] = {}
         by_dm: Dict[str, Dict[str, int]] = {}
+        missed_dms: Dict[str, List[str]] = {}
         ratios: List[float] = []
         for r in rows:
             outcome = str(r.get("outcome") or "unknown")
             by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+            if outcome in Outcome.MISSES:
+                dm_val = r.get("dm_pc_cm3")
+                missed_dms.setdefault(outcome, []).append(
+                    f"{float(dm_val):.0f}" if dm_val is not None else "?")
             dm = r.get("dm_pc_cm3")
             if dm is not None:
                 key = f"{float(dm):.0f}"
@@ -888,6 +893,7 @@ class InjectSentinel:
             "recovered": recovered,
             "by_outcome": by_outcome,
             "by_dm": by_dm,
+            "missed_dms": missed_dms,
         }
         if ratios:
             ratios.sort()
@@ -909,12 +915,17 @@ class InjectSentinel:
                 for dm, v in sorted(by_dm.items(), key=lambda kv: float(kv[0]))
             ))
         by_outcome = dict(stats.get("by_outcome") or {})
+        missed_dms = dict(stats.get("missed_dms") or {})
         misses = {
             k: v for k, v in by_outcome.items() if k in Outcome.MISSES and v
         }
         if misses:
-            lines.append("missed: " + ", ".join(
-                f"{v} {k}" for k, v in sorted(misses.items())))
+            parts = []
+            for k, v in sorted(misses.items()):
+                dms = missed_dms.get(k) or []
+                at = f" (DM {', '.join(dms)})" if dms else ""
+                parts.append(f"{v} {k}{at}")
+            lines.append("missed: " + "; ".join(parts))
         skipped = by_outcome.get(Outcome.SKIPPED_UNHEALTHY, 0)
         failed = (
             by_outcome.get(Outcome.FIRE_FAILED, 0)
@@ -934,16 +945,18 @@ class InjectSentinel:
 
     # ----- daily summary figures ---------------------------------------------
 
-    #: Fixed identity encoding per DM bucket (Tol "vibrant"-derived
-    #: hues, CVD-safe; marker shape doubles the encoding so identity
-    #: never rides on color alone).
+    #: Fixed identity encoding per DM bucket: (fill, marker, edge).
+    #: Open-Color vivid hues with a darker same-hue edge (reads richer
+    #: than a white outline on a white ground); marker shape doubles
+    #: the encoding so identity never rides on color alone. Misses are
+    #: drawn as an "x" IN THE DM's COLOR so a lost shot still says
+    #: which DM it was; the legend shows the x in neutral ink.
     _DM_STYLE = {
-        500.0: ("#0077BB", "o"),
-        1000.0: ("#EE7733", "s"),
-        1500.0: ("#009988", "^"),
-        2000.0: ("#AA4499", "D"),
+        500.0: ("#4C6EF5", "o", "#364FC7"),
+        1000.0: ("#F59F00", "s", "#E67700"),
+        1500.0: ("#12B886", "^", "#087F5B"),
+        2000.0: ("#BE4BDB", "D", "#9C36B5"),
     }
-    _MISS_COLOR = "#CC3311"
     _NEUTRAL = "#9E9E9E"
     _INK = "#262626"
 
@@ -994,14 +1007,14 @@ class InjectSentinel:
 
     def _dm_legend_handles(self, line2d: Any, with_miss: bool) -> List[Any]:
         handles = [
-            line2d([], [], marker=m, color=c, ls="none", ms=7,
-                   mec="white", mew=0.7, label=f"DM {dm:.0f}")
-            for dm, (c, m) in sorted(self._DM_STYLE.items())
+            line2d([], [], marker=m, color=c, ls="none", ms=8,
+                   mec=e, mew=0.9, label=f"DM {dm:.0f}")
+            for dm, (c, m, e) in sorted(self._DM_STYLE.items())
         ]
         if with_miss:
             handles.append(line2d(
-                [], [], marker="x", color=self._MISS_COLOR, ls="none",
-                ms=7, mew=1.6, label="missed"))
+                [], [], marker="x", color=self._INK, ls="none",
+                ms=7, mew=1.6, label="missed (DM color)"))
         return handles
 
     def render_summary_plots(
@@ -1068,20 +1081,21 @@ class InjectSentinel:
                             ha="left", va="top")
                 for r in fired:
                     dm = float(r.get("dm_pc_cm3") or 0)
-                    color, marker = self._DM_STYLE.get(
-                        dm, (self._NEUTRAL, "o"))
+                    color, marker, edge = self._DM_STYLE.get(
+                        dm, (self._NEUTRAL, "o", self._INK))
                     t = _as_float(r.get("target_snr"))
                     o = _as_float(r.get("observed_snr"))
                     if t is None:
                         continue
                     if o is not None:
-                        ax.scatter([t], [o], s=52, marker=marker,
-                                   facecolor=color, edgecolor="white",
-                                   linewidth=0.7, alpha=0.95, zorder=3)
+                        ax.scatter([t], [o], s=70, marker=marker,
+                                   facecolor=color, edgecolor=edge,
+                                   linewidth=0.9, alpha=0.9, zorder=3)
                     else:
-                        ax.scatter([t], [0.0], s=46, marker="x",
-                                   color=self._MISS_COLOR, linewidth=1.6,
-                                   zorder=3)
+                        # Miss: x in the DM's own color so a lost shot
+                        # still identifies its DM.
+                        ax.scatter([t], [0.0], s=60, marker="x",
+                                   color=edge, linewidth=1.8, zorder=3)
                 ax.set_xlim(lo, hi)
                 ax.set_ylim(-1.0, hi)
                 ax.set_xlabel("injected S/N")
@@ -1091,7 +1105,7 @@ class InjectSentinel:
                              loc="left", pad=10)
                 fig.legend(
                     handles=self._dm_legend_handles(Line2D, True),
-                    loc="outside right upper", ncol=1,
+                    loc="outside center right", ncol=1,
                     handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
                 self._despine(ax)
                 _save(fig, "snr_recovery.png",
@@ -1154,25 +1168,24 @@ class InjectSentinel:
                     if off is None or ddm is None:
                         continue
                     dm = float(r.get("dm_pc_cm3") or 0)
-                    color, marker = self._DM_STYLE.get(
-                        dm, (self._NEUTRAL, "o"))
-                    ax.scatter([ddm], [off], s=52, marker=marker,
-                               facecolor=color, edgecolor="white",
-                               linewidth=0.7, alpha=0.95, zorder=3)
+                    color, marker, edge = self._DM_STYLE.get(
+                        dm, (self._NEUTRAL, "o", self._INK))
+                    ax.scatter([ddm], [off], s=70, marker=marker,
+                               facecolor=color, edgecolor=edge,
+                               linewidth=0.9, alpha=0.9, zorder=3)
                 ax.axvline(0.0, color=self._NEUTRAL, lw=0.8, alpha=0.7,
                            zorder=1)
                 ax.set_xlabel(
-                    "DM error, detection $-$ injection (pc cm$^{-3}$)")
+                    "DM error (detection $-$ injection) [pc cm$^{-3}$]")
                 ax.set_ylabel(
-                    "position offset, injection $\\rightarrow$ "
-                    "detection (arcsec)")
+                    "position error (injection $-$ detection) [arcsec]")
                 ax.set_ylim(bottom=0)
                 ax.set_title(f"Recovery accuracy, {span}",
                              fontsize=11.5, color=self._INK,
                              loc="left", pad=10)
                 fig.legend(
                     handles=self._dm_legend_handles(Line2D, False),
-                    loc="outside right upper", ncol=1,
+                    loc="outside center right", ncol=1,
                     handletextpad=0.3, labelspacing=0.6, fontsize=9.5)
                 self._despine(ax)
                 _save(fig, "accuracy.png", f"recovery accuracy, {span}")
