@@ -697,6 +697,21 @@ def bursts():
     snap = cands_index.snapshot()
     all_events = snap.events                       # full index, newest-first
 
+    # Injection visibility (?hide_inj=1): drop events C3 auto-marked as
+    # injections from the whole page universe (rows, tabs, totals,
+    # pagination) so routine browsing isn't spammed by the hourly test
+    # injections. Events whose C3 decision is still pending
+    # (c3_is_injection None) stay visible until C3 rules on them.
+    hide_inj = (
+        (request.args.get("hide_inj") or "").strip().lower()
+        in ("1", "on", "true")
+    )
+    n_inj_hidden = 0
+    if hide_inj:
+        visible = [e for e in all_events if not e.c3_is_injection]
+        n_inj_hidden = len(all_events) - len(visible)
+        all_events = visible
+
     # Human-annotation badges + source vocab: one bulk read each (no
     # per-event query), joined to rows in the template by event name.
     try:
@@ -840,8 +855,11 @@ def bursts():
         # column sort
         sort=sort_key,
         dir=sort_dir,
+        # injection visibility
+        hide_inj=hide_inj,
+        n_inj_hidden=n_inj_hidden,
         # global (all-time) totals from the cached index
-        listing_n_total=snap.n_total,
+        listing_n_total=snap.n_total - n_inj_hidden,
         total_pass=len(g_pass),
         total_fail=len(g_fail),
         total_zombie=len(g_zombie),

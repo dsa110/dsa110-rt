@@ -15,7 +15,9 @@ so no filesystem/NFS access is needed.
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -203,3 +205,63 @@ def test_bursts_default_no_sort_params_unchanged(client, app_module):
     assert ranked == [e.name for e in events]
     assert html_plain == html_explicit_default
     assert " sort-active" not in html_plain
+
+
+# ---------------------------------------------------------------------------
+# ?hide_inj=1 — drop C3-marked injections from the whole page universe
+# ---------------------------------------------------------------------------
+
+
+def _inj_summary(name: str) -> cpf.EventSummary:
+    return dataclasses.replace(_summary(name, snr=20.0), c3_is_injection=True)
+
+
+def test_bursts_hide_inj_filters_marked_injections(client, app_module):
+    events = [
+        _summary("260810aaaa", snr=5.0),
+        _inj_summary("260810bbbb"),
+        _summary("260810cccc", snr=9.0),
+        _inj_summary("260810dddd"),
+    ]
+    with mock.patch.object(app_module.cands_index, "snapshot",
+                           return_value=_snapshot(events)):
+        html_all = client.get("/bursts").get_data(as_text=True)
+        html_hidden = client.get("/bursts?hide_inj=1").get_data(as_text=True)
+
+    for name in ("260810aaaa", "260810bbbb", "260810cccc", "260810dddd"):
+        assert f"/bursts/{name}" in html_all
+    assert "/bursts/260810aaaa" in html_hidden
+    assert "/bursts/260810cccc" in html_hidden
+    assert "/bursts/260810bbbb" not in html_hidden
+    assert "/bursts/260810dddd" not in html_hidden
+    # Checkbox reflects state and reports what was dropped.
+    assert "(2 hidden)" in html_hidden
+    assert "hide injections" in html_all
+
+
+def test_bursts_hide_inj_keeps_pending_c3_events(client, app_module):
+    # c3_is_injection None = C3 has not ruled yet; must stay visible so a
+    # real event is never suppressed before its decision exists.
+    pending = dataclasses.replace(
+        _summary("260810eeee", snr=7.0), c3_is_injection=None)
+    events = [pending, _inj_summary("260810ffff")]
+    with mock.patch.object(app_module.cands_index, "snapshot",
+                           return_value=_snapshot(events)):
+        html = client.get("/bursts?hide_inj=1").get_data(as_text=True)
+    assert "/bursts/260810eeee" in html
+    assert "/bursts/260810ffff" not in html
+
+
+def test_bursts_hide_inj_rides_along_sort_and_pager_links(client, app_module):
+    events = ([_summary(f"26081{i}gggg", snr=float(i)) for i in range(4)]
+              + [_inj_summary("260819hhhh")])
+    with mock.patch.object(app_module.cands_index, "snapshot",
+                           return_value=_snapshot(events)):
+        html = client.get(
+            "/bursts?hide_inj=1&sort=snr&dir=desc").get_data(as_text=True)
+    # Sort-header links must carry hide_inj=1 so re-sorting keeps the
+    # filter (the active snr column's next-state link toggles to asc).
+    html = html.replace("&amp;", "&")   # jinja autoescape in hrefs
+    m = re.search(r'href="(/bursts\?[^"]*sort=snr&dir=asc[^"]*)"', html)
+    assert m, "expected an asc-toggle sort link for the active snr column"
+    assert "hide_inj=1" in m.group(1)

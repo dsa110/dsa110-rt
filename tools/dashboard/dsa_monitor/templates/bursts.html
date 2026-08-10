@@ -134,14 +134,28 @@
 <h1>Burst candidates</h1>
 
 {% set src_qs = ('&source=' ~ (source_filter|urlencode)) if source_filter else '' %}
+{% set inj_qs = '&hide_inj=1' if hide_inj else '' %}
 <div class="annot-filter">
     <span class="lbl">classification</span>
-    <a href="/bursts{% if source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
+    <a href="/bursts?{{ src_qs }}{{ inj_qs }}"
        class="{{ 'active' if not tag_filter or tag_filter == 'all' }}">All</a>
-    <a href="/bursts?tag=unclassified{{ src_qs }}" class="{{ 'active' if tag_filter == 'unclassified' }}">Unclassified</a>
+    <a href="/bursts?tag=unclassified{{ src_qs }}{{ inj_qs }}" class="{{ 'active' if tag_filter == 'unclassified' }}">Unclassified</a>
     {% for lab in annot_filter_labels %}
-    <a href="/bursts?tag={{ lab }}{{ src_qs }}" class="{{ 'active' if tag_filter == lab }}">{{ lab }}</a>
+    <a href="/bursts?tag={{ lab }}{{ src_qs }}{{ inj_qs }}" class="{{ 'active' if tag_filter == lab }}">{{ lab }}</a>
     {% endfor %}
+    <label style="margin-left: 14px; display: inline-flex; gap: 5px; align-items: center; font-size: 12px; cursor: pointer;"
+           title="hide events C3 auto-marked as injections (hourly test pulses); events still awaiting a C3 decision stay visible">
+        <input type="checkbox" id="hide-inj-cb" {% if hide_inj %}checked{% endif %}>
+        hide injections{% if hide_inj %} ({{ n_inj_hidden }} hidden){% endif %}
+    </label>
+    <script>
+    document.getElementById('hide-inj-cb').addEventListener('change', function () {
+        var p = new URLSearchParams(window.location.search);
+        if (this.checked) { p.set('hide_inj', '1'); } else { p.delete('hide_inj'); }
+        p.delete('page');   // filter change always lands on page 1
+        window.location.search = p.toString();
+    });
+    </script>
 </div>
 
 <div class="annot-filter src-searchwrap">
@@ -151,18 +165,19 @@
     <div id="src-search-dd" class="annot-dd"></div>
     {% if source_filter %}
     <span class="src-chip">{{ source_filter }}
-        <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% endif %}"
+        <a href="/bursts?{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{{ inj_qs }}"
            title="clear source filter">×</a></span>
     {% endif %}
     <form method="get" action="/bursts" style="display:flex; gap:6px; align-items:center; margin:0 0 0 12px;">
         {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
         {% if source_filter %}<input type="hidden" name="source" value="{{ source_filter }}">{% endif %}
+        {% if hide_inj %}<input type="hidden" name="hide_inj" value="1">{% endif %}
         <input type="number" name="days" class="src-input" style="width: 90px;"
                min="0" step="1" placeholder="days" value="{{ days }}"
                title="only events from the last N days (blank = all time)">
         <button type="submit" style="padding:4px 12px; border:1px solid #b2bec3; border-radius:12px; background:#eef0f2; font-size:12px; cursor:pointer;">go</button>
         {% if days %}
-        <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% elif source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
+        <a href="/bursts?{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{{ inj_qs }}"
            style="font-size:12px; color:#636e72;">clear</a>
         {% endif %}
     </form>
@@ -176,9 +191,10 @@
                autocomplete="off">
         {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
         {% if source_filter %}<input type="hidden" name="source" value="{{ source_filter }}">{% endif %}
+        {% if hide_inj %}<input type="hidden" name="hide_inj" value="1">{% endif %}
         <button type="submit" style="padding:4px 12px; border:1px solid #b2bec3; border-radius:12px; background:#eef0f2; font-size:12px; cursor:pointer;">go</button>
         {% if q %}
-        <a href="/bursts{% if tag_filter %}?tag={{ tag_filter }}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% elif source_filter %}?source={{ source_filter|urlencode }}{% endif %}"
+        <a href="/bursts?{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{{ inj_qs }}"
            style="font-size:12px; color:#636e72;">clear</a>
         {% endif %}
     </form>
@@ -216,7 +232,7 @@
 
 {# Build the query-string that carries the active filters across page
    links (so paging keeps your search/window). #}
-{% set filt_qs %}{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% if q %}&q={{ q|urlencode }}{% endif %}{% if days %}&days={{ days }}{% endif %}{% if sort %}&sort={{ sort }}&dir={{ dir }}{% endif %}{% endset %}
+{% set filt_qs %}{% if tag_filter %}&tag={{ tag_filter }}{% endif %}{% if source_filter %}&source={{ source_filter|urlencode }}{% endif %}{% if q %}&q={{ q|urlencode }}{% endif %}{% if days %}&days={{ days }}{% endif %}{% if sort %}&sort={{ sort }}&dir={{ dir }}{% endif %}{{ inj_qs }}{% endset %}
 
 {% if not cache_warming %}
 <div class="banner info trunc-note">
@@ -275,6 +291,7 @@
     {% if source_filter %}{% set _ = parts.append('source=' ~ (source_filter|urlencode)) %}{% endif %}
     {% if q %}{% set _ = parts.append('q=' ~ (q|urlencode)) %}{% endif %}
     {% if days %}{% set _ = parts.append('days=' ~ days) %}{% endif %}
+    {% if hide_inj %}{% set _ = parts.append('hide_inj=1') %}{% endif %}
     <th class="{{ css }} sortable{{ ' sort-active' if active }}"{% if title %} title="{{ title }}"{% endif %}>
         <a class="sort-link" href="/bursts{{ '?' ~ parts|join('&') if parts else '' }}">{{ label }}{% if active %}<span class="sort-arrow">{{ '▲' if dir == 'asc' else '▼' }}</span>{% endif %}</a>
     </th>
