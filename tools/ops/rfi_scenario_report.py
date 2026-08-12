@@ -69,6 +69,8 @@ from freq_mapping import production_freq_axis_GHz     # noqa: E402
 HI_LO, HI_HI = 1.400, 1.440
 PDT_OFFSET_H = 7.0                    # PDT = UTC-7
 SPIKE_KERNEL = 41                     # local-median window for spike finding
+NCH_NODE = 96                         # channels per corr node block
+WITHIN_KERNEL = 21                    # 2.6 MHz: narrower than the 10 MHz comb
 SPIKE_NSIGMA = 5.0
 ACF_LAG_MIN, ACF_LAG_MAX = 2.0, 30.0
 
@@ -129,6 +131,33 @@ def peak_rows(img: np.ndarray, nrows: int = 384) -> np.ndarray:
     idx = np.nanargmax(np.where(np.isfinite(r), np.abs(r), -1.0), axis=1)
     out = np.take_along_axis(r, idx[:, None, :], axis=1)[:, 0, :]
     return np.where(allnan, np.nan, out)
+
+
+def within_residual(y: np.ndarray) -> np.ndarray:
+    """Narrow-band residual of ONE window, referenced to nothing else.
+
+    log10 S1 minus a running median taken WITHIN each corr node's
+    96-channel block (never across a boundary -- that would drag the step
+    between two independently-calibrated node bandpasses into the residual
+    and manufacture a false line at each of the 16 seams).
+
+    This exists because the baseline-subtracted panels inverted the natural
+    reading: there, a spike means the line CHANGED, so the one window that
+    still has the comb (S4) is the flattest, which looks like "no RFI in
+    S4" when it means the opposite. Here a positive spike means the RFI IS
+    PRESENT in that window, full stop.
+    """
+    out = np.full_like(y, np.nan)
+    for g in range(y.size // NCH_NODE):
+        sl = slice(g * NCH_NODE, (g + 1) * NCH_NODE)
+        blk = y[sl]
+        ok = np.isfinite(blk)
+        if ok.sum() < NCH_NODE // 2:
+            continue
+        filled = np.where(ok, blk, np.nanmedian(blk[ok]))
+        sm = median_filter(filled, size=WITHIN_KERNEL, mode="nearest")
+        out[sl] = np.where(ok, blk - sm, np.nan)
+    return out
 
 
 def highpass(y: np.ndarray) -> np.ndarray:
@@ -228,6 +257,8 @@ def main() -> int:
             raw[tag] = wmean(m)
         raw["post-test"] = wmean(post_m)
         delta = {k: v - base for k, v in raw.items() if k != "baseline"}
+        within = {k: np.stack([within_residual(v[i]) for i in range(v.shape[0])])
+                  for k, v in raw.items()}
         wf = L - base[None, :, :]                          # (nb, nant, nch)
 
     print("bins: baseline=%d %s post=%d"
@@ -236,7 +267,9 @@ def main() -> int:
 
     with PdfPages(a.out) as pdf:
         _sec1_raw(pdf, f, keep, raw, wins, ai)
+        _sec1b_within(pdf, f, keep, within, wins, ai)
         _sec2_delta(pdf, f, keep, delta, wins, ants, ai)
+        _sec3_both_acf(pdf, f, keep, within, delta, wins, ai)
         _sec3_acf(pdf, f, keep, delta, wins, ai)
         _sec4_waterfall(pdf, t, f, wf, ants, wins, ai, last_test, keep)
     print("wrote %s (%.1f MiB)" % (a.out, os.path.getsize(a.out) / 2**20))
@@ -341,13 +374,86 @@ def _sec2_delta(pdf, f, keep, delta, wins, ants, ai):
     axes[-1].set_xlabel("frequency [GHz]   —   grey verticals = 20 MHz comb "
                         "lines, grey band = HI mask")
     fig.suptitle("2 · BASELINE-SUBTRACTED — target antennas, all "
-                 "configurations\nAt the grey comb lines S4 (green dashed) "
-                 "tracks the pedestal — nothing changed — while the other five "
-                 "dig negative spikes 0.02–0.07 dex deep.\nDips shared by ALL "
+                 "configurations\nCAREFUL: S4 (green dashed) lying flat on the pedestal means the "
+                 "comb is UNCHANGED — i.e. STILL PRESENT, as in the baseline — NOT that "
+                 "the RFI is gone.\nThe other five dig negative spikes 0.02–0.07 dex deep: "
+                 "those are the windows where the comb was REMOVED.  See §1b.\nDips shared by ALL "
                  "six curves, S4 included (e.g. 1.3555, 1.380 GHz), are "
                  "transient RFI in the baseline average, not "
                  "configuration-dependent.", fontweight="bold", fontsize=10.5)
     fig.tight_layout(rect=(0, 0, 1, .875)); pdf.savefig(fig); plt.close(fig)
+
+
+# --------------------------------------------------------------- section 1b
+COMB_LINES = (1.330, 1.350, 1.370, 1.450, 1.470, 1.490)
+
+
+def _sec1b_within(pdf, f, keep, within, wins, ai):
+    """Within-window narrow-band residual: a spike means RFI IS PRESENT."""
+    labs = dict((w[0], w[1]) for w in wins)
+    for gname, glist in GROUPS.items():
+        fig, axes = plt.subplots(len(glist), 1, sharex=True, squeeze=False,
+                                 figsize=(14, 2.9 * len(glist) + 1.7))
+        for ax, an in zip(axes[:, 0], glist):
+            k = ai[an]
+            for nm in _order(within, wins):
+                ax.plot(f, gapped(within[nm][k], keep), label=(
+                    nm if nm in ("baseline", "post-test")
+                    else "%s  %s" % (nm, labs[nm])), **_style(nm))
+            for c in COMB_LINES:
+                ax.axvline(c, color="0.82", lw=.8, zorder=0)
+            ax.axvspan(HI_LO, HI_HI, color="0.88", zorder=0)
+            ax.set_ylabel("ant %d\nresidual [dex]" % an)
+            ax.grid(alpha=.25); ax.axhline(0, color="k", lw=.6)
+        h, l = axes[0, 0].get_legend_handles_labels()
+        fig.legend(h, l, fontsize=7.5, ncol=4, loc="upper center",
+                   bbox_to_anchor=(.5, .925), frameon=False)
+        axes[-1, 0].set_xlabel("frequency [GHz]   —   grey verticals = 20 MHz "
+                               "comb lines, grey band = HI mask")
+        fig.suptitle("1b · NARROW-BAND RESIDUAL, WITHIN EACH WINDOW — %s\n"
+                     "bandpass removed per corr-node block; NO reference to "
+                     "any other window.  A POSITIVE SPIKE = THE RFI IS "
+                     "PRESENT IN THAT WINDOW.\n"
+                     "Read this before the baseline-subtracted pages, where a "
+                     "spike means the line CHANGED, not that it is present."
+                     % gname, fontweight="bold", fontsize=10.5)
+        fig.tight_layout(rect=(0, 0, 1, .875)); pdf.savefig(fig); plt.close(fig)
+
+
+# ---------------------------------------------------------------- section 3a
+def _sec3_both_acf(pdf, f, keep, within, delta, wins, ai):
+    """The two ACF framings side by side, so the inversion is explicit."""
+    labs = dict((w[0], w[1]) for w in wins)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9.5))
+    for row, an in enumerate((50, 51)):
+        k = ai[an]
+        for col, (src, ttl) in enumerate((
+                (within, "WITHIN-WINDOW  —  peak = comb IS PRESENT"),
+                (delta, "BASELINE-SUBTRACTED  —  peak = comb CHANGED"))):
+            ax = axes[row, col]
+            seen = []
+            names = _order(src, wins) if col == 0 else (
+                [w[0] for w in wins] + ["post-test"])
+            for nm in names:
+                y = src[nm][k]
+                lag, ac = cov_acf(highpass(y) if col == 1 else y, f, keep)
+                ax.plot(lag, ac * 1e6, label=(
+                    nm if nm in ("baseline", "post-test")
+                    else "%s" % nm), **_style(nm))
+                seen.append((ac * 1e6)[lag >= ACF_LAG_MIN])
+            _acf_axes(ax, seen)
+            ax.set_ylabel(r"covariance [$10^{-6}$ dex$^2$]")
+            ax.set_xlabel("frequency lag [MHz]")
+            ax.grid(alpha=.3); ax.legend(fontsize=7, ncol=2, loc="upper right")
+            ax.set_title("ant %d — %s" % (an, ttl), fontsize=9.5, loc="left",
+                         fontweight="bold")
+    fig.suptitle("3 · THE TWO ACF FRAMINGS, SIDE BY SIDE\n"
+                 "LEFT: baseline and S4 peak at 10/20 MHz — the comb is "
+                 "present in those two windows and absent in the other five.\n"
+                 "RIGHT: the same fact seen as a difference — S4 is flat "
+                 "because nothing changed, which is NOT the same as no RFI.",
+                 fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, .90)); pdf.savefig(fig); plt.close(fig)
 
 
 # ---------------------------------------------------------------- section 3
