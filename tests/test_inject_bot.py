@@ -44,9 +44,14 @@ from dsart.inject.bot import (  # noqa: E402
 class FakeStore:
     def __init__(self, docs=None):
         self.docs = dict(docs or {})
+        self.put_calls = []
 
     def get_dict(self, key):
         return self.docs.get(key)
+
+    def put_dict(self, key, value):
+        self.put_calls.append((key, dict(value)))
+        self.docs[key] = dict(value)
 
 
 class FakeNotifier:
@@ -118,6 +123,7 @@ class FakeDash:
         self.calibrate_calls = []
         self.inject_calls = []
         self.inject_response = None  # None -> default ok
+        self.calibrate_k = 170000.0  # K a recal probe reports
 
     def get(self, url):
         assert url.endswith("/control/inject_calibrations")
@@ -129,10 +135,10 @@ class FakeDash:
             dm = float(fields["dm_pc_cm3"])
             bucket = bucket_key(dm)
             self.k_entries[bucket] = {
-                "bucket": bucket, "K": 170000.0,
+                "bucket": bucket, "K": self.calibrate_k,
                 "last_calibrated_at_unix": self.now,
             }
-            return 200, {"ok": True, "K": 170000.0, "bucket": bucket}
+            return 200, {"ok": True, "K": self.calibrate_k, "bucket": bucket}
         if url.endswith("/control/inject"):
             self.inject_calls.append(dict(fields))
             if self.inject_response is not None:
@@ -174,6 +180,7 @@ def make_bot(cfg, store, dash, notifier=None, now=None, dm=1000.0):
     # timestamps a genuine trigger can land in the holdoff window and
     # flip the missed_c2 wording.
     s._c2_trigger_reader = lambda t0, t1: []
+    s._c2_discard_reader = lambda t0, t1: []
     return s, clock
 
 
@@ -751,3 +758,139 @@ def test_last_attempt_unix_reads_jsonl_tail(tmp_path):
     s._append_result({"ts_unix": now - 100, "outcome": Outcome.RECOVERED})
     s._append_result({"ts_unix": now - 5, "outcome": Outcome.MISSED_C2})
     assert s._last_attempt_unix() == pytest.approx(now - 5)
+
+
+# ---------------------------------------------------------------------------
+# Recalibration sanity guard — a railed probe must not poison K
+# ---------------------------------------------------------------------------
+
+
+def test_recal_guard_rejects_anomalous_probe(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    b, entry = fresh_entry(now, 2000.0, k=76282.0, age_s=90000.0)  # stale
+    dash = FakeDash(now, {b: entry})
+    dash.calibrate_k = 645815.0        # railed probe: x8.5 jump
+    store = FakeStore(healthy_docs(now))
+    s, _ = make_bot(cfg, store, dash, now=now)
+    usable, info = s.ensure_k_fresh(2000.0)
+    assert usable
+    assert info["recal_anomalous"] is True
+    assert info["rejected_K"] == 645815.0
+    assert info["K"] == 76282.0        # shot proceeds on the previous K
+    # The poisoned etcd entry was overwritten with the restored one.
+    key, restored = store.put_calls[-1]
+    assert key.endswith("/dm2000")
+    assert restored["K"] == 76282.0
+    assert restored["actor"] == "inject_bot_recal_guard"
+    # Stamped fresh: the next cycle must not immediately re-probe.
+    assert restored["last_calibrated_at_unix"] >= now
+
+
+def test_recal_guard_accepts_normal_shift(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    b, entry = fresh_entry(now, 1000.0, k=140000.0, age_s=90000.0)
+    dash = FakeDash(now, {b: entry})
+    dash.calibrate_k = 168000.0        # +20%: normal probe scatter
+    store = FakeStore(healthy_docs(now))
+    s, _ = make_bot(cfg, store, dash, now=now)
+    usable, info = s.ensure_k_fresh(1000.0)
+    assert usable
+    assert "recal_anomalous" not in info
+    assert info["K"] == 168000.0
+    assert store.put_calls == []
+
+
+# ---------------------------------------------------------------------------
+# missed_c2 diagnosis: cube-dump DISCARD vs holdoff
+# ---------------------------------------------------------------------------
+
+
+def _match_only_dash(s, dash, store):
+    orig_post = dash.post
+
+    def post_and_match_only(url, fields):
+        status, doc = orig_post(url, fields)
+        if url.endswith("/control/inject") and doc.get("ok"):
+            add_match_doc(store, fields["inj_id"],
+                          dm=float(fields["dm_pc_cm3"]))
+        return status, doc
+
+    s._http_post_form = post_and_match_only
+
+
+def test_missed_c2_names_cube_discard(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    dash = FakeDash(now)
+    for dm in cfg.dm_choices:
+        b, e = fresh_entry(now, dm, age_s=100.0)
+        dash.k_entries[b] = e
+    store = FakeStore(healthy_docs(now))
+    notifier = FakeNotifier()
+    s, _ = make_bot(cfg, store, dash, notifier, now=now)
+    # C2 triggered on the shot itself (same DM as fired), then
+    # discarded the archive when only 1/8 cube dumps arrived.
+    fired_dm = {}
+    s._c2_trigger_reader = (
+        lambda t0, t1: [(now + 5.0, "260812abcd",
+                         fired_dm.get("dm", -1.0) + 3.0)])
+    s._c2_discard_reader = (
+        lambda t0, t1: [(now + 365.0, "260812abcd", "1/8")])
+    _match_only_dash(s, dash, store)
+    orig = s._http_post_form
+
+    def capture_dm(url, fields):
+        if url.endswith("/control/inject"):
+            fired_dm["dm"] = float(fields["dm_pc_cm3"])
+        return orig(url, fields)
+
+    s._http_post_form = capture_dm
+    rec = s.run_cycle()
+    assert rec["outcome"] == Outcome.MISSED_C2
+    assert rec["discarded_event"] == "260812abcd"
+    assert rec["discarded_cubes"] == "1/8"
+    assert "holdoff_suspect" not in rec
+    body = notifier.updates[0]["attachments"][0]["text"]
+    assert "discarded when only 1/8 cube dumps arrived" in body
+    assert "cube-dump delivery failure" in body
+
+
+def test_missed_c2_own_trigger_is_not_a_holdoff_suspect(tmp_path):
+    # The shot's own trigger (same DM, after fire) must never be blamed
+    # as the holdoff suspect (2026-08-09 22:49 misdiagnosis).
+    now = time.time()
+    cfg = make_config(tmp_path)
+    dash = FakeDash(now)
+    for dm in cfg.dm_choices:
+        b, e = fresh_entry(now, dm, age_s=100.0)
+        dash.k_entries[b] = e
+    store = FakeStore(healthy_docs(now))
+    notifier = FakeNotifier()
+    s, _ = make_bot(cfg, store, dash, notifier, now=now)
+    fired_dm = {}
+
+    def reader(t0, t1):
+        return [(now + 5.0, "260812self", fired_dm.get("dm", -1.0))]
+
+    s._c2_trigger_reader = reader
+    s._c2_discard_reader = lambda t0, t1: []   # no DISCARD logged
+
+    orig_post = dash.post
+
+    def post_and_match_only(url, fields):
+        status, doc = orig_post(url, fields)
+        if url.endswith("/control/inject") and doc.get("ok"):
+            fired_dm["dm"] = float(fields["dm_pc_cm3"])
+            add_match_doc(store, fields["inj_id"],
+                          dm=float(fields["dm_pc_cm3"]))
+        return status, doc
+
+    s._http_post_form = post_and_match_only
+    rec = s.run_cycle()
+    assert rec["outcome"] == Outcome.MISSED_C2
+    assert "holdoff_suspect" not in rec
+    assert "discarded_event" not in rec
+    body = notifier.updates[0]["attachments"][0]["text"]
+    assert "holdoff" not in body

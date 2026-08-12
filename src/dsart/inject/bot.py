@@ -85,6 +85,11 @@ LOG = logging.getLogger("dsart.inject.bot")
 
 #: C2 matcher's per-injection match doc (inject_match.MATCH_EVENT_PREFIX).
 MATCH_EVENT_PREFIX = "/mon/dsart/inject/matches/"
+#: etcd prefix of the per-bucket K entries (mirrors
+#: tools/dashboard/dsa_monitor/inject_calibration.py). The bot writes
+#: here only from the recal guard, to restore a known-good entry after
+#: rejecting an anomalous probe.
+SNR_CALIBRATION_PREFIX = "/cnf/inject/snr_calibration/"
 
 #: DM bucket granularity of the K store (inject_calibration.DM_BUCKET_PC_CC).
 DM_BUCKET_PC_CC = 50.0
@@ -155,6 +160,12 @@ class InjectBotConfig:
 
     k_max_age_s: float = 86400.0
     k_dec_tol_deg: float = 0.5
+    #: Reject a recalibration whose K moved by more than this factor in
+    #: either direction. A railed probe (fp16 detector saturation, e.g.
+    #: 226 sigma from a ~27 sigma prediction) or an RFI-storm noise
+    #: collapse bakes an absurd K that silently blinds the bucket for a
+    #: day (2026-08-09 and 2026-08-11 dm2000 incidents). 0 disables.
+    k_recal_max_change_factor: float = 3.0
     calibrate_poll_timeout_s: float = 30.0
     #: Wait after a K-calibration probe before firing the shot. The
     #: probe fires a real C2 trigger whose class holdoff (30 s,
@@ -219,6 +230,8 @@ class InjectBotConfig:
             lm_max_rad=float(d.get("lm_max_rad", DEFAULT_LM_MAX_RAD)),
             k_max_age_s=float(d.get("k_max_age_s", 86400.0)),
             k_dec_tol_deg=float(d.get("k_dec_tol_deg", 0.5)),
+            k_recal_max_change_factor=float(
+                d.get("k_recal_max_change_factor", 3.0)),
             calibrate_poll_timeout_s=float(
                 d.get("calibrate_poll_timeout_s", 30.0)),
             post_calibration_settle_s=float(
@@ -316,10 +329,13 @@ class InjectBot:
         time_fn: Callable[[], float] = time.time,
         c2_trigger_reader: Optional[
             Callable[[float, float], List[Tuple[float, str]]]] = None,
+        c2_discard_reader: Optional[
+            Callable[[float, float], List[Tuple[float, str, str]]]] = None,
     ) -> None:
         self._cfg = config
         self._store = store
         self._c2_trigger_reader = c2_trigger_reader or self._read_c2_triggers
+        self._c2_discard_reader = c2_discard_reader or self._read_c2_discards
         self._notifier = notifier or SlackNotifier(SlackNotifyConfig(
             enabled=bool(config.enabled and config.channel),
             channel=config.channel,
@@ -507,6 +523,8 @@ class InjectBot:
                 reasons.append("weights_newer_than_k")
 
         if reasons:
+            prev_entry = dict(entry) if entry is not None else None
+            prev_k = float((entry or {}).get("K") or 0)
             info["recal_reasons"] = reasons
             LOG.info("K recal for %s: %s", bucket, ",".join(reasons))
             status, doc = self._http_post_form(
@@ -525,6 +543,34 @@ class InjectBot:
                     "error") or doc.get("reason") or f"http {status}"
                 LOG.warning("K recal for %s failed: %s", bucket, info)
             entry = self._get_calibration_entry(dm)
+            new_k = float((entry or {}).get("K") or 0)
+            factor = cfg.k_recal_max_change_factor
+            if (
+                info["recalibrated"] and factor > 0
+                and prev_entry is not None and prev_k > 0 and new_k > 0
+                and (new_k > prev_k * factor or new_k < prev_k / factor)
+            ):
+                # A railed probe (detector saturation) or an RFI-storm
+                # noise collapse bakes an absurd K; accepting it makes
+                # every subsequent shot in the bucket invisibly faint
+                # (or railed) until a human notices. Keep the previous
+                # K, stamped now so the next cycle does not immediately
+                # re-probe, and write it back over the poisoned entry.
+                LOG.warning(
+                    "K recal for %s REJECTED: K %.0f -> %.0f moved more "
+                    "than x%.1f; restoring previous value",
+                    bucket, prev_k, new_k, factor)
+                restored = dict(prev_entry)
+                restored["last_calibrated_at_unix"] = now
+                restored["actor"] = "inject_bot_recal_guard"
+                try:
+                    self._get_store().put_dict(
+                        SNR_CALIBRATION_PREFIX + bucket, restored)
+                except Exception as exc:  # noqa: BLE001 — keep cycle alive
+                    LOG.warning("recal-guard restore write failed: %s", exc)
+                info["recal_anomalous"] = True
+                info["rejected_K"] = new_k
+                entry = restored
             if info["recalibrated"] and dec_now is not None:
                 cal_decs[bucket] = dec_now
                 self._save_state()
@@ -727,6 +773,23 @@ class InjectBot:
             return line
         if (
             outcome == Outcome.MISSED_C2
+            and record.get("discarded_event")
+        ):
+            return (
+                "NOT recovered: detected by the search (matched at "
+                "{snr}) and C2 triggered `{ev}`, but the archive was "
+                "discarded when only {cubes} cube dumps arrived, "
+                "likely a cube-dump delivery failure"
+            ).format(
+                snr=(
+                    f"{float(record['observed_snr']):.1f} sigma"
+                    if record.get("observed_snr") is not None else "C1"
+                ),
+                ev=record["discarded_event"],
+                cubes=record.get("discarded_cubes") or "partial",
+            )
+        if (
+            outcome == Outcome.MISSED_C2
             and record.get("holdoff_suspect")
         ):
             return (
@@ -901,18 +964,48 @@ class InjectBot:
 
         if event is None:
             out["outcome"] = Outcome.MISSED_C2
-            # Matched at search but no event archived: the most common
-            # benign cause is another event's 30 s post-trigger holdoff
-            # (c2_trigger_criteria.yaml) swallowing our shot. Name the
-            # suspect so the Slack line diagnoses itself.
+            # Matched at search but no event archived. Two known causes,
+            # distinguished via the C2 journal: (a) C2 triggered on the
+            # shot itself but DISCARDed the archive when the cube dumps
+            # never arrived; (b) another event's 30 s post-trigger
+            # holdoff (c2_trigger_criteria.yaml) swallowed the shot.
             try:
                 triggers = self._c2_trigger_reader(
                     fired_at - 35.0, fired_at + 25.0)
             except Exception as exc:  # noqa: BLE001 — diagnosis only
                 LOG.warning("holdoff-suspect lookup failed: %s", exc)
                 triggers = []
-            if triggers:
-                ts, name = max(triggers, key=lambda t: t[0])
+            inj_dm = _as_float(inj.get("dm_pc_cm3"))
+            own_name = None
+            others: List[Tuple[float, str]] = []
+            for t in triggers:
+                ts, name, t_dm = (tuple(t) + (None,))[:3]
+                ts = float(ts)
+                # The shot's own trigger: fired after us, at our DM.
+                # (Stubbed 2-tuple readers carry no DM and fall through
+                # to the holdoff branch, the pre-existing behavior.)
+                if (
+                    own_name is None and inj_dm is not None
+                    and t_dm is not None and ts >= fired_at - 5.0
+                    and abs(float(t_dm) - inj_dm) <= max(10.0, 0.01 * inj_dm)
+                ):
+                    own_name = str(name)
+                else:
+                    others.append((ts, str(name)))
+            if own_name is not None:
+                try:
+                    discards = self._c2_discard_reader(
+                        fired_at, self._time() + 1.0)
+                except Exception as exc:  # noqa: BLE001 — diagnosis only
+                    LOG.warning("discard lookup failed: %s", exc)
+                    discards = []
+                for _dts, dname, cubes in discards:
+                    if dname == own_name:
+                        out["discarded_event"] = dname
+                        out["discarded_cubes"] = cubes
+                        break
+            if "discarded_event" not in out and others:
+                ts, name = max(others, key=lambda t: t[0])
                 out["holdoff_suspect"] = name
                 out["holdoff_suspect_unix"] = ts
             return out
@@ -998,9 +1091,39 @@ class InjectBot:
                 continue
             m_ts = re.match(r"^(\d+\.\d+)", line)
             m_name = re.search(r"name=(\S+)", line)
+            m_dm = re.search(r"dm_med=([0-9.]+)", line)
             if m_ts and m_name:
-                triggers.append((float(m_ts.group(1)), m_name.group(1)))
+                triggers.append((
+                    float(m_ts.group(1)), m_name.group(1),
+                    float(m_dm.group(1)) if m_dm else None,
+                ))
         return triggers
+
+    @staticmethod
+    def _read_c2_discards(t0: float, t1: float) -> List[Tuple[float, str, str]]:
+        """C2 archive DISCARDs in ``[t0, t1]`` as ``(unix_ts, event,
+        "n/total")`` — events whose cube dumps never arrived ("DISCARD
+        <name>: 1/8 cubes after 360s"). Best-effort like
+        :meth:`_read_c2_triggers`."""
+        import re
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["journalctl", "--user", "-u", "dsart_c2",
+                 "--since", "@%d" % int(t0), "--until", "@%d" % (int(t1) + 1),
+                 "--no-pager", "-o", "short-unix"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("journalctl read failed: %s", exc)
+            return []
+        discards: List[Tuple[float, str, str]] = []
+        for line in out.splitlines():
+            m = re.match(
+                r"^(\d+\.\d+).*DISCARD (\S+): (\d+/\d+) cubes", line)
+            if m:
+                discards.append((float(m.group(1)), m.group(2), m.group(3)))
+        return discards
 
     def _read_event_details(self, event: str) -> Dict[str, Any]:
         """Cube count + C3 decision for an archived event (read-only)."""
