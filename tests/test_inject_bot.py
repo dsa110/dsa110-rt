@@ -894,3 +894,71 @@ def test_missed_c2_own_trigger_is_not_a_holdoff_suspect(tmp_path):
     assert "discarded_event" not in rec
     body = notifier.updates[0]["attachments"][0]["text"]
     assert "holdoff" not in body
+
+
+# ---------------------------------------------------------------------------
+# Daily janitor: prune the bot's own old injection cubes
+# ---------------------------------------------------------------------------
+
+
+def _mk_event_dir(root, name, inj_ids, *, is_injection=True, age_s=0.0,
+                  cube_bytes=1000, ncubes=8):
+    ev = root / name
+    (ev / "Level3").mkdir(parents=True)
+    (ev / "Level3" / f"{name}.json").write_text(json.dumps({
+        "injection": {"is_injection": is_injection, "inj_ids": inj_ids},
+    }))
+    cubes = ev / "cubes"
+    cubes.mkdir()
+    for i in range(ncubes):
+        (cubes / f"cube_s1_g0_{i}.npz").write_bytes(b"x" * cube_bytes)
+    old = time.time() - age_s
+    os.utime(ev, (old, old))
+    return ev
+
+
+def test_janitor_prunes_only_owned_old_injections(tmp_path):
+    cfg = make_config(tmp_path)
+    root = tmp_path / "candidates"
+    old_bot = _mk_event_dir(root, "260810aaaa", ["inj_100826_0101"],
+                            age_s=3 * 86400)
+    old_probe = _mk_event_dir(root, "260810bbbb", ["cal_probe_dm500_w4_t1"],
+                              age_s=3 * 86400)
+    young_bot = _mk_event_dir(root, "260812cccc", ["inj_120826_0101"],
+                              age_s=3600)
+    campaign = _mk_event_dir(root, "260810dddd", ["campcal_dm0250_w04_x"],
+                             age_s=3 * 86400)
+    real = _mk_event_dir(root, "260810eeee", [], is_injection=False,
+                         age_s=3 * 86400)
+    mixed = _mk_event_dir(root, "260810ffff",
+                          ["inj_100826_0202", "campcal_dm0250_w04_y"],
+                          age_s=3 * 86400)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(time.time())),
+                    FakeDash(time.time()))
+    out = s.cleanup_old_injection_cubes()
+    assert out["removed"] == 2
+    assert out["freed_bytes"] == 2 * 8 * 1000
+    assert not (old_bot / "cubes").exists()
+    assert not (old_probe / "cubes").exists()
+    # JSON records survive for the pruned events.
+    assert (old_bot / "Level3" / "260810aaaa.json").is_file()
+    # Everything not owned-and-old keeps its cubes.
+    for ev in (young_bot, campaign, real, mixed):
+        assert (ev / "cubes").is_dir()
+
+
+def test_janitor_respects_disable_and_cap(tmp_path):
+    root = tmp_path / "candidates"
+    for i in range(3):
+        _mk_event_dir(root, f"26081{i}gggg", [f"inj_10082{i}_0101"],
+                      age_s=3 * 86400)
+    cfg = make_config(tmp_path, cleanup_enabled=False)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(time.time())),
+                    FakeDash(time.time()))
+    assert s.cleanup_old_injection_cubes() == {"removed": 0,
+                                               "freed_bytes": 0}
+    cfg = make_config(tmp_path, cleanup_max_per_run=2)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(time.time())),
+                    FakeDash(time.time()))
+    out = s.cleanup_old_injection_cubes()
+    assert out["removed"] == 2

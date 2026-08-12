@@ -90,6 +90,10 @@ MATCH_EVENT_PREFIX = "/mon/dsart/inject/matches/"
 #: here only from the recal guard, to restore a known-good entry after
 #: rejecting an anomalous probe.
 SNR_CALIBRATION_PREFIX = "/cnf/inject/snr_calibration/"
+#: inj_id prefixes whose archived events the janitor may prune: the
+#: bot's own shots and the dashboard's calibration probes. Anything
+#: else (e.g. campaign injections like campcal_*) is never touched.
+OWNED_INJ_ID_PREFIXES = ("inj_", "cal_probe_")
 
 #: DM bucket granularity of the K store (inject_calibration.DM_BUCKET_PC_CC).
 DM_BUCKET_PC_CC = 50.0
@@ -189,6 +193,18 @@ class InjectBotConfig:
 
     summary_hour_utc: int = 16
 
+    #: Daily janitor: after the summary posts, delete the ``cubes/``
+    #: directory of the bot's OWN old injection events (Level3 tagged
+    #: is_injection with every inj_id owned by the bot or a calibration
+    #: probe). At ~24 shots/day x ~9 GB of cubes each, uncleaned
+    #: injections alone eat ~250 GB/day of /dataz. JSON records, C3
+    #: decisions, and plots are kept, so recovery statistics survive;
+    #: only the bulk cube arrays go. Events younger than
+    #: ``cleanup_min_age_s`` are kept for human inspection.
+    cleanup_enabled: bool = True
+    cleanup_min_age_s: float = 172800.0            # 2 days
+    cleanup_max_per_run: int = 200
+
     results_path: str = (
         "/dataz/dsa110/operations/inject/inject_bot_results.jsonl"
     )
@@ -242,6 +258,9 @@ class InjectBotConfig:
             recovery_timeout_s=float(d.get("recovery_timeout_s", 720.0)),
             recovery_poll_s=float(d.get("recovery_poll_s", 10.0)),
             summary_hour_utc=int(d.get("summary_hour_utc", 16)),
+            cleanup_enabled=bool(d.get("cleanup_enabled", True)),
+            cleanup_min_age_s=float(d.get("cleanup_min_age_s", 172800.0)),
+            cleanup_max_per_run=int(d.get("cleanup_max_per_run", 200)),
             results_path=str(d.get(
                 "results_path",
                 "/dataz/dsa110/operations/inject/inject_bot_results.jsonl")),
@@ -1125,6 +1144,72 @@ class InjectBot:
                 discards.append((float(m.group(1)), m.group(2), m.group(3)))
         return discards
 
+    def cleanup_old_injection_cubes(self) -> Dict[str, Any]:
+        """Daily janitor: delete the bulk ``cubes/`` payload of the
+        bot's own old injection events so hourly testing does not eat
+        the shared archive (~9 GB of cubes per event, ~250 GB/day).
+
+        Hard safety rails, in order:
+          - the event's Level3 JSON must tag ``injection.is_injection``
+            AND list at least one inj_id, and EVERY inj_id must carry an
+            owned prefix (bot shots / calibration probes) — a real event,
+            a campaign injection, or a real+injection coincidence is
+            never touched;
+          - only the ``cubes/`` subdirectory is deleted — Level3 JSON,
+            C2 CSVs, C3 decision, and plots stay, so recovery stats and
+            the website record survive;
+          - events younger than ``cleanup_min_age_s`` are kept for
+            human inspection, and at most ``cleanup_max_per_run`` are
+            pruned per day.
+        Best-effort: any error skips that event, never the cycle."""
+        cfg = self._cfg
+        out = {"removed": 0, "freed_bytes": 0}
+        if not cfg.cleanup_enabled:
+            return out
+        import shutil
+        root = Path(cfg.candidates_root)
+        now = self._time()
+        try:
+            entries = list(root.iterdir())
+        except OSError as exc:
+            LOG.warning("janitor: candidates root unreadable: %s", exc)
+            return out
+        for d in entries:
+            if out["removed"] >= cfg.cleanup_max_per_run:
+                break
+            try:
+                if not d.is_dir():
+                    continue
+                if d.stat().st_mtime > now - cfg.cleanup_min_age_s:
+                    continue
+                cubes = d / "cubes"
+                if not cubes.is_dir() or not any(cubes.iterdir()):
+                    continue
+                doc = json.loads(
+                    (d / "Level3" / f"{d.name}.json").read_text())
+                injb = doc.get("injection") or {}
+                inj_ids = [str(i) for i in (injb.get("inj_ids") or [])]
+                if not (injb.get("is_injection") and inj_ids):
+                    continue
+                if not all(
+                    i.startswith(OWNED_INJ_ID_PREFIXES) for i in inj_ids
+                ):
+                    continue
+                freed = sum(
+                    f.stat().st_size for f in cubes.iterdir()
+                    if f.is_file()
+                )
+                shutil.rmtree(cubes)
+                out["removed"] += 1
+                out["freed_bytes"] += freed
+                LOG.info(
+                    "janitor: pruned %s/cubes (%.1f GB, inj_ids=%s)",
+                    d.name, freed / 1e9, ",".join(inj_ids))
+            except (OSError, ValueError) as exc:
+                LOG.warning("janitor: skipping %s: %s", d, exc)
+                continue
+        return out
+
     def _read_event_details(self, event: str) -> Dict[str, Any]:
         """Cube count + C3 decision for an archived event (read-only)."""
         out: Dict[str, Any] = {}
@@ -1639,6 +1724,14 @@ class InjectBot:
             if self.summary_due():
                 summary = self.post_daily_summary()
                 LOG.info("daily summary posted: ok=%s", summary.get("ok"))
+                cleaned = self.cleanup_old_injection_cubes()
+                if cleaned.get("removed"):
+                    LOG.info(
+                        "janitor: pruned cubes of %d old injection "
+                        "events (freed %.1f GB)",
+                        cleaned["removed"],
+                        cleaned["freed_bytes"] / 1e9,
+                    )
             next_fire += cfg.interval_s
             now = self._time()
             if next_fire < now + 60.0:
