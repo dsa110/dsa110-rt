@@ -647,12 +647,77 @@ class InjectBot:
         record.setdefault("ts_unix", self._time())
         record["ts_utc"] = datetime.fromtimestamp(
             record["ts_unix"], timezone.utc).isoformat()
+        try:
+            self._k_doctor(record)
+        except Exception:  # noqa: BLE001 — self-repair must never kill a cycle
+            LOG.exception("k doctor failed")
         self._append_result(record)
         try:
             self._update_streaks_and_escalate(record)
         except Exception:  # noqa: BLE001 — escalation must never kill a cycle
             LOG.exception("streak escalation failed")
         return record
+
+    def _k_doctor(self, record: Dict[str, Any]) -> None:
+        """Per-bucket K self-repair, run after every resolved cycle.
+
+        A recovered shot with a sane ratio proves the bucket's K:
+        remember it (``k_last_good`` in the state file). A shot that
+        vanishes entirely (missed_search_or_c1 on a healthy fleet) or
+        recovers at an absurd ratio suggests the stored K went bad via
+        some path the recal guard doesn't see (manual probe, another
+        actor). If the live etcd K then disagrees with the last proven
+        value by more than the guard factor, write the proven value
+        back (actor ``inject_bot_k_doctor``) — the automated version of
+        the manual restores of 2026-08-10/12. No probe is fired here:
+        probing during the anomalous state is how K got poisoned in the
+        first place."""
+        cfg = self._cfg
+        outcome = record.get("outcome")
+        k_info = record.get("k_info") or {}
+        bucket = k_info.get("bucket")
+        dm = record.get("dm_pc_cm3")
+        if not bucket or dm is None:
+            return
+        ratio = _as_float(record.get("snr_ratio"))
+        good = self._load_state().setdefault("k_last_good", {})
+        factor = cfg.k_recal_max_change_factor
+        if outcome == Outcome.RECOVERED and ratio and 0.5 <= ratio <= 2.0:
+            k_used = _as_float(k_info.get("K"))
+            if k_used and good.get(bucket) != k_used:
+                good[bucket] = k_used
+                self._save_state()
+            return
+        suspicious = outcome == Outcome.MISSED_SEARCH_OR_C1 or (
+            outcome == Outcome.RECOVERED and ratio is not None
+            and factor > 0 and not (1.0 / factor <= ratio <= factor)
+        )
+        last_good = _as_float(good.get(bucket))
+        if not suspicious or not last_good or factor <= 0:
+            return
+        entry = self._get_calibration_entry(float(dm))
+        cur_k = _as_float((entry or {}).get("K"))
+        if not entry or not cur_k:
+            return
+        if 1.0 / factor <= cur_k / last_good <= factor:
+            record["k_doctor"] = "k_consistent"
+            return
+        restored = dict(entry)
+        restored["K"] = last_good
+        restored["last_calibrated_at_unix"] = self._time()
+        restored["actor"] = "inject_bot_k_doctor"
+        LOG.warning(
+            "k doctor: %s shot with K=%.0f while last proven K=%.0f; "
+            "restoring the proven value", bucket, cur_k, last_good)
+        try:
+            self._get_store().put_dict(
+                SNR_CALIBRATION_PREFIX + bucket, restored)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("k doctor restore write failed: %s", exc)
+            return
+        record["k_doctor"] = "restored_last_good"
+        record["k_doctor_restored_K"] = last_good
+        record["k_doctor_replaced_K"] = cur_k
 
     def _run_cycle_inner(self) -> Dict[str, Any]:
         cfg = self._cfg

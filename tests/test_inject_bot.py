@@ -962,3 +962,107 @@ def test_janitor_respects_disable_and_cap(tmp_path):
                     FakeDash(time.time()))
     out = s.cleanup_old_injection_cubes()
     assert out["removed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# K doctor: automatic restore of the last proven K
+# ---------------------------------------------------------------------------
+
+
+def _bot_for_doctor(tmp_path, dash, store):
+    cfg = make_config(tmp_path)
+    for dm in cfg.dm_choices:
+        b, e = fresh_entry(now := time.time(), dm, age_s=100.0)
+        dash.k_entries[b] = e
+    s, _ = make_bot(cfg, store, dash, FakeNotifier(), now=time.time())
+    return s
+
+
+def test_k_doctor_records_proven_k_and_restores_after_blind_miss(tmp_path):
+    now = time.time()
+    dash = FakeDash(now)
+    store = FakeStore(healthy_docs(now))
+    s = _bot_for_doctor(tmp_path, dash, store)
+    # A recovered shot at sane ratio proves the bucket's K.
+    rec = {
+        "outcome": Outcome.RECOVERED, "snr_ratio": 0.95,
+        "dm_pc_cm3": 2000.0,
+        "k_info": {"bucket": "dm2000", "K": 76282.0},
+    }
+    s._k_doctor(rec)
+    assert s._load_state()["k_last_good"]["dm2000"] == 76282.0
+
+    # Later the etcd K is poisoned (x8.8) and a shot vanishes.
+    dash.k_entries["dm2000"]["K"] = 669405.0
+    rec2 = {
+        "outcome": Outcome.MISSED_SEARCH_OR_C1,
+        "dm_pc_cm3": 2000.0,
+        "k_info": {"bucket": "dm2000", "K": 669405.0},
+    }
+    s._k_doctor(rec2)
+    assert rec2["k_doctor"] == "restored_last_good"
+    key, restored = store.put_calls[-1]
+    assert key.endswith("/dm2000")
+    assert restored["K"] == 76282.0
+    assert restored["actor"] == "inject_bot_k_doctor"
+
+
+def test_k_doctor_leaves_consistent_k_alone(tmp_path):
+    now = time.time()
+    dash = FakeDash(now)
+    store = FakeStore(healthy_docs(now))
+    s = _bot_for_doctor(tmp_path, dash, store)
+    s._k_doctor({
+        "outcome": Outcome.RECOVERED, "snr_ratio": 1.1,
+        "dm_pc_cm3": 1000.0,
+        "k_info": {"bucket": "dm1000", "K": 140000.0},
+    })
+    # A miss with the etcd K within 3x of the proven value: not a K
+    # problem — no write.
+    dash.k_entries["dm1000"]["K"] = 168000.0
+    rec = {
+        "outcome": Outcome.MISSED_SEARCH_OR_C1,
+        "dm_pc_cm3": 1000.0,
+        "k_info": {"bucket": "dm1000", "K": 168000.0},
+    }
+    s._k_doctor(rec)
+    assert rec["k_doctor"] == "k_consistent"
+    assert store.put_calls == []
+
+
+def test_k_doctor_inflated_ratio_triggers_restore(tmp_path):
+    now = time.time()
+    dash = FakeDash(now)
+    store = FakeStore(healthy_docs(now))
+    s = _bot_for_doctor(tmp_path, dash, store)
+    s._k_doctor({
+        "outcome": Outcome.RECOVERED, "snr_ratio": 1.0,
+        "dm_pc_cm3": 500.0,
+        "k_info": {"bucket": "dm0500", "K": 141000.0},
+    })
+    dash.k_entries["dm0500"]["K"] = 15000.0    # poisoned LOW (x9.4 faint)
+    rec = {
+        "outcome": Outcome.RECOVERED, "snr_ratio": 9.5,  # absurd recovery
+        "dm_pc_cm3": 500.0,
+        "k_info": {"bucket": "dm0500", "K": 15000.0},
+    }
+    s._k_doctor(rec)
+    assert rec["k_doctor"] == "restored_last_good"
+    assert store.put_calls[-1][1]["K"] == 141000.0
+    # And the absurd-ratio shot must NOT overwrite the proven K.
+    assert s._load_state()["k_last_good"]["dm0500"] == 141000.0
+
+
+def test_k_doctor_no_proven_value_no_action(tmp_path):
+    now = time.time()
+    dash = FakeDash(now)
+    store = FakeStore(healthy_docs(now))
+    s = _bot_for_doctor(tmp_path, dash, store)
+    rec = {
+        "outcome": Outcome.MISSED_SEARCH_OR_C1,
+        "dm_pc_cm3": 1500.0,
+        "k_info": {"bucket": "dm1500", "K": 999999.0},
+    }
+    s._k_doctor(rec)
+    assert "k_doctor" not in rec
+    assert store.put_calls == []
