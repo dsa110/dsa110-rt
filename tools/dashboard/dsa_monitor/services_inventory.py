@@ -18,7 +18,7 @@ Tiers
                          collector).
 ``support_h23``          lxd110h23 systemd --user units backing observing:
                          calibration preprocess + calibration, the Slack
-                         relay, copydata, the C2 hiplots and declination.
+                         relay, the C2 hiplots and declination.
                          These ran in the calibration23 LXC container until
                          it was retired (2026-07-31).
 ``grafana_h20``          lxd110h20 systemd --system units: ``etcdv3``,
@@ -194,7 +194,8 @@ def _build_inventory() -> tuple[ServiceEntry, ...]:
         "dsa110-calib-preprocess.service",
         "dsa110-calib-calibration.service",
         "dsart_slack_relay.service",
-        "copydata.service",
+        # copydata.service removed 2026-08-19: legacy T1 path, unresolvable
+        # source hosts, never functional. See SUPPORT_LOCAL_UNITS.
         "hiplot_c2.service",
         "declination.service",
     ):

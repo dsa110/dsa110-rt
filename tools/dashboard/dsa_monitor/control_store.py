@@ -1523,7 +1523,7 @@ H23_DSART_UNITS: tuple[str, ...] = (
     "dsart_c3.service",
     "dsa110-calib-preprocess.service",
     "dsa110-calib-calibration.service",
-    "copydata.service",
+    # copydata.service removed 2026-08-19: legacy T1 path, never functional.
     "declination.service",
     "dsart_slack_relay.service",
     "hiplot_c1.service",

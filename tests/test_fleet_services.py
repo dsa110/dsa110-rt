@@ -105,13 +105,15 @@ class TestInventoryShape:
         """The observing-support units, which moved to h23 --user when the
         calibration23 LXC container was retired (2026-07-31)."""
         rows = inv.entries_by_tier(inv.TIER_SUPPORT_H23)
-        assert len(rows) == 6
+        # 5 since 2026-08-19: copydata.service removed as legacy (rsynced
+        # into the dead T1 path from hostnames that never resolved).
+        assert len(rows) == 5
+        assert "copydata.service" not in {r.service for r in rows}
         for r in rows:
             assert r.host == "lxd110h23"
             assert r.kind == inv.KIND_SYSTEMD_USER
             assert r.is_restartable() is True
         assert sorted(r.service for r in rows) == [
-            "copydata.service",
             "declination.service",
             "dsa110-calib-calibration.service",
             "dsa110-calib-preprocess.service",
@@ -166,9 +168,11 @@ class TestInventoryShape:
         assert "lxd110h20" not in restartable_hosts    # …but not restartable.
 
     def test_inventory_total_size_matches_components(self):
-        # 2 (dsa_monitor_h23) + 2 (dsart_c2/c3) + 6 (support_h23)
-        # + 3 (etcd/influx/grafana) + 16 (corr orch) + 4 (search orch) = 33
-        assert len(inv.SERVICE_INVENTORY) == 33
+        # 2 (dsa_monitor_h23) + 2 (dsart_c2/c3) + 5 (support_h23)
+        # + 3 (etcd/influx/grafana) + 16 (corr orch) + 4 (search orch) = 32
+        # support_h23 dropped from 6 to 5 on 2026-08-19 when the legacy,
+        # never-functional copydata.service was removed.
+        assert len(inv.SERVICE_INVENTORY) == 32
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +683,56 @@ class TestRestartCoverage:
         assert "dsa_monitor.service" not in units
         assert "sefd_dashboard.service" in units
         assert "dsart_c2.service" in units
+
+    def test_support_units_restart_targets_local_hiplot_c2(self):
+        """Step 5 restarts hiplot_c2 on h23, not hiplot inside calibration23.
+
+        The calibration23 LXC container was retired 2026-07-31, so the old
+        ``lxc exec calibration23`` call could only ever fail. Pin the
+        replacement so it cannot silently regress.
+        """
+        recorder = _CallRecorder(default_rc=0)
+        with mock.patch.object(subprocess, "run", side_effect=recorder), \
+             mock.patch.object(subprocess, "Popen", return_value=mock.Mock(pid=1)):
+            summary = fleet_services.restart_all_services()
+        step = summary["steps"]["5_support_units_restart"]
+        units = step["per_unit"]
+        assert "hiplot_c2.service" in units
+        assert "declination.service" in units
+        # copydata is legacy (T1 path, unresolvable hosts) and must NOT be
+        # restarted -- it only loops on rsync failures.
+        assert "copydata.service" not in units
+        # Off the observing path: a failure here must not fail the run.
+        assert step["best_effort"] is True
+        # No lxc call should be made any more.
+        cmds = [" ".join(c) if isinstance(c, (list, tuple)) else str(c)
+                for c in getattr(recorder, "calls", [])]
+        assert not any("calibration23" in c for c in cmds)
+
+    def test_support_unit_failure_does_not_fail_overall(self):
+        """A dead support unit must not make the fleet restart report failed.
+
+        Uses _CallRecorder rather than a bare Mock: the orchestrator-respawn
+        step parses stdout for its liveness check, so a naive mock fails
+        step 6 and masks what this test is actually asserting.
+        """
+        class _FailCopydata(_CallRecorder):
+            def __call__(self, argv, **kw):
+                if any("declination" in str(a) for a in argv):
+                    with self.lock:
+                        self.calls.append(list(argv))
+                    return _fake_completed(1, "", "simulated unit failure")
+                return super().__call__(argv, **kw)
+
+        recorder = _FailCopydata(default_rc=0)
+        with mock.patch.object(subprocess, "run", side_effect=recorder), \
+             mock.patch.object(subprocess, "Popen", return_value=mock.Mock(pid=1)):
+            summary = fleet_services.restart_all_services()
+        step = summary["steps"]["5_support_units_restart"]
+        assert step["ok"] is False
+        assert step["per_unit"]["declination.service"]["ok"] is False
+        # The whole point: an off-path unit failing must not fail the run.
+        assert summary["ok"] is True
 
 
 # ---------------------------------------------------------------------------
