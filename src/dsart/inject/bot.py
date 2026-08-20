@@ -6,7 +6,9 @@ jittered) it:
 
 1. pre-checks fleet health (mirrors
    ``tools/dashboard/dsa_monitor/inject_calibration.precheck_calibration_health``
-   — corr_fast heartbeats on all 16 chgroups, search-compute heartbeats
+   — corr_fast heartbeats on at least ``min_healthy_chgroups`` of the
+   16 chgroups (a dead corr node is a supported degraded mode: the
+   shot is scoped to the live ones), search-compute heartbeats
    on all 8 halves, ``c1_metering_active`` clear);
 2. picks a random DM from ``dm_choices`` and a random target SNR in
    ``[target_snr_min, target_snr_max]`` — deliberately below the
@@ -116,6 +118,10 @@ SEARCH_HALVES: Tuple[Tuple[int, int], ...] = (
 CORR_FAST_MAX_AGE_S = 30.0
 SEARCH_MAX_AGE_S = 30.0
 
+#: Every chgroup the fleet nominally provides (value == chgroup index;
+#: chgroup g lives on corr node CORR_CN_IDS[g], so chgroup 0 == cn 3).
+ALL_CHGROUPS: Tuple[int, ...] = tuple(range(16))
+
 #: Dashboard hard limit is INJECT_LM_MAX_RAD = 0.0279; beyond ~0.02 the
 #: primary beam attenuates and FFT aliasing risk grows (see the
 #: /control/inject docstring), so the bot default stays inside it.
@@ -221,6 +227,13 @@ class InjectBotConfig:
     #: per streak, re-armed when the condition clears.
     miss_alert_streak: int = 5
     unhealthy_alert_streak: int = 5
+    #: Minimum chgroups with a fresh corr_fast heartbeat for a cycle to
+    #: fire. Losing one corr node is a supported degraded mode
+    #: (sensitivity drops by sqrt(15/16) ~ 3% and a chgroup-shaped hole
+    #: appears in the band), so one dead node must not silently stop
+    #: injection monitoring -- the shot is scoped to the live chgroups
+    #: and the skip is reported. Below this the cycle skips entirely.
+    min_healthy_chgroups: int = 15
 
     @classmethod
     def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "InjectBotConfig":
@@ -237,6 +250,8 @@ class InjectBotConfig:
             http_timeout_s=float(d.get("http_timeout_s", 180.0)),
             interval_s=float(d.get("interval_s", 3600.0)),
             jitter_s=float(d.get("jitter_s", 300.0)),
+            min_healthy_chgroups=int(
+                d.get("min_healthy_chgroups", 15)),
             dm_choices=tuple(float(x) for x in dms),
             target_snr_min=float(d.get("target_snr_min", 15.0)),
             target_snr_max=float(d.get("target_snr_max", 25.0)),
@@ -432,22 +447,37 @@ class InjectBot:
 
     # ----- health gate -----------------------------------------------------
 
-    def check_health(self) -> Tuple[bool, str]:
+    def check_health(self) -> Tuple[bool, str, Tuple[int, ...]]:
         """Mirror of the dashboard's ``precheck_calibration_health``
-        (read-only etcd; see the constants block for provenance)."""
+        (read-only etcd; see the constants block for provenance).
+
+        Returns ``(ok, reason, live_chgroups)``. Running one corr node
+        short is a supported degraded mode, so instead of refusing on any
+        stale chgroup we hand back the chgroups that *are* live and let
+        the caller scope the shot to them. Only dropping below
+        ``min_healthy_chgroups`` fails the gate. ``live_chgroups`` is
+        always returned so the caller can report what it skipped.
+        """
         now = self._time()
+        live: List[int] = []
         stale: List[int] = []
-        for cg in range(16):
+        for cg in ALL_CHGROUPS:
             state = self._get_dict(f"/mon/corr_rt/{cg}/corr_fast")
             ts = (state or {}).get("ts_wall_unix")
-            if not (
+            if (
                 isinstance(ts, (int, float))
                 and now - float(ts) <= CORR_FAST_MAX_AGE_S
             ):
+                live.append(cg)
+            else:
                 stale.append(cg)
-        if stale:
-            return False, "corr_fast_stale: chgroups=" + ",".join(
-                str(c) for c in stale)
+        stale_str = ",".join(str(c) for c in stale)
+        min_live = int(self._cfg.min_healthy_chgroups)
+        if len(live) < min_live:
+            return False, (
+                f"corr_fast_stale: chgroups={stale_str} "
+                f"({len(live)}/{len(ALL_CHGROUPS)} live < {min_live})"
+            ), tuple(live)
         sick: List[str] = []
         for sid, g in SEARCH_HALVES:
             state = self._get_dict(f"/mon/search_rt/{sid}/compute/{g}")
@@ -461,8 +491,16 @@ class InjectBot:
             if int((state or {}).get("c1_metering_active") or 0):
                 sick.append(f"s{sid}g{g}")
         if sick:
-            return False, "search_unhealthy: halves=" + ",".join(sick)
-        return True, "ok"
+            return (
+                False,
+                "search_unhealthy: halves=" + ",".join(sick),
+                tuple(live),
+            )
+        if stale:
+            return True, (
+                f"ok (degraded: skipping chgroups={stale_str})"
+            ), tuple(live)
+        return True, "ok", tuple(live)
 
     def read_pointing_dec(self) -> Optional[float]:
         """Live pointing dec (deg); mirrors coincidencer._read_pointing_dec."""
@@ -504,7 +542,10 @@ class InjectBot:
         except OSError:
             return None
 
-    def ensure_k_fresh(self, dm: float) -> Tuple[bool, Dict[str, Any]]:
+    def ensure_k_fresh(
+        self, dm: float,
+        live_chgroups: Optional[Tuple[int, ...]] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
         """Recalibrate the DM bucket when K is missing, stale, or was
         measured at a different pointing dec. Returns ``(usable,
         info)``; ``usable`` False means the bucket still has no valid K
@@ -546,14 +587,24 @@ class InjectBot:
             prev_k = float((entry or {}).get("K") or 0)
             info["recal_reasons"] = reasons
             LOG.info("K recal for %s: %s", bucket, ",".join(reasons))
+            recal_fields: Dict[str, Any] = {
+                "dm_pc_cm3": dm,
+                "width_samples": cfg.width_samples,
+                "poll_timeout_s": cfg.calibrate_poll_timeout_s,
+                "user": "inject_bot",
+            }
+            if (
+                live_chgroups is not None
+                and len(live_chgroups) < len(ALL_CHGROUPS)
+            ):
+                # The dashboard runs its OWN precheck over these; without
+                # scoping it too, one dead chgroup fails the recal probe
+                # and the cycle dies as fire_failed/no_k.
+                recal_fields["chgroups"] = ",".join(
+                    str(c) for c in live_chgroups)
             status, doc = self._http_post_form(
                 f"{cfg.dashboard_base_url}/control/inject_calibrate",
-                {
-                    "dm_pc_cm3": dm,
-                    "width_samples": cfg.width_samples,
-                    "poll_timeout_s": cfg.calibrate_poll_timeout_s,
-                    "user": "inject_bot",
-                },
+                recal_fields,
             )
             info["recalibrated"] = bool(doc.get("ok"))
             info["recal_response_status"] = status
@@ -723,7 +774,7 @@ class InjectBot:
         cfg = self._cfg
         record: Dict[str, Any] = {"ts_unix": self._time()}
 
-        ok, reason = self.check_health()
+        ok, reason, live_chgroups = self.check_health()
         if not ok:
             record["outcome"] = Outcome.NOT_SEARCHING
             record["reason"] = reason
@@ -734,7 +785,8 @@ class InjectBot:
         record.update(params)
         dm = params["dm_pc_cm3"]
 
-        usable, k_info = self.ensure_k_fresh(dm)
+        usable, k_info = self.ensure_k_fresh(
+            dm, live_chgroups=live_chgroups)
         record["k_info"] = k_info
         record["pointing_dec_deg"] = k_info.get("pointing_dec_deg")
         if not usable:
@@ -752,17 +804,27 @@ class InjectBot:
 
         inj_id = self._make_inj_id(dm)
         record["inj_id"] = inj_id
+        inject_fields: Dict[str, Any] = {
+            "inj_id": inj_id,
+            "l_rad": params["l_rad"],
+            "m_rad": params["m_rad"],
+            "dm_pc_cm3": dm,
+            "target_snr": params["target_snr"],
+            "width_samples": params["width_samples"],
+            "profile": params["profile"],
+        }
+        if len(live_chgroups) < len(ALL_CHGROUPS):
+            # Scope the shot to the live chgroups: injecting into a dead
+            # one is a guaranteed partial fan-out and reads as a miss.
+            inject_fields["chgroups"] = ",".join(
+                str(c) for c in live_chgroups)
+            record["chgroups"] = list(live_chgroups)
+            record["skipped_chgroups"] = [
+                c for c in ALL_CHGROUPS if c not in live_chgroups
+            ]
+            record["health_note"] = reason
         status, doc = self._http_post_form(
-            f"{cfg.dashboard_base_url}/control/inject",
-            {
-                "inj_id": inj_id,
-                "l_rad": params["l_rad"],
-                "m_rad": params["m_rad"],
-                "dm_pc_cm3": dm,
-                "target_snr": params["target_snr"],
-                "width_samples": params["width_samples"],
-                "profile": params["profile"],
-            },
+            f"{cfg.dashboard_base_url}/control/inject", inject_fields,
         )
         record["fire_response_status"] = status
         if not doc.get("ok"):
@@ -798,6 +860,13 @@ class InjectBot:
         # can never split them; (l, m) are reported in mrad at two
         # decimals (0.01 mrad ~ 2 arcsec, ample for a message).
         dec = record.get("pointing_dec_deg")
+        skipped = list(record.get("skipped_chgroups") or ())
+        note = (
+            "\n:warning: degraded fleet - shot scoped to "
+            f"{len(ALL_CHGROUPS) - len(skipped)}/{len(ALL_CHGROUPS)}"
+            " chgroups (skipped "
+            f"{','.join(str(c) for c in skipped)})"
+        ) if skipped else ""
         return (
             "injection sent: `{inj_id}`\n"
             "DM {dm:.0f} pc/cc | target SNR {snr:.1f} | "
@@ -815,7 +884,7 @@ class InjectBot:
             l=float(record.get("l_rad") or 0) * 1e3,
             m=float(record.get("m_rad") or 0) * 1e3,
             dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
-        )
+        ) + note
 
     def _outcome_line(self, record: Mapping[str, Any]) -> str:
         """One line describing how the shot resolved (goes into the

@@ -226,7 +226,10 @@ def add_event(tmp_path, cfg, name, inj_id, *, keep=True, ncubes=8,
 def test_unhealthy_fleet_alerts_only_after_streak(tmp_path):
     now = time.time()
     docs = healthy_docs(now)
+    # Two stale chgroups: one alone is now a supported degraded mode
+    # (min_healthy_chgroups=15) and fires a scoped shot instead.
     docs["/mon/corr_rt/7/corr_fast"] = {"ts_wall_unix": now - 3600}
+    docs["/mon/corr_rt/8/corr_fast"] = {"ts_wall_unix": now - 3600}
     cfg = make_config(tmp_path, unhealthy_alert_streak=5)
     dash = FakeDash(now)
     notifier = FakeNotifier()
@@ -268,7 +271,7 @@ def test_metering_active_counts_as_unhealthy(tmp_path):
     }
     cfg = make_config(tmp_path)
     s, _ = make_bot(cfg, FakeStore(docs), FakeDash(now), now=now)
-    ok, reason = s.check_health()
+    ok, reason, _live = s.check_health()
     assert not ok and "s1g0" in reason
 
 
@@ -1066,3 +1069,106 @@ def test_k_doctor_no_proven_value_no_action(tmp_path):
     s._k_doctor(rec)
     assert "k_doctor" not in rec
     assert store.put_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Degraded-fleet operation: one corr node down must not stop monitoring
+# ---------------------------------------------------------------------------
+
+
+def _fire_once(tmp_path, docs, **cfg_over):
+    """Run one cycle far enough to reach (or refuse) the inject POST."""
+    now = time.time()
+    cfg = make_config(tmp_path, **cfg_over)
+    dash = FakeDash(now)
+    for dm in cfg.dm_choices:
+        bb, ee = fresh_entry(now, dm, age_s=100.0)
+        dash.k_entries[bb] = ee
+    notifier = FakeNotifier()
+    s, _ = make_bot(cfg, FakeStore(docs), dash, notifier, now=now)
+    return s.run_cycle(), dash, notifier
+
+
+def _docs_with_stale(now, *chgroups, age_s=49282.0):
+    docs = healthy_docs(now)
+    for cg in chgroups:
+        docs[f"/mon/corr_rt/{cg}/corr_fast"] = {"ts_wall_unix": now - age_s}
+    return docs
+
+
+def test_one_stale_chgroup_is_degraded_not_unhealthy(tmp_path):
+    # chgroup 0 == cn 3 == n03, the node whose DIMM took it down.
+    now = time.time()
+    s, _ = make_bot(
+        make_config(tmp_path), FakeStore(_docs_with_stale(now, 0)),
+        FakeDash(now), now=now,
+    )
+    ok, reason, live = s.check_health()
+    assert ok
+    assert "degraded" in reason and "chgroups=0" in reason
+    assert live == tuple(range(1, 16))
+
+
+def test_stale_chgroup_scopes_the_inject_post(tmp_path):
+    now = time.time()
+    rec, dash, notifier = _fire_once(tmp_path, _docs_with_stale(now, 0))
+    assert rec["outcome"] != Outcome.NOT_SEARCHING
+    assert len(dash.inject_calls) == 1
+    assert dash.inject_calls[0]["chgroups"] == ",".join(
+        str(c) for c in range(1, 16))
+    assert rec["skipped_chgroups"] == [0]
+    assert rec["chgroups"] == list(range(1, 16))
+    assert "degraded fleet" in notifier.texts[0]["text"]
+    assert "15/16" in notifier.texts[0]["text"]
+
+
+def test_healthy_fleet_omits_the_chgroups_field(tmp_path):
+    now = time.time()
+    rec, dash, notifier = _fire_once(tmp_path, healthy_docs(now))
+    assert len(dash.inject_calls) == 1
+    assert "chgroups" not in dash.inject_calls[0]
+    assert "skipped_chgroups" not in rec
+    assert "degraded fleet" not in notifier.texts[0]["text"]
+
+
+def test_two_stale_chgroups_still_skip_the_cycle(tmp_path):
+    now = time.time()
+    rec, dash, _ = _fire_once(tmp_path, _docs_with_stale(now, 0, 5))
+    assert rec["outcome"] == Outcome.NOT_SEARCHING
+    assert "14/16 live < 15" in rec["reason"]
+    assert dash.inject_calls == []
+
+
+def test_min_healthy_chgroups_16_restores_the_strict_gate(tmp_path):
+    now = time.time()
+    rec, dash, _ = _fire_once(
+        tmp_path, _docs_with_stale(now, 0), min_healthy_chgroups=16)
+    assert rec["outcome"] == Outcome.NOT_SEARCHING
+    assert "15/16 live < 16" in rec["reason"]
+    assert dash.inject_calls == []
+
+
+def test_stale_chgroup_also_scopes_the_recal_probe(tmp_path):
+    # The dashboard's /control/inject_calibrate runs its own precheck, so
+    # the recal probe must carry the live chgroups too or it fails with
+    # health_check_failed and the cycle dies as no_k.
+    now = time.time()
+    cfg = make_config(tmp_path)
+    dash = FakeDash(now)  # no K entries -> forces a recal
+    s, _ = make_bot(
+        cfg, FakeStore(_docs_with_stale(now, 0)), dash, now=now)
+    usable, info = s.ensure_k_fresh(2000.0, live_chgroups=tuple(range(1, 16)))
+    assert usable
+    assert len(dash.calibrate_calls) == 1
+    assert dash.calibrate_calls[0]["chgroups"] == ",".join(
+        str(c) for c in range(1, 16))
+
+
+def test_healthy_fleet_omits_chgroups_on_the_recal_probe(tmp_path):
+    now = time.time()
+    cfg = make_config(tmp_path)
+    dash = FakeDash(now)
+    s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
+    usable, _ = s.ensure_k_fresh(2000.0, live_chgroups=tuple(range(16)))
+    assert usable
+    assert "chgroups" not in dash.calibrate_calls[0]
