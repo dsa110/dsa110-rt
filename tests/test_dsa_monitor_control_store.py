@@ -1287,3 +1287,115 @@ class TestC2JournalTailLocal:
         out = control_store.c2_journal_tail_local(timeout_s=5.0)
         assert out["ok"] is False
         assert "timeout" in out["err"]
+
+
+# ---------------------------------------------------------------------------
+# _capture_is_writing / the compute_system_state observing gate
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureIsWriting:
+    """A capture reports ``arm_state='WRITING'`` only while it crosses
+    the armed specnum; minutes later it reads ``ARMED`` again while
+    still writing every block. Regression for 2026-08-20, when a fully
+    observing fleet showed up as "PREPARED - safe to arm".
+    """
+
+    def test_writing_label_is_writing(self):
+        assert control_store._capture_is_writing({"arm_state": "WRITING"})
+
+    def test_armed_past_start_specnum_is_writing(self):
+        # the values actually observed on n04 at 05:32 UTC 2026-08-20
+        assert control_store._capture_is_writing({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 678660702,
+            "utc_stop_specnum": 0,
+            "last_seq_no": 681239010,
+        })
+
+    def test_armed_before_start_specnum_is_not_writing(self):
+        assert not control_store._capture_is_writing({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 678660702,
+            "utc_stop_specnum": 0,
+            "last_seq_no": 678600702,
+        })
+
+    def test_armed_inside_explicit_window_is_writing(self):
+        assert control_store._capture_is_writing({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 100,
+            "utc_stop_specnum": 300,
+            "last_seq_no": 250,
+        })
+
+    def test_armed_past_stop_specnum_is_not_writing(self):
+        assert not control_store._capture_is_writing({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 100,
+            "utc_stop_specnum": 200,
+            "last_seq_no": 250,
+        })
+
+    def test_waiting_for_arm_is_not_writing(self):
+        assert not control_store._capture_is_writing({
+            "arm_state": "WAITING_FOR_ARM",
+            "utc_start_specnum": 0,
+            "last_seq_no": 12345,
+        })
+
+    def test_never_armed_is_not_writing(self):
+        assert not control_store._capture_is_writing({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 0,
+            "last_seq_no": 12345,
+        })
+
+    def test_missing_seq_fields_is_not_writing(self):
+        assert not control_store._capture_is_writing({"arm_state": "ARMED"})
+
+    @pytest.mark.parametrize("payload", [None, "ARMED", 17, [], {}])
+    def test_non_dict_or_empty_is_not_writing(self, payload):
+        assert not control_store._capture_is_writing(payload)
+
+
+class TestSystemStateObservingGate:
+    @staticmethod
+    def _responses(capture: dict[str, Any]) -> dict[str, Any]:
+        now_mjd = time.time() / 86400.0 + 40587.0
+        return {
+            "/mon/corr_rt/3": {
+                "time_mjd": now_mjd,
+                "state": "running",
+                "routines": {"corr_fast": {"pid": 42}},
+            },
+            "/mon/corr_rt/3/capture/4011": capture,
+            "/mon/search_rt/1": {"time_mjd": now_mjd, "state": "running"},
+        }
+
+    def _state_for(self, capture: dict[str, Any]) -> dict[str, Any]:
+        cs = control_store.ControlStore()
+        cs._store = FakeDsaStore(self._responses(capture))
+        return control_store.compute_system_state(
+            cs, corr_cn_ids=[3], search_cn_ids=[1], ports=[4011],
+        )
+
+    def test_armed_past_start_reads_as_observing(self):
+        out = self._state_for({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 678660702,
+            "utc_stop_specnum": 0,
+            "last_seq_no": 681239010,
+        })
+        assert out["state"] == "observing"
+        assert out["counts"]["captures_writing"] == 1
+
+    def test_armed_before_start_is_not_observing(self):
+        out = self._state_for({
+            "arm_state": "ARMED",
+            "utc_start_specnum": 678660702,
+            "utc_stop_specnum": 0,
+            "last_seq_no": 678600702,
+        })
+        assert out["state"] != "observing"
+        assert out["counts"]["captures_writing"] == 0

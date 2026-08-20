@@ -366,6 +366,35 @@ def _is_fresh(payload: Any, now_mjd: float, stale_s: float = _STATE_STALE_S) -> 
     return -5.0 <= age_s <= stale_s
 
 
+def _capture_is_writing(payload: Any) -> bool:
+    """True if a capture mon dict shows voltages actually being written.
+
+    ``arm_state`` only reads ``WRITING`` while the armed specnum is
+    being crossed; a capture that has been streaming for minutes
+    reports ``ARMED`` again even though it writes every block. Keying
+    the banner off the label alone therefore showed a fully observing
+    fleet as "PREPARED - safe to arm" (seen 2026-08-20). Trust the
+    specnum window, and keep the label as a fast path.
+    """
+    if not isinstance(payload, dict):
+        return False
+    state = str(payload.get("arm_state", "")).upper()
+    if state == "WRITING":
+        return True
+    if state != "ARMED":
+        return False
+    start = payload.get("utc_start_specnum")
+    last = payload.get("last_seq_no")
+    if not isinstance(start, int) or not isinstance(last, int):
+        return False
+    if start <= 0 or last < start:
+        return False                    # armed, window not open yet
+    stop = payload.get("utc_stop_specnum")
+    if isinstance(stop, int) and 0 < stop <= last:
+        return False                    # window already closed
+    return True
+
+
 def compute_system_state(
     store: ControlStore,
     *,
@@ -445,7 +474,7 @@ def compute_system_state(
     for cn in running:
         for p in ports:
             c = _get(f"/mon/corr_rt/{cn}/capture/{p}")
-            if isinstance(c, dict) and str(c.get("arm_state", "")).upper() == "WRITING":
+            if _capture_is_writing(c):
                 n_writing += 1
     counts["captures_writing"] = n_writing
     if n_writing > 0:
