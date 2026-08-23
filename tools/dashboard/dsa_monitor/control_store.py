@@ -1024,7 +1024,7 @@ def control_inject_pulse(
     chgroups: Iterable[int] = DEFAULT_INJECT_CHGROUPS,
     user: str | None = None,
     publish_active_registry: bool = True,
-    inject_label_ttl_s: float = 60.0,
+    inject_label_ttl_s: float = 180.0,
     target_snr: float | None = None,
 ) -> dict[str, Any]:
     """High-level helper for the Control tab.

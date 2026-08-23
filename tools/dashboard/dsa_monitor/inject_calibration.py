@@ -139,7 +139,18 @@ DEFAULT_CALIBRATION_PROFILE: str = "gaussian"
 #: injection (seconds). Long enough to cover startup-jitter, NUMA
 #: pinning hiccups, and the cube emission cadence at DM=1500 (which
 #: takes ~3.5 cubes to fully de-disperse).
-DEFAULT_INJECT_TTL_S: float = 60.0
+#:
+#: 2026-08-23: raised 60 -> 180. Shots were being detected (the bot
+#: reported a valid observed_snr) while C2 logged
+#: "InjectionMatcher: evicted expired ... (age=65s ttl=60s)" and the
+#: cycle scored missed_c2 -- i.e. the C1 row reached C2 after the
+#: window had already closed, so a detected injection was recorded as a
+#: miss. This is safe against the 2026-06-09 mis-attribution bug
+#: because the specnum gate (+/-2048 search samples, ~2.2 s) is the
+#: real discriminator; the TTL is only a coarse outer bound, and it was
+#: the TTL-ONLY matching that used to smear one candidate across every
+#: live inj_id.
+DEFAULT_INJECT_TTL_S: float = 180.0
 
 #: Polling cadence for the match-event key (seconds).
 DEFAULT_POLL_INTERVAL_S: float = 0.5
