@@ -244,6 +244,10 @@ class C3Service:
             "rejected": 0,
             "rejected_flagged_only": 0,
             "veto_errors": 0,
+            # Shadow veto: what the veto WOULD have said about an
+            # injection had it been a real burst (see _process_one).
+            "shadow_keep": 0,
+            "shadow_reject": 0,
             "fragments_collected": 0,
             "filterbanks_ok": 0,
             "filterbanks_failed": 0,
@@ -343,6 +347,21 @@ class C3Service:
         if not metrics.ok:
             self._counters["veto_errors"] += 1
         decision = decide(metrics, is_injection=is_inj, thresholds=self._cfg.veto)
+        # Shadow veto (2026-08-24). ``decide`` short-circuits injections to
+        # an unconditional KEEP ("injection - exempt from veto"), so in
+        # production the veto thresholds are NEVER exercised: every hourly
+        # injection yields a tautological KEEP that tells us nothing about
+        # whether R1-R11 still behave. The metrics are computed either way,
+        # so re-run the SAME metrics as if the event were real and record
+        # the counterfactual. Purely observational -- ``decision`` above is
+        # what acts, and this cannot change it. A shadow REJECT on a clean
+        # injection means a veto rule has drifted into rejecting real
+        # bursts, which is exactly the regression nothing else catches.
+        shadow = None
+        if is_inj and metrics.ok:
+            shadow = decide(
+                metrics, is_injection=False, thresholds=self._cfg.veto,
+            )
         rec: Dict[str, Any] = {
             "event_name": name,
             "decided_at_unix": time.time(),
@@ -354,6 +373,12 @@ class C3Service:
             "flag_only_source": flag_only_source,
             "metrics": metrics.__dict__,
         }
+        if shadow is not None:
+            rec["shadow_action"] = shadow.action
+            rec["shadow_keep"] = bool(shadow.keep)
+            rec["shadow_rules_fired"] = list(shadow.rules_fired)
+            self._counters[
+                "shadow_keep" if shadow.keep else "shadow_reject"] += 1
         if decision.keep:
             rec.update(self._do_keep(name, ev_dir, is_inj))
             self._counters["kept"] += 1
@@ -365,10 +390,17 @@ class C3Service:
             "(flagged)" if (not decision.keep and flag_only) else ""
         )
         self._save_state()
+        shadow_note = ""
+        if shadow is not None:
+            shadow_note = " shadow=%s%s" % (
+                shadow.action,
+                "" if shadow.keep else str(list(shadow.rules_fired)),
+            )
         LOG.info(
-            "C3 %s name=%s inj=%s rules=%s%s",
+            "C3 %s name=%s inj=%s rules=%s%s%s",
             decision.action, name, is_inj, list(decision.rules_fired),
             " [flag-only]" if (not decision.keep and flag_only) else "",
+            shadow_note,
         )
         return rec
 
