@@ -179,3 +179,84 @@ def test_archive_event_idempotent_and_partial(tmp_path: Path) -> None:
     # hard links, not copies
     one = ev / "calibration" / "2026-07-15T01:00:00_sb00.hdf5"
     assert one.stat().st_nlink == 2
+
+
+# ---------------------------------------------------------------------------
+# Timing: .fil tstart from the manifest, and the sweep-corrected --t0
+# (2026-08-26 fixes; see filterbank.py N_PRE_BLOCKS / _sweep_s)
+# ---------------------------------------------------------------------------
+
+
+def _mk_manifests(ev: Path, name: str, block_mjd_first: float,
+                  n_sb: int = 2) -> None:
+    """Per-subband voltage manifests, as C3 collection writes them."""
+    vd = ev / "Level2" / "voltages"
+    vd.mkdir(parents=True, exist_ok=True)
+    for sb in range(n_sb):
+        (vd / f"{name}_sb{sb:02d}.json").write_text(json.dumps({
+            "event_name": name, "subband": f"sb{sb:02d}",
+            "block_mjd_first": block_mjd_first,
+            "n_pre": 14, "n_post": 8, "n_blocks_written": 23,
+        }))
+
+
+def test_n_pre_blocks_pinned_to_fourteen() -> None:
+    # Regression pin: the constant was 8 while every manifest records
+    # n_pre=14, which put the .fil tstart 6 blocks (0.805 s) late.
+    from dsart.coinc.filterbank import BLOCK_S, N_PRE_BLOCKS
+    assert N_PRE_BLOCKS == 14
+    assert abs((14 - 8) * BLOCK_S - 0.80531) < 1e-4
+
+
+def test_sweep_s_matches_measured_events() -> None:
+    # Values validated against the two events whose bursts are actually
+    # present in the voltages: the recovered peak sits one sweep before
+    # the C2 t_peak (260824utbu -0.204 s, 260822iyhi -0.356 s).
+    from dsart.coinc.filterbank import _sweep_s
+    assert abs(_sweep_s(367.2) - 0.2078) < 5e-4
+    assert abs(_sweep_s(631.1) - 0.3571) < 5e-4
+    assert _sweep_s(0.0) == 0.0
+
+
+def test_tstart_and_t0_come_from_manifest(tmp_path: Path) -> None:
+    cfg = _stub_scripts(tmp_path)
+    name = "260826aaaa"
+    ev = _mk_event(tmp_path, name)
+    blk = 61277.01057247913
+    t_peak = 61277.01059456718           # 1.9084 s after blk
+    _mk_manifests(ev, name, blk)
+    rep = run_for_event(cfg, ev, name,
+                        {"l_median": 0.0, "m_median": 0.0,
+                         "dm_median": 395.799866, "width_median": 1.0,
+                         "t_peak_mjd": t_peak}, dec_deg=71.63)
+    assert rep["ok"] is True, rep
+    assert rep["tstart_source"] == "manifest"
+    assert abs(rep["tstart_mjd"] - blk) < 1e-12
+    # toolkit gets the manifest tstart, not a computed guess
+    tk = rep["runs"][0]["cmd"]
+    assert abs(float(tk[tk.index("--mjd") + 1]) - blk) < 1e-12
+    # plot gets a sweep-corrected --t0
+    from dsart.coinc.filterbank import _sweep_s
+    want = (t_peak - blk) * 86400.0 - _sweep_s(395.799866)
+    plot = rep["runs"][1]["cmd"]
+    assert "--t0" in plot
+    assert abs(float(plot[plot.index("--t0") + 1]) - want) < 1e-6
+    # ... and that lands where the burst actually is (1.6844 s), not at
+    # the header-implied 1.0737 s the old code produced.
+    assert abs(want - 1.6844) < 2e-3
+
+
+def test_tstart_falls_back_when_no_manifest(tmp_path: Path) -> None:
+    cfg = _stub_scripts(tmp_path)
+    name = "260826bbbb"
+    ev = _mk_event(tmp_path, name)      # data.out only, no *_sbNN.json
+    t_peak = 61277.5
+    rep = run_for_event(cfg, ev, name,
+                        {"l_median": 0.0, "m_median": 0.0,
+                         "dm_median": 100.0, "width_median": 1.0,
+                         "t_peak_mjd": t_peak}, dec_deg=71.63)
+    assert rep["ok"] is True, rep
+    assert rep["tstart_source"] == "computed_fallback"
+    from dsart.coinc.filterbank import BLOCK_S, N_PRE_BLOCKS
+    want = t_peak - N_PRE_BLOCKS * BLOCK_S / 86400.0
+    assert abs(rep["tstart_mjd"] - want) < 1e-12
