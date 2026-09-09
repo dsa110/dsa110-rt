@@ -550,3 +550,49 @@ def test_reader_sees_a_mode_change_without_being_rebuilt(tmp_path,
     finally:
         writer.close()
         writer.unlink()
+
+
+def test_armed_excision_is_skipped_when_nothing_fired():
+    """Arming must not cost the 3.1 ms broadcast on every block.
+
+    The time-resolved mul_ is ~3.1 ms against ~5.5 ms of real-time
+    margin, so paying it unconditionally is what made flag mode "not
+    fit" the fast path. The fleet fires on ~1% of blocks, so the mask
+    is only handed to the masker when something actually fired.
+    """
+    from types import SimpleNamespace
+
+    from dsart.rfi.array_burst import ArrayBurstResult
+    from dsart.services.corr_fast_integration import _array_burst_time_mask
+
+    n_acc, n_ch, n_pol, g = 4, 8, 2, 5
+    empty = torch.zeros(n_acc, n_ch, n_pol, dtype=torch.bool)
+    hot = empty.clone()
+
+    def _res(mask):
+        return SimpleNamespace(array_burst=ArrayBurstResult(
+            fired=torch.zeros(n_acc, g, n_pol, dtype=torch.bool),
+            time_chan_mask=mask,
+            z=torch.zeros(n_acc, g, n_pol),
+            band_frac=torch.zeros(n_acc, g, n_pol),
+            occupancy=torch.zeros(n_acc, g, n_pol),
+            coarse_z=torch.zeros(n_acc, g, 2, n_pol),
+            group_spec=torch.zeros(g, n_ch, n_pol),
+            n_live=torch.zeros(g, n_pol),
+            warmup=False,
+        ))
+
+    armed = SimpleNamespace(cfg=SimpleNamespace(rfi_array_burst_mode="flag"))
+    monitor = SimpleNamespace(
+        cfg=SimpleNamespace(rfi_array_burst_mode="monitor"))
+
+    # Nothing fired -> no mask, so the caller does the cheap zero-fill.
+    assert _array_burst_time_mask(armed, _res(empty)) is None
+    # Something fired -> the mask is handed over.
+    hot[1, 3, 0] = True
+    got = _array_burst_time_mask(armed, _res(hot))
+    assert got is not None and bool(got.any())
+    # Monitor mode never excises, however much fired.
+    assert _array_burst_time_mask(monitor, _res(hot)) is None
+    # Warmup (mask is None) is safe.
+    assert _array_burst_time_mask(armed, _res(None)) is None

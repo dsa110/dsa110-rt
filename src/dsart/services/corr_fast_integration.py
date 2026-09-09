@@ -1340,17 +1340,33 @@ def _array_burst_time_mask(
     ctx: "IntegrationContext",
     rfi_result: FlagBlockResult,
 ) -> torch.Tensor | None:
-    """The array-burst time-resolved mask, but only when armed.
+    """The array-burst time-resolved mask, but only when armed AND
+    something actually fired.
 
     Returns ``None`` in ``off`` and ``monitor`` modes, so the monitor
     path can publish everything the detector found while the voltages
     go through untouched. ``None`` is also returned during the
     detector's warmup window, when it has no baseline yet.
+
+    The "something fired" test is what makes arming affordable. The
+    time-resolved broadcast costs ~3.1 ms per block on a 2080 Ti --
+    the ``keep`` tensor grows from 0.15 MB to 9.4 MB and the mul_'s
+    access pattern gets more complex -- against a measured 5.5 ms of
+    margin. But the fleet fires on roughly 1% of blocks (0.94% over
+    the first 18 h, and 0.001% in a quiet hour), so paying it only on
+    those blocks turns a 4.7 ms cost into ~1.6 ms amortised: the same
+    as monitor mode, which the fleet has already shown it can carry.
+
+    The ``.any()`` is a host sync, but the caller immediately syncs on
+    ``rfi_result.mask.any()`` anyway, and this tensor is [n_acc, G,
+    NPOL] -- 640 elements -- so it adds no meaningful transfer.
     """
     if ctx.cfg.rfi_array_burst_mode != "flag":
         return None
     ab = rfi_result.array_burst
-    if ab is None:
+    if ab is None or ab.time_chan_mask is None:
+        return None
+    if not bool(ab.time_chan_mask.any()):
         return None
     return ab.time_chan_mask
 
