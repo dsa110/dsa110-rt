@@ -410,3 +410,64 @@ def test_flagger_without_detector_is_unchanged():
     r = fl.flag_block(None, None, autos_override=_tiny_autos(seed=3))
     assert r.array_burst is None
     assert int((r.source_tags & int(FlagSourceBit.ARRAY_BURST)).sum()) == 0
+
+
+# ---------------------------------------------------------------------------
+# SK threshold warm-up gating (slow path)
+# ---------------------------------------------------------------------------
+
+
+def test_sk_warmup_is_idempotent_and_sets_ready(monkeypatch):
+    """The warm-up must run once, off the block loop, and always end
+    with ready set — including on failure, or a feature the operator
+    turned on would silently stay off forever."""
+    import dsart.rfi.sk as sk
+    from dsart.services.corr_slow_compute import SkWarmup
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        sk, "sk_thresholds", lambda m, far=1e-4: calls.append(m) or (0.9, 1.1),
+    )
+    w = SkWarmup()
+    assert not w.ready.is_set()
+    w.ensure()
+    w.ensure()                               # second call must be a no-op
+    assert w.wait(timeout=10.0)
+    from dsart.rfi.autos import DEFAULT_M_VALUES
+    assert sorted(calls) == sorted(DEFAULT_M_VALUES)
+
+
+def test_sk_warmup_sets_ready_even_when_it_fails(monkeypatch):
+    import dsart.rfi.sk as sk
+    from dsart.services.corr_slow_compute import SkWarmup
+
+    def _boom(m, far=1e-4):
+        raise MemoryError("33 GB, as it happens")
+
+    monkeypatch.setattr(sk, "sk_thresholds", _boom)
+    w = SkWarmup()
+    w.ensure()
+    assert w.wait(timeout=10.0)
+    assert w.ready.is_set()
+
+
+def test_build_slow_flagger_does_no_sk_work(monkeypatch):
+    """Constructing the flagger must not touch the Monte Carlo: the
+    default is flagging OFF, and corr_slow shares a node with
+    corr_fast, so an unconditional warm would have both processes
+    reaching for tens of GB at startup."""
+    import dsart.rfi.sk as sk
+    from dsart.services.corr_slow_compute import build_slow_flagger
+
+    called: list[int] = []
+    monkeypatch.setattr(
+        sk, "sk_thresholds",
+        lambda m, far=1e-4: called.append(m) or (0.9, 1.1),
+    )
+    flagger, guard = build_slow_flagger(
+        device=torch.device("cpu"), chgroup=6, flagants_path=None,
+        array_burst_mode="off", cal_path=None,
+    )
+    assert flagger is not None
+    assert int(guard.sum()) == 86          # chgroup 6 carries the HI band
+    assert called == []

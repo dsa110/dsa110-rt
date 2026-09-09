@@ -302,6 +302,75 @@ class SlowRfiControl:
             self.poll_once()
 
 
+class SkWarmup:
+    """Populates the SK Monte-Carlo threshold cache off the hot path.
+
+    :func:`dsart.rfi.sk._mc_sk_thresholds` draws a ``(1e6, M)``
+    float64 array — **32.8 GB at M = 4096** — so the first block that
+    flags is a multi-minute, multi-gigabyte event, not the "<100 ms
+    per M" the docstring there claims.
+
+    ``corr_fast`` absorbs this in its pre-sentinel dummy-block warmup.
+    ``corr_slow`` cannot: flagging here is normally OFF at startup and
+    may be switched on hours later from the Control tab. Paying it
+    inline would stall the block loop long enough to fill ``fada``
+    (70 blocks = 9.4 s), and fada back-pressure reaches the SNAPs.
+
+    So: warm in a daemon thread, and hold off flagging until it is
+    done. A few unflagged blocks at the moment the toggle is flipped
+    is a far better failure mode than dropped UDP packets.
+
+    Note the memory as well as the time — ``corr_slow`` and
+    ``corr_fast`` share a node, so an unconditional warm at startup
+    would have both processes reaching for 33 GB at once.
+    """
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self._started = False
+        self._t_start: float | None = None
+
+    def ensure(self) -> None:
+        """Kick off the warm-up once; cheap and idempotent after that."""
+        if self._started:
+            return
+        self._started = True
+        self._t_start = time.monotonic()
+        LOG.info(
+            "slow-RFI: warming the SK threshold cache in the background "
+            "(Monte-Carlo, tens of GB transiently); flagging starts when "
+            "it completes"
+        )
+        threading.Thread(
+            target=self._run, name="slow-rfi-sk-warm", daemon=True,
+        ).start()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self.ready.wait(timeout)
+
+    def _run(self) -> None:
+        try:
+            from dsart.rfi.autos import DEFAULT_M_VALUES
+            from dsart.rfi.sk import sk_thresholds
+            for m in DEFAULT_M_VALUES:
+                sk_thresholds(int(m))
+            LOG.info(
+                "slow-RFI: SK thresholds ready for M=%s in %.1fs",
+                list(DEFAULT_M_VALUES),
+                time.monotonic() - (self._t_start or time.monotonic()),
+            )
+        except Exception:  # noqa: BLE001
+            # Set ready anyway: flag_block is wrapped in the loop, so a
+            # failure there is contained, and blocking forever would
+            # silently disable a feature the operator turned on.
+            LOG.exception(
+                "slow-RFI: SK threshold warm-up failed; the first "
+                "flagged block will pay the cost inline"
+            )
+        finally:
+            self.ready.set()
+
+
 def build_slow_flagger(
     *,
     device: torch.device,
@@ -515,6 +584,15 @@ def run(
                 rfi_ctl.settings.enabled, SLOW_RFI_ETCD_KEY,
             )
         n_flagged_blocks = 0
+        n_flag_deferred = 0
+        sk_warm = SkWarmup()
+        if rfi_flagger is not None and rfi_ctl.settings.enabled:
+            # Already on at startup: warm BEFORE the ready sentinel,
+            # the same place corr_fast pays it, so the first real block
+            # runs at steady-state speed. When flagging is off (the
+            # default) nothing is allocated at all.
+            sk_warm.ensure()
+            sk_warm.wait()
 
         # 2b. Decide voltage / cal dtype based on --cal-mode (D17, 2026-05-05):
         #   * no cal           → fp16 (production fast path, tensor cores)
@@ -634,6 +712,9 @@ def run(
             settings = rfi_ctl.settings
             if rfi_flagger is not None and _apply_mask is not None \
                     and settings.enabled:
+                sk_warm.ensure()
+            if rfi_flagger is not None and _apply_mask is not None \
+                    and settings.enabled and sk_warm.ready.is_set():
                 try:
                     rfi_flagger.set_array_burst_mode(settings.array_burst_mode)
                     res = rfi_flagger.flag_block(real_v, imag_v)
@@ -657,6 +738,20 @@ def run(
                     LOG.exception(
                         "slow-RFI: flag_block failed on block %d; "
                         "passing voltages through unflagged", n_in,
+                    )
+            elif (
+                rfi_flagger is not None and settings.enabled
+                and not sk_warm.ready.is_set()
+            ):
+                # Warming. Pass the block through rather than block the
+                # ring; log sparsely so a long warm-up is visible
+                # without flooding the journal.
+                n_flag_deferred += 1
+                if n_flag_deferred in (1, 10, 100) or \
+                        n_flag_deferred % 500 == 0:
+                    LOG.info(
+                        "slow-RFI: %d block(s) passed through unflagged "
+                        "while the SK cache warms", n_flag_deferred,
                     )
 
             if cal_real_b is not None:
@@ -723,6 +818,7 @@ def run(
             "ms_per_block_p50": ms_p50,
             "ms_per_block_p99": ms_p99,
             "n_blocks_flagged": n_flagged_blocks,
+            "n_blocks_flag_deferred": n_flag_deferred,
             "rfi_enabled": bool(rfi_ctl.settings.enabled),
             "rfi_array_burst_mode": rfi_ctl.settings.array_burst_mode,
             "rfi_hi_guard": bool(rfi_ctl.settings.hi_guard),
