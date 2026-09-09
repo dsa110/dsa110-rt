@@ -109,6 +109,7 @@ from dsart.grid import (
     compute_top_of_band_cell_lambda,
 )
 from dsart.rfi import (
+    ARRAY_BURST_M_FINE,
     BIN_CHANS_DEFAULT,
     TOTAL_NATIVE_T,
     ArrayBurstDetector,
@@ -4095,7 +4096,11 @@ def run(
             # of the accumulation plan (4096 native samples per cube /
             # the base M), so it is known here without waiting for a
             # cube to arrive — which the fixed-size shm record needs.
-            _ab = ctx.rfi_flagger.array_burst
+            # getattr, not attribute access: the flagger is duck-typed
+            # in several tests (see _FixedAntFlagger in
+            # tests/test_corr_fast_integration.py), and monitoring must
+            # not be the thing that breaks a stub.
+            _ab = getattr(ctx.rfi_flagger, "array_burst", None)
             ab_group_names = _ab.group_names if _ab is not None else ()
             ab_group_sizes = (
                 [int(v) for v in _ab.groups.sizes.tolist()]
@@ -4103,9 +4108,11 @@ def run(
             )
             ab_flag_group = _ab.flag_group if _ab is not None else ""
             ab_n_group = len(ab_group_names)
+            _mvals = getattr(
+                ctx.rfi_flagger, "_m_values", (ARRAY_BURST_M_FINE,),
+            )
             ab_n_acc = (
-                TOTAL_NATIVE_T // min(ctx.rfi_flagger._m_values)
-                if _ab is not None else 0
+                TOTAL_NATIVE_T // min(_mvals) if _ab is not None else 0
             )
 
             rfi_aggregator = RFIWindowAggregator(
