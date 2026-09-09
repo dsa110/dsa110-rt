@@ -37,16 +37,32 @@ def _voltages(fill: float = 1.0):
 # ---------------------------------------------------------------------------
 
 
-def test_array_burst_bit_does_not_collide():
-    """Bit 5 must be free and inside uint8."""
-    assert int(FlagSourceBit.ARRAY_BURST) == 32
-    others = (
-        FlagSourceBit.SK | FlagSourceBit.BANDPASS_OUTLIER
-        | FlagSourceBit.GROUP_OUTLIER | FlagSourceBit.SUM_THRESHOLD
-        | FlagSourceBit.FLAGANTS_DAT
+def test_source_tag_bits_are_all_distinct_and_fit_uint8():
+    """No two detectors may share a bit, and the whole set must fit in
+    the uint8 source-tag plane.
+
+    Pinned generally rather than against a hardcoded value: this test
+    was originally written asserting ARRAY_BURST == 32, and it caught
+    a real collision when main independently took bit 5 for the
+    persistence latch. The next detector added should fail here too if
+    it reuses a bit, not silently alias an existing one — the monitor
+    decomposes these bitwise, so an alias would report one detector's
+    flags as another's.
+    """
+    bits = [b for b in FlagSourceBit if int(b) != 0]
+    values = [int(b) for b in bits]
+    assert len(set(values)) == len(values), (
+        "duplicate source-tag bits: %s"
+        % {b.name: int(b) for b in bits}
     )
-    assert int(FlagSourceBit.ARRAY_BURST) & int(others) == 0
-    assert int(others | FlagSourceBit.ARRAY_BURST) <= 255
+    for v in values:
+        assert v & (v - 1) == 0, "not a single bit: %d" % v
+    combined = 0
+    for v in values:
+        assert combined & v == 0
+        combined |= v
+    assert combined <= 255, "source tags no longer fit in uint8"
+    assert int(FlagSourceBit.ARRAY_BURST) & int(FlagSourceBit.PERSISTENCE) == 0
 
 
 # ---------------------------------------------------------------------------
