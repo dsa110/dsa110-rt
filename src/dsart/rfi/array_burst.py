@@ -94,9 +94,19 @@ A sample fires when the flag group's band-summed power exceeds
 what protects real FRBs: across one 11.72 MHz sub-band at 1.4 GHz the
 dispersion sweep is ``0.035 · DM`` ms, so within a single 2.097 ms
 sample an FRB lights ~60% of the band at DM 100, ~20% at DM 300 and
-~6% at DM 1000. At the default ``occupancy_min = 0.75`` anything
-above DM ≈ 150 cannot fire. A local, dispersion-free burst lights
-~100% of the band and does.
+~6% at DM 1000. A local, dispersion-free burst lights ~100% of the
+band, and does fire.
+
+That analytic picture is not the whole story, and the difference
+matters. Measured by injecting dispersed pulses into a real dump
+(n03, 2026-09-09), the occupancy a sweep actually reaches is higher
+than the fraction of band it lights — 0.75 at DM 100, 0.46 at DM 300,
+0.29 at DM 1000 — because the wings of a bright sweep still clear the
+per-bin threshold. It also **rises with brightness**, so the margin is
+not amplitude-independent: at ``occupancy_min = 0.75`` a DM-100 pulse
+at +300% band power reached exactly 0.75 and was flagged. The default
+is therefore 0.90, clear of every dispersed case measured, while a
+dispersion-free burst reaches 1.00 even at +5%.
 
 A genuinely zero-DM broadband event would still fire. Those currently
 rail at the ``dm_min = 100`` search floor and are classified
@@ -159,8 +169,14 @@ DETECT_K_DEFAULT: Final[float] = 6.0
 BIN_K_DEFAULT: Final[float] = 2.0
 
 #: Fraction of coarse bins that must be occupied for a sample to fire.
-#: 0.75 rejects any FRB above DM ≈ 150 by construction.
-OCCUPANCY_MIN_DEFAULT: Final[float] = 0.75
+#:
+#: Set from measurement, not from the analytic sweep width. Injecting
+#: dispersed pulses into a real dump on n03 (2026-09-09) gives a
+#: MAXIMUM occupancy of 0.75 at DM 100, 0.46 at DM 300 and 0.29 at
+#: DM 1000, against 1.00 for a dispersion-free burst. Those ceilings
+#: RISE with brightness, so 0.75 was not safe: a DM-100 pulse at
+#: +300% band power reached exactly 0.75 and fired.
+OCCUPANCY_MIN_DEFAULT: Final[float] = 0.90
 
 #: EMA time constant for the baseline, in cubes. 224 cubes ≈ 30 s,
 #: matching :data:`dsart.common.constants.RFI_BANDPASS_WARMUP_CUBES_DEFAULT`
@@ -727,11 +743,18 @@ class ArrayBurstDetector:
             )
 
         # --- 7. monitor products ------------------------------------
-        # Reduce over time first: the einsum then runs on [A, C, P]
-        # rather than [T, A, C, P], which is 64x fewer MACs for the
-        # same answer.
+        # group_spec is the time-mean of the normalised power. Writing
+        # that out:
+        #
+        #     mean_t(x) = mean_t(s1_fine) * inv = (s1_full / n_acc) * inv
+        #
+        # so it comes straight from s1_full, which is [A, C, P] — 64x
+        # smaller than reducing [T, A, C, P] over time. Identical
+        # answer, one fewer full pass over the fine moments. Measured
+        # on a 2080 Ti this is worth ~0.4 ms of the detector's budget,
+        # which matters when the block has ~7 ms of headroom.
         group_spec = torch.einsum(
-            "acp,agp->gcp", x.mean(dim=0), w,
+            "acp,agp->gcp", s1c * inv / float(n_acc), w,
         )                                                 # [G, C, P]
 
         self._cubes_seen += 1

@@ -12,6 +12,8 @@ Key shapes covered (cardinalities per the M7.5 phase-B fleet):
   - ``/mon/corr_rt/<cn>``                  → ``corr_rt_routine`` (8/cn) + ``corr_rt_buffer``
   - ``/mon/corr_rt/<cn>/capture/<port>``   → ``corr_rt_capture`` (2/cn)
   - ``/mon/corr_rt/<cn>/rfi``              → ``corr_rt_rfi`` (3/cn, per-pol fan-out)
+                                            + ``corr_rt_array_burst``
+                                              (M7.7, per-summing-group fan-out)
   - ``/mon/service/corr_rt/<cn>``          → ``corr_rt_heartbeat``
   - ``/mon/search_rt/<cn>``                → ``search_rt_routine`` (3/cn)
   - ``/mon/search_rt/<cn>/compute/<half>`` → ``search_rt_compute`` (2/cn,
@@ -843,6 +845,108 @@ def make_rfi_points(
     return out
 
 
+#: Per-group fields on ``corr_rt_array_burst``. Each is a dict keyed by
+#: group name in the etcd payload; the pusher fans them out into one
+#: row per group so Grafana can ``GROUP BY group``.
+ARRAY_BURST_GROUP_FIELDS: Tuple[str, ...] = (
+    "fired_fraction",
+    "band_frac_max",
+    "band_frac_at_fire",
+)
+
+#: Node-level fields, duplicated onto every group row so a panel can
+#: pick any single group without a join (same idea as
+#: :data:`RFI_ENVELOPE_FIELDS`).
+ARRAY_BURST_ENVELOPE_FIELDS: Tuple[str, ...] = (
+    "n_samples",
+    "n_fired_samples",
+    "arm_ratio",
+)
+
+#: ``mode`` as an integer so it can be alerted on and plotted.
+#: 0 = off, 1 = monitor (nothing excised), 2 = flag (armed).
+ARRAY_BURST_MODE_CODES: Dict[str, int] = {"off": 0, "monitor": 1, "flag": 2}
+
+
+def make_array_burst_points(
+    payload: Dict[str, Any], *, cn_id: int,
+) -> List[Point]:
+    """Fan the RFI payload's ``array_burst`` block into per-group rows.
+
+    This rides the same ``/mon/corr_rt/<cn>/rfi`` key as
+    :func:`make_rfi_points` but lands on its own measurement, because
+    the natural tag is ``group`` (all / core / ew_arm / ns_arm /
+    outriggers) and ``corr_rt_rfi`` is tagged by ``pol``. Merging them
+    would produce a sparse pol x group cross-product where most cells
+    are meaningless.
+
+    Returns ``[]`` when the detector is not running, so a fleet that
+    has not been restarted onto M7.7 simply contributes nothing rather
+    than a stream of zeros.
+    """
+    ab = payload.get("array_burst")
+    if not isinstance(ab, dict):
+        return []
+
+    publish_unix = payload.get("publish_unix")
+    if not isinstance(publish_unix, (int, float)) or isinstance(
+        publish_unix, bool
+    ):
+        return []
+    ts_ns = int(float(publish_unix) * 1e9)
+    host = _host_for_cn(cn_id)
+
+    mode = str(ab.get("mode", "off"))
+    mode_code = ARRAY_BURST_MODE_CODES.get(mode, 0)
+    running = bool(ab.get("running"))
+
+    groups = ab.get("groups")
+    if not running or not isinstance(groups, list) or not groups:
+        # Detector off or still warming: emit ONE status row so the
+        # dashboard can distinguish "off" from "no data at all",
+        # which are very different operationally.
+        return [Point(
+            measurement="corr_rt_array_burst",
+            tags={"cn_id": str(int(cn_id)), "host": host, "group": "_node"},
+            fields={"mode_code": mode_code, "running": 0, "mode": mode},
+            timestamp_ns=ts_ns,
+        )]
+
+    envelope: Dict[str, Any] = {
+        "mode_code": mode_code,
+        "running": 1,
+        "mode": mode,
+    }
+    for k in ARRAY_BURST_ENVELOPE_FIELDS:
+        v = ab.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        envelope[k] = int(v) if isinstance(v, int) else float(v)
+
+    out: List[Point] = []
+    for gname in groups:
+        if not isinstance(gname, str):
+            continue
+        fields: Dict[str, Any] = dict(envelope)
+        fields["is_flag_group"] = (
+            1 if gname == ab.get("flag_group") else 0
+        )
+        for metric in ARRAY_BURST_GROUP_FIELDS:
+            per_group = ab.get(metric)
+            if not isinstance(per_group, dict):
+                continue
+            v = per_group.get(gname)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                fields[metric] = float(v)
+        out.append(Point(
+            measurement="corr_rt_array_burst",
+            tags={"cn_id": str(int(cn_id)), "host": host, "group": gname},
+            fields=fields,
+            timestamp_ns=ts_ns,
+        ))
+    return out
+
+
 #: Numeric fields lifted off the ``/mon/search_rt/<cn>/compute/<g>``
 #: payload onto the ``search_rt_compute`` measurement. ``c1_metering_*``
 #: is the M7.6 C1→C2 metering rollup (16-block average).
@@ -1390,7 +1494,13 @@ class InfluxPusherService:
                 )
             m = KEY_CORR_RFI.match(key)
             if m:
-                return make_rfi_points(payload, cn_id=int(m.group(1)))
+                cn = int(m.group(1))
+                # One etcd key, two measurements: corr_rt_rfi is tagged
+                # by pol, corr_rt_array_burst by summing group.
+                return (
+                    make_rfi_points(payload, cn_id=cn)
+                    + make_array_burst_points(payload, cn_id=cn)
+                )
             m = KEY_CORR_MERIDIAN.match(key)
             if m:
                 return make_meridian_points(payload, cn_id=int(m.group(1)))

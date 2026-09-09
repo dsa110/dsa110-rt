@@ -1200,3 +1200,134 @@ def test_cli_overrides():
     assert args.poll_cadence_s == 0.5
     assert args.no_dedupe
     assert args.max_iters == 10
+
+
+# ---------------------------------------------------------------------------
+# 7b. make_array_burst_points (M7.7)
+# ---------------------------------------------------------------------------
+
+#: The ``array_burst`` block rfi_monitor_export._array_burst_summary
+#: adds to the RFI payload. Numbers are the 260812imek measurement:
+#: 1.86% on the E-W arm against 0.81% on the N-S, ratio 2.3.
+ARRAY_BURST_GROUPS = ["all", "core", "ew_arm", "ns_arm", "outriggers"]
+ARRAY_BURST_BLOCK = {
+    "mode": "monitor",
+    "flag_group": "core",
+    "groups": ARRAY_BURST_GROUPS,
+    "running": True,
+    "fired_fraction": {"all": 0.00098, "core": 0.00098, "ew_arm": 0.00098,
+                       "ns_arm": 0.00098, "outriggers": 0.0},
+    "n_samples": 1024,
+    "n_fired_samples": 1,
+    "band_frac_max": {n: 0.03 for n in ARRAY_BURST_GROUPS},
+    "band_frac_at_fire": {"all": 0.0142, "core": 0.0145, "ew_arm": 0.0186,
+                          "ns_arm": 0.0081, "outriggers": 0.0},
+    "arm_ratio": 2.2963,
+}
+CORR_RFI_N06_AB = dict(CORR_RFI_N06, array_burst=ARRAY_BURST_BLOCK)
+
+
+class TestMakeArrayBurstPoints:
+    def test_one_row_per_summing_group(self):
+        pts = pusher.make_array_burst_points(CORR_RFI_N06_AB, cn_id=6)
+        assert [p.tags["group"] for p in pts] == ARRAY_BURST_GROUPS
+        assert all(p.measurement == "corr_rt_array_burst" for p in pts)
+        assert all(p.tags["cn_id"] == "6" for p in pts)
+
+    def test_separate_measurement_from_corr_rt_rfi(self):
+        """corr_rt_rfi is tagged by pol, this one by group. Merging
+        them would make a sparse pol x group cross-product where most
+        cells are meaningless."""
+        ab = pusher.make_array_burst_points(CORR_RFI_N06_AB, cn_id=6)
+        rfi = pusher.make_rfi_points(CORR_RFI_N06_AB, cn_id=6)
+        assert {p.measurement for p in ab} == {"corr_rt_array_burst"}
+        assert {p.measurement for p in rfi} == {"corr_rt_rfi"}
+        assert len(rfi) == 3            # the pol fan-out is untouched
+        assert "group" not in rfi[0].tags
+        assert "pol" not in ab[0].tags
+
+    def test_flag_group_and_mode(self):
+        pts = pusher.make_array_burst_points(CORR_RFI_N06_AB, cn_id=6)
+        by = {p.tags["group"]: p for p in pts}
+        assert by["core"].fields["is_flag_group"] == 1
+        assert by["ew_arm"].fields["is_flag_group"] == 0
+        assert by["core"].fields["mode_code"] == 1      # monitor
+        assert by["core"].fields["running"] == 1
+
+    def test_armed_mode_is_alertable(self):
+        armed = dict(CORR_RFI_N06_AB)
+        armed["array_burst"] = dict(ARRAY_BURST_BLOCK, mode="flag")
+        pts = pusher.make_array_burst_points(armed, cn_id=6)
+        assert pts[0].fields["mode_code"] == 2
+
+    def test_per_arm_amplitudes_and_ratio(self):
+        pts = pusher.make_array_burst_points(CORR_RFI_N06_AB, cn_id=6)
+        by = {p.tags["group"]: p for p in pts}
+        assert by["ew_arm"].fields["band_frac_at_fire"] == pytest.approx(0.0186)
+        assert by["ns_arm"].fields["band_frac_at_fire"] == pytest.approx(0.0081)
+        # arm_ratio is a node-level envelope field, duplicated on every
+        # row so a panel can pick one group without a join.
+        for p in pts:
+            assert p.fields["arm_ratio"] == pytest.approx(2.2963)
+
+    def test_timestamp_is_publish_unix(self):
+        pts = pusher.make_array_burst_points(CORR_RFI_N06_AB, cn_id=6)
+        want = int(CORR_RFI_N06_AB["publish_unix"] * 1e9)
+        assert all(p.timestamp_ns == want for p in pts)
+
+    def test_detector_off_emits_one_status_row(self):
+        """'off' and 'no data at all' are very different operationally,
+        so the off case must still say something."""
+        off = dict(CORR_RFI_N06_AB)
+        off["array_burst"] = {"mode": "off", "running": False,
+                              "groups": [], "flag_group": ""}
+        pts = pusher.make_array_burst_points(off, cn_id=6)
+        assert len(pts) == 1
+        assert pts[0].tags["group"] == "_node"
+        assert pts[0].fields["running"] == 0
+        assert pts[0].fields["mode_code"] == 0
+
+    def test_pre_m77_payload_emits_nothing(self):
+        """A node that has not been restarted onto M7.7 has no
+        array_burst key; it must contribute no rows rather than a
+        stream of zeros that would drag fleet means down."""
+        assert pusher.make_array_burst_points(CORR_RFI_N06, cn_id=6) == []
+
+    def test_malformed_subfields_are_skipped_not_fatal(self):
+        bad = dict(CORR_RFI_N06_AB)
+        bad["array_burst"] = dict(
+            ARRAY_BURST_BLOCK, fired_fraction="not-a-dict", arm_ratio=None,
+        )
+        pts = pusher.make_array_burst_points(bad, cn_id=6)
+        assert len(pts) == len(ARRAY_BURST_GROUPS)
+        assert "fired_fraction" not in pts[0].fields
+        assert "arm_ratio" not in pts[0].fields
+
+    def test_missing_publish_unix_drops(self):
+        bad = {k: v for k, v in CORR_RFI_N06_AB.items()
+               if k != "publish_unix"}
+        assert pusher.make_array_burst_points(bad, cn_id=6) == []
+
+    def test_lines_are_well_formed(self):
+        pts = pusher.make_array_burst_points(CORR_RFI_N06_AB, cn_id=6)
+        for p in pts:
+            line = p.to_line()
+            assert line.startswith("corr_rt_array_burst,")
+            assert " " in line
+            assert not line.endswith(",")
+
+
+def test_route_rfi_key_emits_both_measurements():
+    """One etcd key must produce both the pol fan-out and the group
+    fan-out; a regression here would silently lose one of them."""
+    svc = pusher.InfluxPusherService(
+        etcd_client=_fully_populated_etcd(),
+        influx_writer=_FakeInfluxWriter(),
+    )
+    pts = svc._route("/mon/corr_rt/6/rfi", CORR_RFI_N06_AB)
+    ms = {p.measurement for p in pts}
+    assert ms == {"corr_rt_rfi", "corr_rt_array_burst"}
+    assert sum(p.measurement == "corr_rt_rfi" for p in pts) == 3
+    assert sum(
+        p.measurement == "corr_rt_array_burst" for p in pts
+    ) == len(ARRAY_BURST_GROUPS)

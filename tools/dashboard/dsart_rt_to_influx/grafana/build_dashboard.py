@@ -22,6 +22,8 @@ Layout (top to bottom):
          free_blocks, n_written rate.
   Row H. RFI summary -- total/bandpass/ant fractions and per-detector
          decomposition.
+  Row H2. Array-burst detector (M7.7) -- mode, fired fraction per
+         summing group and per cn, E-W/N-S arm ratio.
   Row I. C1 batch RX into C2 (connections_open, bytes_read,
          bad_schema/torn/bad_batch).
   Row J. C1 -> C2 candidate flow (rows_in rate, components evaluated
@@ -1136,6 +1138,137 @@ def panels() -> List[Dict[str, Any]]:
         alias="cn $tag_cn_id",
         w=12, x=12, h=7, unit="s", y_min=0, legend_right=True,
         description="age_s = publish_unix - time_unix. Healthy <=~2.2 s. Spikes mean rfi_monitor_export is behind the corr_fast shm producer.",
+    ))
+    _bump_y(7)
+
+    out.append(row_panel(
+        "H2. Array-burst detector (core / arm autocorrelation sums)"
+    ))
+    _bump_y(1)
+    out.append(text_panel(
+        (
+            "Every detector in the per-antenna chain above (SK, "
+            "bandpass-outlier, group-outlier) works INSIDE one antenna, "
+            "so a broadband burst common to the whole array moves each "
+            "of their references along with the signal and none of them "
+            "fires. Measured on 260812imek sb02 such a burst is 0.05 "
+            "sigma in the cell the flagger tests and 13.3 sigma in the "
+            "array-summed band power at 2.097 ms.\n\n"
+            "These panels show the sum. `mode_code` 0=off, 1=monitor "
+            "(nothing excised -- how the fast path ships), 2=flag "
+            "(armed). The E-W/N-S arm ratio is a local-vs-far-field "
+            "discriminant: a far-field source lights both arms in "
+            "proportion to collecting area, so it sits near 1."),
+        w=24, x=0, h=4,
+    ))
+    _bump_y(4)
+    out.append(graph_panel(
+        title="Array-burst mode per cn (0 off / 1 monitor / 2 ARMED)",
+        raw_query=(
+            'SELECT last("mode_code") FROM "corr_rt_array_burst" '
+            "WHERE \"group\" = 'core' AND $timeFilter "
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=0, h=6, unit="short", y_min=0, y_max=2, legend_right=True,
+        description=(
+            "2 means the detector is ARMED and zero-filling voltages on "
+            "that node. The fast path ships at 1 (monitor). A node "
+            "reading 0 either has the detector off or has not been "
+            "restarted onto M7.7."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Fired fraction of 2.097 ms samples -- fleet mean per group",
+        raw_query=(
+            'SELECT mean("fired_fraction") FROM "corr_rt_array_burst" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "group" fill(null)'
+        ),
+        alias="$tag_group",
+        w=12, x=12, h=6, unit="percentunit", y_min=0, legend_right=True,
+        description=(
+            "Fraction of 2.097 ms accumulations the gate fired on. On "
+            "quiet data this sits at 0 (the null test bounds it below "
+            "1e-3). A step up means real array-common bursts."
+        ),
+    ))
+    _bump_y(6)
+    out.append(graph_panel(
+        title="Fired fraction per cn (flag group = core)",
+        raw_query=(
+            'SELECT mean("fired_fraction") FROM "corr_rt_array_burst" '
+            "WHERE \"group\" = 'core' AND $timeFilter "
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=0, h=7, unit="percentunit", y_min=0, legend_right=True,
+        description=(
+            "Per sub-band. Each corr node decides independently on its "
+            "own 11.72 MHz, so a burst confined to one part of the band "
+            "shows on a subset of nodes."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Burst amplitude when fired -- E-W vs N-S arm (fleet mean)",
+        raw_query=(
+            'SELECT mean("band_frac_at_fire") FROM "corr_rt_array_burst" '
+            "WHERE \"group\" = 'ew_arm' AND $timeFilter "
+            'GROUP BY time($__interval) fill(null)'
+        ),
+        alias="E-W arm",
+        w=12, x=12, h=7, unit="percentunit", legend_right=True,
+        extra_targets=[
+            {"refId": "B", "alias": "N-S arm", "query": (
+                'SELECT mean("band_frac_at_fire") FROM '
+                '"corr_rt_array_burst" '
+                "WHERE \"group\" = 'ns_arm' AND $timeFilter "
+                'GROUP BY time($__interval) fill(null)'
+            )},
+            {"refId": "C", "alias": "core", "query": (
+                'SELECT mean("band_frac_at_fire") FROM '
+                '"corr_rt_array_burst" '
+                "WHERE \"group\" = 'core' AND $timeFilter "
+                'GROUP BY time($__interval) fill(null)'
+            )},
+        ],
+        description=(
+            "Fractional excess over each group's own baseline, averaged "
+            "over the samples that fired. Only meaningful when "
+            "n_fired_samples > 0."
+        ),
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="E-W / N-S arm ratio -- local vs far-field discriminant",
+        raw_query=(
+            'SELECT mean("arm_ratio") FROM "corr_rt_array_burst" '
+            "WHERE \"group\" = 'core' AND $timeFilter "
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "A far-field source illuminates both arms in proportion to "
+            "collecting area, so it sits near 1. The 260812imek bursts "
+            "sit at 2.3 (1.86% E-W vs 0.81% N-S), i.e. near-field. "
+            "Published as a diagnostic; it is NOT part of the firing "
+            "decision."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Samples fired per window, per cn (flag group)",
+        raw_query=(
+            'SELECT last("n_fired_samples") FROM "corr_rt_array_burst" '
+            "WHERE \"group\" = 'core' AND $timeFilter "
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn $tag_cn_id",
+        w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Absolute count out of n_samples (1024 per 16-cube window "
+            "at the production op-point = 64 accumulations x 16 cubes)."
+        ),
     ))
     _bump_y(7)
 
