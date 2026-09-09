@@ -44,10 +44,51 @@ the panel coordinates from the C2 **detection metadata**:
 
 The peak member (max ``snr``) gives the owning ``(search_node, gpu_half)``
 cube, the fine-DM trial (``fine_dm_idx``), and the image pixel
-(``l_pix, m_pix``). The burst time within the cube is the argmax of the
-DM-sliced light curve (the cube's ``event_specnum_start`` is the dump
-*key*, not the cube's first-sample specnum, so specnum arithmetic can't
-locate the burst in time — the per-DM time profile can).
+(``l_pix, m_pix``).
+
+The burst *time* comes from the cube's sample-0 anchor when the NPZ
+carries one (``cube_specnum_start``, dumps from 2026-08-04 on):
+
+    t_in_cube = event_specnum - cube_specnum_start
+
+Both operands count SEARCH samples (one per detector sample), so this
+is a plain subtraction — ``sample_period_specnum`` is native specnums
+per search sample and must NOT be divided out here; see
+:func:`_metadata_t_idx` for the full units contract and the archive
+evidence. Older NPZs carry only ``event_specnum_start``, which is the
+dump *key* (the trigger specnum), not the cube's first-sample specnum,
+so specnum arithmetic can't locate the burst in them — for those we
+fall back to the argmax of the DM-sliced light curve.
+
+Matching the detector's boxcar (2026-08-02)
+-------------------------------------------
+
+That argmax used to run on the **raw** per-sample series, while the
+detector thresholds a *boxcar match-filtered* one of width
+``width_samples``. On real events that mismatch is large: for
+260801rmep (``width_samples=16``) the raw argmax sits at sample 110 with
+6.5 sigma at the detected pixel, while the width-matched argmax sits at
+107 with **15.9 sigma** against a detector-reported 19.7. The panels
+were therefore being placed several samples off the burst centre and
+the re-measured significance understated it by ~2.4x.
+
+We now convolve the DM light curve with the detector's own
+``width_samples`` boxcar (normalised ``1/sqrt(w)``, so the result stays
+in sigma units) before taking the argmax, and :func:`_render_dm_time`
+shows the **smoothed** DM-time cube. ``_BurstCoords`` carries both the
+detector's SNR and the re-measured one so every panel title can print
+the difference; a large gap means the cube and the C1 row disagree and
+the event needs a human.
+
+Set ``DSART_PLOTTER_SMOOTH=0`` to restore the raw-argmax behaviour.
+
+The light curve and the peak search run on the **detected pixel**
+``cube[:, fdm, l_pix, m_pix]``, not on ``cube.max(axis=(2, 3))``: the
+detector works per pixel, and a max over 65 536 pixels has an extreme-
+value distribution whose median/MAD is not a sigma scale for a point
+source (on 260801bdga the image-max series re-measures the burst at 7.3
+sigma against 12.4 at the detected pixel). The image-max trace is kept
+as context on the light-curve panel.
 
 NPZ schema (matches the production ``CubeDumpWriter``)
 ------------------------------------------------------
@@ -391,6 +432,40 @@ def render_event_plots(job: PlotJob) -> List[Path]:
 
     # Burst coords resolved against the cube we actually have.
     coords = _burst_coords(burst, waterfall, peak)
+    if coords is not None and coords.t_idx is not None:
+        _LOG.info(
+            "plotter: %s peak placement — detector SNR=%.2f vs cube "
+            "re-measure %.2f sigma at t=%d (boxcar w=%d); unsmoothed "
+            "re-measure %.2f sigma at t=%s; delta(detector - matched)="
+            "%+.2f sigma, delta(matched - unsmoothed)=%+.2f sigma",
+            job.event_name, coords.snr, coords.snr_measured, coords.t_idx,
+            coords.boxcar, coords.snr_measured_raw, coords.t_idx_raw,
+            coords.snr_delta,
+            coords.snr_measured - coords.snr_measured_raw,
+        )
+        if coords.boxcar > 1 and coords.t_idx_raw is not None:
+            shift = coords.t_idx - coords.t_idx_raw
+            if abs(shift) > 0:
+                _LOG.info(
+                    "plotter: %s width-matching moved the peak %+d "
+                    "sample(s) (raw argmax t=%d -> matched t=%d)",
+                    job.event_name, shift, coords.t_idx_raw, coords.t_idx,
+                )
+        if abs(coords.snr_delta) > _SNR_DELTA_WARN_SIGMA:
+            _LOG.warning(
+                "plotter: %s cube re-measurement is %+.1f sigma off the "
+                "detector's SNR (%.2f reported vs %.2f matched at the "
+                "detected pixel). Expected causes, in order of how often "
+                "they bite: the detector normalises by the Layer-2 "
+                "sigma_k EMA over many cubes while this is one cube's "
+                "own median/MAD at one pixel; the dumped cube is a "
+                "different pipeline stage than the scored one; or the "
+                "dump is time-misaligned and this peak is not the "
+                "candidate. Treat the panels as indicative until it is "
+                "reconciled.",
+                job.event_name, -coords.snr_delta, coords.snr,
+                coords.snr_measured,
+            )
 
     try:
         t0 = time.perf_counter()
@@ -415,7 +490,9 @@ def render_event_plots(job: PlotJob) -> List[Path]:
 
         t0 = time.perf_counter()
         written.append(
-            _render_lightcurve(plots_dir, job.event_name, waterfall, coords),
+            _render_lightcurve(
+                plots_dir, job.event_name, waterfall, coords, burst,
+            ),
         )
         _LOG.info(
             "plotter: lightcurve rendered in %.1fs (event=%s)",
@@ -465,6 +542,17 @@ class _CubeChunk:
     fine_dm_pc_cc: np.ndarray  # shape (n_fdm,)
     mjd_start: float
     sample_period_us: float
+    # TRUE sample-0 anchor (dumps from 2026-08-04 on). -1 / 0 / NaN when
+    # the NPZ predates it, in which case _metadata_t_idx declines and the
+    # width-matched argmax is used instead. See that function.
+    #
+    # cube_specnum_start is in SEARCH-SAMPLE units — the SAME units as a
+    # C1 row's event_specnum — so their difference is directly an index
+    # along axis 0. sample_period_specnum (native specnums per search
+    # sample, 16 in production) is metadata, NOT a divisor.
+    cube_specnum_start: int = -1
+    sample_period_specnum: int = 0
+    cube_mjd_start: float = float("nan")
     # Populated by _populate_peak_grids after _load_cubes returns.
     peak_grid: Optional[np.ndarray] = None  # (n_fdm, n_t), fp32
     # Keep the NpzFile reference alive so the metadata zip handle stays
@@ -648,6 +736,15 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
                 if "sample_period_us" in manifest
                 else _scalar_or(npz, "sample_period_us", 1048.576)
             )
+            # `mjd_start` in a C2-triggered dump mirrors the manifest's
+            # `event_specnum_start`, which that path overwrites with the
+            # TRIGGER specnum (c2_trigger_listener._build_manifest). The
+            # separately-recorded `cube_mjd_start` is the honest MJD of
+            # cube sample 0, so prefer it whenever it is finite; NaN is
+            # the writer's sentinel for "pre-2026-08-04 dump".
+            cube_mjd_start = _scalar_or(npz, "cube_mjd_start", float("nan"))
+            if np.isfinite(cube_mjd_start):
+                mjd_start = float(cube_mjd_start)
 
             chunks.append(_CubeChunk(
                 search_node_id=int(m.group("sid")),
@@ -657,6 +754,13 @@ def _load_cubes(cubes_dir: Path) -> List[_CubeChunk]:
                 fine_dm_pc_cc=fine_dm,
                 mjd_start=mjd_start,
                 sample_period_us=sample_period_us,
+                cube_specnum_start=int(
+                    _scalar_or(npz, "cube_specnum_start", -1)
+                ),
+                sample_period_specnum=int(
+                    _scalar_or(npz, "sample_period_specnum", 0)
+                ),
+                cube_mjd_start=float(cube_mjd_start),
                 _npz=npz,
             ))
         except Exception as exc:  # noqa: BLE001
@@ -696,16 +800,27 @@ class _BurstPeak:
     width_samples: int
     kernel_id: str
     source: str  # "members" | "csv"
+    #: the candidate's absolute spec num, for _metadata_t_idx. 0 when the
+    #: source row did not carry it.
+    event_specnum: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class _BurstCoords:
     """Resolved panel coordinates within the burst cube.
 
-    ``t_idx`` is the cube time sample of the burst (argmax of the DM
-    light curve); ``fdm_idx`` the fine-DM trial row; ``(l_pix, m_pix)``
-    the image pixel. ``from_metadata`` distinguishes the trustworthy
-    metadata path from the cube-argmax fallback (flagged on the plots).
+    ``t_idx`` is the cube time sample of the burst (argmax of the
+    width-matched DM light curve); ``fdm_idx`` the fine-DM trial row;
+    ``(l_pix, m_pix)`` the image pixel. ``from_metadata`` distinguishes
+    the trustworthy metadata path from the cube-argmax fallback (flagged
+    on the plots).
+
+    ``snr`` is what the **detector** reported. ``snr_measured`` is what
+    the plotter re-measures on the dumped cube at ``t_idx`` after
+    applying the detector's own boxcar, and ``snr_measured_raw`` the
+    same without smoothing — the gap between the last two is the
+    smoothing the detector applied and the post-processing used not to.
+    ``boxcar`` is the width actually convolved (1 = none).
     """
 
     t_idx: Optional[int]
@@ -718,6 +833,186 @@ class _BurstCoords:
     n_fdm: int
     t_det: int
     from_metadata: bool
+    snr_measured: float = float("nan")
+    snr_measured_raw: float = float("nan")
+    t_idx_raw: Optional[int] = None
+    boxcar: int = 1
+    #: True when t_idx came from the cube's sample-0 anchor (the
+    #: detector's own index) rather than from a re-located peak.
+    t_from_anchor: bool = False
+
+    @property
+    def snr_delta(self) -> float:
+        """Detector SNR minus the width-matched re-measurement."""
+        return float(self.snr) - float(self.snr_measured)
+
+
+# ---------------------------------------------------------------------------
+# Detector-matched boxcar smoothing
+# ---------------------------------------------------------------------------
+
+
+#: Log a WARNING when the cube re-measurement is this far from the
+#: detector's reported SNR. Sized to catch "the dump doesn't contain the
+#: burst" (tens of sigma), not ordinary normalisation differences.
+_SNR_DELTA_WARN_SIGMA: float = 5.0
+
+
+def _smoothing_enabled() -> bool:
+    """``DSART_PLOTTER_SMOOTH=0`` restores the pre-2026-08-02 raw argmax."""
+    return os.environ.get("DSART_PLOTTER_SMOOTH", "1").strip() not in (
+        "0", "false", "False", "no",
+    )
+
+
+def _boxcar_width(peak: Optional[_BurstPeak]) -> int:
+    """The detector's boxcar width for this candidate (>= 1).
+
+    ``width_samples`` on the C1 row is the matched-filter width the
+    winning kernel used, in cube samples. 0/absent (the no-metadata
+    fallback) means "don't smooth".
+    """
+    if peak is None or not _smoothing_enabled():
+        return 1
+    return max(1, int(peak.width_samples))
+
+
+def _boxcar(series: np.ndarray, width: int) -> np.ndarray:
+    """Match-filter ``series`` with a ``width``-sample boxcar.
+
+    Normalised by ``1/sqrt(width)`` so that white noise keeps unit
+    variance and the output stays directly comparable to the detector's
+    sigma units. ``width <= 1`` is a pass-through.
+    """
+    w = int(width)
+    if w <= 1 or series.size == 0:
+        return np.asarray(series, dtype=np.float32)
+    kernel = np.full(w, 1.0 / float(np.sqrt(w)), dtype=np.float32)
+    return np.convolve(
+        np.asarray(series, dtype=np.float32), kernel, mode="same",
+    ).astype(np.float32, copy=False)
+
+
+def _robust_z(series: np.ndarray) -> np.ndarray:
+    """Median/MAD-normalised series (sigma units), NaN-safe.
+
+    A degenerate MAD (>half the samples identical — sparse synthetic
+    cubes, or a mostly-zero row) falls back to the standard deviation
+    rather than to zeros: the *scale* stops being a robust sigma, but
+    the argmax still lands on the peak, which is what the caller needs.
+    Only a genuinely constant series returns zeros.
+    """
+    x = np.asarray(series, dtype=np.float32)
+    if x.size == 0:
+        return x
+    med = float(np.median(x))
+    sigma = float(np.median(np.abs(x - med))) * 1.4826
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        sigma = float(np.std(x))
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        return np.zeros_like(x)
+    return (x - med) / sigma
+
+
+def _metadata_t_idx(
+    chunk: Optional[_CubeChunk],
+    peak: Optional[_BurstPeak],
+) -> Optional[int]:
+    """The detector's own in-cube time index, or ``None`` if unknowable.
+
+    ``t = event_specnum - cube_specnum_start`` — a plain subtraction, no
+    division.
+
+    Units contract. BOTH operands count **search samples**, one per
+    detector sample, so their difference is already an index along the
+    cube's time axis:
+
+      * ``cube_specnum_start`` is the retained cube's
+        ``slot.specnum_start`` (``dump/c2_trigger_listener.py``
+        ``_build_manifest``), which advances by ``cube_cadence_samples``
+        per cube. ``services/search_compute.py:1338-1345`` states the
+        rule outright: "specnum_start is in SEARCH-SAMPLE units … must
+        NOT be divided by cube_sample_period_specnum" — the same trap,
+        fixed once before for the MJD clock.
+      * ``event_specnum`` is ``specnum_start + t_idx`` where ``t_idx``
+        is the detector's in-cube sample index
+        (``detector/decoder.py:216``).
+
+    ``sample_period_specnum`` is native-SNAP-specnums per search sample
+    (16 at the production op-point). It is emphatically **not** a
+    divisor here; it is read only so a mis-scaled anchor can be named in
+    the log. Dividing by it — as this function did from its
+    introduction (c60556b) until 2026-08-06 — plots every burst at
+    ``t_true // 16``, i.e. collapsed towards the cube start, always in
+    range so the guard below never fires.
+
+    Archive evidence for the units (Δ = event_specnum − anchor, all well
+    inside one cube cadence of 192 samples): 260804xpnp Δ=10,
+    260805pabq Δ=118, 260805tldd Δ=182. Under the divisor reading those
+    same events would have plotted at t=0, 7 and 11.
+
+    Only usable when the NPZ carries ``cube_specnum_start`` (dumps from
+    2026-08-04 on) — before that the only anchor was
+    ``event_specnum_start``, which the C2-trigger path overwrote with the
+    trigger specnum, making the delta identically 0.
+
+    Returns None on absent/sentinel anchors or an out-of-range result, so
+    the caller falls back to the width-matched argmax.
+    """
+    if chunk is None or peak is None:
+        return None
+    anchor = getattr(chunk, "cube_specnum_start", None)
+    if anchor is None or int(anchor) < 0:
+        return None
+    # Diagnostics only — see the units contract above. Never a divisor.
+    period = int(getattr(chunk, "sample_period_specnum", 0) or 0)
+    t = int(peak.event_specnum) - int(anchor)
+    t_det = int(chunk.cube.shape[0]) if chunk.cube.ndim == 4 else 0
+    if t_det and not (0 <= t < t_det):
+        if period > 1 and 0 <= t // period < t_det:
+            # The delta is ~period× too large: the writer handed us
+            # NATIVE SNAP specnums where the contract says search
+            # samples. That is a schema change, not a plotting problem —
+            # guessing a divisor is exactly how the original bug got in.
+            _LOG.error(
+                "plotter: anchor delta %d is outside the cube [0, %d) but "
+                "%d/%d = %d is inside — the anchor looks like NATIVE "
+                "specnums, i.e. the writer's units contract changed. "
+                "Refusing to guess; falling back to the matched argmax.",
+                t, t_det, t, period, t // period,
+            )
+            return None
+        _LOG.warning(
+            "plotter: metadata t_idx=%d outside the cube [0, %d) — "
+            "falling back to the matched argmax", t, t_det,
+        )
+        return None
+    return int(t)
+
+
+def _pixel_lightcurve(
+    chunk: Optional[_CubeChunk],
+    fdm: int,
+    l_pix: int,
+    m_pix: int,
+) -> Optional[np.ndarray]:
+    """``cube[:, fdm, l_pix, m_pix]`` — the series the detector scored.
+
+    A strided read of ``t_det`` fp16 values out of the mmap (one page
+    touch per sample, ~1 MB of I/O), so it is far cheaper than the
+    ``max(axis=(2, 3))`` reduction that already ran.
+    """
+    if chunk is None or chunk.cube.ndim != 4 or not chunk.cube.size:
+        return None
+    try:
+        t_det, n_fdm, n_l, n_m = chunk.cube.shape
+        f = int(np.clip(fdm, 0, n_fdm - 1))
+        li = int(np.clip(l_pix, 0, n_l - 1))
+        mi = int(np.clip(m_pix, 0, n_m - 1))
+        return np.asarray(chunk.cube[:, f, li, mi], dtype=np.float32)
+    except Exception as exc:  # noqa: BLE001 - never sink a plot job
+        _LOG.warning("plotter: pixel light curve read failed: %s", exc)
+        return None
 
 
 def _read_window_csv_rows(archive_root: Path, event_name: str) -> List[dict]:
@@ -752,6 +1047,7 @@ def _peak_from_members(
         width_samples=int(m.width_samples),
         kernel_id=str(m.kernel_id),
         source="members",
+        event_specnum=int(getattr(m, "event_specnum", 0) or 0),
     )
 
 
@@ -780,6 +1076,7 @@ def _peak_from_csv_rows(rows: Sequence[dict]) -> Optional[_BurstPeak]:
             width_samples=int(best["width_samples"]),
             kernel_id=str(best["kernel_id"]),
             source="csv",
+            event_specnum=int(float(best.get("event_specnum", 0) or 0)),
         )
     except (KeyError, TypeError, ValueError) as exc:
         _LOG.warning("plotter: malformed C1-window peak row: %s", exc)
@@ -881,12 +1178,29 @@ def _burst_coords(
     """Resolve in-cube panel coordinates.
 
     cube axes are ``(t_det, n_fdm, l, m)``. With metadata we take the
-    DM row + (l, m) from the peak and the *time* from the argmax of the
-    DM light curve (``waterfall[:, fdm]``), because the cube's stored
-    ``event_specnum_start`` is the dump key, not the cube's first-sample
-    specnum. Without metadata we fall back to the waterfall global
-    argmax (flagged ``from_metadata=False``).
+    DM row + (l, m) from the peak, and the *time* from the cube's
+    sample-0 anchor when it carries one; failing that, from the argmax
+    of the DM light curve (the stored ``event_specnum_start`` is the
+    dump key, not the cube's first-sample specnum, so it cannot serve
+    as an anchor). Without metadata at all we fall back to the
+    waterfall global argmax (flagged ``from_metadata=False``).
+
+    The DM light curve is the **detected pixel's** series when the cube
+    is readable, match-filtered with the detector's own
+    ``width_samples`` boxcar — see the module docstring for why both of
+    those matter. We also re-measure the significance at the located
+    peak, with and without the boxcar, so callers can print the gap
+    against the detector's reported SNR.
     """
+    # 2026-08-04: if the cube carries the TRUE sample-0 anchor
+    # (`cube_specnum_start`), the detector's own time index is directly
+    # computable — `event_specnum - anchor`, both in search samples —
+    # and we no longer have to relocate the burst at all. Older dumps
+    # have only `event_specnum_start`, which the C2-trigger path
+    # overwrote with the trigger specnum, so `_metadata_t_idx` returns
+    # None for them and we fall back to the width-matched argmax below.
+    t_meta = _metadata_t_idx(chunk, peak)
+
     if waterfall is None or waterfall.ndim != 2 or not waterfall.size:
         if peak is None:
             return None
@@ -901,13 +1215,41 @@ def _burst_coords(
     t_det, n_fdm = int(waterfall.shape[0]), int(waterfall.shape[1])
     if peak is not None:
         fdm = int(np.clip(peak.fine_dm_idx, 0, n_fdm - 1))
-        t_idx = int(np.argmax(waterfall[:, fdm]))
         l_pix, m_pix = int(peak.l_pix), int(peak.m_pix)
+        # Prefer the detected pixel; fall back to the image-max row when
+        # the strided cube read fails.
+        series = _pixel_lightcurve(chunk, fdm, l_pix, m_pix)
+        if series is None:
+            series = np.asarray(waterfall[:, fdm], dtype=np.float32)
+        z_raw = _robust_z(series)
+        box = _boxcar_width(peak)
+        # Note the order: smooth FIRST, then take median/MAD of the
+        # smoothed series. Normalising first and convolving after would
+        # score the burst against sigma_raw/sqrt(w), i.e. against a
+        # white-noise assumption; the detector normalises per boxcar
+        # width (Layer-2 publishes s_k_unit_d1_b1..b64), so measuring
+        # sigma on the smoothed series is the like-for-like comparison.
+        # When the two disagree the residual is correlated on the boxcar
+        # scale — logged as the whiteness ratio in render_event_plots.
+        z_smooth = _robust_z(_boxcar(series, box)) if box > 1 else z_raw
+        t_raw = int(np.argmax(z_raw))
+        if t_meta is not None:
+            # The cube carries a trustworthy sample-0 anchor, so this IS
+            # the detector's own time index -- use it directly rather than
+            # relocating the burst. This is what the panels were always
+            # supposed to show.
+            t_idx = int(t_meta)
+        else:
+            t_idx = int(np.argmax(z_smooth))
         return _BurstCoords(
             t_idx=t_idx, fdm_idx=fdm, l_pix=l_pix, m_pix=m_pix,
             dm_pc_cc=peak.dm_pc_cc, snr=peak.snr,
             width_samples=peak.width_samples,
             n_fdm=n_fdm, t_det=t_det, from_metadata=True,
+            snr_measured=float(z_smooth[t_idx]),
+            snr_measured_raw=float(z_raw[t_raw]),
+            t_idx_raw=t_raw, boxcar=box,
+            t_from_anchor=(t_meta is not None),
         )
     # Fallback: global argmax of the waterfall, (l, m) from that plane.
     flat = int(np.argmax(waterfall))
@@ -986,6 +1328,65 @@ _CBAR_RECT = (0.845, 0.19, 0.022, 0.725)
 _CAPTION_Y = 0.03   # baseline of the marker-legend/caption line
 _CAPTION_X = 0.46   # horizontal centre = centre of the panel box
 
+# v3.6: the dm_time/image_peak title is drawn as two visual tiers rather
+# than one two-line ax.set_title (see _fit_title_line and the notes at
+# each call site). Line 1 is the short event identity at
+# _TITLE_FONTSIZE; line 2 is the burst parameters plus the growing
+# _snr_note diagnostic, drawn separately so its font size can be fitted
+# to the axes width. _SUBTITLE_Y is the line-2 baseline in axes
+# fractions (just above the axes top edge); _TITLE_PAD is the
+# ax.set_title pad, in points, that lifts line 1 clear of line 2.
+_SUBTITLE_FONTSIZE = _LEGEND_FONTSIZE   # line-2 starting (maximum) size
+_SUBTITLE_FONTSIZE_MIN = 10             # never shrink below this
+_SUBTITLE_Y = 1.018                     # axes fraction, line-2 baseline
+_TITLE_PAD = 26.0                       # points, axes top → line-1 bottom
+
+
+def _fit_title_line(
+    fig,
+    ax,
+    text: str,
+    y: float = _SUBTITLE_Y,
+    max_fontsize: int = _SUBTITLE_FONTSIZE,
+    min_fontsize: int = _SUBTITLE_FONTSIZE_MIN,
+):
+    """Draw ``text`` centred above ``ax``, shrunk until it fits its width.
+
+    The dm_time/image_peak axes box is pinned (``_PANEL_RECT``) so the
+    two panels align pixel-for-pixel, and the diagnostic second title
+    line (burst parameters + ``_snr_note``) has grown past what fits at
+    ``_TITLE_FONTSIZE``. Rather than tune a font size to today's longest
+    string, measure the rendered text against the axes box with the
+    figure's own renderer and step down 1pt at a time (floor
+    ``min_fontsize``) until it fits. Future additions to ``_snr_note``
+    therefore shrink the line instead of silently clipping it.
+
+    ``min_fontsize`` is a legibility floor, so a pathologically long
+    string can still exceed the axes width — but the fitted target is
+    the axes box (720 px at the panel geometry), while the hard clip
+    boundary is the figure edge (1100 px), so hitting the floor looks
+    wide rather than truncated.
+
+    Returns the ``Text`` artist (its ``get_fontsize()`` is the size the
+    line landed at).
+    """
+    artist = ax.text(
+        0.5, y, text, transform=ax.transAxes, ha="center", va="baseline",
+        fontsize=max_fontsize, color="#2e3440",
+    )
+    try:
+        renderer = fig.canvas.get_renderer()
+    except AttributeError:      # backend without a cached renderer
+        return artist
+    avail = ax.get_window_extent(renderer).width
+    size = max_fontsize
+    while size > min_fontsize:
+        if artist.get_window_extent(renderer).width <= avail:
+            break
+        size -= 1
+        artist.set_fontsize(size)
+    return artist
+
 
 def _placeholder(path: Path, title: str, msg: str) -> Path:
     import matplotlib.pyplot as plt
@@ -1003,10 +1404,57 @@ def _placeholder(path: Path, title: str, msg: str) -> Path:
     return path
 
 
+def _signed_sigma(x: float) -> str:
+    """``+13.6σ`` / ``−12.6σ`` — a proper minus sign, not a hyphen."""
+    sign = "+" if x >= 0.0 else "−"
+    return f"{sign}{abs(x):.1f}σ"
+
+
 def _provenance(coords: Optional[_BurstCoords]) -> str:
+    """" · re-searched in cube" / " · no detector info — showing
+    brightest pixel" — flags the two fallback placements.
+
+    The healthy/default path — the cube carries a trustworthy sample-0
+    anchor, so the panel shows the detector's own time index directly —
+    prints nothing: that is what every panel is supposed to show, and a
+    tag on it would just be noise. The two fallbacks each get a plain-
+    English flag: metadata is present but the cube has no anchor, so
+    the burst time was relocated by a width-matched search of the
+    dumped cube (not the detector's own index); or there is no
+    detection metadata at all, so the panel falls back to the cube's
+    single brightest pixel, which can just as easily be bright steady
+    continuum or RFI as the burst. ("re-searched in cube" is the short
+    form of "burst time re-searched in the cube" — the panel titles are
+    two fixed-width lines inside a pinned axes box (see ``_PANEL_RECT``)
+    and the long form doesn't fit a worst-case (4-digit-DM, wide-boxcar)
+    title even at the font-size floor.)
+    """
     if coords is None:
         return ""
-    return "" if coords.from_metadata else "  [no metadata: cube argmax]"
+    if not coords.from_metadata:
+        return " · no detector info — showing brightest pixel"
+    if coords.t_from_anchor:
+        return ""
+    return " · re-searched in cube"
+
+
+def _snr_note(coords: Optional[_BurstCoords]) -> str:
+    """" · 6.1σ (archived cube) · Δ = +13.6σ" — the cube
+    re-measurement, printed next to the detector's SNR on every panel
+    so the two are never silently conflated. ``Δ`` is the detector's
+    SNR minus this re-measurement (positive means the detector read
+    higher). The boxcar width and the unsmoothed re-measurement behind
+    this number are still written to the log (see the "cube
+    re-measurement" INFO/WARNING lines in ``render_event_plots``) —
+    only the title itself has been trimmed to the plain essentials.
+    Omitted entirely when there is no cube to re-measure against.
+    """
+    if coords is None or not np.isfinite(coords.snr_measured):
+        return ""
+    return (
+        f" · {coords.snr_measured:.1f}σ (archived cube) · "
+        f"Δ = {_signed_sigma(coords.snr_delta)}"
+    )
 
 
 def _robust_row_normalise(img: np.ndarray) -> np.ndarray:
@@ -1045,6 +1493,13 @@ def _render_dm_time(
     Rows are robustly re-normalised (see :func:`_robust_row_normalise`)
     so all halves share one σ colour scale. Dashed lines mark half
     boundaries; the crosshair marks the detected (t_peak, DM_peak).
+
+    2026-08-02: every row is first match-filtered along time with the
+    detector's ``width_samples`` boxcar, so the image shows the cube the
+    detector actually thresholded rather than the unsmoothed one. A
+    ``width_samples=16`` burst is ~4x more visible here than in the raw
+    cube. The boxcar is annotated in the title; ``DSART_PLOTTER_SMOOTH=0``
+    turns it off.
     """
     path = plots_dir / f"dm_time_{event_name}.png"
     if not waterfalls:
@@ -1059,6 +1514,15 @@ def _render_dm_time(
         np.asarray(wf[:t_common, :].T, dtype=np.float32)
         for _, wf in waterfalls
     ]
+    # Match-filter along time BEFORE the per-row σ normalisation, so the
+    # colour scale is σ of the *smoothed* series — directly comparable to
+    # the detector's own units and to `coords.snr_measured`.
+    box = int(coords.boxcar) if coords is not None else 1
+    if box > 1:
+        blocks = [
+            np.stack([_boxcar(row, box) for row in blk], axis=0)
+            for blk in blocks
+        ]
     stacked = _robust_row_normalise(np.concatenate(blocks, axis=0))
 
     # Real DM per stacked row, pulled from the production DM plan and keyed
@@ -1125,7 +1589,12 @@ def _render_dm_time(
     ax.tick_params(axis="x", labelsize=_TICK_FONTSIZE)
     cax = fig.add_axes(_CBAR_RECT)
     cb = fig.colorbar(
-        im, cax=cax, label="image-max amplitude (robust σ per DM row)",
+        im, cax=cax,
+        label=(
+            "image-max amplitude (robust σ per DM row"
+            + (f", boxcar w={box}" if box > 1 else "")
+            + ")"
+        ),
     )
     cb.ax.tick_params(labelsize=_TICK_FONTSIZE)
     cb.set_label(cb.ax.get_ylabel(), fontsize=_AXIS_LABEL_FONTSIZE)
@@ -1190,6 +1659,7 @@ def _render_dm_time(
         )
 
     title = f"DM × time (waterfall) — {event_name}"
+    subtitle = ""
     if coords is not None:
         if coords.t_idx is not None:
             ax.axvline(
@@ -1205,20 +1675,27 @@ def _render_dm_time(
                     color=_RETICLE, ms=16, mew=2.0,
                     label="detector-reported burst",
                 )
-        title += (
-            f"\nburst DM={coords.dm_pc_cc:.1f} pc cm⁻³, "
-            f"SNR={coords.snr:.1f}" + _provenance(coords)
+        subtitle = (
+            f"DM {coords.dm_pc_cc:.1f} pc cm⁻³ · "
+            f"SNR {coords.snr:.1f} (detector)" + _snr_note(coords)
+            + _provenance(coords)
         )
-    # v3.5: explicit two-line title (event identity on line 1, burst
-    # DM/SNR on line 2) instead of one long line + wrap=True. A single
-    # long line at any legible font width overflows the axes box (the
-    # "shared figure geometry" note above _PANEL_RECT pixel-aligns
-    # dm_time/image_peak and can't grow per-title), and wrap=True's
-    # auto-reflow point didn't reliably land at a sensible semantic
-    # break. An explicit "\n" plus the dialed-down 16pt _TITLE_FONTSIZE
-    # keeps both lines within the axes width. The reserved margin above
-    # the axes (see _PANEL_RECT) already has room for two lines.
-    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
+    # v3.6: two visual tiers, not one two-line set_title. v3.5 put the
+    # event identity on line 1 and the burst parameters on line 2 of a
+    # single 16pt title; since then line 2 has grown the _snr_note
+    # diagnostic (cube re-measurement, agreement Δ, a fallback-placement
+    # flag) and at 16pt it overflowed the axes box at both figure edges.
+    # The box cannot grow: the "shared figure geometry" note above _PANEL_RECT
+    # pixel-aligns dm_time/image_peak, so the text has to yield. Line 1
+    # stays an ax.set_title at _TITLE_FONTSIZE (lifted by _TITLE_PAD to
+    # clear line 2); line 2 is drawn by _fit_title_line, which measures
+    # the rendered string against the axes width and steps the font size
+    # down until it fits — fitted by measurement, not tuned to today's
+    # longest string, so a future _snr_note addition shrinks rather than
+    # clips. The margin above the axes still holds both tiers.
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE, pad=_TITLE_PAD)
+    if subtitle:
+        _fit_title_line(fig, ax, subtitle)
     # Legend lives below the axes so it never overlaps the waterfall,
     # title, axis labels, or colorbar. No frame: plain text on the white
     # figure margin. The in-axes × marker is pure white (legible on the
@@ -1272,7 +1749,21 @@ def _render_image_peak(
     # cube[t, fdm] → (l, m) image plane (~128 KB). axis 0 = l, axis 1 = m.
     t_idx = int(np.clip(coords.t_idx, 0, chunk.cube.shape[0] - 1))
     fdm = int(np.clip(coords.fdm_idx, 0, chunk.cube.shape[1] - 1))
-    img = np.asarray(chunk.cube[t_idx, fdm], dtype=np.float32)
+    # 2026-08-02: for a wide burst, average the plane over the detector's
+    # own boxcar centred on the matched peak — same match filter the
+    # detector applied, so the panel shows the image it actually
+    # triggered on instead of one arbitrary 1.05 ms slice of it.
+    box = int(coords.boxcar)
+    if box > 1:
+        t_det_n = int(chunk.cube.shape[0])
+        t0 = max(0, t_idx - box // 2)
+        t1 = min(t_det_n, t0 + box)
+        t0 = max(0, t1 - box)
+        img = np.asarray(
+            chunk.cube[t0:t1, fdm], dtype=np.float32,
+        ).mean(axis=0)
+    else:
+        img = np.asarray(chunk.cube[t_idx, fdm], dtype=np.float32)
     fig = plt.figure(figsize=(10.0, 9.0))
     ax = fig.add_axes(_PANEL_RECT)
     im = ax.imshow(img, origin="lower", cmap="magma")
@@ -1290,14 +1781,19 @@ def _render_image_peak(
     ))
     ax.set_xlabel("m (pix)", fontsize=_AXIS_LABEL_FONTSIZE)
     ax.set_ylabel("l (pix)", fontsize=_AXIS_LABEL_FONTSIZE)
-    title = (
-        f"image at (DM={coords.dm_pc_cc:.1f}, t={t_idx}) — {event_name}\n"
-        f"burst (l,m)=({coords.l_pix},{coords.m_pix})" + _provenance(coords)
+    tlabel = f"t={t_idx}" + (f", mean of w={box}" if box > 1 else "")
+    title = f"image at (DM={coords.dm_pc_cc:.1f}, {tlabel}) — {event_name}"
+    subtitle = (
+        f"detected pixel (l,m)=({coords.l_pix},{coords.m_pix})"
+        + _snr_note(coords) + _provenance(coords)
     )
-    # v3.5: explicit two-line title — see the matching note in
-    # _render_dm_time. Event identity on line 1, burst (l, m) on line 2;
-    # keeps each line within the axes width at _TITLE_FONTSIZE (16pt).
-    ax.set_title(title, fontsize=_TITLE_FONTSIZE)
+    # v3.6: two visual tiers — see the matching note in _render_dm_time.
+    # Event identity on line 1 at _TITLE_FONTSIZE; burst (l, m) plus the
+    # _snr_note diagnostic on line 2, fitted to the pinned axes width by
+    # _fit_title_line. Both panels share the helper so the two tiers
+    # read the same size side by side whenever the strings are.
+    ax.set_title(title, fontsize=_TITLE_FONTSIZE, pad=_TITLE_PAD)
+    _fit_title_line(fig, ax, subtitle)
     # Geometry is shared with _render_dm_time via _PANEL_RECT /
     # _CBAR_RECT / _CAPTION_Y, so both figures align by construction
     # (same 1100x990 PNG, same axes box, caption on the same line as
@@ -1318,6 +1814,7 @@ def _render_lightcurve(
     event_name: str,
     waterfall: Optional[np.ndarray],
     coords: Optional[_BurstCoords],
+    burst: Optional[_CubeChunk] = None,
 ) -> Path:
     path = plots_dir / f"lightcurve_{event_name}.png"
     if waterfall is None or waterfall.size == 0:
@@ -1327,28 +1824,50 @@ def _render_lightcurve(
             path, f"lightcurve — {event_name}", "no detection metadata",
         )
     import matplotlib.pyplot as plt
-    # Light curve = image-max time series at the detected DM row.
     fdm = int(np.clip(coords.fdm_idx, 0, waterfall.shape[1] - 1))
-    lc = np.asarray(waterfall[:, fdm], dtype=np.float32)
+    # 2026-08-02: primary trace is the DETECTED PIXEL's series — that is
+    # what the detector scored. The image-max row is kept as a faint
+    # context trace (it is an extreme-value statistic over 65 536 pixels,
+    # so its σ scale is not the point-source one).
+    pix = _pixel_lightcurve(burst, fdm, coords.l_pix, coords.m_pix)
+    imax = _robust_z(np.asarray(waterfall[:, fdm], dtype=np.float32))
     fig, ax = plt.subplots(figsize=(8.0, 3.6))
-    ax.plot(lc, color="#0984e3", lw=1.5)
+    ax.plot(imax, color="#b2bec3", lw=1.0, alpha=0.9,
+            label="image max (context)")
+    if pix is not None:
+        z_raw = _robust_z(pix)
+        ax.plot(z_raw, color="#0984e3", lw=1.2,
+                label=f"pixel ({coords.l_pix},{coords.m_pix}) raw")
+        if coords.boxcar > 1:
+            ax.plot(
+                _robust_z(_boxcar(pix, coords.boxcar)),
+                color="#d63031", lw=1.8,
+                label=f"pixel, boxcar w={coords.boxcar} (detector-matched)",
+            )
     ax.tick_params(axis="both", labelsize=_TICK_FONTSIZE)
     if coords.t_idx is not None:
         ax.axvline(
             coords.t_idx, color=_RETICLE, lw=1.4, ls="--",
-            label=f"burst t={coords.t_idx}",
+            label=f"matched peak t={coords.t_idx}",
         )
-        ax.legend(loc="upper right", fontsize=_LEGEND_FONTSIZE)
+    if (coords.t_idx_raw is not None
+            and coords.t_idx_raw != coords.t_idx):
+        ax.axvline(
+            coords.t_idx_raw, color="#636e72", lw=1.0, ls=":",
+            label=f"unsmoothed argmax t={coords.t_idx_raw}",
+        )
+    ax.legend(loc="upper right", fontsize=_LEGEND_FONTSIZE)
     ax.set_xlabel("time sample (within cube)",
                  fontsize=_AXIS_LABEL_FONTSIZE_SMALL)
-    ax.set_ylabel("peak amplitude (image max)",
+    ax.set_ylabel("σ above the row's own median",
                  fontsize=_AXIS_LABEL_FONTSIZE_SMALL)
     # v3.7: single-line title — the old second line (DM+SNR) duplicated
     # the dm_time title / card header and its extra line height pushed
     # this panel's axes box out of alignment with its row-mate
     # (kernel_snrs has a one-line title). Provenance marker stays (it is
     # a data-quality warning, not duplicated info).
-    title = f"lightcurve — {event_name}" + _provenance(coords)
+    title = (f"lightcurve — {event_name}" + _snr_note(coords)
+             + _provenance(coords))
     ax.set_title(title, fontsize=_TITLE_FONTSIZE)
     # v3.3: dropped fig.tight_layout() — with the bigger v3.2 ylabel font
     # it was clipping the rotated ylabel's left edge (reproduced in

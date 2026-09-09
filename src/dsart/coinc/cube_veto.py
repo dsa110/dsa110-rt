@@ -64,7 +64,57 @@ class CubeVetoThresholds:
     r4_time_prom_sigma: float = 4.0
     r4_image_prom_sigma: float = 4.0
     r5_dm_shift_trials: int = 4        # edge rail AND > this many trials off
-    r10_tz_trig_sigma: float = 10.0    # trigger feature "weak" below this
+    # R10: the cube must actually show the trigger. Calibrated 2026-08-07
+    # against 47 injections (the only ground truth for a burst of known
+    # strength) and 72 sky KEEPs:
+    #
+    #     injections  min 10.3   median 30.4
+    #     sky KEEPs   max 14.6   median  4.5
+    #     REJECTs     max  9.6   median  3.9
+    #
+    # tz_trig tracks the detector SNR closely (r=0.978, ratio 1.15-1.88),
+    # which is what sets the floor: at the pessimistic 1.15 ratio a
+    # threshold of 10 corresponds to a detector SNR of 8.7 -- ABOVE the
+    # ~8 sigma trigger floor -- so 10 could cut genuine faint bursts. 8.0
+    # keeps 0/47 injections out while still removing 88% of sky KEEPs,
+    # and even a burst at the 8 sigma floor with the worst-case ratio
+    # lands at tz=9.2 and survives.
+    #
+    # Caveat for whoever retunes this: the faintest injection is detector
+    # SNR 11.4, so injections do NOT probe the 8-11 sigma band. The
+    # threshold is set from the tz/SNR ratio, not measured there.
+    r10_tz_trig_sigma: float = 8.0     # cube must confirm at >= this
+
+    # R11 non-Gaussian-noise veto. Thresholds sit an order of magnitude
+    # above the clean-half population (0.00 +/- 0.03 and ~5e-4) and well
+    # below the contaminated one (0.13-0.29, 0.009-0.024); see
+    # `cube_noise_character`.
+    #
+    # DEFAULT OFF, deliberately. The metrics are always computed and
+    # recorded, but R11 does not reject until it has been calibrated on
+    # a real sample. On the only broad-candidate-in-a-streaky-half case
+    # available when this was written (260802ohco: width 16, trigger
+    # half s2g1 at ac1=0.283 / frac_z5=0.0122) R11 fired -- and that
+    # event is the *strongest* candidate in the sample: SNR 18.0,
+    # tz_trig 11.56, t_shift 0, dm_shift 0, 4 C1 rows. Calibrating a
+    # destructive rule on n=1, where the one example looks real, in a
+    # pipeline that currently deletes what it rejects, is not a trade
+    # worth making. Turn it on once `streak_ac1_trig` / `frac_z5_trig`
+    # have been logged across enough events to set the width and
+    # strength gates from data.
+    r11_enabled: bool = False
+    r11_streak_ac1: float = 0.10
+    r11_frac_z5: float = 5.0e-3
+    #: R11 only vetoes candidates at least this wide. A narrow candidate
+    #: in a streaky half is still plausible -- interference correlated on
+    #: ~10 ms scales does not manufacture 1-sample spikes -- whereas a
+    #: broad one is the shape the streaking itself makes.
+    r11_min_width_samples: int = 8
+    #: ...and never vetoes one whose own trigger feature is this strong,
+    #: nor one that is coherent in time and DM. A streaky half makes a
+    #: candidate less trustworthy; it does not override direct evidence
+    #: that the cube confirms the trigger.
+    r11_exempt_tz_trig: float = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +138,8 @@ class CubeMetrics:
     # trigger (from the highest-SNR C1 row)
     snr_c1: float = 0.0
     dm_c1: float = 0.0
+    #: peak C1 row's matched-filter width, in cube samples (R11 gate).
+    width_samples: int = 0
     fdm_trig: int = 0
     l_pix_trig: int = 0
     m_pix_trig: int = 0
@@ -110,6 +162,17 @@ class CubeMetrics:
     g_apex_cube_same: int = 1          # 1 if global apex is in the trigger cube
     g_apex_val: float = 0.0
     n_cubes: int = 0
+
+    # cube-quality (2026-08-04). streak_/frac_ are measured on the
+    # TRIGGER half; *_worst over all dumped halves. dead_tail_trig is
+    # how many trailing time samples of the trigger half carried no
+    # data (the unfilled inter-cube overlap).
+    streak_ac1_trig: float = 0.0
+    frac_z5_trig: float = 0.0
+    streak_ac1_worst: float = 0.0
+    frac_z5_worst: float = 0.0
+    dead_tail_trig: int = 0
+    dead_tail_worst: int = 0
 
 
 @dataclass(frozen=True)
@@ -134,12 +197,19 @@ def decide(
     *,
     is_injection: bool,
     thresholds: Optional[CubeVetoThresholds] = None,
+    width_samples: Optional[int] = None,
 ) -> VetoDecision:
     """Decide KEEP vs REJECT (pure).
 
     REJECT requires (a) metrics computed successfully, (b) the event is
-    NOT an injection, and (c) at least one tier-1 (R1–R5) or R10 rule
-    fires. Everything else KEEPs — the conservative default.
+    NOT an injection, and (c) at least one tier-1 (R1–R5), R10 or R11
+    rule fires. Everything else KEEPs — the conservative default.
+
+    Args:
+        width_samples: the peak C1 row's matched-filter width, in cube
+            samples. Only R11 uses it; when ``None`` R11 cannot fire, so
+            callers that don't have the width keep the pre-2026-08-04
+            rule set.
     """
     th = thresholds or CubeVetoThresholds()
 
@@ -155,6 +225,7 @@ def decide(
         )
 
     fired: List[str] = []
+    notes: List[str] = []
 
     # R1 image incoherence
     if metrics.img_off_apex > th.r1_img_off_px:
@@ -177,17 +248,81 @@ def decide(
         and metrics.dm_shift_trials > th.r5_dm_shift_trials
     ):
         fired.append("R5_dm_edge_rail")
-    # R10 cube doesn't confirm the trigger
-    if (
-        metrics.g_apex_cube_same == 0
-        and metrics.tz_trig < th.r10_tz_trig_sigma
-    ):
+    # R10 the cube doesn't confirm the trigger.
+    #
+    # One condition, deliberately: does the cube show >= r10_tz_trig_sigma
+    # at the DM and time the detector triggered on? If not, the detection
+    # is not corroborated by the data it was made from.
+    #
+    # 2026-08-04 added two extra terms and 2026-08-07 removed both, for
+    # separate reasons. Keeping the history because each is a trap:
+    #
+    # ``g_apex_cube_same`` was the original gate: 1 only when the single
+    # brightest row-normalised cell across ALL dumped halves (~560k cells)
+    # lands in the trigger's half. That argmax tracks "which half holds
+    # the worst RFI", not "is the candidate real" -- every event measured
+    # carries one half with an 11-13 sigma interference spike while the
+    # others top out at 5-8. 260803qmub and 260804ncon were KEPT for
+    # triggering at DM 156 inside their own contaminated half while
+    # 260803doen was REJECTED at DM 339 in a clean one, same width, same
+    # perfect coherence. It is not evidence and it is gone.
+    #
+    # The coherence exemption added in its place (skip R10 when
+    # t_shift and dm_shift are small) was WORSE, because it was vacuous:
+    # R2 and R3 reject anything shifted BEFORE R10 is reached, so every
+    # surviving candidate has t_shift == 0 and dm_shift_trials == 0 by
+    # construction and the exemption was always true. Measured on the
+    # night of 2026-08-06: 15 of 31 KEEPs met R10's conditions and the
+    # exemption spared 100% of them, at tz_trig as low as 2.7. R10 was
+    # dead code for three days.
+    #
+    # The lesson generalises: an exemption predicated on a quantity an
+    # upstream rule has already constrained is not an exemption, it is a
+    # deletion. test_r10_fires_on_a_coherent_but_unconfirmed_trigger
+    # guards this specific case.
+    if metrics.tz_trig < th.r10_tz_trig_sigma:
         fired.append("R10_cube_unconfirmed")
 
+    # R11 broad candidate in a demonstrably non-Gaussian half.
+    # Interference correlated on ~10 ms scales makes broad features, not
+    # 1-sample ones, so this is gated on width: it targets exactly the
+    # "broad + streaky cube" population and leaves narrow candidates in
+    # a noisy half alone.
+    eff_width = (int(width_samples) if width_samples is not None
+                 else int(metrics.width_samples))
+    r11_would_fire = (
+        eff_width >= th.r11_min_width_samples
+        and (
+            metrics.streak_ac1_trig > th.r11_streak_ac1
+            or metrics.frac_z5_trig > th.r11_frac_z5
+        )
+        # ...unless the candidate stands on its own: a strong trigger
+        # feature. The "or an apex on the trigger's time and DM" half of
+        # this exemption carried the same vacuous ``not r10_coherent``
+        # term as R10 and is removed for the same reason (2026-08-07) --
+        # R2/R3 force those to zero upstream, so it always held and R11
+        # could never fire. R11 is disabled pending calibration, so the
+        # only visible effect is that its "would fire" note starts
+        # appearing, which is the whole point of collecting it.
+        and metrics.tz_trig < th.r11_exempt_tz_trig
+    )
+    if r11_would_fire and th.r11_enabled:
+        fired.append("R11_nongaussian_cube")
+    elif r11_would_fire:
+        notes.append(
+            "R11 would fire (width=%d, streak_ac1=%.3f, frac_z5=%.4f) but "
+            "is disabled pending calibration" % (
+                eff_width, metrics.streak_ac1_trig, metrics.frac_z5_trig)
+        )
+
     keep = len(fired) == 0
+    base_note = "" if keep else "tier-1/R10/R11 high-confidence false positive"
+    if notes:
+        base_note = "; ".join([base_note] + notes) if base_note else \
+            "; ".join(notes)
     return VetoDecision(
         keep=keep, rules_fired=tuple(fired), is_injection=False,
-        notes="" if keep else "tier-1/R10 high-confidence false positive",
+        notes=base_note,
     )
 
 
@@ -207,6 +342,33 @@ def _robust_z(x: np.ndarray) -> float:
     return (float(np.max(x)) - med) / sig
 
 
+def live_span(wf: np.ndarray) -> int:
+    """Number of leading time samples that carry data.
+
+    A dumped cube's trailing ``t_det - cube_cadence_samples`` samples (64
+    at the production op-point: 256 vs 192) are the designed inter-cube
+    overlap. When the RX ring did not yet hold those rows at cube-build
+    time the per-chgroup streams stay zero, they image to zero, and the
+    cube arrives with a hard zero block at the end -- observed at t=192
+    in 260803wsxt's lowest-DM half and t~205 in its highest.
+
+    Every statistic below is computed on ``wf[:live_span(wf)]`` because
+    including the zero block drags the per-row median/MAD down, inflates
+    every z-score in the cube, and makes ``g_apex_cube_same`` a lottery.
+
+    Returns ``wf.shape[0]`` for a fully-populated cube, so healthy cubes
+    are unaffected.
+    """
+    wf = np.asarray(wf)
+    if wf.ndim != 2 or wf.size == 0:
+        return 0
+    alive = np.any(wf > 0, axis=1)
+    n = wf.shape[0]
+    while n > 0 and not alive[n - 1]:
+        n -= 1
+    return int(n)
+
+
 def _robust_rownorm(wf: np.ndarray) -> np.ndarray:
     """Per-DM-row robust z-score normalisation (matches the plotter)."""
     wf = np.asarray(wf, dtype=np.float64)
@@ -217,6 +379,45 @@ def _robust_rownorm(wf: np.ndarray) -> np.ndarray:
     fill = float(np.median(pos)) if pos.size else 1.0
     sig = np.where(sig == 0, fill, sig)
     return (wf - med) / sig
+
+
+def cube_noise_character(wf: np.ndarray) -> Tuple[float, float]:
+    """``(streak_ac1, frac_z5)`` for one half's DM-time waterfall.
+
+    Two cheap measures of "is this half's noise Gaussian", both computed
+    on the live span only:
+
+    * ``streak_ac1`` -- lag-1 autocorrelation along time, averaged over
+      DM rows. Thermal noise gives ~0; terrestrial interference is
+      correlated between adjacent samples and drives it up. This is the
+      horizontal banding visible in 260803szgu's waterfall.
+    * ``frac_z5`` -- fraction of cells beyond 5 sigma after per-row
+      median/MAD normalisation. A Gaussian image-max field sits around
+      5e-4; a contaminated half runs 10-50x that.
+
+    Measured 2026-08-04 over the 4 events whose cubes survived, 32
+    halves total:
+
+        clean halves       streak_ac1 0.00 +/- 0.03   frac_z5 ~5e-4
+        contaminated       streak_ac1 0.13 - 0.29     frac_z5 0.009 - 0.024
+
+    The separation is wide enough that the thresholds below are not
+    finely tuned. Contamination concentrated in the lowest-DM half
+    (s1g0) as expected -- terrestrial signals sit near DM 0.
+    """
+    wf = np.asarray(wf, dtype=np.float64)
+    n = live_span(wf)
+    if n < 8:
+        return 0.0, 0.0
+    live = wf[:n]
+    a = live - live.mean(axis=0, keepdims=True)
+    den = np.sum(a * a, axis=0)
+    num = np.sum(a[1:] * a[:-1], axis=0)
+    good = den > 0
+    ac1 = float(np.mean(num[good] / den[good])) if np.any(good) else 0.0
+    z = _robust_rownorm(live)
+    frac = float(np.mean(np.abs(z) > 5.0))
+    return ac1, frac
 
 
 def _mmap_cube(npz_path: str) -> np.ndarray:
@@ -263,6 +464,7 @@ def compute_metrics_from_grids(
     m_pix_trig: int,
     snr_c1: float = 0.0,
     dm_c1: float = 0.0,
+    width_samples: int = 0,
     apex_image_fn: Optional[Callable[[int, int], np.ndarray]] = None,
 ) -> CubeMetrics:
     """Build :class:`CubeMetrics` from per-cube ``peak_grid`` arrays.
@@ -315,14 +517,37 @@ def compute_metrics_from_grids(
             imgz_apex = 0.0
             img_off_apex = 0.0
 
-    # global (all-cube) apex on robust row-normalised stacks (plotter parity)
+    # global (all-cube) apex on robust row-normalised stacks (plotter
+    # parity). 2026-08-04: restricted to each half's live span -- a
+    # zero-filled overlap tail otherwise drags that half's per-row
+    # median/MAD and hands it a spuriously high z, which is one of the
+    # ways g_apex_cube_same ends up pointing at the wrong half.
     best_val = -np.inf
     best_cube: Optional[Tuple[int, int]] = None
+    streak_worst = 0.0
+    fracz_worst = 0.0
+    dead_worst = 0
+    streak_trig = 0.0
+    fracz_trig = 0.0
+    dead_trig = 0
     for key, g in grids.items():
         g = np.asarray(g, dtype=np.float64)
         if g.ndim != 2 or g.size == 0:
             continue
-        z = _robust_rownorm(g)
+        n_live = live_span(g)
+        dead = int(g.shape[0] - n_live)
+        ac1, fz = cube_noise_character(g)
+        if dead > dead_worst:
+            dead_worst = dead
+        if ac1 > streak_worst:
+            streak_worst = ac1
+        if fz > fracz_worst:
+            fracz_worst = fz
+        if key == (sid_trig, g_trig):
+            streak_trig, fracz_trig, dead_trig = ac1, fz, dead
+        if n_live <= 0:
+            continue
+        z = _robust_rownorm(g[:n_live])
         v = float(np.nanmax(z))
         if v > best_val:
             best_val = v
@@ -333,6 +558,7 @@ def compute_metrics_from_grids(
         ok=True,
         snr_c1=float(snr_c1),
         dm_c1=float(dm_c1),
+        width_samples=int(width_samples),
         fdm_trig=fdm_t,
         l_pix_trig=int(l_pix_trig),
         m_pix_trig=int(m_pix_trig),
@@ -351,6 +577,12 @@ def compute_metrics_from_grids(
         g_apex_cube_same=g_same,
         g_apex_val=float(best_val if np.isfinite(best_val) else 0.0),
         n_cubes=len(grids),
+        streak_ac1_trig=float(streak_trig),
+        frac_z5_trig=float(fracz_trig),
+        streak_ac1_worst=float(streak_worst),
+        frac_z5_worst=float(fracz_worst),
+        dead_tail_trig=int(dead_trig),
+        dead_tail_worst=int(dead_worst),
     )
 
 
@@ -399,6 +631,7 @@ def compute_metrics(event_dir: Path, event_name: str) -> CubeMetrics:
         m_t = int(float(trig.get("m_pix", 0)))
         snr_c1 = float(trig.get("snr", 0.0))
         dm_c1 = float(trig.get("dm_pc_cc", 0.0))
+        width_c1 = int(float(trig.get("width_samples", 0) or 0))
     except (KeyError, TypeError, ValueError) as exc:
         return CubeMetrics(ok=False, reason=f"bad C1 row: {exc}")
 
@@ -445,6 +678,7 @@ def compute_metrics(event_dir: Path, event_name: str) -> CubeMetrics:
         m_pix_trig=m_t,
         snr_c1=snr_c1,
         dm_c1=dm_c1,
+        width_samples=width_c1,
         apex_image_fn=apex_image_fn,
     )
 

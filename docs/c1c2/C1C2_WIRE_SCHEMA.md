@@ -62,9 +62,19 @@ Lines:
   Candidate MJD recovery on the C2 side:
 
   ```
-  samples_since_cube_start = (row.event_specnum - header.event_specnum_start) // header.sample_period_specnum
+  samples_since_cube_start = row.event_specnum - header.event_specnum_start
   candidate_mjd            = header.mjd_start + samples_since_cube_start * header.sample_period_us / 1e6 / 86400.0
   ```
+
+  Both `event_specnum_start` and the row's `event_specnum` count
+  **search samples** (one per detector sample), so the delta is
+  already a sample count and `sample_period_us` — itself the
+  search-sample period — turns it straight into microseconds. Do
+  **not** divide by `sample_period_specnum`: that field is native
+  SNAP specnums per search sample, for consumers that need native
+  units (`services/coincidencer.search_to_snap_specnum`). Dividing
+  here made every reported event MJD early by up to ~0.25 s until
+  2026-08-06.
 - Candidate row schema (one space between fields, no trailing
   space, terminated `\n`):
 
@@ -85,9 +95,17 @@ Lines:
   | dm_idx_global    | int    | `%d`               | absolute index into the full plan fine_dm grid  |
   | fine_dm_idx      | int    | `%d`               | per-cube local fine-DM index ∈ [0, n_fdm)       |
   | event_specnum    | int    | `%d`               | absolute spec num of the candidate's t          |
-  | width_samples    | int    | `%d`               | matched-filter width in detector samples        |
+  | width_samples    | int    | `%d`               | matched-filter width in SEARCH (detector) samples — NOT the injector's native-sample width, see below |
   | kernel_id        | string | `k_img:k_dm:k_time`| no spaces, see Candidate._check_kernel_id       |
   | flags            | int    | `%d`               | CandidateFlags bit mask                         |
+
+  `width_samples` cross-reading hazard: the injector's
+  `width_samples` (`inject/online.InjectionRequest`) is an FWHM in
+  **native** samples of 32.768 µs, while this field is the detector
+  boxcar index in **search** samples (1048.576 µs at the production
+  op-point) — a factor of 32 apart. A shot fired at injector `w=4`
+  is reported here at `w≈2`. Convert through the sample periods; do
+  not compare the integers.
 
 - `# END` line terminates the batch.
 

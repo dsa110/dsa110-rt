@@ -9,7 +9,7 @@ probe_one() {
   local host=$1
   local sb=$2
   local cal="/home/ubuntu/data/voltages/250924mptq/cals/beamformer_weights_${sb}.dat"
-  local flag="/home/ubuntu/data/voltages/250924mptq/cals/flagants.dat"
+  local flag="/home/ubuntu/proj/dsa110-shell/dsa110-xengine/scripts/flagants.dat"
   local dmp="/home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz"
   ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -n "${host}.pro.pvt" "
     out=ok

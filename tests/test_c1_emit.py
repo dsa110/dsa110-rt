@@ -9,6 +9,15 @@ Goals:
   * ``candidate_to_c1_row`` projects (l, m) / dm to the locked
     schema.
   * Reconnect on socket error (server disappears mid-stream).
+  * 2026-08-06 sender-thread regressions: a producer that floods
+    ``submit()`` from the service event loop without ever awaiting must
+    NOT starve the sender (``test_threaded_sender_survives_producer_
+    starvation``), the threaded sender reconnects when C2 restarts, and
+    drop accounting still works when C2 stops reading.
+
+The ``run()`` coroutine is still driven directly on the test loop by
+the older tests (it remains public); the new tests exercise the
+production path, ``start()`` / ``stop()``.
 """
 
 from __future__ import annotations
@@ -17,7 +26,9 @@ import asyncio
 import functools
 import os
 import socket
-from typing import List, Tuple
+import threading
+import time
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pytest
@@ -300,7 +311,7 @@ async def test_round_trip_through_echo_server() -> None:
             assert emitter.mon["batches_sent"] == 1
             assert emitter.mon["connected"]
         finally:
-            await emitter.stop()
+            emitter.stop()
             try:
                 await asyncio.wait_for(task, timeout=2.0)
             except asyncio.TimeoutError:
@@ -401,7 +412,7 @@ async def test_reconnect_after_server_drop() -> None:
             or emitter.mon["reconnects"] >= 2
         ), emitter.mon
     finally:
-        await emitter.stop()
+        emitter.stop()
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except asyncio.TimeoutError:
@@ -458,7 +469,7 @@ async def test_connect_timeout_fires_on_syn_blackhole() -> None:
             f"not firing. mon={dict(emitter.mon)}"
         )
     finally:
-        await emitter.stop()
+        emitter.stop()
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except asyncio.TimeoutError:
@@ -543,7 +554,7 @@ async def test_idle_heartbeat_keeps_connection_warm() -> None:
         )
         assert n_zero >= 1, f"no heartbeat batch seen; lines={lines!r}"
     finally:
-        await emitter.stop()
+        emitter.stop()
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except asyncio.TimeoutError:
@@ -618,7 +629,7 @@ async def test_idle_heartbeat_without_prior_batch() -> None:
                 f"heartbeat header missing sid/gpu_half: {ln!r}"
             )
     finally:
-        await emitter.stop()
+        emitter.stop()
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except asyncio.TimeoutError:
@@ -670,9 +681,386 @@ async def test_idle_probe_reconnects_on_peer_close() -> None:
             f"{dict(emitter.mon)}"
         )
     finally:
-        await emitter.stop()
+        emitter.stop()
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except asyncio.TimeoutError:
             task.cancel()
         await srv.stop()
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-06: dedicated sender thread
+# ---------------------------------------------------------------------------
+
+
+class _ThreadedSink:
+    """Fake C2 receiver on REAL threads (no asyncio).
+
+    The starvation regression below deliberately blocks the test's event
+    loop for the whole flood, so the fake C2 must not live on that loop:
+    an ``asyncio.start_server`` sink would neither accept nor read while
+    the producer runs, and the test would pass/fail for the wrong
+    reason. This acceptor runs one thread for ``accept`` plus one reader
+    thread per connection.
+
+    ``hang=True`` accepts connections but NEVER reads them, so the
+    kernel receive window closes and the sender wedges in ``drain()``
+    — the "C2 stopped reading" case.
+    """
+
+    def __init__(self, *, hang: bool = False, rcvbuf: Optional[int] = None):
+        self.hang = bool(hang)
+        self.rcvbuf = rcvbuf
+        self.port: int = 0
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._srv: Optional[socket.socket] = None
+        self._conns: List[socket.socket] = []
+        self._threads: List[threading.Thread] = []
+        self._closing = threading.Event()
+
+    def start(self, port: int = 0) -> int:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self.rcvbuf is not None:
+            # Set on the LISTENING socket so accepted sockets inherit it
+            # (must be set before the handshake for the window to shrink).
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(self.rcvbuf))
+        srv.bind(("127.0.0.1", int(port)))
+        srv.listen(8)
+        srv.settimeout(0.2)
+        self._srv = srv
+        self.port = int(srv.getsockname()[1])
+        t = threading.Thread(target=self._accept_loop, daemon=True)
+        t.start()
+        self._threads.append(t)
+        return self.port
+
+    def _accept_loop(self) -> None:
+        while not self._closing.is_set():
+            try:
+                assert self._srv is not None
+                conn, _ = self._srv.accept()
+            except (socket.timeout, OSError):
+                continue
+            self._conns.append(conn)
+            if self.hang:
+                continue  # accepted, never read
+            rt = threading.Thread(target=self._read_loop, args=(conn,),
+                                  daemon=True)
+            rt.start()
+            self._threads.append(rt)
+
+    def _read_loop(self, conn: socket.socket) -> None:
+        conn.settimeout(0.2)
+        try:
+            while not self._closing.is_set():
+                try:
+                    chunk = conn.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                with self._lock:
+                    self._buf.extend(chunk)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._closing.set()
+        for c in list(self._conns):
+            try:
+                c.close()
+            except OSError:
+                pass
+        self._conns.clear()
+        if self._srv is not None:
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            self._srv = None
+        for t in self._threads:
+            t.join(timeout=2.0)
+        self._threads.clear()
+        self._closing.clear()
+
+    def batches(self) -> List[int]:
+        """cube_ids of every complete batch header the sink has seen."""
+        with self._lock:
+            text = bytes(self._buf).decode("utf-8", "replace")
+        out: List[int] = []
+        for ln in text.splitlines():
+            if ln.startswith("# C1"):
+                # "# C1 <schema> <cube_id> <specnum> ... <n_candidates>"
+                toks = ln.split()
+                try:
+                    out.append(int(toks[3]))
+                except (IndexError, ValueError):
+                    pass
+        return out
+
+
+def _blocking_work(seconds: float) -> None:
+    """Stand-in for the ~350 ms of blocking per-cube GPU work that
+    ``search_compute._process_one_cube`` performs inside ``run_forever``.
+    The point is not CPU burn but that the EVENT LOOP never regains
+    control (no await), exactly as in production."""
+    time.sleep(seconds)
+
+
+@asyncio_test
+async def test_threaded_sender_survives_producer_starvation() -> None:
+    """REGRESSION (2026-08-06, lxd110h02 / s2g1): a producer that submits
+    from the service event loop and never yields must not stop the C1
+    stream.
+
+    The old design ran the drain loop as an ``asyncio.Task`` on the
+    caller's loop, so the ~350 ms of blocking per-cube work in
+    ``_process_one_cube`` left it unschedulable: the 16-deep queue
+    overflowed and ``submit()`` dropped every batch (47 k drops in 9 h,
+    including a real injected candidate at 07:50:27). This test floods
+    ``submit()`` from a coroutine containing ZERO awaits; with the
+    sender on its own thread every batch must still reach C2.
+
+    Run against the pre-fix code (``asyncio.create_task(emitter.run())``
+    instead of ``start()``) this fails with batches_sent == 0 and
+    batches_dropped > 0.
+    """
+    sink = _ThreadedSink()
+    port = sink.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=2, gpu_half=1,
+        queue_depth=16,  # production default -- deliberately not raised
+        connect_backoff_initial_s=0.02, connect_backoff_max_s=0.05,
+        send_timeout_s=5.0, idle_heartbeat_s=None,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    emitter.start()
+    try:
+        # Let the sender thread connect (this is the ONLY await before
+        # the flood).
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if emitter.mon["connected"]:
+                break
+        assert emitter.mon["connected"], dict(emitter.mon)
+
+        n_cubes = 120
+        geom = _geom()
+        cands = [_cand(snr=10.0)]
+        # ---- no await anywhere inside this loop ----
+        for cid in range(n_cubes):
+            header = _header(emitter, n_candidates=1, cube_id=cid)
+            assert emitter.submit(header, cands, geom=geom) is True, (
+                f"batch {cid} dropped -- sender starved; "
+                f"mon={dict(emitter.mon)}"
+            )
+            _blocking_work(0.004)
+        # -------------------------------------------
+
+        assert emitter.mon["batches_dropped"] == 0, dict(emitter.mon)
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            if emitter.mon["batches_sent"] >= n_cubes:
+                break
+        assert emitter.mon["batches_sent"] == n_cubes, dict(emitter.mon)
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if len(sink.batches()) >= n_cubes:
+                break
+        assert sink.batches() == list(range(n_cubes))
+    finally:
+        emitter.stop()
+        sink.stop()
+
+
+def test_threaded_sender_reconnects_after_server_restart() -> None:
+    """The threaded sender must rebuild the connection when C2 goes away
+    and comes back, and resume shipping batches (same backoff lifecycle
+    as the old task-based run(), now inside the thread's private loop).
+
+    Fully synchronous test: no event loop in the test at all, which is
+    the whole point of the sender owning one.
+    """
+    sink = _ThreadedSink()
+    port = sink.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=1, gpu_half=0, queue_depth=16,
+        connect_backoff_initial_s=0.02, connect_backoff_max_s=0.05,
+        send_timeout_s=2.0, idle_heartbeat_s=0.2,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    emitter.start()
+    geom = _geom()
+    cands = [_cand(snr=10.0)]
+    try:
+        for _ in range(200):
+            time.sleep(0.01)
+            if emitter.mon["connected"]:
+                break
+        assert emitter.mon["connected"], dict(emitter.mon)
+        for cid in range(5):
+            assert emitter.submit(
+                _header(emitter, n_candidates=1, cube_id=cid), cands,
+                geom=geom,
+            ) is True
+            time.sleep(0.01)
+        for _ in range(200):
+            time.sleep(0.01)
+            if len(sink.batches()) >= 5:
+                break
+        assert [b for b in sink.batches() if b >= 0][:5] == list(range(5))
+        reconnects_before = int(emitter.mon["reconnects"])
+
+        # C2 dies mid-stream.
+        sink.stop()
+        # Keep submitting so the send path notices the dead socket; the
+        # idle heartbeat would get there too, just more slowly.
+        for cid in range(100, 140):
+            emitter.submit(
+                _header(emitter, n_candidates=1, cube_id=cid), cands,
+                geom=geom,
+            )
+            time.sleep(0.02)
+            if not emitter.mon["connected"]:
+                break
+
+        # C2 comes back on the same endpoint.
+        sink2 = _ThreadedSink()
+        sink2.start(port=port)
+        try:
+            for _ in range(400):
+                time.sleep(0.01)
+                if int(emitter.mon["reconnects"]) > reconnects_before:
+                    break
+            assert int(emitter.mon["reconnects"]) > reconnects_before, (
+                f"sender never reconnected; mon={dict(emitter.mon)}"
+            )
+            sent_before = int(emitter.mon["batches_sent"])
+            for cid in range(200, 205):
+                emitter.submit(
+                    _header(emitter, n_candidates=1, cube_id=cid), cands,
+                    geom=geom,
+                )
+                time.sleep(0.01)
+            for _ in range(300):
+                time.sleep(0.01)
+                if any(b >= 200 for b in sink2.batches()):
+                    break
+            assert any(b >= 200 for b in sink2.batches()), (
+                f"no post-reconnect batch resumed; mon={dict(emitter.mon)}"
+            )
+            assert int(emitter.mon["batches_sent"]) > sent_before
+        finally:
+            sink2.stop()
+    finally:
+        emitter.stop()
+        sink.stop()
+
+
+def test_drop_accounting_when_server_stops_reading() -> None:
+    """When C2 accepts but never reads, the sender wedges in drain(),
+    the bounded queue fills, and ``submit()`` must keep returning False
+    and counting drops (unchanged backpressure contract -- only the
+    queue type changed, asyncio.Queue -> queue.Queue)."""
+    # Tiny receive window so the socket buffers fill in a bounded number
+    # of batches rather than megabytes' worth.
+    sink = _ThreadedSink(hang=True, rcvbuf=2048)
+    port = sink.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=0, gpu_half=0, queue_depth=4,
+        connect_backoff_initial_s=0.02, connect_backoff_max_s=0.05,
+        # Long send timeout: we want the sender parked in drain(), not
+        # tearing the connection down and retrying.
+        send_timeout_s=60.0, idle_heartbeat_s=None,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    emitter.start()
+    geom = _geom()
+    cands = [_cand(snr=10.0)]
+    try:
+        for _ in range(200):
+            time.sleep(0.01)
+            if emitter.mon["connected"]:
+                break
+        assert emitter.mon["connected"], dict(emitter.mon)
+        saw_false = False
+        for cid in range(20000):
+            ok = emitter.submit(
+                _header(emitter, n_candidates=1, cube_id=cid), cands,
+                geom=geom,
+            )
+            if not ok:
+                saw_false = True
+                break
+            time.sleep(0.0005)
+        assert saw_false, (
+            f"submit never reported a drop against a non-reading peer; "
+            f"mon={dict(emitter.mon)}"
+        )
+        assert int(emitter.mon["batches_dropped"]) >= 1
+        assert int(emitter.mon["queue_depth"]) == cfg.queue_depth
+        # And the drop counter keeps climbing while the peer stays deaf.
+        before = int(emitter.mon["batches_dropped"])
+        for cid in range(20000, 20010):
+            emitter.submit(
+                _header(emitter, n_candidates=1, cube_id=cid), cands,
+                geom=geom,
+            )
+        assert int(emitter.mon["batches_dropped"]) > before
+    finally:
+        emitter.stop()
+        sink.stop()
+
+
+def test_stop_is_prompt_when_peer_is_dead() -> None:
+    """``stop()`` must not hang the service shutdown path when the socket
+    is wedged: sentinel + bounded join, thread is a daemon."""
+    sink = _ThreadedSink(hang=True, rcvbuf=2048)
+    port = sink.start()
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=port,
+        search_node_id=0, gpu_half=0, queue_depth=4,
+        connect_backoff_initial_s=0.02, connect_backoff_max_s=0.05,
+        send_timeout_s=60.0, idle_heartbeat_s=0.2,
+        stop_join_timeout_s=2.0,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    emitter.start()
+    try:
+        for _ in range(200):
+            time.sleep(0.01)
+            if emitter.mon["connected"]:
+                break
+        t0 = time.monotonic()
+        emitter.stop()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 3.0, f"stop() took {elapsed:.2f}s"
+        # Idempotent.
+        emitter.stop()
+    finally:
+        sink.stop()
+
+
+def test_start_is_idempotent() -> None:
+    cfg = C1EmitConfig(
+        host="127.0.0.1", port=_free_port(),
+        search_node_id=0, gpu_half=0, queue_depth=4,
+        connect_backoff_initial_s=0.02, connect_backoff_max_s=0.05,
+    )
+    emitter = C1TcpEmitter(config=cfg)
+    emitter.start()
+    t = emitter._thread
+    emitter.start()
+    assert emitter._thread is t
+    emitter.stop()

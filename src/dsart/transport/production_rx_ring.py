@@ -304,6 +304,15 @@ class ProductionRxRingSource:
         self._n_overrun: int = 0
         self._n_pattern_mismatch: int = 0
         self._n_no_data_present: int = 0
+        # 2026-08-04: how many corrs were at the consumer boundary each
+        # time the gate PASSED, as a small histogram keyed on the count.
+        # n_fan_in_stall only counts FAILED checks (and, being a poll
+        # loop, counts iterations rather than episodes -- 4.6M of them
+        # over 47 h while throughput stayed at 17,750-17,880 cubes/hour,
+        # i.e. ~100%% of nominal). What nobody could read off was how
+        # often the gate scrapes through at exactly fan_in_min_corrs,
+        # which is what sets the cost of raising the threshold to 16.
+        self._n_at_target_hist: dict[int, int] = {}
         # Fan-in stall watchdog (see ``fan_in_stall_warn_s`` above). Counts
         # how many gate-poll iterations were spent with an unsatisfiable
         # fan-in (surfaced in the status JSON so ``cube_progress`` shows a
@@ -650,6 +659,10 @@ class ProductionRxRingSource:
             "n_pattern_mismatch": int(self._n_pattern_mismatch),
             "n_no_data_present": int(self._n_no_data_present),
             "n_fan_in_stall": int(self._n_fan_in_stall),
+            # {n_corrs_at_target: n_gate_passes}. A large count at
+            # exactly fan_in_min_corrs means raising the threshold would
+            # start blocking on cubes that currently pass.
+            "n_at_target": dict(sorted(self._n_at_target_hist.items())),
         }
 
     def get_scatter_timing_and_reset(self) -> dict:
@@ -914,6 +927,10 @@ class ProductionRxRingSource:
                 * self._n_active_dms_per_corr
             )
             n_at_target = sum(1 for w in wseqs if w >= target_seq)
+            if n_at_target >= self._fan_in_min_corrs:
+                self._n_at_target_hist[n_at_target] = (
+                    self._n_at_target_hist.get(n_at_target, 0) + 1
+                )
             if n_at_target < self._fan_in_min_corrs:
                 # Insufficient fan-in: parking here is correct ("not enough
                 # data to emit a cube"), but a *permanent* shortfall (a

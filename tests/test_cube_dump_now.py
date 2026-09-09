@@ -778,13 +778,14 @@ class TestResolveEventSpecnumFromSearchRing:
             store, targets=targets, lookback_cubes=4,
         )
         # min(newest) == 10_000_000 (the first half).
-        # cube_span = t_det * spp = 192 * 16 = 3072.
+        # cube_span = t_det = 192 search samples (a cube spans exactly
+        # t_det of them; it was t_det * spp = 3072 before 2026-08-06).
         # cube_cadence_samples (derived from publisher: ring of 16
         # cubes spanning ``(depth - 1) * cadence`` ≈ 1920 samples
         # → cadence = 128).
         # target = min_newest + cube_span // 2 - lookback * cadence
-        #        = 10_000_000 + 1536 - 4 * 128
-        #        = 10_000_000 + 1024
+        #        = 10_000_000 + 96 - 4 * 128
+        #        = 10_000_000 - 416
         assert info["min_newest_event_specnum_start"] == 10_000_000
         assert info["source"] == "search_ring"
         assert info["lookback_cubes"] == 4
@@ -795,9 +796,9 @@ class TestResolveEventSpecnumFromSearchRing:
         assert info["stale"] == []
         assert info["empty"] == []
         assert info["min_newest_sid_g"] == list(targets[0])
-        assert info["target_cube_span"] == 3072
+        assert info["target_cube_span"] == 192
         assert info["ring_cadence_specnums"] == 128
-        assert ev == 10_000_000 + 1536 - 4 * 128
+        assert ev == 10_000_000 + 96 - 4 * 128
 
     def test_picks_mid_newest_when_lookback_zero(self):
         targets = [(sid, g) for (sid, g, _, _) in PROD_BIND_HOSTS]
@@ -809,9 +810,9 @@ class TestResolveEventSpecnumFromSearchRing:
         ev, info = cube_dump_now._resolve_event_specnum_from_search_ring(
             store, targets=targets, lookback_cubes=0,
         )
-        # cube_span // 2 = 3072 // 2 = 1536 forward of newest_start.
-        assert ev == 20_000_000 + 1536
-        assert info["target_offset_from_min_newest"] == 1536
+        # cube_span // 2 = 192 // 2 = 96 forward of newest_start.
+        assert ev == 20_000_000 + 96
+        assert info["target_offset_from_min_newest"] == 96
         assert "ring_cadence_specnums" not in info  # not derived
 
     def test_returns_none_when_no_publishers(self):
@@ -848,8 +849,8 @@ class TestResolveEventSpecnumFromSearchRing:
         assert info["min_newest_event_specnum_start"] == 5_000_000
         assert info["stale"] == ["/mon/search/1/1/ring"]
         assert info["answered"] == ["/mon/search/1/0/ring"]
-        # target = min_newest + cube_span//2 = 5_000_000 + 1536
-        assert ev == 5_000_000 + 1536
+        # target = min_newest + cube_span//2 = 5_000_000 + 96
+        assert ev == 5_000_000 + 96
 
     def test_skips_empty_rings(self):
         # n_committed=0 → newest is None → ring not primed yet.
@@ -875,7 +876,7 @@ class TestResolveEventSpecnumFromSearchRing:
         )
         assert info["empty"] == ["/mon/search/1/1/ring"]
         assert info["answered"] == ["/mon/search/1/0/ring"]
-        assert ev == 5_000_000 + 1536
+        assert ev == 5_000_000 + 96
 
     def test_clamps_to_zero_when_offset_exceeds_min_newest(self):
         # Pathological min_newest=100 with high lookback should
@@ -891,13 +892,13 @@ class TestResolveEventSpecnumFromSearchRing:
         store = FakeDsaStore(get_dict_responses=responses)
         # Force the lookback to be huge but with n_committed=1 the
         # extra-offset subtraction is skipped (needs >= 2 to derive
-        # cadence). target = min_newest + cube_span/2 = 100 + 1536
+        # cadence). target = min_newest + cube_span/2 = 100 + 96
         # = 1636. lookback_cubes can't subtract because cadence
         # can't be derived. So ev = 1636.
         ev, info = cube_dump_now._resolve_event_specnum_from_search_ring(
             store, targets=targets, lookback_cubes=999,
         )
-        assert ev == 100 + 1536
+        assert ev == 100 + 96
         assert info["min_newest_event_specnum_start"] == 100
         assert "ring_cadence_specnums" not in info
 
@@ -908,7 +909,7 @@ class TestResolveEventSpecnumFromSearchRing:
         targets = [(1, 0)]
         # n_committed=16 with very small newest_start means cadence
         # is derivable (16 cubes spanning 15*128 = 1920 samples).
-        # newest=2000 → oldest=80. target=2000 + 1536 - 999*128
+        # newest=2000 → oldest=80. target=2000 + 96 - 999*128
         # → highly negative, clamped to 0.
         responses = _make_search_ring_responses(
             sids_g=targets, newest_per_half={(1, 0): 2000},
@@ -962,12 +963,20 @@ class TestFleetDumpNowPrefersSearchRing:
         # event_specnum is in the LARGE (search-side) domain, NOT
         # the small corr_fast domain.
         assert res.event_specnum is not None
-        # Target should be approximately min_newest (999M) + 1536
-        # (half a cube_span forward of the laggard's newest start)
-        # minus a small backward nudge from the default 4-cube
-        # lookback (4 × 128 = 512 search samples).
-        assert res.event_specnum >= 999_000_000
-        assert res.event_specnum <= 999_000_000 + 1536
+        # target = min_newest + t_det//2 - lookback * cadence
+        #        = 999_000_000 + 96 - 4 * 128 = 999_000_000 - 416
+        #
+        # The net offset is BEHIND min_newest, and that is the point of
+        # DEFAULT_LOOKBACK_CUBES: it "guarantees the leader has finished
+        # writing the slot we hit". This assertion used to require the
+        # pick to land at or forward of min_newest, which only held
+        # because the forward term was t_det * spp = 1536 -- 16x too
+        # wide -- so the pick landed AHEAD of the true leading edge and
+        # every dump_now came back too_early. Landing a couple of cubes
+        # back is correct.
+        assert res.event_specnum == 999_000_000 + 96 - 4 * 128
+        # ...and still comfortably inside the ring, not off the old end.
+        assert res.event_specnum > 999_000_000 - 16 * 128
 
     def test_falls_back_to_corr_fast_when_search_ring_missing(self):
         """The legacy fleet (no SearchRingMonPublisher yet) still

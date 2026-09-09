@@ -16,14 +16,15 @@ records which detector fired in that cell:
     group-outlier     2
     sum-threshold     3
     flagants.dat      4
-    array-burst       5
+    persistence       5
+    array-burst       6
     ===============   =====
 
-``ARRAY_BURST`` (bit 5) does not mean the same thing as the others.
+``ARRAY_BURST`` (bit 6) does not mean the same thing as the others.
 The array-burst detector (:mod:`dsart.rfi.array_burst`) works at
 2.097 ms, not at cube cadence, so its verdict cannot be folded into
 the cube-wide ``[NANTS, NCHAN, NPOL]`` mask without throwing away the
-time resolution that is the whole point of it. Bit 5 therefore marks
+time resolution that is the whole point of it. Bit 6 therefore marks
 ``(ant, ch, pol)`` cells in which **at least one** 2.097 ms sample of
 the cube was excised; the time-resolved mask itself travels
 separately in :attr:`FlagBlockResult.array_burst`, and the caller
@@ -32,6 +33,17 @@ mode.
 
 The numeric values are exposed as :class:`FlagSourceBit` for
 downstream diagnostic logging.
+
+Time persistence
+================
+
+The four detectors are memoryless — each cube is judged on its own
+statistics. :mod:`dsart.rfi.persistence` adds an optional latch on top:
+a cell the detectors flag for a whole 30 s window stays flagged for
+15 min afterwards (bit 5). The latch is fed the *detector* OR only, so
+it can expire; see that module's docstring for the recurrences and the
+cost analysis. Off unless ``persistence=`` is passed to
+:class:`RFIFlagger`.
 
 Cold-start state machine
 ========================
@@ -84,6 +96,7 @@ from dsart.rfi.bandpass_outlier import (
 )
 from dsart.rfi.flagants_loader import load_flagants_torch
 from dsart.rfi.group_outlier import DEFAULT_GROUP_K, group_outlier_mask
+from dsart.rfi.persistence import FlagPersistence
 from dsart.rfi.sk import DEFAULT_SK_FAR, sk_combined_mask
 from dsart.rfi.sum_threshold import (
     DEFAULT_ETA,
@@ -113,7 +126,8 @@ class FlagSourceBit(enum.IntFlag):
     GROUP_OUTLIER = 1 << 2       # value 4
     SUM_THRESHOLD = 1 << 3       # value 8
     FLAGANTS_DAT = 1 << 4        # value 16
-    ARRAY_BURST = 1 << 5         # value 32
+    PERSISTENCE = 1 << 5         # value 32
+    ARRAY_BURST = 1 << 6         # value 64
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +169,11 @@ class FlagBlockResult:
             ``autos_override`` whose ``s1`` does not contain the
             full-block M; only set on the production code path that
             calls ``compute_autos`` itself.
+        n_persist_latched: number of cells currently held flagged by
+            the :mod:`dsart.rfi.persistence` latch (0 when persistence
+            is disabled). Read off the same host sync that produces
+            ``flag_fraction_total``, so it costs nothing extra.
+        n_persist_new: number of cells that latched on *this* cube.
     """
 
     mask: torch.Tensor
@@ -162,6 +181,8 @@ class FlagBlockResult:
     warmup: bool
     flag_fraction_total: float
     s1_full: torch.Tensor | None = None
+    n_persist_latched: int = 0
+    n_persist_new: int = 0
     array_burst: ArrayBurstResult | None = None
 
 
@@ -257,6 +278,11 @@ class RFIFlagger:
         run_sum_threshold: include the SumThreshold post-pass
             (default True). Tests can disable to inspect raw
             per-detector flags.
+        persistence: optional :class:`dsart.rfi.FlagPersistence` latch.
+            When given, cells the detectors flag for a whole trailing
+            window stay flagged for the configured hold time and carry
+            :attr:`FlagSourceBit.PERSISTENCE`. ``None`` (default) keeps
+            the pre-existing memoryless behaviour exactly.
         array_burst: optional :class:`dsart.rfi.array_burst.ArrayBurstDetector`
             for array-common broadband bursts. ``None`` disables it.
         array_burst_mode: ``"off"``, ``"monitor"`` or ``"flag"``.
@@ -266,15 +292,17 @@ class RFIFlagger:
             against a 134.218 ms budget and a new detector that can
             flag every antenna at once deserves a night of looking at
             before it is armed. ``flag`` additionally populates
-            ``array_burst.time_chan_mask`` and sets tag bit 5.
+            ``array_burst.time_chan_mask`` and sets tag bit 6.
 
     Notes
     -----
-    The flagger is *stateful* across cubes only via ``self._cubes_seen``
-    (the warmup counter). All other state — thresholds, configs — is
-    immutable after construction. The instance is safe to reuse across
-    a long run; call :meth:`reset_warmup` to re-arm the warmup window
-    (e.g. after a re-cal or pipeline restart).
+    The flagger is *stateful* across cubes via ``self._cubes_seen`` (the
+    warmup counter) and, when configured, the persistence latch. All
+    other state — thresholds, configs — is immutable after
+    construction. The instance is safe to reuse across a long run; call
+    :meth:`reset_warmup` to re-arm the warmup window (e.g. after a
+    re-cal or pipeline restart) and :meth:`reset_persistence` to drop
+    every latch.
     """
 
     def __init__(
@@ -290,6 +318,7 @@ class RFIFlagger:
         m_values: tuple[int, ...] = DEFAULT_M_VALUES,
         warmup_cubes: int = RFI_BANDPASS_WARMUP_CUBES_DEFAULT,
         run_sum_threshold: bool = True,
+        persistence: FlagPersistence | None = None,
         array_burst: ArrayBurstDetector | None = None,
         array_burst_mode: str = "off",
     ) -> None:
@@ -321,6 +350,7 @@ class RFIFlagger:
         self._m_values = tuple(m_values)
         self._warmup_cubes = warmup_cubes
         self._run_sum_threshold = run_sum_threshold
+        self._persistence = persistence
         self._array_burst = array_burst
         self._array_burst_mode = (
             array_burst_mode if array_burst is not None else "off"
@@ -360,6 +390,11 @@ class RFIFlagger:
         return self._flagants_mask
 
     @property
+    def persistence(self) -> FlagPersistence | None:
+        """The configured time-persistence latch, or ``None``."""
+        return self._persistence
+
+    @property
     def array_burst_mode(self) -> str:
         return self._array_burst_mode
 
@@ -386,6 +421,11 @@ class RFIFlagger:
     def reset_warmup(self) -> None:
         """Reset the warmup counter (e.g. after pipeline restart)."""
         self._cubes_seen = 0
+
+    def reset_persistence(self) -> None:
+        """Drop every persistence latch (no-op when not configured)."""
+        if self._persistence is not None:
+            self._persistence.reset()
 
     # ------------------------------------------------------------------
     # Top-level call
@@ -504,8 +544,22 @@ class RFIFlagger:
             n_pol=n_pol_actual,
         )
 
-        # ---- OR-fold ----------------------------------------------
-        final = sk_m | bp_m | gr_m | sum_m | fa_m
+        # ---- Detector OR-fold -------------------------------------
+        detector_m = sk_m | bp_m | gr_m | sum_m
+
+        # ---- Time persistence (M8.1) ------------------------------
+        # Fed the DETECTOR mask only: including the latch's own output
+        # would keep every latched cell's run alive forever, and
+        # including flagants would latch antennas that are already
+        # unconditionally flagged.
+        if self._persistence is not None:
+            pe_m, pe_stats = self._persistence.update(detector_m)
+        else:
+            pe_m, pe_stats = None, None
+
+        final = detector_m | fa_m
+        if pe_m is not None:
+            final = final | pe_m
 
         # ---- Source-tag uint8 -------------------------------------
         tags = torch.zeros_like(final, dtype=torch.uint8)
@@ -514,11 +568,14 @@ class RFIFlagger:
         tags |= gr_m.to(torch.uint8) * int(FlagSourceBit.GROUP_OUTLIER)
         tags |= sum_m.to(torch.uint8) * int(FlagSourceBit.SUM_THRESHOLD)
         tags |= fa_m.to(torch.uint8) * int(FlagSourceBit.FLAGANTS_DAT)
+        if pe_m is not None:
+            tags |= pe_m.to(torch.uint8) * int(FlagSourceBit.PERSISTENCE)
 
-        # Bit 5 marks the (ant, ch, pol) cells in which at least one
+        # Bit 6 marks the (ant, ch, pol) cells in which at least one
         # 2.097 ms sample was excised. Only meaningful in flag mode;
         # see the module docstring for why it is not the same kind of
-        # statement as bits 0-4.
+        # statement as bits 0-4. Built here, with the other tags, so
+        # everything is in place before the single host sync below.
         if (
             self._array_burst_mode == "flag"
             and ab_result is not None
@@ -532,7 +589,20 @@ class RFIFlagger:
                 * int(FlagSourceBit.ARRAY_BURST)
             )
 
-        flag_frac = float(final.float().mean().item())
+        # One host sync per cube, shared by the flag fraction and the
+        # persistence counters (the latch itself never syncs).
+        if pe_stats is None:
+            flag_frac = float(final.float().mean().item())
+            n_latched = n_new = 0
+        else:
+            frac_t = final.float().mean().to(torch.float64)
+            packed = torch.stack((
+                frac_t,
+                pe_stats.n_latched.to(torch.float64),
+                pe_stats.n_new_latched.to(torch.float64),
+            )).tolist()
+            flag_frac = float(packed[0])
+            n_latched, n_new = int(packed[1]), int(packed[2])
 
         if update_header is not None:
             update_header.set_rfi_warmup(warmup_flag)
@@ -548,6 +618,8 @@ class RFIFlagger:
             warmup=warmup_flag,
             flag_fraction_total=flag_frac,
             s1_full=s1_full,
+            n_persist_latched=n_latched,
+            n_persist_new=n_new,
             array_burst=ab_result,
         )
 

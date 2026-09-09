@@ -11,6 +11,13 @@ Layout (top to bottom):
 
   Row A. Fleet at-a-glance stats (corr/search alive count, fleet
          capture rate, time since last C2 trigger).
+  Row A2. Search GPU health -- one tile per (cn, gpu_half) showing the
+         percentage of real time that half did NOT process cubes, plus
+         the sky-clock ingest / blind-fraction history / freshness /
+         sigma_k-agreement graphs behind them. See
+         _search_gpu_health_panels for the derivation, and in particular
+         for why the tiles are keyed on the cube count rather than on the
+         sky clock they used to use.
   Row B. Service heartbeats (corr + search alive matrix, cadence).
   Row C. Routine state (corr + search, fraction of fleet alive and
          worst verb age).
@@ -42,10 +49,18 @@ Usage::
     ./build_dashboard.py
 
     # Write + POST to the live Grafana instance on h20
+    source ~/.dsart/secrets.env          # exports GRAFANA_AUTH=user:pass
     ./build_dashboard.py --post \
-        --grafana-url http://$GRAFANA_AUTH@localhost:3000
+        --grafana-url http://lxd110h20.pro.pvt:3000
 
-    # GRAFANA_AUTH holds user:pass; never commit real credentials.
+    # GRAFANA_AUTH holds user:pass; never commit real credentials. It is
+    # read by --grafana-auth's default and sent as a Basic header.
+    #
+    # Do NOT put the credentials inline in the URL
+    # (http://$GRAFANA_AUTH@host:3000) as this docstring used to say:
+    # urllib.request does not strip userinfo from the netloc, so it
+    # tries to resolve "user:pass@host" as a hostname and dies with
+    # "Name or service not known".
 
 The generator is intentionally a single self-contained module so we can
 keep the dashboard JSON in version control and re-emit it deterministically.
@@ -309,6 +324,259 @@ def text_panel(
     }
 
 
+# ---------------------------------------------------------------------------
+# Search-GPU health (row A2)
+# ---------------------------------------------------------------------------
+#
+# The 8 search GPUs are (cn_id, gpu_half) for cn in {1, 2, 9, 13}, half in
+# {0, 1}. Nothing publishes a per-GPU "am I receiving data" key
+# (``/mon/search_rt/<cn>/rx`` is in M7.6-MONITOR-POINTS-SEARCH.md §7 but is
+# not written, and the pusher logs it as a planned-but-unbuilt key), so the
+# diagnostic is derived from two counters that only advance when real data
+# flows through that half:
+#
+#   search_rt_dump.cube_ring_newest_end_specnum_excl
+#       Newest specnum staged into the half's cube retention ring, in
+#       SEARCH-SAMPLE units. Multiply its time derivative by the search
+#       sample period and you get "seconds of sky ingested per second of
+#       wall clock" — 1.0 when the half is keeping up with real time.
+#       Measured 2026-08-02 across all 8 halves over a 30 min baseline:
+#       951.5-954.6 samples/s => 0.998-1.001x real time.
+#
+#   search_rt_noise.layer2_cube_count
+#       Cubes the Layer-2 normaliser has seen. Same 30 min baseline:
+#       4.90-4.96 cubes/s on every half (cube stride = 192 search samples,
+#       so real time is 1/(192 * 1.048576 ms) = 4.96 cubes/s).
+#
+# The pair separates two distinct failure modes: the ring advancing while
+# layer2_cube_count sticks is the detector wedging (the fan-in gate freeze
+# / c1_emit wedge signature), whereas both stalling together is the half
+# losing its corr->search feed.
+_SEARCH_HALVES: List[tuple] = [
+    (cn, g) for cn in (1, 2, 9, 13) for g in (0, 1)
+]
+
+#: Search sample period in SECONDS (t_int_search_us = 1048.576 us). One
+#: unit of cube_ring_newest_end_specnum_excl.
+_SEARCH_SAMPLE_S: float = 1.048576e-3
+
+#: Cube stride in search samples (measured: 953 samples/s / 4.96 cubes/s).
+_CUBE_STRIDE_SAMPLES: int = 192
+
+#: Real-time cube rate, cubes/s. Verified against the fleet on 2026-08-05:
+#: cn02 g0/g1 and cn13 g0/g1 all measured 4.96707 cubes/s over a 1 h raw
+#: first/last baseline, i.e. exactly this value, 0.000% deficit. So the
+#: theoretical figure is the correct target and needs no fudge factor.
+_NOMINAL_CUBES_PER_S: float = 1.0 / (_CUBE_STRIDE_SAMPLES * _SEARCH_SAMPLE_S)
+
+#: Telemetry publish cadence, seconds. A first/last difference over a
+#: window of W seconds actually spans W minus one publish interval, since
+#: the first point sits up to one interval inside the window edge. Divide
+#: by (W - this) rather than W or every healthy half reads slightly blind.
+_SEARCH_PUBLISH_S: float = 2.0
+
+#: Blind-fraction thresholds, percent. Measured spread on a healthy fleet
+#: (2026-08-05, 1 h baseline) was 0.000-0.235%, so 0.5% is comfortably
+#: above the noise while still catching the 3% class of deficit that the
+#: old sky-clock tiles rendered solid green.
+_BLIND_WARN_PCT: float = 0.5
+_BLIND_CRIT_PCT: float = 2.0
+
+#: Bucket and smoothing for the blind-fraction *graph*. layer2_cube_count is
+#: an integer, so a per-bucket derivative is quantised to 1/bucket_seconds
+#: cubes/s: at 60 s that is 0.34% of nominal, and the raw trace visibly
+#: steps between -0.66% and +2.69% on a perfectly healthy half -- which
+#: would swamp a 0.5% warning line. Smoothing over 5 buckets brings the
+#: healthy trace to 0.008-0.5%, measured. The tiles do not need this
+#: because a first/last difference over 1800 s is already 1 part in ~8900.
+_BLIND_BUCKET_S: int = 60
+_BLIND_SMOOTH_BUCKETS: int = 5
+
+
+def _search_gpu_health_panels() -> List[Dict[str, Any]]:
+    """Row A2: one blind-fraction tile per search GPU + the graphs behind them."""
+    out: List[Dict[str, Any]] = []
+    out.append(row_panel(
+        "A2. Search GPU health -- all 8 halves receiving + processing?"
+    ))
+    _bump_y(1)
+
+    # --- 8 tiles, 3 grid columns each = one full-width strip -----------
+    # Each tile is the fraction of real time the half was NOT processing
+    # cubes: 0% = kept up perfectly, 3% = missed 3% of the sky.
+    #
+    # Keyed on layer2_cube_count (cubes actually pushed through the
+    # Layer-2 normaliser), NOT on cube_ring_newest_end_specnum_excl as
+    # this row used to be. That counter is the SKY CLOCK -- it advances at
+    # real time because it records where the sky has got to, whether or
+    # not this half processed any of it. On 2026-08-05 cn09 g1 was
+    # persistently 3.03% blind and the sky-clock tiles read 0.998-1.004,
+    # solid green, across the whole episode. Only the cube count sees it.
+    #
+    # Deliberately NOT derivative() + GROUP BY time($__interval): the
+    # trailing bucket of such a query is always partial, so its derivative
+    # reads low (0.34 instead of 1.0 was reproducible on 2026-08-02) and a
+    # tile keyed on "current" would flap red for no reason. A first/last
+    # difference over a FIXED window has no bucket edges to trip over.
+    #
+    # A restart inside the window resets the counter, so last < first and
+    # the tile goes hugely positive -> red. That is the safe direction: a
+    # half that just restarted did miss data, and it recovers on its own
+    # once the window clears.
+    tile_window_s = 1800
+    tile_span_s = tile_window_s - _SEARCH_PUBLISH_S
+    # blind_pct = 100 * (1 - dcount / (span * nominal))
+    tile_scale = 100.0 / (tile_span_s * _NOMINAL_CUBES_PER_S)
+    for i, (cn, g) in enumerate(_SEARCH_HALVES):
+        out.append(singlestat_panel(
+            title=f"n{cn:02d} g{g}",
+            raw_query=(
+                'SELECT 100 - (last("layer2_cube_count") - '
+                'first("layer2_cube_count")) '
+                f'* {tile_scale:.13f} '
+                'FROM "search_rt_noise" '
+                f'WHERE time > now() - {tile_window_s}s '
+                f"AND \"cn_id\" = '{cn}' AND \"gpu_half\" = '{g}'"
+            ),
+            w=3, h=4, x=3 * i, unit="percent", decimals=2,
+            value_name="current",
+            thresholds=f"{_BLIND_WARN_PCT},{_BLIND_CRIT_PCT}",
+            colors=["#299c46", "rgba(237, 129, 40, 0.89)", "#d44a3a"],
+            color_background=True, sparkline_show=False,
+            description=(
+                f"Search half cn{cn} gpu_half {g}: percentage of real time "
+                "this half was NOT processing cubes, over a fixed "
+                f"{tile_window_s} s lookback (independent of the dashboard "
+                "time range). 0% = keeping up; every percent here is a "
+                "percent of the sky in which an FRB could not have been "
+                f"found. Green below {_BLIND_WARN_PCT}%, red above "
+                f"{_BLIND_CRIT_PCT}%. A healthy fleet measured 0.000-0.235% "
+                "on 2026-08-05. A value in the thousands means the process "
+                "restarted inside the window (counter reset); it clears "
+                "itself. N/A = published nothing at all -- process down, or "
+                "the etcd->influx pusher stopped. Source: "
+                "search_rt_noise.layer2_cube_count against a "
+                f"{_NOMINAL_CUBES_PER_S:.5f} cubes/s real-time target."
+            ),
+        ))
+    _bump_y(4)
+
+    # --- the two rate graphs -------------------------------------------
+    out.append(graph_panel(
+        title="Search ingest -- x real time per GPU half (target 1.0)",
+        raw_query=(
+            'SELECT derivative(last("cube_ring_newest_end_specnum_excl"), 1s) '
+            f'* {_SEARCH_SAMPLE_S:.9f} '
+            'FROM "search_rt_dump" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="percentunit", y_min=0, y_max=1.2,
+        legend_right=True, legend_values=True, fill=0, line_width=2,
+        description=(
+            "Per-GPU-half SKY CLOCK advance, expressed as a multiple of "
+            "real time. Kept alongside the blind-fraction panel because it "
+            "answers a different question: this one goes flat only when a "
+            "half stops being fed or stops publishing at all, so it is the "
+            "hard-stall detector. It cannot see a partial deficit -- the "
+            "counter tracks where the sky has got to, not how much of it "
+            "was processed -- which is why the tiles above are keyed on "
+            "the cube count instead. All 8 traces should sit flat on 1.0; "
+            "all 8 dropping together is upstream (corr TX or capture)."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Blind fraction -- % of real time not processed, per GPU half",
+        raw_query=(
+            'SELECT 100 - moving_average('
+            'non_negative_derivative(last("layer2_cube_count"), 1s), '
+            f'{_BLIND_SMOOTH_BUCKETS}) '
+            f'* {100.0 / _NOMINAL_CUBES_PER_S:.13f} '
+            'FROM "search_rt_noise" WHERE $timeFilter '
+            f'GROUP BY time({_BLIND_BUCKET_S}s), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="percent", y_min=-0.5, y_max=6,
+        legend_right=True, legend_values=True, fill=0, line_width=2,
+        thresholds=[
+            {"colorMode": "warning", "fill": False, "line": True,
+             "op": "gt", "value": _BLIND_WARN_PCT, "yaxis": "left"},
+            {"colorMode": "critical", "fill": False, "line": True,
+             "op": "gt", "value": _BLIND_CRIT_PCT, "yaxis": "left"},
+        ],
+        description=(
+            "The history behind the tiles: percent of real time each half "
+            "failed to process, against a "
+            f"{_NOMINAL_CUBES_PER_S:.5f} cubes/s target. Flat on 0 is "
+            "healthy. The y-axis is deliberately clamped to 6% -- the "
+            "whole point of this panel is that a 3% deficit must be "
+            "visible, and it is not on an axis that also has to show a "
+            "hard stall at 100%. Traces do leave the top; that is what the "
+            "tiles and the ingest panel are for.\n\n"
+            "non_negative_derivative, not derivative, so a process restart "
+            "(counter back to 0) is dropped rather than drawn as a single "
+            "enormous spike that flattens the interesting range. Smoothed "
+            f"over {_BLIND_SMOOTH_BUCKETS} x {_BLIND_BUCKET_S} s because the "
+            "cube counter is an integer and the unsmoothed trace steps by "
+            "+/-2.7% on a healthy half.\n\n"
+            "The right-most point always reads high: the trailing bucket is "
+            "partial, so its derivative is short. That artefact is inherent "
+            "to any bucketed rate and is why the tiles above use a "
+            "boundary-free first/last difference instead. Judge the trend "
+            "here, and the tiles for the current number."
+        ),
+    ))
+    _bump_y(7)
+
+    out.append(graph_panel(
+        title="Telemetry freshness -- points published per interval per half",
+        raw_query=(
+            'SELECT count("s_k_median") FROM "search_rt_noise" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(0)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=6, unit="short", y_min=0,
+        legend_right=True, fill=0, line_width=2,
+        description=(
+            "Liveness that survives a half going dark: fill(0) draws an "
+            "explicit zero instead of dropping the series, so a silent "
+            "half reads as a line on the floor rather than a missing "
+            "legend entry. Publish cadence is 2 s, so expect "
+            "interval_seconds/2 points per bucket."
+        ),
+    ))
+    out.append(graph_panel(
+        title="Noise agreement -- sigma_k median spread across the 8 halves",
+        raw_query=(
+            'SELECT max("s_k_median") - min("s_k_median") '
+            'FROM "search_rt_noise" WHERE $timeFilter '
+            'GROUP BY time($__interval) fill(null)'
+        ),
+        alias="max - min sigma_k median",
+        w=12, x=12, h=6, unit="short", y_min=0,
+        legend_right=True, fill=1, line_width=2,
+        extra_targets=[{
+            "alias": "cn $tag_cn_id g$tag_gpu_half",
+            "query": (
+                'SELECT mean("s_k_median") FROM "search_rt_noise" '
+                'WHERE $timeFilter '
+                'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+            ),
+        }],
+        description=(
+            "The 8 halves see statistically identical sky, so their "
+            "Layer-2 sigma_k medians track each other closely (2.847-2.850 "
+            "on 2026-08-02). The spread trace is the cheap scalar alarm: "
+            "one half drifting away means it is being fed different data "
+            "(partial fabric loss, stale cal, or a stuck buffer) even "
+            "though its cube counters still advance."
+        ),
+    ))
+    _bump_y(6)
+    return out
+
+
 def panels() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     out.append(row_panel("A. Fleet at-a-glance"))
@@ -359,6 +627,8 @@ def panels() -> List[Dict[str, Any]]:
         description="MJD of most recent C2 trigger over the last 24 h. Compare to current MJD to gauge staleness.",
     ))
     _bump_y(4)
+
+    out.extend(_search_gpu_health_panels())
 
     out.append(row_panel("B. Service heartbeats"))
     _bump_y(1)
@@ -692,11 +962,15 @@ def panels() -> List[Dict[str, Any]]:
         alias="cn $tag_cn_id g$tag_gpu_half",
         w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
         description=(
-            "Per-half cube-dump writer queue-full drops. Means the "
-            "writer thread couldn't keep up with the trigger fan-out "
-            "(slow disk, full /dataz, or the upstream BoundedCubeUploader "
-            "is back-pressuring). 0 is the only acceptable steady-state "
-            "value."
+            "Per-half cube-dump writer queue-full losses: the writer thread "
+            "couldn't keep up with the trigger fan-out (slow disk, full "
+            "/dataz, or the upstream BoundedCubeUploader back-pressuring).\n\n"
+            "Since 2026-08-06 this counts BOTH kinds of loss -- a displaced "
+            "dump is still a dump that never got written, so it appears "
+            "here too. Use the 'displaced vs plain drops' panel below to "
+            "tell them apart before reacting: a burst of drops that are all "
+            "auto-into-auto costs no vetted candidates, whereas displacement "
+            "means udp arrivals are contending for slots."
         ),
     ))
     _bump_y(7)
@@ -733,6 +1007,62 @@ def panels() -> List[Dict[str, Any]]:
         ),
     ))
     _bump_y(7)
+    out.append(graph_panel(
+        title="cube_dump lost dumps: displaced (recoverable) vs plain drops",
+        raw_query=(
+            'SELECT non_negative_derivative('
+            'mean("cube_dump_n_displaced"), 1s) '
+            'FROM "search_rt_dump" '
+            'WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="DISPLACED cn $tag_cn_id g$tag_gpu_half",
+        extra_targets=[{
+            "alias": "dropped cn $tag_cn_id g$tag_gpu_half",
+            "query": (
+                'SELECT non_negative_derivative('
+                'mean("cube_dump_n_dropped"), 1s) '
+                'FROM "search_rt_dump" '
+                'WHERE $timeFilter '
+                'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+            ),
+        }],
+        w=24, x=0, h=8, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Which kind of dump is being lost when the writer queue fills. "
+            "Read the two traces together -- DISPLACED is a SUBSET of "
+            "dropped, not a separate population, so displaced == dropped "
+            "means every loss was the good case and displaced == 0 with "
+            "dropped > 0 means every loss was the bad-ish case.\n\n"
+            "Background: each queue slot pins a whole ~1.1 GiB cube, so the "
+            "depth of 4 is a memory budget rather than a tuning knob and "
+            "cannot simply be raised. What matters is WHICH request loses. "
+            "A 'udp' dump has been through C1 -> C2 coincidence and survived "
+            "the cross-node vetoes, so it is a real multi-node candidate; an "
+            "'auto' dump is one half's local bright-pulse predicate firing "
+            "with no corroboration. Until 2026-08-06 a full queue dropped "
+            "the ARRIVAL, so a coincidence-confirmed candidate could be "
+            "discarded to keep four unvetted local ones -- and an "
+            "auto-trigger storm is exactly what fills the queue.\n\n"
+            "DISPLACED counts the times the writer instead evicted a queued "
+            "lower-value dump to admit a higher-value arrival. Those are "
+            "cheap losses: an unvetted auto cube gave way to a C2-confirmed "
+            "one.\n\n"
+            "Plain drops (dropped with displaced flat) mean there was "
+            "nothing cheaper to give up -- an auto arriving into a queue of "
+            "autos. That costs no vetted candidates and is normal during a "
+            "storm; 213 such drops with 0 displacements were recorded across "
+            "the fleet in the 25 min after the 2026-08-06 14:05 restart.\n\n"
+            "What to act on: a NON-ZERO displaced rate is the queue doing "
+            "its job, but a sustained one says udp arrivals are routinely "
+            "contending, which is the case where depth (and the memory to "
+            "pay for it) is worth revisiting. A high plain-drop rate points "
+            "at the auto-trigger side instead -- the bright-pulse "
+            "predicate's holdoff_ms throttles how fast autos can fire, and "
+            "that is the cheaper lever than a bigger queue."
+        ),
+    ))
+    _bump_y(8)
 
     out.append(row_panel("D. Capture pipeline (link rate + pps)"))
     _bump_y(1)

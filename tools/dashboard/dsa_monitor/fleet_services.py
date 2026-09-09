@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Final, Iterable
 
 from services_inventory import (
     CORR_HOSTS,
@@ -807,19 +807,36 @@ def _schedule_self_restart(
         }
 
 
-def _restart_hiplot_lxc(
+#: Local h23 user units that are NOT on the observing path: nice to have
+#: back up after a cold restart, but a failure here must not be reported as
+#: a failed fleet restart, hence best-effort in step 5.
+#:
+#: ``copydata.service`` is deliberately absent. It rsyncs into
+#: ``/dataz/dsa110/operations/T1/`` -- the legacy T1 trigger path, which
+#: nothing in dsart references (the live path is
+#: ``/dataz/dsa110/candidates``) -- from hosts that do not resolve
+#: (``h01/hh02/hh09/hh13.pro.pvt``; the search nodes are ``nNN.pro.pvt``).
+#: It has never worked, and restarting it just loops on rsync failures.
+SUPPORT_LOCAL_UNITS: Final[tuple[str, ...]] = (
+    "hiplot_c2.service",
+    "declination.service",
+)
+
+
+def _restart_local_support_units(
     *,
-    container: str = HOST_CALIBRATION23,
+    units: Iterable[str] = SUPPORT_LOCAL_UNITS,
     timeout: float = DEFAULT_SSH_TIMEOUT_S,
-) -> dict[str, Any]:
-    """``lxc exec calibration23 -- sudo -u ubuntu systemctl --user
-    restart hiplot.service``."""
-    return _lxc_run(
-        container,
-        "systemctl --user restart hiplot.service",
-        timeout=timeout,
-        user="ubuntu",
-    )
+) -> dict[str, dict[str, Any]]:
+    """``systemctl --user restart`` the non-observing h23 units.
+
+    Replaces the previous ``lxc exec calibration23 -- systemctl --user
+    restart hiplot.service``. That container was retired on 2026-07-31
+    (see ``services_inventory`` line for HOST_CALIBRATION23), so the old
+    call could only ever fail; hiplot now runs on h23 as
+    ``hiplot_c2.service``.
+    """
+    return _restart_local_user_units(units, timeout=timeout)
 
 
 def restart_all_services(
@@ -966,16 +983,20 @@ def restart_all_services(
             "per_unit": local_res,
         }
 
-    # Step 5: lxc exec calibration23 hiplot restart.
+    # Step 5: local support units (hiplot_c2, declination).
     if dry_run:
-        summary["steps"]["5_hiplot_restart"] = {"skipped": True}
+        summary["steps"]["5_support_units_restart"] = {
+            "skipped": True, "units": list(SUPPORT_LOCAL_UNITS),
+        }
     else:
-        h_res = _restart_hiplot_lxc(timeout=timeout_s)
-        # Best-effort: a missing container is logged but doesn't fail
-        # the overall job.
-        summary["steps"]["5_hiplot_restart"] = {
-            "ok": bool(h_res.get("ok")),
-            "result": h_res,
+        sup_res = _restart_local_support_units(timeout=timeout_s)
+        # Best-effort by design: see SUPPORT_LOCAL_UNITS. These are off the
+        # observing path, so a failure is surfaced per-unit but does NOT
+        # set summary["ok"] -- otherwise a USB unmount would make a
+        # perfectly good fleet restart report as failed.
+        summary["steps"]["5_support_units_restart"] = {
+            "ok": all(r.get("ok") for r in sup_res.values()),
+            "per_unit": sup_res,
             "best_effort": True,
         }
 

@@ -786,6 +786,36 @@ class CubeDumpManifest:
     npz_path: str
     search_node_id: int
     gpu_half: int
+    #: TRUE spec num / MJD at cube sample 0 (2026-08-04).
+    #:
+    #: ``event_specnum_start`` above is documented as sample 0, and is
+    #: that on the auto/udp paths -- but
+    #: ``dump/c2_trigger_listener._build_manifest`` overwrites it with
+    #: ``packet.event_specnum`` (the TRIGGER specnum) because the NPZ
+    #: filename is composed from it and C3 + the dashboards glob on
+    #: ``cube_s*_g*_<trigger_specnum>.npz``. The consequence is that in
+    #: every archived C2-triggered dump ``(event_specnum -
+    #: event_specnum_start) / sample_period_specnum == 0``, so the
+    #: detector's own in-cube time index is unrecoverable offline and the
+    #: cube's phase relative to the 128-search-sample corr blocks cannot
+    #: be computed. That has now blocked two separate investigations
+    #: (placing the burst in 260801rmep/bdga, and testing whether
+    #: 260804jbpj's t=203 break lands on a corr-block seam).
+    #:
+    #: Rather than repurpose ``event_specnum_start`` and break the
+    #: filename contract, these carry the real anchor. ``None`` on
+    #: manifests built before this existed; readers must fall back.
+    cube_specnum_start: Optional[int] = None
+    cube_mjd_start: Optional[float] = None
+    #: spec-nums per detector sample, needed to turn the anchor into a
+    #: time index: ``t = (event_specnum - cube_specnum_start) //
+    #: sample_period_specnum``. Recorded rather than assumed because it
+    #: is derived from the live op-point (t_int_search_us /
+    #: t_int_fast_us) -- CubeGeometry's docstring still says "= 16 in
+    #: production", which was true when t_int_fast_native was 2; at the
+    #: current 32 it is 1. Guessing it silently scales every offline
+    #: time index by 16x.
+    sample_period_specnum: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not DSART_TEST:

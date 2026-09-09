@@ -176,6 +176,22 @@ def _cached_by_source() -> Dict[str, Dict[str, Any]]:
     return data
 
 
+def prime_descriptor_cache() -> None:
+    """Kick the first descriptor scan off the request path.
+
+    Without this the cache is only ever filled by the first request that
+    finds it stale -- and that request returns *before* the background
+    scan finishes, so every source renders with no generated solution.
+    After a dashboard restart the /sefds page therefore shows "no
+    generated bf weights solutions" for every calibrator until someone
+    loads it a second time, which reads as missing data rather than a
+    cold cache. Same reasoning as the burst-index warmer in app.py.
+
+    Non-blocking and single-flight, so calling it at startup is free.
+    """
+    _refresh_descriptors_async()
+
+
 def latest_descriptor(source: str) -> Optional[Dict[str, Any]]:
     """Newest ``<SRC>_<ISOT>`` descriptor for one calibrator, or None.
 

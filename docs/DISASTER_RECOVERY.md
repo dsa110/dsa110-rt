@@ -290,3 +290,31 @@ Outline:
    (`GRAFANA_AUTH` in `~/.dsart/secrets.env` on h23). The `dsartRtMpV1`
    dashboard re-imports from
    `tools/dashboard/dsart_rt_to_influx/grafana/dsart_rt_dashboard.json`.
+
+   **Since 2026-08-03 you should not need the 2019 tarball.** That
+   `grafana.db` was seven years stale — every dashboard edit since then
+   lived only in the live sqlite DB on one host, and `dsartRtMpV1` was the
+   sole board under version control. `tools/ops/backup_grafana.sh` now runs
+   nightly from h23 (10:30 UTC, user crontab, `logger -t backup_grafana`)
+   and writes to `/dataz/dsa110/dr_archive/grafana/<UTC-stamp>/` with a
+   `latest` symlink and 14-day retention:
+
+   | artifact | restores |
+   | --- | --- |
+   | `dashboards/<uid>__<slug>.json` | one file per dashboard, via `POST /api/dashboards/db` |
+   | `datasources.json` | datasource definitions (passwords redacted by Grafana) |
+   | `grafana_db.sql.gz` | everything — users, orgs, prefs, alerts, datasource secrets: `zcat … \| sqlite3 grafana.db` |
+
+   Per-run restore commands are written into each backup's `MANIFEST.txt`.
+   It runs on h23 rather than h20 on purpose: h23 is where `GRAFANA_AUTH`
+   lives, `/dataz/…/dr_archive` is not writable from inside the h20
+   container (LXD uid mapping), and a backup kept on the host being backed
+   up is not a backup. The tree is `0700` — the sql dump carries datasource
+   secrets and the admin password hash.
+
+   Note h20 has Python 3.6 and no `sqlite3` CLI, so the dump uses
+   `iterdump()` on a read-only handle inside a read transaction; neither
+   `VACUUM INTO` (SQLite ≥ 3.27, h20 has 3.22) nor
+   `sqlite3.Connection.backup()` (Python ≥ 3.7) is available there. If the
+   ssh to h20 fails the dashboards are still captured and the run still
+   succeeds — only the `db_dump: no` line in the manifest changes.

@@ -165,11 +165,58 @@ def _run(cmd: List[str], timeout_s: float) -> Dict[str, Any]:
                 "elapsed_s": round(time.monotonic() - t0, 1)}
 
 
-#: The corr dump window is [target-8, target+14] blocks, so the sample
-#: the C2 specnum (and t_peak_mjd) references sits 8 blocks into the
-#: file; tstart = t_peak - 8 blocks.
-N_PRE_BLOCKS = 8
+#: Fallback dump-window geometry. The voltage manifests are
+#: AUTHORITATIVE (``block_mjd_first``) and are used whenever present;
+#: these constants only cover a missing/unreadable manifest.
+#:
+#: 2026-08-26: N_PRE_BLOCKS was 8, with a comment asserting the window is
+#: [target-8, target+14]. Every manifest actually records n_pre=14 /
+#: n_post=8 -- the pair was transposed -- so the .fil tstart was written
+#: 6 blocks (0.805 s) LATE on every event, and any tool comparing the
+#: header time axis against the C2 MJD looked in the wrong place.
+#: Measured header offsets on four events: 0.823 / 0.835 / 0.877 /
+#: 0.890 s, i.e. 0.805 s plus the intra-block residual of the target
+#: sample. Reading the manifest removes the assumption entirely.
+N_PRE_BLOCKS = 14
 BLOCK_S = 0.134217728
+
+#: Full-band .fil geometry the toolkit writes (dsa110-bbproc bbproc.h).
+FIL_FCH1_MHZ = 1498.75
+FIL_FOFF_MHZ = -0.030517578125
+FIL_NCHAN = 6144
+
+#: Dispersion constant in ms, for DM in pc/cc and frequencies in MHz
+#: (i.e. 4.148808 ms with frequencies in GHz, scaled by 1e6).
+DISP_MS_MHZ = 4.148808e6
+
+
+def _sweep_s(dm: float) -> float:
+    """Dispersion delay across the full .fil band, in seconds."""
+    f_hi = FIL_FCH1_MHZ
+    f_lo = FIL_FCH1_MHZ + (FIL_NCHAN - 1) * FIL_FOFF_MHZ
+    return (
+        DISP_MS_MHZ * float(dm) * (f_lo ** -2.0 - f_hi ** -2.0) / 1e3
+    )
+
+
+def _tstart_from_manifest(volt_dir: Path, name: str) -> Optional[float]:
+    """First-block MJD from the voltage manifests, or None.
+
+    Every per-subband manifest carries the same ``block_mjd_first``; take
+    the first readable one. This is exact and survives any future change
+    to the pre/post block split, which the constants above cannot.
+    """
+    if not volt_dir.is_dir():
+        return None
+    for p in sorted(volt_dir.glob(f"{name}_sb??.json")):
+        try:
+            with p.open("r") as fh:
+                v = (json.load(fh) or {}).get("block_mjd_first")
+            if v is not None:
+                return float(v)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+    return None
 
 
 def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
@@ -204,9 +251,32 @@ def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
         report.update({"n_fragments": n_frags, "l": l, "m": m, "dm": dm,
                        "width_fil_samples": width_fil, "dec_deg": dec_deg})
         t_peak_mjd = c2row.get("t_peak_mjd")
-        tstart_mjd = (
-            float(t_peak_mjd) - N_PRE_BLOCKS * BLOCK_S / 86400.0
-        ) if t_peak_mjd else None
+        tstart_mjd = _tstart_from_manifest(volt_dir, name)
+        tstart_source = "manifest"
+        if tstart_mjd is None and t_peak_mjd:
+            tstart_mjd = (
+                float(t_peak_mjd) - N_PRE_BLOCKS * BLOCK_S / 86400.0)
+            tstart_source = "computed_fallback"
+        report["tstart_mjd"] = tstart_mjd
+        report["tstart_source"] = (
+            tstart_source if tstart_mjd is not None else None)
+
+        # Candidate position in the DEDISPERSED series, seconds from file
+        # start, for plot_fil's --t0. plot_fil dedisperses to the top of
+        # the band (fref = freqs.max()), while the C2 t_peak_mjd is
+        # referenced to the BOTTOM, so the burst lands one full sweep
+        # earlier. Verified on 260824utbu (DM 367.2: measured -0.204 s vs
+        # sweep 0.208 s) and 260822iyhi (DM 631.1: -0.356 vs 0.357).
+        # Without --t0 plot_fil marks the global max instead, which on a
+        # non-detection is just the largest noise excursion -- exactly how
+        # 260825ptxu came to be labelled "peak S/N 3.6 at 1.3034 s".
+        t0_s: Optional[float] = None
+        if tstart_mjd is not None and t_peak_mjd:
+            t0_s = (
+                (float(t_peak_mjd) - float(tstart_mjd)) * 86400.0
+                - _sweep_s(dm)
+            )
+            report["t0_s"] = t0_s
 
         cal_sb00 = snapshot_cal(cfg.cal_applied_dir, fb_dir / "cal")
         if cal_sb00 is not None:
@@ -245,10 +315,13 @@ def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
             runs.append(r)
             if r.get("rc") == 0 and fil.is_file():
                 outputs.append(fil.name)
-                pr = _run([sys.executable, cfg.plot_script, str(fil),
-                           "--dm", repr(dm), "--width", str(width_fil),
-                           "--event", name, "--lm", repr(l), repr(m),
-                           "--out", str(png)], 600.0)
+                plot_cmd = [sys.executable, cfg.plot_script, str(fil),
+                            "--dm", repr(dm), "--width", str(width_fil),
+                            "--event", name, "--lm", repr(l), repr(m),
+                            "--out", str(png)]
+                if t0_s is not None and t0_s > 0.0:
+                    plot_cmd += ["--t0", repr(t0_s)]
+                pr = _run(plot_cmd, 600.0)
                 runs.append(pr)
                 if pr.get("rc") == 0 and png.is_file():
                     outputs.append(png.name)

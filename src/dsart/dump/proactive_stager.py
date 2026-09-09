@@ -290,13 +290,23 @@ class ProactiveCubeStager:
                 return False
 
         specnum_start = int(specnum_start)
-        end_excl = specnum_start + int(t_det) * int(sample_period_specnum)
+        # The staged cube covers SEARCH samples [specnum_start,
+        # specnum_start + t_det) — the anchor and a C1 row's
+        # event_specnum are in the same units, so t_det is the whole
+        # span (see cube_pipeline.find_cube_for_specnum). Multiplying by
+        # sample_period_specnum made the claim window 16x too wide at
+        # the production op-point, so a late C2 trigger for an event in
+        # a LATER cube could be matched to this one.
+        end_excl = specnum_start + int(t_det)
         pending_dir = self._pending_dir(specnum_start)
         npz_path = pending_dir / self._npz_name(specnum_start)
         manifest = CubeDumpManifest(
             cube_id=int(cube_id),
             event_specnum_start=specnum_start,
             mjd_start=float(mjd_start),
+            cube_specnum_start=specnum_start,
+            cube_mjd_start=float(mjd_start),
+            sample_period_specnum=int(sample_period_specnum),
             t_det=int(t_det),
             n_fdm_in_cube=int(n_fdm_in_cube),
             n_grid=int(n_grid),

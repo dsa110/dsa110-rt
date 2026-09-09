@@ -403,3 +403,486 @@ def test_plot_worker_dedupes_inflight(tmp_path: Path) -> None:
         fut2.result(timeout=30.0)
     finally:
         worker.shutdown(wait=True)
+
+
+# ---------------------------------------------------------------------------
+# Detector-matched boxcar smoothing (2026-08-02)
+# ---------------------------------------------------------------------------
+
+
+def test_boxcar_is_unit_variance_and_pass_through_at_w1() -> None:
+    """The 1/sqrt(w) normalisation keeps white noise at unit variance, so
+    the smoothed series stays in the detector's sigma units."""
+    from dsart.coinc.plotter import _boxcar
+
+    rng = np.random.default_rng(20260802)
+    x = rng.normal(size=20000).astype(np.float32)
+    assert _boxcar(x, 1) is not x or True          # w<=1 is a pass-through
+    np.testing.assert_allclose(_boxcar(x, 1), x, rtol=0, atol=0)
+    for w in (2, 8, 16):
+        y = _boxcar(x, w)
+        # Trim the convolution edges before measuring.
+        assert abs(float(np.std(y[w:-w])) - 1.0) < 0.05, w
+
+
+def test_boxcar_recovers_a_wide_burst_the_raw_argmax_smears() -> None:
+    """A w-sample burst buried in noise: the width-matched series must
+    both find it and score it far above the unsmoothed one."""
+    from dsart.coinc.plotter import _boxcar, _robust_z
+
+    rng = np.random.default_rng(7)
+    n, w, t0 = 512, 16, 200
+    x = rng.normal(size=n).astype(np.float32)
+    x[t0:t0 + w] += 1.2                       # 1.2 sigma/sample => ~4.8 total
+    z_raw = _robust_z(x)
+    z_box = _robust_z(_boxcar(x, w))
+    # The matched peak lands inside the burst; the raw argmax need not.
+    assert t0 <= int(np.argmax(z_box)) < t0 + w
+    # Matched filter recovers ~1.2 * sqrt(16) = 4.8 sigma; the raw series
+    # can only ever show one sample's worth (1.2 sigma) plus whatever
+    # noise sample happens to sit highest inside the burst (~2 sigma for
+    # 16 draws), so the gap is real but not the full sqrt(w).
+    assert float(z_box.max()) > 4.3
+    assert float(z_box.max()) > 1.3 * float(z_raw[t0:t0 + w].max())
+
+
+def test_robust_z_survives_a_degenerate_mad() -> None:
+    """A mostly-constant series (sparse synthetic cube) must still yield
+    a usable argmax instead of collapsing to all-zeros."""
+    from dsart.coinc.plotter import _robust_z
+
+    x = np.zeros(16, dtype=np.float32)
+    x[9] = 5.0
+    z = _robust_z(x)
+    assert int(np.argmax(z)) == 9
+    assert float(z.max()) > 0.0
+    # Genuinely constant -> zeros, no spurious peak.
+    assert not np.any(_robust_z(np.full(16, 3.0, dtype=np.float32)))
+
+
+def test_burst_coords_reports_detector_and_cube_snrs(tmp_path: Path) -> None:
+    """`_burst_coords` must carry BOTH the detector's SNR and its own
+    cube re-measurement (smoothed and unsmoothed) so the panels can
+    print the difference."""
+    cubes_dir = tmp_path / "cubes"
+    _write_fake_cubes(cubes_dir)
+    cubes = _load_cubes(cubes_dir)
+    try:
+        job = PlotJob(
+            event_name="260802snr0", archive_root=tmp_path,
+            stats=_stats(), members=tuple(_members()),
+        )
+        peak, _ = _resolve_burst(job)
+        burst = _select_burst_chunk(cubes, peak)
+        coords = _burst_coords(burst, _burst_waterfall(burst), peak)
+        assert coords is not None
+        # Detector value is passed through untouched...
+        assert coords.snr == pytest.approx(BURST_SNR)
+        # ...and the cube re-measurement is a separate, finite number.
+        assert np.isfinite(coords.snr_measured)
+        assert np.isfinite(coords.snr_measured_raw)
+        assert coords.snr_delta == pytest.approx(
+            BURST_SNR - coords.snr_measured
+        )
+        # The boxcar is the detector's own width for the peak member.
+        assert coords.boxcar == 2
+        assert coords.t_idx_raw is not None
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_smoothing_can_be_disabled_by_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DSART_PLOTTER_SMOOTH=0 restores the pre-2026-08-02 raw argmax."""
+    cubes_dir = tmp_path / "cubes"
+    _write_fake_cubes(cubes_dir)
+    cubes = _load_cubes(cubes_dir)
+    try:
+        job = PlotJob(
+            event_name="260802nosm", archive_root=tmp_path,
+            stats=_stats(), members=tuple(_members()),
+        )
+        peak, _ = _resolve_burst(job)
+        burst = _select_burst_chunk(cubes, peak)
+        wf = _burst_waterfall(burst)
+        monkeypatch.setenv("DSART_PLOTTER_SMOOTH", "0")
+        coords = _burst_coords(burst, wf, peak)
+        assert coords is not None and coords.boxcar == 1
+        # With no smoothing the two measurements coincide.
+        assert coords.snr_measured == pytest.approx(coords.snr_measured_raw)
+    finally:
+        for c in cubes:
+            c.close()
+
+
+# ---------------------------------------------------------------------------
+# Cube sample-0 anchor (2026-08-04; units corrected 2026-08-06)
+# ---------------------------------------------------------------------------
+#
+# Units contract under test (plotter._metadata_t_idx):
+#
+#     t_in_cube = event_specnum - cube_specnum_start
+#
+# BOTH operands count SEARCH samples, so this is a plain subtraction.
+# `sample_period_specnum` is native SNAP specnums per search sample (16 at
+# the production op-point) and is NOT a divisor.
+#
+# These fixtures are deliberately production-shaped — period 16, ~9.18e6
+# anchors, t_det >= the 192-sample production cube — and every expectation
+# is derived from the PLANTED offset, never from the expression under
+# test. The pre-2026-08-06 tests synthesised `event_specnum = anchor +
+# t * period`, i.e. they encoded the buggy convention on both sides and
+# so could not fail.
+
+# Production op-point: 16 native 65.536 µs specnums per 1048.576 µs search
+# sample; cubes are 192 search samples long and advance by
+# cube_cadence_samples = 192.
+PROD_PERIOD_SPECNUM = 16
+PROD_T_DET = 192
+# A realistic sample-0 anchor: search-sample counts on a live node are
+# O(1e7) a couple of hours into a run.
+PROD_ANCHOR = 9_180_416
+
+
+def _write_anchored_cube(
+    cubes_dir: Path, *, sid: int, g: int, trigger_specnum: int,
+    cube_specnum_start: int, sample_period_specnum: int, burst_t: int,
+    t_det: int = T_DET, mjd_start: float = 60781.0,
+    cube_mjd_start: float | None = 60781.0,
+) -> None:
+    """One NPZ carrying the TRUE sample-0 anchor, with the burst planted
+    somewhere OTHER than where the anchor points, so a test can tell
+    which route placed the panels.
+
+    ``cube_mjd_start=None`` writes the NaN sentinel the writer uses for
+    a dump that has no honest sample-0 MJD.
+    """
+    cubes_dir.mkdir(parents=True, exist_ok=True)
+    cube = np.full((t_det, N_FDM, N_GRID, N_GRID), 0.1, dtype=np.float16)
+    cube[burst_t, BURST_FDM, BURST_L, BURST_M] = 40.0
+    np.savez(
+        cubes_dir / f"cube_s{sid}_g{g}_{trigger_specnum}.npz",
+        cube=cube,
+        peak_grid=cube.max(axis=(2, 3)),
+        mjd_start=np.asarray(mjd_start, dtype="float64"),
+        event_specnum_start=np.asarray(trigger_specnum, dtype="int64"),
+        cube_specnum_start=np.asarray(cube_specnum_start, dtype="int64"),
+        cube_mjd_start=np.asarray(
+            float("nan") if cube_mjd_start is None else cube_mjd_start,
+            dtype="float64",
+        ),
+        sample_period_specnum=np.asarray(sample_period_specnum, dtype="int32"),
+        t_det=np.asarray(t_det, dtype="int32"),
+        n_fdm_in_cube=np.asarray(N_FDM, dtype="int32"),
+        n_grid=np.asarray(N_GRID, dtype="int32"),
+        cluster_record=np.asarray("null", dtype="U"),
+        trigger_source=np.asarray("udp", dtype="U"),
+        search_node_id=np.asarray(sid, dtype="int32"),
+        gpu_half=np.asarray(g, dtype="int32"),
+    )
+
+
+def test_anchor_is_read_off_the_npz(tmp_path: Path) -> None:
+    from dsart.coinc.plotter import _load_cubes
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=PROD_ANCHOR + 3,
+        cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=3,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        assert len(cubes) == 1
+        assert cubes[0].cube_specnum_start == PROD_ANCHOR
+        assert cubes[0].sample_period_specnum == PROD_PERIOD_SPECNUM
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_uses_the_anchor_when_present(tmp_path: Path) -> None:
+    """t = event_specnum - cube_specnum_start, no division.
+
+    Ground truth: the trigger is planted BURST_T samples after the
+    anchor, so the answer must be BURST_T — and explicitly not
+    BURST_T // sample_period_specnum, which is what the divisor bug
+    (c60556b .. 2026-08-06) returned.
+    """
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    burst_t = BURST_T
+    trigger = PROD_ANCHOR + burst_t
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=trigger, cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=burst_t,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        import dataclasses
+        # the fixture's peak member carries event_specnum=200; point it at
+        # the value this cube was written for
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=trigger,
+        )
+        assert _metadata_t_idx(cubes[0], peak) == burst_t
+        # The divisor reading would have collapsed this to 0.
+        assert _metadata_t_idx(cubes[0], peak) != burst_t // PROD_PERIOD_SPECNUM
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_anchor_places_the_panels_on_the_planted_burst(tmp_path: Path) -> None:
+    """End-to-end regression for the 2026-08-04..06 misplacement.
+
+    A production-shaped cube (t_det=192, period=16) with the burst planted
+    at t=118 and the trigger specnum at anchor+118. The full
+    load -> waterfall -> _burst_coords path must land on 118, and the cube
+    value there must be the planted amplitude — the divisor bug placed it
+    at 118 // 16 = 7, on a noise plane.
+    """
+    from dsart.coinc.plotter import (
+        _burst_coords, _burst_waterfall, _load_cubes, _peak_from_members,
+        _select_burst_chunk,
+    )
+    import dataclasses
+
+    anchor = 82_556_992
+    burst_t = 118
+    trigger = 82_557_110          # = anchor + 118, planted, not computed
+    assert trigger - anchor == burst_t
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=trigger, cube_specnum_start=anchor,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=burst_t,
+        t_det=PROD_T_DET,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=trigger,
+        )
+        chunk = _select_burst_chunk(cubes, peak)
+        coords = _burst_coords(chunk, _burst_waterfall(chunk), peak)
+        assert coords is not None
+        assert coords.t_from_anchor is True
+        assert coords.t_idx == burst_t
+        assert coords.t_idx != burst_t // PROD_PERIOD_SPECNUM
+        # ...and the panel really is pointed at the planted signal.
+        assert float(
+            chunk.cube[coords.t_idx, coords.fdm_idx,
+                       coords.l_pix, coords.m_pix]
+        ) == pytest.approx(40.0, abs=0.1)
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_declines_on_a_native_specnum_anchor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If a future writer ever emits NATIVE SNAP specnums, the delta comes
+    out ~16x too large. That is a units-contract change, not something to
+    paper over with a divisor — decline loudly and let the argmax run."""
+    import logging
+    import dataclasses
+
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    anchor = 82_556_992
+    burst_t = 118
+    # Native units: the delta is period x the true sample offset.
+    trigger = anchor + burst_t * PROD_PERIOD_SPECNUM
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=trigger, cube_specnum_start=anchor,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=burst_t,
+        t_det=PROD_T_DET,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=trigger,
+        )
+        with caplog.at_level(logging.ERROR, logger="dsart.coinc.plotter"):
+            assert _metadata_t_idx(cubes[0], peak) is None
+        assert any(
+            r.levelno >= logging.ERROR and "NATIVE" in r.getMessage()
+            for r in caplog.records
+        ), caplog.text
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_declines_on_pre_anchor_dumps(tmp_path: Path) -> None:
+    """Older NPZs have no cube_specnum_start; the sentinel must make the
+    plotter fall back to the width-matched argmax rather than silently
+    placing every panel at t=0."""
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    _write_fake_cubes(tmp_path / "cubes")          # legacy writer, no anchor
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        peak = _peak_from_members(_members())
+        for c in cubes:
+            assert c.cube_specnum_start == -1
+            assert _metadata_t_idx(c, peak) is None
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_metadata_t_idx_rejects_an_out_of_range_index(tmp_path: Path) -> None:
+    """A corrupt or mismatched anchor must not place a panel outside the
+    cube — it should decline and let the argmax path run."""
+    from dsart.coinc.plotter import _load_cubes, _metadata_t_idx, _peak_from_members
+
+    _write_anchored_cube(
+        tmp_path / "cubes", sid=BURST_SID, g=BURST_G, trigger_specnum=999999,
+        cube_specnum_start=0, sample_period_specnum=1, burst_t=3,
+    )
+    cubes = _load_cubes(tmp_path / "cubes")
+    try:
+        import dataclasses
+        peak = dataclasses.replace(
+            _peak_from_members(_members()), event_specnum=999999,
+        )
+        assert _metadata_t_idx(cubes[0], peak) is None
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_load_cubes_prefers_cube_mjd_start_over_mjd_start(
+    tmp_path: Path,
+) -> None:
+    """`mjd_start` in a C2-triggered dump tracks the TRIGGER specnum;
+    `cube_mjd_start` is the honest sample-0 MJD, so a finite value of it
+    must win. NaN (pre-2026-08-04 dumps) falls back."""
+    from dsart.coinc.plotter import _load_cubes
+
+    true_sample0_mjd = 60781.25
+    _write_anchored_cube(
+        tmp_path / "finite", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=PROD_ANCHOR + 3, cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=3,
+        mjd_start=60781.0, cube_mjd_start=true_sample0_mjd,
+    )
+    cubes = _load_cubes(tmp_path / "finite")
+    try:
+        assert cubes[0].cube_mjd_start == pytest.approx(true_sample0_mjd)
+        assert cubes[0].mjd_start == pytest.approx(true_sample0_mjd)
+    finally:
+        for c in cubes:
+            c.close()
+
+    _write_anchored_cube(
+        tmp_path / "nan", sid=BURST_SID, g=BURST_G,
+        trigger_specnum=PROD_ANCHOR + 3, cube_specnum_start=PROD_ANCHOR,
+        sample_period_specnum=PROD_PERIOD_SPECNUM, burst_t=3,
+        mjd_start=60781.0, cube_mjd_start=None,
+    )
+    cubes = _load_cubes(tmp_path / "nan")
+    try:
+        assert np.isnan(cubes[0].cube_mjd_start)
+        assert cubes[0].mjd_start == pytest.approx(60781.0)
+    finally:
+        for c in cubes:
+            c.close()
+
+
+def test_provenance_is_silent_on_the_healthy_anchor_path() -> None:
+    """The default/healthy path (time from the cube's own anchor) gets
+    no placement tag at all — only the two fallbacks are flagged."""
+    import dataclasses
+
+    from dsart.coinc.plotter import _BurstCoords, _provenance
+
+    healthy = _BurstCoords(
+        t_idx=10, fdm_idx=0, l_pix=1, m_pix=1, dm_pc_cc=100.0, snr=10.0,
+        width_samples=4, n_fdm=1, t_det=20, from_metadata=True,
+        t_from_anchor=True,
+    )
+    assert _provenance(healthy) == ""
+
+    relocated = dataclasses.replace(healthy, t_from_anchor=False)
+    assert _provenance(relocated) == " · re-searched in cube"
+
+    no_meta = dataclasses.replace(healthy, from_metadata=False)
+    assert _provenance(no_meta) == (
+        " · no detector info — showing brightest pixel"
+    )
+
+
+def test_snr_note_reports_the_cube_re_measurement_and_delta() -> None:
+    """``Δ`` is detector SNR minus the cube re-measurement, with a
+    proper minus sign for negative deltas; omitted when there is no
+    cube re-measurement to compare against."""
+    from dsart.coinc.plotter import _BurstCoords, _snr_note
+
+    coords = _BurstCoords(
+        t_idx=10, fdm_idx=0, l_pix=1, m_pix=1, dm_pc_cc=100.0, snr=35.7,
+        width_samples=2, n_fdm=1, t_det=20, from_metadata=True,
+        snr_measured=38.4, snr_measured_raw=25.1, boxcar=2,
+    )
+    assert _snr_note(coords) == " · 38.4σ (archived cube) · Δ = −2.7σ"
+
+    no_measurement = _BurstCoords(
+        t_idx=10, fdm_idx=0, l_pix=1, m_pix=1, dm_pc_cc=100.0, snr=10.0,
+        width_samples=0, n_fdm=1, t_det=20, from_metadata=False,
+    )
+    assert _snr_note(no_measurement) == ""
+
+
+def test_title_line_is_fitted_to_the_pinned_axes_box() -> None:
+    """The diagnostic title line shrinks to fit, but stays legible.
+
+    The dm_time/image_peak axes box is pinned (``_PANEL_RECT``) so the
+    two panels align pixel-for-pixel, so the second title line — which
+    grows as ``_snr_note`` gains diagnostics — has to be fitted to it
+    rather than clipped at the figure edge.
+    """
+    import matplotlib.pyplot as plt
+
+    from dsart.coinc.plotter import (
+        _PANEL_RECT,
+        _SUBTITLE_FONTSIZE,
+        _SUBTITLE_FONTSIZE_MIN,
+        _fit_title_line,
+    )
+
+    short = "detected pixel (l,m)=(128,131)"
+    long = (
+        "DM 1702.6 pc cm⁻³ · SNR 135.7 (detector) · 138.4σ "
+        "(archived cube) · Δ = −12.6σ · re-searched in cube"
+    )
+    absurd = long + " " + long + " " + long
+
+    fig = plt.figure(figsize=(10.0, 9.0))
+    try:
+        ax = fig.add_axes(_PANEL_RECT)
+        renderer = fig.canvas.get_renderer()
+        avail = ax.get_window_extent(renderer).width
+
+        # A short line is left at the maximum size.
+        artist = _fit_title_line(fig, ax, short)
+        assert artist.get_fontsize() == _SUBTITLE_FONTSIZE
+        artist.remove()
+
+        # A realistic worst-case line is shrunk, and it fits.
+        artist = _fit_title_line(fig, ax, long)
+        assert artist.get_fontsize() < _SUBTITLE_FONTSIZE
+        assert artist.get_window_extent(renderer).width <= avail
+        artist.remove()
+
+        # Nothing shrinks past the legibility floor.
+        artist = _fit_title_line(fig, ax, absurd)
+        assert artist.get_fontsize() == _SUBTITLE_FONTSIZE_MIN
+    finally:
+        plt.close(fig)

@@ -34,6 +34,7 @@ os.environ["DSART_TEST"] = "1"
 
 import dataclasses  # noqa: E402
 import json  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -620,3 +621,134 @@ def test_writer_submit_after_stop_raises(tmp_path: Path) -> None:
     writer.stop()
     with pytest.raises(RuntimeError, match="after stop"):
         writer.submit(cube=_make_cube(), manifest=_make_manifest())
+
+
+# ---------------------------------------------------------------------------
+# Queue-full displacement (2026-08-06)
+# ---------------------------------------------------------------------------
+#
+# The queue is shallow because each slot pins a ~1.1 GiB cube, so depth is a
+# memory budget and not the lever. The lever is which request loses when a
+# burst arrives: a ``udp`` dump has been through C1 -> C2 coincidence and
+# survived cross-node vetoes, an ``auto`` dump is one half's local predicate
+# firing with no corroboration. These tests pin that ordering, and that a
+# displaced dump's ring pin is released -- if it were not, the slot would stay
+# pinned for the life of the process.
+
+
+def _blocked_writer(tmp_path: Path, *, queue_maxsize: int = 2):
+    """A writer whose drain loop is wedged, so the queue can be filled."""
+    gate = threading.Event()
+    writer = _started_writer(tmp_path, queue_maxsize=queue_maxsize)
+    original = writer._write_one
+
+    def _slow(cube, manifest):            # noqa: ANN001 - test shim
+        gate.wait(timeout=10.0)
+        return original(cube, manifest)
+
+    writer._write_one = _slow             # type: ignore[assignment]
+    return writer, gate
+
+
+def test_udp_displaces_queued_auto_when_full(tmp_path: Path) -> None:
+    writer, gate = _blocked_writer(tmp_path, queue_maxsize=2)
+    try:
+        released: list[int] = []
+        # Wedge the writer on the first item, then fill every queue slot with
+        # auto dumps so the next submit must contend. Every submit carries an
+        # on_complete, because whichever one ends up at the head is the one
+        # that gets displaced and we assert its pin is released.
+        assert writer.submit(
+            cube=_make_cube(), manifest=_make_manifest(cube_id=0),
+            on_complete=lambda: released.append(0),
+        )
+        accepted = 0
+        for i in range(1, 12):
+            ok = writer.submit(
+                cube=_make_cube(),
+                manifest=_make_manifest(trigger_source="auto", cube_id=i),
+                on_complete=lambda i=i: released.append(i),
+            )
+            accepted += int(ok)
+            if not ok:
+                break
+        assert writer.n_dropped >= 1, "expected the queue to fill"
+        drops_before = writer.n_dropped
+
+        # A C2-confirmed dump must now displace a queued auto rather than be
+        # refused, and the displaced item's ring pin must be released.
+        assert writer.submit(
+            cube=_make_cube(),
+            manifest=_make_manifest(
+                trigger_source="udp", cluster_record=None, cube_id=99,
+            ),
+        ) is True
+        assert writer.n_displaced == 1
+        # A displaced dump still did not get written, so it counts in both.
+        assert writer.n_dropped == drops_before + 1
+        assert released, "displaced dump must release its ring slot pin"
+    finally:
+        gate.set()
+        writer.stop()
+
+
+def test_auto_does_not_displace_anything(tmp_path: Path) -> None:
+    """An auto dump is the lowest value, so it can never evict."""
+    writer, gate = _blocked_writer(tmp_path, queue_maxsize=2)
+    try:
+        assert writer.submit(cube=_make_cube(), manifest=_make_manifest())
+        while writer.submit(
+            cube=_make_cube(), manifest=_make_manifest(trigger_source="auto"),
+        ):
+            pass
+        before = writer.n_dropped
+        assert writer.submit(
+            cube=_make_cube(), manifest=_make_manifest(trigger_source="auto"),
+        ) is False
+        assert writer.n_displaced == 0
+        assert writer.n_dropped == before + 1
+    finally:
+        gate.set()
+        writer.stop()
+
+
+def test_udp_does_not_displace_a_queued_udp(tmp_path: Path) -> None:
+    """Equal value must not churn the queue -- first come, first served."""
+    writer, gate = _blocked_writer(tmp_path, queue_maxsize=2)
+    try:
+        udp = dict(trigger_source="udp", cluster_record=None)
+        assert writer.submit(cube=_make_cube(), manifest=_make_manifest(**udp))
+        while writer.submit(cube=_make_cube(), manifest=_make_manifest(**udp)):
+            pass
+        before = writer.n_dropped
+        assert writer.submit(
+            cube=_make_cube(), manifest=_make_manifest(**udp),
+        ) is False
+        assert writer.n_displaced == 0
+        assert writer.n_dropped == before + 1
+    finally:
+        gate.set()
+        writer.stop()
+
+
+def test_displacement_leaves_the_queue_drainable(tmp_path: Path) -> None:
+    """After a displacement the survivors and the arrival all still write."""
+    writer, gate = _blocked_writer(tmp_path, queue_maxsize=2)
+    try:
+        assert writer.submit(cube=_make_cube(), manifest=_make_manifest())
+        while writer.submit(
+            cube=_make_cube(), manifest=_make_manifest(trigger_source="auto"),
+        ):
+            pass
+        writer.submit(
+            cube=_make_cube(),
+            manifest=_make_manifest(
+                trigger_source="udp", cluster_record=None, cube_id=7,
+            ),
+        )
+        gate.set()
+        writer.stop()          # drains everything still queued
+        assert writer.n_dumped >= 2
+        assert writer.n_failed == 0
+    finally:
+        gate.set()

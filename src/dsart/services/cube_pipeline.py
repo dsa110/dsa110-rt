@@ -421,7 +421,14 @@ class RetainedCube:
 
     Args:
         cube_id: monotonic cube counter (= ``CubeRingSlot.cube_id``).
-        event_specnum_start: spec num at sample 0 of this cube.
+        event_specnum_start: spec num at sample 0 of this cube, in
+            SEARCH-sample units (1 per detector/search sample, advancing
+            by ``cube_cadence_samples`` per cube); NOT native SNAP
+            specnums. A C1 row's ``event_specnum`` counts the same
+            units, so ``event_specnum - event_specnum_start`` is
+            directly an index along the cube's time axis — never divide
+            by ``sample_period_specnum`` (see
+            ``services/search_compute.py:1338-1345``).
         mjd_start: double-precision MJD at sample 0.
         t_det: number of time samples in the cube.
         n_fdm: number of fine-DM trials in the cube
@@ -451,7 +458,7 @@ def find_cube_for_specnum(
     event_specnum: int,
 ) -> Optional[RetainedCube]:
     """Return the retained cube whose ``[specnum_start, specnum_start +
-    t_det * sample_period_specnum)`` window contains ``event_specnum``.
+    t_det)`` window contains ``event_specnum``.
 
     Returns ``None`` if no retained cube covers the requested specnum.
     On a multi-hit (impossible at production geometry where cubes
@@ -463,7 +470,15 @@ def find_cube_for_specnum(
     best: Optional[RetainedCube] = None
     for cube in ring.iter_newest_first():
         start = int(cube.event_specnum_start)
-        end_exclusive = start + int(cube.t_det) * int(cube.sample_period_specnum)
+        # Both the anchor and the queried event_specnum count SEARCH
+        # samples (see RetainedCube.event_specnum_start), so a cube
+        # covers exactly t_det of them. This used to be
+        # t_det * sample_period_specnum, i.e. a window 16x too wide at
+        # the production op-point. The newest-first walk masked it: the
+        # freshest cube whose over-wide window matched was almost always
+        # the right one anyway, so the only observable was an occasional
+        # claim of an event that is really in the NEXT cube.
+        end_exclusive = start + int(cube.t_det)
         if start <= int(event_specnum) < end_exclusive:
             best = cube
             break

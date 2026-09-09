@@ -1096,6 +1096,7 @@ class SkyMonitor:
     def __init__(
         self,
         store: SkyFrameStore | None = None,
+        sefd_publisher: Callable[[str, dict[str, Any]], None] | None = None,
         *,
         frame_interval_s: float = 30.0,
         freshness_s: float = 90.0,
@@ -1108,6 +1109,10 @@ class SkyMonitor:
         armed_mjd_provider: Optional[Callable[[], Optional[float]]] = None,
     ) -> None:
         self.store = store if store is not None else SkyFrameStore()
+        # 2026-08-07: optional sink for the per-frame implied SEFD. Injected
+        # rather than imported so this module keeps no etcd dependency and
+        # stays unit-testable; app.py wires it to ControlStore.put_dict.
+        self._sefd_publisher = sefd_publisher
         # 2026-06-14: returns the active sidereal (l,m) dump-veto regions
         # (from C2's /mon/c2/sidereal_vetos) to overlay on each frame.
         self._veto_provider = veto_provider
@@ -1155,6 +1160,42 @@ class SkyMonitor:
             self._seed_history_from_store()
         except Exception:                                # noqa: BLE001
             LOG.exception("static-sub history seed failed (cold start)")
+
+    #: etcd key for the static-sky SEFD rollup. Single-instance (the sky
+    #: monitor runs only on h23) so there is no cn/half in the path, and it
+    #: sits under /mon/sky/ which the influx pusher scans as its own prefix.
+    SEFD_MON_KEY = "/mon/sky/sefd"
+
+    def _publish_sefd(self, noise: dict[str, Any], *, ts: float) -> None:
+        """Publish the frame's implied SEFD to etcd for the influx pusher.
+
+        Deliberately a no-op unless the frame is actually usable:
+        ``static_sub_ready`` false means the instrumental baseline has not
+        been subtracted, the image is structure-dominated and the flux scale
+        fitted against it is meaningless -- ``sefd_implied_jy`` is None in
+        that case. Publishing nothing leaves a gap in Grafana, which is the
+        honest rendering; publishing a zero would draw a cliff.
+
+        Never raises: a monitoring sink must not be able to kill the frame
+        loop that feeds the sky tab.
+        """
+        pub = self._sefd_publisher
+        if pub is None:
+            return
+        sefd = noise.get("sefd_implied_jy")
+        if sefd is None or not np.isfinite(float(sefd)):
+            return
+        payload = dict(noise)
+        payload["ts_unix"] = float(ts)
+        # bool is not useful as an influx field here and the pusher skips it;
+        # keep it in the payload for anyone reading etcd directly.
+        try:
+            pub(self.SEFD_MON_KEY, payload)
+        except Exception:                                   # noqa: BLE001
+            LOG.warning(
+                "sky SEFD publish to %s failed (frame loop continues)",
+                self.SEFD_MON_KEY, exc_info=True,
+            )
 
     def _seed_history_from_store(self) -> None:
         """Prime the static-sub history from raw snapshots persisted in
@@ -1540,6 +1581,7 @@ class SkyMonitor:
                     "n_ant_assumed": SEFD_N_ANT,
                     "bw_eff_hz": SEFD_BW_HZ,
                 }
+                self._publish_sefd(noise, ts=now)
                 annotate = {
                     "ra0_deg": ra0, "dec0_deg": dec0,
                     "fov_rad": fov_rad, "nvss_rows": nvss_rows,

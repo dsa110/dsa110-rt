@@ -81,9 +81,7 @@ def test_r5_dm_edge_rail() -> None:
 
 
 def test_r10_cube_unconfirmed() -> None:
-    d = decide(
-        _clean_metrics(g_apex_cube_same=0, tz_trig=9.9), is_injection=False,
-    )
+    d = decide(_clean_metrics(tz_trig=7.9), is_injection=False)
     assert not d.keep and "R10_cube_unconfirmed" in d.rules_fired
 
 
@@ -153,3 +151,186 @@ def test_event_is_injection_coincidence_fallback(tmp_path: Path) -> None:
     # No L3 marker, no CSV inj_id → only the durable-log coincidence flags it.
     assert event_is_injection(ev, "dddd") is False
     assert event_is_injection(ev, "dddd", fired_log_path=log) is True
+
+
+# ---------------------------------------------------------------------------
+# R10 coherence exemption + R11 cube-quality (2026-08-04)
+# ---------------------------------------------------------------------------
+
+
+def _r10_only(**ov) -> CubeMetrics:
+    """Metrics that trip R10 and nothing else: the global apex is in
+    another half and the trigger feature is weak."""
+    base = dict(g_apex_cube_same=0, tz_trig=6.6, tz_apex=6.6, imgz_apex=6.6,
+                t_shift=0, dm_shift_trials=0)
+    base.update(ov)
+    return _clean_metrics(**base)
+
+
+def test_r10_fires_on_a_coherent_but_unconfirmed_trigger():
+    """REGRESSION GUARD — do not weaken without reading this.
+
+    Every candidate that reaches R10 has t_shift == 0 and
+    dm_shift_trials == 0, because R2 and R3 reject anything shifted
+    first. So any R10 exemption predicated on those quantities is
+    vacuous: it does not soften the rule, it deletes it. That is exactly
+    what happened between 2026-08-04 and 2026-08-07, when 15 of 31 KEEPs
+    on a single night met R10's conditions and an exemption spared all
+    15, at tz_trig as low as 2.7.
+
+    This asserts the state EVERY surviving candidate is in -- perfectly
+    coherent, weak cube confirmation -- still fires R10. If someone
+    reintroduces a coherence carve-out, this test fails.
+    """
+    d = decide(_r10_only(t_shift=0, dm_shift_trials=0), is_injection=False)
+    assert not d.keep, "a vacuous R10 exemption has been reintroduced"
+    assert "R10_cube_unconfirmed" in d.rules_fired
+
+
+def test_r10_does_not_fire_when_the_cube_confirms():
+    th = CubeVetoThresholds()
+    d = decide(_r10_only(tz_trig=th.r10_tz_trig_sigma + 0.1),
+               is_injection=False)
+    assert d.keep, d.rules_fired
+
+
+def test_r10_ignores_which_half_holds_the_global_apex():
+    """g_apex_cube_same is an argmax over ~560k cells across all halves,
+    so it tracks which half has the worst RFI rather than whether the
+    candidate is real (260803doen vs 260803qmub). R10 must not depend on
+    it in either direction."""
+    weak = {"tz_trig": 4.0}
+    assert (
+        decide(_r10_only(g_apex_cube_same=0, **weak),
+               is_injection=False).rules_fired
+        == decide(_r10_only(g_apex_cube_same=1, **weak),
+                  is_injection=False).rules_fired
+    )
+    strong = {"tz_trig": 30.0}
+    assert (
+        decide(_r10_only(g_apex_cube_same=0, **strong),
+               is_injection=False).rules_fired
+        == decide(_r10_only(g_apex_cube_same=1, **strong),
+                  is_injection=False).rules_fired
+    )
+
+
+def test_r10_threshold_stays_below_the_faintest_injection():
+    """Calibration guard. Across 47 injections (2026-08, the only ground
+    truth for a burst of known strength) the minimum tz_trig was 10.3.
+    The threshold must stay under that or the rule starts eating real
+    bursts; the margin also covers the 8 sigma detector floor given the
+    measured tz/SNR ratio of 1.15 at the pessimistic end."""
+    faintest_injection_tz = 10.3
+    th = CubeVetoThresholds()
+    assert th.r10_tz_trig_sigma < faintest_injection_tz
+    assert decide(_r10_only(tz_trig=faintest_injection_tz),
+                  is_injection=False).keep
+
+
+def _streaky(**ov) -> CubeMetrics:
+    """A broad candidate in a demonstrably non-Gaussian half, weak enough
+    for R11 but not so weak that R10 fires first.
+
+    tz_trig must sit in [r10_tz_trig_sigma, r11_exempt_tz_trig) = [8, 10)
+    to exercise R11 in isolation: below 8 R10 rejects it and R11 is moot;
+    at or above 10 R11's own strong-trigger exemption spares it.
+    """
+    base = dict(width_samples=16, streak_ac1_trig=0.28, frac_z5_trig=0.012,
+                tz_trig=9.0, t_shift=10, dm_shift_trials=3)
+    base.update(ov)
+    return _clean_metrics(**base)
+
+
+def test_r11_is_off_by_default_but_says_so():
+    """Uncalibrated, so it must not reject — but the decision has to
+    record that it would have, or we can never calibrate it."""
+    d = decide(_streaky(), is_injection=False)
+    assert d.keep
+    assert "R11_nongaussian_cube" not in d.rules_fired
+    assert "R11 would fire" in d.notes
+
+
+def test_r11_rejects_when_enabled():
+    th = CubeVetoThresholds(r11_enabled=True)
+    d = decide(_streaky(), is_injection=False, thresholds=th)
+    assert not d.keep
+    assert "R11_nongaussian_cube" in d.rules_fired
+
+
+def test_r11_spares_a_narrow_candidate_in_a_streaky_half():
+    """Interference correlated on ~10 ms scales does not manufacture
+    1-sample spikes, so width gates the rule."""
+    th = CubeVetoThresholds(r11_enabled=True)
+    d = decide(_streaky(width_samples=1), is_injection=False, thresholds=th)
+    assert "R11_nongaussian_cube" not in d.rules_fired
+
+
+def test_r11_spares_a_strong_trigger_in_a_streaky_half():
+    """260802ohco: SNR 18, tz_trig 11.6, coherent, but its trigger half
+    is genuinely streaky. A noisy half makes a candidate less
+    trustworthy; it does not outweigh direct evidence."""
+    th = CubeVetoThresholds(r11_enabled=True)
+    assert "R11_nongaussian_cube" not in decide(
+        _streaky(tz_trig=11.6), is_injection=False, thresholds=th,
+    ).rules_fired
+    # The second half of this exemption used to be "or the apex sits on
+    # the trigger's time and DM". Removed 2026-08-07: R2/R3 force those
+    # to zero upstream, so that term was always true and R11 could never
+    # fire at all. Only the strong-trigger exemption above is real.
+
+
+def test_r11_needs_a_width_to_fire():
+    """Callers with no width (width_samples unset) keep the old rule set."""
+    th = CubeVetoThresholds(r11_enabled=True)
+    d = decide(_streaky(width_samples=0), is_injection=False, thresholds=th)
+    assert "R11_nongaussian_cube" not in d.rules_fired
+
+
+def test_r11_never_overrides_the_injection_exemption():
+    th = CubeVetoThresholds(r11_enabled=True)
+    d = decide(_streaky(), is_injection=True, thresholds=th)
+    assert d.keep and d.rules_fired == ()
+
+
+# ---------------------------------------------------------------------------
+# live_span / cube_noise_character
+# ---------------------------------------------------------------------------
+
+
+def test_live_span_ignores_a_zero_filled_overlap_tail():
+    import numpy as np
+    from dsart.coinc.cube_veto import live_span
+
+    wf = np.abs(np.random.RandomState(0).normal(size=(256, 34))) + 1.0
+    assert live_span(wf) == 256          # fully populated cube untouched
+    wf[192:] = 0.0                       # the production 64-sample overlap
+    assert live_span(wf) == 192
+
+
+def test_noise_character_separates_white_from_streaky():
+    import numpy as np
+    from dsart.coinc.cube_veto import cube_noise_character
+
+    rng = np.random.RandomState(1)
+    white = np.abs(rng.normal(size=(256, 34)))
+    ac1_w, fz_w = cube_noise_character(white)
+    # heavily time-correlated: each sample carries the previous one
+    streaky = np.cumsum(rng.normal(size=(256, 34)), axis=0)
+    ac1_s, _ = cube_noise_character(streaky)
+    assert abs(ac1_w) < 0.10 < ac1_s
+    assert fz_w < 5.0e-3
+
+
+def test_noise_character_measures_only_the_live_span():
+    import numpy as np
+    from dsart.coinc.cube_veto import cube_noise_character
+
+    wf = np.abs(np.random.RandomState(2).normal(size=(256, 34))) + 1.0
+    ac1_full, fz_full = cube_noise_character(wf)
+    wf2 = wf.copy()
+    wf2[192:] = 0.0
+    ac1_tail, fz_tail = cube_noise_character(wf2)
+    # the zero block must not register as structure
+    assert abs(ac1_tail - ac1_full) < 0.05
+    assert abs(fz_tail - fz_full) < 2.0e-3
