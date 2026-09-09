@@ -710,11 +710,14 @@ def run(
             # the raw data so cal-induced dynamic-range shifts cannot
             # mask them.
             settings = rfi_ctl.settings
-            if rfi_flagger is not None and _apply_mask is not None \
-                    and settings.enabled:
+            flag_wanted = (
+                rfi_flagger is not None
+                and _apply_mask is not None
+                and settings.enabled
+            )
+            if flag_wanted:
                 sk_warm.ensure()
-            if rfi_flagger is not None and _apply_mask is not None \
-                    and settings.enabled and sk_warm.ready.is_set():
+            if flag_wanted and sk_warm.ready.is_set():
                 try:
                     rfi_flagger.set_array_burst_mode(settings.array_burst_mode)
                     res = rfi_flagger.flag_block(real_v, imag_v)
@@ -739,10 +742,7 @@ def run(
                         "slow-RFI: flag_block failed on block %d; "
                         "passing voltages through unflagged", n_in,
                     )
-            elif (
-                rfi_flagger is not None and settings.enabled
-                and not sk_warm.ready.is_set()
-            ):
+            elif flag_wanted:
                 # Warming. Pass the block through rather than block the
                 # ring; log sparsely so a long warm-up is visible
                 # without flooding the journal.
