@@ -533,7 +533,13 @@ def test_reader_sees_a_mode_change_without_being_rebuilt(tmp_path,
         # order the sidecar actually runs in.
         reader = shm.RFIMonShmReader(4321)
         writer.publish(win("monitor"))
-        assert reader.read_latest().array_burst_mode == "monitor"
+        rec = reader.read_latest()
+        assert rec.array_burst_mode == "monitor"
+        # Sizes have the same problem: the writer does not learn them
+        # until the first publish, so a header parsed at construction
+        # caches zeros and the page renders "0 ant" for every group.
+        assert list(rec.group_sizes) == [96, 82, 47, 35, 14]
+        assert rec.array_burst_flag_group == "core"
         # Now the operator arms it. Same reader object.
         writer.publish(win("flag"))
         assert reader.read_latest().array_burst_mode == "flag"

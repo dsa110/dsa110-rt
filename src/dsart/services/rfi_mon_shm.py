@@ -831,28 +831,47 @@ class RFIMonShmReader:
             **gkw,                                 # type: ignore[arg-type]
         )
 
-    def _read_mode(self) -> str:
-        """Re-read the array-burst mode from the header.
+    def _read_group_header(self) -> tuple[str, str, np.ndarray]:
+        """Re-read the mutable part of the header: mode, flag group,
+        group sizes.
 
-        Parsing the header once at construction and caching this was a
-        bug found in production: the sidecar builds its reader when the
+        Parsing the header once at construction and caching these was a
+        bug found in production. The sidecar builds its reader when the
         segment is created, at which point the writer has only laid
-        down its initial ``off``, and every subsequent publish updates
-        the header word the reader never looked at again. The result
-        was a monitor page confidently reporting ``off`` while the
-        detector was running and publishing real data.
+        down its INITIAL header -- mode ``off`` and sizes all zero,
+        because it does not learn the group sizes until the first
+        window is published. Every later publish rewrote header words
+        the reader never looked at again, so the monitor page reported
+        mode ``off`` and "0 ant" for every group while the detector was
+        running and publishing correct data.
+
+        The mode genuinely changes at runtime (the slow path is toggled
+        from the Control tab); the sizes are fixed but simply unknown
+        at construction. Both have to be read late.
         """
-        if self._version < 2:
-            return "off"
+        mode, flag_group = self._array_burst_mode, self._ab_flag_group
+        sizes = self._group_sizes
+        if self._version < 2 or self._n_group <= 0:
+            return mode, flag_group, sizes
         try:
-            raw = bytes(self._mm[_RESERVED_OFF + 8: _RESERVED_OFF + 16])
-            (word,) = struct.unpack("<Q", raw)
+            raw = bytes(self._mm[_RESERVED_OFF: _RESERVED_OFF + 48])
+            words = struct.unpack("<6Q", raw)
         except (ValueError, struct.error):
-            return self._array_burst_mode
-        code = int((word >> 32) & 0xFFFFFFFF)
+            return mode, flag_group, sizes
+        code = int((words[1] >> 32) & 0xFFFFFFFF)
         if 0 <= code < len(_AB_MODE_NAMES):
-            return _AB_MODE_NAMES[code]
-        return "off"
+            mode = _AB_MODE_NAMES[code]
+        names = GROUP_NAMES[: self._n_group]
+        idx = int(words[1] & 0xFFFFFFFF)
+        if 0 <= idx < len(names):
+            flag_group = names[idx]
+        raw_sizes: list[int] = []
+        for i in range(4):
+            w = int(words[2 + i])
+            raw_sizes.append(w & 0xFFFFFFFF)
+            raw_sizes.append((w >> 32) & 0xFFFFFFFF)
+        sizes = np.asarray(raw_sizes[: self._n_group], dtype=np.int32)
+        return mode, flag_group, sizes
 
     def _decode_group_section(
         self, body_off: int, *, n_cubes: int,
@@ -885,11 +904,12 @@ class RFIMonShmReader:
         body_off += g * self._n_chan_ds * p * 4
         n_live = _f32(gp, body_off)
 
+        mode, flag_group, sizes = self._read_group_header()
         return {
-            "array_burst_mode": self._read_mode(),
-            "array_burst_flag_group": self._ab_flag_group,
+            "array_burst_mode": mode,
+            "array_burst_flag_group": flag_group,
             "group_names": self._group_names,
-            "group_sizes": self._group_sizes,
+            "group_sizes": sizes,
             "n_acc_per_cube": self._n_acc_per_cube,
             "group_z": z.reshape(self._n_acc_total, g, p)[:t_valid],
             "group_band_frac": bf.reshape(self._n_acc_total, g, p)[:t_valid],
