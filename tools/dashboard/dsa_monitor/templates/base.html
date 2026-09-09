@@ -151,6 +151,9 @@
         }
         .node-cell.ok    { background: #d8f3dc; border-left: 3px solid #2d6a4f; }
         .node-cell.stale { background: #ffeaa7; border-left: 3px solid #d4a017; }
+        /* Array sums tab: highlight the flag group, grey out silent nodes. */
+        table.metric tr.hl td { background: #dff9fb; font-weight: 600; }
+        table.metric tr.stale td { color: #b2bec3; }
         .node-cell.fail  { background: #fab1a0; border-left: 3px solid #d63031; }
         .node-cell .cn { font-weight: 700; }
 
@@ -173,6 +176,7 @@
         <div class="brand">DSA-110 Monitor</div>
         <div class="tabs">
             <a class="tab {% if active_tab == 'antennas' %}active{% endif %}" href="/antennas">Antennas / RFI</a>
+            <a class="tab {% if active_tab == 'arraysum' %}active{% endif %}" href="/arraysum">Array sums</a>
             <a class="tab {% if active_tab == 'sefds' %}active{% endif %}" href="/sefds">SEFDs</a>
             <a class="tab {% if active_tab == 'bursts' %}active{% endif %}" href="/bursts">Burst candidates</a>
             <a class="tab {% if active_tab == 'sky' %}active{% endif %}" href="/sky">Sky</a>

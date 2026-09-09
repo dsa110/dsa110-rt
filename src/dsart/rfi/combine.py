@@ -16,7 +16,19 @@ records which detector fired in that cell:
     group-outlier     2
     sum-threshold     3
     flagants.dat      4
+    array-burst       5
     ===============   =====
+
+``ARRAY_BURST`` (bit 5) does not mean the same thing as the others.
+The array-burst detector (:mod:`dsart.rfi.array_burst`) works at
+2.097 ms, not at cube cadence, so its verdict cannot be folded into
+the cube-wide ``[NANTS, NCHAN, NPOL]`` mask without throwing away the
+time resolution that is the whole point of it. Bit 5 therefore marks
+``(ant, ch, pol)`` cells in which **at least one** 2.097 ms sample of
+the cube was excised; the time-resolved mask itself travels
+separately in :attr:`FlagBlockResult.array_burst`, and the caller
+applies it. The bit is set only when the detector runs in ``flag``
+mode.
 
 The numeric values are exposed as :class:`FlagSourceBit` for
 downstream diagnostic logging.
@@ -64,6 +76,7 @@ from dsart.common.constants import (
     NPOL,
     RFI_BANDPASS_WARMUP_CUBES_DEFAULT,
 )
+from dsart.rfi.array_burst import ArrayBurstDetector, ArrayBurstResult
 from dsart.rfi.autos import DEFAULT_M_VALUES, AutoSpectra, compute_autos
 from dsart.rfi.bandpass_outlier import (
     DEFAULT_BANDPASS_K,
@@ -84,6 +97,13 @@ from dsart.rfi.sum_threshold import (
 # ---------------------------------------------------------------------------
 
 
+#: Accepted values of ``RFIFlagger(array_burst_mode=...)``.
+_ARRAY_BURST_MODES: frozenset[str] = frozenset({"off", "monitor", "flag"})
+
+#: The base accumulation depth the array-burst detector requires.
+ARRAY_BURST_M_FINE: int = 64
+
+
 class FlagSourceBit(enum.IntFlag):
     """Per-cell flag-source tag bits (uint8)."""
 
@@ -93,6 +113,7 @@ class FlagSourceBit(enum.IntFlag):
     GROUP_OUTLIER = 1 << 2       # value 4
     SUM_THRESHOLD = 1 << 3       # value 8
     FLAGANTS_DAT = 1 << 4        # value 16
+    ARRAY_BURST = 1 << 5         # value 32
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +136,14 @@ class FlagBlockResult:
             cubes.
         flag_fraction_total: scalar fraction of cells flagged
             (``mask.float().mean()``). Convenience for monitoring.
+        array_burst: per-cube output of the array-common broadband
+            burst detector, or ``None`` when it is not configured.
+            **Its mask is NOT folded into** ``mask`` — it is
+            time-resolved (``[n_acc, NCHAN, NPOL]``, 2.097 ms per
+            row) while ``mask`` is cube-wide, so the caller applies
+            it separately via ``apply_rfi_mask_to_voltages(...,
+            time_chan_mask=...)``. In ``monitor`` mode the field is
+            populated for the RFI page but nothing is excised.
         s1_full: fp32 ``S1_4096`` per (ant, ch, pol). Same shape as
             ``mask``. The full-cube auto-power that the flagger
             computed internally from
@@ -133,6 +162,7 @@ class FlagBlockResult:
     warmup: bool
     flag_fraction_total: float
     s1_full: torch.Tensor | None = None
+    array_burst: ArrayBurstResult | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +257,16 @@ class RFIFlagger:
         run_sum_threshold: include the SumThreshold post-pass
             (default True). Tests can disable to inspect raw
             per-detector flags.
+        array_burst: optional :class:`dsart.rfi.array_burst.ArrayBurstDetector`
+            for array-common broadband bursts. ``None`` disables it.
+        array_burst_mode: ``"off"``, ``"monitor"`` or ``"flag"``.
+            ``monitor`` computes and returns everything but excises
+            nothing and sets no tag bit — this is how it ships on the
+            fast path, where the measured p50 block time is 127 ms
+            against a 134.218 ms budget and a new detector that can
+            flag every antenna at once deserves a night of looking at
+            before it is armed. ``flag`` additionally populates
+            ``array_burst.time_chan_mask`` and sets tag bit 5.
 
     Notes
     -----
@@ -250,7 +290,24 @@ class RFIFlagger:
         m_values: tuple[int, ...] = DEFAULT_M_VALUES,
         warmup_cubes: int = RFI_BANDPASS_WARMUP_CUBES_DEFAULT,
         run_sum_threshold: bool = True,
+        array_burst: ArrayBurstDetector | None = None,
+        array_burst_mode: str = "off",
     ) -> None:
+        if array_burst_mode not in _ARRAY_BURST_MODES:
+            raise ValueError(
+                f"array_burst_mode={array_burst_mode!r}, expected one "
+                f"of {sorted(_ARRAY_BURST_MODES)}"
+            )
+        if array_burst is not None and array_burst_mode != "off":
+            m_fine = min(m_values)
+            if m_fine != ARRAY_BURST_M_FINE:
+                raise ValueError(
+                    f"array-burst needs the base accumulation to be "
+                    f"M={ARRAY_BURST_M_FINE} (2.097 ms); m_values="
+                    f"{tuple(m_values)} has base M={m_fine}. Add 64 to "
+                    f"--rfi-m-values or the detector would run at the "
+                    f"wrong time scale."
+                )
         if warmup_cubes < 0:
             raise ValueError(
                 f"warmup_cubes={warmup_cubes}, expected >= 0"
@@ -264,6 +321,10 @@ class RFIFlagger:
         self._m_values = tuple(m_values)
         self._warmup_cubes = warmup_cubes
         self._run_sum_threshold = run_sum_threshold
+        self._array_burst = array_burst
+        self._array_burst_mode = (
+            array_burst_mode if array_burst is not None else "off"
+        )
 
         if flagants_path is None:
             self._flagants_mask = torch.zeros(
@@ -297,6 +358,30 @@ class RFIFlagger:
     @property
     def flagants_mask(self) -> torch.Tensor:
         return self._flagants_mask
+
+    @property
+    def array_burst_mode(self) -> str:
+        return self._array_burst_mode
+
+    @property
+    def array_burst(self) -> ArrayBurstDetector | None:
+        return self._array_burst
+
+    def set_array_burst_mode(self, mode: str) -> None:
+        """Switch the array-burst detector between off / monitor / flag.
+
+        Exposed so the slow correlator can be toggled live from the
+        dashboard's Control tab without restarting the process. A
+        no-op when no detector was constructed.
+        """
+        if mode not in _ARRAY_BURST_MODES:
+            raise ValueError(
+                f"mode={mode!r}, expected one of "
+                f"{sorted(_ARRAY_BURST_MODES)}"
+            )
+        if self._array_burst is None:
+            return
+        self._array_burst_mode = mode
 
     def reset_warmup(self) -> None:
         """Reset the warmup counter (e.g. after pipeline restart)."""
@@ -336,7 +421,10 @@ class RFIFlagger:
 
         Returns:
             :class:`FlagBlockResult` with the OR-folded mask, per-cell
-            source tags, warmup indicator, and total flag fraction.
+            source tags, warmup indicator, total flag fraction, and —
+            when the array-burst detector is configured — its
+            time-resolved verdict in ``array_burst``. That verdict is
+            NOT included in ``mask``; apply it separately.
 
         Raises:
             ValueError: invalid input shapes (delegated to underlying
@@ -371,6 +459,17 @@ class RFIFlagger:
 
         # ---- Group-outlier (always active) ------------------------
         gr_m = group_outlier_mask(s1_full, k=self._group_k)
+
+        # ---- Array-burst (2.097 ms, array-common; see array_burst) -
+        # Runs on the BASE accumulation the SK detector already built,
+        # so this is a reduction over a resident tensor rather than a
+        # second pass over the voltages. Its mask is time-resolved and
+        # deliberately NOT folded into `final`.
+        ab_result: ArrayBurstResult | None = None
+        if self._array_burst is not None and self._array_burst_mode != "off":
+            ab_result = self._array_burst.detect(
+                autos.s1[min(self._m_values)], s1_full,
+            )
 
         # ---- Sum-threshold post-pass (along channel axis only at
         #      this cube-level granularity; the (ch, t) 2D form lives
@@ -416,6 +515,23 @@ class RFIFlagger:
         tags |= sum_m.to(torch.uint8) * int(FlagSourceBit.SUM_THRESHOLD)
         tags |= fa_m.to(torch.uint8) * int(FlagSourceBit.FLAGANTS_DAT)
 
+        # Bit 5 marks the (ant, ch, pol) cells in which at least one
+        # 2.097 ms sample was excised. Only meaningful in flag mode;
+        # see the module docstring for why it is not the same kind of
+        # statement as bits 0-4.
+        if (
+            self._array_burst_mode == "flag"
+            and ab_result is not None
+            and ab_result.time_chan_mask is not None
+        ):
+            touched = ab_result.time_chan_mask.any(dim=0)   # (NCHAN, NPOL)
+            tags |= (
+                touched.unsqueeze(0)
+                .expand(n_ant_actual, n_ch_actual, n_pol_actual)
+                .to(torch.uint8)
+                * int(FlagSourceBit.ARRAY_BURST)
+            )
+
         flag_frac = float(final.float().mean().item())
 
         if update_header is not None:
@@ -432,6 +548,7 @@ class RFIFlagger:
             warmup=warmup_flag,
             flag_fraction_total=flag_frac,
             s1_full=s1_full,
+            array_burst=ab_result,
         )
 
 

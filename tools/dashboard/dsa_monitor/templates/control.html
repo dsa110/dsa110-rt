@@ -179,6 +179,7 @@
         <li><a href="#panel-calibrate">Injection S/N calibration (fit / view / delete)</a></li>
         <li><a href="#panel-dump-now">Dump now</a></li>
         <li><a href="#panel-dump-control">Dump control (C2 dumps / voltage dumps / reject mode)</a></li>
+        <li><a href="#panel-slow-rfi">Slow-correlator RFI flagging</a></li>
         <li><a href="#panel-spectral-line">Spectral-line mode (SPL)</a></li>
         <li><a href="#panel-clear-sidereal-vetos">Clear sidereal (l,m) vetos</a></li>
         <li><a href="#panel-antenna">Antenna control (elevation / noise diode)</a></li>
@@ -1374,6 +1375,88 @@ async function refreshCalibrations() {
 </div>
 
 <!-- Spectral-line (SPL) per-sub-band config -->
+<div class="panel" style="margin-top: 24px;" id="panel-slow-rfi">
+    <h3>Slow-correlator RFI flagging</h3>
+    <p class="muted">
+        Slow visibilities have always been emitted <strong>unflagged</strong>,
+        deliberately, so calibration solutions can be derived downstream.
+        This turns the flagger on for the <code>corr_slow</code> path across
+        the whole fleet: the same per-antenna chain the fast path runs
+        (spectral kurtosis, bandpass-outlier, group-outlier, SumThreshold,
+        <code>flagants.dat</code>) plus the array-common burst detector, with
+        a protected Galactic HI band on top.
+    </p>
+    <p class="muted">
+        Written to <code>{{ slow_rfi_key }}</code>, which every
+        <code>corr_slow</code> process polls every 5&nbsp;s — so this takes
+        effect without a restart, and a node that restarts picks up the
+        current state rather than reverting to its command-line default.
+        <strong>It changes what every downstream calibration sees.</strong>
+    </p>
+    <p class="muted">
+        <strong>Array-burst detector.</strong> Every detector in the existing
+        chain runs inside one antenna, so a broadband burst common to the
+        whole array moves each of their references along with the signal and
+        none of them fires. Measured on 260812imek sb02, such a burst is
+        0.05&nbsp;σ in the cell the flagger tests and 13.3&nbsp;σ in the
+        array-summed band power at 2.097&nbsp;ms. Default here is
+        <code>flag</code> (armed) rather than the fast path's
+        <code>monitor</code>, because slow visibilities are not searched for
+        FRBs. See the <a href="/arraysum">Array sums</a> tab.
+    </p>
+    <p class="muted">
+        <strong>HI guard.</strong> The online flagger excises the Galactic HI
+        line at up to 99.5% occupancy. That is right on the fast path and
+        wrong here, so −350&nbsp;to&nbsp;+200&nbsp;km/s
+        (1419.458–1422.064&nbsp;MHz, 86 channels of chgroup&nbsp;6 — a no-op
+        on the other fifteen nodes) is protected from every detector. Leave
+        it on unless you specifically want HI removed.
+    </p>
+
+    <div class="verb-row">
+        <span id="slowrfi-pill"
+              style="font-weight:700; padding:4px 10px; border-radius:4px;
+                     background:#7f8c8d; color:#ecf0f1;">
+            slow RFI: …
+        </span>
+        <span id="slowrfi-meta" class="muted" style="margin-left:8px;"></span>
+    </div>
+
+    <form id="form-slow-rfi" onsubmit="return submitSlowRfi(event);">
+        <div class="verb-row" style="margin-top:10px;">
+            <label>
+                <input type="checkbox" name="enabled" id="slowrfi-enabled"
+                       value="true">
+                enable flagging on the slow path
+            </label>
+        </div>
+        <div class="verb-row">
+            <label for="slowrfi-mode">array-burst:</label>
+            <select name="array_burst_mode" id="slowrfi-mode">
+                <option value="flag">flag (armed)</option>
+                <option value="monitor">monitor only</option>
+                <option value="off">off</option>
+            </select>
+            <label style="margin-left:16px;">
+                <input type="checkbox" name="hi_guard" id="slowrfi-hi"
+                       value="true" checked>
+                protect Galactic HI
+            </label>
+            <label style="margin-left:16px;" id="slowrfi-confirm-wrap"
+                   hidden>
+                <input type="checkbox" name="confirm_no_hi_guard"
+                       id="slowrfi-confirm" value="yes">
+                <span style="color:#ffb3b3;">yes, excise HI too</span>
+            </label>
+        </div>
+        <div class="verb-row">
+            <button type="submit">Apply</button>
+            <button type="button" onclick="refreshSlowRfi();">Refresh</button>
+        </div>
+        <div id="resp-slow-rfi" class="resp"></div>
+    </form>
+</div>
+
 <div class="panel" style="margin-top: 24px;" id="panel-spectral-line">
     <h3>Spectral-line mode (SPL)</h3>
     <p class="muted">
@@ -2801,6 +2884,100 @@ async function refreshSystemState() {
 document.addEventListener("DOMContentLoaded", function () {
     refreshSystemState();
     setInterval(refreshSystemState, 4000);
+});
+
+
+// ---------------------------------------------------------------------
+// Slow-correlator RFI flagging panel (M7.7)
+// ---------------------------------------------------------------------
+
+function slowRfiPaint(j) {
+    const pill = document.getElementById("slowrfi-pill");
+    const meta = document.getElementById("slowrfi-meta");
+    if (!j || j.present === false) {
+        pill.textContent = "slow RFI: not set";
+        pill.style.background = "#7f8c8d";
+        meta.textContent = j && j.error
+            ? j.error
+            : "key never written — each node is on its CLI default (off)";
+        return;
+    }
+    const on = !!j.enabled;
+    pill.textContent = on ? "slow RFI: ON" : "slow RFI: off";
+    // Amber, not green, when it is on: this is a deliberate departure
+    // from the shipped default and the operator should notice it.
+    pill.style.background = on ? "#d68910" : "#27ae60";
+    let bits = ["array-burst " + (j.array_burst_mode || "?")];
+    bits.push(j.hi_guard ? "HI protected" : "HI NOT protected");
+    if (j.updated_iso) { bits.push("set " + j.updated_iso); }
+    if (j.updated_by) { bits.push("by " + j.updated_by); }
+    meta.textContent = bits.join(" · ");
+    document.getElementById("slowrfi-enabled").checked = on;
+    document.getElementById("slowrfi-hi").checked = !!j.hi_guard;
+    const sel = document.getElementById("slowrfi-mode");
+    if (j.array_burst_mode) { sel.value = j.array_burst_mode; }
+    slowRfiToggleConfirm();
+}
+
+function slowRfiToggleConfirm() {
+    // The "yes, excise HI too" checkbox only appears when the
+    // combination actually needs it, so it cannot be ticked by habit.
+    const need = document.getElementById("slowrfi-enabled").checked &&
+                 !document.getElementById("slowrfi-hi").checked;
+    const wrap = document.getElementById("slowrfi-confirm-wrap");
+    wrap.hidden = !need;
+    if (!need) { document.getElementById("slowrfi-confirm").checked = false; }
+}
+
+async function refreshSlowRfi() {
+    try {
+        const r = await fetch("/control/slow_rfi");
+        slowRfiPaint(await r.json());
+    } catch (e) {
+        document.getElementById("slowrfi-meta").textContent =
+            "network error: " + e;
+    }
+}
+
+async function submitSlowRfi(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const respEl = document.getElementById("resp-slow-rfi");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    respEl.innerHTML = "<span class='muted'>sending…</span>";
+    const fd = new FormData(form);
+    // Unchecked boxes are absent from FormData; the server reads
+    // absent as false, which is what we want for `enabled` but NOT
+    // for `hi_guard` (absent must mean "off", and it does) — so send
+    // them explicitly to keep the intent unambiguous.
+    fd.set("enabled",
+           document.getElementById("slowrfi-enabled").checked ? "true" : "false");
+    fd.set("hi_guard",
+           document.getElementById("slowrfi-hi").checked ? "true" : "false");
+    let j;
+    try {
+        const r = await fetch("/control/slow_rfi", { method: "POST", body: fd });
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>network error: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    respEl.innerHTML = "<span class='" + (j.ok ? "ok" : "err") + "'>" +
+        (j.ok ? "OK" : "FAIL") + "</span> " +
+        "<code>" + (j.error || JSON.stringify(j.payload || {})) + "</code>";
+    btn.disabled = false;
+    refreshSlowRfi();
+    return false;
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    const en = document.getElementById("slowrfi-enabled");
+    const hi = document.getElementById("slowrfi-hi");
+    if (en) { en.addEventListener("change", slowRfiToggleConfirm); }
+    if (hi) { hi.addEventListener("change", slowRfiToggleConfirm); }
+    refreshSlowRfi();
 });
 
 </script>

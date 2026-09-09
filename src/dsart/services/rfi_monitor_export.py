@@ -65,6 +65,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
+from dsart.common.constants import BLOCK_DURATION_S
 from dsart.services.rfi_mon_shm import (
     RFIMonRecord,
     RFIMonShmAbiMismatch,
@@ -133,6 +134,49 @@ def record_to_json_obj(
         obj["mask_count_grp"] = _encode_array(rec.mask_count_grp)
         obj["mask_count_sumthr"] = _encode_array(rec.mask_count_sumthr)
         obj["mask_count_fa"] = _encode_array(rec.mask_count_fa)
+
+    # ---- v2 array-burst section ------------------------------------
+    # Always emit the scalar metadata (cheap, and the dashboard needs
+    # it to know whether the detector is running at all); the arrays
+    # ride the include_arrays flag like everything else.
+    obj["array_burst"] = {
+        "mode": str(rec.array_burst_mode),
+        "flag_group": str(rec.array_burst_flag_group),
+        "group_names": list(rec.group_names),
+        "group_sizes": (
+            [int(v) for v in rec.group_sizes]
+            if rec.group_sizes is not None else []
+        ),
+        "n_acc_per_cube": int(rec.n_acc_per_cube),
+        "dt_s": float(rec.n_acc_per_cube and BLOCK_DURATION_S / rec.n_acc_per_cube),
+    }
+    if rec.group_n_live is not None:
+        obj["array_burst"]["n_live"] = rec.group_n_live.tolist()
+    if rec.group_fired is not None:
+        # A one-number summary that survives even when arrays are
+        # suppressed: what fraction of 2.097 ms samples fired, per
+        # group, folding both pols.
+        fired = rec.group_fired.astype(np.float32)
+        obj["array_burst"]["fired_fraction"] = (
+            fired.mean(axis=(0, 2)).tolist() if fired.size else []
+        )
+    if rec.group_band_frac is not None and rec.group_band_frac.size:
+        # Peak fractional excess per group over the window. NOTE this
+        # is a noise statistic when nothing fired — see
+        # _array_burst_summary for why the arm comparison is
+        # conditioned on the fired samples instead.
+        obj["array_burst"]["band_frac_max"] = (
+            rec.group_band_frac.max(axis=(0, 2)).tolist()
+        )
+    if include_arrays and rec.group_z is not None:
+        obj["array_burst"]["group_z"] = _encode_array(rec.group_z)
+        obj["array_burst"]["group_band_frac"] = _encode_array(
+            rec.group_band_frac
+        )
+        obj["array_burst"]["group_fired"] = _encode_array(rec.group_fired)
+        obj["array_burst"]["group_spec_mean"] = _encode_array(
+            rec.group_spec_mean
+        )
     return obj
 
 
@@ -214,7 +258,65 @@ def _mon_dict_from_record(
         "frac_grp": _triplet("frac_grp"),
         "frac_sumthr": _triplet("frac_sumthr"),
         "frac_fa": _triplet("frac_fa"),
+        # ---- array-burst headline (M7.7) --------------------------
+        # Scalars only: the full 2.097 ms series is far too big for
+        # etcd and lives on the HTTP endpoint instead. What goes here
+        # is what an alert would want — is it running, is it armed,
+        # how often did it fire, and how asymmetric were the arms.
+        "array_burst": _array_burst_summary(rec),
     }
+
+
+def _array_burst_summary(rec: RFIMonRecord) -> dict[str, Any]:
+    """Scalar array-burst summary for the etcd mon payload."""
+    out: dict[str, Any] = {
+        "mode": str(rec.array_burst_mode),
+        "flag_group": str(rec.array_burst_flag_group),
+        "groups": list(rec.group_names),
+    }
+    if rec.group_fired is None or rec.group_fired.size == 0:
+        out["running"] = False
+        return out
+    out["running"] = True
+    fired = rec.group_fired.astype(np.float32)
+    frac = fired.mean(axis=(0, 2))
+    out["fired_fraction"] = {
+        n: float(f) for n, f in zip(rec.group_names, frac)
+    }
+    out["n_samples"] = int(fired.shape[0])
+    if rec.group_band_frac is not None and rec.group_band_frac.size:
+        names = list(rec.group_names)
+        peak = rec.group_band_frac.max(axis=(0, 2))
+        out["band_frac_max"] = {
+            n: float(v) for n, v in zip(names, peak)
+        }
+        # The arm comparison must be conditioned on the samples that
+        # actually FIRED. Taking a max over a whole window instead
+        # measures the largest noise excursion in ~1000 samples, which
+        # for the core sits around 3 sigma of 0.1% -- comfortably
+        # larger than the ~1.9% / 0.8% asymmetry it is supposed to
+        # report, and completely insensitive to it.
+        flag_idx = (
+            names.index(rec.array_burst_flag_group)
+            if rec.array_burst_flag_group in names else 0
+        )
+        hot = rec.group_fired[:, flag_idx, :].astype(bool).any(axis=1)
+        out["n_fired_samples"] = int(hot.sum())
+        if bool(hot.any()):
+            at_fire = rec.group_band_frac[hot].mean(axis=(0, 2))
+            out["band_frac_at_fire"] = {
+                n: float(v) for n, v in zip(names, at_fire)
+            }
+            if "ew_arm" in names and "ns_arm" in names:
+                ew = float(at_fire[names.index("ew_arm")])
+                ns = float(at_fire[names.index("ns_arm")])
+                # Far-field sources light both arms in proportion to
+                # collecting area, so this sits near 1; a local source
+                # does not (1.86% vs 0.81% = 2.3x on 260812imek).
+                out["arm_ratio"] = (
+                    round(ew / ns, 4) if ns > 1e-6 else None
+                )
+    return out
 
 
 # ---------------------------------------------------------------------------

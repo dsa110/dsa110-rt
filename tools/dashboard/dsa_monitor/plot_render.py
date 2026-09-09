@@ -534,3 +534,203 @@ def render_thumb_grid(
         )
 
     return _fig_to_png_bytes(fig)
+
+
+# ---------------------------------------------------------------------------
+# Array-burst (core / arm autocorrelation sums) — M7.7
+# ---------------------------------------------------------------------------
+#
+# These render the "extra antennas": the gain-normalised sums over the
+# core and over each arm of the core. Unlike every other plot on the
+# Antennas/RFI tab, the time axis here is the 2.097 ms accumulation,
+# not the 134.2 ms cube — which is the whole reason the detector
+# exists. A burst that is 0.05 sigma in one antenna's cube is 13 sigma
+# in the array-summed band power at 2.097 ms.
+
+#: Colours for the summing groups.
+_GROUP_COLOURS: dict[str, str] = {
+    "all": "#636e72",
+    "core": "#0984e3",
+    "ew_arm": "#00b894",
+    "ns_arm": "#e17055",
+    "outriggers": "#b2bec3",
+}
+
+#: Groups drawn by default. "all" and "core" are 96 vs 82 antennas and
+#: track each other closely, so showing both is clutter.
+_TIMESERIES_GROUPS: tuple[str, ...] = ("core", "ew_arm", "ns_arm")
+
+
+def _array_burst_record(snap: StoreSnapshot, *, chgroup: int):
+    """Latest record for one chgroup that actually carries group data."""
+    for cring in snap.per_chgroup:
+        if cring.cn.chgroup != chgroup:
+            continue
+        for rec in reversed(cring.records):
+            gz = getattr(rec, "group_z", None)
+            if gz is not None and gz.size:
+                return rec
+        return None
+    return None
+
+
+def render_array_burst_timeseries(
+    snap: StoreSnapshot, *, chgroup: int, detect_k: float = 6.0,
+) -> bytes:
+    """Band-summed significance per group, at 2.097 ms.
+
+    This is the plot the whole feature is for: the array sum makes
+    visible the bursts that no single antenna can see.
+    """
+    rec = _array_burst_record(snap, chgroup=chgroup)
+    if rec is None:
+        return _placeholder_png(
+            "no array-burst data for chgroup %d\n"
+            "(detector off, still warming up, or exporter is v1)" % chgroup
+        )
+    z = rec.group_z                                # (T, G, NPOL)
+    dt = rec.dt_s or 0.002097152
+    t = np.arange(z.shape[0]) * dt
+
+    fig = plt.figure(figsize=(11, 3.6))
+    ax = fig.add_subplot(111)
+    for name in _TIMESERIES_GROUPS:
+        gi = rec.group_index(name)
+        if gi is None:
+            continue
+        n_ant = rec.group_sizes[gi] if gi < len(rec.group_sizes) else 0
+        ax.plot(
+            t, z[:, gi, :].mean(axis=1), lw=0.7,
+            color=_GROUP_COLOURS.get(name, "#2d3436"),
+            label="%s (%d ant)" % (name, n_ant),
+        )
+    ax.axhline(detect_k, color="#d63031", lw=1.0, ls="--")
+    ax.text(
+        t[-1] if t.size else 0.0, detect_k, " %gσ " % detect_k,
+        color="#d63031", fontsize=8, ha="right", va="bottom",
+    )
+    # Mark the samples the flag group fired on.
+    fi = rec.group_index(rec.array_burst_flag_group or "core")
+    if fi is not None and rec.group_fired is not None:
+        hot = rec.group_fired[:, fi, :].astype(bool).any(axis=1)
+        for tt in t[hot]:
+            ax.axvline(tt, color="#d63031", lw=0.5, alpha=0.25, zorder=0)
+    ax.set_xlim(0, t[-1] if t.size else 1.0)
+    ax.set_xlabel("time within window [s]")
+    ax.set_ylabel("band-summed\nsignificance [σ]")
+    ax.set_title(
+        "chgroup %d — array-burst detector (%s, %.3f ms samples)"
+        % (chgroup, rec.array_burst_mode.upper(), dt * 1e3),
+        loc="left", fontsize=10,
+    )
+    ax.legend(loc="upper right", ncol=3, fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25, lw=0.5)
+    return _fig_to_png_bytes(fig)
+
+
+def render_array_burst_spectrum(snap: StoreSnapshot) -> bytes:
+    """Gain-normalised mean spectrum per group, over the full band.
+
+    Quiet data sits at 1.0 by construction (each antenna is divided by
+    its own running per-channel mean before summing), so anything
+    departing from 1.0 is real structure common to that group.
+    """
+    pieces: list[np.ndarray] = []
+    names: tuple[str, ...] = ()
+    sizes: tuple[int, ...] = ()
+    for cring in snap.per_chgroup:
+        rec = None
+        for r in reversed(cring.records):
+            gs = getattr(r, "group_spec_mean", None)
+            if gs is not None and gs.size:
+                rec = r
+                break
+        if rec is None:
+            return _placeholder_png(
+                "array-burst spectra unavailable\n"
+                "(need every chgroup reporting; detector may be off)"
+            )
+        pieces.append(rec.group_spec_mean)         # (G, NCHAN_DS, NPOL)
+        names, sizes = rec.group_names, rec.group_sizes
+    spec = np.concatenate(pieces, axis=1)          # (G, 16*NCHAN_DS, NPOL)
+    freq = production_freq_axis_GHz()
+    if freq.size != spec.shape[1]:
+        # The freq table is pinned to freq_downsample=4; a differently
+        # binned aggregator would silently mis-label every channel.
+        return _placeholder_png(
+            "frequency axis is %d channels but the records carry %d\n"
+            "(check rfi_mon_freq_downsample)" % (freq.size, spec.shape[1])
+        )
+
+    fig = plt.figure(figsize=(11, 3.6))
+    ax = fig.add_subplot(111)
+    for gi, name in enumerate(names):
+        if name not in _TIMESERIES_GROUPS:
+            continue
+        n_ant = sizes[gi] if gi < len(sizes) else 0
+        ax.plot(
+            freq, spec[gi].mean(axis=1), lw=0.7,
+            color=_GROUP_COLOURS.get(name, "#2d3436"),
+            label="%s (%d ant)" % (name, n_ant),
+        )
+    ax.axhline(1.0, color="0.6", lw=0.7, ls=":")
+    _add_chgroup_dividers(ax)
+    _add_hi_marker(ax)
+    ax.set_xlabel("frequency [GHz]")
+    ax.set_ylabel("power / own\nrunning mean")
+    ax.set_title(
+        "gain-normalised group spectra (1.0 = quiet)",
+        loc="left", fontsize=10,
+    )
+    ax.legend(loc="upper right", ncol=3, fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25, lw=0.5)
+    return _fig_to_png_bytes(fig)
+
+
+def render_array_burst_arms(snap: StoreSnapshot, *, chgroup: int) -> bytes:
+    """E-W against N-S fractional excess, one point per 2.097 ms sample.
+
+    A far-field source illuminates both arms in proportion to their
+    collecting area, so it lands on the 1:1 line. A local source does
+    not — the 260812imek bursts sit at 1.86% E-W against 0.81% N-S.
+    This is the plot that turns the detector into a discriminant.
+    """
+    rec = _array_burst_record(snap, chgroup=chgroup)
+    if rec is None or rec.group_band_frac is None:
+        return _placeholder_png(
+            "no array-burst data for chgroup %d" % chgroup
+        )
+    iew, ins = rec.group_index("ew_arm"), rec.group_index("ns_arm")
+    if iew is None or ins is None:
+        return _placeholder_png("arm groups not present in this record")
+    bf = rec.group_band_frac
+    ew = bf[:, iew, :].mean(axis=1) * 100.0
+    ns = bf[:, ins, :].mean(axis=1) * 100.0
+    fi = rec.group_index(rec.array_burst_flag_group or "core")
+    if fi is None or rec.group_fired is None:
+        hot = np.zeros(ew.shape, dtype=bool)
+    else:
+        hot = rec.group_fired[:, fi, :].astype(bool).any(axis=1)
+
+    fig = plt.figure(figsize=(5.4, 5.2))
+    ax = fig.add_subplot(111)
+    ax.scatter(ns[~hot], ew[~hot], s=4, c="#b2bec3", alpha=0.5,
+               label="quiet samples", linewidths=0)
+    if hot.any():
+        ax.scatter(ns[hot], ew[hot], s=26, c="#d63031",
+                   label="fired (%d)" % int(hot.sum()), zorder=3,
+                   linewidths=0)
+    both = np.concatenate([ew, ns])
+    lim = float(max(1e-3, np.abs(both).max())) * 1.1
+    ax.plot([-lim, lim], [-lim, lim], color="#0984e3", lw=1.0, ls="--",
+            label="1:1 (far field)")
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_xlabel("N-S arm excess [% of own power]")
+    ax.set_ylabel("E-W arm excess [% of own power]")
+    ax.set_title("chgroup %d — arm symmetry" % chgroup, loc="left",
+                 fontsize=10)
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25, lw=0.5)
+    ax.set_aspect("equal")
+    return _fig_to_png_bytes(fig)

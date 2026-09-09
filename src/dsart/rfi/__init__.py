@@ -14,6 +14,12 @@ Public surface:
   transport header used by :mod:`bench.rfi_warmup`.
 * :func:`load_flagants` / :func:`load_flagants_torch` — legacy
   ``flagants.dat`` loader.
+* :class:`ArrayBurstDetector` — array-common broadband burst
+  detector on the core / E-W arm / N-S arm autocorrelation sums, at
+  2.097 ms. Covers the blind spot every per-antenna detector shares:
+  a burst common to the whole array moves each of their references
+  along with the signal. Wired into :class:`RFIFlagger` but reported
+  separately, because its verdict is time-resolved.
 
 The lower-level per-detector helpers (:mod:`dsart.rfi.autos`,
 :mod:`dsart.rfi.sk`, :mod:`dsart.rfi.bandpass_outlier`,
@@ -23,6 +29,16 @@ exposed verbatim so unit tests can pin individual detector behaviour.
 
 from __future__ import annotations
 
+from dsart.rfi.array_burst import (
+    BIN_CHANS_DEFAULT,
+    DETECT_K_DEFAULT,
+    GROUP_NAMES,
+    OCCUPANCY_MIN_DEFAULT,
+    AntennaGroups,
+    ArrayBurstDetector,
+    ArrayBurstResult,
+    build_groups_from_antpos,
+)
 from dsart.rfi.autos import (
     DEFAULT_M_VALUES,
     TOTAL_NATIVE_T,
@@ -35,6 +51,7 @@ from dsart.rfi.bandpass_outlier import (
     bandpass_outlier_mask,
 )
 from dsart.rfi.combine import (
+    ARRAY_BURST_M_FINE,
     FlagBlockResult,
     FlagSourceBit,
     MockTransportHeader,
@@ -63,6 +80,16 @@ from dsart.rfi.sum_threshold import (
 )
 
 __all__ = [
+    # array-burst (array-common broadband, 2.097 ms)
+    "ARRAY_BURST_M_FINE",
+    "AntennaGroups",
+    "ArrayBurstDetector",
+    "ArrayBurstResult",
+    "BIN_CHANS_DEFAULT",
+    "DETECT_K_DEFAULT",
+    "GROUP_NAMES",
+    "OCCUPANCY_MIN_DEFAULT",
+    "build_groups_from_antpos",
     # autos
     "AutoSpectra",
     "DEFAULT_M_VALUES",

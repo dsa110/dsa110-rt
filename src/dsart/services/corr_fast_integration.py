@@ -109,8 +109,12 @@ from dsart.grid import (
     compute_top_of_band_cell_lambda,
 )
 from dsart.rfi import (
+    BIN_CHANS_DEFAULT,
+    TOTAL_NATIVE_T,
+    ArrayBurstDetector,
     FlagBlockResult,
     RFIFlagger,
+    build_groups_from_antpos,
 )
 from dsart.services.corr_fast_kernel import (
     FastCorrKernel,
@@ -1207,20 +1211,34 @@ def apply_rfi_mask_to_voltages(
     real_v: torch.Tensor,
     imag_v: torch.Tensor,
     rfi_mask: torch.Tensor,
+    *,
+    time_chan_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Zero ``(ant, ch, pol)`` cells flagged by the RFI flagger.
+    """Zero flagged cells in the voltages, in place.
 
     Args:
         real_v, imag_v: voltage tensors in M2 GEMM layout
             ``(NCHAN, NTIMES_PER_PACKET, NPOL, NPACKETS_PER_BLOCK,
-            NANTS)`` (any float dtype).
+            NANTS)`` (any float dtype). Must be contiguous.
         rfi_mask: bool tensor ``(NANTS, NCHAN, NPOL)`` from
-            :class:`FlagBlockResult.mask`. **True == flagged**.
+            :class:`FlagBlockResult.mask`. **True == flagged**. This
+            mask is constant across the cube: SK, bandpass- and
+            group-outlier all produce per-cube scalar statistics.
+        time_chan_mask: optional bool tensor ``(n_acc, NCHAN, NPOL)``
+            from the array-burst detector — **True == flagged** for
+            that 2.097 ms accumulation, on *every* antenna, because
+            the signal is array-common and cannot be attributed to
+            one. ``n_acc`` must tile ``NPACKETS_PER_BLOCK`` exactly
+            (64 accumulations of 32 packets in production).
 
     Returns:
-        Pair of voltage tensors with flagged cells set to zero
-        in-place. The mask is broadcast to the GEMM layout via
-        ``(NCHAN, 1, NPOL, 1, NANTS)``.
+        The same two tensors, mutated in place.
+
+    Raises:
+        TypeError: a mask is not bool.
+        ValueError: a mask shape does not match the voltage layout, or
+            ``n_acc`` does not divide the packet axis, or the
+            voltages are not contiguous.
 
     Notes
     -----
@@ -1228,15 +1246,23 @@ def apply_rfi_mask_to_voltages(
     visibilities) means the GEMM never sees the bad samples — so any
     baseline that touches a flagged antenna also has zero contribution
     on those (ch, pol) cells, which is the physically correct
-    treatment. The cost is one ``mul_`` over the voltage cube: ~2 GB
-    of fp16, ~150 µs on a 2080 Ti.
+    treatment.
+
+    The two masks are combined into **one** broadcast ``keep`` tensor
+    and applied with a single ``mul_`` per voltage tensor, so adding
+    the time axis does not add a second pass over the ~1.2 GB of fp16
+    voltages — it only grows ``keep`` from ``(NCHAN, 1, NPOL, 1, 1,
+    NANTS)`` to ``(NCHAN, 1, NPOL, n_acc, 1, NANTS)``, i.e. from
+    ~0.15 MB to ~9.4 MB. That matters: the fast path runs at 127 ms
+    p50 against a 134.218 ms budget, so a second full pass over the
+    voltages would not fit.
     """
     if rfi_mask.dtype != torch.bool:
         raise TypeError(
             f"rfi_mask must be bool; got {rfi_mask.dtype}"
         )
     n_ant_m, n_ch_m, n_pol_m = rfi_mask.shape
-    n_ch_v, _ntp_v, n_pol_v, _np_v, n_ant_v = real_v.shape
+    n_ch_v, ntp_v, n_pol_v, n_pkt_v, n_ant_v = real_v.shape
     if (n_ant_m, n_ch_m, n_pol_m) != (n_ant_v, n_ch_v, n_pol_v):
         raise ValueError(
             f"rfi_mask shape {tuple(rfi_mask.shape)} != voltage layout "
@@ -1251,10 +1277,76 @@ def apply_rfi_mask_to_voltages(
         .unsqueeze(1).unsqueeze(3)                                       # (NCHAN, 1, NPOL, 1, NANTS)
         .to(real_v.device)
     )
-    keep = (~mask_bcast).to(real_v.dtype)                                # 0/1 fp{16,32}
-    real_v.mul_(keep)
-    imag_v.mul_(keep)
+
+    if time_chan_mask is None:
+        keep = (~mask_bcast).to(real_v.dtype)                            # 0/1 fp{16,32}
+        real_v.mul_(keep)
+        imag_v.mul_(keep)
+        return real_v, imag_v
+
+    # ---- time-resolved path -------------------------------------------
+    if time_chan_mask.dtype != torch.bool:
+        raise TypeError(
+            f"time_chan_mask must be bool; got {time_chan_mask.dtype}"
+        )
+    n_acc, n_ch_t, n_pol_t = time_chan_mask.shape
+    if (n_ch_t, n_pol_t) != (n_ch_v, n_pol_v):
+        raise ValueError(
+            f"time_chan_mask shape {tuple(time_chan_mask.shape)} != "
+            f"(n_acc, NCHAN, NPOL) = (*, {n_ch_v}, {n_pol_v})"
+        )
+    if n_acc <= 0 or n_pkt_v % n_acc != 0:
+        raise ValueError(
+            f"time_chan_mask has n_acc={n_acc}, which does not divide "
+            f"the packet axis {n_pkt_v}. The accumulations must tile "
+            f"the block exactly."
+        )
+    if not (real_v.is_contiguous() and imag_v.is_contiguous()):
+        raise ValueError(
+            "time-resolved RFI masking needs contiguous voltages: the "
+            "packet axis is split into (n_acc, pkts_per_acc) as a "
+            "VIEW so the in-place mul_ lands on the caller's tensor. "
+            "A reshape-copy here would silently discard the flags."
+        )
+    pkts_per_acc = n_pkt_v // n_acc
+
+    # (n_acc, NCHAN, NPOL) → (NCHAN, 1, NPOL, n_acc, 1, 1)
+    tmask = (
+        time_chan_mask.permute(1, 2, 0)                                  # (NCHAN, NPOL, n_acc)
+        .unsqueeze(1).unsqueeze(4).unsqueeze(5)                          # (NCHAN, 1, NPOL, n_acc, 1, 1)
+        .to(real_v.device)
+    )
+    # (NCHAN, 1, NPOL, 1, NANTS) → (NCHAN, 1, NPOL, 1, 1, NANTS)
+    cmask = mask_bcast.unsqueeze(3)
+
+    # One materialised keep tensor, then one mul_ per voltage tensor.
+    keep = (~(cmask | tmask)).to(real_v.dtype)
+    real_v.view(
+        n_ch_v, ntp_v, n_pol_v, n_acc, pkts_per_acc, n_ant_v,
+    ).mul_(keep)
+    imag_v.view(
+        n_ch_v, ntp_v, n_pol_v, n_acc, pkts_per_acc, n_ant_v,
+    ).mul_(keep)
     return real_v, imag_v
+
+
+def _array_burst_time_mask(
+    ctx: "IntegrationContext",
+    rfi_result: FlagBlockResult,
+) -> torch.Tensor | None:
+    """The array-burst time-resolved mask, but only when armed.
+
+    Returns ``None`` in ``off`` and ``monitor`` modes, so the monitor
+    path can publish everything the detector found while the voltages
+    go through untouched. ``None`` is also returned during the
+    detector's warmup window, when it has no baseline yet.
+    """
+    if ctx.cfg.rfi_array_burst_mode != "flag":
+        return None
+    ab = rfi_result.array_burst
+    if ab is None:
+        return None
+    return ab.time_chan_mask
 
 
 # ---------------------------------------------------------------------------
@@ -1342,6 +1434,26 @@ class FastIntegrationConfig:
     rfi_m_values: tuple[int, ...] | None = None
     rfi_warmup_cubes: int | None = None
     rfi_sumthr_enabled: bool = True
+    # ---- array-burst detector (array-common broadband, 2.097 ms) ----
+    # Covers the blind spot every per-antenna detector shares: a burst
+    # common to the whole array moves each of their references along
+    # with the signal, so it reads 0.05 sigma in the cell the flagger
+    # tests and 13.3 sigma in the array-summed band power. See
+    # dsart.rfi.array_burst.
+    #
+    # Ships as "monitor": computed and published to the RFI page, but
+    # nothing is excised. The fast path has ~7 ms of p50 headroom
+    # against the 134.218 ms block period (measured across the fleet
+    # 2026-09-08: p50 126.9 ms, p90 138.6 ms), and a detector that can
+    # flag every antenna at once is worth watching before arming.
+    rfi_array_burst_mode: str = "monitor"
+    rfi_array_burst_group: str = "core"
+    rfi_array_burst_k: float | None = None
+    rfi_array_burst_bin_k: float | None = None
+    rfi_array_burst_occupancy: float | None = None
+    rfi_array_burst_bin_chans: int | None = None
+    rfi_array_burst_ema_cubes: int | None = None
+    rfi_array_burst_warmup_cubes: int | None = None
     static_sky_window_s: float = 1.0
     static_sky_warmup_cubes: int = 8
     static_sky_disabled: bool = False
@@ -1847,13 +1959,19 @@ def _process_block_corr_phase(
     if ctx.rfi_flagger is not None and ctx.cfg.rfi_enabled:
         rfi_result = ctx.rfi_flagger.flag_block(real_v, imag_v)
 
-        # 3. Voltage zero-fill of flagged cells (full-cube; bandpass
-        # outliers and SK are on per-cube SCALAR statistics so the
-        # mask is constant-in-time across the cube — we apply it to
-        # all (NTIMES, NPACKETS) samples uniformly).
-        if ctx.cfg.rfi_mask_voltage_zero_fill and rfi_result.mask.any():
+        # 3. Voltage zero-fill of flagged cells. The cube mask is
+        # constant-in-time (bandpass-outlier and SK are per-cube
+        # SCALAR statistics) so it applies to all (NTIMES, NPACKETS)
+        # samples uniformly; the array-burst mask, when armed, is
+        # time-resolved at 2.097 ms and applies to every antenna.
+        # Both fold into a single mul_ — see the function docstring.
+        ab_time_mask = _array_burst_time_mask(ctx, rfi_result)
+        if ctx.cfg.rfi_mask_voltage_zero_fill and (
+            ab_time_mask is not None or rfi_result.mask.any()
+        ):
             real_v, imag_v = apply_rfi_mask_to_voltages(
                 real_v, imag_v, rfi_result.mask,
+                time_chan_mask=ab_time_mask,
             )
 
     # 4. Cal apply with F21 DEC-phase fold
@@ -1970,9 +2088,13 @@ def _process_block_compute_phase(
     rfi_result: FlagBlockResult | None = None
     if ctx.rfi_flagger is not None and ctx.cfg.rfi_enabled:
         rfi_result = ctx.rfi_flagger.flag_block(real_v, imag_v)
-        if ctx.cfg.rfi_mask_voltage_zero_fill and rfi_result.mask.any():
+        ab_time_mask = _array_burst_time_mask(ctx, rfi_result)
+        if ctx.cfg.rfi_mask_voltage_zero_fill and (
+            ab_time_mask is not None or rfi_result.mask.any()
+        ):
             real_v, imag_v = apply_rfi_mask_to_voltages(
                 real_v, imag_v, rfi_result.mask,
+                time_chan_mask=ab_time_mask,
             )
 
     # 4. Cal apply with F21 DEC-phase fold
@@ -2714,6 +2836,7 @@ def build_context(
     antpos_e: np.ndarray,
     antpos_n: np.ndarray,
     is_core_baseline_mask: np.ndarray | None = None,
+    station_numbers: np.ndarray | None = None,
     coarse_dm: CoarseDMStage | None = None,
     stage2_fifo: Stage2FifoStage | None = None,
     transport_tx: TransportTxStage | None = None,
@@ -2726,6 +2849,12 @@ def build_context(
     The ``coarse_dm`` / ``stage2_fifo`` / ``transport_tx`` parameters
     default to no-op stubs (chunk 4 placeholder); chunk 3b / chunk 8
     will pass real implementations in.
+
+    ``station_numbers`` (per-antenna DSA-110 station numbers in fada
+    cube order) is optional and used only by the array-burst detector,
+    to split core from outriggers the canonical way. Without it the
+    split falls back to geometry, which is logged as a warning — see
+    :func:`dsart.rfi.array_burst.build_groups_from_antpos`.
     """
     voltage_dtype: torch.dtype = (
         torch.float32 if (
@@ -2768,6 +2897,17 @@ def build_context(
             rfi_kwargs["m_values"] = cfg.rfi_m_values
         if cfg.rfi_warmup_cubes is not None:
             rfi_kwargs["warmup_cubes"] = cfg.rfi_warmup_cubes
+
+        ab_detector = _build_array_burst_detector(
+            cfg,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            station_numbers=station_numbers,
+            device=device,
+        )
+        if ab_detector is not None:
+            rfi_kwargs["array_burst"] = ab_detector
+            rfi_kwargs["array_burst_mode"] = cfg.rfi_array_burst_mode
+
         rfi_flagger = RFIFlagger(**rfi_kwargs)
         LOG.info(
             "RFIFlagger ready: warmup_cubes=%d sk_far=%.3g "
@@ -2777,6 +2917,26 @@ def build_context(
             "on" if cfg.rfi_sumthr_enabled else "OFF",
             rfi_flagger._m_values,
         )
+        if rfi_flagger.array_burst is not None:
+            ab = rfi_flagger.array_burst
+            LOG.info(
+                "array-burst detector %s: flag_group=%s (%s), "
+                "%d coarse bins of %d channels, detect_k=%.1f "
+                "bin_k=%.1f occupancy>=%.2f",
+                rfi_flagger.array_burst_mode.upper(),
+                ab.flag_group,
+                ", ".join(
+                    "%s=%d" % (n, int(v))
+                    for n, v in zip(ab.group_names, ab.groups.sizes.tolist())
+                ),
+                ab.n_bin, cfg.rfi_array_burst_bin_chans or BIN_CHANS_DEFAULT,
+                ab._detect_k, ab._bin_k, ab._occupancy_min,
+            )
+            if rfi_flagger.array_burst_mode == "monitor":
+                LOG.info(
+                    "array-burst is MONITOR-ONLY: nothing is excised on "
+                    "the fast path. Set --rfi-array-burst-mode flag to arm."
+                )
     else:
         LOG.info("RFIFlagger DISABLED (cfg.rfi_enabled=False)")
 
@@ -3100,6 +3260,108 @@ def load_antpos_from_cal_blob(
                 antpos_e.size,
             )
     return (antpos_e, antpos_n, mask)
+
+
+def load_station_numbers_for_cal(
+    cal_path: Path | None,
+    *,
+    cal_yaml_path: Path | None = None,
+) -> np.ndarray | None:
+    """Per-antenna DSA-110 station numbers in fada cube order.
+
+    Mirrors the resolution order :func:`load_antpos_from_cal_blob`
+    already uses for the core mask: the per-node cal yaml sibling if
+    one exists, otherwise the fleet-wide ``corr_setup_96.yaml`` that
+    ships with the repo (the production case). Returns ``None`` when
+    neither is available, in which case the array-burst grouping falls
+    back to geometry and says so.
+
+    Kept separate from :func:`load_antpos_from_cal_blob` rather than
+    widening its return tuple, because that function has four callers
+    across services and benches.
+    """
+    if cal_path is not None:
+        cal_path = Path(cal_path)
+        yaml_path = cal_yaml_path
+        if yaml_path is None:
+            candidates = sorted(
+                cal_path.parent.glob("beamformer_weights_*.yaml")
+            )
+            if candidates:
+                yaml_path = candidates[0]
+        if yaml_path is not None and Path(yaml_path).is_file():
+            try:
+                import yaml as _yaml
+                with open(yaml_path, "r") as f:
+                    ydoc = _yaml.safe_load(f)
+                order = ydoc["cal_solutions"]["antenna_order"]
+                return np.asarray(order, dtype=np.int64)
+            except Exception:  # noqa: BLE001
+                LOG.exception(
+                    "station numbers: cal yaml %s unreadable; falling "
+                    "back to the fleet order", yaml_path,
+                )
+    order = load_fleet_antenna_order()
+    if order is None:
+        return None
+    return np.asarray(order, dtype=np.int64)
+
+
+def _build_array_burst_detector(
+    cfg: FastIntegrationConfig,
+    *,
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    station_numbers: np.ndarray | None,
+    device: torch.device,
+) -> ArrayBurstDetector | None:
+    """Construct the array-common burst detector, or ``None``.
+
+    Returns ``None`` when the mode is ``off`` or when the array
+    geometry cannot be split into two populated arms — the arm
+    comparison is meaningless without both, and a detector that
+    silently degrades is worse than one that is absent. A geometry
+    failure is logged and swallowed rather than raised: RFI flagging
+    must never be the reason corr_fast fails to start.
+    """
+    if cfg.rfi_array_burst_mode == "off":
+        return None
+    try:
+        groups = build_groups_from_antpos(
+            antpos_e, antpos_n, station_numbers, device=device,
+        )
+    except ValueError:
+        LOG.exception(
+            "array-burst: could not split the array into groups; "
+            "detector DISABLED (the rest of the flagger is unaffected)"
+        )
+        return None
+
+    kw: dict[str, Any] = {
+        "n_chan": NCHAN_PER_CHGROUP,
+        "n_pol": NPOL,
+        "flag_group": cfg.rfi_array_burst_group,
+        "device": device,
+    }
+    if cfg.rfi_array_burst_k is not None:
+        kw["detect_k"] = cfg.rfi_array_burst_k
+    if cfg.rfi_array_burst_bin_k is not None:
+        kw["bin_k"] = cfg.rfi_array_burst_bin_k
+    if cfg.rfi_array_burst_occupancy is not None:
+        kw["occupancy_min"] = cfg.rfi_array_burst_occupancy
+    if cfg.rfi_array_burst_bin_chans is not None:
+        kw["bin_chans"] = cfg.rfi_array_burst_bin_chans
+    if cfg.rfi_array_burst_ema_cubes is not None:
+        kw["ema_cubes"] = cfg.rfi_array_burst_ema_cubes
+    if cfg.rfi_array_burst_warmup_cubes is not None:
+        kw["warmup_cubes"] = cfg.rfi_array_burst_warmup_cubes
+    try:
+        return ArrayBurstDetector(groups, **kw)
+    except ValueError:
+        LOG.exception(
+            "array-burst: bad configuration; detector DISABLED"
+        )
+        return None
 
 
 def _build_core_baseline_mask(
@@ -3430,6 +3692,7 @@ def run(
                 "gridder pattern matches the cal."
             )
         antpos_e, antpos_n, core_mask = load_antpos_from_cal_blob(cfg.cal_path)
+        station_numbers = load_station_numbers_for_cal(cfg.cal_path)
 
         # ── M7.2 overlap path: real Stage2FIFO + TransportTx ─────────
         # When --transport-tx-host is set, replace the NoOp stubs with
@@ -3573,6 +3836,7 @@ def run(
             cfg, device=device,
             antpos_e=antpos_e, antpos_n=antpos_n,
             is_core_baseline_mask=core_mask,
+            station_numbers=station_numbers,
             coarse_dm=coarse_dm,
             stage2_fifo=stage2_fifo,
             transport_tx=transport_tx,
@@ -3826,6 +4090,24 @@ def run(
 
             agg_window = int(rfi_mon_window_size or WINDOW_SIZE_DEFAULT)
             agg_ds = int(rfi_mon_freq_downsample or FREQ_DOWNSAMPLE_DEFAULT)
+
+            # Array-burst section of the record. n_acc is a property
+            # of the accumulation plan (4096 native samples per cube /
+            # the base M), so it is known here without waiting for a
+            # cube to arrive — which the fixed-size shm record needs.
+            _ab = ctx.rfi_flagger.array_burst
+            ab_group_names = _ab.group_names if _ab is not None else ()
+            ab_group_sizes = (
+                [int(v) for v in _ab.groups.sizes.tolist()]
+                if _ab is not None else None
+            )
+            ab_flag_group = _ab.flag_group if _ab is not None else ""
+            ab_n_group = len(ab_group_names)
+            ab_n_acc = (
+                TOTAL_NATIVE_T // min(ctx.rfi_flagger._m_values)
+                if _ab is not None else 0
+            )
+
             rfi_aggregator = RFIWindowAggregator(
                 n_ants=NANTS,
                 n_chan=NCHAN_PER_CHGROUP,
@@ -3833,6 +4115,9 @@ def run(
                 window_size=agg_window,
                 freq_downsample=agg_ds,
                 device=device,
+                group_names=ab_group_names or None,
+                group_sizes=ab_group_sizes,
+                array_burst_flag_group=ab_flag_group,
             )
             rfi_shm_writer = RFIMonShmWriter(
                 cn_id=int(rfi_mon_cn_id),
@@ -3842,6 +4127,10 @@ def run(
                 window_size=agg_window,
                 freq_downsample=agg_ds,
                 n_slots=int(rfi_mon_shm_slots),
+                n_group=ab_n_group,
+                n_acc_per_cube=ab_n_acc,
+                group_names=ab_group_names,
+                array_burst_flag_group=ab_flag_group,
             )
             LOG.info(
                 "M7.6 RFI monitor: aggregator window=%d cubes (~%.2f s), "
@@ -3920,6 +4209,8 @@ def run(
                         source_tags=out.rfi.source_tags,
                         block_n=int(n_out),
                         warmup=bool(out.rfi.warmup),
+                        array_burst=out.rfi.array_burst,
+                        array_burst_mode=ctx.cfg.rfi_array_burst_mode,
                     )
                     if window is not None:
                         rfi_shm_writer.publish(window)
@@ -4296,6 +4587,41 @@ def main(argv: list[str] | None = None) -> int:
                         "bandpass-outlier is bypassed and rfi_warming_up "
                         "is asserted in the transport header. Library "
                         "default ~1118 cubes (~150 s).")
+    # ---- array-burst detector (dsart.rfi.array_burst) ----------------
+    p.add_argument("--rfi-array-burst-mode",
+                   choices=("off", "monitor", "flag"), default="monitor",
+                   help="array-common broadband burst detector on the "
+                        "core / arm autocorrelation sums at 2.097 ms. "
+                        "'monitor' (default) computes and publishes it "
+                        "to the RFI page but excises nothing; 'flag' "
+                        "arms the time-resolved zero-fill; 'off' skips "
+                        "it entirely.")
+    p.add_argument("--rfi-array-burst-group", type=str, default="core",
+                   help="which summing group's verdict drives the flag: "
+                        "all / core / ew_arm / ns_arm / outriggers "
+                        "(default: core — best median significance, "
+                        "excludes the noisier outriggers)")
+    p.add_argument("--rfi-array-burst-k", type=float, default=None,
+                   help="sigma threshold on the group's band-summed "
+                        "power (library default: 6.0)")
+    p.add_argument("--rfi-array-burst-bin-k", type=float, default=None,
+                   help="sigma a coarse frequency bin must clear to "
+                        "count as occupied (library default: 2.0)")
+    p.add_argument("--rfi-array-burst-occupancy", type=float, default=None,
+                   help="fraction of coarse bins that must be occupied "
+                        "before a sample fires (library default: 0.75). "
+                        "This is the FRB guard: a dispersed burst above "
+                        "DM~150 lights too little of an 11.72 MHz "
+                        "sub-band in one 2.097 ms sample to reach it.")
+    p.add_argument("--rfi-array-burst-bin-chans", type=int, default=None,
+                   help="channels per coarse decision bin; must divide "
+                        "384 (library default: 16 = 0.488 MHz)")
+    p.add_argument("--rfi-array-burst-ema-cubes", type=int, default=None,
+                   help="baseline EMA time constant in cubes "
+                        "(library default: 224 ~ 30 s)")
+    p.add_argument("--rfi-array-burst-warmup-cubes", type=int, default=None,
+                   help="cubes spent seeding the baseline before any "
+                        "sample may fire (library default: 32)")
     p.add_argument("--n-grid", type=int, default=256,
                    help="grid side length (default: 256)")
     p.add_argument("--kernel-support", type=int, default=1,
@@ -4622,6 +4948,14 @@ def main(argv: list[str] | None = None) -> int:
         rfi_m_values=rfi_m_values_parsed,
         rfi_warmup_cubes=args.rfi_warmup_cubes,
         rfi_sumthr_enabled=not args.sumthr_disabled,
+        rfi_array_burst_mode=args.rfi_array_burst_mode,
+        rfi_array_burst_group=args.rfi_array_burst_group,
+        rfi_array_burst_k=args.rfi_array_burst_k,
+        rfi_array_burst_bin_k=args.rfi_array_burst_bin_k,
+        rfi_array_burst_occupancy=args.rfi_array_burst_occupancy,
+        rfi_array_burst_bin_chans=args.rfi_array_burst_bin_chans,
+        rfi_array_burst_ema_cubes=args.rfi_array_burst_ema_cubes,
+        rfi_array_burst_warmup_cubes=args.rfi_array_burst_warmup_cubes,
         static_sky_window_s=args.static_sky_window_s,
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,

@@ -54,7 +54,9 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +159,253 @@ def _build_cal_tensors(
     return cal_real, cal_imag, info
 
 
+# ---------------------------------------------------------------------------
+# Optional RFI flagging on the slow path (M7.7)
+# ---------------------------------------------------------------------------
+#
+# The slow correlator has always run unflagged: slow visibilities are
+# emitted deliberately raw so cal solutions can be derived downstream
+# (D2/D17). Flagging here is opt-in, off by default, and toggleable at
+# runtime from the dashboard's Control tab, because turning it on
+# changes what every downstream calibration sees.
+#
+# Two things differ from the fast path:
+#
+#   1. The array-burst detector runs ARMED here, not in monitor mode.
+#      Slow visibilities are not searched for FRBs, so the one risk
+#      that keeps it monitor-only on the fast path does not apply.
+#   2. A Galactic HI guard band is carved out that no detector may
+#      flag. On the fast path, excising HI is correct; on the slow
+#      path it would be throwing away the science. See dsart.rfi.
+#      hi_guard for the measurement that motivated this.
+
+#: etcd key carrying the fleet-wide slow-path flagging state. Written
+#: by the dashboard Control tab, polled here.
+SLOW_RFI_ETCD_KEY: str = "/cnf/corr_slow_rfi"
+
+#: How often the background poller re-reads the etcd key.
+SLOW_RFI_POLL_S: float = 5.0
+
+
+@dataclass
+class SlowRfiSettings:
+    """Runtime-toggleable slow-path flagging state."""
+
+    enabled: bool = False
+    array_burst_mode: str = "flag"
+    hi_guard: bool = True
+
+    @classmethod
+    def from_payload(
+        cls, payload: Any, *, current: "SlowRfiSettings",
+    ) -> "SlowRfiSettings":
+        """Parse an etcd payload, keeping current values for anything
+        absent or malformed. A bad payload must never be able to turn
+        flagging ON by accident, so `enabled` is only honoured when it
+        is a real bool."""
+        if not isinstance(payload, dict):
+            return current
+        enabled = payload.get("enabled")
+        mode = payload.get("array_burst_mode")
+        hi = payload.get("hi_guard")
+        return cls(
+            enabled=(
+                bool(enabled) if isinstance(enabled, bool) else current.enabled
+            ),
+            array_burst_mode=(
+                str(mode) if mode in ("off", "monitor", "flag")
+                else current.array_burst_mode
+            ),
+            hi_guard=bool(hi) if isinstance(hi, bool) else current.hi_guard,
+        )
+
+
+class SlowRfiControl:
+    """Background etcd poller for the slow-path flagging toggle.
+
+    A daemon thread, not an etcd watch: the main loop is a real-time
+    consumer of a PSRDADA ring, and a poll that can be wrapped in a
+    try/except and simply skipped is easier to reason about than a
+    watch callback that can raise from library internals. Five-second
+    latency on a manual operator toggle is irrelevant.
+
+    The main loop only ever reads :attr:`settings`, which is replaced
+    atomically (a dataclass rebind, not a mutation).
+    """
+
+    def __init__(
+        self,
+        *,
+        initial: SlowRfiSettings,
+        key: str = SLOW_RFI_ETCD_KEY,
+        poll_s: float = SLOW_RFI_POLL_S,
+        store: Any | None = None,
+    ) -> None:
+        self.settings = initial
+        self._key = key
+        self._poll_s = float(poll_s)
+        self._store = store
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._n_polls = 0
+        self._n_errors = 0
+
+    def start(self) -> None:
+        if self._store is None:
+            try:
+                from dsautils.dsa_store import DsaStore
+                self._store = DsaStore()
+            except Exception:  # noqa: BLE001
+                LOG.warning(
+                    "slow-RFI control: etcd unavailable; the toggle at "
+                    "%s will not be honoured (staying with %s)",
+                    self._key, self.settings,
+                )
+                return
+        self.poll_once()
+        self._thread = threading.Thread(
+            target=self._loop, name="slow-rfi-control", daemon=True,
+        )
+        self._thread.start()
+        LOG.info(
+            "slow-RFI control: polling %s every %.1fs", self._key, self._poll_s,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def poll_once(self) -> None:
+        if self._store is None:
+            return
+        self._n_polls += 1
+        try:
+            payload = self._store.get_dict(self._key)
+        except Exception:  # noqa: BLE001
+            self._n_errors += 1
+            if self._n_errors <= 3 or self._n_errors % 100 == 0:
+                LOG.warning(
+                    "slow-RFI control: etcd read of %s failed (%d/%d); "
+                    "keeping %s", self._key, self._n_errors, self._n_polls,
+                    self.settings,
+                )
+            return
+        new = SlowRfiSettings.from_payload(payload, current=self.settings)
+        if new != self.settings:
+            LOG.info(
+                "slow-RFI control: %s -> %s (from %s)",
+                self.settings, new, self._key,
+            )
+            self.settings = new
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._poll_s):
+            self.poll_once()
+
+
+def build_slow_flagger(
+    *,
+    device: torch.device,
+    chgroup: int,
+    flagants_path: Path | None,
+    array_burst_mode: str,
+    cal_path: Path | None,
+) -> tuple[Any | None, Any]:
+    """Construct the slow-path RFIFlagger, or ``(None, None)``.
+
+    Returns ``(flagger, hi_guard_mask)`` where ``hi_guard_mask`` is a
+    bool torch tensor ``[NCHAN]``, True for channels the guard
+    protects.
+
+    Failures here are logged and swallowed: the slow correlator must
+    keep producing visibilities even if the flagger cannot be built.
+    """
+    try:
+        from dsart.rfi import RFIFlagger
+        from dsart.rfi.hi_guard import describe_hi_guard, hi_guard_channels
+        from dsart.services.corr_fast_integration import (
+            _build_array_burst_detector,
+            FastIntegrationConfig,
+            load_antpos_from_cal_blob,
+            load_station_numbers_for_cal,
+        )
+    except Exception:  # noqa: BLE001
+        LOG.exception("slow-RFI: imports failed; flagging DISABLED")
+        return (None, None)
+
+    guard_np = hi_guard_channels(int(chgroup))
+    guard = torch.as_tensor(guard_np, dtype=torch.bool, device=device)
+    LOG.info("slow-RFI: %s", describe_hi_guard(int(chgroup)))
+
+    detector = None
+    if array_burst_mode != "off" and cal_path is not None:
+        try:
+            antpos_e, antpos_n, _ = load_antpos_from_cal_blob(cal_path)
+            stations = load_station_numbers_for_cal(cal_path)
+            cfg = FastIntegrationConfig(
+                chgroup=int(chgroup), obs_dec_rad=0.0,
+                rfi_array_burst_mode=array_burst_mode,
+            )
+            detector = _build_array_burst_detector(
+                cfg, antpos_e=antpos_e, antpos_n=antpos_n,
+                station_numbers=stations, device=device,
+            )
+        except Exception:  # noqa: BLE001
+            LOG.exception(
+                "slow-RFI: array-burst detector unavailable; the "
+                "per-antenna chain will still run"
+            )
+            detector = None
+    elif array_burst_mode != "off":
+        LOG.warning(
+            "slow-RFI: --array-burst needs antenna positions, which come "
+            "from the cal blob; pass --antpos-cal. Running the "
+            "per-antenna chain only."
+        )
+
+    try:
+        kw: dict[str, Any] = {
+            "flagants_path": flagants_path,
+            "device": device,
+        }
+        if detector is not None:
+            kw["array_burst"] = detector
+            kw["array_burst_mode"] = array_burst_mode
+        flagger = RFIFlagger(**kw)
+    except Exception:  # noqa: BLE001
+        LOG.exception("slow-RFI: RFIFlagger construction failed; DISABLED")
+        return (None, guard)
+    LOG.info(
+        "slow-RFI: flagger ready (array-burst %s)",
+        array_burst_mode if detector is not None else "unavailable",
+    )
+    return (flagger, guard)
+
+
+def apply_hi_guard_(
+    mask: torch.Tensor,
+    guard: torch.Tensor | None,
+) -> torch.Tensor:
+    """Clear the guarded channels from a ``[NANTS, NCHAN, NPOL]`` mask.
+
+    In place. ``guard`` is ``[NCHAN]`` bool, True = protected.
+    """
+    if guard is None or not bool(guard.any()):
+        return mask
+    mask[:, guard, :] = False
+    return mask
+
+
+def apply_hi_guard_time_(
+    time_mask: torch.Tensor | None,
+    guard: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Same, for the array-burst ``[n_acc, NCHAN, NPOL]`` mask."""
+    if time_mask is None or guard is None or not bool(guard.any()):
+        return time_mask
+    time_mask[:, guard, :] = False
+    return time_mask
+
+
 def run(
     fada_key: int,
     bada_key: int,
@@ -169,6 +418,13 @@ def run(
     cal_mode: str = "phase",
     cal_pol_swap: bool = False,
     ready_sentinel_path: Path | None = None,
+    chgroup: int = 0,
+    rfi_enabled: bool = False,
+    rfi_array_burst_mode: str = "flag",
+    rfi_hi_guard: bool = True,
+    rfi_flagants_path: Path | None = None,
+    rfi_antpos_cal: Path | None = None,
+    rfi_etcd_toggle: bool = True,
 ) -> dict[str, Any]:
     """Connect to PSRDADA, run the corr loop, return summary stats.
 
@@ -215,6 +471,50 @@ def run(
         kernel = SlowCorrKernel(device=device)
         LOG.info("kernel ready: nants=%d nchan=%d nbase=%d nbada_pol=%d",
                  kernel.nants, kernel.nchan, kernel._nbase, kernel.nbada_pol)
+
+        # 2a. Optional RFI flagging (M7.7). OFF by default: slow
+        # visibilities have always been emitted raw so cal solutions
+        # can be derived downstream, and turning this on changes what
+        # every downstream calibration sees. The Control tab toggles
+        # it fleet-wide via etcd; see SlowRfiControl.
+        rfi_settings = SlowRfiSettings(
+            enabled=bool(rfi_enabled),
+            array_burst_mode=str(rfi_array_burst_mode),
+            hi_guard=bool(rfi_hi_guard),
+        )
+        rfi_ctl = SlowRfiControl(initial=rfi_settings)
+        if rfi_etcd_toggle:
+            rfi_ctl.start()
+        # apply_rfi_mask_to_voltages lives in corr_fast_integration,
+        # which imports triton + the gridder + coarse-DM. The slow
+        # correlator is documented as torch + psrdada only (D13), so
+        # this import stays lazy and inside the enabled path.
+        _apply_mask = None
+        rfi_flagger, hi_guard = build_slow_flagger(
+            device=device,
+            chgroup=int(chgroup),
+            flagants_path=rfi_flagants_path,
+            array_burst_mode=str(rfi_array_burst_mode),
+            cal_path=rfi_antpos_cal or cal_path,
+        )
+        if rfi_flagger is None:
+            LOG.info("slow-RFI: no flagger; visibilities stay unflagged")
+        else:
+            try:
+                from dsart.services.corr_fast_integration import (
+                    apply_rfi_mask_to_voltages as _apply_mask,
+                )
+            except Exception:  # noqa: BLE001
+                LOG.exception(
+                    "slow-RFI: cannot import the voltage masker; "
+                    "flagging DISABLED"
+                )
+                rfi_flagger = None
+            LOG.info(
+                "slow-RFI: initial state enabled=%s (toggle key %s)",
+                rfi_ctl.settings.enabled, SLOW_RFI_ETCD_KEY,
+            )
+        n_flagged_blocks = 0
 
         # 2b. Decide voltage / cal dtype based on --cal-mode (D17, 2026-05-05):
         #   * no cal           → fp16 (production fast path, tensor cores)
@@ -327,6 +627,38 @@ def run(
             #   fp32 for full-amplitude cal (avoid |G|² overflow)
             real_v, imag_v = unpack_int4_split(page_arr, device=device,
                                                out_dtype=voltage_dtype)
+
+            # RFI flag BEFORE cal, matching corr_fast: flags belong on
+            # the raw data so cal-induced dynamic-range shifts cannot
+            # mask them.
+            settings = rfi_ctl.settings
+            if rfi_flagger is not None and _apply_mask is not None \
+                    and settings.enabled:
+                try:
+                    rfi_flagger.set_array_burst_mode(settings.array_burst_mode)
+                    res = rfi_flagger.flag_block(real_v, imag_v)
+                    guard = hi_guard if settings.hi_guard else None
+                    cube_mask = apply_hi_guard_(res.mask, guard)
+                    tmask = None
+                    if (
+                        settings.array_burst_mode == "flag"
+                        and res.array_burst is not None
+                    ):
+                        tmask = apply_hi_guard_time_(
+                            res.array_burst.time_chan_mask, guard,
+                        )
+                    real_v, imag_v = _apply_mask(
+                        real_v, imag_v, cube_mask, time_chan_mask=tmask,
+                    )
+                    n_flagged_blocks += 1
+                except Exception:  # noqa: BLE001
+                    # Flagging is an enhancement; never let it stop the
+                    # slow correlator from producing visibilities.
+                    LOG.exception(
+                        "slow-RFI: flag_block failed on block %d; "
+                        "passing voltages through unflagged", n_in,
+                    )
+
             if cal_real_b is not None:
                 real_v_cal, imag_v_cal = apply_cal_split(
                     real_v, imag_v, cal_real_b, cal_imag_b,
@@ -380,8 +712,8 @@ def run(
         ms_p99 = float(np.percentile(per_block_ms, 99)) if per_block_ms else float("nan")
         LOG.info(
             "summary: n_in=%d n_out=%d n_drop=%d elapsed=%.1fs "
-            "p50=%.1fms p99=%.1fms",
-            n_in, n_out, n_drop, elapsed, ms_p50, ms_p99,
+            "p50=%.1fms p99=%.1fms rfi_flagged_blocks=%d",
+            n_in, n_out, n_drop, elapsed, ms_p50, ms_p99, n_flagged_blocks,
         )
         return {
             "n_blocks_in": n_in,
@@ -390,6 +722,10 @@ def run(
             "elapsed_s": elapsed,
             "ms_per_block_p50": ms_p50,
             "ms_per_block_p99": ms_p99,
+            "n_blocks_flagged": n_flagged_blocks,
+            "rfi_enabled": bool(rfi_ctl.settings.enabled),
+            "rfi_array_burst_mode": rfi_ctl.settings.array_burst_mode,
+            "rfi_hi_guard": bool(rfi_ctl.settings.hi_guard),
         }
     finally:
         # Signal bada EOD so any downstream reader (e.g. meridian_fringestop's
@@ -448,6 +784,44 @@ def main(argv: list[str] | None = None) -> int:
                         "gates capture routines (dada_junkdb) on this file "
                         "so they do not stuff the dada/eada rings during "
                         "the multi-second cold start of this consumer.")
+    # ---- optional RFI flagging (M7.7) --------------------------------
+    p.add_argument("--chgroup", type=int, default=0,
+                   help="this node's chgroup index (0-15). Only used by "
+                        "the RFI options: it fixes the channel->frequency "
+                        "map, which the Galactic HI guard needs.")
+    p.add_argument("--rfi", action="store_true",
+                   help="enable RFI flagging on the slow path. OFF by "
+                        "default: slow visibilities have always been "
+                        "emitted raw so cal solutions can be derived "
+                        "downstream, and turning this on changes what "
+                        "every downstream calibration sees. Can also be "
+                        "toggled at runtime from the dashboard Control "
+                        "tab (etcd " + SLOW_RFI_ETCD_KEY + ").")
+    p.add_argument("--rfi-array-burst-mode",
+                   choices=("off", "monitor", "flag"), default="flag",
+                   help="array-common broadband burst detector. Defaults "
+                        "to 'flag' here (unlike the fast path): slow "
+                        "visibilities are not searched for FRBs, so the "
+                        "risk that keeps it monitor-only there does not "
+                        "apply.")
+    p.add_argument("--rfi-no-hi-guard", action="store_true",
+                   help="do NOT protect the Galactic HI band. The guard "
+                        "is on by default because the online flagger "
+                        "excises HI at up to 99.5%% occupancy, which is "
+                        "correct on the fast path and wrong here.")
+    p.add_argument("--rfi-flagants", type=Path, default=None,
+                   help="legacy flagants.dat for the static antenna "
+                        "overlay (optional)")
+    p.add_argument("--rfi-antpos-cal", type=Path, default=None,
+                   help="beamformer-weights blob to read antenna "
+                        "positions from, for the core/arm split. "
+                        "Defaults to --apply-cal when that is given; "
+                        "without either, the array-burst detector "
+                        "cannot be built and only the per-antenna chain "
+                        "runs.")
+    p.add_argument("--rfi-no-etcd-toggle", action="store_true",
+                   help="do not poll etcd for the runtime flagging "
+                        "toggle (use the CLI flags as fixed settings)")
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -482,7 +856,14 @@ def main(argv: list[str] | None = None) -> int:
             cal_path=args.apply_cal,
             cal_mode=args.cal_mode,
             cal_pol_swap=args.cal_pol_swap,
-            ready_sentinel_path=args.ready_sentinel_path)
+            ready_sentinel_path=args.ready_sentinel_path,
+            chgroup=args.chgroup,
+            rfi_enabled=args.rfi,
+            rfi_array_burst_mode=args.rfi_array_burst_mode,
+            rfi_hi_guard=not args.rfi_no_hi_guard,
+            rfi_flagants_path=args.rfi_flagants,
+            rfi_antpos_cal=args.rfi_antpos_cal,
+            rfi_etcd_toggle=not args.rfi_no_etcd_toggle)
     except _StopRequested:
         LOG.info("clean stop")
     except KeyboardInterrupt:

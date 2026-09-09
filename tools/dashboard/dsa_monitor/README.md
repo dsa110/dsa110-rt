@@ -5,6 +5,12 @@ Multi-tab Flask app that surfaces:
 * **Antennas / RFI** — per-antenna pre-flag bandpass, 30-min waterfalls,
   flag spectra, and the existing `/mon/ant/<n>` etcd table for one
   selected antenna.
+* **Array sums** — the core and each arm of the core treated as extra
+  antennas: band-summed significance at 2.097 ms with the fired
+  samples marked, E-W vs N-S arm symmetry against the 1:1 far-field
+  line, and gain-normalised group spectra. This is where the
+  array-common burst detector (M7.7) reports; see
+  `docs/M7.7_array_burst_flagging.md`.
 * **SEFDs** — passthrough/iframe of the existing SEFD dashboard
   (port 5777, run by `sefd_dashboard.service`).
 * **Burst candidates** — placeholder for a future tab.
@@ -36,12 +42,18 @@ auto-refresh, no caching.
 |-----|------|
 | `/` or `/antennas` | Antennas/RFI tab (default) |
 | `/antennas?ant=<idx>` | Same, with antenna pre-selected (`ant_idx` 0..95) |
+| `/arraysum` | Array sums tab (array-burst detector) |
+| `/arraysum?chgroup=<n>` | Same, with a sub-band pre-selected (0..15) |
 | `/sefds` | SEFDs tab (iframe to `:5777`) |
 | `/bursts` | Burst candidates placeholder |
 | `/plot/bandpass.png?ant=<idx>` | Pre-flag bandpass spectrum |
 | `/plot/bandpass_wf.png?ant=<idx>` | Pre-flag bandpass waterfall |
 | `/plot/flag_spectrum.png?ant=<idx>` | Latest-window flag fraction spectrum |
 | `/plot/flag_wf.png?ant=<idx>` | 30-min flag fraction waterfall |
+| `/plot/array_burst_ts.png?chgroup=<n>` | Band-summed significance per group, 2.097 ms |
+| `/plot/array_burst_arms.png?chgroup=<n>` | E-W vs N-S arm excess scatter |
+| `/plot/array_burst_spec.png` | Gain-normalised group spectra, full band |
+| `/control/slow_rfi` (GET/POST) | Slow-correlator RFI flagging toggle (etcd `/cnf/corr_slow_rfi`) |
 | `/api/status` | JSON: per-cn ring sizes, last seq, last fetch time |
 
 ## Deployment on h23
@@ -94,7 +106,8 @@ dsa_monitor/
 ├── plot_render.py            matplotlib PNG renderers
 ├── freq_mapping.py           Per-chgroup freq labelling (uses dsart.common)
 ├── ant_table.py              Per-antenna table from /mon/ant/<n> + RFI agg
-├── templates/                Jinja2 (base / antennas / sefds / bursts)
+├── array_sum_view.py         Array sums page data (core / arm summing groups)
+├── templates/                Jinja2 (base / antennas / arraysum / sefds / bursts / control)
 ├── static/                   (empty placeholder for CSS / icons)
 ├── dsa_monitor.service       systemd user unit
 └── README.md                 this file

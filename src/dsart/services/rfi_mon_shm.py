@@ -27,6 +27,19 @@ ABI:
         uint64 startup_utc_ns
         uint64 _reserved[20]
 
+    v2 spends six of those reserved words on the array-burst section,
+    leaving every pre-existing field at its original offset (so a v1
+    consumer that only reads the per-antenna planes stays correct):
+
+        _reserved[0]   = (n_group << 32) | n_acc_per_cube
+        _reserved[1]   = (ab_mode_code << 32) | ab_flag_group_index
+        _reserved[2:6] = group_sizes, 8 x uint32 packed into 4 words
+
+    Group NAMES are deliberately not in the segment. They are the
+    fixed :data:`dsart.rfi.array_burst.GROUP_NAMES` tuple, and writer
+    and reader are the same checkout on the same node, so an index is
+    enough and 128 bytes of fixed-width strings are not.
+
     Record (record_size_bytes, page-aligned):
         Per-record header (128 B):
             uint64 seq                (matches publish_seq snapshot
@@ -49,6 +62,21 @@ ABI:
             uint8   mask_count_grp
             uint8   mask_count_sumthr
             uint8   mask_count_fa
+
+        v2 appends the array-burst section, present only when
+        ``n_group > 0``. Its time axis is the 2.097 ms accumulation,
+        NOT the 134.2 ms cube — ``n_acc_total = window_size *
+        n_acc_per_cube`` (1024 in production):
+
+            float32 group_z[n_acc_total * n_group * n_pol]
+            float32 group_band_frac[n_acc_total * n_group * n_pol]
+            uint8   group_fired[n_acc_total * n_group * n_pol]
+            float32 group_spec_mean[n_group * n_chan_ds * n_pol]
+            float32 group_n_live[n_group * n_pol]
+
+        At the production op-point that is 40,960 + 40,960 + 10,240 +
+        3,840 + 40 = 96,040 B, taking the record from 184,448 B to
+        280,488 B (page-aligned 282,624 B).
 
 At the production op-point (NANTS=96, NCHAN_DS=96, NPOL=2):
     s1_bytes = 96 * 96 * 2 * 4 = 73,728
@@ -80,19 +108,34 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import logging
 import mmap
 import os
 import struct
 import time
-from typing import Final, Optional
+from typing import Final, Optional, Sequence
 
 import numpy as np
 
+from dsart.rfi.array_burst import GROUP_NAMES
 from dsart.services.rfi_window import RFIWindow
 
 # Bump when the layout changes.
 _RFI_MON_MAGIC: Final[int] = 0xCAFE5F11
-_RFI_MON_VERSION: Final[int] = 1
+_RFI_MON_VERSION: Final[int] = 2
+
+#: Versions this reader can decode. v1 has no array-burst section; it
+#: is accepted so a rolling deploy (sidecar updated before corr_fast,
+#: or the reverse) degrades to "no group data" instead of throwing.
+_RFI_MON_READABLE_VERSIONS: Final[frozenset[int]] = frozenset({1, 2})
+
+#: Ceiling on summing groups, so the header's fixed reserved words can
+#: hold their sizes. :data:`dsart.rfi.array_burst.GROUP_NAMES` has 5.
+_MAX_GROUPS: Final[int] = 8
+
+#: ``array_burst_mode`` as a small int, for the header.
+_AB_MODE_CODES: Final[dict[str, int]] = {"off": 0, "monitor": 1, "flag": 2}
+_AB_MODE_NAMES: Final[tuple[str, ...]] = ("off", "monitor", "flag")
 
 # Per-segment header.
 # Format: <I I I I I I I I I I Q Q + 20*Q  (= 12*uint then 22*uint64)
@@ -139,6 +182,12 @@ _READ_RETRIES: Final[int] = 8
 
 _SHM_DIR: Final[str] = "/dev/shm"
 
+#: Byte offset of the 20 reserved uint64 header words: 10 uint32 then
+#: publish_seq + startup_utc_ns.
+_RESERVED_OFF: Final[int] = struct.calcsize("<10I" + "QQ")
+
+LOG = logging.getLogger("dsart.rfi_mon_shm")
+
 
 def shm_name(cn_id: int) -> str:
     """Return the POSIX shm_open name (without leading slash) for cn_id."""
@@ -155,22 +204,72 @@ def shm_path(cn_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _body_bytes(n_ants: int, n_chan_ds: int, n_pol: int) -> int:
+def group_section_bytes(
+    *,
+    n_group: int,
+    n_acc_total: int,
+    n_chan_ds: int,
+    n_pol: int,
+) -> int:
+    """Bytes the v2 array-burst section occupies. 0 when absent."""
+    if n_group <= 0 or n_acc_total <= 0:
+        return 0
+    gp = n_group * n_pol
+    return (
+        n_acc_total * gp * 4          # group_z
+        + n_acc_total * gp * 4        # group_band_frac
+        + n_acc_total * gp * 1        # group_fired
+        + n_group * n_chan_ds * n_pol * 4   # group_spec_mean
+        + gp * 4                      # group_n_live
+    )
+
+
+def _body_bytes(
+    n_ants: int,
+    n_chan_ds: int,
+    n_pol: int,
+    *,
+    n_group: int = 0,
+    n_acc_total: int = 0,
+) -> int:
     cells = n_ants * n_chan_ds * n_pol
-    return cells * 4 + 6 * cells  # 1 fp32 array + 6 uint8 arrays
+    base = cells * 4 + 6 * cells  # 1 fp32 array + 6 uint8 arrays
+    return base + group_section_bytes(
+        n_group=n_group, n_acc_total=n_acc_total,
+        n_chan_ds=n_chan_ds, n_pol=n_pol,
+    )
 
 
-def _record_bytes(n_ants: int, n_chan_ds: int, n_pol: int) -> int:
-    body = _body_bytes(n_ants, n_chan_ds, n_pol)
+def _record_bytes(
+    n_ants: int,
+    n_chan_ds: int,
+    n_pol: int,
+    *,
+    n_group: int = 0,
+    n_acc_total: int = 0,
+) -> int:
+    body = _body_bytes(
+        n_ants, n_chan_ds, n_pol,
+        n_group=n_group, n_acc_total=n_acc_total,
+    )
     raw = _RECORD_HDR_BYTES + body
     # Round up to PAGE_BYTES for alignment.
     return ((raw + _PAGE_BYTES - 1) // _PAGE_BYTES) * _PAGE_BYTES
 
 
 def segment_bytes(
-    *, n_ants: int, n_chan_ds: int, n_pol: int, n_slots: int,
+    *,
+    n_ants: int,
+    n_chan_ds: int,
+    n_pol: int,
+    n_slots: int,
+    n_group: int = 0,
+    n_acc_total: int = 0,
 ) -> int:
-    return _HEADER_BYTES + n_slots * _record_bytes(n_ants, n_chan_ds, n_pol)
+    return _HEADER_BYTES + n_slots * _record_bytes(
+        n_ants, n_chan_ds, n_pol,
+        n_group=n_group, n_acc_total=n_acc_total,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +310,18 @@ class RFIMonRecord:
     mask_count_sumthr: np.ndarray
     mask_count_fa: np.ndarray
 
+    # ---- v2 array-burst section (empty on a v1 segment) ------------
+    array_burst_mode: str = "off"
+    array_burst_flag_group: str = ""
+    group_names: tuple[str, ...] = ()
+    group_sizes: np.ndarray | None = None          # (G,) int32
+    n_acc_per_cube: int = 0
+    group_z: np.ndarray | None = None              # (T, G, NPOL) fp32
+    group_band_frac: np.ndarray | None = None      # (T, G, NPOL) fp32
+    group_fired: np.ndarray | None = None          # (T, G, NPOL) uint8
+    group_spec_mean: np.ndarray | None = None      # (G, NCHAN_DS, NPOL) fp32
+    group_n_live: np.ndarray | None = None         # (G, NPOL) fp32
+
 
 # ---------------------------------------------------------------------------
 # Writer (corr_fast hot-path side)
@@ -238,9 +349,18 @@ class RFIMonShmWriter:
         window_size: int,
         freq_downsample: int,
         n_slots: int = 64,
+        n_group: int = 0,
+        n_acc_per_cube: int = 0,
+        group_names: Sequence[str] = (),
+        array_burst_flag_group: str = "",
     ) -> None:
         if n_slots <= 0:
             raise ValueError(f"n_slots={n_slots}, expected > 0")
+        if n_group > _MAX_GROUPS:
+            raise ValueError(
+                f"n_group={n_group} exceeds _MAX_GROUPS={_MAX_GROUPS}; "
+                "the header's reserved words cannot carry their sizes"
+            )
         self._cn_id = int(cn_id)
         self._n_ants = int(n_ants)
         self._n_chan_ds = int(n_chan_ds)
@@ -248,15 +368,25 @@ class RFIMonShmWriter:
         self._window_size = int(window_size)
         self._freq_downsample = int(freq_downsample)
         self._n_slots = int(n_slots)
+        self._n_group = int(n_group)
+        self._n_acc_per_cube = int(n_acc_per_cube)
+        self._n_acc_total = self._n_acc_per_cube * self._window_size
+        self._group_names = tuple(group_names)
+        self._ab_flag_group = str(array_burst_flag_group)
 
-        self._record_bytes = _record_bytes(n_ants, n_chan_ds, n_pol)
+        self._record_bytes = _record_bytes(
+            n_ants, n_chan_ds, n_pol,
+            n_group=self._n_group, n_acc_total=self._n_acc_total,
+        )
         self._segment_bytes = segment_bytes(
             n_ants=n_ants, n_chan_ds=n_chan_ds, n_pol=n_pol, n_slots=n_slots,
+            n_group=self._n_group, n_acc_total=self._n_acc_total,
         )
         self._cells = n_ants * n_chan_ds * n_pol
         self._s1_bytes = self._cells * 4
         self._mask_bytes = self._cells              # one uint8 per cell
         self._body_off = _RECORD_HDR_BYTES
+        self._group_sizes = np.zeros(_MAX_GROUPS, dtype=np.uint32)
 
         path = shm_path(cn_id)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -270,6 +400,7 @@ class RFIMonShmWriter:
             os.close(fd)
 
         self._publish_seq: int = 0
+        self._ab_mode_seen: str = "off"
         self._write_header(startup_utc_ns=time.time_ns())
 
     # ------------------------------------------------------------------
@@ -348,6 +479,27 @@ class RFIMonShmWriter:
             self._mm[body_off : body_off + self._mask_bytes] = arr.tobytes()
             body_off += self._mask_bytes
 
+        # ----- v2 array-burst section ------------------------------
+        if self._n_group > 0:
+            body_off = self._write_group_section(window, body_off)
+            # The mode can change at runtime (the slow path is
+            # toggled from the Control tab), so refresh the header's
+            # group words on every publish. 160 bytes; irrelevant next
+            # to the ~280 kB record.
+            if window.group_sizes is not None:
+                n = min(len(window.group_sizes), _MAX_GROUPS)
+                self._group_sizes[:n] = np.asarray(
+                    window.group_sizes, dtype=np.uint32,
+                )[:n]
+            if window.group_names:
+                self._group_names = tuple(window.group_names)
+            if window.array_burst_flag_group:
+                self._ab_flag_group = window.array_burst_flag_group
+            self._ab_mode_seen = window.array_burst_mode
+            self._mm[_RESERVED_OFF : _RESERVED_OFF + 160] = struct.pack(
+                "<20Q", *self._reserved_words(),
+            )
+
         # ----- Publish atomically ----------------------------------
         # Writing publish_seq is the publishing edge. mmap word writes
         # are atomic on x86-64 (8-byte aligned). Use struct.pack into
@@ -382,6 +534,58 @@ class RFIMonShmWriter:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _write_group_section(self, window: RFIWindow, body_off: int) -> int:
+        """Lay down the five array-burst arrays. Short windows are
+        zero-padded to the fixed record size; the reader recovers the
+        valid length from ``n_cubes * n_acc_per_cube``."""
+        gp = self._n_group * self._n_pol
+        specs: tuple[tuple[str, np.dtype, tuple[int, ...]], ...] = (
+            ("group_z", np.dtype(np.float32), (self._n_acc_total, gp)),
+            ("group_band_frac", np.dtype(np.float32),
+             (self._n_acc_total, gp)),
+            ("group_fired", np.dtype(np.uint8), (self._n_acc_total, gp)),
+            ("group_spec_mean", np.dtype(np.float32),
+             (self._n_group * self._n_chan_ds * self._n_pol,)),
+            ("group_n_live", np.dtype(np.float32), (gp,)),
+        )
+        for name, dt, shape in specs:
+            nbytes = int(np.prod(shape)) * dt.itemsize
+            src = getattr(window, name)
+            buf = np.zeros(shape, dtype=dt)
+            if src is not None:
+                flat = np.ascontiguousarray(src, dtype=dt).reshape(-1)
+                target = buf.reshape(-1)
+                k = min(flat.size, target.size)
+                target[:k] = flat[:k]
+                if flat.size > target.size:
+                    LOG.warning(
+                        "rfi_mon_shm: %s has %d elements but the record "
+                        "holds %d; truncating (n_group/n_acc_per_cube "
+                        "mismatch between writer and detector?)",
+                        name, flat.size, target.size,
+                    )
+            self._mm[body_off : body_off + nbytes] = buf.tobytes()
+            body_off += nbytes
+        return body_off
+
+    def _reserved_words(self) -> list[int]:
+        """The 20 reserved uint64s, six of which carry the v2 group
+        metadata. See the module docstring for the packing."""
+        words = [0] * 20
+        words[0] = (self._n_group << 32) | (self._n_acc_per_cube & 0xFFFFFFFF)
+        try:
+            flag_idx = self._group_names.index(self._ab_flag_group)
+        except ValueError:
+            flag_idx = 0
+        mode_code = _AB_MODE_CODES.get(self._ab_mode_seen, 0)
+        words[1] = (mode_code << 32) | (flag_idx & 0xFFFFFFFF)
+        sizes = np.asarray(self._group_sizes, dtype=np.uint32)
+        for i in range(4):
+            lo = int(sizes[2 * i]) if 2 * i < sizes.size else 0
+            hi = int(sizes[2 * i + 1]) if 2 * i + 1 < sizes.size else 0
+            words[2 + i] = (hi << 32) | lo
+        return words
+
     def _write_header(self, *, startup_utc_ns: int) -> None:
         """Lay down the segment header. publish_seq starts at 0."""
         packed = struct.pack(
@@ -398,7 +602,7 @@ class RFIMonShmWriter:
             int(self._record_bytes),
             0,                                     # publish_seq
             int(startup_utc_ns),
-            *([0] * 20),                           # reserved
+            *self._reserved_words(),
         )
         self._mm[0 : len(packed)] = packed
         # Zero the rest of the header window (in case we ever shorten it).
@@ -449,16 +653,20 @@ class RFIMonShmReader:
             raise RFIMonShmAbiMismatch(
                 f"bad magic 0x{magic:08x} (expected 0x{_RFI_MON_MAGIC:08x})"
             )
-        if version != _RFI_MON_VERSION:
+        if version not in _RFI_MON_READABLE_VERSIONS:
             raise RFIMonShmAbiMismatch(
-                f"unsupported version {version} (we know {_RFI_MON_VERSION})"
+                f"unsupported version {version} (we can read "
+                f"{sorted(_RFI_MON_READABLE_VERSIONS)})"
             )
+        self._version = int(version)
         self._n_slots = int(n_slots)
         self._n_ants = int(n_ants)
         self._n_chan_ds = int(n_chan_ds)
         self._n_pol = int(n_pol)
         self._window_size = int(window_size)
         self._freq_downsample = int(freq_downsample)
+        # record_bytes comes from the header, so it already accounts
+        # for the group section the writer sized in.
         self._record_bytes = int(record_bytes)
         self._startup_utc_ns = int(startup_utc_ns)
         self._publish_seq_off = struct.calcsize("<10I")
@@ -466,6 +674,55 @@ class RFIMonShmReader:
         self._cells = self._n_ants * self._n_chan_ds * self._n_pol
         self._s1_bytes = self._cells * 4
         self._mask_bytes = self._cells
+
+        # ---- v2 array-burst section --------------------------------
+        reserved = list(_reserved)
+        if self._version >= 2 and len(reserved) >= 6:
+            self._n_group = int((reserved[0] >> 32) & 0xFFFFFFFF)
+            self._n_acc_per_cube = int(reserved[0] & 0xFFFFFFFF)
+            mode_code = int((reserved[1] >> 32) & 0xFFFFFFFF)
+            flag_idx = int(reserved[1] & 0xFFFFFFFF)
+            sizes: list[int] = []
+            for i in range(4):
+                w = int(reserved[2 + i])
+                sizes.append(w & 0xFFFFFFFF)
+                sizes.append((w >> 32) & 0xFFFFFFFF)
+            self._group_sizes = np.asarray(
+                sizes[: self._n_group], dtype=np.int32,
+            )
+            self._array_burst_mode = (
+                _AB_MODE_NAMES[mode_code]
+                if 0 <= mode_code < len(_AB_MODE_NAMES) else "off"
+            )
+            names = GROUP_NAMES[: self._n_group]
+            self._group_names = tuple(names)
+            self._ab_flag_group = (
+                names[flag_idx] if 0 <= flag_idx < len(names) else ""
+            )
+        else:
+            self._n_group = 0
+            self._n_acc_per_cube = 0
+            self._group_sizes = np.zeros(0, dtype=np.int32)
+            self._array_burst_mode = "off"
+            self._group_names = ()
+            self._ab_flag_group = ""
+        self._n_acc_total = self._n_acc_per_cube * self._window_size
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    @property
+    def n_group(self) -> int:
+        return self._n_group
+
+    @property
+    def n_acc_per_cube(self) -> int:
+        return self._n_acc_per_cube
+
+    @property
+    def group_names(self) -> tuple[str, ...]:
+        return self._group_names
 
     @property
     def n_slots(self) -> int:
@@ -548,6 +805,10 @@ class RFIMonShmReader:
         m_st    = _read_u8(body_off); body_off += self._mask_bytes
         m_fa    = _read_u8(body_off); body_off += self._mask_bytes
 
+        gkw: dict[str, object] = {}
+        if self._n_group > 0 and self._n_acc_total > 0:
+            gkw = self._decode_group_section(body_off, n_cubes=n_cubes)
+
         return RFIMonRecord(
             seq=seq,
             publish_utc_ns=publish_utc_ns,
@@ -563,7 +824,52 @@ class RFIMonShmReader:
             mask_count_grp=m_grp,
             mask_count_sumthr=m_st,
             mask_count_fa=m_fa,
+            **gkw,                                 # type: ignore[arg-type]
         )
+
+    def _decode_group_section(
+        self, body_off: int, *, n_cubes: int,
+    ) -> dict[str, object]:
+        """Decode the v2 array-burst arrays.
+
+        The stored time axis is padded to the full window; the valid
+        prefix is ``n_cubes * n_acc_per_cube`` samples, so a window
+        that closed short does not present zeros as real data.
+        """
+        g, p = self._n_group, self._n_pol
+        gp = g * p
+        t_valid = min(self._n_acc_total, int(n_cubes) * self._n_acc_per_cube)
+
+        def _f32(count: int, off: int) -> np.ndarray:
+            return np.frombuffer(
+                self._mm, dtype=np.float32, count=count, offset=off,
+            ).copy()
+
+        z = _f32(self._n_acc_total * gp, body_off)
+        body_off += self._n_acc_total * gp * 4
+        bf = _f32(self._n_acc_total * gp, body_off)
+        body_off += self._n_acc_total * gp * 4
+        fired = np.frombuffer(
+            self._mm, dtype=np.uint8, count=self._n_acc_total * gp,
+            offset=body_off,
+        ).copy()
+        body_off += self._n_acc_total * gp
+        spec = _f32(g * self._n_chan_ds * p, body_off)
+        body_off += g * self._n_chan_ds * p * 4
+        n_live = _f32(gp, body_off)
+
+        return {
+            "array_burst_mode": self._array_burst_mode,
+            "array_burst_flag_group": self._ab_flag_group,
+            "group_names": self._group_names,
+            "group_sizes": self._group_sizes,
+            "n_acc_per_cube": self._n_acc_per_cube,
+            "group_z": z.reshape(self._n_acc_total, g, p)[:t_valid],
+            "group_band_frac": bf.reshape(self._n_acc_total, g, p)[:t_valid],
+            "group_fired": fired.reshape(self._n_acc_total, g, p)[:t_valid],
+            "group_spec_mean": spec.reshape(g, self._n_chan_ds, p),
+            "group_n_live": n_live.reshape(g, p),
+        }
 
     def read_latest(self) -> Optional[RFIMonRecord]:
         """Return the most recently published window record, or

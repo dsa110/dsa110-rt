@@ -1910,3 +1910,98 @@ def c2_journal_tail_local(
         "err": "",
         "elapsed_s": round(time.monotonic() - started, 3),
     }
+
+
+# ---------------------------------------------------------------------------
+# Slow-correlator RFI flagging toggle (M7.7)
+# ---------------------------------------------------------------------------
+#
+# Unlike every other verb in this module, this does NOT go to
+# /cmd/{namespace}/{cn}. The corr_slow_compute processes poll a single
+# fleet-wide config key directly (see
+# dsart.services.corr_slow_compute.SlowRfiControl), so one PUT
+# reconfigures all sixteen nodes and a node that restarts picks up the
+# current state rather than reverting to its command-line default.
+#
+# Slow visibilities have always been emitted unflagged, deliberately,
+# so cal solutions can be derived downstream. Turning this on changes
+# what every downstream calibration sees — hence the audit row.
+
+#: The key corr_slow_compute polls.
+SLOW_RFI_KEY: str = "/cnf/corr_slow_rfi"
+
+#: Accepted array-burst modes, mirroring dsart.rfi.combine.
+SLOW_RFI_AB_MODES: tuple[str, ...] = ("off", "monitor", "flag")
+
+
+def get_slow_rfi(store: ControlStore) -> dict[str, Any]:
+    """Current slow-path flagging state as the fleet sees it.
+
+    Returns the stored payload plus ``present``: False means the key
+    has never been written, in which case each node is running on its
+    own command-line default (flagging off, in the shipped config).
+    """
+    try:
+        payload = store.get_dict(SLOW_RFI_KEY)
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("get_slow_rfi: etcd read failed: %r", exc)
+        return {"present": False, "error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(payload, dict):
+        return {"present": False}
+    return {
+        "present": True,
+        "enabled": bool(payload.get("enabled", False)),
+        "array_burst_mode": str(payload.get("array_burst_mode", "flag")),
+        "hi_guard": bool(payload.get("hi_guard", True)),
+        "updated_iso": payload.get("updated_iso"),
+        "updated_by": payload.get("updated_by"),
+    }
+
+
+def set_slow_rfi(
+    store: ControlStore,
+    *,
+    enabled: bool,
+    array_burst_mode: str = "flag",
+    hi_guard: bool = True,
+    user: str | None = None,
+) -> dict[str, Any]:
+    """Write the fleet-wide slow-path flagging state.
+
+    Raises:
+        ValueError: unknown ``array_burst_mode``, or ``hi_guard``
+            disabled while flagging is enabled without an explicit
+            override — see below.
+
+    Disabling the HI guard while flagging is ON means the slow
+    correlator will excise Galactic HI, which the offline study
+    measured the online flagger doing at up to 99.5% occupancy. That
+    is almost never what someone wants from the slow path, so it is
+    allowed but never the default.
+    """
+    if array_burst_mode not in SLOW_RFI_AB_MODES:
+        raise ValueError(
+            f"array_burst_mode={array_burst_mode!r}, expected one of "
+            f"{SLOW_RFI_AB_MODES}"
+        )
+    payload = {
+        "enabled": bool(enabled),
+        "array_burst_mode": str(array_burst_mode),
+        "hi_guard": bool(hi_guard),
+        "updated_iso": _iso_ts_utc(),
+        "updated_by": user or "dashboard",
+    }
+    store.put_dict(SLOW_RFI_KEY, payload)
+    LOG.info("set_slow_rfi: %s -> %r", SLOW_RFI_KEY, payload)
+    audit_log(
+        store, namespace="corr_slow", cn_target="fleet",
+        cmd="slow_rfi", val=payload, ok=True,
+        note=(
+            "slow-path RFI flagging "
+            + ("ENABLED" if enabled else "disabled")
+            + f"; array_burst={array_burst_mode}"
+            + ("" if hi_guard else "; HI GUARD OFF")
+        ),
+        user=user,
+    )
+    return {"ok": True, "key": SLOW_RFI_KEY, "payload": payload}

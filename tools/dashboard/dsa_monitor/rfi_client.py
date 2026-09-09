@@ -45,6 +45,32 @@ class DecodedRFIMonRecord:
     mask_count_sumthr: np.ndarray
     mask_count_fa: np.ndarray
 
+    # ---- array-burst section (empty against a v1 exporter) ---------
+    # The time axis of group_z / group_band_frac / group_fired is the
+    # 2.097 ms accumulation, NOT the 134.2 ms cube: 1024 samples per
+    # 16-cube window in production.
+    array_burst_mode: str = "off"
+    array_burst_flag_group: str = ""
+    group_names: tuple[str, ...] = ()
+    group_sizes: tuple[int, ...] = ()
+    n_acc_per_cube: int = 0
+    dt_s: float = 0.0
+    group_z: Optional[np.ndarray] = None            # (T, G, NPOL) fp32
+    group_band_frac: Optional[np.ndarray] = None    # (T, G, NPOL) fp32
+    group_fired: Optional[np.ndarray] = None        # (T, G, NPOL) uint8
+    group_spec_mean: Optional[np.ndarray] = None    # (G, NCHAN_DS, NPOL)
+    group_n_live: Optional[np.ndarray] = None       # (G, NPOL) fp32
+
+    @property
+    def array_burst_running(self) -> bool:
+        return self.group_z is not None and self.group_z.size > 0
+
+    def group_index(self, name: str) -> Optional[int]:
+        try:
+            return self.group_names.index(name)
+        except ValueError:
+            return None
+
 
 def _decode_array(d: dict[str, Any]) -> np.ndarray:
     raw = base64.b64decode(d["data_b64"])
@@ -71,7 +97,37 @@ def _decode_record(payload: dict[str, Any], *, cn_id: int) -> DecodedRFIMonRecor
         mask_count_grp=_decode_array(payload["mask_count_grp"]),
         mask_count_sumthr=_decode_array(payload["mask_count_sumthr"]),
         mask_count_fa=_decode_array(payload["mask_count_fa"]),
+        **_decode_array_burst(payload),
     )
+
+
+def _decode_array_burst(payload: dict[str, Any]) -> dict[str, Any]:
+    """Pull the v2 array-burst section out of an exporter payload.
+
+    Returns an empty-ish dict against a v1 exporter (or one where the
+    detector is off), so the dashboard renders the rest of the page
+    rather than 500-ing during a rolling deploy.
+    """
+    ab = payload.get("array_burst")
+    if not isinstance(ab, dict):
+        return {}
+    out: dict[str, Any] = {
+        "array_burst_mode": str(ab.get("mode", "off")),
+        "array_burst_flag_group": str(ab.get("flag_group", "")),
+        "group_names": tuple(ab.get("group_names") or ()),
+        "group_sizes": tuple(int(v) for v in (ab.get("group_sizes") or ())),
+        "n_acc_per_cube": int(ab.get("n_acc_per_cube") or 0),
+        "dt_s": float(ab.get("dt_s") or 0.0),
+    }
+    n_live = ab.get("n_live")
+    if n_live:
+        out["group_n_live"] = np.asarray(n_live, dtype=np.float32)
+    for key in ("group_z", "group_band_frac", "group_fired",
+                "group_spec_mean"):
+        enc = ab.get(key)
+        if isinstance(enc, dict) and "data_b64" in enc:
+            out[key] = _decode_array(enc)
+    return out
 
 
 def _http_get_json(url: str, *, timeout_s: float) -> dict[str, Any]:

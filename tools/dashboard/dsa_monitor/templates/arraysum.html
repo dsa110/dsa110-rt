@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Array sums – DSA Monitor{% endblock %}
+
+{% block content %}
+<h1>Array sums — core and arm autocorrelations</h1>
+
+<div class="card">
+    <p class="muted" style="max-width:75em">
+    Every detector in the deployed flagger runs <em>inside one antenna</em>,
+    and each needs a reference that the signal does not also move.
+    Bandpass-outlier compares a channel against the other channels of the same
+    antenna; group-outlier compares an antenna against the other antennas;
+    spectral kurtosis asks whether the voltages are Gaussian <em>within</em> an
+    accumulation. A broadband burst common to the whole array defeats all three
+    by construction — measured on 260812imek sb02, such a burst is
+    <strong>0.05&nbsp;σ</strong> in the cell the flagger tests and
+    <strong>13.3&nbsp;σ</strong> in the array-summed band power at 2.097&nbsp;ms.
+    This page shows that sum, treating the core and each of its arms as extra
+    antennas.
+    </p>
+</div>
+
+<div class="card">
+    <h3>Detector state</h3>
+    <table class="metric">
+        <tr>
+            <td>mode</td>
+            <td class="value {% if view.mode == 'flag' %}warn{% endif %}">
+                <strong>{{ view.mode_label }}</strong>
+            </td>
+            <td class="muted">{{ view.mode_note }}</td>
+        </tr>
+        <tr>
+            <td>flag group</td>
+            <td class="value">{{ view.flag_group or '—' }}</td>
+            <td class="muted">whose verdict drives the mask</td>
+        </tr>
+        <tr>
+            <td>reporting</td>
+            <td class="value {% if view.n_reporting < view.n_chgroup %}warn{% endif %}">
+                {{ view.n_reporting }} / {{ view.n_chgroup }}
+            </td>
+            <td class="muted">corr nodes publishing a group section</td>
+        </tr>
+    </table>
+</div>
+
+{% if not view.running %}
+<div class="card">
+    <p class="muted">
+    No corr node is publishing array-burst data. Either the detector is off
+    (<code>--rfi-array-burst-mode off</code>), every node is still inside its
+    warmup window, or the exporters are still on the v1 shm ABI.
+    </p>
+</div>
+{% endif %}
+
+<div class="card">
+    <form method="GET" action="/arraysum" class="controls">
+        <label for="chgroup">Sub-band (chgroup):</label>
+        <select name="chgroup" id="chgroup" onchange="this.form.submit()">
+            {% for row in view.fleet %}
+            <option value="{{ row.chgroup }}"
+                    {% if row.chgroup == view.chgroup %}selected{% endif %}>
+                ch{{ row.chgroup }} — cn{{ '%02d' % row.cn_id }} ({{ row.host }})
+            </option>
+            {% endfor %}
+        </select>
+        <button class="btn" type="submit">go</button>
+        <span class="muted">
+        each corr node sees only its own 11.72&nbsp;MHz and decides independently
+        </span>
+    </form>
+</div>
+
+<div class="plot-card">
+    <h2>Band-summed significance at 2.097 ms — chgroup {{ view.chgroup }}</h2>
+    <img src="/plot/array_burst_ts.png?chgroup={{ view.chgroup }}&t={{ view.snapshot_unix|int }}"
+         alt="array-burst time series">
+    <div class="muted">
+    One point per 2.097&nbsp;ms accumulation — the finest the flagger already
+    forms (<code>autos.s1[64]</code>, built for spectral kurtosis), so the sum
+    costs no new moments. Red verticals mark samples the flag group fired on.
+    Each antenna is divided by its own running per-channel mean before summing,
+    and dead antenna-pols are excluded outright: leaving them in put the all-96
+    null at 0.978&nbsp;±&nbsp;0.026 instead of 1.000&nbsp;±&nbsp;0.0013.
+    </div>
+</div>
+
+<div class="plot-card">
+    <h2>Arm symmetry — chgroup {{ view.chgroup }}</h2>
+    <img src="/plot/array_burst_arms.png?chgroup={{ view.chgroup }}&t={{ view.snapshot_unix|int }}"
+         alt="E-W against N-S arm excess">
+    <div class="muted">
+    A far-field source illuminates both arms in proportion to their collecting
+    area, so it lands on the 1:1 line. A local source does not — the
+    260812imek bursts sit at 1.86% E-W against 0.81% N-S, a 2.3× asymmetry.
+    This is a diagnostic only: the firing decision uses band-summed
+    significance and broadband occupancy, not the arm ratio.
+    </div>
+</div>
+
+{% if view.detail %}
+<div class="card">
+    <h3>Groups — chgroup {{ view.detail.chgroup }}
+        (cn{{ '%02d' % view.detail.cn_id }}, blocks
+        {{ view.detail.block_n_start }}–{{ view.detail.block_n_end }})</h3>
+    <div class="muted">
+    {{ view.detail.n_samples }} samples of {{ view.detail.dt_ms }}&nbsp;ms
+    ({{ view.detail.window_s }}&nbsp;s);
+    {{ view.detail.n_fired }} fired ({{ view.detail.fired_pct }}%);
+    E-W/N-S excess ratio at fire = {{ view.detail.arm_ratio_s }}
+    </div>
+    <table class="metric">
+        <thead>
+            <tr>
+                <th>group</th><th>antennas</th><th>live</th>
+                <th>peak σ</th><th>median σ when fired</th>
+                <th>excess when fired [%]</th><th>fired [%]</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in view.detail.rows %}
+            <tr {% if r.is_flag_group %}class="hl"{% endif %}>
+                <td>{{ r.label }}{% if r.is_flag_group %} <span class="muted">(flag group)</span>{% endif %}</td>
+                <td class="value">{{ r.n_ant }}</td>
+                <td class="value">{{ r.n_live_s }}</td>
+                <td class="value">{{ r.peak_sigma_s }}</td>
+                <td class="value">{{ r.median_sigma_at_fire }}</td>
+                <td class="value">{{ r.excess_at_fire_pct }}</td>
+                <td class="value">{{ r.fired_pct }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<div class="plot-card">
+    <h2>Gain-normalised group spectra — full band</h2>
+    <img src="/plot/array_burst_spec.png?t={{ view.snapshot_unix|int }}"
+         alt="group spectra">
+    <div class="muted">
+    Quiet data sits at 1.0 by construction, so any departure is structure
+    common to that group. Green dashed = HI (1.42&nbsp;GHz); dotted verticals
+    are chgroup boundaries.
+    </div>
+</div>
+
+<div class="card">
+    <h3>Fleet</h3>
+    <table class="metric">
+        <thead>
+            <tr>
+                <th>cn</th><th>chgroup</th><th>host</th><th>age [s]</th>
+                <th>fired</th><th>fired [%]</th><th>peak σ</th>
+                <th>E-W/N-S</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in view.fleet %}
+            <tr {% if not r.reporting %}class="stale"{% endif %}>
+                <td>cn{{ '%02d' % r.cn_id }}</td>
+                <td class="value">{{ r.chgroup }}</td>
+                <td>{{ r.host }}</td>
+                <td class="value">{{ r.age_s if r.age_s is not none else '—' }}</td>
+                {% if r.reporting %}
+                <td class="value">{{ r.n_fired }} / {{ r.n_samples }}</td>
+                <td class="value">{{ '%.2f' % r.fired_pct }}</td>
+                <td class="value">{{ '%.1f' % r.peak_sigma if r.peak_sigma is not none else '—' }}</td>
+                <td class="value">{{ '%.2f' % r.arm_ratio if r.arm_ratio is not none else '—' }}</td>
+                {% else %}
+                <td class="value">—</td><td class="value">—</td>
+                <td class="value">—</td><td class="value">—</td>
+                {% endif %}
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

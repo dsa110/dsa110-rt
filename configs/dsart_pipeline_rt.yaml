@@ -307,9 +307,19 @@ routines:
   # cal). Pinned to GPU 0 via CUDA_VISIBLE_DEVICES (see M7.1 lessons-
   # learned below; without per-process GPU isolation the corr_slow +
   # corr_fast pair hits a Triton "context is destroyed" race).
+  #
+  # M7.7: --chgroup fixes the channel->frequency map, which the
+  # Galactic HI guard needs; it costs nothing when flagging is off.
+  # RFI flagging itself is NOT enabled here. It is toggled fleet-wide
+  # at runtime from the dashboard Control tab via etcd
+  # /cnf/corr_slow_rfi (polled every 5 s), so a node that restarts
+  # picks up the current state rather than reverting to a CLI default.
+  # Turning it on changes what every downstream calibration sees.
+  # --rfi-antpos-cal supplies the antenna positions the core/arm split
+  # needs; without it only the per-antenna chain can run.
   - name: corr_slow
     cmd: python
-    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO --ready-sentinel-path /tmp/dsart-corr-slow-CN.ready
+    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO --ready-sentinel-path /tmp/dsart-corr-slow-CN.ready --chgroup CHGROUP --rfi-antpos-cal /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out --rfi-array-burst-mode flag
     env:
       CUDA_VISIBLE_DEVICES: "0"
 
@@ -479,6 +489,7 @@ routines:
       --sumthr-max-m 8
       --sumthr-eta 1.5
       --rfi-m-values 64,256,1024,4096
+      --rfi-array-burst-mode monitor
       --t-int-fast-native 32
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --chan-sum-factor 8

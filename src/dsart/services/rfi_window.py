@@ -52,11 +52,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, Sequence
 
 import numpy as np
 import torch
 
+from dsart.rfi.array_burst import ArrayBurstResult
 from dsart.rfi.combine import FlagSourceBit
 
 LOG = logging.getLogger("dsart.rfi_window")
@@ -107,6 +108,23 @@ class RFIWindow:
     frac_sumthr: tuple[float, float, float]
     frac_fa: tuple[float, float, float]
 
+    # ---- array-burst section (M7.7) --------------------------------
+    # All None when the array-burst detector is not running, so a v1
+    # consumer that ignores these fields still sees a valid record.
+    # The time axis here is 2.097 ms, NOT the 134.2 ms cube: this is
+    # the whole point of the detector, and the reason the section
+    # could not be folded into the per-antenna planes above.
+    array_burst_mode: str = "off"            # off / monitor / flag
+    array_burst_flag_group: str = ""
+    group_names: tuple[str, ...] = ()
+    group_sizes: np.ndarray | None = None    # (G,) int32, nominal
+    group_n_live: np.ndarray | None = None   # (G, NPOL) fp32, last cube
+    group_spec_mean: np.ndarray | None = None  # (G, NCHAN_DS, NPOL) fp32
+    group_z: np.ndarray | None = None        # (n_cubes*n_acc, G, NPOL) fp32
+    group_band_frac: np.ndarray | None = None  # same shape, fractional
+    group_fired: np.ndarray | None = None    # same shape, uint8 0/1
+    n_acc_per_cube: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Aggregator
@@ -130,6 +148,11 @@ class RFIWindowAggregator:
             Default 4 (→ 96 channels per chgroup at NCHAN=384).
         device: torch device on which the on-device accumulators live.
             Defaults to CPU; CUDA in production.
+        group_names, group_sizes, array_burst_flag_group: static
+            metadata for the array-burst section, taken from the
+            detector at construction. They are properties of the
+            array, not of any one cube, so they are not repeated in
+            every :class:`ArrayBurstResult`.
     """
 
     def __init__(
@@ -141,6 +164,9 @@ class RFIWindowAggregator:
         window_size: int = WINDOW_SIZE_DEFAULT,
         freq_downsample: int = FREQ_DOWNSAMPLE_DEFAULT,
         device: torch.device | str = "cpu",
+        group_names: Sequence[str] | None = None,
+        group_sizes: Sequence[int] | None = None,
+        array_burst_flag_group: str = "",
     ) -> None:
         if window_size <= 0:
             raise ValueError(f"window_size={window_size}, expected > 0")
@@ -158,6 +184,13 @@ class RFIWindowAggregator:
         self._window_size = int(window_size)
         self._freq_downsample = int(freq_downsample)
         self._device = torch.device(device)
+        self._array_burst_mode = "off"
+        self._ab_group_names: tuple[str, ...] = tuple(group_names or ())
+        self._ab_group_sizes: np.ndarray | None = (
+            np.asarray(group_sizes, dtype=np.int32)
+            if group_sizes is not None else None
+        )
+        self._ab_flag_group = str(array_burst_flag_group)
 
         self._reset_accumulators()
 
@@ -177,6 +210,16 @@ class RFIWindowAggregator:
         self._mask_count_grp = torch.zeros(shape, dtype=torch.uint8, device=d)
         self._mask_count_sumthr = torch.zeros(shape, dtype=torch.uint8, device=d)
         self._mask_count_fa = torch.zeros(shape, dtype=torch.uint8, device=d)
+
+        # Array-burst accumulators are allocated lazily on the first
+        # cube that carries a result, because n_acc comes from the
+        # data (64 in production) rather than from configuration.
+        self._ab_z = None
+        self._ab_band_frac = None
+        self._ab_fired = None
+        self._ab_spec_sum = None
+        self._ab_n_live = None
+        self._ab_cubes = 0
 
         self._cubes_in_window: int = 0
         self._cubes_warmup_in_window: int = 0
@@ -208,6 +251,63 @@ class RFIWindowAggregator:
             self._n_ants, self._n_chan_ds, self._freq_downsample, self._n_pol,
         ).sum(dim=2)
 
+    def _downsample_chan_mean(self, x: torch.Tensor) -> torch.Tensor:
+        """Mean-over-bin channel downsample for already-normalised
+        quantities. ``x`` is ``(G, NCHAN, NPOL)``.
+
+        The per-antenna planes use a SUM downsample because they carry
+        raw power; the group spectra are gain-normalised and sit at
+        1.0, so summing would misleadingly scale them by the binning
+        factor.
+        """
+        if self._freq_downsample == 1:
+            return x
+        g, _c, pol = x.shape
+        return x.view(
+            g, self._n_chan_ds, self._freq_downsample, pol,
+        ).mean(dim=2)
+
+    def _push_array_burst(self, ab: ArrayBurstResult) -> None:
+        """Accumulate one cube of array-burst state on the 2.097 ms axis.
+
+        Allocation is lazy because ``n_acc`` is a property of the data
+        (64 accumulations per cube in production), not of the
+        aggregator's configuration.
+        """
+        n_acc, n_group, n_pol = ab.z.shape
+        if self._ab_z is None:
+            d = self._device
+            self._ab_z = torch.zeros(
+                (self._window_size, n_acc, n_group, n_pol),
+                dtype=torch.float32, device=d,
+            )
+            self._ab_band_frac = torch.zeros_like(self._ab_z)
+            self._ab_fired = torch.zeros(
+                (self._window_size, n_acc, n_group, n_pol),
+                dtype=torch.uint8, device=d,
+            )
+            self._ab_spec_sum = torch.zeros(
+                (n_group, self._n_chan_ds, n_pol),
+                dtype=torch.float32, device=d,
+            )
+        if self._ab_cubes >= self._window_size:
+            # More array-burst pushes than cubes in a window should be
+            # impossible; drop rather than grow an unbounded buffer.
+            LOG.warning(
+                "rfi_window: array-burst push %d exceeds window_size "
+                "%d; dropping", self._ab_cubes, self._window_size,
+            )
+            return
+        i = self._ab_cubes
+        self._ab_z[i] = ab.z.to(torch.float32)
+        self._ab_band_frac[i] = ab.band_frac.to(torch.float32)
+        self._ab_fired[i] = ab.fired.to(torch.uint8)
+        self._ab_spec_sum += self._downsample_chan_mean(
+            ab.group_spec.to(torch.float32)
+        )
+        self._ab_n_live = ab.n_live.to(torch.float32)
+        self._ab_cubes += 1
+
     def push(
         self,
         *,
@@ -216,6 +316,8 @@ class RFIWindowAggregator:
         source_tags: torch.Tensor,
         block_n: int,
         warmup: bool,
+        array_burst: "ArrayBurstResult | None" = None,
+        array_burst_mode: str = "off",
     ) -> RFIWindow | None:
         """Ingest one cube.
 
@@ -236,6 +338,14 @@ class RFIWindowAggregator:
             warmup: True iff the production flagger reported
                 ``warmup=True`` for this cube. Counts toward
                 ``RFIWindow.n_cubes_warmup``.
+            array_burst: optional
+                :class:`dsart.rfi.array_burst.ArrayBurstResult` from
+                the same cube. Accumulated on its own 2.097 ms time
+                axis and emitted as the record's group section.
+                ``None`` leaves that section empty.
+            array_burst_mode: the detector's mode, carried through to
+                the record so the page can say whether what it is
+                showing was actually excised.
 
         Returns:
             :class:`RFIWindow` if this cube closed the window
@@ -310,6 +420,11 @@ class RFIWindowAggregator:
         self._mask_count_grp += _ds_any_u8(grp_mask)
         self._mask_count_sumthr += _ds_any_u8(st_mask)
         self._mask_count_fa += _ds_any_u8(fa_mask)
+
+        # ----- array-burst section (2.097 ms axis) -----------------
+        if array_burst is not None:
+            self._push_array_burst(array_burst)
+        self._array_burst_mode = str(array_burst_mode)
 
         self._cubes_in_window += 1
 
@@ -392,6 +507,43 @@ class RFIWindowAggregator:
                    _det_frac(counts["fa"], 1),
                    _det_frac(counts["fa"], None))
 
+        # --- array-burst section ------------------------------------
+        ab_kw: dict[str, object] = {
+            "array_burst_mode": self._array_burst_mode,
+            "array_burst_flag_group": self._ab_flag_group,
+            "group_names": self._ab_group_names,
+            "group_sizes": self._ab_group_sizes,
+        }
+        if self._ab_z is not None and self._ab_cubes > 0:
+            k = self._ab_cubes
+            n_acc = int(self._ab_z.shape[1])
+            # (cubes, n_acc, G, P) -> (cubes*n_acc, G, P): one
+            # continuous 2.097 ms time series across the window.
+            ab_kw["group_z"] = (
+                self._ab_z[:k].reshape(k * n_acc, *self._ab_z.shape[2:])
+                .detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            ab_kw["group_band_frac"] = (
+                self._ab_band_frac[:k]
+                .reshape(k * n_acc, *self._ab_band_frac.shape[2:])
+                .detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            ab_kw["group_fired"] = (
+                self._ab_fired[:k]
+                .reshape(k * n_acc, *self._ab_fired.shape[2:])
+                .detach().cpu().numpy().astype(np.uint8, copy=False)
+            )
+            ab_kw["group_spec_mean"] = (
+                (self._ab_spec_sum / float(k))
+                .detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            if self._ab_n_live is not None:
+                ab_kw["group_n_live"] = (
+                    self._ab_n_live.detach().cpu().numpy()
+                    .astype(np.float32, copy=False)
+                )
+            ab_kw["n_acc_per_cube"] = n_acc
+
         bn_start = self._block_n_start or 0
         bn_end = self._block_n_last or 0
         n_warmup = self._cubes_warmup_in_window
@@ -417,6 +569,7 @@ class RFIWindowAggregator:
             frac_grp=frac_grp,
             frac_sumthr=frac_sumthr,
             frac_fa=frac_fa,
+            **ab_kw,                                       # type: ignore[arg-type]
         )
 
         self._reset_accumulators()

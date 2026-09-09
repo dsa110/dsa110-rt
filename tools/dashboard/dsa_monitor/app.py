@@ -49,7 +49,11 @@ sys.path.insert(0, HERE)
 from corr_topology import CORR_NODES, CORR_NODES_BY_CHGROUP
 from rfi_store import RFIPoller, RFIWindowStore
 from rfi_client import RFIClient
+from array_sum_view import build_array_sum_view
 from plot_render import (
+    render_array_burst_arms,
+    render_array_burst_spectrum,
+    render_array_burst_timeseries,
     render_bandpass_spectrum,
     render_bandpass_waterfall,
     render_flag_spectrum,
@@ -97,10 +101,13 @@ from control_store import (
     control_utc_start_now,
     control_utc_stop_now,
     fleet_restart_all,
+    SLOW_RFI_KEY,
     fleet_service_status,
+    get_slow_rfi,
     list_recent_audit,
     restart_c2_service_local,
     restart_h23_services_local,
+    set_slow_rfi,
 )
 from control_store import H23_DSART_UNITS
 from services_inventory import H20_HOSTNAMES, SERVICE_INVENTORY
@@ -378,6 +385,62 @@ def antennas_rfi():
         nodes_status=nodes_status,
         snapshot_unix=snap.snapshot_unix,
     )
+
+
+def _clamp_chgroup(s: Optional[str], snap) -> int:
+    """Chgroup selector for the Array sums page.
+
+    Defaults to the first chgroup that is actually reporting group
+    data, so the page opens on something with content rather than on
+    ch0 when only some nodes have the detector running.
+    """
+    valid = [c.cn.chgroup for c in snap.per_chgroup]
+    if s:
+        try:
+            want = int(s)
+        except ValueError:
+            want = None
+        if want is not None and want in valid:
+            return want
+    for cring in snap.per_chgroup:
+        for rec in reversed(cring.records):
+            gz = getattr(rec, "group_z", None)
+            if gz is not None and gz.size:
+                return cring.cn.chgroup
+    return valid[0] if valid else 0
+
+
+@app.route("/arraysum", methods=["GET"])
+def array_sums():
+    """Array-burst detector: the core and arm autocorrelation sums,
+    presented as extra antennas. See array_sum_view for why."""
+    snap = store.snapshot()
+    chgroup = _clamp_chgroup(request.args.get("chgroup"), snap)
+    view = build_array_sum_view(snap, chgroup=chgroup)
+    return render_template(
+        "arraysum.html", active_tab="arraysum", view=view,
+    )
+
+
+@app.route("/plot/array_burst_ts.png")
+def plot_array_burst_ts():
+    snap = store.snapshot()
+    chgroup = _clamp_chgroup(request.args.get("chgroup"), snap)
+    return _png_response(
+        render_array_burst_timeseries(snap, chgroup=chgroup)
+    )
+
+
+@app.route("/plot/array_burst_arms.png")
+def plot_array_burst_arms():
+    snap = store.snapshot()
+    chgroup = _clamp_chgroup(request.args.get("chgroup"), snap)
+    return _png_response(render_array_burst_arms(snap, chgroup=chgroup))
+
+
+@app.route("/plot/array_burst_spec.png")
+def plot_array_burst_spec():
+    return _png_response(render_array_burst_spectrum(store.snapshot()))
 
 
 @app.route("/sefds")
@@ -1174,6 +1237,7 @@ def control_page():
         snr_cal_prefix=ic.CALIBRATION_PREFIX,
         corr_nodes=list(CORR_NODES),
         spectral_line_state=spl_state,
+        slow_rfi_key=SLOW_RFI_KEY,
         spectral_line_key=slg.SPECTRAL_LINE_KEY,
         spectral_line_max_integration_s=slg.MAX_INTEGRATION_S,
         spectral_line_min_integration_s=slg.MIN_INTEGRATION_S,
@@ -1394,6 +1458,47 @@ def control_utc_start_post():
 @app.route("/control/utc_stop", methods=["POST"])
 def control_utc_stop_post():
     return _control_json_or_error(control_utc_stop_now)
+
+
+@app.route("/control/slow_rfi", methods=["GET"])
+def control_slow_rfi_get():
+    """Current fleet-wide slow-correlator flagging state."""
+    return jsonify(get_slow_rfi(control_store))
+
+
+@app.route("/control/slow_rfi", methods=["POST"])
+def control_slow_rfi_post():
+    """Turn slow-correlator RFI flagging on or off, fleet-wide.
+
+    One etcd PUT reconfigures all sixteen corr_slow processes within
+    their 5 s poll interval — no restart, and a node that restarts
+    picks up the current state rather than its CLI default.
+    """
+    enabled = request.form.get("enabled", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    mode = request.form.get("array_burst_mode", "flag").strip()
+    hi_guard = request.form.get("hi_guard", "true").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+    if enabled and not hi_guard:
+        # Excising Galactic HI from the slow path is almost never what
+        # anyone wants; require it to be said twice.
+        if request.form.get("confirm_no_hi_guard", "").lower() != "yes":
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "disabling the HI guard while flagging is enabled "
+                    "means the slow correlator will excise Galactic HI "
+                    "(the online flagger does this at up to 99.5% "
+                    "occupancy). Re-submit with "
+                    "confirm_no_hi_guard=yes if that is intended."
+                ),
+            }), 400
+    return _control_json_or_error(
+        set_slow_rfi,
+        enabled=enabled, array_burst_mode=mode, hi_guard=hi_guard,
+    )
 
 
 @app.route("/control/inject", methods=["POST"])
