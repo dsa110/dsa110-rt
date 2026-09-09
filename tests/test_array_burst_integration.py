@@ -487,3 +487,60 @@ def test_build_slow_flagger_does_no_sk_work(monkeypatch):
     assert flagger is not None
     assert int(guard.sum()) == 86          # chgroup 6 carries the HI band
     assert called == []
+
+
+def test_reader_sees_a_mode_change_without_being_rebuilt(tmp_path,
+                                                         monkeypatch):
+    """The mode changes at runtime; a reader built before the change
+    must still report it.
+
+    This is a production bug, not a hypothetical: the rfi_monitor_export
+    sidecar builds its reader when the segment is created, at which
+    point the writer has only laid down its initial "off". Caching the
+    parsed header meant every later publish updated a word the reader
+    never looked at again, and the monitor page reported "off" for
+    sixteen nodes while the detector was running and publishing real
+    data. The numbers were all correct; only the label lied.
+    """
+    import dsart.services.rfi_mon_shm as shm
+    monkeypatch.setattr(shm, "_SHM_DIR", str(tmp_path))
+    n_ants, n_chan_ds, n_pol, w, g, n_acc = 4, 4, 2, 2, 5, 4
+    t = w * n_acc
+    names = ("all", "core", "ew_arm", "ns_arm", "outriggers")
+    z = np.zeros((t, g, n_pol), np.float32)
+
+    def win(mode):
+        return _window(
+            n_ants=n_ants, n_chan_ds=n_chan_ds, n_pol=n_pol, w=w, g=g,
+            n_acc=n_acc, array_burst_mode=mode,
+            array_burst_flag_group="core", group_names=names,
+            group_sizes=np.array([96, 82, 47, 35, 14], np.int32),
+            group_z=z, group_band_frac=z,
+            group_fired=np.zeros((t, g, n_pol), np.uint8),
+            group_spec_mean=np.ones((g, n_chan_ds, n_pol), np.float32),
+            group_n_live=np.ones((g, n_pol), np.float32),
+            n_acc_per_cube=n_acc,
+        )
+
+    writer = shm.RFIMonShmWriter(
+        cn_id=4321, n_ants=n_ants, n_chan_ds=n_chan_ds, n_pol=n_pol,
+        window_size=w, freq_downsample=1, n_slots=3, n_group=g,
+        n_acc_per_cube=n_acc, group_names=names,
+        array_burst_flag_group="core",
+    )
+    try:
+        # Reader built FIRST, before anything has been published -- the
+        # order the sidecar actually runs in.
+        reader = shm.RFIMonShmReader(4321)
+        writer.publish(win("monitor"))
+        assert reader.read_latest().array_burst_mode == "monitor"
+        # Now the operator arms it. Same reader object.
+        writer.publish(win("flag"))
+        assert reader.read_latest().array_burst_mode == "flag"
+        # And turns it off again.
+        writer.publish(win("off"))
+        assert reader.read_latest().array_burst_mode == "off"
+        reader.close()
+    finally:
+        writer.close()
+        writer.unlink()
