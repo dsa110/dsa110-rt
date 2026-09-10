@@ -488,6 +488,24 @@ routines:
   # tools/ops/push_dsart_to_etcd.py and restart corr_fast. Watch the
   # "rfi-persist: held=..." line in the corr_fast log (every 16 blocks)
   # and total_flag_fraction on the dashboard's RFI row.
+  # Array-burst excision (M7.7; monitor 2026-09-08, ARMED 2026-09-09):
+  # the four per-antenna detectors all run inside ONE antenna, so a
+  # burst common to the whole array is ~13 sigma in the core sum and
+  # ~0.05 sigma everywhere they look, and passes straight through.
+  # --rfi-array-burst-mode flag adds a summed-autocorrelation detector
+  # over the core / EW arm / NS arm / outriggers at the M=64 (2.097 ms)
+  # accumulation SK already builds, and zeroes the (time, chan, pol)
+  # cells it fires on across EVERY antenna. Monitor-only for 18 h
+  # first: fired on 0.94% of samples (excluding the startup transient),
+  # zero dropped blocks, fada high-water 29/70 vs 69/70 before.
+  # Cost measured on n03: detector 1.24 ms on every block, plus the
+  # 3.02 ms time-resolved broadcast ONLY on blocks that actually fired
+  # (5f60d61 gates it behind a 0.03 ms .any(); paying it unconditionally
+  # was 4.7 ms and did NOT fit) = +1.30 ms amortised at the measured
+  # rate, against ~5.5 ms of p50 margin. To back it out: set this to
+  # `monitor` (detector still feeds the /arraysum tab, nothing is
+  # excised) or `off`, re-push, restart corr_fast. Watch fired_fraction
+  # per group on /arraysum and the Grafana H2 row.
   #
   # PAIRING INVARIANT: --flagants must come from the SAME calibration
   # solve as --apply-cal. The cal push writes both files together
@@ -516,7 +534,7 @@ routines:
       --rfi-persist-window-s 30
       --rfi-persist-hold-s 900
       --rfi-persist-frac 1.0
-      --rfi-array-burst-mode monitor
+      --rfi-array-burst-mode flag
       --t-int-fast-native 32
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --chan-sum-factor 8
