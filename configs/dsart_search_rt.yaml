@@ -1076,6 +1076,24 @@ inject_bot:
   interval_s: 3600.0          # one injection per hour...
   jitter_s: 300.0             # ...plus/minus 5 min so it never beats with other cadences
   dm_choices: [500.0, 1000.0, 1500.0, 2000.0]
+  # Injected widths, NATIVE samples (1 native = 32.768 us). 32 x
+  # {1,2,4,8,16} spans the detector boxcar octaves that C2 can actually
+  # receive (1..16 search samples = 1.05..16.8 ms); 4 is the historical
+  # reference width, kept so its bucket and long K history stay live.
+  # Cycled ROUND-ROBIN against dm_choices -> 24 (DM, width) pairs, so
+  # every pair is visited about once a day at one shot/hour.
+  #
+  # Widths above the c1c2 cap (max_c1c2_width_samples = 16 search
+  # samples = 512 native) are dropped at config load with a warning:
+  # C2 never receives those candidates, so injecting there would only
+  # manufacture guaranteed misses.
+  #
+  # K IS WIDTH-DEPENDENT and each width carries its own measured K
+  # (bucket dmNNNN@wWWWW; the reference width keeps the bare dmNNNN).
+  # A w=1 probe at the model-equivalent fluence measured K ~ 977
+  # against 2890 at w=4 -- a factor ~3 where the sqrt(width) model
+  # predicts equality -- so nothing is extrapolated across widths.
+  width_choices: [4, 32, 64, 128, 256, 512]
   # Target SNR window: comfortably above the 12-sigma C1 floor, and below
   # the dashboard's 30-sigma-predicted brightness guard even with the
   # ~25% pixel-straddle scatter. The bot never passes allow_bright.
@@ -1083,7 +1101,14 @@ inject_bot:
   target_snr_max: 25.0
   width_samples: 4            # MUST match the K-calibration probe width
   lm_max_rad: 0.02            # inner FoV; dashboard hard limit is 0.0279
-  k_max_age_s: 86400.0        # daily K refresh per DM bucket
+  # 3 days, raised from 1 when multi-width injection landed. With
+  # 4 DMs x 6 widths = 24 buckets and ~24 cycles/day a bucket is
+  # revisited about once a day, so a 24 h limit forced a recalibration
+  # probe on essentially EVERY cycle -- doubling injection traffic and
+  # leaving no clean shots. The invalidators that actually track
+  # physics (new pointing dec, newly applied bf-weights) still fire
+  # immediately regardless of age.
+  k_max_age_s: 259200.0
   k_dec_tol_deg: 0.5          # recalibrate K after a re-point
   recovery_timeout_s: 720.0
   # Attention messages are streak-gated (single events only edit the

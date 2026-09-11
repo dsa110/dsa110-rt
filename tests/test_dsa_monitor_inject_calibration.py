@@ -361,7 +361,9 @@ class TestFireCalibrationProbe:
         )
         assert result.ok is True
         assert result.reason == "ok"
-        assert result.bucket == "dm0500"
+        # K is width-dependent, so a w=32 probe writes the w=32 bucket
+        # and can never overwrite the reference-width K.
+        assert result.bucket == "dm0500@w0032"
         # K should match what we seeded.
         assert result.K == pytest.approx(
             20.0 * math.sqrt(32.0 / 100.0), rel=1e-9,
@@ -369,16 +371,20 @@ class TestFireCalibrationProbe:
         assert result.observed_snr == 20.0
         # Calibration entry persisted.
         cs = ic.CalibrationStore(store)
-        got = cs.get(dm_pc_cm3=500.0)
+        got = cs.get(dm_pc_cm3=500.0, width_samples=32)
         assert got is not None
         assert got.K == pytest.approx(result.K)
         assert got.last_fluence_jy_ms == 100.0
         assert got.last_observed_snr == 20.0
-        # Width is recorded as probe metadata only — the bucket is
-        # DM-only, so a hypothetical injection at a different width
-        # would read back the SAME K.
         assert got.width_samples == 32
-        assert got.bucket == "dm0500"
+        # K IS WIDTH-DEPENDENT (bucket_key): the probe wrote only the
+        # w=32 bucket, so another width reads back nothing rather than
+        # silently inheriting this K. A w=1 probe at the
+        # model-equivalent fluence measured K ~ 977 against 2890 at
+        # w=4, so inheriting across widths was wrong by a factor ~3.
+        assert cs.get(dm_pc_cm3=500.0, width_samples=128) is None
+        assert cs.get(dm_pc_cm3=500.0) is None      # reference width
+        assert got.bucket == "dm0500@w0032"
 
     def test_fleet_lm_offset_match_still_stores_K(self):
         """Regression: a boresight-declared probe matched at the
@@ -417,8 +423,14 @@ class TestFireCalibrationProbe:
         )
         assert result.ok is True
         assert result.reason == "ok"
-        assert result.bucket == "dm0900"
-        assert ic.CalibrationStore(store).get(dm_pc_cm3=900.0) is not None
+        # K is width-dependent, so a w=32 probe writes the w=32 bucket
+        # and can never overwrite the reference-width K.
+        assert result.bucket == "dm0900@w0032"
+        assert ic.CalibrationStore(store).get(
+            dm_pc_cm3=900.0, width_samples=32) is not None
+        # ...and the reference-width bucket is untouched.
+        assert ic.CalibrationStore(store).get(
+            dm_pc_cm3=900.0) is None
 
     def test_no_match_returns_failure(self):
         store = FakeStore()

@@ -33,6 +33,12 @@ from dsart.inject.bot import (  # noqa: E402
     Outcome,
     InjectBotConfig,
     bucket_key,
+    search_samples,
+    _parse_width_choices,
+    CALIBRATION_WIDTH_SAMPLES,
+    DEFAULT_WIDTH_CHOICES,
+    MAX_C1C2_WIDTH_SEARCH_SAMPLES,
+    NATIVE_PER_SEARCH_SAMPLE,
 )
 
 
@@ -109,6 +115,10 @@ def make_config(tmp_path, **over):
         recovery_poll_s=0.01,
         post_calibration_settle_s=0.0,
         weights_applied_dir=str(tmp_path / "weights_applied"),
+        # Pre-existing tests were written against a single width; the
+        # multi-width round-robin is exercised explicitly by the tests
+        # that pass their own width_choices.
+        width_choices=[CALIBRATION_WIDTH_SAMPLES],
     )
     base.update(over)
     return InjectBotConfig.from_dict(base)
@@ -133,7 +143,12 @@ class FakeDash:
         if url.endswith("/control/inject_calibrate"):
             self.calibrate_calls.append(dict(fields))
             dm = float(fields["dm_pc_cm3"])
-            bucket = bucket_key(dm)
+            # Mirror the real probe: it writes the (DM, width) bucket,
+            # never a DM-only one (inject_calibration.bucket_key).
+            bucket = bucket_key(
+                dm,
+                int(fields.get("width_samples", CALIBRATION_WIDTH_SAMPLES)),
+            )
             self.k_entries[bucket] = {
                 "bucket": bucket, "K": self.calibrate_k,
                 "last_calibrated_at_unix": self.now,
@@ -151,8 +166,9 @@ class FakeDash:
         raise AssertionError(f"unexpected POST {url}")
 
 
-def fresh_entry(now, dm, k=170000.0, age_s=0.0):
-    b = bucket_key(dm)
+def fresh_entry(now, dm, k=170000.0, age_s=0.0,
+                width=CALIBRATION_WIDTH_SAMPLES):
+    b = bucket_key(dm, width)
     return b, {
         "bucket": b, "K": k, "last_calibrated_at_unix": now - age_s,
     }
@@ -407,7 +423,9 @@ def test_picked_params_respect_bounds(tmp_path):
         assert cfg.target_snr_min <= p["target_snr"] <= cfg.target_snr_max
         assert abs(p["l_rad"]) <= cfg.lm_max_rad
         assert abs(p["m_rad"]) <= cfg.lm_max_rad
-        assert p["width_samples"] == 4
+        assert p["width_samples"] in cfg.width_choices
+        assert p["width_search_samples"] == pytest.approx(
+            search_samples(p["width_samples"]), rel=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +714,104 @@ def test_bucket_key_matches_dashboard_examples():
     assert bucket_key(1024.0) == "dm1000"
 
 
+def test_bucket_key_is_width_aware_without_legacy_collision():
+    # Reference width keeps the bare key: the live store (all w=4)
+    # needs no migration and a wide-width probe can never overwrite it.
+    assert bucket_key(500.0, CALIBRATION_WIDTH_SAMPLES) == "dm0500"
+    assert bucket_key(500.0) == bucket_key(500.0, 4)
+    # Other widths get their own bucket...
+    assert bucket_key(500.0, 32) == "dm0500@w0032"
+    assert bucket_key(1500.0, 512) == "dm1500@w0512"
+    # ...and must NOT use the legacy "_w" infix, whose entries the
+    # dashboard's is_legacy_bucket() hides from lookup.
+    assert "_w" not in bucket_key(500.0, 32)
+    for w in DEFAULT_WIDTH_CHOICES:
+        assert "_w" not in bucket_key(500.0, w)
+    with pytest.raises(ValueError):
+        bucket_key(500.0, 0)
+
+
+def test_search_samples_conversion():
+    assert search_samples(NATIVE_PER_SEARCH_SAMPLE) == 1.0
+    assert search_samples(512) == 16.0
+    # The default grid spans the shippable boxcar octaves and nothing
+    # above the C1->C2 cap.
+    for w in DEFAULT_WIDTH_CHOICES:
+        assert search_samples(w) <= MAX_C1C2_WIDTH_SEARCH_SAMPLES
+
+
+def test_parse_width_choices_backcompat_and_cap():
+    # No width keys at all -> the multi-width default.
+    assert _parse_width_choices({}) == DEFAULT_WIDTH_CHOICES
+    # Legacy config with only the scalar -> single width, unchanged.
+    assert _parse_width_choices({"width_samples": 4}) == (4,)
+    # Sorted + de-duplicated.
+    assert _parse_width_choices(
+        {"width_choices": [128, 32, 32]}) == (32, 128)
+    # Above the C1->C2 cap is dropped: C2 never receives those
+    # candidates, so injecting there only manufactures misses.
+    over = (MAX_C1C2_WIDTH_SEARCH_SAMPLES + 1) * NATIVE_PER_SEARCH_SAMPLE
+    assert _parse_width_choices(
+        {"width_choices": [32, over]}) == (32,)
+    with pytest.raises(ValueError):
+        _parse_width_choices({"width_choices": [over]})
+    with pytest.raises(ValueError):
+        _parse_width_choices({"width_choices": [0]})
+
+
+def test_round_robin_visits_every_dm_width_pair(tmp_path):
+    cfg = make_config(
+        tmp_path, dm_choices=[500.0, 1000.0], width_choices=[32, 128])
+    s = InjectBot(cfg, store=FakeStore(), notifier=FakeNotifier(),
+                  http_post_form=lambda *a: (200, {"ok": True}),
+                  http_get=lambda *a: (200, {"ok": True, "entries": []}),
+                  rng=random.Random(7))
+    grid = {(dm, w) for dm in cfg.dm_choices for w in cfg.width_choices}
+    seen = []
+    for _ in range(len(grid)):
+        p = s._pick_params()
+        seen.append((p["dm_pc_cm3"], p["width_samples"]))
+    # One full pass covers the grid exactly once -- uniform random
+    # sampling would leave pairs unvisited (and their K stale).
+    assert set(seen) == grid
+    assert len(set(seen)) == len(seen)
+    # ...and it wraps.
+    p = s._pick_params()
+    assert (p["dm_pc_cm3"], p["width_samples"]) == seen[0]
+
+
+def test_summary_includes_width_breakdown(tmp_path):
+    cfg = make_config(tmp_path)
+    s = InjectBot(cfg, store=FakeStore(), notifier=FakeNotifier(),
+                  http_post_form=lambda *a: (200, {"ok": True}),
+                  http_get=lambda *a: (200, {"ok": True, "entries": []}))
+    rows = [
+        {"outcome": Outcome.RECOVERED, "dm_pc_cm3": 500.0,
+         "width_samples": 32, "snr_ratio": 1.02},
+        {"outcome": Outcome.RECOVERED, "dm_pc_cm3": 500.0,
+         "width_samples": 32, "snr_ratio": 0.98},
+        {"outcome": Outcome.MISSED_SEARCH_OR_C1, "dm_pc_cm3": 1000.0,
+         "width_samples": 512},
+        {"outcome": Outcome.RECOVERED, "dm_pc_cm3": 1000.0,
+         "width_samples": 512, "snr_ratio": 0.71},
+    ]
+    stats = s.compute_summary_stats(rows)
+    assert stats["by_width"]["32"] == {"injected": 2, "recovered": 2}
+    assert stats["by_width"]["512"] == {"injected": 2, "recovered": 1}
+    assert stats["snr_ratio_median_by_width"]["512"] == 0.71
+    assert stats["missed_widths"][Outcome.MISSED_SEARCH_OR_C1] == ["512"]
+    text = s._summary_text(stats)
+    assert "per width (native, boxcar)" in text
+    assert "w32 (~1 sa): 2/2" in text
+    assert "w512 (~16 sa): 1/2" in text
+    # The per-width observed/target line is the calibration health
+    # check: a width sitting away from 1.0 has a bad bucket.
+    assert "observed/target by width:" in text
+    assert "w512: 0.71" in text
+    # A miss names its width, not just its DM.
+    assert "DM 1000/w512" in text
+
+
 def test_missed_c2_names_holdoff_suspect(tmp_path):
     now = time.time()
     cfg = make_config(tmp_path)
@@ -731,7 +847,12 @@ def test_post_calibration_settle_before_shot(tmp_path):
     # A recalibration must be followed by the settle sleep (the probe's
     # trigger holdoff would otherwise demote the shot to log_only).
     now = time.time()
-    cfg = make_config(tmp_path, post_calibration_settle_s=90.0)
+    # Pin to ONE (DM, width) bucket so the second cycle revisits it:
+    # the round-robin would otherwise move to a different bucket, whose
+    # missing K legitimately triggers another recal.
+    cfg = make_config(
+        tmp_path, post_calibration_settle_s=90.0,
+        dm_choices=[1000.0], width_choices=[32])
     dash = FakeDash(now)  # no K entries -> recal fires
     s, _ = make_bot(cfg, FakeStore(healthy_docs(now)), dash, now=now)
     sleeps = []

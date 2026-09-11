@@ -173,17 +173,44 @@ DEFAULT_POLL_TIMEOUT_S: float = 30.0
 #: :func:`delete_snr_calibrations` so the operator can wipe them.
 LEGACY_BUCKET_INFIX: str = "_w"
 
+#: Separator for the CURRENT per-width bucket keys, e.g.
+#: ``dm0500@w0128``. Deliberately NOT ``_w``: that is
+#: :data:`LEGACY_BUCKET_INFIX`, whose entries lookup ignores, so reusing
+#: it would make every new per-width bucket invisible.
+WIDTH_BUCKET_INFIX: str = "@w"
 
-def bucket_key(dm_pc_cm3: float) -> str:
-    """Return the calibration bucket key for ``dm``.
 
-    Format: ``dm{rounded_dm:04d}``. Rounded DM is
+def bucket_key(
+    dm_pc_cm3: float,
+    width_samples: int = DEFAULT_CALIBRATION_WIDTH,
+) -> str:
+    """Return the calibration bucket key for ``(dm, width)``.
+
+    Format: ``dm{rounded_dm:04d}`` at the reference width
+    (:data:`DEFAULT_CALIBRATION_WIDTH`), else
+    ``dm{rounded_dm:04d}@w{width:04d}``. Rounded DM is
     ``round(dm / 50) × 50`` (clamped to ≥ 0).
 
-    The bucket is intentionally width-independent: post-F-fix-injector-
-    fluence-norm the injector obeys ``observed_snr ∝ fluence/√width``
-    exactly, so K depends only on the DM band's coarse+fine
-    de-disperser path. One probe at any width pins K for the band.
+    K IS WIDTH-DEPENDENT — 2026-09-11 correction. An earlier revision of
+    this docstring asserted the bucket was "intentionally
+    width-independent ... ``observed_snr ∝ fluence/√width`` exactly, so
+    one probe at any width pins K for the band". That is wrong, and the
+    note on :data:`DEFAULT_CALIBRATION_WIDTH` a few lines above has
+    always contradicted it: **a w=1 probe at the model-equivalent
+    fluence measured K ≈ 977 against 2890 at w=4**, a factor ~3 where
+    the √width model predicts equality. The ±4% confirmation quoted in
+    :func:`snr_to_fluence` came from a fluence sweep at FIXED w=4, so it
+    validated linearity in fluence and never tested the width term.
+
+    Consequences, both relied upon by the inject bot:
+
+    * Each width carries its own measured K. Nothing extrapolates
+      across widths; ``√width`` survives only as the first-probe
+      fluence guess inside :func:`snr_to_fluence`.
+    * The reference width keeps the bare ``dmNNNN`` key, so the live
+      store (dm0250/dm0500/dm1000/dm1500/dm2000, all w=4) needs no
+      migration, and a probe at a non-reference width can never
+      overwrite the reference K.
 
     Examples
     --------
@@ -191,20 +218,28 @@ def bucket_key(dm_pc_cm3: float) -> str:
     'dm0500'
     >>> bucket_key(150.0)
     'dm0150'
-    >>> bucket_key(1500.0)
-    'dm1500'
+    >>> bucket_key(500.0, 128)
+    'dm0500@w0128'
     """
     if not math.isfinite(dm_pc_cm3):
         raise ValueError(f"dm_pc_cm3={dm_pc_cm3} is not finite")
     dm_round = max(
         0, int(round(float(dm_pc_cm3) / DM_BUCKET_PC_CC) * int(DM_BUCKET_PC_CC)),
     )
-    return f"dm{dm_round:04d}"
+    w = int(width_samples)
+    if w < 1:
+        raise ValueError(f"width_samples={width_samples} must be >= 1")
+    if w == int(DEFAULT_CALIBRATION_WIDTH):
+        return f"dm{dm_round:04d}"
+    return f"dm{dm_round:04d}{WIDTH_BUCKET_INFIX}{w:04d}"
 
 
-def calibration_key(dm_pc_cm3: float) -> str:
-    """Return the full etcd key for a DM-band bucket."""
-    return f"{CALIBRATION_PREFIX}{bucket_key(dm_pc_cm3)}"
+def calibration_key(
+    dm_pc_cm3: float,
+    width_samples: int = DEFAULT_CALIBRATION_WIDTH,
+) -> str:
+    """Return the full etcd key for a ``(DM band, width)`` bucket."""
+    return f"{CALIBRATION_PREFIX}{bucket_key(dm_pc_cm3, width_samples)}"
 
 
 def is_legacy_bucket(bucket: str) -> bool:
@@ -284,9 +319,14 @@ class CalibrationStore:
 
     def get(
         self, *, dm_pc_cm3: float,
+        width_samples: int = DEFAULT_CALIBRATION_WIDTH,
     ) -> Optional[CalibrationEntry]:
-        """Return the entry for the DM-band bucket, or None."""
-        key = calibration_key(dm_pc_cm3)
+        """Return the entry for the ``(DM band, width)`` bucket, or None.
+
+        K is width-dependent (see :func:`bucket_key`), so a caller that
+        omits ``width_samples`` gets the reference-width bucket only.
+        """
+        key = calibration_key(dm_pc_cm3, width_samples)
         try:
             raw = self._store.get_dict(key)
         except Exception as exc:  # noqa: BLE001
@@ -634,7 +674,7 @@ def fire_calibration_probe(
     """
     t0 = float(time_fn())
     cs = cal_store if cal_store is not None else CalibrationStore(store)
-    bucket = bucket_key(dm_pc_cm3)
+    bucket = bucket_key(dm_pc_cm3, width_samples)
     inj_id = inj_id_override or _build_probe_inj_id(
         prefix=inj_id_prefix, dm=dm_pc_cm3, width=width_samples,
         timestamp=t0,
@@ -1349,7 +1389,7 @@ def fire_calibration_probe_with_ladder(
                 ProbeResult(
                     ok=False,
                     inj_id="",
-                    bucket=bucket_key(dm_pc_cm3),
+                    bucket=bucket_key(dm_pc_cm3, width_samples),
                     K=None,
                     observed_snr=None,
                     observed_event_specnum=None,
@@ -1369,7 +1409,8 @@ def fire_calibration_probe_with_ladder(
     # 2026-08-06 brightness guard. Prefer the K-derived ceiling (it
     # knows this bucket's actual fluence→SNR gain); fall back to the
     # conservative absolute ceiling when the bucket has no K yet.
-    stored_entry = cs.get(dm_pc_cm3=dm_pc_cm3)
+    stored_entry = cs.get(
+        dm_pc_cm3=dm_pc_cm3, width_samples=width_samples)
     stored_K = (
         stored_entry.K
         if stored_entry is not None and stored_entry.K > 0.0
@@ -1721,6 +1762,7 @@ __all__ = [
     "IMAGER_SAFE_OBSERVED_SNR",
     "SATURATION_OBSERVED_SNR",
     "LEGACY_BUCKET_INFIX",
+    "WIDTH_BUCKET_INFIX",
     "CalibrationEntry",
     "CalibrationStore",
     "HealthSnapshot",

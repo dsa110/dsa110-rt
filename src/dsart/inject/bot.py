@@ -100,12 +100,39 @@ OWNED_INJ_ID_PREFIXES = ("inj_", "cal_probe_")
 #: DM bucket granularity of the K store (inject_calibration.DM_BUCKET_PC_CC).
 DM_BUCKET_PC_CC = 50.0
 
-#: Probe width every K in the store was measured at
-#: (inject_calibration.DEFAULT_CALIBRATION_WIDTH, NATIVE 32.768 us
-#: samples). Sub-search-sample widths make observed SNR scale linearly
-#: with fluence, so target-SNR shots are only self-consistent at the
-#: calibration width — the bot pins its width to this.
+#: Reference probe width (inject_calibration.DEFAULT_CALIBRATION_WIDTH,
+#: NATIVE 32.768 us samples). Buckets at this width keep the bare
+#: ``dmNNNN`` key, so the pre-existing store needs no migration.
 CALIBRATION_WIDTH_SAMPLES = 4
+
+#: Separator for per-width bucket keys (mirror of
+#: inject_calibration.WIDTH_BUCKET_INFIX). NOT ``_w`` — that is the
+#: legacy infix whose entries dashboard lookup ignores.
+WIDTH_BUCKET_INFIX = "@w"
+
+#: Native samples per search sample at the production op-point:
+#: 1048.576 us / 32.768 us. An injection's ``width_samples`` is in
+#: NATIVE samples while a C1 row's is the detector boxcar index in
+#: SEARCH samples (online.InjectionConfig's CROSS-READING HAZARD note).
+NATIVE_PER_SEARCH_SAMPLE = 32
+
+#: C1->C2 width cap (configs/dsart_search_rt.yaml
+#: ``c1c2.max_c1c2_width_samples``, SEARCH samples): candidates wider
+#: than this are dropped before transmission to C2. Injecting above it
+#: is a guaranteed miss, so the bot refuses such widths.
+MAX_C1C2_WIDTH_SEARCH_SAMPLES = 16
+
+#: Default injected widths, NATIVE samples. 32 x {1,2,4,8,16} spans the
+#: shippable detector boxcar octaves (1..16 search samples = 1.05..16.8
+#: ms), and 4 is retained as the historical reference width so its
+#: bucket and its long K history stay live.
+#:
+#: K IS WIDTH-DEPENDENT, so every width carries its OWN measured K
+#: (see inject_calibration.bucket_key): a w=1 probe at the
+#: model-equivalent fluence measured K ~ 977 against 2890 at w=4, a
+#: factor ~3 where the sqrt(width) model predicts equality. Nothing is
+#: extrapolated across widths.
+DEFAULT_WIDTH_CHOICES: Tuple[int, ...] = (4, 32, 64, 128, 256, 512)
 
 #: Search halves the health gate checks (sid, gpu_half) — mirrors
 #: inject_calibration.precheck_calibration_health's default.
@@ -128,14 +155,71 @@ ALL_CHGROUPS: Tuple[int, ...] = tuple(range(16))
 DEFAULT_LM_MAX_RAD = 0.02
 
 
-def bucket_key(dm_pc_cm3: float) -> str:
-    """Mirror of ``inject_calibration.bucket_key`` (``dm{round/50*50:04d}``)."""
+def bucket_key(
+    dm_pc_cm3: float,
+    width_samples: int = CALIBRATION_WIDTH_SAMPLES,
+) -> str:
+    """Mirror of ``inject_calibration.bucket_key``.
+
+    ``dm{round/50*50:04d}`` at the reference width, else
+    ``dm{...}@w{width:04d}``. Must stay byte-identical to the dashboard
+    helper or the bot looks up buckets the probe never writes.
+    """
     if not math.isfinite(dm_pc_cm3):
         raise ValueError(f"dm_pc_cm3={dm_pc_cm3} is not finite")
     dm_round = max(
         0, int(round(float(dm_pc_cm3) / DM_BUCKET_PC_CC) * int(DM_BUCKET_PC_CC)),
     )
-    return f"dm{dm_round:04d}"
+    w = int(width_samples)
+    if w < 1:
+        raise ValueError(f"width_samples={width_samples} must be >= 1")
+    if w == CALIBRATION_WIDTH_SAMPLES:
+        return f"dm{dm_round:04d}"
+    return f"dm{dm_round:04d}{WIDTH_BUCKET_INFIX}{w:04d}"
+
+
+def search_samples(width_native: int) -> float:
+    """Detector boxcar width (SEARCH samples) an injection of
+    ``width_native`` NATIVE samples lands in, to first order."""
+    return float(width_native) / float(NATIVE_PER_SEARCH_SAMPLE)
+
+
+def _parse_width_choices(d: Mapping[str, Any]) -> Tuple[int, ...]:
+    """Validated injected widths in NATIVE samples.
+
+    Back-compat: a config carrying only the scalar ``width_samples``
+    and no ``width_choices`` keeps the old single-width behaviour.
+
+    Widths implying a detector boxcar wider than
+    :data:`MAX_C1C2_WIDTH_SEARCH_SAMPLES` are DROPPED with a warning:
+    ``c1c2`` discards those candidates before they reach C2, so
+    injecting there would only manufacture guaranteed misses.
+    """
+    raw = d.get("width_choices")
+    if raw is None:
+        if "width_samples" in d:
+            return (int(d["width_samples"]),)
+        return DEFAULT_WIDTH_CHOICES
+    out: List[int] = []
+    for x in raw:
+        w = int(x)
+        if w < 1:
+            raise ValueError(f"width_choices entry {x!r} must be >= 1")
+        if search_samples(w) > MAX_C1C2_WIDTH_SEARCH_SAMPLES:
+            LOG.warning(
+                "inject_bot: dropping width_choices entry %d native "
+                "(~%.0f search samples): above the C1->C2 cap of %d, so "
+                "C2 would never see it",
+                w, search_samples(w), MAX_C1C2_WIDTH_SEARCH_SAMPLES)
+            continue
+        out.append(w)
+    if not out:
+        raise ValueError(
+            "width_choices left empty after applying the C1->C2 width cap "
+            f"of {MAX_C1C2_WIDTH_SEARCH_SAMPLES} search samples "
+            f"({MAX_C1C2_WIDTH_SEARCH_SAMPLES * NATIVE_PER_SEARCH_SAMPLE} "
+            "native)")
+    return tuple(sorted(set(out)))
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +248,24 @@ class InjectBotConfig:
     dm_choices: Tuple[float, ...] = (500.0, 1000.0, 1500.0, 2000.0)
     target_snr_min: float = 15.0
     target_snr_max: float = 25.0
+    #: Injected widths, NATIVE samples, cycled round-robin against
+    #: dm_choices so every (DM, width) bucket gets even coverage.
+    width_choices: Tuple[int, ...] = DEFAULT_WIDTH_CHOICES
+    #: Retained for back-compat: a config that sets only the scalar
+    #: ``width_samples`` (and no ``width_choices``) keeps the old
+    #: single-width behaviour exactly.
     width_samples: int = CALIBRATION_WIDTH_SAMPLES
     profile: str = "gaussian"
     lm_max_rad: float = DEFAULT_LM_MAX_RAD
 
-    k_max_age_s: float = 86400.0
+    #: 3 days, raised from 1 day when multi-width injection landed.
+    #: With len(dm_choices) x len(width_choices) = 24 buckets and ~24
+    #: cycles/day, a bucket is revisited about once a day, so a 24 h
+    #: age limit forced a recalibration probe on essentially every
+    #: cycle (doubling injection traffic and leaving no clean shots).
+    #: The physically meaningful invalidators — a new pointing dec and
+    #: newly applied beamformer weights — still fire immediately.
+    k_max_age_s: float = 259200.0
     k_dec_tol_deg: float = 0.5
     #: Reject a recalibration whose K moved by more than this factor in
     #: either direction. A railed probe (fp16 detector saturation, e.g.
@@ -257,6 +354,7 @@ class InjectBotConfig:
             target_snr_max=float(d.get("target_snr_max", 25.0)),
             width_samples=int(
                 d.get("width_samples", CALIBRATION_WIDTH_SAMPLES)),
+            width_choices=_parse_width_choices(d),
             profile=str(d.get("profile", "gaussian")),
             lm_max_rad=float(d.get("lm_max_rad", DEFAULT_LM_MAX_RAD)),
             k_max_age_s=float(d.get("k_max_age_s", 86400.0)),
@@ -515,13 +613,16 @@ class InjectBot:
 
     # ----- K freshness -----------------------------------------------------
 
-    def _get_calibration_entry(self, dm: float) -> Optional[Dict[str, Any]]:
+    def _get_calibration_entry(
+        self, dm: float,
+        width_samples: int = CALIBRATION_WIDTH_SAMPLES,
+    ) -> Optional[Dict[str, Any]]:
         url = f"{self._cfg.dashboard_base_url}/control/inject_calibrations"
         status, doc = self._http_get(url)
         if status != 200 or not doc.get("ok"):
             LOG.warning("inject_calibrations GET failed: %s %s", status, doc)
             return None
-        want = bucket_key(dm)
+        want = bucket_key(dm, width_samples)
         for entry in doc.get("entries") or []:
             if entry.get("bucket") == want:
                 return dict(entry)
@@ -545,15 +646,26 @@ class InjectBot:
     def ensure_k_fresh(
         self, dm: float,
         live_chgroups: Optional[Tuple[int, ...]] = None,
+        width_samples: Optional[int] = None,
     ) -> Tuple[bool, Dict[str, Any]]:
-        """Recalibrate the DM bucket when K is missing, stale, or was
-        measured at a different pointing dec. Returns ``(usable,
-        info)``; ``usable`` False means the bucket still has no valid K
-        (the cycle is then recorded as fire_failed with the reason)."""
+        """Recalibrate the ``(DM, width)`` bucket when K is missing,
+        stale, or was measured at a different pointing dec. Returns
+        ``(usable, info)``; ``usable`` False means the bucket still has
+        no valid K (the cycle is then recorded as fire_failed).
+
+        The probe fires at ``width_samples`` and writes only that
+        width's bucket, so calibrating a wide width can never overwrite
+        the reference-width K — which matters because K is
+        width-dependent by a factor ~3 (see :func:`bucket_key`)."""
         cfg = self._cfg
-        bucket = bucket_key(dm)
-        info: Dict[str, Any] = {"bucket": bucket, "recalibrated": False}
-        entry = self._get_calibration_entry(dm)
+        width = int(
+            cfg.width_samples if width_samples is None else width_samples)
+        bucket = bucket_key(dm, width)
+        info: Dict[str, Any] = {
+            "bucket": bucket, "recalibrated": False,
+            "width_samples": width,
+        }
+        entry = self._get_calibration_entry(dm, width)
         now = self._time()
         dec_now = self.read_pointing_dec()
         info["pointing_dec_deg"] = dec_now
@@ -589,7 +701,7 @@ class InjectBot:
             LOG.info("K recal for %s: %s", bucket, ",".join(reasons))
             recal_fields: Dict[str, Any] = {
                 "dm_pc_cm3": dm,
-                "width_samples": cfg.width_samples,
+                "width_samples": width,
                 "poll_timeout_s": cfg.calibrate_poll_timeout_s,
                 "user": "inject_bot",
             }
@@ -612,7 +724,7 @@ class InjectBot:
                 info["recal_error"] = doc.get(
                     "error") or doc.get("reason") or f"http {status}"
                 LOG.warning("K recal for %s failed: %s", bucket, info)
-            entry = self._get_calibration_entry(dm)
+            entry = self._get_calibration_entry(dm, width)
             new_k = float((entry or {}).get("K") or 0)
             factor = cfg.k_recal_max_change_factor
             if (
@@ -658,18 +770,38 @@ class InjectBot:
 
     # ----- one injection cycle ---------------------------------------------
 
+    def _dm_width_grid(self) -> Tuple[Tuple[float, int], ...]:
+        """Every (DM, native width) pair the bot cycles through."""
+        cfg = self._cfg
+        return tuple(
+            (float(dm), int(w))
+            for dm in cfg.dm_choices
+            for w in cfg.width_choices
+        )
+
     def _pick_params(self) -> Dict[str, Any]:
         cfg = self._cfg
         r = self._rng
-        # Uniform over the inner disc-ish box; both axes independently
-        # bounded well inside the dashboard's 0.0279 rad hard limit.
+        # (DM, width) is ROUND-ROBIN, not random: with 24 pairs and ~24
+        # shots/day, uniform sampling would leave a third of the grid
+        # unvisited on any given day (and some pairs' K permanently
+        # stale), which defeats the point of spanning the widths.
+        grid = self._dm_width_grid()
+        state = self._load_state()
+        idx = int(state.get("dm_width_rr_index", 0)) % len(grid)
+        dm, width = grid[idx]
+        state["dm_width_rr_index"] = (idx + 1) % len(grid)
+        self._save_state()
+        # l, m and target SNR stay uniform over the inner disc-ish box;
+        # both axes bounded well inside the dashboard's 0.0279 rad limit.
         return {
-            "dm_pc_cm3": r.choice(cfg.dm_choices),
+            "dm_pc_cm3": dm,
             "target_snr": round(
                 r.uniform(cfg.target_snr_min, cfg.target_snr_max), 2),
             "l_rad": round(r.uniform(-cfg.lm_max_rad, cfg.lm_max_rad), 6),
             "m_rad": round(r.uniform(-cfg.lm_max_rad, cfg.lm_max_rad), 6),
-            "width_samples": cfg.width_samples,
+            "width_samples": width,
+            "width_search_samples": round(search_samples(width), 3),
             "profile": cfg.profile,
         }
 
@@ -746,7 +878,10 @@ class InjectBot:
         last_good = _as_float(good.get(bucket))
         if not suspicious or not last_good or factor <= 0:
             return
-        entry = self._get_calibration_entry(float(dm))
+        entry = self._get_calibration_entry(
+            float(dm),
+            int(record.get("width_samples") or cfg.width_samples),
+        )
         cur_k = _as_float((entry or {}).get("K"))
         if not entry or not cur_k:
             return
@@ -786,7 +921,8 @@ class InjectBot:
         dm = params["dm_pc_cm3"]
 
         usable, k_info = self.ensure_k_fresh(
-            dm, live_chgroups=live_chgroups)
+            dm, live_chgroups=live_chgroups,
+            width_samples=params["width_samples"])
         record["k_info"] = k_info
         record["pointing_dec_deg"] = k_info.get("pointing_dec_deg")
         if not usable:
@@ -870,7 +1006,8 @@ class InjectBot:
         return (
             "injection sent: `{inj_id}`\n"
             "DM {dm:.0f} pc/cc | target SNR {snr:.1f} | "
-            "fluence {fl} | width {w} native | "
+            "fluence {fl} | width {w} native "
+            "(~{ws:g} search samp) | "
             "(l,m) = ({l:+.2f}, {m:+.2f}) mrad | pointing dec {dec}"
         ).format(
             inj_id=record.get("inj_id"),
@@ -881,6 +1018,8 @@ class InjectBot:
                 if record.get("fluence_jy_ms") is not None else "n/a"
             ),
             w=record.get("width_samples"),
+            ws=round(search_samples(
+                int(record.get("width_samples") or 0)), 2),
             l=float(record.get("l_rad") or 0) * 1e3,
             m=float(record.get("m_rad") or 0) * 1e3,
             dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
@@ -1430,8 +1569,11 @@ class InjectBot:
     ) -> Dict[str, Any]:
         by_outcome: Dict[str, int] = {}
         by_dm: Dict[str, Dict[str, int]] = {}
+        by_width: Dict[str, Dict[str, int]] = {}
         missed_dms: Dict[str, List[str]] = {}
+        missed_widths: Dict[str, List[str]] = {}
         ratios: List[float] = []
+        ratios_by_width: Dict[str, List[float]] = {}
         for r in rows:
             outcome = str(r.get("outcome") or "unknown")
             by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
@@ -1439,6 +1581,9 @@ class InjectBot:
                 dm_val = r.get("dm_pc_cm3")
                 missed_dms.setdefault(outcome, []).append(
                     f"{float(dm_val):.0f}" if dm_val is not None else "?")
+                w_val = r.get("width_samples")
+                missed_widths.setdefault(outcome, []).append(
+                    f"{int(w_val)}" if w_val is not None else "?")
             dm = r.get("dm_pc_cm3")
             if dm is not None:
                 key = f"{float(dm):.0f}"
@@ -1450,8 +1595,23 @@ class InjectBot:
                     slot["injected"] += 1
                 if outcome == Outcome.RECOVERED:
                     slot["recovered"] += 1
+            width = r.get("width_samples")
+            if width is not None:
+                wkey = str(int(width))
+                wslot = by_width.setdefault(
+                    wkey, {"injected": 0, "recovered": 0})
+                if outcome not in (
+                    Outcome.NOT_SEARCHING, Outcome.GUARD_REJECTED,
+                    Outcome.FIRE_FAILED,
+                ):
+                    wslot["injected"] += 1
+                if outcome == Outcome.RECOVERED:
+                    wslot["recovered"] += 1
             if r.get("snr_ratio") is not None:
                 ratios.append(float(r["snr_ratio"]))
+                if width is not None:
+                    ratios_by_width.setdefault(
+                        str(int(width)), []).append(float(r["snr_ratio"]))
         injected = sum(
             v for k, v in by_outcome.items()
             if k in (Outcome.RECOVERED,) + Outcome.MISSES
@@ -1462,13 +1622,23 @@ class InjectBot:
             "recovered": recovered,
             "by_outcome": by_outcome,
             "by_dm": by_dm,
+            "by_width": by_width,
             "missed_dms": missed_dms,
+            "missed_widths": missed_widths,
         }
         if ratios:
             ratios.sort()
             stats["snr_ratio_median"] = ratios[len(ratios) // 2]
             stats["snr_ratio_min"] = ratios[0]
             stats["snr_ratio_max"] = ratios[-1]
+        if ratios_by_width:
+            # Per-width calibration health: K is measured per
+            # (DM, width), so a width whose median ratio sits away
+            # from 1.0 has a bad bucket, not a bad model.
+            stats["snr_ratio_median_by_width"] = {
+                w: sorted(v)[len(v) // 2]
+                for w, v in ratios_by_width.items()
+            }
         return stats
 
     def _summary_text(self, stats: Mapping[str, Any]) -> str:
@@ -1485,8 +1655,18 @@ class InjectBot:
                 f"DM {dm}: {v['recovered']}/{v['injected']}"
                 for dm, v in sorted(by_dm.items(), key=lambda kv: float(kv[0]))
             ))
+        by_width = stats.get("by_width") or {}
+        if by_width:
+            lines.append("per width (native, boxcar): " + " | ".join(
+                "w{w} (~{sa:g} sa): {rec}/{inj}".format(
+                    w=w, sa=round(search_samples(int(w)), 2),
+                    rec=v["recovered"], inj=v["injected"])
+                for w, v in sorted(
+                    by_width.items(), key=lambda kv: int(kv[0]))
+            ))
         by_outcome = dict(stats.get("by_outcome") or {})
         missed_dms = dict(stats.get("missed_dms") or {})
+        missed_widths = dict(stats.get("missed_widths") or {})
         misses = {
             k: v for k, v in by_outcome.items() if k in Outcome.MISSES and v
         }
@@ -1494,7 +1674,14 @@ class InjectBot:
             parts = []
             for k, v in sorted(misses.items()):
                 dms = missed_dms.get(k) or []
-                at = f" (DM {', '.join(dms)})" if dms else ""
+                ws = missed_widths.get(k) or []
+                if dms and ws and len(dms) == len(ws):
+                    at = " (" + ", ".join(
+                        f"DM {d}/w{w}" for d, w in zip(dms, ws)) + ")"
+                elif dms:
+                    at = f" (DM {', '.join(dms)})"
+                else:
+                    at = ""
                 parts.append(f"{v} {k}{at}")
             lines.append("missed: " + "; ".join(parts))
         skipped = by_outcome.get(Outcome.NOT_SEARCHING, 0)
@@ -1512,6 +1699,13 @@ class InjectBot:
                 "(range {lo:.2f}-{hi:.2f})".format(
                     med=stats["snr_ratio_median"],
                     lo=stats["snr_ratio_min"], hi=stats["snr_ratio_max"]))
+        by_w_ratio = stats.get("snr_ratio_median_by_width") or {}
+        if by_w_ratio:
+            lines.append("observed/target by width: " + " | ".join(
+                f"w{w}: {v:.2f}"
+                for w, v in sorted(
+                    by_w_ratio.items(), key=lambda kv: int(kv[0]))
+            ))
         return "\n".join(lines)
 
     # ----- daily summary figures ---------------------------------------------
@@ -1559,6 +1753,23 @@ class InjectBot:
             "savefig.facecolor": "white",
             "figure.constrained_layout.use": True,
         }
+
+    @staticmethod
+    def _width_marker_size(width_native: Optional[float]) -> float:
+        """Marker area encoding the injected width.
+
+        Width spans 4..512 native samples (7 octaves), so area is
+        log-scaled: 4 -> 40, 32 -> 130, 512 -> 250. DM keeps colour and
+        shape, so the two encodings never collide.
+        """
+        try:
+            w = float(width_native or 0)
+        except (TypeError, ValueError):
+            w = 0.0
+        if w <= 0:
+            return 70.0
+        octaves = math.log2(max(w, 1.0) / float(CALIBRATION_WIDTH_SAMPLES))
+        return float(min(260.0, max(40.0, 40.0 + 30.0 * octaves)))
 
     def _despine(self, ax: Any) -> None:
         for side in ("top", "right"):
@@ -1659,21 +1870,35 @@ class InjectBot:
                     o = _as_float(r.get("observed_snr"))
                     if t is None:
                         continue
+                    msize = self._width_marker_size(
+                        r.get("width_samples"))
                     if o is not None:
-                        ax.scatter([t], [o], s=70, marker=marker,
+                        ax.scatter([t], [o], s=msize, marker=marker,
                                    facecolor=color, edgecolor=edge,
                                    linewidth=0.9, alpha=0.9, zorder=3)
                     else:
                         # Miss: same DM marker, OPEN, at recovered
                         # S/N = 0 (filled = recovered, open = missed).
-                        ax.scatter([t], [0.0], s=70, marker=marker,
+                        ax.scatter([t], [0.0], s=msize, marker=marker,
                                    facecolor="none", edgecolor=edge,
                                    linewidth=1.4, zorder=3)
                 ax.set_xlim(lo, hi)
                 ax.set_ylim(-1.0, hi)
                 ax.set_xlabel("injected S/N")
                 ax.set_ylabel("recovered S/N")
-                ax.set_title(f"Injection recovery, {span}",
+                widths_seen = sorted({
+                    int(r["width_samples"]) for r in fired
+                    if r.get("width_samples") is not None
+                })
+                # Second title line, not a suffix: the span string
+                # alone already fills the axes width, so appending to
+                # it clipped the note off the right edge.
+                wsub = (
+                    "\nmarker size = width, {lo}-{hi} native samp".format(
+                        lo=widths_seen[0], hi=widths_seen[-1])
+                    if len(widths_seen) > 1 else ""
+                )
+                ax.set_title(f"Injection recovery, {span}{wsub}",
                              fontsize=11.5, color=self._INK,
                              loc="left", pad=10)
                 fig.legend(

@@ -1622,6 +1622,7 @@ def control_inject_post():
     import inject_calibration as ic                              # local
     cal_entry = ic.CalibrationStore(control_store).get(
         dm_pc_cm3=float(kwargs["dm_pc_cm3"]),
+        width_samples=int(kwargs["width_samples"]),
     )
     target_snr: float | None = None
     if target_snr_raw:
@@ -1639,11 +1640,15 @@ def control_inject_post():
             return jsonify({
                 "ok": False,
                 "error": (
-                    f"No K calibration for DM bucket "
-                    f"{ic.bucket_key(float(kwargs['dm_pc_cm3']))}; "
-                    f"run /control/inject_calibrate first (any width)."
+                    f"No K calibration for bucket "
+                    f"{ic.bucket_key(float(kwargs['dm_pc_cm3']), int(kwargs['width_samples']))}; "
+                    f"run /control/inject_calibrate at THIS width first "
+                    f"(K is width-dependent -- see ic.bucket_key)."
                 ),
-                "bucket": ic.bucket_key(float(kwargs["dm_pc_cm3"])),
+                "bucket": ic.bucket_key(
+                    float(kwargs["dm_pc_cm3"]),
+                    int(kwargs["width_samples"]),
+                ),
             }), 412
         try:
             fluence = ic.snr_to_fluence(
@@ -1679,7 +1684,8 @@ def control_inject_post():
     if not allow_bright:
         fluence_val = float(kwargs["fluence_jy_ms"])
         width_val = int(kwargs["width_samples"])
-        bucket = ic.bucket_key(float(kwargs["dm_pc_cm3"]))
+        bucket = ic.bucket_key(
+            float(kwargs["dm_pc_cm3"]), int(kwargs["width_samples"]))
         cap = ic.max_safe_fluence(
             cal_entry.K if cal_entry is not None else None, width_val,
         )
@@ -1912,6 +1918,7 @@ def control_inject_calibrate_post():
             legacy_kwargs = dict(kwargs)
             entry = ic.CalibrationStore(control_store).get(
                 dm_pc_cm3=float(kwargs["dm_pc_cm3"]),
+                width_samples=int(kwargs["width_samples"]),
             )
             cap = ic.max_safe_fluence(
                 entry.K if entry is not None else None,
