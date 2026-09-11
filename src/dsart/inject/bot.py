@@ -2044,8 +2044,18 @@ class InjectBot:
         self._stop_event = stop_event
         LOG.info(
             "inject_bot: starting (interval=%.0fs jitter=%.0fs "
-            "dms=%s snr=[%.1f, %.1f] channel=%s)",
+            "dms=%s widths_native=%s (~%s search samp) "
+            "%d (dm,width) pairs round-robin, k_max_age=%.1fh "
+            "snr=[%.1f, %.1f] channel=%s)",
             cfg.interval_s, cfg.jitter_s, list(cfg.dm_choices),
+            list(cfg.width_choices),
+            [
+                (int(x) if float(x).is_integer() else x)
+                for x in (round(search_samples(w), 2)
+                          for w in cfg.width_choices)
+            ],
+            len(cfg.dm_choices) * len(cfg.width_choices),
+            cfg.k_max_age_s / 3600.0,
             cfg.target_snr_min, cfg.target_snr_max, cfg.channel or "(none)",
         )
         # Wall-clock anchored cadence: the next shot is scheduled one
