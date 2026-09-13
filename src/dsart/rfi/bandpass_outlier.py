@@ -22,6 +22,11 @@ from typing import Final
 
 import torch
 
+from dsart.rfi.far_calibration import (
+    DEFAULT_OUTLIER_FAR,
+    bandpass_threshold_k,
+)
+
 # ---------------------------------------------------------------------------
 # Module constants
 # ---------------------------------------------------------------------------
@@ -30,7 +35,14 @@ import torch
 #: estimator (i.e. for Gaussian X, ``MAD(X) · 1.4826 ≈ σ(X)``).
 MAD_TO_SIGMA: Final[float] = 1.4826
 
-#: Default outlier threshold in MAD-σ units.
+#: Legacy hand-chosen threshold in MAD-σ units. Retained so an
+#: explicit ``k=`` override still works, but it is NOT the default
+#: route any more: ``k = 5`` reads as "5 sigma" and is not. Measured
+#: under the thermal null at the live geometry (n_chan = 384,
+#: M = 4096) it buys a per-cell FAR of 1.7e-6 — 3x the Gaussian
+#: 5.7e-7, because the median and MAD are estimated from the same
+#: finite sample. Prefer ``far=``; see
+#: :mod:`dsart.rfi.far_calibration`.
 DEFAULT_BANDPASS_K: Final[float] = 5.0
 
 
@@ -42,7 +54,9 @@ DEFAULT_BANDPASS_K: Final[float] = 5.0
 def bandpass_outlier_mask(
     s1: torch.Tensor,
     *,
-    k: float = DEFAULT_BANDPASS_K,
+    k: float | None = None,
+    far: float | None = None,
+    m_acc: int = 4096,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     """Median-bandpass + MAD outlier mask on the per-cube auto-power.
@@ -77,6 +91,12 @@ def bandpass_outlier_mask(
             f"s1 must be 3-dim (NANTS, NCHAN, NPOL); got shape "
             f"{tuple(s1.shape)}"
         )
+    if k is not None and far is not None:
+        raise ValueError("pass k or far, not both")
+    if k is None:
+        far_eff = DEFAULT_OUTLIER_FAR if far is None else float(far)
+        k = bandpass_threshold_k(
+            int(s1.shape[1]), far_eff, m_acc=int(m_acc))
     # Per-(ant, pol) median over the channel axis.
     med = torch.median(s1, dim=1, keepdim=True).values
     abs_dev = (s1 - med).abs()

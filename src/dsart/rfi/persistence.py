@@ -339,3 +339,114 @@ class FlagPersistence:
         at_thresh = self._count >= self._count_thresh
         newly = at_thresh & (self._hold == 0)
         return at_thresh, newly
+
+
+# ---------------------------------------------------------------------------
+# Per-detector latching (R5)
+# ---------------------------------------------------------------------------
+
+#: Default per-detector latch specs, ``name -> (window_s, hold_s)``.
+#: ``None`` means "never latch this detector".
+#:
+#: Rationale for the split (R5). One latch over the OR-folded detector
+#: mask gives every detector the same memory, but they do not want the
+#: same memory:
+#:
+#: * ``sk`` / ``bandpass`` — a narrowband carrier sitting at threshold
+#:   blinks at the cube rate; that is what the latch was built for, and
+#:   30 s / 900 s is the deployed, validated pair. Unchanged.
+#: * ``group`` — a genuinely sick antenna stays sick for far longer
+#:   than 30 s, so a longer window costs nothing and a longer hold
+#:   stops it re-blinking across a maintenance gap.
+#: * ``sumthr`` — sum-threshold is *already* a dilation over
+#:   neighbouring channels. Latching a dilation dilates in time as
+#:   well, which is not what it was calibrated for.
+#:
+#: ``array_burst`` is deliberately absent: its verdict is time-resolved
+#: at 2.097 ms and never enters the cube-cadence mask that is latched
+#: (see :mod:`dsart.rfi.combine`), so there is nothing here to hold.
+DEFAULT_PER_DETECTOR_SPECS: dict[str, tuple[float, float] | None] = {
+    "sk": (30.0, 900.0),
+    "bandpass": (30.0, 900.0),
+    "group": (60.0, 1800.0),
+    "sumthr": None,
+}
+
+
+class PerDetectorPersistence:
+    """One :class:`FlagPersistence` per detector, OR-folded after.
+
+    Composition, not a reimplementation: each detector gets its own
+    validated latch with its own window and hold, and the outputs are
+    OR-folded. The per-cube cost is a handful of elementwise ops on
+    ``[NANTS, NCHAN, NPOL]`` per detector — tens of microseconds
+    against a 134 ms block, so the extra latches are free at the
+    real-time budget (which has ~1.8 ms of margin on the tightest
+    node and cannot absorb anything expensive).
+
+    Args:
+        cadence_s: cube cadence in seconds, used to convert the spec's
+            seconds into cube counts.
+        specs: ``name -> (window_s, hold_s) | None``. Defaults to
+            :data:`DEFAULT_PER_DETECTOR_SPECS`.
+        latch_frac: passed through to each :class:`FlagPersistence`.
+    """
+
+    def __init__(
+        self,
+        *,
+        cadence_s: float,
+        specs: "dict[str, tuple[float, float] | None] | None" = None,
+        latch_frac: float = LATCH_FRAC_DEFAULT,
+    ) -> None:
+        if cadence_s <= 0.0:
+            raise ValueError(f"cadence_s={cadence_s}, expected > 0")
+        specs = dict(
+            DEFAULT_PER_DETECTOR_SPECS if specs is None else specs)
+        self._latches: dict[str, FlagPersistence] = {}
+        self._specs = specs
+        for name, spec in specs.items():
+            if spec is None:
+                continue
+            window_s, hold_s = spec
+            self._latches[name] = FlagPersistence(
+                latch_window_cubes=max(1, int(round(window_s / cadence_s))),
+                hold_cubes=max(1, int(round(hold_s / cadence_s))),
+                latch_frac=latch_frac,
+            )
+
+    @property
+    def detector_names(self) -> tuple[str, ...]:
+        """Names that actually carry a latch."""
+        return tuple(self._latches)
+
+    def update(
+        self, masks: "dict[str, torch.Tensor]",
+    ) -> "tuple[torch.Tensor, dict[str, PersistenceStats]]":
+        """Advance every latch by one cube.
+
+        Args:
+            masks: ``name -> bool [NANTS, NCHAN, NPOL]`` per-detector
+                masks for this cube. Names with no latch configured are
+                ignored; names with a latch but no mask are skipped.
+
+        Returns:
+            ``(persist_mask, stats_by_detector)``. ``persist_mask`` is
+            the OR over the latched detectors, i.e. a drop-in for what
+            :meth:`FlagPersistence.update` returned.
+        """
+        out: torch.Tensor | None = None
+        stats: dict[str, PersistenceStats] = {}
+        for name, latch in self._latches.items():
+            m = masks.get(name)
+            if m is None:
+                continue
+            held, st = latch.update(m)
+            stats[name] = st
+            out = held if out is None else (out | held)
+        if out is None:
+            raise ValueError(
+                f"no detector masks matched the configured latches "
+                f"{sorted(self._latches)}; got {sorted(masks)}"
+            )
+        return out, stats

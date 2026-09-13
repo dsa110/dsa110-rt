@@ -513,6 +513,24 @@ routines:
   # a frozen per-event snapshot lets a new cal flag antennas that stay
   # in the beam (2026-08-06: 49/59/89 flagged at 14:01 UT, still
   # beamformed for hours -- RFI-like candidate spray + decohered sky).
+  # R3 (2026-09-13): the two MAD-outlier detectors are stated as a FAR
+  # like SK, not as a hand-chosen k. "k = 5" never meant 5 sigma -- the
+  # median and MAD are estimated from the same finite sample -- so
+  # measured under the thermal null at this geometry (n_chan 384,
+  # M 4096), k=5.0 bought FAR 1.7e-6 for bandpass and 1.4e-5 for group
+  # against a Gaussian 5.7e-7.
+  #
+  # --bandpass-far / --group-far select the FAR route
+  # (dsart.rfi.far_calibration solves k under an explicit null and
+  # caches it). At 1e-4 that is k=4.01 bandpass / k=4.35 group, i.e.
+  # slightly MORE sensitive than before: on a thermal cube ~9 spurious
+  # cells per 73728 (0.012%) against a ~3% total flag fraction, bought
+  # for sensitivity to weaker narrowband lines. Put --bandpass-k 5.0 /
+  # --group-k 5.0 back to pin the old thresholds; an explicit k wins.
+  #
+  # NB: everything under `args: >-` is a FOLDED SCALAR. A '#' there is
+  # NOT a comment -- it becomes a literal argv entry. Comments about
+  # the flags belong here, above the routine.
   - name: corr_fast
     cmd: python
     args: >-
@@ -525,8 +543,8 @@ routines:
       --cal-mode phase_only
       --flagants /home/ubuntu/proj/dsa110-shell/dsa110-xengine/scripts/flagants.dat
       --sk-far 1e-4
-      --bandpass-k 5.0
-      --group-k 5.0
+      --bandpass-far 1e-4
+      --group-far 1e-4
       --sumthr-max-m 8
       --sumthr-eta 1.5
       --rfi-m-values 64,256,1024,4096

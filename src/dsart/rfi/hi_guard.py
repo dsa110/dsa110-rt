@@ -42,6 +42,7 @@ wondering why the guard "does nothing" on the node you are testing on.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
@@ -111,6 +112,17 @@ def hi_guard_channels(
     return (freqs >= f_lo) & (freqs <= f_hi)
 
 
+def _channels_in_range(
+    chgroup: int, f_lo: float, f_hi: float, *, n_chan: int,
+) -> np.ndarray:
+    """Bool mask ``[n_chan]`` for channels inside ``[f_lo, f_hi]`` GHz."""
+    freqs = np.array(
+        [freq_GHz(int(chgroup), c) for c in range(int(n_chan))],
+        dtype=np.float64,
+    )
+    return (freqs >= f_lo) & (freqs <= f_hi)
+
+
 def describe_hi_guard(
     chgroup: int,
     *,
@@ -136,3 +148,114 @@ def describe_hi_guard(
         f"{int(idx[0])}-{int(idx[-1])} of chgroup {chgroup} are "
         f"PROTECTED from flagging"
     )
+
+
+# ---------------------------------------------------------------------------
+# Configurable protected-line list (R6)
+# ---------------------------------------------------------------------------
+#
+# The HI window above fixes HI and nothing else. Any detector whose
+# statistic is "this channel is unlike its neighbours" will flag a
+# narrow astrophysical line, because a narrow astrophysical line is
+# exactly that — so OH, recombination lines, or a redshifted line in a
+# survey field need the same protection, and a hard-coded 21 cm window
+# cannot give it.
+#
+# Scope note: this is a SLOW-PATH guard. On the fast path, excising a
+# bright line is the RIGHT call — the FRB search does not want a 21 cm
+# line in its dedispersion trials — so nothing here should be wired
+# into corr_fast.
+#
+# The principled long-term discriminant is different and is recorded
+# here as the intended direction: astrophysical line emission is fixed
+# on the sky and fringes at the sidereal rate, while a terrestrial
+# transmitter does not, so in a fringe-stopped interferometer the two
+# separate in the CROSS-correlations even when they are identical in a
+# single antenna's autocorrelation. That is unavailable to any
+# per-antenna flagger and belongs in the slow correlator, not here.
+
+
+@dataclass(frozen=True)
+class ProtectedLine:
+    """One rest-frame line and the velocity window to protect around it.
+
+    Args:
+        name: short label, used in logs and :func:`describe_protected_lines`.
+        rest_ghz: rest frequency in GHz.
+        v_lo_kms, v_hi_kms: radio-velocity window. Note the sign
+            convention inherited from the HI guard — the LOW velocity
+            gives the HIGH frequency.
+    """
+
+    name: str
+    rest_ghz: float
+    v_lo_kms: float = HI_GUARD_V_LO_KMS
+    v_hi_kms: float = HI_GUARD_V_HI_KMS
+
+    def freq_range_GHz(self) -> tuple[float, float]:
+        """``(f_min, f_max)`` in GHz for this line's window."""
+        if self.v_lo_kms >= self.v_hi_kms:
+            raise ValueError(
+                f"{self.name}: v_lo_kms={self.v_lo_kms} must be < "
+                f"v_hi_kms={self.v_hi_kms}"
+            )
+        f_hi = self.rest_ghz * (1.0 - self.v_lo_kms / _C_KMS)
+        f_lo = self.rest_ghz * (1.0 - self.v_hi_kms / _C_KMS)
+        return (f_lo, f_hi)
+
+
+#: Default protected lines. HI reproduces the original hard-coded
+#: guard exactly, so default behaviour is unchanged (asserted in
+#: ``tests/test_hi_guard.py``).
+#:
+#: The OH 18 cm quartet sits at 1.612-1.721 GHz, i.e. ENTIRELY OUTSIDE
+#: the processed band (1.3113-1.4988 GHz), so it protects nothing
+#: today. It is listed as the worked example of how to add a line —
+#: out-of-band entries cost nothing, since a line whose window misses
+#: the chgroup contributes no channels — and so that a band change
+#: does not silently drop OH protection. Add entries here, or pass
+#: ``lines=``, rather than editing code.
+DEFAULT_PROTECTED_LINES: tuple[ProtectedLine, ...] = (
+    ProtectedLine("HI", HI_REST_GHZ),
+    ProtectedLine("OH-1612", 1.612231),
+    ProtectedLine("OH-1665", 1.665402),
+    ProtectedLine("OH-1667", 1.667359),
+    ProtectedLine("OH-1720", 1.720530),
+)
+
+
+def protected_line_channels(
+    chgroup: int,
+    *,
+    lines: "tuple[ProtectedLine, ...] | None" = None,
+    n_chan: int = NCHAN_PER_CHGROUP,
+) -> np.ndarray:
+    """Bool mask ``[n_chan]``, True for channels any line protects.
+
+    The OR over every line's window. Lines whose window falls outside
+    this chgroup contribute nothing, so listing out-of-band lines is
+    free — :data:`DEFAULT_PROTECTED_LINES` carries the OH quartet for
+    exactly that reason.
+    """
+    lines = DEFAULT_PROTECTED_LINES if lines is None else lines
+    out = np.zeros(int(n_chan), dtype=bool)
+    for line in lines:
+        f_lo, f_hi = line.freq_range_GHz()
+        out |= _channels_in_range(chgroup, f_lo, f_hi, n_chan=n_chan)
+    return out
+
+
+def describe_protected_lines(
+    lines: "tuple[ProtectedLine, ...] | None" = None,
+) -> str:
+    """One line per protected line: name, rest GHz, window, freq range."""
+    lines = DEFAULT_PROTECTED_LINES if lines is None else lines
+    rows = []
+    for line in lines:
+        f_lo, f_hi = line.freq_range_GHz()
+        rows.append(
+            f"{line.name:9s} rest {line.rest_ghz:.6f} GHz  "
+            f"v [{line.v_lo_kms:+.0f}, {line.v_hi_kms:+.0f}] km/s  "
+            f"-> [{f_lo:.6f}, {f_hi:.6f}] GHz"
+        )
+    return "\n".join(rows)

@@ -1450,6 +1450,10 @@ class FastIntegrationConfig:
     # production pipeline can be retuned without code changes.
     rfi_sk_far: float | None = None
     rfi_bandpass_k: float | None = None
+    #: R3: per-cell FAR for the two MAD-outlier detectors.
+    #: Used when the matching *_k is not given.
+    rfi_bandpass_far: float | None = None
+    rfi_group_far: float | None = None
     rfi_group_k: float | None = None
     rfi_sumthr_max_m: int | None = None
     rfi_sumthr_eta: float | None = None
@@ -2921,6 +2925,10 @@ def build_context(
             rfi_kwargs["bandpass_k"] = cfg.rfi_bandpass_k
         if cfg.rfi_group_k is not None:
             rfi_kwargs["group_k"] = cfg.rfi_group_k
+        if cfg.rfi_bandpass_far is not None:
+            rfi_kwargs["bandpass_far"] = cfg.rfi_bandpass_far
+        if cfg.rfi_group_far is not None:
+            rfi_kwargs["group_far"] = cfg.rfi_group_far
         if cfg.rfi_sumthr_max_m is not None:
             rfi_kwargs["sum_threshold_max_m"] = cfg.rfi_sumthr_max_m
         if cfg.rfi_sumthr_eta is not None:
@@ -2947,11 +2955,17 @@ def build_context(
             rfi_kwargs["array_burst_mode"] = cfg.rfi_array_burst_mode
 
         rfi_flagger = RFIFlagger(**rfi_kwargs)
+        # k is None on the FAR route (R3), so format defensively —
+        # "%.2f" % None is a TypeError at startup.
+        def _thr(k: float | None, far: float) -> str:
+            return f"k={k:.2f}" if k is not None else f"far={far:.3g}"
+
         LOG.info(
             "RFIFlagger ready: warmup_cubes=%d sk_far=%.3g "
-            "bandpass_k=%.2f group_k=%.2f sumthr=%s m_values=%s",
+            "bandpass[%s] group[%s] sumthr=%s m_values=%s",
             rfi_flagger.warmup_cubes, rfi_flagger._sk_far,
-            rfi_flagger._bandpass_k, rfi_flagger._group_k,
+            _thr(rfi_flagger._bandpass_k, rfi_flagger._bandpass_far),
+            _thr(rfi_flagger._group_k, rfi_flagger._group_far),
             "on" if cfg.rfi_sumthr_enabled else "OFF",
             rfi_flagger._m_values,
         )
@@ -4643,6 +4657,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--bandpass-k", type=float, default=None,
                    help="bandpass-outlier MAD-sigma threshold "
                         "(library default: 5.0)")
+    p.add_argument("--bandpass-far", type=float, default=None,
+                   help="R3: per-channel false-alarm rate for the "
+                        "bandpass-outlier detector, solved into a "
+                        "threshold under a thermal null. Ignored when "
+                        "--bandpass-k is given. Default 1e-4, matching "
+                        "--sk-far.")
+    p.add_argument("--group-far", type=float, default=None,
+                   help="R3: per-antenna false-alarm rate for the "
+                        "group-outlier detector. Ignored when --group-k "
+                        "is given. Default 1e-4.")
     p.add_argument("--group-k", type=float, default=None,
                    help="group-outlier MAD-sigma threshold across ants "
                         "(library default: 5.0)")
@@ -5041,6 +5065,8 @@ def main(argv: list[str] | None = None) -> int:
         rfi_enabled=not args.rfi_disabled,
         rfi_sk_far=args.sk_far,
         rfi_bandpass_k=args.bandpass_k,
+        rfi_bandpass_far=args.bandpass_far,
+        rfi_group_far=args.group_far,
         rfi_group_k=args.group_k,
         rfi_sumthr_max_m=args.sumthr_max_m,
         rfi_sumthr_eta=args.sumthr_eta,

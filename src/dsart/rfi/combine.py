@@ -18,7 +18,23 @@ records which detector fired in that cell:
     flagants.dat      4
     persistence       5
     array-burst       6
+    SK-high           7
     ===============   =====
+
+``SK_HIGH`` (bit 7) is a **qualifier on bit 0, not a separate
+detector**: it marks the subset of SK-flagged cells whose excursion
+was on the HIGH side of the two-sided test at some M. SK below the
+lower bound means a *continuous* emitter (the channel power becomes
+deterministic); SK above the upper bound means an *intermittent* one
+occupying less than half the accumulation. So ``SK`` set with
+``SK_HIGH`` clear reads "carrier", and both set reads "bursty". The
+distinction is free — both comparisons are already computed — and it
+is the only duty-cycle information the flagger produces. See
+:mod:`dsart.rfi.sk`.
+
+.. note::
+   Bit 7 is the last one. ``source_tags`` is ``uint8``, so a ninth
+   provenance flag needs a wider dtype, not another bit.
 
 ``ARRAY_BURST`` (bit 6) does not mean the same thing as the others.
 The array-burst detector (:mod:`dsart.rfi.array_burst`) works at
@@ -67,7 +83,7 @@ Usage::
 
     flagger = RFIFlagger(
         flagants_path="/.../flagants.dat",
-        sk_far=1e-4, bandpass_k=5.0, group_k=5.0,
+        sk_far=1e-4, bandpass_far=1e-4, group_far=1e-4,
     )
     result = flagger.flag_block(real, imag)
     mask, tags, warmup = result.mask, result.source_tags, result.warmup
@@ -91,13 +107,17 @@ from dsart.common.constants import (
 from dsart.rfi.array_burst import ArrayBurstDetector, ArrayBurstResult
 from dsart.rfi.autos import DEFAULT_M_VALUES, AutoSpectra, compute_autos
 from dsart.rfi.bandpass_outlier import (
-    DEFAULT_BANDPASS_K,
     bandpass_outlier_mask,
 )
 from dsart.rfi.flagants_loader import load_flagants_torch
-from dsart.rfi.group_outlier import DEFAULT_GROUP_K, group_outlier_mask
-from dsart.rfi.persistence import FlagPersistence
-from dsart.rfi.sk import DEFAULT_SK_FAR, sk_combined_mask
+from dsart.rfi.group_outlier import group_outlier_mask
+from dsart.rfi.persistence import (
+    FlagPersistence,
+    PerDetectorPersistence,
+    PersistenceStats,
+)
+from dsart.rfi.far_calibration import DEFAULT_OUTLIER_FAR
+from dsart.rfi.sk import DEFAULT_SK_FAR, sk_combined_masks
 from dsart.rfi.sum_threshold import (
     DEFAULT_ETA,
     DEFAULT_MAX_M,
@@ -128,6 +148,10 @@ class FlagSourceBit(enum.IntFlag):
     FLAGANTS_DAT = 1 << 4        # value 16
     PERSISTENCE = 1 << 5         # value 32
     ARRAY_BURST = 1 << 6         # value 64
+    #: Qualifier on SK (bit 0), not a detector: the excursion was on
+    #: the HIGH side => intermittent emitter. SK set and this clear
+    #: => continuous carrier. uint8 is now full.
+    SK_HIGH = 1 << 7             # value 128
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +287,13 @@ class RFIFlagger:
             voltages at flag time.
         sk_far: per-(ant, ch, pol, M) two-sided false-alarm rate for
             SK.
-        bandpass_k: outlier-σ threshold for the bandpass-outlier
+        bandpass_far, group_far: per-cell false-alarm rates for the
+            two MAD-outlier detectors, solved into a threshold under
+            an explicit thermal null by
+            :mod:`dsart.rfi.far_calibration`. Default matches
+            ``sk_far`` so every detector is stated on one scale.
+        bandpass_k: LEGACY explicit outlier-σ threshold for the
+            bandpass-outlier
             detector.
         group_k: outlier-σ threshold for the group-outlier detector.
         sum_threshold_max_m: max sliding-window length for the
@@ -311,14 +341,16 @@ class RFIFlagger:
         flagants_path: str | Path | None,
         device: torch.device | str = "cpu",
         sk_far: float = DEFAULT_SK_FAR,
-        bandpass_k: float = DEFAULT_BANDPASS_K,
-        group_k: float = DEFAULT_GROUP_K,
+        bandpass_k: float | None = None,
+        group_k: float | None = None,
+        bandpass_far: float = DEFAULT_OUTLIER_FAR,
+        group_far: float = DEFAULT_OUTLIER_FAR,
         sum_threshold_max_m: int = DEFAULT_MAX_M,
         sum_threshold_eta: float = DEFAULT_ETA,
         m_values: tuple[int, ...] = DEFAULT_M_VALUES,
         warmup_cubes: int = RFI_BANDPASS_WARMUP_CUBES_DEFAULT,
         run_sum_threshold: bool = True,
-        persistence: FlagPersistence | None = None,
+        persistence: FlagPersistence | PerDetectorPersistence | None = None,
         array_burst: ArrayBurstDetector | None = None,
         array_burst_mode: str = "off",
     ) -> None:
@@ -343,8 +375,15 @@ class RFIFlagger:
             )
         self._device = torch.device(device)
         self._sk_far = sk_far
+        # R3 (2026-09-13): thresholds are stated as a FAR, like SK.
+        # k= is still honoured as an explicit override; when both are
+        # None the FAR route runs. "k = 5" was never 5 sigma — at the
+        # live geometry it buys FAR 1.7e-6 (bandpass) and 1.4e-5
+        # (group) under the thermal null.
         self._bandpass_k = bandpass_k
         self._group_k = group_k
+        self._bandpass_far = bandpass_far
+        self._group_far = group_far
         self._st_max_m = sum_threshold_max_m
         self._st_eta = sum_threshold_eta
         self._m_values = tuple(m_values)
@@ -483,7 +522,9 @@ class RFIFlagger:
         warmup_flag = self.in_warmup
 
         # ---- SK over all M's --------------------------------------
-        sk_m = sk_combined_mask(
+        # Both sides of the two-sided test, so the duty-cycle
+        # direction survives into the source tags (bit 7).
+        sk_m, sk_high_m = sk_combined_masks(
             autos.s1, autos.s2, far=self._sk_far,
         )                                                   # (NANTS, NCHAN, NPOL) bool
 
@@ -495,10 +536,21 @@ class RFIFlagger:
         if warmup_flag:
             bp_m = torch.zeros_like(sk_m)
         else:
-            bp_m = bandpass_outlier_mask(s1_full, k=self._bandpass_k)
+            bp_m = bandpass_outlier_mask(
+                s1_full,
+                k=self._bandpass_k,
+                far=None if self._bandpass_k is not None
+                else self._bandpass_far,
+                m_acc=full_m,
+            )
 
         # ---- Group-outlier (always active) ------------------------
-        gr_m = group_outlier_mask(s1_full, k=self._group_k)
+        gr_m = group_outlier_mask(
+            s1_full,
+            k=self._group_k,
+            far=None if self._group_k is not None else self._group_far,
+            m_acc=full_m,
+        )
 
         # ---- Array-burst (2.097 ms, array-common; see array_burst) -
         # Runs on the BASE accumulation the SK detector already built,
@@ -552,10 +604,38 @@ class RFIFlagger:
         # would keep every latched cell's run alive forever, and
         # including flagants would latch antennas that are already
         # unconditionally flagged.
-        if self._persistence is not None:
-            pe_m, pe_stats = self._persistence.update(detector_m)
-        else:
+        # R5: a PerDetectorPersistence latches each detector on its own
+        # window (a sick antenna stays sick far longer than a blinking
+        # carrier, and sum-threshold is already a dilation so it is not
+        # latched at all); a plain FlagPersistence keeps the original
+        # single latch over the OR. Either is accepted.
+        if self._persistence is None:
             pe_m, pe_stats = None, None
+        elif isinstance(self._persistence, PerDetectorPersistence):
+            pe_m, per_det_stats = self._persistence.update({
+                "sk": sk_m,
+                "bandpass": bp_m,
+                "group": gr_m,
+                "sumthr": sum_m,
+            })
+            # Fold the per-detector stats back into the single
+            # PersistenceStats the header path expects, WITHOUT a host
+            # sync: n_latched is taken from the OR'd mask so cells held
+            # by two detectors are not double-counted, while n_new is
+            # the sum over detectors (an upper bound on distinct new
+            # cells, which is what the counter is used for).
+            pe_stats = PersistenceStats(
+                n_latched=pe_m.sum(dtype=torch.int64),
+                n_new_latched=(
+                    torch.stack([
+                        st.n_new_latched for st in per_det_stats.values()
+                    ]).sum()
+                    if per_det_stats else
+                    torch.zeros((), dtype=torch.int64, device=pe_m.device)
+                ),
+            )
+        else:
+            pe_m, pe_stats = self._persistence.update(detector_m)
 
         final = detector_m | fa_m
         if pe_m is not None:
@@ -564,6 +644,7 @@ class RFIFlagger:
         # ---- Source-tag uint8 -------------------------------------
         tags = torch.zeros_like(final, dtype=torch.uint8)
         tags |= sk_m.to(torch.uint8) * int(FlagSourceBit.SK)
+        tags |= sk_high_m.to(torch.uint8) * int(FlagSourceBit.SK_HIGH)
         tags |= bp_m.to(torch.uint8) * int(FlagSourceBit.BANDPASS_OUTLIER)
         tags |= gr_m.to(torch.uint8) * int(FlagSourceBit.GROUP_OUTLIER)
         tags |= sum_m.to(torch.uint8) * int(FlagSourceBit.SUM_THRESHOLD)
@@ -635,8 +716,8 @@ def flag_block(
     flagants_dat_path: str | Path | None,
     *,
     sk_far: float = DEFAULT_SK_FAR,
-    bandpass_k: float = DEFAULT_BANDPASS_K,
-    group_k: float = DEFAULT_GROUP_K,
+    bandpass_k: float | None = None,
+    group_k: float | None = None,
     n_packets: int = 2048,
     n_times_per_packet: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:

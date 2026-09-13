@@ -66,6 +66,11 @@ from dsart.rfi.flagants_loader import (
     load_flagants_torch,
     parse_flagants_text,
 )
+from dsart.rfi.far_calibration import (
+    DEFAULT_OUTLIER_FAR,
+    bandpass_threshold_k,
+    group_threshold_k,
+)
 from dsart.rfi.group_outlier import DEFAULT_GROUP_K, group_outlier_mask
 from dsart.rfi.persistence import (
     HOLD_S_DEFAULT,
@@ -80,6 +85,10 @@ from dsart.rfi.sk import (
     compute_sk,
     gaussian_sk_thresholds,
     sk_combined_mask,
+    sk_combined_masks,
+    sk_masks,
+    sk_moments,
+    pearson4_sk_thresholds,
     sk_mask,
     sk_thresholds,
 )
@@ -112,6 +121,10 @@ __all__ = [
     "compute_sk",
     "gaussian_sk_thresholds",
     "sk_combined_mask",
+    "sk_combined_masks",
+    "sk_masks",
+    "sk_moments",
+    "pearson4_sk_thresholds",
     "sk_mask",
     "sk_thresholds",
     # bandpass-outlier
@@ -120,6 +133,9 @@ __all__ = [
     # group-outlier
     "DEFAULT_GROUP_K",
     "group_outlier_mask",
+    "DEFAULT_OUTLIER_FAR",
+    "bandpass_threshold_k",
+    "group_threshold_k",
     # sum-threshold
     "DEFAULT_ETA",
     "DEFAULT_MAX_M",

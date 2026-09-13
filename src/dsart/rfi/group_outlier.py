@@ -20,6 +20,11 @@ from typing import Final
 
 import torch
 
+from dsart.rfi.far_calibration import (
+    DEFAULT_OUTLIER_FAR,
+    group_threshold_k,
+)
+
 from dsart.common.constants import NPOL
 from dsart.rfi.bandpass_outlier import MAD_TO_SIGMA
 
@@ -28,6 +33,10 @@ from dsart.rfi.bandpass_outlier import MAD_TO_SIGMA
 # ---------------------------------------------------------------------------
 
 #: Default outlier threshold in MAD-σ units.
+#: Legacy hand-chosen threshold. Measured FAR under the thermal null
+#: at the live geometry (n_ant = 96, effective M = 4096*384) is
+#: 1.4e-5, 24x the Gaussian 5.7e-7. Prefer ``far=``; see
+#: :mod:`dsart.rfi.far_calibration`.
 DEFAULT_GROUP_K: Final[float] = 5.0
 
 
@@ -39,7 +48,9 @@ DEFAULT_GROUP_K: Final[float] = 5.0
 def group_outlier_mask(
     s1: torch.Tensor,
     *,
-    k: float = DEFAULT_GROUP_K,
+    k: float | None = None,
+    far: float | None = None,
+    m_acc: int = 4096,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     """All-antennas-as-one-group outlier mask.
@@ -80,6 +91,12 @@ def group_outlier_mask(
             f"s1 last axis must be NPOL={NPOL}; got {s1.shape[-1]}"
         )
     n_ants, n_ch, _ = s1.shape
+    if k is not None and far is not None:
+        raise ValueError("pass k or far, not both")
+    if k is None:
+        far_eff = DEFAULT_OUTLIER_FAR if far is None else float(far)
+        k = group_threshold_k(
+            int(n_ants), far_eff, n_chan=int(n_ch), m_acc=int(m_acc))
 
     # Per-(ant, pol) total in-band power.
     ant_pol_mean = s1.mean(dim=1)              # (NANTS, NPOL)
