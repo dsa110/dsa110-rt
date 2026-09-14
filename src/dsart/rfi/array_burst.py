@@ -205,6 +205,56 @@ GROUP_NAMES: Final[tuple[str, ...]] = (
     "all", "core", "ew_arm", "ns_arm", "outriggers",
 )
 
+#: Sigma threshold on a SINGLE coarse bin for the band-limited gate
+#: (:data:`BIN_MODES`). Not to be confused with :data:`BIN_K_DEFAULT`,
+#: which is the much lower bar a bin must clear to count towards the
+#: broadband gate's occupancy.
+#:
+#: Calibrated, not guessed. Measured on six archive dumps with no
+#: impulsive population (2026-09-14): ``coarse_z > 6`` fires 7 times in
+#: 129 024 (sample, bin, pol) cells, a FAR of 5.4e-5, and six of those
+#: seven are in one dump that genuinely carries a narrow comb. Five of
+#: the six dumps give 0 or 1.
+BIN_FLAG_K_DEFAULT: Final[float] = 6.0
+
+#: How many cubes in the window a bin must have fired in before its
+#: excision is armed. See :data:`BIN_WINDOW_CUBES_DEFAULT`.
+BIN_PERSIST_N_DEFAULT: Final[int] = 3
+
+#: Length of the arming window, in cubes (8 ≈ 1.07 s).
+#:
+#: This pair is the FRB discriminant, and it is the whole reason the
+#: band-limited gate is safe to arm. A dispersed pulse and a
+#: band-limited impulse are indistinguishable in a single 2.097 ms
+#: sample — a DM 500 pulse sweeps ~1.45 MHz ≈ 3 bins per sample, and
+#: the measured RFI occupies a median of 2 — so occupancy cannot
+#: separate them. What separates them is that a pulse MOVES: it visits
+#: each bin once or twice in a whole dump, while the interference
+#: revisits the SAME bins. Measured over a 2.9 s dump (260909dweu
+#: sb10, 2026-09-14): three bins carry 89 % of all hits, each active
+#: bin fires in a mean of 33.2 samples, and the longest consecutive
+#: run is 3 samples. That is a 17-33x discriminant against a
+#: dispersed pulse, which by construction has no history.
+#:
+#: The count is read CAUSALLY — from cubes strictly before the one
+#: being decided — so a pulse can never arm its own excision.
+BIN_WINDOW_CUBES_DEFAULT: Final[int] = 8
+
+#: A cube only counts towards a bin's arming if at most this FRACTION
+#: of bins fired in it. Without this the revisit counter is not safe:
+#: a dispersed pulse lights EVERY bin once as it sweeps (at DM 500 the
+#: sweep is 17 ms, so all 24 bins inside one 134 ms cube), and a bright
+#: source recurring inside the window — a giant-pulse train, a
+#: repeater — would accumulate exactly the history the gate reads and
+#: arm its own excision. Requiring the contributing cube to have been
+#: BAND-LIMITED separates them by construction: the measured RFI lights
+#: ~3 of 24 bins per cube, a dispersed pulse ~24. Anything broadband
+#: enough to exceed this is the broadband gate's business anyway.
+BIN_ARM_MAX_FRAC_DEFAULT: Final[float] = 0.25
+
+#: Accepted values of ``ArrayBurstDetector(bin_mode=...)``.
+BIN_MODES: Final[frozenset[str]] = frozenset({"off", "monitor", "flag"})
+
 #: 1 / Φ⁻¹(3/4); converts a median-absolute-deviation to a Gaussian σ.
 MAD_TO_SIGMA: Final[float] = 1.4826
 
@@ -416,6 +466,61 @@ class ArrayBurstResult:
     group_spec: torch.Tensor
     n_live: torch.Tensor
     warmup: bool
+    #: ``[n_acc, NGROUP, NBIN, NPOL]`` bool — per-bin significance
+    #: exceeded :data:`BIN_FLAG_K_DEFAULT`, before the arming gate.
+    #: ``None`` when ``bin_mode == "off"``.
+    bin_fired: torch.Tensor | None = None
+    #: ``[NGROUP, NBIN, NPOL]`` bool — the CAUSAL arming state used for
+    #: this cube (built from earlier cubes only).
+    bin_armed: torch.Tensor | None = None
+    #: ``[n_acc, NCHAN, NPOL]`` bool — the flag group's band-limited
+    #: verdict expanded to channels. Kept SEPARATE from
+    #: ``time_chan_mask`` so the broadband and band-limited gates stay
+    #: independently auditable; the caller ORs whichever are armed.
+    bin_chan_mask: torch.Tensor | None = None
+
+
+def excision_mask(
+    result: "ArrayBurstResult",
+    *,
+    broadband: bool,
+    band_limited: bool,
+) -> torch.Tensor | None:
+    """OR together whichever array-burst masks the caller has armed.
+
+    There are two independent gates — the broadband one
+    (``time_chan_mask``) and the band-limited one (``bin_chan_mask``) —
+    each with its own ``off``/``monitor``/``flag`` mode. They are kept
+    separate in :class:`ArrayBurstResult` so each stays auditable, and
+    combined here, in ONE place, so :mod:`dsart.rfi.combine` (which
+    sets the source tag) and
+    :mod:`dsart.services.corr_fast_integration` (which does the
+    zero-fill) cannot drift on the question of what was excised.
+
+    Args:
+        result: this cube's detector output.
+        broadband: True iff the broadband gate is in ``"flag"`` mode.
+        band_limited: True iff the band-limited gate is in ``"flag"``
+            mode.
+
+    Returns:
+        ``[n_acc, NCHAN, NPOL]`` bool, or ``None`` when nothing is
+        armed or nothing fired. ``None`` is load-bearing: it is what
+        lets ``corr_fast`` skip the voltage zero-fill entirely on a
+        quiet block, which is the difference between +1.30 ms
+        amortised and +4.7 ms unconditional.
+    """
+    parts: list[torch.Tensor] = []
+    if broadband and result.time_chan_mask is not None:
+        parts.append(result.time_chan_mask)
+    if band_limited and result.bin_chan_mask is not None:
+        parts.append(result.bin_chan_mask)
+    if not parts:
+        return None
+    out = parts[0]
+    for extra in parts[1:]:
+        out = out | extra
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -444,11 +549,29 @@ class ArrayBurstDetector:
         warmup_cubes: cubes spent seeding before firing is allowed.
         dead_frac: antenna-pols below this fraction of the median
             band gain are dropped from every group.
+        bin_mode: ``"off"``, ``"monitor"`` or ``"flag"`` for the
+            band-limited gate. ``"monitor"`` computes everything and
+            publishes it but the caller must not excise;
+            ``"flag"`` means ``bin_chan_mask`` is live.
+        bin_flag_k: per-bin sigma threshold. Default
+            :data:`BIN_FLAG_K_DEFAULT`.
+        bin_persist_n, bin_window_cubes: the frequency-stationarity
+            discriminant — a bin must have fired in ``bin_persist_n``
+            of the last ``bin_window_cubes`` cubes before its excision
+            arms. See :data:`BIN_WINDOW_CUBES_DEFAULT` for why this is
+            what keeps a dispersed pulse out.
+        bin_arm_max_frac: a cube only counts towards arming if at most
+            this fraction of bins fired in it. See
+            :data:`BIN_ARM_MAX_FRAC_DEFAULT` — this is the second half
+            of the FRB safety argument and the first is not sufficient
+            without it.
         device, dtype: where the state lives.
 
     Raises:
-        ValueError: ``bin_chans`` does not divide ``n_chan``, or a
-            threshold is out of range.
+        ValueError: ``bin_chans`` does not divide ``n_chan``, a
+            threshold is out of range, ``bin_mode`` is not in
+            :data:`BIN_MODES`, or ``bin_persist_n`` exceeds
+            ``bin_window_cubes``.
     """
 
     def __init__(
@@ -465,6 +588,11 @@ class ArrayBurstDetector:
         ema_cubes: int = EMA_CUBES_DEFAULT,
         warmup_cubes: int = WARMUP_CUBES_DEFAULT,
         dead_frac: float = DEAD_FRAC_DEFAULT,
+        bin_mode: str = "off",
+        bin_flag_k: float = BIN_FLAG_K_DEFAULT,
+        bin_persist_n: int = BIN_PERSIST_N_DEFAULT,
+        bin_window_cubes: int = BIN_WINDOW_CUBES_DEFAULT,
+        bin_arm_max_frac: float = BIN_ARM_MAX_FRAC_DEFAULT,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -481,6 +609,23 @@ class ArrayBurstDetector:
             raise ValueError(f"ema_cubes={ema_cubes}, expected >= 1")
         if warmup_cubes < 0:
             raise ValueError(f"warmup_cubes={warmup_cubes}, expected >= 0")
+        if bin_mode not in BIN_MODES:
+            raise ValueError(
+                f"bin_mode={bin_mode!r}, expected one of {sorted(BIN_MODES)}"
+            )
+        if bin_window_cubes < 1:
+            raise ValueError(
+                f"bin_window_cubes={bin_window_cubes}, expected >= 1"
+            )
+        if not 1 <= bin_persist_n <= bin_window_cubes:
+            raise ValueError(
+                f"bin_persist_n={bin_persist_n}, expected in "
+                f"1..bin_window_cubes={bin_window_cubes}"
+            )
+        if not 0.0 < bin_arm_max_frac <= 1.0:
+            raise ValueError(
+                f"bin_arm_max_frac={bin_arm_max_frac}, expected in (0, 1]"
+            )
 
         dev = torch.device(device)
         self._groups = groups.to(dev)
@@ -496,6 +641,13 @@ class ArrayBurstDetector:
         self._alpha = 1.0 / float(ema_cubes)
         self._warmup_cubes = int(warmup_cubes)
         self._dead_frac = float(dead_frac)
+        self._bin_mode = str(bin_mode)
+        self._bin_flag_k = float(bin_flag_k)
+        self._bin_persist_n = int(bin_persist_n)
+        self._bin_window = int(bin_window_cubes)
+        self._bin_arm_max_bins = max(
+            1, int(float(bin_arm_max_frac) * self._n_bin),
+        )
         self._device = dev
         self._dtype = dtype
 
@@ -516,6 +668,17 @@ class ArrayBurstDetector:
         self._sd_bin = torch.ones(
             (n_group, self._n_bin, n_pol), dtype=dtype, device=dev,
         )
+        # Band-limited gate: a ring of per-cube hit counts plus its
+        # running sum, so the arming test is one integer comparison on
+        # the hot path rather than a reduction over history.
+        self._bin_ring = torch.zeros(
+            (self._bin_window, n_group, self._n_bin, n_pol),
+            dtype=torch.int32, device=dev,
+        )
+        self._bin_sum = torch.zeros(
+            (n_group, self._n_bin, n_pol), dtype=torch.int32, device=dev,
+        )
+        self._bin_ptr = 0
         self._cubes_seen = 0
 
     # -- introspection --------------------------------------------------
@@ -537,6 +700,23 @@ class ArrayBurstDetector:
         return self._n_bin
 
     @property
+    def bin_mode(self) -> str:
+        return self._bin_mode
+
+    def set_bin_mode(self, mode: str) -> None:
+        """Switch the band-limited gate at runtime.
+
+        Does NOT reset the arming ring: the history a bin has already
+        accumulated is still the right history when the gate comes
+        back on.
+        """
+        if mode not in BIN_MODES:
+            raise ValueError(
+                f"bin_mode={mode!r}, expected one of {sorted(BIN_MODES)}"
+            )
+        self._bin_mode = mode
+
+    @property
     def cubes_seen(self) -> int:
         return self._cubes_seen
 
@@ -551,6 +731,9 @@ class ArrayBurstDetector:
         self._sd.fill_(1.0)
         self._mu_bin.zero_()
         self._sd_bin.fill_(1.0)
+        self._bin_ring.zero_()
+        self._bin_sum.zero_()
+        self._bin_ptr = 0
         self._cubes_seen = 0
 
     # -- the hot path ---------------------------------------------------
@@ -742,6 +925,58 @@ class ArrayBurstDetector:
                 .contiguous()
             )
 
+        # --- 6b. the band-limited gate ------------------------------
+        # The broadband gate above collapses `coarse_z` to one
+        # occupancy scalar and discards the rest. An impulse confined
+        # to a few bins is exactly what that scalar throws away: it
+        # reaches occupancy ~0.08-0.25 and is rejected, while being
+        # 8-10 sigma in the core sum and ~1 sigma in any one antenna
+        # (measured 2026-09-14: a 3.34 % excess against a per-antenna
+        # per-bin thermal noise of 3.12 %, or 0.319 % in the sum).
+        # Spectral kurtosis does not help — it measures
+        # non-Gaussianity WITHIN an accumulation, and an impulse that
+        # fills the 2.097 ms accumulation is Gaussian inside it. The
+        # SK-fired antenna fraction on those cells is 0.007 against
+        # 0.009 when quiet: no response at all.
+        #
+        # So this gate exists to cover a population nothing else in
+        # the chain can reach. What makes it safe is the arming
+        # window: see BIN_WINDOW_CUBES_DEFAULT.
+        bin_fired = bin_armed = bin_chan_mask = None
+        if self._bin_mode != "off":
+            bin_fired = coarse_z > self._bin_flag_k      # [T, G, B, P]
+            # CAUSAL read: `_bin_sum` covers cubes strictly BEFORE
+            # this one, because the fold below happens after. A
+            # dispersed pulse has no history, so it cannot arm the
+            # excision that would remove it.
+            bin_armed = self._bin_sum >= self._bin_persist_n   # [G, B, P]
+            if not warmup:
+                hit = (
+                    bin_fired[:, self._flag_idx]
+                    & bin_armed[self._flag_idx]
+                )                                        # [T, B, P]
+                bin_chan_mask = hit.repeat_interleave(
+                    self._bin_chans, dim=1,
+                ).contiguous()                           # [T, NCHAN, P]
+                # Fold this cube in only once it is out of warmup, so
+                # the arming history is built from the same statistic
+                # the decision uses (during seeding, `coarse_z` is
+                # measured against the cube's own median).
+                #
+                # ...and only if the cube was BAND-LIMITED. See
+                # BIN_ARM_MAX_FRAC_DEFAULT: a dispersed sweep lights
+                # every bin, so without this gate a bright recurring
+                # source would build its own arming history.
+                n_bins_hit = (
+                    bin_fired.any(dim=0).sum(dim=1, dtype=torch.int32)
+                )                                        # [G, P]
+                narrow = (n_bins_hit <= self._bin_arm_max_bins)
+                cnt = bin_fired.sum(dim=0, dtype=torch.int32)
+                cnt = cnt * narrow.unsqueeze(1).to(torch.int32)
+                self._bin_sum += cnt - self._bin_ring[self._bin_ptr]
+                self._bin_ring[self._bin_ptr] = cnt
+                self._bin_ptr = (self._bin_ptr + 1) % self._bin_window
+
         # --- 7. monitor products ------------------------------------
         # group_spec is the time-mean of the normalised power. Writing
         # that out:
@@ -769,4 +1004,7 @@ class ArrayBurstDetector:
             group_spec=group_spec,
             n_live=n_live,
             warmup=warmup,
+            bin_fired=bin_fired,
+            bin_armed=bin_armed,
+            bin_chan_mask=bin_chan_mask,
         )

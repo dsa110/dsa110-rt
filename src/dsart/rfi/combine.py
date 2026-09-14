@@ -104,7 +104,11 @@ from dsart.common.constants import (
     NPOL,
     RFI_BANDPASS_WARMUP_CUBES_DEFAULT,
 )
-from dsart.rfi.array_burst import ArrayBurstDetector, ArrayBurstResult
+from dsart.rfi.array_burst import (
+    ArrayBurstDetector,
+    ArrayBurstResult,
+    excision_mask,
+)
 from dsart.rfi.autos import DEFAULT_M_VALUES, AutoSpectra, compute_autos
 from dsart.rfi.bandpass_outlier import (
     bandpass_outlier_mask,
@@ -359,7 +363,9 @@ class RFIFlagger:
                 f"array_burst_mode={array_burst_mode!r}, expected one "
                 f"of {sorted(_ARRAY_BURST_MODES)}"
             )
-        if array_burst is not None and array_burst_mode != "off":
+        if array_burst is not None and (
+            array_burst_mode != "off" or array_burst.bin_mode != "off"
+        ):
             m_fine = min(m_values)
             if m_fine != ARRAY_BURST_M_FINE:
                 raise ValueError(
@@ -558,7 +564,14 @@ class RFIFlagger:
         # second pass over the voltages. Its mask is time-resolved and
         # deliberately NOT folded into `final`.
         ab_result: ArrayBurstResult | None = None
-        if self._array_burst is not None and self._array_burst_mode != "off":
+        # EITHER gate being on is enough to need the detector: the
+        # band-limited one has its own mode, so `array_burst_mode=off`
+        # with `bin_mode=flag` is a legitimate configuration and must
+        # not silently do nothing.
+        if self._array_burst is not None and (
+            self._array_burst_mode != "off"
+            or self._array_burst.bin_mode != "off"
+        ):
             ab_result = self._array_burst.detect(
                 autos.s1[min(self._m_values)], s1_full,
             )
@@ -657,12 +670,25 @@ class RFIFlagger:
         # see the module docstring for why it is not the same kind of
         # statement as bits 0-4. Built here, with the other tags, so
         # everything is in place before the single host sync below.
-        if (
-            self._array_burst_mode == "flag"
-            and ab_result is not None
-            and ab_result.time_chan_mask is not None
-        ):
-            touched = ab_result.time_chan_mask.any(dim=0)   # (NCHAN, NPOL)
+        # Both array-burst gates land on the same bit: bit 6 says "at
+        # least one 2.097 ms sample of this cell was excised", which is
+        # equally true of a broadband firing and a band-limited one.
+        # uint8 is full, so there is no room to separate them here —
+        # `FlagBlockResult.array_burst` carries which gate it was.
+        ab_excised = (
+            excision_mask(
+                ab_result,
+                broadband=self._array_burst_mode == "flag",
+                band_limited=(
+                    self._array_burst is not None
+                    and self._array_burst.bin_mode == "flag"
+                ),
+            )
+            if ab_result is not None
+            else None
+        )
+        if ab_excised is not None:
+            touched = ab_excised.any(dim=0)                 # (NCHAN, NPOL)
             tags |= (
                 touched.unsqueeze(0)
                 .expand(n_ant_actual, n_ch_actual, n_pol_actual)

@@ -34,6 +34,15 @@ ABI:
         _reserved[0]   = (n_group << 32) | n_acc_per_cube
         _reserved[1]   = (ab_mode_code << 32) | ab_flag_group_index
         _reserved[2:6] = group_sizes, 8 x uint32 packed into 4 words
+        _reserved[6]   = (bin_mode_code << 32) | bins_armed
+        _reserved[7]   = bin_excised_cells (uint64, this window)
+
+    The band-limited gate gets two of the remaining reserved words
+    rather than a body section: the full per-bin cube is
+    (T, G, NBIN, NPOL), 24x the group planes, and what an operator
+    needs is whether it is armed and how much it is taking. Spending
+    reserved words keeps every existing offset — and therefore every
+    already-deployed reader — valid.
 
     Group NAMES are deliberately not in the segment. They are the
     fixed :data:`dsart.rfi.array_burst.GROUP_NAMES` tuple, and writer
@@ -322,6 +331,12 @@ class RFIMonRecord:
     group_spec_mean: np.ndarray | None = None      # (G, NCHAN_DS, NPOL) fp32
     group_n_live: np.ndarray | None = None         # (G, NPOL) fp32
 
+    # ---- band-limited gate (reserved words 6-7; 0/"off" on older
+    # segments, so a reader of either vintage stays correct) ---------
+    bin_mode: str = "off"
+    bin_bins_armed: int = 0
+    bin_excised_cells: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Writer (corr_fast hot-path side)
@@ -373,6 +388,9 @@ class RFIMonShmWriter:
         self._n_acc_total = self._n_acc_per_cube * self._window_size
         self._group_names = tuple(group_names)
         self._ab_flag_group = str(array_burst_flag_group)
+        self._bin_mode_seen = "off"
+        self._bin_bins_armed = 0
+        self._bin_excised = 0
 
         self._record_bytes = _record_bytes(
             n_ants, n_chan_ds, n_pol,
@@ -496,6 +514,11 @@ class RFIMonShmWriter:
             if window.array_burst_flag_group:
                 self._ab_flag_group = window.array_burst_flag_group
             self._ab_mode_seen = window.array_burst_mode
+            self._bin_mode_seen = getattr(window, "bin_mode", "off")
+            self._bin_bins_armed = int(
+                getattr(window, "bin_bins_armed", 0))
+            self._bin_excised = int(
+                getattr(window, "bin_excised_cells", 0))
             self._mm[_RESERVED_OFF : _RESERVED_OFF + 160] = struct.pack(
                 "<20Q", *self._reserved_words(),
             )
@@ -584,6 +607,9 @@ class RFIMonShmWriter:
             lo = int(sizes[2 * i]) if 2 * i < sizes.size else 0
             hi = int(sizes[2 * i + 1]) if 2 * i + 1 < sizes.size else 0
             words[2 + i] = (hi << 32) | lo
+        bin_code = _AB_MODE_CODES.get(self._bin_mode_seen, 0)
+        words[6] = (bin_code << 32) | (self._bin_bins_armed & 0xFFFFFFFF)
+        words[7] = int(self._bin_excised) & 0xFFFFFFFFFFFFFFFF
         return words
 
     def _write_header(self, *, startup_utc_ns: int) -> None:
@@ -703,6 +729,18 @@ class RFIMonShmReader:
             self._ab_flag_group = (
                 names[flag_idx] if 0 <= flag_idx < len(names) else ""
             )
+            if len(reserved) >= 8:
+                bin_code = int((reserved[6] >> 32) & 0xFFFFFFFF)
+                self._bin_mode = (
+                    _AB_MODE_NAMES[bin_code]
+                    if 0 <= bin_code < len(_AB_MODE_NAMES) else "off"
+                )
+                self._bin_bins_armed = int(reserved[6] & 0xFFFFFFFF)
+                self._bin_excised_cells = int(reserved[7])
+            else:
+                self._bin_mode = "off"
+                self._bin_bins_armed = 0
+                self._bin_excised_cells = 0
         else:
             self._n_group = 0
             self._n_acc_per_cube = 0
@@ -710,6 +748,9 @@ class RFIMonShmReader:
             self._array_burst_mode = "off"
             self._group_names = ()
             self._ab_flag_group = ""
+            self._bin_mode = "off"
+            self._bin_bins_armed = 0
+            self._bin_excised_cells = 0
         self._n_acc_total = self._n_acc_per_cube * self._window_size
 
     @property
@@ -908,6 +949,9 @@ class RFIMonShmReader:
         return {
             "array_burst_mode": mode,
             "array_burst_flag_group": flag_group,
+            "bin_mode": self._bin_mode,
+            "bin_bins_armed": self._bin_bins_armed,
+            "bin_excised_cells": self._bin_excised_cells,
             "group_names": self._group_names,
             "group_sizes": sizes,
             "n_acc_per_cube": self._n_acc_per_cube,

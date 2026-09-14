@@ -582,9 +582,12 @@ def test_armed_excision_is_skipped_when_nothing_fired():
             warmup=False,
         ))
 
-    armed = SimpleNamespace(cfg=SimpleNamespace(rfi_array_burst_mode="flag"))
-    monitor = SimpleNamespace(
-        cfg=SimpleNamespace(rfi_array_burst_mode="monitor"))
+    # Both gates have to be named: a missing config field should be a
+    # loud AttributeError, not a silent "off".
+    armed = SimpleNamespace(cfg=SimpleNamespace(
+        rfi_array_burst_mode="flag", rfi_ab_bin_mode="off"))
+    monitor = SimpleNamespace(cfg=SimpleNamespace(
+        rfi_array_burst_mode="monitor", rfi_ab_bin_mode="off"))
 
     # Nothing fired -> no mask, so the caller does the cheap zero-fill.
     assert _array_burst_time_mask(armed, _res(empty)) is None

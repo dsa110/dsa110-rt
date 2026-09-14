@@ -108,6 +108,7 @@ from dsart.grid import (
     cell_lambda_for_pixel_arcsec,
     compute_top_of_band_cell_lambda,
 )
+from dsart.common.constants import BLOCK_DURATION_S
 from dsart.rfi import (
     HOLD_S_DEFAULT as RFI_PERSIST_HOLD_S_DEFAULT,
     LATCH_FRAC_DEFAULT as RFI_PERSIST_LATCH_FRAC_DEFAULT,
@@ -121,6 +122,7 @@ from dsart.rfi import (
     RFIFlagger,
     seconds_to_cubes,
     build_groups_from_antpos,
+    excision_mask,
 )
 from dsart.services.corr_fast_kernel import (
     FastCorrKernel,
@@ -1361,14 +1363,17 @@ def _array_burst_time_mask(
     ``rfi_result.mask.any()`` anyway, and this tensor is [n_acc, G,
     NPOL] -- 640 elements -- so it adds no meaningful transfer.
     """
-    if ctx.cfg.rfi_array_burst_mode != "flag":
-        return None
     ab = rfi_result.array_burst
-    if ab is None or ab.time_chan_mask is None:
+    if ab is None:
         return None
-    if not bool(ab.time_chan_mask.any()):
+    mask = excision_mask(
+        ab,
+        broadband=ctx.cfg.rfi_array_burst_mode == "flag",
+        band_limited=ctx.cfg.rfi_ab_bin_mode == "flag",
+    )
+    if mask is None or not bool(mask.any()):
         return None
-    return ab.time_chan_mask
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -1483,6 +1488,12 @@ class FastIntegrationConfig:
     # 2026-09-08: p50 126.9 ms, p90 138.6 ms), and a detector that can
     # flag every antenna at once is worth watching before arming.
     rfi_array_burst_mode: str = "monitor"
+    #: Band-limited (impulsive, few-bin) array-burst gate. Independent
+    #: of the broadband mode above; both read the same `coarse_z`.
+    rfi_ab_bin_mode: str = "off"
+    rfi_ab_bin_k: float | None = None
+    rfi_ab_bin_persist_n: int | None = None
+    rfi_ab_bin_window_cubes: int | None = None
     rfi_array_burst_group: str = "core"
     rfi_array_burst_k: float | None = None
     rfi_array_burst_bin_k: float | None = None
@@ -3001,6 +3012,14 @@ def build_context(
                     "array-burst is MONITOR-ONLY: nothing is excised on "
                     "the fast path. Set --rfi-array-burst-mode flag to arm."
                 )
+            LOG.info(
+                "array-burst BAND-LIMITED gate %s: bin_flag_k=%.1f, arms "
+                "after a bin fires in %d of the last %d cubes (%.2f s). "
+                "The arming count is read causally, which is what keeps a "
+                "dispersed pulse out.",
+                ab.bin_mode.upper(), ab._bin_flag_k, ab._bin_persist_n,
+                ab._bin_window, ab._bin_window * BLOCK_DURATION_S,
+            )
     else:
         LOG.info("RFIFlagger DISABLED (cfg.rfi_enabled=False)")
 
@@ -3388,7 +3407,7 @@ def _build_array_burst_detector(
     failure is logged and swallowed rather than raised: RFI flagging
     must never be the reason corr_fast fails to start.
     """
-    if cfg.rfi_array_burst_mode == "off":
+    if cfg.rfi_array_burst_mode == "off" and cfg.rfi_ab_bin_mode == "off":
         return None
     try:
         groups = build_groups_from_antpos(
@@ -3419,6 +3438,13 @@ def _build_array_burst_detector(
         kw["ema_cubes"] = cfg.rfi_array_burst_ema_cubes
     if cfg.rfi_array_burst_warmup_cubes is not None:
         kw["warmup_cubes"] = cfg.rfi_array_burst_warmup_cubes
+    kw["bin_mode"] = cfg.rfi_ab_bin_mode
+    if cfg.rfi_ab_bin_k is not None:
+        kw["bin_flag_k"] = cfg.rfi_ab_bin_k
+    if cfg.rfi_ab_bin_persist_n is not None:
+        kw["bin_persist_n"] = cfg.rfi_ab_bin_persist_n
+    if cfg.rfi_ab_bin_window_cubes is not None:
+        kw["bin_window_cubes"] = cfg.rfi_ab_bin_window_cubes
     try:
         return ArrayBurstDetector(groups, **kw)
     except ValueError:
@@ -4719,6 +4745,26 @@ def main(argv: list[str] | None = None) -> int:
                         "to the RFI page but excises nothing; 'flag' "
                         "arms the time-resolved zero-fill; 'off' skips "
                         "it entirely.")
+    p.add_argument("--rfi-ab-bin-mode",
+                   choices=("off", "monitor", "flag"), default="off",
+                   help="array-common BAND-LIMITED impulsive gate, on the "
+                        "same per-bin significance the broadband gate "
+                        "already computes. Covers a population nothing "
+                        "else in the chain can reach: ~1 sigma in any one "
+                        "antenna, 8-10 sigma in the core sum, and SK does "
+                        "not respond because the impulse fills the "
+                        "2.097 ms accumulation. Safe to arm because a bin "
+                        "must have fired repeatedly in recent cubes, which "
+                        "a dispersed pulse never has.")
+    p.add_argument("--rfi-ab-bin-k", type=float, default=None,
+                   help="per-bin sigma threshold for the band-limited "
+                        "gate (default 6.0; measured FAR 5.4e-5).")
+    p.add_argument("--rfi-ab-bin-persist-n", type=int, default=None,
+                   help="cubes in the window a bin must have fired in "
+                        "before its excision arms (default 3).")
+    p.add_argument("--rfi-ab-bin-window-cubes", type=int, default=None,
+                   help="length of the band-limited arming window in "
+                        "cubes (default 8, about 1.07 s).")
     p.add_argument("--rfi-array-burst-group", type=str, default="core",
                    help="which summing group's verdict drives the flag: "
                         "all / core / ew_arm / ns_arm / outriggers "
@@ -5085,6 +5131,10 @@ def main(argv: list[str] | None = None) -> int:
         rfi_array_burst_bin_chans=args.rfi_array_burst_bin_chans,
         rfi_array_burst_ema_cubes=args.rfi_array_burst_ema_cubes,
         rfi_array_burst_warmup_cubes=args.rfi_array_burst_warmup_cubes,
+        rfi_ab_bin_mode=args.rfi_ab_bin_mode,
+        rfi_ab_bin_k=args.rfi_ab_bin_k,
+        rfi_ab_bin_persist_n=args.rfi_ab_bin_persist_n,
+        rfi_ab_bin_window_cubes=args.rfi_ab_bin_window_cubes,
         static_sky_window_s=args.static_sky_window_s,
         static_sky_warmup_cubes=args.static_sky_warmup_cubes,
         static_sky_disabled=args.static_sky_disabled,

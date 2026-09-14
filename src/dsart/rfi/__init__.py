@@ -17,7 +17,8 @@ Public surface:
   ``latch_window_s`` (see :mod:`dsart.rfi.persistence`).
 * :func:`load_flagants` / :func:`load_flagants_torch` — legacy
   ``flagants.dat`` loader.
-* :class:`ArrayBurstDetector` — array-common broadband burst
+* :class:`ArrayBurstDetector` — array-common broadband burst, and
+  (``bin_mode``) array-common band-limited impulsive
   detector on the core / E-W arm / N-S arm autocorrelation sums, at
   2.097 ms. Covers the blind spot every per-antenna detector shares:
   a burst common to the whole array moves each of their references
@@ -34,6 +35,10 @@ from __future__ import annotations
 
 from dsart.rfi.array_burst import (
     BIN_CHANS_DEFAULT,
+    BIN_FLAG_K_DEFAULT,
+    BIN_MODES,
+    BIN_PERSIST_N_DEFAULT,
+    BIN_WINDOW_CUBES_DEFAULT,
     DETECT_K_DEFAULT,
     GROUP_NAMES,
     OCCUPANCY_MIN_DEFAULT,
@@ -41,6 +46,7 @@ from dsart.rfi.array_burst import (
     ArrayBurstDetector,
     ArrayBurstResult,
     build_groups_from_antpos,
+    excision_mask,
 )
 from dsart.rfi.autos import (
     DEFAULT_M_VALUES,
@@ -106,10 +112,15 @@ __all__ = [
     "ArrayBurstDetector",
     "ArrayBurstResult",
     "BIN_CHANS_DEFAULT",
+    "BIN_FLAG_K_DEFAULT",
+    "BIN_MODES",
+    "BIN_PERSIST_N_DEFAULT",
+    "BIN_WINDOW_CUBES_DEFAULT",
     "DETECT_K_DEFAULT",
     "GROUP_NAMES",
     "OCCUPANCY_MIN_DEFAULT",
     "build_groups_from_antpos",
+    "excision_mask",
     # autos
     "AutoSpectra",
     "DEFAULT_M_VALUES",

@@ -123,6 +123,13 @@ class RFIWindow:
     group_z: np.ndarray | None = None        # (n_cubes*n_acc, G, NPOL) fp32
     group_band_frac: np.ndarray | None = None  # same shape, fractional
     group_fired: np.ndarray | None = None    # same shape, uint8 0/1
+    # ---- band-limited (impulsive) gate ------------------------------
+    # A compact summary rather than the full (T, G, NBIN, NPOL) cube:
+    # 24x the group planes above is not worth the segment, and what an
+    # operator needs is "is it armed, and how much is it taking".
+    bin_mode: str = "off"                    # off / monitor / flag
+    bin_bins_armed: int = 0                  # bins armed in the flag group
+    bin_excised_cells: int = 0               # (sample, chan, pol) cells
     n_acc_per_cube: int = 0
 
 
@@ -220,6 +227,11 @@ class RFIWindowAggregator:
         self._ab_spec_sum = None
         self._ab_n_live = None
         self._ab_cubes = 0
+        self._bin_mode = "off"
+        # Accumulated ON DEVICE so the hot path keeps its single host
+        # sync per cube; both are read back only at snapshot time.
+        self._bin_armed_last: "torch.Tensor | None" = None
+        self._bin_excised: "torch.Tensor | None" = None
 
         self._cubes_in_window: int = 0
         self._cubes_warmup_in_window: int = 0
@@ -307,6 +319,13 @@ class RFIWindowAggregator:
         )
         self._ab_n_live = ab.n_live.to(torch.float32)
         self._ab_cubes += 1
+        if ab.bin_armed is not None:
+            self._bin_armed_last = ab.bin_armed
+        if ab.bin_chan_mask is not None:
+            n = ab.bin_chan_mask.sum(dtype=torch.int64)
+            self._bin_excised = (
+                n if self._bin_excised is None else self._bin_excised + n
+            )
 
     def push(
         self,
@@ -425,6 +444,14 @@ class RFIWindowAggregator:
         if array_burst is not None:
             self._push_array_burst(array_burst)
         self._array_burst_mode = str(array_burst_mode)
+        if array_burst is not None:
+            # The band-limited gate has its own mode, independent of
+            # the broadband one, and the detector is its owner.
+            self._bin_mode = (
+                "off" if array_burst.bin_fired is None
+                else ("flag" if array_burst.bin_chan_mask is not None
+                      else "monitor")
+            )
 
         self._cubes_in_window += 1
 
@@ -508,11 +535,24 @@ class RFIWindowAggregator:
                    _det_frac(counts["fa"], None))
 
         # --- array-burst section ------------------------------------
+        n_armed = 0
+        if self._bin_armed_last is not None:
+            try:
+                fi = self._ab_group_names.index(self._ab_flag_group)
+            except ValueError:
+                fi = 0
+            n_armed = int(self._bin_armed_last[fi].sum().item())
         ab_kw: dict[str, object] = {
             "array_burst_mode": self._array_burst_mode,
             "array_burst_flag_group": self._ab_flag_group,
             "group_names": self._ab_group_names,
             "group_sizes": self._ab_group_sizes,
+            "bin_mode": self._bin_mode,
+            "bin_bins_armed": n_armed,
+            "bin_excised_cells": (
+                0 if self._bin_excised is None
+                else int(self._bin_excised.item())
+            ),
         }
         if self._ab_z is not None and self._ab_cubes > 0:
             k = self._ab_cubes

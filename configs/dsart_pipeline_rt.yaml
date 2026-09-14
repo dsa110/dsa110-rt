@@ -528,6 +528,40 @@ routines:
   # for sensitivity to weaker narrowband lines. Put --bandpass-k 5.0 /
   # --group-k 5.0 back to pin the old thresholds; an explicit k wins.
   #
+  # Band-limited array-burst gate (--rfi-ab-bin-mode, 2026-09-14):
+  # the broadband gate above collapses its 24 per-bin significances to
+  # one occupancy number and requires >=90% of them, so an impulse
+  # confined to a few bins is rejected. Measured on archive dumps,
+  # that population is real and nothing else in the chain can reach
+  # it: ~1 sigma in any single antenna (a 3.34% excess against 3.12%
+  # per-antenna per-bin thermal noise), 8-10 sigma in the core sum,
+  # and SK does not respond at all -- SK-fired antenna fraction 0.007
+  # on those cells vs 0.009 when quiet -- because an impulse that
+  # fills the 2.097 ms accumulation is Gaussian inside it. The
+  # per-antenna chain's only available response is also 64x too coarse
+  # in time: its mask is per-cube, so it removes the channel for the
+  # whole 134 ms on the antennas that exceed threshold (0.56% of the
+  # cube) where the bin gate removes 2.097 ms across all of them
+  # (0.07%).
+  #
+  # Safety: a dispersed pulse and a band-limited impulse are
+  # indistinguishable in ONE sample (DM 500 sweeps ~3 bins; the
+  # measured RFI occupies a median of 2), so occupancy cannot separate
+  # them. What does is that a pulse MOVES: it visits each bin once or
+  # twice in a whole dump, while the interference revisits the SAME
+  # bins -- three bins carried 89% of hits in 260909dweu sb10, each
+  # active bin firing in a mean of 33.2 samples. So a bin must have
+  # fired in --rfi-ab-bin-persist-n of the last
+  # --rfi-ab-bin-window-cubes cubes before its excision arms, and that
+  # count is read CAUSALLY, from earlier cubes only. A pulse has no
+  # history and cannot arm its own excision. --rfi-ab-bin-k 6.0 has a
+  # measured FAR of 5.4e-5 per (sample, bin, pol) cell.
+  #
+  # Starting in `monitor` deliberately, as the broadband gate did:
+  # nothing is excised, and the mode / armed-bin count / excised-cell
+  # count appear in reserved header words 6-7 of the RFI shm segment.
+  # Set to `flag` to arm, `off` to skip it entirely.
+  #
   # NB: everything under `args: >-` is a FOLDED SCALAR. A '#' there is
   # NOT a comment -- it becomes a literal argv entry. Comments about
   # the flags belong here, above the routine.
@@ -553,6 +587,7 @@ routines:
       --rfi-persist-hold-s 900
       --rfi-persist-frac 1.0
       --rfi-array-burst-mode flag
+      --rfi-ab-bin-mode monitor
       --t-int-fast-native 32
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
       --chan-sum-factor 8

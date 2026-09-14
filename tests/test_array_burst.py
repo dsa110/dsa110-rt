@@ -29,6 +29,7 @@ from dsart.rfi.array_burst import (  # noqa: E402
     GROUP_NAMES,
     ArrayBurstDetector,
     build_groups_from_antpos,
+    excision_mask,
 )
 
 NANTS = 96
@@ -390,3 +391,245 @@ def test_baseline_is_read_before_the_cube_is_folded_in():
     # cube reads +2%. Had the update run first, mu would already have
     # absorbed half the step (alpha=0.5) and this would read ~1%.
     assert 0.017 < got < 0.023, got
+
+
+# ---------------------------------------------------------------------------
+# Band-limited (impulsive) gate — 2026-09-14
+# ---------------------------------------------------------------------------
+#
+# This gate exists because the broadband one collapses its 24 per-bin
+# significances into a single occupancy number and demands >= 90 % of
+# them, so an impulse confined to a few bins is rejected. Measured on
+# archive dumps that population is real, is array-common, and nothing
+# else in the chain can reach it: ~1 sigma in any one antenna, 8-10
+# sigma in the core sum, and SK does not respond at all because an
+# impulse that fills the 2.097 ms accumulation is Gaussian inside it.
+#
+# The tests below pin the two halves of the safety argument, both of
+# which are needed: a bin must have fired REPEATEDLY (a pulse visits
+# each bin once), and the contributing cubes must have been BAND-
+# LIMITED (a pulse lights every bin as it sweeps).
+
+
+def _bin_detector(**kw) -> ArrayBurstDetector:
+    kw.setdefault("bin_mode", "flag")
+    kw.setdefault("bin_persist_n", 3)
+    kw.setdefault("bin_window_cubes", 8)
+    kw.setdefault("warmup_cubes", 2)
+    return _make_detector(**kw)
+
+
+def _narrow_excess(bins, samples, amp: float) -> np.ndarray:
+    """[N_ACC, NCHAN] array-common excess confined to whole coarse bins."""
+    exc = np.zeros((N_ACC, NCHAN))
+    for b in bins:
+        lo = b * BIN_CHANS_DEFAULT
+        exc[np.asarray(samples)[:, None],
+            np.arange(lo, lo + BIN_CHANS_DEFAULT)[None, :]] = amp
+    return exc
+
+
+def test_bin_gate_off_by_default_and_computes_nothing():
+    rng = np.random.default_rng(1)
+    gain = _gains(rng)
+    det = _make_detector()
+    r = det.detect(*_draw_cube(rng, gain))
+    assert det.bin_mode == "off"
+    assert r.bin_fired is None
+    assert r.bin_armed is None
+    assert r.bin_chan_mask is None
+
+
+def test_bin_gate_arms_only_after_repeated_hits():
+    """The causal read: the first cubes must fire and NOT excise."""
+    rng = np.random.default_rng(11)
+    gain = _gains(rng)
+    det = _bin_detector()
+    exc = _narrow_excess((5, 6), (10, 11), 0.45)
+    excised, armed_at = [], None
+    for c in range(12):
+        r = det.detect(*_draw_cube(rng, gain, excess=exc))
+        n = 0 if r.bin_chan_mask is None else int(r.bin_chan_mask.sum())
+        excised.append(n)
+        if armed_at is None and n > 0:
+            armed_at = c
+        assert bool(r.bin_fired[:, det.groups.index("core")].any()) or r.warmup
+
+    assert armed_at is not None, "never armed on repeating band-limited RFI"
+    # warmup is 2 cubes and persist_n is 3, so the earliest possible
+    # arming is cube 4 (cubes 2 and 3 fold, cube 4 reads the history).
+    assert armed_at >= 4, f"armed too early at cube {armed_at}"
+    assert all(n == 0 for n in excised[:armed_at])
+    assert all(n > 0 for n in excised[armed_at:])
+
+
+def test_bin_gate_excises_only_the_offending_bins():
+    rng = np.random.default_rng(12)
+    gain = _gains(rng)
+    det = _bin_detector()
+    exc = _narrow_excess((5, 6), (10, 11), 0.45)
+    for _ in range(8):
+        r = det.detect(*_draw_cube(rng, gain, excess=exc))
+    m = r.bin_chan_mask
+    assert m is not None and bool(m.any())
+    # Exactly bins 5 and 6, exactly samples 10 and 11, both pols.
+    want_ch = np.zeros(NCHAN, dtype=bool)
+    for b in (5, 6):
+        want_ch[b * BIN_CHANS_DEFAULT:(b + 1) * BIN_CHANS_DEFAULT] = True
+    got_ch = m.any(dim=0).any(dim=-1).cpu().numpy()
+    assert np.array_equal(got_ch, want_ch), "wrong channels excised"
+    got_t = m.any(dim=1).any(dim=-1).cpu().numpy()
+    want_t = np.zeros(N_ACC, dtype=bool)
+    want_t[[10, 11]] = True
+    assert np.array_equal(got_t, want_t), "wrong samples excised"
+
+
+def test_bin_gate_ignores_a_one_off_event():
+    """A single band-limited event — the shape a pulse has — fires the
+    per-bin test but must never arm, because it has no history."""
+    rng = np.random.default_rng(13)
+    gain = _gains(rng)
+    det = _bin_detector()
+    exc = _narrow_excess((5, 6), (10, 11), 0.45)
+    total = 0
+    for c in range(12):
+        use = exc if c == 9 else None
+        r = det.detect(*_draw_cube(rng, gain, excess=use))
+        if r.bin_chan_mask is not None:
+            total += int(r.bin_chan_mask.sum())
+    assert total == 0, f"a one-off event was excised ({total} cells)"
+
+
+def test_bin_gate_does_not_excise_a_repeating_dispersed_pulse():
+    """The half of the safety argument the revisit counter alone does
+    NOT give you.
+
+    A dispersed sweep lights every bin once as it crosses the band, so
+    a bright source recurring inside the arming window — a giant-pulse
+    train, a repeater — would otherwise accumulate exactly the history
+    the gate reads and arm its own excision. The cube only counts
+    towards arming if it was band-limited, which a sweep never is.
+    """
+    rng = np.random.default_rng(14)
+    gain = _gains(rng)
+    det = _bin_detector()
+    # A bright sweep in EVERY cube: 5 samples, each lighting a fifth of
+    # the band, at 10x the measured RFI amplitude.
+    exc = np.zeros((N_ACC, NCHAN))
+    span = NCHAN // 5
+    for i in range(5):
+        exc[20 + i, i * span:(i + 1) * span] = 0.145
+    total = 0
+    fired_any = False
+    for _ in range(14):
+        r = det.detect(*_draw_cube(rng, gain, excess=exc))
+        if r.bin_fired is not None:
+            fired_any |= bool(r.bin_fired[:, det.groups.index("core")].any())
+        if r.bin_chan_mask is not None:
+            total += int(r.bin_chan_mask.sum())
+    assert fired_any, "the sweep was not even detected; test is vacuous"
+    assert total == 0, (
+        f"a repeating dispersed pulse was excised ({total} cells); the "
+        f"band-limited arming gate is not working"
+    )
+
+
+def test_bin_monitor_mode_computes_but_the_caller_excises_nothing():
+    rng = np.random.default_rng(15)
+    gain = _gains(rng)
+    det = _bin_detector(bin_mode="monitor")
+    exc = _narrow_excess((5, 6), (10, 11), 0.45)
+    saw_mask = False
+    for _ in range(10):
+        r = det.detect(*_draw_cube(rng, gain, excess=exc))
+        if r.bin_chan_mask is not None and bool(r.bin_chan_mask.any()):
+            saw_mask = True
+        # monitor means the CALLER does not arm it
+        assert excision_mask(r, broadband=False, band_limited=False) is None
+    assert saw_mask, "monitor mode computed nothing"
+
+
+def test_excision_mask_ors_the_two_gates():
+    rng = np.random.default_rng(16)
+    gain = _gains(rng)
+    det = _bin_detector()
+    exc = _narrow_excess((5, 6), (10, 11), 0.45)
+    for _ in range(8):
+        r = det.detect(*_draw_cube(rng, gain, excess=exc))
+    both = excision_mask(r, broadband=True, band_limited=True)
+    only_bin = excision_mask(r, broadband=False, band_limited=True)
+    assert both is not None and only_bin is not None
+    assert bool((only_bin <= both).all())
+    assert excision_mask(r, broadband=False, band_limited=False) is None
+
+
+@pytest.mark.parametrize("kw", [
+    {"bin_mode": "nonsense"},
+    {"bin_window_cubes": 0},
+    {"bin_persist_n": 0},
+    {"bin_persist_n": 9, "bin_window_cubes": 8},
+    {"bin_arm_max_frac": 0.0},
+    {"bin_arm_max_frac": 1.5},
+])
+def test_bin_gate_rejects_bad_configuration(kw):
+    args = {"bin_mode": "flag"}
+    args.update(kw)
+    with pytest.raises(ValueError):
+        _make_detector(**args)
+
+
+def _autos_from_s1(s1_fine: "torch.Tensor", s1_full: "torch.Tensor"):
+    """Build an :class:`AutoSpectra` from the M=64 moments.
+
+    ``s2`` is set to ``2 S1^2 / (M+1)``, the value that makes SK
+    exactly 1, so the SK detector contributes nothing and the test is
+    about the array-burst path alone.
+    """
+    from dsart.rfi.autos import AutoSpectra
+
+    s1: dict[int, torch.Tensor] = {}
+    s2: dict[int, torch.Tensor] = {}
+    for m in (64, 256, 1024, 4096):
+        k = m // M_FINE
+        acc = s1_fine.reshape(
+            N_ACC // k, k, *s1_fine.shape[1:],
+        ).sum(dim=1)
+        if m == 4096:
+            acc = s1_full.unsqueeze(0)
+        s1[m] = acc.contiguous()
+        s2[m] = (2.0 * acc * acc / (m + 1.0)).contiguous()
+    return AutoSpectra(s1=s1, s2=s2)
+
+
+def test_bin_gate_runs_with_the_broadband_gate_off():
+    """`array_burst_mode=off` + `bin_mode=flag` is a legitimate
+    configuration and must not silently do nothing."""
+    from dsart.rfi import RFIFlagger
+
+    rng = np.random.default_rng(17)
+    gain = _gains(rng)
+    e, n, st = _dsa_like_antpos()
+    det = ArrayBurstDetector(
+        build_groups_from_antpos(e, n, st), n_chan=NCHAN, n_pol=NPOL,
+        warmup_cubes=2, bin_mode="flag", bin_persist_n=3,
+        bin_window_cubes=8,
+    )
+    flg = RFIFlagger(
+        flagants_path=None, m_values=(64, 256, 1024, 4096),
+        warmup_cubes=0, run_sum_threshold=False,
+        array_burst=det, array_burst_mode="off",
+    )
+    exc = _narrow_excess((5, 6), (10, 11), 0.45)
+    saw = 0
+    for _ in range(9):
+        s1f, s1c = _draw_cube(rng, gain, excess=exc)
+        # RFIFlagger wants voltages; feed the moments it would build.
+        res = flg.flag_block(
+            None, None,
+            autos_override=_autos_from_s1(s1f, s1c),
+        )
+        ab = res.array_burst
+        assert ab is not None, "detector never ran with broadband off"
+        if ab.bin_chan_mask is not None:
+            saw += int(ab.bin_chan_mask.sum())
+    assert saw > 0, "band-limited gate produced nothing"
