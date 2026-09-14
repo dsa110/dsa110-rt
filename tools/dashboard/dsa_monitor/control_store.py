@@ -509,24 +509,38 @@ def compute_system_state(
     # wrapper therefore also publishes ``fstable_staged`` (does the
     # staged/regenerated table exist in the working dir yet); hold the
     # banner at PREPARING until every SPL-running node has it. Nodes
-    # with SPL gated off (routine not spawned) are skipped. Heartbeats
-    # from wrappers predating the field are trusted on freshness+pid
+    # with SPL gated off (routine not spawned) are skipped.
+    #
+    # DELIBERATELY NOT FRESHNESS-GATED (2026-09-14). The wrapper
+    # heartbeats every 10 s from a daemon thread, but it blocks in
+    # semtimedop on an empty `bada` until the sky is flowing, and the
+    # heartbeat thread stops with it. `bada` only fills once capture is
+    # armed -- so requiring a <=25 s heartbeat here deadlocked the
+    # operator: the gate could only clear after arming, while the banner
+    # said "wait before arming". Observed 2026-09-14 on cn10/cn11 with
+    # every node's heartbeat 1213-1224 s old and fstable_staged=true
+    # throughout.
+    #
+    # Freshness adds no safety it does not already have. Liveness comes
+    # from the orchestrator's routine.alive, and `fstable_staged` is a
+    # LATCHING fact -- once the table is on disk it stays there, so an
+    # old heartbeat saying `true` is still true. Anything that would
+    # invalidate it (a dec change, a respawn) restarts the routine and
+    # therefore changes the pid, which the pid check below catches.
+    # Heartbeats from wrappers predating the field are trusted on pid
     # alone (fstable_staged missing != not staged).
-    spl_pending: list[int] = []
+    spl_pending: list[tuple[int, str]] = []
     for cn, d in running.items():
         spl_rt = (d.get("routines") or {}).get("meridian_fringestop_spl")
         if not (isinstance(spl_rt, dict) and spl_rt.get("alive")):
             continue
         rd = _get(f"/mon/corr_rt/{cn}/meridian_spl_ready")
-        if not (
-            isinstance(rd, dict)
-            and _is_fresh(rd, now_mjd)
-            and rd.get("pid") == spl_rt.get("pid")
-        ):
-            spl_pending.append(cn)
-            continue
-        if rd.get("fstable_staged") is False:
-            spl_pending.append(cn)
+        if not isinstance(rd, dict):
+            spl_pending.append((cn, "no heartbeat yet"))
+        elif rd.get("pid") != spl_rt.get("pid"):
+            spl_pending.append((cn, "heartbeat is from a previous process"))
+        elif rd.get("fstable_staged") is False:
+            spl_pending.append((cn, "fstable regenerating"))
     counts["spl_pending"] = len(spl_pending)
 
     if warming or spl_pending:
@@ -537,8 +551,18 @@ def compute_system_state(
                 f"(warming: {sorted(warming)})"
             )
         if spl_pending:
+            # Name the reason that actually fired. The old text always
+            # said "fstable staging/regen pending", which sent an
+            # operator hunting a staged fstable that was already there.
+            by_reason: dict[str, list[int]] = {}
+            for cn, why in spl_pending:
+                by_reason.setdefault(why, []).append(cn)
             bits.append(
-                f"SPL fstable staging/regen pending on {sorted(spl_pending)}"
+                "SPL "
+                + "; ".join(
+                    f"{why} on {sorted(cns)}"
+                    for why, cns in sorted(by_reason.items())
+                )
             )
         return _result(
             "preparing",

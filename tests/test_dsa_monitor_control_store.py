@@ -1399,3 +1399,92 @@ class TestSystemStateObservingGate:
         })
         assert out["state"] != "observing"
         assert out["counts"]["captures_writing"] == 0
+
+
+class TestSystemStateSplFstableGate:
+    """The SPL fstable gate must not deadlock the operator.
+
+    The wrapper's heartbeat necessarily freezes before arming: it blocks
+    in semtimedop on an empty ``bada``, which only fills once capture is
+    armed. A freshness requirement here meant the gate could only clear
+    *after* arming while the banner said "wait before arming" (observed
+    2026-09-14 on cn10/cn11, heartbeats ~1220 s old, fstable_staged true
+    throughout).
+    """
+
+    STALE_MJD = 40587.0  # 1970 -- unambiguously stale
+
+    @classmethod
+    def _responses(cls, spl_ready: Any, *, alive: bool = True,
+                   pid: int = 99) -> dict[str, Any]:
+        now_mjd = time.time() / 86400.0 + 40587.0
+        return {
+            "/mon/corr_rt/3": {
+                "time_mjd": now_mjd,
+                "state": "running",
+                "routines": {
+                    "corr_fast": {"pid": 42},
+                    "meridian_fringestop_spl": {"alive": alive, "pid": pid},
+                },
+            },
+            "/mon/corr_rt/3/corr_fast_ready": {"ready": True, "pid": 42},
+            "/mon/corr_rt/3/meridian_spl_ready": spl_ready,
+            "/mon/search_rt/1": {"time_mjd": now_mjd, "state": "running"},
+        }
+
+    def _state_for(self, spl_ready: Any, **kw) -> dict[str, Any]:
+        cs = control_store.ControlStore()
+        cs._store = FakeDsaStore(self._responses(spl_ready, **kw))
+        return control_store.compute_system_state(
+            cs, corr_cn_ids=[3], search_cn_ids=[1], ports=[4011],
+        )
+
+    def test_stale_heartbeat_with_staged_fstable_does_not_block(self):
+        """The regression: this is the normal pre-arm steady state."""
+        out = self._state_for({
+            "ready": True, "pid": 99, "time_mjd": self.STALE_MJD,
+            "fstable_staged": True, "fstable_cache_ok": True,
+        })
+        assert out["counts"]["spl_pending"] == 0
+        assert "SPL" not in out["detail"]
+
+    def test_stale_heartbeat_still_blocks_while_regenerating(self):
+        """Staleness is ignored; fstable_staged=False is not."""
+        out = self._state_for({
+            "ready": True, "pid": 99, "time_mjd": self.STALE_MJD,
+            "fstable_staged": False,
+        })
+        assert out["counts"]["spl_pending"] == 1
+        assert out["state"] == "preparing"
+        assert "fstable regenerating on [3]" in out["detail"]
+
+    def test_missing_heartbeat_blocks_and_says_so(self):
+        out = self._state_for(None)
+        assert out["counts"]["spl_pending"] == 1
+        assert "no heartbeat yet on [3]" in out["detail"]
+
+    def test_pid_mismatch_blocks_and_says_so(self):
+        """A heartbeat from a previous process proves nothing about the
+        table the current one needs (e.g. after a declination change)."""
+        out = self._state_for({
+            "ready": True, "pid": 1234, "time_mjd": self.STALE_MJD,
+            "fstable_staged": True,
+        }, pid=99)
+        assert out["counts"]["spl_pending"] == 1
+        assert "previous process on [3]" in out["detail"]
+
+    def test_wrapper_predating_the_field_is_trusted_on_pid(self):
+        out = self._state_for({
+            "ready": True, "pid": 99, "time_mjd": self.STALE_MJD,
+        })
+        assert out["counts"]["spl_pending"] == 0
+
+    def test_spl_not_spawned_is_skipped(self):
+        out = self._state_for(None, alive=False)
+        assert out["counts"]["spl_pending"] == 0
+
+    def test_banner_never_calls_a_stale_heartbeat_a_staging_problem(self):
+        """The old text always blamed staging/regen, which sent an
+        operator hunting an fstable that was already on disk."""
+        out = self._state_for(None)
+        assert "staging/regen" not in out["detail"]
