@@ -18,6 +18,19 @@
     This page shows that sum, treating the core and each of its arms as extra
     antennas.
     </p>
+    <p class="muted" style="max-width:75em">
+    <strong>Two gates read this sum.</strong> The <em>broadband</em> gate needs
+    at least 90% of the 24 coarse bins occupied and zeroes the whole sub-band
+    for the samples it fires on. The <em>band-limited</em> gate reads the same
+    per-bin significances the broadband gate collapses into that occupancy
+    number, and zeroes only the offending 0.488&nbsp;MHz bins — covering an
+    impulsive, few-bin population nothing else in the chain reaches:
+    <strong>~1&nbsp;σ</strong> in any single antenna against
+    <strong>8–10&nbsp;σ</strong> in the core sum, with spectral kurtosis not
+    responding at all (SK-fired antenna fraction 0.007 on those cells against
+    0.009 when quiet), because an impulse that fills the 2.097&nbsp;ms
+    accumulation is Gaussian inside it.
+    </p>
 </div>
 
 <div class="card">
@@ -29,6 +42,25 @@
                 <strong>{{ view.mode_label }}</strong>
             </td>
             <td class="muted">{{ view.mode_note }}</td>
+        </tr>
+        <tr>
+            <td>band-limited mode</td>
+            <td class="value {% if view.bin_mode == 'flag' %}warn{% endif %}">
+                <strong>{{ view.bin_mode_label }}</strong>
+            </td>
+            <td class="muted">{{ view.bin_mode_note }}</td>
+        </tr>
+        <tr>
+            <td>bins armed</td>
+            <td class="value {% if view.bins_armed_total > 0 %}warn{% endif %}">
+                {{ view.bins_armed_total }}
+            </td>
+            <td class="muted">
+            summed over reporting nodes, of 24&nbsp;×&nbsp;2&nbsp;pol each. A
+            bin arms only after firing in 3 of the last 8 cubes, and only when
+            those cubes were themselves band-limited — a dispersed pulse
+            sweeps every bin, so it can never build that history.
+            </td>
         </tr>
         <tr>
             <td>flag group</td>
@@ -111,6 +143,14 @@
     {{ view.detail.n_fired }} fired ({{ view.detail.fired_pct }}%);
     E-W/N-S excess ratio at fire = {{ view.detail.arm_ratio_s }}
     </div>
+    <div class="muted">
+    band-limited gate: {{ view.detail.bin_mode }},
+    {{ view.detail.bins_armed }} bin-pol(s) armed,
+    {{ view.detail.bin_excised_pct }}% of this window's
+    (sample, channel, pol) cells
+    {% if view.detail.bin_mode == 'flag' %}excised{% else %}would be
+    excised{% endif %}
+    </div>
     <table class="metric">
         <thead>
             <tr>
@@ -154,7 +194,7 @@
             <tr>
                 <th>cn</th><th>chgroup</th><th>host</th><th>age [s]</th>
                 <th>fired</th><th>fired [%]</th><th>peak σ</th>
-                <th>E-W/N-S</th>
+                <th>E-W/N-S</th><th>bins armed</th><th>bin excised [%]</th>
             </tr>
         </thead>
         <tbody>
@@ -169,7 +209,10 @@
                 <td class="value">{{ '%.2f' % r.fired_pct }}</td>
                 <td class="value">{{ '%.1f' % r.peak_sigma if r.peak_sigma is not none else '—' }}</td>
                 <td class="value">{{ '%.2f' % r.arm_ratio if r.arm_ratio is not none else '—' }}</td>
+                <td class="value {% if r.bins_armed %}warn{% endif %}">{{ r.bins_armed }}</td>
+                <td class="value">{{ '%.3f' % r.bin_excised_pct }}</td>
                 {% else %}
+                <td class="value">—</td><td class="value">—</td>
                 <td class="value">—</td><td class="value">—</td>
                 <td class="value">—</td><td class="value">—</td>
                 {% endif %}

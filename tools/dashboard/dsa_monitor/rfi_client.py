@@ -61,6 +61,14 @@ class DecodedRFIMonRecord:
     group_spec_mean: Optional[np.ndarray] = None    # (G, NCHAN_DS, NPOL)
     group_n_live: Optional[np.ndarray] = None       # (G, NPOL) fp32
 
+    # ---- band-limited (impulsive) gate ----------------------------
+    # Its own mode, independent of array_burst_mode above. Defaults
+    # leave a v1/older exporter rendering as "off" rather than 500-ing.
+    bin_mode: str = "off"
+    bin_bins_armed: int = 0
+    bin_excised_cells: int = 0
+    bin_excised_frac: float = 0.0
+
     @property
     def array_burst_running(self) -> bool:
         return self.group_z is not None and self.group_z.size > 0
@@ -119,6 +127,12 @@ def _decode_array_burst(payload: dict[str, Any]) -> dict[str, Any]:
         "n_acc_per_cube": int(ab.get("n_acc_per_cube") or 0),
         "dt_s": float(ab.get("dt_s") or 0.0),
     }
+    bg = ab.get("bin")
+    if isinstance(bg, dict):
+        out["bin_mode"] = str(bg.get("mode", "off"))
+        out["bin_bins_armed"] = int(bg.get("bins_armed") or 0)
+        out["bin_excised_cells"] = int(bg.get("excised_cells") or 0)
+        out["bin_excised_frac"] = float(bg.get("excised_fraction") or 0.0)
     n_live = ab.get("n_live")
     if n_live:
         out["group_n_live"] = np.asarray(n_live, dtype=np.float32)

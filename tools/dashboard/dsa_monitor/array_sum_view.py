@@ -15,6 +15,20 @@ to the whole array defeats all three by construction. Measured on
 flagger tests and **13.3 sigma** in the array-summed band power at
 2.097 ms.
 
+There are now TWO gates on this sum, with different physics, and the
+page has to distinguish them:
+
+* the BROADBAND gate (``--rfi-array-burst-mode``) needs >= 90 % of the
+  24 coarse bins occupied, and zeroes the whole sub-band for the
+  samples it fires on.
+* the BAND-LIMITED gate (``--rfi-ab-bin-mode``, 2026-09-14) reads the
+  same per-bin significances the broadband gate collapses into that
+  occupancy number, and zeroes only the offending bins. It covers a
+  population nothing else in the chain reaches: ~1 sigma in any single
+  antenna, 8-10 sigma in the core sum, and spectral kurtosis does not
+  respond at all, because an impulse that fills the 2.097 ms
+  accumulation is Gaussian inside it.
+
 This module is pure data assembly: it turns the store snapshot into
 plain dicts the Jinja template can render, and does no plotting (that
 lives in :mod:`plot_render`).
@@ -52,7 +66,24 @@ MODE_LABELS: dict[str, tuple[str, str]] = {
     "flag": (
         "ARMED",
         "Firing samples are zero-filled in the voltages before the "
-        "correlator sees them.",
+        "correlator sees them — the WHOLE sub-band, for those samples.",
+    ),
+}
+
+#: Same three states for the band-limited gate. Kept separate because
+#: "armed" means something different: only the offending 0.488 MHz
+#: bins are zeroed, not the whole sub-band.
+BIN_MODE_LABELS: dict[str, tuple[str, str]] = {
+    "off": ("off", "The band-limited gate is not running."),
+    "monitor": (
+        "monitor only",
+        "Armed-bin and excised counts below are what it WOULD remove. "
+        "Nothing is excised. This is how it ships.",
+    ),
+    "flag": (
+        "ARMED",
+        "Only the offending 0.488 MHz bins are zero-filled, for the "
+        "2.097 ms samples that fired — not the whole sub-band.",
     ),
 }
 
@@ -93,8 +124,10 @@ def build_array_sum_view(
     fleet: list[dict[str, Any]] = []
     detail: Optional[dict[str, Any]] = None
     mode = "off"
+    bin_mode = "off"
     flag_group = ""
     n_reporting = 0
+    bins_armed_total = 0
 
     for cring in snap.per_chgroup:
         rec = _latest_with_groups(cring)
@@ -111,6 +144,9 @@ def build_array_sum_view(
         if rec is not None:
             n_reporting += 1
             mode = rec.array_burst_mode or mode
+            if getattr(rec, "bin_mode", "off") != "off":
+                bin_mode = rec.bin_mode
+            bins_armed_total += int(getattr(rec, "bin_bins_armed", 0))
             flag_group = rec.array_burst_flag_group or flag_group
             fi = rec.group_index(rec.array_burst_flag_group or "core")
             hot = (
@@ -128,6 +164,11 @@ def build_array_sum_view(
                     rec.group_z[:, fi, :].max()
                 ) if fi is not None else None,
                 "arm_ratio": _arm_ratio(rec, hot),
+                "bin_mode": str(getattr(rec, "bin_mode", "off")),
+                "bins_armed": int(getattr(rec, "bin_bins_armed", 0)),
+                "bin_excised_pct": (
+                    100.0 * float(getattr(rec, "bin_excised_frac", 0.0))
+                ),
             })
         fleet.append(row)
 
@@ -135,6 +176,8 @@ def build_array_sum_view(
             detail = _detail_for(rec, cring)
 
     label, note = MODE_LABELS.get(mode, MODE_LABELS["off"])
+    bin_label, bin_note = BIN_MODE_LABELS.get(
+        bin_mode, BIN_MODE_LABELS["off"])
     return {
         "chgroup": chgroup,
         "detail": detail,
@@ -145,6 +188,10 @@ def build_array_sum_view(
         "mode": mode,
         "mode_label": label,
         "mode_note": note,
+        "bin_mode": bin_mode,
+        "bin_mode_label": bin_label,
+        "bin_mode_note": bin_note,
+        "bins_armed_total": bins_armed_total,
         "flag_group": flag_group,
         "snapshot_unix": snap.snapshot_unix,
     }
@@ -230,5 +277,10 @@ def _detail_for(rec, cring) -> dict[str, Any]:
         "block_n_end": rec.block_n_end,
         "arm_ratio": _arm_ratio(rec, hot),
         "arm_ratio_s": _fmt(_arm_ratio(rec, hot), "%.2f"),
+        "bin_mode": str(getattr(rec, "bin_mode", "off")),
+        "bins_armed": int(getattr(rec, "bin_bins_armed", 0)),
+        "bin_excised_cells": int(getattr(rec, "bin_excised_cells", 0)),
+        "bin_excised_pct": _fmt(
+            100.0 * float(getattr(rec, "bin_excised_frac", 0.0)), "%.3f"),
         "publish_unix": rec.publish_unix,
     }

@@ -65,7 +65,11 @@ from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
-from dsart.common.constants import BLOCK_DURATION_S
+from dsart.common.constants import (
+    BLOCK_DURATION_S,
+    NCHAN_PER_CHGROUP,
+    NPOL,
+)
 from dsart.services.rfi_mon_shm import (
     RFIMonRecord,
     RFIMonShmAbiMismatch,
@@ -149,6 +153,7 @@ def record_to_json_obj(
         ),
         "n_acc_per_cube": int(rec.n_acc_per_cube),
         "dt_s": float(rec.n_acc_per_cube and BLOCK_DURATION_S / rec.n_acc_per_cube),
+        "bin": _bin_gate_summary(rec),
     }
     if rec.group_n_live is not None:
         obj["array_burst"]["n_live"] = rec.group_n_live.tolist()
@@ -267,12 +272,37 @@ def _mon_dict_from_record(
     }
 
 
+def _bin_gate_summary(rec: RFIMonRecord) -> dict[str, Any]:
+    """Band-limited (impulsive) gate summary.
+
+    Three numbers, from reserved shm header words 6-7: the gate's own
+    mode, how many coarse bins are currently ARMED in the flag group,
+    and how much of the window it took. The excised fraction is what
+    an operator actually needs when deciding whether to arm it, so
+    compute it here rather than leaving the dashboard to guess the
+    denominator.
+
+    ``getattr`` defaults keep this working against an older
+    ``RFIMonRecord`` during a rolling deploy.
+    """
+    cells = int(getattr(rec, "bin_excised_cells", 0))
+    n_acc = int(rec.n_acc_per_cube or 0)
+    total = int(rec.n_cubes) * n_acc * NCHAN_PER_CHGROUP * NPOL
+    return {
+        "mode": str(getattr(rec, "bin_mode", "off")),
+        "bins_armed": int(getattr(rec, "bin_bins_armed", 0)),
+        "excised_cells": cells,
+        "excised_fraction": (cells / total) if total else 0.0,
+    }
+
+
 def _array_burst_summary(rec: RFIMonRecord) -> dict[str, Any]:
     """Scalar array-burst summary for the etcd mon payload."""
     out: dict[str, Any] = {
         "mode": str(rec.array_burst_mode),
         "flag_group": str(rec.array_burst_flag_group),
         "groups": list(rec.group_names),
+        "bin": _bin_gate_summary(rec),
     }
     if rec.group_fired is None or rec.group_fired.size == 0:
         out["running"] = False
