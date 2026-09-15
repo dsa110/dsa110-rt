@@ -31,6 +31,7 @@ The poller thread starts at import-time; Flask serves HTTP requests.
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
@@ -40,7 +41,16 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+import numpy as np
+from flask import (
+    Flask,
+    abort,
+    jsonify,
+    make_response,
+    render_template,
+    request,
+    send_file,
+)
 
 # We deploy as a directory; make sibling modules importable.
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +61,10 @@ from corr_topology import CORR_NODES, CORR_NODES_BY_CHGROUP
 from rfi_store import RFIPoller, RFIWindowStore
 from rfi_client import RFIClient
 from array_sum_view import build_array_sum_view
+from freq_mapping import production_freq_axis_GHz
+from antenna_map import ant_num_to_cube_idx
 from plot_render import (
+    _concat_waterfall_per_ant,
     render_array_burst_arms,
     render_array_burst_spectrum,
     render_array_burst_timeseries,
@@ -3567,6 +3580,56 @@ def api_position_clear(name: str):
 
 
 # ---------- API ------------------------------------------------------------
+
+
+@app.route("/api/ant_waterfall.npz")
+def api_ant_waterfall():
+    """The 30-min per-antenna waterfall, as a .npz — read-only.
+
+    Exists so an offline consumer can score the RFI environment
+    without standing up a SECOND poller against the corr-node
+    exporters. Those serve ~150 kB of base64 arrays per record and the
+    nodes they run on have ~1.79 ms of real-time block margin, so
+    doubling their JSON-encode load for hours is not free. The
+    dashboard is already holding this ring; hand out what it has.
+
+    Query: ``ant`` (real antenna number, not cube index) and
+    ``plane`` = ``bandpass`` (mean S1) or ``flagfrac`` (fraction of
+    cubes flagged). Returns ``wf`` (n_win, n_chan, 2), ``t_unix``
+    (n_win,), ``freq_ghz`` (n_chan,) — or 503 while the window is
+    still filling.
+    """
+    try:
+        ant_num = int(request.args.get("ant", "1"))
+        ant_idx = ant_num_to_cube_idx(ant_num)
+    except (ValueError, KeyError):
+        return _no_store(jsonify({"error": "bad ?ant= (real antenna number)"})), 400
+    plane = request.args.get("plane", "bandpass")
+    if plane == "bandpass":
+        accessor = lambda r: r.s1_full_mean                    # noqa: E731
+    elif plane == "flagfrac":
+        def accessor(r):
+            return r.mask_count_final.astype(np.float32) / float(
+                max(1, int(r.n_cubes)))
+    else:
+        return _no_store(jsonify({"error": "bad ?plane="})), 400
+
+    out = _concat_waterfall_per_ant(
+        store.snapshot(), ant_idx=ant_idx, accessor=accessor)
+    if out is None:
+        return _no_store(jsonify({
+            "available": False,
+            "reason": "no window present on all 16 corr nodes yet",
+        })), 503
+    wf, t_unix = out
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf, wf=wf.astype(np.float32), t_unix=t_unix,
+        freq_ghz=production_freq_axis_GHz(), ant_num=ant_num,
+        ant_idx=ant_idx, plane=plane)
+    resp = make_response(buf.getvalue())
+    resp.headers["Content-Type"] = "application/octet-stream"
+    return _no_store(resp)
 
 
 @app.route("/api/status")
