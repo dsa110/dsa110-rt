@@ -98,6 +98,7 @@ from dsart.coarse_dm.dm_plan import DMPlan
 
 __all__ = [
     "apply_stage1_shifts",
+    "apply_stage1_shifts_subbin",
     "max_t_dedisp_for_plan",
 ]
 
@@ -301,3 +302,184 @@ def apply_stage1_shifts(
             f"out device {out.device} != vis device {vis.device}"
         )
     return torch.gather(vis, 0, t_idx_b, out=out)
+
+
+def apply_stage1_shifts_subbin(
+    vis_sub: torch.Tensor,
+    plan: DMPlan,
+    *,
+    chgroup: int,
+    dm_idx: int,
+    n_sub: int,
+    t_dedisp: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Stage 1 at SUB-BIN time resolution, integrating down on the way out.
+
+    Why
+    ===
+
+    :func:`apply_stage1_shifts` shifts whole ``t_int_fast`` bins, so it
+    rounds each channel's arrival to ±524 µs at the production
+    op-point. That is the largest single quantisation term in the whole
+    dedispersion chain (see
+    ``_inspect/sensitivity/rounding_decomp.py``). The stored delay
+    table is native-resolution — ±16 µs — and the loss is entirely in
+    ``round(delay_native / t_int_fast_native)``.
+
+    This function takes visibilities at ``t_int_fast / n_sub`` cadence,
+    shifts at that resolution, and sums ``n_sub`` sub-bins per output
+    sample. At ``n_sub == plan.t_int_fast_native`` there is no second
+    rounding at all.
+
+    Measured, combined with the merged per-chgroup rounding
+    (``compute_time_shift_search(merge_coarse_rounding=True)``), on the
+    deployed 150-1290 plan at 1 ms: 0.744 baseline → 0.764 merged →
+    **0.817** with native-resolution stage 1, i.e. **x1.098**. A truly
+    continuous shift scores 0.8173 against 0.8171 here, so the native
+    sample is already effectively exact and there is nothing further to
+    gain from a coherent coarse stage.
+
+    What it costs, and why this is not free
+    =======================================
+
+    Two costs, and the FIRST one is the reason this is a flag and not
+    the default:
+
+    1. **The caller must produce ``vis_sub`` at ``n_sub`` × finer
+       cadence.** In the deployed pipeline that means the fast-corr
+       GEMM emits ``n_sub`` × more time samples (``t_int_fast_native /
+       n_sub`` instead of ``t_int_fast_native``). The GEMM's
+       multiply-accumulate count is unchanged but its output volume,
+       and every byte of downstream traffic up to this call, grows
+       ``n_sub`` ×. Against a measured ~4 ms of corr-side margin this
+       is the binding constraint — benchmark before believing any
+       ``n_sub > 2`` is affordable.
+
+    2. **This function does ``n_sub`` gathers instead of one.** It
+       deliberately does NOT materialise the ``(t_dedisp * n_sub,
+       NBASE, NCHAN)`` gather — at the production op-point that would
+       be ~900 MB × ``n_sub`` and OOMs an 11 GB 2080 Ti for
+       ``n_sub >= 8``. Instead it accumulates one
+       ``(t_dedisp, NBASE, NCHAN)`` gather per sub-bin phase, so peak
+       memory matches :func:`apply_stage1_shifts` and only time scales.
+
+    Output ``t`` sums ``vis_sub[t * n_sub + s + shift_sub[c]]`` over
+    ``s in 0..n_sub-1``, which is the same signal
+    :func:`apply_stage1_shifts` would produce if the shift happened to
+    be an exact multiple of ``n_sub``. ``n_sub=1`` is bit-identical to
+    :func:`apply_stage1_shifts` (pinned by
+    ``test_subbin_n_sub_1_matches_wholebin``).
+
+    Parameters
+    ----------
+    vis_sub : torch.Tensor
+        ``(n_fast_vis * n_sub, NBASE, NCHAN)`` complex, at
+        ``t_int_fast / n_sub`` cadence.
+    plan, chgroup, dm_idx
+        As :func:`apply_stage1_shifts`.
+    n_sub : int
+        Sub-bins per fast-vis sample. Must divide
+        ``plan.t_int_fast_native``.
+    t_dedisp : int, optional
+        Output fast-vis samples. Defaults to the full usable range,
+        ``(n_sub_total - max_shift_sub) // n_sub``.
+    out : torch.Tensor, optional
+        Pre-allocated ``(t_dedisp, NBASE, NCHAN)`` accumulator, same
+        dtype/device as ``vis_sub``. Zeroed on entry.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(t_dedisp, NBASE, NCHAN)``, dtype/device of ``vis_sub``.
+    """
+    if not 0 <= chgroup < N_CHGROUP:
+        raise IndexError(f"chgroup={chgroup}, expected 0..{N_CHGROUP - 1}")
+    if not 0 <= dm_idx < plan.n_coarse:
+        raise IndexError(f"dm_idx={dm_idx}, expected 0..{plan.n_coarse - 1}")
+    if vis_sub.dtype not in _CFLOAT_DTYPES:
+        raise TypeError(
+            f"vis_sub.dtype={vis_sub.dtype}, expected complex"
+        )
+    if vis_sub.ndim != 3:
+        raise ValueError(
+            f"vis_sub must be 3-D (n_fast_vis*n_sub, NBASE, NCHAN); got "
+            f"{vis_sub.ndim}-D shape {tuple(vis_sub.shape)}"
+        )
+    n_sub = int(n_sub)
+    if n_sub < 1:
+        raise ValueError(f"n_sub={n_sub}, expected >= 1")
+    n_t_sub, n_base_v, n_chan_v = vis_sub.shape
+    if n_base_v != NBASE:
+        raise ValueError(f"vis_sub NBASE axis {n_base_v} != NBASE={NBASE}")
+    if n_chan_v > NCHAN_PER_CHGROUP:
+        raise ValueError(
+            f"vis_sub NCHAN axis {n_chan_v} > NCHAN_PER_CHGROUP="
+            f"{NCHAN_PER_CHGROUP}"
+        )
+    if n_t_sub % n_sub != 0:
+        raise ValueError(
+            f"vis_sub time axis {n_t_sub} is not a multiple of "
+            f"n_sub={n_sub}"
+        )
+
+    shifts_full = plan.delay_subbins_per_chgroup(chgroup, n_sub)
+    shifts = shifts_full[:n_chan_v, dm_idx]
+    max_shift = int(shifts.max())
+    available = (n_t_sub - max_shift) // n_sub
+    if available <= 0:
+        raise ValueError(
+            f"vis_sub time axis {n_t_sub} too small for max sub-bin shift "
+            f"{max_shift} at n_sub={n_sub} (chgroup={chgroup}, "
+            f"dm_idx={dm_idx})"
+        )
+    if t_dedisp is None:
+        t_dedisp = available
+    else:
+        t_dedisp = int(t_dedisp)
+        if t_dedisp <= 0:
+            raise ValueError(f"t_dedisp={t_dedisp}, must be > 0")
+        if t_dedisp > available:
+            raise ValueError(
+                f"t_dedisp={t_dedisp} > available={available} "
+                f"(n_t_sub={n_t_sub}, max_sub_shift={max_shift}, "
+                f"n_sub={n_sub})"
+            )
+
+    if out is None:
+        acc = torch.zeros(
+            (t_dedisp, n_base_v, n_chan_v),
+            dtype=vis_sub.dtype, device=vis_sub.device,
+        )
+    else:
+        if out.shape != (t_dedisp, n_base_v, n_chan_v):
+            raise ValueError(
+                f"out shape {tuple(out.shape)} != "
+                f"({t_dedisp}, {n_base_v}, {n_chan_v})"
+            )
+        if out.dtype != vis_sub.dtype:
+            raise TypeError(
+                f"out dtype {out.dtype} != vis_sub dtype {vis_sub.dtype}"
+            )
+        if out.device != vis_sub.device:
+            raise ValueError(
+                f"out device {out.device} != vis_sub device "
+                f"{vis_sub.device}"
+            )
+        acc = out
+        acc.zero_()
+
+    shifts_t = torch.as_tensor(
+        shifts, dtype=torch.int64, device=vis_sub.device,
+    )
+    # Output sample t draws from sub-bin t*n_sub + s + shift[c].
+    t_base = (
+        torch.arange(t_dedisp, dtype=torch.int64, device=vis_sub.device)
+        * n_sub
+    )
+    for s in range(n_sub):
+        t_idx = (t_base[:, None, None] + (s + shifts_t)[None, None, :])
+        acc += vis_sub.gather(
+            0, t_idx.expand(t_dedisp, n_base_v, n_chan_v)
+        )
+    return acc

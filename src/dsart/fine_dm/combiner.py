@@ -154,8 +154,16 @@ def compute_time_shift_search(
     nu_chgroup_top_GHz: Optional[Tuple[float, ...]] = None,
     nu_bot_proc_GHz: float = NU_BOT_PROC_GHZ,
     include_coarse_offset: bool = False,
+    merge_coarse_rounding: bool = False,
+    t_int_corr_us: Optional[float] = None,
 ) -> TimeShiftSearchTable:
     """Build the per-fine-DM × per-chgroup integer-sample shift table.
+
+    ``merge_coarse_rounding`` (2026-09-22, x1.026 recovered S/N at
+    W <= 1 ms): collapse the corr-side stage-2 rounding and this
+    search-side fine rounding into ONE. See the "Two roundings
+    instead of three" section below. Default False = the behaviour
+    that has always shipped.
 
     Per plan §3.6.3:
 
@@ -215,6 +223,69 @@ def compute_time_shift_search(
     be positive (fine above coarse → POSITIVE shift, advance/read-FUTURE)
     or negative (fine below coarse → NEGATIVE shift, retreat/read-PAST).
     Both signs are required under the v2 even-K-around-coarse partition.
+
+    Two roundings instead of three (``merge_coarse_rounding=True``)
+    ==============================================================
+
+    The deployed chain quantises a channel's arrival to a whole
+    ``t_int`` sample THREE times:
+
+      s1  rint(Δτ(ν_ch, ν_TOP[g], dm_coarse)/T)   per CHANNEL, corr
+      s2  rint(Δτ(ν_bot, ν_TOP[g], dm_coarse)/T)  per CHGROUP, corr
+      sf  rint(Δτ(ν_bot, ν_TOP[g], δdm)/T)        per CHGROUP, search
+
+    ``s2`` and ``sf`` share the SAME coefficient and differ only in
+    which DM they use, so together they quantise the per-chgroup delay
+    twice for no reason. They are separate only because s2 runs on the
+    corr node (it aligns the wire frame to ν_bot_proc before transport)
+    and sf runs here.
+
+    But the search side knows ``dm_coarse``, so it can subtract the
+    integer the corr side already applied and hand over the ROUNDED
+    TOTAL instead of the ROUNDED DIFFERENCE::
+
+        sf_new = rint(Δτ(ν_bot, ν_TOP[g], dm_fine)/T)
+               - rint(Δτ(ν_bot, ν_TOP[g], dm_coarse)/T)
+
+    That is a difference of two integers, so it is still a legal whole
+    sample shift, and the TOTAL per-chgroup shift becomes a single
+    rounding at the fine DM. The corr node is untouched and the wire
+    frame stays aligned — unlike ``include_coarse_offset=True``, which
+    also gets to two roundings but only by switching stage 2 off, which
+    then makes the search-side ring absorb the full inter-chgroup delay.
+
+    Cost: nothing. This is a table change.
+
+    Magnitude: ``|sf_new - sf| <= 1`` sample, because
+    ``|rint(a) - rint(b) - (a-b)| <= 1``. So ``max|shifts|`` — which
+    sizes ``ProductionRxRing._t_stream`` — moves by at most one sample.
+
+    Measured (2026-09-22, ``_inspect/sensitivity/csf8_remeasure.py``,
+    the deployed 150-1290 plan, recovered fraction of perfect
+    dedispersion, at the PRODUCTION channel resolution -- arrivals per
+    native channel but stage-1 shifts per chan_sum_factor=8 summed
+    channel, which is what the code does):
+
+      ==========  ==============  ==============
+      W           3 roundings     2 roundings
+      ==========  ==============  ==============
+      0.25 ms     0.6183          0.6346  (x1.026)
+      1 ms        0.7337          0.7529  (x1.026)
+      2 ms        0.8255          0.8389  (x1.016)
+      ==========  ==============  ==============
+
+    (``two_rounding.py`` gives x1.027 / x1.016 on the audit's finer
+    6144-native-channel model; the ratio is insensitive to which, the
+    absolute level is not.)
+
+    Caveat: the MEAN improves but the worst-case DM gets marginally
+    worse (1 ms min 0.579 → 0.572). With two roundings the errors
+    sometimes cancel; with one they cannot.
+
+    Requires ``t_int_corr_us == t_int_search_us`` (true in production:
+    both are ``t_int_fast_native * NATIVE_SAMPLE_US`` = 1048.576 µs).
+    Raises if they differ, because then the subtracted corr-side
+    integer is not a whole search sample.
 
     Args:
         coarse_dm_pc_cm3: ``[N_coarse] float64`` coarse-DM trial table.
@@ -288,6 +359,32 @@ def compute_time_shift_search(
     del chgroup_bot  # retained for back-compat argument; no longer used
     nu_chgroup_ref = chgroup_top
 
+    if merge_coarse_rounding:
+        if include_coarse_offset:
+            raise ValueError(
+                "merge_coarse_rounding is meaningless with "
+                "include_coarse_offset=True: that path already applies a "
+                "single rounding of the full fine-DM delay (the corr-side "
+                "stage 2 is absent), so there is no second rounding to "
+                "merge."
+            )
+        if t_int_corr_us is None:
+            raise ValueError(
+                "merge_coarse_rounding=True requires t_int_corr_us so the "
+                "coarse term can be reproduced EXACTLY as the corr-side "
+                "stage 2 computed it (coarse_dm/stage2_shifts.py). Pass "
+                "cfg.t_int_fast_native * NATIVE_SAMPLE_US."
+            )
+        if abs(float(t_int_corr_us) - float(t_int_search_us)) > 1e-9:
+            raise ValueError(
+                f"merge_coarse_rounding needs t_int_corr_us "
+                f"({t_int_corr_us}) == t_int_search_us "
+                f"({t_int_search_us}). The merge subtracts an integer "
+                f"number of CORR samples from an integer number of SEARCH "
+                f"samples; when the cadences differ that difference is not "
+                f"a whole search sample and the shift would be wrong."
+            )
+
     n_fine = fine_dm_pc_cm3.shape[0]
     shifts = np.zeros((n_fine, N_CHGROUP), dtype=np.int32)
     for f in range(n_fine):
@@ -297,6 +394,27 @@ def compute_time_shift_search(
         else:
             ddm = float(fine_dm_pc_cm3[f] - coarse_dm_pc_cm3[c])
         for g in range(N_CHGROUP):
+            if merge_coarse_rounding:
+                # ONE rounding instead of two. The corr side already
+                # applied rint(dtau(coarse)/T) whole samples (stage 2);
+                # subtracting that integer from rint(dtau(fine)/T) leaves
+                # an integer, and makes the TOTAL applied per-chgroup
+                # shift a single rounding at the fine DM. The two terms
+                # here must be bit-identical to what stage 2 computed:
+                # same TOP reference, same np.rint (half-to-even), same
+                # cadence (checked above).
+                s_fine = np.rint(
+                    delta_tau_us(float(nu_bot_proc_GHz),
+                                 float(nu_chgroup_ref[g]),
+                                 float(fine_dm_pc_cm3[f])) / t_int_search_us
+                )
+                s_coarse = np.rint(
+                    delta_tau_us(float(nu_bot_proc_GHz),
+                                 float(nu_chgroup_ref[g]),
+                                 float(coarse_dm_pc_cm3[c])) / t_int_search_us
+                )
+                shifts[f, g] = int(s_fine - s_coarse)
+                continue
             d_us = delta_tau_us(
                 float(nu_bot_proc_GHz), float(nu_chgroup_ref[g]), ddm
             )

@@ -446,6 +446,78 @@ class DMPlan:
         nat = self.delay_native_samples_per_chgroup(chgroup)
         return np.rint(nat / self.t_int_fast_native).astype(np.int64)
 
+    def delay_subbins_per_chgroup(
+        self, chgroup: int, n_sub: int,
+    ) -> np.ndarray:
+        """Stage-1 shifts in units of ``t_int_fast / n_sub``.
+
+        ``delay_bins_per_chgroup`` rounds the stored NATIVE-sample
+        delay table a SECOND time, down to whole ``t_int_fast`` bins
+        (32 native samples at the production op-point). That second
+        rounding is the single largest quantisation term in the
+        dedispersion chain: it puts up to ±524 µs of arrival error on
+        each channel, where the native table carries only ±16 µs.
+
+        With ``n_sub`` sub-bins per fast-vis sample the rounding is
+        ``t_int_fast / n_sub`` wide, and at ``n_sub ==
+        t_int_fast_native`` it degenerates to the native table itself
+        — no second rounding at all.
+
+        Measured effect (2026-09-22,
+        ``_inspect/sensitivity/coherent_check.py``, deployed 150-1290
+        plan, recovered fraction of perfect dedispersion at 1 ms,
+        combined with the merged per-chgroup rounding): 0.753 at
+        ``n_sub=1`` → 0.801 at native resolution, **x1.092** over the
+        3-rounding baseline (csf8_remeasure.py, production channel
+        resolution; x1.098 on the audit's finer native-channel model). Quantising at the native sample is
+        indistinguishable from an exactly-continuous shift (0.8171 vs
+        0.8173), so there is nothing beyond this to win — a coherent
+        coarse stage in the style of arXiv:1607.00909 would add
+        nothing here, quite apart from being unavailable to us because
+        the SNAP F-engine channelises upstream.
+
+        The caller must supply visibilities at the matching
+        ``t_int_fast / n_sub`` cadence; see
+        :func:`dsart.coarse_dm.stage1.apply_stage1_shifts_subbin` for
+        the cost that implies.
+
+        Args:
+            chgroup: chgroup index ``0..N_CHGROUP-1``.
+            n_sub: sub-bins per fast-vis sample, ``>= 1``. Must divide
+                ``t_int_fast_native`` so sub-bins tile a fast-vis
+                sample exactly.
+
+        Returns:
+            ``(NCHAN_PER_CHGROUP, N_coarse) int64`` shifts in sub-bins.
+        """
+        n_sub = int(n_sub)
+        if n_sub < 1:
+            raise ValueError(f"n_sub={n_sub}, expected >= 1")
+        # t_int_fast_native is a float by schema (benches may use
+        # fractional cadences). Sub-binning only makes sense when a
+        # fast-vis sample is a whole number of native samples.
+        nat_per_fast_f = float(self.t_int_fast_native)
+        if abs(nat_per_fast_f - round(nat_per_fast_f)) > 1e-9:
+            raise ValueError(
+                f"t_int_fast_native={nat_per_fast_f} is not integral; "
+                f"sub-bin stage 1 needs a fast-vis sample that is a whole "
+                f"number of native samples"
+            )
+        nat_per_fast = int(round(nat_per_fast_f))
+        if n_sub > nat_per_fast:
+            raise ValueError(
+                f"n_sub={n_sub} exceeds t_int_fast_native="
+                f"{nat_per_fast}; the native sample is the finest "
+                f"resolution the stored delay table carries"
+            )
+        if nat_per_fast % n_sub != 0:
+            raise ValueError(
+                f"n_sub={n_sub} does not divide t_int_fast_native="
+                f"{nat_per_fast}; sub-bins must tile a fast-vis sample"
+            )
+        nat = self.delay_native_samples_per_chgroup(chgroup)
+        return np.rint(nat / (nat_per_fast / n_sub)).astype(np.int64)
+
     def max_delay_bins_per_chgroup(self, chgroup: int) -> int:
         """Largest bin shift across (ch, dm) for one chgroup.
 

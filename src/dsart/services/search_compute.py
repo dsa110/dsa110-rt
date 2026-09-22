@@ -3085,6 +3085,14 @@ async def _run_async(args: argparse.Namespace) -> int:
         include_coarse_offset_in_search_shifts=bool(
             args.include_coarse_offset_in_search_shifts
         ),
+        # 2026-09-22: one rounding instead of two on the per-chgroup
+        # delay. Table-only; x1.026 recovered S/N at W <= 1 ms. Needs
+        # t_int_corr_us == t_int_search_us, which holds in production
+        # (both are t_int_fast_native * NATIVE_SAMPLE_US).
+        merge_coarse_rounding_in_search_shifts=bool(
+            args.merge_coarse_rounding_in_search_shifts
+        ),
+        t_int_corr_us=float(args.t_int_search_us),
         # M7.7 100 %-coverage symmetric-shift padding. See the
         # CLI flag help text and ProductionRxRingSource.__init__
         # docstring for the full geometry. When True the rx_ring
@@ -3395,6 +3403,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "warmup transient (cubes 1-2 of a fresh start can "
                         "drop sigma ~200x below steady state). 0.0 (default) "
                         "disables. M7.4 burst-replay recommended: 5e-3.")
+    p.add_argument("--merge-coarse-rounding-in-search-shifts",
+                   action="store_true", default=False,
+                   help="Apply the ROUNDED TOTAL per-chgroup delay at the "
+                        "fine DM minus the integer the corr-side stage 2 "
+                        "already applied, instead of the ROUNDED "
+                        "DIFFERENCE. Collapses two whole-sample roundings "
+                        "into one; the corr node and the wire frame are "
+                        "untouched. Measured x1.026 recovered S/N at "
+                        "W <= 1 ms, +1.6% at 2 ms "
+                        "(_inspect/sensitivity/two_rounding.py). Shifts "
+                        "move by at most 1 sample so the ring history "
+                        "barely changes. Mutually exclusive with "
+                        "--include-coarse-offset-in-search-shifts (that "
+                        "path already has a single rounding). NOT YET "
+                        "EXERCISED ON SKY.")
     p.add_argument("--include-coarse-offset-in-search-shifts",
                    action="store_true", default=False,
                    help="M7.4 stage-2-absent escape hatch: bake the "

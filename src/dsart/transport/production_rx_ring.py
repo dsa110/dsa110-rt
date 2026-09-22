@@ -204,6 +204,16 @@ class ProductionRxRingSource:
         # shifts (see ``compute_time_shift_search`` docstring). Used
         # while the corr-side stage-2 application is not yet wired.
         include_coarse_offset_in_search_shifts: bool = False,
+        # 2026-09-22: collapse the corr-side stage-2 rounding and the
+        # search-side fine rounding into ONE (x1.026 recovered S/N at
+        # W <= 1 ms). Table-only change; see
+        # ``compute_time_shift_search`` docstring, section "Two
+        # roundings instead of three". Default False = shipped
+        # behaviour. Requires t_int_corr_us == t_int_search_us, which
+        # the caller must pass so the corr-side integer is reproduced
+        # exactly.
+        merge_coarse_rounding_in_search_shifts: bool = False,
+        t_int_corr_us: float | None = None,
         # M7.7 symmetric-shift padding (2026-06-03): when True, the
         # assembler pre-pads the per-chgroup stream with
         # ``pad_left = max(0, shifts.max())`` samples BEFORE
@@ -284,9 +294,20 @@ class ProductionRxRingSource:
             fine_to_coarse=fine_to_coarse,
             t_int_search_us=t_int_search_us,
             include_coarse_offset=bool(include_coarse_offset_in_search_shifts),
+            merge_coarse_rounding=bool(merge_coarse_rounding_in_search_shifts),
+            t_int_corr_us=(
+                float(t_int_corr_us) if t_int_corr_us is not None
+                # In production the corr fast-vis cadence and the search
+                # cadence are the same value; default to it so callers
+                # that have not been updated still work when they opt in.
+                else float(t_int_search_us)
+            ),
         )
         self._include_coarse_offset_in_search_shifts = bool(
             include_coarse_offset_in_search_shifts
+        )
+        self._merge_coarse_rounding_in_search_shifts = bool(
+            merge_coarse_rounding_in_search_shifts
         )
 
         # Lazy state — opened in start()
