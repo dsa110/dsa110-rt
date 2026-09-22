@@ -196,6 +196,30 @@ routines:
   # ``--include-coarse-offset-in-search-shifts`` (which drives the
   # shifts table to ±1400 samples and would balloon the pad).
   #
+  # 2026-09-22 — ``--merge-coarse-rounding-in-search-shifts`` is
+  # ENABLED on both halves. The chain quantises a channel's arrival to
+  # a whole t_int sample THREE times: s1 per channel at the coarse DM
+  # (corr), then s2 per chgroup (corr, aligns the wire frame) and sf
+  # per chgroup (search, the fine residual). s2 and sf share the SAME
+  # coefficient and differ only in which DM they use, so they round
+  # the per-chgroup delay twice for nothing. With this flag the search
+  # side applies rint(Δτ(fine)/T) − rint(Δτ(coarse)/T) — a difference
+  # of two integers, so still a whole sample — making the TOTAL a
+  # single rounding at the fine DM. The corr node is untouched and the
+  # wire frame stays aligned, unlike the include_coarse_offset route
+  # to two roundings, which needs stage 2 switched off.
+  # Free: it is a table change, no extra compute. |new − old| ≤ 1
+  # sample so T_stream barely moves. Measured x1.026 recovered S/N at
+  # W ≤ 1 ms, x1.016 at 2 ms, at the production chan_sum_factor=8
+  # resolution (_inspect/sensitivity/csf8_remeasure.py). The MEAN
+  # improves but the worst-case DM is marginally worse (1 ms min
+  # 0.576 → 0.568) — two roundings sometimes cancel, one cannot.
+  # Requires t_int_corr_us == t_int_search_us, which holds here (both
+  # are t_int_fast_native × NATIVE_SAMPLE_US = 1048.576 µs);
+  # search_compute passes it and compute_time_shift_search RAISES if
+  # they ever diverge. To revert: delete the flag from both halves,
+  # re-push, restart. NOT YET EXERCISED ON SKY.
+  #
   # CRITICAL: ``args: >-`` is a YAML folded scalar — DO NOT add
   # ``#``-comments inside it; they become literal argv tokens
   # (commit 14f0535 post-mortem). Keep both halves in lockstep when
@@ -234,6 +258,7 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
+      --merge-coarse-rounding-in-search-shifts
       --symmetric-shift-padding
       --pipeline-overlap
       --poll-interval-s 0.001
@@ -327,6 +352,7 @@ routines:
       --detector-k-dm d1
       --detector-k-time b1,b2,b4,b8,b16,b32,b64
       --layer1-max-samples 10000
+      --merge-coarse-rounding-in-search-shifts
       --symmetric-shift-padding
       --pipeline-overlap
       --poll-interval-s 0.001
