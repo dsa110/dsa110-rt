@@ -20,6 +20,7 @@ from dsart.transport.prod_frame import (
     BITS_CFP16_COMPLEX,
     BITS_CINT8_COMPLEX,
     DEFAULT_MAX_FRAG_PAYLOAD_BYTES,
+    DEFAULT_MTU_BYTES,
     FLAG_LAST_IN_BLOCK,
     FLAG_NOISE_WARMUP,
     FLAG_QUANTIZED,
@@ -435,7 +436,14 @@ def test_constants_match_plan_contract() -> None:
     assert FLAG_RESERVED_BIT2 == 0x04
     assert FLAG_NOISE_WARMUP == 0x08
     assert FLAG_RFI_WARMING_UP == 0x10
-    assert DEFAULT_MAX_FRAG_PAYLOAD_BYTES == 8964
+    # 9000 MTU - 20 IPv4 - 8 UDP - 72 ProdFrame header. pack_frame puts
+    # the header and the fragment in ONE datagram, so this cap must
+    # leave room for the header or the kernel IP-fragments every
+    # maximally-sized frame (the pre-2026-09-22 value of 8964 did not).
+    assert DEFAULT_MAX_FRAG_PAYLOAD_BYTES == 8900
+    assert 28 + HEADER_BYTES + DEFAULT_MAX_FRAG_PAYLOAD_BYTES == (
+        DEFAULT_MTU_BYTES
+    )
 
 
 # ---------------------------------------------------------------------------

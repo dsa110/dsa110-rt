@@ -519,6 +519,7 @@ class AsyncTransportTx:
         "_closed",
         "_corr_idx",
         "_block_specnum_inflight",
+        "_pin_buf",
         "n_cubes_in",
     )
 
@@ -534,6 +535,10 @@ class AsyncTransportTx:
         self._closed: bool = False
         self._corr_idx: int = int(cfg.corr_idx)
         self.n_cubes_in: int = 0
+        # Pinned host staging buffer for the per-cube D2H (see
+        # _stage_cube_to_host). Allocated lazily on first CUDA cube and
+        # re-used every block; grown only if a larger cube arrives.
+        self._pin_buf: torch.Tensor | None = None
         # _block_specnum_inflight: per-worker count of cubes still being
         # consumed. Not strictly needed (the rings have their own count)
         # but useful for the mon-key surface.
@@ -730,6 +735,57 @@ class AsyncTransportTx:
     # Hot-path API
     # ------------------------------------------------------------------
 
+    def _stage_cube_to_host(self, cube: torch.Tensor) -> torch.Tensor:
+        """D2H the cube through a re-used PINNED staging buffer.
+
+        This runs on the pipeline thread, inside the 134.218 ms block
+        budget, so the copy bandwidth is real-time margin.
+
+        A plain ``.to("cpu")`` allocates pageable host memory, which the
+        CUDA driver must stage through its own internal pinned bounce
+        buffer. Measured on n04 (2026-09-22, RTX 2080 Ti) that path
+        holds ~4.3 GB/s for a 26.6 MB cube but **collapses to a flat
+        1.46 GB/s above ~40 MB** — so it degrades exactly where a
+        bigger cube would hurt most:
+
+            cube MB   pageable ms   pinned ms
+              26.6        6.23         2.04      <- today's op-point
+              41.0       28.02         3.13
+              69.9       47.78         5.34
+             127.0       86.70         9.67
+
+        A pinned buffer holds 13.1 GB/s flat. At the current op-point
+        that is ~4 ms/block handed back; it is also what makes any
+        larger cube (more sub-bands, more coarse DMs) affordable at all.
+
+        The buffer is re-used across blocks. That is safe because the
+        caller fully consumes the returned tensor before returning: each
+        per-worker slice is copied into a shm ring slot by
+        ``copy_to_slot``, which is a real copy, not a view.
+        """
+        if not cube.is_cuda:
+            # Already on the host (tests, CPU fallback). Nothing to gain
+            # from staging, and .contiguous() is a no-op when it can be.
+            return cube.detach().contiguous()
+
+        src = cube.detach()
+        buf = self._pin_buf
+        if (
+            buf is None
+            or buf.dtype != src.dtype
+            or buf.numel() < src.numel()
+        ):
+            # Size to this cube; a later, larger cube grows it once.
+            buf = torch.empty(
+                src.numel(), dtype=src.dtype, pin_memory=True,
+            )
+            self._pin_buf = buf
+        staged = buf[: src.numel()].view(src.shape)
+        # Blocking copy: the payload must be on the host before the
+        # per-worker ring writes below.
+        staged.copy_(src)
+        return staged
+
     def transmit(
         self,
         cubes_for_tx: Sequence[torch.Tensor],
@@ -796,9 +852,10 @@ class AsyncTransportTx:
                     f"{self._cfg.ring_dims.shape}"
                 )
 
-            # Single D2H copy for the whole cube. Use .numpy() if
-            # already on CPU; otherwise .cpu().numpy().
-            cube_cpu_t = cube.detach().to("cpu", copy=False).contiguous()
+            # Single D2H copy for the whole cube, through a re-used
+            # pinned staging buffer (~3x faster at this size, and it
+            # does not fall off the pageable-path cliff above ~40 MB).
+            cube_cpu_t = self._stage_cube_to_host(cube)
             cube_np = cube_cpu_t.numpy()  # zero-copy view onto host
 
             ring_dm = self._cfg.ring_dims.shape[0]
@@ -853,6 +910,10 @@ class AsyncTransportTx:
         if self._closed:
             return
         self._closed = True
+        # Release the pinned staging buffer: pinned pages are a global,
+        # non-swappable resource and the search nodes have already been
+        # seen OOM-killing on pinned-page pressure.
+        self._pin_buf = None
         LOG.info("AsyncTransportTx.close: signalling %d workers", len(self._workers))
         for wh in self._workers:
             try:

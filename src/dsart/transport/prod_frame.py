@@ -99,10 +99,31 @@ DEFAULT_MTU_BYTES: Final[int] = 9000
 """Default MTU: jumbo frames on ``nic.search``. Conservative-MTU
 deployments override to 1500."""
 
-DEFAULT_MAX_FRAG_PAYLOAD_BYTES: Final[int] = 8964
+DEFAULT_MAX_FRAG_PAYLOAD_BYTES: Final[int] = 8900
 """Default per-fragment payload cap: MTU 9000 − IPv4 (20) − UDP (8) −
-8 B kernel-side slack = 8964 B. Plan §4.3 line 1409 cites 8964 B for
-9000 B MTU."""
+:data:`HEADER_BYTES` (72) = 8900 B.
+
+The 72 B is the point. ``pack_frame`` prepends the ProdFrame header to
+the fragment and :meth:`TransportTx._transmit_one_cube_prod` sends the
+result as ONE datagram, so the wire size is
+``28 + HEADER_BYTES + payload_bytes_in_frag``. The historical value of
+8964 (plan §4.3 line 1409) subtracted IP+UDP and an "8 B kernel-side
+slack" but never the header, giving a 9064 B datagram on a 9000 B MTU —
+i.e. every maximally-sized fragment was itself IP-fragmented in the
+kernel, and losing either IP fragment discarded the whole ProdFrame.
+
+This was latent rather than active: the cap only binds once the payload
+reaches it, and the payload is ``n_filled * bits_per_cell // 8`` = 2 B
+per cell at the operational ``bits_per_cell=16``. Production runs
+n_filled ≈ 3247 (6494 B, one fragment, 6594 B on the wire), so nothing
+fragmented. The cliff sits at **n_filled >= 4451**, and
+``n_filled_max`` is provisioned at 5000 — so a sparsity-pattern change
+could have crossed it silently. Measured 2026-09-22: at a 9036 B
+datagram, 16->1 fan-in lost 90.3% into a search node whose IP-reassembly
+sysctl was at kernel defaults, versus 0.00% for a non-fragmenting
+payload at the same rate.
+
+8900 makes the largest datagram exactly 9000 B."""
 
 # bits_per_cell allowed values (uint8 at header byte 48).
 BITS_CINT8_COMPLEX: Final[int] = 16
