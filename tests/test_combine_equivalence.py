@@ -131,3 +131,90 @@ def test_fp16_accumulator_only_while_exact():
     assert accumulator_dtype_for(16) is torch.float16
     assert accumulator_dtype_for(17) is torch.float32
     assert accumulator_dtype_for(64) is torch.float32
+
+
+# --------------------------------------------------------------------------
+# v2 / v3: the formulations that actually unlock larger n_sb
+# --------------------------------------------------------------------------
+
+from dsart.image.tiled_combine_cuda import (  # noqa: E402
+    build_inverse_lut,
+    combine_tiled_v2,
+    combine_tiled_v3,
+    max_tile_for,
+    pad_t,
+    scatter_compact_to_dense_v2,
+    transpose_compact_tmajor,
+)
+
+
+def _geometry(shifts, n_sb):
+    spread = int(shifts.max().item()) - int(shifts.min().item())
+    return max_tile_for(n_sb, spread, T_DET - T_LO)
+
+
+@pytest.mark.parametrize("n_sb,n_fdm", [(4, 6), (16, 8), (64, 5)])
+@pytest.mark.parametrize("threads", [256, 1024])
+def test_v2_bit_identical(n_sb, n_fdm, threads):
+    cells, lut, n_filled, shifts = _inputs(n_sb, n_fdm)
+    want = _dense_reference(cells, lut, n_filled, shifts, n_sb, n_fdm)
+    t_pad = pad_t(T_ROWS)
+    dense = torch.zeros(
+        (n_sb, N_GRID * N_GRID, t_pad, 2), dtype=torch.int8, device=DEV)
+    scatter_compact_to_dense_v2(cells, lut, n_filled, dense, n_grid=N_GRID)
+    got = combine_tiled_v2(
+        dense, shifts, n_grid=N_GRID, t_rows=T_ROWS,
+        t_out_len=T_DET - T_LO, t_lo=T_LO, fftshift=True,
+        threads=threads, tile=_geometry(shifts, n_sb))
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("n_sb,n_fdm", [(4, 6), (16, 8), (64, 5)])
+def test_v3_bit_identical(n_sb, n_fdm):
+    cells, lut, n_filled, shifts = _inputs(n_sb, n_fdm)
+    want = _dense_reference(cells, lut, n_filled, shifts, n_sb, n_fdm)
+    t_pad = pad_t(T_ROWS)
+    inv = build_inverse_lut(lut, n_filled, n_grid=N_GRID)
+    dense = torch.zeros(
+        (n_sb, N_FILLED_MAX, t_pad, 2), dtype=torch.int8, device=DEV)
+    transpose_compact_tmajor(cells, dense)
+    got = combine_tiled_v3(
+        dense, inv, shifts, n_grid=N_GRID, t_rows=T_ROWS,
+        t_out_len=T_DET - T_LO, t_lo=T_LO, fftshift=True,
+        threads=1024, tile=_geometry(shifts, n_sb))
+    assert torch.equal(got, want)
+
+
+def test_inverse_lut_round_trips():
+    """inv_lut must invert lut exactly, and mark absent cells with -1."""
+    _cells, lut, n_filled, _s = _inputs(4, 4)
+    inv = build_inverse_lut(lut, n_filled, n_grid=N_GRID)
+    assert inv.shape == (4, N_GRID * N_GRID)
+    for g in range(4):
+        nf = int(n_filled[g].item())
+        cells_g = lut[g, :nf].long()
+        assert torch.equal(
+            inv[g, cells_g], torch.arange(nf, dtype=torch.int32, device=DEV))
+        assert int((inv[g] >= 0).sum().item()) == nf
+
+
+def test_v3_shared_memory_guard():
+    """An oversized staged window must be rejected, not silently wrong."""
+    _cells, lut, n_filled, shifts = _inputs(64, 5)
+    inv = build_inverse_lut(lut, n_filled, n_grid=N_GRID)
+    dense = torch.zeros(
+        (64, N_FILLED_MAX, pad_t(T_ROWS), 2), dtype=torch.int8, device=DEV)
+    # 2 cells * n_sb * win_w * 2 B must exceed the 48 KiB cap; the
+    # miniature test geometry cannot reach it on its own, so ask for an
+    # explicitly oversized tile.
+    assert 2 * 64 * (500 + 1) * 2 > 49152
+    with pytest.raises(ValueError, match="shared"):
+        combine_tiled_v3(
+            dense, inv, shifts, n_grid=N_GRID, t_rows=T_ROWS,
+            t_out_len=T_DET - T_LO, t_lo=T_LO, tile=500)
+
+    # and the automatic tile must always be within the cap
+    for n_sb in (16, 32, 64):
+        t = max_tile_for(n_sb, 66, 192)
+        assert 2 * n_sb * (t + 66) * 2 <= 49152
+        assert t >= 1
