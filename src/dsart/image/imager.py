@@ -42,6 +42,7 @@ import torch
 
 __all__ = [
     "compute_edge_mask",
+    "diagnose_edge_mask_alignment",
     "dirty_image_from_uv_grid",
     "apply_edge_mask",
     "image_mask_npad",
@@ -172,6 +173,55 @@ def compute_edge_mask(
         sign = (1.0 - 2.0 * ((ii + jj) & 1)).astype(dtype)
         mask = mask * sign
     return mask
+
+
+def diagnose_edge_mask_alignment(
+    realised_zero: np.ndarray,
+    mask: np.ndarray,
+    max_flat_offset: int = 64,
+) -> tuple[int, int]:
+    """Locate a flat-index misalignment between the intended edge mask
+    and the zero pattern actually present in an emitted cube plane.
+
+    2026-09-22.  An audit of 632 dumped cubes found that 6.14% of every
+    cube is identically zero in a pattern that matches
+    ``compute_edge_mask(npad=4, drop_dc=True)`` displaced by +10
+    elements in ROW-MAJOR order (65526 of 65536 cells agree; the ten
+    that do not are the wrap at row 0).  A flat offset rather than a
+    per-axis roll is the signature of a buffer/view offset, not a
+    coordinate-convention error, and it means eight INTERIOR image
+    columns are permanently dead while the true l-axis border is not
+    masked at all.  173 of 174 injections land on their correct pixel
+    to better than 0.56 pixel, so the image geometry itself is sound --
+    it is the mask that is displaced.
+
+    The root cause was not found by inspection (every Python-side buffer
+    is a fresh contiguous allocation), so rather than guess at a fix
+    this runs once on the first emitted cube and reports the offset it
+    actually measures.
+
+    Args:
+        realised_zero: ``[N, N]`` bool -- cells that are exactly zero in
+            an emitted cube plane.
+        mask: ``[N, N]`` the intended multiplicative edge mask.
+        max_flat_offset: search ``+-`` this many elements.
+
+    Returns:
+        ``(best_offset, n_mismatch)``. ``best_offset == 0`` with
+        ``n_mismatch == 0`` means the mask is correctly aligned.
+    """
+    want = (np.asarray(mask) == 0).ravel()
+    got = np.asarray(realised_zero, dtype=bool).ravel()
+    if want.size != got.size:
+        raise ValueError(
+            f"shape mismatch: mask {want.size} vs realised {got.size}"
+        )
+    best = (0, int((np.roll(want, 0) != got).sum()))
+    for off in range(-int(max_flat_offset), int(max_flat_offset) + 1):
+        n = int((np.roll(want, off) != got).sum())
+        if n < best[1]:
+            best = (off, n)
+    return best
 
 
 # ---------------------------------------------------------------------------

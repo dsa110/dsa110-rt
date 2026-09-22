@@ -679,6 +679,13 @@ class SearchComputeService:
         self._config = config
         self._source = source
         self._detector = detector or self._build_detector(config)
+        # 2026-09-22: the σ estimators must EXCLUDE the image cells the
+        # edge mask zeroes (``apply_edge_mask`` multiplies by a 0/1
+        # mask, so 6.164% of every cube arrives as exact zeros and drags
+        # σ 4.05% low -- every reported SNR was 4.2% high). The mask is
+        # NOT reconstructed here: ``CubePipeline`` publishes it from the
+        # imager that actually multiplies the cube, so the two cannot
+        # drift apart. See CubePipeline._publish_spatial_active.
         self._layer1_state = layer1_state or Layer1State(
             n_fdm=config.n_fdm,
             n_burnin_cubes=config.layer1_n_burnin_cubes,
@@ -746,6 +753,9 @@ class SearchComputeService:
         # M7.6: cumulative candidates dropped pre-transmit by the C1→C2
         # width cap (c1.max_c1c2_width_samples).
         self._c1_cands_dropped_width = 0
+        # 2026-09-22: candidates ALLOWED THROUGH the width cap by the
+        # brightness escape (c1.max_c1c2_width_snr_escape).
+        self._c1_cands_width_escaped = 0
         # 2026-05-30: cumulative candidates dropped pre-transmit by the
         # DM-smearing-floor filter (c1.dm_width_floor_frac) — unphysically
         # narrow high-DM detections (impulsive RFI on a high-DM trial).
@@ -1051,6 +1061,7 @@ class SearchComputeService:
             "c1_batches_submitted": int(self._c1_batches_submitted),
             "c1_batches_dropped": int(self._c1_batches_dropped),
             "c1_cands_dropped_width": int(self._c1_cands_dropped_width),
+            "c1_cands_width_escaped": int(self._c1_cands_width_escaped),
             "c1_cands_dropped_dmfloor": int(self._c1_cands_dropped_dmfloor),
             "c1_cands_dropped_color": int(self._c1_cands_dropped_color),
             "c1_cands_dropped_meter": int(self._c1_cands_dropped_meter),
@@ -1710,11 +1721,40 @@ class SearchComputeService:
             if cfg.c1_emit_config is not None
             else None
         )
+        # 2026-09-22 brightness escape (``c1.max_c1c2_width_snr_escape``).
+        # The width cap is applied AFTER the cross-kernel merge, and the
+        # merger keeps only the highest-SNR member of a neighbourhood --
+        # so once b32 wins, the b16 detection of the same burst has
+        # already been suppressed and the cap drops the burst entirely.
+        # Measured: nothing above W ~ 25 ms produces a C2 candidate at
+        # any brightness, and ``width_max`` never exceeds 16 in 74813 C2
+        # rows.  The cap exists because ~95-100% of the spurious
+        # candidate volume sat at width >= 32 (2026-05-29), so the fix is
+        # an escape for bright candidates, not removal.  ``None`` / <= 0
+        # keeps the legacy hard cap.
+        snr_escape = (
+            cfg.c1_emit_config.max_width_snr_escape
+            if cfg.c1_emit_config is not None
+            else None
+        )
         if max_w is not None and candidates:
-            kept = [c for c in candidates if int(c.width_samples) <= int(max_w)]
+            esc = (float(snr_escape)
+                   if snr_escape is not None and float(snr_escape) > 0.0
+                   else None)
+            kept = [
+                c for c in candidates
+                if int(c.width_samples) <= int(max_w)
+                or (esc is not None and float(c.snr) >= esc)
+            ]
+            n_escaped = (
+                0 if esc is None else
+                sum(1 for c in kept if int(c.width_samples) > int(max_w))
+            )
             n_dropped = len(candidates) - len(kept)
             if n_dropped:
                 self._c1_cands_dropped_width += n_dropped
+            if n_escaped:
+                self._c1_cands_width_escaped += n_escaped
             candidates = kept
         # M7.6 C1→C2 metering: cap candidates/block, narrow-first
         # (width asc) then bright-first (snr desc). RT-safe — we only pay
@@ -1807,6 +1847,8 @@ class SearchComputeService:
                     dropped_max=self._meter_window_dropped_max,
                     cands_sum=self._meter_window_cands_sum,
                     cap=int(cap),
+                    width_dropped_total=self._c1_cands_dropped_width,
+                    width_escaped_total=self._c1_cands_width_escaped,
                 )
             except Exception:  # noqa: BLE001 — mon must never sink the pipe
                 LOG.warning("C1 metering publish failed", exc_info=True)
@@ -2334,6 +2376,7 @@ def _build_search_config_from_yaml(
     fine_dm_pc_cc_full: Optional[np.ndarray],
     t_det: int,
     cube_cadence_samples: int,
+    kernel_support: int = 1,
     cube_pipeline_carry_over_re_imaging: bool = False,
     t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
     enable_c1: bool = True,
@@ -2347,6 +2390,13 @@ def _build_search_config_from_yaml(
     noise = yaml_doc.get("noise", {}) or {}
     pipe_cfg = CubePipelineConfig(
         n_grid=int(n_grid),
+        # 2026-09-22: the image-plane edge mask sizes its border from the
+        # GRIDDING kernel support (npad = ks//2 + 2).  This was never
+        # wired to the CLI, so it sat at the dataclass default of 5
+        # (npad = 4) while production has run ``--kernel-support 1``
+        # (npad = 2) since M7.3 -- twice as wide a dead border as the
+        # pillbox gridder needs, on all four sides of every cube.
+        edge_mask_kernel_support=int(kernel_support),
         image_backend=image_backend,   # "cpu" or "gpu"
         # UV pre-scale (default 1.0 → identity): keeps the cfp16 imager
         # FFT linear for bright bursts. Layer-1 re-estimates σ from the
@@ -2516,6 +2566,7 @@ def _build_search_config_from_yaml(
     c1_emit_cfg: Optional[C1EmitConfig] = None
     if enable_c1 and c2_endpoint:
         _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
+        _max_width_snr_escape = c1.get("max_c1c2_width_snr_escape", None)
         _max_cands_block = c1.get("max_candidates_per_block", None)
         # 2026-07-21: default 2 even when the yaml key is absent, so the
         # SNR-protected metering fix is live on nodes whose local config
@@ -2533,6 +2584,12 @@ def _build_search_config_from_yaml(
             max_width_samples=(
                 int(_max_c1c2_width)
                 if _max_c1c2_width is not None and int(_max_c1c2_width) > 0
+                else None
+            ),
+            max_width_snr_escape=(
+                float(_max_width_snr_escape)
+                if _max_width_snr_escape is not None
+                and float(_max_width_snr_escape) > 0.0
                 else None
             ),
             max_candidates_per_block=(
@@ -3076,6 +3133,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         fine_dm_pc_cc_full=fine_dm,
         t_det=args.t_det,
         cube_cadence_samples=args.cube_cadence_samples,
+        kernel_support=int(args.kernel_support),
         cube_pipeline_carry_over_re_imaging=bool(
             args.cube_pipeline_carry_over_re_imaging
         ),

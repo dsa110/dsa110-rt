@@ -219,7 +219,7 @@ routines:
       --n-fdm 34 --t-det 256 --n-grid 256
       --cube-cadence-samples 192
       --t-int-search-us 1048.576
-      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin150_dmmax1290_tol1.238_csf8_explicit-v1.npz
       --fan-in-min-corrs 15
       --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
@@ -307,7 +307,7 @@ routines:
       --n-fdm 34 --t-det 256 --n-grid 256
       --cube-cadence-samples 192
       --t-int-search-us 1048.576
-      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.364_csf8_cap10.2_v3.1.npz
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin150_dmmax1290_tol1.238_csf8_explicit-v1.npz
       --fan-in-min-corrs 15
       --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
@@ -384,7 +384,19 @@ routines:
 #             shake-down if pinned memory is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 11.0                      # 2026-06-14: lowered 12.0 → 11.0 to widen FRB sensitivity. The C2 rate
+  snr_min: 10.55                     # 2026-09-22: 11.0 → 10.55 is a NO-OP IN TRUE UNITS, not a threshold cut.
+                                     # The sensitivity audit found the image-plane edge mask MULTIPLIES 6.164% of
+                                     # every cube by zero, and those exact zeros were reaching sigma_clipped_std,
+                                     # dragging sigma 4.05% low and inflating every reported SNR by 4.2%
+                                     # (measured: sigma_clip 1.0074 with the masked cells in, 1.0499 with them out).
+                                     # So the nominal 11.0 threshold was really 11.0/1.042 = 10.55 in true units.
+                                     # Layer-1/Layer-2 now exclude masked cells (spatial_active), which removes the
+                                     # inflation — leaving snr_min at 11.0 would SILENTLY RAISE the real threshold
+                                     # from 10.55 to 11.0 and cost ~4.2% in threshold / ~6% in rate. 10.55 keeps the
+                                     # exact operating point and false-alarm rate the fleet has been running since
+                                     # 2026-06-14. TO REVERT THE SIGMA FIX AND THIS TOGETHER: set snr_min back to
+                                     # 11.0 (one line) — the two changes are a matched pair, never move one alone.
+                                     # 2026-06-14: lowered 12.0 → 11.0 to widen FRB sensitivity. The C2 rate
                                      # limiter (60s/100-cluster window) + extragalactic dm_median≥115/snr≥12 +
                                      # sidereal (l,m) registry veto now backstop the extra C1→C2 volume at 11σ.
                                      # Watch C2 windowing lag + C1 emit drops during the post-change soak.
@@ -450,6 +462,24 @@ c1:
                                      # keeps the C2 coincidence peak_event_specnum on fresh cubes
                                      # (fixes too_late dump misses), and unloads the C1->C2 path.
                                      # Set to 0 / remove to disable the filter (ship every survivor).
+  max_c1c2_width_snr_escape: 20.0    # 2026-09-22 sensitivity audit: the width cap above is ABSOLUTE and is
+                                     # applied AFTER the cross-kernel merge, which keeps only the highest-SNR
+                                     # member of a detection neighbourhood. A W >~ 25 ms burst therefore peaks in
+                                     # a wide boxcar, wins the merge, and is then discarded outright — invisible
+                                     # AT ANY BRIGHTNESS. (Confirmed: width_max never exceeds 16 in 74813 archived
+                                     # C2 rows, with a 13.9% pile-up right at 16.) This lets a candidate wider
+                                     # than the cap through if it is at least this bright, so the cap keeps
+                                     # stripping the spurious floor while bright wide bursts survive.
+                                     # 20.0 is deliberately conservative: the worst sustained on-sky RFI floor on
+                                     # record (2026-05-28, DM~1655) topped out at snr_max 12.92, and 95-100% of
+                                     # spurious volume sat at width>=32, so 20.0 sits ~7 sigma clear of the floor
+                                     # while staying below the 35 sigma voltage-dump trigger. Escapes are still
+                                     # subject to max_candidates_per_block + the C2 60s/100-cluster rate limiter.
+                                     # TUNE IT WITH DATA, NOT GUESSES: the new per-half counters
+                                     # c1_cands_dropped_width_total / c1_cands_width_escaped_total are published
+                                     # to /mon/search_rt/<cn>/compute/<half> -> influx. If escapes are rare and
+                                     # clean after a soak, lower toward 15.0. Set to 0 / remove to disable the
+                                     # escape (restores the hard cap).
   max_candidates_per_block: 8        # M7.6 C1->C2 metering: cap candidates shipped per cube (block).
                                      # When more than this survive the width cap in one cube, only the
                                      # top-N are sent, ordered narrow-first (width asc) then bright-first
@@ -1075,7 +1105,17 @@ inject_bot:
   dashboard_base_url: "http://localhost:5778"
   interval_s: 3600.0          # one injection per hour...
   jitter_s: 300.0             # ...plus/minus 5 min so it never beats with other cadences
-  dm_choices: [500.0, 1000.0, 1500.0, 2000.0]
+  # 2026-09-22: was [500, 1000, 1500, 2000]. The deployed DM plan now
+  # searches 150-1290, so injections at 1500/2000 are UNSEARCHABLE by
+  # construction -- they would rail at the top fine trial (1287), always
+  # be scored a miss, and post a false "missed injection" alert to Slack
+  # every miss_alert_streak=5 shots. 250/500/1000 already have
+  # /cnf/inject/snr_calibration buckets; 1250 is new and exercises the
+  # top bucket, which is where the plan is weakest. NOTE that every K in
+  # /cnf/inject/snr_calibration is stale after a DM-grid change (the
+  # residual |fine - true| moved), so the FIRST probe per bucket will
+  # land off-target before the self-calibration converges.
+  dm_choices: [250.0, 500.0, 1000.0, 1250.0]
   # Injected widths, NATIVE samples (1 native = 32.768 us). 32 x
   # {1,2,4,8,16} spans the detector boxcar octaves that C2 can actually
   # receive (1..16 search samples = 1.05..16.8 ms); 4 is the historical

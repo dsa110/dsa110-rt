@@ -62,6 +62,7 @@ def layer2_interior_sigma(
     n_sigma: float = NOISE_SIGMA_CLIP_NSIGMA_DEFAULT,
     n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
     max_samples: Optional[int] = None,
+    spatial_active: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute one interior σ_k per kernel triple from one cube's
     per-kernel score tensor.
@@ -76,6 +77,9 @@ def layer2_interior_sigma(
             ``t_hi = T_det − n_kernel_max_t // 2``.
         n_sigma / n_iterations: σ-clipped std parameters, forwarded to
             ``sigma_clipped_std``.
+        spatial_active: optional 1-D bool of length ``H*W`` marking the
+            image cells inside the edge mask; masked cells are excluded
+            from the estimate (see ``layer1.sigma_clipped_std``).
 
     Returns:
         ``[K] float32`` per-kernel interior σ_k for this cube.
@@ -101,6 +105,7 @@ def layer2_interior_sigma(
             n_iterations=n_iterations,
             max_samples=max_samples,
             rng_seed=int(k),
+            spatial_active=spatial_active,
         )
     return out
 

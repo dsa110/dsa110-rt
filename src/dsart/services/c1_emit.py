@@ -168,6 +168,24 @@ class C1EmitConfig:
     width cap of 16 strips the false-positive floor while preserving
     genuine narrow events. Configured via ``c1.max_c1c2_width_samples`` in
     ``dsart_search_rt.yaml``."""
+    max_width_snr_escape: Optional[float] = None
+    """Brightness escape for :attr:`max_width_samples`. Candidates with
+    ``snr >= max_width_snr_escape`` are shipped even if they exceed the
+    width cap. ``None`` / ``<= 0`` disables (legacy: the cap is absolute).
+
+    2026-09-22. The width cap is applied AFTER the cross-kernel merge,
+    and ``merge_across_kernels_c1`` keeps only the highest-SNR member of
+    a neighbourhood -- so once the b32 kernel wins, the b16 detection of
+    the same burst has already been suppressed and the cap discards the
+    burst outright rather than degrading it. Measured on the exact chain
+    model: the b32 kernel starts winning at W ~ 25 ms (and ~26 ms at a
+    coarse-DM bucket edge), so nothing wider than that reaches C2 at ANY
+    brightness. Empirically consistent: ``width_max`` never exceeds 16 in
+    74813 archived C2 rows, with a 13.9% pile-up exactly at 16.
+
+    The cap is still wanted -- the 2026-05-29 analysis found 95-100% of
+    the spurious candidate volume at width >= 32 -- so this admits only
+    the bright tail. Configured via ``c1.max_c1c2_width_snr_escape``."""
     max_candidates_per_block: Optional[int] = None
     """C1→C2 metering: cap the number of candidates transmitted per cube
     (block). ``None`` / ``<= 0`` disables (ship every width-survivor).

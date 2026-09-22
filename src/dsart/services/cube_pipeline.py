@@ -67,6 +67,7 @@ from ..fine_dm.combiner import combine_chgroups
 from ..image.imager import (
     apply_edge_mask,
     compute_edge_mask,
+    diagnose_edge_mask_alignment,
     dirty_image_from_uv_grid,
 )
 from ..noise_norm.layer1 import Layer1State
@@ -859,6 +860,10 @@ class CubePipeline:
         self._edge_mask = torch.from_numpy(mask_np).to(
             device=self._device, dtype=torch.float32
         )
+        # 2026-09-22: tell the σ estimators which cells this mask
+        # zeroes. The GPU path re-publishes from GpuImager's own mask
+        # below, which is the one that actually multiplies the cube.
+        self._publish_spatial_active(self._edge_mask)
         # GpuImager is built lazily on the first cube so the slot's
         # geometry can pin t_det / n_fdm when the config doesn't.
         self._gpu_imager: Optional[object] = None
@@ -974,6 +979,8 @@ class CubePipeline:
         )
         self._coverage_factor: Optional[torch.Tensor] = None
         self._coverage_factor_shifts_id: Optional[int] = None
+        # one-shot edge-mask alignment check (2026-09-22)
+        self._edge_mask_checked = False
 
         # NOTE: the fused-imager Layer-1 path bakes 1/sigma_prev[fdm]
         # into the imager kernel's per-fdm edge mask. It cannot be
@@ -1184,6 +1191,14 @@ class CubePipeline:
                 "N_grid=%d N_chgroup=%d cube_dtype=%s complex_dtype=%s)",
                 t_det_cfg, n_fdm_cfg, cfg.n_grid, n_chg,
                 cfg.cube_dtype, cfg.gpu_complex_dtype,
+            )
+            # The GpuImager builds its OWN edge mask (it passes
+            # ``drop_dc``, which the CPU-path call above leaves at the
+            # default) and that mask is what multiplies the emitted
+            # cube, so it -- not a reconstruction -- defines which cells
+            # the σ estimators must skip.
+            self._publish_spatial_active(
+                self._gpu_imager.edge_mask_real  # type: ignore[union-attr]
             )
 
         imager_cfg = self._gpu_imager.config  # type: ignore[union-attr]
@@ -1831,7 +1846,9 @@ class CubePipeline:
         # correction is disabled (the symmetric-pad path above sets
         # this on the first matching slot).
         self._ensure_coverage_factor(staged.shifts_t, int(cube.shape[0]))
-        return _clamp_inf_to_finite(cube)
+        cube = _clamp_inf_to_finite(cube)
+        self._maybe_check_edge_mask_alignment(cube)
+        return cube
 
     def _verify_full_coverage_or_raise(
         self,
@@ -1884,6 +1901,86 @@ class CubePipeline:
             int(offset), int(t_stream),
             int(shifts_t.min().item()), int(shifts_t.max().item()),
         )
+
+    def _publish_spatial_active(self, mask: torch.Tensor) -> None:
+        """Hand the σ estimators the edge mask's active-cell map.
+
+        2026-09-22.  ``apply_edge_mask`` MULTIPLIES the cube by a 0/1
+        mask, so the masked cells reach ``sigma_clipped_std`` as exact
+        zeros even though that estimator is written to be NaN-aware.
+        Measured on a real cube: σ = 1.0074 with the 6.164% masked cells
+        in, 1.0499 with them out -- σ 4.05% low, so every reported SNR
+        was 4.2% high.  (``c1.snr_min`` was moved 11.0 -> 10.55 at the
+        same time to hold the true operating point; the two are a
+        matched pair.)
+
+        Taken from the mask object itself rather than recomputed, so a
+        divergence between this map and the mask that actually zeroes
+        the cube is not possible.  Note the mask is ``±1`` in the
+        interior when the ifft2 DC correction is on, hence ``!= 0``.
+        """
+        try:
+            active = (mask != 0).reshape(-1).contiguous()
+            if self.layer1_state is not None:
+                self.layer1_state.set_spatial_active(active)
+            if self.detector is not None:
+                self.detector.set_spatial_active(active)
+            _LOG.info(
+                "CubePipeline: σ estimators will skip %d/%d masked image "
+                "cells (%.4f of the plane)",
+                int((~active).sum()), int(active.numel()),
+                float((~active).to(torch.float32).mean()),
+            )
+        except Exception:                                   # noqa: BLE001
+            # Never block startup over a noise-normalisation refinement;
+            # the legacy behaviour (masked zeros included) still works.
+            _LOG.warning(
+                "could not publish the edge-mask active map; σ will "
+                "include the masked zeros (4%% low)", exc_info=True,
+            )
+
+    def _maybe_check_edge_mask_alignment(self, cube: torch.Tensor) -> None:
+        """One-shot: does the emitted cube's zero pattern match the mask?
+
+        2026-09-22.  The sensitivity audit found the realised zero
+        pattern in dumped cubes is the intended edge mask displaced by
+        +10 elements in row-major order, which kills eight INTERIOR
+        image columns and leaves the true l-axis border unmasked.  The
+        cause is not visible in the Python buffers (all fresh and
+        contiguous), so this measures the offset on the first cube
+        instead of guessing.  Runs once per process; ~1 ms.
+        """
+        if self._edge_mask_checked:
+            return
+        self._edge_mask_checked = True
+        try:
+            if self._gpu_imager is None or cube.dim() != 4:
+                return
+            plane = cube[0, 0].detach().to(torch.float32).cpu().numpy()
+            mask = self._gpu_imager.edge_mask_real.detach().to(
+                torch.float32).cpu().numpy()
+            off, n_bad = diagnose_edge_mask_alignment(plane == 0.0, mask)
+            if off == 0 and n_bad == 0:
+                _LOG.info(
+                    "edge-mask alignment OK: emitted zero pattern matches "
+                    "the intended mask exactly (%d zero cells, %.4f of "
+                    "the plane)",
+                    int((plane == 0.0).sum()),
+                    float((plane == 0.0).mean()),
+                )
+            else:
+                _LOG.error(
+                    "EDGE-MASK MISALIGNED: emitted zero pattern matches the "
+                    "intended mask displaced by %+d elements in row-major "
+                    "order (%d/%d cells still disagree at that offset). "
+                    "Dead cells: %.4f of the plane. Interior columns are "
+                    "being zeroed and the true border is not. See "
+                    "image/imager.py::diagnose_edge_mask_alignment.",
+                    int(off), int(n_bad), int(plane.size),
+                    float((plane == 0.0).mean()),
+                )
+        except Exception:                                   # noqa: BLE001
+            _LOG.warning("edge-mask alignment check failed", exc_info=True)
 
     def _ensure_coverage_factor(
         self,

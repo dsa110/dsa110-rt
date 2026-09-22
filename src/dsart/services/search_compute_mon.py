@@ -153,6 +153,8 @@ class SearchComputeMonPublisher:
         dropped_max: int,
         cands_sum: int,
         cap: int,
+        width_dropped_total: int = 0,
+        width_escaped_total: int = 0,
     ) -> bool:
         """Average the window counters and publish the rollup.
 
@@ -171,6 +173,12 @@ class SearchComputeMonPublisher:
             "c1_metered_dropped_max": int(dropped_max),
             "c1_cands_per_block_mean": round(float(cands_sum) / float(n), 3),
             "c1_max_candidates_per_block": int(cap),
+            # 2026-09-22: surface the C1->C2 width-cap counters. These
+            # were already tracked in mon_snapshot() but never published,
+            # so the drop rate -- exactly the number needed to price the
+            # brightness escape -- was not observable from outside.
+            "c1_cands_dropped_width_total": int(width_dropped_total),
+            "c1_cands_width_escaped_total": int(width_escaped_total),
             "n_blocks": int(n_blocks),
             "ts_mono": time.monotonic(),
             "ts_wall_unix": time.time(),

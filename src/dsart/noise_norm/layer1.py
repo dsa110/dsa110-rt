@@ -129,6 +129,7 @@ def sigma_clipped_std(
     n_iterations: int = NOISE_SIGMA_CLIP_N_ITERATIONS_DEFAULT,
     max_samples: Optional[int] = None,
     rng_seed: int = 0,
+    spatial_active: Optional[torch.Tensor] = None,
 ) -> float:
     """Compute the σ-clipped robust standard deviation of ``x``.
 
@@ -162,6 +163,18 @@ def sigma_clipped_std(
             Default None preserves chunk-1 behaviour (full input).
         rng_seed: seed for the subsample RNG. Same value → same
             subsample for a given input shape.
+        spatial_active: optional 1-D bool of length ``H*W`` marking the
+            image cells INSIDE the edge mask. When given, cells outside
+            it are turned into NaN (which this estimator already drops)
+            so the mask's identically-zero cells cannot drag σ down.
+            The last two axes of ``x`` must be the image axes.
+
+            2026-09-22: ``imager.apply_edge_mask`` MULTIPLIES by a 0/1
+            mask, so masked cells reach the estimator as exact zeros and
+            the documented NaN-exclusion path never fires. Measured on a
+            real cube: σ_clip = 1.0074 with the 6.164% masked cells in,
+            1.0499 with them out — σ 4.05% low, so every reported SNR
+            was 4.2% high.
 
     Returns:
         ``float`` σ-clipped std. Returns 0.0 on an all-NaN or
@@ -172,6 +185,7 @@ def sigma_clipped_std(
         return 0.0
 
     flat = x.reshape(-1)
+    n_sp = None if spatial_active is None else int(spatial_active.numel())
 
     if max_samples is not None and flat.numel() > int(max_samples):
         gen = torch.Generator(device=flat.device)
@@ -180,7 +194,22 @@ def sigma_clipped_std(
             0, flat.numel(), (int(max_samples),),
             device=flat.device, generator=gen,
         )
-        flat = flat[idx]
+        samples = flat[idx]
+        if n_sp is not None:
+            flat = _nan_out_inactive(
+                samples, spatial_active[idx % n_sp]
+            )
+        else:
+            flat = samples
+    elif n_sp is not None and flat.numel() % n_sp == 0:
+        flat = _nan_out_inactive(
+            flat, spatial_active.repeat(flat.numel() // n_sp)
+        )
+    # If the input does not divide by H*W the image axes are not last and
+    # we cannot say which samples are masked, so the mask is skipped
+    # rather than mis-applied. Deliberately silent: this is a hot leaf on
+    # the real-time path, and every production caller
+    # (layer2_interior_sigma, Layer1State) passes [..., H, W].
     # Dispatch through the batched primitive so the scalar path and
     # the batched-per-fdm path share one σ-clip implementation.
     sigmas = sigma_clipped_std_batched(
@@ -189,6 +218,22 @@ def sigma_clipped_std(
         n_iterations=n_iterations,
     )
     return float(sigmas[0].item())
+
+
+def _nan_out_inactive(
+    samples: torch.Tensor,
+    active: torch.Tensor,
+) -> torch.Tensor:
+    """Replace samples outside the edge mask with NaN.
+
+    The σ-clip estimators are NaN-aware, so this is how masked cells are
+    excluded without changing the cube the detector sums over (which
+    must keep them at exactly zero).
+    """
+    nan = torch.tensor(
+        float("nan"), dtype=samples.dtype, device=samples.device
+    )
+    return torch.where(active, samples, nan)
 
 
 def layer1_global_scalar(
@@ -323,6 +368,7 @@ class Layer1State:
         max_samples: Optional[int] = None,
         rng_seed: int = 0,
         sigma_floor: float = 0.0,
+        spatial_active: Optional[torch.Tensor] = None,
     ) -> None:
         if n_fdm < 1:
             raise ValueError(f"n_fdm={n_fdm}, expected ≥ 1")
@@ -351,6 +397,11 @@ class Layer1State:
         # false positives without affecting steady-state detection.
         # Default 0.0 ⇒ disabled (preserves legacy semantics).
         self.sigma_floor = float(sigma_floor)
+        # 2026-09-22: image cells INSIDE the edge mask. Masked cells
+        # arrive as exact zeros (apply_edge_mask multiplies by 0/1), so
+        # without this they bias σ 4% low -- see sigma_clipped_std.
+        self.spatial_active: Optional[torch.Tensor] = spatial_active
+        self._subsample_active: Optional[torch.Tensor] = None
         # Per-fdm sigma history: deque of length ≤ n_burnin_cubes.
         self._history: list[Deque[float]] = [
             deque(maxlen=self.n_burnin_cubes) for _ in range(self.n_fdm)
@@ -362,6 +413,21 @@ class Layer1State:
         # lifetime, not per cube.
         self._subsample_idx: Optional[torch.Tensor] = None
         self._subsample_key: Optional[Tuple[int, int, int, int, str]] = None
+
+    def set_spatial_active(
+        self,
+        active: Optional[torch.Tensor],
+    ) -> None:
+        """Register the image cells INSIDE the edge mask (1-D bool of
+        length ``H*W``) so σ excludes the mask's identically-zero cells.
+
+        Published by ``CubePipeline`` from the imager's own mask once
+        that mask exists, which is why this is a setter and not only a
+        constructor argument. Invalidates the cached subsample map.
+        """
+        self.spatial_active = active
+        self._subsample_active = None
+        self._subsample_key = None
 
     @property
     def cube_count(self) -> int:
@@ -434,16 +500,30 @@ class Layer1State:
                     )
                 self._subsample_idx = flat_idx
                 self._subsample_key = key
+                self._subsample_active = (
+                    None if self.spatial_active is None
+                    else self.spatial_active.to(device)[
+                        flat_idx % (int(H) * int(W))
+                    ]
+                )
             samples = _gather_samples_per_fdm(
                 cube, self._subsample_idx,
                 T_det=int(T_det), H=int(H), W=int(W),
             )
+            if self._subsample_active is not None:
+                samples = _nan_out_inactive(samples, self._subsample_active)
         else:
             samples = (
                 cube.permute(1, 0, 2, 3)
                 .contiguous()
                 .view(self.n_fdm, n_per_fdm)
             )
+            if self.spatial_active is not None:
+                act = self.spatial_active.to(samples.device)
+                samples = _nan_out_inactive(
+                    samples,
+                    act.repeat(int(T_det)).view(1, -1).expand_as(samples),
+                )
         return sigma_clipped_std_batched(
             samples,
             n_sigma=self.n_sigma,

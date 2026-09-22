@@ -594,6 +594,11 @@ class DeterministicDetector(torch.nn.Module):
         # indices into the interior slab.
         self._layer2_idx: Optional[torch.Tensor] = None
         self._layer2_idx_key: Optional[Tuple] = None
+        self._layer2_active: Optional[torch.Tensor] = None
+        # Image cells INSIDE the edge mask (1-D bool of length H*W), set
+        # by the owner via ``set_spatial_active``. None => legacy
+        # behaviour (masked zeros included in σ_k, 4% low).
+        self.spatial_active: Optional[torch.Tensor] = None
         # Optional override of the cumsum accumulation dtype for the
         # amortise fast-path. Default ``None`` preserves the chunk-8
         # behaviour (``fp32`` accum when ``cube.dtype`` is ``fp16``/
@@ -801,6 +806,24 @@ class DeterministicDetector(torch.nn.Module):
     def merger_config(self) -> Optional[MergerConfig]:
         """C1 merger geometry (``None`` ⇒ legacy axis-AND merger)."""
         return self._merger_config
+
+    def set_spatial_active(
+        self,
+        active: Optional["torch.Tensor"],
+    ) -> None:
+        """Register the image cells INSIDE the edge mask (1-D bool
+        of length ``N_grid**2``), so the Layer-2 σ_k estimator drops
+        them instead of counting them as real zeros.
+
+        2026-09-22: ``apply_edge_mask`` multiplies the cube by a 0/1
+        mask, so 6.164% of every cube reaches the estimators as exact
+        zeros and pulls σ_k 4.05% low -- every reported SNR was 4.2%
+        high. ``None`` restores the legacy behaviour.
+        """
+        self.spatial_active = active
+        # invalidate the cached subsample-active map
+        self._layer2_active = None
+        self._layer2_idx_key = None
 
     @property
     def c1_snr_min(self) -> Optional[float]:
@@ -1425,6 +1448,19 @@ class DeterministicDetector(torch.nn.Module):
                     )
                 self._layer2_idx = idx_stack
                 self._layer2_idx_key = l2_key
+                # 2026-09-22: mark which of the cached subsample cells
+                # lie INSIDE the image-plane edge mask. Masked cells are
+                # exactly zero in the cube (apply_edge_mask multiplies
+                # by 0/1) and so pull σ_k down; NaN-ing them here lets
+                # the NaN-aware σ-clip drop them. The interior slab's
+                # last two axes are the image axes, so the spatial cell
+                # of a flat index is ``idx % (H*W)``.
+                self._layer2_active = (
+                    None if self.spatial_active is None
+                    else self.spatial_active.to(cube.device)[
+                        idx_stack % int(self.spatial_active.numel())
+                    ]
+                )
             sigma_samples = torch.empty(
                 (K, m_l2), dtype=torch.float32, device=cube.device,
             )
@@ -1649,11 +1685,30 @@ class DeterministicDetector(torch.nn.Module):
             if layer2_subsample_active:
                 # int64 fancy-index gather; upcast on read so the
                 # ``sigma_samples`` buffer is already fp32.
-                sigma_samples[k_idx] = flat_interior[
+                _smp = flat_interior[
                     self._layer2_idx[k_idx]
                 ].to(torch.float32)
+                if self._layer2_active is not None:
+                    _smp = torch.where(
+                        self._layer2_active[k_idx], _smp,
+                        torch.tensor(float("nan"), dtype=_smp.dtype,
+                                     device=_smp.device),
+                    )
+                sigma_samples[k_idx] = _smp
             else:
-                sigma_full[k_idx] = flat_interior.to(torch.float32)
+                _full = flat_interior.to(torch.float32)
+                if self.spatial_active is not None:
+                    n_sp = int(self.spatial_active.numel())
+                    if _full.numel() % n_sp == 0:
+                        _act = self.spatial_active.to(_full.device).repeat(
+                            _full.numel() // n_sp
+                        )
+                        _full = torch.where(
+                            _act, _full,
+                            torch.tensor(float("nan"), dtype=_full.dtype,
+                                         device=_full.device),
+                        )
+                sigma_full[k_idx] = _full
 
             s_k_scalar = float(s_k_decode[k_idx].item())
             if s_k_scalar == 0.0:
