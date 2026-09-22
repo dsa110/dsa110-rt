@@ -788,6 +788,52 @@ def panels() -> List[Dict[str, Any]]:
     ))
     _bump_y(7)
 
+    # ----- 2026-09-22 C1->C2 width cap + brightness escape -----
+    # The cap (c1.max_c1c2_width_samples = 16) is applied AFTER the
+    # cross-kernel merge, so a W >~ 25 ms burst wins the merge in a wide
+    # boxcar and is then discarded AT ANY BRIGHTNESS. The escape
+    # (c1.max_c1c2_width_snr_escape = 20.0) admits the bright tail.
+    # These two panels are how the escape gets priced: both counters are
+    # cumulative per half, so plot the derivative.
+    out.append(graph_panel(
+        title="C1->C2 width cap -- candidates dropped/s per half (width > cap)",
+        raw_query=(
+            'SELECT derivative(max("c1_cands_dropped_width_total"), 1s) '
+            'FROM "search_rt_compute" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Rate at which the absolute C1->C2 width cap "
+            "(c1.max_c1c2_width_samples = 16) is discarding candidates "
+            "before transmit. The cap exists because 95-100% of the "
+            "spurious candidate volume sat at width >= 32 (2026-05-29), "
+            "so a steady background here is expected and healthy. A step "
+            "change means the wide-boxcar RFI floor moved."
+        ),
+    ))
+    out.append(graph_panel(
+        title="C1->C2 width ESCAPE -- bright wide candidates passed/s per half",
+        raw_query=(
+            'SELECT derivative(max("c1_cands_width_escaped_total"), 1s) '
+            'FROM "search_rt_compute" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=12, x=12, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "Candidates WIDER than the cap that were shipped anyway "
+            "because snr >= c1.max_c1c2_width_snr_escape (20.0). This is "
+            "the knob's price tag. Expected near 0: the worst sustained "
+            "on-sky RFI floor on record topped out at snr 12.92, well "
+            "below 20. If this stays at 0 for a soak the escape can come "
+            "down toward 15.0; if it floods, raise it back. Every escape "
+            "is a burst that was previously invisible at any brightness."
+        ),
+    ))
+    _bump_y(7)
+
     # ----- T1 (2026-06-07) Layer-2 sigma_k EMA noise health -----
     out.append(row_panel(
         "C2. Detector noise health (Layer-2 sigma_k EMA, T1 2026-06-07)"

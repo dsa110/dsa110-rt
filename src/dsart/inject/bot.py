@@ -117,10 +117,29 @@ WIDTH_BUCKET_INFIX = "@w"
 NATIVE_PER_SEARCH_SAMPLE = 32
 
 #: C1->C2 width cap (configs/dsart_search_rt.yaml
-#: ``c1c2.max_c1c2_width_samples``, SEARCH samples): candidates wider
-#: than this are dropped before transmission to C2. Injecting above it
-#: is a guaranteed miss, so the bot refuses such widths.
+#: ``c1.max_c1c2_width_samples``, SEARCH samples): candidates wider
+#: than this are dropped before transmission to C2, so the bot refuses
+#: such widths -- see the escape caveat below.
 MAX_C1C2_WIDTH_SEARCH_SAMPLES = 16
+
+#: Brightness escape on that cap (``c1.max_c1c2_width_snr_escape``,
+#: added 2026-09-22). Mirrored here the same way the cap is.
+#:
+#: The cap is no longer absolute: a candidate WIDER than the cap is
+#: shipped anyway if its SNR reaches this. So "wider than the cap" is
+#: no longer a guaranteed miss -- it is a guaranteed miss only BELOW
+#: this threshold.
+#:
+#: The bot still refuses wide widths, because its target-SNR window is
+#: 15-25 and only its top half clears 20: a wide injection would be
+#: recovered or missed depending on where in the window the draw landed,
+#: which is useless as a health signal and would trip miss_alert_streak.
+#: Consequence worth knowing: NOTHING currently exercises the escape on
+#: sky. Validating it needs a wide width AND target_snr_min raised above
+#: this value, which is an injection-campaign decision (each new (DM,
+#: width) pair carries its own measured K, so it is not free).
+#: Keep in step with the deployed yaml.
+C1C2_WIDTH_SNR_ESCAPE = 20.0
 
 #: Default injected widths, NATIVE samples. 32 x {1,2,4,8,16} spans the
 #: shippable detector boxcar octaves (1..16 search samples = 1.05..16.8
@@ -191,9 +210,13 @@ def _parse_width_choices(d: Mapping[str, Any]) -> Tuple[int, ...]:
     and no ``width_choices`` keeps the old single-width behaviour.
 
     Widths implying a detector boxcar wider than
-    :data:`MAX_C1C2_WIDTH_SEARCH_SAMPLES` are DROPPED with a warning:
-    ``c1c2`` discards those candidates before they reach C2, so
-    injecting there would only manufacture guaranteed misses.
+    :data:`MAX_C1C2_WIDTH_SEARCH_SAMPLES` are DROPPED with a warning.
+    Since 2026-09-22 that cap has a brightness escape
+    (:data:`C1C2_WIDTH_SNR_ESCAPE`), so such a width is only a
+    guaranteed miss BELOW that SNR -- and the bot's 15-25 target window
+    straddles it, which would make recovery a coin flip rather than a
+    health signal. They stay dropped for that reason, not because C2
+    can never see them.
     """
     raw = d.get("width_choices")
     if raw is None:
@@ -208,9 +231,13 @@ def _parse_width_choices(d: Mapping[str, Any]) -> Tuple[int, ...]:
         if search_samples(w) > MAX_C1C2_WIDTH_SEARCH_SAMPLES:
             LOG.warning(
                 "inject_bot: dropping width_choices entry %d native "
-                "(~%.0f search samples): above the C1->C2 cap of %d, so "
-                "C2 would never see it",
-                w, search_samples(w), MAX_C1C2_WIDTH_SEARCH_SAMPLES)
+                "(~%.0f search samples): above the C1->C2 cap of %d. "
+                "C2 would only see it if it landed at SNR >= %.1f (the "
+                "brightness escape), and the target window is %s, so "
+                "recovery would be a coin flip rather than a health "
+                "signal",
+                w, search_samples(w), MAX_C1C2_WIDTH_SEARCH_SAMPLES,
+                C1C2_WIDTH_SNR_ESCAPE, "15-25 by default")
             continue
         out.append(w)
     if not out:

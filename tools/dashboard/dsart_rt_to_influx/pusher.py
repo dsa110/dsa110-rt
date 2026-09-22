@@ -960,6 +960,15 @@ _SEARCH_COMPUTE_INT_FIELDS = (
     "c1_metering_active",
     "c1_metered_dropped_max",
     "c1_max_candidates_per_block",
+    # 2026-09-22: the C1→C2 width-cap counters. Cumulative per half, so
+    # plot them as a derivative. These are what prices
+    # ``c1.max_c1c2_width_snr_escape``: *_dropped_width_total is how many
+    # candidates the absolute cap is still throwing away, and
+    # *_width_escaped_total is how many the brightness escape let
+    # through. If escapes stay rare and clean the escape can come down
+    # from 20.0 toward 15.0; if they flood, it goes back up.
+    "c1_cands_dropped_width_total",
+    "c1_cands_width_escaped_total",
     "n_blocks",
 )
 _SEARCH_COMPUTE_FLOAT_FIELDS = (

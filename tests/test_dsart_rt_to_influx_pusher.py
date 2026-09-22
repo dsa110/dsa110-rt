@@ -971,6 +971,8 @@ SEARCH_COMPUTE_N02_G0 = {
     "c1_metered_dropped_max": 8,
     "c1_cands_per_block_mean": 10.0,
     "c1_max_candidates_per_block": 8,
+    "c1_cands_dropped_width_total": 4213,
+    "c1_cands_width_escaped_total": 2,
     "n_blocks": 16,
     "ts_wall_unix": 1769000000.0,
     "host": "lxd110h02",
@@ -998,6 +1000,27 @@ def test_make_search_compute_points_fields_and_tags():
     line = p.to_line()
     assert "c1_metering_active=1i" in line
     assert "c1_metering_frac=0.25" in line
+
+
+def test_make_search_compute_points_forwards_width_cap_counters():
+    """2026-09-22. ``_SEARCH_COMPUTE_INT_FIELDS`` is an ALLOWLIST, so a
+    counter that is published to etcd but not listed there is silently
+    dropped before Influx and never reaches Grafana.
+
+    These two are what price ``c1.max_c1c2_width_snr_escape``: the cap
+    is applied after the cross-kernel merge, so wide bursts were being
+    discarded at any brightness, and the escape's cost cannot be judged
+    without seeing how often it fires.
+    """
+    p = pusher.make_search_compute_points(
+        SEARCH_COMPUTE_N02_G0, cn_id=2, gpu_half=0,
+        coarse_dm_owner={(2, 0): 4},
+    )[0]
+    assert p.fields["c1_cands_dropped_width_total"] == 4213
+    assert p.fields["c1_cands_width_escaped_total"] == 2
+    line = p.to_line()
+    assert "c1_cands_dropped_width_total=4213i" in line
+    assert "c1_cands_width_escaped_total=2i" in line
 
 
 def test_make_search_compute_points_empty_payload_drops():

@@ -1124,9 +1124,15 @@ inject_bot:
   # every pair is visited about once a day at one shot/hour.
   #
   # Widths above the c1c2 cap (max_c1c2_width_samples = 16 search
-  # samples = 512 native) are dropped at config load with a warning:
-  # C2 never receives those candidates, so injecting there would only
-  # manufacture guaranteed misses.
+  # samples = 512 native) are dropped at config load with a warning.
+  # 2026-09-22: that cap now has a brightness escape
+  # (max_c1c2_width_snr_escape = 20.0), so above-cap is a guaranteed
+  # miss only BELOW 20 sigma. They stay dropped anyway because the
+  # target window below is 15-25 and only its top half clears 20 --
+  # recovery would be a coin flip, not a health signal, and would trip
+  # miss_alert_streak. CONSEQUENCE: nothing exercises the escape on sky.
+  # Validating it needs a wide width AND target_snr_min > 20; each new
+  # (DM, width) pair carries its own measured K, so that is not free.
   #
   # K IS WIDTH-DEPENDENT and each width carries its own measured K
   # (bucket dmNNNN@wWWWW; the reference width keeps the bare dmNNNN).
@@ -1134,7 +1140,9 @@ inject_bot:
   # against 2890 at w=4 -- a factor ~3 where the sqrt(width) model
   # predicts equality -- so nothing is extrapolated across widths.
   width_choices: [4, 32, 64, 128, 256, 512]
-  # Target SNR window: comfortably above the 12-sigma C1 floor, and below
+  # Target SNR window: comfortably above the C1 floor (c1.snr_min, now
+  # 10.55 after the 2026-09-22 sigma fix -- it was 11.0, and 12.0 when
+  # this window was chosen; the TRUE threshold has not moved), and below
   # the dashboard's 30-sigma-predicted brightness guard even with the
   # ~25% pixel-straddle scatter. The bot never passes allow_bright.
   target_snr_min: 15.0
