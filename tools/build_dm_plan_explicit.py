@@ -45,7 +45,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from build_dm_plan import (  # noqa: E402
     _git_sha,
-    _load_t_int_search_us,
     build_partition,
     build_time_shifts,
     compute_dm_overlap_coarse,
@@ -58,7 +57,7 @@ from dsart.common.constants import (  # noqa: E402
     N_CHAN_PROC_NATIVE,
     NU_BOT_PROC_GHZ,
     NU_TOP_PROC_GHZ,
-    T_INT_FAST_US_DEFAULT,
+    NATIVE_SAMPLE_US,
 )
 from dsart.common.contracts import DmPlan  # noqa: E402
 
@@ -225,18 +224,48 @@ def main(argv: list[str] | None = None) -> int:
                    help="comma-separated per-bucket offsets (pc/cm3) applied "
                         "to the bucket centres; default all zero")
     p.add_argument("--chan-sum-factor", type=int, default=8)
-    p.add_argument("--t-int-fast-us", type=float,
-                   default=T_INT_FAST_US_DEFAULT)
-    p.add_argument("--t-int-search-us", type=float, default=None)
+    # 2026-09-22: these are REQUIRED, with no defaults, and that is
+    # deliberate. The first build of the 150-1290 plan took
+    # T_INT_FAST_US_DEFAULT (8 native = 262.144 us) and the
+    # operating_points.yaml default (O-4, 524.288 us) -- both STALE
+    # relative to the fleet, which runs --t-int-fast-native 32 and
+    # --t-int-search-us 1048.576. The DM values are explicit so they
+    # were fine, but all three shift tables were built against the
+    # wrong sample period, and corr_fast refused the plan on every corr
+    # node with "DMPlan.t_int_fast_native=8.0 does not match
+    # cfg.t_int_fast_native=32", leaving the pipeline stuck in
+    # PREPARING. Read the two values off the DEPLOYED argv
+    # (configs/dsart_pipeline_rt.yaml corr_fast --t-int-fast-native,
+    # configs/dsart_search_rt.yaml search_compute --t-int-search-us),
+    # never off a repo default.
+    p.add_argument("--t-int-fast-native", type=int, required=True,
+                   help="fast-vis integration depth in NATIVE samples; MUST "
+                        "equal corr_fast's --t-int-fast-native (32 on the "
+                        "fleet). No default on purpose.")
+    p.add_argument("--t-int-search-us", type=float, required=True,
+                   help="search sample period in us; MUST equal "
+                        "search_compute's --t-int-search-us (1048.576 on the "
+                        "fleet). No default on purpose.")
     a = p.parse_args(argv)
-    t_search = (a.t_int_search_us if a.t_int_search_us is not None
-                else _load_t_int_search_us(REPO_ROOT))
+    t_search = float(a.t_int_search_us)
+    t_fast = float(a.t_int_fast_native) * NATIVE_SAMPLE_US
     offs = (None if a.coarse_offsets is None
             else np.array([float(x) for x in a.coarse_offsets.split(",")]))
     plan = build_explicit(
         a.dm_min, a.dm_max, a.n_coarse, a.n_fine_per_coarse, a.beta, offs,
-        a.t_int_fast_us, t_search, a.chan_sum_factor,
+        t_fast, t_search, a.chan_sum_factor,
     )
+    # Fail here rather than on 16 corr nodes: this is the exact pin
+    # corr_fast_integration.build_context applies (F33 + the
+    # t_int_fast_native check just below it).
+    got = float(plan.metadata["t_int_fast_us"]) / NATIVE_SAMPLE_US
+    if abs(got - float(a.t_int_fast_native)) > 1e-6:
+        raise SystemExit(
+            f"refusing to write: plan t_int_fast_native={got} != requested "
+            f"{a.t_int_fast_native}"
+        )
+    if int(plan.metadata["chan_sum_factor"]) != int(a.chan_sum_factor):
+        raise SystemExit("refusing to write: chan_sum_factor mismatch")
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     plan.to_npz(str(out))
