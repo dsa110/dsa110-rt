@@ -62,6 +62,28 @@ routines:
   # pattern_id per chgroup, but we run with no expected_pattern_id
   # registered so every frame is accepted. Production M7.4+ will load
   # a JSON file via --pattern-id-file.
+  #
+  # SUB-BAND STREAMS (2026-09-23, corr_fast --n-sub 4). Each corr node
+  # now grids its chgroup as 4 sub-band uv planes and ships each as its
+  # own stream (id = chgroup*4 + s), so the ring carries 64 streams and
+  # the search shifts every sub-band separately: the intra-chgroup DM
+  # smear no fine trial can undo drops from ~3.2 to ~0.8 samples.
+  # Measured end-to-end on the real corr stage-1 + stage-2 + search
+  # shift code (tests/test_subband_e2e.py): recovered S/N x1.146 mean,
+  # flat across each coarse bucket instead of falling ~30% at its edges.
+  # Values that MUST move together (all three routines, lock-step):
+  #   --n-corr 64            = 16 chgroups * --n-sub 4
+  #   --n-filled 2600        max sub-band pattern is ~2200 cells (vs
+  #                          3424 whole-chgroup); search_compute
+  #                          refuses to start if any pattern exceeds it
+  #   --t-buf-samples 6144   ring = 64*8*6144*2600*2 B = 15.2 GiB, and
+  #                          the overrun horizon 6144-4*256 = 5120 stays
+  #                          above the 20-cube (3840) real-time re-seek,
+  #                          the same ordering as the old 8192/16 ring
+  #   --fan-in-min-corrs 60  = 15 of 16 corr nodes, as before
+  #   --n-sub 4, --combine-impl compact  (search_compute only)
+  # recv_epoll.c must be rebuilt (MAX_CHGROUPS 16 -> 64). Revert = the
+  # 16 / 8192 / 5000 / 15 values and drop the two flags, on both sides.
   - name: search_rx
     cmd: python
     # 2026-06-09: stagger spawn so search_rx finishes its 10.5 GiB
@@ -75,8 +97,8 @@ routines:
       --port-base 6625 --n-ports 16
       --so-rcvbuf-bytes 268435456
       --shm-name /dsart-rxring-CN
-      --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 8192 --n-filled 5000
+      --n-corr 64 --n-coarse-dm 8
+      --t-buf-samples 6144 --n-filled 2600
       --bytes-per-cell 2
       --status-interval-s 5.0
       --log-level INFO
@@ -242,14 +264,14 @@ routines:
     args: >-
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
-      --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 8192 --n-filled 5000
+      --n-corr 64 --n-coarse-dm 8
+      --t-buf-samples 6144 --n-filled 2600
       --bytes-per-cell 2
       --n-fdm 25 --t-det 256 --n-grid 256
       --cube-cadence-samples 192
       --t-int-search-us 1048.576
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_dmmax1500_tol1.265_csf8_explicit-v2.npz
-      --fan-in-min-corrs 15
+      --fan-in-min-corrs 60
       --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
       --coarse-dm-owners-half-1 1
@@ -276,6 +298,8 @@ routines:
       --kernel-support 1
       --chan-sum-factor 8
       --cell-lambda-mode tee45
+      --n-sub 4
+      --combine-impl compact
     hostargs:
       # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
       # per-host C1 trigger-listener bind addresses (M7.4). The
@@ -331,14 +355,14 @@ routines:
     args: >-
       -u -m dsart.services.search_compute
       --shm-name /dsart-rxring-CN
-      --n-corr 16 --n-coarse-dm 8
-      --t-buf-samples 8192 --n-filled 5000
+      --n-corr 64 --n-coarse-dm 8
+      --t-buf-samples 6144 --n-filled 2600
       --bytes-per-cell 2
       --n-fdm 25 --t-det 256 --n-grid 256
       --cube-cadence-samples 192
       --t-int-search-us 1048.576
       --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_dmmax1500_tol1.265_csf8_explicit-v2.npz
-      --fan-in-min-corrs 15
+      --fan-in-min-corrs 60
       --n-active-dms-per-corr 2
       --coarse-dm-owners-half-0 0
       --coarse-dm-owners-half-1 1
@@ -349,6 +373,8 @@ routines:
       --kernel-support 1
       --chan-sum-factor 8
       --cell-lambda-mode tee45
+      --n-sub 4
+      --combine-impl compact
       --detector-streaming-tile-size 256
       --detector-streaming-decoder-n-top 24
       --detector-boxcar-accum-dtype fp16
