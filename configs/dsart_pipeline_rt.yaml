@@ -565,6 +565,32 @@ routines:
   # NB: everything under `args: >-` is a FOLDED SCALAR. A '#' there is
   # NOT a comment -- it becomes a literal argv entry. Comments about
   # the flags belong here, above the routine.
+  #
+  # DM PLAN (2026-09-23). dm_plan_N8_dmmin100_dmmax1500_tol1.265: 8
+  # coarse x 25 fine = 200 trials over DM 103-1496, bucket widths on a
+  # beta=0.05 ramp. Built to track gen_dmtrials.py at tol 1.30 as
+  # closely as the fixed-n_fine-per-bucket schema allows: realised step
+  # 5.96..8.04 pc/cm3 against Levin's 6.25..8.63 at the same DMs, i.e.
+  # within 7% everywhere (beta=0.10 was within 19%, beta=0 within 21%).
+  #
+  #   python tools/build_dm_plan_explicit.py \
+  #     --out .../dm_plan_N8_dmmin100_dmmax1500_tol1.265_csf8_explicit-v2.npz \
+  #     --dm-min 100 --dm-max 1500 --n-coarse 8 --n-fine-per-coarse 25 \
+  #     --beta 0.05 --chan-sum-factor 8 \
+  #     --t-int-fast-native 32 --t-int-search-us 1048.576
+  #
+  # Trade vs the previous 150-1290 / 34-fine plan: peak recovered S/N is
+  # x0.941 at W=1 ms, because n_coarse is pinned at 8 by the v2 plan
+  # schema (build_dm_plan.build_partition requires n_coarse ==
+  # N_SEARCH * N_SEARCH_GPU) so a wider range means wider buckets and
+  # more INTRA-CHGROUP smear -- 3.18 samples mean, up from 2.93, and no
+  # fine trial can undo it. Bought with: DM range 103-1496 instead of
+  # 150-1290, 200 trials instead of 272 (26% less search-node work on a
+  # fleet running ~8% behind), and a fine step back in the 6-8 pc/cm3
+  # band that c1.merger.dm_max_trials=2 was tuned for.
+  #
+  # n_pre=14 on voltage_retention still covers this: tau_sweep(1496) =
+  # 0.85 s = 7 blocks. Unchanged.
   - name: corr_fast
     cmd: python
     args: >-
@@ -589,7 +615,7 @@ routines:
       --rfi-array-burst-mode flag
       --rfi-ab-bin-mode monitor
       --t-int-fast-native 32
-      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin150_dmmax1290_tol1.238_csf8_explicit-v2.npz
+      --dm-plan-path /home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_dmmax1500_tol1.265_csf8_explicit-v2.npz
       --chan-sum-factor 8
       --cell-lambda-mode tee45
       --sliding-window
