@@ -4087,6 +4087,20 @@ def run(
         if sky_export_url:
             from dsart.services.sky_export import SkySnapshotExporter
             pat_sky = ctx.gridder.pattern
+            sky_ix_row, sky_ix_col = pat_sky.ix_row, pat_sky.ix_col
+            # n_sub > 1: the static-sky cells are the sub-band patterns
+            # concatenated, so ship their indices in the same order. A
+            # grid cell filled by several sub-bands appears once per
+            # sub-band; the h23 combine np.add.at's them back together.
+            _sky_layout = getattr(
+                getattr(ctx, "multi_dm_coarse_dm", None),
+                "subband_layout", None,
+            )
+            if _sky_layout is not None:
+                sky_ix_row = np.concatenate(
+                    [p.ix_row for p in _sky_layout.patterns])
+                sky_ix_col = np.concatenate(
+                    [p.ix_col for p in _sky_layout.patterns])
             # amp_scale: median |G| of this chgroup's cal solutions.
             # phase_only cal leaves the instrumental gain magnitudes in
             # the vis; h23 divides by amp_scale**2 to flatten the
@@ -4103,8 +4117,8 @@ def run(
                 n_grid=int(pat_sky.n_grid),
                 cell_lambda=float(pat_sky.cell_lambda),
                 pattern_id=int(pat_sky.pattern_id),
-                ix_row=pat_sky.ix_row,
-                ix_col=pat_sky.ix_col,
+                ix_row=sky_ix_row,
+                ix_col=sky_ix_col,
                 dec_deg=math.degrees(cfg.obs_dec_rad),
                 amp_scale=amp_scale,
             )

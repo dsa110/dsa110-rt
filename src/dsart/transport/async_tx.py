@@ -209,6 +209,35 @@ class _AsyncTxWorkerCfg:
     log_level: str = "INFO"
 
 
+# The workers' vectorised encode runs whole-cube numpy ops. This numpy
+# is MKL + Intel OpenMP, which spreads each op over a pool of ~nproc/2
+# threads that busy-wait between calls: 4 workers x ~20 spinning
+# threads took 25 of a corr node's 40 cores and starved capture and the
+# corr pipeline (blocks 180-280 ms vs the 134 ms budget, 2026-09-23).
+# Each worker is one flow sized to one core, so spawn it with
+# single-threaded math libraries. Set in the parent around ``start()``
+# because a spawned child imports numpy before its entrypoint runs.
+_WORKER_THREAD_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+
+
+def _start_single_threaded(proc: Any) -> None:
+    saved = {k: os.environ.get(k) for k in _WORKER_THREAD_ENV}
+    os.environ.update(_WORKER_THREAD_ENV)
+    try:
+        proc.start()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _async_tx_worker_main(
     cfg: _AsyncTxWorkerCfg,
     ready_q: mp.Queue,
@@ -231,6 +260,7 @@ def _async_tx_worker_main(
                         specnum=meta.specnum)
             ring.release_slot(meta.slot_idx)
     """
+    torch.set_num_threads(1)
     # Configure logging in the child (spawn-start has no inherited handlers).
     logging.basicConfig(
         level=getattr(logging, cfg.log_level, logging.INFO),
@@ -777,7 +807,7 @@ class AsyncTransportTx:
                     name=f"async-tx-corr{cfg.corr_idx}-w{w}",
                     daemon=False,
                 )
-                proc.start()
+                _start_single_threaded(proc)
                 workers.append(
                     _WorkerHandle(
                         proc=proc,
