@@ -82,6 +82,16 @@ routines:
   #                          the same ordering as the old 8192/16 ring
   #   --fan-in-min-corrs 60  = 15 of 16 corr nodes, as before
   #   --n-sub 4, --combine-impl compact  (search_compute only)
+  #   --imager-uv-prescale 1/256  (search_compute only). The fp16
+  #                          irfft2 goes non-finite once an image pixel
+  #                          exceeds ~1.0 (unnormalised peak > 65504);
+  #                          at n_sub=4 an active uv cell sums ~19
+  #                          streams (7 at n_sub=1), so live noise sits
+  #                          at sigma ~0.064 and a pulse railed the
+  #                          detector (snr 254) from ~18 sigma. 1/256
+  #                          removes the overflow with no measurable
+  #                          loss (max err 0.05 sigma); Layer-1 re-
+  #                          estimates sigma, so snr is unchanged.
   # recv_epoll.c must be rebuilt (MAX_CHGROUPS 16 -> 64). Revert = the
   # 16 / 8192 / 5000 / 15 values and drop the two flags, on both sides.
   - name: search_rx
@@ -300,6 +310,7 @@ routines:
       --cell-lambda-mode tee45
       --n-sub 4
       --combine-impl compact
+      --imager-uv-prescale 0.00390625
     hostargs:
       # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
       # per-host C1 trigger-listener bind addresses (M7.4). The
@@ -375,6 +386,7 @@ routines:
       --cell-lambda-mode tee45
       --n-sub 4
       --combine-impl compact
+      --imager-uv-prescale 0.00390625
       --detector-streaming-tile-size 256
       --detector-streaming-decoder-n-top 24
       --detector-boxcar-accum-dtype fp16
