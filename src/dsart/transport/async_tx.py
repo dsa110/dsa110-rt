@@ -938,38 +938,51 @@ class AsyncTransportTx:
                     f"{self._cfg.ring_dims.shape}"
                 )
 
-            # Single D2H copy for the whole cube, through a re-used
-            # pinned staging buffer (~3x faster at this size, and it
-            # does not fall off the pageable-path cliff above ~40 MB).
-            cube_cpu_t = self._stage_cube_to_host(cube)
-            cube_np = cube_cpu_t.numpy()  # zero-copy view onto host
+            # Hand-off. Fast path (production): the cube is on the GPU
+            # and every worker's DM slice is exactly one ring slot, so
+            # each slice is DMA'd from the GPU straight into its shm
+            # slot (CubeShmRing.device_copy_to_slot). That removes the
+            # host memcpy that ran at ~4 GB/s on the corr pipeline
+            # thread (n05: 16 ms isolated, ~2x under TX-worker load, for
+            # the 70 MB n_sub=4 cube). Otherwise: one pinned D2H of the
+            # whole cube, then a host copy into each slot.
+            ring_shape = tuple(self._cfg.ring_dims.shape)
+            direct = bool(cube.is_cuda) and all(
+                (int(wh.dm_hi - wh.dm_lo), int(n_fv), int(n_filled)) == ring_shape
+                for wh in self._workers
+            )
+            cube_np = None
+            if not direct:
+                cube_cpu_t = self._stage_cube_to_host(cube)
+                cube_np = cube_cpu_t.numpy()  # zero-copy view onto host
 
-            ring_dm = self._cfg.ring_dims.shape[0]
+            src = cube.detach() if direct else None
             for w, wh in enumerate(self._workers):
                 lo, hi = wh.dm_lo, wh.dm_hi
-                slice_np = cube_np[lo:hi]
-                # Pad to ring_dims.shape if this slice is smaller along
-                # the DM axis (i.e. the last worker absorbs the remainder
-                # of an uneven split). We always copy into a fixed-size
-                # ring slot to keep the layout uniform; the worker reads
-                # only the first ``meta.n_dm`` rows.
                 slot_idx = wh.ring.reserve_slot(
                     timeout_s=self._cfg.reserve_timeout_s,
                 )
-                if slice_np.shape == self._cfg.ring_dims.shape:
-                    wh.ring.copy_to_slot(slot_idx, slice_np)
-                else:
-                    # Build a padded view (zeros in unused rows / cols).
-                    # Cheap allocation per block (~32 MiB / W); for
-                    # production W=4 this is 8 MiB. Avoid by sizing
-                    # ring_dims exactly to the largest per-worker slice.
-                    pad = np.zeros(
-                        self._cfg.ring_dims.shape,
-                        dtype=self._cfg.ring_dims.dtype,
-                    )
-                    pad[: slice_np.shape[0], : slice_np.shape[1],
-                        : slice_np.shape[2]] = slice_np
-                    wh.ring.copy_to_slot(slot_idx, pad)
+                done = False
+                if direct:
+                    done = wh.ring.device_copy_to_slot(slot_idx, src[lo:hi])
+                if not done:
+                    if cube_np is None:
+                        # the shm could not be page-locked: host path
+                        cube_np = self._stage_cube_to_host(cube).numpy()
+                    slice_np = cube_np[lo:hi]
+                    # Pad to ring_dims.shape if this slice is smaller
+                    # along the DM axis (the last worker of an uneven
+                    # split). The worker reads only meta.n_dm rows.
+                    if slice_np.shape == ring_shape:
+                        wh.ring.copy_to_slot(slot_idx, slice_np)
+                    else:
+                        pad = np.zeros(
+                            self._cfg.ring_dims.shape,
+                            dtype=self._cfg.ring_dims.dtype,
+                        )
+                        pad[: slice_np.shape[0], : slice_np.shape[1],
+                            : slice_np.shape[2]] = slice_np
+                        wh.ring.copy_to_slot(slot_idx, pad)
                 wh.ring.publish_slot(
                     slot_idx,
                     block_n=int(block_n),

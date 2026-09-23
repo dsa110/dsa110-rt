@@ -283,6 +283,7 @@ class CubeShmRing:
         "_published_slots",
         "_closed",
         "_poisoned",
+        "_pin_state",
         "n_publish", "n_consume", "n_backpressure",
     )
 
@@ -358,6 +359,9 @@ class CubeShmRing:
         self._published_slots: set[int] = set() if owner else set()
 
         self._closed: bool = False
+        # (ok, registered-array) once device_copy_to_slot has pinned the
+        # shm; None until then (and always None on consumer handles).
+        self._pin_state: tuple | None = None
         self._poisoned: bool = False
         self.n_publish: int = 0
         self.n_consume: int = 0
@@ -563,6 +567,55 @@ class CubeShmRing:
             flags=int(hdr["flags"]),
         )
 
+    def device_copy_to_slot(self, slot_idx: int, cube_t: object) -> bool:
+        """DMA a CUDA tensor straight into ``slot_idx``. Producer-side.
+
+        :meth:`copy_to_slot` needs the cube on the host first, i.e. a D2H
+        into a staging buffer and then a host ``memcpy`` into the shm.
+        On the corr nodes that host copy runs at ~4 GB/s single-threaded
+        (measured n05, 2026-09-23: 16 ms for the 70 MB n_sub=4 cube, and
+        ~2x that while the TX workers are encoding), all of it on the
+        corr pipeline thread. Registering the shm with CUDA once
+        (``cudaHostRegister``, the same helper the PSRDADA input pages
+        use) lets the GPU write the slot directly at pinned-D2H speed
+        (~13 GB/s), with no host copy at all.
+
+        Returns False (and copies nothing) if the shm could not be
+        page-locked; the caller then falls back to the host path.
+        Raises on shape/dtype mismatch like :meth:`copy_to_slot`.
+        """
+        import torch  # noqa: PLC0415  (workers never call this)
+
+        if self._closed:
+            raise TxRingClosedError(
+                f"device_copy_to_slot on closed ring {self._name}"
+            )
+        if not self._owner:
+            raise RuntimeError("device_copy_to_slot is producer-side only")
+        if tuple(cube_t.shape) != tuple(self._dims.shape):
+            raise ValueError(
+                f"device_copy_to_slot: cube.shape={tuple(cube_t.shape)} != "
+                f"dims.shape={self._dims.shape}"
+            )
+        if self._pin_state is None:
+            from dsart.services.host_pin import (  # noqa: PLC0415
+                maybe_register_host_buffer,
+            )
+            region = np.frombuffer(self._buf, dtype=np.uint8)
+            ok = bool(maybe_register_host_buffer(region))
+            # Keep the array alive: its finalizer is what unregisters the
+            # pages, and close() drops it BEFORE the shm is unmapped.
+            self._pin_state = (ok, region)
+        if not self._pin_state[0]:
+            return False
+        dst = torch.from_numpy(self._cube_views[slot_idx])
+        if dst.dtype != cube_t.dtype:
+            raise ValueError(
+                f"device_copy_to_slot: dtype {cube_t.dtype} != ring {dst.dtype}"
+            )
+        dst.copy_(cube_t)          # blocking: data is in the slot on return
+        return True
+
     def view_slot(self, slot_idx: int) -> np.ndarray:
         """Return a zero-copy view of the cube payload at ``slot_idx``.
 
@@ -613,7 +666,10 @@ class CubeShmRing:
         self._closed = True
         # Release numpy views BEFORE closing the shm so the underlying
         # buffer isn't pinned (avoids 'cannot close exported pointers
-        # exist' warnings in Python ≥ 3.12).
+        # exist' warnings in Python ≥ 3.12). The CUDA registration of
+        # device_copy_to_slot is dropped first: its finalizer
+        # cudaHostUnregister()s the pages while they are still mapped.
+        self._pin_state = None
         self._header_views.clear()
         self._cube_views.clear()
         try:
