@@ -105,6 +105,53 @@ LOG = logging.getLogger("dsart.transport.async_tx")
 # ---------------------------------------------------------------------------
 
 
+class _MultiStreamTx:
+    """Several :class:`TransportTx` streams behind one ``transmit`` call.
+
+    Each part owns cells ``[lo, hi)`` of the cube's last axis and its
+    own socket, ``chgroup`` label, ``pattern_id`` and per-DM sequence
+    counters. Exposes exactly the surface the worker loop uses.
+    """
+
+    __slots__ = ("_parts",)
+
+    def __init__(self, parts: list[tuple[Any, int, int]]) -> None:
+        if not parts:
+            raise ValueError("_MultiStreamTx needs at least one stream")
+        self._parts = parts
+
+    def transmit(
+        self,
+        cubes: list[torch.Tensor],
+        *,
+        block_n: int,
+        rfi_warming_up: bool,
+        specnum: int,
+    ) -> int:
+        n = 0
+        for cube in cubes:
+            for tx, lo, hi in self._parts:
+                n += int(tx.transmit(
+                    [cube[:, :, lo:hi]],
+                    block_n=block_n,
+                    rfi_warming_up=rfi_warming_up,
+                    specnum=specnum,
+                ))
+        return n
+
+    @property
+    def tx_dropped_payloads(self) -> int:
+        return sum(int(t.tx_dropped_payloads) for t, _, _ in self._parts)
+
+    @property
+    def tx_wire_drops(self) -> int:
+        return sum(int(t.tx_wire_drops) for t, _, _ in self._parts)
+
+    def close(self) -> None:
+        for t, _, _ in self._parts:
+            t.close()
+
+
 @dataclass(frozen=True)
 class _AsyncTxWorkerCfg:
     """Pickleable config for a TX worker subprocess.
@@ -125,6 +172,9 @@ class _AsyncTxWorkerCfg:
     target_gbps_per_flow: float
     pattern_id: int
     n_grid: int
+    streams: list[tuple[int, int, int, int]] | None = None
+    """Sub-band streams ``(stream_id, pattern_id, cell_lo, cell_hi)``; see
+    :attr:`AsyncTransportTxConfig.streams`."""
     bucket_fifo_depth: int = 4
     pacer_headroom: float = 1.05
     t_int_factor: int = 1
@@ -204,7 +254,7 @@ def _async_tx_worker_main(
     from dsart.transport.prod_frame import BITS_CINT8_COMPLEX
     from dsart.transport.tx import TransportTx, TransportTxProdConfig
 
-    tx: TransportTx | None = None
+    tx: "TransportTx | _MultiStreamTx | None" = None
     if cfg.transmit_enabled:
         prod_cfg = TransportTxProdConfig(
             target_gbps_per_flow=cfg.target_gbps_per_flow,
@@ -217,17 +267,38 @@ def _async_tx_worker_main(
             bypass_pacer=bool(cfg.bypass_pacer),
             sndbuf_mib=int(cfg.sndbuf_mib),
         )
-        tx = TransportTx(
-            host=cfg.host,
-            port=cfg.port,
-            chgroup=int(cfg.chgroup),
-            use_prod_frame=True,
-            prod_config=prod_cfg,
-        )
-        tx.prepare_prod(
-            pattern_id_by_chgroup={int(cfg.chgroup): int(cfg.pattern_id)},
-            n_grid=int(cfg.n_grid),
-        )
+        if cfg.streams is None:
+            tx = TransportTx(
+                host=cfg.host,
+                port=cfg.port,
+                chgroup=int(cfg.chgroup),
+                use_prod_frame=True,
+                prod_config=prod_cfg,
+            )
+            tx.prepare_prod(
+                pattern_id_by_chgroup={int(cfg.chgroup): int(cfg.pattern_id)},
+                n_grid=int(cfg.n_grid),
+            )
+        else:
+            parts = []
+            for sid, pid, lo, hi in cfg.streams:
+                t = TransportTx(
+                    host=cfg.host,
+                    port=cfg.port,
+                    chgroup=int(sid),
+                    use_prod_frame=True,
+                    prod_config=prod_cfg,
+                )
+                t.prepare_prod(
+                    pattern_id_by_chgroup={int(sid): int(pid)},
+                    n_grid=int(cfg.n_grid),
+                )
+                parts.append((t, int(lo), int(hi)))
+            tx = _MultiStreamTx(parts)
+            log.info(
+                "sub-band streams on this worker: %s",
+                [(int(s[0]), f"{int(s[2])}:{int(s[3])}") for s in cfg.streams],
+            )
         log.info(
             "TransportTx ready: %s:%d chgroup=%d dm[%d:%d) "
             "dm_idx_offset=%d gbps/flow=%.3f n_grid=%d pattern_id=%d "
@@ -461,6 +532,17 @@ class AsyncTransportTxConfig:
     egress targets a distinct search node — exactly the per-search-node
     fan-out the corner-turn was designed for (see module docstring
     lines 52-58 'forward-compatible to M7.3 4-search-node fan-out')."""
+    streams: list[tuple[int, int, int, int]] | None = None
+    """Sub-band gridding (``corr_fast --n-sub > 1``). ``None`` (default):
+    the whole cube's cell axis is ONE stream labelled ``chgroup`` with
+    ``pattern_id``, exactly as before. Otherwise a list of
+    ``(stream_id, pattern_id, cell_lo, cell_hi)``: the cube's cell axis
+    is the concatenation of the sub-band planes, and every worker sends
+    cells ``[cell_lo, cell_hi)`` as its own stream — its own
+    ``chgroup`` header value (``stream_id = chgroup*n_sub + s``), its
+    own ``pattern_id`` and its own per-DM sequence counters, which the
+    search RX ring needs because it indexes slots per
+    ``(stream, dm, seq)``."""
     coarse_dm_mask: int = 0xFF
     """M7.2 selective TX: bitmask over coarse-DM indices (LSB = coarse_dm[0]).
     Workers whose [dm_lo, dm_hi) slice is ENTIRELY OUT of the mask run as
@@ -675,6 +757,10 @@ class AsyncTransportTx:
                     target_gbps_per_flow=cfg.target_gbps_per_flow,
                     pattern_id=cfg.pattern_id,
                     n_grid=cfg.n_grid,
+                    streams=(
+                        None if cfg.streams is None
+                        else [tuple(int(x) for x in s) for s in cfg.streams]
+                    ),
                     bucket_fifo_depth=cfg.bucket_fifo_depth,
                     pacer_headroom=cfg.pacer_headroom,
                     bypass_pacer=bool(cfg.bypass_pacer),

@@ -295,6 +295,7 @@ def _pattern_id_payload(
     chgroup_table_hash: int,
     chan_sum_factor: int = 1,
     cell_lambda: float = 0.0,
+    sub_band: tuple[int, int] | None = None,
 ) -> bytes:
     """Pack the input tuple into a fixed-layout byte string for hashing.
 
@@ -354,7 +355,7 @@ def _pattern_id_payload(
         raise ValueError(
             f"cell_lambda={cell_lambda} must be finite and ≥ 0"
         )
-    return (
+    payload = (
         np.uint16(chgroup).tobytes()
         + np.uint16(n_grid).tobytes()
         + np.uint16(kernel_support).tobytes()
@@ -363,6 +364,18 @@ def _pattern_id_payload(
         + np.uint64(antpos_hash).tobytes()
         + np.uint64(chgroup_table_hash).tobytes()
         + np.float64(cell_lambda).tobytes()
+    )
+    if sub_band is None:
+        # Whole-chgroup pattern: the 40-byte layout above, unchanged, so
+        # every pre-sub-band pattern_id is preserved bit-for-bit.
+        return payload
+    s, n_sub = (int(sub_band[0]), int(sub_band[1]))
+    if not (1 <= n_sub < (1 << 16) and 0 <= s < n_sub):
+        raise ValueError(f"sub_band={sub_band} invalid (need 0 <= s < n_sub)")
+    # Sub-band pattern: a 7-byte tail. The tag keeps sub-band ids from
+    # ever colliding with a whole-chgroup id of the same chgroup.
+    return (
+        payload + b"SUB" + np.uint16(s).tobytes() + np.uint16(n_sub).tobytes()
     )
 
 
@@ -458,6 +471,10 @@ class SparsityPattern:
     chgroup_table_hash: int
     chan_sum_factor: int = 1
     cell_lambda: float = 0.0
+    sub_band: tuple[int, int] | None = None
+    """``(s, n_sub)`` when this pattern covers only summed channels
+    ``[s*per, (s+1)*per)`` of the chgroup (``per = nchan_eff // n_sub``);
+    ``None`` for a whole-chgroup pattern. Folded into ``pattern_id``."""
 
 
 # ---------------------------------------------------------------------------
@@ -886,8 +903,18 @@ def build_pattern(
     is_core_baseline_mask: np.ndarray | None = None,
     antpos_hash: int | None = None,
     chgroup_table_hash: int | None = None,
+    sub_band: tuple[int, int] | None = None,
 ) -> SparsityPattern:
     """Build the deterministic sparsity pattern for one chgroup at one DEC.
+
+    ``sub_band=(s, n_sub)`` restricts the pattern to summed channels
+    ``[s*per, (s+1)*per)`` with ``per = nchan_eff // n_sub`` — one
+    of ``n_sub`` sub-bands of the chgroup, each gridded to its own uv
+    plane so the search can dedisperse it separately (the intra-chgroup
+    DM smear shrinks ``n_sub``-fold). Requires an explicit
+    ``cell_lambda``: every sub-band must share the chgroup's pixel grid
+    or the search cannot sum them. ``None`` (default) is the
+    whole-chgroup pattern, bit-identical to the pre-sub-band build.
 
     Both ``corr_fast_compute`` (M3) and ``dsart-search-rx`` (M5) call
     this at ``cmd: prepare``; bit-identical inputs yield bit-identical
@@ -1046,6 +1073,22 @@ def build_pattern(
         nu_GHz = nu_GHz_full
     else:
         nu_GHz = nu_GHz_full.reshape(nchan_eff, chan_sum_factor).mean(axis=1)
+    if sub_band is not None:
+        s_idx, n_sub = int(sub_band[0]), int(sub_band[1])
+        if n_sub < 1 or nchan_eff % n_sub != 0 or not 0 <= s_idx < n_sub:
+            raise ValueError(
+                f"sub_band={sub_band}: need 0 <= s < n_sub and n_sub "
+                f"dividing nchan_eff={nchan_eff}"
+            )
+        if cell_lambda is None:
+            raise ValueError(
+                "sub_band requires an explicit cell_lambda: an auto-fit "
+                "scale would differ per sub-band and the search could not "
+                "sum the sub-band planes pixel-for-pixel"
+            )
+        per = nchan_eff // n_sub
+        nu_GHz = nu_GHz[s_idx * per:(s_idx + 1) * per]
+        sub_band = (s_idx, n_sub)
     wavelength_m = SPEED_OF_LIGHT_M_PER_S / (nu_GHz * 1e9)            # (NCHAN_eff,)
 
     # Outer product → (N_kept, NCHAN) in λ. Float64 throughout to keep
@@ -1110,6 +1153,7 @@ def build_pattern(
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
         cell_lambda=cell_lambda_used,
+        sub_band=sub_band,
     ))
 
     half = n_grid // 2
@@ -1169,6 +1213,7 @@ def build_pattern(
         chgroup_table_hash=chgroup_table_hash,
         chan_sum_factor=int(chan_sum_factor),
         cell_lambda=float(cell_lambda_used),
+        sub_band=sub_band,
     )
 
 
@@ -1185,8 +1230,12 @@ def predict_pattern_id(
     antpos_hash: int | None = None,
     chgroup_table_hash: int | None = None,
     is_core_baseline_mask: np.ndarray | None = None,
+    sub_band: tuple[int, int] | None = None,
 ) -> int:
     """Compute ``pattern_id`` without building the full pattern.
+
+    ``sub_band`` as in :func:`build_pattern` (requires explicit
+    ``cell_lambda``).
 
     Used in the ``cmd: prepare`` discovery handshake — both ends compute
     ``predict_pattern_id`` from inputs they already share, then exchange
@@ -1225,6 +1274,8 @@ def predict_pattern_id(
         64-bit unsigned int matching
         :attr:`SparsityPattern.pattern_id` for the same inputs.
     """
+    if sub_band is not None and cell_lambda is None:
+        raise ValueError("sub_band requires an explicit cell_lambda")
     if cell_lambda is None:
         # Legacy auto-fit path: must have the actual antpos arrays so
         # the same auto-fit math :func:`build_pattern` runs can be
@@ -1270,5 +1321,6 @@ def predict_pattern_id(
         antpos_hash=antpos_hash,
         chgroup_table_hash=chgroup_table_hash,
         cell_lambda=cell_lambda_used,
+        sub_band=sub_band,
     ))
 

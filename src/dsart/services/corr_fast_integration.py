@@ -557,6 +557,14 @@ class Stage1MultiDMCoarseDM:
     is bounded by the DM = 3000 ceiling per the M3 production
     review."""
 
+    subband_layout: "SubbandLayout | None" = None
+    """Sub-band gridding (``--n-sub > 1``). When set, stage 1 references
+    each channel to its OWN sub-band's top channel and grids every
+    sub-band into its own plane, concatenated along the cell axis
+    (``subband_layout.n_filled_total`` cells). ``None`` is the
+    whole-chgroup path, bit-identical to before. See
+    :mod:`dsart.grid.subband`."""
+
     _t_dedisp_cache: dict[int, int] = field(
         default_factory=dict, init=False, repr=False,
     )
@@ -590,6 +598,29 @@ class Stage1MultiDMCoarseDM:
     @property
     def n_dm(self) -> int:
         return int(self._dm_idx_iter.shape[0])
+
+    # --- sub-band-aware accessors (whole-chgroup when layout is None) ---
+
+    @property
+    def n_filled_out(self) -> int:
+        """Cells on the output cube's last axis."""
+        if self.subband_layout is not None:
+            return int(self.subband_layout.n_filled_total)
+        return int(self.gridder.pattern.n_filled)
+
+    def _source_cell_map(self) -> torch.Tensor:
+        """``(NBASE * nchan,)`` source -> output-cell map (sentinel = n_filled_out)."""
+        if self.subband_layout is not None:
+            return self.subband_layout.cell_index_map
+        return self.gridder.cell_index_map
+
+    def _stage1_bin_shifts(self) -> np.ndarray:
+        """``(nchan, n_coarse)`` stage-1 bin shifts for this chgroup."""
+        if self.subband_layout is not None:
+            return self.plan.delay_bins_per_subband(
+                self.chgroup, int(self.subband_layout.n_sub),
+            )
+        return self.plan.delay_bins_per_chgroup(self.chgroup)
 
     def t_dedisp_for(self, n_fast_vis: int) -> int:
         """Uniform output time-axis length across all DM trials.
@@ -626,19 +657,19 @@ class Stage1MultiDMCoarseDM:
         """
         n_fv = int(vis_stokes_i.shape[0])
         t_dedisp = self.t_dedisp_for(n_fv)
-        n_filled = int(self.gridder.pattern.n_filled)
+        n_filled = self.n_filled_out
         nb = int(vis_stokes_i.shape[1])
         nch = int(vis_stokes_i.shape[2])
         device = vis_stokes_i.device
 
         vis_T = vis_stokes_i.permute(0, 2, 1).contiguous()
-        bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
+        bin_shifts_full = self._stage1_bin_shifts()
         bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]
         bin_shifts_dev = torch.as_tensor(
             bin_shifts, dtype=torch.int64, device=device,
         )
         t_arange = torch.arange(t_dedisp, dtype=torch.int64, device=device)
-        cim_bc = self.gridder.cell_index_map.reshape(nb, nch)
+        cim_bc = self._source_cell_map().to(device).reshape(nb, nch)
         cim_cb = cim_bc.t().contiguous().reshape(-1)
         out = torch.empty(
             (self.n_dm, t_dedisp, n_filled),
@@ -685,7 +716,7 @@ class Stage1MultiDMCoarseDM:
         if hit is not None:
             return hit
         from dsart.services.triton_dedisp import build_cell_csr  # noqa: PLC0415
-        cim_bc = self.gridder.cell_index_map.to(device)                # (NSRC,) int64
+        cim_bc = self._source_cell_map().to(device)                    # (NSRC,) int64
         csr_offs, csr_b, csr_c = build_cell_csr(
             cim_bc, n_filled=n_filled, nchan_eff=nch, nbase=nb,
         )
@@ -777,7 +808,7 @@ class Stage1MultiDMCoarseDM:
         """
         n_fv = int(vis_stokes_i.shape[0])
         t_dedisp = self.t_dedisp_for(n_fv)
-        n_filled = int(self.gridder.pattern.n_filled)
+        n_filled = self.n_filled_out
         nb = int(vis_stokes_i.shape[1])
         nch = int(vis_stokes_i.shape[2])
         device = vis_stokes_i.device
@@ -814,7 +845,7 @@ class Stage1MultiDMCoarseDM:
 
         # Per-(c, dm) bin-shift table → device int32. n_dm * nch * 4
         # bytes — under 5 KB at the production op-point.
-        bin_shifts_full = self.plan.delay_bins_per_chgroup(self.chgroup)
+        bin_shifts_full = self._stage1_bin_shifts()
         bin_shifts = bin_shifts_full[:nch, self._dm_idx_iter]
         bin_shifts_dev = torch.as_tensor(
             bin_shifts, dtype=torch.int32, device=device,
@@ -944,7 +975,7 @@ class Stage1MultiDMCoarseDM:
 
         # F34 sliding-window path: join prev + current, dedisp the
         # join, emit the prev block's slice. One-block latency.
-        n_filled = int(self.gridder.pattern.n_filled)
+        n_filled = self.n_filled_out
         if self._prev_vis_stokes_i is None:
             # Cold start: nothing to emit yet. Save current; return
             # all-zeros at the prev-block shape so downstream stages
@@ -1560,6 +1591,15 @@ class FastIntegrationConfig:
     stage-1 + grid pass per block (since the join is 2× the
     block size). The latency is acceptable for the search; the
     memory + compute fit on the 11 GB 2080Ti budget."""
+
+    n_sub: int = 1
+    """Sub-bands per chgroup (:mod:`dsart.grid.subband`). ``1`` is the
+    whole-chgroup pipeline, bit-identical to before. ``4`` grids each
+    quarter of the chgroup to its own uv plane and ships it as its own
+    stream (id ``chgroup*n_sub + s``); the search then shifts every
+    sub-band separately, cutting the uncorrectable intra-chgroup DM
+    smear 4-fold. Must divide ``NCHAN_PER_CHGROUP // chan_sum_factor``
+    and match the search side's ``--n-sub``."""
 
     chan_sum_factor: int = 1
     """F33: number of fine channels collapsed into one effective
@@ -2827,28 +2867,10 @@ def _build_gridder(
     is_core_baseline_mask: np.ndarray | None,
     device: torch.device,
 ) -> tuple[SparsityPattern, FastVisGridder]:
-    # F28: resolve cell_lambda per ``cfg.cell_lambda_mode``.
-    if cfg.cell_lambda_mode == "common":
-        cell_lambda_used = compute_top_of_band_cell_lambda(
-            antpos_e, antpos_n,
-            n_grid=cfg.n_grid,
-            is_core_baseline_mask=is_core_baseline_mask,
-        )
-    elif cfg.cell_lambda_mode == "tee45":
-        # Fixed 45" image pixel (Tee mid-band critical sampling); the
-        # uv-cell pitch is baseline-independent so corr + search land on
-        # the identical pixel grid given the same (pixel_arcsec, n_grid).
-        cell_lambda_used = cell_lambda_for_pixel_arcsec(
-            IMAGE_PIXEL_ARCSEC_TEE, cfg.n_grid,
-        )
-    elif cfg.cell_lambda_mode == "per_chgroup":
-        cell_lambda_used = None                                       # legacy auto-fit in build_pattern
-    else:
-        raise ValueError(
-            f"cfg.cell_lambda_mode={cfg.cell_lambda_mode!r}; expected "
-            f"'common' (F28 default), 'tee45' (fixed 45\") or "
-            f"'per_chgroup' (legacy)."
-        )
+    cell_lambda_used = _resolve_cell_lambda(
+        cfg, antpos_e=antpos_e, antpos_n=antpos_n,
+        is_core_baseline_mask=is_core_baseline_mask,
+    )
     pattern = build_pattern(
         antpos_e, antpos_n,
         chgroup=cfg.chgroup,
@@ -2874,6 +2896,85 @@ def _build_gridder(
         device=device,
     )
     return pattern, gridder
+
+
+def _build_subband_layout_for_cfg(
+    cfg: "FastIntegrationConfig",
+    *,
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    is_core_baseline_mask: np.ndarray | None,
+    device: torch.device,
+    whole_gridder: FastVisGridder,
+) -> "SubbandLayout":
+    """``cfg.n_sub`` sub-band patterns + combined cell map for this chgroup.
+
+    Uses the SAME cell_lambda resolution as :func:`_build_gridder` so the
+    sub-band planes share the whole-chgroup pixel grid (which is what
+    lets the search sum them).
+    """
+    from dsart.grid.subband import (  # noqa: PLC0415
+        build_subband_layout,
+        build_subband_patterns,
+    )
+    cell_lambda_used = _resolve_cell_lambda(
+        cfg, antpos_e=antpos_e, antpos_n=antpos_n,
+        is_core_baseline_mask=is_core_baseline_mask,
+    )
+    if cell_lambda_used is None:
+        raise ValueError(
+            "--n-sub > 1 needs a shared pixel grid: use --cell-lambda-mode "
+            "tee45 or common, not per_chgroup"
+        )
+    patterns = build_subband_patterns(
+        antpos_e, antpos_n,
+        chgroup=cfg.chgroup, n_sub=int(cfg.n_sub),
+        dec_deg=math.degrees(cfg.obs_dec_rad),
+        n_grid=cfg.n_grid, kernel_support=cfg.kernel_support,
+        chan_sum_factor=cfg.chan_sum_factor, cell_lambda=cell_lambda_used,
+        is_core_baseline_mask=is_core_baseline_mask,
+    )
+    layout = build_subband_layout(patterns, whole_gridder, device=device)
+    LOG.info(
+        "sub-band gridding: chgroup=%d n_sub=%d streams=%s n_filled=%s "
+        "(total %d) pattern_ids=%s",
+        cfg.chgroup, layout.n_sub, layout.stream_ids,
+        [int(p.n_filled) for p in layout.patterns], layout.n_filled_total,
+        [f"0x{pid:016x}" for pid in layout.pattern_ids],
+    )
+    return layout
+
+
+def _resolve_cell_lambda(
+    cfg: "FastIntegrationConfig",
+    *,
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    is_core_baseline_mask: np.ndarray | None,
+) -> float | None:
+    # F28: resolve cell_lambda per ``cfg.cell_lambda_mode``.
+    if cfg.cell_lambda_mode == "common":
+        cell_lambda_used = compute_top_of_band_cell_lambda(
+            antpos_e, antpos_n,
+            n_grid=cfg.n_grid,
+            is_core_baseline_mask=is_core_baseline_mask,
+        )
+    elif cfg.cell_lambda_mode == "tee45":
+        # Fixed 45" image pixel (Tee mid-band critical sampling); the
+        # uv-cell pitch is baseline-independent so corr + search land on
+        # the identical pixel grid given the same (pixel_arcsec, n_grid).
+        cell_lambda_used = cell_lambda_for_pixel_arcsec(
+            IMAGE_PIXEL_ARCSEC_TEE, cfg.n_grid,
+        )
+    elif cfg.cell_lambda_mode == "per_chgroup":
+        cell_lambda_used = None                                       # legacy auto-fit in build_pattern
+    else:
+        raise ValueError(
+            f"cfg.cell_lambda_mode={cfg.cell_lambda_mode!r}; expected "
+            f"'common' (F28 default), 'tee45' (fixed 45\") or "
+            f"'per_chgroup' (legacy)."
+        )
+    return cell_lambda_used
 
 
 def build_context(
@@ -3029,6 +3130,15 @@ def build_context(
         is_core_baseline_mask=is_core_baseline_mask,
         device=device,
     )
+    subband_layout = None
+    if int(cfg.n_sub) > 1:
+        subband_layout = _build_subband_layout_for_cfg(
+            cfg,
+            antpos_e=antpos_e, antpos_n=antpos_n,
+            is_core_baseline_mask=is_core_baseline_mask,
+            device=device,
+            whole_gridder=gridder,
+        )
 
     # Chunk-9 / F25 production multi-DM path.
     # ``dm_plan`` arg overrides ``cfg.dm_plan_path`` — used by tests +
@@ -3089,6 +3199,7 @@ def build_context(
             dm_indices=dm_indices_arr,
             sliding_window=bool(cfg.sliding_window),
             dm_chunk_size=int(cfg.dm_chunk_size),
+            subband_layout=subband_layout,
         )
         LOG.info(
             "Stage1MultiDMCoarseDM ready: chgroup=%d n_dm=%d t_int_fast_us=%.3f "
@@ -4008,11 +4119,41 @@ def run(
         # production rate; TX latency overlaps into the *next* block's
         # GPU compute.
         async_tx: AsyncTransportTx | None = None
+        if (
+            not use_async_tx
+            and transport_tx_host
+            and ctx.multi_dm_coarse_dm is not None
+            and ctx.multi_dm_coarse_dm.subband_layout is not None
+        ):
+            raise ValueError(
+                "--n-sub > 1 is only wired into the async TX path "
+                "(--transport-tx-workers >= 1); the inline TX would send "
+                "the concatenated sub-band cube as one mislabelled stream"
+            )
         if use_async_tx:
             from dsart.grid.sparsity_pattern import predict_pattern_id
             pat = ctx.gridder.pattern  # SparsityPattern
             n_filled = int(pat.n_filled)
             n_grid_eff = int(pat.n_grid)
+            # Sub-band gridding: the cube's cell axis is the
+            # concatenation of n_sub sub-band planes; each worker ships
+            # every sub-band as its own stream.
+            sb_layout = (
+                ctx.multi_dm_coarse_dm.subband_layout
+                if ctx.multi_dm_coarse_dm is not None else None
+            )
+            tx_streams: list[tuple[int, int, int, int]] | None = None
+            if sb_layout is not None:
+                n_filled = int(sb_layout.n_filled_total)
+                tx_streams = [
+                    (
+                        int(sid), int(pid),
+                        int(sb_layout.offsets[s]), int(sb_layout.offsets[s + 1]),
+                    )
+                    for s, (sid, pid) in enumerate(
+                        zip(sb_layout.stream_ids, sb_layout.pattern_ids)
+                    )
+                ]
             # n_dm_total: prefer the runtime Stage1MultiDMCoarseDM,
             # since the DMPlan may have come from cfg.dm_plan_path
             # (loaded inside build_context, not via the dm_plan arg).
@@ -4099,7 +4240,14 @@ def run(
                 log_level="INFO",
                 shm_name_prefix=f"dsart-corr-tx-{cfg.chgroup}",
                 coarse_dm_mask=int(transport_tx_coarse_dm_mask) & 0xFF,
+                streams=tx_streams,
             )
+            if tx_streams is not None:
+                LOG.info(
+                    "async TX sub-band streams (id, pattern_id, cells): %s",
+                    [(sid, f"0x{pid:016x}", f"{lo}:{hi}")
+                     for sid, pid, lo, hi in tx_streams],
+                )
             async_tx = AsyncTransportTx.spawn(async_cfg)
             ctx.transport_tx = _AsyncTransportTxAdapter(async_tx)
             LOG.info(
@@ -4817,6 +4965,13 @@ def main(argv: list[str] | None = None) -> int:
                         "2080Ti production GPU at t_int_fast_native=8). "
                         "Pass an explicit value to override (e.g. 8 for "
                         "deterministic memory profiling).")
+    p.add_argument("--n-sub", type=int, default=1,
+                   help="Sub-bands per chgroup: grid each 1/n_sub of the "
+                        "chgroup to its own uv plane and ship it as its own "
+                        "stream (id = chgroup*n_sub + s), so the search can "
+                        "dedisperse each separately. 1 (default) = whole "
+                        "chgroup, unchanged. Must match search_compute "
+                        "--n-sub and search_rx --n-corr = 16*n_sub.")
     p.add_argument("--chan-sum-factor", type=int, default=1,
                    help="F33: collapse this many adjacent fine channels "
                         "into one effective channel before dedispersion. "
@@ -5140,6 +5295,7 @@ def main(argv: list[str] | None = None) -> int:
         static_sky_disabled=args.static_sky_disabled,
         n_fv_chunk=args.n_fv_chunk,
         chan_sum_factor=args.chan_sum_factor,
+        n_sub=int(args.n_sub),
         sliding_window=args.sliding_window,
         cell_lambda_mode=args.cell_lambda_mode,
         dm_plan_path=args.dm_plan_path,

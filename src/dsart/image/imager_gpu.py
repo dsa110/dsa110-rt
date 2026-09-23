@@ -213,8 +213,19 @@ class GpuImager:
         chgroup_offsets_re: Optional[torch.Tensor] = None,
         chgroup_offsets_im: Optional[torch.Tensor] = None,
         t_lo: int = 0,
+        compact_inv_lut: Optional[torch.Tensor] = None,
+        compact_t_stream: int = 0,
+        compact_shift_bounds: Optional[tuple] = None,
     ) -> torch.Tensor:
         """Run the full GPU imager for one cube.
+
+        Compact combine (``compact_inv_lut`` given): ``streams_cint8`` is
+        then the time-major ``[N_chg, n_filled_max, t_pad, 2]`` buffer of
+        :func:`dsart.image.tiled_combine_cuda.transpose_compact_tmajor`,
+        ``compact_t_stream`` its valid row count, and the combine runs
+        once per FFT batch (every trial of the batch per launch) via
+        ``combine_tiled_v3`` — bit-identical to the dense path. Unit-scale
+        only (per-chgroup calibration is rejected) and real-FFT only.
 
         Per-fdm pipeline:
           1. Fused dequant + 16-chgroup index-shifted sum into ``uv_slab``
@@ -276,41 +287,71 @@ class GpuImager:
                 f"streams_cint8.dtype={streams_cint8.dtype}, expected int8 "
                 "(M3 sparse-COO cint8 wire payload)"
             )
-        if streams_cint8.ndim != 5:
-            raise ValueError(
-                f"streams_cint8 ndim={streams_cint8.ndim}, expected 5 "
-                "([N_chg, T_stream, 2, N_grid, N_grid])"
-            )
-        n_chg, t_stream, two, n_g, n_g2 = streams_cint8.shape
-        if two != 2:
-            raise ValueError(
-                f"streams_cint8 inner-2-axis={two}, expected 2 "
-                "(real / imaginary split planes)"
-            )
-        if n_g != cfg.n_grid or n_g2 != cfg.n_grid:
-            raise ValueError(
-                f"streams_cint8 grid {n_g}x{n_g2} != config N_grid={cfg.n_grid}"
-            )
-        if n_chg != cfg.n_chgroup:
-            raise ValueError(
-                f"streams_cint8 N_chgroup={n_chg} != config "
-                f"N_chgroup={cfg.n_chgroup}"
-            )
-        if time_shifts_gpu.dtype != torch.int32:
-            raise ValueError(
-                f"time_shifts_gpu.dtype={time_shifts_gpu.dtype}, "
-                "expected int32"
-            )
-        if time_shifts_gpu.shape != (cfg.n_fdm, cfg.n_chgroup):
-            raise ValueError(
-                f"time_shifts_gpu.shape={tuple(time_shifts_gpu.shape)}, "
-                f"expected ({cfg.n_fdm}, {cfg.n_chgroup})"
-            )
-        if t_stream < cfg.t_det:
-            raise ValueError(
-                f"streams_cint8 T_stream={t_stream} < T_det={cfg.t_det}; "
-                "no fdm trial can fit"
-            )
+        use_compact = compact_inv_lut is not None
+        if use_compact:
+            if streams_cint8.ndim != 4 or streams_cint8.shape[3] != 2:
+                raise ValueError(
+                    "compact combine expects [N_chg, n_filled_max, t_pad, 2]; "
+                    f"got {tuple(streams_cint8.shape)}"
+                )
+            if int(streams_cint8.shape[0]) != cfg.n_chgroup:
+                raise ValueError(
+                    f"compact N_chg={streams_cint8.shape[0]} != config "
+                    f"N_chgroup={cfg.n_chgroup}"
+                )
+            if any(x is not None for x in (
+                chgroup_scales, chgroup_offsets_re, chgroup_offsets_im,
+            )):
+                raise ValueError(
+                    "compact combine is the unit-scale path only; "
+                    "per-chgroup calibration needs gpu_combine_impl='dense'"
+                )
+            if int(compact_t_stream) < cfg.t_det:
+                raise ValueError(
+                    f"compact_t_stream={compact_t_stream} < T_det={cfg.t_det}"
+                )
+            if time_shifts_gpu.shape != (cfg.n_fdm, cfg.n_chgroup):
+                raise ValueError(
+                    f"time_shifts_gpu.shape={tuple(time_shifts_gpu.shape)}, "
+                    f"expected ({cfg.n_fdm}, {cfg.n_chgroup})"
+                )
+            t_stream = int(compact_t_stream)
+        if not use_compact:
+            if streams_cint8.ndim != 5:
+                raise ValueError(
+                    f"streams_cint8 ndim={streams_cint8.ndim}, expected 5 "
+                    "([N_chg, T_stream, 2, N_grid, N_grid])"
+                )
+            n_chg, t_stream, two, n_g, n_g2 = streams_cint8.shape
+            if two != 2:
+                raise ValueError(
+                    f"streams_cint8 inner-2-axis={two}, expected 2 "
+                    "(real / imaginary split planes)"
+                )
+            if n_g != cfg.n_grid or n_g2 != cfg.n_grid:
+                raise ValueError(
+                    f"streams_cint8 grid {n_g}x{n_g2} != config N_grid={cfg.n_grid}"
+                )
+            if n_chg != cfg.n_chgroup:
+                raise ValueError(
+                    f"streams_cint8 N_chgroup={n_chg} != config "
+                    f"N_chgroup={cfg.n_chgroup}"
+                )
+            if time_shifts_gpu.dtype != torch.int32:
+                raise ValueError(
+                    f"time_shifts_gpu.dtype={time_shifts_gpu.dtype}, "
+                    "expected int32"
+                )
+            if time_shifts_gpu.shape != (cfg.n_fdm, cfg.n_chgroup):
+                raise ValueError(
+                    f"time_shifts_gpu.shape={tuple(time_shifts_gpu.shape)}, "
+                    f"expected ({cfg.n_fdm}, {cfg.n_chgroup})"
+                )
+            if t_stream < cfg.t_det:
+                raise ValueError(
+                    f"streams_cint8 T_stream={t_stream} < T_det={cfg.t_det}; "
+                    "no fdm trial can fit"
+                )
 
         # Calibration arrays (optional). Shape / dtype validation
         # happens inside fused_dequant_combine_per_fdm; we bind the
@@ -412,7 +453,36 @@ class GpuImager:
                 ev_b_fft_end = torch.cuda.Event(enable_timing=True)
                 ev_b_mask_end = torch.cuda.Event(enable_timing=True)
                 ev_b_start.record()
-            for j in range(n_batch):
+            if use_compact:
+                if not use_rfft:
+                    raise ValueError(
+                        "compact combine writes the Hermitian half-spectrum "
+                        "and needs the real-FFT path (even N_grid, cfp16, "
+                        "DSART_IMAGER_RFFT != 0)"
+                    )
+                from dsart.image.tiled_combine_cuda import combine_tiled_v3
+                s_lo, s_hi = (
+                    compact_shift_bounds if compact_shift_bounds is not None
+                    else (None, None)
+                )
+                # Every trial of this batch in ONE launch, written in
+                # place into uv_batch[:n_batch, t_lo:T_det] (the parent
+                # buffer is contiguous; out_row0 selects the rows).
+                combine_tiled_v3(
+                    streams_cint8,
+                    compact_inv_lut,
+                    time_shifts_gpu[f0:f0 + n_batch],
+                    n_grid=int(cfg.n_grid),
+                    t_rows=int(t_stream),
+                    t_out_len=int(t_det_local),
+                    t_lo=int(t_lo),
+                    fftshift=fftshift_in_combine,
+                    out=self.uv_batch[:n_batch],
+                    out_row0=int(t_lo),
+                    shift_min=s_lo,
+                    shift_max=s_hi,
+                )
+            for j in range(0 if use_compact else n_batch):
                 # M7.7.2 carry-over: pass the sliced uv-batch view
                 # ``uv_batch[j, t_lo:T_det]`` (size ``t_det_local``)
                 # to the kernel. With ``t_lo=0`` this is just

@@ -822,6 +822,52 @@ class TransportTx:
         return scale, np.float32(0.0)
 
     @staticmethod
+    def _encode_rows(
+        row: "torch.Tensor | np.ndarray",
+        bits_per_cell: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Encode all ``n_fv`` tiles of one DM row at once.
+
+        ``row`` is ``(n_fv, N_filled)`` complex. Returns
+        ``(payloads, scales)``: ``payloads[t]`` is the ``(N_filled, 2)``
+        wire array for tile ``t`` (``.tobytes()`` gives the payload) and
+        ``scales[t]`` its float32 dequant scale.
+
+        Bit-identical to calling :meth:`_compute_scale_offset` then
+        :meth:`_encode_payload` per tile:
+
+        * scale: ``amax`` is the float32 max of ``|re|, |im|`` (exact),
+          promoted to float64, ``/ 127.0``, rounded to float32; an
+          all-zero tile gets ``1.0``.
+        * quantise: the per-tile path multiplies the float32 data by the
+          Python float ``1/scale``, which NumPy evaluates in float32 with
+          the scalar rounded to float32 — reproduced here with an
+          explicit float32 ``inv`` — then ``round`` (half-to-even),
+          ``clip(-128, 127)``, ``int8``.
+        """
+        arr = row.numpy() if isinstance(row, torch.Tensor) else np.asarray(row)
+        arr = arr.astype(np.complex64, copy=False)
+        n_fv, n_filled = arr.shape
+        re_im = np.empty((n_fv, n_filled, 2), dtype=np.float32)
+        re_im[:, :, 0] = arr.real
+        re_im[:, :, 1] = arr.imag
+        if bits_per_cell == BITS_CINT8_COMPLEX:
+            if n_filled == 0:
+                amax = np.zeros(n_fv, dtype=np.float32)
+            else:
+                amax = np.abs(re_im).reshape(n_fv, -1).max(axis=1)
+            scales = (amax.astype(np.float64) / 127.0).astype(np.float32)
+            scales[amax == 0.0] = np.float32(1.0)
+            inv = (1.0 / scales.astype(np.float64)).astype(np.float32)
+            q = np.clip(
+                np.round(re_im * inv[:, None, None]), -128.0, 127.0,
+            ).astype(np.int8)
+            return q, scales
+        if bits_per_cell == BITS_CFP16_COMPLEX:
+            return re_im.astype(np.float16), np.ones(n_fv, dtype=np.float32)
+        raise AssertionError(f"unhandled bits_per_cell={bits_per_cell}")
+
+    @staticmethod
     def _encode_payload(
         cells_complex: np.ndarray,
         bits_per_cell: int,
@@ -966,6 +1012,17 @@ class TransportTx:
             payload_dropped = False
             seq = 0  # set inside the t_idx loop; tracked here for cube_seq_emitted
 
+            # Encode every time sample of this DM row in one pass.
+            # Byte-identical to the per-tile _compute_scale_offset +
+            # _encode_payload pair (same float32/float64 order of
+            # operations; see test_tx_encode_vectorised). The per-tile
+            # Python overhead of that pair was ~26 us x (n_dm x n_fv)
+            # per cube, which is what put the worker at 87% duty at
+            # n_sub=4 (116.9 ms of the 134.2 ms block).
+            payload_rows, scale_rows = self._encode_rows(
+                cube_cpu[dm_idx_local], bits_per_cell,
+            )
+
             for t_idx in range(n_fv):
                 # M7.2-amend (2026-05-20): allocate ONE wire seq PER
                 # (cube, dm, t_idx) so the consumer-side RX ring's
@@ -985,27 +1042,9 @@ class TransportTx:
                 # geometry (one slot = one (corr, dm, sample)).
                 seq = self._next_seq(dm_idx)
 
-                slice_np = (
-                    cube_cpu[dm_idx_local, t_idx]
-                    .numpy()
-                    .astype(np.complex64, copy=False)
-                )                                                        # (N_filled,) complex64
-
-                # scale/offset over filled cells only (plan §4.2 pin).
-                re_im_f32 = np.stack(
-                    [slice_np.real, slice_np.imag], axis=1,
-                )                                                        # (N_filled, 2) f32
-                if bits_per_cell == BITS_CINT8_COMPLEX:
-                    # Dynamic range tracks actual filled-cell data.
-                    scale, offset = self._compute_scale_offset(re_im_f32)
-                else:
-                    # cfp16: identity dequant (D1: FLAG_QUANTIZED=0).
-                    scale = np.float32(1.0)
-                    offset = np.float32(0.0)
-
-                payload_bytes = self._encode_payload(
-                    slice_np, bits_per_cell, scale,
-                )
+                scale = scale_rows[t_idx]
+                offset = np.float32(0.0)
+                payload_bytes = payload_rows[t_idx].tobytes()
 
                 frags = split_payload_into_fragments(
                     payload_bytes,

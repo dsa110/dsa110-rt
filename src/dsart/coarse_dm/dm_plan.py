@@ -176,6 +176,21 @@ def build_summed_chgroup_freq_table_GHz(
     return summed
 
 
+def subband_ref_freqs_table_GHz(chan_sum_factor: int, n_sub: int) -> np.ndarray:
+    """``(N_CHGROUP, n_sub)`` stage-1 reference frequency of every sub-band.
+
+    Exactly what :meth:`DMPlan.subband_ref_freqs_GHz` returns for a plan
+    built by :meth:`DMPlan.from_summed_canonical` (same summed-channel
+    table, same first-channel-of-sub-band rule). The search side calls
+    this so its sub-band shift reference cannot drift from the corr's.
+    """
+    freqs = build_summed_chgroup_freq_table_GHz(int(chan_sum_factor))
+    nchan = freqs.shape[1]
+    if n_sub < 1 or nchan % n_sub != 0:
+        raise ValueError(f"n_sub={n_sub} must divide nchan={nchan}")
+    return np.ascontiguousarray(freqs[:, :: nchan // n_sub][:, :n_sub])
+
+
 def compute_delay_native_samples_table(
     coarse_dm: np.ndarray,
     chgroup_freqs_GHz: np.ndarray,
@@ -444,6 +459,59 @@ class DMPlan:
         caches the per-chgroup result for its loop body.
         """
         nat = self.delay_native_samples_per_chgroup(chgroup)
+        return np.rint(nat / self.t_int_fast_native).astype(np.int64)
+
+    def subband_ref_freqs_GHz(self, chgroup: int, n_sub: int) -> np.ndarray:
+        """``(n_sub,)`` stage-1 reference frequency of each sub-band.
+
+        Sub-band ``s`` covers channels ``[s*per, (s+1)*per)`` of this
+        plan's per-chgroup channel grid (``per = nchan // n_sub``); its
+        reference is its own first (highest-frequency) channel — the
+        sub-band analogue of Convention A. The search side must use
+        exactly these values for the fine-DM term of the sub-band shift.
+        """
+        freqs = np.asarray(self.chgroup_freqs_GHz[chgroup], dtype=np.float64)
+        nchan = freqs.shape[0]
+        if n_sub < 1 or nchan % n_sub != 0:
+            raise ValueError(f"n_sub={n_sub} must divide nchan={nchan}")
+        return freqs[:: nchan // n_sub][:n_sub].copy()
+
+    def delay_bins_per_subband(self, chgroup: int, n_sub: int) -> np.ndarray:
+        """Stage-1 bin shifts with each channel referenced to its SUB-BAND top.
+
+        ``(nchan, N_coarse) int64``. Same two roundings as
+        :meth:`delay_bins_per_chgroup` (native sample, then fast-vis
+        bin) and the same formula as
+        :func:`compute_delay_native_samples_table`, but the reference
+        frequency for channel ``c`` is ``subband_ref_freqs_GHz[c // per]``
+        rather than the chgroup top. After stage 1 every channel of
+        sub-band ``s`` is aligned to the arrival time at that sub-band's
+        reference, so the search can apply a separate shift per
+        sub-band and the residual intra-chgroup dispersion shrinks
+        ``n_sub``-fold.
+
+        ``n_sub == 1`` returns :meth:`delay_bins_per_chgroup` itself, so
+        the whole-chgroup path is bit-identical.
+
+        Every entry is ``<=`` the corresponding whole-chgroup shift
+        (the sub-band reference is never above the chgroup top and
+        ``rint`` is monotone), so ``t_dedisp`` derived from the
+        whole-chgroup table stays a safe window.
+        """
+        if n_sub == 1:
+            return self.delay_bins_per_chgroup(chgroup)
+        freqs = np.asarray(self.chgroup_freqs_GHz[chgroup], dtype=np.float64)
+        nchan = freqs.shape[0]
+        refs = self.subband_ref_freqs_GHz(chgroup, n_sub)
+        per = nchan // n_sub
+        ref_per_ch = np.repeat(refs, per)                              # (C,)
+        inv_diff = (1.0 / freqs ** 2) - (1.0 / ref_per_ch ** 2)        # (C,) >= 0
+        delay_us = (
+            K_DM_MS_GHZ2_PC
+            * np.asarray(self.dm_pc_cc, dtype=np.float64)[None, :]
+            * inv_diff[:, None] * 1e3
+        )                                                              # (C, K)
+        nat = np.rint(delay_us / NATIVE_SAMPLE_US).astype(np.int64)
         return np.rint(nat / self.t_int_fast_native).astype(np.int64)
 
     def delay_subbins_per_chgroup(

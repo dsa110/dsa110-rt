@@ -117,10 +117,21 @@
 #define BITS_CFP16_COMPLEX      32
 
 /* Topology bounds — sized for plan §11 line 2654 (16 corr × 24 coarse DMs). */
-#define MAX_CHGROUPS            16
+/* MAX_CHGROUPS is really "max streams": the header's chgroup field is
+ * the stream id, which is the chgroup itself for whole-chgroup TX and
+ * chgroup*n_sub + s for sub-band TX (corr_fast --n-sub). 64 covers
+ * n_sub <= 4.
+ *
+ * MAX_FRAGS_PER_PAYLOAD was 16 (256 MiB of flow state, all of it
+ * committed by the memset in recv_epoll_open). A payload is
+ * n_filled * 2 B <= 5000 * 2 = 10000 B, i.e. at most 2 fragments at the
+ * 8900 B cap; 4 keeps 2x headroom and holds the flow state at the same
+ * ~295 MB with 4x the streams. Larger n_frags are rejected (and
+ * counted) at the existing guard in the fragment path. */
+#define MAX_CHGROUPS            64
 #define MAX_DMS                 32
 #define WINDOW_DEPTH            4
-#define MAX_FRAGS_PER_PAYLOAD   16
+#define MAX_FRAGS_PER_PAYLOAD   4
 #define MAX_FRAG_PAYLOAD_BYTES  9000  /* generous; jumbo MTU caps at 8964 */
 
 /* Maximum simultaneous bound UDP ports. Production topology uses 16

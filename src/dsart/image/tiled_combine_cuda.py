@@ -644,10 +644,11 @@ extern "C" __global__ void tiled_combine_per_fdm_v3(
     const signed char* __restrict__ dense,   /* [n_sb, nfm, t_pad, 2] */
     const int*         __restrict__ inv_lut, /* [n_sb, n_grid^2]      */
     const int*         __restrict__ shifts,  /* [n_fdm, n_sb]         */
-    __half2*           __restrict__ out,     /* [n_fdm, t_out_len, N, n_half] */
+    __half2*           __restrict__ out,     /* [n_fdm, out_rows, N, n_half] */
     int n_sb, int t_rows, int t_pad, int n_filled_max,
     int n_grid, int n_half, int n_fdm, int t_out_len, int t_lo,
-    int shift_max, int win_w, int tile, int fftshift)
+    int shift_max, int win_w, int tile, int fftshift,
+    int out_rows, int out_row0)
 {
     extern __shared__ short sh[];       /* [2][n_sb][win_w] packed (re,im) */
 
@@ -711,8 +712,8 @@ extern "C" __global__ void tiled_combine_per_fdm_v3(
         float o_re = 0.5f * (float)(acc_re + accm_re);
         float o_im = 0.5f * (float)(acc_im - accm_im);
         if (fftshift && ((u + w) & 1)) { o_re = -o_re; o_im = -o_im; }
-        out[(long long)f * t_out_len * n_grid * n_half
-            + (long long)t_out * n_grid * n_half
+        out[(long long)f * out_rows * n_grid * n_half
+            + (long long)(out_row0 + t_out) * n_grid * n_half
             + (long long)u * n_half + w] = __floats2half2_rn(o_re, o_im);
     }
 }
@@ -756,24 +757,63 @@ def build_inverse_lut(
     return inv
 
 
+def _ptr(t: torch.Tensor):
+    """Raw-pointer cupy view of a CONTIGUOUS cuda tensor, any dtype.
+
+    A RawKernel pointer argument only needs the device address, so the
+    tensor is exposed as a flat uint8 array over exactly its bytes; the
+    kernel re-types the pointer (works for complex32, which neither
+    dlpack nor cupy understands).
+    """
+    cp = _get_cupy()
+    if not t.is_cuda:
+        raise ValueError(f"expected a cuda tensor; got {t.device}")
+    if not t.is_contiguous():
+        raise ValueError("tensor must be contiguous")
+    n_bytes = int(t.numel()) * int(t.element_size())
+    mem = cp.cuda.UnownedMemory(
+        t.data_ptr(), n_bytes, owner=t, device_id=t.device.index,
+    )
+    return cp.ndarray(
+        shape=(n_bytes,), dtype=cp.uint8, memptr=cp.cuda.MemoryPointer(mem, 0),
+    )
+
+
+def _on_torch_stream():
+    """Launch on the CURRENT torch stream. PyTorch streams are
+    non-blocking, so a cupy default-stream launch would race the H2D
+    stream / main stream ordering the cube pipeline relies on."""
+    cp = _get_cupy()
+    return cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
+
+
 def transpose_compact_tmajor(
     cells_packed: torch.Tensor, dense: torch.Tensor,
 ) -> None:
     """(t, k) -> (k, t) transpose of the compact COO buffer."""
     n_sb, t_rows, packed_w = cells_packed.shape
     n_filled_max = packed_w // 2
+    if tuple(dense.shape[:2]) != (n_sb, n_filled_max) or dense.shape[3] != 2:
+        raise ValueError(
+            f"dense {tuple(dense.shape)} does not match compact "
+            f"{tuple(cells_packed.shape)}"
+        )
     t_pad = dense.shape[2]
+    if t_pad < t_rows:
+        raise ValueError(f"dense t_pad={t_pad} < compact rows={t_rows}")
     kern = _get_module_v3().get_function("transpose_compact_tmajor")
     threads = 128
-    kern(
-        ((n_filled_max + threads - 1) // threads, t_rows, n_sb),
-        (threads, 1, 1),
-        (
-            _as_cupy(cells_packed), _as_cupy(dense),
-            np.int32(n_sb), np.int32(t_rows), np.int32(t_pad),
-            np.int32(n_filled_max),
-        ),
-    )
+    src = cells_packed if cells_packed.is_contiguous() else cells_packed.contiguous()
+    with _on_torch_stream():
+        kern(
+            ((n_filled_max + threads - 1) // threads, t_rows, n_sb),
+            (threads, 1, 1),
+            (
+                _ptr(src), _ptr(dense),
+                np.int32(n_sb), np.int32(t_rows), np.int32(t_pad),
+                np.int32(n_filled_max),
+            ),
+        )
 
 
 def combine_tiled_v3(
@@ -789,8 +829,30 @@ def combine_tiled_v3(
     threads: int = 1024,
     tile: int | None = None,
     out: torch.Tensor | None = None,
+    out_row0: int = 0,
+    shift_min: int | None = None,
+    shift_max: int | None = None,
 ) -> torch.Tensor:
-    """v2, indexed through the inverse LUT so no dense plane is needed."""
+    """Every fine-DM trial of ``shifts`` in one launch, via the inverse LUT.
+
+    Args:
+        dense: ``[n_sb, n_filled_max, t_pad, 2]`` int8 time-major buffer.
+        inv_lut: ``[n_sb, n_grid*n_grid]`` int32 grid cell -> compact
+            index (-1 absent).
+        shifts: ``[n_fdm, n_sb]`` int32 (cuda).
+        t_rows: valid time rows in ``dense`` (the compact row count).
+        t_out_len: output rows to produce (``t_det - t_lo``).
+        t_lo: first output row in cube-time.
+        out: optional CONTIGUOUS destination, either
+            ``[n_fdm, rows, N, N//2+1]`` complex32 or
+            ``[n_fdm, rows, N, N//2+1, 2]`` float16, with
+            ``rows >= out_row0 + t_out_len``. Output row ``t`` of trial
+            ``f`` lands at ``out[f, out_row0 + t]`` -- which lets the
+            imager write ``uv_batch[:n, t_lo:t_det]`` in place by passing
+            ``uv_batch[:n]`` and ``out_row0=t_lo``.
+        shift_min, shift_max: bounds of ``shifts``. Pass them from a
+            host copy in hot paths: computing them here is a GPU sync.
+    """
     n_sb, n_filled_max, t_pad, two = dense.shape
     if two != 2:
         raise ValueError(
@@ -802,9 +864,17 @@ def combine_tiled_v3(
         raise ValueError(
             f"shifts must be [n_fdm, n_sb={n_sb}]; got {tuple(shifts.shape)}"
         )
+    if tuple(inv_lut.shape) != (n_sb, n_grid * n_grid):
+        raise ValueError(
+            f"inv_lut must be ({n_sb}, {n_grid * n_grid}); got "
+            f"{tuple(inv_lut.shape)}"
+        )
     n_half = n_grid // 2 + 1
-    s_min = int(shifts.min().item())
-    s_max = int(shifts.max().item())
+    if shift_min is None or shift_max is None:
+        s_min = int(shifts.min().item())
+        s_max = int(shifts.max().item())
+    else:
+        s_min, s_max = int(shift_min), int(shift_max)
     spread = s_max - s_min
     if tile is None:
         tile = max_tile_for(n_sb, spread, t_out_len)
@@ -820,21 +890,47 @@ def combine_tiled_v3(
             (n_fdm, t_out_len, n_grid, n_half, 2),
             dtype=torch.float16, device=dense.device,
         )
+        out_rows = t_out_len
+        out_row0 = 0
+    else:
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous (pass the parent buffer + out_row0)")
+        if out.dtype == torch.complex32:
+            want_tail = (n_grid, n_half)
+        elif out.dtype == torch.float16:
+            want_tail = (n_grid, n_half, 2)
+        else:
+            raise ValueError(f"out dtype {out.dtype} not complex32/float16")
+        if int(out.shape[0]) < n_fdm or tuple(out.shape[2:]) != want_tail:
+            raise ValueError(
+                f"out shape {tuple(out.shape)} incompatible with n_fdm={n_fdm} "
+                f"N={n_grid}"
+            )
+        out_rows = int(out.shape[1])
+        if out_row0 < 0 or out_row0 + t_out_len > out_rows:
+            raise ValueError(
+                f"out_row0={out_row0} + t_out_len={t_out_len} > rows={out_rows}"
+            )
     kern = _get_module_v3().get_function("tiled_combine_per_fdm_v3")
     n_tiles = (t_out_len + tile - 1) // tile
-    kern(
-        (n_grid * n_half, n_tiles), (threads, 1, 1),
-        (
-            _as_cupy(dense), _as_cupy(inv_lut.int()), _as_cupy(shifts.int()),
-            _as_cupy(out),
-            np.int32(n_sb), np.int32(t_rows), np.int32(t_pad),
-            np.int32(n_filled_max), np.int32(n_grid), np.int32(n_half),
-            np.int32(n_fdm), np.int32(t_out_len), np.int32(t_lo),
-            np.int32(s_max), np.int32(win_w), np.int32(tile),
-            np.int32(1 if fftshift else 0),
-        ),
-        shared_mem=shmem,
-    )
+    lut_i = inv_lut if (inv_lut.dtype == torch.int32 and inv_lut.is_contiguous()) \
+        else inv_lut.int().contiguous()
+    sh_i = shifts if (shifts.dtype == torch.int32 and shifts.is_contiguous()) \
+        else shifts.int().contiguous()
+    with _on_torch_stream():
+        kern(
+            (n_grid * n_half, n_tiles), (threads, 1, 1),
+            (
+                _ptr(dense), _ptr(lut_i), _ptr(sh_i), _ptr(out),
+                np.int32(n_sb), np.int32(t_rows), np.int32(t_pad),
+                np.int32(n_filled_max), np.int32(n_grid), np.int32(n_half),
+                np.int32(n_fdm), np.int32(t_out_len), np.int32(t_lo),
+                np.int32(s_max), np.int32(win_w), np.int32(tile),
+                np.int32(1 if fftshift else 0),
+                np.int32(out_rows), np.int32(out_row0),
+            ),
+            shared_mem=shmem,
+        )
     return out
 
 

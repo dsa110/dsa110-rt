@@ -2381,6 +2381,8 @@ def _build_search_config_from_yaml(
     t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
     enable_c1: bool = True,
     c1_bind_host_override: Optional[str] = None,
+    gpu_n_chgroup: int = 16,
+    gpu_combine_impl: str = "dense",
 ) -> SearchComputeConfig:
     """Translate ``configs/config_compute_search.yaml`` into
     ``SearchComputeConfig`` with optional M6 sub-systems gated on the
@@ -2414,6 +2416,10 @@ def _build_search_config_from_yaml(
         # configured block size.
         gpu_t_det=int(t_det),
         gpu_n_fdm=int(n_fdm),
+        # One combine input per ring stream: 16 whole chgroups, or
+        # 16*n_sub sub-band streams.
+        gpu_n_chgroup=int(gpu_n_chgroup),
+        gpu_combine_impl=str(gpu_combine_impl),
         cube_cadence_samples=int(cube_cadence_samples),
         cube_pipeline_carry_over_re_imaging=bool(
             cube_pipeline_carry_over_re_imaging
@@ -2840,6 +2846,7 @@ async def _run_async(args: argparse.Namespace) -> int:
     # Lazy import so the CLI parser still works without the C extension
     # when --help is invoked on a dev box.
     from ..transport.production_rx_ring import ProductionRxRingSource
+    from ..coarse_dm.dm_plan import subband_ref_freqs_table_GHz
     from ..transport.recv_ring import (
         BYTES_CFP16_COMPLEX,
         BYTES_CINT8_COMPLEX,
@@ -2963,17 +2970,31 @@ async def _run_async(args: argparse.Namespace) -> int:
             else:
                 cell_lambda_used = None
             n_corr_local = int(args.n_corr)
+            n_sub_local = int(args.n_sub)
+            if n_corr_local % n_sub_local != 0:
+                raise ValueError(
+                    f"--n-corr={n_corr_local} is not a multiple of "
+                    f"--n-sub={n_sub_local}"
+                )
             patterns = []
             for c in range(n_corr_local):
+                # Ring stream c = sub-band (c % n_sub) of chgroup
+                # (c // n_sub); identical inputs to the corr side's
+                # dsart.grid.subband.build_subband_patterns, so the
+                # per-stream pattern_ids agree.
                 pat = build_pattern(
                     antpos_e, antpos_n,
-                    chgroup=c,
+                    chgroup=c // n_sub_local,
                     dec_deg=float(args.obs_dec_deg),
                     n_grid=int(args.n_grid),
                     kernel_support=int(args.kernel_support),
                     chan_sum_factor=int(args.chan_sum_factor),
                     cell_lambda=cell_lambda_used,
                     is_core_baseline_mask=is_core_mask,
+                    sub_band=(
+                        None if n_sub_local == 1
+                        else (c % n_sub_local, n_sub_local)
+                    ),
                 )
                 patterns.append(pat)
             n_filled_max = max(int(p.n_filled) for p in patterns)
@@ -3101,6 +3122,11 @@ async def _run_async(args: argparse.Namespace) -> int:
         # H2D, and the (now redundant) Layer-1 coverage correction
         # is auto-disabled on first such slot.
         symmetric_shift_padding=bool(args.symmetric_shift_padding),
+        n_sub=int(args.n_sub),
+        nu_subband_ref_GHz=(
+            subband_ref_freqs_table_GHz(int(args.chan_sum_factor), int(args.n_sub))
+            if int(args.n_sub) > 1 else None
+        ),
     )
 
     if args.config_yaml is not None and args.config_yaml.exists():
@@ -3148,6 +3174,8 @@ async def _run_async(args: argparse.Namespace) -> int:
         t_int_search_us=args.t_int_search_us,
         enable_c1=not args.disable_c1,
         c1_bind_host_override=args.c1_bind_host,
+        gpu_n_chgroup=int(args.n_corr),
+        gpu_combine_impl=str(args.combine_impl),
     )
 
     if image_cell_rad is not None:
@@ -3322,6 +3350,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "chgroup before gridding (must match the "
                         "corr-side --chan-sum-factor; default 8 to "
                         "match the M7.4 launcher).")
+    p.add_argument("--n-sub", type=int, default=1,
+                   help="Sub-bands per chgroup; MUST match corr_fast "
+                        "--n-sub. The ring then carries 16*n_sub streams "
+                        "(stream = chgroup*n_sub + s), so --n-corr and "
+                        "--fan-in-min-corrs must be scaled by n_sub too. "
+                        "1 (default) = whole chgroups, unchanged.")
+    p.add_argument("--combine-impl", default="dense",
+                   choices=("dense", "compact"),
+                   help="GPU fine-DM combine. 'dense' (default): expand the "
+                        "compact COO into [n_corr, t_stream, 2, N, N] planes "
+                        "then combine one fine-DM trial at a time. "
+                        "'compact': time-major compact buffer + inverse LUT, "
+                        "every fine-DM trial of an FFT batch per launch "
+                        "(dsart.image.tiled_combine_cuda v3) -- bit-identical "
+                        "output, ~4x faster at 64 streams and no dense "
+                        "planes (which OOM above ~40 streams).")
     p.add_argument("--cell-lambda-mode", default="common",
                    choices=("common", "tee45", "per_chgroup"),
                    help="F28 cell-lambda mode (must match corr; default "

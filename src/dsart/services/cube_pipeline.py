@@ -205,6 +205,14 @@ class CubePipelineConfig:
     gpu_t_det: Optional[int] = None
     gpu_n_fdm: Optional[int] = None
     gpu_n_chgroup: int = N_CHGROUP
+    gpu_combine_impl: str = "dense"
+    """``"dense"``: expand the compact COO into ``[n_chg, t_stream, 2,
+    N, N]`` int8 planes (ping-ponged) and combine one fine-DM trial per
+    launch. ``"compact"``: transpose the compact COO into a time-major
+    ``[n_chg, n_filled_max, t_pad, 2]`` buffer, resolve cells through a
+    static inverse LUT, and combine every fine-DM trial of an FFT batch
+    per launch (:func:`dsart.image.tiled_combine_cuda.combine_tiled_v3`).
+    Bit-identical output; needs the GPU-scatter (compact) ingest."""
     gpu_complex_dtype: torch.dtype = torch.complex32
     # Constant folded into the GPU imager's uv_batch before the inverse
     # FFT (forwarded to ``GpuImagerConfig.imager_uv_prescale``). Default
@@ -330,6 +338,11 @@ class CubePipelineConfig:
                 raise ValueError(
                     f"gpu_n_chgroup={self.gpu_n_chgroup}; expected > 0"
                 )
+        if self.gpu_combine_impl not in ("dense", "compact"):
+            raise ValueError(
+                f"gpu_combine_impl={self.gpu_combine_impl!r}; expected "
+                f"'dense' or 'compact'"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,6 +411,15 @@ class _H2dStaged:
     cint8_buf_idx: int
     build_start_ns: int
     h2d_event: Optional[torch.cuda.Event] = None
+    # gpu_combine_impl="compact": ``cint8_t`` is then the time-major
+    # [n_chg, n_filled_max, t_pad, 2] buffer and this is its
+    # [n_chg, N*N] inverse LUT; ``t_stream`` is the valid time extent.
+    compact_inv_lut: Optional[torch.Tensor] = None
+    t_stream: int = 0
+    # Host-side bounds of the (offset-applied) shift table, so the
+    # compact combine sizes its staging window without a GPU sync.
+    shift_min: int = 0
+    shift_max: int = 0
 
 
 @dataclass(slots=True)
@@ -907,6 +929,10 @@ class CubePipeline:
         self._compact_lut_host_id: Optional[int] = None
         self._compact_nfp_gpu: Optional[torch.Tensor] = None
         self._compact_nfp_host_id: Optional[int] = None
+        # gpu_combine_impl="compact": static [n_chg, N*N] inverse LUT,
+        # rebuilt only when the LUT / n_filled host arrays change.
+        self._compact_inv_lut_gpu: Optional[torch.Tensor] = None
+        self._compact_inv_lut_key: Optional[tuple] = None
         self._shifts_gpu_buf: Optional[torch.Tensor] = None
         self._validity_gpu_buf: Optional[torch.Tensor] = None
         self._validity_all_true_gpu: Optional[torch.Tensor] = None
@@ -1266,6 +1292,7 @@ class CubePipeline:
         chgroup_scale_t: Optional[torch.Tensor] = None
         chgroup_offset_re_t: Optional[torch.Tensor] = None
         chgroup_offset_im_t: Optional[torch.Tensor] = None
+        compact_inv_lut_t: Optional[torch.Tensor] = None
         enable_gpu_buf_reuse = bool(
             int(os.environ.get("DSART_ENABLE_GPU_BUF_REUSE", "0"))
         )
@@ -1337,7 +1364,20 @@ class CubePipeline:
             # never touched again (mirrors the M7.4 dense scatter's
             # tail-stays-zero invariant — the compact assembler never
             # writes lookahead samples either).
-            dense_shape = (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid)
+            use_compact_combine = cfg.gpu_combine_impl == "compact"
+            if use_compact_combine:
+                # Time-major compact buffer, not the dense planes: at 64
+                # sub-band streams the dense ping-pong would be ~5.5 GiB
+                # and OOM; this is [n_chg, n_filled_max, t_pad, 2] int8
+                # (~110 MB at 64 x 2500 cells). Still ping-ponged: the
+                # combine reads it on the main stream while the next
+                # cube's prefetch writes the other one.
+                from ..image.tiled_combine_cuda import pad_t
+                dense_shape = (
+                    n_chg, n_filled_max, pad_t(t_stream), 2,
+                )
+            else:
+                dense_shape = (n_chg, t_stream, 2, cfg.n_grid, cfg.n_grid)
             if use_pp:
                 buf = self._cint8_gpu_buf_pp[cint8_dest_idx]
                 if (
@@ -1409,16 +1449,37 @@ class CubePipeline:
             # the imager kernel then has in-range source rows for
             # every (cube_t, fdm, g) tuple (100 % coverage).
             n_rows_compact = int(compact.shape[1])
-            zero_dense_rows(dense=cint8_t, t_det=n_rows_compact)
-            scatter_compact_to_dense(
-                cells_packed=self._compact_gpu_buf,
-                lut=self._compact_lut_gpu,
-                n_filled_per_corr=self._compact_nfp_gpu,
-                dense=cint8_t,
-                t_det=n_rows_compact,
-                n_grid=cfg.n_grid,
-                n_filled_max=n_filled_max,
-            )
+            if use_compact_combine:
+                from ..image.tiled_combine_cuda import (
+                    build_inverse_lut,
+                    transpose_compact_tmajor,
+                )
+                # Rows [n_rows, t_pad) are never written and stay zero
+                # from allocation, exactly as the dense planes' tail
+                # rows do; cells k >= n_filled[g] are zero in the
+                # compact buffer and the inverse LUT never points there.
+                transpose_compact_tmajor(self._compact_gpu_buf, cint8_t)
+                if (
+                    self._compact_inv_lut_gpu is None
+                    or self._compact_inv_lut_key != (lut_host_id, nfp_host_id)
+                ):
+                    self._compact_inv_lut_gpu = build_inverse_lut(
+                        self._compact_lut_gpu, self._compact_nfp_gpu,
+                        n_grid=cfg.n_grid,
+                    )
+                    self._compact_inv_lut_key = (lut_host_id, nfp_host_id)
+                compact_inv_lut_t = self._compact_inv_lut_gpu
+            else:
+                zero_dense_rows(dense=cint8_t, t_det=n_rows_compact)
+                scatter_compact_to_dense(
+                    cells_packed=self._compact_gpu_buf,
+                    lut=self._compact_lut_gpu,
+                    n_filled_per_corr=self._compact_nfp_gpu,
+                    dense=cint8_t,
+                    t_det=n_rows_compact,
+                    n_grid=cfg.n_grid,
+                    n_filled_max=n_filled_max,
+                )
             # Sidecar H2D follows the same per-(chgroup, t) path as
             # the M7.4 dense scatter (shape [N_chg, T_stream] f32).
             if slot.per_chgroup_scale_per_t is not None:
@@ -1570,6 +1631,10 @@ class CubePipeline:
             chgroup_offset_im_t=chgroup_offset_im_t,
             cint8_buf_idx=cint8_dest_idx,
             build_start_ns=0,  # caller fills in
+            compact_inv_lut=compact_inv_lut_t,
+            t_stream=int(t_stream),
+            shift_min=int(np.min(shifts_host_np)),
+            shift_max=int(np.max(shifts_host_np)),
         )
 
     def get_build_event_timing_and_reset(self) -> dict:
@@ -1746,6 +1811,9 @@ class CubePipeline:
 
         cube = self._gpu_imager.process_cube(  # type: ignore[union-attr]
             streams_cint8=staged.cint8_t,
+            compact_inv_lut=staged.compact_inv_lut,
+            compact_t_stream=int(staged.t_stream),
+            compact_shift_bounds=(int(staged.shift_min), int(staged.shift_max)),
             time_shifts_gpu=staged.shifts_t,
             chgroup_scales=staged.chgroup_scale_t if apply_cal else None,
             chgroup_offsets_re=staged.chgroup_offset_re_t if apply_cal else None,
@@ -1814,7 +1882,9 @@ class CubePipeline:
                 self._verify_full_coverage_or_raise(
                     staged.shifts_t, int(cube.shape[0]),
                     offset=int(staged.slot.stream_origin_offset_samples),
-                    t_stream=int(staged.cint8_t.shape[1]),
+                    t_stream=int(
+                        staged.t_stream or staged.cint8_t.shape[1]
+                    ),
                 )
             _LOG.info(
                 "CubePipeline: detected symmetric-shift padding "

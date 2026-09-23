@@ -101,9 +101,12 @@ class TimeShiftSearchTable:
             raise ValueError(
                 f"shifts must be 2D [N_fine, N_chgroup]; got shape {self.shifts.shape}"
             )
-        if self.shifts.shape[1] != N_CHGROUP:
+        # One column per search stream: N_CHGROUP whole chgroups, or
+        # N_CHGROUP * n_sub sub-band streams (stream = chgroup*n_sub + s).
+        if self.shifts.shape[1] % N_CHGROUP != 0:
             raise ValueError(
-                f"shifts.shape[1]={self.shifts.shape[1]} != N_CHGROUP={N_CHGROUP}"
+                f"shifts.shape[1]={self.shifts.shape[1]} is not a multiple "
+                f"of N_CHGROUP={N_CHGROUP}"
             )
         if self.shifts.dtype != np.int32:
             raise TypeError(
@@ -156,8 +159,29 @@ def compute_time_shift_search(
     include_coarse_offset: bool = False,
     merge_coarse_rounding: bool = False,
     t_int_corr_us: Optional[float] = None,
+    n_sub: int = 1,
+    nu_subband_ref_GHz: Optional[np.ndarray] = None,
 ) -> TimeShiftSearchTable:
     """Build the per-fine-DM × per-chgroup integer-sample shift table.
+
+    Sub-band streams (``n_sub > 1``)
+    --------------------------------
+
+    With corr-side sub-band gridding each chgroup arrives as ``n_sub``
+    streams (column ``g*n_sub + s``). Stage 1 aligned sub-band ``s`` to
+    its own reference ``ν_sub[g, s]`` (``nu_subband_ref_GHz``, the corr
+    plan's ``subband_ref_freqs_GHz``), while the corr stage-2 FIFO still
+    applied the WHOLE-chgroup delay ``rint(Δτ(ν_bot, ν_TOP[g], c)/T)``.
+    The total wanted is one rounding of the sub-band's own fine delay,
+    so
+
+        shift[f, g*n_sub+s] = rint(Δτ(ν_bot, ν_sub[g,s], dm_fine)/T)
+                            - rint(Δτ(ν_bot, ν_TOP[g],   dm_coarse)/T)
+
+    i.e. the merged-rounding form with the fine term moved to the
+    sub-band reference and the coarse term left exactly equal to what
+    the corr subtracted. Requires ``merge_coarse_rounding=True``.
+    ``n_sub == 1`` ignores ``nu_subband_ref_GHz`` and is unchanged.
 
     ``merge_coarse_rounding`` (2026-09-22, x1.026 recovered S/N at
     W <= 1 ms): collapse the corr-side stage-2 rounding and this
@@ -386,6 +410,43 @@ def compute_time_shift_search(
             )
 
     n_fine = fine_dm_pc_cm3.shape[0]
+    if int(n_sub) > 1:
+        if not merge_coarse_rounding:
+            raise ValueError(
+                "n_sub > 1 requires merge_coarse_rounding=True (the "
+                "sub-band shift is defined as one rounding of the "
+                "sub-band's fine delay minus the corr stage-2 integer)"
+            )
+        refs = np.asarray(nu_subband_ref_GHz, dtype=np.float64)
+        if refs.shape != (N_CHGROUP, int(n_sub)):
+            raise ValueError(
+                f"nu_subband_ref_GHz must be ({N_CHGROUP}, {n_sub}); got "
+                f"{refs.shape}"
+            )
+        ns = int(n_sub)
+        shifts = np.zeros((n_fine, N_CHGROUP * ns), dtype=np.int32)
+        for f in range(n_fine):
+            c = int(fine_to_coarse[f])
+            for g in range(N_CHGROUP):
+                s_coarse = np.rint(
+                    delta_tau_us(float(nu_bot_proc_GHz),
+                                 float(nu_chgroup_ref[g]),
+                                 float(coarse_dm_pc_cm3[c])) / t_int_search_us
+                )
+                for s in range(ns):
+                    s_fine = np.rint(
+                        delta_tau_us(float(nu_bot_proc_GHz),
+                                     float(refs[g, s]),
+                                     float(fine_dm_pc_cm3[f])) / t_int_search_us
+                    )
+                    shifts[f, g * ns + s] = int(s_fine - s_coarse)
+        return TimeShiftSearchTable(
+            shifts=shifts,
+            fine_to_coarse=fine_to_coarse.astype(np.int64, copy=False),
+            t_int_search_us=float(t_int_search_us),
+            coarse_offset_baked=False,
+        )
+
     shifts = np.zeros((n_fine, N_CHGROUP), dtype=np.int32)
     for f in range(n_fine):
         c = int(fine_to_coarse[f])

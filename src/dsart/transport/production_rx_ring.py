@@ -234,6 +234,12 @@ class ProductionRxRingSource:
         # partial-coverage) geometry. See ``CubeRingSlot.stream_origin
         # _offset_samples`` for the full contract.
         symmetric_shift_padding: bool = False,
+        # Sub-band streams: ring_dims.n_corr == N_CHGROUP * n_sub, stream
+        # g*n_sub + s = sub-band s of chgroup g, each with its own shift
+        # column referenced to nu_subband_ref_GHz[g, s] (see
+        # compute_time_shift_search). 1 = whole chgroups, unchanged.
+        n_sub: int = 1,
+        nu_subband_ref_GHz: np.ndarray | None = None,
     ) -> None:
         if n_fdm_in_cube <= 0:
             raise ValueError(f"n_fdm_in_cube={n_fdm_in_cube}, expected > 0")
@@ -302,7 +308,17 @@ class ProductionRxRingSource:
                 # that have not been updated still work when they opt in.
                 else float(t_int_search_us)
             ),
+            n_sub=int(n_sub),
+            nu_subband_ref_GHz=nu_subband_ref_GHz,
         )
+        if int(n_sub) > 1 and (
+            int(self._time_shift_table.shifts.shape[1]) != int(ring_dims.n_corr)
+        ):
+            raise ValueError(
+                f"shift table has {self._time_shift_table.shifts.shape[1]} "
+                f"stream columns but the ring has n_corr={ring_dims.n_corr}; "
+                f"search_rx --n-corr must equal 16 * --n-sub ({n_sub})"
+            )
         self._include_coarse_offset_in_search_shifts = bool(
             include_coarse_offset_in_search_shifts
         )
