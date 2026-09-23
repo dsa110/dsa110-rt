@@ -686,13 +686,29 @@ class SearchComputeService:
         # NOT reconstructed here: ``CubePipeline`` publishes it from the
         # imager that actually multiplies the cube, so the two cannot
         # drift apart. See CubePipeline._publish_spatial_active.
+        # ``layer1_sigma_floor`` is tuned in UN-prescaled image units
+        # (5e-3 between the ~1e-4 warm-up transient and the ~2e-2
+        # steady state). ``imager_uv_prescale`` shrinks the raw image by
+        # the same factor, so the floor must shrink with it: at 1/256 an
+        # unscaled floor sat 20x ABOVE the steady-state sigma, Layer-1
+        # divided by the floor, the detector saw ~0.05 sigma, Layer-2
+        # pinned at its 0.5 floor and every SNR was ~10x low
+        # (2026-09-23: injections stopped being recovered).
+        l1_floor = float(config.layer1_sigma_floor) * float(
+            getattr(config.pipeline, "imager_uv_prescale", 1.0) or 1.0
+        )
+        if l1_floor != float(config.layer1_sigma_floor):
+            _LOG.info(
+                "layer1 sigma floor %.3g scaled by imager_uv_prescale -> %.3g",
+                float(config.layer1_sigma_floor), l1_floor,
+            )
         self._layer1_state = layer1_state or Layer1State(
             n_fdm=config.n_fdm,
             n_burnin_cubes=config.layer1_n_burnin_cubes,
             n_sigma=config.layer1_n_sigma,
             n_iterations=config.layer1_n_iterations,
             max_samples=config.layer1_max_samples,
-            sigma_floor=config.layer1_sigma_floor,
+            sigma_floor=l1_floor,
         )
         # M7.4: thread the fine-DM grid (pc/cc) into the pipeline so
         # the decoder writes the physical DM (pc/cc) into
