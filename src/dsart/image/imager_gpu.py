@@ -150,6 +150,10 @@ class GpuImager:
     # trials; the per-batch FFT reads views of it) + the static per-cell
     # stream lists keyed by the inverse LUT they were built from.
     _uv_full: Optional[torch.Tensor] = None
+    # the two buffers ``edge_mask_per_fdm`` alternates between, and the
+    # event marking the latest write (waited on before it is read)
+    _edge_mask_per_fdm_pp: list = field(default_factory=list)
+    _edge_mask_ready_event: Optional[object] = None
     _compact_csr: Optional[object] = None
     _compact_csr_key: Optional[tuple] = None
     _output_index: int = 0
@@ -473,6 +477,13 @@ class GpuImager:
         per_cube_combine_evs: list = []
         per_cube_fft_evs: list = []
         per_cube_mask_evs: list = []
+        if (
+            self.edge_mask_per_fdm is not None
+            and self._edge_mask_ready_event is not None
+        ):
+            torch.cuda.current_stream(self.device).wait_event(
+                self._edge_mask_ready_event
+            )
         if use_compact:
             from dsart.image.tiled_combine_cuda import (
                 build_sparse_cell_csr,
@@ -733,18 +744,27 @@ class GpuImager:
                 f"sigma_inv.shape={tuple(sigma_inv.shape)}, expected "
                 f"({cfg.n_fdm},)"
             )
+        # Ping-pong: write the buffer the NEWEST enqueued build is NOT
+        # reading. Under --pipeline-overlap the next cube's imager is
+        # already queued on the prefetch stream reading the current
+        # mask when this runs on the main stream; an in-place rewrite
+        # raced it, so which σ a cube got depended on GPU timing. The
+        # other buffer's last reader is the cube whose Layer-1 is
+        # calling us, and Layer-1 already waited for that build.
+        shape = (cfg.n_fdm, cfg.n_grid, cfg.n_grid)
+        bufs = self._edge_mask_per_fdm_pp
         if (
-            self.edge_mask_per_fdm is None
-            or self.edge_mask_per_fdm.shape
-            != (cfg.n_fdm, cfg.n_grid, cfg.n_grid)
-            or self.edge_mask_per_fdm.dtype != cfg.cube_dtype
-            or self.edge_mask_per_fdm.device != self.device
+            len(bufs) != 2
+            or bufs[0].shape != shape
+            or bufs[0].dtype != cfg.cube_dtype
+            or bufs[0].device != self.device
         ):
-            self.edge_mask_per_fdm = torch.empty(
-                (cfg.n_fdm, cfg.n_grid, cfg.n_grid),
-                dtype=cfg.cube_dtype,
-                device=self.device,
-            )
+            bufs = [
+                torch.empty(shape, dtype=cfg.cube_dtype, device=self.device)
+                for _ in range(2)
+            ]
+            self._edge_mask_per_fdm_pp = bufs
+        dst = bufs[1] if self.edge_mask_per_fdm is bufs[0] else bufs[0]
         # ``edge_mask_real`` is [N, N] cube_dtype; broadcast multiply
         # to [N_fdm, N, N] keeps the cast in cube_dtype.
         sigma_inv_cube = sigma_inv.to(
@@ -753,8 +773,15 @@ class GpuImager:
         torch.mul(
             self.edge_mask_real[None, :, :],
             sigma_inv_cube[:, None, None],
-            out=self.edge_mask_per_fdm,
+            out=dst,
         )
+        self.edge_mask_per_fdm = dst
+        # ...and the next build (possibly on another stream) must not
+        # read ``dst`` before this write lands
+        if self.device.type == "cuda":
+            ev = torch.cuda.Event(enable_timing=False)
+            ev.record(torch.cuda.current_stream(self.device))
+            self._edge_mask_ready_event = ev
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,10 @@ __all__ = [
 
 _LOG = logging.getLogger(__name__)
 
+#: ``_layer1_normalise(sigma_applied=...)`` default: use the σ of the
+#: most recently BUILT cube (right for every sequential build path).
+_LAST_BUILD = object()
+
 
 # Maximum finite magnitude we keep in fp16 cube tensors. fp16 saturates
 # above ~65504, so very bright bursts (or pathological dequant inputs)
@@ -389,6 +393,8 @@ class PrefetchedCube:
     validity_mask: torch.Tensor
     build_start_ns: int
     build_ready_event: Optional[torch.cuda.Event] = None
+    # σ this cube was imaged with (fused Layer-1); None = raw units.
+    sigma_applied: Optional[torch.Tensor] = None
 
 
 @dataclass(slots=True)
@@ -1056,6 +1062,16 @@ class CubePipeline:
         # cube was emitted in raw units (fused-L1 was disabled, or
         # the prev cube was cube 0).
         self._sigma_applied_to_prev_cube: Optional[torch.Tensor] = None
+        # The σ the MOST RECENTLY BUILT cube was imaged with (its new
+        # rows via the fused mask, its carry-over rows via the rescale).
+        # Fused Layer-1 must recover absolute σ with THIS value, not
+        # with ``_sigma_layer1_prev``: under ``--pipeline-overlap`` cube
+        # N+1 is built before cube N's Layer-1 runs, so the two differ
+        # by one cube. Multiplying by the wrong one made the per-fdm σ
+        # a marginally stable recursion (log σ_n = log σ_raw + log
+        # σ_{n-1} - log σ_{n-2}) that never damped: live 2026-09-23
+        # the detector saw per-fdm σ from 0.14 to 0.61 and flooded.
+        self._last_build_sigma_applied: Optional[torch.Tensor] = None
 
     @property
     def edge_mask(self) -> torch.Tensor:
@@ -1865,6 +1881,7 @@ class CubePipeline:
         if self._carry_over_enabled:
             self._prev_cube_for_carryover = cube
             self._sigma_applied_to_prev_cube = sigma_applied_now
+        self._last_build_sigma_applied = sigma_applied_now
         # M7.7 symmetric-shift padding: when the rx_ring pre-pads the
         # per-chgroup stream symmetrically, the imager kernel has
         # in-range source rows for every (t, fdm, g) tuple — coverage
@@ -2209,6 +2226,8 @@ class CubePipeline:
     def _layer1_normalise(
         self,
         cube: torch.Tensor,
+        *,
+        sigma_applied: object = _LAST_BUILD,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute per-fdm Layer-1 σ + return (cube_normalised, sigma).
 
@@ -2239,7 +2258,10 @@ class CubePipeline:
             self._fuse_layer1_into_imager
             and self.config.image_backend == "gpu"
         ):
-            return self._layer1_normalise_fused(cube)
+            if sigma_applied is _LAST_BUILD:
+                # sequential paths: this cube is the last one built
+                sigma_applied = self._last_build_sigma_applied
+            return self._layer1_normalise_fused(cube, sigma_applied)
         # M7.4.2: pre-divide by sqrt(n_chg_contrib / n_chg_max) so per-
         # cell variance is uniform across (t, fdm) before sigma_clipped
         # estimation. See _ensure_coverage_factor() docstring for the
@@ -2268,6 +2290,7 @@ class CubePipeline:
     def _layer1_normalise_fused(
         self,
         cube: torch.Tensor,
+        sigma_applied: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer-1 estimation with the divide fused into the imager.
 
@@ -2291,13 +2314,16 @@ class CubePipeline:
         steady state after the burn-in completes.
         """
         sigma_observed = self.layer1_state._layer1_sigma_cached(cube)
-        if self._sigma_layer1_prev is None:
+        # Undo exactly the σ THIS cube was imaged with (see
+        # ``_last_build_sigma_applied``), so σ_this is this cube's
+        # absolute σ with no dependence on earlier estimates.
+        if sigma_applied is None:
             sigma_this = sigma_observed
         else:
-            prev = self._sigma_layer1_prev.to(
+            applied = sigma_applied.to(
                 dtype=sigma_observed.dtype, device=sigma_observed.device
             )
-            sigma_this = sigma_observed * prev
+            sigma_this = sigma_observed * applied
         sigma_for_use = self.layer1_state.update_and_query(
             per_fdm_sigma=sigma_this
         )
@@ -2595,6 +2621,7 @@ class CubePipeline:
                 validity_mask=validity_mask,
                 build_start_ns=t0,
                 build_ready_event=None,
+                sigma_applied=self._last_build_sigma_applied,
             )
         with torch.cuda.stream(self._prefetch_stream):
             cube, validity_mask = self._build_cube(slot)
@@ -2606,6 +2633,9 @@ class CubePipeline:
             validity_mask=validity_mask,
             build_start_ns=t0,
             build_ready_event=ready,
+            # the caller builds cube N+1 BEFORE running cube N's
+            # Layer-1, so the σ must travel with the cube
+            sigma_applied=self._last_build_sigma_applied,
         )
 
     def process_prefetched(self, prefetched: PrefetchedCube) -> CubePipelineResult:
@@ -2616,7 +2646,9 @@ class CubePipeline:
                 prefetched.build_ready_event
             )
         t1 = time.perf_counter_ns()
-        cube_norm, sigma_layer1 = self._layer1_normalise(prefetched.cube)
+        cube_norm, sigma_layer1 = self._layer1_normalise(
+            prefetched.cube, sigma_applied=prefetched.sigma_applied,
+        )
         t2 = time.perf_counter_ns()
         with torch.no_grad():
             cands = self.detector.forward(
