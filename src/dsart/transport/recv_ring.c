@@ -81,7 +81,13 @@
  * mixed-version producers/consumers cannot share the same shm. The
  * orchestrator-level cleanup (_m72_*_cleanup.sh) clears stale shm
  * segments on every fleet redeploy. */
-#define RX_RING_VERSION  UINT32_C(2)
+/* n_sub amend (2026-09-23): bump to 3. The per-corr header arrays were
+ * sized [16]; with sub-band streams (n_corr = 16 * n_sub = 64) stream
+ * >= 16 wrote over read_seq / overrun / slot_stride / data_offset. They
+ * are now [RX_RING_MAX_CORR]; the offsets moved, so a v2 peer must be
+ * refused at attach. */
+#define RX_RING_VERSION  UINT32_C(3)
+#define RX_RING_MAX_CORR 64
 #define N_COMPUTE        2                      /* plan §4.4 line 1471 */
 #define HEADER_SIZE      4096                   /* 4 KiB header block */
 #define CACHE_LINE       64
@@ -111,7 +117,7 @@ typedef struct __attribute__((packed)) rx_ring_header {
     /* Magic + version + dimensions */
     uint32_t magic;                      /* 0xD5A1107E */
     uint32_t version;                    /* 1 */
-    uint32_t n_corr;                     /* = 16 */
+    uint32_t n_corr;                     /* 16 * n_sub, <= RX_RING_MAX_CORR */
     uint32_t n_coarse_dm;
     uint32_t t_buf_samples;
     uint32_t n_filled_per_corr;
@@ -119,25 +125,25 @@ typedef struct __attribute__((packed)) rx_ring_header {
     uint32_t _pad0;                      /* align next field to 8 B */
 
     /* Per-corr write sequence (atomic; release on write) */
-    uint64_t write_seq_per_corr[16];     /* offset 32 */
+    uint64_t write_seq_per_corr[RX_RING_MAX_CORR];     /* offset 32 */
 
     /* Per-compute-half read sequence (read by compute; NOT read by RX) */
-    uint64_t read_seq_per_compute[N_COMPUTE]; /* offset 32 + 16*8 = 160 */
+    uint64_t read_seq_per_compute[N_COMPUTE]; /* offset 32 + 64*8 = 544 */
 
     /* Per-corr wrap counters */
-    uint64_t wrap_counter_per_corr[16]; /* offset 176 */
+    uint64_t wrap_counter_per_corr[RX_RING_MAX_CORR]; /* offset 560 */
 
     /* Per-consumer overrun counters [N_compute] */
-    uint64_t overrun_count_per_compute[N_COMPUTE]; /* offset 304 */
+    uint64_t overrun_count_per_compute[N_COMPUTE]; /* offset 1072 */
 
     /* Slot stride in bytes (per (dm, t) step for a given corr) */
-    uint64_t slot_stride_bytes;          /* offset 320 */
+    uint64_t slot_stride_bytes;          /* offset 1088 */
 
     /* Total data section offset from shm base */
-    uint64_t data_offset;               /* offset 328 */
+    uint64_t data_offset;               /* offset 1096 */
 
     /* Padding to fill out 4 KiB */
-    uint8_t _pad1[HEADER_SIZE - 336];
+    uint8_t _pad1[HEADER_SIZE - 1104];
 } rx_ring_header_t;
 
 _Static_assert(sizeof(rx_ring_header_t) == HEADER_SIZE,
@@ -254,6 +260,10 @@ rx_ring_open_or_create(
     }
     if (bytes_per_cell != 2 && bytes_per_cell != 4) {
         ERRF("bytes_per_cell must be 2 or 4, got %u", bytes_per_cell);
+        return NULL;
+    }
+    if (n_corr == 0 || n_corr > RX_RING_MAX_CORR) {
+        ERRF("n_corr must be in [1, %u], got %u", RX_RING_MAX_CORR, n_corr);
         return NULL;
     }
 

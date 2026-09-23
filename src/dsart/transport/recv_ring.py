@@ -304,6 +304,8 @@ VF_RFI_WARMING_UP   = 0b100000  # bit5
 
 BYTES_CINT8_COMPLEX = 2  # 2 × int8
 BYTES_CFP16_COMPLEX = 4  # 2 × float16
+# Mirrors RX_RING_MAX_CORR in recv_ring.c (16 chgroups x n_sub <= 4).
+RX_RING_MAX_CORR = 64
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +334,10 @@ class RxRingDims:
         if bytes_per_cell not in (BYTES_CINT8_COMPLEX, BYTES_CFP16_COMPLEX):
             raise ValueError(
                 f"bytes_per_cell must be 2 (cint8) or 4 (cfp16); got {bytes_per_cell}"
+            )
+        if not 1 <= int(n_corr) <= RX_RING_MAX_CORR:
+            raise ValueError(
+                f"n_corr must be in [1, {RX_RING_MAX_CORR}]; got {n_corr}"
             )
         self.n_corr = int(n_corr)
         self.n_coarse_dm = int(n_coarse_dm)
