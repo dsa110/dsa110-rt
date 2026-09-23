@@ -218,3 +218,88 @@ def test_v3_shared_memory_guard():
         t = max_tile_for(n_sb, 66, 192)
         assert 2 * n_sb * (t + 66) * 2 <= 49152
         assert t >= 1
+
+
+# ---------------------------------------------------------------------------
+# v4 (sparse per-cell stream lists) == v3, bit for bit
+# ---------------------------------------------------------------------------
+from dsart.image.tiled_combine_cuda import (  # noqa: E402
+    build_sparse_cell_csr,
+    combine_sparse_v4,
+)
+
+
+def _v4_vs_v3(cells, lut, n_filled, shifts, n_sb):
+    t_pad = pad_t(T_ROWS)
+    inv = build_inverse_lut(lut, n_filled, n_grid=N_GRID)
+    dense = torch.zeros(
+        (n_sb, N_FILLED_MAX, t_pad, 2), dtype=torch.int8, device=DEV)
+    transpose_compact_tmajor(cells, dense)
+    n_fdm = int(shifts.shape[0])
+    n_half = N_GRID // 2 + 1
+    want = torch.zeros((n_fdm, T_DET, N_GRID, n_half, 2),
+                       dtype=torch.float16, device=DEV)
+    combine_tiled_v3(dense, inv, shifts, n_grid=N_GRID, t_rows=T_ROWS,
+                     t_out_len=T_DET - T_LO, t_lo=T_LO, fftshift=True,
+                     out=want, out_row0=T_LO)
+    # v4 must leave rows < out_row0 alone and never write inactive cells
+    got = torch.full_like(want, 7.0)
+    got[:, T_LO:] = 0
+    csr = build_sparse_cell_csr(inv, n_grid=N_GRID)
+    combine_sparse_v4(dense, csr, shifts, t_rows=T_ROWS,
+                      t_out_len=T_DET - T_LO, t_lo=T_LO, fftshift=True,
+                      out=got, out_row0=T_LO,
+                      shift_min=int(shifts.min()), shift_max=int(shifts.max()))
+    assert torch.equal(got[:, T_LO:], want[:, T_LO:])
+    assert bool((got[:, :T_LO] == 7.0).all())
+    return csr
+
+
+@pytest.mark.parametrize("n_sb,n_fdm", [(4, 6), (16, 8), (64, 5)])
+def test_v4_bit_identical_random_patterns(n_sb, n_fdm):
+    cells, lut, n_filled, shifts = _inputs(n_sb, n_fdm)
+    csr = _v4_vs_v3(cells, lut, n_filled, shifts, n_sb)
+    assert 0 < csr.n_active <= N_GRID * (N_GRID // 2 + 1)
+
+
+def test_v4_all_streams_share_cells_and_multi_tile():
+    """Every stream carries the same cells (the <=64 bucket) and a shift
+    spread wide enough that the window needs several time tiles."""
+    n_sb, n_fdm = 64, 4
+    cells, lut, n_filled, _ = _inputs(n_sb, n_fdm, seed=3)
+    lut = lut[:1].repeat(n_sb, 1).contiguous()
+    rng = np.random.default_rng(9)
+    shifts = torch.from_numpy(
+        rng.integers(-90, 91, size=(n_fdm, n_sb)).astype(np.int32)).to(DEV)
+    csr = _v4_vs_v3(cells, lut, n_filled, shifts, n_sb)
+    assert csr.buckets[-1][2] == n_sb
+
+
+def test_v4_csr_lists_exactly_the_carrying_streams():
+    _cells, lut, n_filled, _s = _inputs(16, 2, seed=5)
+    inv = build_inverse_lut(lut, n_filled, n_grid=N_GRID)
+    csr = build_sparse_cell_csr(inv, n_grid=N_GRID)
+    n_half = N_GRID // 2 + 1
+    inv_np = inv.cpu().numpy()
+    uw = csr.cell_uw.cpu().numpy()
+    ptr = csr.cell_ptr.cpu().numpy()
+    g = csr.ent_g.cpu().numpy()
+    k = csr.ent_k.cpu().numpy()
+    km = csr.ent_km.cpu().numpy()
+    seen = set()
+    for a in range(csr.n_active):
+        u, w = divmod(int(uw[a]), n_half)
+        lin = u * N_GRID + w
+        linm = ((N_GRID - u) % N_GRID) * N_GRID + ((N_GRID - w) % N_GRID)
+        want_g = np.nonzero((inv_np[:, lin] >= 0) | (inv_np[:, linm] >= 0))[0]
+        sl = slice(ptr[a], ptr[a + 1])
+        assert list(g[sl]) == list(want_g)
+        assert list(k[sl]) == list(inv_np[want_g, lin])
+        assert list(km[sl]) == list(inv_np[want_g, linm])
+        seen.add((u, w))
+    # every cell some stream carries is listed exactly once
+    carried = (inv_np >= 0).any(0).reshape(N_GRID, N_GRID)
+    for u in range(N_GRID):
+        for w in range(n_half):
+            um, wm = (N_GRID - u) % N_GRID, (N_GRID - w) % N_GRID
+            assert ((u, w) in seen) == bool(carried[u, w] or carried[um, wm])

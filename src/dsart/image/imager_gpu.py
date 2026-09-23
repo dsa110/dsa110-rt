@@ -146,6 +146,12 @@ class GpuImager:
     edge_mask_per_fdm: Optional[torch.Tensor] = None
     uv_batch: Optional[torch.Tensor] = None        # [B, T_det, N, N] complex_dtype
     img_batch_real: Optional[torch.Tensor] = None  # [B, T_det, N, N] cube_dtype
+    # Compact path only: [N_fdm, T_det, N, N//2+1] complex_dtype (all
+    # trials; the per-batch FFT reads views of it) + the static per-cell
+    # stream lists keyed by the inverse LUT they were built from.
+    _uv_full: Optional[torch.Tensor] = None
+    _compact_csr: Optional[object] = None
+    _compact_csr_key: Optional[tuple] = None
     _output_index: int = 0
     # M7.7.1 Phase A.2 (2026-06-04): per-cube fused-imager substage
     # event ring. Each ring entry is one cube's accumulated
@@ -397,7 +403,29 @@ class GpuImager:
             and os.environ.get("DSART_IMAGER_RFFT", "1") != "0"
         )
         uv_last = (cfg.n_grid // 2 + 1) if use_rfft else cfg.n_grid
-        if (
+        if use_compact:
+            if not use_rfft:
+                raise ValueError(
+                    "compact combine writes the Hermitian half-spectrum "
+                    "and needs the real-FFT path (even N_grid, cfp16, "
+                    "DSART_IMAGER_RFFT != 0)"
+                )
+            # Compact (v4) combines EVERY trial in one launch -- staging
+            # each cell's window once, not once per FFT batch -- so its
+            # destination holds all n_fdm trials; the FFT batches below
+            # are views of it. Replaces uv_batch (freed) on this path.
+            full_shape = (cfg.n_fdm, cfg.t_det, cfg.n_grid, uv_last)
+            if (
+                self._uv_full is None
+                or tuple(self._uv_full.shape) != full_shape
+                or self._uv_full.dtype != cfg.complex_dtype
+                or self._uv_full.device != self.device
+            ):
+                self.uv_batch = None
+                self._uv_full = torch.empty(
+                    full_shape, dtype=cfg.complex_dtype, device=self.device,
+                )
+        elif (
             self.uv_batch is None
             or self.uv_batch.shape != (fft_batch, cfg.t_det, cfg.n_grid, uv_last)
             or self.uv_batch.dtype != cfg.complex_dtype
@@ -445,43 +473,61 @@ class GpuImager:
         per_cube_combine_evs: list = []
         per_cube_fft_evs: list = []
         per_cube_mask_evs: list = []
+        if use_compact:
+            from dsart.image.tiled_combine_cuda import (
+                build_sparse_cell_csr,
+                combine_sparse_v4,
+            )
+            csr_key = (
+                int(compact_inv_lut.data_ptr()),
+                tuple(compact_inv_lut.shape),
+                int(cfg.n_grid),
+            )
+            if self._compact_csr is None or self._compact_csr_key != csr_key:
+                self._compact_csr = build_sparse_cell_csr(
+                    compact_inv_lut, n_grid=int(cfg.n_grid),
+                )
+                self._compact_csr_key = csr_key
+            if compact_shift_bounds is not None:
+                s_lo, s_hi = (int(x) for x in compact_shift_bounds)
+            else:                                   # GPU sync; tests only
+                s_lo = int(time_shifts_gpu.min().item())
+                s_hi = int(time_shifts_gpu.max().item())
+            if gpu_profile:
+                ev_c_start = torch.cuda.Event(enable_timing=True)
+                ev_c_end = torch.cuda.Event(enable_timing=True)
+                ev_c_start.record()
+            # v4 writes only the cells some stream carries; the rest
+            # must be zero (irfft2 may also clobber its input).
+            self._uv_full[:, t_lo:cfg.t_det].zero_()
+            combine_sparse_v4(
+                streams_cint8,
+                self._compact_csr,
+                time_shifts_gpu,
+                t_rows=int(t_stream),
+                t_out_len=int(t_det_local),
+                t_lo=int(t_lo),
+                fftshift=fftshift_in_combine,
+                out=self._uv_full,
+                out_row0=int(t_lo),
+                shift_min=s_lo,
+                shift_max=s_hi,
+            )
+            if gpu_profile:
+                ev_c_end.record()
+                per_cube_combine_evs.append((ev_c_start, ev_c_end))
         for f0 in range(0, cfg.n_fdm, fft_batch):
             n_batch = min(fft_batch, cfg.n_fdm - f0)
+            uv = (
+                self._uv_full[f0:f0 + n_batch] if use_compact
+                else self.uv_batch[:n_batch]
+            )
             if gpu_profile:
                 ev_b_start = torch.cuda.Event(enable_timing=True)
                 ev_b_combine_end = torch.cuda.Event(enable_timing=True)
                 ev_b_fft_end = torch.cuda.Event(enable_timing=True)
                 ev_b_mask_end = torch.cuda.Event(enable_timing=True)
                 ev_b_start.record()
-            if use_compact:
-                if not use_rfft:
-                    raise ValueError(
-                        "compact combine writes the Hermitian half-spectrum "
-                        "and needs the real-FFT path (even N_grid, cfp16, "
-                        "DSART_IMAGER_RFFT != 0)"
-                    )
-                from dsart.image.tiled_combine_cuda import combine_tiled_v3
-                s_lo, s_hi = (
-                    compact_shift_bounds if compact_shift_bounds is not None
-                    else (None, None)
-                )
-                # Every trial of this batch in ONE launch, written in
-                # place into uv_batch[:n_batch, t_lo:T_det] (the parent
-                # buffer is contiguous; out_row0 selects the rows).
-                combine_tiled_v3(
-                    streams_cint8,
-                    compact_inv_lut,
-                    time_shifts_gpu[f0:f0 + n_batch],
-                    n_grid=int(cfg.n_grid),
-                    t_rows=int(t_stream),
-                    t_out_len=int(t_det_local),
-                    t_lo=int(t_lo),
-                    fftshift=fftshift_in_combine,
-                    out=self.uv_batch[:n_batch],
-                    out_row0=int(t_lo),
-                    shift_min=s_lo,
-                    shift_max=s_hi,
-                )
             for j in range(0 if use_compact else n_batch):
                 # M7.7.2 carry-over: pass the sliced uv-batch view
                 # ``uv_batch[j, t_lo:T_det]`` (size ``t_det_local``)
@@ -520,7 +566,7 @@ class GpuImager:
             # to the same ``[:n_batch, t_lo:T_det]`` slice both FFT paths
             # read below. Guarded so prescale==1.0 adds zero ops.
             if apply_prescale:
-                self.uv_batch[:n_batch, t_lo:cfg.t_det].mul_(prescale)
+                uv[:, t_lo:cfg.t_det].mul_(prescale)
             # M7.7.2 carry-over: FFT and mask operate only on the
             # newly-imaged rows ``[t_lo : T_det]``. The image tensor
             # has leading-time-axis size ``t_det_local`` (== T_det
@@ -531,7 +577,7 @@ class GpuImager:
                 # ``.real``, and the fftshift is folded into the combine
                 # write (even N only, enforced above).
                 img_real = torch.fft.irfft2(
-                    self.uv_batch[:n_batch, t_lo:cfg.t_det],
+                    uv[:, t_lo:cfg.t_det],
                     s=(cfg.n_grid, cfg.n_grid),
                 )
                 if not fftshift_in_combine:
@@ -540,9 +586,7 @@ class GpuImager:
                     # DSART_DISABLE_FFTSHIFT_FOLD=1).
                     img_real = torch.fft.fftshift(img_real, dim=(-2, -1))
             else:
-                img_complex = torch.fft.ifft2(
-                    self.uv_batch[:n_batch, t_lo:cfg.t_det]
-                )
+                img_complex = torch.fft.ifft2(uv[:, t_lo:cfg.t_det])
                 if not fftshift_in_combine:
                     # Even-N folds the shift into the combine write (above);
                     # only odd-N needs the explicit roll.

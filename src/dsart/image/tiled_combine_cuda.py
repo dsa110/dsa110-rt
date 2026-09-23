@@ -88,6 +88,7 @@ Graded sub-banding (n_sb=40) lands at ~101 ms = 50%.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -938,4 +939,298 @@ __all__ += [
     "build_inverse_lut",
     "combine_tiled_v3",
     "transpose_compact_tmajor",
+]
+
+
+# ---------------------------------------------------------------------------
+# v4: v3, but each uv cell only visits the streams that carry it
+# ---------------------------------------------------------------------------
+#
+# v3 launches a block for every half-plane cell (33024 at N=256) and sums
+# all n_sb streams for every output, reading zeros for streams that do
+# not carry the cell. With the deployed patterns only 7258 half-cells
+# (22%) are carried by ANY stream, and an active cell is carried by 18.8
+# of the 64 sub-band streams on average (7.2 of 16 at n_sub=1): v3 does
+# 15x the necessary work at n_sub=4. It also re-staged the window once
+# per FFT batch (the imager called it per batch of 12 trials), and at
+# n_sb=64 the 48 KiB staging cap forced 3 time tiles per cell.
+#
+# v4 walks a static per-cell stream list (CSR, built once from the
+# inverse LUT), launches only active cells, and buckets them by list
+# length so each bucket gets the largest tile that fits: most cells then
+# cover the whole output axis in one tile. The accumulation is integer,
+# so skipping streams that contribute exactly 0 is bit-exact with v3.
+# Inactive cells are never written: the caller zeroes the destination.
+
+_CUDA_SOURCE_V4 = r"""
+extern "C" __global__ void sparse_combine_v4(
+    const signed char* __restrict__ dense,    /* [n_sb, nfm, t_pad, 2] */
+    const int*         __restrict__ cell_uw,  /* [n_act] u*n_half + w */
+    const int*         __restrict__ cell_ptr, /* [n_act+1] into ent_*  */
+    const int*         __restrict__ ent_g,    /* [n_ent] stream        */
+    const int*         __restrict__ ent_k,    /* [n_ent] k(lin), -1    */
+    const int*         __restrict__ ent_km,   /* [n_ent] k(mirror), -1 */
+    const int*         __restrict__ shifts,   /* [n_fdm, n_sb]         */
+    __half2*           __restrict__ out,      /* [n_fdm, out_rows, N, n_half] */
+    int cell0, int n_sb, int t_rows, int t_pad, int n_filled_max,
+    int n_grid, int n_half, int n_fdm, int t_out_len, int t_lo,
+    int shift_max, int win_w, int tile, int fftshift,
+    int out_rows, int out_row0)
+{
+    extern __shared__ short sh[];       /* [2][ne][win_w] packed (re,im) */
+    __shared__ int s_g[64];
+
+    const int a = cell0 + blockIdx.x;
+    const int uw = cell_uw[a];
+    const int u = uw / n_half;
+    const int w = uw - u * n_half;
+    const int e0 = cell_ptr[a];
+    const int ne = cell_ptr[a + 1] - e0;
+
+    const int t_out0 = blockIdx.y * tile;
+    const int t_win0 = t_out0 + t_lo - shift_max;
+
+    const short* src = (const short*)dense;
+    const int nthreads = blockDim.x;
+    const int tid = threadIdx.x;
+    const int span = ne * win_w;
+
+    for (int e = tid; e < ne; e += nthreads) s_g[e] = ent_g[e0 + e];
+    for (int idx = tid; idx < 2 * span; idx += nthreads) {
+        const int which = idx / span;
+        const int rem   = idx - which * span;
+        const int e     = rem / win_w;
+        const int j     = rem - e * win_w;
+        const int ts    = t_win0 + j;
+        short v = 0;
+        if (ts >= 0 && ts < t_rows) {
+            const int k = which ? ent_km[e0 + e] : ent_k[e0 + e];
+            if (k >= 0) {
+                const int g = ent_g[e0 + e];
+                v = src[((long long)g * n_filled_max + k) * t_pad + ts];
+            }
+        }
+        sh[idx] = v;
+    }
+    __syncthreads();
+
+    const int n_out = n_fdm * tile;
+    for (int idx = tid; idx < n_out; idx += nthreads) {
+        const int f  = idx / tile;
+        const int tl = idx - f * tile;
+        const int t_out = t_out0 + tl;
+        if (t_out >= t_out_len) continue;
+
+        int acc_re = 0, acc_im = 0, accm_re = 0, accm_im = 0;
+        for (int e = 0; e < ne; ++e) {
+            const int ts = t_out + t_lo - shifts[f * n_sb + s_g[e]];
+            if (ts < 0 || ts >= t_rows) continue;
+            const int j = ts - t_win0;
+            const short av = sh[e * win_w + j];
+            const short bv = sh[span + e * win_w + j];
+            acc_re  += (int)(signed char)(av & 0xFF);
+            acc_im  += (int)(signed char)((av >> 8) & 0xFF);
+            accm_re += (int)(signed char)(bv & 0xFF);
+            accm_im += (int)(signed char)((bv >> 8) & 0xFF);
+        }
+        float o_re = 0.5f * (float)(acc_re + accm_re);
+        float o_im = 0.5f * (float)(acc_im - accm_im);
+        if (fftshift && ((u + w) & 1)) { o_re = -o_re; o_im = -o_im; }
+        out[(long long)f * out_rows * n_grid * n_half
+            + (long long)(out_row0 + t_out) * n_grid * n_half
+            + (long long)u * n_half + w] = __floats2half2_rn(o_re, o_im);
+    }
+}
+"""
+
+_MOD4 = None
+
+#: Per-cell stream-count buckets for v4 (upper bounds, inclusive). Each
+#: bucket is one launch sized to its own largest list.
+_V4_BUCKETS = (8, 16, 32, 64)
+
+
+def _get_module_v4():
+    global _MOD4
+    if _MOD4 is None:
+        cp = _get_cupy()
+        _LOG.info("compiling sparse_combine v4 via NVRTC...")
+        _MOD4 = cp.RawModule(
+            code="#include <cuda_fp16.h>\n" + _CUDA_SOURCE_V4,
+            backend="nvrtc", options=("--std=c++14",),
+        )
+        _LOG.info("sparse_combine v4 ready")
+    return _MOD4
+
+
+@dataclass(frozen=True)
+class SparseCellCsr:
+    """Static per-half-cell stream lists for :func:`combine_sparse_v4`.
+
+    Cells are ordered by bucket (see ``_V4_BUCKETS``); ``buckets`` holds
+    ``(cell_begin, cell_end, max_ne)`` per non-empty bucket.
+    """
+
+    n_sb: int
+    n_grid: int
+    cell_uw: torch.Tensor     # int32 [n_act]
+    cell_ptr: torch.Tensor    # int32 [n_act + 1]
+    ent_g: torch.Tensor       # int32 [n_ent]
+    ent_k: torch.Tensor       # int32 [n_ent]
+    ent_km: torch.Tensor      # int32 [n_ent]
+    buckets: tuple
+
+    @property
+    def n_active(self) -> int:
+        return int(self.cell_uw.shape[0])
+
+    @property
+    def n_entries(self) -> int:
+        return int(self.ent_g.shape[0])
+
+
+def build_sparse_cell_csr(inv_lut: torch.Tensor, *, n_grid: int) -> SparseCellCsr:
+    """Per-half-cell list of the streams carrying the cell or its mirror.
+
+    Static for a given sparsity pattern; build once and keep.
+    """
+    n_sb = int(inv_lut.shape[0])
+    if tuple(inv_lut.shape) != (n_sb, n_grid * n_grid):
+        raise ValueError(
+            f"inv_lut must be (n_sb, {n_grid * n_grid}); got {tuple(inv_lut.shape)}"
+        )
+    if n_sb > 64:
+        raise ValueError(f"v4 supports n_sb <= 64; got {n_sb}")
+    dev = inv_lut.device
+    n_half = n_grid // 2 + 1
+    u = torch.arange(n_grid, device=dev).repeat_interleave(n_half)
+    w = torch.arange(n_half, device=dev).repeat(n_grid)
+    lin = u * n_grid + w
+    linm = ((n_grid - u) % n_grid) * n_grid + ((n_grid - w) % n_grid)
+    k_lin = inv_lut[:, lin].t()           # [n_cells_half, n_sb]
+    k_linm = inv_lut[:, linm].t()
+    present = (k_lin >= 0) | (k_linm >= 0)
+    ne = present.sum(1)
+    uw = (u * n_half + w).int()
+    order_parts, buckets, lo, start = [], [], 0, 0
+    for hi in _V4_BUCKETS:
+        sel = torch.nonzero((ne > lo) & (ne <= hi)).flatten()
+        if sel.numel():
+            order_parts.append(sel)
+            buckets.append((start, start + int(sel.numel()),
+                            int(ne[sel].max().item())))
+            start += int(sel.numel())
+        lo = hi
+    order = (torch.cat(order_parts) if order_parts
+             else torch.zeros(0, dtype=torch.long, device=dev))
+    pres_o = present[order]
+    cell_ptr = torch.zeros(order.numel() + 1, dtype=torch.int32, device=dev)
+    cell_ptr[1:] = torch.cumsum(ne[order], 0).int()
+    rows, g = torch.nonzero(pres_o, as_tuple=True)   # cell-major, g ascending
+    cells = order[rows]
+    return SparseCellCsr(
+        n_sb=n_sb, n_grid=int(n_grid),
+        cell_uw=uw[order].contiguous(),
+        cell_ptr=cell_ptr,
+        ent_g=g.int().contiguous(),
+        ent_k=k_lin[cells, g].int().contiguous(),
+        ent_km=k_linm[cells, g].int().contiguous(),
+        buckets=tuple(buckets),
+    )
+
+
+def combine_sparse_v4(
+    dense: torch.Tensor,
+    csr: SparseCellCsr,
+    shifts: torch.Tensor,
+    *,
+    t_rows: int,
+    t_out_len: int,
+    t_lo: int = 0,
+    fftshift: bool = True,
+    threads: int = 512,
+    out: torch.Tensor,
+    out_row0: int = 0,
+    shift_min: int,
+    shift_max: int,
+) -> torch.Tensor:
+    """Sparse drop-in for :func:`combine_tiled_v3` (bit-identical on the
+    cells it writes). Writes ONLY active cells of ``out``: the caller must
+    have zeroed ``out[:n_fdm, out_row0:out_row0+t_out_len]``.
+
+    Args as :func:`combine_tiled_v3`, with ``csr`` from
+    :func:`build_sparse_cell_csr` in place of the inverse LUT, and the
+    shift bounds required (computing them here would be a GPU sync).
+    """
+    n_sb, n_filled_max, t_pad, two = dense.shape
+    if two != 2 or n_sb != csr.n_sb:
+        raise ValueError(
+            f"dense {tuple(dense.shape)} does not match csr n_sb={csr.n_sb}"
+        )
+    n_grid = csr.n_grid
+    n_half = n_grid // 2 + 1
+    n_fdm = int(shifts.shape[0])
+    if shifts.shape[1] != n_sb:
+        raise ValueError(
+            f"shifts must be [n_fdm, n_sb={n_sb}]; got {tuple(shifts.shape)}"
+        )
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous (pass the parent buffer + out_row0)")
+    if out.dtype == torch.complex32:
+        want_tail = (n_grid, n_half)
+    elif out.dtype == torch.float16:
+        want_tail = (n_grid, n_half, 2)
+    else:
+        raise ValueError(f"out dtype {out.dtype} not complex32/float16")
+    if int(out.shape[0]) < n_fdm or tuple(out.shape[2:]) != want_tail:
+        raise ValueError(
+            f"out shape {tuple(out.shape)} incompatible with n_fdm={n_fdm} N={n_grid}"
+        )
+    out_rows = int(out.shape[1])
+    if out_row0 < 0 or out_row0 + t_out_len > out_rows:
+        raise ValueError(
+            f"out_row0={out_row0} + t_out_len={t_out_len} > rows={out_rows}"
+        )
+    spread = int(shift_max) - int(shift_min)
+    sh_i = shifts if (shifts.dtype == torch.int32 and shifts.is_contiguous()) \
+        else shifts.int().contiguous()
+    kern = _get_module_v4().get_function("sparse_combine_v4")
+    args_tail = (
+        np.int32(n_sb), np.int32(t_rows), np.int32(t_pad),
+        np.int32(n_filled_max), np.int32(n_grid), np.int32(n_half),
+        np.int32(n_fdm), np.int32(t_out_len), np.int32(t_lo),
+        np.int32(shift_max),
+    )
+    ptrs = (_ptr(dense), _ptr(csr.cell_uw), _ptr(csr.cell_ptr),
+            _ptr(csr.ent_g), _ptr(csr.ent_k), _ptr(csr.ent_km),
+            _ptr(sh_i), _ptr(out))
+    with _on_torch_stream():
+        for c_lo, c_hi, max_ne in csr.buckets:
+            # the kernel's static s_g[64] (256 B) shares the 48 KiB
+            win_cap = (SHMEM_CAP - 256) // (4 * max_ne)
+            tile = max(1, min(int(t_out_len), win_cap - spread))
+            win_w = tile + spread
+            shmem = 2 * max_ne * win_w * 2
+            if shmem > SHMEM_CAP:
+                raise ValueError(
+                    f"staged window needs {shmem} B > {SHMEM_CAP} B "
+                    f"(max_ne={max_ne}, spread={spread})"
+                )
+            n_tiles = (t_out_len + tile - 1) // tile
+            kern(
+                (c_hi - c_lo, n_tiles), (threads, 1, 1),
+                ptrs + (np.int32(c_lo),) + args_tail + (
+                    np.int32(win_w), np.int32(tile),
+                    np.int32(1 if fftshift else 0),
+                    np.int32(out_rows), np.int32(out_row0),
+                ),
+                shared_mem=shmem,
+            )
+    return out
+
+
+__all__ += [
+    "SparseCellCsr",
+    "build_sparse_cell_csr",
+    "combine_sparse_v4",
 ]
