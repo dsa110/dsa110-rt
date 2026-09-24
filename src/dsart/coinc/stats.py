@@ -80,6 +80,13 @@ class ClusterStats:
     # use the discriminant are unaffected.
     gal_dm_max_los: float = float("nan")
     dm_galactic_fraction: float = float("nan")
+    # DM and boxcar width of the PEAK (max-SNR) member. A very bright
+    # burst drags in many members at neighbouring DMs and wide boxcars,
+    # so its dm_median / width_median describe the sidelobes, not the
+    # burst; the criteria evaluator judges bright clusters on these
+    # instead (see criteria.BRIGHT_PEAK_SNR). NaN / 0 = not computed.
+    dm_peak: float = float("nan")
+    width_peak: int = 0
 
 
 def compute_stats(
@@ -163,4 +170,6 @@ def compute_stats(
             getattr(peak, "sample_period_us", 0.0) or 0.0),
         gal_dm_max_los=gal_dm_los_f,
         dm_galactic_fraction=dm_galactic_fraction,
+        dm_peak=float(peak.dm_pc_cc),
+        width_peak=int(peak.width_samples),
     )

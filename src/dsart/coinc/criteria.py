@@ -127,6 +127,47 @@ def _dm_iqr_max_snr_scaled(stats: ClusterStats, t: float) -> bool:
     return float(stats.dm_iqr) <= cap
 
 
+# Bright clusters are judged on their PEAK member (2026-09-24).
+#
+# A very bright burst lights up many DM trials and wide boxcars, and all
+# of those detections cluster with it. The cluster MEDIANS then describe
+# the sidelobes: live injections at DM 500, W = 1 ms gave width_median
+# 2 / dm_median +0.3 up to 100 sigma, but width_median 48 and dm_median
+# +36.5 at 150-200 sigma and width_median 64 at 300 sigma, so
+# bright_frb_extragalactic (width_median <= 16) stopped matching and a
+# 150-300 sigma FRB was filed as log_only / bright_pulsar -- never
+# archived. At or above BRIGHT_PEAK_SNR (the same point where the
+# dm_iqr cap above goes fully permissive) the DM and width gates, and
+# the galactic fraction, use the max-SNR member's DM and width instead.
+# Fainter clusters are evaluated exactly as before.
+BRIGHT_PEAK_SNR: float = DM_IQR_SNR_CEILING
+
+
+def _is_bright(stats: ClusterStats) -> bool:
+    return float(stats.snr_max) >= BRIGHT_PEAK_SNR
+
+
+def _eff_dm(stats: ClusterStats) -> float:
+    dm_peak = float(getattr(stats, "dm_peak", float("nan")))
+    if _is_bright(stats) and math.isfinite(dm_peak):
+        return dm_peak
+    return float(stats.dm_median)
+
+
+def _eff_width(stats: ClusterStats) -> float:
+    w_peak = int(getattr(stats, "width_peak", 0) or 0)
+    if _is_bright(stats) and w_peak > 0:
+        return float(w_peak)
+    return float(stats.width_median)
+
+
+def _eff_galactic_fraction(stats: ClusterStats) -> float:
+    gal = float(getattr(stats, "gal_dm_max_los", float("nan")))
+    if _is_bright(stats) and math.isfinite(gal) and gal > 0.0:
+        return _eff_dm(stats) / gal
+    return float(stats.dm_galactic_fraction)
+
+
 def _dm_galactic_fraction_max(stats: ClusterStats, t: float) -> bool:
     """``dm_galactic_fraction_max`` — Galactic-disk gate.
 
@@ -135,7 +176,7 @@ def _dm_galactic_fraction_max(stats: ClusterStats, t: float) -> bool:
     discriminant simply don't match when /mon/array/gal_dm is
     unavailable; the operator gets log_only fallback.
     """
-    frac = float(stats.dm_galactic_fraction)
+    frac = _eff_galactic_fraction(stats)
     if not math.isfinite(frac):
         return False
     return frac <= t
@@ -143,7 +184,7 @@ def _dm_galactic_fraction_max(stats: ClusterStats, t: float) -> bool:
 
 def _dm_galactic_fraction_min(stats: ClusterStats, t: float) -> bool:
     """``dm_galactic_fraction_min`` — extragalactic gate."""
-    frac = float(stats.dm_galactic_fraction)
+    frac = _eff_galactic_fraction(stats)
     if not math.isfinite(frac):
         return False
     return frac >= t
@@ -170,11 +211,11 @@ _REQUIRE_PREDICATES: Tuple[
     ("n_search_nodes_max", lambda s, t: s.n_search_nodes <= t),
     ("n_gpu_halves_min", lambda s, t: s.n_gpu_halves >= t),
     ("n_gpu_halves_max", lambda s, t: s.n_gpu_halves <= t),
-    ("dm_median_min_pc_cc", lambda s, t: s.dm_median >= t),
-    ("dm_median_max_pc_cc", lambda s, t: s.dm_median <= t),
+    ("dm_median_min_pc_cc", lambda s, t: _eff_dm(s) >= t),
+    ("dm_median_max_pc_cc", lambda s, t: _eff_dm(s) <= t),
     ("dm_iqr_max_pc_cc", _dm_iqr_max_snr_scaled),
-    ("width_median_max_samples", lambda s, t: s.width_median <= t),
-    ("width_median_min_samples", lambda s, t: s.width_median >= t),
+    ("width_median_max_samples", lambda s, t: _eff_width(s) <= t),
+    ("width_median_min_samples", lambda s, t: _eff_width(s) >= t),
     ("lm_diag_max_rad", lambda s, t: s.lm_diag_rad <= t),
     ("lm_diag_min_rad", lambda s, t: s.lm_diag_rad >= t),
     ("dm_galactic_fraction_max", _dm_galactic_fraction_max),
