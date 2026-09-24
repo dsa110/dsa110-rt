@@ -196,20 +196,77 @@ _CUBE_NPZ_RE = re.compile(
 # read the production DM plan and map each (search_node_id, gpu_half) cube
 # to the coarse-DM bucket it owns.
 #
-# Source-of-truth path: the SAME plan the search fleet runs
-# (``--dm-plan-path`` in configs/dsart_search_rt.yaml). NOTE: configs/
-# dm_plan.npz is the stale v1 plan (690 fine / 16 coarse / 0–3000) and must
-# NOT be used here. Override with DSART_DM_PLAN_PATH if the fleet plan moves.
-_DEFAULT_DM_PLAN_PATH = (
-    "/home/ubuntu/data/dm_plans/dm_plan_N8_dmmin100_tol1.6_v2.npz"
+# Source of truth: the plan and the coarse-DM ownership the search fleet
+# ACTUALLY runs, i.e. ``--dm-plan-path`` / ``--coarse-dm-owners-half-0``
+# in /cnf/search_rt (etcd), falling back to configs/dsart_search_rt.yaml.
+# This used to be a hard-coded plan path, which went stale with every plan
+# swap: after the 2026-09-23 8x25 plan the bucket sizes stopped matching
+# the cubes and the y-axis silently fell back to bare trial indices
+# (0..24 per half). Override with DSART_DM_PLAN_PATH if needed. NOTE:
+# configs/dm_plan.npz is the stale v1 plan and must NOT be used here.
+_LAST_RESORT_DM_PLAN_PATH = (
+    "/home/ubuntu/data/dm_plans/"
+    "dm_plan_N8_dmmin100_dmmax1500_tol1.265_csf8_explicit-v2.npz"
+)
+_SEARCH_YAML = (
+    Path(__file__).resolve().parents[3] / "configs" / "dsart_search_rt.yaml"
 )
 
 # Cache so a multi-event regenerate doesn't re-read the plan per event.
 _DM_PLAN_CACHE: dict[str, Optional[dict[int, np.ndarray]]] = {}
+_FLEET_CFG_CACHE: dict[str, Any] = {}
+_FLEET_CFG_TTL_S = 300.0
+
+
+def _fleet_search_cfg() -> dict:
+    """``{"plan_path": str|None, "owners": {sid: coarse_idx_of_half_0}}``
+    from the live search config (etcd, else the repo yaml). Cached."""
+    now = time.monotonic()
+    hit = _FLEET_CFG_CACHE.get("cfg")
+    if hit is not None and now - _FLEET_CFG_CACHE.get("t", 0.0) < _FLEET_CFG_TTL_S:
+        return hit
+    cfg: Optional[dict] = None
+    try:
+        from dsautils.dsa_store import DsaStore  # noqa: PLC0415
+        cfg = DsaStore().get_dict("/cnf/search_rt")
+    except Exception as exc:  # noqa: BLE001
+        _LOG.debug("plotter: /cnf/search_rt unavailable (%s)", exc)
+    if not cfg:
+        try:
+            import yaml  # noqa: PLC0415
+            with open(_SEARCH_YAML) as fh:
+                cfg = yaml.safe_load(fh)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("plotter: no search config (%s)", exc)
+            cfg = {}
+    out: dict[str, Any] = {"plan_path": None, "owners": {}}
+    for r in (cfg or {}).get("routines", []) or []:
+        if not str(r.get("name", "")).startswith("search_compute"):
+            continue
+        args = str(r.get("args", "")).split()
+        if "--dm-plan-path" in args and out["plan_path"] is None:
+            i = args.index("--dm-plan-path")
+            if i + 1 < len(args):
+                out["plan_path"] = args[i + 1]
+        for host, hargs in (r.get("hostargs") or {}).items():
+            m_sid = re.search(r"(\d+)$", str(host))
+            h = str(hargs).split()
+            if m_sid and "--coarse-dm-owners-half-0" in h:
+                j = h.index("--coarse-dm-owners-half-0")
+                try:
+                    out["owners"][int(m_sid.group(1))] = int(h[j + 1])
+                except (IndexError, ValueError):
+                    pass
+        break
+    _FLEET_CFG_CACHE.update(cfg=out, t=now)
+    return out
 
 
 def _dm_plan_path() -> str:
-    return os.environ.get("DSART_DM_PLAN_PATH", _DEFAULT_DM_PLAN_PATH)
+    env = os.environ.get("DSART_DM_PLAN_PATH")
+    if env:
+        return env
+    return _fleet_search_cfg().get("plan_path") or _LAST_RESORT_DM_PLAN_PATH
 
 
 def _load_coarse_bucket_dms(
@@ -253,10 +310,15 @@ def _owner_coarse_idx(search_node_id: int, gpu_half: int,
     """Map a (search_node_id, gpu_half) cube to its coarse-DM bucket.
 
     Production fan-out: each search node owns 2 consecutive coarse buckets
-    (one per GPU half), assigned in ascending node order — n01→{0,1},
-    n02→{2,3}, n09→{4,5}, n13→{6,7}. We rank the search nodes actually
-    present so the mapping degrades gracefully if a subset dumped.
+    (one per GPU half) — n01→{0,1}, n02→{2,3}, n09→{4,5}, n13→{6,7} —
+    pinned by ``--coarse-dm-owners-half-0`` in the search config, which is
+    read here (a node without the override owns bucket 0). Only when the
+    config cannot be read do we fall back to ranking the nodes present,
+    which mislabels every later node if one node's cubes are missing.
     """
+    owners = _fleet_search_cfg().get("owners") or {}
+    if owners:
+        return int(owners.get(int(search_node_id), 0)) + int(gpu_half)
     ranks = {sid: i for i, sid in enumerate(sorted(set(present_sids)))}
     return ranks.get(int(search_node_id), 0) * 2 + int(gpu_half)
 
