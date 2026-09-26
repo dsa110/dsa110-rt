@@ -679,7 +679,20 @@ def control_update_bfweights_post():
     dry_run = dry_raw in ("1", "true", "yes")
     user = request.form.get("user") or request.remote_addr or "anon"
 
-    latest = bfweights_update.latest_descriptor(source)
+    # Resolve what to APPLY from a fresh scan, never the display cache:
+    # on 2026-09-25 the cache predated the newest 2253+161 solution by
+    # 8.6 h and this route distributed the day-older one.
+    try:
+        latest = bfweights_update.fresh_latest_descriptor(source)
+    except OSError as exc:
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"cannot read {bfweights_update.GENERATED_DIR} to find the "
+                f"newest {source} solution ({exc}); refusing rather than "
+                "applying a possibly stale one"
+            ),
+        }), 503
     if latest is None:
         return jsonify({
             "ok": False,
@@ -688,6 +701,23 @@ def control_update_bfweights_post():
                 f"{bfweights_update.GENERATED_DIR}"
             ),
         }), 412
+    # The operator confirmed the descriptor the PAGE showed; if a newer
+    # one has appeared since, apply nothing and say so.
+    shown = (request.form.get("descriptor") or "").strip()
+    if shown and shown != latest["descriptor"]:
+        return jsonify({
+            "ok": False,
+            "stale_descriptor": True,
+            "shown": shown,
+            "latest": latest["descriptor"],
+            "latest_age_hours": latest.get("age_hours"),
+            "error": (
+                f"the page showed {shown}, but the newest {source} solution "
+                f"is now {latest['descriptor']} ({latest.get('age_hours')} h "
+                "old). Nothing was applied -- reload the page and confirm "
+                "again."
+            ),
+        }), 409
     try:
         started = bfweights_update.start_update(
             latest["descriptor"], dry_run=dry_run, user=user,

@@ -459,8 +459,8 @@
 <script>
 // ---- per-calibrator beamformer-weights update ---------------------------
 // Button → typed-confirm dialog → POST /control/update_bfweights →
-// poll the job until done. Server re-resolves the newest descriptor
-// itself; the one shown here is display-only.
+// poll the job until done. The server re-resolves the newest descriptor
+// from a fresh scan and refuses if it differs from the one shown here.
 (function () {
     const banner = document.getElementById("bf-update-banner");
 
@@ -540,6 +540,8 @@
             const fd = new FormData();
             fd.append("source", source);
             fd.append("confirm", "update_bfweights");
+            // the server refuses (409) if this is no longer the newest
+            fd.append("descriptor", descriptor);
             try {
                 const r = await fetch("/control/update_bfweights",
                                       {method: "POST", body: fd});

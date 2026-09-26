@@ -262,6 +262,61 @@ def _mtime_isot_sec(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+#: One distribution copies ``antennas.out`` to the 16 corr nodes one
+#: after another (~0.33 s apart, 2026-09-25: 15:35:25.78 -> 15:35:28.89),
+#: so their mtimes span several seconds and whole-second truncation still
+#: split one distribution into 4-5 groups ("10 node(s) disagree with the
+#: 6-node consensus"). Mtimes within this window of their neighbour are
+#: one distribution; genuinely different weight generations are hours
+#: apart.
+DISTRIBUTION_GROUP_TOL_S = 300.0
+
+
+def _entry_unix(entry: Dict[str, Any]) -> Optional[float]:
+    mtime_unix = entry.get("mtime_unix")
+    if mtime_unix is not None:
+        try:
+            return float(mtime_unix)
+        except (TypeError, ValueError):
+            pass
+    return _isot_to_unix(entry.get("mtime_isot_sec"))
+
+
+def _isot_to_unix(isot: Optional[str]) -> Optional[float]:
+    if not isot:
+        return None
+    try:
+        return datetime.datetime.strptime(
+            isot[:19], "%Y-%m-%dT%H:%M:%S"
+        ).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _unix_to_isot(t: float) -> str:
+    return datetime.datetime.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _distribution_groups(
+    nodes: List[Dict[str, Any]],
+) -> List[List[Any]]:
+    """Group reporting nodes into distribution events: sorted by mtime,
+    a gap > DISTRIBUTION_GROUP_TOL_S starts a new group. Returns lists
+    of ``(mtime_unix, node)``; nodes without a usable mtime are left out
+    (and so count as disagreeing)."""
+    timed = sorted(
+        ((t, n) for n in nodes if (t := _entry_unix(n)) is not None),
+        key=lambda x: x[0],
+    )
+    groups: List[List[Any]] = []
+    for t, n in timed:
+        if groups and t - groups[-1][-1][0] <= DISTRIBUTION_GROUP_TOL_S:
+            groups[-1].append((t, n))
+        else:
+            groups.append([(t, n)])
+    return groups
+
+
 def _transit_isot(
     bfweights_doc: Optional[Any], distributed_isot: Optional[str]
 ) -> Optional[str]:
@@ -377,21 +432,37 @@ def build_pipeline_weights_view(etcd_store: Any) -> Dict[str, Any]:
 
     consensus_isot: Optional[str] = None
     disagreeing: List[Dict[str, Any]] = []
+    consensus_latest_unix: Optional[float] = None
     if reported_nodes:
-        counts = Counter(n.get("mtime_isot_sec") for n in reported_nodes)
-        consensus_isot, _ = counts.most_common(1)[0]
-        if len(counts) > 1:
-            disagreeing = [
-                n for n in reported_nodes
-                if n.get("mtime_isot_sec") != consensus_isot
-            ]
+        groups = _distribution_groups(reported_nodes)
+        if groups:
+            # largest group; ties go to the newest distribution
+            best = max(groups, key=lambda g: (len(g), max(t for t, _ in g)))
+            consensus_isot = _unix_to_isot(min(t for t, _ in best))
+            consensus_latest_unix = max(t for t, _ in best)
+            members = {id(n) for _, n in best}
+            disagreeing = [n for n in reported_nodes if id(n) not in members]
+        else:
+            counts = Counter(n.get("mtime_isot_sec") for n in reported_nodes)
+            consensus_isot, _ = counts.most_common(1)[0]
+            if len(counts) > 1:
+                disagreeing = [
+                    n for n in reported_nodes
+                    if n.get("mtime_isot_sec") != consensus_isot
+                ]
 
-    # ISOT strings (``YYYY-MM-DDTHH:MM:SS``) sort lexically == chronologically.
-    stale = bool(
-        consensus_isot is not None
-        and distributed_isot is not None
-        and consensus_isot < distributed_isot
-    )
+    # Stale = the nodes' weights predate the last distribution by more
+    # than the copy spread itself.
+    dist_unix = _isot_to_unix(distributed_isot)
+    if consensus_latest_unix is not None and dist_unix is not None:
+        stale = consensus_latest_unix + DISTRIBUTION_GROUP_TOL_S < dist_unix
+    else:
+        # ISOT strings (``YYYY-MM-DDTHH:MM:SS``) sort lexically == chronologically.
+        stale = bool(
+            consensus_isot is not None
+            and distributed_isot is not None
+            and consensus_isot < distributed_isot
+        )
 
     return {
         "solution_provenance": solution_provenance,

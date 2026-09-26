@@ -101,13 +101,38 @@ _desc_refresh_lock = threading.Lock()
 _desc_refreshing = False
 
 
+def _age_hours(isot: Optional[str]) -> Optional[float]:
+    """Hours from a descriptor's (UTC) transit ISOT to NOW. Computed at
+    read time: the scan used to stamp ``age_hours`` once and the cache
+    then served it frozen, so the page under-reported every solution's
+    age by however long ago the last scan ran (3.6 h on 2026-09-26)."""
+    import datetime
+    if not isot:
+        return None
+    try:
+        dt = datetime.datetime.strptime(
+            isot, "%Y-%m-%dT%H:%M:%S"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return round((time.time() - dt.timestamp()) / 3600.0, 1)
+
+
+def _with_live_age(info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if info is None:
+        return None
+    out = dict(info)
+    out["age_hours"] = _age_hours(out.get("isot"))
+    return out
+
+
 def _scan_all_descriptors() -> Dict[str, Dict[str, Any]]:
     """One os.scandir() of GENERATED_DIR → newest descriptor per source.
 
     No per-file stat (age comes from the ISOT in the filename), so the
-    cost is a single directory read regardless of source count.
+    cost is a single directory read regardless of source count. Ages are
+    NOT stored here -- see :func:`_age_hours`.
     """
-    import datetime
     by_source: Dict[str, Dict[str, Any]] = {}
     with os.scandir(GENERATED_DIR) as it:
         for entry in it:
@@ -127,15 +152,6 @@ def _scan_all_descriptors() -> Dict[str, Dict[str, Any]]:
                     "yaml_path": os.path.join(GENERATED_DIR, name),
                     "isot": isot,
                 }
-    now = time.time()
-    for info in by_source.values():
-        try:
-            dt = datetime.datetime.strptime(
-                info["isot"], "%Y-%m-%dT%H:%M:%S"
-            ).replace(tzinfo=datetime.timezone.utc)
-            info["age_hours"] = round((now - dt.timestamp()) / 3600.0, 1)
-        except ValueError:
-            info["age_hours"] = None
     return by_source
 
 
@@ -188,17 +204,48 @@ def prime_descriptor_cache() -> None:
     cold cache. Same reasoning as the burst-index warmer in app.py.
 
     Non-blocking and single-flight, so calling it at startup is free.
+
+    Also starts a background loop that rescans every ``_DESC_TTL_S``.
+    Refreshing only when a request found the cache stale meant the first
+    page load after a quiet spell always rendered the previous scan --
+    on 2026-09-25 the Update-cals button then applied a 2253+161 solution
+    a day older than the one that had been on disk for 8.6 h.
     """
+    global _desc_loop_started
     _refresh_descriptors_async()
+    with _desc_refresh_lock:
+        if _desc_loop_started:
+            return
+        _desc_loop_started = True
+
+    def _loop() -> None:
+        while True:
+            time.sleep(_DESC_TTL_S)
+            _refresh_descriptors_async()
+
+    threading.Thread(
+        target=_loop, name="bfweights-desc-loop", daemon=True
+    ).start()
+
+
+_desc_loop_started = False
+
+
+def descriptor_scan_age_s() -> Optional[float]:
+    """Seconds since the cached scan completed (None before the first)."""
+    with _desc_cache_lock:
+        ts = _desc_cache["ts"]
+    return None if not ts else time.time() - ts
 
 
 def latest_descriptor(source: str) -> Optional[Dict[str, Any]]:
     """Newest ``<SRC>_<ISOT>`` descriptor for one calibrator, or None.
 
-    Served from the cached scan (non-blocking); ``None`` until the first
-    background scan of GENERATED_DIR completes.
+    Served from the cached scan (non-blocking, for page DISPLAY); ``None``
+    until the first background scan of GENERATED_DIR completes. Never use
+    this to choose what to APPLY -- see :func:`fresh_latest_descriptor`.
     """
-    return _cached_by_source().get(source)
+    return _with_live_age(_cached_by_source().get(source))
 
 
 def latest_descriptors(
@@ -206,7 +253,20 @@ def latest_descriptors(
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """:func:`latest_descriptor` for each source, keyed by source."""
     data = _cached_by_source()
-    return {s: data.get(s) for s in sources}
+    return {s: _with_live_age(data.get(s)) for s in sources}
+
+
+def fresh_latest_descriptor(source: str) -> Optional[Dict[str, Any]]:
+    """Newest descriptor for ``source`` from a SYNCHRONOUS scan (and the
+    cache is updated with it). For the update route: applying weights
+    must reflect what is on disk now, not the last page load. Raises
+    OSError if GENERATED_DIR cannot be read -- the caller must refuse
+    rather than fall back to a possibly stale cache."""
+    data = _scan_all_descriptors()
+    with _desc_cache_lock:
+        _desc_cache["by_source"] = data
+        _desc_cache["ts"] = time.time()
+    return _with_live_age(data.get(source))
 
 
 # ---------------------------------------------------------------------------
