@@ -1802,7 +1802,7 @@ class SearchComputeService:
                     self._c1_cands_width_escape_throttled += n_thr
                     if not self._wide_escape_throttling:
                         self._wide_escape_throttling = True
-                        LOG.info(
+                        _LOG.info(
                             "wide-escape governor: THROTTLING (%d of %d "
                             "escapes this block refused; tokens %.2f/%d) -- "
                             "sustained wide candidates, likely RFI or a "
@@ -1813,7 +1813,7 @@ class SearchComputeService:
                         self._wide_escape_gov.tokens
                         >= self._wide_escape_gov.burst - 1e-9):
                     self._wide_escape_throttling = False
-                    LOG.info("wide-escape governor: bucket full again, "
+                    _LOG.info("wide-escape governor: bucket full again, "
                              "throttling ended (%d refused since start)",
                              self._c1_cands_width_escape_throttled)
                 kept = narrow + admitted
@@ -1915,7 +1915,7 @@ class SearchComputeService:
                         self._c1_cands_width_escape_throttled),
                 )
             except Exception:  # noqa: BLE001 — mon must never sink the pipe
-                LOG.warning("C1 metering publish failed", exc_info=True)
+                _LOG.warning("C1 metering publish failed", exc_info=True)
         self._meter_window_blocks = 0
         self._meter_window_metered_blocks = 0
         self._meter_window_dropped_sum = 0
