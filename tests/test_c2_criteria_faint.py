@@ -18,8 +18,8 @@ PROD = Path(__file__).resolve().parents[1] / "configs" / "c2_trigger_criteria.ya
 GAL = 46.1           # NE2001 max-LOS DM at the current pointing
 
 
-def _cls(**kw) -> str:
-    base = dict(
+def _base() -> dict:
+    return dict(
         n_events=1, n_search_nodes=1, n_gpu_halves=1,
         snr_max=11.5, snr_sum=11.5, snr_mean=11.5,
         dm_min=500.0, dm_max=500.0, dm_median=500.0, dm_iqr=0.0,
@@ -29,6 +29,10 @@ def _cls(**kw) -> str:
         kernel_ids_distinct=("unit:d1:b2",), peak_event_specnum=1,
         gal_dm_max_los=GAL, dm_galactic_fraction=500.0 / GAL,
     )
+
+
+def _cls(**kw) -> str:
+    base = _base()
     base.update(kw)
     hit = CriteriaEvaluator(PROD).evaluate(ClusterStats(**base))
     return hit.name if hit is not None else "none"
@@ -68,3 +72,25 @@ def test_it_dumps_and_has_its_own_holdoff() -> None:
     assert c.holdoff_s == 30.0
     names = [x.name for x in ev.classes]
     assert names.index("faint_frb_extragalactic") == names.index("bright_frb_extragalactic") + 1
+
+
+def test_a_bright_burst_in_bright_holdoff_is_not_dumped_again() -> None:
+    """2026-10-05 07:00 live: a 100 sigma probe dumped as
+    bright_frb_extragalactic, then its grown cluster fell through the
+    bright class's holdoff into this class and dumped a second time."""
+    from dsart.coinc.criteria import CriteriaEvaluator
+    clock = {"t": 1000.0}
+    ev = CriteriaEvaluator(PROD, now=lambda: clock["t"])
+    first = ClusterStats(**{**_base(), "snr_max": 88.4, "width_median": 18.0,
+                            "width_peak": 2, "dm_peak": 971.0})
+    assert ev.evaluate(first).name == "bright_frb_extragalactic"
+    clock["t"] += 0.7
+    grown = ClusterStats(**{**_base(), "snr_max": 88.4, "n_events": 4,
+                            "width_median": 20.0, "width_peak": 2, "dm_peak": 971.0})
+    again = ev.evaluate(grown)
+    assert again is None or again.action != "dump_all_gpus", again
+
+
+def test_the_faint_class_is_11_to_12_sigma_only() -> None:
+    assert _cls(snr_max=11.99) == "faint_frb_extragalactic"
+    assert _cls(snr_max=12.0) == "bright_frb_extragalactic"

@@ -88,6 +88,14 @@ trigger_classes:
       Euclidean gain for narrow bursts: (12/11)^1.5 = x1.14.
     require:
       snr_max_min: 11.0
+      # 11-12 sigma ONLY. Without this upper bound a bright burst's
+      # cluster, re-evaluated as more members arrive while
+      # bright_frb_extragalactic is in its 30 s holdoff, falls through to
+      # this class (>= 50 sigma uses the peak member's width, so w <= 8
+      # passes) and is dumped a SECOND time -- seen live 2026-10-05 07:00
+      # on a 100 sigma probe (261005xtdc, then 261005qcgc). The bright
+      # class owns everything >= 12.
+      snr_max_max: 11.99
       n_events_min: 1
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 115.0
