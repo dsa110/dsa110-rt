@@ -223,7 +223,17 @@ DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE: int = 16
 #: latency at DM 3000 with headroom; consecutive probes are ≥ 30 s
 #: apart so cross-attribution stays excluded. The -2 s floor tolerates
 #: specnum→UTC table skew while rejecting rows from before the fire.
-DEFAULT_WALL_TOL_S: float = 20.0
+#:
+#: 2026-10-05: 20 -> 28 s. The fire-to-C2 latency has grown since this
+#: was set (n_sub=4 and the 6.4 s RX buffer): live fallback matches on
+#: 2026-10-05 landed at dt = 18.9 s, and a 60 sigma probe at 20.4 s was
+#: REJECTED -- C2 then treated a synthetic burst as sky, broadcast a real
+#: voltage dump for it, and handed it to C3 as a sky candidate (C3's
+#: fired-log backstop is what stopped a false alarm). 28 s keeps a
+#: margin over the observed latency and stays under the >= 30 s probe
+#: spacing that rules out cross-attribution. Override per-deployment
+#: with DSART_INJECT_WALL_TOL_S (coincidencer reads it at startup).
+DEFAULT_WALL_TOL_S: float = 28.0
 
 #: Specnum residuals beyond ``tol × ORIGIN_MISMATCH_FACTOR`` are treated
 #: as origin mismatches (→ wall-clock fallback) rather than timing

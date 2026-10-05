@@ -933,6 +933,7 @@ class CoincidencerService:
         _dm_tol_env = os.environ.get("DSART_INJECT_DM_TOL_FRAC")
         _max_snr_env = os.environ.get("DSART_INJECT_MAX_OBSERVED_SNR")
         _min_snr_env = os.environ.get("DSART_INJECT_MIN_OBSERVED_SNR")
+        _wall_tol_env = os.environ.get("DSART_INJECT_WALL_TOL_S")
         _matcher_kwargs: dict = {
             "store": self._mon_store,
             "refresh_s": INJECT_REGISTRY_REFRESH_S,
@@ -945,6 +946,8 @@ class CoincidencerService:
             _matcher_kwargs["max_observed_snr"] = float(_max_snr_env)
         if _min_snr_env:
             _matcher_kwargs["min_observed_snr"] = float(_min_snr_env)
+        if _wall_tol_env:
+            _matcher_kwargs["wall_tol_s"] = float(_wall_tol_env)
         self._inject_matcher: InjectionMatcher = (
             inject_matcher if inject_matcher is not None
             else InjectionMatcher(**_matcher_kwargs)

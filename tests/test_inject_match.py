@@ -771,9 +771,22 @@ class TestSpecnumGate(TestTryMatch):
         assert mr is not None
         assert m.snapshot()["rows_rejected_specnum"] == 0
 
+    def test_origin_mismatch_accepts_the_live_20s_latency(self):
+        """2026-10-05 live regression: after search-only bounces a 60
+        sigma probe arrived 20.4 s after its fire and the old +20 s window
+        REJECTED it -- C2 treated a synthetic burst as sky and broadcast a
+        real voltage dump for it. Observed fire-to-C2 latency is now
+        ~19-21 s (n_sub=4, 6.4 s RX buffer)."""
+        m, _ = self._matcher()
+        mjd = 40587.0 + (1_000.0 + 20.4) / 86400.0
+        mr = m.try_match(**self._row_args(
+            event_specnum=62_500 + 10_000_000, mjd=mjd,
+        ))
+        assert mr is not None
+
     def test_origin_mismatch_wall_clock_reject_outside_window(self):
         """Origin mismatch AND the row's event time is 45 s after the
-        fire (outside the +20 s wall window) → still rejected; the
+        fire (outside the +28 s wall window) → still rejected; the
         fallback must not reopen the cross-attribution hole."""
         m, _ = self._matcher()
         mjd_45s_after_fire = 40587.0 + (1_000.0 + 45.0) / 86400.0
