@@ -833,6 +833,28 @@ def panels() -> List[Dict[str, Any]]:
         ),
     ))
     _bump_y(7)
+    out.append(graph_panel(
+        title="C1->C2 wide-escape GOVERNOR -- escapes refused/s per half (floods)",
+        raw_query=(
+            'SELECT derivative(max("c1_cands_width_escape_throttled_total"), 1s) '
+            'FROM "search_rt_compute" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn $tag_cn_id g$tag_gpu_half",
+        w=24, x=0, h=7, unit="short", y_min=0, legend_right=True,
+        description=(
+            "2026-10-05. Wide (>b16) candidates that cleared the brightness "
+            "escape but were refused by the per-half token bucket "
+            "(c1.max_c1c2_width_escape_{per_block,burst,refill_s}: brightest "
+            "1 per block, 3 tokens, 1 back every 20 s). Non-zero = a "
+            "sustained wide-candidate episode -- RFI bursts and satellite "
+            "transits, which recur ~4 min earlier each day. Before the "
+            "governor these floods were 99.4% of all C2 clusters and kept "
+            "C2's cluster-rate limiter (and so every dump) off 5.5% of the "
+            "time. An isolated bright wide burst is never refused."
+        ),
+    ))
+    _bump_y(7)
 
     # ----- T1 (2026-06-07) Layer-2 sigma_k EMA noise health -----
     out.append(row_panel(

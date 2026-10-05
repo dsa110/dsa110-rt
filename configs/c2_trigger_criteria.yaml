@@ -64,6 +64,41 @@ trigger_classes:
     action: dump_all_gpus
     holdoff_s: 30.0
 
+  - name: faint_frb_extragalactic
+    description: >-
+      2026-10-05: the -1 sigma trigger, for NARROW bursts only. Same
+      gates as bright_frb_extragalactic except snr_max_min 11 (was 12)
+      and width_median <= 8 (not 16). First match wins, so anything that
+      already qualifies above is classed there; this only adds 11-12
+      sigma clusters of width <= 8 (8.4 ms).
+
+      Why narrow only. Replaying every non-injection cluster from
+      2026-10-03..05 through this file: lowering the WHOLE class to 11
+      takes quiet-time trigger-eligible clusters from 34/day to 88/day,
+      and 79% of the extra are w=16 -- a population C3 already rejects
+      (38 of 38 sky dumps in that window were REJECTs, 35 on R10). R10
+      is width-biased: its tz_trig is a single-sample robust z, which
+      scales as ~2.5/sqrt(w) of the detector SNR, so at w=16 it cannot
+      separate real from RFI (sky w16 ratio 0.38, injections 0.44) and
+      rejects 49% of genuine w=16 injections. Triggering w16 at 11-12
+      sigma would add dumps C3 throws away. For w <= 8 the extra is
+      ~10/day and R10 confirms real bursts (injection tz/snr 1.3-2.3 at
+      w<=4; 0.84 median at w=8).
+
+      Euclidean gain for narrow bursts: (12/11)^1.5 = x1.14.
+    require:
+      snr_max_min: 11.0
+      n_events_min: 1
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 115.0
+      dm_median_max_pc_cc: 2700.0
+      dm_iqr_max_pc_cc: 100.0
+      width_median_max_samples: 8
+      lm_diag_max_rad: 0.1
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
   - name: bright_galactic
     description: >-
       Galactic-disk burst (dm_median < 0.75 * NE2001 max-LOS DM).
