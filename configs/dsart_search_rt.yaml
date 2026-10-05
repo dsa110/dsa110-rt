@@ -453,7 +453,14 @@ routines:
 #             shake-down if pinned memory is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 9.55                      # 2026-10-05: 10.55 → 9.55, a deliberate -1 sigma DETECTION cut (operator
+  snr_min: 8.55                      # 2026-10-05 06:3x ON-SKY TEST of -2 sigma (operator asked for 1-2 sigma).
+                                     # 9.55 ran 05:43-06:3x: in clean sky the detector emitted ~0 candidates
+                                     # between 9.55 and 10.55 (as Gaussian statistics predict: P(>9.55) x ~1e9
+                                     # trials/cube ~ 0), so the near-threshold population is episodic RFI, not a
+                                     # noise floor. This test measures the real cost through the 07:16-07:40
+                                     # passes: search real time, C1 metering (blocks injections), and C2's
+                                     # cluster_rate_max limiter. Revert = 9.55.
+                                     # 2026-10-05: 10.55 → 9.55, a deliberate -1 sigma DETECTION cut (operator
                                      # request). The C2 trigger is a separate, higher threshold (12 sigma, and
                                      # 11 sigma for narrow w<=8 via faint_frb_extragalactic in
                                      # c2_trigger_criteria.yaml), so this does not by itself raise the dump rate:
