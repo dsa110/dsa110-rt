@@ -1534,13 +1534,27 @@ class SearchComputeService:
         # ran (the GPU pipeline is done with the cube tensor) so the
         # ring copy doesn't compete for the compute stream.
         self._maybe_stage_cube_in_ring(slot, result.cube, geom)
+        # C1 emit. Always invoked when the emitter is configured --
+        # even on empty cubes, so the heartbeat / connectivity check
+        # keeps flowing.
+        shipped: Optional[List[Candidate]] = None
+        if self._c1_emit is not None:
+            shipped = self._submit_c1_batch(slot, geom, result.candidates)
         # 2026-07-21 proactive stage: if this cube's peak candidate is
         # bright enough, write it to a provisional pending dir NOW (while
         # it's still local) so a ``too_late`` C2 trigger can later claim
         # it. Non-blocking (hands off to the same CubeDumpWriter queue as
         # the udp/auto paths); a no-op when the stager is disabled.
-        if self._proactive_stager is not None and result.candidates:
-            max_snr = max(float(c.snr) for c in result.candidates)
+        # 2026-10-05: arm on what C1 SHIPPED, not on raw detector output.
+        # During RFI / satellite passes the raw output is full of >=50
+        # sigma wide junk that the width cap and wide-escape governor
+        # discard -- it never reaches C2, so no trigger can ever claim
+        # the staged cube. Measured: one 05:42 UTC pass staged 76-143
+        # cubes (~110 GB) per search node, all unclaimable. With C1 off
+        # (benches) fall back to the raw list as before.
+        stage_from = result.candidates if shipped is None else shipped
+        if self._proactive_stager is not None and stage_from:
+            max_snr = max(float(c.snr) for c in stage_from)
             self._proactive_stager.maybe_stage(
                 cube_id=int(slot.cube_id),
                 specnum_start=int(slot.specnum_start),
@@ -1552,11 +1566,6 @@ class SearchComputeService:
                 max_snr=max_snr,
                 cube_tensor=result.cube,
             )
-        # C1 emit. Always invoked when the emitter is configured —
-        # even on empty cubes, so the heartbeat / connectivity check
-        # keeps flowing.
-        if self._c1_emit is not None:
-            self._submit_c1_batch(slot, geom, result.candidates)
 
         # Step 4b — legacy clusterer (M6 chunk 1) — disabled by default
         # under the M7.4 C1 stage; kept for offline benches.
@@ -1693,10 +1702,14 @@ class SearchComputeService:
         slot: CubeRingSlot,
         geom: CubeGeometry,
         candidates: List[Candidate],
-    ) -> None:
+    ) -> List[Candidate]:
         """Project ``candidates`` into the C1 row schema + push onto
         the emitter's outbound queue. Drops on queue-full are surfaced
-        via the emitter's mon-points + the service's own counters."""
+        via the emitter's mon-points + the service's own counters.
+
+        Returns the candidates that survived every C1 filter (the batch
+        handed to the emitter), so the proactive stager can arm on what
+        C2 will actually see rather than on raw detector output."""
         assert self._c1_emit is not None
         cfg = self._config
         # 2026-06-02: DM-aware noise-color SNR de-rating FIRST, so the
@@ -1893,6 +1906,7 @@ class SearchComputeService:
             self._c1_batches_submitted += 1
         else:
             self._c1_batches_dropped += 1
+        return list(candidates)
 
     def _publish_c1_metering(self, cap: int) -> None:
         """Flush the C1→C2 metering window to etcd and reset accumulators.

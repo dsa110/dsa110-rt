@@ -130,3 +130,21 @@ def test_the_service_applies_it_only_to_escapes() -> None:
     src = inspect.getsource(search_compute.SearchComputeService._submit_c1_batch)
     assert "self._wide_escape_gov.admit(" in src
     assert "kept = narrow + admitted" in src
+
+
+def test_proactive_staging_arms_on_what_c1_ships() -> None:
+    """2026-10-05: one satellite pass staged ~110 GB/node of cubes armed by
+    >=50 sigma wide junk that the cap + governor then discarded, so no C2
+    trigger could ever claim them. Staging must follow the shipped set."""
+    import inspect
+
+    from dsart.services import search_compute
+
+    src = inspect.getsource(search_compute.SearchComputeService)
+    assert "shipped = self._submit_c1_batch(slot, geom, result.candidates)" in src
+    assert "stage_from = result.candidates if shipped is None else shipped" in src
+    i_emit = src.index("shipped = self._submit_c1_batch(")
+    i_stage = src.index("self._proactive_stager.maybe_stage(")
+    assert i_emit < i_stage, "staging must run after the C1 filters"
+    sub = inspect.getsource(search_compute.SearchComputeService._submit_c1_batch)
+    assert "return list(candidates)" in sub
