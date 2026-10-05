@@ -155,6 +155,7 @@ class SearchComputeMonPublisher:
         cap: int,
         width_dropped_total: int = 0,
         width_escaped_total: int = 0,
+        width_escape_throttled_total: int = 0,
     ) -> bool:
         """Average the window counters and publish the rollup.
 
@@ -179,6 +180,11 @@ class SearchComputeMonPublisher:
             # brightness escape -- was not observable from outside.
             "c1_cands_dropped_width_total": int(width_dropped_total),
             "c1_cands_width_escaped_total": int(width_escaped_total),
+            # 2026-10-05: escapes refused by the wide-escape governor
+            # (floods). The escape counter above counts escapes BEFORE
+            # the governor, so escaped - throttled = actually shipped.
+            "c1_cands_width_escape_throttled_total": int(
+                width_escape_throttled_total),
             "n_blocks": int(n_blocks),
             "ts_mono": time.monotonic(),
             "ts_wall_unix": time.time(),

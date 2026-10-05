@@ -969,6 +969,10 @@ _SEARCH_COMPUTE_INT_FIELDS = (
     # from 20.0 toward 15.0; if they flood, it goes back up.
     "c1_cands_dropped_width_total",
     "c1_cands_width_escaped_total",
+    # 2026-10-05: escapes refused by the wide-escape governor -- the
+    # flood counter. Non-zero only while a half sees sustained wide
+    # candidates (RFI bursts / satellite transits).
+    "c1_cands_width_escape_throttled_total",
     "n_blocks",
 )
 _SEARCH_COMPUTE_FLOAT_FIELDS = (

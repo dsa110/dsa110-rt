@@ -453,7 +453,18 @@ routines:
 #             shake-down if pinned memory is constrained.
 # ---------------------------------------------------------------------------
 c1:
-  snr_min: 10.55                     # 2026-09-22: 11.0 → 10.55 is a NO-OP IN TRUE UNITS, not a threshold cut.
+  snr_min: 9.55                      # 2026-10-05: 10.55 → 9.55, a deliberate -1 sigma DETECTION cut (operator
+                                     # request). The C2 trigger is a separate, higher threshold (12 sigma, and
+                                     # 11 sigma for narrow w<=8 via faint_frb_extragalactic in
+                                     # c2_trigger_criteria.yaml), so this does not by itself raise the dump rate:
+                                     # it logs fainter candidates at C2 and lets a burst's fainter DM/width
+                                     # neighbours join its cluster. Measured 2026-10-03..05 at 10.55: the
+                                     # quiet-time tail is NON-Gaussian and steep (91 clusters in [11,11.5) vs
+                                     # 472 in [10.55,11) over 44 h), so expect roughly x10-25 more C1/C2 volume
+                                     # in quiet time -- C2 ingest handled 8.6k rows/min in floods with zero
+                                     # drops. The sigma-exclusion pairing below still holds: 9.55 here is 9.55 in
+                                     # true units. Revert = set back to 10.55 (search_compute restart).
+                                     # 2026-09-22: 11.0 → 10.55 is a NO-OP IN TRUE UNITS, not a threshold cut.
                                      # The sensitivity audit found the image-plane edge mask MULTIPLIES 6.164% of
                                      # every cube by zero, and those exact zeros were reaching sigma_clipped_std,
                                      # dragging sigma 4.05% low and inflating every reported SNR by 4.2%
@@ -549,6 +560,24 @@ c1:
                                      # to /mon/search_rt/<cn>/compute/<half> -> influx. If escapes are rare and
                                      # clean after a soak, lower toward 15.0. Set to 0 / remove to disable the
                                      # escape (restores the hard cap).
+  max_c1c2_width_escape_per_block: 1 # 2026-10-05 WIDE-ESCAPE GOVERNOR. The escape above was the door for the
+                                     # RFI / satellite-transit floods: over 2026-10-03..05, 8.5% of the time
+                                     # produced 99.4% of all C2 clusters, 91% of them b64 at a median 39 sigma
+                                     # (all above the 20 sigma escape) spanning a median 1243 pc/cm3 of DM and
+                                     # all 8 halves in 35% of cases. They recur ~4 min earlier each day
+                                     # (sidereal) and one drifted ~0.5 deg/min N-S in the ground-fixed (l,m)
+                                     # frame -- a GNSS satellite crossing the beam. Their volume tripped C2's
+                                     # cluster_rate_max 5.5% of the time, and while tripped NO dump can fire,
+                                     # so every FRB in that 5.5% was lost; without the >16 clusters the dead
+                                     # time is 0.44%. A real wide burst is ONE event (one escape, two if it
+                                     # straddles the cube overlap, sidelobes fainter than the main lobe); a
+                                     # flood is many per block for minutes. So: ship at most this many escapes
+                                     # per block (brightest first) and spend a per-half token bucket of
+                                     # _burst tokens refilled one per _refill_s. An isolated bright wide burst
+                                     # always ships; a flood becomes ~3/min/half within a second of onset.
+                                     # Counter: c1_cands_width_escape_throttled_total. 0/remove = disable.
+  max_c1c2_width_escape_burst: 3
+  max_c1c2_width_escape_refill_s: 20.0
   max_candidates_per_block: 8        # M7.6 C1->C2 metering: cap candidates shipped per cube (block).
                                      # When more than this survive the width cap in one cube, only the
                                      # top-N are sent, ordered narrow-first (width asc) then bright-first
@@ -698,7 +727,7 @@ c1:
   proactive_stage:
     enabled: true
     snr_threshold: 50.0    # per-cube peak candidate SNR (sigma) that arms a
-                           # stage. Well above the C1 emit floor (snr_min~11)
+                           # stage. Well above the C1 emit floor (snr_min 9.55)
                            # and the RFI singles floor, so only genuinely
                            # bright cubes stage; 260721upyy at 101.8 sigma is
                            # ~2x this. Lower only if bright FRBs are still
@@ -1209,9 +1238,10 @@ inject_bot:
   # against 2890 at w=4 -- a factor ~3 where the sqrt(width) model
   # predicts equality -- so nothing is extrapolated across widths.
   width_choices: [4, 32, 64, 128, 256, 512]
-  # Target SNR window: comfortably above the C1 floor (c1.snr_min, now
-  # 10.55 after the 2026-09-22 sigma fix -- it was 11.0, and 12.0 when
-  # this window was chosen; the TRUE threshold has not moved), and below
+  # Target SNR window: comfortably above the C1 floor (c1.snr_min, 9.55
+  # since 2026-10-05; 10.55 after the 2026-09-22 sigma fix, 11.0 before
+  # that, and 12.0 when this window was chosen) and the C2 trigger (12,
+  # or 11 for w<=8), and below
   # the dashboard's 30-sigma-predicted brightness guard even with the
   # ~25% pixel-straddle scatter. The bot never passes allow_bright.
   target_snr_min: 15.0

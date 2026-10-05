@@ -93,7 +93,12 @@ from ..dump import (
 )
 from ..common.contracts import CubeDumpManifest
 from ..noise_norm.layer1 import Layer1State
-from .c1_emit import C1EmitConfig, C1TcpEmitter, candidate_to_c1_row
+from .c1_emit import (
+    C1EmitConfig,
+    C1TcpEmitter,
+    WideEscapeGovernor,
+    candidate_to_c1_row,
+)
 from .search_ring_mon import SearchRingMonPublisher
 from .search_compute_mon import SearchComputeMonPublisher
 from ..inject.cal_probe_shadow import CalProbeShadow
@@ -772,6 +777,18 @@ class SearchComputeService:
         # 2026-09-22: candidates ALLOWED THROUGH the width cap by the
         # brightness escape (c1.max_c1c2_width_snr_escape).
         self._c1_cands_width_escaped = 0
+        # 2026-10-05: escapes the wide-escape governor refused (floods).
+        self._c1_cands_width_escape_throttled = 0
+        self._wide_escape_gov: Optional[WideEscapeGovernor] = None
+        _ce = config.c1_emit_config
+        if (_ce is not None and _ce.max_width_snr_escape is not None
+                and _ce.max_width_escape_per_block is not None):
+            self._wide_escape_gov = WideEscapeGovernor(
+                per_block=int(_ce.max_width_escape_per_block),
+                burst=int(_ce.max_width_escape_burst),
+                refill_s=float(_ce.max_width_escape_refill_s),
+            )
+        self._wide_escape_throttling = False
         # 2026-05-30: cumulative candidates dropped pre-transmit by the
         # DM-smearing-floor filter (c1.dm_width_floor_frac) — unphysically
         # narrow high-DM detections (impulsive RFI on a high-DM trial).
@@ -1078,6 +1095,8 @@ class SearchComputeService:
             "c1_batches_dropped": int(self._c1_batches_dropped),
             "c1_cands_dropped_width": int(self._c1_cands_dropped_width),
             "c1_cands_width_escaped": int(self._c1_cands_width_escaped),
+            "c1_cands_width_escape_throttled": int(
+                self._c1_cands_width_escape_throttled),
             "c1_cands_dropped_dmfloor": int(self._c1_cands_dropped_dmfloor),
             "c1_cands_dropped_color": int(self._c1_cands_dropped_color),
             "c1_cands_dropped_meter": int(self._c1_cands_dropped_meter),
@@ -1771,6 +1790,33 @@ class SearchComputeService:
                 self._c1_cands_dropped_width += n_dropped
             if n_escaped:
                 self._c1_cands_width_escaped += n_escaped
+            # 2026-10-05 wide-escape governor -- see
+            # C1EmitConfig.max_width_escape_per_block. Only the escapes
+            # are touched; every candidate within the cap passes as before.
+            if n_escaped and self._wide_escape_gov is not None:
+                narrow = [c for c in kept if int(c.width_samples) <= int(max_w)]
+                escapes = [c for c in kept if int(c.width_samples) > int(max_w)]
+                admitted, n_thr = self._wide_escape_gov.admit(
+                    escapes, time.monotonic())
+                if n_thr:
+                    self._c1_cands_width_escape_throttled += n_thr
+                    if not self._wide_escape_throttling:
+                        self._wide_escape_throttling = True
+                        LOG.info(
+                            "wide-escape governor: THROTTLING (%d of %d "
+                            "escapes this block refused; tokens %.2f/%d) -- "
+                            "sustained wide candidates, likely RFI or a "
+                            "satellite transit",
+                            n_thr, len(escapes), self._wide_escape_gov.tokens,
+                            self._wide_escape_gov.burst)
+                elif self._wide_escape_throttling and (
+                        self._wide_escape_gov.tokens
+                        >= self._wide_escape_gov.burst - 1e-9):
+                    self._wide_escape_throttling = False
+                    LOG.info("wide-escape governor: bucket full again, "
+                             "throttling ended (%d refused since start)",
+                             self._c1_cands_width_escape_throttled)
+                kept = narrow + admitted
             candidates = kept
         # M7.6 C1→C2 metering: cap candidates/block, narrow-first
         # (width asc) then bright-first (snr desc). RT-safe — we only pay
@@ -1865,6 +1911,8 @@ class SearchComputeService:
                     cap=int(cap),
                     width_dropped_total=self._c1_cands_dropped_width,
                     width_escaped_total=self._c1_cands_width_escaped,
+                    width_escape_throttled_total=(
+                        self._c1_cands_width_escape_throttled),
                 )
             except Exception:  # noqa: BLE001 — mon must never sink the pipe
                 LOG.warning("C1 metering publish failed", exc_info=True)
@@ -2589,6 +2637,9 @@ def _build_search_config_from_yaml(
     if enable_c1 and c2_endpoint:
         _max_c1c2_width = c1.get("max_c1c2_width_samples", None)
         _max_width_snr_escape = c1.get("max_c1c2_width_snr_escape", None)
+        _esc_per_block = c1.get("max_c1c2_width_escape_per_block", None)
+        _esc_burst = c1.get("max_c1c2_width_escape_burst", 3)
+        _esc_refill_s = c1.get("max_c1c2_width_escape_refill_s", 20.0)
         _max_cands_block = c1.get("max_candidates_per_block", None)
         # 2026-07-21: default 2 even when the yaml key is absent, so the
         # SNR-protected metering fix is live on nodes whose local config
@@ -2614,6 +2665,13 @@ def _build_search_config_from_yaml(
                 and float(_max_width_snr_escape) > 0.0
                 else None
             ),
+            max_width_escape_per_block=(
+                int(_esc_per_block)
+                if _esc_per_block is not None and int(_esc_per_block) > 0
+                else None
+            ),
+            max_width_escape_burst=max(1, int(_esc_burst)),
+            max_width_escape_refill_s=float(_esc_refill_s),
             max_candidates_per_block=(
                 int(_max_cands_block)
                 if _max_cands_block is not None and int(_max_cands_block) > 0

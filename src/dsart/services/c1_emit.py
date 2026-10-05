@@ -71,6 +71,7 @@ from ..cluster.features import centred_pix_offset
 from ..common.contracts import Candidate, CubeGeometry
 
 __all__ = [
+    "WideEscapeGovernor",
     "C1EmitConfig",
     "C1TcpEmitter",
     "candidate_to_c1_row",
@@ -83,6 +84,62 @@ _LOG = logging.getLogger("dsart.services.c1_emit")
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+
+class WideEscapeGovernor:
+    """Per-search-half rate limit on the C1->C2 width-cap escape.
+
+    See :attr:`C1EmitConfig.max_width_escape_per_block` for why. Pure and
+    clock-injected so it can be unit-tested; ``admit`` is O(n log n) in
+    the (tiny) number of escapes in one block and allocates nothing when
+    there are none.
+
+    Args:
+        per_block: max escapes admitted from one block (brightest first).
+        burst: token-bucket capacity; the bucket starts full.
+        refill_s: seconds to regain one token.
+    """
+
+    def __init__(self, per_block: int, burst: int, refill_s: float) -> None:
+        if int(per_block) < 1:
+            raise ValueError(f"per_block={per_block}, expected >= 1")
+        if int(burst) < 1:
+            raise ValueError(f"burst={burst}, expected >= 1")
+        if not float(refill_s) > 0.0:
+            raise ValueError(f"refill_s={refill_s}, expected > 0")
+        self.per_block = int(per_block)
+        self.burst = int(burst)
+        self.refill_s = float(refill_s)
+        self._tokens = float(self.burst)
+        self._t_last: Optional[float] = None
+
+    @property
+    def tokens(self) -> float:
+        return self._tokens
+
+    def _refill(self, now_s: float) -> None:
+        if self._t_last is not None and now_s > self._t_last:
+            self._tokens = min(
+                float(self.burst),
+                self._tokens + (now_s - self._t_last) / self.refill_s,
+            )
+        self._t_last = float(now_s) if self._t_last is None else max(
+            self._t_last, float(now_s))
+
+    def admit(
+        self, escapes: Sequence[Candidate], now_s: float,
+    ) -> Tuple[list, int]:
+        """Return ``(admitted, n_throttled)`` for one block's escapes."""
+        self._refill(float(now_s))
+        if not escapes:
+            return [], 0
+        n_allow = min(self.per_block, int(self._tokens + 1e-9))
+        if n_allow <= 0:
+            return [], len(escapes)
+        ranked = sorted(escapes, key=lambda c: -float(c.snr))
+        admitted = ranked[:n_allow]
+        self._tokens -= float(len(admitted))
+        return list(admitted), len(escapes) - len(admitted)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +243,37 @@ class C1EmitConfig:
     The cap is still wanted -- the 2026-05-29 analysis found 95-100% of
     the spurious candidate volume at width >= 32 -- so this admits only
     the bright tail. Configured via ``c1.max_c1c2_width_snr_escape``."""
+    max_width_escape_per_block: Optional[int] = None
+    """Wide-escape governor: at most this many escaped (wider-than-cap)
+    candidates per block, brightest first. ``None`` / ``<= 0`` disables
+    the whole governor (legacy: every escape ships).
+
+    2026-10-05. The brightness escape turned out to be the door for the
+    RFI / satellite-transit floods. Over 2026-10-03..05, 8.5% of the
+    time produced 99.4% of all C2 clusters; 91% of those were b64 at a
+    median 39 sigma (all of them above the 20 sigma escape), spanning a
+    median 1243 pc/cm3 of DM and all 8 halves in 35% of cases. The
+    floods recur ~4 min earlier each day (sidereal), and one tracked at
+    ~0.5 deg/min N-S in the ground-fixed (l,m) frame -- the angular rate
+    of a GNSS satellite crossing the 3 deg beam. Their volume tripped
+    C2's cluster-rate limiter (``cluster_rate_max``) 5.5% of the time,
+    and while it is tripped NO dump can fire, so a real FRB of any width
+    or brightness was lost for that 5.5%. Removing the >cap clusters
+    alone drops that dead time to 0.44%.
+
+    A real wide burst is ONE event: one escape (two if it straddles the
+    64-sample cube overlap), with any PSF sidelobes fainter than the
+    main lobe. A flood is many escapes per block for minutes. So this
+    keeps the brightest escape(s) per block and spends a per-half token
+    bucket (:attr:`max_width_escape_burst`, refilled one token every
+    :attr:`max_width_escape_refill_s`). An isolated bright wide burst
+    always ships; a sustained flood is cut to a trickle of ~3/min/half
+    within a few blocks of its onset -- still visible at C2, no longer
+    able to blind it."""
+    max_width_escape_burst: int = 3
+    """Token-bucket capacity for :attr:`max_width_escape_per_block`."""
+    max_width_escape_refill_s: float = 20.0
+    """Seconds per token refilled into the wide-escape bucket."""
     max_candidates_per_block: Optional[int] = None
     """C1→C2 metering: cap the number of candidates transmitted per cube
     (block). ``None`` / ``<= 0`` disables (ship every width-survivor).
