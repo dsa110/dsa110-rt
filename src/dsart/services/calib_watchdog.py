@@ -14,11 +14,16 @@ This module is a one-shot check, run every few minutes by
 ``dsa110-calib-watchdog.timer``; being a fresh process each time, it has no
 long-lived watch of its own that could die the same way. Each run:
 
-* reads the latest ``/cmd/cal`` announcement and the newest file already in
-  the hdf5 directory (both by the timestamp in the filename). While the corr
-  nodes are announcing (the array is observing), a gap of >= ``stall_s``
-  between the two means whole sets were announced and never pulled. Seen on
-  two consecutive runs, that restarts the pre-processor;
+* remembers the latest ``/cmd/cal`` announcement and, on the next run
+  (>= ``pull_wait_s`` later), checks that its set was pulled: some file of
+  that set or a newer one is in the hdf5 directory (judged by the timestamp in
+  the filename, so one node's failing pulls do not count), or anything at all
+  arrived recently (a long backlog only delays pulls). Two unpulled
+  announcements in a row while the corr nodes are announcing (the array is
+  observing) restart the pre-processor. It deliberately does NOT compare
+  filename times of consecutive sets: the corr nodes do not write files
+  continuously across a stop/start, and a 23-min gap between sets read as a
+  stall caused a false restart (2026-10-10 20:57);
 * restarts it immediately if the unit has failed, its heartbeat
   (``/mon/service/calpreprocess``) is stale, or a child reports
   ``ntasks_alive: 0``. A unit that is merely inactive was stopped by hand
@@ -88,12 +93,14 @@ def utc(t: Optional[float]) -> str:
 
 @dataclass(frozen=True)
 class WatchdogConfig:
-    #: Announced-but-not-pulled span (latest announced file vs newest file on
-    #: h23, by filename time) that counts as a stall. Sets are ~5.1 min apart,
-    #: so 600 s is two whole sets missed.
-    stall_s: float = 600.0
-    #: Consecutive stalled runs required before restarting (one run can land
-    #: in the second between an announcement and its pull).
+    #: How long an announced set gets to arrive before it counts as unpulled
+    #: (healthy pulls take seconds; a backfill can queue a couple of minutes).
+    pull_wait_s: float = 240.0
+    #: Files of one set carry timestamps up to a few s apart (the
+    #: pre-processor gathers within 60 s).
+    gather_tol_s: float = 60.0
+    #: Consecutive unpulled announcements required before restarting. With
+    #: the 5-min timer that is >= ~10 min of announced files not pulled.
     confirm_runs: int = 2
     #: The latest announced file must have started within this long for the
     #: array to count as observing (file length ~5.1 min + announce latency).
@@ -123,10 +130,16 @@ class Observation:
     calibration_heartbeat: Optional[float]
     #: mtime of the newest *.ms in the calibration directory.
     newest_ms: Optional[float] = None
+    #: mtime of the hdf5 directory = when the last file arrived (rsync renames
+    #: each file into place). rsync -a preserves the files' own mtimes.
+    last_arrival: Optional[float] = None
 
 
 @dataclass
 class State:
+    #: Filename time of the announcement seen at the previous run, and when.
+    pending_t: Optional[float] = None
+    pending_seen: Optional[float] = None
     stalled_runs: int = 0
     restarts: int = 0  # since the last recovery
     last_restart: Optional[float] = None
@@ -185,17 +198,29 @@ def decide(obs: Observation, st: State, cfg: WatchdogConfig) -> Decision:
         st.calibration_alerted = False
         dec.alerts.append(f"calibration consumer {CALIBRATION_UNIT} is running again.")
 
-    # Is the array observing, and how far behind are the pulls?
+    # Is the array observing (the corr nodes announcing fresh files)? A
+    # "calibrate" command as the latest value, or an unreadable one, gives no
+    # announcement this run.
     announced = None
     if obs.cmd is not None and obs.cmd.get("cmd") == "rsync":
         announced = fname_time(str((obs.cmd.get("val") or {}).get("filename", "")))
     observing = announced is not None and obs.now - announced <= cfg.observing_window_s
-    if announced is None:
-        lag = None  # a "calibrate" command is latest, or unreadable: no verdict
-    elif obs.newest_pulled is None:
-        lag = float("inf")
-    else:
-        lag = announced - obs.newest_pulled
+
+    # Was the set announced at the previous run pulled? None = no verdict.
+    pending_t, pending_seen = st.pending_t, st.pending_seen
+    unpulled = None
+    if (pending_t is not None and pending_seen is not None
+            and obs.now - pending_seen >= cfg.pull_wait_s):
+        pulled = (obs.newest_pulled is not None
+                  and obs.newest_pulled >= pending_t - cfg.gather_tol_s)
+        arriving = (obs.last_arrival is not None
+                    and obs.now - obs.last_arrival < cfg.pull_wait_s)
+        unpulled = not pulled and not arriving
+    if not observing:
+        if announced is not None:
+            st.pending_t = st.pending_seen = None
+    elif pending_t is None or unpulled is not None:
+        st.pending_t, st.pending_seen = announced, obs.now
 
     # End-to-end: are calibrator transits still turning into MSs?
     ms_stale = obs.newest_ms is None or obs.now - obs.newest_ms > cfg.ms_stale_s
@@ -237,23 +262,28 @@ def decide(obs: Observation, st: State, cfg: WatchdogConfig) -> Decision:
             reason = f"pre-processor child process(es) dead: {', '.join(dead)}"
     st.preprocess_stopped_alerted = False
 
-    if not reason and lag is not None:
-        if observing and lag >= cfg.stall_s:
+    if not observing:
+        st.stalled_runs = 0
+    elif not reason and unpulled is not None:
+        if unpulled:
             st.stalled_runs += 1
             if st.stalled_runs >= cfg.confirm_runs:
-                reason = (f"no file pulled since {utc(obs.newest_pulled)} while the corr "
-                          f"nodes have announced files up to {utc(announced)} "
-                          f"({lag / 60:.0f} min unpulled): its etcd watch has died")
+                reason = (f"the set announced as {utc(pending_t)} is still not pulled "
+                          f"{(obs.now - pending_seen) / 60:.0f} min later, nothing has "
+                          f"arrived since {utc(obs.last_arrival)} and the corr nodes "
+                          f"keep announcing (latest {utc(announced)}): its etcd watch "
+                          "has died")
             else:
                 dec.status = "stall suspected"
         else:
             st.stalled_runs = 0
 
     dec.detail = (f"announced {utc(announced)} newest_pulled {utc(obs.newest_pulled)}"
-                  f" observing {observing}")
+                  f" last_arrival {utc(obs.last_arrival)} observing {observing}"
+                  f" unpulled {unpulled}")
 
     if not reason:
-        healthy = lag is not None and observing and lag < cfg.stall_s
+        healthy = observing and unpulled is False
         if healthy and (st.restarts or st.gave_up):
             dec.alerts.append(
                 f"pre-processor recovered: files are being pulled again (newest "
@@ -287,6 +317,9 @@ def decide(obs: Observation, st: State, cfg: WatchdogConfig) -> Decision:
     st.restarts += 1
     st.last_restart = obs.now
     st.stalled_runs = 0
+    # Whatever was announced before the restart is never re-pulled; judge the
+    # new process on what is announced after it.
+    st.pending_t = st.pending_seen = None
     dec.restart = True
     dec.status = "restarted"
     again = " (the previous restart did not help)" if st.restarts > 1 else ""
@@ -355,6 +388,10 @@ def _mjd_heartbeat(d: Optional[Mapping[str, Any]]) -> Optional[float]:
 
 
 def observe(client: Any, hdf5_dir: Path, ms_dir: Path, now: float) -> Observation:
+    try:
+        last_arrival: Optional[float] = os.stat(hdf5_dir).st_mtime
+    except OSError:
+        last_arrival = None
     children = {}
     for c in CHILDREN:
         d = _get_dict(client, f"/mon/cal/{c}_process")
@@ -370,6 +407,7 @@ def observe(client: Any, hdf5_dir: Path, ms_dir: Path, now: float) -> Observatio
         calibration_state=unit_state(CALIBRATION_UNIT),
         calibration_heartbeat=_mjd_heartbeat(_get_dict(client, "/mon/service/calibration")),
         newest_ms=newest_ms(ms_dir),
+        last_arrival=last_arrival,
     )
 
 
@@ -383,7 +421,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--etcd-port", type=int, default=2379)
     p.add_argument("--slack-channel", default="")
     p.add_argument("--slack-token-file", default="")
-    p.add_argument("--stall-s", type=float, default=WatchdogConfig.stall_s)
+    p.add_argument("--pull-wait-s", type=float, default=WatchdogConfig.pull_wait_s)
     p.add_argument("--cooldown-s", type=float, default=WatchdogConfig.cooldown_s)
     p.add_argument("--dry-run", action="store_true",
                    help="decide and log only: no restart, no Slack, no etcd/state writes")
@@ -392,7 +430,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     import etcd3  # deferred so the decision logic imports without it
 
-    cfg = WatchdogConfig(stall_s=args.stall_s, cooldown_s=args.cooldown_s)
+    cfg = WatchdogConfig(pull_wait_s=args.pull_wait_s, cooldown_s=args.cooldown_s)
     client = etcd3.client(host=args.etcd_host, port=args.etcd_port, timeout=10)
     now = time.time()
     st = State.load(args.state)
