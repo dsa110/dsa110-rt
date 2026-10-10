@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the DSA-110 calibration pre-processor watchdog every 5 minutes
+
+[Timer]
+Unit=dsa110-calib-watchdog.service
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

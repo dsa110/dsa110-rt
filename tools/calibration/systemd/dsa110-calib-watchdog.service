@@ -1,0 +1,34 @@
+[Unit]
+# One-shot health check of the calibration pre-processor; driven by
+# dsa110-calib-watchdog.timer. See src/dsart/services/calib_watchdog.py.
+#
+# Restarts dsa110-calib-preprocess.service when the corr nodes are announcing
+# files on /cmd/cal but none has been pulled for ~10 min (its etcd watch died
+# silently -- 2026-09-13 and 2026-10-08), or when the unit has failed / its
+# heartbeat is stale / a child is dead. Alerts (journal, etcd
+# /mon/cal/watchdog, Slack) on every restart and recovery, and when no new
+# calibrator MS has appeared for 26 h while observing. Never touches
+# dsa110-calib-calibration.service (reports only). State lives in
+# ~/.local/state/dsa110-calib-watchdog/state.json.
+#
+# Install: copy this and the .timer to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dsa110-calib-watchdog.timer
+# Pause: systemctl --user stop dsa110-calib-watchdog.timer
+Description=DSA-110 calibration pre-processor watchdog (one-shot check)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/vikram/dev/dsa110-rt
+Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/anaconda3/envs/dsart_h23/bin/python -u -m dsart.services.calib_watchdog \
+    --slack-channel C01NUV2M0HM \
+    --slack-token-file /home/ubuntu/.config/slack_api_dsa110
+# A restart waits for the pre-processor to stop (TimeoutStopSec=60) and start.
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsa110-calib-watchdog
