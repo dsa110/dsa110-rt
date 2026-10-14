@@ -1201,11 +1201,14 @@ slack_relay:
 # ---------------------------------------------------------------------------
 inject_bot:
   enabled: true
-  # Same channel as the candidate cards (operator decision 2026-08-07:
-  # keep injection traffic where the team already looks, ~48 short
-  # messages/day, recovered/miss replies threaded). With it empty the
-  # loop still runs and logs, but no Slack messages are posted.
-  channel: "C01NUV2M0HM"
+  # 2026-10-14: dedicated #injections channel (operator decision) --
+  # every bot message (per-shot sent/recovered, miss / not-searching
+  # alerts, daily summary) goes here. Real on-sky candidate cards
+  # (c3.slack) and their annotation threads (slack_relay) stay in
+  # #candidates C01NUV2M0HM. Was C01NUV2M0HM (2026-08-07 decision: keep
+  # injections with the candidate cards). With it empty the loop still
+  # runs and logs, but no Slack messages are posted.
+  channel: "C0C96DTUK9T"
   token_file: "/home/ubuntu/.config/slack_api_dsa110"   # same dsa110candidates bot
   token_env: "SLACK_TOKEN_DSA110"
   dashboard_base_url: "http://localhost:5778"
