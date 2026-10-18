@@ -130,8 +130,10 @@ class Observation:
     calibration_heartbeat: Optional[float]
     #: mtime of the newest *.ms in the calibration directory.
     newest_ms: Optional[float] = None
-    #: mtime of the hdf5 directory = when the last file arrived (rsync renames
-    #: each file into place). rsync -a preserves the files' own mtimes.
+    #: When the last file arrived: the newest ctime among the correlator
+    #: files (rsync renames each into place; -a preserves their mtimes). Not
+    #: the directory's mtime -- the 04:00 cleanup's deletions bump that, which
+    #: read as an arrival and posted a false "recovered" every morning.
     last_arrival: Optional[float] = None
 
 
@@ -346,6 +348,21 @@ def newest_pulled(hdf5_dir: Path) -> Optional[float]:
     return newest
 
 
+def last_arrival(hdf5_dir: Path) -> Optional[float]:
+    newest = None
+    with os.scandir(hdf5_dir) as it:
+        for entry in it:
+            if fname_time(entry.name) is None:
+                continue  # rsync temp files (.name.XXXXXX), tmp/, ...
+            try:
+                t = entry.stat().st_ctime
+            except OSError:
+                continue  # deleted under us
+            if newest is None or t > newest:
+                newest = t
+    return newest
+
+
 def newest_ms(ms_dir: Path) -> Optional[float]:
     newest = None
     with os.scandir(ms_dir) as it:
@@ -388,10 +405,6 @@ def _mjd_heartbeat(d: Optional[Mapping[str, Any]]) -> Optional[float]:
 
 
 def observe(client: Any, hdf5_dir: Path, ms_dir: Path, now: float) -> Observation:
-    try:
-        last_arrival: Optional[float] = os.stat(hdf5_dir).st_mtime
-    except OSError:
-        last_arrival = None
     children = {}
     for c in CHILDREN:
         d = _get_dict(client, f"/mon/cal/{c}_process")
@@ -407,7 +420,7 @@ def observe(client: Any, hdf5_dir: Path, ms_dir: Path, now: float) -> Observatio
         calibration_state=unit_state(CALIBRATION_UNIT),
         calibration_heartbeat=_mjd_heartbeat(_get_dict(client, "/mon/service/calibration")),
         newest_ms=newest_ms(ms_dir),
-        last_arrival=last_arrival,
+        last_arrival=last_arrival(hdf5_dir),
     )
 
 

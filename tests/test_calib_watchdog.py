@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dsart.services.calib_watchdog import (
-    Observation, State, WatchdogConfig, decide, fname_time, newest_pulled)
+    Observation, State, WatchdogConfig, decide, fname_time, last_arrival, newest_pulled)
 
 CFG = WatchdogConfig()
 SET = 306.0  # correlator file cadence, s
@@ -56,6 +56,20 @@ def test_newest_pulled(tmp_path: Path):
     for n in ("2026-10-09T05:32:02_sb06.hdf5", "2026-10-10T20:06:10_sb00.hdf5", "tmp"):
         (tmp_path / n).write_bytes(b"")
     assert newest_pulled(tmp_path) == t("2026-10-10T20:06:10")
+
+
+def test_last_arrival_ignores_deletions_and_temp_files(tmp_path: Path):
+    # The 04:00 cleanup deleting old files must not look like an arrival.
+    keep = tmp_path / "2026-10-18T03:00:00_sb00.hdf5"
+    keep.write_bytes(b"")
+    arrived = last_arrival(tmp_path)
+    time.sleep(1.1)
+    old = tmp_path / "2026-10-14T03:00:00_sb00.hdf5"
+    old.write_bytes(b"")
+    (tmp_path / ".2026-10-18T03:05:00_sb01.hdf5.Ab12Cd").write_bytes(b"")  # rsync temp
+    old.unlink()
+    assert last_arrival(tmp_path) == arrived
+    assert tmp_path.stat().st_mtime > arrived  # the old heuristic would have fired
 
 
 def test_healthy_observing_does_nothing():

@@ -34,6 +34,13 @@ Environment=PATH=/home/ubuntu/anaconda3/envs/casa38/bin:/usr/local/sbin:/usr/loc
 Environment=OPENBLAS_NUM_THREADS=2
 Environment=OMP_NUM_THREADS=2
 Environment=MKL_NUM_THREADS=2
+# The service opens etcd gRPC connections before forking its children.
+# Without gRPC fork support the children inherit the live HTTP/2 connection,
+# etcd replies GOAWAY ENHANCE_YOUR_CALM "too_many_pings" ~1 s after start and
+# the /cmd/cal watch dies: nothing pulled 2026-10-16..18, every restart. On
+# h23 this is installed as the drop-in
+# ~/.config/systemd/user/dsa110-calib-preprocess.service.d/grpc-fork-support.conf
+Environment=GRPC_ENABLE_FORK_SUPPORT=1
 
 ExecStart=/home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-shell/dsa110-calib/services/preprocess_service.py
 
