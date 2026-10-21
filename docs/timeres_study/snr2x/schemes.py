@@ -1,4 +1,5 @@
-"""The two schemes compared: what is deployed, and the proposed 2x (report v4, roadmap step 1)."""
+"""The schemes compared: what is deployed, the proposed 2x (report v4, roadmap step 1), and a
+single-shot Levin search at 0.26 ms / 244 kHz."""
 from __future__ import annotations
 
 import json
@@ -8,7 +9,7 @@ import sys
 
 import numpy as np
 
-from snr_model import Scheme
+from snr_model import OneStage, Scheme
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
 from physics import DNU_NATIVE_MHZ, F_BOT_MHZ, F_TOP_MHZ, gen_dm_list  # noqa: E402
@@ -46,6 +47,31 @@ def proposed(q1=T4, n_sub=2, tol=1.25):
     tiers = [_tier(50.0, 1600.0, T2, q1, n_sub, tol=tol), _tier(1600.0, 3000.0, T1, min(q1, T1), n_sub, tol=tol)]
     lab = f"proposed 2x (stage-1 at {q1 / 1e3:.2f} ms)"
     return Scheme(lab, csf=2, n_sub=n_sub, tiers=tiers)
+
+
+def gen_dmtrials(dm1, dm2, tol=1.25, nu_ghz=1.405, nchan=768, tsamp_us=262.144, b_mhz=0.24414):
+    """Levin/Cordes step recursion, verbatim from the legacy single-stage generator
+    (/media/ubuntu/ssd/vikram/scratch/gen_dmtrials.py, via _inspect/sensitivity/gen_legacy_grid.py)."""
+    n2 = float(nchan) ** 2.0
+    alp = 1.0 / (16.0 + n2)
+    bet = tsamp_us ** 2.0
+    trials = [float(dm1)]
+    dm_prev, dm = float(dm1), 0.0
+    while dm < dm2:
+        dm = (n2 * alp * dm_prev
+              + np.sqrt(16.0 * alp * (tol ** 2.0 - n2 * alp) * dm_prev ** 2.0
+                        + 16.0 * alp * bet * (tol ** 2.0 - 1.0) * (nu_ghz ** 3.0 / 8.3 / b_mhz) ** 2.0))
+        dm_prev = dm
+        trials.append(float(dm))
+    return np.asarray(trials)
+
+
+def single_shot():
+    """Single-shot incoherent dedispersion: Levin trials tol 1.25 over DM 80-1500, 244 kHz channels
+    (csf 8), 0.262 ms sampling, one integer delay per channel, power-of-2 boxcars 1-256 samples
+    (0.26-67 ms, the same longest boxcar as today's 1-64 at 1.05 ms)."""
+    return OneStage("single-shot 0.26 ms / 244 kHz", csf=8, fine=gen_dmtrials(80.0, 1500.0), T_us=T4,
+                    ladder=(1, 2, 4, 8, 16, 32, 64, 128, 256))
 
 
 def describe(s):

@@ -72,9 +72,9 @@ N_PHASE = 16
 class Scheme:
     """A two-stage plan: per-tier (fine, coarse, f2c, q1, q2) at one channel width."""
 
-    def __init__(self, name, csf, n_sub, tiers):
+    def __init__(self, name, csf, n_sub, tiers, ladder=LADDER):
         """tiers: list of dict(fine, coarse, f2c, q1, q2); q2 is that tier's search sample."""
-        self.name, self.csf, self.n_sub, self.tiers = name, csf, n_sub, tiers
+        self.name, self.csf, self.n_sub, self.tiers, self.ladder = name, csf, n_sub, tiers, tuple(ladder)
         nus = build_summed_chgroup_freq_table_GHz(csf)                 # (16, 384/csf)
         nsum = nus.shape[1]
         per = nsum // n_sub
@@ -128,6 +128,22 @@ class Scheme:
         return min(t["fine"][0] for t in self.tiers), max(t["fine"][-1] for t in self.tiers)
 
 
+class OneStage(Scheme):
+    """Single-shot incoherent dedispersion of a filterbank: every (summed) channel is delayed
+    by ONE integer number of samples, rint(delay(trial DM, channel centre) / T)."""
+
+    def __init__(self, name, csf, fine, T_us, ladder=LADDER):
+        tier = dict(fine=np.asarray(fine, float), coarse=np.zeros(1), f2c=np.zeros(len(fine), int),
+                    q1=T_us, q2=T_us)
+        super().__init__(name, csf, 1, [tier], ladder)
+        nus = build_summed_chgroup_freq_table_GHz(csf)
+        self.a_full = 1e3 * K * (1.0 / NU_BOT ** 2 - 1.0 / nus ** 2)         # (16, nsum) us per pc/cc
+
+    def applied_us(self, ti, fi):
+        t = self.tiers[ti]
+        return (t["q2"] * np.rint(self.a_full * t["fine"][fi] / t["q2"]))[:, self.k]
+
+
 # -- profile + S/N engine ----------------------------------------------------------------
 _F = np.fft.rfftfreq(NGRID)
 
@@ -173,7 +189,7 @@ def histogram(resid_us, dm):
     return np.fft.rfft(prof / prof.sum())
 
 
-def snr_binned(H, kern_ft, T_us, W_us, shape="gauss"):
+def snr_binned(H, kern_ft, T_us, W_us, shape="gauss", ladder=LADDER):
     """Phase-averaged best-boxcar S/N / ideal, for spectrum H with pulse kernel kern_ft."""
     prof = np.fft.irfft(H * kern_ft, n=NGRID)
     m = int(round(T_us / DT))
@@ -182,7 +198,7 @@ def snr_binned(H, kern_ft, T_us, W_us, shape="gauss"):
     ph = (np.arange(N_PHASE) * m) // N_PHASE
     C = cf[ph[:, None] + m * np.arange(nb + 1)[None, :]]                # (P, nb+1) cumulative
     best = np.zeros(N_PHASE)
-    for w in LADDER:
+    for w in ladder:
         s = (C[:, w:] - C[:, :-w]).max(axis=1) / np.sqrt(w * T_us)
         best = np.maximum(best, s)
     return float(best.mean()) / ideal_norm(W_us, shape)
@@ -205,7 +221,7 @@ def evaluate(scheme, dm, widths_us, n_near=8, shape="gauss"):
     T = scheme.tier_T(dm)
     H = histogram(A_TRUE * dm + scheme.exact_us(dm), dm)
     smear = np.array([snr_matched(H, k, w, shape) for k, w in zip(KS, widths_us)])
-    sample = np.array([snr_binned(H, k, T, w, shape) for k, w in zip(KS, widths_us)])
+    sample = np.array([snr_binned(H, k, T, w, shape, scheme.ladder) for k, w in zip(KS, widths_us)])
     near = np.argsort(np.abs(scheme.trial_dm - dm))[:n_near]
     grid = np.zeros(nw)
     full = np.zeros(nw)
@@ -215,6 +231,6 @@ def evaluate(scheme, dm, widths_us, n_near=8, shape="gauss"):
         He = histogram(A_TRUE * dm + scheme.exact_us(d), dm)
         Hi = histogram(A_TRUE * dm + scheme.applied_us(ti, fi), dm)
         for i, (k, w) in enumerate(zip(KS, widths_us)):
-            grid[i] = max(grid[i], snr_binned(He, k, Tt, w, shape))
-            full[i] = max(full[i], snr_binned(Hi, k, Tt, w, shape))
+            grid[i] = max(grid[i], snr_binned(He, k, Tt, w, shape, scheme.ladder))
+            full[i] = max(full[i], snr_binned(Hi, k, Tt, w, shape, scheme.ladder))
     return {"smear": smear, "sample": sample, "dmgrid": grid, "total": full}

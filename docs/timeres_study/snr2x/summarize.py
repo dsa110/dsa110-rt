@@ -6,15 +6,17 @@ import numpy as np
 Z = np.load("results/snr2x.npz")
 W = Z["widths_ms"]
 BANDS = [(50, 100), (100, 500), (500, 1000), (1000, 1500), (1500, 2000), (2000, 3000)]
-KEYS = {"current": "current", "prop_q026": "2x (stage-1 0.26 ms)", "prop_q052": "2x (stage-1 0.52 ms)"}
+KEYS = {"current": "current", "prop_q026": "2x (stage-1 0.26 ms)", "prop_q052": "2x (stage-1 0.52 ms)",
+        "single": "single-shot 0.26 ms/244k"}
+SEARCHED = {"current": (100, 1500), "single": (80, 1500)}       # outside = not searched
 
 
 def band_stats(key, lo, hi):
     dm = Z[f"{key}_dm"]
     ch = Z[f"{key}_chain"]                       # (n, 4, nw): smear, sample, dmgrid, total
     m = (dm >= lo) & (dm < hi)
-    if key == "current":                         # outside the searched range = not searched
-        m &= (dm >= 100) & (dm <= 1500)
+    if key in SEARCHED:                          # outside the searched range = not searched
+        m &= (dm >= SEARCHED[key][0]) & (dm <= SEARCHED[key][1])
     if m.sum() < 5:
         return None
     c = ch[m]
