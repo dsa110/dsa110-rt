@@ -135,23 +135,26 @@ def f3():
     h, l = ax.get_legend_handles_labels()
     order = [0, 2, 4, 1, 3, 5]
     ax.legend([h[i] for i in order], [l[i] for i in order], ncol=2, fontsize=7.4, loc="upper right")
-    ax.set_ylim(0.9, 3.6)
+    ax.set_ylim(0.9, 3.9)
     save(fig, "f3_gain_vs_today.png")
 
 
 def rate_gains():
     """Euclidean rate gain: <f_new^1.5>/<f_old^1.5> over a log-normal width population."""
     lw = np.log(W)
+    fine = np.linspace(lw[0], lw[-1], 600)          # uniform in log W (grid points are not)
     out = {}
     for med, sig, tag in ((1.0, 1.0, "median 1 ms (DSA-like)"), (0.3, 0.8, "median 0.3 ms (narrow)")):
-        p = np.exp(-0.5 * ((lw - np.log(med)) / sig) ** 2)
+        p = np.exp(-0.5 * ((fine - np.log(med)) / sig) ** 2)
         p /= p.sum()
         row = {}
         for k in ("legacy", "x1_c1", "x2_c1", "x4_c8", "x4_c2", "x4_c1", "x8_c1"):
             gains = []
             for dm in (300.0, 800.0, 1500.0):
                 i = DMS.index(dm)
-                gains.append((p * G[k][i] ** 1.5).sum() / (p * G["deployed"][i] ** 1.5).sum())
+                fn = np.interp(fine, lw, G[k][i])
+                fo = np.interp(fine, lw, G["deployed"][i])
+                gains.append((p * fn ** 1.5).sum() / (p * fo ** 1.5).sum())
             row[k] = float(np.mean(gains))
         out[tag] = row
     derived["rate_gain"] = out
@@ -313,7 +316,7 @@ def f7():
     arrow(ax, 0.73, 0.70, 0.80, 0.55)
     arrow(ax, 0.86, 0.66, 0.86, 0.60)
     arrow(ax, 0.80, 0.33, 0.75, 0.20, "candidates")
-    ax.text(0.0, 0.40, "Images never cross the network\n(a cube is ~20-35x the uv\nstreams that make it), so\n"
+    ax.text(0.0, 0.40, "Images never cross the network\n(a bucket's cube is ~6-12x the\nuv streams that make it), so\n"
             "imaging and detection stay\ntogether on each owner.\n\nSlow vis from the same voltage\nload - no duplicated H2D,\n"
             "unpack or correlation;\nbada contract unchanged.", fontsize=7.4, color=INK2, va="top")
     fig.tight_layout()
