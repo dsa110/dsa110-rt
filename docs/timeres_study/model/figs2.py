@@ -158,8 +158,8 @@ def r4():
     ax.text(0, 0.97, "A. Two-stage, one corner turn (today's shape, done right)", fontsize=9.5,
             fontweight="bold", va="top")
     box(ax, 0.0, 0.25, 0.27, 0.55, "corr GPU A\nX-engine: slow + fast\nstage-1 at native 32.8 us\n"
-        "per coarse DM x 4 sub-bands\n(DM-tiered cadence)\ngrid, 4-bit, send", CA)
-    box(ax, 0.36, 0.33, 0.2, 0.4, "corner turn\nsub-band streams\nper coarse bucket\n~3.7 Gb/s/owner", CN)
+        "per coarse DM x 2-4 sub-bands\n(DM-tiered cadence)\ngrid, 4-bit, send", CA)
+    box(ax, 0.36, 0.33, 0.2, 0.4, "corner turn\nsub-band streams\nper coarse bucket\n2-13 Gb/s per\nreceiving node", CN)
     box(ax, 0.65, 0.25, 0.35, 0.55, "24 imaging owners\n(16 corr GPU B + 8 search)\nstage-2 combine (one\n"
         "rounding) -> FFT -> boxcar\n-> C1/C2", CB)
     arr(ax, (0.27, 0.53), (0.36, 0.53))

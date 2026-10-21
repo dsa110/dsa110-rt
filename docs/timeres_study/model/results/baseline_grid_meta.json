@@ -1,0 +1,18 @@
+{
+ "bts2": {
+  "name": "2-stage @0.52 ms, stage-2 at T",
+  "n_fine": 949
+ },
+ "bts4": {
+  "name": "2-stage @0.26 ms, stage-2 at T",
+  "n_fine": 1521
+ },
+ "btc2": {
+  "name": "two CTs @0.52 ms (CT1 0.52 ms, 122 kHz)",
+  "n_fine": 766
+ },
+ "btc1": {
+  "name": "two CTs @1.05 ms (CT1 0.52 ms, 122 kHz)",
+  "n_fine": 476
+ }
+}
