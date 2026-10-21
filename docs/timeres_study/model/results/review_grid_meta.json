@@ -1,0 +1,66 @@
+{
+ "today": {
+  "name": "today: 2-stage 8x4, 244 kHz, stage-1 at T",
+  "n_fine": 200
+ },
+ "legacy": {
+  "name": "legacy dsaX: T=0.26 ms, 244 kHz, 1-stage",
+  "n_fine": 472
+ },
+ "os_T1_c8": {
+  "name": "1-shot @1.05 ms, 244 kHz (today's DM grid)",
+  "n_fine": 200
+ },
+ "ts_T1_c8": {
+  "name": "2-stage 16x8 @1.05 ms, 244 kHz, native stage-1",
+  "n_fine": 243
+ },
+ "ts_T1_c1": {
+  "name": "2-stage 16x8 @1.05 ms, 30.5 kHz, native stage-1",
+  "n_fine": 280
+ },
+ "os_T4_c8": {
+  "name": "1-shot @0.26 ms, 244 kHz",
+  "n_fine": 544
+ },
+ "os_T4_c4": {
+  "name": "1-shot @0.26 ms, 122 kHz",
+  "n_fine": 766
+ },
+ "os_T4_c2": {
+  "name": "1-shot @0.26 ms, 61 kHz",
+  "n_fine": 956
+ },
+ "ts_T4_c8": {
+  "name": "2-stage @0.26 ms, 244 kHz",
+  "n_fine": 544
+ },
+ "ts_T4_c4": {
+  "name": "2-stage @0.26 ms, 122 kHz",
+  "n_fine": 766
+ },
+ "ts_T4_c2": {
+  "name": "2-stage @0.26 ms, 61 kHz",
+  "n_fine": 956
+ },
+ "ts_T4_c1": {
+  "name": "2-stage @0.26 ms, 30.5 kHz",
+  "n_fine": 1059
+ },
+ "ts_T4_c8_h": {
+  "name": "2-stage @0.26 ms, 244 kHz, stage-2 T/2",
+  "n_fine": 544
+ },
+ "ts_T4_c4_h": {
+  "name": "2-stage @0.26 ms, 122 kHz, stage-2 T/2",
+  "n_fine": 766
+ },
+ "ts_T4_c2_h": {
+  "name": "2-stage @0.26 ms, 61 kHz, stage-2 T/2",
+  "n_fine": 956
+ },
+ "ts_T4_c1_h": {
+  "name": "2-stage @0.26 ms, 30.5 kHz, stage-2 T/2",
+  "n_fine": 1059
+ }
+}

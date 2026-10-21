@@ -1,0 +1,62 @@
+{
+ "today": {
+  "name": "today",
+  "n_fine": 200,
+  "T_us": 1048.576
+ },
+ "os1_c8": {
+  "name": "one-shot multicast @1.05 ms, 244 kHz",
+  "n_fine": 385,
+  "T_us": 1048.576
+ },
+ "ts1_c2": {
+  "name": "2-stage @1.05 ms, native stage-1",
+  "n_fine": 525,
+  "T_us": 1048.576
+ },
+ "ts2_c2": {
+  "name": "2-stage @0.52 ms, stage-2 0.26 ms",
+  "n_fine": 949,
+  "T_us": 524.288
+ },
+ "tc2_c2": {
+  "name": "two CTs @0.52 ms (CT1 0.26 ms, 61 kHz)",
+  "n_fine": 949,
+  "T_us": 524.288
+ },
+ "tc1_c2": {
+  "name": "two CTs @1.05 ms (CT1 0.26 ms, 61 kHz)",
+  "n_fine": 525,
+  "T_us": 1048.576
+ },
+ "ts4_c4": {
+  "name": "2-stage @0.26 ms, 122 kHz, stage-2 T/2",
+  "n_fine": 1089,
+  "T_us": 262.144
+ },
+ "ts4_c2": {
+  "name": "2-stage @0.26 ms, 61 kHz, stage-2 T/2",
+  "n_fine": 1521,
+  "T_us": 262.144
+ },
+ "tc4_c4": {
+  "name": "two CTs @0.26 ms (CT1 0.26 ms, 122 kHz)",
+  "n_fine": 1089,
+  "T_us": 262.144
+ },
+ "tc4_c2": {
+  "name": "two CTs @0.26 ms (CT1 0.26 ms, 61 kHz)",
+  "n_fine": 1521,
+  "T_us": 262.144
+ },
+ "tc4_c2h": {
+  "name": "two CTs @0.26 ms (CT1 0.13 ms, 61 kHz)",
+  "n_fine": 1521,
+  "T_us": 262.144
+ },
+ "zoom": {
+  "name": "voltage zoom: coherent, 32.8 us",
+  "n_fine": 61400,
+  "T_us": 32.768
+ }
+}

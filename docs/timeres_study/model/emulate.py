@@ -46,6 +46,7 @@ class Cfg:
     coarse_dm: np.ndarray = field(default=None, repr=False)
     fine_to_coarse: np.ndarray = field(default=None, repr=False)
     q2_us: float | None = None     # stage-2 (per-stream) shift quantum (None -> T)
+    coherent: bool = False         # coherent dedispersion within channels: no intra-channel smear
 
     def __post_init__(self):
         if self.q1_us is None:
@@ -97,6 +98,8 @@ def recovered(cfg: Cfg, D: float, W_us: float, rng, n_trial_nbrs=3):
     nu = _nu
     true_ms = K_DM_MS * D * (nu ** -2 - (F_TOP_MHZ / 1e3) ** -2)
     smear = chan_smear_us(D, DNU_NATIVE_MHZ, FREQS_MHZ)        # us, per native ch
+    if cfg.coherent:
+        smear = np.zeros_like(smear)
     gft = _gauss_kernel_ft(W_us)
     # ideal: unit-fluence Gaussian per channel, matched filter, no smear
     sig_us = W_us / 2.354820045
@@ -113,7 +116,7 @@ def recovered(cfg: Cfg, D: float, W_us: float, rng, n_trial_nbrs=3):
         resid_us -= np.median(resid_us)
         # per-chgroup smear box (smear varies <4% inside a chgroup)
         prof = np.zeros(NGRID)
-        pos = resid_us / DT_US + NGRID / 2
+        pos = np.clip(resid_us / DT_US + NGRID / 2, 0, NGRID - 2)   # out-of-window -> edge (S/N ~0)
         for g in range(N_CHGROUP):
             sl = slice(g * N_CH_PER_CHGROUP, (g + 1) * N_CH_PER_CHGROUP)
             p = pos[sl]

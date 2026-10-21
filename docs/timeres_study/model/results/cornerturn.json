@@ -1,0 +1,258 @@
+[
+ {
+  "scheme": "2-stage today 8x4",
+  "T_us": 1048.576,
+  "csf": 8,
+  "bits": 16,
+  "corr_egress": 1.0419921875,
+  "owner_ingress": 2.083984375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 1048.576,
+  "csf": 8,
+  "bits": 16,
+  "corr_egress": 1.2802734375,
+  "owner_ingress": 20.484375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 1048.576,
+  "csf": 4,
+  "bits": 16,
+  "corr_egress": 2.560546875,
+  "owner_ingress": 40.96875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 1048.576,
+  "csf": 2,
+  "bits": 16,
+  "corr_egress": 5.12109375,
+  "owner_ingress": 81.9375
+ },
+ {
+  "scheme": "2-stage 16x8",
+  "T_us": 1048.576,
+  "csf": "any",
+  "bits": 16,
+  "corr_egress": 3.7109375,
+  "owner_ingress": 3.7109375
+ },
+ {
+  "scheme": "2-stage 24x6",
+  "T_us": 1048.576,
+  "csf": "any",
+  "bits": 16,
+  "corr_egress": 4.1748046875,
+  "owner_ingress": 2.783203125
+ },
+ {
+  "scheme": "2-stage today 8x4",
+  "T_us": 1048.576,
+  "csf": 8,
+  "bits": 8,
+  "corr_egress": 0.52099609375,
+  "owner_ingress": 1.0419921875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 1048.576,
+  "csf": 8,
+  "bits": 8,
+  "corr_egress": 0.64013671875,
+  "owner_ingress": 10.2421875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 1048.576,
+  "csf": 4,
+  "bits": 8,
+  "corr_egress": 1.2802734375,
+  "owner_ingress": 20.484375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 1048.576,
+  "csf": 2,
+  "bits": 8,
+  "corr_egress": 2.560546875,
+  "owner_ingress": 40.96875
+ },
+ {
+  "scheme": "2-stage 16x8",
+  "T_us": 1048.576,
+  "csf": "any",
+  "bits": 8,
+  "corr_egress": 1.85546875,
+  "owner_ingress": 1.85546875
+ },
+ {
+  "scheme": "2-stage 24x6",
+  "T_us": 1048.576,
+  "csf": "any",
+  "bits": 8,
+  "corr_egress": 2.08740234375,
+  "owner_ingress": 1.3916015625
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 524.288,
+  "csf": 8,
+  "bits": 16,
+  "corr_egress": 2.560546875,
+  "owner_ingress": 40.96875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 524.288,
+  "csf": 4,
+  "bits": 16,
+  "corr_egress": 5.12109375,
+  "owner_ingress": 81.9375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 524.288,
+  "csf": 2,
+  "bits": 16,
+  "corr_egress": 10.2421875,
+  "owner_ingress": 163.875
+ },
+ {
+  "scheme": "2-stage 16x8",
+  "T_us": 524.288,
+  "csf": "any",
+  "bits": 16,
+  "corr_egress": 7.421875,
+  "owner_ingress": 7.421875
+ },
+ {
+  "scheme": "2-stage 24x6",
+  "T_us": 524.288,
+  "csf": "any",
+  "bits": 16,
+  "corr_egress": 8.349609375,
+  "owner_ingress": 5.56640625
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 524.288,
+  "csf": 8,
+  "bits": 8,
+  "corr_egress": 1.2802734375,
+  "owner_ingress": 20.484375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 524.288,
+  "csf": 4,
+  "bits": 8,
+  "corr_egress": 2.560546875,
+  "owner_ingress": 40.96875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 524.288,
+  "csf": 2,
+  "bits": 8,
+  "corr_egress": 5.12109375,
+  "owner_ingress": 81.9375
+ },
+ {
+  "scheme": "2-stage 16x8",
+  "T_us": 524.288,
+  "csf": "any",
+  "bits": 8,
+  "corr_egress": 3.7109375,
+  "owner_ingress": 3.7109375
+ },
+ {
+  "scheme": "2-stage 24x6",
+  "T_us": 524.288,
+  "csf": "any",
+  "bits": 8,
+  "corr_egress": 4.1748046875,
+  "owner_ingress": 2.783203125
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 262.144,
+  "csf": 8,
+  "bits": 16,
+  "corr_egress": 5.12109375,
+  "owner_ingress": 81.9375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 262.144,
+  "csf": 4,
+  "bits": 16,
+  "corr_egress": 10.2421875,
+  "owner_ingress": 163.875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 262.144,
+  "csf": 2,
+  "bits": 16,
+  "corr_egress": 20.484375,
+  "owner_ingress": 327.75
+ },
+ {
+  "scheme": "2-stage 16x8",
+  "T_us": 262.144,
+  "csf": "any",
+  "bits": 16,
+  "corr_egress": 14.84375,
+  "owner_ingress": 14.84375
+ },
+ {
+  "scheme": "2-stage 24x6",
+  "T_us": 262.144,
+  "csf": "any",
+  "bits": 16,
+  "corr_egress": 16.69921875,
+  "owner_ingress": 11.1328125
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 262.144,
+  "csf": 8,
+  "bits": 8,
+  "corr_egress": 2.560546875,
+  "owner_ingress": 40.96875
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 262.144,
+  "csf": 4,
+  "bits": 8,
+  "corr_egress": 5.12109375,
+  "owner_ingress": 81.9375
+ },
+ {
+  "scheme": "1-shot (multicast)",
+  "T_us": 262.144,
+  "csf": 2,
+  "bits": 8,
+  "corr_egress": 10.2421875,
+  "owner_ingress": 163.875
+ },
+ {
+  "scheme": "2-stage 16x8",
+  "T_us": 262.144,
+  "csf": "any",
+  "bits": 8,
+  "corr_egress": 7.421875,
+  "owner_ingress": 7.421875
+ },
+ {
+  "scheme": "2-stage 24x6",
+  "T_us": 262.144,
+  "csf": "any",
+  "bits": 8,
+  "corr_egress": 8.349609375,
+  "owner_ingress": 5.56640625
+ }
+]
