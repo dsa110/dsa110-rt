@@ -1,0 +1,792 @@
+{
+ "H_s": 11.0,
+ "n_search": 4,
+ "fabric": {
+  "baseline": {
+   "corr": 0.0,
+   "search": 11.0
+  },
+  "eno2 on search nodes": {
+   "corr": 0.0,
+   "search": 20.4
+  },
+  "eno2 on all nodes": {
+   "corr": 9.4,
+   "search": 20.4
+  },
+  "stretch: card in x16 slot": {
+   "corr": 17,
+   "search": 34.0
+  }
+ },
+ "rows": [
+  {
+   "amb": "2x",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 34.203759765624994,
+   "gpu_eq": 3.1137047051207043,
+   "ct_gbps_v5_cells": 41.39013671875,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "2x",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 30.556640625,
+   "gpu_eq": 3.4350643375594356,
+   "ct_gbps_v5_cells": 38.1640625,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "2x",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 34.203759765624994,
+   "gpu_eq": 2.179593293584492,
+   "ct_gbps_v5_cells": 41.39013671875,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "2x",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 30.556640625,
+   "gpu_eq": 2.404545036291606,
+   "ct_gbps_v5_cells": 38.1640625,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "2x",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 34.196044921875,
+   "gpu_eq": 5.970984240871319,
+   "ct_gbps_v5_cells": 46.809814453125,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "2x",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 34.62890625,
+   "gpu_eq": 6.426676194869764,
+   "ct_gbps_v5_cells": 40.703125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "2x",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 34.196044921875,
+   "gpu_eq": 4.179688968609921,
+   "ct_gbps_v5_cells": 46.809814453125,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "2x",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 34.62890625,
+   "gpu_eq": 4.498673336408835,
+   "ct_gbps_v5_cells": 40.703125,
+   "fits": {
+    "baseline": true,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "baseline"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 59.315380859374926,
+   "gpu_eq": 5.359862506585682,
+   "ct_gbps_v5_cells": 71.77783203125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on search nodes"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 55.001953125,
+   "gpu_eq": 5.913043879952874,
+   "ct_gbps_v5_cells": 68.6953125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on search nodes"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 59.315380859374926,
+   "gpu_eq": 3.7519037546099803,
+   "ct_gbps_v5_cells": 71.77783203125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on search nodes"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 55.001953125,
+   "gpu_eq": 4.139130715967011,
+   "ct_gbps_v5_cells": 68.6953125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on search nodes"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 59.302001953125,
+   "gpu_eq": 10.278320390314443,
+   "ct_gbps_v5_cells": 81.176513671875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 62.33203125,
+   "gpu_eq": 11.062738454998724,
+   "ct_gbps_v5_cells": 73.265625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 59.302001953125,
+   "gpu_eq": 7.194824273220107,
+   "ct_gbps_v5_cells": 81.176513671875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 500",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 62.33203125,
+   "gpu_eq": 7.7439169184991075,
+   "ct_gbps_v5_cells": 73.265625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 74.90190429687507,
+   "gpu_eq": 6.722699824328477,
+   "ct_gbps_v5_cells": 90.63916015625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 68.75244140625,
+   "gpu_eq": 7.416537085450012,
+   "ct_gbps_v5_cells": 85.869140625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 74.90190429687507,
+   "gpu_eq": 4.705889877029943,
+   "ct_gbps_v5_cells": 90.63916015625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on search nodes"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 68.75244140625,
+   "gpu_eq": 5.191575959815004,
+   "ct_gbps_v5_cells": 85.869140625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": true,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on search nodes"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 74.885009765625,
+   "gpu_eq": 12.891760301212514,
+   "ct_gbps_v5_cells": 102.507568359375,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 77.9150390625,
+   "gpu_eq": 13.87563016339156,
+   "ct_gbps_v5_cells": 91.58203125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 74.885009765625,
+   "gpu_eq": 9.024232210848789,
+   "ct_gbps_v5_cells": 102.507568359375,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 800",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 77.9150390625,
+   "gpu_eq": 9.71294111437409,
+   "ct_gbps_v5_cells": 91.58203125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 97.41577148437503,
+   "gpu_eq": 8.31898612705501,
+   "ct_gbps_v5_cells": 117.88330078125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 87.08642578125,
+   "gpu_eq": 9.177573108555444,
+   "ct_gbps_v5_cells": 108.767578125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 97.41577148437503,
+   "gpu_eq": 5.823290288938501,
+   "ct_gbps_v5_cells": 117.88330078125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 87.08642578125,
+   "gpu_eq": 6.424301175988818,
+   "ct_gbps_v5_cells": 108.767578125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 97.393798828125,
+   "gpu_eq": 15.952872789440358,
+   "ct_gbps_v5_cells": 133.319091796875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 98.6923828125,
+   "gpu_eq": 17.17035980331466,
+   "ct_gbps_v5_cells": 116.00390625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 97.393798828125,
+   "gpu_eq": 11.16701095260828,
+   "ct_gbps_v5_cells": 133.319091796875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x below DM 1200",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 98.6923828125,
+   "gpu_eq": 12.019251862320266,
+   "ct_gbps_v5_cells": 116.00390625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 117.33188476562496,
+   "gpu_eq": 9.662895148718041,
+   "ct_gbps_v5_cells": 141.98388671875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 103.892578125,
+   "gpu_eq": 10.660184463976245,
+   "ct_gbps_v5_cells": 129.7578125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 117.33188476562496,
+   "gpu_eq": 6.764026604102627,
+   "ct_gbps_v5_cells": 141.98388671875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 103.892578125,
+   "gpu_eq": 7.462129124783373,
+   "ct_gbps_v5_cells": 129.7578125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": true,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "eno2 on all nodes"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 117.305419921875,
+   "gpu_eq": 18.530014923798205,
+   "ct_gbps_v5_cells": 160.575439453125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 117.73828125,
+   "gpu_eq": 19.944183571313165,
+   "ct_gbps_v5_cells": 138.390625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 117.305419921875,
+   "gpu_eq": 12.971010446658768,
+   "ct_gbps_v5_cells": 160.575439453125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 1600",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 117.73828125,
+   "gpu_eq": 13.960928499919218,
+   "ct_gbps_v5_cells": 138.390625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 211.28398437499956,
+   "gpu_eq": 14.259316380086709,
+   "ct_gbps_v5_cells": 255.67578125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "FoV/2",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 186.3955078125,
+   "gpu_eq": 15.730993724183016,
+   "ct_gbps_v5_cells": 232.80078125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 211.28398437499956,
+   "gpu_eq": 9.981521466060679,
+   "ct_gbps_v5_cells": 255.67578125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "stretch: card in x16 slot"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "FoV/2",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 186.3955078125,
+   "gpu_eq": 11.011695606928116,
+   "ct_gbps_v5_cells": 232.80078125,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": true
+   },
+   "cheapest": "stretch: card in x16 slot"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 2,
+   "ct_gbps": 211.236328125,
+   "gpu_eq": 27.344324993655942,
+   "ct_gbps_v5_cells": 289.154296875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "full",
+   "kernels": 1.0,
+   "n_sub": 4,
+   "ct_gbps": 211.236328125,
+   "gpu_eq": 29.431181763739968,
+   "ct_gbps_v5_cells": 248.2890625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 2,
+   "ct_gbps": 211.236328125,
+   "gpu_eq": 19.141027495559065,
+   "ct_gbps_v5_cells": 289.154296875,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  },
+  {
+   "amb": "4x to DM 3000",
+   "fov": "full",
+   "kernels": 0.7,
+   "n_sub": 4,
+   "ct_gbps": 211.236328125,
+   "gpu_eq": 20.60182723461796,
+   "ct_gbps_v5_cells": 248.2890625,
+   "fits": {
+    "baseline": false,
+    "eno2 on search nodes": false,
+    "eno2 on all nodes": false,
+    "stretch: card in x16 slot": false
+   },
+   "cheapest": "none"
+  }
+ ]
+}

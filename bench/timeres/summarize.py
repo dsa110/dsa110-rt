@@ -25,6 +25,7 @@ show("b3_owner_e2e", ["us_per_image", "ms_combine", "ms_image", "ms_detect",
 show("b4_xengine", ["ms_per_block", "tflops", "frac_of_block", "int8_tops", "fp16_tflops",
                     "ratio", "h2d_gbs", "d2h_gbs"])
 show("b6_zoom", ["ms_beamform_per_block", "ms_dedisp", "ms_per_candidate"])
+show("b7_stage1", ["ms_per_block", "frac_of_block", "per_coarse_dm_ms"])
 
 e2e = [r for r in by.get("b3_owner_e2e", []) if r.get("ok")]
 if e2e:

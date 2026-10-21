@@ -28,15 +28,16 @@ bg_ingress() {   # background NIC ingress on the corr receivers (SNAPs streaming
 }
 
 echo "== background ingress on corr receivers (SNAP traffic) before the test"; bg_ingress
-run() {  # name rx_list per_rx_gbps
+run() {  # name rx_list per_rx_gbps rx_impl
   local rate; rate=$(awk "BEGIN{printf \"%.4f\", $3/$NTX/6}")
-  echo "== $1: RX=[$2] per-RX ${3} Gb/s (6 flows x ${rate} Gb/s per TX->RX pair)"
-  bash tools/dod/corner_turn.sh --duration "$DUR" --tx-list "$TX" --rx-list "$2" \
-       --n-flows 6 --rate "$rate" 2>&1 | tail -25
+  echo "== $1: RX=[$2] per-RX ${3} Gb/s (6 flows x ${rate} Gb/s per TX->RX pair, RX impl $4)"
+  RX_IMPL=$4 bash bench/timeres/corner_turn_rx.sh --duration "$DUR" --tx-list "$TX" --rx-list "$2" \
+       --n-flows 6 --rate "$rate" 2>&1 | grep -v -E "launching|launched|^\s*$" | tail -30 || true
 }
-run S1 "$CORR_RX" 2
-run S2 "$CORR_RX" 4
-run S3 "$SEARCH_RX" 13
-run S4 "$SEARCH_RX" 20
+# corr nodes: python receiver (their _recv_epoll extension is a stale py3.8 build)
+run S1 "$CORR_RX" 2 python
+run S2 "$CORR_RX" 4 python
+run S3 "$SEARCH_RX" 13 epoll
+run S4 "$SEARCH_RX" 20 epoll
 echo "== background ingress after"; bg_ingress
 echo "logs: ~/dsart-corner-turn-logs/<UTC>/ (one dir per scenario)"

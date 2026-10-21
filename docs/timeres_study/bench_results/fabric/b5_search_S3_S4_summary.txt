@@ -1,0 +1,10 @@
+20261021T222728Z tx keys sample ['achieved_gbps_aggregate', 'achieved_gbps_per_flow_mean', 'bytes_sent_total', 'config', 'cubes_emitted_total', 'duration_s', 'elapsed_s', 'frames_sent_total', 'mode', 'n_flows_started', 'nic_counters_after', 'nic_counters_before'] sent 0
+  n01: 1.58 Gb/s  frag_loss median 0.885 max 0.9  received 7042297  committed 137050
+  n02: 12.34 Gb/s  frag_loss median 0.0368 max 0.17  received 13694588  committed 6840108
+  n09: 12.27 Gb/s  frag_loss median 0.0351 max 0.174  received 13605668  committed 6802828
+  n13: 12.29 Gb/s  frag_loss median 0.0429 max 0.142  received 13629032  committed 6814514
+20261021T223020Z tx keys sample ['achieved_gbps_aggregate', 'achieved_gbps_per_flow_mean', 'bytes_sent_total', 'config', 'cubes_emitted_total', 'duration_s', 'elapsed_s', 'frames_sent_total', 'mode', 'n_flows_started', 'nic_counters_after', 'nic_counters_before'] sent 0
+  n01: 1.90 Gb/s  frag_loss median 0.905 max 0.917  received 9074558  committed 80488
+  n02: 4.71 Gb/s  frag_loss median 0.76 max 0.807  received 10563002  committed 1718334
+  n09: 4.74 Gb/s  frag_loss median 0.762 max 0.807  received 10626104  committed 1735133
+  n13: 5.05 Gb/s  frag_loss median 0.748 max 0.795  received 10826502  committed 1918355

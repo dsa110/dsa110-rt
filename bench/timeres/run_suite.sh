@@ -28,6 +28,7 @@ for g in $GPUS; do
   python b3_owner_e2e.py --device "$D" --out "$OUT"
   python b4_xengine.py  --device "$D" --out "$OUT"
   python b6_zoom.py     --device "$D" --out "$OUT"
+  python b7_stage1.py   --device "$D" --out "$OUT"
 done
 python summarize.py "$OUT" | tee "$OUTDIR/summary.txt"
 echo "results in $OUTDIR"

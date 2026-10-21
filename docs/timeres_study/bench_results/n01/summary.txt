@@ -1,0 +1,157 @@
+
+## b1_fft
+  irfft2_256x256_float16_b64               us_per_image=2.84  images_per_s=3.52e+05
+  irfft2_256x256_float16_b64_epi           us_per_image=3.5  images_per_s=2.86e+05
+  irfft2_256x256_float16_b256              us_per_image=2.53  images_per_s=3.96e+05
+  irfft2_256x256_float16_b256_epi          us_per_image=3.2  images_per_s=3.13e+05
+  irfft2_256x256_float32_b64               us_per_image=4.27  images_per_s=2.34e+05
+  irfft2_256x256_float32_b64_epi           us_per_image=6.11  images_per_s=1.64e+05
+  irfft2_256x256_float32_b256              us_per_image=4.09  images_per_s=2.45e+05
+  irfft2_256x256_float32_b256_epi          us_per_image=5.85  images_per_s=1.71e+05
+  irfft2_256x128_float16_b64               us_per_image=1.51  images_per_s=6.62e+05
+  irfft2_256x128_float16_b64_epi           us_per_image=1.86  images_per_s=5.39e+05
+  irfft2_256x128_float16_b256              us_per_image=1.37  images_per_s=7.3e+05
+  irfft2_256x128_float16_b256_epi          us_per_image=1.71  images_per_s=5.86e+05
+  irfft2_256x128_float32_b64               us_per_image=2.35  images_per_s=4.26e+05
+  irfft2_256x128_float32_b64_epi           us_per_image=3.32  images_per_s=3.02e+05
+  irfft2_256x128_float32_b256              us_per_image=2.1  images_per_s=4.77e+05
+  irfft2_256x128_float32_b256_epi          us_per_image=2.99  images_per_s=3.35e+05
+  irfft2_192x192_float32_b64               us_per_image=2.72  images_per_s=3.68e+05
+  irfft2_192x192_float32_b64_epi           us_per_image=3.81  images_per_s=2.63e+05
+  irfft2_192x192_float32_b256              us_per_image=2.51  images_per_s=3.99e+05
+  irfft2_192x192_float32_b256_epi          us_per_image=3.52  images_per_s=2.84e+05
+  irfft2_128x128_float16_b64               us_per_image=0.738  images_per_s=1.35e+06
+  irfft2_128x128_float16_b64_epi           us_per_image=0.886  images_per_s=1.13e+06
+  irfft2_128x128_float16_b256              us_per_image=0.654  images_per_s=1.53e+06
+  irfft2_128x128_float16_b256_epi          us_per_image=0.829  images_per_s=1.21e+06
+  irfft2_128x128_float32_b64               us_per_image=1.08  images_per_s=9.25e+05
+  irfft2_128x128_float32_b64_epi           us_per_image=1.5  images_per_s=6.68e+05
+  irfft2_128x128_float32_b256              us_per_image=1.12  images_per_s=8.95e+05
+  irfft2_128x128_float32_b256_epi          us_per_image=1.58  images_per_s=6.34e+05
+  irfft2_256x256_float16_b64               us_per_image=1.59  images_per_s=6.29e+05
+  irfft2_256x256_float16_b64_epi           us_per_image=0.894  images_per_s=1.12e+06
+  irfft2_256x256_float16_b256              us_per_image=0.174  images_per_s=5.76e+06
+  irfft2_256x256_float16_b256_epi          us_per_image=0.214  images_per_s=4.68e+06
+  irfft2_256x256_float32_b64               us_per_image=0.673  images_per_s=1.49e+06
+  irfft2_256x256_float32_b64_epi           us_per_image=1  images_per_s=9.95e+05
+  irfft2_256x256_float32_b256              us_per_image=0.189  images_per_s=5.29e+06
+  irfft2_256x256_float32_b256_epi          us_per_image=0.252  images_per_s=3.97e+06
+  irfft2_256x128_float16_b64               us_per_image=0.679  images_per_s=1.47e+06
+  irfft2_256x128_float16_b64_epi           us_per_image=0.825  images_per_s=1.21e+06
+  irfft2_256x128_float16_b256              us_per_image=0.174  images_per_s=5.75e+06
+  irfft2_256x128_float16_b256_epi          us_per_image=0.204  images_per_s=4.89e+06
+  irfft2_256x128_float32_b64               us_per_image=0.698  images_per_s=1.43e+06
+  irfft2_256x128_float32_b64_epi           us_per_image=1.07  images_per_s=9.33e+05
+  irfft2_256x128_float32_b256              us_per_image=0.165  images_per_s=6.05e+06
+  irfft2_256x128_float32_b256_epi          us_per_image=0.251  images_per_s=3.98e+06
+  irfft2_192x192_float32_b64               us_per_image=0.69  images_per_s=1.45e+06
+  irfft2_192x192_float32_b64_epi           us_per_image=0.999  images_per_s=1e+06
+  irfft2_192x192_float32_b256              us_per_image=0.168  images_per_s=5.94e+06
+  irfft2_192x192_float32_b256_epi          us_per_image=0.254  images_per_s=3.93e+06
+  irfft2_128x128_float16_b64               us_per_image=0.696  images_per_s=1.44e+06
+  irfft2_128x128_float16_b64_epi           us_per_image=0.838  images_per_s=1.19e+06
+  irfft2_128x128_float16_b256              us_per_image=0.163  images_per_s=6.12e+06
+  irfft2_128x128_float16_b256_epi          us_per_image=0.209  images_per_s=4.79e+06
+  irfft2_128x128_float32_b64               us_per_image=0.666  images_per_s=1.5e+06
+  irfft2_128x128_float32_b64_epi           us_per_image=0.989  images_per_s=1.01e+06
+  irfft2_128x128_float32_b256              us_per_image=0.163  images_per_s=6.13e+06
+  irfft2_128x128_float32_b256_epi          us_per_image=0.249  images_per_s=4.02e+06
+
+## b2_detector
+  floor_256x256_K7                         us_per_image=0.242  ms=0.991
+  cumsum_256x256_K7                        us_per_image=0.871  ms=3.57
+  prod_256x256_K7                          us_per_image=3.7  ms=15.2
+  chunk_256x256_K7                         us_per_image=1.82  ms=7.47
+  floor_256x256_K9                         us_per_image=0.287  ms=1.18
+  cumsum_256x256_K9                        us_per_image=1.2  ms=4.93
+  prod_256x256_K9                          us_per_image=4.78  ms=19.6
+  chunk_256x256_K9                         us_per_image=3.3  ms=13.5
+  floor_256x128_K7                         us_per_image=0.147  ms=0.601
+  cumsum_256x128_K7                        us_per_image=0.423  ms=1.73
+  prod_256x128_K7                          us_per_image=1.82  ms=7.47
+  chunk_256x128_K7                         us_per_image=0.944  ms=3.87
+  floor_256x128_K9                         us_per_image=0.142  ms=0.581
+  cumsum_256x128_K9                        us_per_image=0.579  ms=2.37
+  prod_256x128_K9                          us_per_image=2.39  ms=9.78
+  chunk_256x128_K9                         us_per_image=1.66  ms=6.82
+  floor_256x256_K7                         us_per_image=0.0121  ms=0.0497
+  cumsum_256x256_K7                        us_per_image=0.00603  ms=0.0247
+  prod_256x256_K7                          FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  chunk_256x256_K7                         FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  floor_256x256_K9                         us_per_image=0.008  ms=0.0328
+  cumsum_256x256_K9                        us_per_image=0.0085  ms=0.0348
+  prod_256x256_K9                          FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  chunk_256x256_K9                         FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  floor_256x128_K7                         us_per_image=0.00796  ms=0.0326
+  cumsum_256x128_K7                        us_per_image=0.00813  ms=0.0333
+  prod_256x128_K7                          FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  chunk_256x128_K7                         FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  floor_256x128_K9                         us_per_image=0.00591  ms=0.0242
+  cumsum_256x128_K9                        us_per_image=0.0061  ms=0.025
+  prod_256x128_K9                          FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  chunk_256x128_K9                         FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+
+## b3_owner_e2e
+  e2e_chunk_256x256_K7_F4                  us_per_image=8.83  ms_combine=5.47  ms_image=8.8  ms_detect=3.81  n_fdm_max_realtime=29  peak_gib=1.76
+  e2e_chunk_256x256_K7_F8                  us_per_image=8.32  ms_combine=8.94  ms_image=17.6  ms_detect=7.52  n_fdm_max_realtime=31  peak_gib=3.18
+  e2e_prod_256x256_K7_F4                   us_per_image=9.91  ms_combine=5.08  ms_image=7.74  ms_detect=7.48  n_fdm_max_realtime=26  peak_gib=1.76
+  e2e_prod_256x256_K7_F8                   us_per_image=9.52  ms_combine=8.05  ms_image=15.7  ms_detect=15.3  n_fdm_max_realtime=27  peak_gib=3.18
+  e2e_chunk_256x256_K9_F4                  us_per_image=11.6  ms_combine=6.57  ms_image=10.4  ms_detect=6.78  n_fdm_max_realtime=22  peak_gib=2.32
+  e2e_chunk_256x256_K9_F8                  us_per_image=11  ms_combine=10.8  ms_image=21  ms_detect=13.5  n_fdm_max_realtime=23  peak_gib=4.21
+  e2e_prod_256x256_K9_F4                   us_per_image=13.1  ms_combine=6.57  ms_image=10.4  ms_detect=9.8  n_fdm_max_realtime=20  peak_gib=2.32
+  e2e_prod_256x256_K9_F8                   us_per_image=12.6  ms_combine=10.7  ms_image=21.1  ms_detect=19.6  n_fdm_max_realtime=20  peak_gib=4.21
+  e2e_chunk_256x128_K7_F4                  us_per_image=5.26  ms_combine=4.93  ms_image=3.99  ms_detect=1.86  n_fdm_max_realtime=49  peak_gib=1.41
+  e2e_chunk_256x128_K7_F8                  us_per_image=4.78  ms_combine=7.83  ms_image=7.98  ms_detect=3.77  n_fdm_max_realtime=54  peak_gib=1.77
+  e2e_prod_256x128_K7_F4                   us_per_image=5.69  ms_combine=4.97  ms_image=4.01  ms_detect=2.67  n_fdm_max_realtime=46  peak_gib=1.41
+  e2e_prod_256x128_K7_F8                   us_per_image=5.7  ms_combine=7.89  ms_image=7.98  ms_detect=7.46  n_fdm_max_realtime=46  peak_gib=1.77
+  e2e_chunk_256x128_K9_F4                  us_per_image=7.42  ms_combine=6.46  ms_image=5.36  ms_detect=3.37  n_fdm_max_realtime=35  peak_gib=1.75
+  e2e_chunk_256x128_K9_F8                  us_per_image=6.85  ms_combine=10.5  ms_image=10.8  ms_detect=6.79  n_fdm_max_realtime=38  peak_gib=2.33
+  e2e_prod_256x128_K9_F4                   us_per_image=7.75  ms_combine=6.43  ms_image=5.35  ms_detect=4.1  n_fdm_max_realtime=33  peak_gib=1.75
+  e2e_prod_256x128_K9_F8                   us_per_image=7.58  ms_combine=10.5  ms_image=10.8  ms_detect=9.78  n_fdm_max_realtime=34  peak_gib=2.33
+  e2e_chunk_256x256_K7_F4                  FAILED RuntimeError('Triton Error [CUDA]: context is destroyed')
+  e2e_chunk_256x256_K7_F8                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x256_K7_F4                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x256_K7_F8                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_chunk_256x256_K9_F4                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_chunk_256x256_K9_F8                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x256_K9_F4                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x256_K9_F8                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_chunk_256x128_K7_F4                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_chunk_256x128_K7_F8                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x128_K7_F4                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x128_K7_F8                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_chunk_256x128_K9_F4                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_chunk_256x128_K9_F8                  FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x128_K9_F4                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+  e2e_prod_256x128_K9_F8                   FAILED ValueError('Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)')
+
+## b4_xengine
+  slow_k4096                               ms_per_block=8.9  tflops=26.1  frac_of_block=0.0663
+  fast_tint32                              ms_per_block=11  tflops=21  frac_of_block=0.0823
+  fast_tint16                              ms_per_block=14.6  tflops=15.9  frac_of_block=0.109
+  fast_tint8                               ms_per_block=23.4  tflops=9.91  frac_of_block=0.174
+  fast_tint4                               ms_per_block=46.4  tflops=5  frac_of_block=0.346
+  ddc_per_coarse_dm_nsub8                  ms_per_block=8.96  tflops=25.9  frac_of_block=0.0668
+  ddc_per_coarse_dm_nsub16                 ms_per_block=8.64  tflops=26.8  frac_of_block=0.0644
+  int8_vs_fp16_4096                        int8_tops=51.8  fp16_tflops=52.1  ratio=0.994
+  pcie                                     h2d_gbs=12.3  d2h_gbs=13.2
+  slow_k4096                               ms_per_block=0.0407  tflops=5.71e+03  frac_of_block=0.000303
+  fast_tint32                              ms_per_block=0.0425  tflops=5.45e+03  frac_of_block=0.000317
+  fast_tint16                              ms_per_block=0.076  tflops=3.05e+03  frac_of_block=0.000566
+  fast_tint8                               ms_per_block=0.157  tflops=1.47e+03  frac_of_block=0.00117
+  fast_tint4                               ms_per_block=0.3  tflops=773  frac_of_block=0.00224
+  ddc_per_coarse_dm_nsub8                  ms_per_block=0.0123  tflops=1.89e+04  frac_of_block=9.16e-05
+  ddc_per_coarse_dm_nsub16                 ms_per_block=0.0125  tflops=1.85e+04  frac_of_block=9.32e-05
+  int8_vs_fp16_4096                        int8_tops=9.29e+03  fp16_tflops=8.5e+03  ratio=1.09
+  pcie                                     h2d_gbs=2.24e+04  d2h_gbs=4.62e+04
+
+## b6_zoom
+  zoom_blk12_beams3_dm32                   ms_beamform_per_block=409  ms_dedisp=75.1  ms_per_candidate=4.99e+03
+  zoom_blk12_beams9_dm32                   ms_beamform_per_block=413  ms_dedisp=208  ms_per_candidate=5.17e+03
+  zoom_blk12_beams3_dm64                   ms_beamform_per_block=409  ms_dedisp=150  ms_per_candidate=5.06e+03
+  zoom_blk12_beams3_dm32                   ms_beamform_per_block=0.444  ms_dedisp=511  ms_per_candidate=516
+  zoom_blk12_beams9_dm32                   ms_beamform_per_block=25.3  ms_dedisp=1.23e+03  ms_per_candidate=1.53e+03
+  zoom_blk12_beams3_dm64                   ms_beamform_per_block=5.33  ms_dedisp=1.56e+03  ms_per_candidate=1.63e+03
+
+Best owner config: e2e_chunk_256x128_K7_F8  -> 54 fine DMs per GPU in real time (4.78 us/image).
+Model needs ~44 fine DMs/owner (24 owners, DM<=1500 native) or ~78 (DM<=3000).

@@ -1,0 +1,866 @@
+[
+ {
+  "variant": "4x, DM<800, tol 1.25, 61 kHz",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 2655982.9711914062,
+  "gpu_equiv": 12.695598602294922,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.6
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.74
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.74
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.74
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.6
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.25, 61 kHz",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2655982.9711914062,
+  "gpu_equiv": 8.886919021606445,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.63
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.71
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.52
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.71
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.42
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.25, 61 kHz",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 2655982.9711914062,
+  "gpu_equiv": 21.24786376953125,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "stretch": {
+   "fits": false,
+   "max_gpu": 0.5
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.25, 61 kHz",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2655982.9711914062,
+  "gpu_equiv": 14.873504638671873,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.7
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.7
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.7
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.7
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.7
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.4",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 2032279.9682617188,
+  "gpu_equiv": 9.714298248291016,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.68
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.78
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.56
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.78
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.46
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.4",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2032279.9682617188,
+  "gpu_equiv": 6.800008773803711,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.71
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.55
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.39
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.55
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.32
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.4",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 2032279.9682617188,
+  "gpu_equiv": 16.25823974609375,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.76
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.76
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.76
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.76
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.76
+  }
+ },
+ {
+  "variant": "4x, DM<800, tol 1.4",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2032279.9682617188,
+  "gpu_equiv": 11.380767822265625,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.53
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.79
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.66
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.79
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.53
+  }
+ },
+ {
+  "variant": "4x, DM<800, 122 kHz low tier",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 2457618.7133789062,
+  "gpu_equiv": 11.747417449951172,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.53
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.53
+  }
+ },
+ {
+  "variant": "4x, DM<800, 122 kHz low tier",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2457618.7133789062,
+  "gpu_equiv": 8.223192214965819,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.76
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.67
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.47
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.67
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.37
+  }
+ },
+ {
+  "variant": "4x, DM<800, 122 kHz low tier",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 2457618.7133789062,
+  "gpu_equiv": 19.66094970703125,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "stretch": {
+   "fits": false,
+   "max_gpu": 0.45
+  }
+ },
+ {
+  "variant": "4x, DM<800, 122 kHz low tier",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2457618.7133789062,
+  "gpu_equiv": 13.762664794921875,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.63
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.79
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.79
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.79
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.63
+  }
+ },
+ {
+  "variant": "4x, DM<500",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 2114295.9594726562,
+  "gpu_equiv": 10.106334686279297,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.6
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.73
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.66
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.73
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.45
+  }
+ },
+ {
+  "variant": "4x, DM<500",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2114295.9594726562,
+  "gpu_equiv": 7.074434280395508,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.73
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.51
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.46
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.51
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.31
+  }
+ },
+ {
+  "variant": "4x, DM<500",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 2114295.9594726562,
+  "gpu_equiv": 16.91436767578125,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.5
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.75
+  }
+ },
+ {
+  "variant": "4x, DM<500",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2114295.9594726562,
+  "gpu_equiv": 11.840057373046875,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.7
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.77
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.77
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.77
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.52
+  }
+ },
+ {
+  "variant": "4x, DM<500, tol 1.4",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 1620292.6635742188,
+  "gpu_equiv": 7.744998931884766,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.8
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.56
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.5
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.56
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.34
+  }
+ },
+ {
+  "variant": "4x, DM<500, tol 1.4",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 1620292.6635742188,
+  "gpu_equiv": 5.421499252319336,
+  "Hc0": {
+   "fits": true,
+   "max_gpu": 0.71
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.39
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.35
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.39
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.24
+  }
+ },
+ {
+  "variant": "4x, DM<500, tol 1.4",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 1620292.6635742188,
+  "gpu_equiv": 12.96234130859375,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.77
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.57
+  }
+ },
+ {
+  "variant": "4x, DM<500, tol 1.4",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 1620292.6635742188,
+  "gpu_equiv": 9.073638916015625,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.54
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.65
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.59
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.65
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.4
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.4",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 2923011.7797851562,
+  "gpu_equiv": 13.971996307373047,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.62
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.62
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.62
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.62
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.62
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.4",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2923011.7797851562,
+  "gpu_equiv": 9.780397415161133,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.58
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.58
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.65
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.58
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.43
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.4",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 2923011.7797851562,
+  "gpu_equiv": 23.38409423828125,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.69
+  },
+  "stretch": {
+   "fits": false,
+   "max_gpu": 0.69
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.4",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 2923011.7797851562,
+  "gpu_equiv": 16.36886596679687,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.72
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.72
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.72
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.72
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.72
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.25",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 3817558.2885742188,
+  "gpu_equiv": 18.247928619384766,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.54
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.54
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.54
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.54
+  },
+  "stretch": {
+   "fits": false,
+   "max_gpu": 0.54
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.25",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 3817558.2885742188,
+  "gpu_equiv": 12.773550033569336,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.56
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.25",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 3817558.2885742188,
+  "gpu_equiv": 30.54046630859375,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.45
+  },
+  "stretch": {
+   "fits": false,
+   "max_gpu": 0.45
+  }
+ },
+ {
+  "variant": "4x to DM 1600, tol 1.25",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 3817558.2885742188,
+  "gpu_equiv": 21.378326416015625,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.63
+  },
+  "Hc2": {
+   "fits": false,
+   "max_gpu": 0.63
+  },
+  "Hc4": {
+   "fits": false,
+   "max_gpu": 0.63
+  },
+  "Hc2_merged": {
+   "fits": false,
+   "max_gpu": 0.63
+  },
+  "stretch": {
+   "fits": false,
+   "max_gpu": 0.63
+  }
+ },
+ {
+  "variant": "2x (DM<1600 at 0.52 ms)",
+  "fov": "FoV/2",
+  "kernels": "measured",
+  "images_per_s": 1231193.5424804688,
+  "gpu_equiv": 5.885105133056641,
+  "Hc0": {
+   "fits": true,
+   "max_gpu": 0.74
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.32
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.3
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.3
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.3
+  }
+ },
+ {
+  "variant": "2x (DM<1600 at 0.52 ms)",
+  "fov": "FoV/2",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 1231193.5424804688,
+  "gpu_equiv": 4.1195735931396475,
+  "Hc0": {
+   "fits": true,
+   "max_gpu": 0.52
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.22
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.21
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.21
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.21
+  }
+ },
+ {
+  "variant": "2x (DM<1600 at 0.52 ms)",
+  "fov": "full",
+  "kernels": "measured",
+  "images_per_s": 1231193.5424804688,
+  "gpu_equiv": 9.84954833984375,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.75
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.53
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.5
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.5
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.5
+  }
+ },
+ {
+  "variant": "2x (DM<1600 at 0.52 ms)",
+  "fov": "full",
+  "kernels": "x0.7 optimised",
+  "images_per_s": 1231193.5424804688,
+  "gpu_equiv": 6.894683837890625,
+  "Hc0": {
+   "fits": false,
+   "max_gpu": 0.79
+  },
+  "Hc2": {
+   "fits": true,
+   "max_gpu": 0.37
+  },
+  "Hc4": {
+   "fits": true,
+   "max_gpu": 0.35
+  },
+  "Hc2_merged": {
+   "fits": true,
+   "max_gpu": 0.35
+  },
+  "stretch": {
+   "fits": true,
+   "max_gpu": 0.35
+  }
+ }
+]

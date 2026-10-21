@@ -76,6 +76,10 @@ def cuda_time_ms(fn, reps: int = 5, warmup: int = 2) -> float:
 
 class Recorder:
     def __init__(self, bench: str, args):
+        if args.device.startswith("cuda"):
+            # CUDA events, synchronize() and Triton launches all use the CURRENT
+            # device; without this every --device cuda:1 timing measured cuda:0.
+            torch.cuda.set_device(args.device)
         self.bench = bench
         self.path = args.out or default_out()
         self.meta = env_info(args.device)

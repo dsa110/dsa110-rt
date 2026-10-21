@@ -1,0 +1,23 @@
+{
+ "n_baselines": 3321,
+ "unique_tol0.05m": 1773,
+ "unique_tol0.25m": 1750,
+ "unique_tol1.0m": 1749,
+ "cells_per_channel_full": 1748,
+ "cells_per_channel full": 1748,
+ "full nsub1": 3221.5,
+ "full nsub2": 2482.625,
+ "full nsub4": 2111.625,
+ "cells_per_channel FoV/2 sym": 1741,
+ "FoV/2 sym nsub1": 2356.5,
+ "FoV/2 sym nsub2": 2151.125,
+ "FoV/2 sym nsub4": 1958.125,
+ "cells_per_channel FoV/2 halve u": 1329,
+ "FoV/2 halve u nsub1": 2196.5,
+ "FoV/2 halve u nsub2": 1773.375,
+ "FoV/2 halve u nsub4": 1564.5,
+ "cells_per_channel FoV/2 halve v": 1653,
+ "FoV/2 halve v nsub1": 2091.5,
+ "FoV/2 halve v nsub2": 1873.75,
+ "FoV/2 halve v nsub4": 1760.75
+}

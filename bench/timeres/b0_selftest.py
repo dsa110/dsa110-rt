@@ -51,6 +51,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
+    if a.device.startswith("cuda"):
+        torch.cuda.set_device(a.device)
     test_combine(a.device)
     test_chunkmax(a.device)
     print("b0 selftest PASSED")
