@@ -1,0 +1,72 @@
+{
+ "deployed": {
+  "name": "deployed: T=1.05 ms, 244 kHz, 8x4 two-stage",
+  "n_fine": 200,
+  "T_us": 1048.576,
+  "csf": 8,
+  "stages": 2
+ },
+ "legacy": {
+  "name": "legacy dsaX: T=0.26 ms, 244 kHz, 1-stage",
+  "n_fine": 472,
+  "T_us": 262.144,
+  "csf": 8,
+  "stages": 1
+ },
+ "x1_c1": {
+  "name": "1.05 ms, 30.5 kHz, 16x8",
+  "n_fine": 542,
+  "T_us": 1048.576,
+  "csf": 1,
+  "stages": 2
+ },
+ "x2_c1": {
+  "name": "2x: 0.52 ms, 30.5 kHz, 16x8",
+  "n_fine": 1046,
+  "T_us": 524.288,
+  "csf": 1,
+  "stages": 2
+ },
+ "x4_c8": {
+  "name": "4x: 0.26 ms, 244 kHz, 32x8",
+  "n_fine": 713,
+  "T_us": 262.144,
+  "csf": 8,
+  "stages": 2
+ },
+ "x4_c2": {
+  "name": "4x: 0.26 ms, 61 kHz, 32x8",
+  "n_fine": 1521,
+  "T_us": 262.144,
+  "csf": 2,
+  "stages": 2
+ },
+ "x4_c1": {
+  "name": "4x: 0.26 ms, 30.5 kHz, 32x8",
+  "n_fine": 1883,
+  "T_us": 262.144,
+  "csf": 1,
+  "stages": 2
+ },
+ "x4_c1_ideal": {
+  "name": "4x ideal 1-stage",
+  "n_fine": 1883,
+  "T_us": 262.144,
+  "csf": 1,
+  "stages": 1
+ },
+ "x8_c1": {
+  "name": "8x: 0.13 ms, 30.5 kHz, 32x8",
+  "n_fine": 2979,
+  "T_us": 131.072,
+  "csf": 1,
+  "stages": 2
+ },
+ "x16_c1_ideal": {
+  "name": "16x ideal 1-stage",
+  "n_fine": 4060,
+  "T_us": 65.536,
+  "csf": 1,
+  "stages": 1
+ }
+}

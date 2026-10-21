@@ -1,0 +1,92 @@
+{
+ "deployed": {
+  "name": "deployed: T=1.05 ms, 244 kHz, 8x4 two-stage",
+  "n_fine": 200,
+  "T_us": 1048.576,
+  "csf": 8,
+  "stages": 2,
+  "n_sub": 4,
+  "n_coarse": 8
+ },
+ "legacy": {
+  "name": "legacy dsaX: T=0.26 ms, 244 kHz, 1-stage",
+  "n_fine": 472,
+  "T_us": 262.144,
+  "csf": 8,
+  "stages": 1,
+  "n_sub": 4,
+  "n_coarse": 0
+ },
+ "T262_c8_1st": {
+  "name": "4x, 244 kHz, ideal 1-stage",
+  "n_fine": 544,
+  "T_us": 262.144,
+  "csf": 8,
+  "stages": 1,
+  "n_sub": 4,
+  "n_coarse": 0
+ },
+ "T262_c8_2st": {
+  "name": "4x, 244 kHz, 2-stage 16x8",
+  "n_fine": 544,
+  "T_us": 262.144,
+  "csf": 8,
+  "stages": 2,
+  "n_sub": 8,
+  "n_coarse": 16
+ },
+ "T262_c2_2st": {
+  "name": "4x, 61 kHz, 2-stage 16x8",
+  "n_fine": 956,
+  "T_us": 262.144,
+  "csf": 2,
+  "stages": 2,
+  "n_sub": 8,
+  "n_coarse": 16
+ },
+ "T262_c1_2st": {
+  "name": "4x, 30.5 kHz, 2-stage 16x8",
+  "n_fine": 1059,
+  "T_us": 262.144,
+  "csf": 1,
+  "stages": 2,
+  "n_sub": 8,
+  "n_coarse": 16
+ },
+ "T262_c1_2st_qT": {
+  "name": "4x, 30.5 kHz, 2-stage 16x8, stage-1 at T",
+  "n_fine": 1059,
+  "T_us": 262.144,
+  "csf": 1,
+  "stages": 2,
+  "n_sub": 8,
+  "n_coarse": 16
+ },
+ "T262_c1_1st": {
+  "name": "4x, 30.5 kHz, ideal 1-stage",
+  "n_fine": 1059,
+  "T_us": 262.144,
+  "csf": 1,
+  "stages": 1,
+  "n_sub": 4,
+  "n_coarse": 0
+ },
+ "T131_c1_2st": {
+  "name": "8x, 30.5 kHz, 2-stage 32x8",
+  "n_fine": 1861,
+  "T_us": 131.072,
+  "csf": 1,
+  "stages": 2,
+  "n_sub": 8,
+  "n_coarse": 32
+ },
+ "T66_c1_1st": {
+  "name": "16x, 30.5 kHz, ideal 1-stage",
+  "n_fine": 2796,
+  "T_us": 65.536,
+  "csf": 1,
+  "stages": 1,
+  "n_sub": 4,
+  "n_coarse": 0
+ }
+}
