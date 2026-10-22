@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import socket
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 from . import wire
 
@@ -142,6 +142,31 @@ class TriggerBroadcaster:
                         sid, g, host, port, exc,
                     )
                     out[(sid, g)] = False
+        return out
+
+    def send_to(
+        self, blob: bytes, halves: Iterable[Tuple[int, int]],
+    ) -> Dict[Tuple[int, int], bool]:
+        """Send ``blob`` to selected ``(search_node_id, gpu_half)`` only
+        (x2 cutout requests: the expected set, then targeted resends).
+        A half whose node is not in ``hosts`` is reported False."""
+        out: Dict[Tuple[int, int], bool] = {}
+        for sid, g in halves:
+            host = self._hosts.get(int(sid))
+            if host is None:
+                _LOG.warning("cutout send: no host for search node %s", sid)
+                out[(int(sid), int(g))] = False
+                continue
+            port = self._port_base + int(g)
+            try:
+                self._sock.sendto(blob, (host, port))
+                out[(int(sid), int(g))] = True
+            except OSError as exc:
+                _LOG.warning(
+                    "cutout send to (s=%d, g=%d) %s:%d failed: %s",
+                    sid, g, host, port, exc,
+                )
+                out[(int(sid), int(g))] = False
         return out
 
 

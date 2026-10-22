@@ -82,6 +82,14 @@ def concat_recent_hourly(
 
     out_path = d / out_name
     tmp_path = d / f"{out_name}.tmp"
+    mixed = _mixed_header_newest(paths)
+    if mixed is not None:
+        # A schema change inside the window (x2 archive schema 2 appends
+        # columns): re-key every row by column NAME onto the newest header
+        # instead of letting the older header become a data row. Windows
+        # with one header (always, for an unchanged schema) take the
+        # byte-identical path below.
+        return _concat_rekeyed(paths, mixed, out_path, tmp_path)
     header: Optional[str] = None
     try:
         with tmp_path.open("w", encoding="utf-8") as out:
@@ -102,6 +110,55 @@ def concat_recent_hourly(
                 body = lines[1:] if lines and lines[0] == header else lines
                 for ln in body:
                     out.write(ln)
+        tmp_path.replace(out_path)
+    except OSError as exc:
+        _LOG.warning("concat_recent_hourly: write %s failed: %s",
+                     out_path, exc)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return out_path
+
+
+def _first_line(p: Path) -> Optional[str]:
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            return f.readline()
+    except OSError:
+        return None
+
+
+def _mixed_header_newest(paths: Sequence[Path]) -> Optional[List[str]]:
+    """Newest file's header columns if the files' headers differ, else None."""
+    heads = [h for h in (_first_line(p) for p in paths) if h]
+    if len(set(heads)) <= 1:
+        return None
+    return next(csv.reader([heads[-1]]), [])
+
+
+def _concat_rekeyed(
+    paths: Sequence[Path], columns: Sequence[str], out_path: Path,
+    tmp_path: Path,
+) -> Optional[Path]:
+    try:
+        with tmp_path.open("w", encoding="utf-8", newline="") as out:
+            writer = csv.DictWriter(
+                out, fieldnames=list(columns), extrasaction="ignore",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for p in paths:
+                try:
+                    with p.open("r", encoding="utf-8", newline="") as f:
+                        for row in csv.DictReader(f):
+                            writer.writerow(
+                                {k: (row.get(k) or "") for k in columns})
+                except OSError as exc:
+                    _LOG.warning("concat_recent_hourly: read %s failed: %s",
+                                 p, exc)
+                    continue
         tmp_path.replace(out_path)
     except OSError as exc:
         _LOG.warning("concat_recent_hourly: write %s failed: %s",
@@ -185,6 +242,14 @@ class RollingCsvWriter:
         # can find the column names.
         if not self._current_path.exists():
             self._write_header(self._current_path)
+        else:
+            # x2 archive schema change mid-hour (e.g. C2 restarted with
+            # extra appended columns): never append N+1-column rows under
+            # an N-column header. Re-key the hour's file to this writer's
+            # schema once (old rows get empty new columns). A no-op when
+            # the header already matches, i.e. always for an unchanged
+            # schema, so today's files are untouched.
+            self._upgrade_header(self._current_path)
         return True
 
     def append_row(
@@ -253,3 +318,51 @@ class RollingCsvWriter:
             return
         with path.open("w", encoding="utf-8") as f:
             f.write(buf.getvalue())
+
+    def _upgrade_header(self, path: Path) -> None:
+        """Rewrite ``path`` under this writer's schema if its header differs.
+
+        Rows are re-keyed by column NAME (columns this schema lacks are
+        dropped, new ones left empty) and the file is replaced atomically.
+        Best effort: on any I/O error the file is left as it was.
+        """
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                first = f.readline()
+        except OSError:
+            return
+        if not first:
+            return
+        header = next(csv.reader([first]), [])
+        if tuple(header) == self._schema:
+            return
+        _rekey_csv_file(path, path, self._schema, header_hint=header)
+
+
+def _rekey_csv_file(
+    src: Path, dst: Path, schema: Sequence[str],
+    *, header_hint: Optional[Sequence[str]] = None,
+) -> None:
+    """Copy ``src`` to ``dst`` with its rows re-keyed onto ``schema``."""
+    tmp = dst.with_name(dst.name + ".rekey.tmp")
+    try:
+        with src.open("r", encoding="utf-8", newline="") as f_in, \
+                tmp.open("w", encoding="utf-8", newline="") as f_out:
+            reader = csv.DictReader(f_in)
+            writer = csv.DictWriter(
+                f_out, fieldnames=list(schema), extrasaction="ignore",
+            )
+            writer.writeheader()
+            for row in reader:
+                writer.writerow({k: (row.get(k) or "") for k in schema})
+        tmp.replace(dst)
+        _LOG.info(
+            "csv schema change: re-keyed %s (%d -> %d columns)", src,
+            len(header_hint or ()), len(schema),
+        )
+    except OSError as exc:
+        _LOG.warning("csv schema change: could not re-key %s: %s", src, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
