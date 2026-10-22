@@ -196,6 +196,8 @@ def _build_inventory() -> tuple[ServiceEntry, ...]:
         "dsart_slack_relay.service",
         # copydata.service removed 2026-08-19: legacy T1 path, unresolvable
         # source hosts, never functional. See SUPPORT_LOCAL_UNITS.
+        # x2 D11: hiplot_c1 is restarted by the op-point switch too.
+        "hiplot_c1.service",
         "hiplot_c2.service",
         "declination.service",
     ):
@@ -214,6 +216,10 @@ def _build_inventory() -> tuple[ServiceEntry, ...]:
         "etcdv3.service",
         "influxdb.service",
         "grafana.service",
+        # x2 D11: the etcd -> Influx pusher. It runs from a checkout on h20
+        # that update_dsart does not reach; listing it makes a dead or
+        # stale pusher visible on the Services page.
+        "dsart_rt_to_influx.service",
     ):
         rows.append(ServiceEntry(
             tier=TIER_GRAFANA_H20, host=HOST_H20,

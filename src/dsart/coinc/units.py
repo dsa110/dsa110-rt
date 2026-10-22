@@ -17,11 +17,14 @@ helpers below derive both from the period so neither is ever hard-coded.
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ..common.constants import NATIVE_SAMPLE_US, SPECNUM_PERIOD_US
 
 __all__ = [
+    "TIME_FILTER_FWHM_TIER_SAMPLES",
+    "time_filter_of",
+    "fwhm_ms",
     "T_SEARCH_1X_US",
     "sample_period_us_or_default",
     "period_from_mapping",
@@ -102,3 +105,41 @@ def width_ms(width_samples: Any, sample_period_us: Any) -> float:
     except (TypeError, ValueError):
         return float("nan")
     return w * sample_period_us_or_default(sample_period_us) / 1000.0
+
+
+#: Achieved FWHM, in tier samples, of each time-filter token (Phase 0
+#: time_filters.md: boxcars b<w> are exact; the b3x bank adds t2 = [1,2,1]
+#: and the B3 quadratic splines q<w> with near-equal stage lengths).
+TIME_FILTER_FWHM_TIER_SAMPLES: Dict[str, float] = {
+    "t2": 2.0,
+    "q4": 3.67, "q8": 8.00, "q16": 16.09, "q32": 32.14, "q64": 63.82,
+}
+
+
+def time_filter_of(kernel_id: str) -> Tuple[str, int]:
+    """``(token, nominal width in tier samples)`` of a kernel id's time
+    filter (third ``:`` token): ``b<w>`` boxcars (today), and the proposed
+    b3x tokens ``t2`` ([1,2,1]) and ``q<w>`` (B3). Unknown -> (token, 0)."""
+    parts = str(kernel_id).split(":")
+    tok = parts[-1] if parts else ""
+    for prefix in ("b", "q", "t"):
+        if tok.startswith(prefix) and tok[1:].isdigit():
+            return tok, int(tok[1:])
+    return tok, 0
+
+
+def fwhm_ms(kernel_id: str, width_samples: int, sample_period_us: float) -> float:
+    """FWHM in ms of a C1 row's matched filter.
+
+    ``width_samples`` is the row's width in external samples (T_ext; a
+    tier-B row reports twice its tier width), so the tier scale cancels:
+    FWHM = (achieved FWHM / nominal width) x width_samples x T_ext. For
+    boxcars the achieved FWHM equals the width (today's ``w x T``)."""
+    tok, nominal = time_filter_of(kernel_id)
+    try:
+        w = float(width_samples)
+    except (TypeError, ValueError):
+        return float("nan")
+    if nominal > 0 and tok in TIME_FILTER_FWHM_TIER_SAMPLES:
+        w *= TIME_FILTER_FWHM_TIER_SAMPLES[tok] / float(nominal)
+    return w * float(sample_period_us) / 1000.0

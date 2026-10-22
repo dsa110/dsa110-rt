@@ -944,3 +944,139 @@ __all__ = [
     "fleet_dump_now",
     "resolve_bind_hosts",
 ]
+
+
+# ---------------------------------------------------------------------------
+# x2 (docs/x2/downstream_inventory.md §3.6, D11): Dump Now at a 2x op-point
+# ---------------------------------------------------------------------------
+#
+# At 2x there are no retained cubes; a manual dump is a MANUAL CutoutRequest
+# (no candidate pixel / DM) to the selected halves, which re-image all their
+# owned DMs around ``t_peak_ext`` from the raw ring (and archive the raw
+# window when ``raw`` is set). The time comes from the halves' own
+# ``/mon/search_rt/<cn>/cutout/<g>`` raw-ring window, placed a margin
+# behind the newest row so the window is complete on every half.
+
+#: Seconds behind the fleet's newest raw-ring row (window + DM-3000 sweep).
+CUTOUT_MARGIN_S: float = 3.0
+
+
+def active_opoint_record(store: Any) -> dict[str, Any] | None:
+    """The ``/cnf/opoint`` record (SPEC §10) or None (today's fleet)."""
+    try:
+        raw = store.get_dict("/cnf/opoint")
+    except Exception:  # noqa: BLE001
+        return None
+    return dict(raw) if isinstance(raw, dict) else None
+
+
+def is_2x(record: dict[str, Any] | None) -> bool:
+    return bool(record) and str(record.get("opoint") or "").startswith("2x")
+
+
+def _cutout_mon_key(sid: int, gpu_half: int) -> str:
+    return f"/mon/search_rt/{int(sid)}/cutout/{int(gpu_half)}"
+
+
+def resolve_cutout_t_peak(
+    store: Any, halves: Sequence[tuple[int, int]], *, t_ext_us: float,
+    margin_s: float = CUTOUT_MARGIN_S,
+) -> tuple[int | None, dict[str, Any]]:
+    """``newest - margin`` on the most-behind selected half (even)."""
+    newest: list[int] = []
+    info: dict[str, Any] = {}
+    for sid, g in halves:
+        d = store.get_dict(_cutout_mon_key(sid, g)) or {}
+        v = d.get("raw_ring_newest_ext")
+        info[f"s{sid}_g{g}"] = v
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            newest.append(int(v))
+    if not newest:
+        return None, info
+    t = min(newest) - int(round(margin_s * 1e6 / float(t_ext_us)))
+    return t - (t % 2), info
+
+
+def fleet_cutout_now(
+    store: Any,
+    *,
+    record: dict[str, Any],
+    halves: Sequence[tuple[int, int]] | None = None,
+    t_peak_ext: int | None = None,
+    raw: bool = False,
+    event_name: str | None = None,
+    bind_hosts: Sequence[tuple[int, int, str, int]] | None = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    sender: Callable[..., None] | None = None,
+    yaml_path: str | None = None,
+    rng: random.Random | None = None,
+    user: str | None = None,
+) -> FleetDumpNowResult:
+    """Send a MANUAL ``CutoutRequest`` to the selected halves (default all).
+
+    Same result type as :func:`fleet_dump_now`; ``event_specnum`` carries
+    ``t_peak_ext``. Halves report through C2's status port like any other
+    request; the products land in ``<archive>/<event_name>/cutouts/``.
+    """
+    from dsart.coinc import wire
+    from dsart.x2.opoint import opoint_from_id
+
+    t0 = time.monotonic()
+    rng = rng or random.Random()
+    if bind_hosts is None:
+        bind_hosts = resolve_bind_hosts(yaml_path)
+    if halves is not None:
+        want = {(int(s), int(g)) for s, g in halves}
+        bind_hosts = [b for b in bind_hosts if (int(b[0]), int(b[1])) in want]
+    name = event_name or _gen_event_name(rng)
+    op = opoint_from_id(str(record.get("opoint")))
+    if t_peak_ext is None:
+        t_peak_ext, arm = resolve_cutout_t_peak(
+            store, [(int(b[0]), int(b[1])) for b in bind_hosts],
+            t_ext_us=op.t_ext_us)
+    else:
+        arm = {"source": "caller"}
+    if t_peak_ext is None:
+        return FleetDumpNowResult(
+            ok=False, event_name=name, event_specnum=None, per_half={},
+            pass_count=0, fail_count=0,
+            latency_ms=(time.monotonic() - t0) * 1e3,
+            bind_hosts=tuple(bind_hosts), arm_info=arm,
+            error="no raw-ring window in /mon/search_rt/*/cutout/*; is the 2x fleet up?",
+        )
+    t0_ext, n_t = wire.default_cutout_window(int(t_peak_ext), 512)
+    plan_id = 0
+    pid = record.get("plan_id")
+    if isinstance(pid, str) and pid.startswith("0x"):
+        plan_id = int(pid, 16)
+    flags = wire.CUTOUT_FLAG_CUTOUT | wire.CUTOUT_FLAG_MANUAL
+    if raw:
+        flags |= wire.CUTOUT_FLAG_RAW_ARCHIVE
+    rows_half = int(round(500e3 / op.t_ext_us))
+    req = wire.CutoutRequest(
+        event_name=name, request_id=rng.randrange(1, 1 << 31),
+        t_peak_ext=int(t_peak_ext), t0_ext=t0_ext, n_t=n_t,
+        raw_pre_ext=rows_half, raw_post_ext=rows_half, plan_id=plan_id,
+        stamp_half_px=0, n_stamp_t=0, flags=flags)
+    blob = wire.encode_cutout_request(req)
+    send = sender or default_sender
+    per_half: dict[tuple[int, int], str] = {}
+    for sid, g, host, port in bind_hosts:
+        try:
+            send(blob, (str(host), int(port)), timeout_s)
+            per_half[(int(sid), int(g))] = "ok"
+        except socket.timeout:
+            per_half[(int(sid), int(g))] = "timeout"
+        except OSError as exc:
+            per_half[(int(sid), int(g))] = f"oserror: {exc!r}"
+    n_ok = sum(1 for v in per_half.values() if v == "ok")
+    LOG.info("cutout_now %s -> %d/%d halves (t_peak_ext=%d, raw=%s, user=%s)",
+             name, n_ok, len(per_half), int(t_peak_ext), raw, user)
+    return FleetDumpNowResult(
+        ok=bool(per_half) and n_ok == len(per_half), event_name=name,
+        event_specnum=int(t_peak_ext), per_half=per_half, pass_count=n_ok,
+        fail_count=len(per_half) - n_ok,
+        latency_ms=(time.monotonic() - t0) * 1e3,
+        bind_hosts=tuple(bind_hosts), arm_info=arm,
+        note=f"x2 MANUAL cutout request {req.request_id} ({record.get('opoint')})",
+    )

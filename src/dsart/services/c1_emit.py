@@ -59,7 +59,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from ..coinc.wire import (
     C1BatchEncoder,
@@ -381,6 +381,7 @@ def candidate_to_c1_row(
     cand: Candidate,
     *,
     geom: CubeGeometry,
+    fine_global_idx: Optional[Sequence[int]] = None,
 ) -> C1CandidateRow:
     """Project a ``Candidate`` + ``CubeGeometry`` sidecar into a
     locked-schema ``C1CandidateRow``.
@@ -400,6 +401,14 @@ def candidate_to_c1_row(
     on the per-cube grid (e.g. test fixtures that pass synthetic
     floats), we clamp ``fine_dm_idx`` to 0; the C2 receiver tolerates
     that.
+
+    x2 (inventory finding 2): today ``cand.dm_idx`` is the cube-LOCAL
+    fine index (the pipeline never passes ``fine_to_coarse``), so
+    ``dm_idx_global`` is not global. Passing ``fine_global_idx`` -- the
+    cube's local -> plan-global fine index map, e.g.
+    ``plan.fines_of(d)`` as an array -- makes ``dm_idx_global`` the
+    TieredDmPlan's global fine index (SPEC §9), which C2's cutout
+    requests, C3 and the plotter key on. ``None`` = today's value.
     """
     l_pix = int(round(float(cand.l)))
     m_pix = int(round(float(cand.m)))
@@ -438,6 +447,9 @@ def candidate_to_c1_row(
         # ``dm_fine`` floats that don't exactly fall on the grid.
         diffs = abs(fine_dm - float(cand.dm_fine))
         fine_dm_idx = int(diffs.argmin())
+    dm_idx_global = int(cand.dm_idx)
+    if fine_global_idx is not None and 0 <= fine_dm_idx < len(fine_global_idx):
+        dm_idx_global = int(fine_global_idx[fine_dm_idx])
     return C1CandidateRow(
         snr=float(cand.snr),
         l_rad=float(l_rad),
@@ -445,7 +457,7 @@ def candidate_to_c1_row(
         l_pix=int(l_pix),
         m_pix=int(m_pix),
         dm_pc_cc=float(cand.dm_fine),
-        dm_idx_global=int(cand.dm_idx),
+        dm_idx_global=dm_idx_global,
         fine_dm_idx=int(fine_dm_idx),
         event_specnum=int(cand.event_specnum),
         width_samples=int(cand.width_samples),
@@ -1001,3 +1013,62 @@ _QUEUE_POLL_S: float = 0.25
 #: Wake interval used when ``idle_heartbeat_s`` is disabled — the drain
 #: loop still needs to re-check ``_stopping`` periodically.
 _IDLE_DISABLED_WAIT_S: float = 1.0
+
+
+# ---------------------------------------------------------------------------
+# x2 D9: per-CYCLE C1 filtering, time-filter ids and FWHM
+# ---------------------------------------------------------------------------
+#
+# At 2x one 201.33 ms cycle produces one cube per owned coarse DM (3-6 per
+# half). Today's chain -- width cap + escape, WideEscapeGovernor, metering
+# (cap 8, 2 SNR-protected slots) -- runs per CUBE, so it would admit up to
+# N x 8 rows per half per cycle (the C2 replay: 1903 rows/s = 9.4x real
+# time vs 320 rows/s = 0.46x when pooled) and give governor tokens to the
+# first-processed DM instead of the brightest. ``pool_cycle`` applies ONE
+# pass of the existing chain to the cycle's pooled candidates and hands
+# each per-DM cube its own survivors back (each cube still ships its own
+# C1 batch with its own header). With one cube per cycle (1x) it is the
+# identity wrapper around the chain.
+
+T = TypeVar("T")
+
+
+def pool_cycle(
+    groups: Sequence[Tuple[Any, Sequence[T]]],
+    chain: Callable[[List[T]], List[T]],
+) -> List[Tuple[Any, List[T]]]:
+    """Apply ``chain`` once to all of a cycle's candidates.
+
+    ``groups`` is ``[(cube_key, candidates), ...]`` in processing order;
+    ``chain`` is today's per-block filter (it may reorder and drop, never
+    invent). Returns ``[(cube_key, survivors), ...]`` in the same group
+    order, each group's survivors in the order ``chain`` returned them.
+    Candidates are tracked by identity, so equal-valued rows from two
+    cubes are never confused.
+    """
+    if len(groups) == 1:
+        key, cands = groups[0]
+        return [(key, list(chain(list(cands))))]
+    owner: Dict[int, int] = {}
+    pooled: List[T] = []
+    for gi, (_key, cands) in enumerate(groups):
+        for c in cands:
+            owner[id(c)] = gi
+            pooled.append(c)
+    kept = chain(pooled)
+    out: List[List[T]] = [[] for _ in groups]
+    for c in kept:
+        gi = owner.get(id(c))
+        if gi is None:
+            raise ValueError("chain returned a candidate it was not given")
+        out[gi].append(c)
+    return [(groups[gi][0], out[gi]) for gi in range(len(groups))]
+
+
+# Time-filter ids and FWHM live with the other unit helpers (coinc/units.py)
+# so the archive / C2 can use them without importing the emitter.
+from ..coinc.units import (  # noqa: E402,F401  (re-exported)
+    TIME_FILTER_FWHM_TIER_SAMPLES,
+    fwhm_ms,
+    time_filter_of,
+)

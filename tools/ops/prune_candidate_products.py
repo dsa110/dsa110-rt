@@ -79,7 +79,7 @@ DEFAULT_REPORT_DIR = "/dataz/dsa110/dr_archive/prune"
 
 #: Products eligible for deletion, relative to the event directory.  Order is
 #: cosmetic (report ordering only).
-DEFAULT_PRODUCTS = ("cubes", "voltages", "Level2/voltages")
+DEFAULT_PRODUCTS = ("cubes", "voltages", "Level2/voltages", "raw")  # x2: + raw windows
 
 #: Never delete these, even if a caller passes them via --products.  Belt and
 #: braces against a typo turning this into an archive shredder.
