@@ -1771,6 +1771,13 @@ class RxRingV4Reader:
                 "max_end": fl["max_end"].astype(np.uint64),
                 "last_progress_ns": fl["last_progress_ns"].astype(np.uint64)}
 
+    def flow_stats(self, dm: int) -> dict:
+        """Per-stream writer counters of one DM (``datagrams``, ``rows_written``,
+        ``rows_hole``, ``rows_late``, ``rows_dup``, ``rows_mismatch``, ``resyncs``,
+        ``started``) as int64 arrays."""
+        fl = self._flows(self._loc(dm))
+        return {f: fl[f].astype(np.int64) for f in _RX4_FLOW_FIELDS}
+
     def _min_streams(self, min_streams: Optional[int]) -> int:
         n = self.fmt.n_stream
         if min_streams is None:
