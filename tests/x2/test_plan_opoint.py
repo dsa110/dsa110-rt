@@ -40,7 +40,7 @@ def test_2x_matches_schemes_proposed():
     assert op.tiers[0].t_us == 524.288 and op.tiers[1].t_us == 1048.576
     assert op.coarse_density_t_ref_native * NATIVE_SAMPLE_US == 1048.576
     assert (op.dm_tol, op.dm_ti_us, op.coarse_density) == (1.25, 40.0, 0.0206)
-    assert op.bits_heavy == 16 and op.heavy_frac == 1e-4 and op.normalise_values
+    assert op.bits_heavy == 16 and op.heavy_frac == 3e-5 and op.normalise_values
     assert op.redundancy_tol_m == 0.05 and op.n_grid == 256 and op.cell_lambda_mode == "tee45"
     assert op.n_halves == 8 and op.nchan_eff == 192 and op.n_streams == 32
     assert OPPOINT_2X is opoint_2x
