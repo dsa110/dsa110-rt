@@ -47,7 +47,7 @@ against them; everything else is fixed. Change requests go through integration.
 | `dm_tol`, `dm_ti_us` | float or None | None | 1.25, 40.0 |
 | `coarse_density`, `coarse_density_t_ref_native` | float or None, int | None, 32 | 0.0206, 32 |
 | `normalise_values` | bool | False | True (value / sqrt(n) on the wire, x sqrt(n) at the owner) |
-| `heavy_frac` | float or None | None | 1e-4 (heavy iff n >= heavy_frac x N_image) |
+| `heavy_frac` | float or None | None | 3e-5 (heavy iff n >= heavy_frac x N_image; was 1e-4 in v1, changed by integration 2026-10-22 per Phase 0 study 1: at 1e-4 the n_sub 4 formats compress 2.8-2.9% at the 250-sigma rail) |
 | `redundancy_tol_m` | float | 0.05 | 0.05 |
 | `n_grid`, `cell_lambda_mode` | int, str | 256, "tee45" | 256, "tee45" |
 | `n_halves` | int | 8 | 8 |
@@ -170,7 +170,7 @@ Common to both n_sub:
 ## 3. Value maps (`src/dsart/grid/baseline_grid.py`) [FROZEN v1 by WS-P, 2026-10-22]
 **Builders.**
 - `build_value_map(antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, kind, n_sub, chan_sum_factor,
-  dec_deg, cell_lambda, n_grid=256, heavy_frac=1e-4, normalise=True, redundancy_tol_m=0.05) -> ValueMap`.
+  dec_deg, cell_lambda, n_grid=256, heavy_frac=3e-5, normalise=True, redundancy_tol_m=0.05) -> ValueMap`.
 - `build_value_map_for_opoint(op, antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, dec_deg,
   cell_lambda=None)`. With `cell_lambda=None` it uses `cell_lambda_for_pixel_arcsec(45, n_grid)` (tee45).
 - `OPPOINT_1X` gives the 1x-compat map: gridded, n_sub 4, csf 8, `heavy_frac=None`, `normalise=False`.
@@ -220,7 +220,10 @@ The builder is numpy-only. Importing the module pulls in torch via `dsart/grid/_
 - Owner cell `(cell_row, cell_col)`, uint16, in today's single-side `[n_grid, n_grid]` layout
   (`SparsityPattern.ix_row/ix_col`; LUT form `row x n_grid + col`, `ValueMap.cell_flat(stream)`).
 - `heavy` = `n >= heavy_threshold`, where `heavy_threshold = ceil(heavy_frac x N_image)` in exact rationals and
-  N_image = the sum of n over all values of all streams (10,202,112 at 2x, giving a threshold of 1021).
+  N_image = the sum of n over all values of all streams (10,202,112 at 2x, giving a threshold of 307 at
+  3e-5; 1021 at v1's 1e-4). Heavy values per stream at 3e-5 (Phase 0 rowrule.md): gridded n_sub 2 103 (48.5% of
+  the natural weight), n_sub 4 90 (47.4%); per-baseline n_sub 2 97 (50.1%), n_sub 4 91 (49.2%). The measured
+  table below is at v1's 1e-4.
 
 **Wire order** within a stream: heavy values first, then main values. Each group is in (cell key
 `(row << 16) | col`, class id) order. With no heavy class (1x) this is today's pattern order.

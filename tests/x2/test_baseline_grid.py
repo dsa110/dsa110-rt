@@ -120,12 +120,13 @@ def test_model_rint_binning_overcounts_classes(ant):
 def test_counts_heavy_class_and_wire_order(ant, kind, n_sub):
     vm = vmap(ant, kind, n_sub)
     assert vm.n_streams == 16 * n_sub and vm.n_image == N_IMAGE_2X
-    assert vm.heavy_threshold == heavy_threshold(N_IMAGE_2X, 1e-4) == 1021      # n >= N/1e4
+    assert vm.heavy_threshold == heavy_threshold(N_IMAGE_2X, 3e-5) == 307       # n >= 3e-5 N (Phase 0)
+    assert heavy_threshold(N_IMAGE_2X, 1e-4) == 1021
     per = 192 // n_sub
     for st in vm.streams:
         nh = st.n_heavy
         assert np.all(st.heavy[:nh]) and not np.any(st.heavy[nh:])
-        assert np.array_equal(st.heavy, st.n_contrib >= 1021)
+        assert np.array_equal(st.heavy, st.n_contrib >= 307)
         key = (st.cell_row.astype(np.int64) << 16) | st.cell_col
         for part in (slice(0, nh), slice(nh, None)):
             k, cid = key[part], st.class_id[part]
@@ -134,13 +135,14 @@ def test_counts_heavy_class_and_wire_order(ant, kind, n_sub):
     if kind == "baselines":
         mult = vm.classes.multiplicity
         assert np.all(vm.n_values == 1748) and vm.n_dropped_offgrid == 0
-        assert np.all(vm.n_heavy == int(np.sum(mult * per >= 1021)))
-        assert int(vm.n_heavy[0]) == (80 if n_sub == 2 else 26)     # plan's 1773-class model: 71 / 23
+        assert np.all(vm.n_heavy == int(np.sum(mult * per >= 307)))
+        assert int(vm.n_heavy[0]) == (97 if n_sub == 2 else 91)     # at 1e-4 N: 80 / 26 (plan's model: 71 / 23)
         for st in vm.streams:
             assert np.array_equal(st.n_contrib, mult[st.class_id] * per)
     else:
-        # plan: 3.1% of cells carry 43.5% of the weight (n_sub 2); 1.2% / 21.7% (n_sub 4)
-        lo, hi, wlo, whi = (0.025, 0.035, 0.40, 0.46) if n_sub == 2 else (0.009, 0.015, 0.18, 0.24)
+        # at 3e-5 N (Phase 0 rowrule.md): 103 of 2544 values = 4.0%, 48.5% of the weight (n_sub 2);
+        # 90 of 2159 = 4.2%, 47.4% (n_sub 4). At v1's 1e-4: 2.9% / 42.4% and 1.13% / 20.7%.
+        lo, hi, wlo, whi = (0.035, 0.046, 0.46, 0.51) if n_sub == 2 else (0.036, 0.048, 0.44, 0.50)
         assert lo < s["heavy_value_frac"] < hi and wlo < s["heavy_weight_frac"] < whi
         for st in vm.streams:
             assert np.all(st.class_id == -1) and st.legacy_pattern_id is not None
@@ -280,7 +282,7 @@ def test_pattern_id_covers_every_input(ant):
     e, n, u, mask = ant
     base = dict(kind="gridded", antpos_e=e, antpos_n=n, antpos_u=u, is_core_baseline_mask=mask,
                 chan_sum_factor=2, n_sub=2, n_grid=256, cell_lambda=CELL, dec_deg=DEC,
-                redundancy_tol_m=0.05, heavy_frac=1e-4, normalise=True)
+                redundancy_tol_m=0.05, heavy_frac=3e-5, normalise=True)
     pid = value_map_pattern_id(**base)
     assert pid == vmap(ant, "gridded", 2).pattern_id
     assert value_map_pattern_id(**dict(base, dec_deg=DEC + 0.1)) == pid          # same 0.25 deg bin
