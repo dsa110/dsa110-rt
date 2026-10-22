@@ -849,8 +849,10 @@ class TestInfluxPusherService:
         assert after - before == 8
 
     def test_planned_search_key_warns_once_and_emits_nothing(self, caplog):
+        # x2 D11: /mon/search_rt/<cn>/rx now has a builder (search_rt_rx);
+        # /cands is still a planned-only key.
         etcd = _FakeEtcd()
-        etcd.set("/mon/search_rt/1/rx", {"cn_id": 1, "schema_version": 1},
+        etcd.set("/mon/search_rt/1/cands", {"cn_id": 1, "schema_version": 1},
                  mod_revision=1)
         writer = _FakeInfluxWriter()
         svc = pusher.InfluxPusherService(
@@ -862,7 +864,7 @@ class TestInfluxPusherService:
         assert svc.n_planned_key_hits == 1
         # Idempotent: a second tick (with mod_rev bumped to bypass
         # dedup) shouldn't emit a second log line.
-        etcd.bump("/mon/search_rt/1/rx", {"cn_id": 1}, mod_revision=2)
+        etcd.bump("/mon/search_rt/1/cands", {"cn_id": 1}, mod_revision=2)
         n_before = len([r for r in caplog.records
                         if "planned schema" in r.message])
         svc._tick()

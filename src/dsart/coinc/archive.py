@@ -31,15 +31,21 @@ import os
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .stats import ClusterStats
+from .units import fwhm_ms, width_ms
 from .window import WindowEntry
 
 __all__ = [
     "EventArchiveWriter",
     "C1_WINDOW_CSV_FIELDS",
     "C2_CLUSTER_CSV_FIELDS",
+    "C1_WINDOW_CSV_FIELDS_V2",
+    "C2_CLUSTER_CSV_FIELDS_V2",
+    "ARCHIVE_SCHEMA_DEFAULT",
+    "c1_window_fields",
+    "c2_cluster_fields",
     "EVENT_SUBDIRS",
 ]
 
@@ -117,6 +123,82 @@ C2_CLUSTER_CSV_FIELDS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Archive schema 2 (x2, docs/x2/downstream_inventory.md §3.5 / D1)
+# ---------------------------------------------------------------------------
+#
+# Schema 1 (default, today's files byte-for-byte) carries no sample unit:
+# ``width_*`` and ``event_specnum`` are in the op-point's search samples
+# with nothing saying which. Schema 2 APPENDS the unit + provenance columns
+# at the END of both CSVs (existing readers index by name; hiplot keeps
+# working) and adds the same keys to Level3 ``c2``. It is selected by
+# ``coinc.archive_schema: 2`` (the 2x op-point section); 1x keeps 1.
+
+#: Default archive schema: today's CSV columns and Level3 keys exactly.
+ARCHIVE_SCHEMA_DEFAULT: int = 1
+
+#: Columns appended to the C1 per-row CSVs at schema 2. ``coarse_idx`` /
+#: ``tier`` are filled when a plan resolver is wired (empty otherwise).
+C1_WINDOW_CSV_V2_EXTRA: tuple[str, ...] = (
+    "sample_period_us",
+    "width_ms",
+    "coarse_idx",
+    "tier",
+)
+
+#: Columns appended to the C2 per-cluster CSVs at schema 2.
+C2_CLUSTER_CSV_V2_EXTRA: tuple[str, ...] = (
+    "dm_peak",
+    "width_peak",
+    "peak_sample_period_us",
+    "peak_event_specnum",
+    "width_median_ms",
+    "opoint",
+)
+
+C1_WINDOW_CSV_FIELDS_V2: tuple[str, ...] = (
+    C1_WINDOW_CSV_FIELDS + C1_WINDOW_CSV_V2_EXTRA
+)
+C2_CLUSTER_CSV_FIELDS_V2: tuple[str, ...] = (
+    C2_CLUSTER_CSV_FIELDS + C2_CLUSTER_CSV_V2_EXTRA
+)
+
+
+def c1_window_fields(schema: int = ARCHIVE_SCHEMA_DEFAULT) -> tuple[str, ...]:
+    """C1 CSV columns for archive ``schema`` (1 = today, 2 = x2)."""
+    return C1_WINDOW_CSV_FIELDS_V2 if int(schema) >= 2 else C1_WINDOW_CSV_FIELDS
+
+
+def c2_cluster_fields(schema: int = ARCHIVE_SCHEMA_DEFAULT) -> tuple[str, ...]:
+    """C2 CSV columns for archive ``schema`` (1 = today, 2 = x2)."""
+    return C2_CLUSTER_CSV_FIELDS_V2 if int(schema) >= 2 else C2_CLUSTER_CSV_FIELDS
+
+
+#: Optional resolver ``dm_idx_global -> (coarse_idx, tier)`` from the
+#: deployed DM plan (x2 tiered plan; None until it is wired).
+FineIndexResolver = Callable[[int], Tuple[int, int]]
+
+
+def _fmt_period(v: float) -> str:
+    """Period column text; empty for a missing/placeholder period."""
+    v = float(v)
+    return f"{v:.6f}" if (math.isfinite(v) and v > 0.0) else ""
+
+
+def _fmt_fwhm(entry: WindowEntry, period_us: float) -> str:
+    if not (math.isfinite(float(period_us)) and float(period_us) > 0.0):
+        return ""
+    ms = fwhm_ms(entry.kernel_id, entry.width_samples, period_us)
+    return f"{ms:.6f}" if math.isfinite(ms) else ""
+
+
+def _fmt_ms(samples: float, period_us: float) -> str:
+    if not (math.isfinite(float(period_us)) and float(period_us) > 0.0):
+        return ""
+    ms = width_ms(samples, period_us)
+    return f"{ms:.6f}" if math.isfinite(ms) else ""
+
+
 def _atomic_write(path: Path, body: str) -> None:
     """Write ``body`` to ``path`` via tempfile + os.rename (atomic)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +219,33 @@ def _atomic_write(path: Path, body: str) -> None:
 
 
 def entry_to_csv_row(
+    entry: WindowEntry, *, trigger: str = "", inj_id: str = "",
+    schema: int = ARCHIVE_SCHEMA_DEFAULT,
+    fine_index_resolver: Optional[FineIndexResolver] = None,
+) -> dict[str, object]:
+    row = _entry_to_csv_row_v1(entry, trigger=trigger, inj_id=inj_id)
+    if int(schema) >= 2:
+        period = float(getattr(entry, "sample_period_us", 0.0) or 0.0)
+        coarse: object = ""
+        tier: object = ""
+        if fine_index_resolver is not None:
+            try:
+                c, t = fine_index_resolver(int(entry.dm_idx_global))
+                coarse, tier = int(c), int(t)
+            except Exception:  # noqa: BLE001 - provenance only, never fatal
+                coarse, tier = "", ""
+        row.update({
+            "sample_period_us": _fmt_period(period),
+            # FWHM of the row's time filter (= width x T for boxcars;
+            # the b3x [1,2,1] / B3 filters use their achieved FWHM).
+            "width_ms": _fmt_fwhm(entry, period),
+            "coarse_idx": coarse,
+            "tier": tier,
+        })
+    return row
+
+
+def _entry_to_csv_row_v1(
     entry: WindowEntry, *, trigger: str = "", inj_id: str = "",
 ) -> dict[str, object]:
     return {
@@ -162,6 +271,30 @@ def entry_to_csv_row(
 
 
 def stats_to_csv_row(
+    stats: ClusterStats,
+    *,
+    trigger_class: str = "",
+    trigger: str = "",
+    schema: int = ARCHIVE_SCHEMA_DEFAULT,
+    opoint: str = "",
+) -> dict[str, object]:
+    row = _stats_to_csv_row_v1(
+        stats, trigger_class=trigger_class, trigger=trigger,
+    )
+    if int(schema) >= 2:
+        period = float(stats.peak_sample_period_us or 0.0)
+        row.update({
+            "dm_peak": f"{stats.dm_peak:.6f}",
+            "width_peak": stats.width_peak,
+            "peak_sample_period_us": _fmt_period(period),
+            "peak_event_specnum": stats.peak_event_specnum,
+            "width_median_ms": _fmt_ms(stats.width_median, period),
+            "opoint": opoint,
+        })
+    return row
+
+
+def _stats_to_csv_row_v1(
     stats: ClusterStats,
     *,
     trigger_class: str = "",
@@ -224,11 +357,22 @@ class EventArchiveWriter:
         archive_root: Path,
         *,
         calibration_source: Optional[Path] = None,
+        schema: int = ARCHIVE_SCHEMA_DEFAULT,
+        opoint: str = "",
+        fine_index_resolver: Optional[FineIndexResolver] = None,
     ) -> None:
         self._root = Path(archive_root)
         self._cal_src = (
             Path(calibration_source) if calibration_source else None
         )
+        # Archive schema (1 = today's files exactly; 2 = x2 unit columns).
+        self._schema = int(schema)
+        self._opoint = str(opoint)
+        self._fine_index_resolver = fine_index_resolver
+
+    @property
+    def schema(self) -> int:
+        return self._schema
 
     @property
     def root(self) -> Path:
@@ -274,8 +418,9 @@ class EventArchiveWriter:
         path = event_dir / "Level2" / f"C2_{event_name}.csv"
         row = stats_to_csv_row(
             stats, trigger_class=trigger_class, trigger=trigger,
+            schema=self._schema, opoint=self._opoint,
         )
-        body = self._render_csv(C2_CLUSTER_CSV_FIELDS, [row])
+        body = self._render_csv(c2_cluster_fields(self._schema), [row])
         _atomic_write(path, body)
         return path
 
@@ -300,10 +445,12 @@ class EventArchiveWriter:
         rows = [
             entry_to_csv_row(
                 m, trigger=trigger, inj_id=id_map.get(id(m), ""),
+                schema=self._schema,
+                fine_index_resolver=self._fine_index_resolver,
             )
             for m in members
         ]
-        body = self._render_csv(C1_WINDOW_CSV_FIELDS, rows)
+        body = self._render_csv(c1_window_fields(self._schema), rows)
         _atomic_write(path, body)
         return path
 
@@ -344,6 +491,9 @@ def stats_to_l3_metadata(
     inj_ids: Optional[Iterable[str]] = None,
     pointing_dec_deg: Optional[float] = None,
     pointing_dec_meta: Optional[Mapping[str, object]] = None,
+    archive_schema: int = ARCHIVE_SCHEMA_DEFAULT,
+    opoint: str = "",
+    products: Optional[Mapping[str, object]] = None,
 ) -> dict[str, object]:
     """Build the L3 JSON payload the legacy archive consumer expects.
 
@@ -370,6 +520,54 @@ def stats_to_l3_metadata(
     precedent above).
     """
     inj_list = sorted({str(i) for i in (inj_ids or ()) if str(i).strip()})
+    doc = _l3_doc_v1(
+        event_name=event_name, stats=stats,
+        trigger_class_name=trigger_class_name,
+        trigger_action=trigger_action, holdoff_s=holdoff_s,
+        schema_version=schema_version, inj_list=inj_list,
+        pointing_dec_deg=pointing_dec_deg,
+        pointing_dec_meta=pointing_dec_meta,
+    )
+    if int(archive_schema) >= 2:
+        # x2 archive schema 2: the sample unit + peak provenance every
+        # downstream reader needs (filterbank width, candidate card,
+        # localisation) instead of assuming 1048.576 us. Bumps the L3
+        # schema_version to 2; schema-1 files are untouched.
+        period = float(stats.peak_sample_period_us or 0.0)
+        period_ok = math.isfinite(period) and period > 0.0
+        doc["schema_version"] = max(int(schema_version), 2)
+        doc["opoint"] = str(opoint)
+        c2 = doc["c2"]
+        assert isinstance(c2, dict)
+        c2["sample_period_us"] = period if period_ok else None
+        c2["dm_peak"] = stats.dm_peak
+        c2["width_peak"] = stats.width_peak
+        wm = width_ms(stats.width_median, period) if period_ok else float("nan")
+        c2["width_median_ms"] = wm if math.isfinite(wm) else None
+        wp = width_ms(stats.width_peak, period) if period_ok else float("nan")
+        c2["width_peak_ms"] = wp if math.isfinite(wp) else None
+    if products is not None:
+        # x2 products block (SPEC §9): which halves delivered cutouts /
+        # cubes, which are missing and why, complete vs incomplete. Only
+        # written when the caller supplies it (2x lifecycle, or the 1x
+        # partial_event_policy=archive path), so today's Level3 is unchanged.
+        doc["products"] = dict(products)
+    return doc
+
+
+def _l3_doc_v1(
+    *,
+    event_name: str,
+    stats: ClusterStats,
+    trigger_class_name: str,
+    trigger_action: str,
+    holdoff_s: float,
+    schema_version: int,
+    inj_list: Sequence[str],
+    pointing_dec_deg: Optional[float],
+    pointing_dec_meta: Optional[Mapping[str, object]],
+) -> dict[str, object]:
+    """Today's (archive schema 1) Level3 payload, unchanged."""
     return {
         "event_name": event_name,
         "schema_version": schema_version,

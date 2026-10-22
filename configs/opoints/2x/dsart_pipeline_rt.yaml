@@ -68,7 +68,7 @@ x2_todo:
   - "WS-C corr_fast: value kind / bits args from the format (template variables value_kind, bits_main, bits_heavy are available); fused cal+mask GEMM; GPU packer row rule; stage-2 FIFO off"
   - "WS-T corr_fast transport: frame v2 + C sendmmsg sender args (pacing, explicit DM->half map, k samples per datagram)"
   - "WS-C/WS-O buffers: fada/bada/dada/eada sizes and reader counts confirmed unchanged for 2x (plan: reader count unchanged)"
-  - "WS-D voltage_retention: --n-pre for the DM-3000 sweep (tests/test_voltage_dump_containment.py), dump window in T_ext"
+  - "I1: --n-pre 15 set (DM-3000 sweep 1.698 s = 13 blocks + 1 margin, +1 for 0.18 s headroom); verify with tests/test_voltage_dump_containment.py against the 2x v3 plan, then delete"
 
 # captures.mode is the M7 stage switch:
 #   junkdb  → spawn dada_junkdb x2 (fills dada+eada with /dev/urandom at
@@ -767,7 +767,7 @@ routines:
       --bind-port 11229
       --staging-dir /home/ubuntu/data/voltage_staging
       --retention-s 25.0
-      --n-pre X2TODO:WS-D:n-pre-for-dm3000
+      --n-pre 15
       --n-post 8
       --dump-wait-s 5.0
       --mon-interval-s 5.0

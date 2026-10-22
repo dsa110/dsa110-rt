@@ -197,13 +197,21 @@ def bucket_key(
     return f"dm{dm_round:04d}{WIDTH_BUCKET_INFIX}{w:04d}"
 
 
-def search_samples(width_native: int) -> float:
+def search_samples(
+    width_native: int, native_per_sample: int = NATIVE_PER_SEARCH_SAMPLE,
+) -> float:
     """Detector boxcar width (SEARCH samples) an injection of
-    ``width_native`` NATIVE samples lands in, to first order."""
-    return float(width_native) / float(NATIVE_PER_SEARCH_SAMPLE)
+    ``width_native`` NATIVE samples lands in, to first order. x2: the
+    op-point's native samples per external sample (32 at 1x, 16 at 2x)."""
+    return float(width_native) / float(native_per_sample)
 
 
-def _parse_width_choices(d: Mapping[str, Any]) -> Tuple[int, ...]:
+def _parse_width_choices(
+    d: Mapping[str, Any],
+    *,
+    native_per_sample: int = NATIVE_PER_SEARCH_SAMPLE,
+    cap_search_samples: int = MAX_C1C2_WIDTH_SEARCH_SAMPLES,
+) -> Tuple[int, ...]:
     """Validated injected widths in NATIVE samples.
 
     Back-compat: a config carrying only the scalar ``width_samples``
@@ -228,7 +236,7 @@ def _parse_width_choices(d: Mapping[str, Any]) -> Tuple[int, ...]:
         w = int(x)
         if w < 1:
             raise ValueError(f"width_choices entry {x!r} must be >= 1")
-        if search_samples(w) > MAX_C1C2_WIDTH_SEARCH_SAMPLES:
+        if search_samples(w, native_per_sample) > cap_search_samples:
             LOG.warning(
                 "inject_bot: dropping width_choices entry %d native "
                 "(~%.0f search samples): above the C1->C2 cap of %d. "
@@ -236,16 +244,15 @@ def _parse_width_choices(d: Mapping[str, Any]) -> Tuple[int, ...]:
                 "brightness escape), and the target window is %s, so "
                 "recovery would be a coin flip rather than a health "
                 "signal",
-                w, search_samples(w), MAX_C1C2_WIDTH_SEARCH_SAMPLES,
+                w, search_samples(w, native_per_sample), cap_search_samples,
                 C1C2_WIDTH_SNR_ESCAPE, "15-25 by default")
             continue
         out.append(w)
     if not out:
         raise ValueError(
             "width_choices left empty after applying the C1->C2 width cap "
-            f"of {MAX_C1C2_WIDTH_SEARCH_SAMPLES} search samples "
-            f"({MAX_C1C2_WIDTH_SEARCH_SAMPLES * NATIVE_PER_SEARCH_SAMPLE} "
-            "native)")
+            f"of {cap_search_samples} search samples "
+            f"({cap_search_samples * native_per_sample} native)")
     return tuple(sorted(set(out)))
 
 
@@ -359,9 +366,36 @@ class InjectBotConfig:
     #: and the skip is reported. Below this the cycle skips entirely.
     min_healthy_chgroups: int = 15
 
+    # -- x2 (D10; defaults = today) ------------------------------------
+    #: Native samples per C1 width sample: 32 at 1x, 16 at 2x (from the
+    #: active op-point when the service resolves one, SPEC §10).
+    native_per_search_sample: int = NATIVE_PER_SEARCH_SAMPLE
+    #: C1->C2 width cap in C1 samples (``c1.max_c1c2_width_samples`` of the
+    #: same config file): 16 at 1x, 32 at 2x -- 512 native either way.
+    max_c1c2_width_search_samples: int = MAX_C1C2_WIDTH_SEARCH_SAMPLES
+    #: Search-health gate: "any" (today: any metering half blocks every
+    #: shot) or "owner" (only the halves owning the shot's DM, from the
+    #: tiered plan at ``plan_path``). 1x≠ flag; default "any".
+    metering_gate: str = "any"
+    plan_path: str = ""
+    #: K family of the active op-point ("1x" | "2x"); a K entry tagged with
+    #: another family is ignored (treated as missing -> recalibrate).
+    k_family: str = ""
+
     @classmethod
-    def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "InjectBotConfig":
+    def from_dict(
+        cls, d: Optional[Mapping[str, Any]], *,
+        c1: Optional[Mapping[str, Any]] = None,
+        native_per_search_sample: Optional[int] = None,
+        k_family: str = "",
+    ) -> "InjectBotConfig":
         d = d or {}
+        c1 = c1 or {}
+        native = int(native_per_search_sample or d.get(
+            "native_per_search_sample", NATIVE_PER_SEARCH_SAMPLE))
+        cap = int(c1.get("max_c1c2_width_samples",
+                         MAX_C1C2_WIDTH_SEARCH_SAMPLES) or
+                  MAX_C1C2_WIDTH_SEARCH_SAMPLES)
         dms = d.get("dm_choices", [500.0, 1000.0, 1500.0, 2000.0])
         return cls(
             enabled=bool(d.get("enabled", False)),
@@ -381,7 +415,13 @@ class InjectBotConfig:
             target_snr_max=float(d.get("target_snr_max", 25.0)),
             width_samples=int(
                 d.get("width_samples", CALIBRATION_WIDTH_SAMPLES)),
-            width_choices=_parse_width_choices(d),
+            width_choices=_parse_width_choices(
+                d, native_per_sample=native, cap_search_samples=cap),
+            native_per_search_sample=native,
+            max_c1c2_width_search_samples=cap,
+            metering_gate=str(d.get("metering_gate", "any")),
+            plan_path=str(d.get("plan_path", "") or ""),
+            k_family=str(k_family or ""),
             profile=str(d.get("profile", "gaussian")),
             lm_max_rad=float(d.get("lm_max_rad", DEFAULT_LM_MAX_RAD)),
             k_max_age_s=float(d.get("k_max_age_s", 86400.0)),
@@ -420,10 +460,23 @@ class InjectBotConfig:
         )
 
     @classmethod
-    def from_yaml(cls, path: Path) -> "InjectBotConfig":
+    def from_yaml(cls, path: Path, *, active: Any = None) -> "InjectBotConfig":
+        """``active`` (x2): the resolved ``ActiveOpPoint``; its op-point sets
+        the native-per-sample factor and the K family, and the width cap is
+        read from the same file's ``c1`` block. None = today's constants."""
         with Path(path).open("r", encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
-        return cls.from_dict(doc.get("inject_bot"))
+        if active is None:
+            return cls.from_dict(doc.get("inject_bot"))
+        from dsart.x2.opoint_runtime import k_family_of
+        bot = dict(doc.get("inject_bot") or {})
+        if not bot.get("plan_path") and getattr(active, "plan_path", None):
+            bot["plan_path"] = active.plan_path
+        return cls.from_dict(
+            bot, c1=doc.get("c1") or {},
+            native_per_search_sample=int(active.opoint.t_ext_native),
+            k_family=k_family_of(active.selection),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +625,35 @@ class InjectBot:
 
     # ----- health gate -----------------------------------------------------
 
-    def check_health(self) -> Tuple[bool, str, Tuple[int, ...]]:
+    def _owner_halves(self, dm: Optional[float]) -> Optional[set]:
+        """(sid, g) halves owning ``dm`` in the tiered plan, or None (no
+        plan / v2 plan / no DM) -> the gate falls back to "any"."""
+        if dm is None or not self._cfg.plan_path:
+            return None
+        plan = getattr(self, "_plan_cache", None)
+        if plan is None:
+            try:
+                from dsart.x2.plan import load_any_plan
+                plan = load_any_plan(self._cfg.plan_path)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("owner gate: cannot load plan %s: %s",
+                            self._cfg.plan_path, exc)
+                return None
+            self._plan_cache = plan
+        owner = getattr(plan, "owner_half", None)
+        fine = getattr(plan, "fine_dm", None)
+        f2c = getattr(plan, "fine_to_coarse", None)
+        if owner is None or fine is None or f2c is None:
+            return None
+        import numpy as np
+        f = int(np.argmin(np.abs(np.asarray(fine) - float(dm))))
+        h = int(owner[int(f2c[f])])
+        sid = (1, 2, 9, 13)[h // 2]
+        return {(sid, h % 2)}
+
+    def check_health(
+        self, dm: Optional[float] = None,
+    ) -> Tuple[bool, str, Tuple[int, ...]]:
         """Mirror of the dashboard's ``precheck_calibration_health``
         (read-only etcd; see the constants block for provenance).
 
@@ -604,6 +685,9 @@ class InjectBot:
                 f"({len(live)}/{len(ALL_CHGROUPS)} live < {min_live})"
             ), tuple(live)
         sick: List[str] = []
+        # x2 (flag): only the owner halves' metering blocks the shot.
+        owners = (self._owner_halves(dm)
+                  if self._cfg.metering_gate == "owner" else None)
         for sid, g in SEARCH_HALVES:
             state = self._get_dict(f"/mon/search_rt/{sid}/compute/{g}")
             ts = (state or {}).get("ts_wall_unix")
@@ -614,7 +698,8 @@ class InjectBot:
                 sick.append(f"s{sid}g{g}")
                 continue
             if int((state or {}).get("c1_metering_active") or 0):
-                sick.append(f"s{sid}g{g}")
+                if owners is None or (sid, g) in owners:
+                    sick.append(f"s{sid}g{g}")
         if sick:
             return (
                 False,
@@ -652,6 +737,15 @@ class InjectBot:
         want = bucket_key(dm, width_samples)
         for entry in doc.get("entries") or []:
             if entry.get("bucket") == want:
+                fam = str(entry.get("k_family") or "")
+                if fam and self._cfg.k_family and fam != self._cfg.k_family:
+                    # x2: K measured at the other time resolution (a park
+                    # that did not happen) -- never use it; recalibrate.
+                    LOG.warning(
+                        "K %s is tagged k_family=%s but this bot runs %s; "
+                        "treating it as missing", want, fam,
+                        self._cfg.k_family)
+                    return None
                 return dict(entry)
         return None
 
@@ -828,7 +922,8 @@ class InjectBot:
             "l_rad": round(r.uniform(-cfg.lm_max_rad, cfg.lm_max_rad), 6),
             "m_rad": round(r.uniform(-cfg.lm_max_rad, cfg.lm_max_rad), 6),
             "width_samples": width,
-            "width_search_samples": round(search_samples(width), 3),
+            "width_search_samples": round(
+                search_samples(width, cfg.native_per_search_sample), 3),
             "profile": cfg.profile,
         }
 
@@ -936,14 +1031,20 @@ class InjectBot:
         cfg = self._cfg
         record: Dict[str, Any] = {"ts_unix": self._time()}
 
-        ok, reason, live_chgroups = self.check_health()
+        if cfg.metering_gate == "owner":
+            # The gate needs the shot's DM: pick first (x2 owner gate).
+            params = self._pick_params()
+            ok, reason, live_chgroups = self.check_health(params["dm_pc_cm3"])
+        else:
+            ok, reason, live_chgroups = self.check_health()
         if not ok:
             record["outcome"] = Outcome.NOT_SEARCHING
             record["reason"] = reason
             LOG.warning("cycle skipped: %s", reason)
             return record
 
-        params = self._pick_params()
+        if cfg.metering_gate != "owner":
+            params = self._pick_params()
         record.update(params)
         dm = params["dm_pc_cm3"]
 
@@ -1046,7 +1147,8 @@ class InjectBot:
             ),
             w=record.get("width_samples"),
             ws=round(search_samples(
-                int(record.get("width_samples") or 0)), 2),
+                int(record.get("width_samples") or 0),
+                self._cfg.native_per_search_sample), 2),
             l=float(record.get("l_rad") or 0) * 1e3,
             m=float(record.get("m_rad") or 0) * 1e3,
             dec=(f"{float(dec):.2f} deg" if dec is not None else "n/a"),
@@ -1686,7 +1788,8 @@ class InjectBot:
         if by_width:
             lines.append("per width (native, boxcar): " + " | ".join(
                 "w{w} (~{sa:g} sa): {rec}/{inj}".format(
-                    w=w, sa=round(search_samples(int(w)), 2),
+                    w=w, sa=round(search_samples(
+                        int(w), self._cfg.native_per_search_sample), 2),
                     rec=v["recovered"], inj=v["injected"])
                 for w, v in sorted(
                     by_width.items(), key=lambda kv: int(kv[0]))
@@ -2078,7 +2181,8 @@ class InjectBot:
             list(cfg.width_choices),
             [
                 (int(x) if float(x).is_integer() else x)
-                for x in (round(search_samples(w), 2)
+                for x in (round(search_samples(
+                    w, cfg.native_per_search_sample), 2)
                           for w in cfg.width_choices)
             ],
             len(cfg.dm_choices) * len(cfg.width_choices),
@@ -2164,13 +2268,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--once", action="store_true",
         help="run a single injection cycle and exit (smoke test)")
+    from dsart.x2.opoint_runtime import add_opoint_argument, select_service_config
+    add_opoint_argument(parser)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    cfg = InjectBotConfig.from_yaml(args.config)
+    # x2 (SPEC §10): resolve the op-point once at startup; it picks the
+    # config set (incl. this op-point's own bot state file), the width
+    # factor and the K family. A switch restarts the bot.
+    active, cfg_path = select_service_config(args.config, cli_opoint=args.opoint)
+    cfg = InjectBotConfig.from_yaml(cfg_path, active=active)
+    LOG.info("inject_bot: op-point %s (k_family %s, %d native/sample, "
+             "state %s)", active.opoint_id, cfg.k_family,
+             cfg.native_per_search_sample, cfg.state_path)
     if not cfg.enabled and not (args.summary_now or args.once):
         LOG.error(
             "inject_bot: disabled in config (inject_bot.enabled); "

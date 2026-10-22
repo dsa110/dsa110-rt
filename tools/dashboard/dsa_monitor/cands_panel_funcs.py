@@ -122,6 +122,11 @@ class EventSummary:
     c3_flag_only: Optional[bool] = None
     # Voltage fragments actually on h23 under Level2/voltages/.
     n_voltages: int = 0
+    # x2: what ``n_cubes`` counts. "cubes" (1x: cube files, out of 8) or
+    # "cutouts" (2x: distinct per-half cutout manifests, out of the
+    # expected halves C2 recorded in Level3 ``products``).
+    products_kind: str = "cubes"
+    n_products_expected: int = 8
     # Event time of day (UTC HH:MM:SS), from t_peak_mjd with a
     # dir-mtime fallback (suffixed '~' to mark it approximate).
     utc_hms: Optional[str] = None
@@ -318,6 +323,10 @@ class EventDetail:
     radec_source: Optional[str] = None
     ra_hms: Optional[str] = None      # "HH:MM:SS.s(NN)"; no (NN) for legacy
     dec_dms: Optional[str] = None     # "+DD:MM:SS(NN)"; no (NN) for legacy
+    #: x2: per-half cutout files under cutouts/ (2x events) and the Level3
+    #: ``products`` block (expected / present / missing halves).
+    cutouts: Tuple[str, ...] = ()
+    products: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -520,6 +529,14 @@ class ArchiveBrowser:
         c2 = (meta or {}).get("c2", {}) if isinstance(meta, dict) else {}
         trigger = (meta or {}).get("trigger", {}) if isinstance(meta, dict) else {}
         n_cubes = _count_files(event_dir / "cubes", "cube_s*_g*_*.npz")
+        products_kind, n_expected = "cubes", 8
+        if (event_dir / "cutouts").is_dir():
+            # x2: halves that delivered (manifest = completion signal).
+            products_kind = "cutouts"
+            n_cubes = _count_files(event_dir / "cutouts", "cutout_s*_g*.json")
+            prod = (meta or {}).get("products") if isinstance(meta, dict) else None
+            exp = (prod or {}).get("expected") if isinstance(prod, dict) else None
+            n_expected = len(exp) if isinstance(exp, list) and exp else 8
         n_plots = _count_files(event_dir / "Level2" / "plots", "*.png")
         c3 = self._read_c3(event_dir) or {}
         mjd_peak = _as_optional_float(c2.get("t_peak_mjd"))
@@ -535,6 +552,8 @@ class ArchiveBrowser:
             m_median=_as_optional_float(c2.get("m_median")),
             n_cubes=n_cubes,
             n_plots=n_plots,
+            products_kind=products_kind,
+            n_products_expected=n_expected,
             c3_action=_as_optional_str(c3.get("action")),
             c3_rules=tuple(str(r) for r in (c3.get("rules_fired") or [])),
             c3_notes=_as_optional_str(c3.get("notes")) or None,
@@ -601,6 +620,11 @@ class ArchiveBrowser:
             metadata=meta,
             plots=tuple(plots),
             cubes=tuple(cubes),
+            cutouts=tuple(sorted(
+                q.name for q in (event_dir / "cutouts").glob("cutout_s*_g*.npz")
+            )) if (event_dir / "cutouts").is_dir() else (),
+            products=(meta.get("products")
+                      if isinstance(meta, dict) else None),
             has_c2_csv=(event_dir / "Level2" / f"C2_{name}.csv").is_file(),
             has_c1_csv=(
                 event_dir / "Level2" / f"C1_window_{name}.csv"

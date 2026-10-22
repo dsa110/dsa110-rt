@@ -44,9 +44,6 @@ x2_todo:
   - "WS-S search_compute: owner engine args (per-DM cubes, K0-K3b, B-spline filters), amplitude regime in sigma units (input_clip_sigma 250, Layer-1/Layer-2 floors for the new image units, saturation guard 240), --enable-cube-dump vs on-demand cutouts (O1); tokens in routines[search_compute_0/1]"
   - "WS-S/WS-D c1: merger dm_max_trials in pc/cc (2x fine spacing 2.8-3.2 pc/cc vs ~7), metering per cycle not per cube (never meter an injection more often than 1x), _DEDISP_CHAN_SUM_FACTOR wired from --chan-sum-factor (search_compute.py:266 is a literal 8 today)"
   - "WS-S cube / cube_dump / noise / detector blocks: 2x values (cube retention ring, proactive stager and cube uploader retire in 2x)"
-  - "WS-D D6 coinc: the code reads partial_event_policy and cutout.{wait_s,status_port}; expected halves from the plan; sample_period_us in CSVs and Level3 json; class ids by crc32"
-  - "WS-D c3: the code reads veto.r2_t_shift_ms (2x key); R-rules on cutouts; filterbank period from the event"
-  - "WS-D D10 inject_bot: factor 16 + width cap from the c1 block, width_choices incl. 16 native, dm_choices to 3000 avoiding 1575-1625, owner map from the plan, op-point-tagged K keys"
 # Carried over from 1x, recalibrated on 2x data at CP2 (does NOT block a switch).
 x2_cp2_recalibrate:
   - "coinc.cluster_rate_max 400 (counts evaluations; 2x sends ~3-6x more batches per burst)"
@@ -1280,7 +1277,9 @@ inject_bot:
   # /cnf/inject/snr_calibration is stale after a DM-grid change (the
   # residual |fine - true| moved), so the FIRST probe per bucket will
   # land off-target before the self-calibration converges.
-  dm_choices: [250.0, 500.0, 1000.0, 1250.0]
+  # 2x (WS-D D10): DMs across both tiers, never within 25 pc/cc of the tier boundary at 1600
+  # (the dm1600 K bucket would straddle tiers A and B).
+  dm_choices: [100.0, 300.0, 800.0, 1400.0, 2000.0, 2500.0]
   # Injected widths, NATIVE samples (1 native = 32.768 us). 32 x
   # {1,2,4,8,16} spans the detector boxcar octaves that C2 can actually
   # receive (1..16 search samples = 1.05..16.8 ms); 4 is the historical
@@ -1304,7 +1303,8 @@ inject_bot:
   # A w=1 probe at the model-equivalent fluence measured K ~ 977
   # against 2890 at w=4 -- a factor ~3 where the sqrt(width) model
   # predicts equality -- so nothing is extrapolated across widths.
-  width_choices: [4, 32, 64, 128, 256, 512]
+  # 2x: 16 native = one T_ext sample (0.524 ms) added; the 2x width cap is 512 native as in 1x.
+  width_choices: [4, 16, 32, 64, 128, 256, 512]
   # Target SNR window: comfortably above the C1 floor (c1.snr_min, 9.55
   # since 2026-10-05; 10.55 after the 2026-09-22 sigma fix, 11.0 before
   # that, and 12.0 when this window was chosen) and the C2 trigger (12,

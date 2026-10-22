@@ -161,6 +161,30 @@ def _eff_width(stats: ClusterStats) -> float:
     return float(stats.width_median)
 
 
+def _eff_width_ms(stats: ClusterStats) -> float:
+    """Effective width (peak member at >= BRIGHT_PEAK_SNR, else median) in
+    ms, using the peak member's own sample period (x2: widths downstream
+    are in the op-point's external sample, 1.048576 ms at 1x, 0.524288 ms
+    at 2x). NaN when the period is unknown, so ``*_ms`` gates fail closed
+    (no match -> the cluster falls through to a later class / log_only).
+    The ``*_samples`` keys are untouched, so 1x criteria files that keep
+    using them evaluate bit-identically (no float ms rounding at w=16)."""
+    period = float(getattr(stats, "peak_sample_period_us", 0.0) or 0.0)
+    if not (math.isfinite(period) and period > 0.0):
+        return float("nan")
+    return _eff_width(stats) * period / 1000.0
+
+
+def _width_ms_max(stats: ClusterStats, t: float) -> bool:
+    w = _eff_width_ms(stats)
+    return math.isfinite(w) and w <= t
+
+
+def _width_ms_min(stats: ClusterStats, t: float) -> bool:
+    w = _eff_width_ms(stats)
+    return math.isfinite(w) and w >= t
+
+
 def _eff_galactic_fraction(stats: ClusterStats) -> float:
     gal = float(getattr(stats, "gal_dm_max_los", float("nan")))
     if _is_bright(stats) and math.isfinite(gal) and gal > 0.0:
@@ -216,6 +240,8 @@ _REQUIRE_PREDICATES: Tuple[
     ("dm_iqr_max_pc_cc", _dm_iqr_max_snr_scaled),
     ("width_median_max_samples", lambda s, t: _eff_width(s) <= t),
     ("width_median_min_samples", lambda s, t: _eff_width(s) >= t),
+    ("width_median_max_ms", _width_ms_max),
+    ("width_median_min_ms", _width_ms_min),
     ("lm_diag_max_rad", lambda s, t: s.lm_diag_rad <= t),
     ("lm_diag_min_rad", lambda s, t: s.lm_diag_rad >= t),
     ("dm_galactic_fraction_max", _dm_galactic_fraction_max),
@@ -284,13 +310,40 @@ def _validate_class(entry: Mapping[str, Any], idx: int) -> TriggerClass:
     )
 
 
-def _load_yaml_classes(path: Path) -> List[TriggerClass]:
+def _select_opoint_section(
+    doc: Mapping[str, Any], path: Path, opoint: Optional[str],
+) -> Mapping[str, Any]:
+    """x2 op-point sections (SPEC §10): ``opoints: {<id>: {trigger_classes:
+    [...]}}``. The section is chosen by the exact op-point id (e.g.
+    ``2x-gridded-ns2-cint4``), else its family (``2x``); with no ``opoint``
+    or no matching section the top-level ``trigger_classes`` is used --
+    today's files (no ``opoints`` key) load exactly as before."""
+    if not opoint:
+        return doc
+    sections = doc.get("opoints")
+    if sections is None:
+        return doc
+    if not isinstance(sections, Mapping):
+        raise BadCriteriaFile(f"{path}: 'opoints' must be a mapping")
+    for key in (str(opoint), str(opoint).split("-", 1)[0]):
+        sec = sections.get(key)
+        if sec is not None:
+            if not isinstance(sec, Mapping):
+                raise BadCriteriaFile(f"{path}: opoints.{key} must be a mapping")
+            return sec
+    return doc
+
+
+def _load_yaml_classes(
+    path: Path, opoint: Optional[str] = None,
+) -> List[TriggerClass]:
     with path.open("r", encoding="utf-8") as f:
         doc = yaml.safe_load(f) or {}
     if not isinstance(doc, Mapping):
         raise BadCriteriaFile(
             f"{path}: top-level YAML must be a mapping; got {type(doc).__name__}"
         )
+    doc = _select_opoint_section(doc, path, opoint)
     classes = doc.get("trigger_classes")
     if classes is None:
         raise BadCriteriaFile(
@@ -330,13 +383,23 @@ class CriteriaEvaluator:
     resets all holdoffs.
     """
 
-    def __init__(self, path: Path, *, now: Optional[Any] = None) -> None:
+    def __init__(
+        self, path: Path, *, now: Optional[Any] = None,
+        opoint: Optional[str] = None,
+    ) -> None:
         self._path = Path(path)
         self._now = now or time.monotonic
+        # x2: op-point whose ``opoints.<id>`` section to load (and to keep
+        # loading on every hot reload). None = top-level classes (today).
+        self._opoint = opoint or None
         self._classes: List[TriggerClass] = []
         self._mtime: float = -1.0
         self._last_fired_at: Dict[str, float] = {}
         self._reload()
+
+    @property
+    def opoint(self) -> Optional[str]:
+        return self._opoint
 
     @property
     def path(self) -> Path:
@@ -351,11 +414,13 @@ class CriteriaEvaluator:
     def _reload(self) -> None:
         if not self._path.exists():
             raise BadCriteriaFile(f"criteria file not found: {self._path}")
-        self._classes = _load_yaml_classes(self._path)
+        self._classes = _load_yaml_classes(self._path, self._opoint)
         self._mtime = self._path.stat().st_mtime
         _LOG.info(
-            "criteria reload: %s now defines %d trigger classes (%s)",
-            self._path, len(self._classes),
+            "criteria reload: %s%s now defines %d trigger classes (%s)",
+            self._path,
+            f" [opoint {self._opoint}]" if self._opoint else "",
+            len(self._classes),
             ", ".join(c.name for c in self._classes),
         )
 
