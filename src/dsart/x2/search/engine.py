@@ -474,8 +474,8 @@ class OwnerEngine:
         return out, found
 
     def reimage_iter(self, d: int, t_lo: int, t_hi: int, *, raw: Optional[np.ndarray] = None,
-                     valid: Optional[np.ndarray] = None, batch_rows: int = 32,
-                     normalise: bool = True):
+                     valid: Optional[np.ndarray] = None, raw_row0: Optional[int] = None,
+                     batch_rows: int = 32, normalise: bool = True):
         """Re-image tier rows ``[t_lo, t_hi)`` of DM ``d`` for every fine DM,
         from a raw snapshot (``raw [S, n, row_bytes]`` covering stream rows
         ``[t_lo - max_pos, t_hi + max_neg)``) or the ring, into a private
@@ -489,6 +489,19 @@ class OwnerEngine:
         if raw is None:
             raw, valid = self.ring.wait_window(d, s_lo, s_hi - s_lo,
                                                timeout_s=self.cfg.wait_timeout_s)
+        else:
+            if valid is None:
+                valid = np.ones(raw.shape[:2], dtype=bool)
+            if raw_row0 is not None and (raw_row0 != s_lo or raw.shape[1] != s_hi - s_lo):
+                # cut the needed rows out of a larger snapshot (zero / invalid outside)
+                sub = np.zeros((raw.shape[0], s_hi - s_lo, raw.shape[2]), dtype=raw.dtype)
+                vsub = np.zeros((raw.shape[0], s_hi - s_lo), dtype=bool)
+                a = max(s_lo, raw_row0)
+                b = min(s_hi, raw_row0 + raw.shape[1])
+                if b > a:
+                    sub[:, a - s_lo:b - s_lo] = raw[:, a - raw_row0:b - raw_row0]
+                    vsub[:, a - s_lo:b - s_lo] = valid[:, a - raw_row0:b - raw_row0]
+                raw, valid = sub, vsub
         if valid is None:
             valid = np.ones(raw.shape[:2], dtype=bool)
         if self._gpu is not None and hasattr(self._gpu, "reimage_iter"):
@@ -515,8 +528,7 @@ class OwnerEngine:
             if normalise:
                 sig, _found = self.sigma_at(d, rows)
                 img = img / sig[:, :, None, None]
-            sl = np.mod(rows[None, :, None] - spec.shifts[:, None, :] - s_lo,
-                        scratch.n_slots)                                  # [F, n, S]
+            sl = scratch.slots(rows[None, :, None] - spec.shifts[:, None, :])  # [F, n, S]
             vf = float(scratch.valid[np.arange(spec.n_stream)[None, None, :], sl].mean())
             yield rows, img, vf
 
