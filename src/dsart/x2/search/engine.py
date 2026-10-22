@@ -181,8 +181,10 @@ class DmState:
         self.R_img = spec.hop + self.history
         self.R_s = spec.hop + self.history + spec.max_pos + spec.max_neg + 1
         V = int(inputs.c_v.shape[1])
-        self.streams = StreamRing(spec.n_stream, V, self.R_s)
-        self.image = np.zeros((self.R_img, spec.n_fdm, N * N), dtype=np.float16)
+        on_host = cfg.backend == "cpu"            # the GPU backend owns device rings
+        self.streams = StreamRing(spec.n_stream, V, self.R_s, with_codes=on_host)
+        self.image = (np.zeros((self.R_img, spec.n_fdm, N * N), dtype=np.float16) if on_host
+                      else None)
         self.image_hi: Optional[int] = None          # exclusive absolute row imaged
         self.image_lo: Optional[int] = None
         self.mask_scaled = (mask * image_scale).astype(np.float32)

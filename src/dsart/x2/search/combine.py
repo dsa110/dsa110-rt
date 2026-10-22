@@ -38,8 +38,11 @@ __all__ = [
 class StreamRing:
     """Host/numpy stream ring of one DM (the CPU path's K0 target)."""
 
-    def __init__(self, n_stream: int, n_values: int, n_slots: int) -> None:
-        self.codes = np.zeros((n_stream, n_values, n_slots, 2), dtype=np.int8)
+    def __init__(self, n_stream: int, n_values: int, n_slots: int, *,
+                 with_codes: bool = True) -> None:
+        # the GPU backend keeps the codes on the device: host validity only
+        self.codes = (np.zeros((n_stream, n_values, n_slots, 2), dtype=np.int8) if with_codes
+                      else None)
         self.valid = np.zeros((n_stream, n_slots), dtype=bool)
         self.n_slots = int(n_slots)
         self.loaded_hi: Optional[int] = None      # exclusive absolute row
