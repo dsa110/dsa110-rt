@@ -1393,7 +1393,8 @@ typedef struct rx4_dm_desc {
     uint32_t reorder_rows;
     uint64_t data_off;
     uint64_t tags_off;
-    uint64_t _pad[4];
+    uint64_t steps_off;      /* f32 [n_stream][t_buf][2]: step_main, step_heavy */
+    uint64_t _pad[3];
 } rx4_dm_desc_t;
 _Static_assert(sizeof(rx4_dm_desc_t) == 64, "rx4_dm_desc_t is 64 B");
 
@@ -1530,6 +1531,14 @@ rx4_tag_ptr(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq)
            + (size_t)s * dd->t_buf + (size_t)(seq % dd->t_buf);
 }
 
+static inline float *
+rx4_steps_ptr(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq)
+{
+    const rx4_dm_desc_t *dd = &r->hdr->dms[d];
+    return (float *)(r->base + dd->steps_off)
+           + 2 * ((size_t)s * dd->t_buf + (size_t)(seq % dd->t_buf));
+}
+
 static inline uint8_t *
 rx4_row_ptr(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq)
 {
@@ -1608,9 +1617,11 @@ rx4_create(const char *name, const rx4_config_t *cfg, int prefault,
 
     /* Layout. */
     uint64_t off = sizeof(rx4_header_t);
-    uint64_t tags_off[RX4_MAX_DM], data_off[RX4_MAX_DM];
+    uint64_t tags_off[RX4_MAX_DM], steps_off[RX4_MAX_DM], data_off[RX4_MAX_DM];
     for (uint32_t d = 0; d < cfg->n_dm; d++) {
         tags_off[d] = off;
+        off = rx4_round_up(off + (uint64_t)cfg->n_stream * cfg->t_buf[d] * 8, RX4_PAGE);
+        steps_off[d] = off;
         off = rx4_round_up(off + (uint64_t)cfg->n_stream * cfg->t_buf[d] * 8, RX4_PAGE);
     }
     const uint64_t data_start = off;
@@ -1680,6 +1691,7 @@ rx4_create(const char *name, const rx4_config_t *cfg, int prefault,
         dd->t_buf = cfg->t_buf[d];
         dd->reorder_rows = cfg->reorder_rows[d];
         dd->tags_off = tags_off[d];
+        dd->steps_off = steps_off[d];
         dd->data_off = data_off[d];
         r->dm_lut[cfg->dm_global[d]] = (int8_t)d;
     }
@@ -1733,13 +1745,17 @@ rx4_size(rx4_ring_t *r)
 /* One row, seqlock-style (see the section comment). src == NULL zero-fills. */
 static void
 rx4_write_row(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq,
-              const uint8_t *src, uint64_t bps, uint64_t state)
+              const uint8_t *src, uint64_t bps, uint64_t state,
+              float step_main, float step_heavy)
 {
     uint64_t *tp = rx4_tag_ptr(r, d, s, seq);
     uint8_t *row = rx4_row_ptr(r, d, s, seq);
+    float *sp = rx4_steps_ptr(r, d, s, seq);
     const uint64_t rb = r->hdr->row_bytes;
     __atomic_store_n(tp, RX4_TAG_WRITING, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
+    sp[0] = src ? step_main : 0.0f;
+    sp[1] = src ? step_heavy : 0.0f;
     if (src) {
         memcpy(row, src, bps);
         if (bps < rb) memset(row + bps, 0, rb - bps);
@@ -1769,7 +1785,7 @@ rx4_advance(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t force_until,
         if (force_until > hole_until) hole_until = force_until;
         if (hole_until > me) hole_until = me;
         if (ct >= me || ct >= hole_until) break;
-        rx4_write_row(r, d, s, ct, NULL, 0, RX4_TAG_HOLE);
+        rx4_write_row(r, d, s, ct, NULL, 0, RX4_TAG_HOLE, 0.0f, 0.0f);
         holes++;
         ct++;
     }
@@ -1798,7 +1814,7 @@ rx4_flow_reset(rx4_flow_t *f, uint64_t seq, uint64_t now_ns)
 static void
 rx4_place(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq_first,
           uint32_t k, const uint8_t *payload, uint64_t bps, uint64_t state,
-          uint64_t now_ns)
+          float step_main, float step_heavy, uint64_t now_ns)
 {
     rx4_header_t *h = r->hdr;
     rx4_flow_t *f = &h->flows[d][s];
@@ -1836,7 +1852,7 @@ rx4_place(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq_first,
             continue;
         }
         rx4_write_row(r, d, s, seq, payload ? payload + (size_t)i * bps : NULL,
-                      bps, state);
+                      bps, state, step_main, step_heavy);
         written++;
     }
     if (written)
@@ -1920,7 +1936,8 @@ rx4_ingest(rx4_ring_t *r, const uint8_t *buf, size_t len, uint64_t now_ns,
         if (fl & F2_FLAG_NOISE_WARM) state |= RX4_TAG_NOISE_WARM;
     }
     rx4_place(r, (uint32_t)d, fh.stream_id, fh.seq_first, fh.k,
-              mismatch ? NULL : buf + F2_HDR, bps, state, now_ns);
+              mismatch ? NULL : buf + F2_HDR, bps, state,
+              fh.step_main, fh.step_heavy, now_ns);
     if (mismatch) REJECT(RX4_C_PATTERN_MISMATCH);
     rx4_cadd(h, RX4_C_OK, 1);
     return RX4_C_OK;
@@ -1988,6 +2005,7 @@ rx4_abi(uint64_t *out, uint32_t n)
         F2_HDR,
         sizeof(rx4_config_t),
         offsetof(rx4_flow_t, gap_since_ns),
+        offsetof(rx4_dm_desc_t, steps_off),
     };
     const uint32_t m = (uint32_t)(sizeof(v) / sizeof(v[0]));
     if (out)
@@ -2083,8 +2101,8 @@ rx4_window_validity(const void *base, uint32_t d, uint64_t t_first,
  * is not PRESENT (or is lapped during the copy) is zero-filled. */
 int
 rx4_copy_window(const void *base, uint32_t d, uint64_t t_first,
-                uint32_t n_rows, uint8_t *out_rows, uint8_t *out_v,
-                uint64_t *out_counts)
+                uint32_t n_rows, uint8_t *out_rows, float *out_steps,
+                uint8_t *out_v, uint64_t *out_counts)
 {
     const rx4_header_t *h = (const rx4_header_t *)base;
     if (!rx4_reader_ok(h, d) || !out_v || !out_rows) return -1;
@@ -2094,6 +2112,7 @@ rx4_copy_window(const void *base, uint32_t d, uint64_t t_first,
     if (n_rows > tb) return -2;
     const uint64_t *tags = (const uint64_t *)((const uint8_t *)base + dd->tags_off);
     const uint8_t *data = (const uint8_t *)base + dd->data_off;
+    const float *steps = (const float *)((const uint8_t *)base + dd->steps_off);
     uint64_t c[8] = {0};
     for (uint32_t s = 0; s < h->n_stream; s++) {
         const uint64_t me = __atomic_load_n(&h->flows[d][s].max_end, __ATOMIC_ACQUIRE);
@@ -2103,16 +2122,20 @@ rx4_copy_window(const void *base, uint32_t d, uint64_t t_first,
             const uint64_t t1 = __atomic_load_n(&tags[idx], __ATOMIC_ACQUIRE);
             uint8_t v = rx4_classify(t1, seq, me, tb);
             uint8_t *dst = out_rows + ((size_t)s * n_rows + i) * rb;
+            float *sdst = out_steps ? out_steps + 2 * ((size_t)s * n_rows + i) : NULL;
             if (v & RX4_RV_PRESENT) {
                 memcpy(dst, data + idx * rb, rb);
+                if (sdst) { sdst[0] = steps[2 * idx]; sdst[1] = steps[2 * idx + 1]; }
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);
                 const uint64_t t2 = __atomic_load_n(&tags[idx], __ATOMIC_RELAXED);
                 if (t2 != t1) {
                     v = RX4_RV_LAPPED;
                     memset(dst, 0, rb);
+                    if (sdst) { sdst[0] = 0.0f; sdst[1] = 0.0f; }
                 }
             } else {
                 memset(dst, 0, rb);
+                if (sdst) { sdst[0] = 0.0f; sdst[1] = 0.0f; }
             }
             out_v[(size_t)s * n_rows + i] = v;
             rx4_count(c, v);

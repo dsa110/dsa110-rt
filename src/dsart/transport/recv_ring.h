@@ -269,8 +269,8 @@ int rx4_scan(const void *base, uint32_t dm_local, uint64_t *out_complete_through
 int rx4_window_validity(const void *base, uint32_t dm_local, uint64_t t_first,
                         uint32_t n_rows, uint8_t *out_validity, uint64_t *out_counts);
 int rx4_copy_window(const void *base, uint32_t dm_local, uint64_t t_first,
-                    uint32_t n_rows, uint8_t *out_rows, uint8_t *out_validity,
-                    uint64_t *out_counts);
+                    uint32_t n_rows, uint8_t *out_rows, float *out_steps,
+                    uint8_t *out_validity, uint64_t *out_counts);
 int rx4_recheck(const void *base, uint32_t dm_local, uint64_t t_first,
                 uint32_t n_rows, uint8_t *validity, uint64_t *out_n_changed);
 
