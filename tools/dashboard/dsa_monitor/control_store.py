@@ -153,6 +153,31 @@ class ControlStore:
         self._ensure()
         return self._store.get_dict(key)
 
+    def put_dicts_atomic(self, items: list[tuple[str, Any]]) -> str:
+        """Write several keys in ONE etcd transaction (x2 op-point switch).
+
+        Same JSON encoding as ``DsaStore.put_dict`` (strict: no NaN/inf).
+        Falls back to sequential puts when the client has no transaction
+        support; returns ``"txn"`` or ``"sequential"``.
+        """
+        self._ensure()
+        payloads = [(k, json.dumps(v, allow_nan=False)) for k, v in items]
+        client = None
+        try:
+            client = self._store.get_etcd()
+        except Exception:                                          # noqa: BLE001
+            client = None
+        if client is not None and hasattr(client, "transaction") \
+                and hasattr(client, "transactions"):
+            ops = [client.transactions.put(k, v) for k, v in payloads]
+            ok, _ = client.transaction(compare=[], success=ops, failure=[])
+            if not ok:
+                raise RuntimeError("etcd transaction was not applied")
+            return "txn"
+        for k, v in items:
+            self._store.put_dict(k, v)
+        return "sequential"
+
 
 # ---------------------------------------------------------------------------
 # Verb senders — keep the payload shape bit-identical to the ops scripts
@@ -1322,6 +1347,10 @@ def control_start_fleet(
     *,
     obs_dec_deg: float | None = None,
     user: str | None = None,
+    opoint: str | None = None,
+    reapply_opoint: bool = False,
+    pre_start: Any = None,
+    opoint_switcher: Any = None,
 ) -> dict[str, Any]:
     """Start the corr fleet via broadcast + each search node via
     fanout. Returns a dict the Flask layer can serialise to JSON.
@@ -1329,24 +1358,71 @@ def control_start_fleet(
     ``obs_dec_deg`` is the declination passed as the ``start`` verb's
     ``val``. ``None`` means "let the orchestrator resolve from
     ``/mon/array/dec``" (M7.4 ``CUSTOMDEC`` fallback).
+
+    ``opoint`` (x2, docs/x2/SPEC.md §10): ``None`` = today's behaviour
+    exactly. Otherwise :func:`opoint_switch.switch_opoint` runs first: when
+    ``opoint`` differs from ``/cnf/opoint`` (or ``reapply_opoint``) it
+    requires the fleet stopped, copies ``/cnf/opoints/<op>/*`` to the live
+    configs, sets ``/cnf/opoint``, restarts the h23 services and waits for
+    them; if anything fails the Start is refused (``ok=False``, nothing
+    broadcast). ``pre_start`` (the node housekeeping) runs after a
+    successful switch and before the broadcast; its failure never blocks
+    the start.
     """
     val = float(obs_dec_deg) if obs_dec_deg is not None else None
+    switch: dict[str, Any] | None = None
+    if opoint is not None:
+        if opoint_switcher is None:
+            import opoint_switch as _ops                            # local
+            opoint_switcher = _ops.switch_opoint
+        switch = opoint_switcher(store, opoint, user=user, reapply=bool(reapply_opoint))
+        if not switch.get("ok"):
+            err = f"op-point {opoint}: {switch.get('error', 'switch failed')}"
+            audit_log(
+                store, namespace="corr_rt+search_rt",
+                cn_target="0+1,2,9,13",
+                cmd="start", val=val, ok=False,
+                note=f"refused, nothing broadcast: {err}"[:900],
+                user=user,
+            )
+            return {
+                "ok": False,
+                "cmd": "start",
+                "val": val,
+                "error": err,
+                "opoint": opoint,
+                "opoint_switch": switch,
+            }
+    pre: Any = None
+    if pre_start is not None:
+        try:
+            pre = pre_start()
+        except Exception as exc:                                   # noqa: BLE001
+            LOG.exception("pre-start hook failed (continuing)")
+            pre = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     corr_key = broadcast_corr(store, cmd="start", val=val)
     search_keys = fanout_search(store, cmd="start", val=val)
     audit_log(
         store, namespace="corr_rt+search_rt",
         cn_target="0+1,2,9,13",
         cmd="start", val=val, ok=True,
-        note=f"corr={corr_key} search={search_keys}",
+        note=f"corr={corr_key} search={search_keys}"
+        + (f" opoint={opoint}" if opoint is not None else ""),
         user=user,
     )
-    return {
+    out: dict[str, Any] = {
         "ok": True,
         "cmd": "start",
         "val": val,
         "corr_broadcast_key": corr_key,
         "search_fanout_keys": search_keys,
     }
+    if opoint is not None:
+        out["opoint"] = opoint
+        out["opoint_switch"] = switch
+    if pre_start is not None:
+        out["node_cleanup"] = pre
+    return out
 
 
 def control_stop_fleet(

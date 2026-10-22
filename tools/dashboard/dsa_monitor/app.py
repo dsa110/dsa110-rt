@@ -1323,6 +1323,14 @@ def control_page():
         LOG.warning("spl freq map: %s", exc)
         spl_chgroup_freqs = {}
         spl_raw_chan_khz = 0.030517578125 * 1.0e3    # native Δν fallback
+    # x2 op-point selector default = the active op-point (fallback 1x).
+    try:
+        import opoint_switch                                        # local
+        opoint_choices = list(opoint_switch.OPOINT_CHOICES)
+        opoint_current = opoint_switch.opoint_banner(control_store)["active"]
+    except Exception as exc:                                        # noqa: BLE001
+        LOG.warning("opoint_banner: %s", exc)
+        opoint_choices, opoint_current = ["1x", "1x-legacy", "2x"], "1x"
     return render_template(
         "control.html",
         active_tab="control",
@@ -1342,6 +1350,8 @@ def control_page():
         spl_chgroup_freqs=spl_chgroup_freqs,
         spl_raw_chan_khz=spl_raw_chan_khz,
         h23_dsart_units=list(H23_DSART_UNITS),
+        opoint_choices=opoint_choices,
+        opoint_current=opoint_current,
     )
 
 
@@ -1430,6 +1440,11 @@ def control_system_state():
         }), 200
     st["ok"] = True
     st.update(_banner_extras())
+    try:
+        import opoint_switch                                       # local
+        st["opoint"] = opoint_switch.opoint_banner(control_store)
+    except Exception as exc:                                       # noqa: BLE001
+        LOG.warning("opoint_banner: %s", exc)
     return jsonify(st)
 
 
@@ -1477,39 +1492,60 @@ def control_start_post():
 
     user = request.form.get("user") or request.remote_addr or "anon"
 
+    # x2 op-point selector (docs/x2/SPEC.md §10). Absent = today's start
+    # exactly; present = switch first if it differs from /cnf/opoint (fleet
+    # must be stopped), see opoint_switch.switch_opoint.
+    import opoint_switch                                             # local
+    opoint = request.form.get("opoint", "").strip() or None
+    if opoint is not None and opoint not in opoint_switch.OPOINT_CHOICES:
+        return jsonify({
+            "ok": False,
+            "error": f"opoint={opoint!r}: not one of {list(opoint_switch.OPOINT_CHOICES)}",
+        }), 400
+    reapply = request.form.get("reapply_opoint", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
     # Start-time housekeeping: wipe the accumulated "safe to delete on
     # restart" ephemera on every corr + search node BEFORE the start
-    # verb fans out. h23 (the candidate/CSV archive) is never touched.
-    # Best-effort — a cleanup failure must never block the start.
+    # verb fans out (and after a successful op-point switch). h23 (the
+    # candidate/CSV archive) is never touched. Best-effort — a cleanup
+    # failure must never block the start.
     import fleet_services                                            # local
-    try:
-        node_cleanup = fleet_services.cleanup_nodes_for_start()
-    except Exception as exc:                                         # noqa: BLE001
-        LOG.exception("start-time node cleanup failed (continuing)")
-        node_cleanup = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    try:
-        audit_log(
-            control_store, namespace="corr_rt+search_rt", cn_target="all",
-            cmd="start_cleanup", val=None, ok=bool(node_cleanup.get("ok")),
-            note=(
-                f"n_ok={node_cleanup.get('n_ok')} "
-                f"n_failed={node_cleanup.get('n_failed')}"
-            ),
-            user=user,
-        )
-    except Exception:                                               # noqa: BLE001
-        LOG.exception("start_cleanup audit_log failed (continuing)")
+    node_cleanup: dict[str, Any] = {"ok": False, "error": "not run"}
+
+    def _cleanup() -> dict[str, Any]:
+        nonlocal node_cleanup
+        try:
+            node_cleanup = fleet_services.cleanup_nodes_for_start()
+        except Exception as exc:                                     # noqa: BLE001
+            LOG.exception("start-time node cleanup failed (continuing)")
+            node_cleanup = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            audit_log(
+                control_store, namespace="corr_rt+search_rt", cn_target="all",
+                cmd="start_cleanup", val=None, ok=bool(node_cleanup.get("ok")),
+                note=(
+                    f"n_ok={node_cleanup.get('n_ok')} "
+                    f"n_failed={node_cleanup.get('n_failed')}"
+                ),
+                user=user,
+            )
+        except Exception:                                           # noqa: BLE001
+            LOG.exception("start_cleanup audit_log failed (continuing)")
+        return node_cleanup
 
     try:
         result = control_start_fleet(
             control_store, obs_dec_deg=obs_dec, user=user,
+            opoint=opoint, reapply_opoint=reapply, pre_start=_cleanup,
         )
     except Exception as exc:                                         # noqa: BLE001
         LOG.exception("control verb control_start_fleet failed")
         try:
             audit_log(
                 control_store, namespace="control", cn_target="-",
-                cmd="control_start_fleet", val={"obs_dec_deg": obs_dec},
+                cmd="control_start_fleet",
+                val={"obs_dec_deg": obs_dec, "opoint": opoint},
                 ok=False, note=f"exception: {exc!r}", user=user,
             )
         except Exception:                                           # noqa: BLE001
@@ -1517,8 +1553,21 @@ def control_start_post():
         return jsonify({
             "ok": False, "error": str(exc), "node_cleanup": node_cleanup,
         }), 500
-    result["node_cleanup"] = node_cleanup
+    if not result.get("ok"):
+        return jsonify(result), 409
     return jsonify(result)
+
+
+@app.route("/control/opoint", methods=["GET"])
+def control_opoint_get():
+    """x2 op-point status: active op-point, live-config stamps, and whether
+    each stored set (/cnf/opoints/<op>/*) is switchable."""
+    import opoint_switch                                             # local
+    try:
+        return jsonify(dict(opoint_switch.opoint_status(control_store), ok=True))
+    except Exception as exc:                                         # noqa: BLE001
+        LOG.exception("opoint_status failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/control/stop", methods=["POST"])

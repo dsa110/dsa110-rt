@@ -217,6 +217,17 @@
                 <input type="text" id="obs_dec_deg" name="obs_dec_deg"
                        placeholder="(auto from etcd)"
                        oninput="scheduleFstStatusRefresh();" />
+                <!-- x2 op-point selector (docs/x2/SPEC.md §10). Default =
+                     the active op-point (/cnf/opoint, absent = 1x). -->
+                <label for="opoint">op-point</label>
+                <select id="opoint" name="opoint" data-current="{{ opoint_current }}">
+                    {% for op in opoint_choices %}
+                    <option value="{{ op }}" {% if op == opoint_current %}selected{% endif %}>{{ op }}{% if op == opoint_current %} (active){% endif %}</option>
+                    {% endfor %}
+                </select>
+                <label title="rewrite the live configs from /cnf/opoints/&lt;op&gt; even if the op-point is unchanged">
+                    <input type="checkbox" id="reapply_opoint" name="reapply_opoint" value="true" /> re-apply
+                </label>
                 <button type="submit">Start fleet</button>
                 <!-- Traffic light: fringe-stopping table presence for
                      the operator's (or etcd-derived) DEC. RED means
@@ -242,6 +253,16 @@
                 <code>/cmd/corr_rt/0</code> + per-cn fanout to
                 <code>/cmd/search_rt/{1,2,9,13}</code>. Leave dec blank to
                 use <code>/mon/array/dec</code> (the CUSTOMDEC fallback).
+                <br><strong>op-point</strong>: choosing a different op-point
+                (or ticking re-apply) first requires the fleet
+                <strong>stopped</strong> (READY), copies
+                <code>/cnf/opoints/&lt;op&gt;/{pipeline_rt,search_rt}</code>
+                to the live configs, sets <code>/cnf/opoint</code>, restarts
+                <code>dsart_c2</code>, <code>dsart_c3</code>,
+                <code>dsart_inject_bot</code>, <code>hiplot_c1</code>,
+                <code>hiplot_c2</code> and waits for them to be healthy
+                (~30&ndash;90 s) before starting. Any failure refuses the
+                start and rolls back. Status: <a href="/control/opoint">/control/opoint</a>.
             </div>
             <div id="resp-start" class="response"></div>
         </form>
@@ -726,6 +747,25 @@ async function guardedStart(event) {
     // submitVerb() at the end of this function, calling it again here
     // is harmless/idempotent).
     event.preventDefault();
+    // x2 op-point switch speed bump: a different op-point (or re-apply)
+    // stops nothing by itself but needs the fleet stopped and restarts the
+    // h23 C2/C3/bot/hiplot services before the start.
+    const opSel = document.getElementById("opoint");
+    const reapplyEl = document.getElementById("reapply_opoint");
+    if (opSel) {
+        const cur = opSel.dataset.current || "1x";
+        const want = opSel.value;
+        if (want !== cur || (reapplyEl && reapplyEl.checked)) {
+            const ok = window.confirm(
+                (want !== cur ? "Switch op-point " + cur + " -> " + want
+                              : "Re-apply op-point " + want) +
+                "?\n\nRequires the fleet STOPPED (READY). Copies /cnf/opoints/" + want +
+                " to /cnf/pipeline_rt + /cnf/search_rt, sets /cnf/opoint, restarts " +
+                "dsart_c2, dsart_c3, dsart_inject_bot, hiplot_c1, hiplot_c2, waits for " +
+                "them (~30-90 s), then starts. Any failure refuses the start and rolls back.");
+            if (!ok) return false;
+        }
+    }
     const lightEl = document.getElementById("fst-light");
     let cls = (lightEl && lightEl.className) || "";
     // Pull fresh status synchronously so a stale 60-s-old light
@@ -773,7 +813,38 @@ async function guardedStart(event) {
         // status endpoint; surface it but proceed.
         console.warn("guardedStart: status fetch failed:", err);
     }
-    return submitVerb(event, '/control/start', 'resp-start');
+    return submitStart(event);
+}
+
+// Like submitVerb, but a refused start (e.g. an op-point switch that could
+// not run) stays on screen instead of vanishing in the 1.5 s reload.
+async function submitStart(ev) {
+    const form = ev.target;
+    const respEl = document.getElementById("resp-start");
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    const sw = document.getElementById("opoint");
+    const switching = sw && (sw.value !== (sw.dataset.current || "1x") ||
+        (document.getElementById("reapply_opoint") || {}).checked);
+    respEl.innerHTML = "<span class='muted'>" +
+        (switching ? "switching op-point (restarting h23 services, up to ~2 min)…" : "sending…") +
+        "</span>";
+    let j;
+    try {
+        const r = await fetch("/control/start", { method: "POST", body: new FormData(form) });
+        j = await r.json();
+    } catch (e) {
+        respEl.innerHTML = "<span class='err'>request failed: " + e + "</span>";
+        btn.disabled = false;
+        return false;
+    }
+    respEl.innerHTML =
+        "<span class='" + (j.ok ? "ok" : "err") + "'>" + (j.ok ? "OK" : "REFUSED") +
+        "</span>" + (j.error ? " <strong>" + String(j.error).replace(/</g, "&lt;") + "</strong>" : "") +
+        "<div class='info-blob'>" + JSON.stringify(j, null, 2).replace(/</g, "&lt;") + "</div>";
+    btn.disabled = false;
+    if (j.ok) setTimeout(() => location.reload(), 1500);
+    return false;
 }
 </script>
 
@@ -2845,6 +2916,16 @@ function _renderBannerChips(j) {
     if (!el) return;
     if (!j) { el.innerHTML = ""; return; }
     const out = [];
+    if (j.opoint && j.opoint.active) {
+        // x2 op-point: amber when the live configs do not carry the active
+        // op-point's stamp, or while a switch is in progress.
+        const o = j.opoint;
+        let txt = o.active + (o.switching ? " (switching)" : "");
+        if (o.consistent === false) txt += " / live config " +
+            JSON.stringify(o.live_stamps).replace(/"/g, "");
+        out.push(_chip("op-point", txt,
+                       (o.consistent === false || o.switching || o.warning) ? "warn" : "info"));
+    }
     if (j.dumps_enabled !== undefined) {
         out.push(_chip("c2 dumps", j.dumps_enabled ? "ON" : "SUPPRESSED",
                        j.dumps_enabled ? "on" : "off"));
