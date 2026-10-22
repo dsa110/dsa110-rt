@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -49,7 +50,6 @@ import numpy as np
 
 from .candidates import (NOISE_WARMUP_FLAG, PARTIAL_FANIN_FLAG, Candidate2x,
                          decode_chunkmax, merge_c1)
-from .codec import RowFormat
 from .combine import StreamRing, k0_rows_to_ring, k1_twin
 from .csr import OwnerCsr, expected_image_sigma
 from .fft import FftPlan, image_from_uv_torch, image_from_uv_twin
@@ -101,6 +101,7 @@ class EngineConfig:
     backend: str = "cpu"
     rows_per_batch: int = 64
     wait_timeout_s: Optional[float] = 0.0
+    sigma_history_cycles: int = 160          # >= 30 s of 201 ms cycles
 
     @classmethod
     def compat_1x(cls, **kw) -> "EngineConfig":
@@ -117,11 +118,12 @@ class EngineConfig:
 class DmInputs:
     """Static per-DM inputs: row format, owner CSR and decode constants."""
 
-    fmt: RowFormat
+    fmt: object                  # RowFormat or codec.StreamFormats (per stream)
     csr: OwnerCsr
     c_v: np.ndarray              # [S, V] float32
     offset: float = 0.0
     value_sigma: Optional[list] = None   # per stream [V] decoded per-component std
+    pattern_id: Optional[int] = None     # value-map pattern_id (SPEC §3)
 
 
 @dataclass
@@ -203,6 +205,9 @@ class DmState:
         self.layer2._s_k.copy_(torch.as_tensor(bank.seeds, dtype=self.layer2._s_k.dtype))
         self.sigma_prev: Optional[np.ndarray] = None
         self.cycles = 0
+        # applied Layer-1 sigma per detected centre range, >= 30 s (cutouts
+        # are normalised with the sigma used at detection, SPEC §9)
+        self.sigma_history: "deque" = deque(maxlen=int(cfg.sigma_history_cycles))
 
     # ------------------------------------------------------------------
     def stream_rows_needed(self, img_lo: int, img_hi: int) -> tuple:
@@ -240,8 +245,8 @@ class OwnerEngine:
             scale = self._image_scale(inp)
             st = DmState(spec, inp, self.cfg, self.bank, mask, scale)
             self.states[spec.d] = st
-            self.build_status[spec.d] = dict(ok=True, pattern_id=inp.csr.pattern_id,
-                                             **st.summary())
+            pid = inp.pattern_id if inp.pattern_id is not None else inp.csr.pattern_id
+            self.build_status[spec.d] = dict(ok=True, pattern_id=pid, **st.summary())
         missing = [d for d, s in self.build_status.items() if not s["ok"]]
         if missing:
             # Fail loudly: a half must never run deaf to part of its DMs
@@ -386,6 +391,7 @@ class OwnerEngine:
         else:
             raise ValueError(f"layer1_mode={cfg.layer1_mode!r}")
         st.sigma_prev = sigma_new
+        st.sigma_history.append((t0 - st.delay, t1 - st.delay, np.asarray(sigma_applied).copy()))
         tm["layer1_ms"] = 1e3 * (time.perf_counter() - a)
         s_k_applied = st.layer2._s_k.detach().cpu().numpy().astype(np.float64)
         a = time.perf_counter()
@@ -425,6 +431,79 @@ class OwnerEngine:
                              valid_fraction=vfrac, warming_up=bool(warming), candidates=cands,
                              best=best if keep_maps else None, tk=tk if keep_maps else None,
                              timings_ms=tm)
+
+    # ------------------------------------------------------------------
+    # on-demand re-imaging (cutouts, SPEC §9) -- never touches live state
+    # ------------------------------------------------------------------
+    def sigma_at(self, d: int, rows: np.ndarray) -> tuple:
+        """Layer-1 sigma applied at detection for tier rows ``rows``:
+        ``(sigma [len(rows), F], found bool [len(rows)])``; rows outside the
+        kept history take the nearest cycle's sigma (``found`` False)."""
+        st = self.states[d]
+        rows = np.asarray(rows, dtype=np.int64)
+        hist = list(st.sigma_history)
+        F = st.spec.n_fdm
+        out = np.ones((rows.size, F))
+        found = np.zeros(rows.size, dtype=bool)
+        if not hist:
+            return out, found
+        lo = np.array([h[0] for h in hist])
+        hi = np.array([h[1] for h in hist])
+        for i, r in enumerate(rows):
+            j = np.nonzero((lo <= r) & (r < hi))[0]
+            if j.size:
+                out[i] = hist[int(j[-1])][2]
+                found[i] = True
+            else:
+                out[i] = hist[int(np.argmin(np.minimum(np.abs(lo - r), np.abs(hi - 1 - r))))][2]
+        return out, found
+
+    def reimage_iter(self, d: int, t_lo: int, t_hi: int, *, raw: Optional[np.ndarray] = None,
+                     valid: Optional[np.ndarray] = None, batch_rows: int = 32,
+                     normalise: bool = True):
+        """Re-image tier rows ``[t_lo, t_hi)`` of DM ``d`` for every fine DM,
+        from a raw snapshot (``raw [S, n, row_bytes]`` covering stream rows
+        ``[t_lo - max_pos, t_hi + max_neg)``) or the ring, into a private
+        scratch stream ring (the live DM state is untouched; on the GPU this
+        runs on the low-priority stream). Yields ``(rows, images, valid_frac)``
+        batches, ``images [n, F, N, N]`` float32, divided by the Layer-1
+        sigma applied at detection when ``normalise``."""
+        st = self.states[d]
+        spec = st.spec
+        s_lo, s_hi = t_lo - spec.max_pos, t_hi + spec.max_neg
+        if raw is None:
+            raw, valid = self.ring.wait_window(d, s_lo, s_hi - s_lo,
+                                               timeout_s=self.cfg.wait_timeout_s)
+        if valid is None:
+            valid = np.ones(raw.shape[:2], dtype=bool)
+        if self._gpu is not None and hasattr(self._gpu, "reimage_iter"):
+            yield from self._gpu.reimage_iter(st, t_lo, t_hi, raw, valid, s_lo, batch_rows,
+                                              normalise)
+            return
+        scratch = StreamRing(spec.n_stream, int(st.inp.c_v.shape[1]), s_hi - s_lo + 1)
+        k0_rows_to_ring(scratch, raw, valid, row0=int(s_lo), fmt=st.inp.fmt)
+        N = self.cfg.n_grid
+        for r0 in range(t_lo, t_hi, batch_rows):
+            n = min(batch_rows, t_hi - r0)
+            uv = k1_twin(scratch.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
+                         shifts=spec.shifts, t_lo=r0, n_t=n)
+            uvb = np.ascontiguousarray(np.swapaxes(uv, 0, 1)).reshape(n * spec.n_fdm, -1)
+            if self.cfg.fft_mode == "twin":
+                img = image_from_uv_twin(uvb, st.fft, st.mask_scaled, out_dtype=np.float16)
+            else:
+                import torch
+                img = image_from_uv_torch(torch.from_numpy(uvb), st.fft,
+                                          torch.from_numpy(st.mask_scaled),
+                                          mode=self.cfg.fft_mode).numpy().astype(np.float16)
+            img = img.astype(np.float32).reshape(n, spec.n_fdm, N, N)
+            rows = np.arange(r0, r0 + n)
+            if normalise:
+                sig, _found = self.sigma_at(d, rows)
+                img = img / sig[:, :, None, None]
+            sl = np.mod(rows[None, :, None] - spec.shifts[:, None, :] - s_lo,
+                        scratch.n_slots)                                  # [F, n, S]
+            vf = float(scratch.valid[np.arange(spec.n_stream)[None, None, :], sl].mean())
+            yield rows, img, vf
 
     # ------------------------------------------------------------------
     def detector_input(self, d: int, t_lo: int, t_hi: int, sigma: np.ndarray) -> np.ndarray:

@@ -209,21 +209,37 @@ def ref_layer1(img: np.ndarray, active: np.ndarray, *, sample_idx: Optional[np.n
 # ---------------------------------------------------------------------------
 
 
+def _box_axis0(x: np.ndarray, w: int) -> np.ndarray:
+    """Trailing box sum along axis 0 (zeros before row 0): out[e] = sum x[e-w+1 .. e]."""
+    P = np.concatenate([np.zeros((1,) + x.shape[1:]), np.cumsum(x, axis=0)], axis=0)
+    lo = np.maximum(np.arange(x.shape[0]) + 1 - w, 0)
+    return P[1:] - P[lo]
+
+
 def ref_filter_scores(x_norm: np.ndarray, row0: int, filters: Sequence[RefFilter],
                       centres: Sequence[int]) -> np.ndarray:
     """Filter outputs ``[K, n_c, F, N, N]`` at absolute centres.
 
     ``x_norm [R, F, N, N]`` is the clipped, sigma-normalised input; row ``i``
-    is absolute row ``row0 + i``; rows outside are zero.
+    is absolute row ``row0 + i``; rows outside are zero. Each B-spline is
+    evaluated as ``m`` cascaded float64 prefix-sum box filters over the
+    whole (zero-extended) row axis, then read at the window end
+    ``c - a + L - 1`` (independent of the engine's fp32 running sums).
     """
     centres = np.asarray(centres, dtype=np.int64)
     R = x_norm.shape[0]
     out = np.zeros((len(filters), centres.size) + x_norm.shape[1:], dtype=np.float64)
+    order = {"b": 1, "t": 2, "g": 3}
+    pad = max(f.length for f in filters)
+    xp = np.concatenate([np.asarray(x_norm, dtype=np.float64),
+                         np.zeros((pad,) + x_norm.shape[1:])], axis=0)
     for k, flt in enumerate(filters):
-        for j, tap in enumerate(flt.taps):
-            rows = centres - flt.a + j - row0
-            ok = (rows >= 0) & (rows < R)
-            out[k, ok] += tap * x_norm[rows[ok]]
+        y = xp
+        for _ in range(order[flt.family]):
+            y = _box_axis0(y, flt.width)
+        e = centres - flt.a + flt.length - 1 - row0
+        ok = (e >= 0) & (e < R + pad)
+        out[k, ok] = y[e[ok]]
     return out
 
 
@@ -235,12 +251,17 @@ def ref_chunk_max(snr: np.ndarray, chunk: int = 64) -> tuple:
     """
     K, n_c = snr.shape[:2]
     n_ch = n_c // chunk
-    v = snr[:, :n_ch * chunk].reshape((K, n_ch, chunk) + snr.shape[2:])
-    v = np.moveaxis(v, 0, 2)                                     # [n_ch, chunk, K, ...]
-    flat = v.reshape((n_ch, chunk * K) + snr.shape[2:])
-    arg = np.argmax(flat, axis=1)                                # first max = earliest (t, k)
-    mx = np.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
-    return mx, arg // K, arg % K
+    mx = np.empty((n_ch,) + snr.shape[2:])
+    tin = np.empty((n_ch,) + snr.shape[2:], dtype=np.int64)
+    kk = np.empty((n_ch,) + snr.shape[2:], dtype=np.int64)
+    for ci in range(n_ch):
+        v = np.moveaxis(snr[:, ci * chunk:(ci + 1) * chunk], 0, 1)     # [chunk, K, ...]
+        flat = v.reshape((chunk * K,) + snr.shape[2:])
+        arg = np.argmax(flat, axis=0)                                  # earliest (t, k)
+        mx[ci] = np.take_along_axis(flat, arg[None], axis=0)[0]
+        tin[ci] = arg // K
+        kk[ci] = arg % K
+    return mx, tin, kk
 
 
 def ref_decode_topk(score: np.ndarray, *, threshold: float, n_top: int,
@@ -285,9 +306,10 @@ class RefCycleResult:
     image: np.ndarray        # [T, F, N, N] scaled masked image (float64)
     sigma: np.ndarray        # [F] Layer-1 sigma used
     x_norm: np.ndarray       # [T, F, N, N] clip(image / sigma)
-    scores: np.ndarray       # [K, n_c, F, N, N] raw filter outputs
-    snr: np.ndarray          # scores / s_k
-    chunk_max: tuple         # (max, t_in_chunk, k)
+    scores: Optional[np.ndarray]   # [K, n_c, F, N, N] raw filter outputs (keep_scores)
+    full_max: np.ndarray     # [n_c, F, N, N] max over filters of score / s_k
+    full_k: np.ndarray       # winning filter (first on ties)
+    chunk_max: tuple         # (max, t_in_chunk, k), ties -> earliest centre, lowest k
     centres: np.ndarray
     image_rows: np.ndarray
     candidates: list = field(default_factory=list)
@@ -314,6 +336,7 @@ def ref_search_cycle(
     threshold: float = 9.55,
     n_top: int = 224,
     decode: str = "chunk",
+    keep_scores: bool = False,
 ) -> RefCycleResult:
     """Reference for one owner cycle of one DM.
 
@@ -333,10 +356,28 @@ def ref_search_cycle(
     sigma = np.asarray(sigma, dtype=np.float64)
     x = np.clip(img / sigma[None, :, None, None], -clip, clip)
     centres = np.arange(t0 - delay, t0 + hop - delay)
-    scores = ref_filter_scores(x, int(rows[0]), filters, centres)
-    snr = scores / np.asarray(s_k, dtype=np.float64)[:, None, None, None, None]
-    cm = ref_chunk_max(snr, chunk)
-    mx, tin, kk = cm
+    s_k = np.asarray(s_k, dtype=np.float64)
+    full = None
+    kfull = None
+    scores = [] if keep_scores else None
+    for k, flt in enumerate(filters):                      # max over filters, first k on ties
+        sc = ref_filter_scores(x, int(rows[0]), [flt], centres)[0]
+        if keep_scores:
+            scores.append(sc)
+        v = sc / s_k[k]
+        if full is None:
+            full, kfull = v, np.zeros(v.shape, dtype=np.int64)
+        else:
+            b = v > full
+            full = np.where(b, v, full)
+            kfull = np.where(b, k, kfull)
+    n_ch = hop // chunk
+    fv = full[:n_ch * chunk].reshape((n_ch, chunk) + full.shape[1:])
+    arg = np.argmax(fv, axis=1)                             # earliest centre on ties
+    mx = np.take_along_axis(fv, arg[:, None], axis=1)[:, 0]
+    kk = np.take_along_axis(kfull[:n_ch * chunk].reshape(fv.shape), arg[:, None], axis=1)[:, 0]
+    cm = (mx, arg, kk)
+    tin = arg
     cands = []
     if decode == "chunk":
         def t_of(ci, f, l_, m_):
@@ -347,8 +388,6 @@ def ref_search_cycle(
             ci = (tt - int(centres[0])) // chunk
             cands.append(dict(t=tt, f=f, l=l_, m=m_, snr=v, k=int(kk[ci, f, l_, m_])))
     elif decode == "full":
-        full = snr.max(axis=0)
-        kfull = snr.argmax(axis=0)
         raw = ref_decode_topk(full, threshold=threshold, n_top=n_top,
                               t_of=lambda t, f, l_, m_: int(centres[t]))
         for (tt, f, l_, m_, v) in raw:
@@ -356,8 +395,11 @@ def ref_search_cycle(
                               k=int(kfull[tt - int(centres[0]), f, l_, m_])))
     else:
         raise ValueError(f"decode={decode!r}")
-    return RefCycleResult(G=G, image=img, sigma=sigma, x_norm=x, scores=scores, snr=snr,
-                          chunk_max=cm, centres=centres, image_rows=rows, candidates=cands)
+    if keep_scores:
+        scores = np.stack(scores)
+    return RefCycleResult(G=G, image=img, sigma=sigma, x_norm=x, scores=scores, full_max=full,
+                          full_k=kfull, chunk_max=cm, centres=centres, image_rows=rows,
+                          candidates=cands)
 
 
 # ---------------------------------------------------------------------------
@@ -403,10 +445,13 @@ def inject_dispersed_burst(values: Sequence[np.ndarray], cells: Sequence[np.ndar
                 val[r] += vis
 
 
-def quantize_rowrule(y: np.ndarray, step: float, bits: int) -> tuple:
-    """Reference mid-rise quantiser (SPEC §4.3, test-data generator only):
-    ``code = clip(floor(y / step), -2^(b-1), 2^(b-1) - 1)`` per component."""
-    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
-    re = np.clip(np.floor(np.real(y) / step), lo, hi).astype(np.int64)
-    im = np.clip(np.floor(np.imag(y) / step), lo, hi).astype(np.int64)
+def quantize_rowrule(y: np.ndarray, step: float, bits: int, midrise: bool = False) -> tuple:
+    """Reference quantiser (SPEC §4.4, test-data generator only). Mid-tread
+    (default, ``x2/quant.py``): ``clip(rint(y / step), -(2^(b-1) - 1),
+    2^(b-1) - 1)``; mid-rise: ``clip(floor(y / step), -2^(b-1), 2^(b-1) - 1)``."""
+    hi = (1 << (bits - 1)) - 1
+    lo = -(1 << (bits - 1)) if midrise else -hi
+    op = np.floor if midrise else np.rint
+    re = np.clip(op(np.real(y) / step), lo, hi).astype(np.int64)
+    im = np.clip(op(np.imag(y) / step), lo, hi).astype(np.int64)
     return re, im

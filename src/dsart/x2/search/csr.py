@@ -7,7 +7,7 @@ Hermitian fold of the gridded sum
     G_h[u, w] = 0.5 * sum_e  (v_e  or  conj(v_e))       (fixed entry order)
 
 times today's fftshift checkerboard ``(-1)^(u+w)``. An entry ``e`` is
-``(stream, value, conj)``; a value sitting at full-plane cell ``(u, w)``
+``(stream, value, conj)``, ordered ``(stream, conj, value)`` (SPEC §3); a value sitting at full-plane cell ``(u, w)``
 contributes directly to half-cell ``(u, w)`` when ``w <= N/2`` and as
 ``conj`` to the mirror half-cell ``((N-u) % N, (N-w) % N)`` when that
 mirror's column is ``<= N/2`` -- exactly the ``k`` / ``km`` pair
@@ -33,6 +33,7 @@ import numpy as np
 
 __all__ = [
     "OwnerCsr",
+    "csr_from_owner",
     "csr_from_value_cells",
     "csr_from_lut_1x",
     "csr_matches_v4",
@@ -134,8 +135,8 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
             (per-baseline formats, many-to-one).
         n_grid: N (even).
 
-    Entry order inside a cell: by ``(stream, value, conj)`` ascending --
-    for 1x this is the v4 stream-ascending order with direct before mirror.
+    Entry order inside a cell: ``(stream, conj, value)`` ascending -- the
+    frozen SPEC §3 owner order (for 1x: v4's stream-ascending order).
     """
     N = int(n_grid)
     if N % 2:
@@ -167,7 +168,7 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
     s = np.concatenate(ss).astype(np.int64)
     v = np.concatenate(vs).astype(np.int64)
     c = np.concatenate(cs).astype(np.int64)
-    order = np.lexsort((c, v, s, u, w))                # cell (w, u) major, then entry order
+    order = np.lexsort((v, c, s, u, w))                # cell (w, u) major; entries (stream, conj, value)
     u, w, s, v, c = u[order], w[order], s[order], v[order], c[order]
     key = w * N + u                                     # unique per (w, u)
     starts = np.concatenate([[0], np.nonzero(np.diff(key))[0] + 1])
@@ -179,6 +180,39 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
         ent_conj=c.astype(np.int8),
         pattern_id=_pid(N, *[np.asarray(x, dtype=np.int64) for x in value_cells], extra_id or ""),
     )
+
+
+def csr_from_owner(owner) -> tuple:
+    """WS-P ``baseline_grid.OwnerCsr`` (row-major ``cell_uw``, entries
+    ``(stream, conj, value)``, ``ent_weight``) -> ``(OwnerCsr, weight)``:
+    the same cells re-ordered column-major for K2 (each cell's entry block
+    kept verbatim, so the fp32 accumulation order is the frozen one) and the
+    per-entry weights in the new entry order."""
+    N = int(owner.n_grid)
+    nh = N // 2 + 1
+    uw = np.asarray(owner.cell_uw, dtype=np.int64)
+    ptr = np.asarray(owner.cell_ptr, dtype=np.int64)
+    u, w = uw // nh, uw % nh
+    order = np.lexsort((u, w))
+    ne = np.diff(ptr)[order]
+    new_ptr = np.concatenate([[0], np.cumsum(ne)]).astype(np.int32)
+    take = np.concatenate([np.arange(ptr[a], ptr[a + 1]) for a in order]) if order.size \
+        else np.zeros(0, np.int64)
+    S = int(np.asarray(owner.ent_stream).max(initial=-1)) + 1
+    n_values = np.zeros(S, dtype=np.int32)
+    es = np.asarray(owner.ent_stream)
+    ev = np.asarray(owner.ent_value)
+    for s in range(S):
+        sel = ev[es == s]
+        n_values[s] = int(sel.max(initial=-1)) + 1
+    csr = OwnerCsr(
+        n_grid=N, n_stream=S, n_values=n_values,
+        cell_u=u[order].astype(np.int32), cell_w=w[order].astype(np.int32), cell_ptr=new_ptr,
+        ent_stream=es[take].astype(np.int32), ent_value=ev[take].astype(np.int32),
+        ent_conj=np.asarray(owner.ent_conj)[take].astype(np.int8),
+        pattern_id=_pid(N, uw, ptr, es, ev, np.asarray(owner.ent_conj)),
+    )
+    return csr, np.asarray(owner.ent_weight, dtype=np.float32)[take]
 
 
 def csr_from_lut_1x(lut: np.ndarray, n_filled: np.ndarray, *, n_grid: int) -> OwnerCsr:

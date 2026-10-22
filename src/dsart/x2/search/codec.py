@@ -5,15 +5,18 @@ A ring row is one stream sample of one coarse DM. Two row formats:
 * ``"cint8"`` (1x, today's wire v1 as stored by the RX ring): ``n_values``
   interleaved ``(int8 re, int8 im)`` pairs, codes summed WITHOUT any scale
   (production ``image/imager_gpu.py`` unit-scale path). Decode = identity.
-* ``"frame2"`` (2x, SPEC §5): ``n_heavy`` ``(int8 re, int8 im)`` pairs, then
-  the main values as a packed little-endian bit stream, ``b`` bits per
-  component, re then im per value, two's complement, padded to a byte.
-  Decode (SPEC §4.5) = ``(code + 0.5) * s`` with ``s = s_h`` (heavy) or
-  ``s_b`` (main), times the static ``sqrt(n_v)`` and the owner weight
-  ``w_v`` (``sqrt(multiplicity)`` for per-baseline values) -- all folded
-  into ONE per-value fp32 constant ``c_v`` so the decode is a single
-  rounding ``fl32((code + 0.5) * c_v)`` and K1 is pure fp32 adds (no FMA
-  contraction can make the GPU and its numpy twin differ).
+* ``"frame2"`` (2x, SPEC §5 / ``transport/prod_frame2.py``): ``n_heavy``
+  ``(int8 re, int8 im)`` pairs, then the main values as a packed
+  little-endian bit stream, ``b`` bits per component, re in the low bits,
+  two's complement, padded to a byte. Decode (SPEC §4.5, reference
+  ``x2/quant.py``) = ``(code + off) * s`` with ``off = 0`` (mid-tread, the
+  default) or ``0.5`` (mid-rise, frame flag bit 6), ``s = s_heavy`` /
+  ``s_main`` (frame header, sigma_hat units), times the static owner
+  weight ``sqrt(n_v)`` -- folded into ONE per-value fp32 constant
+  ``c_v = fl32(s * sqrt(n_v))`` so the decode is a single rounding
+  ``fl32((code + off) * c_v)`` and K1 is pure fp32 adds (no FMA contraction
+  can make the GPU and its numpy twin differ). The dynamic sigma_hat is
+  NOT applied (today's per-row 1/sigma weighting semantics).
 
 Everything here is numpy and is the reference the K0 CUDA kernel's twin
 (:mod:`dsart.x2.search.kernels_cuda`) is checked against.
@@ -27,6 +30,8 @@ import numpy as np
 
 __all__ = [
     "RowFormat",
+    "StreamFormats",
+    "as_stream_formats",
     "pack_frame2_rows",
     "unpack_frame2_rows",
     "unpack_cint8_rows",
@@ -52,6 +57,7 @@ class RowFormat:
     n_values: int
     n_heavy: int = 0
     bits: int = 8
+    midrise: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in ("cint8", "frame2"):
@@ -71,6 +77,40 @@ class RowFormat:
         if self.kind == "cint8":
             return 2 * self.n_values
         return 2 * self.n_heavy + (2 * self.bits * self.n_main + 7) // 8
+
+
+@dataclass(frozen=True)
+class StreamFormats:
+    """Per-stream row formats of one DM (2x streams carry different value
+    and heavy counts); a ring row is padded to the largest stream's bytes."""
+
+    per_stream: tuple
+
+    @property
+    def kind(self) -> str:
+        return self.per_stream[0].kind
+
+    @property
+    def row_bytes(self) -> int:
+        return max(f.row_bytes for f in self.per_stream)
+
+    @property
+    def n_values(self) -> int:
+        return max(f.n_values for f in self.per_stream)
+
+    def __getitem__(self, s: int) -> RowFormat:
+        return self.per_stream[s]
+
+    def __len__(self) -> int:
+        return len(self.per_stream)
+
+
+def as_stream_formats(fmt, n_stream: int) -> StreamFormats:
+    if isinstance(fmt, StreamFormats):
+        if len(fmt) != n_stream:
+            raise ValueError(f"{len(fmt)} stream formats for {n_stream} streams")
+        return fmt
+    return StreamFormats(tuple([fmt] * int(n_stream)))
 
 
 def _to_twos(code: np.ndarray, bits: int) -> np.ndarray:
@@ -114,7 +154,7 @@ def unpack_frame2_rows(raw: np.ndarray, fmt: RowFormat) -> tuple:
     """``uint8 [rows, row_bytes]`` -> ``(re, im)`` int8 ``[rows, n_values]``."""
     if fmt.kind != "frame2":
         raise ValueError("unpack_frame2_rows needs a frame2 format")
-    raw = np.ascontiguousarray(raw, dtype=np.uint8)
+    raw = np.ascontiguousarray(raw, dtype=np.uint8)[:, :fmt.row_bytes]
     rows = raw.shape[0]
     nh, nm, b = fmt.n_heavy, fmt.n_main, fmt.bits
     re = np.empty((rows, fmt.n_values), dtype=np.int8)
@@ -136,7 +176,8 @@ def unpack_frame2_rows(raw: np.ndarray, fmt: RowFormat) -> tuple:
 
 def unpack_cint8_rows(raw: np.ndarray, fmt: RowFormat) -> tuple:
     """1x rows (``int8`` or ``uint8 [rows, 2 * n_values]``) -> ``(re, im)``."""
-    a = np.ascontiguousarray(raw).view(np.int8).reshape(raw.shape[0], fmt.n_values, 2)
+    a = np.ascontiguousarray(raw[:, :fmt.row_bytes]).view(np.int8).reshape(
+        raw.shape[0], fmt.n_values, 2)
     return a[..., 0].copy(), a[..., 1].copy()
 
 
@@ -153,7 +194,7 @@ def decode_constants(
     1x (``cint8``): ``c_v = 1``, offset 0 -- codes summed raw, exactly
     today's unit-scale combine. 2x (``frame2``): ``c_v = fl32(s * sqrt(n_v)
     * w_v)`` with ``s = step_heavy`` for ``v < n_heavy`` else
-    ``step_main``; offset 0.5 (mid-rise reconstruction).
+    ``step_main``; offset 0 (mid-tread) or 0.5 (mid-rise).
     """
     nv = fmt.n_values
     if fmt.kind == "cint8":
@@ -164,7 +205,7 @@ def decode_constants(
         s = s * np.sqrt(np.asarray(n_contrib, dtype=np.float64))
     if weight is not None:
         s = s * np.asarray(weight, dtype=np.float64)
-    return s.astype(np.float32), np.float32(0.5)
+    return s.astype(np.float32), np.float32(0.5 if fmt.midrise else 0.0)
 
 
 def decode_values(re: np.ndarray, im: np.ndarray, c_v: np.ndarray,

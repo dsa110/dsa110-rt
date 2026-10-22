@@ -91,7 +91,7 @@ class SyntheticSky:
     cells: Dict[int, list]
     formats: Dict[int, RowFormat]
     n_grid: int
-    step_main: float = 0.336
+    step_main: float = 0.3534
     step_heavy: float = 0.1
     noise: float = 1.0
     seed: int = 1
@@ -133,16 +133,19 @@ class SyntheticSky:
             return raw, dec
         from ..ref.search2x_ref import quantize_rowrule
         nh = fmt.n_heavy
+        off = 0.5 if fmt.midrise else 0.0
         for s in range(S):
             re = np.zeros((n, V), dtype=np.int64)
             im = np.zeros((n, V), dtype=np.int64)
             if nh:
-                re[:, :nh], im[:, :nh] = quantize_rowrule(y[s][:, :nh], self.step_heavy, 8)
-            re[:, nh:], im[:, nh:] = quantize_rowrule(y[s][:, nh:], self.step_main, fmt.bits)
-            raw[s] = pack_frame2_rows(re, im, fmt)
+                re[:, :nh], im[:, :nh] = quantize_rowrule(y[s][:, :nh], self.step_heavy, 8,
+                                                          fmt.midrise)
+            re[:, nh:], im[:, nh:] = quantize_rowrule(y[s][:, nh:], self.step_main, fmt.bits,
+                                                      fmt.midrise)
+            raw[s, :, :fmt.row_bytes] = pack_frame2_rows(re, im, fmt)
             st = np.full(V, self.step_main)
             st[:nh] = self.step_heavy
-            dec.append((re + 0.5) * st + 1j * (im + 0.5) * st)
+            dec.append((re + off) * st + 1j * (im + off) * st)
         return raw, dec
 
     def fill(self, ring, spec: DmSpec, row0: int, n: int) -> None:

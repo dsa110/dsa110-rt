@@ -12,13 +12,13 @@ owns, in one place and independent of where the numbers came from:
 
 Builders:
 
-* :func:`owner_plan_from_tiered` -- from a WS-P ``TieredDmPlan``
-  (``src/dsart/x2/plan.py``, SPEC §2), duck-typed so this module does not
-  import it; **the per-DM n_fdm always comes from the plan** (the
-  hand-edited ``--n-fdm`` trap of 2026-09-23 cannot recur).
-* :func:`owner_plan_from_tiers` -- stand-in used until WS-P lands and by
-  tests: per-tier (T_native, coarse, fine, f2c) lists; stage-2 bins from
-  the sub-band reference table exactly as SPEC §2 defines them.
+* :func:`owner_plan_from_tiered` -- from the frozen WS-P ``TieredDmPlan``
+  (``src/dsart/x2/plan.py``, SPEC §2); **the per-DM n_fdm always comes
+  from the plan** (the hand-edited ``--n-fdm`` trap of 2026-09-23 cannot
+  recur).
+* :func:`owner_plan_from_tiers` -- small synthetic plans for tests: per-tier
+  (T_native, coarse, fine, f2c) lists; stage-2 bins from the sub-band
+  reference table exactly as SPEC §2 defines them.
 * :func:`owner_plan_1x` -- today's op-point (one coarse DM per half,
   merged-rounding signed shifts from the production
   ``compute_time_shift_search``), for 1x-compat.
@@ -281,47 +281,33 @@ def owner_plan_from_tiers(
                      plan_id=_plan_id(ids + [n_sub, csf]))
 
 
-def _get(obj, *names, default=None):
-    for n in names:
-        if isinstance(obj, dict) and n in obj:
-            return obj[n]
-        if hasattr(obj, n):
-            return getattr(obj, n)
-    return default
+def owner_plan_from_tiered(plan, *, half: int, ext_native: int = 16) -> OwnerPlan:
+    """Owner plan of ``half`` from a frozen WS-P ``TieredDmPlan`` (SPEC §2).
 
-
-def owner_plan_from_tiered(plan, *, half: int, n_halves: int = N_HALVES,
-                           ext_native: int = 16) -> OwnerPlan:
-    """Owner plan from a WS-P ``TieredDmPlan`` (SPEC §2), duck-typed.
-
-    Reads per tier ``T_native``, ``coarse_dm``, ``fine_dm``,
-    ``fine_to_coarse``, ``stage2_bins`` and the plan's ``n_sub`` / ``csf``.
-    The stage-2 table is taken from the plan, never recomputed, so the
-    owner applies exactly the shifts the plan was validated with.
+    Uses only the frozen API: ``dms_of_half``, ``stage2_for_coarse`` (read
+    convention ``stream[t - stage2_bins]``), ``fine_offset`` (global fine
+    index = plan order = C1 ``dm_idx_global``), ``coarse_t_native``,
+    ``coarse_tier``, ``tier_name``, ``plan_id``. ``n_fdm`` per DM comes from
+    the plan (never a hand-edited ``--n-fdm``). Shifts are never recomputed.
     """
-    tiers_obj = _get(plan, "tiers")
-    if tiers_obj is None:
-        raise TypeError("plan has no 'tiers'")
-    n_sub = int(_get(plan, "n_sub"))
-    csf = int(_get(plan, "csf", "chan_sum_factor", default=2))
-    tiers, s2 = [], []
-    for i, t in enumerate(tiers_obj):
-        tiers.append(dict(
-            name=str(_get(t, "name", default="AB"[i] if i < 2 else str(i))),
-            t_native=int(_get(t, "T_native", "t_native")),
-            coarse=np.asarray(_get(t, "coarse_dm")),
-            fine=np.asarray(_get(t, "fine_dm")),
-            f2c=np.asarray(_get(t, "fine_to_coarse")),
+    dms: List[DmSpec] = []
+    for d in plan.dms_of_half(int(half)):
+        d = int(d)
+        sl = plan.fines_of(d)
+        fg = np.arange(sl.start, sl.stop, dtype=np.int64)
+        dms.append(DmSpec(
+            d=d, tier=str(plan.tier_name[int(plan.coarse_tier[d])]),
+            t_native=int(plan.coarse_t_native[d]), coarse_dm=float(plan.coarse_dm[d]),
+            fine_dm=np.asarray(plan.fine_dm[sl]), fine_global=fg,
+            shifts=np.asarray(plan.stage2_for_coarse(d)),
         ))
-        s2.append(np.asarray(_get(t, "stage2_bins")))
-    op = owner_plan_from_tiers(tiers, half=half, n_sub=n_sub, csf=csf,
-                               n_halves=n_halves, ext_native=ext_native,
-                               shifts_override=s2)
-    pid = _get(plan, "plan_id", "pattern_id", default=None)
-    if pid is not None:
-        op = OwnerPlan(half=op.half, dms=op.dms, n_stream=op.n_stream,
-                       ext_native=op.ext_native, opoint="2x", plan_id=str(pid))
-    return op
+        if dms[-1].n_fdm != int(plan.n_fdm[d]):
+            raise ValueError(f"DM {d}: plan n_fdm {int(plan.n_fdm[d])} != fines {dms[-1].n_fdm}")
+    if not dms:
+        raise ValueError(f"half {half} owns no DMs in this plan")
+    return OwnerPlan(half=int(half), dms=tuple(dms), n_stream=int(plan.n_streams),
+                     ext_native=int(ext_native), opoint="2x", plan_id=f"{int(plan.plan_id):016x}",
+                     extra=dict(n_sub=int(plan.n_sub), chan_sum_factor=int(plan.chan_sum_factor)))
 
 
 def owner_plan_1x(

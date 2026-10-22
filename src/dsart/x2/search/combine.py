@@ -24,7 +24,7 @@ from typing import Optional
 
 import numpy as np
 
-from .codec import RowFormat, unpack_cint8_rows, unpack_frame2_rows
+from .codec import RowFormat, as_stream_formats, unpack_cint8_rows, unpack_frame2_rows
 from .csr import OwnerCsr
 
 __all__ = [
@@ -58,10 +58,12 @@ def k0_rows_to_ring(ring: StreamRing, raw: np.ndarray, valid: np.ndarray, *,
     if n > ring.n_slots:
         raise ValueError(f"{n} rows > ring of {ring.n_slots}")
     slots = ring.slots(np.arange(row0, row0 + n))
-    unpack = unpack_cint8_rows if fmt.kind == "cint8" else unpack_frame2_rows
-    nv = fmt.n_values
+    fmts = as_stream_formats(fmt, S)
     for s in range(S):
-        re, im = unpack(raw[s], fmt)                     # [n, nv]
+        fs = fmts[s]
+        unpack = unpack_cint8_rows if fs.kind == "cint8" else unpack_frame2_rows
+        nv = fs.n_values
+        re, im = unpack(raw[s], fs)                      # [n, nv]
         ok = np.asarray(valid[s], dtype=bool)
         re = np.where(ok[:, None], re, 0).astype(np.int8)
         im = np.where(ok[:, None], im, 0).astype(np.int8)
