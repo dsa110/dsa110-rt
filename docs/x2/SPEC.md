@@ -218,10 +218,15 @@ etcd `/cnf/opoints/{1x,1x-legacy,2x}/{pipeline_rt,search_rt}`, `/cnf/opoint`; pe
 - WS-T: `src/dsart/transport/prod_frame2.py`, `send_mmsg.c` + wrapper, `recv_epoll.c`, `recv_ring.{c,h,py}`,
   `production_rx_ring.py`, `services/search_rx.py`, `bench/fake_corr_to_search.py`, `tools/x2/rx_recorder.py`.
 - WS-C: `services/corr_fast_integration.py`, `src/dsart/x2/corr/*`, `src/dsart/x2/ref/corr2x_ref.py`.
-- WS-S: `services/search_compute.py`, `services/cube_pipeline.py`, `src/dsart/x2/search/*`,
-  `image/*`, `detector/*`, `noise_norm/*`, `fine_dm/combiner.py`, `src/dsart/x2/ref/search2x_ref.py`.
+- WS-S: `services/search_compute.py`, `services/cube_pipeline.py`, `src/dsart/x2/search/*` (incl. the
+  cutout producer `cutout_service.py`), `image/*`, `detector/*`, `noise_norm/*`, `fine_dm/combiner.py`,
+  `src/dsart/x2/ref/search2x_ref.py`, `services/search_compute_mon.py`, `services/search_ring_mon.py`.
 - WS-D: `services/c1_emit.py`, `services/coincidencer.py`, `coinc/*`, `services/c3.py`, `inject/*`,
+  `dump/*`, `services/slack_notify.py`, `services/candidate_card.py`, `src/dsart/x2/cutout/*`,
+  `tools/inject/*`, `tools/viz/*`, `tools/c2/*`, `tools/ops/prune_candidate_products.py`,
   `tools/dashboard/**` except the Start control, grafana, pusher.
+- Integration: `common/contracts.py`, `docs/x2/SPEC.md` (sections are frozen by their owners; edits
+  between freezes go through integration), `tools/x2/node_cpu_tests.sh`, merges into `x2/main`.
 - WS-O: `configs/*.yaml`, `tools/ops/push_dsart_to_etcd.py`, dashboard Start control
   (`app.py /control/start`, `control_store.control_start_fleet`), `tools/x2/cp*_runner*`, runbooks.
 - Phase 0: `docs/x2/phase0/**`, `docs/timeres_study/model/*` additions.
