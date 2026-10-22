@@ -12,6 +12,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 triton = pytest.importorskip("triton")
+import triton.language as tl  # noqa: E402
 
 from dsart.x2.search.triton_interp import install  # noqa: E402
 
@@ -64,3 +65,22 @@ def test_k3b_triton_equals_twin_bit_for_bit(bank):
     assert np.array_equal(b1.numpy(), b0)
     assert np.array_equal(t1.numpy(), t0)
     assert np.array_equal(p1.numpy(), p0)
+
+
+@triton.jit
+def _plus_one(x_ptr, out_ptr, n, ADD: tl.constexpr, B: tl.constexpr):
+    offs = tl.arange(0, B)
+    m = offs < n
+    x = tl.load(x_ptr + offs, mask=m, other=0.0)
+    tl.store(out_ptr + offs, x + ADD, mask=m)
+
+
+@pytest.mark.parametrize("add,ok", [(1.0, True), (2.0, False)])
+def test_interpreter_is_not_vacuous(add, ok):
+    """The shimmed interpreter really executes kernels: a deliberately
+    broken kernel (adds 2) must FAIL the comparison a correct one passes."""
+    x = torch.arange(10, dtype=torch.float32)
+    out = torch.full((16,), -5.0)
+    _plus_one[(1,)](x, out, 10, ADD=add, B=16)
+    assert np.array_equal(out[:10].numpy(), (x + 1.0).numpy()) == ok
+    assert np.all(out[10:].numpy() == -5.0)                  # masked lanes untouched

@@ -9,8 +9,10 @@ the filter (family + width), S/N and flags.
 ``common.contracts.Candidate`` for the existing C1 path (WS-D owns any
 schema change): ``dm_idx`` = global fine index in 2x (today's local fine
 index in 1x), ``event_specnum`` / ``width_samples`` in external samples,
-``kernel_id`` ``unit:d1:b<n>`` with ``n`` the filter's support rounded up
-to a power of two (B-spline family and true width kept on Candidate2x).
+``kernel_id`` ``unit:d1:<filter>`` with the b3x tokens (b1, b2, t2,
+q4..q64; ``DETECTOR_TIME_KERNELS_X2_B3X``) or today's ``b<w>``. NB the
+tier is NOT in the kernel_id: a tier-B ``q8`` spans 2x the time of a
+tier-A ``q8`` -- ``width_samples`` (T_ext) disambiguates.
 
 :func:`decode_chunkmax` is today's ``decode_topk_argmax_lowmem`` applied
 to the per-(pixel, 64-centre chunk) maxima: global top-``n_top`` by S/N
@@ -27,7 +29,7 @@ import numpy as np
 
 from .filters import FilterBank, unpack_tk
 
-__all__ = ["Candidate2x", "decode_chunkmax", "merge_c1", "NOISE_WARMUP_FLAG",
+__all__ = ["Candidate2x", "decode_chunkmax", "decode_topk", "merge_c1", "NOISE_WARMUP_FLAG",
            "PARTIAL_FANIN_FLAG"]
 
 #: ``CandidateFlags.NOISE_WARMUP`` (Layer-2 burn-in), same bit as today.
@@ -56,17 +58,21 @@ class Candidate2x:
 
     def to_legacy(self, *, search_node_id: int, gpu_half: int, dm_index_mode: str = "global",
                   detector_version: str = "x2.owner"):
+        from ...common.constants import DETECTOR_TIME_KERNELS_VALID
         from ...common.contracts import Candidate
 
-        n = 1
-        while n < max(1, self.support_ext):
-            n *= 2
-        n = min(n, 128)
+        if self.filt in DETECTOR_TIME_KERNELS_VALID:
+            tok = self.filt                    # b1..b64, t2, q4..q64 (b3x tokens)
+        else:
+            n = 1
+            while n < max(1, self.support_ext):
+                n *= 2
+            tok = f"b{min(n, 128)}"
         dm_idx = self.fine_global if dm_index_mode == "global" else self.fdm_local
         return Candidate(
             l=float(self.l), m=float(self.m), dm_fine=float(self.dm), dm_idx=int(dm_idx),
             event_specnum=int(self.event_specnum), width_samples=int(self.width_ext),
-            kernel_id=f"unit:d1:b{n}", snr=float(self.snr), detector_version=detector_version,
+            kernel_id=f"unit:d1:{tok}", snr=float(self.snr), detector_version=detector_version,
             flags=int(self.flags), search_node_id=int(search_node_id), gpu_half=int(gpu_half),
         )
 
@@ -99,18 +105,36 @@ def decode_chunkmax(
     if k <= 0 or not np.isfinite(flat).any() or float(np.nanmax(flat)) <= threshold:
         return []
     part = np.argpartition(-flat, k - 1)[:k] if k < flat.size else np.arange(flat.size)
-    order = part[np.lexsort((part, -flat[part]))]            # value desc, index asc
     tkf = np.asarray(tk).reshape(-1)
+    return decode_topk(flat[part], part, tkf[part], shape=(n_ch, F, P), c_first=c_first,
+                       chunk=chunk, n_grid=n_grid, bank=bank, threshold=threshold, spec=spec,
+                       half=half, ext_factor=ext_factor, radius_t=radius_t, radius_f=radius_f,
+                       radius_lm=radius_lm, flags=flags)
+
+
+def decode_topk(vals: np.ndarray, flat_idx: np.ndarray, tk_vals: np.ndarray, *, shape: tuple,
+                c_first: int, chunk: int, n_grid: int, bank: FilterBank, threshold: float,
+                spec, half: int, ext_factor: int, radius_t: int = 128, radius_f: int = 5,
+                radius_lm: int = 3, flags: int = 0) -> List[Candidate2x]:
+    """Decode a pre-selected top-k (values, flat indices into ``shape =
+    (n_ch, F, P)``, packed ``(t, k)``) -- the GPU path ships only these to the
+    host (one D2H per cube). Order: value desc, flat index asc."""
+    n_ch, F, P = shape
+    vals = np.asarray(vals, dtype=np.float32)
+    flat_idx = np.asarray(flat_idx, dtype=np.int64)
+    tk_vals = np.asarray(tk_vals)
+    order = np.lexsort((flat_idx, -vals))
     out: List[Candidate2x] = []
     acc: list = []
-    for ix in order:
-        v = float(flat[ix])
+    for j in order:
+        ix = int(flat_idx[j])
+        v = float(vals[j])
         if not v > threshold:
             break
         ci, rem = divmod(int(ix), F * P)
         f, p = divmod(rem, P)
         l_, m_ = divmod(p, n_grid)
-        tin, kk = unpack_tk(tkf[ix])
+        tin, kk = unpack_tk(tk_vals[j])
         t = int(c_first + ci * chunk + int(tin))
         if any(abs(t - a) <= radius_t and abs(f - b) <= radius_f
                and abs(l_ - c) <= radius_lm and abs(m_ - dd) <= radius_lm

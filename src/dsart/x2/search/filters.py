@@ -152,10 +152,15 @@ class FilterBank:
 
     @classmethod
     def b3x(cls) -> "FilterBank":
-        """Phase 0 bank: b1, b2, t2 = [1,2,1], q4 .. q64 (WS-D kernel_id time tokens)."""
+        """Phase 0 bank: b1, b2, t2 = [1,2,1], q4 .. q64, named by
+        ``common.constants.DETECTOR_TIME_KERNELS_X2_B3X`` (C1 kernel_id)."""
+        from ...common.constants import DETECTOR_TIME_KERNELS_X2_B3X
+
         f = [TimeFilter.make("b", 1), TimeFilter.make("b", 2),
              TimeFilter("t2", 2, (2, 2))]
         f += [TimeFilter("q%d" % w, w, B3_STAGES[w]) for w in (4, 8, 16, 32, 64)]
+        if tuple(x.name for x in f) != tuple(DETECTOR_TIME_KERNELS_X2_B3X):
+            raise AssertionError("b3x bank names drifted from DETECTOR_TIME_KERNELS_X2_B3X")
         return cls(tuple(f))
 
     def __len__(self) -> int:

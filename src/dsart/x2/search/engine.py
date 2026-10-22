@@ -50,7 +50,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .candidates import (NOISE_WARMUP_FLAG, PARTIAL_FANIN_FLAG, Candidate2x,
-                         decode_chunkmax, merge_c1)
+                         decode_chunkmax, decode_topk, merge_c1)
 from .combine import StreamRing, k0_rows_to_ring, k1_twin
 from .csr import OwnerCsr, expected_image_sigma
 from .fft import FftPlan, image_from_uv_torch, image_from_uv_twin
@@ -320,8 +320,10 @@ class OwnerEngine:
         raw, valid = self.ring.wait_window(st.spec.d, int(start), int(n),
                                            timeout_s=self.cfg.wait_timeout_s)
         if self._gpu is not None:
-            self._gpu.k0(st, raw, valid, start)
-        k0_rows_to_ring(sr, raw, valid, row0=int(start), fmt=st.inp.fmt)
+            self._gpu.k0(st, raw, valid, start)              # codes live on the device
+            sr.valid[:, sr.slots(np.arange(start, start + n))] = np.asarray(valid, bool)
+        else:
+            k0_rows_to_ring(sr, raw, valid, row0=int(start), fmt=st.inp.fmt)
         sr.loaded_hi = hi
         sr.loaded_lo = max(sr.loaded_lo, hi - sr.n_slots)
 
@@ -404,8 +406,13 @@ class OwnerEngine:
         sigma_inv = (1.0 / np.maximum(sigma_applied, np.finfo(np.float32).tiny)).astype(np.float32)
         s_inv = (1.0 / np.maximum(s_k_applied, 1e-30)).astype(np.float32)
         c_first = t0 - st.delay
+        n_top = int(round(cfg.n_top_per_192 * spec.hop / 192.0))
+        topk = None
         if self._gpu is not None:
-            best, tk, taps = self._gpu.k3b(st, c_first, sigma_inv, s_inv)
+            vals, idx, tkv, shape, taps = self._gpu.k3b_topk(st, c_first, sigma_inv, s_inv,
+                                                              n_top)
+            topk = (vals, idx, tkv, shape)
+            best = tk = None
         else:
             best, tk, taps = k3b_twin(st.image, ring_row0=0, c_first=c_first, n_c=spec.hop,
                                       sigma_inv=sigma_inv, s_inv=s_inv, bank=self.bank,
@@ -424,12 +431,14 @@ class OwnerEngine:
         _sk, warming = st.layer2.update_and_query(per_kernel_sigma=sig_k, valid=cube_valid)
         flags = (NOISE_WARMUP_FLAG if warming else 0) | (PARTIAL_FANIN_FLAG if vfrac < 1.0 else 0)
         a = time.perf_counter()
-        n_top = int(round(cfg.n_top_per_192 * spec.hop / 192.0))
-        cands = decode_chunkmax(best, tk, c_first=c_first, chunk=cfg.chunk, n_grid=cfg.n_grid,
-                                bank=self.bank, threshold=cfg.threshold, n_top=n_top, spec=spec,
-                                half=self.plan.half, ext_factor=self.plan.ext_factor(spec),
-                                radius_t=cfg.radius_t, radius_f=cfg.radius_f,
-                                radius_lm=cfg.radius_lm, flags=flags)
+        dkw = dict(c_first=c_first, chunk=cfg.chunk, n_grid=cfg.n_grid, bank=self.bank,
+                   threshold=cfg.threshold, spec=spec, half=self.plan.half,
+                   ext_factor=self.plan.ext_factor(spec), radius_t=cfg.radius_t,
+                   radius_f=cfg.radius_f, radius_lm=cfg.radius_lm, flags=flags)
+        if topk is not None:
+            cands = decode_topk(topk[0], topk[1], topk[2], shape=topk[3], **dkw)
+        else:
+            cands = decode_chunkmax(best, tk, n_top=n_top, **dkw)
         tm["decode_ms"] = 1e3 * (time.perf_counter() - a)
         st.cycles += 1
         return DmCycleResult(d=spec.d, cycle=k, t0=t0, sigma_applied=sigma_applied,
