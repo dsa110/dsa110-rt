@@ -49,7 +49,7 @@ import numpy as np
 
 from .candidates import (NOISE_WARMUP_FLAG, PARTIAL_FANIN_FLAG, Candidate2x,
                          decode_chunkmax, merge_c1)
-from .codec import RowFormat, decode_constants
+from .codec import RowFormat
 from .combine import StreamRing, k0_rows_to_ring, k1_twin
 from .csr import OwnerCsr, expected_image_sigma
 from .fft import FftPlan, image_from_uv_torch, image_from_uv_twin

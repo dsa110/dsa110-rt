@@ -156,21 +156,27 @@ def ref_image(G: np.ndarray, mask: np.ndarray, scale: float) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _lower_median(s: np.ndarray) -> float:
+    """``torch.nanmedian`` semantics: the LOWER middle value for even counts."""
+    return float(np.partition(s, (s.size - 1) // 2)[(s.size - 1) // 2])
+
+
 def ref_sigma_clipped_std(x: np.ndarray, n_sigma: float = 3.0, n_iter: int = 3) -> float:
     """Median-centred iterative clip, exactly the production estimator's
-    semantics (``noise_norm.layer1.sigma_clipped_std_batched``), float64."""
+    semantics (``noise_norm.layer1.sigma_clipped_std_batched``: lower
+    median, rms about it over the kept set), float64."""
     s = np.asarray(x, dtype=np.float64).reshape(-1)
     s = s[np.isfinite(s)]
     if s.size == 0:
         return 0.0
-    med = np.median(s)
+    med = _lower_median(s)
     sig = np.sqrt(np.mean((s - med) ** 2))
     act = np.ones(s.size, dtype=bool)
     for _ in range(int(n_iter)):
         act &= (s >= med - n_sigma * sig) & (s <= med + n_sigma * sig)
         if not act.any():
             return 0.0
-        med = np.median(s[act])
+        med = _lower_median(s[act])
         sig = np.sqrt(np.mean((s[act] - med) ** 2))
     return float(sig)
 
@@ -307,12 +313,17 @@ def ref_search_cycle(
     chunk: int = 64,
     threshold: float = 9.55,
     n_top: int = 224,
+    decode: str = "chunk",
 ) -> RefCycleResult:
     """Reference for one owner cycle of one DM.
 
     Images rows ``[t0 - history, t0 + hop)``; detects centres
     ``[t0 - delay, t0 + hop - delay)``. ``sigma`` (Layer-1) defaults to the
     cycle's own new rows ``[t0, t0 + hop)`` (2x same-cycle semantics).
+    ``decode="chunk"`` decodes the per-(pixel, chunk) maxima (2x);
+    ``"full"`` decodes the full max-over-filters cube exactly as today's
+    ``decode_topk_argmax_lowmem`` does (its top-k can saturate on one bright
+    burst -- the S2 "chunk-max decoder" item).
     """
     rows = np.arange(t0 - history, t0 + hop)
     G = ref_grid_dedispersed(values, cells, shifts, row0=row0, out_rows=rows, n_grid=n_grid)
@@ -326,17 +337,25 @@ def ref_search_cycle(
     snr = scores / np.asarray(s_k, dtype=np.float64)[:, None, None, None, None]
     cm = ref_chunk_max(snr, chunk)
     mx, tin, kk = cm
-    n_ch = mx.shape[0]
-
-    def t_of(ci, f, l_, m_):
-        return int(centres[0] + ci * chunk + tin[ci, f, l_, m_])
-
-    raw = ref_decode_topk(mx, threshold=threshold, n_top=n_top, t_of=t_of)
     cands = []
-    for (tt, f, l_, m_, v) in raw:
-        ci = (tt - int(centres[0])) // chunk
-        cands.append(dict(t=tt, f=f, l=l_, m=m_, snr=v, k=int(kk[ci, f, l_, m_])))
-    del n_ch
+    if decode == "chunk":
+        def t_of(ci, f, l_, m_):
+            return int(centres[0] + ci * chunk + tin[ci, f, l_, m_])
+
+        raw = ref_decode_topk(mx, threshold=threshold, n_top=n_top, t_of=t_of)
+        for (tt, f, l_, m_, v) in raw:
+            ci = (tt - int(centres[0])) // chunk
+            cands.append(dict(t=tt, f=f, l=l_, m=m_, snr=v, k=int(kk[ci, f, l_, m_])))
+    elif decode == "full":
+        full = snr.max(axis=0)
+        kfull = snr.argmax(axis=0)
+        raw = ref_decode_topk(full, threshold=threshold, n_top=n_top,
+                              t_of=lambda t, f, l_, m_: int(centres[t]))
+        for (tt, f, l_, m_, v) in raw:
+            cands.append(dict(t=tt, f=f, l=l_, m=m_, snr=v,
+                              k=int(kfull[tt - int(centres[0]), f, l_, m_])))
+    else:
+        raise ValueError(f"decode={decode!r}")
     return RefCycleResult(G=G, image=img, sigma=sigma, x_norm=x, scores=scores, snr=snr,
                           chunk_max=cm, centres=centres, image_rows=rows, candidates=cands)
 

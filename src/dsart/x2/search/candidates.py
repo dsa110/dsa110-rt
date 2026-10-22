@@ -21,7 +21,7 @@ fine index / pixels), winner filter from the packed ``(t, k)``.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 
