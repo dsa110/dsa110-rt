@@ -4078,6 +4078,11 @@ def run(
         )
     if orchestrator == "pipelined" and use_pipeliner_3s:
         raise ValueError("--orchestrator pipelined excludes --pipeliner-3s")
+    if opoint != "1x" and (use_pipeliner_3s or profile_stages_every > 0):
+        raise ValueError(
+            "--opoint 2x runs its own scheduler: drop --pipeliner-3s / "
+            "--profile-stages-every (the StageTimer covers 2x)"
+        )
     if blocks_output_mode not in ("full", "first_tile_only", "none"):
         raise ValueError(
             f"blocks_output_mode must be full|first_tile_only|none, "
