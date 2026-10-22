@@ -1,0 +1,122 @@
+{
+ "eta_amax": {
+  "4": {
+   "1773": 0.9895789704487007,
+   "2112": 0.9894201898771483,
+   "2483": 0.9891445851218709
+  },
+  "5": {
+   "1773": 0.9975426160126449,
+   "2112": 0.9974841758001038,
+   "2483": 0.9974170213630268
+  },
+  "6": {
+   "1773": 0.9994026095313076,
+   "2112": 0.9993864470355511,
+   "2483": 0.9993776259273148
+  },
+  "8": {
+   "1773": 0.999963416204154,
+   "2112": 0.9999626552101717,
+   "2483": 0.999961775808036
+  }
+ },
+ "load": [
+  {
+   "format": "gridded n_sub 2",
+   "bits": 4,
+   "k": 3,
+   "total_gbps": 48.854248046875,
+   "per_node": 12.21356201171875,
+   "clean_needed_80pct": 15.266952514648438
+  },
+  {
+   "format": "gridded n_sub 2",
+   "bits": 5,
+   "k": 2,
+   "total_gbps": 61.27032470703125,
+   "per_node": 15.317581176757812,
+   "clean_needed_80pct": 19.146976470947266
+  },
+  {
+   "format": "gridded n_sub 2",
+   "bits": 6,
+   "k": 2,
+   "total_gbps": 73.2427978515625,
+   "per_node": 18.310699462890625,
+   "clean_needed_80pct": 22.88837432861328
+  },
+  {
+   "format": "gridded n_sub 4",
+   "bits": 4,
+   "k": 4,
+   "total_gbps": 42.001953125,
+   "per_node": 10.50048828125,
+   "clean_needed_80pct": 13.1256103515625
+  },
+  {
+   "format": "gridded n_sub 4",
+   "bits": 5,
+   "k": 3,
+   "total_gbps": 52.5390625,
+   "per_node": 13.134765625,
+   "clean_needed_80pct": 16.41845703125
+  },
+  {
+   "format": "gridded n_sub 4",
+   "bits": 6,
+   "k": 2,
+   "total_gbps": 63.30078125,
+   "per_node": 15.8251953125,
+   "clean_needed_80pct": 19.781494140625
+  },
+  {
+   "format": "per-baseline n_sub 2",
+   "bits": 4,
+   "k": 4,
+   "total_gbps": 34.9385986328125,
+   "per_node": 8.734649658203125,
+   "clean_needed_80pct": 10.918312072753906
+  },
+  {
+   "format": "per-baseline n_sub 2",
+   "bits": 5,
+   "k": 3,
+   "total_gbps": 43.70941162109375,
+   "per_node": 10.927352905273438,
+   "clean_needed_80pct": 13.659191131591797
+  },
+  {
+   "format": "per-baseline n_sub 2",
+   "bits": 6,
+   "k": 2,
+   "total_gbps": 52.7020263671875,
+   "per_node": 13.175506591796875,
+   "clean_needed_80pct": 16.469383239746094
+  },
+  {
+   "format": "per-baseline n_sub 4",
+   "bits": 4,
+   "k": 4,
+   "total_gbps": 35.380859375,
+   "per_node": 8.84521484375,
+   "clean_needed_80pct": 11.0565185546875
+  },
+  {
+   "format": "per-baseline n_sub 4",
+   "bits": 5,
+   "k": 3,
+   "total_gbps": 44.2626953125,
+   "per_node": 11.065673828125,
+   "clean_needed_80pct": 13.83209228515625
+  },
+  {
+   "format": "per-baseline n_sub 4",
+   "bits": 6,
+   "k": 2,
+   "total_gbps": 53.369140625,
+   "per_node": 13.34228515625,
+   "clean_needed_80pct": 16.6778564453125
+  }
+ ]
+}

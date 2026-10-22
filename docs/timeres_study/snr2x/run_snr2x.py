@@ -14,7 +14,8 @@ WIDTHS_MS = np.array([0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0])
 SCHEMES = {"current": (current, (60.0, 1700.0)),
            "prop_q026": (lambda: proposed(q1=T4), (50.0, 3000.0)),
            "prop_q052": (lambda: proposed(q1=T2), (50.0, 3000.0)),
-           "single": (single_shot, (50.0, 1700.0))}
+           "single": (single_shot, (50.0, 1700.0)),
+           "prop_ns4": (lambda: proposed(q1=T4, n_sub=4), (50.0, 3000.0))}
 STEP, JIT = 4.0, 1.5
 _S = {}
 
