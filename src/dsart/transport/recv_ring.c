@@ -63,7 +63,11 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <stddef.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "recv_ring.h"
 
 /* Try POSIX shm_open / shm_unlink from <sys/mman.h> (Linux). */
 #ifndef SHM_NAME_MAX
@@ -1280,4 +1284,903 @@ rx_ring_get_dims(
     if (out_bytes_per_cell)    *out_bytes_per_cell    = ring->hdr->bytes_per_cell;
     if (out_slot_stride_bytes) *out_slot_stride_bytes = ring->hdr->slot_stride_bytes;
     if (out_shm_size)          *out_shm_size          = ring->shm_size;
+}
+
+
+/* =======================================================================
+ * Ring v4 — x2 2x time resolution (docs/x2/SPEC.md §6, FROZEN)
+ * =======================================================================
+ *
+ * Nothing above this line is touched by v4: a v4 ring is a separate shm
+ * segment with version 4, written by the RX in v4 mode (recv_epoll.c) from
+ * frame-v2 datagrams (prod_frame2.py).
+ *
+ * Segment layout (all offsets from the shm base, page aligned):
+ *   [rx4_header_t 135168 B]
+ *   [per owned DM: tags u64 [n_stream][t_buf], steps f32 [n_stream][t_buf][2]]
+ *   [data: per owned DM uint8 [n_stream][t_buf][row_bytes]]
+ * The steps sidecar holds the frame's (step_main, step_heavy) of each row
+ * (0 for holes / mismatch rows), written inside the row seqlock.
+ * Row (dm, stream, seq) lives at index seq % t_buf. seq is the tier-clock
+ * sample index from the frame (= t0_native / t_int_factor), so rows are
+ * aligned to absolute time; a (dm, stream) window is contiguous unless it
+ * wraps.
+ *
+ * Row tag (u64): bits 0..55 = seq, bits 56..63 = row state
+ *   PRESENT | HOLE | MISMATCH (one of; "final") + RFI_WARM / NOISE_WARM /
+ *   ROW_GUARD (frame flags carried with PRESENT rows);
+ *   0 = never written; all-ones = WRITING (a write is in progress).
+ * Writer protocol per row (seqlock): tag = WRITING (relaxed); release
+ * fence; write row bytes (zero padding to row_bytes); tag = seq | state
+ * (release). Readers: t1 = acquire(tag); read; acquire fence; t2 = tag;
+ * the row is good iff t1 == t2 == seq | PRESENT.
+ *
+ * Per (dm, stream) flow state (single writer, readers load-acquire):
+ *   complete_through: every row < it is final (present, hole or mismatch);
+ *   max_end: 1 + highest seq placed; last_progress_ns: when
+ *   complete_through last moved (CLOCK_MONOTONIC); gap_since_ns: when the
+ *   current gap at complete_through was first seen. A missing row becomes a
+ *   HOLE (zero-filled) once it is reorder_rows behind max_end, or when the
+ *   gap is older than hole_timeout_ns (rx4_sweep, every ~10 ms). Final rows
+ *   never change until the writer laps them (seq + t_buf), so a zero-copy
+ *   reader view of a final window is stable until then. Late data for a
+ *   final row is dropped and counted.
+ *
+ * Readers never write: they map the segment PROT_READ and call the const
+ * helpers (rx4_scan / rx4_window_validity / rx4_copy_window /
+ * rx4_recheck). Reader-side counters (overruns, fan-in outcomes) live in
+ * the reader process (recv_ring.py RxRingV4Reader), never in the segment.
+ */
+
+#define RX4_MAGIC          UINT32_C(0xD5A1107E)
+#define RX4_VERSION        UINT32_C(4)
+#define RX4_PAGE           UINT64_C(4096)
+#define RX4_SEQ_MASK       ((UINT64_C(1) << 56) - 1)
+#define RX4_TAG_WRITING    UINT64_MAX
+#define RX4_TAG_PRESENT    (UINT64_C(0x01) << 56)
+#define RX4_TAG_HOLE       (UINT64_C(0x02) << 56)
+#define RX4_TAG_MISMATCH   (UINT64_C(0x04) << 56)
+#define RX4_TAG_RFI_WARM   (UINT64_C(0x08) << 56)
+#define RX4_TAG_NOISE_WARM (UINT64_C(0x10) << 56)
+#define RX4_TAG_ROW_GUARD  (UINT64_C(0x20) << 56)
+#define RX4_TAG_FINAL      (RX4_TAG_PRESENT | RX4_TAG_HOLE | RX4_TAG_MISMATCH)
+
+#define RX4_STATE_INIT     UINT64_C(0)
+#define RX4_STATE_READY    UINT64_C(1)
+#define RX4_STATE_CLOSED   UINT64_C(2)
+
+#define RX4_N_COUNTERS     32
+
+/* Frame v2 — mirrors src/dsart/transport/prod_frame2.py. */
+#define F2_MAGIC           UINT32_C(0xD5A1107E)
+#define F2_VERSION         2
+#define F2_HDR             72
+#define F2_MAX_PAYLOAD     8900
+#define F2_FLAG_QUANTIZED  (1u << 0)
+#define F2_FLAG_LAST       (1u << 1)
+#define F2_FLAG_RESERVED2  (1u << 2)
+#define F2_FLAG_NOISE_WARM (1u << 3)
+#define F2_FLAG_RFI_WARM   (1u << 4)
+#define F2_FLAG_HEAVY      (1u << 5)
+#define F2_FLAG_ROW_GUARD  (1u << 6)
+#define F2_FLAGS_DEFINED   0x7Fu
+
+typedef struct __attribute__((packed)) f2_hdr {
+    uint32_t magic;          /* 0 */
+    uint16_t version;        /* 4 */
+    uint16_t flags;          /* 6 */
+    uint64_t seq_first;      /* 8 */
+    uint64_t t0_native;      /* 16 */
+    uint16_t stream_id;      /* 24 */
+    uint16_t dm_idx;         /* 26 */
+    uint8_t  k;              /* 28 */
+    uint8_t  n_sub;          /* 29 */
+    uint8_t  bits_main;      /* 30 */
+    uint8_t  bits_heavy;     /* 31 */
+    uint16_t n_grid;         /* 32 */
+    uint8_t  t_int_factor;   /* 34 */
+    uint8_t  value_kind;     /* 35 */
+    uint32_t n_values;       /* 36 */
+    uint64_t pattern_id;     /* 40 */
+    uint32_t n_heavy;        /* 48 */
+    float    step_main;      /* 52 */
+    float    step_heavy;     /* 56 */
+    uint32_t payload_bytes;  /* 60 */
+    float    s_main;         /* 64 */
+    float    s_heavy;        /* 68 */
+} f2_hdr_t;
+_Static_assert(sizeof(f2_hdr_t) == F2_HDR, "frame v2 header must be 72 bytes");
+
+typedef struct rx4_dm_desc {
+    uint32_t dm_global;
+    uint32_t t_int_factor;
+    uint32_t t_buf;
+    uint32_t reorder_rows;
+    uint64_t data_off;
+    uint64_t tags_off;
+    uint64_t steps_off;      /* f32 [n_stream][t_buf][2]: step_main, step_heavy */
+    uint64_t _pad[3];
+} rx4_dm_desc_t;
+_Static_assert(sizeof(rx4_dm_desc_t) == 64, "rx4_dm_desc_t is 64 B");
+
+typedef struct rx4_stream_desc {
+    uint32_t n_values;          /* 0 = unchecked */
+    uint32_t n_heavy;
+    uint32_t bytes_per_sample;  /* 0 = unchecked */
+    uint32_t pid_set;           /* atomic */
+    uint64_t pattern_id;        /* atomic */
+    uint64_t _pad;
+} rx4_stream_desc_t;
+_Static_assert(sizeof(rx4_stream_desc_t) == 32, "rx4_stream_desc_t is 32 B");
+
+typedef struct rx4_flow {
+    uint64_t complete_through;
+    uint64_t max_end;
+    uint64_t last_progress_ns;
+    uint64_t datagrams;
+    uint64_t rows_written;
+    uint64_t rows_late;
+    uint64_t rows_dup;
+    uint64_t rows_hole;
+    uint64_t rows_mismatch;
+    uint64_t resyncs;
+    uint64_t first_seq;
+    uint64_t started;
+    uint64_t gap_since_ns;
+    uint64_t _pad[3];
+} rx4_flow_t;
+_Static_assert(sizeof(rx4_flow_t) == 128, "rx4_flow_t is 128 B");
+
+typedef struct rx4_header {
+    uint32_t magic;             /* 0 */
+    uint32_t version;           /* 4 */
+    uint32_t header_bytes;      /* 8: == sizeof(rx4_header_t) */
+    uint32_t n_dm;              /* 12 */
+    uint32_t n_stream;          /* 16 */
+    uint32_t n_sub;             /* 20 */
+    uint32_t row_bytes;         /* 24 */
+    uint32_t bits_main;         /* 28 */
+    uint32_t bits_heavy;        /* 32 */
+    uint32_t value_kind;        /* 36 */
+    uint32_t n_grid;            /* 40 */
+    uint32_t quant_mode;        /* 44 */
+    float    s_main;            /* 48 */
+    float    s_heavy;           /* 52 */
+    uint32_t check_scales;      /* 56 */
+    uint32_t _pad0;             /* 60 */
+    uint64_t shm_size;          /* 64 */
+    uint64_t data_start;        /* 72 */
+    uint64_t create_unix_ns;    /* 80 */
+    uint64_t writer_pid;        /* 88 */
+    uint64_t generation;        /* 96 */
+    uint64_t hole_timeout_ns;   /* 104 */
+    uint64_t heartbeat_ns;      /* 112: atomic, CLOCK_MONOTONIC of the last sweep */
+    uint64_t state;             /* 120: atomic, 0 init / 1 ready / 2 closed */
+    uint64_t _pad1[48];         /* 128 */
+    uint64_t counters[RX4_N_COUNTERS];               /* 512 */
+    rx4_dm_desc_t dms[RX4_MAX_DM];                   /* 768 */
+    rx4_stream_desc_t streams[RX4_MAX_STREAM];       /* 1792 */
+    uint8_t  _pad2[256];                             /* 3840 */
+    rx4_flow_t flows[RX4_MAX_DM][RX4_MAX_STREAM];    /* 4096 */
+} rx4_header_t;
+_Static_assert(offsetof(rx4_header_t, counters) == 512, "counters @512");
+_Static_assert(offsetof(rx4_header_t, dms) == 768, "dms @768");
+_Static_assert(offsetof(rx4_header_t, streams) == 1792, "streams @1792");
+_Static_assert(offsetof(rx4_header_t, flows) == 4096, "flows @4096");
+_Static_assert(sizeof(rx4_header_t) == 135168, "rx4 header is 33 pages");
+_Static_assert(RX4_C_N <= RX4_N_COUNTERS, "counter array too small");
+
+struct rx4_ring {
+    rx4_header_t *hdr;
+    uint8_t      *base;
+    size_t        size;
+    int           fd;
+    char          name[SHM_NAME_MAX + 1];
+    int8_t        dm_lut[65536];   /* global dm_idx -> local, -1 = not owned */
+};
+
+uint64_t
+rx4_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t
+rx4_unix_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static inline uint64_t
+rx4_bps(uint32_t n_values, uint32_t n_heavy, uint32_t bits_main,
+        uint32_t bits_heavy)
+{
+    return (uint64_t)n_heavy * bits_heavy / 8
+           + ((uint64_t)(n_values - n_heavy) * bits_main + 7) / 8;
+}
+
+static inline int
+rx4_valid_tif(uint32_t t)
+{
+    return t == 1 || t == 4 || t == 8 || t == 16 || t == 32 || t == 64
+           || t == 128;
+}
+
+static inline uint64_t
+rx4_round_up(uint64_t x, uint64_t a)
+{
+    return (x + a - 1) / a * a;
+}
+
+static inline void
+rx4_cadd(rx4_header_t *h, int i, uint64_t v)
+{
+    __atomic_fetch_add(&h->counters[i], v, __ATOMIC_RELAXED);
+}
+
+static inline void
+rx4_fadd(uint64_t *p, uint64_t v)
+{
+    __atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+}
+
+static inline uint64_t *
+rx4_tag_ptr(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq)
+{
+    const rx4_dm_desc_t *dd = &r->hdr->dms[d];
+    return (uint64_t *)(r->base + dd->tags_off)
+           + (size_t)s * dd->t_buf + (size_t)(seq % dd->t_buf);
+}
+
+static inline float *
+rx4_steps_ptr(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq)
+{
+    const rx4_dm_desc_t *dd = &r->hdr->dms[d];
+    return (float *)(r->base + dd->steps_off)
+           + 2 * ((size_t)s * dd->t_buf + (size_t)(seq % dd->t_buf));
+}
+
+static inline uint8_t *
+rx4_row_ptr(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq)
+{
+    const rx4_dm_desc_t *dd = &r->hdr->dms[d];
+    return r->base + dd->data_off
+           + ((size_t)s * dd->t_buf + (size_t)(seq % dd->t_buf))
+             * (size_t)r->hdr->row_bytes;
+}
+
+static inline int
+rx4_row_final(uint64_t t, uint64_t seq)
+{
+    return t != RX4_TAG_WRITING && (t & RX4_SEQ_MASK) == seq
+           && (t & RX4_TAG_FINAL) != 0;
+}
+
+rx4_ring_t *
+rx4_create(const char *name, const rx4_config_t *cfg, int prefault,
+           char *errbuf, size_t errbuf_len)
+{
+#define E4(...) do { \
+    if (errbuf && errbuf_len > 0) snprintf(errbuf, errbuf_len, __VA_ARGS__); \
+} while (0)
+    if (!name || !name[0]) { E4("rx4_create: empty name"); return NULL; }
+    if (!cfg) { E4("rx4_create: NULL config"); return NULL; }
+    if (cfg->n_dm < 1 || cfg->n_dm > RX4_MAX_DM) {
+        E4("n_dm=%u not in [1, %d]", cfg->n_dm, RX4_MAX_DM); return NULL;
+    }
+    if (cfg->n_stream < 1 || cfg->n_stream > RX4_MAX_STREAM) {
+        E4("n_stream=%u not in [1, %d]", cfg->n_stream, RX4_MAX_STREAM); return NULL;
+    }
+    if (cfg->n_sub != 1 && cfg->n_sub != 2 && cfg->n_sub != 4) {
+        E4("n_sub=%u not in {1,2,4}", cfg->n_sub); return NULL;
+    }
+    if (cfg->row_bytes == 0 || cfg->row_bytes % 8 != 0) {
+        E4("row_bytes=%u must be a positive multiple of 8", cfg->row_bytes); return NULL;
+    }
+    if (cfg->bits_main != 8 && cfg->bits_main != 10 && cfg->bits_main != 12) {
+        E4("bits_main=%u not in {8,10,12}", cfg->bits_main); return NULL;
+    }
+    if (cfg->bits_heavy != 0 && cfg->bits_heavy != 16) {
+        E4("bits_heavy=%u not in {0,16}", cfg->bits_heavy); return NULL;
+    }
+    if (cfg->value_kind > 1 || cfg->quant_mode != 0) {
+        E4("value_kind=%u must be 0 or 1; quant_mode=%u must be 0 (mid-tread)",
+           cfg->value_kind, cfg->quant_mode); return NULL;
+    }
+    if (cfg->hole_timeout_ns == 0) { E4("hole_timeout_ns must be > 0"); return NULL; }
+    for (uint32_t d = 0; d < cfg->n_dm; d++) {
+        if (cfg->dm_global[d] > 0xFFFF) { E4("dm_global[%u] > 65535", d); return NULL; }
+        for (uint32_t e = 0; e < d; e++)
+            if (cfg->dm_global[e] == cfg->dm_global[d]) {
+                E4("dm_global %u listed twice", cfg->dm_global[d]); return NULL;
+            }
+        if (!rx4_valid_tif(cfg->t_int_factor[d])) {
+            E4("t_int_factor[%u]=%u invalid", d, cfg->t_int_factor[d]); return NULL;
+        }
+        if (cfg->t_buf[d] < 2) { E4("t_buf[%u] < 2", d); return NULL; }
+        if (cfg->reorder_rows[d] < 1 || cfg->reorder_rows[d] >= cfg->t_buf[d]) {
+            E4("reorder_rows[%u]=%u not in [1, t_buf)", d, cfg->reorder_rows[d]);
+            return NULL;
+        }
+    }
+    for (uint32_t s = 0; s < cfg->n_stream; s++) {
+        uint32_t nv = cfg->stream_n_values[s], nh = cfg->stream_n_heavy[s];
+        if (!nv) continue;
+        if (nh > nv || (cfg->bits_heavy == 0 && nh)) {
+            E4("stream %u: n_heavy=%u invalid (n_values=%u)", s, nh, nv); return NULL;
+        }
+        uint64_t bps = rx4_bps(nv, nh, cfg->bits_main, cfg->bits_heavy);
+        if (bps > cfg->row_bytes) {
+            E4("stream %u: %llu B/sample > row_bytes=%u", s,
+               (unsigned long long)bps, cfg->row_bytes); return NULL;
+        }
+    }
+
+    /* Layout. */
+    uint64_t off = sizeof(rx4_header_t);
+    uint64_t tags_off[RX4_MAX_DM], steps_off[RX4_MAX_DM], data_off[RX4_MAX_DM];
+    for (uint32_t d = 0; d < cfg->n_dm; d++) {
+        tags_off[d] = off;
+        off = rx4_round_up(off + (uint64_t)cfg->n_stream * cfg->t_buf[d] * 8, RX4_PAGE);
+        steps_off[d] = off;
+        off = rx4_round_up(off + (uint64_t)cfg->n_stream * cfg->t_buf[d] * 8, RX4_PAGE);
+    }
+    const uint64_t data_start = off;
+    for (uint32_t d = 0; d < cfg->n_dm; d++) {
+        data_off[d] = off;
+        off = rx4_round_up(off + (uint64_t)cfg->n_stream * cfg->t_buf[d]
+                                 * cfg->row_bytes, RX4_PAGE);
+    }
+    const uint64_t size = off;
+
+    rx4_ring_t *r = (rx4_ring_t *)calloc(1, sizeof(rx4_ring_t));
+    if (!r) { E4("out of memory"); return NULL; }
+    strncpy(r->name, name, SHM_NAME_MAX);
+    r->name[SHM_NAME_MAX] = '\0';
+    r->fd = -1;
+
+    (void)shm_unlink(name);   /* a fresh object: no stale rows, zero pages */
+    r->fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0660);
+    if (r->fd < 0) { E4("shm_open(%s): %s", name, strerror(errno)); free(r); return NULL; }
+    if (ftruncate(r->fd, (off_t)size) < 0) {
+        E4("ftruncate(%llu): %s", (unsigned long long)size, strerror(errno));
+        close(r->fd); shm_unlink(name); free(r); return NULL;
+    }
+    void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd, 0);
+    if (base == MAP_FAILED) {
+        E4("mmap(%llu): %s", (unsigned long long)size, strerror(errno));
+        close(r->fd); shm_unlink(name); free(r); return NULL;
+    }
+    r->base = (uint8_t *)base;
+    r->hdr = (rx4_header_t *)base;
+    r->size = size;
+
+    rx4_header_t *h = r->hdr;
+    h->magic = RX4_MAGIC;
+    h->version = RX4_VERSION;
+    h->header_bytes = (uint32_t)sizeof(rx4_header_t);
+    h->n_dm = cfg->n_dm;
+    h->n_stream = cfg->n_stream;
+    h->n_sub = cfg->n_sub;
+    h->row_bytes = cfg->row_bytes;
+    h->bits_main = cfg->bits_main;
+    h->bits_heavy = cfg->bits_heavy;
+    h->value_kind = cfg->value_kind;
+    h->n_grid = cfg->n_grid;
+    h->quant_mode = cfg->quant_mode;
+    h->s_main = cfg->s_main;
+    h->s_heavy = cfg->s_heavy;
+    h->check_scales = cfg->check_scales ? 1u : 0u;
+    h->shm_size = size;
+    h->data_start = data_start;
+    h->create_unix_ns = rx4_unix_ns();
+    h->writer_pid = (uint64_t)getpid();
+    h->hole_timeout_ns = cfg->hole_timeout_ns;
+    uint64_t gen = 0;
+    int ufd = open("/dev/urandom", O_RDONLY);
+    if (ufd >= 0) {
+        if (read(ufd, &gen, sizeof(gen)) != (ssize_t)sizeof(gen)) gen = 0;
+        close(ufd);
+    }
+    if (!gen) gen = h->create_unix_ns ^ ((uint64_t)getpid() << 32);
+    h->generation = gen;
+    memset(r->dm_lut, -1, sizeof(r->dm_lut));
+    for (uint32_t d = 0; d < cfg->n_dm; d++) {
+        rx4_dm_desc_t *dd = &h->dms[d];
+        dd->dm_global = cfg->dm_global[d];
+        dd->t_int_factor = cfg->t_int_factor[d];
+        dd->t_buf = cfg->t_buf[d];
+        dd->reorder_rows = cfg->reorder_rows[d];
+        dd->tags_off = tags_off[d];
+        dd->steps_off = steps_off[d];
+        dd->data_off = data_off[d];
+        r->dm_lut[cfg->dm_global[d]] = (int8_t)d;
+    }
+    for (uint32_t s = 0; s < cfg->n_stream; s++) {
+        rx4_stream_desc_t *sd = &h->streams[s];
+        sd->n_values = cfg->stream_n_values[s];
+        sd->n_heavy = cfg->stream_n_heavy[s];
+        sd->bytes_per_sample = sd->n_values
+            ? (uint32_t)rx4_bps(sd->n_values, sd->n_heavy, cfg->bits_main,
+                                cfg->bits_heavy)
+            : 0u;
+    }
+    if (prefault)
+        memset(r->base + sizeof(rx4_header_t), 0, size - sizeof(rx4_header_t));
+    __atomic_store_n(&h->heartbeat_ns, rx4_now_ns(), __ATOMIC_RELAXED);
+    __atomic_store_n(&h->state, RX4_STATE_READY, __ATOMIC_RELEASE);
+    return r;
+#undef E4
+}
+
+void
+rx4_close(rx4_ring_t *r)
+{
+    if (!r) return;
+    if (r->hdr) {
+        __atomic_store_n(&r->hdr->state, RX4_STATE_CLOSED, __ATOMIC_RELEASE);
+        munmap(r->base, r->size);
+    }
+    if (r->fd >= 0) close(r->fd);
+    free(r);
+}
+
+int
+rx4_unlink(const char *name)
+{
+    return shm_unlink(name);
+}
+
+void *
+rx4_base(rx4_ring_t *r)
+{
+    return r ? (void *)r->base : NULL;
+}
+
+uint64_t
+rx4_size(rx4_ring_t *r)
+{
+    return r ? (uint64_t)r->size : 0;
+}
+
+/* One row, seqlock-style (see the section comment). src == NULL zero-fills. */
+static void
+rx4_write_row(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq,
+              const uint8_t *src, uint64_t bps, uint64_t state,
+              float step_main, float step_heavy)
+{
+    uint64_t *tp = rx4_tag_ptr(r, d, s, seq);
+    uint8_t *row = rx4_row_ptr(r, d, s, seq);
+    float *sp = rx4_steps_ptr(r, d, s, seq);
+    const uint64_t rb = r->hdr->row_bytes;
+    __atomic_store_n(tp, RX4_TAG_WRITING, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    sp[0] = src ? step_main : 0.0f;
+    sp[1] = src ? step_heavy : 0.0f;
+    if (src) {
+        memcpy(row, src, bps);
+        if (bps < rb) memset(row + bps, 0, rb - bps);
+    } else {
+        memset(row, 0, rb);
+    }
+    __atomic_store_n(tp, (seq & RX4_SEQ_MASK) | state, __ATOMIC_RELEASE);
+}
+
+/* Advance complete_through over final rows; declare holes for missing rows
+ * that are reorder_rows behind max_end or below force_until. */
+static void
+rx4_advance(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t force_until,
+            uint64_t now_ns)
+{
+    rx4_header_t *h = r->hdr;
+    rx4_flow_t *f = &h->flows[d][s];
+    const uint64_t rr = h->dms[d].reorder_rows;
+    const uint64_t me = __atomic_load_n(&f->max_end, __ATOMIC_RELAXED);
+    const uint64_t ct0 = __atomic_load_n(&f->complete_through, __ATOMIC_RELAXED);
+    uint64_t ct = ct0, holes = 0;
+    for (;;) {
+        while (ct < me && rx4_row_final(
+                   __atomic_load_n(rx4_tag_ptr(r, d, s, ct), __ATOMIC_RELAXED), ct))
+            ct++;
+        uint64_t hole_until = me > rr ? me - rr : 0;
+        if (force_until > hole_until) hole_until = force_until;
+        if (hole_until > me) hole_until = me;
+        if (ct >= me || ct >= hole_until) break;
+        rx4_write_row(r, d, s, ct, NULL, 0, RX4_TAG_HOLE, 0.0f, 0.0f);
+        holes++;
+        ct++;
+    }
+    if (holes) rx4_fadd(&f->rows_hole, holes);
+    if (ct != ct0) {
+        __atomic_store_n(&f->complete_through, ct, __ATOMIC_RELEASE);
+        __atomic_store_n(&f->last_progress_ns, now_ns, __ATOMIC_RELEASE);
+    }
+    if (ct < me) {
+        if (ct != ct0 || __atomic_load_n(&f->gap_since_ns, __ATOMIC_RELAXED) == 0)
+            __atomic_store_n(&f->gap_since_ns, now_ns ? now_ns : 1, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&f->gap_since_ns, 0, __ATOMIC_RELEASE);
+    }
+}
+
+static void
+rx4_flow_reset(rx4_flow_t *f, uint64_t seq, uint64_t now_ns)
+{
+    __atomic_store_n(&f->max_end, seq, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->complete_through, seq, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->last_progress_ns, now_ns, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->gap_since_ns, 0, __ATOMIC_RELEASE);
+}
+
+static void
+rx4_place(rx4_ring_t *r, uint32_t d, uint32_t s, uint64_t seq_first,
+          uint32_t k, const uint8_t *payload, uint64_t bps, uint64_t state,
+          float step_main, float step_heavy, uint64_t now_ns)
+{
+    rx4_header_t *h = r->hdr;
+    rx4_flow_t *f = &h->flows[d][s];
+    const uint64_t tb = h->dms[d].t_buf;
+    const uint64_t end = seq_first + k;
+    rx4_fadd(&f->datagrams, 1);
+    if (!__atomic_load_n(&f->started, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&f->first_seq, seq_first, __ATOMIC_RELAXED);
+        rx4_flow_reset(f, seq_first, now_ns);
+        __atomic_store_n(&f->started, 1, __ATOMIC_RELEASE);
+    } else {
+        const uint64_t ct = __atomic_load_n(&f->complete_through, __ATOMIC_RELAXED);
+        const uint64_t me = __atomic_load_n(&f->max_end, __ATOMIC_RELAXED);
+        if (seq_first >= me + tb || end + tb <= ct) {
+            /* Jump beyond retention either way (sender restart / epoch
+             * change / long outage): restart the flow at this datagram. */
+            rx4_fadd(&f->resyncs, 1);
+            rx4_flow_reset(f, seq_first, now_ns);
+        } else if (end <= ct) {
+            rx4_fadd(&f->rows_late, k);
+            return;
+        }
+    }
+    /* max_end first, so a reader seeing a WRITING tag can tell a lap. */
+    if (end > __atomic_load_n(&f->max_end, __ATOMIC_RELAXED))
+        __atomic_store_n(&f->max_end, end, __ATOMIC_RELEASE);
+    const uint64_t ct = __atomic_load_n(&f->complete_through, __ATOMIC_RELAXED);
+    uint64_t written = 0, late = 0, dup = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        const uint64_t seq = seq_first + i;
+        if (seq < ct) { late++; continue; }
+        if (rx4_row_final(__atomic_load_n(rx4_tag_ptr(r, d, s, seq),
+                                          __ATOMIC_RELAXED), seq)) {
+            dup++;
+            continue;
+        }
+        rx4_write_row(r, d, s, seq, payload ? payload + (size_t)i * bps : NULL,
+                      bps, state, step_main, step_heavy);
+        written++;
+    }
+    if (written)
+        rx4_fadd((state & RX4_TAG_MISMATCH) ? &f->rows_mismatch : &f->rows_written,
+                 written);
+    if (late) rx4_fadd(&f->rows_late, late);
+    if (dup) rx4_fadd(&f->rows_dup, dup);
+    rx4_advance(r, d, s, 0, now_ns);
+}
+
+int
+rx4_ingest(rx4_ring_t *r, const uint8_t *buf, size_t len, uint64_t now_ns,
+           uint32_t port_chgroup)
+{
+    if (!r || !r->hdr || !buf) return -1;
+    rx4_header_t *h = r->hdr;
+    rx4_cadd(h, RX4_C_DATAGRAMS, 1);
+    rx4_cadd(h, RX4_C_BYTES, (uint64_t)len);
+#define REJECT(c) do { rx4_cadd(h, (c), 1); return (c); } while (0)
+    if (len < F2_HDR) REJECT(RX4_C_BAD_LENGTH);
+    f2_hdr_t fh;
+    memcpy(&fh, buf, F2_HDR);
+    if (fh.magic != F2_MAGIC) REJECT(RX4_C_BAD_MAGIC);
+    if (fh.version != F2_VERSION) {
+        if (fh.version == 1) rx4_cadd(h, RX4_C_V1_FRAMES, 1);
+        REJECT(RX4_C_BAD_VERSION);
+    }
+    const uint32_t fl = fh.flags;
+    if (!(fl & F2_FLAG_QUANTIZED) || (fl & F2_FLAG_RESERVED2)
+        || (fl & ~F2_FLAGS_DEFINED)
+        || (((fl & F2_FLAG_HEAVY) != 0) != (fh.n_heavy > 0)))
+        REJECT(RX4_C_BAD_FLAGS);
+    if (fh.k < 1
+        || (fh.n_sub != 1 && fh.n_sub != 2 && fh.n_sub != 4)
+        || (fh.bits_main != 8 && fh.bits_main != 10 && fh.bits_main != 12)
+        || (fh.bits_heavy != 0 && fh.bits_heavy != 16)
+        || fh.n_values < 1 || fh.n_heavy > fh.n_values
+        || (fh.bits_heavy == 0 && fh.n_heavy > 0)
+        || fh.value_kind > 1
+        || !rx4_valid_tif(fh.t_int_factor)
+        || fh.stream_id >= 16u * fh.n_sub
+        || fh.seq_first >= RX4_SEQ_MASK - fh.k)
+        REJECT(RX4_C_BAD_FIELD);
+    const uint64_t bps = rx4_bps(fh.n_values, fh.n_heavy, fh.bits_main,
+                                 fh.bits_heavy);
+    if ((uint64_t)fh.payload_bytes != (uint64_t)(len - F2_HDR)
+        || (uint64_t)fh.payload_bytes != (uint64_t)fh.k * bps
+        || fh.payload_bytes > F2_MAX_PAYLOAD)
+        REJECT(RX4_C_BAD_LENGTH);
+    if (fh.t0_native != fh.seq_first * (uint64_t)fh.t_int_factor)
+        REJECT(RX4_C_BAD_TIME);
+    if (fh.n_sub != h->n_sub || fh.bits_main != h->bits_main
+        || (fh.bits_heavy != 0 && fh.bits_heavy != h->bits_heavy)
+        || fh.value_kind != h->value_kind || fh.n_grid != h->n_grid
+        || bps > h->row_bytes)
+        REJECT(RX4_C_FORMAT_MISMATCH);
+    if (h->check_scales
+        && (memcmp(&fh.s_main, &h->s_main, sizeof(float)) != 0
+            || memcmp(&fh.s_heavy, &h->s_heavy, sizeof(float)) != 0))
+        REJECT(RX4_C_FORMAT_MISMATCH);
+    if (fh.stream_id >= h->n_stream) REJECT(RX4_C_BAD_FIELD);
+    if (port_chgroup != UINT32_MAX && fh.stream_id / fh.n_sub != port_chgroup)
+        REJECT(RX4_C_PORT_MISMATCH);
+    const int d = r->dm_lut[fh.dm_idx];
+    if (d < 0) REJECT(RX4_C_NOT_OWNED);
+    if (fh.t_int_factor != h->dms[d].t_int_factor) REJECT(RX4_C_TIER_MISMATCH);
+    const rx4_stream_desc_t *sd = &h->streams[fh.stream_id];
+    if (sd->n_values && (fh.n_values != sd->n_values || fh.n_heavy != sd->n_heavy))
+        REJECT(RX4_C_STREAM_MISMATCH);
+    int mismatch = 0;
+    if (__atomic_load_n(&sd->pid_set, __ATOMIC_ACQUIRE)
+        && fh.pattern_id != __atomic_load_n(&sd->pattern_id, __ATOMIC_RELAXED))
+        mismatch = 1;
+    uint64_t state;
+    if (mismatch) {
+        state = RX4_TAG_MISMATCH;
+    } else {
+        state = RX4_TAG_PRESENT;
+        if (fl & F2_FLAG_RFI_WARM) state |= RX4_TAG_RFI_WARM;
+        if (fl & F2_FLAG_NOISE_WARM) state |= RX4_TAG_NOISE_WARM;
+        if (fl & F2_FLAG_ROW_GUARD) state |= RX4_TAG_ROW_GUARD;
+    }
+    rx4_place(r, (uint32_t)d, fh.stream_id, fh.seq_first, fh.k,
+              mismatch ? NULL : buf + F2_HDR, bps, state,
+              fh.step_main, fh.step_heavy, now_ns);
+    if (mismatch) REJECT(RX4_C_PATTERN_MISMATCH);
+    rx4_cadd(h, RX4_C_OK, 1);
+    return RX4_C_OK;
+#undef REJECT
+}
+
+void
+rx4_sweep(rx4_ring_t *r, uint64_t now_ns, uint64_t stream_mask)
+{
+    if (!r || !r->hdr) return;
+    rx4_header_t *h = r->hdr;
+    __atomic_store_n(&h->heartbeat_ns, now_ns, __ATOMIC_RELEASE);
+    rx4_cadd(h, RX4_C_SWEEPS, 1);
+    const uint64_t to = h->hole_timeout_ns;
+    for (uint32_t d = 0; d < h->n_dm; d++) {
+        for (uint32_t s = 0; s < h->n_stream; s++) {
+            if (!((stream_mask >> s) & 1u)) continue;
+            rx4_flow_t *f = &h->flows[d][s];
+            if (!__atomic_load_n(&f->started, __ATOMIC_RELAXED)) continue;
+            const uint64_t ct = __atomic_load_n(&f->complete_through, __ATOMIC_RELAXED);
+            const uint64_t me = __atomic_load_n(&f->max_end, __ATOMIC_RELAXED);
+            if (ct >= me) continue;
+            const uint64_t gs = __atomic_load_n(&f->gap_since_ns, __ATOMIC_RELAXED);
+            if (gs && now_ns > gs && now_ns - gs >= to)
+                rx4_advance(r, d, s, me, now_ns);
+        }
+    }
+}
+
+int
+rx4_set_expected_pid(rx4_ring_t *r, uint32_t stream, uint64_t pid)
+{
+    if (!r || !r->hdr || stream >= r->hdr->n_stream) return -1;
+    rx4_stream_desc_t *sd = &r->hdr->streams[stream];
+    __atomic_store_n(&sd->pattern_id, pid, __ATOMIC_RELAXED);
+    __atomic_store_n(&sd->pid_set, 1u, __ATOMIC_RELEASE);
+    return 0;
+}
+
+int
+rx4_clear_expected_pid(rx4_ring_t *r, uint32_t stream)
+{
+    if (!r || !r->hdr || stream >= r->hdr->n_stream) return -1;
+    __atomic_store_n(&r->hdr->streams[stream].pid_set, 0u, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* ABI description for the Python reader (layout cross-check). */
+int
+rx4_abi(uint64_t *out, uint32_t n)
+{
+    const uint64_t v[] = {
+        sizeof(rx4_header_t),
+        offsetof(rx4_header_t, counters),
+        offsetof(rx4_header_t, dms),
+        offsetof(rx4_header_t, streams),
+        offsetof(rx4_header_t, flows),
+        sizeof(rx4_dm_desc_t),
+        sizeof(rx4_stream_desc_t),
+        sizeof(rx4_flow_t),
+        RX4_N_COUNTERS,
+        RX4_C_N,
+        offsetof(rx4_header_t, heartbeat_ns),
+        offsetof(rx4_header_t, state),
+        F2_HDR,
+        sizeof(rx4_config_t),
+        offsetof(rx4_flow_t, gap_since_ns),
+        offsetof(rx4_dm_desc_t, steps_off),
+    };
+    const uint32_t m = (uint32_t)(sizeof(v) / sizeof(v[0]));
+    if (out)
+        for (uint32_t i = 0; i < n && i < m; i++) out[i] = v[i];
+    return (int)m;
+}
+
+static inline int
+rx4_reader_ok(const rx4_header_t *h, uint32_t d)
+{
+    return h && h->magic == RX4_MAGIC && h->version == RX4_VERSION
+           && d < h->n_dm;
+}
+
+int
+rx4_scan(const void *base, uint32_t d, uint64_t *out_ct, uint64_t *out_me,
+         uint64_t *out_lp)
+{
+    const rx4_header_t *h = (const rx4_header_t *)base;
+    if (!rx4_reader_ok(h, d)) return -1;
+    for (uint32_t s = 0; s < h->n_stream; s++) {
+        const rx4_flow_t *f = &h->flows[d][s];
+        if (out_ct) out_ct[s] = __atomic_load_n(&f->complete_through, __ATOMIC_ACQUIRE);
+        if (out_me) out_me[s] = __atomic_load_n(&f->max_end, __ATOMIC_ACQUIRE);
+        if (out_lp) out_lp[s] = __atomic_load_n(&f->last_progress_ns, __ATOMIC_ACQUIRE);
+    }
+    return 0;
+}
+
+static inline uint8_t
+rx4_classify(uint64_t t, uint64_t seq, uint64_t me, uint64_t tb)
+{
+    if (t == RX4_TAG_WRITING)
+        return me > seq + tb ? (uint8_t)RX4_RV_LAPPED : (uint8_t)RX4_RV_MISSING;
+    const uint64_t ts = t & RX4_SEQ_MASK;
+    if (ts == seq) {
+        if (t & RX4_TAG_PRESENT) {
+            uint8_t v = RX4_RV_PRESENT;
+            if (t & RX4_TAG_RFI_WARM) v |= RX4_RV_RFI_WARMING_UP;
+            if (t & RX4_TAG_NOISE_WARM) v |= RX4_RV_NOISE_WARMUP;
+            if (t & RX4_TAG_ROW_GUARD) v |= RX4_RV_ROW_GUARD;
+            return v;
+        }
+        if (t & RX4_TAG_HOLE) return RX4_RV_HOLE;
+        if (t & RX4_TAG_MISMATCH) return RX4_RV_PATTERN_MISMATCH;
+        return RX4_RV_MISSING;
+    }
+    if (ts > seq && (t & RX4_TAG_FINAL)) return RX4_RV_LAPPED;
+    return RX4_RV_MISSING;
+}
+
+static inline void
+rx4_count(uint64_t *c, uint8_t v)
+{
+    if (v & RX4_RV_PRESENT) c[0]++;
+    if (v & RX4_RV_HOLE) c[1]++;
+    if (v & RX4_RV_PATTERN_MISMATCH) c[2]++;
+    if (v & RX4_RV_MISSING) c[3]++;
+    if (v & RX4_RV_LAPPED) c[4]++;
+    if (v & RX4_RV_RFI_WARMING_UP) c[5]++;
+    if (v & RX4_RV_NOISE_WARMUP) c[6]++;
+    if (v & RX4_RV_ROW_GUARD) c[7]++;
+}
+
+/* out_validity: uint8 [n_stream][n_rows]; out_counts (optional): u64[8]
+ * += {present, hole, mismatch, missing, lapped, rfi_warm, noise_warm, 0}. */
+int
+rx4_window_validity(const void *base, uint32_t d, uint64_t t_first,
+                    uint32_t n_rows, uint8_t *out_v, uint64_t *out_counts)
+{
+    const rx4_header_t *h = (const rx4_header_t *)base;
+    if (!rx4_reader_ok(h, d) || !out_v) return -1;
+    const rx4_dm_desc_t *dd = &h->dms[d];
+    const uint64_t tb = dd->t_buf;
+    if (n_rows > tb) return -2;
+    const uint64_t *tags = (const uint64_t *)((const uint8_t *)base + dd->tags_off);
+    uint64_t c[8] = {0};
+    for (uint32_t s = 0; s < h->n_stream; s++) {
+        const uint64_t me = __atomic_load_n(&h->flows[d][s].max_end, __ATOMIC_ACQUIRE);
+        const uint64_t *ts = tags + (size_t)s * tb;
+        for (uint32_t i = 0; i < n_rows; i++) {
+            const uint64_t seq = t_first + i;
+            const uint64_t t = __atomic_load_n(&ts[seq % tb], __ATOMIC_ACQUIRE);
+            const uint8_t v = rx4_classify(t, seq, me, tb);
+            out_v[(size_t)s * n_rows + i] = v;
+            rx4_count(c, v);
+        }
+    }
+    if (out_counts)
+        for (int j = 0; j < 8; j++) out_counts[j] += c[j];
+    return 0;
+}
+
+/* Copy a window into out_rows [n_stream][n_rows][row_bytes]; every row that
+ * is not PRESENT (or is lapped during the copy) is zero-filled. */
+int
+rx4_copy_window(const void *base, uint32_t d, uint64_t t_first,
+                uint32_t n_rows, uint8_t *out_rows, float *out_steps,
+                uint8_t *out_v, uint64_t *out_counts)
+{
+    const rx4_header_t *h = (const rx4_header_t *)base;
+    if (!rx4_reader_ok(h, d) || !out_v || !out_rows) return -1;
+    const rx4_dm_desc_t *dd = &h->dms[d];
+    const uint64_t tb = dd->t_buf;
+    const size_t rb = h->row_bytes;
+    if (n_rows > tb) return -2;
+    const uint64_t *tags = (const uint64_t *)((const uint8_t *)base + dd->tags_off);
+    const uint8_t *data = (const uint8_t *)base + dd->data_off;
+    const float *steps = (const float *)((const uint8_t *)base + dd->steps_off);
+    uint64_t c[8] = {0};
+    for (uint32_t s = 0; s < h->n_stream; s++) {
+        const uint64_t me = __atomic_load_n(&h->flows[d][s].max_end, __ATOMIC_ACQUIRE);
+        for (uint32_t i = 0; i < n_rows; i++) {
+            const uint64_t seq = t_first + i;
+            const size_t idx = (size_t)s * tb + (size_t)(seq % tb);
+            const uint64_t t1 = __atomic_load_n(&tags[idx], __ATOMIC_ACQUIRE);
+            uint8_t v = rx4_classify(t1, seq, me, tb);
+            uint8_t *dst = out_rows + ((size_t)s * n_rows + i) * rb;
+            float *sdst = out_steps ? out_steps + 2 * ((size_t)s * n_rows + i) : NULL;
+            if (v & RX4_RV_PRESENT) {
+                memcpy(dst, data + idx * rb, rb);
+                if (sdst) { sdst[0] = steps[2 * idx]; sdst[1] = steps[2 * idx + 1]; }
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                const uint64_t t2 = __atomic_load_n(&tags[idx], __ATOMIC_RELAXED);
+                if (t2 != t1) {
+                    v = RX4_RV_LAPPED;
+                    memset(dst, 0, rb);
+                    if (sdst) { sdst[0] = 0.0f; sdst[1] = 0.0f; }
+                }
+            } else {
+                memset(dst, 0, rb);
+                if (sdst) { sdst[0] = 0.0f; sdst[1] = 0.0f; }
+            }
+            out_v[(size_t)s * n_rows + i] = v;
+            rx4_count(c, v);
+        }
+    }
+    if (out_counts)
+        for (int j = 0; j < 8; j++) out_counts[j] += c[j];
+    return 0;
+}
+
+/* After a zero-copy consumer has read a window: rows marked PRESENT whose
+ * tag changed since are re-marked LAPPED (their bytes were overwritten). */
+int
+rx4_recheck(const void *base, uint32_t d, uint64_t t_first, uint32_t n_rows,
+            uint8_t *v, uint64_t *out_n_changed)
+{
+    const rx4_header_t *h = (const rx4_header_t *)base;
+    if (!rx4_reader_ok(h, d) || !v) return -1;
+    const rx4_dm_desc_t *dd = &h->dms[d];
+    const uint64_t tb = dd->t_buf;
+    if (n_rows > tb) return -2;
+    const uint64_t *tags = (const uint64_t *)((const uint8_t *)base + dd->tags_off);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint64_t changed = 0;
+    for (uint32_t s = 0; s < h->n_stream; s++) {
+        for (uint32_t i = 0; i < n_rows; i++) {
+            uint8_t *vp = &v[(size_t)s * n_rows + i];
+            if (!(*vp & RX4_RV_PRESENT)) continue;
+            const uint64_t seq = t_first + i;
+            const uint64_t t = __atomic_load_n(
+                &tags[(size_t)s * tb + (size_t)(seq % tb)], __ATOMIC_ACQUIRE);
+            if (!(t != RX4_TAG_WRITING && (t & RX4_SEQ_MASK) == seq
+                  && (t & RX4_TAG_PRESENT))) {
+                *vp = RX4_RV_LAPPED;
+                changed++;
+            }
+        }
+    }
+    if (out_n_changed) *out_n_changed += changed;
+    return 0;
 }

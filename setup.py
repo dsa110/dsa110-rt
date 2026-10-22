@@ -8,6 +8,9 @@
   Python. Replaces the Python ``_RxLoop`` + ``TransportRxProd.ingest_datagram``
   hot path at production rates.
   Source: ``src/dsart/transport/recv_epoll.c``.
+* ``_send_mmsg`` (x2) — paced multi-destination ``sendmmsg`` sender (GIL
+  released, explicit DM -> destination routing) for the 2x corner turn.
+  Source: ``src/dsart/transport/send_mmsg.c``.
 * ``dsart_capture_manythread`` (M7.5) — SNAP-UDP -> PSRDADA capture
   binary, vendored from dsa110-xengine with dsart improvements
   (recvmmsg batch receive, deterministic arming, explicit SO_RCVBUF,
@@ -81,6 +84,23 @@ _recv_epoll = Extension(
     language="c",
 )
 
+# x2 (WS-T): paced multi-destination sendmmsg sender for the 2x corr TX.
+_send_mmsg = Extension(
+    name="dsart.transport._send_mmsg",
+    sources=["src/dsart/transport/send_mmsg.c"],
+    extra_compile_args=[
+        "-O3",
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-pthread",
+    ],
+    extra_link_args=[
+        "-pthread",
+    ],
+    language="c",
+)
+
 _CAPTURE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "src", "dsart", "capture",
@@ -146,6 +166,6 @@ class build_ext_with_capture_binary(build_ext):
 
 
 setup(
-    ext_modules=[_recv_ring, _recv_epoll],
+    ext_modules=[_recv_ring, _recv_epoll, _send_mmsg],
     cmdclass={"build_ext": build_ext_with_capture_binary},
 )

@@ -173,6 +173,26 @@ def _bind_signatures(lib: ctypes.CDLL) -> None:
         fn.argtypes = []
         fn.restype = ctypes.c_uint64
 
+    # x2 ring v4 mode (frame v2; recv_epoll.c v4 section).
+    if hasattr(lib, "recv_epoll_attach_ring4"):
+        from .recv_ring import Rx4Config, bind_rx4_api
+        lib.recv_epoll_attach_ring4.argtypes = [
+            ctypes.c_char_p, ctypes.POINTER(Rx4Config), ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t,
+        ]
+        lib.recv_epoll_attach_ring4.restype = ctypes.c_int
+        lib.recv_epoll_detach_ring4.argtypes = []
+        lib.recv_epoll_detach_ring4.restype = ctypes.c_int
+        lib.recv_epoll_ring4_set_expected_pid.argtypes = [ctypes.c_uint32, ctypes.c_uint64]
+        lib.recv_epoll_ring4_set_expected_pid.restype = ctypes.c_int
+        lib.recv_epoll_ring4_clear_expected_pid.argtypes = [ctypes.c_uint32]
+        lib.recv_epoll_ring4_clear_expected_pid.restype = ctypes.c_int
+        lib.recv_epoll_get_ring4_attached.argtypes = []
+        lib.recv_epoll_get_ring4_attached.restype = ctypes.c_int
+        lib.recv_epoll_get_n_threads4.argtypes = []
+        lib.recv_epoll_get_n_threads4.restype = ctypes.c_int
+        bind_rx4_api(lib)
+
     # Per-(corr, dm) flow counters (M7.2 G4 observability).
     for name in (
         "ring_slots_written_for",
@@ -432,6 +452,61 @@ class RxEpoll:
                 f"bytes_per_cell={bytes_per_cell}): {msg or '(no error message)'}"
             )
         self._ring_attached = True
+
+    # ---- x2 ring v4 mode ----------------------------------------------------
+
+    def attach_ring4(self, *, shm_name: str, spec, prefault: bool = True,
+                     n_threads: int = 1, strict_ports: bool = False) -> None:
+        """Create the v4 ring ``shm_name`` from a
+        :class:`~dsart.transport.recv_ring.RingV4Spec` and switch this RX to
+        frame-v2 / ring-v4 mode (call after every ``add_port``, before
+        ``start``). Socket i (bind order) is chgroup i; it is served by thread
+        ``i % n_threads``. With ``n_threads > 1`` (or ``strict_ports``) a
+        stream arriving on another chgroup's port is dropped
+        (``port_mismatch``) so every flow has one writer thread."""
+        if self._started:
+            raise RuntimeError("RxEpoll.attach_ring4 called after start; stop first")
+        if not hasattr(self._lib, "recv_epoll_attach_ring4"):
+            raise NotImplementedError("_recv_epoll.so has no ring v4 mode; rebuild C extensions")
+        cfg = spec.to_config()
+        err = ctypes.create_string_buffer(512)
+        rc = self._lib.recv_epoll_attach_ring4(
+            shm_name.encode(), ctypes.byref(cfg), 1 if prefault else 0, int(n_threads),
+            1 if strict_ports else 0, err, len(err))
+        if rc != 0:
+            raise RuntimeError(
+                f"recv_epoll_attach_ring4 failed: rc={rc} shm_name={shm_name!r} "
+                f"n_threads={n_threads} sockets={self.n_sockets}: "
+                f"{err.value.decode(errors='replace') or '(no message)'}")
+        self._ring4_name = shm_name
+
+    @property
+    def ring4_attached(self) -> bool:
+        if not hasattr(self._lib, "recv_epoll_get_ring4_attached"):
+            return False
+        return bool(self._lib.recv_epoll_get_ring4_attached())
+
+    @property
+    def n_threads4(self) -> int:
+        return int(self._lib.recv_epoll_get_n_threads4())
+
+    def set_expected_pattern_id4(self, stream: int, pattern_id: int) -> None:
+        """Expected value-map ``pattern_id`` of a v4 stream (frames that
+        differ are placed as zero-filled PATTERN_MISMATCH rows)."""
+        if self._lib.recv_epoll_ring4_set_expected_pid(int(stream), int(pattern_id)) != 0:
+            raise ValueError(f"set_expected_pattern_id4: stream {stream} invalid or no v4 ring")
+
+    def clear_expected_pattern_id4(self, stream: int) -> None:
+        self._lib.recv_epoll_ring4_clear_expected_pid(int(stream))
+
+    def ring4_reader(self, *, access: str = "pread"):
+        """A read-only :class:`~dsart.transport.recv_ring.RxRingV4Reader` on
+        this RX's v4 ring (pread access by default: no extra mapping)."""
+        from .recv_ring import RxRingV4Reader
+        name = getattr(self, "_ring4_name", None)
+        if name is None:
+            raise RuntimeError("no v4 ring attached")
+        return RxRingV4Reader.open(name, access=access)
 
     def detach_ring(self) -> None:
         """Tear down the ring-publish path. No-op if not attached."""
