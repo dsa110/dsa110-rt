@@ -55,6 +55,7 @@ for f in "$@"; do
     exit 4
   fi
   # a file whose tests all skip on CPU (CUDA-only) or are deselected (x2_gpu) is not a failure
-  echo "$out" | grep -q -E "passed|skipped|deselected|no tests ran" && ! echo "$out" | grep -q -E "failed|error" || fail=1
+  # case-insensitive: pytest reports a missing file as "ERROR: file or directory not found" + "no tests ran"
+  echo "$out" | grep -q -E "passed|skipped|deselected|no tests ran" && ! echo "$out" | grep -q -i -E "failed|error" || fail=1
 done
 exit $fail
