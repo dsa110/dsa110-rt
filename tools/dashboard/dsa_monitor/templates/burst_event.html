@@ -340,6 +340,22 @@ window.POS = {
     {% endif %}
 </div>
 
+{% if event.cutouts %}
+<div class="card">
+    {% set prod = event.products or {} %}
+    <h2>Cutouts ({{ event.cutouts|length }} / {{ (prod.expected or [])|length or 8 }}){% if prod.status %} — {{ prod.status }}{% endif %}</h2>
+    {% if prod.missing %}
+    <div class="muted">missing halves:
+        {% for h, why in prod.missing.items() %}<code>{{ h }}</code> ({{ why }}){% if not loop.last %}, {% endif %}{% endfor %}
+    </div>
+    {% endif %}
+    <ul style="margin-left:20px;font-size:13px;font-family:'Menlo','Consolas',monospace;">
+        {% for c in event.cutouts %}
+        <li>{{ c }}</li>
+        {% endfor %}
+    </ul>
+</div>
+{% else %}
 <div class="card">
     <h2>Cubes ({{ event.cubes|length }} / 8)</h2>
     {% if event.cubes %}
@@ -352,6 +368,7 @@ window.POS = {
     <div class="muted">No NPZs uploaded yet (the per-search-node <code>dsart_cube_uploader.service</code> rsyncs them after the C2 trigger lands).</div>
     {% endif %}
 </div>
+{% endif %}
 
 <div class="card">
     <h2>CSV inputs</h2>

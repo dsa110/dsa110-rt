@@ -394,7 +394,7 @@
                 <td class="value">{{ '%.2f'|format(e.dm_median) if e.dm_median is not none else '—' }}</td>
                 <td class="value">{{ '%.3e'|format(e.l_median) if e.l_median is not none else '—' }}</td>
                 <td class="value">{{ '%.3e'|format(e.m_median) if e.m_median is not none else '—' }}</td>
-                <td class="value">{{ e.n_cubes }}/8</td>
+                <td class="value">{{ e.n_cubes }}/{{ e.n_products_expected }}</td>
                 <td class="value">{{ e.n_plots }}/4</td>
             </tr>
             {% endif %}

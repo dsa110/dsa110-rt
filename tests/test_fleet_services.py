@@ -107,7 +107,7 @@ class TestInventoryShape:
         rows = inv.entries_by_tier(inv.TIER_SUPPORT_H23)
         # 5 since 2026-08-19: copydata.service removed as legacy (rsynced
         # into the dead T1 path from hostnames that never resolved).
-        assert len(rows) == 5
+        assert len(rows) == 6                      # x2: + hiplot_c1
         assert "copydata.service" not in {r.service for r in rows}
         for r in rows:
             assert r.host == "lxd110h23"
@@ -118,12 +118,13 @@ class TestInventoryShape:
             "dsa110-calib-calibration.service",
             "dsa110-calib-preprocess.service",
             "dsart_slack_relay.service",
+            "hiplot_c1.service",
             "hiplot_c2.service",
         ]
 
     def test_grafana_h20_tier_has_three_units_and_is_not_restartable(self):
         rows = inv.entries_by_tier(inv.TIER_GRAFANA_H20)
-        assert len(rows) == 3
+        assert len(rows) == 4                      # x2: + dsart_rt_to_influx
         for r in rows:
             assert r.host == "lxd110h20.pro.pvt"
             assert r.kind == inv.KIND_SYSTEMD_SYSTEM
@@ -134,6 +135,7 @@ class TestInventoryShape:
         # so the old "grafana-server.service" row matched nothing;
         # telegraf is not installed.
         assert names == [
+            "dsart_rt_to_influx.service",
             "etcdv3.service",
             "grafana.service",
             "influxdb.service",
@@ -172,7 +174,7 @@ class TestInventoryShape:
         # + 3 (etcd/influx/grafana) + 16 (corr orch) + 4 (search orch) = 32
         # support_h23 dropped from 6 to 5 on 2026-08-19 when the legacy,
         # never-functional copydata.service was removed.
-        assert len(inv.SERVICE_INVENTORY) == 32
+        assert len(inv.SERVICE_INVENTORY) == 34   # x2: + hiplot_c1, pusher
 
 
 # ---------------------------------------------------------------------------

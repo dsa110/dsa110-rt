@@ -101,6 +101,7 @@ PREFIXES: Tuple[str, ...] = (
     "/mon/service/search_rt/",
     "/mon/c2/",
     "/mon/sky/",
+    "/mon/c3/",
 )
 
 # Per-key-shape regexes.  Order matters: ``_route_key`` tries them in
@@ -122,6 +123,13 @@ KEY_SEARCH_NOISE = re.compile(r"^/mon/search_rt/(\d+)/noise/(\d+)$")
 # ``search_compute_mon.SearchComputeMonPublisher.publish_dump_health``.
 KEY_SEARCH_DUMP = re.compile(r"^/mon/search_rt/(\d+)/dump/(\d+)$")
 KEY_SEARCH_CANDS = re.compile(r"^/mon/search_rt/(\d+)/cands$")
+# x2 (docs/x2/downstream_inventory.md §4): per-DM engine health, the
+# on-demand cutout service, the RX ring, corr_fast block time, C3.
+KEY_SEARCH_DM = re.compile(r"^/mon/search_rt/(\d+)/dm/(\d+)$")
+KEY_SEARCH_CUTOUT = re.compile(r"^/mon/search_rt/(\d+)/cutout/(\d+)$")
+# NB indexed by CHGROUP (0..15), unlike every other /mon/corr_rt/<cn> key.
+KEY_CORR_FAST = re.compile(r"^/mon/corr_rt/(\d+)/corr_fast$")
+KEY_C3 = re.compile(r"^/mon/c3/([^/]+)$")
 KEY_SEARCH_CN = re.compile(r"^/mon/search_rt/(\d+)$")
 KEY_SEARCH_HEARTBEAT = re.compile(r"^/mon/service/search_rt/(\d+)$")
 
@@ -183,6 +191,17 @@ COARSE_DM_OWNER: Dict[Tuple[int, int], int] = {
     (9, 0): 4, (9, 1): 5,
     (13, 0): 6, (13, 1): 7,
 }
+
+#: chgroup -> corr cn (dsa_monitor/corr_topology.py order). Fallback only:
+#: an x2 corr_fast payload carries ``cn_id`` itself.
+CORR_CN_OF_CHGROUP: Tuple[int, ...] = (
+    3, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 21, 22,
+)
+
+#: String fields the generic x2 builders keep (everything else numeric).
+_GENERIC_STR_FIELDS: Tuple[str, ...] = (
+    "opoint", "opoint_selection", "plan_id", "pattern_id", "coarse_dms",
+)
 
 # Mon-publish cadence the orchestrator uses (corr/search doc §2.5).
 # Used only as a sanity bound for the polling cadence.
@@ -1137,6 +1156,56 @@ def make_search_dump_health_points(
     )]
 
 
+def _ts_ns_of(payload: Dict[str, Any]) -> int:
+    for k in ("ts_wall_unix", "ts_unix"):
+        v = payload.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(float(v) * 1e9)
+    v = payload.get("time_mjd")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return int(_mjd_to_unix_s(float(v)) * 1e9)
+    return int(time.time() * 1e9)
+
+
+def make_generic_points(
+    payload: Dict[str, Any], *, measurement: str, tags: Dict[str, str],
+    tag_fields: Tuple[str, ...] = (),
+) -> List[Point]:
+    """x2 keys: one Point with every numeric scalar (bool -> 0/1) of the
+    payload, numeric scalars of a nested ``counters`` dict, and the
+    :data:`_GENERIC_STR_FIELDS` strings. ``tag_fields`` are payload keys
+    promoted to tags (e.g. ``tier``, ``opoint``)."""
+    t = dict(tags)
+    for k in tag_fields:
+        v = payload.get(k)
+        if v is not None and not isinstance(v, (dict, list)):
+            t[k] = str(v)
+    fields: Dict[str, Any] = {}
+
+    def _take(src: Dict[str, Any]) -> None:
+        for k, v in src.items():
+            if k in t or k in ("ts_wall_unix", "ts_unix", "ts_mono"):
+                continue
+            if isinstance(v, bool):
+                fields[k] = int(v)
+            elif isinstance(v, int):
+                fields[k] = int(v)
+            elif isinstance(v, float):
+                if v == v and v not in (float("inf"), float("-inf")):
+                    fields[k] = float(v)
+            elif isinstance(v, str) and k in _GENERIC_STR_FIELDS:
+                fields[k] = v
+
+    _take(payload)
+    counters = payload.get("counters")
+    if isinstance(counters, dict):
+        _take(counters)
+    if not fields:
+        return []
+    return [Point(measurement=measurement, tags=t, fields=fields,
+                  timestamp_ns=_ts_ns_of(payload))]
+
+
 def make_search_compute_points(
     payload: Dict[str, Any], *, cn_id: int, gpu_half: int,
     coarse_dm_owner: Optional[Dict[Tuple[int, int], int]] = None,
@@ -1162,10 +1231,15 @@ def make_search_compute_points(
         "host": host,
         "gpu_half": str(int(gpu_half)),
     }
-    if coarse_dm_owner is not None:
+    if isinstance(payload.get("coarse_dms"), str):
+        # x2: a half owns several coarse DMs; the payload names them.
+        tags["coarse_dms"] = str(payload["coarse_dms"])
+    elif coarse_dm_owner is not None:
         cd = coarse_dm_owner.get((int(cn_id), int(gpu_half)))
         if cd is not None:
             tags["coarse_dm"] = str(int(cd))
+    if isinstance(payload.get("opoint"), str):
+        tags["opoint"] = str(payload["opoint"])
 
     fields: Dict[str, Any] = {}
     for k in _SEARCH_COMPUTE_INT_FIELDS:
@@ -1300,7 +1374,14 @@ def make_c2_points(
     for k in ("uptime_s", "window_size", "graph_size", "pending_plots",
               "last_event_mjd", "gal_dm_max_los_pc_cc",
               "gal_dm_polls_ok", "gal_dm_polls_fail",
-              "dumps_gate_reads", "dumps_gate_fails"):
+              "dumps_gate_reads", "dumps_gate_fails",
+              # x2 inventory: published since 2026-07 but never ingested
+              "ingest_queue_size", "ingest_queue_depth", "cluster_rate",
+              "cluster_rate_max", "sidereal_vetos_active",
+              "voltages_gate_reads", "voltages_gate_fails",
+              # x2 cutout lifecycle
+              "cutout_pending_events", "cutout_expected_halves",
+              "cutout_late_watch"):
         v = payload.get(k)
         if isinstance(v, bool):
             continue
@@ -1319,7 +1400,8 @@ def make_c2_points(
     # last_event_name / last_trigger_class are nullable strings;
     # only emit when populated so the InfluxDB field type stays str
     # (not "null"-typed first sample) and the graph stays sparse.
-    for k in ("last_event_name", "last_trigger_class"):
+    for k in ("last_event_name", "last_trigger_class",
+              "opoint", "opoint_selection", "plan_id"):
         v = payload.get(k)
         if isinstance(v, str) and v:
             svc_fields[k] = v
@@ -1654,12 +1736,62 @@ class InfluxPusherService:
                     coarse_dm_owner=self.coarse_dm_owner,
                 )
 
+            # ---- x2 keys (additive; 1x payloads never hit these) ----
+            m = KEY_SEARCH_DM.match(key)
+            if m:
+                cn = int(m.group(1))
+                return make_generic_points(
+                    payload, measurement="search_rt_dm",
+                    tags={"cn_id": str(cn),
+                          "host": str(payload.get("host") or _host_for_cn(cn)),
+                          "coarse_dm": str(int(m.group(2)))},
+                    tag_fields=("gpu_half", "tier", "opoint"),
+                )
+            m = KEY_SEARCH_CUTOUT.match(key)
+            if m:
+                cn = int(m.group(1))
+                return make_generic_points(
+                    payload, measurement="search_rt_cutout",
+                    tags={"cn_id": str(cn),
+                          "host": str(payload.get("host") or _host_for_cn(cn)),
+                          "gpu_half": str(int(m.group(2)))},
+                    tag_fields=("opoint",),
+                )
+            m = KEY_SEARCH_RX.match(key)
+            if m:
+                cn = int(m.group(1))
+                return make_generic_points(
+                    payload, measurement="search_rt_rx",
+                    tags={"cn_id": str(cn),
+                          "host": str(payload.get("host") or _host_for_cn(cn))},
+                    tag_fields=("opoint",),
+                )
+            m = KEY_CORR_FAST.match(key)
+            if m:
+                cg = int(m.group(1))
+                cn = payload.get("cn_id")
+                if not isinstance(cn, int) or isinstance(cn, bool):
+                    cn = (CORR_CN_OF_CHGROUP[cg]
+                          if 0 <= cg < len(CORR_CN_OF_CHGROUP) else cg)
+                return make_generic_points(
+                    payload, measurement="corr_rt_corr_fast",
+                    tags={"chgroup": str(cg), "cn_id": str(int(cn)),
+                          "host": _host_for_cn(int(cn))},
+                    tag_fields=("opoint",),
+                )
+            m = KEY_C3.match(key)
+            if m:
+                return make_generic_points(
+                    payload, measurement="c3_service",
+                    tags={"host": str(m.group(1))},
+                    tag_fields=("opoint",),
+                )
+
             # Planned but not-yet-defined: per search doc §7.4 we want
             # to fail loudly here so a new publisher landing on the
             # fleet doesn't silently drop on the floor.  Log-once per
             # key to avoid log spam.
-            if (KEY_SEARCH_RX.match(key)
-                    or KEY_SEARCH_CANDS.match(key)):
+            if KEY_SEARCH_CANDS.match(key):
                 self.n_planned_key_hits += 1
                 if key not in self._warned_unknown_keys:
                     self._warned_unknown_keys.add(key)

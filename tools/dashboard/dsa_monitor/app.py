@@ -2318,6 +2318,75 @@ def control_fstables_deploy_post():
     return jsonify(result)
 
 
+@app.route("/api/x2/health")
+def api_x2_health():
+    """x2 D11: real-time gates + per-half DM ownership (read-only JSON).
+
+    Gates from the plan: corr block p99 <= 134.218 ms (p50 <= 85 %), GPU
+    duty <= 0.75 per half, frame loss <= 1e-4 per search node; plus the
+    cutout counters. ``unknown`` where a publisher is not live yet.
+    """
+    import cube_dump_now                                          # local
+    import x2_health                                              # local
+
+    rec = cube_dump_now.active_opoint_record(control_store)
+    return _no_store(jsonify(x2_health.gather(control_store, rec)))
+
+
+@app.route("/x2/health")
+def page_x2_health():
+    """Minimal HTML rendering of /api/x2/health (no template needed)."""
+    import html as _html
+
+    import cube_dump_now                                          # local
+    import x2_health                                              # local
+
+    d = x2_health.gather(control_store, cube_dump_now.active_opoint_record(
+        control_store))
+
+    def row(cells):
+        return "<tr>" + "".join(
+            f"<td>{_html.escape(str(c))}</td>" for c in cells) + "</tr>"
+
+    parts = [f"<h2>x2 health — op-point {_html.escape(str(d['opoint']))}: "
+             f"{_html.escape(d['overall'])}</h2>",
+             "<h3>search halves</h3><table border=1 cellpadding=3>",
+             row(["half", "coarse DMs", "GPU duty", "gate", "cubes/s",
+                  "nominal", "metering", "cutouts done", "failed",
+                  "latency ms"])]
+    for h in d["halves"]:
+        parts.append(row([h["half"], h["coarse_dms"], h["gpu_duty"],
+                          h["duty_gate"], h["cubes_per_s"],
+                          h["cubes_per_s_nominal"], h["c1_metering_active"],
+                          h["cutout_done_total"], h["cutout_failed_total"],
+                          h["cutout_last_latency_ms"]]))
+    parts.append("</table><h3>search nodes (corner turn)</h3><table border=1 "
+                 "cellpadding=3>" + row(["node", "rx Gb/s", "loss", "gate"]))
+    for n in d["search_nodes"]:
+        parts.append(row([n["node"], n["rx_gbps"], n["loss_frac"], n["loss_gate"]]))
+    parts.append("</table><h3>corr_fast</h3><table border=1 cellpadding=3>"
+                 + row(["chgroup", "cn", "p50 ms", "p99 ms", "last ms",
+                        "gate", "tx Gb/s"]))
+    for c in d["corr"]:
+        parts.append(row([c["chgroup"], c["cn_id"], c["block_ms_p50"],
+                          c["block_ms_p99"], c["last_block_ms"],
+                          c["block_gate"], c["tx_gbps"]]))
+    parts.append("</table><h3>DM ownership</h3><table border=1 cellpadding=3>"
+                 + row(["half", "coarse (tier: DM range, n_fdm)", "n_fine"]))
+    for o in d["ownership"]:
+        if "error" in o:
+            parts.append(row([o["error"], "", ""]))
+            continue
+        parts.append(row([
+            f"s{o['sid']}g{o['gpu_half']}",
+            "; ".join(f"{c['coarse']} ({c['tier']}: {c['dm_lo']}-{c['dm_hi']}, "
+                      f"{c['n_fdm']})" for c in o["coarse"]),
+            o["n_fine"]]))
+    parts.append("</table>")
+    return "<html><body style='font-family:sans-serif'>" + "".join(parts) + \
+        "</body></html>"
+
+
 @app.route("/control/dump_now", methods=["POST"])
 def control_dump_now_post():
     """M7.4 Phase 6c: broadcast a one-shot synthetic C2 trigger to
@@ -2359,7 +2428,22 @@ def control_dump_now_post():
 
     user = request.form.get("user") or request.remote_addr or "anon"
     try:
-        result = cube_dump_now.fleet_dump_now(control_store, user=user)
+        # x2: at a 2x op-point a manual dump is a MANUAL cutout request
+        # (optionally per half: halves=s1g0,s9g1; raw=1 archives the raw
+        # window). Without an op-point record this is today's path.
+        rec = cube_dump_now.active_opoint_record(control_store)
+        if cube_dump_now.is_2x(rec):
+            sel = [h for h in (request.form.get("halves") or "").split(",") if h]
+            halves = None
+            if sel:
+                halves = [(int(h.split("g")[0].lstrip("s")), int(h.split("g")[1]))
+                          for h in sel]
+            result = cube_dump_now.fleet_cutout_now(
+                control_store, record=rec, halves=halves,
+                raw=request.form.get("raw", "") in ("1", "true", "yes"),
+                user=user)
+        else:
+            result = cube_dump_now.fleet_dump_now(control_store, user=user)
     except Exception as exc:                                       # noqa: BLE001
         LOG.exception("control_dump_now failed")
         try:
@@ -3129,6 +3213,8 @@ def control_recent_events():
             "m_median": e.m_median,
             "n_cubes": e.n_cubes,
             "n_plots": e.n_plots,
+            "products_kind": e.products_kind,
+            "n_products_expected": e.n_products_expected,
         })
     return jsonify({
         "ok": True,

@@ -577,7 +577,153 @@ def _search_gpu_health_panels() -> List[Dict[str, Any]]:
     return out
 
 
-def panels() -> List[Dict[str, Any]]:
+def _reset_layout() -> None:
+    """Restart panel ids and the y cursor (one dashboard per build)."""
+    global _panel_id_counter
+    _panel_id_counter = 0
+    _y.cursor = 0  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# x2 (docs/x2/downstream_inventory.md §4): the 2x op-point dashboard.
+# ---------------------------------------------------------------------------
+#
+# Built only with ``--opoint 2x...``; the default build is today's JSON.
+# At 2x a half owns 3-6 coarse DMs and runs one cube PER DM per 201.33 ms
+# cycle, so the per-half cube rate is n_dm x 4.96707/s and the 1x
+# blind-fraction tiles (one nominal rate for all halves) would read wrong.
+# The 2x row measures blindness per DM instead (search_rt_dm), where the
+# nominal is the cycle rate for every DM, plus the real-time gates of the
+# plan (corr block time, GPU duty, fan-in, RX loss) and the cutout path.
+
+#: Cycle rate = per-DM cube rate at 2x (384 T_ext = 192 x 1.048576 ms).
+_X2_CYCLE_PER_S: float = 1.0 / (192 * 1.048576e-3)
+#: Corr block budget (ms) and the plan's real-time gates.
+_X2_BLOCK_BUDGET_MS: float = 134.217728
+_X2_GATE_MEAN_FRAC: float = 0.85
+_X2_DUTY_AIM: float = 0.6
+_X2_DUTY_GATE: float = 0.75
+
+
+def _thr(value: float, color: str = "red", op: str = "gt") -> Dict[str, Any]:
+    return {"value": value, "colorMode": "custom", "op": op, "fill": False,
+            "line": True, "lineColor": color}
+
+
+def _x2_panels(opoint: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    out.append(row_panel(f"X2. {opoint} real-time gates + cutouts"))
+    _bump_y(1)
+    out.append(graph_panel(
+        title="corr_fast block time p50 / p99 (ms) vs 134.2 ms budget",
+        raw_query=(
+            'SELECT max("block_ms_p99") FROM "corr_rt_corr_fast" '
+            'WHERE $timeFilter GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="p99 cn$tag_cn_id", w=12, x=0, h=7, unit="ms", y_min=0,
+        extra_targets=[{"refId": "B", "alias": "p50 cn$tag_cn_id", "query": (
+            'SELECT max("block_ms_p50") FROM "corr_rt_corr_fast" '
+            'WHERE $timeFilter GROUP BY time($__interval), "cn_id" fill(null)')}],
+        thresholds=[_thr(_X2_GATE_MEAN_FRAC * _X2_BLOCK_BUDGET_MS, "orange"),
+                    _thr(_X2_BLOCK_BUDGET_MS, "red")],
+        description=("Plan gate: mean <= 85% of 134.218 ms (orange line), "
+                     "p99 <= 100% (red). Published by corr_fast at "
+                     "/mon/corr_rt/<chgroup>/corr_fast."),
+    ))
+    out.append(graph_panel(
+        title="search GPU duty per half",
+        raw_query=(
+            'SELECT max("gpu_duty") FROM "search_rt_compute" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="cn$tag_cn_id g$tag_gpu_half", w=12, x=12, h=7, unit="percentunit",
+        y_min=0, y_max=1,
+        thresholds=[_thr(_X2_DUTY_AIM, "orange"), _thr(_X2_DUTY_GATE, "red")],
+        description="Gate: <= 0.75 per half all-in (aim <= 0.6).",
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="per-DM blind fraction (%) -- cubes vs the 201.33 ms cycle",
+        raw_query=(
+            f'SELECT 100 * (1 - derivative(last("cubes_total"), 1s) * '
+            f'{1.0 / _X2_CYCLE_PER_S:.12f}) FROM "search_rt_dm" WHERE $timeFilter '
+            'GROUP BY time(1m), "coarse_dm" fill(null)'
+        ),
+        alias="d$tag_coarse_dm", w=12, x=0, h=7, unit="percent",
+        thresholds=[_thr(_BLIND_WARN_PCT, "orange"), _thr(_BLIND_CRIT_PCT, "red")],
+        description=("Every coarse DM runs one cube per cycle "
+                     f"({_X2_CYCLE_PER_S:.5f}/s); 0% = real time."),
+    ))
+    out.append(graph_panel(
+        title="per-DM ring lag (ms) and fan-in streams present",
+        raw_query=(
+            'SELECT max("ring_lag_ms") FROM "search_rt_dm" WHERE $timeFilter '
+            'GROUP BY time($__interval), "coarse_dm" fill(null)'
+        ),
+        alias="lag d$tag_coarse_dm", w=12, x=12, h=7, unit="ms", y_min=0,
+        extra_targets=[{"refId": "B", "alias": "fan-in d$tag_coarse_dm", "query": (
+            'SELECT min("fanin_streams_present") FROM "search_rt_dm" '
+            'WHERE $timeFilter GROUP BY time($__interval), "coarse_dm" fill(null)')}],
+        description="Gate: bounded lag; fan-in complete >= 99.9% of cubes per DM.",
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="RX loss fraction per search node (frame v2)",
+        raw_query=(
+            'SELECT max("loss_frac") FROM "search_rt_rx" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn$tag_cn_id", w=12, x=0, h=7, unit="percentunit", y_min=0,
+        thresholds=[_thr(1e-4, "red")],
+        description="'Clean' corner turn: frame loss <= 1e-4 (red line).",
+    ))
+    out.append(graph_panel(
+        title="corr TX Gb/s per node",
+        raw_query=(
+            'SELECT mean("tx_gbps") FROM "corr_rt_corr_fast" WHERE $timeFilter '
+            'GROUP BY time($__interval), "cn_id" fill(null)'
+        ),
+        alias="cn$tag_cn_id", w=12, x=12, h=7, unit="short", y_min=0,
+    ))
+    _bump_y(7)
+    out.append(graph_panel(
+        title="cutouts: done / partial / failed per half (cumulative)",
+        raw_query=(
+            'SELECT last("cutout_done_total") FROM "search_rt_cutout" WHERE '
+            '$timeFilter GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)'
+        ),
+        alias="done cn$tag_cn_id g$tag_gpu_half", w=12, x=0, h=7, unit="short",
+        extra_targets=[
+            {"refId": "B", "alias": "partial cn$tag_cn_id g$tag_gpu_half", "query": (
+                'SELECT last("cutout_partial_total") FROM "search_rt_cutout" WHERE '
+                '$timeFilter GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)')},
+            {"refId": "C", "alias": "failed cn$tag_cn_id g$tag_gpu_half", "query": (
+                'SELECT last("cutout_failed_total") FROM "search_rt_cutout" WHERE '
+                '$timeFilter GROUP BY time($__interval), "cn_id", "gpu_half" fill(null)')},
+        ],
+    ))
+    out.append(graph_panel(
+        title="C2 events complete / incomplete / halves missing (cumulative)",
+        raw_query=(
+            'SELECT last("events_complete") FROM "c2_service" WHERE "host" = \'h23\' '
+            'AND $timeFilter GROUP BY time($__interval) fill(null)'
+        ),
+        alias="complete", w=12, x=12, h=7, unit="short",
+        extra_targets=[
+            {"refId": "B", "alias": "incomplete", "query": (
+                'SELECT last("events_incomplete") FROM "c2_service" WHERE "host" = '
+                '\'h23\' AND $timeFilter GROUP BY time($__interval) fill(null)')},
+            {"refId": "C", "alias": "halves missing", "query": (
+                'SELECT last("halves_missing") FROM "c2_service" WHERE "host" = '
+                '\'h23\' AND $timeFilter GROUP BY time($__interval) fill(null)')},
+        ],
+        description="An incomplete event is KEPT (never deleted); see Level3 products.",
+    ))
+    _bump_y(7)
+    return out
+
+
+def panels(opoint: str = "") -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     out.append(row_panel("A. Fleet at-a-glance"))
     _bump_y(1)
@@ -628,7 +774,12 @@ def panels() -> List[Dict[str, Any]]:
     ))
     _bump_y(4)
 
-    out.extend(_search_gpu_health_panels())
+    if str(opoint).startswith("2x"):
+        # 2x: the per-half 1x tiles would mis-read (n_dm cubes per cycle);
+        # the per-DM view in the X2 row replaces them.
+        out.extend(_x2_panels(str(opoint)))
+    else:
+        out.extend(_search_gpu_health_panels())
 
     out.append(row_panel("B. Service heartbeats"))
     _bump_y(1)
@@ -2118,7 +2269,21 @@ def panels() -> List[Dict[str, Any]]:
     return out
 
 
-def build_dashboard() -> Dict[str, Any]:
+def build_dashboard(opoint: str = "") -> Dict[str, Any]:
+    """Today's dashboard; ``opoint`` 2x... builds the 2x variant (own uid
+    and title, so both can live in Grafana side by side)."""
+    two = str(opoint).startswith("2x")
+    if two:
+        _reset_layout()
+    dash = _build_dashboard_body(opoint if two else "")
+    if two:
+        dash["uid"] = DASHBOARD_UID + "x2"
+        dash["title"] = DASHBOARD_TITLE + " -- " + str(opoint)
+        dash["tags"] = list(dash["tags"]) + ["x2", str(opoint)]
+    return dash
+
+
+def _build_dashboard_body(opoint: str = "") -> Dict[str, Any]:
     return {
         "annotations": {"list": []},
         "editable": True,
@@ -2140,7 +2305,7 @@ def build_dashboard() -> Dict[str, Any]:
         },
         "templating": {"list": []},
         "links": [],
-        "panels": panels(),
+        "panels": panels(opoint),
     }
 
 
@@ -2196,9 +2361,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             "unauthenticated."
         ),
     )
+    ap.add_argument(
+        "--opoint", default="",
+        help="x2: build the 2x variant (e.g. 2x-gridded-ns2-cint4; writes "
+             "dsart_rt_dashboard_2x.json unless --out). Default: today's.",
+    )
     args = ap.parse_args(argv)
 
-    dash = build_dashboard()
+    if args.opoint and args.out == str(
+            pathlib.Path(__file__).with_name("dsart_rt_dashboard.json")):
+        args.out = str(pathlib.Path(__file__).with_name("dsart_rt_dashboard_2x.json"))
+    dash = build_dashboard(args.opoint)
     out_path = pathlib.Path(args.out)
     out_path.write_text(json.dumps(dash, indent=2) + "\n")
     print("Wrote", out_path, "with", len(dash["panels"]), "panels")
