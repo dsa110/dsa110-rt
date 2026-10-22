@@ -34,3 +34,13 @@ Do not set them there until the user signs off (they are the CP1 sign-off items)
   period and fail closed if it is unknown. The 2x section should use these keys in place of
   `width_median_*_samples`, and set `dm_median_max_pc_cc` ≥ 3000 and the DM-50 floor margin
   (inventory §2.3).
+
+## `configs/dsart_search_rt.yaml` → `c3:` (read by `services/c3.py`)
+
+| key | default (= today) | 2x value | task | notes |
+|---|---|---|---|---|
+| `veto.r2_t_shift_ms` | absent | `31.5` | D7 | R2 in ms; applies only to cutout events, whose metrics carry `t_ext_us`. 1x cube events keep `r2_t_shift_samples`. R3/R5/R10 keep their 1x values until they are recalibrated from the shadow veto on CP2 injections. |
+
+C3 itself needs no op-point switch: it reads cutouts when an event has `cutouts/`, and cubes otherwise.
+A non-flag-only REJECT now also deletes `<event>/raw/` and keeps `cutouts/`. The Slack readiness gate
+skips the cube count for cutout events.
