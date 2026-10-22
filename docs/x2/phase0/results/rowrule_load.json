@@ -1,0 +1,385 @@
+{
+ "loads": {
+  "g_ns2|cint4|heavy0.0001": {
+   "total_gbps": 51.374229431152344,
+   "node_gbps": [
+    13.006134033203125,
+    13.006134033203125,
+    13.006134033203125,
+    12.355827331542969
+   ],
+   "node_max": 13.006134033203125,
+   "clean_needed_80": 16.257667541503906,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 2544.0,
+   "heavy_per_stream_mean": 73.65625,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 803629.557291667,
+   "datagrams_per_s_node_max": 203450.52083333343
+  },
+  "g_ns2|cint4|heavy3e-05": {
+   "total_gbps": 51.94139099121094,
+   "node_gbps": [
+    13.14971923828125,
+    13.14971923828125,
+    13.14971923828125,
+    12.492233276367188
+   ],
+   "node_max": 13.14971923828125,
+   "clean_needed_80": 16.437149047851562,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 2544.0,
+   "heavy_per_stream_mean": 103.0625,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 803629.557291667,
+   "datagrams_per_s_node_max": 203450.5208333334
+  },
+  "g_ns2|cint5|heavy0.0001": {
+   "total_gbps": 63.721595764160156,
+   "node_gbps": [
+    16.132049560546875,
+    16.132049560546875,
+    16.132049560546875,
+    15.325447082519531
+   ],
+   "node_max": 16.132049560546875,
+   "clean_needed_80": 20.165061950683594,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 2544.0,
+   "heavy_per_stream_mean": 73.65625,
+   "k_range": [
+    2,
+    3
+   ],
+   "datagrams_per_s_total": 1192887.6241048179,
+   "datagrams_per_s_node_max": 301996.86686197924
+  },
+  "g_ns2|cint5|heavy3e-05": {
+   "total_gbps": 64.16218566894531,
+   "node_gbps": [
+    16.24359130859375,
+    16.24359130859375,
+    16.24359130859375,
+    15.431411743164062
+   ],
+   "node_max": 16.24359130859375,
+   "clean_needed_80": 20.304489135742188,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 2544.0,
+   "heavy_per_stream_mean": 103.0625,
+   "k_range": [
+    2,
+    2
+   ],
+   "datagrams_per_s_total": 1205444.3359375,
+   "datagrams_per_s_node_max": 305175.78125
+  },
+  "g_ns4|cint4|heavy0.0001": {
+   "total_gbps": 43.3563232421875,
+   "node_gbps": [
+    10.839080810546875,
+    10.839080810546875,
+    10.839080810546875,
+    10.839080810546875
+   ],
+   "node_max": 10.839080810546875,
+   "clean_needed_80": 13.548851013183594,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 2159.046875,
+   "heavy_per_stream_mean": 24.5,
+   "k_range": [
+    3,
+    4
+   ],
+   "datagrams_per_s_total": 642140.7063802084,
+   "datagrams_per_s_node_max": 160535.1765950521
+  },
+  "g_ns4|cint4|heavy3e-05": {
+   "total_gbps": 44.769287109375,
+   "node_gbps": [
+    11.19232177734375,
+    11.19232177734375,
+    11.19232177734375,
+    11.19232177734375
+   ],
+   "node_max": 11.19232177734375,
+   "clean_needed_80": 13.990402221679688,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 2159.046875,
+   "heavy_per_stream_mean": 90.015625,
+   "k_range": [
+    3,
+    4
+   ],
+   "datagrams_per_s_total": 762939.4531250003,
+   "datagrams_per_s_node_max": 190734.8632812501
+  },
+  "g_ns4|cint5|heavy0.0001": {
+   "total_gbps": 53.975830078125,
+   "node_gbps": [
+    13.49395751953125,
+    13.49395751953125,
+    13.49395751953125,
+    13.49395751953125
+   ],
+   "node_max": 13.49395751953125,
+   "clean_needed_80": 16.867446899414062,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 2159.046875,
+   "heavy_per_stream_mean": 24.5,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 813802.0833333338,
+   "datagrams_per_s_node_max": 203450.52083333346
+  },
+  "g_ns4|cint5|heavy3e-05": {
+   "total_gbps": 54.9346923828125,
+   "node_gbps": [
+    13.733673095703125,
+    13.733673095703125,
+    13.733673095703125,
+    13.733673095703125
+   ],
+   "node_max": 13.733673095703125,
+   "clean_needed_80": 17.167091369628906,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 2159.046875,
+   "heavy_per_stream_mean": 90.015625,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 813802.0833333338,
+   "datagrams_per_s_node_max": 203450.52083333346
+  },
+  "b_ns2|cint4|heavy0.0001": {
+   "total_gbps": 36.2308349609375,
+   "node_gbps": [
+    9.17236328125,
+    9.17236328125,
+    9.17236328125,
+    8.7137451171875
+   ],
+   "node_max": 9.17236328125,
+   "clean_needed_80": 11.4654541015625,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 71.0,
+   "k_range": [
+    4,
+    4
+   ],
+   "datagrams_per_s_total": 602722.16796875,
+   "datagrams_per_s_node_max": 152587.890625
+  },
+  "b_ns2|cint4|heavy3e-05": {
+   "total_gbps": 37.0601806640625,
+   "node_gbps": [
+    9.38232421875,
+    9.38232421875,
+    9.38232421875,
+    8.9132080078125
+   ],
+   "node_max": 9.38232421875,
+   "clean_needed_80": 11.7279052734375,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 114.0,
+   "k_range": [
+    4,
+    4
+   ],
+   "datagrams_per_s_total": 602722.16796875,
+   "datagrams_per_s_node_max": 152587.890625
+  },
+  "b_ns2|cint5|heavy0.0001": {
+   "total_gbps": 44.6689453125,
+   "node_gbps": [
+    11.30859375,
+    11.30859375,
+    11.30859375,
+    10.7431640625
+   ],
+   "node_max": 11.30859375,
+   "clean_needed_80": 14.1357421875,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 71.0,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 803629.557291667,
+   "datagrams_per_s_node_max": 203450.52083333343
+  },
+  "b_ns2|cint5|heavy3e-05": {
+   "total_gbps": 45.2861328125,
+   "node_gbps": [
+    11.46484375,
+    11.46484375,
+    11.46484375,
+    10.8916015625
+   ],
+   "node_max": 11.46484375,
+   "clean_needed_80": 14.3310546875,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 114.0,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 803629.557291667,
+   "datagrams_per_s_node_max": 203450.5208333334
+  },
+  "b_ns4|cint4|heavy0.0001": {
+   "total_gbps": 35.751953125,
+   "node_gbps": [
+    8.93798828125,
+    8.93798828125,
+    8.93798828125,
+    8.93798828125
+   ],
+   "node_max": 8.93798828125,
+   "clean_needed_80": 11.1724853515625,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 23.0,
+   "k_range": [
+    4,
+    4
+   ],
+   "datagrams_per_s_total": 610351.5625,
+   "datagrams_per_s_node_max": 152587.890625
+  },
+  "b_ns4|cint4|heavy3e-05": {
+   "total_gbps": 37.236328125,
+   "node_gbps": [
+    9.30908203125,
+    9.30908203125,
+    9.30908203125,
+    9.30908203125
+   ],
+   "node_max": 9.30908203125,
+   "clean_needed_80": 11.6363525390625,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 99.0,
+   "k_range": [
+    4,
+    4
+   ],
+   "datagrams_per_s_total": 610351.5625,
+   "datagrams_per_s_node_max": 152587.890625
+  },
+  "b_ns4|cint5|heavy0.0001": {
+   "total_gbps": 44.53125,
+   "node_gbps": [
+    11.1328125,
+    11.1328125,
+    11.1328125,
+    11.1328125
+   ],
+   "node_max": 11.1328125,
+   "clean_needed_80": 13.916015625,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 23.0,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 813802.0833333338,
+   "datagrams_per_s_node_max": 203450.52083333346
+  },
+  "b_ns4|cint5|heavy3e-05": {
+   "total_gbps": 45.64453125,
+   "node_gbps": [
+    11.4111328125,
+    11.4111328125,
+    11.4111328125,
+    11.4111328125
+   ],
+   "node_max": 11.4111328125,
+   "clean_needed_80": 14.263916015625,
+   "n_coarse": [
+    16,
+    8
+   ],
+   "values_per_stream_mean": 1773.0,
+   "heavy_per_stream_mean": 99.0,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 813802.0833333338,
+   "datagrams_per_s_node_max": 203450.52083333346
+  }
+ },
+ "dedisp_ns4_over_ns2": {
+  "0.05ms": 0.9956213467048652,
+  "0.1ms": 0.9956819026612105,
+  "0.2ms": 0.9958663046541877,
+  "0.5ms": 0.9967426927257333,
+  "1ms": 0.9977900737498758,
+  "2ms": 0.9989320821720991,
+  "4ms": 0.99966299490926,
+  "8ms": 0.9999126024352633,
+  "16ms": 0.9999779508899085,
+  "all_widths_0.1-16ms": 0.9985552393841524,
+  "same_dm_grid": false
+ }
+}
