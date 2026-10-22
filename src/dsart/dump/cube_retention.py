@@ -45,6 +45,7 @@ from __future__ import annotations
 import dataclasses
 import fcntl
 import logging
+import os
 import shutil
 import threading
 import time
@@ -122,6 +123,80 @@ def _scan_entry(path: Path) -> Optional[_Entry]:
         return None
 
 
+#: x2 (D4) per-half product subdirs of an event dir. Each is swept as its
+#: own entry (recursive size, its own upload.log / UPLOAD_OK), so one
+#: half's upload never marks the other half's data as uploaded and raw
+#: windows (GB, nested) count toward the size cap.
+_PRODUCT_DIR_PREFIXES: tuple = ("raw_s", "cutouts")
+
+
+def _is_product_dir(p: Path) -> bool:
+    return p.is_dir() and (p.name.startswith(_PRODUCT_DIR_PREFIXES) or p.name == "raw")
+
+
+def _scan_tree(path: Path) -> Optional[_Entry]:
+    """Recursive size / newest mtime; uploaded iff ``path/upload.log``
+    carries UPLOAD_OK."""
+    newest, total = 0.0, 0
+    try:
+        for dirpath, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    st = os.stat(os.path.join(dirpath, name))
+                except FileNotFoundError:
+                    continue
+                newest = max(newest, st.st_mtime)
+                total += st.st_size
+        uploaded = False
+        log = path / "upload.log"
+        if log.is_file():
+            try:
+                uploaded = _UPLOAD_OK_MARKER in log.read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError:
+                uploaded = False
+        if newest == 0.0:
+            newest = path.stat().st_mtime
+        return _Entry(path, True, newest, total, uploaded)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        _LOG.warning("cube_retention: scan failed for %s: %r", path, exc)
+        return None
+
+
+def _enumerate_entries(root: Path) -> list:
+    """Sweep entries under ``root``: today's event dirs / loose files, but
+    an event dir holding x2 product subdirs contributes one entry per
+    product subdir instead (``raw/`` is descended one level)."""
+    out = []
+    for p in root.iterdir():
+        if p.name == _LOCK_NAME:
+            continue
+        if p.is_dir():
+            try:
+                subs = [c for c in p.iterdir() if _is_product_dir(c)]
+            except OSError:
+                subs = []
+            if subs:
+                for c in subs:
+                    if c.name == "raw":
+                        try:
+                            kids = [k for k in c.iterdir() if k.is_dir()]
+                        except OSError:
+                            kids = []
+                        out.extend(e for e in (_scan_tree(k) for k in kids) if e)
+                    else:
+                        e = _scan_tree(c)
+                        if e is not None:
+                            out.append(e)
+                continue
+        e = _scan_entry(p)
+        if e is not None:
+            out.append(e)
+    return out
+
+
 def _delete(entry: _Entry) -> int:
     """Best-effort delete; returns bytes freed (0 on failure)."""
     try:
@@ -185,8 +260,7 @@ def sweep_once(config: CubeRetentionConfig, *,
                 pass
 
     # ---- enumerate --------------------------------------------------------
-    entries = [e for e in (_scan_entry(p) for p in root.iterdir()
-                           if p.name != _LOCK_NAME) if e is not None]
+    entries = _enumerate_entries(root)
 
     # ---- tier 1: age cap --------------------------------------------------
     age_cutoff = t_now - config.max_age_h * 3600.0

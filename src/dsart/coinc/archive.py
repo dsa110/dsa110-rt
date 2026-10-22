@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .stats import ClusterStats
-from .units import width_ms
+from .units import fwhm_ms, width_ms
 from .window import WindowEntry
 
 __all__ = [
@@ -185,6 +185,13 @@ def _fmt_period(v: float) -> str:
     return f"{v:.6f}" if (math.isfinite(v) and v > 0.0) else ""
 
 
+def _fmt_fwhm(entry: WindowEntry, period_us: float) -> str:
+    if not (math.isfinite(float(period_us)) and float(period_us) > 0.0):
+        return ""
+    ms = fwhm_ms(entry.kernel_id, entry.width_samples, period_us)
+    return f"{ms:.6f}" if math.isfinite(ms) else ""
+
+
 def _fmt_ms(samples: float, period_us: float) -> str:
     if not (math.isfinite(float(period_us)) and float(period_us) > 0.0):
         return ""
@@ -229,7 +236,9 @@ def entry_to_csv_row(
                 coarse, tier = "", ""
         row.update({
             "sample_period_us": _fmt_period(period),
-            "width_ms": _fmt_ms(entry.width_samples, period),
+            # FWHM of the row's time filter (= width x T for boxcars;
+            # the b3x [1,2,1] / B3 filters use their achieved FWHM).
+            "width_ms": _fmt_fwhm(entry, period),
             "coarse_idx": coarse,
             "tier": tier,
         })

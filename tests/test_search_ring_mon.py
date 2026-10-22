@@ -317,3 +317,13 @@ def test_concurrent_publishes_count_correctly() -> None:
     assert pub.n_published == 80
     assert pub.n_errors == 0
     assert len(store.puts) == 80
+
+
+def test_end_in_sample_units_flag_fixes_the_16x_end():
+    """The 2x path publishes ``_end`` in the same units as ``_start``."""
+    store = _FakeStore()
+    pub = SearchRingMonPublisher(search_node_id=1, gpu_half=0, store=store,
+                                 end_in_sample_units=True)
+    newest = _FakeCube(cube_id=7, event_specnum_start=4_500_000)
+    assert pub.publish_from_ring(_FakeRing(cubes=[newest])) is True
+    assert store.puts[0][1]["newest_event_specnum_end"] == 4_500_000 + 192

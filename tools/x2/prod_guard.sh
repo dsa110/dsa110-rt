@@ -20,7 +20,17 @@ if [ -z "$LOGS" ]; then
 fi
 setsid "$@" &
 PID=$!
+WPID=
 TRIP=$(mktemp)
+# The command runs in its own session, so a signal to this script (timeout, ssh hang-up, ^C) would
+# otherwise orphan it, still running and no longer guarded: kill its process group first.
+# (2026-10-22: a `timeout` around this script left a pytest running on n13 after the timeout fired.)
+_stop() {
+  kill -9 -- -"$PID" 2>/dev/null
+  if [ -n "$WPID" ]; then pkill -P "$WPID" 2>/dev/null; kill "$WPID" 2>/dev/null; fi
+  rm -f "$TRIP"
+}
+trap '_stop; echo "PRODUCTION_GUARD: interrupted on $(hostname) -> test killed"; exit 143' TERM INT HUP
 (
   tail -n0 -F $LOGS 2>/dev/null | awk -v min="$MIN_RATE" '
     /lag-recovery seek/ { print "lag-recovery seek: " substr($0, 1, 160); fflush(); exit }

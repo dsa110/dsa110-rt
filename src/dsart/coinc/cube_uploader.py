@@ -127,6 +127,7 @@ def build_rsync_argv(
     remote_rsync_bin: str = "rsync",
     extra_opts: Iterable[str] = (),
     bandwidth_limit_kbps: int = 0,
+    dest_subdir: str = "cubes",
 ) -> list[str]:
     """Construct the rsync argv list for one event.
 
@@ -149,7 +150,12 @@ def build_rsync_argv(
     src = str(Path(src_dir))
     if not src.endswith(os.sep):
         src = src + os.sep
-    remote_dir = f"{dest_root.rstrip('/')}/{event_name}/cubes"
+    # x2 (D4): the per-event product subdir -- "cubes" (1x, today),
+    # "cutouts" or "raw/raw_s<sid>_g<g>" (2x).
+    sub = str(dest_subdir).strip("/")
+    if not sub or ".." in sub.split("/"):
+        raise ValueError(f"bad dest_subdir: {dest_subdir!r}")
+    remote_dir = f"{dest_root.rstrip('/')}/{event_name}/{sub}"
     dest = f"{dest_host}:{remote_dir}/"
     # --rsync-path runs an UNESCAPED command on the remote shell via
     # ssh; shlex-quote dest_root + event_name so the mkdir never
@@ -181,6 +187,7 @@ def upload_event_cubes(
     extra_opts: Iterable[str] = (),
     bandwidth_limit_kbps: int = 0,
     popen=subprocess.Popen,
+    dest_subdir: str = "cubes",
 ) -> subprocess.Popen:
     """Spawn a detached rsync that pushes ``src_dir/*`` to h23.
 
@@ -223,6 +230,7 @@ def upload_event_cubes(
         rsync_path=rsync_path,
         extra_opts=extra_opts,
         bandwidth_limit_kbps=bandwidth_limit_kbps,
+        dest_subdir=dest_subdir,
     )
     log = Path(log_path) if log_path is not None else (src / "upload.log")
     try:
@@ -359,6 +367,7 @@ class BoundedCubeUploader:
         upload_fn: Any = upload_event_cubes,
         thread_name: str = "cube-upload",
         purge_pattern: Optional[str] = None,
+        dest_subdir: str = "cubes",
     ) -> None:
         """``purge_pattern`` (2026-07-19 disk-full incident): when set,
         the worker deletes the ``src_dir`` files matching this glob
@@ -395,6 +404,10 @@ class BoundedCubeUploader:
         self._lock = threading.Lock()
         self._workers: list[threading.Thread] = []
         self._thread_name = str(thread_name)
+        # x2 (D4): remote product subdir ("cubes" = today's path; the
+        # kwarg is only forwarded when it differs, so custom upload_fn
+        # stand-ins keep working unchanged).
+        self._dest_subdir = str(dest_subdir)
         self._purge_pattern = (
             str(purge_pattern) if purge_pattern else None
         )
@@ -545,6 +558,8 @@ class BoundedCubeUploader:
                     extra_opts=self._extra_opts,
                     bandwidth_limit_kbps=self._bandwidth_limit_kbps,
                     popen=self._popen,
+                    **({} if self._dest_subdir == "cubes"
+                       else {"dest_subdir": self._dest_subdir}),
                 )
             except Exception as exc:                              # noqa: BLE001
                 self._n_failed += 1

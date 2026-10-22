@@ -54,6 +54,7 @@ for f in "$@"; do
     echo "ABORT: production guard tripped on $NODE; remaining files not run"
     exit 4
   fi
-  echo "$out" | grep -q -E "passed|no tests ran" && ! echo "$out" | grep -q -E "failed|error" || fail=1
+  # a file whose tests all skip on CPU (CUDA-only) or are deselected (x2_gpu) is not a failure
+  echo "$out" | grep -q -E "passed|skipped|deselected|no tests ran" && ! echo "$out" | grep -q -E "failed|error" || fail=1
 done
 exit $fail

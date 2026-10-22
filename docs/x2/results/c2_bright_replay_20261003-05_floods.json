@@ -1,0 +1,542 @@
+{
+ "n_rows": 332812,
+ "span_days": 2.002701509212784,
+ "recorded": {
+  "log_only": 330985,
+  "bright_frb_extragalactic": 1684,
+  "bright_pulsar": 140,
+  "bright_galactic": 3
+ },
+ "runs": {
+  "1x": {
+   "dump_class_rows_per_day": {
+    "bright_frb_extragalactic": 64.41,
+    "faint_frb_extragalactic": 23.97,
+    "bright_galactic": 1.0
+   },
+   "dump_rows_per_day": 89.38,
+   "n_changed_to_dump": 57,
+   "bright_rows_per_day": {
+    "rows_snr_ge_35": 90351.96,
+    "rows_snr_ge_50": 51494.44,
+    "rows_snr_ge_100": 571.73
+   },
+   "changed_examples": [
+    {
+     "mjd": "61316.23938419118",
+     "snr_1x": 11.24219,
+     "snr_now": 11.24219,
+     "dm": "327.127655",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31312881790",
+     "snr_1x": 11.00781,
+     "snr_now": 11.00781,
+     "dm": "620.531921",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31404904043",
+     "snr_1x": 11.07812,
+     "snr_now": 11.07812,
+     "dm": "559.319153",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31527673603",
+     "snr_1x": 11.05469,
+     "snr_now": 11.05469,
+     "dm": "138.723404",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.38342140865",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "586.276611",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.42096579369",
+     "snr_1x": 11.17188,
+     "snr_now": 11.17188,
+     "dm": "174.468079",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57778035876",
+     "snr_1x": 11.03125,
+     "snr_now": 11.03125,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57843906838",
+     "snr_1x": 11.61719,
+     "snr_now": 11.61719,
+     "dm": "1225.361694",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.72382760176",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.82664171646",
+     "snr_1x": 11.34375,
+     "snr_now": 11.34375,
+     "dm": "723.297852",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    }
+   ]
+  },
+  "1x+lin[w_min]": {
+   "dump_class_rows_per_day": {
+    "bright_frb_extragalactic": 64.41,
+    "faint_frb_extragalactic": 23.97,
+    "bright_galactic": 1.0
+   },
+   "dump_rows_per_day": 89.38,
+   "n_changed_to_dump": 57,
+   "bright_rows_per_day": {
+    "rows_snr_ge_35": 90352.96,
+    "rows_snr_ge_50": 51494.44,
+    "rows_snr_ge_100": 571.73
+   },
+   "changed_examples": [
+    {
+     "mjd": "61316.23938419118",
+     "snr_1x": 11.24219,
+     "snr_now": 11.24219,
+     "dm": "327.127655",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31312881790",
+     "snr_1x": 11.00781,
+     "snr_now": 11.00781,
+     "dm": "620.531921",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31404904043",
+     "snr_1x": 11.07812,
+     "snr_now": 11.07812,
+     "dm": "559.319153",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31527673603",
+     "snr_1x": 11.05469,
+     "snr_now": 11.05469,
+     "dm": "138.723404",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.38342140865",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "586.276611",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.42096579369",
+     "snr_1x": 11.17188,
+     "snr_now": 11.17188,
+     "dm": "174.468079",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57778035876",
+     "snr_1x": 11.03125,
+     "snr_now": 11.03125,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57843906838",
+     "snr_1x": 11.61719,
+     "snr_now": 11.61719,
+     "dm": "1225.361694",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.72382760176",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.82664171646",
+     "snr_1x": 11.34375,
+     "snr_now": 11.34375,
+     "dm": "723.297852",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    }
+   ]
+  },
+  "1x+lin[w_med]": {
+   "dump_class_rows_per_day": {
+    "bright_frb_extragalactic": 64.41,
+    "faint_frb_extragalactic": 23.97,
+    "bright_galactic": 1.0
+   },
+   "dump_rows_per_day": 89.38,
+   "n_changed_to_dump": 57,
+   "bright_rows_per_day": {
+    "rows_snr_ge_35": 90352.96,
+    "rows_snr_ge_50": 51494.44,
+    "rows_snr_ge_100": 571.73
+   },
+   "changed_examples": [
+    {
+     "mjd": "61316.23938419118",
+     "snr_1x": 11.24219,
+     "snr_now": 11.24219,
+     "dm": "327.127655",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31312881790",
+     "snr_1x": 11.00781,
+     "snr_now": 11.00781,
+     "dm": "620.531921",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31404904043",
+     "snr_1x": 11.07812,
+     "snr_now": 11.07812,
+     "dm": "559.319153",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31527673603",
+     "snr_1x": 11.05469,
+     "snr_now": 11.05469,
+     "dm": "138.723404",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.38342140865",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "586.276611",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.42096579369",
+     "snr_1x": 11.17188,
+     "snr_now": 11.17188,
+     "dm": "174.468079",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57778035876",
+     "snr_1x": 11.03125,
+     "snr_now": 11.03125,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57843906838",
+     "snr_1x": 11.61719,
+     "snr_now": 11.61719,
+     "dm": "1225.361694",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.72382760176",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.82664171646",
+     "snr_1x": 11.34375,
+     "snr_now": 11.34375,
+     "dm": "723.297852",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    }
+   ]
+  },
+  "2x+lin[w_min]": {
+   "dump_class_rows_per_day": {
+    "bright_frb_extragalactic": 64.41,
+    "faint_frb_extragalactic": 23.97,
+    "bright_galactic": 1.0
+   },
+   "dump_rows_per_day": 89.38,
+   "n_changed_to_dump": 57,
+   "bright_rows_per_day": {
+    "rows_snr_ge_35": 90352.96,
+    "rows_snr_ge_50": 51494.44,
+    "rows_snr_ge_100": 571.73
+   },
+   "changed_examples": [
+    {
+     "mjd": "61316.23938419118",
+     "snr_1x": 11.24219,
+     "snr_now": 11.24219,
+     "dm": "327.127655",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31312881790",
+     "snr_1x": 11.00781,
+     "snr_now": 11.00781,
+     "dm": "620.531921",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31404904043",
+     "snr_1x": 11.07812,
+     "snr_now": 11.07812,
+     "dm": "559.319153",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31527673603",
+     "snr_1x": 11.05469,
+     "snr_now": 11.05469,
+     "dm": "138.723404",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.38342140865",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "586.276611",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.42096579369",
+     "snr_1x": 11.17188,
+     "snr_now": 11.17188,
+     "dm": "174.468079",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57778035876",
+     "snr_1x": 11.03125,
+     "snr_now": 11.03125,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57843906838",
+     "snr_1x": 11.61719,
+     "snr_now": 11.61719,
+     "dm": "1225.361694",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.72382760176",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.82664171646",
+     "snr_1x": 11.34375,
+     "snr_now": 11.34375,
+     "dm": "723.297852",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    }
+   ]
+  },
+  "2x+lin[w_med]": {
+   "dump_class_rows_per_day": {
+    "bright_frb_extragalactic": 64.41,
+    "faint_frb_extragalactic": 23.97,
+    "bright_galactic": 1.0
+   },
+   "dump_rows_per_day": 89.38,
+   "n_changed_to_dump": 57,
+   "bright_rows_per_day": {
+    "rows_snr_ge_35": 90352.96,
+    "rows_snr_ge_50": 51494.44,
+    "rows_snr_ge_100": 571.73
+   },
+   "changed_examples": [
+    {
+     "mjd": "61316.23938419118",
+     "snr_1x": 11.24219,
+     "snr_now": 11.24219,
+     "dm": "327.127655",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31312881790",
+     "snr_1x": 11.00781,
+     "snr_now": 11.00781,
+     "dm": "620.531921",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31404904043",
+     "snr_1x": 11.07812,
+     "snr_now": 11.07812,
+     "dm": "559.319153",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.31527673603",
+     "snr_1x": 11.05469,
+     "snr_now": 11.05469,
+     "dm": "138.723404",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.38342140865",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "586.276611",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.42096579369",
+     "snr_1x": 11.17188,
+     "snr_now": 11.17188,
+     "dm": "174.468079",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57778035876",
+     "snr_1x": 11.03125,
+     "snr_now": 11.03125,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.57843906838",
+     "snr_1x": 11.61719,
+     "snr_now": 11.61719,
+     "dm": "1225.361694",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.72382760176",
+     "snr_1x": 11.625,
+     "snr_now": 11.625,
+     "dm": "408.595734",
+     "width_median": "8.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    },
+    {
+     "mjd": "61316.82664171646",
+     "snr_1x": 11.34375,
+     "snr_now": 11.34375,
+     "dm": "723.297852",
+     "width_median": "4.000",
+     "recorded": "log_only",
+     "replayed": "faint_frb_extragalactic"
+    }
+   ]
+  }
+ }
+}

@@ -300,6 +300,7 @@ def filter_unphysical_narrow(
     floor_frac: Optional[float],
     *,
     t_search_us: float = T_INT_SEARCH_US_DEFAULT,
+    chan_sum_factor: int = _DEDISP_CHAN_SUM_FACTOR,
 ) -> "tuple[List[Candidate], int]":
     """Drop candidates far narrower than the DM-smearing floor permits.
 
@@ -328,7 +329,7 @@ def filter_unphysical_narrow(
         c
         for c in candidates
         if float(c.width_samples) >= floor_frac * dm_smear_samples(
-            float(c.dm_fine), t_search_us=t_search_us,
+            float(c.dm_fine), chan_sum_factor=chan_sum_factor, t_search_us=t_search_us,
         )
     ]
     return kept, len(candidates) - len(kept)
@@ -569,6 +570,10 @@ class SearchComputeConfig:
     # noise floor (~2×10⁻²) and was empirically validated against
     # the 250924mptq burst.
     layer1_sigma_floor: float = 0.0
+    # x2 (inventory item 6): the summed-channel factor of the noise-colour
+    # de-rate and DM-smearing floor comes from the op-point (--chan-sum-factor;
+    # 8 = today's literal, so 1x is unchanged).
+    dedisp_chan_sum_factor: int = _DEDISP_CHAN_SUM_FACTOR
 
     # --- M6 chunk 5: cube-geometry hyperparameters ---------------------
     cube_cell_l_rad: float = 1.5e-4
@@ -1735,6 +1740,7 @@ class SearchComputeService:
             )
             candidates, n_color_dropped = derate_noise_color(
                 candidates, nc_strength, nc_floor,
+                chan_sum_factor=int(cfg.dedisp_chan_sum_factor),
                 t_search_us=float(geom.sample_period_us),
             )
             if n_color_dropped:
@@ -1755,9 +1761,45 @@ class SearchComputeService:
             candidates, n_dm_dropped = filter_unphysical_narrow(
                 candidates, dm_floor_frac,
                 t_search_us=float(geom.sample_period_us),
+                chan_sum_factor=int(cfg.dedisp_chan_sum_factor),
             )
             if n_dm_dropped:
                 self._c1_cands_dropped_dmfloor += n_dm_dropped
+        # x2 D9 (WS-D, services/c1_emit.pool_cycle): the width cap / escape /
+        # governor / metering chain runs ONCE per cycle over all of a half's
+        # per-DM cubes; with one cube per cycle (1x) it is exactly the call
+        # below, i.e. today's behaviour.
+        from .c1_emit import pool_cycle
+        candidates = pool_cycle(
+            [(int(slot.cube_id), candidates)], self._c1_cycle_chain,
+        )[0][1]
+        rows = tuple(
+            candidate_to_c1_row(c, geom=geom) for c in candidates
+        )
+        header = build_header(
+            cube_id=int(slot.cube_id),
+            event_specnum_start=int(slot.specnum_start),
+            mjd_start=float(geom.mjd_start),
+            sample_period_specnum=int(geom.sample_period_specnum),
+            sample_period_us=float(geom.sample_period_us),
+            n_grid=int(slot.n_grid),
+            n_fdm_in_cube=int(slot.n_fdm_in_cube),
+            search_node_id=int(cfg.search_node_id),
+            gpu_half=int(cfg.gpu_half),
+            n_candidates=len(rows),
+        )
+        accepted = self._c1_emit.submit(header, candidates, rows=rows)
+        if accepted:
+            self._c1_batches_submitted += 1
+        else:
+            self._c1_batches_dropped += 1
+        return list(candidates)
+
+    def _c1_cycle_chain(self, candidates: List[Candidate]) -> List[Candidate]:
+        """Width cap + brightness escape + WideEscapeGovernor + metering --
+        today's C1 chain, applied once per pool (one cube in 1x, one cycle of
+        per-DM cubes in 2x via ``c1_emit.pool_cycle``)."""
+        cfg = self._config
         # M7.6: drop candidates wider than the configured C1→C2 width cap
         # BEFORE they are transmitted. Wide boxcars (≥32) are the on-sky
         # false-positive floor; capping at ``max_width_samples`` keeps the
@@ -1886,26 +1928,6 @@ class SearchComputeService:
                 self._meter_window_dropped_max = n_metered
         if self._meter_window_blocks >= _METER_WINDOW_BLOCKS:
             self._publish_c1_metering(int(cap or 0))
-        rows = tuple(
-            candidate_to_c1_row(c, geom=geom) for c in candidates
-        )
-        header = build_header(
-            cube_id=int(slot.cube_id),
-            event_specnum_start=int(slot.specnum_start),
-            mjd_start=float(geom.mjd_start),
-            sample_period_specnum=int(geom.sample_period_specnum),
-            sample_period_us=float(geom.sample_period_us),
-            n_grid=int(slot.n_grid),
-            n_fdm_in_cube=int(slot.n_fdm_in_cube),
-            search_node_id=int(cfg.search_node_id),
-            gpu_half=int(cfg.gpu_half),
-            n_candidates=len(rows),
-        )
-        accepted = self._c1_emit.submit(header, candidates, rows=rows)
-        if accepted:
-            self._c1_batches_submitted += 1
-        else:
-            self._c1_batches_dropped += 1
         return list(candidates)
 
     def _publish_c1_metering(self, cap: int) -> None:
@@ -2455,6 +2477,7 @@ def _build_search_config_from_yaml(
     t_det: int,
     cube_cadence_samples: int,
     kernel_support: int = 1,
+    chan_sum_factor: int = _DEDISP_CHAN_SUM_FACTOR,
     cube_pipeline_carry_over_re_imaging: bool = False,
     t_int_search_us: float = T_INT_SEARCH_US_DEFAULT,
     enable_c1: bool = True,
@@ -2879,6 +2902,7 @@ def _build_search_config_from_yaml(
             if float(layer1_sigma_floor) > 0.0
             else float(noise.get("layer1_sigma_floor", 0.0))
         ),
+        dedisp_chan_sum_factor=int(chan_sum_factor),
         fine_dm_pc_cc_full=fine_dm_pc_cc_full,
         clusterer_config=clusterer_cfg,
         cube_dump_writer_config=cube_dump_cfg,
@@ -3256,6 +3280,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         t_det=args.t_det,
         cube_cadence_samples=args.cube_cadence_samples,
         kernel_support=int(args.kernel_support),
+        chan_sum_factor=int(args.chan_sum_factor),
         cube_pipeline_carry_over_re_imaging=bool(
             args.cube_pipeline_carry_over_re_imaging
         ),
@@ -3316,6 +3341,18 @@ async def _run_async(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # x2 (docs/x2/SPEC.md §10): ``--opoint 2x-*`` runs the owner engine
+    # (dsart.x2.search.service); ``--opoint 1x`` / no flag = today's path,
+    # untouched. The 1x parser never sees --opoint.
+    _argv = list(sys.argv[1:] if argv is None else argv)
+    if "--opoint" in _argv:
+        _i = _argv.index("--opoint")
+        _sel = _argv[_i + 1] if _i + 1 < len(_argv) else ""
+        if _sel.startswith("2x"):
+            from ..x2.search.service import main as _x2_main
+            return _x2_main(_argv)
+        del _argv[_i:_i + 2]
+        argv = _argv
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
