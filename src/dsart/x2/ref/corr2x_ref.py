@@ -45,7 +45,6 @@ import numpy as np
 from dsart.coarse_dm.dm_plan import build_summed_chgroup_freq_table_GHz
 from dsart.common.constants import LEGACY_FLUFF_SCALE, NATIVE_SAMPLE_US, SPEED_OF_LIGHT_M_S
 from dsart.x2.corr.plan2x import CorrPlan2x
-from dsart.x2.corr.value_map import ValueMap
 
 __all__ = [
     "FRAME2_HEADER",
@@ -67,7 +66,9 @@ __all__ = [
     "unpack_bits_le",
     "unpack_frame2",
     "unpack_int4_onwire",
-    "value_dest",
+    "value_dest_cells",
+    "value_dest_classes",
+    "value_dest_from_vm",
 ]
 
 # ---------------------------------------------------------------------------
@@ -137,36 +138,68 @@ def gemm_core(E: np.ndarray, rows_a: np.ndarray, rows_b: np.ndarray, *, t_int: i
 # ---------------------------------------------------------------------------
 
 
-def value_dest(vm: ValueMap, antpos_e, antpos_n) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Per stream: ``(dest, conj)`` arrays of shape ``(R, per)`` giving the
-    stream-local value index of each (row, sub-band channel) source (``-1``
-    = off-grid) and whether it is conjugated. Cells: from the uv geometry
-    at the summed-channel frequency, looked up in the stream's cell list.
-    Baselines: the source's redundancy class."""
-    rows = vm.rows
-    nus = build_summed_chgroup_freq_table_GHz(vm.csf)[vm.chgroup]
-    out = []
-    for s, sv in enumerate(vm.streams):
-        ks = np.arange(s * vm.per, (s + 1) * vm.per)
-        if vm.kind == "cells":
-            lam = SPEED_OF_LIGHT_M_S / (nus[ks] * 1e9)
-            du = antpos_e[rows.a].astype(np.float64) - antpos_e[rows.b].astype(np.float64)
-            dv = antpos_n[rows.a].astype(np.float64) - antpos_n[rows.b].astype(np.float64)
-            half = vm.n_grid // 2
-            col = np.rint(-(du[:, None] / lam[None, :]) / vm.cell_lambda).astype(np.int64) + half
-            row = np.rint(-(dv[:, None] / lam[None, :]) / vm.cell_lambda).astype(np.int64) + half
-            ok = (row >= 0) & (row < vm.n_grid) & (col >= 0) & (col < vm.n_grid)
-            key = np.where(ok, (row << 16) | col, -1)
-            vkeys = (sv.cell_row.astype(np.int64) << 16) | sv.cell_col.astype(np.int64)
-            lut = {int(k): i for i, k in enumerate(vkeys)}
-            dest = np.vectorize(lambda k: lut.get(int(k), -1), otypes=[np.int64])(key)
-            conj = np.zeros(dest.shape, bool)
-        else:
-            vidx = {int(c): i for i, c in enumerate(sv.klass)}
-            dest = np.array([vidx[int(c)] for c in vm.class_of_row], np.int64)[:, None].repeat(vm.per, 1)
-            conj = np.asarray(vm.conj_of_row, bool)[:, None].repeat(vm.per, 1)
-        out.append((dest, conj))
-    return out
+def value_dest_cells(
+    antpos_e: np.ndarray,
+    antpos_n: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    nu_ghz: np.ndarray,
+    *,
+    cell_lambda: float,
+    n_grid: int,
+    cell_row: np.ndarray,
+    cell_col: np.ndarray,
+) -> np.ndarray:
+    """Gridded cells, from the geometry alone: the stream-local value index
+    of each (row, channel) source, ``(R, n_chan)`` (-1 = off-grid). Rows
+    are baselines ``(a, b)``; ``nu_ghz`` the summed-channel frequencies;
+    ``cell_row/col`` the stream's cells in wire order (the contract)."""
+    lam = SPEED_OF_LIGHT_M_S / (np.asarray(nu_ghz, np.float64) * 1e9)
+    du = np.asarray(antpos_e, np.float64)[a] - np.asarray(antpos_e, np.float64)[b]
+    dv = np.asarray(antpos_n, np.float64)[a] - np.asarray(antpos_n, np.float64)[b]
+    half = n_grid // 2
+    col = np.rint(-(du[:, None] / lam[None, :]) / cell_lambda).astype(np.int64) + half
+    row = np.rint(-(dv[:, None] / lam[None, :]) / cell_lambda).astype(np.int64) + half
+    ok = (row >= 0) & (row < n_grid) & (col >= 0) & (col < n_grid)
+    key = np.where(ok, (row << 16) | col, -1)
+    vkeys = (np.asarray(cell_row, np.int64) << 16) | np.asarray(cell_col, np.int64)
+    srt = np.argsort(vkeys, kind="stable")
+    pos = np.clip(np.searchsorted(vkeys[srt], key), 0, max(vkeys.size - 1, 0))
+    hit = ok & (vkeys[srt][pos] == key)
+    return np.where(hit, srt[pos], -1)
+
+
+def value_dest_classes(
+    bl_class: np.ndarray, bl_conj: np.ndarray, class_id_wire: np.ndarray, n_chan: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-baseline values: every (row, channel) source goes to its
+    redundancy class's value, conjugated where the member is reversed."""
+    vidx = np.full(int(np.max(bl_class)) + 1, -1, np.int64)
+    vidx[np.asarray(class_id_wire, np.int64)] = np.arange(len(class_id_wire))
+    dest = np.repeat(vidx[np.asarray(bl_class, np.int64)][:, None], n_chan, axis=1)
+    conj = np.repeat(np.asarray(bl_conj, bool)[:, None], n_chan, axis=1)
+    return dest, conj
+
+
+def value_dest_from_vm(vm, stream: int, antpos_e, antpos_n) -> tuple[np.ndarray, np.ndarray]:
+    """``(dest, conj)`` ``(R, per)`` for one stream of a WS-P
+    :class:`dsart.grid.baseline_grid.ValueMap`; rows are its ``kept_bl``
+    (core cross-baselines, xGPU order). Cells come from the geometry, not
+    from the map's CSR."""
+    from dsart.grid.baseline_grid import kept_core_baselines  # noqa: PLC0415
+    st = vm.streams[stream]
+    per = vm.nchan_eff // vm.n_sub
+    chans = np.arange(st.sub_band * per, (st.sub_band + 1) * per)
+    if vm.kind == "gridded":
+        mask = np.zeros(antpos_e.shape[0] * (antpos_e.shape[0] + 1) // 2, bool)
+        mask[vm.kept_bl] = True
+        _, a, b = kept_core_baselines(mask, antpos_e.shape[0])
+        nu = build_summed_chgroup_freq_table_GHz(vm.chan_sum_factor)[st.chgroup][chans]
+        dest = value_dest_cells(antpos_e, antpos_n, a, b, nu, cell_lambda=vm.cell_lambda,
+                                n_grid=vm.n_grid, cell_row=st.cell_row, cell_col=st.cell_col)
+        return dest, np.zeros(dest.shape, bool)
+    c = vm.classes
+    return value_dest_classes(c.bl_class, c.bl_conj, st.class_id, per)
 
 
 def stage1_values(
@@ -248,11 +281,16 @@ S_MAIN = {4: 0.336, 5: 0.191, 6: 0.106}
 
 @dataclass
 class RowRuleState:
-    """Per (stream, coarse DM) robust sigma (EMA)."""
+    """Per (stream, coarse DM) robust sigma (EMA), SPEC §4 step 2:
+    1.4826 x the LOWER median of ``|re|, |im|`` over every ``stride``-th
+    sample of the block, excluding components above ``clip_sigma`` x the
+    previous sigma; EMA with ``tau_s``. A block is quantised with the
+    previous sigma (its own estimate for the first block)."""
 
     tau_s: float = 10.0
     block_s: float = 4096 * NATIVE_SAMPLE_US * 1e-6
     clip_sigma: float = 6.0
+    stride: int = 4
     sigma: dict = field(default_factory=dict)
 
     @property
@@ -260,17 +298,17 @@ class RowRuleState:
         return 1.0 - math.exp(-self.block_s / self.tau_s)
 
     def robust(self, y: np.ndarray, prev: float | None) -> float:
-        comp = np.abs(np.concatenate([y.real.ravel(), y.imag.ravel()]))
+        ys = y[:: self.stride]
+        comp = np.abs(np.stack([ys.real, ys.imag], axis=-1)).ravel()
         if prev is not None:
             comp = comp[comp <= self.clip_sigma * prev]
         if comp.size == 0:
             return float(prev) if prev is not None else 1.0
-        return float(1.4826 * np.median(comp))
+        k = (comp.size - 1) // 2
+        return float(1.4826 * np.partition(comp, k)[k])
 
     def step(self, key, y: np.ndarray) -> float:
-        """Sigma used to quantise this block (the PREVIOUS estimate once one
-        exists; the block's own robust estimate for the first block), and
-        advance the EMA with this block."""
+        """Sigma used to quantise this block, then advance the EMA."""
         prev = self.sigma.get(key)
         est = self.robust(y, prev)
         use = est if prev is None else prev
@@ -468,26 +506,21 @@ class Corr2xRef:
     """The whole corr chain for one chgroup, block by block, mirroring the
     GPU orchestrator's framing: block ``k``'s GEMM output joins block
     ``k-1``'s in a 2-block window; stage 1 then emits block ``k-1`` for
-    every coarse DM of every tier (the first call emits nothing)."""
+    every coarse DM of every tier (the first call emits nothing).
+
+    ``streams[s] = (dest, conj, n_values)`` from :func:`value_dest_cells` /
+    :func:`value_dest_classes` / :func:`value_dest_from_vm`."""
 
     plan: CorrPlan2x
-    vm: ValueMap
-    antpos_e: np.ndarray
-    antpos_n: np.ndarray
-    t_int: int = 8
+    chgroup: int
+    streams: list
     static_sky: StaticSkyRef | None = None
     _prev: np.ndarray | None = field(default=None, repr=False)
-    _dest: list | None = field(default=None, repr=False)
-
-    def gemm_block(self, E: np.ndarray) -> np.ndarray:
-        return gemm_core(E, self.vm.rows.a, self.vm.rows.b, t_int=self.t_int, csf=self.vm.csf)
 
     def push(self, V: np.ndarray, *, block_start_q1: int) -> dict | None:
         """``V`` = this block's GEMM output ``(n_q, nsum, R)``; returns
         ``{(d, s): (x_dec (n_dec, V_s) complex, t0_native)}`` for the
         previous block, or None on the first call."""
-        if self._dest is None:
-            self._dest = value_dest(self.vm, self.antpos_e, self.antpos_n)
         prev, self._prev = self._prev, V
         if prev is None:
             return None
@@ -495,21 +528,20 @@ class Corr2xRef:
         joined = np.concatenate([prev, V], axis=0)
         start = block_start_q1 - n_q                                   # absolute q1 of prev[0]
         out = {}
-        g = self.vm.chgroup
+        per = self.plan.per
         for ti, tier in enumerate(self.plan.tiers):
-            s1_all = self.plan.stage1_bins(ti)[g]                      # (nsum, n_c)
+            s1_all = self.plan.stage1_bins(ti)[self.chgroup]           # (nsum, n_c)
             D = tier.decim
             if start % D or n_q % D:
                 raise ValueError("blocks must align to the tier decimation")
             for c in range(tier.n_coarse):
                 d = tier.d0 + c
-                for s, sv in enumerate(self.vm.streams):
-                    ks = np.arange(s * self.vm.per, (s + 1) * self.vm.per)
-                    dest, conj = self._dest[s]
+                for s, (dest, conj, n_values) in enumerate(self.streams):
+                    ks = np.arange(s * per, (s + 1) * per)
                     x = stage1_values(joined, dest, conj, ks=ks, s1=s1_all[ks, c],
-                                      n_values=sv.n_values, t0=0, n_out=n_q)
+                                      n_values=n_values, t0=0, n_out=n_q)
                     xd = decimate(x, D)
                     if self.static_sky is not None:
                         xd = self.static_sky.apply((d, s), xd)
-                    out[(d, s)] = (xd, start * self.t_int)
+                    out[(d, s)] = (xd, start * tier.q1_native)
         return out

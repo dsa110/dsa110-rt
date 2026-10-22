@@ -5,8 +5,9 @@
 * a dispersed impulse lands on the predicted decimated sample for EVERY
   coarse DM of both tiers (vis domain, three chgroups), and end to end
   from raw int4 bytes through unpack / cal / float64 GEMM / gridding;
-* the interim value map reproduces today's sub-band patterns exactly
-  (SPEC §3 1x-compat) and builds consistent redundancy classes;
+* the reference's GEOMETRIC source placement agrees with WS-P's value-map
+  CSR (both kinds, production antenna fixture), so the CSR the kernels use
+  is checked against an independent derivation;
 * row rule, bit packing and frame v2 round-trip; the v1 cint8 rule equals
   ``TransportTx._encode_rows`` byte for byte.
 """
@@ -19,9 +20,9 @@ import sys
 import numpy as np
 import pytest
 
-from dsart.common.constants import NANTS, NATIVE_SAMPLE_US, NCHAN_PER_CHGROUP
+from dsart.coarse_dm.dm_plan import build_summed_chgroup_freq_table_GHz
+from dsart.common.constants import NATIVE_SAMPLE_US, NCHAN_PER_CHGROUP
 from dsart.x2.corr.plan2x import proposed_corr_plan, stage1_a1_us
-from dsart.x2.corr.value_map import build_value_map, row_csr_for_values
 from dsart.x2.ref import corr2x_ref as ref
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -43,30 +44,25 @@ def _oracle(n_sub: int):
 
 @pytest.mark.parametrize("n_sub,counts", [(2, (32, 15)), (4, (16, 8))])
 def test_stage1_tables_equal_oracle(n_sub, counts) -> None:
+    """WS-P's plan (through the corr view), the oracle and an independent
+    restatement of a1 all give the same stage-1 table."""
     plan = proposed_corr_plan(n_sub)
     orc = _oracle(n_sub)
+    a1 = stage1_a1_us(2, n_sub)
     assert tuple(t.n_coarse for t in plan.tiers) == counts
-    assert np.array_equal(plan.a1_us, orc.a1)
+    assert np.array_equal(a1, orc.a1)
     for ti, (t, ot) in enumerate(zip(plan.tiers, orc.tiers)):
         assert np.array_equal(t.coarse_dm, ot["coarse"])
         assert t.T_us == ot["q2"] and t.q1_native * NATIVE_SAMPLE_US == ot["q1"]
+        assert t.decim == (2 if t.name == "A" else 4)
         tab = plan.stage1_bins(ti)
+        mine = np.rint(np.rint(a1[:, :, None] * t.coarse_dm[None, None, :] / NATIVE_SAMPLE_US)
+                       / t.q1_native).astype(np.int64)
+        assert np.array_equal(tab, mine)
         for c in range(t.n_coarse):
             assert np.array_equal(tab[:, :, c], orc.stage1_bins(ti, c).astype(np.int64)), (ti, c)
     assert plan.n_coarse_total == sum(counts)
     assert [plan.owner_half(d) for d in range(10)] == [0, 1, 2, 3, 4, 5, 6, 7, 0, 1]
-
-
-def test_tiered_plan_adapter_when_available() -> None:
-    plan_mod = pytest.importorskip("dsart.x2.plan", reason="WS-P TieredDmPlan not merged yet")
-    builder = getattr(plan_mod, "proposed_tiered_plan", None) or getattr(plan_mod, "build_proposed", None)
-    if builder is None:
-        pytest.skip("TieredDmPlan has no proposed() builder under the expected names")
-    from dsart.x2.corr.plan2x import CorrPlan2x
-    for n_sub in (2, 4):
-        mine = proposed_corr_plan(n_sub)
-        theirs = CorrPlan2x.from_tiered_plan(builder(n_sub=n_sub))
-        assert np.array_equal(mine.stage1_bins_global(), theirs.stage1_bins_global())
 
 
 # ---------------------------------------------------------------------------
@@ -111,23 +107,44 @@ def test_impulse_lands_on_predicted_sample_every_dm(n_sub) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _toy_array(n_core: int = 6):
-    rng = np.random.default_rng(3)
-    e = rng.uniform(-40, 40, n_core)
-    n = rng.uniform(-40, 40, n_core)
+def _toy_array():
+    """6 antennas on an E-W line at 5.75 m plus one N offset: redundant."""
+    e = np.array([0.0, 5.75, 11.5, 17.25, 23.0, 5.75])
+    n = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 7.0])
     return e, n
 
 
-@pytest.mark.parametrize("kind", ["cells", "baselines"])
+@pytest.mark.parametrize("kind", ["gridded", "baselines"])
 def test_voltage_impulse_end_to_end(kind) -> None:
+    from dsart.grid.baseline_grid import kept_core_baselines, redundancy_classes
     n_sub, g = 2, 15
     plan = proposed_corr_plan(n_sub)
     a1 = stage1_a1_us(plan.csf, n_sub)
     e, n = _toy_array()
     nants = e.size
-    vm = build_value_map(kind, chgroup=g, antpos_e=e, antpos_n=n, is_core_ant=np.ones(nants, bool),
-                         csf=plan.csf, n_sub=n_sub, n_grid=64, cell_lambda=16.0)
-    dests = ref.value_dest(vm, e, n)
+    _, ka, kb = kept_core_baselines(None, nants)
+    R = ka.size
+    per = plan.per
+    nus = build_summed_chgroup_freq_table_GHz(plan.csf)[g]
+    streams = []
+    for s_ in range(n_sub):
+        chans = np.arange(s_ * per, (s_ + 1) * per)
+        if kind == "gridded":
+            lam = 299792458.0 / (nus[chans] * 1e9)
+            col = np.rint(-((e[ka] - e[kb])[:, None] / lam) / 16.0).astype(np.int64) + 32
+            row = np.rint(-((n[ka] - n[kb])[:, None] / lam) / 16.0).astype(np.int64) + 32
+            keys = np.unique((row << 16) | col)
+            dest = ref.value_dest_cells(e, n, ka, kb, nus[chans], cell_lambda=16.0, n_grid=64,
+                                        cell_row=keys >> 16, cell_col=keys & 0xFFFF)
+            conj = np.zeros(dest.shape, bool)
+            nv = keys.size
+        else:
+            rc = redundancy_classes(e, n, is_core_baseline_mask=None)
+            assert rc.n_class < R
+            dest, conj = ref.value_dest_classes(rc.bl_class, rc.bl_conj, np.arange(rc.n_class), per)
+            nv = rc.n_class
+        assert (dest >= 0).all()
+        streams.append((dest, conj, nv))
     for ti, tier in enumerate(plan.tiers):
         c = tier.n_coarse - 1
         dm = tier.coarse_dm[c]
@@ -145,114 +162,60 @@ def test_voltage_impulse_end_to_end(kind) -> None:
                                    nchan=NCHAN_PER_CHGROUP)
         gains = np.exp(1j * np.zeros((nants, NCHAN_PER_CHGROUP, 2)))
         E = ref.apply_cal(ref.apply_masks(E), gains)
-        V = ref.gemm_core(E, vm.rows.a, vm.rows.b, t_int=8, csf=plan.csf)
+        V = ref.gemm_core(E, ka, kb, t_int=8, csf=plan.csf)
         # point source at the phase centre: every baseline real, = csf*2pol*(3*0.05)^2
         unit = plan.csf * 2 * (3 * 0.05) ** 2
         s1 = plan.stage1_bins(ti)[g][:, c]
         n_out = (t0_q // D + 2) * D
-        for s, sv in enumerate(vm.streams):
-            ks = np.arange(s * plan.per, (s + 1) * plan.per)
-            dest, conj = dests[s]
-            x = ref.stage1_values(V, dest, conj, ks=ks, s1=s1[ks], n_values=sv.n_values,
-                                  t0=0, n_out=n_out)
+        for s_, (dest, conj, nv) in enumerate(streams):
+            ks = np.arange(s_ * per, (s_ + 1) * per)
+            x = ref.stage1_values(V, dest, conj, ks=ks, s1=s1[ks], n_values=nv, t0=0, n_out=n_out)
             xd = ref.decimate(x, D)
             tot = xd.sum(axis=1)
             j = int(np.argmax(np.abs(tot)))
-            assert j == t0_q // D, (kind, tier.name, s, j)
-            np.testing.assert_allclose(tot[j].real, vm.rows.n * plan.per * unit, rtol=1e-12)
+            assert j == t0_q // D, (kind, tier.name, s_, j)
+            np.testing.assert_allclose(tot[j].real, R * per * unit, rtol=1e-12)
             assert abs(tot[j].imag) < 1e-9
             assert np.allclose(np.delete(tot, j), 0.0)
-            # every value got exactly its static contribution count
-            np.testing.assert_allclose(xd[j].real, sv.n * unit, rtol=1e-12)
+            n_v = np.bincount(dest.ravel(), minlength=nv)
+            np.testing.assert_allclose(xd[j].real, n_v * unit, rtol=1e-12)
 
 
 # ---------------------------------------------------------------------------
-# value maps
+# reference geometry vs WS-P's value-map CSR (production antenna fixture)
 # ---------------------------------------------------------------------------
 
 
-def _synth_antpos(seed: int = 42):
-    rng = np.random.default_rng(seed)
-    e = np.zeros(NANTS, dtype=np.float32)
-    n = np.zeros(NANTS, dtype=np.float32)
-    e[:82] = rng.uniform(-300.0, 300.0, size=82).astype(np.float32)
-    n[:82] = rng.uniform(-300.0, 300.0, size=82).astype(np.float32)
-    e[82:] = rng.uniform(-5000.0, 5000.0, size=NANTS - 82).astype(np.float32)
-    n[82:] = rng.uniform(-2000.0, 2000.0, size=NANTS - 82).astype(np.float32)
-    return e, n
+def _fixture_vm(kind: str, n_sub: int):
+    from dsart.grid.baseline_grid import build_value_map_for_opoint
+    from dsart.grid.sparsity_pattern import core_baseline_mask_from_station_numbers
+    from dsart.x2.opoint import opoint_2x
+    z = np.load(os.path.join(ROOT, "tests", "fixtures", "x2", "dsa110_antpos.npz"))
+    e, n = z["antpos_e"], z["antpos_n"]
+    mask = core_baseline_mask_from_station_numbers(z["station"])
+    vm = build_value_map_for_opoint(opoint_2x(kind, n_sub), e, n, is_core_baseline_mask=mask,
+                                    dec_deg=71.63)
+    return vm, e, n, mask
 
 
-@pytest.mark.parametrize("csf,n_sub", [(8, 4), (2, 2)])
-def test_cells_map_equals_todays_subband_patterns(csf, n_sub) -> None:
-    from dsart.grid import FastVisGridder, build_pattern, cell_lambda_for_pixel_arcsec
-    from dsart.grid.subband import build_subband_layout, build_subband_patterns
-    from dsart.grid import IMAGE_PIXEL_ARCSEC_TEE
-    from dsart.services.corr_fast_integration import _build_core_baseline_mask
-
-    e, n = _synth_antpos()
-    is_core = np.zeros(NANTS, bool)
-    is_core[:82] = True
-    core = _build_core_baseline_mask(n_core=82)
-    cl = cell_lambda_for_pixel_arcsec(IMAGE_PIXEL_ARCSEC_TEE, 256)
-    g = 9
-    pats = build_subband_patterns(e, n, chgroup=g, n_sub=n_sub, dec_deg=71.6, n_grid=256,
-                                  kernel_support=1, chan_sum_factor=csf, cell_lambda=cl,
-                                  is_core_baseline_mask=core)
-    whole = build_pattern(e, n, chgroup=g, dec_deg=71.6, n_grid=256, kernel_support=1,
-                          chan_sum_factor=csf, cell_lambda=cl, is_core_baseline_mask=core)
-    gr = FastVisGridder.from_pattern(whole, e, n, is_core_baseline_mask=core, device="cpu")
-    lay = build_subband_layout(pats, gr, device="cpu")
-    vm = build_value_map("cells", chgroup=g, antpos_e=e, antpos_n=n, is_core_ant=is_core,
-                         csf=csf, n_sub=n_sub, n_grid=256, cell_lambda=cl)
-    nsum = NCHAN_PER_CHGROUP // csf
-    cim = lay.cell_index_map.numpy().reshape(-1, nsum)                  # (NBASE, nsum)
-    for s, (p, sv) in enumerate(zip(pats, vm.streams)):
-        assert np.array_equal(p.ix_row.astype(np.int64), sv.cell_row)
-        assert np.array_equal(p.ix_col.astype(np.int64), sv.cell_col)
-        lo = int(lay.offsets[s])
-        flat = cim.reshape(-1)
-        sel = flat[(flat >= lo) & (flat < lo + p.n_filled)] - lo
-        assert np.array_equal(np.bincount(sel, minlength=p.n_filled), sv.n)
-        # same (baseline, channel) -> cell assignment
-        for v in (0, sv.n_values // 2, sv.n_values - 1):
-            a, b = sv.src_ptr[v], sv.src_ptr[v + 1]
-            bls = vm.rows.bls[sv.src_row[a:b]]
-            assert np.all(cim[bls, sv.src_k[a:b]] == lo + v)
-    csr = row_csr_for_values(vm)
-    assert csr["ptr"][-1] == csr["row"].size == int(csr["n"].sum())
-    assert int(csr["n"].sum()) == vm.rows.n * nsum - int(np.sum(cim[vm.rows.bls] >= lay.n_filled_total))
-
-
-def _redundant_array():
-    """DSA-like Tee: 30 E-W at 5.75 m, 20 N-S at 5.75 m (sharing the
-    corner), heights 0 -- lots of exact redundancy."""
-    ew = [(5.75 * i, 0.0) for i in range(30)]
-    ns = [(0.0, 5.75 * j) for j in range(1, 21)]
-    pts = np.array(ew + ns)
-    return pts[:, 0], pts[:, 1]
-
-
-def test_baselines_map_redundancy_and_counts() -> None:
-    e, n = _redundant_array()
-    nants = e.size
-    vm = build_value_map("baselines", chgroup=4, antpos_e=e, antpos_n=n,
-                         is_core_ant=np.ones(nants, bool), csf=2, n_sub=2, n_grid=256,
-                         cell_lambda=2.0, heavy_threshold=40 * 96)
-    R = vm.rows.n
-    assert R == nants * (nants - 1) // 2
-    assert vm.n_class < R // 3                     # strongly redundant
-    d = np.stack([e[vm.rows.a] - e[vm.rows.b], n[vm.rows.a] - n[vm.rows.b]], 1)
-    for c in range(vm.n_class):
-        mem = np.flatnonzero(vm.class_of_row == c)
-        sgn = np.where(vm.conj_of_row[mem], -1.0, 1.0)[:, None]
-        assert np.allclose(d[mem] * sgn, d[mem[0]], atol=0.05)
-        assert not vm.conj_of_row[mem[0]]
-    for sv in vm.streams:
-        assert int(sv.n.sum()) == R * vm.per
-        assert np.all(sv.n[: sv.n_heavy] >= 40 * 96) and np.all(sv.n[sv.n_heavy:] < 40 * 96)
-        assert sv.n_heavy > 0
-    csr = row_csr_for_values(vm, rows="classes")
-    assert csr["row"].max() < vm.n_class and not csr["conj"].any()
+@pytest.mark.parametrize("kind,n_sub", [("gridded", 2), ("baselines", 4)])
+def test_reference_geometry_equals_value_map_csr(kind, n_sub) -> None:
+    vm, e, n, _ = _fixture_vm(kind, n_sub)
+    kept = vm.kept_bl.astype(np.int64)
+    per = vm.nchan_eff // n_sub
+    for stream in (0, n_sub * 7 + 1, vm.n_streams - 1):
+        dest, conj = ref.value_dest_from_vm(vm, stream, e, n)
+        csr = vm.corr_csr(stream)
+        st = vm.streams[stream]
+        # rebuild the CSR from the reference placement, in the SPEC's fixed order
+        r_idx, k_loc = np.nonzero(dest >= 0)
+        v = dest[r_idx, k_loc]
+        flat = kept[r_idx] * vm.nchan_eff + st.sub_band * per + k_loc
+        order = np.lexsort((flat, v))
+        assert np.array_equal(np.bincount(v, minlength=st.n_values), st.n_contrib)
+        assert np.array_equal(flat[order] // vm.nchan_eff, csr.bl)
+        assert np.array_equal(flat[order] % vm.nchan_eff, csr.ch)
+        assert np.array_equal(conj[r_idx, k_loc][order], csr.conj)
 
 
 # ---------------------------------------------------------------------------

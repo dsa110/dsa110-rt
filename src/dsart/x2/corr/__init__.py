@@ -6,9 +6,8 @@ package never pulls in torch / triton / cupy):
 
 * :mod:`.pipeline1x`  -- 1x-compat orchestrator (async H2D, 2-block ring,
   deferred TX); bit-identical to ``process_block`` at today's parameters.
-* :mod:`.plan2x`      -- corr view of the tiered 2x DM plan (stage-1 tables).
-* :mod:`.value_map`   -- interim gridded-cell / unique-baseline value maps
-  (until WS-P's ``grid/baseline_grid.py`` lands).
+* :mod:`.plan2x`      -- corr view of WS-P's tiered 2x DM plan (stage-1 tables).
+  Value maps are WS-P's ``dsart.grid.baseline_grid``.
 * :mod:`.gemm2x`      -- Triton fast GEMM (core cross-baselines, cal + mask
   on load, cfp16 time-minor ring output, unique-baseline reduce).
 * :mod:`.stage1_cuda` -- CSR-driven stage-1 (all DMs of a tier, x2/x4

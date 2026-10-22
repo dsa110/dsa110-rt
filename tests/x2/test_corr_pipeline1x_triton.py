@@ -11,7 +11,7 @@ bit-identity, checked under ``TRITON_INTERPRET=1`` on the CPU:
 """
 from __future__ import annotations
 
-from _interp import run_interpreted
+from ._interp import run_interpreted
 
 _GEMM = r"""
 import torch

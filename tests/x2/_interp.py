@@ -16,6 +16,13 @@ interpreter is exact. Create the overlay once per test node::
 
 (``X2_NP1_OVERLAY`` overrides the path.) If no working interpreter is
 found the calling test is skipped with the reason, never silently passed.
+
+Every snippet is prefixed with :data:`PREAMBLE`, which teaches the
+interpreter string annotations: kernel modules written with ``from
+__future__ import annotations`` (``triton_dedisp``, ``triton_corr_fused``)
+carry ``"tl.constexpr"`` strings, which the compiler accepts (substring
+test) but triton 3.1's interpreter only recognises as the exact string
+``"constexpr"``.
 """
 from __future__ import annotations
 
@@ -27,6 +34,15 @@ import sys
 import pytest
 
 OVERLAY = os.environ.get("X2_NP1_OVERLAY", "/home/ubuntu/x2_scratch/_np126")
+
+PREAMBLE = r"""
+import triton.runtime.jit as _tj
+_tj_norm = _tj._normalize_ty
+def _tj_norm2(ty):
+    r = _tj_norm(ty)
+    return "constexpr" if isinstance(r, str) and r.endswith("constexpr") else r
+_tj._normalize_ty = _tj_norm2
+"""
 
 _PROBE = r"""
 import torch, triton, triton.language as tl
@@ -78,7 +94,7 @@ def run_interpreted(code: str, *, timeout: int = 900) -> str:
     if env is None:
         pytest.skip(f"no working Triton interpreter (numpy<2 overlay {OVERLAY}?): {why}")
     r = subprocess.run(
-        [sys.executable, "-c", code], env=env,
+        [sys.executable, "-c", PREAMBLE + code], env=env,
         capture_output=True, text=True, timeout=timeout,
     )
     if r.returncode != 0:

@@ -81,58 +81,62 @@ class Gemm2xTables:
         return out
 
 
-def build_gemm_tables(vm, *, rows: str = "baselines") -> Gemm2xTables:
-    """From a :class:`~dsart.x2.corr.value_map.ValueMap`.
+def build_gemm_tables(is_core_baseline_mask, *, nants: int = 96, classes=None) -> Gemm2xTables:
+    """Static tables from the core-baseline mask (SPEC §3 production input).
 
-    ``rows="baselines"``: ring row = core-baseline row (gridded cells, or
-    per-baseline values without the reduce). ``rows="classes"`` (baselines
-    kind): ring row = class id; singleton classes are stored directly,
-    members of multi-member classes go to scratch rows that
-    :func:`reduce_classes` sums in ascending-row order."""
-    cr = vm.rows
-    core = np.asarray(cr.core_ants, np.int64)
+    Without ``classes``: ring row = kept core baseline in xGPU order
+    (``baseline_grid.kept_core_baselines``; gridded cells, or per-baseline
+    values without the reduce). With ``classes``
+    (:class:`dsart.grid.baseline_grid.RedundancyClasses` of the same mask):
+    ring row = class id; singleton classes are stored directly, members of
+    multi-member classes go to scratch rows that :func:`reduce_classes` sums
+    in ascending-member order (``class_members``) with ``bl_conj``."""
+    from dsart.grid.baseline_grid import kept_core_baselines  # noqa: PLC0415
+    _, a, b = kept_core_baselines(is_core_baseline_mask, nants)
+    a = a.astype(np.int64)
+    b = b.astype(np.int64)
+    n_kept = a.size
+    core = np.unique(np.concatenate([a, b]))
     nc = core.size
     nc_pad = -(-nc // BLOCK) * BLOCK
     core_ants = np.zeros(nc_pad, np.int32)
     core_ants[:nc] = core
-    slot = {int(a): i for i, a in enumerate(core)}
-    sm = np.array([slot[int(b)] for b in cr.b], np.int64)
-    sn = np.array([slot[int(a)] for a in cr.a], np.int64)
+    slot = np.full(nants, -1, np.int64)
+    slot[core] = np.arange(nc)
+    sm, sn = slot[b], slot[a]                       # b < a  ->  slot m < slot n
     pair_dst = np.full((nc_pad, nc_pad), -1, np.int32)
-    if rows == "baselines":
-        pair_dst[sm, sn] = np.arange(cr.n)
-        n_ring, n_scr = cr.n, 0
+    if classes is None:
+        pair_dst[sm, sn] = np.arange(n_kept)
+        n_ring, n_scr = n_kept, 0
         cptr = np.zeros(1, np.int32)
         csrc = np.zeros(0, np.int32)
         cconj = np.zeros(0, np.uint8)
         crow = np.zeros(0, np.int32)
-    elif rows == "classes":
-        if vm.kind != "baselines":
-            raise ValueError("rows='classes' needs a baselines value map")
-        cls, conj = vm.class_of_row, vm.conj_of_row
-        counts = np.bincount(cls, minlength=vm.n_class)
-        multi = np.flatnonzero(counts > 1)
-        n_ring, n_scr = vm.n_class, int(counts[multi].sum())
+    else:
+        if classes.n_kept != n_kept:
+            raise ValueError("redundancy classes were built from a different core mask")
+        cls = np.asarray(classes.bl_class, np.int64)
+        mult = np.asarray(classes.multiplicity, np.int64)
+        multi = np.flatnonzero(mult > 1)
+        n_ring, n_scr = classes.n_class, int(mult[multi].sum())
+        scr_of_row = np.full(n_kept, -1, np.int64)
         cptr_l, csrc_l, cconj_l = [0], [], []
-        scr_of_row = np.full(cr.n, -1, np.int64)
         nxt = 0
         for c in multi:
-            mem = np.flatnonzero(cls == c)             # ascending row = the fixed order
-            for r in mem:
+            mem = classes.class_members[classes.class_ptr[c]:classes.class_ptr[c + 1]]
+            for r in mem:                              # ascending kept index = fixed order
                 scr_of_row[r] = nxt
                 csrc_l.append(nxt)
-                cconj_l.append(int(conj[r]))
+                cconj_l.append(int(classes.bl_conj[r]))
                 nxt += 1
-            cptr_l.append(cptr_l[-1] + mem.size)
-        single = counts[cls] == 1
+            cptr_l.append(cptr_l[-1] + len(mem))
+        single = mult[cls] == 1
         pair_dst[sm[single], sn[single]] = cls[single]
         pair_dst[sm[~single], sn[~single]] = n_ring + scr_of_row[~single]
         cptr = np.asarray(cptr_l, np.int32)
         csrc = np.asarray(csrc_l, np.int32)
         cconj = np.asarray(cconj_l, np.uint8)
         crow = multi.astype(np.int32)
-    else:
-        raise ValueError(f"rows={rows!r}")
     nt = nc_pad // BLOCK
     tp = np.array([(i, j) for i in range(nt) for j in range(i, nt)], np.int32)
     return Gemm2xTables(
@@ -381,7 +385,7 @@ def gemm2x_reference(
 
 
 def ring_write_reference(vis_rows: torch.Tensor, tables: Gemm2xTables, class_of_row=None,
-                         conj_of_row=None) -> torch.Tensor:
+                         conj_of_row=None) -> torch.Tensor:  # noqa: D401
     """What the kernel (+ reduce) leaves in the ring rows, as complex
     ``(n_fv, NSUM, n_ring_rows)``: core rows directly, or class sums in
     ascending-row order with conj (``class_of_row`` given)."""
