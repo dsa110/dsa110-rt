@@ -32,7 +32,7 @@ The search detector `detector/forward.py` does not clip. The 250 clip lives in `
 | boxcar fp16 worst sum | 250 x 64 = 16000 | |
 | sigma_k at b1 / b64 | ~1.0 / 1.163 x 8 (audit, live) | |
 | **wire saturation, one sample** | **~150 sigma per sample**; L = 0.97 at 35, 0.93 at 50, 0.80 at 100, 0.49 at 250 | study 1, section 7 |
-| detection rail | ~150 x sqrt(k) from the wire. The 250 clip is not reached by a point source. | study 1 |
+| detection rail | ~150 x sqrt(k) from the wire. The 250 clip is not reached by a point source. Per row: a burst spread over several stream samples by the coarse-to-fine sweep is compressed less at the same detected S/N. | study 1 |
 
 The model raw sigma (0.0674) agrees with the live value (0.064) to 5%. That validates the per-row
 max-abs wire model behind the compression numbers.

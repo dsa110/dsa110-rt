@@ -192,6 +192,11 @@ are exact Gaussian moments; today's rows are Monte Carlo of per-row max-abs cint
 | per-baseline n_sub 4, 4-bit, heavy N/3e4, centre | 1.000 | 1.000 | 1.000 | 0.999 | **0.997** | 0.983 | 0.818 |
 | per-baseline n_sub 4, 5-bit, heavy N/3e4, centre | 1.000 | 1.000 | 1.000 | 1.000 | **0.999** | 0.991 | 0.846 |
 
+- rho is the S/N carried by ONE row (one stream sample at one coarse DM, summed over the 16 x
+  n_sub streams). A burst whose signal is spread over several samples of a stream gets less
+  compression at the same detected S/N. The spread can come from intrinsic width, or from the
+  intra-sub-band sweep between the coarse and the fine DM (1-5 samples at 1x). The curves are
+  therefore the worst case per detected S/N, and are exact for unresolved bursts at a coarse DM.
 - **Heavy threshold N/3e4, not N/1e4.** At N/1e4 the heaviest main value sits exactly at the 4-bit
   top level at 250 sigma, and the many near-threshold values compress the n_sub 4 formats by 2.7-2.8%
   at the rail. At N/3e4 every format is within 0.5% (4-bit) or 0.2% (5-bit) up to 250 sigma per
