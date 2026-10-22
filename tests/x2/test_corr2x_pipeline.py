@@ -1,15 +1,18 @@
 """x2 WS-C deliverable 4: the 2x orchestrator (CPU path) against the
 numpy reference, end to end from raw fada pages.
 
-Full-size pages (production antenna fixture, station-number core mask,
-WS-P value map and tiered plan) carry int4 noise on six core antennas and
-zeros elsewhere, so the float64 reference only has to correlate those six.
+512-packet pages (``tests/x2/_small_blocks.py``; production antenna
+fixture, station-number core mask, WS-P value map and tiered plan) carry
+int4 noise on six core antennas and zeros elsewhere, so the float64
+reference only has to correlate those six. Chgroup 2 keeps the tier-B
+stage-1 shifts inside the 128-sample (q1) block.
 Checked for both value kinds (per-baseline through the GEMM's class
 reduce), on the first/last coarse DM of each tier:
 
 * stage-1 + decimation + static-sky output == reference (fp16 ring
   rounding: <= 2e-3 of the rms);
-* the row-rule codes == reference codes but for rounding-boundary flips;
+* the TX hand-off carries one payload row per (DM, tier sample) of the
+  packer's layout (row-rule bit-equality itself: ``test_corr2x_packer``);
 * TX hand-off framing: emitted block, t0_native, tier sample, stream ids;
 * the RFI cube mask (folded into the gains) and the array-burst time mask
   (applied on operand load) zero exactly what the reference zeroes;
@@ -34,9 +37,11 @@ from dsart.x2.corr.plan2x import proposed_corr_plan
 from dsart.x2.ref import corr2x_ref as ref
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-G = 6
+G = 2
 ANTS = [3, 10, 22, 40, 55, 71]                       # core antennas carrying noise
 BLOCKS = [5, 6, 7]
+NPKT = 512
+NQ = NPKT * 2 // 8                                   # q1 samples per page
 
 
 def _fixture():
@@ -52,10 +57,10 @@ def _pages():
     rng = np.random.default_rng(42)
     pages = []
     for _ in BLOCKS:
-        raw = np.zeros((2048, NANTS, NCHAN_PER_CHGROUP, 2, 2), np.uint8)
-        raw[:, ANTS] = rng.integers(0, 256, size=(2048, len(ANTS), NCHAN_PER_CHGROUP, 2, 2))
+        raw = np.zeros((NPKT, NANTS, NCHAN_PER_CHGROUP, 2, 2), np.uint8)
+        raw[:, ANTS] = rng.integers(0, 256, size=(NPKT, len(ANTS), NCHAN_PER_CHGROUP, 2, 2))
         pages.append(raw.reshape(-1))
-    assert pages[0].size == FADA_BYTES_PER_BLOCK
+    assert pages[0].size == FADA_BYTES_PER_BLOCK * NPKT // 2048
     return pages
 
 
@@ -99,6 +104,8 @@ def _gains():
 def _build(kind: str, monkeypatch):
     from dsart.grid.baseline_grid import build_value_map_for_opoint
     from dsart.x2.opoint import opoint_2x
+    from ._small_blocks import patch_small_blocks
+    page_bytes = patch_small_blocks(monkeypatch, NPKT)
     monkeypatch.setattr(cfi, "_array_burst_time_mask", _ab)
     e, n, mask, _ = _fixture()
     op = opoint_2x(kind, 2)
@@ -123,11 +130,13 @@ def _build(kind: str, monkeypatch):
     sentinel = object()
     ctx.stage2_fifo = sentinel
     plan = proposed_corr_plan(2)
-    dms = [0, 31, 32, 46]
+    dms = [0, 31, 32]
+    assert int(plan.stage1_bins(1)[G][:, 0].max()) < NQ - 4      # tier B fits the window
     tx = RecordingTx2x()
     orch = Corr2xPipeline(ctx, plan=plan, vm=vm, is_core_baseline_mask=mask, bits_main=8,
                           tx2x=tx, static_sky_window_blocks=2, static_sky_warmup=0,
-                          value_subset=24, dm_subset=dms)
+                          value_subset=24, dm_subset=dms, expected_fada_bytes=page_bytes,
+                          fv_chunk=NQ)
     return ctx, orch, tx, vm, plan, dms, e, n, mask, gn, sentinel
 
 
@@ -153,8 +162,8 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
     lb = np.array([loc[b] for b in kb[sel]])
     Vs = []
     for i, p in enumerate(pages):
-        raw = p.reshape(2048, NANTS, NCHAN_PER_CHGROUP, 2, 2)[:, ANTS]
-        E = ref.unpack_int4_onwire(raw.reshape(-1), n_packets=2048, nants=len(ANTS),
+        raw = p.reshape(NPKT, NANTS, NCHAN_PER_CHGROUP, 2, 2)[:, ANTS]
+        E = ref.unpack_int4_onwire(raw.reshape(-1), n_packets=NPKT, nants=len(ANTS),
                                    nchan=NCHAN_PER_CHGROUP)
         cube = np.zeros((len(ANTS), NCHAN_PER_CHGROUP, 2), bool)
         cube[1, 40:80, :] = True
@@ -173,11 +182,14 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
         blk = rec["block_n"]
         i = BLOCKS.index(blk)
         joined = np.concatenate([Vs[i], Vs[i + 1]], axis=0)
-        assert rec["t0_native"] == blk * 4096
+        assert rec["t0_native"] == blk * NQ * 8
         assert rec["stream_ids"] == [G * 2, G * 2 + 1]
         ti = 0 if rec["tier"] == "A" else 1
         tier = plan.tiers[ti]
         assert rec["T_native"] == tier.T_native
+        for si, pk in enumerate(rec["packets"]):
+            assert pk["payload"].shape == (len(rec["dms"]), NQ // tier.decim,
+                                           orch.tiers[ti].packer.bytes_per_sample(si))
     # stage-1 output (after static sky) is carried in the outputs
     sky = {}
     for o in outs:
@@ -198,7 +210,7 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
                         c = vm.classes
                         dest, conj = ref.value_dest_classes(c.bl_class[sel], c.bl_conj[sel],
                                                             st.class_id[:hi - lo], per)
-                    blk = q_emit // 512
+                    blk = q_emit // NQ
                     i = BLOCKS.index(blk)
                     joined = np.concatenate([Vs[i], Vs[i + 1]], axis=0)
                     ks = np.arange(s * per, (s + 1) * per)
@@ -206,7 +218,7 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
                     c_loc = d - plan.tiers[ti].d0
                     xs = ref.stage1_values(joined, dest, conj, ks=ks,
                                            s1=plan.stage1_bins(ti)[G][ks, c_loc],
-                                           n_values=hi - lo, t0=0, n_out=512)
+                                           n_values=hi - lo, t0=0, n_out=NQ)
                     xd = ref.decimate(xs, ts.D)
                     key = (int(d), s)
                     rs = sky.setdefault(key, ref.StaticSkyRef(window_blocks=2, warmup_cubes=0))
@@ -215,9 +227,9 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
                     rms = np.sqrt(np.mean(np.abs(want) ** 2)) + 1e-12
                     assert np.abs(got - want).max() <= 2e-3 * rms * 10, (kind, d, s, blk)
                     assert np.sqrt(np.mean(np.abs(got - want) ** 2)) <= 2e-3 * rms
-    # the time mask zeroed the flagged accumulations of block 6 at the GEMM:
-    # q1 samples of accumulations 10, 11 (32 packets = 64 natives = 8 q1 each)
-    assert np.abs(Vs[1][80:96]).max() == 0.0
+    # the time mask zeroed the flagged accumulations of block 6:
+    # q1 samples of accumulations 10, 11 (8 packets = 16 natives = 2 q1 each)
+    assert np.abs(Vs[1][20:24]).max() == 0.0 and np.abs(Vs[1][24:28]).max() > 0.0
 
 
 def test_injection_window_detection() -> None:

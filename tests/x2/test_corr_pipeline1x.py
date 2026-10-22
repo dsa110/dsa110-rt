@@ -18,8 +18,10 @@ Equality is asserted on every ``IntegrationOutput.gridded_minus_sky``,
 on every cube handed to ``transport_tx.transmit`` (with its block_n and
 rfi_warming_up flag) and on ``n_tx``.
 
-CPU cost: one fp32 fast GEMM is ~30 s on one core, so GEMM results are
-memoised on the exact (sign-of-zero-normalised) input bytes. A cache hit
+CPU tests use 256-packet pages (``tests/x2/_small_blocks.py`` swaps the
+size-checked unpack and cal for shape-agnostic versions in BOTH loops; the
+GPU tests use real 2048-packet pages). GEMM results are memoised on the
+exact (sign-of-zero-normalised) input bytes. A cache hit
 can only return the output of a byte-identical input, so the memo never
 masks a difference -- it only stops the second pipeline and the second
 ``n_sub`` from paying for GEMMs the first already did.
@@ -54,7 +56,12 @@ CHGROUP = 3
 T_INT = 32
 CSF = 8
 N_BLOCKS = 4
-DMS = np.array([0.0, 200.0, 600.0, 1200.0])
+#: CPU tests use 256-packet pages (16 fast samples of 1.05 ms); every DM's
+#: in-chgroup stage-1 shift (<= 14 bins at DM 450, chgroup 3) fits the
+#: 2-block window, and DM 30's stage-2 shift (~14 samples) makes the
+#: per-coarse-DM FIFO emit views of the PREVIOUS block's cube.
+NPKT_CPU = 256
+DMS = np.array([0.0, 30.0, 250.0, 450.0])
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +92,10 @@ def _plan() -> DMPlan:
     )
 
 
-def _blocks() -> list[np.ndarray]:
+def _blocks(n_packets: int = 2048) -> list[np.ndarray]:
     return [
         np.random.default_rng(20261022 + i).integers(
-            0, 256, size=FADA_BYTES_PER_BLOCK, dtype=np.uint8,
+            0, 256, size=FADA_BYTES_PER_BLOCK * n_packets // 2048, dtype=np.uint8,
         )
         for i in range(N_BLOCKS)
     ]
@@ -272,12 +279,20 @@ def _ab_patch(monkeypatch):
     monkeypatch.setattr(cfi, "_array_burst_time_mask", _fake_ab_time_mask)
 
 
+@pytest.fixture
+def small(monkeypatch):
+    """CPU tests: 256-packet pages through the same (patched) unpack and cal
+    in both loops (x2 rule: short CPU tests; full size is CP1)."""
+    from ._small_blocks import patch_small_blocks
+    return patch_small_blocks(monkeypatch, NPKT_CPU)
+
+
 @pytest.mark.parametrize("n_sub", [1, 4])
-def test_pipelined_equals_process_block_cpu(n_sub: int) -> None:
-    blocks = _blocks()
+def test_pipelined_equals_process_block_cpu(n_sub: int, small) -> None:
+    blocks = _blocks(NPKT_CPU)
     dev = torch.device("cpu")
     legacy, ctx_l = _run_legacy(n_sub, blocks, dev)
-    piped, ctx_p = _run_pipelined(n_sub, blocks, dev)
+    piped, ctx_p = _run_pipelined(n_sub, blocks, dev, expected_fada_bytes=small)
     _assert_identical(legacy, ctx_l, piped, ctx_p)
     # the mask schedule really exercised all three masking routes
     assert ctx_p.rfi_flagger.n == N_BLOCKS
@@ -289,20 +304,21 @@ def test_pipelined_equals_process_block_cpu(n_sub: int) -> None:
             "stage2", "tx"} <= set(s["stage_ms"])
 
 
-def test_pipelined_no_defer_and_no_fold_cpu() -> None:
+def test_pipelined_no_defer_and_no_fold_cpu(small) -> None:
     """Undeferred TX and the unfolded mask route give the same bits too."""
-    blocks = _blocks()
+    blocks = _blocks(NPKT_CPU)
     dev = torch.device("cpu")
     legacy, ctx_l = _run_legacy(1, blocks, dev)
-    piped, ctx_p = _run_pipelined(1, blocks, dev, defer_tx=False, fold_mask_into_cal=False)
+    piped, ctx_p = _run_pipelined(1, blocks, dev, defer_tx=False, fold_mask_into_cal=False,
+                                  expected_fada_bytes=small)
     _assert_identical(legacy, ctx_l, piped, ctx_p)
 
 
-def test_output_lag_and_release_order_cpu() -> None:
+def test_output_lag_and_release_order_cpu(small) -> None:
     """push(k) returns block k-2 (deferred TX) and releases page k."""
-    blocks = _blocks()[:3]
+    blocks = _blocks(NPKT_CPU)[:3]
     ctx = _ctx(1, torch.device("cpu"))
-    orch = PipelinedCorrFast(ctx)
+    orch = PipelinedCorrFast(ctx, expected_fada_bytes=small)
     got = []
     for i, b in enumerate(blocks):
         got.append([o.block_n for o in orch.push(b, block_n=i + 1)])

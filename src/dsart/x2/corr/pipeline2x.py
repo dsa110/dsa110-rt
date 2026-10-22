@@ -177,7 +177,9 @@ class Corr2xPipeline(PipelinedCorrFast):
         self.vm = vm
         g = int(ctx.cfg.chgroup)
         self.chgroup = g
-        self.n_q = BLOCK_NATIVE // 8                            # q1 samples per block (t_int 8)
+        nants = int(ctx.kernel.nants)
+        n_pkt = self.expected_fada_bytes // (nants * int(ctx.kernel.nchan) * 4)
+        self.n_q = n_pkt * NTIMES_PER_PACKET // 8                # q1 samples per block (t_int 8)
         self.T_ring = 2 * self.n_q
         self.fv_chunk = int(fv_chunk)
         if self.n_q % self.fv_chunk:
@@ -186,7 +188,6 @@ class Corr2xPipeline(PipelinedCorrFast):
         if class_reduce is None:
             class_reduce = vm.kind == "baselines"
         self.class_reduce = bool(class_reduce)
-        nants = int(ctx.kernel.nants)
         self.tables = build_gemm_tables(
             is_core_baseline_mask, nants=nants,
             classes=vm.classes if self.class_reduce else None,
