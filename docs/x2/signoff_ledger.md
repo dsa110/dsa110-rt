@@ -7,7 +7,7 @@ checkpoint (CP1 unless marked). Each item: what, evidence needed, who supplies i
 | id | item | evidence | owner | default until signed |
 |---|---|---|---|---|
 | S1 | Corner-turn format and its network-forced S/N cost (0.4-1.0% vs the model) | CP1 capacity sweep with v2 single-fragment frames | WS-T, WS-O runner | none (2x does not run) |
-| S2a | Hybrid row rule: sqrt(n) normalisation, robust per-stream scale + clip, 8-bit heavy values | Phase 0 row-rule study incl. storm window and hot cells | Phase 0 | — |
+| S2a | Hybrid row rule: sqrt(n) normalisation, robust per-stream scale + clip, 8-bit heavy values. Measured maps (WS-P, SPEC §3): heavy threshold n >= 1021; gridded n_sub 2: 70-78 heavy/stream = 2.9% of values, 42.4% of natural weight; n_sub 4: 21-25 = 1.13% / 20.7%; per-baseline: 1748 exact redundancy classes (not 1773), 80 heavy (46.3%) at n_sub 2, 26 (22.1%) at n_sub 4 | Phase 0 row-rule study incl. storm window and hot cells | Phase 0 | — |
 | S2b | cfp16 corr storage of fast visibilities | Phase 0 U-precision study, CP1 corr exactness | Phase 0, WS-C | — |
 | S2c | Fused-cal ULP differences in 2x | CP1 corr taps vs CPU reference | WS-C | 1x keeps separate kernels |
 | S2d | fp32 detector accumulation, per-DM sigma_k, chunk-max decoder in floods | CPU twins + CP1 K3b compat | WS-S | — |
