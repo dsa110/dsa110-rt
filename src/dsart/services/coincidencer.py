@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import math
 import os
@@ -56,15 +57,15 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import yaml
 
 from ..coinc import wire
 from ..coinc.archive import (
-    C1_WINDOW_CSV_FIELDS,
-    C2_CLUSTER_CSV_FIELDS,
     EventArchiveWriter,
+    c1_window_fields,
+    c2_cluster_fields,
     entry_to_csv_row,
     stats_to_csv_row,
     stats_to_l3_metadata,
@@ -73,6 +74,19 @@ from ..coinc.broadcast import TriggerBroadcaster, VoltageBroadcaster
 from ..coinc.components import CoincidenceGraph
 from ..coinc.criteria import CriteriaEvaluator
 from ..coinc.csv_rotator import RollingCsvWriter, concat_recent_hourly
+from ..coinc.cutout_lifecycle import (
+    PARTIAL_POLICY_ARCHIVE,
+    PARTIAL_POLICY_DISCARD,
+    CutoutConfig,
+    CutoutStatusProtocol,
+    CutoutTracker,
+    build_request,
+    check_partial_policy,
+    expected_halves,
+    products_block,
+    read_pending,
+    write_pending,
+)
 from ..coinc.inject_match import (
     DEFAULT_REGISTRY_REFRESH_S as INJECT_REGISTRY_REFRESH_S,
     InjectionMatcher,
@@ -379,6 +393,37 @@ class CoincidencerConfig:
     plot_dispatch_poll_s: float = 5.0
     plot_expected_cube_count: int = 8
 
+    # x2 (docs/x2/downstream_inventory.md D1): archive schema 1 writes
+    # today's CSV columns + Level3 keys byte-for-byte; 2 appends the sample
+    # unit + peak provenance (sample_period_us, width_ms, dm_peak, ...).
+    # ``opoint`` is the op-point label recorded at schema 2 ("1x"/"2x").
+    archive_schema: int = 1
+    opoint: str = ""
+    # x2 D6 (docs/x2/downstream_inventory.md §3.5). All defaults = today.
+    #: ``coinc.cutout``: the 2x on-demand cutout lifecycle (off = cube path).
+    cutout: CutoutConfig = field(default_factory=CutoutConfig)
+    #: What an event with an incomplete product set becomes at the
+    #: deadline: "discard" (today: rmtree, 1x default) or "archive"
+    #: (Level3 written with products.status=incomplete; never deleted).
+    #: The cutout lifecycle always archives. 1x≠: needs sign-off for 1x.
+    partial_event_policy: str = "discard"
+    #: Search sample period assumed when a peak member's batch header is
+    #: unusable (voltage-dump specnum fallback). 1048.576 = today's x16.
+    fallback_sample_period_us: float = 1048.576
+    #: Never dump the same cluster twice: suppress a dump whose cluster
+    #: contains a member of an already-dumped event (the class-holdoff
+    #: fall-through duplicate). 1x≠ flag, default off.
+    dedupe_fired_clusters: bool = False
+    #: Inject-matcher time gate in SECONDS, applied with each C1 row's own
+    #: sample period (x2: 4.294967296 reproduces today's 4096 x 1.05 ms).
+    #: None = today's fixed 4096-sample gate.
+    inject_specnum_tol_s: Optional[float] = None
+    #: SPEC §10 (set from the resolved op-point at startup, not the YAML):
+    #: the selection and the active record's plan_id ("0x..."); C2 refuses
+    #: to run its cutout lifecycle on a plan with a different plan_id.
+    opoint_selection: str = ""
+    active_plan_id: str = ""
+
     # Mon-points export.
     mon_etcd_key: str = "/mon/c2/h23"
     mon_publish_interval_s: float = 5.0
@@ -486,6 +531,10 @@ class CoincidencerConfig:
         coinc = doc.get("coinc", {}) or {}
         if override:
             coinc = {**coinc, **override}
+        # x2: at a 2x op-point (resolved at startup, SPEC §10) the 2x
+        # behaviours default ON; any explicit key still wins. At 1x every
+        # default below is today's.
+        is2x = str(coinc.get("opoint") or "").startswith("2x")
         bind = coinc.get("bind", {}) or {}
         dump = coinc.get("dump_broadcast", {}) or {}
         volt = coinc.get("voltage_broadcast", {}) or {}
@@ -598,6 +647,25 @@ class CoincidencerConfig:
             plot_expected_cube_count=int(
                 coinc.get("plot_expected_cube_count", 8),
             ),
+            archive_schema=int(coinc.get("archive_schema", 2 if is2x else 1)),
+            opoint=str(coinc.get("opoint", "") or ""),
+            cutout=CutoutConfig.from_mapping(
+                coinc.get("cutout"), default_enabled=is2x),
+            partial_event_policy=check_partial_policy(
+                coinc.get("partial_event_policy",
+                          PARTIAL_POLICY_ARCHIVE if is2x
+                          else PARTIAL_POLICY_DISCARD)),
+            fallback_sample_period_us=float(
+                coinc.get("fallback_sample_period_us",
+                          524.288 if is2x else 1048.576)),
+            dedupe_fired_clusters=bool(
+                coinc.get("dedupe_fired_clusters", False)),
+            opoint_selection=str(coinc.get("opoint_selection", "") or ""),
+            active_plan_id=str(coinc.get("active_plan_id", "") or ""),
+            inject_specnum_tol_s=(
+                float(coinc["inject_specnum_tol_s"])
+                if coinc.get("inject_specnum_tol_s") is not None
+                else (4.294967296 if is2x else None)),
             mon_etcd_key=str(coinc.get("mon_etcd_key", "/mon/c2/h23")),
             mon_publish_interval_s=float(
                 coinc.get("mon_publish_interval_s", 5.0),
@@ -721,6 +789,14 @@ class _PendingPlot:
     #: id(member) → inj_id labels, computed at fire time (the inject
     #: registry is time-sensitive; matching later would miss).
     member_inj_ids: Dict[int, str] = field(default_factory=dict)
+    # -- x2 cutout lifecycle (``mode == "cutouts"``) --------------------
+    mode: str = "cubes"
+    expected_halves: Tuple[Tuple[int, int], ...] = ()
+    request: Optional[wire.CutoutRequest] = None
+    #: Level3 doc without ``products`` (persisted; lets a restarted C2
+    #: finalise an event whose stats/members it no longer holds).
+    l3_draft: Optional[Dict[str, Any]] = None
+    fired_unix: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -733,8 +809,38 @@ class _PendingPlot:
 _SPECNUM_FACTOR_FALLBACK = 16
 
 
+def _load_cutout_plan(path: Optional[Path]) -> Optional[Any]:
+    """The deployed DM plan (v3 tiered, or v2) for the cutout lifecycle;
+    None (logged) when absent/unreadable -- C2 must keep running."""
+    if path is None:
+        return None
+    try:
+        from ..x2.plan import load_any_plan   # numpy-only, no torch
+        return load_any_plan(path)
+    except Exception as exc:  # noqa: BLE001
+        _LOG.error("cutout lifecycle: cannot load DM plan %s: %r", path, exc)
+        return None
+
+
+def _plan_fine_resolver(plan: Any):
+    """``dm_idx_global -> (coarse, tier)`` for a tiered plan, else None."""
+    f2c = getattr(plan, "fine_to_coarse", None)
+    tier = getattr(plan, "fine_tier", None)
+    if f2c is None or tier is None:
+        return None
+
+    def _resolve(f: int) -> Tuple[int, int]:
+        if f < 0:
+            raise IndexError(f)
+        return int(f2c[f]), int(tier[f])
+
+    return _resolve
+
+
 def search_to_snap_specnum(event_specnum: int,
-                           sample_period_us: float) -> int:
+                           sample_period_us: float,
+                           fallback_factor: int = _SPECNUM_FACTOR_FALLBACK,
+                           ) -> int:
     """Convert a C1 search-sample specnum to SNAP specnums (65.536 us).
 
     The factor comes from the peak member's own C1 batch header
@@ -744,9 +850,12 @@ def search_to_snap_specnum(event_specnum: int,
     moment the op-point changes (VOLTAGE_DUMP_TIMING_FIX.md §4).
     Guards fall back to the production factor rather than raising:
     this path runs inside the trigger flow and must never break the
-    cube dump.
+    cube dump. ``fallback_factor`` (x2) is the op-point's own factor
+    (``coinc.fallback_sample_period_us`` / 65.536: 16 at 1x, 8 at 2x) so
+    a malformed 2x header can never stage the window at twice the
+    specnum.
     """
-    factor = _SPECNUM_FACTOR_FALLBACK
+    factor = int(fallback_factor)
     if sample_period_us > 100.0:      # excludes heartbeat placeholder 1.0
         cand = round(sample_period_us / SPECNUM_PERIOD_US)
         if cand >= 1 and abs(cand * SPECNUM_PERIOD_US
@@ -756,12 +865,11 @@ def search_to_snap_specnum(event_specnum: int,
             _LOG.warning(
                 "sample_period_us=%.6f is not an integer multiple of the "
                 "specnum period %.3f us — falling back to factor %d",
-                sample_period_us, SPECNUM_PERIOD_US,
-                _SPECNUM_FACTOR_FALLBACK)
+                sample_period_us, SPECNUM_PERIOD_US, factor)
     else:
         _LOG.warning(
             "peak sample_period_us=%.3f unusable — falling back to "
-            "factor %d", sample_period_us, _SPECNUM_FACTOR_FALLBACK)
+            "factor %d", sample_period_us, factor)
     return int(event_specnum) * factor
 
 
@@ -806,29 +914,93 @@ class CoincidencerService:
 
         self._window = TimeWindow(window_s=config.window_s)
         self._graph = CoincidenceGraph()
-        self._criteria = CriteriaEvaluator(config.trigger_criteria_path)
+        # x2: the op-point picks its ``opoints.<id>`` section of the
+        # criteria file (and keeps it on hot reload); "" = top level.
+        self._criteria = CriteriaEvaluator(
+            config.trigger_criteria_path, opoint=config.opoint or None,
+        )
+        # Voltage-dump specnum fallback factor (x16 at today's default).
+        self._specnum_fallback_factor = max(1, int(round(
+            float(config.fallback_sample_period_us) / SPECNUM_PERIOD_US)))
 
         # M7.6: the per-candidate C1 hiplot CSV is opt-in (large + rarely
         # useful). Default off — see ``CoincidencerConfig.write_c1_csv``.
         self._c1_csv: Optional[RollingCsvWriter] = (
             RollingCsvWriter(
-                config.csv_dir_c1, "c1", C1_WINDOW_CSV_FIELDS,
+                config.csv_dir_c1, "c1",
+                c1_window_fields(config.archive_schema),
                 retention_hours=config.csv_retention_hours,
             )
             if config.write_c1_csv
             else None
         )
         self._c2_csv = RollingCsvWriter(
-            config.csv_dir_c2, "c2", C2_CLUSTER_CSV_FIELDS,
+            config.csv_dir_c2, "c2",
+            c2_cluster_fields(config.archive_schema),
             retention_hours=config.csv_retention_hours,
         )
 
-        self._archive = EventArchiveWriter(config.event_archive_root)
+        # x2 cutout lifecycle (off unless coinc.cutout.enabled): the
+        # deployed tiered plan gives the expected halves (owner map), the
+        # plan_id carried by requests and the fine -> (coarse, tier)
+        # resolver for the archived C1 rows.
+        self._cutout_plan: Optional[Any] = None
+        self._cutout_plan_id = 0
+        fine_resolver = None
+        if config.cutout.enabled:
+            self._cutout_plan = _load_cutout_plan(config.cutout.plan_path)
+            if self._cutout_plan is not None:
+                self._cutout_plan_id = int(
+                    getattr(self._cutout_plan, "plan_id", 0) or 0)
+                fine_resolver = _plan_fine_resolver(self._cutout_plan)
+                want = str(config.active_plan_id or "")
+                have = f"0x{self._cutout_plan_id:016x}"
+                if want and want.lower() != have:
+                    # SPEC §10 plan check: never run on a plan the active
+                    # op-point record does not name.
+                    raise RuntimeError(
+                        f"cutout plan {config.cutout.plan_path} has plan_id "
+                        f"{have}, /cnf/opoint says {want}")
+        self._archive = EventArchiveWriter(
+            config.event_archive_root,
+            schema=config.archive_schema,
+            opoint=config.opoint,
+            fine_index_resolver=fine_resolver,
+        )
 
         self._broadcaster = broadcaster or TriggerBroadcaster(
             config.dump_broadcast_hosts,
             port_base=config.dump_broadcast_port_base,
         )
+
+        # x2 cutout request / ack / resend tracking + expected halves.
+        self._cutout_tracker: Optional[CutoutTracker] = None
+        self._cutout_expected: Tuple[Tuple[int, int], ...] = ()
+        self._cutout_status_transport: Optional[Any] = None
+        #: finalised cutout events still accepting late manifests:
+        #: name -> (finalised monotonic, products block as written)
+        self._finalised_cutouts: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cutout_request_seq = int(time.time()) & 0x7FFFFFFF
+        if config.cutout.enabled:
+            self._cutout_tracker = CutoutTracker(
+                self._broadcaster.send_to, config.cutout)
+            if self._cutout_plan is not None:
+                self._cutout_expected = tuple(
+                    expected_halves(self._cutout_plan))
+            else:
+                self._cutout_expected = tuple(
+                    (int(sid), g)
+                    for sid in sorted(config.dump_broadcast_hosts)
+                    for g in (0, 1)
+                )
+                _LOG.warning(
+                    "cutout lifecycle without a readable tiered plan "
+                    "(coinc.cutout.plan_path=%s): expecting every dump "
+                    "host x 2 halves, plan_id 0 (halves skip the check)",
+                    config.cutout.plan_path,
+                )
+        # dedupe_fired_clusters: member keys of dumped clusters -> mono.
+        self._fired_member_keys: Dict[Tuple[int, int, int, int, int], float] = {}
 
         # Voltage broadcaster (NEW). Only constructed when corr hosts are
         # configured; otherwise the voltage path is fully disabled and
@@ -948,6 +1120,10 @@ class CoincidencerService:
             _matcher_kwargs["min_observed_snr"] = float(_min_snr_env)
         if _wall_tol_env:
             _matcher_kwargs["wall_tol_s"] = float(_wall_tol_env)
+        # x2 D10: time gate in seconds with each row's own period
+        # (coinc.inject_specnum_tol_s; None = today's 4096 samples).
+        if config.inject_specnum_tol_s is not None:
+            _matcher_kwargs["specnum_tol_s"] = float(config.inject_specnum_tol_s)
         self._inject_matcher: InjectionMatcher = (
             inject_matcher if inject_matcher is not None
             else InjectionMatcher(**_matcher_kwargs)
@@ -1063,6 +1239,14 @@ class CoincidencerService:
             "events_incomplete_discarded": 0,
             "csv_rotations": 0,
             "csv_removed": 0,
+            # x2 D6: product lifecycle (cutouts, or 1x cubes under
+            # partial_event_policy=archive). Never-delete accounting.
+            "events_complete": 0,
+            "events_incomplete": 0,
+            "events_finalised_late": 0,
+            "events_recovered": 0,
+            "halves_missing": 0,
+            "dumps_dedup_suppressed": 0,
         }
         self._last_event_name: Optional[str] = None
         self._last_trigger_class: Optional[str] = None
@@ -1130,6 +1314,15 @@ class CoincidencerService:
             asyncio.create_task(self._plot_dispatcher_loop(),
                                 name="c2-plot-dispatcher"),
         )
+        if self._cutout_tracker is not None:
+            # x2 cutout lifecycle: status endpoint (advisory), resend
+            # loop, and re-adoption of events a previous process fired.
+            await self._start_cutout_status_endpoint()
+            self._recover_pending_cutout_events()
+            self._tasks.append(
+                asyncio.create_task(self._cutout_ack_loop(),
+                                    name="c2-cutout-acks"),
+            )
         self._tasks.append(
             asyncio.create_task(self._mon_publish_loop(),
                                 name="c2-mon-publish"),
@@ -1167,6 +1360,12 @@ class CoincidencerService:
         await self._receiver.stop()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        if self._cutout_status_transport is not None:
+            try:
+                self._cutout_status_transport.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cutout_status_transport = None
         try:
             self._broadcaster.close()
         except Exception:  # noqa: BLE001
@@ -1469,6 +1668,7 @@ class CoincidencerService:
                 search_node_id=e.search_node_id,
                 gpu_half=e.gpu_half,
                 mjd=e.mjd,
+                sample_period_us=e.sample_period_us,
             )
             if label is not None:
                 inj_id_by_entry_id[id(e)] = label.inj_id
@@ -1484,6 +1684,7 @@ class CoincidencerService:
                     entry_to_csv_row(
                         e, trigger="",
                         inj_id=inj_id_by_entry_id.get(id(e), ""),
+                        schema=self._config.archive_schema,
                     ),
                     now_utc=now_utc,
                 )
@@ -1650,7 +1851,8 @@ class CoincidencerService:
         # cannot silently stage 0 blocks (2026-07-13 incident +
         # VOLTAGE_DUMP_TIMING_FIX.md §4).
         native_specnum = search_to_snap_specnum(
-            stats.peak_event_specnum, stats.peak_sample_period_us)
+            stats.peak_event_specnum, stats.peak_sample_period_us,
+            self._specnum_fallback_factor)
         try:
             result = self._voltage_broadcaster.broadcast(
                 event_name=event_name,
@@ -1754,6 +1956,23 @@ class CoincidencerService:
             return
 
         if action == "dump_all_gpus":
+            # x2 D6 (flag, default off): a cluster that already produced a
+            # dump (a member of it was dumped) is never dumped again under
+            # another class -- the holdoff fall-through duplicate. Checked
+            # before the name allocation so no name is consumed.
+            if self._config.dedupe_fired_clusters and self._already_dumped(members):
+                self._counters["dumps_dedup_suppressed"] += 1
+                if prev_holdoff is not None:
+                    self._criteria.restore_last_fired_at(
+                        trigger_class.name, prev_holdoff,
+                    )
+                _LOG.info(
+                    "DUMP DEDUP-SUPPRESSED class=%s n=%d snr_max=%.2f "
+                    "dm_med=%.2f -- cluster already dumped",
+                    trigger_class.name, stats.n_events, stats.snr_max,
+                    stats.dm_median,
+                )
+                return
             dumps_enabled = self._dumps_gate.enabled()
             event_name = self._allocator.allocate(stats.t_peak_mjd)
             self._last_event_name = event_name
@@ -1793,6 +2012,8 @@ class CoincidencerService:
                 stats_to_csv_row(
                     stats, trigger_class=trigger_class.name,
                     trigger=event_name,
+                    schema=self._config.archive_schema,
+                    opoint=self._config.opoint,
                 ),
                 now_utc=now_utc,
             )
@@ -1896,6 +2117,14 @@ class CoincidencerService:
                 )
                 return
             self._record_dump_fire()
+            if self._config.dedupe_fired_clusters:
+                self._remember_dumped(members)
+
+            if self._cutout_tracker is not None:
+                # x2: on-demand cutouts from every expected half instead
+                # of the 64-byte cube trigger (SPEC §9).
+                self._fire_cutouts(event_name, stats, members, trigger_class)
+                return
 
             result = self._broadcaster.broadcast(
                 event_name=event_name,
@@ -1923,6 +2152,7 @@ class CoincidencerService:
                     snr=m.snr,
                     event_specnum=m.event_specnum,
                     mjd=m.mjd,
+                    sample_period_us=m.sample_period_us,
                 )
                 if label is not None:
                     member_inj_ids[id(m)] = label
@@ -1967,6 +2197,8 @@ class CoincidencerService:
                 stats_to_csv_row(
                     stats, trigger_class=trigger_class.name,
                     trigger="",
+                    schema=self._config.archive_schema,
+                    opoint=self._config.opoint,
                 ),
                 now_utc=now_utc,
             )
@@ -1981,6 +2213,350 @@ class CoincidencerService:
                 "unknown trigger action %r for class %s; skipping",
                 action, trigger_class.name,
             )
+
+    # ----- x2: dump dedupe + cutout lifecycle ---------------------------
+
+    _DEDUPE_MEMORY_S: float = 120.0
+
+    @staticmethod
+    def _member_key(m: WindowEntry) -> Tuple[int, int, int, int, int]:
+        return (int(m.search_node_id), int(m.gpu_half), int(m.cube_id),
+                int(m.event_specnum), int(m.dm_idx_global))
+
+    def _already_dumped(self, members: Sequence[WindowEntry]) -> bool:
+        now = time.monotonic()
+        for k, t in list(self._fired_member_keys.items()):
+            if now - t > self._DEDUPE_MEMORY_S:
+                del self._fired_member_keys[k]
+        return any(self._member_key(m) in self._fired_member_keys
+                   for m in members)
+
+    def _remember_dumped(self, members: Sequence[WindowEntry]) -> None:
+        now = time.monotonic()
+        for m in members:
+            self._fired_member_keys[self._member_key(m)] = now
+
+    def _tag_injection_members(
+        self, members: Sequence[WindowEntry],
+    ) -> Dict[int, str]:
+        """id(member) -> inj_id for members matching a live injection."""
+        out: Dict[int, str] = {}
+        for m in members:
+            label = self._inject_matcher.matched_inj_id(
+                dm_pc_cc=m.dm_pc_cc,
+                l_rad=m.l_rad,
+                m_rad=m.m_rad,
+                width_samples=m.width_samples,
+                snr=m.snr,
+                event_specnum=m.event_specnum,
+                mjd=m.mjd,
+                sample_period_us=m.sample_period_us,
+            )
+            if label is not None:
+                out[id(m)] = label
+        return out
+
+    def _fire_cutouts(
+        self,
+        event_name: str,
+        stats: ClusterStats,
+        members: List[WindowEntry],
+        trigger_class,
+    ) -> None:
+        """2x dump: request cutouts from every expected half, write the
+        event dir + Level2 CSVs NOW (a C2 crash cannot lose the record),
+        persist the pending state, then wait for per-half manifests."""
+        assert self._cutout_tracker is not None
+        cfg = self._config.cutout
+        member_inj_ids = self._tag_injection_members(members)
+        is_inj = bool(member_inj_ids)
+        self._cutout_request_seq = (self._cutout_request_seq + 1) & 0xFFFFFFFF
+        req = build_request(
+            event_name=event_name, request_id=self._cutout_request_seq,
+            stats=stats, members=members, cfg=cfg,
+            trigger_class_name=trigger_class.name, is_injection=is_inj,
+            plan=self._cutout_plan, plan_id=self._cutout_plan_id,
+        )
+        result = self._cutout_tracker.start(req, self._cutout_expected)
+        ok = sum(1 for v in result.values() if v)
+        self._counters["broadcast_send_ok"] += ok
+        self._counters["broadcast_send_fail"] += len(result) - ok
+        self._counters["triggers_dump"] += 1
+
+        self._maybe_broadcast_voltage(
+            event_name=event_name, stats=stats,
+            trigger_class=trigger_class, is_injection=is_inj,
+        )
+        pointing_dec_deg, pointing_dec_meta = self._read_pointing_dec()
+        l3_draft = stats_to_l3_metadata(
+            event_name=event_name, stats=stats,
+            trigger_class_name=trigger_class.name,
+            trigger_action=trigger_class.action,
+            holdoff_s=trigger_class.holdoff_s,
+            inj_ids=member_inj_ids.values(),
+            pointing_dec_deg=pointing_dec_deg,
+            pointing_dec_meta=pointing_dec_meta,
+            archive_schema=self._config.archive_schema,
+            opoint=self._config.opoint,
+        )
+        pp = _PendingPlot(
+            event_name=event_name,
+            submitted_at_monotonic=time.monotonic(),
+            stats=stats,
+            members=tuple(members),
+            trigger_class_name=trigger_class.name,
+            trigger_action=trigger_class.action,
+            trigger_holdoff_s=trigger_class.holdoff_s,
+            member_inj_ids=member_inj_ids,
+            mode="cutouts",
+            expected_halves=tuple(self._cutout_expected),
+            request=req,
+            l3_draft=l3_draft,
+            fired_unix=time.time(),
+        )
+        try:
+            ev_dir = self._archive.create(event_name)
+            self._archive.write_c2_cluster_csv(
+                ev_dir, event_name, stats,
+                trigger_class=trigger_class.name, trigger=event_name,
+            )
+            self._archive.write_c1_window_csv(
+                ev_dir, event_name, list(members), trigger=event_name,
+                inj_ids=member_inj_ids,
+            )
+            write_pending(ev_dir, self._pending_doc(pp))
+        except Exception:                                  # noqa: BLE001
+            _LOG.exception("cutout event %s: early archive write failed",
+                           event_name)
+        self._pending_plots[event_name] = pp
+        _LOG.info(
+            "DUMP class=%s name=%s n=%d snr_max=%.2f dm_med=%.2f "
+            "cutout_request=%d sent=%d/%d inj=%s raw=%s",
+            trigger_class.name, event_name, stats.n_events, stats.snr_max,
+            stats.dm_median, req.request_id, ok, len(result), is_inj,
+            req.wants_raw,
+        )
+
+    def _pending_doc(self, pp: _PendingPlot) -> Dict[str, Any]:
+        req = pp.request
+        return {
+            "event_name": pp.event_name,
+            "mode": pp.mode,
+            "fired_unix": pp.fired_unix,
+            "expected_halves": [list(sg) for sg in pp.expected_halves],
+            "request": (
+                {f: getattr(req, f) for f in req.__dataclass_fields__}
+                if req is not None else None
+            ),
+            "l3_draft": pp.l3_draft,
+            "trigger_class": pp.trigger_class_name,
+        }
+
+    def _finalise_event(
+        self, pp: _PendingPlot, *, kind: str,
+        present: Sequence[Tuple[int, int]], late_ok: bool,
+        now_mono: float,
+    ) -> Dict[str, Any]:
+        """Write Level3 (+ products) for a pending event and queue its
+        plots. Never deletes anything. Returns the products block."""
+        tracker = self._cutout_tracker
+        states = tracker.half_states(pp.event_name) if tracker else {}
+        expected = pp.expected_halves or tuple(
+            (int(s), g) for s in sorted(self._config.dump_broadcast_hosts)
+            for g in (0, 1))
+        products = products_block(
+            kind=kind, expected=expected, present=present,
+            half_states=states, opoint=self._config.opoint,
+            plan_id=self._cutout_plan_id if kind == "cutouts" else 0,
+            request=pp.request,
+            raw=({"requested": bool(pp.request.wants_raw)}
+                 if pp.request is not None else None),
+        )
+        name = pp.event_name
+        try:
+            if pp.l3_draft is not None:
+                # Cutout mode: the CSVs were written at fire time and the
+                # Level3 body was snapshotted then (also what a restarted
+                # C2 recovers); only the products block is added now.
+                ev_dir = self._archive.create(name)
+                doc = dict(pp.l3_draft)
+                doc["products"] = products
+                self._archive.write_l3_metadata(ev_dir, name, doc)
+            else:
+                ev_dir = self._write_event_archive(pp, products=products)
+            try:
+                (ev_dir / "Level2" / "products_pending.json").unlink()
+            except FileNotFoundError:
+                pass
+            self._counters["events_archived"] += 1
+        except Exception:                                  # noqa: BLE001
+            _LOG.exception("event archive write failed for %s "
+                           "(plot still dispatched)", name)
+        complete = products["status"] == "complete"
+        self._counters["events_complete" if complete else "events_incomplete"] += 1
+        self._counters["halves_missing"] += len(products["missing"])
+        enqueue_event(
+            self._plot_worker, name, self._config.event_archive_root,
+            stats=pp.stats, members=list(pp.members),
+        )
+        self._counters["plots_dispatched"] += 1
+        if tracker is not None:
+            tracker.forget(name)
+        if late_ok:
+            self._finalised_cutouts[name] = (now_mono, products)
+        log = _LOG.info if complete else _LOG.warning
+        log(
+            "FINALISE %s %s: %d/%d halves after %.1fs%s",
+            name, products["status"], len(products["present"]),
+            len(products["expected"]),
+            now_mono - pp.submitted_at_monotonic,
+            "" if complete else f" missing={products['missing']}",
+        )
+        return products
+
+    def _scan_pending_cutouts(self, now_mono: float) -> None:
+        """Cutout-mode dispatcher pass: finalise on a full manifest set or
+        at ``coinc.cutout.wait_s`` (incomplete, recorded, never deleted);
+        then fold late manifests into recently finalised events."""
+        from ..x2.cutout.products import halves_with_products
+
+        cfg = self._config.cutout
+        for name, pp in list(self._pending_plots.items()):
+            ev_dir = self._config.event_archive_root / name
+            _kind, present, _n = halves_with_products(ev_dir)
+            want = set(pp.expected_halves)
+            age = now_mono - pp.submitted_at_monotonic
+            if (want and want <= present) or age >= cfg.wait_s:
+                self._pending_plots.pop(name, None)
+                self._finalise_event(
+                    pp, kind="cutouts", present=sorted(present),
+                    late_ok=True, now_mono=now_mono,
+                )
+        for name, (t_fin, products) in list(self._finalised_cutouts.items()):
+            if now_mono - t_fin > cfg.late_accept_s:
+                del self._finalised_cutouts[name]
+                continue
+            if not products.get("missing"):
+                del self._finalised_cutouts[name]
+                continue
+            ev_dir = self._config.event_archive_root / name
+            _kind, present, _n = halves_with_products(ev_dir)
+            labels = {f"s{s}g{g}" for s, g in present}
+            newly = sorted(lb for lb in products["missing"] if lb in labels)
+            if not newly:
+                continue
+            self._record_late_halves(ev_dir, name, products, newly)
+
+    def _record_late_halves(
+        self, ev_dir: Path, name: str, products: Dict[str, Any],
+        newly: Sequence[str],
+    ) -> None:
+        """Append late halves to Level3 ``products.late`` (C3 is not re-run;
+        the plots can be regenerated)."""
+        l3 = ev_dir / "Level3" / f"{name}.json"
+        try:
+            with l3.open("r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as exc:
+            _LOG.warning("late cutouts for %s: cannot read %s: %s", name, l3, exc)
+            return
+        block = doc.setdefault("products", products)
+        late = list(block.get("late", []))
+        for lb in newly:
+            late.append({"half": lb, "t_unix": time.time()})
+            block.get("missing", {}).pop(lb, None)
+            products.get("missing", {}).pop(lb, None)
+        block["late"] = late
+        self._archive.write_l3_metadata(ev_dir, name, doc)
+        self._counters["events_finalised_late"] += 1
+        _LOG.info("LATE cutouts for %s: %s", name, ", ".join(newly))
+
+    def _recover_pending_cutout_events(self) -> int:
+        """Re-adopt cutout events a previous C2 process fired but never
+        finalised (``Level2/products_pending.json`` without Level3)."""
+        root = self._config.event_archive_root
+        cfg = self._config.cutout
+        if not root.is_dir():
+            return 0
+        now_unix = time.time()
+        now_mono = time.monotonic()
+        n = 0
+        horizon = cfg.late_accept_s + cfg.wait_s
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            return 0
+        for ent in entries:
+            try:
+                if not ent.is_dir() or now_unix - ent.stat().st_mtime > horizon:
+                    continue
+            except OSError:
+                continue
+            ev_dir = Path(ent.path)
+            if (ev_dir / "Level3" / f"{ent.name}.json").exists():
+                continue
+            doc = read_pending(ev_dir)
+            if not doc or doc.get("mode") != "cutouts":
+                continue
+            req = None
+            if isinstance(doc.get("request"), dict):
+                try:
+                    req = wire.CutoutRequest(**doc["request"])
+                except (TypeError, ValueError):
+                    req = None
+            age = max(0.0, now_unix - float(doc.get("fired_unix") or now_unix))
+            pp = _PendingPlot(
+                event_name=ent.name,
+                submitted_at_monotonic=now_mono - age,
+                stats=None,  # type: ignore[arg-type]
+                members=(),
+                trigger_class_name=str(doc.get("trigger_class", "")),
+                mode="cutouts",
+                expected_halves=tuple(
+                    (int(s), int(g)) for s, g in doc.get("expected_halves", [])),
+                request=req,
+                l3_draft=doc.get("l3_draft"),
+                fired_unix=float(doc.get("fired_unix") or now_unix),
+            )
+            self._pending_plots[ent.name] = pp
+            if req is not None and self._cutout_tracker is not None:
+                # Track again; re-send only while the halves' raw rings can
+                # still hold the window (the deadline the request carries).
+                if age <= float(req.deadline_s):
+                    self._cutout_tracker.start(req, pp.expected_halves)
+            n += 1
+        if n:
+            self._counters["events_recovered"] += n
+            _LOG.warning("recovered %d pending cutout event(s) after restart", n)
+        return n
+
+    async def _cutout_ack_loop(self) -> None:
+        """Resend unacknowledged cutout requests (0.5 s cadence)."""
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                if self._cutout_tracker is not None:
+                    self._cutout_tracker.service_resends()
+        except asyncio.CancelledError:
+            return
+
+    async def _start_cutout_status_endpoint(self) -> None:
+        if self._cutout_tracker is None:
+            return
+        loop = asyncio.get_running_loop()
+        cfg = self._config.cutout
+        try:
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: CutoutStatusProtocol(self._cutout_tracker),
+                local_addr=(cfg.status_bind_host, int(cfg.status_port)),
+            )
+            self._cutout_status_transport = transport
+            _LOG.info("cutout status endpoint bound %s:%d",
+                      cfg.status_bind_host, cfg.status_port)
+        except OSError as exc:
+            # Status is advisory (manifests are authoritative): keep going.
+            _LOG.error("cutout status endpoint bind %s:%d failed: %r",
+                       cfg.status_bind_host, cfg.status_port, exc)
 
     # ----- background loops --------------------------------------------
 
@@ -2003,7 +2579,13 @@ class CoincidencerService:
                 win = int(self._config.c2_rolling_window_hours)
                 if win > 0:
                     try:
-                        concat_recent_hourly(
+                        # x2 D6: off the event loop. Re-reading 24 h of
+                        # CSV synchronously stalled C1 ingest for the
+                        # duration; the output is identical, only the
+                        # thread changes (a row appended mid-read shows
+                        # up in the next refresh, 60 s later).
+                        await asyncio.to_thread(
+                            concat_recent_hourly,
                             self._config.csv_dir_c2, "c2",
                             now_utc=now_utc, window_hours=win,
                             out_name="c2_last24h.csv",
@@ -2015,7 +2597,10 @@ class CoincidencerService:
         except asyncio.CancelledError:
             return
 
-    def _write_event_archive(self, pp: _PendingPlot) -> Path:
+    def _write_event_archive(
+        self, pp: _PendingPlot,
+        products: Optional[Mapping[str, Any]] = None,
+    ) -> Path:
         """Materialise ``<archive_root>/<event_name>/`` (dir tree +
         Level2 CSVs + Level3 metadata) for a completed cube set.
 
@@ -2047,6 +2632,9 @@ class CoincidencerService:
                 inj_ids=pp.member_inj_ids.values(),
                 pointing_dec_deg=pointing_dec_deg,
                 pointing_dec_meta=pointing_dec_meta,
+                archive_schema=self._config.archive_schema,
+                opoint=self._config.opoint,
+                products=products,
             ),
         )
         return ev_dir
@@ -2136,6 +2724,10 @@ class CoincidencerService:
 
     def _scan_pending_events(self, now_mono: float) -> None:
         """One dispatcher pass (factored out of the loop for tests)."""
+        if self._cutout_tracker is not None:
+            # x2: manifest-counted halves, finalise-never-delete.
+            self._scan_pending_cutouts(now_mono)
+            return
         # Re-sweep straggler partial dirs from earlier discards.
         for name, t_disc in list(self._discarded_events.items()):
             if now_mono - t_disc >= self._DISCARD_RESWEEP_S:
@@ -2182,7 +2774,19 @@ class CoincidencerService:
                 name, now_mono - pp.submitted_at_monotonic,
             )
         for name, n_cubes in expired:
-            self._pending_plots.pop(name, None)
+            pp_exp = self._pending_plots.pop(name, None)
+            if (self._config.partial_event_policy == PARTIAL_POLICY_ARCHIVE
+                    and pp_exp is not None):
+                # 1x≠ (flag): keep the event with its incomplete cube set
+                # recorded in Level3 ``products`` instead of deleting it.
+                from ..x2.cutout.products import cube_file_halves
+                _files, halves = cube_file_halves(
+                    self._config.event_archive_root / name / "cubes")
+                self._finalise_event(
+                    pp_exp, kind="cubes", present=sorted(halves),
+                    late_ok=False, now_mono=now_mono,
+                )
+                continue
             self._counters["events_incomplete_discarded"] += 1
             _LOG.warning(
                 "DISCARD %s: %d/%d cubes after %.0fs -- no "
@@ -2255,7 +2859,7 @@ class CoincidencerService:
                     "last_trigger_class": self._last_trigger_class,
                     "last_event_mjd": self._last_event_mjd,
                     "receiver": self._receiver.counters.snapshot(),
-                    "counters": dict(self._counters),
+                    "counters": self._mon_counters(),
                     "gal_dm_max_los_pc_cc": (
                         float(gal_dm) if gal_dm is not None else None
                     ),
@@ -2284,11 +2888,30 @@ class CoincidencerService:
                         self._config.dm_comb_dm_span_min_pc_cc
                     ),
                 }
+                if self._config.opoint:
+                    payload["opoint"] = self._config.opoint
+                    payload["opoint_selection"] = self._config.opoint_selection
+                    payload["plan_id"] = (
+                        f"0x{self._cutout_plan_id:016x}"
+                        if self._cutout_plan_id else
+                        (self._config.active_plan_id or None))
+                if self._cutout_tracker is not None:
+                    payload["cutout_pending_events"] = len(self._pending_plots)
+                    payload["cutout_expected_halves"] = len(self._cutout_expected)
+                    payload["cutout_late_watch"] = len(self._finalised_cutouts)
                 self._mon_store.put_dict(
                     self._config.mon_etcd_key, payload,
                 )
         except asyncio.CancelledError:
             return
+
+    def _mon_counters(self) -> Dict[str, int]:
+        """Service counters (+ the cutout tracker's, when the x2 lifecycle
+        is on) for ``/mon/c2/h23 counters`` -> Influx ``c2_service``."""
+        out = dict(self._counters)
+        if self._cutout_tracker is not None:
+            out.update(self._cutout_tracker.counters)
+        return out
 
     # ----- galactic-DM poller ------------------------------------------
 
@@ -2431,6 +3054,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-level", default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
     )
+    from ..x2.opoint_runtime import add_opoint_argument
+    add_opoint_argument(parser=p)
     return p
 
 
@@ -2449,8 +3074,26 @@ async def _run_async(args: argparse.Namespace) -> int:
         override["trigger_criteria_path"] = str(args.criteria)
     if args.name_allocator_offline:
         override["name_allocator_offline"] = True
+    # x2 (SPEC §10): the op-point is resolved ONCE at startup (/cnf/opoint
+    # unless --opoint names one); it selects the config set file and is
+    # fixed for the process lifetime (a switch restarts C2).
+    from ..x2.opoint_runtime import select_service_config
+    active, cfg_path = select_service_config(
+        args.config, cli_opoint=getattr(args, "opoint", "auto"))
+    override["opoint"] = active.opoint_id
+    override["opoint_selection"] = active.selection
+    if active.plan_id:
+        override["active_plan_id"] = str(active.plan_id)
+    cut = None
+    if active.plan_path:
+        with Path(cfg_path).open("r", encoding="utf-8") as fh:
+            cut = dict(((yaml.safe_load(fh) or {}).get("coinc") or {})
+                       .get("cutout") or {})
+        if not cut.get("plan_path"):
+            cut["plan_path"] = active.plan_path
+            override["cutout"] = cut
 
-    cfg = CoincidencerConfig.from_yaml(args.config, override=override)
+    cfg = CoincidencerConfig.from_yaml(cfg_path, override=override)
     svc = CoincidencerService(cfg)
     return await svc.run()
 

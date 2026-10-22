@@ -445,6 +445,16 @@ def render_event_plots(job: PlotJob) -> List[Path]:
     plots_dir = job.archive_root / job.event_name / "Level2" / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
+    # x2 D8: an event with cutouts (2x) renders from them; every other
+    # event takes the unchanged cube path below (1x PNGs byte-identical).
+    cut_dir = job.archive_root / job.event_name / "cutouts"
+    if cut_dir.is_dir() and any(cut_dir.glob("cutout_s*_g*.npz")):
+        from ..x2.cutout.products import KIND_CUTOUTS, load_event_products
+        products = load_event_products(job.archive_root / job.event_name)
+        if products.kind == KIND_CUTOUTS:
+            from .plotter_cutouts import render_cutout_plots
+            return render_cutout_plots(job, products)
+
     t_total = time.perf_counter()
     written: List[Path] = []
 
@@ -2017,9 +2027,11 @@ def regenerate_recent_events(
             if not d.is_dir():
                 continue
             cubes_dir = d / "cubes"
-            if not cubes_dir.is_dir():
-                continue
-            npzs = list(cubes_dir.glob("cube_s*_g*_*.npz"))
+            npzs = (list(cubes_dir.glob("cube_s*_g*_*.npz"))
+                    if cubes_dir.is_dir() else [])
+            # x2: events with per-half cutouts instead of cubes.
+            if not npzs and (d / "cutouts").is_dir():
+                npzs = list((d / "cutouts").glob("cutout_s*_g*.npz"))
             if not npzs:
                 continue
             mtime = max(p.stat().st_mtime for p in npzs)

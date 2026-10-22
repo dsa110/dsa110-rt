@@ -180,6 +180,23 @@ LEGACY_BUCKET_INFIX: str = "_w"
 WIDTH_BUCKET_INFIX: str = "@w"
 
 
+def active_k_family(store: Any) -> str:
+    """K family ("1x" | "2x") of the active op-point record ``/cnf/opoint``,
+    or "" when there is none (today's fleet) or it cannot be read."""
+    try:
+        raw = store.get_dict("/cnf/opoint")
+    except Exception:  # noqa: BLE001 - tagging is best-effort
+        return ""
+    if not raw:
+        return ""
+    try:
+        from dsart.x2.opoint_runtime import k_family_of, parse_active_record
+        sel = parse_active_record(raw)
+        return k_family_of(sel) if sel else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def bucket_key(
     dm_pc_cm3: float,
     width_samples: int = DEFAULT_CALIBRATION_WIDTH,
@@ -280,9 +297,16 @@ class CalibrationEntry:
     last_calibrated_at_unix: float
     last_target_snr: Optional[float] = None
     actor: str = "unknown"
+    #: x2 (SPEC §10): the K family ("1x" | "2x") the entry was measured in.
+    #: Empty for entries written before any op-point record existed; only
+    #: serialised when set, so today's payloads are unchanged.
+    k_family: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if not d.get("k_family"):
+            d.pop("k_family", None)
+        return d
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "CalibrationEntry":
@@ -300,6 +324,7 @@ class CalibrationEntry:
                 if d.get("last_target_snr") is not None else None
             ),
             actor=str(d.get("actor", "unknown")),
+            k_family=str(d.get("k_family", "") or ""),
         )
 
 
@@ -343,9 +368,19 @@ class CalibrationStore:
             return None
 
     def put(self, entry: CalibrationEntry) -> str:
-        """Persist an entry; returns the etcd key written."""
+        """Persist an entry; returns the etcd key written.
+
+        x2: the entry is tagged with the active K family (from
+        ``/cnf/opoint``) when an op-point record exists, so a K measured at
+        one time resolution is never silently used at the other (the
+        switch parks K per family, SPEC §10; the tag is the backstop)."""
         key = f"{CALIBRATION_PREFIX}{entry.bucket}"
-        self._store.put_dict(key, entry.to_dict())
+        payload = entry.to_dict()
+        if not entry.k_family:
+            fam = active_k_family(self._store)
+            if fam:
+                payload["k_family"] = fam
+        self._store.put_dict(key, payload)
         return key
 
     def list_all(self) -> List[CalibrationEntry]:

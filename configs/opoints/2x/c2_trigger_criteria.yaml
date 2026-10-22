@@ -59,8 +59,6 @@ opoint: 2x
 #   * dm_median_max_pc_cc 3100 (search reaches DM 3000; 1x: 2700 over 2653);
 #   * everything else starts at the 1x value and is listed in
 #     x2_cp2_recalibrate (does not block the switch).
-x2_todo:
-  - "WS-D D6: the criteria loader accepts width_median_max_ms (unknown require keys raise today); delete this entry when D6 lands"
 x2_cp2_recalibrate:
   - "dm_median_min_pc_cc 115 kept from 1x (floor 100 + 15); the 2x floor is 50, lowering to 65 is a CP2 decision (zero-DM rail at the floor)"
   - "bright_galactic dm_median_min_pc_cc 100 (the 1x floor)"

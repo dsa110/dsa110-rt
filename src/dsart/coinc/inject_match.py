@@ -244,6 +244,9 @@ ORIGIN_MISMATCH_FACTOR: float = 16.0
 #: Unix epoch in MJD (1970-01-01 00:00:00 UTC).
 _MJD_UNIX_EPOCH: float = 40587.0
 
+#: SNAP specnum period (us); a row's specnums-per-sample = period / this.
+_SPECNUM_PERIOD_US: float = 65.536
+
 #: Grace period beyond ``ttl_s`` before the matcher actively deletes an
 #: expired ``/cnf/inject/active/<inj_id>`` row from etcd.
 #:
@@ -538,6 +541,7 @@ class InjectionMatcher:
             DEFAULT_SPECNUMS_PER_SEARCH_SAMPLE
         ),
         wall_tol_s: float = DEFAULT_WALL_TOL_S,
+        specnum_tol_s: Optional[float] = None,
         time_fn: Any = time.time,
         active_inject_prefix: str = ACTIVE_INJECT_PREFIX,
         expiry_grace_s: Optional[float] = DEFAULT_EXPIRY_GRACE_S,
@@ -589,6 +593,14 @@ class InjectionMatcher:
             else float(specnum_tol_samples)
         )
         self._specnums_per_search_sample = int(specnums_per_search_sample)
+        # x2 D10: time-gate tolerance in SECONDS, applied with each row's
+        # own sample period (C1 batch header). None = today's fixed
+        # ``specnum_tol_samples`` (4096 search samples ~ 4.29 s at 1x,
+        # but only 2.15 s at the 2x 524.288 us sample).
+        if specnum_tol_s is not None and float(specnum_tol_s) <= 0.0:
+            raise ValueError(f"specnum_tol_s={specnum_tol_s} must be positive")
+        self._specnum_tol_s: Optional[float] = (
+            None if specnum_tol_s is None else float(specnum_tol_s))
         if wall_tol_s <= 0.0:
             raise ValueError(f"wall_tol_s={wall_tol_s} must be positive")
         self._wall_tol_s = float(wall_tol_s)
@@ -738,6 +750,7 @@ class InjectionMatcher:
         search_node_id: int,
         gpu_half: int,
         mjd: float,
+        sample_period_us: Optional[float] = None,
     ) -> Optional[MatchResult]:
         """Match one C1 row against the active registry; return best
         :class:`MatchResult` on a hit (else ``None``).
@@ -767,6 +780,7 @@ class InjectionMatcher:
                 width_samples=width_samples,
                 event_specnum=event_specnum,
                 mjd=mjd,
+                sample_period_us=sample_period_us,
             ):
                 continue
             K = compute_k_inferred(
@@ -812,6 +826,7 @@ class InjectionMatcher:
         snr: Optional[float] = None,
         event_specnum: Optional[int] = None,
         mjd: float = 0.0,
+        sample_period_us: Optional[float] = None,
     ) -> Optional[str]:
         """Return the best-quality matching ``inj_id`` (no publish).
 
@@ -844,6 +859,7 @@ class InjectionMatcher:
                         0 if event_specnum is None else int(event_specnum)
                     ),
                     mjd=mjd,
+                    sample_period_us=sample_period_us,
                 ):
                     continue
             elif not self._row_matches_dm_lm(
@@ -970,6 +986,7 @@ class InjectionMatcher:
         inj: ActiveInjection,
         event_specnum: int,
         mjd: float = 0.0,
+        sample_period_us: Optional[float] = None,
     ) -> bool:
         """Specnum-proximity gate (2026-06-09) with wall-clock fallback
         (2026-06-10).
@@ -990,17 +1007,12 @@ class InjectionMatcher:
             return True
         if inj.apply_at_specnum <= 0 or event_specnum <= 0:
             return True
-        expected = (
-            float(inj.apply_at_specnum)
-            / float(self._specnums_per_search_sample)
-        )
+        spp, tol = self._row_units(sample_period_us)
+        expected = float(inj.apply_at_specnum) / float(spp)
         residual = float(event_specnum) - expected
-        if abs(residual) <= self._specnum_tol_samples:
+        if abs(residual) <= tol:
             return True
-        origin_mismatch = (
-            abs(residual)
-            > self._specnum_tol_samples * ORIGIN_MISMATCH_FACTOR
-        )
+        origin_mismatch = abs(residual) > tol * ORIGIN_MISMATCH_FACTOR
         if origin_mismatch and math.isfinite(mjd) and mjd > 0.0:
             row_unix = (float(mjd) - _MJD_UNIX_EPOCH) * 86400.0
             dt = row_unix - float(inj.fired_at_unix)
@@ -1027,10 +1039,33 @@ class InjectionMatcher:
         LOG.info(
             "inject_match: specnum gate reject inj_id=%s residual=%.0f "
             "samples (tol=%.0f, expected=%.0f, observed=%d, dm=%.0f)",
-            inj.inj_id, residual, self._specnum_tol_samples,
+            inj.inj_id, residual, tol,
             expected, int(event_specnum), inj.dm_pc_cm3,
         )
         return False
+
+    def _row_units(self, sample_period_us: Optional[float]) -> tuple:
+        """``(specnums per row sample, tolerance in row samples)``.
+
+        Without a usable row period (or without ``specnum_tol_s``) this
+        is today's ``(specnums_per_search_sample, specnum_tol_samples)``
+        exactly. With both, the factor follows the row's own period
+        (16 at 1048.576 us, 8 at 524.288 us) and the tolerance is the
+        configured seconds in that period."""
+        spp = self._specnums_per_search_sample
+        tol = float(self._specnum_tol_samples)
+        if self._specnum_tol_s is None:
+            return spp, tol            # today's gate, bit for bit
+        try:
+            p = float(sample_period_us) if sample_period_us is not None else 0.0
+        except (TypeError, ValueError):
+            p = 0.0
+        if p > 100.0 and math.isfinite(p):
+            cand = int(round(p / _SPECNUM_PERIOD_US))
+            if cand >= 1 and abs(cand * _SPECNUM_PERIOD_US - p) < 1e-6:
+                spp = cand
+                tol = self._specnum_tol_s * 1e6 / p
+        return spp, tol
 
     def _row_qualifies(
         self,
@@ -1043,6 +1078,7 @@ class InjectionMatcher:
         width_samples: int,
         event_specnum: int = 0,
         mjd: float = 0.0,
+        sample_period_us: Optional[float] = None,
     ) -> bool:
         """Full match gate: DM/l/m proximity + SNR band + specnum window.
 
@@ -1089,6 +1125,7 @@ class InjectionMatcher:
             return False
         if not self._row_matches_specnum(
             inj=inj, event_specnum=event_specnum, mjd=mjd,
+            sample_period_us=sample_period_us,
         ):
             self._n_rows_rejected_specnum += 1
             return False

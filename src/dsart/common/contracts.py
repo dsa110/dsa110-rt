@@ -42,7 +42,7 @@ from .config_loader import DSART_TEST
 from .constants import (
     DETECTOR_DM_KERNELS,
     DETECTOR_IMAGE_KERNELS,
-    DETECTOR_TIME_KERNELS,
+    DETECTOR_TIME_KERNELS_VALID,
     DM_PLAN_METADATA_VERSION,
     NCHAN_PER_CHGROUP,
     N_CHGROUP,
@@ -99,9 +99,9 @@ def _check_kernel_id(kernel_id: str) -> None:
         raise ValueError(
             f"kernel_id dm token {dm!r} not in {DETECTOR_DM_KERNELS}"
         )
-    if t not in DETECTOR_TIME_KERNELS:
+    if t not in DETECTOR_TIME_KERNELS_VALID:
         raise ValueError(
-            f"kernel_id time token {t!r} not in {DETECTOR_TIME_KERNELS}"
+            f"kernel_id time token {t!r} not in {DETECTOR_TIME_KERNELS_VALID}"
         )
 
 
