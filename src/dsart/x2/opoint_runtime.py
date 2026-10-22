@@ -79,6 +79,58 @@ _FILE_TO_KIND: dict[str, str] = {v: k for k, v in CONFIG_FILES.items()}
 
 STAMP_KEY: str = "opoint"
 TODO_LIST_KEY: str = "x2_todo"
+#: Informational list (does NOT block a switch): values carried over from 1x
+#: that are to be recalibrated on 2x data at CP2.
+RECAL_LIST_KEY: str = "x2_cp2_recalibrate"
+
+#: Injection K (S/N calibration) lives under this etcd prefix (dashboard
+#: ``inject_calibration.CALIBRATION_PREFIX``). K measured at one time
+#: resolution is wrong at the other, so a switch between K families parks the
+#: live K of the old family and restores the parked K of the new one.
+K_PREFIX: str = "/cnf/inject/snr_calibration/"
+K_FAMILY: dict[str, str] = {"1x": "1x", "1x-legacy": "1x", "2x": "2x"}
+K_PARK_PREFIX: str = "/cnf/opoints/_kpark"
+
+
+def k_park_prefix(family: str) -> str:
+    if family not in set(K_FAMILY.values()):
+        raise ValueError(f"unknown K family {family!r}")
+    return f"{K_PARK_PREFIX}/{family}/"
+
+
+#: Every time-unit parameter, explicit per op-point (SPEC §8/§10). The code
+#: defaults are 2x (``common/constants.py`` T_INT_SEARCH_US_DEFAULT = 524.288),
+#: so a set that omits one of these silently runs 2x units: validate_set flags
+#: a missing or wrong value as a problem. ``("args", routine, flag)`` = the last
+#: occurrence of ``flag`` in that routine's args; ``("key", dotted.path)`` = a
+#: YAML value. ``cube_sample_period_specnum`` (search_compute) is derived from
+#: --t-int-search-us (16 at 1x, 8 at 2x); ``cube.sample_period_specnum`` is only
+#: the merger's fallback and stays 16 with it. The merger keeps 16 at 2x on
+#: purpose: it holds the merge window constant in wall-clock time
+#: (detector/merger.py; downstream inventory finding 16).
+_TU_1X: dict[tuple, float] = {
+    ("pipeline_rt", "args", "corr_fast", "--t-int-fast-native"): 32,
+    ("pipeline_rt", "args", "corr_fast", "--chan-sum-factor"): 8,
+    ("search_rt", "args", "search_compute_0", "--t-int-search-us"): 1048.576,
+    ("search_rt", "args", "search_compute_1", "--t-int-search-us"): 1048.576,
+    ("search_rt", "args", "search_compute_0", "--chan-sum-factor"): 8,
+    ("search_rt", "args", "search_compute_1", "--chan-sum-factor"): 8,
+    ("search_rt", "key", "c1.merger.sample_period_specnum"): 16,
+    ("search_rt", "key", "c1.max_c1c2_width_samples"): 16,
+    ("search_rt", "key", "cube.sample_period_specnum"): 16,
+}
+_TU_2X: dict[tuple, float] = {
+    ("pipeline_rt", "args", "corr_fast", "--t-int-fast-native"): 8,
+    ("pipeline_rt", "args", "corr_fast", "--chan-sum-factor"): 2,
+    ("search_rt", "args", "search_compute_0", "--t-int-search-us"): 524.288,
+    ("search_rt", "args", "search_compute_1", "--t-int-search-us"): 524.288,
+    ("search_rt", "args", "search_compute_0", "--chan-sum-factor"): 2,
+    ("search_rt", "args", "search_compute_1", "--chan-sum-factor"): 2,
+    ("search_rt", "key", "c1.merger.sample_period_specnum"): 16,
+    ("search_rt", "key", "c1.max_c1c2_width_samples"): 32,
+    ("search_rt", "key", "cube.sample_period_specnum"): 16,
+}
+TIME_UNITS: dict[str, dict[tuple, float]] = {"1x": _TU_1X, "1x-legacy": _TU_1X, "2x": _TU_2X}
 PLACEHOLDER_RE = re.compile(r"X2TODO:[A-Za-z0-9-]+:[A-Za-z0-9_./=,-]+")
 #: Any path that names an op-point-managed config file.
 _CONFIG_REF_RE = re.compile(
@@ -376,6 +428,14 @@ def find_placeholders(cfg: Any) -> list[tuple[str, str]]:
     return out
 
 
+def recalibration_notes(cfg: Any) -> list[str]:
+    """Entries of the informational ``x2_cp2_recalibrate`` list (never blocking)."""
+    if not isinstance(cfg, Mapping):
+        return []
+    v = cfg.get(RECAL_LIST_KEY) or []
+    return [str(x) for x in (v if isinstance(v, list) else [v])]
+
+
 def find_cross_refs(cfg: Any, op: str) -> list[tuple[str, str]]:
     """References to another op-point's config files inside ``cfg``.
 
@@ -392,6 +452,63 @@ def find_cross_refs(cfg: Any, op: str) -> list[tuple[str, str]]:
             if not ok:
                 bad.append((path, m.group(0)))
     return bad
+
+
+def routine_arg(cfg: Mapping[str, Any], routine: str, flag: str) -> str | None:
+    """Value of the LAST ``flag`` in ``routine``'s args (argparse semantics)."""
+    import shlex
+
+    for r in cfg.get("routines") or []:
+        if isinstance(r, Mapping) and r.get("name") == routine:
+            try:
+                toks = shlex.split(str(r.get("args") or ""))
+            except ValueError:
+                toks = str(r.get("args") or "").split()
+            val = None
+            for i, t in enumerate(toks):
+                if t == flag and i + 1 < len(toks):
+                    val = toks[i + 1]
+                elif t.startswith(flag + "="):
+                    val = t.split("=", 1)[1]
+            return val
+    return None
+
+
+def _dotted(cfg: Any, path: str) -> Any:
+    cur = cfg
+    for part in path.split("."):
+        if not isinstance(cur, Mapping) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def check_time_units(cfgs: Mapping[str, Any], op: str) -> list[str]:
+    """Problems with the op-point's explicit time-unit parameters (:data:`TIME_UNITS`)."""
+    problems: list[str] = []
+    for spec, want in TIME_UNITS[validate_name(op)].items():
+        inst = spec[0]
+        cfg = cfgs.get(inst)
+        if not isinstance(cfg, Mapping):
+            continue  # reported as missing elsewhere
+        if spec[1] == "args":
+            where = f"{inst}: routines[{spec[2]}] {spec[3]}"
+            got = routine_arg(cfg, spec[2], spec[3])
+        else:
+            where = f"{inst}: {spec[2]}"
+            got = _dotted(cfg, spec[2])
+        if got is None:
+            problems.append(f"{where} not set explicitly (want {want:g}; code defaults are 2x)")
+            continue
+        if PLACEHOLDER_RE.fullmatch(str(got)):
+            continue  # an unfilled placeholder is reported as a placeholder
+        try:
+            ok = abs(float(got) - float(want)) <= 1e-9 * max(1.0, abs(float(want)))
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            problems.append(f"{where} = {got!r}, op-point {op} needs {want:g}")
+    return problems
 
 
 @dataclass
@@ -436,10 +553,17 @@ def validate_config(cfg: Any, op: str, instance: str) -> SetReport:
     return rep
 
 
-def validate_set(cfgs: Mapping[str, Any], op: str, *, require_stamp: bool = False) -> SetReport:
-    """Validate a set ``{instance: cfg}`` (instances, plus optional c2_criteria)."""
+def validate_set(cfgs: Mapping[str, Any], op: str, *, require_stamp: bool = False,
+                 check_units: bool = True) -> SetReport:
+    """Validate a set ``{instance: cfg}`` (instances, plus optional c2_criteria).
+
+    ``check_units`` also requires every :data:`TIME_UNITS` parameter to be set
+    explicitly to the op-point's value.
+    """
     validate_name(op)
     rep = SetReport(op)
+    if check_units:
+        rep.problems.extend(check_time_units(cfgs, op))
     for inst in INSTANCES:
         cfg = cfgs.get(inst)
         if cfg is None:

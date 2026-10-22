@@ -43,8 +43,23 @@
 #     bounding box, in radians; ~0 for a true point source.
 
 opoint: 2x
+# 2x differences from the 1x file (configs/c2_trigger_criteria.yaml):
+#   * width gates are in ms (width_median_max_ms, computed per member from
+#     each row's sample period) -- 1x keeps the integer _samples gates, since
+#     16 x 1.048576 ms in float can flip the w=16 boundary by one ulp. The ms
+#     limits sit between allowed boxcar widths (16.8 between 16.78 and 33.55,
+#     8.4 between 8.39 and 16.78, 33.6 between 33.55 and 67.1), so no ulp
+#     can move a width across a gate;
+#   * dm_median_max_pc_cc 3100 (search reaches DM 3000; 1x: 2700 over 2653);
+#   * everything else starts at the 1x value and is listed in
+#     x2_cp2_recalibrate (does not block the switch).
 x2_todo:
-  - "WS-D: widths and time criteria in ms; dm_median_max_pc_cc >= 3000; DM-comb, cluster_rate_max and holdoff_s retuned for ~4x trials and 2x cubes/s; zero-DM rail moves to the DM-50 floor (galactic/extragalactic classification near the floor re-checked)"
+  - "WS-D D6: the criteria loader accepts width_median_max_ms (unknown require keys raise today); delete this entry when D6 lands"
+x2_cp2_recalibrate:
+  - "dm_median_min_pc_cc 115 kept from 1x (floor 100 + 15); the 2x floor is 50, lowering to 65 is a CP2 decision (zero-DM rail at the floor)"
+  - "bright_galactic dm_median_min_pc_cc 100 (the 1x floor)"
+  - "dm_iqr_max_pc_cc caps were tuned to ~7 pc/cc fine spacing; 2x tier A is 2.8-3.2 pc/cc"
+  - "holdoff_s 30 per class: 2x sends ~3-6x more batches per burst (duplicate-dump hole, inventory finding 8)"
 
 trigger_classes:
   - name: bright_frb_extragalactic
@@ -77,9 +92,9 @@ trigger_classes:
       # DM smearing) to log_only. The earlier 3000→2000 tighten was a
       # false-positive defense; 2700 keeps a margin above the searched
       # range without re-opening the >2653 unphysical tail.
-      dm_median_max_pc_cc: 2700.0
+      dm_median_max_pc_cc: 3100.0      # 2x: the search reaches DM 3000
       dm_iqr_max_pc_cc: 100.0
-      width_median_max_samples: 16
+      width_median_max_ms: 16.8        # 1x: 16 samples x 1.048576 ms
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
@@ -120,9 +135,9 @@ trigger_classes:
       n_events_min: 1
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 115.0
-      dm_median_max_pc_cc: 2700.0
+      dm_median_max_pc_cc: 3100.0      # 2x: the search reaches DM 3000
       dm_iqr_max_pc_cc: 100.0
-      width_median_max_samples: 8
+      width_median_max_ms: 8.4         # 1x: 8 samples x 1.048576 ms
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
@@ -145,7 +160,7 @@ trigger_classes:
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 100.0
       dm_iqr_max_pc_cc: 50.0
-      width_median_max_samples: 32
+      width_median_max_ms: 33.6        # 1x: 32 samples x 1.048576 ms
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_max: 1.0
     action: dump_all_gpus

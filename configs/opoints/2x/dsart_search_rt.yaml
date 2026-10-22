@@ -37,11 +37,17 @@ opoint: 2x
 x2_todo:
   - "WS-T search_rx: recv v4 / ring v4 args (owned DMs only, per-DM cadence and fan-in, retention >= 20 s; tokens in routines[search_rx])"
   - "WS-S search_compute: owner engine args (per-DM cubes, K0-K3b, B-spline filters), amplitude regime in sigma units (input_clip_sigma 250, Layer-1/Layer-2 floors for the new image units, saturation guard 240), --enable-cube-dump vs on-demand cutouts (O1); tokens in routines[search_compute_0/1]"
-  - "WS-S/WS-D c1: external clock (T_ext 524.288 us), merger radii in T_ext or ms, metering rule (never meter an injection more often than 1x), real csf in the filters"
+  - "WS-S/WS-D c1: merger dm_max_trials in pc/cc (2x fine spacing 2.8-3.2 pc/cc vs ~7), metering per cycle not per cube (never meter an injection more often than 1x), _DEDISP_CHAN_SUM_FACTOR wired from --chan-sum-factor (search_compute.py:266 is a literal 8 today)"
   - "WS-S cube / cube_dump / noise / detector blocks: 2x values (cube retention ring, proactive stager and cube uploader retire in 2x)"
-  - "WS-D coinc: widths/windows in ms, dm_median_max_pc_cc >= 3000, DM-comb, cluster_rate_max and holdoff for ~4x trials and 2x cubes/s, expected products from config, sample_period_us in CSVs and Level3 json, missing halves never discard an event"
-  - "WS-D c3: R-rules on cutouts rescaled (ms, DM density), filterbank period from the event, --n-pre vs DM 3000"
-  - "WS-D inject_bot: native->search factor 16, widths + cap, dm_choices to 3000, owner map from config, per-half metering block, K wiped and recalibrated"
+  - "WS-D D6 coinc: the code reads partial_event_policy and cutout.{wait_s,status_port}; expected halves from the plan; sample_period_us in CSVs and Level3 json; class ids by crc32"
+  - "WS-D c3: the code reads veto.r2_t_shift_ms (2x key); R-rules on cutouts; filterbank period from the event"
+  - "WS-D D10 inject_bot: factor 16 + width cap from the c1 block, width_choices incl. 16 native, dm_choices to 3000 avoiding 1575-1625, owner map from the plan, op-point-tagged K keys"
+# Carried over from 1x, recalibrated on 2x data at CP2 (does NOT block a switch).
+x2_cp2_recalibrate:
+  - "coinc.cluster_rate_max 400 (counts evaluations; 2x sends ~3-6x more batches per burst)"
+  - "coinc.dm_comb_* (3 clusters, 300 pc/cc span, 2 s, 90 arcsec): retune with 2x injections, risk of vetoing real bright bursts"
+  - "coinc.window_s 5.0 vs the DM-3000 sweep (~1.7 s) + per-DM cube latency; coinc.ingest_queue_depth 512 (~2 s at 2x rates)"
+  - "c3.veto r3/r5 (fine trials per bucket) and R10 tz_trig on 512 tier-A rows"
 
 # No mode switch for search — the search-side wire format is always
 # the M4a prod-frame UDP regardless of whether the corr senders are
@@ -311,7 +317,7 @@ routines:
       --bytes-per-cell X2TODO:WS-T:bits-per-value
       --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
       --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
-      --t-int-search-us X2TODO:WS-S:t-ext-524.288
+      --t-int-search-us 524.288
       --dm-plan-path X2TODO:WS-P:tiered-dm-plan-v3-path
       --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
       --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
@@ -338,7 +344,7 @@ routines:
       --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
-      --chan-sum-factor X2TODO:WS-S:chan-sum-factor
+      --chan-sum-factor 2
       --cell-lambda-mode tee45
       --n-sub X2TODO:WS-S:n-sub-from-CP1-format
       --combine-impl X2TODO:WS-S:combine-impl
@@ -404,7 +410,7 @@ routines:
       --bytes-per-cell X2TODO:WS-T:bits-per-value
       --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
       --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
-      --t-int-search-us X2TODO:WS-S:t-ext-524.288
+      --t-int-search-us 524.288
       --dm-plan-path X2TODO:WS-P:tiered-dm-plan-v3-path
       --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
       --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
@@ -415,7 +421,7 @@ routines:
       --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
-      --chan-sum-factor X2TODO:WS-S:chan-sum-factor
+      --chan-sum-factor 2
       --cell-lambda-mode tee45
       --n-sub X2TODO:WS-S:n-sub-from-CP1-format
       --combine-impl X2TODO:WS-S:combine-impl
@@ -570,12 +576,16 @@ c1:
     lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
     dm_max_trials: 2                 # half-window on fine-DM index
     t_frac: 1.0                      # |Δt| ≤ t_frac * 0.5 * (w_i + w_j) samples
+    # 2x: KEEP 16 (not 8). The merger multiplies its window by this, so 16
+    # holds the merge window constant in wall-clock time at 2x
+    # (detector/merger.py; downstream inventory finding 16).
     sample_period_specnum: 16        # spec-nums per detector sample
   c2_endpoint:
     host: lxd110h23.pro.pvt          # FQDN (search nodes can't resolve bare 'lxd110h23')
     port: 11500
   emit_queue_depth: 16
-  max_c1c2_width_samples: 16         # M7.6: drop candidates wider than this (boxcar samples)
+  # 2x: 32 T_ext samples = 16.8 ms, the same wall-clock cap as 16 x 1.05 ms at 1x.
+  max_c1c2_width_samples: 32         # M7.6: drop candidates wider than this (boxcar samples)
                                      # BEFORE transmitting to C2. Wide boxcars (>=32) are the
                                      # on-sky false-positive floor (2026-05-29 analysis: 95-100%
                                      # of spurious-candidate volume at width>=32); capping at 16
@@ -923,6 +933,14 @@ enable_legacy_clusterer: false
 # ``--config-yaml`` for the c1: block above and ignore coinc:.
 # ---------------------------------------------------------------------------
 coinc:
+  # 2x (SPEC §9 / downstream inventory §3.5): C2 never discards an event
+  # (1x keeps `discard` until the user signs off at O2), and waits
+  # cutout.wait_s for the per-half cutouts; halves report status to
+  # status_port.
+  partial_event_policy: archive
+  cutout:
+    wait_s: 120
+    status_port: 11501
   bind:
     host: "0.0.0.0"
     port: 11500                    # mirrors c1.c2_endpoint.port
@@ -1159,7 +1177,7 @@ c3:
   # dsart.coinc.cube_veto + the FP-analysis report). Tier-1 R1-R5 + R10.
   veto:
     r1_img_off_px: 40.0              # apex image >40 px (~30') from triggered pixel -> reject
-    r2_t_shift_samples: 30           # cube time apex shifted >30 samples from trigger -> reject
+    r2_t_shift_ms: 31.5              # 2x: 60 T_ext (1x: r2_t_shift_samples 30 x 1.05 ms)
     r3_dm_shift_trials: 8            # cube DM apex shifted >8 trials AND weak DM peak -> reject
     r4_time_prom_sigma: 4.0          # require a >=4 sigma time-series peak
     r4_image_prom_sigma: 4.0         # require a >=4 sigma image peak
@@ -1310,5 +1328,8 @@ inject_bot:
   unhealthy_alert_streak: 5
   summary_hour_utc: 16
   results_path: "/dataz/dsa110/operations/inject/inject_bot_results.jsonl"
-  state_path: "~/.dsa_monitor/inject_bot_state.json"
+  # 2x: its own bot state file, so the K doctor's k_last_good /
+  # k_calibration_dec of 1x can never write 1x K back in 2x (and vice
+  # versa); the etcd K itself is parked per K family by the op-point switch.
+  state_path: "~/.dsa_monitor/inject_bot_state_2x.json"
   summary_dir: "~/.dsa_monitor/inject_bot"

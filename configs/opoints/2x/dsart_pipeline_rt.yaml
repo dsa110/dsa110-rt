@@ -627,6 +627,10 @@ routines:
   # and 157 ms -- 117% duty -- would have been n_sub=4 without it).
   # MUST match search_compute --n-sub and search_rx --n-corr 64; see
   # the SUB-BAND STREAMS note in dsart_search_rt.yaml.
+  # 2x time units (user decisions, plan rev 4; explicit because the code
+  # defaults are not the 1x values -- checked by
+  # dsart.x2.opoint_runtime.TIME_UNITS): fast vis --t-int-fast-native 8
+  # (0.262 ms), --chan-sum-factor 2 (61 kHz).
   - name: corr_fast
     cmd: python
     args: >-
@@ -651,9 +655,9 @@ routines:
       --rfi-array-burst-mode flag
       --rfi-ab-bin-mode monitor
       --opoint 2x
-      --t-int-fast-native X2TODO:WS-C:t-int-fast-native
+      --t-int-fast-native 8
       --dm-plan-path X2TODO:WS-P:tiered-dm-plan-v3-path
-      --chan-sum-factor X2TODO:WS-C:chan-sum-factor
+      --chan-sum-factor 2
       --n-sub X2TODO:WS-C:n-sub-from-CP1-format
       --cell-lambda-mode tee45
       --sliding-window

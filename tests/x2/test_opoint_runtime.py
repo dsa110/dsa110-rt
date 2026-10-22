@@ -201,14 +201,18 @@ def test_find_placeholders_and_cross_refs():
 
 def test_validate_set():
     good = {"routines": [], "opoint": "2x"}
-    rep = opr.validate_set({"pipeline_rt": good, "search_rt": good}, "2x", require_stamp=True)
+    rep = opr.validate_set({"pipeline_rt": good, "search_rt": good}, "2x", require_stamp=True,
+                           check_units=False)
     assert rep.ok and rep.summary() == "ok"
-    rep = opr.validate_set({"pipeline_rt": {"routines": []}}, "2x", require_stamp=True)
+    rep = opr.validate_set({"pipeline_rt": good, "search_rt": good}, "2x")
+    assert not rep.ok and any("not set explicitly" in p for p in rep.problems)
+    rep = opr.validate_set({"pipeline_rt": {"routines": []}}, "2x", require_stamp=True,
+                           check_units=False)
     assert not rep.ok
     assert any("search_rt: missing" in p for p in rep.problems)
     assert any("stamp" in p for p in rep.problems)
     rep = opr.validate_set({"pipeline_rt": {"routines": [], "opoint": "1x"},
-                            "search_rt": "nope"}, "2x")
+                            "search_rt": "nope"}, "2x", check_units=False)
     assert any("expected '2x'" in p for p in rep.problems)
     assert any("not a mapping" in p for p in rep.problems)
 
@@ -287,7 +291,8 @@ def test_repo_2x_set_keeps_the_1x_structure():
     for inst in opr.INSTANCES:
         assert [r["name"] for r in one[inst]["routines"]] == [r["name"] for r in two[inst]["routines"]]
         assert one[inst]["buffers"] == two[inst]["buffers"]
-        assert set(two[inst]) - set(one[inst]) == {"opoint", "x2_todo"}
+        assert set(two[inst]) - set(one[inst]) <= {"opoint", "x2_todo", "x2_cp2_recalibrate"}
+        assert set(one[inst]) - set(two[inst]) == set()
 
 
 def test_repo_2x_node_services_get_opoint_arg():
@@ -295,6 +300,75 @@ def test_repo_2x_node_services_get_opoint_arg():
     by = {r["name"]: r for inst in opr.INSTANCES for r in two[inst]["routines"]}
     for name in ("corr_fast", "search_rx", "search_compute_0", "search_compute_1"):
         assert "--opoint 2x" in by[name]["args"], name
+
+
+@pytest.mark.parametrize("op", ["1x", "1x-legacy", "2x"])
+def test_repo_sets_set_every_time_unit_explicitly(op):
+    """The code defaults are 2x: each set must carry its own values (inventory finding 15)."""
+    s = opr.load_repo_set(op, CONFIGS)
+    assert opr.check_time_units(s, op) == []
+    want = opr.TIME_UNITS[op]
+    assert float(opr.routine_arg(s["search_rt"], "search_compute_1", "--t-int-search-us")) == \
+        want[("search_rt", "args", "search_compute_1", "--t-int-search-us")]
+
+
+def test_time_unit_values_per_opoint():
+    t1, t2 = opr.TIME_UNITS["1x"], opr.TIME_UNITS["2x"]
+    assert t1[("search_rt", "args", "search_compute_0", "--t-int-search-us")] == 1048.576
+    assert t2[("search_rt", "args", "search_compute_0", "--t-int-search-us")] == 524.288
+    assert t2[("pipeline_rt", "args", "corr_fast", "--t-int-fast-native")] == 8
+    assert t2[("search_rt", "key", "c1.max_c1c2_width_samples")] == 32
+    # the merger keeps 16 at 2x on purpose (wall-clock window; inventory finding 16)
+    assert t1[("search_rt", "key", "c1.merger.sample_period_specnum")] == 16
+    assert t2[("search_rt", "key", "c1.merger.sample_period_specnum")] == 16
+    assert opr.TIME_UNITS["1x-legacy"] == t1
+
+
+def test_check_time_units_flags_missing_and_wrong():
+    s = {inst: dict(cfg) for inst, cfg in opr.load_repo_set("1x", CONFIGS).items()}
+    s["search_rt"] = dict(s["search_rt"])
+    s["search_rt"]["routines"] = [
+        dict(r, args=r["args"].replace("--t-int-search-us 1048.576", ""))
+        if r["name"] == "search_compute_0" else r
+        for r in s["search_rt"]["routines"]]
+    s["search_rt"]["c1"] = dict(s["search_rt"]["c1"], max_c1c2_width_samples=32)
+    probs = opr.check_time_units(s, "1x")
+    assert any("search_compute_0] --t-int-search-us not set explicitly" in p for p in probs)
+    assert any("max_c1c2_width_samples = 32" in p for p in probs)
+    assert len(probs) == 2
+    assert not opr.validate_set(s, "1x").ok
+    assert opr.validate_set(s, "1x", check_units=False).ok
+
+
+def test_routine_arg_last_occurrence_wins():
+    cfg = {"routines": [{"name": "a", "args": "-u --x 1 --y 2 --x 3"}, {"name": "b", "args": ""}]}
+    assert opr.routine_arg(cfg, "a", "--x") == "3"
+    assert opr.routine_arg(cfg, "a", "--z") is None
+    assert opr.routine_arg(cfg, "b", "--x") is None
+    assert opr.routine_arg(cfg, "nope", "--x") is None
+
+
+def test_k_families():
+    assert opr.K_FAMILY["1x"] == opr.K_FAMILY["1x-legacy"] != opr.K_FAMILY["2x"]
+    assert opr.k_park_prefix("2x") == "/cnf/opoints/_kpark/2x/"
+    with pytest.raises(ValueError):
+        opr.k_park_prefix("1x-legacy")
+
+
+def test_repo_2x_k_isolation_and_c2_keys():
+    one = opr.load_repo_set("1x", CONFIGS)
+    two = opr.load_repo_set("2x", CONFIGS)
+    assert two["search_rt"]["inject_bot"]["state_path"] != one["search_rt"]["inject_bot"]["state_path"]
+    coinc = two["search_rt"]["coinc"]
+    assert coinc["partial_event_policy"] == "archive"
+    assert coinc["cutout"] == {"wait_s": 120, "status_port": 11501}
+    assert "partial_event_policy" not in one["search_rt"]["coinc"]
+    req = [c["require"] for c in two["c2_criteria"]["trigger_classes"]]
+    assert all("width_median_max_samples" not in r for r in req)
+    assert [r["width_median_max_ms"] for r in req if "width_median_max_ms" in r] == [16.8, 8.4, 33.6]
+    assert all(r["dm_median_max_pc_cc"] >= 3000 for r in req if "dm_median_max_pc_cc" in r)
+    assert opr.recalibration_notes(two["c2_criteria"])
+    assert opr.recalibration_notes(one["c2_criteria"]) == []
 
 
 def test_repo_2x_placeholders_block_a_switch():

@@ -18,13 +18,24 @@ failure refuses the Start with a clear message and nothing is broadcast):
    files the restarted services will read (search_rt, C2 criteria) exist and
    are clean too;
 4. backup of the live ``/cnf/pipeline_rt``, ``/cnf/search_rt``, ``/cnf/opoint``
-   to ``/cnf/opoints/_previous/*``;
-5. one write (an etcd transaction when available) of the two live configs and
-   the ``/cnf/opoint`` record, verified by read-back;
-6. ``systemctl --user restart`` of :data:`OPOINT_RESTART_UNITS`, then a wait
-   until each is active/running with a new, stable MainPID;
-7. on a failure in 5-6: the backup is written back and the units restarted
-   again so they run the previous op-point.
+   to ``/cnf/opoints/_previous/*`` (for a human; a warning is added when
+   dsart_c2 runs without PYTHONHASHSEED);
+5. ``dsart_inject_bot`` stopped (it must not write K while K moves);
+6. one write (an etcd transaction when available) of the two live configs,
+   the ``/cnf/opoint`` record and the injection-K moves (:func:`plan_k_park`:
+   K of the old K family is parked under ``/cnf/opoints/_kpark/<family>/``,
+   the new family's parked K restored; 1x <-> 1x-legacy share K), verified
+   by read-back;
+7. ``systemctl --user restart`` of :data:`OPOINT_RESTART_UNITS` (starts the
+   bot again), then a wait until each is active/running with a new, stable
+   MainPID;
+8. on a failure in 6-7: every touched key is written back to its exact
+   previous value (absent keys deleted) and the units restarted again so
+   they run the previous op-point.
+
+The bot's own K memory (``k_last_good`` / ``k_calibration_dec``) lives in its
+state file, which is per op-point (``inject_bot.state_path`` differs in the 2x
+set), so 1x K cannot leak into 2x through the K doctor either.
 
 The dashboard is the systemd --user unit ``dsa_monitor.service`` (verified
 2026-10-22: parent is ``systemd --user``, environment has XDG_RUNTIME_DIR and
@@ -149,6 +160,15 @@ class SystemdUser:
 
     def restart(self, unit: str, timeout: float = 60.0) -> dict[str, Any]:
         return dict(self.systemctl("restart", unit, timeout=timeout), unit=unit)
+
+    def stop(self, unit: str, timeout: float = 60.0) -> dict[str, Any]:
+        return dict(self.systemctl("stop", unit, timeout=timeout), unit=unit)
+
+    def environment(self, unit: str, timeout: float = 5.0) -> str:
+        """The unit's ``Environment=`` property (all assignments, one line)."""
+        r = self.systemctl("show", "--no-pager", "--property=Environment", unit,
+                           timeout=timeout)
+        return r.get("stdout") or ""
 
     def show(self, unit: str, timeout: float = 5.0) -> dict[str, str]:
         r = self.systemctl(
@@ -306,6 +326,19 @@ def _h23_files_report(op: str, configs_dir: Path) -> tuple[list[str], dict[str, 
         rep = opr.validate_config(cfg, op, kind)
         if not rep.ok:
             problems.append(f"h23 {path}: {rep.summary()}")
+    # K isolation: each K family's inject bot keeps its own state file.
+    if isinstance(parsed.get("search_rt"), Mapping):
+        mine = (parsed["search_rt"].get("inject_bot") or {}).get("state_path")
+        for other in sorted(set(opr.K_FAMILY.values()) - {opr.K_FAMILY[op]}):
+            try:
+                ocfg = opr.load_yaml(opr.config_path("search_rt", other, configs_dir))
+            except (FileNotFoundError, OSError):
+                continue
+            theirs = ((ocfg or {}).get("inject_bot") or {}).get("state_path")
+            if mine is not None and mine == theirs:
+                problems.append(
+                    f"h23 inject_bot.state_path {mine} is shared with op-point {other}: "
+                    "the K doctor would carry K across time resolutions")
     return problems, parsed
 
 
@@ -338,13 +371,52 @@ def opoint_status(store: Any, *, configs_dir: Path = H23_CONFIGS_DIR) -> dict[st
 # ---------------------------------------------------------------------------
 
 
-def _put_all(store: Any, items: list[tuple[str, Any]]) -> str:
-    fn = getattr(store, "put_dicts_atomic", None)
+def _apply(store: Any, puts: list[tuple[str, Any]], deletes: Iterable[str] = ()) -> str:
+    """Atomic when the store supports it (:meth:`ControlStore.apply_atomic`)."""
+    deletes = list(deletes)
+    fn = getattr(store, "apply_atomic", None)
     if callable(fn):
-        return str(fn(items) or "atomic")
-    for k, v in items:
+        return str(fn(puts, deletes) or "atomic")
+    for k, v in puts:
         store.put_dict(k, v)
+    for k in deletes:
+        store.delete(k)
     return "sequential"
+
+
+def plan_k_park(store: Any, from_op: str, to_op: str) -> dict[str, Any]:
+    """etcd operations that move injection K between K families.
+
+    Leaving family F parks the live ``/cnf/inject/snr_calibration/*`` under
+    ``/cnf/opoints/_kpark/F/``; entering family T restores T's parked keys
+    and empties T's park. A switch within one family (1x <-> 1x-legacy) does
+    nothing. Returns ``{puts, deletes, prior, info}``; ``prior`` maps every
+    touched key to its value before the switch (``None`` = absent), which is
+    what an exact rollback writes back.
+    """
+    ff, tf = opr.K_FAMILY[from_op], opr.K_FAMILY[to_op]
+    if ff == tf:
+        return {"puts": [], "deletes": [], "prior": {},
+                "info": {"family": tf, "parked": 0, "restored": 0}}
+    getp = store.get_prefix_dicts
+    live = getp(opr.K_PREFIX)
+    park_from, park_to = opr.k_park_prefix(ff), opr.k_park_prefix(tf)
+    old_park = getp(park_from)
+    to_park = getp(park_to)
+    puts: dict[str, Any] = {}
+    for k, v in live.items():
+        puts[park_from + k[len(opr.K_PREFIX):]] = v
+    for k, v in to_park.items():
+        puts[opr.K_PREFIX + k[len(park_to):]] = v
+    deletes = [k for k in live if k not in puts]                 # live K of the old family
+    deletes += [k for k in old_park if k not in puts]             # stale keys in the old park
+    deletes += list(to_park)                                      # the new family's park, now live
+    prior: dict[str, Any] = {}
+    for k in list(puts) + deletes:
+        prior[k] = live.get(k, old_park.get(k, to_park.get(k)))
+    return {"puts": sorted(puts.items()), "deletes": deletes, "prior": prior,
+            "info": {"from_family": ff, "family": tf, "parked": len(live),
+                     "restored": len(to_park)}}
 
 
 def switch_opoint(
@@ -456,61 +528,81 @@ def switch_opoint(
         _audit("validate", True, {"sha256": {k: v[:16] for k, v in sha_new.items()}},
                "; ".join(warnings))
 
-        # 4. backup
+        if "dsart_c2.service" in units and "PYTHONHASHSEED=" not in sd.environment(
+                "dsart_c2.service"):
+            warnings.append(
+                "dsart_c2 has no PYTHONHASHSEED: hash()-based trigger_class_ids change on "
+                "this restart (install systemd/dsart_c2.service.d/x2-pythonhashseed.conf)")
+
+        # 4. backup (one-deep, for a human; the rollback below uses `prior`)
         prev_active = store.get_dict(opr.ACTIVE_KEY)
-        if prev_active is None:
-            prev_active = {"opoint": opr.DEFAULT_OPOINT, "note": "was unset"}
         if any(live[i] is None for i in opr.INSTANCES):
             return _refuse("backup", "a live config key is empty; refusing to switch "
                                      "without a backup")
         backup = [(opr.backup_key(i), live[i]) for i in opr.INSTANCES]
-        backup.append((opr.backup_key("opoint"), prev_active))
-        _put_all(store, backup)
+        backup.append((opr.backup_key("opoint"),
+                       prev_active if prev_active is not None else {"unset": True}))
+        _apply(store, backup)
         _audit("backup", True, {"to": opr.BACKUP_PREFIX,
                                 "sha256": {i: cdiff.canonical_sha256(live[i])[:16]
                                            for i in opr.INSTANCES}})
-        restore_items = [(opr.LIVE_KEYS[i], live[i]) for i in opr.INSTANCES]
-        restore_items.append((opr.ACTIVE_KEY, prev_active))
 
-        def _rollback(reason: str, *, restart: bool = True) -> dict[str, Any]:
+        # injection K: park the old K family, restore the new one's
+        kp = plan_k_park(store, active.name, target)
+        res["k_park"] = kp["info"]
+
+        # everything the write touches, with its value before the switch
+        prior: dict[str, Any] = {opr.LIVE_KEYS[i]: live[i] for i in opr.INSTANCES}
+        prior[opr.ACTIVE_KEY] = prev_active
+        prior.update(kp["prior"])
+
+        def _rollback(reason: str) -> dict[str, Any]:
             rb: dict[str, Any] = {}
             try:
-                _put_all(store, restore_items)
+                _apply(store, [(k, v) for k, v in prior.items() if v is not None],
+                       [k for k, v in prior.items() if v is None])
                 rb["etcd"] = "restored"
             except Exception as exc:  # noqa: BLE001
                 rb["etcd"] = f"RESTORE FAILED: {exc!r} (backup in {opr.BACKUP_PREFIX})"
-            if restart:
-                pids = {u: _pid(sd, u) for u in units}
-                rb["restart"] = {u: sd.restart(u)["ok"] for u in units}
-                rb["health"] = wait_units_healthy(
-                    sd, units, old_pids=pids, timeout_s=health_timeout_s,
-                    settle_s=settle_s, poll_s=poll_s, clock=clock, sleep=sleep)["ok"]
+            pids = {u: _pid(sd, u) for u in units}
+            rb["restart"] = {u: sd.restart(u)["ok"] for u in units}
+            rb["health"] = wait_units_healthy(
+                sd, units, old_pids=pids, timeout_s=health_timeout_s,
+                settle_s=settle_s, poll_s=poll_s, clock=clock, sleep=sleep)["ok"]
             res["rollback"] = rb
             res["switched"] = False
             return _refuse("rollback", f"{reason}; rolled back to {res['from']} ({rb})", rb)
 
-        # 5. write live keys
+        # 5. the bot must not run while its K moves (K doctor / calibration writes)
+        if "dsart_inject_bot.service" in units:
+            st = sd.stop("dsart_inject_bot.service")
+            if not st["ok"]:
+                return _refuse("stop_bot", f"could not stop dsart_inject_bot: {st['err']}")
+
+        # 6. one atomic write: live configs, /cnf/opoint, K moves
         record = {"opoint": target, "set_utc": _iso_now(), "user": user or "unknown",
                   "host": socket.gethostname(), "previous": active.name,
                   "sha256": sha_new,
                   "set_meta": ({k: meta.get(k) for k in ("pushed_utc", "git_sha", "source", "user")}
                                if isinstance(meta, dict) else None)}
-        items = [(opr.LIVE_KEYS[i], new[i]) for i in opr.INSTANCES]
-        items.append((opr.ACTIVE_KEY, record))
+        puts = [(opr.LIVE_KEYS[i], new[i]) for i in opr.INSTANCES]
+        puts.append((opr.ACTIVE_KEY, record))
+        puts += kp["puts"]
         try:
-            how = _put_all(store, items)
+            how = _apply(store, puts, kp["deletes"])
             back = read_live(store)
             if any(cdiff.canonical_sha256(back[i]) != sha_new[i] for i in opr.INSTANCES):
                 raise RuntimeError("read-back of the live configs differs from the set")
             if opr.parse_active_record(store.get_dict(opr.ACTIVE_KEY)) != target:
                 raise RuntimeError(f"read-back of {opr.ACTIVE_KEY} is not {target}")
         except Exception as exc:  # noqa: BLE001
-            # nothing restarted yet: the services still run the previous op-point
-            return _rollback(f"live write failed: {exc!r}", restart=False)
-        _audit("write", True, {"keys": [k for k, _ in items], "how": how})
+            return _rollback(f"live write failed: {exc!r}")
+        _audit("write", True, {"keys": [k for k, _ in puts if not k.startswith(opr.K_PREFIX)
+                                        and not k.startswith(opr.K_PARK_PREFIX)],
+                               "k_park": kp["info"], "how": how})
         res["switched"] = True
 
-        # 6. restart + health
+        # 7. restart (a stopped bot is started) + health
         pids = {u: _pid(sd, u) for u in units}
         restarts = [sd.restart(u) for u in units]
         failed = [r["unit"] for r in restarts if not r["ok"]]

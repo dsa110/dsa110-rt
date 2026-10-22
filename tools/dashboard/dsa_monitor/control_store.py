@@ -153,30 +153,53 @@ class ControlStore:
         self._ensure()
         return self._store.get_dict(key)
 
-    def put_dicts_atomic(self, items: list[tuple[str, Any]]) -> str:
-        """Write several keys in ONE etcd transaction (x2 op-point switch).
-
-        Same JSON encoding as ``DsaStore.put_dict`` (strict: no NaN/inf).
-        Falls back to sequential puts when the client has no transaction
-        support; returns ``"txn"`` or ``"sequential"``.
-        """
+    def _etcd_client(self) -> Any:
         self._ensure()
-        payloads = [(k, json.dumps(v, allow_nan=False)) for k, v in items]
-        client = None
         try:
-            client = self._store.get_etcd()
+            return self._store.get_etcd()
         except Exception:                                          # noqa: BLE001
-            client = None
+            return None
+
+    def apply_atomic(
+        self,
+        puts: list[tuple[str, Any]],
+        deletes: Iterable[str] = (),
+    ) -> str:
+        """Write and delete several keys in ONE etcd transaction (x2 op-point
+        switch). Same JSON encoding as ``DsaStore.put_dict`` (strict: no
+        NaN/inf). Falls back to sequential operations when the client has
+        no transaction support; returns ``"txn"`` or ``"sequential"``.
+        """
+        deletes = list(deletes)
+        payloads = [(k, json.dumps(v, allow_nan=False)) for k, v in puts]
+        client = self._etcd_client()
         if client is not None and hasattr(client, "transaction") \
                 and hasattr(client, "transactions"):
             ops = [client.transactions.put(k, v) for k, v in payloads]
+            ops += [client.transactions.delete(k) for k in deletes]
             ok, _ = client.transaction(compare=[], success=ops, failure=[])
             if not ok:
                 raise RuntimeError("etcd transaction was not applied")
             return "txn"
-        for k, v in items:
+        for k, v in puts:
             self._store.put_dict(k, v)
+        for k in deletes:
+            self._store.delete(k)
         return "sequential"
+
+    def get_prefix_dicts(self, prefix: str) -> dict[str, Any]:
+        """``{key: parsed JSON}`` for every key under ``prefix`` (small
+        prefixes only: one gRPC response is capped at 4 MB)."""
+        client = self._etcd_client()
+        if client is None:
+            raise RuntimeError("no etcd client")
+        out: dict[str, Any] = {}
+        for value, meta in client.get_prefix(prefix):
+            key = meta.key.decode("utf-8") if isinstance(meta.key, bytes) else str(meta.key)
+            if isinstance(value, (bytes, bytearray)):
+                value = value.decode("utf-8")
+            out[key] = json.loads(value) if isinstance(value, str) else value
+        return out
 
 
 # ---------------------------------------------------------------------------

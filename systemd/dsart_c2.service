@@ -14,6 +14,10 @@ Environment=PYTHONPATH=/home/ubuntu/vikram/dev/dsa110-rt/src
 Environment=PATH=/home/ubuntu/anaconda3/envs/dsart_h23/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=MPLBACKEND=Agg
+# Stable trigger_class_id (= hash(name) & 0xFFFF) across restarts, incl. the
+# x2 op-point switch. Installed copies get it from
+# dsart_c2.service.d/x2-pythonhashseed.conf.
+Environment=PYTHONHASHSEED=0
 # Keep BLAS/OpenMP thread pools small so a coincidencer + 2 plotter
 # workers cannot starve the box. C2 work is light (a few hundred
 # rows/sec at production rate) so single-threaded BLAS is sufficient.

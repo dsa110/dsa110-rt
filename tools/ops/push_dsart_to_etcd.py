@@ -217,16 +217,26 @@ def push_opoint(
             for line in cdiff.format_diff(le):
                 out("  " + line)
 
+    # Every time-unit parameter explicit with this op-point's value
+    # (the code defaults are 2x; opoint_runtime.TIME_UNITS).
+    problems += opr.check_time_units(stamped, opoint)
+    notes: list[str] = []
+    for cfg in stamped.values():
+        notes += opr.recalibration_notes(cfg)
     if not seed_from_live:
         # The C2 criteria file is not stored in etcd (C2 reads it on h23), but
         # it is part of the set: its placeholders gate the push as well.
         try:
             crit_path = opr.config_path("c2_criteria", opoint, config_dir)
-            rep = opr.validate_config(opr.load_yaml(crit_path), opoint, "c2_criteria")
+            crit = opr.load_yaml(crit_path)
+            rep = opr.validate_config(crit, opoint, "c2_criteria")
             problems += rep.problems
             placeholders += rep.placeholders
+            notes += opr.recalibration_notes(crit)
         except FileNotFoundError as exc:
             problems.append(str(exc))
+    for n in notes:
+        out(f"  note (recalibrate at CP2, not blocking): {n}")
 
     out("")
     out(f"validation: {len(problems)} problem(s), {len(placeholders)} placeholder(s)")
