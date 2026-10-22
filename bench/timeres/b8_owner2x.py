@@ -81,6 +81,42 @@ def check_python() -> list:
     return res
 
 
+def _nvrtc_ptx_ctypes(src: str, opts: list) -> str:
+    """Compile CUDA C to PTX with libnvrtc through ctypes (no device, no
+    driver; the CPU-node path of compile-check)."""
+    import ctypes
+    import ctypes.util
+    import glob
+
+    cands = sorted(glob.glob(os.path.join(sys.prefix, "lib", "libnvrtc.so*")))
+    cands = [c for c in cands if "builtins" not in c]
+    path = cands[0] if cands else ctypes.util.find_library("nvrtc")
+    if not path:
+        raise RuntimeError("libnvrtc not found")
+    lib = ctypes.CDLL(path)
+    prog = ctypes.c_void_p()
+    rc = lib.nvrtcCreateProgram(ctypes.byref(prog), src.encode(), b"x2.cu", 0, None, None)
+    if rc != 0:
+        raise RuntimeError(f"nvrtcCreateProgram rc={rc}")
+    try:
+        bo = [o.encode() for o in opts]
+        arr = (ctypes.c_char_p * len(bo))(*bo)
+        rc = lib.nvrtcCompileProgram(prog, len(bo), arr)
+        if rc != 0:
+            n = ctypes.c_size_t()
+            lib.nvrtcGetProgramLogSize(prog, ctypes.byref(n))
+            log = ctypes.create_string_buffer(n.value)
+            lib.nvrtcGetProgramLog(prog, log)
+            raise RuntimeError(f"NVRTC error rc={rc}: {log.value.decode(errors='replace')}")
+        n = ctypes.c_size_t()
+        lib.nvrtcGetPTXSize(prog, ctypes.byref(n))
+        buf = ctypes.create_string_buffer(n.value)
+        lib.nvrtcGetPTX(prog, buf)
+        return buf.value.decode(errors="replace")
+    finally:
+        lib.nvrtcDestroyProgram(ctypes.byref(prog))
+
+
 def check_nvrtc() -> dict:
     try:
         import cupy
@@ -95,10 +131,25 @@ def check_nvrtc() -> dict:
             opts.append("-I" + os.path.join(cuda_path, "include"))
     except Exception:                                            # noqa: BLE001
         pass
+    from dsart.x2.search.k1_staged import CUDA_SOURCE_K1S
+
+    def ptx_of(src: str) -> str:
+        try:
+            ptx = compiler.compile_using_nvrtc(src, options=tuple(opts), arch="compute_75")
+            return ptx if isinstance(ptx, str) else str(ptx)
+        except Exception as e:                                   # noqa: BLE001
+            if "NoDevice" not in repr(e) and "no CUDA-capable" not in repr(e):
+                raise
+        # CPU node: cupy queries the device; libnvrtc itself needs none
+        return _nvrtc_ptx_ctypes(src, list(opts) + ["--gpu-architecture=compute_75"])
+
     try:
-        ptx = compiler.compile_using_nvrtc(CUDA_SOURCE, options=tuple(opts), arch="compute_75")
-        names = [n for n in ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
-                             "k3a_rowc2r_256") if n in (ptx if isinstance(ptx, str) else str(ptx))]
+        names = []
+        for src, want in ((CUDA_SOURCE, ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
+                                         "k3a_rowc2r_256")),
+                          (CUDA_SOURCE_K1S, ("k1_staged",))):
+            txt = ptx_of(src)
+            names += [n for n in want if n in txt]
         return dict(check="cuda_nvrtc", status="ok", arch="compute_75", kernels=names)
     except Exception as e:                                       # noqa: BLE001
         msg = repr(e)
