@@ -6,6 +6,7 @@ import importlib.util
 import sys
 import threading
 import time
+import os
 import uuid
 from pathlib import Path
 
@@ -66,7 +67,7 @@ def _write(r, t0: int, t1: int) -> None:
 def _cfg(r, out, **kw):
     base = dict(shm_name=r.name, out_dir=out, fan_in_min=N_CORR, lag_rows=2,
                 chunk_rows=5, torn_margin_rows=1, poll_s=0.0, duration_s=5,
-                max_disk_frac=1.01)
+                max_disk_frac=1.01, guard_log_glob=None)
     base.update(kw)
     return rr.RecorderConfig(**base)
 
@@ -165,8 +166,9 @@ def test_recorder_is_passive(ring, tmp_path):
     rr.dry_run(ring.name, 0.05)
     assert hashlib.sha256(seg.read_bytes()).hexdigest() == before
     pr = rr.PassiveRing(ring.name)
-    with pytest.raises(ValueError):
-        pr.data[0, 0, 0, 0] = 1                      # PROT_READ mapping
+    assert not hasattr(pr, "data")                   # no mapping of the ring at all
+    with pytest.raises(OSError):
+        os.write(pr.fd, b"x")                        # O_RDONLY fd
     pr.close()
 
 
@@ -227,7 +229,9 @@ def test_replay_into_ring(ring, tmp_path):
                 # (read_slot's overrun test compares slot counts with t; read
                 # the slot passively instead)
                 pr = rr.PassiveRing(name)
-                sl = pr.data[c, 0, (t - a) % T_BUF]
+                sl = np.empty((1, pr.layout.slot_stride), np.uint8)
+                pr.read_rows(c, 0, t - a, sl)
+                sl = sl[0]
                 assert sl[: 2 * N_FILLED].view(np.int8).tolist() == _payload(c, 0, t).tolist()
                 assert sl[2 * N_FILLED + 8:2 * N_FILLED + 10].view("<u2")[0] == recv_ring.VF_DATA_PRESENT
                 assert sl[2 * N_FILLED:2 * N_FILLED + 4].view("<f4")[0] == np.float32(_scale(c, 0, t))
@@ -242,6 +246,67 @@ def test_flush_path_and_cli_dry_run(ring, tmp_path, monkeypatch, capsys):
     out = tmp_path / "rec"
     _record(ring, out, sync_every_mb=1e-4)               # fdatasync + DONTNEED every chunk
     assert rr.Recording(out).t_range(0) == (19, 59)
-    monkeypatch.setattr(rr, "_lower_priority", lambda cpu: None)
+    monkeypatch.setattr(rr, "_lower_priority", lambda: None)
     assert rr.main(["--shm-name", ring.name, "--dry-run", "--dry-run-s", "0.05"]) == 0
     assert '"active_dms"' in capsys.readouterr().out
+    # a real run refuses to start unguarded when no search_compute log exists
+    assert rr.main(["--shm-name", ring.name, "--out-root", str(tmp_path / "x"),
+                    "--guard-log-glob", str(tmp_path / "nolog*.log")]) == 98
+    assert not (tmp_path / "x").exists() or not any((tmp_path / "x").iterdir())
+
+
+def test_read_rows_wraps_ring_end(ring):
+    _write(ring, 0, 70)                                    # rows 64..69 overwrite 0..5
+    pr = rr.PassiveRing(ring.name)
+    out = np.empty((8, pr.layout.slot_stride), np.uint8)
+    pr.read_rows(1, 2, 60, out)
+    pb = 2 * N_FILLED
+    for i, t in enumerate(range(60, 68)):
+        assert out[i, :pb].view(np.int8).tolist() == _payload(1, 2, t).tolist()
+    pr.close()
+
+
+def _log_line(rate):
+    return f"2026-10-22 12:00:00 INFO cube_progress: n=1200 ({rate:.2f} cubes/s last 10 s)\n"
+
+
+def test_log_guard_trips(tmp_path):
+    log = tmp_path / "search_rt-13-search_compute_0.log"
+    log.write_text(_log_line(4.2) * 5)                     # history before start is ignored
+    g = rr.LogGuard(str(tmp_path / "*search_compute_*.log"), min_rate=4.9)
+    g.poll()
+    assert g.reason is None
+    with open(log, "a") as f:
+        f.write(_log_line(5.01) + _log_line(4.5) + _log_line(5.0) + _log_line(4.4))
+    g.poll()
+    assert g.reason is None                                # never two LOW in a row
+    with open(log, "a") as f:
+        f.write(_log_line(4.3))
+    g.poll()
+    assert g.reason and "cube rate 4.30" in g.reason
+    g2 = rr.LogGuard(str(log))
+    with open(log, "a") as f:
+        f.write("WARNING ProductionRxRingSource: lag-recovery seek from boundary 1 -> 2\n")
+    g2.poll()
+    assert "lag-recovery seek" in g2.reason
+    with pytest.raises(FileNotFoundError):
+        rr.LogGuard(str(tmp_path / "none*.log"))
+
+
+def test_recorder_stops_when_guard_trips(ring, tmp_path):
+    log = tmp_path / "search_rt-1-search_compute_1.log"
+    log.write_text("")
+    _write(ring, 0, 30)
+    rec = rr.Recorder(_cfg(ring, tmp_path / "rec", guard_log_glob=str(log), duration_s=30,
+                           poll_s=0.01, stall_s=30))
+    def trip():
+        time.sleep(0.3)
+        with open(log, "a") as f:
+            f.write("WARNING lag-recovery seek from boundary 5 -> 9\n")
+    th = threading.Thread(target=trip)
+    th.start()
+    t0 = time.monotonic()
+    reason = rec.run()
+    th.join()
+    assert reason.startswith("guard: lag-recovery seek") and time.monotonic() - t0 < 5
+    assert rr.Recording(tmp_path / "rec").manifest["stop_reason"] == reason

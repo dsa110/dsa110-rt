@@ -1,11 +1,23 @@
 #!/usr/bin/env python
 """Passive recorder of TODAY's (v3) search-node RX ring, for 1x-compat replay.
 
-STRICTLY PASSIVE. The ring is opened ``O_RDONLY`` and mapped ``PROT_READ``:
-the recorder cannot write a byte of the segment (no reader registration, no
-read_seq / overrun counters, no control words — unlike ``RxRing.read_slot``,
-which bumps overrun counters in the shared header). The writer may lap the
-recorder; every copied row is re-validated against ``write_seq`` after the
+STOP-RULE (2026-10-22 07:25 n13 incident): an earlier version of this tool
+read the ring through a PROT_READ mmap; with numa_balancing=1 every page it
+touched cost a ~2.4 ms minor fault, search_compute_0 fell behind and 41.5 s
+of coarse DM 6 went unsearched. This version NEVER maps the ring: it reads
+with ``os.pread`` / ``os.preadv`` on an ``O_RDONLY`` fd (tmpfs ``read()``
+copies from the page cache: no PTEs, no faults, no NUMA hinting). It never
+pins itself to a core (a nice-19 task pinned to a core looks idle to CFS and
+production threads land on it) — it only lowers its own CPU and I/O
+priority. Whether it may run on a production node is the USER's decision;
+when it does, it must run under ``tools/x2/prod_guard.sh`` and it also
+guards itself (``--guard-log-glob``): it stops at the first
+"lag-recovery seek" or at two consecutive cube_progress rates below
+``--guard-min-rate`` in any search_compute log.
+
+It never writes the segment, never registers as a reader and never touches
+read_seq / overrun counters (unlike ``RxRing.read_slot``). The writer may
+lap it: every copied row is re-validated against ``write_seq`` after the
 copy and marked TORN when the writer could have overwritten it.
 
 What is recorded (per recorded coarse DM ``d``; the node's active DMs are
@@ -14,7 +26,7 @@ detected from the slots' validity flags unless ``--dms`` is given):
 * ``dm<d>.slots``  uint8 ``[T, n_corr, slot_stride]`` — the ring slots
   verbatim (payload ``n_filled * bpc`` B | scale f32 | offset f32 | vf u16 |
   pad), time-major, for consecutive ring sample indices ``t0 .. t0+T-1``.
-* ``dm<d>.rows``   structured ``[T]`` (``ROW_DTYPE``): ``t`` (ring sample
+* ``dm<d>.rows``   structured ``[T]`` (``row_dtype``): ``t`` (ring sample
   index = the wire seq the consumer treats as specnum), ``dm``, ``wall_ns``
   (UTC ns at copy), ``n_written`` / ``n_present`` / ``n_torn`` (fan-in
   counts) and ``corr_flags[n_corr]`` (``F_WRITTEN``: the writer had reached
@@ -23,23 +35,22 @@ detected from the slots' validity flags unless ``--dms`` is given):
   slot's vf bits for valid copies).
 * ``header_start.bin`` / ``header_end.bin`` — the 4096-byte ring header.
 * ``manifest.json`` — node, git sha, ring layout constants, args, ranges,
-  counts, CPU time; written at start and rewritten at the end.
+  counts, CPU time and page-fault counts; rewritten at the end.
 
 The capture front follows the production consumer
 (``ProductionRxRingSource``): per corr ``written = write_seq // n_active``;
 rows are copied up to the ``fan_in_min``-th fastest corr minus
 ``--lag-rows`` (so stragglers have landed), starting at the live edge.
 
-Safety: run under ``nice -n 19 ionice -c3 taskset -c <core>`` (the script
-also lowers its own priority and pins itself); memory is bounded by
-``--chunk-rows``; it stops at ``--duration-s``, ``--max-gib`` written, the
-``--max-disk-frac`` filesystem use, or ``--stall-s`` without writer progress.
-``--dry-run`` attaches, samples for ``--dry-run-s`` (10 s) and prints rates
-without writing anything.
+Bounds: memory = two chunk buffers (``--chunk-rows``); disk stops at
+``--max-gib`` written or ``--max-disk-frac`` filesystem use; written pages
+are fdatasync'ed and dropped from the page cache every ``--sync-every-mb``;
+it stops at ``--duration-s`` or after ``--stall-s`` without writer progress.
+``--dry-run`` reads only the header for ``--dry-run-s`` and prints rates.
 
-Reading back: :class:`Recording` (``slots``, ``iter_cubes`` — the per-cube
-compact payload/scale/validity that ``rx_ring_assemble_compact_block`` would
-have produced — and ``replay_into_ring``).
+Reading back (offline): :class:`Recording` (``slots``, ``iter_cubes`` — what
+``rx_ring_assemble_compact_block`` would have produced — and
+``replay_into_ring``).
 """
 from __future__ import annotations
 
@@ -52,16 +63,18 @@ for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 
 import argparse  # noqa: E402
 import datetime as _dt  # noqa: E402
+import glob  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
-import mmap  # noqa: E402
+import re  # noqa: E402
 import resource  # noqa: E402
 import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
-from dataclasses import dataclass, field  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Callable, Iterator, Optional  # noqa: E402
 
@@ -91,6 +104,7 @@ F_VF_MISMATCH = 1 << 3
 F_VF_OVERRUN = 1 << 4
 
 RECORDING_FORMAT = "dsart-x2-rxrec-v1"
+GUARD_LOG_GLOB = "/tmp/dsart-rt-children/*search_compute_*.log"
 
 
 def row_dtype(n_corr: int) -> np.dtype:
@@ -130,69 +144,162 @@ def _shm_path(name: str) -> str:
     return "/dev/shm/" + name.lstrip("/")
 
 
+def _preadv_into(fd: int, buf: np.ndarray, offset: int) -> None:
+    """Fill the C-contiguous uint8 array ``buf`` from ``offset`` (no mmap)."""
+    mv = memoryview(buf).cast("B")
+    got = 0
+    while got < len(mv):
+        n = os.preadv(fd, [mv[got:]], offset + got)
+        if n <= 0:
+            raise OSError(f"short pread at offset {offset + got}")
+        got += n
+
+
 class PassiveRing:
-    """Read-only (O_RDONLY + PROT_READ) view of a v3 ring segment."""
+    """Read-only access to a v3 ring segment through ``pread`` (NO mmap).
+
+    The fd is ``O_RDONLY``: nothing here can modify the segment."""
 
     def __init__(self, shm_name: str) -> None:
         self.shm_name = shm_name
-        fd = os.open(_shm_path(shm_name), os.O_RDONLY)
+        self.fd = os.open(_shm_path(shm_name), os.O_RDONLY)
         try:
-            size = os.fstat(fd).st_size
-            self._mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED,
-                                 prot=mmap.PROT_READ)
-        finally:
-            os.close(fd)
-        buf = np.frombuffer(self._mm, dtype=np.uint8)
-        hdr32 = np.frombuffer(self._mm, dtype="<u4", count=8, offset=0)
-        if int(hdr32[0]) != RING_MAGIC:
-            raise RuntimeError(f"{shm_name}: bad magic 0x{int(hdr32[0]):08x}")
-        if int(hdr32[1]) != RING_VERSION:
-            raise RuntimeError(f"{shm_name}: ring version {int(hdr32[1])} != {RING_VERSION}")
-        stride = int(np.frombuffer(self._mm, "<u8", 1, OFF_SLOT_STRIDE)[0])
-        doff = int(np.frombuffer(self._mm, "<u8", 1, OFF_DATA_OFFSET)[0])
-        self.layout = RingLayout(
-            n_corr=int(hdr32[2]), n_coarse_dm=int(hdr32[3]), t_buf=int(hdr32[4]),
-            n_filled=int(hdr32[5]), bytes_per_cell=int(hdr32[6]),
-            slot_stride=stride, data_offset=doff, shm_size=size)
-        L = self.layout
-        need = doff + L.n_corr * L.n_coarse_dm * L.t_buf * stride
-        if not (1 <= L.n_corr <= MAX_CORR) or need > size:
-            raise RuntimeError(f"{shm_name}: inconsistent header {L}")
-        self.data = buf[doff:need].reshape(L.n_corr, L.n_coarse_dm, L.t_buf, stride)
-        self._wseq = np.frombuffer(self._mm, "<u8", L.n_corr, OFF_WRITE_SEQ)
+            size = os.fstat(self.fd).st_size
+            hdr = os.pread(self.fd, HEADER_SIZE, 0)
+            h32 = np.frombuffer(hdr, "<u4", 8)
+            if int(h32[0]) != RING_MAGIC:
+                raise RuntimeError(f"{shm_name}: bad magic 0x{int(h32[0]):08x}")
+            if int(h32[1]) != RING_VERSION:
+                raise RuntimeError(f"{shm_name}: ring version {int(h32[1])} != {RING_VERSION}")
+            stride = int(np.frombuffer(hdr, "<u8", 1, OFF_SLOT_STRIDE)[0])
+            doff = int(np.frombuffer(hdr, "<u8", 1, OFF_DATA_OFFSET)[0])
+            self.layout = RingLayout(
+                n_corr=int(h32[2]), n_coarse_dm=int(h32[3]), t_buf=int(h32[4]),
+                n_filled=int(h32[5]), bytes_per_cell=int(h32[6]),
+                slot_stride=stride, data_offset=doff, shm_size=size)
+            L = self.layout
+            need = doff + L.n_corr * L.n_coarse_dm * L.t_buf * stride
+            if not (1 <= L.n_corr <= MAX_CORR) or need > size or stride < L.vf_offset + 2:
+                raise RuntimeError(f"{shm_name}: inconsistent header {L}")
+            self._wseq_buf = np.empty(L.n_corr, dtype="<u8")
+        except Exception:
+            os.close(self.fd)
+            raise
 
     def write_seq(self) -> np.ndarray:
-        """Snapshot of write_seq_per_corr (aligned 8-byte loads)."""
-        return self._wseq.copy()
+        """write_seq_per_corr (one small pread; aligned 8-byte fields)."""
+        _preadv_into(self.fd, self._wseq_buf.view(np.uint8), OFF_WRITE_SEQ)
+        return self._wseq_buf.copy()
 
     def header_bytes(self) -> bytes:
-        return bytes(self._mm[:HEADER_SIZE])
+        return os.pread(self.fd, HEADER_SIZE, 0)
 
-    def vf(self, corr: int, dm: int) -> np.ndarray:
-        """vf u16 of every slot of (corr, dm) (copy)."""
-        off = self.layout.vf_offset
-        col = self.data[corr, dm, :, off:off + 2]
-        return np.ascontiguousarray(col).view("<u2").reshape(-1)
+    def read_rows(self, corr: int, dm: int, t0: int, out: np.ndarray) -> None:
+        """Slots of rows ``t0 .. t0+n`` of one (corr, dm) into ``out`` (uint8
+        ``[n, slot_stride]``, C-contiguous): one pread per contiguous run (two
+        when the run wraps the ring end)."""
+        L = self.layout
+        n = out.shape[0]
+        i0 = t0 % L.t_buf
+        base = L.data_offset + (corr * L.n_coarse_dm + dm) * L.t_buf * L.slot_stride
+        n1 = min(n, L.t_buf - i0)
+        _preadv_into(self.fd, out[:n1], base + i0 * L.slot_stride)
+        if n1 < n:
+            _preadv_into(self.fd, out[n1:], base)
 
     def close(self) -> None:
-        self.data = None
-        self._wseq = None
-        try:
-            self._mm.close()
-        except BufferError:
-            pass
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
 
 
-def detect_active_dms(ring: PassiveRing, n_probe_corr: int = 8) -> list[int]:
-    """Coarse DMs whose slots ever carried data (vf != 0) on probed corrs."""
+def detect_active_dms(ring: PassiveRing, n_probe_corr: int = 4, n_rows: int = 64) -> list[int]:
+    """Coarse DMs whose slots carried data (vf != 0) in ring rows [0, n_rows)
+    of the first ``n_probe_corr`` corrs (~10 MB of preads)."""
     L = ring.layout
+    buf = np.empty((min(n_rows, L.t_buf), L.slot_stride), np.uint8)
     active = []
     for d in range(L.n_coarse_dm):
         for c in range(min(L.n_corr, n_probe_corr)):
-            if ring.vf(c, d).any():
+            ring.read_rows(c, d, 0, buf)
+            if buf[:, L.vf_offset:L.vf_offset + 2].any():
                 active.append(d)
                 break
     return active
+
+
+# ---------------------------------------------------------------------------
+# Self-guard (mirror of tools/x2/prod_guard.sh)
+# ---------------------------------------------------------------------------
+
+_RATE_RE = re.compile(r"\(([0-9.]+) cubes/s last")
+
+
+class LogGuard:
+    """Tail the node's search_compute logs from their current end; trip on a
+    'lag-recovery seek' or two consecutive cube_progress rates < min_rate."""
+
+    def __init__(self, pattern: str, min_rate: float = 4.9, poll_s: float = 0.5) -> None:
+        self.paths = sorted(glob.glob(pattern))
+        if not self.paths:
+            raise FileNotFoundError(f"no logs match {pattern}: refusing to run unguarded")
+        self.min_rate = float(min_rate)
+        self.poll_s = poll_s
+        self.reason: Optional[str] = None
+        self._low = {p: 0 for p in self.paths}
+        self._pos = {p: os.path.getsize(p) for p in self.paths}
+        self._partial = {p: "" for p in self.paths}
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._run, name="rx_recorder-guard", daemon=True)
+
+    def start(self) -> "LogGuard":
+        self._th.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._th.join(timeout=2)
+
+    def check_line(self, path: str, line: str) -> None:
+        if "lag-recovery seek" in line:
+            self.reason = f"lag-recovery seek in {os.path.basename(path)}: {line[:160]}"
+            return
+        m = _RATE_RE.search(line)
+        if m:
+            if float(m.group(1)) < self.min_rate:
+                self._low[path] += 1
+                if self._low[path] >= 2:
+                    self.reason = (f"cube rate {m.group(1)} < {self.min_rate} twice in "
+                                   f"{os.path.basename(path)}")
+            else:
+                self._low[path] = 0
+
+    def poll(self) -> None:
+        for p in self.paths:
+            try:
+                size = os.path.getsize(p)
+                if size < self._pos[p]:          # rotated / truncated
+                    self._pos[p] = 0
+                if size == self._pos[p]:
+                    continue
+                with open(p, "r", errors="replace") as f:
+                    f.seek(self._pos[p])
+                    chunk = f.read(size - self._pos[p])
+                self._pos[p] = size
+            except OSError:
+                continue
+            text = self._partial[p] + chunk
+            lines = text.split("\n")
+            self._partial[p] = lines.pop()
+            for ln in lines:
+                self.check_line(p, ln)
+                if self.reason:
+                    return
+
+    def _run(self) -> None:
+        while not self._stop.is_set() and self.reason is None:
+            self.poll()
+            self._stop.wait(self.poll_s)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +323,8 @@ class RecorderConfig:
     stall_s: float = 10.0
     torn_margin_rows: int = 64
     sync_every_mb: float = 256.0
+    guard_log_glob: Optional[str] = GUARD_LOG_GLOB    # None = no self-guard (synthetic rings)
+    guard_min_rate: float = 4.9
     label: str = ""
     git_sha: str = ""
 
@@ -233,10 +342,13 @@ class _DmSink:
 
 
 class Recorder:
-    """Step-wise passive recorder (``poll_once``) plus a ``run`` loop."""
+    """Step-wise passive recorder (``poll_once``) plus a guarded ``run`` loop."""
 
     def __init__(self, cfg: RecorderConfig, ring: Optional[PassiveRing] = None) -> None:
         self.cfg = cfg
+        self.guard: Optional[LogGuard] = None
+        if cfg.guard_log_glob:
+            self.guard = LogGuard(cfg.guard_log_glob, cfg.guard_min_rate)   # raises if no logs
         self.ring = ring if ring is not None else PassiveRing(cfg.shm_name)
         L = self.ring.layout
         self.dms = list(cfg.dms) if cfg.dms is not None else detect_active_dms(self.ring)
@@ -249,10 +361,14 @@ class Recorder:
         self.fan_in_min = max(1, min(int(cfg.fan_in_min), L.n_corr))
         self.rdt = row_dtype(L.n_corr)
         self.sinks = {d: _DmSink(d) for d in self.dms}
+        cr = int(cfg.chunk_rows)
+        self._buf_cm = np.empty((L.n_corr, cr, L.slot_stride), np.uint8)   # corr-major reads
+        self._buf_tm = np.empty((cr, L.n_corr, L.slot_stride), np.uint8)   # time-major file rows
         self.bytes_written = 0
         self._synced_bytes = 0
         self.stop_reason: Optional[str] = None
         self.t_start_unix = time.time()
+        self._ru0 = resource.getrusage(resource.RUSAGE_SELF)
         self._last_progress = time.monotonic()
         self._last_wseq = self.ring.write_seq()
         self._after_copy_hook: Optional[Callable[[], None]] = None   # tests
@@ -272,9 +388,7 @@ class Recorder:
 
     def front(self, wseq: np.ndarray) -> int:
         pos = np.sort(self.positions(wseq))
-        n = pos.size
-        ready = pos[n - self.fan_in_min]
-        return int(ready) - int(self.cfg.lag_rows)
+        return int(pos[pos.size - self.fan_in_min]) - int(self.cfg.lag_rows)
 
     def _disk_ok(self, nbytes: int) -> bool:
         cfg = self.cfg
@@ -291,15 +405,18 @@ class Recorder:
         return True
 
     def _copy_chunk(self, d: int, t0: int, n: int) -> tuple[np.ndarray, np.ndarray]:
-        """Copy rows [t0, t0+n) of dm d for every corr; return (slots, rows)."""
+        """Copy rows [t0, t0+n) of dm d for every corr (pread, one run per
+        corr); return (time-major slots view, rows)."""
         ring, L = self.ring, self.ring.layout
         wseq_before = ring.write_seq()
-        idx = (np.arange(t0, t0 + n) % L.t_buf)
-        slots = np.ascontiguousarray(ring.data[:, d, idx, :].transpose(1, 0, 2))
+        for c in range(L.n_corr):
+            ring.read_rows(c, d, t0, self._buf_cm[c, :n])
         wall = time.time_ns()
         if self._after_copy_hook is not None:
             self._after_copy_hook()
         wseq_after = ring.write_seq()
+        slots = self._buf_tm[:n]
+        slots[...] = self._buf_cm[:, :n].transpose(1, 0, 2)
         pos_b = self.positions(wseq_before)
         pos_a = self.positions(wseq_after)
         t = np.arange(t0, t0 + n, dtype=np.int64)
@@ -308,13 +425,11 @@ class Recorder:
         # for per-DM interleave and the integer position estimate.
         torn = (pos_a[None, :] + self.cfg.torn_margin_rows) >= (t[:, None] + L.t_buf)
         vf = slots[:, :, L.vf_offset:L.vf_offset + 2].copy().view("<u2")[..., 0]
-        flags = np.zeros((n, L.n_corr), dtype=np.uint8)
-        flags |= np.where(written, F_WRITTEN, 0).astype(np.uint8)
-        flags |= np.where(torn, F_TORN, 0).astype(np.uint8)
         good = written & ~torn
-        flags |= np.where(good & ((vf & VF_DATA_PRESENT) != 0), F_VF_PRESENT, 0).astype(np.uint8)
-        flags |= np.where(good & ((vf & VF_PATTERN_MISMATCH) != 0), F_VF_MISMATCH, 0).astype(np.uint8)
-        flags |= np.where(good & ((vf & VF_RX_OVERRUN) != 0), F_VF_OVERRUN, 0).astype(np.uint8)
+        flags = (np.where(written, F_WRITTEN, 0) | np.where(torn, F_TORN, 0)
+                 | np.where(good & ((vf & VF_DATA_PRESENT) != 0), F_VF_PRESENT, 0)
+                 | np.where(good & ((vf & VF_PATTERN_MISMATCH) != 0), F_VF_MISMATCH, 0)
+                 | np.where(good & ((vf & VF_RX_OVERRUN) != 0), F_VF_OVERRUN, 0)).astype(np.uint8)
         rows = np.zeros(n, dtype=self.rdt)
         rows["t"] = t
         rows["dm"] = d
@@ -327,8 +442,7 @@ class Recorder:
 
     def _maybe_flush(self, force: bool = False) -> None:
         """Bound dirty / cached pages: every ``sync_every_mb`` written,
-        fdatasync and drop the written pages from the page cache, so a long
-        recording never bloats node memory (the node keeps ~40 GiB of shm)."""
+        fdatasync and drop the written pages from the page cache."""
         mb = self.cfg.sync_every_mb
         if mb <= 0 or self.cfg.out_dir is None:
             return
@@ -361,6 +475,9 @@ class Recorder:
                 s.t_next = front                      # start at the live edge
                 s.t0 = front
             while s.t_next < front and self.stop_reason is None:
+                if self.guard is not None and self.guard.reason:
+                    self.stop_reason = "guard: " + self.guard.reason
+                    break
                 n = min(self.cfg.chunk_rows, front - s.t_next)
                 slots, rows = self._copy_chunk(d, s.t_next, n)
                 if self.cfg.out_dir is not None:
@@ -372,38 +489,55 @@ class Recorder:
                     self._maybe_flush()
                 s.n_rows += n
                 s.n_torn_rows += int((rows["n_torn"] > 0).sum())
-                s.n_unwritten_slots += int((rows["corr_flags"] & F_WRITTEN == 0).sum())
+                s.n_unwritten_slots += int(((rows["corr_flags"] & F_WRITTEN) == 0).sum())
                 s.t_next += n
                 total += n
         return total
 
     def run(self) -> str:
         cfg = self.cfg
-        t_end = time.monotonic() + cfg.duration_s
-        while self.stop_reason is None:
-            now = time.monotonic()
-            if now >= t_end:
-                self.stop_reason = "duration"
-                break
-            if now - self._last_progress > cfg.stall_s:
-                self.stop_reason = f"writer stalled > {cfg.stall_s} s"
-                break
-            self.poll_once()
-            time.sleep(cfg.poll_s)
-        self.close()
+        if self.guard is not None:
+            self.guard.start()
+        try:
+            t_end = time.monotonic() + cfg.duration_s
+            while self.stop_reason is None:
+                now = time.monotonic()
+                if self.guard is not None and self.guard.reason:
+                    self.stop_reason = "guard: " + self.guard.reason
+                    break
+                if now >= t_end:
+                    self.stop_reason = "duration"
+                    break
+                if now - self._last_progress > cfg.stall_s:
+                    self.stop_reason = f"writer stalled > {cfg.stall_s} s"
+                    break
+                self.poll_once()
+                time.sleep(cfg.poll_s)
+        finally:
+            if self.guard is not None:
+                self.guard.stop()
+            self.close()
         return self.stop_reason
 
     # -- bookkeeping -----------------------------------------------------------
 
-    def manifest(self, final: bool) -> dict:
+    def usage(self) -> dict:
         ru = resource.getrusage(resource.RUSAGE_SELF)
-        cpu = ru.ru_utime + ru.ru_stime
+        r0 = self._ru0
         wall = max(1e-9, time.time() - self.t_start_unix)
+        cpu = (ru.ru_utime - r0.ru_utime) + (ru.ru_stime - r0.ru_stime)
+        return {"wall_s": wall, "cpu_s": cpu, "cpu_frac": cpu / wall,
+                "user_s": ru.ru_utime - r0.ru_utime, "sys_s": ru.ru_stime - r0.ru_stime,
+                "minflt": ru.ru_minflt - r0.ru_minflt, "majflt": ru.ru_majflt - r0.ru_majflt,
+                "maxrss_kib": ru.ru_maxrss}
+
+    def manifest(self, final: bool) -> dict:
         return {
             "format": RECORDING_FORMAT,
             "final": final,
             "node": socket.gethostname(),
             "shm_name": self.cfg.shm_name,
+            "access": "pread on an O_RDONLY fd (no mmap)",
             "label": self.cfg.label,
             "git_sha": self.cfg.git_sha or _git_sha(),
             "recorder_sha256": _file_sha256(Path(__file__)),
@@ -422,9 +556,9 @@ class Recorder:
                        for d, s in self.sinks.items()},
             "bytes_written": self.bytes_written,
             "stop_reason": self.stop_reason,
-            "cpu_s": cpu,
-            "cpu_frac": cpu / wall,
-            "maxrss_kib": ru.ru_maxrss,
+            "guard": None if self.guard is None else {"logs": self.guard.paths,
+                                                      "min_rate": self.guard.min_rate},
+            "usage": self.usage(),
             "config": {k: (str(v) if isinstance(v, Path) else v)
                        for k, v in self.cfg.__dict__.items()},
         }
@@ -438,7 +572,7 @@ class Recorder:
         tmp.replace(p)
 
     def close(self) -> None:
-        if self.cfg.out_dir is not None:
+        if self.cfg.out_dir is not None and not getattr(self, "_closed", False):
             self._maybe_flush(force=True)
             for s in self.sinks.values():
                 for f in (s.slots_f, s.rows_f):
@@ -446,11 +580,13 @@ class Recorder:
                         f.close()
             (self.cfg.out_dir / "header_end.bin").write_bytes(self.ring.header_bytes())
             self.write_manifest(final=True)
+        self._closed = True
 
 
 def dry_run(shm_name: str, seconds: float = 10.0, n_active: Optional[int] = None,
             dms: Optional[list[int]] = None) -> dict:
-    """Attach, sample write_seq for ``seconds``, report rates. Writes nothing."""
+    """Read write_seq twice ``seconds`` apart (two small preads) + the active-DM
+    probe; report rates. Writes nothing anywhere."""
     ring = PassiveRing(shm_name)
     try:
         L = ring.layout
@@ -478,12 +614,13 @@ def dry_run(shm_name: str, seconds: float = 10.0, n_active: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
-# Reading back
+# Reading back (offline)
 # ---------------------------------------------------------------------------
 
 
 class Recording:
-    """Read a recording directory (memory-mapped)."""
+    """Read a recording directory (offline; memory-maps the RECORDING files,
+    never a ring)."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -618,6 +755,8 @@ class Recording:
         return n
 
 
+
+
 # ---------------------------------------------------------------------------
 # Helpers + CLI
 # ---------------------------------------------------------------------------
@@ -639,7 +778,8 @@ def _git_sha() -> str:
         return ""
 
 
-def _lower_priority(cpu: Optional[int]) -> None:
+def _lower_priority() -> None:
+    """nice 19 + idle I/O class. Deliberately NO CPU pinning."""
     try:
         os.nice(19 - os.nice(0))
     except OSError:
@@ -647,12 +787,6 @@ def _lower_priority(cpu: Optional[int]) -> None:
     if shutil.which("ionice"):
         subprocess.run(["ionice", "-c3", "-p", str(os.getpid())],
                        capture_output=True, check=False)
-    try:
-        ncpu = os.cpu_count() or 1
-        # default: the second-to-last core (the x2 CPU-test harness uses the last)
-        os.sched_setaffinity(0, {max(0, ncpu - 2) if cpu is None else int(cpu)})
-    except (AttributeError, OSError):
-        pass
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -674,34 +808,46 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--max-gib", type=float, default=40.0)
     p.add_argument("--max-disk-frac", type=float, default=0.80)
     p.add_argument("--stall-s", type=float, default=10.0)
-    p.add_argument("--cpu", type=int, default=None,
-                   help="core to pin (default: second-to-last)")
     p.add_argument("--sync-every-mb", type=float, default=256.0,
                    help="fdatasync + drop written pages from the cache every N MB")
+    p.add_argument("--guard-log-glob", default=GUARD_LOG_GLOB,
+                   help="search_compute logs to watch; the recorder stops on a lag-recovery "
+                        "seek or two low cube rates (refuses to start if none match)")
+    p.add_argument("--guard-min-rate", type=float, default=4.9)
+    p.add_argument("--no-guard", action="store_true",
+                   help="disable the self-guard (synthetic rings / non-production hosts only)")
     p.add_argument("--git-sha", default="")
+    p.add_argument("--no-write", action="store_true",
+                   help="read and validate rows but write nothing (benchmarks)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--dry-run-s", type=float, default=10.0)
     a = p.parse_args(argv)
-    _lower_priority(a.cpu)
+    _lower_priority()
     if a.dry_run:
         print(json.dumps(dry_run(a.shm_name, a.dry_run_s, a.n_active_dms, a.dms), indent=1))
         return 0
     utc = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out = a.out_root / (utc + (f"_{a.label}" if a.label else ""))
-    a.out_root.mkdir(parents=True, exist_ok=True)
-    rec = Recorder(RecorderConfig(
-        shm_name=a.shm_name, out_dir=out, duration_s=a.duration_s, dms=a.dms,
-        n_active=a.n_active_dms, fan_in_min=a.fan_in_min, lag_rows=a.lag_rows,
-        chunk_rows=a.chunk_rows, poll_s=a.poll_s, max_gib=a.max_gib,
-        max_disk_frac=a.max_disk_frac, stall_s=a.stall_s, label=a.label,
-        sync_every_mb=a.sync_every_mb,
-        git_sha=a.git_sha))
+    out = None if a.no_write else a.out_root / (utc + (f"_{a.label}" if a.label else ""))
+    if out is not None:
+        a.out_root.mkdir(parents=True, exist_ok=True)
+    try:
+        rec = Recorder(RecorderConfig(
+            shm_name=a.shm_name, out_dir=out, duration_s=a.duration_s, dms=a.dms,
+            n_active=a.n_active_dms, fan_in_min=a.fan_in_min, lag_rows=a.lag_rows,
+            chunk_rows=a.chunk_rows, poll_s=a.poll_s, max_gib=a.max_gib,
+            max_disk_frac=a.max_disk_frac, stall_s=a.stall_s, label=a.label,
+            sync_every_mb=a.sync_every_mb,
+            guard_log_glob=None if a.no_guard else a.guard_log_glob,
+            guard_min_rate=a.guard_min_rate, git_sha=a.git_sha))
+    except FileNotFoundError as exc:
+        print(f"rx_recorder: {exc}", file=sys.stderr)
+        return 98
     reason = rec.run()
     m = rec.manifest(final=True)
     print(json.dumps({"out": str(out), "stop_reason": reason,
-                      "bytes_written": m["bytes_written"], "cpu_frac": m["cpu_frac"],
+                      "bytes_written": m["bytes_written"], "usage": m["usage"],
                       "per_dm": m["per_dm"]}, indent=1))
-    return 0
+    return 99 if reason and reason.startswith("guard:") else 0
 
 
 if __name__ == "__main__":
