@@ -24,14 +24,15 @@ Per owned DM, per cycle (201.326592 ms, aligned to absolute native sample
    -> :class:`Candidate2x` in external-clock units with global fine-DM
    indices; optional C1 cross-kernel merge across the half's DMs.
 
-Amplitude regime (plan "Today's amplitude regime"): input clip 250 sigma
-on the Layer-1-normalised input, Layer-2 floor 0.5 in S/N units,
-``layer1_floor`` in IMAGE units. In 2x the image scale defaults to
-``1 / expected_image_sigma`` (unit-variance decoded values), so the image
-is ~1 sigma and ``layer1_floor`` = 0.25 reproduces today's floor/steady
-ratio (5e-3 / 2e-2); Phase 0 confirms both numbers. In 1x-compat the
-image scale is today's uv prescale (1/256) and the floor today's
-``5e-3 * prescale``.
+Amplitude regime (Phase 0 study 2, option B): the image scale defaults to
+``1 / expected_image_sigma`` = ``N^2 / sqrt(sum n V)`` on top of irfft2's
+1/N^2, so the raw image is in sigma (1.00); Layer-1 floor 0.078 in those
+image units (today's 5e-3/256 relative to the live sigma); Layer-2 floor
+0.5 in post-Layer-1 units for boxcars, ``0.5 * seed / sqrt(w)`` per filter
+otherwise, NEVER rescaled with image units; input clip 250; fp32
+accumulation; the 2x wire is linear to the clip (no emulation of today's
+compression, ledger S3). In 1x-compat the image scale is today's uv
+prescale (1/256) and the floors today's ``5e-3 / 256`` and 0.5.
 
 Backends: ``"cpu"`` runs the numpy twins (bit-exact with the kernels
 where the kernels are exact: K0, K1, K3b); ``"gpu"`` dispatches to
@@ -66,18 +67,18 @@ _LOG = logging.getLogger(__name__)
 class EngineConfig:
     n_grid: int = 256
     widths: tuple = (1, 2, 4, 8, 16, 32, 64)
-    families: tuple = ("b",)
+    families: tuple = ("b3x",)            # Phase 0 bank; ("b",) = today's boxcars
     clip_sigma: float = 250.0
     chunk: int = 64
     delay: Optional[int] = None
     image_scale: Optional[float] = None
     edge_kernel_support: int = 1
     layer1_mode: str = "same_cycle"
-    layer1_floor: float = 0.25
+    layer1_floor: float = 0.078           # image units (Phase 0 study 2, option B)
     layer1_max_samples: int = 10000
     layer1_n_burnin: int = 1
     layer1_seed: int = 0
-    layer2_floor: float = 0.5
+    layer2_floor: Optional[float] = None  # None: per filter 0.5 * seed / sqrt(w)
     layer2_max_ratio: float = 4.0
     layer2_escape: int = 64
     layer2_valid_min_fraction: float = 0.9
@@ -107,7 +108,7 @@ class EngineConfig:
     def compat_1x(cls, **kw) -> "EngineConfig":
         """Today's search at today's parameters (``configs/dsart_search_rt.yaml``)."""
         base = dict(widths=(1, 2, 4, 8, 16, 32, 64), families=("b",), delay=32,
-                    image_scale=1.0 / 256.0, layer1_floor=5e-3 / 256.0,
+                    image_scale=1.0 / 256.0, layer1_floor=5e-3 / 256.0, layer2_floor=0.5,
                     layer1_mode="lagged", layer2_cadence_s=0.134217728,
                     dm_index_mode="local", threshold=9.55)
         base.update(kw)
@@ -169,6 +170,9 @@ class DmState:
         if inputs.csr.n_stream != spec.n_stream:
             raise ValueError(f"DM {spec.d}: CSR has {inputs.csr.n_stream} streams, "
                              f"plan {spec.n_stream}")
+        if float(inputs.offset) != 0.0:
+            raise ValueError(f"DM {spec.d}: mid-rise decode is not supported -- flagged / "
+                             "zero-filled rows must decode to 0 (SPEC §4, Phase 0 study 1)")
         self.fft = FftPlan.build(inputs.csr)
         self.delay = bank.max_d if cfg.delay is None else int(cfg.delay)
         self.history = bank.history(self.delay)
@@ -199,7 +203,9 @@ class DmState:
         self.layer2 = Layer2State(
             n_kernels=len(bank), cube_cadence_s=float(cad), tau_s=cfg.layer2_tau_s,
             n_burnin=cfg.layer2_n_burnin, n_kernel_max_t=1,
-            sigma_floor=cfg.layer2_floor, sigma_max_ratio=cfg.layer2_max_ratio,
+            sigma_floor=(bank.layer2_floors if cfg.layer2_floor is None
+                         else float(cfg.layer2_floor)),
+            sigma_max_ratio=cfg.layer2_max_ratio,
             clamp_escape_cubes=cfg.layer2_escape,
         )
         self.layer2._s_k.copy_(torch.as_tensor(bank.seeds, dtype=self.layer2._s_k.dtype))

@@ -119,6 +119,23 @@ def test_engine_bsplines_match_reference():
     _check_vs_ref(eng, sky, cells, res)
 
 
+def test_engine_b3x_bank_matches_reference():
+    """Phase 0 b3x bank (box1, box2, [1,2,1], B3 4..64): 148 history rows,
+    per-filter Layer-2 seeds and floors."""
+    bursts = [Burst(d=1, f=1, t=192 + 120, l=14, m=18, amp=0.35, width=12)]
+    plan, ring, sky, eng, cells = _setup_2x(bursts, families=("b3x",), t_a=32, only=(1,))
+    st = eng.states[1]
+    assert st.history == 148 and st.delay == 74
+    assert eng.bank.kernel_ids() == ["b1", "b2", "t2", "g4", "g8", "g16", "g32", "g64"]
+    floors = st.layer2._sigma_floor_vec.numpy()
+    assert np.allclose(floors[:2], 0.5) and np.isclose(floors[2], 0.5 * np.sqrt(6) / np.sqrt(2))
+    _fill(plan, ring, sky, 1)
+    res = eng.process_cycle(1, keep_maps=True)
+    _check_vs_ref(eng, sky, cells, res)
+    best = [c for c in res.per_dm[1].candidates if (c.l, c.m) == (14, 18)]
+    assert best and best[0].filt.startswith("g")
+
+
 def test_engine_cycles_are_contiguous_and_stateful():
     plan, ring, sky, eng, cells = _setup_2x([], t_a=32, only=(0,))
     _fill(plan, ring, sky, 3)
@@ -242,7 +259,10 @@ def test_engine_1x_compat_matches_production_chain():
     # K3b compat: chunk maxima of production's (fp16) max cube vs the engine's
     pm = prod.max_snr.astype(np.float32).reshape(3, 64, *prod.max_snr.shape[1:]).max(axis=1)
     pm = pm.reshape(res.best.shape)
-    tol = 0.02 + 2e-3 * np.abs(pm)
+    # production holds the cumsum in fp16 (an absolute error up to ~ulp of
+    # the running sum, 0.016 at |cumsum| ~ 16-32) and stores the max in fp16:
+    # the CPU gate is 0.03 + 3e-3 |S/N| (the GPU gate vs real taps is CP1's)
+    tol = 0.03 + 3e-3 * np.abs(pm)
     assert np.all(np.abs(res.best - pm) <= tol), np.max(np.abs(res.best - pm) - tol)
     # every production candidate is found by the engine (same cell, |dS/N| <= 0.05)
     cmp = compare_candidates(prod.raw_candidates, res.candidates, dt=0, ddm=0, dlm=0, dsnr=0.05,

@@ -146,6 +146,21 @@ class Layer2State:
             raise ValueError(f"n_burnin={n_burnin}, expected ≥ 0")
         if n_kernel_max_t < 1:
             raise ValueError(f"n_kernel_max_t={n_kernel_max_t}, expected ≥ 1")
+        # 2x (x2 owner engine): ``sigma_floor`` may be a per-kernel sequence
+        # (floor_k = 0.5 * seed_k / sqrt(w_k), Phase 0 study 2). A scalar
+        # keeps the historical path bit for bit.
+        floor_vec = None
+        if isinstance(sigma_floor, (list, tuple)) or getattr(sigma_floor, "ndim", 0) > 0:
+            floor_vec = torch.as_tensor(sigma_floor, dtype=dtype, device=device).reshape(-1)
+            if floor_vec.numel() != int(n_kernels):
+                raise ValueError(
+                    f"per-kernel sigma_floor has {floor_vec.numel()} entries, "
+                    f"expected n_kernels={n_kernels}"
+                )
+            if bool((floor_vec < 0).any()):
+                raise ValueError("per-kernel sigma_floor must be >= 0")
+            sigma_floor = float(floor_vec.min())
+        sigma_floor = float(sigma_floor)
         if sigma_floor < 0:
             raise ValueError(f"sigma_floor={sigma_floor}, expected ≥ 0")
         if sigma_max_ratio < 0:
@@ -172,6 +187,7 @@ class Layer2State:
         # (no unbounded inflation when σ_k learning gets unlucky on one
         # node). Default 0.0 preserves legacy behaviour bit-for-bit.
         self.sigma_floor = float(sigma_floor)
+        self._sigma_floor_vec = floor_vec
         # 2026-06-07 hardening (T1): cap how far a single cube can lift
         # σ_k. Without an upper bound, a transient high-energy cube
         # (bright RFI, an over-fluence calibration probe, a merger
@@ -429,7 +445,9 @@ class Layer2State:
         # cube. Applied AFTER the blend so steady-state σ_k > floor
         # is unchanged; only protects the divisor in pathological
         # cases. Disabled by default (``sigma_floor=0.0``).
-        if self.sigma_floor > 0.0:
+        if self._sigma_floor_vec is not None:
+            self._s_k = torch.maximum(self._s_k, self._sigma_floor_vec.to(self._s_k.device))
+        elif self.sigma_floor > 0.0:
             self._s_k = torch.clamp(self._s_k, min=self.sigma_floor)
 
         self._cube_count += 1

@@ -12,9 +12,11 @@ Independent of every production / engine code path it checks:
   correction) and a scalar image scale (1x: the uv prescale 1/256);
 * Layer-1: 3 x 3-sigma median-centred clipped std over the active cells
   (optionally over a given subsample, to compare with production);
-* filters: boxcar (``b``), B2 triangle (``t``), B3 (``g``) as explicit
-  integer FIR taps, centred ``a = L // 2`` (today's boxcar convention
-  ``[c - w//2, c - w//2 + w - 1]``), on ``clip(x / sigma, +-clip)``;
+* filters: cascades of integer box stages -- boxcar (``b``), triangle
+  (``t``), FWHM-matched B3 (``g``) and the Phase 0 ``b3x`` bank -- with taps
+  by explicit convolution, centred ``a = L // 2`` (today's boxcar
+  convention ``[c - w//2, c - w//2 + w - 1]``), evaluated as float64
+  prefix-sum box stages on ``clip(x / sigma, +-clip)``;
 * chunk maxima over 64 consecutive centres and every filter, packed
   ``(t, k)``; and today's decoder (top-k over cells, merge-radius
   suppression ``|dt|<=128, |df|<=5, |dl|,|dm|<=3``, AND semantics).
@@ -32,6 +34,7 @@ import numpy as np
 
 __all__ = [
     "RefFilter",
+    "ref_filter",
     "ref_filter_bank",
     "ref_decode",
     "ref_grid_dedispersed",
@@ -58,8 +61,8 @@ __all__ = [
 @dataclass(frozen=True)
 class RefFilter:
     name: str
-    family: str          # "b" boxcar, "t" B2 triangle, "g" B3
-    width: int           # base boxcar width (tier samples)
+    width: int           # nominal width (tier samples)
+    stages: tuple        # box stage lengths of the cascade (integer sums)
     taps: np.ndarray     # float64 [L]
     a: int               # output at centre c = sum_j taps[j] x[c - a + j]
 
@@ -72,17 +75,33 @@ class RefFilter:
         return float(np.sqrt(np.sum(self.taps ** 2)))
 
 
+def ref_filter(name: str, width: int, stages) -> RefFilter:
+    """A cascade of integer box stages; taps by explicit convolution."""
+    taps = np.ones(1)
+    for L in stages:
+        taps = np.convolve(taps, np.ones(int(L)))
+    return RefFilter(name, int(width), tuple(int(L) for L in stages), taps,
+                     int(taps.shape[0]) // 2)
+
+
+#: Phase 0 study 5 quadratic B-spline stage lengths (FWHM-matched).
+REF_B3 = {2: (1, 2, 2), 4: (3, 3, 3), 8: (6, 6, 7), 16: (12, 13, 13), 32: (25, 25, 26),
+          64: (50, 50, 51)}
+
+
 def ref_filter_bank(widths: Sequence[int], family: str = "b") -> List[RefFilter]:
-    """B-spline order 1/2/3 = 1/2/3-fold convolution of a width-w boxcar."""
-    order = {"b": 1, "t": 2, "g": 3}[family]
+    """``b`` boxcar, ``t`` equal triangle (w, w), ``g`` FWHM-matched B3
+    (Phase 0 table), ``b3x`` the 8-filter Phase 0 bank (widths ignored)."""
+    if family == "b3x":
+        return ([ref_filter("b1", 1, (1,)), ref_filter("b2", 2, (2,)),
+                 ref_filter("t2", 2, (2, 2))]
+                + [ref_filter(f"g{w}", w, REF_B3[w]) for w in (4, 8, 16, 32, 64)])
     out = []
     for w in widths:
-        box = np.ones(int(w))
-        taps = box
-        for _ in range(order - 1):
-            taps = np.convolve(taps, box)
-        out.append(RefFilter(f"{family}{int(w)}", family, int(w), taps.astype(np.float64),
-                             int(taps.shape[0]) // 2))
+        w = int(w)
+        st = {"b": (w,), "t": (w, w),
+              "g": REF_B3.get(w, (max(1, round(w / 1.268)),) * 3)}[family]
+        out.append(ref_filter(f"{family}{w}", w, st))
     return out
 
 
@@ -229,14 +248,13 @@ def ref_filter_scores(x_norm: np.ndarray, row0: int, filters: Sequence[RefFilter
     centres = np.asarray(centres, dtype=np.int64)
     R = x_norm.shape[0]
     out = np.zeros((len(filters), centres.size) + x_norm.shape[1:], dtype=np.float64)
-    order = {"b": 1, "t": 2, "g": 3}
     pad = max(f.length for f in filters)
     xp = np.concatenate([np.asarray(x_norm, dtype=np.float64),
                          np.zeros((pad,) + x_norm.shape[1:])], axis=0)
     for k, flt in enumerate(filters):
         y = xp
-        for _ in range(order[flt.family]):
-            y = _box_axis0(y, flt.width)
+        for L in flt.stages:
+            y = _box_axis0(y, int(L))
         e = centres - flt.a + flt.length - 1 - row0
         ok = (e >= 0) & (e < R + pad)
         out[k, ok] = y[e[ok]]

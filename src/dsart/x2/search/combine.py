@@ -44,6 +44,7 @@ class StreamRing:
         self.n_slots = int(n_slots)
         self.loaded_hi: Optional[int] = None      # exclusive absolute row
         self.loaded_lo: Optional[int] = None
+        self.n_nodata = 0                           # "no data" sentinel values seen
 
     def slots(self, rows: np.ndarray) -> np.ndarray:
         return np.mod(rows, self.n_slots)
@@ -53,7 +54,9 @@ def k0_rows_to_ring(ring: StreamRing, raw: np.ndarray, valid: np.ndarray, *,
                     row0: int, fmt: RowFormat) -> None:
     """Unpack ``raw [S, n, row_bytes]`` (rows ``row0 .. row0 + n - 1``) into
     the stream ring; invalid ``(stream, row)`` (``valid [S, n]`` False) are
-    written as zero codes -- the flagged zero-fill of SPEC §6."""
+    written as zero codes -- the flagged zero-fill of SPEC §6 (0 in DECODED
+    space: mid-tread codes, offset 0). Frame-v2 "no data" sentinels
+    (code -2^(b-1); -128 for heavy) decode to 0 and are counted."""
     S, n, _ = raw.shape
     if n > ring.n_slots:
         raise ValueError(f"{n} rows > ring of {ring.n_slots}")
@@ -65,6 +68,20 @@ def k0_rows_to_ring(ring: StreamRing, raw: np.ndarray, valid: np.ndarray, *,
         nv = fs.n_values
         re, im = unpack(raw[s], fs)                      # [n, nv]
         ok = np.asarray(valid[s], dtype=bool)
+        if fs.kind == "frame2":
+            # SPEC §4 (Phase 0): code -2^(b-1) = "no data" -> 0 (mid-tread 0);
+            # a row with no data at all is invalid
+            nd = np.zeros(re.shape, dtype=bool)
+            nh = fs.n_heavy
+            if nh:
+                nd[:, :nh] = (re[:, :nh] == -128) | (im[:, :nh] == -128)
+            sent = -(1 << (fs.bits - 1))
+            nd[:, nh:] = (re[:, nh:] == sent) | (im[:, nh:] == sent)
+            if nd.any():
+                ring.n_nodata += int(nd[ok].sum())
+                re = np.where(nd, 0, re)
+                im = np.where(nd, 0, im)
+                ok = ok & ~nd.all(axis=1)
         re = np.where(ok[:, None], re, 0).astype(np.int8)
         im = np.where(ok[:, None], im, 0).astype(np.int8)
         ring.codes[s, :nv, slots, 0] = re

@@ -122,13 +122,19 @@ def test_ref_boxcar_equals_production_padded_cumsum():
 
 
 def test_bspline_taps_and_centring():
-    for fam, order in (("b", 1), ("t", 2), ("g", 3)):
+    for fam, order in (("b", 1), ("t", 2)):
         for w in (1, 2, 3, 8):
             f = ref.ref_filter_bank([w], fam)[0]
             assert f.length == order * (w - 1) + 1
             assert f.taps.sum() == w ** order
             assert f.a == f.length // 2
     assert np.array_equal(ref.ref_filter_bank([3], "t")[0].taps, [1, 2, 3, 2, 1])
+    bank = ref.ref_filter_bank((), "b3x")
+    assert [f.name for f in bank] == ["b1", "b2", "t2", "g4", "g8", "g16", "g32", "g64"]
+    assert np.array_equal(bank[2].taps, [1, 2, 1])
+    assert max(f.length for f in bank) - 1 == 148                 # Phase 0 history rows
+    norms = [round(f.norm, 2) for f in bank]
+    assert norms == [1.0, 1.41, 2.45, 11.87, 74.55, 423.0, 2394.94, 13328.78]   # Phase 0 table
 
 
 def test_ref_sigma_clip_equals_production_estimator():
