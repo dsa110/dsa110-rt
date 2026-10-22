@@ -8,12 +8,13 @@ into the engine's :class:`~dsart.x2.search.engine.DmInputs`:
 * per-stream row formats (2x streams differ in value and heavy counts):
   heavy values first as int8 pairs, main values packed at ``bits_main / 2``
   bits per component; 1x = today's cint8 rows;
-* the per-value decode constant ``c_v = fl32(s * sqrt(n_v))`` with
-  ``s = s_heavy`` for ``StreamValues.heavy`` values else ``s_main`` (the
-  frame header's sigma_hat-unit steps) -- the coordinator's "per-entry
-  weight table built at pattern load", stored per value because a value's
-  direct and mirror entries share it (checked against ``ent_weight``);
-  1x: ``c_v = 1`` (codes summed raw, today);
+* the per-value decode step ``c_v = f32(s)`` with ``s = s_heavy`` for
+  ``StreamValues.heavy`` values else ``s_main`` (the frame header's
+  sigma_hat-unit steps) and the natural weight ``w_v = f32(sqrt(n_v))``,
+  applied as two fp32 multiplies (SPEC §4.5) -- the coordinator's
+  "per-entry weight table built at pattern load", stored per value because
+  a value's direct and mirror entries share it (checked against
+  ``ent_weight``); 1x: ``c_v = w_v = 1`` (codes summed raw, today);
 * ``value_sigma = sqrt(n_v)``: decoded per-component noise in sigma_hat
   units, for the 2x image scale.
 
@@ -62,13 +63,14 @@ def dm_inputs_from_value_map(vmap, *, s_main: float = 1.0, s_heavy: float = 1.0,
     is_1x = (not vmap.normalise) and vmap.heavy_threshold is None
     V = max(int(sv.n_values) for sv in vmap.streams)
     c_v = np.zeros((S, V), dtype=np.float32)
+    w_v = np.zeros((S, V), dtype=np.float32)
     fmts = []
     vsig = []
     for s, sv in enumerate(vmap.streams):
         nv = int(sv.n_values)
         if is_1x:
             f = RowFormat("cint8", n_values=nv)
-            c, off = decode_constants(f)
+            c, w, off = decode_constants(f)
             vsig.append(np.ones(nv))
         else:
             nh = int(sv.n_heavy)
@@ -77,11 +79,12 @@ def dm_inputs_from_value_map(vmap, *, s_main: float = 1.0, s_heavy: float = 1.0,
             f = RowFormat("frame2", n_values=nv, n_heavy=nh, bits=int(bits_main) // 2,
                           midrise=bool(midrise))
             n = np.asarray(sv.n_contrib, dtype=np.int64)
-            c, off = decode_constants(f, step_main=float(np.float32(s_main)),
+            c, w, off = decode_constants(f, step_main=float(np.float32(s_main)),
                                       step_heavy=float(np.float32(s_heavy)),
                                       n_contrib=n if vmap.normalise else None)
             vsig.append(np.sqrt(n.astype(np.float64)) if vmap.normalise else np.ones(nv))
         c_v[s, :nv] = c
+        w_v[s, :nv] = w
         fmts.append(f)
     # the per-entry CSR weight must be the per-value static weight
     if w_ent is not None:
@@ -90,7 +93,7 @@ def dm_inputs_from_value_map(vmap, *, s_main: float = 1.0, s_heavy: float = 1.0,
         if sv_w.size and np.max(np.abs(sv_w - w_ent) / np.maximum(sv_w, 1.0)) > 1e-6:
             raise ValueError("owner CSR ent_weight is not the per-value sqrt(n)")
     return DmInputs(fmt=StreamFormats(tuple(fmts)), csr=csr, c_v=c_v, offset=float(off),
-                    value_sigma=vsig, pattern_id=int(vmap.pattern_id))
+                    value_sigma=vsig, pattern_id=int(vmap.pattern_id), w_v=w_v)
 
 
 def check_pattern(vmap, frame_pattern_id: int) -> None:

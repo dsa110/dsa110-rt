@@ -37,10 +37,12 @@ def test_k1_triton_equals_twin_bit_for_bit(fold):
     csr = csr_from_value_cells(cells, n_grid=N, fold=fold)
     codes = rng.integers(-7, 8, size=(S, V, R, 2)).astype(np.int8)
     cv = rng.uniform(0.05, 9.0, size=(S, V)).astype(np.float32)
+    wv = np.sqrt(rng.integers(1, 3000, size=(S, V)).astype(np.float64)).astype(np.float32)
     shifts = rng.integers(0, 6, size=(2, S)).astype(np.int32)
-    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=shifts, t_lo=20, n_t=5)
+    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=shifts, t_lo=20, n_t=5, w_v=wv)
     got = k1_combine(torch.from_numpy(codes), torch.from_numpy(cv), csr_tensors(csr, "cpu"),
-                     torch.from_numpy(shifts), t_lo=20, n_t=5, block_c=16, block_t=4).numpy()
+                     torch.from_numpy(shifts), t_lo=20, n_t=5, block_c=16, block_t=4,
+                     w_v=torch.from_numpy(wv)).numpy()
     assert np.array_equal(got[..., 0], want.real) and np.array_equal(got[..., 1], want.imag)
 
 

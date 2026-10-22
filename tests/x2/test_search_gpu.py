@@ -98,8 +98,9 @@ def test_gpu_k1_triton_equals_twin_on_the_2x_map():
     dev = torch.device("cuda")
     got = k1_combine(torch.from_numpy(codes).to(dev), torch.as_tensor(inp.c_v, device=dev),
                      csr_tensors(inp.csr, dev), torch.from_numpy(sh).to(dev), t_lo=200,
-                     n_t=4).cpu().numpy()
-    want = k1_twin(codes, c_v=inp.c_v, offset=0.0, csr=inp.csr, shifts=sh, t_lo=200, n_t=4)
+                     n_t=4, w_v=torch.as_tensor(inp.weights(), device=dev)).cpu().numpy()
+    want = k1_twin(codes, c_v=inp.c_v, offset=0.0, csr=inp.csr, shifts=sh, t_lo=200, n_t=4,
+                   w_v=inp.w_v)
     assert np.array_equal(got[..., 0], want.real) and np.array_equal(got[..., 1], want.imag)
 
 

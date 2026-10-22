@@ -130,7 +130,7 @@ def check_triton_compile() -> list:
                         error=repr(e)[:2000])
 
     out = []
-    k1 = dict(codes_ptr="*i8", cv_ptr="*fp32", ptr_ptr="*i32", es_ptr="*i32", ev_ptr="*i32",
+    k1 = dict(codes_ptr="*i8", cv_ptr="*fp32", wv_ptr="*fp32", ptr_ptr="*i32", es_ptr="*i32", ev_ptr="*i32",
               ec_ptr="*i32", hs_ptr="*fp32", sh_ptr="*i32", out_ptr="*fp32", n_act="i32",
               n_t="i32", t_lo="i32", R="i32", V="i32", S="i32", off="fp32")
     out.append(comp(kt._k1_kernel, k1, dict(MAX_NE=64, BLOCK_C=64, BLOCK_T=16), "K1"))
@@ -141,6 +141,18 @@ def check_triton_compile() -> list:
     for order, ln in ((0, 1), (1, 64), (2, 3), (3, 149)):
         out.append(comp(kt._k3b_kernel, k3, dict(LEN=ln, N_C=384, ORDER=order, CHUNK=64,
                                                   BLOCK=128), f"K3b order {order}"))
+    # fused K3b (one generated kernel per bank): tier A n_c 384, tier B 192
+    from dsart.x2.search.filters import FilterBank
+    from dsart.x2.search.k3b_fused import aot_compile
+    for bank_name, fb in (("b3x", FilterBank.b3x()), ("box", FilterBank.build())):
+        for n_c in (384, 192):
+            try:
+                aot_compile(fb, arch=75, n_c=n_c)
+                out.append(dict(check="triton_compile", kernel=f"K3b fused {bank_name} n_c {n_c}",
+                                status="ok"))
+            except Exception as e:                               # noqa: BLE001
+                out.append(dict(check="triton_compile", kernel=f"K3b fused {bank_name} n_c {n_c}",
+                                status="fail", error=repr(e)[:2000]))
     return out
 
 
@@ -225,10 +237,12 @@ def selftest_interp() -> int:
     csr = csr_from_value_cells(cells, n_grid=16)
     codes = rng.integers(-7, 8, size=(3, 10, 8, 2)).astype(np.int8)
     cv = rng.uniform(0.1, 2, size=(3, 10)).astype(np.float32)
+    wv = np.sqrt(rng.integers(1, 900, size=(3, 10)).astype(np.float64)).astype(np.float32)
     sh = rng.integers(0, 3, size=(2, 3)).astype(np.int32)
-    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=sh, t_lo=5, n_t=3)
+    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=sh, t_lo=5, n_t=3, w_v=wv)
     got = k1_combine(torch.from_numpy(codes), torch.from_numpy(cv), csr_tensors(csr, "cpu"),
-                     torch.from_numpy(sh), t_lo=5, n_t=3, block_c=16, block_t=4).numpy()
+                     torch.from_numpy(sh), t_lo=5, n_t=3, block_c=16, block_t=4,
+                     w_v=torch.from_numpy(wv)).numpy()
     ok = np.array_equal(got[..., 0], want.real) and np.array_equal(got[..., 1], want.imag)
     fb = FilterBank.build((1, 2, 4))
     ring = rng.standard_normal((70, 1, 8)).astype(np.float16)
@@ -237,7 +251,11 @@ def selftest_interp() -> int:
     b1, t1, _ = k3b_detect(torch.from_numpy(ring), ring_row0=0, c_first=4, n_c=64,
                            sigma_inv=torch.ones(1), s_inv=np.ones(3), bank=fb, block=8)
     ok &= np.array_equal(b1.numpy(), b0) and np.array_equal(t1.numpy(), t0)
-    print("interp K1/K3b bit-exact:", ok)
+    from dsart.x2.search.k3b_fused import k3b_fused
+    b2, t2, _ = k3b_fused(torch.from_numpy(ring), ring_row0=0, c_first=4, n_c=64,
+                          sigma_inv=torch.ones(1), s_inv=np.ones(3), bank=fb, block=8)
+    ok &= np.array_equal(b2.numpy(), b0) and np.array_equal(t2.numpy(), t0)
+    print("interp K1/K3b v1/K3b fused bit-exact:", ok)
     return 0 if ok else 1
 
 
@@ -333,11 +351,12 @@ def cmd_kernels(a) -> int:
             shifts = torch.from_numpy(rng.integers(0, 1700, size=(F, S)).astype(np.int32)).to(dev)
             ct = csr_tensors(inp.csr, dev)
             cv = torch.as_tensor(inp.c_v, device=dev)
-            ms = _cuda_ms(lambda: k1_combine(codes, cv, ct, shifts, t_lo=2000, n_t=n_t))
+            wv = torch.as_tensor(inp.weights(), device=dev)
+            ms = _cuda_ms(lambda: k1_combine(codes, cv, ct, shifts, t_lo=2000, n_t=n_t, w_v=wv))
             # bit check on a slice vs the twin
-            sub = k1_combine(codes, cv, ct, shifts[:2], t_lo=2000, n_t=2).cpu().numpy()
+            sub = k1_combine(codes, cv, ct, shifts[:2], t_lo=2000, n_t=2, w_v=wv).cpu().numpy()
             tw = k1_twin(codes.cpu().numpy(), c_v=inp.c_v, offset=0.0, csr=inp.csr,
-                         shifts=shifts[:2].cpu().numpy(), t_lo=2000, n_t=2)
+                         shifts=shifts[:2].cpu().numpy(), t_lo=2000, n_t=2, w_v=inp.w_v)
             exact = bool(np.array_equal(sub[..., 0], tw.real) and np.array_equal(sub[..., 1],
                                                                                    tw.imag))
             us = 1e3 * ms / (F * n_t)

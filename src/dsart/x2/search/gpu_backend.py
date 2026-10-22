@@ -64,6 +64,7 @@ class GpuBackend:
         x.nodata = torch.zeros((S,), dtype=torch.int64, device=self.dev)
         x.image = torch.zeros((st.R_img, spec.n_fdm, N * N), dtype=torch.float16, device=self.dev)
         x.c_v = torch.as_tensor(inp.c_v, dtype=torch.float32, device=self.dev)
+        x.w_v = torch.as_tensor(inp.weights(), dtype=torch.float32, device=self.dev)
         x.csr = csr_tensors(inp.csr, self.dev)
         x.shifts = torch.as_tensor(spec.shifts, dtype=torch.int32, device=self.dev)
         x.pix = torch.as_tensor((st.mask_scaled.astype(np.float64) / (N * N)).astype(np.float32),
@@ -159,7 +160,7 @@ class GpuBackend:
         F = st.spec.n_fdm
         with torch.cuda.stream(stream):
             uv = k1_combine(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
-                            offset=float(st.inp.offset))                  # [F, n, A, 2]
+                            offset=float(st.inp.offset), w_v=x.w_v)                  # [F, n, A, 2]
             B = F * n
             A = int(x.csr["n_act"])
             if cfg.fft_mode in ("pruned", "irfft2"):
@@ -215,14 +216,18 @@ class GpuBackend:
                  n_top: int) -> tuple:
         """K3b + top-k on the device; ONE D2H of the top-k and the taps."""
         from .kernels_triton import k3b_detect
+        from .k3b_fused import k3b_fused
 
         x = self.dm[st.spec.d]
         cfg = self.eng.cfg
+        if cfg.k3b_impl not in ("v1", "fused"):
+            raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused)")
+        detect = k3b_fused if cfg.k3b_impl == "fused" else k3b_detect
         ev0 = torch.cuda.Event(enable_timing=True)
         ev1 = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(self.compute):
             ev0.record(self.compute)
-            best, tk, taps = k3b_detect(
+            best, tk, taps = detect(
                 x.image, ring_row0=0, c_first=c_first, n_c=st.spec.hop,
                 sigma_inv=torch.as_tensor(sigma_inv, device=self.dev), s_inv=s_inv,
                 bank=self.eng.bank, clip=cfg.clip_sigma, chunk=cfg.chunk,
