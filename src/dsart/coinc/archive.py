@@ -484,6 +484,7 @@ def stats_to_l3_metadata(
     pointing_dec_meta: Optional[Mapping[str, object]] = None,
     archive_schema: int = ARCHIVE_SCHEMA_DEFAULT,
     opoint: str = "",
+    products: Optional[Mapping[str, object]] = None,
 ) -> dict[str, object]:
     """Build the L3 JSON payload the legacy archive consumer expects.
 
@@ -536,6 +537,12 @@ def stats_to_l3_metadata(
         c2["width_median_ms"] = wm if math.isfinite(wm) else None
         wp = width_ms(stats.width_peak, period) if period_ok else float("nan")
         c2["width_peak_ms"] = wp if math.isfinite(wp) else None
+    if products is not None:
+        # x2 products block (SPEC §9): which halves delivered cutouts /
+        # cubes, which are missing and why, complete vs incomplete. Only
+        # written when the caller supplies it (2x lifecycle, or the 1x
+        # partial_event_policy=archive path), so today's Level3 is unchanged.
+        doc["products"] = dict(products)
     return doc
 
 
