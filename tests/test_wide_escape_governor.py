@@ -127,7 +127,10 @@ def test_the_service_applies_it_only_to_escapes() -> None:
 
     from dsart.services import search_compute
 
-    src = inspect.getsource(search_compute.SearchComputeService._submit_c1_batch)
+    # x2 D9: the chain moved into _c1_cycle_chain, run via c1_emit.pool_cycle
+    sub = inspect.getsource(search_compute.SearchComputeService._submit_c1_batch)
+    assert "pool_cycle(" in sub and "self._c1_cycle_chain" in sub
+    src = inspect.getsource(search_compute.SearchComputeService._c1_cycle_chain)
     assert "self._wide_escape_gov.admit(" in src
     assert "kept = narrow + admitted" in src
 
