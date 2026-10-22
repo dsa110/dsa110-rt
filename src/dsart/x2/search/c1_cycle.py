@@ -10,7 +10,7 @@ C2 at 9.4x real time, vs 320 rows/s pooled). :class:`C1CyclePool` runs the
 SAME chain, with the SAME production helpers, once over the cycle's pooled
 candidates, so tokens and slots go to the brightest across DMs. With one DM
 per cycle and today's units it is exactly today's per-cube chain
-(``tests/x2/test_c1_cycle.py`` pins both).
+(tests/x2/test_search_c1_cycle.py).
 
 Units: the de-rate and the DM floor use each candidate's OWN tier sample
 (tier B internal 1.048576 ms) and width in tier samples, with the op-point's
@@ -18,8 +18,8 @@ Units: the de-rate and the DM floor use each candidate's OWN tier sample
 in external samples (32 T_ext = 16.8 ms in 2x, 16 in 1x). Metering and the
 governor see the legacy ``Candidate`` rows that will be shipped.
 
-To be replaced by WS-D's D9 helpers in ``services/c1_emit.py`` once they
-land (same semantics).
+The per-candidate steps (de-rate, DM floor) run before pooling (they are
+element-wise); the pooled steps go through ``pool_cycle``.
 """
 from __future__ import annotations
 
@@ -110,27 +110,40 @@ class C1CyclePool:
                                        t_search_us=self._tier_us(c))]
             cnt["dropped_dmfloor"] += len(cands) - len(kept)
             cands = kept
-        # 3. width cap + brightness escape + governor -- ONCE per cycle
-        mw = cfg.max_width_ext
-        if mw is not None and cands:
-            esc = (float(cfg.max_width_snr_escape) if cfg.max_width_snr_escape is not None
-                   and float(cfg.max_width_snr_escape) > 0 else None)
-            narrow = [c for c in cands if int(c.width_ext) <= int(mw)]
-            escapes = [c for c in cands if int(c.width_ext) > int(mw)
-                       and esc is not None and float(c.snr) >= esc]
-            cnt["dropped_width"] += len(cands) - len(narrow) - len(escapes)
-            cnt["width_escaped"] += len(escapes)
-            if escapes:
-                admitted, n_thr = self.gov.admit(escapes, float(now_s))
-                cnt["escape_throttled"] += n_thr
-                escapes = admitted
-            cands = narrow + escapes
-        # 4. metering on the legacy rows (narrow-first, SNR-protected slots)
+        # 3-4. width cap + brightness escape + governor + metering, ONCE per
+        # cycle over the half's per-DM cubes: WS-D's D9 ``pool_cycle`` with
+        # today's chain on the legacy rows that will be shipped
+        from ...services.c1_emit import pool_cycle
+
         legacy = [c.to_legacy(search_node_id=search_node_id, gpu_half=gpu_half,
                               dm_index_mode=cfg.dm_index_mode) for c in cands]
         back = {id(lg): c for lg, c in zip(legacy, cands)}
-        kept_l, n_met = meter_candidates(legacy, cfg.max_candidates_per_cycle,
-                                         always_keep_predicate=cal_probe_predicate,
-                                         snr_protected_slots=int(cfg.snr_protected_slots))
-        cnt["dropped_meter"] += n_met
+        by_d: Dict[int, list] = {}
+        for lg, c in zip(legacy, cands):
+            by_d.setdefault(int(c.d), []).append(lg)
+        groups = [(d, by_d[d]) for d in sorted(by_d)] or [(-1, [])]
+        now = float(now_s)
+
+        def chain(pooled: list) -> list:
+            mw = cfg.max_width_ext
+            if mw is not None and pooled:
+                esc = (float(cfg.max_width_snr_escape) if cfg.max_width_snr_escape is not None
+                       and float(cfg.max_width_snr_escape) > 0 else None)
+                narrow = [c for c in pooled if int(c.width_samples) <= int(mw)]
+                escapes = [c for c in pooled if int(c.width_samples) > int(mw)
+                           and esc is not None and float(c.snr) >= esc]
+                cnt["dropped_width"] += len(pooled) - len(narrow) - len(escapes)
+                cnt["width_escaped"] += len(escapes)
+                if escapes:
+                    admitted, n_thr = self.gov.admit(escapes, now)
+                    cnt["escape_throttled"] += n_thr
+                    escapes = admitted
+                pooled = narrow + escapes
+            kept, n_met = meter_candidates(pooled, cfg.max_candidates_per_cycle,
+                                           always_keep_predicate=cal_probe_predicate,
+                                           snr_protected_slots=int(cfg.snr_protected_slots))
+            cnt["dropped_meter"] += n_met
+            return list(kept)
+
+        kept_l = [c for _d, surv in pool_cycle(groups, chain) for c in surv]
         return [back[id(lg)] for lg in kept_l], list(kept_l)

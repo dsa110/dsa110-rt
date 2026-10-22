@@ -1758,6 +1758,41 @@ class SearchComputeService:
             )
             if n_dm_dropped:
                 self._c1_cands_dropped_dmfloor += n_dm_dropped
+        # x2 D9 (WS-D, services/c1_emit.pool_cycle): the width cap / escape /
+        # governor / metering chain runs ONCE per cycle over all of a half's
+        # per-DM cubes; with one cube per cycle (1x) it is exactly the call
+        # below, i.e. today's behaviour.
+        from .c1_emit import pool_cycle
+        candidates = pool_cycle(
+            [(int(slot.cube_id), candidates)], self._c1_cycle_chain,
+        )[0][1]
+        rows = tuple(
+            candidate_to_c1_row(c, geom=geom) for c in candidates
+        )
+        header = build_header(
+            cube_id=int(slot.cube_id),
+            event_specnum_start=int(slot.specnum_start),
+            mjd_start=float(geom.mjd_start),
+            sample_period_specnum=int(geom.sample_period_specnum),
+            sample_period_us=float(geom.sample_period_us),
+            n_grid=int(slot.n_grid),
+            n_fdm_in_cube=int(slot.n_fdm_in_cube),
+            search_node_id=int(cfg.search_node_id),
+            gpu_half=int(cfg.gpu_half),
+            n_candidates=len(rows),
+        )
+        accepted = self._c1_emit.submit(header, candidates, rows=rows)
+        if accepted:
+            self._c1_batches_submitted += 1
+        else:
+            self._c1_batches_dropped += 1
+        return list(candidates)
+
+    def _c1_cycle_chain(self, candidates: List[Candidate]) -> List[Candidate]:
+        """Width cap + brightness escape + WideEscapeGovernor + metering --
+        today's C1 chain, applied once per pool (one cube in 1x, one cycle of
+        per-DM cubes in 2x via ``c1_emit.pool_cycle``)."""
+        cfg = self._config
         # M7.6: drop candidates wider than the configured C1→C2 width cap
         # BEFORE they are transmitted. Wide boxcars (≥32) are the on-sky
         # false-positive floor; capping at ``max_width_samples`` keeps the
@@ -1886,26 +1921,6 @@ class SearchComputeService:
                 self._meter_window_dropped_max = n_metered
         if self._meter_window_blocks >= _METER_WINDOW_BLOCKS:
             self._publish_c1_metering(int(cap or 0))
-        rows = tuple(
-            candidate_to_c1_row(c, geom=geom) for c in candidates
-        )
-        header = build_header(
-            cube_id=int(slot.cube_id),
-            event_specnum_start=int(slot.specnum_start),
-            mjd_start=float(geom.mjd_start),
-            sample_period_specnum=int(geom.sample_period_specnum),
-            sample_period_us=float(geom.sample_period_us),
-            n_grid=int(slot.n_grid),
-            n_fdm_in_cube=int(slot.n_fdm_in_cube),
-            search_node_id=int(cfg.search_node_id),
-            gpu_half=int(cfg.gpu_half),
-            n_candidates=len(rows),
-        )
-        accepted = self._c1_emit.submit(header, candidates, rows=rows)
-        if accepted:
-            self._c1_batches_submitted += 1
-        else:
-            self._c1_batches_dropped += 1
         return list(candidates)
 
     def _publish_c1_metering(self, cap: int) -> None:
