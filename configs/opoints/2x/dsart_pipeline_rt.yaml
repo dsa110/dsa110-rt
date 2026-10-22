@@ -1,0 +1,810 @@
+# =============================================================================
+# CONFIG SET 2x -- corr-node pipeline (etcd /cnf/opoints/<2x id>/pipeline_rt)
+#
+# TEMPLATE for every 2x corner-turn format (op-point id
+# 2x-<kind>-ns<n>-cint<b>, dsart.x2.opoint; the format is chosen at CP1).
+# Copied to the live /cnf/pipeline_rt only by the web-UI Start control
+# (fleet stopped).
+# Frozen interface: docs/x2/SPEC.md section 10. Started as a verbatim copy of
+# configs/dsart_pipeline_rt.yaml (the 1x base set, which stays byte-identical
+# to production).
+#   * ${var} in routine args / hostargs is rendered at push time from the
+#     op-point id and the v3 plan (`push_dsart_to_etcd.py --opoint <2x id>
+#     --plan <npz> --write`; variables: dsart.x2.opoint_runtime.render_context
+#     -- n_sub, n_streams, plan_path, plan_id, owned_coarse_csv_h<h>, ...).
+#     Variables are allowed ONLY there: the h23 services read the other
+#     blocks straight from this file.
+#   * X2TODO:<owner>:<what> tokens stand for values not decided yet (they
+#     fail argument parsing); top-level x2_todo entries are section reviews
+#     still owed. Both block a switch (the push needs --allow-placeholders).
+#   * x2_cp2_recalibrate entries are 1x values to recalibrate at CP2 (do not
+#     block).
+# Paths to op-point managed files must point into configs/opoints/2x/.
+# =============================================================================
+# dsart-rt corr-node pipeline config — pushed to etcd under
+# /cnf/pipeline_rt by tools/ops/push_dsart_to_etcd.py and consumed at
+# runtime by services/dsart_rt.py (`-in pipeline_rt`).
+#
+# Schema mirrors the legacy /cnf/pipeline (corr.py-compatible) so the
+# routine substitution + spawn semantics stay identical to the existing
+# operator workflow. The two key differences vs legacy are:
+#
+#   1. The 'captures.mode' switch lets a corr node feed the fada chain
+#      from synthetic data (dada_junkdb) instead of the real SNAP
+#      capture binary. This is what the M7.1 / M7.3 stages of the on-sky
+#      bring-up use (production-rate plumbing without a telescope).
+#
+#   2. fada is multi-reader (r=3) so slow-corr, fast-corr AND the
+#      voltage-retention service can attach to the same ring without
+#      copying. The legacy /cnf/pipeline used r=2; the third reader is
+#      the M8 corr-node voltage retention tap. Like every PSRDADA reader
+#      it WILL back-pressure merge if it falls behind, so the retention
+#      reader's hot path is deliberately a single ~288 MiB memcpy into a
+#      private RAM ring followed by an immediate markCleared() — no NVMe
+#      I/O on the fada read path. The expensive part (extract window +
+#      write fragment to NVMe on a C2 trigger) runs in a SEPARATE worker
+#      thread that reads the decoupled RAM ring, never fada, so a slow
+#      disk can never stall merge. See the voltage_retention routine +
+#      docs/voltage_dumps/. Any NEW reader MUST bump r before being added
+#      or corr_fast's writer stalls at the (n+1)th block waiting on the
+#      absent reader.
+#
+#   3. bada is ALSO multi-reader (r=2) as of the spectral-line (SPL)
+#      work. Reader 1 is always meridian_fringestop (the production
+#      slow-vis fringe-stopper). Reader 2 is EXACTLY ONE of two
+#      mutually-exclusive routines selected per-node at `start` from
+#      /cnf/spectral_line: meridian_fringestop_spl (when this sub-band
+#      has SPL enabled) or bada_null_drain (when it does not). Keeping
+#      the reader count constant at r=2 means corr_slow's writer never
+#      stalls waiting on an absent second reader regardless of the SPL
+#      toggle — the no-op drain stands in when SPL is off.
+#
+# Buffer byte/block math is physics-pinned by the legacy block layout —
+# see configs/config_corr.yaml comments for the derivation. Do NOT edit
+# without also editing the consumer services.
+schema_version: 1
+opoint: 2x
+x2_todo:
+  - "WS-C corr_fast: value kind / bits args from the format (template variables value_kind, bits_main, bits_heavy are available); fused cal+mask GEMM; GPU packer row rule; stage-2 FIFO off"
+  - "WS-T corr_fast transport: frame v2 + C sendmmsg sender args (pacing, explicit DM->half map, k samples per datagram)"
+  - "WS-C/WS-O buffers: fada/bada/dada/eada sizes and reader counts confirmed unchanged for 2x (plan: reader count unchanged)"
+  - "WS-D voltage_retention: --n-pre for the DM-3000 sweep (tests/test_voltage_dump_containment.py), dump window in T_ext"
+
+# captures.mode is the M7 stage switch:
+#   junkdb  → spawn dada_junkdb x2 (fills dada+eada with /dev/urandom at
+#             native cadence; used by M7.1/M7.3 plumbing stages).
+#   real    → spawn dsaX_capture_manythread x2 (live SNAP UDP capture;
+#             used by M7.5/M7.6 on-sky stages).
+# M7.0 ships both routine sets but the captures.mode flag is consulted
+# by dsart_rt._select_routines() before spawning.
+captures:
+  # Production: live SNAP UDP capture via dsart_capture_manythread.
+  # M7.4 noise test used mode `synth_fada` (bench/replay_voltage_dump
+  # --synthesize → fada). Flip back to `synth_fada` for repeatable
+  # pure-Gaussian validation without on-sky data.
+  # `replay_burst` is the M7.4 burst-correctness mode: bench/
+  # replay_voltage_dump --run-id 250924mptq → fada. Loops the 15-block
+  # burst capture indefinitely so a soak picks the burst up multiple
+  # times. Default stays at `real` (production SNAP); operators flip
+  # to `replay_burst` via local edit + ``push_dsart_to_etcd.py`` when
+  # they need to repeat the M7.4 burst correctness check.
+  mode: real
+
+buffers:
+  - {k: dada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 0)
+  - {k: eada, b: 150994944, n: 20,  c: 1, r: 1}   # 144 MiB x 20 = 2.7 s capture history (NUMA 1)
+  - {k: fada, b: 301989888, n: 70,  c: 1, r: 3}   # 288 MiB x 70 = 9.4 s merged voltage (corr_slow + corr_fast + voltage_retention all read)
+  - {k: bada, b:  28606464, n: 300, c: 1, r: 2}   # 27.3 MiB x 300 = 40 s slow-vis (meridian_fringestop + SPL/drain second reader)
+
+routines:
+  # ---- captures (mode-gated) ---------------------------------------
+  # dada_junkdb usage (verified against the installed binary on n06,
+  # /usr/local/bin/dada_junkdb): positional arg is a PSRDADA ASCII
+  # header file (NOT a data source); -g is a flag for gaussian
+  # distribution (not a path); -r is MB/s; -t seconds. The legacy
+  # correlator_header_dsaX.txt under dsa110-xengine/src/ is byte-shape
+  # compatible with the dada/eada blocks. M0.sh::[plumbing_junkdb]
+  # uses this same header for the same role.
+  - name: cap_a_junkdb
+    when: captures.mode == junkdb
+    cmd: /usr/local/bin/dada_junkdb
+    # -r 1073 MiB/s = 144 MiB / 134.218 ms = EXACT native cadence. Note
+    # that dada_junkdb's -r flag is MiB/s (binary; `rate_base=1024*1024`
+    # in dada_junkdb.c:391) despite the help text saying "MB/s" — we
+    # had been using -r 1200 (= 12 % over native), which built spurious
+    # queue depth in dada/eada and was implicated in the M7.1 5-min
+    # soak hang where merge stopped advancing fada at ~3 min.
+    # -t 86400: transfer_size = 86400 × 1.125 GB/s = ~97 TB of bytes
+    # to write before junkdb exits (= ~24 h at native cadence). Plenty
+    # of headroom for any 60-min soak; orchestrator still kills with
+    # SIGTERM on `stop` verb well before then.
+    # -g = gaussian-distributed payload (flag, no value).
+    # -z = PSRDADA zero-copy direct shm write — avoids the user-buffer
+    # → ring-buffer memcpy that the default path does, giving merge a
+    # cleaner producer in the multi-reader (r=2) fada → corr_slow +
+    # corr_fast topology.
+    #
+    # NO gate_on_paths (M7.4 Phase 8b, 2026-05-29 — reverts the M7.2
+    # gating). junkdb is the head of the fada-chain writer (junkdb ->
+    # dada/eada header -> dsaX_merge -> fada header -> corr_fast.Reader
+    # (fada)), so gating it on the corr ready-sentinels deadlocks the
+    # same way cap_a_real did (corr_fast can't reach ready without the
+    # header; the header can't arrive until junkdb runs; junkdb won't
+    # run until corr_fast is ready). The M7.2 gate only "worked" for
+    # junkdb because the 240 s gate-timeout force-spawned it anyway —
+    # i.e. it cost 240 s of dead time and still produced the very
+    # ring-fill transient it was meant to avoid. The fill is harmless
+    # for junkdb (a synthetic generator has no real SNAP packets to
+    # drop; back-pressure just throttles the generator) and is the
+    # cosmetic warmup transient noted below; the kernel-warmup pass in
+    # corr_fast/corr_slow keeps the steady state clean.
+    args: -k dada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+  - name: cap_b_junkdb
+    when: captures.mode == junkdb
+    cmd: /usr/local/bin/dada_junkdb
+    args: -k eada -r 1073 -t 86400 -g -z /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/correlator_header_dsaX.txt
+
+  # ---- synth_fada (M7.4 noise test) ---------------------------------
+  # The legacy /usr/local/bin/dada_junkdb has a known bug: its gaussian
+  # writer only branches on nbit ∈ {8, 32} (see dada_junkdb.c:266-279).
+  # Our pipeline runs at nbit=4 (packed int4 complex voltages), so the
+  # `-g` flag is effectively a no-op and the dada/eada buffers receive
+  # only the zero-initialised user buffer. With zeros into corr_fast,
+  # the gridder + dedispersion produce zero cubes, sigma_l1 floors at
+  # 5e-3, and no C1 candidates fire. This mode bypasses the broken
+  # junkdb + dsaX_merge plumbing and uses bench/replay_voltage_dump.py
+  # in --synthesize mode, which generates properly-packed 4-bit
+  # gaussian voltages in the FADA layout
+  # (NPACKETS=2048, NANTS=96, NCHAN=384, 2t, NPOL=2) and writes them
+  # straight to fada. corr_slow + corr_fast each remain a passive fada
+  # reader. --synth-thermal-sigma=1.5 sits comfortably in the [-8,7]
+  # int4 range (5σ headroom). --n-blocks=400000 gives ~14.9 h before
+  # the writer exits; the orchestrator SIGTERMs well before then on
+  # the stop verb.
+  - name: cap_synth_fada
+    when: captures.mode == synth_fada
+    cmd: /home/ubuntu/miniforge3/envs/dsa110-rt/bin/python
+    args: -u -m bench.replay_voltage_dump --synthesize --n-blocks 400000 --synth-thermal-sigma 1.5 --fada-key fada
+    env:
+      PYTHONPATH: /home/ubuntu/proj/dsa110-rt
+    # NOTE: no gate_on_paths here. cap_synth_fada is the sole fada
+    # writer in this mode and provides the PSRDADA header that
+    # corr_fast.getHeader() blocks on; gating on the corr_fast ready
+    # sentinel would deadlock (corr_fast can't reach ready without a
+    # header, and the header only arrives once cap_synth_fada starts).
+    # Back-pressure is naturally bounded by fada n=70 buffers ≈ 9.4 s
+    # and PSRDADA flow control.
+
+  # ---- replay_burst (M7.4 burst correctness mode) --------------------
+  # Reads the 250924mptq voltage dump (15 native blocks ~ 2 s) and
+  # writes them straight into fada via bench/replay_voltage_dump.py in
+  # manifest mode. Per-node chgroup is set via the CHGROUP substitution
+  # token (n03→0, n04→1, …, n22→15). DSART_VOLTAGE_FIXTURE_ROOT points
+  # at the on-node 250924mptq fixture tree (manifest.yaml +
+  # fl_burst_chgroup<g>.out symlink pointing at the actual
+  # 250924mptq_sb<g>_data.out file).
+  #
+  # 2026-05-27 (M7.4): --repeat-fixture 1 (single pass, the
+  # replay_voltage_dump default). The earlier looped mode (--repeat-
+  # fixture 0) was useful for soaks but created a "burst at the same
+  # signal-time over and over" pathology that, combined with the now-
+  # fixed graph leak + mjd_at_specnum_0=0 anchor bug, produced an
+  # immortal C2 cluster firing thousands of stale-specnum dumps. A
+  # single pass exercises C1 emit → C2 cluster → broadcast → cube
+  # dump → plot generation end-to-end; the corr fleet re-arms via
+  # dsart_rt's reap loop if more passes are needed.
+  - name: cap_replay_burst
+    when: captures.mode == replay_burst
+    cmd: /home/ubuntu/miniforge3/envs/dsa110-rt/bin/python
+    args: -u -m bench.replay_voltage_dump --run-id 250924mptq --fada-key fada --rate native --chgroups CHGROUP --repeat-fixture 1
+    env:
+      PYTHONPATH: /home/ubuntu/proj/dsa110-rt
+      DSART_VOLTAGE_FIXTURE_ROOT: /home/ubuntu/data/voltages
+
+  # Vendored dsart capture binary (built by setup.py build_ext, lives
+  # inside the dsa110-rt package tree). Improvements vs upstream
+  # legacy dsaX_capture_manythread: recvmmsg(64) batch receive,
+  # deterministic arming (no auto-arm: requires explicit etcd
+  # utc_start verb), explicit SO_RCVBUF=256 MiB, POSIX-shm mon
+  # publisher consumed by capture_control sidecar. See
+  # src/dsart/capture/README.md for the full diff vs upstream.
+  #
+  # The `-p` flag selects the SNAP-side UDP data port; -k selects the
+  # PSRDADA output key (dada / eada). -q is optional; if unset the
+  # binary defaults to 11223 for dPort=4011 and 11224 for dPort=4012
+  # (matches the legacy convention dsart_rt._send_utc_udp targets).
+  #
+  # Per-host -j <DATA_IP>:
+  #   The SNAP UDP datagrams arrive on enp129s0f0 of each corr node.
+  #   The legacy default ("-j" unset -> bind to 127.0.0.1) is fine for
+  #   loopback smoke tests but produces silent zero-packet capture on
+  #   live SNAPs (observed n06 2026-05-20: cap binary up, shm armed,
+  #   n_recv_packets=0 for the entire soak because INADDR_LOOPBACK
+  #   doesn't pick up traffic destined for the 100GbE interface).
+  #   We use the per-host `hostargs:` mechanism (see search_rt.yaml
+  #   bind-host example) to pin the right NIC IP without parameterising
+  #   the YAML via tokens. IPs verified live on each node 2026-05-20.
+  #
+  # NO gate_on_paths on cap_a_real / cap_b_real. (M7.4 Phase 8b,
+  # 2026-05-29 — reverts the Phase 8 gating from 2026-05-28.)
+  #
+  # The Phase 8 change gated real capture on the corr_fast / corr_slow
+  # ready-sentinels to chase a fada nfull=68/70 reading. That gating
+  # DEADLOCKS real mode, for exactly the reason the synth_fada block
+  # above (see "NOTE: no gate_on_paths here") documents: cap_a_real is
+  # the head of the only chain that produces the PSRDADA *header* that
+  # corr_fast's Reader(fada) blocks on at init:
+  #     cap_a_real -> dada header -> dsaX_merge -> fada header
+  #         -> corr_fast.Reader(fada) unblocks -> warmup -> ready sentinel
+  # Gating cap_a_real on the corr ready-sentinels makes corr_fast wait
+  # for a header that can only come once cap_a_real runs, which only
+  # runs once corr_fast is ready: a hard deadlock (observed 2026-05-29
+  # fleet-wide — merge + corr_fast both parked in do_semtimedop, gate
+  # timed out at 300 s, capture force-spawned but still WAITING_FOR_ARM
+  # so no header was ever written).
+  #
+  # The fada nfull=68/70 cold-start fill that Phase 8 tried to fix is
+  # instead solved at the source by the kernel-warmup pass added to
+  # corr_fast_integration.py / corr_slow_compute.py: both consumers
+  # JIT-compile their GPU kernels on dummy blocks BEFORE touching the
+  # ready sentinel, so by the time the operator issues utc_start (which
+  # is the real "data starts flowing" signal — capture writes only the
+  # header on start, no data blocks until armed) the consumers are
+  # already at steady-state speed and drain fada from the first block.
+  # Verified on-sky 2026-05-29 (n04): n_dropped_kernel=0, 7.4 blocks/s,
+  # fada backlog (n_written - n_read) ~0-1 from the first armed block.
+  - name: cap_a_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
+    args: -o dada -p 4011    # SNAP UDP port 0 of this corr's pair (configs/config_corr.yaml capture.snap_udp_ports[0])
+    hostargs:
+      lxd110h03: -j 10.41.0.224
+      lxd110h04: -j 10.41.0.138
+      lxd110h05: -j 10.41.0.206
+      lxd110h06: -j 10.41.0.203
+      lxd110h07: -j 10.41.0.208
+      lxd110h08: -j 10.41.0.209
+      lxd110h10: -j 10.41.0.211
+      lxd110h11: -j 10.41.0.216
+      lxd110h12: -j 10.41.0.218
+      lxd110h14: -j 10.41.0.212
+      lxd110h15: -j 10.41.0.223
+      lxd110h16: -j 10.41.0.220
+      lxd110h18: -j 10.41.0.228
+      lxd110h19: -j 10.41.0.227
+      lxd110h21: -j 10.41.0.250
+      lxd110h22: -j 10.41.0.233
+  - name: cap_b_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-rt/src/dsart/capture/dsart_capture_manythread
+    args: -o eada -p 4012    # SNAP UDP port 1 (snap_udp_ports[1])
+    # NO gate_on_paths — see cap_a_real above (deadlock; warmup solves fill).
+    hostargs:
+      lxd110h03: -j 10.41.0.224
+      lxd110h04: -j 10.41.0.138
+      lxd110h05: -j 10.41.0.206
+      lxd110h06: -j 10.41.0.203
+      lxd110h07: -j 10.41.0.208
+      lxd110h08: -j 10.41.0.209
+      lxd110h10: -j 10.41.0.211
+      lxd110h11: -j 10.41.0.216
+      lxd110h12: -j 10.41.0.218
+      lxd110h14: -j 10.41.0.212
+      lxd110h15: -j 10.41.0.223
+      lxd110h16: -j 10.41.0.220
+      lxd110h18: -j 10.41.0.228
+      lxd110h19: -j 10.41.0.227
+      lxd110h21: -j 10.41.0.250
+      lxd110h22: -j 10.41.0.233
+
+  # Mon-publisher sidecar -- snapshots the POSIX-shm segments the two
+  # capture binaries publish, pushes into etcd at
+  # /mon/corr_rt/CN/capture/<port>. Active in both `real` (production)
+  # and `junkdb` (synthetic) modes -- in junkdb mode the shm doesn't
+  # exist and the sidecar publishes a single 'shm_status: missing'
+  # placeholder lane per port, so the dashboard surface stays stable
+  # across captures.mode flips.
+  - name: capture_control
+    cmd: python
+    args: -u -m dsart.services.capture_control --udp-ports 4011,4012 --cn-id CN --log-level INFO
+
+  # ---- merge (always on; reads dada+eada -> writes fada) ------------
+  # dsaX_merge reads dada+eada and writes fada (the merged-voltage
+  # ring that both corr_slow and corr_fast consume). -m enables
+  # multithread write. -c pins to a core; we pick CPU 12 (NUMA 1) so
+  # the merge isn't competing with corr_fast (NUMA 1 GPU 1 = CUDA :1)
+  # for cache, but is on the same NUMA node as fada (per
+  # configs/config_corr.yaml: fada.numa_cluster = 1).
+  # `merge` runs only in `real` and `junkdb` modes -- the modes that
+  # actually fill dada/eada via the capture binaries. In synth_fada
+  # and replay_burst the writers target fada directly so merge would
+  # produce a fada double-writer race; we omit it. The when-predicate
+  # parser only supports ==/!=, so two clones (one per mode) is the
+  # simplest way to express the OR.
+  - name: merge_real
+    when: captures.mode == real
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
+    args: -i dada -j eada -o fada -m -c 12
+  - name: merge_junkdb
+    when: captures.mode == junkdb
+    cmd: /home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge
+    args: -i dada -j eada -o fada -m -c 12
+
+  # ---- corr_slow (M2; reads fada -> writes bada) -------------------
+  # Production runs WITHOUT cal apply (slow-vis are emitted uncalibrated
+  # so meridian_fringestop / downstream pipelines can derive their own
+  # cal). Pinned to GPU 0 via CUDA_VISIBLE_DEVICES (see M7.1 lessons-
+  # learned below; without per-process GPU isolation the corr_slow +
+  # corr_fast pair hits a Triton "context is destroyed" race).
+  #
+  # M7.7: --chgroup fixes the channel->frequency map, which the
+  # Galactic HI guard needs; it costs nothing when flagging is off.
+  # RFI flagging itself is NOT enabled here. It is toggled fleet-wide
+  # at runtime from the dashboard Control tab via etcd
+  # /cnf/corr_slow_rfi (polled every 5 s), so a node that restarts
+  # picks up the current state rather than reverting to a CLI default.
+  # Turning it on changes what every downstream calibration sees.
+  # --rfi-antpos-cal supplies the antenna positions the core/arm split
+  # needs; without it only the per-antenna chain can run.
+  - name: corr_slow
+    cmd: python
+    args: -u -m dsart.services.corr_slow_compute --fada-key fada --bada-key bada --device cuda:0 --log-level INFO --ready-sentinel-path /tmp/dsart-corr-slow-CN.ready --chgroup CHGROUP --rfi-antpos-cal /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out --rfi-array-burst-mode flag
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  # ---- meridian_fringestop (M7.4 Phase 9; reads bada -> UVH5) ------
+  # The legacy slow-vis fringe-stopper, run UNMODIFIED from the casa38
+  # env (dsamfs / dsa110-meridian-fs) via the operator-side wrapper
+  # tools/ops/meridian_fringestop_rt.py. It is the FIRST of bada's two
+  # readers (bada is r:2); the second is selected per-node from
+  # /cnf/spectral_line (meridian_fringestop_spl OR bada_null_drain,
+  # below). corr_slow's back-pressure chain is held open by BOTH
+  # readers -- if either stalls for >40 s the ring fills and corr_slow
+  # deadlocks at the 301st write (see CAUTION below).
+  #
+  # bada (300 buffers ~= 40 s of slow-vis) gives meridian ~40 s of
+  # headroom to absorb hdf5 file-close jitter; legacy sustained this
+  # cadence. CAUTION: dsart_rt does NOT auto-restart routines, so if
+  # EITHER bada reader crashes corr_slow fills bada and deadlocks at the
+  # 301st write within ~40 s -- back-pressuring merge and stalling
+  # corr_fast (the M7.1/n06 deadlock). Watch
+  # /mon/corr_rt/<cn>/meridian_ready + /mon/corr_rt/<cn>/meridian_spl_ready
+  # (the wrappers' heartbeats) and re-issue `start` to recover.
+  #
+  # Env: casa38 python (cannot import dsart). taskset pins to NUMA 0
+  # cores 8-9,28-29 -- same socket as bada + corr_slow (NUMA 0 =
+  # 0-9,20-29 per lscpu on the corr nodes; corr_slow holds 4-5,24-25,
+  # corr_fast is on NUMA 1), away from capture/corr_slow and away from
+  # the SPL fringe-stopper (6-7,26-27 -- see below). CUSTOMDEC is
+  # substituted by dsart_rt with the observing dec at `start`; the
+  # wrapper snaps it to the 0.25 deg fstable-cache grid and pins
+  # dsamfs.get_pointing_declination to the snapped value so the cached
+  # table (built per-dec by tools/build_fstable_cache.py --from-etcd)
+  # is a guaranteed hit. PREREQUISITE: the fstable cache must exist at
+  # /home/ubuntu/data/fstables for the observing dec, else the wrapper
+  # fails fast with the exact build command (no silent slow regen).
+  - name: meridian_fringestop
+    cmd: taskset
+    args: -c 8-9,28-29 /home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-rt/tools/ops/meridian_fringestop_rt.py --cn-id CN --pt-dec-deg CUSTOMDEC --fstable-cache /home/ubuntu/data/fstables --working-dir /home/ubuntu/data --output-dir /home/ubuntu/data --log-level INFO
+
+  # ---- bada second reader (SPL ON): spectral-line fringe-stopper ----
+  # Spawned ONLY when this node's sub-band has spectral-line mode
+  # enabled in /cnf/spectral_line (spl_gate: on -> dsart_rt selects it
+  # against the per-node chgroup entry). A SECOND meridian_fringestop
+  # over the SAME bada ring, run with --spl so dsamfs writes a
+  # *_sb<NN>_spl.hdf5 product with a different channelisation
+  # (nfreq_int) and integration time (nint). The per-sub-band
+  # integration time + channel averaging come from the Control-tab
+  # panel via the SPL_INTEGRATION_S / SPL_NFREQ_INT tokens (dsart_rt
+  # substitutes them from /cnf/spectral_line at `start`); the casa38
+  # wrapper converts integration_s -> nint using the /cnf/corr tsamp
+  # and monkeypatches dsamfs.parse_params so the dsamfs install stays
+  # untouched (constraint D14).
+  #
+  # CPU pinning: fringe-stopping is CPU-heavy, so this gets its OWN
+  # 2 phys cores + HT siblings on NUMA 0 (6-7,26-27) -- distinct from
+  # the production fringe-stopper (8-9,28-29), corr_slow (4-5,24-25)
+  # and merge (NUMA 1, core 12). Output + working dir is /home/ubuntu/
+  # data/spl so the staged fstable symlink (named only by dec+nant,
+  # NOT nint) does not collide with the production fringe-stopper's.
+  # --allow-regenerate: if the operator changes the integration time
+  # away from the production 12.88 s (nint=96), the bw fstable shape
+  # (nint, nbls) no longer matches the cached production table; dsamfs
+  # then regenerates it once at the SPL nint (~30 s, needs casatools,
+  # which casa38 has) into the spl working dir. With the default
+  # integration time the production cache is re-used (no regen).
+  - name: meridian_fringestop_spl
+    spl_gate: "on"
+    cmd: taskset
+    args: -c 6-7,26-27 /home/ubuntu/anaconda3/envs/casa38/bin/python -u /home/ubuntu/proj/dsa110-rt/tools/ops/meridian_fringestop_rt.py --cn-id CN --pt-dec-deg CUSTOMDEC --fstable-cache /home/ubuntu/data/fstables --working-dir /home/ubuntu/data/spl --output-dir /home/ubuntu/data/spl --spl --integration-s SPL_INTEGRATION_S --nfreq-int-spl SPL_NFREQ_INT --allow-regenerate --log-level INFO
+
+  # ---- bada second reader (SPL OFF): no-op drain --------------------
+  # Spawned ONLY when this node's sub-band does NOT have spectral-line
+  # mode enabled (spl_gate: off). bada is r:2, so SOMETHING must hold
+  # the second reader slot open or corr_slow stalls at the 301st write;
+  # when SPL is off this no-op drain is that something. It reads every
+  # bada block and immediately markCleared()s it (see
+  # dsart.services.dada_drain for why the Python drain beats the buggy
+  # dada_dbnull). Light CPU (one memcpy-free release per 134 ms block),
+  # pinned to a single NUMA-0 core (6) it shares with the (never co-
+  # resident) SPL fringe-stopper.
+  - name: bada_null_drain
+    spl_gate: "off"
+    cmd: taskset
+    args: -c 6,26 python -u -m dsart.services.dada_drain --key bada --log-level INFO
+
+  # ---- corr_fast (M3 production integration; reads fada -> TX) -----
+  # Uses the FULL M3 integration shell (RFI flagger + cal + GEMM +
+  # static-sky + multi-DM-trial coarse-DM dedispersion + gridder +
+  # transport TX into the void).
+  #
+  # Op-point: REALTIME-FEASIBLE x32 integration (vs the production
+  # x8 used in earlier benches). At x8 the 2080Ti was not quite
+  # sustaining block cadence — every 4 blocks the gridder + dedisp
+  # would slip ~10-20 ms. x32 (1048.576 µs cadence; 4× longer
+  # integration) cuts the fast-vis tile count from 512/block to
+  # 128/block, dropping the gridder+dedisp work by ~4×. The matching
+  # coarse-DM trial count drops from 24 → 5 (band-local Δdm step
+  # scales linearly with t_int_fast, so we need ~4× fewer trials to
+  # cover the same DM range at the same smearing tolerance). With
+  # chan_sum_factor=8 (production F33) + sliding-window (production
+  # F34) this op-point sustains realtime with comfortable headroom
+  # on a single 2080Ti.
+  #
+  # Per-node cal blob: each corr node applies its OWN local
+  # `antennas.out` — the legacy x-engine beamformer-weights binary the
+  # upstream cal pipeline (calibration23 / update_bfweights.py) writes
+  # to `~/proj/dsa110-shell/dsa110-xengine/utils/antennas.out` on every
+  # corr node. Because the file is already node-local (it carries that
+  # node's own subband solution), the path is identical on all 16 corr
+  # nodes and needs no CALSB substitution. The blob is the same legacy
+  # format `dsart.cal.bf_weights.load_bf_weights` reads (the old
+  # `beamformer_weights_sb<NN>.dat` files were this same format), so the
+  # fast-corr cal loader consumes it unchanged. `--apply-cal` is read
+  # ONCE at routine spawn (process startup) — there is no hot-reload:
+  # `cmd: reload_cal` is accepted-and-logged by dsart_rt
+  # (`_LOGGED_VERBS`) but is an unimplemented no-op ("no-op until
+  # later M7 chunk" — see dsart_rt.py). To pick up a new weights file
+  # an operator must `stop` then `start` this instance (a fresh spawn
+  # re-reads the file). dsart_rt publishes what it actually loaded to
+  # `/mon/corr_rt/<cn>/cal_file` on each `start` so this can be
+  # cross-checked against the latest distributed solution. (CALSB is
+  # still substituted by dsart_rt for any other per-node args that
+  # want it; it is just no longer used here.)
+  #
+  # GPU isolation: CUDA_VISIBLE_DEVICES=1 hides GPU 0 from this
+  # process; the post-mask logical device 0 == physical GPU 1, which
+  # is the NUMA-1 GPU paired with fada (configs/config_corr.yaml::
+  # fada.numa_cluster = 1). Without this mask, simultaneous Triton
+  # JIT in corr_fast + corr_slow on the same node crashes one of
+  # them with "Triton Error [CUDA]: context is destroyed" — see
+  # M7-1-REPORT.md for the bisect.
+  # Option A (2026-06-03): corr-side stage-2 inter-chgroup alignment
+  # FIFO is enabled via --stage2-mode per_coarse_dm below. Each chgroup
+  # applies a per-coarse-DM integer-sample delay
+  # (Δτ(ν_bot_proc, ν_chgroup_TOP[g], coarse_dm)) so the wire-frame data
+  # is already aligned to ν_bot_proc at the search receiver. Pairs with
+  # the search side dropping --include-coarse-offset-in-search-shifts
+  # (default include_coarse_offset=False; see dsart_search_rt.yaml).
+  # Per-chgroup FIFO depth ≤ 11 cubes worst case (chgroup-0 at DM=2500);
+  # steady-state per-cube cost ≈ 1 ms (<1% of 130 ms budget); per-node
+  # FIFO memory peaks at ~1.1 GiB on chgroup-0. NB: comments MUST live
+  # outside the args: >- folded scalar (`#` characters inside it become
+  # literal argv tokens that argparse rejects — see 2026-06-03 incident).
+  # Sky monitor (E2E test 1, 2026-06-09): --sky-export-url makes each
+  # corr_fast POST its slot-0 static-sky window mean (~60 KB npz) to
+  # the h23 dashboard every 30 s; h23 combines the 16 chgroups into a
+  # fleet dirty image on the /sky tab. Fail-soft: a down dashboard
+  # never stalls the RT loop (bounded queue + daemon POST thread).
+  # Static-sky window (2026-06-09 fringe-rate fix): the subtracted
+  # estimate is a strict ~1 s sliding boxcar (--static-sky-window-s,
+  # 8 blocks), NOT the old alpha=0.001 EMA whose ~134 s time constant
+  # decorrelated against the ~6.9 s/2pi max core-baseline fringe
+  # winding (leaving bright sources largely unsubtracted).
+  # RFI time persistence (--rfi-persist, 2026-08-02): the four detectors
+  # are memoryless, so a transmitter sitting on a detector threshold
+  # blinks in and out at the 7.45 Hz cube cadence and leaves partly-
+  # excised RFI in the fast-vis stream. --rfi-persist latches any
+  # (ant, ch, pol) cell the detectors flag for a whole
+  # --rfi-persist-window-s (30 s = 224 cubes) and holds it flagged for
+  # --rfi-persist-hold-s (900 s = 6706 cubes) after they stop firing.
+  # --rfi-persist-frac 1.0 means "flagged in EVERY cube of the window",
+  # which needs only a consecutive-run counter: 2 int32 cube-shaped
+  # tensors (576 KB) and ~4 elementwise kernels per cube, no host sync.
+  # Lower it (e.g. 0.9) to tolerate gaps, at the cost of a
+  # [224, 96, 384, 2] uint8 ring (~16.5 MB). NOT YET EXERCISED ON SKY:
+  # to revert, delete the four --rfi-persist* lines, re-push with
+  # tools/ops/push_dsart_to_etcd.py and restart corr_fast. Watch the
+  # "rfi-persist: held=..." line in the corr_fast log (every 16 blocks)
+  # and total_flag_fraction on the dashboard's RFI row.
+  # Array-burst excision (M7.7; monitor 2026-09-08, ARMED 2026-09-09):
+  # the four per-antenna detectors all run inside ONE antenna, so a
+  # burst common to the whole array is ~13 sigma in the core sum and
+  # ~0.05 sigma everywhere they look, and passes straight through.
+  # --rfi-array-burst-mode flag adds a summed-autocorrelation detector
+  # over the core / EW arm / NS arm / outriggers at the M=64 (2.097 ms)
+  # accumulation SK already builds, and zeroes the (time, chan, pol)
+  # cells it fires on across EVERY antenna. Monitor-only for 18 h
+  # first: fired on 0.94% of samples (excluding the startup transient),
+  # zero dropped blocks, fada high-water 29/70 vs 69/70 before.
+  # Cost measured on n03: detector 1.24 ms on every block, plus the
+  # 3.02 ms time-resolved broadcast ONLY on blocks that actually fired
+  # (5f60d61 gates it behind a 0.03 ms .any(); paying it unconditionally
+  # was 4.7 ms and did NOT fit) = +1.30 ms amortised at the measured
+  # rate, against ~5.5 ms of p50 margin. To back it out: set this to
+  # `monitor` (detector still feeds the /arraysum tab, nothing is
+  # excised) or `off`, re-push, restart corr_fast. Watch fired_fraction
+  # per group on /arraysum and the Grafana H2 row.
+  #
+  # PAIRING INVARIANT: --flagants must come from the SAME calibration
+  # solve as --apply-cal. The cal push writes both files together
+  # (utils/antennas.out + scripts/flagants.dat); pointing --flagants at
+  # a frozen per-event snapshot lets a new cal flag antennas that stay
+  # in the beam (2026-08-06: 49/59/89 flagged at 14:01 UT, still
+  # beamformed for hours -- RFI-like candidate spray + decohered sky).
+  # R3 (2026-09-13): the two MAD-outlier detectors are stated as a FAR
+  # like SK, not as a hand-chosen k. "k = 5" never meant 5 sigma -- the
+  # median and MAD are estimated from the same finite sample -- so
+  # measured under the thermal null at this geometry (n_chan 384,
+  # M 4096), k=5.0 bought FAR 1.7e-6 for bandpass and 1.4e-5 for group
+  # against a Gaussian 5.7e-7.
+  #
+  # --bandpass-far / --group-far select the FAR route
+  # (dsart.rfi.far_calibration solves k under an explicit null and
+  # caches it). At 1e-4 that is k=4.01 bandpass / k=4.35 group, i.e.
+  # slightly MORE sensitive than before: on a thermal cube ~9 spurious
+  # cells per 73728 (0.012%) against a ~3% total flag fraction, bought
+  # for sensitivity to weaker narrowband lines. Put --bandpass-k 5.0 /
+  # --group-k 5.0 back to pin the old thresholds; an explicit k wins.
+  #
+  # Band-limited array-burst gate (--rfi-ab-bin-mode, 2026-09-14):
+  # the broadband gate above collapses its 24 per-bin significances to
+  # one occupancy number and requires >=90% of them, so an impulse
+  # confined to a few bins is rejected. Measured on archive dumps,
+  # that population is real and nothing else in the chain can reach
+  # it: ~1 sigma in any single antenna (a 3.34% excess against 3.12%
+  # per-antenna per-bin thermal noise), 8-10 sigma in the core sum,
+  # and SK does not respond at all -- SK-fired antenna fraction 0.007
+  # on those cells vs 0.009 when quiet -- because an impulse that
+  # fills the 2.097 ms accumulation is Gaussian inside it. The
+  # per-antenna chain's only available response is also 64x too coarse
+  # in time: its mask is per-cube, so it removes the channel for the
+  # whole 134 ms on the antennas that exceed threshold (0.56% of the
+  # cube) where the bin gate removes 2.097 ms across all of them
+  # (0.07%).
+  #
+  # Safety: a dispersed pulse and a band-limited impulse are
+  # indistinguishable in ONE sample (DM 500 sweeps ~3 bins; the
+  # measured RFI occupies a median of 2), so occupancy cannot separate
+  # them. What does is that a pulse MOVES: it visits each bin once or
+  # twice in a whole dump, while the interference revisits the SAME
+  # bins -- three bins carried 89% of hits in 260909dweu sb10, each
+  # active bin firing in a mean of 33.2 samples. So a bin must have
+  # fired in --rfi-ab-bin-persist-n of the last
+  # --rfi-ab-bin-window-cubes cubes before its excision arms, and that
+  # count is read CAUSALLY, from earlier cubes only. A pulse has no
+  # history and cannot arm its own excision. --rfi-ab-bin-k 6.0 has a
+  # measured FAR of 5.4e-5 per (sample, bin, pol) cell.
+  #
+  # Starting in `monitor` deliberately, as the broadband gate did:
+  # nothing is excised, and the mode / armed-bin count / excised-cell
+  # count appear in reserved header words 6-7 of the RFI shm segment.
+  # Set to `flag` to arm, `off` to skip it entirely.
+  #
+  # NB: everything under `args: >-` is a FOLDED SCALAR. A '#' there is
+  # NOT a comment -- it becomes a literal argv entry. Comments about
+  # the flags belong here, above the routine.
+  #
+  # DM PLAN (2026-09-23). dm_plan_N8_dmmin100_dmmax1500_tol1.265: 8
+  # coarse x 25 fine = 200 trials over DM 103-1496, bucket widths on a
+  # beta=0.05 ramp. Built to track gen_dmtrials.py at tol 1.30 as
+  # closely as the fixed-n_fine-per-bucket schema allows: realised step
+  # 5.96..8.04 pc/cm3 against Levin's 6.25..8.63 at the same DMs, i.e.
+  # within 7% everywhere (beta=0.10 was within 19%, beta=0 within 21%).
+  #
+  #   python tools/build_dm_plan_explicit.py \
+  #     --out .../dm_plan_N8_dmmin100_dmmax1500_tol1.265_csf8_explicit-v2.npz \
+  #     --dm-min 100 --dm-max 1500 --n-coarse 8 --n-fine-per-coarse 25 \
+  #     --beta 0.05 --chan-sum-factor 8 \
+  #     --t-int-fast-native 32 --t-int-search-us 1048.576
+  #
+  # Trade vs the previous 150-1290 / 34-fine plan: peak recovered S/N is
+  # x0.941 at W=1 ms, because n_coarse is pinned at 8 by the v2 plan
+  # schema (build_dm_plan.build_partition requires n_coarse ==
+  # N_SEARCH * N_SEARCH_GPU) so a wider range means wider buckets and
+  # more INTRA-CHGROUP smear -- 3.18 samples mean, up from 2.93, and no
+  # fine trial can undo it. Bought with: DM range 103-1496 instead of
+  # 150-1290, 200 trials instead of 272 (26% less search-node work on a
+  # fleet running ~8% behind), and a fine step back in the 6-8 pc/cm3
+  # band that c1.merger.dm_max_trials=2 was tuned for.
+  #
+  # n_pre=14 on voltage_retention still covers this: tau_sweep(1496) =
+  # 0.85 s = 7 blocks. Unchanged.
+  #
+  # --n-sub 4 (2026-09-23): stage 1 references each quarter-chgroup to
+  # its own top channel and grids it to its own uv plane; the async TX
+  # ships each as its own stream (id chgroup*4 + s, own pattern_id and
+  # sequence counters). Cuts the uncorrectable intra-chgroup smear from
+  # ~3.2 to ~0.8 samples. Corr cost, measured: stage-1 dedisp+grid is
+  # unchanged in structure (one fused kernel over the concatenated
+  # 4-plane cell axis, ~2.6x the cells); TX worker 32 ms/block at
+  # n_sub=4 with the vectorised encode (was 33 ms at n_sub=1 before it,
+  # and 157 ms -- 117% duty -- would have been n_sub=4 without it).
+  # MUST match search_compute --n-sub and search_rx --n-corr 64; see
+  # the SUB-BAND STREAMS note in dsart_search_rt.yaml.
+  # 2x: ${var} values are rendered per CP1 format id + v3 plan by
+  # `push_dsart_to_etcd.py --opoint <2x id> --plan <npz>` from
+  # dsart.x2.opoint.opoint_from_id(<id>) (SPEC §1) and the plan: fast vis
+  # t_int 8 native (0.262 ms), csf 2 (61 kHz), n_sub from the format, the
+  # plan's path. Time units are checked against the op-point
+  # (opoint_runtime.time_units_for).
+  - name: corr_fast
+    cmd: python
+    args: >-
+      -u -m dsart.services.corr_fast_integration
+      --fada-key fada
+      --chgroup CHGROUP
+      --obs-dec-deg CUSTOMDEC
+      --device cuda:0
+      --apply-cal /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
+      --cal-mode phase_only
+      --flagants /home/ubuntu/proj/dsa110-shell/dsa110-xengine/scripts/flagants.dat
+      --sk-far 1e-4
+      --bandpass-far 1e-4
+      --group-far 1e-4
+      --sumthr-max-m 8
+      --sumthr-eta 1.5
+      --rfi-m-values 64,256,1024,4096
+      --rfi-persist
+      --rfi-persist-window-s 30
+      --rfi-persist-hold-s 900
+      --rfi-persist-frac 1.0
+      --rfi-array-burst-mode flag
+      --rfi-ab-bin-mode monitor
+      --opoint ${opoint_id}
+      --t-int-fast-native ${t_int_fast_native}
+      --dm-plan-path ${plan_path}
+      --chan-sum-factor ${chan_sum_factor}
+      --n-sub ${n_sub}
+      --cell-lambda-mode tee45
+      --sliding-window
+      --n-grid 256
+      --transport-tx-mode X2TODO:WS-T:frame-v2-tx-mode
+      --transport-tx-workers X2TODO:WS-T:c-sender-workers
+      --transport-tx-host 10.41.0.205
+      --transport-tx-base-port 6625
+      --transport-tx-coarse-dm-mask X2TODO:WS-T:coarse-dm-to-half-map
+      --transport-tx-worker-hosts 10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238
+      --stage2-mode X2TODO:WS-C:stage2-fifo-off
+      --max-blocks 0
+      --output-dir /home/ubuntu/tmp/dsart-fast-grid
+      --blocks-output-mode none
+      --log-level INFO
+      --ready-sentinel-path /tmp/dsart-corr-fast-CN.ready
+      --rfi-mon-cn-id CN
+      --rfi-mon-window-size 16
+      --rfi-mon-freq-downsample 4
+      --rfi-mon-shm-slots 64
+      --inject-watch
+      --static-sky-window-s 1.0
+      --sky-export-url http://lxd110h23.pro.pvt:5778/sky/ingest
+      --sky-export-interval-s 30
+    env:
+      CUDA_VISIBLE_DEVICES: "1"
+
+  # M7.6 RFI monitor exporter sidecar. Sibling of corr_fast — reads
+  # the 16-cube window shm /dev/shm/dsart-rfi-window-CN that
+  # corr_fast_integration publishes, exposes it over HTTP on port
+  # 5780 (h23 dashboard pulls), and pushes the scalar window
+  # summary to etcd at /mon/corr_rt/CN/rfi every 2 s.
+  #
+  # Lifecycle: starts whenever corr_fast does; safe to start even
+  # when the shm isn't there yet (it retries every cadence). No GPU
+  # usage; no CUDA_VISIBLE_DEVICES setting.
+  - name: rfi_monitor_export
+    cmd: python
+    args: >-
+      -u -m dsart.services.rfi_monitor_export
+      --cn-id CN
+      --etcd-cadence-s 2.0
+      --staleness-s 10.0
+      --http-bind 0.0.0.0
+      --http-port 5780
+      --log-level INFO
+
+  # ---- voltage_retention (M8; reads fada -> RAM ring -> NVMe on C2) --
+  # Third fada reader (see buffers.fada r:3 above). Maintains a private
+  # ~15 s (~32 GiB) RAM ring of raw FADA blocks so that when a C2 voltage
+  # trigger arrives (UDP, DUMP_VOLTAGE flag) — up to ~30 s after the burst
+  # in the worst case — the ~3 s window around the burst is still in RAM
+  # and can be staged to NVMe for C3 to pull. Decoupling:
+  #
+  #   fada --(reader thread: memcpy + markCleared, NUMA 1)--> RAM ring
+  #   RAM ring --(dump worker thread: extract window + write fragment)--> NVMe
+  #   UDP :11229 --(asyncio listener: decode trigger -> enqueue dump)
+  #
+  # The reader thread does NO disk I/O so it can never stall merge; the
+  # dump worker reads the decoupled ring, never fada. Injections get NO
+  # voltage dump (C2 suppresses the DUMP_VOLTAGE broadcast for synthetic
+  # events), so this service only ever stages real candidates.
+  #
+  # Sizing: --retention-s 25 at 288 MiB/block, 7.4 blocks/s ≈ 187 blocks
+  # ≈ 52.6 GiB resident (NUMA-1 DRAM is 96 GiB; corr_fast + fada n=70
+  # (~20 GiB) leave ~23 GiB headroom). Raised 15 → 25 s (2026-07-15)
+  # after the C1→C2 trigger latency (~10-17 s when the search pipeline
+  # is backlogged; it has only ~4% realtime headroom) cost two of the
+  # first night's three dumps (260715oeee/msyj staged 0 blocks).
+  #
+  # Window (2026-07-15 timing fix, docs/voltage_dumps/
+  # VOLTAGE_DUMP_TIMING_FIX.md): the C1/C2 event label is the pulse
+  # arrival at the BOTTOM of the band (ν_bot = 1.311 GHz; the corr
+  # stage-2 FIFO aligns all chgroups to it), so the burst lies BEFORE
+  # the target block, up to τ_sweep(DM) = 5.65916e-4 × DM seconds
+  # earlier (1.50 s at the deployed fine-DM max 2652.98). Hence:
+  #   n_pre  ≥ ceil(τ_sweep(DM_max_fine)/0.134217728) + 1  = 13 → 14
+  #   n_post ≥ pulse width + intra-chgroup smear (≤ ~0.1 s) + margin → 8
+  # If the deployed dm-plan's fine-DM max changes, re-derive n_pre
+  # (guarded by tests/test_voltage_dump_containment.py).
+  #
+  # CPU pinning: NUMA 1 (same socket as fada, GPU 1, the 100GbE search
+  # NIC) cores 18-19,38-39 — 2 phys cores + HT siblings, clear of merge
+  # (-c 12) and corr_slow (NUMA 0). The memcpy is ~2.1 GiB/s on one core;
+  # the second core covers the dump worker's burst NVMe writes.
+  #
+  # --bind-host 0.0.0.0 so the listener accepts the C2 (h23) trigger on
+  # the 10.41.0.x corr-net NIC. --staging-dir is the local NVMe scratch
+  # C3 rsyncs fragments out of. NO gate_on_paths: the reader must attach
+  # to fada as soon as the ring exists (it is one of fada's three required
+  # readers; a late attach would back-pressure merge until it joins).
+  - name: voltage_retention
+    cmd: taskset
+    args: >-
+      -c 18-19,38-39 python -u -m dsart.services.voltage_retention
+      --fada-key fada
+      --cn-id CN
+      --chgroup CHGROUP
+      --bind-host 0.0.0.0
+      --bind-port 11229
+      --staging-dir /home/ubuntu/data/voltage_staging
+      --retention-s 25.0
+      --n-pre X2TODO:WS-D:n-pre-for-dm3000
+      --n-post 8
+      --dump-wait-s 5.0
+      --mon-interval-s 5.0
+      --ready-sentinel-path /tmp/dsart-voltage-retention-CN.ready
+      --min-free-bytes-floor 17179869184
+      --staging-max-total-bytes 128849018880
+      --staging-orphan-ttl-s 7200
+      --orphan-sweep-interval-s 300
+      --log-level INFO
+  #
+  # --min-free-bytes-floor / --staging-max-total-bytes (2026-07-21 ENOSPC
+  # fleet stall): a C2 voltage-dump broadcast storm (dozens of triggers
+  # 19:20-21:42 UT, each staging ~6.47 GiB/corr node) filled the root
+  # filesystem on 9/16 corr nodes with NO free-space check anywhere in
+  # voltage_retention.py. The full disk stalled the meridian UVH5 writer
+  # sharing this filesystem -> bada back-pressure -> corr_slow blocked ->
+  # fada deadlock -> corr_fast TX froze on 3 nodes -> below
+  # --fan-in-min-corrs 15/16 -> all 8 search consumers stalled 25 min.
+  # A dump is now refused (logged once, counters
+  # dumps_skipped_disk_full / dumps_skipped_staging_cap on the mon
+  # payload) rather than written, whenever either guard trips; the RAM
+  # ring / reader thread are unaffected either way.
+  #   --min-free-bytes-floor: 16 GiB (17179869184 B). Refuse when free
+  #   space would drop below max(2 x expected fragment size ~12.9 GiB
+  #   at n_pre=14/n_post=8, this floor).
+  #   --staging-max-total-bytes: 120 GiB (128849018880 B). Cumulative
+  #   cap on --staging-dir; bounds the storm case even when the disk is
+  #   otherwise empty (~18 fragments at ~6.47 GiB before C3 catches up).
+  #
+  # --staging-orphan-ttl-s / --orphan-sweep-interval-s (2026-07-24 orphan
+  # eviction): the cap above has NO eviction, and C3 only deletes events
+  # it adjudicates. A C2 dump-trigger whose event C2 then DISCARDS
+  # (cube-incomplete under an RFI storm — the common case) strands its
+  # ~6.5 GiB/node fragment forever. On 2026-07-23, 31 such orphans
+  # (~1.81 TiB fleet-wide) pinned the cap and voltage_retention skipped
+  # ~half of every dump for ~18 h (dead voltage capability). The sweeper
+  # evicts any fragment older than the TTL (counter orphans_evicted on
+  # the mon payload). TTL 7200 s (2 h) >> c3.collect_timeout_s (1800 s),
+  # so a legitimate KEEP fragment awaiting C3 collection is never
+  # touched. Raise the TTL if c3.collect_timeout_s is raised.
