@@ -1,0 +1,4 @@
+__pycache__/
+*.log
+results/valuemaps_*.npz
+_wsplan/
