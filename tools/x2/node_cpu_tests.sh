@@ -9,7 +9,10 @@
 # - -b rebuilds C extensions in the scratch copy (setup.py build_ext --inplace);
 # - every file runs separately: nice 19, ionice idle, one core, single-threaded BLAS, no GPU
 #   (CUDA_VISIBLE_DEVICES=""), `-m "not x2_gpu"`, shell timeout (no pytest-timeout on nodes);
-# - aborts if `import dsart` does not resolve to the scratch copy.
+# - aborts if `import dsart` does not resolve to the scratch copy;
+# - every build/test runs under tools/x2/prod_guard.sh, which kills it if any search half on the node
+#   starts to lag (2026-10-22: an mmap reader of the RX ring cost 41.5 s of production data on n13);
+#   a trip stops the run (exit 4).
 set -eo pipefail
 NODE=n13.pro.pvt
 TAG=$(git rev-parse --abbrev-ref HEAD | tr '/' '_')
@@ -33,7 +36,7 @@ rsync -a --exclude='*.so' --exclude='__pycache__' --exclude='*.pdf' --exclude='*
   "$ROOT/src" "$ROOT/tests" "$ROOT/tools" "$ROOT/configs" "$ROOT/bench" "$ROOT/docs" "$ROOT/setup.py" \
   "$NODE:$SCR/"
 if [ $BUILD = 1 ]; then
-  ssh -o BatchMode=yes "$NODE" "cd $SCR && $LOW taskset -c $CORE env $ENVS $PY setup.py -q build_ext --inplace > /dev/null"
+  ssh -o BatchMode=yes "$NODE" "cd $SCR && bash tools/x2/prod_guard.sh $LOW taskset -c $CORE env $ENVS $PY setup.py -q build_ext --inplace > /dev/null"
 fi
 WHERE=$(ssh -o BatchMode=yes "$NODE" "cd $SCR && env $ENVS $PY -c 'import dsart; print(dsart.__file__)'")
 case "$WHERE" in
@@ -43,10 +46,14 @@ esac
 
 fail=0
 for f in "$@"; do
-  out=$(ssh -o BatchMode=yes "$NODE" "cd $SCR && $LOW taskset -c $CORE env $ENVS timeout 900 \
-        $PY -m pytest -q -p no:cacheprovider -m 'not x2_gpu' $f 2>&1 | tail -15" || true)
+  out=$(ssh -o BatchMode=yes "$NODE" "cd $SCR && bash tools/x2/prod_guard.sh $LOW taskset -c $CORE env $ENVS \
+        timeout 900 $PY -m pytest -q -p no:cacheprovider -m 'not x2_gpu' $f 2>&1 | tail -15" || true)
   echo "=== $f"
   echo "$out"
+  if echo "$out" | grep -q "PRODUCTION_GUARD"; then
+    echo "ABORT: production guard tripped on $NODE; remaining files not run"
+    exit 4
+  fi
   echo "$out" | grep -q -E "passed|no tests ran" && ! echo "$out" | grep -q -E "failed|error" || fail=1
 done
 exit $fail
