@@ -98,7 +98,10 @@ def test_too_late_claim_miss_no_rescue(tmp_path: Path) -> None:
 
 def test_hit_drops_pending_and_dispatches(tmp_path: Path) -> None:
     ring = CubeRetentionRing(depth=2, t_det=4, n_fdm=2, n_grid=4, pinned=False)
-    _stage(ring, cube_id=0, specnum=1000)  # window [1000, 1064)
+    # window [1000, 1004): a cube spans t_det SEARCH samples (the old
+    # [1000, 1064) assumed the t_det x sample_period_specnum units bug that
+    # cube_pipeline.find_cube_for_specnum fixed; this test predated it).
+    _stage(ring, cube_id=0, specnum=1000)
     stager = _FakeStager()
     dispatched: List[int] = []
     listener = C2TriggerListener(
@@ -107,9 +110,9 @@ def test_hit_drops_pending_and_dispatches(tmp_path: Path) -> None:
         stager=stager,
         dispatcher=lambda r, p, m: (dispatched.append(int(p.event_specnum)), True)[1],
     )
-    listener._handle_trigger(_packet("ev", 1010), ("10.0.0.1", 5))
-    assert dispatched == [1010]
-    assert stager.drop_calls == [1010]
+    listener._handle_trigger(_packet("ev", 1002), ("10.0.0.1", 5))
+    assert dispatched == [1002]
+    assert stager.drop_calls == [1002]
     assert stager.claim_calls == []
     mon = listener.mon
     assert mon["hits"] == 1
