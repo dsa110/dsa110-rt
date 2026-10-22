@@ -7,17 +7,20 @@
         x_v,d[t] = sum_{(row, k) -> v} V'[t + s1[k, d], k, row]      (V' = conj if flagged)
       --decimate x2 (tier A) / x4 (tier B), aligned to the absolute clock-->
       --static sky (StaticSkyMean semantics, one state per (d, value))-->
-      --row rule (SPEC §4): / sqrt(n), robust EMA sigma, mid-rise codes-->
-      --frame v2 (SPEC §5)--> datagram bytes
+      --row rule (SPEC §4, WS-T's dsart.x2.quant reference)-->
+      --frame v2 (SPEC §5, WS-T's prod_frame2)--> datagram bytes
 
 Everything is float64 numpy, written for clarity, and independent of the
 GPU code: gridding is geometric (each (row, channel) source is placed in
 its value slot with ``np.add.at`` from the uv geometry, never from the
-CSR the kernels use); the stage-1 table is recomputed from the oracle's
-formula (:mod:`dsart.x2.corr.plan2x`, pinned to
-``docs/timeres_study/snr2x/schemes.py``). Only the *contract* objects --
-the value order of each stream and the redundancy classes -- come from
-the value map, because they define the wire format.
+CSR the kernels use); the stage-1 table is the tiered plan's, which the
+tests pin to ``docs/timeres_study/snr2x/schemes.py`` and to an independent
+restatement of a1. Only the *contract* objects -- the value order of each
+stream and the redundancy classes -- come from the value map, because they
+define the wire format; the row rule and the frame codec are WS-T's
+references (``dsart.x2.quant``, ``dsart.transport.prod_frame2``), called,
+not restated. The GPU stores the fast visibilities as cfp16 (Phase 0:
+S/N factor 1 - 2e-8), the reference keeps float64.
 
 Sizes are free: tests run with a handful of packets per block and a
 subset of antennas/channels; nothing here assumes the production shape.
@@ -36,35 +39,29 @@ Conventions (today's, verbatim):
 """
 from __future__ import annotations
 
-import math
-import struct
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from dsart.coarse_dm.dm_plan import build_summed_chgroup_freq_table_GHz
-from dsart.common.constants import LEGACY_FLUFF_SCALE, NATIVE_SAMPLE_US, SPEED_OF_LIGHT_M_S
+from dsart.common.constants import LEGACY_FLUFF_SCALE, SPEED_OF_LIGHT_M_S
 from dsart.x2.corr.plan2x import CorrPlan2x
 
 __all__ = [
-    "FRAME2_HEADER",
-    "MAGIC",
-    "Frame2Header",
-    "RowRuleState",
+    "Corr2xRef",
     "StaticSkyRef",
     "apply_cal",
     "apply_masks",
     "decimate",
-    "decode_row_rule",
+    "frames_for_block",
     "gemm_core",
     "pack_bits_le",
-    "pack_frame2",
-    "pack_stream_block",
-    "quantise_row_rule",
+    "payload_row",
+    "quantise_flow",
     "quantise_v1_rows",
+    "sample_bytes",
     "stage1_values",
     "unpack_bits_le",
-    "unpack_frame2",
     "unpack_int4_onwire",
     "value_dest_cells",
     "value_dest_classes",
@@ -276,78 +273,14 @@ class StaticSkyRef:
 # row rule (SPEC §4) and v1 cint8
 # ---------------------------------------------------------------------------
 
-S_MAIN = {4: 0.336, 5: 0.191, 6: 0.106}
-"""Main step in sigma units per bits-per-component (SPEC §4; Phase 0 confirms)."""
-
-
-@dataclass
-class RowRuleState:
-    """Per (stream, coarse DM) robust sigma (EMA), SPEC §4 step 2:
-    1.4826 x the LOWER median of ``|re|, |im|`` over every ``stride``-th
-    sample of the block, excluding components above ``clip_sigma`` x the
-    previous sigma; EMA with ``tau_s``. A block is quantised with the
-    previous sigma (its own estimate for the first block)."""
-
-    tau_s: float = 10.0
-    block_s: float = 4096 * NATIVE_SAMPLE_US * 1e-6
-    clip_sigma: float = 6.0
-    stride: int = 4
-    sigma: dict = field(default_factory=dict)
-
-    @property
-    def alpha(self) -> float:
-        return 1.0 - math.exp(-self.block_s / self.tau_s)
-
-    def robust(self, y: np.ndarray, prev: float | None) -> float:
-        ys = y[:: self.stride]
-        comp = np.abs(np.stack([ys.real, ys.imag], axis=-1)).ravel()
-        if prev is not None:
-            comp = comp[comp <= self.clip_sigma * prev]
-        if comp.size == 0:
-            return float(prev) if prev is not None else 1.0
-        k = (comp.size - 1) // 2
-        return float(1.4826 * np.partition(comp, k)[k])
-
-    def step(self, key, y: np.ndarray) -> float:
-        """Sigma used to quantise this block, then advance the EMA."""
-        prev = self.sigma.get(key)
-        est = self.robust(y, prev)
-        use = est if prev is None else prev
-        self.sigma[key] = est if prev is None else prev + self.alpha * (est - prev)
-        return max(use, 1e-30)
-
-
-def quantise_row_rule(
-    x: np.ndarray,
-    n: np.ndarray,
-    n_heavy: int,
-    sigma: float,
-    *,
-    bits: int,
-    s_heavy: float = 0.1,
-    s_main: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """SPEC §4 rows ``x[t, v]`` (one stream, one coarse DM) ->
-    ``(heavy_codes int8 (t, n_heavy, 2), main_codes int (t, V-n_heavy, 2),
-    step_main, step_heavy)``; codes are mid-rise ``floor(y / step)`` clipped
-    to the signed range, ``y = x / sqrt(n)``."""
-    y = x / np.sqrt(np.asarray(n, np.float64))[None, :]
-    s_m = S_MAIN[bits] if s_main is None else s_main
-    step_m, step_h = s_m * sigma, s_heavy * sigma
-    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
-    ri = np.stack([y.real, y.imag], axis=-1)
-    h = np.clip(np.floor(ri[:, :n_heavy] / step_h), -128, 127).astype(np.int8)
-    m = np.clip(np.floor(ri[:, n_heavy:] / step_m), lo, hi).astype(np.int16)
-    return h, m, step_m, step_h
-
-
-def decode_row_rule(h, m, n, n_heavy, *, bits, s_heavy=0.1, s_main=None) -> np.ndarray:
-    """Owner-side decode in sigma units, re-weighted by sqrt(n) (SPEC §4.5)."""
-    s_m = S_MAIN[bits] if s_main is None else s_main
-    vh = (h.astype(np.float64) + 0.5) * s_heavy
-    vm = (m.astype(np.float64) + 0.5) * s_m
-    v = np.concatenate([vh, vm], axis=1)
-    return (v[..., 0] + 1j * v[..., 1]) * np.sqrt(np.asarray(n, np.float64))[None, :]
+def quantise_flow(blocks, n_contrib, n_heavy: int, rule) -> list:
+    """SPEC §4 on one (stream, coarse DM) flow, block by block, by WS-T's
+    reference (:class:`dsart.x2.quant.RowQuantiser`; the row rule is WS-T's,
+    this reference does not restate it). ``blocks``: iterable of ``(S, V)``
+    complex arrays. Returns ``quant.BlockCodes`` per block."""
+    from dsart.x2.quant import RowQuantiser  # noqa: PLC0415
+    q = RowQuantiser(rule=rule, n_contrib=np.asarray(n_contrib), n_heavy=int(n_heavy))
+    return [q.process_block(np.asarray(x)) for x in blocks]
 
 
 def quantise_v1_rows(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -390,111 +323,23 @@ def unpack_bits_le(buf: bytes, bits: int, count: int) -> np.ndarray:
     return np.where(vals & sign, vals - (1 << bits), vals)
 
 
-MAGIC = 0xD5A1107E
-FRAME2_HEADER = struct.Struct("<IHHQQHHBBBBHBBIQIffI8s")
-assert FRAME2_HEADER.size == 72
-
-
-@dataclass(frozen=True)
-class Frame2Header:
-    flags: int
-    seq_first: int
-    t0_native: int
-    stream_id: int
-    dm_idx: int
-    k: int
-    n_sub: int
-    bits_main: int
-    bits_heavy: int
-    n_grid: int
-    t_int_factor: int
-    value_kind: int
-    n_values: int
-    pattern_id: int
-    n_heavy: int
-    step_main: float
-    step_heavy: float
-    payload_bytes: int
-    version: int = 2
-    magic: int = MAGIC
-
-
-def pack_frame2(h: Frame2Header, payload: bytes) -> bytes:
-    if len(payload) != h.payload_bytes:
-        raise ValueError("payload_bytes mismatch")
-    return FRAME2_HEADER.pack(
-        h.magic, h.version, h.flags, h.seq_first, h.t0_native, h.stream_id, h.dm_idx,
-        h.k, h.n_sub, h.bits_main, h.bits_heavy, h.n_grid, h.t_int_factor, h.value_kind,
-        h.n_values, h.pattern_id & 0xFFFF_FFFF_FFFF_FFFF, h.n_heavy, h.step_main,
-        h.step_heavy, h.payload_bytes, b"\0" * 8,
-    ) + payload
-
-
-def unpack_frame2(buf: bytes) -> tuple[Frame2Header, bytes]:
-    f = FRAME2_HEADER.unpack_from(buf, 0)
-    h = Frame2Header(
-        magic=f[0], version=f[1], flags=f[2], seq_first=f[3], t0_native=f[4],
-        stream_id=f[5], dm_idx=f[6], k=f[7], n_sub=f[8], bits_main=f[9], bits_heavy=f[10],
-        n_grid=f[11], t_int_factor=f[12], value_kind=f[13], n_values=f[14], pattern_id=f[15],
-        n_heavy=f[16], step_main=f[17], step_heavy=f[18], payload_bytes=f[19],
-    )
-    return h, bytes(buf[72: 72 + h.payload_bytes])
-
-
-FLAG_HEAVY_PRESENT = 1 << 5
-MAX_PAYLOAD = 8900
-
-
 def sample_bytes(n_values: int, n_heavy: int, bits_main: int) -> int:
-    """Bytes per sample: heavy cint8 pairs + the byte-padded main stream."""
+    """Bytes per stream sample: heavy cint8 pairs + the byte-padded main stream."""
     return 2 * n_heavy + ((n_values - n_heavy) * bits_main + 7) // 8
 
 
-def pack_stream_block(
-    h_codes: np.ndarray,
-    m_codes: np.ndarray,
-    *,
-    bits_main: int,
-    t0_native: int,
-    T_native: int,
-    stream_id: int,
-    dm_idx: int,
-    n_sub: int,
-    n_grid: int,
-    value_kind: int,
-    pattern_id: int,
-    step_main: float,
-    step_heavy: float,
-    flags: int = 0,
-) -> list[bytes]:
-    """Datagrams for one (stream, coarse DM) block of rows: ``k =
-    floor(8900 / bytes_per_sample)`` samples each (the last may be
-    shorter). ``bits_main`` is per complex value (8/10/12)."""
-    n_t, n_heavy = h_codes.shape[0], h_codes.shape[1]
-    n_values = n_heavy + m_codes.shape[1]
-    b_comp = bits_main // 2
-    sb = sample_bytes(n_values, n_heavy, bits_main)
-    k = max(1, MAX_PAYLOAD // sb)
-    if n_heavy:
-        flags |= FLAG_HEAVY_PRESENT
-    out = []
-    for t_start in range(0, n_t, k):
-        t_end = min(n_t, t_start + k)
-        parts = []
-        for t in range(t_start, t_end):
-            parts.append(np.asarray(h_codes[t], np.int8).tobytes())
-            parts.append(pack_bits_le(m_codes[t], b_comp))
-        payload = b"".join(parts)
-        t0 = int(t0_native) + t_start * int(T_native)
-        out.append(pack_frame2(Frame2Header(
-            flags=flags, seq_first=t0 // int(T_native), t0_native=t0,
-            stream_id=stream_id, dm_idx=dm_idx, k=t_end - t_start, n_sub=n_sub,
-            bits_main=bits_main, bits_heavy=16 if n_heavy else 0, n_grid=n_grid,
-            t_int_factor=T_native, value_kind=value_kind, n_values=n_values,
-            pattern_id=pattern_id, n_heavy=n_heavy, step_main=float(step_main),
-            step_heavy=float(step_heavy), payload_bytes=len(payload),
-        ), payload))
-    return out
+def payload_row(codes_heavy: np.ndarray, codes_main: np.ndarray, comp_bits: int) -> bytes:
+    """One stream sample's payload (SPEC §5): heavy (re, im) int8 pairs, then
+    the main codes as one little-endian bit stream, re then im per value."""
+    return (np.asarray(codes_heavy, np.int8).tobytes()
+            + pack_bits_le(np.asarray(codes_main), comp_bits))
+
+
+def frames_for_block(codes_heavy, codes_main, **header) -> list:
+    """Datagrams of one corr block of one flow, through WS-T's frame-v2
+    codec (``dsart.transport.prod_frame2.iter_block_datagrams``)."""
+    from dsart.transport import prod_frame2  # noqa: PLC0415
+    return list(prod_frame2.iter_block_datagrams(codes_heavy, codes_main, **header))
 
 
 # ---------------------------------------------------------------------------

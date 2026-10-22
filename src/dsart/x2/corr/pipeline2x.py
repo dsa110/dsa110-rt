@@ -58,7 +58,7 @@ from dsart.x2.corr.gemm2x import (
     reduce_classes,
     ring_write_reference,
 )
-from dsart.x2.corr.packer2x import RowRulePacker
+from dsart.x2.corr.packer2x import PackerRule, RowRulePacker, heavy_step_phase0
 from dsart.x2.corr.pipeline1x import PipelinedCorrFast, _Done
 from dsart.x2.corr.plan2x import CorrPlan2x
 from dsart.x2.corr.stage1_cuda import Stage1Csr, geometry_for, stage1_csr, stage1_twin
@@ -106,6 +106,23 @@ class RecordingTx2x:
         return sum(int(p["payload"].shape[0] * p["payload"].shape[1]) for p in packets)
 
 
+def default_rule_2x(vm, *, bits_main: int, hold_blocks: int) -> PackerRule:
+    """The row rule the 2x corr runs: WS-T's ``quant.RowRule`` defaults when
+    that module is present (the packer is bit-equal to it), else the Phase-0
+    recommendation (tau 3 s, no |y| exclusion, skip blocks < 50% non-zero);
+    the heavy step from Phase 0 §2 for this map; sigma held until the
+    static-sky warm-up is over."""
+    n_max = max(int(st.n_contrib.max()) for st in vm.streams)
+    s_h = heavy_step_phase0(n_max, int(vm.n_image))
+    try:
+        from dsart.x2.quant import RowRule  # noqa: PLC0415
+    except ImportError:
+        return PackerRule(comp_bits=bits_main // 2, s_heavy=s_h, tau_s=3.0,
+                          excl_sigma=float("inf"), min_frac=0.5, hold_blocks=hold_blocks)
+    return PackerRule.from_quant(RowRule(comp_bits=bits_main // 2), s_heavy=s_h,
+                                 hold_blocks=hold_blocks)
+
+
 def injection_active(injector, block_n: int) -> bool:
     """True if any pending injection's footprint overlaps block ``block_n``
     (same window arithmetic as ``OnlineInjector.apply_block``)."""
@@ -145,6 +162,7 @@ class Corr2xPipeline(PipelinedCorrFast):
         vm,
         is_core_baseline_mask: np.ndarray,
         bits_main: int = 8,
+        rule: PackerRule | None = None,
         class_reduce: bool | None = None,
         tx2x: Tx2xStage | None = None,
         static_sky_window_blocks: int = 8,
@@ -178,6 +196,8 @@ class Corr2xPipeline(PipelinedCorrFast):
         self.stream_ids = [g * vm.n_sub + s for s in range(vm.n_sub)]
         # ring rows actually read by stage 1 (the CPU path only builds these)
         self.needed_rows = np.unique(self.csr.row)
+        self.rule = rule if rule is not None else default_rule_2x(
+            vm, bits_main=bits_main, hold_blocks=static_sky_warmup)
         dms_keep = None if dm_subset is None else set(int(d) for d in dm_subset)
         self.tiers: list[_TierState] = []
         for ti, t in enumerate(plan.tiers):
@@ -191,7 +211,7 @@ class Corr2xPipeline(PipelinedCorrFast):
                                   warmup_cubes=static_sky_warmup, device=ctx.device)
             pk = RowRulePacker(n_d=len(local), value_offsets=self.voff,
                                n_contrib=self.csr.n_contrib, n_heavy=self.n_heavy,
-                               bits_main=bits_main, device=ctx.device)
+                               rule=self.rule, device=ctx.device)
             ts = _TierState(ti=ti, name=t.name, dms=np.asarray([t.d0 + c for c in local]),
                             shifts=shifts, geo=geo, D=t.decim, T_native=t.T_native,
                             static_sky=ss, packer=pk)

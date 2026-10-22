@@ -3,10 +3,12 @@
 * ``BatchedStaticSky`` == ``StaticSkyMean`` per DM (to the last fp32 bit
   of the time mean's reduction order) and == the float64 reference;
 * bit packer: Triton kernel (interpreter) == torch twin == reference;
-* row-rule packer: codes == the float64 reference codes except at
-  rounding boundaries (< 1e-4 of components, never more than one step),
-  sigma == reference sigma to fp32 precision, payload bytes == reference
-  datagram payload bytes when the codes agree, EMA behaviour;
+* row-rule packer: bit-equal to WS-T's ``dsart.x2.quant`` reference
+  (codes, sigma, steps) and to its frame-v2 payload, for the reference
+  defaults, the Phase-0 parameters, mid-rise and 5/6-bit codes, flagged
+  values, a mostly-flagged block and a non-finite value; mid-tread keeps
+  zeros at code 0 and never emits the no-data code; the warm-up hold, the
+  50% skip and the per-row guard (Phase 0, not yet in quant.py);
 * v1 cint8 mode == ``TransportTx._encode_rows`` byte for byte.
 """
 from __future__ import annotations
@@ -15,7 +17,7 @@ import numpy as np
 import pytest
 import torch
 
-from dsart.x2.corr.packer2x import RowRulePacker, pack_bits_torch, pack_v1
+from dsart.x2.corr.packer2x import PackerRule, RowRulePacker, pack_bits_torch, pack_v1
 from dsart.x2.corr.static_sky2x import BatchedStaticSky
 from dsart.x2.ref import corr2x_ref as ref
 
@@ -67,44 +69,118 @@ print("RESULT", *ok)
     assert "RESULT True True True" in out, out
 
 
-@pytest.mark.parametrize("bits_main", [8, 10])
-def test_row_rule_packer_vs_reference(bits_main) -> None:
-    rng = np.random.default_rng(bits_main)
-    n_d, n_t = 3, 64
-    voff = [0, 40, 95]
-    nh = [4, 6]
+def _flow_inputs(seed, n_d=3, n_t=64, voff=(0, 40, 95), nh=(4, 6), n_blocks=4):
+    """Blocks with drifting noise, flagged (exact-zero) values, one mostly
+    flagged block (must not update sigma) and a non-finite value."""
+    rng = np.random.default_rng(seed)
     V = voff[-1]
     n = rng.integers(1, 2000, size=V)
-    n[0:4] = 3000
-    n[40:46] = 2500
-    pk = RowRulePacker(n_d=n_d, value_offsets=voff, n_contrib=n, n_heavy=nh, bits_main=bits_main)
-    st = ref.RowRuleState()
-    b = bits_main // 2
-    for blk in range(3):
-        scale = 1.0 + 0.5 * blk
-        x = (rng.normal(size=(n_d, n_t, V)) + 1j * rng.normal(size=(n_d, n_t, V))) * np.sqrt(n) * scale
-        x64 = x.astype(np.complex64).astype(np.complex128)
-        res = pk.pack(torch.from_numpy(x64.astype(np.complex64)))
-        for s in range(2):
-            lo, hi = voff[s], voff[s + 1]
-            for d in range(n_d):
-                sig = st.step((s, d), x64[d, :, lo:hi] / np.sqrt(n[lo:hi])[None, :])
-                assert abs(float(res[s]["sigma"][d]) - sig) <= 1e-5 * sig
-                h, m, sm, sh = ref.quantise_row_rule(x64[d, :, lo:hi], n[lo:hi], nh[s], sig, bits=b)
-                gh = res[s]["codes_heavy"][d].numpy()
-                gm = res[s]["codes_main"][d].numpy()
-                mism = np.mean(gm != m) + np.mean(gh != h)
-                assert mism < 1e-3, mism
-                assert np.abs(gm.astype(int) - m).max() <= 1 and np.abs(gh.astype(int) - h).max() <= 1
-                # payload bytes for rows whose codes agree
-                pay = res[s]["payload"][d].numpy()
-                assert pay.shape[1] == ref.sample_bytes(hi - lo, nh[s], bits_main)
-                same = np.all(gm == m, axis=(1, 2)) & np.all(gh == h, axis=(1, 2))
-                for t in np.flatnonzero(same)[:5]:
-                    want = h[t].tobytes() + ref.pack_bits_le(m[t], b)
-                    assert pay[t].tobytes() == want
-    # the EMA moved towards the louder blocks
-    assert float(pk.sigma.mean()) > 1.0
+    n[voff[0]:voff[0] + nh[0]] = 3000
+    n[voff[1]:voff[1] + nh[1]] = 2500
+    blocks = []
+    for b in range(n_blocks):
+        x = (rng.normal(size=(n_d, n_t, V)) + 1j * rng.normal(size=(n_d, n_t, V))) * np.sqrt(n) * (1 + 0.3 * b)
+        x[:, :, 7] = 0                                   # a flagged value
+        x[0, ::5, 50] = 0
+        if b == 2:
+            x[1, :, : int(0.8 * V)] = 0                  # mostly flagged flow
+        if b == 3:
+            x[2, 3, 60] = np.inf
+        blocks.append(x.astype(np.complex64))
+    return blocks, n, list(voff), list(nh)
+
+
+_RULES = [
+    dict(comp_bits=4),
+    dict(comp_bits=5, s_heavy=0.0547),
+    dict(comp_bits=4, tau_s=3.0, excl_sigma=float("inf"), min_frac=0.5, s_heavy=0.0773),
+    dict(comp_bits=4, mode="midrise"),
+    dict(comp_bits=6, est_stride=4),
+]
+
+
+@pytest.mark.parametrize("kw", _RULES)
+def test_packer_bit_equal_to_ws_t_reference(kw) -> None:
+    """The packer == ``dsart.x2.quant.RowQuantiser`` on the same inputs:
+    codes, sigma, steps, and the payload == ``prod_frame2.pack_samples``."""
+    quant = pytest.importorskip("dsart.x2.quant", reason="WS-T row-rule reference not merged yet")
+    rule = quant.RowRule(**kw)
+    blocks, n, voff, nh = _flow_inputs(sum(map(ord, repr(kw))))
+    n_d = blocks[0].shape[0]
+    pk = RowRulePacker(n_d=n_d, value_offsets=voff, n_contrib=n, n_heavy=nh,
+                       rule=PackerRule.from_quant(rule))
+    flows = {(d, s): quant.RowQuantiser(rule=rule, n_contrib=n[voff[s]:voff[s + 1]], n_heavy=nh[s])
+             for d in range(n_d) for s in range(2)}
+    try:
+        from dsart.transport.prod_frame2 import pack_samples
+    except ImportError:
+        pack_samples = None
+    for x in blocks:
+        res = pk.pack(torch.from_numpy(x))
+        for (d, s), q in flows.items():
+            bc = q.process_block(x[d, :, voff[s]:voff[s + 1]])
+            r = res[s]
+            assert np.array_equal(r["codes_heavy"][d].numpy(), bc.codes_heavy)
+            assert np.array_equal(r["codes_main"][d].numpy(), bc.codes_main)
+            assert r["sigma"][d].numpy().tobytes() == np.float32(bc.sigma).tobytes()
+            assert r["step_main"][d].numpy().tobytes() == np.float32(bc.step_main).tobytes()
+            assert r["step_heavy"][d].numpy().tobytes() == np.float32(bc.step_heavy).tobytes()
+            pay = r["payload"][d].numpy()
+            if pack_samples is not None:
+                assert np.array_equal(pay, pack_samples(bc.codes_heavy, bc.codes_main, rule.bits_main))
+            else:
+                for t in (0, 17):
+                    assert pay[t].tobytes() == ref.payload_row(bc.codes_heavy[t], bc.codes_main[t],
+                                                               rule.comp_bits)
+
+
+def test_packer_midtread_never_emits_no_data_code_and_keeps_zero() -> None:
+    blocks, n, voff, nh = _flow_inputs(1)
+    pk = RowRulePacker(n_d=3, value_offsets=voff, n_contrib=n, n_heavy=nh,
+                       rule=PackerRule(comp_bits=4))
+    for x in blocks:
+        for s, r in enumerate(pk.pack(torch.from_numpy(x))):
+            m, h = r["codes_main"].numpy(), r["codes_heavy"].numpy()
+            assert m.min() >= -7 and m.max() <= 7 and h.min() >= -127
+            v7 = 7 - voff[s] - nh[s]
+            if 0 <= v7 < m.shape[2]:
+                assert not m[:, :, v7].any()                   # flagged value -> code 0
+
+
+def test_packer_skip_and_hold_rules() -> None:
+    blocks, n, voff, nh = _flow_inputs(2)
+    rule = PackerRule(comp_bits=4, min_frac=0.5, excl_sigma=float("inf"), hold_blocks=2)
+    pk = RowRulePacker(n_d=3, value_offsets=voff, n_contrib=n, n_heavy=nh, rule=rule)
+    r0 = pk.pack(torch.from_numpy(blocks[0]))
+    assert float(pk.sigma.abs().max()) == 0.0                   # held: sigma not initialised
+    assert not r0[0]["codes_main"].numpy().any()                # unset sigma -> code 0
+    pk.pack(torch.from_numpy(blocks[1]))                        # still held
+    assert float(pk.sigma.abs().max()) == 0.0
+    pk.pack(torch.from_numpy(blocks[1]))                        # 3rd call: first update
+    s_before = pk.sigma.clone()
+    assert float(s_before.min()) > 0.0
+    pk.pack(torch.from_numpy(blocks[2]))
+    # flow d=1 of block 2 is 80% zero: below min_frac -> its stream-0 sigma
+    # is unchanged, while a normal flow moves
+    assert float(pk.sigma[1, 0]) == float(s_before[1, 0])
+    assert float(pk.sigma[0, 0]) != float(s_before[0, 0])
+
+
+def test_packer_row_guard() -> None:
+    rng = np.random.default_rng(3)
+    n = np.full(60, 100)
+    x = (rng.normal(size=(1, 32, 60)) + 1j * rng.normal(size=(1, 32, 60))) * 10.0
+    rule = PackerRule(comp_bits=4, est_stride=1, guard_g=1.5)
+    pk = RowRulePacker(n_d=1, value_offsets=[0, 60], n_contrib=n, n_heavy=[0], rule=rule)
+    pk.pack(torch.from_numpy(x.astype(np.complex64)))           # initialise sigma ~ 1
+    x2 = x.copy()
+    x2[0, 9] *= 5.0                                             # a broadband surge in one row
+    r = pk.pack(torch.from_numpy(x2.astype(np.complex64)))[0]
+    rs = r["row_sigma"][0].numpy()
+    sig = float(r["sigma"][0])
+    assert rs[9] > 4.0 * sig and np.all(rs[np.arange(32) != 9] == np.float32(sig))
+    # coded at its own scale: saturation stays at the normal-noise level
+    assert np.mean(np.abs(r["codes_main"][0, 9].numpy()) == 7) < 0.1
 
 
 def test_v1_mode_equals_transport_tx() -> None:

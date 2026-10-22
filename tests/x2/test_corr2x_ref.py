@@ -8,8 +8,10 @@
 * the reference's GEOMETRIC source placement agrees with WS-P's value-map
   CSR (both kinds, production antenna fixture), so the CSR the kernels use
   is checked against an independent derivation;
-* row rule, bit packing and frame v2 round-trip; the v1 cint8 rule equals
-  ``TransportTx._encode_rows`` byte for byte.
+* bit packing round-trips and the payload layout equals WS-T's frame-v2
+  codec; the row rule is WS-T's reference, called through
+  ``quantise_flow``; the v1 cint8 rule equals ``TransportTx._encode_rows``
+  byte for byte.
 """
 from __future__ import annotations
 
@@ -223,35 +225,6 @@ def test_reference_geometry_equals_value_map_csr(kind, n_sub) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [4, 5])
-def test_row_rule_roundtrip(bits) -> None:
-    rng = np.random.default_rng(11)
-    n = rng.integers(1, 3000, size=200)
-    n[:5] = 5000
-    x = (rng.normal(size=(64, 200)) + 1j * rng.normal(size=(64, 200))) * np.sqrt(n)[None, :]
-    st = ref.RowRuleState()
-    sig = st.step("k", x / np.sqrt(n)[None, :])
-    assert 0.9 < sig < 1.1
-    h, m, sm, sh = ref.quantise_row_rule(x, n, 5, sig, bits=bits)
-    assert h.dtype == np.int8 and m.min() >= -(1 << (bits - 1)) and m.max() <= (1 << (bits - 1)) - 1
-    dec = ref.decode_row_rule(h, m, n, 5, bits=bits) * sig      # back to data units / sqrt(n) * sqrt(n)
-    y = x / np.sqrt(n)[None, :]
-    yd = dec / np.sqrt(n)[None, :]
-    half = (1 << (bits - 1)) * sm
-    main_in = (np.abs(y.real[:, 5:]) < half) & (np.abs(y.imag[:, 5:]) < half)
-    err = yd - y
-    assert np.all(np.abs(err.real[:, 5:])[main_in] <= sm / 2 + 1e-12)
-    assert np.all(np.abs(err.imag[:, 5:])[main_in] <= sm / 2 + 1e-12)
-    assert np.all(np.abs(err.real[:, :5]) <= sh / 2 + 1e-12)
-    assert main_in.mean() > 0.95
-    # EMA moves towards a new level
-    st2 = ref.RowRuleState(tau_s=1.0)
-    st2.step("k", np.ones((10, 10)) * (1 + 1j))
-    s_before = st2.sigma["k"]
-    st2.step("k", 3 * (rng.normal(size=(10, 10)) + 1j * rng.normal(size=(10, 10))))
-    assert st2.sigma["k"] != s_before
-
-
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 def test_bit_packing_roundtrip(bits) -> None:
     rng = np.random.default_rng(bits)
@@ -264,30 +237,28 @@ def test_bit_packing_roundtrip(bits) -> None:
     assert ref.pack_bits_le(np.array([0, 1]), 4) == bytes([0x10])
 
 
-def test_frame2_pack_roundtrip() -> None:
+def test_payload_row_matches_frame2_codec() -> None:
+    """The reference payload layout == WS-T's ``prod_frame2.pack_samples``."""
+    pf2 = pytest.importorskip("dsart.transport.prod_frame2", reason="WS-T frame v2 not merged yet")
     rng = np.random.default_rng(5)
-    n_t, n_h, n_m = 300, 7, 900
-    h = rng.integers(-128, 128, size=(n_t, n_h, 2)).astype(np.int8)
-    m = rng.integers(-8, 8, size=(n_t, n_m, 2))
-    frames = ref.pack_stream_block(h, m, bits_main=8, t0_native=4096 * 1000, T_native=16,
-                                   stream_id=37, dm_idx=12, n_sub=2, n_grid=256, value_kind=0,
-                                   pattern_id=(1 << 63) + 5, step_main=0.3, step_heavy=0.1)
-    sb = ref.sample_bytes(n_h + n_m, n_h, 8)
-    k = 8900 // sb
-    assert len(frames) == math.ceil(n_t / k)
-    t = 0
-    for f in frames:
-        hd, pl = ref.unpack_frame2(f)
-        assert hd.magic == ref.MAGIC and hd.version == 2 and len(f) == 72 + hd.payload_bytes
-        assert hd.payload_bytes <= 8900 and hd.flags & ref.FLAG_HEAVY_PRESENT
-        assert hd.t0_native == 4096 * 1000 + 16 * t and hd.seq_first == hd.t0_native // 16
-        for i in range(hd.k):
-            row = pl[i * sb:(i + 1) * sb]
-            assert np.array_equal(np.frombuffer(row[: 2 * n_h], np.int8).reshape(n_h, 2), h[t + i])
-            got = ref.unpack_bits_le(row[2 * n_h:], 4, 2 * n_m).reshape(n_m, 2)
-            assert np.array_equal(got, m[t + i])
-        t += hd.k
-    assert t == n_t
+    for comp_bits in (4, 5, 6):
+        lim = (1 << (comp_bits - 1)) - 1
+        h = rng.integers(-127, 128, size=(3, 7, 2)).astype(np.int8)
+        m = rng.integers(-lim, lim + 1, size=(3, 301, 2)).astype(np.int8)
+        want = pf2.pack_samples(h, m, 2 * comp_bits)
+        for t in range(3):
+            assert ref.payload_row(h[t], m[t], comp_bits) == want[t].tobytes()
+        assert want.shape[1] == ref.sample_bytes(308, 7, 2 * comp_bits)
+
+
+def test_quantise_flow_delegates_to_ws_t_reference() -> None:
+    quant = pytest.importorskip("dsart.x2.quant", reason="WS-T row-rule reference not merged yet")
+    rng = np.random.default_rng(6)
+    n = rng.integers(1, 3000, size=50)
+    blocks = [(rng.normal(size=(64, 50)) + 1j * rng.normal(size=(64, 50))) * np.sqrt(n) for _ in range(3)]
+    out = ref.quantise_flow(blocks, n, 5, quant.RowRule(comp_bits=4))
+    assert len(out) == 3 and 0.9 < float(out[-1].sigma) < 1.1
+    assert out[0].codes_main.shape == (64, 45, 2) and out[0].codes_heavy.shape == (64, 5, 2)
 
 
 def test_v1_cint8_equals_transport_tx() -> None:
