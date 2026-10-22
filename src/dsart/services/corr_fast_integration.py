@@ -4954,6 +4954,11 @@ def run(
                         extra.update(ctx.stage_timer.summary())
                         extra["orchestrator"] = orchestrator
                     extra["opoint"] = opoint
+                    # x2 monitoring (WS-D D11 panels / RT health page):
+                    # wall block time over the last 128 blocks.
+                    _recent = per_block_ms[-128:]
+                    extra["block_ms_p50"] = round(float(np.median(_recent)), 3)
+                    extra["block_ms_p99"] = round(float(np.percentile(_recent, 99)), 3)
                     mon_publisher.publish(
                         block_n=n_in,
                         n_processed=n_processed,
