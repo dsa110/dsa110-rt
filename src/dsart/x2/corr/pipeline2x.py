@@ -241,15 +241,22 @@ class Corr2xPipeline(PipelinedCorrFast):
         vm = self.vm
         g = self.chgroup
         n_heavy = [int(vm.streams[g * vm.n_sub + s].n_heavy) for s in range(vm.n_sub)]
+        self.value_sel = []
         if value_subset is None:
+            for s in range(vm.n_sub):
+                self.value_sel.append(np.arange(int(csr.value_offsets[s + 1] - csr.value_offsets[s])))
             return csr, [int(v) for v in csr.value_offsets], n_heavy
         keep, voff, nh = [], [0], []
         for s in range(vm.n_sub):
             lo, hi = int(csr.value_offsets[s]), int(csr.value_offsets[s + 1])
-            m = min(int(value_subset), hi - lo)
-            keep.extend(range(lo, lo + m))
-            voff.append(voff[-1] + m)
-            nh.append(min(n_heavy[s], m))
+            nv = hi - lo
+            m = min(int(value_subset), nv)
+            # half from the front (heavy values), half from the back (main)
+            sel = np.unique(np.concatenate([np.arange(m // 2), np.arange(nv - (m - m // 2), nv)]))
+            self.value_sel.append(sel)
+            keep.extend((lo + sel).tolist())
+            voff.append(voff[-1] + sel.size)
+            nh.append(int(np.count_nonzero(sel < n_heavy[s])))
         ptr, rows, ks, cj = [0], [], [], []
         for v in keep:
             a, b = int(csr.ptr[v]), int(csr.ptr[v + 1])
@@ -270,9 +277,8 @@ class Corr2xPipeline(PipelinedCorrFast):
         rows, cols = [], []
         for s in range(self.vm.n_sub):
             st = self.vm.streams[self.chgroup * self.vm.n_sub + s]
-            m = self.voff[s + 1] - self.voff[s]
-            rows.append(st.cell_row[:m])
-            cols.append(st.cell_col[:m])
+            rows.append(st.cell_row[self.value_sel[s]])
+            cols.append(st.cell_col[self.value_sel[s]])
         return np.concatenate(rows).astype(np.uint16), np.concatenate(cols).astype(np.uint16)
 
     @property

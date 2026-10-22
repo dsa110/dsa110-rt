@@ -203,13 +203,13 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
                         nu = build_summed_chgroup_freq_table_GHz(2)[G][s * per:(s + 1) * per]
                         dest = ref.value_dest_cells(e, n, aa[sel], bb[sel], nu,
                                                     cell_lambda=vm.cell_lambda, n_grid=256,
-                                                    cell_row=st.cell_row[:hi - lo],
-                                                    cell_col=st.cell_col[:hi - lo])
+                                                    cell_row=st.cell_row[orch.value_sel[s]],
+                                                    cell_col=st.cell_col[orch.value_sel[s]])
                         conj = np.zeros(dest.shape, bool)
                     else:
                         c = vm.classes
                         dest, conj = ref.value_dest_classes(c.bl_class[sel], c.bl_conj[sel],
-                                                            st.class_id[:hi - lo], per)
+                                                            st.class_id[orch.value_sel[s]], per)
                     blk = q_emit // NQ
                     i = BLOCKS.index(blk)
                     joined = np.concatenate([Vs[i], Vs[i + 1]], axis=0)
