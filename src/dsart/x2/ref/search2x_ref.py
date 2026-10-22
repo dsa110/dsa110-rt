@@ -473,3 +473,97 @@ def quantize_rowrule(y: np.ndarray, step: float, bits: int, midrise: bool = Fals
     re = np.clip(op(np.real(y) / step), lo, hi).astype(np.int64)
     im = np.clip(op(np.imag(y) / step), lo, hi).astype(np.int64)
     return re, im
+
+
+# ---------------------------------------------------------------------------
+# offline re-imaging of archived raw windows (WS-D tools/x2/reimage_raw_window)
+# ---------------------------------------------------------------------------
+
+_VALUE_MAPS: dict = {}
+
+
+def register_value_map(vmap) -> None:
+    """Make a value map (``grid.baseline_grid.ValueMap`` or a duck-typed
+    equivalent) available to :func:`reimage_from_raw` by its ``pattern_id``
+    (value maps are archived once per pattern, not per event)."""
+    _VALUE_MAPS[int(vmap.pattern_id)] = vmap
+
+
+#: Phase 0 decode steps (sigma_hat units) by complex bits / n_sub.
+_S_MAIN = {8: 0.3534, 10: 0.1932, 12: 0.1055}
+_S_HEAVY = {2: 0.0773, 4: 0.0547}
+
+
+def reimage_from_raw(slab, fine_local: int, t0_ext: int, n_t: int, *, ext_factor: int,
+                     value_map=None, s_main: Optional[float] = None,
+                     s_heavy: Optional[float] = None, image_scale: Optional[float] = None,
+                     sigma=None, kernel_support: int = 1) -> np.ndarray:
+    """Images ``[n_t, N, N]`` (float64) of fine ``fine_local`` of one archived
+    coarse-DM slab (``x2.cutout.raw_archive.RawSlab``) over external rows
+    ``[t0_ext, t0_ext + n_t)``; a tier-B tier sample fills ext rows 2k and
+    2k+1 with the SAME image.
+
+    Independent float64 path: frame-v2 rows unpacked (``x2.search.codec``,
+    the K0 reference), mid-tread decode ``code * s`` (``s_heavy`` for heavy
+    values) times ``sqrt(n)`` when the map is normalised, the ``"no data"``
+    sentinel and invalid rows as 0, ``np.add.at`` gridding at
+    ``stream[t - shift]``, ``fftshift(Re(ifft2))``, today's mask and the 2x
+    image scale ``N^2 / sqrt(sum n)`` (raw image in sigma; Phase 0 option B)
+    unless ``image_scale`` is given; divided by ``sigma`` (the Layer-1 sigma
+    applied at detection: scalar or ``[n_t]``) when given.
+    """
+    from ..search.codec import RowFormat, unpack_cint8_rows, unpack_frame2_rows
+
+    ex = getattr(slab, "extra", {}) or {}
+    vm = value_map if value_map is not None else _VALUE_MAPS.get(int(ex.get("pattern_id", -1)))
+    if vm is None:
+        raise ValueError(f"no value map registered for pattern_id {ex.get('pattern_id')!r}")
+    N = int(vm.n_grid)
+    r = int(ext_factor)
+    e_rows = np.arange(int(t0_ext), int(t0_ext) + int(n_t))
+    t_rows = e_rows // r
+    out_rows = np.arange(int(t_rows[0]), int(t_rows[-1]) + 1)
+    sh = np.asarray(slab.shifts)[int(fine_local)]                     # [S]
+    is_2x = bool(getattr(vm, "normalise", False)) or getattr(vm, "heavy_threshold", None) is not None
+    bits_c = int(ex.get("bits_main", 8))
+    n_sub = len(vm.streams) // 16 if len(vm.streams) >= 16 else 1
+    sm = float(np.float32(s_main if s_main is not None else _S_MAIN.get(bits_c, 1.0)))
+    shv = float(np.float32(s_heavy if s_heavy is not None else _S_HEAVY.get(n_sub, 0.1)))
+    vals, cells, sig2 = [], [], 0.0
+    lo = int(out_rows[0] - sh.max())
+    hi = int(out_rows[-1] - sh.min()) + 1
+    for s, sv in enumerate(vm.streams):
+        nv = int(sv.n_values)
+        nh = int(getattr(sv, "n_heavy", 0))
+        codes, valid = slab.rows(s, lo, hi - lo)
+        if is_2x:
+            fmt = RowFormat("frame2", n_values=nv, n_heavy=nh, bits=bits_c // 2)
+            re, im = unpack_frame2_rows(codes, fmt)
+            sent = -(1 << (fmt.bits - 1))
+            nd = np.zeros(re.shape, bool)
+            nd[:, :nh] = (re[:, :nh] == -128) | (im[:, :nh] == -128)
+            nd[:, nh:] = (re[:, nh:] == sent) | (im[:, nh:] == sent)
+            step = np.full(nv, sm)
+            step[:nh] = shv
+        else:
+            re, im = unpack_cint8_rows(codes, RowFormat("cint8", n_values=nv))
+            nd = np.zeros(re.shape, bool)
+            step = np.ones(nv)
+        n = np.asarray(sv.n_contrib, dtype=np.float64)
+        w = np.sqrt(n) if bool(getattr(vm, "normalise", False)) else np.ones(nv)
+        v = (re.astype(np.float64) + 1j * im.astype(np.float64)) * (step * w)[None, :]
+        v[nd] = 0.0
+        v[np.asarray(valid) == 0] = 0.0
+        vals.append(v)
+        cel = np.asarray(sv.cell_row, np.int64) * N + np.asarray(sv.cell_col, np.int64)
+        cel = np.where(np.asarray(sv.cell_row, np.int64) < 0, -1, cel)   # unused values
+        cells.append(cel)
+        sig2 += float(np.sum(w[cel >= 0] ** 2))
+    G = ref_grid_dedispersed(vals, cells, sh[None, :], row0=lo, out_rows=out_rows, n_grid=N)
+    scale = float(image_scale) if image_scale is not None else N * N / np.sqrt(sig2)
+    img = ref_image(G, ref_edge_mask(N, kernel_support), scale)[0]        # [T_tier, N, N]
+    out = img[t_rows - out_rows[0]]
+    if sigma is not None:
+        sg = np.asarray(sigma, dtype=np.float64)
+        out = out / (sg[:, None, None] if sg.ndim else sg)
+    return out

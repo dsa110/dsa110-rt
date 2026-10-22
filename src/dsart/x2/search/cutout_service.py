@@ -9,9 +9,10 @@ Flow per request (``docs/x2/downstream_inventory.md`` §3.4):
    served after triggered ones; send ACCEPTED (64-B ``DSCS`` to C2:11501).
 3. **Raw snapshot** (RAW_ARCHIVE): per owned coarse DM the ring-v4 rows of
    every stream covering ``[t_peak - raw_pre, t_peak + raw_post)`` plus the
-   stage-2 extents, written verbatim (``raw_d<DDD>.npz``, atomic) -- a start
-   that rotated out is TOO_LATE, a window not complete by ``deadline_s`` is
-   zero-filled and flagged.
+   stage-2 extents, written verbatim with WS-D's D4 ``raw_archive``
+   (``write_raw_slab`` per DM, ``write_raw_meta``, ``mark_raw_ok`` last) --
+   a start that rotated out is TOO_LATE, a window not complete by
+   ``deadline_s`` is zero-filled and flagged.
 4. **Cutout**: every owned fine re-imaged over ``[t0, t0 + n_t)`` on the
    low-priority stream (``OwnerEngine.reimage_iter``) from the snapshot (or
    the ring), normalised with the Layer-1 sigma applied at detection;
@@ -19,7 +20,8 @@ Flow per request (``docs/x2/downstream_inventory.md`` §3.4):
    sample, one image, two references -- C3's apex lookup relies on it);
    assembled by WS-D's ``x2.cutout.schema.assemble_cutout`` (the reference)
    and written with ``write_cutout`` (npz, then the json manifest).
-5. **Report** DONE / PARTIAL / FAILED.
+5. **Upload** (``make_uploaders``): the cutout first, then the raw window;
+   each half purges only its own files. **Report** DONE / PARTIAL / FAILED.
 
 Socket listener and status sender are thin wrappers (``CutoutListener``);
 everything else is CPU-testable without sockets or a GPU.
@@ -28,7 +30,6 @@ from __future__ import annotations
 
 import heapq
 import itertools
-import os
 import socket
 import struct
 import threading
@@ -41,7 +42,7 @@ import numpy as np
 
 __all__ = [
     "REQ_STRUCT", "STATUS_STRUCT", "CutoutRequest", "decode_request", "encode_status",
-    "CutoutImages", "CutoutProducer", "CutoutListener",
+    "CutoutImages", "CutoutProducer", "CutoutListener", "make_uploaders",
     "ACCEPTED", "DONE", "PARTIAL", "FAILED",
 ]
 
@@ -235,6 +236,8 @@ class CutoutProducer:
         self.queue_depth = int(queue_depth)
         self.geometry = dict(geometry or dict(n_grid=engine.cfg.n_grid))
         self.clock_mjd = clock_mjd
+        self.uploaders: Optional[tuple] = None
+        self.last_latency_ms = 0
         self._q: list = []
         self._seq = itertools.count()
         self._seen: Dict[tuple, int] = {}
@@ -280,17 +283,21 @@ class CutoutProducer:
 
     # ------------------------------------------------------------------
     def raw_snapshot(self, req: CutoutRequest, out_dir: Optional[Path] = None) -> tuple:
-        """Per owned DM ``(raw, valid, row0)`` covering the raw window plus
-        stage-2 extents; written verbatim (atomic) when ``out_dir``."""
+        """Per owned DM ``(raw, valid, row0)`` covering the raw window plus the
+        stage-2 extents (``raw_archive.stream_window``); written with WS-D's
+        D4 ``write_raw_slab`` per DM, then ``write_raw_meta``, then
+        ``mark_raw_ok`` LAST (readers trust only RAW_OK dirs)."""
+        from ..cutout.raw_archive import mark_raw_ok, stream_window, write_raw_meta, \
+            write_raw_slab
+        from .codec import as_stream_formats
+
         snaps, too_late, raw_bytes = {}, [], 0
-        lo_e = req.t_peak_ext - req.raw_pre_ext
-        hi_e = req.t_peak_ext + req.raw_post_ext
         for spec in self.eng.plan.dms:
-            r = self.eng.plan.ext_factor(spec)
-            t_lo, t_hi = lo_e // r, -(-hi_e // r)
-            s_lo, s_hi = t_lo - spec.max_pos, t_hi + spec.max_neg
+            s_lo, n = stream_window(req.t_peak_ext, req.raw_pre_ext, req.raw_post_ext,
+                                    ext_factor=self.eng.plan.ext_factor(spec),
+                                    max_pos=spec.max_pos, max_neg=spec.max_neg)
             try:
-                raw, valid = self.eng.ring.wait_window(spec.d, s_lo, s_hi - s_lo,
+                raw, valid = self.eng.ring.wait_window(spec.d, s_lo, n,
                                                        timeout_s=float(req.deadline_s))
             except TimeoutError:
                 too_late.append(spec.d)
@@ -298,15 +305,25 @@ class CutoutProducer:
             snaps[spec.d] = (raw, valid, s_lo)
             raw_bytes += raw.nbytes
             if out_dir is not None:
-                out_dir.mkdir(parents=True, exist_ok=True)
-                tmp = out_dir / f".raw_d{spec.d:03d}.npz.tmp"
-                with open(tmp, "wb") as fh:
-                    np.savez(fh, codes=raw, valid=valid, row0=np.int64(s_lo),
-                             t_native=np.int32(spec.t_native), d=np.int32(spec.d),
-                             shifts=spec.shifts, fine_global=spec.fine_global)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp, out_dir / f"raw_d{spec.d:03d}.npz")
+                inp = self.eng.states[spec.d].inp
+                fm = as_stream_formats(inp.fmt, spec.n_stream)
+                extra = dict(n_values=np.array([f.n_values for f in fm.per_stream], np.int32),
+                             n_heavy=np.array([getattr(f, "n_heavy", 0) for f in fm.per_stream],
+                                              np.int32),
+                             bits_main=np.int32(2 * getattr(fm.per_stream[0], "bits", 8)),
+                             n_grid=np.int32(self.eng.cfg.n_grid))
+                if inp.pattern_id is not None:
+                    extra["pattern_id"] = np.uint64(int(inp.pattern_id))
+                write_raw_slab(out_dir, codes=np.ascontiguousarray(raw, dtype=np.uint8),
+                               valid=np.asarray(valid).astype(np.uint8), row0=int(s_lo),
+                               t_native=int(spec.t_native), d=int(spec.d), shifts=spec.shifts,
+                               fine_global=spec.fine_global, **extra)
+        if out_dir is not None:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            write_raw_meta(out_dir, req, identity=dict(
+                search_node_id=self.sid, gpu_half=self.g, half_index=self.eng.plan.half,
+                opoint=self.eng.plan.opoint, plan_id=self.plan_id), too_late=too_late)
+            mark_raw_ok(out_dir)
         return snaps, too_late, raw_bytes
 
     def build_arrays(self, req: CutoutRequest, snaps: Optional[dict] = None) -> tuple:
@@ -335,26 +352,50 @@ class CutoutProducer:
         return arrays, status
 
     def serve(self, req: CutoutRequest, *, event_dir: Path) -> tuple:
-        """Run one job; returns ``(state, reason, info)``."""
+        """Run one job; returns ``(state, reason, info)``. Uploads (when
+        ``uploaders`` are set): the cutout first, then the raw window (D4)."""
         from ..cutout.schema import write_cutout
 
         t_start = time.monotonic()
         snaps, too_late, raw_bytes = ({}, [], 0)
+        raw_dir = event_dir / "raw" / f"raw_s{self.sid}_g{self.g}"
         if req.flags & FLAG_RAW:
-            snaps, too_late, raw_bytes = self.raw_snapshot(
-                req, event_dir / "raw" / f"raw_s{self.sid}_g{self.g}")
+            snaps, too_late, raw_bytes = self.raw_snapshot(req, raw_dir)
         try:
             arrays, status = self.build_arrays(req, snaps)
-            path = write_cutout(event_dir / "cutouts", arrays)
+            path, _manifest = write_cutout(event_dir / "cutouts", arrays)
         except Exception as e:                                  # noqa: BLE001
             self.counters["failed"] += 1
             return FAILED, R_IO, dict(error=repr(e))
+        if self.uploaders is not None:
+            cut_up, raw_up = self.uploaders
+            cut_up.submit(req.event_name, event_dir / "cutouts")
+            if req.flags & FLAG_RAW:
+                raw_up.submit(req.event_name, raw_dir)
+        self.last_latency_ms = int(1e3 * (time.monotonic() - t_start))
         state = DONE if (status == "complete" and not too_late) else PARTIAL
         self.counters["done" if state == DONE else "partial"] += 1
         self._seen[req.key] = state
         return state, (R_TOO_LATE if too_late else R_OK), dict(
             path=str(path), raw_bytes=raw_bytes, too_late=too_late,
             latency_ms=int(1e3 * (time.monotonic() - t_start)))
+
+
+def make_uploaders(*, sid: int, g: int, dest_host: str, dest_root: str,
+                   raw_bwlimit_kbps: int = 50_000) -> tuple:
+    """WS-D D4: two bounded uploaders -- (a) the cutout (``cutouts``, purge
+    only this half's ``cutout_s<sid>_g<g>.*``), (b) the raw window
+    (``raw/raw_s<sid>_g<g>``, purge ``*``, bandwidth-limited)."""
+    from ...coinc.cube_uploader import BoundedCubeUploader
+
+    cut = BoundedCubeUploader(dest_host=dest_host, dest_root=dest_root, dest_subdir="cutouts",
+                              purge_pattern=f"cutout_s{sid}_g{g}.*",
+                              thread_name=f"cutout-upload-g{g}")
+    raw = BoundedCubeUploader(dest_host=dest_host, dest_root=dest_root,
+                              dest_subdir=f"raw/raw_s{sid}_g{g}", purge_pattern="*",
+                              bandwidth_limit_kbps=int(raw_bwlimit_kbps),
+                              thread_name=f"raw-upload-g{g}")
+    return cut, raw
 
 
 class CutoutListener:

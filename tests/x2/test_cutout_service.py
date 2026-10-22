@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -29,6 +30,13 @@ N = 32
 V = 20
 
 
+_CELLS = {}
+
+
+def _cells_of(eng, d, s):
+    return _CELLS[d][s]
+
+
 def _engine():
     fa = np.array([50.0, 53.0, 56.0])
     fb = np.array([100.0, 106.0])
@@ -39,6 +47,7 @@ def _engine():
     cells, inputs = {}, {}
     for s in plan.dms:
         cells[s.d] = random_value_cells(16, V, N, radius=6, seed=s.d + 4, n_unused=2)
+        _CELLS[s.d] = cells[s.d]
         inputs[s.d] = make_dm_inputs(cells[s.d], n_grid=N, fmt=fmt, step_main=0.3534,
                                      step_heavy=0.1)
     ring = MemoryRing({s.d: fmt for s in plan.dms}, 16, t_buf=4096)
@@ -51,6 +60,28 @@ def _engine():
     for k in (1, 2):
         eng.process_cycle(k)
     return eng
+
+
+class _Plan:                                              # the axis the schema needs
+    def __init__(self, op):
+        fines = np.concatenate([s.fine_global for s in op.dms])
+        self._f = fines
+        self.fine_dm = np.concatenate([s.fine_dm for s in op.dms])
+        self.fine_to_coarse = np.concatenate([[s.d] * s.n_fdm for s in op.dms])
+        self.fine_local_idx = np.concatenate([np.arange(s.n_fdm) for s in op.dms])
+        self.fine_tier = np.concatenate([[0 if s.tier == "A" else 1] * s.n_fdm
+                                         for s in op.dms])
+        self.coarse_t_native = np.array([s.t_native for s in op.dms])
+
+    def fines_of_half(self, h):
+        return self._f
+
+    def dms_of_half(self, h):
+        return np.array([0, 1])
+
+
+def _axis_plan(eng):
+    return _Plan(eng.plan)
 
 
 def _req(**kw):
@@ -134,27 +165,85 @@ def test_end_to_end_with_ws_d_schema(tmp_path):
     schema = pytest.importorskip("dsart.x2.cutout.schema")
     eng = _engine()
 
-    class _Plan:                                              # the axis the schema needs
-        def __init__(self, op):
-            fines = np.concatenate([s.fine_global for s in op.dms])
-            self._f = fines
-            self.fine_dm = np.concatenate([s.fine_dm for s in op.dms])
-            self.fine_to_coarse = np.concatenate([[s.d] * s.n_fdm for s in op.dms])
-            self.fine_local_idx = np.concatenate([np.arange(s.n_fdm) for s in op.dms])
-            self.fine_tier = np.concatenate([[0 if s.tier == "A" else 1] * s.n_fdm
-                                             for s in op.dms])
-            self.coarse_t_native = np.array([s.t_native for s in op.dms])
-
-        def fines_of_half(self, h):
-            return self._f
-
-        def dms_of_half(self, h):
-            return np.array([0, 1])
-
-    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path, plan=_Plan(eng.plan))
+    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path, plan=_axis_plan(eng))
     arrays, status = p.build_arrays(_req())
     assert status == "complete"
-    schema.validate(arrays)
-    pg = arrays["peak_grid"]
-    fb = 3
+    npz_path, _manifest = schema.write_cutout(tmp_path / "cutouts", arrays)
+    cut = schema.read_cutout(Path(npz_path), check=True)
+    pg = cut["peak_grid"]
+    fb = 3                                                    # first tier-B plane fine
     assert np.array_equal(pg[0::2, fb], pg[1::2, fb])
+    assert np.array_equal(cut["sigma_applied"][0::2, fb], cut["sigma_applied"][1::2, fb])
+
+
+class _SV:
+    def __init__(self, cells, n_heavy):
+        c = np.asarray(cells)
+        self.cell_row = np.where(c >= 0, c // N, -1)
+        self.cell_col = np.where(c >= 0, c % N, -1)
+        self.n_values = c.size
+        self.n_heavy = n_heavy
+        self.n_contrib = np.ones(c.size, int)
+
+
+class _VM:
+    def __init__(self, cells_per_stream, n_heavy):
+        self.streams = [_SV(c, n_heavy) for c in cells_per_stream]
+        self.n_grid = N
+        self.normalise = False
+        self.heavy_threshold = 1
+        self.pattern_id = 12345
+
+
+def test_raw_archive_d4_and_offline_reimage_matches_the_producer(tmp_path):
+    from dsart.x2.cutout.raw_archive import is_raw_complete, read_raw_dir
+    from dsart.x2.ref.search2x_ref import reimage_from_raw
+
+    eng = _engine()
+    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path)
+    req = _req(t_peak_ext=832, raw_pre_ext=48, raw_post_ext=48)
+    out = tmp_path / "raw_s0_g0"
+    snaps, too_late, nbytes = p.raw_snapshot(req, out)
+    assert is_raw_complete(out) and not too_late
+    slabs = read_raw_dir(out)
+    assert sorted(slabs) == [0, 1] and slabs[1].t_native == 32
+    src = CutoutImages(eng, t0_ext=800, n_t=64, raw=snaps)
+    a_spec, b_spec = sorted(eng.plan.dms, key=lambda s: s.d)
+    for spec, f_plane, f_loc in ((a_spec, 1, 1), (b_spec, a_spec.n_fdm + 1, 1)):
+        vm = _VM([_cells_of(eng, spec.d, s) for s in range(spec.n_stream)], n_heavy=2)
+        rows_t = (800 + np.arange(64)) // eng.plan.ext_factor(spec)
+        sig, _ = eng.sigma_at(spec.d, rows_t)
+        img = reimage_from_raw(slabs[spec.d], f_loc, 800, 64,
+                               ext_factor=eng.plan.ext_factor(spec), value_map=vm,
+                               s_main=0.3534, s_heavy=0.1, sigma=sig[:, f_loc])
+        mine = src(f_plane).astype(np.float64)
+        assert np.max(np.abs(img - mine)) < 4e-3 * max(1.0, np.abs(mine).max())
+        if spec.tier == "B":
+            assert np.array_equal(img[0::2], img[1::2])
+
+
+def test_serve_writes_raw_then_cutout_and_uploads_cutout_first(tmp_path):
+    pytest.importorskip("dsart.x2.cutout.schema")
+    from dsart.x2.cutout.raw_archive import is_raw_complete
+    from dsart.x2.search.cutout_service import DONE
+
+    eng = _engine()
+    calls = []
+
+    class _Up:
+        def __init__(self, name):
+            self.name = name
+
+        def submit(self, ev, src):
+            calls.append((self.name, ev, Path(src).name))
+            return True
+
+    p = CutoutProducer(eng, search_node_id=2, gpu_half=1, out_root=tmp_path,
+                       plan=_axis_plan(eng))
+    p.uploaders = (_Up("cutout"), _Up("raw"))
+    req = _req(raw_pre_ext=40, raw_post_ext=40)
+    state, reason, info = p.serve(req, event_dir=tmp_path / req.event_name)
+    assert state == DONE and reason == 0, info
+    assert is_raw_complete(tmp_path / req.event_name / "raw" / "raw_s2_g1")
+    assert (tmp_path / req.event_name / "cutouts" / "cutout_s2_g1.json").is_file()
+    assert [c[0] for c in calls] == ["cutout", "raw"]
