@@ -578,7 +578,9 @@ The banner shows the active selection, its plan_id, and whether the live configs
   `dump/*`, `services/slack_notify.py`, `services/candidate_card.py`, `src/dsart/x2/cutout/*`,
   `tools/inject/*`, `tools/viz/*`, `tools/c2/*`, `tools/ops/prune_candidate_products.py`,
   `tools/dashboard/**` except the Start control, grafana, pusher.
-- Integration: `common/contracts.py`, `docs/x2/SPEC.md` (sections are frozen by their owners; edits
+- After WS-O finished (2026-10-22): `configs/opoints/2x/c2_trigger_criteria.yaml` -> WS-D; the other
+  WS-O files (configs, push script, Start control, runner) -> integration.
+- Integration: `common/contracts.py`, `common/constants.py` (detector token tuples), `docs/x2/SPEC.md` (sections are frozen by their owners; edits
   between freezes go through integration), `tools/x2/node_cpu_tests.sh`, merges into `x2/main`.
 - WS-O: `configs/*.yaml`, `tools/ops/push_dsart_to_etcd.py`, dashboard Start control
   (`app.py /control/start`, `control_store.control_start_fleet`), `tools/x2/cp*_runner*`, runbooks.
