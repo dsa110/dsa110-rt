@@ -748,6 +748,33 @@ def nic_gate(base_text: str, test_text: str, *, slack: float = 1e-5) -> dict[str
     return {"ok": lt <= lb + slack, "loss_base": lb, "loss_test": lt, "base": b, "test": t}
 
 
+def vm_rates(text: str) -> dict[str, Any]:
+    """Rates over a cp_runner_vm_sample.sh capture (ledger E5): NUMA hint faults/s, page faults/s,
+    system-time fraction of all CPU time."""
+    bal = None
+    rows = []
+    for ln in text.splitlines():
+        if ln.startswith("# numa_balancing"):
+            bal = ln.split()[2]
+            continue
+        parts = ln.split()
+        if len(parts) >= 9:
+            try:
+                rows.append([float(x) for x in parts[:9]])
+            except ValueError:
+                continue
+    if len(rows) < 2:
+        return {"ok": False, "numa_balancing": bal, "error": "fewer than 2 samples"}
+    a, b = rows[0], rows[-1]
+    d = [y - x for x, y in zip(a, b)]
+    dt = max(d[0], 1e-9)
+    cpu = max(d[6] + d[7] + d[8], 1.0)
+    return {"ok": True, "numa_balancing": bal, "seconds": round(dt, 1),
+            "numa_hint_faults_per_s": d[1] / dt, "numa_hint_faults_local_per_s": d[2] / dt,
+            "numa_pages_migrated_per_s": d[3] / dt, "pgfault_per_s": d[4] / dt,
+            "pgmajfault_per_s": d[5] / dt, "system_frac": d[7] / cpu}
+
+
 def format_table(capacity: dict[str, Any] | None) -> list[str]:
     """The S1 decision table: Phase 0 numbers + the measured clean ingress (if a sweep result exists)."""
     from cp_runner_plans import FORMAT_TABLE
@@ -794,6 +821,10 @@ def _check_main(argv: list[str]) -> int:
     s.add_argument("--out", default=None)
     s = sub.add_parser("format-table")
     s.add_argument("--capacity", default=None)
+    s = sub.add_parser("vm-summary")
+    s.add_argument("--dir", required=True)
+    s.add_argument("--nodes", required=True)
+    s.add_argument("--out", default=None)
     s = sub.add_parser("nic-gate")
     s.add_argument("--baseline-dir", required=True)
     s.add_argument("--test-dir", required=True)
@@ -802,6 +833,18 @@ def _check_main(argv: list[str]) -> int:
     s.add_argument("--out", default=None)
     a = p.parse_args(argv)
 
+    if a.what == "vm-summary":           # E5: measure only, never a gate
+        res_vm: dict[str, Any] = {}
+        for n in a.nodes.split(","):
+            try:
+                res_vm[n] = vm_rates(Path(a.dir, f"{n}.txt").read_text())
+            except OSError as exc:
+                res_vm[n] = {"ok": False, "error": str(exc)}
+        text = json.dumps(res_vm, indent=1)
+        if a.out:
+            Path(a.out).write_text(text)
+        print(text)
+        return 0
     if a.what == "nic-gate":
         res: dict[str, Any] = {}
         for n in a.nodes.split(","):

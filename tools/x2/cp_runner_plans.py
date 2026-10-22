@@ -34,6 +34,7 @@ _FAKE = "bench/fake_corr_to_search.py"
 _FAKE_V2 = _FAKE + "::prod_frame2|frame.?version"
 _FAKE_C = _FAKE + "::send_?mmsg"
 _SAMPLER = "@{repo}/tools/x2/cp_runner_nic_sample.sh"
+_VM_SAMPLER = "@{repo}/tools/x2/cp_runner_vm_sample.sh"     # ledger E5 (NUMA hint faults, sys time)
 
 _KILL_MARKED = (
     "me=$$; for p in $(pgrep -u \"$(id -u)\" .); do [ \"$p\" = \"$me\" ] && continue; "
@@ -59,10 +60,11 @@ _CHECKOUT = ("cd /home/ubuntu/proj/dsa110-rt && echo $(git rev-parse HEAD) "
 ALL_NODES = CORR_NODES + SEARCH_NODES
 
 
-def _sampler_bg(nodes: str, n: int, period: int, outdir: str) -> str:
-    """Local: start the read-only NIC sampler on every node in the background; PIDs in a file."""
+def _sampler_bg(nodes: str, n: int, period: int, outdir: str, script: str = _SAMPLER) -> str:
+    """Local: start a read-only sampler (NIC by default) on every node in the background; PIDs in a
+    file of ``outdir`` (one sampler kind per directory)."""
     return (f"mkdir -p {outdir} && : > {outdir}/.pids && for n in {nodes}; do "
-            f"ssh -o BatchMode=yes $n.pro.pvt 'bash -s {n} {period}' < {_SAMPLER} > {outdir}/$n.txt & "
+            f"ssh -o BatchMode=yes $n.pro.pvt 'bash -s {n} {period}' < {script} > {outdir}/$n.txt & "
             f"echo $! >> {outdir}/.pids; done")
 
 
@@ -122,6 +124,13 @@ def _cp1_pre() -> list[Step]:
                     "--out @{state}/pre/search_health_1x.json", None, 300, mark=False)],
             gate="0 lag-recovery seeks, cube rate >= 4.9/s, scatter mean <= 90 ms on all 8 halves",
             optional=True),
+        Step("pre.vm_baseline_1x", t, "read-only: 1x NUMA hint faults + system time on the search nodes "
+             "(ledger E5 baseline, 2 min)", 3, [
+            Command(_sampler_bg("@{search_nodes}", 25, 5, "@{state}/pre/vm_1x", _VM_SAMPLER) + "; "
+                    + _sampler_wait("@{state}/pre/vm_1x") + "; @{py_h23} @{repo}/tools/x2/cp_runner.py check "
+                    "vm-summary --dir @{state}/pre/vm_1x --nodes @{search_nodes_csv} "
+                    "--out @{state}/pre/e5_numa_1x.json", None, 300, mark=False)],
+            gate="recorded (today ~3,100 hint faults/s per node with numa_balancing=1)", optional=True),
         Step("pre.nic_baseline_1x", t, "read-only: 1x NIC counters on all 20 nodes while observing (5 min)", 6, [
             Command(_sampler_bg("@{all_nodes}", 61, 5, "@{state}/pre/nic_1x") + "; "
                     + _sampler_wait("@{state}/pre/nic_1x"), None, 600, mark=False)],
@@ -210,10 +219,12 @@ def _cp1_search() -> list[Step]:
             touches=("gpu",), requires=(_BENCH_OWNER,), owner="WS-S",
             gate="1x-compat equal to production on the recorded taps"),
         Step("search.engine_synthetic", t, "owner engine on both GPUs from a synthetic ring", 15, [
-            Command(f"{_RUN} {_BENCH_OWNER} engine --gpus 0,1 --input synthetic-ring --opoint @{{live_format}} "
+            Command(f"(bash @{{scratch}}/tools/x2/cp_runner_vm_sample.sh 130 5 > {out}/vm_@{{search_node}}.txt &) "
+                    f"&& {_RUN} {_BENCH_OWNER} engine --gpus 0,1 --input synthetic-ring --opoint @{{live_format}} "
                     f"--minutes 10 --out {out}", h, 1500)],
             touches=("gpu", "shm"), requires=(_BENCH_OWNER,), owner="WS-S",
-            gate="GPU duty <= 0.75 per half (aim 0.6), bounded lag, zero ring overruns, host <= 30 ms/cycle"),
+            gate="GPU duty <= 0.75 per half (aim 0.6), bounded lag, zero ring overruns, host <= 30 ms/cycle; "
+                 "E5: NUMA hint faults/s, system time and scatter recorded (vm_<node>.txt + the bench JSON)"),
         Step("search.collect", t, "pull the search results to h23", 2, [
             Command(f"mkdir -p @{{state}}/search && rsync -a {h}.pro.pvt:{out}/ @{{state}}/search/", None, 600,
                     mark=False)]),
@@ -275,14 +286,19 @@ def _cp1_fleet() -> list[Step]:
         Step("fleet.search_full_load", t, "search real time through the real RX path: v2 synthetic UDP at the "
              "chosen load +10% into search_rx v4 + owner engines on all 8 halves", 45, [
             Command(_sampler_bg("@{search_nodes}", 400, 5, "@{state}/fleet/nic_full_load") + "; "
+                    + _sampler_bg("@{search_nodes}", 400, 5, "@{state}/fleet/vm_full_load", _VM_SAMPLER) + "; "
                     f"@{{py_h23}} @{{repo}}/{_FAKE} fleet-load --format @{{format}} --load-factor 1.1 "
                     f"--plan @{{scratch}}/cp_plan.npz {drv} --engine '{_BENCH_OWNER} engine --input rx-v4' "
                     "--minutes 30 --out @{state}/fleet/full_load.json; rc=$?; "
-                    + _sampler_wait("@{state}/fleet/nic_full_load") + "; exit $rc", None, 3600)],
+                    + _sampler_wait("@{state}/fleet/nic_full_load") + "; "
+                    + _sampler_wait("@{state}/fleet/vm_full_load") + "; exit $rc", None, 3600),
+            Command("@{py_h23} @{repo}/tools/x2/cp_runner.py check vm-summary --dir @{state}/fleet/vm_full_load "
+                    "--nodes @{search_nodes_csv} --out @{state}/fleet/e5_numa.json", None, 120, mark=False)],
             touches=("gpu", "shm", "nic", "services"), guard_hosts=ALL_NODES,
             requires=(_FAKE_V2, _BENCH_OWNER), owner="WS-T / WS-S",
             gate="per half GPU duty <= 0.75 (aim 0.6), bounded lag, zero ring overruns, fan-in >= 99.9% of "
-                 "cubes per DM, loss <= max(1e-4, 1x), host <= 30 ms/cycle"),
+                 "cubes per DM, loss <= max(1e-4, 1x), host <= 30 ms/cycle; E5 (measure only): NUMA hint "
+                 "faults/s and system-time fraction per search node vs the 1x ~3,100 faults/s, plus scatter"),
         Step("fleet.c_sender_snap_live", t, "C sendmmsg sender at the chosen per-corr load with the SNAPs live", 15, [
             Command(_sampler_bg("@{corr_nodes}", 130, 5, "@{state}/fleet/nic_snap_live") + "; "
                     f"@{{py_h23}} @{{repo}}/{_FAKE} snap-live --sender c --format @{{format}} {drv} "

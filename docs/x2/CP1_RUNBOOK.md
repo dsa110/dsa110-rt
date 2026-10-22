@@ -71,7 +71,7 @@ Then, while observing, run:
 
 ```
 cd <x2/main checkout on h23>
-tools/x2/cp_runner.py run cp1 --track pre          # ~45 min, read-only + guarded CPU tests
+tools/x2/cp_runner.py run cp1 --track pre          # ~50 min, read-only + guarded CPU tests
 ```
 
 | step | what it records (in `~/x2_checkpoints/<tag>/pre/`) |
@@ -83,6 +83,7 @@ tools/x2/cp_runner.py run cp1 --track pre          # ~45 min, read-only + guarde
 | pre.etcd_snapshot | sha256 of /cnf/pipeline_rt, /cnf/search_rt, /cnf/opoint and the injection K prefix |
 | pre.node_checkouts | the production checkout sha and dirty count on all 20 nodes |
 | pre.search_health_1x | the 1x baseline of lag seeks, cube rate and scatter, 2 min on 8 halves |
+| pre.vm_baseline_1x | the 1x baseline for E5: NUMA hint faults/s and system time on the 4 search nodes (`/proc/vmstat`, `/proc/stat`) |
 | pre.nic_baseline_1x | 5 min of 1x NIC counters on all 20 nodes, used for the relative loss/discard gates |
 
 The tag is `cp1_<sha>`. Use the same `--tag` for every later command, so all results land in
@@ -149,6 +150,12 @@ To answer them in advance, pass `--yes <step>`.
   - GPU duty ≤ 0.75 per half (aim ≤ 0.6);
   - bounded lag and zero ring overruns;
   - host Python ≤ 30 ms per cycle.
+- **E5 (ledger; measured, not a gate).** The runner samples NUMA hint faults/s, page faults and the
+  system-time fraction during `search.engine_synthetic` and `fleet.search_full_load`
+  (`fleet/e5_numa.json`). Compare them with the 1x baseline of about 3,100 hint faults/s per node
+  and with the engines' scatter. If ring v4's mmap readers cost real time, the options are
+  pread/pinned-copy readers or `kernel.numa_balancing=0`. The second is a host change and needs
+  your sign-off; it is not done at CP1.
 
 ## S1: the format choice
 

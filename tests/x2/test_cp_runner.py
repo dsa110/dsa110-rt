@@ -363,9 +363,31 @@ def test_check_fleet_stopped_uses_corr_and_search_state():
     assert not ok and "stopped" in msg
 
 
-def test_node_sampler_script_is_read_only():
-    text = (REPO / "tools" / "x2" / "cp_runner_nic_sample.sh").read_text()
+@pytest.mark.parametrize("name", ["cp_runner_nic_sample.sh", "cp_runner_vm_sample.sh"])
+def test_node_sampler_scripts_are_read_only(name):
+    text = (REPO / "tools" / "x2" / name).read_text()
     body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
-    for word in ("sudo", "sysctl -w", "ip link set", "ethtool -K", "ethtool -G", "rm ", "> /"):
+    for word in ("sudo", "sysctl -w", "ip link set", "ethtool -K", "ethtool -G", "rm ", "> /", "tee "):
         assert word not in body, word
-    assert "10\\.41\\.0\\." in body and "brif" in body
+    if name == "cp_runner_nic_sample.sh":
+        assert "10\\.41\\.0\\." in body and "brif" in body
+
+
+def test_vm_rates_and_e5_steps():
+    lines = ["# numa_balancing 1 host n13"]
+    for i in range(3):
+        # t hint local migrated pgfault pgmaj user system idle
+        lines.append(f"{100 + 10 * i} {i * 31000} {i * 30000} {i * 50} {i * 900000} {i} "
+                     f"{1000 + i * 800} {500 + i * 100} {9000 + i * 3100}")
+    r = cr.vm_rates("\n".join(lines))
+    assert r["ok"] and r["numa_balancing"] == "1"
+    assert abs(r["numa_hint_faults_per_s"] - 3100) < 1e-9
+    assert abs(r["system_frac"] - 200 / (1600 + 200 + 6200)) < 1e-9
+    assert not cr.vm_rates("# numa_balancing 1\n")["ok"]
+    plan = cpp.build_cp1()
+    full = next(s for s in plan.steps if s.id == "fleet.search_full_load")
+    assert any("cp_runner_vm_sample.sh" in c.sh for c in full.commands)
+    assert any("vm-summary" in c.sh for c in full.commands)
+    eng = next(s for s in plan.steps if s.id == "search.engine_synthetic")
+    assert "cp_runner_vm_sample.sh" in eng.commands[0].sh
+    assert any(s.id == "pre.vm_baseline_1x" and not s.touches for s in plan.steps)
