@@ -177,50 +177,50 @@
   "b_ns2": {
    "N": 10202112.0,
    "n_max": 3936.0,
-   "heavy_count": 2272,
-   "heavy_weight": 0.4010840108401084,
+   "heavy_count": 2560,
+   "heavy_weight": 0.4628124059018368,
    "s_h": 0.077330137925038,
    "heavy_clip_sigma": 9.820927516479825,
    "max_main_snr_at_250": 2.425105193644369,
    "midrise4": {
-    "eta_eff": 0.9964371281236045,
+    "eta_eff": 0.9967791762797478,
     "eta_all_main": 0.9942118061905367
    },
    "midrise5": {
-    "eta_eff": 0.9988527570100405,
+    "eta_eff": 0.9989453619534006,
     "eta_all_main": 0.9982508645818917
    },
    "midtread4": {
-    "eta_eff": 0.9960323835455724,
+    "eta_eff": 0.9964162796817297,
     "eta_all_main": 0.9935344050858524
    },
    "midtread5": {
-    "eta_eff": 0.9987933919429932,
+    "eta_eff": 0.9988921205580732,
     "eta_all_main": 0.998151681974063
    }
   },
   "b_ns4": {
    "N": 10202112.0,
    "n_max": 1968.0,
-   "heavy_count": 1472,
-   "heavy_weight": 0.1951219512195122,
+   "heavy_count": 1664,
+   "heavy_weight": 0.22071665161096055,
    "s_h": 0.054680664916885384,
    "heavy_clip_sigma": 6.944444444444444,
    "max_main_snr_at_250": 2.4849933521546763,
    "midrise4": {
-    "eta_eff": 0.9953194314418514,
+    "eta_eff": 0.9954646305355584,
     "eta_all_main": 0.9942118061905367
    },
    "midrise5": {
-    "eta_eff": 0.9985680577647562,
+    "eta_eff": 0.9986096575964472,
     "eta_all_main": 0.9982508645818917
    },
    "midtread4": {
-    "eta_eff": 0.9947748494635793,
+    "eta_eff": 0.9949374475158957,
     "eta_all_main": 0.9935344050858524
    },
    "midtread5": {
-    "eta_eff": 0.998488253994705,
+    "eta_eff": 0.998532394861719,
     "eta_all_main": 0.998151681974063
    }
   }
@@ -311,30 +311,30 @@
    "0.0003": {
     "heavy_count": 224,
     "heavy_weight": 0.07286961758506474,
-    "max_main_snr_at_250": 4.1298053320584724,
+    "max_main_snr_at_250": 4.269838301475451,
     "eta_midtread4": 0.9939887056647735,
     "eta_midtread5": 0.9982682966048938
    },
    "0.0001": {
-    "heavy_count": 2272,
-    "heavy_weight": 0.4010840108401084,
+    "heavy_count": 2560,
+    "heavy_weight": 0.4628124059018368,
     "max_main_snr_at_250": 2.425105193644369,
-    "eta_midtread4": 0.9960323835455724,
-    "eta_midtread5": 0.9987933919429932
+    "eta_midtread4": 0.9964162796817297,
+    "eta_midtread5": 0.9988921205580732
    },
    "3e-05": {
-    "heavy_count": 3648,
-    "heavy_weight": 0.49623607347184584,
+    "heavy_count": 3104,
+    "heavy_weight": 0.5010538994278831,
     "max_main_snr_at_250": 1.3282848188819547,
-    "eta_midtread4": 0.9966240840767264,
-    "eta_midtread5": 0.9989455748135334
+    "eta_midtread4": 0.9966540343133572,
+    "eta_midtread5": 0.9989532797184147
    },
    "1e-05": {
-    "heavy_count": 3936,
-    "heavy_weight": 0.5031616982836495,
+    "heavy_count": 3232,
+    "heavy_weight": 0.5040650406504065,
     "max_main_snr_at_250": 0.7668855977419899,
-    "eta_midtread4": 0.9966671372606755,
-    "eta_midtread5": 0.9989566505974229
+    "eta_midtread4": 0.9966727527571299,
+    "eta_midtread5": 0.9989580952567099
    }
   },
   "b_ns4": {
@@ -353,25 +353,25 @@
     "eta_midtread5": 0.998151681974063
    },
    "0.0001": {
-    "heavy_count": 1472,
-    "heavy_weight": 0.1951219512195122,
+    "heavy_count": 1664,
+    "heavy_weight": 0.22071665161096055,
     "max_main_snr_at_250": 2.4849933521546763,
-    "eta_midtread4": 0.9947748494635793,
-    "eta_midtread5": 0.998488253994705
+    "eta_midtread4": 0.9949374475158957,
+    "eta_midtread5": 0.998532394861719
    },
    "3e-05": {
-    "heavy_count": 6336,
-    "heavy_weight": 0.4742547425474255,
+    "heavy_count": 5824,
+    "heavy_weight": 0.49202047576031316,
     "max_main_snr_at_250": 1.3282848188819547,
-    "eta_midtread4": 0.9965466938652162,
-    "eta_midtread5": 0.998969545942123
+    "eta_midtread4": 0.9966593585186048,
+    "eta_midtread5": 0.9990001706466027
    },
    "1e-05": {
-    "heavy_count": 7616,
-    "heavy_weight": 0.5007527853056308,
+    "heavy_count": 6336,
+    "heavy_weight": 0.5028605841613971,
     "max_main_snr_at_250": 0.7668855977419899,
-    "eta_midtread4": 0.9967147313990421,
-    "eta_midtread5": 0.9990152231304963
+    "eta_midtread4": 0.9967280968065559,
+    "eta_midtread5": 0.9990188564554062
    }
   }
  },

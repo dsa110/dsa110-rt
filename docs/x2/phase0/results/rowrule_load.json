@@ -185,21 +185,21 @@
    "datagrams_per_s_node_max": 203450.52083333346
   },
   "b_ns2|cint4|heavy0.0001": {
-   "total_gbps": 36.2308349609375,
+   "total_gbps": 35.9222412109375,
    "node_gbps": [
-    9.17236328125,
-    9.17236328125,
-    9.17236328125,
-    8.7137451171875
+    9.09423828125,
+    9.09423828125,
+    9.09423828125,
+    8.6395263671875
    ],
-   "node_max": 9.17236328125,
-   "clean_needed_80": 11.4654541015625,
+   "node_max": 9.09423828125,
+   "clean_needed_80": 11.3677978515625,
    "n_coarse": [
     32,
     15
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 71.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 80.0,
    "k_range": [
     4,
     4
@@ -208,21 +208,21 @@
    "datagrams_per_s_node_max": 152587.890625
   },
   "b_ns2|cint4|heavy3e-05": {
-   "total_gbps": 37.0601806640625,
+   "total_gbps": 36.2501220703125,
    "node_gbps": [
-    9.38232421875,
-    9.38232421875,
-    9.38232421875,
-    8.9132080078125
+    9.17724609375,
+    9.17724609375,
+    9.17724609375,
+    8.7183837890625
    ],
-   "node_max": 9.38232421875,
-   "clean_needed_80": 11.7279052734375,
+   "node_max": 9.17724609375,
+   "clean_needed_80": 11.4715576171875,
    "n_coarse": [
     32,
     15
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 114.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 97.0,
    "k_range": [
     4,
     4
@@ -231,44 +231,21 @@
    "datagrams_per_s_node_max": 152587.890625
   },
   "b_ns2|cint5|heavy0.0001": {
-   "total_gbps": 44.6689453125,
+   "total_gbps": 44.186767578125,
    "node_gbps": [
-    11.30859375,
-    11.30859375,
-    11.30859375,
-    10.7431640625
+    11.1865234375,
+    11.1865234375,
+    11.1865234375,
+    10.627197265625
    ],
-   "node_max": 11.30859375,
-   "clean_needed_80": 14.1357421875,
+   "node_max": 11.1865234375,
+   "clean_needed_80": 13.983154296875,
    "n_coarse": [
     32,
     15
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 71.0,
-   "k_range": [
-    3,
-    3
-   ],
-   "datagrams_per_s_total": 803629.557291667,
-   "datagrams_per_s_node_max": 203450.52083333343
-  },
-  "b_ns2|cint5|heavy3e-05": {
-   "total_gbps": 45.2861328125,
-   "node_gbps": [
-    11.46484375,
-    11.46484375,
-    11.46484375,
-    10.8916015625
-   ],
-   "node_max": 11.46484375,
-   "clean_needed_80": 14.3310546875,
-   "n_coarse": [
-    32,
-    15
-   ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 114.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 80.0,
    "k_range": [
     3,
     3
@@ -276,45 +253,68 @@
    "datagrams_per_s_total": 803629.557291667,
    "datagrams_per_s_node_max": 203450.5208333334
   },
-  "b_ns4|cint4|heavy0.0001": {
-   "total_gbps": 35.751953125,
+  "b_ns2|cint5|heavy3e-05": {
+   "total_gbps": 44.4375,
    "node_gbps": [
-    8.93798828125,
-    8.93798828125,
-    8.93798828125,
-    8.93798828125
+    11.25,
+    11.25,
+    11.25,
+    10.6875
    ],
-   "node_max": 8.93798828125,
-   "clean_needed_80": 11.1724853515625,
+   "node_max": 11.25,
+   "clean_needed_80": 14.0625,
+   "n_coarse": [
+    32,
+    15
+   ],
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 97.0,
+   "k_range": [
+    3,
+    3
+   ],
+   "datagrams_per_s_total": 803629.557291667,
+   "datagrams_per_s_node_max": 203450.52083333343
+  },
+  "b_ns4|cint4|heavy0.0001": {
+   "total_gbps": 35.187500000000036,
+   "node_gbps": [
+    8.796875000000009,
+    8.796875000000009,
+    8.796875000000009,
+    8.796875000000009
+   ],
+   "node_max": 8.796875000000009,
+   "clean_needed_80": 10.99609375000001,
    "n_coarse": [
     16,
     8
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 23.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 26.0,
    "k_range": [
-    4,
-    4
+    5,
+    5
    ],
-   "datagrams_per_s_total": 610351.5625,
-   "datagrams_per_s_node_max": 152587.890625
+   "datagrams_per_s_total": 488281.25,
+   "datagrams_per_s_node_max": 122070.31250000001
   },
   "b_ns4|cint4|heavy3e-05": {
-   "total_gbps": 37.236328125,
+   "total_gbps": 36.591796875,
    "node_gbps": [
-    9.30908203125,
-    9.30908203125,
-    9.30908203125,
-    9.30908203125
+    9.14794921875,
+    9.14794921875,
+    9.14794921875,
+    9.14794921875
    ],
-   "node_max": 9.30908203125,
-   "clean_needed_80": 11.6363525390625,
+   "node_max": 9.14794921875,
+   "clean_needed_80": 11.4349365234375,
    "n_coarse": [
     16,
     8
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 99.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 91.0,
    "k_range": [
     4,
     4
@@ -323,44 +323,44 @@
    "datagrams_per_s_node_max": 152587.890625
   },
   "b_ns4|cint5|heavy0.0001": {
-   "total_gbps": 44.53125,
+   "total_gbps": 43.740234375,
    "node_gbps": [
-    11.1328125,
-    11.1328125,
-    11.1328125,
-    11.1328125
+    10.93505859375,
+    10.93505859375,
+    10.93505859375,
+    10.93505859375
    ],
-   "node_max": 11.1328125,
-   "clean_needed_80": 13.916015625,
+   "node_max": 10.93505859375,
+   "clean_needed_80": 13.6688232421875,
    "n_coarse": [
     16,
     8
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 23.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 26.0,
    "k_range": [
-    3,
-    3
+    4,
+    4
    ],
-   "datagrams_per_s_total": 813802.0833333338,
-   "datagrams_per_s_node_max": 203450.52083333346
+   "datagrams_per_s_total": 610351.5625,
+   "datagrams_per_s_node_max": 152587.890625
   },
   "b_ns4|cint5|heavy3e-05": {
-   "total_gbps": 45.64453125,
+   "total_gbps": 44.921875,
    "node_gbps": [
-    11.4111328125,
-    11.4111328125,
-    11.4111328125,
-    11.4111328125
+    11.23046875,
+    11.23046875,
+    11.23046875,
+    11.23046875
    ],
-   "node_max": 11.4111328125,
-   "clean_needed_80": 14.263916015625,
+   "node_max": 11.23046875,
+   "clean_needed_80": 14.0380859375,
    "n_coarse": [
     16,
     8
    ],
-   "values_per_stream_mean": 1773.0,
-   "heavy_per_stream_mean": 99.0,
+   "values_per_stream_mean": 1748.0,
+   "heavy_per_stream_mean": 91.0,
    "k_range": [
     3,
     3

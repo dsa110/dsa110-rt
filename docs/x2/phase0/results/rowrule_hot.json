@@ -90,49 +90,49 @@
   },
   "b_ns4|heaviest|H0": {
    "n_hot": 1968.0,
-   "rule2x_4bit": 0.9938127152571928,
+   "rule2x_4bit": 0.994209552764912,
    "hot_clip_sigma": 6.944444444444444,
    "artefact_image_sigma_per_sample": 0.09645061728395062
   },
   "b_ns4|heaviest|H10": {
    "n_hot": 1968.0,
-   "rule2x_4bit": 0.9938127152571928,
+   "rule2x_4bit": 0.994209552764912,
    "hot_clip_sigma": 6.944444444444444,
    "artefact_image_sigma_per_sample": 0.09645061728395062
   },
   "b_ns4|heaviest|H50": {
    "n_hot": 1968.0,
-   "rule2x_4bit": 0.9938127152571928,
+   "rule2x_4bit": 0.994209552764912,
    "hot_clip_sigma": 6.944444444444444,
    "artefact_image_sigma_per_sample": 0.09645061728395062
   },
   "b_ns4|heaviest|H1000": {
    "n_hot": 1968.0,
-   "rule2x_4bit": 0.9938127152571928,
+   "rule2x_4bit": 0.994209552764912,
    "hot_clip_sigma": 6.944444444444444,
    "artefact_image_sigma_per_sample": 0.09645061728395062
   },
   "b_ns4|median|H0": {
    "n_hot": 48.0,
-   "rule2x_4bit": 0.9938883260648017,
+   "rule2x_4bit": 0.9942539862523179,
    "hot_clip_sigma": 2.4737999999999998,
    "artefact_image_sigma_per_sample": 0.005365870168889356
   },
   "b_ns4|median|H10": {
    "n_hot": 48.0,
-   "rule2x_4bit": 0.9938883260648017,
+   "rule2x_4bit": 0.9942539862523179,
    "hot_clip_sigma": 2.4737999999999998,
    "artefact_image_sigma_per_sample": 0.005365870168889356
   },
   "b_ns4|median|H50": {
    "n_hot": 48.0,
-   "rule2x_4bit": 0.9938883260648017,
+   "rule2x_4bit": 0.9942539862523179,
    "hot_clip_sigma": 2.4737999999999998,
    "artefact_image_sigma_per_sample": 0.005365870168889356
   },
   "b_ns4|median|H1000": {
    "n_hot": 48.0,
-   "rule2x_4bit": 0.9938883260648017,
+   "rule2x_4bit": 0.9942539862523179,
    "hot_clip_sigma": 2.4737999999999998,
    "artefact_image_sigma_per_sample": 0.005365870168889356
   }
@@ -151,15 +151,15 @@
    "b64_snr_per_sigma_offset": 6.8787618228718825
   },
   "b_ns2": {
-   "one_stream_zero_sigma": 1.0702684316348021,
-   "one_antenna_flagged_sigma_mean": 0.6620863787693886,
-   "one_antenna_flagged_sigma_max": 0.8061403242107287,
+   "one_stream_zero_sigma": 1.0511570144570244,
+   "one_antenna_flagged_sigma_mean": 0.6608825853534442,
+   "one_antenna_flagged_sigma_max": 0.7896884808594894,
    "b64_snr_per_sigma_offset": 6.8787618228718825
   },
   "b_ns4": {
-   "one_stream_zero_sigma": 0.7567940656988593,
-   "one_antenna_flagged_sigma_mean": 0.93633153631816,
-   "one_antenna_flagged_sigma_max": 1.1400545796746564,
+   "one_stream_zero_sigma": 0.7432802530143675,
+   "one_antenna_flagged_sigma_mean": 0.934629115343036,
+   "one_antenna_flagged_sigma_max": 1.1167881596812959,
    "b64_snr_per_sigma_offset": 6.8787618228718825
   }
  }

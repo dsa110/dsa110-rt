@@ -1,6 +1,19 @@
 """Real contribution counts n per transmitted value, for every corner-turn format (Phase 0, shared).
 
-Production conventions (grid/sparsity_pattern.build_pattern as deployed, cell_lambda_mode tee45):
+SOURCE OF TRUTH (since rev 2 of this file): WS-P's `dsart.grid.baseline_grid.build_value_map` at
+origin/x2/ws-plan 193b89c (SPEC section 3 frozen v1), run on its fixture
+tests/fixtures/x2/dsa110_antpos.npz (cal-blob E/N, corr_setup_96 station order, antpos_u = None as
+in production), tee45, DEC 71.63.  Extract it once (gitignored):
+
+    mkdir -p docs/x2/phase0/_wsplan && git archive 193b89c src/dsart/__init__.py src/dsart/common \
+        src/dsart/grid tests/fixtures/x2 docs/x2/SPEC.md | tar -x -C docs/x2/phase0/_wsplan
+
+The module below is bound WITHOUT dsart/grid/__init__.py (which imports torch); the builder is numpy.
+The independent model below (`build_model`) is kept as a cross-check: gridded maps agree exactly;
+per-baseline differs because rint(B / 5 cm) binning splits 1556 near-identical pairs across bin edges
+(1773 bins vs 1748 exact classes).
+
+Model conventions (grid/sparsity_pattern.build_pattern as deployed, cell_lambda_mode tee45):
   * antenna E/N from antennas.out (== _inspect/sensitivity/pipeline_antpos.npz), heights from the
     station survey (station_enu.npz; the core is flat to 1 cm, so 3-D and 2-D classes agree);
   * core = station number <= 102 (82 antennas, 3321 cross-baselines), xGPU upper-tri order b <= a,
@@ -90,8 +103,57 @@ def cell_of(du, dv, f_ghz):
     return row, col, ok
 
 
+WSP_REV = "193b89c"
+WSP_DIR = os.path.join(HERE, "..", "_wsplan")
+DEC_DEG = 71.63
+_BG = None
+
+
+def wsp():
+    """WS-P's baseline_grid module from the extracted tree, bound without dsart/grid/__init__."""
+    global _BG
+    if _BG is not None:
+        return _BG
+    import importlib.util
+    import sys
+    import types
+    src = os.path.join(WSP_DIR, "src", "dsart")
+    if not os.path.isfile(os.path.join(src, "grid", "baseline_grid.py")):
+        raise RuntimeError(f"extract WS-P {WSP_REV} into {WSP_DIR} first (see module docstring)")
+    if "dsart" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("dsart", os.path.join(src, "__init__.py"),
+                                                      submodule_search_locations=[src])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["dsart"] = mod
+        spec.loader.exec_module(mod)
+        grid = types.ModuleType("dsart.grid")
+        grid.__path__ = [os.path.join(src, "grid")]
+        sys.modules["dsart.grid"] = grid
+    from dsart.grid import baseline_grid as bg  # noqa: E402
+    _BG = bg
+    return bg
+
+
+def wsp_inputs():
+    """(antpos_e, antpos_n, core mask) exactly as WS-P's fixture / production."""
+    bg = wsp()
+    from dsart.grid.sparsity_pattern import core_baseline_mask_from_station_numbers
+    z = np.load(os.path.join(WSP_DIR, "tests", "fixtures", "x2", "dsa110_antpos.npz"))
+    mask = core_baseline_mask_from_station_numbers(z["station"])
+    return z["antpos_e"], z["antpos_n"], mask, bg
+
+
 def redundancy_classes(tol=0.05):
-    """class index per core baseline (3-D positions within tol, sign-canonical), conj flag, mult."""
+    """WS-P exact classes, in core_baselines() order: (class per baseline, conj flag, multiplicity)."""
+    e, n, mask, bg = wsp_inputs()
+    rc = bg.redundancy_classes(e, n, None, is_core_baseline_mask=mask, tol_m=tol)
+    du, dv, _, a_l, b_l = core_baselines()
+    assert np.array_equal(rc.ant_a, a_l) and np.array_equal(rc.ant_b, b_l), "kept-baseline order differs"
+    return rc.bl_class.astype(np.int64), rc.bl_conj.astype(bool), rc.multiplicity.astype(np.int64)
+
+
+def redundancy_classes_model(tol=0.05):
+    """The model's rint(B / tol) binning (sign-canonical): 1773 bins, splits near-identical pairs."""
     du, dv, dw, _, _ = core_baselines()
     q = np.stack([np.rint(du / tol), np.rint(dv / tol), np.rint(dw / tol)], 1).astype(np.int64)
     flip = (q[:, 1] < 0) | ((q[:, 1] == 0) & (q[:, 0] < 0))
@@ -101,7 +163,21 @@ def redundancy_classes(tol=0.05):
 
 
 def build(kind, csf, n_sub):
-    """List of streams; each stream = dict(g, s, n (values,), row, col) plus totals."""
+    """Streams from WS-P's build_value_map (the source of truth): dict(g, s, n, row, col)."""
+    e, n, mask, bg = wsp_inputs()
+    vm = bg.build_value_map(e, n, antpos_u=None, is_core_baseline_mask=mask, kind=kind, n_sub=n_sub,
+                            chan_sum_factor=csf, dec_deg=DEC_DEG, cell_lambda=CELL, n_grid=N_GRID,
+                            heavy_frac=None, normalise=(csf != 8))
+    out = []
+    for st in vm.streams:
+        out.append(dict(g=int(st.chgroup), s=int(st.sub_band), n=st.n_contrib.astype(np.int64),
+                        row=st.cell_row.astype(np.int64), col=st.cell_col.astype(np.int64), n_dropped=0))
+    out[0]["n_dropped"] = int(vm.n_dropped_offgrid)
+    return out
+
+
+def build_model(kind, csf, n_sub):
+    """Independent model (cross-check): list of streams dict(g, s, n, row, col)."""
     du, dv, dw, _, _ = core_baselines()
     nus = summed_freqs_ghz(csf)
     per = nus.shape[1] // n_sub
@@ -116,8 +192,7 @@ def build(kind, csf, n_sub):
                 streams.append(dict(g=g, s=s, n=n.astype(np.int64), row=cells // N_GRID,
                                     col=cells % N_GRID, n_dropped=int((~ok).sum())))
     else:
-        cls, flip, mult = redundancy_classes()
-        # representative uv of each class: the canonical (unflipped) member geometry
+        cls, flip, mult = redundancy_classes_model()
         rep_du = np.zeros(len(mult))
         rep_dv = np.zeros(len(mult))
         sgn = np.where(flip, -1.0, 1.0)
@@ -130,7 +205,7 @@ def build(kind, csf, n_sub):
                 fc = nus[g, s * per:(s + 1) * per].mean()
                 row, col, ok = cell_of(rep_du, rep_dv, fc)
                 n = (mult * per).astype(np.int64)
-                streams.append(dict(g=g, s=s, n=n[ok], row=row[ok], col=col[ok], mult=mult[ok],
+                streams.append(dict(g=g, s=s, n=n[ok], row=row[ok], col=col[ok],
                                     n_dropped=int((mult[~ok] * per).sum())))
     return streams
 
@@ -177,14 +252,28 @@ def save(fmt):
 
 if __name__ == "__main__":
     os.makedirs(RES, exist_ok=True)
-    du, dv, dw, _, _ = core_baselines()
-    cls, flip, mult = redundancy_classes()
-    out = {"n_core_baselines": int(len(du)), "unique_3d_5cm": int(len(mult)),
-           "mult_max": int(mult.max()), "singletons": int((mult == 1).sum()),
-           "cell_lambda": CELL}
+    e, n, mask, bg = wsp_inputs()
+    a = np.fromfile(SENS + "antennas.out", dtype="<f4")
+    cls, conj, mult = redundancy_classes()
+    _, _, mult_m = redundancy_classes_model()
+    out = {"source": f"WS-P baseline_grid @ {WSP_REV} (SPEC section 3 v1), fixture dsa110_antpos.npz",
+           "fixture_equals_antennas_out": bool(np.array_equal(e, a[:96]) and np.array_equal(n, a[96:192])),
+           "n_core_baselines": int(len(cls)), "exact_classes": int(len(mult)), "model_bins": int(len(mult_m)),
+           "mult_max": int(mult.max()), "singletons": int((mult == 1).sum()), "cell_lambda": CELL}
     print(out, flush=True)
-    for fmt in FORMATS:
-        s = summarise(save(fmt))
-        out[fmt] = s
-        print(fmt, json.dumps(s), flush=True)
+    for fmt, (kind, csf, n_sub) in FORMATS.items():
+        st = save(fmt)
+        sm = summarise(st)
+        # heavy at N/3e4 as well
+        n_all = np.concatenate([x["n"] for x in st])
+        thr3 = 3e-5 * n_all.sum()
+        sm["heavy3e-5_per_stream_mean"] = float((n_all >= thr3).sum() / len(st))
+        sm["heavy3e-5_frac_weight"] = float(n_all[n_all >= thr3].sum() / n_all.sum())
+        mod = build_model(kind, csf, n_sub)
+        same = len(mod) == len(st) and all(np.array_equal(np.sort(x["n"]), np.sort(y["n"]))
+                                           for x, y in zip(st, mod))
+        sm["model_identical_n"] = bool(same)
+        sm["model_values_per_stream_mean"] = float(np.mean([len(x["n"]) for x in mod]))
+        out[fmt] = sm
+        print(fmt, json.dumps(sm), flush=True)
     json.dump(out, open(os.path.join(RES, "valuemaps.json"), "w"), indent=1)

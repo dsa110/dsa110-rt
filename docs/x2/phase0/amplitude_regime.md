@@ -82,11 +82,11 @@ already present in K3a.
 | image output scale | 1/N^2 | c_img = 1/sqrt(sum n V) = 3.14e-4 | 1/N^2 | K3a (`src/dsart/x2/search/*`) |
 | steady sigma_img | 2.5e-4 | 1.00 | 0.0486 | |
 | Layer-1 floor (raw units) | 1.953e-5 = 0.078 sigma_ss | **0.078** | 3.80e-3 | `noise.layer1_sigma_floor` + the scaling at `search_compute.py:702`. 2x: floor = 0.078 x sigma_pred, with sigma_pred from the pattern (1.0 in B), not via `imager_uv_prescale` |
-| Layer-2 floor | 0.5 (sums of unit-sigma samples) | **0.5** for boxcars. For a weighted kernel h_k replacing boxcar width w_k: 0.5 x \|\|h_k\|\|_2 / sqrt(w_k), the same fraction of the seed as today | same | `detector.layer2_sigma_floor` (per-kernel in 2x) |
-| Layer-2 seed | sqrt(w) implicit | \|\|h_k\|\|_2 (plan) | same | |
+| Layer-2 floor | 0.5 (sums of unit-sigma samples) | **0.5** for boxcars. For any other kernel (study 5 b3x: [1,2,1], B3) floor_k = seed_k x 0.5/sqrt(w_k), with w_k the nominal width and seed_k the white-noise sigma of the kernel's output (\|\|h_k\|\|_2 for integer sums, \|\|h_k\|\|_2/sum h_k for moving averages). This is the same fraction of the seed as today | same | `detector.layer2_sigma_floor` (per-kernel in 2x) |
+| Layer-2 seed | sqrt(w) implicit | white-noise output sigma of h_k (\|\|h_k\|\|_2 if outputs are sums) | same | |
 | sigma_max_ratio / escape / tau | 4.0 / 64 cubes / 30 s | 4.0 / 64 cubes (per-DM state, 201.3 ms cycle = 12.9 s as today) / 30 s | same | |
 | input clip | 250 sigma per sample, post-L1 | **250** | 250 | `detector.input_clip_sigma` -> K3b |
-| boxcar accumulation | fp16 (guard 16000 < 65504) | fp32 (plan K3b); the fp16 guard becomes irrelevant. Keep it for any fp16 fallback: 250 x max support < 65504 needs support <= 262 (B3 ~170 OK) | | `cube_pipeline.py:815` |
+| boxcar accumulation | fp16 (guard 16000 < 65504) | **fp32** (plan K3b). B3-64 integer-cascade sums reach 250 x 127,500 = 3.2e7 at the clip (study 5), so fp16 is impossible for B-splines; moving averages keep values O(clip). Keep the start-up guard, generalised to clip x max sum h_k for any fp16 path | | `cube_pipeline.py:815` |
 | fp16 image ring | | max 6.5e4 sigma, ULP 1e-3 sigma at 1 sigma | max 1.3e6 sigma, ULP 6e-4 sigma | |
 | saturation guard | 240 | **240** (0.96 x the smallest rail, b1 = 250) | | `inject_calibration.py:1021` |
 | probe aim | 30 | 30 (keep; the 2x wire is linear far beyond) | | `inject_calibration.py:1012` |

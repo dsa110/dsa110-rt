@@ -5,6 +5,10 @@ geometry from `scripts/valuemaps.py`. Results: `results/imaging_per_baseline.jso
 `results/imaging_per_baseline_map.npz` (17 x 17 field map), `results/imaging_per_baseline_noise.json`.
 Runtime about 3 min on one core of h23.
 
+**Re-run on WS-P's exact classes.** The first run used the model's 1773 rint-binned classes. After WS-P
+measured 1748 exact classes, everything was re-run on them. Every number below is unchanged at the
+4th decimal; the only visible change is B4 vs A astrometry, max 0.0051 px instead of 0.0052.
+
 ## What is compared
 The setup is the 2x op-point: csf 2 (16 chgroups x 192 summed channels), 3321 core cross-baselines,
 N = 10,202,112 contributions per image, and the production gridding convention (`build_pattern`,
@@ -14,7 +18,7 @@ tee45): u = -dE/lambda, v = -dN/lambda, no dec projection, a 17.905-lambda cell 
 | scheme | placement |
 |---|---|
 | **A**: gridded cells (today's semantics) | each (baseline, summed channel) at its own nearest cell |
-| **B**: per-baseline, n_sub 2 / 4 | each exact 3-D redundancy class (5 cm; 1773 classes) summed over its members and the sub-band's channels (natural weighting = SUM). The sum is placed at the nearest cell of the class member-mean uv at the sub-band CENTRE frequency. 56,736 / 113,472 entries |
+| **B**: per-baseline, n_sub 2 / 4 | each exact 3-D redundancy class (5 cm; **1748 classes from WS-P's `baseline_grid.redundancy_classes` @ 193b89c**) summed over its members and the sub-band's channels (natural weighting = SUM). The sum is placed at the nearest cell of the class member-mean uv at the sub-band CENTRE frequency. 55,936 / 111,872 entries |
 | **Bx** | the same entries at their EXACT (unrounded) uv, evaluated by DFT. This isolates bandwidth smearing |
 | ideal | every (baseline, channel) at its exact uv. The peak is exactly 1 at the true position |
 
