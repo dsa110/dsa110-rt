@@ -24,6 +24,10 @@ This is the correctness-first v1 of K3b (8 launches for b3x, the image
 re-read per filter); the fused smem-stage-ring variant is a CP1
 optimisation with the same twin (see ``bench/timeres/b8_owner2x.py``).
 
+Loop bounds are ``tl.constexpr`` (one specialisation per (n_c, filter
+length) / max entries): the Triton 3.1 interpreter cannot index a runtime
+scalar with numpy >= 2.
+
 No ``from __future__ import annotations``: Triton must see real
 ``tl.constexpr`` annotations.
 """
@@ -37,8 +41,8 @@ __all__ = ["k1_combine", "k3b_detect"]
 
 @triton.jit
 def _k1_kernel(codes_ptr, cv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_ptr, out_ptr,
-               n_act, n_t, t_lo, R, V, S, max_ne, off,
-               BLOCK_C: tl.constexpr, BLOCK_T: tl.constexpr):
+               n_act, n_t, t_lo, R, V, S, off,
+               MAX_NE: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_T: tl.constexpr):
     pid_c = tl.program_id(0)
     pid_t = tl.program_id(1)
     f = tl.program_id(2)
@@ -51,7 +55,7 @@ def _k1_kernel(codes_ptr, cv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_pt
     ne = p1 - p0
     acc_re = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
     acc_im = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
-    for j in range(0, max_ne):
+    for j in range(0, MAX_NE):
         has = (ne > j) & cm
         e = p0 + j
         s = tl.load(es_ptr + e, mask=has, other=0)
@@ -97,9 +101,8 @@ def k1_combine(codes: torch.Tensor, c_v: torch.Tensor, csr_t: dict, shifts: torc
     grid = (triton.cdiv(n_act, block_c), triton.cdiv(n_t, block_t), F)
     _k1_kernel[grid](codes, c_v, csr_t["cell_ptr"], csr_t["ent_stream"], csr_t["ent_value"],
                      csr_t["ent_conj"], csr_t["half_sign"], shifts, out,
-                     n_act, int(n_t), int(t_lo), int(R), int(V), int(S),
-                     int(csr_t["max_ne"]), float(offset),
-                     BLOCK_C=block_c, BLOCK_T=block_t)
+                     n_act, int(n_t), int(t_lo), int(R), int(V), int(S), float(offset),
+                     MAX_NE=int(csr_t["max_ne"]), BLOCK_C=block_c, BLOCK_T=block_t)
     return out
 
 
@@ -133,8 +136,9 @@ def _xs(ring_ptr, row, r_start, row0, R, FP, base, pm, si, clip):
 @triton.jit
 def _k3b_kernel(ring_ptr, si_ptr, best_ptr, tk_ptr, tapidx_ptr, taps_ptr,
                 R, F, P, row0, c_first, n_c, s_inv_k, clip, k_id, first,
-                D, A, LEN, L1, L2, L3, n_tap,
-                ORDER: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+                D, A, L1, L2, L3, n_tap,
+                LEN: tl.constexpr, N_C: tl.constexpr, ORDER: tl.constexpr,
+                CHUNK: tl.constexpr, BLOCK: tl.constexpr):
     pid_p = tl.program_id(0)
     f = tl.program_id(1)
     pix = pid_p * BLOCK + tl.arange(0, BLOCK)
@@ -153,8 +157,7 @@ def _k3b_kernel(ring_ptr, si_ptr, best_ptr, tk_ptr, tapidx_ptr, taps_ptr,
     s30 = tl.zeros((BLOCK,), dtype=tl.float32)
     cur = tl.full((BLOCK,), float("-inf"), dtype=tl.float32)
     ctk = tl.zeros((BLOCK,), dtype=tl.int32)
-    n_iter = n_c + LEN - 1
-    for it in range(0, n_iter):
+    for it in range(0, N_C + LEN - 1):
         c = c_first - (LEN - 1) + it
         e = c + D
         if ORDER == 0:
@@ -236,7 +239,8 @@ def k3b_detect(ring: torch.Tensor, *, ring_row0: int, c_first: int, n_c: int,
         _k3b_kernel[grid](ring, sigma_inv, best, tk, tapidx, taps,
                           int(R), int(F), int(P), int(ring_row0), int(c_first), int(n_c),
                           float(s_inv[k]), float(clip), int(k), int(k == 0),
-                          int(flt.d), int(flt.a), int(flt.length),
+                          int(flt.d), int(flt.a),
                           int(st[0]), int(st[1]), int(st[2]), int(max(n_tap, 1)),
-                          ORDER=int(flt.order), CHUNK=int(chunk), BLOCK=int(block))
+                          LEN=int(flt.length), N_C=int(n_c), ORDER=int(flt.order),
+                          CHUNK=int(chunk), BLOCK=int(block))
     return best, tk, (taps if n_tap else None)
