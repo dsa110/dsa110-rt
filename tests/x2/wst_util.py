@@ -50,14 +50,14 @@ def plan(n_sub: int = 2):
 def stream_blocks(vm, streams, *, rule: q.RowRule, n_samples: int, seed: int = 0,
                   sigma: float = 2.0, n_blocks: int = 2):
     """Row-rule codes for ``n_samples`` noise samples of each stream (after
-    ``n_blocks - 1`` warm-up blocks). Returns {stream: BlockCodes}."""
+    the rule's warm-up and ``n_blocks - 1`` more blocks). Returns {stream: BlockCodes}."""
     rng = np.random.default_rng(seed)
     out = {}
     for s in streams:
         sv = vm.streams[s]
         rq = q.RowQuantiser(rule, sv.n_contrib, sv.n_heavy)
         x = None
-        for _ in range(n_blocks):
+        for _ in range(rule.warmup_blocks + n_blocks):
             shape = (n_samples, sv.n_values)
             x = ((rng.normal(0, sigma, shape) + 1j * rng.normal(0, sigma, shape))
                  * np.sqrt(sv.n_contrib)[None, :]).astype(np.complex64)
@@ -74,9 +74,9 @@ def datagrams_for(vm, bc, *, stream: int, dm: int, seq_first: int, t_int_factor:
         bits_main=rule.bits_main, n_grid=vm.n_grid,
         value_kind=0 if vm.kind == "gridded" else 1,
         pattern_id=int(vm.stream_pattern_ids[stream]),
-        step_main=float(bc.step_main), step_heavy=float(bc.step_heavy),
+        step_main=bc.step_main, step_heavy=bc.step_heavy, guarded=bc.guarded,
         s_main=float(rule.s_main_f32), s_heavy=float(rule.s_heavy_f32),
-        midrise=rule.midrise, extra_flags=extra_flags, k=k))
+        extra_flags=extra_flags, k=k))
 
 
 def synthetic_frame(*, stream=0, dm=0, seq_first=0, k=2, n_values=20, n_heavy=2,

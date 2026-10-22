@@ -1,13 +1,21 @@
 """Frame v2 codec (SPEC §5): layout, sizes, packing, validation."""
 from __future__ import annotations
 
+import importlib.util
 import struct
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from dsart.transport import prod_frame
 from dsart.transport import prod_frame2 as f2
+
+_spec = importlib.util.spec_from_file_location("wst_util", Path(__file__).with_name("wst_util.py"))
+wu = importlib.util.module_from_spec(_spec)
+sys.modules["wst_util"] = wu
+_spec.loader.exec_module(wu)
 
 
 def _hdr(**kw) -> f2.Frame2Header:
@@ -32,7 +40,7 @@ def test_header_is_72_bytes_and_round_trips():
 
 def test_exact_byte_offsets():
     h = _hdr(seq_first=0x0010203040506070, t0_native=0x0010203040506070 * 16,
-             flags=f2.FLAG_QUANTIZED | f2.FLAG_HEAVY_PRESENT | f2.FLAG_MIDRISE
+             flags=f2.FLAG_QUANTIZED | f2.FLAG_HEAVY_PRESENT | f2.FLAG_ROW_GUARD
              | f2.FLAG_LAST_IN_BLOCK)
     b = f2.pack_header(h)
     o = f2.OFFSETS
@@ -207,7 +215,7 @@ def test_block_datagrams_split_and_flags():
         assert h.t0_native == h.seq_first * 32
         assert h.k == (4 if i < 2 else 2)
         assert h.last_in_block == (i == 2)
-        assert h.rfi_warming_up and not h.midrise
+        assert h.rfi_warming_up and not h.row_guard
         assert h.flags & f2.FLAG_HEAVY_PRESENT
         a, b = f2.unpack_samples(p, h.k, h.n_values, h.n_heavy, 8, 16)
         got_h.append(a)
@@ -227,3 +235,70 @@ def test_block_datagrams_default_k_is_max_and_fits_mtu():
         pattern_id=1, step_main=1.0, step_heavy=1.0, s_main=0.3534, s_heavy=0.1))
     assert len(dgs) == -(-256 // 3)
     assert max(len(d) for d in dgs) == 72 + 3 * 2837 <= 8972
+
+
+def test_t0_native_is_twice_the_snap_specnum():
+    """t0_native counts 32.768 us native samples = 2 x SNAP specnum (65.536 us),
+    same epoch; the external row is t0_native // 16 at 2x, // 32 at 1x."""
+    for spec in (0, 1, 12345, 2**40 + 7):
+        t0 = f2.t0_native_from_specnum(spec)
+        assert t0 == 2 * spec and f2.specnum_from_t0_native(t0) == spec
+        assert f2.ext_row(t0) == t0 // 16 == spec // 8
+        assert f2.ext_row(t0, f2.NATIVE_PER_EXT_1X) == spec // 16
+    # a tier-B row (32 native) covers external rows 2r and 2r+1
+    seq = 1000
+    assert f2.ext_row(seq * 32) == 2 * seq and f2.ext_row(seq * 32 + 31) == 2 * seq + 1
+
+
+def test_runs_of_equal_steps_and_guard_flag():
+    rng = np.random.default_rng(4)
+    S = 12
+    ch = rng.integers(-127, 128, size=(S, 2, 2)).astype(np.int8)
+    cm = rng.integers(-7, 8, size=(S, 30, 2))
+    sm = np.full(S, 0.25, np.float32)
+    sh = np.full(S, 0.05, np.float32)
+    gd = np.zeros(S, bool)
+    sm[5:7], sh[5:7], gd[5:7] = 0.75, 0.15, True                # two guarded rows, same scale
+    sm[9], sh[9], gd[9] = 0.6, 0.12, True                        # another guarded row
+    dgs = [f2.unpack_frame(d) for d in f2.iter_block_datagrams(
+        codes_heavy=ch, codes_main=cm, seq_first=0, t_int_factor=16, stream_id=1, dm_idx=2,
+        n_sub=2, bits_main=8, n_grid=256, value_kind=0, pattern_id=1, step_main=sm,
+        step_heavy=sh, guarded=gd, s_main=0.3534, s_heavy=0.0773, k=4)]
+    runs = [(h.seq_first, h.k, h.row_guard, round(h.step_main, 3)) for h, _ in dgs]
+    assert runs == [(0, 4, False, 0.25), (4, 1, False, 0.25), (5, 2, True, 0.75),
+                    (7, 2, False, 0.25), (9, 1, True, 0.6), (10, 2, False, 0.25)]
+    assert [h.last_in_block for h, _ in dgs] == [False] * 5 + [True]
+    back = np.concatenate([f2.unpack_samples(p, h.k, 32, 2, 8, 16)[1] for h, p in dgs])
+    np.testing.assert_array_equal(back, cm)
+
+
+@pytest.mark.parametrize("fmt", [("gridded", 2, 8), ("gridded", 2, 10), ("gridded", 4, 10),
+                                 ("gridded", 4, 8), ("baselines", 4, 8), ("baselines", 2, 8)])
+def test_real_value_maps_fit_one_datagram(fmt):
+    vm = wu.value_map(*fmt)
+    for sv in vm.streams:
+        bps = f2.bytes_per_sample(sv.n_values, sv.n_heavy, fmt[2], 16 if sv.n_heavy else 0)
+        k = f2.max_k(bps)
+        assert k >= 2 and f2.HEADER_BYTES + k * bps <= 8972
+
+
+def _worst_node_datagram_rate(fmt) -> float:
+    vm = wu.value_map(*fmt)
+    pl = wu.plan(fmt[1])
+    rate = np.zeros(4)
+    k = [f2.max_k(f2.bytes_per_sample(sv.n_values, sv.n_heavy, fmt[2], 16 if sv.n_heavy else 0))
+         for sv in vm.streams]
+    for d in range(len(pl.owner_half)):
+        rows_per_block = 4096 // int(pl.coarse_t_native[d])
+        per_block = sum(-(-rows_per_block // kk) for kk in k)    # datagrams never straddle a block
+        rate[int(pl.owner_half[d]) // 2] += per_block / (4096 * 32.768e-6)
+    return float(rate.max())
+
+
+def test_worst_node_datagram_rates_match_phase0():
+    """The RX v4 / CP1 sweep requirement (Phase 0 rowrule §8): gridded n_sub 2
+    cint5 ~305k datagrams/s on the worst search node, cint4 ~203k."""
+    r5 = _worst_node_datagram_rate(("gridded", 2, 10))
+    r4 = _worst_node_datagram_rate(("gridded", 2, 8))
+    assert 0.97 * 305e3 < r5 < 1.10 * 305e3, r5
+    assert 0.97 * 203e3 < r4 < 1.10 * 203e3, r4
