@@ -82,7 +82,8 @@ OPOINT_RESTART_UNITS: tuple[str, ...] = (
     "hiplot_c2.service",
 )
 
-OPOINT_CHOICES: tuple[str, ...] = opr.OPOINTS
+#: Start-control choices: 1x, 1x-legacy and the six CP1 2x formats (by op-point id).
+OPOINT_CHOICES: tuple[str, ...] = opr.UI_SELECTIONS
 DEFAULT_HEALTH_TIMEOUT_S: float = 90.0
 DEFAULT_SETTLE_S: float = 8.0
 _SEARCH_CN_IDS: tuple[int, ...] = (1, 2, 9, 13)
@@ -297,23 +298,32 @@ def opoint_banner(store: Any, *, ttl_s: float = 15.0,
         return dict(_BANNER_CACHE["val"], switching=_SWITCH_LOCK.locked())
     active = opr.resolve_active_opoint(store, retries=1, use_cache=False)
     live = read_live(store)
-    stamps = {inst: opr.config_stamp(cfg) for inst, cfg in live.items()}
-    consistent = all(opr.stamp_matches(cfg, active.name) for cfg in live.values()
+    stamps = {inst: opr.rendered_selection(cfg) for inst, cfg in live.items()}
+    consistent = all(opr.stamp_matches(cfg, active.selection) for cfg in live.values()
                      if cfg is not None)
-    val = {"active": active.name, "source": active.source, "warning": active.warning,
+    val = {"active": active.selection, "opoint_id": active.opoint_id,
+           "plan_id": active.plan_id, "source": active.source, "warning": active.warning,
            "live_stamps": stamps, "consistent": consistent,
            "choices": list(OPOINT_CHOICES)}
     _BANNER_CACHE.update(t=now, val=val)
     return dict(val, switching=_SWITCH_LOCK.locked())
 
 
-def _h23_files_report(op: str, configs_dir: Path) -> tuple[list[str], dict[str, Any]]:
-    """Problems with the h23 files the restarted services read, + their parsed search_rt."""
+def _strip_for_compare(cfg: Any) -> Any:
+    """A search_rt without what rendering changes (routines + stamps)."""
+    if not isinstance(cfg, Mapping):
+        return cfg
+    drop = {"routines", opr.STAMP_KEY, opr.SELECTION_KEY, opr.PLAN_ID_KEY, opr.PLAN_PATH_KEY}
+    return {k: v for k, v in cfg.items() if k not in drop}
+
+
+def _h23_files_report(sel: str, configs_dir: Path) -> tuple[list[str], dict[str, Any]]:
+    """Problems with the h23 files the restarted services read, + their parsed contents."""
     problems: list[str] = []
     parsed: dict[str, Any] = {}
     for kind in ("search_rt", "c2_criteria"):
         try:
-            path = opr.config_path(kind, op, configs_dir)
+            path = opr.config_path(kind, sel, configs_dir)
         except FileNotFoundError as exc:
             problems.append(f"h23 {exc}")
             continue
@@ -323,43 +333,67 @@ def _h23_files_report(op: str, configs_dir: Path) -> tuple[list[str], dict[str, 
             problems.append(f"h23 {path}: unreadable ({exc})")
             continue
         parsed[kind] = cfg
-        rep = opr.validate_config(cfg, op, kind)
+        rep = opr.validate_config(cfg, sel, kind, rendered=False)
         if not rep.ok:
             problems.append(f"h23 {path}: {rep.summary()}")
     # K isolation: each K family's inject bot keeps its own state file.
     if isinstance(parsed.get("search_rt"), Mapping):
         mine = (parsed["search_rt"].get("inject_bot") or {}).get("state_path")
-        for other in sorted(set(opr.K_FAMILY.values()) - {opr.K_FAMILY[op]}):
+        for fam in sorted(set(opr.K_FAMILIES) - {opr.k_family_of(sel)}):
+            other_set = "1x" if fam == "1x" else "2x"
             try:
-                ocfg = opr.load_yaml(opr.config_path("search_rt", other, configs_dir))
+                ocfg = opr.load_yaml(opr.config_path("search_rt", other_set, configs_dir))
             except (FileNotFoundError, OSError):
                 continue
             theirs = ((ocfg or {}).get("inject_bot") or {}).get("state_path")
             if mine is not None and mine == theirs:
                 problems.append(
-                    f"h23 inject_bot.state_path {mine} is shared with op-point {other}: "
+                    f"h23 inject_bot.state_path {mine} is shared with the {fam} config set: "
                     "the K doctor would carry K across time resolutions")
     return problems, parsed
+
+
+def check_plan_on_h23(plan_id: str | None, plan_path: str | None) -> tuple[list[str], list[str]]:
+    """(problems, warnings) for the set's v3 plan as seen from h23.
+
+    C2/C3/the bot take the owner map from the plan, so the file at
+    ``plan_path`` must be THE plan of the set (``plan_id`` equal). A missing
+    file is a warning (h23 services may not use it yet); a different plan is a
+    problem.
+    """
+    if not plan_path:
+        return [], []
+    if not os.path.isfile(plan_path):
+        return [], [f"plan {plan_path} is not on h23 (C2/C3/bot owner maps need it)"]
+    try:
+        from dsart.x2.plan import TieredDmPlan
+
+        got = f"0x{int(TieredDmPlan.from_npz(plan_path).plan_id):016x}"
+    except Exception as exc:  # noqa: BLE001
+        return [f"plan {plan_path} on h23 is unreadable: {exc}"], []
+    if got != plan_id:
+        return [f"plan {plan_path} on h23 has plan_id {got}, the set says {plan_id}"], []
+    return [], []
 
 
 def opoint_status(store: Any, *, configs_dir: Path = H23_CONFIGS_DIR) -> dict[str, Any]:
     """Full status for ``GET /control/opoint``: active op-point + readiness of each set."""
     out = opoint_banner(store, ttl_s=0.0)
     sets: dict[str, Any] = {}
-    for op in OPOINT_CHOICES:
-        cfgs = {inst: store.get_dict(opr.set_key(op, inst)) for inst in opr.INSTANCES}
-        meta = store.get_dict(opr.meta_key(op))
+    for sel in OPOINT_CHOICES:
+        cfgs = {inst: store.get_dict(opr.set_key(sel, inst)) for inst in opr.INSTANCES}
+        meta = store.get_dict(opr.meta_key(sel))
         pushed = all(v is not None for v in cfgs.values())
-        rep = opr.validate_set(cfgs, op, require_stamp=True) if pushed else None
-        h23_problems, _ = _h23_files_report(op, configs_dir)
-        sets[op] = {
+        rep = opr.validate_set(cfgs, sel) if pushed else None
+        h23_problems, _ = _h23_files_report(sel, configs_dir)
+        sets[sel] = {
             "pushed": pushed,
-            "meta": {k: meta.get(k) for k in ("pushed_utc", "user", "git_sha", "source")}
+            "meta": {k: meta.get(k) for k in ("pushed_utc", "user", "git_sha", "source", "plan_id")}
             if isinstance(meta, dict) else None,
             "switchable": bool(pushed and rep is not None and rep.ok and not h23_problems),
             "problems": (rep.summary() if rep is not None and not rep.ok
                          else ("" if pushed else "not pushed (push_dsart_to_etcd.py --opoint "
-                               f"{op} --write)")),
+                               f"{sel} --write)")),
             "h23_problems": h23_problems,
         }
     out["sets"] = sets
@@ -394,7 +428,7 @@ def plan_k_park(store: Any, from_op: str, to_op: str) -> dict[str, Any]:
     touched key to its value before the switch (``None`` = absent), which is
     what an exact rollback writes back.
     """
-    ff, tf = opr.K_FAMILY[from_op], opr.K_FAMILY[to_op]
+    ff, tf = opr.k_family_of(from_op), opr.k_family_of(to_op)
     if ff == tf:
         return {"puts": [], "deletes": [], "prior": {},
                 "info": {"family": tf, "parked": 0, "restored": 0}}
@@ -459,10 +493,11 @@ def switch_opoint(
         return res
 
     try:
-        opr.validate_name(target)
+        target = opr.validate_selection(target)
     except opr.OpPointError as exc:
         res["error"] = str(exc)
         return res
+    res["to"] = target
     if not _SWITCH_LOCK.acquire(blocking=False):
         res["error"] = "another op-point switch is in progress"
         return res
@@ -471,16 +506,17 @@ def switch_opoint(
                                            use_cache=False, sleep_fn=sleep)
         if active.source == "default":
             return _refuse("read", f"cannot read {opr.ACTIVE_KEY}: {active.warning}")
-        res["from"] = active.name
+        res["from"] = active.selection
         live = read_live(store)
-        if target == active.name and not reapply:
+        if target == active.selection and not reapply:
             bad = [inst for inst, cfg in live.items()
                    if cfg is not None and not opr.stamp_matches(cfg, target)]
             if bad:
                 return _refuse(
                     "consistency",
                     f"/cnf/opoint is {target} but live "
-                    + ", ".join(f"/cnf/{i} is stamped {opr.config_stamp(live[i])!r}" for i in bad)
+                    + ", ".join(f"/cnf/{i} is rendered for {opr.rendered_selection(live[i])!r}"
+                                for i in bad)
                     + "; tick 're-apply op-point' to rewrite the live configs from "
                     f"/cnf/opoints/{target}")
             res["ok"] = True
@@ -507,24 +543,30 @@ def switch_opoint(
         if missing:
             return _refuse("validate", f"{', '.join(missing)} not in etcd; push it with "
                                        f"tools/ops/push_dsart_to_etcd.py --opoint {target} --write")
-        rep = opr.validate_set(new, target, require_stamp=True)
+        rep = opr.validate_set(new, target)
         if not rep.ok:
             return _refuse("validate", f"/cnf/opoints/{target}: {rep.summary()}")
         h23_problems, h23_parsed = _h23_files_report(target, Path(configs_dir))
+        plan_id = new["search_rt"].get(opr.PLAN_ID_KEY)
+        plan_path = new["search_rt"].get(opr.PLAN_PATH_KEY)
+        if opr.op_of(target).plan_version == 3 and not plan_id:
+            h23_problems.append(f"/cnf/opoints/{target}/search_rt carries no plan_id")
+        if new["pipeline_rt"].get(opr.PLAN_ID_KEY) != plan_id:
+            h23_problems.append("pipeline_rt and search_rt were rendered with different plans")
+        p_probs, p_warn = check_plan_on_h23(plan_id, plan_path)
+        h23_problems += p_probs
+        warnings.extend(p_warn)
         if h23_problems:
             return _refuse("validate", "; ".join(h23_problems))
         meta = store.get_dict(opr.meta_key(target))
         sha_new = {inst: cdiff.canonical_sha256(cfg) for inst, cfg in new.items()}
-        if "search_rt" in h23_parsed:
-            try:
-                h23_sha = cdiff.canonical_sha256(opr.stamp(h23_parsed["search_rt"], target))
-            except opr.OpPointError:
-                h23_sha = None
-            if h23_sha != sha_new["search_rt"]:
-                warnings.append(
-                    f"h23 {opr.config_path('search_rt', target, configs_dir)} differs from "
-                    f"/cnf/opoints/{target}/search_rt (C2/C3/bot read the h23 file, the "
-                    "search nodes the etcd copy)")
+        if "search_rt" in h23_parsed and (
+                cdiff.canonical_sha256(_strip_for_compare(h23_parsed["search_rt"]))
+                != cdiff.canonical_sha256(_strip_for_compare(new["search_rt"]))):
+            warnings.append(
+                f"h23 {opr.config_path('search_rt', target, configs_dir)} differs from "
+                f"/cnf/opoints/{target}/search_rt outside the routines (C2/C3/bot read the "
+                "h23 file, the search nodes the etcd copy): re-push or pull the h23 checkout")
         _audit("validate", True, {"sha256": {k: v[:16] for k, v in sha_new.items()}},
                "; ".join(warnings))
 
@@ -548,7 +590,7 @@ def switch_opoint(
                                            for i in opr.INSTANCES}})
 
         # injection K: park the old K family, restore the new one's
-        kp = plan_k_park(store, active.name, target)
+        kp = plan_k_park(store, active.selection, target)
         res["k_park"] = kp["info"]
 
         # everything the write touches, with its value before the switch
@@ -580,11 +622,12 @@ def switch_opoint(
                 return _refuse("stop_bot", f"could not stop dsart_inject_bot: {st['err']}")
 
         # 6. one atomic write: live configs, /cnf/opoint, K moves
-        record = {"opoint": target, "set_utc": _iso_now(), "user": user or "unknown",
-                  "host": socket.gethostname(), "previous": active.name,
-                  "sha256": sha_new,
-                  "set_meta": ({k: meta.get(k) for k in ("pushed_utc", "git_sha", "source", "user")}
-                               if isinstance(meta, dict) else None)}
+        record = opr.make_active_record(
+            target, plan_id=plan_id, plan_path=plan_path, set_utc=_iso_now(),
+            user=user or "unknown", host=socket.gethostname(), previous=active.selection,
+            sha256=sha_new,
+            set_meta=({k: meta.get(k) for k in ("pushed_utc", "git_sha", "source", "user")}
+                      if isinstance(meta, dict) else None))
         puts = [(opr.LIVE_KEYS[i], new[i]) for i in opr.INSTANCES]
         puts.append((opr.ACTIVE_KEY, record))
         puts += kp["puts"]

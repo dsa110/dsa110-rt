@@ -1,23 +1,28 @@
 # =============================================================================
-# OP-POINT 2x -- search-node pipeline + h23 C1/C2/C3/bot blocks (etcd /cnf/opoints/2x/search_rt)
+# CONFIG SET 2x -- search-node pipeline + h23 C1/C2/C3/bot blocks
 #
-# Pushed by `tools/ops/push_dsart_to_etcd.py --opoint 2x --write` to
-# /cnf/opoints/2x/search_rt; copied to the live /cnf/search_rt only by the
-# web-UI Start control (fleet stopped). The h23 services (C2, C3, inject bot)
-# read THIS file from the h23 checkout when /cnf/opoint is 2x
-# (dsart.x2.opoint_runtime.select_service_config); search_compute reads its
+# TEMPLATE for every 2x corner-turn format (op-point id
+# 2x-<kind>-ns<n>-cint<b>, dsart.x2.opoint; the format is chosen at CP1).
+# Rendered copy: /cnf/opoints/<2x id>/search_rt -> live /cnf/search_rt
+# (Start control). The h23 services (C2, C3, inject bot) read THIS file
+# from the h23 checkout when /cnf/opoint is a 2x id
+# (opoint_runtime.select_service_config); search_compute reads its
 # c1/detector blocks from the node copy via --config-yaml.
 # Frozen interface: docs/x2/SPEC.md section 10. Started as a verbatim copy of
 # configs/dsart_search_rt.yaml (the 1x base set, which stays byte-identical
-# to production). Every value the 2x op-point still has to decide is either
-#   * an  X2TODO:<owner>:<what>  token in place of the value (it fails argument
-#     parsing, so this set can never run with a 1x value by accident), or
-#   * an entry of the top-level  x2_todo:  list (section-level reviews).
-# The owner replaces the token / deletes the entry. The web-UI Start control
-# refuses to switch to 2x while any token or entry remains, and
-# `push_dsart_to_etcd.py --opoint 2x --write` refuses unless
-# --allow-placeholders is given. Paths to op-point managed files must point
-# into configs/opoints/2x/ (validated).
+# to production).
+#   * ${var} in routine args / hostargs is rendered at push time from the
+#     op-point id and the v3 plan (`push_dsart_to_etcd.py --opoint <2x id>
+#     --plan <npz> --write`; variables: dsart.x2.opoint_runtime.render_context
+#     -- n_sub, n_streams, plan_path, plan_id, owned_coarse_csv_h<h>, ...).
+#     Variables are allowed ONLY there: the h23 services read the other
+#     blocks straight from this file.
+#   * X2TODO:<owner>:<what> tokens stand for values not decided yet (they
+#     fail argument parsing); top-level x2_todo entries are section reviews
+#     still owed. Both block a switch (the push needs --allow-placeholders).
+#   * x2_cp2_recalibrate entries are 1x values to recalibrate at CP2 (do not
+#     block).
+# Paths to op-point managed files must point into configs/opoints/2x/.
 # =============================================================================
 # dsart-rt search-node pipeline config — pushed to etcd under
 # /cnf/search_rt by tools/ops/push_dsart_to_etcd.py and consumed at
@@ -35,7 +40,7 @@
 schema_version: 1
 opoint: 2x
 x2_todo:
-  - "WS-T search_rx: recv v4 / ring v4 args (owned DMs only, per-DM cadence and fan-in, retention >= 20 s; tokens in routines[search_rx])"
+  - "WS-T search_rx: recv v4 / ring v4 args (owned DMs only -- template variables owned_coarse_csv_n01/n02/n09/n13 and n_owned_<node> are available for hostargs -- per-DM cadence and fan-in, retention >= 20 s; tokens in routines[search_rx])"
   - "WS-S search_compute: owner engine args (per-DM cubes, K0-K3b, B-spline filters), amplitude regime in sigma units (input_clip_sigma 250, Layer-1/Layer-2 floors for the new image units, saturation guard 240), --enable-cube-dump vs on-demand cutouts (O1); tokens in routines[search_compute_0/1]"
   - "WS-S/WS-D c1: merger dm_max_trials in pc/cc (2x fine spacing 2.8-3.2 pc/cc vs ~7), metering per cycle not per cube (never meter an injection more often than 1x), _DEDISP_CHAN_SUM_FACTOR wired from --chan-sum-factor (search_compute.py:266 is a literal 8 today)"
   - "WS-S cube / cube_dump / noise / detector blocks: 2x values (cube retention ring, proactive stager and cube uploader retire in 2x)"
@@ -140,11 +145,11 @@ routines:
     spawn_delay_s: 4.0
     args: >-
       -u -m dsart.services.search_rx
-      --opoint 2x
+      --opoint ${opoint_id}
       --port-base 6625 --n-ports 16
       --so-rcvbuf-bytes 268435456
       --shm-name /dsart-rxring-CN
-      --n-corr X2TODO:WS-T:n-streams --n-coarse-dm X2TODO:WS-T:owned-dms
+      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-T:owned-dms
       --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
       --bytes-per-cell X2TODO:WS-T:bits-per-value
       --status-interval-s 5.0
@@ -310,19 +315,19 @@ routines:
     spawn_delay_s: 8.0
     args: >-
       -u -m dsart.services.search_compute
-      --opoint 2x
+      --opoint ${opoint_id}
       --shm-name /dsart-rxring-CN
-      --n-corr X2TODO:WS-T:n-streams --n-coarse-dm X2TODO:WS-S:owned-dms
+      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-S:owned-dms
       --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
       --bytes-per-cell X2TODO:WS-T:bits-per-value
       --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
       --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
-      --t-int-search-us 524.288
-      --dm-plan-path X2TODO:WS-P:tiered-dm-plan-v3-path
+      --t-int-search-us ${t_ext_us}
+      --dm-plan-path ${plan_path}
       --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
       --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
-      --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8
-      --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8
+      --coarse-dm-owners-half-0 ${owned_coarse_csv_h0}
+      --coarse-dm-owners-half-1 ${owned_coarse_csv_h1}
       --gpu-half 0 --search-node-id CN
       --device cuda:0 --image-backend gpu
       --detector-streaming-tile-size 256
@@ -344,9 +349,9 @@ routines:
       --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
-      --chan-sum-factor 2
+      --chan-sum-factor ${chan_sum_factor}
       --cell-lambda-mode tee45
-      --n-sub X2TODO:WS-S:n-sub-from-CP1-format
+      --n-sub ${n_sub}
       --combine-impl X2TODO:WS-S:combine-impl
       --imager-uv-prescale X2TODO:WS-S:image-units-prescale
     hostargs:
@@ -356,13 +361,13 @@ routines:
       # the per-host IPv4 takes precedence over the empty default in
       # ``c1.dump_listener.bind_host`` below.
       lxd110h01: --c1-bind-host 10.41.0.205
-      lxd110h02: --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.222
-      lxd110h09: --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.253
-      lxd110h13: --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.238
+      lxd110h02: --coarse-dm-owners-half-0 ${owned_coarse_csv_h2} --c1-bind-host 10.41.0.222
+      lxd110h09: --coarse-dm-owners-half-0 ${owned_coarse_csv_h4} --c1-bind-host 10.41.0.253
+      lxd110h13: --coarse-dm-owners-half-0 ${owned_coarse_csv_h6} --c1-bind-host 10.41.0.238
       n01: --c1-bind-host 10.41.0.205
-      n02: --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.222
-      n09: --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.253
-      n13: --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.238
+      n02: --coarse-dm-owners-half-0 ${owned_coarse_csv_h2} --c1-bind-host 10.41.0.222
+      n09: --coarse-dm-owners-half-0 ${owned_coarse_csv_h4} --c1-bind-host 10.41.0.253
+      n13: --coarse-dm-owners-half-0 ${owned_coarse_csv_h6} --c1-bind-host 10.41.0.238
     env:
       # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
       # always pass --device cuda:0 (the post-mask logical device).
@@ -403,27 +408,27 @@ routines:
     cmd: python
     args: >-
       -u -m dsart.services.search_compute
-      --opoint 2x
+      --opoint ${opoint_id}
       --shm-name /dsart-rxring-CN
-      --n-corr X2TODO:WS-T:n-streams --n-coarse-dm X2TODO:WS-S:owned-dms
+      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-S:owned-dms
       --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
       --bytes-per-cell X2TODO:WS-T:bits-per-value
       --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
       --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
-      --t-int-search-us 524.288
-      --dm-plan-path X2TODO:WS-P:tiered-dm-plan-v3-path
+      --t-int-search-us ${t_ext_us}
+      --dm-plan-path ${plan_path}
       --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
       --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
-      --coarse-dm-owners-half-0 X2TODO:WS-S:owner-map-d-mod-8
-      --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8
+      --coarse-dm-owners-half-0 ${owned_coarse_csv_h0}
+      --coarse-dm-owners-half-1 ${owned_coarse_csv_h1}
       --gpu-half 1 --search-node-id CN
       --device cuda:0 --image-backend gpu
       --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
       --kernel-support 1
-      --chan-sum-factor 2
+      --chan-sum-factor ${chan_sum_factor}
       --cell-lambda-mode tee45
-      --n-sub X2TODO:WS-S:n-sub-from-CP1-format
+      --n-sub ${n_sub}
       --combine-impl X2TODO:WS-S:combine-impl
       --imager-uv-prescale X2TODO:WS-S:image-units-prescale
       --detector-streaming-tile-size 256
@@ -444,13 +449,13 @@ routines:
       --enable-cube-dump
     hostargs:
       lxd110h01: --c1-bind-host 10.41.0.205
-      lxd110h02: --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.222
-      lxd110h09: --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.253
-      lxd110h13: --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.238
+      lxd110h02: --coarse-dm-owners-half-1 ${owned_coarse_csv_h3} --c1-bind-host 10.41.0.222
+      lxd110h09: --coarse-dm-owners-half-1 ${owned_coarse_csv_h5} --c1-bind-host 10.41.0.253
+      lxd110h13: --coarse-dm-owners-half-1 ${owned_coarse_csv_h7} --c1-bind-host 10.41.0.238
       n01: --c1-bind-host 10.41.0.205
-      n02: --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.222
-      n09: --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.253
-      n13: --coarse-dm-owners-half-1 X2TODO:WS-S:owner-map-d-mod-8 --c1-bind-host 10.41.0.238
+      n02: --coarse-dm-owners-half-1 ${owned_coarse_csv_h3} --c1-bind-host 10.41.0.222
+      n09: --coarse-dm-owners-half-1 ${owned_coarse_csv_h5} --c1-bind-host 10.41.0.253
+      n13: --coarse-dm-owners-half-1 ${owned_coarse_csv_h7} --c1-bind-host 10.41.0.238
     env:
       # half 1 → physical GPU 1 (logical cuda:0 inside this process).
       CUDA_VISIBLE_DEVICES: "1"

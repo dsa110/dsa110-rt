@@ -27,26 +27,36 @@ The default is `--instance all`; both YAMLs are pushed.
 
 Op-point sets (x2, docs/x2/SPEC.md §10)
 ---------------------------------------
-With ``--opoint {1x,1x-legacy,2x}`` the script NEVER touches the live
-keys. It writes the op-point's set to
+With ``--opoint <selection>`` (``1x``, ``1x-legacy`` or a 2x op-point id
+such as ``2x-gridded-ns2-cint4``, see ``dsart.x2.opoint.FORMATS_2X``) the
+script NEVER touches the live keys. It writes the selection's set to
 
-  /cnf/opoints/<op>/pipeline_rt, /cnf/opoints/<op>/search_rt, /cnf/opoints/<op>/meta
+  /cnf/opoints/<sel>/pipeline_rt, /cnf/opoints/<sel>/search_rt, /cnf/opoints/<sel>/meta
 
-and is a DRY RUN unless ``--write`` is given. The source is the op-point's
-own file (``configs/opoints/<op>/<file>``) or, for 1x and 1x-legacy, the
-base file when it has none. ``--seed-from-live`` (1x, 1x-legacy only) takes
-the live /cnf/pipeline_rt and /cnf/search_rt instead — an exact snapshot of
-what production runs, drift included. Each config is stamped
-``opoint: <op>``. Every run prints a STRUCTURAL diff against what is in
-/cnf/opoints/<op>/* (``--diff-live`` also against the live keys = what a
-web-UI Start with this op-point would change) and validates the set
-(stamp, cross-op-point file references, X2TODO placeholders / x2_todo
-entries). ``--write`` refuses a set with problems, and a set with
-placeholders unless ``--allow-placeholders``. The web-UI Start control is
-the only writer of the live keys for op-point switches.
+and is a DRY RUN unless ``--write`` is given. The source is the config
+set's own file (``configs/opoints/<set>/<file>``) or, for 1x and 1x-legacy,
+the base file when it has none. A 2x selection needs ``--plan <v3 npz>``
+(built by ``tools/build_dm_plan_tiers.py --opoint <id>``): the plan must be
+THE plan of that op-point (plan_id equal to a rebuild), and the 2x template's
+``${var}`` values (n_sub, n_streams, plan path, per-half owned coarse DMs, ...)
+are rendered from the op-point and the plan; ``--plan-node-path`` is the
+plan's path on the nodes if it differs from ``--plan``.
+``--seed-from-live`` (1x, 1x-legacy only) takes the live /cnf/pipeline_rt
+and /cnf/search_rt instead — an exact snapshot of what production runs,
+drift included. Each config is stamped ``opoint: <op-point id>`` and
+``opoint_selection: <sel>`` (+ ``plan_id`` / ``plan_path`` for 2x). Every
+run prints a STRUCTURAL diff against what is in /cnf/opoints/<sel>/*
+(``--diff-live`` also against the live keys = what a web-UI Start with this
+selection would change) and validates the set (stamp, explicit time units,
+cross-set file references, X2TODO placeholders / x2_todo entries).
+``--write`` refuses a set with problems, and a set with placeholders unless
+``--allow-placeholders``. The web-UI Start control is the only writer of the
+live keys for op-point switches.
 
-    python tools/ops/push_dsart_to_etcd.py --opoint 2x              # diff + validate
-    python tools/ops/push_dsart_to_etcd.py --opoint 2x --write      # store the set
+    python tools/ops/push_dsart_to_etcd.py --opoint 2x-gridded-ns2-cint4 \\
+        --plan /home/ubuntu/data/dm_plans/dm_plan_2x_ns2.npz            # diff + validate
+    python tools/ops/push_dsart_to_etcd.py --opoint 2x-gridded-ns2-cint4 \\
+        --plan /home/ubuntu/data/dm_plans/dm_plan_2x_ns2.npz --write    # store the set
     python tools/ops/push_dsart_to_etcd.py --opoint 1x-legacy --seed-from-live --write
 """
 
@@ -133,10 +143,12 @@ def _git_sha(path: Path) -> dict[str, Any]:
 
 def push_opoint(
     store: Any,
-    opoint: str,
+    selection: str,
     *,
     instances: list[str],
     config_dir: Path,
+    plan_path: str | None = None,
+    plan_node_path: str | None = None,
     write: bool = False,
     seed_from_live: bool = False,
     allow_placeholders: bool = False,
@@ -144,24 +156,52 @@ def push_opoint(
     out: Callable[[str], None] = print,
     now_utc: Callable[[], str] | None = None,
 ) -> int:
-    """Diff, validate and (with ``write``) store op-point ``opoint``'s set.
+    """Diff, validate and (with ``write``) store selection ``selection``'s set.
 
-    Writes only ``/cnf/opoints/<op>/*`` keys (asserted before every put).
+    Writes only ``/cnf/opoints/<sel>/*`` keys (asserted before every put).
     Returns one of the ``RC_*`` codes.
     """
     opr, cdiff = _x2_modules()
     try:
-        opr.validate_name(opoint)
+        sel = opr.validate_selection(selection)
     except opr.OpPointError as exc:
         out(f"[ERROR] {exc}")
         return RC_USAGE
-    if seed_from_live and opoint not in opr.BASE_FALLBACK:
-        out(f"[ERROR] --seed-from-live is only for {sorted(opr.BASE_FALLBACK)}, not {opoint}")
+    op = opr.op_of(sel)
+    if seed_from_live and sel not in opr.BASE_FALLBACK:
+        out(f"[ERROR] --seed-from-live is only for {sorted(opr.BASE_FALLBACK)}, not {sel}")
         return RC_USAGE
+    plan = None
+    if op.plan_version == 3:
+        if not plan_path:
+            out(f"[ERROR] {sel} needs --plan <v3 plan npz> "
+                f"(tools/build_dm_plan_tiers.py --opoint {sel} --out <npz>)")
+            return RC_USAGE
+        from dsart.x2.plan import TieredDmPlan
+
+        try:
+            plan = TieredDmPlan.from_npz(plan_path, verify=True)
+        except Exception as exc:  # noqa: BLE001 - any load/verify failure
+            out(f"[ERROR] --plan {plan_path}: {exc}")
+            return RC_INVALID
+        bad = opr.check_plan_for(sel, plan)
+        if bad:
+            out(f"[ERROR] --plan {plan_path}: " + "; ".join(bad))
+            return RC_INVALID
+    elif plan_path:
+        out(f"[ERROR] {sel} takes no --plan (its DM plan is in the routine args)")
+        return RC_USAGE
+    try:
+        ctx = opr.render_context(sel, plan=plan, plan_path=plan_node_path or plan_path)
+    except opr.OpPointError as exc:
+        out(f"[ERROR] {exc}")
+        return RC_INVALID
 
     mode = "WRITE" if write else "DRY RUN (nothing is written; add --write)"
-    out(f"op-point {opoint}: {mode}")
-    stamped: dict[str, dict[str, Any]] = {}
+    out(f"op-point {sel} (id {op.opoint_id}, config set {opr.config_set_of(sel)}"
+        + (f", plan {ctx['plan_id']} at {ctx['plan_path']}" if plan is not None else "")
+        + f"): {mode}")
+    rendered: dict[str, dict[str, Any]] = {}
     sources: dict[str, str] = {}
     problems: list[str] = []
     placeholders: list[tuple[str, str, str]] = []
@@ -170,9 +210,13 @@ def push_opoint(
         if seed_from_live:
             src_desc = f"etcd {opr.LIVE_KEYS[inst]}"
             cfg = store.get_dict(opr.LIVE_KEYS[inst])
+            have = opr.rendered_selection(cfg)
+            if have not in (None, sel):
+                out(f"[ERROR] {src_desc} is rendered for {have!r}, not {sel!r}")
+                return RC_INVALID
         else:
             try:
-                path = opr.config_path(inst, opoint, config_dir)
+                path = opr.config_path(inst, sel, config_dir)
             except FileNotFoundError as exc:
                 out(f"[ERROR] {exc}")
                 return RC_INVALID
@@ -182,17 +226,17 @@ def push_opoint(
             out(f"[ERROR] {src_desc} is not a mapping ({type(cfg).__name__})")
             return RC_INVALID
         try:
-            new = opr.stamp(cfg, opoint)
+            new = opr.render(cfg, sel, ctx, instance=inst)
         except opr.OpPointError as exc:
             out(f"[ERROR] {src_desc}: {exc}")
             return RC_INVALID
-        rep = opr.validate_config(new, opoint, inst)
+        rep = opr.validate_config(new, sel, inst)
         problems += rep.problems
         placeholders += rep.placeholders
-        stamped[inst] = new
+        rendered[inst] = new
         sources[inst] = src_desc
 
-        key = opr.set_key(opoint, inst)
+        key = opr.set_key(sel, inst)
         cur = store.get_dict(key)
         entries = cdiff.structural_diff(cur, new)
         s = cdiff.summarize(entries)
@@ -212,24 +256,24 @@ def push_opoint(
             live = store.get_dict(opr.LIVE_KEYS[inst])
             le = cdiff.structural_diff(live, new)
             ls = cdiff.summarize(le)
-            out(f"   vs LIVE {opr.LIVE_KEYS[inst]} (what a Start with op-point {opoint} "
+            out(f"   vs LIVE {opr.LIVE_KEYS[inst]} (what a Start with {sel} "
                 f"would change): +{ls['added']} -{ls['removed']} ~{ls['changed']}")
             for line in cdiff.format_diff(le):
                 out("  " + line)
 
     # Every time-unit parameter explicit with this op-point's value
-    # (the code defaults are 2x; opoint_runtime.TIME_UNITS).
-    problems += opr.check_time_units(stamped, opoint)
+    # (the code defaults are 2x; opoint_runtime.time_units_for).
+    problems += opr.check_time_units(rendered, sel)
     notes: list[str] = []
-    for cfg in stamped.values():
+    for cfg in rendered.values():
         notes += opr.recalibration_notes(cfg)
     if not seed_from_live:
         # The C2 criteria file is not stored in etcd (C2 reads it on h23), but
         # it is part of the set: its placeholders gate the push as well.
         try:
-            crit_path = opr.config_path("c2_criteria", opoint, config_dir)
+            crit_path = opr.config_path("c2_criteria", sel, config_dir)
             crit = opr.load_yaml(crit_path)
-            rep = opr.validate_config(crit, opoint, "c2_criteria")
+            rep = opr.validate_config(crit, sel, "c2_criteria", rendered=False)
             problems += rep.problems
             placeholders += rep.placeholders
             notes += opr.recalibration_notes(crit)
@@ -263,15 +307,19 @@ def push_opoint(
 
     stamp_utc = (now_utc or (lambda: _dt.datetime.now(_dt.timezone.utc)
                              .strftime("%Y-%m-%dT%H:%M:%SZ")))()
-    meta_key = opr.meta_key(opoint)
+    meta_key = opr.meta_key(sel)
     meta = store.get_dict(meta_key)
     meta = dict(meta) if isinstance(meta, dict) else {}
     files = dict(meta.get("files") or {})
-    for inst, cfg in stamped.items():
+    for inst, cfg in rendered.items():
         files[inst] = {"source": sources[inst], "sha256": cdiff.canonical_sha256(cfg),
                        "pushed_utc": stamp_utc}
     meta.update({
-        "opoint": opoint,
+        "opoint": op.opoint_id,
+        "selection": sel,
+        "config_set": opr.config_set_of(sel),
+        "plan_id": ctx.get("plan_id"),
+        "plan_path": ctx.get("plan_path"),
         "pushed_utc": stamp_utc,
         "user": getpass.getuser(),
         "host": socket.gethostname(),
@@ -280,7 +328,7 @@ def push_opoint(
         "placeholders": len(placeholders),
         **_git_sha(config_dir),
     })
-    writes = [(opr.set_key(opoint, inst), cfg) for inst, cfg in stamped.items()]
+    writes = [(opr.set_key(sel, inst), cfg) for inst, cfg in rendered.items()]
     writes.append((meta_key, meta))
     for key, payload in writes:
         if not key.startswith(opr.SETS_PREFIX + "/") or opr.is_live_key(key):
@@ -288,12 +336,12 @@ def push_opoint(
     for key, payload in writes:
         store.put_dict(key, payload)
         out(f"  wrote {key}")
-    for inst, cfg in stamped.items():
-        back = store.get_dict(opr.set_key(opoint, inst))
+    for inst, cfg in rendered.items():
+        back = store.get_dict(opr.set_key(sel, inst))
         if cdiff.canonical_sha256(back) != cdiff.canonical_sha256(cfg):
-            out(f"[ERROR] read-back of {opr.set_key(opoint, inst)} differs from what was written")
+            out(f"[ERROR] read-back of {opr.set_key(sel, inst)} differs from what was written")
             return RC_VERIFY
-    out(f"op-point {opoint} stored ({len(stamped)} config(s) + meta); live keys untouched.")
+    out(f"op-point {sel} stored ({len(rendered)} config(s) + meta); live keys untouched.")
     return RC_OK
 
 
@@ -307,10 +355,15 @@ def main(argv: list[str] | None = None, *, store: Any = None) -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="parse + print but do not write to etcd")
     g = p.add_argument_group("op-point sets (x2; never writes live keys)")
-    g.add_argument("--opoint", default=None, choices=("1x", "1x-legacy", "2x"),
-                   help="store this op-point's set under /cnf/opoints/<op>/ (dry run unless --write)")
+    g.add_argument("--opoint", default=None, metavar="SELECTION",
+                   help="1x, 1x-legacy or a 2x op-point id (e.g. 2x-gridded-ns2-cint4): store "
+                        "its set under /cnf/opoints/<sel>/ (dry run unless --write)")
+    g.add_argument("--plan", default=None,
+                   help="with a 2x --opoint: the v3 DM plan npz (tools/build_dm_plan_tiers.py)")
+    g.add_argument("--plan-node-path", default=None,
+                   help="the plan's path on the nodes, if it differs from --plan")
     g.add_argument("--write", action="store_true",
-                   help="with --opoint: actually write /cnf/opoints/<op>/*")
+                   help="with --opoint: actually write /cnf/opoints/<sel>/*")
     g.add_argument("--seed-from-live", action="store_true",
                    help="with --opoint 1x|1x-legacy: snapshot the live /cnf/pipeline_rt + /cnf/search_rt")
     g.add_argument("--allow-placeholders", action="store_true",
@@ -329,8 +382,9 @@ def main(argv: list[str] | None = None, *, store: Any = None) -> int:
         instances = [args.instance]
 
     if args.opoint is None:
-        if args.write or args.seed_from_live or args.allow_placeholders or args.diff_live:
-            print("[ERROR] --write/--seed-from-live/--allow-placeholders/--diff-live "
+        if (args.write or args.seed_from_live or args.allow_placeholders or args.diff_live
+                or args.plan or args.plan_node_path):
+            print("[ERROR] --write/--plan/--seed-from-live/--allow-placeholders/--diff-live "
                   "need --opoint", file=sys.stderr)
             return 2
         if store is None:
@@ -352,6 +406,7 @@ def main(argv: list[str] | None = None, *, store: Any = None) -> int:
         store = DsaStore()
     return push_opoint(
         store, args.opoint, instances=instances, config_dir=cfg_dir,
+        plan_path=args.plan, plan_node_path=args.plan_node_path,
         write=args.write, seed_from_live=args.seed_from_live,
         allow_placeholders=args.allow_placeholders, diff_live=args.diff_live,
     )

@@ -2920,7 +2920,8 @@ function _renderBannerChips(j) {
         // x2 op-point: amber when the live configs do not carry the active
         // op-point's stamp, or while a switch is in progress.
         const o = j.opoint;
-        let txt = o.active + (o.switching ? " (switching)" : "");
+        let txt = o.active + (o.plan_id ? " plan " + String(o.plan_id).slice(0, 10) : "") +
+                  (o.switching ? " (switching)" : "");
         if (o.consistent === false) txt += " / live config " +
             JSON.stringify(o.live_stamps).replace(/"/g, "");
         out.push(_chip("op-point", txt,
