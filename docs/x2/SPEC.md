@@ -23,60 +23,291 @@ against them; everything else is fixed. Change requests go through integration.
 - New code lives under `src/dsart/x2/` unless it extends an existing module; new tests under
   `tests/x2/`. Match surrounding style; pyflakes-clean.
 
-## 1. Op-point parameters (`src/dsart/x2/opoint.py`) [FREEZE: WS-P]
-One frozen dataclass `OpPoint` with presets `OPPOINT_1X` (today) and `OPPOINT_2X(fmt)`:
+## 1. Op-point parameters (`src/dsart/x2/opoint.py`) [FROZEN v1 by WS-P, 2026-10-22]
+`OpPoint` is a frozen dataclass (pure python, no numpy import; validated in `__post_init__`). API:
+`OPPOINT_1X`; `opoint_2x(value_kind="gridded", n_sub=2, bits_main=8) -> OpPoint` (alias `OPPOINT_2X`);
+`FORMATS_2X: dict[str, OpPoint]` (the six CP1 format-table rows, keyed by id); `opoint_from_id(id)`;
+`TierSpec(name, dm_lo, dm_hi, t_native)` with `.t_us`; constants `VALUE_KINDS`,
+`STAGE2_CORR_FIFO_MERGED`, `STAGE2_SEARCH_SINGLE_RINT`.
 
-| field | 1x | 2x |
+| field | type | 1x | 2x |
+|---|---|---|---|
+| `name` | str | "1x" | "2x" |
+| `t_int_fast_native` | int | 32 | 8 |
+| `chan_sum_factor` | int | 8 | 2 |
+| `n_sub` | int | 4 | 2 or 4 (format) |
+| `stage1_q_native` | int | 32 | 8 |
+| `stage2_mode` | str | "corr_fifo_merged" | "search_single_rint" |
+| `value_kind` | str | "gridded" | "gridded" or "baselines" (format) |
+| `bits_main` | int, bits per complex value | 16 (cint8) | 8 / 10 / 12 (cint4/5/6; format) |
+| `bits_heavy` | int | 0 (no heavy class) | 16 (cint8) |
+| `t_ext_native` | int | 32 (1048.576 us) | 16 (524.288 us) |
+| `plan_version` | int | 2 (DmPlan v2 file) | 3 (`TieredDmPlan`) |
+| `tiers` | tuple[TierSpec] | () | (A 50-1600 @ 16 native, B 1600-3000 @ 32 native) |
+| `dm_tol`, `dm_ti_us` | float or None | None | 1.25, 40.0 |
+| `coarse_density`, `coarse_density_t_ref_native` | float or None, int | None, 32 | 0.0206, 32 |
+| `normalise_values` | bool | False | True (value / sqrt(n) on the wire, x sqrt(n) at the owner) |
+| `heavy_frac` | float or None | None | 1e-4 (heavy iff n >= heavy_frac x N_image) |
+| `redundancy_tol_m` | float | 0.05 | 0.05 |
+| `n_grid`, `cell_lambda_mode` | int, str | 256, "tee45" | 256, "tee45" |
+| `n_halves` | int | 8 | 8 |
+
+Derived properties: `nchan_eff` (48 or 192), `n_streams` (16 x n_sub), `t_fast_us`, `stage1_q_us`,
+`t_ext_us`, `chan_width_khz`, `opoint_id` ("1x", or "2x-<kind>-ns<n_sub>-cint<bits_main/2>", e.g.
+"2x-gridded-ns2-cint4"; the string published to etcd). Value kind and bits do not change the DM plan.
+The 2x tables reproduce `docs/timeres_study/snr2x/schemes.py::proposed(q1=262.144, n_sub=...)` bit for bit
+(coarse, fine, f2c, stage-1 bins, stage-2 bins, applied delays; `tests/x2/test_plan_oracle.py`).
+
+## 2. Tiered DM plan v3 (`src/dsart/x2/plan.py`, `tools/build_dm_plan_tiers.py`) [FROZEN v1 by WS-P, 2026-10-22]
+`TieredDmPlan` (metadata `schema = "dsart.x2.TieredDmPlan"`, `version = 3`) lives in
+`src/dsart/x2/plan.py`. It is torch-free, so it loads on h23. `DmPlan` v2 (`common/contracts.py`) and
+`coarse_dm/dm_plan.py` are unchanged. v2 plans keep loading through them; tests build a v2 plan with
+`tools/build_dm_plan_explicit.py` and load it.
+
+**Definitions** (constants from `dsart.common.constants`; K = `K_DM_MS_GHZ2_PC`, T_nat = 32.768 us):
+- **Fine grid per tier.** `gen_dm_list(dm_lo, dm_hi, T_tier_us, dnu = csf x 250/8192 MHz, nchans = 6144 / csf,
+  F_CTR_MHZ, ti_us = 40, tol = 1.25)`. This is a verbatim port of `model/physics.py`. Values above `dm_hi + 1e-9`
+  are dropped. `F_CTR_MHZ` = 1405.0152587890625 is built exactly like `physics.py`: top 1498.75, bottom =
+  top - 6143 dnu.
+- **Coarse grid per tier.** `n_c = max(1, ceil(0.0206 x (dm_hi - dm_lo) x (T_ref / T_tier) / n_sub))` with
+  T_ref = 32 native. The tier has `n_c` uniform buckets over [dm_lo, dm_hi], and coarse = the bucket centre.
+  `fine_to_coarse` maps each fine DM to the bucket containing it (`searchsorted(edges, fine, "right") - 1`,
+  clipped).
+- **Stage 1 (corr).** `a1[g,k] = 1e3 K (nu[g,k]^-2 - nu_ref[g, k // per]^-2)` us per pc/cc. Here `nu` =
+  band-centre summed-channel frequencies (`summed_freqs_GHz(csf)`, bit-identical to
+  `build_summed_chgroup_freq_table_GHz`), `nu_ref` = the first summed channel of the sub-band, and
+  `per = nchan_eff / n_sub`. Then
+  `stage1_bins[g,k,d] = rint(rint(a1[g,k] x coarse_dm[d] / T_nat) / q1_native)`, which is >= 0 and is 0 on every
+  sub-band's first channel. The corr ADVANCES summed channel k by `stage1_bins x q1_native` native samples
+  (`out[t] = vis_k[t + shift]`), which aligns it to the arrival at the sub-band reference. This equals
+  `DMPlan.delay_bins_per_subband` at the 2x fast sample (test-pinned).
+- **Stage 2 (search).** `a2[g,s] = 1e3 K (NU_BOT_PROC_GHZ^-2 - nu_ref[g,s]^-2)` and
+  `stage2_bins[f, g x n_sub + s] = rint(a2[g,s] x fine_dm[f] / T_tier_us)`. There is one rounding, at the
+  tier sample. The array is signed int32 by contract and >= 0 in this plan. The search reads
+  `stream[t - stage2_bins[f, stream]]`, which aligns every stream to the arrival at nu_bot_proc (today's read
+  convention).
+- **Global indices.**
+  - Coarse d: tier A 0..nA-1, then tier B.
+  - **Global fine index f**: plan order, tier A fines then tier B fines (= coarse d ascending, fines ascending
+    within d). `fine_dm` is strictly increasing.
+  - Owner half of d = `d % 8`. Half h is search node `SEARCH_NODES[h // 2]`
+    (`("n01", "n02", "n09", "n13")`), GPU `h % 2`.
+- **plan_id** (u64). A blake2b-64 (person `dsart-x2-plan`) over the scalar inputs and every array below,
+  hashing name, dtype, shape and little-endian bytes, in table order. It is independent of git sha and
+  build time. SPEC §9 carries it.
+
+**Fields** (read-only ndarrays). Shapes: T tiers (2), C coarse (47 at n_sub 2, 24 at n_sub 4), F fine
+(758), G = 16, K = 192 summed channels, S = 16 n_sub streams, N = n_sub.
+
+| name | dtype | shape | meaning |
+|---|---|---|---|
+| `tier_name` | <U8 | T | "A", "B" |
+| `tier_dm_lo`, `tier_dm_hi` | f8 | T | 50/1600, 1600/3000 |
+| `tier_t_native`, `tier_q1_native` | i4 | T | 16/32; 8/8 |
+| `tier_coarse_offsets`, `tier_fine_offsets` | i4 | T+1 | global index range of each tier |
+| `coarse_dm` | f8 | C | coarse DM (bucket centre) |
+| `coarse_tier`, `coarse_t_native` | i4 | C | tier index; stream sample of d (16 or 32 native) |
+| `fine_offset` | i4 | C+1 | CSR: fines of d = `fine_offset[d]:fine_offset[d+1]` |
+| `n_fdm` | i4 | C | fines per coarse DM (VARIES) |
+| `owner_half` | i4 | C | `d % 8` |
+| `stage2_max`, `stage2_min` | i4 | C | extreme stage-2 shift over d's fines x all streams (tier samples; ring sizing) |
+| `fine_dm` | f8 | F | fine DM, global index |
+| `fine_to_coarse` | i4 | F | global coarse d |
+| `fine_local_idx` | i4 | F | index within d's bucket (`f - fine_offset[d]`; the C1 `fine_dm_idx`) |
+| `fine_tier` | i4 | F | tier of f |
+| `stage1_bins` | i4 | G, K, C | see above (q1 units) |
+| `stage2_bins` | i4 | F, S | see above (tier samples) |
+| `summed_freq_GHz`, `stage1_coeff_us` | f8 | G, K | nu; a1 |
+| `subband_ref_GHz`, `stage2_coeff_us` | f8 | G, N | nu_ref; a2 |
+
+Scalars: `n_sub`, `chan_sum_factor`, `tol`, `ti_us`, `f_ctr_MHz`, `coarse_density`,
+`coarse_density_t_ref_native`, `n_halves`, `metadata` (dict). Property: `plan_id`.
+
+**API.**
+
+Plan properties and methods:
+- `n_tiers`, `n_coarse`, `n_fine`, `n_streams`, `nchan_eff`.
+- `fines_of(d) -> slice`; `fines_of_half(h) -> i4[]` (global fines of half h, in global (d, fine) order);
+  `dms_of_half(h) -> i4[]`.
+- `stage2_for_coarse(d) -> i4[n_fdm[d], S]`; `t_us(d)`; `owner_node(d) -> "n01".."n13"`; `owner_gpu(d)`.
+- `tier_dict(i)`: the oracle form.
+- `validate()`: structural; runs on construction.
+- `verify_rebuild()`: rebuilds from `metadata["inputs"]` and requires bit-identical arrays.
+- `to_npz(path)`; `TieredDmPlan.from_npz(path, verify=False)`; `summary() -> dict`.
+
+Module functions:
+- `build_tiered_plan(*, n_sub, chan_sum_factor=2, tiers=(("A", 50, 1600, 16, 8), ("B", 1600, 3000, 32, 8)),
+  tol=1.25, ti_us=40.0, coarse_density=0.0206, coarse_density_t_ref_native=32, opoint_id=None,
+  git_sha=None, build_utc_ns=None)`.
+- `build_tiered_plan_for_opoint(op, **kw)`.
+- `load_any_plan(path)`: returns a v2 `DmPlan` or a `TieredDmPlan`.
+- `plan_metadata_version(path)`.
+- `gen_dm_list`, `tier_grid`, `summed_freqs_GHz`, `subband_ref_freqs_GHz`, `stage1_coeff_us`, `stage2_coeff_us`.
+- Constants: `F_CTR_MHZ`, `SEARCH_NODES`, `N_HALVES`, `PLAN_SCHEMA`, `PLAN_VERSION`.
+
+CLI: `tools/build_dm_plan_tiers.py --opoint <id> | --n-sub {2,4} --out <npz> [--git-sha]`. It writes the plan,
+reloads it with `verify=True`, and prints the summary JSON.
+
+**npz** (`allow_pickle=False`): every array above, plus `metadata` (JSON). The metadata holds `schema`, `version`,
+`git_sha`, `build_utc_ns`, `build_utc`, `opoint_id`, `inputs{n_sub, chan_sum_factor, tol, ti_us, coarse_density,
+coarse_density_t_ref_native, tiers[{name, dm_lo, dm_hi, t_native, q1_native}]}`, `constants{...}`,
+`search_nodes`, `oracle` and `conventions`. A second key, `scalars`, is JSON too. `from_npz` refuses any other
+schema or version, including the v1 `configs/dm_plan.npz` and v2 files. Note that `*_v3.npz` file NAMES under
+`/home/ubuntu/data/dm_plans` are v2-schema plans; the `schema` key disambiguates them.
+
+**Values.**
+
+| | n_sub 2 | n_sub 4 |
 |---|---|---|
-| t_int_fast_native | 32 | 8 |
-| chan_sum_factor | 8 | 2 |
-| n_sub | 4 | 2 or 4 (format) |
-| tiers | one: DM plan v2 file | A: DM 50-1600, T = 16 native (524.288 us); B: 1600-3000, T = 32 native |
-| stage-1 quantum (native) | 32 | 8 |
-| stage-2 | corr FIFO + merged search rounding | corr FIFO off; one rint at the fine DM, search side |
-| value kind | gridded cells | gridded cells or unique baselines (format) |
-| bits main / heavy | cint8 (16) / none | cint4/5 (8/10) / cint8 (16) |
-| external sample | 1048.576 us | 524.288 us |
-| fine grid | v2 plan | `gen_dm_list` tol 1.25, ti 40 us, csf-2 channels, f_ctr = band centre |
-| coarse count | 8 | ceil(0.0206 x dDM x (T1/T) / n_sub) per tier, uniform-width buckets, coarse = bucket centre |
-The 2x tables must reproduce `docs/timeres_study/snr2x/schemes.py::proposed(q1=262.144, n_sub=...)`
-exactly (coarse, fine, f2c, stage-1 bins, stage-2 bins) — that file is the oracle.
+| coarse A + B | 32 + 15 | 16 + 8 |
+| n_fdm A / B | 15-18 / 15-17 | 30-35 / 28-30 |
+| per half | 4 A + 2 B (half 7: 4 A + 1 B) | 2 A + 1 B |
 
-## 2. Tiered DM plan v3 (`src/dsart/x2/plan.py`, `tools/build_dm_plan_tiers.py`) [FREEZE: WS-P]
-New class `TieredDmPlan` (metadata `version = 3`); `DmPlan` v2 is not modified and keeps loading.
-- Per tier: `T_native`, `coarse_dm[c]`, `fine_dm[f]`, `fine_to_coarse[f]` (variable fines per
-  coarse: n_sub 2 -> 15-18, n_sub 4 -> 28-35), `q1_native`.
-- Global coarse index d: tier A coarse 0..nA-1 then tier B. Owner half of d = `d % 8`
-  (half h -> search node index h // 2, gpu h % 2 in `N_SEARCH` order n01, n02, n09, n13).
-- `stage1_bins[g, k, d]`: per chgroup g, summed channel k, global coarse d =
-  rint(rint(a1[g,k] x DM_c / T_nat) / q1_native), a1 relative to the sub-band reference = first summed
-  channel of the sub-band (`DMPlan.delay_bins_per_subband` semantics, band-centre summed frequencies
-  from `build_summed_chgroup_freq_table_GHz(csf)`).
-- `stage2_bins[f, stream]` (signed int32; stream = g x n_sub + s) = rint(a2[g,s] x DM_f / T_tier),
-  a2 = delay from the sub-band reference to nu_bot_proc. One rounding, applied at the search side.
-- Derived per-DM quantities the search needs: n_fdm per DM, max positive/negative stage-2 shift per DM
-  (ring sizing), owner map.
-- npz round-trip with explicit schema version, git sha, build UTC, inputs; validators.
+Common to both n_sub:
+- F = 526 + 232. Tier A fines run 50-1597.44; tier B fines run 1600-2996.47.
+- `stage2_max` <= 1724 tier-A samples (904 ms) and <= 1617 tier-B samples (1696 ms).
 
-## 3. Value maps (`src/dsart/grid/baseline_grid.py`) [FREEZE: WS-P]
-One function builds, per (chgroup, sub-band) stream, the ordered list of values and their sources,
-for either kind:
-- **gridded cells**: sources = (baseline, summed channel) pairs of core cross-baselines (station
-  number <= 102; `core_baseline_mask_from_station_numbers`), each mapped to its nearest uv cell at that
-  channel's frequency exactly as `grid/sparsity_pattern.build_pattern` does today (same cell_lambda,
-  sign/flip convention, DEC projection). A value = one cell.
-- **unique baselines**: exact 3-D redundancy classes (positions agree within 5 cm incl. height), with
-  per-member conjugation flags; a value = one class summed over the sub-band's channels; the owner
-  places it at the cell nearest its uv at the sub-band CENTRE frequency.
-- Per value: static contribution count `n` (number of (baseline, summed channel) sources), and the
-  owner-side cell (row, col) in today's image layout and conventions.
-- **Heavy values**: n >= N_image / 1e4 (N_image = total contributions per image over all streams);
-  ordered FIRST in each stream; count `n_heavy`. Then main values in cell order.
-- CSR forms: corr side (value <- sources, fixed source order) and owner side (cell <- (stream, value,
-  conj, weight)), plus `pattern_id` = blake2b-64 over every input (kind, antpos, heights, chgroup table,
-  csf, n_sub, n_grid, cell_lambda, quantised dec, tolerances, heavy threshold).
-- For kind = gridded, n_sub 4, csf 8 the map must equal today's `build_subband_patterns` /
-  `build_cell_csr` cell set and order (1x-compat check).
+## 3. Value maps (`src/dsart/grid/baseline_grid.py`) [FROZEN v1 by WS-P, 2026-10-22]
+**Builders.**
+- `build_value_map(antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, kind, n_sub, chan_sum_factor,
+  dec_deg, cell_lambda, n_grid=256, heavy_frac=1e-4, normalise=True, redundancy_tol_m=0.05) -> ValueMap`.
+- `build_value_map_for_opoint(op, antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, dec_deg,
+  cell_lambda=None)`. With `cell_lambda=None` it uses `cell_lambda_for_pixel_arcsec(45, n_grid)` (tee45).
+- `OPPOINT_1X` gives the 1x-compat map: gridded, n_sub 4, csf 8, `heavy_frac=None`, `normalise=False`.
+
+Other functions:
+- `redundancy_classes(antpos_e, antpos_n, antpos_u=None, *, is_core_baseline_mask, tol_m=0.05) -> RedundancyClasses`
+- `kept_core_baselines(mask, nants=96) -> (bl, a, b)`
+- `value_map_pattern_id(**build keywords) -> int`
+- `heavy_threshold(n_image, heavy_frac) -> int`
+- `build_owner_csr(streams, n_grid, normalise) -> OwnerCsr`
+
+The builder is numpy-only. Importing the module pulls in torch via `dsart/grid/__init__.py`.
+
+**Production inputs.**
+- `antpos_e/n`: the float32 E/N header of the cal blob (`load_antpos_from_cal_blob`).
+- `is_core_baseline_mask`: `core_baseline_mask_from_station_numbers` of the `configs/corr_setup_96.yaml`
+  `antenna_order` (station <= 102; 82 antennas, 3321 cross-baselines in xGPU order a > b).
+- `dec_deg`: the pointing DEC. It enters only `pattern_id` (0.25 deg bins), as today.
+- `cell_lambda`: tee45.
+- `antpos_u = None` (zeros). The station table gives every core station the same nominal elevation
+  (1182.6 m). The residual ENU curvature is <= 8.5 mm across core baselines, and the 3-D classes built with
+  it are identical to the 2-D classes (tested). A surveyed height table, if one appears, enters through
+  `antpos_u` and `pattern_id`. Corr and search must pass identical inputs.
+
+**Kinds.**
+- **gridded.** A value is one uv cell. A stream's cells are exactly
+  `build_pattern(..., kernel_support=1, sub_band=(s, n_sub))`, i.e. `build_subband_patterns`. Sources are
+  every in-grid (core cross-baseline, summed channel of the sub-band), mapped with `FastVisGridder.from_pattern`
+  arithmetic: `u = -dE/lambda`, `v = -dN/lambda` (F20), `col = rint(u / cell_lambda) + n_grid/2`, and row likewise.
+  This is lambda-uniform, with NO DEC projection and no w (today's convention). `class_id = -1`.
+  `legacy_pattern_id` = today's sub-band `pattern_id`.
+- **baselines.** A value is one exact redundancy class.
+  - Classes are single-linkage at `tol_m` on 3-D vectors in either orientation, and must have diameter <= tol
+    (otherwise the builder raises).
+  - Class ids are ordered by first member (lowest kept index). The canonical orientation is the first member's
+    natural vector `pos[a] - pos[b]`. `bl_conj[i]` marks members whose natural vector is the reverse; their
+    visibilities are conjugated before summing.
+  - The value is the sum over members x the sub-band's summed channels.
+  - The owner cell is the class's mean (E, N) at the sub-band CENTRE frequency (the mean of its summed-channel
+    frequencies), with the same cell formula. Off-grid (class, stream) pairs are dropped and counted
+    (0 with tee45).
+  - `class_id` = the class.
+
+**Per value.**
+- `n` (`n_contrib`): the number of (baseline, summed channel) sources: gridded = in-grid sources of the
+  cell; baselines = multiplicity x channels per sub-band.
+- Owner cell `(cell_row, cell_col)`, uint16, in today's single-side `[n_grid, n_grid]` layout
+  (`SparsityPattern.ix_row/ix_col`; LUT form `row x n_grid + col`, `ValueMap.cell_flat(stream)`).
+- `heavy` = `n >= heavy_threshold`, where `heavy_threshold = ceil(heavy_frac x N_image)` in exact rationals and
+  N_image = the sum of n over all values of all streams (10,202,112 at 2x, giving a threshold of 1021).
+
+**Wire order** within a stream: heavy values first, then main values. Each group is in (cell key
+`(row << 16) | col`, class id) order. With no heavy class (1x) this is today's pattern order.
+
+**Data classes** (frozen; identity equality):
+
+`ValueMap`:
+- Scalars: `kind`, `n_sub`, `chan_sum_factor`, `n_grid`, `cell_lambda`, `dec_deg_quant`, `normalise`,
+  `heavy_frac`, `heavy_threshold` (int or None), `n_image`, `redundancy_tol_m`, `pattern_id` (u64),
+  `stream_pattern_ids` (tuple of u64; payload + stream index), `n_dropped_offgrid`.
+- Members: `streams` (tuple[StreamValues], index = stream id g x n_sub + s), `owner` (OwnerCsr), `classes`
+  (RedundancyClasses or None), `kept_bl` (i4[3321]).
+- Methods: `n_streams`, `nchan_eff`, `n_values` (i4[S]), `n_heavy` (i4[S]), `cell_flat(stream)`,
+  `corr_csr(stream) -> CorrCsr`, `corr_csr_chgroup(g) -> (CorrCsr, value_offsets[n_sub+1])`, `summary()`.
+
+`StreamValues`:
+- `stream`, `chgroup`, `sub_band`, `cell_row`/`cell_col` u2[V], `n_contrib` i4[V], `heavy` bool[V],
+  `class_id` i4[V], `legacy_pattern_id`.
+- Properties: `n_values`, `n_heavy`, `sqrt_n` and `inv_sqrt_n` (f4[V]).
+
+`CorrCsr` (corr side, one stream; value v <- sources `ptr[v]:ptr[v+1]`):
+- `ptr` i4[V+1], `bl` i4 (xGPU baseline index 0..4655), `ch` i4 (summed channel within the chgroup), and
+  `conj` bool.
+- Sources are in ascending `bl x nchan_eff + ch` order: the fixed fp32 summation order.
+- Built on demand and deterministic. `ptr` diff == `n_contrib`.
+
+`OwnerCsr` is the owner side, in the Hermitian half-spectrum of today's real-FFT combine
+(`build_sparse_cell_csr`).
+- Fields:
+  - `cell_uw` i4[A] = `row x (n_grid/2+1) + col`, ascending.
+  - `cell_ptr` i4[A+1].
+  - Per entry: `ent_stream` i4, `ent_value` i4 (index into the stream's wire order), `ent_conj` u1, and
+    `ent_weight` f4 (= sqrt(n) if `normalise`, else 1).
+  - Entries within a cell are ordered by (stream, conj, value).
+- Folding: a value at full cell (r, c) contributes
+  - a direct entry at (r, c) if c <= n_grid/2;
+  - a conj entry at ((n_grid-r) % n_grid, (n_grid-c) % n_grid) if that column is <= n_grid/2.
+  Columns 0 and n_grid/2 get both.
+- The consumer writes `G_h[cell] = 0.5 x sum(weight x (conj ? conj(x) : x))`. Then
+  `irfft2(G_h, s=(N,N)) == Re(ifft2(G_full))`.
+- The 0.5 and the fftshift checkerboard are kernel constants and are not in the CSR. One cell can have
+  more than 64 entries in 2x.
+
+`RedundancyClasses`:
+- `tol_m`.
+- Per kept baseline (i4[n_kept] unless noted): `kept_bl`, `ant_a`, `ant_b`, `bl_class`, and `bl_conj` (bool).
+- `class_ptr` i4[n_class+1] and `class_members` i4[n_kept] (grouped, ascending).
+- `class_uvw_m` f8[n_class, 3] (canonical mean E, N, U) and `multiplicity` i4.
+- `max_diameter_m` and `min_gap_m`.
+
+**pattern_id** = blake2b-64 (person `dsart-x2-vmap`) over:
+- schema version 1, kind, csf, n_sub, n_grid, normalise, n_ants;
+- cell_lambda, `quantise_dec_deg(dec)`, redundancy tol, heavy_frac (-1 if None), all as f8;
+- the chgroup-table hash;
+- antpos E/N/U as f8, and the core mask as u1.
+
+**Natural weighting.** A value is the sum of its sources / sqrt(n) (corr) and is re-weighted by sqrt(n) at the
+owner. For a phase-centre point source every (baseline, channel) then contributes weight 1, and the image
+peak is N_image / N^2 for both kinds (tested).
+
+**1x-compat** (tested). The `OPPOINT_1X` map equals today's production structures:
+- Cells, order and legacy ids: `build_subband_patterns`.
+- Corr-side source set per cell: `build_cell_csr(build_subband_layout(...).cell_index_map)`. Our
+  within-cell order is fixed; today's `torch.argsort` order is unspecified.
+- Owner side: `build_sparse_cell_csr(build_inverse_lut(...))`, entry for entry.
+
+**Measured** (production antpos, tee45, DEC 71.63; plan-rev-4 model values in parentheses):
+
+| map | values / stream | heavy / stream | heavy share of values / natural weight |
+|---|---|---|---|
+| gridded, n_sub 2 | 2318-2759 (mean 2544) | 70-78 | 2.9% / 42.4% (3.1% / 43.5%) |
+| gridded, n_sub 4 | 2043-2267 (mean 2159) | 21-25 | 1.13% / 20.7% (1.2% / 21.7%) |
+| baselines, n_sub 2 | 1748 | 80 (71) | 4.6% / 46.3% (40%) |
+| baselines, n_sub 4 | 1748 | 26 (23) | 1.5% / 22.1% (19.5%) |
+| 1x | 2032-2243 (mean 2134) | none | — |
+
+**Redundancy: 3321 baselines form 1748 exact classes, not the model's 1773.**
+- The largest multiplicity is 41.
+- Within a class, members are at most 11.7 mm apart. Different classes are at least 2.88 m apart, so any
+  tolerance from 1.2 cm to 2.8 m gives the same 1748 classes.
+- The model's `rint(B / 0.05 m)` binning splits 1556 pairs that are at most 1.2 cm apart across bin edges.
+  Random bin offsets give 1779-1802 classes.
+- Every class the model finds lies inside one exact class (tested).
+- Per-baseline formats therefore carry 1748 values, about 1.4% fewer than the load table assumed, with more
+  of them heavy.
+- The gridded counts differ slightly from the model because production gridding has no DEC projection. The
+  model's `nfilled.py` used `v x cos(z)`.
 
 ## 4. Quantisation ("row rule") [FREEZE: WS-T + Phase 0]
 Corr side, per (stream, coarse DM, sample) row of values x_v (complex):
@@ -214,7 +445,10 @@ etcd `/cnf/opoints/{1x,1x-legacy,2x}/{pipeline_rt,search_rt}`, `/cnf/opoint`; pe
 
 ## 11. Ownership (single owner per file; others request changes through the owner)
 - WS-P: `src/dsart/x2/opoint.py`, `src/dsart/x2/plan.py`, `src/dsart/grid/baseline_grid.py`,
-  `tools/build_dm_plan_tiers.py`, `tests/x2/test_plan*.py`, `tests/x2/test_baseline_grid*.py`.
+  `tools/build_dm_plan_tiers.py`, `tests/x2/test_plan*.py`, `tests/x2/test_baseline_grid*.py`,
+  `tests/fixtures/x2/dsa110_antpos.npz` (cal-blob E/N, corr_setup_96 station order, station-table U).
+  `src/dsart/x2/__init__.py` and `tests/x2/__init__.py` are empty package markers: anyone may add
+  them, nobody puts code in them.
 - WS-T: `src/dsart/transport/prod_frame2.py`, `send_mmsg.c` + wrapper, `recv_epoll.c`, `recv_ring.{c,h,py}`,
   `production_rx_ring.py`, `services/search_rx.py`, `bench/fake_corr_to_search.py`, `tools/x2/rx_recorder.py`.
 - WS-C: `services/corr_fast_integration.py`, `src/dsart/x2/corr/*`, `src/dsart/x2/ref/corr2x_ref.py`.
