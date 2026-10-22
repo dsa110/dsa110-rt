@@ -491,7 +491,7 @@ def _order_values(keys, class_id, n, threshold):
 
 def build_value_map(antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, kind: str, n_sub: int,
                     chan_sum_factor: int, dec_deg: float, cell_lambda: float, n_grid: int = 256,
-                    heavy_frac: float | None = 1e-4, normalise: bool = True,
+                    heavy_frac: float | None = 3e-5, normalise: bool = True,
                     redundancy_tol_m: float = 0.05) -> ValueMap:
     """Build the value map of every (chgroup, sub-band) stream (SPEC §3).
 

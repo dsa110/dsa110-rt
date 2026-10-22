@@ -17,6 +17,7 @@ checkpoint (CP1 unless marked). Each item: what, evidence needed, who supplies i
 | E1 | Owner chain > 4.8 us/image after fallbacks -> tol 1.4 or FoV/2 | CP1 search track | WS-S | escalate, no change |
 | E2 | Corr GEMM + stage-1 > 55 ms after fallbacks -> n_sub 4, then stage-1 at 0.52 ms, ... | CP1 corr track | WS-C | escalate, no change |
 | E4 | Clean capacity < 11.2 Gb/s/node -> hardware or delay | CP1 capacity sweep | WS-T | escalate |
+| E5 | NUMA balancing vs the ring v4 consumers. Search nodes run kernel.numa_balancing=1 (~3,100 hint faults/s per node today, 17.5 G over 64 days); an extra mapper of the 16 GB 1x ring saw 2.4 ms minor faults (07:25 incident). Ring v4 (22-33 GB, per-DM, mmap readers) must be measured at CP1 under full load (system time, faults/s, scatter). If it costs real time: pread/pinned-copy readers, or kernel.numa_balancing=0 on search nodes (host change, sign-off) | CP1 search track + fleet load test | WS-T, WS-S | measure only |
 | CP1-op | Install /etc/sysctl.d/99-dsart-ipfrag.conf on n01 (missing; n02/n09/n13 have it) | diagnostics_20261022.md | runner | not installed |
 
 ## Behaviour changes in 1x found by WS-D (all behind flags defaulting to today's behaviour)
