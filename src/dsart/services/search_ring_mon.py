@@ -108,10 +108,17 @@ class SearchRingMonPublisher:
         search_node_id: int,
         gpu_half: int,
         store: Optional[Any] = None,
+        end_in_sample_units: bool = False,
     ) -> None:
         self.search_node_id = int(search_node_id)
         self.gpu_half = int(gpu_half)
         self._store = store
+        # ``event_specnum_start`` is in detector samples, so the historical
+        # ``start + t_det * sample_period_specnum`` end is 16x too far
+        # (WS-D inventory). True = ``start + t_det`` (same units as start);
+        # the 2x path sets it, 1x keeps the published value bit-identical
+        # until the dashboard switches (nothing reads ``_end`` today).
+        self.end_in_sample_units = bool(end_in_sample_units)
         self._lock = threading.Lock()
         self._n_published = 0
         self._n_errors = 0
@@ -180,7 +187,8 @@ class SearchRingMonPublisher:
                 "newest_event_specnum_start":
                     int(newest.event_specnum_start),
                 "newest_event_specnum_end":
-                    int(newest.event_specnum_start) + t_det * spp,
+                    int(newest.event_specnum_start)
+                    + (t_det if self.end_in_sample_units else t_det * spp),
                 "oldest_event_specnum_start":
                     int(oldest.event_specnum_start),
                 "sample_period_specnum": spp,

@@ -3316,6 +3316,18 @@ async def _run_async(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # x2 (docs/x2/SPEC.md §10): ``--opoint 2x-*`` runs the owner engine
+    # (dsart.x2.search.service); ``--opoint 1x`` / no flag = today's path,
+    # untouched. The 1x parser never sees --opoint.
+    _argv = list(sys.argv[1:] if argv is None else argv)
+    if "--opoint" in _argv:
+        _i = _argv.index("--opoint")
+        _sel = _argv[_i + 1] if _i + 1 < len(_argv) else ""
+        if _sel.startswith("2x"):
+            from ..x2.search.service import main as _x2_main
+            return _x2_main(_argv)
+        del _argv[_i:_i + 2]
+        argv = _argv
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
