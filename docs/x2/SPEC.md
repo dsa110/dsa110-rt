@@ -127,12 +127,85 @@ Downstream of the search engine the only sample unit is T_ext = 524.288 us (16 n
 batch header `sample_period_us = 524.288` in 2x. Every "samples" parameter downstream is audited
 (WS-D inventory) and either converted to ms or doubled.
 
-## 9. Cutouts and raw windows [FREEZE: WS-D]
-On a C2 dump decision C2 sends (event id, t0, t1 in T_ext, DM, (l,m), width) to every half; each half
-re-images its owned DMs at the candidate pixel/time window from its raw ring (low-priority stream)
-and returns a cutout file; the raw-stream windows for all owned DMs are written for archival. The
-cutout schema covers every consumer listed in `docs/x2/downstream_inventory.md`. Missing halves never
-cause an event to be discarded.
+## 9. Cutouts and raw windows [FROZEN v1 by WS-D, 2026-10-22]
+Full text, rationale and consumer coverage: `docs/x2/downstream_inventory.md` §3. Summary of the frozen
+interface:
+
+**Units and indices.**
+- **Rows.** A row is the absolute T_ext index `native // native_per_ext`: 16 at 2x, 32 at 1x. Native
+  index = 2 × SNAP specnum.
+- **Time reference.** Times are arrival times at `NU_BOT_PROC_GHZ` after dedispersion at the row's
+  fine DM. C1 `event_specnum`, the request, the cutout and Level3 all share this index.
+- **Tier B.** Values occupy rows 2k and 2k+1. `t0_ext` is even. Statistics use only rows with
+  `r % t_step_ext[f] == 0`.
+- **Widths.** Integer T_ext samples. A FWHM in ms, if adopted, is a separate field.
+- **Global fine index** (WS-P must define it in `TieredDmPlan`): plan order, tier A then tier B. In 2x it
+  is carried by the C1 `dm_idx_global`; today that field is the half-local fine index. The C1
+  `fine_dm_idx` is the index within its coarse bucket. Owner half = `d % 8`.
+
+**Request (C2 → every half).**
+- `CutoutRequest`: 128 B little-endian, `struct "<IHH16sIHHqqIIIHHffffihhhHfdQH14s"`.
+- Fields, in order: magic `b"DSCQ"`, version 1, flags, event_name, request_id, trigger_class_id
+  (crc32 & 0xFFFF), reserved, t_peak_ext, t0_ext, n_t, raw_pre_ext, raw_post_ext, width_ext,
+  stamp_half_px, dm_peak, snr_peak, l_rad, m_rad, fine_global_peak, coarse_global_peak, l_pix, m_pix,
+  n_stamp_t, stamp_dm_halfwidth, mjd_peak, plan_id, deadline_s, reserved.
+- Flags: bit0 CUTOUT, bit1 RAW_ARCHIVE (cleared for injections by default), bit2 INJECTION, bit3 MANUAL
+  (Dump Now: `l_pix = −1`, `dm < 0`), bit4 RESEND.
+- Sent over UDP to the existing `coinc.dump_broadcast.hosts[sid]` : `port_base + g` (11227 / 11228).
+  Old 1x listeners drop it on size. A 2x half ignores and counts 64-B DSRT v1 packets.
+- Defaults: n_t 512 (268 ms), raw ±954 rows (±0.5 s), stamps S = 16 / 64 rows / ±150 pc/cc,
+  deadline 15 s.
+
+**Status (half → C2).**
+- `CutoutStatus`: 64 B, `struct "<IHBB16sIBBBBfIQIh10s"`. Magic `b"DSCS"`.
+- State: ACCEPTED, then exactly one of DONE / PARTIAL / FAILED. Reason codes are in §3.3 of the
+  inventory.
+- Sent over UDP to `c1.c2_endpoint.host:11501` (`coinc.cutout.status_port`).
+- Lossy. Used only for resends (2 s, at most 3) and early completion.
+
+**Half behaviour.**
+- Queue depth 8.
+- Raw snapshot from ring v4 first: wait for per-DM frontier coverage, up to `deadline_s`, then zero-fill
+  and flag. A start that has already rotated out is TOO_LATE.
+- Then re-image every owned fine over `[t0, t0+n_t)` on the low-priority stream, from the snapshot,
+  with the Layer-1 sigma applied at detection.
+- Write atomically `cutouts/cutout_s<sid>_g<g>.npz` and then `.json`.
+- Upload the cutout first, then the raw window (bwlimit). Each half purges its own files after rc==0,
+  with a per-product `UPLOAD_OK`.
+
+**Cutout file** (`dsart.cutout` v1). Uncompressed NPZ, one per half per event, always produced.
+- F = the half's fines in global (d, fine) order. D = the half's owned coarse DMs.
+- Images are Layer-1-normalised, the same as today's `cube`.
+
+| group | keys |
+|---|---|
+| scalars | provenance (opoint, plan_id, pattern_id, code_version); clock (`t_ext_us`, `native_per_ext`, `sample_period_specnum`, `t0_ext`, `n_t`, `mjd_t0`, `mjd_clock`); request echo; image geometry (`n_grid`, `cell_l_rad`, `cell_m_rad`, `l0_rad`, `m0_rad`); `status`, `status_json` |
+| fine axis [F] | `fine_dm_pc_cc`, `fine_global_idx`, `coarse_global_idx`, `fine_local_idx`, `tier`, `t_step_ext`, `input_valid_frac` |
+| coarse axis [D] | `coarse_owned`, `fine_offset[D+1]`, `row_valid[n_t, D]`, `apex_t`, `apex_f`, `apex_image[D, n_grid, n_grid]` |
+| planes [n_t, F] | `peak_grid` (full-field width-1 max, today's definition), `peak_pix`, `pix_lc` (value at the request pixel), `sigma_applied` |
+| images | `has_peak_image`, `peak_image`, `peak_image_w` (mean over the width window at the peak fine), `stamp_fine`, `stamp_t0_ext`, `stamp[n_stamp_t, F_s, 2S+1, 2S+1]` |
+| optional | `kernel_ids`, `sigma_k[D, K]` |
+
+- The apex follows C3's definition exactly: `nanargmax` over the coarse block, all rows.
+- Size ≈ 2-4 MB per half.
+
+**Raw window archive.** One directory per half: `raw_s<sid>_g<g>/` holding `raw_d<DDD>.npz` per owned
+coarse DM, plus `meta.json` and `RAW_OK.json`.
+- `raw_d<DDD>.npz` holds the ring v4 bytes verbatim, `codes[n_stream, n_rows, bytes_per_sample]`, along
+  with step fields, `valid`, per-stream row-0 seq / t0_native, and the frame scalars.
+- Value maps are referenced by `pattern_id` and uploaded once to `operations/x2/patterns/`.
+- Size ≈ corner-turn load × window: 4.5-6.6 GB per event at 1.0 s depending on format.
+- Rebuilt into cubes by `tools/x2/reimage_raw_window.py`.
+
+**C2 lifecycle.**
+- Expected halves come from the plan's owner map. C2 counts distinct per-half manifests, not files.
+- At `coinc.cutout.wait_s` (120 s) it finalises Level3 v2 with a `products` block listing
+  expected / present / missing (with reasons), and `status` complete or incomplete.
+- The pending set is persisted. Late manifests are recorded.
+- **An event is never deleted.** The 1x `rmtree` stays behind `coinc.partial_event_policy`
+  (default `discard`) until the user signs off.
+- C3, the plotter, Slack and the dashboard read products through one adapter, which also reads 1x
+  cubes bit-identically.
 
 ## 10. Op-point switching [FREEZE: WS-O]
 etcd `/cnf/opoints/{1x,1x-legacy,2x}/{pipeline_rt,search_rt}`, `/cnf/opoint`; per-op-point sections in
@@ -145,10 +218,15 @@ etcd `/cnf/opoints/{1x,1x-legacy,2x}/{pipeline_rt,search_rt}`, `/cnf/opoint`; pe
 - WS-T: `src/dsart/transport/prod_frame2.py`, `send_mmsg.c` + wrapper, `recv_epoll.c`, `recv_ring.{c,h,py}`,
   `production_rx_ring.py`, `services/search_rx.py`, `bench/fake_corr_to_search.py`, `tools/x2/rx_recorder.py`.
 - WS-C: `services/corr_fast_integration.py`, `src/dsart/x2/corr/*`, `src/dsart/x2/ref/corr2x_ref.py`.
-- WS-S: `services/search_compute.py`, `services/cube_pipeline.py`, `src/dsart/x2/search/*`,
-  `image/*`, `detector/*`, `noise_norm/*`, `fine_dm/combiner.py`, `src/dsart/x2/ref/search2x_ref.py`.
+- WS-S: `services/search_compute.py`, `services/cube_pipeline.py`, `src/dsart/x2/search/*` (incl. the
+  cutout producer `cutout_service.py`), `image/*`, `detector/*`, `noise_norm/*`, `fine_dm/combiner.py`,
+  `src/dsart/x2/ref/search2x_ref.py`, `services/search_compute_mon.py`, `services/search_ring_mon.py`.
 - WS-D: `services/c1_emit.py`, `services/coincidencer.py`, `coinc/*`, `services/c3.py`, `inject/*`,
+  `dump/*`, `services/slack_notify.py`, `services/candidate_card.py`, `src/dsart/x2/cutout/*`,
+  `tools/inject/*`, `tools/viz/*`, `tools/c2/*`, `tools/ops/prune_candidate_products.py`,
   `tools/dashboard/**` except the Start control, grafana, pusher.
+- Integration: `common/contracts.py`, `docs/x2/SPEC.md` (sections are frozen by their owners; edits
+  between freezes go through integration), `tools/x2/node_cpu_tests.sh`, merges into `x2/main`.
 - WS-O: `configs/*.yaml`, `tools/ops/push_dsart_to_etcd.py`, dashboard Start control
   (`app.py /control/start`, `control_store.control_start_fleet`), `tools/x2/cp*_runner*`, runbooks.
 - Phase 0: `docs/x2/phase0/**`, `docs/timeres_study/model/*` additions.
