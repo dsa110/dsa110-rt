@@ -6,12 +6,14 @@ checkpoint (CP1 unless marked). Each item: what, evidence needed, who supplies i
 ## From the plan (rev 4)
 | id | item | evidence | owner | default until signed |
 |---|---|---|---|---|
-| S1 | Corner-turn format and its network-forced S/N cost (0.4-1.0% vs the model) | CP1 capacity sweep with v2 single-fragment frames | WS-T, WS-O runner | none (2x does not run) |
+| S1 | Corner-turn format and its network-forced S/N cost (0.3-1.0% vs the model; Phase 0: today's wire itself costs 1.2%, so every 2x format is 0.2-1.0% better on the wire than today and the expected end-to-end gain is ~x1.21 at 1 ms) | CP1 capacity sweep with v2 single-fragment frames | WS-T, WS-O runner | none (2x does not run) |
 | S2a | Hybrid row rule: sqrt(n) normalisation, robust per-stream scale + clip, 8-bit heavy values. Measured maps (WS-P, SPEC §3): heavy threshold n >= 1021; gridded n_sub 2: 70-78 heavy/stream = 2.9% of values, 42.4% of natural weight; n_sub 4: 21-25 = 1.13% / 20.7%; per-baseline: 1748 exact redundancy classes (not 1773), 80 heavy (46.3%) at n_sub 2, 26 (22.1%) at n_sub 4 | Phase 0 row-rule study incl. storm window and hot cells | Phase 0 | — |
 | S2b | cfp16 corr storage of fast visibilities | Phase 0 U-precision study, CP1 corr exactness | Phase 0, WS-C | — |
 | S2c | Fused-cal ULP differences in 2x | CP1 corr taps vs CPU reference | WS-C | 1x keeps separate kernels |
 | S2d | fp32 detector accumulation, per-DM sigma_k, chunk-max decoder in floods | CPU twins + CP1 K3b compat | WS-S | — |
 | S2e | B-spline time filters (adopt if modelled gain > 0 and CP1 cost within duty aim) | Phase 0 study 5 + CP1 K3b timing | Phase 0, WS-S | boxcar |
+| S2f | Phase 0 recommendations (docs/x2/phase0/SUMMARY.md): mid-tread codes (s4 0.3534, s5 0.1932; code -2^(b-1) = no data); heavy threshold 3e-5 N (n >= 306; required by the plan's own 'clip >= 2x rail' rule, +0.2-1.4 Gb/s); sigma_hat tau 3 s; per-row guard (row robust scale > 1.5 sigma_hat -> coded at that scale); image in sigma units (L1 floor 0.078, L2 floor 0.5, clip 250); cfp16 accepted; b3x filter bank (x1.043 at 1 ms, 8 filters, 148 history rows) | Phase 0 studies 1-5 | WS-T, WS-S implement as defaults, user signs | as recommended (development default) |
+| **S3** | **Bright-signal response.** Today's per-row max-abs wire compresses bright bursts (0.93 at 50 sigma, 0.80 at 100, 0.49 at 250, saturating ~150 sigma per sample; the 250 clip is never reached). 2x is linear to the clip, so bright events read up to 2x higher than today, the direction 3b43118 warns about. Choose: (a) linear 2x after a C1/C2 bright-class replay shows no storm, or (b) emulate today's compression | Phase 0 study 2 + C1/C2 bright-class replay (WS-D D13) before CP2 | user | (a) in development; no deployment without the replay |
 | E1 | Owner chain > 4.8 us/image after fallbacks -> tol 1.4 or FoV/2 | CP1 search track | WS-S | escalate, no change |
 | E2 | Corr GEMM + stage-1 > 55 ms after fallbacks -> n_sub 4, then stage-1 at 0.52 ms, ... | CP1 corr track | WS-C | escalate, no change |
 | E4 | Clean capacity < 11.2 Gb/s/node -> hardware or delay | CP1 capacity sweep | WS-T | escalate |
@@ -32,3 +34,10 @@ Source: `docs/x2/downstream_inventory.md` §0 and §5.
 - n22 loses 5.7% of SNAP packets to PHY CRC errors (optic/cable/port).
 - n01/n02 corner-turn PHY loss 3-7e-4 (CRC + discard bursts).
 - dsa110-operator injection probe never sends `inj_id` (400 from /control/inject) — WS-D D12 list.
+
+## Incidents caused by x2 work (reported to the user)
+- **2026-10-22 07:25-07:31 UTC, n13 search half 6 (coarse DM 6): 41.5 s of data unsearched.** Cause: integration
+  ran the WS-T passive recorder (mmap PROT_READ of /dev/shm/dsart-rxring-13) and a copy-timing probe. Minor
+  faults took ~2.4 ms each (numa_balancing=1), production scatter rose 55 -> 110-135 ms, and search_compute_0 made 12
+  lag-recovery seeks. It recovered by itself. No recording was kept. Fix: tools/x2/prod_guard.sh (70eb50e) wraps every
+  node run; no mmap of production segments; any further recording on production waits for the user's decision.
