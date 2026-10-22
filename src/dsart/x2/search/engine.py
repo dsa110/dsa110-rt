@@ -330,8 +330,14 @@ class OwnerEngine:
         n = hi - start
         if n > sr.n_slots:
             raise ValueError(f"DM {st.spec.d}: {n} rows > stream ring {sr.n_slots}")
-        raw, valid = self.ring.wait_window(st.spec.d, int(start), int(n),
-                                           timeout_s=self.cfg.wait_timeout_s)
+        into = getattr(self.ring, "wait_window_into", None)
+        if into is not None and self._gpu is not None:      # ring -> pinned staging, one copy
+            buf = self._gpu.staging(st, int(n), int(self.ring.row_bytes))
+            raw, valid = into(st.spec.d, int(start), int(n), out=buf,
+                              timeout_s=self.cfg.wait_timeout_s)
+        else:
+            raw, valid = self.ring.wait_window(st.spec.d, int(start), int(n),
+                                               timeout_s=self.cfg.wait_timeout_s)
         if self._gpu is not None:
             self._gpu.k0(st, raw, valid, start)              # codes live on the device
             sr.valid[:, sr.slots(np.arange(start, start + n))] = np.asarray(valid, bool)

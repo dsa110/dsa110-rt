@@ -110,18 +110,37 @@ class GpuBackend:
         return _ptr(t)
 
     # ------------------------------------------------------------------
+    def staging(self, st, n: int, row_bytes: int) -> np.ndarray:
+        """The DM's pinned host staging as ``uint8 [S, n, row_bytes]`` (after
+        the previous H2D from it finished): the ring copies straight into it
+        (``RingV4Source.wait_window_into``) and :meth:`k0` skips its copy."""
+        x = self.dm[st.spec.d]
+        S = st.spec.n_stream
+        size = S * int(n) * int(row_bytes)
+        if getattr(x, "pinned_ev", None) is not None:
+            x.pinned_ev.synchronize()
+            x.pinned_ev = None
+        if x.pinned is None or x.pinned.numel() < size:
+            x.pinned = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        return x.pinned[:size].numpy().reshape(S, int(n), int(row_bytes))
+
     def k0(self, st, raw: np.ndarray, valid: np.ndarray, start: int) -> None:
         """H2D (copy stream, pinned) + K0 unpack into the device code ring."""
         from .kernels_cuda import get_module
 
         x = self.dm[st.spec.d]
         S, n, rb = raw.shape
+        staged = (x.pinned is not None and raw.flags["C_CONTIGUOUS"]
+                  and raw.ctypes.data == x.pinned.data_ptr())
         if getattr(x, "pinned_ev", None) is not None:
             x.pinned_ev.synchronize()                 # previous H2D done with the buffer
-        if x.pinned is None or x.pinned.numel() < raw.size:
-            x.pinned = torch.empty(raw.size, dtype=torch.uint8, pin_memory=True)
-        hraw = x.pinned[:raw.size].view(S, n, rb)
-        hraw.copy_(torch.from_numpy(np.ascontiguousarray(raw)))
+        if staged:
+            hraw = x.pinned[:raw.size].view(S, n, rb)     # the ring copied into it already
+        else:
+            if x.pinned is None or x.pinned.numel() < raw.size:
+                x.pinned = torch.empty(raw.size, dtype=torch.uint8, pin_memory=True)
+            hraw = x.pinned[:raw.size].view(S, n, rb)
+            hraw.copy_(torch.from_numpy(np.ascontiguousarray(raw)))
         hval = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.uint8))
         with torch.cuda.stream(self.copy):
             draw = hraw.to(self.dev, non_blocking=True)

@@ -96,9 +96,13 @@ def test_search_compute_dispatches_2x_and_leaves_1x_alone(monkeypatch):
     seen = {}
     monkeypatch.setattr(xs, "main", lambda argv: seen.setdefault("x2", argv) and 7)
     assert sc.main(["--opoint", "2x-gridded-ns2-cint4", "--plan-path", "p"]) == 7
-    assert seen["x2"][:2] == ["--opoint", "2x-gridded-ns2-cint4"]
-    try:                                              # 1x: --opoint stripped, 1x parser runs
-        sc.main(["--opoint", "1x"])
-    except SystemExit as e:                           # required 1x args missing -> argparse exit
-        assert e.code == 2
+    assert seen["x2"] == ["--opoint", "2x-gridded-ns2-cint4", "--plan-path", "p"]
+    seen.clear()                                      # the --opoint=<id> form too
+    assert sc.main(["--plan-path", "p", "--opoint=2x-baselines-ns4-cint5"]) == 7
+    assert seen["x2"] == ["--opoint", "2x-baselines-ns4-cint5", "--plan-path", "p"]
+    for form in (["--opoint", "1x"], ["--opoint=1x"]):
+        try:                                          # 1x: --opoint stripped, 1x parser runs
+            sc.main(form)
+        except SystemExit as e:                       # required 1x args missing -> argparse exit
+            assert e.code == 2
     assert "x2" in seen and len(seen) == 1
