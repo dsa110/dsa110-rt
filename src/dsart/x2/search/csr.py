@@ -16,12 +16,15 @@ Static per-value scales (row-rule step, ``sqrt(n)``, ``sqrt(mult)``) are
 NOT here: they live in the per-value decode constant (``codec``), so K1 is
 pure fp32 adds in a fixed order and its numpy twin is bit-exact.
 
-Active cells are ordered by column ``w`` then row ``u``, so the K2 column
-FFT reads a column's cells contiguously; :attr:`OwnerCsr.fft_cols` lists
-the columns holding a cell off ``u = 0`` (they need a column FFT) and
-:attr:`OwnerCsr.const_cols` the columns whose only cell is ``u = 0`` (the
-column IFFT of a single ``u = 0`` cell is that cell's value at every row --
-an exact constant for K3a).
+The Hermitian half axis is selectable (``fold``): ``"col"`` is today's
+irfft2 layout (``w <= N/2``), ``"row"`` folds along rows (``u <= N/2``).
+Active cells are ordered line-major (line = the half-axis coordinate), so
+K2 reads a line's cells contiguously; :attr:`OwnerCsr.fft_lines` lists the
+lines holding a cell off position 0 along the full axis (they need a K2
+FFT) and :attr:`OwnerCsr.const_lines` the lines whose only cell is at
+position 0 (its IFFT is that value everywhere -- an exact constant for
+K3a). With today's DC-at-centre grid the DSA-110 core spans 112 half
+columns but 57 half rows: 2x folds along rows (:func:`choose_fold`).
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ __all__ = [
     "OwnerCsr",
     "csr_from_owner",
     "csr_from_value_cells",
+    "choose_fold",
     "csr_from_lut_1x",
     "csr_matches_v4",
     "expected_image_sigma",
@@ -66,6 +70,7 @@ class OwnerCsr:
     ent_value: np.ndarray
     ent_conj: np.ndarray
     pattern_id: str
+    fold: str = "col"
 
     @property
     def n_half(self) -> int:
@@ -89,32 +94,46 @@ class OwnerCsr:
         return np.where(((self.cell_u + self.cell_w) & 1) == 1, -1.0, 1.0).astype(np.float32)
 
     @property
-    def fft_cols(self) -> np.ndarray:
-        """Columns holding at least one active cell with ``u != 0``."""
-        return np.unique(self.cell_w[self.cell_u != 0]).astype(np.int32)
+    def cell_line(self) -> np.ndarray:
+        """Half-axis coordinate of each cell (col fold: w; row fold: u)."""
+        return self.cell_w if self.fold == "col" else self.cell_u
 
     @property
-    def const_cols(self) -> np.ndarray:
-        """Columns whose ONLY active cell is ``u = 0``."""
-        cols = np.unique(self.cell_w[self.cell_u == 0])
-        return np.setdiff1d(cols, self.fft_cols).astype(np.int32)
+    def cell_pos(self) -> np.ndarray:
+        """Full-axis coordinate (col fold: u; row fold: w) -- the K2 FFT axis."""
+        return self.cell_u if self.fold == "col" else self.cell_w
 
-    def col_ptr(self, cols: np.ndarray) -> np.ndarray:
-        """``[len(cols) + 1]`` offsets of each column's cells in the active
-        order (cells are sorted by ``(w, u)``)."""
-        lo = np.searchsorted(self.cell_w, cols, side="left")
-        hi = np.searchsorted(self.cell_w, cols, side="right")
-        if np.any(np.diff(np.concatenate([[0], lo])) < 0):
-            raise AssertionError("cells not column-sorted")
-        return np.concatenate([lo, hi[-1:]]).astype(np.int32) if len(cols) else np.zeros(1, np.int32)
+    @property
+    def fft_lines(self) -> np.ndarray:
+        """Half-axis lines holding at least one cell off position 0 (K2)."""
+        return np.unique(self.cell_line[self.cell_pos != 0]).astype(np.int32)
+
+    @property
+    def const_lines(self) -> np.ndarray:
+        """Lines whose ONLY cell is at position 0 (exact constants in K3a)."""
+        lines = np.unique(self.cell_line[self.cell_pos == 0])
+        return np.setdiff1d(lines, self.fft_lines).astype(np.int32)
+
+    def line_ptr(self, lines: np.ndarray) -> np.ndarray:
+        """``[len(lines) + 1]`` offsets of each line's cells in the active
+        order (cells are sorted line-major)."""
+        cl = self.cell_line
+        if np.any(np.diff(cl) < 0):
+            raise AssertionError("cells not line-sorted")
+        lo = np.searchsorted(cl, lines, side="left")
+        hi = np.searchsorted(cl, lines, side="right")
+        return np.concatenate([lo, hi[-1:]]).astype(np.int32) if len(lines) else np.zeros(1, np.int32)
 
     def summary(self) -> dict:
         ne = np.diff(self.cell_ptr)
         return dict(n_grid=self.n_grid, n_stream=self.n_stream, n_active=self.n_active,
                     n_entries=self.n_entries, max_entries=int(ne.max(initial=0)),
                     mean_entries=float(ne.mean()) if ne.size else 0.0,
-                    n_fft_cols=int(self.fft_cols.size), n_const_cols=int(self.const_cols.size),
-                    max_fft_col=int(self.fft_cols.max(initial=-1)), pattern_id=self.pattern_id)
+                    fold=self.fold, n_fft_lines=int(self.fft_lines.size),
+                    n_const_lines=int(self.const_lines.size),
+                    fft_line_range=(int(self.fft_lines.min(initial=-1)),
+                                    int(self.fft_lines.max(initial=-1))),
+                    pattern_id=self.pattern_id)
 
 
 def _pid(*parts) -> str:
@@ -124,8 +143,34 @@ def _pid(*parts) -> str:
     return h.hexdigest()
 
 
+def _half_lines(value_cells, N: int, fold: str) -> int:
+    u_all, w_all = [], []
+    for cells in value_cells:
+        c = np.asarray(cells, dtype=np.int64)
+        c = c[c >= 0]
+        u_all.append(c // N)
+        w_all.append(c % N)
+    u = np.concatenate(u_all)
+    w = np.concatenate(w_all)
+    if fold == "row":
+        a, b = u, w
+    else:
+        a, b = w, u
+    a_half = np.where(a <= N // 2, a, (N - a) % N)
+    b_half = np.where(a <= N // 2, b, (N - b) % N)
+    return int(np.unique(a_half[b_half != 0]).size)
+
+
+def choose_fold(value_cells: Sequence[np.ndarray], n_grid: int) -> str:
+    """The Hermitian half axis that minimises the K2 line count. With
+    today's DC-at-centre grid the DSA-110 core occupies 112 half-plane
+    columns but only 57 half-plane rows, so 2x folds along rows."""
+    return "row" if _half_lines(value_cells, n_grid, "row") < \
+        _half_lines(value_cells, n_grid, "col") else "col"
+
+
 def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
-                         extra_id: Optional[str] = None) -> OwnerCsr:
+                         extra_id: Optional[str] = None, fold: str = "col") -> OwnerCsr:
     """Build the owner CSR from per-stream full-plane cell maps.
 
     Args:
@@ -137,10 +182,19 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
 
     Entry order inside a cell: ``(stream, conj, value)`` ascending -- the
     frozen SPEC §3 owner order (for 1x: v4's stream-ascending order).
+
+    ``fold`` picks the Hermitian half axis: ``"col"`` (today's irfft2
+    layout, ``w <= N/2``; required for the 1x bit-exactness with v4),
+    ``"row"`` (``u <= N/2``) or ``"auto"`` (:func:`choose_fold`). Both give
+    the same image ``Re(ifft2(G_full))``.
     """
     N = int(n_grid)
     if N % 2:
         raise ValueError("n_grid must be even")
+    if fold == "auto":
+        fold = choose_fold(value_cells, N)
+    if fold not in ("col", "row"):
+        raise ValueError(f"fold={fold!r}")
     us, ws, ss, vs, cs = [], [], [], [], []
     n_values = np.array([len(v) for v in value_cells], dtype=np.int32)
     for s, cells in enumerate(value_cells):
@@ -153,12 +207,16 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
             raise ValueError(f"stream {s}: cell index {int(lin.max())} >= N^2")
         u = lin // N
         w = lin % N
-        d = w <= N // 2                                 # direct into (u, w)
-        us.append(u[d]); ws.append(w[d]); ss.append(np.full(int(d.sum()), s)); vs.append(vidx[d])
-        cs.append(np.zeros(int(d.sum()), dtype=np.int8))
         mu = (N - u) % N
         mw = (N - w) % N
-        m = mw <= N // 2                                # conj into the mirror
+        if fold == "col":
+            d = w <= N // 2                             # direct into (u, w)
+            m = mw <= N // 2                            # conj into the mirror
+        else:
+            d = u <= N // 2
+            m = mu <= N // 2
+        us.append(u[d]); ws.append(w[d]); ss.append(np.full(int(d.sum()), s)); vs.append(vidx[d])
+        cs.append(np.zeros(int(d.sum()), dtype=np.int8))
         us.append(mu[m]); ws.append(mw[m]); ss.append(np.full(int(m.sum()), s)); vs.append(vidx[m])
         cs.append(np.ones(int(m.sum()), dtype=np.int8))
     if not us:
@@ -168,9 +226,11 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
     s = np.concatenate(ss).astype(np.int64)
     v = np.concatenate(vs).astype(np.int64)
     c = np.concatenate(cs).astype(np.int64)
-    order = np.lexsort((v, c, s, u, w))                # cell (w, u) major; entries (stream, conj, value)
+    line, pos = (w, u) if fold == "col" else (u, w)
+    order = np.lexsort((v, c, s, pos, line))           # line-major cells; entries (stream, conj, value)
     u, w, s, v, c = u[order], w[order], s[order], v[order], c[order]
-    key = w * N + u                                     # unique per (w, u)
+    line, pos = (w, u) if fold == "col" else (u, w)
+    key = line * N + pos                                # unique per cell
     starts = np.concatenate([[0], np.nonzero(np.diff(key))[0] + 1])
     cell_ptr = np.concatenate([starts, [key.size]]).astype(np.int32)
     return OwnerCsr(
@@ -178,7 +238,9 @@ def csr_from_value_cells(value_cells: Sequence[np.ndarray], *, n_grid: int,
         cell_u=u[starts].astype(np.int32), cell_w=w[starts].astype(np.int32),
         cell_ptr=cell_ptr, ent_stream=s.astype(np.int32), ent_value=v.astype(np.int32),
         ent_conj=c.astype(np.int8),
-        pattern_id=_pid(N, *[np.asarray(x, dtype=np.int64) for x in value_cells], extra_id or ""),
+        pattern_id=_pid(N, fold, *[np.asarray(x, dtype=np.int64) for x in value_cells],
+                        extra_id or ""),
+        fold=fold,
     )
 
 
@@ -292,6 +354,6 @@ def expected_image_sigma(csr: OwnerCsr, value_sigma: Sequence[np.ndarray]) -> fl
             sv = float(value_sigma[csr.ent_stream[e]][csr.ent_value[e]])
             acc += 0.25 * sv * sv
         var[a] = acc
-    selfcol = (csr.cell_w == 0) | (csr.cell_w == N // 2)
+    selfcol = (csr.cell_line == 0) | (csr.cell_line == N // 2)
     factor = np.where(selfcol, 2.0, 4.0)
     return float(np.sqrt(np.sum(factor * var)) / (N * N))

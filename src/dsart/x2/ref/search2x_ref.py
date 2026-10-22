@@ -13,7 +13,7 @@ Independent of every production / engine code path it checks:
 * Layer-1: 3 x 3-sigma median-centred clipped std over the active cells
   (optionally over a given subsample, to compare with production);
 * filters: cascades of integer box stages -- boxcar (``b``), triangle
-  (``t``), FWHM-matched B3 (``g``) and the Phase 0 ``b3x`` bank -- with taps
+  (``t``), FWHM-matched B3 (``q``) and the Phase 0 ``b3x`` bank -- with taps
   by explicit convolution, centred ``a = L // 2`` (today's boxcar
   convention ``[c - w//2, c - w//2 + w - 1]``), evaluated as float64
   prefix-sum box stages on ``clip(x / sigma, +-clip)``;
@@ -90,17 +90,17 @@ REF_B3 = {2: (1, 2, 2), 4: (3, 3, 3), 8: (6, 6, 7), 16: (12, 13, 13), 32: (25, 2
 
 
 def ref_filter_bank(widths: Sequence[int], family: str = "b") -> List[RefFilter]:
-    """``b`` boxcar, ``t`` equal triangle (w, w), ``g`` FWHM-matched B3
+    """``b`` boxcar, ``t`` equal triangle (w, w), ``q`` FWHM-matched B3
     (Phase 0 table), ``b3x`` the 8-filter Phase 0 bank (widths ignored)."""
     if family == "b3x":
         return ([ref_filter("b1", 1, (1,)), ref_filter("b2", 2, (2,)),
                  ref_filter("t2", 2, (2, 2))]
-                + [ref_filter(f"g{w}", w, REF_B3[w]) for w in (4, 8, 16, 32, 64)])
+                + [ref_filter(f"q{w}", w, REF_B3[w]) for w in (4, 8, 16, 32, 64)])
     out = []
     for w in widths:
         w = int(w)
         st = {"b": (w,), "t": (w, w),
-              "g": REF_B3.get(w, (max(1, round(w / 1.268)),) * 3)}[family]
+              "q": REF_B3.get(w, (max(1, round(w / 1.268)),) * 3)}[family]
         out.append(ref_filter(f"{family}{w}", w, st))
     return out
 

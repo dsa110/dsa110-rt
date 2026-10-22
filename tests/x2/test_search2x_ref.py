@@ -130,7 +130,7 @@ def test_bspline_taps_and_centring():
             assert f.a == f.length // 2
     assert np.array_equal(ref.ref_filter_bank([3], "t")[0].taps, [1, 2, 3, 2, 1])
     bank = ref.ref_filter_bank((), "b3x")
-    assert [f.name for f in bank] == ["b1", "b2", "t2", "g4", "g8", "g16", "g32", "g64"]
+    assert [f.name for f in bank] == ["b1", "b2", "t2", "q4", "q8", "q16", "q32", "q64"]
     assert np.array_equal(bank[2].taps, [1, 2, 1])
     assert max(f.length for f in bank) - 1 == 148                 # Phase 0 history rows
     norms = [round(f.norm, 2) for f in bank]

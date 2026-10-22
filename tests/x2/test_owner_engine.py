@@ -126,14 +126,14 @@ def test_engine_b3x_bank_matches_reference():
     plan, ring, sky, eng, cells = _setup_2x(bursts, families=("b3x",), t_a=32, only=(1,))
     st = eng.states[1]
     assert st.history == 148 and st.delay == 74
-    assert eng.bank.kernel_ids() == ["b1", "b2", "t2", "g4", "g8", "g16", "g32", "g64"]
+    assert eng.bank.kernel_ids() == ["b1", "b2", "t2", "q4", "q8", "q16", "q32", "q64"]
     floors = st.layer2._sigma_floor_vec.numpy()
     assert np.allclose(floors[:2], 0.5) and np.isclose(floors[2], 0.5 * np.sqrt(6) / np.sqrt(2))
     _fill(plan, ring, sky, 1)
     res = eng.process_cycle(1, keep_maps=True)
     _check_vs_ref(eng, sky, cells, res)
     best = [c for c in res.per_dm[1].candidates if (c.l, c.m) == (14, 18)]
-    assert best and best[0].filt.startswith("g")
+    assert best and best[0].filt.startswith("q")
 
 
 def test_engine_cycles_are_contiguous_and_stateful():

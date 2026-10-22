@@ -9,10 +9,10 @@ convention (window ``[c - w//2, c - w//2 + w - 1]``). Banks:
 
 * ``"box"`` -- today's ladder ``b1 .. b64`` (stages ``(w,)``);
 * ``"b3x"`` -- the Phase 0 recommendation (8 filters): ``b1``, ``b2``,
-  ``t2`` = [1,2,1], then FWHM-matched quadratic B-splines ``g4 .. g64``
+  ``t2`` = [1,2,1], then FWHM-matched quadratic B-splines ``q4 .. q64``
   with near-equal stage lengths (3,3,3), (6,6,7), (12,13,13),
   (25,25,26), (50,50,51); 148 history rows;
-* ``"t"`` / ``"g"`` families at arbitrary widths (studies, tests).
+* ``"t"`` / ``"q"`` families at arbitrary widths (studies, tests).
 
 Per filter: ``seed = ||h||_2`` (Layer-2 sigma_k seed, the white-noise
 sigma of the integer-sum output) and the Layer-2 floor
@@ -31,13 +31,13 @@ same fp32 operations in the same order, so they agree bit for bit):
   stages outputs ``xs[e]``. Rows before the filter's first needed row read
   as zero, so every cycle restarts from a zero state (bounded error, no
   cross-cycle drift);
-* the loop runs over CENTRES: filter ``k`` consumes window end
-  ``e = c + D_k`` (``D_k = L_k - 1 - a_k``) so every filter reports the
-  same centre in the same iteration; each family group runs a warm-up of
-  ``max(L_k) - 1`` iterations;
+* one pass per filter in bank order, over CENTRES ``c``: filter ``k``
+  consumes window end ``e = c + D_k`` (``D_k = L_k - 1 - a_k``) after a
+  warm-up of ``L_k - 1`` iterations;
 * ``snr = S * s_inv[k]``; per (pixel, 64-centre chunk) keep the max over
-  (centre, filter) -- strict ``>``; groups run in bank order and accumulate
-  into the same chunk maxima -- plus the packed ``(t_in_chunk << 8) | k``;
+  (centre, filter) -- strict ``>``, filters accumulate into the same chunk
+  maxima in bank order (ties: earlier filter, then earlier centre) -- plus
+  the packed ``(t_in_chunk << 8) | k``;
 * taps: the raw outputs of every centre at fixed tap pixels feed the
   per-DM Layer-2 sigma_k estimate.
 """
@@ -68,7 +68,7 @@ def _stages_for(family: str, w: int) -> tuple:
         return (w,)
     if family == "t":
         return (w, w)
-    if family == "g":
+    if family == "q":
         if w in B3_STAGES:
             return B3_STAGES[w]
         a = max(1, int(round(w / 1.268)))
@@ -152,10 +152,10 @@ class FilterBank:
 
     @classmethod
     def b3x(cls) -> "FilterBank":
-        """Phase 0 bank: b1, b2, t2 = [1,2,1], g4 .. g64."""
+        """Phase 0 bank: b1, b2, t2 = [1,2,1], q4 .. q64 (WS-D kernel_id time tokens)."""
         f = [TimeFilter.make("b", 1), TimeFilter.make("b", 2),
              TimeFilter("t2", 2, (2, 2))]
-        f += [TimeFilter("g%d" % w, w, B3_STAGES[w]) for w in (4, 8, 16, 32, 64)]
+        f += [TimeFilter("q%d" % w, w, B3_STAGES[w]) for w in (4, 8, 16, 32, 64)]
         return cls(tuple(f))
 
     def __len__(self) -> int:
@@ -264,43 +264,39 @@ def k3b_twin(
         x = ring[(row - ring_row0) % R].astype(np.float32)
         return np.minimum(np.maximum(x * si, -clip32), clip32)
 
-    for _order, k0, k1 in bank.family_groups():
-        grp = bank.filters[k0:k1]
-        lmax = max(f.length for f in grp)
-        lags = [f.lag_sets() for f in grp]
-        state = [{(j, o): np.zeros((F, P), dtype=np.float32)
-                  for j in range(len(ls)) for o in ls[j]} for ls in lags]
+    # one pass per FILTER in bank order (the kernel launches once per filter
+    # and accumulates into the same chunk maxima): ties go to the earlier
+    # filter, then to the earlier centre
+    for k, flt in enumerate(bank.filters):
+        ls = flt.lag_sets()
+        st = {(jj, o): np.zeros((F, P), dtype=np.float32)
+              for jj in range(len(ls)) for o in ls[jj]}
+        r_start = c_first - flt.a
         cur_best = best[0].copy()
         cur_tk = tk[0].copy()
-        for c in range(c_first - (lmax - 1), c_first + n_c):
-            out_c = c >= c_first
+        for c in range(c_first - (flt.length - 1), c_first + n_c):
+            e = c + flt.d
+            if not flt.stages:
+                score = xs_at(e, r_start)
+            else:
+                L1 = flt.stages[0]
+                for o in ls[0]:
+                    st[(0, o)] = (st[(0, o)] + xs_at(e - o, r_start)) - xs_at(e - o - L1, r_start)
+                for jj in range(1, flt.order):
+                    Lj = flt.stages[jj]
+                    for o in ls[jj]:
+                        st[(jj, o)] = (st[(jj, o)] + st[(jj - 1, o)]) - st[(jj - 1, o + Lj)]
+                score = st[(flt.order - 1, 0)]
+            if c < c_first:
+                continue
             ci = c - c_first
-            for kk, flt in enumerate(grp):
-                k = k0 + kk
-                e = c + flt.d
-                r_start = c_first - flt.a
-                if not flt.stages:
-                    score = xs_at(e, r_start)
-                else:
-                    st, ls = state[kk], lags[kk]
-                    L1 = flt.stages[0]
-                    for o in ls[0]:
-                        st[(0, o)] = (st[(0, o)] + xs_at(e - o, r_start)) \
-                            - xs_at(e - o - L1, r_start)
-                    for j in range(1, flt.order):
-                        Lj = flt.stages[j]
-                        for o in ls[j]:
-                            st[(j, o)] = (st[(j, o)] + st[(j - 1, o)]) - st[(j - 1, o + Lj)]
-                    score = st[(flt.order - 1, 0)]
-                if not out_c:
-                    continue
-                if taps_out is not None:
-                    taps_out[k, :, :, ci] = score[:, tap_pixels]
-                v = score * sk[k]
-                better = v > cur_best
-                cur_best = np.where(better, v, cur_best)
-                cur_tk = np.where(better, np.int32(((ci % chunk) << 8) | k), cur_tk)
-            if out_c and (ci % chunk) == chunk - 1:
+            if taps_out is not None:
+                taps_out[k, :, :, ci] = score[:, tap_pixels]
+            v = score * sk[k]
+            better = v > cur_best
+            cur_best = np.where(better, v, cur_best)
+            cur_tk = np.where(better, np.int32(((ci % chunk) << 8) | k), cur_tk)
+            if (ci % chunk) == chunk - 1:
                 best[ci // chunk] = cur_best
                 tk[ci // chunk] = cur_tk
                 nxt = ci // chunk + 1

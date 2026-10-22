@@ -57,33 +57,37 @@ def bitrev5(x: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True)
 class FftPlan:
-    """Static column/row bookkeeping for one owner CSR."""
+    """Static line bookkeeping for one owner CSR (fold-axis aware).
+
+    A "line" is a fixed half-axis coordinate (col fold: column ``w``; row
+    fold: row ``u``); K2 transforms each FFT line along the full axis
+    (position = ``u`` / ``w``), K3a runs the C2R along the half axis for every
+    output coordinate of the full axis. Row fold produces the image
+    transposed, which the writers undo (output strides).
+    """
 
     n_grid: int
-    fft_cols: np.ndarray        # [n_fc] columns needing a column FFT
-    const_cols: np.ndarray      # [n_cc] columns whose only cell is u = 0
-    cell_col_slot: np.ndarray   # [n_act] index into fft_cols, or -1
-    cell_const_slot: np.ndarray  # [n_act] index into const_cols, or -1
-    cell_u: np.ndarray
-    cell_w: np.ndarray
+    fold: str
+    fft_lines: np.ndarray        # [n_fl] lines needing a K2 FFT
+    const_lines: np.ndarray      # [n_cl] lines whose only cell is at position 0
+    cell_line_slot: np.ndarray   # [n_act] index into fft_lines, or -1
+    cell_const_slot: np.ndarray  # [n_act] index into const_lines, or -1
+    cell_line: np.ndarray        # [n_act] half-axis coordinate
+    cell_pos: np.ndarray         # [n_act] full-axis coordinate
 
     @classmethod
     def build(cls, csr: OwnerCsr) -> "FftPlan":
-        fc = csr.fft_cols
-        cc = csr.const_cols
-        col_slot = np.full(csr.n_active, -1, dtype=np.int32)
-        const_slot = np.full(csr.n_active, -1, dtype=np.int32)
-        pos_f = {int(w): i for i, w in enumerate(fc)}
-        pos_c = {int(w): i for i, w in enumerate(cc)}
-        for a in range(csr.n_active):
-            w = int(csr.cell_w[a])
-            if w in pos_f:
-                col_slot[a] = pos_f[w]
-            elif w in pos_c:
-                const_slot[a] = pos_c[w]
-        return cls(n_grid=csr.n_grid, fft_cols=fc, const_cols=cc,
-                   cell_col_slot=col_slot, cell_const_slot=const_slot,
-                   cell_u=csr.cell_u.copy(), cell_w=csr.cell_w.copy())
+        fl = csr.fft_lines
+        cl = csr.const_lines
+        line = np.asarray(csr.cell_line)
+        pf = {int(x): i for i, x in enumerate(fl)}
+        pc = {int(x): i for i, x in enumerate(cl)}
+        ls = np.array([pf.get(int(x), -1) for x in line], dtype=np.int32)
+        cs = np.array([-1 if ls[a] >= 0 else pc.get(int(x), -1) for a, x in enumerate(line)],
+                      dtype=np.int32)
+        return cls(n_grid=csr.n_grid, fold=csr.fold, fft_lines=fl, const_lines=cl,
+                   cell_line_slot=ls, cell_const_slot=cs, cell_line=line.copy(),
+                   cell_pos=np.asarray(csr.cell_pos).copy())
 
     @property
     def n_half(self) -> int:
@@ -92,9 +96,9 @@ class FftPlan:
 
 def image_from_uv_torch(uv, plan: FftPlan, mask_scaled, *, mode: str = "pruned"):
     """``uv [B, n_act]`` complex64 tensor -> ``[B, N, N]`` float32 image
-    (times ``mask_scaled [N, N]`` = edge mask x image scale x ... ).
+    ``irfft2``-normalised, times ``mask_scaled [N, N]`` (edge mask x scale).
 
-    ``mode="pruned"``: column-pruned (cuFFT fallback), ``"irfft2"``: dense.
+    ``mode="pruned"``: line-pruned cuFFT fallback; ``"irfft2"``: dense.
     """
     import torch
 
@@ -102,32 +106,32 @@ def image_from_uv_torch(uv, plan: FftPlan, mask_scaled, *, mode: str = "pruned")
     N = plan.n_grid
     nh = plan.n_half
     dev = uv.device
-    cu = torch.as_tensor(plan.cell_u, dtype=torch.long, device=dev)
-    cw = torch.as_tensor(plan.cell_w, dtype=torch.long, device=dev)
+    ln = torch.as_tensor(plan.cell_line, dtype=torch.long, device=dev)
+    ps = torch.as_tensor(plan.cell_pos, dtype=torch.long, device=dev)
     if mode == "irfft2":
-        G = torch.zeros((B, N, nh), dtype=torch.complex64, device=dev)
-        G[:, cu, cw] = uv
-        img = torch.fft.irfft2(G, s=(N, N))
+        G = torch.zeros((B, N, nh), dtype=torch.complex64, device=dev)   # [B, pos, line]
+        G[:, ps, ln] = uv
+        img = torch.fft.irfft2(G, s=(N, N))                            # [B, pos-out, line-out]
     elif mode == "pruned":
-        fc = plan.fft_cols
+        fl = plan.fft_lines
         rows = torch.zeros((B, N, nh), dtype=torch.complex64, device=dev)
-        if fc.size:
-            sel = np.nonzero(plan.cell_col_slot >= 0)[0]
-            cols = torch.zeros((B, int(fc.size), N), dtype=torch.complex64, device=dev)
+        if fl.size:
+            sel = np.nonzero(plan.cell_line_slot >= 0)[0]
+            lines = torch.zeros((B, int(fl.size), N), dtype=torch.complex64, device=dev)
             idx = torch.as_tensor(sel, dtype=torch.long, device=dev)
-            cslot = torch.as_tensor(plan.cell_col_slot[sel], dtype=torch.long, device=dev)
-            cols[:, cslot, cu[idx]] = uv[:, idx]
-            # unnormalised column IFFT (norm="forward" puts 1/N on the forward side)
-            colt = torch.fft.ifft(cols, dim=-1, norm="forward")            # [B, n_fc, N(y)]
-            rows[:, :, torch.as_tensor(fc, dtype=torch.long, device=dev)] = colt.transpose(1, 2)
-        if plan.const_cols.size:
+            lslot = torch.as_tensor(plan.cell_line_slot[sel], dtype=torch.long, device=dev)
+            lines[:, lslot, ps[idx]] = uv[:, idx]
+            lt = torch.fft.ifft(lines, dim=-1, norm="forward")              # unnormalised
+            rows[:, :, torch.as_tensor(fl, dtype=torch.long, device=dev)] = lt.transpose(1, 2)
+        if plan.const_lines.size:
             sel = np.nonzero(plan.cell_const_slot >= 0)[0]
             idx = torch.as_tensor(sel, dtype=torch.long, device=dev)
-            w = torch.as_tensor(plan.cell_w[sel], dtype=torch.long, device=dev)
-            rows[:, :, w] = uv[:, idx][:, None, :]
-        img = torch.fft.irfft(rows, n=N, dim=-1) / float(N)                 # irfft has 1/N
+            rows[:, :, ln[idx]] = uv[:, idx][:, None, :]
+        img = torch.fft.irfft(rows, n=N, dim=-1) / float(N)
     else:
         raise ValueError(f"mode={mode!r}")
+    if plan.fold == "row":
+        img = img.transpose(1, 2)                                       # [B, y(u), x(w)]
     return img * mask_scaled
 
 
@@ -224,17 +228,19 @@ def image_from_uv_twin(uv: np.ndarray, plan: FftPlan, mask_scaled: np.ndarray,
     N = plan.n_grid
     nh = plan.n_half
     B = uv.shape[0]
-    rows = np.zeros((B, N, nh), dtype=np.complex64)
-    if plan.fft_cols.size:
-        sel = np.nonzero(plan.cell_col_slot >= 0)[0]
-        cols = np.zeros((B, plan.fft_cols.size, N), dtype=np.complex64)
-        cols[:, plan.cell_col_slot[sel], plan.cell_u[sel]] = uv[:, sel]
-        colt = k2_twin(cols, N)                                  # [B, n_fc, N(y)]
-        rows[:, :, plan.fft_cols] = np.swapaxes(colt, 1, 2)
-    if plan.const_cols.size:
+    rows = np.zeros((B, N, nh), dtype=np.complex64)                  # [B, pos-out, line]
+    if plan.fft_lines.size:
+        sel = np.nonzero(plan.cell_line_slot >= 0)[0]
+        lines = np.zeros((B, plan.fft_lines.size, N), dtype=np.complex64)
+        lines[:, plan.cell_line_slot[sel], plan.cell_pos[sel]] = uv[:, sel]
+        lt = k2_twin(lines, N)                                       # [B, n_fl, N(out)]
+        rows[:, :, plan.fft_lines] = np.swapaxes(lt, 1, 2)
+    if plan.const_lines.size:
         sel = np.nonzero(plan.cell_const_slot >= 0)[0]
-        rows[:, :, plan.cell_w[sel]] = uv[:, sel][:, None, :]
-    img = k3a_twin(rows, N)                                      # [B, N, N] (y, x)
+        rows[:, :, plan.cell_line[sel]] = uv[:, sel][:, None, :]
+    img = k3a_twin(rows, N)                                          # [B, pos-out, line-out]
+    if plan.fold == "row":
+        img = np.swapaxes(img, 1, 2)
     pix = (np.asarray(mask_scaled, dtype=np.float64) / float(N * N)).astype(np.float32)
     out = (img * pix).astype(np.float32)
     return out.astype(out_dtype) if out_dtype is not None else out

@@ -26,23 +26,36 @@ from __future__ import annotations
 import numpy as np
 
 from .codec import RowFormat, StreamFormats, decode_constants
-from .csr import csr_from_owner
+from .csr import choose_fold, csr_from_owner, csr_from_value_cells
 
 __all__ = ["dm_inputs_from_value_map", "check_pattern"]
 
 
 def dm_inputs_from_value_map(vmap, *, s_main: float = 1.0, s_heavy: float = 1.0,
-                             bits_main: int = 8, midrise: bool = False):
+                             bits_main: int = 8, midrise: bool = False, fold: str = "auto"):
     """``ValueMap`` -> ``DmInputs`` (one per DM; the map is DM-independent).
 
     Args:
         s_main, s_heavy: decode steps in sigma_hat units (frame header
             ``s_main`` / ``s_heavy``); ignored for a 1x map.
         bits_main: frame ``bits_main`` (bits per COMPLEX main value: 8/10/12).
+        fold: Hermitian half axis of the owner CSR: ``"col"`` = WS-P's
+            ``OwnerCsr`` verbatim (today's layout), ``"row"`` = rebuilt from
+            the same value cells folded along rows, ``"auto"`` = the axis
+            with fewer K2 lines (rows for the DSA-110 core: 57 vs 112).
     """
     from .engine import DmInputs
 
-    csr, w_ent = csr_from_owner(vmap.owner)
+    cells_all = [np.asarray(sv.cell_row, np.int64) * int(vmap.n_grid)
+                 + np.asarray(sv.cell_col, np.int64) for sv in vmap.streams]
+    if fold == "auto":
+        fold = choose_fold(cells_all, int(vmap.n_grid))
+    if fold == "col":
+        csr, w_ent = csr_from_owner(vmap.owner)
+    else:
+        csr = csr_from_value_cells(cells_all, n_grid=int(vmap.n_grid), fold=fold,
+                                   extra_id=f"{int(vmap.pattern_id):016x}")
+        w_ent = None
     S = len(vmap.streams)
     if csr.n_stream > S:
         raise ValueError(f"owner CSR references {csr.n_stream} streams, map has {S}")
@@ -71,10 +84,11 @@ def dm_inputs_from_value_map(vmap, *, s_main: float = 1.0, s_heavy: float = 1.0,
         c_v[s, :nv] = c
         fmts.append(f)
     # the per-entry CSR weight must be the per-value static weight
-    sv_w = np.array([np.sqrt(float(vmap.streams[s].n_contrib[v])) if vmap.normalise else 1.0
-                     for s, v in zip(csr.ent_stream, csr.ent_value)])
-    if sv_w.size and np.max(np.abs(sv_w - w_ent) / np.maximum(sv_w, 1.0)) > 1e-6:
-        raise ValueError("owner CSR ent_weight is not the per-value sqrt(n)")
+    if w_ent is not None:
+        sv_w = np.array([np.sqrt(float(vmap.streams[s].n_contrib[v])) if vmap.normalise
+                         else 1.0 for s, v in zip(csr.ent_stream, csr.ent_value)])
+        if sv_w.size and np.max(np.abs(sv_w - w_ent) / np.maximum(sv_w, 1.0)) > 1e-6:
+            raise ValueError("owner CSR ent_weight is not the per-value sqrt(n)")
     return DmInputs(fmt=StreamFormats(tuple(fmts)), csr=csr, c_v=c_v, offset=float(off),
                     value_sigma=vsig, pattern_id=int(vmap.pattern_id))
 
