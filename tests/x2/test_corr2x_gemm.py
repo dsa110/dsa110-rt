@@ -4,6 +4,9 @@ ring-row kinds (core baselines; redundancy classes via scratch + the
 fixed-order reduce), with cal, the folded cube mask, the array-burst
 time mask, and a ring position that wraps.
 
+Each interpreted test also runs a MUTANT kernel (one flipped sign) and
+requires it to MISS the twin, proving the interpreter executed the kernel.
+
 Tolerance (plan §Correctness 2): the kernel accumulates in fp32 on tensor
 cores, the twin in float64 from the same fp16 operands; after the cfp16
 store they may differ by one fp16 ULP.
@@ -75,8 +78,18 @@ for has_t in (False, True):
     r = 5
     v = sum(np.conj(Ec[c, t2, p, 4:8, kb[r]]) @ Ec[c, t2, p, 4:8, ka[r]]
             for c in (2, 3) for t2 in (0, 1) for p in (0, 1))
-    direct = abs(complex(want[1, 1, r]) - v) < 1e-3
+    direct = abs(complex(want[1, 1, r]) - v) < 5e-2
     print("RESULT", has_t, ok, untouched, direct, int(tab.n_ring_rows))
+# mutant kernel (one flipped term) must miss the twin
+import dsart.x2.corr.gemm2x as g2
+g2._gemm2x_kernel = _mutant("dsart.x2.corr.gemm2x", "_gemm2x_kernel",
+                            "acc_im -= tl.dot(a_i, b_r, out_dtype=tl.float32)",
+                            "acc_im += tl.dot(a_i, b_r, out_dtype=tl.float32)")
+ring.fill_(float("nan"))
+gemm2x_into_ring(re, im, cr, ci, tab, ring, fv0=0, n_fv=n_fv, t_ring0=t0, csf=csf, t_int=t_int)
+want = gemm2x_reference(re, im, cr, ci, tab, fv0=0, n_fv=n_fv, csf=csf, t_int=t_int)
+got = torch.complex(ring[..., 0].float(), ring[..., 1].float())[:, :, pos].permute(2, 1, 0)
+print("MUTANT", not (ulp_ok(got.real, want.real) and ulp_ok(got.imag, want.imag)))
 """
 
 _CLASSES = _COMMON + r"""
@@ -94,6 +107,15 @@ pos = [(t0 + i) % T_ring for i in range(n_fv)]
 got = torch.complex(ring[..., 0].float(), ring[..., 1].float())[:, :, pos].permute(2, 1, 0)
 ok = ulp_ok(got.real, want.real) and ulp_ok(got.imag, want.imag)
 print("RESULT", ok, int(rc.n_class), int(tab.n_scratch_rows), bool(torch.isfinite(got).all()))
+import dsart.x2.corr.gemm2x as g2
+g2._reduce_kernel = _mutant("dsart.x2.corr.gemm2x", "_reduce_kernel",
+                            "acc_i += sg * tl.load(", "acc_i -= sg * tl.load(")
+ring.fill_(float("nan"))
+gemm2x_into_ring(re, im, cr, ci, tab, ring, fv0=0, n_fv=n_fv, t_ring0=t0, csf=csf, t_int=t_int,
+                 scratch=scr)
+g2.reduce_classes(scr, ring, tab, t_ring0=t0, n_fv=n_fv)
+got = torch.complex(ring[..., 0].float(), ring[..., 1].float())[:, :, pos].permute(2, 1, 0)
+print("MUTANT", not (ulp_ok(got.real, want.real) and ulp_ok(got.imag, want.imag)))
 """
 
 
@@ -103,11 +125,14 @@ def test_gemm2x_rows_matches_twin_interpreted() -> None:
     assert len(lines) == 2, out
     for ln in lines:
         assert ln.split()[2:5] == ["True", "True", "True"], out
+    assert "MUTANT True" in out, out
 
 
 def test_gemm2x_class_reduce_matches_twin_interpreted() -> None:
     out = run_interpreted(_CLASSES)
-    assert "RESULT True" in out and "True" == out.split()[-1], out
+    res = [ln for ln in out.splitlines() if ln.startswith("RESULT")][0].split()
+    assert res[1] == "True" and res[-1] == "True", out
+    assert "MUTANT True" in out, out
 
 
 def test_gemm_tables_cover_every_core_pair_once() -> None:

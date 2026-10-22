@@ -63,10 +63,14 @@ ok = []
 for bits in (4, 5, 6):
     c = torch.from_numpy(rng.integers(-(1 << (bits - 1)), 1 << (bits - 1), size=(5, 203)).astype(np.int8))
     ok.append(torch.equal(pack_bits_triton(c, bits, block=64), pack_bits_torch(c, bits)))
+import dsart.x2.corr.packer2x as pk
+pk._pack_bits_kernel = _mutant("dsart.x2.corr.packer2x", "_pack_bits_kernel",
+                               "(v1 << (B - sh))", "(v1 << (B - sh + 1))")
+ok.append(not torch.equal(pk.pack_bits_triton(c, 5, block=64), pack_bits_torch(c, 5)))
 print("RESULT", *ok)
 """
     out = run_interpreted(code)
-    assert "RESULT True True True" in out, out
+    assert "RESULT True True True True" in out, out
 
 
 def _flow_inputs(seed, n_d=3, n_t=64, voff=(0, 40, 95), nh=(4, 6), n_blocks=4):
