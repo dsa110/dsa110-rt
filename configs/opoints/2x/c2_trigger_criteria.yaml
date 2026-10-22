@@ -1,0 +1,186 @@
+# =============================================================================
+# CONFIG SET 2x -- C2 trigger criteria (h23 file, hot-reloaded by C2)
+#
+# TEMPLATE for every 2x corner-turn format (op-point id
+# 2x-<kind>-ns<n>-cint<b>, dsart.x2.opoint; the format is chosen at CP1).
+# Read by C2 when /cnf/opoint is a 2x id (coinc.trigger_criteria_path of
+# configs/opoints/2x/dsart_search_rt.yaml points here).
+# Frozen interface: docs/x2/SPEC.md section 10. Started as a verbatim copy of
+# configs/c2_trigger_criteria.yaml (the 1x base set, which stays byte-identical
+# to production).
+#   * ${var} in routine args / hostargs is rendered at push time from the
+#     op-point id and the v3 plan (`push_dsart_to_etcd.py --opoint <2x id>
+#     --plan <npz> --write`; variables: dsart.x2.opoint_runtime.render_context
+#     -- n_sub, n_streams, plan_path, plan_id, owned_coarse_csv_h<h>, ...).
+#     Variables are allowed ONLY there: the h23 services read the other
+#     blocks straight from this file.
+#   * X2TODO:<owner>:<what> tokens stand for values not decided yet (they
+#     fail argument parsing); top-level x2_todo entries are section reviews
+#     still owed. Both block a switch (the push needs --allow-placeholders).
+#   * x2_cp2_recalibrate entries are 1x values to recalibrate at CP2 (do not
+#     block).
+# Paths to op-point managed files must point into configs/opoints/2x/.
+# =============================================================================
+# C2 coincidencer trigger criteria.
+#
+# Hot-reloadable on SIGHUP (the C2 service watches mtime).  See
+# docs/c1c2/C1C2_DESIGN.md §3.4 for action semantics.
+#
+# Layout (top-to-bottom; first match wins):
+#   1. bright_frb_extragalactic   — DM/gal_dm_max_los >= 0.75
+#   2. bright_galactic            — DM/gal_dm_max_los <  0.75
+#   3. bright_pulsar              — tight-DM repeats (e.g. Crab)
+#   4. log_only                   — fallback
+#
+# Notes on semantics (see src/dsart/coinc/criteria.py):
+#   * ``dm_galactic_fraction_{max,min}`` reference the NE2001 max-LOS
+#     galactic DM from /mon/array/gal_dm (declination.service, h23).
+#     A cluster with dm_median = D and gal_dm_max_los = G is
+#     classified Galactic when D/G < 0.75 and extragalactic otherwise.
+#     If gal_dm_max_los is unavailable (cold boot, etcd outage), both
+#     predicates return False and these classes silently no-op — the
+#     trailing log_only entry still fires.
+#   * ``dm_iqr_max_pc_cc`` is SNR-scaled: the value here is the cap
+#     applied at snr_max=12; the effective cap grows hyperbolically
+#     and is infinity at snr_max>=50. This lets very-bright bursts
+#     (which trip many DM trials at once) pass while keeping a tight
+#     cap for low-SNR candidates.
+#   * ``lm_diag_max_rad`` is the diagonal of the cluster's (l,m)
+#     bounding box, in radians; ~0 for a true point source.
+
+opoint: 2x
+# 2x differences from the 1x file (configs/c2_trigger_criteria.yaml):
+#   * width gates are in ms (width_median_max_ms, computed per member from
+#     each row's sample period) -- 1x keeps the integer _samples gates, since
+#     16 x 1.048576 ms in float can flip the w=16 boundary by one ulp. The ms
+#     limits sit between allowed boxcar widths (16.8 between 16.78 and 33.55,
+#     8.4 between 8.39 and 16.78, 33.6 between 33.55 and 67.1), so no ulp
+#     can move a width across a gate;
+#   * dm_median_max_pc_cc 3100 (search reaches DM 3000; 1x: 2700 over 2653);
+#   * everything else starts at the 1x value and is listed in
+#     x2_cp2_recalibrate (does not block the switch).
+x2_cp2_recalibrate:
+  - "dm_median_min_pc_cc 115 kept from 1x (floor 100 + 15); the 2x floor is 50, lowering to 65 is a CP2 decision (zero-DM rail at the floor)"
+  - "bright_galactic dm_median_min_pc_cc 100 (the 1x floor)"
+  - "dm_iqr_max_pc_cc caps were tuned to ~7 pc/cc fine spacing; 2x tier A is 2.8-3.2 pc/cc"
+  - "holdoff_s 30 per class: 2x sends ~3-6x more batches per burst (duplicate-dump hole, inventory finding 8)"
+
+trigger_classes:
+  - name: bright_frb_extragalactic
+    description: >-
+      Extragalactic FRB candidate: dm_median >= 0.75 * NE2001 max-LOS
+      galactic DM, so even the most-pessimistic line-of-sight cannot
+      account for it. Permissive SNR threshold (we lose nothing if a
+      Galactic source straggles into this bin) so the floor is 8 σ.
+      
+      2026-05-27: dm_iqr_max relaxed from 30 → 250 (yaml-side) because
+      the connected-components clusterer in M7.4 absorbs candidates
+      across multiple DM trials that share the same (l, m, t) coords.
+      With the SNR-scaling at snr_max=39.69 (effective cap = t*38/10.3
+      ≈ t*3.7), 250 → ~920 pc/cc which comfortably accommodates the
+      250924mptq replay's natural dm_iqr (~170 pc/cc). Tune downward
+      once the clusterer is sharpened (graph DM-proximity threshold
+      or HDBSCAN-style re-clustering on the cluster's row set).
+    require:
+      # 2026-06-14: snr_max_min 15 → 12 (widen extragalactic FRB reach)
+      # and dm_median_min 100 → 115 (drop the DM≈100 pile-up at the
+      # search floor, which the 48h study showed is dominated by RFI /
+      # sub-threshold-DM events rather than real extragalactic bursts).
+      snr_max_min: 12.0
+      n_events_min: 1
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 115.0
+      # 2026-06-10: raised 2000 → 2700 so the full production v2 DM plan
+      # (dm_max ≈ 2653) is dump-eligible. The 2000 ceiling silently
+      # demoted DM≈2000 injections (recovered dm_median 2005–2014 after
+      # DM smearing) to log_only. The earlier 3000→2000 tighten was a
+      # false-positive defense; 2700 keeps a margin above the searched
+      # range without re-opening the >2653 unphysical tail.
+      dm_median_max_pc_cc: 3100.0      # 2x: the search reaches DM 3000
+      dm_iqr_max_pc_cc: 100.0
+      width_median_max_ms: 16.8        # 1x: 16 samples x 1.048576 ms
+      lm_diag_max_rad: 0.1
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
+  - name: faint_frb_extragalactic
+    description: >-
+      2026-10-05: the -1 sigma trigger, for NARROW bursts only. Same
+      gates as bright_frb_extragalactic except snr_max_min 11 (was 12)
+      and width_median <= 8 (not 16). First match wins, so anything that
+      already qualifies above is classed there; this only adds 11-12
+      sigma clusters of width <= 8 (8.4 ms).
+
+      Why narrow only. Replaying every non-injection cluster from
+      2026-10-03..05 through this file: lowering the WHOLE class to 11
+      takes quiet-time trigger-eligible clusters from 34/day to 88/day,
+      and 79% of the extra are w=16 -- a population C3 already rejects
+      (38 of 38 sky dumps in that window were REJECTs, 35 on R10). R10
+      is width-biased: its tz_trig is a single-sample robust z, which
+      scales as ~2.5/sqrt(w) of the detector SNR, so at w=16 it cannot
+      separate real from RFI (sky w16 ratio 0.38, injections 0.44) and
+      rejects 49% of genuine w=16 injections. Triggering w16 at 11-12
+      sigma would add dumps C3 throws away. For w <= 8 the extra is
+      ~10/day and R10 confirms real bursts (injection tz/snr 1.3-2.3 at
+      w<=4; 0.84 median at w=8).
+
+      Euclidean gain for narrow bursts: (12/11)^1.5 = x1.14.
+    require:
+      snr_max_min: 11.0
+      # 11-12 sigma ONLY. Without this upper bound a bright burst's
+      # cluster, re-evaluated as more members arrive while
+      # bright_frb_extragalactic is in its 30 s holdoff, falls through to
+      # this class (>= 50 sigma uses the peak member's width, so w <= 8
+      # passes) and is dumped a SECOND time -- seen live 2026-10-05 07:00
+      # on a 100 sigma probe (261005xtdc, then 261005qcgc). The bright
+      # class owns everything >= 12.
+      snr_max_max: 11.99
+      n_events_min: 1
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 115.0
+      dm_median_max_pc_cc: 3100.0      # 2x: the search reaches DM 3000
+      dm_iqr_max_pc_cc: 100.0
+      width_median_max_ms: 8.4         # 1x: 8 samples x 1.048576 ms
+      lm_diag_max_rad: 0.1
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
+  - name: bright_galactic
+    description: >-
+      Galactic-disk burst (dm_median < 0.75 * NE2001 max-LOS DM).
+      Tighter SNR threshold (12 σ) — Galactic events at low DM are
+      almost always known pulsars and we want a higher bar before
+      taking a 64-cube dump.
+    require:
+      # 2026-07-14: snr_max_min 15 → 35 (operator request): Galactic
+      # events dump voltages only for bright single pulses, so a
+      # transiting pulsar (e.g. B1913+16 at the current +16.27° dec)
+      # yields a handful of high-S/N M8 voltage dumps instead of
+      # rate-capping on every ≥15 σ pulse.
+      snr_max_min: 35.0
+      n_events_min: 1
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 100.0
+      dm_iqr_max_pc_cc: 50.0
+      width_median_max_ms: 33.6        # 1x: 32 samples x 1.048576 ms
+      lm_diag_max_rad: 0.1
+      dm_galactic_fraction_max: 1.0
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
+  - name: bright_pulsar
+    description: "single-source multi-pulse train, tight DM"
+    require:
+      snr_max_min: 10.0
+      n_events_min: 5
+      dm_iqr_max_pc_cc: 2.0
+    action: log_only
+    holdoff_s: 30.0
+
+  - name: log_only
+    description: "fallback — every cluster that doesn't trip a real trigger"
+    require:
+      n_events_min: 1
+    action: log_only

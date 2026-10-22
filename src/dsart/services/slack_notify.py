@@ -366,6 +366,11 @@ class SlackNotifier:
         paths = [plots_dir / f"{p}_{name}.png" for p in self._CUBE_PANELS]
         cubes_dir = Path(ev_dir) / "cubes"
         want_cubes = int(self._cfg.expected_cubes)
+        # x2: a cutout event has no cubes; C2 writes its Level3 only after
+        # the per-half products are finalised (complete or recorded as
+        # incomplete), so only the plots remain to wait for.
+        if (Path(ev_dir) / "cutouts").is_dir():
+            want_cubes = 0
         deadline = time.monotonic() + wait_s
         waited = False
         while True:

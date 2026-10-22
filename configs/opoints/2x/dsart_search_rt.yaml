@@ -1,0 +1,1340 @@
+# =============================================================================
+# CONFIG SET 2x -- search-node pipeline + h23 C1/C2/C3/bot blocks
+#
+# TEMPLATE for every 2x corner-turn format (op-point id
+# 2x-<kind>-ns<n>-cint<b>, dsart.x2.opoint; the format is chosen at CP1).
+# Rendered copy: /cnf/opoints/<2x id>/search_rt -> live /cnf/search_rt
+# (Start control). The h23 services (C2, C3, inject bot) read THIS file
+# from the h23 checkout when /cnf/opoint is a 2x id
+# (opoint_runtime.select_service_config); search_compute reads its
+# c1/detector blocks from the node copy via --config-yaml.
+# Frozen interface: docs/x2/SPEC.md section 10. Started as a verbatim copy of
+# configs/dsart_search_rt.yaml (the 1x base set, which stays byte-identical
+# to production).
+#   * ${var} in routine args / hostargs is rendered at push time from the
+#     op-point id and the v3 plan (`push_dsart_to_etcd.py --opoint <2x id>
+#     --plan <npz> --write`; variables: dsart.x2.opoint_runtime.render_context
+#     -- n_sub, n_streams, plan_path, plan_id, owned_coarse_csv_h<h>, ...).
+#     Variables are allowed ONLY there: the h23 services read the other
+#     blocks straight from this file.
+#   * X2TODO:<owner>:<what> tokens stand for values not decided yet (they
+#     fail argument parsing); top-level x2_todo entries are section reviews
+#     still owed. Both block a switch (the push needs --allow-placeholders).
+#   * x2_cp2_recalibrate entries are 1x values to recalibrate at CP2 (do not
+#     block).
+# Paths to op-point managed files must point into configs/opoints/2x/.
+# =============================================================================
+# dsart-rt search-node pipeline config — pushed to etcd under
+# /cnf/search_rt by tools/ops/push_dsart_to_etcd.py and consumed at
+# runtime by services/dsart_rt.py (`-in search_rt`).
+#
+# Search nodes have NO PSRDADA buffers in the M4a transport contract —
+# the search-RX writes directly into a POSIX-shm SPMC sparse ring
+# (src/dsart/transport/recv_ring.c + production_rx_ring.py) and the
+# search-compute halves attach to that ring. So 'buffers:' is empty by
+# design; recv_ring is created/torn-down inside the search-rx process
+# itself (M4a chunk 4 ownership), not by dsart_rt's dada_db setup.
+#
+# Schema parity with dsart_pipeline_rt.yaml is preserved so the same
+# dsart_rt.py orchestrator binary handles both instances.
+schema_version: 1
+opoint: 2x
+x2_todo:
+  - "WS-T search_rx: recv v4 / ring v4 args (owned DMs only -- template variables owned_coarse_csv_n01/n02/n09/n13 and n_owned_<node> are available for hostargs -- per-DM cadence and fan-in, retention >= 20 s; tokens in routines[search_rx])"
+  - "WS-S search_compute: owner engine args (per-DM cubes, K0-K3b, B-spline filters), amplitude regime in sigma units (input_clip_sigma 250, Layer-1/Layer-2 floors for the new image units, saturation guard 240), --enable-cube-dump vs on-demand cutouts (O1); tokens in routines[search_compute_0/1]"
+  - "WS-S/WS-D c1: merger dm_max_trials in pc/cc (2x fine spacing 2.8-3.2 pc/cc vs ~7), metering per cycle not per cube (never meter an injection more often than 1x), _DEDISP_CHAN_SUM_FACTOR wired from --chan-sum-factor (search_compute.py:266 is a literal 8 today)"
+  - "WS-S cube / cube_dump / noise / detector blocks: 2x values (cube retention ring, proactive stager and cube uploader retire in 2x)"
+# Carried over from 1x, recalibrated on 2x data at CP2 (does NOT block a switch).
+x2_cp2_recalibrate:
+  - "coinc.cluster_rate_max 400 (counts evaluations; 2x sends ~3-6x more batches per burst)"
+  - "coinc.dm_comb_* (3 clusters, 300 pc/cc span, 2 s, 90 arcsec): retune with 2x injections, risk of vetoing real bright bursts"
+  - "coinc.window_s 5.0 vs the DM-3000 sweep (~1.7 s) + per-DM cube latency; coinc.ingest_queue_depth 512 (~2 s at 2x rates)"
+  - "c3.veto r3/r5 (fine trials per bucket) and R10 tz_trig on 512 tier-A rows"
+
+# No mode switch for search — the search-side wire format is always
+# the M4a prod-frame UDP regardless of whether the corr senders are
+# in junkdb or real mode. Synthetic search-side load tests (M7.2)
+# instead use bench/net_pair.py as the TX side, with the real search-rx
+# binary as the RX side; we don't fork the search-side pipeline graph.
+
+buffers: []
+
+# Per-node substitution conventions (dsart_rt._substitute):
+#   CN     -> cn_id integer (1 / 2 / 9 / 13 for the four search nodes).
+#   CALSB  -> "sb%02d" of the corr chgroup; UNUSED here (search nodes
+#             have no chgroup). Don't reference it from search args.
+#   CHGROUP -> chgroup index 0..15; ALSO unused here.
+# Per-host overrides via the `hostargs:` block pick up first by FQDN
+# (n01.pro.pvt) then bare short hostname (n01).
+
+routines:
+  # ---- search_rx (M4a chunk 6 + M7.2 ring publish) -----------------
+  # Long-running C-epoll fan-in. Binds 16 UDP ports (6625..6640 = one
+  # per corr chgroup) on the node's nic.search address, drains each
+  # via a single epoll pthread, reassembles fragmented prod_frames and
+  # publishes reassembled cube slots into a POSIX-shm SPMC ring named
+  # /dsart-rxring-<cn_id> (e.g. /dsart-rxring-1 on n01). The two
+  # search_compute halves attach to this same ring as read-only
+  # consumers (n_filled, t_buf_samples, bytes_per_cell must match
+  # exactly between owner and consumer or the ctypes header check
+  # rejects at attach time).
+  #
+  # Op-point (M7.6-mem production): n_corr=16, n_coarse_dm=8,
+  # bytes_per_cell=2 (cint8 complex), t_buf_samples=8192 (~64 cube
+  # cadences ≈ 8.6 s of headroom — safe for a momentary compute-half
+  # stall). LOWERED from 32768 (2026-05-31): 32768 was ~256 cadences
+  # ≈ 34 s and made the rxring a 39 GiB tmpfs segment, which together
+  # with the lazily-growing depth-24 cube ring blew past the 93 GiB
+  # node RAM into swap. 8192 = 9.8 GiB rxring (still 4× the prior
+  # 4096 design point). The two search_compute halves MUST be
+  # launched with the SAME --t-buf-samples or the ring header check
+  # rejects them at attach (all three routines below are kept in
+  # lock-step).
+  #
+  # SO_RCVBUF=256 MiB matches corner_turn.sh and the M7.PREP socket
+  # buffer note (/proc/sys/net/core/rmem_max must be ≥ 268435456 on
+  # the search nodes; M7.0 ops bootstrap raises it).
+  #
+  # The pattern_id table is intentionally omitted for M7.2; the smoke
+  # uses bench/net_pair.py as TX, which emits a known constant
+  # pattern_id per chgroup, but we run with no expected_pattern_id
+  # registered so every frame is accepted. Production M7.4+ will load
+  # a JSON file via --pattern-id-file.
+  #
+  # SUB-BAND STREAMS (2026-09-23, corr_fast --n-sub 4). Each corr node
+  # now grids its chgroup as 4 sub-band uv planes and ships each as its
+  # own stream (id = chgroup*4 + s), so the ring carries 64 streams and
+  # the search shifts every sub-band separately: the intra-chgroup DM
+  # smear no fine trial can undo drops from ~3.2 to ~0.8 samples.
+  # Measured end-to-end on the real corr stage-1 + stage-2 + search
+  # shift code (tests/test_subband_e2e.py): recovered S/N x1.146 mean,
+  # flat across each coarse bucket instead of falling ~30% at its edges.
+  # Values that MUST move together (all three routines, lock-step):
+  #   --n-corr 64            = 16 chgroups * --n-sub 4
+  #   --n-filled 2600        max sub-band pattern is ~2200 cells (vs
+  #                          3424 whole-chgroup); search_compute
+  #                          refuses to start if any pattern exceeds it
+  #   --t-buf-samples 6144   ring = 64*8*6144*2600*2 B = 15.2 GiB, and
+  #                          the overrun horizon 6144-4*256 = 5120 stays
+  #                          above the 20-cube (3840) real-time re-seek,
+  #                          the same ordering as the old 8192/16 ring
+  #   --fan-in-min-corrs 60  = 15 of 16 corr nodes, as before
+  #   --n-sub 4, --combine-impl compact  (search_compute only)
+  #   --imager-uv-prescale 1/256  (search_compute only). The fp16
+  #                          irfft2 goes non-finite once an image pixel
+  #                          exceeds ~1.0 (unnormalised peak > 65504);
+  #                          at n_sub=4 an active uv cell sums ~19
+  #                          streams (7 at n_sub=1), so live noise sits
+  #                          at sigma ~0.064 and a pulse railed the
+  #                          detector (snr 254) from ~18 sigma. 1/256
+  #                          removes the overflow with no measurable
+  #                          loss (max err 0.05 sigma); Layer-1 re-
+  #                          estimates sigma, so snr is unchanged.
+  # recv_epoll.c must be rebuilt (MAX_CHGROUPS 16 -> 64). Revert = the
+  # 16 / 8192 / 5000 / 15 values and drop the two flags, on both sides.
+  - name: search_rx
+    cmd: python
+    # 2026-06-09: stagger spawn so search_rx finishes its 10.5 GiB
+    # rxring shm allocation before the search_compute halves race for
+    # CUDA pinned-host pages. Without this, n09 + n13 OOM'd at startup
+    # (n01 + n02 happened to win the race). 4 s is a touch longer than
+    # the observed shm-create + ring-attach time (~2.5 s).
+    spawn_delay_s: 4.0
+    args: >-
+      -u -m dsart.services.search_rx
+      --opoint ${opoint_id}
+      --port-base 6625 --n-ports 16
+      --so-rcvbuf-bytes 268435456
+      --shm-name /dsart-rxring-CN
+      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-T:owned-dms
+      --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
+      --bytes-per-cell X2TODO:WS-T:bits-per-value
+      --status-interval-s 5.0
+      --log-level INFO
+    # Hostargs lookup tries the FQDN first, then the bare short hostname
+    # (dsart_rt.py:571). In the production lab `socket.gethostname()`
+    # returns `lxd110h<NN>` (the kernel-level container name), NOT the
+    # operator-facing `n<NN>` alias. We list BOTH forms so the yaml
+    # works in either case — the lab one is the path that actually
+    # matches today (verified on n01.pro.pvt 2026-05-17, M7.2.8 prep);
+    # the `n<NN>` keys are kept as future-proofing in case a node ever
+    # gets its kernel hostname renamed to the short alias.
+    hostargs:
+      lxd110h01: --bind-host 10.41.0.205
+      lxd110h02: --bind-host 10.41.0.222
+      lxd110h09: --bind-host 10.41.0.253
+      lxd110h13: --bind-host 10.41.0.238
+      n01: --bind-host 10.41.0.205
+      n02: --bind-host 10.41.0.222
+      n09: --bind-host 10.41.0.253
+      n13: --bind-host 10.41.0.238
+
+  # M7.3 (2026-05-20): per-search-node owner overrides
+  # ---------------------------------------------------
+  # The ``--coarse-dm-owners-half-{0,1}`` defaults set in each
+  # ``search_compute_{0,1}`` routine's ``args:`` block are for the n01
+  # 16x1 case (owners=0,1). In the 16x4 production fan-out each of the
+  # four search nodes owns a different pair of coarse-DMs:
+  #   n01 → 0, 1   (default in args:, no override needed)
+  #   n02 → 2, 3
+  #   n09 → 4, 5
+  #   n13 → 6, 7
+  # We bolt those onto the per-routine ``args:`` lists via the routine
+  # hostargs maps below. ``argparse`` is last-wins for scalar
+  # ``--coarse-dm-owners-half-{0,1}``, so the routine-level defaults
+  # are silently overridden by the per-host entries here. ``dsart_rt``
+  # tries the FQDN-style key (``lxd110h<NN>``) first then the bare
+  # short hostname (``n<NN>``) — we list both so the config works
+  # whether ``socket.gethostname()`` returns the kernel-level
+  # container name or the operator alias.
+
+  # ---- search_compute x 2 (one per GPU half) -----------------------
+  # Both halves attach the SAME ring (read-only) and process the same
+  # cube slots, but each one runs the detector on a disjoint slice of
+  # fine-DM trials from the shared v2 DM plan. In M7.2-low on n01:
+  #   half 0 owns coarse_dm index 0  -> K=25 fine rows
+  #   half 1 owns coarse_dm index 1  -> K=25 fine rows
+  # (M7.2-high uses owners 6 and 7).
+  #
+  # K MUST equal --n-fdm and must equal N_fine / n_coarse for the
+  # deployed plan: _slice_owner_dm_grids raises
+  # "yields n_fdm=<k>, but --n-fdm=<n>" and the half never starts.
+  # 2026-09-23: 34 -> 25 with the 100-1500 plan (200 fine / 8 coarse).
+  #
+  # M7.2.8 flipped to PRODUCTION GPU op-point (user-clarified
+  # 2026-05-18): both halves pinned to cuda:0 / cuda:1,
+  # image_backend=gpu. The prior 89cb1bc commit had this on CPU with
+  # the comment "search nodes don't yet have a GPU pinned" — that was
+  # wrong; n01 (and the other 3 search nodes) each have 2 × RTX 2080 Ti
+  # (cuda:0, cuda:1, 11 GB each). The point of M7.2.8 is to verify the
+  # search-side GPU pipeline keeps real-time at production op-point on
+  # synthetic data, analogous to how M7.1 validated the corr-side
+  # GPU pipeline on dada_junkdb data.
+  #
+  # Production op-point:
+  #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan),
+  #   t_det=256, cube_cadence_samples=192
+  #     ⇒ search overlap = t_det - cube_cadence_samples = 64 samples
+  #       (= b_max, the minimum overlap that catches any pulse up to
+  #       64 samples wide straddling a cube boundary).
+  #   t_int_search_us=1048.576 (matches corr t_int_fast at 32x native)
+  #   ⇒ cube cadence = 192 * 1.048576 = 201.327 ms wall per cube.
+  #
+  # M7.7.4 (2026-06-06): rfft-imager (real-output FFT via
+  # conjugate-fold half-grid combine) is default-on in GpuImager and
+  # halves both the FFT cost and the uv-batch transient memory. That
+  # made the big-block op-point (cube_cadence_samples=192/t_det=256)
+  # fit comfortably on the 11 GiB 2080 Ti (was OOM at 192/256 before),
+  # and the n01 GPU1 speed gate clears the 201.3 ms budget by 17.6%
+  # (sustained 166 ms / cube, full 7-boxcar octave bank preserved).
+  # The prior op-point (t_det=192 / cube_cadence_samples=128) was 5.6%
+  # over the matching 134.2 ms RT budget — and was the trigger for the
+  # M7.7 optimisation work. Set DSART_IMAGER_RFFT=0 in env to force the
+  # legacy ifft2+.real path (in-binary A/B). M7.2 perf-gate finding —
+  # that t_det=192 saved ~35 ms vs t_det=256 — is superseded by rfft:
+  # at t_det=256 the imager substages are smaller than they were at
+  # t_det=192 pre-rfft.
+  #
+  # The two halves run as independent processes so a crash in one
+  # doesn't take down the other; dsart_rt restarts them on the
+  # `start` verb. Each writes its own stderr log under
+  # ~/tmp/dsart-rt/search_rt-<cn_id>-search_compute_{0,1}.log.
+  #
+  # M6 sub-systems (clusterer, cube_dump, udp_listener, cands_logger)
+  # are all gated OFF for M7.2 — they land in M7.3 along with the
+  # full 16x4 fleet bring-up.
+  # M7.2-amend (2026-05-20): turned ON ``--pipeline-overlap`` for both
+  # halves. The narrow-overlap path (prefetch cube N+1 onto a
+  # dedicated CUDA H2D stream while the imager+detector run cube N
+  # on the compute stream) hides the ~35 ms cint8 H2D (~420 MiB) +
+  # validity H2D under the GPU work. py-spy (2026-05-20) showed
+  # ``cint8_host_t.to(device)`` + the validity-mask sync barrier
+  # as the dominant per-cube wall-time at the 16x1 op-point AFTER
+  # the cint8-stack quantise bypass landed; without overlap the
+  # search node hit ~6.55 cubes/s vs the 7.45 cubes/s target. The
+  # bench (``bench/search_node_throughput.py``) has always used
+  # ``--pipeline-overlap`` so the GPU pipeline benchmark numbers
+  # (~105 ms p50 at production geometry) are an apples-to-apples
+  # match only when the prod service runs with it on too.
+  #
+  # M7.7 (2026-06-04) — symmetric-shift padding is ENABLED on both
+  # halves via ``--symmetric-shift-padding`` in the ``args: >-``
+  # blocks below. The per-chgroup stream is pre-padded with
+  # ``max(0, shifts.max())`` leading + ``max(0, -shifts.min())``
+  # trailing samples, giving the imager kernel in-range source rows
+  # for every (cube_t, fdm, g) tuple. Auto-disables the Layer-1
+  # coverage correction (cov ≡ 1) and re-enables the fused-imager
+  # Layer-1 fast path, recovering the ~96 ms / cube L1 regression
+  # introduced in M7.4.2 / 131ca41. T_stream grows 275 → 358 samples
+  # (~30 % H2D + ring-history bump); ~+86 MiB / cube ×
+  # cube_ring_depth=16 × 2 halves ≈ +2.7 GiB / search node. Pairs
+  # naturally with Option A; do NOT stack with
+  # ``--include-coarse-offset-in-search-shifts`` (which drives the
+  # shifts table to ±1400 samples and would balloon the pad).
+  #
+  # 2026-09-22 — ``--merge-coarse-rounding-in-search-shifts`` is
+  # ENABLED on both halves. The chain quantises a channel's arrival to
+  # a whole t_int sample THREE times: s1 per channel at the coarse DM
+  # (corr), then s2 per chgroup (corr, aligns the wire frame) and sf
+  # per chgroup (search, the fine residual). s2 and sf share the SAME
+  # coefficient and differ only in which DM they use, so they round
+  # the per-chgroup delay twice for nothing. With this flag the search
+  # side applies rint(Δτ(fine)/T) − rint(Δτ(coarse)/T) — a difference
+  # of two integers, so still a whole sample — making the TOTAL a
+  # single rounding at the fine DM. The corr node is untouched and the
+  # wire frame stays aligned, unlike the include_coarse_offset route
+  # to two roundings, which needs stage 2 switched off.
+  # Free: it is a table change, no extra compute. |new − old| ≤ 1
+  # sample so T_stream barely moves. Measured x1.026 recovered S/N at
+  # W ≤ 1 ms, x1.016 at 2 ms, at the production chan_sum_factor=8
+  # resolution (_inspect/sensitivity/csf8_remeasure.py). The MEAN
+  # improves but the worst-case DM is marginally worse (1 ms min
+  # 0.576 → 0.568) — two roundings sometimes cancel, one cannot.
+  # Requires t_int_corr_us == t_int_search_us, which holds here (both
+  # are t_int_fast_native × NATIVE_SAMPLE_US = 1048.576 µs);
+  # search_compute passes it and compute_time_shift_search RAISES if
+  # they ever diverge. To revert: delete the flag from both halves,
+  # re-push, restart. NOT YET EXERCISED ON SKY.
+  #
+  # CRITICAL: ``args: >-`` is a YAML folded scalar — DO NOT add
+  # ``#``-comments inside it; they become literal argv tokens
+  # (commit 14f0535 post-mortem). Keep both halves in lockstep when
+  # flipping this flag.
+  - name: search_compute_0
+    cmd: python
+    # 2026-06-09: stagger spawn so the second half (search_compute_1)
+    # doesn't race this one for CUDA pinned-host pages during pipeline
+    # build. Each half holds onto ~14 GiB of mlock'd pages once it's
+    # past the imager build; on a 93 GiB node both halves simultaneously
+    # demanding their pinned pool from cold OOM-killed n09 + n13 on
+    # 2026-06-09. 8 s is comfortably past the pinned-pool warmup but
+    # imperceptible vs the ~2.5 min total cold-start to first cube.
+    spawn_delay_s: 8.0
+    args: >-
+      -u -m dsart.services.search_compute
+      --opoint ${opoint_id}
+      --shm-name /dsart-rxring-CN
+      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-S:owned-dms
+      --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
+      --bytes-per-cell X2TODO:WS-T:bits-per-value
+      --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
+      --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
+      --t-int-search-us ${t_ext_us}
+      --dm-plan-path ${plan_path}
+      --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
+      --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
+      --coarse-dm-owners-half-0 ${owned_coarse_csv_h0}
+      --coarse-dm-owners-half-1 ${owned_coarse_csv_h1}
+      --gpu-half 0 --search-node-id CN
+      --device cuda:0 --image-backend gpu
+      --detector-streaming-tile-size 256
+      --detector-streaming-decoder-n-top 24
+      --detector-boxcar-accum-dtype fp16
+      --detector-layer2-max-samples 100000
+      --detector-k-img unit
+      --detector-k-dm d1
+      --detector-k-time X2TODO:WS-S:time-filters-width-cap-32
+      --layer1-max-samples 10000
+      X2TODO:WS-S:stage2-rounding-flag
+      --symmetric-shift-padding
+      --pipeline-overlap
+      --poll-interval-s 0.001
+      --max-cubes 0
+      --log-level INFO
+      --config-yaml /home/ubuntu/proj/dsa110-rt/configs/opoints/2x/dsart_search_rt.yaml
+      --enable-cube-dump
+      --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
+      --obs-dec-deg CUSTOMDEC
+      --kernel-support 1
+      --chan-sum-factor ${chan_sum_factor}
+      --cell-lambda-mode tee45
+      --n-sub ${n_sub}
+      --combine-impl X2TODO:WS-S:combine-impl
+      --imager-uv-prescale X2TODO:WS-S:image-units-prescale
+    hostargs:
+      # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
+      # per-host C1 trigger-listener bind addresses (M7.4). The
+      # ``--c1-bind-host`` arg is appended via argparse "last wins" so
+      # the per-host IPv4 takes precedence over the empty default in
+      # ``c1.dump_listener.bind_host`` below.
+      lxd110h01: --c1-bind-host 10.41.0.205
+      lxd110h02: --coarse-dm-owners-half-0 ${owned_coarse_csv_h2} --c1-bind-host 10.41.0.222
+      lxd110h09: --coarse-dm-owners-half-0 ${owned_coarse_csv_h4} --c1-bind-host 10.41.0.253
+      lxd110h13: --coarse-dm-owners-half-0 ${owned_coarse_csv_h6} --c1-bind-host 10.41.0.238
+      n01: --c1-bind-host 10.41.0.205
+      n02: --coarse-dm-owners-half-0 ${owned_coarse_csv_h2} --c1-bind-host 10.41.0.222
+      n09: --coarse-dm-owners-half-0 ${owned_coarse_csv_h4} --c1-bind-host 10.41.0.253
+      n13: --coarse-dm-owners-half-0 ${owned_coarse_csv_h6} --c1-bind-host 10.41.0.238
+    env:
+      # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
+      # always pass --device cuda:0 (the post-mask logical device).
+      # half 0 → physical GPU 0.
+      CUDA_VISIBLE_DEVICES: "0"
+      # M7.2-amend (2026-05-20): flip the cint8 + shift/calibration
+      # H2D copies in ``cube_pipeline._stage_h2d`` to ``non_blocking=
+      # True`` (the env knob gates ``copy_(..., non_blocking)`` on
+      # the cached GPU buffer). Without this, ``prefetch_build``
+      # still BLOCKS the CPU thread on the ~35 ms cint8 .to() even
+      # though the kernels themselves are issued on the dedicated
+      # prefetch CUDA stream, so the overlap window collapses to
+      # the imager/detector compute only. py-spy confirmed
+      # ``_stage_h2d`` line 614 as the CPU-side block. Enabling
+      # the env makes the H2D fully asynchronous on the prefetch
+      # stream, restoring the narrow-overlap window.
+      DSART_ENABLE_GPU_BUF_REUSE: "1"
+      # M7.4: tag cube-dump filenames so the two compute halves don't
+      # race-overwrite each other's ``cube_{cid:06d}.pt``.
+      DSART_M74_DUMP_TAG: "h0"
+      # M7.3 baseline RE-BENCH (2026-05-27): set DSART_DISABLE_SCATTER=
+      # "1" to force the M7.2 zero-stub validity path so we can confirm
+      # the non-scatter pipeline still hits 7.45 cubes/s with all the
+      # M7.4 C1/C2/Option-A bolt-ons. Leave at "0" for production.
+      DSART_DISABLE_SCATTER: "0"
+      # M7.4.1 GPU-scatter (2026-05-27): when set to "1", the CPU-side
+      # scatter writes the COMPACT ~30 MiB COO buffer instead of the
+      # ~565 MiB dense plane; the CubePipeline expands it GPU-side via
+      # gpu_scatter. Eliminates 565 MiB CPU memset + 565 MiB H2D per
+      # cube (the dominant bottleneck identified by the M7.4 diagnosis
+      # 2026-05-27: H2D=75 ms, ~50% of the 134 ms RT budget). Byte-
+      # identical dense plane vs the dense path (parity tested in
+      # tests/transport/test_recv_ring_assemble_compact.py). Flip to
+      # "0" to A/B the dense path on the same binary.
+      DSART_GPU_SCATTER: "1"
+
+  - name: search_compute_1
+    cmd: python
+    args: >-
+      -u -m dsart.services.search_compute
+      --opoint ${opoint_id}
+      --shm-name /dsart-rxring-CN
+      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-S:owned-dms
+      --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
+      --bytes-per-cell X2TODO:WS-T:bits-per-value
+      --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
+      --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
+      --t-int-search-us ${t_ext_us}
+      --dm-plan-path ${plan_path}
+      --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
+      --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
+      --coarse-dm-owners-half-0 ${owned_coarse_csv_h0}
+      --coarse-dm-owners-half-1 ${owned_coarse_csv_h1}
+      --gpu-half 1 --search-node-id CN
+      --device cuda:0 --image-backend gpu
+      --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
+      --obs-dec-deg CUSTOMDEC
+      --kernel-support 1
+      --chan-sum-factor ${chan_sum_factor}
+      --cell-lambda-mode tee45
+      --n-sub ${n_sub}
+      --combine-impl X2TODO:WS-S:combine-impl
+      --imager-uv-prescale X2TODO:WS-S:image-units-prescale
+      --detector-streaming-tile-size 256
+      --detector-streaming-decoder-n-top 24
+      --detector-boxcar-accum-dtype fp16
+      --detector-layer2-max-samples 100000
+      --detector-k-img unit
+      --detector-k-dm d1
+      --detector-k-time X2TODO:WS-S:time-filters-width-cap-32
+      --layer1-max-samples 10000
+      X2TODO:WS-S:stage2-rounding-flag
+      --symmetric-shift-padding
+      --pipeline-overlap
+      --poll-interval-s 0.001
+      --max-cubes 0
+      --log-level INFO
+      --config-yaml /home/ubuntu/proj/dsa110-rt/configs/opoints/2x/dsart_search_rt.yaml
+      --enable-cube-dump
+    hostargs:
+      lxd110h01: --c1-bind-host 10.41.0.205
+      lxd110h02: --coarse-dm-owners-half-1 ${owned_coarse_csv_h3} --c1-bind-host 10.41.0.222
+      lxd110h09: --coarse-dm-owners-half-1 ${owned_coarse_csv_h5} --c1-bind-host 10.41.0.253
+      lxd110h13: --coarse-dm-owners-half-1 ${owned_coarse_csv_h7} --c1-bind-host 10.41.0.238
+      n01: --c1-bind-host 10.41.0.205
+      n02: --coarse-dm-owners-half-1 ${owned_coarse_csv_h3} --c1-bind-host 10.41.0.222
+      n09: --coarse-dm-owners-half-1 ${owned_coarse_csv_h5} --c1-bind-host 10.41.0.253
+      n13: --coarse-dm-owners-half-1 ${owned_coarse_csv_h7} --c1-bind-host 10.41.0.238
+    env:
+      # half 1 → physical GPU 1 (logical cuda:0 inside this process).
+      CUDA_VISIBLE_DEVICES: "1"
+      # M7.2-amend (2026-05-20): see search_compute_0 for rationale.
+      DSART_ENABLE_GPU_BUF_REUSE: "1"
+      # M7.4: tag cube-dump filenames per-half to prevent collisions.
+      DSART_M74_DUMP_TAG: "h1"
+      # M7.3 baseline RE-BENCH (2026-05-27): see search_compute_0
+      # rationale. Set to "0" to restore the M7.4 active-scatter
+      # production path.
+      DSART_DISABLE_SCATTER: "0"
+      # M7.4.1 GPU-scatter (2026-05-27): see search_compute_0 for
+      # rationale + parity / perf evidence. Flip to "0" to A/B the
+      # M7.4 dense-CPU-scatter path on the same binary.
+      DSART_GPU_SCATTER: "1"
+
+# ---------------------------------------------------------------------------
+# M7.4 C1 stage config (locked schema; see docs/c1c2/C1C2_WIRE_SCHEMA.md §3
+# for the source-of-truth schema). Search-compute processes read this block
+# via the ``--config-yaml`` flag wired into each ``search_compute_{0,1}``
+# routine above. Bump this file's ``schema_version`` if you change the c1
+# block in a way that breaks the loader.
+#
+# Memory cost of the cube ring (per gpu_half):
+#   per cube = t_det * n_fdm * n_grid * n_grid * 2 bytes (fp16)
+#           = 192 * 34 * 256 * 256 * 2 = 855 MiB ≈ 0.8 GiB at the
+#             production op-point (NOT 3.2 GiB — the old figure was 4×
+#             too big; on-disk cube dumps are 855 MB). ``cube_ring_depth:
+#             16`` → ~12.8 GiB per half → ~25.6 GiB per search node.
+#             NOTE (2026-05-31): the real
+#             production search nodes have ~93 GiB RAM (NOT 256 GiB —
+#             an earlier comment here was wrong). The cube ring is
+#             torch pin_memory=True (shared-anon, shows in Shmem) and
+#             LAZILY allocated, so an over-large depth silently grows
+#             into swap and wedges the node. Keep
+#             ``cube_ring_depth * 0.8 GiB * 2 halves`` + the rxring
+#             (``t_buf_samples / 32768 * 39 GiB``) + ~8 GiB base
+#             comfortably under 93 GiB. Drop depth further during
+#             shake-down if pinned memory is constrained.
+# ---------------------------------------------------------------------------
+c1:
+  snr_min: 9.55                      # 2026-10-05: -1 sigma. -2 sigma (8.55) was TESTED on sky 06:25-07:4x and
+                                     # REVERTED: clean sky costs ~nothing (~1 cluster per 3-4 min in [8.55,9.55)),
+                                     # but the 07:16 narrow satellite comb exploded -- per 2 min at its peak 5,110
+                                     # clusters in [8.55,9.55) vs 3,359 in [9.55,10.55) and 675 above, C2's
+                                     # trailing-60 s count 4,947 (cluster_rate_max 400 => no dumps), and all 8
+                                     # halves C1-metering (which blocks the inject bot). Real time held (5.11-5.15
+                                     # cubes/s). Triggers start at 11 sigma, so the extra sigma buys nothing at the
+                                     # trigger; it only amplifies narrow RFI episodes.
+                                     # 2026-10-05: 10.55 → 9.55, a deliberate -1 sigma DETECTION cut (operator
+                                     # request). The C2 trigger is a separate, higher threshold (12 sigma, and
+                                     # 11 sigma for narrow w<=8 via faint_frb_extragalactic in
+                                     # c2_trigger_criteria.yaml), so this does not by itself raise the dump rate:
+                                     # it logs fainter candidates at C2 and lets a burst's fainter DM/width
+                                     # neighbours join its cluster. Measured 2026-10-03..05 at 10.55: the
+                                     # quiet-time tail is NON-Gaussian and steep (91 clusters in [11,11.5) vs
+                                     # 472 in [10.55,11) over 44 h), so expect roughly x10-25 more C1/C2 volume
+                                     # in quiet time -- C2 ingest handled 8.6k rows/min in floods with zero
+                                     # drops. The sigma-exclusion pairing below still holds: 9.55 here is 9.55 in
+                                     # true units. Revert = set back to 10.55 (search_compute restart).
+                                     # 2026-09-22: 11.0 → 10.55 is a NO-OP IN TRUE UNITS, not a threshold cut.
+                                     # The sensitivity audit found the image-plane edge mask MULTIPLIES 6.164% of
+                                     # every cube by zero, and those exact zeros were reaching sigma_clipped_std,
+                                     # dragging sigma 4.05% low and inflating every reported SNR by 4.2%
+                                     # (measured: sigma_clip 1.0074 with the masked cells in, 1.0499 with them out).
+                                     # So the nominal 11.0 threshold was really 11.0/1.042 = 10.55 in true units.
+                                     # Layer-1/Layer-2 now exclude masked cells (spatial_active), which removes the
+                                     # inflation — leaving snr_min at 11.0 would SILENTLY RAISE the real threshold
+                                     # from 10.55 to 11.0 and cost ~4.2% in threshold / ~6% in rate. 10.55 keeps the
+                                     # exact operating point and false-alarm rate the fleet has been running since
+                                     # 2026-06-14. TO REVERT THE SIGMA FIX AND THIS TOGETHER: set snr_min back to
+                                     # 11.0 (one line) — the two changes are a matched pair, never move one alone.
+                                     # 2026-06-14: lowered 12.0 → 11.0 to widen FRB sensitivity. The C2 rate
+                                     # limiter (60s/100-cluster window) + extragalactic dm_median≥115/snr≥12 +
+                                     # sidereal (l,m) registry veto now backstop the extra C1→C2 volume at 11σ.
+                                     # Watch C2 windowing lag + C1 emit drops during the post-change soak.
+                                     # Phase 6c (M7.4 commissioning): raised from 8.0 → 12.0 to suppress
+                                     # the persistent on-sky RFI floor that was generating ~6.8 cluster windows/s
+                                     # at C2 (10260 LOG / 25 min in the 2026-05-28 soak), with up to ~3300 cands per
+                                     # window from a stable RFI source at DM≈1655 pc/cc, snr_max≈12.92. That
+                                     # volume saturated the search→h23 C1 emit (n01-g0 dropped 99.8% of batches,
+                                     # total_dropped=7800/7815) and lagged C2 windowing by ~25s, so all dump
+                                     # triggers reached search nodes as ``too_late`` and zero cubes were dumped.
+                                     # 12.0 is consistent with the floor of the ``bright_galactic`` C2 trigger
+                                     # criterion, and on-sky injections (fluence ≥ 50 Jy·ms) will sit well above
+                                     # it. Lower back toward 8.0 for production once the RFI source is
+                                     # mitigated (NUMA-pinned imager / RFI mask refinement / Phase 6c.E zero-
+                                     # fill).
+                                     # Phase 1a FA reference: at 6σ we measured ~6 cands/cube/half on pure
+                                     # Gaussian, matching Q(6)~9.9e-10 × 6.4e9 trials = 6.3 cands/cube.
+                                     # Coverage correction is required for this to hold; see cube_pipeline.py
+                                     # M7.4.2 notes.
+  cube_ring_depth: 12                # 2026-06-09 second-pass tighten (after f0b8a26 depth=16):
+                                     #
+                                     # On the first restart with depth=16 only n01 + n02 came up; the
+                                     # n09 + n13 search_compute halves were OOM-killed during the
+                                     # startup transient (kernel dump: shmem-rss 41 GiB / half on
+                                     # n09, 7 s after spawn, while n01/n02 successfully reached
+                                     # steady state at ~35 GiB / half). Root cause is the CUDA
+                                     # pinned-host-memory caching allocator: it allocates in 2 GiB
+                                     # chunks (visible as `rw-s- zero (deleted)` regions in pmap),
+                                     # so depth=16's 17 GiB of fp16 slot data round up to ~22 GiB
+                                     # of pinned-pool chunks (11 × 2 GiB) per half. Combined with
+                                     # the 10.5 GiB rxring shm (mapped per-process, ~10 GiB shmem-rss
+                                     # contribution per half) the per-half RssShmem hits ~32 GiB =
+                                     # 64 GiB across both halves. n01 steady state shows only
+                                     # 7.8 GiB available — any startup transient (the two halves
+                                     # racing for pinned pages while search_rx tries to allocate
+                                     # the 10.5 GiB rxring shm) pushes past the cliff.
+                                     #
+                                     # depth=12: 12*1.067 = 12.8 GiB of slot data, rounds up to ~14
+                                     # GiB pool (7 × 2 GiB chunks). Per-half RssShmem ≈ 14 + 10.5 =
+                                     # 24.5 GiB → ~49 GiB pinned across both halves + 16 GiB
+                                     # per-process base = ~65 GiB out of 93 GiB → ~28 GiB headroom.
+                                     # Comfortably absorbs the startup race. Retention drops from
+                                     # 3.22 s (depth=16) to 12 × 0.201 s = 2.41 s. T5's
+                                     # BoundedCubeUploader (max_concurrent=1, queue_maxsize=8)
+                                     # bounds dump latency well under that; if `too_late` events
+                                     # recur in production, fix the upstream latency (drain queue,
+                                     # rsync stall) rather than re-grow the ring — re-growing
+                                     # forfeits the headroom that lets the halves co-spawn cleanly.
+  merger:
+    lm_max_cells: 5                  # user-locked production value (was 3); OR-mode half-window on (l, m) cells
+    dm_max_trials: 2                 # half-window on fine-DM index
+    t_frac: 1.0                      # |Δt| ≤ t_frac * 0.5 * (w_i + w_j) samples
+    # 2x: KEEP 16 (not 8). The merger multiplies its window by this, so 16
+    # holds the merge window constant in wall-clock time at 2x
+    # (detector/merger.py; downstream inventory finding 16).
+    sample_period_specnum: 16        # spec-nums per detector sample
+  c2_endpoint:
+    host: lxd110h23.pro.pvt          # FQDN (search nodes can't resolve bare 'lxd110h23')
+    port: 11500
+  emit_queue_depth: 16
+  # 2x: 32 T_ext samples = 16.8 ms, the same wall-clock cap as 16 x 1.05 ms at 1x.
+  max_c1c2_width_samples: 32         # M7.6: drop candidates wider than this (boxcar samples)
+                                     # BEFORE transmitting to C2. Wide boxcars (>=32) are the
+                                     # on-sky false-positive floor (2026-05-29 analysis: 95-100%
+                                     # of spurious-candidate volume at width>=32); capping at 16
+                                     # strips that floor while preserving genuine narrow FRBs,
+                                     # keeps the C2 coincidence peak_event_specnum on fresh cubes
+                                     # (fixes too_late dump misses), and unloads the C1->C2 path.
+                                     # Set to 0 / remove to disable the filter (ship every survivor).
+  max_c1c2_width_snr_escape: 20.0    # 2026-09-22 sensitivity audit: the width cap above is ABSOLUTE and is
+                                     # applied AFTER the cross-kernel merge, which keeps only the highest-SNR
+                                     # member of a detection neighbourhood. A W >~ 25 ms burst therefore peaks in
+                                     # a wide boxcar, wins the merge, and is then discarded outright — invisible
+                                     # AT ANY BRIGHTNESS. (Confirmed: width_max never exceeds 16 in 74813 archived
+                                     # C2 rows, with a 13.9% pile-up right at 16.) This lets a candidate wider
+                                     # than the cap through if it is at least this bright, so the cap keeps
+                                     # stripping the spurious floor while bright wide bursts survive.
+                                     # 20.0 is deliberately conservative: the worst sustained on-sky RFI floor on
+                                     # record (2026-05-28, DM~1655) topped out at snr_max 12.92, and 95-100% of
+                                     # spurious volume sat at width>=32, so 20.0 sits ~7 sigma clear of the floor
+                                     # while staying below the 35 sigma voltage-dump trigger. Escapes are still
+                                     # subject to max_candidates_per_block + the C2 60s/100-cluster rate limiter.
+                                     # TUNE IT WITH DATA, NOT GUESSES: the new per-half counters
+                                     # c1_cands_dropped_width_total / c1_cands_width_escaped_total are published
+                                     # to /mon/search_rt/<cn>/compute/<half> -> influx. If escapes are rare and
+                                     # clean after a soak, lower toward 15.0. Set to 0 / remove to disable the
+                                     # escape (restores the hard cap).
+  max_c1c2_width_escape_per_block: 1 # 2026-10-05 WIDE-ESCAPE GOVERNOR. The escape above was the door for the
+                                     # RFI / satellite-transit floods: over 2026-10-03..05, 8.5% of the time
+                                     # produced 99.4% of all C2 clusters, 91% of them b64 at a median 39 sigma
+                                     # (all above the 20 sigma escape) spanning a median 1243 pc/cm3 of DM and
+                                     # all 8 halves in 35% of cases. They recur ~4 min earlier each day
+                                     # (sidereal) and one drifted ~0.5 deg/min N-S in the ground-fixed (l,m)
+                                     # frame -- a GNSS satellite crossing the beam. Their volume tripped C2's
+                                     # cluster_rate_max 5.5% of the time, and while tripped NO dump can fire,
+                                     # so every FRB in that 5.5% was lost; without the >16 clusters the dead
+                                     # time is 0.44%. A real wide burst is ONE event (one escape, two if it
+                                     # straddles the cube overlap, sidelobes fainter than the main lobe); a
+                                     # flood is many per block for minutes. So: ship at most this many escapes
+                                     # per block (brightest first) and spend a per-half token bucket of
+                                     # _burst tokens refilled one per _refill_s. An isolated bright wide burst
+                                     # always ships; a flood becomes ~3/min/half within a second of onset.
+                                     # Counter: c1_cands_width_escape_throttled_total. 0/remove = disable.
+  max_c1c2_width_escape_burst: 3
+  max_c1c2_width_escape_refill_s: 20.0
+  max_candidates_per_block: 8        # M7.6 C1->C2 metering: cap candidates shipped per cube (block).
+                                     # When more than this survive the width cap in one cube, only the
+                                     # top-N are sent, ordered narrow-first (width asc) then bright-first
+                                     # (snr desc) -- e.g. if there are too many width-1/2 cands, keep the
+                                     # highest-SNR width-2 ones. Bounds the worst-case C1->C2 + C2 clustering
+                                     # load during RFI floods (the 2026-05-28 soak saw ~3300 cands/window
+                                     # lag C2 ~25s -> every dump trigger arrived too_late). With 8 halves x
+                                     # ~7.45 cubes/s ~= 60 batches/s into one C2, a cap of 8 bounds the fleet
+                                     # worst-case at ~480 rows/s while never biting normal load (a few
+                                     # cands/cube/half at snr_min) or a real burst (a handful of narrow
+                                     # cands near the peak). Per-half metering state is rolled up over 16
+                                     # blocks and published to /mon/search_rt/<cn>/compute/<half> -> influx
+                                     # -> grafana. Set to 0 / remove to disable (ship every survivor).
+                                     # RT-safe: selection is O(k log N) and skipped entirely under the cap.
+  snr_protected_slots: 2             # 2026-07-21 SNR-protected metering: reserve this many of the
+                                     # max_candidates_per_block slots for the top candidates by SNR ALONE
+                                     # (regardless of width); the rest are filled by the width-first
+                                     # heuristic above. Total kept never exceeds the cap. Fixes a silent
+                                     # eviction: width-ascending was the PRIMARY metering key and SNR only
+                                     # a within-width tie-break, so during a sidelobe/RFI storm >=8 narrow
+                                     # 11-16 sigma junk candidates unconditionally evicted a genuine width-4
+                                     # burst at 109.6 sigma (verified live -- the detector logged max_snr
+                                     # 109.62/150.62 but those candidates never reached the C2 coincidencer;
+                                     # a real bright FRB during an RFI storm would be lost the same way).
+                                     # Reserving 2 SNR-only slots guarantees the brightest few survive any
+                                     # width distribution while leaving the normal case (few cands/cube, or a
+                                     # genuine wide-junk storm) unchanged. 0 = exact pre-2026-07-21 behaviour.
+                                     # A rescue that displaces a heuristic pick is logged (INFO) for tracing.
+  dm_width_floor_frac: 0.6           # 2026-05-30 physical-plausibility filter: drop candidates whose
+                                     # boxcar width is below this fraction of the DM-smearing floor for
+                                     # their DM (intra-8ch-summed-channel dispersion smearing), using the
+                                     # ACTUAL per-cube sample period (prod t_int_search = 1048.576 us =>
+                                     # smear ~1.8 samples at DM2500). The search flooded C2 with field-
+                                     # filling, time-incoherent width-1 spikes at DM~2538 that matched
+                                     # bright_pulsar and drove a dump storm (-> GIL-starved C2, 34-min
+                                     # C1->C2 stall). At 0.6 a candidate is dropped when width < 0.6 x
+                                     # smear(DM): at prod cadence this sheds width-1 above DM~2330 (the
+                                     # clearly-unphysical set) while KEEPING width-2 high-DM detections
+                                     # (which are consistent with smearing there) and all low-DM narrow
+                                     # events (floor is sub-sample at low DM). Width alone is not a strong
+                                     # artifact discriminator at prod cadence -- the criteria + dump-rate
+                                     # cap do the heavy lifting; this is cheap defense-in-depth. 0=off.
+  noise_color_strength: 4.0          # 2026-06-02 DM-aware noise-color SNR de-rating. s13.1 (lxd110h13
+                                     # gpu_half=1, coarse-DM owner 7) emitted ~98% of all C2 candidates:
+                                     # steady single-half noise singles at DM>=2300, median SNR~13.8,
+                                     # width 2, saturating its C1 metering budget. Cause: the detector's
+                                     # sigma-clipped per-kernel sigma_k under-counts the true noise where
+                                     # the dedispersed series is correlated by intra-channel dispersion
+                                     # smearing (the clip rejects the correlation-broadened tail), so
+                                     # width-2 noise blobs at the highest DM (where smear~1.8 samples
+                                     # matches width-2) read 12-14 sigma. De-rates each candidate's SNR by
+                                     # 1 + strength*(color_factor-1) where color_factor =
+                                     # boxcar_noise_color_factor(dm_fine, width) at the per-cube sample
+                                     # period; survivors carry the corrected SNR downstream. Factor is 1.0
+                                     # at low DM and for width-1, so low/mid-DM and width-1 detections are
+                                     # PROVABLY untouched. strength=1.0 = full theoretical Gaussian-color
+                                     # correction (factor~1.20 at DM2538 width-2). 4.0 is calibrated so the
+                                     # observed median-13.8-sigma high-DM noise (applied factor ~1.8) drops
+                                     # below the 8-sigma floor; it compensates for the sigma-clip rejecting
+                                     # more tail than the pure-Gaussian model predicts. Cost: real high-DM
+                                     # width-2 bursts now need true SNR >= ~14.4 to survive (correct, given
+                                     # the smearing-aware noise scale). Tune vs the observed high-DM rate
+                                     # via the c1_cands_dropped_color mon-point. 0 / remove = disable.
+  noise_color_snr_floor: 8.0         # Drop candidates whose DE-RATED SNR falls below this (BEFORE the
+                                     # width cap + metering, so the freed budget goes to real candidates).
+                                     # Set to the detector emit threshold (detector.threshold_sigma=8.0):
+                                     # the de-rating re-applies the sigma-threshold against the corrected
+                                     # (smearing-aware) noise scale. Remove to keep every de-rated
+                                     # candidate (SNR corrected but nothing dropped on this account).
+  dump_listener:
+    bind_host: ""                    # filled per-host via --c1-bind-host above
+    base_port: 11227                 # actual port = base_port + gpu_half
+    # 2026-08-06: how long a ``too_early`` cube request (one naming a
+    # cube this half has NOT produced yet) is parked and retried
+    # against the advancing retention ring before it is written off as
+    # a miss. Since the c1_emit sender fix cut the C1->C2->request
+    # round trip to ~1 s, requests routinely arrive before the slower
+    # halves' frontiers, which sit 1-60 s behind the detecting half
+    # after a restart and never catch up (every half runs at
+    # ~realtime). Without this the halves logged a terminal miss
+    # seconds before they had the cube, events landed 4/8-5/8 cubes,
+    # and C2's all-or-nothing policy DISCARDed the whole event dir.
+    # 120 s covers the observed spread with margin; the ring passes
+    # over every specnum, so a parked request either fulfils or the
+    # fleet is genuinely wedged. 0 = old terminal-miss behaviour.
+    # ``too_late`` requests are never retried (the data is gone).
+    too_early_retry_timeout_s: 120.0
+  dump_root: /home/ubuntu/data/c2/cube_dump
+  uploader:
+    remote_root: ubuntu@lxd110h23.pro.pvt:/dataz/dsa110/candidates   # FQDN: search nodes can't resolve bare 'lxd110h23'
+    bandwidth_limit_kbps: 0          # 0 = unlimited
+    # T5 (2026-06-07): per-process upload concurrency cap. Each search
+    # half spawns one rsync per cube_dump completion; without a cap,
+    # 4 nodes × 2 halves × C2's worst-case 6-events/60-s window can
+    # put 48 concurrent rsyncs on the corr-net, starving SNAP ingress
+    # and feeding back into σ_k inflation (the closed-loop failure
+    # mode behind the 2026-06-07 search-side detector freezes). The
+    # bounded uploader holds at most ``max_concurrent`` simultaneous
+    # rsyncs per half (=> fleet-wide 8 concurrent at default 1) and
+    # queues the rest up to ``queue_maxsize`` (oldest-evicting on a
+    # full queue, so newer events are preferred during sustained
+    # backlog).
+    max_concurrent: 1
+    queue_maxsize: 8
+    # 2026-07-19 disk-full incident: staged cubes were never deleted
+    # anywhere, so ~2.2 GB/event/node accumulated until all four
+    # search nodes hit 100% root disk (~285 GB each in cube_dump).
+    # With this ON each half deletes ITS OWN NPZs after a verified
+    # (rc==0) rsync to h23 and stamps UPLOAD_OK into upload.log.
+    delete_after_upload: true
+  # 2026-07-19: last-resort retention backstop over dump_root — bounds
+  # the staging dir by age and size even when uploads fail (h23 down,
+  # network out) or events never get an archive dir (C2
+  # events_incomplete_discarded). Uploaded dirs are sacrificed first
+  # under the size cap; un-uploaded dirs only if that isn't enough
+  # (loud warning — those cubes exist nowhere else). Runs in both
+  # halves with an flock so passes never overlap. Default-enabled
+  # whenever c1.dump_root is set; enabled: false opts out.
+  retention:
+    enabled: true
+    max_age_h: 96          # 4 days: outlast a weekend h23/network outage
+    max_total_gb: 150      # sweep trigger (disk is 469 GB, shared with /)
+    low_water_gb: 120      # sweep target
+    tmp_age_h: 2           # *.tmp / 0-byte NPZ hygiene age
+    sweep_interval_s: 600
+  # 2026-07-21 proactive cube staging for bright candidates.
+  #
+  # The C2-triggered cube dump can only pull a cube while it is still in
+  # the search node's CPU retention ring (cube_ring_depth cubes). Measured
+  # live 2026-07-21, the burst->C2-dump-request round trip is 7.8-9 s
+  # (detect ~1.3 s + cube pipeline + C1 batch emit + C2 ingest + cluster
+  # eval + broadcast) while the ring window is only ~6.5 s -- a STRUCTURAL
+  # deficit. That night three consecutive bright triggers were lost as
+  # ``too_late`` misses: 260721upyy (101.8 sigma, 22:15:36, missed by
+  # ~1.3 s), 260721kfrt (22:22:22), 260721ypdw (22:29:38).
+  #
+  # The search node already has the detection cube locally the moment the
+  # detector fires. When a cube's peak candidate SNR clears snr_threshold
+  # we stage it to disk NOW under a provisional pending_g<half>_<specnum>/
+  # dir (no event name exists yet). If the C2 dump request for that
+  # specnum later arrives too_late for the live ring, the trigger listener
+  # CLAIMS the staged copy -- renaming it into <event_name>/ and firing
+  # the uploader -- turning the miss into a successful dump. If the ring
+  # still has the cube, the live-ring dump wins and the staged copy is
+  # dropped. The NPZ write reuses the same non-blocking CubeDumpWriter
+  # queue as the udp/auto dumps, so the hot loop never stalls.
+  proactive_stage:
+    enabled: true
+    snr_threshold: 50.0    # per-cube peak candidate SNR (sigma) that arms a
+                           # stage. Well above the C1 emit floor (snr_min 9.55)
+                           # and the RFI singles floor, so only genuinely
+                           # bright cubes stage; 260721upyy at 101.8 sigma is
+                           # ~2x this. Lower only if bright FRBs are still
+                           # being missed AND the pending budget/disk allow.
+    max_pending: 4         # LRU budget of concurrently-staged (unclaimed)
+                           # windows per half; oldest evicted (its pending
+                           # dir removed) when a new stage would exceed it.
+                           # Bounds staged footprint at ~4 x 1.1 GiB/half so
+                           # an RFI storm can't fill the disk.
+    min_interval_s: 2.0    # minimum wall gap between two stages on one half
+                           # (throttles a bright RFI run staging back-to-back).
+    ttl_s: 600.0           # unclaimed pending dirs older than this are GC'd
+                           # (a real C2 request lands within ~10 s; 600 s is a
+                           # generous backstop before the retention sweeper).
+
+# Cube geometry knobs shared with the merger block. The merger reads
+# ``cube.sample_period_specnum`` as the default for
+# ``merger.sample_period_specnum`` when the latter is omitted.
+# --- cube-dump writer -------------------------------------------------
+cube_dump:
+  # 2026-08-06: writer queue depth between the dispatch path and the
+  # single cube-dump writer thread. This is a MEMORY budget, not a
+  # tuning knob -- each slot pins a whole [256, 34, 256, 256] float16
+  # cube, ~1.1 GiB, so depth 4 is already ~4.4 GiB per half and there
+  # are two halves per node. Do not raise it to chase drops.
+  #
+  # Drops are bursty, not steady: on 2026-08-06 every half sat pinned at
+  # depth 4 through the 08:00-10:10 window (the dashboard injection
+  # ladder spraying sidelobe candidates fleet-wide, then the restart)
+  # and shed hundreds of requests, while the rest of the day and every
+  # window since the 10:12 restart drop nothing and peak at depth 2.
+  #
+  # What was wrong was not the depth but WHICH request lost. put_nowait
+  # dropped the arrival, so a ``udp`` dump -- one that had already been
+  # through C1 -> C2 coincidence and survived cross-node vetoes -- could
+  # be discarded to keep four unvetted local ``auto`` bright-pulse
+  # cubes. The writer now displaces the oldest strictly-lower-value
+  # queued dump instead, releasing its ring pin, and reports the split
+  # as cube_dump_n_displaced (a subset of cube_dump_n_dropped). Watch
+  # the two together: displacements mean the queue is doing its job,
+  # plain drops with a udp arrival mean it is genuinely oversubscribed.
+  queue_maxsize: 4
+
+cube:
+  sample_period_specnum: 16
+
+# M7.4 burst-replay noise knobs.
+#
+# layer1_n_burnin_cubes: 1 means each cube's sigma comes from that
+#   cube alone (no cross-cube median ring) — safest for short replays
+#   (<<5 cubes pre-burst) where the default 5-cube median would be
+#   contaminated by the burst itself.
+#
+# layer1_sigma_floor: 5e-3 clamps the per-fdm sigma from below.
+#   Without the floor, the static-sky-EMA-warmup transient drives
+#   sigma to ~1e-4 (200x below the steady-state noise floor) on
+#   cubes 1-2 of a fresh start, producing 10^5-sigma false-positive
+#   detections everywhere. 5e-3 sits between the warmup transient
+#   sigma and the steady-state floor (~2e-2) and was empirically
+#   validated against the 250924mptq replay; tune by inspecting
+#   /tmp/m74_diag/fig1_l1_sigma_evolution.png.
+noise:
+  layer1_n_burnin_cubes: 1
+  layer1_sigma_floor: 5.0e-3
+
+# M7.4 hardening: Layer-2 σ_k EMA tuning. The 250924mptq replay surfaced
+# a node-specific σ_k snowball (n02 SNR ~ 4.7e4) when σ_k was depressed
+# by sparse-valid cubes. The detector also rejected ALL updates under
+# the legacy strict 100%-valid gate, which left σ_k pinned at the seed
+# on most nodes and let inter-node luck dominate.
+#
+# Wired knobs (read by ``_build_search_config_from_yaml`` → forwarded
+# to ``DeterministicDetector``):
+#   layer2_valid_min_fraction: allow σ_k updates when ≥ this fraction
+#       of (T_det, N_fdm) cells are valid. 1.0 = legacy strict gate;
+#       0.95 reflects field-typical UV-cell flagging.
+#   layer2_sigma_floor: clamp σ_k from below after every update so
+#       a pathological cube can never depress the divisor enough to
+#       blow up SNR. Tune from the offline σ_k calibration bench;
+#       0.0 disables the clamp (preserves bit-for-bit legacy).
+#   cube_cadence_s / layer2_tau_s / layer2_n_burnin: omit to use the
+#       detector defaults (production-tuned). Override to shorten
+#       burn-in on short replays.
+detector:
+  # Production: require ≥ 90 % of (T_det, N_fdm) cells valid before
+  # updating Layer-2 σ_k. Drop to 0.0 only when running the M7.4
+  # synth_fada noise test (the slow synth-side cadence keeps the
+  # validity mask sparse, but the underlying noise statistics are
+  # still gaussian, so we want σ_k to keep learning).
+  layer2_valid_min_fraction: 0.9
+  layer2_sigma_floor: 0.5
+  # T1 (2026-06-07): per-kernel upper-bound clamp on the σ_k EMA
+  # update. Without it, a single high-energy cube (bright RFI, an
+  # over-fluence calibration probe, a merger glitch) inflates σ_k
+  # and the τ_s≈30 s relaxation suppresses every detection on that
+  # half for ~30 s — the "candidate counter freeze" failure mode
+  # observed 2026-06-07 after a dump-storm + manual cal-probe
+  # burst. With sigma_max_ratio=4.0 the post-EMA σ_k can never
+  # rise more than 4× above the previous cube's value (offending
+  # kernels' updates are rejected; n_clamped_high counter rolls
+  # up to /mon/search_rt/<cn>/noise/<g>). Bounds the freeze
+  # duration after an anomalous cube to a single sample. Set to
+  # 0.0 to disable (preserve bit-for-bit legacy behaviour).
+  layer2_sigma_max_ratio: 4.0
+  # 2026-06-09: σ_k clamp ESCAPE HATCH. The bare T1 clamp deadlocks
+  # when the noise level legitimately rises > sigma_max_ratio × s_k:
+  # every subsequent update is rejected, σ_k stays stuck low, SNRs
+  # are inflated against the wrong divisor, and the affected kernels
+  # flood C2 with junk candidates (observed live 2026-06-09 as
+  # n_clamped_high incrementing on every cube for hours on 2 of 7
+  # kernels). With clamp_escape_cubes=64, a kernel clamped for 64
+  # CONSECUTIVE cubes (~8.6 s at 134 ms cadence) rebaselines: σ_k
+  # jumps to the live estimate on the 65th cube. Transients (cal
+  # probes, dump storms, RFI bursts < ~8.6 s) are still fully
+  # clamped, preserving the T1 protection. Counters roll up to
+  # /mon/search_rt/<cn>/noise/<g> (n_clamp_escapes_total,
+  # clamp_streak_max). 0 disables (bare-clamp legacy).
+  layer2_clamp_escape_cubes: 64
+  # 2026-06-10: bright-burst / fp16-overflow hardening. Very bright
+  # bursts (probes ≳1.4e-3 Jy·ms, peak ≳35σ) overflow the cuFFT-cfp16
+  # butterflies → ±inf → rewritten to ±60000 by the post-imager
+  # nan_to_num. The detector's boxcar stages then SUM those cells:
+  # 4 × 60000 = 240000 → fp16 inf in the score tensor, and the DM-axis
+  # boxcar computes inf − inf = NaN — the burst (and its whole tile)
+  # silently VANISHES instead of being reported. This clamp bounds the
+  # σ-normalised cube to ±250σ right before Detector.forward(), so the
+  # worst-case boxcar sum (250 × 64 × 3 = 48000) stays finite in fp16
+  # and a >250σ burst degrades to a saturated-but-reported candidate.
+  # Costs one in-place full-cube pass (~4-6 ms/cube). 0 disables.
+  # 2026-07-22: the SNR-linearity regime (uv prescale 1/256, clip
+  # 1000→300, ÷256 sigma floors; 3a5b8db + f0eccd9) was reverted after
+  # it proved to be the cause of the bright_frb_extragalactic RFI dump
+  # storm (0 → 60-480 triggers/day from first light 07-20 19:00 UT,
+  # criteria unchanged). Re-landing it needs an RFI-robustness plan.
+  input_clip_sigma: 250.0
+  # cube_cadence_s: 0.13421772
+  # layer2_tau_s: 30.0
+  # layer2_n_burnin: 8
+
+# Legacy clusterer / cands_logger gating. M7.4 production runs with C1
+# emit replacing per-node clustering — leave this False unless an offline
+# tool wants T1/T2 ASCII rows from a replay bench.
+enable_legacy_clusterer: false
+
+# ---------------------------------------------------------------------------
+# M7.4 C2 (h23 coincidencer) config (locked schema; see
+# docs/c1c2/C1C2_WIRE_SCHEMA.md §3 for the source-of-truth schema and
+# docs/c1c2/C1C2_DESIGN.md §3 for the runtime semantics). Read by
+# ``src/dsart/services/coincidencer.py`` via ``CoincidencerConfig.from_yaml``.
+#
+# The C2 service lives only on h23 — search nodes load this file via
+# ``--config-yaml`` for the c1: block above and ignore coinc:.
+# ---------------------------------------------------------------------------
+coinc:
+  # 2x (SPEC §9 / downstream inventory §3.5): C2 never discards an event
+  # (1x keeps `discard` until the user signs off at O2), and waits
+  # cutout.wait_s for the per-half cutouts; halves report status to
+  # status_port.
+  partial_event_policy: archive
+  cutout:
+    wait_s: 120
+    status_port: 11501
+  bind:
+    host: "0.0.0.0"
+    port: 11500                    # mirrors c1.c2_endpoint.port
+  window_s: 5.0                    # rolling buffer time depth
+  # 2026-07-21 C2 drain-collapse guard. The receiver now enqueues each C1
+  # batch onto a bounded in-process queue drained by a dedicated worker,
+  # instead of processing it inline on the socket-reader coroutine. This
+  # keeps the TCP sockets draining at line rate during candidate storms
+  # (bright-burst sidelobes / RFI floods) so the search-side c1_emit does
+  # NOT backpressure-drop whole batches. Incident: on 2026-07-21T20:36:55Z
+  # a 112.75-sigma injection's primary batch was dropped by c1_emit's
+  # outbound queue while C2 was wedged in the old O(N^2) inline age-out.
+  ingest_queue_depth: 512          # max C1 batches buffered before C2 must drop.
+                                   # On overflow, drops are counted (counters.ingest_batches_dropped),
+                                   # rate-limited WARNING-logged, and governed by top-N-by-max-SNR
+                                   # admission (see priority_snr). ~512 batches ~= 100 s at 5/s/half.
+  priority_snr: 30.0               # a batch whose max candidate SNR >= this is never dropped in favour
+                                   # of a dimmer queued batch (the lowest-max-SNR queued batch is evicted
+                                   # instead). A dropped batch above this threshold logs at ERROR every time.
+                                   # ALSO the threshold for the late-priority rescue below.
+  rescue_late_priority: true       # 2026-07-21 last silent-loss path. A C1 row whose mjd is already
+                                   # below the window cutoff on arrival was inserted then immediately aged
+                                   # out ("late arrival") and NEVER graph-added: the inject matcher still
+                                   # ran on it (so a MATCH was logged) but it could never cluster or trigger
+                                   # -- a SILENT loss (rows_late_drop counter only). Incident: le_w64_r3
+                                   # 111.75-sigma injection at 21:05 UT was matched but never clustered
+                                   # because a transient C2 event-loop stall (in-process plotter waterfall
+                                   # reduce, ~20s) burst-drained the sockets per-connection, advancing the
+                                   # window anchor before the primary's batch processed, so it landed >5s
+                                   # (window_s) behind the cutoff. When true, a late arrival with SNR >=
+                                   # priority_snr is re-admitted to the window with its mjd clamped to the
+                                   # cutoff (tail-extended, anchor untouched) and graph-added, so it is still
+                                   # clustered + can trigger a dump (counter rows_late_rescued). Dim late
+                                   # arrivals are dropped as before. Every late drop of a >= priority_snr row
+                                   # is WARNING-logged either way (never silent). false = exact pre-2026-07-21
+                                   # behaviour. NB the search-side plotter-blocks-the-loop stall that CAUSES
+                                   # the burst is a separate follow-up (owned by the plotter/search side).
+  csv_retention_hours: 48
+  csv_dir_c1: /dataz/dsa110/operations/C1/cluster_output
+  csv_dir_c2: /dataz/dsa110/operations/C2/cluster_output
+  write_c1_csv: false                # M7.6: per-candidate C1 hiplot CSV is opt-in. Off by default
+                                     # (every received candidate incl. late arrivals -> large + rarely
+                                     # useful). C2 cluster rows + the rolling 24h view below are the
+                                     # operator-facing hiplot surfaces. Flip true for C1 debugging.
+  c2_rolling_window_hours: 24        # M7.6: maintain a single c2_last24h.csv (concatenation of the recent
+                                     # hourly C2 CSVs) so the C2 hiplot always shows ~the last day in one
+                                     # experiment. Regenerated each housekeep tick. 0 disables.
+  event_archive_root: /dataz/dsa110/candidates
+  # Array pointing declination key, snapshotted into every event's
+  # Level3 c2.pointing_dec_deg at archive time so a historical event's
+  # absolute RA/Dec is recoverable (the l/m image offsets are relative
+  # to this pointing, and the live key has no history). Same key C3
+  # reads for the bbproc beamform (c3.filterbank.dec_key) — keep aligned.
+  pointing_dec_etcd_key: /mon/array/dec
+  trigger_criteria_path: /home/ubuntu/vikram/dev/dsa110-rt/configs/opoints/2x/c2_trigger_criteria.yaml
+  dump_broadcast:
+    port_base: 11227               # actual port = port_base + gpu_half
+    hosts:
+      # (search_node_id, ipv4) — must match the per-host bind addresses
+      # in the search_compute_{0,1} routines above so the UDP triggers
+      # land on the C1TriggerListener's bound socket.
+      "1": "10.41.0.205"           # n01 / lxd110h01
+      "2": "10.41.0.222"           # n02 / lxd110h02
+      "9": "10.41.0.253"           # n09 / lxd110h09
+      "13": "10.41.0.238"          # n13 / lxd110h13
+  # M8 voltage-dump broadcast to the 16 corr nodes (corr-net 10.41.0.x —
+  # the same data NIC C2 already reaches for the cube dump_broadcast).
+  # One UDP packet per corr node, DUMP_VOLTAGE flag, port 11229 (matches
+  # the voltage_retention routine's --bind-port in dsart_pipeline_rt.yaml).
+  # Keyed by cn_id (3..22, skipping 9/13/17/20 — corr_topology.py); the
+  # packet payload is host-agnostic (event_specnum + mjd_target only), so
+  # each corr listener maps the shared specnum to its own block locally.
+  #
+  # GATED: this broadcast fires only when /cmd/c2/voltages_enabled is true
+  # (default OFF — voltage dumps are ~103 GiB/event) AND the event is not
+  # an injection. Leave `hosts` empty to disable the voltage path entirely
+  # (no VoltageBroadcaster is constructed).
+  voltage_broadcast:
+    port: 11229
+    enabled_key: "/cmd/c2/voltages_enabled"
+    hosts:
+      "3": "10.41.0.224"           # n03 / lxd110h03 / chgroup 0
+      "4": "10.41.0.138"           # n04 / lxd110h04 / chgroup 1
+      "5": "10.41.0.206"           # n05 / lxd110h05 / chgroup 2
+      "6": "10.41.0.203"           # n06 / lxd110h06 / chgroup 3
+      "7": "10.41.0.208"           # n07 / lxd110h07 / chgroup 4
+      "8": "10.41.0.209"           # n08 / lxd110h08 / chgroup 5
+      "10": "10.41.0.211"          # n10 / lxd110h10 / chgroup 6
+      "11": "10.41.0.216"          # n11 / lxd110h11 / chgroup 7
+      "12": "10.41.0.218"          # n12 / lxd110h12 / chgroup 8
+      "14": "10.41.0.212"          # n14 / lxd110h14 / chgroup 9
+      "15": "10.41.0.223"          # n15 / lxd110h15 / chgroup 10
+      "16": "10.41.0.220"          # n16 / lxd110h16 / chgroup 11
+      "18": "10.41.0.228"          # n18 / lxd110h18 / chgroup 12
+      "19": "10.41.0.227"          # n19 / lxd110h19 / chgroup 13
+      "21": "10.41.0.250"          # n21 / lxd110h21 / chgroup 14
+      "22": "10.41.0.233"          # n22 / lxd110h22 / chgroup 15
+  plotter:
+    n_workers: 2
+    per_event_timeout_s: 30.0
+    use_process_pool: true           # 2026-05-30 resilience: render plots in a separate PROCESS, not a
+                                     # thread. Cubes (~855 MB) + matplotlib are GIL-heavy; in a thread they
+                                     # serialise against C2's single asyncio loop and can starve the C1
+                                     # receiver (observed: a dump storm wedged the loop ~34 min, flatlining
+                                     # C1->C2). A process pool isolates that CPU/IO. false = legacy threads.
+  dump_rate_max_per_window: 6        # 2026-05-30 resilience: max full-fleet dump broadcasts per rolling
+  dump_rate_window_s: 60.0           # window. Bounds a cube-dump storm from a single persistently-noisy
+                                     # source regardless of candidate volume (the proximate cause of the C2
+                                     # stall). Audit trail is still written for capped events; only the UDP
+                                     # fan-out + plot scheduling are skipped. Set max=0 to disable the cap.
+  # 2026-07-17 RFI-storm guard headroom. The code default (100/60 s)
+  # is saturated by the nightly B1933+16 transit (~170-190 evaluated
+  # clusters/60 s at DM~158 for ~16 min), which suppressed EVERY
+  # dump-class trigger during the transit — including an unrelated
+  # 12.4-sigma DM-439 extragalactic candidate on 2026-07-17. 400/60 s
+  # is ~2x the observed transit peak. Dump volume stays bounded by
+  # dump_rate_max_per_window, per-class holdoffs, and the DM-comb +
+  # sidereal vetoes, so the storm guard is a last-resort backstop and
+  # can afford the headroom.
+  cluster_rate_max: 400
+  # 2026-06-15 broadband-RFI ("DM comb") veto. An impulsive terrestrial signal deposits power at every
+  # dispersion delay -> many trial DMs fire at the SAME (l,m)+time; the time-only clusterer splits the
+  # non-adjacent firing trials into several co-located clusters, so the per-cluster dm_iqr cap never sees
+  # the full spread. At dump time C2 scans the clusters in the window: if >= min_clusters sit within
+  # lm_tol_arcsec (box) and dt_s of the candidate AND their DM span exceeds dm_span_min_pc_cc, the dump is
+  # suppressed (holdoff rolled back). A single-DM repeater (pulsar) is safe -> its clusters share ~one DM.
+  dm_comb_veto_enabled: true
+  dm_comb_lm_tol_arcsec: 90.0        # 2 px at the 45" Tee image scale (matches the sidereal veto tol)
+  dm_comb_dt_s: 2.0                  # max time separation of comb fragments
+  dm_comb_min_clusters: 3            # >= this many co-located clusters to call it a comb (0 disables)
+  dm_comb_dm_span_min_pc_cc: 300.0   # required DM span (max-min) across the co-located clusters
+  # Event-name allocator (event.names + etcd /mon/corr/1/trigger):
+  etcd_lastname_key: "/mon/corr/1/trigger"
+  event_pkg_path: "/home/ubuntu/proj/dsa110-shell/dsa110-event"
+  name_allocator_offline: false    # flip true on dev hosts w/o etcd
+  # Plot dispatcher: wait for all 8 cubes or this many seconds, then plot.
+  # 2026-07-21: raised 60 -> 360. Cube rsync (2.3 GB/node -> /dataz NFS)
+  # measured ~4 min under load (voltage-dump collection + C3 catch-up);
+  # every trigger since 21:41 UT hit the 60 s deadline and was discarded
+  # 0/8 with its late-landing cubes deleted (le_w64_r4 103-sigma incl.).
+  plot_cube_wait_s: 360.0
+  plot_dispatch_poll_s: 5.0
+  plot_expected_cube_count: 8
+  # Mon-points export (every coinc.mon_publish_interval_s seconds):
+  mon_etcd_key: "/mon/c2/h23"
+  mon_publish_interval_s: 5.0
+
+# ---------------------------------------------------------------------------
+# M8 C3 (h23 voltage-dump collector + cube veto) config. Read by
+# ``src/dsart/services/c3.py`` via ``C3Config.from_yaml`` (defaults to this
+# file). C3 is the dsa110-rt replacement for legacy ``dsa110-T3``: it
+# watches the candidate archive C2 writes, runs the cube-morphology veto,
+# and for KEEP events rsyncs the 16 per-corr voltage fragments into the
+# candidate dir; for REJECT events it conservatively cleans up (delete
+# staged voltages + bulky cubes, MOVE metadata/plots to candidates_rejected).
+#
+# corr_nodes is keyed by CHGROUP (0..15) — the fragment identity the corr
+# voltage_retention service stages by. ssh_host is the br1 name C3 rsyncs
+# over (n<NN>.pro.pvt); udp_ip is the corr-net 10.41.0.x address C3 sends
+# the DELETE signal to (must match coinc.voltage_broadcast.hosts above).
+# ---------------------------------------------------------------------------
+c3:
+  archive_root: /dataz/dsa110/candidates
+  rejected_root: /dataz/dsa110/candidates_rejected
+  state_path: /dataz/dsa110/operations/c3/c3_state.json
+  # Durable fired-injection log (written by the dashboard at arm time).
+  # Registry-independent backstop so C3 exempts injections the live C2
+  # matcher missed at fire time. Empty string disables the fallback.
+  fired_injection_log: /dataz/dsa110/operations/inject/fired_injections.jsonl
+  staging_dir: /home/ubuntu/data/voltage_staging
+  voltage_port: 11229
+  expected_cube_count: 8
+  scan_interval_s: 10.0
+  # ---- bbproc coherent filterbank per KEEP event (2026-07-15) ----------
+  # After fragment collection C3 snapshots the newest complete
+  # per-subband cal set into <cand>/filterbank/cal/, then runs the
+  # dsa110-bbproc toolkit (coherent core-antenna beamform toward the
+  # cluster's (l_median, m_median)) and tools/plot_fil.py, writing
+  # <cand>/filterbank/<event>[_rfi].{fil,png} + filterbank.json
+  # provenance. Runs synchronously inside the scan loop -> events are
+  # processed strictly one after another (no GPU/disk contention).
+  filterbank:
+    enabled: true
+    toolkit_bin: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/toolkit
+    plot_script: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/tools/plot_fil.py
+    core_antennas: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/config/core_antennas.txt
+    cal_applied_dir: /dataz/dsa110/operations/beamformer_weights/applied
+    gpu: 0
+    tscrunch: 8                      # 262 us .fil samples
+    rfi_mode: both                   # unflagged + SK-flagged versions
+    phase_only: true                 # match the realtime cal convention
+    timeout_s: 1800.0
+  # ---- correlator-HDF5 calibration archive (2026-07-15) ----------------
+  # T3 link_hdf5_files equivalent: when a KEEP carries voltages, C3
+  # hard-links the +-2 h correlator UVH5 window into <cand>/calibration/
+  # (zero disk cost; survives the 3.5-day delete_level1_data cron).
+  # The +2h half doesn't exist yet at KEEP time, so C3 re-runs the
+  # (idempotent) link pass after window end + settle_s.
+  cal_hdf5:
+    enabled: true
+    hours_each_side: 2.0
+    correlator_dir: /dataz/dsa110/operations/correlator
+    dest_subdir: calibration
+    settle_s: 600.0
+    max_late_s: 7200.0
+  slack:            # C3 KEEP notifications -> Slack (best-effort; token from token_file, falls back to env SLACK_TOKEN_DSA)
+    enabled: true
+    channel: "C01NUV2M0HM"
+    token_file: "/home/ubuntu/.config/slack_api_dsa110"   # dedicated dsa110candidates bot, created 2026-07-23; legacy candplotter file (/home/ubuntu/.config/slack_api) kept as fallback reference, no longer read by default
+    token_env: "SLACK_TOKEN_DSA"                   # fallback if token_file is unset/unreadable
+    timeout_s: 10.0
+    upload_plot: true
+    card: true
+    plot_wait_s: 300.0   # readiness gate: wait until the event is complete as the dashboard counts it (plots 4/4 AND cubes 8/8) before posting the card — KEEP typically lands ~1 min before Level2/plots/ (first live post 260723pllz 2026-07-23 went out all-placeholders without this). Bounded fail-open: on timeout post with what exists; 0 disables
+    plot_poll_s: 5.0
+    expected_cubes: 8    # "cubes 8/8" half of the readiness gate (mirrors c3.expected_cube_count)
+    dashboard_base_url: "http://localhost:5778"   # dsa_monitor web UI; KEEP messages link to /bursts/<name> (verified tools/dashboard/dsa_monitor/app.py:823-824); localhost assumes the reader's normal SSH port-forward to h23
+    post_map_db: "~/.dsa_monitor/slack_candidate_posts.db"   # event -> (channel, ts) index consumed by slack_annotation_relay.py to thread classification updates onto the card message
+  collect_timeout_s: 1800.0          # 30 min: corr retention holds ~15 s in RAM but stages to NVMe on trigger
+  collect_poll_s: 15.0
+  collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land
+  collect_no_show_grace_s: 120.0     # give up if NO fragment shows up at all (event never dumped — e.g. voltages off); bounds the per-event wait so the scan loop can't wedge
+  rsync_bwlimit_kbps: 0              # 0 = unthrottled; raise if collection saturates br1
+  cleanup_staging_after_keep: true   # free corr NVMe staging once fragments are safely on h23
+  # Rollout safety: flag_only logs every veto decision + writes the audit
+  # sidecar but performs NO destructive REJECT actions (still collects
+  # voltages). Per the FP-analysis plan: run flag-first for a few days,
+  # confirm zero real-burst losses, THEN flip to false to enable
+  # auto-delete. Override at launch with --no-flag-only.
+  flag_only: true
+  mon_key: "/mon/c3/h23"
+  mon_interval_s: 5.0
+  # Cube-morphology veto thresholds (injection-exempt; see
+  # dsart.coinc.cube_veto + the FP-analysis report). Tier-1 R1-R5 + R10.
+  veto:
+    r1_img_off_px: 40.0              # apex image >40 px (~30') from triggered pixel -> reject
+    r2_t_shift_ms: 31.5              # 2x: 60 T_ext (1x: r2_t_shift_samples 30 x 1.05 ms)
+    r3_dm_shift_trials: 8            # cube DM apex shifted >8 trials AND weak DM peak -> reject
+    r4_time_prom_sigma: 4.0          # require a >=4 sigma time-series peak
+    r4_image_prom_sigma: 4.0         # require a >=4 sigma image peak
+    r5_dm_shift_trials: 4            # DM apex shifted >4 trials AND no time/image peak -> reject
+    # 2026-08-07: was 10.0 with a coherence exemption that R2/R3 made
+    # vacuous, so R10 never fired -- 15 of 31 KEEPs on the night of
+    # 08-06 met its conditions and all 15 were spared, at tz_trig down
+    # to 2.7. Rule is now the single condition below. 8.0 rather than
+    # 10.0 because tz_trig tracks detector SNR at ratio 1.15-1.88, so 10
+    # would correspond to ~8.7 sigma detector -- above the trigger floor
+    # and able to cut genuine faint bursts. At 8.0: 0 of 47 injections
+    # lost, 88% of sky KEEPs removed.
+    r10_tz_trig_sigma: 8.0           # cube must show >= this at the triggered DM/time
+  corr_nodes:
+    0:  {ssh_host: n03.pro.pvt, udp_ip: 10.41.0.224}
+    1:  {ssh_host: n04.pro.pvt, udp_ip: 10.41.0.138}
+    2:  {ssh_host: n05.pro.pvt, udp_ip: 10.41.0.206}
+    3:  {ssh_host: n06.pro.pvt, udp_ip: 10.41.0.203}
+    4:  {ssh_host: n07.pro.pvt, udp_ip: 10.41.0.208}
+    5:  {ssh_host: n08.pro.pvt, udp_ip: 10.41.0.209}
+    6:  {ssh_host: n10.pro.pvt, udp_ip: 10.41.0.211}
+    7:  {ssh_host: n11.pro.pvt, udp_ip: 10.41.0.216}
+    8:  {ssh_host: n12.pro.pvt, udp_ip: 10.41.0.218}
+    9:  {ssh_host: n14.pro.pvt, udp_ip: 10.41.0.212}
+    10: {ssh_host: n15.pro.pvt, udp_ip: 10.41.0.223}
+    11: {ssh_host: n16.pro.pvt, udp_ip: 10.41.0.220}
+    12: {ssh_host: n18.pro.pvt, udp_ip: 10.41.0.228}
+    13: {ssh_host: n19.pro.pvt, udp_ip: 10.41.0.227}
+    14: {ssh_host: n21.pro.pvt, udp_ip: 10.41.0.250}
+    15: {ssh_host: n22.pro.pvt, udp_ip: 10.41.0.233}
+
+# ---------------------------------------------------------------------------
+# Website -> Slack annotation relay (dsart.services.slack_annotation_relay).
+# Separate process/unit (systemd/dsart_slack_relay.service) from C3 — reads
+# the dashboard's SQLite annotations DB (operator burst classifications) and
+# posts each new/changed/cleared tag as a threaded reply on that event's
+# card message (looked up via c3.slack.post_map_db). Best-effort throughout;
+# never touches C3's KEEP/REJECT decision path.
+# ---------------------------------------------------------------------------
+slack_relay:
+  enabled: true
+  channel: "C01NUV2M0HM"
+  token_file: "/home/ubuntu/.config/slack_api_dsa110"   # same dedicated dsa110candidates bot as c3.slack
+  token_env: "SLACK_TOKEN_DSA110"
+  annotations_db: "~/.dsa_monitor/annotations.db"
+  post_map_db: "~/.dsa_monitor/slack_candidate_posts.db"   # must match c3.slack.post_map_db above
+  state_path: "~/.dsa_monitor/slack_relay_state.json"
+  poll_s: 15.0
+  timeout_s: 10.0
+  # Only FRB verdicts get reply_broadcast (channel-wide visibility);
+  # RFI/NOISE/PULSAR/INJECTION tags stay thread-only so the main channel
+  # isn't flooded by routine RFI/noise classification chatter. Use ["*"]
+  # to broadcast every label, or an explicit list for a different subset.
+  broadcast_labels: ["FRB"]
+  # Polling is mtime-gated: each cycle only os.stat()s annotations_db (+
+  # its "-wal" sibling) and queries sqlite ONLY if either changed since
+  # the last check. fallback_sweep_s is a safety-net unconditional full
+  # query, in case an mtime update is ever missed.
+  fallback_sweep_s: 600.0
+
+# ---------------------------------------------------------------------------
+# Injection bot (dsart.inject.bot). Separate process/unit
+# (systemd/dsart_inject_bot.service) on h23: fires one test injection
+# roughly every interval_s through the dashboard's /control/inject (sharing
+# its K lookup + fp16-imager brightness guard), auto-refreshes each DM
+# bucket's K when stale (> k_max_age_s) or measured at a different pointing
+# dec, posts per-injection sent/recovered text messages to Slack, and posts
+# one daily summary plot. Never writes etcd; never touches candidate dirs.
+# C2 skips voltage dumps for matcher-tagged injections
+# (coincidencer._maybe_broadcast_voltage), so bot shots cost cube dumps
+# only.
+# ---------------------------------------------------------------------------
+inject_bot:
+  enabled: true
+  # 2026-10-14: dedicated #injections channel (operator decision) --
+  # every bot message (per-shot sent/recovered, miss / not-searching
+  # alerts, daily summary) goes here. Real on-sky candidate cards
+  # (c3.slack) and their annotation threads (slack_relay) stay in
+  # #candidates C01NUV2M0HM. Was C01NUV2M0HM (2026-08-07 decision: keep
+  # injections with the candidate cards). With it empty the loop still
+  # runs and logs, but no Slack messages are posted.
+  channel: "C0C96DTUK9T"
+  token_file: "/home/ubuntu/.config/slack_api_dsa110"   # same dsa110candidates bot
+  token_env: "SLACK_TOKEN_DSA110"
+  dashboard_base_url: "http://localhost:5778"
+  interval_s: 3600.0          # one injection per hour...
+  jitter_s: 300.0             # ...plus/minus 5 min so it never beats with other cadences
+  # 2026-09-22: was [500, 1000, 1500, 2000]. The deployed DM plan now
+  # searches 150-1290, so injections at 1500/2000 are UNSEARCHABLE by
+  # construction -- they would rail at the top fine trial (1287), always
+  # be scored a miss, and post a false "missed injection" alert to Slack
+  # every miss_alert_streak=5 shots. 250/500/1000 already have
+  # /cnf/inject/snr_calibration buckets; 1250 is new and exercises the
+  # top bucket, which is where the plan is weakest. NOTE that every K in
+  # /cnf/inject/snr_calibration is stale after a DM-grid change (the
+  # residual |fine - true| moved), so the FIRST probe per bucket will
+  # land off-target before the self-calibration converges.
+  # 2x (WS-D D10): DMs across both tiers, never within 25 pc/cc of the tier boundary at 1600
+  # (the dm1600 K bucket would straddle tiers A and B).
+  dm_choices: [100.0, 300.0, 800.0, 1400.0, 2000.0, 2500.0]
+  # Injected widths, NATIVE samples (1 native = 32.768 us). 32 x
+  # {1,2,4,8,16} spans the detector boxcar octaves that C2 can actually
+  # receive (1..16 search samples = 1.05..16.8 ms); 4 is the historical
+  # reference width, kept so its bucket and long K history stay live.
+  # Cycled ROUND-ROBIN against dm_choices -> 24 (DM, width) pairs, so
+  # every pair is visited about once a day at one shot/hour.
+  #
+  # Widths above the c1c2 cap (max_c1c2_width_samples = 16 search
+  # samples = 512 native) are dropped at config load with a warning.
+  # 2026-09-22: that cap now has a brightness escape
+  # (max_c1c2_width_snr_escape = 20.0), so above-cap is a guaranteed
+  # miss only BELOW 20 sigma. They stay dropped anyway because the
+  # target window below is 15-25 and only its top half clears 20 --
+  # recovery would be a coin flip, not a health signal, and would trip
+  # miss_alert_streak. CONSEQUENCE: nothing exercises the escape on sky.
+  # Validating it needs a wide width AND target_snr_min > 20; each new
+  # (DM, width) pair carries its own measured K, so that is not free.
+  #
+  # K IS WIDTH-DEPENDENT and each width carries its own measured K
+  # (bucket dmNNNN@wWWWW; the reference width keeps the bare dmNNNN).
+  # A w=1 probe at the model-equivalent fluence measured K ~ 977
+  # against 2890 at w=4 -- a factor ~3 where the sqrt(width) model
+  # predicts equality -- so nothing is extrapolated across widths.
+  # 2x: 16 native = one T_ext sample (0.524 ms) added; the 2x width cap is 512 native as in 1x.
+  width_choices: [4, 16, 32, 64, 128, 256, 512]
+  # Target SNR window: comfortably above the C1 floor (c1.snr_min, 9.55
+  # since 2026-10-05; 10.55 after the 2026-09-22 sigma fix, 11.0 before
+  # that, and 12.0 when this window was chosen) and the C2 trigger (12,
+  # or 11 for w<=8), and below
+  # the dashboard's 30-sigma-predicted brightness guard even with the
+  # ~25% pixel-straddle scatter. The bot never passes allow_bright.
+  target_snr_min: 15.0
+  target_snr_max: 25.0
+  width_samples: 4            # MUST match the K-calibration probe width
+  lm_max_rad: 0.02            # inner FoV; dashboard hard limit is 0.0279
+  # 3 days, raised from 1 when multi-width injection landed. With
+  # 4 DMs x 6 widths = 24 buckets and ~24 cycles/day a bucket is
+  # revisited about once a day, so a 24 h limit forced a recalibration
+  # probe on essentially EVERY cycle -- doubling injection traffic and
+  # leaving no clean shots. The invalidators that actually track
+  # physics (new pointing dec, newly applied bf-weights) still fire
+  # immediately regardless of age.
+  k_max_age_s: 259200.0
+  k_dec_tol_deg: 0.5          # recalibrate K after a re-point
+  recovery_timeout_s: 720.0
+  # Attention messages are streak-gated (single events only edit the
+  # shot's own message, so misses are never double-counted in the
+  # channel): 5 consecutive missed shots, or 5 consecutive
+  # not-searching cycles (~5 h), post ONE alert per streak.
+  miss_alert_streak: 5
+  unhealthy_alert_streak: 5
+  summary_hour_utc: 16
+  results_path: "/dataz/dsa110/operations/inject/inject_bot_results.jsonl"
+  # 2x: its own bot state file, so the K doctor's k_last_good /
+  # k_calibration_dec of 1x can never write 1x K back in 2x (and vice
+  # versa); the etcd K itself is parked per K family by the op-point switch.
+  state_path: "~/.dsa_monitor/inject_bot_state_2x.json"
+  summary_dir: "~/.dsa_monitor/inject_bot"

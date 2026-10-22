@@ -60,6 +60,9 @@ __all__ = [
 class CubeVetoThresholds:
     r1_img_off_px: float = 40.0        # >0.5° at 45" pixels
     r2_t_shift_samples: int = 30       # >31 ms at the search cadence
+    #: x2: R2 in ms (e.g. 31.5). Used only for cutout events (metrics carry
+    #: ``t_ext_us``); None keeps the samples rule everywhere (1x).
+    r2_t_shift_ms: Optional[float] = None
     r3_dm_shift_trials: int = 8
     r4_time_prom_sigma: float = 4.0
     r4_image_prom_sigma: float = 4.0
@@ -174,6 +177,12 @@ class CubeMetrics:
     dead_tail_trig: int = 0
     dead_tail_worst: int = 0
 
+    # x2 cutouts (0 / "cubes" for today's events). Time indices above are
+    # then in T_ext rows (tier-B statistics use independent rows only).
+    t_ext_us: float = 0.0
+    source: str = "cubes"
+    apex_mismatch: int = 0
+
 
 @dataclass(frozen=True)
 class VetoDecision:
@@ -230,8 +239,12 @@ def decide(
     # R1 image incoherence
     if metrics.img_off_apex > th.r1_img_off_px:
         fired.append("R1_image_offset")
-    # R2 time incoherence
-    if metrics.t_shift > th.r2_t_shift_samples:
+    # R2 time incoherence (x2: in ms when the metrics carry a period)
+    if th.r2_t_shift_ms is not None and metrics.t_ext_us > 0.0:
+        r2 = metrics.t_shift * metrics.t_ext_us / 1000.0 > th.r2_t_shift_ms
+    else:
+        r2 = metrics.t_shift > th.r2_t_shift_samples
+    if r2:
         fired.append("R2_time_shift")
     # R3 DM incoherence
     if metrics.dm_shift_trials > th.r3_dm_shift_trials:
@@ -466,8 +479,14 @@ def compute_metrics_from_grids(
     dm_c1: float = 0.0,
     width_samples: int = 0,
     apex_image_fn: Optional[Callable[[int, int], np.ndarray]] = None,
+    trig_key: Optional[Tuple[int, ...]] = None,
 ) -> CubeMetrics:
     """Build :class:`CubeMetrics` from per-cube ``peak_grid`` arrays.
+
+    ``trig_key`` (x2) names the trigger plane when ``grids`` is keyed by
+    something other than ``(sid, g)`` -- the per-(half, coarse DM) planes
+    of cutouts, keyed ``(sid, g, coarse)``. ``None`` = ``(sid_trig, g_trig)``
+    (today's cubes, one plane per half).
 
     ``grids`` maps ``(search_node_id, gpu_half) -> peak_grid`` with shape
     ``(T_det, n_fdm)``. ``apex_image_fn(t, fdm) -> image_plane`` returns
@@ -476,9 +495,10 @@ def compute_metrics_from_grids(
     R4 falls back to the time prominence alone — both fail-safe toward
     KEEP). Pure: no file access.
     """
-    if (sid_trig, g_trig) not in grids:
+    key_t = trig_key if trig_key is not None else (sid_trig, g_trig)
+    if key_t not in grids:
         return CubeMetrics(ok=False, reason="trigger cube absent")
-    wf = np.asarray(grids[(sid_trig, g_trig)], dtype=np.float64)
+    wf = np.asarray(grids[key_t], dtype=np.float64)
     if wf.ndim != 2 or wf.size == 0:
         return CubeMetrics(ok=False, reason="trigger peak_grid empty")
     T, F = wf.shape
@@ -523,7 +543,7 @@ def compute_metrics_from_grids(
     # median/MAD and hands it a spuriously high z, which is one of the
     # ways g_apex_cube_same ends up pointing at the wrong half.
     best_val = -np.inf
-    best_cube: Optional[Tuple[int, int]] = None
+    best_cube: Optional[Tuple[int, ...]] = None
     streak_worst = 0.0
     fracz_worst = 0.0
     dead_worst = 0
@@ -543,7 +563,7 @@ def compute_metrics_from_grids(
             streak_worst = ac1
         if fz > fracz_worst:
             fracz_worst = fz
-        if key == (sid_trig, g_trig):
+        if key == key_t:
             streak_trig, fracz_trig, dead_trig = ac1, fz, dead
         if n_live <= 0:
             continue
@@ -552,7 +572,7 @@ def compute_metrics_from_grids(
         if v > best_val:
             best_val = v
             best_cube = key
-    g_same = int(best_cube == (sid_trig, g_trig))
+    g_same = int(best_cube == key_t)
 
     return CubeMetrics(
         ok=True,
@@ -635,6 +655,15 @@ def compute_metrics(event_dir: Path, event_name: str) -> CubeMetrics:
     except (KeyError, TypeError, ValueError) as exc:
         return CubeMetrics(ok=False, reason=f"bad C1 row: {exc}")
 
+    cut_dir = event_dir / "cutouts"
+    if cut_dir.is_dir() and any(cut_dir.glob("cutout_s*_g*.npz")):
+        # x2: per-(half, coarse DM) planes from the cutouts. 1x events
+        # (cubes only) take the unchanged code below.
+        return _compute_metrics_cutouts(
+            event_dir, trig, l_t=l_t, m_t=m_t, snr_c1=snr_c1, dm_c1=dm_c1,
+            width_c1=width_c1,
+        )
+
     cubes = sorted(glob.glob(str(event_dir / "cubes" / "cube_s*_g*_*.npz")))
     if not cubes:
         return CubeMetrics(ok=False, reason="no cube npz files")
@@ -680,6 +709,59 @@ def compute_metrics(event_dir: Path, event_name: str) -> CubeMetrics:
         dm_c1=dm_c1,
         width_samples=width_c1,
         apex_image_fn=apex_image_fn,
+    )
+
+
+def _compute_metrics_cutouts(
+    event_dir: Path, trig: dict, *, l_t: int, m_t: int, snr_c1: float,
+    dm_c1: float, width_c1: int,
+) -> CubeMetrics:
+    """C3 metrics on x2 cutouts (docs/x2/downstream_inventory.md §3.7).
+
+    The trigger plane is the coarse-DM bucket holding the C1 row's GLOBAL
+    fine index (``dm_idx_global``), on whichever half owns it; R3/R5 count
+    fine trials inside that bucket exactly as they did inside a cube.
+    Statistics run on each plane's independent rows (tier-B values sit on
+    two rows), and the time results are reported back in T_ext rows.
+    """
+    import dataclasses
+
+    from ..x2.cutout.products import load_event_products
+
+    try:
+        fg = int(float(trig.get("dm_idx_global", -1)))
+    except (TypeError, ValueError):
+        return CubeMetrics(ok=False, reason="bad C1 row: dm_idx_global")
+    prod = load_event_products(event_dir)
+    hit = prod.plane_of_fine(fg)
+    if hit is None:
+        return CubeMetrics(ok=False, reason="trigger cutout absent")
+    plane, j = hit
+    grids: Dict[Tuple[int, ...], np.ndarray] = {}
+    for p in prod.planes:
+        grids[p.key] = np.asarray(p.peak_grid, dtype=np.float32)[::max(1, int(p.t_step))]
+    step = max(1, int(plane.t_step))
+    mismatch = [0]
+
+    def apex_image_fn(t: int, f: int) -> np.ndarray:
+        try:
+            return plane.apex_image(int(t) * step, int(f))
+        except KeyError:
+            mismatch[0] = 1
+            raise
+
+    m = compute_metrics_from_grids(
+        grids=grids, sid_trig=plane.sid, g_trig=plane.gpu_half, fdm_trig=j,
+        l_pix_trig=l_t, m_pix_trig=m_t, snr_c1=snr_c1, dm_c1=dm_c1,
+        width_samples=width_c1, apex_image_fn=apex_image_fn,
+        trig_key=plane.key,
+    )
+    if not m.ok:
+        return m
+    return dataclasses.replace(
+        m, t_img=m.t_img * step, t_apex=m.t_apex * step,
+        t_shift=m.t_shift * step, t_ext_us=float(plane.t_ext_us or 0.0),
+        source="cutouts", apex_mismatch=mismatch[0],
     )
 
 

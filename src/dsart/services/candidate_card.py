@@ -51,6 +51,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from ..coinc.units import sample_period_us_or_default
+
 LOG = logging.getLogger("dsart.services.candidate_card")
 
 #: unix epoch expressed as MJD (same constant used in slack_notify.py /
@@ -280,19 +282,39 @@ def _fmt(value: Any, fmt: str = "{}") -> str:
         return str(value)
 
 
-def _width_str(width_samp: Any) -> str:
-    """"X ms (N samp)" — width_samp converted via
-    ``_SEARCH_SAMPLE_PERIOD_MS`` (see its derivation comment), samples kept
-    in the bracket for cross-checking against the raw c2 field. "n/a" if
-    width_samp is missing/non-numeric."""
+def _width_str(width_samp: Any, sample_period_ms: Optional[float] = None) -> str:
+    """"X ms (N samp)" — width_samp converted via the event's own sample
+    period when the archive carries one (``c2.sample_period_us``, archive
+    schema 2; 0.524288 ms at the 2x op-point), else via
+    ``_SEARCH_SAMPLE_PERIOD_MS`` (see its derivation comment). Samples are
+    kept in the bracket for cross-checking against the raw c2 field. "n/a"
+    if width_samp is missing/non-numeric."""
     try:
         samp = float(width_samp)
     except (TypeError, ValueError):
         return "n/a"
     if not math.isfinite(samp):
         return "n/a"
-    ms = samp * _SEARCH_SAMPLE_PERIOD_MS
+    period_ms = (
+        _SEARCH_SAMPLE_PERIOD_MS if sample_period_ms is None
+        else float(sample_period_ms)
+    )
+    ms = samp * period_ms
     return f"{ms:.1f} ms ({samp:.0f} samp)"
+
+
+def _c2_sample_period_ms(c2row: Mapping[str, Any]) -> Optional[float]:
+    """The event's external sample period in ms from an archive-schema-2
+    Level3 ``c2`` dict, or ``None`` (pre-schema-2 events: caller falls back
+    to the 1x constant, so their cards are unchanged)."""
+    if not isinstance(c2row, Mapping):
+        return None
+    for key in ("sample_period_us", "peak_sample_period_us"):
+        if key in c2row:
+            v = sample_period_us_or_default(c2row.get(key), float("nan"))
+            if math.isfinite(v):
+                return v / 1000.0
+    return None
 
 
 def _resolve_detection_dm(ev_dir: Path, name: str) -> Optional[float]:
@@ -358,7 +380,7 @@ def _line1_str(
         f"MJD {mjd_str}    "
         f"σ={_fmt(snr, '{:.1f}')}    "
         f"{dm_label}={_fmt(dm, '{:.1f}')} pc cm⁻³    "
-        f"width={_width_str(width)}"
+        f"width={_width_str(width, _c2_sample_period_ms(c2row))}"
     )
 
 

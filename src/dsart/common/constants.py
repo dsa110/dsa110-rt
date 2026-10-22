@@ -299,6 +299,16 @@ DETECTOR_TIME_KERNELS: tuple[str, ...] = tuple(
 )
 """Time-kernel namespace tokens (third token of kernel_id; e.g. 'b16')."""
 
+DETECTOR_TIME_KERNELS_X2_B3X: tuple[str, ...] = (
+    "b1", "b2", "t2", "q4", "q8", "q16", "q32", "q64")
+"""x2 b3x time-filter bank (docs/x2/phase0/time_filters.md): boxcars b1/b2, the [1,2,1]
+triangle t2, and cubic B-splines q4..q64 (width in T_ext samples). Not part of the 1x
+default bank; :data:`DETECTOR_TIME_KERNELS_VALID` is what kernel_id validation accepts."""
+
+DETECTOR_TIME_KERNELS_VALID: tuple[str, ...] = DETECTOR_TIME_KERNELS + tuple(
+    t for t in DETECTOR_TIME_KERNELS_X2_B3X if t not in DETECTOR_TIME_KERNELS)
+"""Every time token a kernel_id may carry (1x boxcars + x2 b3x tokens)."""
+
 
 # ---------------------------------------------------------------------------
 # Transport (plan §4.3 lines 1360-1394)
