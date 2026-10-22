@@ -25,6 +25,53 @@ Do not set them there until the user signs off (they are the CP1 sign-off items)
 | `fallback_sample_period_us` | `1048.576` | `524.288` | D6 | Voltage-dump specnum fallback when a peak header is unusable: ×16 at 1x, ×8 at 2x. |
 | `dedupe_fired_clusters` | `false` | `true` (after sign-off) | D6 | **1x≠.** Never dump the same cluster twice through class-holdoff fall-through. |
 
+| `inject_specnum_tol_s` | none (4096 samples) | `4.294967296` | D10 | Inject-matcher time gate in seconds, applied with each row's own period. |
+
+**At a 2x op-point the 2x behaviours default on.** C2 resolves the op-point at startup through
+`select_service_config` (SPEC §10). At 2x the following defaults switch on; an explicit key still
+overrides:
+
+| key | 2x default |
+|---|---|
+| `cutout.enabled` | `true` |
+| `archive_schema` | `2` |
+| `partial_event_policy` | `archive` |
+| `fallback_sample_period_us` | `524.288` |
+| `inject_specnum_tol_s` | `4.294967296` |
+
+The 2x set therefore needs only what it already has: `partial_event_policy` and `cutout.{wait_s,status_port}`.
+If `cutout.plan_path` is absent, C2 uses `/cnf/opoint.plan_path`. C2 refuses to start if the plan's
+`plan_id` differs from `/cnf/opoint.plan_id`.
+
+**The WS-D `x2_todo` entries in `configs/opoints/2x/dsart_search_rt.yaml` are resolved by the code**
+(D6, D7 and D10 are merged on `x2/ws-downstream`). WS-O can delete these three entries:
+- "WS-D D6 coinc";
+- "WS-D c3";
+- "WS-D D10 inject_bot". The bot takes the factor and cap from the op-point and the `c1` block, the
+  owner map from `plan_path`, and the K family from `/cnf/opoint`.
+
+The bot's `width_choices` / `dm_choices` values are WS-O's to set. Recommended:
+- `width_choices`: add 16 native (one T_ext sample).
+- `dm_choices`: e.g. `[100, 300, 800, 1400, 2000, 2500]`. Keep them away from 1575-1625, where the 50 pc/cc
+  K bucket straddles the tier A/B boundary.
+
+## `configs/opoints/2x/dsart_search_rt.yaml` → `inject_bot:`
+
+| key | default (= today) | 2x value | notes |
+|---|---|---|---|
+| `metering_gate` | `any` | `owner` (after sign-off) | **1x≠ / sign-off.** `owner` means only the halves that own the shot's DM can block it (owner map from `plan_path`). |
+| `plan_path` | `""` | from `/cnf/opoint` | Needed only for `metering_gate: owner`. Filled automatically from the active record. |
+| `state_path` | today's file | `~/.dsa_monitor/inject_bot_state_2x.json` (already set by WS-O) | Per-family K-doctor and round-robin state. |
+
+## `configs/opoints/2x/dsart_pipeline_rt.yaml`
+
+- `X2TODO:WS-D:n-pre-for-dm3000` → **15**.
+  - The full-band sweep at DM 3000 is 1.698 s. With the +1-block event-placement margin, the minimum is
+    ceil(1.698 / 0.134218) + 1 = 14 blocks.
+  - 14 blocks leaves 47 ms of margin; 15 gives 0.18 s.
+  - `tests/test_voltage_dump_containment.py` will need to read the v3 plan's max fine DM
+    (`fine_dm` is a flat array in v3 too, so it works as is).
+
 ## `configs/c2_trigger_criteria.yaml` (read by `coinc/criteria.py`)
 
 - A new optional top-level `opoints:` mapping, keyed by op-point id or family (`2x`), each holding its

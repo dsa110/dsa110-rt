@@ -414,6 +414,15 @@ class CoincidencerConfig:
     #: contains a member of an already-dumped event (the class-holdoff
     #: fall-through duplicate). 1x≠ flag, default off.
     dedupe_fired_clusters: bool = False
+    #: Inject-matcher time gate in SECONDS, applied with each C1 row's own
+    #: sample period (x2: 4.294967296 reproduces today's 4096 x 1.05 ms).
+    #: None = today's fixed 4096-sample gate.
+    inject_specnum_tol_s: Optional[float] = None
+    #: SPEC §10 (set from the resolved op-point at startup, not the YAML):
+    #: the selection and the active record's plan_id ("0x..."); C2 refuses
+    #: to run its cutout lifecycle on a plan with a different plan_id.
+    opoint_selection: str = ""
+    active_plan_id: str = ""
 
     # Mon-points export.
     mon_etcd_key: str = "/mon/c2/h23"
@@ -520,20 +529,12 @@ class CoincidencerConfig:
         with Path(path).open("r", encoding="utf-8") as f:
             doc = yaml.safe_load(f) or {}
         coinc = doc.get("coinc", {}) or {}
-        # x2 (SPEC §10): an op-point section overlays coinc: shallowly
-        # (coinc_opoints.<id> or its family, e.g. "2x"). Selected by
-        # override["opoint"] (--opoint) else coinc.opoint; absent = today.
-        opoint_sel = str(
-            (override or {}).get("opoint") or coinc.get("opoint") or "")
-        sections = doc.get("coinc_opoints") or {}
-        if opoint_sel and isinstance(sections, Mapping):
-            for key in (opoint_sel, opoint_sel.split("-", 1)[0]):
-                sec = sections.get(key)
-                if isinstance(sec, Mapping):
-                    coinc = {**coinc, **sec}
-                    break
         if override:
             coinc = {**coinc, **override}
+        # x2: at a 2x op-point (resolved at startup, SPEC §10) the 2x
+        # behaviours default ON; any explicit key still wins. At 1x every
+        # default below is today's.
+        is2x = str(coinc.get("opoint") or "").startswith("2x")
         bind = coinc.get("bind", {}) or {}
         dump = coinc.get("dump_broadcast", {}) or {}
         volt = coinc.get("voltage_broadcast", {}) or {}
@@ -646,15 +647,25 @@ class CoincidencerConfig:
             plot_expected_cube_count=int(
                 coinc.get("plot_expected_cube_count", 8),
             ),
-            archive_schema=int(coinc.get("archive_schema", 1)),
+            archive_schema=int(coinc.get("archive_schema", 2 if is2x else 1)),
             opoint=str(coinc.get("opoint", "") or ""),
-            cutout=CutoutConfig.from_mapping(coinc.get("cutout")),
+            cutout=CutoutConfig.from_mapping(
+                coinc.get("cutout"), default_enabled=is2x),
             partial_event_policy=check_partial_policy(
-                coinc.get("partial_event_policy", PARTIAL_POLICY_DISCARD)),
+                coinc.get("partial_event_policy",
+                          PARTIAL_POLICY_ARCHIVE if is2x
+                          else PARTIAL_POLICY_DISCARD)),
             fallback_sample_period_us=float(
-                coinc.get("fallback_sample_period_us", 1048.576)),
+                coinc.get("fallback_sample_period_us",
+                          524.288 if is2x else 1048.576)),
             dedupe_fired_clusters=bool(
                 coinc.get("dedupe_fired_clusters", False)),
+            opoint_selection=str(coinc.get("opoint_selection", "") or ""),
+            active_plan_id=str(coinc.get("active_plan_id", "") or ""),
+            inject_specnum_tol_s=(
+                float(coinc["inject_specnum_tol_s"])
+                if coinc.get("inject_specnum_tol_s") is not None
+                else (4.294967296 if is2x else None)),
             mon_etcd_key=str(coinc.get("mon_etcd_key", "/mon/c2/h23")),
             mon_publish_interval_s=float(
                 coinc.get("mon_publish_interval_s", 5.0),
@@ -942,6 +953,14 @@ class CoincidencerService:
                 self._cutout_plan_id = int(
                     getattr(self._cutout_plan, "plan_id", 0) or 0)
                 fine_resolver = _plan_fine_resolver(self._cutout_plan)
+                want = str(config.active_plan_id or "")
+                have = f"0x{self._cutout_plan_id:016x}"
+                if want and want.lower() != have:
+                    # SPEC §10 plan check: never run on a plan the active
+                    # op-point record does not name.
+                    raise RuntimeError(
+                        f"cutout plan {config.cutout.plan_path} has plan_id "
+                        f"{have}, /cnf/opoint says {want}")
         self._archive = EventArchiveWriter(
             config.event_archive_root,
             schema=config.archive_schema,
@@ -1101,6 +1120,10 @@ class CoincidencerService:
             _matcher_kwargs["min_observed_snr"] = float(_min_snr_env)
         if _wall_tol_env:
             _matcher_kwargs["wall_tol_s"] = float(_wall_tol_env)
+        # x2 D10: time gate in seconds with each row's own period
+        # (coinc.inject_specnum_tol_s; None = today's 4096 samples).
+        if config.inject_specnum_tol_s is not None:
+            _matcher_kwargs["specnum_tol_s"] = float(config.inject_specnum_tol_s)
         self._inject_matcher: InjectionMatcher = (
             inject_matcher if inject_matcher is not None
             else InjectionMatcher(**_matcher_kwargs)
@@ -1645,6 +1668,7 @@ class CoincidencerService:
                 search_node_id=e.search_node_id,
                 gpu_half=e.gpu_half,
                 mjd=e.mjd,
+                sample_period_us=e.sample_period_us,
             )
             if label is not None:
                 inj_id_by_entry_id[id(e)] = label.inj_id
@@ -2128,6 +2152,7 @@ class CoincidencerService:
                     snr=m.snr,
                     event_specnum=m.event_specnum,
                     mjd=m.mjd,
+                    sample_period_us=m.sample_period_us,
                 )
                 if label is not None:
                     member_inj_ids[id(m)] = label
@@ -2225,6 +2250,7 @@ class CoincidencerService:
                 snr=m.snr,
                 event_specnum=m.event_specnum,
                 mjd=m.mjd,
+                sample_period_us=m.sample_period_us,
             )
             if label is not None:
                 out[id(m)] = label
@@ -2864,6 +2890,11 @@ class CoincidencerService:
                 }
                 if self._config.opoint:
                     payload["opoint"] = self._config.opoint
+                    payload["opoint_selection"] = self._config.opoint_selection
+                    payload["plan_id"] = (
+                        f"0x{self._cutout_plan_id:016x}"
+                        if self._cutout_plan_id else
+                        (self._config.active_plan_id or None))
                 if self._cutout_tracker is not None:
                     payload["cutout_pending_events"] = len(self._pending_plots)
                     payload["cutout_expected_halves"] = len(self._cutout_expected)
@@ -3023,13 +3054,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-level", default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
     )
-    p.add_argument(
-        "--opoint", default=None,
-        help="x2 op-point id (e.g. 1x, 2x-gridded-ns2-cint4). Sets "
-             "coinc.opoint, overlays the matching coinc_opoints.<id|family> "
-             "section of the YAML and selects the criteria file's "
-             "opoints.<id|family> section. Omitted = today's behaviour.",
-    )
+    from ..x2.opoint_runtime import add_opoint_argument
+    add_opoint_argument(parser=p)
     return p
 
 
@@ -3048,10 +3074,26 @@ async def _run_async(args: argparse.Namespace) -> int:
         override["trigger_criteria_path"] = str(args.criteria)
     if args.name_allocator_offline:
         override["name_allocator_offline"] = True
-    if getattr(args, "opoint", None):
-        override["opoint"] = str(args.opoint)
+    # x2 (SPEC §10): the op-point is resolved ONCE at startup (/cnf/opoint
+    # unless --opoint names one); it selects the config set file and is
+    # fixed for the process lifetime (a switch restarts C2).
+    from ..x2.opoint_runtime import select_service_config
+    active, cfg_path = select_service_config(
+        args.config, cli_opoint=getattr(args, "opoint", "auto"))
+    override["opoint"] = active.opoint_id
+    override["opoint_selection"] = active.selection
+    if active.plan_id:
+        override["active_plan_id"] = str(active.plan_id)
+    cut = None
+    if active.plan_path:
+        with Path(cfg_path).open("r", encoding="utf-8") as fh:
+            cut = dict(((yaml.safe_load(fh) or {}).get("coinc") or {})
+                       .get("cutout") or {})
+        if not cut.get("plan_path"):
+            cut["plan_path"] = active.plan_path
+            override["cutout"] = cut
 
-    cfg = CoincidencerConfig.from_yaml(args.config, override=override)
+    cfg = CoincidencerConfig.from_yaml(cfg_path, override=override)
     svc = CoincidencerService(cfg)
     return await svc.run()
 

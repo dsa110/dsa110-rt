@@ -26,6 +26,7 @@ See ``docs/voltage_dumps/VOLTAGE_DUMP_C3_DESIGN.md``.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import asyncio
 import json
 import logging
@@ -128,6 +129,9 @@ class C3Config:
     # Slack KEEP notifications (best-effort; token from env var named by
     # slack.token_env, never logged). See services/slack_notify.py.
     slack: SlackNotifyConfig = field(default_factory=SlackNotifyConfig)
+    #: SPEC §10: the op-point resolved at startup (published in the mon key).
+    opoint: str = ""
+    opoint_selection: str = ""
 
     @classmethod
     def from_yaml(cls, path: Path) -> "C3Config":
@@ -803,6 +807,9 @@ class C3Service:
                     "flag_only": self._effective_flag_only(),
                     "flag_only_config": self._cfg.flag_only,
                     "n_corr_nodes": len(self._cfg.corr_nodes),
+                    **({"opoint": self._cfg.opoint,
+                        "opoint_selection": self._cfg.opoint_selection}
+                       if self._cfg.opoint else {}),
                 })
                 await asyncio.sleep(self._cfg.mon_interval_s)
         except asyncio.CancelledError:
@@ -850,6 +857,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    default=None, help="Force flag-only (no destructive REJECT).")
     p.add_argument("--no-flag-only", dest="flag_only", action="store_false",
                    help="Enable destructive REJECT cleanup.")
+    from ..x2.opoint_runtime import add_opoint_argument
+    add_opoint_argument(p)
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return p
@@ -862,7 +871,14 @@ def main(argv: Optional[list] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    cfg = C3Config.from_yaml(args.config)
+    # x2 (SPEC §10): resolve the op-point once; its config set supplies the
+    # c3: block (e.g. veto.r2_t_shift_ms at 2x). A switch restarts C3.
+    from ..x2.opoint_runtime import select_service_config
+    active, cfg_path = select_service_config(
+        args.config, cli_opoint=getattr(args, "opoint", "auto"))
+    cfg = dataclasses.replace(
+        C3Config.from_yaml(cfg_path), opoint=active.opoint_id,
+        opoint_selection=active.selection)
     if args.flag_only is not None:
         cfg = C3Config(**{**cfg.__dict__, "flag_only": bool(args.flag_only)})
     svc = C3Service(cfg)

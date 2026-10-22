@@ -88,11 +88,13 @@ class CutoutConfig:
     plan_path: Optional[Path] = None
 
     @classmethod
-    def from_mapping(cls, d: Optional[Mapping[str, Any]]) -> "CutoutConfig":
+    def from_mapping(
+        cls, d: Optional[Mapping[str, Any]], *, default_enabled: bool = False,
+    ) -> "CutoutConfig":
         d = dict(d or {})
         plan = d.get("plan_path")
         return cls(
-            enabled=bool(d.get("enabled", False)),
+            enabled=bool(d.get("enabled", default_enabled)),
             status_bind_host=str(d.get("status_bind_host", "0.0.0.0")),
             status_port=int(d.get("status_port", wire.CUTOUT_STATUS_PORT_DEFAULT)),
             rows=int(d.get("rows", 512)),
