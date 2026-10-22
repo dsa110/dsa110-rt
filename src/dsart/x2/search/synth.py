@@ -97,6 +97,7 @@ class SyntheticSky:
     seed: int = 1
     bursts: List[Burst] = field(default_factory=list)
     code_scale_1x: float = 20.0
+    noise_scale_at: Optional[object] = None    # callable(abs rows [n]) -> factor [n]
     decoded: Dict[int, list] = field(default_factory=dict)      # d -> per stream [T, V] complex
 
     def rows(self, spec: DmSpec, row0: int, n: int) -> tuple:
@@ -108,6 +109,8 @@ class SyntheticSky:
         V = fmt.n_values
         rng = np.random.default_rng(self.seed * 1000003 + spec.d * 7919 + row0)
         y = (rng.standard_normal((S, n, V)) + 1j * rng.standard_normal((S, n, V))) * self.noise
+        if self.noise_scale_at is not None:
+            y *= np.asarray(self.noise_scale_at(np.arange(row0, row0 + n)), float)[None, :, None]
         for b in self.bursts:
             if b.d != spec.d:
                 continue
