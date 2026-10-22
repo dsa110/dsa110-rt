@@ -115,6 +115,8 @@ class GpuBackend:
 
         x = self.dm[st.spec.d]
         S, n, rb = raw.shape
+        if getattr(x, "pinned_ev", None) is not None:
+            x.pinned_ev.synchronize()                 # previous H2D done with the buffer
         if x.pinned is None or x.pinned.numel() < raw.size:
             x.pinned = torch.empty(raw.size, dtype=torch.uint8, pin_memory=True)
         hraw = x.pinned[:raw.size].view(S, n, rb)
@@ -125,6 +127,7 @@ class GpuBackend:
             dval = hval.to(self.dev, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(self.copy)
+        x.pinned_ev = ev
         self.compute.wait_event(ev)
         mod = get_module()
         with self._ext(self.compute):
