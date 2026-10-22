@@ -40,8 +40,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 G = 2
 ANTS = [3, 10, 22, 40, 55, 71]                       # core antennas carrying noise
 BLOCKS = [5, 6, 7]
-NPKT = 512
-NQ = NPKT * 2 // 8                                   # q1 samples per page
+NPKT = 512                                           # CPU pages; GPU uses 2048
 
 
 def _fixture():
@@ -53,14 +52,14 @@ def _fixture():
     return e, n, mask, z["station"]
 
 
-def _pages():
+def _pages(npkt):
     rng = np.random.default_rng(42)
     pages = []
     for _ in BLOCKS:
-        raw = np.zeros((NPKT, NANTS, NCHAN_PER_CHGROUP, 2, 2), np.uint8)
-        raw[:, ANTS] = rng.integers(0, 256, size=(NPKT, len(ANTS), NCHAN_PER_CHGROUP, 2, 2))
+        raw = np.zeros((npkt, NANTS, NCHAN_PER_CHGROUP, 2, 2), np.uint8)
+        raw[:, ANTS] = rng.integers(0, 256, size=(npkt, len(ANTS), NCHAN_PER_CHGROUP, 2, 2))
         pages.append(raw.reshape(-1))
-    assert pages[0].size == FADA_BYTES_PER_BLOCK * NPKT // 2048
+    assert pages[0].size == FADA_BYTES_PER_BLOCK * npkt // 2048
     return pages
 
 
@@ -101,11 +100,15 @@ def _gains():
     return np.exp(1j * ph)
 
 
-def _build(kind: str, monkeypatch):
+def _build(kind: str, monkeypatch, *, device="cpu", npkt=NPKT, value_subset=24, dms=(0, 31, 32)):
     from dsart.grid.baseline_grid import build_value_map_for_opoint
     from dsart.x2.opoint import opoint_2x
     from ._small_blocks import patch_small_blocks
-    page_bytes = patch_small_blocks(monkeypatch, NPKT)
+    if device == "cpu":
+        page_bytes = patch_small_blocks(monkeypatch, npkt)
+    else:
+        page_bytes = FADA_BYTES_PER_BLOCK
+    nq = npkt * 2 // 8
     monkeypatch.setattr(cfi, "_array_burst_time_mask", _ab)
     e, n, mask, _ = _fixture()
     op = opoint_2x(kind, 2)
@@ -115,35 +118,52 @@ def _build(kind: str, monkeypatch):
         cal_path=None, rfi_enabled=False, rfi_array_burst_mode="off", static_sky_disabled=True,
         chan_sum_factor=2, n_sub=2, cell_lambda_mode="tee45",
     )
-    ctx = cfi.build_context(cfg, device=torch.device("cpu"), antpos_e=e, antpos_n=n,
+    ctx = cfi.build_context(cfg, device=torch.device(device), antpos_e=e, antpos_n=n,
                             is_core_baseline_mask=mask)
     cfg.rfi_enabled = True
     ctx.rfi_flagger = _Flagger()
     gn = _gains()
     gt = np.ascontiguousarray(gn.transpose(1, 2, 0))[:, None, :, None, :]
     ctx.cal = FastCorrCalTensors(
-        cal_real=torch.from_numpy(gt.real.astype(np.float32)).half(),
-        cal_imag=torch.from_numpy(gt.imag.astype(np.float32)).half(),
+        cal_real=torch.from_numpy(gt.real.astype(np.float32)).half().to(device),
+        cal_imag=torch.from_numpy(gt.imag.astype(np.float32)).half().to(device),
         raw_bf_weights=None, obs_dec_rad=cfg.obs_dec_rad, chgroup=G, cal_mode="phase_only",
         pol_swap=False, info={},
     )
     sentinel = object()
     ctx.stage2_fifo = sentinel
     plan = proposed_corr_plan(2)
-    dms = [0, 31, 32]
-    assert int(plan.stage1_bins(1)[G][:, 0].max()) < NQ - 4      # tier B fits the window
+    dms = list(dms)
+    for d in dms:                                                   # every DM fits the window
+        ti, c = plan.tier_of(d)
+        assert int(plan.stage1_bins(ti)[G][:, c].max()) < nq - 4
     tx = RecordingTx2x()
     orch = Corr2xPipeline(ctx, plan=plan, vm=vm, is_core_baseline_mask=mask, bits_main=8,
                           tx2x=tx, static_sky_window_blocks=2, static_sky_warmup=0,
-                          value_subset=24, dm_subset=dms, expected_fada_bytes=page_bytes,
-                          fv_chunk=NQ)
+                          value_subset=value_subset, dm_subset=dms, expected_fada_bytes=page_bytes,
+                          fv_chunk=min(nq, 128))
     return ctx, orch, tx, vm, plan, dms, e, n, mask, gn, sentinel
 
 
 @pytest.mark.parametrize("kind", ["gridded", "baselines"])
 def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
-    ctx, orch, tx, vm, plan, dms, e, n, mask, gn, sentinel = _build(kind, monkeypatch)
-    pages = _pages()
+    _run_and_check(kind, monkeypatch, device="cpu", npkt=NPKT, value_subset=24, dms=(0, 31, 32))
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+@pytest.mark.parametrize("kind", ["gridded", "baselines"])
+def test_corr2x_pipeline_gpu_equals_reference(kind, monkeypatch) -> None:
+    """Production pages and kernels, every value, first/last DM of each tier."""
+    _run_and_check(kind, monkeypatch, device="cuda", npkt=2048, value_subset=None,
+                   dms=(0, 31, 32, 46))
+
+
+def _run_and_check(kind, monkeypatch, *, device, npkt, value_subset, dms) -> None:
+    NQ = npkt * 2 // 8
+    ctx, orch, tx, vm, plan, dms, e, n, mask, gn, sentinel = _build(
+        kind, monkeypatch, device=device, npkt=npkt, value_subset=value_subset, dms=dms)
+    pages = _pages(npkt)
     outs = []
     for b, p in zip(BLOCKS, pages):
         outs += orch.push(p, block_n=b)
@@ -152,6 +172,7 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
     assert ctx.stage2_fifo is sentinel                       # stage-2 FIFO off in 2x
     assert [r["block_n"] for r in tx.log] == [5, 5, 6, 6]    # tiers A, B of blocks 5 and 6
     assert [r["tier"] for r in tx.log] == ["A", "B", "A", "B"]
+    NPKT = npkt  # noqa: N806
 
     # ---- reference: unpack/mask/cal/GEMM on the six antennas ------------------------
     from dsart.grid.baseline_grid import kept_core_baselines
@@ -223,13 +244,14 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
                     key = (int(d), s)
                     rs = sky.setdefault(key, ref.StaticSkyRef(window_blocks=2, warmup_cubes=0))
                     want = rs.apply(0, xd)
-                    got = x[j, :, lo:hi].numpy().astype(np.complex128)
+                    got = x[j, :, lo:hi].cpu().numpy().astype(np.complex128)
                     rms = np.sqrt(np.mean(np.abs(want) ** 2)) + 1e-12
                     assert np.abs(got - want).max() <= 2e-3 * rms * 10, (kind, d, s, blk)
                     assert np.sqrt(np.mean(np.abs(got - want) ** 2)) <= 2e-3 * rms
-    # the time mask zeroed the flagged accumulations of block 6:
-    # q1 samples of accumulations 10, 11 (8 packets = 16 natives = 2 q1 each)
-    assert np.abs(Vs[1][20:24]).max() == 0.0 and np.abs(Vs[1][24:28]).max() > 0.0
+    # the time mask zeroed the flagged accumulations of block 6 (acc 10, 11)
+    q_acc = NQ // 64
+    assert np.abs(Vs[1][10 * q_acc:12 * q_acc]).max() == 0.0
+    assert np.abs(Vs[1][12 * q_acc:14 * q_acc]).max() > 0.0
 
 
 def test_sky_export_hooks(monkeypatch) -> None:

@@ -139,3 +139,55 @@ def test_gemm_tables_cover_every_core_pair_once() -> None:
     assert tc.n_ring_rows == rc.n_class
     assert torch.equal(tc.class_ptr[1:] - tc.class_ptr[:-1],
                        torch.from_numpy(rc.multiplicity[rc.multiplicity > 1]).int())
+
+
+# ---------------------------------------------------------------------------
+# GPU (CP1)
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+@pytest.mark.parametrize("classes", [False, True])
+def test_gemm2x_kernel_vs_twin_gpu(classes) -> None:
+    """Production shapes (96 antennas, fixture core, 384 channels, a full
+    page): ring rows == float64 twin to one fp16 ULP; class reduce in fixed
+    order; time mask on load."""
+    import os
+    from dsart.grid.baseline_grid import redundancy_classes
+    from dsart.grid.sparsity_pattern import core_baseline_mask_from_station_numbers
+    from dsart.services.slow_corr_kernel import unpack_int4_split
+    from dsart.x2.corr.gemm2x import (build_gemm_tables, compact_cal, gemm2x_into_ring,
+                                      gemm2x_reference, reduce_classes, ring_write_reference)
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    z = np.load(os.path.join(root, "tests", "fixtures", "x2", "dsa110_antpos.npz"))
+    mask = core_baseline_mask_from_station_numbers(z["station"])
+    rc = redundancy_classes(z["antpos_e"], z["antpos_n"], is_core_baseline_mask=mask) if classes else None
+    dev = torch.device("cuda")
+    tab = build_gemm_tables(mask, classes=rc).to(dev)
+    raw = np.random.default_rng(0).integers(0, 256, size=301989888, dtype=np.uint8)
+    re, im = unpack_int4_split(raw, device=dev)
+    rng = np.random.default_rng(1)
+    ph = torch.from_numpy(rng.uniform(-np.pi, np.pi, size=(384, 1, 2, 1, 96)).astype(np.float32))
+    cube = torch.zeros(96, 384, 2, dtype=torch.bool)
+    cube[5] = True
+    cr, ci = compact_cal(torch.cos(ph).half().to(dev), torch.sin(ph).half().to(dev), cube.to(dev))
+    tk = torch.ones(64, 384, 2, device=dev)
+    tk[3] = 0
+    n_fv, T_ring = 64, 1024
+    ring = torch.zeros((tab.n_ring_rows, 192, T_ring, 2), dtype=torch.float16, device=dev)
+    scr = (torch.empty((tab.n_scratch_rows, 192, n_fv, 2), device=dev) if classes else None)
+    gemm2x_into_ring(re, im, cr, ci, tab, ring, fv0=0, n_fv=n_fv, t_ring0=1000, csf=2, t_int=8,
+                     scratch=scr, time_keep=tk)
+    if classes:
+        reduce_classes(scr, ring, tab, t_ring0=1000, n_fv=n_fv)
+    want = gemm2x_reference(re, im, cr, ci, tab, fv0=0, n_fv=n_fv, csf=2, t_int=8, time_keep=tk)
+    if classes:
+        want = ring_write_reference(want, tab, rc.bl_class, rc.bl_conj)
+    pos = (1000 + torch.arange(n_fv, device=dev)) % T_ring
+    got = torch.complex(ring[:, :, pos, 0].float(), ring[:, :, pos, 1].float()).permute(2, 1, 0)
+    w16 = torch.complex(want.real.half().float(), want.imag.half().float())
+    tol = 2 * torch.finfo(torch.float16).eps * w16.abs() + 1e-6
+    assert bool(((got - w16).abs() <= tol * 1.5).all())

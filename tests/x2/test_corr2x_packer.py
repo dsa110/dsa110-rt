@@ -195,3 +195,35 @@ def test_v1_mode_equals_transport_tx() -> None:
         q2, sc2 = TransportTx._encode_rows(x[d].numpy(), BITS_CINT8_COMPLEX)
         assert np.array_equal(sc[d].numpy(), sc2)
         assert q[d].numpy().tobytes() == np.asarray(q2).tobytes()
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+@pytest.mark.parametrize("kw", _RULES + [dict(comp_bits=4, guard_g=1.5, hold_blocks=1)])
+def test_packer_gpu_equals_cpu(kw) -> None:
+    """CUDA packer (Triton bit packer) == the CPU twin, byte for byte."""
+    blocks, n, voff, nh = _flow_inputs(11)
+    rule = PackerRule(**kw)
+    cpu = RowRulePacker(n_d=3, value_offsets=voff, n_contrib=n, n_heavy=nh, rule=rule)
+    gpu = RowRulePacker(n_d=3, value_offsets=voff, n_contrib=n, n_heavy=nh, rule=rule, device="cuda")
+    for x in blocks:
+        a = cpu.pack(torch.from_numpy(x))
+        b = gpu.pack(torch.from_numpy(x).cuda())
+        for ra, rb in zip(a, b):
+            for k in ("payload", "codes_main", "codes_heavy", "sigma", "row_sigma"):
+                assert torch.equal(ra[k], rb[k].cpu()), k
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+def test_static_sky_and_v1_gpu_equals_cpu() -> None:
+    rng = np.random.default_rng(12)
+    x = torch.from_numpy((rng.normal(size=(6, 128, 2500)) + 1j * rng.normal(size=(6, 128, 2500)))
+                         .astype(np.complex64))
+    a = BatchedStaticSky(n_d=6, n_values=2500, window_blocks=3, warmup_cubes=1)
+    b = BatchedStaticSky(n_d=6, n_values=2500, window_blocks=3, warmup_cubes=1, device="cuda")
+    for _ in range(4):
+        torch.testing.assert_close(a.apply_(x.clone()), b.apply_(x.cuda()).cpu(), rtol=1e-6, atol=1e-6)
+    q1, s1 = pack_v1(x)
+    q2, s2 = pack_v1(x.cuda())
+    assert torch.equal(q1, q2.cpu()) and torch.equal(s1, s2.cpu())
