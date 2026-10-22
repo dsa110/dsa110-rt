@@ -253,6 +253,9 @@ class PipelinedCorrFast:
         self._ring_primed = False
         self._bin_shifts_dev: torch.Tensor | None = None
         self.n_blocks_out = 0
+        #: optional ``tap(name, block_n, re, im)`` -- CP1 compat taps see the
+        #: fast visibilities in the ring (``vis``, (NBASE, NCHAN_eff, n_fv)).
+        self.tap: Callable[..., Any] | None = None
 
     # ------------------------------------------------------------------
     # public API
@@ -659,6 +662,8 @@ class PipelinedCorrFast:
         n_fv = self._gemm_into_ring(real_v, imag_v)
         del real_v, imag_v
         cfi._tmark(ctx, "gemm")
+        if self.tap is not None:
+            self.tap("vis", block_n, self._ring_re[:, :, n_fv:], self._ring_im[:, :, n_fv:])
         dedispersed = self._stage1_from_ring(n_fv)
         # slide: cur -> prev (the cold-start block primes the ring)
         self._ring_re[:, :, :n_fv].copy_(self._ring_re[:, :, n_fv:])

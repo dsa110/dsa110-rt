@@ -15,8 +15,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 @pytest.mark.parametrize("fmt", ["2x-gridded-ns2-cint4", "2x-baselines-ns4-cint4"])
 def test_b8_describe(fmt) -> None:
     sys.path.insert(0, os.path.join(ROOT, "bench", "timeres"))
+    from types import SimpleNamespace
     import b8_corr2x
-    d = b8_corr2x.describe(fmt, b8_corr2x._antpos("fixture"), 15)
+    d = b8_corr2x.describe(fmt, b8_corr2x._antpos_for(SimpleNamespace(antpos="fixture")), 15)
     assert d["values"] > 0 and d["sources"] >= d["values"]
     assert d["ring_gib"] < 3.0
     for t in d["tiers"]:

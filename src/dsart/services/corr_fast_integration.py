@@ -5025,6 +5025,18 @@ def run(
             "n_fast_vis_per_block": ctx.kernel.n_fast_vis_per_full_block,
             "n_grid": cfg.n_grid,
             "n_filled": int(ctx.gridder.pattern.n_filled),
+            # x2: CP gates (mean block time) + the per-stage timing table
+            "ms_per_block_mean": (
+                float(np.mean(per_block_ms)) if per_block_ms else float("nan")
+            ),
+            "ms_per_block_max": (
+                float(np.max(per_block_ms)) if per_block_ms else float("nan")
+            ),
+            "stage_timer": (
+                ctx.stage_timer.summary() if ctx.stage_timer is not None else None
+            ),
+            "orchestrator": orchestrator,
+            "opoint": opoint,
         }
     finally:
         try:
