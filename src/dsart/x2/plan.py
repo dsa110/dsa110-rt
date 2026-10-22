@@ -46,6 +46,7 @@ owns coarse d; half h is search node ``SEARCH_NODES[h // 2]`` GPU ``h % 2``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import subprocess
@@ -71,6 +72,7 @@ from dsart.common.constants import (
 
 __all__ = [
     "F_CTR_MHZ",
+    "N_HALVES",
     "PLAN_SCHEMA",
     "PLAN_VERSION",
     "SEARCH_NODES",
@@ -227,13 +229,14 @@ _ARRAYS: tuple[tuple[str, str, tuple], ...] = (
     ("coarse_dm", "float64", ("C",)),
     ("coarse_tier", "int32", ("C",)),
     ("coarse_t_native", "int32", ("C",)),
-    ("fine_offsets", "int32", ("C+1",)),
+    ("fine_offset", "int32", ("C+1",)),
     ("n_fdm", "int32", ("C",)),
     ("owner_half", "int32", ("C",)),
     ("stage2_max", "int32", ("C",)),
     ("stage2_min", "int32", ("C",)),
     ("fine_dm", "float64", ("F",)),
     ("fine_to_coarse", "int32", ("F",)),
+    ("fine_local_idx", "int32", ("F",)),
     ("fine_tier", "int32", ("F",)),
     ("stage1_bins", "int32", ("G", "K", "C")),
     ("stage2_bins", "int32", ("F", "S")),
@@ -244,7 +247,7 @@ _ARRAYS: tuple[tuple[str, str, tuple], ...] = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class TieredDmPlan:
     """DM plan v3 (SPEC §2). Arrays are read-only numpy arrays; see :data:`_ARRAYS`.
 
@@ -254,12 +257,13 @@ class TieredDmPlan:
     ``[tier_fine_offsets[i], tier_fine_offsets[i+1])``.
 
     Per global coarse d: ``coarse_dm``, ``coarse_tier``, ``coarse_t_native``, the CSR
-    ``fine_offsets`` (fines of d = ``fine_offsets[d]:fine_offsets[d+1]``), ``n_fdm``
+    ``fine_offset`` (fines of d = ``fine_offset[d]:fine_offset[d+1]``), ``n_fdm``
     (VARIES per d), ``owner_half`` (= d % 8), and ``stage2_max`` / ``stage2_min``
     (extreme stage-2 shift over d's fines and all streams, tier samples; ring sizing).
 
-    Per global fine f: ``fine_dm`` (strictly increasing), ``fine_to_coarse`` (global d),
-    ``fine_tier``; ``stage2_bins[f, g * n_sub + s]`` int32 (tier samples, >= 0 here;
+    Per GLOBAL fine index f (plan order: tier A then tier B = coarse d ascending, fines
+    ascending within d): ``fine_dm`` (strictly increasing), ``fine_to_coarse`` (global d),
+    ``fine_local_idx`` (index within d's bucket, = f - fine_offset[d]), ``fine_tier``; ``stage2_bins[f, g * n_sub + s]`` int32 (tier samples, >= 0 here;
     signed by contract).
 
     ``stage1_bins[g, k, d]`` int32: stage-1 advance of summed channel k of chgroup g at
@@ -285,13 +289,14 @@ class TieredDmPlan:
     coarse_dm: np.ndarray
     coarse_tier: np.ndarray
     coarse_t_native: np.ndarray
-    fine_offsets: np.ndarray
+    fine_offset: np.ndarray
     n_fdm: np.ndarray
     owner_half: np.ndarray
     stage2_max: np.ndarray
     stage2_min: np.ndarray
     fine_dm: np.ndarray
     fine_to_coarse: np.ndarray
+    fine_local_idx: np.ndarray
     fine_tier: np.ndarray
     stage1_bins: np.ndarray
     stage2_bins: np.ndarray
@@ -307,6 +312,15 @@ class TieredDmPlan:
             if isinstance(arr, np.ndarray):
                 arr.setflags(write=False)
         self.validate()
+        object.__setattr__(self, "_plan_id", _plan_id(self))
+
+    @property
+    def plan_id(self) -> int:
+        """u64 = blake2b-64 (person ``dsart-x2-plan``) over the canonical tables: every
+        array of :data:`_ARRAYS` (name, dtype, shape, little-endian C bytes, in that order)
+        and the scalar inputs. Independent of git sha / build time: equal tables, equal id.
+        Carried by C1/C2 cutout requests and files (SPEC §9); a mismatch is PLAN_MISMATCH."""
+        return self._plan_id
 
     # -- sizes --------------------------------------------------------------------------
     @property
@@ -332,7 +346,7 @@ class TieredDmPlan:
     # -- per-DM helpers ------------------------------------------------------------------
     def fines_of(self, d: int) -> slice:
         """Global fine indices of coarse d (contiguous)."""
-        return slice(int(self.fine_offsets[d]), int(self.fine_offsets[d + 1]))
+        return slice(int(self.fine_offset[d]), int(self.fine_offset[d + 1]))
 
     def t_us(self, d: int) -> float:
         """Stream sample of coarse d (us)."""
@@ -347,6 +361,10 @@ class TieredDmPlan:
     def dms_of_half(self, h: int) -> np.ndarray:
         """Global coarse indices owned by half h (ascending)."""
         return np.flatnonzero(self.owner_half == int(h)).astype(np.int32)
+
+    def fines_of_half(self, h: int) -> np.ndarray:
+        """Global fine indices owned by half h, in global (d, fine) order (= ascending)."""
+        return np.flatnonzero(self.owner_half[self.fine_to_coarse] == int(h)).astype(np.int32)
 
     def stage2_for_coarse(self, d: int) -> np.ndarray:
         """``(n_fdm[d], n_streams)`` int32 stage-2 shifts of coarse d's fines."""
@@ -409,8 +427,10 @@ class TieredDmPlan:
         counts = np.bincount(self.fine_to_coarse, minlength=nC)
         if counts.shape[0] != nC or np.any(counts != self.n_fdm) or np.any(self.n_fdm < 1):
             raise ValueError("n_fdm must equal the fines per coarse and be >= 1 everywhere")
-        if self.fine_offsets[0] != 0 or np.any(np.diff(self.fine_offsets) != self.n_fdm):
-            raise ValueError("fine_offsets must be the CSR of n_fdm")
+        if self.fine_offset[0] != 0 or np.any(np.diff(self.fine_offset) != self.n_fdm):
+            raise ValueError("fine_offset must be the CSR of n_fdm")
+        if np.any(self.fine_local_idx != np.arange(nF) - self.fine_offset[self.fine_to_coarse]):
+            raise ValueError("fine_local_idx must be f - fine_offset[fine_to_coarse[f]]")
         if np.any(self.owner_half != np.arange(nC) % self.n_halves):
             raise ValueError("owner_half must be d % n_halves")
         if np.any(self.stage1_bins < 0):
@@ -472,7 +492,8 @@ class TieredDmPlan:
         return plan
 
     def summary(self) -> dict:
-        out = {"version": PLAN_VERSION, "n_sub": self.n_sub, "csf": self.chan_sum_factor,
+        out = {"version": PLAN_VERSION, "plan_id": f"0x{self.plan_id:016x}", "n_sub": self.n_sub,
+               "csf": self.chan_sum_factor,
                "n_coarse": self.n_coarse, "n_fine": self.n_fine, "tiers": []}
         for i in range(self.n_tiers):
             c = slice(int(self.tier_coarse_offsets[i]), int(self.tier_coarse_offsets[i + 1]))
@@ -486,6 +507,19 @@ class TieredDmPlan:
         out["dms_per_half"] = [int(np.sum(self.owner_half == h)) for h in range(self.n_halves)]
         out["fines_per_half"] = [int(self.n_fdm[self.owner_half == h].sum()) for h in range(self.n_halves)]
         return out
+
+
+def _plan_id(plan: "TieredDmPlan") -> int:
+    h = hashlib.blake2b(digest_size=8, person=b"dsart-x2-plan")
+    scal = np.array([plan.n_sub, plan.chan_sum_factor, plan.coarse_density_t_ref_native, plan.n_halves],
+                    dtype="<i8")
+    h.update(b"x2plan/v3" + scal.tobytes()
+             + np.array([plan.tol, plan.ti_us, plan.f_ctr_MHz, plan.coarse_density], dtype="<f8").tobytes())
+    for name, _, _ in _ARRAYS:
+        a = np.asarray(getattr(plan, name))
+        a = np.ascontiguousarray(a, dtype=a.dtype.newbyteorder("<"))
+        h.update(name.encode() + a.dtype.str.encode() + np.array(a.shape, dtype="<i8").tobytes() + a.tobytes())
+    return int.from_bytes(h.digest(), "little")
 
 
 # ---------------------------------------------------------------------------------------
@@ -524,12 +558,12 @@ def build_tiered_plan(*, n_sub: int, chan_sum_factor: int = 2,
     fine_tier = np.repeat(np.arange(nT, dtype=np.int32), np.diff(f_off))
     t_nat = np.array([r[3] for r in t_rows], dtype=np.int32)
     n_fdm = np.bincount(f2c, minlength=nC).astype(np.int32)
-    fine_offsets = np.zeros(nC + 1, dtype=np.int32)
-    fine_offsets[1:] = np.cumsum(n_fdm)
+    fine_offset = np.zeros(nC + 1, dtype=np.int32)
+    fine_offset[1:] = np.cumsum(n_fdm)
     stage2 = np.concatenate(s2, axis=0)
-    s2max = np.array([stage2[fine_offsets[d]:fine_offsets[d + 1]].max() if n_fdm[d] else 0
+    s2max = np.array([stage2[fine_offset[d]:fine_offset[d + 1]].max() if n_fdm[d] else 0
                       for d in range(nC)], dtype=np.int32)
-    s2min = np.array([stage2[fine_offsets[d]:fine_offsets[d + 1]].min() if n_fdm[d] else 0
+    s2min = np.array([stage2[fine_offset[d]:fine_offset[d + 1]].min() if n_fdm[d] else 0
                       for d in range(nC)], dtype=np.int32)
     if build_utc_ns is None:
         build_utc_ns = time.time_ns()
@@ -573,10 +607,11 @@ def build_tiered_plan(*, n_sub: int, chan_sum_factor: int = 2,
         tier_coarse_offsets=np.array(c_off, dtype=np.int32),
         tier_fine_offsets=np.array(f_off, dtype=np.int32),
         coarse_dm=coarse_dm, coarse_tier=coarse_tier, coarse_t_native=t_nat[coarse_tier],
-        fine_offsets=fine_offsets, n_fdm=n_fdm,
+        fine_offset=fine_offset, n_fdm=n_fdm,
         owner_half=(np.arange(nC) % N_HALVES).astype(np.int32),
         stage2_max=s2max, stage2_min=s2min,
-        fine_dm=fine_dm, fine_to_coarse=f2c, fine_tier=fine_tier,
+        fine_dm=fine_dm, fine_to_coarse=f2c,
+        fine_local_idx=(np.arange(f2c.shape[0]) - fine_offset[f2c]).astype(np.int32), fine_tier=fine_tier,
         stage1_bins=np.concatenate(s1, axis=2), stage2_bins=stage2,
         summed_freq_GHz=np.ascontiguousarray(summed_freqs_GHz(csf), dtype=np.float64),
         subband_ref_GHz=subband_ref_freqs_GHz(csf, n_sub).astype(np.float64),

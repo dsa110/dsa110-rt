@@ -60,6 +60,47 @@ def test_ownership_interleaves_over_8_halves(plan):
     assert SEARCH_NODES == ("n01", "n02", "n09", "n13")
 
 
+def test_global_fine_index(plan):
+    """SPEC §2/§9: f_global = plan order (tier A then B = d ascending, fines ascending in d)."""
+    f = np.arange(plan.n_fine)
+    assert np.all(np.diff(plan.fine_to_coarse) >= 0) and np.all(np.diff(plan.fine_dm) > 0)
+    assert plan.fine_offset.shape == (plan.n_coarse + 1,) and plan.fine_offset[-1] == plan.n_fine
+    assert np.array_equal(plan.fine_local_idx, f - plan.fine_offset[plan.fine_to_coarse])
+    for d in range(plan.n_coarse):
+        sl = plan.fines_of(d)
+        assert np.array_equal(plan.fine_to_coarse[sl], np.full(plan.n_fdm[d], d))
+        assert np.array_equal(plan.fine_local_idx[sl], np.arange(plan.n_fdm[d]))
+        assert np.all(plan.fine_tier[sl] == plan.coarse_tier[d])
+    seen = []
+    for h in range(8):
+        fh = plan.fines_of_half(h)
+        assert np.all(np.diff(fh) > 0)
+        assert np.array_equal(fh, np.concatenate([np.arange(plan.fine_offset[d], plan.fine_offset[d + 1])
+                                                  for d in plan.dms_of_half(h)]))
+        assert np.all(plan.owner_half[plan.fine_to_coarse[fh]] == h)
+        seen.append(fh)
+    assert np.array_equal(np.sort(np.concatenate(seen)), f)
+
+
+def test_plan_id_is_a_function_of_the_tables_only(plan, tmp_path):
+    again = build_tiered_plan_for_opoint(opoint_2x(n_sub=plan.n_sub), git_sha="other", build_utc_ns=12345)
+    assert again.plan_id == plan.plan_id and 0 < plan.plan_id < 2 ** 64
+    other = build_tiered_plan_for_opoint(opoint_2x(n_sub=6 - plan.n_sub), git_sha="test", build_utc_ns=0)
+    assert other.plan_id != plan.plan_id
+    p = tmp_path / "plan.npz"
+    plan.to_npz(p)
+    assert TieredDmPlan.from_npz(p).plan_id == plan.plan_id
+    bad = tmp_path / "bad.npz"
+
+    def bump(a):
+        a = a.copy()
+        a.flat[123] += 1
+        return a
+    _tamper(p, bad, stage1_bins=bump)                       # structurally valid, different table
+    assert TieredDmPlan.from_npz(bad).plan_id != plan.plan_id
+    assert plan.summary()["plan_id"] == f"0x{plan.plan_id:016x}"
+
+
 def test_shift_tables_shapes_signs_and_ring_extremes(plan):
     nsum = 192
     assert plan.stage1_bins.shape == (16, nsum, plan.n_coarse) and plan.stage1_bins.dtype == np.int32

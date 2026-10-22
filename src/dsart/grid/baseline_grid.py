@@ -111,7 +111,7 @@ def kept_core_baselines(is_core_baseline_mask: np.ndarray | None, nants: int = N
     return bl, a_list[keep].astype(np.int32), b_list[keep].astype(np.int32)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class RedundancyClasses:
     """Exact 3-D redundancy classes of the kept (core cross) baselines.
 
@@ -228,7 +228,7 @@ def redundancy_classes(antpos_e, antpos_n, antpos_u=None, *, is_core_baseline_ma
 # ---------------------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------------------
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class StreamValues:
     """The values of one (chgroup, sub-band) stream, in wire order."""
 
@@ -260,7 +260,7 @@ class StreamValues:
         return (1.0 / np.sqrt(self.n_contrib.astype(np.float64))).astype(np.float32)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CorrCsr:
     """Corr side, one stream: value v <- sources ``ptr[v]:ptr[v+1]``."""
 
@@ -275,7 +275,7 @@ class CorrCsr:
         return int(self.bl.shape[0])
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class OwnerCsr:
     """Owner side: half-spectrum cell <- entries (see module docstring)."""
 
@@ -300,7 +300,7 @@ class OwnerCsr:
         return int(self.ent_stream.shape[0])
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ValueMap:
     """Every stream's values + the owner CSR + provenance. Build with :func:`build_value_map`."""
 
