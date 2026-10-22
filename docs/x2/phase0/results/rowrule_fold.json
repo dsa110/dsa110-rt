@@ -1,0 +1,17 @@
+{
+ "csf2_nsub2": {
+  "cells_nofold": 2544.0,
+  "cells_fold": 2505.78125,
+  "saving": 0.0150230935534591
+ },
+ "csf2_nsub4": {
+  "cells_nofold": 2159.046875,
+  "cells_fold": 2123.4375,
+  "saving": 0.01649309953031941
+ },
+ "csf8_nsub4": {
+  "cells_nofold": 2134.4375,
+  "cells_fold": 2098.984375,
+  "saving": 0.016610055342449748
+ }
+}

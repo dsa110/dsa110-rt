@@ -1,0 +1,638 @@
+{
+ "bank_table": [
+  {
+   "bank": "boxcar",
+   "w": 1,
+   "lengths": [
+    1
+   ],
+   "support": 1,
+   "fwhm": 1.0,
+   "l2": 1.0,
+   "stages": 0,
+   "flops_per_output": 0
+  },
+  {
+   "bank": "boxcar",
+   "w": 2,
+   "lengths": [
+    2
+   ],
+   "support": 2,
+   "fwhm": 2.0,
+   "l2": 1.4142,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "boxcar",
+   "w": 4,
+   "lengths": [
+    4
+   ],
+   "support": 4,
+   "fwhm": 4.0,
+   "l2": 2.0,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "boxcar",
+   "w": 8,
+   "lengths": [
+    8
+   ],
+   "support": 8,
+   "fwhm": 8.0,
+   "l2": 2.8284,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "boxcar",
+   "w": 16,
+   "lengths": [
+    16
+   ],
+   "support": 16,
+   "fwhm": 16.0,
+   "l2": 4.0,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "boxcar",
+   "w": 32,
+   "lengths": [
+    32
+   ],
+   "support": 32,
+   "fwhm": 32.0,
+   "l2": 5.6569,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "boxcar",
+   "w": 64,
+   "lengths": [
+    64
+   ],
+   "support": 64,
+   "fwhm": 64.0,
+   "l2": 8.0,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "b2",
+   "w": 1,
+   "lengths": [
+    1,
+    1
+   ],
+   "support": 1,
+   "fwhm": 1.0,
+   "l2": 1.0,
+   "stages": 0,
+   "flops_per_output": 0
+  },
+  {
+   "bank": "b2",
+   "w": 2,
+   "lengths": [
+    2,
+    2
+   ],
+   "support": 3,
+   "fwhm": 2.0,
+   "l2": 2.4495,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2",
+   "w": 4,
+   "lengths": [
+    4,
+    4
+   ],
+   "support": 7,
+   "fwhm": 4.0,
+   "l2": 6.6332,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2",
+   "w": 8,
+   "lengths": [
+    8,
+    8
+   ],
+   "support": 15,
+   "fwhm": 8.0,
+   "l2": 18.5472,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2",
+   "w": 16,
+   "lengths": [
+    16,
+    16
+   ],
+   "support": 31,
+   "fwhm": 16.0,
+   "l2": 52.3068,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2",
+   "w": 32,
+   "lengths": [
+    32,
+    32
+   ],
+   "support": 63,
+   "fwhm": 32.0,
+   "l2": 147.8377,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2",
+   "w": 64,
+   "lengths": [
+    64,
+    64
+   ],
+   "support": 127,
+   "fwhm": 64.0,
+   "l2": 418.0718,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b3",
+   "w": 1,
+   "lengths": [
+    1,
+    1,
+    1
+   ],
+   "support": 1,
+   "fwhm": 1.0,
+   "l2": 1.0,
+   "stages": 0,
+   "flops_per_output": 0
+  },
+  {
+   "bank": "b3",
+   "w": 2,
+   "lengths": [
+    1,
+    2,
+    2
+   ],
+   "support": 3,
+   "fwhm": 2.0,
+   "l2": 2.4495,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b3",
+   "w": 4,
+   "lengths": [
+    3,
+    3,
+    3
+   ],
+   "support": 7,
+   "fwhm": 3.667,
+   "l2": 11.8743,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3",
+   "w": 8,
+   "lengths": [
+    6,
+    6,
+    7
+   ],
+   "support": 17,
+   "fwhm": 8.0,
+   "l2": 74.552,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3",
+   "w": 16,
+   "lengths": [
+    12,
+    13,
+    13
+   ],
+   "support": 36,
+   "fwhm": 16.091,
+   "l2": 423.0035,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3",
+   "w": 32,
+   "lengths": [
+    25,
+    25,
+    26
+   ],
+   "support": 74,
+   "fwhm": 32.136,
+   "l2": 2394.9384,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3",
+   "w": 64,
+   "lengths": [
+    50,
+    50,
+    51
+   ],
+   "support": 149,
+   "fwhm": 63.818,
+   "l2": 13328.7831,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "gauss",
+   "w": 1,
+   "lengths": null,
+   "support": 5,
+   "fwhm": 1.067,
+   "l2": 1.0039,
+   "stages": null,
+   "flops_per_output": 10
+  },
+  {
+   "bank": "gauss",
+   "w": 2,
+   "lengths": null,
+   "support": 7,
+   "fwhm": 2.0,
+   "l2": 1.2279,
+   "stages": null,
+   "flops_per_output": 14
+  },
+  {
+   "bank": "gauss",
+   "w": 4,
+   "lengths": null,
+   "support": 13,
+   "fwhm": 4.0,
+   "l2": 1.7352,
+   "stages": null,
+   "flops_per_output": 26
+  },
+  {
+   "bank": "gauss",
+   "w": 8,
+   "lengths": null,
+   "support": 23,
+   "fwhm": 8.0,
+   "l2": 2.4539,
+   "stages": null,
+   "flops_per_output": 46
+  },
+  {
+   "bank": "gauss",
+   "w": 16,
+   "lengths": null,
+   "support": 43,
+   "fwhm": 16.0,
+   "l2": 3.4703,
+   "stages": null,
+   "flops_per_output": 86
+  },
+  {
+   "bank": "gauss",
+   "w": 32,
+   "lengths": null,
+   "support": 83,
+   "fwhm": 32.0,
+   "l2": 4.9077,
+   "stages": null,
+   "flops_per_output": 166
+  },
+  {
+   "bank": "gauss",
+   "w": 64,
+   "lengths": null,
+   "support": 165,
+   "fwhm": 64.0,
+   "l2": 6.9406,
+   "stages": null,
+   "flops_per_output": 330
+  },
+  {
+   "bank": "b2h",
+   "w": 1,
+   "lengths": [
+    1
+   ],
+   "support": 1,
+   "fwhm": 1.0,
+   "l2": 1.0,
+   "stages": 0,
+   "flops_per_output": 0
+  },
+  {
+   "bank": "b2h",
+   "w": 2,
+   "lengths": [
+    2
+   ],
+   "support": 2,
+   "fwhm": 2.0,
+   "l2": 1.4142,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "b2h",
+   "w": 4,
+   "lengths": [
+    4,
+    4
+   ],
+   "support": 7,
+   "fwhm": 4.0,
+   "l2": 6.6332,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2h",
+   "w": 8,
+   "lengths": [
+    8,
+    8
+   ],
+   "support": 15,
+   "fwhm": 8.0,
+   "l2": 18.5472,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2h",
+   "w": 16,
+   "lengths": [
+    16,
+    16
+   ],
+   "support": 31,
+   "fwhm": 16.0,
+   "l2": 52.3068,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2h",
+   "w": 32,
+   "lengths": [
+    32,
+    32
+   ],
+   "support": 63,
+   "fwhm": 32.0,
+   "l2": 147.8377,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b2h",
+   "w": 64,
+   "lengths": [
+    64,
+    64
+   ],
+   "support": 127,
+   "fwhm": 64.0,
+   "l2": 418.0718,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b3h",
+   "w": 1,
+   "lengths": [
+    1
+   ],
+   "support": 1,
+   "fwhm": 1.0,
+   "l2": 1.0,
+   "stages": 0,
+   "flops_per_output": 0
+  },
+  {
+   "bank": "b3h",
+   "w": 2,
+   "lengths": [
+    2
+   ],
+   "support": 2,
+   "fwhm": 2.0,
+   "l2": 1.4142,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "b3h",
+   "w": 4,
+   "lengths": [
+    3,
+    3,
+    3
+   ],
+   "support": 7,
+   "fwhm": 3.667,
+   "l2": 11.8743,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3h",
+   "w": 8,
+   "lengths": [
+    6,
+    6,
+    7
+   ],
+   "support": 17,
+   "fwhm": 8.0,
+   "l2": 74.552,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3h",
+   "w": 16,
+   "lengths": [
+    12,
+    13,
+    13
+   ],
+   "support": 36,
+   "fwhm": 16.091,
+   "l2": 423.0035,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3h",
+   "w": 32,
+   "lengths": [
+    25,
+    25,
+    26
+   ],
+   "support": 74,
+   "fwhm": 32.136,
+   "l2": 2394.9384,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3h",
+   "w": 64,
+   "lengths": [
+    50,
+    50,
+    51
+   ],
+   "support": 149,
+   "fwhm": 63.818,
+   "l2": 13328.7831,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3x",
+   "w": 1,
+   "lengths": [
+    1
+   ],
+   "support": 1,
+   "fwhm": 1.0,
+   "l2": 1.0,
+   "stages": 0,
+   "flops_per_output": 0
+  },
+  {
+   "bank": "b3x",
+   "w": 2,
+   "lengths": [
+    2
+   ],
+   "support": 2,
+   "fwhm": 2.0,
+   "l2": 1.4142,
+   "stages": 1,
+   "flops_per_output": 2
+  },
+  {
+   "bank": "b3x",
+   "w": 2,
+   "lengths": [
+    2,
+    2
+   ],
+   "support": 3,
+   "fwhm": 2.0,
+   "l2": 2.4495,
+   "stages": 2,
+   "flops_per_output": 4
+  },
+  {
+   "bank": "b3x",
+   "w": 4,
+   "lengths": [
+    3,
+    3,
+    3
+   ],
+   "support": 7,
+   "fwhm": 3.667,
+   "l2": 11.8743,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3x",
+   "w": 8,
+   "lengths": [
+    6,
+    6,
+    7
+   ],
+   "support": 17,
+   "fwhm": 8.0,
+   "l2": 74.552,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3x",
+   "w": 16,
+   "lengths": [
+    12,
+    13,
+    13
+   ],
+   "support": 36,
+   "fwhm": 16.091,
+   "l2": 423.0035,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3x",
+   "w": 32,
+   "lengths": [
+    25,
+    25,
+    26
+   ],
+   "support": 74,
+   "fwhm": 32.136,
+   "l2": 2394.9384,
+   "stages": 3,
+   "flops_per_output": 6
+  },
+  {
+   "bank": "b3x",
+   "w": 64,
+   "lengths": [
+    50,
+    50,
+    51
+   ],
+   "support": 149,
+   "fwhm": 63.818,
+   "l2": 13328.7831,
+   "stages": 3,
+   "flops_per_output": 6
+  }
+ ],
+ "boxcar_engine_vs_original_maxdiff": 2.220446049250313e-16
+}
