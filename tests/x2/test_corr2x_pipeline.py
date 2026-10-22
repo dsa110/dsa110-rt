@@ -278,3 +278,34 @@ def test_injection_window_detection() -> None:
 
     assert injection_active(Inj(), 5) and not injection_active(Inj(), 4)
     assert not injection_active(Inj(), 6) and not injection_active(None, 5)
+
+
+def test_injection_block_takes_todays_order(monkeypatch) -> None:
+    """On an injection block the 2x chain zero-fills, applies cal to the
+    voltages, injects, and hands the GEMM unit gains (today's order)."""
+    import dsart.x2.corr.pipeline2x as p2
+    ctx, orch, *_ = _build("gridded", monkeypatch)
+    calls = []
+
+    class _Inj:
+        pending = {}
+
+        def apply_block(self, re, im, spec):
+            calls.append(spec)
+            re.add_(1.0)
+            return {"active_inj_ids": [], "n_purged": 0}
+
+    ctx.injector = _Inj()
+    monkeypatch.setattr(p2, "injection_active", lambda inj, b: True)
+    shape = (NCHAN_PER_CHGROUP, 2, 2, NPKT, NANTS)
+    re = torch.full(shape, 0.5, dtype=torch.float16)
+    im = torch.zeros(shape, dtype=torch.float16)
+    rfi = ctx.rfi_flagger.flag_block(re, im)
+    r2, i2, cr, ci, tk = orch._gains_and_voltages(re.clone(), im.clone(), rfi, 9)
+    assert calls == [9 * 2048] and tk is None
+    assert torch.equal(cr, torch.ones_like(cr)) and not ci.any()
+    g = ctx.cal.cal_real[:, 0, :, 0, :]                      # (C, P, A)
+    want = 0.5 * float(g[3, 0, 0]) + 1.0                     # cal'd, then injected
+    assert float(r2[3, 0, 0, 0, 0]) == pytest.approx(want, rel=2e-3)
+    # the flagged cells were zeroed BEFORE the injection, as today
+    assert float(r2[45, 0, 0, 0, ANTS[1]]) == 1.0
