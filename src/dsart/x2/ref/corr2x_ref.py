@@ -174,7 +174,8 @@ def value_dest_classes(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-baseline values: every (row, channel) source goes to its
     redundancy class's value, conjugated where the member is reversed."""
-    vidx = np.full(int(np.max(bl_class)) + 1, -1, np.int64)
+    size = int(max(np.max(bl_class), np.max(class_id_wire) if len(class_id_wire) else 0)) + 1
+    vidx = np.full(size, -1, np.int64)
     vidx[np.asarray(class_id_wire, np.int64)] = np.arange(len(class_id_wire))
     dest = np.repeat(vidx[np.asarray(bl_class, np.int64)][:, None], n_chan, axis=1)
     conj = np.repeat(np.asarray(bl_conj, bool)[:, None], n_chan, axis=1)

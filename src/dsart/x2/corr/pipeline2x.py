@@ -340,17 +340,20 @@ class Corr2xPipeline(PipelinedCorrFast):
                     reduce_classes(self._scratch, self._ring, self._tables_dev,
                                    t_ring0=q_block + f0, n_fv=self.fv_chunk)
             return
-        # CPU twin: complex64 GEMM of every core row, then the rows stage 1 reads
-        rows = gemm2x_reference(real_v.half(), imag_v.half(), cr, ci, self.tables, fv0=0,
-                                n_fv=self.n_q, csf=csf, t_int=8, time_keep=tk,
-                                accum=torch.float32)
-        if self.class_reduce:
-            c = self.vm.classes
-            rows = ring_write_reference(rows, self.tables, c.bl_class, c.bl_conj)
-        rows = rows[:, :, torch.from_numpy(self.needed_rows)]               # (n_q, C, Rn)
-        pos = (q_block + torch.arange(self.n_q)) % self.T_ring
-        self._ring[:, :, pos, 0] = rows.real.permute(2, 1, 0).half()
-        self._ring[:, :, pos, 1] = rows.imag.permute(2, 1, 0).half()
+        # CPU twin: complex64 GEMM of every core row (fv chunks bound the
+        # (fv, k, A, A) intermediate), then only the rows stage 1 reads.
+        need = torch.from_numpy(self.needed_rows)
+        rv, iv = real_v.half(), imag_v.half()
+        for f0 in range(0, self.n_q, 8):
+            rows = gemm2x_reference(rv, iv, cr, ci, self.tables, fv0=f0, n_fv=8, csf=csf,
+                                    t_int=8, time_keep=tk, accum=torch.float32)
+            if self.class_reduce:
+                c = self.vm.classes
+                rows = ring_write_reference(rows, self.tables, c.bl_class, c.bl_conj)
+            rows = rows[:, :, need]                                        # (8, C, Rn)
+            pos = (q_block + f0 + torch.arange(8)) % self.T_ring
+            self._ring[:, :, pos, 0] = rows.real.permute(2, 1, 0).half()
+            self._ring[:, :, pos, 1] = rows.imag.permute(2, 1, 0).half()
 
     def _stage1(self, ts: _TierState, q_emit: int) -> torch.Tensor:
         n_out = self.n_q // ts.D

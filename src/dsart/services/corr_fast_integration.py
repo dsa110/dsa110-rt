@@ -4046,6 +4046,7 @@ def run(
     # x2 WS-C: block-loop orchestrator + always-on stage timing
     orchestrator: str = "legacy",
     stage_timing: bool = True,
+    opoint: str = "1x",
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -4056,6 +4057,11 @@ def run(
     double-buffered H2D, 2-block stage-1 ring, deferred TX, gc.freeze).
     ``stage_timing``: always-on, sync-free per-stage CUDA-event timing
     (:class:`StageTimer`), published with the corr_fast heartbeat.
+    ``opoint``: ``"1x"`` (default, today's chain, nothing below changes) or
+    a 2x op-point id (``dsart.x2.opoint``, e.g. ``2x-gridded-ns2-cint4``):
+    the :class:`dsart.x2.corr.pipeline2x.Corr2xPipeline` chain (t_int 8,
+    csf 2, tiered plan, corr stage-2 FIFO off, row-rule packer). The 1x
+    TX / stage-2 options are ignored in 2x.
 
     Returns a summary dict including:
         {n_blocks_in, n_blocks_processed, n_dropped, elapsed_s,
@@ -4110,6 +4116,34 @@ def run(
             )
         antpos_e, antpos_n, core_mask = load_antpos_from_cal_blob(cfg.cal_path)
         station_numbers = load_station_numbers_for_cal(cfg.cal_path)
+
+        # ── x2: 2x op-point (behind --opoint; 1x untouched) ───────────
+        x2_op = None
+        x2_plan = None
+        if opoint != "1x":
+            from dsart.x2.opoint import opoint_from_id
+            x2_op = opoint_from_id(opoint)
+            if (cfg.t_int_fast_native != x2_op.t_int_fast_native
+                    or cfg.chan_sum_factor != x2_op.chan_sum_factor
+                    or int(cfg.n_sub) != x2_op.n_sub):
+                raise ValueError(
+                    f"--opoint {opoint} needs --t-int-fast-native "
+                    f"{x2_op.t_int_fast_native} --chan-sum-factor "
+                    f"{x2_op.chan_sum_factor} --n-sub {x2_op.n_sub}"
+                )
+            from dsart.x2.plan import TieredDmPlan, build_tiered_plan_for_opoint
+            if cfg.dm_plan_path is not None:
+                x2_plan = TieredDmPlan.from_npz(str(cfg.dm_plan_path), verify=True)
+            else:
+                x2_plan = build_tiered_plan_for_opoint(x2_op)
+            # nothing of the 1x stage-1 / stage-2 / TX stack is built in 2x
+            cfg.dm_plan_path = None
+            dm_plan = None
+            transport_tx_host = ""
+            LOG.info(
+                "x2 op-point %s: plan_id=0x%016x n_coarse=%d (stage-2 corr FIFO off)",
+                x2_op.opoint_id, int(x2_plan.plan_id), int(x2_plan.n_coarse),
+            )
 
         # ── M7.2 overlap path: real Stage2FIFO + TransportTx ─────────
         # When --transport-tx-host is set, replace the NoOp stubs with
@@ -4260,6 +4294,25 @@ def run(
             dm_plan=dm_plan,
         )
 
+        x2_orch = None
+        if x2_op is not None:
+            from dsart.grid.baseline_grid import build_value_map_for_opoint
+            from dsart.x2.corr.pipeline2x import Corr2xPipeline, NoOpTx2x
+            from dsart.x2.corr.plan2x import CorrPlan2x
+            vmap = build_value_map_for_opoint(
+                x2_op, antpos_e, antpos_n, is_core_baseline_mask=core_mask,
+                dec_deg=math.degrees(cfg.obs_dec_rad),
+            )
+            LOG.warning(
+                "x2: the v2 corner-turn sender (WS-T) is not wired yet; "
+                "2x packets go to a drain (NoOpTx2x)"
+            )
+            x2_orch = Corr2xPipeline(
+                ctx, plan=CorrPlan2x.from_tiered_plan(x2_plan), vm=vmap,
+                is_core_baseline_mask=core_mask, bits_main=x2_op.bits_main,
+                tx2x=NoOpTx2x(), expected_fada_bytes=expected_fada_bytes,
+            )
+
         # ── M7.4 Phase 6 runtime: per-chgroup inject watch ──────────────
         # When ``--inject-watch`` was passed (cfg.inject_watch_enabled),
         # build_context guarantees ctx.injector is a real OnlineInjector;
@@ -4314,6 +4367,8 @@ def run(
             from dsart.services.sky_export import SkySnapshotExporter
             pat_sky = ctx.gridder.pattern
             sky_ix_row, sky_ix_col = pat_sky.ix_row, pat_sky.ix_col
+            sky_cell_lambda = float(pat_sky.cell_lambda)
+            sky_pattern_id = int(pat_sky.pattern_id)
             # n_sub > 1: the static-sky cells are the sub-band patterns
             # concatenated, so ship their indices in the same order. A
             # grid cell filled by several sub-bands appears once per
@@ -4327,6 +4382,12 @@ def run(
                     [p.ix_row for p in _sky_layout.patterns])
                 sky_ix_col = np.concatenate(
                     [p.ix_col for p in _sky_layout.patterns])
+            if x2_orch is not None:
+                # 2x: the tier-A static sky over this chgroup's values; each
+                # value (a cell, or a redundancy class) at its owner cell.
+                sky_ix_row, sky_ix_col = x2_orch.sky_cells()
+                sky_cell_lambda = float(x2_orch.vm.cell_lambda)
+                sky_pattern_id = int(x2_orch.vm.pattern_id)
             # amp_scale: median |G| of this chgroup's cal solutions.
             # phase_only cal leaves the instrumental gain magnitudes in
             # the vis; h23 divides by amp_scale**2 to flatten the
@@ -4341,8 +4402,8 @@ def run(
                 interval_s=float(sky_export_interval_s),
                 chgroup=int(cfg.chgroup),
                 n_grid=int(pat_sky.n_grid),
-                cell_lambda=float(pat_sky.cell_lambda),
-                pattern_id=int(pat_sky.pattern_id),
+                cell_lambda=sky_cell_lambda,
+                pattern_id=sky_pattern_id,
                 ix_row=sky_ix_row,
                 ix_col=sky_ix_col,
                 dec_deg=math.degrees(cfg.obs_dec_rad),
@@ -4735,7 +4796,12 @@ def run(
         _publish_corr_fast_ready(rfi_mon_cn_id, ready=False, n_blocks=_warmup_n)
         _warmup_t0 = time.time()
         orch = None
-        if orchestrator == "pipelined":
+        if x2_orch is not None:
+            from dsart.x2.corr.pipeline1x import freeze_gc
+            orch = x2_orch
+            orch.warmup(_warmup_n)
+            LOG.info("x2 orchestrator warm; gc.freeze moved %d objects", freeze_gc())
+        elif orchestrator == "pipelined":
             from dsart.x2.corr.pipeline1x import PipelinedCorrFast, freeze_gc
             orch = PipelinedCorrFast(ctx, expected_fada_bytes=expected_fada_bytes)
             orch.warmup(_warmup_n)
@@ -4843,7 +4909,10 @@ def run(
             # Cheap monotonic compare per block; D2H + npz only on the
             # ~30 s tick; POST on a daemon thread (never blocks here).
             if sky_exporter is not None:
-                sky_exporter.maybe_export(ctx.static_sky, block_n=n_in)
+                sky_exporter.maybe_export(
+                    x2_orch.sky_static if x2_orch is not None else ctx.static_sky,
+                    block_n=n_in,
+                )
 
             if n_in % 16 == 0:
                 LOG.info(
@@ -4879,6 +4948,7 @@ def run(
                         ctx.stage_timer.poll()
                         extra.update(ctx.stage_timer.summary())
                         extra["orchestrator"] = orchestrator
+                    extra["opoint"] = opoint
                     mon_publisher.publish(
                         block_n=n_in,
                         n_processed=n_processed,
@@ -5304,6 +5374,12 @@ def main(argv: list[str] | None = None) -> int:
                         "double-buffered H2D on a copy stream, 2-block "
                         "stage-1 ring, cube mask folded into cal, deferred "
                         "TX on a D2H stream, gc.freeze); outputs lag 2 blocks.")
+    p.add_argument("--opoint", default="1x",
+                   help="x2: op-point id. '1x' (default) = today's chain. A 2x id "
+                        "(e.g. 2x-gridded-ns2-cint4, see dsart.x2.opoint) runs the "
+                        "2x corr chain (needs --t-int-fast-native 8 "
+                        "--chan-sum-factor 2 --n-sub <2|4>; --dm-plan-path then "
+                        "names a TieredDmPlan npz, else the plan is built).")
     p.add_argument("--no-stage-timing", action="store_true",
                    help="disable the always-on sync-free per-stage CUDA-event "
                         "timing published in the /mon corr_fast heartbeat")
@@ -5653,6 +5729,7 @@ def main(argv: list[str] | None = None) -> int:
             sky_export_interval_s=args.sky_export_interval_s,
             orchestrator=args.orchestrator,
             stage_timing=not args.no_stage_timing,
+            opoint=args.opoint,
         )
     except _StopRequested:
         LOG.info("clean stop")
