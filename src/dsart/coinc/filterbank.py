@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .units import period_from_mapping
+
 LOG = logging.getLogger("dsart.coinc.filterbank")
 
 N_SUBBANDS = 16
@@ -48,7 +50,9 @@ N_SUBBANDS = 16
 #: .fil native sample = fada native sample (see dsa110-bbproc bbproc.h).
 NATIVE_SAMPLE_US = 32.768
 
-#: search sample (t_int_search) in us — width_median's unit in the C2 row.
+#: 1x search sample (t_int_search) in us — width_median's unit in a C2 row
+#: that predates archive schema 2. From schema 2 on the Level3 ``c2`` dict
+#: carries ``sample_period_us`` (524.288 at 2x) and that value wins.
 T_INT_SEARCH_US = 1048.576
 
 
@@ -246,7 +250,10 @@ def run_for_event(cfg: FilterbankConfig, ev_dir: Path, name: str,
         dm = float(c2row.get("dm_median") or 0.0)
         width_search = float(c2row.get("width_median") or 1.0)
         fil_tsamp_us = NATIVE_SAMPLE_US * cfg.tscrunch
-        width_fil = max(1, round(width_search * T_INT_SEARCH_US /
+        search_period_us = period_from_mapping(
+            c2row, "sample_period_us", "peak_sample_period_us",
+            default=T_INT_SEARCH_US)
+        width_fil = max(1, round(width_search * search_period_us /
                                  fil_tsamp_us))
         report.update({"n_fragments": n_frags, "l": l, "m": m, "dm": dm,
                        "width_fil_samples": width_fil, "dec_deg": dec_deg})

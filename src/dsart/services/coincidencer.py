@@ -62,9 +62,9 @@ import yaml
 
 from ..coinc import wire
 from ..coinc.archive import (
-    C1_WINDOW_CSV_FIELDS,
-    C2_CLUSTER_CSV_FIELDS,
     EventArchiveWriter,
+    c1_window_fields,
+    c2_cluster_fields,
     entry_to_csv_row,
     stats_to_csv_row,
     stats_to_l3_metadata,
@@ -379,6 +379,13 @@ class CoincidencerConfig:
     plot_dispatch_poll_s: float = 5.0
     plot_expected_cube_count: int = 8
 
+    # x2 (docs/x2/downstream_inventory.md D1): archive schema 1 writes
+    # today's CSV columns + Level3 keys byte-for-byte; 2 appends the sample
+    # unit + peak provenance (sample_period_us, width_ms, dm_peak, ...).
+    # ``opoint`` is the op-point label recorded at schema 2 ("1x"/"2x").
+    archive_schema: int = 1
+    opoint: str = ""
+
     # Mon-points export.
     mon_etcd_key: str = "/mon/c2/h23"
     mon_publish_interval_s: float = 5.0
@@ -598,6 +605,8 @@ class CoincidencerConfig:
             plot_expected_cube_count=int(
                 coinc.get("plot_expected_cube_count", 8),
             ),
+            archive_schema=int(coinc.get("archive_schema", 1)),
+            opoint=str(coinc.get("opoint", "") or ""),
             mon_etcd_key=str(coinc.get("mon_etcd_key", "/mon/c2/h23")),
             mon_publish_interval_s=float(
                 coinc.get("mon_publish_interval_s", 5.0),
@@ -812,18 +821,24 @@ class CoincidencerService:
         # useful). Default off — see ``CoincidencerConfig.write_c1_csv``.
         self._c1_csv: Optional[RollingCsvWriter] = (
             RollingCsvWriter(
-                config.csv_dir_c1, "c1", C1_WINDOW_CSV_FIELDS,
+                config.csv_dir_c1, "c1",
+                c1_window_fields(config.archive_schema),
                 retention_hours=config.csv_retention_hours,
             )
             if config.write_c1_csv
             else None
         )
         self._c2_csv = RollingCsvWriter(
-            config.csv_dir_c2, "c2", C2_CLUSTER_CSV_FIELDS,
+            config.csv_dir_c2, "c2",
+            c2_cluster_fields(config.archive_schema),
             retention_hours=config.csv_retention_hours,
         )
 
-        self._archive = EventArchiveWriter(config.event_archive_root)
+        self._archive = EventArchiveWriter(
+            config.event_archive_root,
+            schema=config.archive_schema,
+            opoint=config.opoint,
+        )
 
         self._broadcaster = broadcaster or TriggerBroadcaster(
             config.dump_broadcast_hosts,
@@ -1484,6 +1499,7 @@ class CoincidencerService:
                     entry_to_csv_row(
                         e, trigger="",
                         inj_id=inj_id_by_entry_id.get(id(e), ""),
+                        schema=self._config.archive_schema,
                     ),
                     now_utc=now_utc,
                 )
@@ -1793,6 +1809,8 @@ class CoincidencerService:
                 stats_to_csv_row(
                     stats, trigger_class=trigger_class.name,
                     trigger=event_name,
+                    schema=self._config.archive_schema,
+                    opoint=self._config.opoint,
                 ),
                 now_utc=now_utc,
             )
@@ -1967,6 +1985,8 @@ class CoincidencerService:
                 stats_to_csv_row(
                     stats, trigger_class=trigger_class.name,
                     trigger="",
+                    schema=self._config.archive_schema,
+                    opoint=self._config.opoint,
                 ),
                 now_utc=now_utc,
             )
@@ -2047,6 +2067,8 @@ class CoincidencerService:
                 inj_ids=pp.member_inj_ids.values(),
                 pointing_dec_deg=pointing_dec_deg,
                 pointing_dec_meta=pointing_dec_meta,
+                archive_schema=self._config.archive_schema,
+                opoint=self._config.opoint,
             ),
         )
         return ev_dir
