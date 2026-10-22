@@ -47,7 +47,7 @@ against them; everything else is fixed. Change requests go through integration.
 | `dm_tol`, `dm_ti_us` | float or None | None | 1.25, 40.0 |
 | `coarse_density`, `coarse_density_t_ref_native` | float or None, int | None, 32 | 0.0206, 32 |
 | `normalise_values` | bool | False | True (value / sqrt(n) on the wire, x sqrt(n) at the owner) |
-| `heavy_frac` | float or None | None | 1e-4 (heavy iff n >= heavy_frac x N_image) |
+| `heavy_frac` | float or None | None | 3e-5 (heavy iff n >= heavy_frac x N_image; was 1e-4 in v1, changed by integration 2026-10-22 per Phase 0 study 1: at 1e-4 the n_sub 4 formats compress 2.8-2.9% at the 250-sigma rail) |
 | `redundancy_tol_m` | float | 0.05 | 0.05 |
 | `n_grid`, `cell_lambda_mode` | int, str | 256, "tee45" | 256, "tee45" |
 | `n_halves` | int | 8 | 8 |
@@ -170,7 +170,7 @@ Common to both n_sub:
 ## 3. Value maps (`src/dsart/grid/baseline_grid.py`) [FROZEN v1 by WS-P, 2026-10-22]
 **Builders.**
 - `build_value_map(antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, kind, n_sub, chan_sum_factor,
-  dec_deg, cell_lambda, n_grid=256, heavy_frac=1e-4, normalise=True, redundancy_tol_m=0.05) -> ValueMap`.
+  dec_deg, cell_lambda, n_grid=256, heavy_frac=3e-5, normalise=True, redundancy_tol_m=0.05) -> ValueMap`.
 - `build_value_map_for_opoint(op, antpos_e, antpos_n, *, antpos_u=None, is_core_baseline_mask, dec_deg,
   cell_lambda=None)`. With `cell_lambda=None` it uses `cell_lambda_for_pixel_arcsec(45, n_grid)` (tee45).
 - `OPPOINT_1X` gives the 1x-compat map: gridded, n_sub 4, csf 8, `heavy_frac=None`, `normalise=False`.
@@ -220,7 +220,10 @@ The builder is numpy-only. Importing the module pulls in torch via `dsart/grid/_
 - Owner cell `(cell_row, cell_col)`, uint16, in today's single-side `[n_grid, n_grid]` layout
   (`SparsityPattern.ix_row/ix_col`; LUT form `row x n_grid + col`, `ValueMap.cell_flat(stream)`).
 - `heavy` = `n >= heavy_threshold`, where `heavy_threshold = ceil(heavy_frac x N_image)` in exact rationals and
-  N_image = the sum of n over all values of all streams (10,202,112 at 2x, giving a threshold of 1021).
+  N_image = the sum of n over all values of all streams (10,202,112 at 2x, giving a threshold of 307 at
+  3e-5; 1021 at v1's 1e-4). Heavy values per stream at 3e-5 (Phase 0 rowrule.md): gridded n_sub 2 103 (48.5% of
+  the natural weight), n_sub 4 90 (47.4%); per-baseline n_sub 2 97 (50.1%), n_sub 4 91 (49.2%). The measured
+  table below is at v1's 1e-4.
 
 **Wire order** within a stream: heavy values first, then main values. Each group is in (cell key
 `(row << 16) | col`, class id) order. With no heavy class (1x) this is today's pattern order.
@@ -438,10 +441,126 @@ coarse DM, plus `meta.json` and `RAW_OK.json`.
 - C3, the plotter, Slack and the dashboard read products through one adapter, which also reads 1x
   cubes bit-identically.
 
-## 10. Op-point switching [FREEZE: WS-O]
-etcd `/cnf/opoints/{1x,1x-legacy,2x}/{pipeline_rt,search_rt}`, `/cnf/opoint`; per-op-point sections in
-`configs/dsart_pipeline_rt.yaml`, `dsart_search_rt.yaml`, `c2_trigger_criteria.yaml`; services take
-`--opoint`. The web-UI Start control switches only when stopped (plan §Op-point switching).
+## 10. Op-point switching [FROZEN v1 by WS-O, 2026-10-22]
+Code: `src/dsart/x2/opoint_runtime.py`, `src/dsart/x2/config_diff.py`, `tools/ops/push_dsart_to_etcd.py`,
+`tools/dashboard/dsa_monitor/opoint_switch.py`, and the Start control (`app.py /control/start`,
+`control_store.control_start_fleet`). Tests: `tests/x2/test_opoint_runtime.py`, `test_push_opoint.py`,
+`test_opoint_switch.py`.
+
+**Selections.** A selection is what the operator picks and what etcd sets are keyed by:
+- `1x`: today's search, run by the unified code in 1x-compat mode;
+- `1x-legacy`: today's search as deployed before x2 (until it is retired);
+- a 2x op-point id `2x-<kind>-ns<n>-cint<b>` (§1 `OpPoint.opoint_id`). The UI offers the six CP1
+  rows of `FORMATS_2X`.
+
+Both 1x selections have op-point id `1x`. `opoint_runtime.validate_selection` / `op_of` /
+`config_set_of` map a selection to its `OpPoint` and its config set.
+
+**Config sets (repo).**
+- `configs/{dsart_pipeline_rt,dsart_search_rt,c2_trigger_criteria}.yaml` is the base set. It stays
+  byte-identical to production and is used by `1x` and `1x-legacy`.
+- `configs/opoints/<set>/<same names>` holds a set's own files. `1x` and `1x-legacy` fall back to
+  the base per file. `2x` never falls back.
+- `configs/opoints/2x/*` is a template for every 2x format:
+  - routine `args`/`hostargs` may use `${var}`. `render_context(sel, plan, plan_path)` supplies:
+    - from the op-point: `opoint_id`, `n_sub`, `n_streams` (16 x n_sub), `value_kind`,
+      `bits_main`, `bits_heavy`, `t_int_fast_native`, `chan_sum_factor`, `t_ext_us`,
+      `t_ext_native`, `stage1_q_native`, `n_grid`;
+    - from the v3 plan: `plan_path`, `plan_id` (0x%016x), `n_coarse`, `n_fine`, `max_fine_dm`;
+    - per half h: `owned_coarse_csv_h<h>`, `n_owned_h<h>`, `n_owned_A_h<h>`, `n_owned_B_h<h>`,
+      `n_fine_h<h>`;
+    - per search node X: `owned_coarse_csv_X`, `n_owned_X`.
+  - Variables are allowed only there, because the h23 services read every other block straight
+    from the file.
+  - Paths to op-point-managed files must point into the set's own directory.
+  - Values not decided yet are `X2TODO:<owner>:<what>` tokens (they fail argument parsing) or
+    entries of a top-level `x2_todo:` list. Both block a switch.
+  - `x2_cp2_recalibrate:` lists 1x values to recalibrate at CP2. It does not block.
+- **Time units are explicit per op-point.** The code defaults are 2x. `time_units_for(op)`
+  requires, with the op-point's value:
+  - corr_fast `--t-int-fast-native` and `--chan-sum-factor`;
+  - both search halves' `--t-int-search-us` (= `t_ext_us`) and `--chan-sum-factor`;
+  - `c1.max_c1c2_width_samples` (= 512 native: 16 | 32);
+  - `c1.merger.sample_period_specnum` (= 16 at every op-point: wall-clock merge window);
+  - `cube.sample_period_specnum` (16).
+
+  Validation fails if any of these is missing or wrong.
+
+**etcd.**
+- `/cnf/opoints/<sel>/{pipeline_rt,search_rt}`: rendered sets. Each carries top-level `opoint`
+  (the op-point id) and `opoint_selection`; 2x sets also carry `plan_id` and `plan_path`.
+- `/cnf/opoints/<sel>/meta`: provenance (`opoint`, `selection`, `config_set`, `plan_id`,
+  `plan_path`, `pushed_utc`, `user`, `host`, `source` yaml|live, per-file sha256, `git_sha`,
+  `placeholders`).
+- `/cnf/opoint`: the active record `{opoint: <op-point id>, selection, config_set, plan_id,
+  plan_path, set_utc, user, host, previous, sha256, set_meta}`. Absent means selection `1x`.
+- `/cnf/opoints/_previous/{pipeline_rt,search_rt,opoint}`: a one-deep backup written by each switch.
+- `/cnf/opoints/_kpark/<1x|2x>/<bucket>`: injection K parked per K family.
+
+Writers:
+- `push_dsart_to_etcd.py --opoint <sel>` writes `/cnf/opoints/<sel>/*` only. It is a dry run unless
+  `--write`, prints a structural diff, and validates the set. A 2x selection needs `--plan <v3
+  npz>`, whose `plan_id` must equal a rebuild from the op-point. `--seed-from-live` snapshots
+  production into a 1x set.
+- The Start control is the only writer of `/cnf/pipeline_rt`, `/cnf/search_rt` and `/cnf/opoint`
+  for switches.
+- The legacy `push_dsart_to_etcd.py` without `--opoint` is unchanged.
+
+**Services.**
+- **h23 services** (C2, C3, inject bot):
+  - `--opoint {auto | <selection>}`, default `auto` (`opoint_runtime.add_opoint_argument`);
+  - at startup they call `select_service_config(<--config path>, cli_opoint=...)`. This reads
+    `/cnf/opoint` once (3 tries; on an etcd outage, the last-seen value from
+    `~/.local/state/dsart/opoint_last.json`, then 1x with a warning). It returns the
+    `ActiveOpPoint` (`selection`, `opoint_id`, `config_set`, `plan_id`, `plan_path`, `source`) and
+    maps the unit's base-set path to the set's file;
+  - the op-point is fixed for the process lifetime: a switch restarts them;
+  - C2 criteria hot reload re-reads the same (set's) criteria file;
+  - every service publishes `opoint` (the op-point id string, inventory §4), `opoint_selection` and
+    `plan_id` in its mon payload.
+- **Node services** get `--opoint <op-point id>` in their rendered routine args. Absent means
+  today's (1x-legacy) behaviour.
+- **Plan check.** Every service that loads the v3 plan must compare `plan.plan_id` with the set's
+  `plan_id` (template variable `${plan_id}`, or `/cnf/opoint.plan_id`) and refuse to run on a
+  mismatch.
+
+**Switch (web-UI Start with an op-point selection).**
+
+A Start with the active selection and no "re-apply" is today's start. It first checks that the
+live configs carry the active selection's stamp; an unstamped config counts as a 1x selection.
+
+Otherwise `opoint_switch.switch_opoint` runs these steps:
+1. Fleet READY (`compute_system_state`) and no search orchestrator running.
+2. `systemctl --user` reachable. The dashboard is the systemd --user unit `dsa_monitor.service`
+   under the same manager; `SystemdUser` fills `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` from
+   `/run/user/<uid>` when missing.
+3. The stored set is valid: rendered for the selection, explicit time units, no placeholders, no
+   cross-set references, same plan in both instances.
+4. The h23 files the services will read are present and clean, and the inject bot state file is
+   not shared across K families.
+5. The h23 copy of the plan (if present) has the same `plan_id`. A different plan refuses the
+   switch; a missing plan is a warning.
+6. Backup of the live keys.
+7. `dsart_inject_bot` is stopped.
+8. One atomic etcd write (transaction) of the two live configs, `/cnf/opoint`, and the K moves.
+   Between K families (1x | 2x), the live `/cnf/inject/snr_calibration/*` is parked and the new
+   family's parked K is restored. The bot's own K memory is per op-point because the 2x set has
+   its own `inject_bot.state_path`.
+9. A read-back of the write.
+10. Restart, in order: `dsart_c2`, `dsart_c3`, `dsart_inject_bot`, `hiplot_c1`, `hiplot_c2`.
+11. A wait until each unit is active/running on a new MainPID that stays stable for 8 s (90 s
+    timeout).
+12. Node housekeeping, then the start broadcast.
+
+A failure after step 7 writes every touched key back to its exact previous value (absent keys are
+deleted) and restarts the units again. The Start is then refused (HTTP 409) with the reason.
+Every step is audit-logged under namespace `opoint`.
+
+Without `PYTHONHASHSEED` in `dsart_c2`, the switch warns. The drop-in
+`systemd/dsart_c2.service.d/x2-pythonhashseed.conf` fixes this.
+
+The banner shows the active selection, its plan_id, and whether the live configs match.
+`GET /control/opoint` reports which stored sets are switchable.
 
 ## 11. Ownership (single owner per file; others request changes through the owner)
 - WS-P: `src/dsart/x2/opoint.py`, `src/dsart/x2/plan.py`, `src/dsart/grid/baseline_grid.py`,

@@ -234,7 +234,7 @@ def opoint_2x(value_kind: str = "gridded", n_sub: int = 2, bits_main: int = 8) -
         dm_ti_us=40.0,
         coarse_density=0.0206,
         normalise_values=True,
-        heavy_frac=1e-4,
+        heavy_frac=3e-5,     # Phase 0 study 1: 1e-4 compressed n_sub 4 values 2.8-2.9% at the 250-sigma rail
     )
 
 
