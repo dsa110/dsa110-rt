@@ -1094,8 +1094,9 @@ RV_MISSING = 1 << 3
 RV_LAPPED = 1 << 4
 RV_RFI_WARMING_UP = 1 << 5
 RV_NOISE_WARMUP = 1 << 6
+RV_ROW_GUARD = 1 << 7
 RV_NAMES = ("present", "hole", "pattern_mismatch", "missing", "lapped",
-            "rfi_warming_up", "noise_warmup")
+            "rfi_warming_up", "noise_warmup", "row_guard")
 
 RX4_COUNTERS = (
     "datagrams", "ok", "bad_length", "bad_magic", "bad_version", "bad_flags",
@@ -1349,16 +1350,14 @@ class RingV4Spec:
             rows = int(np.ceil(retention_s / (f * NATIVE_SAMPLE_S)))
             tbuf.append(int(np.ceil(rows / cyc) * cyc))
         s_main = s_heavy = 0.0
-        quant_mode = 0
         if rule is not None:
             s_main, s_heavy = float(rule.s_main_f32), float(rule.s_heavy_f32)
-            quant_mode = 1 if rule.midrise else 0
         return cls(
             dms=tuple(dms), t_int_factor=tuple(tif), t_buf=tuple(tbuf),
             n_stream=int(value_map.n_streams), n_sub=int(value_map.n_sub),
             bits_main=int(opoint.bits_main), bits_heavy=int(opoint.bits_heavy) or 16,
             value_kind=0 if value_map.kind == "gridded" else 1,
-            n_grid=int(value_map.n_grid), quant_mode=quant_mode, s_main=s_main,
+            n_grid=int(value_map.n_grid), s_main=s_main,
             s_heavy=s_heavy, check_scales=rule is not None,
             stream_n_values=tuple(int(x) for x in value_map.n_values),
             stream_n_heavy=tuple(int(x) for x in value_map.n_heavy),
@@ -1514,33 +1513,71 @@ class DmSnapshot:
     status: str                     # complete | deadline | too_late
 
 
-class RxRingV4Reader:
-    """Read-only consumer of a v4 ring (SPEC §6 API for WS-S)."""
+_TAG_WRITING = np.uint64(0xFFFFFFFFFFFFFFFF)
+_SEQ_MASK = np.uint64((1 << 56) - 1)
 
-    def __init__(self, shm_name: str, mm, mm_rw=None) -> None:
-        import mmap as _mmap  # noqa: F401  (keeps the mapping types documented)
+
+def _classify_tags(tags: np.ndarray, t_first: int, max_end: np.ndarray, t_buf: int) -> np.ndarray:
+    """numpy twin of ``rx4_classify`` (recv_ring.c): tags ``u64 [n_stream,
+    n_rows]`` of rows ``t_first ..`` -> ``RV_*`` uint8."""
+    n = tags.shape[1]
+    seq = (np.uint64(t_first) + np.arange(n, dtype=np.uint64))[None, :]
+    writing = tags == _TAG_WRITING
+    ts = tags & _SEQ_MASK
+    fl = (tags >> np.uint64(56)).astype(np.uint8)
+    v = np.full(tags.shape, RV_MISSING, dtype=np.uint8)
+    match = (ts == seq) & ~writing
+    present = match & ((fl & 0x01) != 0)
+    hole = match & ~present & ((fl & 0x02) != 0)
+    mism = match & ~present & ~hole & ((fl & 0x04) != 0)
+    pv = (RV_PRESENT | np.where(fl & 0x08, RV_RFI_WARMING_UP, 0)
+          | np.where(fl & 0x10, RV_NOISE_WARMUP, 0)
+          | np.where(fl & 0x20, RV_ROW_GUARD, 0)).astype(np.uint8)
+    v[present] = pv[present]
+    v[hole] = RV_HOLE
+    v[mism] = RV_PATTERN_MISMATCH
+    v[~writing & (ts > seq) & ((fl & 0x07) != 0)] = RV_LAPPED
+    lap_w = writing & (max_end.astype(np.uint64)[:, None] > seq + np.uint64(t_buf))
+    v[lap_w] = RV_LAPPED
+    return v
+
+
+class RxRingV4Reader:
+    """Read-only consumer of a v4 ring (SPEC §6 API for WS-S).
+
+    ``access="mmap"`` (default, today's consumer model): one ``PROT_READ``
+    mapping; zero-copy windows, C helpers with acquire loads.
+    ``access="pread"``: NO mapping at all — header, progress, tags, steps and
+    rows are ``pread``/``preadv`` from an ``O_RDONLY`` fd into process memory
+    (pass pinned host buffers as ``out=``), the seqlock check re-reads the
+    tags after the copy. Both paths return identical bytes and validity
+    (tested); CP1 times both under full load (ledger E5)."""
+
+    def __init__(self, shm_name: str, fd: int, *, access: str = "mmap", mm=None,
+                 mm_rw=None) -> None:
+        if access not in ("mmap", "pread"):
+            raise ValueError(f"access={access!r}, expected 'mmap' or 'pread'")
         self.shm_name = shm_name
+        self.access = access
+        self._fd = fd
         self._mm = mm
         self._mm_rw = mm_rw
         self._lib = _rx4_lib()
-        self._buf = np.frombuffer(mm, dtype=np.uint8)
-        self._base = self._buf.ctypes.data
-        h = np.frombuffer(mm, dtype=_RX4_HDR_DT, count=1)[0]
+        static = os.pread(fd, RX4_HEADER_BYTES, 0)
+        h = np.frombuffer(static, dtype=_RX4_HDR_DT, count=1)[0]
         if int(h["magic"]) != 0xD5A1107E or int(h["version"]) != RX4_VERSION:
             raise RuntimeError(f"{shm_name}: not a v4 ring (magic/version)")
-        self._hdr = h
         self._n_dm = int(h["n_dm"])
+        self._data_start = int(h["data_start"])
+        self._generation = int(h["generation"])
         self.fmt = RingFormat(
             n_stream=int(h["n_stream"]), n_sub=int(h["n_sub"]), row_bytes=int(h["row_bytes"]),
             bits_main=int(h["bits_main"]), bits_heavy=int(h["bits_heavy"]),
             value_kind=int(h["value_kind"]), n_grid=int(h["n_grid"]),
             quant_mode=int(h["quant_mode"]), s_main=float(h["s_main"]),
             s_heavy=float(h["s_heavy"]))
-        self._dmd = np.frombuffer(mm, dtype=_RX4_DM_DT, count=RX4_MAX_DM, offset=_RX4_OFF_DMS)
-        self._sd = np.frombuffer(mm, dtype=_RX4_STREAM_DT, count=RX4_MAX_STREAM, offset=_RX4_OFF_STREAMS)
-        self._flows = np.frombuffer(mm, dtype=_RX4_FLOW_DT, count=RX4_MAX_DM * RX4_MAX_STREAM,
-                                    offset=_RX4_OFF_FLOWS).reshape(RX4_MAX_DM, RX4_MAX_STREAM)
-        self._counters = np.frombuffer(mm, dtype="<u8", count=32, offset=_RX4_OFF_COUNTERS)
+        self._dmd = np.frombuffer(static, dtype=_RX4_DM_DT, count=RX4_MAX_DM,
+                                  offset=_RX4_OFF_DMS).copy()
         self._dms = []
         self._local = {}
         for i in range(self._n_dm):
@@ -1551,17 +1588,22 @@ class RxRingV4Reader:
             self._local[info.dm] = i
         ns, rb = self.fmt.n_stream, self.fmt.row_bytes
         self._data = {}
-        for i, info in enumerate(self._dms):
-            off = int(self._dmd[i]["data_off"])
-            n = ns * info.t_buf * rb
-            src = self._buf
-            if mm_rw is not None:
-                ds = int(self._hdr["data_start"])
-                src = np.frombuffer(mm_rw, dtype=np.uint8)
-                off -= ds
-            arr = src[off:off + n].reshape(ns, info.t_buf, rb)
-            arr.flags.writeable = False
-            self._data[info.dm] = arr
+        if access == "mmap":
+            self._buf = np.frombuffer(mm, dtype=np.uint8)
+            self._base = self._buf.ctypes.data
+            self._flows_mm = np.frombuffer(mm, dtype=_RX4_FLOW_DT,
+                                           count=RX4_MAX_DM * RX4_MAX_STREAM,
+                                           offset=_RX4_OFF_FLOWS).reshape(RX4_MAX_DM, RX4_MAX_STREAM)
+            for i, info in enumerate(self._dms):
+                off = int(self._dmd[i]["data_off"])
+                n = ns * info.t_buf * rb
+                src = self._buf
+                if mm_rw is not None:
+                    src = np.frombuffer(mm_rw, dtype=np.uint8)
+                    off -= self._data_start
+                arr = src[off:off + n].reshape(ns, info.t_buf, rb)
+                arr.flags.writeable = False
+                self._data[info.dm] = arr
         self._rc: dict[int, dict] = {d.dm: {"windows": {}, "rows": dict.fromkeys(RV_NAMES, 0),
                                              "overruns": 0, "stall_warnings": 0,
                                              "snapshots": {}} for d in self._dms}
@@ -1571,62 +1613,113 @@ class RxRingV4Reader:
     # -- open / close ----------------------------------------------------------
 
     @classmethod
-    def open(cls, shm_name: str, *, attach_timeout_s: float = 0.0,
+    def open(cls, shm_name: str, *, access: str = "mmap", attach_timeout_s: float = 0.0,
              data_writable: bool = False) -> "RxRingV4Reader":
-        """Attach read-only (``O_RDONLY`` + ``PROT_READ``). Waits up to
-        ``attach_timeout_s`` for the segment to exist and be READY.
-        ``data_writable`` adds a second, read-write mapping of the DATA region
-        only, so views can be ``cudaHostRegister``-ed without
+        """Attach read-only (``O_RDONLY``; ``PROT_READ`` in mmap mode). Waits up
+        to ``attach_timeout_s`` for the segment to exist and be READY.
+        ``data_writable`` (mmap mode) adds a second, read-write mapping of the
+        DATA region only, so views can be ``cudaHostRegister``-ed without
         ``cudaHostRegisterReadOnly``; the views stay numpy-read-only and the
         header / tags are never mapped writable."""
         import mmap
+        if access not in ("mmap", "pread"):
+            raise ValueError(f"access={access!r}, expected 'mmap' or 'pread'")
         path = "/dev/shm/" + shm_name.lstrip("/")
         t_end = time.monotonic() + attach_timeout_s
         while True:
+            fd = -1
             try:
                 fd = os.open(path, os.O_RDONLY)
-                try:
-                    size = os.fstat(fd).st_size
-                    if size >= RX4_HEADER_BYTES:
-                        mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
-                        st = int(np.frombuffer(mm, "<u8", 1, 120)[0])
-                        if st >= 1:
-                            break
-                        mm.close()
-                finally:
-                    os.close(fd)
+                size = os.fstat(fd).st_size
+                if size >= RX4_HEADER_BYTES:
+                    st = int(np.frombuffer(os.pread(fd, 8, 120), "<u8")[0])
+                    if st >= 1:
+                        break
             except FileNotFoundError:
                 pass
+            if fd >= 0:
+                os.close(fd)
             if time.monotonic() >= t_end:
                 raise FileNotFoundError(f"ring v4 {shm_name} not ready")
             time.sleep(0.05)
-        mm_rw = None
-        if data_writable:
-            ds = int(np.frombuffer(mm, "<u8", 1, 72)[0])
-            fd = os.open(path, os.O_RDWR)
-            try:
-                mm_rw = mmap.mmap(fd, size - ds, flags=mmap.MAP_SHARED,
-                                  prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=ds)
-            finally:
-                os.close(fd)
-        return cls(shm_name, mm, mm_rw)
+        mm = mm_rw = None
+        try:
+            if access == "mmap":
+                mm = mmap.mmap(fd, size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+                if data_writable:
+                    ds = int(np.frombuffer(os.pread(fd, 8, 72), "<u8")[0])
+                    fd2 = os.open(path, os.O_RDWR)
+                    try:
+                        mm_rw = mmap.mmap(fd2, size - ds, flags=mmap.MAP_SHARED,
+                                          prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=ds)
+                    finally:
+                        os.close(fd2)
+            return cls(shm_name, fd, access=access, mm=mm, mm_rw=mm_rw)
+        except Exception:
+            os.close(fd)
+            raise
 
     def close(self) -> None:
         self._data = {}
-        for name in ("_buf", "_hdr", "_dmd", "_sd", "_flows", "_counters"):
-            setattr(self, name, None)
+        for name in ("_buf", "_flows_mm"):
+            if hasattr(self, name):
+                setattr(self, name, None)
         for m in (self._mm, self._mm_rw):
             if m is not None:
                 try:
                     m.close()
                 except BufferError:
                     pass
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
 
     def __enter__(self) -> "RxRingV4Reader":
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    # -- low-level reads (the only places that touch the segment) -------------
+
+    def _u64_at(self, off: int) -> int:
+        if self.access == "mmap":
+            return int(np.frombuffer(self._mm, "<u8", 1, off)[0])
+        return int(np.frombuffer(os.pread(self._fd, 8, off), "<u8")[0])
+
+    def _flows(self, i: int) -> np.ndarray:
+        ns = self.fmt.n_stream
+        if self.access == "mmap":
+            return self._flows_mm[i, :ns].copy()
+        off = _RX4_OFF_FLOWS + i * RX4_MAX_STREAM * _RX4_FLOW_DT.itemsize
+        return np.frombuffer(os.pread(self._fd, ns * _RX4_FLOW_DT.itemsize, off), _RX4_FLOW_DT)
+
+    def _pread_into(self, out: np.ndarray, off: int) -> None:
+        mv = memoryview(out).cast("B")
+        got = 0
+        while got < len(mv):
+            n = os.preadv(self._fd, [mv[got:]], off + got)
+            if n <= 0:
+                raise OSError(f"short pread at {off + got}")
+            got += n
+
+    def _pread_runs(self, info: DmInfo, region_off: int, item: int, t_first: int, n_rows: int,
+                    out: np.ndarray) -> None:
+        """Per-stream [t_first, t_first+n_rows) of a [n_stream][t_buf] x ``item``
+        region into ``out [n_stream, n_rows, ...]`` (1-2 preads per stream)."""
+        tb = info.t_buf
+        i0 = int(t_first) % tb
+        n1 = min(n_rows, tb - i0)
+        for s in range(self.fmt.n_stream):
+            base = region_off + s * tb * item
+            self._pread_into(out[s, :n1], base + i0 * item)
+            if n1 < n_rows:
+                self._pread_into(out[s, n1:], base)
+
+    def _tags(self, info: DmInfo, t_first: int, n_rows: int) -> np.ndarray:
+        t = np.empty((self.fmt.n_stream, n_rows), dtype="<u8")
+        self._pread_runs(info, int(self._dmd[info.local]["tags_off"]), 8, t_first, n_rows, t)
+        return t
 
     # -- description -----------------------------------------------------------
 
@@ -1637,22 +1730,20 @@ class RxRingV4Reader:
         return self._dms[self._loc(dm)]
 
     def streams(self) -> list[StreamInfo]:
-        out = []
-        for s in range(self.fmt.n_stream):
-            sd = self._sd[s]
-            out.append(StreamInfo(stream=s, n_values=int(sd["n_values"]),
-                                  n_heavy=int(sd["n_heavy"]),
-                                  bytes_per_sample=int(sd["bytes_per_sample"]),
-                                  pattern_id=int(sd["pattern_id"]) if int(sd["pid_set"]) else None))
-        return out
+        raw = os.pread(self._fd, RX4_MAX_STREAM * _RX4_STREAM_DT.itemsize, _RX4_OFF_STREAMS)
+        sd = np.frombuffer(raw, dtype=_RX4_STREAM_DT)
+        return [StreamInfo(stream=s, n_values=int(sd[s]["n_values"]), n_heavy=int(sd[s]["n_heavy"]),
+                           bytes_per_sample=int(sd[s]["bytes_per_sample"]),
+                           pattern_id=int(sd[s]["pattern_id"]) if int(sd[s]["pid_set"]) else None)
+                for s in range(self.fmt.n_stream)]
 
     @property
     def generation(self) -> int:
-        return int(self._hdr["generation"])
+        return self._generation
 
     @property
     def writer_state(self) -> str:
-        st = int(np.frombuffer(self._mm, "<u8", 1, 120)[0])
+        st = self._u64_at(120)
         return {0: "init", 1: "ready", 2: "closed"}.get(st, f"state{st}")
 
     def _loc(self, dm: int) -> int:
@@ -1665,16 +1756,20 @@ class RxRingV4Reader:
     # -- progress ----------------------------------------------------------------
 
     def heads(self, dm: int) -> dict:
-        """Per-stream ``complete_through`` / ``max_end`` / ``last_progress_ns``
-        (acquire loads)."""
+        """Per-stream ``complete_through`` / ``max_end`` / ``last_progress_ns``."""
         i = self._loc(dm)
-        ct, me, lp = self._u64(), self._u64(), self._u64()
-        if self._lib.rx4_scan(ctypes.c_void_p(self._base), i, ct, me, lp) != 0:
-            raise RuntimeError("rx4_scan failed")
         n = self.fmt.n_stream
-        return {"complete_through": np.array(ct[:n], dtype=np.uint64),
-                "max_end": np.array(me[:n], dtype=np.uint64),
-                "last_progress_ns": np.array(lp[:n], dtype=np.uint64)}
+        if self.access == "mmap":
+            ct, me, lp = self._u64(), self._u64(), self._u64()
+            if self._lib.rx4_scan(ctypes.c_void_p(self._base), i, ct, me, lp) != 0:
+                raise RuntimeError("rx4_scan failed")
+            return {"complete_through": np.array(ct[:n], dtype=np.uint64),
+                    "max_end": np.array(me[:n], dtype=np.uint64),
+                    "last_progress_ns": np.array(lp[:n], dtype=np.uint64)}
+        fl = self._flows(i)
+        return {"complete_through": fl["complete_through"].astype(np.uint64),
+                "max_end": fl["max_end"].astype(np.uint64),
+                "last_progress_ns": fl["last_progress_ns"].astype(np.uint64)}
 
     def _min_streams(self, min_streams: Optional[int]) -> int:
         n = self.fmt.n_stream
@@ -1708,10 +1803,16 @@ class RxRingV4Reader:
 
     # -- windows -----------------------------------------------------------------
 
-    def window_validity(self, dm: int, t_first: int, n_rows: int) -> np.ndarray:
-        info = self.dm_info(dm)
+    def _check_rows(self, info: DmInfo, n_rows: int) -> None:
         if not 0 < n_rows <= info.t_buf:
             raise ValueError(f"n_rows={n_rows} not in (0, t_buf={info.t_buf}]")
+
+    def window_validity(self, dm: int, t_first: int, n_rows: int) -> np.ndarray:
+        info = self.dm_info(dm)
+        self._check_rows(info, n_rows)
+        if self.access == "pread":
+            me = self.heads(info.dm)["max_end"]
+            return _classify_tags(self._tags(info, t_first, n_rows), t_first, me, info.t_buf)
         v = np.zeros((self.fmt.n_stream, n_rows), dtype=np.uint8)
         rc = self._lib.rx4_window_validity(ctypes.c_void_p(self._base), info.local,
                                            int(t_first), int(n_rows), v.ctypes.data, None)
@@ -1720,8 +1821,10 @@ class RxRingV4Reader:
         return v
 
     def view(self, dm: int, t_first: int, n_rows: int) -> Optional[np.ndarray]:
-        """Zero-copy ``[n_stream, n_rows, row_bytes]`` view, or None if the
-        window wraps the ring end."""
+        """Zero-copy ``[n_stream, n_rows, row_bytes]`` view (mmap access), or
+        None if the window wraps the ring end or access is pread."""
+        if self.access != "mmap":
+            return None
         info = self.dm_info(dm)
         i0 = int(t_first) % info.t_buf
         if i0 + n_rows > info.t_buf:
@@ -1730,51 +1833,78 @@ class RxRingV4Reader:
 
     def copy_window(self, dm: int, t_first: int, n_rows: int, *,
                     out: Optional[np.ndarray] = None, with_steps: bool = False) -> RingWindow:
-        """Seqlock copy: every non-PRESENT (or lapped-during-copy) row is
-        zero-filled in ``out``. Never blocks the writer."""
+        """Seqlock copy into ``out`` (e.g. a pinned host buffer): every
+        non-PRESENT (or lapped-during-copy) row is zero-filled. Never blocks
+        the writer."""
         info = self.dm_info(dm)
-        if not 0 < n_rows <= info.t_buf:
-            raise ValueError(f"n_rows={n_rows} not in (0, t_buf={info.t_buf}]")
-        shape = (self.fmt.n_stream, n_rows, self.fmt.row_bytes)
+        self._check_rows(info, n_rows)
+        ns, rb = self.fmt.n_stream, self.fmt.row_bytes
+        shape = (ns, n_rows, rb)
         if out is None:
             out = np.empty(shape, dtype=np.uint8)
         elif out.shape != shape or out.dtype != np.uint8 or not out.flags["C_CONTIGUOUS"]:
             raise ValueError(f"out must be C-contiguous uint8 {shape}")
-        steps = np.empty((self.fmt.n_stream, n_rows, 2), np.float32) if with_steps else None
-        v = np.empty((self.fmt.n_stream, n_rows), dtype=np.uint8)
-        rc = self._lib.rx4_copy_window(
-            ctypes.c_void_p(self._base), info.local, int(t_first), int(n_rows),
-            out.ctypes.data, None if steps is None else steps.ctypes.data, v.ctypes.data, None)
-        if rc != 0:
-            raise RuntimeError(f"rx4_copy_window rc={rc}")
+        steps = np.empty((ns, n_rows, 2), np.float32) if with_steps else None
+        if self.access == "mmap":
+            v = np.empty((ns, n_rows), dtype=np.uint8)
+            rc = self._lib.rx4_copy_window(
+                ctypes.c_void_p(self._base), info.local, int(t_first), int(n_rows),
+                out.ctypes.data, None if steps is None else steps.ctypes.data, v.ctypes.data, None)
+            if rc != 0:
+                raise RuntimeError(f"rx4_copy_window rc={rc}")
+        else:
+            d = self._dmd[info.local]
+            me = self.heads(info.dm)["max_end"]
+            t1 = self._tags(info, t_first, n_rows)
+            v = _classify_tags(t1, t_first, me, info.t_buf)
+            self._pread_runs(info, int(d["data_off"]), rb, t_first, n_rows, out)
+            if steps is not None:
+                self._pread_runs(info, int(d["steps_off"]), 8, t_first, n_rows, steps)
+            t2 = self._tags(info, t_first, n_rows)
+            v[(t2 != t1) & ((v & RV_PRESENT) != 0)] = RV_LAPPED
+            bad = (v & RV_PRESENT) == 0
+            out[bad] = 0
+            if steps is not None:
+                steps[bad] = 0
         self._count_rows(info.dm, v)
+        n_final = int((self.heads(info.dm)["complete_through"].astype(np.int64)
+                       >= int(t_first) + n_rows).sum())
         return RingWindow(dm=info.dm, t_first=int(t_first), n_rows=int(n_rows), view=out,
-                          validity=v, status="copied",
-                          n_final_streams=int((self.heads(info.dm)["complete_through"]
-                                               >= t_first + n_rows).sum()),
+                          validity=v, status="copied", n_final_streams=n_final,
                           waited_s=0.0, zero_copy=False, steps=steps)
 
     def recheck(self, window: RingWindow) -> int:
         """After consuming a zero-copy window: rows overwritten since are
         re-marked ``RV_LAPPED``; returns how many (counted as overruns)."""
         info = self.dm_info(window.dm)
-        n = ctypes.c_uint64(0)
         v = window.validity
         if not v.flags["C_CONTIGUOUS"] or not v.flags["WRITEABLE"]:
             v = window.validity = np.ascontiguousarray(v).copy()
-        rc = self._lib.rx4_recheck(ctypes.c_void_p(self._base), info.local, window.t_first,
-                                   window.n_rows, v.ctypes.data, ctypes.byref(n))
-        if rc != 0:
-            raise RuntimeError(f"rx4_recheck rc={rc}")
-        if n.value:
+        if self.access == "pread":
+            tags = self._tags(info, window.t_first, window.n_rows)
+            seq = np.uint64(window.t_first) + np.arange(window.n_rows, dtype=np.uint64)
+            ok = ((tags != _TAG_WRITING) & ((tags & _SEQ_MASK) == seq[None, :])
+                  & (((tags >> np.uint64(56)) & np.uint64(1)) != 0))
+            chg = ((v & RV_PRESENT) != 0) & ~ok
+            v[chg] = RV_LAPPED
+            n = int(chg.sum())
+        else:
+            c = ctypes.c_uint64(0)
+            rc = self._lib.rx4_recheck(ctypes.c_void_p(self._base), info.local, window.t_first,
+                                       window.n_rows, v.ctypes.data, ctypes.byref(c))
+            if rc != 0:
+                raise RuntimeError(f"rx4_recheck rc={rc}")
+            n = int(c.value)
+        if n:
             self._rc[info.dm]["overruns"] += 1
-            self._rc[info.dm]["rows"]["lapped"] += int(n.value)
-        return int(n.value)
+            self._rc[info.dm]["rows"]["lapped"] += n
+        return n
 
     def wait_window(self, dm: int, t_first: int, n_rows: int, *,
                     min_streams: Optional[int] = None, grace_s: float = 0.25,
                     deadline_s: float = 1.0, timeout_s: Optional[float] = None,
                     poll_s: float = 0.001, copy: bool = False,
+                    out: Optional[np.ndarray] = None,
                     stall_warn_s: float = 3.0) -> RingWindow:
         """Wait for rows ``[t_first, t_first + n_rows)`` of every stream.
 
@@ -1786,15 +1916,16 @@ class RxRingV4Reader:
         ``timeout_s`` (None = wait forever, with a rate-limited stall WARNING
         naming the behind streams every ``stall_warn_s``); ``lapped`` if the
         window start was already overwritten. Missing streams are flagged in
-        ``validity`` (and zero-filled when ``copy``)."""
+        ``validity``; ``copy`` (always, with access="pread", into ``out`` if
+        given) returns a zero-filled copy instead of a zero-copy view."""
         info = self.dm_info(dm)
-        if not 0 < n_rows <= info.t_buf:
-            raise ValueError(f"n_rows={n_rows} not in (0, t_buf={info.t_buf}]")
+        self._check_rows(info, n_rows)
         end = int(t_first) + int(n_rows)
         need = self._min_streams(min_streams)
         t0 = time.monotonic()
         t_need = t_any = None
         status = None
+        n_final = 0
         while True:
             hd = self.heads(info.dm)
             ct = hd["complete_through"].astype(np.int64)
@@ -1822,8 +1953,8 @@ class RxRingV4Reader:
                 self._stall_warn(info, ct, end, now - t0, hd["last_progress_ns"])
             time.sleep(poll_s)
         waited = time.monotonic() - t0
-        if copy:
-            w = self.copy_window(info.dm, t_first, n_rows)
+        if copy or out is not None or self.access == "pread":
+            w = self.copy_window(info.dm, t_first, n_rows, out=out)
             w.status, w.waited_s, w.n_final_streams = status, waited, n_final
         else:
             v = self.window_validity(info.dm, t_first, n_rows)
@@ -1870,6 +2001,7 @@ class RxRingV4Reader:
             if done or time.monotonic() >= t_end:
                 break
             time.sleep(poll_s)
+        bps = np.array([s.bytes_per_sample for s in self.streams()], np.uint32)
         out = {}
         for d, (info, s0, s1) in win.items():
             too_late = self.oldest(d) > s0
@@ -1883,9 +2015,7 @@ class RxRingV4Reader:
                 codes=w.view, steps=w.steps, valid=w.validity,
                 row0_seq=np.full(ns, s0, np.uint64),
                 row0_t0_native=np.full(ns, s0 * info.t_int_factor, np.uint64),
-                bytes_per_sample=np.array([int(self._sd[s]["bytes_per_sample"]) for s in range(ns)],
-                                          np.uint32),
-                complete_through=ct, coverage=cov, status=status)
+                bytes_per_sample=bps, complete_through=ct, coverage=cov, status=status)
             sn = self._rc[d]["snapshots"]
             sn[status] = sn.get(status, 0) + 1
         return out
@@ -1917,17 +2047,17 @@ class RxRingV4Reader:
             self.heartbeat_age_s())
 
     def heartbeat_age_s(self) -> float:
-        hb = int(np.frombuffer(self._mm, "<u8", 1, 112)[0])
+        hb = self._u64_at(112)
         return (rx4_now_ns() - hb) / 1e9 if hb else float("inf")
 
     def counters(self) -> dict:
         """Writer counters (from the segment, read-only) + this reader's own
         per-DM counters (windows by status, rows by validity, overruns)."""
-        c = self._counters.copy()
+        c = np.frombuffer(os.pread(self._fd, 8 * 32, _RX4_OFF_COUNTERS), "<u8")
         writer = {name: int(c[i]) for i, name in enumerate(RX4_COUNTERS)}
         per_dm = {}
         for info in self._dms:
-            fl = self._flows[info.local, : self.fmt.n_stream].copy()
+            fl = self._flows(info.local)
             agg = {f: int(fl[f].sum()) for f in ("datagrams", "rows_written", "rows_late",
                                                   "rows_dup", "rows_hole", "rows_mismatch",
                                                   "resyncs")}
@@ -1935,7 +2065,8 @@ class RxRingV4Reader:
             agg["rows_hole_by_stream"] = fl["rows_hole"].astype(int).tolist()
             per_dm[info.dm] = {"writer": agg, "reader": _deepcopy_counts(self._rc[info.dm])}
         return {"writer": writer, "writer_state": self.writer_state,
-                "heartbeat_age_s": self.heartbeat_age_s(), "per_dm": per_dm}
+                "heartbeat_age_s": self.heartbeat_age_s(), "access": self.access,
+                "per_dm": per_dm}
 
     def stall_report(self, stall_s: float = 1.0) -> dict:
         """Streams without progress for ``stall_s`` (per DM) + writer liveness."""
@@ -1943,7 +2074,7 @@ class RxRingV4Reader:
         out = {"heartbeat_age_s": self.heartbeat_age_s(), "writer_state": self.writer_state,
                "dms": {}}
         for info in self._dms:
-            fl = self._flows[info.local, : self.fmt.n_stream].copy()
+            fl = self._flows(info.local)
             started = fl["started"] != 0
             age = (now_ns - fl["last_progress_ns"].astype(np.int64)) / 1e9
             stalled = np.nonzero(started & (age > stall_s))[0]

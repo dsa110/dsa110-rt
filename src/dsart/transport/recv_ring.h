@@ -200,6 +200,7 @@ rx_ring_assemble_compact_block(
 #define RX4_RV_LAPPED           (1u << 4)  /* overwritten by a newer lap */
 #define RX4_RV_RFI_WARMING_UP   (1u << 5)  /* present; frame flag bit4 */
 #define RX4_RV_NOISE_WARMUP     (1u << 6)  /* present; frame flag bit3 */
+#define RX4_RV_ROW_GUARD        (1u << 7)  /* present; coded at its own row scale (bit6) */
 
 /* rx4_ingest return codes (also the counter index of the outcome). */
 enum rx4_counter {
@@ -213,7 +214,7 @@ enum rx4_counter {
     RX4_C_BAD_TIME,          /* t0_native != seq_first * t_int_factor */
     RX4_C_NOT_OWNED,         /* dm_idx not in this ring */
     RX4_C_TIER_MISMATCH,     /* t_int_factor != the DM's tier */
-    RX4_C_FORMAT_MISMATCH,   /* bits / kind / n_sub / n_grid / mode / scales / row size */
+    RX4_C_FORMAT_MISMATCH,   /* bits / kind / n_sub / n_grid / scales / row size */
     RX4_C_STREAM_MISMATCH,   /* n_values / n_heavy != the stream's map */
     RX4_C_PATTERN_MISMATCH,  /* rows placed as zero-filled mismatch rows */
     RX4_C_V1_FRAMES,         /* subset of BAD_VERSION */
@@ -232,7 +233,7 @@ typedef struct rx4_config {
     uint32_t bits_heavy;      /* 16 (or 0: no stream has heavy values) */
     uint32_t value_kind;      /* 0 cells, 1 baselines */
     uint32_t n_grid;
-    uint32_t quant_mode;      /* 0 mid-tread, 1 mid-rise (frame flag bit6) */
+    uint32_t quant_mode;      /* reserved: must be 0 (mid-tread, SPEC §4) */
     float    s_main;          /* decode steps; checked bit-exactly iff check_scales */
     float    s_heavy;
     uint32_t check_scales;

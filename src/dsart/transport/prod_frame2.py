@@ -22,13 +22,17 @@ Header layout (72 bytes, little-endian, packed)::
                                    bit2 reserved (must be 0, as in v1)
                                    bit3 NOISE_WARMUP, bit4 RFI_WARMING_UP (v1)
                                    bit5 HEAVY_PRESENT (== n_heavy > 0)
-                                   bit6 MIDRISE (codes are mid-rise; 0 =
-                                        mid-tread, the default)
+                                   bit6 ROW_GUARD (every sample here was coded
+                                        at its own row scale, SPEC §4 step 3)
                                    bits 7..15 must be 0
-    8   8    seq_first      u64    tier-clock index of the first sample =
+    8   8    seq_first      u64    tier-clock row of the first sample =
                                    t0_native / t_int_factor (exact)
-    16  8    t0_native      u64    absolute native (32.768 us) sample index of
-                                   the first sample; C2 specnum epoch
+    16  8    t0_native      u64    absolute NATIVE-sample index (32.768 us) of
+                                   the first sample = 2 x SNAP specnum (same
+                                   epoch as SNAP specnum 0; C2's
+                                   ``search_to_snap_specnum`` returns specnums,
+                                   65.536 us); external row = t0_native // 16
+                                   at 2x (// 32 at 1x), SPEC §8/§9
     24  2    stream_id      u16    chgroup * n_sub + s
     26  2    dm_idx         u16    global coarse-DM index d (same offset as v1)
     28  1    k              u8     samples in this datagram, >= 1
@@ -41,8 +45,9 @@ Header layout (72 bytes, little-endian, packed)::
     36  4    n_values       u32    values per stream sample, heavy included
     40  8    pattern_id     u64    value-map id (SPEC §3)
     48  4    n_heavy        u32    leading heavy values, <= n_values
-    52  4    step_main      f32    s_main  * sigma_hat (monitoring only)
-    56  4    step_heavy     f32    s_heavy * sigma_hat (monitoring only)
+    52  4    step_main      f32    s_main  * sigma (the sigma every sample in
+                                   this datagram was coded with; monitoring)
+    56  4    step_heavy     f32    s_heavy * sigma
     60  4    payload_bytes  u32    k * bytes_per_sample
     64  4    s_main         f32    main decode step in sigma_hat units
     68  4    s_heavy        f32    heavy decode step in sigma_hat units
@@ -54,11 +59,15 @@ little-endian bit stream (value v occupies bits ``[v*W, (v+1)*W)``, re in the
 low ``W/2`` bits, im in the high ``W/2`` bits, two's complement, bit i of the
 stream is bit ``i % 8`` of byte ``i // 8``), zero-padded to a whole byte.
 ``bytes_per_sample = n_heavy * bits_heavy / 8 + ceil(n_main * bits_main / 8)``.
+Codes are mid-tread two's complement; ``-2^(c-1)`` (-8 / -16 / -32 main,
+-128 heavy) is the NO_DATA sentinel and decodes to 0.
 
 Sender rules: ``k <= max_k(bytes_per_sample)`` (largest datagram 72 + 8900 =
-8972 B, 9000 B on the wire at MTU 9000 — never IP-fragmented); a datagram
-never straddles a corr block (the step fields are exact for every sample in
-it), so the last datagram of a block may be short and carries LAST_IN_BLOCK.
+8972 B, 9000 B on the wire at MTU 9000 — never IP-fragmented); all samples
+of a datagram share ``step_main``, ``step_heavy`` and ROW_GUARD exactly, so a
+datagram never straddles a corr block (sigma_hat changes per block) nor a
+guarded row (each run of equal steps is framed separately); the last datagram
+of a block carries LAST_IN_BLOCK.
 """
 
 from __future__ import annotations
@@ -85,12 +94,37 @@ FLAG_RESERVED_BIT2: Final[int] = 1 << 2
 FLAG_NOISE_WARMUP: Final[int] = 1 << 3
 FLAG_RFI_WARMING_UP: Final[int] = 1 << 4
 FLAG_HEAVY_PRESENT: Final[int] = 1 << 5
-FLAG_MIDRISE: Final[int] = 1 << 6
+FLAG_ROW_GUARD: Final[int] = 1 << 6
 FLAGS_DEFINED_V2: Final[int] = (
     FLAG_QUANTIZED | FLAG_LAST_IN_BLOCK | FLAG_RESERVED_BIT2
     | FLAG_NOISE_WARMUP | FLAG_RFI_WARMING_UP | FLAG_HEAVY_PRESENT
-    | FLAG_MIDRISE
+    | FLAG_ROW_GUARD
 )
+
+NATIVE_PER_SPECNUM: Final[int] = 2
+"""Native samples (32.768 us) per SNAP specnum (65.536 us)."""
+NATIVE_PER_EXT_2X: Final[int] = 16
+NATIVE_PER_EXT_1X: Final[int] = 32
+
+
+def t0_native_from_specnum(specnum: int) -> int:
+    """Native-sample index of SNAP specnum ``specnum`` (= 2 x specnum)."""
+    return NATIVE_PER_SPECNUM * int(specnum)
+
+
+def specnum_from_t0_native(t0_native: int) -> int:
+    """Inverse of :func:`t0_native_from_specnum` (floor)."""
+    return int(t0_native) // NATIVE_PER_SPECNUM
+
+
+def ext_row(t0_native: int, native_per_ext: int = NATIVE_PER_EXT_2X) -> int:
+    """External-clock row (SPEC §8/§9) of a native index."""
+    return int(t0_native) // int(native_per_ext)
+
+
+def no_data_code(comp_bits: int) -> int:
+    """NO_DATA sentinel ``-2**(comp_bits - 1)`` (decodes to 0)."""
+    return -(1 << (comp_bits - 1))
 
 VALID_BITS_MAIN: Final[tuple[int, ...]] = (8, 10, 12)
 VALID_BITS_HEAVY: Final[tuple[int, ...]] = (0, 16)
@@ -197,8 +231,8 @@ class Frame2Header:
                                 self.bits_heavy)
 
     @property
-    def midrise(self) -> bool:
-        return bool(self.flags & FLAG_MIDRISE)
+    def row_guard(self) -> bool:
+        return bool(self.flags & FLAG_ROW_GUARD)
 
     @property
     def last_in_block(self) -> bool:
@@ -439,18 +473,21 @@ def iter_block_datagrams(
     n_grid: int,
     value_kind: int,
     pattern_id: int,
-    step_main: float,
-    step_heavy: float,
+    step_main,
+    step_heavy,
     s_main: float,
     s_heavy: float,
-    midrise: bool = False,
+    guarded=None,
     extra_flags: int = 0,
     k: int | None = None,
 ) -> Iterator[bytes]:
     """Frame one corr block of one (stream, DM) flow into v2 datagrams.
 
-    ``codes_* [S, n, 2]`` hold the block's S samples. Datagrams carry
-    ``k`` samples (default :func:`max_k`); the last may be short and carries
+    ``codes_* [S, n, 2]`` hold the block's S samples; ``step_main`` /
+    ``step_heavy`` are scalars or per-sample ``[S]`` arrays and ``guarded`` an
+    optional per-sample bool array (SPEC §4 row guard). Samples are framed in
+    runs of identical (step_main, step_heavy, guarded), at most ``k`` per
+    datagram (default :func:`max_k`); the block's last datagram carries
     ``FLAG_LAST_IN_BLOCK``. This is the reference the GPU packer matches.
     """
     ch = np.asarray(codes_heavy)
@@ -462,33 +499,45 @@ def iter_block_datagrams(
     kk = max_k(bps) if k is None else int(k)
     if not 1 <= kk <= max_k(bps):
         raise Frame2Error(f"k={kk} not in [1, {max_k(bps)}]")
+    sm = np.broadcast_to(np.asarray(step_main, dtype=np.float32), (S,))
+    sh = np.broadcast_to(np.asarray(step_heavy, dtype=np.float32), (S,))
+    gd = (np.zeros(S, bool) if guarded is None
+          else np.broadcast_to(np.asarray(guarded, dtype=bool), (S,)))
     payload = pack_samples(ch, cm, bits_main)                       # [S, bps]
     base_flags = FLAG_QUANTIZED | int(extra_flags)
     if n_heavy:
         base_flags |= FLAG_HEAVY_PRESENT
-    if midrise:
-        base_flags |= FLAG_MIDRISE
-    for j0 in range(0, S, kk):
-        j1 = min(S, j0 + kk)
+    j0 = 0
+    while j0 < S:
+        j1 = j0 + 1
+        while (j1 < S and j1 - j0 < kk and gd[j1] == gd[j0]
+               and sm[j1].tobytes() == sm[j0].tobytes()
+               and sh[j1].tobytes() == sh[j0].tobytes()):
+            j1 += 1
         flags = base_flags | (FLAG_LAST_IN_BLOCK if j1 == S else 0)
+        if gd[j0]:
+            flags |= FLAG_ROW_GUARD
         seq = seq_first + j0
         h = Frame2Header(
             seq_first=seq, t0_native=seq * t_int_factor, stream_id=stream_id,
             dm_idx=dm_idx, k=j1 - j0, n_sub=n_sub, bits_main=bits_main,
             bits_heavy=bits_heavy, n_grid=n_grid, t_int_factor=t_int_factor,
             value_kind=value_kind, n_values=n_values, pattern_id=pattern_id,
-            n_heavy=n_heavy, step_main=step_main, step_heavy=step_heavy,
+            n_heavy=n_heavy, step_main=float(sm[j0]), step_heavy=float(sh[j0]),
             payload_bytes=(j1 - j0) * bps, s_main=s_main, s_heavy=s_heavy,
             flags=flags,
         )
         yield pack_header(h) + payload[j0:j1].tobytes()
+        j0 = j1
 
 
 __all__ = [
     "MAGIC", "VERSION", "HEADER_BYTES", "MAX_PAYLOAD_BYTES", "OFFSETS",
     "FLAG_QUANTIZED", "FLAG_LAST_IN_BLOCK", "FLAG_RESERVED_BIT2",
     "FLAG_NOISE_WARMUP", "FLAG_RFI_WARMING_UP", "FLAG_HEAVY_PRESENT",
-    "FLAG_MIDRISE", "FLAGS_DEFINED_V2", "VALID_BITS_MAIN", "VALID_BITS_HEAVY",
+    "FLAG_ROW_GUARD", "FLAGS_DEFINED_V2", "NATIVE_PER_SPECNUM",
+    "NATIVE_PER_EXT_2X", "NATIVE_PER_EXT_1X", "t0_native_from_specnum",
+    "specnum_from_t0_native", "ext_row", "no_data_code", "VALID_BITS_MAIN", "VALID_BITS_HEAVY",
     "VALID_N_SUB", "VALID_T_INT_FACTORS", "VALUE_KIND_CELLS",
     "VALUE_KIND_BASELINES", "MAX_K", "SEQ_LIMIT", "Frame2Error",
     "Frame2Header", "bytes_per_sample", "max_k", "validate_header",

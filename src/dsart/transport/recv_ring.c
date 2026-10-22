@@ -1296,15 +1296,19 @@ rx_ring_get_dims(
  * frame-v2 datagrams (prod_frame2.py).
  *
  * Segment layout (all offsets from the shm base, page aligned):
- *   [rx4_header_t 135168 B][tags: per owned DM u64 [n_stream][t_buf]]
+ *   [rx4_header_t 135168 B]
+ *   [per owned DM: tags u64 [n_stream][t_buf], steps f32 [n_stream][t_buf][2]]
  *   [data: per owned DM uint8 [n_stream][t_buf][row_bytes]]
+ * The steps sidecar holds the frame's (step_main, step_heavy) of each row
+ * (0 for holes / mismatch rows), written inside the row seqlock.
  * Row (dm, stream, seq) lives at index seq % t_buf. seq is the tier-clock
  * sample index from the frame (= t0_native / t_int_factor), so rows are
  * aligned to absolute time; a (dm, stream) window is contiguous unless it
  * wraps.
  *
  * Row tag (u64): bits 0..55 = seq, bits 56..63 = row state
- *   PRESENT | HOLE | MISMATCH (one of; "final") + RFI_WARM / NOISE_WARM;
+ *   PRESENT | HOLE | MISMATCH (one of; "final") + RFI_WARM / NOISE_WARM /
+ *   ROW_GUARD (frame flags carried with PRESENT rows);
  *   0 = never written; all-ones = WRITING (a write is in progress).
  * Writer protocol per row (seqlock): tag = WRITING (relaxed); release
  * fence; write row bytes (zero padding to row_bytes); tag = seq | state
@@ -1338,6 +1342,7 @@ rx_ring_get_dims(
 #define RX4_TAG_MISMATCH   (UINT64_C(0x04) << 56)
 #define RX4_TAG_RFI_WARM   (UINT64_C(0x08) << 56)
 #define RX4_TAG_NOISE_WARM (UINT64_C(0x10) << 56)
+#define RX4_TAG_ROW_GUARD  (UINT64_C(0x20) << 56)
 #define RX4_TAG_FINAL      (RX4_TAG_PRESENT | RX4_TAG_HOLE | RX4_TAG_MISMATCH)
 
 #define RX4_STATE_INIT     UINT64_C(0)
@@ -1357,7 +1362,7 @@ rx_ring_get_dims(
 #define F2_FLAG_NOISE_WARM (1u << 3)
 #define F2_FLAG_RFI_WARM   (1u << 4)
 #define F2_FLAG_HEAVY      (1u << 5)
-#define F2_FLAG_MIDRISE    (1u << 6)
+#define F2_FLAG_ROW_GUARD  (1u << 6)
 #define F2_FLAGS_DEFINED   0x7Fu
 
 typedef struct __attribute__((packed)) f2_hdr {
@@ -1582,8 +1587,8 @@ rx4_create(const char *name, const rx4_config_t *cfg, int prefault,
     if (cfg->bits_heavy != 0 && cfg->bits_heavy != 16) {
         E4("bits_heavy=%u not in {0,16}", cfg->bits_heavy); return NULL;
     }
-    if (cfg->value_kind > 1 || cfg->quant_mode > 1) {
-        E4("value_kind=%u / quant_mode=%u must be 0 or 1",
+    if (cfg->value_kind > 1 || cfg->quant_mode != 0) {
+        E4("value_kind=%u must be 0 or 1; quant_mode=%u must be 0 (mid-tread)",
            cfg->value_kind, cfg->quant_mode); return NULL;
     }
     if (cfg->hole_timeout_ns == 0) { E4("hole_timeout_ns must be > 0"); return NULL; }
@@ -1907,7 +1912,6 @@ rx4_ingest(rx4_ring_t *r, const uint8_t *buf, size_t len, uint64_t now_ns,
     if (fh.n_sub != h->n_sub || fh.bits_main != h->bits_main
         || (fh.bits_heavy != 0 && fh.bits_heavy != h->bits_heavy)
         || fh.value_kind != h->value_kind || fh.n_grid != h->n_grid
-        || ((fl & F2_FLAG_MIDRISE) ? 1u : 0u) != h->quant_mode
         || bps > h->row_bytes)
         REJECT(RX4_C_FORMAT_MISMATCH);
     if (h->check_scales
@@ -1934,6 +1938,7 @@ rx4_ingest(rx4_ring_t *r, const uint8_t *buf, size_t len, uint64_t now_ns,
         state = RX4_TAG_PRESENT;
         if (fl & F2_FLAG_RFI_WARM) state |= RX4_TAG_RFI_WARM;
         if (fl & F2_FLAG_NOISE_WARM) state |= RX4_TAG_NOISE_WARM;
+        if (fl & F2_FLAG_ROW_GUARD) state |= RX4_TAG_ROW_GUARD;
     }
     rx4_place(r, (uint32_t)d, fh.stream_id, fh.seq_first, fh.k,
               mismatch ? NULL : buf + F2_HDR, bps, state,
@@ -2046,6 +2051,7 @@ rx4_classify(uint64_t t, uint64_t seq, uint64_t me, uint64_t tb)
             uint8_t v = RX4_RV_PRESENT;
             if (t & RX4_TAG_RFI_WARM) v |= RX4_RV_RFI_WARMING_UP;
             if (t & RX4_TAG_NOISE_WARM) v |= RX4_RV_NOISE_WARMUP;
+            if (t & RX4_TAG_ROW_GUARD) v |= RX4_RV_ROW_GUARD;
             return v;
         }
         if (t & RX4_TAG_HOLE) return RX4_RV_HOLE;
@@ -2066,6 +2072,7 @@ rx4_count(uint64_t *c, uint8_t v)
     if (v & RX4_RV_LAPPED) c[4]++;
     if (v & RX4_RV_RFI_WARMING_UP) c[5]++;
     if (v & RX4_RV_NOISE_WARMUP) c[6]++;
+    if (v & RX4_RV_ROW_GUARD) c[7]++;
 }
 
 /* out_validity: uint8 [n_stream][n_rows]; out_counts (optional): u64[8]
