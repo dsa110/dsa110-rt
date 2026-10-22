@@ -228,6 +228,31 @@ class MmsgSender:
             pass
 
 
+class TxRateMeter:
+    """Turns successive :meth:`MmsgSender.counters` snapshots into the small
+    monitoring dict WS-D reads from ``/mon/corr_rt/<chgroup>/corr_fast``:
+    ``tx_gbps`` (datagram bytes), ``tx_datagrams_per_s``, ``tx_drops_per_s``
+    (queue-full + send errors + unrouted) and ``tx_queue_depth_max``."""
+
+    def __init__(self) -> None:
+        self._prev = None
+
+    def update(self, counters: dict, now: float | None = None) -> dict | None:
+        import time as _time
+        t = _time.monotonic() if now is None else float(now)
+        snap = (t, sum(d["bytes"] for d in counters["per_dest"]),
+                sum(d["sent"] for d in counters["per_dest"]),
+                sum(d["full_drops"] + d["errors"] for d in counters["per_dest"]) + counters["unrouted"])
+        prev, self._prev = self._prev, snap
+        if prev is None:
+            return None
+        dt = max(1e-9, snap[0] - prev[0])
+        return {"tx_gbps": round((snap[1] - prev[1]) * 8 / dt / 1e9, 4),
+                "tx_datagrams_per_s": round((snap[2] - prev[2]) / dt, 1),
+                "tx_drops_per_s": round((snap[3] - prev[3]) / dt, 2),
+                "tx_queue_depth_max": max((d["depth"] for d in counters["per_dest"]), default=0)}
+
+
 def routes_for_owner_halves(dms: Iterable[int], owner_half: Sequence[int],
                             node_of_half=lambda h: h // 2) -> dict[int, int]:
     """``{d: search-node index}`` for the plan's owner map (half ``d % 8`` ->
@@ -235,5 +260,5 @@ def routes_for_owner_halves(dms: Iterable[int], owner_half: Sequence[int],
     return {int(d): int(node_of_half(int(owner_half[int(d)]))) for d in dms}
 
 
-__all__ = ["MmsgSender", "pack_datagrams", "routes_for_owner_halves", "DEST_COUNTERS",
+__all__ = ["MmsgSender", "TxRateMeter", "pack_datagrams", "routes_for_owner_halves", "DEST_COUNTERS",
            "GLOBAL_COUNTERS", "DM_OFFSET"]

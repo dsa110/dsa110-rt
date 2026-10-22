@@ -145,3 +145,14 @@ def test_routes_for_owner_halves():
     owner_half = np.arange(47) % 8
     r = sm.routes_for_owner_halves(range(47), owner_half)
     assert r[0] == 0 and r[1] == 0 and r[2] == 1 and r[7] == 3 and r[46] == 3
+
+
+def test_tx_rate_meter():
+    m = sm.TxRateMeter()
+    c0 = {"unrouted": 0, "per_dest": [{"bytes": 0, "sent": 0, "full_drops": 0, "errors": 0, "depth": 0}]}
+    c1 = {"unrouted": 2, "per_dest": [{"bytes": 125_000_000, "sent": 14000, "full_drops": 1,
+                                       "errors": 0, "depth": 7}]}
+    assert m.update(c0, now=10.0) is None
+    r = m.update(c1, now=11.0)
+    assert r == {"tx_gbps": 1.0, "tx_datagrams_per_s": 14000.0, "tx_drops_per_s": 3.0,
+                 "tx_queue_depth_max": 7}

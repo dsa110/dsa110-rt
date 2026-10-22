@@ -406,6 +406,27 @@ def _write_json(path: str, obj) -> None:
     tmp.replace(p)
 
 
+def _barrier(a) -> float:
+    """Ready/go barrier: write ``<out>.ready``, wait for the driver's go file
+    (JSON ``{"start_at": unix}``) and return the common start time. Without
+    ``--go-file`` the worker uses ``--start-at``."""
+    if not getattr(a, "go_file", None):
+        if a.start_at is None:
+            raise SystemExit("--start-at or --go-file is required")
+        return float(a.start_at)
+    _write_json(a.out + ".ready", {"t": time.time(), "host": socket.gethostname()})
+    t_end = time.time() + a.go_timeout_s
+    go = Path(a.go_file)
+    while time.time() < t_end:
+        if go.exists():
+            try:
+                return float(json.loads(go.read_text())["start_at"])
+            except (ValueError, KeyError):
+                pass
+        time.sleep(0.05)
+    raise TimeoutError(f"no go file {go} within {a.go_timeout_s} s")
+
+
 def worker_tx(a) -> int:
     """One corr node. Sweep mode: synthetic max-size frames, per-step rates.
     Format mode: real value-map flows at the plan's block cadence x load factor."""
@@ -434,11 +455,13 @@ def worker_tx(a) -> int:
         flows_of = {dd: [(f, fr) for f, fr in flows.items() if dest_of[f[1]] == dd]
                     for dd in range(n_dest)}
         dlen = next(iter(flows.values())).dlen
-        _sleep_until(a.start_at)
+        start_at = _barrier(a)
+        _sleep_until(start_at)
         for i, rate in enumerate(rates):
-            t0 = a.start_at + i * (a.dwell_s + a.gap_s)
+            t0 = start_at + i * (a.dwell_s + a.gap_s)
             t1 = t0 + a.dwell_s
             _sleep_until(t0)
+            t_act = time.time()
             per_pair_bps = rate * 1e9 / n_tx
             dg_per_s = per_pair_bps / 8.0 / dlen
             for dd in range(n_dest):                    # C paces finely, a bit faster than
@@ -467,7 +490,7 @@ def worker_tx(a) -> int:
             tx.flush(max(0.2, a.gap_s * 0.6))
             c1 = tx.counters()
             res["steps"].append({
-                "rate_gbps": rate, "t0": t0, "t1": t1,
+                "rate_gbps": rate, "t0": t0, "t1": t1, "late_s": t_act - t0,
                 "sent_per_dest": [y["sent"] - x["sent"] for x, y in zip(c0["per_dest"], c1["per_dest"])],
                 "bytes_per_dest": [y["bytes"] - x["bytes"] for x, y in zip(c0["per_dest"], c1["per_dest"])],
                 "emitted_per_dest": emitted,
@@ -496,16 +519,17 @@ def worker_tx(a) -> int:
         tx = MmsgSender([(h, int(p), r) for (h, p), r in zip(dests, rate)], routes=routes,
                         bind_host=src_ip, queue_slots=16384, batch=64, burst_bytes=a.burst_bytes)
         tx.start()
-        blk0 = int((a.start_at - 1.6e9) / BLOCK_S)            # common epoch for all corr nodes
-        _sleep_until(a.start_at)
+        start_at = _barrier(a)
+        blk0 = int((start_at - 1.6e9) / BLOCK_S)              # common epoch for all corr nodes
+        _sleep_until(start_at)
         c0 = tx.counters()
         nic0 = read_nic(iface)
-        t_end = a.start_at + a.minutes * 60.0
+        t_end = start_at + a.minutes * 60.0
         b = 0
         late = 0
         expected = 0
         while True:
-            t_blk = a.start_at + b * period
+            t_blk = start_at + b * period
             if t_blk >= t_end:
                 break
             if time.time() > t_blk + period:
@@ -562,9 +586,16 @@ def worker_rx(a) -> int:
                         strict_ports=True)
         rx.start()
         r = rx.ring4_reader(access="pread")
-        snap_at = [float(x) for x in a.snap_at.split(",")] if a.snap_at else []
+        if a.snap_at:
+            snap_at = [float(x) for x in a.snap_at.split(",")]
+        else:
+            start_at = _barrier(a)
+            step = a.dwell_s + a.gap_s
+            snap_at = [start_at - a.gap_s / 2] + [start_at + i * step + a.dwell_s + 0.8 * a.gap_s
+                                                  for i in range(a.n_steps)]
         for t in snap_at:
             _sleep_until(t)
+            t_act = time.time()
             per_stream = np.zeros(n_stream, np.int64)
             holes = np.zeros(n_stream, np.int64)
             for d in dms:
@@ -573,7 +604,8 @@ def worker_rx(a) -> int:
                 holes += fs["rows_hole"]
             c = rx.counters()
             res["snaps"].append({
-                "t": t, "datagrams_per_stream": per_stream.tolist(), "holes_per_stream": holes.tolist(),
+                "t": t, "t_actual": t_act, "datagrams_per_stream": per_stream.tolist(),
+                "holes_per_stream": holes.tolist(),
                 "n_received": c.n_received, "bytes": c.bytes_received_total,
                 "writer": r.counters()["writer"], "nic": read_nic(iface) if iface else {},
             })
@@ -591,8 +623,10 @@ def worker_ring_stats(a) -> int:
     ``--every-s`` until ``--end-at``; used by fleet-load / snap-live."""
     from dsart.transport.recv_ring import RxRingV4Reader
     iface = detect_data_iface(a.bind_ip) if a.nic else None
-    r = RxRingV4Reader.open(a.ring, access="pread", attach_timeout_s=120.0)
+    r = RxRingV4Reader.open(a.ring, access="pread", attach_timeout_s=300.0)
     out = {"role": "ring-stats", "host": socket.gethostname(), "iface": iface, "snaps": []}
+    if a.end_at is None:
+        a.end_at = _barrier(a) + a.minutes * 60.0 + 5.0
     try:
         while True:
             c = r.counters()
@@ -638,12 +672,16 @@ class Driver:
                f"DSART_CONFIG_DIR={shlex.quote(self.scratch)}/configs OMP_NUM_THREADS=1 "
                f"MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1")
         cmd = " ".join(shlex.quote(x) for x in args)
+        # braces: only the worker is backgrounded (its fds redirected), so the
+        # ssh / bash that launched it returns at once
         return (f"mkdir -p {shlex.quote(str(self.results))} && cd {shlex.quote(self.scratch)} && "
-                f"env {env} nohup {shlex.quote(self.py)} bench/fake_corr_to_search.py {cmd} "
-                f"> {shlex.quote(log)} 2>&1 < /dev/null &")
+                f"{{ env {env} nohup {shlex.quote(self.py)} bench/fake_corr_to_search.py {cmd} "
+                f"> {shlex.quote(log)} 2>&1 < /dev/null & }}")
 
     def launch(self, node: str, args: list[str], name: str) -> str:
-        """Start a marked worker on ``node``; returns its result-JSON path."""
+        """Start a marked worker on ``node``; returns its result-JSON path
+        (named after the marker: results of earlier runs are never read)."""
+        name = f"{self.marker}_{name}"
         out = str(self.results / f"{name}.json")
         log = str(self.results / f"{name}.log")
         full = list(args) + ["--out", out]
@@ -666,6 +704,26 @@ class Driver:
                                   timeout=timeout)
         return subprocess.run(["ssh", "-o", "BatchMode=yes", f"{node}.pro.pvt", shell],
                               capture_output=True, text=True, timeout=timeout)
+
+    def go_file(self) -> str:
+        return str(self.results / f"{self.marker}_go.json")
+
+    def barrier(self, launched: list[tuple[str, str]], lead_s: float, timeout_s: float) -> float:
+        """Wait until every launched worker wrote ``<out>.ready``, then write
+        the go file (start = now + lead) on every node; returns the start."""
+        t_end = time.time() + timeout_s
+        for node, out in launched:
+            if self.fetch(node, out + ".ready", max(1.0, t_end - time.time())) is None:
+                raise TimeoutError(f"worker {out} on {node} not ready within {timeout_s} s")
+        start = time.time() + lead_s
+        body = json.dumps({"start_at": start})
+        for node in dict.fromkeys(n for n, _ in launched):
+            r = self.run_on(node, f"mkdir -p {shlex.quote(str(self.results))} && printf %s "
+                                  f"{shlex.quote(body)} > {shlex.quote(self.go_file())}.tmp && "
+                                  f"mv {shlex.quote(self.go_file())}.tmp {shlex.quote(self.go_file())}")
+            if r.returncode != 0:
+                raise RuntimeError(f"go file on {node}: {r.stderr[-300:]}")
+        return start
 
     def fetch(self, node: str, path: str, wait_s: float) -> Optional[dict]:
         t_end = time.time() + wait_s
@@ -739,6 +797,8 @@ def evaluate_sweep(tx_res: list[dict], rx_res: list[dict], rx_nodes: list[str], 
             bytes_ = sum(t["steps"][i]["bytes_per_dest"][j] for t in tx_res)
             snaps = rx_res[j]["snaps"]
             a, b = snaps[i], snaps[i + 1]
+            tx_late = max(t["steps"][i].get("late_s", 0.0) for t in tx_res)
+            rx_late = max(s_.get("t_actual", s_.get("t", 0.0)) - s_.get("t", 0.0) for s_ in (a, b))
             recv = sum(b["datagrams_per_stream"]) - sum(a["datagrams_per_stream"])
             dwell = tx_res[0]["steps"][i]["t1"] - tx_res[0]["steps"][i]["t0"]
             loss = 1.0 - recv / sent if sent else 1.0
@@ -747,13 +807,16 @@ def evaluate_sweep(tx_res: list[dict], rx_res: list[dict], rx_nodes: list[str], 
                         if nd.get("rx_packets_phy") else 0.0)
             allowed = max(1e-4, baseline.get(node, crc_frac))
             discards = nd.get("rx_discards_phy", 0) + nd.get("rx_out_of_buffer", 0)
-            clean = (loss <= allowed) and (discards == 0) and sent > 0
+            timing_ok = tx_late < 0.1 * dwell and rx_late < 0.5
+            clean = (loss <= allowed) and (discards == 0) and sent > 0 and timing_ok
             per_node[node].append({
                 "rate_gbps_target": rate, "sent": sent, "received": recv, "loss": loss,
                 "allowed_loss": allowed, "baseline_source": "given" if node in baseline else "crc",
                 "gbps_payload": bytes_ * 8 / dwell / 1e9,
                 "gbps_wire": (bytes_ + sent * WIRE_OVERHEAD_B) * 8 / dwell / 1e9,
-                "datagrams_per_s": sent / dwell, "nic_delta": nd, "clean": bool(clean)})
+                "datagrams_per_s": sent / dwell, "nic_delta": nd, "clean": bool(clean),
+                "timing_ok": bool(timing_ok), "tx_late_s": tx_late, "rx_late_s": rx_late,
+                "rx_writer": b.get("writer", {})})
     clean_gbps = {}
     for node, steps in per_node.items():
         c = 0.0
@@ -781,13 +844,10 @@ def cmd_sweep(a) -> int:
     if not 72 < a.frame_bytes <= MAX_DATAGRAM:
         raise SystemExit(f"--frame-bytes must be in (72, {MAX_DATAGRAM}] (no IP fragmentation)")
     drv = Driver(a)
-    a.lead_s = 20.0 if a.lead_s is None else a.lead_s
+    a.lead_s = 3.0 if a.lead_s is None else a.lead_s
     rates = [float(x) for x in a.rates_gbps.split(",")]
     n_rx, n_tx = len(drv.rx_nodes), len(drv.tx_nodes)
-    start = time.time() + a.lead_s
     step = a.dwell_s + a.gap_s
-    snap_at = [start - a.gap_s / 2] + [start + i * step + a.dwell_s + a.gap_s * 0.8
-                                       for i in range(len(rates))]
     rx_out, tx_out = [], []
     try:
         for j, n in enumerate(drv.rx_nodes):
@@ -796,18 +856,21 @@ def cmd_sweep(a) -> int:
                 "rx", "--bind-ip", drv.ip[n], "--port-base", str(a.port_base), "--n-tx", str(n_tx),
                 "--dms", ",".join(map(str, dms)), "--frame-bytes", str(a.frame_bytes),
                 "--threads", str(a.rx_threads), "--t-buf", "1024",
-                "--ring", f"/dsart-x2-{a.marker}-sweep-{j}", "--snap-at",
-                ",".join(f"{t:.3f}" for t in snap_at)] + (["--nic"] if a.nic_counters else []),
-                f"sweep_rx_{n}"))
+                "--ring", f"/dsart-x2-{a.marker}-sweep-{j}", "--go-file", drv.go_file(),
+                "--n-steps", str(len(rates)), "--dwell-s", str(a.dwell_s), "--gap-s", str(a.gap_s)]
+                + (["--nic"] if a.nic_counters else []),
+                f"sweep_rx_{j}_{n}"))
         for g, n in enumerate(drv.tx_nodes):
             d_list = ",".join(f"{drv.ip[r]}:{a.port_base + g}" for r in drv.rx_nodes)
             tx_out.append(drv.launch(n, [
                 "tx", "--mode", "sweep", "--chgroup", str(g), "--n-tx", str(n_tx),
                 "--dests", d_list, "--bind-ip", drv.ip.get(n, ""), "--rates", a.rates_gbps,
-                "--dwell-s", str(a.dwell_s), "--gap-s", str(a.gap_s), "--start-at", f"{start:.3f}",
+                "--dwell-s", str(a.dwell_s), "--gap-s", str(a.gap_s), "--go-file", drv.go_file(),
                 "--frame-bytes", str(a.frame_bytes)] + (["--nic"] if a.nic_counters else []),
-                f"sweep_tx_{n}"))
-        wait = max(0.0, snap_at[-1] - time.time()) + 60
+                f"sweep_tx_{g}_{n}"))
+        start = drv.barrier(list(zip(drv.rx_nodes, rx_out)) + list(zip(drv.tx_nodes, tx_out)),
+                            a.lead_s, a.ready_timeout_s)
+        wait = max(0.0, start + len(rates) * step - time.time()) + 60
         txr = [drv.fetch(n, p, wait) for n, p in zip(drv.tx_nodes, tx_out)]
         rxr = [drv.fetch(n, p, 60) for n, p in zip(drv.rx_nodes, rx_out)]
     finally:
@@ -836,11 +899,9 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
     search_rx v4 (+ owner engines) on every search node."""
     drv = Driver(a)
     n_rx = len(drv.rx_nodes)
-    a.lead_s = 120.0 if a.lead_s is None else a.lead_s
+    a.lead_s = 5.0 if a.lead_s is None else a.lead_s
     if not a.plan:
         raise SystemExit("--plan (v3 plan npz path on the nodes) is required")
-    start = time.time() + a.lead_s
-    end = start + a.minutes * 60.0
     antpos = a.antpos_npz or f"{a.scratch}/tests/fixtures/x2/dsa110_antpos.npz"
     ring_of = {n: f"/dsart-x2-{a.marker}-rx4-{j}" for j, n in enumerate(drv.rx_nodes)}
     tx_out, st_out = [], []
@@ -848,8 +909,8 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
                  "tx_nodes": drv.tx_nodes, "rx_nodes": drv.rx_nodes, "gates": {}}
     try:
         for j, n in enumerate(drv.rx_nodes):
-            spec = str(drv.results / f"ring4_spec_{n}.json")
-            pids = str(drv.results / f"ring4_pids_{n}.json")
+            spec = str(drv.results / f"{a.marker}_ring4_spec_{j}_{n}.json")
+            pids = str(drv.results / f"{a.marker}_ring4_pids_{j}_{n}.json")
             mk = drv.run_on(n, (
                 f"mkdir -p {drv.results} && cd {shlex.quote(a.scratch)} && env PYTHONPATH={a.scratch}/src "
                 f"{shlex.quote(drv.py)} -m dsart.services.search_rx make-ring4-spec --plan {a.plan} "
@@ -858,21 +919,23 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
             if mk.returncode != 0:
                 raise RuntimeError(f"make-ring4-spec on {n}: {mk.stderr[-400:]}")
             env = f"DSART_X2_CP={a.marker} PYTHONPATH={a.scratch}/src OMP_NUM_THREADS=1"
-            rxcmd = (f"cd {a.scratch} && env {env} nohup {drv.py} -m dsart.services.search_rx "
+            rxcmd = (f"cd {a.scratch} && {{ env {env} nohup {drv.py} -m dsart.services.search_rx "
                      f"--ring-version 4 --ring4-spec {spec} --pattern-id-file {pids} "
                      f"--bind-host {drv.ip[n]} --port-base {a.port_base} --n-ports {len(drv.tx_nodes)} "
                      f"--rx-threads {a.rx_threads} --shm-name {ring_of[n]} --status-interval-s 10 "
-                     f"> {drv.results}/{name}_search_rx_{n}.log 2>&1 < /dev/null &")
-            drv.run_on(n, rxcmd if not drv._is_local(n) else rxcmd.replace("nohup ", ""), timeout=60)
-            st_out.append(drv.launch(n, ["ring-stats", "--ring", ring_of[n], "--end-at",
-                                         f"{end + 5:.3f}", "--every-s", "10", "--bind-ip", drv.ip[n]]
+                     f"{'--no-prefault ' if a.rx_no_prefault else ''}"
+                     f"> {drv.results}/{a.marker}_{name}_search_rx_{j}_{n}.log 2>&1 < /dev/null & }}")
+            drv.run_on(n, rxcmd, timeout=60)
+            st_out.append(drv.launch(n, ["ring-stats", "--ring", ring_of[n], "--go-file", drv.go_file(),
+                                         "--minutes", str(a.minutes), "--every-s", "10",
+                                         "--bind-ip", drv.ip[n]]
                                      + (["--nic"] if not drv._is_local(n) else []),
-                                     f"{name}_ringstats_{n}"))
+                                     f"{name}_ringstats_{j}_{n}"))
             if engines and a.engine:
-                ecmd = (f"cd {a.scratch} && env {env} nohup {drv.py} {a.engine} --shm-name {ring_of[n]} "
+                ecmd = (f"cd {a.scratch} && {{ env {env} nohup {drv.py} {a.engine} --shm-name {ring_of[n]} "
                         f"--plan {a.plan} --opoint {a.format} --halves {2 * (j % 4)},{2 * (j % 4) + 1} "
-                        f"--minutes {a.minutes} --out {drv.results}/engine_{n} "
-                        f"> {drv.results}/{name}_engine_{n}.log 2>&1 < /dev/null &")
+                        f"--minutes {a.minutes} --out {drv.results}/{a.marker}_engine_{j}_{n} "
+                        f"> {drv.results}/{a.marker}_{name}_engine_{j}_{n}.log 2>&1 < /dev/null & }}")
                 drv.run_on(n, ecmd, timeout=60)
         for g, n in enumerate(drv.tx_nodes):
             dl = ",".join(f"{drv.ip[r]}:{a.port_base + g}" for r in drv.rx_nodes)
@@ -880,15 +943,19 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
                 "tx", "--mode", "format", "--format", a.format, "--plan", a.plan, "--chgroup", str(g),
                 "--n-tx", str(len(drv.tx_nodes)), "--dests", dl, "--bind-ip", drv.ip.get(n, ""),
                 "--load-factor", str(a.load_factor), "--minutes", str(a.minutes),
-                "--start-at", f"{start:.3f}", "--antpos-npz", antpos, "--dec-deg", str(a.dec_deg)]
+                "--go-file", drv.go_file(), "--antpos-npz", antpos, "--dec-deg", str(a.dec_deg)]
                 + (["--dm-subset", a.dm_subset] if a.dm_subset else [])
-                + (["--nic"] if not drv._is_local(n) else []), f"{name}_tx_{n}"))
+                + (["--nic"] if not drv._is_local(n) else []), f"{name}_tx_{g}_{n}"))
+        start = drv.barrier(list(zip(drv.rx_nodes, st_out)) + list(zip(drv.tx_nodes, tx_out)),
+                            a.lead_s, a.ready_timeout_s)
+        end = start + a.minutes * 60.0
         txr = [drv.fetch(n, p, max(0.0, end - time.time()) + 120) for n, p in zip(drv.tx_nodes, tx_out)]
         str_ = [drv.fetch(n, p, 120) for n, p in zip(drv.rx_nodes, st_out)]
         eng = {}
         if engines and a.engine:
-            for n in drv.rx_nodes:
-                r = drv.run_on(n, f"cat {drv.results}/engine_{n}/*.json 2>/dev/null | head -c 200000")
+            for j, n in enumerate(drv.rx_nodes):
+                r = drv.run_on(n, f"cat {drv.results}/{a.marker}_engine_{j}_{n}/*.json 2>/dev/null "
+                                  "| head -c 200000")
                 eng[n] = r.stdout[:200000] if r.returncode == 0 else None
     finally:
         res["teardown"] = drv.teardown()
@@ -972,7 +1039,9 @@ def _driver_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--port-base", type=int, default=PORT_BASE)
     p.add_argument("--rx-threads", type=int, default=4)
     p.add_argument("--lead-s", type=float, default=None,
-                   help="start delay for sync + ring creation (default 20 s sweep, 120 s ring loads)")
+                   help="start delay after every worker is ready (default 3 s sweep, 5 s ring loads)")
+    p.add_argument("--ready-timeout-s", type=float, default=900.0,
+                   help="max wait for workers to prepare (ring create / value maps)")
     p.add_argument("--baseline-loss", default=None,
                    help="per-node 1x loss: n01=3e-4,n02=7e-4 or a JSON file")
 
@@ -1002,6 +1071,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--dec-deg", type=float, default=71.63)
         p.add_argument("--retention-s", type=float, default=20.0)
         p.add_argument("--dm-subset", default=None, help="debug: comma list of coarse DMs to send")
+        p.add_argument("--rx-no-prefault", action="store_true",
+                       help="debug: search_rx --no-prefault (small test rings)")
         if name == "fleet-load":
             p.add_argument("--engine", default="", help="owner engine command (WS-S bench)")
         else:
@@ -1020,7 +1091,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rates", default="")
     p.add_argument("--dwell-s", type=float, default=10.0)
     p.add_argument("--gap-s", type=float, default=4.0)
-    p.add_argument("--start-at", type=float, required=True)
+    p.add_argument("--start-at", type=float, default=None)
+    p.add_argument("--go-file", default=None)
+    p.add_argument("--go-timeout-s", type=float, default=1800.0)
     p.add_argument("--frame-bytes", type=int, default=MAX_DATAGRAM)
     p.add_argument("--burst-bytes", type=int, default=512 << 10)
     p.add_argument("--format", default=None)
@@ -1043,12 +1116,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--t-buf", type=int, default=1024)
     p.add_argument("--ring", required=True)
     p.add_argument("--snap-at", default="")
+    p.add_argument("--go-file", default=None)
+    p.add_argument("--go-timeout-s", type=float, default=1800.0)
+    p.add_argument("--start-at", type=float, default=None)
+    p.add_argument("--n-steps", type=int, default=0)
+    p.add_argument("--dwell-s", type=float, default=10.0)
+    p.add_argument("--gap-s", type=float, default=4.0)
     p.add_argument("--nic", action="store_true")
     p.add_argument("--out", required=True)
     p.set_defaults(func=worker_rx)
     p = sub.add_parser("ring-stats")
     p.add_argument("--ring", required=True)
-    p.add_argument("--end-at", type=float, required=True)
+    p.add_argument("--end-at", type=float, default=None)
+    p.add_argument("--go-file", default=None)
+    p.add_argument("--go-timeout-s", type=float, default=1800.0)
+    p.add_argument("--start-at", type=float, default=None)
+    p.add_argument("--minutes", type=float, default=1.0)
     p.add_argument("--every-s", type=float, default=10.0)
     p.add_argument("--bind-ip", default="")
     p.add_argument("--nic", action="store_true")
