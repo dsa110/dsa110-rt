@@ -282,9 +282,13 @@ class Corr2xPipeline(PipelinedCorrFast):
         return np.concatenate(rows).astype(np.uint16), np.concatenate(cols).astype(np.uint16)
 
     @property
-    def sky_static(self) -> BatchedStaticSky | None:
-        """Tier-A static sky (slot 0 = lowest coarse DM) for the exporter."""
-        return self.tiers[0].static_sky if self.tiers else None
+    def sky_static(self) -> "_ScaledSky | None":
+        """Tier-A static sky (slot 0 = lowest coarse DM) for the exporter,
+        scaled by 32 / T_native so a value carries today's 32 natives per
+        sample and the Sky tab's amplitude scale is unchanged."""
+        if not self.tiers or self.tiers[0].static_sky is None:
+            return None
+        return _ScaledSky(self.tiers[0].static_sky, 32.0 / self.tiers[0].T_native)
 
     def warmup(self, n_blocks: int) -> None:
         """Compile every kernel on dummy pages with the 2x TX detached."""
@@ -471,6 +475,17 @@ class Corr2xPipeline(PipelinedCorrFast):
             outs.append(d.out)
             self.n_blocks_out += 1
         return outs
+
+
+class _ScaledSky:
+    """``running_mean_for`` duck type of ``StaticSkyMean`` with a gain."""
+
+    def __init__(self, sky: BatchedStaticSky, gain: float) -> None:
+        self.sky, self.gain = sky, float(gain)
+
+    def running_mean_for(self, dm_slot: int = 0):
+        m = self.sky.running_mean_for(dm_slot)
+        return None if m is None else m * self.gain
 
 
 class _null:

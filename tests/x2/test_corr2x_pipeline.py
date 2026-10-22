@@ -232,6 +232,20 @@ def test_corr2x_pipeline_cpu_equals_reference(kind, monkeypatch) -> None:
     assert np.abs(Vs[1][20:24]).max() == 0.0 and np.abs(Vs[1][24:28]).max() > 0.0
 
 
+def test_sky_export_hooks(monkeypatch) -> None:
+    """The exporter's duck types: owner cells per value, tier-A slot-0 mean
+    x 32/16 (today's natives per sample)."""
+    ctx, orch, tx, vm, plan, dms, e, n, mask, gn, _ = _build("baselines", monkeypatch)
+    rows, cols = orch.sky_cells()
+    assert rows.dtype == np.uint16 and rows.size == orch.csr.n_values
+    st = vm.streams[G * 2]
+    assert np.array_equal(rows[: orch.voff[1]], st.cell_row[orch.value_sel[0]])
+    assert orch.sky_static.running_mean_for(0) is None
+    x = torch.ones((len(orch.tiers[0].dms), 4, orch.csr.n_values), dtype=torch.complex64)
+    orch.tiers[0].static_sky.apply_(x)
+    assert torch.allclose(orch.sky_static.running_mean_for(0), torch.full((orch.csr.n_values,), 2.0 + 0j))
+
+
 def test_injection_window_detection() -> None:
     class A:
         def __init__(self, lo, hi):
