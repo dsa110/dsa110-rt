@@ -10,7 +10,8 @@ Checked for both value kinds (per-baseline through the GEMM's class
 reduce), on the first/last coarse DM of each tier:
 
 * stage-1 + decimation + static-sky output == reference (fp16 ring
-  rounding: <= 2e-3 of the rms);
+  rounding: rms error <= 2e-3 of the rms, every sample within 1% of its
+  value's own rms);
 * the TX hand-off carries one payload row per (DM, tier sample) of the
   packer's layout (row-rule bit-equality itself: ``test_corr2x_packer``);
 * TX hand-off framing: emitted block, t0_native, tier sample, stream ids;
@@ -246,8 +247,14 @@ def _run_and_check(kind, monkeypatch, *, device, npkt, value_subset, dms) -> Non
                     want = rs.apply(0, xd)
                     got = x[j, :, lo:hi].cpu().numpy().astype(np.complex128)
                     rms = np.sqrt(np.mean(np.abs(want) ** 2)) + 1e-12
-                    assert np.abs(got - want).max() <= 2e-3 * rms * 10, (kind, d, s, blk)
-                    assert np.sqrt(np.mean(np.abs(got - want) ** 2)) <= 2e-3 * rms
+                    # fp16 ring: each visibility rounds to 2^-11 relative, so a value's
+                    # error scales with ITS OWN amplitude (heavy cells sum many
+                    # contributions and sit far above the global rms)
+                    rms_v = np.sqrt(np.mean(np.abs(want) ** 2, axis=0)) + 1e-6 * rms
+                    err = np.abs(got - want)
+                    assert np.all(err <= 1e-2 * rms_v[None, :]), (kind, d, s, blk, float(
+                        (err / rms_v[None, :]).max()))
+                    assert np.sqrt(np.mean(err ** 2)) <= 2e-3 * rms
     # the time mask zeroed the flagged accumulations of block 6 (acc 10, 11)
     q_acc = NQ // 64
     assert np.abs(Vs[1][10 * q_acc:12 * q_acc]).max() == 0.0
