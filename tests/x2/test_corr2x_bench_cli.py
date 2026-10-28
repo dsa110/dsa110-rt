@@ -38,23 +38,20 @@ def b8(tmp_path, monkeypatch):
 
 
 def test_live_argv_is_a_2x_drain(b8) -> None:
-    argv, env = b8._prod_argv(
-        dec=71.63,
-        drop=("--transport-tx-*", "--sky-export-*", "--rfi-mon-*", "--inject-watch", "--stage2-mode",
-              "--dm-plan-path", "--ready-sentinel-path", "--output-dir", "--max-blocks"),
-        set_={"--t-int-fast-native": 8, "--chan-sum-factor": 2, "--n-sub": 4,
-              "--opoint": "2x-baselines-ns4-cint4", "--max-blocks": 8941,
-              "--output-dir": "/tmp/dsart-x2-test-out", "--blocks-output-mode": "none",
-              "--ready-sentinel-path": "/tmp/dsart-x2-corr-fast-live.ready"})
+    argv, env = b8.live_argv("2x-baselines-ns4-cint4", dec=71.63, n_blocks=8941,
+                             out_blocks="/tmp/dsart-x2-test-out")
     joined = " ".join(argv)
-    for bad in ("--transport-tx", "--sky-export", "--rfi-mon", "--inject-watch", "--stage2-mode",
+    for bad in ("--transport-tx-host", "--transport-tx-workers", "--transport-tx-worker-hosts",
+                "--sky-export", "--rfi-mon", "--inject-watch", "--stage2-mode",
                 "/tmp/dsart-corr-fast-", "CHGROUP", "CUSTOMDEC"):
         assert bad not in joined, bad
+    assert "--transport-tx-mode drain" in joined
     assert env.get("CUDA_VISIBLE_DEVICES") == "1"
     cap = b8._capture_cfg(argv)
     cfg, kw = cap["cfg"], cap["kw"]
     assert (cfg.t_int_fast_native, cfg.chan_sum_factor, cfg.n_sub, cfg.chgroup) == (8, 2, 4, 1)
     assert kw["opoint"] == "2x-baselines-ns4-cint4" and kw["max_blocks"] == 8941
+    assert kw["transport_tx_mode"] == "drain" and kw["transport_tx_worker_hosts"] == ""
     assert kw["transport_tx_host"] == "" and kw["sky_export_url"] == ""
     assert kw["rfi_mon_cn_id"] is None and not cfg.inject_watch_enabled
     assert cfg.rfi_enabled and cfg.rfi_persist_enabled and cfg.rfi_array_burst_mode == "flag"

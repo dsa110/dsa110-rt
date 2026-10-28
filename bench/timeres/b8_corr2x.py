@@ -22,7 +22,9 @@
   live --opoint F --minutes M --tx drain --reader-identity corr_fast --out D
                                          corr_fast 2x on the live fada of this node (production
                                          corr_fast STOPPED by the runner; capture, merge, corr_slow and
-                                         voltage_retention running), TX to a drain; block-time and
+                                         voltage_retention running), TX to the frame-v2 drain
+                                         (--transport-tx-mode drain: framed, counted, never sent); the
+                                         summary carries the TX counters; block-time and
                                          buffer-overrun gates
   teardown                               remove /dev/shm/dsart-x2-* and /tmp/dsart-x2-*
 
@@ -192,8 +194,9 @@ def _set_gpu_env(env: dict) -> None:
 
 
 def _triton_specs():
-    """(module, kernel, signature, [constants...]) of every Triton kernel the
-    corr launches in 1x-compat and 2x."""
+    """(module, kernel, signature, [constants...], compile options) of every
+    Triton kernel the corr launches in 1x-compat and 2x. The row-rule
+    kernels run with ``enable_fp_fusion=False`` (bit-exact vs quant.py)."""
     i32, f16, f32 = "i32", "*fp16", "*fp32"
     g = dict(re_ptr=f16, im_ptr=f16, calr_ptr=f32, cali_ptr=f32, tmask_ptr=f32, core_ptr="*i32",
              dst_ptr="*i32", tp_ptr="*i32", ring_ptr=f16, scr_ptr=f32, fv0=i32, n_core=i32,
@@ -202,7 +205,12 @@ def _triton_specs():
     gc = dict(NSUM=192, NVP=2, CSF=2, PPFV=4, NC_PAD=96, BLOCK=16)
     r = dict(scr_ptr=f32, ring_ptr=f16, cptr_ptr="*i32", csrc_ptr="*i32", cconj_ptr="*u8",
              crow_ptr="*i32", t_ring0=i32, T_ring=i32, n_fv=i32)
-    p = dict(codes_ptr="*i8", out_ptr="*u8", n_comp=i32, n_bytes=i32)
+    p = dict(codes_ptr="*i8", out_ptr="*u8", n_comp=i32, n_bytes=i32, s_in=i32, s_out=i32)
+    rs = dict(x_ptr=f32, r_ptr=f32, t_ptr=f32, m_ptr="*i32", c_ptr="*i32", S=i32, V=i32, s_d=i32,
+              s_t=i32)
+    cd = dict(x_ptr=f32, r_ptr=f32, invm_ptr=f32, invh_ptr=f32, okm_ptr="*i8", okh_ptr="*i8",
+              out_ptr="*i8", S=i32, V=i32, NH=i32, s_d=i32, s_t=i32)
+    nofma = {"enable_fp_fusion": False}
     c1 = dict(R_ptr=f16, I_ptr=f16, out_re_ptr=f32, out_im_ptr=f32, n_fv=i32, A_stride_b=i32,
               A_stride_k=i32, A_stride_n=i32, OUT_stride_fv=i32, OUT_stride_bls=i32, OUT_stride_c=i32)
     c1c = dict(NCHAN=384, NCHAN_EFF=48, NANTS=96, NBASE=4656, NVP=2, CSF=8, K=32, BLOCK_M=16, BLOCK_N=16)
@@ -214,6 +222,9 @@ def _triton_specs():
         ("dsart.x2.corr.gemm2x", "_gemm2x_kernel", g, [dict(gc, HAS_TMASK=False), dict(gc, HAS_TMASK=True)]),
         ("dsart.x2.corr.gemm2x", "_reduce_kernel", r, [dict(NSUM=192, BLOCK_T=64)]),
         ("dsart.x2.corr.packer2x", "_pack_bits_kernel", p, [dict(B=b, BLOCK=256) for b in (4, 5, 6)]),
+        ("dsart.x2.corr.packer2x", "_row_stats_kernel", rs, [dict(BLOCK_V=256)], nofma),
+        ("dsart.x2.corr.packer2x", "_codes_kernel", cd, [dict(CMAX=c, BLOCK_V=256) for c in (7, 15, 31)],
+         nofma),
         ("dsart.services.triton_corr_fused", "_fused_corr_post_no_cat_kernel", c1, [c1c]),
         ("dsart.services.triton_dedisp", "_fused_dedisp_kernel", d,
          [dict(NCHAN_EFF=48, NBASE=4656, BLOCK_T=128)]),
@@ -221,20 +232,28 @@ def _triton_specs():
 
 
 def compile_triton_kernels(arch: int = 75) -> dict:
-    """AOT-compile every corr Triton kernel for ``sm_<arch>`` (no GPU needed)."""
+    """AOT-compile every corr Triton kernel for ``sm_<arch>`` (no GPU needed).
+    Per kernel: cubin size, the fp-fusion option, and the PTX's count of
+    ``fma`` instructions (must be 0 where fusion is off)."""
     import importlib
     import triton
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
     res = {}
-    for modname, kname, sig, consts in _triton_specs():
+    for spec in _triton_specs():
+        modname, kname, sig, consts = spec[:4]
+        opts = dict(spec[4]) if len(spec) > 4 else {}
         fn = getattr(importlib.import_module(modname), kname)
         for c in consts:
             key = f"{kname}{json.dumps(c, sort_keys=True)}"
             try:
                 k = triton.compile(ASTSource(fn=fn, signature=sig, constants=c),
-                                   target=GPUTarget("cuda", arch, 32))
-                res[key] = {"ok": True, "cubin_bytes": len(k.asm.get("cubin", b""))}
+                                   target=GPUTarget("cuda", arch, 32), options=opts or None)
+                ptx = k.asm.get("ptx", "")
+                res[key] = {"ok": True, "cubin_bytes": len(k.asm.get("cubin", b"")),
+                            "fp_fusion": bool(opts.get("enable_fp_fusion", True)),
+                            "ptx_fma": ptx.count("fma."), "ptx": ptx if not opts.get(
+                                "enable_fp_fusion", True) else None}
             except Exception as exc:  # noqa: BLE001
                 res[key] = {"ok": False, "error": repr(exc)[:400]}
     return res
@@ -263,8 +282,12 @@ def cmd_compile_check(args) -> int:
                                      "compile runs in tests/x2/test_corr2x_compile.py (pre.cpu_tests)"}
     if have_triton:
         res = compile_triton_kernels()
+        for v in res.values():
+            v.pop("ptx", None)
         out["triton"] = res
         gates["triton_compiles"] = all(v["ok"] for v in res.values())
+        gates["row_rule_kernels_no_fma"] = all(v.get("ptx_fma") == 0 for v in res.values()
+                                               if v["ok"] and not v["fp_fusion"])
     return _finish(args.out, "compile_check.json", out, gates)
 
 
@@ -733,6 +756,25 @@ def _production_corr_fast_pids() -> list[int]:
     return pids
 
 
+def live_argv(opoint: str, *, dec: float, n_blocks: int, out_blocks: str,
+              tx: str = "drain") -> tuple[list[str], dict]:
+    """corr_fast argv of the CP1 live step: production's options at the 2x
+    op-point, every 1x TX / sky-export / RFI-monitor / inject option dropped,
+    and the 2x TX set to ``tx`` (``drain``: frame v2 built and counted, no
+    packet on the fabric)."""
+    from dsart.x2.opoint import opoint_from_id
+    op = opoint_from_id(opoint)
+    return _prod_argv(
+        dec=dec,
+        drop=("--transport-tx-*", "--sky-export-*", "--rfi-mon-*", "--inject-watch", "--stage2-mode",
+              "--dm-plan-path", "--ready-sentinel-path", "--output-dir", "--max-blocks", "--x2-tx-*"),
+        set_={"--t-int-fast-native": op.t_int_fast_native, "--chan-sum-factor": op.chan_sum_factor,
+              "--n-sub": op.n_sub, "--opoint": op.opoint_id, "--max-blocks": n_blocks,
+              "--output-dir": out_blocks, "--blocks-output-mode": "none",
+              "--ready-sentinel-path": "/tmp/dsart-x2-corr-fast-live.ready",
+              "--transport-tx-mode": tx})
+
+
 def cmd_live(args) -> int:
     if args.reader_identity != "corr_fast" or args.tx != "drain":
         print("live: only --tx drain --reader-identity corr_fast are supported", file=sys.stderr)
@@ -745,14 +787,8 @@ def cmd_live(args) -> int:
     op = opoint_from_id(args.opoint)
     n_blocks = int(args.minutes * 60e3 / BLOCK_MS)
     out_blocks = os.path.join(args.out, "live_blocks")
-    argv, env = _prod_argv(
-        dec=args.dec,
-        drop=("--transport-tx-*", "--sky-export-*", "--rfi-mon-*", "--inject-watch", "--stage2-mode",
-              "--dm-plan-path", "--ready-sentinel-path", "--output-dir", "--max-blocks"),
-        set_={"--t-int-fast-native": op.t_int_fast_native, "--chan-sum-factor": op.chan_sum_factor,
-              "--n-sub": op.n_sub, "--opoint": op.opoint_id, "--max-blocks": n_blocks,
-              "--output-dir": out_blocks, "--blocks-output-mode": "none",
-              "--ready-sentinel-path": "/tmp/dsart-x2-corr-fast-live.ready"})
+    argv, env = live_argv(op.opoint_id, dec=args.dec, n_blocks=n_blocks, out_blocks=out_blocks,
+                          tx=args.tx)
     _set_gpu_env(env)
     import dsart.services.corr_fast_integration as cfi
     samples: dict = {"fada": [], "eada": [], "dada": []}
@@ -796,6 +832,8 @@ def cmd_live(args) -> int:
         "p99_le_100pct": p99 <= BLOCK_MS,
         "no_dropped_blocks": int(s.get("n_dropped", 1)) == 0,
         "ran_requested_blocks": int(s.get("n_blocks_in", 0)) >= n_blocks,
+        "tx_framed_no_rejects": bool((s.get("x2_tx") or {}).get("datagrams", 0) > 0
+                                     and (s.get("x2_tx") or {}).get("rejected", 1) == 0),
     }
     for k in ("fada", "eada"):
         mx, nb = over[k]
