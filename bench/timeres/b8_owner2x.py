@@ -571,8 +571,8 @@ def cmd_kernels(a) -> int:
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="pruned")  # noqa: E731
                 elif v == "dense":
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="irfft2")  # noqa: E731
-                elif v == "warp":
-                    fn = _warp_runner(uvt, plan, inp, dev)
+                elif v in ("warp", "fused"):
+                    fn = _warp_runner(uvt, plan, inp, dev, mode=v)
                 else:
                     continue
                 ms = _cuda_ms(fn)
@@ -655,7 +655,7 @@ def _check_1x_csr(dev, rng) -> dict:
         return dict(check="k1_1x_csr_vs_v4", status="fail", error=repr(e)[:1000])
 
 
-def _warp_runner(uvt, plan, inp, dev):
+def _warp_runner(uvt, plan, inp, dev, mode: str = "warp"):
     import numpy as np
     import torch
 
@@ -685,6 +685,20 @@ def _warp_runner(uvt, plan, inp, dev):
     mod = get_module()
     k2, k3 = mod.get_function("k2_colfft_256"), mod.get_function("k3a_rowc2r_256")
     A = int(uvt.shape[1])
+
+    tr = int(plan.fold == "row")
+    lines = dict(line_ptr=lp, line_idx=li, line_pos=lpos, fl=fl, cc_idx=cci, cc_line=ccl)
+
+    from dsart.x2.search.kernels_cuda import k23_tables, launch_k23
+    tables = k23_tables(lines, n_fl, dev, pix=pix)
+
+    def run_fused():
+        launch_k23(uv2, tables, tw, pix, ring, B=B, n_act=A, n_t=B, F=1, t0=0, R_img=B,
+                   transpose=tr, stream=torch.cuda.current_stream())
+        return ring.view(B, N, N)
+
+    if mode == "fused":
+        return run_fused
 
     def run():
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
@@ -1013,7 +1027,7 @@ def main(argv=None) -> int:
     c = sub.add_parser("compile-check")
     c.add_argument("--out", default="b8_out")
     k = sub.add_parser("kernels")
-    k.add_argument("--fft", default="cufft,warp")
+    k.add_argument("--fft", default="cufft,warp,fused")
     k.add_argument("--k3b", default="box,b3x,v1,fused,cuda,reg",
                    help="filter banks (box, b3x) and implementations (v1, fused, cuda, reg)")
     k.add_argument("--k1", default="triton,staged", help="K1 variants (triton, staged)")
@@ -1047,7 +1061,7 @@ def main(argv=None) -> int:
     e.add_argument("--half", default=None, help=argparse.SUPPRESS)
     e.add_argument("--seconds", type=float, default=0.0, help=argparse.SUPPRESS)
     e.add_argument("--half-base", dest="half_base", type=int, default=0)
-    e.add_argument("--fft-mode", dest="fft_mode", default="warp")
+    e.add_argument("--fft-mode", dest="fft_mode", default="fused")
     e.add_argument("--bank", default="b3x", choices=("b3x", "box"))
     e.add_argument("--cpu", action="store_true", help="CPU twins (plumbing dry run only)")
     sub.add_parser("teardown")

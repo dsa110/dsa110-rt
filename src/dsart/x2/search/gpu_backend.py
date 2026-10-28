@@ -220,6 +220,18 @@ class GpuBackend:
                 if timed:
                     self._mark(st.spec.d, "fft", eb, self._ev(stream))
                 return
+            if cfg.fft_mode == "fused":                    # K2 + K3a in one kernel
+                from .kernels_cuda import k23_tables, launch_k23
+                if getattr(x, "k23", None) is None:
+                    x.k23 = k23_tables(dict(line_ptr=x.line_ptr, line_idx=x.line_idx,
+                                            line_pos=x.line_pos, fl=x.fl, cc_idx=x.cc_idx,
+                                            cc_line=x.cc_line), int(x.fl.numel()), self.dev,
+                                       pix=x.pix)
+                launch_k23(uv, x.k23, self.tw, x.pix, ring, B=B, n_act=A, n_t=n, F=F, t0=r0,
+                           R_img=ring_rows, transpose=x.transpose, stream=stream)
+                if timed:
+                    self._mark(st.spec.d, "fft", eb, self._ev(stream))
+                return
             mod = get_module()
             n_fl = int(x.fl.numel())
             Y = torch.empty((B, max(n_fl, 1), N, 2), dtype=torch.float32, device=self.dev)
