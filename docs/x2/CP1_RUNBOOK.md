@@ -235,8 +235,10 @@ The `fleet.n01_ipfrag` step does the following:
    `--track fleet --from fleet.nic_detect`.
 3. Checks that every key in the file reads the same on n01 as on n02.
 
-To revert: `sudo rm /etc/sysctl.d/99-dsart-ipfrag.conf` and
-`sudo sysctl -w <key>=<old value from the step log>` for each key.
+**The user decided on 2026-10-22 that n01 keeps this file permanently after CP1. Do NOT revert it.** It lives in
+`/etc/sysctl.d/`, so it survives reboots. `restore.n01_ipfrag_kept` checks that it is still there and matches n02.
+(For reference only: `sudo rm /etc/sysctl.d/99-dsart-ipfrag.conf` and `sudo sysctl -w <key>=<old value from the
+step log>` would undo it.)
 
 ## Results
 

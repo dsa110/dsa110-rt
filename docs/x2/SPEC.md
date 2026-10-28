@@ -669,7 +669,8 @@ The banner shows the active selection, its plan_id, and whether the live configs
   `tests/fixtures/x2/dsa110_antpos.npz` (cal-blob E/N, corr_setup_96 station order, station-table U).
   `src/dsart/x2/__init__.py` and `tests/x2/__init__.py` are empty package markers: anyone may add
   them, nobody puts code in them.
-- WS-T: `src/dsart/transport/prod_frame2.py`, `send_mmsg.c` + wrapper, `recv_epoll.c`, `recv_ring.{c,h,py}`,
+- WS-T: `src/dsart/transport/prod_frame2.py`, `src/dsart/x2/quant.py`, `tools/x2/rx_recorder*.py`, `tests/x2/wst_util.py`,
+  `tests/x2/test_x2_*.py`, `send_mmsg.c` + wrapper, `recv_epoll.c`, `recv_ring.{c,h,py}`,
   `production_rx_ring.py`, `services/search_rx.py`, `bench/fake_corr_to_search.py`, `tools/x2/rx_recorder.py`.
 - WS-C: `services/corr_fast_integration.py`, `src/dsart/x2/corr/*`, `src/dsart/x2/ref/corr2x_ref.py`.
 - WS-S: `services/search_compute.py`, `services/cube_pipeline.py`, `src/dsart/x2/search/*` (incl. the
