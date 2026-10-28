@@ -1731,6 +1731,176 @@ class IntegrationContext:
     ``None`` (default), the profiler hooks are skipped entirely so
     the hot path has zero overhead. See :class:`StageProfiler`."""
 
+    stage_timer: "StageTimer | None" = None
+    """x2: always-on per-stage timing (:class:`StageTimer`). Unlike
+    :attr:`profiler` it never synchronises: events are harvested with a
+    non-blocking ``query()`` a block or more later, so it is safe to
+    leave on in production. Measurement only -- it records CUDA events
+    between stages and changes no data. ``None`` disables it."""
+
+
+class StageTimer:
+    """Always-on per-stage GPU timing without host synchronisation (x2).
+
+    The block loop calls :meth:`begin_block`, then :meth:`mark` after
+    each stage (on the stream that ran it), then :meth:`end_block`. A
+    mark records one CUDA event; a stage's time is the interval between
+    its mark and the previous mark of the same block, i.e. the GPU
+    timeline between stage boundaries (it includes any launch bubble the
+    host left in front of the stage, which is exactly what a real-time
+    budget has to pay). :meth:`span_begin` / :meth:`span_end` time work
+    on a side stream (the async H2D copy) as an independent interval.
+
+    Nothing here blocks: :meth:`poll` harvests a pending block only once
+    its last event reports complete (``Event.query()``), so the numbers
+    lag the hot path by a block or two. At most ``max_pending`` blocks
+    are kept; older ones are dropped uncounted (``n_dropped``) rather
+    than ever waiting on the GPU.
+
+    On a CPU device (tests) marks are host ``perf_counter`` stamps, which
+    are the true stage times there because CPU ops are synchronous.
+
+    :meth:`summary` returns per-stage mean / p50 / p99 over the last
+    ``window`` harvested blocks plus the whole-block GPU span; the run
+    loop publishes it through :class:`CorrFastMonPublisher` (the
+    ``/mon/corr_rt/<chgroup>/corr_fast`` key) every 16 blocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device | str = "cpu",
+        window: int = 64,
+        max_pending: int = 8,
+    ) -> None:
+        if window < 1 or max_pending < 1:
+            raise ValueError("StageTimer: window and max_pending must be >= 1")
+        self.device = torch.device(device)
+        self.cuda = self.device.type == "cuda"
+        self.window = int(window)
+        self.max_pending = int(max_pending)
+        self._open: dict[str, Any] | None = None
+        self._pending: list[dict[str, Any]] = []
+        self._hist: dict[str, list[float]] = {}
+        self._order: list[str] = []
+        self.n_blocks = 0
+        self.n_dropped = 0
+
+    # -- recording --------------------------------------------------------
+
+    def _stamp(self, stream: "torch.cuda.Stream | None" = None) -> Any:
+        if not self.cuda:
+            return time.perf_counter()
+        ev = torch.cuda.Event(enable_timing=True)
+        if stream is None:
+            ev.record()
+        else:
+            ev.record(stream)
+        return ev
+
+    def begin_block(self, block_n: int) -> None:
+        self._open = {
+            "block_n": int(block_n),
+            "marks": [("_start", self._stamp())],
+            "spans": {},
+        }
+
+    def mark(self, name: str) -> None:
+        if self._open is not None:
+            self._open["marks"].append((name, self._stamp()))
+
+    def span_begin(self, name: str, stream: Any = None) -> None:
+        if self._open is not None:
+            self._open["spans"][name] = [self._stamp(stream), None]
+
+    def span_end(self, name: str, stream: Any = None) -> None:
+        if self._open is not None and name in self._open["spans"]:
+            self._open["spans"][name][1] = self._stamp(stream)
+
+    def end_block(self) -> None:
+        rec, self._open = self._open, None
+        if rec is None:
+            return
+        self._pending.append(rec)
+        while len(self._pending) > self.max_pending:
+            self._pending.pop(0)
+            self.n_dropped += 1
+        self.poll()
+
+    # -- harvesting -------------------------------------------------------
+
+    @staticmethod
+    def _done(stamp: Any) -> bool:
+        return True if isinstance(stamp, float) else bool(stamp.query())
+
+    @staticmethod
+    def _ms(a: Any, b: Any) -> float:
+        if isinstance(a, float):
+            return (b - a) * 1e3
+        return float(a.elapsed_time(b))
+
+    def _push(self, name: str, ms: float) -> None:
+        lst = self._hist.get(name)
+        if lst is None:
+            lst = self._hist[name] = []
+            self._order.append(name)
+        lst.append(ms)
+        if len(lst) > self.window:
+            del lst[0]
+
+    def poll(self) -> int:
+        """Harvest every pending block whose events have completed (in
+        order; stops at the first incomplete one). Never blocks."""
+        n = 0
+        while self._pending:
+            rec = self._pending[0]
+            stamps = [s for _, s in rec["marks"]]
+            for a, b in rec["spans"].values():
+                stamps.append(a)
+                if b is not None:
+                    stamps.append(b)
+            if not all(self._done(s) for s in stamps):
+                break
+            self._pending.pop(0)
+            marks = rec["marks"]
+            for (_, a), (name, b) in zip(marks[:-1], marks[1:]):
+                self._push(name, self._ms(a, b))
+            if len(marks) > 1:
+                self._push("block_gpu", self._ms(marks[0][1], marks[-1][1]))
+            for name, (a, b) in rec["spans"].items():
+                if b is not None:
+                    self._push(name, self._ms(a, b))
+            self.n_blocks += 1
+            n += 1
+        return n
+
+    def summary(self) -> dict[str, Any]:
+        """``{"stage_ms": {name: {"mean","p50","p99"}}, ...}`` over the
+        last ``window`` harvested blocks (empty until the first harvest)."""
+        out: dict[str, dict[str, float]] = {}
+        for name in self._order:
+            v = sorted(self._hist[name])
+            if not v:
+                continue
+            out[name] = {
+                "mean": round(sum(v) / len(v), 3),
+                "p50": round(v[len(v) // 2], 3),
+                "p99": round(v[min(len(v) - 1, int(0.99 * len(v)))], 3),
+            }
+        return {
+            "stage_ms": out,
+            "stage_blocks": int(self.n_blocks),
+            "stage_dropped": int(self.n_dropped),
+        }
+
+
+def _tmark(ctx: "IntegrationContext", name: str) -> None:
+    """Record a :class:`StageTimer` boundary if timing is on (cheap no-op
+    otherwise)."""
+    t = ctx.stage_timer
+    if t is not None:
+        t.mark(name)
+
 
 class StageProfiler:
     """Per-stage CUDA-event timing for the corr-fast pipeline (M7.2
@@ -1914,6 +2084,24 @@ def process_block(
     # corr-side and consume-side phases sequentially on the default
     # stream. The phase split is what BlockPipeliner uses to overlap
     # the two halves on separate CUDA streams.
+    timer = ctx.stage_timer
+    if timer is not None:
+        timer.begin_block(block_n)
+        try:
+            return _process_block_timed_body(raw, ctx=ctx, block_n=block_n)
+        finally:
+            timer.end_block()
+    return _process_block_timed_body(raw, ctx=ctx, block_n=block_n)
+
+
+def _process_block_timed_body(
+    raw: np.ndarray,
+    *,
+    ctx: IntegrationContext,
+    block_n: int,
+) -> IntegrationOutput:
+    """Body of :func:`process_block` (split out so the x2 stage timer can
+    bracket it without re-indenting the pipeline)."""
     if ctx.profiler is not None:
         # M7.2 Phase 0 diagnostic: bracket the two halves so we can
         # decompose per-block ms into corr-half (unpack + RFI + cal +
@@ -2039,12 +2227,14 @@ def _process_block_corr_phase(
     """
     # 1. Unpack
     real_v, imag_v = _process_block_unpack_phase(raw, ctx=ctx)
+    _tmark(ctx, "unpack")
 
     # 2. RFI flag (before cal — flags should be on raw data + DC pol
     # so that any cal-induced dynamic range shifts can't mask them).
     rfi_result: FlagBlockResult | None = None
     if ctx.rfi_flagger is not None and ctx.cfg.rfi_enabled:
         rfi_result = ctx.rfi_flagger.flag_block(real_v, imag_v)
+        _tmark(ctx, "rfi")
 
         # 3. Voltage zero-fill of flagged cells. The cube mask is
         # constant-in-time (bandpass-outlier and SK are per-cube
@@ -2060,6 +2250,7 @@ def _process_block_corr_phase(
                 real_v, imag_v, rfi_result.mask,
                 time_chan_mask=ab_time_mask,
             )
+        _tmark(ctx, "zero_fill")
 
     # 4. Cal apply with F21 DEC-phase fold
     if ctx.cal is not None:
@@ -2068,6 +2259,7 @@ def _process_block_corr_phase(
         )
         del real_v, imag_v
         real_v, imag_v = real_v_c, imag_v_c
+        _tmark(ctx, "cal")
 
     # 4b. M7.4 Phase 8: voltage-domain online injection, AFTER RFI +
     # cal (was step 1b / pre-RFI through Phase 6/7 — see
@@ -2152,6 +2344,7 @@ def _process_block_corr_phase(
             vis_stokes_i[fv0:fv1] = stokes_i_slab
             del real_v_slab, imag_v_slab, vis_2pol_slab, stokes_i_slab
         del real_v, imag_v
+    _tmark(ctx, "gemm")
 
     return vis_stokes_i, rfi_result
 
@@ -2295,6 +2488,7 @@ def _process_block_consume_phase(
                 vis_stokes_i, block_n=block_n,
             )
         del vis_stokes_i
+        _tmark(ctx, "stage1")
 
         # 8. Per-trial static-sky EMA subtraction (collapses the
         # T_dedisp axis → N_filled internally; replicates back to
@@ -2320,6 +2514,7 @@ def _process_block_consume_phase(
                     dedispersed[c] = ctx.static_sky.apply(
                         dedispersed[c], dm_slot=c,
                     )
+            _tmark(ctx, "static_sky")
 
         # The "headline" pre-stage2 cube is the multi-DM cube itself.
         # Tests + benches read this from IntegrationOutput.gridded_minus_sky.
@@ -2358,9 +2553,11 @@ def _process_block_consume_phase(
             )
     else:
         cubes_for_tx = ctx.stage2_fifo.push(dedispersed, block_n=block_n)
+        _tmark(ctx, "stage2")
         n_tx = ctx.transport_tx.transmit(
             cubes_for_tx, block_n=block_n, rfi_warming_up=rfi_warmup_flag,
         )
+        _tmark(ctx, "tx")
 
     return IntegrationOutput(
         gridded_minus_sky=gridded_minus_sky,
@@ -3846,9 +4043,25 @@ def run(
     # E2E test 1 ("always seeing the sky"): empty URL disables.
     sky_export_url: str = "",
     sky_export_interval_s: float = 30.0,
+    # x2 WS-C: block-loop orchestrator + always-on stage timing
+    orchestrator: str = "legacy",
+    stage_timing: bool = True,
+    opoint: str = "1x",
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
+
+    ``orchestrator``: ``"legacy"`` (default) calls :func:`process_block`
+    once per page; ``"pipelined"`` drives the bit-identical
+    :class:`dsart.x2.corr.pipeline1x.PipelinedCorrFast` (async
+    double-buffered H2D, 2-block stage-1 ring, deferred TX, gc.freeze).
+    ``stage_timing``: always-on, sync-free per-stage CUDA-event timing
+    (:class:`StageTimer`), published with the corr_fast heartbeat.
+    ``opoint``: ``"1x"`` (default, today's chain, nothing below changes) or
+    a 2x op-point id (``dsart.x2.opoint``, e.g. ``2x-gridded-ns2-cint4``):
+    the :class:`dsart.x2.corr.pipeline2x.Corr2xPipeline` chain (t_int 8,
+    csf 2, tiered plan, corr stage-2 FIFO off, row-rule packer). The 1x
+    TX / stage-2 options are ignored in 2x.
 
     Returns a summary dict including:
         {n_blocks_in, n_blocks_processed, n_dropped, elapsed_s,
@@ -3859,6 +4072,17 @@ def run(
     """
     from psrdada import Reader
 
+    if orchestrator not in ("legacy", "pipelined"):
+        raise ValueError(
+            f"orchestrator={orchestrator!r}; expected 'legacy' or 'pipelined'"
+        )
+    if orchestrator == "pipelined" and use_pipeliner_3s:
+        raise ValueError("--orchestrator pipelined excludes --pipeliner-3s")
+    if opoint != "1x" and (use_pipeliner_3s or profile_stages_every > 0):
+        raise ValueError(
+            "--opoint 2x runs its own scheduler: drop --pipeliner-3s / "
+            "--profile-stages-every (the StageTimer covers 2x)"
+        )
     if blocks_output_mode not in ("full", "first_tile_only", "none"):
         raise ValueError(
             f"blocks_output_mode must be full|first_tile_only|none, "
@@ -3897,6 +4121,34 @@ def run(
             )
         antpos_e, antpos_n, core_mask = load_antpos_from_cal_blob(cfg.cal_path)
         station_numbers = load_station_numbers_for_cal(cfg.cal_path)
+
+        # ── x2: 2x op-point (behind --opoint; 1x untouched) ───────────
+        x2_op = None
+        x2_plan = None
+        if opoint != "1x":
+            from dsart.x2.opoint import opoint_from_id
+            x2_op = opoint_from_id(opoint)
+            if (cfg.t_int_fast_native != x2_op.t_int_fast_native
+                    or cfg.chan_sum_factor != x2_op.chan_sum_factor
+                    or int(cfg.n_sub) != x2_op.n_sub):
+                raise ValueError(
+                    f"--opoint {opoint} needs --t-int-fast-native "
+                    f"{x2_op.t_int_fast_native} --chan-sum-factor "
+                    f"{x2_op.chan_sum_factor} --n-sub {x2_op.n_sub}"
+                )
+            from dsart.x2.plan import TieredDmPlan, build_tiered_plan_for_opoint
+            if cfg.dm_plan_path is not None:
+                x2_plan = TieredDmPlan.from_npz(str(cfg.dm_plan_path), verify=True)
+            else:
+                x2_plan = build_tiered_plan_for_opoint(x2_op)
+            # nothing of the 1x stage-1 / stage-2 / TX stack is built in 2x
+            cfg.dm_plan_path = None
+            dm_plan = None
+            transport_tx_host = ""
+            LOG.info(
+                "x2 op-point %s: plan_id=0x%016x n_coarse=%d (stage-2 corr FIFO off)",
+                x2_op.opoint_id, int(x2_plan.plan_id), int(x2_plan.n_coarse),
+            )
 
         # ── M7.2 overlap path: real Stage2FIFO + TransportTx ─────────
         # When --transport-tx-host is set, replace the NoOp stubs with
@@ -4047,6 +4299,25 @@ def run(
             dm_plan=dm_plan,
         )
 
+        x2_orch = None
+        if x2_op is not None:
+            from dsart.grid.baseline_grid import build_value_map_for_opoint
+            from dsart.x2.corr.pipeline2x import Corr2xPipeline, NoOpTx2x
+            from dsart.x2.corr.plan2x import CorrPlan2x
+            vmap = build_value_map_for_opoint(
+                x2_op, antpos_e, antpos_n, is_core_baseline_mask=core_mask,
+                dec_deg=math.degrees(cfg.obs_dec_rad),
+            )
+            LOG.warning(
+                "x2: the v2 corner-turn sender (WS-T) is not wired yet; "
+                "2x packets go to a drain (NoOpTx2x)"
+            )
+            x2_orch = Corr2xPipeline(
+                ctx, plan=CorrPlan2x.from_tiered_plan(x2_plan), vm=vmap,
+                is_core_baseline_mask=core_mask, bits_main=x2_op.bits_main,
+                tx2x=NoOpTx2x(), expected_fada_bytes=expected_fada_bytes,
+            )
+
         # ── M7.4 Phase 6 runtime: per-chgroup inject watch ──────────────
         # When ``--inject-watch`` was passed (cfg.inject_watch_enabled),
         # build_context guarantees ctx.injector is a real OnlineInjector;
@@ -4078,6 +4349,19 @@ def run(
                 npackets_per_block=NPACKETS_PER_BLOCK,
             )
 
+        # ── x2: always-on per-stage timing (measurement only) ─────────
+        # Sync-free CUDA events between stages, harvested a block or two
+        # later; published with the 16-block heartbeat. Not compatible
+        # with the 3-stream pipeliner (events on different streams).
+        if stage_timing and not use_pipeliner_3s:
+            ctx.stage_timer = StageTimer(device=device)
+            if mon_publisher is None and rfi_mon_cn_id is not None:
+                from dsart.services.corr_fast_mon import CorrFastMonPublisher
+                mon_publisher = CorrFastMonPublisher(
+                    chgroup=int(cfg.chgroup),
+                    npackets_per_block=NPACKETS_PER_BLOCK,
+                )
+
         # ── E2E test 1: static-sky snapshot exporter ────────────────────
         # Snapshots the slot-0 StaticSkyMean window mean every
         # ``sky_export_interval_s`` and POSTs it to the h23 sky monitor.
@@ -4088,6 +4372,8 @@ def run(
             from dsart.services.sky_export import SkySnapshotExporter
             pat_sky = ctx.gridder.pattern
             sky_ix_row, sky_ix_col = pat_sky.ix_row, pat_sky.ix_col
+            sky_cell_lambda = float(pat_sky.cell_lambda)
+            sky_pattern_id = int(pat_sky.pattern_id)
             # n_sub > 1: the static-sky cells are the sub-band patterns
             # concatenated, so ship their indices in the same order. A
             # grid cell filled by several sub-bands appears once per
@@ -4101,6 +4387,12 @@ def run(
                     [p.ix_row for p in _sky_layout.patterns])
                 sky_ix_col = np.concatenate(
                     [p.ix_col for p in _sky_layout.patterns])
+            if x2_orch is not None:
+                # 2x: the tier-A static sky over this chgroup's values; each
+                # value (a cell, or a redundancy class) at its owner cell.
+                sky_ix_row, sky_ix_col = x2_orch.sky_cells()
+                sky_cell_lambda = float(x2_orch.vm.cell_lambda)
+                sky_pattern_id = int(x2_orch.vm.pattern_id)
             # amp_scale: median |G| of this chgroup's cal solutions.
             # phase_only cal leaves the instrumental gain magnitudes in
             # the vis; h23 divides by amp_scale**2 to flatten the
@@ -4115,8 +4407,8 @@ def run(
                 interval_s=float(sky_export_interval_s),
                 chgroup=int(cfg.chgroup),
                 n_grid=int(pat_sky.n_grid),
-                cell_lambda=float(pat_sky.cell_lambda),
-                pattern_id=int(pat_sky.pattern_id),
+                cell_lambda=sky_cell_lambda,
+                pattern_id=sky_pattern_id,
                 ix_row=sky_ix_row,
                 ix_col=sky_ix_col,
                 dec_deg=math.degrees(cfg.obs_dec_rad),
@@ -4508,9 +4800,26 @@ def run(
         # hot so the operator knows it is safe to utc_start.
         _publish_corr_fast_ready(rfi_mon_cn_id, ready=False, n_blocks=_warmup_n)
         _warmup_t0 = time.time()
-        _warmup_pipeline_jit(
-            ctx, expected_fada_bytes=expected_fada_bytes, n_blocks=_warmup_n,
-        )
+        orch = None
+        if x2_orch is not None:
+            from dsart.x2.corr.pipeline1x import freeze_gc
+            orch = x2_orch
+            orch.warmup(_warmup_n)
+            LOG.info("x2 orchestrator warm; gc.freeze moved %d objects", freeze_gc())
+        elif orchestrator == "pipelined":
+            from dsart.x2.corr.pipeline1x import PipelinedCorrFast, freeze_gc
+            orch = PipelinedCorrFast(ctx, expected_fada_bytes=expected_fada_bytes)
+            orch.warmup(_warmup_n)
+            n_frozen = freeze_gc()
+            LOG.info(
+                "orchestrator=pipelined: async H2D + 2-block ring + deferred "
+                "TX; gc.freeze moved %d objects to the permanent generation",
+                n_frozen,
+            )
+        else:
+            _warmup_pipeline_jit(
+                ctx, expected_fada_bytes=expected_fada_bytes, n_blocks=_warmup_n,
+            )
         _publish_corr_fast_ready(
             rfi_mon_cn_id, ready=True,
             warmup_s=time.time() - _warmup_t0, n_blocks=_warmup_n,
@@ -4561,7 +4870,15 @@ def run(
                     break
                 continue
 
-            if pipeliner is not None:
+            if orch is not None:
+                # x2 pipelined orchestrator: stages this page on the copy
+                # stream, issues the previous block, hands the one before
+                # that to TX, and releases this page once its H2D lands.
+                for done in orch.push(
+                    page_arr, block_n=n_in, release=reader.markCleared,
+                ):
+                    _consume_completed(done.block_n, done)
+            elif pipeliner is not None:
                 # push() returns the IntegrationOutput for the block
                 # submitted ``n_buffers=3`` calls ago, or None during
                 # the first 3 pushes (warmup). The block number it
@@ -4597,7 +4914,10 @@ def run(
             # Cheap monotonic compare per block; D2H + npz only on the
             # ~30 s tick; POST on a daemon thread (never blocks here).
             if sky_exporter is not None:
-                sky_exporter.maybe_export(ctx.static_sky, block_n=n_in)
+                sky_exporter.maybe_export(
+                    x2_orch.sky_static if x2_orch is not None else ctx.static_sky,
+                    block_n=n_in,
+                )
 
             if n_in % 16 == 0:
                 LOG.info(
@@ -4628,14 +4948,36 @@ def run(
                             iw_state = dict(inject_watch.state())
                         except Exception:                   # noqa: BLE001
                             iw_state = None
+                    extra = dict(iw_state) if iw_state else {}
+                    if ctx.stage_timer is not None:
+                        ctx.stage_timer.poll()
+                        extra.update(ctx.stage_timer.summary())
+                        extra["orchestrator"] = orchestrator
+                    extra["opoint"] = opoint
+                    # x2 monitoring (WS-D D11 panels / RT health page):
+                    # wall block time over the last 128 blocks.
+                    _recent = per_block_ms[-128:]
+                    extra["block_ms_p50"] = round(float(np.median(_recent)), 3)
+                    extra["block_ms_p99"] = round(float(np.percentile(_recent, 99)), 3)
                     mon_publisher.publish(
                         block_n=n_in,
                         n_processed=n_processed,
                         n_drop=n_drop,
                         n_tx=n_tx_total,
                         last_block_ms=per_block_ms[-1],
-                        extra=iw_state,
+                        extra=extra or None,
                     )
+            if ctx.stage_timer is not None and n_in % 128 == 0:
+                ctx.stage_timer.poll()
+                _st = ctx.stage_timer.summary()["stage_ms"]
+                LOG.info(
+                    "stage-timer (%s, last %d blocks, mean/p99 ms): %s",
+                    orchestrator, ctx.stage_timer.window,
+                    " ".join(
+                        f"{k}={v['mean']:.1f}/{v['p99']:.1f}"
+                        for k, v in _st.items()
+                    ),
+                )
 
             if max_blocks is not None and n_in >= max_blocks:
                 LOG.info("hit --max-blocks=%d; stopping", max_blocks)
@@ -4644,6 +4986,9 @@ def run(
                 LOG.info("fada EOD; loop done")
                 break
 
+        if orch is not None:
+            for done in orch.flush():
+                _consume_completed(done.block_n, done)
         if pipeliner is not None:
             # Drain the 3-stream pipeline: this returns up to ``n_buffers``
             # blocks still in flight (the last 3 pushed).
@@ -4685,6 +5030,18 @@ def run(
             "n_fast_vis_per_block": ctx.kernel.n_fast_vis_per_full_block,
             "n_grid": cfg.n_grid,
             "n_filled": int(ctx.gridder.pattern.n_filled),
+            # x2: CP gates (mean block time) + the per-stage timing table
+            "ms_per_block_mean": (
+                float(np.mean(per_block_ms)) if per_block_ms else float("nan")
+            ),
+            "ms_per_block_max": (
+                float(np.max(per_block_ms)) if per_block_ms else float("nan")
+            ),
+            "stage_timer": (
+                ctx.stage_timer.summary() if ctx.stage_timer is not None else None
+            ),
+            "orchestrator": orchestrator,
+            "opoint": opoint,
         }
     finally:
         try:
@@ -5031,6 +5388,23 @@ def main(argv: list[str] | None = None) -> int:
                         "wall to max(U,C,D) instead of U+C+D. Adds a "
                         "3-block result latency (output for block N "
                         "returned by push(N+3)). Requires CUDA.")
+    p.add_argument("--orchestrator", default="legacy",
+                   choices=("legacy", "pipelined"),
+                   help="x2 WS-C: block-loop orchestrator. 'legacy' (default) "
+                        "= process_block per page. 'pipelined' = the "
+                        "bit-identical 1x-compat restructure (async "
+                        "double-buffered H2D on a copy stream, 2-block "
+                        "stage-1 ring, cube mask folded into cal, deferred "
+                        "TX on a D2H stream, gc.freeze); outputs lag 2 blocks.")
+    p.add_argument("--opoint", default="1x",
+                   help="x2: op-point id. '1x' (default) = today's chain. A 2x id "
+                        "(e.g. 2x-gridded-ns2-cint4, see dsart.x2.opoint) runs the "
+                        "2x corr chain (needs --t-int-fast-native 8 "
+                        "--chan-sum-factor 2 --n-sub <2|4>; --dm-plan-path then "
+                        "names a TieredDmPlan npz, else the plan is built).")
+    p.add_argument("--no-stage-timing", action="store_true",
+                   help="disable the always-on sync-free per-stage CUDA-event "
+                        "timing published in the /mon corr_fast heartbeat")
     p.add_argument("--profile-stages-every", type=int, default=0,
                    help="M7.2 Phase 0 diagnostic. When > 0, brackets "
                         "corr_phase / consume_phase / multi_dm / "
@@ -5375,6 +5749,9 @@ def main(argv: list[str] | None = None) -> int:
             rfi_mon_shm_slots=args.rfi_mon_shm_slots,
             sky_export_url=args.sky_export_url,
             sky_export_interval_s=args.sky_export_interval_s,
+            orchestrator=args.orchestrator,
+            stage_timing=not args.no_stage_timing,
+            opoint=args.opoint,
         )
     except _StopRequested:
         LOG.info("clean stop")

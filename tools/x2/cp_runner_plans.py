@@ -360,6 +360,15 @@ def _cp1_restore() -> list[Step]:
             Command("ssh -o BatchMode=yes lxd110h20.pro.pvt systemctl is-active dsart_rt_to_influx.service",
                     None, 60, mark=False)],
             gate="active", optional=True),
+        # The user decided (2026-10-22) that n01 KEEPS the ipfrag sysctl after CP1: never revert it.
+        Step("restore.n01_ipfrag_kept", t, "read-only: n01 still has n02's 99-dsart-ipfrag.conf and the same "
+             "live ipfrag values (kept permanently by the user's decision)", 1, [
+            Command("mkdir -p @{state}/restore && for n in n01 n02; do ssh -o BatchMode=yes $n.pro.pvt "
+                    "'sysctl -n net.ipv4.ipfrag_high_thresh net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_time' "
+                    "> @{state}/restore/ipfrag_$n.txt; done && ssh -o BatchMode=yes n01.pro.pvt "
+                    "cat /etc/sysctl.d/99-dsart-ipfrag.conf | diff - @{state}/fleet/99-dsart-ipfrag.conf && "
+                    "diff @{state}/restore/ipfrag_n01.txt @{state}/restore/ipfrag_n02.txt", None, 120, mark=False)],
+            gate="file identical to n02's; live values equal"),
         Step("restore.user_start", t, "the user starts 1x from the web UI and arms", 15, [
             Command("@{py_h23} @{repo}/tools/x2/cp_runner.py check fleet-state --want observing --wait-s 1200",
                     None, 1260, mark=False)],
