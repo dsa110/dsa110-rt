@@ -100,6 +100,8 @@ class EngineConfig:
     dm_index_mode: str = "global"
     fft_mode: str = "twin"
     backend: str = "cpu"
+    k3b_impl: str = "v1"                     # GPU K3b: "v1" (per filter) | "fused" (one kernel)
+    k1_impl: str = "triton"                  # GPU K1: "triton" | "staged" (CUDA smem windows)
     rows_per_batch: int = 64
     wait_timeout_s: Optional[float] = 0.0
     sigma_history_cycles: int = 160          # >= 30 s of 201 ms cycles
@@ -121,10 +123,17 @@ class DmInputs:
 
     fmt: object                  # RowFormat or codec.StreamFormats (per stream)
     csr: OwnerCsr
-    c_v: np.ndarray              # [S, V] float32
+    c_v: np.ndarray              # [S, V] float32 decode step s (SPEC §4.5)
     offset: float = 0.0
     value_sigma: Optional[list] = None   # per stream [V] decoded per-component std
     pattern_id: Optional[int] = None     # value-map pattern_id (SPEC §3)
+    w_v: Optional[np.ndarray] = None     # [S, V] float32 f32(sqrt(n_v)); None = 1
+
+    def weights(self) -> np.ndarray:
+        """``w_v`` (ones when absent: 1x and unit-weight tests)."""
+        if self.w_v is None:
+            return np.ones_like(np.asarray(self.c_v, dtype=np.float32))
+        return np.asarray(self.w_v, dtype=np.float32)
 
 
 @dataclass
@@ -270,7 +279,9 @@ class OwnerEngine:
             return float(self.cfg.image_scale)
         vs = inp.value_sigma
         if vs is None:
-            vs = [np.asarray(inp.c_v[s], dtype=np.float64) for s in range(inp.csr.n_stream)]
+            w = inp.weights()
+            vs = [np.asarray(inp.c_v[s], dtype=np.float64) * w[s]
+                  for s in range(inp.csr.n_stream)]
         sig = expected_image_sigma(inp.csr, vs)
         if not sig > 0:
             raise ValueError("expected image sigma is zero (empty CSR?)")
@@ -319,8 +330,14 @@ class OwnerEngine:
         n = hi - start
         if n > sr.n_slots:
             raise ValueError(f"DM {st.spec.d}: {n} rows > stream ring {sr.n_slots}")
-        raw, valid = self.ring.wait_window(st.spec.d, int(start), int(n),
-                                           timeout_s=self.cfg.wait_timeout_s)
+        into = getattr(self.ring, "wait_window_into", None)
+        if into is not None and self._gpu is not None:      # ring -> pinned staging, one copy
+            buf = self._gpu.staging(st, int(n), int(self.ring.row_bytes))
+            raw, valid = into(st.spec.d, int(start), int(n), out=buf,
+                              timeout_s=self.cfg.wait_timeout_s)
+        else:
+            raw, valid = self.ring.wait_window(st.spec.d, int(start), int(n),
+                                               timeout_s=self.cfg.wait_timeout_s)
         if self._gpu is not None:
             self._gpu.k0(st, raw, valid, start)              # codes live on the device
             sr.valid[:, sr.slots(np.arange(start, start + n))] = np.asarray(valid, bool)
@@ -339,7 +356,8 @@ class OwnerEngine:
         for r0 in range(lo, hi, self.cfg.rows_per_batch):
             n = min(self.cfg.rows_per_batch, hi - r0)
             uv = k1_twin(st.streams.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
-                         shifts=spec.shifts, t_lo=r0, n_t=n)               # [F, n, n_act]
+                         shifts=spec.shifts, t_lo=r0, n_t=n,
+                         w_v=st.inp.w_v)                                   # [F, n, n_act]
             uvb = np.ascontiguousarray(np.swapaxes(uv, 0, 1)).reshape(n * spec.n_fdm, -1)
             if self.cfg.fft_mode == "twin":
                 img = image_from_uv_twin(uvb, st.fft, st.mask_scaled)
@@ -516,7 +534,7 @@ class OwnerEngine:
         for r0 in range(t_lo, t_hi, batch_rows):
             n = min(batch_rows, t_hi - r0)
             uv = k1_twin(scratch.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
-                         shifts=spec.shifts, t_lo=r0, n_t=n)
+                         shifts=spec.shifts, t_lo=r0, n_t=n, w_v=st.inp.w_v)
             uvb = np.ascontiguousarray(np.swapaxes(uv, 0, 1)).reshape(n * spec.n_fdm, -1)
             if self.cfg.fft_mode == "twin":
                 img = image_from_uv_twin(uvb, st.fft, st.mask_scaled, out_dtype=np.float16)

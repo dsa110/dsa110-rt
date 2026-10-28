@@ -37,10 +37,12 @@ def test_k1_triton_equals_twin_bit_for_bit(fold):
     csr = csr_from_value_cells(cells, n_grid=N, fold=fold)
     codes = rng.integers(-7, 8, size=(S, V, R, 2)).astype(np.int8)
     cv = rng.uniform(0.05, 9.0, size=(S, V)).astype(np.float32)
+    wv = np.sqrt(rng.integers(1, 3000, size=(S, V)).astype(np.float64)).astype(np.float32)
     shifts = rng.integers(0, 6, size=(2, S)).astype(np.int32)
-    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=shifts, t_lo=20, n_t=5)
+    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=shifts, t_lo=20, n_t=5, w_v=wv)
     got = k1_combine(torch.from_numpy(codes), torch.from_numpy(cv), csr_tensors(csr, "cpu"),
-                     torch.from_numpy(shifts), t_lo=20, n_t=5, block_c=16, block_t=4).numpy()
+                     torch.from_numpy(shifts), t_lo=20, n_t=5, block_c=16, block_t=4,
+                     w_v=torch.from_numpy(wv)).numpy()
     assert np.array_equal(got[..., 0], want.real) and np.array_equal(got[..., 1], want.imag)
 
 
@@ -84,3 +86,53 @@ def test_interpreter_is_not_vacuous(add, ok):
     _plus_one[(1,)](x, out, 10, ADD=add, B=16)
     assert np.array_equal(out[:10].numpy(), (x + 1.0).numpy()) == ok
     assert np.all(out[10:].numpy() == -5.0)                  # masked lanes untouched
+
+
+@pytest.mark.parametrize("bank", ["box", "b3x", "t"])
+def test_k3b_fused_equals_twin_bit_for_bit(bank):
+    """ONE fused kernel for the whole bank == the per-filter twin (values,
+    packed (t, k) incl. tie order, taps)."""
+    from dsart.x2.search.k3b_fused import k3b_fused
+
+    rng = np.random.default_rng(5)
+    fb = {"box": FilterBank.build((1, 2, 4, 8)), "b3x": FilterBank.b3x(),
+          "t": FilterBank.build((1, 2, 3), ("t",))}[bank]
+    F, P, n_c = 2, 20, 64
+    R = n_c + fb.history() + 3
+    ring = rng.standard_normal((R, F, P)).astype(np.float16)
+    ring[7, 0, 4] = 500.0
+    c_first = 5 * R + 1 + fb.max_d + fb.max_a
+    si = np.array([0.8, 1.3], dtype=np.float32)
+    sk = (1.0 / (fb.seeds * 1.07)).astype(np.float32)
+    taps = np.array([0, 9, 19])
+    b0, t0, p0 = k3b_twin(ring, ring_row0=0, c_first=c_first, n_c=n_c, sigma_inv=si, s_inv=sk,
+                          bank=fb, tap_pixels=taps)
+    b1, t1, p1 = k3b_fused(torch.from_numpy(ring), ring_row0=0, c_first=c_first, n_c=n_c,
+                           sigma_inv=torch.from_numpy(si), s_inv=sk, bank=fb, tap_pixels=taps,
+                           block=16)
+    assert np.array_equal(b1.numpy(), b0)
+    assert np.array_equal(t1.numpy(), t0)
+    assert np.array_equal(p1.numpy(), p0)
+
+
+@pytest.mark.parametrize("mutate", ["offset", "tie"])
+def test_k3b_fused_mutants_are_caught(mutate):
+    """Deliberately wrong fused kernels (a shifted read; >= instead of the
+    tie rule) must NOT match the twin -- the comparison is not vacuous."""
+    from dsart.x2.search.k3b_fused import k3b_fused
+
+    rng = np.random.default_rng(6)
+    fb = FilterBank.b3x()
+    F, P, n_c = 1, 16, 64
+    R = n_c + fb.history() + 1
+    ring = (rng.standard_normal((R, F, P)) if mutate == "offset"
+            else np.zeros((R, F, P))).astype(np.float16)
+    c_first = R + fb.max_d + fb.max_a
+    si = np.ones(1, np.float32)
+    sk = np.ones(len(fb), np.float32)
+    b0, t0, _ = k3b_twin(ring, ring_row0=0, c_first=c_first, n_c=n_c, sigma_inv=si, s_inv=sk,
+                         bank=fb)
+    b1, t1, _ = k3b_fused(torch.from_numpy(ring), ring_row0=0, c_first=c_first, n_c=n_c,
+                          sigma_inv=torch.from_numpy(si), s_inv=sk, bank=fb, block=16,
+                          mutate=mutate)
+    assert not (np.array_equal(b1.numpy(), b0) and np.array_equal(t1.numpy(), t0))

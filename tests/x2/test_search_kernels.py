@@ -247,7 +247,7 @@ def test_valuemap_adapter_real_2x_map_images_like_reference():
         nv = vm.streams[s].n_values
         codes[s, :nv, 1] = rng.integers(-7, 8, size=(nv, 2))
     uv = k1_twin(codes, c_v=inp.c_v, offset=0.0, csr=csr, shifts=np.zeros((1, S), np.int32),
-                 t_lo=1, n_t=1)
+                 t_lo=1, n_t=1, w_v=inp.w_v)
     plan = FftPlan.build(csr)
     msk = ref.ref_edge_mask(256, 1)
     img = image_from_uv_twin(uv.reshape(1, -1), plan, msk, out_dtype=None)[0]
@@ -256,9 +256,61 @@ def test_valuemap_adapter_real_2x_map_images_like_reference():
         sv = vm.streams[s]
         nv = sv.n_values
         c = codes[s, :nv, 1].astype(float)
-        vals.append(((c[:, 0] + 1j * c[:, 1]) * inp.c_v[s, :nv])[None, :])
+        vals.append(((c[:, 0] + 1j * c[:, 1]) * inp.c_v[s, :nv].astype(float)
+                     * inp.weights()[s, :nv])[None, :])
         cells.append(sv.cell_row.astype(np.int64) * 256 + sv.cell_col.astype(np.int64))
     G = ref.ref_grid_dedispersed(vals, cells, np.zeros((1, S), int), row0=0, out_rows=[0],
                                  n_grid=256)
     want = ref.ref_image(G, msk, 1.0)[0, 0]
     assert np.max(np.abs(img - want)) < 2e-5 * np.abs(want).max()
+
+
+def test_owner_decode_is_spec_45_two_roundings():
+    """K1's decode == SPEC §4.5 literally: v = f32(code) * f32(s) (NO_DATA
+    -> 0), then * f32(sqrt(n)) -- two fp32 roundings, bit for bit (and ==
+    ``dsart.x2.quant.decode`` + ``natural_weight`` when WS-T's reference is
+    importable). A single fused constant f32(s sqrt n) differs."""
+    from dsart.x2.search.codec import decode_constants, decode_values
+
+    rng = np.random.default_rng(45)
+    nv, nh = 300, 20
+    fmt = RowFormat("frame2", n_values=nv, n_heavy=nh, bits=4)
+    n = rng.integers(1, 5000, size=nv)
+    c_v, w_v, off = decode_constants(fmt, step_main=0.3534, step_heavy=0.0773, n_contrib=n)
+    assert off == 0.0
+    re = rng.integers(-7, 8, size=(5, nv))
+    im = rng.integers(-7, 8, size=(5, nv))
+    re[:, :nh] = rng.integers(-127, 128, size=(5, nh))
+    im[:, :nh] = rng.integers(-127, 128, size=(5, nh))
+    s = np.where(np.arange(nv) < nh, np.float32(0.0773), np.float32(0.3534)).astype(np.float32)
+    w = np.sqrt(n.astype(np.float64)).astype(np.float32)
+    want_re = (re.astype(np.float32) * s) * w
+    want_im = (im.astype(np.float32) * s) * w
+    fr, fi = decode_values(re, im, c_v, off, w_v)
+    assert np.array_equal(fr, want_re) and np.array_equal(fi, want_im)
+    # K1 (one value per cell, F = 1, no shift) carries exactly these values
+    cells = [np.arange(nv, dtype=np.int64) * 3 + 1]
+    csr = csr_from_value_cells(cells, n_grid=64)
+    codes = np.zeros((1, nv, 2, 2), np.int8)
+    codes[0, :, 1, 0] = re[0]
+    codes[0, :, 1, 1] = im[0]
+    uv = k1_twin(codes, c_v=c_v[None], offset=0.0, csr=csr, shifts=np.zeros((1, 1), np.int32),
+                 t_lo=1, n_t=1, w_v=w_v[None])
+    # cells with ONE entry hold 0.5 * sign * value (x0.5, x-1 exact; re of conj = re)
+    one = np.diff(csr.cell_ptr) == 1
+    assert one.sum() > 100
+    ev = csr.ent_value[csr.cell_ptr[:-1]][one]
+    got = uv[0, 0][one] / (np.float32(0.5) * csr.sign[one])
+    assert np.array_equal(got.real.astype(np.float32), want_re[0, ev])
+    # the one-constant decode is NOT this (the test discriminates)
+    fused = (re.astype(np.float64) * (s.astype(np.float64) * np.sqrt(n))).astype(np.float32)
+    assert not np.array_equal(fused, want_re)
+    try:
+        from dsart.x2 import quant
+    except ImportError:
+        return
+    for row in range(5):
+        vh = quant.decode(np.stack([re[row, :nh], im[row, :nh]], -1), np.float32(0.0773), 8)
+        vm = quant.decode(np.stack([re[row, nh:], im[row, nh:]], -1), np.float32(0.3534), 4)
+        q = quant.natural_weight(np.concatenate([vh, vm]), n)
+        assert np.array_equal(q.real, want_re[row]) and np.array_equal(q.imag, want_im[row])

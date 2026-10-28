@@ -64,8 +64,14 @@ class GpuBackend:
         x.nodata = torch.zeros((S,), dtype=torch.int64, device=self.dev)
         x.image = torch.zeros((st.R_img, spec.n_fdm, N * N), dtype=torch.float16, device=self.dev)
         x.c_v = torch.as_tensor(inp.c_v, dtype=torch.float32, device=self.dev)
+        x.w_v = torch.as_tensor(inp.weights(), dtype=torch.float32, device=self.dev)
         x.csr = csr_tensors(inp.csr, self.dev)
         x.shifts = torch.as_tensor(spec.shifts, dtype=torch.int32, device=self.dev)
+        if cfg.k1_impl not in ("triton", "staged"):
+            raise ValueError(f"k1_impl={cfg.k1_impl!r} (triton|staged)")
+        from .k1_staged import staged_geometry
+        x.k1geom = staged_geometry(spec.shifts, n_t=cfg.rows_per_batch)
+        x.csr["smax"] = torch.as_tensor(x.k1geom.smax, dtype=torch.int32, device=self.dev)
         x.pix = torch.as_tensor((st.mask_scaled.astype(np.float64) / (N * N)).astype(np.float32),
                                 device=self.dev)
         x.mask_scaled = torch.as_tensor(st.mask_scaled, device=self.dev)
@@ -104,32 +110,63 @@ class GpuBackend:
         return cp.cuda.ExternalStream(stream.cuda_stream)
 
     @staticmethod
+    def _ev(stream) -> torch.cuda.Event:
+        e = torch.cuda.Event(enable_timing=True)
+        e.record(stream)
+        return e
+
+    def _mark(self, d: int, name: str, a, b) -> None:
+        self.gpu_ms.setdefault(d, []).append((name, a, b))
+
+    @staticmethod
     def _ptr(t: torch.Tensor):
         from ...image.tiled_combine_cuda import _ptr
         return _ptr(t)
 
     # ------------------------------------------------------------------
+    def staging(self, st, n: int, row_bytes: int) -> np.ndarray:
+        """The DM's pinned host staging as ``uint8 [S, n, row_bytes]`` (after
+        the previous H2D from it finished): the ring copies straight into it
+        (``RingV4Source.wait_window_into``) and :meth:`k0` skips its copy."""
+        x = self.dm[st.spec.d]
+        S = st.spec.n_stream
+        size = S * int(n) * int(row_bytes)
+        if getattr(x, "pinned_ev", None) is not None:
+            x.pinned_ev.synchronize()
+            x.pinned_ev = None
+        if x.pinned is None or x.pinned.numel() < size:
+            x.pinned = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+        return x.pinned[:size].numpy().reshape(S, int(n), int(row_bytes))
+
     def k0(self, st, raw: np.ndarray, valid: np.ndarray, start: int) -> None:
         """H2D (copy stream, pinned) + K0 unpack into the device code ring."""
         from .kernels_cuda import get_module
 
         x = self.dm[st.spec.d]
         S, n, rb = raw.shape
+        staged = (x.pinned is not None and raw.flags["C_CONTIGUOUS"]
+                  and raw.ctypes.data == x.pinned.data_ptr())
         if getattr(x, "pinned_ev", None) is not None:
             x.pinned_ev.synchronize()                 # previous H2D done with the buffer
-        if x.pinned is None or x.pinned.numel() < raw.size:
-            x.pinned = torch.empty(raw.size, dtype=torch.uint8, pin_memory=True)
-        hraw = x.pinned[:raw.size].view(S, n, rb)
-        hraw.copy_(torch.from_numpy(np.ascontiguousarray(raw)))
+        if staged:
+            hraw = x.pinned[:raw.size].view(S, n, rb)     # the ring copied into it already
+        else:
+            if x.pinned is None or x.pinned.numel() < raw.size:
+                x.pinned = torch.empty(raw.size, dtype=torch.uint8, pin_memory=True)
+            hraw = x.pinned[:raw.size].view(S, n, rb)
+            hraw.copy_(torch.from_numpy(np.ascontiguousarray(raw)))
         hval = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.uint8))
         with torch.cuda.stream(self.copy):
+            h0 = self._ev(self.copy)
             draw = hraw.to(self.dev, non_blocking=True)
             dval = hval.to(self.dev, non_blocking=True)
-            ev = torch.cuda.Event()
+            ev = torch.cuda.Event(enable_timing=True)
             ev.record(self.copy)
+        self._mark(st.spec.d, "h2d", h0, ev)
         x.pinned_ev = ev
         self.compute.wait_event(ev)
         mod = get_module()
+        k0a = self._ev(self.compute)
         with self._ext(self.compute):
             if x.kind == "frame2":
                 k = mod.get_function("k0_unpack_frame2")
@@ -144,6 +181,7 @@ class GpuBackend:
                                    self._ptr(x.valid), np.int32(S), np.int32(n), np.int32(rb),
                                    np.int32(x.codes.shape[1]), np.int32(st.R_s),
                                    np.int64(start)))
+        self._mark(st.spec.d, "k0", k0a, self._ev(self.compute))
         draw.record_stream(self.compute)
         dval.record_stream(self.compute)
 
@@ -153,13 +191,24 @@ class GpuBackend:
         from .kernels_triton import k1_combine
         from .kernels_cuda import get_module
         from .fft import image_from_uv_torch
+        from .k1_staged import k1_staged
 
         cfg = self.eng.cfg
         N = cfg.n_grid
         F = st.spec.n_fdm
+        timed = stream is self.compute
         with torch.cuda.stream(stream):
-            uv = k1_combine(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
-                            offset=float(st.inp.offset))                  # [F, n, A, 2]
+            ea = self._ev(stream) if timed else None
+            if cfg.k1_impl == "staged":
+                uv = k1_staged(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
+                               offset=float(st.inp.offset), w_v=x.w_v, geom=x.k1geom,
+                               stream=stream)                                      # [F, n, A, 2]
+            else:
+                uv = k1_combine(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
+                                offset=float(st.inp.offset), w_v=x.w_v)            # [F, n, A, 2]
+            if timed:
+                eb = self._ev(stream)
+                self._mark(st.spec.d, "k1", ea, eb)
             B = F * n
             A = int(x.csr["n_act"])
             if cfg.fft_mode in ("pruned", "irfft2"):
@@ -168,6 +217,8 @@ class GpuBackend:
                 img = img.view(F, n, N * N).transpose(0, 1).to(torch.float16)
                 slots = torch.remainder(torch.arange(r0, r0 + n, device=self.dev), ring_rows)
                 ring[slots] = img
+                if timed:
+                    self._mark(st.spec.d, "fft", eb, self._ev(stream))
                 return
             mod = get_module()
             n_fl = int(x.fl.numel())
@@ -186,17 +237,14 @@ class GpuBackend:
                     np.int32(B), np.int32(A), np.int32(n_fl), np.int32(int(x.cc_idx.numel())),
                     np.int32(n), np.int32(F), np.int64(r0), np.int32(ring_rows),
                     np.int32(x.transpose)), shared_mem=warps * (N // 2 + 1) * 8)
+            if timed:
+                self._mark(st.spec.d, "fft", eb, self._ev(stream))
 
     def image_rows(self, st, lo: int, hi: int) -> None:
         x = self.dm[st.spec.d]
-        ev0 = torch.cuda.Event(enable_timing=True)
-        ev1 = torch.cuda.Event(enable_timing=True)
-        ev0.record(self.compute)
         for r0 in range(lo, hi, self.eng.cfg.rows_per_batch):
             n = min(self.eng.cfg.rows_per_batch, hi - r0)
             self._image_batch(st, x, r0, n, self.compute, x.image, st.R_img)
-        ev1.record(self.compute)
-        self.gpu_ms.setdefault(st.spec.d, []).append(("image", ev0, ev1))
         st.image_hi = hi if st.image_hi is None else max(st.image_hi, hi)
 
     def layer1_sigma(self, st, t0: int) -> np.ndarray:
@@ -204,47 +252,62 @@ class GpuBackend:
 
         x = self.dm[st.spec.d]
         with torch.cuda.stream(self.compute):
+            a = self._ev(self.compute)
             slots = torch.as_tensor(np.mod(t0 + st.l1_t, st.R_img), device=self.dev)
             f_idx = torch.arange(st.spec.n_fdm, device=self.dev)[:, None]
             p = torch.as_tensor(st.l1_p, device=self.dev)
             smp = x.image[slots, f_idx, p].float()
             sig = sigma_clipped_std_batched(smp)
-        return sig.cpu().numpy()
+            self._mark(st.spec.d, "l1", a, self._ev(self.compute))
+            # D2H ON the compute stream: ordered after the work that produced it
+            # (a .cpu() outside this block runs on the default stream and can
+            # read the buffers before the compute stream has written them)
+            return sig.cpu().numpy()
 
     def k3b_topk(self, st, c_first: int, sigma_inv: np.ndarray, s_inv: np.ndarray,
                  n_top: int) -> tuple:
         """K3b + top-k on the device; ONE D2H of the top-k and the taps."""
         from .kernels_triton import k3b_detect
+        from .k3b_fused import k3b_fused
 
         x = self.dm[st.spec.d]
         cfg = self.eng.cfg
-        ev0 = torch.cuda.Event(enable_timing=True)
-        ev1 = torch.cuda.Event(enable_timing=True)
+        if cfg.k3b_impl not in ("v1", "fused"):
+            raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused)")
+        detect = k3b_fused if cfg.k3b_impl == "fused" else k3b_detect
         with torch.cuda.stream(self.compute):
-            ev0.record(self.compute)
-            best, tk, taps = k3b_detect(
+            ev0 = self._ev(self.compute)
+            best, tk, taps = detect(
                 x.image, ring_row0=0, c_first=c_first, n_c=st.spec.hop,
                 sigma_inv=torch.as_tensor(sigma_inv, device=self.dev), s_inv=s_inv,
                 bank=self.eng.bank, clip=cfg.clip_sigma, chunk=cfg.chunk,
                 tap_pixels=st.tap_pixels)
+            evm = self._ev(self.compute)
             flat = best.view(-1)
             k = int(min(max(1, n_top), flat.numel()))
             vals, idx = torch.topk(flat, k)
             tkv = tk.view(-1)[idx]
-            ev1.record(self.compute)
-        self.gpu_ms.setdefault(st.spec.d, []).append(("k3b", ev0, ev1))
-        out = (vals.cpu().numpy(), idx.cpu().numpy(), tkv.cpu().numpy(), tuple(best.shape),
-               None if taps is None else taps.cpu().numpy())
+            ev1 = self._ev(self.compute)
+            # D2H on the compute stream (see layer1_sigma)
+            out = (vals.cpu().numpy(), idx.cpu().numpy(), tkv.cpu().numpy(), tuple(best.shape),
+                   None if taps is None else taps.cpu().numpy())
+        self._mark(st.spec.d, "k3b", ev0, evm)
+        self._mark(st.spec.d, "topk", evm, ev1)
         return out
 
-    def pop_gpu_ms(self) -> dict:
-        """Per DM: summed compute-stream ms since the last call (syncs)."""
+    def pop_gpu_ms(self, by_stage: bool = False) -> dict:
+        """Per DM since the last call (syncs): the compute-stream ms summed
+        over stages (the duty numerator; ``h2d`` runs on the copy stream and
+        overlaps, so it is excluded), or with ``by_stage`` ``{stage: ms}``
+        for ``h2d k0 k1 fft l1 k3b topk``."""
         out = {}
         for d, evs in self.gpu_ms.items():
-            if evs:
-                evs[-1][2].synchronize()
-            out[d] = float(sum(a.elapsed_time(b) for _n, a, b in evs))
+            st = {}
+            for name, a, b in evs:
+                b.synchronize()
+                st[name] = st.get(name, 0.0) + float(a.elapsed_time(b))
             evs.clear()
+            out[d] = st if by_stage else float(sum(v for k, v in st.items() if k != "h2d"))
         return out
 
     # ------------------------------------------------------------------
