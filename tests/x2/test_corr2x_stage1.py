@@ -1,9 +1,9 @@
-"""x2 WS-C deliverable 3: the CSR-driven stage-1 CUDA kernel.
+"""x2 WS-C: the CSR-driven stage-1 CUDA kernel (one block per value, k-major ring).
 
-* numpy twin (same tiles, staging windows with the ring wrap, chunking and
-  float32 add order) == the float64 reference ``stage1_values`` +
-  ``decimate`` to fp32 rounding, for both decimations and conjugated
-  sources;
+* numpy twin (same per-value blocks, staging windows with the ring wrap,
+  chunking and float32 add order) == the float64 reference
+  ``stage1_values`` + ``decimate`` to fp32 rounding, for both decimations
+  and conjugated sources;
 * twin output is invariant to the source chunk size (the add order is the
   CSR order, not the staging order) -- bit for bit;
 * WS-P's value-map CSR drives it (rows = kept baselines or classes);
@@ -29,11 +29,11 @@ from dsart.x2.corr.stage1_cuda import (
 from dsart.x2.ref import corr2x_ref as ref
 
 
-def _problem(seed=0, R=9, C=8, n_sub=2, n_d=3, T_ring=40, conj_frac=0.3):
+def _problem(seed=0, R=9, C=8, n_sub=2, n_d=3, T_ring=64, conj_frac=0.3):
     rng = np.random.default_rng(seed)
     per = C // n_sub
-    # fp16-representable ring values
-    ring = (rng.normal(size=(R, C, T_ring)) + 1j * rng.normal(size=(R, C, T_ring)))
+    # fp16-representable ring values, k-major (C, R, T_ring)
+    ring = (rng.normal(size=(C, R, T_ring)) + 1j * rng.normal(size=(C, R, T_ring)))
     ring = (ring.real.astype(np.float16).astype(np.float64)
             + 1j * ring.imag.astype(np.float16).astype(np.float64))
     streams, ptr, rows, ks, cj, voff = [], [0], [], [], [], [0]
@@ -62,16 +62,16 @@ def _problem(seed=0, R=9, C=8, n_sub=2, n_d=3, T_ring=40, conj_frac=0.3):
 
 
 @pytest.mark.parametrize("D", [2, 4])
-@pytest.mark.parametrize("q_base", [0, 27])                 # 27: the window wraps the ring
+@pytest.mark.parametrize("q_base", [0, 59])                 # 59: the window wraps the ring
 def test_twin_equals_reference(D, q_base) -> None:
     ring, csr, shifts, streams, per = _problem()
-    R, C, T_ring = ring.shape
+    C, R, T_ring = ring.shape
     n_out = 3
-    geo = geometry_for(shifts, D=D, TT=2)
+    geo = geometry_for(shifts, D=D, n_out=n_out)
     got = stage1_twin(ring, csr, shifts, geo, q_base=q_base, n_out=n_out)
     # reference on the unwrapped series starting at q_base
     idx = (q_base + np.arange(n_out * D + int(shifts.max()) + 1)) % T_ring
-    Vt = ring[:, :, idx].transpose(2, 1, 0)                  # (t, C, R)
+    Vt = ring[:, :, idx].transpose(2, 0, 1)                  # (t, C, R)
     for d in range(shifts.shape[0]):
         for s, (dest, conj, nv) in enumerate(streams):
             ks = np.arange(s * per, (s + 1) * per)
@@ -84,19 +84,23 @@ def test_twin_equals_reference(D, q_base) -> None:
 
 def test_twin_chunk_invariant_bit_exact() -> None:
     ring, csr, shifts, _, _ = _problem(seed=3)
-    g1 = geometry_for(shifts, D=2, TT=4)
+    import dataclasses
+    g1 = geometry_for(shifts, D=2, n_out=6)
     a = stage1_twin(ring, csr, shifts, g1, q_base=5, n_out=6)
-    g2 = type(g1)(D=g1.D, TT=g1.TT, W=g1.W, chunk=1, smin=g1.smin, spread=g1.spread,
-                  threads=g1.threads)
+    g2 = dataclasses.replace(g1, chunk=1)
     b = stage1_twin(ring, csr, shifts, g2, q_base=5, n_out=6)
     assert np.array_equal(a, b)
 
 
-def test_geometry_bounds() -> None:
-    sh = np.random.default_rng(0).integers(0, 130, size=(32, 192)).astype(np.int32)
-    g = geometry_for(sh, D=2)
-    assert g.threads <= 1024 and g.smem_bytes <= 48 * 1024
-    assert g.W == g.TT * 2 + g.spread and g.chunk >= 1
+@pytest.mark.parametrize("n_d,D,n_out", [(32, 2, 256), (15, 4, 128), (16, 2, 256), (8, 4, 128),
+                                         (3, 2, 64), (47, 2, 256)])
+def test_geometry_bounds(n_d, D, n_out) -> None:
+    from dsart.x2.corr.stage1_cuda import OPT_CHOICES
+    sh = np.random.default_rng(0).integers(0, 130, size=(n_d, 192)).astype(np.int32)
+    g = geometry_for(sh, D=D, n_out=n_out)
+    assert g.threads == n_d * g.TT <= 1024 and g.smem_bytes <= 64 * 1024
+    assert g.OPT in OPT_CHOICES and g.OPT * g.TT >= n_out and (g.OPT == 1 or n_d * -(-n_out // (g.OPT // 2)) > 1024)
+    assert g.W == g.OPT * g.TT * D + g.spread and g.chunk >= 1
     assert np.all(sh - g.smin[None, :] <= g.spread)
 
 
@@ -128,17 +132,18 @@ def test_csr_from_value_map() -> None:
 def test_cuda_source_compiles_sm75() -> None:
     nvcc = "/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc") else shutil.which("nvcc")
     ptx = compile_check_nvcc(CUDA_SOURCE, nvcc=nvcc)
-    assert ".entry stage1_tier" in ptx
+    from dsart.x2.corr.stage1_cuda import OPT_CHOICES
+    for o in OPT_CHOICES:
+        assert f".entry stage1_tier_o{o}" in ptx
 
 
 @pytest.mark.x2_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
-@pytest.mark.parametrize("D", [2, 4])
-def test_kernel_equals_twin_gpu(D) -> None:
+@pytest.mark.parametrize("D,n_out", [(2, 17), (4, 17), (2, 256), (4, 128)])
+def test_kernel_equals_twin_gpu(D, n_out) -> None:
     from dsart.x2.corr.stage1_cuda import stage1_tier_cuda
-    ring, csr, shifts, _, _ = _problem(seed=7, R=40, C=16, n_d=12, T_ring=96)
-    geo = geometry_for(shifts, D=D)
-    n_out = 17
+    ring, csr, shifts, _, _ = _problem(seed=7, R=40, C=16, n_d=12, T_ring=1024)
+    geo = geometry_for(shifts, D=D, n_out=n_out)
     want = stage1_twin(ring, csr, shifts, geo, q_base=70, n_out=n_out)
     dev = torch.device("cuda")
     r16 = torch.from_numpy(np.stack([ring.real, ring.imag], -1).astype(np.float16)).to(dev)

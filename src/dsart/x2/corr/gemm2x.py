@@ -1,4 +1,9 @@
-"""2x fast GEMM (x2 WS-C deliverable 3): Triton kernel + CPU twin.
+"""2x fast GEMM, portable Triton kernel + CPU twin.
+
+Production on CUDA is the tensor-core ``mma.sync`` kernel in
+:mod:`dsart.x2.corr.gemm2x_cuda` (6x faster; same arithmetic contract and
+ring layout). This Triton kernel is its executable specification: it runs
+under ``TRITON_INTERPRET=1`` on the CPU (with mutant checks) and on GPUs.
 
 One launch correlates one block (or an fv-chunk of it) at the 2x op-point
 (t_int 8 natives = 262.144 us, csf 2 -> 192 summed channels):
@@ -17,9 +22,10 @@ One launch correlates one block (or an fv-chunk of it) at the 2x op-point
   layout ``(NCHAN, 2t, 2p, NPKT, NANTS)`` -- no permute copy -- so Stokes
   I and the channel sum fall out of the one reduction;
 * **cfp16 time-minor output** -- ``V(a,b) = conj(E_b) E_a`` stored as
-  (re, im) fp16 at ``ring[row, k, t mod T_ring]`` with ``t`` the absolute
-  q1 sample: stage 1 reads every source's time series contiguously and
-  the 2-block window is an index wrap, never a copy;
+  (re, im) fp16 at ``ring[k, row, t mod T_ring]`` (k-major: the rows written
+  together are close in memory) with ``t`` the absolute q1 sample: stage 1
+  reads every source's time series contiguously and the 2-block window is
+  an index wrap, never a copy;
 * **unique-baseline reduce (optional)** -- ``pair_dst`` sends each pair to
   its ring row (every baseline for gridded cells; singleton classes) or to
   an fp32 scratch row (members of redundant classes); :func:`reduce_classes`
@@ -168,7 +174,7 @@ def _gemm2x_kernel(
     calr_ptr, cali_ptr,                      # fp32 (NCHAN, NVP, NANTS)
     tmask_ptr,                               # fp32 keep (n_acc, NCHAN, NVP) if HAS_TMASK
     core_ptr, dst_ptr, tp_ptr,               # int32 tables
-    ring_ptr,                                # fp16 (n_ring_rows, NSUM, T_ring, 2)
+    ring_ptr,                                # fp16 (NSUM, n_ring_rows, T_ring, 2) k-major
     scr_ptr,                                 # fp32 (n_scratch_rows, NSUM, n_fv_scr, 2)
     fv0, n_core, n_ring_rows, t_ring0, T_ring, n_fv_scr, pk_per_acc, nants, nchan,
     s_ch, s_t, s_p, s_pk, s_ant,
@@ -230,7 +236,7 @@ def _gemm2x_kernel(
     to_ring = (dst >= 0) & (dst < n_ring_rows)
     to_scr = dst >= n_ring_rows
     t_ring = (t_ring0 + pid_fv) % T_ring
-    roff = ((dst * NSUM + pid_k) * T_ring + t_ring) * 2
+    roff = ((pid_k * n_ring_rows + dst) * T_ring + t_ring) * 2
     tl.store(ring_ptr + roff, acc_re.to(tl.float16), mask=to_ring)
     tl.store(ring_ptr + roff + 1, acc_im.to(tl.float16), mask=to_ring)
     soff = (((dst - n_ring_rows) * NSUM + pid_k) * n_fv_scr + pid_fv) * 2
@@ -256,8 +262,8 @@ def gemm2x_into_ring(
     num_warps: int = 4,
 ) -> None:
     """Correlate fast samples ``[fv0, fv0 + n_fv)`` of the block into the
-    ring at ``(t_ring0 + i) % T_ring``. ``ring`` is fp16 ``(n_ring_rows,
-    NSUM, T_ring, 2)``; ``scratch`` fp32 ``(n_scratch_rows, NSUM, n_fv, 2)``
+    ring at ``(t_ring0 + i) % T_ring``. ``ring`` is fp16 k-major ``(NSUM,
+    n_ring_rows, T_ring, 2)``; ``scratch`` fp32 ``(n_scratch_rows, NSUM, n_fv, 2)``
     when the tables route pairs there; ``time_keep`` fp32 ``(n_acc, NCHAN,
     NPOL)`` 0/1 (array burst) or None."""
     nchan, two, nvp, npkt, nants = real_v.shape
@@ -265,8 +271,8 @@ def gemm2x_into_ring(
     assert imag_v.shape == real_v.shape and imag_v.stride() == real_v.stride()
     ppfv = t_int // 2
     nsum = nchan // csf
-    assert ring.dtype == torch.float16 and ring.shape[1] == nsum and ring.shape[3] == 2
-    assert ring.is_contiguous() and ring.shape[0] == tables.n_ring_rows
+    assert ring.dtype == torch.float16 and ring.shape[0] == nsum and ring.shape[3] == 2
+    assert ring.is_contiguous() and ring.shape[1] == tables.n_ring_rows
     T_ring = int(ring.shape[2])
     if tables.n_scratch_rows:
         assert scratch is not None and scratch.dtype == torch.float32
@@ -293,7 +299,7 @@ def gemm2x_into_ring(
 @triton.jit
 def _reduce_kernel(
     scr_ptr, ring_ptr, cptr_ptr, csrc_ptr, cconj_ptr, crow_ptr,
-    t_ring0, T_ring, n_fv,
+    t_ring0, T_ring, n_fv, n_ring_rows,
     NSUM: tl.constexpr, BLOCK_T: tl.constexpr,
 ):
     c = tl.program_id(0)
@@ -312,7 +318,7 @@ def _reduce_kernel(
         acc_r += tl.load(scr_ptr + off, mask=mt, other=0.0)
         acc_i += sg * tl.load(scr_ptr + off + 1, mask=mt, other=0.0)
     row = tl.load(crow_ptr + c)
-    roff = ((row * NSUM + k) * T_ring + (t_ring0 + t) % T_ring) * 2
+    roff = ((k * n_ring_rows + row) * T_ring + (t_ring0 + t) % T_ring) * 2
     tl.store(ring_ptr + roff, acc_r.to(tl.float16), mask=mt)
     tl.store(ring_ptr + roff + 1, acc_i.to(tl.float16), mask=mt)
 
@@ -320,15 +326,15 @@ def _reduce_kernel(
 def reduce_classes(scratch, ring, tables: Gemm2xTables, *, t_ring0: int, n_fv: int,
                    block_t: int = 64) -> None:
     """Sum each redundant class's member rows (fixed order, conj applied)
-    from ``scratch`` into its ring row at ``(t_ring0 + i) % T_ring``."""
+    from ``scratch`` into its (k-major) ring row at ``(t_ring0 + i) % T_ring``."""
     n_multi = int(tables.class_row.shape[0])
     if n_multi == 0:
         return
-    nsum, T_ring = int(ring.shape[1]), int(ring.shape[2])
+    nsum, T_ring = int(ring.shape[0]), int(ring.shape[2])
     grid = (n_multi, nsum, triton.cdiv(n_fv, block_t))
     _reduce_kernel[grid](
         scratch, ring, tables.class_ptr, tables.class_src, tables.class_conj, tables.class_row,
-        t_ring0 % T_ring, T_ring, n_fv, NSUM=nsum, BLOCK_T=block_t,
+        t_ring0 % T_ring, T_ring, n_fv, int(ring.shape[1]), NSUM=nsum, BLOCK_T=block_t,
     )
 
 

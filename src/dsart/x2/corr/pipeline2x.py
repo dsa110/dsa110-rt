@@ -8,10 +8,11 @@ body is the 2x chain:
 
     unpack (today's kernel)
       -> RFI flag (today's flagger, voltage domain, unchanged)
-      -> 2x fast GEMM: core cross-baselines only, cal + cube mask folded
-         into the per-(ch, pol, ant) gains and applied on operand load,
-         array-burst time mask on load, cfp16 time-minor ring
-         (+ fixed-order class reduce for per-baseline formats)
+      -> 2x fast GEMM (tensor-core mma.sync kernel, ``gemm2x_cuda``): core
+         cross-baselines only, cal + cube mask folded into the per-(ch, pol,
+         ant) gains and applied on operand load, array-burst time mask on
+         load, cfp16 k-major time-minor ring ``[k][row][t]`` (+ fixed-order
+         class reduce for per-baseline formats)
       -> per tier: CSR stage 1 (all coarse DMs, x2 / x4 decimation),
          batched static sky, row-rule packer (SPEC §4, bit-equal to
          ``dsart.x2.quant``)
@@ -56,13 +57,12 @@ from dsart.services.slow_corr_kernel import NPACKETS_PER_BLOCK, NTIMES_PER_PACKE
 from dsart.x2.corr.gemm2x import (
     build_gemm_tables,
     compact_cal,
-    gemm2x_into_ring,
     gemm2x_reference,
-    reduce_classes,
     ring_write_reference,
 )
 from dsart.x2 import quant
 from dsart.x2.corr.framer2x import StreamFormat
+from dsart.x2.corr.gemm2x_cuda import gemm2x_mma_into_ring, reduce_classes_cuda
 from dsart.x2.corr.packer2x import RowRulePacker
 from dsart.x2.corr.pipeline1x import PipelinedCorrFast, _Done
 from dsart.x2.corr.plan2x import CorrPlan2x
@@ -205,7 +205,9 @@ class Corr2xPipeline(PipelinedCorrFast):
             if not local:
                 continue
             shifts = np.ascontiguousarray(plan.stage1_bins(ti)[g][:, local].T.astype(np.int32))
-            geo = geometry_for(shifts, D=t.decim)
+            if self.T_ring & (self.T_ring - 1):
+                raise ValueError(f"T_ring={self.T_ring} (2 blocks of q1) must be a power of two")
+            geo = geometry_for(shifts, D=t.decim, n_out=self.n_q // t.decim)
             ss = BatchedStaticSky(n_d=len(local), n_values=self.csr.n_values,
                                   window_blocks=static_sky_window_blocks,
                                   warmup_cubes=static_sky_warmup, device=ctx.device)
@@ -230,7 +232,7 @@ class Corr2xPipeline(PipelinedCorrFast):
             "(%s) tiers=%s class_reduce=%s",
             g, vm.kind, vm.n_sub, self.csr.n_values, self.stream_ids, self.tables.n_ring_rows,
             "classes" if self.class_reduce else "core baselines",
-            [(t.name, len(t.dms), t.D, t.geo.TT, t.geo.W, t.geo.chunk) for t in self.tiers],
+            [(t.name, len(t.dms), t.D, t.geo.TT, t.geo.OPT, t.geo.W, t.geo.chunk) for t in self.tiers],
             self.class_reduce,
         )
 
@@ -326,10 +328,11 @@ class Corr2xPipeline(PipelinedCorrFast):
         dev = self.ctx.device
         nsum = self.vm.nchan_eff
         rows = self.tables.n_ring_rows if self.cuda else int(self.needed_rows.size)
-        self._ring = torch.zeros((rows, nsum, self.T_ring, 2), dtype=torch.float16, device=dev)
+        # k-major, time-minor cfp16 ring [k][row][t mod T_ring]
+        self._ring = torch.zeros((nsum, rows, self.T_ring, 2), dtype=torch.float16, device=dev)
         if self.cuda:
-            if self.tables.n_scratch_rows:
-                self._scratch = torch.empty((self.tables.n_scratch_rows, nsum, self.fv_chunk, 2),
+            if self.tables.n_scratch_rows:                # class members, f-major
+                self._scratch = torch.empty((nsum, self.fv_chunk, self.tables.n_scratch_rows, 2),
                                             dtype=torch.float32, device=dev)
             self._tables_dev = self.tables.to(dev)
             self._csr_dev = {k: torch.from_numpy(np.ascontiguousarray(getattr(self.csr, k))).to(dev)
@@ -374,12 +377,12 @@ class Corr2xPipeline(PipelinedCorrFast):
         csf = self.vm.chan_sum_factor
         if self.cuda:
             for f0 in range(0, self.n_q, self.fv_chunk):
-                gemm2x_into_ring(real_v, imag_v, cr, ci, self._tables_dev, self._ring,
-                                 fv0=f0, n_fv=self.fv_chunk, t_ring0=q_block + f0, csf=csf,
-                                 t_int=8, scratch=self._scratch, time_keep=tk)
+                gemm2x_mma_into_ring(real_v, imag_v, cr, ci, self._tables_dev, self._ring,
+                                     fv0=f0, n_fv=self.fv_chunk, t_ring0=q_block + f0,
+                                     scratch=self._scratch, time_keep=tk)
                 if self.tables.n_scratch_rows:
-                    reduce_classes(self._scratch, self._ring, self._tables_dev,
-                                   t_ring0=q_block + f0, n_fv=self.fv_chunk)
+                    reduce_classes_cuda(self._scratch, self._ring, self._tables_dev,
+                                        t_ring0=q_block + f0, n_fv=self.fv_chunk)
             return
         # CPU twin: complex64 GEMM of every core row (fv chunks bound the
         # (fv, k, A, A) intermediate), then only the rows stage 1 reads.
@@ -393,8 +396,8 @@ class Corr2xPipeline(PipelinedCorrFast):
                 rows = ring_write_reference(rows, self.tables, c.bl_class, c.bl_conj)
             rows = rows[:, :, need]                                        # (8, C, Rn)
             pos = (q_block + f0 + torch.arange(8)) % self.T_ring
-            self._ring[:, :, pos, 0] = rows.real.permute(2, 1, 0).half()
-            self._ring[:, :, pos, 1] = rows.imag.permute(2, 1, 0).half()
+            self._ring[:, :, pos, 0] = rows.real.permute(1, 2, 0).half()
+            self._ring[:, :, pos, 1] = rows.imag.permute(1, 2, 0).half()
 
     def _stage1(self, ts: _TierState, q_emit: int) -> torch.Tensor:
         n_out = self.n_q // ts.D

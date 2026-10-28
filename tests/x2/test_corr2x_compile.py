@@ -1,6 +1,7 @@
 """O4 compile-only checks of every corr kernel, on the CPU (no GPU):
 
-* the CUDA stage-1 kernel through ``nvcc -ptx -arch=sm_75``;
+* the CUDA stage-1 kernel and the tensor-core GEMM (``mma.sync``) through
+  ``nvcc -ptx -arch=sm_75``;
 * every Triton kernel the corr launches (2x GEMM with/without the time
   mask, class reduce, bit packer at 4/5/6 bits, the row-rule row-stats and
   codes kernels, and today's fused GEMM and stage-1 kernels) AOT-compiled to
@@ -52,3 +53,12 @@ def test_bench_compile_check_cli(tmp_path) -> None:
     assert r.returncode == 0, (r.stdout[-2000:], r.stderr[-2000:])
     assert out["passed"] and out["gates"]["cuda_compiles"]
     assert out["gates"].get("triton_compiles", True)
+
+
+@pytest.mark.skipif(not os.path.exists(_NVCC), reason="no nvcc on this host")
+def test_cuda_gemm_compiles_sm75() -> None:
+    from dsart.x2.corr.gemm2x_cuda import CUDA_SOURCE
+    from dsart.x2.corr.stage1_cuda import compile_check_nvcc
+    ptx = compile_check_nvcc(CUDA_SOURCE, nvcc=_NVCC)
+    assert ".entry gemm2x_mma" in ptx and ".entry reduce_fmajor" in ptx
+    assert "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32" in ptx
