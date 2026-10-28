@@ -33,6 +33,12 @@ Source: `docs/x2/downstream_inventory.md` §0 and §5.
 | D-e | Injection health gate | bot refuses when ANY half meters | owner-scoped gate |
 | D-f | MJD of events | wall-clock derived | derived from the capture epoch |
 
+## Pre-existing test failures on main (verified identical with and without x2, n02, 2026-10-28)
+- tests/transport/test_async_tx.py: 4 failures (multi-worker DM split / coarse_dm_mask m72 / full mask).
+- tests/transport/test_recv_ring_assemble_validity.py::TestParity::test_overrun_counter_bumped_on_lapped_slot.
+- tests/transport/test_production_rx_ring_phaseb.py: hangs to the 900 s timeout.
+- tests/test_c2_proactive_claim.py: was stale (old units bug), fixed by WS-D D4.
+
 ## Pre-existing hardware/ops issues (independent of x2, reported)
 - n22 loses 5.7% of SNAP packets to PHY CRC errors (optic/cable/port).
 - n01/n02 corner-turn PHY loss 3-7e-4 (CRC + discard bursts).
