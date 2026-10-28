@@ -20,7 +20,7 @@ checkpoint (CP1 unless marked). Each item: what, evidence needed, who supplies i
 | E5 | NUMA balancing vs the ring v4 consumers. Search nodes run kernel.numa_balancing=1 (~3,100 hint faults/s per node today, 17.5 G over 64 days); an extra mapper of the 16 GB 1x ring saw 2.4 ms minor faults (07:25 incident). Ring v4 (22-33 GB, per-DM, mmap readers) must be measured at CP1 under full load (system time, faults/s, scatter). If it costs real time: pread/pinned-copy readers, or kernel.numa_balancing=0 on search nodes (host change, sign-off) | CP1 search track + fleet load test | WS-T, WS-S | measure only |
 | E6 | Ring v4 size: ~35 GB on a search node for gridded n_sub 2 (WS-T, rows padded to the largest stream), above the plan's 22-33 GB; must fit the node's 93 GiB budget with search_compute's GPU-host buffers and the freed 15.2 GiB v3 ring + ~20 GB pinned cube retention. A per-stream stride saves ~8%. Measure resident memory at CP1 fleet load | CP1 fleet load | WS-T | measure |
 | CP2-K | Injection K with the b3x filter bank: the K bucket key stays (DM, injected width); the detecting filter is recorded in each K entry (WS-D D9/D10). Decide at CP2 from injection data whether a filter mismatch between calibration and probe should invalidate or re-key K | CP2 injection campaign | WS-D | record only |
-| CP1-op | Install /etc/sysctl.d/99-dsart-ipfrag.conf on n01 (missing; n02/n09/n13 have it). **DECIDED by the user 2026-10-22: install at CP1 and keep it permanently** (restore.n01_ipfrag_kept verifies) | diagnostics_20261022.md | runner | install at CP1, keep |
+| CP1-op | Install /etc/sysctl.d/99-dsart-ipfrag.conf on n01 (missing; n02/n09/n13 have it). **DECIDED by the user 2026-10-22: install and keep it permanently.** DONE 2026-10-28 23:29 UTC after n01 came back from the outage (n02's file, md5 a37bfd46..., applied with `sysctl -p` on that file only; previous live values 262144/196608/30); restore.n01_ipfrag_kept verifies | diagnostics_20261022.md | integration | installed, keep |
 
 ## Behaviour changes in 1x found by WS-D (all behind flags defaulting to today's behaviour)
 Source: `docs/x2/downstream_inventory.md` §0 and §5.
@@ -40,7 +40,7 @@ Source: `docs/x2/downstream_inventory.md` §0 and §5.
 - tests/test_c2_proactive_claim.py: was stale (old units bug), fixed by WS-D D4.
 
 ## Pre-existing hardware/ops issues (independent of x2, reported)
-- n22 loses 5.7% of SNAP packets to PHY CRC errors (optic/cable/port).
+- n22 loses 5.7% of SNAP packets to PHY CRC errors (optic/cable/port). **Worse after the outage (10-28):** jumbo (8972 B) pings n01 -> h22 lose 66%, small pings 0% — size-dependent CRC loss on h22's 40G port.
 - n01/n02 corner-turn PHY loss 3-7e-4 (CRC + discard bursts).
 - dsa110-operator injection probe never sends `inj_id` (400 from /control/inject) — WS-D D12 list.
 
