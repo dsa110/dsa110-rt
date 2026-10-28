@@ -306,7 +306,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ring-access", default="pread", choices=("pread", "mmap"),
                    help="ring v4 read path (SPEC §6; pread maps nothing -- the n13 incident)")
     p.add_argument("--ring-attach-timeout-s", type=float, default=60.0)
-    p.add_argument("--k3b", default="v1", choices=("v1", "fused"))      # CP1 picks
+    p.add_argument("--k3b", default="v1", choices=("v1", "fused", "cuda", "reg"))   # CP1 picks
     p.add_argument("--k1", default="triton", choices=("triton", "staged"))
     p.add_argument("--log-level", default="INFO")
     a, _unknown = p.parse_known_args(argv)

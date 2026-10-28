@@ -169,12 +169,10 @@ class GpuBackend:
         k0a = self._ev(self.compute)
         with self._ext(self.compute):
             if x.kind == "frame2":
-                k = mod.get_function("k0_unpack_frame2")
-                k((n, S), (128,), (self._ptr(draw), self._ptr(dval), self._ptr(x.nv),
-                                   self._ptr(x.nh), self._ptr(x.bits), self._ptr(x.codes),
-                                   self._ptr(x.valid), self._ptr(x.nodata), np.int32(S),
-                                   np.int32(n), np.int32(rb), np.int32(x.codes.shape[1]),
-                                   np.int32(st.R_s), np.int64(start)))
+                from .kernels_cuda import launch_k0_tile
+                launch_k0_tile(draw, dval, x.nv, x.nh, x.bits, x.codes, x.valid, x.nodata, S=S,
+                               n=n, row_bytes=rb, V=int(x.codes.shape[1]), R=st.R_s, row0=start,
+                               stream=self.compute)
             else:
                 k = mod.get_function("k0_unpack_cint8")
                 k((n, S), (128,), (self._ptr(draw), self._ptr(dval), self._ptr(x.codes),
@@ -217,6 +215,18 @@ class GpuBackend:
                 img = img.view(F, n, N * N).transpose(0, 1).to(torch.float16)
                 slots = torch.remainder(torch.arange(r0, r0 + n, device=self.dev), ring_rows)
                 ring[slots] = img
+                if timed:
+                    self._mark(st.spec.d, "fft", eb, self._ev(stream))
+                return
+            if cfg.fft_mode == "fused":                    # K2 + K3a in one kernel
+                from .kernels_cuda import k23_tables, launch_k23
+                if getattr(x, "k23", None) is None:
+                    x.k23 = k23_tables(dict(line_ptr=x.line_ptr, line_idx=x.line_idx,
+                                            line_pos=x.line_pos, fl=x.fl, cc_idx=x.cc_idx,
+                                            cc_line=x.cc_line), int(x.fl.numel()), self.dev,
+                                       pix=x.pix)
+                launch_k23(uv, x.k23, self.tw, x.pix, ring, B=B, n_act=A, n_t=n, F=F, t0=r0,
+                           R_img=ring_rows, transpose=x.transpose, stream=stream)
                 if timed:
                     self._mark(st.spec.d, "fft", eb, self._ev(stream))
                 return
@@ -272,9 +282,12 @@ class GpuBackend:
 
         x = self.dm[st.spec.d]
         cfg = self.eng.cfg
-        if cfg.k3b_impl not in ("v1", "fused"):
-            raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused)")
-        detect = k3b_fused if cfg.k3b_impl == "fused" else k3b_detect
+        from .k3b_cuda import k3b_cuda
+        from .k3b_reg import k3b_reg
+        impls = dict(v1=k3b_detect, fused=k3b_fused, cuda=k3b_cuda, reg=k3b_reg)
+        if cfg.k3b_impl not in impls:
+            raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused|cuda|reg)")
+        detect = impls[cfg.k3b_impl]
         with torch.cuda.stream(self.compute):
             ev0 = self._ev(self.compute)
             best, tk, taps = detect(

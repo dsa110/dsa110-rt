@@ -100,7 +100,7 @@ class EngineConfig:
     dm_index_mode: str = "global"
     fft_mode: str = "twin"
     backend: str = "cpu"
-    k3b_impl: str = "v1"                     # GPU K3b: "v1" (per filter) | "fused" (one kernel)
+    k3b_impl: str = "v1"                     # GPU K3b: "v1" | "fused" (Triton) | "cuda" | "reg"
     k1_impl: str = "triton"                  # GPU K1: "triton" | "staged" (CUDA smem windows)
     rows_per_batch: int = 64
     wait_timeout_s: Optional[float] = 0.0

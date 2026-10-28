@@ -45,7 +45,8 @@ def _map(fid="2x-gridded-ns2-cint4"):
 
 
 @_gpu
-def test_gpu_k0_unpack_equals_twin():
+@pytest.mark.parametrize("tiled", [False, True])
+def test_gpu_k0_unpack_equals_twin(tiled):
     from dsart.x2.search.codec import as_stream_formats, pack_frame2_rows
     from dsart.x2.search.combine import StreamRing, k0_rows_to_ring
     from dsart.x2.search.kernels_cuda import get_module
@@ -76,10 +77,16 @@ def test_gpu_k0_unpack_equals_twin():
     nv = t([f.n_values for f in fm.per_stream], torch.int32)
     nh = t([f.n_heavy for f in fm.per_stream], torch.int32)
     bits = t([f.bits for f in fm.per_stream], torch.int32)
-    get_module().get_function("k0_unpack_frame2")(
-        (n, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes),
-                         _ptr(vout), _ptr(nod), np.int32(S), np.int32(n),
-                         np.int32(fm.row_bytes), np.int32(V), np.int32(64), np.int64(100)))
+    if tiled:                                         # rows 100..139 wrap the 64-slot ring
+        from dsart.x2.search.kernels_cuda import launch_k0_tile
+        launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nod, S=S, n=n,
+                       row_bytes=fm.row_bytes, V=V, R=64, row0=100,
+                       stream=torch.cuda.current_stream())
+    else:
+        get_module().get_function("k0_unpack_frame2")(
+            (n, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes),
+                             _ptr(vout), _ptr(nod), np.int32(S), np.int32(n),
+                             np.int32(fm.row_bytes), np.int32(V), np.int32(64), np.int64(100)))
     torch.cuda.synchronize()
     assert np.array_equal(codes.cpu().numpy(), ring.codes)
     assert np.array_equal(vout.cpu().numpy().astype(bool), ring.valid)
@@ -152,8 +159,9 @@ def test_gpu_k1_1x_bit_exact_vs_combine_sparse_v4(tmp_path):
 
 
 @_gpu
+@pytest.mark.parametrize("mode", ["warp", "fused"])
 @pytest.mark.parametrize("fold", ["col", "row"])
-def test_gpu_fft_pair_matches_twin_and_float64(fold):
+def test_gpu_fft_pair_matches_twin_and_float64(fold, mode):
     from dsart.x2.search.csr import csr_from_value_cells
     from dsart.x2.search.fft import FftPlan, image_from_uv_twin
 
@@ -171,7 +179,7 @@ def test_gpu_fft_pair_matches_twin_and_float64(fold):
 
     class _Inp:
         pass
-    run = _warp_runner(torch.from_numpy(uv).cuda(), plan, _Inp(), torch.device("cuda"))
+    run = _warp_runner(torch.from_numpy(uv).cuda(), plan, _Inp(), torch.device("cuda"), mode=mode)
     got = run().float().cpu().numpy()                         # fp16 ring, 1/N^2 pixel scale
     twin = image_from_uv_twin(uv, plan, np.ones((256, 256)), out_dtype=None)
     sig = float(np.std(twin))
@@ -232,8 +240,9 @@ def test_gpu_k3b_fused_equals_twin_and_v1(bank):
 
 
 @_gpu
-@pytest.mark.parametrize("k1,k3b", [("triton", "v1"), ("staged", "fused")])
-def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b):
+@pytest.mark.parametrize("k1,k3b,fft", [("triton", "v1", "warp"), ("staged", "fused", "warp"),
+                                        ("staged", "reg", "fused")])
+def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b, fft):
     """Same synthetic 2x ring through backend='cpu' and backend='gpu'."""
     from dsart.x2.search.codec import RowFormat
     from dsart.x2.search.engine import EngineConfig, OwnerEngine
@@ -255,9 +264,9 @@ def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b):
         ring, spec, 0, 3 * 384)
     inp = make_dm_inputs(cells, n_grid=N, fmt=fmt, step_main=0.3534, step_heavy=0.1)
     out = {}
-    for backend, fft in (("cpu", "pruned"), ("gpu", "warp")):
+    for backend, fmode in (("cpu", "pruned"), ("gpu", fft)):
         eng = OwnerEngine(plan, {0: inp}, ring, EngineConfig(n_grid=N, backend=backend,
-                                                             fft_mode=fft, layer2_n_burnin=0,
+                                                             fft_mode=fmode, layer2_n_burnin=0,
                                                              k1_impl=k1, k3b_impl=k3b))
         out[backend] = eng.process_cycle(1, keep_maps=True).per_dm[0]
     a, b = out["cpu"], out["gpu"]
@@ -273,7 +282,7 @@ def test_cp1_gpu_list_is_marked():
     import sys
     mod = sys.modules[__name__]
     names = [n for n in dir(mod) if n.startswith("test_gpu_")]
-    assert len(names) == 8                                   # 13 cases with parametrize
+    assert len(names) == 8                                   # 17 cases with parametrize
     for n in names:
         marks = {m.name for m in getattr(getattr(mod, n), "pytestmark", [])}
         assert "x2_gpu" in marks, n
