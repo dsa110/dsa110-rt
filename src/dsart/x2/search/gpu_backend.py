@@ -259,7 +259,10 @@ class GpuBackend:
             smp = x.image[slots, f_idx, p].float()
             sig = sigma_clipped_std_batched(smp)
             self._mark(st.spec.d, "l1", a, self._ev(self.compute))
-        return sig.cpu().numpy()
+            # D2H ON the compute stream: ordered after the work that produced it
+            # (a .cpu() outside this block runs on the default stream and can
+            # read the buffers before the compute stream has written them)
+            return sig.cpu().numpy()
 
     def k3b_topk(self, st, c_first: int, sigma_inv: np.ndarray, s_inv: np.ndarray,
                  n_top: int) -> tuple:
@@ -285,10 +288,11 @@ class GpuBackend:
             vals, idx = torch.topk(flat, k)
             tkv = tk.view(-1)[idx]
             ev1 = self._ev(self.compute)
+            # D2H on the compute stream (see layer1_sigma)
+            out = (vals.cpu().numpy(), idx.cpu().numpy(), tkv.cpu().numpy(), tuple(best.shape),
+                   None if taps is None else taps.cpu().numpy())
         self._mark(st.spec.d, "k3b", ev0, evm)
         self._mark(st.spec.d, "topk", evm, ev1)
-        out = (vals.cpu().numpy(), idx.cpu().numpy(), tkv.cpu().numpy(), tuple(best.shape),
-               None if taps is None else taps.cpu().numpy())
         return out
 
     def pop_gpu_ms(self, by_stage: bool = False) -> dict:
