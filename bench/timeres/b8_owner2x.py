@@ -407,7 +407,6 @@ def cmd_kernels(a) -> int:
     from dsart.x2.search.k3b_cuda import k3b_cuda
     from dsart.x2.search.k3b_fused import k3b_fused
     from dsart.x2.search.k3b_reg import k3b_reg
-    from dsart.x2.search.kernels_cuda import get_module
     from dsart.x2.search.kernels_triton import csr_tensors, k1_combine, k3b_detect
     from dsart.x2.search.valuemap import dm_inputs_from_value_map
 
@@ -509,16 +508,12 @@ def cmd_kernels(a) -> int:
                                  device=dev)
             bits = torch.as_tensor([f_.bits for f_ in fms.per_stream], dtype=torch.int32,
                                    device=dev)
-            from dsart.image.tiled_combine_cuda import _ptr
-            import cupy as cp
-            k0k = get_module().get_function("k0_unpack_frame2")
+            from dsart.x2.search.kernels_cuda import launch_k0_tile
 
             def run_k0():
-                with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
-                    k0k((spec.hop, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh),
-                                                _ptr(bits), _ptr(codes0), _ptr(vout), _ptr(nod),
-                                                np.int32(S), np.int32(spec.hop), np.int32(rb),
-                                                np.int32(V), np.int32(R_s), np.int64(0)))
+                launch_k0_tile(draw, dval, nv, nh, bits, codes0, vout, nod, S=S, n=spec.hop,
+                               row_bytes=rb, V=V, R=R_s, row0=0,
+                               stream=torch.cuda.current_stream())
             us["k0"] = 1e3 * _cuda_ms(run_k0) / (F * spec.hop)
             us["h2d"] = 1e3 * _cuda_ms(lambda: hraw.to(dev, non_blocking=True)) / (F * spec.hop)
             codes0 = None
@@ -552,7 +547,7 @@ def cmd_kernels(a) -> int:
             codes = None
             # FFT variants on this format's map
             plan = FftPlan.build(inp.csr)
-            B = 64
+            B = F * 64                                 # the engine's batch: F x rows_per_batch
             uvn = (rng.standard_normal((B, inp.csr.n_active))
                    + 1j * rng.standard_normal((B, inp.csr.n_active))).astype(np.complex64)
             G = np.zeros((2, 256, 129), complex)

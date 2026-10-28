@@ -20,8 +20,10 @@ the block reads it from shared memory at ``j = tl + smax[s] - shifts[f,
 s]``. Entries are staged in chunks of ``ec`` (shared-memory bound), so
 there is no cap on entries per cell; each thread keeps its ``OPT``
 outputs' accumulators in registers across chunks, so the summation order
-is the CSR order exactly. Threads map to outputs cell-fastest, so the
-``CPB`` cells of a block write one 32-byte sector per (f, t).
+is the CSR order exactly. Threads map to outputs cell-major, so a warp's
+lanes share one cell (uniform entry loop, broadcast metadata) and the
+``CPB`` cells' warps fill each 32-byte output sector together; tiles divide
+the row batch evenly.
 
 FMA contraction cannot change the result: decode and accumulation use
 ``__fmul_rn`` / ``__fadd_rn``. :func:`k1_staged_twin` replays the exact
@@ -41,32 +43,26 @@ __all__ = ["CUDA_SOURCE_K1S", "StagedGeometry", "staged_geometry", "k1_staged_tw
 
 OPT = 8                       # outputs per thread (compile-time; registers)
 SMEM_CAP = 48 * 1024          # default dynamic shared memory without opt-in
-_META_B = 20                  # per staged entry: stream, smax, conj, c_v, w_v
+_META_B = 16                  # per staged entry: stream, conj, c_v, w_v
 
 CUDA_SOURCE_K1S = r"""
 #define OPT 8
-extern "C" __global__ void k1_staged(
-    const short* __restrict__ codes,      /* [S, V, R] packed (re, im) int8 pairs */
-    const float* __restrict__ c_v,        /* [S, V] decode step */
-    const float* __restrict__ w_v,        /* [S, V] natural weight */
-    const int* __restrict__ cell_ptr,     /* [n_act + 1] */
-    const int* __restrict__ ent_s,
-    const int* __restrict__ ent_v,
-    const int* __restrict__ ent_c,
-    const float* __restrict__ half_sign,  /* [n_act] 0.5 * (-1)^(u+w) */
-    const int* __restrict__ shifts,       /* [F, S] */
-    const int* __restrict__ smax,         /* [S] max_f shifts[f, s] */
-    float2* __restrict__ out,             /* [F, n_t, n_act] */
+template <bool HAS_OFF>
+__device__ __forceinline__ void k1s_body(
+    const short* __restrict__ codes, const float* __restrict__ c_v, const float* __restrict__ w_v,
+    const int* __restrict__ cell_ptr, const int* __restrict__ ent_s, const int* __restrict__ ent_v,
+    const int* __restrict__ ent_c, const float* __restrict__ half_sign,
+    const int* __restrict__ shifts, const int* __restrict__ smax, float2* __restrict__ out,
     int n_act, int F, int S, int V, int R, int n_t, long long t_lo, float off,
     int cpb, int tile, int win_w, int ec, int meta_off)
 {
     extern __shared__ unsigned char smem[];
     short* win = (short*)smem;                         /* [ec][win_w] */
     int* m_s = (int*)(smem + meta_off);                /* [ec] stream */
-    int* m_off = m_s + ec;                             /* [ec] smax[s] */
-    int* m_cj = m_off + ec;                            /* [ec] conj */
+    int* m_cj = m_s + ec;                              /* [ec] conj */
     float* m_c = (float*)(m_cj + ec);                  /* [ec] */
     float* m_w = m_c + ec;                             /* [ec] */
+    int* offS = (int*)(m_w + ec);                      /* [F][S] smax[s] - shifts[f, s] */
 
     const int a0 = blockIdx.x * cpb;
     const int ncell = min(cpb, n_act - a0);
@@ -77,44 +73,52 @@ extern "C" __global__ void k1_staged(
     const int n_out = ncell * F * nt;
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, nw = nth >> 5;
 
+    for (int i = tid; i < F * S; i += nth) {
+        const int sidx = i % S;
+        offS[i] = smax[sidx] - shifts[i];
+    }
     float acc_re[OPT], acc_im[OPT];
-    int my_e0[OPT], my_e1[OPT], my_f[OPT], my_tl[OPT];
+    int my_e0[OPT], my_e1[OPT], my_fs[OPT], my_tl[OPT];
 #pragma unroll
     for (int k = 0; k < OPT; ++k) {
         acc_re[k] = 0.0f; acc_im[k] = 0.0f;
         const int idx = tid + k * nth;
-        my_e0[k] = 0; my_e1[k] = 0; my_f[k] = 0; my_tl[k] = 0;
+        my_e0[k] = 0; my_e1[k] = 0; my_fs[k] = 0; my_tl[k] = 0;
         if (idx < n_out) {
-            const int c = idx % ncell;                 /* cell fastest: coalesced writes */
-            const int ft = idx / ncell;
-            my_f[k] = ft / nt;
-            my_tl[k] = ft - my_f[k] * nt;
+            /* cell-major: a warp's lanes share one cell (uniform loop count and
+               metadata broadcasts); the 4 cells' warps fill each output sector */
+            const int c = idx / (F * nt);
+            const int ft = idx - c * (F * nt);
+            const int f = ft / nt;
+            my_fs[k] = f * S;
+            my_tl[k] = ft - f * nt;
             my_e0[k] = cell_ptr[a0 + c];
             my_e1[k] = cell_ptr[a0 + c + 1];
         }
     }
     for (int c0 = e_lo; c0 < e_hi; c0 += ec) {
         const int nc = min(ec, e_hi - c0);
-        __syncthreads();                               /* previous chunk consumed */
-        for (int e = tid; e < nc; e += nth) {
+        __syncthreads();                               /* previous chunk consumed (and offS) */
+        /* one warp per entry: its window slot once, lanes over the window */
+        for (int e = warp; e < nc; e += nw) {
             const int ent = c0 + e;
             const int s = ent_s[ent], v = ent_v[ent];
-            m_s[e] = s;
-            m_off[e] = smax[s];
-            m_cj[e] = ent_c[ent];
-            m_c[e] = c_v[(long long)s * V + v];
-            m_w[e] = w_v[(long long)s * V + v];
-        }
-        for (int idx = tid; idx < nc * win_w; idx += nth) {
-            const int e = idx / win_w;
-            const int j = idx - e * win_w;
-            const int ent = c0 + e;
-            const int s = ent_s[ent], v = ent_v[ent];
-            const long long row = t_lo + (long long)t0 - (long long)smax[s] + j;
-            long long slot = row % R;
-            if (slot < 0) slot += R;
-            win[idx] = codes[((long long)s * V + v) * R + slot];
+            long long r0 = (t_lo + (long long)t0 - (long long)smax[s]) % R;
+            int sl = (int)(r0 < 0 ? r0 + R : r0);
+            const short* src = codes + ((long long)s * V + v) * R;
+            short* dst = win + e * win_w;
+            for (int j = lane; j < win_w; j += 32) {
+                int q = sl + j; if (q >= R) q -= R;
+                dst[j] = src[q];
+            }
+            if (lane == 0) {
+                m_s[e] = s;
+                m_cj[e] = ent_c[ent];
+                m_c[e] = c_v[(long long)s * V + v];
+                m_w[e] = w_v[(long long)s * V + v];
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -123,15 +127,17 @@ extern "C" __global__ void k1_staged(
             if (idx < n_out) {
                 const int lo = max(my_e0[k], c0), hi = min(my_e1[k], c0 + nc);
                 float ar = acc_re[k], ai = acc_im[k];
-                const int frow = my_f[k] * S;
+                const int* offf = offS + my_fs[k];
+                const int tl = my_tl[k];
                 for (int ent = lo; ent < hi; ++ent) {
                     const int e = ent - c0;
-                    const int j = my_tl[k] + m_off[e] - __ldg(&shifts[frow + m_s[e]]);
+                    const int j = tl + offf[m_s[e]];
                     const short pv = win[e * win_w + j];
-                    const float cre = (float)(signed char)(pv & 0xFF);
-                    const float cim = (float)(signed char)((pv >> 8) & 0xFF);
-                    const float vre = __fmul_rn(__fmul_rn(__fadd_rn(cre, off), m_c[e]), m_w[e]);
-                    float vim = __fmul_rn(__fmul_rn(__fadd_rn(cim, off), m_c[e]), m_w[e]);
+                    float cre = (float)(signed char)(pv & 0xFF);
+                    float cim = (float)(signed char)((pv >> 8) & 0xFF);
+                    if (HAS_OFF) { cre = __fadd_rn(cre, off); cim = __fadd_rn(cim, off); }
+                    const float vre = __fmul_rn(__fmul_rn(cre, m_c[e]), m_w[e]);
+                    float vim = __fmul_rn(__fmul_rn(cim, m_c[e]), m_w[e]);
                     if (m_cj[e]) vim = -vim;
                     ar = __fadd_rn(ar, vre);
                     ai = __fadd_rn(ai, vim);
@@ -144,12 +150,29 @@ extern "C" __global__ void k1_staged(
     for (int k = 0; k < OPT; ++k) {
         const int idx = tid + k * nth;
         if (idx < n_out) {
-            const int c = idx % ncell;
+            const int c = idx / (F * nt);
             const float hs = half_sign[a0 + c];
-            out[((long long)my_f[k] * n_t + t0 + my_tl[k]) * n_act + a0 + c] =
+            out[((long long)(my_fs[k] / S) * n_t + t0 + my_tl[k]) * n_act + a0 + c] =
                 make_float2(__fmul_rn(acc_re[k], hs), __fmul_rn(acc_im[k], hs));
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(512) k1_staged(
+    const short* __restrict__ codes, const float* __restrict__ c_v, const float* __restrict__ w_v,
+    const int* __restrict__ cell_ptr, const int* __restrict__ ent_s, const int* __restrict__ ent_v,
+    const int* __restrict__ ent_c, const float* __restrict__ half_sign,
+    const int* __restrict__ shifts, const int* __restrict__ smax, float2* __restrict__ out,
+    int n_act, int F, int S, int V, int R, int n_t, long long t_lo, float off,
+    int cpb, int tile, int win_w, int ec, int meta_off)
+{
+    /* off == +0.0 (mid-tread): code + 0.0 is the code itself, exactly */
+    if (off != 0.0f)
+        k1s_body<true>(codes, c_v, w_v, cell_ptr, ent_s, ent_v, ent_c, half_sign, shifts, smax,
+                       out, n_act, F, S, V, R, n_t, t_lo, off, cpb, tile, win_w, ec, meta_off);
+    else
+        k1s_body<false>(codes, c_v, w_v, cell_ptr, ent_s, ent_v, ent_c, half_sign, shifts, smax,
+                        out, n_act, F, S, V, R, n_t, t_lo, off, cpb, tile, win_w, ec, meta_off);
 }
 """
 
@@ -189,14 +212,18 @@ def staged_geometry(shifts: np.ndarray, *, n_t: int, cpb: int = 4, threads: int 
     smax = sh.max(axis=0)
     spread = int((smax - sh.min(axis=0)).max(initial=0))
     tile = int(max(1, min(int(n_t), (OPT * threads) // (cpb * F))))
+    while n_t % tile:                       # equal tiles (no near-empty last tile)
+        tile -= 1
     if cpb * F * tile > OPT * threads:
         raise ValueError(f"cpb={cpb} x F={F} > {OPT} x {threads} outputs per block")
     win_w = tile + spread
-    ec = int(min(max_ec, (smem_cap - 16) // (2 * win_w + _META_B)))
+    S = int(sh.shape[1])
+    offs_b = 4 * F * S                                    # [F][S] window offsets
+    ec = int(min(max_ec, (smem_cap - 16 - offs_b) // (2 * win_w + _META_B)))
     if ec < 1:
         raise ValueError(f"window of {win_w} rows does not fit {smem_cap} B of shared memory")
     meta_off = (2 * ec * win_w + 15) // 16 * 16
-    smem = meta_off + _META_B * ec
+    smem = meta_off + _META_B * ec + offs_b
     return StagedGeometry(cpb=cpb, threads=threads, tile=tile, win_w=win_w, ec=ec,
                           meta_off=meta_off, smem=smem, smax=smax.astype(np.int32), spread=spread)
 

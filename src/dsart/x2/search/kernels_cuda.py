@@ -93,6 +93,98 @@ extern "C" __global__ void k0_unpack_frame2(
     }
 }
 
+/* K0 2-D tiles: one block per (TR rows, VB values, stream). Only the byte range
+   of the block's values is loaded (coalesced) per row; values are unpacked with
+   k0_unpack_frame2's exact bit gather / NO_DATA rule into a [VB][TR] shared tile
+   written as runs of TR consecutive ring slots per value. Per-row NO_DATA counts
+   are summed across value tiles in ndc[s * n + r] (zeroed by the caller);
+   k0_f2_valid then sets valid_out and nodata exactly as the per-row kernel. */
+#define K0_TR 32
+#define K0_VB 128
+extern "C" __global__ void k0_f2_tile2(
+    const unsigned char* __restrict__ raw, const unsigned char* __restrict__ valid,
+    const int* __restrict__ nv_s, const int* __restrict__ nh_s, const int* __restrict__ bits_s,
+    signed char* __restrict__ codes, int* __restrict__ ndc, int S, int n, int row_bytes, int V,
+    int R, long long row0)
+{
+    __shared__ unsigned char rt[K0_TR * (2 * K0_VB + 8)];
+    __shared__ unsigned short ot[K0_VB * K0_TR];
+    __shared__ int nd_row[K0_TR];
+    __shared__ int okr[K0_TR];
+    const int r0 = blockIdx.x * K0_TR, v0 = blockIdx.y * K0_VB, s = blockIdx.z;
+    const int nr = min(K0_TR, n - r0), nvb = min(K0_VB, V - v0);
+    const int tid = threadIdx.x, nth = blockDim.x;
+    const int nv = nv_s[s], nh = nh_s[s], b = bits_s[s];
+    const int v1 = min(v0 + nvb, nv);                 /* values carrying data in this tile */
+    int blo = 0, bhi = 0;
+    if (v1 > v0) {
+        blo = v0 < nh ? 2 * v0 : 2 * nh + (int)(((long long)(v0 - nh) * 2 * b) >> 3);
+        bhi = v1 <= nh ? 2 * v1 : 2 * nh + (int)((((long long)(v1 - nh) * 2 * b) + 7) >> 3) + 2;
+        bhi = min(bhi, row_bytes);
+    }
+    const int bw = bhi - blo;
+    if (tid < K0_TR) { nd_row[tid] = 0; okr[tid] = tid < nr ? valid[(long long)s * n + r0 + tid] : 0; }
+    for (int i = tid; i < nr * bw; i += nth) {
+        const int r = i / bw, c = i - r * bw;
+        rt[r * (2 * K0_VB + 8) + c] = raw[((long long)s * n + r0 + r) * row_bytes + blo + c];
+    }
+    __syncthreads();
+    const unsigned int m = (1u << b) - 1u;
+    const int half = 1 << (b - 1), sent = -(1 << (b - 1));
+    for (int i = tid; i < nvb * K0_TR; i += nth) {
+        const int vl = i / K0_TR, r = i - vl * K0_TR, v = v0 + vl;
+        int re = 0, im = 0;
+        if (r < nr && okr[r] && v < nv) {
+            const unsigned char* row = rt + r * (2 * K0_VB + 8) - blo;   /* global byte index */
+            int nd;
+            if (v < nh) {
+                re = (signed char)row[2 * v];
+                im = (signed char)row[2 * v + 1];
+                nd = (re == -128) || (im == -128);
+            } else {
+                const long long bit = (long long)(v - nh) * 2 * b;
+                const long long byte = 2LL * nh + (bit >> 3);
+                unsigned int w = row[byte];
+                if (byte + 1 < row_bytes) w |= ((unsigned int)row[byte + 1]) << 8;
+                if (byte + 2 < row_bytes) w |= ((unsigned int)row[byte + 2]) << 16;
+                w >>= (unsigned int)(bit & 7);
+                const int ur = (int)(w & m), ui = (int)((w >> b) & m);
+                re = ur >= half ? ur - (1 << b) : ur;
+                im = ui >= half ? ui - (1 << b) : ui;
+                nd = (re == sent) || (im == sent);
+            }
+            if (nd) { re = 0; im = 0; atomicAdd(&nd_row[r], 1); }
+        }
+        ot[i] = (unsigned short)((unsigned int)(unsigned char)re
+                                 | ((unsigned int)(unsigned char)im << 8));
+    }
+    __syncthreads();
+    const long long sl0 = ((row0 + r0) % R + R) % R;
+    unsigned short* cs = (unsigned short*)codes;
+    for (int i = tid; i < nvb * K0_TR; i += nth) {
+        const int vl = i / K0_TR, r = i - vl * K0_TR;
+        if (r < nr) {
+            long long sl = sl0 + r; if (sl >= R) sl -= R;
+            cs[((long long)s * V + v0 + vl) * R + sl] = ot[i];
+        }
+    }
+    if (tid < nr && nd_row[tid]) atomicAdd(&ndc[(long long)s * n + r0 + tid], nd_row[tid]);
+}
+
+extern "C" __global__ void k0_f2_valid(const unsigned char* __restrict__ valid,
+    const int* __restrict__ nv_s, const int* __restrict__ ndc,
+    unsigned char* __restrict__ valid_out, unsigned long long* __restrict__ nodata,
+    int S, int n, int R, long long row0)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= S * n) return;
+    const int s = i / n, r = i - s * n;
+    long long sl = ((row0 + r) % R + R) % R;
+    const int nd = ndc[i];
+    valid_out[(long long)s * R + sl] = (unsigned char)(valid[i] && nd < nv_s[s]);
+    if (nd) atomicAdd(&nodata[s], (unsigned long long)nd);
+}
+
 extern "C" __global__ void k0_unpack_cint8(
     const signed char* __restrict__ raw,      /* [S, n, 2 * V_row] */
     const unsigned char* __restrict__ valid,  /* [S, n] */
@@ -512,6 +604,34 @@ def k23_tables(lines: dict, n_fl: int, device, pix=None) -> dict:
             out["pcode"] = torch.as_tensor(code, device=device)
             out["pc"] = c
     return out
+
+
+def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: int,
+                   row_bytes: int, V: int, R: int, row0: int, stream, ndc=None) -> None:
+    """Frame-v2 K0 in 2-D tiles (``k0_f2_tile2``: 32 rows x 128 values x stream)
+    + the per-row validity pass (``k0_f2_valid``). Same outputs as
+    ``k0_unpack_frame2``. ``ndc``: optional int32 scratch ``[S * n]``."""
+    import cupy as cp
+    import torch
+
+    from ...image.tiled_combine_cuda import _ptr
+
+    mod = get_module()
+    if ndc is None or ndc.numel() < S * n:
+        ndc = torch.zeros(S * n, dtype=torch.int32, device=draw.device)
+    else:
+        ndc = ndc[:S * n]
+        ndc.zero_()
+    with cp.cuda.ExternalStream(stream.cuda_stream):
+        mod.get_function("k0_f2_tile2")(
+            ((n + 31) // 32, (V + 127) // 128, S), (256,),
+            (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes), _ptr(ndc),
+             np.int32(S), np.int32(n), np.int32(row_bytes), np.int32(V), np.int32(R),
+             np.int64(row0)))
+        mod.get_function("k0_f2_valid")(
+            ((S * n + 255) // 256,), (256,),
+            (_ptr(dval), _ptr(nv), _ptr(ndc), _ptr(vout), _ptr(nodata), np.int32(S),
+             np.int32(n), np.int32(R), np.int64(row0)))
 
 
 def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int, F: int,

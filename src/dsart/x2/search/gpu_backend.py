@@ -169,12 +169,10 @@ class GpuBackend:
         k0a = self._ev(self.compute)
         with self._ext(self.compute):
             if x.kind == "frame2":
-                k = mod.get_function("k0_unpack_frame2")
-                k((n, S), (128,), (self._ptr(draw), self._ptr(dval), self._ptr(x.nv),
-                                   self._ptr(x.nh), self._ptr(x.bits), self._ptr(x.codes),
-                                   self._ptr(x.valid), self._ptr(x.nodata), np.int32(S),
-                                   np.int32(n), np.int32(rb), np.int32(x.codes.shape[1]),
-                                   np.int32(st.R_s), np.int64(start)))
+                from .kernels_cuda import launch_k0_tile
+                launch_k0_tile(draw, dval, x.nv, x.nh, x.bits, x.codes, x.valid, x.nodata, S=S,
+                               n=n, row_bytes=rb, V=int(x.codes.shape[1]), R=st.R_s, row0=start,
+                               stream=self.compute)
             else:
                 k = mod.get_function("k0_unpack_cint8")
                 k((n, S), (128,), (self._ptr(draw), self._ptr(dval), self._ptr(x.codes),

@@ -45,7 +45,8 @@ def _map(fid="2x-gridded-ns2-cint4"):
 
 
 @_gpu
-def test_gpu_k0_unpack_equals_twin():
+@pytest.mark.parametrize("tiled", [False, True])
+def test_gpu_k0_unpack_equals_twin(tiled):
     from dsart.x2.search.codec import as_stream_formats, pack_frame2_rows
     from dsart.x2.search.combine import StreamRing, k0_rows_to_ring
     from dsart.x2.search.kernels_cuda import get_module
@@ -76,10 +77,16 @@ def test_gpu_k0_unpack_equals_twin():
     nv = t([f.n_values for f in fm.per_stream], torch.int32)
     nh = t([f.n_heavy for f in fm.per_stream], torch.int32)
     bits = t([f.bits for f in fm.per_stream], torch.int32)
-    get_module().get_function("k0_unpack_frame2")(
-        (n, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes),
-                         _ptr(vout), _ptr(nod), np.int32(S), np.int32(n),
-                         np.int32(fm.row_bytes), np.int32(V), np.int32(64), np.int64(100)))
+    if tiled:                                         # rows 100..139 wrap the 64-slot ring
+        from dsart.x2.search.kernels_cuda import launch_k0_tile
+        launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nod, S=S, n=n,
+                       row_bytes=fm.row_bytes, V=V, R=64, row0=100,
+                       stream=torch.cuda.current_stream())
+    else:
+        get_module().get_function("k0_unpack_frame2")(
+            (n, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes),
+                             _ptr(vout), _ptr(nod), np.int32(S), np.int32(n),
+                             np.int32(fm.row_bytes), np.int32(V), np.int32(64), np.int64(100)))
     torch.cuda.synchronize()
     assert np.array_equal(codes.cpu().numpy(), ring.codes)
     assert np.array_equal(vout.cpu().numpy().astype(bool), ring.valid)
@@ -275,7 +282,7 @@ def test_cp1_gpu_list_is_marked():
     import sys
     mod = sys.modules[__name__]
     names = [n for n in dir(mod) if n.startswith("test_gpu_")]
-    assert len(names) == 8                                   # 16 cases with parametrize
+    assert len(names) == 8                                   # 17 cases with parametrize
     for n in names:
         marks = {m.name for m in getattr(getattr(mod, n), "pytestmark", [])}
         assert "x2_gpu" in marks, n
