@@ -13,8 +13,11 @@ body is the 2x chain:
          array-burst time mask on load, cfp16 time-minor ring
          (+ fixed-order class reduce for per-baseline formats)
       -> per tier: CSR stage 1 (all coarse DMs, x2 / x4 decimation),
-         batched static sky, row-rule packer
-      -> TX hand-off (WS-T's sender; :class:`Tx2xStage`)
+         batched static sky, row-rule packer (SPEC §4, bit-equal to
+         ``dsart.x2.quant``)
+      -> TX hand-off one block later on the D2H stream (:class:`Tx2xStage`;
+         production: :class:`dsart.x2.corr.tx2x.FramedTx2x` = frame v2 +
+         WS-T's C sendmmsg sender, or its drain)
 
 **Stage-2 FIFO is off in 2x** -- the search applies the single stage-2
 rounding (SPEC §1/§2); nothing here touches ``ctx.stage2_fifo``.
@@ -58,7 +61,9 @@ from dsart.x2.corr.gemm2x import (
     reduce_classes,
     ring_write_reference,
 )
-from dsart.x2.corr.packer2x import PackerRule, RowRulePacker, heavy_step_phase0
+from dsart.x2 import quant
+from dsart.x2.corr.framer2x import StreamFormat
+from dsart.x2.corr.packer2x import RowRulePacker
 from dsart.x2.corr.pipeline1x import PipelinedCorrFast, _Done
 from dsart.x2.corr.plan2x import CorrPlan2x
 from dsart.x2.corr.stage1_cuda import Stage1Csr, geometry_for, stage1_csr, stage1_twin
@@ -66,7 +71,8 @@ from dsart.x2.corr.static_sky2x import BatchedStaticSky
 
 LOG = logging.getLogger("dsart.x2.corr.pipeline2x")
 
-__all__ = ["Corr2xPipeline", "NoOpTx2x", "RecordingTx2x", "Tx2xStage", "injection_active"]
+__all__ = ["Corr2xPipeline", "NoOpTx2x", "RecordingTx2x", "Tx2xStage", "default_rule_2x",
+           "injection_active"]
 
 BLOCK_NATIVE = NPACKETS_PER_BLOCK * NTIMES_PER_PACKET          # 4096
 
@@ -78,9 +84,11 @@ class Tx2xStage(Protocol):
         self, *, block_n: int, tier: str, dms: np.ndarray, t0_native: int, T_native: int,
         stream_ids: list[int], packets: list[dict], rfi_warming_up: bool,
     ) -> int:
-        """``packets[s]``: ``payload`` uint8 ``(n_d, n_t, bytes_per_sample)``,
-        ``step_main`` / ``step_heavy`` ``(n_d,)``. ``dms`` the global coarse
-        indices of axis 0. Returns datagrams queued."""
+        """``packets[s]`` (the packer's per-stream result): ``payload`` uint8
+        ``(n_d, n_t, bytes_per_sample)``, per-row ``step_main`` /
+        ``step_heavy`` float32 and ``guarded`` bool ``(n_d, n_t)``. ``dms``
+        the global coarse indices of axis 0; row 0 is native sample
+        ``t0_native``, ``T_native`` natives per row. Returns datagrams queued."""
         ...
 
 
@@ -106,21 +114,12 @@ class RecordingTx2x:
         return sum(int(p["payload"].shape[0] * p["payload"].shape[1]) for p in packets)
 
 
-def default_rule_2x(vm, *, bits_main: int, hold_blocks: int) -> PackerRule:
-    """The row rule the 2x corr runs: WS-T's ``quant.RowRule`` defaults when
-    that module is present (the packer is bit-equal to it), else the Phase-0
-    recommendation (tau 3 s, no |y| exclusion, skip blocks < 50% non-zero);
-    the heavy step from Phase 0 §2 for this map; sigma held until the
-    static-sky warm-up is over."""
-    n_max = max(int(st.n_contrib.max()) for st in vm.streams)
-    s_h = heavy_step_phase0(n_max, int(vm.n_image))
-    try:
-        from dsart.x2.quant import RowRule  # noqa: PLC0415
-    except ImportError:
-        return PackerRule(comp_bits=bits_main // 2, s_heavy=s_h, tau_s=3.0,
-                          excl_sigma=float("inf"), min_frac=0.5, hold_blocks=hold_blocks)
-    return PackerRule.from_quant(RowRule(comp_bits=bits_main // 2), s_heavy=s_h,
-                                 hold_blocks=hold_blocks)
+def default_rule_2x(vm, *, bits_main: int, warmup_blocks: int = 8) -> "quant.RowRule":
+    """The frozen row rule (SPEC §4) for this format: ``quant.RowRule.
+    for_format(bits_main, n_sub)`` (s_main by bits, s_heavy 0.0773 / 0.0547
+    by n_sub, tau 3 s, skip < 50% non-zero, guard 1.5), with sigma_hat
+    initialised only after the static-sky warm-up (``warmup_blocks``, 8)."""
+    return quant.RowRule.for_format(int(bits_main), int(vm.n_sub), warmup_blocks=int(warmup_blocks))
 
 
 def injection_active(injector, block_n: int) -> bool:
@@ -162,7 +161,7 @@ class Corr2xPipeline(PipelinedCorrFast):
         vm,
         is_core_baseline_mask: np.ndarray,
         bits_main: int = 8,
-        rule: PackerRule | None = None,
+        rule: "quant.RowRule | None" = None,
         class_reduce: bool | None = None,
         tx2x: Tx2xStage | None = None,
         static_sky_window_blocks: int = 8,
@@ -198,7 +197,7 @@ class Corr2xPipeline(PipelinedCorrFast):
         # ring rows actually read by stage 1 (the CPU path only builds these)
         self.needed_rows = np.unique(self.csr.row)
         self.rule = rule if rule is not None else default_rule_2x(
-            vm, bits_main=bits_main, hold_blocks=static_sky_warmup)
+            vm, bits_main=bits_main, warmup_blocks=static_sky_warmup)
         dms_keep = None if dm_subset is None else set(int(d) for d in dm_subset)
         self.tiers: list[_TierState] = []
         for ti, t in enumerate(plan.tiers):
@@ -269,6 +268,17 @@ class Corr2xPipeline(PipelinedCorrFast):
                         value_offsets=np.asarray(voff, np.int32),
                         n_contrib=csr.n_contrib[keep].astype(np.int32))
         return sub, voff, nh
+
+    def stream_formats(self) -> list[StreamFormat]:
+        """Frame-v2 static fields of this chgroup's streams (packer order)."""
+        return [StreamFormat.from_value_map(self.vm, sid, self.rule,
+                                            n_values=self.voff[s + 1] - self.voff[s],
+                                            n_heavy=self.n_heavy[s])
+                for s, sid in enumerate(self.stream_ids)]
+
+    def tier_dms(self) -> dict[int, int]:
+        """``{global coarse DM: T_native}`` of every DM this corr emits."""
+        return {int(d): int(t.T_native) for t in self.tiers for d in t.dms}
 
     def sky_cells(self) -> tuple[np.ndarray, np.ndarray]:
         """Owner cells of this chgroup's values (wire order, streams
@@ -432,7 +442,7 @@ class Corr2xPipeline(PipelinedCorrFast):
                 cfi._tmark(ctx, f"stage1_{ts.name}")
                 if ts.static_sky is not None:
                     ts.static_sky.apply_(x)
-                pk = ts.packer.pack(x)
+                pk = ts.packer.pack(x, resolve_overflow=not self.cuda)
                 cfi._tmark(ctx, f"pack_{ts.name}")
                 packets.append((ts, q_emit, pk, x))
         elif q_emit is not None:
@@ -460,7 +470,9 @@ class Corr2xPipeline(PipelinedCorrFast):
                     self._d2h_stream.wait_event(d.ready)
                 if timer is not None:
                     timer.span_begin("tx", self._d2h_stream if self.cuda else None)
-                for ts, q_emit, pk, _x in d.cubes:
+                for ts, q_emit, pk, x in d.cubes:
+                    if self.cuda:                    # rare: > guard_capacity guarded rows
+                        ts.packer.resolve_overflow(pk, x)
                     n_tx += int(self.tx2x.transmit_tier(
                         block_n=d.out.block_n - 1, tier=ts.name, dms=ts.dms,
                         t0_native=q_emit * 8, T_native=ts.T_native, stream_ids=self.stream_ids,
