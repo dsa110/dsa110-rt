@@ -232,7 +232,7 @@ def test_gpu_k3b_fused_equals_twin_and_v1(bank):
 
 
 @_gpu
-@pytest.mark.parametrize("k1,k3b", [("triton", "v1"), ("staged", "fused")])
+@pytest.mark.parametrize("k1,k3b", [("triton", "v1"), ("staged", "fused"), ("staged", "reg")])
 def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b):
     """Same synthetic 2x ring through backend='cpu' and backend='gpu'."""
     from dsart.x2.search.codec import RowFormat
@@ -273,7 +273,7 @@ def test_cp1_gpu_list_is_marked():
     import sys
     mod = sys.modules[__name__]
     names = [n for n in dir(mod) if n.startswith("test_gpu_")]
-    assert len(names) == 8                                   # 13 cases with parametrize
+    assert len(names) == 8                                   # 14 cases with parametrize
     for n in names:
         marks = {m.name for m in getattr(getattr(mod, n), "pytestmark", [])}
         assert "x2_gpu" in marks, n

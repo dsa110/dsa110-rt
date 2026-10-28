@@ -23,7 +23,7 @@ Subcommands (exit 0 = every gate passed, 1 = a gate failed, 2 = error):
                                 detector vs multi_boxcar_argmax).
   engine --gpus 0,1 --input synthetic-ring|rx-v4 --opoint <id> --minutes M
          [--shm-name /ring --plan p.npz --halves 2j,2j+1 --out DIR]   (WS-T fleet-load form)
-         [--variants staged:fused,triton:v1 --ring-access pread|mmap]
+         [--variants staged:reg,triton:v1 --ring-access pread|mmap]
                                 one owner half per GPU, real-time paced synthetic ring
                                 (in-process; no shm) or ring v4 (RingV4Source); each k1:k3b
                                 variant for M / n_variants minutes: per-stage us/image (CUDA
@@ -92,80 +92,34 @@ def check_python() -> list:
     return res
 
 
-def _nvrtc_ptx_ctypes(src: str, opts: list) -> str:
-    """Compile CUDA C to PTX with libnvrtc through ctypes (no device, no
-    driver; the CPU-node path of compile-check)."""
-    import ctypes
-    import ctypes.util
-    import glob
-
-    cands = sorted(glob.glob(os.path.join(sys.prefix, "lib", "libnvrtc.so*")))
-    cands = [c for c in cands if "builtins" not in c]
-    path = cands[0] if cands else ctypes.util.find_library("nvrtc")
-    if not path:
-        raise RuntimeError("libnvrtc not found")
-    lib = ctypes.CDLL(path)
-    prog = ctypes.c_void_p()
-    rc = lib.nvrtcCreateProgram(ctypes.byref(prog), src.encode(), b"x2.cu", 0, None, None)
-    if rc != 0:
-        raise RuntimeError(f"nvrtcCreateProgram rc={rc}")
-    try:
-        bo = [o.encode() for o in opts]
-        arr = (ctypes.c_char_p * len(bo))(*bo)
-        rc = lib.nvrtcCompileProgram(prog, len(bo), arr)
-        if rc != 0:
-            n = ctypes.c_size_t()
-            lib.nvrtcGetProgramLogSize(prog, ctypes.byref(n))
-            log = ctypes.create_string_buffer(n.value)
-            lib.nvrtcGetProgramLog(prog, log)
-            raise RuntimeError(f"NVRTC error rc={rc}: {log.value.decode(errors='replace')}")
-        n = ctypes.c_size_t()
-        lib.nvrtcGetPTXSize(prog, ctypes.byref(n))
-        buf = ctypes.create_string_buffer(n.value)
-        lib.nvrtcGetPTX(prog, buf)
-        return buf.value.decode(errors="replace")
-    finally:
-        lib.nvrtcDestroyProgram(ctypes.byref(prog))
-
-
 def check_nvrtc() -> dict:
-    try:
-        import cupy
-        from cupy.cuda import compiler
-    except Exception as e:                                       # noqa: BLE001
-        return dict(check="cuda_nvrtc", status="skip", reason=f"cupy unavailable: {e!r}")
-    from dsart.x2.search.kernels_cuda import CUDA_SOURCE
-    opts = ["--std=c++14"]
-    try:
-        cuda_path = cupy.cuda.get_cuda_path()
-        if cuda_path:
-            opts.append("-I" + os.path.join(cuda_path, "include"))
-    except Exception:                                            # noqa: BLE001
-        pass
+    """Every owner-engine CUDA source compiled for compute_75 with libnvrtc
+    (no device needed: ``dsart.x2.search.nvrtc``)."""
+    from dsart.x2.search import nvrtc
+    if not nvrtc.available():
+        return dict(check="cuda_nvrtc", status="skip", reason="libnvrtc not found")
+    from dsart.x2.search.filters import FilterBank
     from dsart.x2.search.k1_staged import CUDA_SOURCE_K1S
-
-    def ptx_of(src: str) -> str:
-        try:
-            ptx = compiler.compile_using_nvrtc(src, options=tuple(opts), arch="compute_75")
-            return ptx if isinstance(ptx, str) else str(ptx)
-        except Exception as e:                                   # noqa: BLE001
-            if "NoDevice" not in repr(e) and "no CUDA-capable" not in repr(e):
-                raise
-        # CPU node: cupy queries the device; libnvrtc itself needs none
-        return _nvrtc_ptx_ctypes(src, list(opts) + ["--gpu-architecture=compute_75"])
-
+    from dsart.x2.search.k3b_cuda import cuda_source
+    from dsart.x2.search.kernels_cuda import CUDA_SOURCE
+    srcs = [(CUDA_SOURCE, ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
+                           "k3a_rowc2r_256")),
+            (CUDA_SOURCE_K1S, ("k1_staged",))]
+    from dsart.x2.search.k3b_reg import plan_parts, reg_source
+    for bank_name, fb in (("b3x", FilterBank.b3x()), ("box", FilterBank.build())):
+        src, meta = cuda_source(fb, name=f"k3b_cuda_{bank_name}")
+        srcs.append((src, (meta["name"],)))
+        for i, part in enumerate(plan_parts(fb)):
+            src, meta = reg_source(fb, part, name=f"k3b_reg_{bank_name}_{i}")
+            srcs.append((src, (meta["name"],)))
     try:
         names = []
-        for src, want in ((CUDA_SOURCE, ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
-                                         "k3a_rowc2r_256")),
-                          (CUDA_SOURCE_K1S, ("k1_staged",))):
-            txt = ptx_of(src)
-            names += [n for n in want if n in txt]
+        for src, want in srcs:
+            txt = nvrtc.ptx(src)
+            names += [n for n in want if f".entry {n}" in txt]
         return dict(check="cuda_nvrtc", status="ok", arch="compute_75", kernels=names)
     except Exception as e:                                       # noqa: BLE001
-        msg = repr(e)
-        st = "fail" if ("error" in msg and "CUDA" not in msg[:40]) else "skip"
-        return dict(check="cuda_nvrtc", status=st, error=msg[:2000])
+        return dict(check="cuda_nvrtc", status="fail", error=repr(e)[:2000])
 
 
 def check_triton_compile() -> list:
@@ -384,7 +338,7 @@ def _cuda_ms(fn, reps: int = 5) -> float:
 FORMATS_2X = ("2x-gridded-ns2-cint4", "2x-gridded-ns4-cint5", "2x-gridded-ns4-cint4",
               "2x-baselines-ns4-cint5", "2x-baselines-ns2-cint4", "2x-baselines-ns4-cint4")
 K1_VARIANTS = ("triton", "staged")
-K3B_IMPLS = ("v1", "fused")
+K3B_IMPLS = ("v1", "fused", "cuda", "reg")
 CHAIN_GATE_US = 4.8          # us/image, all-in compute chain (ledger E1)
 DUTY_AIM, DUTY_GATE = 0.6, 0.75
 STAGES = ("k0", "k1", "fft", "l1", "k3b", "topk")     # compute stream (h2d overlaps on copy)
@@ -450,7 +404,9 @@ def cmd_kernels(a) -> int:
     from dsart.x2.search.fft import FftPlan, image_from_uv_torch, image_from_uv_twin
     from dsart.x2.search.filters import FilterBank, k3b_twin
     from dsart.x2.search.k1_staged import k1_staged, staged_geometry
+    from dsart.x2.search.k3b_cuda import k3b_cuda
     from dsart.x2.search.k3b_fused import k3b_fused
+    from dsart.x2.search.k3b_reg import k3b_reg
     from dsart.x2.search.kernels_cuda import get_module
     from dsart.x2.search.kernels_triton import csr_tensors, k1_combine, k3b_detect
     from dsart.x2.search.valuemap import dm_inputs_from_value_map
@@ -477,7 +433,7 @@ def cmd_kernels(a) -> int:
                              n_c=64, sigma_inv=np.ones(2, np.float32),
                              s_inv=(1 / fb.seeds).astype(np.float32), bank=fb)
         for impl in impls:
-            fn = k3b_fused if impl == "fused" else k3b_detect
+            fn = dict(v1=k3b_detect, fused=k3b_fused, cuda=k3b_cuda, reg=k3b_reg)[impl]
             try:
                 ms = _cuda_ms(lambda: fn(ring, ring_row0=0, c_first=fb.max_d + fb.max_a,
                                          n_c=hop, sigma_inv=si, s_inv=1 / fb.seeds, bank=fb),
@@ -845,7 +801,7 @@ def _atomic_json(path: Path, obj: dict) -> None:
 
 
 def _variants(a) -> list:
-    """``--variants k1:k3b,...`` (default: staged:fused then triton:v1)."""
+    """``--variants k1:k3b,...`` (default: staged:reg then triton:v1)."""
     out = []
     for tok in [t for t in a.variants.split(",") if t]:
         k1, _, k3b = tok.partition(":")
@@ -1058,8 +1014,8 @@ def main(argv=None) -> int:
     c.add_argument("--out", default="b8_out")
     k = sub.add_parser("kernels")
     k.add_argument("--fft", default="cufft,warp")
-    k.add_argument("--k3b", default="box,b3x,v1,fused",
-                   help="filter banks (box, b3x) and implementations (v1, fused) to time")
+    k.add_argument("--k3b", default="box,b3x,v1,fused,cuda,reg",
+                   help="filter banks (box, b3x) and implementations (v1, fused, cuda, reg)")
     k.add_argument("--k1", default="triton,staged", help="K1 variants (triton, staged)")
     k.add_argument("--k1-formats", dest="k1_formats", default="all")
     k.add_argument("--check-1x-csr", dest="check_1x_csr", action="store_true")
@@ -1078,7 +1034,7 @@ def main(argv=None) -> int:
     e.add_argument("--opoint", default="2x-gridded-ns2-cint4")
     e.add_argument("--minutes", type=float, default=10.0, help="total, split over --variants")
     e.add_argument("--out", default="b8_out", help="directory; b8_engine.json is the result")
-    e.add_argument("--variants", default="staged:fused,triton:v1",
+    e.add_argument("--variants", default="staged:reg,triton:v1",
                    help="k1:k3b pairs, run one after another")
     e.add_argument("--ring-access", dest="ring_access", default="pread",
                    choices=("pread", "mmap"))

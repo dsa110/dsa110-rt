@@ -32,14 +32,12 @@ def test_compile_check_passes_on_cpu(tmp_path):
     st = {r["check"]: r["status"] for r in res if r["check"] in ("cuda_nvrtc", "triton_interpret")}
     print(st)
     nv = next(r for r in res if r["check"] == "cuda_nvrtc")
-    try:
-        __import__("cupy_backends.cuda.libs.nvrtc")
-        have_nvrtc = True
-    except Exception:                                            # noqa: BLE001
-        have_nvrtc = False
-    if have_nvrtc:                                     # NVRTC needs no GPU: must really compile
+    from dsart.x2.search import nvrtc
+    if nvrtc.available():                                     # NVRTC needs no GPU: must really compile
         assert nv["status"] == "ok", nv
-        assert {"k0_unpack_frame2", "k2_colfft_256", "k3a_rowc2r_256", "k1_staged"} <= set(
+        assert {"k0_unpack_frame2", "k2_colfft_256", "k3a_rowc2r_256", "k1_staged",
+                "k3b_cuda_b3x", "k3b_cuda_box", "k3b_reg_b3x_0", "k3b_reg_b3x_2",
+                "k3b_reg_box_0"} <= set(
             nv["kernels"]), nv
     tc = {r.get("kernel"): r["status"] for r in res if r["check"] == "triton_compile"}
     if tc.get("K1") == "ok":                       # Triton present: every variant compiled

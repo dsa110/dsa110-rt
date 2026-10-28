@@ -272,9 +272,12 @@ class GpuBackend:
 
         x = self.dm[st.spec.d]
         cfg = self.eng.cfg
-        if cfg.k3b_impl not in ("v1", "fused"):
-            raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused)")
-        detect = k3b_fused if cfg.k3b_impl == "fused" else k3b_detect
+        from .k3b_cuda import k3b_cuda
+        from .k3b_reg import k3b_reg
+        impls = dict(v1=k3b_detect, fused=k3b_fused, cuda=k3b_cuda, reg=k3b_reg)
+        if cfg.k3b_impl not in impls:
+            raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused|cuda|reg)")
+        detect = impls[cfg.k3b_impl]
         with torch.cuda.stream(self.compute):
             ev0 = self._ev(self.compute)
             best, tk, taps = detect(
