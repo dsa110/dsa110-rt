@@ -99,12 +99,12 @@ def check_nvrtc() -> dict:
     if not nvrtc.available():
         return dict(check="cuda_nvrtc", status="skip", reason="libnvrtc not found")
     from dsart.x2.search.filters import FilterBank
-    from dsart.x2.search.k1_staged import CUDA_SOURCE_K1S
+    from dsart.x2.search.k1_staged import k1_source
     from dsart.x2.search.k3b_cuda import cuda_source
     from dsart.x2.search.kernels_cuda import CUDA_SOURCE
     srcs = [(CUDA_SOURCE, ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
                            "k3a_rowc2r_256")),
-            (CUDA_SOURCE_K1S, ("k1_staged",))]
+            (k1_source(24), ("k1_staged",))]
     from dsart.x2.search.k3b_reg import plan_parts, reg_source
     for bank_name, fb in (("b3x", FilterBank.b3x()), ("box", FilterBank.build())):
         src, meta = cuda_source(fb, name=f"k3b_cuda_{bank_name}")

@@ -17,7 +17,7 @@ import pytest
 
 from dsart.x2.search.combine import k1_twin
 from dsart.x2.search.csr import csr_from_value_cells
-from dsart.x2.search.k1_staged import OPT, SMEM_CAP, k1_staged_twin, staged_geometry
+from dsart.x2.search.k1_staged import k1_staged_twin, staged_geometry
 
 
 def _case(seed=0, N=16, S=5, V=30, R=96, F=6, heavy_cell=True):
@@ -40,24 +40,23 @@ def _case(seed=0, N=16, S=5, V=30, R=96, F=6, heavy_cell=True):
 
 
 @pytest.mark.parametrize("geo", [
-    dict(),                                              # defaults: one tile, one chunk
-    dict(cpb=1, threads=32),                             # tile 42 < n_t
-    dict(cpb=3, threads=16, smem_cap=600),               # tile 7, entry chunks of a few
-    dict(cpb=4, threads=8, smem_cap=200),                # chunks of 1-2 entries
+    dict(),                                              # defaults: 32-row tiles (32 + 18)
+    dict(cpb=1),                                         # one cell per block
+    dict(cpb=3, smem_cap=600),                           # entry chunks of a few
+    dict(cpb=4, smem_cap=330),                           # chunks of 1-2 entries
 ])
 def test_staged_twin_equals_k1_twin_bit_for_bit(geo):
     csr, codes, cv, wv, shifts = _case()
     assert csr.max_entries > 64                          # no 64-entry cap
     n_t, t_lo = 50, 90                                   # rows wrap the 96-slot ring
     g = staged_geometry(shifts, n_t=n_t, **geo)
-    assert g.smem <= geo.get("smem_cap", SMEM_CAP) and g.ec >= 1
-    assert g.cpb * shifts.shape[0] * g.tile <= OPT * g.threads
+    assert g.smem <= geo.get("smem_cap", 20 * 1024) and g.ec >= 1 and g.tile == 32
     want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=shifts, t_lo=t_lo, n_t=n_t,
                    w_v=wv)
     got = k1_staged_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=shifts, t_lo=t_lo,
                          n_t=n_t, w_v=wv, geom=g)
     assert np.array_equal(got.real, want.real) and np.array_equal(got.imag, want.imag)
-    if geo.get("smem_cap", SMEM_CAP) < 1000:
+    if geo.get("smem_cap", 20 * 1024) < 1000:
         assert g.ec < csr.max_entries                    # chunking really exercised
 
 
