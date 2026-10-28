@@ -205,6 +205,11 @@ typedef struct flow {
     bool     head_seq_set;
 } flow_t;
 
+/* x2 ring v4 mode: one receive thread per socket subset (see the v4
+ * section at the end of this file). */
+struct rx4_thread;
+#define RX4_MAX_THREADS 8
+
 
 /* -----------------------------------------------------------------------
  * Global state — singleton C loop per Python process. The MVP only
@@ -281,6 +286,14 @@ typedef struct rx_epoll {
      * maximum possible single-slot payload (16 frags × 9000 B). Only
      * touched by the loop pthread, so no atomics required. */
     uint8_t        concat_scratch[MAX_FRAGS_PER_PAYLOAD * MAX_FRAG_PAYLOAD_BYTES];
+
+    /* x2 ring v4 mode (frame v2 only). When ring4 is attached the v3 path
+     * above is not used: start() runs n_threads4 v4 threads instead. */
+    rx4_ring_t        *ring4;
+    _Atomic int        ring4_attached;
+    int                n_threads4;
+    int                strict_ports4;
+    struct rx4_thread *th4;
 } rx_epoll_t;
 
 static rx_epoll_t g_state;
@@ -819,6 +832,8 @@ int recv_epoll_add_port(const char *bind_host, uint16_t bind_port,
     if (!g_state_init) return -1;
     rx_epoll_t *s = &g_state;
     if (s->n_sockets >= MAX_PORTS) return -7;  /* would overflow sockfds[] */
+    if (atomic_load_explicit(&s->ring4_attached, memory_order_acquire))
+        return -9;                              /* v4 threads own the socket sets */
     if (s->thread_started) return -8;          /* stop first; epoll_ctl
                                                 * mid-loop is racy with
                                                 * our single drainer */
@@ -863,6 +878,8 @@ int recv_epoll_attach_ring(const char *shm_name, int owner,
     if (atomic_load_explicit(&s->ring_attached, memory_order_acquire))
         return -2;  /* already attached */
     if (s->thread_started) return -3;
+    if (atomic_load_explicit(&s->ring4_attached, memory_order_acquire))
+        return -5;  /* a v4 ring is attached: one ring version per RX */
     rx_ring_t *r = rx_ring_open_or_create(shm_name, n_corr, n_coarse_dm,
                                           t_buf_samples, n_filled,
                                           bytes_per_cell, owner,
@@ -887,9 +904,23 @@ int recv_epoll_detach_ring(void) {
     return 0;
 }
 
+static int rx4_threads_start(rx_epoll_t *s);
+static void rx4_threads_stop(rx_epoll_t *s);
+static void rx4_teardown(rx_epoll_t *s);
+
 int recv_epoll_start(void) {
     if (!g_state_init) return -1;
     if (g_state.thread_started) return 0;
+    if (atomic_load_explicit(&g_state.ring4_attached, memory_order_acquire)) {
+        atomic_store_explicit(&g_state.run_flag, 1, memory_order_release);
+        int rc4 = rx4_threads_start(&g_state);
+        if (rc4 != 0) {
+            atomic_store_explicit(&g_state.run_flag, 0, memory_order_release);
+            return rc4;
+        }
+        g_state.thread_started = true;
+        return 0;
+    }
     atomic_store_explicit(&g_state.run_flag, 1, memory_order_release);
     int rc = pthread_create(&g_state.thread, NULL, epoll_thread_main,
                             &g_state);
@@ -905,6 +936,11 @@ int recv_epoll_stop(void) {
     if (!g_state_init) return -1;
     if (!g_state.thread_started) return 0;
     atomic_store_explicit(&g_state.run_flag, 0, memory_order_release);
+    if (atomic_load_explicit(&g_state.ring4_attached, memory_order_acquire)) {
+        rx4_threads_stop(&g_state);
+        g_state.thread_started = false;
+        return 0;
+    }
     pthread_join(g_state.thread, NULL);
     g_state.thread_started = false;
     return 0;
@@ -913,6 +949,7 @@ int recv_epoll_stop(void) {
 int recv_epoll_close(void) {
     if (!g_state_init) return -1;
     if (g_state.thread_started) recv_epoll_stop();
+    rx4_teardown(&g_state);
     /* Tear down the ring first so a re-open of the same shm name in the
      * same process doesn't race with our cached pointer. */
     if (atomic_load_explicit(&g_state.ring_attached, memory_order_acquire)) {
@@ -1000,4 +1037,222 @@ int recv_epoll_get_n_sockets(void) {
 int recv_epoll_get_ring_attached(void) {
     if (!g_state_init) return 0;
     return atomic_load_explicit(&g_state.ring_attached, memory_order_acquire);
+}
+
+
+
+/* =======================================================================
+ * x2 ring v4 mode (docs/x2/SPEC.md §6). Frame v2 only: every datagram goes
+ * through rx4_ingest (recv_ring.c), which validates it and places its rows
+ * in the v4 ring; v1 frames are counted there (v1_frames / bad_version) and
+ * dropped. Nothing above changes when no v4 ring is attached.
+ *
+ * Threads: n_threads4 (1..RX4_MAX_THREADS) receive threads, each with its
+ * own epoll set and recvmmsg buffers. Socket i (bind order = chgroup i,
+ * port_base + i) belongs to thread i % n_threads4. A (stream, DM) flow must
+ * have exactly one writer thread, so with more than one thread (or
+ * strict_ports) a datagram whose stream's chgroup is not its socket's index
+ * is dropped (port_mismatch). Each thread sweeps only its own streams'
+ * gaps (hole timeout) every ~10 ms; the sweep also refreshes the ring
+ * heartbeat.
+ * ===================================================================== */
+
+typedef struct rx4_thread {
+    rx_epoll_t     *s;
+    int             idx;
+    int             epfd;
+    int             started;
+    pthread_t       th;
+    uint64_t        stream_mask;
+    struct mmsghdr  mmsg[RECV_BATCH];
+    struct iovec    iovs[RECV_BATCH];
+    uint8_t         bufs[RECV_BATCH][RECV_BUF_BYTES];
+} rx4_thread_t;
+
+#define RX4_SWEEP_NS UINT64_C(10000000)
+
+static void *rx4_thread_main(void *arg) {
+    rx4_thread_t *t = (rx4_thread_t *)arg;
+    rx_epoll_t *s = t->s;
+    const int strict = s->strict_ports4 || s->n_threads4 > 1;
+    struct epoll_event evs[MAX_PORTS];
+    uint64_t last_sweep = 0;
+    while (atomic_load_explicit(&s->run_flag, memory_order_acquire)) {
+        int n = epoll_wait(t->epfd, evs, MAX_PORTS, 10 /* ms */);
+        if (n < 0 && errno != EINTR) break;
+        for (int e = 0; e < n; e++) {
+            if (!(evs[e].events & EPOLLIN)) continue;
+            const int fd = (int)(uint32_t)(evs[e].data.u64 & 0xFFFFFFFFu);
+            const uint32_t chg = (uint32_t)(evs[e].data.u64 >> 32);
+            const uint32_t port_chg = strict ? chg : UINT32_MAX;
+            for (int it = 0; it < 64; it++) {
+                int m = recvmmsg(fd, t->mmsg, RECV_BATCH, MSG_DONTWAIT, NULL);
+                if (m <= 0) break;
+                const uint64_t now = rx4_now_ns();
+                for (int i = 0; i < m; i++) {
+                    const unsigned len = t->mmsg[i].msg_len;
+                    atomic_fetch_add_explicit(&s->n_received, 1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&s->bytes_received_total, len,
+                                              memory_order_relaxed);
+                    const int rc = rx4_ingest(s->ring4, t->bufs[i], len, now, port_chg);
+                    switch (rc) {
+                    case RX4_C_OK:
+                        atomic_fetch_add_explicit(&s->n_committed, 1, memory_order_relaxed);
+                        break;
+                    case RX4_C_BAD_MAGIC:
+                        atomic_fetch_add_explicit(&s->bad_magic_count, 1, memory_order_relaxed);
+                        break;
+                    case RX4_C_BAD_VERSION:
+                        atomic_fetch_add_explicit(&s->bad_version_count, 1, memory_order_relaxed);
+                        break;
+                    case RX4_C_BAD_LENGTH:
+                        atomic_fetch_add_explicit(&s->bad_length_count, 1, memory_order_relaxed);
+                        break;
+                    case RX4_C_PATTERN_MISMATCH:
+                        atomic_fetch_add_explicit(&s->pattern_mismatch_count, 1, memory_order_relaxed);
+                        break;
+                    default:
+                        atomic_fetch_add_explicit(&s->bad_field_range_count, 1, memory_order_relaxed);
+                        break;
+                    }
+                }
+                if (m < RECV_BATCH) break;
+            }
+        }
+        const uint64_t now = rx4_now_ns();
+        if (now - last_sweep >= RX4_SWEEP_NS) {
+            rx4_sweep(s->ring4, now, t->stream_mask);
+            last_sweep = now;
+        }
+    }
+    return NULL;
+}
+
+static int rx4_threads_start(rx_epoll_t *s) {
+    for (int i = 0; i < s->n_threads4; i++) {
+        rx4_thread_t *t = &s->th4[i];
+        if (pthread_create(&t->th, NULL, rx4_thread_main, t) != 0) {
+            atomic_store_explicit(&s->run_flag, 0, memory_order_release);
+            for (int j = 0; j < i; j++) {
+                pthread_join(s->th4[j].th, NULL);
+                s->th4[j].started = 0;
+            }
+            return -2;
+        }
+        t->started = 1;
+    }
+    return 0;
+}
+
+static void rx4_threads_stop(rx_epoll_t *s) {
+    for (int i = 0; i < s->n_threads4; i++) {
+        if (s->th4[i].started) {
+            pthread_join(s->th4[i].th, NULL);
+            s->th4[i].started = 0;
+        }
+    }
+}
+
+static void rx4_teardown(rx_epoll_t *s) {
+    if (!atomic_load_explicit(&s->ring4_attached, memory_order_acquire)) return;
+    atomic_store_explicit(&s->ring4_attached, 0, memory_order_release);
+    if (s->th4) {
+        for (int i = 0; i < s->n_threads4; i++)
+            if (s->th4[i].epfd >= 0) close(s->th4[i].epfd);
+        free(s->th4);
+        s->th4 = NULL;
+    }
+    if (s->ring4) {
+        rx4_close(s->ring4);
+        s->ring4 = NULL;
+    }
+    s->n_threads4 = 0;
+}
+
+/* Create the v4 ring (rx4_create: unlinks any stale segment of that name)
+ * and arm v4 mode. Call after every open/add_port and before start. */
+int recv_epoll_attach_ring4(const char *shm_name, const rx4_config_t *cfg,
+                            int prefault, int n_threads, int strict_ports,
+                            char *errbuf, size_t errbuf_len) {
+    if (!g_state_init) return -1;
+    rx_epoll_t *s = &g_state;
+    if (atomic_load_explicit(&s->ring_attached, memory_order_acquire)) return -2;
+    if (atomic_load_explicit(&s->ring4_attached, memory_order_acquire)) return -3;
+    if (s->thread_started) return -4;
+    if (n_threads < 1 || n_threads > RX4_MAX_THREADS || n_threads > s->n_sockets) return -5;
+    rx4_ring_t *r = rx4_create(shm_name, cfg, prefault, errbuf, errbuf_len);
+    if (!r) return -6;
+    rx4_thread_t *th = (rx4_thread_t *)calloc((size_t)n_threads, sizeof(rx4_thread_t));
+    if (!th) {
+        rx4_close(r);
+        return -7;
+    }
+    for (int i = 0; i < n_threads; i++) {
+        rx4_thread_t *t = &th[i];
+        t->s = s;
+        t->idx = i;
+        t->epfd = epoll_create1(EPOLL_CLOEXEC);
+        if (t->epfd < 0) {
+            for (int j = 0; j < i; j++) close(th[j].epfd);
+            free(th);
+            rx4_close(r);
+            return -8;
+        }
+        for (int b = 0; b < RECV_BATCH; b++) {
+            t->iovs[b].iov_base = t->bufs[b];
+            t->iovs[b].iov_len = RECV_BUF_BYTES;
+            t->mmsg[b].msg_hdr.msg_iov = &t->iovs[b];
+            t->mmsg[b].msg_hdr.msg_iovlen = 1;
+        }
+        uint64_t mask = 0;
+        for (uint32_t st = 0; st < cfg->n_stream && st < 64; st++)
+            if (n_threads == 1 || (int)((st / cfg->n_sub) % (uint32_t)n_threads) == i)
+                mask |= UINT64_C(1) << st;
+        t->stream_mask = mask;
+    }
+    for (int k = 0; k < s->n_sockets; k++) {
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        ev.data.u64 = ((uint64_t)(uint32_t)k << 32) | (uint32_t)s->sockfds[k];
+        if (epoll_ctl(th[k % n_threads].epfd, EPOLL_CTL_ADD, s->sockfds[k], &ev) < 0) {
+            for (int j = 0; j < n_threads; j++) close(th[j].epfd);
+            free(th);
+            rx4_close(r);
+            return -9;
+        }
+    }
+    s->ring4 = r;
+    s->th4 = th;
+    s->n_threads4 = n_threads;
+    s->strict_ports4 = strict_ports ? 1 : 0;
+    atomic_store_explicit(&s->ring4_attached, 1, memory_order_release);
+    return 0;
+}
+
+int recv_epoll_detach_ring4(void) {
+    if (!g_state_init) return -1;
+    if (g_state.thread_started) return -2;
+    rx4_teardown(&g_state);
+    return 0;
+}
+
+int recv_epoll_ring4_set_expected_pid(uint32_t stream, uint64_t pid) {
+    if (!g_state_init || !g_state.ring4) return -1;
+    return rx4_set_expected_pid(g_state.ring4, stream, pid);
+}
+
+int recv_epoll_ring4_clear_expected_pid(uint32_t stream) {
+    if (!g_state_init || !g_state.ring4) return -1;
+    return rx4_clear_expected_pid(g_state.ring4, stream);
+}
+
+int recv_epoll_get_ring4_attached(void) {
+    if (!g_state_init) return 0;
+    return atomic_load_explicit(&g_state.ring4_attached, memory_order_acquire);
+}
+
+int recv_epoll_get_n_threads4(void) {
+    if (!g_state_init) return 0;
+    return g_state.n_threads4;
 }

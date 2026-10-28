@@ -312,40 +312,141 @@ peak is N_image / N^2 for both kinds (tested).
 - The gridded counts differ slightly from the model because production gridding has no DEC projection. The
   model's `nfilled.py` used `v x cos(z)`.
 
-## 4. Quantisation ("row rule") [FREEZE: WS-T + Phase 0]
-Corr side, per (stream, coarse DM, sample) row of values x_v (complex):
-1. normalise: y_v = x_v / sqrt(n_v) (static n from §3) — equal noise per value;
-2. sigma_hat per (stream, coarse DM): slow EMA (tau ~ 10 s) of a robust estimate (1.4826 x median|re,im|
-   over the block, after excluding |y| > 6 sigma_hat_prev);
-3. main values: step_m = s_b x sigma_hat (s_4 = 0.336, s_5 = 0.191 — Phase 0 confirms), code =
-   clip(floor(y / step_m), -2^(b-1), 2^(b-1)-1) per component (mid-rise);
-4. heavy values: cint8, step_h = s_h x sigma_hat with s_h chosen so the clip (128 x step_h) is >= 2x the
-   value's S/N at today's 250-sigma image rail (Phase 0 sets s_h; ~0.1);
-5. owner decode in sigma_hat units: v = (code + 0.5) x s_b (main) or x s_h (heavy), then x sqrt(n_v)
-   when gridding — natural weighting of what was summed, 1/sigma_hat weighting across streams (today's
-   per-row 1/max-abs semantics without the burst-dependent compression). step values travel in the
-   header for monitoring only.
-1x-compat keeps v1 exactly: per-row max-abs cint8, codes summed without the scale.
+## 4. Quantisation ("row rule") [FROZEN v1 by WS-T + Phase 0, 2026-10-22]
+Reference: `src/dsart/x2/quant.py` (numpy; WS-C's packer and WS-S's decoder match it bit for bit,
+`tests/x2/test_x2_quant.py` incl. a scalar twin and a golden vector). Evidence: `docs/x2/phase0/rowrule.md`.
+Arithmetic: float32, round-to-nearest-even, NO fused multiply-add (CUDA `__fmul_rn`/`__fadd_rn`/
+`__fdiv_rn`/`rintf`, or `--fmad=false`). lowmed(m numbers) = the element of rank (m-1)//2 ascending.
+Per (stream, coarse DM) flow, per corr block b (S rows: 256 tier A, 128 tier B; 4096 native samples):
+1. Normalise: `r_v = f32(1/sqrt(n_v))` (float64, one rounding; n from §3); `y = (f32(re x)*r_v, f32(im x)*r_v)`.
+2. sigma_hat: block estimate on the rows j % 16 == 0. A value is *used* iff finite and not 0+0i. If
+   used < max(16, ceil(M/2)) (M = values in that subsample) the block does not update. Else
+   `est = max(f32(1.4826) * lowmed(|re|,|im| of used values), f32(1e-30))`. No outlier exclusion. Blocks
+   b < 8 (the corr static-sky warm-up) never update; the first update sets sigma_hat = est, later ones
+   `d = est - s; m = alpha*d; s = s + m` with `alpha = f32(-expm1(-0.134217728/3))` (tau 3 s). Block b is
+   coded with sigma_hat after its own update; while sigma_hat = 0 every code is NO_DATA.
+3. Row guard (per row j): `s_row = f32(1.4826) * lowmed(|re|,|im| of the row's used values)` (rows with
+   < 50% used values are never guarded). If `s_row > f32(1.5) * sigma_hat` the row is coded with
+   sigma = s_row (main and heavy) and framed with flag ROW_GUARD (§5). Never fires on normal noise (~30
+   sd); a point source trips it only above ~500 sigma per sample (tested at 400 / 1500 on WS-P's map).
+4. Codes (per component, sigma = sigma_hat or s_row): `step = f32(s)*sigma; inv = f32(1)/step;
+   q = y*inv; code = clip(rint(q), -(2^(c-1)-1), 2^(c-1)-1)` — MID-TREAD. Main: c = 4/5/6 (bits_main
+   8/10/12), `s = s_main` = 0.3534 / 0.1932 / 0.1055. Heavy (n >= 3e-5 N_image, §1/§3; first n_heavy
+   values): c = 8, `s = s_heavy` = 0.0773 (n_sub 2) / 0.0547 (n_sub 4) = f32(2*250*sqrt(n_max/N)/127).
+   The code -2^(c-1) (-8/-16/-32 main, -128 heavy) is NO_DATA: emitted for non-finite components and
+   while sigma is 0, never a level. Exactly-zero values code to 0 (why not mid-rise: a mid-rise code turns
+   flagged zeros into a constant fake source of 5-8 sigma in b64).
+5. Owner: `v = f32(code) * s` (s_main or s_heavy), NO_DATA -> 0.0; gridding multiplies by
+   `f32(sqrt(n_v))`. No row factor (a guarded row is weighted 1/s_row, today's semantics); fan-in
+   zero-fill is 0.0 in DECODED space. step_main / step_heavy (= s * sigma of the datagram) travel for
+   monitoring; s_main / s_heavy travel in the header and the RX checks them against the ring.
+1x-compat keeps v1 exactly: per-row max-abs cint8, codes summed without the scale (`quant.v1_rowmax_cint8`
+== `TransportTx._encode_rows`).
 
-## 5. Frame v2 (`src/dsart/transport/prod_frame2.py`) [FREEZE: WS-T]
-Same magic, `version = 2`, 72-byte header (little-endian, packed): magic u32 | version u16 | flags u16
-(v1 bits + bit5 heavy-present) | seq_first u64 (stream-sample index of the first sample, per (stream,
-dm), tier clock) | t0_native u64 (absolute native-sample index of the first sample — same epoch as
-C2's `search_to_snap_specnum`) | stream_id u16 (g x n_sub + s) | dm_idx u16 (global coarse d) | k u8
-(samples in datagram) | n_sub u8 | bits_main u8 (8/10/12) | bits_heavy u8 (16 or 0) | n_grid u16 |
-t_int_factor u8 (native samples per stream sample: 16 or 32) | value_kind u8 (0 cells, 1 baselines) |
-n_values u32 | pattern_id u64 | n_heavy u32 | step_main f32 | step_heavy f32 | payload_bytes u32 |
-reserved u8[8]. Payload = k samples, each: n_heavy x (int8 re, int8 im), then the main values as a
-packed little-endian bit stream (re then im per value), padded to a byte. k = floor(8900 / bytes per
-sample). v1 frames are unchanged and still accepted.
+## 5. Frame v2 (`src/dsart/transport/prod_frame2.py`) [FROZEN v1 by WS-T, 2026-10-22]
+One datagram = k consecutive rows of ONE (stream, coarse DM) flow. Same magic as v1 and `version` at the
+same offset, so receivers dispatch on bytes 4-5 (`peek_version`). Header 72 B, little-endian, packed:
 
-## 6. Ring v4 and fan-in [FREEZE: WS-T]
-Owned DMs only (<= 16 per node), per-DM cadence and t_buf, write_seq per (stream, local DM), layout
-[dm][stream][t][bytes] so a (dm, stream) window is contiguous for DMA, per-DM fan-in (>= 15/16 of
-streams or a deadline with the missing streams flagged and zero-filled), per-DM stall watchdog,
-retention >= 20 s, overrun counters per DM. Readers never write into the shared header (the
-`read_slot` overrun-counter trap). API consumed by WS-S: open(shm), dms(), wait_window(dm, t_first,
-n_rows) -> (view, validity), counters().
+| off | size | field | notes |
+|---|---|---|---|
+| 0 | 4 | magic u32 | 0xD5A1107E |
+| 4 | 2 | version u16 | 2 |
+| 6 | 2 | flags u16 | bit0 QUANTIZED (must be 1), bit1 LAST_IN_BLOCK, bit2 reserved (must be 0), bit3 NOISE_WARMUP, bit4 RFI_WARMING_UP, bit5 HEAVY_PRESENT (== n_heavy > 0), bit6 ROW_GUARD (§4.3), bits 7-15 must be 0 |
+| 8 | 8 | seq_first u64 | tier-clock row of the first sample = t0_native / t_int_factor exactly; < 2^56 - 1 - k |
+| 16 | 8 | t0_native u64 | absolute NATIVE-sample index (32.768 us) of the first sample = 2 x SNAP specnum (same epoch as specnum 0; `search_to_snap_specnum` returns specnums of 65.536 us); external row = t0_native // 16 at 2x (// 32 at 1x), §8/§9. Helpers `t0_native_from_specnum`, `specnum_from_t0_native`, `ext_row` |
+| 24 | 2 | stream_id u16 | chgroup x n_sub + s, < 16 n_sub |
+| 26 | 2 | dm_idx u16 | global coarse d (same offset as v1; the sender routes on it) |
+| 28 | 1 | k u8 | rows in this datagram, 1..255 |
+| 29 | 1 | n_sub u8 | 1, 2, 4 |
+| 30 | 1 | bits_main u8 | 8 / 10 / 12 (cint4/5/6, complex bits per main value) |
+| 31 | 1 | bits_heavy u8 | 16 if n_heavy > 0 else 0 |
+| 32 | 2 | n_grid u16 | |
+| 34 | 1 | t_int_factor u8 | native samples per row: 16 tier A, 32 tier B (RX checks it against the DM's tier) |
+| 35 | 1 | value_kind u8 | 0 gridded cells, 1 unique baselines |
+| 36 | 4 | n_values u32 | values per row, heavy included |
+| 40 | 8 | pattern_id u64 | the STREAM's pattern id (`ValueMap.stream_pattern_ids[s]`) |
+| 48 | 4 | n_heavy u32 | leading heavy values |
+| 52 | 4 | step_main f32 | s_main x sigma of every row here (monitoring) |
+| 56 | 4 | step_heavy f32 | s_heavy x sigma |
+| 60 | 4 | payload_bytes u32 | k x bytes_per_sample |
+| 64 | 4 | s_main f32 | decode step (§4.5) |
+| 68 | 4 | s_heavy f32 | decode step |
+
+Payload: k rows back to back; a row = n_heavy x (int8 re, int8 im), then the n_values - n_heavy main
+values as ONE little-endian bit stream of W = bits_main bits per value (re in the low W/2 bits, im in the
+high W/2, two's complement; stream bit i = bit i%8 of byte i//8), zero-padded to a byte.
+`bytes_per_sample = n_heavy*bits_heavy/8 + ceil((n_values-n_heavy)*bits_main/8)`.
+Sender rules: k <= `max_k` = min(255, floor(8900/bytes_per_sample)), so every datagram is <= 8972 B
+(9000 B on the wire at MTU 9000, never IP-fragmented; every 2x map fits k >= 2). All rows of a datagram
+share step_main, step_heavy and ROW_GUARD exactly: rows are framed in runs of equal steps, so a datagram
+never straddles a corr block or a guarded row; the block's last datagram carries LAST_IN_BLOCK
+(`iter_block_datagrams` is the reference framing). Worst search node: gridded ns2 cint5 ~305k
+datagrams/s, ns2 cint4 ~203k (`tests/x2/test_x2_frame2.py` recomputes it from WS-P's maps and plan).
+Corr TX: `transport/send_mmsg.py` `MmsgSender` (C sendmmsg thread, GIL released, per-destination
+token-bucket pacing, explicit dm -> destination routes, drop-and-count on full queues, `set_rate`,
+counters; `TxRateMeter` for `/mon/corr_rt/<chgroup>/corr_fast`). v1 frames are unchanged and still
+accepted by v3-mode receivers; a v4-mode receiver counts and drops them.
+
+## 6. Ring v4 and fan-in [FROZEN v1 by WS-T, 2026-10-22]
+Writer: `search_rx --ring-version 4` (`RxEpoll.attach_ring4`, 1-8 receive threads; socket i = chgroup i
+-> thread i % N; with N > 1 a stream on another chgroup's port is dropped, so every flow has one
+writer) or `RxRingV4Writer` (tests/replay). Spec: `RingV4Spec` (owned global DMs <= 16, their
+t_int_factor and t_buf, n_stream <= 64, format, per-stream n_values/n_heavy, row_bytes = max
+bytes_per_sample rounded to 8; retention t_buf x tif x 32.768 us >= 20 s (for_node rounds t_buf up to whole
+201.3 ms cycles); `RingV4Spec.for_node(plan, value_map, opoint, node_index=i, rule=...)`, JSON via
+`search_rx make-ring4-spec`). Gridded ns2 cint4 node 0: 12 DMs, ~35 GB.
+Segment `/dev/shm/<name>`: header 135168 B (static description, 32 writer counters, per-DM and
+per-stream descriptors, per-(dm, stream) flow state), then per DM tags u64 [stream][t_buf] and steps
+f32 [stream][t_buf][2], then per DM data u8 [stream][t_buf][row_bytes] (page aligned). Row `seq` of a
+(dm, stream) is at index seq % t_buf, seq = the frame's seq_first + i (absolute, time-aligned).
+Row tag = seq (bits 0-55) | state (bits 56-63: PRESENT / HOLE / MISMATCH, + RFI_WARM / NOISE_WARM /
+ROW_GUARD); 0 = never written; all-ones = WRITING. Writer seqlock per row: tag = WRITING; write steps,
+row bytes (padding zeroed); tag = seq | state (release). Flow state (single writer): complete_through
+(every row below is final), max_end, last_progress_ns, gap_since_ns, per-flow counters. A missing row
+becomes a zero-filled HOLE once 64 rows behind max_end or after a 50 ms gap (the RX threads sweep every
+10 ms and refresh a heartbeat). Late data for a final row is dropped and counted; a jump beyond
+retention restarts the flow (counted). Ingest validation counters: datagrams, ok, bad_length/magic/
+version/flags/field/time, not_owned, tier_mismatch, format_mismatch (n_sub, bits, kind, n_grid,
+s_main/s_heavy, row size), stream_mismatch (n_values/n_heavy), pattern_mismatch (rows written as
+zero-filled MISMATCH), v1_frames, port_mismatch.
+Readers (`RxRingV4Reader`, `transport/recv_ring.py`) NEVER write the segment: `access="mmap"` maps it
+PROT_READ (zero-copy views; `data_writable=True` adds a RW mapping of the data region only, for
+`cudaHostRegister` without the ReadOnly flag) and `access="pread"` maps nothing (pread/preadv into
+caller buffers, e.g. pinned host memory). Both return identical bytes and validity (tested; CP1 times
+both under load, ledger E5). Reader-side counters live in the reader process. API for WS-S / WS-D:
+- `RxRingV4Reader.open(shm_name, *, access="mmap"|"pread", attach_timeout_s=0, data_writable=False)`;
+  `close()`; `dms() -> [DmInfo(dm, local, t_int_factor, t_buf, reorder_rows, sample_period_s,
+  retention_s)]`; `.fmt` (`RingFormat`: n_stream, n_sub, row_bytes, bits_main, bits_heavy, value_kind,
+  n_grid, quant_mode, s_main, s_heavy); `streams() -> [StreamInfo(stream, n_values, n_heavy,
+  bytes_per_sample, pattern_id)]`.
+- `wait_window(dm, t_first, n_rows, *, min_streams=ceil(15/16 n_stream), grace_s=0.25, deadline_s=1.0,
+  timeout_s=None, poll_s=0.001, copy=False, out=None, stall_warn_s=3.0) -> RingWindow` (unpacks as
+  `view, validity`; `.status` complete | fan_in | deadline | lapped | timeout; `.n_final_streams`,
+  `.waited_s`, `.zero_copy`, `.usable`). Fan-in per DM: complete when every stream is final through the
+  window; fan_in once >= min_streams are and grace_s has passed; deadline once deadline_s has passed
+  since the first stream was final (no freeze when a corr node is out); stall WARNING naming the behind
+  streams every stall_warn_s. `view` is uint8 [n_stream, n_rows, row_bytes]; zero-copy views keep
+  STALE bytes in rows without RV_PRESENT (the consumer zeroes them); copies (copy=True, out=, or pread
+  access) are zero-filled.
+- validity uint8 [n_stream, n_rows]: RV_PRESENT 1, RV_HOLE 2, RV_PATTERN_MISMATCH 4, RV_MISSING 8,
+  RV_LAPPED 16, RV_RFI_WARMING_UP 32, RV_NOISE_WARMUP 64, RV_ROW_GUARD 128. Use a row iff RV_PRESENT.
+- `copy_window(dm, t_first, n_rows, *, out=None, with_steps=False)`; `recheck(window) -> n_lapped`
+  (after a zero-copy DMA; lapped rows become RV_LAPPED); `window_validity`; `view`.
+- `heads(dm)` (complete_through / max_end / last_progress_ns per stream), `live_edge(dm, min_streams=)`,
+  `oldest(dm)`, `frontier(native_end, dms=None)` (per-DM coverage), `flow_stats(dm)`.
+- `snapshot(native_first, native_end, *, dms=None, pad_rows={dm: (pre, post)}, deadline_s=15,
+  poll_s=0.01) -> {dm: DmSnapshot(dm, t_int_factor, seq0, n_rows, codes [stream, row, row_bytes], steps
+  [stream, row, 2], valid, row0_seq [stream], row0_t0_native [stream], bytes_per_sample [stream],
+  complete_through, coverage, status complete | deadline | too_late)}` — the §9 raw-window / cutout
+  input; waits (never blocking the writer) until every stream is final or the deadline.
+- `counters()` (writer counters + per-DM flow aggregates + this reader's windows by status, rows by
+  validity, overruns, stall warnings, snapshots), `stall_report(stall_s)`, `heartbeat_age_s()`,
+  `writer_state`, `generation`.
+Monitoring: `search_rx --mon-cn <cn>` publishes `/mon/search_rt/<cn>/rx` = {rx_gbps,
+rx_datagrams_per_s, loss_frac (lost rows / rows), rejected_per_s, pattern_mismatch_per_s,
+stalled_streams, heartbeat_age_s, ring, ts_wall_unix} at 2 Hz.
+1x / v3: unchanged (`RxRing`, `ProductionRxRingSource`, recv_epoll v3 path). Passive 1x recordings:
+`tools/x2/rx_recorder.py` (pread only, self-guarded; production use is the user's decision).
 
 ## 7. Search engine contract [FREEZE: WS-S]
 Per half: owned DMs from the plan; per-DM cubes (hop 384 tier-A / 192 tier-B samples, cycle 201.3 ms

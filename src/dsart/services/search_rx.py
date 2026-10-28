@@ -275,6 +275,279 @@ class SearchRxService:
 
 
 # ---------------------------------------------------------------------------
+# x2: ring v4 mode (frame v2; SPEC §5/§6). The v3 service above is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def build_search_rx_mon_key(cn: int) -> str:
+    """``/mon/search_rt/<cn>/rx`` (WS-D monitoring, D11)."""
+    return f"/mon/search_rt/{int(cn)}/rx"
+
+
+class RxMonPublisher:
+    """Small ``/mon/search_rt/<cn>/rx`` payload at a few Hz: rx_gbps,
+    datagrams/s, row loss fraction, rejected frames, stalled streams.
+    ``store`` is a DsaStore-like object (``put_dict``); created lazily from
+    dsautils when None. An etcd failure never stops the RX."""
+
+    def __init__(self, cn: int, *, store=None) -> None:
+        self.cn = int(cn)
+        self.key = build_search_rx_mon_key(cn)
+        self._store = store
+        self._prev: Optional[dict] = None
+        self.n_published = 0
+        self.n_errors = 0
+
+    @staticmethod
+    def snapshot(rx: RxEpoll, reader) -> dict:
+        c = rx.counters()
+        rc = reader.counters()
+        w = rc["writer"]
+        rows = sum(d["writer"]["rows_written"] for d in rc["per_dm"].values())
+        holes = sum(d["writer"]["rows_hole"] for d in rc["per_dm"].values())
+        rejected = sum(v for k, v in w.items()
+                       if k not in ("datagrams", "ok", "bytes", "sweeps", "pattern_mismatch"))
+        return {"t": time.monotonic(), "bytes": c.bytes_received_total,
+                "datagrams": c.n_received, "rows": rows, "holes": holes,
+                "rejected": rejected, "pattern_mismatch": w["pattern_mismatch"],
+                "heartbeat_age_s": rc["heartbeat_age_s"]}
+
+    def payload(self, snap: dict, stalled_streams: int) -> Optional[dict]:
+        prev, self._prev = self._prev, snap
+        if prev is None:
+            return None
+        dt = max(1e-9, snap["t"] - prev["t"])
+        d_rows = snap["rows"] - prev["rows"]
+        d_holes = snap["holes"] - prev["holes"]
+        return {
+            "rx_gbps": round((snap["bytes"] - prev["bytes"]) * 8 / dt / 1e9, 4),
+            "rx_datagrams_per_s": round((snap["datagrams"] - prev["datagrams"]) / dt, 1),
+            "loss_frac": round(d_holes / (d_rows + d_holes), 7) if d_rows + d_holes else 0.0,
+            "rejected_per_s": round((snap["rejected"] - prev["rejected"]) / dt, 2),
+            "pattern_mismatch_per_s": round(
+                (snap["pattern_mismatch"] - prev["pattern_mismatch"]) / dt, 2),
+            "stalled_streams": int(stalled_streams),
+            "heartbeat_age_s": round(float(snap["heartbeat_age_s"]), 3),
+            "ring": "v4",
+            "ts_wall_unix": round(time.time(), 3),
+        }
+
+    def publish(self, payload: dict) -> bool:
+        try:
+            if self._store is None:
+                from dsautils.dsa_store import DsaStore
+                self._store = DsaStore()
+            self._store.put_dict(self.key, payload)
+            self.n_published += 1
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.n_errors += 1
+            if self.n_errors == 1:
+                LOG.warning("rx mon publish to %s failed: %s (further failures silent)",
+                            self.key, exc)
+            return False
+
+
+def _load_stream_pattern_ids(path: Path) -> Dict[int, int]:
+    """Per-STREAM pattern ids (v4): list (index = stream) or {"<stream>": pid}."""
+    raw = json.loads(path.read_text())
+    if isinstance(raw, list):
+        return {i: int(p) for i, p in enumerate(raw)}
+    return {int(str(k).replace("stream_", "")): int(v) for k, v in raw.items()}
+
+
+class SearchRxV4Service:
+    """search_rx in ring v4 mode: frame-v2 UDP -> ring v4 (owned DMs only)."""
+
+    def __init__(self, *, bind_host: str, port_base: int, n_ports: int, shm_name: str,
+                 spec, so_rcvbuf_bytes: int, n_threads: int = 2, strict_ports: bool = True,
+                 prefault: bool = True, pattern_ids: Optional[Dict[int, int]] = None,
+                 status_interval_s: float = 5.0, mon_cn: Optional[int] = None,
+                 mon_interval_s: float = 0.5, mon_store=None,
+                 stall_warn_s: float = 3.0, unlink_shm_on_exit: bool = True) -> None:
+        self.bind_host = bind_host
+        self.port_base = int(port_base)
+        self.n_ports = int(n_ports)
+        self.shm_name = shm_name
+        self.spec = spec
+        self.so_rcvbuf_bytes = int(so_rcvbuf_bytes)
+        self.n_threads = int(n_threads)
+        self.strict_ports = bool(strict_ports)
+        self.prefault = bool(prefault)
+        self.pattern_ids = dict(pattern_ids or {})
+        self.status_interval_s = float(status_interval_s)
+        self.mon = RxMonPublisher(mon_cn, store=mon_store) if mon_cn is not None else None
+        self.mon_interval_s = float(mon_interval_s)
+        self.stall_warn_s = float(stall_warn_s)
+        self.unlink_shm_on_exit = bool(unlink_shm_on_exit)
+        self._rx: Optional[RxEpoll] = None
+        self._reader = None
+        self._stopping = False
+
+    def setup(self) -> None:
+        from ..transport.recv_ring import unlink_ring_v4
+        rx = RxEpoll.open(bind_host=self.bind_host, bind_port=self.port_base,
+                          so_rcvbuf_bytes=self.so_rcvbuf_bytes)
+        for i in range(1, self.n_ports):
+            rx.add_port(bind_host=self.bind_host, bind_port=self.port_base + i,
+                        so_rcvbuf_bytes=self.so_rcvbuf_bytes)
+        try:
+            rx.attach_ring4(shm_name=self.shm_name, spec=self.spec, prefault=self.prefault,
+                            n_threads=self.n_threads, strict_ports=self.strict_ports)
+        except Exception:
+            rx.close()
+            unlink_ring_v4(self.shm_name)
+            raise
+        for s, pid in self.pattern_ids.items():
+            rx.set_expected_pattern_id4(s, pid)
+        LOG.info("search_rx v4: %d ports from %s:%d, %d threads, ring %s: dms=%s tif=%s "
+                 "t_buf=%s n_stream=%d row_bytes=%d (%.2f GB), %d expected pattern ids",
+                 rx.n_sockets, self.bind_host, self.port_base, self.n_threads, self.shm_name,
+                 list(self.spec.dms), list(self.spec.t_int_factor), list(self.spec.t_buf),
+                 self.spec.n_stream, self.spec.row_bytes_eff, self.spec.size_bytes / 1e9,
+                 len(self.pattern_ids))
+        if not self.pattern_ids:
+            LOG.warning("search_rx v4: no expected pattern ids; every value map is accepted")
+        self._rx = rx
+        self._reader = rx.ring4_reader(access="pread")
+
+    def start(self) -> None:
+        assert self._rx is not None, "call setup() first"
+        self._rx.start()
+
+    def request_stop(self) -> None:
+        self._stopping = True
+
+    def status_once(self) -> dict:
+        """One status record (also what the periodic log line prints)."""
+        r = self._reader
+        rep = r.stall_report(stall_s=self.stall_warn_s)
+        stalled = sum(len(v["stalled"]) for v in rep["dms"].values())
+        edges = {d.dm: r.live_edge(d.dm) for d in r.dms()}
+        return {"counters": r.counters(), "stalled_streams": stalled,
+                "stall_report": rep, "live_edge": edges}
+
+    def run_status_loop(self) -> None:
+        assert self._rx is not None
+        next_status = time.monotonic() + self.status_interval_s
+        next_mon = time.monotonic()
+        while not self._stopping:
+            time.sleep(0.05)
+            now = time.monotonic()
+            if self.mon is not None and now >= next_mon:
+                next_mon = now + self.mon_interval_s
+                rep = self._reader.stall_report(stall_s=self.stall_warn_s)
+                stalled = sum(len(v["stalled"]) for v in rep["dms"].values())
+                p = self.mon.payload(RxMonPublisher.snapshot(self._rx, self._reader), stalled)
+                if p is not None:
+                    self.mon.publish(p)
+            if now >= next_status:
+                next_status = now + self.status_interval_s
+                st = self.status_once()
+                w = st["counters"]["writer"]
+                LOG.info("rx4_status: %s", json.dumps({
+                    k: w[k] for k in ("datagrams", "ok", "bad_version", "v1_frames", "not_owned",
+                                      "format_mismatch", "stream_mismatch", "pattern_mismatch",
+                                      "port_mismatch", "tier_mismatch", "bad_length")}))
+                per_dm = {d: {k: v["writer"][k] for k in ("rows_written", "rows_hole", "rows_late",
+                                                           "resyncs", "streams_started")}
+                          for d, v in st["counters"]["per_dm"].items()}
+                LOG.info("rx4_dm: live_edge=%s per_dm=%s", st["live_edge"], per_dm)
+                if st["stalled_streams"]:
+                    LOG.warning("rx4_stall: %d stream(s) without progress > %.1f s: %s",
+                                st["stalled_streams"], self.stall_warn_s,
+                                {d: v["stalled"] for d, v in st["stall_report"]["dms"].items()
+                                 if v["stalled"]})
+
+    def shutdown(self) -> None:
+        from ..transport.recv_ring import unlink_ring_v4
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+        if self._rx is not None:
+            try:
+                self._rx.stop()
+            finally:
+                self._rx.close()
+                self._rx = None
+        if self.unlink_shm_on_exit:
+            unlink_ring_v4(self.shm_name)
+
+
+def _spec_from_args(args):
+    from ..transport.recv_ring import RingV4Spec
+    if args.ring4_spec is not None:
+        return RingV4Spec.from_dict(json.loads(args.ring4_spec.read_text()))
+    raise SystemExit("--ring-version 4 needs --ring4-spec (see `search_rx make-ring4-spec`)")
+
+
+def make_ring4_spec(argv: Optional[List[str]] = None) -> int:
+    """``search_rx make-ring4-spec``: the v4 ring spec JSON of one search node
+    from WS-P's plan + value map (antenna positions npz with antpos_e/n/u +
+    station, e.g. tests/fixtures/x2/dsa110_antpos.npz)."""
+    import numpy as np
+    from ..grid.baseline_grid import build_value_map_for_opoint
+    from ..grid.sparsity_pattern import core_baseline_mask_from_station_numbers
+    from ..transport.recv_ring import RingV4Spec
+    from ..x2.opoint import opoint_from_id
+    from ..x2.plan import TieredDmPlan
+    from ..x2.quant import RowRule
+
+    p = argparse.ArgumentParser(prog="search_rx make-ring4-spec")
+    p.add_argument("--plan", type=Path, required=True)
+    p.add_argument("--opoint", required=True, help="e.g. 2x-gridded-ns2-cint4")
+    p.add_argument("--node-index", type=int, required=True, help="0..3 in N_SEARCH order")
+    p.add_argument("--antpos-npz", type=Path, required=True)
+    p.add_argument("--dec-deg", type=float, required=True)
+    p.add_argument("--retention-s", type=float, default=20.0)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--pattern-ids-out", type=Path, default=None)
+    a = p.parse_args(argv)
+    op = opoint_from_id(a.opoint)
+    plan = TieredDmPlan.from_npz(a.plan)
+    z = np.load(a.antpos_npz)
+    mask = core_baseline_mask_from_station_numbers(z["station"])
+    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"], antpos_u=z["antpos_u"],
+                                    is_core_baseline_mask=mask, dec_deg=a.dec_deg)
+    rule = RowRule.for_format(op.bits_main, op.n_sub)
+    spec = RingV4Spec.for_node(plan, vm, op, node_index=a.node_index, rule=rule,
+                               retention_s=a.retention_s)
+    a.out.write_text(json.dumps(spec.to_dict(), indent=1))
+    if a.pattern_ids_out is not None:
+        a.pattern_ids_out.write_text(json.dumps([int(x) for x in vm.stream_pattern_ids]))
+    print(json.dumps({"dms": list(spec.dms), "size_gb": spec.size_bytes / 1e9,
+                      "pattern_id": f"0x{vm.pattern_id:016x}"}))
+    return 0
+
+
+def main_v4(args) -> int:
+    pids = None
+    if args.pattern_id_file is not None:
+        pids = _load_stream_pattern_ids(args.pattern_id_file)
+    svc = SearchRxV4Service(
+        bind_host=args.bind_host, port_base=args.port_base, n_ports=args.n_ports,
+        shm_name=args.shm_name, spec=_spec_from_args(args),
+        so_rcvbuf_bytes=args.so_rcvbuf_bytes, n_threads=args.rx_threads,
+        strict_ports=not args.no_strict_ports, prefault=not args.no_prefault,
+        pattern_ids=pids, status_interval_s=args.status_interval_s, mon_cn=args.mon_cn,
+        mon_interval_s=args.mon_interval_s, unlink_shm_on_exit=not args.keep_shm_on_exit)
+    _install_signals(svc)
+    rc = 0
+    try:
+        svc.setup()
+        svc.start()
+        svc.run_status_loop()
+    except KeyboardInterrupt:
+        LOG.info("KeyboardInterrupt; shutting down…")
+    except Exception:  # noqa: BLE001
+        LOG.exception("search_rx v4 crashed")
+        rc = 1
+    finally:
+        svc.shutdown()
+    return rc
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -288,6 +561,9 @@ def _install_signals(svc: SearchRxService) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "make-ring4-spec":
+        return make_ring4_spec(argv[1:])
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -339,6 +615,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "for post-mortem of a crashed compute half).")
     p.add_argument("--log-level", default="INFO",
                    choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    # x2 ring v4 mode (frame v2). Default stays the v3 ring.
+    p.add_argument("--ring-version", type=int, default=3, choices=(3, 4),
+                   help="3 = today's ring (frame v1); 4 = x2 ring v4 (frame v2, owned DMs "
+                        "only; --n-corr/--n-coarse-dm/--t-buf-samples/--n-filled ignored)")
+    p.add_argument("--ring4-spec", type=Path, default=None,
+                   help="v4: RingV4Spec JSON (``search_rx make-ring4-spec``)")
+    p.add_argument("--rx-threads", type=int, default=2,
+                   help="v4: receive threads (socket i -> thread i %% N)")
+    p.add_argument("--no-strict-ports", action="store_true",
+                   help="v4 with 1 thread: accept a stream on any port")
+    p.add_argument("--no-prefault", action="store_true",
+                   help="v4: do not touch every ring page at create")
+    p.add_argument("--mon-cn", type=int, default=None,
+                   help="v4: publish /mon/search_rt/<cn>/rx (rx_gbps, loss_frac, ...)")
+    p.add_argument("--mon-interval-s", type=float, default=0.5)
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -346,6 +637,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+
+    if args.ring_version == 4:
+        return main_v4(args)
 
     bpc = BYTES_CINT8_COMPLEX if args.bytes_per_cell == 2 else BYTES_CFP16_COMPLEX
 
