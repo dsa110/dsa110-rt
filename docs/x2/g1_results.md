@@ -41,7 +41,26 @@ bench defaults to 16 KB (d3e4924). **S1 decided by the user: 2x-gridded-ns4-cint
   CRC errors. The ring reader waits on wall-clock grace per window when streams have holes. -> WS-S:
   data-time release with zero-fill flags, start at the data frontier, a loss/outage test.
 
+## 3. Fleet-load, 60 min — PASSED (2026-10-29 14:26-15:32 UTC)
+Same setup as section 2, engines at WS-S 90f9f01 (data-time fan-in release, sparse valid fraction, quorum
+start), 16 KB sender pacing.
+
+| node | halves | duty | wall p99 (gate <= 181 ms) | chain us/image (gate 4.8) | seeks | start-up skips | cycles | datagram loss (PHY CRC frac) |
+|---|---|---|---|---|---|---|---|---|
+| n01 | 0 / 1 | 0.574 / 0.563 | 163 / 162 | 3.63 / 3.60 | 0 / 0 | 0 / 0 | 19671 | 0 |
+| n02 | 2 / 3 | 0.553 / 0.556 | 158 / 155 | 3.54 / 3.62 | 0 / 0 | 0 / 0 | 19671 | 1.04e-3 (7.2e-4) |
+| n09 | 4 / 5 | 0.552 / 0.555 | 157 / 162 | 3.59 / 3.68 | 0 / 0 | 0 / 0 | 19671 | 0 |
+| n13 | 6 / 7 | 0.528 / 0.522 | 147 / 146 | 3.55 / 3.55 | 0 / 0 | 0 / 0 | 19671 | 0 |
+
+- 12.2 Gb/s, 211k datagrams/s per search node for 60 min; TX 29505 blocks per sender, 0 late, 0 drops;
+  NIC discards 0 everywhere. Search real-time gates met on all 8 halves with duty <= 0.574 (aim 0.6).
+- The only loss is pre-existing PHY CRC corruption on whichever of n01/n02 the run lands on (this hour all on
+  n02, the previous run all on n01; n09/n13 always clean). The engines absorb it (0 seeks). Hardware
+  recommendation: inspect/clean/replace the switch-side optics or cables of n01 and n02.
+- E6: ring v4 per search node = 6 owned DMs (4 tier-A x 38400 rows + 2 tier-B x 19200 rows, 20 s retention),
+  roughly 28-31 GB of the 97.6 GB node; no memory pressure in 60 min. E5: the engines read the ring with
+  `pread` (default), so the mmap NUMA-fault risk does not apply; no lag at any point.
+
 ## Open
-- Engine robustness to packet loss (above), then the >= 1 h fleet-load.
 - Production C sender pacing (16 KB) and corr real-time tail (WS-C), then corr 2x live from replayed
   voltages on all 16 nodes into the real chain.
