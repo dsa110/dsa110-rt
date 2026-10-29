@@ -187,7 +187,8 @@ def test_i1_1x_compat(monkeypatch) -> None:
 
 VOLT_ROOT = Path(os.environ.get("DSART_X2_I1_VOLTAGES", "/home/ubuntu/data/voltages/250924mptq"))
 DM_250924 = 404.688                      # T2_250924mptq.json
-DEC_250924 = 53.848986                   # pointing DEC of the dump (PARALLEL_AGENTS.md §5)
+DEC_250924 = 53.848986                   # the burst's localized DEC: the test steers the phase centre there
+#   (the array pointed at 54.573 deg that night: corr hdf5 phase_center_dec 0.95249 rad)
 TOP_ARRIVAL_250924 = 15248               # native sample of the chgroup-0 top-of-band arrival
                                          # from the dump start (bench/corr_fast_burst_250924mptq.py)
 
@@ -231,6 +232,8 @@ def test_i1_real_burst_250924mptq_gpu(monkeypatch) -> None:
     import importlib.util
     spec_ = importlib.util.spec_from_file_location("x2_i1_replay", U.REPO / "bench" / "_corr_fast_replay.py")
     replay = importlib.util.module_from_spec(spec_)
+    import sys
+    sys.modules[spec_.name] = replay          # dataclasses resolve their module via sys.modules
     spec_.loader.exec_module(replay)
 
     op = opoint_2x("gridded", 2, 8)
