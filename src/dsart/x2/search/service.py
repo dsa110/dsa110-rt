@@ -58,10 +58,12 @@ class CycleScheduler:
         self.k: Optional[int] = None
         self.n_seeks = 0
         self.n_skipped = 0
+        self.n_startup_skipped = 0
+        self._armed = True                      # disarmed while the first cycle runs
 
-    def _ready_cycle(self) -> Optional[int]:
-        """Newest cycle whose rows are complete on every owned DM."""
-        wp = getattr(self.ring, "write_pos", None)
+    def _ready_cycle(self, pos_name: str = "write_pos") -> Optional[int]:
+        """Newest cycle whose rows are released on every owned DM."""
+        wp = getattr(self.ring, pos_name, None)
         if wp is None:
             return None
         return int(min((wp(s.d) - s.max_neg) // s.hop for s in self.plan.dms)) - 1
@@ -74,11 +76,25 @@ class CycleScheduler:
                 self.k = 0 if self.k is None else self.k + 1
                 return self.k
             if self.k is None:
-                if ready >= 0:
-                    self.k = ready
+                # start at the newest cycle the fan-in QUORUM has (the ring
+                # starts empty and its flows start one by one: the deadline
+                # edge would hand out a cycle the data has not reached yet)
+                q = self._ready_cycle("quorum_pos")
+                first = ready if q is None else min(ready, q)
+                if first >= 0:
+                    self.k, self._armed = first, False
                     return self.k
             else:
                 nxt = self.k + 1
+                if not self._armed:
+                    # the lag clock arms after the first cycle (kernel first
+                    # use, history imaging): its backlog is a start-up
+                    # re-anchor to the frontier, not a lag-recovery seek
+                    self._armed = True
+                    if ready - nxt > self.max_lag:
+                        self.n_startup_skipped += ready - nxt
+                        _LOG.info("start-up re-anchor: cycle %d -> %d", nxt, ready)
+                        nxt = ready
                 if ready - nxt > self.max_lag:
                     self.n_seeks += 1
                     self.n_skipped += ready - nxt

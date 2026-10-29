@@ -33,9 +33,14 @@ window ``[t, t + n)`` is released, from ``heads(dm)["complete_through"]``
 
 i.e. ``release_edge = max(min ct, min(ct_need, max ct - grace_rows),
 max ct - deadline_rows)`` -- which is also :meth:`RingV4Source.write_pos`,
-so the scheduler and the window agree. A live consumer waits the same
-grace as the reader's rule (data arrives in real time); a lagging one waits
-nothing. Rows are then taken with ``copy_window`` (seqlock copy, every
+so the scheduler and the window agree. Every term is DATA time: a stream
+that stopped (a corr node out) costs a live consumer a constant ``grace_s``
+of latency for the whole outage -- never a wait per window -- and a lagging
+consumer nothing. ``grace_s`` defaults to 0.1 s: the writer declares a
+lost datagram's rows HOLE (final, zero-filled) once they are
+``reorder_rows`` (64 rows: 34 / 67 ms tier A / B) behind the stream's lead
+or after ``hole_timeout_s`` (50 ms), so a stream that is merely in flight is
+waited for, not zero-filled at the window edge. Rows are then taken with ``copy_window`` (seqlock copy, every
 non-PRESENT row zero-filled; ``access="mmap"`` C helper or ``"pread"``),
 straight into the GPU backend's pinned staging when it asks
 (:meth:`RingV4Source.wait_window_into`). A row is used iff ``RV_PRESENT``.
@@ -140,7 +145,7 @@ class RingV4Source:
     reader are called."""
 
     def __init__(self, reader, *, owned=None, min_streams: Optional[int] = None,
-                 grace_s: float = 0.25, deadline_s: float = 1.0, poll_s: float = 0.001) -> None:
+                 grace_s: float = 0.1, deadline_s: float = 1.0, poll_s: float = 0.001) -> None:
         self.r = reader
         infos = {int(i.dm): i for i in reader.dms()}
         own = sorted(infos) if owned is None else sorted(int(d) for d in owned)
@@ -261,6 +266,12 @@ class RingV4Source:
     def write_pos(self, d: int) -> int:
         """Exclusive release edge (rows below it may be taken now)."""
         return self._edge(self._ct(d), d)
+
+    def quorum_pos(self, d: int) -> int:
+        """Rows final on at least ``min_streams`` streams (the scheduler's
+        start: never a cycle only the deadline rule releases)."""
+        s = np.sort(self._ct(d))
+        return int(s[s.size - self.need])
 
     def frontier(self, d: int) -> dict:
         ct = self._ct(d)

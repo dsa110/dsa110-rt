@@ -77,6 +77,15 @@ class GpuBackend:
         from .kernels_cuda import get_module
 
         cfg = self.eng.cfg
+        # pinned staging at its largest (the first cycle's window, R_s - 1 rows):
+        # cudaHostAlloc of ~100 MB per DM took ~1 s inside cycle 0
+        rb = getattr(self.eng.ring, "row_bytes", None)
+        if rb:
+            for d, x in self.dm.items():
+                st = self.eng.states[d]
+                size = st.spec.n_stream * int(st.R_s) * int(rb)
+                if x.pinned is None or x.pinned.numel() < size:
+                    x.pinned = torch.empty(size, dtype=torch.uint8, pin_memory=True)
         m = get_module()
         for name in ("k0_f2_tile2", "k0_f2_valid", "k0_unpack_cint8", "k23v2p_256",
                      "k23v2_256", "k23_fused_256", "l1_clipstd", "clipstd_rows"):
