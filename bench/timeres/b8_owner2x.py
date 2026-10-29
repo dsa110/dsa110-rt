@@ -341,7 +341,7 @@ K1_VARIANTS = ("triton", "staged")
 K3B_IMPLS = ("v1", "fused", "cuda", "reg")
 CHAIN_GATE_US = 4.8          # us/image, all-in compute chain (ledger E1)
 DUTY_AIM, DUTY_GATE = 0.6, 0.75
-STAGES = ("k0", "k1", "fft", "l1", "k3b", "topk")     # compute stream (h2d overlaps on copy)
+STAGES = ("k0", "k1", "fft", "l1", "k3b", "topk", "l2")   # compute stream (h2d overlaps on copy)
 
 
 def _plan_for(op, plan_path: str = ""):
@@ -745,17 +745,87 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
                 compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max")
 
 
+class _FakeRecording:
+    """WS-T ``Recording`` duck type over an in-memory 1x payload."""
+
+    def __init__(self, payload, t0):
+        from dsart.x2.search.replay import F_WRITTEN, VF_DATA_PRESENT
+        import numpy as np
+        self.p, self.t0 = payload, int(t0)
+        T, C, _ = payload.shape
+        self.cf = np.full((T, C), F_WRITTEN, np.uint8)
+        self.vf = np.full((T, C), VF_DATA_PRESENT, np.uint16)
+
+    def t_range(self, dm):
+        return self.t0, self.t0 + self.p.shape[0]
+
+    def slots(self, dm, a, b):
+        i, j = a - self.t0, b - self.t0
+        return dict(payload=self.p[i:j], vf=self.vf[i:j], corr_flags=self.cf[i:j])
+
+
 def cmd_compat_1x(a) -> int:
+    """(1) kernel taps: K1 1x CSR vs combine_sparse_v4 bit for bit, K3b box vs
+    production fp16 boxcars; (2) today's production chain composed on CPU
+    (``compat1x.production_cycle_cpu``) vs the owner engine on the GPU in
+    1x-compat (``EngineConfig.compat_1x``) cycle by cycle on a synthetic 1x
+    recording made with the REAL 1x value map: every production candidate
+    matched within t / fine DM / l / m +- 1 and dS/N <= 0.1."""
     _need_gpu()
+    import numpy as np
+
+    from dsart.x2.search.codec import RowFormat
+    from dsart.x2.search.geometry import owner_plan_1x
+    from dsart.x2.search.replay import replay_1x
+    from dsart.x2.search.ring import MemoryRing
+    from dsart.x2.search.synth import Burst, SyntheticSky
+
     res = []
-    # the kernels-level taps (K1 1x CSR vs v4, K3b box vs production) are run here too
-    a2 = argparse.Namespace(out=a.out, fft="cufft,warp", k3b="box,v1,fused", k1="triton",
+    a2 = argparse.Namespace(out=a.out, fft="cufft,warp,fused", k3b="box,v1,fused,reg", k1="triton",
                             k1_formats="", check_1x_csr=True)
     rc = cmd_kernels(a2)
     res.append(dict(check="kernels_taps", status="ok" if rc == 0 else "fail"))
-    _write(Path(a.out), "b8_compat_1x.json", dict(results=res, note=(
-        "full CubePipeline-vs-engine comparison on recorded RX taps runs once WS-T's "
-        "recordings exist (I1/I2); the taps here cover K1, FFT and K3b")))
+    try:
+        op, vm = _value_map("1x")
+        S = len(vm.streams)
+        nfm = max(int(sv.n_values) for sv in vm.streams)
+        cells = []
+        for sv in vm.streams:
+            c = np.full(nfm, -1, np.int64)
+            c[:sv.n_values] = sv.cell_row.astype(np.int64) * 256 + sv.cell_col
+            cells.append(c)
+        lut = np.stack([np.where(c >= 0, c, 0) for c in cells]).astype(np.int32)
+        nf = np.array([(c >= 0).sum() for c in cells], np.int32)
+        fine = 500.0 + 2.0 * (np.arange(25) - 12)
+        plan = owner_plan_1x(coarse_dm=np.array([500.0]), fine_dm=fine,
+                             fine_to_coarse=np.zeros(25, int), owned=[0], n_sub=max(1, S // 16),
+                             csf=8)
+        spec = plan.dms[0]
+        fmt = RowFormat("cint8", n_values=nfm)
+        n_cyc = int(a.cycles)
+        t0, T = 100, (n_cyc + 5) * spec.hop + spec.max_pos + spec.max_neg
+        tmp = MemoryRing({0: fmt}, S, t_buf=T + 8)
+        bursts = [Burst(d=0, f=f, t=t, l=l, m=m, amp=amp) for f, t, l, m, amp in
+                  ((3, 4 * spec.hop + 40, 100, 140, 0.4), (12, 5 * spec.hop + 90, 60, 200, 0.8),
+                   (20, 6 * spec.hop + 15, 180, 70, 1.6))]
+        sky = SyntheticSky(plan=plan, cells={0: cells}, formats={0: fmt}, n_grid=256, seed=5,
+                           bursts=bursts)
+        sky.fill(tmp, spec, t0, T)
+        raw, _ = tmp.wait_window(0, t0, T)
+        payload = np.ascontiguousarray(raw.transpose(1, 0, 2)).view(np.int8)
+        out = replay_1x(_FakeRecording(payload, t0), 0, plan=plan, lut=lut, n_filled=nf,
+                        n_grid=256, n_cycles=n_cyc, fft_mode=a.fft_mode, backend="gpu",
+                        cfg_kw=dict(k1_impl="triton", k3b_impl=a.k3b))
+        n_prod = sum(c["n_prod"] for c in out["cycles"])
+        res.append(dict(check="production_vs_engine_1x", status="ok" if (out["ok"] and n_prod)
+                        else "fail", n_cycles=len(out["cycles"]), n_prod_candidates=n_prod,
+                        fft_mode=a.fft_mode, k3b=a.k3b, cycles=out["cycles"]))
+    except Exception as e:                                       # noqa: BLE001
+        res.append(dict(check="production_vs_engine_1x", status="fail",
+                        error=traceback.format_exc()[-2000:], exc=repr(e)))
+    _write(Path(a.out), "b8_compat_1x.json", dict(results=res))
+    for r in res:
+        print(json.dumps({k: v for k, v in r.items() if k not in ("cycles", "error")}))
     return _status(res)
 
 
@@ -794,14 +864,30 @@ class ClockedRing:
         cyc = self.start_cycle + (time.monotonic() - self.t0) / CYCLE_S
         return int(cyc * spec.hop)
 
+    @property
+    def row_bytes(self):
+        return max(int(p.shape[2]) for p in self.pool.values())
+
     def wait_window(self, d, t_first, n_rows, timeout_s=None):
+        return self.wait_window_into(d, t_first, n_rows, out=None, timeout_s=timeout_s)
+
+    def wait_window_into(self, d, t_first, n_rows, *, out=None, timeout_s=None):
+        """Like RingV4Source: rows copied straight into ``out`` (the engine's
+        pinned staging) -- one host copy, as in production."""
         import numpy as np
         while self.write_pos(d) < t_first + n_rows:
             self.n_wait += 1
             time.sleep(0.0005)
         pool = self.pool[d]
-        idx = np.mod(np.arange(t_first, t_first + n_rows), pool.shape[1])
-        return pool[:, idx], np.ones((pool.shape[0], n_rows), bool)
+        S, n_pool, rb = pool.shape
+        if out is None:
+            out = np.empty((S, n_rows, self.row_bytes), np.uint8)
+        i0 = int(t_first) % n_pool
+        n1 = min(n_rows, n_pool - i0)
+        out[:, :n1, :rb] = pool[:, i0:i0 + n1]
+        if n1 < n_rows:
+            out[:, n1:, :rb] = pool[:, :n_rows - n1]
+        return out, np.ones((S, n_rows), bool)
 
     def counters(self):
         return dict(n_wait=self.n_wait)
@@ -1036,6 +1122,9 @@ def main(argv=None) -> int:
     k.add_argument("--out", default="b8_out")
     x = sub.add_parser("compat-1x")
     x.add_argument("--out", default="b8_out")
+    x.add_argument("--cycles", type=int, default=4)
+    x.add_argument("--fft-mode", dest="fft_mode", default="fused", choices=("warp", "fused", "pruned"))
+    x.add_argument("--k3b", default="reg", choices=("v1", "fused", "cuda", "reg"))
     e = sub.add_parser("engine")
     e.add_argument("--gpus", default="0,1")
     e.add_argument("--halves", default="",

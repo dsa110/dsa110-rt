@@ -441,11 +441,14 @@ class OwnerEngine:
         tm["k3b_ms"] = 1e3 * (time.perf_counter() - a)
         # Layer-2 (single pass: decode used the state BEFORE this update)
         K = len(self.bank)
-        flat = taps.reshape(K, -1)
-        if flat.shape[1] > cfg.layer2_max_samples:
-            idx = np.linspace(0, flat.shape[1] - 1, cfg.layer2_max_samples).astype(np.int64)
-            flat = flat[:, idx]
-        sig_k = sigma_clipped_std_batched(torch.from_numpy(np.ascontiguousarray(flat)))
+        if self._gpu is not None and isinstance(taps, torch.Tensor):
+            sig_k = self._gpu.layer2_sigma(st, taps, cfg.layer2_max_samples)
+        else:
+            flat = taps.reshape(K, -1)
+            if flat.shape[1] > cfg.layer2_max_samples:
+                idx = np.linspace(0, flat.shape[1] - 1, cfg.layer2_max_samples).astype(np.int64)
+                flat = flat[:, idx]
+            sig_k = sigma_clipped_std_batched(torch.from_numpy(np.ascontiguousarray(flat)))
         vfrac = self._valid_fraction(st, t0)
         cube_valid = vfrac >= cfg.layer2_valid_min_fraction
         _sk, warming = st.layer2.update_and_query(per_kernel_sigma=sig_k, valid=cube_valid)

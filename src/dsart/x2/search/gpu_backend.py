@@ -316,11 +316,34 @@ class GpuBackend:
             tkv = tk.view(-1)[idx]
             ev1 = self._ev(self.compute)
             # D2H on the compute stream (see layer1_sigma)
+            # taps stay on the device: Layer-2 runs there (layer2_sigma)
             out = (vals.cpu().numpy(), idx.cpu().numpy(), tkv.cpu().numpy(), tuple(best.shape),
-                   None if taps is None else taps.cpu().numpy())
+                   taps)
         self._mark(st.spec.d, "k3b", ev0, evm)
         self._mark(st.spec.d, "topk", evm, ev1)
         return out
+
+    def layer2_sigma(self, st, taps: torch.Tensor, max_samples: int) -> torch.Tensor:
+        """Per-filter sigma of the raw tap scores on the device (the CPU path's
+        ``sigma_clipped_std_batched`` over the same ``linspace`` subsample);
+        only K floats come back."""
+        from ...noise_norm.layer1 import sigma_clipped_std_batched
+
+        x = self.dm[st.spec.d]
+        K = int(taps.shape[0])
+        with torch.cuda.stream(self.compute):
+            a = self._ev(self.compute)
+            flat = taps.reshape(K, -1)
+            n = int(flat.shape[1])
+            if n > max_samples:
+                key = (n, int(max_samples))
+                if getattr(x, "l2_idx", (None, None))[0] != key:
+                    x.l2_idx = (key, torch.as_tensor(
+                        np.linspace(0, n - 1, max_samples).astype(np.int64), device=self.dev))
+                flat = flat[:, x.l2_idx[1]]
+            sig = sigma_clipped_std_batched(flat.contiguous())
+            self._mark(st.spec.d, "l2", a, self._ev(self.compute))
+            return sig.cpu()
 
     def pop_gpu_ms(self, by_stage: bool = False) -> dict:
         """Per DM since the last call (syncs): the compute-stream ms summed
