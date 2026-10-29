@@ -1397,8 +1397,10 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
         # queues behind the previous block, which is fine while the queue never holds 2 blocks
         per_blk = max(tl.get("dest_enqueued") or [0]) / max(1, int(s.get("n_blocks_processed", 1)))
         gates["tx_drains_inside_block"] = bool(tl.get("drain_ms")) and tl["drain_ms"]["p99"] < BLOCK_MS
-        gates["tx_queue_below_2_blocks"] = max(tl.get("dest_max_depth") or [1 << 30]) < 2 * per_blk
+        # queue depth vs the regular block (a guard storm legitimately needs more slots; the
+        # queues are sized for that, and an overflow shows up as full_drops above)
         tl["datagrams_per_block_per_dest"] = per_blk
+        tl["max_depth_in_regular_blocks"] = max(tl.get("dest_max_depth") or [0]) / max(per_blk, 1.0)
     return _finish(args.out, "live_2x.json", res, gates)
 
 

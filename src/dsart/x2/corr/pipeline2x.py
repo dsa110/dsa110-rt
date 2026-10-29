@@ -223,6 +223,8 @@ class Corr2xPipeline(PipelinedCorrFast):
                                n_contrib=self.csr.n_contrib, n_heavy=self.n_heavy,
                                rule=self.rule, device=ctx.device,
                                guard_capacity=0 if self.cuda else 8)
+            if self.cuda:
+                pk.prewarm_resolve()                 # no Triton JIT at the first guarded row
             ts = _TierState(ti=ti, name=t.name, dms=np.asarray([t.d0 + c for c in local]),
                             shifts=shifts, geo=geo, D=t.decim, T_native=t.T_native,
                             static_sky=ss, packer=pk)
