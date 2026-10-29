@@ -42,7 +42,7 @@ import numpy as np
 
 __all__ = [
     "REQ_STRUCT", "STATUS_STRUCT", "CutoutRequest", "decode_request", "encode_status",
-    "CutoutImages", "CutoutProducer", "CutoutListener", "make_uploaders",
+    "CutoutImages", "CutoutProducer", "CutoutListener", "make_uploaders", "fine_axis_for_owner",
     "ACCEPTED", "DONE", "PARTIAL", "FAILED",
 ]
 
@@ -139,6 +139,53 @@ def validate_request(req: CutoutRequest, *, plan_id: int, t_ext_us: float) -> in
     if (req.raw_pre_ext + req.raw_post_ext) * t_ext_us * 1e-6 > 4.0 + 1e-9:
         return R_BAD_REQUEST
     return R_OK
+
+
+def fine_axis_for_owner(oplan, plan=None, *, t_ext_native: int) -> Dict[str, np.ndarray]:
+    """The cutout's fine axis + D-axis CSR (WS-D ``schema.fine_axis_for_half``
+    keys and dtypes) for the coarse DMs the ENGINE owns -- ``oplan.dms`` in
+    ascending ``d``, each DM's fines in plan order: the same order
+    :class:`CutoutImages` lays out its planes in, so the two can never
+    disagree when an engine owns only some of its half's DMs.
+    ``fine_dm`` / ``fine_local_idx`` / ``tier`` come from the tiered
+    ``plan`` when given (checked against the owner plan), else from the
+    DmSpecs (tier A -> 0, B -> 1; local index = position in the DM)."""
+    from ..cutout.schema import CutoutError
+
+    specs = sorted(oplan.dms, key=lambda s: s.d)
+    fines = np.concatenate([np.asarray(s.fine_global, np.int64) for s in specs]
+                           or [np.zeros(0, np.int64)])
+    dms = np.array([s.d for s in specs], dtype=np.int64)
+    f2c = np.concatenate([np.full(s.n_fdm, s.d, np.int64) for s in specs]
+                         or [np.zeros(0, np.int64)])
+    t_nat = np.concatenate([np.full(s.n_fdm, s.t_native, np.int64) for s in specs]
+                           or [np.zeros(0, np.int64)])
+    if np.any(t_nat % int(t_ext_native)):
+        raise CutoutError(f"coarse sample {sorted(set(t_nat.tolist()))} not a multiple of "
+                          f"the external sample {t_ext_native}")
+    if plan is not None:
+        if not np.array_equal(np.asarray(plan.fine_to_coarse)[fines], f2c):
+            raise CutoutError("owner plan fines are not the tiered plan's fines of their DMs")
+        fine_dm = np.asarray(plan.fine_dm)[fines]
+        local = np.asarray(plan.fine_local_idx)[fines]
+        tier = np.asarray(plan.fine_tier)[fines]
+    else:
+        fine_dm = np.concatenate([np.asarray(s.fine_dm) for s in specs] or [np.zeros(0)])
+        local = np.concatenate([np.arange(s.n_fdm) for s in specs] or [np.zeros(0, np.int64)])
+        tier = np.concatenate([np.full(s.n_fdm, 1 if s.tier == "B" else 0) for s in specs]
+                              or [np.zeros(0, np.int64)])
+    offset = np.zeros(len(specs) + 1, dtype=np.int32)
+    offset[1:] = np.cumsum([s.n_fdm for s in specs])
+    return {
+        "fine_dm_pc_cc": np.asarray(fine_dm).astype(np.float32),
+        "fine_global_idx": fines.astype(np.int32),
+        "coarse_global_idx": f2c.astype(np.int16),
+        "fine_local_idx": np.asarray(local).astype(np.int16),
+        "tier": np.asarray(tier).astype(np.uint8),
+        "t_step_ext": (t_nat // int(t_ext_native)).astype(np.uint8),
+        "coarse_owned": dms.astype(np.int16),
+        "fine_offset": offset,
+    }
 
 
 class CutoutImages:
@@ -328,12 +375,13 @@ class CutoutProducer:
 
     def build_arrays(self, req: CutoutRequest, snaps: Optional[dict] = None) -> tuple:
         """``(arrays dict, status)`` via WS-D's ``assemble_cutout``."""
-        from ..cutout.schema import assemble_cutout, fine_axis_for_half
+        from ..cutout.schema import assemble_cutout
 
         t0 = int(req.t0_ext)
         src = CutoutImages(self.eng, t0_ext=t0, n_t=int(req.n_t), raw=snaps or {})
-        axis = fine_axis_for_half(self.plan, self.eng.plan.half,
-                                  t_ext_native=self.eng.plan.ext_native)
+        # the engine's own DMs (not the whole half's: an engine may own a subset)
+        axis = fine_axis_for_owner(self.eng.plan, self.plan,
+                                   t_ext_native=self.eng.plan.ext_native)
         rv, ivf = src.valid()
         status = "complete" if rv.all() else "partial"
         mjd = self.clock_mjd(t0) if self.clock_mjd is not None else 0.0
