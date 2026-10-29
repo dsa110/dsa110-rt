@@ -343,6 +343,18 @@ Per (stream, coarse DM) flow, per corr block b (S rows: 256 tier A, 128 tier B; 
 1x-compat keeps v1 exactly: per-row max-abs cint8, codes summed without the scale (`quant.v1_rowmax_cint8`
 == `TransportTx._encode_rows`).
 
+**v1.1 (2026-10-29, integration; ledger S2g; WS-C f35c2c1).** Two changes, both in `quant.py` and the GPU
+packer bit for bit (`RowRule.used_floor` / `reset_factor`; 0 restores v1.0):
+- (a) In steps 2 and 3 a value is *used* iff finite and `|re|` or `|im|` exceeds
+  `f32(f32(1e-6) * sigma_hat_prev)` (while sigma_hat = 0 this is exactly v1.0's "not 0+0i"). Long
+  whole-cube excisions leave float residue (static sky); v1.0 counted it as used, sigma_hat decayed to ~1e-10
+  and the release produced a ~16 s guard storm (WS-C, 30-min replay). v1.1 holds sigma_hat through excision.
+- (b) After the block estimate, if `est > f32(f32(1.5) * sigma_hat)` then `sigma_hat = est` (re-converge in one
+  block after an upward level step).
+Phase 0 tracking re-check (`docs/x2/phase0/scripts/rr_track_v11.py`): every rowrule.md §3 scenario within
+0.0374% (4-bit) / 0.0357% (5-bit) of static (bar 0.04%). Also (corr, 2x only): static sky leaves excised
+samples (exactly 0+0i) at zero.
+
 ## 5. Frame v2 (`src/dsart/transport/prod_frame2.py`) [FROZEN v1 by WS-T, 2026-10-22]
 One datagram = k consecutive rows of ONE (stream, coarse DM) flow. Same magic as v1 and `version` at the
 same offset, so receivers dispatch on bytes 4-5 (`peek_version`). Header 72 B, little-endian, packed:
