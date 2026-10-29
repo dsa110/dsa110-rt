@@ -156,7 +156,7 @@ def test_lagging_consumer_is_not_charged_wall_clock_grace():
     would charge 0.25 s per DM window)."""
     plan, _inputs, mr = _setup()
     d = plan.dms[0].d
-    fake, src = _src(plan, mr)                          # production grace 0.25 s, deadline 1 s
+    fake, src = _src(plan, mr)                          # production grace 0.1 s, deadline 1 s
     fake.ct[d][:] = 3000
     fake.ct[d][5] = 0                                   # stream 5 never arrived
     t = time.monotonic()

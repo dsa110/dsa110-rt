@@ -432,10 +432,25 @@ class OwnerEngine:
         return out.detach().cpu().numpy().astype(np.float64)
 
     def _valid_fraction(self, st: DmState, t0: int) -> float:
+        """Fraction of (fine DM, row) images of the cycle whose every stream
+        row is valid: ``ok[f, t] = all_s valid[s, t0 + t - shifts[f, s]]``.
+        Computed from the INVALID (stream, row) entries only (each spoils the
+        images ``t = row + shifts[f, s] - t0`` of every f): datagram loss makes
+        a few per window, and the dense [F, hop, S] gather cost ~13 ms per DM
+        at ns4 -- 40 ms per cycle of host time on a lossy node (G1 seeks)."""
         sh = st.spec.shifts
-        lo, hi = t0 - int(sh.max()), t0 + st.spec.hop - int(sh.min())   # rows any (f, s) reads
-        if hi - lo <= st.R_s and st.streams.valid[:, np.mod(np.arange(lo, hi), st.R_s)].all():
-            return 1.0                     # every row read is valid (the common case)
+        F, hop = int(sh.shape[0]), int(st.spec.hop)
+        lo, hi = t0 - int(sh.max()), t0 + hop - int(sh.min())       # rows any (f, s) reads
+        if hi - lo <= st.R_s:
+            rows = np.arange(lo, hi)
+            bad_s, bad_w = np.nonzero(~st.streams.valid[:, np.mod(rows, st.R_s)])
+            if bad_s.size == 0:
+                return 1.0                 # every row read is valid (the common case)
+            rel = rows[bad_w][:, None] + sh[:, bad_s].T - t0          # [n_bad, F]
+            hit = (rel >= 0) & (rel < hop)
+            bad = np.zeros((F, hop), dtype=bool)
+            bad[np.nonzero(hit)[1], rel[hit]] = True
+            return float(F * hop - int(bad.sum())) / float(F * hop)   # == ok.mean()
         rows = t0 + np.arange(st.spec.hop)
         sl = np.mod(rows[None, :, None] - st.spec.shifts[:, None, :], st.R_s)  # [F, hop, S]
         ok = st.streams.valid[np.arange(st.spec.n_stream)[None, None, :], sl].all(axis=2)

@@ -865,9 +865,21 @@ def cmd_compat_1x(a) -> int:
 class ClockedRing:
     """Synthetic ring for the engine bench: rows become available at the
     real-time rate; payload drawn from a pre-generated pool (no per-cycle
-    generation cost, no shm)."""
+    generation cost, no shm).
 
-    def __init__(self, plan, formats, pool_rows: int = 4096, seed: int = 0):
+    Loss model (G1: production always loses some datagrams): a datagram is
+    ``rows_per_dg`` consecutive rows of one stream, lost with probability
+    ``loss`` (a fixed hash of (dm, stream, datagram): reproducible, and
+    :meth:`valid_mask` answers for any row range after the run); and
+    ``dropout_streams`` (one corr node = its streams) send nothing for
+    ``dropout_s`` from ``dropout_at_s`` after the start. Missing rows are
+    zero-filled and flagged invalid, as ``copy_window`` does; holes are final
+    at once and the dropped streams are below the fan-in quorum, so the
+    release edge keeps real time (as RingV4Source's)."""
+
+    def __init__(self, plan, formats, pool_rows: int = 4096, seed: int = 0, *,
+                 loss: float = 0.0, rows_per_dg: int = 4, dropout_streams=(),
+                 dropout_at_s: float = 0.0, dropout_s: float = 0.0):
         import numpy as np
         rng = np.random.default_rng(seed)
         self.plan = plan
@@ -880,6 +892,35 @@ class ClockedRing:
         self.t0 = time.monotonic()
         self.start_cycle = 2
         self.n_wait = 0
+        self.loss, self.rows_per_dg = float(loss), max(1, int(rows_per_dg))
+        self.drop = np.zeros(max(s.n_stream for s in plan.dms), bool)
+        self.drop[list(dropout_streams)] = True
+        self.drop_cyc = (self.start_cycle + float(dropout_at_s) / CYCLE_S,
+                         self.start_cycle + (float(dropout_at_s) + float(dropout_s)) / CYCLE_S)
+        self.rows_missing = 0
+
+    def valid_mask(self, d, t_first, n_rows):
+        """``bool [S, n_rows]``: row present (not in a lost datagram, stream
+        not dropped out at that data time)."""
+        import numpy as np
+        spec = self.plan.by_d(d)
+        S = spec.n_stream
+        rows = np.arange(int(t_first), int(t_first) + int(n_rows), dtype=np.int64)
+        v = np.ones((S, rows.size), bool)
+        if self.loss > 0:
+            g = (rows // self.rows_per_dg).astype(np.uint64)[None, :]
+            sd = (np.arange(S, dtype=np.uint64)[:, None] * np.uint64(0xC2B2AE3D27D4EB4F)
+                  + np.full(1, d, np.uint64) * np.uint64(0x165667B19E3779F9))
+            h = g * np.uint64(0x9E3779B97F4A7C15) + sd
+            h ^= h >> np.uint64(29)
+            h *= np.uint64(0xBF58476D1CE4E5B9)
+            h ^= h >> np.uint64(32)
+            v &= (h >> np.uint64(11)).astype(np.float64) * 2.0 ** -53 >= self.loss
+        if self.drop.any() and self.drop_cyc[1] > self.drop_cyc[0]:
+            lo, hi = (int(np.ceil(c * spec.hop)) for c in self.drop_cyc)
+            out = (rows >= lo) & (rows < hi)
+            v[self.drop[:S][:, None] & out[None, :]] = False
+        return v
 
     def dms(self):
         return sorted(self.pool)
@@ -915,10 +956,30 @@ class ClockedRing:
         out[:, :n1, :rb] = pool[:, i0:i0 + n1]
         if n1 < n_rows:
             out[:, n1:, :rb] = pool[:, :n_rows - n1]
+        if self.loss > 0 or self.drop.any():
+            valid = self.valid_mask(d, t_first, n_rows)
+            if not valid.all():
+                out[~valid] = 0                      # as copy_window: missing rows zero-filled
+                self.rows_missing += int((~valid).sum())
+            return out, valid
         return out, np.ones((S, n_rows), bool)
 
     def counters(self):
-        return dict(n_wait=self.n_wait)
+        return dict(n_wait=self.n_wait, rows_missing=self.rows_missing)
+
+
+def _expected_valid_fraction(ring, spec, t0) -> float:
+    """Dense reference of the engine's valid fraction (all streams valid for
+    every (fine DM, row) image of the cycle), from the ring's own mask."""
+    import numpy as np
+    sh = np.asarray(spec.shifts, dtype=np.int64)
+    lo = int(t0) - int(sh.max())
+    n = int(spec.hop) + int(sh.max()) - int(sh.min())
+    v = ring.valid_mask(spec.d, lo, n)                                  # [S, n]
+    t = np.arange(int(spec.hop))
+    idx = (t[None, :, None] - sh[:, None, :]) + int(t0) - lo            # [F, hop, S]
+    ok = v[np.arange(sh.shape[1])[None, None, :], idx].all(axis=2)
+    return float(ok.mean())
 
 
 def _atomic_json(path: Path, obj: dict) -> None:
@@ -964,7 +1025,15 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
                     sum(s.n_fdm * s.hop for s in oplan.dms)))
     head["images_per_s"] = head["images_per_cycle"] / CYCLE_S
     if a.input == "synthetic-ring":
-        ring = ClockedRing(oplan, {s.d: inp.fmt for s in oplan.dms})
+        drop = []
+        for tok in [t for t in str(a.dropout_streams).split(",") if t]:
+            lo_, _, hi_ = tok.partition("-")
+            drop += list(range(int(lo_), int(hi_ or lo_) + 1))
+        ring = ClockedRing(oplan, {s.d: inp.fmt for s in oplan.dms}, loss=a.loss,
+                           rows_per_dg=a.loss_rows_per_dg, dropout_streams=drop,
+                           dropout_at_s=a.dropout_at_s, dropout_s=a.dropout_s)
+        head.update(loss=a.loss, rows_per_dg=a.loss_rows_per_dg, dropout_streams=drop,
+                    dropout_at_s=a.dropout_at_s, dropout_s=a.dropout_s)
     else:
         ring = RingV4Source.open(a.shm_name, owned=[s.d for s in oplan.dms],
                                  access=a.ring_access, attach_timeout_s=a.attach_timeout_s)
@@ -976,7 +1045,8 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
     eng = OwnerEngine(oplan, inputs, ring, cfg)
     sched = CycleScheduler(oplan, ring, max_lag_cycles=8)
     head["engine_status"] = eng.status()
-    rec, stage_ms, images = [], {}, 0
+    from dsart.x2.search.candidates import PARTIAL_FANIN_FLAG
+    rec, stage_ms, images, vf_log = [], {}, 0, []
     t_first = None
     stop = "minutes"
     t_part = time.monotonic()
@@ -1003,6 +1073,10 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
         lag = max(sched.lag_ms(k).values(), default=0.0)
         rec.append(dict(cycle=k, wall_ms=wall, gpu_ms=gpu, lag_ms=lag,
                         n_cand=len(r.candidates), phase_ms=dict(r.phase_ms)))
+        for d_, dr in r.per_dm.items():
+            vf_log.append((int(d_), int(dr.t0), float(dr.valid_fraction),
+                           sum(1 for c in dr.candidates
+                               if dr.valid_fraction < 1.0 and not c.flags & PARTIAL_FANIN_FLAG)))
         now = time.monotonic()
         if now - t_part >= 15.0:
             _atomic_json(part, dict(head, final=False, **_half_summary(rec, stage_ms, images,
@@ -1011,6 +1085,21 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
         if now - t_first >= seconds:
             break
     out = dict(head, final=True, stop=stop, **_half_summary(rec, stage_ms, images, sched, ring))
+    out["startup_skipped_cycles"] = int(getattr(sched, "n_startup_skipped", 0))
+    if hasattr(ring, "valid_mask"):
+        # after the run (the dense reference costs ~13 ms per DM-cycle): the
+        # engine's valid fraction == the ring's mask, and every candidate of a
+        # partial cube carries PARTIAL_FANIN_FLAG
+        by_d = {s.d: s for s in oplan.dms}
+        mism = [x for x in vf_log
+                if _expected_valid_fraction(ring, by_d[x[0]], x[1]) != x[2]]
+        part_ = [x for x in vf_log if x[2] < 1.0]
+        out["fanin_check"] = dict(
+            dm_cycles=len(vf_log), partial_dm_cycles=len(part_),
+            min_valid_fraction=min((x[2] for x in vf_log), default=1.0),
+            valid_fraction_mismatches=len(mism), first_mismatch=mism[:3],
+            unflagged_partial_candidates=int(sum(x[3] for x in vf_log)),
+            rows_missing=int(getattr(ring, "rows_missing", 0)))
     _atomic_json(part, out)
     if hasattr(ring, "close"):
         ring.close()
@@ -1051,12 +1140,16 @@ def _engine_gate(h: dict) -> dict:
     # within 90% of the cycle at p99, no lag-recovery seek, no growing lag; the
     # host's share is reported (host_ms_p99) but gated only through the wall
     wall_p99 = h.get("wall_ms_p99", float("inf"))
+    fc = h.get("fanin_check") or {}
     ok = (h.get("n_cycles", 0) > 0 and h["gpu_duty"] <= DUTY_GATE
+          and not fc.get("valid_fraction_mismatches") and not fc.get("unflagged_partial_candidates")
           and wall_p99 <= 0.9 * 1e3 * CYCLE_S
           and h["lag_ms_last"] <= 2.0 * 1e3 * CYCLE_S and h["lag_recovery_seeks"] == 0
           and h["chain_us_per_image"] <= CHAIN_GATE_US)
     return dict(check="engine", half=h["half"], k1=h["k1"], k3b=h["k3b"],
                 plan_id=h.get("plan_id"), n_dm=h.get("n_dm"),
+                startup_skipped_cycles=h.get("startup_skipped_cycles"),
+                fanin_check=h.get("fanin_check"),
                 images_per_s=h.get("images_per_s"), gpu_ms_mean=h.get("gpu_ms_mean"),
                 wall_ms_p99=h.get("wall_ms_p99"), host_phase_ms=h.get("host_phase_ms"),
                 n_cycles=h.get("n_cycles", 0), stop=h.get("stop"), gpu_duty=h["gpu_duty"],
@@ -1131,7 +1224,11 @@ def _child_args(a) -> list:
             "--bank", a.bank, "--ring-access", a.ring_access,
             "--attach-timeout-s", str(a.attach_timeout_s),
             "--first-data-timeout-s", str(a.first_data_timeout_s),
-            "--idle-stop-s", str(a.idle_stop_s), "--dec-deg", str(a.dec_deg)]
+            "--idle-stop-s", str(a.idle_stop_s), "--dec-deg", str(a.dec_deg),
+            "--loss", str(a.loss), "--loss-rows-per-dg", str(a.loss_rows_per_dg),
+            "--dropout-at-s", str(a.dropout_at_s), "--dropout-s", str(a.dropout_s)]
+    if a.dropout_streams:
+        args += ["--dropout-streams", a.dropout_streams]
     for flag, val in (("--shm-name", a.shm_name), ("--plan", a.plan),
                       ("--antpos-npz", a.antpos_npz)):
         if val:
@@ -1202,6 +1299,13 @@ def main(argv=None) -> int:
     e.add_argument("--fft-mode", dest="fft_mode", default="fused")
     e.add_argument("--bank", default="b3x", choices=("b3x", "box"))
     e.add_argument("--cpu", action="store_true", help="CPU twins (plumbing dry run only)")
+    e.add_argument("--loss", type=float, default=0.0,
+                   help="synthetic ring: datagram loss probability (G1: 3-7e-4 in production)")
+    e.add_argument("--loss-rows-per-dg", dest="loss_rows_per_dg", type=int, default=4)
+    e.add_argument("--dropout-streams", dest="dropout_streams", default="",
+                   help="synthetic ring: streams of a corr node that stops, e.g. 0-3")
+    e.add_argument("--dropout-at-s", dest="dropout_at_s", type=float, default=0.0)
+    e.add_argument("--dropout-s", dest="dropout_s", type=float, default=0.0)
     sub.add_parser("teardown")
     sub.add_parser("_selftest-interp")
     a = ap.parse_args(argv)
