@@ -1073,6 +1073,14 @@ def cmd_live(args) -> int:
                  "--x2-tx-burst-bytes", str(int(args.tx_burst_bytes))]
     if getattr(args, "block0", 0):
         argv += ["--x2-block0", str(int(args.block0))]
+    if getattr(args, "ab_mode", None):
+        # the looped 2 s replay drives the array-burst detector into whole-cube excision from
+        # cube ~414 to ~1995 (zeros, then a guard storm when data returns); 'monitor' detects
+        # without excising
+        if "--rfi-array-burst-mode" in argv:
+            argv[argv.index("--rfi-array-burst-mode") + 1] = args.ab_mode
+        else:
+            argv += ["--rfi-array-burst-mode", args.ab_mode]
     if getattr(args, "plan_id", None):
         argv += ["--plan-id", args.plan_id]
     _set_gpu_env(env)
@@ -1509,6 +1517,8 @@ def main(argv=None) -> int:
     p.add_argument("--block0", type=int, default=0,
                    help="corr_fast --x2-block0: block index of the first page (same on every node)")
     p.add_argument("--plan-id", default=None, help="corr_fast --plan-id (hex)")
+    p.add_argument("--ab-mode", default=None, choices=("flag", "monitor", "off"),
+                   help="override corr_fast --rfi-array-burst-mode (production: flag)")
     p.add_argument("--reader-identity", default="corr_fast")
     p.add_argument("--trace", action="store_true",
                    help="per-block host/GPU trace (DSART_X2_BLOCK_TRACE) + wall histogram in the JSON")
