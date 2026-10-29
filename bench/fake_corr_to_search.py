@@ -1547,6 +1547,11 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
                  for k in ("rows_written", "rows_hole", "rows_late", "rows_dup", "rows_mismatch", "resyncs")}
         loss_all = 1.0 - recv_w / sent_all if sent_all else None
         loss_ex = 1.0 - recv_ex / sent_ex if sent_ex else None
+        # path dependence (G1: the PHY corruption sits on a few corr -> search paths of the fabric)
+        bad_paths = {c: p["loss"] for c, p in pairs.items() if p["loss"] is not None and p["loss"] > 1e-4}
+        good = {c: p for c, p in pairs.items() if c not in bad_paths and p["sent"]}
+        g_sent = sum(p["sent"] for p in good.values())
+        loss_other_paths = (1.0 - sum(p["received"] or 0 for p in good.values()) / g_sent) if g_sent else None
         g = {"loss_le_max_1e-4_crc": loss_ex is not None and loss_ex <= allowed,
              "zero_nic_discards": bool(nd) and discards == 0,
              "zero_rejected": not rejected,
@@ -1558,6 +1563,10 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
                      # PHY packet count also holds small non-test frames)
                      "phy_crc_per_datagram": nd.get("rx_crc_errors_phy", 0) / sent_all if sent_all else None,
                      "rejected": rejected, "pairs": pairs, "silent_streams_by_dm": silent,
+                     "paths_loss_gt_1e-4": bad_paths, "loss_other_paths": loss_other_paths,
+                     "lost_datagrams": sent_all - recv_w if sent_all else None,
+                     "lost_per_crc_error": (sent_all - recv_w) / nd["rx_crc_errors_phy"]
+                     if nd.get("rx_crc_errors_phy") else None,
                      "fan_in_windows": win, "fan_in_timeouts": timeouts,
                      "rows_missing_frac": rows_missing / (rows_missing + rows_present)
                      if rows_missing + rows_present else None,
@@ -1648,6 +1657,15 @@ def replay_markdown(res: dict) -> str:
                  f"{w.get('complete', 0)}/{w.get('fan_in', 0)}/{w.get('deadline', 0)} | "
                  f"{_f(r['rows_missing_frac'], '{:.2e}')} | {_f(r.get('gbps'), '{:.2f}')} | "
                  f"{'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
+    bad = {n: r for n, r in (res.get("search") or {}).items() if r.get("paths_loss_gt_1e-4")}
+    if bad:
+        L += ["", "### Paths with loss > 1e-4 (corr -> search)", "",
+              "| search node | paths (loss) | loss on its other paths | lost datagrams | lost per CRC error |",
+              "|---|---|---|---|---|"]
+        for n, r in bad.items():
+            paths = ", ".join(f"{c} ({v:.1e})" for c, v in sorted(r["paths_loss_gt_1e-4"].items()))
+            L.append(f"| {n} | {paths} | {_f(r.get('loss_other_paths'), '{:.1e}')} | {r.get('lost_datagrams')} | "
+                     f"{_f(r.get('lost_per_crc_error'), '{:.2f}')} |")
     if res.get("lossy_flows"):
         L += ["", "### Lossy corr nodes (reported separately, excluded from the loss gate)", "",
               "| corr node | search node | sent | received | loss |", "|---|---|---|---|---|"]
