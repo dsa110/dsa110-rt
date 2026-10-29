@@ -944,7 +944,8 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
                 "tx", "--mode", "format", "--format", a.format, "--plan", a.plan, "--chgroup", str(g),
                 "--n-tx", str(len(drv.tx_nodes)), "--dests", dl, "--bind-ip", drv.ip.get(n, ""),
                 "--load-factor", str(a.load_factor), "--minutes", str(a.minutes),
-                "--go-file", drv.go_file(), "--antpos-npz", antpos, "--dec-deg", str(a.dec_deg)]
+                "--go-file", drv.go_file(), "--antpos-npz", antpos, "--dec-deg", str(a.dec_deg),
+                "--burst-bytes", str(a.burst_bytes)]
                 + (["--dm-subset", a.dm_subset] if a.dm_subset else [])
                 + (["--nic"] if not drv._is_local(n) else []), f"{name}_tx_{g}_{n}"))
         start = drv.barrier(list(zip(drv.rx_nodes, st_out)) + list(zip(drv.tx_nodes, tx_out)),
@@ -1059,8 +1060,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gap-s", type=float, default=4.0)
     p.add_argument("--frame-bytes", type=int, default=MAX_DATAGRAM)
     p.add_argument("--record-pps", action="store_true", help="(always recorded)")
-    p.add_argument("--burst-bytes", type=int, default=512 << 10,
-                   help="sender back-to-back burst before pacing (incast microbursts vs NIC port buffer)")
+    p.add_argument("--burst-bytes", type=int, default=16 << 10,
+                   help="sender token-bucket depth per destination (G1 2026-10-29: 512 KB -> 1-5.6%% NIC "
+                        "port-buffer discards from incast microbursts; 16 KB -> none up to 17 Gb/s)")
     p.add_argument("--nic-counters", action="store_true")
     p.set_defaults(func=cmd_sweep)
     for name, func in (("fleet-load", cmd_fleet_load), ("snap-live", cmd_snap_live)):
@@ -1074,6 +1076,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--dec-deg", type=float, default=71.63)
         p.add_argument("--retention-s", type=float, default=20.0)
         p.add_argument("--dm-subset", default=None, help="debug: comma list of coarse DMs to send")
+        p.add_argument("--burst-bytes", type=int, default=16 << 10,
+                       help="sender token-bucket depth per destination (see sweep --burst-bytes)")
         p.add_argument("--rx-no-prefault", action="store_true",
                        help="debug: search_rx --no-prefault (small test rings)")
         if name == "fleet-load":
@@ -1098,7 +1102,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--go-file", default=None)
     p.add_argument("--go-timeout-s", type=float, default=1800.0)
     p.add_argument("--frame-bytes", type=int, default=MAX_DATAGRAM)
-    p.add_argument("--burst-bytes", type=int, default=512 << 10)
+    p.add_argument("--burst-bytes", type=int, default=16 << 10)
     p.add_argument("--format", default=None)
     p.add_argument("--plan", default=None)
     p.add_argument("--antpos-npz", default=None)
