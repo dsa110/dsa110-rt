@@ -1200,8 +1200,12 @@ def _health(drv: Driver, chg: dict) -> dict:
     out = {}
     for n in dict.fromkeys(drv.tx_nodes + drv.rx_nodes):
         if n in chg:
-            sh = ("echo corr=$(pgrep -fc '[b]8_corr2x[.]py live') "
-                  f"sentinel=$(test -f {CORR_READY_SENTINEL} && echo 1 || echo 0)")
+            # SigCgt of the corr python: which signals have handlers (a handled signal makes the
+            # blocking semop in psrdada's getNextPage fail -> corr_fast exits; G1 2026-10-29)
+            sh = ("p=$(pgrep -f '^[^ ]*python[^ ]* bench/timeres/[b]8_corr2x[.]py live' | head -1); "
+                  "echo corr=$(pgrep -fc '[b]8_corr2x[.]py live') "
+                  f"sentinel=$(test -f {CORR_READY_SENTINEL} && echo 1 || echo 0) "
+                  "sigcgt=$( [ -n \"$p\" ] && grep SigCgt /proc/$p/status | cut -f2)")
         else:
             sh = ("echo rx=$(pgrep -fc '[s]earch_rx --ring-version') "
                   "engine=$(pgrep -fc '[b]8_owner2x[.]py engine')")
@@ -1348,9 +1352,12 @@ def cmd_fleet_replay(a) -> int:
         res["not_ready_at_start"] = [n for n in drv.tx_nodes if "sentinel=1" not in h.get(n, "")]
         dead = [n for n in drv.tx_nodes if "corr=0" in h.get(n, "")]
         print(f"  at start: not warm {res['not_ready_at_start']} dead {dead}", flush=True)
-        if dead and len(dead) == len(drv.tx_nodes):
-            raise RuntimeError("every corr worker died before the start: "
-                               + _log_tail(drv, dead[0], corr_dir[dead[0]] + ".log"))
+        res["dead_at_start"] = dead
+        if len(dead) > a.max_dead_corr:
+            # a missing chgroup is not a real-time result: stop now instead of running the
+            # whole duration on a broken fan-in quorum (G1 2026-10-29: 2 of 16 died at start-up)
+            res["dead_log_tails"] = {n: _log_tail(drv, n, corr_dir[n] + ".log", 60) for n in dead}
+            raise RuntimeError(f"corr workers dead at the start: {dead}")
         # 5. run: periodic liveness lines
         t_data_end = t_start + a.minutes * 60.0
         while time.time() < t_data_end:
@@ -1783,6 +1790,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collect-timeout-s", type=float, default=900.0,
                    help="max wait after the data end for every corr's live_2x.json")
     p.add_argument("--skip-preflight", action="store_true", help="run despite preflight findings")
+    p.add_argument("--max-dead-corr", type=int, default=0,
+                   help="abort (teardown) when more corr workers than this are dead at the start")
     p.set_defaults(func=cmd_fleet_replay, lead_s=180.0)
     p = sub.add_parser("replay-report", help="re-evaluate a fleet_replay.json (gates + markdown)")
     p.add_argument("--in", dest="input", required=True)
