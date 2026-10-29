@@ -175,6 +175,22 @@ class OwnerService:
         self._stop.set()
 
 
+def _ring_fanin(ring, d: int) -> dict:
+    """Ring v4 fan-in of DM ``d`` for its D11 key (empty for other rings)."""
+    fan = getattr(ring, "fan_in", None)
+    if fan is None:
+        return {}
+    f = fan(d)
+    w = f["windows"]
+    return dict(fanin_last_status=f["last_status"], fanin_last_n_final=int(f["last_n_final"]),
+                fanin_last_wait_ms=float(f["last_waited_ms"]),
+                fanin_windows_complete_total=int(w.get("complete", 0)),
+                fanin_windows_partial_total=int(w.get("fan_in", 0)),
+                fanin_windows_deadline_total=int(w.get("deadline", 0)),
+                fanin_rows_missing_total=int(f["rows_missing"]),
+                fanin_rows_lapped_total=int(f["rows_lapped"]))
+
+
 def mon_payloads(svc: OwnerService, *, opoint: str) -> Dict[str, dict]:
     """``{etcd key: payload}`` for WS-D's D11 keys (``cn`` = search_node_id)."""
     eng, m = svc.eng, svc.mon
@@ -212,6 +228,7 @@ def mon_payloads(svc: OwnerService, *, opoint: str) -> Dict[str, dict]:
             cubes_total=int(m.cubes_total.get(s.d, 0)),
             ring_lag_ms=float(m.lag_ms.get(s.d, 0.0)),
             fanin_streams_present=int(m.fanin.get(s.d, 0)), fanin_streams_expected=s.n_stream,
+            **_ring_fanin(eng.ring, s.d),
             s_k_median=float(np.median(sk)), s_k_max=float(np.max(sk)),
             layer1_sigma_median=float(np.median(sig)), layer1_sigma_min=float(np.min(sig)),
             c1_cands_per_cycle_mean=float(np.mean(m.cands.get(s.d, [0]))), ts_wall_unix=now)
@@ -286,6 +303,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--cutout-root", default="/home/ubuntu/data/c2/cutouts")
     p.add_argument("--mon-interval-s", type=float, default=2.0)
     p.add_argument("--max-cycles", type=int, default=0)
+    p.add_argument("--ring-access", default="pread", choices=("pread", "mmap"),
+                   help="ring v4 read path (SPEC §6; pread maps nothing -- the n13 incident)")
+    p.add_argument("--ring-attach-timeout-s", type=float, default=60.0)
+    p.add_argument("--k3b", default="v1", choices=("v1", "fused", "cuda", "reg"))   # CP1 picks
+    p.add_argument("--k1", default="triton", choices=("triton", "staged"))
     p.add_argument("--log-level", default="INFO")
     a, _unknown = p.parse_known_args(argv)
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO))
@@ -305,11 +327,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     s_main = {8: 0.3534, 10: 0.1932, 12: 0.1055}[int(op.bits_main)]
     s_heavy = {2: 0.0773, 4: 0.0547}[int(op.n_sub)]
     inp = dm_inputs_from_value_map(vm, s_main=s_main, s_heavy=s_heavy, bits_main=op.bits_main)
-    from ...transport.recv_ring import open_ring_v4          # WS-T, SPEC §6
-    ring = open_ring_v4(a.shm_name, owned=[s.d for s in oplan.dms])
+    from .ring import RingV4Source                           # WS-T reader, SPEC §6
+    ring = RingV4Source.open(a.shm_name, owned=[s.d for s in oplan.dms], access=a.ring_access,
+                             attach_timeout_s=a.ring_attach_timeout_s)
+    inputs = {s.d: inp for s in oplan.dms}
+    ring.validate(oplan, inputs, vmap=vm)                    # fail loudly (SPEC §7)
     cfg = EngineConfig(backend="gpu", fft_mode=a.fft_mode,
-                       families=("b3x",) if a.bank == "b3x" else ("b",), wait_timeout_s=10.0)
-    eng = OwnerEngine(oplan, {s.d: inp for s in oplan.dms}, ring, cfg)
+                       families=("b3x",) if a.bank == "b3x" else ("b",), wait_timeout_s=10.0,
+                       k3b_impl=a.k3b, k1_impl=a.k1)
+    eng = OwnerEngine(oplan, inputs, ring, cfg)
     _LOG.info("x2 half %d (%s g%d) status: %s", half, node, a.gpu_half, eng.status())
     pool = C1CyclePool(C1CycleConfig(chan_sum_factor=int(op.chan_sum_factor),
                                      ext_period_us=float(op.t_ext_us)))

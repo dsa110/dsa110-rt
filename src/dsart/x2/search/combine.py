@@ -5,15 +5,17 @@ Stream ring (per owned DM, on the GPU in production): ``int8 [S, V, R, 2]``
 row ``r`` in slot ``r % R``), ``(re, im)`` codes. Time-minor so one
 CSR entry's window is a contiguous run (today's ``transpose_compact_tmajor``
 layout ``[g, k, t, 2]``). Codes stay codes ("codes as today"): K1 decodes
-on load with the per-value constant ``c_v`` (``codec.decode_constants``).
+on load with the per-value step ``c_v`` and weight ``w_v``
+(``codec.decode_constants``).
 
 K1 output: ``uv [F, T, n_act]`` complex64 -- the active half-plane cells
 in :class:`~dsart.x2.search.csr.OwnerCsr` order (column-major), already
 folded (x 0.5) and checkerboarded (x (-1)^(u+w)). The accumulation is
 fp32, one accumulator per component, entries in CSR order; masked
-entries add ``+0.0``; decode is ``(float(code) + off) * c_v`` (exact add,
-one rounding). The Triton kernel performs the same operations in the same
-order, so twin and kernel agree bit for bit. At 1x (``c_v = 1``,
+entries add ``+0.0``; decode is ``((float(code) + off) * c_v) * w_v``
+(exact add, two roundings: SPEC §4.5 ``quant.decode`` then
+``quant.natural_weight``). The Triton kernel performs the same operations
+in the same order, so twin and kernel agree bit for bit. At 1x (``c_v = w_v = 1``,
 ``off = 0``, int8 codes) every partial sum is an integer below 2^24, so
 the result equals ``combine_sparse_v4`` (int32 accumulate, ``0.5f *``,
 sign, round to half) after the final fp16 rounding.
@@ -93,12 +95,14 @@ def k0_rows_to_ring(ring: StreamRing, raw: np.ndarray, valid: np.ndarray, *,
 
 
 def k1_twin(codes: np.ndarray, *, c_v: np.ndarray, offset: float, csr: OwnerCsr,
-            shifts: np.ndarray, t_lo: int, n_t: int) -> np.ndarray:
+            shifts: np.ndarray, t_lo: int, n_t: int,
+            w_v: Optional[np.ndarray] = None) -> np.ndarray:
     """K1 twin: ``uv [F, n_t, n_act]`` complex64 for output rows
     ``t_lo .. t_lo + n_t - 1``.
 
     ``codes`` is the stream ring ``int8 [S, V, R, 2]`` (row ``r`` in slot
-    ``r % R``); ``c_v [S, V]`` float32 decode constants.
+    ``r % R``); ``c_v [S, V]`` float32 decode steps, ``w_v [S, V]`` float32
+    natural weights (None = 1).
     """
     S, V, R, _ = codes.shape
     F = shifts.shape[0]
@@ -109,6 +113,7 @@ def k1_twin(codes: np.ndarray, *, c_v: np.ndarray, offset: float, csr: OwnerCsr,
     acc_im = np.zeros((F, n_t, n_act), dtype=np.float32)
     t = t_lo + np.arange(n_t, dtype=np.int64)
     cv = np.asarray(c_v, dtype=np.float32)
+    wv = np.ones_like(cv) if w_v is None else np.asarray(w_v, dtype=np.float32)
     off = np.float32(offset)
     for j in range(int(ne.max(initial=0))):
         has = ne > j
@@ -117,13 +122,14 @@ def k1_twin(codes: np.ndarray, *, c_v: np.ndarray, offset: float, csr: OwnerCsr,
         v = csr.ent_value[e].astype(np.int64)
         cj = csr.ent_conj[e].astype(bool)
         c = cv[s, v]
+        w = wv[s, v]
         for f in range(F):
             rows = t[:, None] - shifts[f, s][None, :].astype(np.int64)     # [n_t, n_act]
             slot = np.mod(rows, R)
             cre = codes[s[None, :], v[None, :], slot, 0].astype(np.float32)
             cim = codes[s[None, :], v[None, :], slot, 1].astype(np.float32)
-            vre = (cre + off) * c[None, :]
-            vim = (cim + off) * c[None, :]
+            vre = ((cre + off) * c[None, :]) * w[None, :]
+            vim = ((cim + off) * c[None, :]) * w[None, :]
             vim = np.where(cj[None, :], -vim, vim)
             vre = np.where(has[None, :], vre, np.float32(0.0))
             vim = np.where(has[None, :], vim, np.float32(0.0))
