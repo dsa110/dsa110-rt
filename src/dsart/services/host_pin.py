@@ -327,6 +327,105 @@ def _buffer_address_and_size(buf: object) -> tuple[int, int] | None:
     return None
 
 
+def _register_persistent(cudart, addr: int, size: int, *, log: bool = True) -> bool:
+    """``DSART_HOST_PIN_PERSIST=1``: register ``(addr, size)`` once for the life of the
+    process (no finalizer: the memory is a stable shm mapping)."""
+    with _REGISTRY_LOCK:
+        if (addr, size) in _REGISTERED:
+            return True
+    import time as _time
+    _t0 = _time.perf_counter()
+    rval = cudart.cudaHostRegister(
+        ctypes.c_void_p(addr), ctypes.c_size_t(size),
+        ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
+    )
+    _clear_cuda_error(cudart, rval)            # do not leave the error for torch's next check
+    if rval in (0, _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED):
+        if rval == 0:
+            _STATS["register_new"] += 1
+            _STATS["register_ms"] += (_time.perf_counter() - _t0) * 1e3
+        with _REGISTRY_LOCK:
+            _REGISTERED.add((addr, size))
+            n = len(_REGISTERED)
+        if log:
+            LOG.info("host-pinned PSRDADA buffer page (persistent): addr=0x%x size=%d MB "
+                     "(now %d page(s) pinned)", addr, size // (1024 * 1024), n)
+        return True
+    LOG.debug("host-pin: cudaHostRegister(addr=0x%x size=%d) failed rval=%d", addr, size, rval)
+    return False
+
+
+#: CPython layout of psrdada-python's ``Ringbuffer`` (ringbuffer.pxd / the generated
+#: ``struct __pyx_obj_7psrdada_10ringbuffer_Ringbuffer``): PyObject_HEAD, ``key_t _key``,
+#: ``dada_hdu_t *_c_dada_hdu``, ... -- no vtable (no cdef methods)
+_PSRDADA_KEY_OFFSET = 16
+_PSRDADA_HDU_OFFSET = 24
+
+
+def psrdada_page_addresses(reader, key: int) -> tuple[list[int], int] | None:
+    """Every data-block page address (this process's mapping) and the page size of a
+    connected psrdada-python ``Reader``, through libpsrdada's ``dada_hdu_db_addresses`` (the
+    call bfCorr's ``dada_cuda_dbregister`` makes; psrdada is linked statically into the
+    extension, which exports it). The struct offset is verified against the reader's key
+    before anything is dereferenced; None when anything does not check out."""
+    try:
+        import psrdada.reader as _rd  # noqa: PLC0415
+        if not getattr(reader, "isConnected", False):
+            return None
+        base = id(reader)
+        if ctypes.c_ulong.from_address(base + _PSRDADA_KEY_OFFSET).value != int(key):
+            LOG.warning("host-pin: psrdada Reader layout not recognised (key mismatch); "
+                        "pages will be pinned on first use")
+            return None
+        hdu = ctypes.c_void_p.from_address(base + _PSRDADA_HDU_OFFSET).value
+        if not hdu:
+            return None
+        lib = ctypes.CDLL(_rd.__file__)
+        fn = lib.dada_hdu_db_addresses
+        fn.restype = ctypes.POINTER(ctypes.c_void_p)
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+        nb, bs = ctypes.c_uint64(0), ctypes.c_uint64(0)
+        arr = fn(ctypes.c_void_p(hdu), ctypes.byref(nb), ctypes.byref(bs))
+        nbufs, bufsz = int(nb.value), int(bs.value)
+        if not arr or not 0 < nbufs <= 65536 or bufsz <= 0:
+            return None
+        pages = [int(arr[i] or 0) for i in range(nbufs)]
+        if not all(pages):
+            return None
+        return pages, bufsz
+    except Exception:  # noqa: BLE001 -- an optimisation; lazy pinning still works
+        LOG.exception("host-pin: could not read the psrdada page addresses")
+        return None
+
+
+def prepin_psrdada_reader(reader, key: int, expected_bufsz: int | None = None) -> dict:
+    """``DSART_HOST_PIN_PERSIST=1``: register EVERY data-block page of a connected psrdada
+    ``Reader`` now -- before the service reports ready -- instead of on each page's first
+    visit (~30-46 ms per 288 MB page, paid by each of the first ring pass's blocks: 70 at
+    production fada). The later per-block calls then find every page registered. Returns
+    ``{"pages", "registered", "ms", "bufsz"}`` or ``{}`` (flag off / not available)."""
+    if _DISABLED or not _PERSIST:
+        return {}
+    cudart = _get_cudart()
+    if cudart is None:
+        return {}
+    got = psrdada_page_addresses(reader, key)
+    if got is None:
+        return {}
+    pages, bufsz = got
+    if expected_bufsz is not None and bufsz != int(expected_bufsz):
+        LOG.warning("host-pin: psrdada pages are %d B, expected %d; not pre-pinning", bufsz,
+                    int(expected_bufsz))
+        return {}
+    import time as _time
+    t0 = _time.perf_counter()
+    ok = sum(bool(_register_persistent(cudart, a, bufsz, log=False)) for a in pages)
+    ms = (_time.perf_counter() - t0) * 1e3
+    LOG.info("host-pin: pre-pinned %d/%d psrdada pages of %d MB in %.1f s (persistent)",
+             ok, len(pages), bufsz // (1024 * 1024), ms / 1e3)
+    return {"pages": len(pages), "registered": ok, "ms": ms, "bufsz": bufsz}
+
+
 def maybe_register_host_buffer(buf: object) -> bool:
     """Register a host buffer with CUDA so PyTorch H2D copies hit the pinned path.
 
@@ -392,28 +491,7 @@ def maybe_register_host_buffer(buf: object) -> bool:
     # ends at the reader's memoryview); numpy-owned buffers (warm-up dummy pages, benches) can
     # be freed and their address reused, so they keep today's finalizer path
     if _PERSIST and not (isinstance(buf, np.ndarray) and _numpy_base(buf).flags["OWNDATA"]):
-        with _REGISTRY_LOCK:
-            if (addr, size) in _REGISTERED:
-                return True
-        import time as _time
-        _t0 = _time.perf_counter()
-        rval = cudart.cudaHostRegister(
-            ctypes.c_void_p(addr), ctypes.c_size_t(size),
-            ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
-        )
-        _clear_cuda_error(cudart, rval)        # do not leave the error for torch's next check
-        if rval in (0, _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED):
-            if rval == 0:
-                _STATS["register_new"] += 1
-                _STATS["register_ms"] += (_time.perf_counter() - _t0) * 1e3
-            with _REGISTRY_LOCK:
-                _REGISTERED.add((addr, size))
-                n = len(_REGISTERED)
-            LOG.info("host-pinned PSRDADA buffer page (persistent): addr=0x%x size=%d MB "
-                     "(now %d page(s) pinned)", addr, size // (1024 * 1024), n)
-            return True
-        LOG.debug("host-pin: cudaHostRegister(addr=0x%x size=%d) failed rval=%d", addr, size, rval)
-        return False
+        return _register_persistent(cudart, addr, size)
 
     import time as _time
     _t0 = _time.perf_counter()

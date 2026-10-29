@@ -16,20 +16,29 @@ Per (stream, coarse DM) flow, per corr block b of S samples (S = 256 tier A,
    ``y = (f32(re x) * r_v, f32(im x) * r_v)``.
 2. sigma_hat (per flow):
    - block estimate on the subsample ``j % est_stride == 0`` (16): a value is
-     *used* iff both components are finite and it is not exactly 0 (0 + 0i:
-     flagged / excised). With m used values out of M, the block is SKIPPED
-     (no update) when ``m < max(16, ceil(M / 2))`` (< 50% non-zero). Else
+     *used* iff both components are finite and at least one exceeds
+     ``thr = f32(f32(1e-6) * sigma_hat_prev)`` in magnitude (v1.1; with
+     sigma_hat_prev = 0 that is "not exactly 0 + 0i", v1.0's rule: flagged /
+     excised). With m used values out of M, the block is SKIPPED
+     (no update) when ``m < max(16, ceil(M / 2))`` (< 50% used). Else
      ``est = f32(1.4826) * lowmed(|re|, |im| of the used values)`` (2m numbers).
      No outlier exclusion (the median's 50% breakdown point suffices).
    - warm-up: blocks ``b < warmup_blocks`` (8 = the corr static-sky warm-up)
      never touch sigma_hat. The first non-skipped block after it sets
      ``sigma_hat = est``; later ones ``d = est - s; m = alpha * d; s = s + m``
-     (three f32 ops), ``alpha = f32(-expm1(-block_s / 3 s))``.
+     (three f32 ops), ``alpha = f32(-expm1(-block_s / 3 s))`` -- except that
+     (v1.1) ``est > f32(f32(1.5) * s)`` resets ``s = est`` (a level step up
+     re-converges in one block instead of guarding every row for seconds).
      ``est`` is floored at ``f32(1e-30)``.
+   - v1.1 (2026-10-29, ledger S2g; ``RowRule.used_floor`` / ``reset_factor``,
+     0 = v1.0): after a long whole-cube excision the static-sky residue
+     (~1e-9 of sigma) counted as used data, sigma_hat decayed to it, and the
+     release guarded every row for ~16 s. Both rules are inert on stationary
+     noise (est / sigma_hat within 0.993..1.028 over 545 replayed blocks).
    - block b is coded with sigma_hat AFTER its own update. While sigma_hat is
      0 (warm-up, or no valid block yet) every code is NO_DATA.
 3. Row guard (per sample j): ``s_row = f32(1.4826) * lowmed(|re|, |im|)`` over
-   the row's used values (same "used" rule; a row with < 50% used values is
+   the row's used values (same "used" rule and ``thr``; a row with < 50% used values is
    never guarded). The row is GUARDED iff ``s_row > f32(1.5) * sigma_hat``; it
    is then coded with ``sigma_row = s_row`` instead of sigma_hat (a broadband
    noise surge keeps today's per-row 1/scale semantics; on normal noise the
@@ -106,6 +115,10 @@ class RowRule:
     min_count: int = 16
     warmup_blocks: int = 8
     guard_factor: float = 1.5
+    #: v1.1: a value whose |re| and |im| are both <= used_floor * sigma_hat_prev is unused
+    used_floor: float = 1e-6
+    #: v1.1: est > reset_factor * sigma_hat resets sigma_hat = est (0 = never: v1.0)
+    reset_factor: float = 1.5
 
     def __post_init__(self) -> None:
         if self.comp_bits not in (4, 5, 6):
@@ -134,6 +147,18 @@ class RowRule:
     @property
     def alpha_f32(self) -> np.float32:
         return F32(-math.expm1(-self.block_s / self.tau_s))
+
+    @property
+    def used_floor_f32(self) -> np.float32:
+        return F32(self.used_floor)
+
+    @property
+    def reset_factor_f32(self) -> np.float32:
+        return F32(self.reset_factor)
+
+    def used_threshold(self, sigma_prev) -> np.float32:
+        """``thr = f32(f32(used_floor) * sigma_hat_prev)`` (0 while sigma_hat is 0)."""
+        return F32(self.used_floor_f32 * F32(sigma_prev))
 
     @property
     def main_range(self) -> tuple[int, int]:
@@ -180,8 +205,13 @@ def normalise(x: np.ndarray, r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return re.astype(np.float32, copy=False), im.astype(np.float32, copy=False)
 
 
-def _used(re: np.ndarray, im: np.ndarray) -> np.ndarray:
-    return np.isfinite(re) & np.isfinite(im) & ~((re == 0) & (im == 0))
+def _used(re: np.ndarray, im: np.ndarray, thr=F32(0.0)) -> np.ndarray:
+    """Finite, and |re| or |im| above ``thr`` (``thr = 0``: not exactly 0 + 0i)."""
+    t = F32(thr)
+    fin = np.isfinite(re) & np.isfinite(im)
+    with np.errstate(invalid="ignore"):
+        big = (np.abs(re) > t) | (np.abs(im) > t)
+    return fin & big
 
 
 def lower_median(a: np.ndarray) -> np.float32:
@@ -192,11 +222,12 @@ def lower_median(a: np.ndarray) -> np.float32:
 
 
 def robust_estimate(re: np.ndarray, im: np.ndarray,
-                    rule: RowRule) -> tuple[np.float32 | None, int]:
-    """Block estimate on the subsample. Returns ``(est or None, m_used)``."""
+                    rule: RowRule, thr=F32(0.0)) -> tuple[np.float32 | None, int]:
+    """Block estimate on the subsample (``thr``: the used threshold, v1.1).
+    Returns ``(est or None, m_used)``."""
     re = np.asarray(re, dtype=np.float32)
     im = np.asarray(im, dtype=np.float32)
-    used = _used(re, im)
+    used = _used(re, im, thr)
     m = int(used.sum())
     m_min = max(int(rule.min_count), int(math.ceil(rule.min_used_frac * re.size)))
     if m < m_min or m == 0:
@@ -214,17 +245,19 @@ def ema_update(sigma_prev: np.float32, est: np.float32 | None,
     e = F32(est)
     if not (np.isfinite(sp) and sp > 0):
         return e
+    if rule.reset_factor > 0 and e > F32(rule.reset_factor_f32 * sp):
+        return e                                     # v1.1: a step up re-converges at once
     d = F32(e - sp)
     m = F32(rule.alpha_f32 * d)
     return F32(sp + m)
 
 
-def row_scales(re: np.ndarray, im: np.ndarray, rule: RowRule) -> np.ndarray:
+def row_scales(re: np.ndarray, im: np.ndarray, rule: RowRule, thr=F32(0.0)) -> np.ndarray:
     """Per-sample robust scale ``f32(1.4826) * lowmed`` over each row's used
-    values (``re/im [S, V]``); 0 where the row has < 50% used values."""
+    values (``re/im [S, V]``, used threshold ``thr``); 0 where the row has < 50% used values."""
     S, V = re.shape
     out = np.zeros(S, dtype=np.float32)
-    used = _used(re, im)
+    used = _used(re, im, thr)
     need = max(int(rule.min_count), int(math.ceil(rule.min_used_frac * V)))
     for j in range(S):
         u = used[j]
@@ -330,14 +363,15 @@ class RowQuantiser:
         S = x.shape[0]
         re, im = normalise(x, self._r)
         est, m = None, 0
+        thr = rule.used_threshold(self.sigma)           # from sigma_hat BEFORE this block
         if self.blocks_seen >= rule.warmup_blocks:
             sub = slice(0, S, rule.est_stride)
-            est, m = robust_estimate(re[sub], im[sub], rule)
+            est, m = robust_estimate(re[sub], im[sub], rule, thr)
             self.sigma = ema_update(self.sigma, est, rule)
         self.blocks_seen += 1
         sig = F32(self.sigma)
         if sig > 0:
-            srow = row_scales(re, im, rule)
+            srow = row_scales(re, im, rule, thr)
             guarded = srow > F32(F32(rule.guard_factor) * sig)
             sigma_row = np.where(guarded, srow, sig).astype(np.float32)
         else:

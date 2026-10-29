@@ -33,11 +33,11 @@ def test_triton_kernels_compile_for_sm75() -> None:
     res = b8_corr2x.compile_triton_kernels(75)
     bad = {k: v for k, v in res.items() if not v["ok"]}
     assert not bad, bad
-    assert len(res) == 12 and all(v["cubin_bytes"] > 0 for v in res.values())
+    assert len(res) == 13 and all(v["cubin_bytes"] > 0 for v in res.values())
     # the row-rule kernels compile without FMA contraction, and the codes
     # kernel keeps its (q + 1.5*2^23) - 1.5*2^23 rint (not folded away)
     nofma = {k: v for k, v in res.items() if not v["fp_fusion"]}
-    assert len(nofma) == 4 and all(v["ptx_fma"] == 0 for v in nofma.values()), nofma
+    assert len(nofma) == 5 and all(v["ptx_fma"] == 0 for v in nofma.values()), nofma
     for k, v in nofma.items():
         if k.startswith("_codes_kernel"):
             ptx = v["ptx"].upper()

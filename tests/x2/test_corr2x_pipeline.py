@@ -164,6 +164,7 @@ def _run_and_check(kind, monkeypatch, *, device, npkt, value_subset, dms) -> Non
     NQ = npkt * 2 // 8
     ctx, orch, tx, vm, plan, dms, e, n, mask, gn, sentinel = _build(
         kind, monkeypatch, device=device, npkt=npkt, value_subset=value_subset, dms=dms)
+    orch.native0 = 2 * 2048 * 977 - 4096                     # SPEC §5 epoch (2 x armed specnum)
     pages = _pages(npkt)
     outs = []
     for b, p in zip(BLOCKS, pages):
@@ -204,7 +205,7 @@ def _run_and_check(kind, monkeypatch, *, device, npkt, value_subset, dms) -> Non
         blk = rec["block_n"]
         i = BLOCKS.index(blk)
         joined = np.concatenate([Vs[i], Vs[i + 1]], axis=0)
-        assert rec["t0_native"] == blk * NQ * 8
+        assert rec["t0_native"] == orch.native0 + blk * NQ * 8
         assert rec["stream_ids"] == [G * 2, G * 2 + 1]
         ti = 0 if rec["tier"] == "A" else 1
         tier = plan.tiers[ti]

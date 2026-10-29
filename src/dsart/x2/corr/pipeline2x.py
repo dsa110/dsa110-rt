@@ -190,6 +190,11 @@ class Corr2xPipeline(PipelinedCorrFast):
         if self.n_q % self.fv_chunk:
             raise ValueError(f"fv_chunk={fv_chunk} must divide {self.n_q}")
         self.tx2x = tx2x if tx2x is not None else NoOpTx2x()
+        #: absolute native-sample index added to every frame's t0_native (SPEC §5: t0_native =
+        #: 2 x SNAP specnum). block_n x 4096 is the page's offset; corr_fast sets this from the
+        #: capture epoch (``2 x utc_start_specnum - 4096``: page n_in = 1 starts at the armed
+        #: specnum). 0 = relative numbering (benches, tests)
+        self.native0 = 0
         if class_reduce is None:
             class_reduce = vm.kind == "baselines"
         self.class_reduce = bool(class_reduce)
@@ -532,7 +537,8 @@ class Corr2xPipeline(PipelinedCorrFast):
                         ts.packer.resolve_overflow(pk, x)
                     n_tx += int(self.tx2x.transmit_tier(
                         block_n=d.out.block_n - 1, tier=ts.name, dms=ts.dms,
-                        t0_native=q_emit * 8, T_native=ts.T_native, stream_ids=self.stream_ids,
+                        t0_native=int(self.native0) + q_emit * 8, T_native=ts.T_native,
+                        stream_ids=self.stream_ids,
                         packets=pk, rfi_warming_up=d.rfi_warmup,
                     ))
                 if timer is not None:
