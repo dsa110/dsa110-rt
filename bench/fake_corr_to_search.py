@@ -1544,6 +1544,9 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
         search[n] = {"index": j, "sent": sent_all, "received_writer": recv_w, "loss_all": loss_all,
                      "sent_excl_lossy": sent_ex, "received_excl_lossy": recv_ex, "loss_excl_lossy": loss_ex,
                      "phy_crc_frac": crc, "allowed_loss": allowed, "nic_delta": nd, "discards": discards,
+                     # diagnostic: CRC errors per datagram sent (the corruption is size dependent and the
+                     # PHY packet count also holds small non-test frames)
+                     "phy_crc_per_datagram": nd.get("rx_crc_errors_phy", 0) / sent_all if sent_all else None,
                      "rejected": rejected, "pairs": pairs, "silent_streams_by_dm": silent,
                      "fan_in_windows": win, "fan_in_timeouts": timeouts,
                      "rows_missing_frac": rows_missing / (rows_missing + rows_present)
@@ -1618,17 +1621,18 @@ def replay_markdown(res: dict) -> str:
                  f"{_f(r['tx_drops'], '{}')} | {sent} | {'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
     L += ["", "## Corner turn (per search node; loss on the non-lossy flows vs max(1e-4, PHY CRC fraction "
           "over the same window))", "",
-          "| node | sent | loss (excl. lossy) | loss (all) | PHY CRC frac | NIC discards | rejected | "
-          "fan-in windows c/f/d | rows missing | Gb/s | gates |",
-          "|---|---|---|---|---|---|---|---|---|---|---|"]
+          "| node | sent | loss (excl. lossy) | loss (all) | PHY CRC frac | CRC per datagram | NIC discards | "
+          "rejected | fan-in windows c/f/d | rows missing | Gb/s | gates |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for n, r in (res.get("search") or {}).items():
         if r.get("missing"):
-            L.append(f"| {n} | missing | | | | | | | | | FAIL |")
+            L.append(f"| {n} | missing | | | | | | | | | | FAIL |")
             continue
         w = r["fan_in_windows"]
         bad = [k for k, v in r["gates"].items() if not v]
         L.append(f"| {n} | {r['sent']} | {_f(r['loss_excl_lossy'], '{:.2e}')} | {_f(r['loss_all'], '{:.2e}')} | "
-                 f"{_f(r['phy_crc_frac'], '{:.2e}')} | {r['discards']} | {r['rejected'] or 0} | "
+                 f"{_f(r['phy_crc_frac'], '{:.2e}')} | {_f(r.get('phy_crc_per_datagram'), '{:.2e}')} | "
+                 f"{r['discards']} | {r['rejected'] or 0} | "
                  f"{w.get('complete', 0)}/{w.get('fan_in', 0)}/{w.get('deadline', 0)} | "
                  f"{_f(r['rows_missing_frac'], '{:.2e}')} | {_f(r.get('gbps'), '{:.2f}')} | "
                  f"{'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
