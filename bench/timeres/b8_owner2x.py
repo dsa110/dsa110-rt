@@ -8,18 +8,29 @@ Subcommands (exit 0 = every gate passed, 1 = a gate failed, 2 = error):
                                 CUDA K0/K2/K3a compile with NVRTC (compile only); Triton
                                 K1/K3b compile for sm_75 (no launch); CPU twins and the
                                 TRITON_INTERPRET runs agree with their references.
-  kernels --fft cufft,warp --k3b box,b3x --k1-formats all --check-1x-csr
-                                GPU: us/image per stage and variant; K1 1x CSR bit-exact
-                                vs combine_sparse_v4; FFT |d| <= 2e-3 sigma vs float64;
-                                K3b == twin (bit) and box vs production fp16 boxcars
-                                |dS/N| <= 0.02 (+fp16 ulp); chain total vs 4.8 us/image (E1).
+  kernels --fft cufft,warp --k3b box,b3x[,v1,fused] --k1 triton,staged --k1-formats all
+          --check-1x-csr
+                                GPU: us/image per kernel (K0, H2D, K1 per variant, FFT per
+                                variant, Layer-1, K3b per bank x implementation, top-k) per
+                                format; every (K1, FFT, K3b) chain total vs the 4.8 us/image
+                                gate and the worst half's duty vs the 0.6 aim / 0.75 gate
+                                (the best combination per format gates); K1 variants and K3b
+                                implementations bit-exact vs their twins; K1 1x CSR vs
+                                combine_sparse_v4; FFT |d| <= 2e-3 sigma vs float64; K3b box
+                                vs production fp16 boxcars |dS/N| <= 0.02 (+fp16 ulp).
   compat-1x                     GPU: the engine at today's parameters vs production taps
                                 (K1 == v4 bit for bit, image vs fp16 cuFFT+prescale,
                                 detector vs multi_boxcar_argmax).
   engine --gpus 0,1 --input synthetic-ring|rx-v4 --opoint <id> --minutes M
+         [--shm-name /ring --plan p.npz --halves 2j,2j+1 --out DIR]   (WS-T fleet-load form)
+         [--variants staged:reg[,triton:v1] --ring-access pread|mmap]
                                 one owner half per GPU, real-time paced synthetic ring
-                                (in-process; no shm) or ring v4: GPU duty <= 0.75 (aim
-                                0.6), bounded lag, zero ring overruns, host <= 30 ms/cycle.
+                                (in-process; no shm) or ring v4 (RingV4Source); each k1:k3b
+                                variant for M / n_variants minutes: per-stage us/image (CUDA
+                                events), chain total vs 4.8, GPU duty <= 0.75 (aim 0.6),
+                                bounded lag, no lag-recovery seek, host <= 30 ms/cycle;
+                                exit 0 if some variant passes on every half. rx-v4 waits for
+                                the ring (attach) and the first data, stops when data stop.
   teardown                      remove this bench's /dev/shm/dsart-x2-* and temp files.
 
 All JSON goes under --out (a directory). Runs only from the node test copy.
@@ -82,28 +93,33 @@ def check_python() -> list:
 
 
 def check_nvrtc() -> dict:
-    try:
-        import cupy
-        from cupy.cuda import compiler
-    except Exception as e:                                       # noqa: BLE001
-        return dict(check="cuda_nvrtc", status="skip", reason=f"cupy unavailable: {e!r}")
+    """Every owner-engine CUDA source compiled for compute_75 with libnvrtc
+    (no device needed: ``dsart.x2.search.nvrtc``)."""
+    from dsart.x2.search import nvrtc
+    if not nvrtc.available():
+        return dict(check="cuda_nvrtc", status="skip", reason="libnvrtc not found")
+    from dsart.x2.search.filters import FilterBank
+    from dsart.x2.search.k1_staged import k1_source
+    from dsart.x2.search.k3b_cuda import cuda_source
     from dsart.x2.search.kernels_cuda import CUDA_SOURCE
-    opts = ["--std=c++14"]
+    srcs = [(CUDA_SOURCE, ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
+                           "k3a_rowc2r_256")),
+            (k1_source(24), ("k1_staged",))]
+    from dsart.x2.search.k3b_reg import plan_parts, reg_source
+    for bank_name, fb in (("b3x", FilterBank.b3x()), ("box", FilterBank.build())):
+        src, meta = cuda_source(fb, name=f"k3b_cuda_{bank_name}")
+        srcs.append((src, (meta["name"],)))
+        for i, part in enumerate(plan_parts(fb)):
+            src, meta = reg_source(fb, part, name=f"k3b_reg_{bank_name}_{i}")
+            srcs.append((src, (meta["name"],)))
     try:
-        cuda_path = cupy.cuda.get_cuda_path()
-        if cuda_path:
-            opts.append("-I" + os.path.join(cuda_path, "include"))
-    except Exception:                                            # noqa: BLE001
-        pass
-    try:
-        ptx = compiler.compile_using_nvrtc(CUDA_SOURCE, options=tuple(opts), arch="compute_75")
-        names = [n for n in ("k0_unpack_frame2", "k0_unpack_cint8", "k2_colfft_256",
-                             "k3a_rowc2r_256") if n in (ptx if isinstance(ptx, str) else str(ptx))]
+        names = []
+        for src, want in srcs:
+            txt = nvrtc.ptx(src)
+            names += [n for n in want if f".entry {n}" in txt]
         return dict(check="cuda_nvrtc", status="ok", arch="compute_75", kernels=names)
     except Exception as e:                                       # noqa: BLE001
-        msg = repr(e)
-        st = "fail" if ("error" in msg and "CUDA" not in msg[:40]) else "skip"
-        return dict(check="cuda_nvrtc", status=st, error=msg[:2000])
+        return dict(check="cuda_nvrtc", status="fail", error=repr(e)[:2000])
 
 
 def check_triton_compile() -> list:
@@ -130,7 +146,7 @@ def check_triton_compile() -> list:
                         error=repr(e)[:2000])
 
     out = []
-    k1 = dict(codes_ptr="*i8", cv_ptr="*fp32", ptr_ptr="*i32", es_ptr="*i32", ev_ptr="*i32",
+    k1 = dict(codes_ptr="*i8", cv_ptr="*fp32", wv_ptr="*fp32", ptr_ptr="*i32", es_ptr="*i32", ev_ptr="*i32",
               ec_ptr="*i32", hs_ptr="*fp32", sh_ptr="*i32", out_ptr="*fp32", n_act="i32",
               n_t="i32", t_lo="i32", R="i32", V="i32", S="i32", off="fp32")
     out.append(comp(kt._k1_kernel, k1, dict(MAX_NE=64, BLOCK_C=64, BLOCK_T=16), "K1"))
@@ -141,6 +157,18 @@ def check_triton_compile() -> list:
     for order, ln in ((0, 1), (1, 64), (2, 3), (3, 149)):
         out.append(comp(kt._k3b_kernel, k3, dict(LEN=ln, N_C=384, ORDER=order, CHUNK=64,
                                                   BLOCK=128), f"K3b order {order}"))
+    # fused K3b (one generated kernel per bank): tier A n_c 384, tier B 192
+    from dsart.x2.search.filters import FilterBank
+    from dsart.x2.search.k3b_fused import aot_compile
+    for bank_name, fb in (("b3x", FilterBank.b3x()), ("box", FilterBank.build())):
+        for n_c in (384, 192):
+            try:
+                aot_compile(fb, arch=75, n_c=n_c)
+                out.append(dict(check="triton_compile", kernel=f"K3b fused {bank_name} n_c {n_c}",
+                                status="ok"))
+            except Exception as e:                               # noqa: BLE001
+                out.append(dict(check="triton_compile", kernel=f"K3b fused {bank_name} n_c {n_c}",
+                                status="fail", error=repr(e)[:2000]))
     return out
 
 
@@ -225,10 +253,12 @@ def selftest_interp() -> int:
     csr = csr_from_value_cells(cells, n_grid=16)
     codes = rng.integers(-7, 8, size=(3, 10, 8, 2)).astype(np.int8)
     cv = rng.uniform(0.1, 2, size=(3, 10)).astype(np.float32)
+    wv = np.sqrt(rng.integers(1, 900, size=(3, 10)).astype(np.float64)).astype(np.float32)
     sh = rng.integers(0, 3, size=(2, 3)).astype(np.int32)
-    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=sh, t_lo=5, n_t=3)
+    want = k1_twin(codes, c_v=cv, offset=0.0, csr=csr, shifts=sh, t_lo=5, n_t=3, w_v=wv)
     got = k1_combine(torch.from_numpy(codes), torch.from_numpy(cv), csr_tensors(csr, "cpu"),
-                     torch.from_numpy(sh), t_lo=5, n_t=3, block_c=16, block_t=4).numpy()
+                     torch.from_numpy(sh), t_lo=5, n_t=3, block_c=16, block_t=4,
+                     w_v=torch.from_numpy(wv)).numpy()
     ok = np.array_equal(got[..., 0], want.real) and np.array_equal(got[..., 1], want.imag)
     fb = FilterBank.build((1, 2, 4))
     ring = rng.standard_normal((70, 1, 8)).astype(np.float16)
@@ -237,7 +267,11 @@ def selftest_interp() -> int:
     b1, t1, _ = k3b_detect(torch.from_numpy(ring), ring_row0=0, c_first=4, n_c=64,
                            sigma_inv=torch.ones(1), s_inv=np.ones(3), bank=fb, block=8)
     ok &= np.array_equal(b1.numpy(), b0) and np.array_equal(t1.numpy(), t0)
-    print("interp K1/K3b bit-exact:", ok)
+    from dsart.x2.search.k3b_fused import k3b_fused
+    b2, t2, _ = k3b_fused(torch.from_numpy(ring), ring_row0=0, c_first=4, n_c=64,
+                          sigma_inv=torch.ones(1), s_inv=np.ones(3), bank=fb, block=8)
+    ok &= np.array_equal(b2.numpy(), b0) and np.array_equal(t2.numpy(), t0)
+    print("interp K1/K3b v1/K3b fused bit-exact:", ok)
     return 0 if ok else 1
 
 
@@ -264,17 +298,19 @@ def _need_gpu():
         raise RuntimeError("this subcommand needs a GPU (CP1 only)")
 
 
-def _value_map(opoint_id: str):
+def _value_map(opoint_id: str, antpos_npz: str = "", dec_deg: float = DEC_DEG):
+    """WS-P value map of ``opoint_id`` (the same antpos + DEC as WS-T's TX,
+    so the pattern ids match the ring's)."""
     import numpy as np
     from dsart.grid.baseline_grid import build_value_map_for_opoint
     from dsart.grid.sparsity_pattern import core_baseline_mask_from_station_numbers
     from dsart.x2.opoint import opoint_from_id
 
     op = opoint_from_id(opoint_id)
-    z = np.load(FIXTURE)
+    z = np.load(antpos_npz or FIXTURE)
     vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"],
                                     is_core_baseline_mask=core_baseline_mask_from_station_numbers(
-                                        z["station"]), dec_deg=DEC_DEG)
+                                        z["station"]), dec_deg=float(dec_deg))
     return op, vm
 
 
@@ -299,169 +335,344 @@ def _cuda_ms(fn, reps: int = 5) -> float:
     return a.elapsed_time(b) / reps
 
 
+FORMATS_2X = ("2x-gridded-ns2-cint4", "2x-gridded-ns4-cint5", "2x-gridded-ns4-cint4",
+              "2x-baselines-ns4-cint5", "2x-baselines-ns2-cint4", "2x-baselines-ns4-cint4")
+K1_VARIANTS = ("triton", "staged")
+K3B_IMPLS = ("v1", "fused", "cuda", "reg")
+CHAIN_GATE_US = 4.8          # us/image, all-in compute chain (ledger E1)
+DUTY_AIM, DUTY_GATE = 0.6, 0.75
+STAGES = ("k0", "k1", "fft", "l1", "k3b", "topk", "l2")   # compute stream (h2d overlaps on copy)
+
+
+def _plan_for(op, plan_path: str = ""):
+    from dsart.x2.plan import TieredDmPlan, build_tiered_plan_for_opoint
+    if plan_path:
+        return TieredDmPlan.from_npz(plan_path, verify=True)
+    return build_tiered_plan_for_opoint(op)
+
+
+def _half_loads(plan) -> dict:
+    """Per owner half: images per cycle (sum n_fdm x hop) and its DMs."""
+    from dsart.x2.search.geometry import owner_plan_from_tiered
+    out = {}
+    for h in range(int(plan.n_halves)):
+        op_ = owner_plan_from_tiered(plan, half=h)
+        out[h] = dict(images_per_cycle=int(sum(s.n_fdm * s.hop for s in op_.dms)),
+                      n_dm=len(op_.dms), oplan=op_)
+    return out
+
+
+def _split_k3b(arg: str) -> tuple:
+    """``--k3b`` tokens: banks (box, b3x) and implementations (v1, fused)."""
+    toks = [t for t in arg.split(",") if t]
+    banks = [t for t in toks if t in ("box", "b3x")] or ["b3x"]
+    impls = [t for t in toks if t in K3B_IMPLS] or list(K3B_IMPLS)
+    bad = [t for t in toks if t not in ("box", "b3x") + K3B_IMPLS]
+    if bad:
+        raise SystemExit(f"--k3b: unknown {bad} (banks box,b3x; implementations v1,fused)")
+    return banks, impls
+
+
+def _chain_records(fid: str, us: dict, img_per_s: float) -> list:
+    """Every (K1, FFT, K3b) combination of one format: all-in us/image vs
+    the 4.8 gate and the worst half's GPU duty vs the 0.6 aim / 0.75 gate."""
+    out = []
+    fixed = us.get("k0", 0.0) + us.get("l1", 0.0) + us.get("topk", 0.0)
+    for k1v, k1us in us.get("k1", {}).items():
+        for fv, fus in us.get("fft", {}).items():
+            for kv, kus in us.get("k3b", {}).items():
+                tot = fixed + k1us + fus + kus
+                duty = tot * img_per_s * 1e-6
+                out.append(dict(check="chain", format=fid, k1=k1v, fft=fv, k3b=kv,
+                                us_per_image=dict(k0=us.get("k0"), k1=k1us, fft=fus,
+                                                  l1=us.get("l1"), k3b=kus, topk=us.get("topk")),
+                                h2d_us_per_image=us.get("h2d"), total_us=tot,
+                                gate_us=CHAIN_GATE_US, images_per_s_worst_half=img_per_s,
+                                gpu_duty=duty, duty_aim_met=duty <= DUTY_AIM,
+                                status="ok" if (tot <= CHAIN_GATE_US and duty <= DUTY_GATE)
+                                else "fail"))
+    return out
+
+
 def cmd_kernels(a) -> int:
     _need_gpu()
     import numpy as np
     import torch
 
-    from dsart.x2.search.csr import csr_from_lut_1x
+    from dsart.x2.search.combine import k1_twin
     from dsart.x2.search.fft import FftPlan, image_from_uv_torch, image_from_uv_twin
     from dsart.x2.search.filters import FilterBank, k3b_twin
+    from dsart.x2.search.k1_staged import k1_staged, staged_geometry
+    from dsart.x2.search.k3b_cuda import k3b_cuda
+    from dsart.x2.search.k3b_fused import k3b_fused
+    from dsart.x2.search.k3b_reg import k3b_reg
     from dsart.x2.search.kernels_triton import csr_tensors, k1_combine, k3b_detect
-    from dsart.x2.search.combine import k1_twin
     from dsart.x2.search.valuemap import dm_inputs_from_value_map
 
     out = Path(a.out)
     res = []
     dev = torch.device("cuda")
     rng = np.random.default_rng(0)
-    fmts = ["2x-gridded-ns2-cint4", "2x-gridded-ns4-cint5", "2x-gridded-ns4-cint4",
-            "2x-baselines-ns4-cint5", "2x-baselines-ns2-cint4", "2x-baselines-ns4-cint4"]
-    if a.k1_formats not in ("all", ""):
-        fmts = a.k1_formats.split(",")
-    stage_us = {}
-    # ---- K1 per format --------------------------------------------------------------
+    fmts = list(FORMATS_2X) if a.k1_formats == "all" else [f for f in a.k1_formats.split(",") if f]
+    k1_vars = [v for v in a.k1.split(",") if v]
+    banks, impls = _split_k3b(a.k3b)
+    fft_vars = [v for v in a.fft.split(",") if v]
+    hop, n_t = 384, 64
+    # ---- format-independent: K3b (bank x implementation), Layer-1, top-k -------------
+    common = {"k3b": {}}
+    for bank_name in banks:
+        fb = FilterBank.b3x() if bank_name == "b3x" else FilterBank.build()
+        F, P = 18, 65536
+        R = hop + fb.history()
+        ring = torch.randn((R, F, P), device=dev).to(torch.float16)
+        si = torch.ones(F, device=dev)
+        small = ring[:, :2, :4096].contiguous()
+        b0, t0, _ = k3b_twin(small.cpu().numpy(), ring_row0=0, c_first=fb.max_d + fb.max_a,
+                             n_c=64, sigma_inv=np.ones(2, np.float32),
+                             s_inv=(1 / fb.seeds).astype(np.float32), bank=fb)
+        for impl in impls:
+            fn = dict(v1=k3b_detect, fused=k3b_fused, cuda=k3b_cuda, reg=k3b_reg)[impl]
+            try:
+                ms = _cuda_ms(lambda: fn(ring, ring_row0=0, c_first=fb.max_d + fb.max_a,
+                                         n_c=hop, sigma_inv=si, s_inv=1 / fb.seeds, bank=fb),
+                              reps=2)
+                us = 1e3 * ms / (F * hop)
+                b1, t1, _ = fn(small, ring_row0=0, c_first=fb.max_d + fb.max_a, n_c=64,
+                               sigma_inv=si[:2], s_inv=1 / fb.seeds, bank=fb)
+                exact = bool(np.array_equal(b1.cpu().numpy(), b0) and
+                             np.array_equal(t1.cpu().numpy(), t0))
+                entry = dict(check="k3b", bank=bank_name, impl=impl, us_per_image=us,
+                             bit_exact_vs_twin=exact, status="ok" if exact else "fail")
+                if bank_name == "box" and impl == "v1":
+                    entry.update(_k3b_compat_vs_production(fb, dev))
+                    if entry.get("compat_status") == "fail":
+                        entry["status"] = "fail"
+                if bank_name == "b3x":
+                    common["k3b"][impl] = us
+                res.append(entry)
+            except Exception as e:                               # noqa: BLE001
+                res.append(dict(check="k3b", bank=bank_name, impl=impl, status="fail",
+                                error=repr(e)[:1000]))
+        ring = small = None
+    try:
+        F = 18
+        from dsart.x2.search.kernels_cuda import launch_l1
+        img = torch.randn((hop + 150, F, 65536), device=dev).to(torch.float16)
+        lt = torch.randint(0, hop, (F, 10000), dtype=torch.int32, device=dev)
+        lp = torch.randint(0, 65536, (F, 10000), dtype=torch.int32, device=dev)
+        sig = torch.empty(F, device=dev)
+        ms = _cuda_ms(lambda: launch_l1(img, lt, lp, sig, F=F, P=65536, R_img=hop + 150, t0=0,
+                                        M=10000, stream=torch.cuda.current_stream()))
+        common["l1"] = 1e3 * ms / (F * hop)
+        del img
+        best = torch.randn((hop // 64, F, 65536), device=dev)
+        n_top = 224 * hop // 192
+        ms = _cuda_ms(lambda: torch.topk(best.view(-1), n_top))
+        common["topk"] = 1e3 * ms / (F * hop)
+        res.append(dict(check="l1_topk", l1_us_per_image=common["l1"],
+                        topk_us_per_image=common["topk"], status="ok"))
+    except Exception as e:                                       # noqa: BLE001
+        res.append(dict(check="l1_topk", status="fail", error=repr(e)[:1000]))
+    # ---- per format: K0, H2D, K1 variants, FFT variants, chain ------------------------
+    summary = {}
     for fid in fmts:
+        us = dict(k1={}, fft={}, k3b=dict(common["k3b"]), l1=common.get("l1", 0.0),
+                  topk=common.get("topk", 0.0))
         try:
             op, vm = _value_map(fid)
             sm, sh = _steps(op)
             inp = dm_inputs_from_value_map(vm, s_main=sm, s_heavy=sh, bits_main=op.bits_main)
-            S, V = inp.c_v.shape
+            loads = _half_loads(_plan_for(op))
+            wh = max(loads, key=lambda h: loads[h]["images_per_cycle"])
+            img_per_s = loads[wh]["images_per_cycle"] / CYCLE_S
+            spec = max(loads[wh]["oplan"].dms, key=lambda s: s.n_fdm * s.hop)
+            F, S = int(spec.n_fdm), int(spec.n_stream)
+            fm = inp.fmt
+            V = int(inp.c_v.shape[1])
+            # K0 + H2D: one cycle of rows of this DM
+            from dsart.x2.search.codec import as_stream_formats, pack_frame2_rows
+            fms = as_stream_formats(fm, S)
+            rb = fms.row_bytes
+            raw = np.zeros((S, spec.hop, rb), np.uint8)
+            for s_ in range(S):
+                f_ = fms[s_]
+                lo = -(1 << (f_.bits - 1)) + 1
+                re = rng.integers(lo, -lo + 1, size=(spec.hop, f_.n_values))
+                im = rng.integers(lo, -lo + 1, size=(spec.hop, f_.n_values))
+                raw[s_, :, :f_.row_bytes] = pack_frame2_rows(re, im, f_)
+            hraw = torch.from_numpy(raw).pin_memory()
+            draw = hraw.to(dev)
+            dval = torch.ones((S, spec.hop), dtype=torch.uint8, device=dev)
+            R_s = spec.hop + 400
+            codes0 = torch.zeros((S, V, R_s, 2), dtype=torch.int8, device=dev)
+            vout = torch.zeros((S, R_s), dtype=torch.uint8, device=dev)
+            nod = torch.zeros((S,), dtype=torch.int64, device=dev)
+            nv = torch.as_tensor([f_.n_values for f_ in fms.per_stream], dtype=torch.int32,
+                                 device=dev)
+            nh = torch.as_tensor([f_.n_heavy for f_ in fms.per_stream], dtype=torch.int32,
+                                 device=dev)
+            bits = torch.as_tensor([f_.bits for f_ in fms.per_stream], dtype=torch.int32,
+                                   device=dev)
+            from dsart.x2.search.kernels_cuda import launch_k0_tile
+
+            def run_k0():
+                launch_k0_tile(draw, dval, nv, nh, bits, codes0, vout, nod, S=S, n=spec.hop,
+                               row_bytes=rb, V=V, R=R_s, row0=0,
+                               stream=torch.cuda.current_stream())
+            us["k0"] = 1e3 * _cuda_ms(run_k0) / (F * spec.hop)
+            us["h2d"] = 1e3 * _cuda_ms(lambda: hraw.to(dev, non_blocking=True)) / (F * spec.hop)
+            codes0 = None
+            # K1 variants on the plan's real shifts
             R = 2400
             codes = torch.from_numpy(rng.integers(-7, 8, size=(S, V, R, 2)).astype(np.int8)).to(dev)
-            F, n_t = 18, 64
-            shifts = torch.from_numpy(rng.integers(0, 1700, size=(F, S)).astype(np.int32)).to(dev)
+            shifts = torch.as_tensor(spec.shifts, dtype=torch.int32, device=dev)
             ct = csr_tensors(inp.csr, dev)
+            geom = staged_geometry(spec.shifts, n_t=n_t)
+            ct["smax"] = torch.as_tensor(geom.smax, dtype=torch.int32, device=dev)
             cv = torch.as_tensor(inp.c_v, device=dev)
-            ms = _cuda_ms(lambda: k1_combine(codes, cv, ct, shifts, t_lo=2000, n_t=n_t))
-            # bit check on a slice vs the twin
-            sub = k1_combine(codes, cv, ct, shifts[:2], t_lo=2000, n_t=2).cpu().numpy()
+            wv = torch.as_tensor(inp.weights(), device=dev)
             tw = k1_twin(codes.cpu().numpy(), c_v=inp.c_v, offset=0.0, csr=inp.csr,
-                         shifts=shifts[:2].cpu().numpy(), t_lo=2000, n_t=2)
-            exact = bool(np.array_equal(sub[..., 0], tw.real) and np.array_equal(sub[..., 1],
-                                                                                   tw.imag))
-            us = 1e3 * ms / (F * n_t)
-            stage_us.setdefault("k1", {})[fid] = us
-            res.append(dict(check="k1", format=fid, us_per_image=us, bit_exact_vs_twin=exact,
-                            csr=inp.csr.summary(), status="ok" if exact else "fail"))
+                         shifts=spec.shifts[:2], t_lo=2000, n_t=2, w_v=inp.w_v)
+            # staged K1 as the engine runs it: passes of <= 24 fine DMs
+            # (EngineConfig.k1_fdm_per_pass), each with its own window geometry
+            bnd = np.linspace(0, F, -(-F // 24) + 1).astype(int)
+            k1p = []
+            for f0, f1 in zip(bnd[:-1], bnd[1:]):
+                shp = np.ascontiguousarray(spec.shifts[int(f0):int(f1)])
+                gp = staged_geometry(shp, n_t=n_t)
+                cp_ = dict(ct)
+                cp_["smax"] = torch.as_tensor(gp.smax, dtype=torch.int32, device=dev)
+                k1p.append((int(f0), int(f1), torch.as_tensor(shp, dtype=torch.int32, device=dev),
+                            gp, cp_))
+            uv_out = torch.empty((F, n_t, inp.csr.n_active, 2), dtype=torch.float32, device=dev)
+
+            def k1_passes():
+                for f0, f1, shp, gp, cp_ in k1p:
+                    k1_staged(codes, cv, cp_, shp, t_lo=2000, n_t=n_t, w_v=wv, geom=gp,
+                              out=uv_out[f0:f1])
+            for v in k1_vars:
+                if v == "staged":
+                    fn = lambda sh_, nt_: k1_staged(codes, cv, ct, sh_, t_lo=2000,  # noqa: E731
+                                                    n_t=nt_, w_v=wv, geom=geom)
+                else:
+                    fn = lambda sh_, nt_: k1_combine(codes, cv, ct, sh_, t_lo=2000,  # noqa: E731
+                                                     n_t=nt_, w_v=wv)
+                ms = _cuda_ms(k1_passes if v == "staged" else (lambda: fn(shifts, n_t)))
+                sub_ = fn(shifts[:2].contiguous(), 2).cpu().numpy()
+                exact = bool(np.array_equal(sub_[..., 0], tw.real)
+                             and np.array_equal(sub_[..., 1], tw.imag))
+                us["k1"][v] = 1e3 * ms / (F * n_t)
+                res.append(dict(check="k1", format=fid, variant=v, us_per_image=us["k1"][v],
+                                bit_exact_vs_twin=exact, n_fdm=F, spread=geom.spread,
+                                win_w=geom.win_w, entry_chunk=geom.ec,
+                                csr=inp.csr.summary(), status="ok" if exact else "fail"))
+            codes = None
+            # FFT variants on this format's map
+            plan = FftPlan.build(inp.csr)
+            B = F * 64                                 # the engine's batch: F x rows_per_batch
+            uvn = (rng.standard_normal((B, inp.csr.n_active))
+                   + 1j * rng.standard_normal((B, inp.csr.n_active))).astype(np.complex64)
+            G = np.zeros((2, 256, 129), complex)
+            G[:, plan.cell_pos, plan.cell_line] = uvn[:2]
+            exact = np.fft.irfft2(G, s=(256, 256))
+            if plan.fold == "row":
+                exact = np.swapaxes(exact, 1, 2)
+            twin = image_from_uv_twin(uvn[:2], plan, np.ones((256, 256)), out_dtype=None)
+            res.append(dict(check="fft_twin_vs_float64", format=fid, status="ok" if np.max(
+                np.abs(twin - exact)) <= 1e-5 * np.abs(exact).max() else "fail"))
+            sig = float(np.std(exact))
+            uvt = torch.from_numpy(uvn).to(dev)
+            mk = torch.ones((256, 256), device=dev)
+            for v in fft_vars:
+                if v == "cufft":
+                    fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="pruned")  # noqa: E731
+                elif v == "dense":
+                    fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="irfft2")  # noqa: E731
+                elif v in ("warp", "fused", "fused_v1", "fused_v2"):
+                    fn = _warp_runner(uvt, plan, inp, dev, mode=v)
+                else:
+                    continue
+                ms = _cuda_ms(fn)
+                img = fn()[:2].float().cpu().numpy().reshape(2, 256, 256)
+                d = float(np.max(np.abs(img - exact)) / sig)
+                us["fft"][v] = 1e3 * ms / B
+                res.append(dict(check="fft", format=fid, variant=v, us_per_image=us["fft"][v],
+                                max_abs_sigma=d, fold=plan.fold,
+                                status="ok" if d <= 2e-3 else "fail"))
+            chains = _chain_records(fid, us, img_per_s)
+            res += chains
+            if chains:
+                best = min(chains, key=lambda c: c["total_us"])
+                summary[fid] = dict(best={k: best[k] for k in ("k1", "fft", "k3b", "total_us",
+                                                                "gpu_duty", "status")},
+                                    combos={f"{c['k1']}/{c['fft']}/{c['k3b']}":
+                                            dict(total_us=round(c["total_us"], 3),
+                                                 gpu_duty=round(c["gpu_duty"], 3))
+                                            for c in chains},
+                                    worst_half=int(wh), images_per_s=img_per_s)
+                res.append(dict(check="chain_best", format=fid, **summary[fid]["best"],
+                                duty_aim_met=best["gpu_duty"] <= DUTY_AIM))
         except Exception as e:                                   # noqa: BLE001
-            res.append(dict(check="k1", format=fid, status="fail", error=repr(e)[:1000]))
+            res.append(dict(check="format", format=fid, status="fail",
+                            error=traceback.format_exc()[-1500:], exc=repr(e)))
     # ---- 1x CSR vs combine_sparse_v4 ------------------------------------------------
     if a.check_1x_csr:
-        try:
-            from dsart.image.tiled_combine_cuda import (build_inverse_lut, build_sparse_cell_csr,
-                                                        combine_sparse_v4, pad_t)
-            op, vm = _value_map("1x")
-            S = len(vm.streams)
-            nfm = max(sv.n_values for sv in vm.streams)
-            lut = np.zeros((S, nfm), np.int32)
-            nf = np.zeros(S, np.int32)
-            for s, sv in enumerate(vm.streams):
-                lut[s, :sv.n_values] = sv.cell_row.astype(np.int64) * 256 + sv.cell_col
-                nf[s] = sv.n_values
-            t_rows, t_det, F = 300, 256, 25
-            cells = rng.integers(-127, 128, size=(S, t_rows, nfm, 2)).astype(np.int8)
-            dense = torch.zeros((S, nfm, pad_t(t_rows), 2), dtype=torch.int8, device=dev)
-            dense[:, :, :t_rows] = torch.from_numpy(cells.transpose(0, 2, 1, 3).copy()).to(dev)
-            shifts = rng.integers(-20, 20, size=(F, S)).astype(np.int32)
-            csr_v4 = build_sparse_cell_csr(build_inverse_lut(torch.from_numpy(lut).to(dev),
-                                                             torch.from_numpy(nf).to(dev),
-                                                             n_grid=256), n_grid=256)
-            outv4 = torch.zeros((F, t_det, 256, 129), dtype=torch.complex32, device=dev)
-            sh_t = torch.from_numpy(shifts).to(dev)
-            combine_sparse_v4(dense, csr_v4, sh_t, t_rows=t_rows, t_out_len=t_det, t_lo=0,
-                              out=outv4, shift_min=int(shifts.min()), shift_max=int(shifts.max()))
-            csr = csr_from_lut_1x(lut, nf, n_grid=256)
-            ring = torch.zeros((S, nfm, 512, 2), dtype=torch.int8, device=dev)
-            ring[:, :, :t_rows] = dense[:, :, :t_rows]
-            uv = k1_combine(ring, torch.ones((S, nfm), device=dev), csr_tensors(csr, dev),
-                            sh_t, t_lo=0, n_t=t_det)
-            mine = torch.zeros((F, t_det, 256, 129, 2), dtype=torch.float16, device=dev)
-            cu = torch.as_tensor(csr.cell_u, device=dev).long()
-            cw = torch.as_tensor(csr.cell_w, device=dev).long()
-            mine[:, :, cu, cw] = uv.to(torch.float16)
-            eq = bool(torch.equal(torch.view_as_real(outv4), mine))
-            res.append(dict(check="k1_1x_csr_vs_v4", status="ok" if eq else "fail", equal=eq))
-        except Exception as e:                                   # noqa: BLE001
-            res.append(dict(check="k1_1x_csr_vs_v4", status="fail", error=repr(e)[:1000]))
-    # ---- FFT variants -----------------------------------------------------------------
+        res.append(_check_1x_csr(dev, rng))
+    # the gate: per format, the BEST combination must pass (CP1 selects it); every
+    # exactness check must pass; slower combinations are reported, not failed
+    gated = [r for r in res if r["check"] not in ("chain",)]
+    _write(out, "b8_kernels.json", dict(results=res, summary=summary, gate_us=CHAIN_GATE_US,
+                                        duty_aim=DUTY_AIM, duty_gate=DUTY_GATE))
+    for fid, s in summary.items():
+        print(json.dumps(dict(format=fid, **s["best"])))
+    return _status(gated)
+
+
+def _check_1x_csr(dev, rng) -> dict:
+    import numpy as np
+    import torch
+
+    from dsart.x2.search.csr import csr_from_lut_1x
+    from dsart.x2.search.kernels_triton import csr_tensors, k1_combine
     try:
-        op, vm = _value_map("2x-gridded-ns2-cint4")
-        sm, sh = _steps(op)
-        inp = dm_inputs_from_value_map(vm, s_main=sm, s_heavy=sh, bits_main=8)
-        plan = FftPlan.build(inp.csr)
-        B = 64
-        uvn = (rng.standard_normal((B, inp.csr.n_active))
-               + 1j * rng.standard_normal((B, inp.csr.n_active))).astype(np.complex64)
-        G = np.zeros((2, 256, 129), complex)                      # [pos, line]: line = half axis
-        G[:, plan.cell_pos, plan.cell_line] = uvn[:2]
-        exact = np.fft.irfft2(G, s=(256, 256))
-        if plan.fold == "row":
-            exact = np.swapaxes(exact, 1, 2)
-        twin = image_from_uv_twin(uvn[:2], plan, np.ones((256, 256)), out_dtype=None)
-        res.append(dict(check="fft_twin_vs_float64", status="ok" if np.max(np.abs(
-            twin - exact)) <= 1e-5 * np.abs(exact).max() else "fail"))
-        sig = float(np.std(exact))
-        uvt = torch.from_numpy(uvn).to(dev)
-        mk = torch.ones((256, 256), device=dev)
-        for v in a.fft.split(","):
-            if v == "cufft":
-                fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="pruned")  # noqa: E731
-            elif v == "dense":
-                fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="irfft2")  # noqa: E731
-            elif v == "warp":
-                fn = _warp_runner(uvt, plan, inp, dev)
-            else:
-                continue
-            ms = _cuda_ms(fn)
-            img = fn()[:2].float().cpu().numpy().reshape(2, 256, 256)
-            d = float(np.max(np.abs(img - exact)) / sig)
-            stage_us.setdefault("fft", {})[v] = 1e3 * ms / B
-            res.append(dict(check="fft", variant=v, us_per_image=1e3 * ms / B, max_abs_sigma=d,
-                            status="ok" if d <= 2e-3 else "fail"))
+        from dsart.image.tiled_combine_cuda import (build_inverse_lut, build_sparse_cell_csr,
+                                                    combine_sparse_v4, pad_t)
+        op, vm = _value_map("1x")
+        S = len(vm.streams)
+        nfm = max(sv.n_values for sv in vm.streams)
+        lut = np.zeros((S, nfm), np.int32)
+        nf = np.zeros(S, np.int32)
+        for s, sv in enumerate(vm.streams):
+            lut[s, :sv.n_values] = sv.cell_row.astype(np.int64) * 256 + sv.cell_col
+            nf[s] = sv.n_values
+        t_rows, t_det, F = 300, 256, 25
+        cells = rng.integers(-127, 128, size=(S, t_rows, nfm, 2)).astype(np.int8)
+        dense = torch.zeros((S, nfm, pad_t(t_rows), 2), dtype=torch.int8, device=dev)
+        dense[:, :, :t_rows] = torch.from_numpy(cells.transpose(0, 2, 1, 3).copy()).to(dev)
+        shifts = rng.integers(-20, 20, size=(F, S)).astype(np.int32)
+        csr_v4 = build_sparse_cell_csr(build_inverse_lut(torch.from_numpy(lut).to(dev),
+                                                         torch.from_numpy(nf).to(dev),
+                                                         n_grid=256), n_grid=256)
+        outv4 = torch.zeros((F, t_det, 256, 129), dtype=torch.complex32, device=dev)
+        sh_t = torch.from_numpy(shifts).to(dev)
+        combine_sparse_v4(dense, csr_v4, sh_t, t_rows=t_rows, t_out_len=t_det, t_lo=0,
+                          out=outv4, shift_min=int(shifts.min()), shift_max=int(shifts.max()))
+        csr = csr_from_lut_1x(lut, nf, n_grid=256)
+        ring = torch.zeros((S, nfm, 512, 2), dtype=torch.int8, device=dev)
+        ring[:, :, :t_rows] = dense[:, :, :t_rows]
+        uv = k1_combine(ring, torch.ones((S, nfm), device=dev), csr_tensors(csr, dev),
+                        sh_t, t_lo=0, n_t=t_det)
+        mine = torch.zeros((F, t_det, 256, 129, 2), dtype=torch.float16, device=dev)
+        cu = torch.as_tensor(csr.cell_u, device=dev).long()
+        cw = torch.as_tensor(csr.cell_w, device=dev).long()
+        mine[:, :, cu, cw] = uv.to(torch.float16)
+        eq = bool(torch.equal(torch.view_as_real(outv4), mine))
+        return dict(check="k1_1x_csr_vs_v4", status="ok" if eq else "fail", equal=eq)
     except Exception as e:                                       # noqa: BLE001
-        res.append(dict(check="fft", status="fail", error=traceback.format_exc()[-1500:],
-                        exc=repr(e)))
-    # ---- K3b ------------------------------------------------------------------------------
-    for bank_name in a.k3b.split(","):
-        try:
-            fb = FilterBank.b3x() if bank_name == "b3x" else FilterBank.build()
-            F, P, hop = 18, 65536, 384
-            R = hop + fb.history()
-            ring = torch.randn((R, F, P), device=dev).to(torch.float16)
-            si = torch.ones(F, device=dev)
-            ms = _cuda_ms(lambda: k3b_detect(ring, ring_row0=0, c_first=fb.max_d + fb.max_a,
-                                             n_c=hop, sigma_inv=si, s_inv=1 / fb.seeds,
-                                             bank=fb), reps=2)
-            us = 1e3 * ms / (F * hop)
-            stage_us.setdefault("k3b", {})[bank_name] = us
-            small = ring[:, :2, :4096].contiguous()
-            b1, t1, _ = k3b_detect(small, ring_row0=0, c_first=fb.max_d + fb.max_a, n_c=64,
-                                   sigma_inv=si[:2], s_inv=1 / fb.seeds, bank=fb)
-            b0, t0, _ = k3b_twin(small.cpu().numpy(), ring_row0=0, c_first=fb.max_d + fb.max_a,
-                                 n_c=64, sigma_inv=np.ones(2, np.float32),
-                                 s_inv=(1 / fb.seeds).astype(np.float32), bank=fb)
-            exact = bool(np.array_equal(b1.cpu().numpy(), b0) and
-                         np.array_equal(t1.cpu().numpy(), t0))
-            entry = dict(check="k3b", bank=bank_name, us_per_image=us, bit_exact_vs_twin=exact,
-                         status="ok" if exact else "fail")
-            if bank_name == "box":
-                entry.update(_k3b_compat_vs_production(fb, dev))
-                if entry.get("compat_status") == "fail":
-                    entry["status"] = "fail"
-            res.append(entry)
-        except Exception as e:                                   # noqa: BLE001
-            res.append(dict(check="k3b", bank=bank_name, status="fail", error=repr(e)[:1000]))
-    chain = {k: min(v.values()) for k, v in stage_us.items() if v}
-    total = sum(chain.values()) + 0.05 + 0.03 + 0.18             # K0, Layer-1, top-k/launch
-    res.append(dict(check="chain", us_per_image_best=chain, total_us=total,
-                    status="ok" if total <= 4.8 else "fail",
-                    note="E1 escalation if > 4.8 us/image after the fallbacks"))
-    _write(out, "b8_kernels.json", dict(results=res))
-    return _status(res)
+        return dict(check="k1_1x_csr_vs_v4", status="fail", error=repr(e)[:1000])
 
 
-def _warp_runner(uvt, plan, inp, dev):
+def _warp_runner(uvt, plan, inp, dev, mode: str = "warp"):
     import numpy as np
     import torch
 
@@ -492,6 +703,24 @@ def _warp_runner(uvt, plan, inp, dev):
     k2, k3 = mod.get_function("k2_colfft_256"), mod.get_function("k3a_rowc2r_256")
     A = int(uvt.shape[1])
 
+    tr = int(plan.fold == "row")
+    lines = dict(line_ptr=lp, line_idx=li, line_pos=lpos, fl=fl, cc_idx=cci, cc_line=ccl)
+
+    from dsart.x2.search.kernels_cuda import k23_tables, launch_k23
+    tables = k23_tables(lines, n_fl, dev, pix=pix)
+
+    def run_fused(kname="k23v2p_256"):
+        launch_k23(uv2, tables, tw, pix, ring, B=B, n_act=A, n_t=B, F=1, t0=0, R_img=B,
+                   transpose=tr, stream=torch.cuda.current_stream(), kname=kname)
+        return ring.view(B, N, N)
+
+    if mode == "fused":
+        return run_fused
+    if mode == "fused_v1":
+        return lambda: run_fused("k23_fused_256")
+    if mode == "fused_v2":
+        return lambda: run_fused("k23v2_256")
+
     def run():
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
             k2(((B * n_fl + 3) // 4,), (128,), (_ptr(uv2), _ptr(lp), _ptr(li), _ptr(lpos), _ptr(tw),
@@ -515,7 +744,8 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
     from dsart.x2.search.kernels_triton import k3b_detect
 
     T, F, P = 256, 4, 65536
-    cube = (torch.randn((T, F, P), device=dev) * 1.0).to(torch.float16)
+    g = torch.Generator(device=dev).manual_seed(0)
+    cube = torch.randn((T, F, P), device=dev, generator=g).to(torch.float16)
     cube[100, 1, 1234] = 40.0
     maxw = 64
     cs = torch.zeros((T + maxw, F, P), dtype=torch.float16, device=dev)
@@ -531,23 +761,99 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
     best, _tk, _ = k3b_detect(cube.contiguous(), ring_row0=0, c_first=maxw // 2, n_c=T - maxw,
                               sigma_inv=torch.ones(F, device=dev), s_inv=1 / fb.seeds, bank=fb)
     d = (best - prod).abs()
-    tol = 0.02 + 2.0 * torch.abs(prod) * 2.0 ** -11
+    # production's boxcar is a difference of two fp16 running sums: each carries
+    # up to half an fp16 ulp of its magnitude (|cumsum| reaches ~40 over 256
+    # rows: ulp 2^-5), so the tolerance includes one ulp of the window's largest
+    # |cumsum| (x max s_inv = 1, b1) besides 0.02 and the stored max's ulp
+    cs_max = cs.float().abs().amax(dim=0)                                  # [F, P]
+    tol = 0.02 + 2.0 * torch.abs(prod) * 2.0 ** -11 + 2.0 ** -10 * cs_max[None]
     worst = float((d - tol).max())
     return dict(compat_max_abs=float(d.max()), compat_status="ok" if worst <= 0 else "fail",
-                compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max")
+                compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max + 1 fp16 ulp of "
+                            "the largest |cumsum| (production's fp16 running sums)")
+
+
+class _FakeRecording:
+    """WS-T ``Recording`` duck type over an in-memory 1x payload."""
+
+    def __init__(self, payload, t0):
+        from dsart.x2.search.replay import F_WRITTEN, VF_DATA_PRESENT
+        import numpy as np
+        self.p, self.t0 = payload, int(t0)
+        T, C, _ = payload.shape
+        self.cf = np.full((T, C), F_WRITTEN, np.uint8)
+        self.vf = np.full((T, C), VF_DATA_PRESENT, np.uint16)
+
+    def t_range(self, dm):
+        return self.t0, self.t0 + self.p.shape[0]
+
+    def slots(self, dm, a, b):
+        i, j = a - self.t0, b - self.t0
+        return dict(payload=self.p[i:j], vf=self.vf[i:j], corr_flags=self.cf[i:j])
 
 
 def cmd_compat_1x(a) -> int:
+    """(1) kernel taps: K1 1x CSR vs combine_sparse_v4 bit for bit, K3b box vs
+    production fp16 boxcars; (2) today's production chain composed on CPU
+    (``compat1x.production_cycle_cpu``) vs the owner engine on the GPU in
+    1x-compat (``EngineConfig.compat_1x``) cycle by cycle on a synthetic 1x
+    recording made with the REAL 1x value map: every production candidate
+    matched within t / fine DM / l / m +- 1 and dS/N <= 0.1."""
     _need_gpu()
+    import numpy as np
+
+    from dsart.x2.search.codec import RowFormat
+    from dsart.x2.search.geometry import owner_plan_1x
+    from dsart.x2.search.replay import replay_1x
+    from dsart.x2.search.ring import MemoryRing
+    from dsart.x2.search.synth import Burst, SyntheticSky
+
     res = []
-    # the kernels-level taps (K1 1x CSR vs v4, K3b box vs production) are run here too
-    a2 = argparse.Namespace(out=a.out, fft="cufft,warp", k3b="box", k1_formats="",
-                            check_1x_csr=True)
+    a2 = argparse.Namespace(out=a.out, fft="cufft,warp,fused", k3b="box,v1,fused,reg", k1="triton",
+                            k1_formats="", check_1x_csr=True)
     rc = cmd_kernels(a2)
     res.append(dict(check="kernels_taps", status="ok" if rc == 0 else "fail"))
-    _write(Path(a.out), "b8_compat_1x.json", dict(results=res, note=(
-        "full CubePipeline-vs-engine comparison on recorded RX taps runs once WS-T's "
-        "recordings exist (I1/I2); the taps here cover K1, FFT and K3b")))
+    try:
+        op, vm = _value_map("1x")
+        S = len(vm.streams)
+        nfm = max(int(sv.n_values) for sv in vm.streams)
+        cells = []
+        for sv in vm.streams:
+            c = np.full(nfm, -1, np.int64)
+            c[:sv.n_values] = sv.cell_row.astype(np.int64) * 256 + sv.cell_col
+            cells.append(c)
+        lut = np.stack([np.where(c >= 0, c, 0) for c in cells]).astype(np.int32)
+        nf = np.array([(c >= 0).sum() for c in cells], np.int32)
+        fine = 500.0 + 2.0 * (np.arange(25) - 12)
+        plan = owner_plan_1x(coarse_dm=np.array([500.0]), fine_dm=fine,
+                             fine_to_coarse=np.zeros(25, int), owned=[0], n_sub=max(1, S // 16),
+                             csf=8)
+        spec = plan.dms[0]
+        fmt = RowFormat("cint8", n_values=nfm)
+        n_cyc = int(a.cycles)
+        t0, T = 100, (n_cyc + 5) * spec.hop + spec.max_pos + spec.max_neg
+        tmp = MemoryRing({0: fmt}, S, t_buf=T + 8)
+        bursts = [Burst(d=0, f=f, t=t, l=l, m=m, amp=amp) for f, t, l, m, amp in
+                  ((3, 4 * spec.hop + 40, 100, 140, 0.4), (12, 5 * spec.hop + 90, 60, 200, 0.8),
+                   (20, 6 * spec.hop + 15, 180, 70, 1.6))]
+        sky = SyntheticSky(plan=plan, cells={0: cells}, formats={0: fmt}, n_grid=256, seed=5,
+                           bursts=bursts)
+        sky.fill(tmp, spec, t0, T)
+        raw, _ = tmp.wait_window(0, t0, T)
+        payload = np.ascontiguousarray(raw.transpose(1, 0, 2)).view(np.int8)
+        out = replay_1x(_FakeRecording(payload, t0), 0, plan=plan, lut=lut, n_filled=nf,
+                        n_grid=256, n_cycles=n_cyc, fft_mode=a.fft_mode, backend="gpu",
+                        cfg_kw=dict(k1_impl="triton", k3b_impl=a.k3b))
+        n_prod = sum(c["n_prod"] for c in out["cycles"])
+        res.append(dict(check="production_vs_engine_1x", status="ok" if (out["ok"] and n_prod)
+                        else "fail", n_cycles=len(out["cycles"]), n_prod_candidates=n_prod,
+                        fft_mode=a.fft_mode, k3b=a.k3b, cycles=out["cycles"]))
+    except Exception as e:                                       # noqa: BLE001
+        res.append(dict(check="production_vs_engine_1x", status="fail",
+                        error=traceback.format_exc()[-2000:], exc=repr(e)))
+    _write(Path(a.out), "b8_compat_1x.json", dict(results=res))
+    for r in res:
+        print(json.dumps({k: v for k, v in r.items() if k not in ("cycles", "error")}))
     return _status(res)
 
 
@@ -559,9 +865,21 @@ def cmd_compat_1x(a) -> int:
 class ClockedRing:
     """Synthetic ring for the engine bench: rows become available at the
     real-time rate; payload drawn from a pre-generated pool (no per-cycle
-    generation cost, no shm)."""
+    generation cost, no shm).
 
-    def __init__(self, plan, formats, pool_rows: int = 4096, seed: int = 0):
+    Loss model (G1: production always loses some datagrams): a datagram is
+    ``rows_per_dg`` consecutive rows of one stream, lost with probability
+    ``loss`` (a fixed hash of (dm, stream, datagram): reproducible, and
+    :meth:`valid_mask` answers for any row range after the run); and
+    ``dropout_streams`` (one corr node = its streams) send nothing for
+    ``dropout_s`` from ``dropout_at_s`` after the start. Missing rows are
+    zero-filled and flagged invalid, as ``copy_window`` does; holes are final
+    at once and the dropped streams are below the fan-in quorum, so the
+    release edge keeps real time (as RingV4Source's)."""
+
+    def __init__(self, plan, formats, pool_rows: int = 4096, seed: int = 0, *,
+                 loss: float = 0.0, rows_per_dg: int = 4, dropout_streams=(),
+                 dropout_at_s: float = 0.0, dropout_s: float = 0.0):
         import numpy as np
         rng = np.random.default_rng(seed)
         self.plan = plan
@@ -574,6 +892,35 @@ class ClockedRing:
         self.t0 = time.monotonic()
         self.start_cycle = 2
         self.n_wait = 0
+        self.loss, self.rows_per_dg = float(loss), max(1, int(rows_per_dg))
+        self.drop = np.zeros(max(s.n_stream for s in plan.dms), bool)
+        self.drop[list(dropout_streams)] = True
+        self.drop_cyc = (self.start_cycle + float(dropout_at_s) / CYCLE_S,
+                         self.start_cycle + (float(dropout_at_s) + float(dropout_s)) / CYCLE_S)
+        self.rows_missing = 0
+
+    def valid_mask(self, d, t_first, n_rows):
+        """``bool [S, n_rows]``: row present (not in a lost datagram, stream
+        not dropped out at that data time)."""
+        import numpy as np
+        spec = self.plan.by_d(d)
+        S = spec.n_stream
+        rows = np.arange(int(t_first), int(t_first) + int(n_rows), dtype=np.int64)
+        v = np.ones((S, rows.size), bool)
+        if self.loss > 0:
+            g = (rows // self.rows_per_dg).astype(np.uint64)[None, :]
+            sd = (np.arange(S, dtype=np.uint64)[:, None] * np.uint64(0xC2B2AE3D27D4EB4F)
+                  + np.full(1, d, np.uint64) * np.uint64(0x165667B19E3779F9))
+            h = g * np.uint64(0x9E3779B97F4A7C15) + sd
+            h ^= h >> np.uint64(29)
+            h *= np.uint64(0xBF58476D1CE4E5B9)
+            h ^= h >> np.uint64(32)
+            v &= (h >> np.uint64(11)).astype(np.float64) * 2.0 ** -53 >= self.loss
+        if self.drop.any() and self.drop_cyc[1] > self.drop_cyc[0]:
+            lo, hi = (int(np.ceil(c * spec.hop)) for c in self.drop_cyc)
+            out = (rows >= lo) & (rows < hi)
+            v[self.drop[:S][:, None] & out[None, :]] = False
+        return v
 
     def dms(self):
         return sorted(self.pool)
@@ -586,101 +933,307 @@ class ClockedRing:
         cyc = self.start_cycle + (time.monotonic() - self.t0) / CYCLE_S
         return int(cyc * spec.hop)
 
+    @property
+    def row_bytes(self):
+        return max(int(p.shape[2]) for p in self.pool.values())
+
     def wait_window(self, d, t_first, n_rows, timeout_s=None):
+        return self.wait_window_into(d, t_first, n_rows, out=None, timeout_s=timeout_s)
+
+    def wait_window_into(self, d, t_first, n_rows, *, out=None, timeout_s=None):
+        """Like RingV4Source: rows copied straight into ``out`` (the engine's
+        pinned staging) -- one host copy, as in production."""
         import numpy as np
         while self.write_pos(d) < t_first + n_rows:
             self.n_wait += 1
             time.sleep(0.0005)
         pool = self.pool[d]
-        idx = np.mod(np.arange(t_first, t_first + n_rows), pool.shape[1])
-        return pool[:, idx], np.ones((pool.shape[0], n_rows), bool)
+        S, n_pool, rb = pool.shape
+        if out is None:
+            out = np.empty((S, n_rows, self.row_bytes), np.uint8)
+        i0 = int(t_first) % n_pool
+        n1 = min(n_rows, n_pool - i0)
+        out[:, :n1, :rb] = pool[:, i0:i0 + n1]
+        if n1 < n_rows:
+            out[:, n1:, :rb] = pool[:, :n_rows - n1]
+        if self.loss > 0 or self.drop.any():
+            valid = self.valid_mask(d, t_first, n_rows)
+            if not valid.all():
+                out[~valid] = 0                      # as copy_window: missing rows zero-filled
+                self.rows_missing += int((~valid).sum())
+            return out, valid
+        return out, np.ones((S, n_rows), bool)
 
     def counters(self):
-        return dict(n_wait=self.n_wait)
+        return dict(n_wait=self.n_wait, rows_missing=self.rows_missing)
 
 
-def run_half(a, half: int) -> dict:
+def _expected_valid_fraction(ring, spec, t0) -> float:
+    """Dense reference of the engine's valid fraction (all streams valid for
+    every (fine DM, row) image of the cycle), from the ring's own mask."""
     import numpy as np
+    sh = np.asarray(spec.shifts, dtype=np.int64)
+    lo = int(t0) - int(sh.max())
+    n = int(spec.hop) + int(sh.max()) - int(sh.min())
+    v = ring.valid_mask(spec.d, lo, n)                                  # [S, n]
+    t = np.arange(int(spec.hop))
+    idx = (t[None, :, None] - sh[:, None, :]) + int(t0) - lo            # [F, hop, S]
+    ok = v[np.arange(sh.shape[1])[None, None, :], idx].all(axis=2)
+    return float(ok.mean())
 
-    from dsart.x2.plan import build_tiered_plan_for_opoint
+
+def _atomic_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj, indent=1, default=str))
+    os.replace(tmp, path)
+
+
+def _variants(a) -> list:
+    """``--variants k1:k3b,...`` (default: staged:reg)."""
+    out = []
+    for tok in [t for t in a.variants.split(",") if t]:
+        k1, _, k3b = tok.partition(":")
+        if k1 not in K1_VARIANTS or k3b not in K3B_IMPLS:
+            raise SystemExit(f"--variants: {tok!r} is not <{'|'.join(K1_VARIANTS)}>:"
+                             f"<{'|'.join(K3B_IMPLS)}>")
+        out.append((k1, k3b))
+    return out
+
+
+def _stage_us(stage_ms: dict, images: int) -> dict:
+    return {k: (1e3 * v / images if images else 0.0) for k, v in stage_ms.items()}
+
+
+def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dict:
+    """One owner half on this process's GPU for ``seconds`` of data."""
     from dsart.x2.search.engine import EngineConfig, OwnerEngine
     from dsart.x2.search.geometry import owner_plan_from_tiered
+    from dsart.x2.search.ring import RingV4Source
+    from dsart.x2.search.service import CycleScheduler
     from dsart.x2.search.valuemap import dm_inputs_from_value_map
 
-    op, vm = _value_map(a.opoint)
-    plan = build_tiered_plan_for_opoint(op)
+    op, vm = _value_map(a.opoint, a.antpos_npz, a.dec_deg)
+    plan = _plan_for(op, a.plan)
     oplan = owner_plan_from_tiered(plan, half=half)
     sm, sh = _steps(op)
     inp = dm_inputs_from_value_map(vm, s_main=sm, s_heavy=sh, bits_main=op.bits_main)
     inputs = {s.d: inp for s in oplan.dms}
+    head = dict(half=half, opoint=a.opoint, k1=k1, k3b=k3b, input=a.input,
+                plan_id=str(getattr(plan, "plan_id", "")), n_dm=len(oplan.dms),
+                dms=oplan.summary()["dms"], images_per_cycle=int(
+                    sum(s.n_fdm * s.hop for s in oplan.dms)))
+    head["images_per_s"] = head["images_per_cycle"] / CYCLE_S
     if a.input == "synthetic-ring":
-        ring = ClockedRing(oplan, {s.d: inp.fmt for s in oplan.dms})
+        drop = []
+        for tok in [t for t in str(a.dropout_streams).split(",") if t]:
+            lo_, _, hi_ = tok.partition("-")
+            drop += list(range(int(lo_), int(hi_ or lo_) + 1))
+        ring = ClockedRing(oplan, {s.d: inp.fmt for s in oplan.dms}, loss=a.loss,
+                           rows_per_dg=a.loss_rows_per_dg, dropout_streams=drop,
+                           dropout_at_s=a.dropout_at_s, dropout_s=a.dropout_s)
+        head.update(loss=a.loss, rows_per_dg=a.loss_rows_per_dg, dropout_streams=drop,
+                    dropout_at_s=a.dropout_at_s, dropout_s=a.dropout_s)
     else:
-        try:
-            from dsart.transport.recv_ring import open_ring_v4    # WS-T (frozen SPEC §6)
-        except Exception as e:                                   # noqa: BLE001
-            raise RuntimeError(f"rx-v4 consumer API not available: {e!r}")
-        ring = open_ring_v4(a.shm, owned=[s.d for s in oplan.dms])
+        ring = RingV4Source.open(a.shm_name, owned=[s.d for s in oplan.dms],
+                                 access=a.ring_access, attach_timeout_s=a.attach_timeout_s)
+        ring.validate(oplan, inputs, vmap=vm)
+        head["ring_access"] = ring.access
     cfg = EngineConfig(backend="gpu" if not a.cpu else "cpu", fft_mode=a.fft_mode,
-                       families=("b3x",) if a.bank == "b3x" else ("b",),
-                       n_grid=256, wait_timeout_s=30.0)
+                       families=("b3x",) if a.bank == "b3x" else ("b",), n_grid=256,
+                       wait_timeout_s=5.0, k1_impl=k1, k3b_impl=k3b)
     eng = OwnerEngine(oplan, inputs, ring, cfg)
-    t_end = time.monotonic() + 60.0 * a.minutes
-    k = 2 if a.input == "synthetic-ring" else None
-    rec = []
-    while time.monotonic() < t_end:
-        if k is None:
-            k = int(min(ring.write_pos(s.d) // s.hop for s in oplan.dms)) - 1
+    sched = CycleScheduler(oplan, ring, max_lag_cycles=8)
+    head["engine_status"] = eng.status()
+    from dsart.x2.search.candidates import PARTIAL_FANIN_FLAG
+    rec, stage_ms, images, vf_log = [], {}, 0, []
+    t_first = None
+    stop = "minutes"
+    t_part = time.monotonic()
+    first_timeout = a.first_data_timeout_s
+    while True:
+        try:
+            k = sched.next_cycle(timeout_s=first_timeout if t_first is None else a.idle_stop_s)
+        except TimeoutError:
+            stop = "no_data" if t_first is None else "idle"
+            break
         t_a = time.monotonic()
+        t_first = t_first or t_a
         r = eng.process_cycle(k)
         wall = 1e3 * (time.monotonic() - t_a)
-        gms = eng._gpu.pop_gpu_ms() if eng._gpu is not None else {}
-        lag = max((ring.write_pos(s.d) - (k + 1) * s.hop) * s.t_native * 32.768e-3
-                  for s in oplan.dms)
-        rec.append(dict(cycle=k, wall_ms=wall, gpu_ms=float(sum(gms.values())), lag_ms=lag,
-                        n_cand=len(r.candidates)))
-        k += 1
-    gpu = np.array([x["gpu_ms"] for x in rec])
-    wall = np.array([x["wall_ms"] for x in rec])
-    lag = np.array([x["lag_ms"] for x in rec])
+        by = eng._gpu.pop_gpu_ms(by_stage=True) if eng._gpu is not None else {}
+        cyc_stage = {}
+        for dct in by.values():
+            for kk, v in dct.items():
+                cyc_stage[kk] = cyc_stage.get(kk, 0.0) + v
+        for kk, v in cyc_stage.items():
+            stage_ms[kk] = stage_ms.get(kk, 0.0) + v
+        images += head["images_per_cycle"]
+        gpu = float(sum(v for kk, v in cyc_stage.items() if kk != "h2d"))
+        lag = max(sched.lag_ms(k).values(), default=0.0)
+        rec.append(dict(cycle=k, wall_ms=wall, gpu_ms=gpu, lag_ms=lag,
+                        n_cand=len(r.candidates), phase_ms=dict(r.phase_ms)))
+        for d_, dr in r.per_dm.items():
+            vf_log.append((int(d_), int(dr.t0), float(dr.valid_fraction),
+                           sum(1 for c in dr.candidates
+                               if dr.valid_fraction < 1.0 and not c.flags & PARTIAL_FANIN_FLAG)))
+        now = time.monotonic()
+        if now - t_part >= 15.0:
+            _atomic_json(part, dict(head, final=False, **_half_summary(rec, stage_ms, images,
+                                                                        sched, ring)))
+            t_part = now
+        if now - t_first >= seconds:
+            break
+    out = dict(head, final=True, stop=stop, **_half_summary(rec, stage_ms, images, sched, ring))
+    out["startup_skipped_cycles"] = int(getattr(sched, "n_startup_skipped", 0))
+    if hasattr(ring, "valid_mask"):
+        # after the run (the dense reference costs ~13 ms per DM-cycle): the
+        # engine's valid fraction == the ring's mask, and every candidate of a
+        # partial cube carries PARTIAL_FANIN_FLAG
+        by_d = {s.d: s for s in oplan.dms}
+        mism = [x for x in vf_log
+                if _expected_valid_fraction(ring, by_d[x[0]], x[1]) != x[2]]
+        part_ = [x for x in vf_log if x[2] < 1.0]
+        out["fanin_check"] = dict(
+            dm_cycles=len(vf_log), partial_dm_cycles=len(part_),
+            min_valid_fraction=min((x[2] for x in vf_log), default=1.0),
+            valid_fraction_mismatches=len(mism), first_mismatch=mism[:3],
+            unflagged_partial_candidates=int(sum(x[3] for x in vf_log)),
+            rows_missing=int(getattr(ring, "rows_missing", 0)))
+    _atomic_json(part, out)
+    if hasattr(ring, "close"):
+        ring.close()
+    return out
+
+
+def _half_summary(rec, stage_ms, images, sched, ring) -> dict:
+    import numpy as np
+    gpu = np.array([x["gpu_ms"] for x in rec]) if rec else np.zeros(0)
+    wall = np.array([x["wall_ms"] for x in rec]) if rec else np.zeros(0)
+    lag = np.array([x["lag_ms"] for x in rec]) if rec else np.zeros(0)
+    st_us = _stage_us(stage_ms, images)
+    chain = float(sum(v for k, v in st_us.items() if k != "h2d"))
     duty = float(gpu.mean() / (1e3 * CYCLE_S)) if gpu.size else 0.0
     host = float(np.percentile(np.maximum(wall - gpu, 0), 99)) if wall.size else 0.0
-    return dict(half=half, opoint=a.opoint, dms=oplan.summary()["dms"], n_cycles=len(rec),
-                gpu_duty=duty, host_ms_p99=host, lag_ms_max=float(lag.max(initial=0)),
+    phase = {}
+    for x in rec:
+        for kk, v in x.get("phase_ms", {}).items():
+            phase.setdefault(kk, []).append(v)
+    phase = {kk: dict(mean=float(np.mean(v)), p99=float(np.percentile(v, 99)))
+             for kk, v in phase.items()}
+    fan = {}
+    if hasattr(ring, "fan_in"):
+        fan = {int(d): ring.fan_in(d) for d in ring.dms()}
+    return dict(n_cycles=len(rec), gpu_duty=duty, host_phase_ms=phase,
+                wall_ms_p99=float(np.percentile(wall, 99)) if wall.size else 0.0,
+                gpu_ms_mean=float(gpu.mean()) if gpu.size else 0.0,
+                gpu_duty_p99=float(np.percentile(gpu, 99) / (1e3 * CYCLE_S)) if gpu.size else 0.0,
+                host_ms_p99=host, lag_ms_max=float(lag.max(initial=0)),
                 lag_ms_last=float(lag[-1]) if lag.size else 0.0,
-                status=dict(engine=eng.status()), cycles=rec[-50:])
+                lag_recovery_seeks=int(sched.n_seeks), cycles_skipped=int(sched.n_skipped),
+                stage_us_per_image=st_us, chain_us_per_image=chain, fan_in=fan,
+                cycles=rec[-20:])
+
+
+def _engine_gate(h: dict) -> dict:
+    # real time: every cycle's wall time (GPU + the host work it does not hide)
+    # within 90% of the cycle at p99, no lag-recovery seek, no growing lag; the
+    # host's share is reported (host_ms_p99) but gated only through the wall
+    wall_p99 = h.get("wall_ms_p99", float("inf"))
+    fc = h.get("fanin_check") or {}
+    ok = (h.get("n_cycles", 0) > 0 and h["gpu_duty"] <= DUTY_GATE
+          and not fc.get("valid_fraction_mismatches") and not fc.get("unflagged_partial_candidates")
+          and wall_p99 <= 0.9 * 1e3 * CYCLE_S
+          and h["lag_ms_last"] <= 2.0 * 1e3 * CYCLE_S and h["lag_recovery_seeks"] == 0
+          and h["chain_us_per_image"] <= CHAIN_GATE_US)
+    return dict(check="engine", half=h["half"], k1=h["k1"], k3b=h["k3b"],
+                plan_id=h.get("plan_id"), n_dm=h.get("n_dm"),
+                startup_skipped_cycles=h.get("startup_skipped_cycles"),
+                fanin_check=h.get("fanin_check"),
+                images_per_s=h.get("images_per_s"), gpu_ms_mean=h.get("gpu_ms_mean"),
+                wall_ms_p99=h.get("wall_ms_p99"), host_phase_ms=h.get("host_phase_ms"),
+                n_cycles=h.get("n_cycles", 0), stop=h.get("stop"), gpu_duty=h["gpu_duty"],
+                duty_aim_met=h["gpu_duty"] <= DUTY_AIM, host_ms_p99=h["host_ms_p99"],
+                lag_ms_max=h["lag_ms_max"], lag_recovery_seeks=h["lag_recovery_seeks"],
+                stage_us_per_image=h["stage_us_per_image"],
+                chain_us_per_image=h["chain_us_per_image"], gate_us=CHAIN_GATE_US,
+                status="ok" if ok else "fail")
 
 
 def cmd_engine(a) -> int:
+    """One process per (half, GPU) per variant; variants run one after
+    another for minutes / n_variants each. ``--out`` (a directory) gets
+    ``b8_engine.json`` (rewritten after every variant and at the end; the
+    only ``*.json`` at its top level) and ``halves/`` (per-half progress)."""
     out = Path(a.out)
-    if a.half is not None:
-        res = run_half(a, int(a.half))
-        _write(out, f"b8_engine_half{a.half}.json", res)
+    if a.half is not None:                                       # child
+        k1, _, k3b = a.variants.partition(":")
+        run_half(a, int(a.half), k1, k3b, float(a.seconds),
+                 out / "halves" / f"{k1}_{k3b}_half{a.half}.json")
         return EXIT_OK
+    halves = ([int(h) for h in a.halves.split(",") if h != ""] if a.halves else
+              [a.half_base + i for i in range(len([g for g in a.gpus.split(",") if g != ""]))])
     gpus = [g for g in a.gpus.split(",") if g != ""]
-    procs = []
-    for i, g in enumerate(gpus):
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(g), DSART_X2_CP=os.environ.get(
-            "DSART_X2_CP", "b8"))
-        cmd = [sys.executable, __file__, "engine", "--half", str(a.half_base + i), "--opoint",
-               a.opoint, "--input", a.input, "--minutes", str(a.minutes), "--out", a.out,
-               "--fft-mode", a.fft_mode, "--bank", a.bank] + (["--cpu"] if a.cpu else [])
-        procs.append(subprocess.Popen(cmd, env=env))
-    rcs = [p.wait() for p in procs]
-    res = []
-    for i, _g in enumerate(gpus):
-        p = out / f"b8_engine_half{a.half_base + i}.json"
-        if not p.exists():
-            res.append(dict(check="engine", half=a.half_base + i, status="fail", rc=rcs[i]))
+    if len(gpus) < len(halves):
+        raise SystemExit(f"{len(halves)} halves need {len(halves)} GPUs (--gpus {a.gpus})")
+    variants = _variants(a)
+    seconds = 60.0 * a.minutes / max(1, len(variants))
+    summary = dict(opoint=a.opoint, input=a.input, halves=halves, minutes=a.minutes,
+                   variants=[f"{k1}:{k3b}" for k1, k3b in variants], gate_us=CHAIN_GATE_US,
+                   duty_aim=DUTY_AIM, duty_gate=DUTY_GATE, results=[], final=False)
+    _atomic_json(out / "b8_engine.json", summary)
+    no_data = False
+    for k1, k3b in variants:
+        if no_data:
+            summary["results"] += [dict(check="engine", half=h, k1=k1, k3b=k3b, status="skip",
+                                        reason="no data in an earlier variant") for h in halves]
             continue
-        h = json.loads(p.read_text())
-        gate = (h["gpu_duty"] <= 0.75 and h["host_ms_p99"] <= 30.0
-                and h["lag_ms_last"] <= 2.0 * 1e3 * CYCLE_S)
-        res.append(dict(check="engine", half=h["half"], gpu_duty=h["gpu_duty"],
-                        duty_aim_met=h["gpu_duty"] <= 0.6, host_ms_p99=h["host_ms_p99"],
-                        lag_ms_max=h["lag_ms_max"], status="ok" if gate else "fail"))
-    _write(out, "b8_engine.json", dict(results=res))
-    return _status(res)
+        procs = []
+        for h, g in zip(halves, gpus):
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(g),
+                       DSART_X2_CP=os.environ.get("DSART_X2_CP", "b8"))
+            cmd = [sys.executable, __file__, "engine", "--half", str(h), "--variants",
+                   f"{k1}:{k3b}", "--seconds", str(seconds)] + _child_args(a)
+            procs.append(subprocess.Popen(cmd, env=env))
+        rcs = [p.wait() for p in procs]
+        for h, rc in zip(halves, rcs):
+            p = out / "halves" / f"{k1}_{k3b}_half{h}.json"
+            if not p.exists():
+                summary["results"].append(dict(check="engine", half=h, k1=k1, k3b=k3b,
+                                               status="fail", rc=rc))
+                continue
+            hj = json.loads(p.read_text())
+            if hj.get("stop") == "no_data":
+                no_data = True
+            summary["results"].append(_engine_gate(hj))
+        _atomic_json(out / "b8_engine.json", summary)
+    res = summary["results"]
+    by_var = {}
+    for r in res:
+        by_var.setdefault(f"{r['k1']}:{r['k3b']}", []).append(r["status"])
+    passing = [v for v, st in by_var.items() if st and all(s == "ok" for s in st)]
+    summary.update(final=True, passing_variants=passing,
+                   status="ok" if passing else "fail")
+    _atomic_json(out / "b8_engine.json", summary)
+    print(json.dumps(dict(passing_variants=passing, out=str(out / "b8_engine.json"))))
+    return EXIT_OK if passing else EXIT_GATE
+
+
+def _child_args(a) -> list:
+    args = ["--opoint", a.opoint, "--input", a.input, "--out", a.out, "--fft-mode", a.fft_mode,
+            "--bank", a.bank, "--ring-access", a.ring_access,
+            "--attach-timeout-s", str(a.attach_timeout_s),
+            "--first-data-timeout-s", str(a.first_data_timeout_s),
+            "--idle-stop-s", str(a.idle_stop_s), "--dec-deg", str(a.dec_deg),
+            "--loss", str(a.loss), "--loss-rows-per-dg", str(a.loss_rows_per_dg),
+            "--dropout-at-s", str(a.dropout_at_s), "--dropout-s", str(a.dropout_s)]
+    if a.dropout_streams:
+        args += ["--dropout-streams", a.dropout_streams]
+    for flag, val in (("--shm-name", a.shm_name), ("--plan", a.plan),
+                      ("--antpos-npz", a.antpos_npz)):
+        if val:
+            args += [flag, val]
+    return args + (["--cpu"] if a.cpu else [])
 
 
 def cmd_teardown(a) -> int:
@@ -703,28 +1256,61 @@ def main(argv=None) -> int:
     c = sub.add_parser("compile-check")
     c.add_argument("--out", default="b8_out")
     k = sub.add_parser("kernels")
-    k.add_argument("--fft", default="cufft,warp")
-    k.add_argument("--k3b", default="box,b3x")
+    k.add_argument("--fft", default="cufft,warp,fused_v1,fused_v2,fused",
+                   help="cufft, dense, warp, fused (k23v2p_256), fused_v2 (k23v2_256), "
+                        "fused_v1 (k23_fused_256)")
+    k.add_argument("--k3b", default="box,b3x,v1,fused,cuda,reg",
+                   help="filter banks (box, b3x) and implementations (v1, fused, cuda, reg)")
+    k.add_argument("--k1", default="triton,staged", help="K1 variants (triton, staged)")
     k.add_argument("--k1-formats", dest="k1_formats", default="all")
     k.add_argument("--check-1x-csr", dest="check_1x_csr", action="store_true")
     k.add_argument("--out", default="b8_out")
     x = sub.add_parser("compat-1x")
     x.add_argument("--out", default="b8_out")
+    x.add_argument("--cycles", type=int, default=4)
+    x.add_argument("--fft-mode", dest="fft_mode", default="fused", choices=("warp", "fused", "pruned"))
+    x.add_argument("--k3b", default="reg", choices=("v1", "fused", "cuda", "reg"))
     e = sub.add_parser("engine")
     e.add_argument("--gpus", default="0,1")
-    e.add_argument("--input", default="synthetic-ring", choices=("synthetic-ring", "rx-v4"))
+    e.add_argument("--halves", default="",
+                   help="owner halves, one per GPU (WS-T fleet-load: 2j,2j+1); default "
+                        "--half-base + GPU index")
+    e.add_argument("--input", default=None, choices=("synthetic-ring", "rx-v4"),
+                   help="default: rx-v4 when --shm-name is given, else synthetic-ring")
+    e.add_argument("--shm-name", "--shm", dest="shm_name", default="", help="ring v4 (WS-T)")
+    e.add_argument("--plan", default="", help="TieredDmPlan npz (default: built for --opoint)")
     e.add_argument("--opoint", default="2x-gridded-ns2-cint4")
-    e.add_argument("--minutes", type=float, default=10.0)
-    e.add_argument("--out", default="b8_out")
-    e.add_argument("--half", default=None)
+    e.add_argument("--minutes", type=float, default=10.0, help="total, split over --variants")
+    e.add_argument("--out", default="b8_out", help="directory; b8_engine.json is the result")
+    e.add_argument("--variants", default="staged:reg",
+                   help="k1:k3b pairs, run one after another (minutes split between them); "
+                        "the default is the G0 pick (staged K1, register K3b, fused FFT)")
+    e.add_argument("--ring-access", dest="ring_access", default="pread",
+                   choices=("pread", "mmap"))
+    e.add_argument("--attach-timeout-s", dest="attach_timeout_s", type=float, default=300.0)
+    e.add_argument("--first-data-timeout-s", dest="first_data_timeout_s", type=float,
+                   default=600.0)
+    e.add_argument("--idle-stop-s", dest="idle_stop_s", type=float, default=10.0)
+    e.add_argument("--antpos-npz", dest="antpos_npz", default="")
+    e.add_argument("--dec-deg", dest="dec_deg", type=float, default=DEC_DEG)
+    e.add_argument("--half", default=None, help=argparse.SUPPRESS)
+    e.add_argument("--seconds", type=float, default=0.0, help=argparse.SUPPRESS)
     e.add_argument("--half-base", dest="half_base", type=int, default=0)
-    e.add_argument("--shm", default="")
-    e.add_argument("--fft-mode", dest="fft_mode", default="warp")
+    e.add_argument("--fft-mode", dest="fft_mode", default="fused")
     e.add_argument("--bank", default="b3x", choices=("b3x", "box"))
     e.add_argument("--cpu", action="store_true", help="CPU twins (plumbing dry run only)")
+    e.add_argument("--loss", type=float, default=0.0,
+                   help="synthetic ring: datagram loss probability (G1: 3-7e-4 in production)")
+    e.add_argument("--loss-rows-per-dg", dest="loss_rows_per_dg", type=int, default=4)
+    e.add_argument("--dropout-streams", dest="dropout_streams", default="",
+                   help="synthetic ring: streams of a corr node that stops, e.g. 0-3")
+    e.add_argument("--dropout-at-s", dest="dropout_at_s", type=float, default=0.0)
+    e.add_argument("--dropout-s", dest="dropout_s", type=float, default=0.0)
     sub.add_parser("teardown")
     sub.add_parser("_selftest-interp")
     a = ap.parse_args(argv)
+    if a.cmd == "engine" and a.input is None:
+        a.input = "rx-v4" if a.shm_name else "synthetic-ring"
     try:
         if a.cmd == "compile-check":
             return cmd_compile_check(a)

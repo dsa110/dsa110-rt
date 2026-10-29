@@ -118,7 +118,8 @@ def test_dry_run_prints_every_step_and_executes_nothing():
         if s.touches:
             block = text.split(f"[{s.id}]")[1].split("\n[")[0]
             assert "GUARD $ (h23" in block and "check fleet-stopped" in block, s.id
-    assert "PLACEHOLDER" in text and "window critical path" in text
+    # placeholder steps disappear as the owed bench scripts land (all delivered by 2026-10-29)
+    assert "step(s) are placeholders" in text and "window critical path" in text
     assert "<format: set at run time>" in text            # chosen at the S1 step
     assert "sudo -n install -m 0644" in text
 

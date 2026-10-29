@@ -31,6 +31,18 @@ def test_compile_check_passes_on_cpu(tmp_path):
             "twin_k3b"} <= names
     st = {r["check"]: r["status"] for r in res if r["check"] in ("cuda_nvrtc", "triton_interpret")}
     print(st)
+    nv = next(r for r in res if r["check"] == "cuda_nvrtc")
+    from dsart.x2.search import nvrtc
+    if nvrtc.available():                                     # NVRTC needs no GPU: must really compile
+        assert nv["status"] == "ok", nv
+        assert {"k0_unpack_frame2", "k2_colfft_256", "k3a_rowc2r_256", "k1_staged",
+                "k3b_cuda_b3x", "k3b_cuda_box", "k3b_reg_b3x_0", "k3b_reg_b3x_2",
+                "k3b_reg_box_0"} <= set(
+            nv["kernels"]), nv
+    tc = {r.get("kernel"): r["status"] for r in res if r["check"] == "triton_compile"}
+    if tc.get("K1") == "ok":                       # Triton present: every variant compiled
+        fused = {k: v for k, v in tc.items() if k and k.startswith("K3b fused")}
+        assert len(fused) == 4 and set(fused.values()) == {"ok"}, tc
 
 
 def test_gpu_subcommands_refuse_without_gpu_and_teardown_is_clean(tmp_path):

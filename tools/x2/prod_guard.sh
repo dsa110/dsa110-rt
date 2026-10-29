@@ -20,8 +20,12 @@
 MIN_RATE=${MIN_RATE:-4.9}
 
 prod_pids() {
-  local pid cwd
+  local pid cwd comm
   for pid in $(pgrep -f "${GUARD_PROD_PATTERN:-dsart[.]services[.]|dsart_capture_manythread}"); do
+    # only real interpreters / the capture binary count: shell wrappers (ssh 'bash -c ...', pgrep lines)
+    # that merely mention dsart.services must not trip the guard (2026-10-29: a transient one did, on n02)
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+    case "$comm" in python*|dsart_capture*|${GUARD_PROD_COMM:-python*}) ;; *) continue ;; esac
     cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
     case "$cwd" in /home/ubuntu/x2_scratch*) continue ;; esac
     echo "$pid"
@@ -71,16 +75,20 @@ if [ "$MODE" = live ]; then
   ) &
 else
   (
+    prev=
     while kill -0 "$PID" 2>/dev/null; do
-      p=$(prod_pids | head -3 | tr '\n' ' ')
-      if [ -n "$p" ]; then
-        echo "production started (pids $p)" > "$TRIP"
+      cur=$(prod_pids | sort | tr '\n' ' ')
+      # debounce: trip only on a production pid seen in two consecutive polls (2 s apart)
+      both=$(comm -12 <(echo "$prev" | tr ' ' '\n' | sort) <(echo "$cur" | tr ' ' '\n' | sort) | tr '\n' ' ')
+      if [ -n "${both// /}" ]; then
+        echo "production started (pids $both)" > "$TRIP"
         kill -9 -- -"$PID" 2>/dev/null
         break
       fi
+      prev=$cur
       sleep 2
     done
-  ) &
+  ) 2>/dev/null &
 fi
 WPID=$!
 wait "$PID"

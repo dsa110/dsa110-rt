@@ -479,5 +479,7 @@ def test_repo_2x_placeholders_block_a_switch(plans):
     rep = opr.validate_set(s, NS2)
     assert not rep.ok
     owners = {tok.split(":")[1] for _i, _p, tok in rep.placeholders if tok.startswith("X2TODO:")}
-    assert {"WS-C", "WS-S", "WS-T"} <= owners
+    # placeholders shrink as workstreams deliver (WS-C's corr args were filled 2026-10-29); while any
+    # remain, the set must not be switchable
+    assert owners and owners <= {"WS-C", "WS-S", "WS-T", "WS-D", "WS-O"}
     assert "placeholder" in rep.summary()

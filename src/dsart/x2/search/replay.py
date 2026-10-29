@@ -58,7 +58,8 @@ def ring_from_recording(rec, dm: int, *, n_values: int, t_buf: Optional[int] = N
 
 def replay_1x(rec, dm: int, *, plan, lut: np.ndarray, n_filled: np.ndarray, n_grid: int = 256,
               n_cycles: Optional[int] = None, fft_mode: str = "pruned",
-              backend: str = "cpu", tol: Optional[dict] = None) -> dict:
+              backend: str = "cpu", tol: Optional[dict] = None,
+              cfg_kw: Optional[dict] = None) -> dict:
     """Run both chains over a recording of coarse DM ``dm``; returns per-cycle
     match statistics and an overall ``ok``."""
     from .compat1x import compare_candidates, production_cycle_cpu
@@ -73,7 +74,8 @@ def replay_1x(rec, dm: int, *, plan, lut: np.ndarray, n_filled: np.ndarray, n_gr
     inputs = {spec.d: DmInputs(fmt=RowFormat("cint8", n_values=nfm), csr=csr,
                                c_v=np.ones((S, nfm), np.float32), offset=0.0)}
     eng = OwnerEngine(plan, inputs, ring, EngineConfig.compat_1x(n_grid=n_grid, fft_mode=fft_mode,
-                                                                 backend=backend))
+                                                                 backend=backend,
+                                                                 **(cfg_kw or {})))
     a, b = rec.t_range(dm)
     hop = spec.hop
     pad_l, pad_r = spec.max_pos, spec.max_neg

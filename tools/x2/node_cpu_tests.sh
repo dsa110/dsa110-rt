@@ -2,7 +2,7 @@
 # x2 CPU test harness: run dsart tests on a SEARCH NODE (CLAUDE.md: never on h23), CPU only, at
 # the lowest priority, while the node keeps observing.
 #
-#   tools/x2/node_cpu_tests.sh [-n NODE] [-t TAG] [-b] [-g GPUS] -- tests/x2/test_a.py [tests/...]
+#   tools/x2/node_cpu_tests.sh [-n NODE] [-t TAG] [-b] [-g GPUS] [-e KEY=VALUE]... -- tests/x2/test_a.py [tests/...]
 #
 # - scratch copy of the node's own checkout (inherits its cpython-311 C extensions), then this
 #   worktree's src/ tests/ tools/ configs/ bench/ docs/ overlaid on it (never the production tree);
@@ -16,13 +16,15 @@
 # - -g GPUS (e.g. -g 0,1): GPU mode for a node with production STOPPED (rev 5, observing off): the guard
 #   refuses unless no production process runs and kills the run if one starts; CUDA_VISIBLE_DEVICES=GPUS,
 #   x2_gpu tests included, no single-core pin, nice 5, 3600 s timeout per file.
+# - -e KEY=VALUE (repeatable): extra environment for the tests (e.g. DSART_X2_I1_VOLTAGES=...).
 set -eo pipefail
 NODE=n13.pro.pvt
 TAG=$(git rev-parse --abbrev-ref HEAD | tr '/' '_')
 BUILD=0
 GPUS=
-while getopts "n:t:bg:" o; do
-  case $o in n) NODE=$OPTARG ;; t) TAG=$OPTARG ;; b) BUILD=1 ;; g) GPUS=$OPTARG ;; *) exit 2 ;; esac
+XENV=
+while getopts "n:t:bg:e:" o; do
+  case $o in n) NODE=$OPTARG ;; t) TAG=$OPTARG ;; b) BUILD=1 ;; g) GPUS=$OPTARG ;; e) XENV="$XENV $OPTARG" ;; *) exit 2 ;; esac
 done
 shift $((OPTIND - 1))
 [ "$1" = "--" ] && shift
@@ -46,6 +48,7 @@ if [ -n "$GPUS" ]; then
   TMO=3600
   GUARD="env GUARD_REQUIRE_STOPPED=1 bash tools/x2/prod_guard.sh"
 fi
+ENVS="$ENVS$XENV"
 
 ssh -o BatchMode=yes "$NODE" "test -d $SCR || { mkdir -p $(dirname $SCR) && $LOW cp -a /home/ubuntu/proj/dsa110-rt $SCR; }"
 rsync -a --exclude='*.so' --exclude='__pycache__' --exclude='*.pdf' --exclude='*.png' \

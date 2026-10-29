@@ -34,10 +34,11 @@ def opoint(kind: str = "gridded", n_sub: int = 2, bits_main: int = 8):
 
 @functools.lru_cache(maxsize=None)
 def value_map(kind: str = "gridded", n_sub: int = 2, bits_main: int = 8):
-    """WS-P's value map for a 2x format (fixture antenna positions, DEC 71.63)."""
+    """WS-P's value map for a 2x format (fixture antenna positions, DEC 71.63), built with SPEC §3's
+    production inputs (antpos_u = None, as corr_fast and the owner engine do)."""
     from dsart.grid.baseline_grid import build_value_map_for_opoint
-    e, n, u, mask = antpos()
-    return build_value_map_for_opoint(opoint(kind, n_sub, bits_main), e, n, antpos_u=u,
+    e, n, _u, mask = antpos()
+    return build_value_map_for_opoint(opoint(kind, n_sub, bits_main), e, n,
                                       is_core_baseline_mask=mask, dec_deg=DEC)
 
 

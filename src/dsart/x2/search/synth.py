@@ -59,17 +59,19 @@ def make_dm_inputs(cells: Sequence[np.ndarray], *, n_grid: int, fmt: RowFormat,
     S = len(cells)
     V = fmt.n_values
     c_v = np.zeros((S, V), dtype=np.float32)
+    w_v = np.zeros((S, V), dtype=np.float32)
     off = 0.0
     for s in range(S):
-        c, off = decode_constants(fmt, step_main=step_main, step_heavy=step_heavy,
-                                  n_contrib=None if n_contrib is None else n_contrib[s])
+        c, w, off = decode_constants(fmt, step_main=step_main, step_heavy=step_heavy,
+                                     n_contrib=None if n_contrib is None else n_contrib[s])
         c_v[s] = c
+        w_v[s] = w
     # decoded noise is ~unit per component in sigma_hat units (x sqrt(n))
     vs = [np.ones(V) if n_contrib is None else np.sqrt(np.asarray(n_contrib[s], float))
           for s in range(S)]
     if fmt.kind == "cint8":
         vs = None
-    return DmInputs(fmt=fmt, csr=csr, c_v=c_v, offset=float(off), value_sigma=vs)
+    return DmInputs(fmt=fmt, csr=csr, c_v=c_v, offset=float(off), value_sigma=vs, w_v=w_v)
 
 
 @dataclass

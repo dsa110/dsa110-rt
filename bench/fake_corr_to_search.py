@@ -362,7 +362,8 @@ def format_framers(fmt: str, chgroup: int, plan_path: str, antpos_npz: str, dec_
     plan = TieredDmPlan.from_npz(plan_path)
     z = np.load(antpos_npz)
     mask = core_baseline_mask_from_station_numbers(z["station"])
-    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"], antpos_u=z["antpos_u"],
+    # SPEC §3 production inputs: antpos_u = None, as corr_fast and the owner engine do
+    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"],
                                     is_core_baseline_mask=mask, dec_deg=dec_deg)
     rule = q.RowRule.for_format(op.bits_main, op.n_sub, warmup_blocks=0)
     rng = np.random.default_rng(seed + chgroup)
@@ -866,7 +867,8 @@ def cmd_sweep(a) -> int:
                 "tx", "--mode", "sweep", "--chgroup", str(g), "--n-tx", str(n_tx),
                 "--dests", d_list, "--bind-ip", drv.ip.get(n, ""), "--rates", a.rates_gbps,
                 "--dwell-s", str(a.dwell_s), "--gap-s", str(a.gap_s), "--go-file", drv.go_file(),
-                "--frame-bytes", str(a.frame_bytes)] + (["--nic"] if a.nic_counters else []),
+                "--frame-bytes", str(a.frame_bytes), "--burst-bytes", str(a.burst_bytes)]
+                + (["--nic"] if a.nic_counters else []),
                 f"sweep_tx_{g}_{n}"))
         start = drv.barrier(list(zip(drv.rx_nodes, rx_out)) + list(zip(drv.tx_nodes, tx_out)),
                             a.lead_s, a.ready_timeout_s)
@@ -943,7 +945,8 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
                 "tx", "--mode", "format", "--format", a.format, "--plan", a.plan, "--chgroup", str(g),
                 "--n-tx", str(len(drv.tx_nodes)), "--dests", dl, "--bind-ip", drv.ip.get(n, ""),
                 "--load-factor", str(a.load_factor), "--minutes", str(a.minutes),
-                "--go-file", drv.go_file(), "--antpos-npz", antpos, "--dec-deg", str(a.dec_deg)]
+                "--go-file", drv.go_file(), "--antpos-npz", antpos, "--dec-deg", str(a.dec_deg),
+                "--burst-bytes", str(a.burst_bytes)]
                 + (["--dm-subset", a.dm_subset] if a.dm_subset else [])
                 + (["--nic"] if not drv._is_local(n) else []), f"{name}_tx_{g}_{n}"))
         start = drv.barrier(list(zip(drv.rx_nodes, st_out)) + list(zip(drv.tx_nodes, tx_out)),
@@ -954,7 +957,12 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
         eng = {}
         if engines and a.engine:
             for j, n in enumerate(drv.rx_nodes):
-                r = drv.run_on(n, f"cat {drv.results}/{a.marker}_engine_{j}_{n}/*.json 2>/dev/null "
+                # the engines finish after the TX: wait (<= 300 s) for each one's final JSON, or a fast
+                # node's result is read before a slower node's engine has written it (G1 smoke run)
+                edir = f"{drv.results}/{a.marker}_engine_{j}_{n}"
+                drv.run_on(n, f"for i in $(seq 150); do grep -qs '\"final\": true' {edir}/*.json && break; "
+                              "sleep 2; done", timeout=330)
+                r = drv.run_on(n, f"cat {edir}/*.json 2>/dev/null "
                                   "| head -c 200000")
                 eng[n] = r.stdout[:200000] if r.returncode == 0 else None
     finally:
@@ -1058,6 +1066,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gap-s", type=float, default=4.0)
     p.add_argument("--frame-bytes", type=int, default=MAX_DATAGRAM)
     p.add_argument("--record-pps", action="store_true", help="(always recorded)")
+    p.add_argument("--burst-bytes", type=int, default=16 << 10,
+                   help="sender token-bucket depth per destination (G1 2026-10-29: 512 KB -> 1-5.6%% NIC "
+                        "port-buffer discards from incast microbursts; 16 KB -> none up to 17 Gb/s)")
     p.add_argument("--nic-counters", action="store_true")
     p.set_defaults(func=cmd_sweep)
     for name, func in (("fleet-load", cmd_fleet_load), ("snap-live", cmd_snap_live)):
@@ -1071,6 +1082,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--dec-deg", type=float, default=71.63)
         p.add_argument("--retention-s", type=float, default=20.0)
         p.add_argument("--dm-subset", default=None, help="debug: comma list of coarse DMs to send")
+        p.add_argument("--burst-bytes", type=int, default=16 << 10,
+                       help="sender token-bucket depth per destination (see sweep --burst-bytes)")
         p.add_argument("--rx-no-prefault", action="store_true",
                        help="debug: search_rx --no-prefault (small test rings)")
         if name == "fleet-load":
@@ -1095,7 +1108,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--go-file", default=None)
     p.add_argument("--go-timeout-s", type=float, default=1800.0)
     p.add_argument("--frame-bytes", type=int, default=MAX_DATAGRAM)
-    p.add_argument("--burst-bytes", type=int, default=512 << 10)
+    p.add_argument("--burst-bytes", type=int, default=16 << 10)
     p.add_argument("--format", default=None)
     p.add_argument("--plan", default=None)
     p.add_argument("--antpos-npz", default=None)

@@ -9,7 +9,7 @@ not contract through.
 
 K1 (``k1_combine``): one program per (cell block, row block, fine DM);
 dynamic loop over the cell's entries (no 64-entry cap -- a 2x half-cell
-can carry more), decode ``(code + off) * c_v`` from the time-minor code
+can carry more), decode ``((code + off) * c_v) * w_v`` from the time-minor code
 ring, conjugate, accumulate, x ``0.5 (-1)^(u+w)``.
 
 K3b (``k3b_detect``): one launch per filter (bank order), one program per
@@ -40,7 +40,7 @@ __all__ = ["k1_combine", "k3b_detect"]
 
 
 @triton.jit
-def _k1_kernel(codes_ptr, cv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_ptr, out_ptr,
+def _k1_kernel(codes_ptr, cv_ptr, wv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_ptr, out_ptr,
                n_act, n_t, t_lo, R, V, S, off,
                MAX_NE: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_T: tl.constexpr):
     pid_c = tl.program_id(0)
@@ -62,6 +62,7 @@ def _k1_kernel(codes_ptr, cv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_pt
         v = tl.load(ev_ptr + e, mask=has, other=0)
         cj = tl.load(ec_ptr + e, mask=has, other=0)
         c = tl.load(cv_ptr + s * V + v, mask=has, other=0.0)
+        wv = tl.load(wv_ptr + s * V + v, mask=has, other=0.0)
         sh = tl.load(sh_ptr + f * S + s, mask=has, other=0)
         row = (t_lo + tt)[:, None] - sh[None, :]
         slot = ((row % R) + R) % R
@@ -69,8 +70,8 @@ def _k1_kernel(codes_ptr, cv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_pt
         m2 = has[None, :] & tm[:, None]
         cre = tl.load(codes_ptr + base, mask=m2, other=0).to(tl.float32)
         cim = tl.load(codes_ptr + base + 1, mask=m2, other=0).to(tl.float32)
-        vre = (cre + off) * c[None, :]
-        vim = (cim + off) * c[None, :]
+        vre = ((cre + off) * c[None, :]) * wv[None, :]
+        vim = ((cim + off) * c[None, :]) * wv[None, :]
         vim = tl.where(cj[None, :] != 0, -vim, vim)
         vre = tl.where(m2, vre, 0.0)
         vim = tl.where(m2, vim, 0.0)
@@ -87,19 +88,22 @@ def _k1_kernel(codes_ptr, cv_ptr, ptr_ptr, es_ptr, ev_ptr, ec_ptr, hs_ptr, sh_pt
 
 def k1_combine(codes: torch.Tensor, c_v: torch.Tensor, csr_t: dict, shifts: torch.Tensor, *,
                t_lo: int, n_t: int, offset: float = 0.0, out: torch.Tensor = None,
-               block_c: int = 64, block_t: int = 16) -> torch.Tensor:
+               block_c: int = 64, block_t: int = 16, w_v: torch.Tensor = None) -> torch.Tensor:
     """``uv [F, n_t, n_act]`` complex64 (as float32 ``[..., 2]`` storage).
 
-    ``codes`` int8 ``[S, V, R, 2]`` contiguous; ``c_v`` float32 ``[S, V]``;
+    ``codes`` int8 ``[S, V, R, 2]`` contiguous; ``c_v`` float32 ``[S, V]``
+    steps, ``w_v`` float32 ``[S, V]`` natural weights (None = 1);
     ``csr_t`` = :func:`csr_tensors`; ``shifts`` int32 ``[F, S]``.
     """
+    if w_v is None:
+        w_v = torch.ones_like(c_v)
     S, V, R, two = codes.shape
     F = int(shifts.shape[0])
     n_act = int(csr_t["n_act"])
     if out is None:
         out = torch.empty((F, n_t, n_act, 2), dtype=torch.float32, device=codes.device)
     grid = (triton.cdiv(n_act, block_c), triton.cdiv(n_t, block_t), F)
-    _k1_kernel[grid](codes, c_v, csr_t["cell_ptr"], csr_t["ent_stream"], csr_t["ent_value"],
+    _k1_kernel[grid](codes, c_v, w_v, csr_t["cell_ptr"], csr_t["ent_stream"], csr_t["ent_value"],
                      csr_t["ent_conj"], csr_t["half_sign"], shifts, out,
                      n_act, int(n_t), int(t_lo), int(R), int(V), int(S), float(offset),
                      MAX_NE=int(csr_t["max_ne"]), BLOCK_C=block_c, BLOCK_T=block_t)

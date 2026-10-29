@@ -45,7 +45,8 @@ def _map(fid="2x-gridded-ns2-cint4"):
 
 
 @_gpu
-def test_gpu_k0_unpack_equals_twin():
+@pytest.mark.parametrize("tiled", [False, True])
+def test_gpu_k0_unpack_equals_twin(tiled):
     from dsart.x2.search.codec import as_stream_formats, pack_frame2_rows
     from dsart.x2.search.combine import StreamRing, k0_rows_to_ring
     from dsart.x2.search.kernels_cuda import get_module
@@ -76,10 +77,16 @@ def test_gpu_k0_unpack_equals_twin():
     nv = t([f.n_values for f in fm.per_stream], torch.int32)
     nh = t([f.n_heavy for f in fm.per_stream], torch.int32)
     bits = t([f.bits for f in fm.per_stream], torch.int32)
-    get_module().get_function("k0_unpack_frame2")(
-        (n, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes),
-                         _ptr(vout), _ptr(nod), np.int32(S), np.int32(n),
-                         np.int32(fm.row_bytes), np.int32(V), np.int32(64), np.int64(100)))
+    if tiled:                                         # rows 100..139 wrap the 64-slot ring
+        from dsart.x2.search.kernels_cuda import launch_k0_tile
+        launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nod, S=S, n=n,
+                       row_bytes=fm.row_bytes, V=V, R=64, row0=100,
+                       stream=torch.cuda.current_stream())
+    else:
+        get_module().get_function("k0_unpack_frame2")(
+            (n, S), (128,), (_ptr(draw), _ptr(dval), _ptr(nv), _ptr(nh), _ptr(bits), _ptr(codes),
+                             _ptr(vout), _ptr(nod), np.int32(S), np.int32(n),
+                             np.int32(fm.row_bytes), np.int32(V), np.int32(64), np.int64(100)))
     torch.cuda.synchronize()
     assert np.array_equal(codes.cpu().numpy(), ring.codes)
     assert np.array_equal(vout.cpu().numpy().astype(bool), ring.valid)
@@ -98,9 +105,43 @@ def test_gpu_k1_triton_equals_twin_on_the_2x_map():
     dev = torch.device("cuda")
     got = k1_combine(torch.from_numpy(codes).to(dev), torch.as_tensor(inp.c_v, device=dev),
                      csr_tensors(inp.csr, dev), torch.from_numpy(sh).to(dev), t_lo=200,
-                     n_t=4).cpu().numpy()
-    want = k1_twin(codes, c_v=inp.c_v, offset=0.0, csr=inp.csr, shifts=sh, t_lo=200, n_t=4)
+                     n_t=4, w_v=torch.as_tensor(inp.weights(), device=dev)).cpu().numpy()
+    want = k1_twin(codes, c_v=inp.c_v, offset=0.0, csr=inp.csr, shifts=sh, t_lo=200, n_t=4,
+                   w_v=inp.w_v)
     assert np.array_equal(got[..., 0], want.real) and np.array_equal(got[..., 1], want.imag)
+
+
+@_gpu
+@pytest.mark.parametrize("fid", ["2x-gridded-ns2-cint4", "2x-baselines-ns4-cint5"])
+def test_gpu_k1_staged_equals_twin_on_the_2x_map(fid):
+    """``--k1 staged`` (CUDA smem windows) == k1_twin bit for bit, with
+    per-stream absolute shifts far apart and a ~50-row stage-2 sweep."""
+    from dsart.x2.search.combine import k1_twin
+    from dsart.x2.search.k1_staged import k1_staged, staged_geometry
+    from dsart.x2.search.kernels_triton import csr_tensors, k1_combine
+
+    _op, _vm, inp = _map(fid)
+    rng = np.random.default_rng(2)
+    S, V = inp.c_v.shape
+    R = 512
+    codes = rng.integers(-7, 8, size=(S, V, R, 2)).astype(np.int8)
+    F = 18
+    base = rng.integers(0, 300, size=S)
+    sh = (base[None, :] + rng.integers(0, 50, size=(F, S))).astype(np.int32)
+    dev = torch.device("cuda")
+    ct = csr_tensors(inp.csr, dev)
+    g = staged_geometry(sh, n_t=64)
+    ct["smax"] = torch.as_tensor(g.smax, dtype=torch.int32, device=dev)
+    args = (torch.from_numpy(codes).to(dev), torch.as_tensor(inp.c_v, device=dev), ct,
+            torch.from_numpy(sh).to(dev))
+    wv = torch.as_tensor(inp.weights(), device=dev)
+    got = k1_staged(*args, t_lo=700, n_t=64, w_v=wv, geom=g).cpu().numpy()
+    tri = k1_combine(*args, t_lo=700, n_t=64, w_v=wv).cpu().numpy()
+    assert np.array_equal(got, tri)
+    want = k1_twin(codes, c_v=inp.c_v, offset=0.0, csr=inp.csr, shifts=sh[:3], t_lo=700,
+                   n_t=64, w_v=inp.w_v)
+    assert np.array_equal(got[:3, ..., 0], want.real) and np.array_equal(got[:3, ..., 1],
+                                                                        want.imag)
 
 
 @_gpu
@@ -118,8 +159,9 @@ def test_gpu_k1_1x_bit_exact_vs_combine_sparse_v4(tmp_path):
 
 
 @_gpu
+@pytest.mark.parametrize("mode", ["warp", "fused", "fused_v2", "fused_v1"])
 @pytest.mark.parametrize("fold", ["col", "row"])
-def test_gpu_fft_pair_matches_twin_and_float64(fold):
+def test_gpu_fft_pair_matches_twin_and_float64(fold, mode):
     from dsart.x2.search.csr import csr_from_value_cells
     from dsart.x2.search.fft import FftPlan, image_from_uv_twin
 
@@ -137,7 +179,7 @@ def test_gpu_fft_pair_matches_twin_and_float64(fold):
 
     class _Inp:
         pass
-    run = _warp_runner(torch.from_numpy(uv).cuda(), plan, _Inp(), torch.device("cuda"))
+    run = _warp_runner(torch.from_numpy(uv).cuda(), plan, _Inp(), torch.device("cuda"), mode=mode)
     got = run().float().cpu().numpy()                         # fp16 ring, 1/N^2 pixel scale
     twin = image_from_uv_twin(uv, plan, np.ones((256, 256)), out_dtype=None)
     sig = float(np.std(twin))
@@ -169,7 +211,38 @@ def test_gpu_k3b_triton_equals_twin(bank):
 
 
 @_gpu
-def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring():
+@pytest.mark.parametrize("bank", ["box", "b3x"])
+def test_gpu_k3b_fused_equals_twin_and_v1(bank):
+    """``--k3b fused`` (one generated kernel) == twin == v1, bit for bit."""
+    from dsart.x2.search.filters import FilterBank, k3b_twin
+    from dsart.x2.search.k3b_fused import k3b_fused
+    from dsart.x2.search.kernels_triton import k3b_detect
+
+    rng = np.random.default_rng(4)
+    fb = FilterBank.build() if bank == "box" else FilterBank.b3x()
+    F, P, n_c = 3, 4096, 384
+    R = n_c + fb.history() + 5
+    ring = rng.standard_normal((R, F, P)).astype(np.float16)
+    ring[50, 1, 77] = 600.0
+    c_first = 3 * R + 2 + fb.max_d + fb.max_a
+    si = rng.uniform(0.8, 1.2, F).astype(np.float32)
+    sk = (1 / fb.seeds).astype(np.float32)
+    taps = np.array([0, 77, 4095])
+    dev = torch.device("cuda")
+    kw = dict(ring_row0=0, c_first=c_first, n_c=n_c, s_inv=sk, bank=fb, tap_pixels=taps)
+    b0, t0, p0 = k3b_twin(ring, sigma_inv=si, **kw)
+    rt = torch.from_numpy(ring).to(dev)
+    st = torch.from_numpy(si).to(dev)
+    for fn in (k3b_fused, k3b_detect):
+        b1, t1, p1 = fn(rt, sigma_inv=st, **kw)
+        assert np.array_equal(b1.cpu().numpy(), b0) and np.array_equal(t1.cpu().numpy(), t0)
+        assert np.array_equal(p1.cpu().numpy(), p0)
+
+
+@_gpu
+@pytest.mark.parametrize("k1,k3b,fft", [("triton", "v1", "warp"), ("staged", "fused", "warp"),
+                                        ("staged", "reg", "fused"), ("staged2", "reg", "fused")])
+def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b, fft):
     """Same synthetic 2x ring through backend='cpu' and backend='gpu'."""
     from dsart.x2.search.codec import RowFormat
     from dsart.x2.search.engine import EngineConfig, OwnerEngine
@@ -191,9 +264,11 @@ def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring():
         ring, spec, 0, 3 * 384)
     inp = make_dm_inputs(cells, n_grid=N, fmt=fmt, step_main=0.3534, step_heavy=0.1)
     out = {}
-    for backend, fft in (("cpu", "pruned"), ("gpu", "warp")):
-        eng = OwnerEngine(plan, {0: inp}, ring, EngineConfig(n_grid=N, backend=backend,
-                                                             fft_mode=fft, layer2_n_burnin=0))
+    for backend, fmode in (("cpu", "pruned"), ("gpu", fft)):
+        eng = OwnerEngine(plan, {0: inp}, ring, EngineConfig(
+            n_grid=N, backend=backend, fft_mode=fmode, layer2_n_burnin=0,
+            k1_impl=k1.rstrip("2"), k3b_impl=k3b,
+            k1_fdm_per_pass=2 if k1 == "staged2" else 24))       # staged2: K1 in 2 passes
         out[backend] = eng.process_cycle(1, keep_maps=True).per_dm[0]
     a, b = out["cpu"], out["gpu"]
     assert np.allclose(a.sigma_applied, b.sigma_applied, rtol=1e-3)
@@ -208,7 +283,55 @@ def test_cp1_gpu_list_is_marked():
     import sys
     mod = sys.modules[__name__]
     names = [n for n in dir(mod) if n.startswith("test_gpu_")]
-    assert len(names) == 6                                   # 8 cases with parametrize
+    assert len(names) == 10                                  # 20 cases with parametrize
     for n in names:
         marks = {m.name for m in getattr(getattr(mod, n), "pytestmark", [])}
         assert "x2_gpu" in marks, n
+
+
+@_gpu
+def test_gpu_layer1_kernel_matches_torch_reference():
+    """kernels_cuda.l1_clipstd == noise_norm.layer1.sigma_clipped_std_batched:
+    same lower median (exact), same clip, sums in another order (rtol 1e-5)."""
+    from dsart.noise_norm.layer1 import sigma_clipped_std_batched
+    from dsart.x2.search.kernels_cuda import launch_l1
+
+    rng = np.random.default_rng(9)
+    R, F, P, M = 40, 5, 3000, 10000
+    img = (rng.standard_normal((R, F, P)) * rng.uniform(0.5, 2.0, (1, F, 1))).astype(np.float16)
+    img[3, 1, 10:400] = 80.0                                  # outliers clipped away
+    img[7, 2, :] = np.float16(np.inf)                         # non-finite dropped
+    lt = rng.integers(0, 32, size=(F, M)).astype(np.int32)
+    lp = rng.integers(0, P, size=(F, M)).astype(np.int32)
+    lt[4, :] = 7
+    lp[4, :] = rng.integers(0, P, M)                          # row 4: all samples non-finite
+    img[(17 + 7) % R, 4, :] = np.float16(np.inf)
+    t0 = 17
+    smp = img[np.mod(t0 + lt, R), np.arange(F)[:, None], lp].astype(np.float32)
+    want = sigma_clipped_std_batched(torch.from_numpy(smp)).numpy()
+    dev = torch.device("cuda")
+    out = torch.empty(F, dtype=torch.float32, device=dev)
+    launch_l1(torch.from_numpy(img).to(dev), torch.from_numpy(lt).to(dev),
+              torch.from_numpy(lp).to(dev), out, F=F, P=P, R_img=R, t0=t0, M=M,
+              stream=torch.cuda.current_stream())
+    got = out.cpu().numpy()
+    assert want[4] == 0.0 and got[4] == 0.0
+    assert np.allclose(got, want, rtol=1e-5, atol=0), (got, want)
+
+
+@_gpu
+def test_gpu_clipstd_rows_matches_torch_reference():
+    """kernels_cuda.clipstd_rows (Layer-2, 1e5 samples per row) == the torch
+    sigma_clipped_std_batched (rtol 1e-5)."""
+    from dsart.noise_norm.layer1 import sigma_clipped_std_batched
+    from dsart.x2.search.kernels_cuda import launch_clipstd_rows
+
+    rng = np.random.default_rng(10)
+    x = (rng.standard_normal((8, 100000)) * rng.uniform(0.5, 300.0, (8, 1))).astype(np.float32)
+    x[2, :500] = 1e6
+    x[5, 7] = np.nan
+    want = sigma_clipped_std_batched(torch.from_numpy(x.copy())).numpy()
+    xd = torch.from_numpy(x).cuda()
+    out = torch.empty(8, dtype=torch.float32, device="cuda")
+    launch_clipstd_rows(xd, out, stream=torch.cuda.current_stream())
+    assert np.allclose(out.cpu().numpy(), want, rtol=1e-5, atol=0), (out.cpu().numpy(), want)

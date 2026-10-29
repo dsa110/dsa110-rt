@@ -11,12 +11,14 @@ A ring row is one stream sample of one coarse DM. Two row formats:
   two's complement, padded to a byte. Decode (SPEC §4.5, reference
   ``x2/quant.py``) = ``(code + off) * s`` with ``off = 0`` (mid-tread, the
   default) or ``0.5`` (mid-rise, frame flag bit 6), ``s = s_heavy`` /
-  ``s_main`` (frame header, sigma_hat units), times the static owner
-  weight ``sqrt(n_v)`` -- folded into ONE per-value fp32 constant
-  ``c_v = fl32(s * sqrt(n_v))`` so the decode is a single rounding
-  ``fl32((code + off) * c_v)`` and K1 is pure fp32 adds (no FMA contraction
-  can make the GPU and its numpy twin differ). The dynamic sigma_hat is
-  NOT applied (today's per-row 1/sigma weighting semantics).
+  ``s_main`` (frame header, sigma_hat units), then times the static owner
+  weight ``w_v = f32(sqrt(n_v))`` -- TWO fp32 roundings exactly as SPEC
+  §4.5 / ``quant.decode`` + ``quant.natural_weight``:
+  ``fl32(fl32((code + off) * s_v) * w_v)`` (``code + off`` is exact). The
+  per-value constants are ``c_v = s_v`` (step) and ``w_v``; K1 multiplies
+  twice, then adds, with selects between (no FMA contraction can make the
+  GPU and its numpy twin differ). The dynamic sigma_hat is NOT applied
+  (today's per-row 1/sigma weighting semantics).
 
 Everything here is numpy and is the reference the K0 CUDA kernel's twin
 (:mod:`dsart.x2.search.kernels_cuda`) is checked against.
@@ -34,6 +36,7 @@ __all__ = [
     "as_stream_formats",
     "pack_frame2_rows",
     "unpack_frame2_rows",
+    "unpack_frame2_rows_ref",
     "unpack_cint8_rows",
     "decode_constants",
     "decode_values",
@@ -151,7 +154,46 @@ def pack_frame2_rows(re: np.ndarray, im: np.ndarray, fmt: RowFormat) -> np.ndarr
 
 
 def unpack_frame2_rows(raw: np.ndarray, fmt: RowFormat) -> tuple:
-    """``uint8 [rows, row_bytes]`` -> ``(re, im)`` int8 ``[rows, n_values]``."""
+    """``uint8 [rows, row_bytes]`` -> ``(re, im)`` int8 ``[rows, n_values]``.
+
+    Bit for bit :func:`unpack_frame2_rows_ref` (the bit-expansion reference)
+    without its int64 bit array: 4-bit components are the two nibbles of
+    one byte; other widths <= 8 go ``unpackbits`` -> ``packbits`` per
+    component (I1's ``unpack_frame2_rows_fast``; ~the speed the CPU K0 and
+    the offline re-imaging tools need)."""
+    if fmt.kind != "frame2":
+        raise ValueError("unpack_frame2_rows needs a frame2 format")
+    if fmt.n_main and fmt.bits > 8:
+        return unpack_frame2_rows_ref(raw, fmt)
+    raw = np.ascontiguousarray(raw, dtype=np.uint8)[:, :fmt.row_bytes]
+    rows = raw.shape[0]
+    nh, nm, b = fmt.n_heavy, fmt.n_main, fmt.bits
+    re = np.empty((rows, fmt.n_values), dtype=np.int8)
+    im = np.empty((rows, fmt.n_values), dtype=np.int8)
+    if nh:
+        pair = raw[:, :2 * nh].view(np.int8).reshape(rows, nh, 2)
+        re[:, :nh] = pair[..., 0]
+        im[:, :nh] = pair[..., 1]
+    if nm:
+        if b == 4:
+            m = raw[:, 2 * nh:2 * nh + nm]
+            lo_ = (m & 0x0F).astype(np.int16)
+            hi_ = (m >> 4).astype(np.int16)
+            re[:, nh:] = np.where(lo_ >= 8, lo_ - 16, lo_)
+            im[:, nh:] = np.where(hi_ >= 8, hi_ - 16, hi_)
+        else:
+            bits = np.unpackbits(raw[:, 2 * nh:], axis=1, bitorder="little")[:, :2 * nm * b]
+            pad = np.zeros((rows, nm, 2, 8), np.uint8)
+            pad[..., :b] = bits.reshape(rows, nm, 2, b)
+            val = np.packbits(pad, axis=-1, bitorder="little")[..., 0].astype(np.int16)
+            val = np.where(val >= (1 << (b - 1)), val - (1 << b), val)
+            re[:, nh:] = val[..., 0]
+            im[:, nh:] = val[..., 1]
+    return re, im
+
+
+def unpack_frame2_rows_ref(raw: np.ndarray, fmt: RowFormat) -> tuple:
+    """The bit-expansion reference of :func:`unpack_frame2_rows`."""
     if fmt.kind != "frame2":
         raise ValueError("unpack_frame2_rows needs a frame2 format")
     raw = np.ascontiguousarray(raw, dtype=np.uint8)[:, :fmt.row_bytes]
@@ -187,38 +229,42 @@ def decode_constants(
     step_main: float = 1.0,
     step_heavy: float = 1.0,
     n_contrib: Optional[np.ndarray] = None,
-    weight: Optional[np.ndarray] = None,
 ) -> tuple:
-    """Per-value ``(c_v float32 [n_values], offset float32)``.
+    """Per-value ``(c_v float32 [n_values], w_v float32 [n_values], offset)``.
 
-    1x (``cint8``): ``c_v = 1``, offset 0 -- codes summed raw, exactly
-    today's unit-scale combine. 2x (``frame2``): ``c_v = fl32(s * sqrt(n_v)
-    * w_v)`` with ``s = step_heavy`` for ``v < n_heavy`` else
-    ``step_main``; offset 0 (mid-tread) or 0.5 (mid-rise).
+    1x (``cint8``): ``c_v = w_v = 1``, offset 0 -- codes summed raw, exactly
+    today's unit-scale combine. 2x (``frame2``): ``c_v = f32(s)`` with
+    ``s = step_heavy`` for ``v < n_heavy`` else ``step_main``; ``w_v =
+    f32(sqrt(n_v))`` (float64 sqrt, one rounding: ``quant.sqrt_n``) or 1;
+    offset 0 (mid-tread) or 0.5 (mid-rise).
     """
     nv = fmt.n_values
     if fmt.kind == "cint8":
-        return np.ones(nv, dtype=np.float32), np.float32(0.0)
-    s = np.full(nv, float(step_main), dtype=np.float64)
-    s[:fmt.n_heavy] = float(step_heavy)
-    if n_contrib is not None:
-        s = s * np.sqrt(np.asarray(n_contrib, dtype=np.float64))
-    if weight is not None:
-        s = s * np.asarray(weight, dtype=np.float64)
-    return s.astype(np.float32), np.float32(0.5 if fmt.midrise else 0.0)
+        return (np.ones(nv, dtype=np.float32), np.ones(nv, dtype=np.float32),
+                np.float32(0.0))
+    s = np.full(nv, np.float32(step_main), dtype=np.float32)
+    s[:fmt.n_heavy] = np.float32(step_heavy)
+    if n_contrib is None:
+        w = np.ones(nv, dtype=np.float32)
+    else:
+        w = np.sqrt(np.asarray(n_contrib, dtype=np.float64)).astype(np.float32)
+    return s, w, np.float32(0.5 if fmt.midrise else 0.0)
 
 
 def decode_values(re: np.ndarray, im: np.ndarray, c_v: np.ndarray,
-                  offset: float) -> tuple:
-    """fp32 decode with ONE rounding per component: ``fl32((code + off) * c_v)``.
+                  offset: float, w_v: Optional[np.ndarray] = None) -> tuple:
+    """SPEC §4.5 decode per component: ``fl32(fl32((code + off) * c_v) * w_v)``.
 
-    ``code + 0.5`` and the product are formed in float64 (exact: a <=8-bit
-    integer plus 0.5 times a float32 has <= 33 significant bits) and
-    rounded once to float32 -- the same value the GPU's ``(float)code +
-    0.5f`` then ``* c`` produces (both exact before the final rounding).
+    ``code + off`` is exact in float32 (an 8-bit integer plus 0); each
+    product is one correctly-rounded float32 multiply -- the GPU's two
+    ``__fmul_rn`` (no add in between, so nothing to contract).
     """
-    c = np.asarray(c_v, dtype=np.float64)
-    off = float(offset)
-    fr = ((np.asarray(re, dtype=np.float64) + off) * c).astype(np.float32)
-    fi = ((np.asarray(im, dtype=np.float64) + off) * c).astype(np.float32)
-    return fr, fi
+    c = np.asarray(c_v, dtype=np.float32)
+    off = np.float32(offset)
+    fr = (np.asarray(re, dtype=np.float32) + off) * c
+    fi = (np.asarray(im, dtype=np.float32) + off) * c
+    if w_v is not None:
+        w = np.asarray(w_v, dtype=np.float32)
+        fr = fr * w
+        fi = fi * w
+    return fr.astype(np.float32), fi.astype(np.float32)
