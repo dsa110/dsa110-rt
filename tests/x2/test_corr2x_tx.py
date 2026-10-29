@@ -311,3 +311,47 @@ def test_x2_tx_modes_are_2x_only_and_v2_needs_four_hosts(monkeypatch) -> None:
         with pytest.raises(ValueError, match="transport-tx-mode"):
             cfi.run(0, "/tmp/dsart-x2-ws-corr-never", torch.device("cpu"), cfg, opoint=opoint,
                     transport_tx_mode=mode)
+
+
+def test_x2_sender_burst_is_16k_by_default(monkeypatch) -> None:
+    """G1 corner-turn sweep: the 2x sender's token bucket is 16 KB per destination unless
+    ``--x2-tx-burst-bytes`` says otherwise (the MmsgSender class default, 256 KB, overflows the
+    search NIC's port buffer); a bucket shallower than one datagram is refused; the CLI value
+    reaches the sender through ``_build_x2_tx``."""
+    import dsart.transport.send_mmsg as sm
+    from dsart.x2.corr.tx2x import X2_TX_BURST_BYTES, build_mmsg_sender
+    cap: dict = {}
+
+    class _Fake:
+        def __init__(self, dests, **kw):
+            cap.clear()
+            cap.update(kw, dests=dests)
+
+        def start(self):
+            cap["started"] = True
+
+    monkeypatch.setattr(sm, "MmsgSender", _Fake)
+    fmts = _formats(quant.RowRule.for_format(8, 2), [0, 30, 70], [2, 3])
+    hosts = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+    kw = dict(formats=fmts, dm_t_native={0: 16, 3: 16}, owner_half=np.arange(47) % 8, hosts=hosts,
+              port=6626, start=False)
+    build_mmsg_sender(**kw)
+    assert X2_TX_BURST_BYTES == 16384 and cap["burst_bytes"] == 16384 and cap["slot_bytes"] == 9000
+    build_mmsg_sender(**kw, burst_bytes=65536)
+    assert cap["burst_bytes"] == 65536
+    with pytest.raises(ValueError, match="burst_bytes"):
+        build_mmsg_sender(**kw, burst_bytes=8192)
+
+    class _Orch:
+        def stream_formats(self):
+            return fmts
+
+        def tier_dms(self):
+            return {0: 16, 3: 16}
+
+    cfi._build_x2_tx(_Orch(), owner_half=np.arange(47) % 8, mode="v2", hosts=",".join(hosts),
+                     port_base=6625, chgroup=1)
+    assert cap["burst_bytes"] == 16384 and cap["started"]
+    cfi._build_x2_tx(_Orch(), owner_half=np.arange(47) % 8, mode="v2", hosts=",".join(hosts),
+                     port_base=6625, chgroup=1, burst_bytes=32768)
+    assert cap["burst_bytes"] == 32768

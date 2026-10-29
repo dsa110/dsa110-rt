@@ -43,6 +43,12 @@ def test_plan_id_reaches_run(monkeypatch) -> None:
               "--transport-tx-mode", "drain", "--plan-id", "0xdeadbeef", "--max-blocks", "1",
               "--output-dir", "/tmp/dsart-x2-ws-corr-never"])
     assert cap["plan_id"] == "0xdeadbeef" and cap["opoint"] == "2x-gridded-ns2-cint4"
+    assert cap["x2_tx_burst_bytes"] == 16384 and cap["x2_tx_pace"] == 1.25
+    cfi.main(["--chgroup", "1", "--obs-dec-deg", "54.57", "--opoint", "2x-gridded-ns4-cint4",
+              "--t-int-fast-native", "8", "--chan-sum-factor", "2", "--n-sub", "4",
+              "--transport-tx-mode", "drain", "--x2-tx-burst-bytes", "65536", "--max-blocks", "1",
+              "--output-dir", "/tmp/dsart-x2-ws-corr-never"])
+    assert cap["x2_tx_burst_bytes"] == 65536
 
 
 def test_rfi_far_thresholds_solved_at_startup(monkeypatch) -> None:

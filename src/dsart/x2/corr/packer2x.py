@@ -316,14 +316,19 @@ def guard_threshold(G: torch.Tensor, k: float, *, iters: int = 4):
     Starts at ``f32(G / k)`` (float64 division, one rounding: within ~2 ulp
     of the answer) and walks with ``nextafter``; ``valid`` additionally
     proves minimality (``f32(k * prev(t)) <= G``). All float32 IEEE, so CPU
-    and GPU agree."""
-    k32 = torch.tensor(float(np.float32(k)), dtype=torch.float32, device=G.device)
-    t = (G.double() / float(np.float32(k))).float()
+    and GPU agree.
+
+    No host sync: ``k`` enters as a Python scalar (exactly a float32, so the
+    float32 multiply is the same IEEE op); a ``torch.tensor(k, device=cuda)``
+    here was a pageable H2D copy that blocked the host until the stream had
+    drained -- twice per corr block, serialising host launches and GPU."""
+    k32 = float(np.float32(k))
+    t = (G.double() / k32).float()
     zero = torch.zeros_like(t)
     inf = torch.full_like(t, float("inf"))
 
     def pred(u):
-        return (k32 * u) > G
+        return (u * k32) > G
 
     for _ in range(iters):
         dn = torch.nextafter(t, zero)
@@ -534,13 +539,17 @@ class RowRulePacker:
     def resolve_overflow(self, results: list, x: torch.Tensor) -> list:
         """Recode the flows that had more than ``guard_capacity`` guarded rows
         in this block (exact s_row for all of them). Syncs with the device
-        once per stream; a no-op unless a broadband surge tripped the guard
+        once per call (plus once per stream that overflowed); a no-op unless a broadband surge tripped the guard
         on many rows. ``x`` is the tensor :meth:`pack` was given."""
         xr = None
+        if not results:
+            return results
+        # one host sync for the tier: which streams have an overflowing flow at all
+        any_ov = torch.stack([res["guard_overflow"].any() for res in results]).tolist()
         for s, res in enumerate(results):
-            ov = res["guard_overflow"]
-            if not bool(ov.any()):
+            if not any_ov[s]:
                 continue
+            ov = res["guard_overflow"]
             if xr is None:
                 xr = torch.view_as_real(x.to(torch.complex64).contiguous())
             flows = torch.nonzero(ov).flatten()

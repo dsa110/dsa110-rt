@@ -3640,7 +3640,9 @@ def load_antpos_from_cal_blob(
         import yaml as _yaml
         with open(yaml_path, "r") as f:
             ydoc = _yaml.safe_load(f)
-        antenna_order = ydoc["cal_solutions"]["antenna_order"]
+        # per-node cal yaml (``cal_solutions: {antenna_order: ...}``) or the archived
+        # beamformer_weights_<utc>.yaml (top-level ``antenna_order``, x2 replay staging)
+        antenna_order = (ydoc.get("cal_solutions") or ydoc)["antenna_order"]
         mask = core_baseline_mask_from_station_numbers(antenna_order)
     else:
         # No per-node cal yaml sibling (production case). Use the
@@ -3703,7 +3705,7 @@ def load_station_numbers_for_cal(
                 import yaml as _yaml
                 with open(yaml_path, "r") as f:
                     ydoc = _yaml.safe_load(f)
-                order = ydoc["cal_solutions"]["antenna_order"]
+                order = (ydoc.get("cal_solutions") or ydoc)["antenna_order"]
                 return np.asarray(order, dtype=np.int64)
             except Exception:  # noqa: BLE001
                 LOG.exception(
@@ -4077,13 +4079,15 @@ def _x2_tx_mon(meter, tx) -> dict:
 
 
 def _build_x2_tx(orch, *, owner_half, mode: str, hosts: str, port_base: int, chgroup: int,
-                 bind_host: str = "", cpu: int = -1, pace: float = 1.25):
+                 bind_host: str = "", cpu: int = -1, pace: float = 1.25,
+                 burst_bytes: int | None = None):
     """The 2x TX stage of :class:`~dsart.x2.corr.pipeline2x.Corr2xPipeline`
     ``orch``: frame v2 into WS-T's C sendmmsg sender (``mode="v2"``; one
     destination per search node, ``hosts`` in ``SEARCH_NODES`` order, port
-    ``port_base + chgroup``, routes ``dm -> owner_half[dm] // 2``) or into a
-    counting drain (``mode="drain"``, no socket)."""
-    from dsart.x2.corr.tx2x import DrainSink, FramedTx2x, build_mmsg_sender
+    ``port_base + chgroup``, routes ``dm -> owner_half[dm] // 2``, a
+    ``burst_bytes`` token bucket per destination) or into a counting drain
+    (``mode="drain"``, no socket)."""
+    from dsart.x2.corr.tx2x import X2_TX_BURST_BYTES, DrainSink, FramedTx2x, build_mmsg_sender
 
     formats = orch.stream_formats()
     if mode == "drain":
@@ -4104,6 +4108,7 @@ def _build_x2_tx(orch, *, owner_half, mode: str, hosts: str, port_base: int, chg
         formats=formats, dm_t_native=orch.tier_dms(), owner_half=owner_half,
         hosts=host_list, port=int(port_base) + int(chgroup), bind_host=bind_host,
         cpu=cpu, pace=pace,
+        burst_bytes=X2_TX_BURST_BYTES if burst_bytes is None else int(burst_bytes),
     )
     return FramedTx2x(sender, formats)
 
@@ -4150,6 +4155,7 @@ def run(
     x2_tx_bind_host: str = "",
     x2_tx_cpu: int = -1,
     x2_tx_pace: float = 1.25,
+    x2_tx_burst_bytes: int = 16 << 10,
     plan_id: str | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
@@ -4169,7 +4175,9 @@ def run(
     ``"v2"`` (frame v2 through WS-T's C sendmmsg sender to
     ``transport_tx_worker_hosts`` -- the search nodes in SEARCH_NODES order --
     at ``transport_tx_port + chgroup``, routes from the plan's owner map,
-    paced at ``x2_tx_pace`` x the regular rate, bound to ``x2_tx_bind_host``,
+    paced at ``x2_tx_pace`` x the regular rate with an ``x2_tx_burst_bytes``
+    token bucket per destination (16 KB: deeper buckets overflow the search
+    NIC's port buffer on the 13->1 incast), bound to ``x2_tx_bind_host``,
     sender thread on ``x2_tx_cpu``) or ``"drain"`` (framed, counted, never
     sent); the sender's rates join the 16-block heartbeat.
 
@@ -4439,7 +4447,7 @@ def run(
                 x2_orch, owner_half=x2_plan.owner_half, mode=transport_tx_mode,
                 hosts=transport_tx_worker_hosts, port_base=transport_tx_port,
                 chgroup=int(cfg.chgroup), bind_host=x2_tx_bind_host, cpu=x2_tx_cpu,
-                pace=x2_tx_pace,
+                pace=x2_tx_pace, burst_bytes=x2_tx_burst_bytes,
             )
             x2_orch.tx2x = x2_tx
             from dsart.transport.send_mmsg import TxRateMeter
@@ -5594,6 +5602,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--x2-tx-pace", type=float, default=1.25,
                    help="2x TX: per-search-node pacing rate as a multiple of its "
                         "regular bytes per 134.2 ms block (default 1.25)")
+    p.add_argument("--x2-tx-burst-bytes", type=int, default=16 << 10,
+                   help="2x TX: token-bucket depth per search-node destination, bytes "
+                        "(default 16384; >= one 9000 B datagram). The G1 corner-turn sweep "
+                        "found 16 KB loss-free to 17 Gb/s per search node where 512 KB lost "
+                        "1-5.6%% to NIC port-buffer overflow (incast microbursts)")
     p.add_argument("--no-stage-timing", action="store_true",
                    help="disable the always-on sync-free per-stage CUDA-event "
                         "timing published in the /mon corr_fast heartbeat")
@@ -5957,6 +5970,7 @@ def main(argv: list[str] | None = None) -> int:
             x2_tx_bind_host=args.x2_tx_bind_host,
             x2_tx_cpu=args.x2_tx_cpu,
             x2_tx_pace=args.x2_tx_pace,
+            x2_tx_burst_bytes=args.x2_tx_burst_bytes,
         )
     except _StopRequested:
         LOG.info("clean stop")

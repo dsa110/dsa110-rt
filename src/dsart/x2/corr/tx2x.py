@@ -35,7 +35,8 @@ import numpy as np
 import torch
 
 from dsart.transport import prod_frame2 as f2
-from dsart.x2.corr.framer2x import FramedBlock, StreamFormat, frame_stream_block, max_buffer_bytes
+from dsart.x2.corr.framer2x import (FramedBlock, StreamFormat, frame_stream_block, max_buffer_bytes,
+                                    staging_bytes)
 
 LOG = logging.getLogger("dsart.x2.corr.tx2x")
 
@@ -119,6 +120,30 @@ class FramedTx2x:
         self.frame_s = 0.0
         self._dbuf: dict = {}
         self._hbuf: dict = {}
+        self._sbuf: dict = {}
+
+    @staticmethod
+    def _row_params(packets) -> list | None:
+        """Per stream ``(step_main, step_heavy, guarded)`` as numpy from ONE device-to-host
+        copy for the whole tier (instead of three per stream); None unless every stream's
+        rows are CUDA tensors of one shape."""
+        if not packets:
+            return None
+        shp = None
+        rows = []
+        for pk in packets:
+            ts = [pk["step_main"], pk["step_heavy"]] + ([pk["guarded"]] if "guarded" in pk else [])
+            if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in ts):
+                return None
+            shp = tuple(ts[0].shape) if shp is None else shp
+            if any(tuple(t.shape) != shp for t in ts):
+                return None
+            rows += [ts[0].to(torch.float32), ts[1].to(torch.float32),
+                     ts[2].to(torch.float32) if len(ts) == 3
+                     else torch.zeros(shp, dtype=torch.float32, device=ts[0].device)]
+        host = torch.stack(rows).cpu().numpy()
+        return [(host[3 * s], host[3 * s + 1], (host[3 * s + 2] > 0.5) if "guarded" in pk else None)
+                for s, pk in enumerate(packets)]
 
     def transmit_tier(self, *, block_n, tier, dms, t0_native, T_native, stream_ids, packets,
                       rfi_warming_up) -> int:
@@ -129,30 +154,47 @@ class FramedTx2x:
         extra = f2.FLAG_RFI_WARMING_UP if rfi_warming_up else 0
         if len(packets) != len(self.formats):
             raise ValueError(f"{len(packets)} streams handed to TX, {len(self.formats)} formats")
-        n_ok = 0
+        for s in range(len(packets)):
+            if int(stream_ids[s]) != self.formats[s].stream_id:
+                raise ValueError(f"stream {s}: id {stream_ids[s]} != format {self.formats[s].stream_id}")
+        t0 = time.perf_counter()
+        dev_pay = [self.device_framing and isinstance(pk["payload"], torch.Tensor)
+                   and pk["payload"].is_cuda for pk in packets]
+        rp = self._row_params(packets) if any(dev_pay) else None
+        # phase 1: every stream framed; device streams leave their D2H copy in flight
+        blocks = []
+        pending = None
         for s, pk in enumerate(packets):
             fmt = self.formats[s]
-            if int(stream_ids[s]) != fmt.stream_id:
-                raise ValueError(f"stream {s}: id {stream_ids[s]} != format {fmt.stream_id}")
-            t0 = time.perf_counter()
             pay = pk["payload"]
-            if self.device_framing and isinstance(pay, torch.Tensor) and pay.is_cuda:
+            if rp is not None:
+                sm, sh, gd = rp[s]
+            else:
+                sm, sh = _np(pk["step_main"]), _np(pk["step_heavy"])
+                gd = _np(pk["guarded"]) if "guarded" in pk else None
+            if dev_pay[s]:
                 key = (s, tuple(pay.shape))
                 if key not in self._dbuf:
                     n_b = max_buffer_bytes(*(int(x) for x in pay.shape))
                     self._dbuf[key] = torch.empty(n_b, dtype=torch.uint8, device=pay.device)
                     self._hbuf[key] = torch.empty(n_b, dtype=torch.uint8, pin_memory=True)
-                fb = frame_stream_block(pay, _np(pk["step_main"]), _np(pk["step_heavy"]),
-                                        _np(pk["guarded"]) if "guarded" in pk else None, fmt=fmt,
-                                        dms=np.asarray(dms), seq_first=seq_first, t_int_factor=T,
-                                        extra_flags=extra, dbuf=self._dbuf[key], hbuf=self._hbuf[key])
+                    self._sbuf[key] = torch.empty(staging_bytes(int(pay.shape[0]), int(pay.shape[1])),
+                                                  dtype=torch.uint8, pin_memory=True)
+                fb = frame_stream_block(pay, sm, sh, gd, fmt=fmt, dms=np.asarray(dms),
+                                        seq_first=seq_first, t_int_factor=T, extra_flags=extra,
+                                        dbuf=self._dbuf[key], hbuf=self._hbuf[key],
+                                        sbuf=self._sbuf[key], sync=False)
+                pending = pay.device
                 self.n_device_framed += 1
             else:
-                fb = frame_stream_block(_np(pay), _np(pk["step_main"]), _np(pk["step_heavy"]),
-                                        _np(pk["guarded"]) if "guarded" in pk else None, fmt=fmt,
-                                        dms=np.asarray(dms), seq_first=seq_first, t_int_factor=T,
-                                        extra_flags=extra)
-            self.frame_s += time.perf_counter() - t0
+                fb = frame_stream_block(_np(pay), sm, sh, gd, fmt=fmt, dms=np.asarray(dms),
+                                        seq_first=seq_first, t_int_factor=T, extra_flags=extra)
+            blocks.append(fb)
+        if pending is not None:                  # phase 2: one sync for the tier's D2H copies
+            torch.cuda.current_stream(pending).synchronize()
+        self.frame_s += time.perf_counter() - t0
+        n_ok = 0
+        for fb in blocks:
             n = int(self.sink.submit(fb.as_submit())) if len(fb) else 0
             n_ok += n
             self.n_datagrams += len(fb)
@@ -199,14 +241,30 @@ def block_tx_budget(formats: list[StreamFormat], dm_t_native: dict[int, int],
     return nbytes, ndg
 
 
+#: Token-bucket depth per destination of the 2x corr sender. G1 corner-turn sweep (13 corr ->
+#: n01/n02, frame v2 8972 B): 512 KB lost 1-5.6% at every rate 9-18 Gb/s (rx_discards_phy, NIC
+#: port-buffer overflow from incast microbursts), 64 KB was clean to 13 Gb/s, 16 KB had ZERO
+#: discards up to the sender-limited 17.08 Gb/s per search node. (MmsgSender's class default,
+#: 256 KB, discards.)
+X2_TX_BURST_BYTES = 16 << 10
+#: largest datagram the sender queues (slot size); a bucket shallower than one datagram never
+#: accumulates enough tokens to send it
+X2_TX_MAX_DATAGRAM = 9000
+
+
 def build_mmsg_sender(*, formats: list[StreamFormat], dm_t_native: dict[int, int], owner_half,
                       hosts: list[str], port: int, bind_host: str = "", cpu: int = -1,
-                      pace: float = 1.25, burst_bytes: int = 256 << 10, start: bool = True):
+                      pace: float = 1.25, burst_bytes: int = X2_TX_BURST_BYTES,
+                      start: bool = True):
     """The 2x corr sender: one destination per search node (``hosts`` in
     ``SEARCH_NODES`` order) at ``port`` (= port_base + chgroup), explicit
     routes from the plan's owner map, paced at ``pace`` x the regular bytes
-    per block, queues sized for >= 2 blocks."""
+    per block with a ``burst_bytes`` token bucket per destination, queues
+    sized for >= 2 blocks."""
     from dsart.transport.send_mmsg import MmsgSender  # noqa: PLC0415
+    if int(burst_bytes) < X2_TX_MAX_DATAGRAM:
+        raise ValueError(f"burst_bytes {burst_bytes} < one datagram ({X2_TX_MAX_DATAGRAM} B): "
+                         "the paced sender would never send")
     n_dest = len(hosts)
     routes = corr_routes(owner_half, dm_t_native.keys(), n_dest=n_dest)
     nbytes, ndg = block_tx_budget(formats, dm_t_native, routes, n_dest)
@@ -215,11 +273,12 @@ def build_mmsg_sender(*, formats: list[StreamFormat], dm_t_native: dict[int, int
     while slots < 2 * max(ndg, default=0):
         slots *= 2
     tx = MmsgSender([(h, int(port), r) for h, r in zip(hosts, rates)], routes=routes,
-                    bind_host=bind_host, queue_slots=slots, burst_bytes=int(burst_bytes), cpu=int(cpu))
+                    bind_host=bind_host, queue_slots=slots, burst_bytes=int(burst_bytes), cpu=int(cpu),
+                    slot_bytes=X2_TX_MAX_DATAGRAM)
     LOG.info("x2 TX: %d destinations port %d, %.2f Gb/s paced total (x%.2f of %.2f Gb/s), "
-             "%d datagrams/block, queue %d slots, bind %r",
-             n_dest, port, sum(rates) / 1e9, pace, 8.0 * sum(nbytes) / BLOCK_S / 1e9, sum(ndg),
-             slots, bind_host or "any")
+             "burst %d B/destination, %d datagrams/block, queue %d slots, bind %r",
+             n_dest, port, sum(rates) / 1e9, pace, 8.0 * sum(nbytes) / BLOCK_S / 1e9,
+             int(burst_bytes), sum(ndg), slots, bind_host or "any")
     if start:
         tx.start()
     return tx

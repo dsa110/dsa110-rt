@@ -70,6 +70,10 @@ BLOCK_MS = 134.217728
 CORR_NODES = (3, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 21, 22)
 #: the x2 TEST fada DADA key (replay only; production uses dada/eada/fada/bada)
 REPLAY_KEY = "d2f0"
+#: ``live --tx loopback``: the real 2x sender (frame v2, C sendmmsg, paced) to four loopback
+#: "search nodes" on a port nothing listens on -- never a packet on the fabric
+LOOPBACK_HOSTS = "127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4"
+LOOPBACK_PORT_BASE = 47900
 FADA_BYTES = 301989888
 #: x2 scratch staging (G1: every corr node's own sub-band + the cal live at the event) first,
 #: then the M7.4 fixture trees
@@ -1035,8 +1039,11 @@ def live_argv(opoint: str, *, dec: float, n_blocks: int, out_blocks: str,
 
 
 def cmd_live(args) -> int:
-    if args.reader_identity != "corr_fast" or args.tx != "drain":
-        print("live: only --tx drain --reader-identity corr_fast are supported", file=sys.stderr)
+    if args.reader_identity != "corr_fast" or args.tx not in ("drain", "loopback"):
+        print("live: only --tx drain|loopback --reader-identity corr_fast are supported", file=sys.stderr)
+        return EXIT_ERR
+    if args.tx == "loopback" and not getattr(args, "replay", None):
+        print("live: --tx loopback needs --replay", file=sys.stderr)
         return EXIT_ERR
     prod = _production_corr_fast_pids()
     if prod:
@@ -1047,7 +1054,11 @@ def cmd_live(args) -> int:
     n_blocks = int(args.minutes * 60e3 / BLOCK_MS)
     out_blocks = os.path.join(args.out, "live_blocks")
     argv, env = live_argv(op.opoint_id, dec=args.dec, n_blocks=n_blocks, out_blocks=out_blocks,
-                          tx=args.tx)
+                          tx="v2" if args.tx == "loopback" else args.tx)
+    if args.tx == "loopback":
+        argv += ["--transport-tx-worker-hosts", LOOPBACK_HOSTS,
+                 "--transport-tx-port", str(LOOPBACK_PORT_BASE),
+                 "--x2-tx-burst-bytes", str(int(args.tx_burst_bytes))]
     _set_gpu_env(env)
     if getattr(args, "replay", None):
         return _live_on_replay(args, argv, n_blocks)
@@ -1117,6 +1128,10 @@ def trace_summary(path: str, skip: int = 32) -> dict:
     ns = sorted(n for n in host if n > skip)
     if not ns:
         return {}
+    for n in ns:                                   # per-block framing ms from the running total
+        a, b = host.get(n - 1, {}).get("tx_frame_s"), host[n].get("tx_frame_s")
+        if a is not None and b is not None:
+            host[n]["tx_frame_ms"] = (b - a) * 1e3
     wall = np.array([host[n]["wall_ms"] for n in ns])
     edges = [0, 50, 60, 70, 80, 90, 100, 110, 120, 134.218, 1e9]
     hist = np.histogram(wall, bins=edges)[0].tolist()
@@ -1136,6 +1151,9 @@ def trace_summary(path: str, skip: int = 32) -> dict:
             v = [r["host"][k] for r in rows if "host" in r]
             if v:
                 d[f"host_{k}"] = float(np.mean(v))
+        v = [r["tx_frame_ms"] for r in rows if "tx_frame_ms" in r]
+        if v:
+            d["host_tx_frame"] = float(np.mean(v))
         for k in sorted({k for x in g for k in x if k != "gpu_block"}):
             v = [x[k] for x in g if k in x]
             if v:
@@ -1147,6 +1165,127 @@ def trace_summary(path: str, skip: int = 32) -> dict:
     out["typical_le_p50"] = profile(fast)
     out["slow_blocks"] = slow[:50]
     return out
+
+
+def _thread_cpu_s(tid: int) -> float:
+    """utime + stime of one thread of this process, seconds."""
+    with open(f"/proc/self/task/{tid}/stat") as fh:
+        f = fh.read().rsplit(")", 1)[1].split()
+    return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+
+
+class TxDrainMonitor:
+    """``live --tx loopback``: wraps corr_fast's ``_build_x2_tx`` to keep the 2x sender and
+    the tid of its C thread (the one thread ``tx.start()`` creates), then samples the
+    sender's queue depth every ``period_s``. Per block: the drain time from the submit (the
+    ``enqueued`` step) to an empty queue. Sender thread CPU = utime+stime over the run."""
+
+    def __init__(self, cfi, period_s: float = 2.5e-4) -> None:
+        self.cfi, self.period_s = cfi, period_s
+        self.tx = None
+        self.tids: list[int] = []
+        self.cpu0 = None
+        self.t0 = None
+        self.drain_ms: list[float] = []
+        self.submit_t: list[float] = []
+        self.backlog_at_submit = 0
+        self.last = None                     # last counters before corr_fast closes the sender
+        self.cpu_last: dict = {}
+        self.t_last = None
+        self._real = cfi._build_x2_tx
+        self._stop = threading.Event()
+        self._th = None
+
+    def __enter__(self):
+        def build(*a, **kw):
+            before = set(int(x) for x in os.listdir("/proc/self/task"))
+            tx = self._real(*a, **kw)
+            self.tids = sorted(set(int(x) for x in os.listdir("/proc/self/task")) - before)
+            self.tx = tx
+            self.cpu0 = {t: _thread_cpu_s(t) for t in self.tids}
+            self.t0 = time.monotonic()
+            self._th = threading.Thread(target=self._poll, daemon=True)
+            self._th.start()
+            return tx
+        self.cfi._build_x2_tx = build
+        return self
+
+    def _poll(self) -> None:
+        snd = getattr(self.tx, "sink", None)
+        if snd is None or not hasattr(snd, "counters"):
+            return
+        last_enq, t_sub = None, None
+        t_cpu = 0.0
+        while not self._stop.is_set():
+            full = snd.counters()
+            c = full["per_dest"]
+            if sum(d["enqueued"] for d in c) or self.last is None:
+                self.last = full                  # zeros once the sender is destroyed
+            if time.monotonic() - t_cpu > 0.5:
+                t_cpu = time.monotonic()
+                for t in self.tids:
+                    try:
+                        self.cpu_last[t] = _thread_cpu_s(t)
+                    except OSError:
+                        pass
+                if self.cpu_last:
+                    self.t_last = t_cpu
+            enq = sum(d["enqueued"] for d in c)
+            depth = sum(d["depth"] for d in c)
+            now = time.monotonic()
+            if last_enq is not None and enq > last_enq:
+                # the tiers of one block are submitted back to back: a step more than 30 ms
+                # after this block's first one while it is still queued = the next block's
+                # submit found a backlog
+                if t_sub is None or now - t_sub > 0.030:
+                    self.submit_t.append(now)
+                if t_sub is None:
+                    t_sub = now
+                elif now - t_sub > 0.030:
+                    self.backlog_at_submit += 1
+                    self.drain_ms.append((now - t_sub) * 1e3)
+                    t_sub = now
+            last_enq = enq
+            if t_sub is not None and depth == 0:
+                self.drain_ms.append((now - t_sub) * 1e3)
+                t_sub = None
+            time.sleep(self.period_s)
+
+    def summary(self) -> dict:
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=5)
+        out: dict = {"sender_tids": self.tids}
+        if self.tx is None:
+            return out
+        wall = (self.t_last or time.monotonic()) - self.t0
+        out["sender_cpu_frac"] = {str(t): (v - self.cpu0[t]) / wall for t, v in self.cpu_last.items()}
+        c = self.last or {}
+        out["counters"] = {k: v for k, v in c.items() if k != "per_dest"}
+        pd = c.get("per_dest", [])
+        for k in ("enqueued", "sent", "bytes", "full_drops", "errors", "eagain", "max_depth"):
+            out[f"dest_{k}"] = [d[k] for d in pd]
+        out["wall_s"] = wall
+        out["gbps_total"] = 8.0 * sum(d["bytes"] for d in pd) / wall / 1e9
+        sent = sum(d["sent"] for d in pd)
+        if sent:
+            out["datagrams_per_sendmmsg"] = sent / max(1, c.get("sendmmsg_calls", 0))
+            out["idle_sleeps_per_s"] = c.get("idle_sleeps", 0) / wall
+        d = np.asarray(self.drain_ms[8:]) if len(self.drain_ms) > 8 else np.asarray(self.drain_ms)
+        if d.size:
+            out["drain_ms"] = {"n": int(d.size), "p50": float(np.percentile(d, 50)),
+                               "p99": float(np.percentile(d, 99)), "max": float(d.max()),
+                               "mean": float(d.mean())}
+        out["blocks_submitted_with_backlog"] = self.backlog_at_submit
+        iv = np.diff(np.asarray(self.submit_t[8:])) * 1e3
+        if iv.size:
+            out["submit_interval_ms"] = {"p1": float(np.percentile(iv, 1)), "p50": float(np.percentile(iv, 50)),
+                                         "p99": float(np.percentile(iv, 99)), "min": float(iv.min())}
+        return out
+
+    def __exit__(self, *exc):
+        self.cfi._build_x2_tx = self._real
+        self._stop.set()
 
 
 def _live_on_replay(args, argv: list, n_blocks: int) -> int:
@@ -1198,10 +1337,15 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
         th = threading.Thread(target=poll, daemon=True)
         th.start()
         cfi.run = run_and_keep
+        txmon = TxDrainMonitor(cfi) if args.tx == "loopback" else None
         try:
+            if txmon is not None:
+                txmon.__enter__()
             rc = cfi.main(argv)
         finally:
             cfi.run = real
+            if txmon is not None:
+                txmon.__exit__()
             stop.set()
             th.join(timeout=5)
             if w.poll() is None:
@@ -1218,6 +1362,8 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
            "trace": trace_summary(trace) if trace and os.path.exists(trace) else None,
            "writer": _writer_summary(log), "max_nfull": max((nf for _, nf, _ in samples), default=None),
            "nbufs": samples[0][2] if samples else None}
+    if txmon is not None:
+        res["tx_loopback"] = txmon.summary()
     if rc != 0 or not s:
         _write(args.out, "live_2x.json", res)
         return EXIT_ERR
@@ -1232,6 +1378,15 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
         "tx_framed_no_rejects": bool((s.get("x2_tx") or {}).get("datagrams", 0) > 0
                                      and (s.get("x2_tx") or {}).get("rejected", 1) == 0),
     }
+    if txmon is not None:
+        tl = res["tx_loopback"]
+        gates["tx_no_queue_drops"] = sum(tl.get("dest_full_drops", [1])) == 0 and \
+            sum(tl.get("dest_errors", [1])) == 0
+        # paced at 1.25x a block drains in ~0.8 block; a submit that lands early (host jitter)
+        # queues behind the previous block, which is fine while the queue never holds 2 blocks
+        per_blk = max(tl.get("dest_enqueued") or [0]) / max(1, int(s.get("n_blocks_processed", 1)))
+        gates["tx_drains_inside_block"] = bool(tl.get("drain_ms")) and tl["drain_ms"]["p99"] < BLOCK_MS
+        gates["tx_queue_below_2_blocks"] = max(tl.get("dest_max_depth") or [1 << 30]) < 2 * per_blk
     return _finish(args.out, "live_2x.json", res, gates)
 
 
@@ -1286,7 +1441,11 @@ def main(argv=None) -> int:
     p = common(sub.add_parser("live"))
     p.add_argument("--opoint", required=True)
     p.add_argument("--minutes", type=float, default=20.0)
-    p.add_argument("--tx", default="drain")
+    p.add_argument("--tx", default="drain",
+                   help="drain (frame v2 counted, no socket) | loopback (the real paced sender to "
+                        f"{LOOPBACK_HOSTS}:{LOOPBACK_PORT_BASE}+chgroup, needs --replay)")
+    p.add_argument("--tx-burst-bytes", type=int, default=16 << 10,
+                   help="--tx loopback: the sender's token-bucket depth per destination")
     p.add_argument("--reader-identity", default="corr_fast")
     p.add_argument("--trace", action="store_true",
                    help="per-block host/GPU trace (DSART_X2_BLOCK_TRACE) + wall histogram in the JSON")
