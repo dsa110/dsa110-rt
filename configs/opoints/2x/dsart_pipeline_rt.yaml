@@ -670,6 +670,9 @@ routines:
       --sliding-window
       --n-grid 256
       --transport-tx-mode v2
+      --x2-tx-burst-bytes 16384
+      --plan-id ${plan_id}
+      --x2-epoch capture
       --transport-tx-base-port 6625
       --transport-tx-worker-hosts 10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238
       --max-blocks 0
@@ -707,6 +710,9 @@ routines:
       lxd110h22: --x2-tx-bind-host 10.41.0.233
     env:
       CUDA_VISIBLE_DEVICES: "1"
+      # pre-pin every fada page before the ready sentinel (WS-C 9f3d792; 0 start-up blocks over budget).
+      # 2x only: whether 1x enables it is the user's decision (ledger P-b).
+      DSART_HOST_PIN_PERSIST: "1"
 
   # M7.6 RFI monitor exporter sidecar. Sibling of corr_fast — reads
   # the 16-cube window shm /dev/shm/dsart-rfi-window-CN that
