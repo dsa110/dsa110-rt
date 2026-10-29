@@ -4,6 +4,7 @@
   byte for byte, flow by flow, in send order: regular blocks, guarded rows
   (alone and in equal-step runs), step changes, NO_DATA blocks (sigma 0),
   every k up to ``max_k``, RFI_WARMING_UP; every datagram <= 8972 B;
+* device framing of regular blocks == the reference (CPU tensors; CUDA in x2_gpu);
 * ``FramedTx2x`` over a packer result: the drain sink counts every
   datagram and sends nothing; its counters feed ``TxRateMeter`` (the
   corr_fast heartbeat keys);
@@ -101,14 +102,73 @@ def test_framer_equals_reference(case) -> None:
         assert len(fb) == n_d * -(-S // fmt.max_k)
 
 
-def _packed_block(rule, n_d=3, S=32, seed=0):
+@pytest.mark.parametrize("n_values,n_heavy,S", [(1500, 4, 256), (300, 0, 128), (40, 4, 256), (2600, 7, 128)])
+def test_device_framing_equals_reference(n_values, n_heavy, S) -> None:
+    """Regular blocks (one step per flow, no guard): the device framer (here on CPU tensors:
+    the same torch ops) == the reference framing, byte for byte, in send order."""
+    from dsart.x2.corr.tx2x import frame_regular_device
+    rng = np.random.default_rng(n_values)
+    fmt = _fmt(n_values=n_values, n_heavy=n_heavy)
+    n_d = 5
+    ch, cm = _codes(rng, fmt, n_d, S)
+    sig = rng.uniform(0.5, 2.0, size=n_d).astype(np.float32)
+    sig[2] = 0.0                                               # a flow still in warm-up
+    sm = (np.float32(fmt.s_main) * sig).astype(np.float32)
+    sh = (np.float32(fmt.s_heavy) * sig).astype(np.float32)
+    pay = np.stack([f2.pack_samples(ch[i], cm[i], fmt.bits_main) for i in range(n_d)])
+    dms = [1, 9, 17, 25, 33]
+    fb = frame_regular_device(torch.from_numpy(pay), sm, sh, fmt=fmt, dms=dms, seq_first=3 * S,
+                              t_int_factor=32, extra_flags=f2.FLAG_RFI_WARMING_UP)
+    want = _reference(fmt, ch, cm, np.repeat(sm[:, None], S, 1), np.repeat(sh[:, None], S, 1),
+                      np.zeros((n_d, S), bool), dms, 3 * S, 32, extra=f2.FLAG_RFI_WARMING_UP)
+    assert fb.datagrams() == want
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+def test_framed_tx_device_path_gpu() -> None:
+    """CUDA packets: regular streams framed on the device, guarded ones on the host; every
+    datagram equal to the reference."""
+    rule = quant.RowRule.for_format(8, 2, warmup_blocks=1)
+    res, voff, nh, _ = _packed_block(rule, n_d=3, surge=slice(30, 70))     # stream 1 only
+    fmts = _formats(rule, voff, nh)
+    assert not res[0]["guarded"].any() and res[1]["guarded"].any()
+
+    class _Keep(DrainSink):
+        def __init__(self):
+            super().__init__()
+            self.dgs = []
+
+        def submit(self, d, **kw):
+            buf, offs, lens = d
+            self.dgs += [buf[int(o):int(o) + int(n)].tobytes() for o, n in zip(offs, lens)]
+            return super().submit(d)
+
+    sink = _Keep()
+    tx = FramedTx2x(sink, fmts)
+    dms = np.array([0, 8, 16])
+    for blk in range(2):                                         # buffers reused across blocks
+        gpu = [{k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in r.items()} for r in res]
+        sink.dgs.clear()
+        tx.transmit_tier(block_n=blk, tier="A", dms=dms, t0_native=(9 + blk) * 4096, T_native=16,
+                         stream_ids=[2, 3], packets=gpu, rfi_warming_up=False)
+        want = []
+        for s_, r in enumerate(res):
+            want += _reference(fmts[s_], r["codes_heavy"].numpy(), r["codes_main"].numpy(),
+                               r["step_main"].numpy(), r["step_heavy"].numpy(), r["guarded"].numpy(),
+                               dms, (9 + blk) * 4096 // 16, 16)
+        assert sink.dgs == want
+    assert tx.n_device_framed >= 1                               # stream 0 has no guarded row
+
+
+def _packed_block(rule, n_d=3, S=32, seed=0, surge=slice(None)):
     rng = np.random.default_rng(seed)
     voff, nh = [0, 30, 70], [2, 3]
     n = rng.integers(1, 500, size=70)
     pk = RowRulePacker(n_d=n_d, value_offsets=voff, n_contrib=n, n_heavy=nh, rule=rule)
     for _ in range(int(rule.warmup_blocks) + 1):
         x = ((rng.normal(size=(n_d, S, 70)) + 1j * rng.normal(size=(n_d, S, 70))) * np.sqrt(n))
-        x[1, 5] *= 6.0                                     # one guarded row
+        x[1, 5, surge] *= 6.0                              # one guarded row
         res = pk.pack(torch.from_numpy(x.astype(np.complex64)))
     return res, voff, nh, n
 

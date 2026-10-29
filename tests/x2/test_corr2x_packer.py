@@ -250,12 +250,15 @@ def test_guard_threshold_is_the_exact_boundary() -> None:
     assert not bool(vv[0])
 
 
-def test_guard_overflow_is_deferred_and_resolved() -> None:
+@pytest.mark.parametrize("capacity", [0, 1])
+def test_guard_overflow_is_deferred_and_resolved(capacity) -> None:
     """With ``resolve_overflow=False`` a flow with more guarded rows than the
-    capacity is flagged; ``resolve_overflow`` then makes it exact."""
+    capacity is flagged (capacity 0, the CUDA pipeline's: every guarded flow);
+    ``resolve_overflow`` then makes it exact."""
     rule = quant.RowRule.for_format(8, 2, warmup_blocks=1)
     blocks, n = _blocks(8, rule, n_after=3)
-    pk = RowRulePacker(n_d=3, value_offsets=VOFF, n_contrib=n, n_heavy=NH, rule=rule, guard_capacity=1)
+    pk = RowRulePacker(n_d=3, value_offsets=VOFF, n_contrib=n, n_heavy=NH, rule=rule,
+                       guard_capacity=capacity)
     flows = _flows(rule, n, 3)
     for b, x in enumerate(blocks):
         xt = torch.from_numpy(x)

@@ -38,6 +38,9 @@ for guarded rows: up to ``guard_capacity`` (8) per flow on the device with
 fixed shapes (no host sync), and -- if a flow has more guarded rows in one
 block (a broadband surge) -- by :meth:`RowRulePacker.resolve_overflow`, which
 the 2x pipeline calls at its D2H sync point (the CPU path resolves inline).
+The CUDA pipeline runs with ``guard_capacity=0``: on normal noise no row is
+guarded, so the steady state does no row sorting at all, and every flow with
+a guarded row is recoded exactly at the sync point.
 
 Kernels (Triton on CUDA, launched with ``enable_fp_fusion=False``; a torch
 twin is the CPU path and the test oracle):
@@ -360,7 +363,7 @@ class RowRulePacker:
             raise ValueError("n_contrib must cover every value")
         self.sigma = torch.zeros((int(n_d), self.n_sub), dtype=torch.float32, device=self.device)
         self.blocks_seen = 0
-        self.guard_capacity = max(1, int(guard_capacity))
+        self.guard_capacity = max(0, int(guard_capacity))
         self.use_triton = (self.device.type == "cuda") if use_triton is None else bool(use_triton)
         self.n_overflow_resolved = 0
 
@@ -444,7 +447,7 @@ class RowRulePacker:
         guarded = (pos & valid)[:, None] & (m_row >= self._need[s]) & (cnt <= half)
         sigma_row = torch.where(pos, sig, torch.zeros_like(sig))[:, None].expand(n_f, S).contiguous()
         K = min(int(capacity), S)
-        if n_f and S:
+        if n_f and S and K:
             order = torch.argsort(guarded.to(torch.int8), dim=1, descending=True, stable=True)[:, :K]
             cand = torch.gather(guarded, 1, order)
             rows = xs[torch.arange(n_f, device=dev)[:, None], order]          # (n_f, K, V, 2)

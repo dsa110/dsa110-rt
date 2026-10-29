@@ -211,9 +211,12 @@ class Corr2xPipeline(PipelinedCorrFast):
             ss = BatchedStaticSky(n_d=len(local), n_values=self.csr.n_values,
                                   window_blocks=static_sky_window_blocks,
                                   warmup_cubes=static_sky_warmup, device=ctx.device)
+            # CUDA: no on-device guard capacity -- guarded flows (rare) are recoded exactly
+            # at the D2H sync point (resolve_overflow in _emit), so normal blocks sort nothing
             pk = RowRulePacker(n_d=len(local), value_offsets=self.voff,
                                n_contrib=self.csr.n_contrib, n_heavy=self.n_heavy,
-                               rule=self.rule, device=ctx.device)
+                               rule=self.rule, device=ctx.device,
+                               guard_capacity=0 if self.cuda else 8)
             ts = _TierState(ti=ti, name=t.name, dms=np.asarray([t.d0 + c for c in local]),
                             shifts=shifts, geo=geo, D=t.decim, T_native=t.T_native,
                             static_sky=ss, packer=pk)
