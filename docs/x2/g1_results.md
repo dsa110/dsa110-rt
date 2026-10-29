@@ -61,6 +61,15 @@ start), 16 KB sender pacing.
   roughly 28-31 GB of the 97.6 GB node; no memory pressure in 60 min. E5: the engines read the ring with
   `pread` (default), so the mmap NUMA-fault risk does not apply; no lag at any point.
 
+## 4. I2: real FRB 250924mptq through the full 2x chain on GPU — PASSED
+Real voltages (16 sub-bands, 2025-09-21 cals) -> 2x corr (GPU) -> frame v2 -> ring v4 -> owner engine (GPU) -> C1, and
+the same pages through today's 1x chain (n02, x2/main 6f1bd69):
+- Position: 2x and 1x both at pixel (137, 171) (l 0.009381, m 0.001963 rad): **2x - 1x = (0, 0) px**.
+- DM: 2x fine 126 (405.49, the predicted trial); 1x 402.19. Time: both within 0.2 sample of the expected arrival.
+- S/N: 2x 266.4 (t2) vs 1x 144.8 (b2) = x1.84 = the model's x1.25 at 1 ms / today's wire compression ~0.68 at ~150
+  sigma per sample (Phase 0 study 2, ledger S3), now seen on real sky data.
+- The ~10 px offset of both chains from the TNS geometric prediction is pre-existing (ledger P-c).
+
 ## Open
 - Production C sender pacing (16 KB) and corr real-time tail (WS-C), then corr 2x live from replayed
   voltages on all 16 nodes into the real chain.
