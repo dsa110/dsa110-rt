@@ -866,7 +866,8 @@ def cmd_sweep(a) -> int:
                 "tx", "--mode", "sweep", "--chgroup", str(g), "--n-tx", str(n_tx),
                 "--dests", d_list, "--bind-ip", drv.ip.get(n, ""), "--rates", a.rates_gbps,
                 "--dwell-s", str(a.dwell_s), "--gap-s", str(a.gap_s), "--go-file", drv.go_file(),
-                "--frame-bytes", str(a.frame_bytes)] + (["--nic"] if a.nic_counters else []),
+                "--frame-bytes", str(a.frame_bytes), "--burst-bytes", str(a.burst_bytes)]
+                + (["--nic"] if a.nic_counters else []),
                 f"sweep_tx_{g}_{n}"))
         start = drv.barrier(list(zip(drv.rx_nodes, rx_out)) + list(zip(drv.tx_nodes, tx_out)),
                             a.lead_s, a.ready_timeout_s)
@@ -1058,6 +1059,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gap-s", type=float, default=4.0)
     p.add_argument("--frame-bytes", type=int, default=MAX_DATAGRAM)
     p.add_argument("--record-pps", action="store_true", help="(always recorded)")
+    p.add_argument("--burst-bytes", type=int, default=512 << 10,
+                   help="sender back-to-back burst before pacing (incast microbursts vs NIC port buffer)")
     p.add_argument("--nic-counters", action="store_true")
     p.set_defaults(func=cmd_sweep)
     for name, func in (("fleet-load", cmd_fleet_load), ("snap-live", cmd_snap_live)):
