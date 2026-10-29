@@ -475,29 +475,62 @@ class SearchRxV4Service:
 
 
 def _spec_from_args(args):
+    """``(RingV4Spec, {stream: expected pattern_id} or None)``: from ``--ring4-spec`` JSON
+    (+ ``--pattern-id-file``), or built in-process from ``--plan`` + ``--opoint`` +
+    ``--node-index`` + ``--antpos-path`` + ``--obs-dec-deg`` exactly as corr_fast and the
+    owner engine build their value maps (``dsart.x2.prod_inputs``)."""
     from ..transport.recv_ring import RingV4Spec
     if args.ring4_spec is not None:
-        return RingV4Spec.from_dict(json.loads(args.ring4_spec.read_text()))
-    raise SystemExit("--ring-version 4 needs --ring4-spec (see `search_rx make-ring4-spec`)")
+        if args.plan is not None:
+            raise SystemExit("--ring4-spec and --plan are exclusive")
+        spec = RingV4Spec.from_dict(json.loads(args.ring4_spec.read_text()))
+        pids = None
+        if args.pattern_id_file is not None:
+            pids = _load_stream_pattern_ids(args.pattern_id_file)
+        return spec, pids
+    if args.plan is not None:
+        from ..x2 import prod_inputs as pi
+        from ..x2.opoint import opoint_from_id
+        need = {"--opoint": args.opoint, "--node-index": args.node_index,
+                "--antpos-path": args.antpos_path, "--obs-dec-deg": args.obs_dec_deg}
+        missing = [k for k, v in need.items() if v is None]
+        if missing:
+            raise SystemExit(f"--ring-version 4 --plan also needs {' '.join(missing)}")
+        if args.pattern_id_file is not None:
+            raise SystemExit("--pattern-id-file with --plan: the ids come from the value map")
+        if args.mon_cn is not None and pi.node_index_of_cn(args.mon_cn) != args.node_index:
+            raise SystemExit(f"--node-index {args.node_index} is not search node cn "
+                             f"{args.mon_cn} (index {pi.node_index_of_cn(args.mon_cn)})")
+        op = opoint_from_id(args.opoint)
+        plan = pi.load_plan(args.plan, op, args.plan_id)
+        spec, vm, pids = pi.node_ring4(op, plan, node_index=args.node_index,
+                                       antpos_path=args.antpos_path,
+                                       obs_dec_deg=args.obs_dec_deg,
+                                       retention_s=args.retention_s)
+        LOG.info("search_rx v4: %s node %d, plan 0x%016x, value map 0x%016x (DEC %.4f -> "
+                 "%.2f), %d streams", op.opoint_id, args.node_index, int(plan.plan_id),
+                 int(vm.pattern_id), float(args.obs_dec_deg), vm.dec_deg_quant, vm.n_streams)
+        return spec, pids
+    raise SystemExit("--ring-version 4 needs --plan (with --opoint --node-index --antpos-path "
+                     "--obs-dec-deg) or --ring4-spec (see `search_rx make-ring4-spec`)")
 
 
 def make_ring4_spec(argv: Optional[List[str]] = None) -> int:
     """``search_rx make-ring4-spec``: the v4 ring spec JSON of one search node
-    from WS-P's plan + value map (antenna positions npz with antpos_e/n/u +
-    station, e.g. tests/fixtures/x2/dsa110_antpos.npz)."""
-    import numpy as np
-    from ..grid.baseline_grid import build_value_map_for_opoint
-    from ..grid.sparsity_pattern import core_baseline_mask_from_station_numbers
-    from ..transport.recv_ring import RingV4Spec
+    from WS-P's plan + value map (the production cal blob or an antenna
+    positions npz with antpos_e/n + station, e.g.
+    tests/fixtures/x2/dsa110_antpos.npz), built by ``dsart.x2.prod_inputs`` like
+    search_rx's in-process path."""
+    from ..x2 import prod_inputs as pi
     from ..x2.opoint import opoint_from_id
     from ..x2.plan import TieredDmPlan
-    from ..x2.quant import RowRule
 
     p = argparse.ArgumentParser(prog="search_rx make-ring4-spec")
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--opoint", required=True, help="e.g. 2x-gridded-ns2-cint4")
     p.add_argument("--node-index", type=int, required=True, help="0..3 in N_SEARCH order")
-    p.add_argument("--antpos-npz", type=Path, required=True)
+    p.add_argument("--antpos-npz", "--antpos-path", dest="antpos_npz", type=Path, required=True,
+                   help="cal blob (antennas.out) or antpos npz")
     p.add_argument("--dec-deg", type=float, required=True)
     p.add_argument("--retention-s", type=float, default=20.0)
     p.add_argument("--out", type=Path, required=True)
@@ -505,15 +538,9 @@ def make_ring4_spec(argv: Optional[List[str]] = None) -> int:
     a = p.parse_args(argv)
     op = opoint_from_id(a.opoint)
     plan = TieredDmPlan.from_npz(a.plan)
-    z = np.load(a.antpos_npz)
-    mask = core_baseline_mask_from_station_numbers(z["station"])
-    # SPEC §3 production inputs: antpos_u = None (heights are not passed by corr or the engine; they
-    # enter pattern_id, so passing them here made the ring's ids disagree with the engine's)
-    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"],
-                                    is_core_baseline_mask=mask, dec_deg=a.dec_deg)
-    rule = RowRule.for_format(op.bits_main, op.n_sub)
-    spec = RingV4Spec.for_node(plan, vm, op, node_index=a.node_index, rule=rule,
-                               retention_s=a.retention_s)
+    # SPEC §3 production inputs (antpos_u = None, the canonical DEC), shared with corr and the engine
+    vm = pi.value_map_for(op, a.antpos_npz, a.dec_deg)
+    spec = pi.ring4_spec(plan, vm, op, node_index=a.node_index, retention_s=a.retention_s)
     a.out.write_text(json.dumps(spec.to_dict(), indent=1))
     if a.pattern_ids_out is not None:
         a.pattern_ids_out.write_text(json.dumps([int(x) for x in vm.stream_pattern_ids]))
@@ -523,12 +550,10 @@ def make_ring4_spec(argv: Optional[List[str]] = None) -> int:
 
 
 def main_v4(args) -> int:
-    pids = None
-    if args.pattern_id_file is not None:
-        pids = _load_stream_pattern_ids(args.pattern_id_file)
+    spec, pids = _spec_from_args(args)
     svc = SearchRxV4Service(
         bind_host=args.bind_host, port_base=args.port_base, n_ports=args.n_ports,
-        shm_name=args.shm_name, spec=_spec_from_args(args),
+        shm_name=args.shm_name, spec=spec,
         so_rcvbuf_bytes=args.so_rcvbuf_bytes, n_threads=args.rx_threads,
         strict_ports=not args.no_strict_ports, prefault=not args.no_prefault,
         pattern_ids=pids, status_interval_s=args.status_interval_s, mon_cn=args.mon_cn,
@@ -623,6 +648,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "only; --n-corr/--n-coarse-dm/--t-buf-samples/--n-filled ignored)")
     p.add_argument("--ring4-spec", type=Path, default=None,
                    help="v4: RingV4Spec JSON (``search_rx make-ring4-spec``)")
+    # v4 in-process spec (production, SPEC §6): plan + op-point + node + the value map's
+    # inputs; the expected per-stream pattern ids come from the same value map
+    p.add_argument("--opoint", default=None,
+                   help="op-point id (2x-<kind>-ns<n>-cint<b>; 2x needs --ring-version 4)")
+    p.add_argument("--plan", type=Path, default=None, help="v4: tiered DM plan v3 npz")
+    p.add_argument("--plan-id", default=None,
+                   help="v4: refuse a plan whose plan_id differs (the set's ${plan_id})")
+    p.add_argument("--node-index", type=int, default=None, choices=(0, 1, 2, 3),
+                   help="v4: search node index in SEARCH_NODES order (n01 n02 n09 n13)")
+    p.add_argument("--antpos-path", default=None,
+                   help="v4: cal blob (antennas.out, as corr_fast --apply-cal) or antpos npz")
+    p.add_argument("--obs-dec-deg", type=float, default=None,
+                   help="v4: the start verb's DEC (CUSTOMDEC; enters pattern_id)")
+    p.add_argument("--retention-s", type=float, default=20.0,
+                   help="v4: minimum ring retention per DM (s)")
     p.add_argument("--rx-threads", type=int, default=2,
                    help="v4: receive threads (socket i -> thread i %% N)")
     p.add_argument("--no-strict-ports", action="store_true",
@@ -642,6 +682,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.ring_version == 4:
         return main_v4(args)
+    if args.opoint not in (None, "1x"):
+        LOG.error("--opoint %s needs --ring-version 4", args.opoint)
+        return 2
 
     bpc = BYTES_CINT8_COMPLEX if args.bytes_per_cell == 2 else BYTES_CFP16_COMPLEX
 
