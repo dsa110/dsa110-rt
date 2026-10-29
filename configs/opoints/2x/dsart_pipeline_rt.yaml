@@ -669,13 +669,9 @@ routines:
       --cell-lambda-mode tee45
       --sliding-window
       --n-grid 256
-      --transport-tx-mode X2TODO:WS-T:frame-v2-tx-mode
-      --transport-tx-workers X2TODO:WS-T:c-sender-workers
-      --transport-tx-host 10.41.0.205
+      --transport-tx-mode v2
       --transport-tx-base-port 6625
-      --transport-tx-coarse-dm-mask X2TODO:WS-T:coarse-dm-to-half-map
       --transport-tx-worker-hosts 10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238
-      --stage2-mode X2TODO:WS-C:stage2-fifo-off
       --max-blocks 0
       --output-dir /home/ubuntu/tmp/dsart-fast-grid
       --blocks-output-mode none
@@ -689,6 +685,26 @@ routines:
       --static-sky-window-s 1.0
       --sky-export-url http://lxd110h23.pro.pvt:5778/sky/ingest
       --sky-export-interval-s 30
+    # 2x (WS-C fa57a17): frame v2 via the C sendmmsg sender bound to this node's data IP; routes come
+    # from the plan's owner_half (search node = SEARCH_NODES order above, port 6625 + chgroup). The 1x
+    # flags --transport-tx-workers/-host/-coarse-dm-mask and --stage2-mode are ignored at 2x (removed).
+    hostargs:
+      lxd110h03: --x2-tx-bind-host 10.41.0.224
+      lxd110h04: --x2-tx-bind-host 10.41.0.138
+      lxd110h05: --x2-tx-bind-host 10.41.0.206
+      lxd110h06: --x2-tx-bind-host 10.41.0.203
+      lxd110h07: --x2-tx-bind-host 10.41.0.208
+      lxd110h08: --x2-tx-bind-host 10.41.0.209
+      lxd110h10: --x2-tx-bind-host 10.41.0.211
+      lxd110h11: --x2-tx-bind-host 10.41.0.216
+      lxd110h12: --x2-tx-bind-host 10.41.0.218
+      lxd110h14: --x2-tx-bind-host 10.41.0.212
+      lxd110h15: --x2-tx-bind-host 10.41.0.223
+      lxd110h16: --x2-tx-bind-host 10.41.0.220
+      lxd110h18: --x2-tx-bind-host 10.41.0.228
+      lxd110h19: --x2-tx-bind-host 10.41.0.227
+      lxd110h21: --x2-tx-bind-host 10.41.0.250
+      lxd110h22: --x2-tx-bind-host 10.41.0.233
     env:
       CUDA_VISIBLE_DEVICES: "1"
 

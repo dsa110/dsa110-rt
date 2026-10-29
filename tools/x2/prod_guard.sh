@@ -80,7 +80,7 @@ else
       fi
       sleep 2
     done
-  ) &
+  ) 2>/dev/null &
 fi
 WPID=$!
 wait "$PID"
