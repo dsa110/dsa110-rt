@@ -36,6 +36,7 @@ below); one search cycle per DM (Layer-2 burn-in 0); C2 cutouts of 64 rows and
 """
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -186,126 +187,63 @@ def test_i1_1x_compat(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 VOLT_ROOT = Path(os.environ.get("DSART_X2_I1_VOLTAGES", "/home/ubuntu/data/voltages/250924mptq"))
-DM_250924 = 404.688                      # T2_250924mptq.json
-DEC_250924 = 53.848986                   # the burst's localized DEC: the test steers the phase centre there
-#   (the array pointed at 54.573 deg that night: corr hdf5 phase_center_dec 0.95249 rad)
-TOP_ARRIVAL_250924 = 15248               # native sample of the chgroup-0 top-of-band arrival
-                                         # from the dump start (bench/corr_fast_burst_250924mptq.py)
 
 
 @pytest.mark.x2_gpu
-def test_i1_real_burst_250924mptq_gpu(monkeypatch) -> None:
-    """The real burst through the 2x corr orchestrator (GPU kernels, real cal,
-    16 chgroups one after another into one ring v4) and the GPU owner engine:
-    the owner half of DM 404.7's coarse bucket detects it within one fine
-    trial, within 4 px of the phase centre (the F21 DEC fold steers the
-    source to (0, 0); the 1x bench gate) and within 2 T_ext of the expected
-    arrival. NOT feasible on CPU (2x GEMM ~1e11 flop per chgroup-block, 15
-    blocks x 16 chgroups); needs ``node_cpu_tests.sh -g 0`` and the dump
-    staged as ``$DSART_X2_I1_VOLTAGES/{voltages/250924mptq_sb<NN>_data.out,
-    cals/beamformer_weights_sb<NN>*.dat}`` for all 16 sub-bands. Row-rule and
-    static-sky warm-ups are 2 blocks (the dump is 15 blocks, the burst in
-    blocks 3-5); the RFI flagger is off."""
+def test_i1_real_burst_250924mptq_gpu() -> None:
+    """The real burst through the 2x chain AND today's 1x chain, on the same
+    voltage pages, cal (the solution live at the burst), DEC steering (the
+    burst's DEC), RFI (off) and static-sky warm-up (2 blocks):
+
+    * 2x: Corr2xPipeline (GPU) -> frame v2 -> ring v4 -> GPU owner engine;
+    * 1x: corr_fast's production context (multi-DM stage 1, deployed v2 plan,
+      per-coarse-DM stage-2 FIFO) under PipelinedCorrFast -> today's v1 wire
+      -> the owner engine in 1x-compat mode (production search arithmetic);
+
+    each engine warmed over the cycle before the burst (Layer-1 / Layer-2).
+    Asserted: both detect it within one fine trial of DM 404.688 and within 2
+    samples of the expected arrival; the 2x (l, m) equals the 1x (l, m) within
+    one pixel (the plan's criterion: same conventions -- today's (l, m)
+    orientation, fftshift, edge mask, 45" cell). Reported: both S/N, their ratio
+    vs the snr_model 2x/1x ratio, and the geometric (TNS) position. NOT feasible
+    on CPU; ``node_cpu_tests.sh -g 0 -e DSART_X2_I1_VOLTAGES=<dump>`` with
+    ``voltages/*_sb<NN>_data.out`` + ``cals/beamformer_weights_sb<NN>*.dat``."""
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA-only (GPU mode)")
-    vfiles = sorted((VOLT_ROOT / "voltages").glob("*_sb*_data.out"))
-    cals = [sorted((VOLT_ROOT / "cals").glob(f"beamformer_weights_sb{g:02d}*.dat")) for g in range(16)]
-    if len(vfiles) != 16 or not all(cals):
+    staged = U.real_inputs(VOLT_ROOT)
+    if staged is None:
         pytest.skip(f"250924mptq voltages + 16 cal files not staged under {VOLT_ROOT}")
-    import math
-
-    from dsart.grid.baseline_grid import build_value_map_for_opoint
-    from dsart.services import corr_fast_integration as cfi
-    from dsart.x2 import quant
-    from dsart.x2.corr.pipeline2x import Corr2xPipeline
-    from dsart.x2.corr.tx2x import FramedTx2x
-    from dsart.x2.opoint import opoint_2x
-    from dsart.x2.search.c1_cycle import C1CycleConfig, C1CyclePool
-    from dsart.x2.search.engine import OwnerEngine
-    from dsart.x2.search.ring import RingV4Source
-    from dsart.x2.search.service import c1_rows_for_cycle
-    from dsart.x2.search.valuemap import dm_inputs_from_value_map
-    from dsart.transport import recv_ring as rr
-
-    import importlib.util
-    spec_ = importlib.util.spec_from_file_location("x2_i1_replay", U.REPO / "bench" / "_corr_fast_replay.py")
-    replay = importlib.util.module_from_spec(spec_)
-    import sys
-    sys.modules[spec_.name] = replay          # dataclasses resolve their module via sys.modules
-    spec_.loader.exec_module(replay)
-
-    op = opoint_2x("gridded", 2, 8)
-    fmt = U.get_format(op.opoint_id)
-    e, n, mask = cfi.load_antpos_from_cal_blob(cals[0][0])
-    vm = build_value_map_for_opoint(op, e, n, is_core_baseline_mask=mask, dec_deg=DEC_250924)
-    rule = quant.RowRule.for_format(8, 2, warmup_blocks=2)
-    d = fmt.coarse_of_dm(DM_250924)
-    h = fmt.owner_half(d)
-    sid, g_h = U.sid_g_of_half(h)
-    b0 = 999                                           # 999 * 4096 = 666 cycles: aligned clock
-    n_blocks = 15
-    spec = rr.RingV4Spec(
-        dms=(d,), t_int_factor=(16,), t_buf=((n_blocks + 2) * 256,), n_stream=vm.n_streams,
-        n_sub=2, bits_main=8, bits_heavy=16, value_kind=0, n_grid=256,
-        s_main=float(rule.s_main_f32), s_heavy=float(rule.s_heavy_f32),
-        stream_n_values=tuple(int(s.n_values) for s in vm.streams),
-        stream_n_heavy=tuple(int(s.n_heavy) for s in vm.streams), min_retention_s=0.0)
-    name = f"{U.SHM_PREFIX}real-{os.getpid()}"
-    w = rr.RxRingV4Writer.create(name, spec)
-    src = None
-    try:
-        for s in range(vm.n_streams):
-            w.set_expected_pattern_id(s, int(vm.stream_pattern_ids[s]))
-        sink = U._RingSink(w, rr)
-        for g in range(16):
-            cfg = cfi.FastIntegrationConfig(
-                chgroup=g, obs_dec_rad=math.radians(DEC_250924), n_grid=256, t_int_fast_native=8,
-                cal_path=str(cals[g][0]), rfi_enabled=False, rfi_array_burst_mode="off",
-                chan_sum_factor=2, n_sub=2, cell_lambda_mode="tee45")
-            ctx = cfi.build_context(cfg, device=torch.device("cuda:0"), antpos_e=e, antpos_n=n,
-                                    is_core_baseline_mask=mask)
-            orch = Corr2xPipeline(ctx, plan=fmt.cplan, vm=vm, is_core_baseline_mask=mask,
-                                  bits_main=8, rule=rule, static_sky_warmup=2, dm_subset=[d])
-            orch.tx2x = FramedTx2x(sink, orch.stream_formats())
-            vpath = next(p for p in vfiles if f"_sb{g:02d}_" in p.name)
-            for i, page in enumerate(replay.iterate_voltage_blocks(vpath, max_blocks=n_blocks)):
-                orch.push(np.frombuffer(page, np.uint8), block_n=b0 + i)
-            orch.flush()
-            del orch, ctx
-            torch.cuda.empty_cache()
-        assert not sink.bad and sink.n_ok > 0, sink.bad
-        inp = dm_inputs_from_value_map(vm, s_main=float(rule.s_main_f32),
-                                       s_heavy=float(rule.s_heavy_f32), bits_main=8)
-        oplan = U.owner_plan(fmt, h, [d])
-        src = RingV4Source.open(name, owned=[d], access="pread")
-        src.validate(oplan, {d: inp}, vmap=vm)
-        eng = OwnerEngine(oplan, {d: inp}, src, U.engine_config(backend="gpu", fft_mode="warp"))
-        _, sm = U.oracle()
-        n_bot = b0 * U.BLOCK_NATIVE + TOP_ARRIVAL_250924 - int(round(sm.A_TRUE[0, 0] * DM_250924
-                                                                     / sm.T_NAT))
-        k = (n_bot // 16 + eng.states[d].delay) // 384
-        res = eng.process_cycle(k)
-        kept, _legacy = C1CyclePool(C1CycleConfig()).filter(res.candidates, now_s=0.0,
-                                                             search_node_id=sid, gpu_half=g_h)
-        geom = dict(n_grid=256, cell_l_rad=fmt.cell_rad, cell_m_rad=fmt.cell_rad)
-        rows = c1_rows_for_cycle(kept, geom=geom)
-        f0 = fmt.nearest_fine(DM_250924)
-        best = max(range(len(kept)), key=lambda i: kept[i].snr) if kept else None
-        rec = dict(n_bot=n_bot, cycle=k, n_kept=len(kept))
-        if best is not None:
-            c, r = kept[best], rows[best]
-            rec.update(snr=float(c.snr), dm=float(c.dm), fine=int(c.fine_global), f0=f0,
-                       pixel=[int(c.l), int(c.m)], l_rad=float(r.l_rad), m_rad=float(r.m_rad),
-                       event_ext=int(c.event_specnum), expected_ext=n_bot / 16.0, filt=c.filt)
-        U.write_report("real_250924mptq", rec)
-        assert best is not None, rec
-        assert abs(rec["fine"] - f0) <= 1, rec
-        assert max(abs(rec["pixel"][0] - 128), abs(rec["pixel"][1] - 128)) <= 4, rec
-        assert abs(rec["event_ext"] - rec["expected_ext"]) <= 2.0, rec
-    finally:
-        if src is not None:
-            src.close()
-        w.close()
-        w.unlink()
+    vfiles, cals = staged
+    replay = U.replay_module()
+    dev = torch.device("cuda:0")
+    x2 = U.run_real_2x(vfiles, cals, replay, device=dev)
+    U.write_report("real_250924mptq/2x", x2)
+    x1 = U.run_real_1x(vfiles, cals, replay, device=dev)
+    U.write_report("real_250924mptq/1x", x1)
+    n_bot = U.real_n_bot()
+    geo = U.real_geometry(x2["cell_rad"])
+    cmp = dict(
+        n_bot=n_bot, geometry_tns=geo,
+        d_pix_2x_minus_1x=[x2["pixel"][0] - x1["pixel"][0], x2["pixel"][1] - x1["pixel"][1]]
+        if "pixel" in x2 and "pixel" in x1 else None,
+        dl_px_2x_minus_1x=(x2.get("l_rad", np.nan) - x1.get("l_rad", np.nan)) / x2["cell_rad"],
+        dm_px_2x_minus_1x=(x2.get("m_rad", np.nan) - x1.get("m_rad", np.nan)) / x2["cell_rad"],
+        snr_ratio_2x_1x=x2.get("snr", np.nan) / x1.get("snr", np.nan),
+        model_ratio_2x_1x=U.model_ratio_2x_1x(U.REAL_DM, (262.144, 524.288, 1048.576, 2097.152,
+                                                           4194.304)))
+    if "snr" in x1:
+        w1 = max(1, int(x1["width"]))                   # 1x boxcar width (1.048576 ms samples)
+        rho = x1["snr"] / math.sqrt(w1)
+        for _ in range(20):                             # true per-sample S/N under today's wire
+            rho = x1["snr"] / math.sqrt(w1) / float(U.today_compression(np.array([rho]))[0])
+        cmp["1x_per_sample_snr_true_est"] = rho
+        cmp["1x_wire_response_est"] = float(U.today_compression(np.array([rho]))[0])
+    U.write_report("real_250924mptq/compare", cmp)
+    for leg, r in (("2x", x2), ("1x", x1)):
+        assert "snr" in r, (leg, r)
+        assert abs(r["fine"] - r["f0"]) <= 1, (leg, r)
+        assert abs(r["event"] - n_bot / r["ext_native"]) <= 2.0, (leg, r, n_bot)
+    assert x2["cell_rad"] == pytest.approx(x1["cell_rad"], rel=1e-12)
+    assert abs(cmp["dl_px_2x_minus_1x"]) <= 1.0 + 1e-6 and abs(cmp["dm_px_2x_minus_1x"]) <= 1.0 + 1e-6, cmp

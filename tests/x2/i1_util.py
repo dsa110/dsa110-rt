@@ -1641,3 +1641,312 @@ def run_1x_leg(monkeypatch) -> None:
     write_report("1x/bursts", recs)
     write_report("1x/timings", dict(total_s=time.perf_counter() - t0, cycle=k))
     assert not problems, problems
+
+
+# ---------------------------------------------------------------------------
+# real data: 250924mptq (GPU) -- the 2x chain and TODAY's 1x chain on the same
+# voltage pages, same cal, same DEC steering, same RFI (off) and static-sky
+# warm-up (2 blocks), each engine warmed over the cycle before the burst
+# ---------------------------------------------------------------------------
+
+REAL_DM = 404.688                        # T2_250924mptq.json
+REAL_DEC = 53.848986                     # the burst's localized DEC: the phase centre is steered there
+REAL_TOP_ARRIVAL = 15248                 # native sample of the chgroup-0 top-of-band arrival from the
+                                         # dump start (bench/corr_fast_burst_250924mptq.py)
+REAL_TNS = dict(ra_deg=307.7765, dec_deg=53.849, mjd=60942.172498155)   # TNS localization (+-1')
+OVRO_LON_DEG = -118.2834
+REAL_B0 = 1001                           # block of the first page: 1001 = 2 (mod 3) puts a cycle
+                                         # boundary just after the burst in both legs, so the cycle
+                                         # before it is a clean (post-warm-up) warm cycle
+REAL_N_BLOCKS = 15
+
+
+def real_inputs(root: Path):
+    """``(voltage file by chgroup, cal blob by chgroup)`` or None if not staged."""
+    vfiles = {}
+    for p in sorted((root / "voltages").glob("*_sb*_data.out")):
+        vfiles[int(p.name.split("_sb")[1][:2])] = p
+    cals = {}
+    for g in range(16):
+        c = sorted((root / "cals").glob(f"beamformer_weights_sb{g:02d}*.dat"))
+        if c:
+            cals[g] = c[0]
+    if len(vfiles) != 16 or len(cals) != 16:
+        return None
+    return vfiles, cals
+
+
+def replay_module():
+    """``bench/_corr_fast_replay.py`` (``iterate_voltage_blocks``)."""
+    spec_ = importlib.util.spec_from_file_location("x2_i1_replay",
+                                                   REPO / "bench" / "_corr_fast_replay.py")
+    mod = importlib.util.module_from_spec(spec_)
+    sys.modules[spec_.name] = mod             # dataclasses resolve their module via sys.modules
+    spec_.loader.exec_module(mod)
+    return mod
+
+
+def real_n_bot() -> int:
+    """Native index of the burst's arrival at NU_BOT_PROC (page 0 = block REAL_B0)."""
+    _, sm = oracle()
+    return REAL_B0 * BLOCK_NATIVE + REAL_TOP_ARRIVAL - int(round(sm.A_TRUE[0, 0] * REAL_DM
+                                                                 / sm.T_NAT))
+
+
+def real_geometry(cell_rad: float) -> dict:
+    """Where the TNS position should image: phase centre (HA = 0, REAL_DEC);
+    the imager's (l, m) are the horizon-frame east / north direction-cosine
+    offsets (u = -dE / lambda, v = -dN / lambda, no projection; F20/F21)."""
+    from astropy import units as u
+    from astropy.coordinates import EarthLocation
+    from astropy.time import Time
+
+    from dsart.common.constants import PHI_LAT_OVRO_RAD as lat
+
+    loc = EarthLocation(lat=math.degrees(lat) * u.deg, lon=OVRO_LON_DEG * u.deg)
+    lst = Time(REAL_TNS["mjd"], format="mjd", scale="utc").sidereal_time(
+        "apparent", longitude=loc.lon).deg
+    ha = math.radians(((lst - REAL_TNS["ra_deg"] + 180.0) % 360.0) - 180.0)
+    dec, dec0 = math.radians(REAL_TNS["dec_deg"]), math.radians(REAL_DEC)
+    east = -math.cos(dec) * math.sin(ha)
+    north = (math.cos(lat) * math.sin(dec) - math.sin(lat) * math.cos(dec) * math.cos(ha)) - \
+        (math.cos(lat) * math.sin(dec0) - math.sin(lat) * math.cos(dec0))
+    return dict(lst_deg=float(lst), ha_deg=math.degrees(ha), l_rad=east, m_rad=north,
+                l_px=east / cell_rad, m_px=north / cell_rad)
+
+
+def model_ratio_2x_1x(dm: float, widths_us: Sequence[float]) -> dict:
+    """snr_model: proposed 2x (n_sub 2) / current (deployed 1x) total efficiency
+    for Gaussian bursts, both with the boxcar ladder (b3x adds ~x1.05 for
+    Gaussians, Phase 0 study 5; today's wire compression is separate)."""
+    schemes, sm = oracle()
+    p = sm.evaluate(_scheme(2), float(dm), list(widths_us), shape="gauss")["total"]
+    c = sm.evaluate(schemes.current(), float(dm), list(widths_us), shape="gauss")["total"]
+    return {f"{w:g}us": float(a / b) for w, a, b in zip(widths_us, p, c)}
+
+
+def _best_c1(eng, k: int, pool, *, sid: int, g: int, geom: dict, warm: Sequence[int]) -> dict:
+    """Warm cycles, then the burst cycle; the brightest C1 row of cycle ``k``."""
+    from dsart.x2.search.service import c1_rows_for_cycle
+
+    for kk in warm:
+        eng.process_cycle(int(kk))
+    res = eng.process_cycle(int(k))
+    kept, _legacy = pool.filter(res.candidates, now_s=0.0, search_node_id=sid, gpu_half=g)
+    rows = c1_rows_for_cycle(kept, geom=geom)
+    out = dict(cycle=int(k), n_engine=len(res.candidates), n_kept=len(kept))
+    if kept:
+        i = max(range(len(kept)), key=lambda j: kept[j].snr)
+        c, r = kept[i], rows[i]
+        pd = res.per_dm[int(c.d)]
+        out.update(snr=float(c.snr), dm=float(c.dm), fine=int(c.fine_global), d=int(c.d),
+                   pixel=[int(c.l), int(c.m)], l_rad=float(r.l_rad), m_rad=float(r.m_rad),
+                   event=int(c.event_specnum), filt=c.filt, width=int(c.width_ext),
+                   sigma_l1_median=float(np.median(pd.sigma_applied)),
+                   s_k=[float(x) for x in pd.s_k_applied], flags=int(c.flags))
+    return out
+
+
+def run_real_2x(vfiles, cals, replay, *, device) -> dict:
+    """2x gridded ns2 cint4: Corr2xPipeline (GPU) per chgroup -> FramedTx2x ->
+    ring v4 -> RingV4Source -> GPU owner engine (warm cycle, burst cycle) -> C1."""
+    import torch
+
+    from dsart.grid.baseline_grid import build_value_map_for_opoint
+    from dsart.services import corr_fast_integration as cfi
+    from dsart.transport import recv_ring as rr
+    from dsart.x2 import quant
+    from dsart.x2.corr.pipeline2x import Corr2xPipeline
+    from dsart.x2.corr.tx2x import FramedTx2x
+    from dsart.x2.opoint import opoint_2x
+    from dsart.x2.search.c1_cycle import C1CycleConfig, C1CyclePool
+    from dsart.x2.search.engine import OwnerEngine
+    from dsart.x2.search.ring import RingV4Source
+    from dsart.x2.search.valuemap import dm_inputs_from_value_map
+
+    op = opoint_2x("gridded", 2, 8)
+    fmt = get_format(op.opoint_id)
+    e, n, mask = cfi.load_antpos_from_cal_blob(cals[0])
+    vm = build_value_map_for_opoint(op, e, n, is_core_baseline_mask=mask, dec_deg=REAL_DEC)
+    rule = quant.RowRule.for_format(8, 2, warmup_blocks=2)
+    d = fmt.coarse_of_dm(REAL_DM)
+    h = fmt.owner_half(d)
+    sid, g_h = sid_g_of_half(h)
+    spec = rr.RingV4Spec(
+        dms=(d,), t_int_factor=(16,), t_buf=((REAL_N_BLOCKS + 2) * 256,), n_stream=vm.n_streams,
+        n_sub=2, bits_main=8, bits_heavy=16, value_kind=0, n_grid=N_GRID,
+        s_main=float(rule.s_main_f32), s_heavy=float(rule.s_heavy_f32),
+        stream_n_values=tuple(int(s.n_values) for s in vm.streams),
+        stream_n_heavy=tuple(int(s.n_heavy) for s in vm.streams), min_retention_s=0.0)
+    name = f"{SHM_PREFIX}real-{uuid.uuid4().hex[:8]}"
+    w = rr.RxRingV4Writer.create(name, spec)
+    src = None
+    t0 = time.perf_counter()
+    try:
+        for s in range(vm.n_streams):
+            w.set_expected_pattern_id(s, int(vm.stream_pattern_ids[s]))
+        sink = _RingSink(w, rr)
+        for g in range(16):
+            cfg = cfi.FastIntegrationConfig(
+                chgroup=g, obs_dec_rad=math.radians(REAL_DEC), n_grid=N_GRID, t_int_fast_native=8,
+                cal_path=str(cals[g]), rfi_enabled=False, rfi_array_burst_mode="off",
+                chan_sum_factor=2, n_sub=2, cell_lambda_mode="tee45")
+            ctx = cfi.build_context(cfg, device=device, antpos_e=e, antpos_n=n,
+                                    is_core_baseline_mask=mask)
+            orch = Corr2xPipeline(ctx, plan=fmt.cplan, vm=vm, is_core_baseline_mask=mask,
+                                  bits_main=8, rule=rule, static_sky_warmup=2, dm_subset=[d])
+            orch.tx2x = FramedTx2x(sink, orch.stream_formats())
+            for i, page in enumerate(replay.iterate_voltage_blocks(vfiles[g],
+                                                                   max_blocks=REAL_N_BLOCKS)):
+                orch.push(np.frombuffer(page, np.uint8), block_n=REAL_B0 + i)
+            orch.flush()
+            del orch, ctx
+            torch.cuda.empty_cache()
+        if sink.bad or not sink.n_ok:
+            raise AssertionError(f"ring v4 ingest: ok {sink.n_ok} bad {sink.bad}")
+        t_corr = time.perf_counter() - t0
+        inp = dm_inputs_from_value_map(vm, s_main=float(rule.s_main_f32),
+                                       s_heavy=float(rule.s_heavy_f32), bits_main=8)
+        oplan = owner_plan(fmt, h, [d])
+        src = RingV4Source.open(name, owned=[d], access="pread")
+        src.validate(oplan, {d: inp}, vmap=vm)
+        eng = OwnerEngine(oplan, {d: inp}, src,
+                          engine_config(backend="gpu", fft_mode="warp", layer2_n_burnin=1))
+        k = (real_n_bot() // EXT_NATIVE + eng.states[d].delay) // 384
+        geom = dict(n_grid=N_GRID, cell_l_rad=fmt.cell_rad, cell_m_rad=fmt.cell_rad)
+        out = _best_c1(eng, k, C1CyclePool(C1CycleConfig()), sid=sid, g=g_h, geom=geom,
+                       warm=[k - 1])
+        out.update(half=h, coarse=d, f0=fmt.nearest_fine(REAL_DM), ext_native=EXT_NATIVE,
+                   cell_rad=fmt.cell_rad, cell_lambda=float(vm.cell_lambda),
+                   corr_s=t_corr, total_s=time.perf_counter() - t0)
+        return out
+    finally:
+        if src is not None:
+            src.close()
+        w.close()
+        w.unlink()
+
+
+class _Capture1x:
+    """TX stand-in of today's 1x corr (the ``transport_tx`` stage): each cube
+    row is coded with today's v1 rule over the WHOLE chgroup row
+    (``TransportTx._encode_rows`` == ``corr2x_ref.quantise_v1_rows``: per-row
+    max-abs cint8, the scale is not used by the search), then split into the
+    n_sub sub-band streams as search_rx does. A cube pushed at ``block_n``
+    holds rows ``(block_n - 1) * T ..`` (the sliding-window stage 1 emits the
+    previous block; the per-coarse-DM stage-2 FIFO delays within that slot)."""
+
+    def __init__(self, store, valid, sids, offsets, rows_blk: int) -> None:
+        self.store, self.valid, self.sids = store, valid, list(sids)
+        self.off = [int(o) for o in offsets]
+        self.T = int(rows_blk)
+        self.n_cubes = 0
+
+    def transmit(self, cubes_for_tx, *, block_n: int, rfi_warming_up: bool) -> int:
+        from dsart.x2.ref.corr2x_ref import quantise_v1_rows
+
+        for cube in cubes_for_tx:
+            x = cube.detach().to("cpu").numpy()
+            if x.shape[0] != 1 or x.shape[1] != self.T:
+                raise AssertionError(f"1x cube {x.shape}")
+            r0 = (int(block_n) - 1 - REAL_B0) * self.T
+            if r0 < 0:
+                continue
+            q, _scales = quantise_v1_rows(x[0])                     # (T, N_filled, 2) int8
+            for s, sid in enumerate(self.sids):
+                lo, hi = self.off[s], self.off[s + 1]
+                self.store[sid, r0:r0 + self.T, :2 * (hi - lo)] = \
+                    q[:, lo:hi].reshape(self.T, -1).view(np.uint8)
+                self.valid[sid, r0:r0 + self.T] = True
+            self.n_cubes += 1
+        return len(cubes_for_tx)
+
+
+def run_real_1x(vfiles, cals, replay, *, device) -> dict:
+    """TODAY's 1x: corr_fast's production context (multi-DM stage 1 from the
+    deployed v2 plan, sliding window, csf 8, n_sub 4, t_int 32, tee45, the
+    per-coarse-DM stage-2 FIFO) driven by WS-C's PipelinedCorrFast (equal to
+    ``process_block``), today's v1 wire, the 1x RX row layout, and the owner
+    engine in 1x-compat mode (the production combine / imager / detector /
+    decoder arithmetic, WS-S-checked) on the GPU -> today's C1 chain."""
+    import torch
+
+    from dsart.grid.baseline_grid import build_value_map_for_opoint
+    from dsart.services import corr_fast_integration as cfi
+    from dsart.x2.corr.pipeline1x import PipelinedCorrFast
+    from dsart.x2.opoint import OPPOINT_1X
+    from dsart.x2.search.c1_cycle import C1CycleConfig, C1CyclePool
+    from dsart.x2.search.engine import EngineConfig, OwnerEngine
+    from dsart.x2.search.geometry import owner_plan_1x
+    from dsart.x2.search.ring import MemoryRing
+    from dsart.x2.search.valuemap import dm_inputs_from_value_map
+
+    schemes, _sm = oracle()
+    z = np.load(schemes.DEPLOYED, allow_pickle=True)
+    coarse = np.asarray(z["coarse_dm"], float)
+    fine = np.asarray(z["fine_dm"], float)
+    f2c = np.asarray(z["fine_to_coarse"], np.int64)
+    c1 = int(f2c[int(np.argmin(np.abs(fine - REAL_DM)))])
+    h = c1                                             # 1x: coarse DM c on half c
+    sid_h, g_h = sid_g_of_half(h)
+    t_us = 32 * NATIVE_S * 1e6
+    e, n, mask = cfi.load_antpos_from_cal_blob(cals[0])
+    vm1 = build_value_map_for_opoint(OPPOINT_1X, e, n, is_core_baseline_mask=mask,
+                                     dec_deg=REAL_DEC)
+    inp1 = dm_inputs_from_value_map(vm1)
+    rb = int(inp1.fmt.row_bytes)
+    rows_blk = BLOCK_NATIVE // 32
+    n_rows = (REAL_N_BLOCKS + 1) * rows_blk
+    store = np.zeros((vm1.n_streams, n_rows, rb), np.uint8)
+    valid = np.zeros((vm1.n_streams, n_rows), bool)
+    t0 = time.perf_counter()
+    for g in range(16):
+        sids = [g * 4 + s for s in range(4)]
+        offs = np.concatenate([[0], np.cumsum([int(vm1.streams[s].n_values) for s in sids])])
+        cap = _Capture1x(store, valid, sids, offs, rows_blk)
+        fifo = cfi._Stage2InterChgroupShiftAdapter(chgroup=g, coarse_dm_pc_cm3=coarse[[c1]],
+                                                    t_int_corr_us=t_us)
+        cfg = cfi.FastIntegrationConfig(
+            chgroup=g, obs_dec_rad=math.radians(REAL_DEC), n_grid=N_GRID, t_int_fast_native=32,
+            cal_path=str(cals[g]), rfi_enabled=False, rfi_array_burst_mode="off",
+            chan_sum_factor=8, n_sub=4, cell_lambda_mode="tee45",
+            dm_plan_path=Path(schemes.DEPLOYED), dm_indices_subset=(c1,), sliding_window=True,
+            static_sky_warmup_cubes=2)
+        ctx = cfi.build_context(cfg, device=device, antpos_e=e, antpos_n=n,
+                                is_core_baseline_mask=mask, stage2_fifo=fifo, transport_tx=cap)
+        md = ctx.multi_dm_coarse_dm
+        if not np.isclose(float(md.plan.dm_pc_cc[c1]), float(coarse[c1])):
+            raise AssertionError("1x corr plan coarse DM != the deployed plan's")
+        lay = md.subband_layout
+        for s, sid in enumerate(sids):                 # corr cells == the 1x map's (wire order)
+            p, st = lay.patterns[s], vm1.streams[sid]
+            if not (np.array_equal(np.asarray(p.ix_row), np.asarray(st.cell_row))
+                    and np.array_equal(np.asarray(p.ix_col), np.asarray(st.cell_col))):
+                raise AssertionError(f"chgroup {g} sub-band {s}: corr cells != OPPOINT_1X map")
+        orch = PipelinedCorrFast(ctx)
+        for i, page in enumerate(replay.iterate_voltage_blocks(vfiles[g],
+                                                               max_blocks=REAL_N_BLOCKS)):
+            orch.push(np.frombuffer(page, np.uint8), block_n=REAL_B0 + i)
+        orch.flush()
+        if not cap.n_cubes:
+            raise AssertionError(f"chgroup {g}: the 1x corr transmitted nothing")
+        del orch, ctx
+        torch.cuda.empty_cache()
+    t_corr = time.perf_counter() - t0
+    oplan = owner_plan_1x(coarse_dm=coarse, fine_dm=fine, fine_to_coarse=f2c, owned=[c1], half=h,
+                          n_sub=4, csf=8, t_native=32)
+    ring = MemoryRing({c1: inp1.fmt}, vm1.n_streams, t_buf=n_rows + 64)
+    ring.push(c1, REAL_B0 * rows_blk, store, valid)
+    cfg = EngineConfig.compat_1x(backend="gpu", fft_mode="warp", layer2_n_burnin=1,
+                                 wait_timeout_s=0.0)
+    eng = OwnerEngine(oplan, {c1: inp1}, ring, cfg)
+    k = (real_n_bot() // 32 + eng.states[c1].delay) // 192
+    cell = 1.0 / (N_GRID * float(vm1.cell_lambda))
+    geom = dict(n_grid=N_GRID, cell_l_rad=cell, cell_m_rad=cell)
+    out = _best_c1(eng, k, C1CyclePool(C1CycleConfig.today_1x()), sid=sid_h, g=g_h, geom=geom,
+                   warm=[k - 1])
+    spec = oplan.dms[0]
+    out.update(half=h, coarse=c1, f0=int(np.argmin(np.abs(spec.fine_dm - REAL_DM))),
+               ext_native=32, cell_rad=cell, cell_lambda=float(vm1.cell_lambda), corr_s=t_corr,
+               total_s=time.perf_counter() - t0, rows_valid_frac=float(valid.mean()))
+    return out
