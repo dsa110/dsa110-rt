@@ -337,14 +337,19 @@ def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, b
     tk = torch.empty((n_ch, F, P), dtype=torch.int32, device=dev)
     n_tap = 0
     tappix = torch.zeros((1,), dtype=torch.int32, device=dev)
+    # device tensors pass straight through; a numpy argument is a pageable
+    # H2D, which torch completes with a host-side stream sync
     if tap_pixels is not None:
-        tappix = torch.as_tensor(np.asarray(tap_pixels), dtype=torch.int32, device=dev)
+        tappix = (tap_pixels.to(device=dev, dtype=torch.int32)
+                  if isinstance(tap_pixels, torch.Tensor)
+                  else torch.as_tensor(np.asarray(tap_pixels), dtype=torch.int32, device=dev))
         n_tap = int(tappix.numel())
     K = len(bank)
     # every (k, f, tap, centre) is written by the taps kernels: no zero fill
     taps = torch.empty((K, F, max(n_tap, 1), n_c), dtype=torch.float32, device=dev)
     si = torch.as_tensor(sigma_inv, dtype=torch.float32, device=dev).contiguous()
-    sk = torch.as_tensor(np.asarray(s_inv, dtype=np.float32), device=dev)
+    sk = (s_inv.to(device=dev, dtype=torch.float32) if isinstance(s_inv, torch.Tensor)
+          else torch.as_tensor(np.asarray(s_inv, dtype=np.float32), device=dev))
     ring = ring.contiguous()
     st = cp.cuda.ExternalStream((stream or torch.cuda.current_stream()).cuda_stream)
     args_tail = (np.int32(R), np.int32(F), np.int32(P), np.int64(ring_row0), np.int64(c_first),

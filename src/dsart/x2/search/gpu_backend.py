@@ -257,7 +257,9 @@ class GpuBackend:
             self._image_batch(st, x, r0, n, self.compute, x.image, st.R_img)
         st.image_hi = hi if st.image_hi is None else max(st.image_hi, hi)
 
-    def layer1_sigma(self, st, t0: int) -> np.ndarray:
+    def layer1_launch(self, st, t0: int) -> torch.Tensor:
+        """Layer-1 per-fine-DM sigma of the cycle's new rows, left on the
+        device (compute stream; :meth:`to_host` brings it back)."""
         from ...noise_norm.layer1 import sigma_clipped_std_batched
 
         x = self.dm[st.spec.d]
@@ -270,9 +272,9 @@ class GpuBackend:
                         torch.as_tensor(np.ascontiguousarray(st.l1_t), dtype=torch.int32,
                                         device=self.dev),
                         torch.as_tensor(np.ascontiguousarray(st.l1_p), dtype=torch.int32,
-                                        device=self.dev),
-                        torch.empty(st.spec.n_fdm, dtype=torch.float32, device=self.dev))
-                lt, lp, sig = x.l1_tables
+                                        device=self.dev))
+                lt, lp = x.l1_tables
+                sig = torch.empty(st.spec.n_fdm, dtype=torch.float32, device=self.dev)
                 launch_l1(x.image, lt, lp, sig, F=st.spec.n_fdm, P=int(x.image.shape[2]),
                           R_img=st.R_img, t0=int(t0), M=int(st.l1_t.shape[1]),
                           stream=self.compute)
@@ -283,14 +285,34 @@ class GpuBackend:
                 smp = x.image[slots, f_idx, p].float()
                 sig = sigma_clipped_std_batched(smp)
             self._mark(st.spec.d, "l1", a, self._ev(self.compute))
-            # D2H ON the compute stream: ordered after the work that produced it
-            # (a .cpu() outside this block runs on the default stream and can
-            # read the buffers before the compute stream has written them)
-            return sig.cpu().numpy()
+        return sig
 
-    def k3b_topk(self, st, c_first: int, sigma_inv: np.ndarray, s_inv: np.ndarray,
-                 n_top: int) -> tuple:
-        """K3b + top-k on the device; ONE D2H of the top-k and the taps."""
+    def to_host(self, tensors: dict) -> dict:
+        """ONE wait for every device tensor in ``{key: tensor | tuple of
+        tensors}``: non-blocking D2H copies into pinned memory ON the compute
+        stream (ordered after the work that produced them; a copy on another
+        stream could read the buffers before the compute stream wrote them),
+        one event sync; returns the same structure as numpy arrays."""
+        out = {}
+        with torch.cuda.stream(self.compute):
+            for key, v in tensors.items():
+                if isinstance(v, (tuple, list)):
+                    out[key] = tuple(t.to("cpu", non_blocking=True) for t in v)
+                else:
+                    out[key] = v.to("cpu", non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.compute)
+        ev.synchronize()
+        return {k: (tuple(t.numpy() for t in v) if isinstance(v, tuple) else v.numpy())
+                for k, v in out.items()}
+
+    def layer1_sigma(self, st, t0: int) -> np.ndarray:
+        return self.to_host({0: self.layer1_launch(st, t0)})[0]
+
+    def k3b_topk_launch(self, st, c_first: int, sigma_inv: np.ndarray, s_inv: np.ndarray,
+                        n_top: int) -> tuple:
+        """K3b + top-k on the device (compute stream, nothing comes back):
+        ``(vals, idx, tk_at_idx, best.shape, taps)``."""
         from .kernels_triton import k3b_detect
         from .k3b_fused import k3b_fused
 
@@ -304,29 +326,44 @@ class GpuBackend:
         detect = impls[cfg.k3b_impl]
         with torch.cuda.stream(self.compute):
             ev0 = self._ev(self.compute)
+            # small per-cycle inputs go up pinned + non-blocking (a pageable
+            # torch H2D syncs the host with the stream); "reg" takes device
+            # tensors for all of them
+            si = torch.from_numpy(np.ascontiguousarray(sigma_inv, dtype=np.float32))
+            si = si.pin_memory().to(self.dev, non_blocking=True)
+            tap_pixels, sk = st.tap_pixels, s_inv
+            if cfg.k3b_impl == "reg":
+                if getattr(x, "tap32", None) is None:
+                    x.tap32 = x.tap.to(torch.int32)
+                tap_pixels = x.tap32 if st.tap_pixels is not None else None
+                sk = torch.from_numpy(np.ascontiguousarray(s_inv, dtype=np.float32))
+                sk = sk.pin_memory().to(self.dev, non_blocking=True)
             best, tk, taps = detect(
                 x.image, ring_row0=0, c_first=c_first, n_c=st.spec.hop,
-                sigma_inv=torch.as_tensor(sigma_inv, device=self.dev), s_inv=s_inv,
-                bank=self.eng.bank, clip=cfg.clip_sigma, chunk=cfg.chunk,
-                tap_pixels=st.tap_pixels)
+                sigma_inv=si, s_inv=sk, bank=self.eng.bank, clip=cfg.clip_sigma,
+                chunk=cfg.chunk, tap_pixels=tap_pixels)
             evm = self._ev(self.compute)
             flat = best.view(-1)
             k = int(min(max(1, n_top), flat.numel()))
             vals, idx = torch.topk(flat, k)
             tkv = tk.view(-1)[idx]
             ev1 = self._ev(self.compute)
-            # D2H on the compute stream (see layer1_sigma)
-            # taps stay on the device: Layer-2 runs there (layer2_sigma)
-            out = (vals.cpu().numpy(), idx.cpu().numpy(), tkv.cpu().numpy(), tuple(best.shape),
-                   taps)
         self._mark(st.spec.d, "k3b", ev0, evm)
         self._mark(st.spec.d, "topk", evm, ev1)
-        return out
+        return vals, idx, tkv, tuple(best.shape), taps
 
-    def layer2_sigma(self, st, taps: torch.Tensor, max_samples: int) -> torch.Tensor:
+    def k3b_topk(self, st, c_first: int, sigma_inv: np.ndarray, s_inv: np.ndarray,
+                 n_top: int) -> tuple:
+        """K3b + top-k on the device; ONE D2H of the top-k (taps stay on the
+        device for :meth:`layer2_sigma`)."""
+        vals, idx, tkv, shape, taps = self.k3b_topk_launch(st, c_first, sigma_inv, s_inv, n_top)
+        h = self.to_host({0: (vals, idx, tkv)})[0]
+        return h[0], h[1], h[2], shape, taps
+
+    def layer2_launch(self, st, taps: torch.Tensor, max_samples: int) -> torch.Tensor:
         """Per-filter sigma of the raw tap scores on the device (the CPU path's
-        ``sigma_clipped_std_batched`` over the same ``linspace`` subsample);
-        only K floats come back."""
+        ``sigma_clipped_std_batched`` over the same ``linspace`` subsample),
+        left on the device."""
         x = self.dm[st.spec.d]
         K = int(taps.shape[0])
         with torch.cuda.stream(self.compute):
@@ -346,7 +383,10 @@ class GpuBackend:
             sig = torch.empty(K, dtype=torch.float32, device=self.dev)
             launch_clipstd_rows(work, sig, stream=self.compute)
             self._mark(st.spec.d, "l2", a, self._ev(self.compute))
-            return sig.cpu()
+        return sig
+
+    def layer2_sigma(self, st, taps: torch.Tensor, max_samples: int) -> torch.Tensor:
+        return torch.from_numpy(self.to_host({0: self.layer2_launch(st, taps, max_samples)})[0])
 
     def pop_gpu_ms(self, by_stage: bool = False) -> dict:
         """Per DM since the last call (syncs): the compute-stream ms summed

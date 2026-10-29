@@ -297,11 +297,14 @@ class OwnerEngine:
         t_start = time.perf_counter()
         per_dm: Dict[int, DmCycleResult] = {}
         cands: List[Candidate2x] = []
+        if self._gpu is not None:
+            per_dm = self._process_cycle_phased(int(k), keep_maps=keep_maps)
+        else:
+            for spec in self.order_dms():
+                per_dm[spec.d] = self._process_dm(self.states[spec.d], int(k),
+                                                  keep_maps=keep_maps)
         for spec in self.order_dms():
-            st = self.states[spec.d]
-            res = self._process_dm(st, int(k), keep_maps=keep_maps)
-            per_dm[spec.d] = res
-            cands.extend(res.candidates)
+            cands.extend(per_dm[spec.d].candidates)
         if self.cfg.c1_merge and cands:
             cands = merge_c1(cands, lm_max_cells=self.cfg.c1_lm_max_cells,
                              dm_max_trials=self.cfg.c1_dm_max_trials, t_frac=self.cfg.c1_t_frac,
@@ -383,6 +386,11 @@ class OwnerEngine:
             f_idx = np.arange(st.spec.n_fdm)[:, None]
             samples = st.image[slots, f_idx, st.l1_p].astype(np.float32)
             sig = sigma_clipped_std_batched(torch.from_numpy(samples)).numpy()
+        return self._layer1_update(st, sig)
+
+    def _layer1_update(self, st: DmState, sig) -> np.ndarray:
+        import torch
+
         out = st.layer1.update_and_query(per_fdm_sigma=torch.as_tensor(sig, dtype=torch.float32))
         return out.detach().cpu().numpy().astype(np.float64)
 
@@ -392,13 +400,12 @@ class OwnerEngine:
         ok = st.streams.valid[np.arange(st.spec.n_stream)[None, None, :], sl].all(axis=2)
         return float(ok.mean())
 
-    def _process_dm(self, st: DmState, k: int, *, keep_maps: bool) -> DmCycleResult:
-        import torch
-        from ...noise_norm.layer1 import sigma_clipped_std_batched
-
-        spec, cfg = st.spec, self.cfg
-        tm = {}
-        t0, t1 = spec.cycle_rows(k)
+    # ------------------------------------------------------------------
+    # one DM-cycle, as steps shared by the serial (CPU) and phased (GPU) paths
+    # ------------------------------------------------------------------
+    def _dm_image(self, st: DmState, k: int, tm: dict) -> tuple:
+        """K0 + K1 + K2/K3a for this cycle's new rows; ``(t0, t1)``."""
+        t0, t1 = st.spec.cycle_rows(k)
         img_lo = t0 - st.history
         if st.image_hi is not None and st.image_hi >= img_lo and st.image_hi <= t1:
             img_lo = max(img_lo, st.image_hi)
@@ -410,8 +417,12 @@ class OwnerEngine:
             a = time.perf_counter()
             self._image_rows(st, img_lo, t1)
             tm["image_ms"] = 1e3 * (time.perf_counter() - a)
-        a = time.perf_counter()
-        sigma_new = self._layer1(st, t0)
+        return t0, t1
+
+    def _dm_sigma(self, st: DmState, t0: int, t1: int, sigma_new: np.ndarray) -> tuple:
+        """Layer-1 bookkeeping + the detector's inputs: ``(sigma_applied,
+        s_k_applied, sigma_inv, s_inv)``."""
+        cfg = self.cfg
         if cfg.layer1_mode == "same_cycle" or st.sigma_prev is None:
             sigma_applied = sigma_new
         elif cfg.layer1_mode == "lagged":
@@ -420,35 +431,19 @@ class OwnerEngine:
             raise ValueError(f"layer1_mode={cfg.layer1_mode!r}")
         st.sigma_prev = sigma_new
         st.sigma_history.append((t0 - st.delay, t1 - st.delay, np.asarray(sigma_applied).copy()))
-        tm["layer1_ms"] = 1e3 * (time.perf_counter() - a)
         s_k_applied = st.layer2._s_k.detach().cpu().numpy().astype(np.float64)
-        a = time.perf_counter()
         sigma_inv = (1.0 / np.maximum(sigma_applied, np.finfo(np.float32).tiny)).astype(np.float32)
         s_inv = (1.0 / np.maximum(s_k_applied, 1e-30)).astype(np.float32)
+        return sigma_applied, s_k_applied, sigma_inv, s_inv
+
+    def _n_top(self, spec: DmSpec) -> int:
+        return int(round(self.cfg.n_top_per_192 * spec.hop / 192.0))
+
+    def _dm_finish(self, st: DmState, k: int, t0: int, sig_k, topk, best, tk, *, sigma_new,
+                   sigma_applied, s_k_applied, keep_maps: bool, tm: dict) -> DmCycleResult:
+        """Layer-2 update (decode used the state BEFORE it) + decode."""
+        spec, cfg = st.spec, self.cfg
         c_first = t0 - st.delay
-        n_top = int(round(cfg.n_top_per_192 * spec.hop / 192.0))
-        topk = None
-        if self._gpu is not None:
-            vals, idx, tkv, shape, taps = self._gpu.k3b_topk(st, c_first, sigma_inv, s_inv,
-                                                              n_top)
-            topk = (vals, idx, tkv, shape)
-            best = tk = None
-        else:
-            best, tk, taps = k3b_twin(st.image, ring_row0=0, c_first=c_first, n_c=spec.hop,
-                                      sigma_inv=sigma_inv, s_inv=s_inv, bank=self.bank,
-                                      clip=cfg.clip_sigma, chunk=cfg.chunk,
-                                      tap_pixels=st.tap_pixels)
-        tm["k3b_ms"] = 1e3 * (time.perf_counter() - a)
-        # Layer-2 (single pass: decode used the state BEFORE this update)
-        K = len(self.bank)
-        if self._gpu is not None and isinstance(taps, torch.Tensor):
-            sig_k = self._gpu.layer2_sigma(st, taps, cfg.layer2_max_samples)
-        else:
-            flat = taps.reshape(K, -1)
-            if flat.shape[1] > cfg.layer2_max_samples:
-                idx = np.linspace(0, flat.shape[1] - 1, cfg.layer2_max_samples).astype(np.int64)
-                flat = flat[:, idx]
-            sig_k = sigma_clipped_std_batched(torch.from_numpy(np.ascontiguousarray(flat)))
         vfrac = self._valid_fraction(st, t0)
         cube_valid = vfrac >= cfg.layer2_valid_min_fraction
         _sk, warming = st.layer2.update_and_query(per_kernel_sigma=sig_k, valid=cube_valid)
@@ -461,7 +456,7 @@ class OwnerEngine:
         if topk is not None:
             cands = decode_topk(topk[0], topk[1], topk[2], shape=topk[3], **dkw)
         else:
-            cands = decode_chunkmax(best, tk, n_top=n_top, **dkw)
+            cands = decode_chunkmax(best, tk, n_top=self._n_top(spec), **dkw)
         tm["decode_ms"] = 1e3 * (time.perf_counter() - a)
         st.cycles += 1
         return DmCycleResult(d=spec.d, cycle=k, t0=t0, sigma_applied=sigma_applied,
@@ -469,6 +464,83 @@ class OwnerEngine:
                              valid_fraction=vfrac, warming_up=bool(warming), candidates=cands,
                              best=best if keep_maps else None, tk=tk if keep_maps else None,
                              timings_ms=tm)
+
+    def _process_dm(self, st: DmState, k: int, *, keep_maps: bool) -> DmCycleResult:
+        """Serial DM-cycle (the CPU twins)."""
+        import torch
+        from ...noise_norm.layer1 import sigma_clipped_std_batched
+
+        spec, cfg = st.spec, self.cfg
+        tm = {}
+        t0, t1 = self._dm_image(st, k, tm)
+        a = time.perf_counter()
+        sigma_new = self._layer1(st, t0)
+        sigma_applied, s_k_applied, sigma_inv, s_inv = self._dm_sigma(st, t0, t1, sigma_new)
+        tm["layer1_ms"] = 1e3 * (time.perf_counter() - a)
+        a = time.perf_counter()
+        best, tk, taps = k3b_twin(st.image, ring_row0=0, c_first=t0 - st.delay, n_c=spec.hop,
+                                  sigma_inv=sigma_inv, s_inv=s_inv, bank=self.bank,
+                                  clip=cfg.clip_sigma, chunk=cfg.chunk,
+                                  tap_pixels=st.tap_pixels)
+        tm["k3b_ms"] = 1e3 * (time.perf_counter() - a)
+        K = len(self.bank)
+        flat = taps.reshape(K, -1)
+        if flat.shape[1] > cfg.layer2_max_samples:
+            idx = np.linspace(0, flat.shape[1] - 1, cfg.layer2_max_samples).astype(np.int64)
+            flat = flat[:, idx]
+        sig_k = sigma_clipped_std_batched(torch.from_numpy(np.ascontiguousarray(flat)))
+        return self._dm_finish(st, k, t0, sig_k, None, best, tk, sigma_new=sigma_new,
+                               sigma_applied=sigma_applied, s_k_applied=s_k_applied,
+                               keep_maps=keep_maps, tm=tm)
+
+    def _process_cycle_phased(self, k: int, *, keep_maps: bool) -> Dict[int, DmCycleResult]:
+        """The GPU cycle in three phases over ALL owned DMs, so the host
+        never waits on the device per DM (two syncs per cycle, not three
+        per DM): (A) fetch + K0 + image + Layer-1 kernel of every DM, one
+        D2H of all the sigmas; host Layer-1 updates; (B) K3b + top-k +
+        Layer-2 kernel of every DM, one D2H; (C) host Layer-2 updates +
+        decode. Per DM the operations and the state each sees are those of
+        :meth:`_process_dm` (DM states are independent)."""
+        import torch
+
+        gpu = self._gpu
+        order = [self.states[s.d] for s in self.order_dms()]
+        tms = {st.spec.d: {} for st in order}
+        rows, l1_dev = {}, {}
+        for st in order:                                         # phase A
+            t0, t1 = self._dm_image(st, k, tms[st.spec.d])
+            rows[st.spec.d] = (t0, t1)
+            l1_dev[st.spec.d] = gpu.layer1_launch(st, t0)
+        a = time.perf_counter()
+        l1_host = gpu.to_host(l1_dev)
+        sync_ms = 1e3 * (time.perf_counter() - a)
+        sig, b_dev, shapes = {}, {}, {}
+        for st in order:                                         # phase B
+            d = st.spec.d
+            t0, t1 = rows[d]
+            a = time.perf_counter()
+            sigma_new = self._layer1_update(st, l1_host[d])
+            sig[d] = (sigma_new,) + self._dm_sigma(st, t0, t1, sigma_new)
+            tms[d]["layer1_ms"] = 1e3 * (time.perf_counter() - a)
+            a = time.perf_counter()
+            vals, idx, tkv, shapes[d], taps = gpu.k3b_topk_launch(
+                st, t0 - st.delay, sig[d][3], sig[d][4], self._n_top(st.spec))
+            b_dev[d] = (vals, idx, tkv, gpu.layer2_launch(st, taps, self.cfg.layer2_max_samples))
+            tms[d]["k3b_ms"] = 1e3 * (time.perf_counter() - a)
+        a = time.perf_counter()
+        b_host = gpu.to_host(b_dev)
+        sync_ms += 1e3 * (time.perf_counter() - a)
+        out = {}
+        for st in order:                                         # phase C
+            d = st.spec.d
+            vals, idx, tkv, l2 = b_host[d]
+            sigma_new, sigma_applied, s_k_applied, _si, _sk = sig[d]
+            tms[d]["sync_ms"] = sync_ms / len(order)
+            out[d] = self._dm_finish(st, k, rows[d][0], torch.from_numpy(l2),
+                                     (vals, idx, tkv, shapes[d]), None, None,
+                                     sigma_new=sigma_new, sigma_applied=sigma_applied,
+                                     s_k_applied=s_k_applied, keep_maps=keep_maps, tm=tms[d])
+        return out
 
     # ------------------------------------------------------------------
     # on-demand re-imaging (cutouts, SPEC §9) -- never touches live state
