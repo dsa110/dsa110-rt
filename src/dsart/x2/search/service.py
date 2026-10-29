@@ -404,7 +404,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="cal blob (antennas.out) or an antpos npz (value map, SPEC §3)")
     p.add_argument("--obs-dec-deg", type=float, required=True)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--fft-mode", default="warp", choices=("fused", "warp", "pruned", "irfft2"))
+    p.add_argument("--fft-mode", default="fused", choices=("fused", "warp", "pruned", "irfft2"))
     p.add_argument("--bank", default="b3x", choices=("b3x", "box"))
     p.add_argument("--c1-host", default="", help="C2 host (C1 batches, cutout status); '' = off")
     p.add_argument("--c1-port", type=int, default=11500)
@@ -423,8 +423,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ring-access", default="pread", choices=("pread", "mmap"),
                    help="ring v4 read path (SPEC §6; pread maps nothing -- the n13 incident)")
     p.add_argument("--ring-attach-timeout-s", type=float, default=60.0)
-    p.add_argument("--k3b", default="v1", choices=("v1", "fused", "cuda", "reg"))   # CP1 picks
-    p.add_argument("--k1", default="triton", choices=("triton", "staged"))
+    p.add_argument("--k3b", default="reg", choices=("v1", "fused", "cuda", "reg"))   # G0 timing pick
+    p.add_argument("--k1", default="staged", choices=("triton", "staged"))
     p.add_argument("--log-level", default="INFO")
     a, _unknown = p.parse_known_args(argv)
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO))

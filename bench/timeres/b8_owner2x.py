@@ -23,7 +23,7 @@ Subcommands (exit 0 = every gate passed, 1 = a gate failed, 2 = error):
                                 detector vs multi_boxcar_argmax).
   engine --gpus 0,1 --input synthetic-ring|rx-v4 --opoint <id> --minutes M
          [--shm-name /ring --plan p.npz --halves 2j,2j+1 --out DIR]   (WS-T fleet-load form)
-         [--variants staged:reg,triton:v1 --ring-access pread|mmap]
+         [--variants staged:reg[,triton:v1] --ring-access pread|mmap]
                                 one owner half per GPU, real-time paced synthetic ring
                                 (in-process; no shm) or ring v4 (RingV4Source); each k1:k3b
                                 variant for M / n_variants minutes: per-stage us/image (CUDA
@@ -533,6 +533,23 @@ def cmd_kernels(a) -> int:
             wv = torch.as_tensor(inp.weights(), device=dev)
             tw = k1_twin(codes.cpu().numpy(), c_v=inp.c_v, offset=0.0, csr=inp.csr,
                          shifts=spec.shifts[:2], t_lo=2000, n_t=2, w_v=inp.w_v)
+            # staged K1 as the engine runs it: passes of <= 24 fine DMs
+            # (EngineConfig.k1_fdm_per_pass), each with its own window geometry
+            bnd = np.linspace(0, F, -(-F // 24) + 1).astype(int)
+            k1p = []
+            for f0, f1 in zip(bnd[:-1], bnd[1:]):
+                shp = np.ascontiguousarray(spec.shifts[int(f0):int(f1)])
+                gp = staged_geometry(shp, n_t=n_t)
+                cp_ = dict(ct)
+                cp_["smax"] = torch.as_tensor(gp.smax, dtype=torch.int32, device=dev)
+                k1p.append((int(f0), int(f1), torch.as_tensor(shp, dtype=torch.int32, device=dev),
+                            gp, cp_))
+            uv_out = torch.empty((F, n_t, inp.csr.n_active, 2), dtype=torch.float32, device=dev)
+
+            def k1_passes():
+                for f0, f1, shp, gp, cp_ in k1p:
+                    k1_staged(codes, cv, cp_, shp, t_lo=2000, n_t=n_t, w_v=wv, geom=gp,
+                              out=uv_out[f0:f1])
             for v in k1_vars:
                 if v == "staged":
                     fn = lambda sh_, nt_: k1_staged(codes, cv, ct, sh_, t_lo=2000,  # noqa: E731
@@ -540,7 +557,7 @@ def cmd_kernels(a) -> int:
                 else:
                     fn = lambda sh_, nt_: k1_combine(codes, cv, ct, sh_, t_lo=2000,  # noqa: E731
                                                      n_t=nt_, w_v=wv)
-                ms = _cuda_ms(lambda: fn(shifts, n_t))
+                ms = _cuda_ms(k1_passes if v == "staged" else (lambda: fn(shifts, n_t)))
                 sub_ = fn(shifts[:2].contiguous(), 2).cpu().numpy()
                 exact = bool(np.array_equal(sub_[..., 0], tw.real)
                              and np.array_equal(sub_[..., 1], tw.imag))
@@ -912,7 +929,7 @@ def _atomic_json(path: Path, obj: dict) -> None:
 
 
 def _variants(a) -> list:
-    """``--variants k1:k3b,...`` (default: staged:reg then triton:v1)."""
+    """``--variants k1:k3b,...`` (default: staged:reg)."""
     out = []
     for tok in [t for t in a.variants.split(",") if t]:
         k1, _, k3b = tok.partition(":")
@@ -1168,8 +1185,9 @@ def main(argv=None) -> int:
     e.add_argument("--opoint", default="2x-gridded-ns2-cint4")
     e.add_argument("--minutes", type=float, default=10.0, help="total, split over --variants")
     e.add_argument("--out", default="b8_out", help="directory; b8_engine.json is the result")
-    e.add_argument("--variants", default="staged:reg,triton:v1",
-                   help="k1:k3b pairs, run one after another")
+    e.add_argument("--variants", default="staged:reg",
+                   help="k1:k3b pairs, run one after another (minutes split between them); "
+                        "the default is the G0 pick (staged K1, register K3b, fused FFT)")
     e.add_argument("--ring-access", dest="ring_access", default="pread",
                    choices=("pread", "mmap"))
     e.add_argument("--attach-timeout-s", dest="attach_timeout_s", type=float, default=300.0)
