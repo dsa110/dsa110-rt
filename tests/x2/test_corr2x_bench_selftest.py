@@ -21,4 +21,4 @@ def test_b8_describe(fmt) -> None:
     assert d["values"] > 0 and d["sources"] >= d["values"]
     assert d["ring_gib"] < 3.0
     for t in d["tiers"]:
-        assert t["threads"] <= 1024 and t["smem_kib"] <= 48 and t["chunk"] >= 1
+        assert t["threads"] <= 1024 and t["smem_kib"] <= 64 and t["chunk"] >= 1

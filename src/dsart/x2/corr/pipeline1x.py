@@ -273,14 +273,18 @@ class PipelinedCorrFast:
         landed, and return the finished outputs (oldest first)."""
         timer = self.ctx.stage_timer
         prev = self._staged
+        t0 = time.perf_counter()
         if prev is not None and timer is not None:
             timer.begin_block(prev.block_n)
         try:
             staged = self._stage(page, block_n=block_n)
             self._staged = staged
+            t1 = time.perf_counter()
             if prev is not None:
                 self._issue(prev)
+            t2 = time.perf_counter()
             ready = self._emit(keep=1 if self.defer_tx else 0)
+            t3 = time.perf_counter()
         finally:
             if prev is not None and timer is not None:
                 timer.end_block()
@@ -288,6 +292,11 @@ class PipelinedCorrFast:
             if staged.h2d_done is not None:
                 staged.h2d_done.synchronize()
             release()
+        t4 = time.perf_counter()
+        #: host-side phase times of the last push (ms): stage (H2D issue + page pin), issue
+        #: (launching the block body), emit (wait for the previous block + TX), release
+        self.last_timing = {"stage": (t1 - t0) * 1e3, "issue": (t2 - t1) * 1e3,
+                            "emit": (t3 - t2) * 1e3, "release": (t4 - t3) * 1e3}
         return ready
 
     def flush(self) -> list["cfi.IntegrationOutput"]:

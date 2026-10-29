@@ -255,9 +255,12 @@ def test_quantise_flow_delegates_to_ws_t_reference() -> None:
     quant = pytest.importorskip("dsart.x2.quant", reason="WS-T row-rule reference not merged yet")
     rng = np.random.default_rng(6)
     n = rng.integers(1, 3000, size=50)
-    blocks = [(rng.normal(size=(64, 50)) + 1j * rng.normal(size=(64, 50))) * np.sqrt(n) for _ in range(3)]
-    out = ref.quantise_flow(blocks, n, 5, quant.RowRule(comp_bits=4))
-    assert len(out) == 3 and 0.9 < float(out[-1].sigma) < 1.1
+    rule = quant.RowRule(comp_bits=4)                         # frozen rule: 8 warm-up blocks
+    nb = rule.warmup_blocks + 3
+    blocks = [(rng.normal(size=(64, 50)) + 1j * rng.normal(size=(64, 50))) * np.sqrt(n) for _ in range(nb)]
+    out = ref.quantise_flow(blocks, n, 5, rule)
+    assert len(out) == nb and float(out[rule.warmup_blocks - 1].sigma) == 0.0
+    assert 0.9 < float(out[-1].sigma) < 1.1
     assert out[0].codes_main.shape == (64, 45, 2) and out[0].codes_heavy.shape == (64, 5, 2)
 
 

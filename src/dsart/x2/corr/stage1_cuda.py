@@ -1,5 +1,4 @@
-"""2x corr stage 1 (x2 WS-C deliverable 3): CSR-driven CUDA kernel
-(cupy RawModule, the ``tiled_combine_cuda`` v3 pattern) + numpy twin.
+"""2x corr stage 1: CSR-driven CUDA kernel (cupy RawModule) + numpy twin.
 
 What it computes, for one chgroup and ONE tier (all of its coarse DMs in
 one launch):
@@ -11,18 +10,24 @@ where ``x_src`` is the GEMM ring row ``row_src`` at summed channel
 ``k_src`` (conjugated if flagged), ``shift`` the stage-1 table of the
 tier (q1 units; the corr ADVANCES channel k), ``D`` the tier decimation
 (2 for tier A, 4 for tier B) and ``q_base`` the absolute q1 sample of the
-block being emitted (ring positions are taken modulo ``T_ring``).
+block being emitted (ring positions are taken modulo ``T_ring``, a power
+of two).
 
-Kernel layout (v3 pattern): one thread block per (value ``v``, tile of
-``TT`` output samples); ``blockDim = n_d * TT`` threads, thread ``(d, tl)``
-owns output ``(d, tile*TT + tl)`` in two fp32 registers. Sources are
-staged chunk by chunk into shared memory, each as one window of ``W =
-TT*D + spread`` q1 samples starting at ``q_tile0 + smin[k]`` (``smin`` /
-``spread`` = min / max-min of the tier's shifts per channel), so every
-input sample a tile needs is read from global memory once per tile and
-reused by all ``n_d`` DMs. Accumulation order is fixed: sources in CSR
-order, then ``i = 0..D-1`` -- the twin reproduces it in float32 and is
-bit-exact.
+Ring layout (shared with :mod:`dsart.x2.corr.gemm2x_cuda`): k-major,
+time-minor half2 ``ring[k][row][t mod T_ring]``.
+
+Kernel layout (G0, v5): ONE thread block per value ``v`` covering all
+``n_out`` outputs of all ``n_d`` DMs; thread ``tid -> (d = tid % n_d,
+tl = tid / n_d)`` owns outputs ``t = tl + o*TT`` (``o < OPT``) in fp32
+registers. Sources are staged chunk by chunk into shared memory (one
+source per warp, lanes over its window of ``W = OPT*TT*D + spread`` q1
+samples from ``q_base + smin[k]``; the conj flag is folded in by flipping
+the im sign bit, exact), with each source's per-DM window offset cached in
+shared memory; every input sample is read from global memory once per
+block and reused by all DMs. Accumulation order is fixed: sources in CSR
+order, then ``i = 0..D-1`` (``__fadd_rn``) -- the twin reproduces it in
+float32 and is bit-exact. Measured on an RTX 2080 Ti (gridded n_sub 2,
+tier A 32 DMs): 16.7 ms per block, vs 40-46 ms for the v3 tile kernel.
 
 The CSR comes from WS-P's value map (:func:`stage1_csr`): rows are the
 GEMM ring rows (kept core baselines, or redundancy classes when the GEMM
@@ -41,6 +46,7 @@ LOG = logging.getLogger("dsart.x2.corr.stage1_cuda")
 
 __all__ = [
     "CUDA_SOURCE",
+    "OPT_CHOICES",
     "Stage1Csr",
     "Stage1Geometry",
     "compile_check_nvcc",
@@ -50,67 +56,94 @@ __all__ = [
     "stage1_twin",
 ]
 
+#: outputs per thread the kernel is instantiated for (``stage1_tier_o<OPT>``)
+OPT_CHOICES = (1, 2, 4, 8, 16, 32)
+
 CUDA_SOURCE = r"""
 #include <cuda_fp16.h>
 
-/* One block = (value v, tile of TT decimated output samples), all n_d DMs.
-   blockDim.x = n_d * TT; thread tid -> (d = tid / TT, tl = tid % TT).
-   ring   : half2 [R][C][T_ring]   (re, im), time-minor, absolute q1 mod T_ring
-   out    : float2 [n_d][n_out][V] */
-extern "C" __global__ void stage1_tier(
-    const __half2*       __restrict__ ring,
-    const int*           __restrict__ ptr,      /* [V+1] */
-    const int*           __restrict__ src_row,  /* [S]   */
-    const int*           __restrict__ src_k,    /* [S]   */
-    const unsigned char* __restrict__ src_conj, /* [S]   */
-    const int*           __restrict__ shifts,   /* [n_d][C] q1 units */
-    const int*           __restrict__ smin,     /* [C]   min over d */
-    float2*              __restrict__ out,
-    int C, int T_ring, int n_d, int n_out, int V,
-    long long q_base, int D, int TT, int W, int chunk)
+/* ring   : half2 bits [C][R][T] (k-major, time-minor, absolute q1 mod T; T = T_mask + 1)
+   out    : float2 [n_d][n_out][V]
+   blockDim.x = n_d * TT; thread tid -> (d = tid % n_d, tl = tid / n_d), outputs t = tl + o*TT */
+template <int OPT>
+__device__ __forceinline__ void stage1_body(
+    const unsigned int* __restrict__ ring,
+    const int* __restrict__ ptr, const int* __restrict__ src_row, const int* __restrict__ src_k,
+    const unsigned char* __restrict__ src_conj,
+    const int* __restrict__ shifts, const int* __restrict__ smin,
+    float2* __restrict__ out,
+    int C, int R, int T_mask, int n_d, int n_out, int V, long long q_base,
+    int D, int TT, int W, int chunk)
 {
-    extern __shared__ __half2 win[];            /* [chunk][W] */
-    const int v    = blockIdx.x;
-    const int tile = blockIdx.y;
-    const int tid  = threadIdx.x;
-    const int d    = tid / TT;
-    const int tl   = tid - d * TT;
-    const int t_out = tile * TT + tl;
-    const bool active = (d < n_d) && (t_out < n_out);
-    const long long q_tile0 = q_base + (long long)tile * TT * D;
-    float acc_re = 0.f, acc_im = 0.f;
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned int* win = reinterpret_cast<unsigned int*>(smem);     /* [chunk][W] half2 bits */
+    int* soff = reinterpret_cast<int*>(win + chunk * W);           /* [chunk][n_d] */
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nwarp = blockDim.x >> 5;
+    const int d = tid % n_d, tl = tid / n_d;
+    const int v = blockIdx.x;
+    const bool active = tl < TT;
+    float acc_re[OPT], acc_im[OPT];
+#pragma unroll
+    for (int o = 0; o < OPT; ++o) { acc_re[o] = 0.f; acc_im[o] = 0.f; }
     const int s0 = ptr[v], s1 = ptr[v + 1];
     for (int c0 = s0; c0 < s1; c0 += chunk) {
         const int nc = min(chunk, s1 - c0);
         __syncthreads();
-        for (int i = tid; i < nc * W; i += blockDim.x) {
-            const int si = i / W;
-            const int w  = i - si * W;
-            const int s  = c0 + si;
-            const int k  = src_k[s];
-            long long q  = q_tile0 + smin[k] + w;
-            long long tr = q % T_ring;
-            if (tr < 0) tr += T_ring;
-            win[i] = ring[((long long)src_row[s] * C + k) * T_ring + tr];
+        for (int si = warp; si < nc; si += nwarp) {
+            const int s = c0 + si;
+            const int k = src_k[s];
+            const unsigned int* base = ring + ((long long)k * R + src_row[s]) * (long long)(T_mask + 1);
+            const int sm = smin[k];
+            const int start = (int)((q_base + sm) & (long long)T_mask);
+            const unsigned int flip = src_conj[s] ? 0x80000000u : 0u;
+#pragma unroll 4
+            for (int w = lane; w < W; w += 32) win[si * W + w] = base[(start + w) & T_mask] ^ flip;
+            for (int dd = lane; dd < n_d; dd += 32) soff[si * n_d + dd] = shifts[dd * C + k] - sm;
         }
         __syncthreads();
         if (active) {
             for (int si = 0; si < nc; ++si) {
-                const int s   = c0 + si;
-                const int k   = src_k[s];
-                const int off = si * W + tl * D + shifts[d * C + k] - smin[k];
-                const float sg = src_conj[s] ? -1.f : 1.f;
-                for (int i = 0; i < D; ++i) {
-                    const float2 x = __half22float2(win[off + i]);
-                    acc_re = __fadd_rn(acc_re, x.x);
-                    acc_im = __fadd_rn(acc_im, sg * x.y);
+                const unsigned int* wp = win + si * W + soff[si * n_d + d] + tl * D;
+#pragma unroll
+                for (int o = 0; o < OPT; ++o) {
+                    const unsigned int* q = wp + o * TT * D;
+#pragma unroll 4
+                    for (int i = 0; i < D; ++i) {
+                        const unsigned int u = q[i];
+                        const float2 x = __half22float2(*reinterpret_cast<const __half2*>(&u));
+                        acc_re[o] = __fadd_rn(acc_re[o], x.x);
+                        acc_im[o] = __fadd_rn(acc_im[o], x.y);
+                    }
                 }
             }
         }
     }
-    if (active)
-        out[((long long)d * n_out + t_out) * V + v] = make_float2(acc_re, acc_im);
+    if (active) {
+#pragma unroll
+        for (int o = 0; o < OPT; ++o) {
+            const int t = tl + o * TT;
+            if (t < n_out) out[((long long)d * n_out + t) * V + v] = make_float2(acc_re[o], acc_im[o]);
+        }
+    }
 }
+
+#define STAGE1_INST(OPT)                                                                       \
+extern "C" __global__ void __launch_bounds__(1024) stage1_tier_o##OPT(                         \
+    const unsigned int* __restrict__ ring, const int* __restrict__ ptr,                        \
+    const int* __restrict__ src_row, const int* __restrict__ src_k,                            \
+    const unsigned char* __restrict__ src_conj, const int* __restrict__ shifts,                \
+    const int* __restrict__ smin, float2* __restrict__ out, int C, int R, int T_mask, int n_d, \
+    int n_out, int V, long long q_base, int D, int TT, int W, int chunk)                       \
+{                                                                                              \
+    stage1_body<OPT>(ring, ptr, src_row, src_k, src_conj, shifts, smin, out, C, R, T_mask,    \
+                     n_d, n_out, V, q_base, D, TT, W, chunk);                                  \
+}
+STAGE1_INST(1)
+STAGE1_INST(2)
+STAGE1_INST(4)
+STAGE1_INST(8)
+STAGE1_INST(16)
+STAGE1_INST(32)
 """
 
 
@@ -166,36 +199,41 @@ def stage1_csr(vm, chgroup: int, *, ring_rows: str = "baselines") -> Stage1Csr:
 
 @dataclass(frozen=True)
 class Stage1Geometry:
-    """Launch geometry of one tier."""
+    """Launch geometry of one tier (one block per value)."""
 
     D: int
-    TT: int
-    W: int
-    chunk: int
+    TT: int                    # threads per DM
+    OPT: int                   # outputs per thread (t = tl + o*TT)
+    n_out: int
+    W: int                     # staged window per source, q1 samples
+    chunk: int                 # sources per staging round
     smin: np.ndarray           # (C,) int32
     spread: int
     threads: int
 
     @property
     def smem_bytes(self) -> int:
-        return 4 * self.chunk * self.W
+        return self.chunk * (4 * self.W + 4 * (self.threads // self.TT))
 
 
-def geometry_for(shifts: np.ndarray, *, D: int, TT: int | None = None,
-                 smem_bytes: int = 48 * 1024) -> Stage1Geometry:
-    """``shifts`` (n_d, C) int; picks ``TT`` so ``n_d*TT <= 1024`` and sizes
-    the source chunk to the shared-memory budget."""
+def geometry_for(shifts: np.ndarray, *, D: int, n_out: int, smem_bytes: int = 64 * 1024,
+                 max_threads: int = 1024) -> Stage1Geometry:
+    """``shifts`` (n_d, C) int; ``n_out`` decimated outputs per block. ``OPT`` = the smallest
+    instantiated outputs-per-thread with ``n_d * ceil(n_out / OPT) <= max_threads``; the
+    source chunk fills ``smem_bytes`` (64 KB = the sm_75 opt-in maximum)."""
     n_d = int(shifts.shape[0])
-    if TT is None:
-        TT = max(1, min(64, 1024 // max(1, n_d)))
-    if n_d * TT > 1024:
-        raise ValueError(f"n_d({n_d}) * TT({TT}) > 1024 threads")
+    if n_d < 1 or n_d > max_threads:
+        raise ValueError(f"n_d={n_d} out of range")
+    opt = next((o for o in OPT_CHOICES if n_d * -(-n_out // o) <= max_threads), None)
+    if opt is None:
+        raise ValueError(f"n_out={n_out} with n_d={n_d} needs more than {OPT_CHOICES[-1]} outputs/thread")
+    TT = -(-n_out // opt)
     smin = shifts.min(axis=0).astype(np.int32)
     spread = int((shifts.max(axis=0) - smin).max()) if shifts.size else 0
-    W = TT * D + spread
-    chunk = max(1, smem_bytes // (4 * W))
-    return Stage1Geometry(D=int(D), TT=int(TT), W=int(W), chunk=int(chunk), smin=smin,
-                          spread=spread, threads=n_d * TT)
+    W = opt * TT * int(D) + spread
+    chunk = max(1, smem_bytes // (4 * W + 4 * n_d))
+    return Stage1Geometry(D=int(D), TT=int(TT), OPT=int(opt), n_out=int(n_out), W=int(W),
+                          chunk=int(chunk), smin=smin, spread=spread, threads=n_d * TT)
 
 
 def stage1_twin(
@@ -207,52 +245,51 @@ def stage1_twin(
     q_base: int,
     n_out: int,
 ) -> np.ndarray:
-    """Numpy twin of ``stage1_tier``: same tiles, same staging windows (with
-    the ring wrap), same chunking and the same float32 add order. ``ring``
-    is complex-valued ``(R, C, T_ring)`` holding fp16-representable values
-    (or a float16 ``(R, C, T_ring, 2)`` array). Returns ``(n_d, n_out, V)``
-    complex64, bit-identical to the kernel."""
+    """Numpy twin of ``stage1_tier``: same per-value blocks, staging windows (with the ring
+    wrap), chunking and float32 add order. ``ring`` is k-major: complex ``(C, R, T_ring)``
+    holding fp16-representable values, or float16 ``(C, R, T_ring, 2)``. Returns ``(n_d, n_out,
+    V)`` complex64, bit-identical to the kernel."""
     if ring.dtype == np.float16:
         rre = ring[..., 0].astype(np.float32)
         rim = ring[..., 1].astype(np.float32)
     else:
         rre = ring.real.astype(np.float16).astype(np.float32)
         rim = ring.imag.astype(np.float16).astype(np.float32)
-    R, C, T_ring = rre.shape
+    C, R, T_ring = rre.shape
+    if T_ring & (T_ring - 1):
+        raise ValueError(f"T_ring={T_ring} must be a power of two")
+    if n_out > geo.OPT * geo.TT:
+        raise ValueError("geometry covers fewer outputs than n_out")
     n_d = shifts.shape[0]
-    D, TT, W, chunk = geo.D, geo.TT, geo.W, geo.chunk
+    D, W, chunk = geo.D, geo.W, geo.chunk
     smin = geo.smin.astype(np.int64)
     V = csr.n_values
     out_re = np.zeros((n_d, n_out, V), np.float32)
     out_im = np.zeros((n_d, n_out, V), np.float32)
-    n_tiles = -(-n_out // TT)
-    tl = np.arange(TT)
+    t = np.arange(n_out)
     for v in range(V):
         s0, s1 = int(csr.ptr[v]), int(csr.ptr[v + 1])
-        for tile in range(n_tiles):
-            q_tile0 = q_base + tile * TT * D
-            acc_re = np.zeros((n_d, TT), np.float32)
-            acc_im = np.zeros((n_d, TT), np.float32)
-            for c0 in range(s0, s1, chunk):
-                nc = min(chunk, s1 - c0)
-                # stage: win[si, w] = ring[row, k, (q_tile0 + smin[k] + w) mod T_ring]
-                srcs = np.arange(c0, c0 + nc)
-                kk = csr.k[srcs].astype(np.int64)
-                rr = csr.row[srcs].astype(np.int64)
-                tr = (q_tile0 + smin[kk][:, None] + np.arange(W)[None, :]) % T_ring
-                win_re = rre[rr[:, None], kk[:, None], tr]
-                win_im = rim[rr[:, None], kk[:, None], tr]
-                for si in range(nc):
-                    k = kk[si]
-                    sg = np.float32(-1.0) if csr.conj[c0 + si] else np.float32(1.0)
-                    off = tl[None, :] * D + shifts[:, k][:, None] - smin[k]    # (n_d, TT)
-                    for i in range(D):
-                        acc_re = acc_re + win_re[si][off + i]
-                        acc_im = acc_im + sg * win_im[si][off + i]
-            t_out = tile * TT + tl
-            ok = t_out < n_out
-            out_re[:, t_out[ok], v] = acc_re[:, ok]
-            out_im[:, t_out[ok], v] = acc_im[:, ok]
+        acc_re = np.zeros((n_d, n_out), np.float32)
+        acc_im = np.zeros((n_d, n_out), np.float32)
+        for c0 in range(s0, s1, chunk):
+            nc = min(chunk, s1 - c0)
+            srcs = np.arange(c0, c0 + nc)
+            kk = csr.k[srcs].astype(np.int64)
+            rr = csr.row[srcs].astype(np.int64)
+            # win[si, w] = ring[k, row, (q_base + smin[k] + w) & (T_ring - 1)], conj folded in
+            tr = (q_base + smin[kk][:, None] + np.arange(W)[None, :]) & (T_ring - 1)
+            win_re = rre[kk[:, None], rr[:, None], tr]
+            win_im = rim[kk[:, None], rr[:, None], tr]
+            cj = csr.conj[srcs].astype(bool)
+            win_im[cj] = -win_im[cj]
+            for si in range(nc):
+                k = kk[si]
+                off = t[None, :] * D + shifts[:, k][:, None] - smin[k]            # (n_d, n_out)
+                for i in range(D):
+                    acc_re = acc_re + win_re[si][off + i]
+                    acc_im = acc_im + win_im[si][off + i]
+        out_re[:, :, v] = acc_re
+        out_im[:, :, v] = acc_im
     return out_re + 1j * out_im
 
 
@@ -280,26 +317,30 @@ def _cp(t):
 
 def stage1_tier_cuda(ring, csr_dev: dict, shifts_dev, smin_dev, out, geo: Stage1Geometry, *,
                      q_base: int, n_out: int) -> None:
-    """Launch on the current torch stream. ``ring`` fp16 torch
-    ``(R, C, T_ring, 2)``; ``csr_dev`` torch tensors ``ptr,row,k,conj``;
-    ``shifts_dev`` int32 ``(n_d, C)``; ``smin_dev`` int32 ``(C,)``; ``out``
-    float32 ``(n_d, n_out, V, 2)``."""
+    """Launch on the current torch stream. ``ring`` fp16 torch k-major ``(C, R, T_ring, 2)``
+    (``T_ring`` a power of two); ``csr_dev`` torch tensors ``ptr,row,k,conj``; ``shifts_dev``
+    int32 ``(n_d, C)``; ``smin_dev`` int32 ``(C,)``; ``out`` float32 ``(n_d, n_out, V, 2)``."""
     import cupy as cp  # noqa: PLC0415
     import torch  # noqa: PLC0415
-    R, C, T_ring, two = ring.shape
+    C, R, T_ring, two = ring.shape
     assert two == 2 and ring.dtype == torch.float16 and ring.is_contiguous()
+    if T_ring & (T_ring - 1):
+        raise ValueError(f"T_ring={T_ring} must be a power of two")
     n_d = int(shifts_dev.shape[0])
     V = int(csr_dev["ptr"].shape[0] - 1)
     assert tuple(out.shape) == (n_d, n_out, V, 2) and out.dtype == torch.float32
-    kern = _module().get_function("stage1_tier")
-    n_tiles = -(-n_out // geo.TT)
+    if n_out > geo.OPT * geo.TT:
+        raise ValueError("geometry covers fewer outputs than n_out")
+    kern = _module().get_function(f"stage1_tier_o{geo.OPT}")
+    if geo.smem_bytes > 48 * 1024:
+        kern.max_dynamic_shared_size_bytes = geo.smem_bytes
     stream = cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream)
     with stream:
         kern(
-            (V, n_tiles), (geo.threads,),
-            (_cp(ring), _cp(csr_dev["ptr"]), _cp(csr_dev["row"]), _cp(csr_dev["k"]),
+            (V,), (geo.threads,),
+            (_cp(ring.view(torch.int32)), _cp(csr_dev["ptr"]), _cp(csr_dev["row"]), _cp(csr_dev["k"]),
              _cp(csr_dev["conj"]), _cp(shifts_dev), _cp(smin_dev), _cp(out),
-             np.int32(C), np.int32(T_ring), np.int32(n_d), np.int32(n_out), np.int32(V),
+             np.int32(C), np.int32(R), np.int32(T_ring - 1), np.int32(n_d), np.int32(n_out), np.int32(V),
              np.int64(q_base), np.int32(geo.D), np.int32(geo.TT), np.int32(geo.W),
              np.int32(geo.chunk)),
             shared_mem=geo.smem_bytes,

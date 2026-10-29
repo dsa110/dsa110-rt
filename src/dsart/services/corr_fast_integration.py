@@ -1785,6 +1785,9 @@ class StageTimer:
         self._order: list[str] = []
         self.n_blocks = 0
         self.n_dropped = 0
+        #: optional ``on_block(block_n, {stage: ms})`` called as each block is
+        #: harvested (diagnostics: the x2 per-block trace)
+        self.on_block = None
 
     # -- recording --------------------------------------------------------
 
@@ -1863,13 +1866,28 @@ class StageTimer:
                 break
             self._pending.pop(0)
             marks = rec["marks"]
+            per = {} if self.on_block is not None else None
             for (_, a), (name, b) in zip(marks[:-1], marks[1:]):
-                self._push(name, self._ms(a, b))
+                ms = self._ms(a, b)
+                self._push(name, ms)
+                if per is not None:
+                    per[name] = per.get(name, 0.0) + ms
             if len(marks) > 1:
-                self._push("block_gpu", self._ms(marks[0][1], marks[-1][1]))
+                ms = self._ms(marks[0][1], marks[-1][1])
+                self._push("block_gpu", ms)
+                if per is not None:
+                    per["block_gpu"] = ms
             for name, (a, b) in rec["spans"].items():
                 if b is not None:
-                    self._push(name, self._ms(a, b))
+                    ms = self._ms(a, b)
+                    self._push(name, ms)
+                    if per is not None:
+                        per[name] = ms
+            if per is not None:
+                try:
+                    self.on_block(rec["block_n"], per)
+                except Exception:  # noqa: BLE001 -- diagnostics must never break the loop
+                    LOG.exception("StageTimer.on_block failed (non-fatal)")
             self.n_blocks += 1
             n += 1
         return n
@@ -4008,6 +4026,88 @@ def _warmup_pipeline_jit(
     )
 
 
+def _prewarm_rfi_far(ctx) -> None:
+    """Solve the RFI flagger's bandpass / group FAR thresholds now (cached by
+    ``dsart.rfi.far_calibration``). The bandpass test is bypassed during the flagger's
+    warm-up, so without this its first use -- ~150 s into a run -- blocks the hot path for
+    ~7.4 s on a corr node (measured on n05, 2026-10-29). Same k, same masks: only the time
+    the cache is filled moves to start-up."""
+    fl = getattr(ctx, "rfi_flagger", None)
+    fl = getattr(fl, "_inner", fl)
+    if fl is None or not hasattr(fl, "_m_values"):
+        return
+    from dsart.rfi.far_calibration import bandpass_threshold_k, group_threshold_k
+    t0 = time.monotonic()
+    full_m = int(max(fl._m_values))
+    if getattr(fl, "_bandpass_k", None) is None:
+        bandpass_threshold_k(NCHAN_PER_CHGROUP, float(fl._bandpass_far), m_acc=full_m)
+    if getattr(fl, "_group_k", None) is None:
+        group_threshold_k(NANTS, float(fl._group_far), n_chan=NCHAN_PER_CHGROUP, m_acc=full_m)
+    LOG.info("RFI FAR thresholds pre-solved in %.1f s (M=%d)", time.monotonic() - t0, full_m)
+
+
+def check_x2_plan_id(plan, plan_id: str | None) -> None:
+    """SPEC §10: refuse to start when the loaded tiered plan is not the set's ``${plan_id}``
+    (hex, with or without ``0x``). ``None`` / empty = no check (development runs)."""
+    if not plan_id:
+        return
+    want = int(str(plan_id), 16)
+    got = int(plan.plan_id)
+    if got != want:
+        raise ValueError(f"tiered DM plan plan_id 0x{got:016x} != --plan-id 0x{want:016x}: "
+                         "the plan file is not the one this op-point set was rendered for")
+    LOG.info("x2 plan_id 0x%016x matches --plan-id", got)
+
+
+#: ``--transport-tx-mode`` values of the 2x op-points (frame v2).
+X2_TX_MODES: tuple[str, ...] = ("v2", "drain")
+
+
+def _x2_tx_mon(meter, tx) -> dict:
+    """2x TX keys of the 16-block corr_fast heartbeat: ``TxRateMeter().update(
+    sender.counters())`` -> tx_gbps, tx_datagrams_per_s, tx_drops_per_s,
+    tx_queue_depth_max since the previous heartbeat ({} on the first call or
+    if the counters cannot be read)."""
+    try:
+        rate = meter.update(tx.counters())
+    except Exception:                                   # noqa: BLE001
+        LOG.exception("x2 TX counters failed (non-fatal)")
+        return {}
+    return dict(rate) if rate else {}
+
+
+def _build_x2_tx(orch, *, owner_half, mode: str, hosts: str, port_base: int, chgroup: int,
+                 bind_host: str = "", cpu: int = -1, pace: float = 1.25):
+    """The 2x TX stage of :class:`~dsart.x2.corr.pipeline2x.Corr2xPipeline`
+    ``orch``: frame v2 into WS-T's C sendmmsg sender (``mode="v2"``; one
+    destination per search node, ``hosts`` in ``SEARCH_NODES`` order, port
+    ``port_base + chgroup``, routes ``dm -> owner_half[dm] // 2``) or into a
+    counting drain (``mode="drain"``, no socket)."""
+    from dsart.x2.corr.tx2x import DrainSink, FramedTx2x, build_mmsg_sender
+
+    formats = orch.stream_formats()
+    if mode == "drain":
+        LOG.info("x2 TX: drain (frames built and counted, nothing sent)")
+        return FramedTx2x(DrainSink(), formats)
+    if mode != "v2":
+        raise ValueError(f"2x TX mode {mode!r} not in {X2_TX_MODES}")
+    from dsart.x2.plan import SEARCH_NODES
+
+    host_list = [h.strip() for h in str(hosts).split(",") if h.strip()]
+    if len(host_list) != len(SEARCH_NODES):
+        raise ValueError(
+            f"--transport-tx-mode v2 needs --transport-tx-worker-hosts with "
+            f"{len(SEARCH_NODES)} search-node addresses ({','.join(SEARCH_NODES)} order), "
+            f"got {host_list}"
+        )
+    sender = build_mmsg_sender(
+        formats=formats, dm_t_native=orch.tier_dms(), owner_half=owner_half,
+        hosts=host_list, port=int(port_base) + int(chgroup), bind_host=bind_host,
+        cpu=cpu, pace=pace,
+    )
+    return FramedTx2x(sender, formats)
+
+
 def run(
     fada_key: int,
     output_dir: Path,
@@ -4047,6 +4147,10 @@ def run(
     orchestrator: str = "legacy",
     stage_timing: bool = True,
     opoint: str = "1x",
+    x2_tx_bind_host: str = "",
+    x2_tx_cpu: int = -1,
+    x2_tx_pace: float = 1.25,
+    plan_id: str | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -4061,7 +4165,13 @@ def run(
     a 2x op-point id (``dsart.x2.opoint``, e.g. ``2x-gridded-ns2-cint4``):
     the :class:`dsart.x2.corr.pipeline2x.Corr2xPipeline` chain (t_int 8,
     csf 2, tiered plan, corr stage-2 FIFO off, row-rule packer). The 1x
-    TX / stage-2 options are ignored in 2x.
+    TX / stage-2 options are ignored in 2x, except: ``transport_tx_mode``
+    ``"v2"`` (frame v2 through WS-T's C sendmmsg sender to
+    ``transport_tx_worker_hosts`` -- the search nodes in SEARCH_NODES order --
+    at ``transport_tx_port + chgroup``, routes from the plan's owner map,
+    paced at ``x2_tx_pace`` x the regular rate, bound to ``x2_tx_bind_host``,
+    sender thread on ``x2_tx_cpu``) or ``"drain"`` (framed, counted, never
+    sent); the sender's rates join the 16-block heartbeat.
 
     Returns a summary dict including:
         {n_blocks_in, n_blocks_processed, n_dropped, elapsed_s,
@@ -4082,6 +4192,15 @@ def run(
         raise ValueError(
             "--opoint 2x runs its own scheduler: drop --pipeliner-3s / "
             "--profile-stages-every (the StageTimer covers 2x)"
+        )
+    if opoint == "1x" and plan_id:
+        raise ValueError("--plan-id names a 2x tiered plan (needs --opoint 2x-*)")
+    if opoint == "1x" and transport_tx_mode in X2_TX_MODES:
+        raise ValueError(f"--transport-tx-mode {transport_tx_mode} is a 2x mode (needs --opoint 2x-*)")
+    if opoint != "1x" and transport_tx_mode not in X2_TX_MODES:
+        raise ValueError(
+            f"--opoint {opoint} sends frame v2: --transport-tx-mode v2 (C sender to "
+            f"--transport-tx-worker-hosts) or drain, not {transport_tx_mode!r}"
         )
     if blocks_output_mode not in ("full", "first_tile_only", "none"):
         raise ValueError(
@@ -4141,6 +4260,7 @@ def run(
                 x2_plan = TieredDmPlan.from_npz(str(cfg.dm_plan_path), verify=True)
             else:
                 x2_plan = build_tiered_plan_for_opoint(x2_op)
+            check_x2_plan_id(x2_plan, plan_id)
             # nothing of the 1x stage-1 / stage-2 / TX stack is built in 2x
             cfg.dm_plan_path = None
             dm_plan = None
@@ -4300,6 +4420,8 @@ def run(
         )
 
         x2_orch = None
+        x2_tx = None
+        x2_tx_meter = None
         if x2_op is not None:
             from dsart.grid.baseline_grid import build_value_map_for_opoint
             from dsart.x2.corr.pipeline2x import Corr2xPipeline, NoOpTx2x
@@ -4308,15 +4430,21 @@ def run(
                 x2_op, antpos_e, antpos_n, is_core_baseline_mask=core_mask,
                 dec_deg=math.degrees(cfg.obs_dec_rad),
             )
-            LOG.warning(
-                "x2: the v2 corner-turn sender (WS-T) is not wired yet; "
-                "2x packets go to a drain (NoOpTx2x)"
-            )
             x2_orch = Corr2xPipeline(
                 ctx, plan=CorrPlan2x.from_tiered_plan(x2_plan), vm=vmap,
                 is_core_baseline_mask=core_mask, bits_main=x2_op.bits_main,
                 tx2x=NoOpTx2x(), expected_fada_bytes=expected_fada_bytes,
             )
+            x2_tx = _build_x2_tx(
+                x2_orch, owner_half=x2_plan.owner_half, mode=transport_tx_mode,
+                hosts=transport_tx_worker_hosts, port_base=transport_tx_port,
+                chgroup=int(cfg.chgroup), bind_host=x2_tx_bind_host, cpu=x2_tx_cpu,
+                pace=x2_tx_pace,
+            )
+            x2_orch.tx2x = x2_tx
+            from dsart.transport.send_mmsg import TxRateMeter
+            x2_tx_meter = TxRateMeter()
+            x2_tx_meter.update(x2_tx.counters())
 
         # ── M7.4 Phase 6 runtime: per-chgroup inject watch ──────────────
         # When ``--inject-watch`` was passed (cfg.inject_watch_enabled),
@@ -4800,6 +4928,10 @@ def run(
         # hot so the operator knows it is safe to utc_start.
         _publish_corr_fast_ready(rfi_mon_cn_id, ready=False, n_blocks=_warmup_n)
         _warmup_t0 = time.time()
+        try:
+            _prewarm_rfi_far(ctx)
+        except Exception:  # noqa: BLE001 -- the flagger solves it lazily as before
+            LOG.exception("RFI FAR pre-solve failed (non-fatal)")
         orch = None
         if x2_orch is not None:
             from dsart.x2.corr.pipeline1x import freeze_gc
@@ -4846,12 +4978,29 @@ def run(
                     ready_sentinel_path, e,
                 )
 
+        # x2 diagnostics: DSART_X2_BLOCK_TRACE=<path> writes one JSON line per block (host
+        # wall / page wait / orchestrator phases / host-pin and GC activity) and one per
+        # harvested GPU stage-timer block. Off by default; nothing here changes the data path.
+        _trace = None
+        _trace_path = os.environ.get("DSART_X2_BLOCK_TRACE", "")
+        if _trace_path:
+            import gc as _gc
+            import json as _json
+            from dsart.services import host_pin as _hp
+            _trace = open(_trace_path, "w", buffering=1)
+            if ctx.stage_timer is not None:
+                ctx.stage_timer.on_block = lambda b, d: _trace.write(_json.dumps(
+                    {"gpu_block": int(b), **{k: round(v, 3) for k, v in d.items()}}) + "\n")
+            _gc_prev = [g["collections"] for g in _gc.get_stats()]
+            _pin_prev = _hp.stats()
         while not state["stop"]:
+            _t_wait0 = time.monotonic()
             try:
                 page = reader.getNextPage()
             except StopIteration:
                 LOG.info("fada reader StopIteration (EOD)")
                 break
+            _wait_ms = (time.monotonic() - _t_wait0) * 1e3
             if reader.isEndOfData:
                 LOG.info("fada EOD flag set; draining final block")
             n_in += 1
@@ -4909,6 +5058,22 @@ def run(
 
             t_block_end = time.monotonic()
             per_block_ms.append((t_block_end - t_block_start) * 1000.0)
+            if _trace is not None:
+                _gc_now = [g["collections"] for g in _gc.get_stats()]
+                _pin_now = _hp.stats()
+                _rec = {"n": n_in, "wall_ms": round(per_block_ms[-1], 3), "wait_ms": round(_wait_ms, 3),
+                        "gc": [a - b for a, b in zip(_gc_now, _gc_prev)],
+                        "pin_new": _pin_now["register_new"] - _pin_prev["register_new"],
+                        "pin_ms": round(_pin_now["register_ms"] - _pin_prev["register_ms"], 3),
+                        "pin_unreg": _pin_now["finalizer_unregister"] - _pin_prev["finalizer_unregister"],
+                        "pin_force": _pin_now["force_clean"] - _pin_prev["force_clean"]}
+                if orch is not None and getattr(orch, "last_timing", None):
+                    _rec["host"] = {k: round(v, 3) for k, v in orch.last_timing.items()}
+                    _tx = getattr(orch, "tx2x", None)
+                    if _tx is not None and hasattr(_tx, "frame_s"):
+                        _rec["tx_frame_s"] = round(_tx.frame_s, 4)
+                _trace.write(_json.dumps(_rec) + "\n")
+                _gc_prev, _pin_prev = _gc_now, _pin_now
 
             # E2E test 1: periodic static-sky snapshot → h23 sky monitor.
             # Cheap monotonic compare per block; D2H + npz only on the
@@ -4959,6 +5124,8 @@ def run(
                     _recent = per_block_ms[-128:]
                     extra["block_ms_p50"] = round(float(np.median(_recent)), 3)
                     extra["block_ms_p99"] = round(float(np.percentile(_recent, 99)), 3)
+                    if x2_tx_meter is not None:
+                        extra.update(_x2_tx_mon(x2_tx_meter, x2_tx))
                     mon_publisher.publish(
                         block_n=n_in,
                         n_processed=n_processed,
@@ -5042,6 +5209,11 @@ def run(
             ),
             "orchestrator": orchestrator,
             "opoint": opoint,
+            "x2_tx": (
+                {"datagrams": int(x2_tx.n_datagrams), "bytes": int(x2_tx.n_bytes),
+                 "rejected": int(x2_tx.n_rejected), "frame_s": float(x2_tx.frame_s)}
+                if x2_tx is not None else None
+            ),
         }
     finally:
         try:
@@ -5069,6 +5241,15 @@ def run(
                 LOG.exception("async_tx.close failed (non-fatal)")
         # E2E test 1: stop the sky-export worker thread (daemon anyway,
         # but a clean join keeps logs tidy + flushes counters).
+        _x2_tx = locals().get("x2_tx")
+        if _x2_tx is not None:
+            try:
+                LOG.info("x2 TX: %d datagrams %d B framed (%.1f s framing), counters %s",
+                         _x2_tx.n_datagrams, _x2_tx.n_bytes, _x2_tx.frame_s,
+                         {k: v for k, v in _x2_tx.counters().items() if k != "per_dest"})
+                _x2_tx.close()
+            except Exception:
+                LOG.exception("x2 TX close failed (non-fatal)")
         _sky_exporter = locals().get("sky_exporter")
         if _sky_exporter is not None:
             try:
@@ -5402,6 +5583,17 @@ def main(argv: list[str] | None = None) -> int:
                         "2x corr chain (needs --t-int-fast-native 8 "
                         "--chan-sum-factor 2 --n-sub <2|4>; --dm-plan-path then "
                         "names a TieredDmPlan npz, else the plan is built).")
+    p.add_argument("--plan-id", default=None,
+                   help="2x: expected tiered-plan id (hex, the set's ${plan_id}); corr_fast "
+                        "refuses to start when the loaded plan differs (SPEC §10)")
+    p.add_argument("--x2-tx-bind-host", default="",
+                   help="2x TX: source IPv4 of the sender (the corr node's data "
+                        "NIC); empty = any")
+    p.add_argument("--x2-tx-cpu", type=int, default=-1,
+                   help="2x TX: pin the C sender thread to this core (-1 = no pin)")
+    p.add_argument("--x2-tx-pace", type=float, default=1.25,
+                   help="2x TX: per-search-node pacing rate as a multiple of its "
+                        "regular bytes per 134.2 ms block (default 1.25)")
     p.add_argument("--no-stage-timing", action="store_true",
                    help="disable the always-on sync-free per-stage CUDA-event "
                         "timing published in the /mon corr_fast heartbeat")
@@ -5480,7 +5672,7 @@ def main(argv: list[str] | None = None) -> int:
                         "spelling is the canonical form; the legacy "
                         "`--transport-tx-port` spelling is preserved.")
     p.add_argument("--transport-tx-mode",
-                   choices=("chunk8", "prod"), default="chunk8",
+                   choices=("chunk8", "prod") + X2_TX_MODES, default="chunk8",
                    help=("M7.2: TransportTx wire format. "
                          "'chunk8' = simple 32-byte FastVisFrame, "
                          "one sendto per (dm_idx, t_idx), no pacing "
@@ -5489,7 +5681,16 @@ def main(argv: list[str] | None = None) -> int:
                          "fragmentation + per-dm_idx token bucket "
                          "(production path). 'prod' requires "
                          "--transport-tx-target-gbps-per-flow > 0 "
-                         "and uses block_n as specnum."))
+                         "and uses block_n as specnum. 2x op-points "
+                         "(--opoint 2x-*) take 'v2' (frame v2, WS-T's C "
+                         "sendmmsg sender to --transport-tx-worker-hosts "
+                         "= the search nodes in SEARCH_NODES order, port "
+                         "--transport-tx-base-port + chgroup, routes from "
+                         "the plan's owner map) or 'drain' (framed and "
+                         "counted, never sent; CP1 live). At 2x "
+                         "--transport-tx-host/-workers/-coarse-dm-mask/"
+                         "-dtype/-ring-slots/-target-gbps-per-flow and "
+                         "--stage2-mode are ignored."))
     p.add_argument("--transport-tx-dtype",
                    choices=("cfp16", "cint8"), default="cfp16",
                    help=("M7.2: payload encoding for chunk8 mode. "
@@ -5752,6 +5953,10 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator=args.orchestrator,
             stage_timing=not args.no_stage_timing,
             opoint=args.opoint,
+            plan_id=args.plan_id,
+            x2_tx_bind_host=args.x2_tx_bind_host,
+            x2_tx_cpu=args.x2_tx_cpu,
+            x2_tx_pace=args.x2_tx_pace,
         )
     except _StopRequested:
         LOG.info("clean stop")

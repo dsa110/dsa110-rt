@@ -64,6 +64,23 @@ _DISABLED: Final[bool] = bool(int(os.environ.get("DSART_DISABLE_HOST_PIN", "0"))
 if _DISABLED:
     LOG.info("host-pin disabled via DSART_DISABLE_HOST_PIN=1")
 
+# x2 G0 finding (2026-10-29): today's finalizer is bound to the numpy wrapper the caller
+# passes in. For a PSRDADA page that is the per-block ``np.asarray(reader.getNextPage())``
+# (its base is the memoryview, where ``_numpy_base`` stops), so a page's pin lives only as long
+# as one block's wrapper: when the wrapper dies the page is unregistered and the next visit
+# pays ``cudaHostRegister`` again (~30 ms for 288 MB on a corr node); a live wrapper of an
+# older visit instead triggers the force-clean re-register. Whether either fires depends on
+# CPython id() reuse, because ``_FINALIZERS`` is keyed by id(base) but the finalizer removes
+# by address. ``DSART_HOST_PIN_PERSIST=1`` registers each (address, size) of memory numpy does
+# not own (a PSRDADA ring page: a stable shm mapping) once for the life of the process and never
+# unregisters it; steady state is one set lookup per block. numpy-owned buffers keep the
+# finalizer path. Off by default: today's behaviour is unchanged. Measured 2026-10-29 on n04
+# (1x legacy, production argv, replayed voltages, 24-page ring, 600 blocks): 30 fresh
+# registrations at 30.3 ms each (908 ms), 6 finalizer unregisters and 2 force-cleans.
+_PERSIST: Final[bool] = bool(int(os.environ.get("DSART_HOST_PIN_PERSIST", "0")))
+if _PERSIST:
+    LOG.info("host-pin: persistent page registration (DSART_HOST_PIN_PERSIST=1)")
+
 
 # ---------------------------------------------------------------------------
 # CUDA runtime binding (lazy, optional)
@@ -118,6 +135,11 @@ def _get_cudart() -> ctypes.CDLL | None:
 _REGISTRY_LOCK = threading.Lock()
 _REGISTERED: set[tuple[int, int]] = set()
 
+#: diagnostic counters (x2 per-block trace): fresh cudaHostRegister calls and their
+#: wall time, finalizer-driven unregisters, force-clean re-registrations
+_STATS: dict = {"register_new": 0, "register_ms": 0.0, "finalizer_unregister": 0,
+                "force_clean": 0}
+
 # Active weakref finalizers, keyed by id(base_buffer). Holding a
 # strong reference to the finalizer object keeps it alive until the
 # underlying numpy base array is GC'd, at which point the finalizer
@@ -151,6 +173,7 @@ def _make_unregister_finalizer(addr: int, size: int) -> None:
         return
 
     def _on_finalize() -> None:
+        _STATS["finalizer_unregister"] += 1
         rval = cudart.cudaHostUnregister(ctypes.c_void_p(addr))
         if rval != 0:
             LOG.debug(
@@ -274,11 +297,43 @@ def maybe_register_host_buffer(buf: object) -> bool:
     if cudart is None:
         return False
 
+    # persistent pinning only for memory numpy does not own (a PSRDADA page: the base chain
+    # ends at the reader's memoryview); numpy-owned buffers (warm-up dummy pages, benches) can
+    # be freed and their address reused, so they keep today's finalizer path
+    if _PERSIST and not (isinstance(buf, np.ndarray) and _numpy_base(buf).flags["OWNDATA"]):
+        with _REGISTRY_LOCK:
+            if (addr, size) in _REGISTERED:
+                return True
+        import time as _time
+        _t0 = _time.perf_counter()
+        rval = cudart.cudaHostRegister(
+            ctypes.c_void_p(addr), ctypes.c_size_t(size),
+            ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
+        )
+        if rval != 0:
+            cudart.cudaGetLastError()          # do not leave the error for torch's next check
+        if rval in (0, _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED):
+            if rval == 0:
+                _STATS["register_new"] += 1
+                _STATS["register_ms"] += (_time.perf_counter() - _t0) * 1e3
+            with _REGISTRY_LOCK:
+                _REGISTERED.add((addr, size))
+                n = len(_REGISTERED)
+            LOG.info("host-pinned PSRDADA buffer page (persistent): addr=0x%x size=%d MB "
+                     "(now %d page(s) pinned)", addr, size // (1024 * 1024), n)
+            return True
+        LOG.debug("host-pin: cudaHostRegister(addr=0x%x size=%d) failed rval=%d", addr, size, rval)
+        return False
+
+    import time as _time
+    _t0 = _time.perf_counter()
     rval = cudart.cudaHostRegister(
         ctypes.c_void_p(addr), ctypes.c_size_t(size),
         ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
     )
     if rval == 0:
+        _STATS["register_new"] += 1
+        _STATS["register_ms"] += (_time.perf_counter() - _t0) * 1e3
         # Newly registered; record + arm a weakref finalizer on the
         # underlying numpy base so we cudaHostUnregister BEFORE the OS
         # munmaps the memory. Without this, GC'ing a pinned numpy
@@ -334,6 +389,8 @@ def maybe_register_host_buffer(buf: object) -> bool:
             with _REGISTRY_LOCK:
                 force_clean = base_id not in _FINALIZERS
         if force_clean:
+            _STATS["force_clean"] += 1
+            _t1 = _time.perf_counter()
             cudart.cudaHostUnregister(ctypes.c_void_p(addr))
             with _REGISTRY_LOCK:
                 _REGISTERED.discard((addr, size))
@@ -341,6 +398,7 @@ def maybe_register_host_buffer(buf: object) -> bool:
                 ctypes.c_void_p(addr), ctypes.c_size_t(size),
                 ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
             )
+            _STATS["register_ms"] += (_time.perf_counter() - _t1) * 1e3
             if rval == 0:
                 with _REGISTRY_LOCK:
                     _REGISTERED.add((addr, size))
@@ -426,6 +484,12 @@ def unregister_all() -> int:
             LOG.debug("host-unpin: cudaHostUnregister(0x%x) → rval=%d",
                       addr, rval)
     return n
+
+
+def stats() -> dict:
+    """Copy of the diagnostic counters (fresh registrations and their total wall
+    time in ms, finalizer unregisters, force-clean re-registrations)."""
+    return dict(_STATS)
 
 
 def n_registered() -> int:
