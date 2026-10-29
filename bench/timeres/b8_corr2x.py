@@ -1211,6 +1211,23 @@ class TxDrainMonitor:
             self.t0 = time.monotonic()
             self._th = threading.Thread(target=self._poll, daemon=True)
             self._th.start()
+            real_close = tx.close
+
+            def close(*a, **kw):
+                # stop polling BEFORE the sender is destroyed: a counters() call racing
+                # txm_destroy is a use-after-free (a segfault at the end of a 6-min run)
+                self._stop.set()
+                self._th.join(timeout=5)
+                try:
+                    if hasattr(tx.sink, "flush"):
+                        tx.sink.flush(1.0)
+                    self.last = tx.sink.counters()
+                    self.cpu_last = {t: _thread_cpu_s(t) for t in self.tids}
+                    self.t_last = time.monotonic()
+                except Exception:  # noqa: BLE001
+                    pass
+                return real_close(*a, **kw)
+            tx.close = close
             return tx
         self.cfi._build_x2_tx = build
         return self
