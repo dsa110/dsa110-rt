@@ -252,6 +252,23 @@ X2_TX_BURST_BYTES = 16 << 10
 X2_TX_MAX_DATAGRAM = 9000
 
 
+def block_tx_worst_datagrams(formats: list[StreamFormat], dm_t_native: dict[int, int], routes,
+                              n_dest: int) -> list[int]:
+    """Per destination, the most datagrams one corr block can need: every row its own
+    datagram (each guarded row carries its own steps, so a level step that guards whole
+    blocks for a few seconds multiplies the datagram count by up to ``max_k`` while the
+    bytes barely change)."""
+    ndg = [0] * n_dest
+    for d, tn in dm_t_native.items():
+        S = BLOCK_NATIVE // int(tn)
+        ndg[routes[d]] += S * len(formats)
+    return ndg
+
+
+#: the sender's queue memory (slots x 9000 B x destinations) is bounded by this many slots
+X2_TX_MAX_SLOTS = 1 << 15
+
+
 def build_mmsg_sender(*, formats: list[StreamFormat], dm_t_native: dict[int, int], owner_half,
                       hosts: list[str], port: int, bind_host: str = "", cpu: int = -1,
                       pace: float = 1.25, burst_bytes: int = X2_TX_BURST_BYTES,
@@ -269,16 +286,21 @@ def build_mmsg_sender(*, formats: list[StreamFormat], dm_t_native: dict[int, int
     routes = corr_routes(owner_half, dm_t_native.keys(), n_dest=n_dest)
     nbytes, ndg = block_tx_budget(formats, dm_t_native, routes, n_dest)
     rates = [float(pace) * 8.0 * b / BLOCK_S for b in nbytes]
+    # queues hold 2 blocks of the WORST datagram count (a guard storm), not of the regular one:
+    # on 2026-10-29 a 16 s storm overflowed 4096 regular-sized slots (41k datagrams dropped)
+    worst = block_tx_worst_datagrams(formats, dm_t_native, routes, n_dest)
     slots = 1024
-    while slots < 2 * max(ndg, default=0):
+    while slots < 2 * max(max(ndg, default=0), max(worst, default=0)) and slots < X2_TX_MAX_SLOTS:
         slots *= 2
     tx = MmsgSender([(h, int(port), r) for h, r in zip(hosts, rates)], routes=routes,
                     bind_host=bind_host, queue_slots=slots, burst_bytes=int(burst_bytes), cpu=int(cpu),
                     slot_bytes=X2_TX_MAX_DATAGRAM)
     LOG.info("x2 TX: %d destinations port %d, %.2f Gb/s paced total (x%.2f of %.2f Gb/s), "
-             "burst %d B/destination, %d datagrams/block, queue %d slots, bind %r",
+             "burst %d B/destination, %d datagrams/block (worst %d/destination), queue %d slots "
+             "(%.0f MB), bind %r",
              n_dest, port, sum(rates) / 1e9, pace, 8.0 * sum(nbytes) / BLOCK_S / 1e9,
-             int(burst_bytes), sum(ndg), slots, bind_host or "any")
+             int(burst_bytes), sum(ndg), max(worst, default=0), slots,
+             slots * X2_TX_MAX_DATAGRAM * n_dest / 1e6, bind_host or "any")
     if start:
         tx.start()
     return tx

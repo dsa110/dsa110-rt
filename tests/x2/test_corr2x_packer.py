@@ -270,6 +270,30 @@ def test_guard_overflow_is_deferred_and_resolved(capacity) -> None:
         _assert_block_equal(res, flows, x, rule)
 
 
+@pytest.mark.parametrize("dev", ["cpu", "cuda"])
+def test_lowmed_rows_selection_equals_the_sort(dev) -> None:
+    """resolve_overflow's selection (unused values split -inf / +inf, one topk with k = V + 1)
+    == the sort-based lower median, bit for bit, for rows with unused, zero-component,
+    non-finite and duplicate values and any used count m >= 1."""
+    if dev == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA-only")
+    rng = np.random.default_rng(5)
+    y = rng.normal(size=(64, 37, 2)).astype(np.float32)
+    y[3, :10] = 0                                      # unused values
+    y[5, 5, 0] = np.inf
+    y[6, 2, 1] = np.nan
+    y[7, :36] = 0                                      # m = 1
+    y[8, ::2, 0] = 0                                   # a zero component: still used
+    y[9] = 1.5                                         # all magnitudes tied
+    y[10, :20] = np.float32(0.25)                      # ties around the median
+    y[11, 1:] = 0                                      # m = 1 at the front
+    t = torch.from_numpy(y).to(dev)
+    med, m = RowRulePacker._lowmed(None, t)
+    assert int(m.min()) >= 1
+    got = RowRulePacker._lowmed_rows(t)
+    assert torch.equal(got, med), (got - med).abs().max()
+
+
 def test_packer_rejects_a_non_quant_rule() -> None:
     with pytest.raises(TypeError):
         RowRulePacker(n_d=1, value_offsets=[0, 4], n_contrib=np.ones(4), n_heavy=[0], rule=object())
