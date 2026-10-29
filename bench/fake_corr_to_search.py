@@ -13,7 +13,13 @@ h23 and starts marked workers on the nodes over ssh)::
     fleet-load --format 2x-... --load-factor 1.1 --plan <node path> --engine '<cmd>'
                [--minutes M] DRV                        -> search_rx v4 + owner engines
     snap-live  --sender c --format 2x-... [--minutes M] DRV
-    teardown   DRV                                      -> kill marked workers, rm test shm
+    fleet-replay --format 2x-... --plan <search node path> --plan-id 0x... [--replay 250924mptq]
+               [--minutes M] DRV                        -> G1 full chain: the REAL 2x corr
+               (bench/timeres/b8_corr2x.py live on replayed voltages, frame v2, C sender) on every
+               corr node into search_rx v4 + owner engines; every node process under
+               tools/x2/prod_guard.sh; fleet_replay.json + fleet_replay.md in --out (a directory)
+    replay-report --in fleet_replay.json --out DIR      -> re-evaluate a fleet-replay result
+    teardown   DRV [--corr-replay]                      -> kill marked workers, rm test shm
     DRV = --tx-nodes n03,... --rx-nodes n01,... --scratch <node scratch> --marker <tag>
           --out <file.json | dir>
 
@@ -1398,6 +1404,9 @@ def cmd_fleet_replay(a) -> int:
         res["leftovers"] = drv.leftovers(corr_nodes=drv.tx_nodes)
     res["corr_raw"] = corr_res
     res["engines_raw"] = eng_res
+    # first + last ring snapshot: enough to re-evaluate (replay-report) without the 10 s series
+    res["ring_raw"] = {n: ({"snaps": [r["snaps"][0], r["snaps"][-1]], "iface": r.get("iface")}
+                           if r and r.get("snaps") else r) for n, r in ring_res.items()}
     ev = evaluate_replay(res, corr_res, ring_res, eng_res, n_sub=n_sub, lossy=lossy)
     res.update(ev)
     res["leftovers_clean"] = all(not v for v in res["leftovers"].values())
@@ -1452,7 +1461,9 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
             "tx_full_drops": sum(tl.get("dest_full_drops") or [0]), "tx_errors": sum(tl.get("dest_errors") or [0]),
             "tx_unrouted": int(cnt.get("unrouted", 0) or 0),
             "tx_unsent_at_close": int(sum(e - x for e, x in zip(enq, sent))) if enq and sent else None,
-            "tx_rejected": (s.get("x2_tx") or {}).get("rejected"), "tx_gbps": tl.get("gbps_total"),
+            "tx_rejected": (s.get("x2_tx") or {}).get("rejected"),
+            # over the data window (the sender's own gbps_total also counts the warm-up / wait for the start)
+            "tx_gbps": 8.0 * sum(tl.get("dest_bytes") or [0]) / (res["minutes"] * 60.0) / 1e9 if tl else None,
             "tx_drain_p99_ms": (tl.get("drain_ms") or {}).get("p99"),
             "tx_sender_cpu_frac": tl.get("sender_cpu_frac"),
         }
@@ -1541,9 +1552,9 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
                      "row_hole_frac": flows["rows_hole"] / (flows["rows_written"] + flows["rows_hole"])
                      if flows["rows_written"] + flows["rows_hole"] else None,
                      "gates": g, "passed": all(g.values())}
-        span = s1["t"] - s0["t"]
-        if span > 0:
-            search[n]["gbps_mean_over_window"] = 8.0 * (w1.get("bytes", 0) - w0.get("bytes", 0)) / span / 1e9
+        data_s = res["minutes"] * 60.0                       # ring-stats spans more (set-up + tail)
+        search[n]["gbps"] = 8.0 * (w1.get("bytes", 0) - w0.get("bytes", 0)) / data_s / 1e9
+        search[n]["datagrams_per_s"] = recv_w / data_s
         summ = (eng_res.get(n) or {}).get("summary") or {}
         got = {int(r_["half"]): r_ for r_ in summ.get("results", []) if "half" in r_}
         for hh in (2 * j, 2 * j + 1):
@@ -1595,14 +1606,14 @@ def replay_markdown(res: dict) -> str:
         L += [f"Corr nodes not warm at the start: {res['not_ready_at_start']}", ""]
     L += ["## Corr (per node; block time from corr_fast's summary, over-budget blocks from the trace, which "
           "skips the first 32 blocks)", "",
-          "| node | chg | mean ms | p99 ms | max ms | blocks > 134.2 ms | blocks | overruns | late start s | "
-          "TX Gb/s | TX drops | sent n01/n02/n09/n13 | gates |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "| node | chg | mean ms | p99 ms | max ms | steady p99 / max ms | blocks > 134.2 ms | blocks | overruns "
+          "| late start s | TX Gb/s | TX drops | sent n01/n02/n09/n13 | gates |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for n, r in (res.get("corr") or {}).items():
         sent = "/".join(str(x) for x in (r.get("tx_sent_per_dest") or [])) or "-"
         bad = [k for k, v in (r.get("gates") or {}).items() if not v]
         L.append(f"| {n} | {r['chgroup']} | {_f(r['mean_ms'])} | {_f(r['p99_ms'])} | {_f(r['max_ms'])} | "
-                 f"{_f(r['over_budget_blocks'], '{}')} | {_f(r['n_blocks_in'], '{}')} | {_f(r['overruns'], '{}')} | "
+                 f"{_f(r['trace_p99_ms'])} / {_f(r['trace_max_ms'])} | {_f(r['over_budget_blocks'], '{}')} | {_f(r['n_blocks_in'], '{}')} | {_f(r['overruns'], '{}')} | "
                  f"{_f(r['writer_start_late_s'], '{:.2f}')} | {_f(r['tx_gbps'], '{:.2f}')} | "
                  f"{_f(r['tx_drops'], '{}')} | {sent} | {'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
     L += ["", "## Corner turn (per search node; loss on the non-lossy flows vs max(1e-4, PHY CRC fraction "
@@ -1619,7 +1630,7 @@ def replay_markdown(res: dict) -> str:
         L.append(f"| {n} | {r['sent']} | {_f(r['loss_excl_lossy'], '{:.2e}')} | {_f(r['loss_all'], '{:.2e}')} | "
                  f"{_f(r['phy_crc_frac'], '{:.2e}')} | {r['discards']} | {r['rejected'] or 0} | "
                  f"{w.get('complete', 0)}/{w.get('fan_in', 0)}/{w.get('deadline', 0)} | "
-                 f"{_f(r['rows_missing_frac'], '{:.2e}')} | {_f(r.get('gbps_mean_over_window'), '{:.2f}')} | "
+                 f"{_f(r['rows_missing_frac'], '{:.2e}')} | {_f(r.get('gbps'), '{:.2f}')} | "
                  f"{'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
     if res.get("lossy_flows"):
         L += ["", "### Lossy corr nodes (reported separately, excluded from the loss gate)", "",
@@ -1641,6 +1652,22 @@ def replay_markdown(res: dict) -> str:
                  f"{r['startup_skipped_cycles']} | {r['stop']} | {'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
     L.append("")
     return "\n".join(L)
+
+
+def cmd_replay_report(a) -> int:
+    """Re-evaluate a fleet_replay.json from its raw corr / ring / engine records
+    (rewrites fleet_replay.json + .md in --out)."""
+    res = json.loads(Path(a.input).read_text())
+    ring = res.get("ring_raw") or {}
+    ev = evaluate_replay(res, res.get("corr_raw") or {}, ring, res.get("engines_raw") or {},
+                         n_sub=_n_sub_of(res["format"]), lossy=res.get("lossy_tx_nodes") or [])
+    res.update(ev)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    _write_json(str(out / "fleet_replay.json"), res)
+    (out / "fleet_replay.md").write_text(replay_markdown(res))
+    print(json.dumps({"passed": res.get("passed"), "gates": res["gates"], "out": str(out)}))
+    return 0
 
 
 def cmd_teardown(a) -> int:
@@ -1748,6 +1775,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="max wait after the data end for every corr's live_2x.json")
     p.add_argument("--skip-preflight", action="store_true", help="run despite preflight findings")
     p.set_defaults(func=cmd_fleet_replay, lead_s=180.0)
+    p = sub.add_parser("replay-report", help="re-evaluate a fleet_replay.json (gates + markdown)")
+    p.add_argument("--in", dest="input", required=True)
+    p.add_argument("--out", required=True, help="directory")
+    p.set_defaults(func=cmd_replay_report)
     p = sub.add_parser("teardown")
     _driver_args(p)
     p.add_argument("--corr-replay", action="store_true",
@@ -1816,7 +1847,8 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-SUBCOMMANDS = ("sweep", "fleet-load", "snap-live", "fleet-replay", "teardown", "tx", "rx", "ring-stats")
+SUBCOMMANDS = ("sweep", "fleet-load", "snap-live", "fleet-replay", "replay-report", "teardown", "tx", "rx",
+               "ring-stats")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
