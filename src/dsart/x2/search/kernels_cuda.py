@@ -33,6 +33,8 @@ twins to fp32 rounding (checked at CP1, ``x2_gpu`` tests), not bit for bit.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 from .codec import RowFormat
@@ -183,6 +185,108 @@ extern "C" __global__ void k0_f2_valid(const unsigned char* __restrict__ valid,
     const int nd = ndc[i];
     valid_out[(long long)s * R + sl] = (unsigned char)(valid[i] && nd < nv_s[s]);
     if (nd) atomicAdd(&nodata[s], (unsigned long long)nd);
+}
+
+/* Layer-1 sigma (noise_norm.layer1.sigma_clipped_std_batched in ONE launch per
+   DM): block f gathers its M samples image[(t0 + l1_t[f, m]) % R_img, f,
+   l1_p[f, m]] into shared memory, then: median = the LOWER median of the active
+   (finite, then also in-band) samples by 4-pass radix select on order-preserving
+   float keys (torch.nanmedian), sigma = sqrt(sum (s - med)^2 / count), and
+   n_iter times: active &= med - n_sigma sigma <= s <= med + n_sigma sigma,
+   recompute. A row with no active sample returns 0. M <= L1_MMAX. */
+#define L1_MMAX 10240   /* samples per row; inactive samples are set to NaN */
+__device__ __forceinline__ unsigned int l1_key(float v) {
+    const unsigned int u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float l1_unkey(unsigned int k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+extern "C" __global__ void l1_clipstd(const __half* __restrict__ image, const int* __restrict__ l1_t,
+    const int* __restrict__ l1_p, float* __restrict__ out, int F, int P, int R_img, long long t0,
+    int M, float n_sigma, int n_iter)
+{
+    __shared__ float sv[L1_MMAX];
+    __shared__ unsigned int hist[256];
+    __shared__ float red[32];
+    __shared__ int redn[32];
+    __shared__ unsigned int s_pref, s_rank;
+    __shared__ float s_med, s_sig;
+    __shared__ int s_n;
+    const int f = blockIdx.x, tid = threadIdx.x, nth = blockDim.x;
+    const int lane = tid & 31, warp = tid >> 5, nw = nth >> 5;
+    for (int m = tid; m < M; m += nth) {
+        long long sl = (t0 + l1_t[(long long)f * M + m]) % R_img; if (sl < 0) sl += R_img;
+        const float v = __half2float(image[(sl * F + f) * (long long)P + l1_p[(long long)f * M + m]]);
+        sv[m] = isfinite(v) ? v : __int_as_float(0x7fc00000);
+    }
+    __syncthreads();
+    for (int it = 0; it <= n_iter; ++it) {
+        if (it > 0) {
+            const float med = s_med, sig = s_sig;
+            const float lo = __fsub_rn(med, __fmul_rn(n_sigma, sig));
+            const float hi = __fadd_rn(med, __fmul_rn(n_sigma, sig));
+            for (int m = tid; m < M; m += nth)
+                if (!(sv[m] >= lo && sv[m] <= hi)) sv[m] = __int_as_float(0x7fc00000);
+            __syncthreads();
+        }
+        /* count active */
+        int c = 0;
+        for (int m = tid; m < M; m += nth) c += isnan(sv[m]) ? 0 : 1;
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+        if (lane == 0) redn[warp] = c;
+        __syncthreads();
+        if (tid == 0) {
+            int n = 0;
+            for (int w = 0; w < nw; ++w) n += redn[w];
+            s_n = n;
+            s_pref = 0u;
+            s_rank = n > 0 ? (unsigned int)((n - 1) / 2) : 0u;   /* lower median */
+        }
+        __syncthreads();
+        if (s_n == 0) { if (tid == 0) out[f] = 0.0f; return; }
+        /* radix select, 8 bits per pass from the top */
+        for (int sh = 24; sh >= 0; sh -= 8) {
+            for (int i = tid; i < 256; i += nth) hist[i] = 0u;
+            __syncthreads();
+            const unsigned int pref = s_pref;
+            const unsigned int hmask = sh == 24 ? 0u : (0xffffffffu << (sh + 8));
+            for (int m = tid; m < M; m += nth) {
+                if (isnan(sv[m])) continue;
+                const unsigned int k = l1_key(sv[m]);
+                if ((k & hmask) == pref) atomicAdd(&hist[(k >> sh) & 0xFFu], 1u);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                unsigned int r = s_rank, cum = 0u, bin = 0u;
+                for (bin = 0u; bin < 256u; ++bin) {
+                    if (cum + hist[bin] > r) break;
+                    cum += hist[bin];
+                }
+                s_rank = r - cum;
+                s_pref = pref | (bin << sh);
+            }
+            __syncthreads();
+        }
+        const float med = l1_unkey(s_pref);
+        /* sigma */
+        float acc = 0.0f;
+        for (int m = tid; m < M; m += nth)
+            if (!isnan(sv[m])) { const float d = __fsub_rn(sv[m], med); acc = __fadd_rn(acc, __fmul_rn(d, d)); }
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) red[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+            for (int w = 0; w < nw; ++w) tot += red[w];
+            s_med = med;
+            s_sig = sqrtf(tot / (float)s_n);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[f] = isnan(s_sig) ? 0.0f : s_sig;
 }
 
 extern "C" __global__ void k0_unpack_cint8(
@@ -532,6 +636,7 @@ extern "C" __global__ void k23_fused_256(const float2* __restrict__ uv,
       }
     }
 }
+
 """
 
 _MOD = None
@@ -606,6 +711,23 @@ def k23_tables(lines: dict, n_fl: int, device, pix=None) -> dict:
     return out
 
 
+def launch_l1(image, l1_t, l1_p, out, *, F: int, P: int, R_img: int, t0: int, M: int,
+              stream, n_sigma: float = 3.0, n_iter: int = 3) -> None:
+    """Layer-1 sigma of one DM-cycle in one launch (``l1_clipstd``): ``out [F]``
+    float32; ``l1_t``/``l1_p`` int32 ``[F, M]`` (sample rows / pixels)."""
+    import cupy as cp
+
+    from ...image.tiled_combine_cuda import _ptr
+
+    if M > 10240:
+        raise ValueError(f"M={M} > 10240 Layer-1 samples per fine DM")
+    with cp.cuda.ExternalStream(stream.cuda_stream):
+        get_module().get_function("l1_clipstd")(
+            (int(F),), (256,),
+            (_ptr(image), _ptr(l1_t), _ptr(l1_p), _ptr(out), np.int32(F), np.int32(P),
+             np.int32(R_img), np.int64(t0), np.int32(M), np.float32(n_sigma), np.int32(n_iter)))
+
+
 def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: int,
                    row_bytes: int, V: int, R: int, row0: int, stream, ndc=None) -> None:
     """Frame-v2 K0 in 2-D tiles (``k0_f2_tile2``: 32 rows x 128 values x stream)
@@ -635,7 +757,7 @@ def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: 
 
 
 def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int, F: int,
-               t0: int, R_img: int, transpose: int, stream, warps: int = 16) -> None:
+               t0: int, R_img: int, transpose: int, stream, warps: Optional[int] = None) -> None:
     """K2+K3a fused (``k23_fused_256``): ``uv`` float32 ``[B, n_act, 2]``
     (``b = f * n_t + t``) -> fp16 image ring ``[R_img, F, N*N]`` rows
     ``t0 .. t0 + n_t - 1``; ``tables`` = :func:`k23_tables`."""
@@ -644,6 +766,7 @@ def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int,
     from ...image.tiled_combine_cuda import _ptr
 
     n_fl = int(tables["n_fl"])
+    warps = warps or 16
     k = get_module().get_function("k23_fused_256")
     smem = (256 + ((n_fl * 33 + 1) & ~1) + warps * 128) * 8
     if smem > 48 * 1024 and getattr(k, "max_dynamic_shared_size_bytes", 0) < smem:

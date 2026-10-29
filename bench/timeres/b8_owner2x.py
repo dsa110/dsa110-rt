@@ -399,7 +399,6 @@ def cmd_kernels(a) -> int:
     import numpy as np
     import torch
 
-    from dsart.noise_norm.layer1 import sigma_clipped_std_batched
     from dsart.x2.search.combine import k1_twin
     from dsart.x2.search.fft import FftPlan, image_from_uv_torch, image_from_uv_twin
     from dsart.x2.search.filters import FilterBank, k3b_twin
@@ -457,9 +456,15 @@ def cmd_kernels(a) -> int:
         ring = small = None
     try:
         F = 18
-        smp = torch.randn((F, 10000), device=dev)
-        ms = _cuda_ms(lambda: sigma_clipped_std_batched(smp))
+        from dsart.x2.search.kernels_cuda import launch_l1
+        img = torch.randn((hop + 150, F, 65536), device=dev).to(torch.float16)
+        lt = torch.randint(0, hop, (F, 10000), dtype=torch.int32, device=dev)
+        lp = torch.randint(0, 65536, (F, 10000), dtype=torch.int32, device=dev)
+        sig = torch.empty(F, device=dev)
+        ms = _cuda_ms(lambda: launch_l1(img, lt, lp, sig, F=F, P=65536, R_img=hop + 150, t0=0,
+                                        M=10000, stream=torch.cuda.current_stream()))
         common["l1"] = 1e3 * ms / (F * hop)
+        del img
         best = torch.randn((hop // 64, F, 65536), device=dev)
         n_top = 224 * hop // 192
         ms = _cuda_ms(lambda: torch.topk(best.view(-1), n_top))

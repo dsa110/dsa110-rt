@@ -263,11 +263,25 @@ class GpuBackend:
         x = self.dm[st.spec.d]
         with torch.cuda.stream(self.compute):
             a = self._ev(self.compute)
-            slots = torch.as_tensor(np.mod(t0 + st.l1_t, st.R_img), device=self.dev)
-            f_idx = torch.arange(st.spec.n_fdm, device=self.dev)[:, None]
-            p = torch.as_tensor(st.l1_p, device=self.dev)
-            smp = x.image[slots, f_idx, p].float()
-            sig = sigma_clipped_std_batched(smp)
+            if st.l1_t.shape[1] <= 10240:               # one launch (kernels_cuda.l1_clipstd)
+                from .kernels_cuda import launch_l1
+                if getattr(x, "l1_tables", None) is None:
+                    x.l1_tables = (
+                        torch.as_tensor(np.ascontiguousarray(st.l1_t), dtype=torch.int32,
+                                        device=self.dev),
+                        torch.as_tensor(np.ascontiguousarray(st.l1_p), dtype=torch.int32,
+                                        device=self.dev),
+                        torch.empty(st.spec.n_fdm, dtype=torch.float32, device=self.dev))
+                lt, lp, sig = x.l1_tables
+                launch_l1(x.image, lt, lp, sig, F=st.spec.n_fdm, P=int(x.image.shape[2]),
+                          R_img=st.R_img, t0=int(t0), M=int(st.l1_t.shape[1]),
+                          stream=self.compute)
+            else:
+                slots = torch.as_tensor(np.mod(t0 + st.l1_t, st.R_img), device=self.dev)
+                f_idx = torch.arange(st.spec.n_fdm, device=self.dev)[:, None]
+                p = torch.as_tensor(st.l1_p, device=self.dev)
+                smp = x.image[slots, f_idx, p].float()
+                sig = sigma_clipped_std_batched(smp)
             self._mark(st.spec.d, "l1", a, self._ev(self.compute))
             # D2H ON the compute stream: ordered after the work that produced it
             # (a .cpu() outside this block runs on the default stream and can

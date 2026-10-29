@@ -282,7 +282,37 @@ def test_cp1_gpu_list_is_marked():
     import sys
     mod = sys.modules[__name__]
     names = [n for n in dir(mod) if n.startswith("test_gpu_")]
-    assert len(names) == 8                                   # 17 cases with parametrize
+    assert len(names) == 9                                   # 19 cases with parametrize
     for n in names:
         marks = {m.name for m in getattr(getattr(mod, n), "pytestmark", [])}
         assert "x2_gpu" in marks, n
+
+
+@_gpu
+def test_gpu_layer1_kernel_matches_torch_reference():
+    """kernels_cuda.l1_clipstd == noise_norm.layer1.sigma_clipped_std_batched:
+    same lower median (exact), same clip, sums in another order (rtol 1e-5)."""
+    from dsart.noise_norm.layer1 import sigma_clipped_std_batched
+    from dsart.x2.search.kernels_cuda import launch_l1
+
+    rng = np.random.default_rng(9)
+    R, F, P, M = 40, 5, 3000, 10000
+    img = (rng.standard_normal((R, F, P)) * rng.uniform(0.5, 2.0, (1, F, 1))).astype(np.float16)
+    img[3, 1, 10:400] = 80.0                                  # outliers clipped away
+    img[7, 2, :] = np.float16(np.inf)                         # non-finite dropped
+    lt = rng.integers(0, 32, size=(F, M)).astype(np.int32)
+    lp = rng.integers(0, P, size=(F, M)).astype(np.int32)
+    lt[4, :] = 7
+    lp[4, :] = rng.integers(0, P, M)                          # row 4: all samples non-finite
+    img[(17 + 7) % R, 4, :] = np.float16(np.inf)
+    t0 = 17
+    smp = img[np.mod(t0 + lt, R), np.arange(F)[:, None], lp].astype(np.float32)
+    want = sigma_clipped_std_batched(torch.from_numpy(smp)).numpy()
+    dev = torch.device("cuda")
+    out = torch.empty(F, dtype=torch.float32, device=dev)
+    launch_l1(torch.from_numpy(img).to(dev), torch.from_numpy(lt).to(dev),
+              torch.from_numpy(lp).to(dev), out, F=F, P=P, R_img=R, t0=t0, M=M,
+              stream=torch.cuda.current_stream())
+    got = out.cpu().numpy()
+    assert want[4] == 0.0 and got[4] == 0.0
+    assert np.allclose(got, want, rtol=1e-5, atol=0), (got, want)
