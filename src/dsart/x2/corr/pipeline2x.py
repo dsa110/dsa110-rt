@@ -169,9 +169,15 @@ class Corr2xPipeline(PipelinedCorrFast):
         fv_chunk: int = 128,
         value_subset: int | None = None,
         dm_subset: list[int] | None = None,
+        front_stream: bool = True,
         **kw,
     ) -> None:
         super().__init__(ctx, **kw)
+        #: CUDA: unpack + RFI + gains of block N run on their own stream, so they overlap the
+        #: previous block's stage 1 / packer on the main stream (same kernels, same inputs ->
+        #: the same results); the GEMM waits on them through one event
+        self._front_stream = (torch.cuda.Stream(device=ctx.device)
+                              if (self.cuda and front_stream) else None)
         self.plan = plan
         self.vm = vm
         g = int(ctx.cfg.chgroup)
@@ -419,7 +425,8 @@ class Corr2xPipeline(PipelinedCorrFast):
         x = stage1_twin(ring_np, csr_local, ts.shifts, ts.geo, q_base=q_emit, n_out=n_out)
         return torch.from_numpy(x.astype(np.complex64))
 
-    def _issue(self, st) -> None:
+    def _front(self, st):
+        """unpack -> RFI flag -> gains (+ the explicit injection path) on the current stream."""
         ctx = self.ctx
         if self.cuda:
             torch.cuda.current_stream(ctx.device).wait_event(st.h2d_done)
@@ -435,6 +442,22 @@ class Corr2xPipeline(PipelinedCorrFast):
             cfi._tmark(ctx, "rfi")
         real_v, imag_v, cr, ci, tk = self._gains_and_voltages(real_v, imag_v, rfi_result, st.block_n)
         cfi._tmark(ctx, "gains")
+        return real_v, imag_v, cr, ci, tk, rfi_result
+
+    def _issue(self, st) -> None:
+        ctx = self.ctx
+        if self._front_stream is not None:
+            main = torch.cuda.current_stream(ctx.device)
+            with torch.cuda.stream(self._front_stream):
+                real_v, imag_v, cr, ci, tk, rfi_result = self._front(st)
+                front_done = torch.cuda.Event()
+                front_done.record(self._front_stream)
+            main.wait_event(front_done)
+            for t in (real_v, imag_v, cr, ci, tk):
+                if t is not None:
+                    t.record_stream(main)          # freed only after the main stream used them
+        else:
+            real_v, imag_v, cr, ci, tk, rfi_result = self._front(st)
         self._ensure_buffers()
         q_block = int(st.block_n) * self.n_q
         self._gemm(real_v, imag_v, cr, ci, tk, q_block)

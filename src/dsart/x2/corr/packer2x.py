@@ -428,17 +428,21 @@ class RowRulePacker:
         upd = sp + mm
         return torch.where(ok, torch.where(is_set, upd, est), sp)
 
+    def _thresholds(self, sig: torch.Tensor):
+        """(t, valid) of the guard for sigma_hat ``sig`` (any shape)."""
+        t, valid = guard_threshold(self._guard * sig, float(self.rule.robust_k))
+        return torch.where(valid, t, torch.zeros_like(t)), valid
+
     def _code_stream(self, xs: torch.Tensor, r: torch.Tensor, sig: torch.Tensor, s: int,
-                     capacity: int) -> dict:
+                     capacity: int, tv=None) -> dict:
         """Guard + codes + payload of stream ``s`` for the flows in ``xs``
-        (float32 ``(n_f, S, V, 2)`` view) at sigma_hat ``sig`` ``(n_f,)``."""
+        (float32 ``(n_f, S, V, 2)`` view) at sigma_hat ``sig`` ``(n_f,)``;
+        ``tv`` = precomputed ``(t, valid)`` for these flows."""
         n_f, S, V, _ = xs.shape
         nh = self.n_heavy[s]
         dev = xs.device
         pos = sig > 0
-        G = self._guard * sig
-        t, valid = guard_threshold(G, float(self.rule.robust_k))
-        t = torch.where(valid, t, torch.zeros_like(t))
+        t, valid = self._thresholds(sig) if tv is None else tv
         if self.use_triton:
             m_row, cnt = row_stats_triton(xs, r, t)
         else:
@@ -498,27 +502,30 @@ class RowRulePacker:
         on the device; the caller must then pass the result through
         :meth:`resolve_overflow` before using it."""
         xr = torch.view_as_real(x.to(torch.complex64).contiguous())
-        n_d = xr.shape[0]
         do_est = self.blocks_seen >= int(self.rule.warmup_blocks)
         self.blocks_seen += 1
         out = []
+        # per-flow scalars of all streams at once (one EMA, one threshold solve): the
+        # per-stream loop below only runs the data-sized kernels
+        if do_est:
+            parts = [self._estimate(xr[:, :, self.voff[s]:self.voff[s + 1]],
+                                    self.r[self.voff[s]:self.voff[s + 1]]) for s in range(self.n_sub)]
+            est = torch.stack([p[0] for p in parts], 1)
+            ok = torch.stack([p[1] for p in parts], 1)
+            m_used = torch.stack([p[2] for p in parts], 1)
+            self.sigma.copy_(self._ema(self.sigma, est, ok))
+            est = torch.where(ok, est, torch.full_like(est, float("nan")))
+        else:
+            est = torch.full_like(self.sigma, float("nan"))
+            m_used = torch.zeros(self.sigma.shape, dtype=torch.int64, device=self.device)
+        sig_all = self.sigma.clone()
+        t_all, valid_all = self._thresholds(sig_all)
         for s in range(self.n_sub):
             lo, hi = self.voff[s], self.voff[s + 1]
-            xs = xr[:, :, lo:hi]
-            r = self.r[lo:hi]
-            sp = self.sigma[:, s]
-            if do_est:
-                est, ok, m_used = self._estimate(xs, r)
-                sig = self._ema(sp, est, ok)
-                self.sigma[:, s] = sig
-                est = torch.where(ok, est, torch.full_like(est, float("nan")))
-            else:
-                sig = sp.clone()
-                est = torch.full_like(sp, float("nan"))
-                m_used = torch.zeros(n_d, dtype=torch.int64, device=self.device)
-            res = self._code_stream(xs, r, sig, s, self.guard_capacity)
-            res["est"] = est
-            res["n_used"] = m_used
+            res = self._code_stream(xr[:, :, lo:hi], self.r[lo:hi], sig_all[:, s], s,
+                                    self.guard_capacity, tv=(t_all[:, s], valid_all[:, s]))
+            res["est"] = est[:, s]
+            res["n_used"] = m_used[:, s]
             out.append(res)
         if resolve_overflow:
             self.resolve_overflow(out, x)
@@ -539,8 +546,9 @@ class RowRulePacker:
             flows = torch.nonzero(ov).flatten()
             lo, hi = self.voff[s], self.voff[s + 1]
             xs = xr[flows][:, :, lo:hi]
-            S = xs.shape[1]
-            sub = self._code_stream(xs, self.r[lo:hi], res["sigma"][flows], s, capacity=S)
+            # exact s_row for every guarded row of these flows: capacity = the most any has
+            n_g = int(res["guarded"][flows].sum(1).max())
+            sub = self._code_stream(xs, self.r[lo:hi], res["sigma"][flows], s, capacity=n_g)
             for key in ("payload", "codes_heavy", "codes_main", "sigma_row", "step_main",
                         "step_heavy", "guarded", "guard_overflow"):
                 res[key][flows] = sub[key]

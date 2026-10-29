@@ -4,12 +4,11 @@
 2x corr_fast runs (the pipeline calls it on its D2H stream, one block
 behind). Per tier and stream it builds the datagrams byte-equal to
 ``prod_frame2.iter_block_datagrams`` and hands all of them to a sink in ONE
-call. Regular blocks (no guarded row: every row of a flow has the same
-steps) are framed ON THE DEVICE: the payload rows are copied into the
-datagram slots of a persistent device buffer, the headers (numpy, vectorised)
-into theirs, and the whole buffer comes back in one D2H into pinned memory;
-the CPU only builds headers and submits. Blocks with guarded rows go through
-:func:`~dsart.x2.corr.framer2x.frame_stream_block` on the host. Sinks:
+call. CUDA blocks are framed ON THE DEVICE (guarded rows included): the
+per-row steps / guard flags come to the host (small), the layout and headers
+are built there (numpy, vectorised), the payload rows are gathered into the
+datagram slots of a persistent device buffer and the whole buffer comes back
+in one D2H into pinned memory. Sinks:
 
 * :func:`build_mmsg_sender` -- ``transport.send_mmsg.MmsgSender``: a C
   pthread drains per-destination queues with ``sendmmsg``; ``submit`` is a
@@ -36,7 +35,7 @@ import numpy as np
 import torch
 
 from dsart.transport import prod_frame2 as f2
-from dsart.x2.corr.framer2x import FramedBlock, StreamFormat, frame_stream_block
+from dsart.x2.corr.framer2x import FramedBlock, StreamFormat, frame_stream_block, max_buffer_bytes
 
 LOG = logging.getLogger("dsart.x2.corr.tx2x")
 
@@ -90,97 +89,15 @@ class DrainSink:
         pass
 
 
-def _regular_layout(n_d: int, S: int, kk: int, bps: int):
-    """Byte layout of a regular block: per flow ``n_full`` datagrams of ``kk`` rows, then a
-    tail of ``rem`` rows; full datagrams of all flows first in the buffer, then the tails.
-    Returns (n_full, rem, dl_full, dl_tail, total, offsets, lengths, flow, j0, k) with the
-    per-datagram arrays in send order (flow by flow, rows ascending)."""
-    n_full, rem = divmod(S, kk)
-    dl_full = f2.HEADER_BYTES + kk * bps
-    dl_tail = f2.HEADER_BYTES + rem * bps
-    per = n_full + (1 if rem else 0)
-    flow = np.repeat(np.arange(n_d, dtype=np.int64), per)
-    i = np.tile(np.arange(per, dtype=np.int64), n_d)
-    j0 = i * kk
-    k = np.where(i < n_full, kk, rem).astype(np.int64)
-    off = np.where(i < n_full, (flow * n_full + i) * dl_full, n_d * n_full * dl_full + flow * dl_tail)
-    lengths = (f2.HEADER_BYTES + k * bps).astype(np.uint32)
-    total = n_d * n_full * dl_full + (n_d * dl_tail if rem else 0)
-    return n_full, rem, dl_full, dl_tail, total, off.astype(np.uint64), lengths, flow, j0, k
-
-
 def frame_regular_device(payload, step_main, step_heavy, *, fmt: StreamFormat, dms, seq_first: int,
                          t_int_factor: int, extra_flags: int = 0, dbuf=None, hbuf=None) -> FramedBlock:
-    """Device framing of a block whose every flow has one (step_main, step_heavy) and no guard:
-    ``payload`` torch uint8 ``(n_d, S, bps)`` (any device), ``step_*`` per flow ``(n_d,)``.
-    Byte-equal to :func:`frame_stream_block` (and the reference) for such blocks. ``dbuf`` /
-    ``hbuf``: optional persistent device / (pinned) host uint8 buffers of at least the total."""
-    from dsart.x2.corr.framer2x import HEADER_DTYPE, _EXTRA_OK, _validate_static  # noqa: PLC0415
-    n_d, S, bps = (int(x) for x in payload.shape)
-    if bps != fmt.bytes_per_sample:
-        raise ValueError(f"payload rows are {bps} B, the stream format needs {fmt.bytes_per_sample}")
-    if int(extra_flags) & ~_EXTRA_OK:
-        raise ValueError("extra_flags: only NOISE_WARMUP / RFI_WARMING_UP")
-    dms = np.asarray(dms, dtype=np.int64).reshape(-1)
-    _validate_static(fmt, t_int_factor, dms)
-    kk = fmt.max_k
-    n_full, rem, dl_full, dl_tail, total, offsets, lengths, flow, j0, k = _regular_layout(n_d, S, kk, bps)
-    sm = np.ascontiguousarray(np.asarray(step_main, np.float32).reshape(n_d))
-    sh = np.ascontiguousarray(np.asarray(step_heavy, np.float32).reshape(n_d))
-    n = flow.size
-    hdr = np.zeros(n, HEADER_DTYPE)
-    flags = np.full(n, f2.FLAG_QUANTIZED | int(extra_flags), np.uint16)
-    if fmt.n_heavy:
-        flags |= np.uint16(f2.FLAG_HEAVY_PRESENT)
-    flags[j0 + k == S] |= np.uint16(f2.FLAG_LAST_IN_BLOCK)
-    seq = int(seq_first) + j0
-    hdr["magic"] = f2.MAGIC
-    hdr["version"] = f2.VERSION
-    hdr["flags"] = flags
-    hdr["seq_first"] = seq
-    hdr["t0_native"] = seq * int(t_int_factor)
-    hdr["stream_id"] = fmt.stream_id
-    hdr["dm_idx"] = dms[flow]
-    hdr["k"] = k
-    hdr["n_sub"] = fmt.n_sub
-    hdr["bits_main"] = fmt.bits_main
-    hdr["bits_heavy"] = fmt.bits_heavy
-    hdr["n_grid"] = fmt.n_grid
-    hdr["t_int_factor"] = int(t_int_factor)
-    hdr["value_kind"] = fmt.value_kind
-    hdr["n_values"] = fmt.n_values
-    hdr["pattern_id"] = np.uint64(int(fmt.pattern_id) & 0xFFFF_FFFF_FFFF_FFFF)
-    hdr["n_heavy"] = fmt.n_heavy
-    hdr["step_main"] = sm[flow]
-    hdr["step_heavy"] = sh[flow]
-    hdr["payload_bytes"] = k * bps
-    hdr["s_main"] = np.float32(fmt.s_main)
-    hdr["s_heavy"] = np.float32(fmt.s_heavy)
-    dev = payload.device
-    if dbuf is None or dbuf.numel() < total:
-        dbuf = torch.empty(total, dtype=torch.uint8, device=dev)
-    db = dbuf[:total]
-    hb = torch.from_numpy(hdr.view(np.uint8).reshape(n, f2.HEADER_BYTES)).to(dev, non_blocking=True)
-    per = n_full + (1 if rem else 0)
-    hb = hb.reshape(n_d, per, f2.HEADER_BYTES)
-    if n_full:
-        full = db[: n_d * n_full * dl_full].view(n_d, n_full, dl_full)
-        full[:, :, f2.HEADER_BYTES:] = payload[:, : n_full * kk].reshape(n_d, n_full, kk * bps)
-        full[:, :, : f2.HEADER_BYTES] = hb[:, :n_full]
-    if rem:
-        tail = db[n_d * n_full * dl_full:].view(n_d, 1, dl_tail)
-        tail[:, :, f2.HEADER_BYTES:] = payload[:, n_full * kk:].reshape(n_d, 1, rem * bps)
-        tail[:, :, : f2.HEADER_BYTES] = hb[:, n_full:]
-    if db.is_cuda:
-        if hbuf is None or hbuf.numel() < total:
-            hbuf = torch.empty(total, dtype=torch.uint8, pin_memory=True)
-        hb_host = hbuf[:total]
-        hb_host.copy_(db, non_blocking=True)
-        torch.cuda.current_stream(dev).synchronize()
-        buf = hb_host.numpy()
-    else:
-        buf = db.numpy()
-    return FramedBlock(buf=buf, offsets=offsets, lengths=lengths, flow=flow, j0=j0, k=k)
+    """A block whose every flow has one (step_main, step_heavy) and no guard, framed with the
+    payload where it is (torch, any device): :func:`frame_stream_block` with per-flow steps."""
+    n_d, S = int(payload.shape[0]), int(payload.shape[1])
+    sm = np.repeat(np.asarray(step_main, np.float32).reshape(n_d, 1), S, axis=1)
+    sh = np.repeat(np.asarray(step_heavy, np.float32).reshape(n_d, 1), S, axis=1)
+    return frame_stream_block(payload, sm, sh, None, fmt=fmt, dms=dms, seq_first=seq_first,
+                              t_int_factor=t_int_factor, extra_flags=extra_flags, dbuf=dbuf, hbuf=hbuf)
 
 
 class FramedTx2x:
@@ -219,21 +136,18 @@ class FramedTx2x:
                 raise ValueError(f"stream {s}: id {stream_ids[s]} != format {fmt.stream_id}")
             t0 = time.perf_counter()
             pay = pk["payload"]
-            fb = None
-            if (self.device_framing and isinstance(pay, torch.Tensor) and pay.is_cuda
-                    and not bool(pk["guarded"].any())):
+            if self.device_framing and isinstance(pay, torch.Tensor) and pay.is_cuda:
                 key = (s, tuple(pay.shape))
                 if key not in self._dbuf:
-                    n_d, S, bps = (int(x) for x in pay.shape)
-                    n_b = _regular_layout(n_d, S, fmt.max_k, bps)[4]
+                    n_b = max_buffer_bytes(*(int(x) for x in pay.shape))
                     self._dbuf[key] = torch.empty(n_b, dtype=torch.uint8, device=pay.device)
                     self._hbuf[key] = torch.empty(n_b, dtype=torch.uint8, pin_memory=True)
-                fb = frame_regular_device(pay, pk["step_main"][:, 0].cpu().numpy(),
-                                          pk["step_heavy"][:, 0].cpu().numpy(), fmt=fmt,
-                                          dms=np.asarray(dms), seq_first=seq_first, t_int_factor=T,
-                                          extra_flags=extra, dbuf=self._dbuf[key], hbuf=self._hbuf[key])
+                fb = frame_stream_block(pay, _np(pk["step_main"]), _np(pk["step_heavy"]),
+                                        _np(pk["guarded"]) if "guarded" in pk else None, fmt=fmt,
+                                        dms=np.asarray(dms), seq_first=seq_first, t_int_factor=T,
+                                        extra_flags=extra, dbuf=self._dbuf[key], hbuf=self._hbuf[key])
                 self.n_device_framed += 1
-            if fb is None:
+            else:
                 fb = frame_stream_block(_np(pay), _np(pk["step_main"]), _np(pk["step_heavy"]),
                                         _np(pk["guarded"]) if "guarded" in pk else None, fmt=fmt,
                                         dms=np.asarray(dms), seq_first=seq_first, t_int_factor=T,

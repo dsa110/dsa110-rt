@@ -1785,6 +1785,9 @@ class StageTimer:
         self._order: list[str] = []
         self.n_blocks = 0
         self.n_dropped = 0
+        #: optional ``on_block(block_n, {stage: ms})`` called as each block is
+        #: harvested (diagnostics: the x2 per-block trace)
+        self.on_block = None
 
     # -- recording --------------------------------------------------------
 
@@ -1863,13 +1866,28 @@ class StageTimer:
                 break
             self._pending.pop(0)
             marks = rec["marks"]
+            per = {} if self.on_block is not None else None
             for (_, a), (name, b) in zip(marks[:-1], marks[1:]):
-                self._push(name, self._ms(a, b))
+                ms = self._ms(a, b)
+                self._push(name, ms)
+                if per is not None:
+                    per[name] = per.get(name, 0.0) + ms
             if len(marks) > 1:
-                self._push("block_gpu", self._ms(marks[0][1], marks[-1][1]))
+                ms = self._ms(marks[0][1], marks[-1][1])
+                self._push("block_gpu", ms)
+                if per is not None:
+                    per["block_gpu"] = ms
             for name, (a, b) in rec["spans"].items():
                 if b is not None:
-                    self._push(name, self._ms(a, b))
+                    ms = self._ms(a, b)
+                    self._push(name, ms)
+                    if per is not None:
+                        per[name] = ms
+            if per is not None:
+                try:
+                    self.on_block(rec["block_n"], per)
+                except Exception:  # noqa: BLE001 -- diagnostics must never break the loop
+                    LOG.exception("StageTimer.on_block failed (non-fatal)")
             self.n_blocks += 1
             n += 1
         return n
@@ -4008,6 +4026,39 @@ def _warmup_pipeline_jit(
     )
 
 
+def _prewarm_rfi_far(ctx) -> None:
+    """Solve the RFI flagger's bandpass / group FAR thresholds now (cached by
+    ``dsart.rfi.far_calibration``). The bandpass test is bypassed during the flagger's
+    warm-up, so without this its first use -- ~150 s into a run -- blocks the hot path for
+    ~7.4 s on a corr node (measured on n05, 2026-10-29). Same k, same masks: only the time
+    the cache is filled moves to start-up."""
+    fl = getattr(ctx, "rfi_flagger", None)
+    fl = getattr(fl, "_inner", fl)
+    if fl is None or not hasattr(fl, "_m_values"):
+        return
+    from dsart.rfi.far_calibration import bandpass_threshold_k, group_threshold_k
+    t0 = time.monotonic()
+    full_m = int(max(fl._m_values))
+    if getattr(fl, "_bandpass_k", None) is None:
+        bandpass_threshold_k(NCHAN_PER_CHGROUP, float(fl._bandpass_far), m_acc=full_m)
+    if getattr(fl, "_group_k", None) is None:
+        group_threshold_k(NANTS, float(fl._group_far), n_chan=NCHAN_PER_CHGROUP, m_acc=full_m)
+    LOG.info("RFI FAR thresholds pre-solved in %.1f s (M=%d)", time.monotonic() - t0, full_m)
+
+
+def check_x2_plan_id(plan, plan_id: str | None) -> None:
+    """SPEC §10: refuse to start when the loaded tiered plan is not the set's ``${plan_id}``
+    (hex, with or without ``0x``). ``None`` / empty = no check (development runs)."""
+    if not plan_id:
+        return
+    want = int(str(plan_id), 16)
+    got = int(plan.plan_id)
+    if got != want:
+        raise ValueError(f"tiered DM plan plan_id 0x{got:016x} != --plan-id 0x{want:016x}: "
+                         "the plan file is not the one this op-point set was rendered for")
+    LOG.info("x2 plan_id 0x%016x matches --plan-id", got)
+
+
 #: ``--transport-tx-mode`` values of the 2x op-points (frame v2).
 X2_TX_MODES: tuple[str, ...] = ("v2", "drain")
 
@@ -4099,6 +4150,7 @@ def run(
     x2_tx_bind_host: str = "",
     x2_tx_cpu: int = -1,
     x2_tx_pace: float = 1.25,
+    plan_id: str | None = None,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -4141,6 +4193,8 @@ def run(
             "--opoint 2x runs its own scheduler: drop --pipeliner-3s / "
             "--profile-stages-every (the StageTimer covers 2x)"
         )
+    if opoint == "1x" and plan_id:
+        raise ValueError("--plan-id names a 2x tiered plan (needs --opoint 2x-*)")
     if opoint == "1x" and transport_tx_mode in X2_TX_MODES:
         raise ValueError(f"--transport-tx-mode {transport_tx_mode} is a 2x mode (needs --opoint 2x-*)")
     if opoint != "1x" and transport_tx_mode not in X2_TX_MODES:
@@ -4206,6 +4260,7 @@ def run(
                 x2_plan = TieredDmPlan.from_npz(str(cfg.dm_plan_path), verify=True)
             else:
                 x2_plan = build_tiered_plan_for_opoint(x2_op)
+            check_x2_plan_id(x2_plan, plan_id)
             # nothing of the 1x stage-1 / stage-2 / TX stack is built in 2x
             cfg.dm_plan_path = None
             dm_plan = None
@@ -4873,6 +4928,10 @@ def run(
         # hot so the operator knows it is safe to utc_start.
         _publish_corr_fast_ready(rfi_mon_cn_id, ready=False, n_blocks=_warmup_n)
         _warmup_t0 = time.time()
+        try:
+            _prewarm_rfi_far(ctx)
+        except Exception:  # noqa: BLE001 -- the flagger solves it lazily as before
+            LOG.exception("RFI FAR pre-solve failed (non-fatal)")
         orch = None
         if x2_orch is not None:
             from dsart.x2.corr.pipeline1x import freeze_gc
@@ -4919,12 +4978,29 @@ def run(
                     ready_sentinel_path, e,
                 )
 
+        # x2 diagnostics: DSART_X2_BLOCK_TRACE=<path> writes one JSON line per block (host
+        # wall / page wait / orchestrator phases / host-pin and GC activity) and one per
+        # harvested GPU stage-timer block. Off by default; nothing here changes the data path.
+        _trace = None
+        _trace_path = os.environ.get("DSART_X2_BLOCK_TRACE", "")
+        if _trace_path:
+            import gc as _gc
+            import json as _json
+            from dsart.services import host_pin as _hp
+            _trace = open(_trace_path, "w", buffering=1)
+            if ctx.stage_timer is not None:
+                ctx.stage_timer.on_block = lambda b, d: _trace.write(_json.dumps(
+                    {"gpu_block": int(b), **{k: round(v, 3) for k, v in d.items()}}) + "\n")
+            _gc_prev = [g["collections"] for g in _gc.get_stats()]
+            _pin_prev = _hp.stats()
         while not state["stop"]:
+            _t_wait0 = time.monotonic()
             try:
                 page = reader.getNextPage()
             except StopIteration:
                 LOG.info("fada reader StopIteration (EOD)")
                 break
+            _wait_ms = (time.monotonic() - _t_wait0) * 1e3
             if reader.isEndOfData:
                 LOG.info("fada EOD flag set; draining final block")
             n_in += 1
@@ -4982,6 +5058,22 @@ def run(
 
             t_block_end = time.monotonic()
             per_block_ms.append((t_block_end - t_block_start) * 1000.0)
+            if _trace is not None:
+                _gc_now = [g["collections"] for g in _gc.get_stats()]
+                _pin_now = _hp.stats()
+                _rec = {"n": n_in, "wall_ms": round(per_block_ms[-1], 3), "wait_ms": round(_wait_ms, 3),
+                        "gc": [a - b for a, b in zip(_gc_now, _gc_prev)],
+                        "pin_new": _pin_now["register_new"] - _pin_prev["register_new"],
+                        "pin_ms": round(_pin_now["register_ms"] - _pin_prev["register_ms"], 3),
+                        "pin_unreg": _pin_now["finalizer_unregister"] - _pin_prev["finalizer_unregister"],
+                        "pin_force": _pin_now["force_clean"] - _pin_prev["force_clean"]}
+                if orch is not None and getattr(orch, "last_timing", None):
+                    _rec["host"] = {k: round(v, 3) for k, v in orch.last_timing.items()}
+                    _tx = getattr(orch, "tx2x", None)
+                    if _tx is not None and hasattr(_tx, "frame_s"):
+                        _rec["tx_frame_s"] = round(_tx.frame_s, 4)
+                _trace.write(_json.dumps(_rec) + "\n")
+                _gc_prev, _pin_prev = _gc_now, _pin_now
 
             # E2E test 1: periodic static-sky snapshot → h23 sky monitor.
             # Cheap monotonic compare per block; D2H + npz only on the
@@ -5491,6 +5583,9 @@ def main(argv: list[str] | None = None) -> int:
                         "2x corr chain (needs --t-int-fast-native 8 "
                         "--chan-sum-factor 2 --n-sub <2|4>; --dm-plan-path then "
                         "names a TieredDmPlan npz, else the plan is built).")
+    p.add_argument("--plan-id", default=None,
+                   help="2x: expected tiered-plan id (hex, the set's ${plan_id}); corr_fast "
+                        "refuses to start when the loaded plan differs (SPEC §10)")
     p.add_argument("--x2-tx-bind-host", default="",
                    help="2x TX: source IPv4 of the sender (the corr node's data "
                         "NIC); empty = any")
@@ -5858,6 +5953,7 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator=args.orchestrator,
             stage_timing=not args.no_stage_timing,
             opoint=args.opoint,
+            plan_id=args.plan_id,
             x2_tx_bind_host=args.x2_tx_bind_host,
             x2_tx_cpu=args.x2_tx_cpu,
             x2_tx_pace=args.x2_tx_pace,

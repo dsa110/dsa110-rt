@@ -71,7 +71,13 @@ CORR_NODES = (3, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 21, 22)
 #: the x2 TEST fada DADA key (replay only; production uses dada/eada/fada/bada)
 REPLAY_KEY = "d2f0"
 FADA_BYTES = 301989888
-FIXTURE_ROOTS = ("/home/ubuntu/data/voltage_fixtures", "/home/ubuntu/data/voltages")
+#: x2 scratch staging (G1: every corr node's own sub-band + the cal live at the event) first,
+#: then the M7.4 fixture trees
+FIXTURE_ROOTS = ("/home/ubuntu/x2_scratch/voltages", "/home/ubuntu/data/voltage_fixtures",
+                 "/home/ubuntu/data/voltages")
+#: array pointing (DEC phase centre) of fixtures whose manifest only carries the burst position
+#: (250924mptq: phase_center_dec 0.95249 rad; the manifest's 53.849 deg is the localisation)
+FIXTURE_POINTING_DEC_DEG = {"250924mptq": 54.5737}
 MAP_NAMES = {"gridded": "gridded", "baselines": "baselines"}
 PROD_CORR_FAST_RE = r"dsart[.]services[.]corr_fast_integration"
 
@@ -605,6 +611,13 @@ def _fixture_manifest(run_id: str) -> dict:
         return yaml.safe_load(fh)
 
 
+def _pointing_dec(run_id: str, man: dict, default: float) -> float:
+    """The array's DEC phase centre for a replay (not the burst position)."""
+    if "pointing_dec_deg" in man:
+        return float(man["pointing_dec_deg"])
+    return float(FIXTURE_POINTING_DEC_DEG.get(run_id, man.get("dec_deg", default)))
+
+
 def _run_blocks(mode: str, n_blocks: int, dev, dec: float, taps: dict | None, source=None,
                 cal: tuple | None = None, inject: bool = True):
     """Legacy loop or PipelinedCorrFast over the Pages (or a DadaSource); returns timings.
@@ -738,7 +751,7 @@ def cmd_replay_1x(args) -> int:
     man = _fixture_manifest(args.run_id)
     cal = _fixture_cal(args.run_id)
     _, chgroup = _cn_chgroup()
-    dec = float(man.get("dec_deg", args.dec))
+    dec = _pointing_dec(args.run_id, man, args.dec)
     os.makedirs(args.out, exist_ok=True)
     res: dict = {"run_id": args.run_id, "chgroup": chgroup, "dec_deg": dec, "key": REPLAY_KEY,
                  "file": _fixture_file(args.run_id, chgroup),
@@ -1089,6 +1102,53 @@ def cmd_live(args) -> int:
     return _finish(args.out, "live_2x.json", res, gates)
 
 
+def trace_summary(path: str, skip: int = 32) -> dict:
+    """Wall-time histogram of a DSART_X2_BLOCK_TRACE file and what the slow blocks have in
+    common: host records ``n`` (push of page n = issue of block n-1 + TX of block n-2) joined
+    with the GPU stage record of block n-1."""
+    host, gpu = {}, {}
+    with open(path) as fh:
+        for line in fh:
+            r = json.loads(line)
+            if "gpu_block" in r:
+                gpu[r["gpu_block"]] = r
+            else:
+                host[r["n"]] = r
+    ns = sorted(n for n in host if n > skip)
+    if not ns:
+        return {}
+    wall = np.array([host[n]["wall_ms"] for n in ns])
+    edges = [0, 50, 60, 70, 80, 90, 100, 110, 120, 134.218, 1e9]
+    hist = np.histogram(wall, bins=edges)[0].tolist()
+    out = {"n_blocks": len(ns), "edges_ms": edges[:-1], "hist": hist,
+           "p50": float(np.percentile(wall, 50)), "p90": float(np.percentile(wall, 90)),
+           "p99": float(np.percentile(wall, 99)), "p999": float(np.percentile(wall, 99.9)),
+           "max": float(wall.max()), "mean": float(wall.mean())}
+
+    def profile(sel):
+        rows = [host[n] for n in sel]
+        g = [gpu.get(n - 1, {}) for n in sel]
+        d = {"n": len(rows), "wall": float(np.mean([r["wall_ms"] for r in rows])),
+             "gc2": float(np.mean([r["gc"][2] for r in rows])), "gc1": float(np.mean([r["gc"][1] for r in rows])),
+             "pin_new": float(np.mean([r["pin_new"] for r in rows])),
+             "pin_ms": float(np.mean([r["pin_ms"] for r in rows]))}
+        for k in ("stage", "issue", "emit", "release"):
+            v = [r["host"][k] for r in rows if "host" in r]
+            if v:
+                d[f"host_{k}"] = float(np.mean(v))
+        for k in sorted({k for x in g for k in x if k != "gpu_block"}):
+            v = [x[k] for x in g if k in x]
+            if v:
+                d[f"gpu_{k}"] = float(np.mean(v))
+        return d
+    slow = [n for n in ns if host[n]["wall_ms"] > 100.0]
+    fast = [n for n in ns if host[n]["wall_ms"] <= np.percentile(wall, 50)]
+    out["slow_gt100"] = profile(slow) if slow else {}
+    out["typical_le_p50"] = profile(fast)
+    out["slow_blocks"] = slow[:50]
+    return out
+
+
 def _live_on_replay(args, argv: list, n_blocks: int) -> int:
     """``live`` fed by the replay writer through the TEST DADA buffer (no SNAPs): corr_fast's own
     main/run on key REPLAY_KEY with the fixture's cal; block-time gates as live, plus the writer
@@ -1097,7 +1157,7 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
     man = _fixture_manifest(args.replay)
     cal = _fixture_cal(args.replay)
     _, chgroup = _cn_chgroup()
-    dec = float(man.get("dec_deg", args.dec))
+    dec = _pointing_dec(args.replay, man, args.dec)
     argv = [a for a in argv]
     sets = [("--fada-key", REPLAY_KEY), ("--obs-dec-deg", str(dec))]
     if cal:
@@ -1110,6 +1170,9 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
     os.makedirs(args.out, exist_ok=True)
     cap: dict = {}
     real = cfi.run
+    trace = os.path.join(args.out, "block_trace.jsonl") if args.trace else None
+    if trace:
+        os.environ["DSART_X2_BLOCK_TRACE"] = trace
 
     def run_and_keep(*a, **kw):
         cap["summary"] = real(*a, **kw)
@@ -1149,7 +1212,10 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
                     w.kill()
             w.wait(timeout=60)
     s = cap.get("summary") or {}
+    if trace:
+        os.environ.pop("DSART_X2_BLOCK_TRACE", None)
     res = {"opoint": args.opoint, "argv": argv, "rc": rc, "summary": s, "replay": args.replay,
+           "trace": trace_summary(trace) if trace and os.path.exists(trace) else None,
            "writer": _writer_summary(log), "max_nfull": max((nf for _, nf, _ in samples), default=None),
            "nbufs": samples[0][2] if samples else None}
     if rc != 0 or not s:
@@ -1222,6 +1288,8 @@ def main(argv=None) -> int:
     p.add_argument("--minutes", type=float, default=20.0)
     p.add_argument("--tx", default="drain")
     p.add_argument("--reader-identity", default="corr_fast")
+    p.add_argument("--trace", action="store_true",
+                   help="per-block host/GPU trace (DSART_X2_BLOCK_TRACE) + wall histogram in the JSON")
     p.add_argument("--replay", default=None,
                    help="fixture run id: feed corr_fast from the replay writer via the test DADA "
                         f"buffer 0x{REPLAY_KEY} instead of the node's fada")

@@ -14,9 +14,12 @@ Output is what ``MmsgSender.submit`` takes: one contiguous ``uint8`` buffer
 plus per-datagram ``offsets`` / ``lengths``, listed flow by flow in row
 order (``dms`` order, then ascending rows) so the receiver sees every flow in
 sequence. Datagrams of equal k are laid out together in the buffer (one
-strided copy per k, headers from a structured array), so the regular case
+row gather per k, headers from a structured array), so the regular case
 (no guarded rows) costs two copies per stream: the full-k datagrams and the
-per-flow tails.
+per-flow tails. The payload may be a numpy array (host assembly) or a torch
+tensor on a device: then the layout and headers are computed on the host
+from the small per-row step / guard arrays, the buffer is assembled on the
+device and comes back in one copy (pinned ``hbuf`` on CUDA).
 """
 from __future__ import annotations
 
@@ -109,18 +112,20 @@ class FramedBlock:
         return [b[int(o): int(o) + int(n)].tobytes() for o, n in zip(self.offsets, self.lengths)]
 
 
-def frame_stream_block(payload: np.ndarray, step_main: np.ndarray, step_heavy: np.ndarray,
+def frame_stream_block(payload, step_main: np.ndarray, step_heavy: np.ndarray,
                        guarded: np.ndarray | None, *, fmt: StreamFormat, dms, seq_first: int,
-                       t_int_factor: int, extra_flags: int = 0, k: int | None = None) -> FramedBlock:
+                       t_int_factor: int, extra_flags: int = 0, k: int | None = None,
+                       dbuf=None, hbuf=None) -> FramedBlock:
     """Frame ``payload`` uint8 ``(n_d, S, bytes_per_sample)`` (flow ``i`` = DM
     ``dms[i]`` of stream ``fmt.stream_id``) with per-row steps ``(n_d, S)``
     float32 (or ``(n_d,)`` / scalars) and the per-row guard ``(n_d, S)``.
     ``seq_first`` is the tier-clock row of row 0 (``t0_native = seq *
     t_int_factor``)."""
-    pay = np.ascontiguousarray(payload, dtype=np.uint8)
+    on_device = not isinstance(payload, np.ndarray) and hasattr(payload, "device")
+    pay = payload if on_device else np.ascontiguousarray(payload, dtype=np.uint8)
     if pay.ndim != 3:
-        raise ValueError(f"payload must be (n_d, S, bps), got {pay.shape}")
-    n_d, S, bps = pay.shape
+        raise ValueError(f"payload must be (n_d, S, bps), got {tuple(pay.shape)}")
+    n_d, S, bps = (int(x) for x in pay.shape)
     if bps != fmt.bytes_per_sample:
         raise ValueError(f"payload rows are {bps} B, the stream format needs {fmt.bytes_per_sample}")
     dms = np.asarray(dms, dtype=np.int64).reshape(-1)
@@ -194,9 +199,14 @@ def frame_stream_block(payload: np.ndarray, step_main: np.ndarray, step_heavy: n
     hdr["s_heavy"] = np.float32(fmt.s_heavy)
     _validate_static(fmt, t_int_factor, dms)
 
-    # ---- buffer: groups of equal k, one strided copy each
+    # ---- buffer: groups of equal k, one row gather each
     lengths = (f2.HEADER_BYTES + kdg * bps).astype(np.uint32)
     offsets = np.zeros(n, np.uint64)
+    if on_device:
+        buf = _assemble_device(pay, hdr, flat0, kdg, n_d, S, bps, offsets, dbuf, hbuf,
+                               int(lengths.sum(dtype=np.int64)))
+        return FramedBlock(buf=buf, offsets=offsets, lengths=lengths, flow=flow.astype(np.int64),
+                           j0=j0.astype(np.int64), k=kdg.astype(np.int64))
     buf = np.empty(int(lengths.sum(dtype=np.int64)), np.uint8)
     rows2 = pay.reshape(n_d * S, bps)
     hdr_u8 = hdr.view(np.uint8).reshape(n, f2.HEADER_BYTES)
@@ -216,6 +226,51 @@ def frame_stream_block(payload: np.ndarray, step_main: np.ndarray, step_heavy: n
         pos += sel.size * dlen
     return FramedBlock(buf=buf, offsets=offsets, lengths=lengths, flow=flow.astype(np.int64),
                        j0=j0.astype(np.int64), k=kdg.astype(np.int64))
+
+
+def max_buffer_bytes(n_d: int, S: int, bps: int) -> int:
+    """Upper bound of a block's datagram bytes (every row its own datagram)."""
+    return int(n_d) * int(S) * (f2.HEADER_BYTES + int(bps))
+
+
+def _assemble_device(pay, hdr, flat0, kdg, n_d, S, bps, offsets, dbuf, hbuf, total):
+    """The same group layout as the host path, assembled on the payload's device; returns
+    the host numpy buffer (via pinned ``hbuf`` on CUDA)."""
+    import torch  # noqa: PLC0415
+    dev = pay.device
+    if dbuf is None or dbuf.numel() < total:
+        dbuf = torch.empty(max(total, 1), dtype=torch.uint8, device=dev)
+    db = dbuf[:total]
+    rows2 = pay.reshape(n_d * S, bps)
+    hdr_t = torch.from_numpy(hdr.view(np.uint8).reshape(-1, f2.HEADER_BYTES)).to(dev, non_blocking=True)
+    pos = 0
+    for kv in np.unique(kdg):
+        kv = int(kv)
+        sel = np.flatnonzero(kdg == kv)
+        dlen = f2.HEADER_BYTES + kv * bps
+        g = db[pos: pos + sel.size * dlen].view(sel.size, dlen)
+        sel_t = torch.from_numpy(sel).to(dev, non_blocking=True)
+        g[:, : f2.HEADER_BYTES] = hdr_t.index_select(0, sel_t)
+        f0 = flat0[sel]
+        if (n_d * S) % kv == 0 and not np.any(f0 % kv):
+            src = rows2.reshape(-1, kv * bps)
+            if sel.size == src.shape[0]:
+                g[:, f2.HEADER_BYTES:] = src                       # every datagram full: a copy
+            else:
+                g[:, f2.HEADER_BYTES:] = src.index_select(0, torch.from_numpy(f0 // kv).to(dev))
+        else:
+            idx = torch.from_numpy((f0[:, None] + np.arange(kv)[None, :]).reshape(-1)).to(dev)
+            g[:, f2.HEADER_BYTES:] = rows2.index_select(0, idx).view(sel.size, kv * bps)
+        offsets[sel] = pos + np.arange(sel.size, dtype=np.uint64) * np.uint64(dlen)
+        pos += sel.size * dlen
+    if db.is_cuda:
+        if hbuf is None or hbuf.numel() < total:
+            hbuf = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=True)
+        hb = hbuf[:total]
+        hb.copy_(db, non_blocking=True)
+        torch.cuda.current_stream(dev).synchronize()
+        return hb.numpy()
+    return db.numpy()
 
 
 def _validate_static(fmt: StreamFormat, t_int_factor: int, dms: np.ndarray) -> None:

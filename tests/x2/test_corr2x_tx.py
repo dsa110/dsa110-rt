@@ -93,6 +93,10 @@ def test_framer_equals_reference(case) -> None:
     assert len(got) == len(want)
     for a, b in zip(got, want):
         assert a == b
+    # device assembly (torch payload; here on the CPU: the same torch ops as on CUDA)
+    fb_t = frame_stream_block(torch.from_numpy(pay), sm, sh, gd, fmt=fmt, dms=dms, seq_first=7 * S,
+                              t_int_factor=16, extra_flags=extra, k=k)
+    assert fb_t.datagrams() == want
     assert int(fb.lengths.max()) <= f2.HEADER_BYTES + f2.MAX_PAYLOAD_BYTES
     # the buffer holds every datagram exactly once
     spans = sorted(zip(fb.offsets.tolist(), fb.lengths.tolist()))
