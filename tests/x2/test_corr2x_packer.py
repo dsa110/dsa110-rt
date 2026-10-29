@@ -576,3 +576,23 @@ def test_static_sky_and_v1_gpu_equals_cpu() -> None:
     q1, s1 = pack_v1(x)
     q2, s2 = pack_v1(x.cuda())
     assert torch.equal(q1, q2.cpu()) and torch.equal(s1, s2.cpu())
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+def test_sky_subtraction_kernel_equals_the_torch_twin() -> None:
+    """The fused CUDA kernel (x -= sky except where x == 0 + 0i) == the torch twin bit for
+    bit, including excised rows / values / components of signed zero and a partial last block."""
+    from dsart.x2.corr.static_sky2x import subtract_sky_keep_zeros_
+    rng = np.random.default_rng(9)
+    n_d, S, V = 4, 37, 1201
+    x = (rng.normal(size=(n_d, S, V)) + 1j * rng.normal(size=(n_d, S, V))).astype(np.complex64)
+    x[1, 3:9] = 0
+    x[2, :, 17] = 0
+    x[0, 5, 6] = complex(0.0, 1.5)                         # re 0, im non-zero: subtracted
+    x[3, 7, 8] = complex(-0.0, -0.0)                       # signed zero: stays
+    sky = (rng.normal(size=(n_d, V)) + 1j * rng.normal(size=(n_d, V))).astype(np.complex64)
+    a = subtract_sky_keep_zeros_(torch.from_numpy(x.copy()), torch.from_numpy(sky))
+    b = subtract_sky_keep_zeros_(torch.from_numpy(x.copy()).cuda(), torch.from_numpy(sky).cuda()).cpu()
+    assert torch.equal(torch.view_as_real(a), torch.view_as_real(b))
+    assert (b[1, 3:9] == 0).all() and (b[2, :, 17] == 0).all()

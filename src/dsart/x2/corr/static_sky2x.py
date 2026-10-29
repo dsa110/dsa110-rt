@@ -23,11 +23,49 @@ of the same code is the twin; ``tests/x2/test_corr2x_static_sky.py``
 checks it against ``StaticSkyMean`` per DM and against the float64
 reference.
 """
-from __future__ import annotations
-
 import torch
+import triton
+import triton.language as tl
 
-__all__ = ["BatchedStaticSky"]
+# NB: no ``from __future__ import annotations`` (Triton constexpr annotations).
+
+__all__ = ["BatchedStaticSky", "subtract_sky_keep_zeros_"]
+
+
+@triton.jit
+def _sub_sky_kernel(x_ptr, sky_ptr, S, V, BLOCK_V: tl.constexpr):
+    """Program (row = d * S + j, value block): ``x -= sky[d]`` per component, except where the
+    complex value is exactly 0 + 0i (excised), which stays 0. One read + one write of x."""
+    row = tl.program_id(0)
+    vb = tl.program_id(1)
+    d = row // S
+    v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+    mv = v < V
+    xb = x_ptr + row * (2 * V) + 2 * v
+    sb = sky_ptr + d * (2 * V) + 2 * v
+    xr = tl.load(xb, mask=mv, other=0.0)
+    xi = tl.load(xb + 1, mask=mv, other=0.0)
+    sr = tl.load(sb, mask=mv, other=0.0)
+    si = tl.load(sb + 1, mask=mv, other=0.0)
+    nz = (xr != 0.0) | (xi != 0.0)
+    tl.store(xb, tl.where(nz, xr - sr, xr), mask=mv)
+    tl.store(xb + 1, tl.where(nz, xi - si, xi), mask=mv)
+
+
+def subtract_sky_keep_zeros_(x: torch.Tensor, sky: torch.Tensor, *, block_v: int = 512) -> torch.Tensor:
+    """In place: ``x (n_d, S, V)`` complex64 minus ``sky (n_d, V)`` wherever ``x != 0``. CUDA
+    + contiguous: one fused Triton pass (the torch.where twin below needs a full-size temporary
+    and cost ~2-3 ms a block at 2x); otherwise the torch twin (same IEEE subtraction)."""
+    if x.is_cuda and x.is_contiguous() and x.dtype == torch.complex64:
+        n_d, S, V = x.shape
+        sk = sky.to(torch.complex64).contiguous()
+        if n_d * S * V:
+            grid = (n_d * S, triton.cdiv(V, block_v))
+            _sub_sky_kernel[grid](torch.view_as_real(x), torch.view_as_real(sk), S, V,
+                                  BLOCK_V=block_v, enable_fp_fusion=False)
+        return x
+    sk = sky.unsqueeze(1)
+    return x.sub_(torch.where(x != 0, sk, torch.zeros_like(sk)))
 
 
 class BatchedStaticSky:
@@ -65,8 +103,7 @@ class BatchedStaticSky:
             raise ValueError(f"x shape {tuple(x.shape)} != (n_d, n_t, {tuple(self.sum.shape)[1]})")
         mean = x.mean(dim=1)                                        # (n_d, V)
         if self.count > 0 and self.seen >= self.warmup_cubes:
-            sky = (self.sum / self.count).unsqueeze(1)
-            x.sub_(torch.where(x != 0, sky, torch.zeros_like(sky)))  # excised stays 0
+            subtract_sky_keep_zeros_(x, self.sum / self.count)       # excised stays 0
         if self.count == self.window_blocks:
             self.sum.sub_(self.ring[self.head])
         else:
