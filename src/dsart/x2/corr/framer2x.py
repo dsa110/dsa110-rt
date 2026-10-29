@@ -115,12 +115,19 @@ class FramedBlock:
 def frame_stream_block(payload, step_main: np.ndarray, step_heavy: np.ndarray,
                        guarded: np.ndarray | None, *, fmt: StreamFormat, dms, seq_first: int,
                        t_int_factor: int, extra_flags: int = 0, k: int | None = None,
-                       dbuf=None, hbuf=None) -> FramedBlock:
+                       dbuf=None, hbuf=None, sbuf=None, sync: bool = True) -> FramedBlock:
     """Frame ``payload`` uint8 ``(n_d, S, bytes_per_sample)`` (flow ``i`` = DM
     ``dms[i]`` of stream ``fmt.stream_id``) with per-row steps ``(n_d, S)``
     float32 (or ``(n_d,)`` / scalars) and the per-row guard ``(n_d, S)``.
     ``seq_first`` is the tier-clock row of row 0 (``t0_native = seq *
-    t_int_factor``)."""
+    t_int_factor``).
+
+    A device ``payload`` is framed on its device: ``dbuf`` (device) / ``hbuf``
+    (pinned host) hold the datagram bytes, ``sbuf`` (pinned host) stages the
+    headers and gather indices for ONE host-to-device copy. ``sync=False``
+    leaves the device-to-host copy in flight on the current stream: the caller
+    must synchronise that stream before reading ``.buf`` (several streams of a
+    tier then share one sync)."""
     on_device = not isinstance(payload, np.ndarray) and hasattr(payload, "device")
     pay = payload if on_device else np.ascontiguousarray(payload, dtype=np.uint8)
     if pay.ndim != 3:
@@ -204,7 +211,7 @@ def frame_stream_block(payload, step_main: np.ndarray, step_heavy: np.ndarray,
     offsets = np.zeros(n, np.uint64)
     if on_device:
         buf = _assemble_device(pay, hdr, flat0, kdg, n_d, S, bps, offsets, dbuf, hbuf,
-                               int(lengths.sum(dtype=np.int64)))
+                               int(lengths.sum(dtype=np.int64)), sbuf=sbuf, sync=sync)
         return FramedBlock(buf=buf, offsets=offsets, lengths=lengths, flow=flow.astype(np.int64),
                            j0=j0.astype(np.int64), k=kdg.astype(np.int64))
     buf = np.empty(int(lengths.sum(dtype=np.int64)), np.uint8)
@@ -233,42 +240,86 @@ def max_buffer_bytes(n_d: int, S: int, bps: int) -> int:
     return int(n_d) * int(S) * (f2.HEADER_BYTES + int(bps))
 
 
-def _assemble_device(pay, hdr, flat0, kdg, n_d, S, bps, offsets, dbuf, hbuf, total):
+def staging_bytes(n_d: int, S: int) -> int:
+    """Upper bound of :func:`_assemble_device`'s staged headers + int64 indices."""
+    n = int(n_d) * int(S)
+    return n * f2.HEADER_BYTES + 8 + 3 * 8 * n
+
+
+def _assemble_device(pay, hdr, flat0, kdg, n_d, S, bps, offsets, dbuf, hbuf, total, *,
+                     sbuf=None, sync: bool = True):
     """The same group layout as the host path, assembled on the payload's device; returns
-    the host numpy buffer (via pinned ``hbuf`` on CUDA)."""
+    the host numpy buffer (via pinned ``hbuf`` on CUDA). Headers and gather indices go up
+    in one copy through ``sbuf`` (pinned on CUDA, so the copy is truly asynchronous); with
+    ``sync=False`` the device-to-host copy is left in flight on the current stream."""
     import torch  # noqa: PLC0415
     dev = pay.device
+    cuda = dev.type == "cuda"
     if dbuf is None or dbuf.numel() < total:
         dbuf = torch.empty(max(total, 1), dtype=torch.uint8, device=dev)
     db = dbuf[:total]
     rows2 = pay.reshape(n_d * S, bps)
-    hdr_t = torch.from_numpy(hdr.view(np.uint8).reshape(-1, f2.HEADER_BYTES)).to(dev, non_blocking=True)
-    pos = 0
+    # ---- host plan: per group of equal k, (sel, gather) int64 arrays; one staged upload
+    n = int(hdr.shape[0])
+    hb_len = n * f2.HEADER_BYTES
+    o = (hb_len + 7) // 8 * 8
+    plan = []
+    arrays = []
     for kv in np.unique(kdg):
         kv = int(kv)
         sel = np.flatnonzero(kdg == kv)
-        dlen = f2.HEADER_BYTES + kv * bps
-        g = db[pos: pos + sel.size * dlen].view(sel.size, dlen)
-        sel_t = torch.from_numpy(sel).to(dev, non_blocking=True)
-        g[:, : f2.HEADER_BYTES] = hdr_t.index_select(0, sel_t)
         f0 = flat0[sel]
         if (n_d * S) % kv == 0 and not np.any(f0 % kv):
+            gat = None if sel.size == (n_d * S) // kv else (f0 // kv)
+            kind = "regular"
+        else:
+            gat = (f0[:, None] + np.arange(kv)[None, :]).reshape(-1)
+            kind = "rows"
+        ent = {"kv": kv, "sel": sel, "kind": kind, "sel_o": o, "gat_o": None, "gat_n": 0}
+        arrays.append((o, sel))
+        o += 8 * sel.size
+        if gat is not None:
+            ent["gat_o"], ent["gat_n"] = o, int(gat.size)
+            arrays.append((o, gat))
+            o += 8 * gat.size
+        plan.append(ent)
+    n_stage = o
+    if sbuf is None or sbuf.numel() < n_stage:
+        sbuf = torch.empty(max(n_stage, 8), dtype=torch.uint8, pin_memory=cuda)
+    sb = sbuf[:n_stage].numpy()
+    sb[:hb_len] = hdr.view(np.uint8).reshape(-1)
+    for off, arr in arrays:
+        sb[off: off + 8 * arr.size].view(np.int64)[:] = arr
+    st = sbuf[:n_stage].to(dev, non_blocking=True) if cuda else sbuf[:n_stage]
+    hdr_t = st[:hb_len].view(n, f2.HEADER_BYTES)
+
+    def i64(off, cnt):
+        return st[off: off + 8 * cnt].view(torch.int64)
+
+    pos = 0
+    for ent in plan:
+        kv, sel = ent["kv"], ent["sel"]
+        dlen = f2.HEADER_BYTES + kv * bps
+        g = db[pos: pos + sel.size * dlen].view(sel.size, dlen)
+        g[:, : f2.HEADER_BYTES] = hdr_t.index_select(0, i64(ent["sel_o"], sel.size))
+        if ent["kind"] == "regular":
             src = rows2.reshape(-1, kv * bps)
-            if sel.size == src.shape[0]:
+            if ent["gat_o"] is None:
                 g[:, f2.HEADER_BYTES:] = src                       # every datagram full: a copy
             else:
-                g[:, f2.HEADER_BYTES:] = src.index_select(0, torch.from_numpy(f0 // kv).to(dev))
+                g[:, f2.HEADER_BYTES:] = src.index_select(0, i64(ent["gat_o"], ent["gat_n"]))
         else:
-            idx = torch.from_numpy((f0[:, None] + np.arange(kv)[None, :]).reshape(-1)).to(dev)
-            g[:, f2.HEADER_BYTES:] = rows2.index_select(0, idx).view(sel.size, kv * bps)
+            g[:, f2.HEADER_BYTES:] = rows2.index_select(
+                0, i64(ent["gat_o"], ent["gat_n"])).view(sel.size, kv * bps)
         offsets[sel] = pos + np.arange(sel.size, dtype=np.uint64) * np.uint64(dlen)
         pos += sel.size * dlen
-    if db.is_cuda:
+    if cuda:
         if hbuf is None or hbuf.numel() < total:
             hbuf = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=True)
         hb = hbuf[:total]
         hb.copy_(db, non_blocking=True)
-        torch.cuda.current_stream(dev).synchronize()
+        if sync:
+            torch.cuda.current_stream(dev).synchronize()
         return hb.numpy()
     return db.numpy()
 

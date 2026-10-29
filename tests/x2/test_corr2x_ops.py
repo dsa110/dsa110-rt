@@ -21,6 +21,35 @@ import torch
 import dsart.services.corr_fast_integration as cfi
 
 
+@pytest.mark.parametrize("layout", ["cal_solutions", "top_level"])
+def test_cal_yaml_antenna_order_both_layouts(tmp_path, monkeypatch, layout) -> None:
+    """Today's per-node yaml (``cal_solutions: {antenna_order}``) and the 2025-era
+    beamformer_weights_<utc>.yaml (``antenna_order`` at the top level, the cal live for
+    250924mptq) give the same station numbers to both readers. The order is permuted so a
+    silent fall-back to the fleet order would be caught."""
+    import numpy as np
+    import yaml
+
+    import dsart.cal.bf_weights as bw
+    from dsart.grid.sparsity_pattern import core_baseline_mask_from_station_numbers
+    fleet = cfi.load_fleet_antenna_order()
+    assert fleet is not None
+    order = [int(x) for x in np.asarray(fleet)[::-1]]
+    body = {"antenna_order": order, "caltime": 60939.17, "flagged_antennas": [], "delays": [0] * len(order)}
+    doc = {"cal_solutions": body} if layout == "cal_solutions" else body
+    (tmp_path / "beamformer_weights_2025-09-21T03:58:36.yaml").write_text(yaml.safe_dump(doc))
+    dat = tmp_path / "beamformer_weights_sb02.dat"
+    dat.write_bytes(b"")
+    z = np.zeros(len(order), np.float32)
+    monkeypatch.setattr(bw, "load_bf_weights", lambda p: SimpleNamespace(antpos_e=z, antpos_n=z))
+    assert cfi.cal_yaml_antenna_order(doc) == order
+    _, _, mask = cfi.load_antpos_from_cal_blob(dat)
+    want = core_baseline_mask_from_station_numbers(order)
+    assert np.array_equal(mask, want)
+    assert not np.array_equal(want, core_baseline_mask_from_station_numbers(list(fleet)))
+    assert np.array_equal(cfi.load_station_numbers_for_cal(dat), np.asarray(order, np.int64))
+
+
 def test_plan_id_check() -> None:
     plan = SimpleNamespace(plan_id=0x1234ABCD)
     cfi.check_x2_plan_id(plan, None)
@@ -43,6 +72,12 @@ def test_plan_id_reaches_run(monkeypatch) -> None:
               "--transport-tx-mode", "drain", "--plan-id", "0xdeadbeef", "--max-blocks", "1",
               "--output-dir", "/tmp/dsart-x2-ws-corr-never"])
     assert cap["plan_id"] == "0xdeadbeef" and cap["opoint"] == "2x-gridded-ns2-cint4"
+    assert cap["x2_tx_burst_bytes"] == 16384 and cap["x2_tx_pace"] == 1.25
+    cfi.main(["--chgroup", "1", "--obs-dec-deg", "54.57", "--opoint", "2x-gridded-ns4-cint4",
+              "--t-int-fast-native", "8", "--chan-sum-factor", "2", "--n-sub", "4",
+              "--transport-tx-mode", "drain", "--x2-tx-burst-bytes", "65536", "--max-blocks", "1",
+              "--output-dir", "/tmp/dsart-x2-ws-corr-never"])
+    assert cap["x2_tx_burst_bytes"] == 65536
 
 
 def test_rfi_far_thresholds_solved_at_startup(monkeypatch) -> None:
@@ -62,21 +97,73 @@ def test_rfi_far_thresholds_solved_at_startup(monkeypatch) -> None:
     cfi._prewarm_rfi_far(SimpleNamespace(rfi_flagger=None))
 
 
+def _psrdada_like_page(m):
+    """What psrdada's Reader.getNextPage returns: a READ-ONLY owner-less memoryview
+    (PyMemoryView_FromMemory(ptr, size, PyBUF_READ)) over shared memory."""
+    import ctypes
+    f = ctypes.pythonapi.PyMemoryView_FromMemory
+    f.restype, f.argtypes = ctypes.py_object, [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int]
+    addr = ctypes.addressof((ctypes.c_char * len(m)).from_buffer(m))
+    return f(addr, len(m), 0x100)                                # PyBUF_READ
+
+
+def test_host_pin_eligibility(tmp_path) -> None:
+    """Pinned: PSRDADA pages (read-only owner-less views of shm), writable buffers, read-only
+    views of numpy memory. Never: file-backed np.memmap, or read-only memory owned by another
+    Python object -- the I2 replay's np.frombuffer(f.read(...)) pages."""
+    import mmap
+
+    import numpy as np
+
+    from dsart.services import host_pin as hp
+    m = mmap.mmap(-1, 1 << 16)
+    page = _psrdada_like_page(m)
+    assert page.readonly and page.obj is None
+    arr = np.asarray(page)
+    assert not arr.flags["WRITEABLE"]
+    assert hp._pin_eligible(arr) and hp._pin_eligible(page) and hp._pin_eligible(arr[:100])
+    assert not hp._pin_eligible(np.frombuffer(bytes(4096), np.uint8))       # the I2 page
+    assert not hp._pin_eligible(memoryview(bytes(64)))
+    assert hp._pin_eligible(np.frombuffer(m, np.uint8))                     # writable shm ring
+    own = np.zeros(64, np.uint8)
+    assert hp._pin_eligible(own)
+    v = own[:8]
+    v.flags["WRITEABLE"] = False
+    assert hp._pin_eligible(v)                                              # numpy-owned memory
+    mm = np.memmap(tmp_path / "v.out", dtype=np.uint8, mode="w+", shape=(64,))
+    assert not hp._pin_eligible(mm) and not hp._pin_eligible(mm[:8])
+    ro = np.memmap(tmp_path / "v.out", dtype=np.uint8, mode="r", shape=(64,))
+    assert not hp._pin_eligible(ro)
+
+
 _PIN = r"""
-import gc, mmap, numpy as np
+import ctypes, gc, mmap, numpy as np, torch
 from dsart.services import host_pin as hp
-m = mmap.mmap(-1, 64 << 20)                              # a shm-like mapping numpy does not own
+m = mmap.mmap(-1, 64 << 20)                              # shm-like memory numpy does not own
+f = ctypes.pythonapi.PyMemoryView_FromMemory
+f.restype, f.argtypes = ctypes.py_object, [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int]
+addr = ctypes.addressof((ctypes.c_char * len(m)).from_buffer(m))
 for _ in range(6):
-    page = np.frombuffer(m, dtype=np.uint8)              # a fresh wrapper per block, like np.asarray(page)
-    assert hp.maybe_register_host_buffer(page)
+    page = np.asarray(f(addr, len(m), 0x100))            # a fresh read-only wrapper per block, as
+    assert hp.maybe_register_host_buffer(page)           # np.asarray(reader.getNextPage())
     del page
     gc.collect()
 own = np.zeros(32 << 20, np.uint8)                      # numpy-owned: keeps the finalizer path
 assert hp.maybe_register_host_buffer(own)
 del own
 gc.collect()
+for _ in range(3):                                      # the I2 replay's bytes pages: never pinned
+    assert not hp.maybe_register_host_buffer(np.frombuffer(bytes(16 << 20), np.uint8))
+# a failed runtime call (unregistering memory that is not registered) must not leave its error
+# for torch's next kernel-launch check
+junk = np.zeros(1 << 20, np.uint8)
+hp._make_unregister_finalizer(int(junk.ctypes.data), junk.nbytes, key=-1)()
+x = torch.ones(1 << 10, device="cuda")
+assert float((x * 2).sum()) == 2048.0
+torch.cuda.synchronize()
 s = hp.stats()
-print("STATS", s["register_new"], s["finalizer_unregister"], s["force_clean"])
+assert s["skipped_ineligible"] == 3 and s["cuda_errors_cleared"] >= 1, s
+print("STATS", s["register_new"], s["finalizer_unregister"] - 1, s["force_clean"], len(hp._FINALIZERS))
 """
 
 
@@ -87,8 +174,10 @@ def test_host_pin_persist_flag(persist) -> None:
     env = dict(os.environ, DSART_HOST_PIN_PERSIST="1" if persist else "0")
     r = subprocess.run([sys.executable, "-c", _PIN], env=env, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stderr[-2000:]
-    new, unreg, force = (int(x) for x in r.stdout.split("STATS")[1].split())
+    new, unreg, force, n_fin = (int(x) for x in r.stdout.split("STATS")[1].split())
     if persist:
         assert new == 2 and unreg == 1 and force == 0         # the page once; the owned buffer
+        assert n_fin == 0                                      # its finalizer entry is removed
     else:
         assert new + force >= 3                                # today: the page is re-pinned
+        assert n_fin >= 1                                      # today: entries are never removed

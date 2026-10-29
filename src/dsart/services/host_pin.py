@@ -119,6 +119,8 @@ def _get_cudart() -> ctypes.CDLL | None:
             lib.cudaHostRegister.restype = ctypes.c_int
             lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
             lib.cudaHostUnregister.restype = ctypes.c_int
+            lib.cudaGetLastError.argtypes = []
+            lib.cudaGetLastError.restype = ctypes.c_int
             _CUDART = lib
         except OSError as exc:
             LOG.debug("libcudart.so not loadable, host-pin disabled: %s", exc)
@@ -138,7 +140,7 @@ _REGISTERED: set[tuple[int, int]] = set()
 #: diagnostic counters (x2 per-block trace): fresh cudaHostRegister calls and their
 #: wall time, finalizer-driven unregisters, force-clean re-registrations
 _STATS: dict = {"register_new": 0, "register_ms": 0.0, "finalizer_unregister": 0,
-                "force_clean": 0}
+                "force_clean": 0, "skipped_ineligible": 0, "cuda_errors_cleared": 0}
 
 # Active weakref finalizers, keyed by id(base_buffer). Holding a
 # strong reference to the finalizer object keeps it alive until the
@@ -156,8 +158,36 @@ def _numpy_base(arr: np.ndarray) -> np.ndarray:
     return base
 
 
-def _make_unregister_finalizer(addr: int, size: int) -> None:
+def _needs_finalizer(base: np.ndarray, base_id: int) -> bool:
+    """Whether to arm an unregister finalizer for ``base``.
+
+    numpy-owned memory (``OWNDATA``: freed and its address reused once the
+    array dies) needs one unless a LIVE finalizer already guards this very
+    object. Today's test, "``id(base)`` not in ``_FINALIZERS``", is fooled
+    by the stale entries the historical pop key leaves behind: a new buffer
+    that reuses a dead wrapper's id got no finalizer, stayed registered after
+    numpy freed it, and the next pinned allocation at that address failed
+    with "resource already mapped" (n05, 2026-10-29: torch's own CUDA init).
+    Other memory (a PSRDADA page wrapper) keeps today's test unchanged.
+    """
+    if base.flags["OWNDATA"]:
+        fin = _FINALIZERS.get(base_id)
+        return fin is None or not fin.alive
+    return base_id not in _FINALIZERS
+
+
+def _make_unregister_finalizer(addr: int, size: int, key: int | None = None,
+                               owned: bool = False) -> None:
     """Schedule cudaHostUnregister(addr) when the owning python object dies.
+
+    ``key`` is the ``_FINALIZERS`` key the finalizer was stored under
+    (``id(base)``). Today's default removes ``addr`` instead -- a key that is
+    never present, so entries are never removed -- and the force-clean test
+    below (``base_id not in _FINALIZERS``) has come to depend on those stale
+    ids. Only ``DSART_HOST_PIN_PERSIST=1`` removes the right key; the default
+    keeps the historical behaviour bit for bit -- except for numpy-owned
+    buffers (``owned``), whose entry is always removed by its own key (see
+    :func:`_needs_finalizer`).
 
     Bound to the numpy base array via :func:`weakref.finalize`. If the
     base array is GC'd, the finalizer:
@@ -175,6 +205,7 @@ def _make_unregister_finalizer(addr: int, size: int) -> None:
     def _on_finalize() -> None:
         _STATS["finalizer_unregister"] += 1
         rval = cudart.cudaHostUnregister(ctypes.c_void_p(addr))
+        _clear_cuda_error(cudart, rval)
         if rval != 0:
             LOG.debug(
                 "host-unpin (finalizer): cudaHostUnregister(0x%x) → rval=%d",
@@ -182,9 +213,63 @@ def _make_unregister_finalizer(addr: int, size: int) -> None:
             )
         with _REGISTRY_LOCK:
             _REGISTERED.discard((addr, size))
-            _FINALIZERS.pop(addr, None)
+            if key is not None and (_PERSIST or owned):
+                # fires while its object is being freed: no live object can hold this id yet
+                _FINALIZERS.pop(key, None)
+            else:
+                _FINALIZERS.pop(addr, None)
 
     return _on_finalize
+
+
+def _pin_eligible(buf: object) -> bool:
+    """Only memory whose lifetime the caller controls is page-locked.
+
+    Eligible: an owner-less ``memoryview`` exported from C memory (a PSRDADA
+    ring page: psrdada's reader hands out a READ-ONLY view of the shm page)
+    and any array over it; writable buffers (numpy-owned, a POSIX-shm mmap);
+    a read-only view of numpy-owned memory.
+
+    Never: a ``np.memmap`` (file-backed), or read-only memory owned by some
+    other Python object -- ``np.frombuffer(f.read(...))`` (a ``bytes`` page:
+    the x2 I2 replay driver), a read-only ``mmap`` of a file, a read-only
+    view of ``bytes``. Those come and go per block at recycled addresses;
+    registering them (~30 ms per 288 MB) churns the driver's registry, and a
+    stale registration at a reused address is what CUDA then reports as
+    "resource already mapped" at an unrelated later call.
+    """
+    if isinstance(buf, memoryview):
+        return not (buf.readonly and buf.obj is not None)
+    if not isinstance(buf, np.ndarray):
+        return True
+    a = buf
+    while True:
+        if isinstance(a, np.memmap):
+            return False
+        if isinstance(a.base, np.ndarray):
+            a = a.base
+            continue
+        break
+    if buf.flags["WRITEABLE"]:
+        return True
+    root = a.base
+    if root is None:
+        return True                                  # a read-only view of numpy-owned memory
+    if isinstance(root, memoryview):
+        return root.obj is None                      # owner-less C memory: a PSRDADA page
+    return False
+
+
+def _clear_cuda_error(cudart, rval: int) -> None:
+    """After a failed runtime call, consume the error it left: otherwise
+    the next ``cudaGetLastError`` in PyTorch (after any kernel launch)
+    reports it as that unrelated kernel's failure."""
+    if rval != 0:
+        _STATS["cuda_errors_cleared"] += 1
+        try:
+            cudart.cudaGetLastError()
+        except Exception:  # noqa: BLE001 -- best effort
+            pass
 
 
 def _buffer_address_and_size(buf: object) -> tuple[int, int] | None:
@@ -224,9 +309,12 @@ def _buffer_address_and_size(buf: object) -> tuple[int, int] | None:
         # in the driver's pinned set.
         #
         # Bench paths that mint a fresh np.frombuffer(bytes) per
-        # iteration are still safe: cudaHostRegister succeeds
-        # idempotently on the stable VA range, the GC finalizer
-        # tears it down, and the next iteration re-pins.
+        # iteration are NOT pinned any more (x2 I2, 2026-10-29): those
+        # pages come and go at recycled addresses, and on n05 the third
+        # one failed its H2D with "invalid argument" (asynchronously:
+        # "misaligned address" / "resource already mapped" later on).
+        # :func:`_pin_eligible` keeps PSRDADA pages (read-only but
+        # owner-less shm views) and refuses those.
         return int(buf.ctypes.data), int(buf.nbytes)
     if isinstance(buf, memoryview):
         if not buf.contiguous:
@@ -285,6 +373,9 @@ def maybe_register_host_buffer(buf: object) -> bool:
     """
     if _DISABLED:
         return False
+    if not _pin_eligible(buf):
+        _STATS["skipped_ineligible"] += 1
+        return False
 
     addr_size = _buffer_address_and_size(buf)
     if addr_size is None:
@@ -310,8 +401,7 @@ def maybe_register_host_buffer(buf: object) -> bool:
             ctypes.c_void_p(addr), ctypes.c_size_t(size),
             ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
         )
-        if rval != 0:
-            cudart.cudaGetLastError()          # do not leave the error for torch's next check
+        _clear_cuda_error(cudart, rval)        # do not leave the error for torch's next check
         if rval in (0, _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED):
             if rval == 0:
                 _STATS["register_new"] += 1
@@ -331,6 +421,7 @@ def maybe_register_host_buffer(buf: object) -> bool:
         ctypes.c_void_p(addr), ctypes.c_size_t(size),
         ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
     )
+    _clear_cuda_error(cudart, rval)
     if rval == 0:
         _STATS["register_new"] += 1
         _STATS["register_ms"] += (_time.perf_counter() - _t0) * 1e3
@@ -349,8 +440,9 @@ def maybe_register_host_buffer(buf: object) -> bool:
             base = _numpy_base(buf)
             base_id = id(base)
             with _REGISTRY_LOCK:
-                if base_id not in _FINALIZERS:
-                    cb = _make_unregister_finalizer(addr, size)
+                if _needs_finalizer(base, base_id):
+                    cb = _make_unregister_finalizer(addr, size, key=base_id,
+                                                    owned=bool(base.flags["OWNDATA"]))
                     if cb is not None:
                         _FINALIZERS[base_id] = weakref.finalize(base, cb)
         LOG.info(
@@ -387,17 +479,18 @@ def maybe_register_host_buffer(buf: object) -> bool:
             base = _numpy_base(buf)
             base_id = id(base)
             with _REGISTRY_LOCK:
-                force_clean = base_id not in _FINALIZERS
+                force_clean = _needs_finalizer(base, base_id)        # no LIVE finalizer: case (b)
         if force_clean:
             _STATS["force_clean"] += 1
             _t1 = _time.perf_counter()
-            cudart.cudaHostUnregister(ctypes.c_void_p(addr))
+            _clear_cuda_error(cudart, cudart.cudaHostUnregister(ctypes.c_void_p(addr)))
             with _REGISTRY_LOCK:
                 _REGISTERED.discard((addr, size))
             rval = cudart.cudaHostRegister(
                 ctypes.c_void_p(addr), ctypes.c_size_t(size),
                 ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT),
             )
+            _clear_cuda_error(cudart, rval)
             _STATS["register_ms"] += (_time.perf_counter() - _t1) * 1e3
             if rval == 0:
                 with _REGISTRY_LOCK:
@@ -406,8 +499,9 @@ def maybe_register_host_buffer(buf: object) -> bool:
                     base = _numpy_base(buf)
                     base_id = id(base)
                     with _REGISTRY_LOCK:
-                        if base_id not in _FINALIZERS:
-                            cb = _make_unregister_finalizer(addr, size)
+                        if _needs_finalizer(base, base_id):
+                            cb = _make_unregister_finalizer(addr, size, key=base_id,
+                                                            owned=bool(base.flags["OWNDATA"]))
                             if cb is not None:
                                 _FINALIZERS[base_id] = weakref.finalize(
                                     base, cb,
@@ -478,6 +572,7 @@ def unregister_all() -> int:
     n = 0
     for addr, _size in registered:
         rval = cudart.cudaHostUnregister(ctypes.c_void_p(addr))
+        _clear_cuda_error(cudart, rval)
         if rval == 0:
             n += 1
         else:

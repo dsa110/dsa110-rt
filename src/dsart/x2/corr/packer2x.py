@@ -316,14 +316,19 @@ def guard_threshold(G: torch.Tensor, k: float, *, iters: int = 4):
     Starts at ``f32(G / k)`` (float64 division, one rounding: within ~2 ulp
     of the answer) and walks with ``nextafter``; ``valid`` additionally
     proves minimality (``f32(k * prev(t)) <= G``). All float32 IEEE, so CPU
-    and GPU agree."""
-    k32 = torch.tensor(float(np.float32(k)), dtype=torch.float32, device=G.device)
-    t = (G.double() / float(np.float32(k))).float()
+    and GPU agree.
+
+    No host sync: ``k`` enters as a Python scalar (exactly a float32, so the
+    float32 multiply is the same IEEE op); a ``torch.tensor(k, device=cuda)``
+    here was a pageable H2D copy that blocked the host until the stream had
+    drained -- twice per corr block, serialising host launches and GPU."""
+    k32 = float(np.float32(k))
+    t = (G.double() / k32).float()
     zero = torch.zeros_like(t)
     inf = torch.full_like(t, float("inf"))
 
     def pred(u):
-        return (k32 * u) > G
+        return (u * k32) > G
 
     for _ in range(iters):
         dn = torch.nextafter(t, zero)
@@ -407,6 +412,22 @@ class RowRulePacker:
         m = used.sum(-1)
         idx = torch.div(2 * m - 1, 2, rounding_mode="floor").clamp(min=0)
         return srt.gather(-1, idx.unsqueeze(-1)).squeeze(-1), m
+
+    @staticmethod
+    def _lowmed_rows(y: torch.Tensor) -> torch.Tensor:
+        """:meth:`_lowmed` of each row of ``y`` float32 ``(G, V, 2)`` whose used count m is
+        >= 1, by selection instead of a sort: an unused value contributes ``-inf`` (re) and
+        ``+inf`` (im), so its two entries sit on either side of the 2m used magnitudes and the
+        wanted rank ``(2m - 1) // 2 = m - 1`` among those lands at index ``V - 1`` of the row
+        for every m -- one ``topk`` with a constant k. An exact selection (no arithmetic), so
+        the value is the sort's bit for bit; ~6x cheaper for a block of guarded rows."""
+        G, V, _ = y.shape
+        used = torch.isfinite(y).all(-1) & (y != 0).any(-1)
+        a = y.abs()
+        lo = torch.where(used, a[..., 0], torch.full_like(a[..., 0], float("-inf")))
+        hi = torch.where(used, a[..., 1], torch.full_like(a[..., 1], float("inf")))
+        flat = torch.stack((lo, hi), -1).reshape(G, 2 * V)
+        return torch.topk(flat, V + 1, dim=-1, largest=True, sorted=False).values.amin(-1)
 
     def _estimate(self, xs: torch.Tensor, r: torch.Tensor):
         rule = self.rule
@@ -531,26 +552,87 @@ class RowRulePacker:
             self.resolve_overflow(out, x)
         return out
 
+    def _recode_rows(self, s: int, rows: torch.Tensor):
+        """Exact ``s_row`` (guarded rows: m >= need >= 1), steps, int8 codes ``(G, V, 2)`` and
+        payload rows ``(G, bps)`` of ``rows`` float32 ``(G, V, 2)`` of stream ``s``. The
+        kernels see the rows as ``(G, 1, V, 2)``: every integer argument (S = 1, V, strides)
+        is then fixed per stream, so Triton compiles them once (:meth:`prewarm_resolve`),
+        never again in the middle of a guard storm."""
+        lo, hi = self.voff[s], self.voff[s + 1]
+        nh = self.n_heavy[s]
+        V = hi - lo
+        G = int(rows.shape[0])
+        cb = self.rule.comp_bits
+        r = self.r[lo:hi]
+        med = self._lowmed_rows(rows * r[None, :, None])
+        s_c = self._k * med
+        step_m = self._s_main * s_c
+        step_h = self._s_heavy * s_c
+        ok_m = torch.isfinite(step_m) & (step_m > 0)
+        ok_h = torch.isfinite(step_h) & (step_h > 0)
+        inv_m = self._one / torch.where(ok_m, step_m, self._one)
+        inv_h = self._one / torch.where(ok_h, step_h, self._one)
+        xs1 = rows.reshape(G, 1, V, 2)
+        args = (xs1, r, inv_m[:, None], inv_h[:, None], ok_m[:, None], ok_h[:, None])
+        if self.use_triton:
+            codes = codes_triton(*args, n_heavy=nh, comp_bits=cb)[:, 0]
+        else:
+            codes = codes_torch(*args, n_heavy=nh, comp_bits=cb)[:, 0]
+        bps = 2 * nh + ((V - nh) * 2 * cb + 7) // 8
+        pay = torch.empty((G, bps), dtype=torch.uint8, device=rows.device)
+        flat = codes.reshape(G, V * 2)
+        if nh:
+            pay[:, : 2 * nh] = flat[:, : 2 * nh].view(torch.uint8)
+        if self.use_triton:
+            pack_bits_triton(flat[:, 2 * nh:], cb, out=pay[:, 2 * nh:])
+        else:
+            pay[:, 2 * nh:] = pack_bits_torch(flat[:, 2 * nh:], cb)
+        return s_c, step_m, step_h, codes, pay
+
+    def prewarm_resolve(self) -> None:
+        """Compile :meth:`resolve_overflow`'s kernels now (one dummy row per stream): the first
+        guarded row otherwise pays Triton's JIT in the hot path (2026-10-29: a 1.1 s block at
+        start-up and 0.3 s blocks during the first guard storm)."""
+        for s in range(self.n_sub):
+            V = self.voff[s + 1] - self.voff[s]
+            for G in (1, 2, 16, 17):                     # whatever the row count, the same kernels
+                self._recode_rows(s, torch.ones((G, V, 2), dtype=torch.float32, device=self.device))
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
     def resolve_overflow(self, results: list, x: torch.Tensor) -> list:
-        """Recode the flows that had more than ``guard_capacity`` guarded rows
-        in this block (exact s_row for all of them). Syncs with the device
-        once per stream; a no-op unless a broadband surge tripped the guard
-        on many rows. ``x`` is the tensor :meth:`pack` was given."""
-        xr = None
+        """Recode the guarded rows of the flows that had more than
+        ``guard_capacity`` of them in this block: exact ``s_row`` (a sort of
+        just those rows), their steps, codes and payload rows; every other row
+        already carries its final codes (it was coded with the flow's sigma_hat).
+        The same IEEE ops as :meth:`_code_stream`, on the guarded rows only, so
+        the result is bit-identical to recoding whole flows -- at a fraction of
+        the cost when a level step guards many rows for a few seconds (the
+        sigma_hat EMA catching up). Syncs once per call plus once per stream
+        that overflowed; a no-op otherwise. ``x`` is the tensor :meth:`pack`
+        was given."""
+        if not results:
+            return results
+        # one host sync for the tier: which streams have an overflowing flow at all
+        any_ov = torch.stack([res["guard_overflow"].any() for res in results]).tolist()
+        if not any(any_ov):
+            return results
+        xr = torch.view_as_real(x.to(torch.complex64).contiguous())
         for s, res in enumerate(results):
-            ov = res["guard_overflow"]
-            if not bool(ov.any()):
+            if not any_ov[s]:
                 continue
-            if xr is None:
-                xr = torch.view_as_real(x.to(torch.complex64).contiguous())
-            flows = torch.nonzero(ov).flatten()
             lo, hi = self.voff[s], self.voff[s + 1]
-            xs = xr[flows][:, :, lo:hi]
-            # exact s_row for every guarded row of these flows: capacity = the most any has
-            n_g = int(res["guarded"][flows].sum(1).max())
-            sub = self._code_stream(xs, self.r[lo:hi], res["sigma"][flows], s, capacity=n_g)
-            for key in ("payload", "codes_heavy", "codes_main", "sigma_row", "step_main",
-                        "step_heavy", "guarded", "guard_overflow"):
-                res[key][flows] = sub[key]
-            self.n_overflow_resolved += int(flows.numel())
+            nh = self.n_heavy[s]
+            ov = res["guard_overflow"]
+            fi, ri = torch.nonzero(res["guarded"] & ov[:, None], as_tuple=True)
+            self.n_overflow_resolved += int(torch.unique(fi).numel())
+            rows = xr[fi, ri, lo:hi]                                  # (G, V, 2) float32
+            s_c, step_m, step_h, codes, pay = self._recode_rows(s, rows)
+            res["sigma_row"][fi, ri] = s_c
+            res["step_main"][fi, ri] = step_m
+            res["step_heavy"][fi, ri] = step_h
+            res["payload"][fi, ri] = pay
+            res["codes_heavy"][fi, ri] = codes[:, :nh]
+            res["codes_main"][fi, ri] = codes[:, nh:]
+            res["guard_overflow"] = torch.zeros_like(ov)
         return results

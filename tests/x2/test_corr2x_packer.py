@@ -270,6 +270,30 @@ def test_guard_overflow_is_deferred_and_resolved(capacity) -> None:
         _assert_block_equal(res, flows, x, rule)
 
 
+@pytest.mark.parametrize("dev", ["cpu", "cuda"])
+def test_lowmed_rows_selection_equals_the_sort(dev) -> None:
+    """resolve_overflow's selection (unused values split -inf / +inf, one topk with k = V + 1)
+    == the sort-based lower median, bit for bit, for rows with unused, zero-component,
+    non-finite and duplicate values and any used count m >= 1."""
+    if dev == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA-only")
+    rng = np.random.default_rng(5)
+    y = rng.normal(size=(64, 37, 2)).astype(np.float32)
+    y[3, :10] = 0                                      # unused values
+    y[5, 5, 0] = np.inf
+    y[6, 2, 1] = np.nan
+    y[7, :36] = 0                                      # m = 1
+    y[8, ::2, 0] = 0                                   # a zero component: still used
+    y[9] = 1.5                                         # all magnitudes tied
+    y[10, :20] = np.float32(0.25)                      # ties around the median
+    y[11, 1:] = 0                                      # m = 1 at the front
+    t = torch.from_numpy(y).to(dev)
+    med, m = RowRulePacker._lowmed(None, t)
+    assert int(m.min()) >= 1
+    got = RowRulePacker._lowmed_rows(t)
+    assert torch.equal(got, med), (got - med).abs().max()
+
+
 def test_packer_rejects_a_non_quant_rule() -> None:
     with pytest.raises(TypeError):
         RowRulePacker(n_d=1, value_offsets=[0, 4], n_contrib=np.ones(4), n_heavy=[0], rule=object())
@@ -419,24 +443,38 @@ print("RESULT", bool(ok), tri.n_overflow_resolved > 0, diff)
 
 @pytest.mark.x2_gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+@pytest.mark.parametrize("cap", [8, 0])
 @pytest.mark.parametrize("kw", _RULES)
-def test_packer_gpu_equals_cpu(kw) -> None:
+def test_packer_gpu_equals_cpu(kw, cap) -> None:
     """CUDA packer (Triton row-stats / codes / bit packer, deferred overflow)
-    == the CPU twin == quant.py, byte for byte."""
+    == the CPU twin == quant.py, byte for byte. ``cap=0`` is the 2x pipeline's
+    setting: every flow with a guarded row overflows on the device and is
+    recoded exactly by ``resolve_overflow`` (the surge rows force it). During
+    the warm-up sigma_hat is 0: no row is guarded, nothing overflows."""
     kw = dict(kw)
     rule = quant.RowRule.for_format(kw.pop("bits_main"), kw.pop("n_sub"), **kw)
     blocks, n = _blocks(11, rule)
     cpu = RowRulePacker(n_d=3, value_offsets=VOFF, n_contrib=n, n_heavy=NH, rule=rule)
-    gpu = RowRulePacker(n_d=3, value_offsets=VOFF, n_contrib=n, n_heavy=NH, rule=rule, device="cuda")
-    for x in blocks:
+    gpu = RowRulePacker(n_d=3, value_offsets=VOFF, n_contrib=n, n_heavy=NH, rule=rule, device="cuda",
+                        guard_capacity=cap)
+    w = int(rule.warmup_blocks)
+    n_over = 0
+    for i, x in enumerate(blocks):
         a = cpu.pack(torch.from_numpy(x))
         xg = torch.from_numpy(x).cuda()
         b = gpu.pack(xg, resolve_overflow=False)
+        ov = sum(int(r["guard_overflow"].sum()) for r in b)
+        if i < w:
+            assert ov == 0 and not any(bool(r["guarded"].any()) for r in b)
+        n_over += ov
         gpu.resolve_overflow(b, xg)
         for ra, rb in zip(a, b):
+            assert not bool(rb["guard_overflow"].any())
             for k in ("payload", "codes_main", "codes_heavy", "sigma", "sigma_row", "step_main",
                       "step_heavy", "guarded"):
                 assert torch.equal(ra[k], rb[k].cpu()), k
+    torch.cuda.synchronize()
+    assert n_over >= (3 if cap == 0 else 1) and gpu.n_overflow_resolved == n_over
 
 
 @pytest.mark.x2_gpu

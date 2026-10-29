@@ -223,6 +223,8 @@ class Corr2xPipeline(PipelinedCorrFast):
                                n_contrib=self.csr.n_contrib, n_heavy=self.n_heavy,
                                rule=self.rule, device=ctx.device,
                                guard_capacity=0 if self.cuda else 8)
+            if self.cuda:
+                pk.prewarm_resolve()                 # no Triton JIT at the first guarded row
             ts = _TierState(ti=ti, name=t.name, dms=np.asarray([t.d0 + c for c in local]),
                             shifts=shifts, geo=geo, D=t.decim, T_native=t.T_native,
                             static_sky=ss, packer=pk)
@@ -312,12 +314,38 @@ class Corr2xPipeline(PipelinedCorrFast):
         return _ScaledSky(self.tiers[0].static_sky, 32.0 / self.tiers[0].T_native)
 
     def warmup(self, n_blocks: int) -> None:
-        """Compile every kernel on dummy pages with the 2x TX detached."""
-        saved, self.tx2x = self.tx2x, NoOpTx2x()
+        """Compile every kernel on dummy pages -- including the paths real blocks only reach
+        after the warm-ups (static-sky subtraction, the sigma_hat estimate and the guard) and
+        the TX framing with its pinned / device buffers -- with nothing sent: a framing TX gets
+        a counting drain for the duration, any other TX is detached. Every per-cube state is
+        reset afterwards (:meth:`reset`), so real block 1 starts cold as before. Without this
+        the first real blocks paid ~170 ms (first framing + buffer allocation, block 4) and
+        ~90 ms (first estimate / static-sky kernels, block 11)."""
+        from dsart.x2.corr.tx2x import DrainSink  # noqa: PLC0415
+        saved = self.tx2x
+        sink = getattr(saved, "sink", None)
+        stats = None
+        if sink is not None and hasattr(saved, "transmit_tier"):
+            stats = (saved.n_datagrams, saved.n_bytes, saved.n_rejected, saved.n_device_framed,
+                     saved.frame_s)
+            saved.sink = DrainSink()
+        else:
+            self.tx2x = NoOpTx2x()
+        hot = []
+        for t in self.tiers:                         # skip the warm-ups for the dummy pages
+            hot.append((t.packer.blocks_seen, None if t.static_sky is None else t.static_sky.seen))
+            t.packer.blocks_seen = int(t.packer.rule.warmup_blocks)
+            if t.static_sky is not None:
+                t.static_sky.seen = int(t.static_sky.warmup_cubes)
         try:
             super().warmup(n_blocks)
         finally:
+            if stats is not None:
+                saved.sink = sink
+                (saved.n_datagrams, saved.n_bytes, saved.n_rejected, saved.n_device_framed,
+                 saved.frame_s) = stats
             self.tx2x = saved
+            self.reset()
 
     def reset(self) -> None:
         super().reset()

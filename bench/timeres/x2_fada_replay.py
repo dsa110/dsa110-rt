@@ -51,6 +51,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dec-deg", type=float, default=0.0)
     ap.add_argument("--wait-for", default=None,
                     help="start writing only once this file exists (a consumer's ready sentinel)")
+    ap.add_argument("--start-at", type=float, default=0.0,
+                    help="unix time of the first page (after --wait-for): corr nodes of a fleet run "
+                         "start their line-rate replay together; 0 = at once")
     a = ap.parse_args(argv)
     stop = {"flag": False}
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("flag", True))
@@ -72,6 +75,12 @@ def main(argv=None) -> int:
     if a.wait_for:
         while not os.path.exists(a.wait_for) and not stop["flag"]:
             time.sleep(0.05)
+    if a.start_at > 0:
+        if time.time() > a.start_at:
+            print(json.dumps({"x2_fada_replay_start_late_s": round(time.time() - a.start_at, 3)}),
+                  flush=True)
+        while time.time() < a.start_at and not stop["flag"]:
+            time.sleep(min(0.05, max(0.0, a.start_at - time.time())))
     fill_ms, late = [], 0
     t0 = None
     n = 0
