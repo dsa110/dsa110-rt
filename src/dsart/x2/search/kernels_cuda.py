@@ -289,6 +289,90 @@ extern "C" __global__ void l1_clipstd(const __half* __restrict__ image, const in
     if (tid == 0) out[f] = isnan(s_sig) ? 0.0f : s_sig;
 }
 
+/* The same clipped sigma for rows of any length held in global memory (Layer-2:
+   K rows of up to ~1e5 tap scores): x [R, M] float32 is MUTATED (inactive
+   samples -> NaN); one block per row. */
+extern "C" __global__ void clipstd_rows(float* __restrict__ x, float* __restrict__ out, int M,
+                                        float n_sigma, int n_iter)
+{
+    __shared__ unsigned int hist[256];
+    __shared__ float red[32];
+    __shared__ int redn[32];
+    __shared__ unsigned int s_pref, s_rank;
+    __shared__ float s_med, s_sig;
+    __shared__ int s_n;
+    float* sv = x + (long long)blockIdx.x * M;
+    const int tid = threadIdx.x, nth = blockDim.x, lane = tid & 31, warp = tid >> 5, nw = nth >> 5;
+    for (int m = tid; m < M; m += nth) if (!isfinite(sv[m])) sv[m] = __int_as_float(0x7fc00000);
+    __syncthreads();
+    for (int it = 0; it <= n_iter; ++it) {
+        if (it > 0) {
+            const float med = s_med, sig = s_sig;
+            const float lo = __fsub_rn(med, __fmul_rn(n_sigma, sig));
+            const float hi = __fadd_rn(med, __fmul_rn(n_sigma, sig));
+            for (int m = tid; m < M; m += nth)
+                if (!(sv[m] >= lo && sv[m] <= hi)) sv[m] = __int_as_float(0x7fc00000);
+            __syncthreads();
+        }
+        int c = 0;
+        for (int m = tid; m < M; m += nth) c += isnan(sv[m]) ? 0 : 1;
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) c += __shfl_xor_sync(0xffffffffu, c, o);
+        if (lane == 0) redn[warp] = c;
+        __syncthreads();
+        if (tid == 0) {
+            int n = 0;
+            for (int w = 0; w < nw; ++w) n += redn[w];
+            s_n = n;
+            s_pref = 0u;
+            s_rank = n > 0 ? (unsigned int)((n - 1) / 2) : 0u;
+        }
+        __syncthreads();
+        if (s_n == 0) { if (tid == 0) out[blockIdx.x] = 0.0f; return; }
+        for (int sh = 24; sh >= 0; sh -= 8) {
+            for (int i = tid; i < 256; i += nth) hist[i] = 0u;
+            __syncthreads();
+            const unsigned int pref = s_pref;
+            const unsigned int hmask = sh == 24 ? 0u : (0xffffffffu << (sh + 8));
+            for (int m = tid; m < M; m += nth) {
+                const float v = sv[m];
+                if (isnan(v)) continue;
+                const unsigned int k = l1_key(v);
+                if ((k & hmask) == pref) atomicAdd(&hist[(k >> sh) & 0xFFu], 1u);
+            }
+            __syncthreads();
+            if (tid == 0) {
+                unsigned int r = s_rank, cum = 0u, bin = 0u;
+                for (bin = 0u; bin < 256u; ++bin) {
+                    if (cum + hist[bin] > r) break;
+                    cum += hist[bin];
+                }
+                s_rank = r - cum;
+                s_pref = pref | (bin << sh);
+            }
+            __syncthreads();
+        }
+        const float med = l1_unkey(s_pref);
+        float acc = 0.0f;
+        for (int m = tid; m < M; m += nth) {
+            const float v = sv[m];
+            if (!isnan(v)) { const float d = __fsub_rn(v, med); acc = __fadd_rn(acc, __fmul_rn(d, d)); }
+        }
+        #pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) red[warp] = acc;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = 0.0f;
+            for (int w = 0; w < nw; ++w) tot += red[w];
+            s_med = med;
+            s_sig = sqrtf(tot / (float)s_n);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[blockIdx.x] = isnan(s_sig) ? 0.0f : s_sig;
+}
+
 extern "C" __global__ void k0_unpack_cint8(
     const signed char* __restrict__ raw,      /* [S, n, 2 * V_row] */
     const unsigned char* __restrict__ valid,  /* [S, n] */
@@ -486,7 +570,8 @@ __device__ __forceinline__ float2 k23_src(int s, const float2* Ys, const float2*
     return s >= 0 ? Ys[s * 33 + y1] : (s <= -2 ? uvb[-(s + 2)] : make_float2(0.f, 0.f));
 }
 
-extern "C" __global__ void k23_fused_256(const float2* __restrict__ uv,
+template <int LN, int RN>
+__device__ __forceinline__ void k23_body(const float2* __restrict__ uv,
     const int* __restrict__ lidx, const int* __restrict__ lstart,
     const unsigned int* __restrict__ lbm, const int* __restrict__ wsrc,
     const float2* __restrict__ tw_g, const float* __restrict__ pix,
@@ -517,7 +602,6 @@ extern "C" __global__ void k23_fused_256(const float2* __restrict__ uv,
     dif_tw(wd, tw_g, N, lane);
     const int y1o = __brev(lane) >> 27;
     /* LN lines per warp at once: independent values through the same DIF (ILP) */
-    const int LN = 4;
     for (int c0 = warp * LN; c0 < n_fc; c0 += nw * LN) {
         float2 A[LN];
         #pragma unroll
@@ -573,7 +657,6 @@ extern "C" __global__ void k23_fused_256(const float2* __restrict__ uv,
         for (int n2 = 0; n2 < R2; ++n2) wm[k2 * R2 + n2] = tw[(k2 * n2 * (N / R2)) % N];
     }
     /* RN rows per warp at once (ILP through the DIF) */
-    const int RN = 2;
     for (int r0 = warp * RN; r0 < 32; r0 += nw * RN) {
         float2 Bv[RN * R2];
         #pragma unroll
@@ -636,6 +719,15 @@ extern "C" __global__ void k23_fused_256(const float2* __restrict__ uv,
       }
     }
 }
+
+#define K23_ARGS const float2* __restrict__ uv, const int* __restrict__ lidx, \
+    const int* __restrict__ lstart, const unsigned int* __restrict__ lbm, \
+    const int* __restrict__ wsrc, const float2* __restrict__ tw_g, const float* __restrict__ pix, \
+    const unsigned char* __restrict__ pcode, float pc, __half* __restrict__ ring, int B, \
+    int n_act, int n_fc, int n_t, int F, long long t0, int R_img, int transpose, int contig
+#define K23_PASS uv, lidx, lstart, lbm, wsrc, tw_g, pix, pcode, pc, ring, B, n_act, n_fc, n_t, \
+    F, t0, R_img, transpose, contig
+extern "C" __global__ void k23_fused_256(K23_ARGS) { k23_body<4, 2>(K23_PASS); }
 
 """
 
@@ -728,6 +820,20 @@ def launch_l1(image, l1_t, l1_p, out, *, F: int, P: int, R_img: int, t0: int, M:
              np.int32(R_img), np.int64(t0), np.int32(M), np.float32(n_sigma), np.int32(n_iter)))
 
 
+def launch_clipstd_rows(x, out, *, stream, n_sigma: float = 3.0, n_iter: int = 3) -> None:
+    """``clipstd_rows``: per-row clipped sigma of ``x [R, M]`` float32 (contiguous,
+    MUTATED: inactive samples become NaN) into ``out [R]``."""
+    import cupy as cp
+
+    from ...image.tiled_combine_cuda import _ptr
+
+    R, M = int(x.shape[0]), int(x.shape[1])
+    with cp.cuda.ExternalStream(stream.cuda_stream):
+        get_module().get_function("clipstd_rows")(
+            (R,), (1024,), (_ptr(x), _ptr(out), np.int32(M), np.float32(n_sigma),
+                            np.int32(n_iter)))
+
+
 def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: int,
                    row_bytes: int, V: int, R: int, row0: int, stream, ndc=None) -> None:
     """Frame-v2 K0 in 2-D tiles (``k0_f2_tile2``: 32 rows x 128 values x stream)
@@ -757,7 +863,8 @@ def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: 
 
 
 def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int, F: int,
-               t0: int, R_img: int, transpose: int, stream, warps: Optional[int] = None) -> None:
+               t0: int, R_img: int, transpose: int, stream, warps: Optional[int] = None,
+               kname: str = "k23_fused_256") -> None:
     """K2+K3a fused (``k23_fused_256``): ``uv`` float32 ``[B, n_act, 2]``
     (``b = f * n_t + t``) -> fp16 image ring ``[R_img, F, N*N]`` rows
     ``t0 .. t0 + n_t - 1``; ``tables`` = :func:`k23_tables`."""
@@ -767,7 +874,7 @@ def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int,
 
     n_fl = int(tables["n_fl"])
     warps = warps or 16
-    k = get_module().get_function("k23_fused_256")
+    k = get_module().get_function(kname)
     smem = (256 + ((n_fl * 33 + 1) & ~1) + warps * 128) * 8
     if smem > 48 * 1024 and getattr(k, "max_dynamic_shared_size_bytes", 0) < smem:
         if hasattr(k, "max_dynamic_shared_size_bytes"):          # cupy RawKernel

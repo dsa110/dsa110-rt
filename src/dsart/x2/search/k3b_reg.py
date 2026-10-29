@@ -341,7 +341,8 @@ def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, b
         tappix = torch.as_tensor(np.asarray(tap_pixels), dtype=torch.int32, device=dev)
         n_tap = int(tappix.numel())
     K = len(bank)
-    taps = torch.zeros((K, F, max(n_tap, 1), n_c), dtype=torch.float32, device=dev)
+    # every (k, f, tap, centre) is written by the taps kernels: no zero fill
+    taps = torch.empty((K, F, max(n_tap, 1), n_c), dtype=torch.float32, device=dev)
     si = torch.as_tensor(sigma_inv, dtype=torch.float32, device=dev).contiguous()
     sk = torch.as_tensor(np.asarray(s_inv, dtype=np.float32), device=dev)
     ring = ring.contiguous()

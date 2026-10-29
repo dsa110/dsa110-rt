@@ -282,7 +282,7 @@ def test_cp1_gpu_list_is_marked():
     import sys
     mod = sys.modules[__name__]
     names = [n for n in dir(mod) if n.startswith("test_gpu_")]
-    assert len(names) == 9                                   # 19 cases with parametrize
+    assert len(names) == 10                                  # 20 cases with parametrize
     for n in names:
         marks = {m.name for m in getattr(getattr(mod, n), "pytestmark", [])}
         assert "x2_gpu" in marks, n
@@ -316,3 +316,21 @@ def test_gpu_layer1_kernel_matches_torch_reference():
     got = out.cpu().numpy()
     assert want[4] == 0.0 and got[4] == 0.0
     assert np.allclose(got, want, rtol=1e-5, atol=0), (got, want)
+
+
+@_gpu
+def test_gpu_clipstd_rows_matches_torch_reference():
+    """kernels_cuda.clipstd_rows (Layer-2, 1e5 samples per row) == the torch
+    sigma_clipped_std_batched (rtol 1e-5)."""
+    from dsart.noise_norm.layer1 import sigma_clipped_std_batched
+    from dsart.x2.search.kernels_cuda import launch_clipstd_rows
+
+    rng = np.random.default_rng(10)
+    x = (rng.standard_normal((8, 100000)) * rng.uniform(0.5, 300.0, (8, 1))).astype(np.float32)
+    x[2, :500] = 1e6
+    x[5, 7] = np.nan
+    want = sigma_clipped_std_batched(torch.from_numpy(x.copy())).numpy()
+    xd = torch.from_numpy(x).cuda()
+    out = torch.empty(8, dtype=torch.float32, device="cuda")
+    launch_clipstd_rows(xd, out, stream=torch.cuda.current_stream())
+    assert np.allclose(out.cpu().numpy(), want, rtol=1e-5, atol=0), (out.cpu().numpy(), want)

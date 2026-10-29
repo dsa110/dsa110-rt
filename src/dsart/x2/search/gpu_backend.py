@@ -327,8 +327,6 @@ class GpuBackend:
         """Per-filter sigma of the raw tap scores on the device (the CPU path's
         ``sigma_clipped_std_batched`` over the same ``linspace`` subsample);
         only K floats come back."""
-        from ...noise_norm.layer1 import sigma_clipped_std_batched
-
         x = self.dm[st.spec.d]
         K = int(taps.shape[0])
         with torch.cuda.stream(self.compute):
@@ -341,7 +339,12 @@ class GpuBackend:
                     x.l2_idx = (key, torch.as_tensor(
                         np.linspace(0, n - 1, max_samples).astype(np.int64), device=self.dev))
                 flat = flat[:, x.l2_idx[1]]
-            sig = sigma_clipped_std_batched(flat.contiguous())
+            from .kernels_cuda import launch_clipstd_rows
+            work = flat.float().contiguous()
+            if work.data_ptr() == taps.data_ptr():
+                work = work.clone()                      # the kernel marks samples in place
+            sig = torch.empty(K, dtype=torch.float32, device=self.dev)
+            launch_clipstd_rows(work, sig, stream=self.compute)
             self._mark(st.spec.d, "l2", a, self._ev(self.compute))
             return sig.cpu()
 
