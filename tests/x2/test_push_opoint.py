@@ -63,35 +63,55 @@ def _clean_2x_configs(tmp_path) -> Path:
     return dst
 
 
+def _dirty_2x_configs(tmp_path) -> Path:
+    """Copy of configs/ whose 2x template still owes a value (an X2TODO token + an x2_todo
+    entry), as it did before the G2 wiring filled the last ones."""
+    dst = tmp_path / "configs_dirty"
+    shutil.copytree(CONFIGS, dst, ignore=shutil.ignore_patterns("*.npz", "dm_plans"))
+    f = dst / "opoints" / "2x" / "dsart_search_rt.yaml"
+    doc = yaml.safe_load(f.read_text())
+    doc["x2_todo"] = ["WS-T: an open review"]
+    doc["routines"][0]["args"] += " --rx-threads X2TODO:WS-T:threads"
+    f.write_text(yaml.safe_dump(doc, sort_keys=False))
+    return dst
+
+
 def _push(store, sel, cfg_dir, out, **kw):
     return push.push_opoint(store, sel, instances=["pipeline_rt", "search_rt"],
                             config_dir=Path(cfg_dir), out=out.append,
                             now_utc=lambda: "2026-10-22T00:00:00Z", **kw)
 
 
-def test_dry_run_is_the_default_and_writes_nothing(plan_files):
+def test_dry_run_is_the_default_and_writes_nothing(plan_files, tmp_path):
     s = FakeStore()
     out: list[str] = []
     rc = _push(s, NS2, CONFIGS, out, plan_path=str(plan_files[NS2]))
     assert rc == push.RC_OK
     assert s.puts == []
     text = "\n".join(out)
-    assert "DRY RUN" in text and "X2TODO" in text and "dry run: nothing written" in text
+    assert "DRY RUN" in text and "dry run: nothing written" in text
+    assert "X2TODO" not in text                     # the repo template is complete (G2 wiring)
     assert f"/cnf/opoints/{NS2}/search_rt" in text
     assert "recalibrate at CP2" in text
+    out = []
+    assert _push(s, NS2, _dirty_2x_configs(tmp_path), out,
+                 plan_path=str(plan_files[NS2])) == push.RC_OK
+    assert "X2TODO" in "\n".join(out) and s.puts == []
 
 
-def test_write_refuses_placeholders(plan_files):
+def test_write_refuses_placeholders(plan_files, tmp_path):
     s = FakeStore()
     out: list[str] = []
-    rc = _push(s, NS2, CONFIGS, out, plan_path=str(plan_files[NS2]), write=True)
+    rc = _push(s, NS2, _dirty_2x_configs(tmp_path), out, plan_path=str(plan_files[NS2]),
+               write=True)
     assert rc == push.RC_PLACEHOLDERS and s.puts == []
 
 
-def test_write_with_allow_placeholders_writes_only_set_keys(plan_files):
+def test_write_with_allow_placeholders_writes_only_set_keys(plan_files, tmp_path):
     s = FakeStore({"/cnf/pipeline_rt": {"routines": []}, "/cnf/search_rt": {"routines": []}})
     out: list[str] = []
-    rc = _push(s, NS2, CONFIGS, out, plan_path=str(plan_files[NS2]),
+    dirty = _dirty_2x_configs(tmp_path)
+    rc = _push(s, NS2, dirty, out, plan_path=str(plan_files[NS2]),
                plan_node_path="/home/ubuntu/data/dm_plans/p2.npz", write=True,
                allow_placeholders=True)
     assert rc == push.RC_OK, "\n".join(out)
@@ -101,13 +121,14 @@ def test_write_with_allow_placeholders_writes_only_set_keys(plan_files):
     sr = s.kv[f"/cnf/opoints/{NS2}/search_rt"]
     assert sr["opoint"] == NS2 and sr["opoint_selection"] == NS2
     assert sr["plan_path"] == "/home/ubuntu/data/dm_plans/p2.npz"
-    assert opr.routine_arg(sr, "search_compute_0", "--dm-plan-path") == sr["plan_path"]
+    assert opr.routine_arg(sr, "search_compute_0", "--plan-path") == sr["plan_path"]
+    assert opr.routine_arg(sr, "search_rx", "--plan") == sr["plan_path"]
     meta = s.kv[f"/cnf/opoints/{NS2}/meta"]
     assert meta["opoint"] == NS2 and meta["config_set"] == "2x" and meta["plan_id"] == sr["plan_id"]
     assert meta["placeholders"] > 0 and meta["pushed_utc"] == "2026-10-22T00:00:00Z"
     # second run: no change
     out2: list[str] = []
-    _push(s, NS2, CONFIGS, out2, plan_path=str(plan_files[NS2]),
+    _push(s, NS2, dirty, out2, plan_path=str(plan_files[NS2]),
           plan_node_path="/home/ubuntu/data/dm_plans/p2.npz")
     assert "(no change)" in "\n".join(out2)
 
@@ -122,12 +143,12 @@ def test_clean_set_writes_without_flag_and_diff_shows_tokens(tmp_path, plan_file
     assert rep.ok, rep.summary()
     # change one arg in the template: the diff is reported token by token
     f = cfg / "opoints" / "2x" / "dsart_search_rt.yaml"
-    f.write_text(f.read_text().replace("--layer1-max-samples 10000", "--layer1-max-samples 20000"))
+    f.write_text(f.read_text().replace("--k1 staged", "--k1 triton"))
     out = []
     _push(s, NS2, cfg, out, plan_path=str(plan_files[NS2]))
     text = "\n".join(out)
     assert "~ routines[search_compute_0].args (tokens)" in text
-    assert "- 10000" in text and "+ 20000" in text
+    assert "- staged" in text and "+ triton" in text
 
 
 def test_plan_must_match_the_selection(plan_files):

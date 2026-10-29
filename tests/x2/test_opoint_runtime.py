@@ -404,23 +404,21 @@ def test_repo_1x_sets_are_the_unstamped_base_files():
 def test_repo_2x_template_renders_per_format(sel, plans):
     s = opr.render_repo_set(sel, CONFIGS, plan=plans[sel], plan_path=NODE_PLAN)
     rep = opr.validate_set(s, sel)
-    assert rep.problems == []                       # stamps, units, no ${}, no cross refs
-    assert rep.placeholders                         # still owed by WS-C/S/T/D
+    assert rep.ok, rep.summary()                    # stamps, units, no ${}, no placeholders
     op = opr.op_of(sel)
+    pid = f"0x{plans[sel].plan_id:016x}"
     for inst in opr.INSTANCES:
-        assert s[inst]["plan_id"] == f"0x{plans[sel].plan_id:016x}"
+        assert s[inst]["plan_id"] == pid
     sr = s["search_rt"]
     for half, name in ((0, "search_compute_0"), (1, "search_compute_1")):
-        assert opr.routine_arg(sr, name, "--n-sub") == str(op.n_sub)
-        assert opr.routine_arg(sr, name, "--n-corr") == str(op.n_streams)
         assert opr.routine_arg(sr, name, "--opoint") == sel
-        assert opr.routine_arg(sr, name, "--dm-plan-path") == NODE_PLAN
-        flag = f"--coarse-dm-owners-half-{half}"
-        want = ",".join(str(d) for d in plans[sel].dms_of_half(half))
-        assert opr.routine_arg(sr, name, flag) == want
-    sc1 = next(r for r in sr["routines"] if r["name"] == "search_compute_1")
-    want7 = ",".join(str(d) for d in plans[sel].dms_of_half(7))
-    assert f"--coarse-dm-owners-half-1 {want7} " in sc1["hostargs"]["lxd110h13"] + " "
+        assert opr.routine_arg(sr, name, "--plan-path") == NODE_PLAN
+        assert opr.routine_arg(sr, name, "--plan-id") == pid
+        assert opr.routine_arg(sr, name, "--gpu-half") == str(half)
+        assert float(opr.routine_arg(sr, name, "--t-int-search-us")) == op.t_ext_us
+    assert opr.routine_arg(sr, "search_rx", "--plan") == NODE_PLAN
+    assert opr.routine_arg(sr, "search_rx", "--plan-id") == pid
+    assert opr.routine_arg(sr, "search_rx", "--ring-version") == "4"
     cf = s["pipeline_rt"]
     assert opr.routine_arg(cf, "corr_fast", "--n-sub") == str(op.n_sub)
     assert opr.routine_arg(cf, "corr_fast", "--opoint") == sel
@@ -434,8 +432,9 @@ def test_repo_2x_template_is_self_contained():
     assert raw["search_rt"]["coinc"]["trigger_criteria_path"].endswith(
         "configs/opoints/2x/c2_trigger_criteria.yaml")
     for name in ("search_compute_0", "search_compute_1"):
+        # the 2x halves read no yaml (their C1 values: tests/x2/test_g2_wiring.py)
         r = next(r for r in raw["search_rt"]["routines"] if r["name"] == name)
-        assert "configs/opoints/2x/dsart_search_rt.yaml" in r["args"]
+        assert "--config-yaml" not in r["args"] and "configs/dsart_" not in r["args"]
 
 
 def test_repo_2x_set_keeps_the_1x_structure():
@@ -475,11 +474,14 @@ def test_width_gates_sit_between_boxcar_widths():
 
 
 def test_repo_2x_placeholders_block_a_switch(plans):
+    # every placeholder of the repo template was filled at G2 wiring (2026-10-29): switchable
     s = opr.render_repo_set(NS2, CONFIGS, plan=plans[NS2], plan_path=NODE_PLAN)
     rep = opr.validate_set(s, NS2)
-    assert not rep.ok
+    assert rep.ok and rep.placeholders == [], rep.summary()
+    # one placeholder token or x2_todo entry anywhere blocks it again
+    s["search_rt"]["routines"][0]["args"] += " --x X2TODO:WS-T:something"
+    s["pipeline_rt"]["x2_todo"] = ["WS-C: open item"]
+    rep = opr.validate_set(s, NS2)
+    assert not rep.ok and "placeholder" in rep.summary()
     owners = {tok.split(":")[1] for _i, _p, tok in rep.placeholders if tok.startswith("X2TODO:")}
-    # placeholders shrink as workstreams deliver (WS-C's corr args were filled 2026-10-29); while any
-    # remain, the set must not be switchable
-    assert owners and owners <= {"WS-C", "WS-S", "WS-T", "WS-D", "WS-O"}
-    assert "placeholder" in rep.summary()
+    assert owners == {"WS-T"} and len(rep.placeholders) == 2

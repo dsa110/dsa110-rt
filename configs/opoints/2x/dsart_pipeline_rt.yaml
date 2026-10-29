@@ -64,11 +64,13 @@
 # without also editing the consumer services.
 schema_version: 1
 opoint: 2x
-x2_todo:
-  - "WS-C corr_fast: value kind / bits args from the format (template variables value_kind, bits_main, bits_heavy are available); fused cal+mask GEMM; GPU packer row rule; stage-2 FIFO off"
-  - "WS-T corr_fast transport: frame v2 + C sendmmsg sender args (pacing, explicit DM->half map, k samples per datagram)"
-  - "WS-C/WS-O buffers: fada/bada/dada/eada sizes and reader counts confirmed unchanged for 2x (plan: reader count unchanged)"
-  - "I1: --n-pre 15 set (DM-3000 sweep 1.698 s = 13 blocks + 1 margin, +1 for 0.18 s headroom); verify with tests/test_voltage_dump_containment.py against the 2x v3 plan, then delete"
+# x2_todo: none open (G2 wiring, 2026-10-29; tests/x2/test_g2_wiring.py). Closed:
+# corr_fast takes value kind / bits / n_sub from --opoint and the DM->half map
+# from the plan (WS-C 2x pipeline: fused cal GEMM, GPU packer row rule, no
+# stage-2 FIFO); frame v2 C sender (--transport-tx-mode v2, 16 KB bursts, per-
+# host --x2-tx-bind-host); buffers and reader counts identical to the 1x base
+# set; every other routine identical except voltage_retention --n-pre 15, which
+# contains the 2x plan's fine-DM-max (2996 pc/cc) sweep + one block.
 
 # captures.mode is the M7 stage switch:
 #   junkdb  → spawn dada_junkdb x2 (fills dada+eada with /dev/urandom at
