@@ -39,6 +39,12 @@ Source: `docs/x2/downstream_inventory.md` §0 and §5.
 - tests/transport/test_production_rx_ring_phaseb.py: hangs to the 900 s timeout.
 - tests/test_c2_proactive_claim.py: was stale (old units bug), fixed by WS-D D4.
 
+## Pre-existing physics/production bugs found by x2 work (1x today; user decision)
+| id | item | evidence | proposed |
+|---|---|---|---|
+| P-a | `image/imager.py:167` `compute_edge_mask(drop_dc)` zeroes pixel (N/2, N/2) = the phase centre (l,m) = (0,0): an exactly on-axis burst is reported 1 px (45") off at 0.644 of its true S/N (-36%). Biases injections placed at (0,0) and the K calibration built on them; sky impact is 1 pixel of 65536 | I1 measured 0.641-0.646 in both 1x and 2x | mask the uv DC cell instead of the image centre, behind a flag; recalibrate K |
+| P-b | corr_fast `host_pin` may unregister a pinned 288 MB page when its numpy base is collected; re-pinning costs 5-14 s (seen by WS-C in a test harness) | to be confirmed read-only in the production path (WS-C) | fix behind a flag if confirmed |
+
 ## Pre-existing hardware/ops issues (independent of x2, reported)
 - n22 loses 5.7% of SNAP packets to PHY CRC errors (optic/cable/port). **Worse after the outage (10-28):** jumbo (8972 B) pings n01 -> h22 lose 66%, small pings 0% — size-dependent CRC loss on h22's 40G port.
 - n01/n02 corner-turn PHY loss 3-7e-4 (CRC + discard bursts).
