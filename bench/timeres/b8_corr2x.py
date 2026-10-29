@@ -74,6 +74,8 @@ REPLAY_KEY = "d2f0"
 #: "search nodes" on a port nothing listens on -- never a packet on the fabric
 LOOPBACK_HOSTS = "127.0.0.1,127.0.0.2,127.0.0.3,127.0.0.4"
 LOOPBACK_PORT_BASE = 47900
+#: ``live --tx v2``: the search nodes in SEARCH_NODES order (n01, n02, n09, n13)
+SEARCH_HOSTS = "10.41.0.205,10.41.0.222,10.41.0.253,10.41.0.238"
 FADA_BYTES = 301989888
 #: x2 scratch staging (G1: every corr node's own sub-band + the cal live at the event) first,
 #: then the M7.4 fixture trees
@@ -547,14 +549,18 @@ def _fixture_cal(run_id: str):
 
 def _start_writer(run_id: str, chgroup: int, *, n_blocks: int, rate: str = "native",
                   key: str = REPLAY_KEY, log: str | None = None, dec: float = 0.0,
-                  wait_for: str | None = None) -> subprocess.Popen:
+                  wait_for: str | None = None, file: str | None = None,
+                  start_at: float = 0.0) -> subprocess.Popen:
     """bench/timeres/x2_fada_replay.py (preloaded blocks, multi-threaded page fill); with
-    ``wait_for`` it starts writing when that file appears (corr_fast's ready sentinel)."""
+    ``wait_for`` it starts writing when that file appears (corr_fast's ready sentinel), with
+    ``start_at`` (unix s) not before then; ``file`` overrides the chgroup's own sub-band."""
     cmd = [sys.executable, os.path.join(ROOT, "bench", "timeres", "x2_fada_replay.py"),
-           "--file", _fixture_file(run_id, chgroup), "--key", key, "--n-blocks", str(int(n_blocks)),
-           "--rate", rate, "--dec-deg", str(dec)]
+           "--file", file or _fixture_file(run_id, chgroup), "--key", key,
+           "--n-blocks", str(int(n_blocks)), "--rate", rate, "--dec-deg", str(dec)]
     if wait_for:
         cmd += ["--wait-for", wait_for]
+    if start_at:
+        cmd += ["--start-at", repr(float(start_at))]
     out = open(log, "w") if log else subprocess.DEVNULL
     return subprocess.Popen(cmd, env=dict(os.environ, PYTHONPATH=os.path.join(ROOT, "src")),
                             stdout=out, stderr=subprocess.STDOUT)
@@ -1039,11 +1045,11 @@ def live_argv(opoint: str, *, dec: float, n_blocks: int, out_blocks: str,
 
 
 def cmd_live(args) -> int:
-    if args.reader_identity != "corr_fast" or args.tx not in ("drain", "loopback"):
-        print("live: only --tx drain|loopback --reader-identity corr_fast are supported", file=sys.stderr)
+    if args.reader_identity != "corr_fast" or args.tx not in ("drain", "loopback", "v2"):
+        print("live: only --tx drain|loopback|v2 --reader-identity corr_fast are supported", file=sys.stderr)
         return EXIT_ERR
-    if args.tx == "loopback" and not getattr(args, "replay", None):
-        print("live: --tx loopback needs --replay", file=sys.stderr)
+    if args.tx in ("loopback", "v2") and not getattr(args, "replay", None):
+        print(f"live: --tx {args.tx} needs --replay", file=sys.stderr)
         return EXIT_ERR
     prod = _production_corr_fast_pids()
     if prod:
@@ -1054,11 +1060,21 @@ def cmd_live(args) -> int:
     n_blocks = int(args.minutes * 60e3 / BLOCK_MS)
     out_blocks = os.path.join(args.out, "live_blocks")
     argv, env = live_argv(op.opoint_id, dec=args.dec, n_blocks=n_blocks, out_blocks=out_blocks,
-                          tx="v2" if args.tx == "loopback" else args.tx)
+                          tx="v2" if args.tx in ("loopback", "v2") else args.tx)
     if args.tx == "loopback":
         argv += ["--transport-tx-worker-hosts", LOOPBACK_HOSTS,
                  "--transport-tx-port", str(LOOPBACK_PORT_BASE),
                  "--x2-tx-burst-bytes", str(int(args.tx_burst_bytes))]
+    elif args.tx == "v2":                       # the real search nodes (G1 fleet runs)
+        argv += ["--transport-tx-worker-hosts", args.tx_hosts,
+                 "--transport-tx-port", str(int(args.tx_port_base)),
+                 "--x2-tx-bind-host", args.tx_bind_host,
+                 "--x2-tx-cpu", str(int(args.tx_cpu)),
+                 "--x2-tx-burst-bytes", str(int(args.tx_burst_bytes))]
+    if getattr(args, "block0", 0):
+        argv += ["--x2-block0", str(int(args.block0))]
+    if getattr(args, "plan_id", None):
+        argv += ["--plan-id", args.plan_id]
     _set_gpu_env(env)
     if getattr(args, "replay", None):
         return _live_on_replay(args, argv, n_blocks)
@@ -1352,7 +1368,8 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
         log = os.path.join(args.out, "writer_live.log")
         # like the capture routines, the writer waits for corr_fast's ready sentinel (kernels warm)
         w = _start_writer(args.replay, chgroup, n_blocks=n_blocks, rate="native", log=log, dec=dec,
-                          wait_for=sentinel)
+                          wait_for=sentinel, file=getattr(args, "replay_file", None),
+                          start_at=float(getattr(args, "start_at", 0.0) or 0.0))
         samples = []
         stop = threading.Event()
 
@@ -1365,7 +1382,7 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
         th = threading.Thread(target=poll, daemon=True)
         th.start()
         cfi.run = run_and_keep
-        txmon = TxDrainMonitor(cfi) if args.tx == "loopback" else None
+        txmon = TxDrainMonitor(cfi) if args.tx in ("loopback", "v2") else None
         try:
             if txmon is not None:
                 txmon.__enter__()
@@ -1476,7 +1493,22 @@ def main(argv=None) -> int:
                    help="drain (frame v2 counted, no socket) | loopback (the real paced sender to "
                         f"{LOOPBACK_HOSTS}:{LOOPBACK_PORT_BASE}+chgroup, needs --replay)")
     p.add_argument("--tx-burst-bytes", type=int, default=16 << 10,
-                   help="--tx loopback: the sender's token-bucket depth per destination")
+                   help="--tx loopback|v2: the sender's token-bucket depth per destination")
+    p.add_argument("--tx-hosts", default=SEARCH_HOSTS,
+                   help="--tx v2: the 4 search-node addresses in SEARCH_NODES order (n01,n02,n09,n13)")
+    p.add_argument("--tx-port-base", type=int, default=19100,
+                   help="--tx v2: UDP port base; this corr sends to port_base + chgroup")
+    p.add_argument("--tx-bind-host", default="",
+                   help="--tx v2: source IPv4 (this corr node's data NIC); empty = any")
+    p.add_argument("--tx-cpu", type=int, default=-1, help="--tx v2: pin the C sender thread")
+    p.add_argument("--replay-file", default=None,
+                   help="--replay: voltage file to stream instead of the chgroup's own sub-band "
+                        "(timing runs only: content does not change the cost)")
+    p.add_argument("--start-at", type=float, default=0.0,
+                   help="--replay: unix time of the first page (fleet runs start together)")
+    p.add_argument("--block0", type=int, default=0,
+                   help="corr_fast --x2-block0: block index of the first page (same on every node)")
+    p.add_argument("--plan-id", default=None, help="corr_fast --plan-id (hex)")
     p.add_argument("--reader-identity", default="corr_fast")
     p.add_argument("--trace", action="store_true",
                    help="per-block host/GPU trace (DSART_X2_BLOCK_TRACE) + wall histogram in the JSON")

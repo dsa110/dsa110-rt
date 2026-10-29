@@ -4166,6 +4166,7 @@ def run(
     x2_tx_pace: float = 1.25,
     x2_tx_burst_bytes: int = 16 << 10,
     plan_id: str | None = None,
+    x2_block0: int = 0,
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -4210,6 +4211,8 @@ def run(
             "--opoint 2x runs its own scheduler: drop --pipeliner-3s / "
             "--profile-stages-every (the StageTimer covers 2x)"
         )
+    if opoint == "1x" and x2_block0:
+        raise ValueError("--x2-block0 needs a 2x op-point")
     if opoint == "1x" and plan_id:
         raise ValueError("--plan-id names a 2x tiered plan (needs --opoint 2x-*)")
     if opoint == "1x" and transport_tx_mode in X2_TX_MODES:
@@ -5041,7 +5044,8 @@ def run(
                 # stream, issues the previous block, hands the one before
                 # that to TX, and releases this page once its H2D lands.
                 for done in orch.push(
-                    page_arr, block_n=n_in, release=reader.markCleared,
+                    page_arr, block_n=n_in + (int(x2_block0) if x2_orch is not None else 0),
+                    release=reader.markCleared,
                 ):
                     _consume_completed(done.block_n, done)
             elif pipeliner is not None:
@@ -5600,6 +5604,11 @@ def main(argv: list[str] | None = None) -> int:
                         "2x corr chain (needs --t-int-fast-native 8 "
                         "--chan-sum-factor 2 --n-sub <2|4>; --dm-plan-path then "
                         "names a TieredDmPlan npz, else the plan is built).")
+    p.add_argument("--x2-block0", type=int, default=0,
+                   help="2x: block index of the first fada page (frames carry t0_native = "
+                        "(block0 + n) x 4096 native samples); several corr nodes started together "
+                        "on replayed data share one value so their rows line up at the search "
+                        "nodes (default 0: today's n_in numbering)")
     p.add_argument("--plan-id", default=None,
                    help="2x: expected tiered-plan id (hex, the set's ${plan_id}); corr_fast "
                         "refuses to start when the loaded plan differs (SPEC §10)")
@@ -5976,6 +5985,7 @@ def main(argv: list[str] | None = None) -> int:
             stage_timing=not args.no_stage_timing,
             opoint=args.opoint,
             plan_id=args.plan_id,
+            x2_block0=args.x2_block0,
             x2_tx_bind_host=args.x2_tx_bind_host,
             x2_tx_cpu=args.x2_tx_cpu,
             x2_tx_pace=args.x2_tx_pace,
