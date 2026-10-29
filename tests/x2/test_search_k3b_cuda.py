@@ -56,7 +56,7 @@ def test_reg_source_compiles(bank):
 
 
 @_gpu
-@pytest.mark.parametrize("impl", ["cuda", "reg"])
+@pytest.mark.parametrize("impl", ["cuda", "reg", "reg_taps_launch"])
 @pytest.mark.parametrize("bank,n_c", [("b3x", 384), ("b3x", 192), ("box", 384), ("t", 128)])
 def test_gpu_k3b_cuda_equals_twin(bank, n_c, impl):
     from dsart.x2.search.k3b_cuda import k3b_cuda
@@ -78,6 +78,8 @@ def test_gpu_k3b_cuda_equals_twin(bank, n_c, impl):
     kw = dict(ring_row0=row0, c_first=c_first, n_c=n_c, s_inv=sk, bank=fb, tap_pixels=taps)
     b0, t0, p0 = k3b_twin(ring, sigma_inv=si, **kw)
     fn = k3b_cuda if impl == "cuda" else k3b_reg
+    if impl == "reg_taps_launch":                        # taps from the separate launch
+        kw["taps_inline"] = False
     b1, t1, p1 = fn(torch.from_numpy(ring).cuda(), sigma_inv=torch.from_numpy(si).cuda(), **kw)
     b1, t1, p1 = b1.cpu().numpy(), t1.cpu().numpy(), p1.cpu().numpy()
     assert np.array_equal(b1, b0), np.argwhere(b1 != b0)[:5]

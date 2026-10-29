@@ -103,6 +103,7 @@ class EngineConfig:
     k3b_impl: str = "v1"                     # GPU K3b: "v1" | "fused" (Triton) | "cuda" | "reg"
     k1_impl: str = "triton"                  # GPU K1: "triton" | "staged" (CUDA smem windows)
     rows_per_batch: int = 64
+    fetch_threads: int = 3                   # GPU path: ring copies ahead of the launches
     wait_timeout_s: Optional[float] = 0.0
     sigma_history_cycles: int = 160          # >= 30 s of 201 ms cycles
 
@@ -158,6 +159,7 @@ class CycleResult:
     per_dm: Dict[int, DmCycleResult]
     candidates: List[Candidate2x]
     wall_ms: float
+    phase_ms: dict = field(default_factory=dict)    # GPU path: host ms per phase / sync
 
 
 class DmState:
@@ -297,12 +299,14 @@ class OwnerEngine:
         t_start = time.perf_counter()
         per_dm: Dict[int, DmCycleResult] = {}
         cands: List[Candidate2x] = []
+        phase_ms: dict = {}
         if self._gpu is not None:
-            per_dm = self._process_cycle_phased(int(k), keep_maps=keep_maps)
+            per_dm = self._process_cycle_phased(int(k), keep_maps=keep_maps, phase_ms=phase_ms)
         else:
             for spec in self.order_dms():
                 per_dm[spec.d] = self._process_dm(self.states[spec.d], int(k),
                                                   keep_maps=keep_maps)
+        a = time.perf_counter()
         for spec in self.order_dms():
             cands.extend(per_dm[spec.d].candidates)
         if self.cfg.c1_merge and cands:
@@ -311,36 +315,56 @@ class OwnerEngine:
                              sample_period_specnum=self.cfg.c1_sample_period_specnum,
                              dm_index_mode=self.cfg.dm_index_mode)
             cands = [c for c in cands if c.snr >= self.cfg.threshold]
-        return CycleResult(cycle=int(k), per_dm=per_dm, candidates=cands,
-                           wall_ms=1e3 * (time.perf_counter() - t_start))
+        out = CycleResult(cycle=int(k), per_dm=per_dm, candidates=cands,
+                          wall_ms=1e3 * (time.perf_counter() - t_start), phase_ms=phase_ms)
+        phase_ms["merge"] = 1e3 * (time.perf_counter() - a)
+        return out
 
     def order_dms(self) -> List[DmSpec]:
         """Tier A (finest sample, most work) first, then by global index."""
         return sorted((s for s in self.plan.dms), key=lambda s: (s.t_native, s.d))
 
     # ------------------------------------------------------------------
-    def _fetch(self, st: DmState, lo: int, hi: int) -> None:
-        """K0: make stream rows ``[lo, hi)`` resident (append when
-        contiguous with what is loaded, reload on a gap)."""
+    def _fetch_window(self, st: DmState, lo: int, hi: int) -> Optional[tuple]:
+        """The ring rows ``(start, n)`` that make stream rows ``[lo, hi)``
+        resident (append when contiguous with what is loaded, reload on a
+        gap), or None when they already are. Pure: :meth:`_fetch` commits."""
         sr = st.streams
         if sr.loaded_hi is not None and sr.loaded_lo <= lo and hi <= sr.loaded_hi:
-            return
+            return None
         if sr.loaded_hi is None or lo < sr.loaded_lo or lo > sr.loaded_hi:
             start = lo
-            sr.loaded_lo = sr.loaded_hi = lo
         else:
             start = sr.loaded_hi
         n = hi - start
         if n > sr.n_slots:
             raise ValueError(f"DM {st.spec.d}: {n} rows > stream ring {sr.n_slots}")
+        return int(start), int(n)
+
+    def _fetch_copy(self, st: DmState, start: int, n: int) -> tuple:
+        """The ring copy of rows ``[start, start + n)`` (``(raw, valid)``);
+        thread-safe per DM (the prefetch pool runs it ahead of the launches)."""
         into = getattr(self.ring, "wait_window_into", None)
         if into is not None and self._gpu is not None:      # ring -> pinned staging, one copy
             buf = self._gpu.staging(st, int(n), int(self.ring.row_bytes))
-            raw, valid = into(st.spec.d, int(start), int(n), out=buf,
-                              timeout_s=self.cfg.wait_timeout_s)
+            return into(st.spec.d, int(start), int(n), out=buf, timeout_s=self.cfg.wait_timeout_s)
+        return self.ring.wait_window(st.spec.d, int(start), int(n),
+                                     timeout_s=self.cfg.wait_timeout_s)
+
+    def _fetch(self, st: DmState, lo: int, hi: int, copied=None) -> None:
+        """K0: make stream rows ``[lo, hi)`` resident. ``copied``: the
+        ``(start, n, future)`` of a prefetched :meth:`_fetch_copy`."""
+        sr = st.streams
+        win = self._fetch_window(st, lo, hi)
+        if win is None:
+            return
+        start, n = win
+        if sr.loaded_hi is None or start != sr.loaded_hi:
+            sr.loaded_lo = sr.loaded_hi = start
+        if copied is not None and (copied[0], copied[1]) == (start, n):
+            raw, valid = copied[2].result()
         else:
-            raw, valid = self.ring.wait_window(st.spec.d, int(start), int(n),
-                                               timeout_s=self.cfg.wait_timeout_s)
+            raw, valid = self._fetch_copy(st, start, n)
         if self._gpu is not None:
             self._gpu.k0(st, raw, valid, start)              # codes live on the device
             sr.valid[:, sr.slots(np.arange(start, start + n))] = np.asarray(valid, bool)
@@ -395,6 +419,10 @@ class OwnerEngine:
         return out.detach().cpu().numpy().astype(np.float64)
 
     def _valid_fraction(self, st: DmState, t0: int) -> float:
+        sh = st.spec.shifts
+        lo, hi = t0 - int(sh.max()), t0 + st.spec.hop - int(sh.min())   # rows any (f, s) reads
+        if hi - lo <= st.R_s and st.streams.valid[:, np.mod(np.arange(lo, hi), st.R_s)].all():
+            return 1.0                     # every row read is valid (the common case)
         rows = t0 + np.arange(st.spec.hop)
         sl = np.mod(rows[None, :, None] - st.spec.shifts[:, None, :], st.R_s)  # [F, hop, S]
         ok = st.streams.valid[np.arange(st.spec.n_stream)[None, None, :], sl].all(axis=2)
@@ -403,16 +431,21 @@ class OwnerEngine:
     # ------------------------------------------------------------------
     # one DM-cycle, as steps shared by the serial (CPU) and phased (GPU) paths
     # ------------------------------------------------------------------
-    def _dm_image(self, st: DmState, k: int, tm: dict) -> tuple:
-        """K0 + K1 + K2/K3a for this cycle's new rows; ``(t0, t1)``."""
+    def _dm_rows(self, st: DmState, k: int) -> tuple:
+        """``(t0, t1, img_lo)``: the cycle's rows and the first row to image."""
         t0, t1 = st.spec.cycle_rows(k)
         img_lo = t0 - st.history
         if st.image_hi is not None and st.image_hi >= img_lo and st.image_hi <= t1:
             img_lo = max(img_lo, st.image_hi)
+        return t0, t1, img_lo
+
+    def _dm_image(self, st: DmState, k: int, tm: dict, copied=None) -> tuple:
+        """K0 + K1 + K2/K3a for this cycle's new rows; ``(t0, t1)``."""
+        t0, t1, img_lo = self._dm_rows(st, k)
         if img_lo < t1:
             s_lo, s_hi = st.stream_rows_needed(img_lo, t1)
             a = time.perf_counter()
-            self._fetch(st, s_lo, s_hi)
+            self._fetch(st, s_lo, s_hi, copied=copied)
             tm["k0_ms"] = 1e3 * (time.perf_counter() - a)
             a = time.perf_counter()
             self._image_rows(st, img_lo, t1)
@@ -493,7 +526,15 @@ class OwnerEngine:
                                sigma_applied=sigma_applied, s_k_applied=s_k_applied,
                                keep_maps=keep_maps, tm=tm)
 
-    def _process_cycle_phased(self, k: int, *, keep_maps: bool) -> Dict[int, DmCycleResult]:
+    def _prefetch_pool(self):
+        if getattr(self, "_pool", None) is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._pool = ThreadPoolExecutor(max_workers=max(1, int(self.cfg.fetch_threads)),
+                                            thread_name_prefix="x2-fetch")
+        return self._pool
+
+    def _process_cycle_phased(self, k: int, *, keep_maps: bool,
+                              phase_ms: Optional[dict] = None) -> Dict[int, DmCycleResult]:
         """The GPU cycle in three phases over ALL owned DMs, so the host
         never waits on the device per DM (two syncs per cycle, not three
         per DM): (A) fetch + K0 + image + Layer-1 kernel of every DM, one
@@ -504,16 +545,30 @@ class OwnerEngine:
         import torch
 
         gpu = self._gpu
+        ph = phase_ms if phase_ms is not None else {}
+        t_ph = time.perf_counter()
         order = [self.states[s.d] for s in self.order_dms()]
         tms = {st.spec.d: {} for st in order}
         rows, l1_dev = {}, {}
+        # the ring copies (host memcpy / pread into each DM's pinned staging)
+        # run on the prefetch pool, ahead of the main thread's launches
+        copies = {}
+        pool = self._prefetch_pool()
+        for st in order:
+            t0, t1, img_lo = self._dm_rows(st, k)
+            if img_lo < t1:
+                win = self._fetch_window(st, *st.stream_rows_needed(img_lo, t1))
+                if win is not None:
+                    copies[st.spec.d] = win + (pool.submit(self._fetch_copy, st, *win),)
         for st in order:                                         # phase A
-            t0, t1 = self._dm_image(st, k, tms[st.spec.d])
+            t0, t1 = self._dm_image(st, k, tms[st.spec.d], copied=copies.get(st.spec.d))
             rows[st.spec.d] = (t0, t1)
             l1_dev[st.spec.d] = gpu.layer1_launch(st, t0)
         a = time.perf_counter()
+        ph["a_host"] = 1e3 * (a - t_ph)
         l1_host = gpu.to_host(l1_dev)
-        sync_ms = 1e3 * (time.perf_counter() - a)
+        t_ph = time.perf_counter()
+        sync_ms = ph["a_sync"] = 1e3 * (t_ph - a)
         sig, b_dev, shapes = {}, {}, {}
         for st in order:                                         # phase B
             d = st.spec.d
@@ -528,8 +583,11 @@ class OwnerEngine:
             b_dev[d] = (vals, idx, tkv, gpu.layer2_launch(st, taps, self.cfg.layer2_max_samples))
             tms[d]["k3b_ms"] = 1e3 * (time.perf_counter() - a)
         a = time.perf_counter()
+        ph["b_host"] = 1e3 * (a - t_ph)
         b_host = gpu.to_host(b_dev)
-        sync_ms += 1e3 * (time.perf_counter() - a)
+        t_ph = time.perf_counter()
+        ph["b_sync"] = 1e3 * (t_ph - a)
+        sync_ms += ph["b_sync"]
         out = {}
         for st in order:                                         # phase C
             d = st.spec.d
@@ -540,6 +598,9 @@ class OwnerEngine:
                                      (vals, idx, tkv, shapes[d]), None, None,
                                      sigma_new=sigma_new, sigma_applied=sigma_applied,
                                      s_k_applied=s_k_applied, keep_maps=keep_maps, tm=tms[d])
+        ph["c_host"] = 1e3 * (time.perf_counter() - t_ph)
+        for key in ("k0_ms", "image_ms", "layer1_ms", "k3b_ms", "decode_ms"):
+            ph[key] = float(sum(t.get(key, 0.0) for t in tms.values()))
         return out
 
     # ------------------------------------------------------------------

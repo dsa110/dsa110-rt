@@ -159,7 +159,7 @@ def test_gpu_k1_1x_bit_exact_vs_combine_sparse_v4(tmp_path):
 
 
 @_gpu
-@pytest.mark.parametrize("mode", ["warp", "fused"])
+@pytest.mark.parametrize("mode", ["warp", "fused", "fused_v1"])
 @pytest.mark.parametrize("fold", ["col", "row"])
 def test_gpu_fft_pair_matches_twin_and_float64(fold, mode):
     from dsart.x2.search.csr import csr_from_value_cells

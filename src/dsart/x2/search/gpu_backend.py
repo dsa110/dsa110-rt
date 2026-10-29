@@ -33,6 +33,25 @@ class _DmDev:
     pass
 
 
+class _OnStream:
+    """``torch.cuda.stream(s)`` without its per-entry ``torch.cuda.is_available()``
+    (a device-count query, ~0.1 ms: hundreds per cycle)."""
+    __slots__ = ("s", "prev")
+
+    def __init__(self, s) -> None:
+        self.s = s
+
+    def __enter__(self):
+        self.prev = torch.cuda.current_stream()
+        if self.prev != self.s:
+            torch.cuda.set_stream(self.s)
+        return self.s
+
+    def __exit__(self, *exc) -> None:
+        if self.prev != self.s:
+            torch.cuda.set_stream(self.prev)
+
+
 class GpuBackend:
     def __init__(self, engine) -> None:
         if not torch.cuda.is_available():
@@ -156,7 +175,7 @@ class GpuBackend:
             hraw = x.pinned[:raw.size].view(S, n, rb)
             hraw.copy_(torch.from_numpy(np.ascontiguousarray(raw)))
         hval = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.uint8))
-        with torch.cuda.stream(self.copy):
+        with _OnStream(self.copy):
             h0 = self._ev(self.copy)
             draw = hraw.to(self.dev, non_blocking=True)
             dval = hval.to(self.dev, non_blocking=True)
@@ -166,8 +185,9 @@ class GpuBackend:
         x.pinned_ev = ev
         self.compute.wait_event(ev)
         mod = get_module()
-        k0a = self._ev(self.compute)
-        with self._ext(self.compute):
+        # torch work (K0's scratch zero-fill) must be on the compute stream too
+        with _OnStream(self.compute), self._ext(self.compute):
+            k0a = self._ev(self.compute)
             if x.kind == "frame2":
                 from .kernels_cuda import launch_k0_tile
                 launch_k0_tile(draw, dval, x.nv, x.nh, x.bits, x.codes, x.valid, x.nodata, S=S,
@@ -195,7 +215,7 @@ class GpuBackend:
         N = cfg.n_grid
         F = st.spec.n_fdm
         timed = stream is self.compute
-        with torch.cuda.stream(stream):
+        with _OnStream(stream):
             ea = self._ev(stream) if timed else None
             if cfg.k1_impl == "staged":
                 uv = k1_staged(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
@@ -263,7 +283,7 @@ class GpuBackend:
         from ...noise_norm.layer1 import sigma_clipped_std_batched
 
         x = self.dm[st.spec.d]
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             a = self._ev(self.compute)
             if st.l1_t.shape[1] <= 10240:               # one launch (kernels_cuda.l1_clipstd)
                 from .kernels_cuda import launch_l1
@@ -294,7 +314,7 @@ class GpuBackend:
         stream could read the buffers before the compute stream wrote them),
         one event sync; returns the same structure as numpy arrays."""
         out = {}
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             for key, v in tensors.items():
                 if isinstance(v, (tuple, list)):
                     out[key] = tuple(t.to("cpu", non_blocking=True) for t in v)
@@ -324,7 +344,7 @@ class GpuBackend:
         if cfg.k3b_impl not in impls:
             raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused|cuda|reg)")
         detect = impls[cfg.k3b_impl]
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             ev0 = self._ev(self.compute)
             # small per-cycle inputs go up pinned + non-blocking (a pageable
             # torch H2D syncs the host with the stream); "reg" takes device
@@ -366,7 +386,7 @@ class GpuBackend:
         left on the device."""
         x = self.dm[st.spec.d]
         K = int(taps.shape[0])
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             a = self._ev(self.compute)
             flat = taps.reshape(K, -1)
             n = int(flat.shape[1])
@@ -419,7 +439,7 @@ class GpuBackend:
         priv.__dict__.update(x.__dict__)
         priv.codes = codes
         N = self.eng.cfg.n_grid
-        with torch.cuda.stream(self.low):
+        with _OnStream(self.low):
             draw = torch.from_numpy(np.ascontiguousarray(raw)).to(self.dev)
             dval = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.uint8)).to(self.dev)
             mod = get_module()
@@ -442,7 +462,7 @@ class GpuBackend:
             ring = torch.zeros((n, spec.n_fdm, N * N), dtype=torch.float16, device=self.dev)
             # a private n-row ring: row r lands in slot r % n; roll back to row order
             self._image_batch(st, priv, r0, n, self.low, ring, n)
-            with torch.cuda.stream(self.low):
+            with _OnStream(self.low):
                 if r0 % n:
                     ring = torch.roll(ring, -(r0 % n), dims=0)
             self.low.synchronize()

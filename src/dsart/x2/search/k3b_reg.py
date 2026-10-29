@@ -38,6 +38,11 @@ import numpy as np
 __all__ = ["reg_source", "plan_parts", "k3b_reg"]
 
 _KERNELS: dict = {}
+# per-call host cost matters (one call per DM-cycle): the bank's parts and
+# each (part, options) kernel are resolved once per bank OBJECT (kept alive
+# in the value so an id is never reused while cached)
+_PARTS: dict = {}
+_BY_KEY: dict = {}
 
 
 def _req(bank, ks) -> dict:
@@ -121,8 +126,10 @@ def plan_parts(bank) -> list:
 def reg_source(bank, part: Sequence[int], *, dq: int = 4, name: str = "k3b_reg",
                threads: int = 128, chunk: int = 64, mode: str = "keys") -> tuple:
     """Kernel source for filters ``part``. ``mode="keys"``: per-(pixel, chunk)
-    keys for every pixel; ``mode="taps"``: raw scores of the listed tap
-    pixels only (thread x = tap index)."""
+    keys for every pixel, and the raw scores of the tap pixels (``tappix`` is
+    then the per-pixel tap index, -1 = not a tap: a predicated store in the
+    same pass); ``mode="taps"``: raw scores of the listed tap pixels only
+    (thread x = tap index; a separate long serial launch, kept for tests)."""
     ks = sorted(part)
     req = _req(bank, ks)
     U, regs, rs = _choose_U(req, dq)
@@ -163,6 +170,7 @@ def reg_source(bank, part: Sequence[int], *, dq: int = 4, name: str = "k3b_reg",
     else:
         w("    const int p = blockIdx.x * blockDim.x + threadIdx.x;")
         w("    if (p >= P) return;")
+        w("    const int ti = tappix[p];                          /* tap index or -1 */")
     w("    const int f = blockIdx.y;")
     w("    const float si = si_[f];")
     w("    const __half* src = ring + (long long)f * P + p;")
@@ -220,12 +228,13 @@ def reg_source(bank, part: Sequence[int], *, dq: int = 4, name: str = "k3b_reg",
                 w(f"{ind}      R{k}_{jj}[j % {n}] = s{k}_{jj - 1};")
                 w(f"{ind}      s{k}_{jj} = __fsub_rn(__fadd_rn(s{k}_{jj}, s{k}_{jj - 1}), old); }}")
             w(f"{ind}    const float score{k} = s{k}_{flt.order - 1};")
+        w(f"{ind}    if ({'' if mode == 'taps' else 'ti >= 0 && '}it >= LMAX - 1 && it < NIT) {{")
+        for k in ks:
+            w(f"{ind}        taps[(((long long){k} * F + f) * n_tap + ti) * n_c + (it - (LMAX - 1))] "
+              f"= score{k};")
+        w(f"{ind}    }}")
         if mode == "taps":
-            w(f"{ind}    if (it >= LMAX - 1 && it < NIT) {{")
-            for k in ks:
-                w(f"{ind}        taps[(((long long){k} * F + f) * n_tap + ti) * n_c + (it - (LMAX - 1))] "
-                  f"= score{k};")
-            w(f"{ind}    }}")
+            pass
         elif chunk_static:
             # the outer iteration lies inside one chunk (U | 64) or spans whole chunks (64 | U)
             w(f"{ind}    {{ const int tin = (tin0 + j) & (CHUNK - 1);")
@@ -303,21 +312,29 @@ def reg_source(bank, part: Sequence[int], *, dq: int = 4, name: str = "k3b_reg",
 
 
 def get_kernel(bank, part, **kw):
+    key = (id(bank), tuple(part), tuple(sorted(kw.items())))
+    hit = _BY_KEY.get(key)
+    if hit is not None and hit[0] is bank:
+        return hit[1]
     src, meta = reg_source(bank, part, **kw)
     h = hashlib.blake2b(src.encode(), digest_size=8).hexdigest()
     if h not in _KERNELS:
         import cupy as cp
         _KERNELS[h] = (cp.RawKernel(src, meta["name"], options=("--std=c++14",),
                                     backend="nvrtc"), meta)
+    _BY_KEY[key] = (bank, _KERNELS[h])
     return _KERNELS[h]
 
 
 def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, bank,
             clip: float = 250.0, chunk: int = 64, tap_pixels=None, stream=None,
-            parts: Optional[list] = None, gen: Optional[dict] = None):
+            parts: Optional[list] = None, gen: Optional[dict] = None, taps_inline: bool = True):
     """Same contract and outputs as ``kernels_triton.k3b_detect``: one keys
-    launch per part, one combine, and (if taps) one small taps launch per part
-    over the tap pixels only."""
+    launch per part (which also stores the tap pixels' raw scores), one
+    combine. ``taps_inline=False``: the taps come from a separate small launch
+    per part over the tap pixels instead -- its 256 threads x F run the whole
+    serial recursion on a nearly empty GPU (+0.59 us/image at F 35, n_c 384,
+    n13), kept as the cross-check."""
     import cupy as cp
     import torch
 
@@ -329,7 +346,11 @@ def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, b
         raise ValueError(f"n_c={n_c} not a multiple of chunk={chunk}")
     if R * F * P >= 2 ** 31:
         raise ValueError(f"image ring {R}x{F}x{P} too large for 32-bit offsets")
-    parts = parts if parts is not None else plan_parts(bank)
+    if parts is None:
+        hit = _PARTS.get(id(bank))
+        if hit is None or hit[0] is not bank:
+            hit = _PARTS[id(bank)] = (bank, plan_parts(bank))
+        parts = hit[1]
     n_ch = n_c // chunk
     dev = ring.device
     keys = torch.empty((len(parts), n_ch, F, P), dtype=torch.int64, device=dev)
@@ -337,6 +358,7 @@ def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, b
     tk = torch.empty((n_ch, F, P), dtype=torch.int32, device=dev)
     n_tap = 0
     tappix = torch.zeros((1,), dtype=torch.int32, device=dev)
+    tapidx = torch.full((P,), -1, dtype=torch.int32, device=dev)
     # device tensors pass straight through; a numpy argument is a pageable
     # H2D, which torch completes with a host-side stream sync
     if tap_pixels is not None:
@@ -344,6 +366,7 @@ def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, b
                   if isinstance(tap_pixels, torch.Tensor)
                   else torch.as_tensor(np.asarray(tap_pixels), dtype=torch.int32, device=dev))
         n_tap = int(tappix.numel())
+        tapidx[tappix.long()] = torch.arange(n_tap, dtype=torch.int32, device=dev)
     K = len(bank)
     # every (k, f, tap, centre) is written by the taps kernels: no zero fill
     taps = torch.empty((K, F, max(n_tap, 1), n_c), dtype=torch.float32, device=dev)
@@ -359,9 +382,9 @@ def k3b_reg(ring, *, ring_row0: int, c_first: int, n_c: int, sigma_inv, s_inv, b
             kern, meta = get_kernel(bank, part, chunk=chunk, **(gen or {}))
             th = meta["threads"]
             kern(((P + th - 1) // th, F), (th,),
-                 (_ptr(ring), _ptr(si), _ptr(sk), _ptr(keys[i]), _ptr(tappix), _ptr(taps))
+                 (_ptr(ring), _ptr(si), _ptr(sk), _ptr(keys[i]), _ptr(tapidx), _ptr(taps))
                  + args_tail)
-            if n_tap:
+            if n_tap and not taps_inline:
                 tkern, _tmeta = get_kernel(bank, part, chunk=chunk, mode="taps",
                                            name="k3b_reg_taps", **(gen or {}))
                 tkern(((n_tap + 127) // 128, F), (128,),

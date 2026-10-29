@@ -571,7 +571,7 @@ def cmd_kernels(a) -> int:
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="pruned")  # noqa: E731
                 elif v == "dense":
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="irfft2")  # noqa: E731
-                elif v in ("warp", "fused"):
+                elif v in ("warp", "fused", "fused_v1"):
                     fn = _warp_runner(uvt, plan, inp, dev, mode=v)
                 else:
                     continue
@@ -692,13 +692,15 @@ def _warp_runner(uvt, plan, inp, dev, mode: str = "warp"):
     from dsart.x2.search.kernels_cuda import k23_tables, launch_k23
     tables = k23_tables(lines, n_fl, dev, pix=pix)
 
-    def run_fused():
+    def run_fused(kname="k23v2_256"):
         launch_k23(uv2, tables, tw, pix, ring, B=B, n_act=A, n_t=B, F=1, t0=0, R_img=B,
-                   transpose=tr, stream=torch.cuda.current_stream())
+                   transpose=tr, stream=torch.cuda.current_stream(), kname=kname)
         return ring.view(B, N, N)
 
     if mode == "fused":
         return run_fused
+    if mode == "fused_v1":
+        return lambda: run_fused("k23_fused_256")
 
     def run():
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
@@ -931,8 +933,10 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
     inp = dm_inputs_from_value_map(vm, s_main=sm, s_heavy=sh, bits_main=op.bits_main)
     inputs = {s.d: inp for s in oplan.dms}
     head = dict(half=half, opoint=a.opoint, k1=k1, k3b=k3b, input=a.input,
+                plan_id=str(getattr(plan, "plan_id", "")), n_dm=len(oplan.dms),
                 dms=oplan.summary()["dms"], images_per_cycle=int(
                     sum(s.n_fdm * s.hop for s in oplan.dms)))
+    head["images_per_s"] = head["images_per_cycle"] / CYCLE_S
     if a.input == "synthetic-ring":
         ring = ClockedRing(oplan, {s.d: inp.fmt for s in oplan.dms})
     else:
@@ -972,7 +976,7 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
         gpu = float(sum(v for kk, v in cyc_stage.items() if kk != "h2d"))
         lag = max(sched.lag_ms(k).values(), default=0.0)
         rec.append(dict(cycle=k, wall_ms=wall, gpu_ms=gpu, lag_ms=lag,
-                        n_cand=len(r.candidates)))
+                        n_cand=len(r.candidates), phase_ms=dict(r.phase_ms)))
         now = time.monotonic()
         if now - t_part >= 15.0:
             _atomic_json(part, dict(head, final=False, **_half_summary(rec, stage_ms, images,
@@ -996,10 +1000,18 @@ def _half_summary(rec, stage_ms, images, sched, ring) -> dict:
     chain = float(sum(v for k, v in st_us.items() if k != "h2d"))
     duty = float(gpu.mean() / (1e3 * CYCLE_S)) if gpu.size else 0.0
     host = float(np.percentile(np.maximum(wall - gpu, 0), 99)) if wall.size else 0.0
+    phase = {}
+    for x in rec:
+        for kk, v in x.get("phase_ms", {}).items():
+            phase.setdefault(kk, []).append(v)
+    phase = {kk: dict(mean=float(np.mean(v)), p99=float(np.percentile(v, 99)))
+             for kk, v in phase.items()}
     fan = {}
     if hasattr(ring, "fan_in"):
         fan = {int(d): ring.fan_in(d) for d in ring.dms()}
-    return dict(n_cycles=len(rec), gpu_duty=duty,
+    return dict(n_cycles=len(rec), gpu_duty=duty, host_phase_ms=phase,
+                wall_ms_p99=float(np.percentile(wall, 99)) if wall.size else 0.0,
+                gpu_ms_mean=float(gpu.mean()) if gpu.size else 0.0,
                 gpu_duty_p99=float(np.percentile(gpu, 99) / (1e3 * CYCLE_S)) if gpu.size else 0.0,
                 host_ms_p99=host, lag_ms_max=float(lag.max(initial=0)),
                 lag_ms_last=float(lag[-1]) if lag.size else 0.0,
@@ -1013,6 +1025,9 @@ def _engine_gate(h: dict) -> dict:
           and h["lag_ms_last"] <= 2.0 * 1e3 * CYCLE_S and h["lag_recovery_seeks"] == 0
           and h["chain_us_per_image"] <= CHAIN_GATE_US)
     return dict(check="engine", half=h["half"], k1=h["k1"], k3b=h["k3b"],
+                plan_id=h.get("plan_id"), n_dm=h.get("n_dm"),
+                images_per_s=h.get("images_per_s"), gpu_ms_mean=h.get("gpu_ms_mean"),
+                wall_ms_p99=h.get("wall_ms_p99"), host_phase_ms=h.get("host_phase_ms"),
                 n_cycles=h.get("n_cycles", 0), stop=h.get("stop"), gpu_duty=h["gpu_duty"],
                 duty_aim_met=h["gpu_duty"] <= DUTY_AIM, host_ms_p99=h["host_ms_p99"],
                 lag_ms_max=h["lag_ms_max"], lag_recovery_seeks=h["lag_recovery_seeks"],
@@ -1113,7 +1128,8 @@ def main(argv=None) -> int:
     c = sub.add_parser("compile-check")
     c.add_argument("--out", default="b8_out")
     k = sub.add_parser("kernels")
-    k.add_argument("--fft", default="cufft,warp,fused")
+    k.add_argument("--fft", default="cufft,warp,fused_v1,fused",
+                   help="cufft, dense, warp, fused (k23v2_256), fused_v1 (k23_fused_256)")
     k.add_argument("--k3b", default="box,b3x,v1,fused,cuda,reg",
                    help="filter banks (box, b3x) and implementations (v1, fused, cuda, reg)")
     k.add_argument("--k1", default="triton,staged", help="K1 variants (triton, staged)")
