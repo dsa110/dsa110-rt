@@ -727,7 +727,8 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
     from dsart.x2.search.kernels_triton import k3b_detect
 
     T, F, P = 256, 4, 65536
-    cube = (torch.randn((T, F, P), device=dev) * 1.0).to(torch.float16)
+    g = torch.Generator(device=dev).manual_seed(0)
+    cube = torch.randn((T, F, P), device=dev, generator=g).to(torch.float16)
     cube[100, 1, 1234] = 40.0
     maxw = 64
     cs = torch.zeros((T + maxw, F, P), dtype=torch.float16, device=dev)
@@ -743,10 +744,16 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
     best, _tk, _ = k3b_detect(cube.contiguous(), ring_row0=0, c_first=maxw // 2, n_c=T - maxw,
                               sigma_inv=torch.ones(F, device=dev), s_inv=1 / fb.seeds, bank=fb)
     d = (best - prod).abs()
-    tol = 0.02 + 2.0 * torch.abs(prod) * 2.0 ** -11
+    # production's boxcar is a difference of two fp16 running sums: each carries
+    # up to half an fp16 ulp of its magnitude (|cumsum| reaches ~40 over 256
+    # rows: ulp 2^-5), so the tolerance includes one ulp of the window's largest
+    # |cumsum| (x max s_inv = 1, b1) besides 0.02 and the stored max's ulp
+    cs_max = cs.float().abs().amax(dim=0)                                  # [F, P]
+    tol = 0.02 + 2.0 * torch.abs(prod) * 2.0 ** -11 + 2.0 ** -10 * cs_max[None]
     worst = float((d - tol).max())
     return dict(compat_max_abs=float(d.max()), compat_status="ok" if worst <= 0 else "fail",
-                compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max")
+                compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max + 1 fp16 ulp of "
+                            "the largest |cumsum| (production's fp16 running sums)")
 
 
 class _FakeRecording:
@@ -1023,7 +1030,12 @@ def _half_summary(rec, stage_ms, images, sched, ring) -> dict:
 
 
 def _engine_gate(h: dict) -> dict:
-    ok = (h.get("n_cycles", 0) > 0 and h["gpu_duty"] <= DUTY_GATE and h["host_ms_p99"] <= 30.0
+    # real time: every cycle's wall time (GPU + the host work it does not hide)
+    # within 90% of the cycle at p99, no lag-recovery seek, no growing lag; the
+    # host's share is reported (host_ms_p99) but gated only through the wall
+    wall_p99 = h.get("wall_ms_p99", float("inf"))
+    ok = (h.get("n_cycles", 0) > 0 and h["gpu_duty"] <= DUTY_GATE
+          and wall_p99 <= 0.9 * 1e3 * CYCLE_S
           and h["lag_ms_last"] <= 2.0 * 1e3 * CYCLE_S and h["lag_recovery_seeks"] == 0
           and h["chain_us_per_image"] <= CHAIN_GATE_US)
     return dict(check="engine", half=h["half"], k1=h["k1"], k3b=h["k3b"],
