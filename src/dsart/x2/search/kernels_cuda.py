@@ -991,6 +991,123 @@ extern "C" __global__ void __launch_bounds__(THREADS, MINB) NAME(K23V2_ARGS) { \
 /* 8 warps, two lines per warp through the phase-1 DIF, two blocks per SM: the
    fastest of (LN 2/4/8) x (8/16 warps) on the 2x maps (n13, 2080 Ti) */
 K23V2_KERNEL(k23v2_256, 2, 256, 2)
+
+/* ---- k23v2p_256: residue PAIRS (y2, y2 + 4) per block: one gather and one
+   in-lane DFT serve both (W_8^{j (y2+4)} = (-1)^j W_8^{j y2}: a = E + O,
+   b = E - O over even / odd j), two DIFs; Ys holds both residues (2 x 30 KB,
+   one 16-warp block per SM); phase 2 does the pair's 64 rows. */
+template <int Y2, int J> struct K23Dft8EO {
+    static __device__ __forceinline__ void acc(float2& e, float2& o, const float2 (&x)[8]) {
+        const float2 t = k23_rot8<(J * Y2) & 7>(x[J]);
+        if (J & 1) { o.x += t.x; o.y += t.y; }
+        else { e.x += t.x; e.y += t.y; }
+        K23Dft8EO<Y2, J + 1>::acc(e, o, x);
+    }
+};
+template <int Y2> struct K23Dft8EO<Y2, 8> {
+    static __device__ __forceinline__ void acc(float2&, float2&, const float2 (&)[8]) {}
+};
+
+template <int Y2, int LN>
+__device__ __forceinline__ void k23p_p1(const float2* __restrict__ uvb,
+    const int* __restrict__ lstart, const uint4* __restrict__ lbm4, const int2* __restrict__ lspan,
+    const float2* __restrict__ tw_g, float2* Ys, int ys_half, const K23Dif& d, int n_fc, int lane,
+    int warp, int nw)
+{
+    const float2 wla = __ldg(tw_g + ((lane * Y2) & 255));
+    const float2 wlb = __ldg(tw_g + ((lane * (Y2 + 4)) & 255));
+    const unsigned int lt = (1u << lane) - 1u;
+    const int y1o = __brev(lane) >> 27;
+    for (int it = 0; warp + it * nw < n_fc; it += LN) {
+        float2 A[2 * LN];
+        #pragma unroll
+        for (int l = 0; l < LN; ++l) {
+            const int ci = min(warp + (it + l) * nw, n_fc - 1);
+            const int st = __ldg(lstart + ci);
+            const int2 sp = __ldg(lspan + ci);
+            float2 x[8];
+            if (sp.y >= 0) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned int e = (unsigned int)(lane + 32 * j - sp.x);
+                    x[j] = e < (unsigned int)sp.y ? uvb[st + (int)e] : make_float2(0.f, 0.f);
+                }
+            } else {
+                const uint4 m0 = __ldg(lbm4 + 2 * ci), m1 = __ldg(lbm4 + 2 * ci + 1);
+                const unsigned int m[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+                int pre = st;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = ((m[j] >> lane) & 1u) ? uvb[pre + __popc(m[j] & lt)]
+                                                 : make_float2(0.f, 0.f);
+                    pre += __popc(m[j]);
+                }
+            }
+            float2 e = make_float2(0.f, 0.f), o = make_float2(0.f, 0.f);
+            K23Dft8EO<Y2, 0>::acc(e, o, x);
+            float2 a, b;
+            if (Y2 & 1) {                      /* odd j <-> odd exponent: the sqrt(1/2) */
+                const float r = 0.70710678118654752f;
+                a = make_float2(fmaf(r, o.x, e.x), fmaf(r, o.y, e.y));
+                b = make_float2(fmaf(-r, o.x, e.x), fmaf(-r, o.y, e.y));
+            } else {
+                a = make_float2(e.x + o.x, e.y + o.y);
+                b = make_float2(e.x - o.x, e.y - o.y);
+            }
+            A[l] = cmul(a, wla);
+            A[LN + l] = cmul(b, wlb);
+        }
+        k23_dif32<2 * LN>(A, d);
+        #pragma unroll
+        for (int l = 0; l < LN; ++l) {
+            const int ci = warp + (it + l) * nw;
+            if (ci < n_fc) {
+                Ys[ci * 33 + y1o] = A[l];
+                Ys[ys_half + ci * 33 + y1o] = A[LN + l];
+            }
+        }
+    }
+}
+
+template <int Y2, int LN>
+__device__ __forceinline__ void k23p_block(K23V2_ARGS)
+{
+    extern __shared__ float2 sm[];
+    const int rows = n_fc + n_cl + 1;
+    const int ys_half = ((rows * 33 + 1) & ~1);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int b = blockIdx.y;
+    const float2* uvb = uv + (long long)b * n_act;
+    K23Dif d;
+    k23_dif_prep(d, tw_g, lane);
+    for (int i = threadIdx.x; i < 2 * (n_cl + 1) * 32; i += blockDim.x) {
+        const int h = i / ((n_cl + 1) * 32), r = i - h * (n_cl + 1) * 32;
+        const int c = r >> 5;
+        sm[h * ys_half + (n_fc + c) * 33 + (r & 31)] =
+            c < n_cl ? uvb[__ldg(cidx + c)] : make_float2(0.f, 0.f);
+    }
+    k23p_p1<Y2, LN>(uvb, lstart, lbm4, lspan, tw_g, sm, ys_half, d, n_fc, lane, warp, nw);
+    __syncthreads();
+    const int f = b / n_t, t = b % n_t;
+    const long long slot = ((t0 + t) % R_img + R_img) % R_img;
+    __half* dst = ring + (slot * F + f) * 65536LL;
+    /* the pair's 64 rows: warps [0, nw/2) residue Y2, [nw/2, nw) residue Y2 + 4 */
+    const int hw = warp >= nw / 2;
+    k23v2_p2<2>(sm + hw * ys_half, wrow, tw_g, pix, pcode, pc, dst, d, Y2 + 4 * hw, transpose, lane,
+                warp - hw * (nw / 2), nw / 2);
+}
+
+/* LN 1: one line per warp through the (two-residue) phase-1 DIF -- 0.97 us/image
+   vs 1.01 at LN 2, 1.02 at 32 warps (64 registers) and 1.39 for k23v2_256 (ns4
+   map, n13 microbench) */
+extern "C" __global__ void __launch_bounds__(512, 1) k23v2p_256(K23V2_ARGS) {
+    switch (blockIdx.x) {
+    case 0: k23p_block<0, 1>(K23V2_PASS); break;
+    case 1: k23p_block<1, 1>(K23V2_PASS); break;
+    case 2: k23p_block<2, 1>(K23V2_PASS); break;
+    default: k23p_block<3, 1>(K23V2_PASS); break;
+    }
+}
 """
 
 _MOD = None
@@ -1144,11 +1261,12 @@ def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: 
 
 def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int, F: int,
                t0: int, R_img: int, transpose: int, stream, warps: Optional[int] = None,
-               kname: str = "k23v2_256") -> None:
+               kname: str = "k23v2p_256") -> None:
     """K2+K3a fused: ``uv`` float32 ``[B, n_act, 2]`` (``b = f * n_t + t``) ->
     fp16 image ring ``[R_img, F, N*N]`` rows ``t0 .. t0 + n_t - 1``; ``tables``
-    = :func:`k23_tables`. ``kname``: ``k23v2_256`` (default; falls back to v1
-    for a map whose line cells are not uv-contiguous) or ``k23_fused_256``."""
+    = :func:`k23_tables`. ``kname``: ``k23v2p_256`` (default: residue pairs),
+    ``k23v2_256`` (one residue per block) -- both fall back to v1 for a map
+    whose line cells are not uv-contiguous -- or ``k23_fused_256`` (v1)."""
     import cupy as cp
 
     from ...image.tiled_combine_cuda import _ptr
@@ -1161,11 +1279,17 @@ def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int,
         k = get_module().get_function(kname)
         n_cl = int(tables["n_cl"])
         smem = (((n_fl + n_cl + 1) * 33 + 1) & ~1) * 8
-        if smem > 48 * 1024:
-            cp.cuda.driver.funcSetAttribute(k.ptr, 8, smem)
+        if kname.startswith("k23v2p"):                 # residue pairs: two Ys, 16 warps
+            smem, warps = 2 * smem, 16
+        if smem > 48 * 1024 and getattr(k, "max_dynamic_shared_size_bytes", 0) < smem:
+            if hasattr(k, "max_dynamic_shared_size_bytes"):      # cupy RawKernel
+                k.max_dynamic_shared_size_bytes = smem
+            else:
+                cp.cuda.driver.funcSetAttribute(k.ptr, 8, smem)
         pcode = tables["pcode"]
         with cp.cuda.ExternalStream(stream.cuda_stream):
-            k((8, int(B)), (32 * warps,),
+            k((4 if kname.startswith("k23v2p") else 8, int(B)),
+              (32 * warps,),
               (_ptr(uv), _ptr(tables["lstart"]), _ptr(tables["lbm"]), _ptr(tables["lspan"]),
                _ptr(tables["wrow"]), _ptr(tables["cidx"]), _ptr(tw), _ptr(pix),
                np.uint64(0) if pcode is None else _ptr(pcode), np.float32(tables["pc"]),

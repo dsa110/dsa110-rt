@@ -68,6 +68,28 @@ class GpuBackend:
         self.tw = torch.as_tensor(twiddles(N).view(np.float32).reshape(-1, 2), device=self.dev)
         for d, st in engine.states.items():
             self.dm[d] = self._build(st)
+        self.warmup()
+
+    def warmup(self) -> None:
+        """Compile (NVRTC) every kernel the cycle will launch, before the
+        first cycle: otherwise cycle 0 takes seconds and the scheduler starts
+        with a lag-recovery seek."""
+        from .kernels_cuda import get_module
+
+        cfg = self.eng.cfg
+        m = get_module()
+        for name in ("k0_f2_tile2", "k0_f2_valid", "k0_unpack_cint8", "k23v2p_256",
+                     "k23v2_256", "k23_fused_256", "l1_clipstd", "clipstd_rows"):
+            m.get_function(name)
+        if cfg.k1_impl == "staged":
+            from .k1_staged import get_module as k1_module
+            for x in self.dm.values():
+                for f0, f1, *_rest in x.k1passes:
+                    k1_module(-(-(f1 - f0) // 8) * 8).get_function("k1_staged")
+        if cfg.k3b_impl == "reg":
+            from .k3b_reg import get_kernel, plan_parts
+            for part in plan_parts(self.eng.bank):
+                get_kernel(self.eng.bank, part, chunk=cfg.chunk)[0].compile()
 
     # ------------------------------------------------------------------
     def _build(self, st) -> _DmDev:
@@ -91,6 +113,20 @@ class GpuBackend:
         from .k1_staged import staged_geometry
         x.k1geom = staged_geometry(spec.shifts, n_t=cfg.rows_per_batch)
         x.csr["smax"] = torch.as_tensor(x.k1geom.smax, dtype=torch.int32, device=self.dev)
+        # staged K1 in passes of <= k1_fdm_per_pass fine DMs: FMAX register
+        # accumulators per thread (35 at ns4 -> 123 registers, 16 warps / SM;
+        # two passes of 18: -9% at ns4, n13). Per (f, t) the same codes and the
+        # same CSR-order sums: bit-identical to one pass.
+        per = max(1, int(cfg.k1_fdm_per_pass))
+        bnd = np.linspace(0, spec.n_fdm, -(-spec.n_fdm // per) + 1).astype(int)
+        x.k1passes = []
+        for f0, f1 in zip(bnd[:-1], bnd[1:]):
+            sh = np.ascontiguousarray(spec.shifts[int(f0):int(f1)])
+            g = staged_geometry(sh, n_t=cfg.rows_per_batch)
+            c = dict(x.csr)
+            c["smax"] = torch.as_tensor(g.smax, dtype=torch.int32, device=self.dev)
+            x.k1passes.append((int(f0), int(f1), torch.as_tensor(sh, dtype=torch.int32,
+                                                                  device=self.dev), g, c))
         x.pix = torch.as_tensor((st.mask_scaled.astype(np.float64) / (N * N)).astype(np.float32),
                                 device=self.dev)
         x.mask_scaled = torch.as_tensor(st.mask_scaled, device=self.dev)
@@ -217,10 +253,16 @@ class GpuBackend:
         timed = stream is self.compute
         with _OnStream(stream):
             ea = self._ev(stream) if timed else None
-            if cfg.k1_impl == "staged":
+            if cfg.k1_impl == "staged" and len(x.k1passes) == 1:
                 uv = k1_staged(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
                                offset=float(st.inp.offset), w_v=x.w_v, geom=x.k1geom,
                                stream=stream)                                      # [F, n, A, 2]
+            elif cfg.k1_impl == "staged":
+                uv = torch.empty((F, n, int(x.csr["n_act"]), 2), dtype=torch.float32,
+                                 device=self.dev)
+                for f0, f1, sh, g, c in x.k1passes:
+                    k1_staged(x.codes, x.c_v, c, sh, t_lo=r0, n_t=n, offset=float(st.inp.offset),
+                              w_v=x.w_v, geom=g, out=uv[f0:f1], stream=stream)
             else:
                 uv = k1_combine(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
                                 offset=float(st.inp.offset), w_v=x.w_v)            # [F, n, A, 2]

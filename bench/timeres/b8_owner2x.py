@@ -571,7 +571,7 @@ def cmd_kernels(a) -> int:
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="pruned")  # noqa: E731
                 elif v == "dense":
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="irfft2")  # noqa: E731
-                elif v in ("warp", "fused", "fused_v1"):
+                elif v in ("warp", "fused", "fused_v1", "fused_v2"):
                     fn = _warp_runner(uvt, plan, inp, dev, mode=v)
                 else:
                     continue
@@ -692,7 +692,7 @@ def _warp_runner(uvt, plan, inp, dev, mode: str = "warp"):
     from dsart.x2.search.kernels_cuda import k23_tables, launch_k23
     tables = k23_tables(lines, n_fl, dev, pix=pix)
 
-    def run_fused(kname="k23v2_256"):
+    def run_fused(kname="k23v2p_256"):
         launch_k23(uv2, tables, tw, pix, ring, B=B, n_act=A, n_t=B, F=1, t0=0, R_img=B,
                    transpose=tr, stream=torch.cuda.current_stream(), kname=kname)
         return ring.view(B, N, N)
@@ -701,6 +701,8 @@ def _warp_runner(uvt, plan, inp, dev, mode: str = "warp"):
         return run_fused
     if mode == "fused_v1":
         return lambda: run_fused("k23_fused_256")
+    if mode == "fused_v2":
+        return lambda: run_fused("k23v2_256")
 
     def run():
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
@@ -1128,8 +1130,9 @@ def main(argv=None) -> int:
     c = sub.add_parser("compile-check")
     c.add_argument("--out", default="b8_out")
     k = sub.add_parser("kernels")
-    k.add_argument("--fft", default="cufft,warp,fused_v1,fused",
-                   help="cufft, dense, warp, fused (k23v2_256), fused_v1 (k23_fused_256)")
+    k.add_argument("--fft", default="cufft,warp,fused_v1,fused_v2,fused",
+                   help="cufft, dense, warp, fused (k23v2p_256), fused_v2 (k23v2_256), "
+                        "fused_v1 (k23_fused_256)")
     k.add_argument("--k3b", default="box,b3x,v1,fused,cuda,reg",
                    help="filter banks (box, b3x) and implementations (v1, fused, cuda, reg)")
     k.add_argument("--k1", default="triton,staged", help="K1 variants (triton, staged)")

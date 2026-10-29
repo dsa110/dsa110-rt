@@ -124,7 +124,7 @@ def plan_parts(bank) -> list:
 
 
 def reg_source(bank, part: Sequence[int], *, dq: int = 4, name: str = "k3b_reg",
-               threads: int = 128, chunk: int = 64, mode: str = "keys") -> tuple:
+               threads: int = 128, chunk: int = 64, mode: str = "keys", minb: int = 0) -> tuple:
     """Kernel source for filters ``part``. ``mode="keys"``: per-(pixel, chunk)
     keys for every pixel, and the raw scores of the tap pixels (``tappix`` is
     then the per-pixel tap index, -1 = not a tap: a predicated store in the
@@ -157,7 +157,7 @@ def reg_source(bank, part: Sequence[int], *, dq: int = 4, name: str = "k3b_reg",
     w("    unsigned int o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);")
     w("    return ((unsigned long long)o << 32) | (unsigned long long)(((255 - k) << 8) | (255 - t));")
     w("}")
-    w(f'extern "C" __global__ void __launch_bounds__({threads}) {name}(')
+    w(f'extern "C" __global__ void __launch_bounds__({threads}{", " + str(minb) if minb else ""}) {name}(')
     w("    const __half* __restrict__ ring, const float* __restrict__ si_,")
     w("    const float* __restrict__ sk_, unsigned long long* __restrict__ keys,")
     w("    const int* __restrict__ tappix, float* __restrict__ taps,")

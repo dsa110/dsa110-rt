@@ -103,6 +103,7 @@ class EngineConfig:
     k3b_impl: str = "v1"                     # GPU K3b: "v1" | "fused" (Triton) | "cuda" | "reg"
     k1_impl: str = "triton"                  # GPU K1: "triton" | "staged" (CUDA smem windows)
     rows_per_batch: int = 64
+    k1_fdm_per_pass: int = 24               # staged K1: fine DMs per launch (register accumulators)
     fetch_threads: int = 3                   # GPU path: ring copies ahead of the launches
     wait_timeout_s: Optional[float] = 0.0
     sigma_history_cycles: int = 160          # >= 30 s of 201 ms cycles
