@@ -105,6 +105,7 @@ class EngineConfig:
     rows_per_batch: int = 64
     k1_fdm_per_pass: int = 24               # staged K1: fine DMs per launch (register accumulators)
     fetch_threads: int = 3                   # GPU path: ring copies ahead of the launches
+    cpu_impl: str = "twin"                   # CPU path: "twin" (exactness refs) | "fast" (cpu_fast)
     wait_timeout_s: Optional[float] = 0.0
     sigma_history_cycles: int = 160          # >= 30 s of 201 ms cycles
 
@@ -374,6 +375,17 @@ class OwnerEngine:
         sr.loaded_hi = hi
         sr.loaded_lo = max(sr.loaded_lo, hi - sr.n_slots)
 
+    def _cpu_kernels(self) -> tuple:
+        """``(k1, k3b)`` of the CPU path: the numpy twins (exactness
+        references, ``cpu_impl="twin"``) or ``cpu_fast`` (``"fast"``: K1 bit
+        for bit, K3b to fp32 summation order -- offline replays / CPU e2e)."""
+        if self.cfg.cpu_impl == "twin":
+            return k1_twin, k3b_twin
+        if self.cfg.cpu_impl == "fast":
+            from .cpu_fast import k1_fast, k3b_fast
+            return k1_fast, k3b_fast
+        raise ValueError(f"cpu_impl={self.cfg.cpu_impl!r} (twin|fast)")
+
     def _image_rows(self, st: DmState, lo: int, hi: int) -> None:
         """K1 + K2/K3a for absolute rows ``[lo, hi)`` into the image ring."""
         spec = st.spec
@@ -381,11 +393,11 @@ class OwnerEngine:
         if self._gpu is not None:
             self._gpu.image_rows(st, lo, hi)
             return
+        k1 = self._cpu_kernels()[0]
         for r0 in range(lo, hi, self.cfg.rows_per_batch):
             n = min(self.cfg.rows_per_batch, hi - r0)
-            uv = k1_twin(st.streams.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
-                         shifts=spec.shifts, t_lo=r0, n_t=n,
-                         w_v=st.inp.w_v)                                   # [F, n, n_act]
+            uv = k1(st.streams.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
+                    shifts=spec.shifts, t_lo=r0, n_t=n, w_v=st.inp.w_v)   # [F, n, n_act]
             uvb = np.ascontiguousarray(np.swapaxes(uv, 0, 1)).reshape(n * spec.n_fdm, -1)
             if self.cfg.fft_mode == "twin":
                 img = image_from_uv_twin(uvb, st.fft, st.mask_scaled)
@@ -512,10 +524,10 @@ class OwnerEngine:
         sigma_applied, s_k_applied, sigma_inv, s_inv = self._dm_sigma(st, t0, t1, sigma_new)
         tm["layer1_ms"] = 1e3 * (time.perf_counter() - a)
         a = time.perf_counter()
-        best, tk, taps = k3b_twin(st.image, ring_row0=0, c_first=t0 - st.delay, n_c=spec.hop,
-                                  sigma_inv=sigma_inv, s_inv=s_inv, bank=self.bank,
-                                  clip=cfg.clip_sigma, chunk=cfg.chunk,
-                                  tap_pixels=st.tap_pixels)
+        best, tk, taps = self._cpu_kernels()[1](
+            st.image, ring_row0=0, c_first=t0 - st.delay, n_c=spec.hop, sigma_inv=sigma_inv,
+            s_inv=s_inv, bank=self.bank, clip=cfg.clip_sigma, chunk=cfg.chunk,
+            tap_pixels=st.tap_pixels)
         tm["k3b_ms"] = 1e3 * (time.perf_counter() - a)
         K = len(self.bank)
         flat = taps.reshape(K, -1)
@@ -668,10 +680,11 @@ class OwnerEngine:
         scratch = StreamRing(spec.n_stream, int(st.inp.c_v.shape[1]), s_hi - s_lo + 1)
         k0_rows_to_ring(scratch, raw, valid, row0=int(s_lo), fmt=st.inp.fmt)
         N = self.cfg.n_grid
+        k1 = self._cpu_kernels()[0]
         for r0 in range(t_lo, t_hi, batch_rows):
             n = min(batch_rows, t_hi - r0)
-            uv = k1_twin(scratch.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
-                         shifts=spec.shifts, t_lo=r0, n_t=n, w_v=st.inp.w_v)
+            uv = k1(scratch.codes, c_v=st.inp.c_v, offset=st.inp.offset, csr=st.inp.csr,
+                    shifts=spec.shifts, t_lo=r0, n_t=n, w_v=st.inp.w_v)
             uvb = np.ascontiguousarray(np.swapaxes(uv, 0, 1)).reshape(n * spec.n_fdm, -1)
             if self.cfg.fft_mode == "twin":
                 img = image_from_uv_twin(uvb, st.fft, st.mask_scaled, out_dtype=np.float16)
