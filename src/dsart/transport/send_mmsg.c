@@ -141,6 +141,12 @@ txm_create(const txm_config_t *cfg, const txm_dest_t *dests, char *err, size_t e
         q->slots = (uint8_t *)malloc((size_t)cfg->queue_slots * cfg->slot_bytes);
         q->lens = (uint32_t *)calloc(cfg->queue_slots, sizeof(uint32_t));
         if (!q->slots || !q->lens) { EM("out of memory (queues)"); txm_destroy(t); return NULL; }
+        /* Pre-fault the queue now (x2 WS-C, 2026-10-29): a 16384-slot queue is 147 MB per
+         * destination, and touching it for the first time cost the corr's first ~10 blocks
+         * ~30 ms each of page faults in the submit path. Creation runs before the service
+         * reports ready, so the cost (~0.1 s per destination) lands outside the hot path. */
+        memset(q->slots, 0, (size_t)cfg->queue_slots * cfg->slot_bytes);
+        memset(q->lens, 0, (size_t)cfg->queue_slots * sizeof(uint32_t));
         memset(&q->addr, 0, sizeof(q->addr));
         q->addr.sin_family = AF_INET;
         q->addr.sin_port = htons(dests[d].port);

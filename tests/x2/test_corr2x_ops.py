@@ -50,6 +50,38 @@ def test_cal_yaml_antenna_order_both_layouts(tmp_path, monkeypatch, layout) -> N
     assert np.array_equal(cfi.load_station_numbers_for_cal(dat), np.asarray(order, np.int64))
 
 
+def test_x2_epoch_from_the_capture_mon_shm(tmp_path, monkeypatch) -> None:
+    """SPEC §5: t0_native = 2 x SNAP specnum. The epoch is the armed capture's
+    utc_start_specnum from its MON shm (the PSRDADA header is a static template); live
+    segments must agree, stale ones (dead pid / old update) are ignored; page n_in = 1 then
+    starts at 2 x utc_start_specnum."""
+    import struct
+    import time
+
+    from dsart.capture import mon_shm as ms
+    monkeypatch.setattr(ms, "_SHM_DIR", str(tmp_path))
+
+    def seg(port, utc, *, pid=None, age_s=0.0, state=ms.ArmState.WRITING):
+        b = struct.pack(ms._FMT, ms._MON_MAGIC, ms._MON_VERSION, port, 11223, 0, int(state),
+                        os.getpid() if pid is None else pid, 0, int((time.time() - age_s) * 1e9),
+                        utc, 0, 0, *([0] * 12), 0, 0, 0, 0, 0)
+        (tmp_path / f"dsart-capture-{port}").write_bytes(b)
+
+    assert cfi.capture_epoch_specnum() is None                 # nothing armed
+    U = 2048 * 123456
+    seg(4001, U)
+    seg(4002, U)
+    seg(4003, U + 7, pid=2 ** 22 + 12345)                       # a dead capture: ignored
+    seg(4004, U + 9, age_s=120.0)                               # a stale segment: ignored
+    assert cfi.capture_epoch_specnum() == U
+    n0 = cfi.x2_native0_from_specnum(U)
+    assert n0 + 1 * 4096 == 2 * U and n0 % 32 == 0
+    seg(4002, U + 2048)
+    assert cfi.capture_epoch_specnum() is None                 # live captures disagree
+    n1 = cfi.x2_native0_from_specnum(U + 5)                    # not a multiple of 16
+    assert n1 % 32 == 0 and 0 < 2 * (U + 5) - (n1 + 4096) < 32
+
+
 def test_plan_id_check() -> None:
     plan = SimpleNamespace(plan_id=0x1234ABCD)
     cfi.check_x2_plan_id(plan, None)
@@ -181,3 +213,50 @@ def test_host_pin_persist_flag(persist) -> None:
     else:
         assert new + force >= 3                                # today: the page is re-pinned
         assert n_fin >= 1                                      # today: entries are never removed
+
+
+_PREPIN = r"""
+import subprocess, numpy as np
+from psrdada import Reader, Writer
+from dsart.services import host_pin as hp
+KEY = 0xd2f8                                            # x2 WS-C test key, removed below
+B, N = 1 << 20, 6
+subprocess.run(["dada_db", "-d", "-k", "d2f8"], capture_output=True)
+assert subprocess.run(["dada_db", "-k", "d2f8", "-b", str(B), "-n", str(N), "-l", "-p", "-r", "1"],
+                      capture_output=True).returncode == 0
+try:
+    w = Writer(KEY)
+    w.setHeader({"X2_TEST": "1"})
+    r = Reader(KEY)
+    r.getHeader()
+    pages, bufsz = hp.psrdada_page_addresses(r, KEY)
+    info = hp.prepin_psrdada_reader(r, KEY, expected_bufsz=B)
+    new0 = hp.stats()["register_new"]
+    seen = []
+    for i in range(2 * N):
+        p = w.getNextPage(); np.asarray(p)[:] = i; w.markFilled()
+        q = np.asarray(r.getNextPage())
+        seen.append(int(q.ctypes.data))
+        assert hp.maybe_register_host_buffer(q)
+        r.markCleared()
+    print("PREPIN", len(pages), bufsz, info.get("registered"), hp.stats()["register_new"] - new0,
+          int(set(seen) <= set(pages)), int(hp.psrdada_page_addresses(r, KEY + 1) is None))
+    r.disconnect(); w.disconnect()
+finally:
+    subprocess.run(["dada_db", "-d", "-k", "d2f8"], capture_output=True)
+"""
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+def test_host_pin_prepins_every_psrdada_page() -> None:
+    """DSART_HOST_PIN_PERSIST=1: every data-block page of a connected psrdada Reader is
+    registered at once (libpsrdada's dada_hdu_db_addresses through the Reader's dada_hdu_t*,
+    checked against its key first); the pages the reader then hands out are among them and
+    need no further registration; a wrong key refuses to read the layout."""
+    env = dict(os.environ, DSART_HOST_PIN_PERSIST="1")
+    r = subprocess.run([sys.executable, "-c", _PREPIN], env=env, capture_output=True, text=True,
+                       timeout=300)
+    assert r.returncode == 0, r.stderr[-2000:]
+    n, bufsz, reg, new_later, subset, wrong_key = (int(x) for x in r.stdout.split("PREPIN")[1].split())
+    assert (n, bufsz, reg, new_later, subset, wrong_key) == (6, 1 << 20, 6, 0, 1, 1)
