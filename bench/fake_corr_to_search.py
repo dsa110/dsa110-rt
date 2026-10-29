@@ -957,7 +957,12 @@ def _ring_load_common(a, *, engines: bool, name: str) -> int:
         eng = {}
         if engines and a.engine:
             for j, n in enumerate(drv.rx_nodes):
-                r = drv.run_on(n, f"cat {drv.results}/{a.marker}_engine_{j}_{n}/*.json 2>/dev/null "
+                # the engines finish after the TX: wait (<= 300 s) for each one's final JSON, or a fast
+                # node's result is read before a slower node's engine has written it (G1 smoke run)
+                edir = f"{drv.results}/{a.marker}_engine_{j}_{n}"
+                drv.run_on(n, f"for i in $(seq 150); do grep -qs '\"final\": true' {edir}/*.json && break; "
+                              "sleep 2; done", timeout=330)
+                r = drv.run_on(n, f"cat {edir}/*.json 2>/dev/null "
                                   "| head -c 200000")
                 eng[n] = r.stdout[:200000] if r.returncode == 0 else None
     finally:
