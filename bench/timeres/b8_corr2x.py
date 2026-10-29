@@ -231,8 +231,9 @@ def _triton_specs():
     r = dict(scr_ptr=f32, ring_ptr=f16, cptr_ptr="*i32", csrc_ptr="*i32", cconj_ptr="*u8",
              crow_ptr="*i32", t_ring0=i32, T_ring=i32, n_fv=i32, n_ring_rows=i32)
     p = dict(codes_ptr="*i8", out_ptr="*u8", n_comp=i32, n_bytes=i32, s_in=i32, s_out=i32)
-    rs = dict(x_ptr=f32, r_ptr=f32, t_ptr=f32, m_ptr="*i32", c_ptr="*i32", S=i32, V=i32, s_d=i32,
-              s_t=i32)
+    rs = dict(x_ptr=f32, r_ptr=f32, t_ptr=f32, u_ptr=f32, m_ptr="*i32", c_ptr="*i32", S=i32, V=i32,
+              s_d=i32, s_t=i32)
+    sk = dict(x_ptr=f32, sky_ptr=f32, S=i32, V=i32)
     cd = dict(x_ptr=f32, r_ptr=f32, invm_ptr=f32, invh_ptr=f32, okm_ptr="*i8", okh_ptr="*i8",
               out_ptr="*i8", S=i32, V=i32, NH=i32, s_d=i32, s_t=i32)
     nofma = {"enable_fp_fusion": False}
@@ -248,6 +249,7 @@ def _triton_specs():
         ("dsart.x2.corr.gemm2x", "_reduce_kernel", r, [dict(NSUM=192, BLOCK_T=64)]),
         ("dsart.x2.corr.packer2x", "_pack_bits_kernel", p, [dict(B=b, BLOCK=256) for b in (4, 5, 6)]),
         ("dsart.x2.corr.packer2x", "_row_stats_kernel", rs, [dict(BLOCK_V=256)], nofma),
+        ("dsart.x2.corr.static_sky2x", "_sub_sky_kernel", sk, [dict(BLOCK_V=512)], nofma),
         ("dsart.x2.corr.packer2x", "_codes_kernel", cd, [dict(CMAX=c, BLOCK_V=256) for c in (7, 15, 31)],
          nofma),
         ("dsart.services.triton_corr_fused", "_fused_corr_post_no_cat_kernel", c1, [c1c]),

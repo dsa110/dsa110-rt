@@ -4057,6 +4057,61 @@ def _prewarm_rfi_far(ctx) -> None:
     LOG.info("RFI FAR thresholds pre-solved in %.1f s (M=%d)", time.monotonic() - t0, full_m)
 
 
+def capture_epoch_specnum(ports: "list[int] | None" = None) -> "int | None":
+    """The armed start specnum of this node's capture(s), from their MON shm
+    (``/dev/shm/dsart-capture-<port>``, ``utc_start_specnum``; the PSRDADA
+    header the capture writes is a static template, its UTC_START a fixed
+    date). Every armed segment found must agree; None when none is armed or
+    they disagree (logged)."""
+    import glob as _glob
+    from dsart.capture import mon_shm as _ms
+    if ports is None:
+        ports = []
+        for p in _glob.glob(os.path.join(_ms._SHM_DIR, "dsart-capture-*")):
+            try:
+                ports.append(int(p.rsplit("-", 1)[1]))
+            except ValueError:
+                continue
+    vals = {}
+    for port in sorted(set(ports)):
+        try:
+            m = _ms.MonShm.open(int(port))
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            snap = m.snapshot()
+        finally:
+            m.close()
+        try:                                     # a live capture, not a stale segment
+            os.kill(int(snap.pid), 0)
+        except (OSError, ValueError):
+            continue
+        if time.time() - snap.last_update_utc_ns * 1e-9 > 30.0:
+            continue
+        if snap.arm_state in (_ms.ArmState.ARMED, _ms.ArmState.WRITING) and snap.utc_start_specnum:
+            vals[port] = int(snap.utc_start_specnum)
+    if not vals:
+        LOG.warning("x2 epoch: no armed capture MON shm found (ports %s)", ports or "none")
+        return None
+    if len(set(vals.values())) != 1:
+        LOG.error("x2 epoch: captures disagree on utc_start_specnum: %s", vals)
+        return None
+    return next(iter(vals.values()))
+
+
+def x2_native0_from_specnum(utc_start_specnum: int) -> int:
+    """``native0`` such that page n_in = 1 (block_n = 1) starts at native sample
+    ``2 x utc_start_specnum`` (SPEC §5). Frames need t0_native % T_native == 0 (T <= 32),
+    so the armed specnum should be a multiple of 16; otherwise the epoch is rounded down
+    to the 32-native grid and the offset logged."""
+    n0 = 2 * int(utc_start_specnum) - 4096
+    r = n0 % 32
+    if r:
+        LOG.error("x2 epoch: utc_start_specnum %d is not a multiple of 16; t0_native rounded "
+                  "down by %d native samples (%.1f us)", utc_start_specnum, r, r * 32.768)
+    return n0 - r
+
+
 def check_x2_plan_id(plan, plan_id: str | None) -> None:
     """SPEC §10: refuse to start when the loaded tiered plan is not the set's ``${plan_id}``
     (hex, with or without ``0x``). ``None`` / empty = no check (development runs)."""
@@ -4167,6 +4222,7 @@ def run(
     x2_tx_burst_bytes: int = 16 << 10,
     plan_id: str | None = None,
     x2_block0: int = 0,
+    x2_epoch: str = "capture",
 ) -> dict[str, Any]:
     """Connect to PSRDADA fada, run the integration pipeline per block,
     optionally serialise per-block artefacts.
@@ -4250,6 +4306,10 @@ def run(
         fada_header = reader.getHeader()
         LOG.info("fada header: %d keys (UTC_START=%s)",
                  len(fada_header), fada_header.get("UTC_START", "?"))
+        # DSART_HOST_PIN_PERSIST=1: pin every fada page now, before the ready sentinel, instead
+        # of ~30-46 ms per page on each page's first visit (the first ring pass)
+        from dsart.services import host_pin as _host_pin
+        _host_pin.prepin_psrdada_reader(reader, fada_key, expected_bufsz=expected_fada_bytes)
 
         if cfg.cal_path is None:
             raise RuntimeError(
@@ -5039,6 +5099,17 @@ def run(
                     break
                 continue
 
+            if x2_orch is not None and n_in == 1 and not x2_block0 and x2_epoch == "capture":
+                # SPEC §5: frames carry absolute native indices (2 x SNAP specnum); the first
+                # page starts at the capture's armed specnum
+                _u = capture_epoch_specnum()
+                if _u is not None:
+                    x2_orch.native0 = x2_native0_from_specnum(_u)
+                    LOG.info("x2 epoch: utc_start_specnum %d -> native0 %d (page 1 at t0_native "
+                             "%d)", _u, x2_orch.native0, x2_orch.native0 + 4096)
+                else:
+                    LOG.warning("x2 epoch: no capture epoch; frames use the relative block "
+                                "numbering (t0_native = n_in x 4096)")
             if orch is not None:
                 # x2 pipelined orchestrator: stages this page on the copy
                 # stream, issues the previous block, hands the one before
@@ -5605,10 +5676,13 @@ def main(argv: list[str] | None = None) -> int:
                         "--chan-sum-factor 2 --n-sub <2|4>; --dm-plan-path then "
                         "names a TieredDmPlan npz, else the plan is built).")
     p.add_argument("--x2-block0", type=int, default=0,
-                   help="2x: block index of the first fada page (frames carry t0_native = "
-                        "(block0 + n) x 4096 native samples); several corr nodes started together "
-                        "on replayed data share one value so their rows line up at the search "
-                        "nodes (default 0: today's n_in numbering)")
+                   help="2x, BENCHES ONLY: block index of the first fada page (frames carry "
+                        "t0_native = (block0 + n) x 4096); replaying corr nodes share one value. "
+                        "Overrides --x2-epoch")
+    p.add_argument("--x2-epoch", default="capture", choices=("capture", "none"),
+                   help="2x: absolute t0_native (SPEC §5, 2 x specnum) from the armed capture's "
+                        "utc_start_specnum (its MON shm) at the first page (default), or 'none' "
+                        "for the relative n_in numbering")
     p.add_argument("--plan-id", default=None,
                    help="2x: expected tiered-plan id (hex, the set's ${plan_id}); corr_fast "
                         "refuses to start when the loaded plan differs (SPEC §10)")
@@ -5986,6 +6060,7 @@ def main(argv: list[str] | None = None) -> int:
             opoint=args.opoint,
             plan_id=args.plan_id,
             x2_block0=args.x2_block0,
+            x2_epoch=args.x2_epoch,
             x2_tx_bind_host=args.x2_tx_bind_host,
             x2_tx_cpu=args.x2_tx_cpu,
             x2_tx_pace=args.x2_tx_pace,

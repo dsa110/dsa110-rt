@@ -65,6 +65,36 @@ def test_batched_static_sky_equals_per_dm() -> None:
     assert bs.running_mean() is None
 
 
+def test_batched_static_sky_keeps_excised_samples_zero() -> None:
+    """2x: an excised sample (exactly 0 + 0i) stays exactly 0 after the subtraction (an
+    all-excised block becomes all zeros, not -sky); every other sample is unchanged versus
+    StaticSkyMean; the window still takes the block's mean."""
+    from dsart.services.corr_fast_integration import StaticSkyMean
+    rng = np.random.default_rng(1)
+    n_d, n_t, V = 3, 10, 21
+    bs = BatchedStaticSky(n_d=n_d, n_values=V, window_blocks=3, warmup_cubes=1)
+    per = StaticSkyMean(window_blocks=3, warmup_cubes=1, n_dm=n_d)
+    rs = ref.StaticSkyRef(window_blocks=3, warmup_cubes=1)
+    for blk in range(8):
+        x = (rng.normal(size=(n_d, n_t, V)) + 1j * rng.normal(size=(n_d, n_t, V)) + 3.0).astype(np.complex64)
+        x[0, 2:5] = 0                                       # excised rows
+        x[1, :, 7] = 0                                      # an excised value
+        if blk == 5:
+            x[:] = 0                                        # a whole excised block
+        xt = torch.from_numpy(x)
+        want = torch.stack([per.apply(xt[d].clone(), dm_slot=d) for d in range(n_d)])
+        got = bs.apply_(xt.clone())
+        r64 = np.stack([rs.apply(d, x[d].astype(np.complex128)) for d in range(n_d)])
+        zero = torch.from_numpy(x == 0)
+        assert (got[zero] == 0).all()
+        if blk >= 1 and blk != 5:
+            assert (got[~zero] != 0).all()
+        torch.testing.assert_close(got[~zero], want[~zero], rtol=2e-6, atol=2e-6)
+        np.testing.assert_allclose(got.numpy(), r64, rtol=1e-5, atol=1e-5)
+        if blk == 5:
+            assert (got == 0).all()
+
+
 @pytest.mark.parametrize("bits", [4, 5, 6])
 def test_pack_bits_torch_equals_reference(bits) -> None:
     rng = np.random.default_rng(bits)
@@ -294,6 +324,56 @@ def test_lowmed_rows_selection_equals_the_sort(dev) -> None:
     assert torch.equal(got, med), (got - med).abs().max()
 
 
+@pytest.mark.parametrize("dev", ["cpu", "cuda"])
+def test_excision_release_and_step_up_bit_equal_to_quant(dev) -> None:
+    """quant v1.1 on the packer (CPU twin; CUDA with capacity 0 + resolve_overflow), every
+    block == quant.RowQuantiser: a long excision whose residue is ~1e-9 of the noise leaves
+    sigma_hat exactly where it was, the release guards no row, and a x3 level step resets
+    sigma_hat in one block (no guarded rows either)."""
+    if dev == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA-only")
+    rule = quant.RowRule.for_format(8, 2, warmup_blocks=1)
+    rng = np.random.default_rng(21)
+    V, n_d, S = VOFF[-1], 3, 64
+    n = rng.integers(1, 2000, size=V)
+    pk = RowRulePacker(n_d=n_d, value_offsets=VOFF, n_contrib=n, n_heavy=NH, rule=rule, device=dev,
+                       guard_capacity=0 if dev == "cuda" else 8)
+    flows = _flows(rule, n, n_d)
+    v10 = _flows(quant.RowRule.for_format(8, 2, warmup_blocks=1, used_floor=0.0, reset_factor=0.0),
+                 n, n_d)
+    amp = np.sqrt(n)
+    plan = [1.0] * 6 + [1e-9] * 40 + [1.0] * 4 + [3.0] * 4
+    sig0 = None
+    g_release = g_step = g10 = 0
+    for i, scale in enumerate(plan):
+        x = ((rng.normal(size=(n_d, S, V)) + 1j * rng.normal(size=(n_d, S, V))) * amp * scale)
+        x = x.astype(np.complex64)
+        xt = torch.from_numpy(x).to(dev)
+        if dev == "cuda":
+            res = pk.pack(xt, resolve_overflow=False)
+            pk.resolve_overflow(res, xt)
+            res = [{k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in r.items()} for r in res]
+        else:
+            res = pk.pack(xt)
+        _assert_block_equal(res, flows, x, rule)
+        g = sum(int(q.process_block(x[d, :, VOFF[s_]:VOFF[s_ + 1]]).guarded.sum()) for (d, s_), q in v10.items())
+        if i >= 46:
+            g10 += g
+        if i == 5:
+            sig0 = pk.sigma.cpu().clone()
+        if 6 <= i < 46:
+            assert torch.equal(pk.sigma.cpu(), sig0)            # held through the excision
+        n_g = sum(int(r["guarded"].sum()) for r in res)
+        if 46 <= i < 50:
+            g_release += n_g
+        if i >= 50:
+            g_step += n_g
+    # 64-row blocks of 30-40 values: a row's robust scale has ~15% scatter, so an odd row may
+    # cross 1.5 x on noise; v1.0 guards the whole release and the step (~2 x 3 x 64 rows a block)
+    assert g_release + g_step <= 4 and g10 > 500, (g_release, g_step, g10)
+    assert float((pk.sigma.cpu() / sig0).min()) > 2.5           # reset onto the x3 level
+
+
 def test_packer_rejects_a_non_quant_rule() -> None:
     with pytest.raises(TypeError):
         RowRulePacker(n_d=1, value_offsets=[0, 4], n_contrib=np.ones(4), n_heavy=[0], rule=object())
@@ -362,6 +442,12 @@ ok = []
 a = pk.row_stats_triton(xs, r, t, block_v=16)
 b = pk.row_stats_torch(xs, r, t)
 ok.append(torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]))
+u = torch.tensor([0.3, 1e-6])                            # quant v1.1 used thresholds
+x2 = x.copy(); x2[0, 2, lo:lo + 20] = 1e-3               # sub-threshold values in flow 0
+xs2 = torch.from_numpy(x2)[:, :, lo:lo + V]
+a2 = pk.row_stats_triton(xs2, r, t, u, block_v=16)
+b2 = pk.row_stats_torch(xs2, r, t, u)
+ok.append(torch.equal(a2[0], b2[0]) and torch.equal(a2[1], b2[1]) and not torch.equal(a2[0], a[0]))
 inv_m = torch.from_numpy(rng.uniform(0.2, 3, size=(n_d, S)).astype(np.float32))
 inv_h = torch.from_numpy(rng.uniform(0.05, 1, size=(n_d, S)).astype(np.float32))
 inv_m[0, 4] = 1.0
@@ -383,7 +469,7 @@ ok.append(not torch.equal(c1, c2))
 print("RESULT", *ok)
 """
     out = run_interpreted(code)
-    assert "RESULT " + " ".join(["True"] * 7) in out, _last(out)
+    assert "RESULT " + " ".join(["True"] * 8) in out, _last(out)
 
 
 def test_packer_with_triton_kernels_interpreted_equals_quant() -> None:
@@ -490,3 +576,23 @@ def test_static_sky_and_v1_gpu_equals_cpu() -> None:
     q1, s1 = pack_v1(x)
     q2, s2 = pack_v1(x.cuda())
     assert torch.equal(q1, q2.cpu()) and torch.equal(s1, s2.cpu())
+
+
+@pytest.mark.x2_gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA-only (CP1)")
+def test_sky_subtraction_kernel_equals_the_torch_twin() -> None:
+    """The fused CUDA kernel (x -= sky except where x == 0 + 0i) == the torch twin bit for
+    bit, including excised rows / values / components of signed zero and a partial last block."""
+    from dsart.x2.corr.static_sky2x import subtract_sky_keep_zeros_
+    rng = np.random.default_rng(9)
+    n_d, S, V = 4, 37, 1201
+    x = (rng.normal(size=(n_d, S, V)) + 1j * rng.normal(size=(n_d, S, V))).astype(np.complex64)
+    x[1, 3:9] = 0
+    x[2, :, 17] = 0
+    x[0, 5, 6] = complex(0.0, 1.5)                         # re 0, im non-zero: subtracted
+    x[3, 7, 8] = complex(-0.0, -0.0)                       # signed zero: stays
+    sky = (rng.normal(size=(n_d, V)) + 1j * rng.normal(size=(n_d, V))).astype(np.complex64)
+    a = subtract_sky_keep_zeros_(torch.from_numpy(x.copy()), torch.from_numpy(sky))
+    b = subtract_sky_keep_zeros_(torch.from_numpy(x.copy()).cuda(), torch.from_numpy(sky).cuda()).cpu()
+    assert torch.equal(torch.view_as_real(a), torch.view_as_real(b))
+    assert (b[1, 3:9] == 0).all() and (b[2, :, 17] == 0).all()

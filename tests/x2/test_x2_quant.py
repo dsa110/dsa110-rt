@@ -43,25 +43,35 @@ def _scalar_block(x, n_contrib, n_heavy, sigma_prev, blocks_seen, rule):
     im = [[F32(F32(x[j, v].imag) * r[v]) for v in range(V)] for j in range(S)]
     k = F32(rule.robust_k)
     sigma = F32(sigma_prev)
+    thr = F32(F32(rule.used_floor) * sigma)                 # v1.1 used threshold
+
+    def unused(a, b):
+        return abs(a) <= thr and abs(b) <= thr
+
     if blocks_seen >= rule.warmup_blocks:
         comps, m, M = [], 0, 0
         for j in range(0, S, rule.est_stride):
             for v in range(V):
                 M += 1
-                if re[j][v] == 0 and im[j][v] == 0:
+                if unused(re[j][v], im[j][v]):
                     continue
                 m += 1
                 comps += [abs(re[j][v]), abs(im[j][v])]
         if m >= max(rule.min_count, math.ceil(0.5 * M)):
             est = max(F32(k * _lowmed(comps)), F32(1e-30))
-            sigma = est if sigma == 0 else F32(sigma + F32(rule.alpha_f32 * F32(est - sigma)))
+            if sigma == 0:
+                sigma = est
+            elif rule.reset_factor > 0 and est > F32(F32(rule.reset_factor) * sigma):
+                sigma = est                                    # v1.1 reset on a step up
+            else:
+                sigma = F32(sigma + F32(rule.alpha_f32 * F32(est - sigma)))
     out = np.zeros((S, V, 2), np.int64)
     guard = np.zeros(S, bool)
     need = max(rule.min_count, math.ceil(0.5 * V))
     for j in range(S):
         sig = sigma
         if sigma > 0:
-            comps = [c for v in range(V) if not (re[j][v] == 0 and im[j][v] == 0)
+            comps = [c for v in range(V) if not unused(re[j][v], im[j][v])
                      for c in (abs(re[j][v]), abs(im[j][v]))]
             if len(comps) // 2 >= need:
                 srow = F32(k * _lowmed(comps))
@@ -201,13 +211,66 @@ def test_ema_initialises_then_tracks_with_tau_3s():
     rule = q.RowRule()
     s = q.ema_update(F32(0), F32(2.0), rule)
     assert s == F32(2.0)
-    s1 = q.ema_update(s, F32(3.0), rule)
+    s1 = q.ema_update(s, F32(3.0), rule)                # 3.0 = 1.5 x 2.0: not above, so EMA
     assert s1 == F32(F32(2.0) + F32(rule.alpha_f32 * F32(1.0)))
     assert q.ema_update(s1, None, rule) == s1
     s = F32(1.0)
-    for _ in range(int(round(3.0 / q.BLOCK_S))):       # ~tau: 63% of the step
-        s = q.ema_update(s, F32(2.0), rule)
+    for _ in range(int(round(3.0 / q.BLOCK_S))):       # ~tau: 63% of a x1.4 step
+        s = q.ema_update(s, F32(1.4), rule)
+    assert 1.24 < float(s) < 1.264
+    v10 = q.RowRule(reset_factor=0.0)                   # v1.0: a x2 step is tracked by the EMA
+    s = F32(1.0)
+    for _ in range(int(round(3.0 / q.BLOCK_S))):
+        s = q.ema_update(s, F32(2.0), v10)
     assert 1.6 < float(s) < 1.66
+
+
+def test_v11_step_up_resets_sigma_hat():
+    """v1.1: est > f32(1.5) * sigma_hat sets sigma_hat = est in one block; a step down and a
+    step up to exactly 1.5 x keep the EMA."""
+    rule = q.RowRule()
+    assert q.ema_update(F32(1.0), F32(2.0), rule) == F32(2.0)
+    assert q.ema_update(F32(1.0), F32(1.5), rule) == F32(F32(1.0) + F32(rule.alpha_f32 * F32(0.5)))
+    assert q.ema_update(F32(2.0), F32(0.5), rule) == F32(F32(2.0) + F32(rule.alpha_f32 * F32(-1.5)))
+    assert q.ema_update(F32(1.0), F32(2.0), q.RowRule(reset_factor=0.0)) < F32(1.1)
+
+
+def test_v11_used_threshold():
+    """v1.1: |re| and |im| both <= f32(1e-6 * sigma_hat_prev) -> unused; 0 threshold = v1.0."""
+    rule = q.RowRule()
+    thr = rule.used_threshold(F32(2.0))
+    assert thr == F32(F32(1e-6) * F32(2.0))
+    re = np.array([0, 1e-7, 3e-6, 0, np.inf, -0.0], np.float32)
+    im = np.array([0, 1e-7, 0, 1e-5, 1.0, 0.0], np.float32)
+    np.testing.assert_array_equal(q._used(re, im, thr), [False, False, True, True, False, False])
+    np.testing.assert_array_equal(q._used(re, im), [False, True, True, True, False, False])
+
+
+@pytest.mark.parametrize("v11", [True, False])
+def test_excision_then_release(v11):
+    """A long whole-cube excision whose static-sky residue is ~1e-9 of the noise: v1.1 holds
+    sigma_hat through it (residue unused -> no update) and the release guards no row; v1.0
+    lets sigma_hat collapse onto the residue and the release guards every row."""
+    kw = {} if v11 else dict(used_floor=0.0, reset_factor=0.0)
+    rule = q.RowRule(comp_bits=4, warmup_blocks=1, **kw)
+    rng = np.random.default_rng(3)
+    S, V = 64, 200
+    n = rng.integers(10, 2000, size=V)
+    rq = q.RowQuantiser(rule, n, 4)
+    amp = np.sqrt(n)[None, :].astype(np.float32)
+    for _ in range(10):
+        rq.process_block(_noise(rng, (S, V), 1.0) * amp)
+    s0 = rq.sigma
+    for _ in range(600):                                    # excised: residue only
+        rq.process_block(_noise(rng, (S, V), 1e-9) * amp)
+    s_exc = rq.sigma
+    guarded = [int(rq.process_block(_noise(rng, (S, V), 1.0) * amp).guarded.sum()) for _ in range(5)]
+    if v11:
+        assert s_exc == s0
+        assert sum(guarded) == 0
+    else:
+        assert s_exc < F32(1e-6) * s0
+        assert guarded[0] == S
 
 
 def test_warmup_then_initialise_from_first_valid_block():

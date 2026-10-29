@@ -94,14 +94,15 @@ _RINT_CLAMP = tl.constexpr(256.0)               # |q| clamp before the magic rin
 
 
 @triton.jit
-def _row_stats_kernel(x_ptr, r_ptr, t_ptr, m_ptr, c_ptr, S, V, s_d, s_t,
+def _row_stats_kernel(x_ptr, r_ptr, t_ptr, u_ptr, m_ptr, c_ptr, S, V, s_d, s_t,
                       BLOCK_V: tl.constexpr):
-    """One program per (flow d, row j): ``m`` = used values, ``c`` = used
-    magnitudes (re and im) ``< t[d]``."""
+    """One program per (flow d, row j): ``m`` = used values (finite, |re| or |im| above
+    ``u[d]``), ``c`` = used magnitudes (re and im) ``< t[d]``."""
     row = tl.program_id(0)
     d = row // S
     j = row - d * S
     t = tl.load(t_ptr + d)
+    u = tl.load(u_ptr + d)
     base = x_ptr + d * s_d + j * s_t
     m = tl.zeros((BLOCK_V,), tl.int32)
     c = tl.zeros((BLOCK_V,), tl.int32)
@@ -115,7 +116,7 @@ def _row_stats_kernel(x_ptr, r_ptr, t_ptr, m_ptr, c_ptr, S, V, s_d, s_t,
         yim = xim * r
         are = tl.abs(yre)
         aim = tl.abs(yim)
-        used = (are <= _F32_MAX) & (aim <= _F32_MAX) & ((yre != 0.0) | (yim != 0.0))
+        used = (are <= _F32_MAX) & (aim <= _F32_MAX) & ((are > u) | (aim > u))
         m += used.to(tl.int32)
         c += (used & (are < t)).to(tl.int32) + (used & (aim < t)).to(tl.int32)
     tl.store(m_ptr + row, tl.sum(m, axis=0))
@@ -193,7 +194,8 @@ def _check_xs(xs: torch.Tensor) -> None:
         raise ValueError("xs rows must be contiguous (V, 2)")
 
 
-def row_stats_triton(xs: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *, block_v: int = 256):
+def row_stats_triton(xs: torch.Tensor, r: torch.Tensor, t: torch.Tensor, u: torch.Tensor | None = None,
+                     *, block_v: int = 256):
     """``(m, cnt)`` int32 ``(n_d, S)`` (see :func:`row_stats_torch`)."""
     _check_xs(xs)
     n_d, S, V, _ = xs.shape
@@ -201,18 +203,32 @@ def row_stats_triton(xs: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *, bloc
     c = torch.empty_like(m)
     if n_d * S == 0:
         return m, c
-    _row_stats_kernel[(n_d * S,)](xs, r.contiguous(), t.contiguous(), m, c, S, V,
+    if u is None:
+        u = torch.zeros_like(t)
+    _row_stats_kernel[(n_d * S,)](xs, r.contiguous(), t.contiguous(), u.contiguous(), m, c, S, V,
                                   xs.stride(0), xs.stride(1), BLOCK_V=block_v,
                                   enable_fp_fusion=False)
     return m, c
 
 
-def row_stats_torch(xs: torch.Tensor, r: torch.Tensor, t: torch.Tensor):
-    """Twin of :func:`row_stats_triton`: per row the used count ``m`` and the
-    number of used magnitudes (re and im) below the flow's ``t``."""
+def _used_t(y: torch.Tensor, thr: torch.Tensor | None) -> torch.Tensor:
+    """quant v1.1 "used" over the last axis (re, im) of float32 ``y``: both finite and
+    |re| or |im| above ``thr`` (broadcast over the leading axes; None = 0: not 0 + 0i)."""
+    a = y.abs()
+    if thr is None:
+        big = (a > 0).any(-1)
+    else:
+        th = thr.reshape(tuple(thr.shape) + (1,) * (a.dim() - 1 - thr.dim()))
+        big = (a > th[..., None]).any(-1)
+    return torch.isfinite(y).all(-1) & big
+
+
+def row_stats_torch(xs: torch.Tensor, r: torch.Tensor, t: torch.Tensor, u: torch.Tensor | None = None):
+    """Twin of :func:`row_stats_triton`: per row the used count ``m`` (used threshold
+    ``u`` per flow) and the number of used magnitudes (re and im) below the flow's ``t``."""
     y = xs * r[None, None, :, None]
     a = y.abs()
-    used = torch.isfinite(y).all(-1) & (y != 0).any(-1)
+    used = _used_t(y, u)
     m = used.sum(-1, dtype=torch.int32)
     lt = (a < t[:, None, None, None]) & used[..., None]
     return m, lt.sum((-1, -2), dtype=torch.int32)
@@ -381,6 +397,8 @@ class RowRulePacker:
         self._s_heavy = f32(rule.s_heavy_f32)
         self._guard = f32(rule.guard_factor)
         self._floor = f32(quant.SIGMA_FLOOR)
+        self._ufloor = f32(rule.used_floor)                     # v1.1 used threshold factor
+        self._reset = f32(rule.reset_factor) if rule.reset_factor > 0 else None   # v1.1
         self._one = f32(1.0)
         self._need = [max(int(rule.min_count),
                           int(math.ceil(rule.min_used_frac * (self.voff[s + 1] - self.voff[s]))))
@@ -402,10 +420,11 @@ class RowRulePacker:
 
     # ------------------------------------------------------------------
 
-    def _lowmed(self, y: torch.Tensor):
+    def _lowmed(self, y: torch.Tensor, thr: torch.Tensor | None = None):
         """``y`` float32 ``(..., V, 2)`` -> (lower median of the used values'
-        2m magnitudes, m) over the last two axes, exact (sort + select)."""
-        used = torch.isfinite(y).all(-1) & (y != 0).any(-1)
+        2m magnitudes, m) over the last two axes, exact (sort + select); ``thr`` = the used
+        threshold per leading index (None = 0)."""
+        used = _used_t(y, thr)
         a = torch.where(used[..., None], y.abs(), torch.full_like(y, float("inf")))
         a = a.flatten(-2)
         srt = torch.sort(a, dim=-1).values
@@ -414,7 +433,7 @@ class RowRulePacker:
         return srt.gather(-1, idx.unsqueeze(-1)).squeeze(-1), m
 
     @staticmethod
-    def _lowmed_rows(y: torch.Tensor) -> torch.Tensor:
+    def _lowmed_rows(y: torch.Tensor, thr: torch.Tensor | None = None) -> torch.Tensor:
         """:meth:`_lowmed` of each row of ``y`` float32 ``(G, V, 2)`` whose used count m is
         >= 1, by selection instead of a sort: an unused value contributes ``-inf`` (re) and
         ``+inf`` (im), so its two entries sit on either side of the 2m used magnitudes and the
@@ -422,19 +441,19 @@ class RowRulePacker:
         for every m -- one ``topk`` with a constant k. An exact selection (no arithmetic), so
         the value is the sort's bit for bit; ~6x cheaper for a block of guarded rows."""
         G, V, _ = y.shape
-        used = torch.isfinite(y).all(-1) & (y != 0).any(-1)
+        used = _used_t(y, thr)
         a = y.abs()
         lo = torch.where(used, a[..., 0], torch.full_like(a[..., 0], float("-inf")))
         hi = torch.where(used, a[..., 1], torch.full_like(a[..., 1], float("inf")))
         flat = torch.stack((lo, hi), -1).reshape(G, 2 * V)
         return torch.topk(flat, V + 1, dim=-1, largest=True, sorted=False).values.amin(-1)
 
-    def _estimate(self, xs: torch.Tensor, r: torch.Tensor):
+    def _estimate(self, xs: torch.Tensor, r: torch.Tensor, thr: torch.Tensor | None = None):
         rule = self.rule
         n_d = xs.shape[0]
         sub = xs[:, :: rule.est_stride]
         y = sub * r[None, None, :, None]
-        med, m = self._lowmed(y.reshape(n_d, -1, 2))
+        med, m = self._lowmed(y.reshape(n_d, -1, 2), thr)
         M = sub.shape[1] * sub.shape[2]
         m_min = max(int(rule.min_count), int(math.ceil(rule.min_used_frac * M)))
         ok = (m >= m_min) & (m > 0)
@@ -447,6 +466,8 @@ class RowRulePacker:
         d = est - sp
         mm = self._alpha_t * d
         upd = sp + mm
+        if self._reset is not None:                   # v1.1: a step up re-converges at once
+            upd = torch.where(est > self._reset * sp, est, upd)
         return torch.where(ok, torch.where(is_set, upd, est), sp)
 
     def _thresholds(self, sig: torch.Tensor):
@@ -455,19 +476,22 @@ class RowRulePacker:
         return torch.where(valid, t, torch.zeros_like(t)), valid
 
     def _code_stream(self, xs: torch.Tensor, r: torch.Tensor, sig: torch.Tensor, s: int,
-                     capacity: int, tv=None) -> dict:
+                     capacity: int, tv=None, thr: torch.Tensor | None = None) -> dict:
         """Guard + codes + payload of stream ``s`` for the flows in ``xs``
         (float32 ``(n_f, S, V, 2)`` view) at sigma_hat ``sig`` ``(n_f,)``;
-        ``tv`` = precomputed ``(t, valid)`` for these flows."""
+        ``tv`` = precomputed ``(t, valid)`` for these flows; ``thr`` = the flows' used
+        threshold (quant v1.1, from sigma_hat before this block; None = 0)."""
         n_f, S, V, _ = xs.shape
         nh = self.n_heavy[s]
         dev = xs.device
         pos = sig > 0
+        if thr is None:
+            thr = torch.zeros_like(sig)
         t, valid = self._thresholds(sig) if tv is None else tv
         if self.use_triton:
-            m_row, cnt = row_stats_triton(xs, r, t)
+            m_row, cnt = row_stats_triton(xs, r, t, thr)
         else:
-            m_row, cnt = row_stats_torch(xs, r, t)
+            m_row, cnt = row_stats_torch(xs, r, t, thr)
         half = torch.div(2 * m_row - 1, 2, rounding_mode="floor")
         guarded = (pos & valid)[:, None] & (m_row >= self._need[s]) & (cnt <= half)
         sigma_row = torch.where(pos, sig, torch.zeros_like(sig))[:, None].expand(n_f, S).contiguous()
@@ -476,7 +500,7 @@ class RowRulePacker:
             order = torch.argsort(guarded.to(torch.int8), dim=1, descending=True, stable=True)[:, :K]
             cand = torch.gather(guarded, 1, order)
             rows = xs[torch.arange(n_f, device=dev)[:, None], order]          # (n_f, K, V, 2)
-            med, _ = self._lowmed(rows * r[None, None, :, None])
+            med, _ = self._lowmed(rows * r[None, None, :, None], thr)
             s_c = self._k * med
             sigma_row.scatter_(1, order, torch.where(cand, s_c, torch.gather(sigma_row, 1, order)))
         overflow = guarded.sum(1) > K
@@ -505,7 +529,7 @@ class RowRulePacker:
             "payload": payload.reshape(n_f, S, bps),
             "codes_heavy": codes[:, :, :nh], "codes_main": codes[:, :, nh:],
             "sigma": sig, "sigma_row": sigma_row, "step_main": step_m, "step_heavy": step_h,
-            "guarded": guarded, "guard_overflow": overflow,
+            "guarded": guarded, "guard_overflow": overflow, "used_thr": thr,
         }
 
     # ------------------------------------------------------------------
@@ -526,11 +550,14 @@ class RowRulePacker:
         do_est = self.blocks_seen >= int(self.rule.warmup_blocks)
         self.blocks_seen += 1
         out = []
+        # quant v1.1 used threshold, from sigma_hat BEFORE this block's update
+        thr_all = self._ufloor * self.sigma
         # per-flow scalars of all streams at once (one EMA, one threshold solve): the
         # per-stream loop below only runs the data-sized kernels
         if do_est:
             parts = [self._estimate(xr[:, :, self.voff[s]:self.voff[s + 1]],
-                                    self.r[self.voff[s]:self.voff[s + 1]]) for s in range(self.n_sub)]
+                                    self.r[self.voff[s]:self.voff[s + 1]], thr_all[:, s])
+                     for s in range(self.n_sub)]
             est = torch.stack([p[0] for p in parts], 1)
             ok = torch.stack([p[1] for p in parts], 1)
             m_used = torch.stack([p[2] for p in parts], 1)
@@ -544,7 +571,8 @@ class RowRulePacker:
         for s in range(self.n_sub):
             lo, hi = self.voff[s], self.voff[s + 1]
             res = self._code_stream(xr[:, :, lo:hi], self.r[lo:hi], sig_all[:, s], s,
-                                    self.guard_capacity, tv=(t_all[:, s], valid_all[:, s]))
+                                    self.guard_capacity, tv=(t_all[:, s], valid_all[:, s]),
+                                    thr=thr_all[:, s])
             res["est"] = est[:, s]
             res["n_used"] = m_used[:, s]
             out.append(res)
@@ -552,7 +580,7 @@ class RowRulePacker:
             self.resolve_overflow(out, x)
         return out
 
-    def _recode_rows(self, s: int, rows: torch.Tensor):
+    def _recode_rows(self, s: int, rows: torch.Tensor, thr: torch.Tensor | None = None):
         """Exact ``s_row`` (guarded rows: m >= need >= 1), steps, int8 codes ``(G, V, 2)`` and
         payload rows ``(G, bps)`` of ``rows`` float32 ``(G, V, 2)`` of stream ``s``. The
         kernels see the rows as ``(G, 1, V, 2)``: every integer argument (S = 1, V, strides)
@@ -564,7 +592,7 @@ class RowRulePacker:
         G = int(rows.shape[0])
         cb = self.rule.comp_bits
         r = self.r[lo:hi]
-        med = self._lowmed_rows(rows * r[None, :, None])
+        med = self._lowmed_rows(rows * r[None, :, None], thr)
         s_c = self._k * med
         step_m = self._s_main * s_c
         step_h = self._s_heavy * s_c
@@ -596,7 +624,8 @@ class RowRulePacker:
         for s in range(self.n_sub):
             V = self.voff[s + 1] - self.voff[s]
             for G in (1, 2, 16, 17):                     # whatever the row count, the same kernels
-                self._recode_rows(s, torch.ones((G, V, 2), dtype=torch.float32, device=self.device))
+                self._recode_rows(s, torch.ones((G, V, 2), dtype=torch.float32, device=self.device),
+                                  torch.zeros(G, dtype=torch.float32, device=self.device))
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
@@ -627,7 +656,8 @@ class RowRulePacker:
             fi, ri = torch.nonzero(res["guarded"] & ov[:, None], as_tuple=True)
             self.n_overflow_resolved += int(torch.unique(fi).numel())
             rows = xr[fi, ri, lo:hi]                                  # (G, V, 2) float32
-            s_c, step_m, step_h, codes, pay = self._recode_rows(s, rows)
+            thr_rows = res["used_thr"][fi] if "used_thr" in res else None
+            s_c, step_m, step_h, codes, pay = self._recode_rows(s, rows, thr_rows)
             res["sigma_row"][fi, ri] = s_c
             res["step_main"][fi, ri] = step_m
             res["step_heavy"][fi, ri] = step_h
