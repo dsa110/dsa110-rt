@@ -113,8 +113,12 @@ def test_h2d_speedup_after_registration():
     actually engaging.
     """
     size = 64 * 1024 * 1024                  # 64 MB — long enough to dominate launch overhead
-    arr_pageable = np.zeros(size, dtype=np.uint8)
-    arr_pinned = np.zeros(size, dtype=np.uint8)
+    # np.ones, not np.zeros: untouched calloc pages all map the kernel's shared zero page, and
+    # a "pageable" copy out of it ran at 7.7 ms instead of ~19 ms on n05 (2026-10-29), failing
+    # the ratio whenever the allocator handed out fresh pages -- a property of the allocator
+    # state left by earlier tests, not of pinning
+    arr_pageable = np.ones(size, dtype=np.uint8)
+    arr_pinned = np.ones(size, dtype=np.uint8)
 
     def _bench(arr, n_iter=10):
         torch.cuda.synchronize()

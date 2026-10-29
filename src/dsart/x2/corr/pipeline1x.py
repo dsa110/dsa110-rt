@@ -66,6 +66,7 @@ from __future__ import annotations
 import gc
 import logging
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -243,6 +244,10 @@ class PipelinedCorrFast:
         else:
             self._copy_stream = self._d2h_stream = None
         self._slot_free: list[Any] = [None] * self.N_SLOTS
+        #: (h2d_done, host page) of copies still in flight: a pinned page is read by the DMA
+        #: after ``_stage`` returns, so it stays referenced until its copy has landed (a
+        #: caller without a ``release`` callback may drop its own reference at once)
+        self._inflight: deque = deque()
         self._staged: _Staged | None = None
         self._done: deque[_Done] = deque()
         self._n_staged = 0
@@ -324,6 +329,7 @@ class PipelinedCorrFast:
             torch.cuda.synchronize(self.ctx.device)
         self._staged = None
         self._done.clear()
+        self._inflight.clear()
         self._slot_free = [None] * self.N_SLOTS
         self._n_staged = 0
         self._ring_primed = False
@@ -381,7 +387,14 @@ class PipelinedCorrFast:
             )
         slot = self._n_staged % self.N_SLOTS
         self._n_staged += 1
-        src = torch.as_tensor(arr)
+        if arr.flags["WRITEABLE"]:
+            src = torch.as_tensor(arr)
+        else:
+            # PSRDADA reader pages (and replayed bytes) are read-only views; the tensor is only
+            # ever the source of the H2D copy, so torch's "not writable" warning does not apply
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                src = torch.as_tensor(arr)
         dst = self._raw[slot]
         timer = self.ctx.stage_timer
         if not self.cuda:
@@ -408,6 +421,9 @@ class PipelinedCorrFast:
                 timer.span_end("h2d", cs)
             ev = torch.cuda.Event()
             ev.record(cs)
+        while self._inflight and self._inflight[0][0].query():
+            self._inflight.popleft()
+        self._inflight.append((ev, arr))
         return _Staged(block_n=int(block_n), slot=slot, h2d_done=ev)
 
     # ------------------------------------------------------------------

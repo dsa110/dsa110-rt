@@ -1180,6 +1180,9 @@ class TxDrainMonitor:
     sender's queue depth every ``period_s``. Per block: the drain time from the submit (the
     ``enqueued`` step) to an empty queue. Sender thread CPU = utime+stime over the run."""
 
+    GROUP_S = 0.060          # submits closer than this belong to one block (tiers A, B)
+    SKIP_BLOCKS = 32         # steady-state queue depth: after the start-up transient
+
     def __init__(self, cfi, period_s: float = 2.5e-4) -> None:
         self.cfi, self.period_s = cfi, period_s
         self.tx = None
@@ -1188,6 +1191,8 @@ class TxDrainMonitor:
         self.t0 = None
         self.drain_ms: list[float] = []
         self.submit_t: list[float] = []
+        self.backlog_t: list[float] = []
+        self.depth_max_steady = 0
         self.backlog_at_submit = 0
         self.last = None                     # last counters before corr_fast closes the sender
         self.cpu_last: dict = {}
@@ -1234,18 +1239,22 @@ class TxDrainMonitor:
             depth = sum(d["depth"] for d in c)
             now = time.monotonic()
             if last_enq is not None and enq > last_enq:
-                # the tiers of one block are submitted back to back: a step more than 30 ms
-                # after this block's first one while it is still queued = the next block's
-                # submit found a backlog
-                if t_sub is None or now - t_sub > 0.030:
+                # the tiers of one block are submitted within one emit (tier B up to ~30 ms
+                # after tier A): a step more than GROUP_S after this block's first one while it
+                # is still queued = the next block's submit found a backlog
+                if t_sub is None or now - t_sub > self.GROUP_S:
                     self.submit_t.append(now)
+                    if t_sub is not None:
+                        self.backlog_t.append(now - self.t0)
                 if t_sub is None:
                     t_sub = now
-                elif now - t_sub > 0.030:
+                elif now - t_sub > self.GROUP_S:
                     self.backlog_at_submit += 1
                     self.drain_ms.append((now - t_sub) * 1e3)
                     t_sub = now
             last_enq = enq
+            if len(self.submit_t) > self.SKIP_BLOCKS:
+                self.depth_max_steady = max(self.depth_max_steady, max(d["depth"] for d in c))
             if t_sub is not None and depth == 0:
                 self.drain_ms.append((now - t_sub) * 1e3)
                 t_sub = None
@@ -1277,6 +1286,8 @@ class TxDrainMonitor:
                                "p99": float(np.percentile(d, 99)), "max": float(d.max()),
                                "mean": float(d.mean())}
         out["blocks_submitted_with_backlog"] = self.backlog_at_submit
+        out["backlog_at_s"] = [round(x, 1) for x in self.backlog_t[:40]]
+        out["dest_depth_max_steady"] = self.depth_max_steady
         iv = np.diff(np.asarray(self.submit_t[8:])) * 1e3
         if iv.size:
             out["submit_interval_ms"] = {"p1": float(np.percentile(iv, 1)), "p50": float(np.percentile(iv, 50)),
@@ -1387,6 +1398,7 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
         per_blk = max(tl.get("dest_enqueued") or [0]) / max(1, int(s.get("n_blocks_processed", 1)))
         gates["tx_drains_inside_block"] = bool(tl.get("drain_ms")) and tl["drain_ms"]["p99"] < BLOCK_MS
         gates["tx_queue_below_2_blocks"] = max(tl.get("dest_max_depth") or [1 << 30]) < 2 * per_blk
+        tl["datagrams_per_block_per_dest"] = per_blk
     return _finish(args.out, "live_2x.json", res, gates)
 
 

@@ -3640,9 +3640,7 @@ def load_antpos_from_cal_blob(
         import yaml as _yaml
         with open(yaml_path, "r") as f:
             ydoc = _yaml.safe_load(f)
-        # per-node cal yaml (``cal_solutions: {antenna_order: ...}``) or the archived
-        # beamformer_weights_<utc>.yaml (top-level ``antenna_order``, x2 replay staging)
-        antenna_order = (ydoc.get("cal_solutions") or ydoc)["antenna_order"]
+        antenna_order = cal_yaml_antenna_order(ydoc)          # either yaml layout
         mask = core_baseline_mask_from_station_numbers(antenna_order)
     else:
         # No per-node cal yaml sibling (production case). Use the
@@ -3671,6 +3669,17 @@ def load_antpos_from_cal_blob(
                 antpos_e.size,
             )
     return (antpos_e, antpos_n, mask)
+
+
+def cal_yaml_antenna_order(ydoc: dict):
+    """``antenna_order`` of a cal yaml in either layout: today's per-node yaml
+    (``cal_solutions: {antenna_order: [...], ...}``) or the 2025-era
+    ``beamformer_weights_<utc>.yaml`` with the keys at the top level
+    (``antenna_order, caltime, delays, eastings, flagged_antennas, northings,
+    ...``; e.g. the cal live for 250924mptq). Historical cals are legitimate
+    inputs (replays, re-imaging)."""
+    cs = ydoc.get("cal_solutions") or ydoc
+    return cs["antenna_order"]
 
 
 def load_station_numbers_for_cal(
@@ -3705,7 +3714,7 @@ def load_station_numbers_for_cal(
                 import yaml as _yaml
                 with open(yaml_path, "r") as f:
                     ydoc = _yaml.safe_load(f)
-                order = (ydoc.get("cal_solutions") or ydoc)["antenna_order"]
+                order = cal_yaml_antenna_order(ydoc)                # either yaml layout
                 return np.asarray(order, dtype=np.int64)
             except Exception:  # noqa: BLE001
                 LOG.exception(
