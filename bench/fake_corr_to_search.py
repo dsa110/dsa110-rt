@@ -1466,6 +1466,9 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
             "tx_gbps": 8.0 * sum(tl.get("dest_bytes") or [0]) / (res["minutes"] * 60.0) / 1e9 if tl else None,
             "tx_drain_p99_ms": (tl.get("drain_ms") or {}).get("p99"),
             "tx_sender_cpu_frac": tl.get("sender_cpu_frac"),
+            # corr_fast's CUDA-event stage timer: the GPU time of one block, and per stage
+            "gpu_block_ms": ((s.get("stage_timer") or {}).get("stage_ms") or {}).get("block_gpu"),
+            "stage_ms": (s.get("stage_timer") or {}).get("stage_ms"),
         }
         overruns = None
         if not row["missing"] and s:
@@ -1609,14 +1612,16 @@ def replay_markdown(res: dict) -> str:
         L += [f"Corr nodes not warm at the start: {res['not_ready_at_start']}", ""]
     L += ["## Corr (per node; block time from corr_fast's summary, over-budget blocks from the trace, which "
           "skips the first 32 blocks)", "",
-          "| node | chg | mean ms | p99 ms | max ms | steady p99 / max ms | blocks > 134.2 ms | blocks | overruns "
-          "| late start s | TX Gb/s | TX drops | sent n01/n02/n09/n13 | gates |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "| node | chg | mean ms | p99 ms | max ms | steady p99 / max ms | GPU block mean / p99 ms | "
+          "blocks > 134.2 ms | blocks | overruns | late start s | TX Gb/s | TX drops | sent n01/n02/n09/n13 | gates |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for n, r in (res.get("corr") or {}).items():
         sent = "/".join(str(x) for x in (r.get("tx_sent_per_dest") or [])) or "-"
         bad = [k for k, v in (r.get("gates") or {}).items() if not v]
         L.append(f"| {n} | {r['chgroup']} | {_f(r['mean_ms'])} | {_f(r['p99_ms'])} | {_f(r['max_ms'])} | "
-                 f"{_f(r['trace_p99_ms'])} / {_f(r['trace_max_ms'])} | {_f(r['over_budget_blocks'], '{}')} | {_f(r['n_blocks_in'], '{}')} | {_f(r['overruns'], '{}')} | "
+                 f"{_f(r['trace_p99_ms'])} / {_f(r['trace_max_ms'])} | "
+                 f"{_f((r.get('gpu_block_ms') or {}).get('mean'))} / {_f((r.get('gpu_block_ms') or {}).get('p99'))} | "
+                 f"{_f(r['over_budget_blocks'], '{}')} | {_f(r['n_blocks_in'], '{}')} | {_f(r['overruns'], '{}')} | "
                  f"{_f(r['writer_start_late_s'], '{:.2f}')} | {_f(r['tx_gbps'], '{:.2f}')} | "
                  f"{_f(r['tx_drops'], '{}')} | {sent} | {'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
     L += ["", "## Corner turn (per search node; loss on the non-lossy flows vs max(1e-4, PHY CRC fraction "
