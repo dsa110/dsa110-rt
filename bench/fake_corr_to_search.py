@@ -362,7 +362,8 @@ def format_framers(fmt: str, chgroup: int, plan_path: str, antpos_npz: str, dec_
     plan = TieredDmPlan.from_npz(plan_path)
     z = np.load(antpos_npz)
     mask = core_baseline_mask_from_station_numbers(z["station"])
-    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"], antpos_u=z["antpos_u"],
+    # SPEC §3 production inputs: antpos_u = None, as corr_fast and the owner engine do
+    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"],
                                     is_core_baseline_mask=mask, dec_deg=dec_deg)
     rule = q.RowRule.for_format(op.bits_main, op.n_sub, warmup_blocks=0)
     rng = np.random.default_rng(seed + chgroup)

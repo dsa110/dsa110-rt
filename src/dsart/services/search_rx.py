@@ -507,7 +507,9 @@ def make_ring4_spec(argv: Optional[List[str]] = None) -> int:
     plan = TieredDmPlan.from_npz(a.plan)
     z = np.load(a.antpos_npz)
     mask = core_baseline_mask_from_station_numbers(z["station"])
-    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"], antpos_u=z["antpos_u"],
+    # SPEC §3 production inputs: antpos_u = None (heights are not passed by corr or the engine; they
+    # enter pattern_id, so passing them here made the ring's ids disagree with the engine's)
+    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"],
                                     is_core_baseline_mask=mask, dec_deg=a.dec_deg)
     rule = RowRule.for_format(op.bits_main, op.n_sub)
     spec = RingV4Spec.for_node(plan, vm, op, node_index=a.node_index, rule=rule,
