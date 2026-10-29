@@ -26,7 +26,16 @@
                                          (--transport-tx-mode drain: framed, counted, never sent); the
                                          summary carries the TX counters; block-time and
                                          buffer-overrun gates
-  teardown                               remove /dev/shm/dsart-x2-* and /tmp/dsart-x2-*
+  replay-1x --run-id R --blocks N --out D
+                                         recorded voltages (bench/replay_voltage_dump.py, fixture R)
+                                         through the TEST DADA buffer 0xd2f0 (never fada): a line-rate
+                                         probe (writer at full speed into dada_dbnull), then the legacy
+                                         loop and the pipelined orchestrator on N replayed blocks each:
+                                         per-stage hashes equal, per-block timings
+  live ... --replay R                    the same corr_fast 2x run fed by the replay writer through
+                                         0xd2f0 instead of the node's fada (no SNAPs needed)
+  teardown                               remove /dev/shm/dsart-x2-*, /tmp/dsart-x2-* and the 0xd2f0
+                                         DADA buffer
 
 Exit codes: 0 every gate passed, 1 a gate failed (named in the JSON), 2 error. JSON goes under
 ``--out``. Test shm / files are named ``dsart-x2-*``. Budget: 134.218 ms per block (design 57
@@ -59,6 +68,10 @@ if os.path.join(ROOT, "src") not in sys.path:
 EXIT_OK, EXIT_GATE, EXIT_ERR = 0, 1, 2
 BLOCK_MS = 134.217728
 CORR_NODES = (3, 4, 5, 6, 7, 8, 10, 11, 12, 14, 15, 16, 18, 19, 21, 22)
+#: the x2 TEST fada DADA key (replay only; production uses dada/eada/fada/bada)
+REPLAY_KEY = "d2f0"
+FADA_BYTES = 301989888
+FIXTURE_ROOTS = ("/home/ubuntu/data/voltage_fixtures", "/home/ubuntu/data/voltages")
 MAP_NAMES = {"gridded": "gridded", "baselines": "baselines"}
 PROD_CORR_FAST_RE = r"dsart[.]services[.]corr_fast_integration"
 
@@ -204,7 +217,7 @@ def _triton_specs():
              nchan=i32, s_ch=i32, s_t=i32, s_p=i32, s_pk=i32, s_ant=i32)
     gc = dict(NSUM=192, NVP=2, CSF=2, PPFV=4, NC_PAD=96, BLOCK=16)
     r = dict(scr_ptr=f32, ring_ptr=f16, cptr_ptr="*i32", csrc_ptr="*i32", cconj_ptr="*u8",
-             crow_ptr="*i32", t_ring0=i32, T_ring=i32, n_fv=i32)
+             crow_ptr="*i32", t_ring0=i32, T_ring=i32, n_fv=i32, n_ring_rows=i32)
     p = dict(codes_ptr="*i8", out_ptr="*u8", n_comp=i32, n_bytes=i32, s_in=i32, s_out=i32)
     rs = dict(x_ptr=f32, r_ptr=f32, t_ptr=f32, m_ptr="*i32", c_ptr="*i32", S=i32, V=i32, s_d=i32,
               s_t=i32)
@@ -344,14 +357,16 @@ class Pages:
                 "inject_block": self.INJECT_BLOCK, "seed": self.seed}
 
 
-def _build_1x_ctx(dev, *, dec: float, recorder, inject: bool):
+def _build_1x_ctx(dev, *, dec: float, recorder, inject: bool, cal: tuple | None = None):
     """Production 1x context (corr_fast's own CLI parse of the yaml args) with
-    a recording TX and today's per-coarse-DM stage-2 FIFO."""
+    a recording TX and today's per-coarse-DM stage-2 FIFO. ``cal`` = (antennas.out,
+    flagants.dat) overrides the production cal (a fixture's own)."""
     import dsart.services.corr_fast_integration as cfi
     from dsart.common.constants import NATIVE_SAMPLE_US
+    set_ = {"--apply-cal": cal[0], "--flagants": cal[1]} if cal else None
     argv, env = _prod_argv(dec=dec, drop=("--transport-tx-*", "--sky-export-*", "--rfi-mon-*",
                                           "--inject-watch", "--ready-sentinel-path", "--output-dir",
-                                          "--max-blocks"))
+                                          "--max-blocks"), set_=set_)
     cap = _capture_cfg(argv)
     cfg = cap["cfg"]
     if inject:
@@ -425,6 +440,11 @@ def _install_taps(ctx, taps: dict, orch=None):
 
     cfi.apply_cal_split = cal
     p1.apply_cal_split = cal
+
+    def restore():                           # the module-level patch outlives the run otherwise
+        cfi.apply_cal_split = real_cal
+        p1.apply_cal_split = real_cal
+    cur["restore"] = restore
     if ctx.rfi_flagger is not None:
         class _Flag(_Delegate):
             def flag_block(self, re, im, **kw):
@@ -465,19 +485,145 @@ def _install_taps(ctx, taps: dict, orch=None):
     return cur
 
 
-def _run_blocks(mode: str, n_blocks: int, dev, dec: float, taps: dict | None):
-    """Legacy loop or PipelinedCorrFast over the Pages; returns timings."""
+# ---------------------------------------------------------------------------
+# recorded-voltage replay through a TEST DADA buffer
+# ---------------------------------------------------------------------------
+
+
+def _fixture_dir(run_id: str) -> str:
+    for r in FIXTURE_ROOTS:
+        if os.path.isfile(os.path.join(r, run_id, "manifest.yaml")):
+            return os.path.join(r, run_id)
+    raise FileNotFoundError(f"no voltage fixture {run_id!r} under {FIXTURE_ROOTS}")
+
+
+def _dada_db(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["dada_db", *args], capture_output=True, text=True, timeout=60)
+
+
+class ReplayBuffer:
+    """Context manager: create the TEST DADA buffer (key ``REPLAY_KEY``), remove it on exit."""
+
+    def __init__(self, nbufs: int = 12, readers: int = 1, key: str = REPLAY_KEY) -> None:
+        self.key, self.nbufs, self.readers = key, int(nbufs), int(readers)
+
+    def __enter__(self) -> "ReplayBuffer":
+        _dada_db("-d", "-k", self.key)                         # stale buffer of an aborted run
+        # production's flags (dsart_rt BufferSpec): -l lock pages, -p page-aligned, -c 1
+        r = _dada_db("-k", self.key, "-b", str(FADA_BYTES), "-n", str(self.nbufs), "-l", "-p",
+                     "-c", "1", "-r", str(self.readers))
+        if r.returncode != 0:
+            raise RuntimeError(f"dada_db -k {self.key} failed: {r.stderr.strip()[-400:]}")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        _dada_db("-d", "-k", self.key)
+
+
+def _fixture_file(run_id: str, chgroup: int) -> str:
+    f = glob.glob(os.path.join(_fixture_dir(run_id), f"fl_*_chgroup{chgroup}.out"))
+    if not f:
+        raise FileNotFoundError(f"fixture {run_id} has no chgroup {chgroup} voltage file")
+    return os.path.realpath(f[0])
+
+
+def _fixture_cal(run_id: str):
+    """The fixture's own (antennas.out, flagants.dat) when complete, else None (production cal)."""
+    d = os.path.join(_fixture_dir(run_id), "cals")
+    ant, fl = os.path.join(d, "antennas.out"), os.path.join(d, "flagants.dat")
+    ok = os.path.isfile(ant) and os.path.getsize(ant) == 74496 and os.path.isfile(fl)
+    return (ant, fl) if ok else None
+
+
+def _start_writer(run_id: str, chgroup: int, *, n_blocks: int, rate: str = "native",
+                  key: str = REPLAY_KEY, log: str | None = None, dec: float = 0.0,
+                  wait_for: str | None = None) -> subprocess.Popen:
+    """bench/timeres/x2_fada_replay.py (preloaded blocks, multi-threaded page fill); with
+    ``wait_for`` it starts writing when that file appears (corr_fast's ready sentinel)."""
+    cmd = [sys.executable, os.path.join(ROOT, "bench", "timeres", "x2_fada_replay.py"),
+           "--file", _fixture_file(run_id, chgroup), "--key", key, "--n-blocks", str(int(n_blocks)),
+           "--rate", rate, "--dec-deg", str(dec)]
+    if wait_for:
+        cmd += ["--wait-for", wait_for]
+    out = open(log, "w") if log else subprocess.DEVNULL
+    return subprocess.Popen(cmd, env=dict(os.environ, PYTHONPATH=os.path.join(ROOT, "src")),
+                            stdout=out, stderr=subprocess.STDOUT)
+
+
+def _writer_summary(log: str) -> dict:
+    try:
+        text = open(log).read()
+    except OSError:
+        return {}
+    for line in reversed(text.splitlines()):
+        if '"x2_fada_replay"' in line:
+            try:
+                return json.loads(line)
+            except ValueError:
+                break
+    return {"tail": text[-600:]}
+
+
+class DadaSource:
+    """Pages of a DADA buffer as (array, release) pairs (``release`` = markCleared)."""
+
+    def __init__(self, key: str = REPLAY_KEY, attach_timeout_s: float = 60.0) -> None:
+        from psrdada import Reader
+        t_end = time.time() + attach_timeout_s
+        while True:
+            try:
+                self.reader = Reader(int(key, 16))
+                break
+            except Exception:  # noqa: BLE001
+                if time.time() > t_end:
+                    raise
+                time.sleep(0.2)
+        self.header = self.reader.getHeader()
+        self.wait_s = 0.0
+        self._pages: dict = {}
+
+    def next(self):
+        t0 = time.perf_counter()
+        page = self.reader.getNextPage()
+        self.wait_s += time.perf_counter() - t0
+        arr = np.asarray(page)
+        # keep one array per ring page alive: host_pin unregisters a page when the numpy base
+        # it pinned is collected, and re-pinning 288 MB costs seconds (corr_fast holds its pages)
+        arr = self._pages.setdefault(arr.ctypes.data, arr)
+        return arr, self.reader.markCleared
+
+    def close(self) -> None:
+        try:
+            self.reader.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _fixture_manifest(run_id: str) -> dict:
+    import yaml
+    with open(os.path.join(_fixture_dir(run_id), "manifest.yaml")) as fh:
+        return yaml.safe_load(fh)
+
+
+def _run_blocks(mode: str, n_blocks: int, dev, dec: float, taps: dict | None, source=None,
+                cal: tuple | None = None, inject: bool = True):
+    """Legacy loop or PipelinedCorrFast over the Pages (or a DadaSource); returns timings.
+    With a source, ``busy_ms_*`` exclude the wait for the next page, ``throughput_ms`` is the
+    elapsed time per block with the writer ahead (no per-block synchronisation)."""
     import torch
     import dsart.services.corr_fast_integration as cfi
     from dsart.x2.corr.pipeline1x import PipelinedCorrFast
     pages = Pages()
     streams = None
-    recorder = _TapTx(taps if taps is not None else {}, None)
-    ctx, cfg, argv = _build_1x_ctx(dev, dec=dec, recorder=recorder, inject=True)
+    # timing runs (taps None) drop the cubes like a TX stub; hashing hundreds of MB per block
+    # (the taps) would dominate every stage span
+    recorder = _TapTx(taps, None) if taps is not None else cfi.NoOpTransportTx()
+    ctx, cfg, argv = _build_1x_ctx(dev, dec=dec, recorder=recorder, inject=inject, cal=cal)
     lay = ctx.multi_dm_coarse_dm.subband_layout
     if lay is not None:
         streams = [(int(lay.offsets[s]), int(lay.offsets[s + 1])) for s in range(lay.n_sub)]
-    recorder.streams = streams
+    if taps is not None:
+        recorder.streams = streams
     orch = PipelinedCorrFast(ctx) if mode == "pipelined" else None
     if orch is not None:
         orch.warmup(4)
@@ -485,23 +631,43 @@ def _run_blocks(mode: str, n_blocks: int, dev, dec: float, taps: dict | None):
         cfi._warmup_pipeline_jit(ctx, expected_fada_bytes=pages.page(0).size, n_blocks=4)
     cur = _install_taps(ctx, taps, orch) if taps is not None else None
     walls = []
+    t_start = None
     for b in range(1, n_blocks + 1):
         if cur is not None and orch is None:
             cur["b"] = b
+        if source is None:
+            page, release = pages.page(b), None
+        else:
+            page, release = source.next()
+        if t_start is None:
+            t_start = time.perf_counter()
         t0 = time.perf_counter()
         if orch is None:
-            cfi.process_block(pages.page(b), ctx=ctx, block_n=b)
+            cfi.process_block(page, ctx=ctx, block_n=b)
+            if source is None:
+                torch.cuda.synchronize()
+            if release is not None:
+                release()
         else:
-            orch.push(pages.page(b), block_n=b)
-        torch.cuda.synchronize()
+            orch.push(page, block_n=b, release=release)
+            if source is None:
+                torch.cuda.synchronize()
         walls.append((time.perf_counter() - t0) * 1e3)
     if orch is not None:
         orch.flush()
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - (t_start or time.perf_counter())
+    if cur is not None:
+        cur["restore"]()
     ctx.stage_timer.poll()
-    w = sorted(walls[4:]) or sorted(walls)
-    return {"mode": mode, "n_blocks": n_blocks, "argv": argv,
-            "wall_ms_mean": float(np.mean(w)), "wall_ms_p50": float(w[len(w) // 2]),
-            "wall_ms_max": float(w[-1]), "stage_ms": ctx.stage_timer.summary()["stage_ms"]}
+    skip = 4 if source is None else 16          # replay: the first pass pins the ring's pages
+    w = sorted(walls[skip:]) or sorted(walls)
+    out = {"mode": mode, "n_blocks": n_blocks, "argv": argv, "stats_skip_blocks": skip,
+           "wall_ms_mean": float(np.mean(w)), "wall_ms_p50": float(w[len(w) // 2]),
+           "wall_ms_max": float(w[-1]), "stage_ms": ctx.stage_timer.summary()["stage_ms"]}
+    if source is not None:
+        out.update(throughput_ms=1e3 * elapsed / n_blocks, page_wait_ms=1e3 * source.wait_s / n_blocks)
+    return out
 
 
 def cmd_profile_1x(args) -> int:
@@ -550,6 +716,77 @@ def cmd_compat_1x(args) -> int:
     return _finish(args.out, "compat_1x.json", res, gates)
 
 
+def _compare_taps(gold: dict, mine: dict) -> tuple[int, list]:
+    mism, n = [], 0
+    for b, stages in gold.items():
+        other = mine.get(b, {})
+        for k, v in stages.items():
+            n += 1
+            if other.get(k) != v:
+                mism.append(f"block {b} {k}")
+    return n, mism
+
+
+def cmd_replay_1x(args) -> int:
+    """Recorded voltages -> TEST DADA buffer -> legacy loop and pipelined orchestrator."""
+    _set_gpu_env(_prod_routine().get("env") or {})
+    import torch
+    if _production_corr_fast_pids():
+        print("replay-1x: production corr_fast is running; refusing", file=sys.stderr)
+        return EXIT_ERR
+    dev = torch.device(args.device)
+    man = _fixture_manifest(args.run_id)
+    cal = _fixture_cal(args.run_id)
+    _, chgroup = _cn_chgroup()
+    dec = float(man.get("dec_deg", args.dec))
+    os.makedirs(args.out, exist_ok=True)
+    res: dict = {"run_id": args.run_id, "chgroup": chgroup, "dec_deg": dec, "key": REPLAY_KEY,
+                 "file": _fixture_file(args.run_id, chgroup),
+                 "cal": cal[0] if cal else "production (fixture cal incomplete)"}
+    # 1. line-rate probe: writer at full speed, dada_dbnull drains
+    with ReplayBuffer(nbufs=12, readers=1):
+        log = os.path.join(args.out, "writer_probe.log")
+        null = subprocess.Popen(["dada_dbnull", "-k", REPLAY_KEY, "-z", "-s"], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        w = _start_writer(args.run_id, chgroup, n_blocks=args.probe_blocks, rate="fast", log=log, dec=dec)
+        try:
+            w.wait(timeout=600)
+            null.wait(timeout=60)
+        finally:
+            for p in (w, null):
+                if p.poll() is None:
+                    p.kill()
+        res["line_rate_probe"] = _writer_summary(log)
+    taps: dict = {}
+    for mode, tapped in (("legacy", False), ("pipelined", False), ("legacy", True), ("pipelined", True)):
+        t = {} if tapped else None
+        name = f"{mode}{'_taps' if tapped else ''}"
+        with ReplayBuffer(nbufs=12, readers=1):
+            log = os.path.join(args.out, f"writer_{name}.log")
+            w = _start_writer(args.run_id, chgroup, n_blocks=args.blocks, rate=args.rate, log=log, dec=dec)
+            src = None
+            try:
+                src = DadaSource()
+                res[name] = _run_blocks(mode, args.blocks, dev, dec, t, source=src, cal=cal, inject=False)
+                w.wait(timeout=120)
+            finally:
+                if src is not None:
+                    src.close()
+                if w.poll() is None:
+                    w.kill()
+            res[name]["writer"] = _writer_summary(log)
+        if tapped:
+            taps[mode] = t
+        torch.cuda.empty_cache()
+    n_cmp, mism = _compare_taps(taps["legacy"], taps["pipelined"])
+    res.update(n_compared=n_cmp, n_mismatches=len(mism), mismatches=mism[:100])
+    probe = res["line_rate_probe"].get("ms_per_block", float("inf"))
+    gates = {"stages_equal": n_cmp > 0 and not mism,
+             "writer_at_line_rate": probe <= BLOCK_MS,
+             "every_block_tapped": all(b in taps["legacy"] for b in range(1, args.blocks + 1))}
+    return _finish(args.out, "replay_1x.json", res, gates)
+
+
 # ---------------------------------------------------------------------------
 # kernels (2x)
 # ---------------------------------------------------------------------------
@@ -579,7 +816,7 @@ def _setup_2x(fmt, antpos, chgroup):
     geos = []
     for ti, t in enumerate(plan.tiers):
         sh = np.ascontiguousarray(plan.stage1_bins(ti)[chgroup].T.astype(np.int32))
-        geos.append((t, sh, geometry_for(sh, D=t.decim)))
+        geos.append((t, sh, geometry_for(sh, D=t.decim, n_out=512 // t.decim)))
     return op, vm, plan, csr, geos, mask
 
 
@@ -597,9 +834,9 @@ def describe(fmt: str, antpos, chgroup: int) -> dict:
     for t, sh, g in geos:
         n_out = 512 // t.decim
         out["tiers"].append(dict(
-            tier=t.name, n_d=t.n_coarse, D=t.decim, TT=g.TT, W=g.W, chunk=g.chunk,
+            tier=t.name, n_d=t.n_coarse, D=t.decim, TT=g.TT, OPT=g.OPT, W=g.W, chunk=g.chunk,
             spread=g.spread, smem_kib=round(g.smem_bytes / 1024, 1), threads=g.threads,
-            grid=[int(csr.n_values), -(-n_out // g.TT)],
+            grid=[int(csr.n_values)],
             out_gib=round(t.n_coarse * n_out * csr.n_values * 8 / 2 ** 30, 3),
             smem_reads_G=round(int(csr.row.size) * t.n_coarse * 512 / 1e9, 2)))
     return out
@@ -609,9 +846,10 @@ def _kernels_one(fmt, antpos, chgroup, dev, reps, check_ref):
     import torch
     from common import cuda_time_ms
     from dsart.services.slow_corr_kernel import unpack_int4_split
-    from dsart.x2.corr.gemm2x import (build_gemm_tables, gemm2x_into_ring, gemm2x_reference,
-                                      reduce_classes, ring_write_reference)
-    from dsart.x2.corr.packer2x import PackerRule, RowRulePacker
+    from dsart.x2.corr.gemm2x import build_gemm_tables, gemm2x_reference, ring_write_reference
+    from dsart.x2.corr.gemm2x_cuda import gemm2x_mma_into_ring, reduce_classes_cuda
+    from dsart.x2 import quant
+    from dsart.x2.corr.packer2x import RowRulePacker
     from dsart.x2.corr.stage1_cuda import Stage1Csr, stage1_tier_cuda, stage1_twin
     from dsart.x2.corr.static_sky2x import BatchedStaticSky
     op, vm, plan, csr, geos, mask = _setup_2x(fmt, antpos, chgroup)
@@ -624,16 +862,16 @@ def _kernels_one(fmt, antpos, chgroup, dev, reps, check_ref):
     ph = torch.from_numpy(rng.uniform(-np.pi, np.pi, size=(384, 2, 96)).astype(np.float32)).to(dev)
     cr, ci = torch.cos(ph).half().float(), torch.sin(ph).half().float()
     nsum = vm.nchan_eff
-    ring = torch.zeros((tab.n_ring_rows, nsum, 1024, 2), dtype=torch.float16, device=dev)
+    ring = torch.zeros((nsum, tab.n_ring_rows, 1024, 2), dtype=torch.float16, device=dev)  # k-major
     chunk = 128
-    scr = torch.empty((tab.n_scratch_rows, nsum, chunk, 2), device=dev) if classes else None
+    scr = torch.empty((nsum, chunk, tab.n_scratch_rows, 2), device=dev) if classes else None
 
     def gemm(q0=512):
         for f0 in range(0, 512, chunk):
-            gemm2x_into_ring(re, im, cr, ci, tab, ring, fv0=f0, n_fv=chunk, t_ring0=q0 + f0,
-                             csf=2, t_int=8, scratch=scr)
+            gemm2x_mma_into_ring(re, im, cr, ci, tab, ring, fv0=f0, n_fv=chunk, t_ring0=q0 + f0,
+                                 scratch=scr)
             if scr is not None:
-                reduce_classes(scr, ring, tab, t_ring0=q0 + f0, n_fv=chunk)
+                reduce_classes_cuda(scr, ring, tab, t_ring0=q0 + f0, n_fv=chunk)
 
     res = {"fmt": fmt, "gemm_ms": cuda_time_ms(gemm, reps=reps)}
     gemm(0)
@@ -643,7 +881,7 @@ def _kernels_one(fmt, antpos, chgroup, dev, reps, check_ref):
         want = gemm2x_reference(re, im, cr, ci, tab, fv0=0, n_fv=16, csf=2, t_int=8)
         if classes:
             want = ring_write_reference(want, tab, vm.classes.bl_class, vm.classes.bl_conj)
-        got = torch.complex(ring[:, :, 512:528, 0].float(), ring[:, :, 512:528, 1].float()).permute(2, 1, 0)
+        got = torch.complex(ring[:, :, 512:528, 0].float(), ring[:, :, 512:528, 1].float()).permute(2, 0, 1)
         w16 = torch.complex(want.real.half().float(), want.imag.half().float())
         tol = 2 * torch.finfo(torch.float16).eps * w16.abs() + 1e-6
         gates["gemm_within_1ulp"] = bool(((got - w16).abs() <= 1.5 * tol).all())
@@ -661,11 +899,14 @@ def _kernels_one(fmt, antpos, chgroup, dev, reps, check_ref):
         res[f"stage1_{t.name}_ms"] = ms
         t1 += ms
         x = torch.view_as_complex(out)
-        rule = PackerRule(comp_bits=op.bits_main // 2)
+        # the frozen row rule; warm-up 0 so the timed and checked blocks carry real codes
+        rule = quant.RowRule.for_format(op.bits_main, op.n_sub, warmup_blocks=0)
         ss = BatchedStaticSky(n_d=t.n_coarse, n_values=csr.n_values, device=dev)
         pk = RowRulePacker(n_d=t.n_coarse, value_offsets=csr.value_offsets, n_contrib=csr.n_contrib,
                            n_heavy=n_heavy, rule=rule, device=dev)
-        ms2 = cuda_time_ms(lambda: pk.pack(ss.apply_(x.clone())), reps=reps)
+        ms2 = cuda_time_ms(lambda: pk.pack(ss.apply_(x.clone()), resolve_overflow=False), reps=reps)
+        ms_sky = cuda_time_ms(lambda: ss.apply_(x.clone()), reps=reps)
+        res[f"sky_{t.name}_ms"] = ms_sky
         res[f"skypack_{t.name}_ms"] = ms2
         t2 += ms2
         if check_ref:
@@ -678,11 +919,16 @@ def _kernels_one(fmt, antpos, chgroup, dev, reps, check_ref):
                 x[:, :, :nv].cpu().numpy(), twin.astype(np.complex64)))
             pc = RowRulePacker(n_d=t.n_coarse, value_offsets=csr.value_offsets,
                                n_contrib=csr.n_contrib, n_heavy=n_heavy, rule=rule)
-            a = pc.pack(x.cpu())
-            b = RowRulePacker(n_d=t.n_coarse, value_offsets=csr.value_offsets, n_contrib=csr.n_contrib,
-                              n_heavy=n_heavy, rule=rule, device=dev).pack(x)
-            gates[f"packer_{t.name}_gpu_eq_cpu"] = all(torch.equal(ra["payload"], rb["payload"].cpu())
-                                                       for ra, rb in zip(a, b))
+            pg = RowRulePacker(n_d=t.n_coarse, value_offsets=csr.value_offsets, n_contrib=csr.n_contrib,
+                               n_heavy=n_heavy, rule=rule, device=dev)
+            ok = True
+            for blk in range(2):                     # sigma init, then an EMA update
+                a = pc.pack(x.cpu())
+                b = pg.pack(x, resolve_overflow=False)
+                pg.resolve_overflow(b, x)
+                ok &= all(torch.equal(ra[k], rb[k].cpu()) for ra, rb in zip(a, b)
+                          for k in ("payload", "sigma", "sigma_row", "guarded"))
+            gates[f"packer_{t.name}_gpu_eq_cpu"] = bool(ok)
     res.update(stage1_ms=t1, skypack_ms=t2, gemm_plus_stage1_ms=res["gemm_ms"] + t1,
                corr_2x_kernels_ms=res["gemm_ms"] + t1 + t2,
                frac_of_block=(res["gemm_ms"] + t1 + t2) / BLOCK_MS,
@@ -790,6 +1036,8 @@ def cmd_live(args) -> int:
     argv, env = live_argv(op.opoint_id, dec=args.dec, n_blocks=n_blocks, out_blocks=out_blocks,
                           tx=args.tx)
     _set_gpu_env(env)
+    if getattr(args, "replay", None):
+        return _live_on_replay(args, argv, n_blocks)
     import dsart.services.corr_fast_integration as cfi
     samples: dict = {"fada": [], "eada": [], "dada": []}
     stop = threading.Event()
@@ -841,8 +1089,90 @@ def cmd_live(args) -> int:
     return _finish(args.out, "live_2x.json", res, gates)
 
 
+def _live_on_replay(args, argv: list, n_blocks: int) -> int:
+    """``live`` fed by the replay writer through the TEST DADA buffer (no SNAPs): corr_fast's own
+    main/run on key REPLAY_KEY with the fixture's cal; block-time gates as live, plus the writer
+    keeping up (the buffer never runs dry while the corr keeps pace)."""
+    import dsart.services.corr_fast_integration as cfi
+    man = _fixture_manifest(args.replay)
+    cal = _fixture_cal(args.replay)
+    _, chgroup = _cn_chgroup()
+    dec = float(man.get("dec_deg", args.dec))
+    argv = [a for a in argv]
+    sets = [("--fada-key", REPLAY_KEY), ("--obs-dec-deg", str(dec))]
+    if cal:
+        sets += [("--apply-cal", cal[0]), ("--flagants", cal[1])]
+    for flag, val in sets:
+        if flag in argv:
+            argv[argv.index(flag) + 1] = val
+        else:
+            argv += [flag, val]
+    os.makedirs(args.out, exist_ok=True)
+    cap: dict = {}
+    real = cfi.run
+
+    def run_and_keep(*a, **kw):
+        cap["summary"] = real(*a, **kw)
+        return cap["summary"]
+
+    sentinel = argv[argv.index("--ready-sentinel-path") + 1]
+    if os.path.exists(sentinel):
+        os.unlink(sentinel)
+    with ReplayBuffer(nbufs=24, readers=1):
+        log = os.path.join(args.out, "writer_live.log")
+        # like the capture routines, the writer waits for corr_fast's ready sentinel (kernels warm)
+        w = _start_writer(args.replay, chgroup, n_blocks=n_blocks, rate="native", log=log, dec=dec,
+                          wait_for=sentinel)
+        samples = []
+        stop = threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                m = _dbmetric(REPLAY_KEY)
+                if m:
+                    samples.append((time.time(), m["nfull"], m["nbufs"]))
+                stop.wait(2.0)
+        th = threading.Thread(target=poll, daemon=True)
+        th.start()
+        cfi.run = run_and_keep
+        try:
+            rc = cfi.main(argv)
+        finally:
+            cfi.run = real
+            stop.set()
+            th.join(timeout=5)
+            if w.poll() is None:
+                w.terminate()                         # the writer prints its summary on SIGTERM
+                try:
+                    w.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    w.kill()
+            w.wait(timeout=60)
+    s = cap.get("summary") or {}
+    res = {"opoint": args.opoint, "argv": argv, "rc": rc, "summary": s, "replay": args.replay,
+           "writer": _writer_summary(log), "max_nfull": max((nf for _, nf, _ in samples), default=None),
+           "nbufs": samples[0][2] if samples else None}
+    if rc != 0 or not s:
+        _write(args.out, "live_2x.json", res)
+        return EXIT_ERR
+    mean, p99 = float(s.get("ms_per_block_mean", np.nan)), float(s.get("ms_per_block_p99", np.nan))
+    gates = {
+        "mean_le_85pct": mean <= 0.85 * BLOCK_MS,
+        "p99_le_100pct": p99 <= BLOCK_MS,
+        "no_dropped_blocks": int(s.get("n_dropped", 1)) == 0,
+        "ran_requested_blocks": int(s.get("n_blocks_in", 0)) >= n_blocks,
+        "replay_buffer_never_full": res["max_nfull"] is not None and res["max_nfull"] < res["nbufs"],
+        "writer_never_late": res["writer"].get("late_blocks", 1) == 0,
+        "tx_framed_no_rejects": bool((s.get("x2_tx") or {}).get("datagrams", 0) > 0
+                                     and (s.get("x2_tx") or {}).get("rejected", 1) == 0),
+    }
+    return _finish(args.out, "live_2x.json", res, gates)
+
+
 def cmd_teardown(args) -> int:
     removed = []
+    if _dada_db("-d", "-k", REPLAY_KEY).returncode == 0:
+        removed.append(f"dada:{REPLAY_KEY}")
     for pat in ("/dev/shm/dsart-x2-*", "/tmp/dsart-x2-*"):
         for p in glob.glob(pat):
             try:
@@ -892,9 +1222,17 @@ def main(argv=None) -> int:
     p.add_argument("--minutes", type=float, default=20.0)
     p.add_argument("--tx", default="drain")
     p.add_argument("--reader-identity", default="corr_fast")
+    p.add_argument("--replay", default=None,
+                   help="fixture run id: feed corr_fast from the replay writer via the test DADA "
+                        f"buffer 0x{REPLAY_KEY} instead of the node's fada")
+    p = common(sub.add_parser("replay-1x"))
+    p.add_argument("--run-id", default="250924mptq")
+    p.add_argument("--blocks", type=int, default=64)
+    p.add_argument("--probe-blocks", type=int, default=150)
+    p.add_argument("--rate", default="native", help="writer pacing for the legacy/pipelined runs")
     common(sub.add_parser("teardown"), gpu=False)
     args = ap.parse_args(argv)
-    fn = {"compile-check": cmd_compile_check, "profile-1x": cmd_profile_1x,
+    fn = {"compile-check": cmd_compile_check, "profile-1x": cmd_profile_1x, "replay-1x": cmd_replay_1x,
           "golden-capture": cmd_golden_capture, "kernels": cmd_kernels, "compat-1x": cmd_compat_1x,
           "live": cmd_live, "teardown": cmd_teardown}[args.cmd]
     if args.cmd not in ("compile-check", "teardown"):
