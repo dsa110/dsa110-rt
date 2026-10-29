@@ -159,7 +159,7 @@ def test_gpu_k1_1x_bit_exact_vs_combine_sparse_v4(tmp_path):
 
 
 @_gpu
-@pytest.mark.parametrize("mode", ["warp", "fused"])
+@pytest.mark.parametrize("mode", ["warp", "fused", "fused_v2", "fused_v1"])
 @pytest.mark.parametrize("fold", ["col", "row"])
 def test_gpu_fft_pair_matches_twin_and_float64(fold, mode):
     from dsart.x2.search.csr import csr_from_value_cells
@@ -241,7 +241,7 @@ def test_gpu_k3b_fused_equals_twin_and_v1(bank):
 
 @_gpu
 @pytest.mark.parametrize("k1,k3b,fft", [("triton", "v1", "warp"), ("staged", "fused", "warp"),
-                                        ("staged", "reg", "fused")])
+                                        ("staged", "reg", "fused"), ("staged2", "reg", "fused")])
 def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b, fft):
     """Same synthetic 2x ring through backend='cpu' and backend='gpu'."""
     from dsart.x2.search.codec import RowFormat
@@ -265,9 +265,10 @@ def test_gpu_engine_equals_cpu_engine_on_a_synthetic_ring(k1, k3b, fft):
     inp = make_dm_inputs(cells, n_grid=N, fmt=fmt, step_main=0.3534, step_heavy=0.1)
     out = {}
     for backend, fmode in (("cpu", "pruned"), ("gpu", fft)):
-        eng = OwnerEngine(plan, {0: inp}, ring, EngineConfig(n_grid=N, backend=backend,
-                                                             fft_mode=fmode, layer2_n_burnin=0,
-                                                             k1_impl=k1, k3b_impl=k3b))
+        eng = OwnerEngine(plan, {0: inp}, ring, EngineConfig(
+            n_grid=N, backend=backend, fft_mode=fmode, layer2_n_burnin=0,
+            k1_impl=k1.rstrip("2"), k3b_impl=k3b,
+            k1_fdm_per_pass=2 if k1 == "staged2" else 24))       # staged2: K1 in 2 passes
         out[backend] = eng.process_cycle(1, keep_maps=True).per_dm[0]
     a, b = out["cpu"], out["gpu"]
     assert np.allclose(a.sigma_applied, b.sigma_applied, rtol=1e-3)

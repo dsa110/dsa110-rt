@@ -729,6 +729,385 @@ __device__ __forceinline__ void k23_body(const float2* __restrict__ uv,
     F, t0, R_img, transpose, contig
 extern "C" __global__ void k23_fused_256(K23_ARGS) { k23_body<4, 2>(K23_PASS); }
 
+
+/* ---- K2+K3a fused v2 (k23v2_256, fft_mode "fused"): the k23_fused_256 data
+   flow (one block per (residue y2 = y mod 8, image); phase 1 the column IFFT
+   at that residue into shared Ys, phase 2 the row C2R of its 32 rows) with
+   fewer instructions and half the shared memory, so two 16-warp blocks fit
+   an SM:
+   * phase 1 is compiled per residue (template Y2): the in-lane 8-point DFT
+     at Y2 uses the exact 8th roots (+-1, +-i, one sqrt(1/2) multiply), and a
+     gap-free line (contiguous positions AND uv cells) is gathered by range,
+     a gapped one through its 256-bit occupancy;
+   * the DIF butterflies need no select (s = p + sign * a, then * w, w = 1 on
+     the top half) and the last stage no multiply;
+   * phase 2 reads every half-axis value from Ys through one per-lane row
+     offset (constant lines are materialised as rows, zeros as a zero row),
+     the 4-point stage uses the exact 4th roots, and each lane stores its
+     eight consecutive pixels as ONE 16-byte write (col fold) -- no staging,
+     no shared twiddle copy.
+   Same arithmetic up to fp32 rounding (exact twiddles instead of the table's
+   cos(pi/2) = 6e-17); checked against the twin like the other FFT paths. */
+template <int E> __device__ __forceinline__ float2 k23_rot8(float2 v) {
+    if (E == 0) return v;
+    if (E == 2) return make_float2(-v.y, v.x);
+    if (E == 4) return make_float2(-v.x, -v.y);
+    if (E == 6) return make_float2(v.y, -v.x);
+    if (E == 1) return make_float2(v.x - v.y, v.x + v.y);     /* / sqrt(2) later */
+    if (E == 3) return make_float2(-v.x - v.y, v.x - v.y);
+    if (E == 5) return make_float2(v.y - v.x, -v.x - v.y);
+    return make_float2(v.x + v.y, v.y - v.x);                  /* E == 7 */
+}
+
+template <int Y2, int J> struct K23Dft8 {
+    static __device__ __forceinline__ void acc(float2& ev, float2& od, const float2 (&x)[8]) {
+        const float2 t = k23_rot8<(J * Y2) & 7>(x[J]);
+        if (((J * Y2) & 7) & 1) { od.x += t.x; od.y += t.y; }
+        else { ev.x += t.x; ev.y += t.y; }
+        K23Dft8<Y2, J + 1>::acc(ev, od, x);
+    }
+};
+template <int Y2> struct K23Dft8<Y2, 8> {
+    static __device__ __forceinline__ void acc(float2&, float2&, const float2 (&)[8]) {}
+};
+
+struct K23Dif { float2 w[4]; float sg[5]; };
+
+__device__ __forceinline__ void k23_dif_prep(K23Dif& d, const float2* __restrict__ tw_g, int lane) {
+    #pragma unroll
+    for (int s = 0, h = 16; h >= 1; h >>= 1, ++s) {
+        const bool top = (lane & h) == 0;
+        d.sg[s] = top ? 1.0f : -1.0f;
+        if (s < 4) d.w[s] = top ? make_float2(1.0f, 0.0f)
+                                : __ldg(tw_g + ((lane & (h - 1)) * (256 / (2 * h))) % 256);
+    }
+}
+
+template <int R>
+__device__ __forceinline__ void k23_dif32(float2 (&A)[R], const K23Dif& d) {
+    #pragma unroll
+    for (int s = 0, h = 16; h >= 1; h >>= 1, ++s) {
+        #pragma unroll
+        for (int i = 0; i < R; ++i) {
+            float2 p;
+            p.x = __shfl_xor_sync(0xffffffffu, A[i].x, h);
+            p.y = __shfl_xor_sync(0xffffffffu, A[i].y, h);
+            const float2 t = make_float2(fmaf(d.sg[s], A[i].x, p.x), fmaf(d.sg[s], A[i].y, p.y));
+            A[i] = (h == 1) ? t : cmul(t, d.w[s < 4 ? s : 0]);
+        }
+    }
+}
+
+template <int Y2, int LN>
+__device__ __forceinline__ void k23v2_p1(const float2* __restrict__ uvb,
+    const int* __restrict__ lstart, const uint4* __restrict__ lbm4, const int2* __restrict__ lspan,
+    const float2* __restrict__ tw_g, float2* Ys, const K23Dif& d, int n_fc, int lane, int warp,
+    int nw)
+{
+    const float2 wl = __ldg(tw_g + ((lane * Y2) & 255));
+    const unsigned int lt = (1u << lane) - 1u;
+    const int y1o = __brev(lane) >> 27;
+    /* lines warp, warp + nw, ... ; LN of them through the DIF at once */
+    for (int it = 0; warp + it * nw < n_fc; it += LN) {
+        float2 A[LN];
+        #pragma unroll
+        for (int l = 0; l < LN; ++l) {
+            const int ci = min(warp + (it + l) * nw, n_fc - 1);
+            const int st = __ldg(lstart + ci);
+            const int2 sp = __ldg(lspan + ci);          /* (p0, n) gap-free, else (0, -1) */
+            float2 x[8];
+            if (sp.y >= 0) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned int e = (unsigned int)(lane + 32 * j - sp.x);
+                    x[j] = e < (unsigned int)sp.y ? uvb[st + (int)e] : make_float2(0.f, 0.f);
+                }
+            } else {
+                const uint4 m0 = __ldg(lbm4 + 2 * ci), m1 = __ldg(lbm4 + 2 * ci + 1);
+                const unsigned int m[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+                int pre = st;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = ((m[j] >> lane) & 1u) ? uvb[pre + __popc(m[j] & lt)]
+                                                 : make_float2(0.f, 0.f);
+                    pre += __popc(m[j]);
+                }
+            }
+            float2 ev = make_float2(0.f, 0.f), od = make_float2(0.f, 0.f);
+            K23Dft8<Y2, 0>::acc(ev, od, x);
+            if (Y2 & 1) {
+                const float r = 0.70710678118654752f;
+                ev.x = fmaf(r, od.x, ev.x);
+                ev.y = fmaf(r, od.y, ev.y);
+            }
+            A[l] = cmul(ev, wl);
+        }
+        k23_dif32<LN>(A, d);
+        #pragma unroll
+        for (int l = 0; l < LN; ++l) {
+            const int ci = warp + (it + l) * nw;
+            if (ci < n_fc) Ys[ci * 33 + y1o] = A[l];
+        }
+    }
+}
+
+template <int RN>
+__device__ __forceinline__ void k23v2_p2(const float2* Ys, const int* __restrict__ wrow,
+    const float2* __restrict__ tw_g, const float* __restrict__ pix,
+    const unsigned char* __restrict__ pcode, float pc, __half* __restrict__ dst, const K23Dif& d,
+    int y2, int transpose, int lane, int warp, int nw)
+{
+    const int N = 256, M = 128;
+    int ok[4], orr[4];
+    float2 wk[4], wo[4];
+    #pragma unroll
+    for (int k2 = 0; k2 < 4; ++k2) {
+        const int k = lane + 32 * k2;
+        ok[k2] = __ldg(wrow + k) * 33;
+        orr[k2] = __ldg(wrow + (k == 0 ? M : M - k)) * 33;
+        wk[k2] = __ldg(tw_g + k);
+        wo[k2] = __ldg(tw_g + ((2 * lane * k2) & 255));
+    }
+    const float m0 = lane == 0 ? 0.0f : 1.0f;   /* k = 0: DC / Nyquist real parts only */
+    const int n1 = __brev(lane) >> 27;
+    const unsigned int cb = __float_as_uint(pc);
+    for (int r0 = warp * RN; r0 < 32; r0 += nw * RN) {
+        float2 Bv[RN * 4];
+        #pragma unroll
+        for (int rr = 0; rr < RN; ++rr) {
+            const int y1 = r0 + rr;
+            float2 A[4];
+            #pragma unroll
+            for (int k2 = 0; k2 < 4; ++k2) {
+                float2 yk = Ys[ok[k2] + y1];
+                const float2 r = Ys[orr[k2] + y1];
+                float2 yr = make_float2(r.x, -r.y);
+                if (k2 == 0) { yk.y *= m0; yr.y *= m0; }
+                const float2 fe = make_float2(yk.x + yr.x, yk.y + yr.y);
+                const float2 fo = cmul(make_float2(yk.x - yr.x, yk.y - yr.y), wk[k2]);
+                A[k2] = make_float2(fe.x - fo.y, fe.y + fo.x);
+            }
+            const float2 s02 = make_float2(A[0].x + A[2].x, A[0].y + A[2].y);
+            const float2 d02 = make_float2(A[0].x - A[2].x, A[0].y - A[2].y);
+            const float2 s13 = make_float2(A[1].x + A[3].x, A[1].y + A[3].y);
+            const float2 d13 = make_float2(A[1].x - A[3].x, A[1].y - A[3].y);
+            Bv[rr * 4 + 0] = make_float2(s02.x + s13.x, s02.y + s13.y);
+            Bv[rr * 4 + 1] = cmul(make_float2(d02.x - d13.y, d02.y + d13.x), wo[1]);
+            Bv[rr * 4 + 2] = cmul(make_float2(s02.x - s13.x, s02.y - s13.y), wo[2]);
+            Bv[rr * 4 + 3] = cmul(make_float2(d02.x + d13.y, d02.y - d13.x), wo[3]);
+        }
+        k23_dif32<RN * 4>(Bv, d);
+        #pragma unroll
+        for (int rr = 0; rr < RN; ++rr) {
+            const int y = y2 + 8 * (r0 + rr);
+            /* lane: pixels x = 8 n1 + i, i = 2 n2 + q */
+            float v[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = (i & 1) ? Bv[rr * 4 + (i >> 1)].y : Bv[rr * 4 + (i >> 1)].x;
+            if (!transpose) {
+                const long long p0 = (long long)y * N + 8 * n1;
+                if (pcode) {            /* pix in {+pc, -pc, +0, -0}: exactly raw * pix */
+                    const uint2 c8 = __ldg((const uint2*)(pcode + p0));
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const unsigned int cd = ((i < 4 ? c8.x : c8.y) >> (8 * (i & 3))) & 3u;
+                        v[i] *= __uint_as_float(((cd & 2u) ? 0u : cb) | ((cd & 1u) << 31));
+                    }
+                } else {
+                    const float4 q0 = __ldg((const float4*)(pix + p0));
+                    const float4 q1 = __ldg((const float4*)(pix + p0 + 4));
+                    v[0] *= q0.x; v[1] *= q0.y; v[2] *= q0.z; v[3] *= q0.w;
+                    v[4] *= q1.x; v[5] *= q1.y; v[6] *= q1.z; v[7] *= q1.w;
+                }
+                __half2 h[4];
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) h[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+                *(uint4*)(dst + p0) = *(const uint4*)h;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const long long pidx = (long long)(8 * n1 + i) * N + y;
+                    float f;
+                    if (pcode) {
+                        const unsigned int cd = __ldg(pcode + pidx);
+                        f = __uint_as_float(((cd & 2u) ? 0u : cb) | ((cd & 1u) << 31));
+                    } else {
+                        f = pix[pidx];
+                    }
+                    dst[pidx] = __float2half_rn(v[i] * f);
+                }
+            }
+        }
+    }
+}
+
+template <int Y2, int LN>
+__device__ __forceinline__ void k23v2_block(const float2* __restrict__ uv,
+    const int* __restrict__ lstart, const uint4* __restrict__ lbm4, const int2* __restrict__ lspan,
+    const int* __restrict__ wrow, const int* __restrict__ cidx, const float2* __restrict__ tw_g,
+    const float* __restrict__ pix, const unsigned char* __restrict__ pcode, float pc,
+    __half* __restrict__ ring, int B, int n_act, int n_fc, int n_cl, int n_t, int F, long long t0,
+    int R_img, int transpose)
+{
+    extern __shared__ float2 sm[];
+    float2* Ys = sm;                       /* (n_fc + n_cl + 1) rows x 33 */
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int b = blockIdx.y;
+    const float2* uvb = uv + (long long)b * n_act;
+    K23Dif d;
+    k23_dif_prep(d, tw_g, lane);
+    /* constant lines (position 0 only: the same value at every y) and the zero row */
+    for (int i = threadIdx.x; i < (n_cl + 1) * 32; i += blockDim.x) {
+        const int c = i >> 5;
+        Ys[(n_fc + c) * 33 + (i & 31)] = c < n_cl ? uvb[__ldg(cidx + c)] : make_float2(0.f, 0.f);
+    }
+    k23v2_p1<Y2, LN>(uvb, lstart, lbm4, lspan, tw_g, Ys, d, n_fc, lane, warp, nw);
+    __syncthreads();
+    const int f = b / n_t, t = b % n_t;
+    const long long slot = ((t0 + t) % R_img + R_img) % R_img;
+    k23v2_p2<2>(Ys, wrow, tw_g, pix, pcode, pc, ring + (slot * F + f) * 65536LL, d, Y2,
+                transpose, lane, warp, nw);
+}
+
+#define K23V2_ARGS const float2* __restrict__ uv, const int* __restrict__ lstart, \
+    const uint4* __restrict__ lbm4, const int2* __restrict__ lspan, const int* __restrict__ wrow, \
+    const int* __restrict__ cidx, const float2* __restrict__ tw_g, const float* __restrict__ pix, \
+    const unsigned char* __restrict__ pcode, float pc, __half* __restrict__ ring, int B, \
+    int n_act, int n_fc, int n_cl, int n_t, int F, long long t0, int R_img, int transpose
+#define K23V2_PASS uv, lstart, lbm4, lspan, wrow, cidx, tw_g, pix, pcode, pc, ring, B, n_act, \
+    n_fc, n_cl, n_t, F, t0, R_img, transpose
+#define K23V2_KERNEL(NAME, LN, THREADS, MINB) \
+extern "C" __global__ void __launch_bounds__(THREADS, MINB) NAME(K23V2_ARGS) { \
+    switch (blockIdx.x) { \
+    case 0: k23v2_block<0, LN>(K23V2_PASS); break; \
+    case 1: k23v2_block<1, LN>(K23V2_PASS); break; \
+    case 2: k23v2_block<2, LN>(K23V2_PASS); break; \
+    case 3: k23v2_block<3, LN>(K23V2_PASS); break; \
+    case 4: k23v2_block<4, LN>(K23V2_PASS); break; \
+    case 5: k23v2_block<5, LN>(K23V2_PASS); break; \
+    case 6: k23v2_block<6, LN>(K23V2_PASS); break; \
+    default: k23v2_block<7, LN>(K23V2_PASS); break; \
+    } }
+/* 8 warps, two lines per warp through the phase-1 DIF, two blocks per SM: the
+   fastest of (LN 2/4/8) x (8/16 warps) on the 2x maps (n13, 2080 Ti) */
+K23V2_KERNEL(k23v2_256, 2, 256, 2)
+
+/* ---- k23v2p_256: residue PAIRS (y2, y2 + 4) per block: one gather and one
+   in-lane DFT serve both (W_8^{j (y2+4)} = (-1)^j W_8^{j y2}: a = E + O,
+   b = E - O over even / odd j), two DIFs; Ys holds both residues (2 x 30 KB,
+   one 16-warp block per SM); phase 2 does the pair's 64 rows. */
+template <int Y2, int J> struct K23Dft8EO {
+    static __device__ __forceinline__ void acc(float2& e, float2& o, const float2 (&x)[8]) {
+        const float2 t = k23_rot8<(J * Y2) & 7>(x[J]);
+        if (J & 1) { o.x += t.x; o.y += t.y; }
+        else { e.x += t.x; e.y += t.y; }
+        K23Dft8EO<Y2, J + 1>::acc(e, o, x);
+    }
+};
+template <int Y2> struct K23Dft8EO<Y2, 8> {
+    static __device__ __forceinline__ void acc(float2&, float2&, const float2 (&)[8]) {}
+};
+
+template <int Y2, int LN>
+__device__ __forceinline__ void k23p_p1(const float2* __restrict__ uvb,
+    const int* __restrict__ lstart, const uint4* __restrict__ lbm4, const int2* __restrict__ lspan,
+    const float2* __restrict__ tw_g, float2* Ys, int ys_half, const K23Dif& d, int n_fc, int lane,
+    int warp, int nw)
+{
+    const float2 wla = __ldg(tw_g + ((lane * Y2) & 255));
+    const float2 wlb = __ldg(tw_g + ((lane * (Y2 + 4)) & 255));
+    const unsigned int lt = (1u << lane) - 1u;
+    const int y1o = __brev(lane) >> 27;
+    for (int it = 0; warp + it * nw < n_fc; it += LN) {
+        float2 A[2 * LN];
+        #pragma unroll
+        for (int l = 0; l < LN; ++l) {
+            const int ci = min(warp + (it + l) * nw, n_fc - 1);
+            const int st = __ldg(lstart + ci);
+            const int2 sp = __ldg(lspan + ci);
+            float2 x[8];
+            if (sp.y >= 0) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned int e = (unsigned int)(lane + 32 * j - sp.x);
+                    x[j] = e < (unsigned int)sp.y ? uvb[st + (int)e] : make_float2(0.f, 0.f);
+                }
+            } else {
+                const uint4 m0 = __ldg(lbm4 + 2 * ci), m1 = __ldg(lbm4 + 2 * ci + 1);
+                const unsigned int m[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
+                int pre = st;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = ((m[j] >> lane) & 1u) ? uvb[pre + __popc(m[j] & lt)]
+                                                 : make_float2(0.f, 0.f);
+                    pre += __popc(m[j]);
+                }
+            }
+            float2 e = make_float2(0.f, 0.f), o = make_float2(0.f, 0.f);
+            K23Dft8EO<Y2, 0>::acc(e, o, x);
+            float2 a, b;
+            if (Y2 & 1) {                      /* odd j <-> odd exponent: the sqrt(1/2) */
+                const float r = 0.70710678118654752f;
+                a = make_float2(fmaf(r, o.x, e.x), fmaf(r, o.y, e.y));
+                b = make_float2(fmaf(-r, o.x, e.x), fmaf(-r, o.y, e.y));
+            } else {
+                a = make_float2(e.x + o.x, e.y + o.y);
+                b = make_float2(e.x - o.x, e.y - o.y);
+            }
+            A[l] = cmul(a, wla);
+            A[LN + l] = cmul(b, wlb);
+        }
+        k23_dif32<2 * LN>(A, d);
+        #pragma unroll
+        for (int l = 0; l < LN; ++l) {
+            const int ci = warp + (it + l) * nw;
+            if (ci < n_fc) {
+                Ys[ci * 33 + y1o] = A[l];
+                Ys[ys_half + ci * 33 + y1o] = A[LN + l];
+            }
+        }
+    }
+}
+
+template <int Y2, int LN>
+__device__ __forceinline__ void k23p_block(K23V2_ARGS)
+{
+    extern __shared__ float2 sm[];
+    const int rows = n_fc + n_cl + 1;
+    const int ys_half = ((rows * 33 + 1) & ~1);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int b = blockIdx.y;
+    const float2* uvb = uv + (long long)b * n_act;
+    K23Dif d;
+    k23_dif_prep(d, tw_g, lane);
+    for (int i = threadIdx.x; i < 2 * (n_cl + 1) * 32; i += blockDim.x) {
+        const int h = i / ((n_cl + 1) * 32), r = i - h * (n_cl + 1) * 32;
+        const int c = r >> 5;
+        sm[h * ys_half + (n_fc + c) * 33 + (r & 31)] =
+            c < n_cl ? uvb[__ldg(cidx + c)] : make_float2(0.f, 0.f);
+    }
+    k23p_p1<Y2, LN>(uvb, lstart, lbm4, lspan, tw_g, sm, ys_half, d, n_fc, lane, warp, nw);
+    __syncthreads();
+    const int f = b / n_t, t = b % n_t;
+    const long long slot = ((t0 + t) % R_img + R_img) % R_img;
+    __half* dst = ring + (slot * F + f) * 65536LL;
+    /* the pair's 64 rows: warps [0, nw/2) residue Y2, [nw/2, nw) residue Y2 + 4 */
+    const int hw = warp >= nw / 2;
+    k23v2_p2<2>(sm + hw * ys_half, wrow, tw_g, pix, pcode, pc, dst, d, Y2 + 4 * hw, transpose, lane,
+                warp - hw * (nw / 2), nw / 2);
+}
+
+/* LN 1: one line per warp through the (two-residue) phase-1 DIF -- 0.97 us/image
+   vs 1.01 at LN 2, 1.02 at 32 warps (64 registers) and 1.39 for k23v2_256 (ns4
+   map, n13 microbench) */
+extern "C" __global__ void __launch_bounds__(512, 1) k23v2p_256(K23V2_ARGS) {
+    switch (blockIdx.x) {
+    case 0: k23p_block<0, 1>(K23V2_PASS); break;
+    case 1: k23p_block<1, 1>(K23V2_PASS); break;
+    case 2: k23p_block<2, 1>(K23V2_PASS); break;
+    default: k23p_block<3, 1>(K23V2_PASS); break;
+    }
+}
 """
 
 _MOD = None
@@ -782,7 +1161,25 @@ def k23_tables(lines: dict, n_fl: int, device, pix=None) -> dict:
     wsrc = np.full(129, -1, dtype=np.int32)
     wsrc[fl[:n_fl]] = np.arange(n_fl, dtype=np.int32)
     wsrc[ccl] = -(cci.astype(np.int32) + 2)
+    # v2: one Ys row per half-axis index (FFT line slot, constant line n_fl + i,
+    # zero row n_fl + n_cl); gap-free lines as (first position, count)
+    n_cl = int(cci.size)
+    wrow = np.full(129, n_fl + n_cl, dtype=np.int32)
+    wrow[fl[:n_fl]] = np.arange(n_fl, dtype=np.int32)
+    wrow[ccl] = n_fl + np.arange(n_cl, dtype=np.int32)
+    lspan = np.zeros((nl, 2), dtype=np.int32)
+    lspan[:, 1] = -1
+    for ci in range(n_fl):
+        e0, e1 = int(lp[ci]), int(lp[ci + 1])
+        idx, pos = li[e0:e1], lpos[e0:e1]
+        if e1 > e0 and np.all(np.diff(pos) == 1) and np.all(np.diff(idx) == 1):
+            lspan[ci] = (pos[0], e1 - e0)
+        elif e1 == e0:
+            lspan[ci] = (0, 0)
     out = dict(n_fl=n_fl, contig=int(contig), wsrc=torch.as_tensor(wsrc, device=device),
+               wrow=torch.as_tensor(wrow, device=device), n_cl=n_cl,
+               cidx=torch.as_tensor(np.concatenate([cci.astype(np.int32), [0]]), device=device),
+               lspan=torch.as_tensor(lspan, device=device),
                lidx=torch.as_tensor(lidx, device=device),
                lstart=torch.as_tensor(lstart, device=device),
                lbm=torch.as_tensor(lbm.view(np.int32), device=device), pcode=None, pc=0.0)
@@ -864,15 +1261,42 @@ def launch_k0_tile(draw, dval, nv, nh, bits, codes, vout, nodata, *, S: int, n: 
 
 def launch_k23(uv, tables: dict, tw, pix, ring, *, B: int, n_act: int, n_t: int, F: int,
                t0: int, R_img: int, transpose: int, stream, warps: Optional[int] = None,
-               kname: str = "k23_fused_256") -> None:
-    """K2+K3a fused (``k23_fused_256``): ``uv`` float32 ``[B, n_act, 2]``
-    (``b = f * n_t + t``) -> fp16 image ring ``[R_img, F, N*N]`` rows
-    ``t0 .. t0 + n_t - 1``; ``tables`` = :func:`k23_tables`."""
+               kname: str = "k23v2p_256") -> None:
+    """K2+K3a fused: ``uv`` float32 ``[B, n_act, 2]`` (``b = f * n_t + t``) ->
+    fp16 image ring ``[R_img, F, N*N]`` rows ``t0 .. t0 + n_t - 1``; ``tables``
+    = :func:`k23_tables`. ``kname``: ``k23v2p_256`` (default: residue pairs),
+    ``k23v2_256`` (one residue per block) -- both fall back to v1 for a map
+    whose line cells are not uv-contiguous -- or ``k23_fused_256`` (v1)."""
     import cupy as cp
 
     from ...image.tiled_combine_cuda import _ptr
 
     n_fl = int(tables["n_fl"])
+    if kname.startswith("k23v2") and not tables["contig"]:
+        kname = "k23_fused_256"          # v2 gathers line-contiguous uv cells only
+    if kname.startswith("k23v2"):
+        warps = warps or 8
+        k = get_module().get_function(kname)
+        n_cl = int(tables["n_cl"])
+        smem = (((n_fl + n_cl + 1) * 33 + 1) & ~1) * 8
+        if kname.startswith("k23v2p"):                 # residue pairs: two Ys, 16 warps
+            smem, warps = 2 * smem, 16
+        if smem > 48 * 1024 and getattr(k, "max_dynamic_shared_size_bytes", 0) < smem:
+            if hasattr(k, "max_dynamic_shared_size_bytes"):      # cupy RawKernel
+                k.max_dynamic_shared_size_bytes = smem
+            else:
+                cp.cuda.driver.funcSetAttribute(k.ptr, 8, smem)
+        pcode = tables["pcode"]
+        with cp.cuda.ExternalStream(stream.cuda_stream):
+            k((4 if kname.startswith("k23v2p") else 8, int(B)),
+              (32 * warps,),
+              (_ptr(uv), _ptr(tables["lstart"]), _ptr(tables["lbm"]), _ptr(tables["lspan"]),
+               _ptr(tables["wrow"]), _ptr(tables["cidx"]), _ptr(tw), _ptr(pix),
+               np.uint64(0) if pcode is None else _ptr(pcode), np.float32(tables["pc"]),
+               _ptr(ring), np.int32(B), np.int32(n_act), np.int32(n_fl), np.int32(n_cl),
+               np.int32(n_t), np.int32(F), np.int64(t0), np.int32(R_img), np.int32(transpose)),
+              shared_mem=smem)
+        return
     warps = warps or 16
     k = get_module().get_function(kname)
     smem = (256 + ((n_fl * 33 + 1) & ~1) + warps * 128) * 8

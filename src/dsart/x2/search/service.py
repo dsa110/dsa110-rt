@@ -15,6 +15,14 @@ search half (node, GPU), as today.
   samples: ``sample_period_specnum`` = 8, ``sample_period_us`` = 524.288 in
   2x; ``dm_idx_global`` = the plan's global fine index, ``fine_dm_idx`` =
   the index within its coarse bucket), monitoring accumulators.
+* :func:`c1_geometry` / :class:`MjdClock` / :func:`c1_batch_header` /
+  :func:`make_c1_emit` -- the C1 path of :func:`main`: rows in radians
+  (``1 / (N cell_lambda)`` per pixel, the 1x convention), one batch per
+  cycle with the 2x header (``event_specnum_start = k * 384`` external
+  samples, ``sample_period_specnum`` = 8 x 65.536 us, ``mjd_start`` from
+  the capture arm record), shipped by the production ``C1TcpEmitter``;
+  cutouts by :class:`~dsart.x2.search.cutout_service.CutoutListener` on
+  ``cutout_base_port + gpu_half``.
 * :func:`mon_payloads` -- the keys WS-D's D11 monitoring reads:
   ``/mon/search_rt/<cn>/compute/<g>``, ``/mon/search_rt/<cn>/dm/<d>``,
   ``/mon/search_rt/<cn>/cutout/<g>`` (published at <= 2 Hz from the host
@@ -34,10 +42,12 @@ import numpy as np
 
 from .geometry import CYCLE_NATIVE, SEARCH_NODES
 
-__all__ = ["CycleScheduler", "OwnerService", "mon_payloads", "c1_rows_for_cycle", "main"]
+__all__ = ["CycleScheduler", "OwnerService", "mon_payloads", "c1_rows_for_cycle", "c1_geometry",
+           "MjdClock", "c1_batch_header", "make_c1_emit", "main"]
 
 _LOG = logging.getLogger("dsart.x2.search.service")
-CYCLE_S = CYCLE_NATIVE * 32.768e-6
+NATIVE_S = 32.768e-6
+CYCLE_S = CYCLE_NATIVE * NATIVE_S
 
 
 class CycleScheduler:
@@ -107,6 +117,106 @@ def c1_rows_for_cycle(cands, *, geom: dict):
             event_specnum=int(c.event_specnum), width_samples=int(c.width_ext),
             kernel_id=f"unit:d1:{c.filt}", flags=int(c.flags)))
     return rows
+
+
+def c1_geometry(cell_lambda: float, n_grid: int) -> dict:
+    """C1 / cutout pixel geometry: ``cell_{l,m}_rad = 1 / (N * cell_lambda)``
+    -- the 1x ``image_cell_rad`` (``services/search_compute.py``) from the
+    value map's own ``cell_lambda`` (the corr grids with the same one);
+    ``l0 = m0 = 0``: offsets from the phase centre at pixel ``N // 2``
+    (``centred_pix_offset``)."""
+    if not (np.isfinite(cell_lambda) and cell_lambda > 0):
+        raise ValueError(f"cell_lambda={cell_lambda} must be > 0")
+    cell = 1.0 / (float(n_grid) * float(cell_lambda))
+    return dict(n_grid=int(n_grid), cell_l_rad=cell, cell_m_rad=cell, l0_rad=0.0, m0_rad=0.0)
+
+
+def _read_armed_mjd() -> Optional[float]:
+    """MJD of native sample 0: the capture arm record ``/mon/snap/1/armed_mjd``
+    (stamped at ``utc_start``; the corr block numbering starts there), as the
+    1x ``SearchComputeService._read_capture_anchor_mjd``. None when etcd is
+    unavailable or the value is not within the last 30 days."""
+    try:
+        from dsautils.dsa_store import DsaStore
+        doc = DsaStore().get_dict("/mon/snap/1/armed_mjd") or {}
+        val = float(doc.get("armed_mjd") or 0.0)
+    except Exception as exc:                                     # noqa: BLE001
+        _LOG.warning("capture-anchor etcd read failed (%s)", exc)
+        return None
+    now_mjd = 40587.0 + time.time() / 86400.0
+    if not (now_mjd - 30.0 < val <= now_mjd + 2.0 / 86400.0):
+        _LOG.warning("armed_mjd %.6f implausible (now %.6f)", val, now_mjd)
+        return None
+    return val
+
+
+class MjdClock:
+    """MJD of native sample ``n`` = ``mjd_at_native_0 + n * 32.768 us``.
+
+    The anchor is resolved once: an explicit ``mjd_at_native_0`` (> 0), else
+    the capture arm record (``read_armed``), accepted when the first query's
+    data time lags the wall clock by -2..120 s (the 1x rule), else a wall
+    latch at that first query (late by the pipeline latency, logged)."""
+
+    def __init__(self, mjd_at_native_0: float = 0.0, *, read_armed=_read_armed_mjd,
+                 wall=time.time) -> None:
+        self.anchor: Optional[float] = float(mjd_at_native_0) if mjd_at_native_0 > 0 else None
+        self.source = "explicit" if self.anchor is not None else ""
+        self._read_armed = read_armed
+        self._wall = wall
+
+    def _latch(self, n_now: int) -> float:
+        wall_anchor = 40587.0 + self._wall() / 86400.0 - float(n_now) * NATIVE_S / 86400.0
+        armed = self._read_armed() if self._read_armed is not None else None
+        if armed is not None and -2.0 <= (wall_anchor - armed) * 86400.0 <= 120.0:
+            self.anchor, self.source = float(armed), "armed_mjd"
+        else:
+            if armed is not None:
+                _LOG.warning("armed_mjd %.9f inconsistent with the wall latch %.9f; using the "
+                             "wall latch (labels late by the pipeline latency)", armed,
+                             wall_anchor)
+            self.anchor, self.source = wall_anchor, "wall"
+        _LOG.info("x2 mjd_at_native_0 = %.9f (%s)", self.anchor, self.source)
+        return self.anchor
+
+    def mjd_of_native(self, n: int, *, latch_n: Optional[int] = None) -> float:
+        """``latch_n``: the newest native sample in hand (the wall latch's
+        "now"), default ``n``."""
+        anchor = self.anchor if self.anchor is not None else self._latch(
+            int(n if latch_n is None else latch_n))
+        return float(anchor + float(n) * NATIVE_S / 86400.0)
+
+
+def c1_batch_header(k: int, *, plan, n_rows: int, search_node_id: int, gpu_half: int,
+                    n_grid: int, clock: MjdClock):
+    """The C1 batch header of cycle ``k`` of one half (``coinc.wire``): the
+    cycle's first external sample, its MJD, ``sample_period_specnum`` in
+    65.536-us spec-nums (8 in 2x, 16 in 1x-compat), the half's fine count."""
+    from ...coinc import wire
+    from ...common.constants import SPECNUM_PERIOD_US
+
+    ext = int(plan.ext_native)
+    e0 = int(k) * (CYCLE_NATIVE // ext)
+    period_us = float(plan.ext_period_us)
+    return wire.build_header(
+        cube_id=int(k), event_specnum_start=e0,
+        mjd_start=clock.mjd_of_native(e0 * ext, latch_n=(int(k) + 1) * CYCLE_NATIVE),
+        sample_period_specnum=int(round(period_us / SPECNUM_PERIOD_US)),
+        sample_period_us=period_us, n_grid=int(n_grid),
+        n_fdm_in_cube=int(sum(s.n_fdm for s in plan.dms)),
+        search_node_id=int(search_node_id), gpu_half=int(gpu_half), n_candidates=int(n_rows))
+
+
+def make_c1_emit(sender, *, plan, search_node_id: int, gpu_half: int, n_grid: int,
+                 clock: MjdClock) -> Callable:
+    """:class:`OwnerService` ``emit`` callback: one batch per cycle (also an
+    empty one -- C2's per-half liveness) through ``sender.submit(header,
+    candidates, rows=...)`` (the production ``services.c1_emit.C1TcpEmitter``)."""
+    def emit(k: int, kept, rows) -> bool:
+        hdr = c1_batch_header(k, plan=plan, n_rows=len(rows), search_node_id=search_node_id,
+                              gpu_half=gpu_half, n_grid=n_grid, clock=clock)
+        return bool(sender.submit(hdr, kept, rows=rows))
+    return emit
 
 
 @dataclass
@@ -294,20 +404,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="cal blob (antennas.out) or an antpos npz (value map, SPEC §3)")
     p.add_argument("--obs-dec-deg", type=float, required=True)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--fft-mode", default="warp", choices=("warp", "pruned", "irfft2"))
+    p.add_argument("--fft-mode", default="fused", choices=("fused", "warp", "pruned", "irfft2"))
     p.add_argument("--bank", default="b3x", choices=("b3x", "box"))
-    p.add_argument("--c1-host", default="")
+    p.add_argument("--c1-host", default="", help="C2 host (C1 batches, cutout status); '' = off")
     p.add_argument("--c1-port", type=int, default=11500)
-    p.add_argument("--cutout-bind-host", default="")
+    p.add_argument("--c1-queue-depth", type=int, default=16)
+    p.add_argument("--mjd-at-native-0", type=float, default=0.0,
+                   help="MJD of native sample 0; 0 = capture arm record, else a wall latch")
+    p.add_argument("--cutout-bind-host", default="", help="'' = no cutout listener")
     p.add_argument("--cutout-base-port", type=int, default=11227)
+    p.add_argument("--cutout-status-port", type=int, default=11501)
     p.add_argument("--cutout-root", default="/home/ubuntu/data/c2/cutouts")
+    p.add_argument("--upload-dest-host", default="", help="cutout/raw uploads (rsync); '' = off")
+    p.add_argument("--upload-dest-root", default="/dataz/dsa110/candidates")
+    p.add_argument("--raw-bwlimit-kbps", type=int, default=50_000)
     p.add_argument("--mon-interval-s", type=float, default=2.0)
     p.add_argument("--max-cycles", type=int, default=0)
     p.add_argument("--ring-access", default="pread", choices=("pread", "mmap"),
                    help="ring v4 read path (SPEC §6; pread maps nothing -- the n13 incident)")
     p.add_argument("--ring-attach-timeout-s", type=float, default=60.0)
-    p.add_argument("--k3b", default="v1", choices=("v1", "fused", "cuda", "reg"))   # CP1 picks
-    p.add_argument("--k1", default="triton", choices=("triton", "staged"))
+    p.add_argument("--k3b", default="reg", choices=("v1", "fused", "cuda", "reg"))   # G0 timing pick
+    p.add_argument("--k1", default="staged", choices=("triton", "staged"))
     p.add_argument("--log-level", default="INFO")
     a, _unknown = p.parse_known_args(argv)
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO))
@@ -339,14 +456,53 @@ def main(argv: Optional[List[str]] = None) -> int:
     _LOG.info("x2 half %d (%s g%d) status: %s", half, node, a.gpu_half, eng.status())
     pool = C1CyclePool(C1CycleConfig(chan_sum_factor=int(op.chan_sum_factor),
                                      ext_period_us=float(op.t_ext_us)))
-    svc = OwnerService(eng, search_node_id=a.search_node_id, gpu_half=a.gpu_half, c1_pool=pool)
+    geom = c1_geometry(vm.cell_lambda, cfg.n_grid)
+    clock = MjdClock(a.mjd_at_native_0)
+    emitter = emit = None
+    if a.c1_host:
+        from ...services.c1_emit import C1EmitConfig, C1TcpEmitter
+        emitter = C1TcpEmitter(config=C1EmitConfig(
+            host=a.c1_host, port=int(a.c1_port), search_node_id=int(a.search_node_id),
+            gpu_half=int(a.gpu_half), queue_depth=int(a.c1_queue_depth)))
+        emitter.start()
+        emit = make_c1_emit(emitter, plan=oplan, search_node_id=a.search_node_id,
+                            gpu_half=a.gpu_half, n_grid=cfg.n_grid, clock=clock)
+    producer = listener = None
+    if a.cutout_bind_host:
+        from pathlib import Path
+
+        from .cutout_service import CutoutListener, CutoutProducer, make_uploaders
+        ext = int(oplan.ext_native)
+        producer = CutoutProducer(eng, search_node_id=a.search_node_id, gpu_half=a.gpu_half,
+                                  out_root=Path(a.cutout_root), plan=plan,
+                                  plan_id=int(plan.plan_id), geometry=geom,
+                                  clock_mjd=lambda t0e: clock.mjd_of_native(int(t0e) * ext))
+        if a.upload_dest_host:
+            producer.uploaders = make_uploaders(sid=a.search_node_id, g=a.gpu_half,
+                                                dest_host=a.upload_dest_host,
+                                                dest_root=a.upload_dest_root,
+                                                raw_bwlimit_kbps=a.raw_bwlimit_kbps)
+            for up in producer.uploaders:
+                up.start()
+        listener = CutoutListener(producer, bind_host=a.cutout_bind_host,
+                                  base_port=a.cutout_base_port, c2_host=a.c1_host or "h23",
+                                  status_port=a.cutout_status_port, event_root=Path(a.cutout_root))
+        threading.Thread(target=listener.run, daemon=True, name="x2-cutout").start()
+    svc = OwnerService(eng, search_node_id=a.search_node_id, gpu_half=a.gpu_half, c1_pool=pool,
+                       emit=emit, cutout=producer, geom=geom)
     mon = MonThread(svc, opoint=a.opoint, put=_etcd_put(), interval_s=a.mon_interval_s)
     mon.start()
     n = 0
-    while a.max_cycles <= 0 or n < a.max_cycles:
-        svc.step(timeout_s=30.0)
-        n += 1
-    mon.stop_ev.set()
+    try:
+        while a.max_cycles <= 0 or n < a.max_cycles:
+            svc.step(timeout_s=30.0)
+            n += 1
+    finally:
+        mon.stop_ev.set()
+        if listener is not None:
+            listener.stop()
+        if emitter is not None:
+            emitter.stop()
     return 0
 
 

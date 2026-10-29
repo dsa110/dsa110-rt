@@ -33,6 +33,25 @@ class _DmDev:
     pass
 
 
+class _OnStream:
+    """``torch.cuda.stream(s)`` without its per-entry ``torch.cuda.is_available()``
+    (a device-count query, ~0.1 ms: hundreds per cycle)."""
+    __slots__ = ("s", "prev")
+
+    def __init__(self, s) -> None:
+        self.s = s
+
+    def __enter__(self):
+        self.prev = torch.cuda.current_stream()
+        if self.prev != self.s:
+            torch.cuda.set_stream(self.s)
+        return self.s
+
+    def __exit__(self, *exc) -> None:
+        if self.prev != self.s:
+            torch.cuda.set_stream(self.prev)
+
+
 class GpuBackend:
     def __init__(self, engine) -> None:
         if not torch.cuda.is_available():
@@ -49,6 +68,28 @@ class GpuBackend:
         self.tw = torch.as_tensor(twiddles(N).view(np.float32).reshape(-1, 2), device=self.dev)
         for d, st in engine.states.items():
             self.dm[d] = self._build(st)
+        self.warmup()
+
+    def warmup(self) -> None:
+        """Compile (NVRTC) every kernel the cycle will launch, before the
+        first cycle: otherwise cycle 0 takes seconds and the scheduler starts
+        with a lag-recovery seek."""
+        from .kernels_cuda import get_module
+
+        cfg = self.eng.cfg
+        m = get_module()
+        for name in ("k0_f2_tile2", "k0_f2_valid", "k0_unpack_cint8", "k23v2p_256",
+                     "k23v2_256", "k23_fused_256", "l1_clipstd", "clipstd_rows"):
+            m.get_function(name)
+        if cfg.k1_impl == "staged":
+            from .k1_staged import get_module as k1_module
+            for x in self.dm.values():
+                for f0, f1, *_rest in x.k1passes:
+                    k1_module(-(-(f1 - f0) // 8) * 8).get_function("k1_staged")
+        if cfg.k3b_impl == "reg":
+            from .k3b_reg import get_kernel, plan_parts
+            for part in plan_parts(self.eng.bank):
+                get_kernel(self.eng.bank, part, chunk=cfg.chunk)[0].compile()
 
     # ------------------------------------------------------------------
     def _build(self, st) -> _DmDev:
@@ -72,6 +113,20 @@ class GpuBackend:
         from .k1_staged import staged_geometry
         x.k1geom = staged_geometry(spec.shifts, n_t=cfg.rows_per_batch)
         x.csr["smax"] = torch.as_tensor(x.k1geom.smax, dtype=torch.int32, device=self.dev)
+        # staged K1 in passes of <= k1_fdm_per_pass fine DMs: FMAX register
+        # accumulators per thread (35 at ns4 -> 123 registers, 16 warps / SM;
+        # two passes of 18: -9% at ns4, n13). Per (f, t) the same codes and the
+        # same CSR-order sums: bit-identical to one pass.
+        per = max(1, int(cfg.k1_fdm_per_pass))
+        bnd = np.linspace(0, spec.n_fdm, -(-spec.n_fdm // per) + 1).astype(int)
+        x.k1passes = []
+        for f0, f1 in zip(bnd[:-1], bnd[1:]):
+            sh = np.ascontiguousarray(spec.shifts[int(f0):int(f1)])
+            g = staged_geometry(sh, n_t=cfg.rows_per_batch)
+            c = dict(x.csr)
+            c["smax"] = torch.as_tensor(g.smax, dtype=torch.int32, device=self.dev)
+            x.k1passes.append((int(f0), int(f1), torch.as_tensor(sh, dtype=torch.int32,
+                                                                  device=self.dev), g, c))
         x.pix = torch.as_tensor((st.mask_scaled.astype(np.float64) / (N * N)).astype(np.float32),
                                 device=self.dev)
         x.mask_scaled = torch.as_tensor(st.mask_scaled, device=self.dev)
@@ -156,7 +211,7 @@ class GpuBackend:
             hraw = x.pinned[:raw.size].view(S, n, rb)
             hraw.copy_(torch.from_numpy(np.ascontiguousarray(raw)))
         hval = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.uint8))
-        with torch.cuda.stream(self.copy):
+        with _OnStream(self.copy):
             h0 = self._ev(self.copy)
             draw = hraw.to(self.dev, non_blocking=True)
             dval = hval.to(self.dev, non_blocking=True)
@@ -166,8 +221,9 @@ class GpuBackend:
         x.pinned_ev = ev
         self.compute.wait_event(ev)
         mod = get_module()
-        k0a = self._ev(self.compute)
-        with self._ext(self.compute):
+        # torch work (K0's scratch zero-fill) must be on the compute stream too
+        with _OnStream(self.compute), self._ext(self.compute):
+            k0a = self._ev(self.compute)
             if x.kind == "frame2":
                 from .kernels_cuda import launch_k0_tile
                 launch_k0_tile(draw, dval, x.nv, x.nh, x.bits, x.codes, x.valid, x.nodata, S=S,
@@ -195,12 +251,18 @@ class GpuBackend:
         N = cfg.n_grid
         F = st.spec.n_fdm
         timed = stream is self.compute
-        with torch.cuda.stream(stream):
+        with _OnStream(stream):
             ea = self._ev(stream) if timed else None
-            if cfg.k1_impl == "staged":
+            if cfg.k1_impl == "staged" and len(x.k1passes) == 1:
                 uv = k1_staged(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
                                offset=float(st.inp.offset), w_v=x.w_v, geom=x.k1geom,
                                stream=stream)                                      # [F, n, A, 2]
+            elif cfg.k1_impl == "staged":
+                uv = torch.empty((F, n, int(x.csr["n_act"]), 2), dtype=torch.float32,
+                                 device=self.dev)
+                for f0, f1, sh, g, c in x.k1passes:
+                    k1_staged(x.codes, x.c_v, c, sh, t_lo=r0, n_t=n, offset=float(st.inp.offset),
+                              w_v=x.w_v, geom=g, out=uv[f0:f1], stream=stream)
             else:
                 uv = k1_combine(x.codes, x.c_v, x.csr, x.shifts, t_lo=r0, n_t=n,
                                 offset=float(st.inp.offset), w_v=x.w_v)            # [F, n, A, 2]
@@ -263,7 +325,7 @@ class GpuBackend:
         from ...noise_norm.layer1 import sigma_clipped_std_batched
 
         x = self.dm[st.spec.d]
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             a = self._ev(self.compute)
             if st.l1_t.shape[1] <= 10240:               # one launch (kernels_cuda.l1_clipstd)
                 from .kernels_cuda import launch_l1
@@ -294,7 +356,7 @@ class GpuBackend:
         stream could read the buffers before the compute stream wrote them),
         one event sync; returns the same structure as numpy arrays."""
         out = {}
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             for key, v in tensors.items():
                 if isinstance(v, (tuple, list)):
                     out[key] = tuple(t.to("cpu", non_blocking=True) for t in v)
@@ -324,7 +386,7 @@ class GpuBackend:
         if cfg.k3b_impl not in impls:
             raise ValueError(f"k3b_impl={cfg.k3b_impl!r} (v1|fused|cuda|reg)")
         detect = impls[cfg.k3b_impl]
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             ev0 = self._ev(self.compute)
             # small per-cycle inputs go up pinned + non-blocking (a pageable
             # torch H2D syncs the host with the stream); "reg" takes device
@@ -366,7 +428,7 @@ class GpuBackend:
         left on the device."""
         x = self.dm[st.spec.d]
         K = int(taps.shape[0])
-        with torch.cuda.stream(self.compute):
+        with _OnStream(self.compute):
             a = self._ev(self.compute)
             flat = taps.reshape(K, -1)
             n = int(flat.shape[1])
@@ -419,7 +481,7 @@ class GpuBackend:
         priv.__dict__.update(x.__dict__)
         priv.codes = codes
         N = self.eng.cfg.n_grid
-        with torch.cuda.stream(self.low):
+        with _OnStream(self.low):
             draw = torch.from_numpy(np.ascontiguousarray(raw)).to(self.dev)
             dval = torch.from_numpy(np.ascontiguousarray(valid, dtype=np.uint8)).to(self.dev)
             mod = get_module()
@@ -442,7 +504,7 @@ class GpuBackend:
             ring = torch.zeros((n, spec.n_fdm, N * N), dtype=torch.float16, device=self.dev)
             # a private n-row ring: row r lands in slot r % n; roll back to row order
             self._image_batch(st, priv, r0, n, self.low, ring, n)
-            with torch.cuda.stream(self.low):
+            with _OnStream(self.low):
                 if r0 % n:
                     ring = torch.roll(ring, -(r0 % n), dims=0)
             self.low.synchronize()

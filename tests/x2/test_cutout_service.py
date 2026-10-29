@@ -6,7 +6,10 @@
   apex lookup), images = the detection images / the sigma applied at
   detection, snapshot slicing == ring reads;
 * end to end through WS-D's assemble_cutout when x2/cutout/schema.py is
-  present (skipped otherwise).
+  present (skipped otherwise);
+* the fine axis is the ENGINE's (its owned DMs, in its plane order): an
+  engine owning a subset of its half's DMs writes a consistent cutout, and
+  for a whole half the axis equals WS-D's ``fine_axis_for_half``.
 """
 from __future__ import annotations
 
@@ -247,3 +250,89 @@ def test_serve_writes_raw_then_cutout_and_uploads_cutout_first(tmp_path):
     assert is_raw_complete(tmp_path / req.event_name / "raw" / "raw_s2_g1")
     assert (tmp_path / req.event_name / "cutouts" / "cutout_s2_g1.json").is_file()
     assert [c[0] for c in calls] == ["cutout", "raw"]
+
+
+def _engine_two_tier_a(owned):
+    """Half 0 (one half) holds tier-A DMs 0, 1 and tier-B DM 2; the engine owns ``owned``."""
+    from dsart.x2.search.geometry import OwnerPlan
+
+    tiers = [dict(name="A", t_native=16, coarse=np.array([53.0, 60.0]),
+                  fine=np.array([50.0, 53.0, 56.0, 58.0, 60.0, 62.0]),
+                  f2c=np.array([0, 0, 0, 1, 1, 1])),
+             dict(name="B", t_native=32, coarse=np.array([103.0]), fine=np.array([100.0, 106.0]),
+                  f2c=np.zeros(2, int))]
+    full = owner_plan_from_tiers(tiers, half=0, n_sub=1, csf=2, n_halves=1)
+    plan = OwnerPlan(half=full.half, dms=tuple(full.by_d(d) for d in owned),
+                     n_stream=full.n_stream, ext_native=full.ext_native, opoint=full.opoint,
+                     plan_id=full.plan_id, extra=dict(full.extra))
+    fmt = RowFormat("frame2", n_values=V, n_heavy=2, bits=4)
+    cells, inputs = {}, {}
+    for sp in plan.dms:
+        cells[sp.d] = random_value_cells(16, V, N, radius=6, seed=sp.d + 4, n_unused=2)
+        inputs[sp.d] = make_dm_inputs(cells[sp.d], n_grid=N, fmt=fmt, step_main=0.3534,
+                                      step_heavy=0.1)
+    ring = MemoryRing({sp.d: fmt for sp in plan.dms}, 16, t_buf=4096)
+    sky = SyntheticSky(plan=plan, cells=cells, formats={sp.d: fmt for sp in plan.dms}, n_grid=N)
+    for sp in plan.dms:
+        sky.fill(ring, sp, 0, 4 * sp.hop)
+    eng = OwnerEngine(plan, inputs, ring, EngineConfig(n_grid=N, families=("b",), widths=(1, 2, 4),
+                                                       fft_mode="pruned", n_tap_pixels=32,
+                                                       layer2_n_burnin=0))
+    for k in (1, 2):
+        eng.process_cycle(k)
+    return eng, full
+
+
+class _TieredView:
+    """The half's tiered-plan arrays (global fine index) for ALL its DMs."""
+
+    def __init__(self, full):
+        specs = sorted(full.dms, key=lambda sp: sp.d)
+        n = 1 + max(int(sp.fine_global.max()) for sp in specs)
+        self.fine_dm = np.zeros(n)
+        self.fine_to_coarse = np.full(n, -1)
+        self.fine_local_idx = np.zeros(n, int)
+        self.fine_tier = np.zeros(n, int)
+        for sp in specs:
+            self.fine_dm[sp.fine_global] = sp.fine_dm
+            self.fine_to_coarse[sp.fine_global] = sp.d
+            self.fine_local_idx[sp.fine_global] = np.arange(sp.n_fdm)
+            self.fine_tier[sp.fine_global] = 0 if sp.tier == "A" else 1
+        self.coarse_t_native = np.array([sp.t_native for sp in specs])
+        self._specs = specs
+
+    def fines_of_half(self, h):
+        return np.concatenate([sp.fine_global for sp in self._specs])
+
+    def dms_of_half(self, h):
+        return np.array([sp.d for sp in self._specs])
+
+
+def test_cutout_axis_is_the_engines_owned_dms(tmp_path):
+    schema = pytest.importorskip("dsart.x2.cutout.schema")
+    from dsart.x2.search.cutout_service import fine_axis_for_owner
+
+    eng, full = _engine_two_tier_a(owned=(0, 2))           # DM 1 of the half is not ours
+    view = _TieredView(full)
+    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path, plan=view)
+    arrays, status = p.build_arrays(_req(fine_global_peak=1, coarse_global_peak=0))
+    assert status == "complete"
+    npz_path, _manifest = schema.write_cutout(tmp_path / "cutouts", arrays)
+    cut = schema.read_cutout(Path(npz_path), check=True)
+    want = np.concatenate([full.by_d(0).fine_global, full.by_d(2).fine_global])
+    assert np.array_equal(np.asarray(cut["fine_global_idx"]), want)
+    assert np.array_equal(np.asarray(cut["coarse_owned"]), [0, 2])
+    assert cut["peak_grid"].shape[1] == want.size
+    fb = full.by_d(0).n_fdm                                    # first tier-B plane fine
+    pg = cut["peak_grid"]
+    assert np.array_equal(pg[0::2, fb], pg[1::2, fb])
+    # without a tiered plan the DmSpecs give the same axis
+    a1 = fine_axis_for_owner(eng.plan, view, t_ext_native=16)
+    a0 = fine_axis_for_owner(eng.plan, None, t_ext_native=16)
+    for key in a1:
+        assert np.array_equal(a1[key], a0[key]) and a1[key].dtype == a0[key].dtype, key
+    # an engine owning its whole half: WS-D's fine_axis_for_half, field for field
+    whole = fine_axis_for_owner(full, view, t_ext_native=16)
+    ref = schema.fine_axis_for_half(view, 0, t_ext_native=16)
+    for key in ref:
+        assert np.array_equal(whole[key], ref[key]) and whole[key].dtype == ref[key].dtype, key

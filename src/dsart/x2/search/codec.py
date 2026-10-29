@@ -36,6 +36,7 @@ __all__ = [
     "as_stream_formats",
     "pack_frame2_rows",
     "unpack_frame2_rows",
+    "unpack_frame2_rows_ref",
     "unpack_cint8_rows",
     "decode_constants",
     "decode_values",
@@ -153,7 +154,46 @@ def pack_frame2_rows(re: np.ndarray, im: np.ndarray, fmt: RowFormat) -> np.ndarr
 
 
 def unpack_frame2_rows(raw: np.ndarray, fmt: RowFormat) -> tuple:
-    """``uint8 [rows, row_bytes]`` -> ``(re, im)`` int8 ``[rows, n_values]``."""
+    """``uint8 [rows, row_bytes]`` -> ``(re, im)`` int8 ``[rows, n_values]``.
+
+    Bit for bit :func:`unpack_frame2_rows_ref` (the bit-expansion reference)
+    without its int64 bit array: 4-bit components are the two nibbles of
+    one byte; other widths <= 8 go ``unpackbits`` -> ``packbits`` per
+    component (I1's ``unpack_frame2_rows_fast``; ~the speed the CPU K0 and
+    the offline re-imaging tools need)."""
+    if fmt.kind != "frame2":
+        raise ValueError("unpack_frame2_rows needs a frame2 format")
+    if fmt.n_main and fmt.bits > 8:
+        return unpack_frame2_rows_ref(raw, fmt)
+    raw = np.ascontiguousarray(raw, dtype=np.uint8)[:, :fmt.row_bytes]
+    rows = raw.shape[0]
+    nh, nm, b = fmt.n_heavy, fmt.n_main, fmt.bits
+    re = np.empty((rows, fmt.n_values), dtype=np.int8)
+    im = np.empty((rows, fmt.n_values), dtype=np.int8)
+    if nh:
+        pair = raw[:, :2 * nh].view(np.int8).reshape(rows, nh, 2)
+        re[:, :nh] = pair[..., 0]
+        im[:, :nh] = pair[..., 1]
+    if nm:
+        if b == 4:
+            m = raw[:, 2 * nh:2 * nh + nm]
+            lo_ = (m & 0x0F).astype(np.int16)
+            hi_ = (m >> 4).astype(np.int16)
+            re[:, nh:] = np.where(lo_ >= 8, lo_ - 16, lo_)
+            im[:, nh:] = np.where(hi_ >= 8, hi_ - 16, hi_)
+        else:
+            bits = np.unpackbits(raw[:, 2 * nh:], axis=1, bitorder="little")[:, :2 * nm * b]
+            pad = np.zeros((rows, nm, 2, 8), np.uint8)
+            pad[..., :b] = bits.reshape(rows, nm, 2, b)
+            val = np.packbits(pad, axis=-1, bitorder="little")[..., 0].astype(np.int16)
+            val = np.where(val >= (1 << (b - 1)), val - (1 << b), val)
+            re[:, nh:] = val[..., 0]
+            im[:, nh:] = val[..., 1]
+    return re, im
+
+
+def unpack_frame2_rows_ref(raw: np.ndarray, fmt: RowFormat) -> tuple:
+    """The bit-expansion reference of :func:`unpack_frame2_rows`."""
     if fmt.kind != "frame2":
         raise ValueError("unpack_frame2_rows needs a frame2 format")
     raw = np.ascontiguousarray(raw, dtype=np.uint8)[:, :fmt.row_bytes]

@@ -23,7 +23,7 @@ Subcommands (exit 0 = every gate passed, 1 = a gate failed, 2 = error):
                                 detector vs multi_boxcar_argmax).
   engine --gpus 0,1 --input synthetic-ring|rx-v4 --opoint <id> --minutes M
          [--shm-name /ring --plan p.npz --halves 2j,2j+1 --out DIR]   (WS-T fleet-load form)
-         [--variants staged:reg,triton:v1 --ring-access pread|mmap]
+         [--variants staged:reg[,triton:v1] --ring-access pread|mmap]
                                 one owner half per GPU, real-time paced synthetic ring
                                 (in-process; no shm) or ring v4 (RingV4Source); each k1:k3b
                                 variant for M / n_variants minutes: per-stage us/image (CUDA
@@ -533,6 +533,23 @@ def cmd_kernels(a) -> int:
             wv = torch.as_tensor(inp.weights(), device=dev)
             tw = k1_twin(codes.cpu().numpy(), c_v=inp.c_v, offset=0.0, csr=inp.csr,
                          shifts=spec.shifts[:2], t_lo=2000, n_t=2, w_v=inp.w_v)
+            # staged K1 as the engine runs it: passes of <= 24 fine DMs
+            # (EngineConfig.k1_fdm_per_pass), each with its own window geometry
+            bnd = np.linspace(0, F, -(-F // 24) + 1).astype(int)
+            k1p = []
+            for f0, f1 in zip(bnd[:-1], bnd[1:]):
+                shp = np.ascontiguousarray(spec.shifts[int(f0):int(f1)])
+                gp = staged_geometry(shp, n_t=n_t)
+                cp_ = dict(ct)
+                cp_["smax"] = torch.as_tensor(gp.smax, dtype=torch.int32, device=dev)
+                k1p.append((int(f0), int(f1), torch.as_tensor(shp, dtype=torch.int32, device=dev),
+                            gp, cp_))
+            uv_out = torch.empty((F, n_t, inp.csr.n_active, 2), dtype=torch.float32, device=dev)
+
+            def k1_passes():
+                for f0, f1, shp, gp, cp_ in k1p:
+                    k1_staged(codes, cv, cp_, shp, t_lo=2000, n_t=n_t, w_v=wv, geom=gp,
+                              out=uv_out[f0:f1])
             for v in k1_vars:
                 if v == "staged":
                     fn = lambda sh_, nt_: k1_staged(codes, cv, ct, sh_, t_lo=2000,  # noqa: E731
@@ -540,7 +557,7 @@ def cmd_kernels(a) -> int:
                 else:
                     fn = lambda sh_, nt_: k1_combine(codes, cv, ct, sh_, t_lo=2000,  # noqa: E731
                                                      n_t=nt_, w_v=wv)
-                ms = _cuda_ms(lambda: fn(shifts, n_t))
+                ms = _cuda_ms(k1_passes if v == "staged" else (lambda: fn(shifts, n_t)))
                 sub_ = fn(shifts[:2].contiguous(), 2).cpu().numpy()
                 exact = bool(np.array_equal(sub_[..., 0], tw.real)
                              and np.array_equal(sub_[..., 1], tw.imag))
@@ -571,7 +588,7 @@ def cmd_kernels(a) -> int:
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="pruned")  # noqa: E731
                 elif v == "dense":
                     fn = lambda: image_from_uv_torch(uvt, plan, mk, mode="irfft2")  # noqa: E731
-                elif v in ("warp", "fused"):
+                elif v in ("warp", "fused", "fused_v1", "fused_v2"):
                     fn = _warp_runner(uvt, plan, inp, dev, mode=v)
                 else:
                     continue
@@ -692,13 +709,17 @@ def _warp_runner(uvt, plan, inp, dev, mode: str = "warp"):
     from dsart.x2.search.kernels_cuda import k23_tables, launch_k23
     tables = k23_tables(lines, n_fl, dev, pix=pix)
 
-    def run_fused():
+    def run_fused(kname="k23v2p_256"):
         launch_k23(uv2, tables, tw, pix, ring, B=B, n_act=A, n_t=B, F=1, t0=0, R_img=B,
-                   transpose=tr, stream=torch.cuda.current_stream())
+                   transpose=tr, stream=torch.cuda.current_stream(), kname=kname)
         return ring.view(B, N, N)
 
     if mode == "fused":
         return run_fused
+    if mode == "fused_v1":
+        return lambda: run_fused("k23_fused_256")
+    if mode == "fused_v2":
+        return lambda: run_fused("k23v2_256")
 
     def run():
         with cp.cuda.ExternalStream(torch.cuda.current_stream().cuda_stream):
@@ -723,7 +744,8 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
     from dsart.x2.search.kernels_triton import k3b_detect
 
     T, F, P = 256, 4, 65536
-    cube = (torch.randn((T, F, P), device=dev) * 1.0).to(torch.float16)
+    g = torch.Generator(device=dev).manual_seed(0)
+    cube = torch.randn((T, F, P), device=dev, generator=g).to(torch.float16)
     cube[100, 1, 1234] = 40.0
     maxw = 64
     cs = torch.zeros((T + maxw, F, P), dtype=torch.float16, device=dev)
@@ -739,10 +761,16 @@ def _k3b_compat_vs_production(fb, dev) -> dict:
     best, _tk, _ = k3b_detect(cube.contiguous(), ring_row0=0, c_first=maxw // 2, n_c=T - maxw,
                               sigma_inv=torch.ones(F, device=dev), s_inv=1 / fb.seeds, bank=fb)
     d = (best - prod).abs()
-    tol = 0.02 + 2.0 * torch.abs(prod) * 2.0 ** -11
+    # production's boxcar is a difference of two fp16 running sums: each carries
+    # up to half an fp16 ulp of its magnitude (|cumsum| reaches ~40 over 256
+    # rows: ulp 2^-5), so the tolerance includes one ulp of the window's largest
+    # |cumsum| (x max s_inv = 1, b1) besides 0.02 and the stored max's ulp
+    cs_max = cs.float().abs().amax(dim=0)                                  # [F, P]
+    tol = 0.02 + 2.0 * torch.abs(prod) * 2.0 ** -11 + 2.0 ** -10 * cs_max[None]
     worst = float((d - tol).max())
     return dict(compat_max_abs=float(d.max()), compat_status="ok" if worst <= 0 else "fail",
-                compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max")
+                compat_note="tolerance 0.02 + 1 fp16 ulp of the stored max + 1 fp16 ulp of "
+                            "the largest |cumsum| (production's fp16 running sums)")
 
 
 class _FakeRecording:
@@ -901,7 +929,7 @@ def _atomic_json(path: Path, obj: dict) -> None:
 
 
 def _variants(a) -> list:
-    """``--variants k1:k3b,...`` (default: staged:reg then triton:v1)."""
+    """``--variants k1:k3b,...`` (default: staged:reg)."""
     out = []
     for tok in [t for t in a.variants.split(",") if t]:
         k1, _, k3b = tok.partition(":")
@@ -931,8 +959,10 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
     inp = dm_inputs_from_value_map(vm, s_main=sm, s_heavy=sh, bits_main=op.bits_main)
     inputs = {s.d: inp for s in oplan.dms}
     head = dict(half=half, opoint=a.opoint, k1=k1, k3b=k3b, input=a.input,
+                plan_id=str(getattr(plan, "plan_id", "")), n_dm=len(oplan.dms),
                 dms=oplan.summary()["dms"], images_per_cycle=int(
                     sum(s.n_fdm * s.hop for s in oplan.dms)))
+    head["images_per_s"] = head["images_per_cycle"] / CYCLE_S
     if a.input == "synthetic-ring":
         ring = ClockedRing(oplan, {s.d: inp.fmt for s in oplan.dms})
     else:
@@ -972,7 +1002,7 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
         gpu = float(sum(v for kk, v in cyc_stage.items() if kk != "h2d"))
         lag = max(sched.lag_ms(k).values(), default=0.0)
         rec.append(dict(cycle=k, wall_ms=wall, gpu_ms=gpu, lag_ms=lag,
-                        n_cand=len(r.candidates)))
+                        n_cand=len(r.candidates), phase_ms=dict(r.phase_ms)))
         now = time.monotonic()
         if now - t_part >= 15.0:
             _atomic_json(part, dict(head, final=False, **_half_summary(rec, stage_ms, images,
@@ -996,10 +1026,18 @@ def _half_summary(rec, stage_ms, images, sched, ring) -> dict:
     chain = float(sum(v for k, v in st_us.items() if k != "h2d"))
     duty = float(gpu.mean() / (1e3 * CYCLE_S)) if gpu.size else 0.0
     host = float(np.percentile(np.maximum(wall - gpu, 0), 99)) if wall.size else 0.0
+    phase = {}
+    for x in rec:
+        for kk, v in x.get("phase_ms", {}).items():
+            phase.setdefault(kk, []).append(v)
+    phase = {kk: dict(mean=float(np.mean(v)), p99=float(np.percentile(v, 99)))
+             for kk, v in phase.items()}
     fan = {}
     if hasattr(ring, "fan_in"):
         fan = {int(d): ring.fan_in(d) for d in ring.dms()}
-    return dict(n_cycles=len(rec), gpu_duty=duty,
+    return dict(n_cycles=len(rec), gpu_duty=duty, host_phase_ms=phase,
+                wall_ms_p99=float(np.percentile(wall, 99)) if wall.size else 0.0,
+                gpu_ms_mean=float(gpu.mean()) if gpu.size else 0.0,
                 gpu_duty_p99=float(np.percentile(gpu, 99) / (1e3 * CYCLE_S)) if gpu.size else 0.0,
                 host_ms_p99=host, lag_ms_max=float(lag.max(initial=0)),
                 lag_ms_last=float(lag[-1]) if lag.size else 0.0,
@@ -1009,10 +1047,18 @@ def _half_summary(rec, stage_ms, images, sched, ring) -> dict:
 
 
 def _engine_gate(h: dict) -> dict:
-    ok = (h.get("n_cycles", 0) > 0 and h["gpu_duty"] <= DUTY_GATE and h["host_ms_p99"] <= 30.0
+    # real time: every cycle's wall time (GPU + the host work it does not hide)
+    # within 90% of the cycle at p99, no lag-recovery seek, no growing lag; the
+    # host's share is reported (host_ms_p99) but gated only through the wall
+    wall_p99 = h.get("wall_ms_p99", float("inf"))
+    ok = (h.get("n_cycles", 0) > 0 and h["gpu_duty"] <= DUTY_GATE
+          and wall_p99 <= 0.9 * 1e3 * CYCLE_S
           and h["lag_ms_last"] <= 2.0 * 1e3 * CYCLE_S and h["lag_recovery_seeks"] == 0
           and h["chain_us_per_image"] <= CHAIN_GATE_US)
     return dict(check="engine", half=h["half"], k1=h["k1"], k3b=h["k3b"],
+                plan_id=h.get("plan_id"), n_dm=h.get("n_dm"),
+                images_per_s=h.get("images_per_s"), gpu_ms_mean=h.get("gpu_ms_mean"),
+                wall_ms_p99=h.get("wall_ms_p99"), host_phase_ms=h.get("host_phase_ms"),
                 n_cycles=h.get("n_cycles", 0), stop=h.get("stop"), gpu_duty=h["gpu_duty"],
                 duty_aim_met=h["gpu_duty"] <= DUTY_AIM, host_ms_p99=h["host_ms_p99"],
                 lag_ms_max=h["lag_ms_max"], lag_recovery_seeks=h["lag_recovery_seeks"],
@@ -1113,7 +1159,9 @@ def main(argv=None) -> int:
     c = sub.add_parser("compile-check")
     c.add_argument("--out", default="b8_out")
     k = sub.add_parser("kernels")
-    k.add_argument("--fft", default="cufft,warp,fused")
+    k.add_argument("--fft", default="cufft,warp,fused_v1,fused_v2,fused",
+                   help="cufft, dense, warp, fused (k23v2p_256), fused_v2 (k23v2_256), "
+                        "fused_v1 (k23_fused_256)")
     k.add_argument("--k3b", default="box,b3x,v1,fused,cuda,reg",
                    help="filter banks (box, b3x) and implementations (v1, fused, cuda, reg)")
     k.add_argument("--k1", default="triton,staged", help="K1 variants (triton, staged)")
@@ -1137,8 +1185,9 @@ def main(argv=None) -> int:
     e.add_argument("--opoint", default="2x-gridded-ns2-cint4")
     e.add_argument("--minutes", type=float, default=10.0, help="total, split over --variants")
     e.add_argument("--out", default="b8_out", help="directory; b8_engine.json is the result")
-    e.add_argument("--variants", default="staged:reg,triton:v1",
-                   help="k1:k3b pairs, run one after another")
+    e.add_argument("--variants", default="staged:reg",
+                   help="k1:k3b pairs, run one after another (minutes split between them); "
+                        "the default is the G0 pick (staged K1, register K3b, fused FFT)")
     e.add_argument("--ring-access", dest="ring_access", default="pread",
                    choices=("pread", "mmap"))
     e.add_argument("--attach-timeout-s", dest="attach_timeout_s", type=float, default=300.0)
