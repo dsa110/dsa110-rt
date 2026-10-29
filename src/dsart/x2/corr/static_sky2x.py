@@ -9,7 +9,12 @@ loop of ``n_dm`` ``apply`` calls:
   ``window_blocks`` blocks' per-value means is subtracted -- strictly
   causal, a burst never subtracts itself;
 * then this block's per-value mean (over its time samples) joins the
-  window; the running sum is re-summed exactly every 1024 blocks.
+  window; the running sum is re-summed exactly every 1024 blocks;
+* 2x (adopted 2026-10-29, with the row rule v1.1): an excised sample
+  (exactly 0 + 0i: its voltages were zeroed by the array-burst / RFI mask)
+  stays exactly 0 -- the window mean is not subtracted from it. Subtracting
+  it turned excised data into a fake -sky value that the row rule counted
+  as data. The 1x ``StaticSkyMean`` path is unchanged.
 
 In place on ``x`` ``(n_d, n_t, V)`` complex64, ~5 elementwise/reduction
 kernels per tier regardless of ``n_d``. Every DM of a tier advances
@@ -60,7 +65,8 @@ class BatchedStaticSky:
             raise ValueError(f"x shape {tuple(x.shape)} != (n_d, n_t, {tuple(self.sum.shape)[1]})")
         mean = x.mean(dim=1)                                        # (n_d, V)
         if self.count > 0 and self.seen >= self.warmup_cubes:
-            x.sub_((self.sum / self.count).unsqueeze(1))
+            sky = (self.sum / self.count).unsqueeze(1)
+            x.sub_(torch.where(x != 0, sky, torch.zeros_like(sky)))  # excised stays 0
         if self.count == self.window_blocks:
             self.sum.sub_(self.ring[self.head])
         else:

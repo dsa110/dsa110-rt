@@ -247,8 +247,9 @@ class StaticSkyRef:
     """Strictly causal sliding mean of per-block cell means: a block is
     passed through while fewer than ``warmup_cubes`` blocks have been
     seen, otherwise the mean of the previous ``window_blocks`` blocks'
-    per-cell means is subtracted; then this block's mean joins the window
-    (exactly ``StaticSkyMean.apply``, one state per key)."""
+    per-cell means is subtracted from every sample that is not exactly 0
+    (2x: excised samples stay 0); then this block's mean joins the window
+    (``StaticSkyMean.apply``, one state per key, plus the 2x zero rule)."""
 
     window_blocks: int = 8
     warmup_cubes: int = 8
@@ -261,7 +262,7 @@ class StaticSkyRef:
         if not ring or seen < self.warmup_cubes:
             out = x.copy()
         else:
-            out = x - np.mean(ring, axis=0)[None, :]
+            out = np.where(x != 0, x - np.mean(ring, axis=0)[None, :], x)
         ring.append(x.mean(axis=0))
         if len(ring) > self.window_blocks:
             ring.pop(0)
