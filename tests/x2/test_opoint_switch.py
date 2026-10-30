@@ -286,10 +286,11 @@ def test_refused_when_set_missing_or_dirty(env2x, tmp_path):
         del s.kv[opr.set_key(NS2, inst)]
     res = _switch(s, NS2, FakeSystemd(), env2x)
     assert not res["ok"] and "push_dsart_to_etcd.py --opoint" in res["error"]
-    # a set with placeholders (the real template) is refused
+    # a set with placeholders (a template that still owes a value) is refused
     plan_path = tmp_path / "p.npz"
     env2x["plan"].to_npz(plan_path)
-    dirty = opr.render_repo_set(NS2, CONFIGS, plan=env2x["plan"], plan_path=str(plan_path))
+    dirty = opr.render_repo_set(NS2, _dirty_configs(tmp_path), plan=env2x["plan"],
+                                plan_path=str(plan_path))
     for inst in opr.INSTANCES:
         s.kv[opr.set_key(NS2, inst)] = dirty[inst]
     res = _switch(s, NS2, FakeSystemd(), env2x)
@@ -297,10 +298,22 @@ def test_refused_when_set_missing_or_dirty(env2x, tmp_path):
     assert s.live_writes() == []
 
 
-def test_refused_when_h23_files_have_placeholders(env2x):
+def _dirty_configs(tmp_path) -> Path:
+    """Copy of configs/ whose 2x template still owes a value (X2TODO token + x2_todo entry)."""
+    dst = tmp_path / "configs_dirty"
+    shutil.copytree(CONFIGS, dst, ignore=shutil.ignore_patterns("*.npz", "dm_plans"))
+    f = dst / "opoints" / "2x" / "dsart_search_rt.yaml"
+    doc = yaml.safe_load(f.read_text())
+    doc["x2_todo"] = ["WS-T: an open review"]
+    doc["routines"][0]["args"] += " --rx-threads X2TODO:WS-T:threads"
+    f.write_text(yaml.safe_dump(doc, sort_keys=False))
+    return dst
+
+
+def test_refused_when_h23_files_have_placeholders(env2x, tmp_path):
     s = _kv_with_sets(env2x, live_sel="unstamped")
     res = osw.switch_opoint(s, NS2, user="ops", systemd=FakeSystemd(), compute_state=_ready,
-                            configs_dir=CONFIGS)          # the real (unfinished) 2x template
+                            configs_dir=_dirty_configs(tmp_path))
     assert not res["ok"] and "h23" in res["error"] and "placeholder" in res["error"]
 
 
@@ -603,7 +616,7 @@ def test_control_start_fleet_without_opoint_is_unchanged():
 # ------------------------------------------------------------ banner/status
 
 
-def test_banner_and_status(env2x):
+def test_banner_and_status(env2x, tmp_path):
     osw._BANNER_CACHE["val"] = None
     s = _kv_with_sets(env2x, live_sel=NS2, active=opr.make_active_record(NS2, plan_id="0x1"))
     b = osw.opoint_banner(s, ttl_s=0)
@@ -614,7 +627,9 @@ def test_banner_and_status(env2x):
     st = osw.opoint_status(s, configs_dir=env2x["configs"])
     assert st["sets"][NS2]["switchable"] and st["sets"]["1x"]["switchable"]
     assert not st["sets"]["2x-baselines-ns4-cint4"]["pushed"]
-    st = osw.opoint_status(s, configs_dir=CONFIGS)
+    st = osw.opoint_status(s, configs_dir=CONFIGS)       # the repo template is complete (G2)
+    assert st["sets"][NS2]["switchable"] and not st["sets"][NS2]["h23_problems"]
+    st = osw.opoint_status(s, configs_dir=_dirty_configs(tmp_path))
     assert not st["sets"][NS2]["switchable"] and st["sets"][NS2]["h23_problems"]
     osw._BANNER_CACHE["val"] = None
 

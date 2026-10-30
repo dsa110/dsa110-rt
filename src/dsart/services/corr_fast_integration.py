@@ -4503,13 +4503,12 @@ def run(
         x2_tx = None
         x2_tx_meter = None
         if x2_op is not None:
-            from dsart.grid.baseline_grid import build_value_map_for_opoint
             from dsart.x2.corr.pipeline2x import Corr2xPipeline, NoOpTx2x
             from dsart.x2.corr.plan2x import CorrPlan2x
-            vmap = build_value_map_for_opoint(
-                x2_op, antpos_e, antpos_n, is_core_baseline_mask=core_mask,
-                dec_deg=math.degrees(cfg.obs_dec_rad),
-            )
+            from dsart.x2.prod_inputs import value_map as _x2_value_map
+            # the helper search_rx v4 and the owner engine also use (same pattern ids)
+            vmap = _x2_value_map(x2_op, antpos_e, antpos_n, core_mask,
+                                 dec_deg=math.degrees(cfg.obs_dec_rad))
             x2_orch = Corr2xPipeline(
                 ctx, plan=CorrPlan2x.from_tiered_plan(x2_plan), vm=vmap,
                 is_core_baseline_mask=core_mask, bits_main=x2_op.bits_main,

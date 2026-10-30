@@ -128,17 +128,31 @@ def test_c1_rows_are_in_radians_from_the_value_map_cell():
 
 
 def test_mjd_clock_anchor_rule():
-    n = 1_000_000                                     # native samples since the capture arm
+    import pytest
+
+    from dsart.x2.prod_inputs import ArmRecord, capture_native0
+    from dsart.x2.search.service import MjdEpochError
+
+    arm_seq = 17_179_869_184 + 16 * 1234                # absolute SNAP specnum of the arm
+    n0 = capture_native0(arm_seq)                     # = 2 x arm_seq (a multiple of 16)
+    n = n0 + 1_000_000                                # absolute native index of the data in hand
     wall_s = 1.8e9
     wall_mjd = 40587.0 + wall_s / 86400.0
-    armed = wall_mjd - (n * 32.768e-6 + 5.0) / 86400.0          # 5 s pipeline latency
-    c = MjdClock(read_armed=lambda: armed, wall=lambda: wall_s)
-    assert c.mjd_of_native(0, latch_n=n) == armed and c.source == "armed_mjd"
-    stale = armed - 3600.0 / 86400.0                  # an hour off: not this run's arm
-    c = MjdClock(read_armed=lambda: stale, wall=lambda: wall_s)
-    got = c.mjd_of_native(n)
+    armed = wall_mjd - (1_000_000 * 32.768e-6 + 5.0) / 86400.0  # 5 s pipeline latency
+    rec = ArmRecord(armed_mjd=armed, arm_seq=arm_seq, source="pps_epoch")
+    c = MjdClock(read_arm=lambda: (rec, ""), wall=lambda: wall_s)
+    assert abs((c.mjd_of_native(n0, latch_n=n) - armed) * 86400.0) < 1e-5
+    assert c.source == "arm:pps_epoch" and c.record == rec
+    assert c.anchor == armed - n0 * 32.768e-6 / 86400.0
+    stale = ArmRecord(armed_mjd=armed - 3600.0 / 86400.0, arm_seq=arm_seq)  # not this run's arm
+    with pytest.raises(MjdEpochError, match="behind the wall clock"):
+        MjdClock(read_arm=lambda: (stale, ""), wall=lambda: wall_s).mjd_of_native(n)
+    with pytest.raises(MjdEpochError, match="no record"):          # production: fail loudly
+        MjdClock(read_arm=lambda: (None, "no record"), wall=lambda: wall_s).mjd_of_native(n)
+    c = MjdClock(read_arm=lambda: (stale, ""), wall=lambda: wall_s, strict=False)
+    got = c.mjd_of_native(n)                          # development: the wall latch
     assert c.source == "wall" and abs((got - wall_mjd) * 86400.0) < 1e-3
-    c = MjdClock(61341.25, read_armed=lambda: 1 / 0)  # explicit: etcd never read
+    c = MjdClock(61341.25, read_arm=lambda: 1 / 0)    # explicit: etcd never read
     assert c.mjd_of_native(6144) == 61341.25 + 6144 * 32.768e-6 / 86400.0
 
 
@@ -147,7 +161,7 @@ def test_one_c1_batch_per_cycle_through_the_production_emitter():
     from dsart.services.c1_emit import C1EmitConfig, C1TcpEmitter
 
     tx = C1TcpEmitter(config=C1EmitConfig(host="127.0.0.1", search_node_id=9, gpu_half=1))
-    clock = MjdClock(61341.0, read_armed=None)
+    clock = MjdClock(61341.0, read_arm=None)
     bursts = [Burst(d=0, f=2, t=3 * 384 + 150, l=11, m=21, amp=1.8)]
     holder = {}
     svc, *_ = _svc(bursts=bursts, last_cycle=3,

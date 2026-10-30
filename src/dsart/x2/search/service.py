@@ -42,12 +42,17 @@ import numpy as np
 
 from .geometry import CYCLE_NATIVE, SEARCH_NODES
 
-__all__ = ["CycleScheduler", "OwnerService", "mon_payloads", "c1_rows_for_cycle", "c1_geometry",
-           "MjdClock", "c1_batch_header", "make_c1_emit", "main"]
+__all__ = ["CycleScheduler", "NoCycleYet", "OwnerService", "mon_payloads", "c1_rows_for_cycle",
+           "c1_geometry", "MjdClock", "MjdEpochError", "c1_batch_header", "make_c1_emit", "main"]
 
 _LOG = logging.getLogger("dsart.x2.search.service")
 NATIVE_S = 32.768e-6
 CYCLE_S = CYCLE_NATIVE * NATIVE_S
+
+
+class NoCycleYet(TimeoutError):
+    """No complete cycle within ``next_cycle``'s timeout (no data: before the arm, or an
+    outage upstream); raised before any processing, so the caller may simply wait on."""
 
 
 class CycleScheduler:
@@ -104,7 +109,7 @@ class CycleScheduler:
                     self.k = nxt
                     return self.k
             if t_end is not None and time.monotonic() >= t_end:
-                raise TimeoutError("no complete cycle")
+                raise NoCycleYet("no complete cycle")
             time.sleep(poll_s)
 
     def lag_ms(self, k: int) -> Dict[int, float]:
@@ -147,51 +152,63 @@ def c1_geometry(cell_lambda: float, n_grid: int) -> dict:
     return dict(n_grid=int(n_grid), cell_l_rad=cell, cell_m_rad=cell, l0_rad=0.0, m0_rad=0.0)
 
 
-def _read_armed_mjd() -> Optional[float]:
-    """MJD of native sample 0: the capture arm record ``/mon/snap/1/armed_mjd``
-    (stamped at ``utc_start``; the corr block numbering starts there), as the
-    1x ``SearchComputeService._read_capture_anchor_mjd``. None when etcd is
-    unavailable or the value is not within the last 30 days."""
-    try:
-        from dsautils.dsa_store import DsaStore
-        doc = DsaStore().get_dict("/mon/snap/1/armed_mjd") or {}
-        val = float(doc.get("armed_mjd") or 0.0)
-    except Exception as exc:                                     # noqa: BLE001
-        _LOG.warning("capture-anchor etcd read failed (%s)", exc)
-        return None
-    now_mjd = 40587.0 + time.time() / 86400.0
-    if not (now_mjd - 30.0 < val <= now_mjd + 2.0 / 86400.0):
-        _LOG.warning("armed_mjd %.6f implausible (now %.6f)", val, now_mjd)
-        return None
-    return val
+class MjdEpochError(RuntimeError):
+    """The capture epoch needed to label candidates is unavailable or inconsistent."""
+
+
+def _read_arm_record():
+    """``(ArmRecord | None, reason)`` from ``/mon/snap/1/armed_mjd`` (``prod_inputs``)."""
+    from ..prod_inputs import read_arm_record
+    return read_arm_record()
 
 
 class MjdClock:
     """MJD of native sample ``n`` = ``mjd_at_native_0 + n * 32.768 us``.
 
-    The anchor is resolved once: an explicit ``mjd_at_native_0`` (> 0), else
-    the capture arm record (``read_armed``), accepted when the first query's
-    data time lags the wall clock by -2..120 s (the 1x rule), else a wall
-    latch at that first query (late by the pipeline latency, logged)."""
+    Native indices are absolute (SPEC §9: 2 x SNAP specnum; corr_fast ``--x2-epoch
+    capture`` starts the first page after an arm at specnum ``u`` at native
+    ``prod_inputs.capture_native0(u)``). The anchor is resolved once, at the first query:
 
-    def __init__(self, mjd_at_native_0: float = 0.0, *, read_armed=_read_armed_mjd,
-                 wall=time.time) -> None:
+    * an explicit ``mjd_at_native_0`` (> 0: replays, tests), else
+    * the capture arm record (``read_arm`` -> ``(ArmRecord, reason)``):
+      ``armed_mjd - capture_native0(arm_seq) x 32.768 us`` -- the record 1x labels its
+      candidates from (``SearchComputeService._read_capture_anchor_mjd``), accepted when
+      the first query's data time lags the wall clock by -2..120 s (the 1x rule);
+    * otherwise ``strict`` (production) raises :class:`MjdEpochError`; non-strict
+      (development) falls back to a wall latch at that query (late by the pipeline
+      latency, logged).
+    """
+
+    def __init__(self, mjd_at_native_0: float = 0.0, *, read_arm=_read_arm_record,
+                 wall=time.time, strict: bool = True) -> None:
         self.anchor: Optional[float] = float(mjd_at_native_0) if mjd_at_native_0 > 0 else None
         self.source = "explicit" if self.anchor is not None else ""
-        self._read_armed = read_armed
+        self._read_arm = read_arm
         self._wall = wall
+        self.strict = bool(strict)
+        self.record = None
 
     def _latch(self, n_now: int) -> float:
         wall_anchor = 40587.0 + self._wall() / 86400.0 - float(n_now) * NATIVE_S / 86400.0
-        armed = self._read_armed() if self._read_armed is not None else None
-        if armed is not None and -2.0 <= (wall_anchor - armed) * 86400.0 <= 120.0:
-            self.anchor, self.source = float(armed), "armed_mjd"
-        else:
-            if armed is not None:
-                _LOG.warning("armed_mjd %.9f inconsistent with the wall latch %.9f; using the "
-                             "wall latch (labels late by the pipeline latency)", armed,
-                             wall_anchor)
-            self.anchor, self.source = wall_anchor, "wall"
+        rec, why = self._read_arm() if self._read_arm is not None else (None, "no arm reader")
+        if rec is not None:
+            anchor = float(rec.mjd_at_native_0)
+            lag_s = (wall_anchor - anchor) * 86400.0
+            if -2.0 <= lag_s <= 120.0:
+                self.anchor, self.source, self.record = anchor, f"arm:{rec.source}", rec
+                _LOG.info("x2 mjd_at_native_0 = %.9f from the arm record (armed_mjd %.9f, "
+                          "arm_seq %d, %s); native %d lags the wall clock by %.2f s",
+                          anchor, rec.armed_mjd, rec.arm_seq, rec.source or "?", n_now, lag_s)
+                return self.anchor
+            why = (f"the arm record (armed_mjd {rec.armed_mjd:.9f}, arm_seq {rec.arm_seq}) puts "
+                   f"native sample {n_now} {lag_s:+.1f} s behind the wall clock (want -2..120 s): "
+                   "not this data's arm, or corr_fast is not on --x2-epoch capture")
+        if self.strict:
+            _LOG.error("x2 MJD epoch unavailable: %s", why)
+            raise MjdEpochError(f"x2 MJD epoch unavailable: {why}")
+        _LOG.warning("x2 MJD epoch: %s; using the wall latch (labels late by the pipeline "
+                     "latency)", why)
+        self.anchor, self.source = wall_anchor, "wall"
         _LOG.info("x2 mjd_at_native_0 = %.9f (%s)", self.anchor, self.source)
         return self.anchor
 
@@ -413,6 +430,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="dsart 2x search half (owner engine)")
     p.add_argument("--opoint", required=True)
     p.add_argument("--plan-path", required=True, help="TieredDmPlan npz (SPEC §2)")
+    p.add_argument("--plan-id", default=None,
+                   help="refuse a plan whose plan_id differs (the set's ${plan_id}, SPEC §10)")
+    p.add_argument("--t-int-search-us", type=float, default=None,
+                   help="must equal the op-point's T_ext (SPEC §10 explicit time units)")
+    p.add_argument("--chan-sum-factor", type=int, default=None,
+                   help="must equal the op-point's chan_sum_factor (SPEC §10)")
     p.add_argument("--search-node-id", type=int, required=True, help="cn: 1, 2, 9, 13")
     p.add_argument("--gpu-half", type=int, required=True)
     p.add_argument("--shm-name", required=True, help="ring v4 (WS-T)")
@@ -426,7 +449,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--c1-port", type=int, default=11500)
     p.add_argument("--c1-queue-depth", type=int, default=16)
     p.add_argument("--mjd-at-native-0", type=float, default=0.0,
-                   help="MJD of native sample 0; 0 = capture arm record, else a wall latch")
+                   help="MJD of native sample 0 (replays); 0 = from the capture arm record")
+    p.add_argument("--mjd-epoch", default="capture", choices=("capture", "capture-or-wall"),
+                   help="capture: the arm record or refuse to label (production); "
+                        "capture-or-wall: fall back to a wall latch (development)")
     p.add_argument("--cutout-bind-host", default="", help="'' = no cutout listener")
     p.add_argument("--cutout-base-port", type=int, default=11227)
     p.add_argument("--cutout-status-port", type=int, default=11501)
@@ -434,6 +460,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--upload-dest-host", default="", help="cutout/raw uploads (rsync); '' = off")
     p.add_argument("--upload-dest-root", default="/dataz/dsa110/candidates")
     p.add_argument("--raw-bwlimit-kbps", type=int, default=50_000)
+    # age/size backstop over --cutout-root (today's c1.retention over c1.dump_root; the
+    # sweeper sweeps the x2 cutouts / raw_s product dirs per half)
+    p.add_argument("--cutout-retention-max-age-h", type=float, default=96.0)
+    p.add_argument("--cutout-retention-max-total-gb", type=float, default=150.0,
+                   help="0 = no retention sweeper")
+    p.add_argument("--cutout-retention-low-water-gb", type=float, default=120.0)
     p.add_argument("--mon-interval-s", type=float, default=2.0)
     p.add_argument("--max-cycles", type=int, default=0)
     p.add_argument("--ring-access", default="pread", choices=("pread", "mmap"),
@@ -442,19 +474,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--k3b", default="reg", choices=("v1", "fused", "cuda", "reg"))   # G0 timing pick
     p.add_argument("--k1", default="staged", choices=("triton", "staged"))
     p.add_argument("--log-level", default="INFO")
-    a, _unknown = p.parse_known_args(argv)
+    a = p.parse_args(argv)                  # strict: a stray (e.g. 1x) argument fails loudly
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO))
     from ...x2.opoint import opoint_from_id
-    from ...x2.plan import TieredDmPlan
+    from ..prod_inputs import load_plan, node_index_of_cn
     from .c1_cycle import C1CycleConfig, C1CyclePool
     from .engine import EngineConfig, OwnerEngine
     from .geometry import owner_plan_from_tiered
     from .valuemap import dm_inputs_from_value_map
 
     op = opoint_from_id(a.opoint)
-    node = {1: "n01", 2: "n02", 9: "n09", 13: "n13"}[int(a.search_node_id)]
-    half = SEARCH_NODES.index(node) * 2 + int(a.gpu_half)
-    plan = TieredDmPlan.from_npz(a.plan_path, verify=True)
+    if a.t_int_search_us is not None and abs(a.t_int_search_us - op.t_ext_us) > 1e-6:
+        p.error(f"--t-int-search-us {a.t_int_search_us} != {op.opoint_id} T_ext {op.t_ext_us}")
+    if a.chan_sum_factor is not None and a.chan_sum_factor != op.chan_sum_factor:
+        p.error(f"--chan-sum-factor {a.chan_sum_factor} != {op.opoint_id} "
+                f"{op.chan_sum_factor}")
+    if a.gpu_half not in (0, 1):
+        p.error(f"--gpu-half {a.gpu_half}: 0 or 1")
+    half = node_index_of_cn(a.search_node_id) * 2 + int(a.gpu_half)
+    node = SEARCH_NODES[half // 2]
+    plan = load_plan(a.plan_path, op, a.plan_id)
     oplan = owner_plan_from_tiered(plan, half=half)
     vm = _value_map_for(op, a.antpos_path, a.obs_dec_deg)
     s_main = {8: 0.3534, 10: 0.1932, 12: 0.1055}[int(op.bits_main)]
@@ -473,7 +512,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pool = C1CyclePool(C1CycleConfig(chan_sum_factor=int(op.chan_sum_factor),
                                      ext_period_us=float(op.t_ext_us)))
     geom = c1_geometry(vm.cell_lambda, cfg.n_grid)
-    clock = MjdClock(a.mjd_at_native_0)
+    clock = MjdClock(a.mjd_at_native_0, strict=a.mjd_epoch == "capture")
     emitter = emit = None
     if a.c1_host:
         from ...services.c1_emit import C1EmitConfig, C1TcpEmitter
@@ -483,7 +522,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         emitter.start()
         emit = make_c1_emit(emitter, plan=oplan, search_node_id=a.search_node_id,
                             gpu_half=a.gpu_half, n_grid=cfg.n_grid, clock=clock)
-    producer = listener = None
+    producer = listener = retention = None
     if a.cutout_bind_host:
         from pathlib import Path
 
@@ -504,14 +543,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                                   base_port=a.cutout_base_port, c2_host=a.c1_host or "h23",
                                   status_port=a.cutout_status_port, event_root=Path(a.cutout_root))
         threading.Thread(target=listener.run, daemon=True, name="x2-cutout").start()
+        if a.cutout_retention_max_total_gb > 0:
+            from ...dump.cube_retention import CubeRetentionConfig, CubeRetentionSweeper
+            Path(a.cutout_root).mkdir(parents=True, exist_ok=True)
+            retention = CubeRetentionSweeper(CubeRetentionConfig(
+                dump_root=Path(a.cutout_root), max_age_h=a.cutout_retention_max_age_h,
+                max_total_gb=a.cutout_retention_max_total_gb,
+                low_water_gb=a.cutout_retention_low_water_gb),
+                thread_name=f"cutout-retention-g{a.gpu_half}")
+            retention.start()
     svc = OwnerService(eng, search_node_id=a.search_node_id, gpu_half=a.gpu_half, c1_pool=pool,
                        emit=emit, cutout=producer, geom=geom)
     mon = MonThread(svc, opoint=a.opoint, put=_etcd_put(), interval_s=a.mon_interval_s)
     mon.start()
     n = 0
+    idle_s = 0.0
     try:
         while a.max_cycles <= 0 or n < a.max_cycles:
-            svc.step(timeout_s=30.0)
+            try:
+                svc.step(timeout_s=30.0)
+            except NoCycleYet:
+                # no data yet (dsart_rt starts the halves before the arm) or a corr /
+                # search_rx outage: keep waiting, the scheduler re-anchors on the data
+                idle_s += 30.0
+                _LOG.warning("x2 half %d: no complete cycle for %.0f s (not armed yet, or no "
+                             "frames reach the ring); waiting", half, idle_s)
+                continue
+            idle_s = 0.0
             n += 1
     finally:
         mon.stop_ev.set()
@@ -519,21 +577,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             listener.stop()
         if emitter is not None:
             emitter.stop()
+        if retention is not None:
+            retention.stop()
     return 0
 
 
 def _value_map_for(op, antpos_path: str, dec_deg: float):
-    from pathlib import Path
-
-    from ...grid.baseline_grid import build_value_map_for_opoint
-    from ...grid.sparsity_pattern import core_baseline_mask_from_station_numbers
-
-    if antpos_path.endswith(".npz"):                            # e.g. the WS-P fixture
-        z = np.load(antpos_path)
-        e, n = z["antpos_e"], z["antpos_n"]
-        mask = core_baseline_mask_from_station_numbers(z["station"])
-    else:                                                        # production cal blob
-        from ...services.corr_fast_integration import load_antpos_from_cal_blob
-        e, n, mask = load_antpos_from_cal_blob(Path(antpos_path))
-    return build_value_map_for_opoint(op, e, n, is_core_baseline_mask=mask,
-                                      dec_deg=float(dec_deg))
+    """The value map corr_fast and search_rx build for the same inputs
+    (``dsart.x2.prod_inputs``: cal blob or antpos npz, the canonical DEC)."""
+    from ..prod_inputs import value_map_for
+    return value_map_for(op, antpos_path, dec_deg)

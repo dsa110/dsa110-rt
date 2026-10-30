@@ -6,8 +6,9 @@
 # Rendered copy: /cnf/opoints/<2x id>/search_rt -> live /cnf/search_rt
 # (Start control). The h23 services (C2, C3, inject bot) read THIS file
 # from the h23 checkout when /cnf/opoint is a 2x id
-# (opoint_runtime.select_service_config); search_compute reads its
-# c1/detector blocks from the node copy via --config-yaml.
+# (opoint_runtime.select_service_config). The 2x search halves take their
+# C1 / detector values from the engine (EngineConfig / C1CycleConfig, equal to
+# the c1: block, tested), not from --config-yaml.
 # Frozen interface: docs/x2/SPEC.md section 10. Started as a verbatim copy of
 # configs/dsart_search_rt.yaml (the 1x base set, which stays byte-identical
 # to production).
@@ -39,13 +40,17 @@
 # dsart_rt.py orchestrator binary handles both instances.
 schema_version: 1
 opoint: 2x
-x2_todo:
-  - "WS-T search_rx: recv v4 / ring v4 args (owned DMs only -- template variables owned_coarse_csv_n01/n02/n09/n13 and n_owned_<node> are available for hostargs -- per-DM cadence and fan-in, retention >= 20 s; tokens in routines[search_rx])"
-  - "WS-S search_compute: owner engine args (per-DM cubes, K0-K3b, B-spline filters), amplitude regime in sigma units (input_clip_sigma 250, Layer-1/Layer-2 floors for the new image units, saturation guard 240), --enable-cube-dump vs on-demand cutouts (O1); tokens in routines[search_compute_0/1]"
-  - "WS-S/WS-D c1: merger dm_max_trials in pc/cc (2x fine spacing 2.8-3.2 pc/cc vs ~7), metering per cycle not per cube (never meter an injection more often than 1x), _DEDISP_CHAN_SUM_FACTOR wired from --chan-sum-factor (search_compute.py:266 is a literal 8 today)"
-  - "WS-S cube / cube_dump / noise / detector blocks: 2x values (cube retention ring, proactive stager and cube uploader retire in 2x)"
+# x2_todo: none open (G2 wiring, 2026-10-29). Closed: search_rx ring v4 args
+# (in-process spec + pattern ids, routines[search_rx]); owner-engine args
+# (routines[search_compute_0/1]; amplitude regime = the engine's EngineConfig:
+# clip 250 sigma, Layer-1 floor 0.078, Layer-2 floors per filter; on-demand
+# cutouts replace --enable-cube-dump); C1 per cycle with the op-point's
+# chan_sum_factor (dsart.x2.search.c1_cycle); the cube / cube_dump / noise /
+# detector blocks are not read by the 2x halves (kept for schema parity and
+# cube.sample_period_specnum, a checked time unit).
 # Carried over from 1x, recalibrated on 2x data at CP2 (does NOT block a switch).
 x2_cp2_recalibrate:
+  - "c1.merger.dm_max_trials 2 (the engine's c1_dm_max_trials): a half-window in fine-DM index, so at 2x fine spacing (2.8-3.2 pc/cc vs ~7 at 1x) the merge window is ~2.3x narrower in pc/cc; retune with 2x injections"
   - "coinc.cluster_rate_max 400 (counts evaluations; 2x sends ~3-6x more batches per burst)"
   - "coinc.dm_comb_* (3 clusters, 300 pc/cc span, 2 s, 90 arcsec): retune with 2x injections, risk of vetoing real bright bursts"
   - "coinc.window_s 5.0 vs the DM-3000 sweep (~1.7 s) + per-DM cube latency; coinc.ingest_queue_depth 512 (~2 s at 2x rates)"
@@ -59,415 +64,223 @@ x2_cp2_recalibrate:
 
 buffers: []
 
-# Per-node substitution conventions (dsart_rt._substitute):
+# Per-node substitution conventions (dsart_rt._substitute, a plain
+# substring replace on every argv token and env value):
 #   CN     -> cn_id integer (1 / 2 / 9 / 13 for the four search nodes).
+#   CUSTOMDEC -> the start verb's DEC (else /mon/array/dec.dec_deg; left
+#             literal -- and rejected by argparse -- when neither exists).
 #   CALSB  -> "sb%02d" of the corr chgroup; UNUSED here (search nodes
 #             have no chgroup). Don't reference it from search args.
 #   CHGROUP -> chgroup index 0..15; ALSO unused here.
+# No other upper-case "CN" may appear in args (it would be replaced).
 # Per-host overrides via the `hostargs:` block pick up first by FQDN
 # (n01.pro.pvt) then bare short hostname (n01).
 
 routines:
-  # ---- search_rx (M4a chunk 6 + M7.2 ring publish) -----------------
-  # Long-running C-epoll fan-in. Binds 16 UDP ports (6625..6640 = one
-  # per corr chgroup) on the node's nic.search address, drains each
-  # via a single epoll pthread, reassembles fragmented prod_frames and
-  # publishes reassembled cube slots into a POSIX-shm SPMC ring named
-  # /dsart-rxring-<cn_id> (e.g. /dsart-rxring-1 on n01). The two
-  # search_compute halves attach to this same ring as read-only
-  # consumers (n_filled, t_buf_samples, bytes_per_cell must match
-  # exactly between owner and consumer or the ctypes header check
-  # rejects at attach time).
+  # ---- 2x search-node routines (docs/x2/SPEC.md §6, §7, §9, §10) -------
+  # Ring v4 (frame v2, owned DMs only) written by search_rx and read by the
+  # two owner-engine halves (dsart.x2.search.service, dispatched by
+  # `search_compute --opoint 2x-*`). Every value-map input is the same in
+  # corr_fast, search_rx and the engine (dsart.x2.prod_inputs): the cal blob
+  # corr_fast calibrates with (--apply-cal ... antennas.out), the core mask of
+  # configs/corr_setup_96.yaml, the start verb's DEC (CUSTOMDEC, 0.25 deg
+  # bins) and tee45, so the per-stream pattern ids match and the engine's
+  # fail-loudly ring check (SPEC §7) passes. --plan-id ${plan_id}: every
+  # process refuses a plan file that is not the set's (SPEC §10).
   #
-  # Op-point (M7.6-mem production): n_corr=16, n_coarse_dm=8,
-  # bytes_per_cell=2 (cint8 complex), t_buf_samples=8192 (~64 cube
-  # cadences ≈ 8.6 s of headroom — safe for a momentary compute-half
-  # stall). LOWERED from 32768 (2026-05-31): 32768 was ~256 cadences
-  # ≈ 34 s and made the rxring a 39 GiB tmpfs segment, which together
-  # with the lazily-growing depth-24 cube ring blew past the 93 GiB
-  # node RAM into swap. 8192 = 9.8 GiB rxring (still 4× the prior
-  # 4096 design point). The two search_compute halves MUST be
-  # launched with the SAME --t-buf-samples or the ring header check
-  # rejects them at attach (all three routines below are kept in
-  # lock-step).
+  # CRITICAL: ``args: >-`` is a YAML folded scalar -- DO NOT add
+  # ``#``-comments inside it; they become literal argv tokens (commit
+  # 14f0535 post-mortem).
   #
-  # SO_RCVBUF=256 MiB matches corner_turn.sh and the M7.PREP socket
-  # buffer note (/proc/sys/net/core/rmem_max must be ≥ 268435456 on
-  # the search nodes; M7.0 ops bootstrap raises it).
+  # ---- search_rx (ring v4 writer) ---------------------------------------
+  # 16 UDP ports (6625 + chgroup) on the node's data address, 4 receive
+  # threads (socket i -> thread i % 4; the G1 fleet-load setting: 60 min at
+  # 12.2 Gb/s, 0 NIC discards, 2026-10-29), frame v2 -> ring v4 of this
+  # node's owned coarse DMs (halves 2i, 2i+1 of the plan), retention >= 20 s
+  # per DM (rounded up to whole 201.3 ms cycles; ~28-31 GB for
+  # 2x-gridded-ns4-cint4, prefaulted at create). The spec and the expected
+  # per-stream pattern ids are built in-process from the plan + value map
+  # (--node-index per host below = SEARCH_NODES order n01 n02 n09 n13;
+  # search_rx refuses a --node-index that is not --mon-cn's). Frames whose
+  # pattern id differs are written as zero-filled MISMATCH rows and counted.
+  # /mon/search_rt/<cn>/rx at 2 Hz (--mon-cn). The shm name is today's, so
+  # the fleet housekeeping that clears /dev/shm/dsart-rxring-* covers it.
   #
-  # The pattern_id table is intentionally omitted for M7.2; the smoke
-  # uses bench/net_pair.py as TX, which emits a known constant
-  # pattern_id per chgroup, but we run with no expected_pattern_id
-  # registered so every frame is accepted. Production M7.4+ will load
-  # a JSON file via --pattern-id-file.
+  # Spawn stagger (dsart_rt spawn_delay_s = sleep AFTER this routine): the
+  # halves block in their ring attach (--ring-attach-timeout-s) until the
+  # ring exists, before any GPU allocation, so the ring's prefault never
+  # races their pinned-host allocations (the 2026-06-09 n09/n13 OOM).
   #
-  # SUB-BAND STREAMS (2026-09-23, corr_fast --n-sub 4). Each corr node
-  # now grids its chgroup as 4 sub-band uv planes and ships each as its
-  # own stream (id = chgroup*4 + s), so the ring carries 64 streams and
-  # the search shifts every sub-band separately: the intra-chgroup DM
-  # smear no fine trial can undo drops from ~3.2 to ~0.8 samples.
-  # Measured end-to-end on the real corr stage-1 + stage-2 + search
-  # shift code (tests/test_subband_e2e.py): recovered S/N x1.146 mean,
-  # flat across each coarse bucket instead of falling ~30% at its edges.
-  # Values that MUST move together (all three routines, lock-step):
-  #   --n-corr 64            = 16 chgroups * --n-sub 4
-  #   --n-filled 2600        max sub-band pattern is ~2200 cells (vs
-  #                          3424 whole-chgroup); search_compute
-  #                          refuses to start if any pattern exceeds it
-  #   --t-buf-samples 6144   ring = 64*8*6144*2600*2 B = 15.2 GiB, and
-  #                          the overrun horizon 6144-4*256 = 5120 stays
-  #                          above the 20-cube (3840) real-time re-seek,
-  #                          the same ordering as the old 8192/16 ring
-  #   --fan-in-min-corrs 60  = 15 of 16 corr nodes, as before
-  #   --n-sub 4, --combine-impl compact  (search_compute only)
-  #   --imager-uv-prescale 1/256  (search_compute only). The fp16
-  #                          irfft2 goes non-finite once an image pixel
-  #                          exceeds ~1.0 (unnormalised peak > 65504);
-  #                          at n_sub=4 an active uv cell sums ~19
-  #                          streams (7 at n_sub=1), so live noise sits
-  #                          at sigma ~0.064 and a pulse railed the
-  #                          detector (snr 254) from ~18 sigma. 1/256
-  #                          removes the overflow with no measurable
-  #                          loss (max err 0.05 sigma); Layer-1 re-
-  #                          estimates sigma, so snr is unchanged.
-  # recv_epoll.c must be rebuilt (MAX_CHGROUPS 16 -> 64). Revert = the
-  # 16 / 8192 / 5000 / 15 values and drop the two flags, on both sides.
+  # Hostargs lookup tries the FQDN first, then the bare short hostname
+  # (dsart_rt._build_argv). socket.gethostname() returns lxd110h<NN> on the
+  # nodes; the n<NN> keys are kept as future-proofing.
   - name: search_rx
     cmd: python
-    # 2026-06-09: stagger spawn so search_rx finishes its 10.5 GiB
-    # rxring shm allocation before the search_compute halves race for
-    # CUDA pinned-host pages. Without this, n09 + n13 OOM'd at startup
-    # (n01 + n02 happened to win the race). 4 s is a touch longer than
-    # the observed shm-create + ring-attach time (~2.5 s).
     spawn_delay_s: 4.0
     args: >-
       -u -m dsart.services.search_rx
       --opoint ${opoint_id}
+      --ring-version 4
+      --plan ${plan_path}
+      --plan-id ${plan_id}
+      --antpos-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
+      --obs-dec-deg CUSTOMDEC
+      --retention-s 20
       --port-base 6625 --n-ports 16
       --so-rcvbuf-bytes 268435456
+      --rx-threads 4
       --shm-name /dsart-rxring-CN
-      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-T:owned-dms
-      --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
-      --bytes-per-cell X2TODO:WS-T:bits-per-value
+      --mon-cn CN
+      --mon-interval-s 0.5
       --status-interval-s 5.0
       --log-level INFO
-    # Hostargs lookup tries the FQDN first, then the bare short hostname
-    # (dsart_rt.py:571). In the production lab `socket.gethostname()`
-    # returns `lxd110h<NN>` (the kernel-level container name), NOT the
-    # operator-facing `n<NN>` alias. We list BOTH forms so the yaml
-    # works in either case — the lab one is the path that actually
-    # matches today (verified on n01.pro.pvt 2026-05-17, M7.2.8 prep);
-    # the `n<NN>` keys are kept as future-proofing in case a node ever
-    # gets its kernel hostname renamed to the short alias.
     hostargs:
-      lxd110h01: --bind-host 10.41.0.205
-      lxd110h02: --bind-host 10.41.0.222
-      lxd110h09: --bind-host 10.41.0.253
-      lxd110h13: --bind-host 10.41.0.238
-      n01: --bind-host 10.41.0.205
-      n02: --bind-host 10.41.0.222
-      n09: --bind-host 10.41.0.253
-      n13: --bind-host 10.41.0.238
+      lxd110h01: --bind-host 10.41.0.205 --node-index 0
+      lxd110h02: --bind-host 10.41.0.222 --node-index 1
+      lxd110h09: --bind-host 10.41.0.253 --node-index 2
+      lxd110h13: --bind-host 10.41.0.238 --node-index 3
+      n01: --bind-host 10.41.0.205 --node-index 0
+      n02: --bind-host 10.41.0.222 --node-index 1
+      n09: --bind-host 10.41.0.253 --node-index 2
+      n13: --bind-host 10.41.0.238 --node-index 3
+    env:
+      OMP_NUM_THREADS: "1"
 
-  # M7.3 (2026-05-20): per-search-node owner overrides
-  # ---------------------------------------------------
-  # The ``--coarse-dm-owners-half-{0,1}`` defaults set in each
-  # ``search_compute_{0,1}`` routine's ``args:`` block are for the n01
-  # 16x1 case (owners=0,1). In the 16x4 production fan-out each of the
-  # four search nodes owns a different pair of coarse-DMs:
-  #   n01 → 0, 1   (default in args:, no override needed)
-  #   n02 → 2, 3
-  #   n09 → 4, 5
-  #   n13 → 6, 7
-  # We bolt those onto the per-routine ``args:`` lists via the routine
-  # hostargs maps below. ``argparse`` is last-wins for scalar
-  # ``--coarse-dm-owners-half-{0,1}``, so the routine-level defaults
-  # are silently overridden by the per-host entries here. ``dsart_rt``
-  # tries the FQDN-style key (``lxd110h<NN>``) first then the bare
-  # short hostname (``n<NN>``) — we list both so the config works
-  # whether ``socket.gethostname()`` returns the kernel-level
-  # container name or the operator alias.
-
-  # ---- search_compute x 2 (one per GPU half) -----------------------
-  # Both halves attach the SAME ring (read-only) and process the same
-  # cube slots, but each one runs the detector on a disjoint slice of
-  # fine-DM trials from the shared v2 DM plan. In M7.2-low on n01:
-  #   half 0 owns coarse_dm index 0  -> K=25 fine rows
-  #   half 1 owns coarse_dm index 1  -> K=25 fine rows
-  # (M7.2-high uses owners 6 and 7).
-  #
-  # K MUST equal --n-fdm and must equal N_fine / n_coarse for the
-  # deployed plan: _slice_owner_dm_grids raises
-  # "yields n_fdm=<k>, but --n-fdm=<n>" and the half never starts.
-  # 2026-09-23: 34 -> 25 with the 100-1500 plan (200 fine / 8 coarse).
-  #
-  # M7.2.8 flipped to PRODUCTION GPU op-point (user-clarified
-  # 2026-05-18): both halves pinned to cuda:0 / cuda:1,
-  # image_backend=gpu. The prior 89cb1bc commit had this on CPU with
-  # the comment "search nodes don't yet have a GPU pinned" — that was
-  # wrong; n01 (and the other 3 search nodes) each have 2 × RTX 2080 Ti
-  # (cuda:0, cuda:1, 11 GB each). The point of M7.2.8 is to verify the
-  # search-side GPU pipeline keeps real-time at production op-point on
-  # synthetic data, analogous to how M7.1 validated the corr-side
-  # GPU pipeline on dada_junkdb data.
-  #
-  # Production op-point:
-  #   n_grid=256, n_fdm=34 (K = N_fine/8 from v2 plan),
-  #   t_det=256, cube_cadence_samples=192
-  #     ⇒ search overlap = t_det - cube_cadence_samples = 64 samples
-  #       (= b_max, the minimum overlap that catches any pulse up to
-  #       64 samples wide straddling a cube boundary).
-  #   t_int_search_us=1048.576 (matches corr t_int_fast at 32x native)
-  #   ⇒ cube cadence = 192 * 1.048576 = 201.327 ms wall per cube.
-  #
-  # M7.7.4 (2026-06-06): rfft-imager (real-output FFT via
-  # conjugate-fold half-grid combine) is default-on in GpuImager and
-  # halves both the FFT cost and the uv-batch transient memory. That
-  # made the big-block op-point (cube_cadence_samples=192/t_det=256)
-  # fit comfortably on the 11 GiB 2080 Ti (was OOM at 192/256 before),
-  # and the n01 GPU1 speed gate clears the 201.3 ms budget by 17.6%
-  # (sustained 166 ms / cube, full 7-boxcar octave bank preserved).
-  # The prior op-point (t_det=192 / cube_cadence_samples=128) was 5.6%
-  # over the matching 134.2 ms RT budget — and was the trigger for the
-  # M7.7 optimisation work. Set DSART_IMAGER_RFFT=0 in env to force the
-  # legacy ifft2+.real path (in-binary A/B). M7.2 perf-gate finding —
-  # that t_det=192 saved ~35 ms vs t_det=256 — is superseded by rfft:
-  # at t_det=256 the imager substages are smaller than they were at
-  # t_det=192 pre-rfft.
-  #
-  # The two halves run as independent processes so a crash in one
-  # doesn't take down the other; dsart_rt restarts them on the
-  # `start` verb. Each writes its own stderr log under
-  # ~/tmp/dsart-rt/search_rt-<cn_id>-search_compute_{0,1}.log.
-  #
-  # M6 sub-systems (clusterer, cube_dump, udp_listener, cands_logger)
-  # are all gated OFF for M7.2 — they land in M7.3 along with the
-  # full 16x4 fleet bring-up.
-  # M7.2-amend (2026-05-20): turned ON ``--pipeline-overlap`` for both
-  # halves. The narrow-overlap path (prefetch cube N+1 onto a
-  # dedicated CUDA H2D stream while the imager+detector run cube N
-  # on the compute stream) hides the ~35 ms cint8 H2D (~420 MiB) +
-  # validity H2D under the GPU work. py-spy (2026-05-20) showed
-  # ``cint8_host_t.to(device)`` + the validity-mask sync barrier
-  # as the dominant per-cube wall-time at the 16x1 op-point AFTER
-  # the cint8-stack quantise bypass landed; without overlap the
-  # search node hit ~6.55 cubes/s vs the 7.45 cubes/s target. The
-  # bench (``bench/search_node_throughput.py``) has always used
-  # ``--pipeline-overlap`` so the GPU pipeline benchmark numbers
-  # (~105 ms p50 at production geometry) are an apples-to-apples
-  # match only when the prod service runs with it on too.
-  #
-  # M7.7 (2026-06-04) — symmetric-shift padding is ENABLED on both
-  # halves via ``--symmetric-shift-padding`` in the ``args: >-``
-  # blocks below. The per-chgroup stream is pre-padded with
-  # ``max(0, shifts.max())`` leading + ``max(0, -shifts.min())``
-  # trailing samples, giving the imager kernel in-range source rows
-  # for every (cube_t, fdm, g) tuple. Auto-disables the Layer-1
-  # coverage correction (cov ≡ 1) and re-enables the fused-imager
-  # Layer-1 fast path, recovering the ~96 ms / cube L1 regression
-  # introduced in M7.4.2 / 131ca41. T_stream grows 275 → 358 samples
-  # (~30 % H2D + ring-history bump); ~+86 MiB / cube ×
-  # cube_ring_depth=16 × 2 halves ≈ +2.7 GiB / search node. Pairs
-  # naturally with Option A; do NOT stack with
-  # ``--include-coarse-offset-in-search-shifts`` (which drives the
-  # shifts table to ±1400 samples and would balloon the pad).
-  #
-  # 2026-09-22 — ``--merge-coarse-rounding-in-search-shifts`` is
-  # ENABLED on both halves. The chain quantises a channel's arrival to
-  # a whole t_int sample THREE times: s1 per channel at the coarse DM
-  # (corr), then s2 per chgroup (corr, aligns the wire frame) and sf
-  # per chgroup (search, the fine residual). s2 and sf share the SAME
-  # coefficient and differ only in which DM they use, so they round
-  # the per-chgroup delay twice for nothing. With this flag the search
-  # side applies rint(Δτ(fine)/T) − rint(Δτ(coarse)/T) — a difference
-  # of two integers, so still a whole sample — making the TOTAL a
-  # single rounding at the fine DM. The corr node is untouched and the
-  # wire frame stays aligned, unlike the include_coarse_offset route
-  # to two roundings, which needs stage 2 switched off.
-  # Free: it is a table change, no extra compute. |new − old| ≤ 1
-  # sample so T_stream barely moves. Measured x1.026 recovered S/N at
-  # W ≤ 1 ms, x1.016 at 2 ms, at the production chan_sum_factor=8
-  # resolution (_inspect/sensitivity/csf8_remeasure.py). The MEAN
-  # improves but the worst-case DM is marginally worse (1 ms min
-  # 0.576 → 0.568) — two roundings sometimes cancel, one cannot.
-  # Requires t_int_corr_us == t_int_search_us, which holds here (both
-  # are t_int_fast_native × NATIVE_SAMPLE_US = 1048.576 µs);
-  # search_compute passes it and compute_time_shift_search RAISES if
-  # they ever diverge. To revert: delete the flag from both halves,
-  # re-push, restart. NOT YET EXERCISED ON SKY.
-  #
-  # CRITICAL: ``args: >-`` is a YAML folded scalar — DO NOT add
-  # ``#``-comments inside it; they become literal argv tokens
-  # (commit 14f0535 post-mortem). Keep both halves in lockstep when
-  # flipping this flag.
+  # ---- search_compute x 2 (owner-engine halves, one per GPU) ------------
+  # Half h = 2 x node index + --gpu-half owns the plan's coarse DMs d with
+  # owner_half[d] == h (2x-gridded-ns4-cint4: 2 tier-A + 1 tier-B DMs per
+  # half), reads them from the ring with pread (never mmap: the 2026-10-22
+  # n13 incident), and runs the G0/G1-selected kernels: K1 staged, fused FFT,
+  # K3b reg, b3x filter bank (SPEC §7; G1 fleet load: duty <= 0.574, chain
+  # 3.5-3.7 us/image). Detection thresholds, the C1 merger and the C1 chain
+  # (de-rate, DM floor, width cap 32 T_ext + escape governor, metering 8 / 2
+  # SNR-protected slots, pooled per 201.3 ms cycle) are the engine's
+  # EngineConfig / C1CycleConfig values; they equal the c1: block below
+  # (tests/x2/test_g2_wiring.py fails if the two diverge) -- the 2x halves
+  # do not read --config-yaml.
+  # Time: one C1 batch per cycle in T_ext = 524.288 us samples (SPEC §8);
+  # --t-int-search-us / --chan-sum-factor are checked against the op-point.
+  # MJD labels (SPEC §9): --mjd-epoch capture takes the epoch from the capture
+  # arm record dsart_rt writes at utc_start (/mon/snap/1/armed_mjd: armed_mjd
+  # + arm_seq; mjd_at_native_0 = armed_mjd - 2 x arm_seq x 32.768 us on
+  # corr_fast's 32-native grid) -- the record 1x labels from -- and the half
+  # EXITS (rc 1, MjdEpochError) rather than label candidates on a wall latch
+  # when it is missing or inconsistent with the data (-2..120 s rule).
+  # C1 batches -> C2 at c1.c2_endpoint (lxd110h23.pro.pvt:11500). Cutouts
+  # (SPEC §9): the listener binds the node's data address on
+  # 11227 + gpu_half (= coinc.dump_broadcast.port_base), status to the
+  # c2_endpoint host :11501 (coinc.cutout.status_port); products under
+  # /home/ubuntu/data/c2/cutouts/<event>/, uploaded (cutout first, then the
+  # raw window at 50 MB/s) to today's cube destination
+  # ubuntu@lxd110h23.pro.pvt:/dataz/dsa110/candidates and purged after rc==0;
+  # c1.retention's age/size backstop (96 h, 150 -> 120 GB) sweeps the cutout
+  # root (dsart.dump.cube_retention, per-half product dirs, flock-shared).
+  # GPU pinning: CUDA_VISIBLE_DEVICES = the half's physical GPU, --device
+  # cuda:0 (the M7.1 convention).
   - name: search_compute_0
     cmd: python
-    # 2026-06-09: stagger spawn so the second half (search_compute_1)
-    # doesn't race this one for CUDA pinned-host pages during pipeline
-    # build. Each half holds onto ~14 GiB of mlock'd pages once it's
-    # past the imager build; on a 93 GiB node both halves simultaneously
-    # demanding their pinned pool from cold OOM-killed n09 + n13 on
-    # 2026-06-09. 8 s is comfortably past the pinned-pool warmup but
-    # imperceptible vs the ~2.5 min total cold-start to first cube.
+    # 2026-06-09: stagger the halves' pinned-host-memory start-up (n09/n13
+    # OOM'd when both raced); 8 s is past one half's warm-up.
     spawn_delay_s: 8.0
     args: >-
       -u -m dsart.services.search_compute
       --opoint ${opoint_id}
+      --plan-path ${plan_path}
+      --plan-id ${plan_id}
+      --search-node-id CN
+      --gpu-half 0
       --shm-name /dsart-rxring-CN
-      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-S:owned-dms
-      --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
-      --bytes-per-cell X2TODO:WS-T:bits-per-value
-      --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
-      --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
-      --t-int-search-us ${t_ext_us}
-      --dm-plan-path ${plan_path}
-      --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
-      --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
-      --coarse-dm-owners-half-0 ${owned_coarse_csv_h0}
-      --coarse-dm-owners-half-1 ${owned_coarse_csv_h1}
-      --gpu-half 0 --search-node-id CN
-      --device cuda:0 --image-backend gpu
-      --detector-streaming-tile-size 256
-      --detector-streaming-decoder-n-top 24
-      --detector-boxcar-accum-dtype fp16
-      --detector-layer2-max-samples 100000
-      --detector-k-img unit
-      --detector-k-dm d1
-      --detector-k-time X2TODO:WS-S:time-filters-width-cap-32
-      --layer1-max-samples 10000
-      X2TODO:WS-S:stage2-rounding-flag
-      --symmetric-shift-padding
-      --pipeline-overlap
-      --poll-interval-s 0.001
-      --max-cubes 0
-      --log-level INFO
-      --config-yaml /home/ubuntu/proj/dsa110-rt/configs/opoints/2x/dsart_search_rt.yaml
-      --enable-cube-dump
-      --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
+      --ring-access pread
+      --ring-attach-timeout-s 180
+      --antpos-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
-      --kernel-support 1
+      --device cuda:0
+      --fft-mode fused
+      --bank b3x
+      --k1 staged
+      --k3b reg
+      --t-int-search-us ${t_ext_us}
       --chan-sum-factor ${chan_sum_factor}
-      --cell-lambda-mode tee45
-      --n-sub ${n_sub}
-      --combine-impl X2TODO:WS-S:combine-impl
-      --imager-uv-prescale X2TODO:WS-S:image-units-prescale
+      --mjd-epoch capture
+      --c1-host lxd110h23.pro.pvt
+      --c1-port 11500
+      --c1-queue-depth 16
+      --cutout-base-port 11227
+      --cutout-status-port 11501
+      --cutout-root /home/ubuntu/data/c2/cutouts
+      --upload-dest-host ubuntu@lxd110h23.pro.pvt
+      --upload-dest-root /dataz/dsa110/candidates
+      --raw-bwlimit-kbps 50000
+      --cutout-retention-max-age-h 96
+      --cutout-retention-max-total-gb 150
+      --cutout-retention-low-water-gb 120
+      --mon-interval-s 2.0
+      --max-cycles 0
+      --log-level INFO
     hostargs:
-      # Per-host coarse-DM owner overrides (M7.3 16x4 fan-out) +
-      # per-host C1 trigger-listener bind addresses (M7.4). The
-      # ``--c1-bind-host`` arg is appended via argparse "last wins" so
-      # the per-host IPv4 takes precedence over the empty default in
-      # ``c1.dump_listener.bind_host`` below.
-      lxd110h01: --c1-bind-host 10.41.0.205
-      lxd110h02: --coarse-dm-owners-half-0 ${owned_coarse_csv_h2} --c1-bind-host 10.41.0.222
-      lxd110h09: --coarse-dm-owners-half-0 ${owned_coarse_csv_h4} --c1-bind-host 10.41.0.253
-      lxd110h13: --coarse-dm-owners-half-0 ${owned_coarse_csv_h6} --c1-bind-host 10.41.0.238
-      n01: --c1-bind-host 10.41.0.205
-      n02: --coarse-dm-owners-half-0 ${owned_coarse_csv_h2} --c1-bind-host 10.41.0.222
-      n09: --coarse-dm-owners-half-0 ${owned_coarse_csv_h4} --c1-bind-host 10.41.0.253
-      n13: --coarse-dm-owners-half-0 ${owned_coarse_csv_h6} --c1-bind-host 10.41.0.238
+      lxd110h01: --cutout-bind-host 10.41.0.205
+      lxd110h02: --cutout-bind-host 10.41.0.222
+      lxd110h09: --cutout-bind-host 10.41.0.253
+      lxd110h13: --cutout-bind-host 10.41.0.238
+      n01: --cutout-bind-host 10.41.0.205
+      n02: --cutout-bind-host 10.41.0.222
+      n09: --cutout-bind-host 10.41.0.253
+      n13: --cutout-bind-host 10.41.0.238
     env:
-      # M7.1 convention: pin physical GPU via CUDA_VISIBLE_DEVICES,
-      # always pass --device cuda:0 (the post-mask logical device).
-      # half 0 → physical GPU 0.
+      # half 0 -> physical GPU 0 (logical cuda:0 inside this process)
       CUDA_VISIBLE_DEVICES: "0"
-      # M7.2-amend (2026-05-20): flip the cint8 + shift/calibration
-      # H2D copies in ``cube_pipeline._stage_h2d`` to ``non_blocking=
-      # True`` (the env knob gates ``copy_(..., non_blocking)`` on
-      # the cached GPU buffer). Without this, ``prefetch_build``
-      # still BLOCKS the CPU thread on the ~35 ms cint8 .to() even
-      # though the kernels themselves are issued on the dedicated
-      # prefetch CUDA stream, so the overlap window collapses to
-      # the imager/detector compute only. py-spy confirmed
-      # ``_stage_h2d`` line 614 as the CPU-side block. Enabling
-      # the env makes the H2D fully asynchronous on the prefetch
-      # stream, restoring the narrow-overlap window.
-      DSART_ENABLE_GPU_BUF_REUSE: "1"
-      # M7.4: tag cube-dump filenames so the two compute halves don't
-      # race-overwrite each other's ``cube_{cid:06d}.pt``.
-      DSART_M74_DUMP_TAG: "h0"
-      # M7.3 baseline RE-BENCH (2026-05-27): set DSART_DISABLE_SCATTER=
-      # "1" to force the M7.2 zero-stub validity path so we can confirm
-      # the non-scatter pipeline still hits 7.45 cubes/s with all the
-      # M7.4 C1/C2/Option-A bolt-ons. Leave at "0" for production.
-      DSART_DISABLE_SCATTER: "0"
-      # M7.4.1 GPU-scatter (2026-05-27): when set to "1", the CPU-side
-      # scatter writes the COMPACT ~30 MiB COO buffer instead of the
-      # ~565 MiB dense plane; the CubePipeline expands it GPU-side via
-      # gpu_scatter. Eliminates 565 MiB CPU memset + 565 MiB H2D per
-      # cube (the dominant bottleneck identified by the M7.4 diagnosis
-      # 2026-05-27: H2D=75 ms, ~50% of the 134 ms RT budget). Byte-
-      # identical dense plane vs the dense path (parity tested in
-      # tests/transport/test_recv_ring_assemble_compact.py). Flip to
-      # "0" to A/B the dense path on the same binary.
-      DSART_GPU_SCATTER: "1"
+      OMP_NUM_THREADS: "1"
 
   - name: search_compute_1
     cmd: python
     args: >-
       -u -m dsart.services.search_compute
       --opoint ${opoint_id}
+      --plan-path ${plan_path}
+      --plan-id ${plan_id}
+      --search-node-id CN
+      --gpu-half 1
       --shm-name /dsart-rxring-CN
-      --n-corr ${n_streams} --n-coarse-dm X2TODO:WS-S:owned-dms
-      --t-buf-samples X2TODO:WS-T:ring-v4-retention-20s --n-filled X2TODO:WS-T:n-values
-      --bytes-per-cell X2TODO:WS-T:bits-per-value
-      --n-fdm X2TODO:WS-S:n-fdm-per-dm-from-plan --t-det X2TODO:WS-S:t-det --n-grid 256
-      --cube-cadence-samples X2TODO:WS-S:hop-384-tierA-192-tierB
-      --t-int-search-us ${t_ext_us}
-      --dm-plan-path ${plan_path}
-      --fan-in-min-corrs X2TODO:WS-T:per-dm-fan-in
-      --n-active-dms-per-corr X2TODO:WS-S:owned-dms-per-half
-      --coarse-dm-owners-half-0 ${owned_coarse_csv_h0}
-      --coarse-dm-owners-half-1 ${owned_coarse_csv_h1}
-      --gpu-half 1 --search-node-id CN
-      --device cuda:0 --image-backend gpu
-      --cal-blob-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
+      --ring-access pread
+      --ring-attach-timeout-s 180
+      --antpos-path /home/ubuntu/proj/dsa110-shell/dsa110-xengine/utils/antennas.out
       --obs-dec-deg CUSTOMDEC
-      --kernel-support 1
+      --device cuda:0
+      --fft-mode fused
+      --bank b3x
+      --k1 staged
+      --k3b reg
+      --t-int-search-us ${t_ext_us}
       --chan-sum-factor ${chan_sum_factor}
-      --cell-lambda-mode tee45
-      --n-sub ${n_sub}
-      --combine-impl X2TODO:WS-S:combine-impl
-      --imager-uv-prescale X2TODO:WS-S:image-units-prescale
-      --detector-streaming-tile-size 256
-      --detector-streaming-decoder-n-top 24
-      --detector-boxcar-accum-dtype fp16
-      --detector-layer2-max-samples 100000
-      --detector-k-img unit
-      --detector-k-dm d1
-      --detector-k-time X2TODO:WS-S:time-filters-width-cap-32
-      --layer1-max-samples 10000
-      X2TODO:WS-S:stage2-rounding-flag
-      --symmetric-shift-padding
-      --pipeline-overlap
-      --poll-interval-s 0.001
-      --max-cubes 0
+      --mjd-epoch capture
+      --c1-host lxd110h23.pro.pvt
+      --c1-port 11500
+      --c1-queue-depth 16
+      --cutout-base-port 11227
+      --cutout-status-port 11501
+      --cutout-root /home/ubuntu/data/c2/cutouts
+      --upload-dest-host ubuntu@lxd110h23.pro.pvt
+      --upload-dest-root /dataz/dsa110/candidates
+      --raw-bwlimit-kbps 50000
+      --cutout-retention-max-age-h 96
+      --cutout-retention-max-total-gb 150
+      --cutout-retention-low-water-gb 120
+      --mon-interval-s 2.0
+      --max-cycles 0
       --log-level INFO
-      --config-yaml /home/ubuntu/proj/dsa110-rt/configs/opoints/2x/dsart_search_rt.yaml
-      --enable-cube-dump
     hostargs:
-      lxd110h01: --c1-bind-host 10.41.0.205
-      lxd110h02: --coarse-dm-owners-half-1 ${owned_coarse_csv_h3} --c1-bind-host 10.41.0.222
-      lxd110h09: --coarse-dm-owners-half-1 ${owned_coarse_csv_h5} --c1-bind-host 10.41.0.253
-      lxd110h13: --coarse-dm-owners-half-1 ${owned_coarse_csv_h7} --c1-bind-host 10.41.0.238
-      n01: --c1-bind-host 10.41.0.205
-      n02: --coarse-dm-owners-half-1 ${owned_coarse_csv_h3} --c1-bind-host 10.41.0.222
-      n09: --coarse-dm-owners-half-1 ${owned_coarse_csv_h5} --c1-bind-host 10.41.0.253
-      n13: --coarse-dm-owners-half-1 ${owned_coarse_csv_h7} --c1-bind-host 10.41.0.238
+      lxd110h01: --cutout-bind-host 10.41.0.205
+      lxd110h02: --cutout-bind-host 10.41.0.222
+      lxd110h09: --cutout-bind-host 10.41.0.253
+      lxd110h13: --cutout-bind-host 10.41.0.238
+      n01: --cutout-bind-host 10.41.0.205
+      n02: --cutout-bind-host 10.41.0.222
+      n09: --cutout-bind-host 10.41.0.253
+      n13: --cutout-bind-host 10.41.0.238
     env:
-      # half 1 → physical GPU 1 (logical cuda:0 inside this process).
+      # half 1 -> physical GPU 1 (logical cuda:0 inside this process)
       CUDA_VISIBLE_DEVICES: "1"
-      # M7.2-amend (2026-05-20): see search_compute_0 for rationale.
-      DSART_ENABLE_GPU_BUF_REUSE: "1"
-      # M7.4: tag cube-dump filenames per-half to prevent collisions.
-      DSART_M74_DUMP_TAG: "h1"
-      # M7.3 baseline RE-BENCH (2026-05-27): see search_compute_0
-      # rationale. Set to "0" to restore the M7.4 active-scatter
-      # production path.
-      DSART_DISABLE_SCATTER: "0"
-      # M7.4.1 GPU-scatter (2026-05-27): see search_compute_0 for
-      # rationale + parity / perf evidence. Flip to "0" to A/B the
-      # M7.4 dense-CPU-scatter path on the same binary.
-      DSART_GPU_SCATTER: "1"
+      OMP_NUM_THREADS: "1"
 
 # ---------------------------------------------------------------------------
 # M7.4 C1 stage config (locked schema; see docs/c1c2/C1C2_WIRE_SCHEMA.md §3
