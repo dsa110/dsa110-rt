@@ -70,6 +70,7 @@ from dsart.cal.bf_weights import (
     upsample_coarse_to_fine,
 )
 from dsart.common.config_loader import load
+from dsart.services.fada_read import next_fada_page
 from dsart.common.constants import (
     BADA_BYTES_PER_INTEGRATION,
     FADA_BYTES_PER_BLOCK,
@@ -677,11 +678,11 @@ def run(
                 )
 
         while not state["stop"]:
-            # --- READ ---
-            try:
-                page = reader.getNextPage()
-            except StopIteration:
-                LOG.info("fada reader StopIteration (EOD)")
+            # --- READ --- (a failed read -- e.g. an interrupted semop -- is retried; stop and
+            # end-of-data end the loop; 8 consecutive failures are fatal: dsart.services.fada_read)
+            page = next_fada_page(reader, state, log=LOG)
+            if page is None:
+                LOG.info("fada reader: end-of-data or stop")
                 break
             if reader.isEndOfData:
                 LOG.info("fada EOD flag set; draining final block")
