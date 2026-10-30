@@ -13,7 +13,13 @@ h23 and starts marked workers on the nodes over ssh)::
     fleet-load --format 2x-... --load-factor 1.1 --plan <node path> --engine '<cmd>'
                [--minutes M] DRV                        -> search_rx v4 + owner engines
     snap-live  --sender c --format 2x-... [--minutes M] DRV
-    teardown   DRV                                      -> kill marked workers, rm test shm
+    fleet-replay --format 2x-... --plan <search node path> --plan-id 0x... [--replay 250924mptq]
+               [--minutes M] DRV                        -> G1 full chain: the REAL 2x corr
+               (bench/timeres/b8_corr2x.py live on replayed voltages, frame v2, C sender) on every
+               corr node into search_rx v4 + owner engines; every node process under
+               tools/x2/prod_guard.sh; fleet_replay.json + fleet_replay.md in --out (a directory)
+    replay-report --in fleet_replay.json --out DIR      -> re-evaluate a fleet-replay result
+    teardown   DRV [--corr-replay]                      -> kill marked workers, rm test shm
     DRV = --tx-nodes n03,... --rx-nodes n01,... --scratch <node scratch> --marker <tag>
           --out <file.json | dir>
 
@@ -45,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import struct
@@ -169,6 +176,27 @@ SWEEP_N_SUB = 2
 NIC_KEYS = ("rx_packets_phy", "rx_bytes_phy", "rx_discards_phy", "rx_out_of_buffer",
             "rx_crc_errors_phy", "tx_packets_phy", "tx_discards_phy", "tx_pause_ctrl_phy",
             "rx_pause_ctrl_phy")
+#: fleet-replay: the real corr routes dm -> SEARCH_NODES[owner_half[dm] // 2] (dsart.x2.plan) and
+#: sends to port_base + chgroup, chgroup = index of the corr node in CORR_NODES (b8_corr2x)
+SEARCH_NODE_ORDER = ("n01", "n02", "n09", "n13")
+CORR_NODE_ORDER = ("n03", "n04", "n05", "n06", "n07", "n08", "n10", "n11", "n12", "n14", "n15",
+                   "n16", "n18", "n19", "n21", "n22")
+#: the x2 TEST DADA key of bench/timeres/b8_corr2x.py live --replay, and its corr ready sentinel
+REPLAY_KEY = "d2f0"
+CORR_READY_SENTINEL = "/tmp/dsart-x2-corr-fast-live.ready"
+#: array pointing (DEC phase centre) of a replayed fixture = b8_corr2x FIXTURE_POINTING_DEC_DEG: the
+#: ring spec and the engines must build their value maps at the corr's DEC or every stream mismatches
+REPLAY_POINTING_DEC = {"250924mptq": 54.5737}
+BLOCK_MS = BLOCK_S * 1e3
+CYCLE_S = 6144 * NATIVE_S
+
+
+def guarded(cmd: str, timeout_s: float) -> str:
+    """Rev 5 rule for node processes: ``cmd`` (a shell word string, run from the
+    scratch copy) under tools/x2/prod_guard.sh in STOPPED mode (refuses if a
+    production process runs, kills the run if one starts) with the timeout
+    INSIDE the guarded command."""
+    return f"env GUARD_REQUIRE_STOPPED=1 bash tools/x2/prod_guard.sh timeout {int(timeout_s)} {cmd}"
 
 
 def _now() -> float:
@@ -621,21 +649,44 @@ def worker_rx(a) -> int:
 
 def worker_ring_stats(a) -> int:
     """Sample a v4 ring's counters (pread reader, read-only) every
-    ``--every-s`` until ``--end-at``; used by fleet-load / snap-live."""
+    ``--every-s`` until ``--end-at``; used by fleet-load / snap-live /
+    fleet-replay. ``--snap-before-go`` (fleet-replay): the first snapshot is
+    taken BEFORE the ready/go barrier, so it precedes every datagram of the
+    run (the senders start after the go); the end is then go + minutes +
+    ``--tail-s``. Snapshots carry per-stream datagram / hole counts summed
+    over the owned DMs; the last one also per (DM, stream)."""
     from dsart.transport.recv_ring import RxRingV4Reader
-    iface = detect_data_iface(a.bind_ip) if a.nic else None
+    iface = a.nic_iface or (detect_data_iface(a.bind_ip) if a.nic else None)
     r = RxRingV4Reader.open(a.ring, access="pread", attach_timeout_s=300.0)
     out = {"role": "ring-stats", "host": socket.gethostname(), "iface": iface, "snaps": []}
-    if a.end_at is None:
-        a.end_at = _barrier(a) + a.minutes * 60.0 + 5.0
+    dms = [i.dm for i in r.dms()]
+
+    def snap(last: bool = False) -> None:
+        import numpy as np
+        c = r.counters()
+        per_dm_streams = {d: r.flow_stats(d) for d in dms}
+        dg = np.sum([v["datagrams"] for v in per_dm_streams.values()], axis=0) if dms else []
+        holes = np.sum([v["rows_hole"] for v in per_dm_streams.values()], axis=0) if dms else []
+        s = {"t": time.time(), "writer": c["writer"],
+             "per_dm": {str(d): v["writer"] for d, v in c["per_dm"].items()},
+             "datagrams_per_stream": [int(x) for x in dg],
+             "rows_hole_per_stream": [int(x) for x in holes],
+             "stall": r.stall_report(stall_s=2.0),
+             "nic": read_nic(iface) if iface else {}}
+        if last:
+            s["dm_stream_datagrams"] = {str(d): [int(x) for x in v["datagrams"]]
+                                        for d, v in per_dm_streams.items()}
+        out["snaps"].append(s)
+
     try:
+        if a.end_at is None:
+            if a.snap_before_go:
+                snap()
+            a.end_at = _barrier(a) + a.minutes * 60.0 + a.tail_s
         while True:
-            c = r.counters()
-            out["snaps"].append({"t": time.time(), "writer": c["writer"],
-                                 "per_dm": {str(d): v["writer"] for d, v in c["per_dm"].items()},
-                                 "stall": r.stall_report(stall_s=2.0),
-                                 "nic": read_nic(iface) if iface else {}})
-            if time.time() >= a.end_at:
+            last = time.time() >= a.end_at
+            snap(last=last)
+            if last:
                 break
             time.sleep(min(a.every_s, max(0.1, a.end_at - time.time())))
     finally:
@@ -664,28 +715,39 @@ class Driver:
                 self.ip[k] = v
         self.results = Path(a.scratch) / "cp_results"
         self.procs: list[subprocess.Popen] = []
+        self.replay_files: dict = {}
 
     def _is_local(self, node: str) -> bool:
         return node in ("localhost", "127.0.0.1")
 
-    def _remote_cmd(self, args: list[str], log: str) -> str:
+    def _remote_cmd(self, args: list[str], log: str, guard_timeout_s: Optional[float] = None) -> str:
         env = (f"DSART_X2_CP={shlex.quote(self.marker)} PYTHONPATH={shlex.quote(self.scratch)}/src "
                f"DSART_CONFIG_DIR={shlex.quote(self.scratch)}/configs OMP_NUM_THREADS=1 "
                f"MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1")
         cmd = " ".join(shlex.quote(x) for x in args)
+        py = f"{shlex.quote(self.py)} bench/fake_corr_to_search.py {cmd}"
+        if guard_timeout_s is not None:
+            py = guarded(py, guard_timeout_s)
         # braces: only the worker is backgrounded (its fds redirected), so the
         # ssh / bash that launched it returns at once
         return (f"mkdir -p {shlex.quote(str(self.results))} && cd {shlex.quote(self.scratch)} && "
-                f"{{ env {env} nohup {shlex.quote(self.py)} bench/fake_corr_to_search.py {cmd} "
+                f"{{ env {env} nohup {py} "
                 f"> {shlex.quote(log)} 2>&1 < /dev/null & }}")
 
-    def launch(self, node: str, args: list[str], name: str) -> str:
+    def launch(self, node: str, args: list[str], name: str,
+               guard_timeout_s: Optional[float] = None) -> str:
         """Start a marked worker on ``node``; returns its result-JSON path
-        (named after the marker: results of earlier runs are never read)."""
+        (named after the marker: results of earlier runs are never read).
+        ``guard_timeout_s``: run it under tools/x2/prod_guard.sh in stopped
+        mode with ``timeout`` inside the guarded command (fleet-replay)."""
         name = f"{self.marker}_{name}"
         out = str(self.results / f"{name}.json")
         log = str(self.results / f"{name}.log")
         full = list(args) + ["--out", out]
+        if guard_timeout_s is not None and not self._is_local(node):
+            subprocess.run(["ssh", "-o", "BatchMode=yes", f"{node}.pro.pvt",
+                            self._remote_cmd(full, log, guard_timeout_s)], check=True, timeout=60)
+            return out
         if self._is_local(node):
             self.results.mkdir(parents=True, exist_ok=True)
             env = dict(os.environ, DSART_X2_CP=self.marker,
@@ -774,6 +836,55 @@ class Driver:
                 out[n] = self.run_on(n, kill, timeout=60).returncode
             except Exception as exc:  # noqa: BLE001
                 out[n] = f"error: {exc}"
+        return out
+
+    # -- fleet-replay: marker-scoped teardown (other agents' test rings / buffers are left alone) --
+
+    def _kill_marker(self) -> str:
+        """TERM then KILL every process of this user carrying DSART_X2_CP=<marker>."""
+        one = ("for p in $(pgrep -u \"$(id -u)\" .); do [ \"$p\" = \"$me\" ] && continue; "
+               "tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qx "
+               f"'DSART_X2_CP={self.marker}' && kill -{{sig}} $p 2>/dev/null; done")
+        return "me=$$; " + one.format(sig="TERM") + "; sleep 3; " + one.format(sig="KILL") + "; sleep 1"
+
+    def teardown_replay(self, corr_nodes: list[str]) -> dict:
+        """Kill the marker's processes on every node, remove only this marker's
+        /dev/shm/dsart-x2-<marker>* and, on corr nodes, the TEST DADA buffer
+        0x{REPLAY_KEY} and the corr ready sentinel -- unless another (unmarked)
+        b8 corr / replay writer still runs there (its buffer, not ours)."""
+        out = {}
+        for n in dict.fromkeys(self.tx_nodes + self.rx_nodes):
+            sh = self._kill_marker() + f"; rm -f /dev/shm/dsart-x2-{self.marker}*"
+            if n in corr_nodes:
+                sh += ("; if pgrep -f '[b]8_corr2x[.]py|[x]2_fada_replay[.]py' > /dev/null; then "
+                       "echo other-b8-running; else "
+                       f"dada_db -d -k {REPLAY_KEY} > /dev/null 2>&1; rm -f {CORR_READY_SENTINEL}; fi")
+            sh += "; true"
+            try:
+                r = self.run_on(n, sh, timeout=90)
+                out[n] = r.returncode if not r.stdout.strip() else r.stdout.strip()[-200:]
+            except Exception as exc:  # noqa: BLE001
+                out[n] = f"error: {exc}"
+        return out
+
+    def leftovers(self, corr_nodes: list[str]) -> dict:
+        """After teardown: this marker's processes, shm and (corr) the TEST DADA
+        key / sentinel on every node -- all must be empty."""
+        out = {}
+        for n in dict.fromkeys(self.tx_nodes + self.rx_nodes):
+            sh = ("me=$$; for p in $(pgrep -u \"$(id -u)\" .); do [ \"$p\" = \"$me\" ] && continue; "
+                  "tr '\\0' '\\n' < /proc/$p/environ 2>/dev/null | grep -qx "
+                  f"'DSART_X2_CP={self.marker}' && echo \"proc $p $(cat /proc/$p/comm)\"; done; "
+                  f"ls /dev/shm/ | grep -- 'dsart-x2-{self.marker}' | sed 's/^/shm /'")
+            if n in corr_nodes:
+                sh += (f"; ipcs -m | grep -i '0x0000{REPLAY_KEY}\\|0x0000{int(REPLAY_KEY, 16) + 1:04x}' "
+                       f"| sed 's/^/dada /'; ls {CORR_READY_SENTINEL} 2>/dev/null | sed 's/^/file /'")
+            sh += "; true"
+            try:
+                r = self.run_on(n, sh, timeout=60)
+                out[n] = [x for x in r.stdout.splitlines() if x.strip()]
+            except Exception as exc:  # noqa: BLE001
+                out[n] = [f"error: {exc}"]
         return out
 
 
@@ -1023,8 +1134,583 @@ def cmd_snap_live(a) -> int:
     return _ring_load_common(a, engines=False, name="snap_live")
 
 
+# =============================================================================
+# fleet-replay: the REAL 2x corr (b8_corr2x live, replayed voltages, C sender)
+# -> search_rx v4 -> owner engines (G1 full chain without SNAPs)
+# =============================================================================
+
+
+def _n_sub_of(fmt: str) -> int:
+    m = re.search(r"-ns(\d+)-", fmt)
+    return int(m.group(1)) if m else 4
+
+
+def _preflight_replay(drv: Driver, a, chg: dict) -> dict:
+    """Per node (read-only, plus one guarded ``true``): scratch copy, production
+    stopped, no GPU compute process, no other x2 bench running, search: the
+    plan; corr: the fixture sub-band (+ its own cal), no TEST DADA buffer."""
+    out = {}
+    sc = shlex.quote(a.scratch)
+    for n in dict.fromkeys(drv.tx_nodes + drv.rx_nodes):
+        sh = (f"test -f {sc}/tools/x2/prod_guard.sh && echo scratch_ok; "
+              f"env GUARD_REQUIRE_STOPPED=1 bash {sc}/tools/x2/prod_guard.sh true > /dev/null 2>&1 "
+              "&& echo stopped_ok; "
+              "nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null "
+              "| sed 's/^/gpu_app /'; "
+              "pgrep -af '[b]8_corr2x[.]py|[b]8_owner2x[.]py|[x]2_fada_replay[.]py|[f]ake_corr_to_search[.]py"
+              "|[s]earch_rx --ring-version' | sed 's/^/busy /'; ")
+        if n in drv.rx_nodes:
+            sh += f"test -f {shlex.quote(a.plan)} && echo plan_ok; "
+        if n in chg:
+            rf = drv.replay_files.get(n)
+            if rf:
+                sh += f"test -r {shlex.quote(rf)} && echo fixture_ok; "
+            sh += (f"for r in /home/ubuntu/x2_scratch/voltages /home/ubuntu/data/voltage_fixtures "
+                   f"/home/ubuntu/data/voltages; do if [ -f $r/{a.replay}/manifest.yaml ]; then "
+                   f"f=$(ls $r/{a.replay}/fl_*_chgroup{chg[n]}.out 2>/dev/null | head -1); "
+                   f"[ -n \"$f\" ] && test -r \"$(readlink -f $f)\" && echo fixture_ok $r; "
+                   f"test -s $r/{a.replay}/cals/antennas.out && echo cal_ok; break; fi; done; "
+                   f"ipcs -m | grep -qi '0x0000{REPLAY_KEY}' && echo dada_key_exists; ")
+        sh += "true"
+        try:
+            lines = drv.run_on(n, sh, timeout=90).stdout.splitlines()
+        except Exception as exc:  # noqa: BLE001
+            lines = [f"error {exc}"]
+        fatal = []
+        if "scratch_ok" not in lines:
+            fatal.append("no scratch copy")
+        if "stopped_ok" not in lines:
+            fatal.append("production running (guard refuses) or guard error")
+        fatal += [x for x in lines if x.startswith(("gpu_app", "busy", "error", "dada_key_exists"))]
+        if n in drv.rx_nodes and "plan_ok" not in lines:
+            fatal.append(f"no plan {a.plan}")
+        warn = []
+        if n in chg:
+            if not any(x.startswith("fixture_ok") for x in lines):
+                fatal.append(f"no {a.replay} chgroup {chg[n]} voltage file")
+            if "cal_ok" not in lines:
+                warn.append("no fixture cal: corr_fast falls back to the production cal (pattern ids may "
+                            "differ from the ring's)")
+        out[n] = {"lines": lines, "fatal": fatal, "warn": warn}
+    return out
+
+
+def _health(drv: Driver, chg: dict) -> dict:
+    """Light liveness probe: corr b8 workers, search_rx and engines per node."""
+    out = {}
+    for n in dict.fromkeys(drv.tx_nodes + drv.rx_nodes):
+        if n in chg:
+            # SigCgt of the corr python: which signals have handlers (a handled signal makes the
+            # blocking semop in psrdada's getNextPage fail -> corr_fast exits; G1 2026-10-29)
+            sh = ("p=$(pgrep -f '^[^ ]*python[^ ]* bench/timeres/[b]8_corr2x[.]py live' | head -1); "
+                  "echo corr=$(pgrep -fc '[b]8_corr2x[.]py live') "
+                  f"sentinel=$(test -f {CORR_READY_SENTINEL} && echo 1 || echo 0) "
+                  "sigcgt=$( [ -n \"$p\" ] && grep SigCgt /proc/$p/status | cut -f2)")
+        else:
+            sh = ("echo rx=$(pgrep -fc '[s]earch_rx --ring-version') "
+                  "engine=$(pgrep -fc '[b]8_owner2x[.]py engine')")
+        try:
+            out[n] = drv.run_on(n, sh, timeout=30).stdout.strip()
+        except Exception as exc:  # noqa: BLE001
+            out[n] = f"error: {exc}"
+    return out
+
+
+def _log_tail(drv: Driver, node: str, path: str, n: int = 25) -> str:
+    try:
+        return drv.run_on(node, f"tail -n {n} {shlex.quote(path)} 2>/dev/null", timeout=30).stdout[-3000:]
+    except Exception as exc:  # noqa: BLE001
+        return f"error: {exc}"
+
+
+def cmd_fleet_replay(a) -> int:
+    """G1 full chain: b8_corr2x live (corr_fast 2x on replayed voltages, frame v2, C sender) on every
+    --tx-nodes corr node, search_rx v4 + ring-stats + b8_owner2x engines on every --rx-nodes search
+    node; common --start-at / --block0. Every node process runs under prod_guard (stopped mode)."""
+    drv = Driver(a)
+    drv.replay_files = dict(kv.split("=", 1) for kv in (a.replay_file or "").split(",") if kv)
+    bad = ([n for n in drv.rx_nodes if n not in SEARCH_NODE_ORDER]
+           + [n for n in drv.tx_nodes if n not in CORR_NODE_ORDER])
+    if bad or len(set(drv.tx_nodes)) != len(drv.tx_nodes):
+        raise SystemExit(f"fleet-replay: --rx-nodes from {SEARCH_NODE_ORDER}, --tx-nodes distinct from "
+                         f"{CORR_NODE_ORDER} (bad: {bad})")
+    if not a.plan or not a.plan_id:
+        raise SystemExit("fleet-replay: --plan (npz on the search nodes) and --plan-id are required")
+    dec = a.dec_deg if a.dec_deg is not None else REPLAY_POINTING_DEC.get(a.replay)
+    if dec is None:
+        raise SystemExit(f"fleet-replay: --dec-deg (the corr's pointing DEC for fixture {a.replay})")
+    chg = {n: CORR_NODE_ORDER.index(n) for n in drv.tx_nodes}
+    idx = {n: SEARCH_NODE_ORDER.index(n) for n in drv.rx_nodes}
+    # every corr sends to all four search nodes (SEARCH_NODES order); a search node outside this run
+    # gets a loopback address, so no test datagram reaches a node another agent may be using
+    tx_hosts = ",".join(drv.ip[n] if n in drv.rx_nodes else a.absent_rx_host for n in SEARCH_NODE_ORDER)
+    n_sub = _n_sub_of(a.format)
+    lossy = [n for n in (a.lossy_tx_nodes or "").split(",") if n]
+    out_dir = Path(a.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total_s = a.lead_s + a.minutes * 60.0 + 2400.0           # guard timeouts (teardown ends earlier)
+    sc, res_dir, py = a.scratch, drv.results, drv.py
+    res: dict = {"marker": a.marker, "format": a.format, "plan": a.plan, "plan_id": a.plan_id,
+                 "replay": a.replay, "dec_deg": dec, "minutes": a.minutes, "tx_nodes": drv.tx_nodes,
+                 "rx_nodes": drv.rx_nodes, "chgroup": chg, "search_index": idx, "tx_hosts": tx_hosts,
+                 "port_base": a.port_base, "burst_bytes": a.burst_bytes, "ab_mode": a.ab_mode,
+                 "lossy_tx_nodes": lossy, "ring_spec": {}, "launch": {}, "health": [], "gates": {}}
+    print(f"fleet-replay {a.marker}: preflight {len(drv.tx_nodes)} corr + {len(drv.rx_nodes)} search",
+          flush=True)
+    res["preflight"] = _preflight_replay(drv, a, chg)
+    fatal = {n: v["fatal"] for n, v in res["preflight"].items() if v["fatal"]}
+    if fatal and not a.skip_preflight:
+        res["error"] = f"preflight: {fatal}"
+        _write_json(str(out_dir / "fleet_replay.json"), res)
+        print(json.dumps({"error": res["error"]}), flush=True)
+        return 2
+    corr_dir = {n: f"{res_dir}/{a.marker}_corr_{chg[n]}_{n}" for n in drv.tx_nodes}
+    st_out: dict = {}
+    corr_res: dict = {}
+    ring_res: dict = {}
+    eng_res: dict = {}
+    t_start = None
+    try:
+        # 1. search side: ring spec at the corr's DEC, search_rx v4 on all 16 chgroup ports, ring-stats
+        #    (first snapshot before any datagram), owner engines on both GPUs
+        for n in drv.rx_nodes:
+            j = idx[n]
+            ring = f"/dsart-x2-{a.marker}-rx4-{j}"
+            spec = f"{res_dir}/{a.marker}_ring4_spec_{j}_{n}.json"
+            pids = f"{res_dir}/{a.marker}_ring4_pids_{j}_{n}.json"
+            antpos = a.antpos_npz or f"{sc}/tests/fixtures/x2/dsa110_antpos.npz"
+            mk = drv.run_on(n, (
+                f"mkdir -p {res_dir} && cd {sc} && env DSART_X2_CP={a.marker} PYTHONPATH={sc}/src "
+                + guarded(f"{py} -m dsart.services.search_rx make-ring4-spec --plan {a.plan} "
+                          f"--opoint {a.format} --node-index {j} --antpos-npz {antpos} --dec-deg {dec} "
+                          f"--retention-s {a.retention_s} --out {spec} --pattern-ids-out {pids}", 600)),
+                timeout=660)
+            if mk.returncode != 0:
+                raise RuntimeError(f"make-ring4-spec on {n}: {(mk.stdout + mk.stderr)[-600:]}")
+            try:
+                res["ring_spec"][n] = json.loads(mk.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                res["ring_spec"][n] = mk.stdout[-400:]
+            env = f"DSART_X2_CP={a.marker} PYTHONPATH={sc}/src OMP_NUM_THREADS=1"
+            rx = guarded(f"{py} -m dsart.services.search_rx --ring-version 4 --ring4-spec {spec} "
+                         f"--pattern-id-file {pids} --bind-host {drv.ip[n]} --port-base {a.port_base} "
+                         f"--n-ports {len(CORR_NODE_ORDER)} --rx-threads {a.rx_threads} --shm-name {ring} "
+                         f"--status-interval-s 10", total_s)
+            drv.run_on(n, f"cd {sc} && {{ env {env} nohup {rx} > {res_dir}/{a.marker}_replay_search_rx_{j}_{n}.log "
+                          "2>&1 < /dev/null & }", timeout=60)
+            st_out[n] = drv.launch(n, ["ring-stats", "--ring", ring, "--go-file", drv.go_file(),
+                                       "--go-timeout-s", str(a.ready_timeout_s + a.lead_s + 600),
+                                       "--minutes", str(a.minutes), "--every-s", "10", "--bind-ip", drv.ip[n],
+                                       "--nic", "--snap-before-go", "--tail-s", str(a.tail_s)]
+                                   + (["--nic-iface", a.nic_iface] if a.nic_iface else []),
+                                   f"replay_ringstats_{j}_{n}", guard_timeout_s=total_s)
+            edir = f"{res_dir}/{a.marker}_engine_{j}_{n}"
+            eng = guarded(f"{py} {a.engine} --shm-name {ring} --plan {a.plan} --opoint {a.format} "
+                          f"--halves {2 * j},{2 * j + 1} --minutes {a.minutes} --dec-deg {dec} --out {edir}",
+                          total_s)
+            drv.run_on(n, f"cd {sc} && {{ env {env} nohup {eng} > {res_dir}/{a.marker}_replay_engine_{j}_{n}.log "
+                          "2>&1 < /dev/null & }", timeout=60)
+            print(f"  search {n} (index {j}): ring {ring} {res['ring_spec'][n]}", flush=True)
+        t_end_ready = time.time() + a.ready_timeout_s
+        for n in drv.rx_nodes:
+            if drv.fetch(n, st_out[n] + ".ready", max(1.0, t_end_ready - time.time())) is None:
+                raise TimeoutError(f"ring-stats on {n} not ready: "
+                                   + _log_tail(drv, n, st_out[n].replace(".json", ".log")))
+        # 2. common start: a block boundary >= lead after the last corr launch (warm-up 60-75 s)
+        t0 = time.time() + a.lead_s + 1.5 * len(drv.tx_nodes)
+        block0 = int(-(-(t0 - 1.6e9) // BLOCK_S))
+        t_start = 1.6e9 + block0 * BLOCK_S
+        res.update(start_at=t_start, block0=block0,
+                   start_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t_start)))
+        body = json.dumps({"start_at": t_start})
+        for n in drv.rx_nodes:                               # ring-stats: sample until start + minutes
+            r = drv.run_on(n, f"printf %s {shlex.quote(body)} > {drv.go_file()}.tmp && "
+                              f"mv {drv.go_file()}.tmp {drv.go_file()}")
+            if r.returncode != 0:
+                raise RuntimeError(f"go file on {n}: {r.stderr[-300:]}")
+        # 3. the real corr on every corr node
+        n_tx_timeout = int(a.lead_s + 1.5 * len(drv.tx_nodes) + a.minutes * 60 + 1200)
+        for n in drv.tx_nodes:
+            od = corr_dir[n]
+            rf = drv.replay_files.get(n)
+            cmd = guarded(
+                f"env PYTHONPATH=src DSART_CONFIG_DIR=configs MKL_INTERFACE_LAYER=GNU,LP64 {py} "
+                f"bench/timeres/b8_corr2x.py live --opoint {a.format} --minutes {a.minutes} "
+                f"--replay {a.replay} --reader-identity corr_fast --trace --tx v2 --tx-hosts {tx_hosts} "
+                f"--tx-port-base {a.port_base} --tx-bind-host {drv.ip[n]} --tx-burst-bytes {a.burst_bytes} "
+                f"--start-at {t_start!r} --block0 {block0} --plan-id {a.plan_id} --ab-mode {a.ab_mode} "
+                f"--out {od}" + (f" --replay-file {shlex.quote(rf)}" if rf else ""), n_tx_timeout)
+            drv.run_on(n, f"mkdir -p {res_dir} && cd {sc} && {{ env DSART_X2_CP={a.marker} "
+                          f"DSART_HOST_PIN_PERSIST=1 nohup {cmd} > {od}.log 2>&1 < /dev/null & }}", timeout=60)
+            res["launch"][n] = time.time()
+        print(f"  corr launched on {len(drv.tx_nodes)} nodes; start {res['start_utc']} block0 {block0} "
+              f"(in {t_start - time.time():.0f} s)", flush=True)
+        # 4. at the start: which corr nodes are warm (sentinel) / alive
+        _sleep_until(t_start - 3.0)
+        h = _health(drv, chg)
+        res["health"].append({"t": time.time(), "at": "start", "nodes": h})
+        res["not_ready_at_start"] = [n for n in drv.tx_nodes if "sentinel=1" not in h.get(n, "")]
+        dead = [n for n in drv.tx_nodes if "corr=0" in h.get(n, "")]
+        print(f"  at start: not warm {res['not_ready_at_start']} dead {dead}", flush=True)
+        res["dead_at_start"] = dead
+        if len(dead) > a.max_dead_corr:
+            # a missing chgroup is not a real-time result: stop now instead of running the
+            # whole duration on a broken fan-in quorum (G1 2026-10-29: 2 of 16 died at start-up)
+            res["dead_log_tails"] = {n: _log_tail(drv, n, corr_dir[n] + ".log", 60) for n in dead}
+            raise RuntimeError(f"corr workers dead at the start: {dead}")
+        # 5. run: periodic liveness lines
+        t_data_end = t_start + a.minutes * 60.0
+        while time.time() < t_data_end:
+            _sleep_until(min(t_data_end, time.time() + a.check_every_s))
+            h = _health(drv, chg)
+            res["health"].append({"t": time.time(), "nodes": h})
+            down = sorted(n for n, v in h.items()
+                          if re.search(r"\b(corr|rx|engine)=0\b", v) or v.startswith("error"))
+            print(f"  t+{time.time() - t_start:6.0f} s  down: {down}", flush=True)
+        # 6. results: corr live_2x.json, ring stats, engines
+        t_wait = time.time() + a.collect_timeout_s
+        for n in drv.tx_nodes:
+            od = corr_dir[n]
+            r = drv.fetch(n, f"{od}/live_2x.json", max(5.0, t_wait - time.time()))
+            if r is None:
+                r = drv.fetch(n, f"{od}/live_error.json", 5.0) or {}
+                r["missing"] = True
+                r["log_tail"] = _log_tail(drv, n, od + ".log", 40)
+            sl = drv.run_on(n, f"grep -h x2_fada_replay_start_late_s {od}/writer_live.log 2>/dev/null | tail -1",
+                            timeout=30).stdout.strip()
+            try:
+                r["writer_start_late_s"] = json.loads(sl)["x2_fada_replay_start_late_s"] if sl else 0.0
+            except (ValueError, KeyError):
+                r["writer_start_late_s"] = sl
+            corr_res[n] = r
+        for n in drv.rx_nodes:
+            ring_res[n] = drv.fetch(n, st_out[n], max(0.0, t_data_end + a.tail_s - time.time()) + 300)
+        for n in drv.rx_nodes:
+            j = idx[n]
+            edir = f"{res_dir}/{a.marker}_engine_{j}_{n}"
+            drv.run_on(n, f"for i in $(seq 150); do grep -qs '\"final\": true' {edir}/b8_engine.json && break; "
+                          "sleep 2; done", timeout=330)
+            e = drv.fetch(n, f"{edir}/b8_engine.json", 5.0)
+            halves = {}
+            for hh in (2 * j, 2 * j + 1):
+                hj = drv.run_on(n, f"cat {edir}/halves/*_half{hh}.json 2>/dev/null | head -c 400000", timeout=60)
+                try:
+                    halves[hh] = json.loads(hj.stdout) if hj.stdout.strip() else None
+                except ValueError:
+                    halves[hh] = None
+            eng_res[n] = {"summary": e, "halves": halves,
+                          "log_tail": None if e else _log_tail(drv, n, f"{res_dir}/{a.marker}_replay_engine_{j}_{n}.log")}
+    except BaseException as exc:  # noqa: BLE001 -- record and tear down on any failure (also ^C)
+        import traceback
+        res["error"] = repr(exc)
+        res["traceback"] = traceback.format_exc()[-3000:]
+        print(f"fleet-replay {a.marker}: error {exc!r}", flush=True)
+    finally:
+        print(f"fleet-replay {a.marker}: teardown", flush=True)
+        res["teardown"] = drv.teardown_replay(corr_nodes=drv.tx_nodes)
+        res["leftovers"] = drv.leftovers(corr_nodes=drv.tx_nodes)
+    res["corr_raw"] = corr_res
+    res["engines_raw"] = eng_res
+    # first + last ring snapshot: enough to re-evaluate (replay-report) without the 10 s series
+    res["ring_raw"] = {n: ({"snaps": [r["snaps"][0], r["snaps"][-1]], "iface": r.get("iface")}
+                           if r and r.get("snaps") else r) for n, r in ring_res.items()}
+    ev = evaluate_replay(res, corr_res, ring_res, eng_res, n_sub=n_sub, lossy=lossy)
+    res.update(ev)
+    res["leftovers_clean"] = all(not v for v in res["leftovers"].values())
+    _write_json(str(out_dir / "fleet_replay.json"), res)
+    (out_dir / "fleet_replay.md").write_text(replay_markdown(res))
+    print(json.dumps({"passed": res.get("passed"), "gates": res["gates"], "error": res.get("error"),
+                      "leftovers_clean": res["leftovers_clean"], "out": str(out_dir)}), flush=True)
+    if res.get("error"):
+        return 2
+    return 0 if res.get("passed") else 1
+
+
+def _nic_d(s0: dict, s1: dict) -> dict:
+    a, b = s0.get("nic") or {}, s1.get("nic") or {}
+    return nic_delta(a, b) if a and b else {}
+
+
+def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *, n_sub: int,
+                    lossy: list) -> dict:
+    """Gates (G1 full chain):
+    corr per node: mean <= 85% of 134.218 ms, p99 <= 100%, zero overruns (no dropped block, the replay
+      writer never late, its buffer never full, every block run), zero TX drops;
+    corner turn per search node: loss <= max(1e-4, PHY CRC fraction over the same window) on the
+      non-lossy flows, zero NIC discards, zero rejected datagrams, fan-in complete;
+    search per half: engine status ok, duty <= 0.75, wall p99 <= 0.9 cycle, 0 lag-recovery seeks."""
+    n_blocks_req = int(res["minutes"] * 60e3 / BLOCK_MS)
+    corr = {}
+    for n in res["tx_nodes"]:
+        r = corr_res.get(n) or {}
+        s = r.get("summary") or {}
+        tr = r.get("trace") or {}
+        tl = r.get("tx_loopback") or {}
+        w = r.get("writer") or {}
+        cnt = tl.get("counters") or {}
+        sent = list(tl.get("dest_sent") or [])
+        enq = list(tl.get("dest_enqueued") or [])
+        row = {
+            "chgroup": res["chgroup"][n], "missing": bool(r.get("missing") or not r), "rc": r.get("rc"),
+            "b8_failed_gates": r.get("failed_gates"),
+            "mean_ms": s.get("ms_per_block_mean"), "p50_ms": s.get("ms_per_block_p50"),
+            "p99_ms": s.get("ms_per_block_p99"), "max_ms": s.get("ms_per_block_max"),
+            "trace_blocks": tr.get("n_blocks"), "trace_mean_ms": tr.get("mean"), "trace_p99_ms": tr.get("p99"),
+            "trace_p999_ms": tr.get("p999"), "trace_max_ms": tr.get("max"),
+            "trace_hist": tr.get("hist"), "trace_edges_ms": tr.get("edges_ms"),
+            "over_budget_blocks": (tr.get("hist") or [None])[-1],
+            "n_blocks_req": n_blocks_req, "n_blocks_in": s.get("n_blocks_in"),
+            "n_blocks_processed": s.get("n_blocks_processed"), "n_dropped": s.get("n_dropped"),
+            "writer_blocks": w.get("n_blocks"), "writer_late_blocks": w.get("late_blocks"),
+            "writer_start_late_s": r.get("writer_start_late_s"),
+            "replay_max_nfull": r.get("max_nfull"), "replay_nbufs": r.get("nbufs"),
+            "tx_sent_per_dest": sent, "tx_bytes_per_dest": tl.get("dest_bytes"),
+            "tx_full_drops": sum(tl.get("dest_full_drops") or [0]), "tx_errors": sum(tl.get("dest_errors") or [0]),
+            "tx_unrouted": int(cnt.get("unrouted", 0) or 0),
+            "tx_unsent_at_close": int(sum(e - x for e, x in zip(enq, sent))) if enq and sent else None,
+            "tx_rejected": (s.get("x2_tx") or {}).get("rejected"),
+            # over the data window (the sender's own gbps_total also counts the warm-up / wait for the start)
+            "tx_gbps": 8.0 * sum(tl.get("dest_bytes") or [0]) / (res["minutes"] * 60.0) / 1e9 if tl else None,
+            "tx_drain_p99_ms": (tl.get("drain_ms") or {}).get("p99"),
+            "tx_sender_cpu_frac": tl.get("sender_cpu_frac"),
+            # corr_fast's CUDA-event stage timer: the GPU time of one block, and per stage
+            "gpu_block_ms": ((s.get("stage_timer") or {}).get("stage_ms") or {}).get("block_gpu"),
+            "stage_ms": (s.get("stage_timer") or {}).get("stage_ms"),
+        }
+        overruns = None
+        if not row["missing"] and s:
+            overruns = (int(s.get("n_dropped") or 0) + int(w.get("late_blocks") or 0)
+                        + int(row["replay_max_nfull"] is None or row["replay_nbufs"] is None
+                              or row["replay_max_nfull"] >= row["replay_nbufs"]))
+        row["overruns"] = overruns
+        drops = None
+        if tl:
+            drops = (row["tx_full_drops"] + row["tx_errors"] + row["tx_unrouted"]
+                     + int(row["tx_unsent_at_close"] or 0) + int(row["tx_rejected"] or 0))
+        row["tx_drops"] = drops
+        g = {"mean_le_85pct": row["mean_ms"] is not None and row["mean_ms"] <= 0.85 * BLOCK_MS,
+             "p99_le_100pct": row["p99_ms"] is not None and row["p99_ms"] <= BLOCK_MS,
+             "zero_overruns": overruns == 0 and int(s.get("n_blocks_in") or 0) >= n_blocks_req,
+             "zero_tx_drops": drops == 0 and sum(sent) > 0}
+        row["gates"] = g
+        row["passed"] = all(g.values())
+        corr[n] = row
+    search, halves = {}, {}
+    for n in res["rx_nodes"]:
+        j = res["search_index"][n]
+        st = ring_res.get(n)
+        if not st or not st.get("snaps"):
+            search[n] = {"missing": True, "passed": False, "gates": {"ring_stats": False}}
+            continue
+        s0, s1 = st["snaps"][0], st["snaps"][-1]
+        w0, w1 = s0["writer"], s1["writer"]
+        recv_w = (w1["ok"] + w1["pattern_mismatch"]) - (w0["ok"] + w0["pattern_mismatch"])
+        d0, d1 = s0.get("datagrams_per_stream") or [], s1.get("datagrams_per_stream") or []
+        dstream = [b - a for a, b in zip(d0, d1)] if d0 else list(d1)
+        pairs = {}
+        for c in res["tx_nodes"]:
+            g_ = res["chgroup"][c]
+            sent_c = (corr.get(c) or {}).get("tx_sent_per_dest") or []
+            sent_c = int(sent_c[j]) if len(sent_c) > j else None
+            recv_c = int(sum(dstream[g_ * n_sub:(g_ + 1) * n_sub])) if dstream else None
+            pairs[c] = {"sent": sent_c, "received": recv_c,
+                        "loss": (1.0 - recv_c / sent_c) if sent_c and recv_c is not None else None}
+        sent_all = sum(p["sent"] or 0 for p in pairs.values())
+        ok_pairs = {c: p for c, p in pairs.items() if c not in lossy}
+        sent_ex = sum(p["sent"] or 0 for p in ok_pairs.values())
+        recv_ex = sum(p["received"] or 0 for p in ok_pairs.values())
+        nd = _nic_d(s0, s1)
+        crc = nd.get("rx_crc_errors_phy", 0) / nd["rx_packets_phy"] if nd.get("rx_packets_phy") else 0.0
+        allowed = max(1e-4, crc)
+        discards = nd.get("rx_discards_phy", 0) + nd.get("rx_out_of_buffer", 0)
+        rejected = {k: v - w0.get(k, 0) for k, v in w1.items()
+                    if k not in ("datagrams", "ok", "bytes", "sweeps") and v - w0.get(k, 0)}
+        # fan-in: every stream of every corr in the run delivered to every owned DM, and the engines'
+        # windows released complete / by quorum (never by deadline, never a timeout) >= 99.9%
+        dsd = s1.get("dm_stream_datagrams") or {}
+        exp_streams = [res["chgroup"][c] * n_sub + k for c in res["tx_nodes"] for k in range(n_sub)]
+        silent = {d: [s_ for s_ in exp_streams if s_ < len(v) and v[s_] == 0] for d, v in dsd.items()}
+        silent = {d: v for d, v in silent.items() if v}
+        win = {"complete": 0, "fan_in": 0, "deadline": 0}
+        timeouts = rows_missing = rows_present = 0
+        for hh, hj in ((eng_res.get(n) or {}).get("halves") or {}).items():
+            for d, f in ((hj or {}).get("fan_in") or {}).items():
+                for k, v in (f.get("windows") or {}).items():
+                    win[k] = win.get(k, 0) + int(v)
+                timeouts += int(f.get("timeouts", 0))
+                rows_missing += int(f.get("rows_missing", 0))
+                rows_present += int(f.get("rows_present", 0))
+        n_win = sum(win.values())
+        fan_ok = (bool(dsd) and not silent and win.get("deadline", 0) == 0 and timeouts == 0 and n_win > 0
+                  and (win["complete"] + win["fan_in"]) >= 0.999 * n_win)
+        flows = {k: int(sum(int(v.get(k, 0)) for v in (s1.get("per_dm") or {}).values()))
+                 for k in ("rows_written", "rows_hole", "rows_late", "rows_dup", "rows_mismatch", "resyncs")}
+        loss_all = 1.0 - recv_w / sent_all if sent_all else None
+        loss_ex = 1.0 - recv_ex / sent_ex if sent_ex else None
+        # path dependence (G1: the PHY corruption sits on a few corr -> search paths of the fabric)
+        bad_paths = {c: p["loss"] for c, p in pairs.items() if p["loss"] is not None and p["loss"] > 1e-4}
+        good = {c: p for c, p in pairs.items() if c not in bad_paths and p["sent"]}
+        g_sent = sum(p["sent"] for p in good.values())
+        loss_other_paths = (1.0 - sum(p["received"] or 0 for p in good.values()) / g_sent) if g_sent else None
+        g = {"loss_le_max_1e-4_crc": loss_ex is not None and loss_ex <= allowed,
+             "zero_nic_discards": bool(nd) and discards == 0,
+             "zero_rejected": not rejected,
+             "fan_in_complete": fan_ok}
+        search[n] = {"index": j, "sent": sent_all, "received_writer": recv_w, "loss_all": loss_all,
+                     "sent_excl_lossy": sent_ex, "received_excl_lossy": recv_ex, "loss_excl_lossy": loss_ex,
+                     "phy_crc_frac": crc, "allowed_loss": allowed, "nic_delta": nd, "discards": discards,
+                     # diagnostic: CRC errors per datagram sent (the corruption is size dependent and the
+                     # PHY packet count also holds small non-test frames)
+                     "phy_crc_per_datagram": nd.get("rx_crc_errors_phy", 0) / sent_all if sent_all else None,
+                     "rejected": rejected, "pairs": pairs, "silent_streams_by_dm": silent,
+                     "paths_loss_gt_1e-4": bad_paths, "loss_other_paths": loss_other_paths,
+                     "lost_datagrams": sent_all - recv_w if sent_all else None,
+                     "lost_per_crc_error": (sent_all - recv_w) / nd["rx_crc_errors_phy"]
+                     if nd.get("rx_crc_errors_phy") else None,
+                     "fan_in_windows": win, "fan_in_timeouts": timeouts,
+                     "rows_missing_frac": rows_missing / (rows_missing + rows_present)
+                     if rows_missing + rows_present else None,
+                     "flows": flows, "stall_at_end": s1.get("stall"),
+                     "row_hole_frac": flows["rows_hole"] / (flows["rows_written"] + flows["rows_hole"])
+                     if flows["rows_written"] + flows["rows_hole"] else None,
+                     "gates": g, "passed": all(g.values())}
+        data_s = res["minutes"] * 60.0                       # ring-stats spans more (set-up + tail)
+        search[n]["gbps"] = 8.0 * (w1.get("bytes", 0) - w0.get("bytes", 0)) / data_s / 1e9
+        search[n]["datagrams_per_s"] = recv_w / data_s
+        summ = (eng_res.get(n) or {}).get("summary") or {}
+        got = {int(r_["half"]): r_ for r_ in summ.get("results", []) if "half" in r_}
+        for hh in (2 * j, 2 * j + 1):
+            r_ = got.get(hh)
+            if r_ is None:
+                halves[hh] = {"node": n, "missing": True, "passed": False}
+                continue
+            hg = {"engine_status_ok": r_.get("status") == "ok",
+                  "duty_le_0.75": r_.get("gpu_duty") is not None and r_["gpu_duty"] <= 0.75,
+                  "wall_p99_le_0.9_cycle": r_.get("wall_ms_p99") is not None
+                  and r_["wall_ms_p99"] <= 0.9 * CYCLE_S * 1e3,
+                  "zero_seeks": r_.get("lag_recovery_seeks") == 0}
+            halves[hh] = {"node": n, "gpu_duty": r_.get("gpu_duty"), "duty_aim_met": r_.get("duty_aim_met"),
+                          "wall_ms_p99": r_.get("wall_ms_p99"), "lag_recovery_seeks": r_.get("lag_recovery_seeks"),
+                          "lag_ms_max": r_.get("lag_ms_max"), "chain_us_per_image": r_.get("chain_us_per_image"),
+                          "n_cycles": r_.get("n_cycles"), "stop": r_.get("stop"),
+                          "startup_skipped_cycles": r_.get("startup_skipped_cycles"),
+                          "fanin_check": r_.get("fanin_check"), "gates": hg, "passed": all(hg.values())}
+    lossy_rep = {c: {n: search[n]["pairs"].get(c) for n in search if "pairs" in search[n]}
+                 for c in lossy if c in res["tx_nodes"]}
+    gates = {"corr": all(r["passed"] for r in corr.values()) and bool(corr),
+             "corner_turn": all(r["passed"] for r in search.values()) and bool(search),
+             "search": all(r["passed"] for r in halves.values()) and len(halves) == 2 * len(res["rx_nodes"])}
+    return {"corr": corr, "search": search, "halves": halves, "lossy_flows": lossy_rep, "gates": gates,
+            "passed": all(gates.values()) and not res.get("error")}
+
+
+def _f(x, fmt="{:.1f}", none="-"):
+    try:
+        return none if x is None else fmt.format(x)
+    except (ValueError, TypeError):
+        return str(x)
+
+
+def replay_markdown(res: dict) -> str:
+    L = [f"# G1 fleet-replay {res['marker']}",
+         "",
+         f"Real 2x corr (`b8_corr2x.py live`, replay {res['replay']}, DEC {res['dec_deg']}) on "
+         f"{len(res['tx_nodes'])} corr nodes -> C sender (frame v2, {res['burst_bytes']} B bursts) -> "
+         f"`search_rx` v4 -> `b8_owner2x.py engine` on {len(res['rx_nodes'])} search nodes. "
+         f"Format {res['format']}, plan {res['plan_id']}, {res['minutes']} min from "
+         f"{res.get('start_utc', '-')} (block0 {res.get('block0', '-')}).",
+         "",
+         f"**Result: {'PASSED' if res.get('passed') else 'FAILED'}** -- gates {res.get('gates')}"
+         + (f"; error `{res['error']}`" if res.get("error") else "")
+         + f"; leftovers after teardown: {'none' if res.get('leftovers_clean') else res.get('leftovers')}",
+         ""]
+    if res.get("not_ready_at_start"):
+        L += [f"Corr nodes not warm at the start: {res['not_ready_at_start']}", ""]
+    L += ["## Corr (per node; block time from corr_fast's summary, over-budget blocks from the trace, which "
+          "skips the first 32 blocks)", "",
+          "| node | chg | mean ms | p99 ms | max ms | steady p99 / max ms | GPU block mean / p99 ms | "
+          "blocks > 134.2 ms | blocks | overruns | late start s | TX Gb/s | TX drops | sent n01/n02/n09/n13 | gates |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for n, r in (res.get("corr") or {}).items():
+        sent = "/".join(str(x) for x in (r.get("tx_sent_per_dest") or [])) or "-"
+        bad = [k for k, v in (r.get("gates") or {}).items() if not v]
+        L.append(f"| {n} | {r['chgroup']} | {_f(r['mean_ms'])} | {_f(r['p99_ms'])} | {_f(r['max_ms'])} | "
+                 f"{_f(r['trace_p99_ms'])} / {_f(r['trace_max_ms'])} | "
+                 f"{_f((r.get('gpu_block_ms') or {}).get('mean'))} / {_f((r.get('gpu_block_ms') or {}).get('p99'))} | "
+                 f"{_f(r['over_budget_blocks'], '{}')} | {_f(r['n_blocks_in'], '{}')} | {_f(r['overruns'], '{}')} | "
+                 f"{_f(r['writer_start_late_s'], '{:.2f}')} | {_f(r['tx_gbps'], '{:.2f}')} | "
+                 f"{_f(r['tx_drops'], '{}')} | {sent} | {'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
+    L += ["", "## Corner turn (per search node; loss on the non-lossy flows vs max(1e-4, PHY CRC fraction "
+          "over the same window))", "",
+          "| node | sent | loss (excl. lossy) | loss (all) | PHY CRC frac | CRC per datagram | NIC discards | "
+          "rejected | fan-in windows c/f/d | rows missing | Gb/s | gates |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for n, r in (res.get("search") or {}).items():
+        if r.get("missing"):
+            L.append(f"| {n} | missing | | | | | | | | | | FAIL |")
+            continue
+        w = r["fan_in_windows"]
+        bad = [k for k, v in r["gates"].items() if not v]
+        L.append(f"| {n} | {r['sent']} | {_f(r['loss_excl_lossy'], '{:.2e}')} | {_f(r['loss_all'], '{:.2e}')} | "
+                 f"{_f(r['phy_crc_frac'], '{:.2e}')} | {_f(r.get('phy_crc_per_datagram'), '{:.2e}')} | "
+                 f"{r['discards']} | {r['rejected'] or 0} | "
+                 f"{w.get('complete', 0)}/{w.get('fan_in', 0)}/{w.get('deadline', 0)} | "
+                 f"{_f(r['rows_missing_frac'], '{:.2e}')} | {_f(r.get('gbps'), '{:.2f}')} | "
+                 f"{'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
+    bad = {n: r for n, r in (res.get("search") or {}).items() if r.get("paths_loss_gt_1e-4")}
+    if bad:
+        L += ["", "### Paths with loss > 1e-4 (corr -> search)", "",
+              "| search node | paths (loss) | loss on its other paths | lost datagrams | lost per CRC error |",
+              "|---|---|---|---|---|"]
+        for n, r in bad.items():
+            paths = ", ".join(f"{c} ({v:.1e})" for c, v in sorted(r["paths_loss_gt_1e-4"].items()))
+            L.append(f"| {n} | {paths} | {_f(r.get('loss_other_paths'), '{:.1e}')} | {r.get('lost_datagrams')} | "
+                     f"{_f(r.get('lost_per_crc_error'), '{:.2f}')} |")
+    if res.get("lossy_flows"):
+        L += ["", "### Lossy corr nodes (reported separately, excluded from the loss gate)", "",
+              "| corr node | search node | sent | received | loss |", "|---|---|---|---|---|"]
+        for c, per in res["lossy_flows"].items():
+            for n, p in per.items():
+                if p:
+                    L.append(f"| {c} | {n} | {p['sent']} | {p['received']} | {_f(p['loss'], '{:.2e}')} |")
+    L += ["", "## Search (per half)", "",
+          "| half | node | duty | wall p99 ms (gate 181.2) | seeks | chain us/image | cycles | start-up skips | "
+          "stop | gates |", "|---|---|---|---|---|---|---|---|---|---|"]
+    for hh, r in sorted((res.get("halves") or {}).items()):
+        if r.get("missing"):
+            L.append(f"| {hh} | {r['node']} | missing | | | | | | | FAIL |")
+            continue
+        bad = [k for k, v in r["gates"].items() if not v]
+        L.append(f"| {hh} | {r['node']} | {_f(r['gpu_duty'], '{:.3f}')} | {_f(r['wall_ms_p99'])} | "
+                 f"{r['lag_recovery_seeks']} | {_f(r['chain_us_per_image'], '{:.2f}')} | {r['n_cycles']} | "
+                 f"{r['startup_skipped_cycles']} | {r['stop']} | {'ok' if not bad else 'FAIL ' + ','.join(bad)} |")
+    L.append("")
+    return "\n".join(L)
+
+
+def cmd_replay_report(a) -> int:
+    """Re-evaluate a fleet_replay.json from its raw corr / ring / engine records
+    (rewrites fleet_replay.json + .md in --out)."""
+    res = json.loads(Path(a.input).read_text())
+    ring = res.get("ring_raw") or {}
+    ev = evaluate_replay(res, res.get("corr_raw") or {}, ring, res.get("engines_raw") or {},
+                         n_sub=_n_sub_of(res["format"]), lossy=res.get("lossy_tx_nodes") or [])
+    res.update(ev)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    _write_json(str(out / "fleet_replay.json"), res)
+    (out / "fleet_replay.md").write_text(replay_markdown(res))
+    print(json.dumps({"passed": res.get("passed"), "gates": res["gates"], "out": str(out)}))
+    return 0
+
+
 def cmd_teardown(a) -> int:
-    td = Driver(a).teardown()
+    drv = Driver(a)
+    if getattr(a, "corr_replay", False):
+        td = {"teardown": drv.teardown_replay(corr_nodes=drv.tx_nodes),
+              "leftovers": drv.leftovers(corr_nodes=drv.tx_nodes)}
+    else:
+        td = drv.teardown()
     print(json.dumps(td))
     if a.out:
         _write_json(str(_out_path(a.out, "teardown")), td)
@@ -1091,8 +1777,48 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             p.add_argument("--sender", default="c", choices=("c",))
         p.set_defaults(func=func)
+    p = sub.add_parser("fleet-replay", help="G1 full chain: the real 2x corr on replayed voltages")
+    _driver_args(p)
+    p.add_argument("--format", required=True, help="op-point id, e.g. 2x-gridded-ns4-cint4")
+    p.add_argument("--plan", required=True, help="v3 plan npz path ON THE SEARCH NODES")
+    p.add_argument("--plan-id", required=True, help="the plan's id (corr_fast --plan-id, hex)")
+    p.add_argument("--replay", default="250924mptq", help="voltage fixture run id (b8_corr2x --replay)")
+    p.add_argument("--replay-file", default=None,
+                   help="per-node voltage file overrides: n18=/path/x.out,... (b8_corr2x --replay-file)")
+    p.add_argument("--dec-deg", type=float, default=None,
+                   help="the corr's pointing DEC (default: the fixture's, 250924mptq 54.5737); the ring "
+                        "spec and engines build their value maps at it")
+    p.add_argument("--minutes", type=float, default=10.0)
+    p.add_argument("--antpos-npz", default=None, help="search side antpos (default: the x2 fixture, "
+                   "== 250924mptq's cal blob antpos)")
+    p.add_argument("--retention-s", type=float, default=20.0)
+    p.add_argument("--burst-bytes", type=int, default=16 << 10, help="corr sender token bucket per destination")
+    p.add_argument("--ab-mode", default="monitor", choices=("flag", "monitor", "off"),
+                   help="corr_fast --rfi-array-burst-mode (monitor: the looped 2 s replay never zeroes blocks)")
+    p.add_argument("--engine", default="bench/timeres/b8_owner2x.py engine --gpus 0,1 --input rx-v4",
+                   help="owner engine command (scratch-relative)")
+    p.add_argument("--absent-rx-host", default="127.0.0.1",
+                   help="address for a search node not in --rx-nodes (subset runs): nothing reaches it")
+    p.add_argument("--lossy-tx-nodes", default="n22",
+                   help="corr nodes with a known PHY fault: their flows are reported separately and left "
+                        "out of the corner-turn loss gate")
+    p.add_argument("--nic-iface", default=None, help="search NIC for the counters (default: the data IP's)")
+    p.add_argument("--tail-s", type=float, default=60.0, help="ring stats until start + minutes + tail")
+    p.add_argument("--check-every-s", type=float, default=300.0, help="liveness probe period")
+    p.add_argument("--collect-timeout-s", type=float, default=900.0,
+                   help="max wait after the data end for every corr's live_2x.json")
+    p.add_argument("--skip-preflight", action="store_true", help="run despite preflight findings")
+    p.add_argument("--max-dead-corr", type=int, default=0,
+                   help="abort (teardown) when more corr workers than this are dead at the start")
+    p.set_defaults(func=cmd_fleet_replay, lead_s=180.0)
+    p = sub.add_parser("replay-report", help="re-evaluate a fleet_replay.json (gates + markdown)")
+    p.add_argument("--in", dest="input", required=True)
+    p.add_argument("--out", required=True, help="directory")
+    p.set_defaults(func=cmd_replay_report)
     p = sub.add_parser("teardown")
     _driver_args(p)
+    p.add_argument("--corr-replay", action="store_true",
+                   help="fleet-replay teardown: marker-scoped shm, the corr TEST DADA buffer + sentinel")
     p.set_defaults(func=cmd_teardown)
     # workers
     p = sub.add_parser("tx")
@@ -1148,12 +1874,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--every-s", type=float, default=10.0)
     p.add_argument("--bind-ip", default="")
     p.add_argument("--nic", action="store_true")
+    p.add_argument("--nic-iface", default=None, help="NIC for the counters (default: the one holding --bind-ip)")
+    p.add_argument("--snap-before-go", action="store_true",
+                   help="first snapshot before the ready/go barrier (fleet-replay)")
+    p.add_argument("--tail-s", type=float, default=5.0, help="sample until go + minutes + tail")
     p.add_argument("--out", required=True)
     p.set_defaults(func=worker_ring_stats)
     return ap
 
 
-SUBCOMMANDS = ("sweep", "fleet-load", "snap-live", "teardown", "tx", "rx", "ring-stats")
+SUBCOMMANDS = ("sweep", "fleet-load", "snap-live", "fleet-replay", "replay-report", "teardown", "tx", "rx",
+               "ring-stats")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1161,7 +1892,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not argv or argv[0] not in SUBCOMMANDS:
         return main_v1(argv)
     a = build_parser().parse_args(argv)
-    if a.cmd in ("sweep", "fleet-load", "snap-live") and not a.out:
+    if a.cmd in ("sweep", "fleet-load", "snap-live", "fleet-replay") and not a.out:
         print("--out is required", file=sys.stderr)
         return 2
     try:
@@ -1171,7 +1902,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:  # noqa: BLE001
         import traceback
         traceback.print_exc()
-        if getattr(a, "out", None) and a.cmd in ("sweep", "fleet-load", "snap-live"):
+        if getattr(a, "out", None) and a.cmd in ("sweep", "fleet-load", "snap-live", "fleet-replay"):
             try:
                 _write_json(str(_out_path(a.out, a.cmd.replace("-", "_"))), {"error": repr(exc)})
             except Exception:  # noqa: BLE001
