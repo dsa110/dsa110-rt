@@ -538,7 +538,7 @@ def make_ring4_spec(argv: Optional[List[str]] = None) -> int:
     a = p.parse_args(argv)
     op = opoint_from_id(a.opoint)
     plan = TieredDmPlan.from_npz(a.plan)
-    # SPEC §3 production inputs (antpos_u = None, the canonical DEC), shared with corr and the engine
+    # SPEC §3 production inputs (antpos_u None, the canonical DEC), shared with corr and the engine
     vm = pi.value_map_for(op, a.antpos_npz, a.dec_deg)
     spec = pi.ring4_spec(plan, vm, op, node_index=a.node_index, retention_s=a.retention_s)
     a.out.write_text(json.dumps(spec.to_dict(), indent=1))

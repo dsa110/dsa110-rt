@@ -616,7 +616,7 @@ def test_control_start_fleet_without_opoint_is_unchanged():
 # ------------------------------------------------------------ banner/status
 
 
-def test_banner_and_status(env2x):
+def test_banner_and_status(env2x, tmp_path):
     osw._BANNER_CACHE["val"] = None
     s = _kv_with_sets(env2x, live_sel=NS2, active=opr.make_active_record(NS2, plan_id="0x1"))
     b = osw.opoint_banner(s, ttl_s=0)
@@ -627,7 +627,9 @@ def test_banner_and_status(env2x):
     st = osw.opoint_status(s, configs_dir=env2x["configs"])
     assert st["sets"][NS2]["switchable"] and st["sets"]["1x"]["switchable"]
     assert not st["sets"]["2x-baselines-ns4-cint4"]["pushed"]
-    st = osw.opoint_status(s, configs_dir=CONFIGS)
+    st = osw.opoint_status(s, configs_dir=CONFIGS)       # the repo template is complete (G2)
+    assert st["sets"][NS2]["switchable"] and not st["sets"][NS2]["h23_problems"]
+    st = osw.opoint_status(s, configs_dir=_dirty_configs(tmp_path))
     assert not st["sets"][NS2]["switchable"] and st["sets"][NS2]["h23_problems"]
     osw._BANNER_CACHE["val"] = None
 
