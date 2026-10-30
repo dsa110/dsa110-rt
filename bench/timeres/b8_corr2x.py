@@ -515,6 +515,20 @@ def _dada_db(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["dada_db", *args], capture_output=True, text=True, timeout=60)
 
 
+def _dada_key_exists(key: str) -> bool:
+    """A SysV shm segment with the DADA data-block key exists (``ipcs -m``)."""
+    r = subprocess.run(["ipcs", "-m"], capture_output=True, text=True, timeout=30)
+    return f"0x{int(key, 16):08x}" in r.stdout
+
+
+def _dada_db_destroy(key: str) -> bool:
+    """``dada_db -d -k key`` when the buffer exists (dada_db -d on a missing key segfaults:
+    a kernel log line per call on every node). True when one was removed."""
+    if not _dada_key_exists(key):
+        return False
+    return _dada_db("-d", "-k", key).returncode == 0
+
+
 class ReplayBuffer:
     """Context manager: create the TEST DADA buffer (key ``REPLAY_KEY``), remove it on exit."""
 
@@ -522,7 +536,7 @@ class ReplayBuffer:
         self.key, self.nbufs, self.readers = key, int(nbufs), int(readers)
 
     def __enter__(self) -> "ReplayBuffer":
-        _dada_db("-d", "-k", self.key)                         # stale buffer of an aborted run
+        _dada_db_destroy(self.key)                             # stale buffer of an aborted run
         # production's flags (dsart_rt BufferSpec): -l lock pages, -p page-aligned, -c 1
         r = _dada_db("-k", self.key, "-b", str(FADA_BYTES), "-n", str(self.nbufs), "-l", "-p",
                      "-c", "1", "-r", str(self.readers))
@@ -531,7 +545,7 @@ class ReplayBuffer:
         return self
 
     def __exit__(self, *exc) -> None:
-        _dada_db("-d", "-k", self.key)
+        _dada_db_destroy(self.key)
 
 
 def _fixture_file(run_id: str, chgroup: int) -> str:
@@ -1221,6 +1235,8 @@ class TxDrainMonitor:
         self.depth_max_steady = 0
         self.backlog_at_submit = 0
         self.last = None                     # last counters before corr_fast closes the sender
+        self.t_data0 = None
+        self.t_data1 = None
         self.cpu_last: dict = {}
         self.t_last = None
         self._real = cfi._build_x2_tx
@@ -1263,6 +1279,7 @@ class TxDrainMonitor:
         if snd is None or not hasattr(snd, "counters"):
             return
         last_enq, t_sub = None, None
+        last_sent = 0
         t_cpu = 0.0
         while not self._stop.is_set():
             full = snd.counters()
@@ -1281,6 +1298,12 @@ class TxDrainMonitor:
             enq = sum(d["enqueued"] for d in c)
             depth = sum(d["depth"] for d in c)
             now = time.monotonic()
+            sent = sum(d["sent"] for d in c)
+            if enq and self.t_data0 is None:
+                self.t_data0 = now                       # the data window: first submit ...
+            if sent > last_sent:
+                self.t_data1 = now                       # ... to the last datagram sent
+                last_sent = sent
             if last_enq is not None and enq > last_enq:
                 # the tiers of one block are submitted within one emit (tier B up to ~30 ms
                 # after tier A): a step more than GROUP_S after this block's first one while it
@@ -1318,7 +1341,9 @@ class TxDrainMonitor:
         for k in ("enqueued", "sent", "bytes", "full_drops", "errors", "eagain", "max_depth"):
             out[f"dest_{k}"] = [d[k] for d in pd]
         out["wall_s"] = wall
-        out["gbps_total"] = 8.0 * sum(d["bytes"] for d in pd) / wall / 1e9
+        span = (self.t_data1 - self.t_data0) if (self.t_data0 and self.t_data1) else wall
+        out["data_window_s"] = span
+        out["gbps_total"] = 8.0 * sum(d["bytes"] for d in pd) / max(span, 1e-9) / 1e9
         sent = sum(d["sent"] for d in pd)
         if sent:
             out["datagrams_per_sendmmsg"] = sent / max(1, c.get("sendmmsg_calls", 0))
@@ -1450,7 +1475,7 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
 
 def cmd_teardown(args) -> int:
     removed = []
-    if _dada_db("-d", "-k", REPLAY_KEY).returncode == 0:
+    if _dada_db_destroy(REPLAY_KEY):
         removed.append(f"dada:{REPLAY_KEY}")
     for pat in ("/dev/shm/dsart-x2-*", "/tmp/dsart-x2-*"):
         for p in glob.glob(pat):
