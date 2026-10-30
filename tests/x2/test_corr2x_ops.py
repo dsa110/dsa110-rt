@@ -221,7 +221,8 @@ from psrdada import Reader, Writer
 from dsart.services import host_pin as hp
 KEY = 0xd2f8                                            # x2 WS-C test key, removed below
 B, N = 1 << 20, 6
-subprocess.run(["dada_db", "-d", "-k", "d2f8"], capture_output=True)
+if "0x0000d2f8" in subprocess.run(["ipcs", "-m"], capture_output=True, text=True).stdout:
+    subprocess.run(["dada_db", "-d", "-k", "d2f8"], capture_output=True)   # dada_db -d on a missing key segfaults
 assert subprocess.run(["dada_db", "-k", "d2f8", "-b", str(B), "-n", str(N), "-l", "-p", "-r", "1"],
                       capture_output=True).returncode == 0
 try:
@@ -260,3 +261,96 @@ def test_host_pin_prepins_every_psrdada_page() -> None:
     assert r.returncode == 0, r.stderr[-2000:]
     n, bufsz, reg, new_later, subset, wrong_key = (int(x) for x in r.stdout.split("PREPIN")[1].split())
     assert (n, bufsz, reg, new_later, subset, wrong_key) == (6, 1 << 20, 6, 0, 1, 1)
+
+
+
+# psrdada-python's getNextPage blocks in C WITH the GIL held, so nothing in the reading process
+# can run Python meanwhile: signals come from `kill` in a shell, the page from a writer process.
+_EINTR_WRITER = r"""
+import os, sys, time
+import numpy as np
+from psrdada import Writer
+w = Writer(int(sys.argv[1], 16))
+w.setHeader({"X2_TEST": "1"})
+trig = sys.argv[2]
+while not os.path.exists(trig):
+    time.sleep(0.02)
+p = w.getNextPage()
+np.asarray(p)[:] = 7
+w.markFilled()
+time.sleep(30)                                           # stay connected; killed by the reader
+"""
+
+_EINTR = r"""
+import os, signal, subprocess, sys, time
+import numpy as np
+from psrdada import Reader
+from psrdada.exceptions import PSRDadaError
+import dsart.services.corr_fast_integration as cfi
+K = "d2f9"                                               # x2 WS-C test key, removed below
+KEY, PID, TRIG = int(K, 16), os.getpid(), sys.argv[2]
+
+
+def exists():
+    return f"0x{KEY:08x}" in subprocess.run(["ipcs", "-m"], capture_output=True, text=True).stdout
+
+
+def later(cmds):                                         # signals from outside the process
+    return subprocess.Popen(["sh", "-c", cmds])
+
+
+if exists():
+    subprocess.run(["dada_db", "-d", "-k", K], capture_output=True)
+assert subprocess.run(["dada_db", "-k", K, "-b", str(1 << 16), "-n", "4", "-r", "1"],
+                      capture_output=True).returncode == 0
+st = {"stop": False}
+signal.signal(signal.SIGUSR1, lambda *a: None)           # a handled signal, as in the corr python
+signal.signal(signal.SIGUSR2, lambda *a: st.__setitem__("stop", True))   # like corr_fast's SIGTERM
+res = {}
+wr = subprocess.Popen([sys.executable, "-c", sys.argv[1], K, TRIG])
+try:
+    r = Reader(KEY)
+    r.getHeader()
+    # 1) the bare read: one handled signal during the blocking semop is fatal
+    later(f"sleep 0.3; kill -USR1 {PID}")
+    try:
+        r.getNextPage()
+        res["bare"] = "page"
+    except PSRDadaError:
+        res["bare"] = "error"
+    # 2) next_fada_page: three signals during the wait are retried, then the page arrives
+    later(f"for i in 1 2 3; do sleep 0.2; kill -USR1 {PID}; done; sleep 0.2; touch {TRIG}")
+    page = cfi.next_fada_page(r, st)
+    res["retried"] = int(np.asarray(page)[0]) if page is not None else None
+    r.markCleared()
+    # 3) a stop request (the handler sets state["stop"]) during the wait returns None
+    later(f"sleep 0.3; kill -USR2 {PID}")
+    res["stopped"] = cfi.next_fada_page(r, st) is None
+    # 4) more consecutive failures than allowed: raised
+    st["stop"] = False
+    later(f"sleep 0.3; kill -USR1 {PID}")
+    try:
+        cfi.next_fada_page(r, st, retries=0)
+        res["bounded"] = False
+    except PSRDadaError:
+        res["bounded"] = True
+    print("EINTR", res["bare"], res["retried"], res["stopped"], res["bounded"], flush=True)
+    r.disconnect()
+finally:
+    wr.kill()
+    wr.wait()
+    subprocess.run(["dada_db", "-d", "-k", K], capture_output=True)
+"""
+
+
+def test_fada_read_survives_an_interrupted_semop(tmp_path) -> None:
+    """G1: a handled signal during the blocking getNextPage (semop EINTR -> psrdada
+    'error decrement FULL' -> PSRDadaError) killed corr_fast. Reproduced on a test ring
+    (0xd2f9): the bare read fails; next_fada_page retries (WARNING) and gets the page, returns
+    None on a stop request, and raises after the allowed consecutive failures."""
+    r = subprocess.run([sys.executable, "-c", _EINTR, _EINTR_WRITER, str(tmp_path / "go")],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    out = r.stdout.split("EINTR")[1].split()
+    assert out == ["error", "7", "True", "True"], (out, r.stderr[-1500:])
+    assert "not at end-of-data: retry 1/" in r.stderr and "error decrement FULL" in r.stderr
