@@ -460,6 +460,8 @@ stalled_streams, heartbeat_age_s, ring, ts_wall_unix} at 2 Hz.
 1x / v3: unchanged (`RxRing`, `ProductionRxRingSource`, recv_epoll v3 path). Passive 1x recordings:
 `tools/x2/rx_recorder.py` (pread only, self-guarded; production use is the user's decision).
 
+**Production wiring (2026-10-30, G2 wiring 7512b6f/69df1d7).** `search_rx --ring-version 4` builds its spec and the expected stream pattern ids IN-PROCESS from `--plan --opoint --node-index --antpos-path --obs-dec-deg [--plan-id]` via `dsart.x2.prod_inputs`, the one helper corr_fast, search_rx and the engine share (cal blob E/N, core mask, DEC through corr_fast's rad<->deg round trip, so a 0.25-deg bin edge lands identically). The 2x search half labels MJD as `armed_mjd - capture_native0(arm_seq) x 32.768 us` from one arm record (`--mjd-epoch capture` refuses to run without it).
+
 ## 7. Search engine contract [FREEZE: WS-S]
 Per half: owned DMs from the plan; per-DM cubes (hop 384 tier-A / 192 tier-B samples, cycle 201.3 ms
 aligned to absolute specnum); amplitude regime identical to today in sigma units (`input_clip_sigma`
