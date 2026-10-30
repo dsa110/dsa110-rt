@@ -39,6 +39,7 @@ Source: `docs/x2/downstream_inventory.md` §0 and §5.
 - tests/transport/test_recv_ring_assemble_validity.py::TestParity::test_overrun_counter_bumped_on_lapped_slot.
 - tests/transport/test_production_rx_ring_phaseb.py: hangs to the 900 s timeout.
 - tests/test_c2_proactive_claim.py: was stale (old units bug), fixed by WS-D D4.
+- tests/test_voltage_fixture_slow_corr_smoke.py: dirty-image peak check fails (l = -0.166 rad, expected +0.050) identically with and without x2 (WS-C, 10-30); corr_slow's bada output is byte-identical.
 
 ## Pre-existing physics/production bugs found by x2 work (1x today; user decision)
 | id | item | evidence | proposed |
@@ -52,7 +53,7 @@ Source: `docs/x2/downstream_inventory.md` §0 and §5.
 - **Web-UI arm sequence** = max(last_seq_no) + 30000 (not a multiple of 16): corr_fast 2x logs and rounds the epoch down to the 32-native grid and the search mirrors the rounding (labels stay exact). Rounding `compute_arm_seq` would change 1x too -> user decision.
 - **Corner-turn fabric (G1, 10-29/30):** into n01/n02, 2-3 of the 64 corr->search paths lose ~5e-3 each while every other path into the same node loses ~1e-6; which paths are affected changes run to run with the senders' ephemeral ports -> flow hashing onto a faulty inter-switch / LAG member link (or switch port group). ~1.43 datagrams lost per CRC error counted at the receiving NIC. Check the Arista inter-switch/LAG members' error counters. The engines absorb it (0 seeks).
 - **psrdada `ipcutil.c:67`** (dsa110-psrdada repo): `if (!(flag | IPC_NOWAIT))` is always false (should be `&`), so `ipc_semop` never prints errno -- hides the cause of corr_fast's failed page reads.
-- **corr_fast page read (1x and 2x) — FIXED in x2 (WS-C 2facb4f; 1x error-path change for sign-off, D-g):** one failed `getNextPage` was fatal (`corr_fast_integration.py:5079`); cause reproduced: a handled signal interrupting the blocking semop (`ipcbuf_get_next_read: error decrement FULL`). Now retried (WARNING each), stop request honoured, fatal only at real EOD or after 8 consecutive failures; normal path unchanged (1x-compat torch.equal). corr_slow has the same bare read (`corr_slow_compute.py:682`) -> WS-C.
+- **corr_fast page read (1x and 2x) — FIXED in x2 (WS-C 2facb4f; 1x error-path change for sign-off, D-g):** one failed `getNextPage` was fatal (`corr_fast_integration.py:5079`); cause reproduced: a handled signal interrupting the blocking semop (`ipcbuf_get_next_read: error decrement FULL`). Now retried (WARNING each), stop request honoured, fatal only at real EOD or after 8 consecutive failures; normal path unchanged (1x-compat torch.equal). corr_slow has the same bare read (`corr_slow_compute.py:682`): FIXED the same way (WS-C 39358b1, shared `services/fada_read.py`; bada output byte-identical).
 - Arming: corr_fast 2x takes its absolute epoch from the capture's armed utc_start_specnum (the PSRDADA header UTC_START is a static template). Arm at multiples of 16 specnums, or the epoch is rounded down to the 32-native grid (logged). Check what the web-UI arm path picks before G2.
 - n22 loses 5.7% of SNAP packets to PHY CRC errors (optic/cable/port). **Worse after the outage (10-28):** jumbo (8972 B) pings n01 -> h22 lose 66%, small pings 0% — size-dependent CRC loss on h22's 40G port.
 - n01/n02 corner-turn PHY loss 3-7e-4 (CRC + discard bursts).
