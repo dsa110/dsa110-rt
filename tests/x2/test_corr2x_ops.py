@@ -282,11 +282,11 @@ time.sleep(30)                                           # stay connected; kille
 """
 
 _EINTR = r"""
-import os, signal, subprocess, sys, time
+import importlib, os, signal, subprocess, sys, time
 import numpy as np
 from psrdada import Reader
 from psrdada.exceptions import PSRDadaError
-import dsart.services.corr_fast_integration as cfi
+cfi = importlib.import_module(sys.argv[3])               # the service whose read is under test
 K = "d2f9"                                               # x2 WS-C test key, removed below
 KEY, PID, TRIG = int(K, 16), os.getpid(), sys.argv[2]
 
@@ -343,14 +343,38 @@ finally:
 """
 
 
-def test_fada_read_survives_an_interrupted_semop(tmp_path) -> None:
+@pytest.mark.parametrize("service", ["dsart.services.corr_fast_integration",
+                                     "dsart.services.corr_slow_compute"])
+def test_fada_read_survives_an_interrupted_semop(tmp_path, service) -> None:
     """G1: a handled signal during the blocking getNextPage (semop EINTR -> psrdada
-    'error decrement FULL' -> PSRDadaError) killed corr_fast. Reproduced on a test ring
-    (0xd2f9): the bare read fails; next_fada_page retries (WARNING) and gets the page, returns
-    None on a stop request, and raises after the allowed consecutive failures."""
-    r = subprocess.run([sys.executable, "-c", _EINTR, _EINTR_WRITER, str(tmp_path / "go")],
+    'error decrement FULL' -> PSRDadaError) killed corr_fast; corr_slow reads fada the same
+    way. Reproduced on a test ring (0xd2f9), through each service's own next_fada_page: the
+    bare read fails; next_fada_page retries (WARNING) and gets the page, returns None on a stop
+    request, and raises after the allowed consecutive failures."""
+    r = subprocess.run([sys.executable, "-c", _EINTR, _EINTR_WRITER, str(tmp_path / "go"), service],
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr[-2000:]
     out = r.stdout.split("EINTR")[1].split()
     assert out == ["error", "7", "True", "True"], (out, r.stderr[-1500:])
     assert "not at end-of-data: retry 1/" in r.stderr and "error decrement FULL" in r.stderr
+
+
+def test_both_corr_services_read_fada_through_next_fada_page() -> None:
+    """corr_fast (1x and 2x share one read loop) and corr_slow both read their fada pages
+    through dsart.services.fada_read.next_fada_page; neither calls the bare
+    reader.getNextPage() any more. The helper's successful read is the bare call's result."""
+    import inspect
+
+    import dsart.services.corr_slow_compute as cs
+    from dsart.services import fada_read
+    assert cfi.next_fada_page is fada_read.next_fada_page is cs.next_fada_page
+    for mod in (cfi, cs):
+        src = inspect.getsource(mod.run)
+        assert "reader.getNextPage()" not in src and "next_fada_page(reader, state" in src, mod
+
+    class _R:
+        isEndOfData = False
+
+        def getNextPage(self):
+            return b"page"
+    assert fada_read.next_fada_page(_R(), {"stop": False}) == b"page"

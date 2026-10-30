@@ -3032,49 +3032,8 @@ class _StopRequested(Exception):
     """SIGTERM / SIGINT → request main-loop stop."""
 
 
-#: consecutive failed fada page reads tolerated (not at end-of-data) before giving up
-PAGE_READ_RETRIES = 8
-
-
-def next_fada_page(reader, state: "dict[str, Any] | None" = None, *,
-                   retries: int = PAGE_READ_RETRIES, backoff_s: float = 0.05):
-    """``reader.getNextPage()`` that survives a failed read. psrdada raises
-    ``PSRDadaError`` ("NULL page read") whenever ``ipcbuf_get_next_read``
-    returns NULL -- including a blocking ``semop`` interrupted by any handled
-    signal (EINTR is never restarted for semop; psrdada's ``ipc_semop`` does
-    not even print the errno: ``ipcutil.c`` tests ``flag | IPC_NOWAIT``).
-    G1 2026-10-29: two cold-started corr_fast died 0.2 s into their first
-    blocking read with "error decrement FULL". A failed read leaves the
-    reader not holding a page, so it is simply retried -- unless a stop was
-    requested (``state["stop"]``, set by the SIGTERM / SIGINT handler) or
-    the ring is at end-of-data (refreshed by ``markCleared()``, which for a
-    reader holding no page only reads ``ipcbuf_eod``); fatal after
-    ``retries`` consecutive failures. Returns the page, or None (stop / EOD)."""
-    from psrdada.exceptions import PSRDadaError  # noqa: PLC0415
-    n_fail = 0
-    while True:
-        try:
-            return reader.getNextPage()
-        except StopIteration:
-            return None
-        except PSRDadaError as exc:
-            n_fail += 1
-            if state is not None and state.get("stop"):
-                LOG.info("fada read interrupted (%s) by a stop request", exc)
-                return None
-            try:
-                reader.markCleared()
-            except Exception:  # noqa: BLE001
-                LOG.exception("fada reader markCleared after a failed read")
-            if getattr(reader, "isEndOfData", False):
-                LOG.info("fada read failed at end-of-data (%s): EOD", exc)
-                return None
-            if n_fail > int(retries):
-                LOG.error("fada read failed %d times in a row, not at end-of-data: %s", n_fail, exc)
-                raise
-            LOG.warning("fada getNextPage failed (%s), not at end-of-data: retry %d/%d",
-                        exc, n_fail, int(retries))
-            time.sleep(backoff_s)
+# the fada page read shared with corr_slow (dsart.services.fada_read); re-exported here
+from dsart.services.fada_read import PAGE_READ_RETRIES, next_fada_page  # noqa: E402,F401
 
 
 def _install_signals(state: dict[str, Any]) -> None:
@@ -5119,7 +5078,7 @@ def run(
             _pin_prev = _hp.stats()
         while not state["stop"]:
             _t_wait0 = time.monotonic()
-            page = next_fada_page(reader, state)        # 1x and 2x: a failed read is retried
+            page = next_fada_page(reader, state, log=LOG)   # 1x and 2x: a failed read is retried
             if page is None:
                 LOG.info("fada reader: end-of-data or stop")
                 break
