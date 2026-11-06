@@ -1359,9 +1359,10 @@ def cmd_fleet_replay(a) -> int:
                                    + (["--nic-iface", a.nic_iface] if a.nic_iface else []),
                                    f"replay_ringstats_{j}_{n}", guard_timeout_s=total_s)
             edir = f"{res_dir}/{a.marker}_engine_{j}_{n}"
+            # the engine's value map from the same antpos as the ring spec (pattern ids must agree)
             eng = guarded(f"{py} {a.engine} --shm-name {ring} --plan {a.plan} --opoint {a.format} "
-                          f"--halves {2 * j},{2 * j + 1} --minutes {a.minutes} --dec-deg {dec} --out {edir}",
-                          total_s)
+                          f"--halves {2 * j},{2 * j + 1} --minutes {a.minutes} --dec-deg {dec} "
+                          f"--antpos-npz {antpos} --out {edir}", total_s)
             drv.run_on(n, f"cd {sc} && {{ env {env} nohup {eng} > {res_dir}/{a.marker}_replay_engine_{j}_{n}.log "
                           "2>&1 < /dev/null & }", timeout=60)
             print(f"  search {n} (index {j}): ring {ring} {res['ring_spec'][n]}", flush=True)
@@ -1871,6 +1872,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-preflight", action="store_true", help="run despite preflight findings")
     p.add_argument("--max-dead-corr", type=int, default=0,
                    help="abort (teardown) when more corr workers than this are dead at the start")
+    p.add_argument("--live-capture", action="store_true",
+                   help="G2: the corr nodes on LIVE SNAP data (b8_corr2x --live-capture), armed together by "
+                        "the driver; needs --dec-deg (the array's /mon/array/dec)")
+    p.add_argument("--arm-lead-s", type=float, default=15.0,
+                   help="--live-capture: common arm this far ahead of the newest SNAP seq_no")
     p.set_defaults(func=cmd_fleet_replay, lead_s=180.0)
     p = sub.add_parser("replay-report", help="re-evaluate a fleet_replay.json (gates + markdown)")
     p.add_argument("--in", dest="input", required=True)
