@@ -1037,6 +1037,8 @@ def run_half(a, half: int, k1: str, k3b: str, seconds: float, part: Path) -> dic
     cfg = EngineConfig(backend="gpu" if not a.cpu else "cpu", fft_mode=a.fft_mode,
                        families=("b3x",) if a.bank == "b3x" else ("b",), n_grid=256,
                        wait_timeout_s=5.0, k1_impl=k1, k3b_impl=k3b)
+    from dsart.x2.search.service import prime_engine
+    head["prime"] = prime_engine(oplan, inputs, cfg, cycles=a.prime_cycles)
     eng = OwnerEngine(oplan, inputs, ring, cfg)
     sched = CycleScheduler(oplan, ring, max_lag_cycles=8)
     head["engine_status"] = eng.status()
@@ -1127,7 +1129,7 @@ def _half_summary(rec, stage_ms, images, sched, ring) -> dict:
                 lag_ms_last=float(lag[-1]) if lag.size else 0.0,
                 lag_recovery_seeks=int(sched.n_seeks), cycles_skipped=int(sched.n_skipped),
                 stage_us_per_image=st_us, chain_us_per_image=chain, fan_in=fan,
-                cycles=rec[-20:])
+                cycles=rec[-20:], first_cycles=rec[:40])
 
 
 def _engine_gate(h: dict) -> dict:
@@ -1221,7 +1223,8 @@ def _child_args(a) -> list:
             "--first-data-timeout-s", str(a.first_data_timeout_s),
             "--idle-stop-s", str(a.idle_stop_s), "--dec-deg", str(a.dec_deg),
             "--loss", str(a.loss), "--loss-rows-per-dg", str(a.loss_rows_per_dg),
-            "--dropout-at-s", str(a.dropout_at_s), "--dropout-s", str(a.dropout_s)]
+            "--dropout-at-s", str(a.dropout_at_s), "--dropout-s", str(a.dropout_s),
+            "--prime-cycles", str(a.prime_cycles)]
     if a.dropout_streams:
         args += ["--dropout-streams", a.dropout_streams]
     for flag, val in (("--shm-name", a.shm_name), ("--plan", a.plan),
@@ -1287,6 +1290,8 @@ def main(argv=None) -> int:
                    default=600.0)
     e.add_argument("--idle-stop-s", dest="idle_stop_s", type=float, default=10.0)
     e.add_argument("--antpos-npz", dest="antpos_npz", default="")
+    e.add_argument("--prime-cycles", type=int, default=2,
+                   help="twin-engine priming cycles before the live engine (service.prime_engine)")
     e.add_argument("--dec-deg", dest="dec_deg", type=float, default=DEC_DEG)
     e.add_argument("--half", default=None, help=argparse.SUPPRESS)
     e.add_argument("--seconds", type=float, default=0.0, help=argparse.SUPPRESS)

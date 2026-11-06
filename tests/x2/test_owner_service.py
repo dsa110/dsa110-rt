@@ -188,3 +188,23 @@ def test_one_c1_batch_per_cycle_through_the_production_emitter():
     hdr0 = c1_batch_header(k + 1, plan=svc.eng.plan, n_rows=0, search_node_id=9, gpu_half=1,
                            n_grid=N, clock=clock)
     assert hdr0.n_candidates == 0 and hdr0.event_specnum_start == (k + 1) * 384
+
+
+def test_prime_ring_feeds_an_engine_and_priming_is_gpu_only():
+    """service.PrimeRing serves every window an OwnerEngine asks for (all rows valid, the pool's
+    bytes), and prime_engine is a no-op on the CPU backend (the twin exists for GPU first-use
+    costs only)."""
+    from dsart.x2.search.service import PrimeRing, prime_engine
+    svc, *_ = _svc()
+    plan = svc.eng.plan
+    inputs = {s.d: svc.eng.states[s.d].inp for s in plan.dms}
+    fmts = {d: x.fmt for d, x in inputs.items()}
+    pr = PrimeRing(plan, fmts, pool_rows=64)
+    s0 = plan.dms[0]
+    out, valid = pr.wait_window_into(s0.d, 100, 80)
+    assert out.shape == (s0.n_stream, 80, pr.row_bytes) and valid.all()
+    assert np.array_equal(out[:, 0, :fmts[s0.d].row_bytes], pr.pool[s0.d][:, 100 % 64])
+    twin = OwnerEngine(plan, inputs, pr, svc.eng.cfg)
+    r = twin.process_cycle(8)
+    assert set(r.per_dm) == {s.d for s in plan.dms}
+    assert prime_engine(plan, inputs, svc.eng.cfg) == {"cycles": 0}

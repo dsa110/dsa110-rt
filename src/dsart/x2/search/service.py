@@ -42,7 +42,8 @@ import numpy as np
 
 from .geometry import CYCLE_NATIVE, SEARCH_NODES
 
-__all__ = ["CycleScheduler", "NoCycleYet", "OwnerService", "mon_payloads", "c1_rows_for_cycle",
+__all__ = ["CycleScheduler", "NoCycleYet", "OwnerService", "PrimeRing", "prime_engine",
+           "mon_payloads", "c1_rows_for_cycle",
            "c1_geometry", "MjdClock", "MjdEpochError", "c1_batch_header", "make_c1_emit", "main"]
 
 _LOG = logging.getLogger("dsart.x2.search.service")
@@ -118,6 +119,82 @@ class CycleScheduler:
             return {}
         return {s.d: max(0.0, (wp(s.d) - (k + 1) * s.hop) * s.t_native * 32.768e-3)
                 for s in self.plan.dms}
+
+
+class PrimeRing:
+    """In-memory stand-in for :class:`~dsart.x2.search.ring.RingV4Source`, used only by
+    :func:`prime_engine`: every row of every owned DM is available at once, payload drawn from a
+    small random pool (noise-like codes, every row valid)."""
+
+    def __init__(self, plan, formats, pool_rows: int = 2048, seed: int = 0) -> None:
+        rng = np.random.default_rng(seed)
+        self.plan, self.fmt = plan, formats
+        self.pool = {s.d: rng.integers(0, 256, size=(s.n_stream, pool_rows, formats[s.d].row_bytes),
+                                       dtype=np.uint8) for s in plan.dms}
+
+    def dms(self):
+        return sorted(self.pool)
+
+    def row_format(self, d):
+        return self.fmt[d]
+
+    def write_pos(self, d):
+        return 1 << 40
+
+    @property
+    def row_bytes(self):
+        return max(int(p.shape[2]) for p in self.pool.values())
+
+    def valid_mask(self, d, t_first, n_rows):
+        return np.ones((self.plan.by_d(d).n_stream, int(n_rows)), bool)
+
+    def wait_window(self, d, t_first, n_rows, timeout_s=None):
+        return self.wait_window_into(d, t_first, n_rows, out=None, timeout_s=timeout_s)
+
+    def wait_window_into(self, d, t_first, n_rows, *, out=None, timeout_s=None):
+        pool = self.pool[d]
+        S, n_pool, rb = pool.shape
+        if out is None:
+            out = np.empty((S, n_rows, self.row_bytes), np.uint8)
+        idx = (int(t_first) + np.arange(int(n_rows))) % n_pool
+        out[:, :n_rows, :rb] = pool[:, idx]
+        return out, np.ones((S, n_rows), bool)
+
+    def counters(self):
+        return {}
+
+
+def prime_engine(oplan, inputs, cfg, *, cycles: int = 2) -> dict:
+    """Run ``cycles`` throwaway cycles of a TWIN OwnerEngine on in-memory data before the live
+    engine is built, so the first-use costs land here instead of in the live engine's first cycle:
+    CUDA caching-allocator growth, FFT plans, first kernel launches, pinned staging. G2 2026-11-06:
+    without it the first live cycle took 0.7-0.9 s of a 0.2 s cycle on every half and one half's
+    2 s start-up backlog was counted as a lag-recovery seek. The twin and its state are discarded
+    (the cache is NOT emptied: the live engine reuses its blocks); GPU backend only."""
+    if cycles <= 0 or getattr(cfg, "backend", "gpu") != "gpu":
+        return {"cycles": 0}
+    import gc
+    from .engine import OwnerEngine
+
+    t0 = time.monotonic()
+    twin = OwnerEngine(oplan, inputs, PrimeRing(oplan, {d: inputs[d].fmt for d in inputs}), cfg)
+    walls = []
+    for i in range(int(cycles)):
+        t = time.monotonic()
+        twin.process_cycle(64 + i)
+        walls.append(round(1e3 * (time.monotonic() - t), 1))
+    if twin._gpu is not None:
+        twin._gpu.pop_gpu_ms()
+    del twin
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001 -- CPU-only interpreter
+        pass
+    out = {"cycles": int(cycles), "cycle_ms": walls, "prime_s": round(time.monotonic() - t0, 2)}
+    _LOG.info("engine primed: %s", out)
+    return out
 
 
 def c1_rows_for_cycle(cands, *, geom: dict):
@@ -473,6 +550,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ring-attach-timeout-s", type=float, default=60.0)
     p.add_argument("--k3b", default="reg", choices=("v1", "fused", "cuda", "reg"))   # G0 timing pick
     p.add_argument("--k1", default="staged", choices=("triton", "staged"))
+    p.add_argument("--prime-cycles", type=int, default=2,
+                   help="throwaway cycles of a twin engine on in-memory data before the live engine "
+                        "(first-use costs out of the first live cycle; 0 = off)")
     p.add_argument("--log-level", default="INFO")
     a = p.parse_args(argv)                  # strict: a stray (e.g. 1x) argument fails loudly
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO))
@@ -507,6 +587,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = EngineConfig(backend="gpu", fft_mode=a.fft_mode,
                        families=("b3x",) if a.bank == "b3x" else ("b",), wait_timeout_s=10.0,
                        k3b_impl=a.k3b, k1_impl=a.k1)
+    prime_engine(oplan, inputs, cfg, cycles=a.prime_cycles)
     eng = OwnerEngine(oplan, inputs, ring, cfg)
     _LOG.info("x2 half %d (%s g%d) status: %s", half, node, a.gpu_half, eng.status())
     pool = C1CyclePool(C1CycleConfig(chan_sum_factor=int(op.chan_sum_factor),
