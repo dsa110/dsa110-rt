@@ -141,7 +141,8 @@ def _mon(port: int) -> Optional[dict]:
 
 
 def _prod_capture_running(own: set[int]) -> bool:
-    out = subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True, text=True).stdout
+    # exact comm (15 chars), not -f: -f also matches command lines that mention the binary
+    out = subprocess.run(["pgrep", "-x", "dsart_capture_m"], capture_output=True, text=True).stdout
     return any(int(p) not in own for p in out.split())
 
 

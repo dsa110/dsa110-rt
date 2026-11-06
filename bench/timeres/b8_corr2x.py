@@ -92,6 +92,9 @@ CAP_KEYS = ("c2b0", "c2b2")
 CAP_BYTES = 150994944
 CAP_PORTS = (4011, 4012)
 CAP_CTRL_PORTS = (11323, 11324)
+#: the capture binary's comm (/proc/<pid>/comm keeps 15 chars): pgrep -x on it, never -f -- a -f
+#: pattern also matches any command line that only mentions the binary (prod_guard's own pgrep)
+CAP_COMM = "dsart_capture_m"
 DSAX_MERGE = "/home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge"
 
 
@@ -1527,7 +1530,7 @@ class LiveCapture:
         self.procs: dict[str, subprocess.Popen] = {}
 
     def __enter__(self) -> "LiveCapture":
-        if subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True).returncode == 0:
+        if subprocess.run(["pgrep", "-x", CAP_COMM], capture_output=True).returncode == 0:
             raise RuntimeError("a capture binary already runs on this node")
         try:
             return self._start()
@@ -1576,7 +1579,7 @@ class LiveCapture:
                 p.wait(timeout=10)
         for k in CAP_KEYS:
             _dada_db_destroy(k)
-        if subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True).returncode != 0:
+        if subprocess.run(["pgrep", "-x", CAP_COMM], capture_output=True).returncode != 0:
             for port in CAP_PORTS:            # a killed capture leaves its mon shm behind
                 try:
                     os.unlink(f"/dev/shm/dsart-capture-{port}")
@@ -1793,7 +1796,7 @@ def cmd_teardown(args) -> int:
         if _dada_db_destroy(k):
             removed.append(f"dada:{k}")
     pats = ["/dev/shm/dsart-x2-*", "/tmp/dsart-x2-*"]
-    if subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True).returncode != 0:
+    if subprocess.run(["pgrep", "-x", CAP_COMM], capture_output=True).returncode != 0:
         pats.append("/dev/shm/dsart-capture-*")      # left by a killed --live-capture run
     for pat in pats:
         for p in glob.glob(pat):
