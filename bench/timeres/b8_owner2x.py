@@ -300,18 +300,13 @@ def _need_gpu():
 
 def _value_map(opoint_id: str, antpos_npz: str = "", dec_deg: float = DEC_DEG):
     """WS-P value map of ``opoint_id`` (the same antpos + DEC as WS-T's TX,
-    so the pattern ids match the ring's)."""
-    import numpy as np
-    from dsart.grid.baseline_grid import build_value_map_for_opoint
-    from dsart.grid.sparsity_pattern import core_baseline_mask_from_station_numbers
+    so the pattern ids match the ring's). ``antpos_npz``: an antpos npz or a production cal
+    blob (antennas.out, as corr_fast --apply-cal), through the helper search_rx shares."""
+    from dsart.x2 import prod_inputs as pi
     from dsart.x2.opoint import opoint_from_id
 
     op = opoint_from_id(opoint_id)
-    z = np.load(antpos_npz or FIXTURE)
-    vm = build_value_map_for_opoint(op, z["antpos_e"], z["antpos_n"],
-                                    is_core_baseline_mask=core_baseline_mask_from_station_numbers(
-                                        z["station"]), dec_deg=float(dec_deg))
-    return op, vm
+    return op, pi.value_map_for(op, antpos_npz or FIXTURE, dec_deg)
 
 
 def _steps(op) -> tuple:

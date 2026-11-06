@@ -1161,7 +1161,10 @@ def _preflight_replay(drv: Driver, a, chg: dict) -> dict:
               "|[s]earch_rx --ring-version' | sed 's/^/busy /'; ")
         if n in drv.rx_nodes:
             sh += f"test -f {shlex.quote(a.plan)} && echo plan_ok; "
-        if n in chg:
+        if n in chg and getattr(a, "live_capture", False):
+            sh += ("pgrep -af '[d]sart_capture_manythread' | sed 's/^/busy capture /'; "
+                   "ipcs -m | grep -qi -E '0x0000c2b0|0x0000c2b2' && echo dada_key_exists; ")
+        elif n in chg:
             rf = drv.replay_files.get(n)
             if rf:
                 sh += f"test -r {shlex.quote(rf)} && echo fixture_ok; "
@@ -1185,7 +1188,7 @@ def _preflight_replay(drv: Driver, a, chg: dict) -> dict:
         if n in drv.rx_nodes and "plan_ok" not in lines:
             fatal.append(f"no plan {a.plan}")
         warn = []
-        if n in chg:
+        if n in chg and not getattr(a, "live_capture", False):
             if not any(x.startswith("fixture_ok") for x in lines):
                 fatal.append(f"no {a.replay} chgroup {chg[n]} voltage file")
             if "cal_ok" not in lines:
@@ -1223,11 +1226,60 @@ def _log_tail(drv: Driver, node: str, path: str, n: int = 25) -> str:
         return f"error: {exc}"
 
 
+def _write_go(drv: "Driver", t_start: float) -> None:
+    """ring-stats on every search node samples from ``t_start`` for --minutes."""
+    body = json.dumps({"start_at": t_start})
+    for n in drv.rx_nodes:
+        r = drv.run_on(n, f"printf %s {shlex.quote(body)} > {drv.go_file()}.tmp && "
+                          f"mv {drv.go_file()}.tmp {drv.go_file()}")
+        if r.returncode != 0:
+            raise RuntimeError(f"go file on {n}: {r.stderr[-300:]}")
+
+
+def _live_common_arm(drv: "Driver", a, res: dict, corr_dir: dict, arm_path: str) -> float:
+    """--live-capture: wait until every corr node's arm helper announced arm_ready (corr_fast warm, the
+    latest SNAP seq_no), arm all of them at one seq_no ``--arm-lead-s`` ahead of the newest (on the
+    32-native grid), and return the estimated unix time of the first armed sample."""
+    ready: dict = {}
+    t_end = time.time() + a.ready_timeout_s + 300
+    while time.time() < t_end and len(ready) < len(drv.tx_nodes):
+        for n in drv.tx_nodes:
+            if n not in ready:
+                r = drv.fetch(n, f"{corr_dir[n]}/arm_ready.json", 0.1)
+                if r and "last_seq" in r:
+                    ready[n] = r
+        if len(ready) < len(drv.tx_nodes):
+            time.sleep(2.0)
+    missing = [n for n in drv.tx_nodes if n not in ready]
+    res["not_ready_to_arm"] = missing
+    if not ready or len(missing) > a.max_dead_corr:
+        res["not_ready_log_tails"] = {n: _log_tail(drv, n, corr_dir[n] + ".log", 40) for n in missing}
+        raise RuntimeError(f"corr nodes never ready to arm: {missing}")
+    rate = max(r["seq_rate_per_s"] for r in ready.values())
+    now = time.time()
+    newest = max(r["last_seq"] + rate * (now - r["t"]) for r in ready.values())
+    arm = int(newest + rate * a.arm_lead_s)
+    arm += (-arm) % 32
+    body = shlex.quote(json.dumps({"arm_seq": arm}))
+    for n in drv.tx_nodes:
+        drv.run_on(n, f"printf %s {body} > {arm_path}.tmp && mv {arm_path}.tmp {arm_path}")
+    t_start = now + (arm - newest) / rate
+    res.update(arm_seq=arm, seq_rate_per_s=rate, start_at=t_start, block0=None,
+               start_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t_start)))
+    print(f"  live: {len(ready)} corr nodes warm; armed at seq {arm} (data in {t_start - time.time():.0f} s)",
+          flush=True)
+    return t_start
+
+
 def cmd_fleet_replay(a) -> int:
     """G1 full chain: b8_corr2x live (corr_fast 2x on replayed voltages, frame v2, C sender) on every
     --tx-nodes corr node, search_rx v4 + ring-stats + b8_owner2x engines on every --rx-nodes search
-    node; common --start-at / --block0. Every node process runs under prod_guard (stopped mode)."""
+    node; common --start-at / --block0. Every node process runs under prod_guard (stopped mode).
+    --live-capture (G2, SNAPs on): the corr nodes run on LIVE SNAP data (b8_corr2x live --live-capture:
+    test captures -> dsaX_merge -> test fada) and the driver arms every capture at one common seq_no once
+    all corr_fast instances are warm; the data start replaces --start-at / --block0."""
     drv = Driver(a)
+    live = bool(getattr(a, "live_capture", False))
     drv.replay_files = dict(kv.split("=", 1) for kv in (a.replay_file or "").split(",") if kv)
     bad = ([n for n in drv.rx_nodes if n not in SEARCH_NODE_ORDER]
            + [n for n in drv.tx_nodes if n not in CORR_NODE_ORDER])
@@ -1236,9 +1288,10 @@ def cmd_fleet_replay(a) -> int:
                          f"{CORR_NODE_ORDER} (bad: {bad})")
     if not a.plan or not a.plan_id:
         raise SystemExit("fleet-replay: --plan (npz on the search nodes) and --plan-id are required")
-    dec = a.dec_deg if a.dec_deg is not None else REPLAY_POINTING_DEC.get(a.replay)
+    dec = a.dec_deg if a.dec_deg is not None else (None if live else REPLAY_POINTING_DEC.get(a.replay))
     if dec is None:
-        raise SystemExit(f"fleet-replay: --dec-deg (the corr's pointing DEC for fixture {a.replay})")
+        raise SystemExit("fleet-replay: --dec-deg (the array's pointing DEC: /mon/array/dec when live, else "
+                         f"the corr's pointing DEC for fixture {a.replay})")
     chg = {n: CORR_NODE_ORDER.index(n) for n in drv.tx_nodes}
     idx = {n: SEARCH_NODE_ORDER.index(n) for n in drv.rx_nodes}
     # every corr sends to all four search nodes (SEARCH_NODES order); a search node outside this run
@@ -1251,7 +1304,8 @@ def cmd_fleet_replay(a) -> int:
     total_s = a.lead_s + a.minutes * 60.0 + 2400.0           # guard timeouts (teardown ends earlier)
     sc, res_dir, py = a.scratch, drv.results, drv.py
     res: dict = {"marker": a.marker, "format": a.format, "plan": a.plan, "plan_id": a.plan_id,
-                 "replay": a.replay, "dec_deg": dec, "minutes": a.minutes, "tx_nodes": drv.tx_nodes,
+                 "replay": None if live else a.replay, "live_capture": live, "dec_deg": dec,
+                 "minutes": a.minutes, "tx_nodes": drv.tx_nodes,
                  "rx_nodes": drv.rx_nodes, "chgroup": chg, "search_index": idx, "tx_hosts": tx_hosts,
                  "port_base": a.port_base, "burst_bytes": a.burst_bytes, "ab_mode": a.ab_mode,
                  "lossy_tx_nodes": lossy, "ring_spec": {}, "launch": {}, "health": [], "gates": {}}
@@ -1316,33 +1370,37 @@ def cmd_fleet_replay(a) -> int:
             if drv.fetch(n, st_out[n] + ".ready", max(1.0, t_end_ready - time.time())) is None:
                 raise TimeoutError(f"ring-stats on {n} not ready: "
                                    + _log_tail(drv, n, st_out[n].replace(".json", ".log")))
-        # 2. common start: a block boundary >= lead after the last corr launch (warm-up 60-75 s)
-        t0 = time.time() + a.lead_s + 1.5 * len(drv.tx_nodes)
-        block0 = int(-(-(t0 - 1.6e9) // BLOCK_S))
-        t_start = 1.6e9 + block0 * BLOCK_S
-        res.update(start_at=t_start, block0=block0,
-                   start_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t_start)))
-        body = json.dumps({"start_at": t_start})
-        for n in drv.rx_nodes:                               # ring-stats: sample until start + minutes
-            r = drv.run_on(n, f"printf %s {shlex.quote(body)} > {drv.go_file()}.tmp && "
-                              f"mv {drv.go_file()}.tmp {drv.go_file()}")
-            if r.returncode != 0:
-                raise RuntimeError(f"go file on {n}: {r.stderr[-300:]}")
+        # 2. common start: a block boundary >= lead after the last corr launch (warm-up 60-75 s); live:
+        #    the data start follows from the common arm (after the corr launch, below)
+        t_start = block0 = None
+        if not live:
+            t0 = time.time() + a.lead_s + 1.5 * len(drv.tx_nodes)
+            block0 = int(-(-(t0 - 1.6e9) // BLOCK_S))
+            t_start = 1.6e9 + block0 * BLOCK_S
+            res.update(start_at=t_start, block0=block0,
+                       start_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t_start)))
+            _write_go(drv, t_start)
         # 3. the real corr on every corr node
         n_tx_timeout = int(a.lead_s + 1.5 * len(drv.tx_nodes) + a.minutes * 60 + 1200)
+        arm_path = f"{res_dir}/{a.marker}_arm.json"
         for n in drv.tx_nodes:
             od = corr_dir[n]
             rf = drv.replay_files.get(n)
+            src = (f"--live-capture --arm-file {arm_path} --dec {dec}" if live else
+                   f"--replay {a.replay} --start-at {t_start!r} --block0 {block0}"
+                   + (f" --replay-file {shlex.quote(rf)}" if rf else ""))
             cmd = guarded(
                 f"env PYTHONPATH=src DSART_CONFIG_DIR=configs MKL_INTERFACE_LAYER=GNU,LP64 {py} "
                 f"bench/timeres/b8_corr2x.py live --opoint {a.format} --minutes {a.minutes} "
-                f"--replay {a.replay} --reader-identity corr_fast --trace --tx v2 --tx-hosts {tx_hosts} "
+                f"{src} --reader-identity corr_fast --trace --tx v2 --tx-hosts {tx_hosts} "
                 f"--tx-port-base {a.port_base} --tx-bind-host {drv.ip[n]} --tx-burst-bytes {a.burst_bytes} "
-                f"--start-at {t_start!r} --block0 {block0} --plan-id {a.plan_id} --ab-mode {a.ab_mode} "
-                f"--out {od}" + (f" --replay-file {shlex.quote(rf)}" if rf else ""), n_tx_timeout)
-            drv.run_on(n, f"mkdir -p {res_dir} && cd {sc} && {{ env DSART_X2_CP={a.marker} "
+                f"--plan-id {a.plan_id} --ab-mode {a.ab_mode} --out {od}", n_tx_timeout)
+            drv.run_on(n, f"mkdir -p {res_dir} && rm -f {arm_path} && cd {sc} && {{ env DSART_X2_CP={a.marker} "
                           f"DSART_HOST_PIN_PERSIST=1 nohup {cmd} > {od}.log 2>&1 < /dev/null & }}", timeout=60)
             res["launch"][n] = time.time()
+        if live:
+            t_start = _live_common_arm(drv, a, res, corr_dir, arm_path)
+            _write_go(drv, t_start)
         print(f"  corr launched on {len(drv.tx_nodes)} nodes; start {res['start_utc']} block0 {block0} "
               f"(in {t_start - time.time():.0f} s)", flush=True)
         # 4. at the start: which corr nodes are warm (sentinel) / alive
@@ -1376,8 +1434,8 @@ def cmd_fleet_replay(a) -> int:
                 r = drv.fetch(n, f"{od}/live_error.json", 5.0) or {}
                 r["missing"] = True
                 r["log_tail"] = _log_tail(drv, n, od + ".log", 40)
-            sl = drv.run_on(n, f"grep -h x2_fada_replay_start_late_s {od}/writer_live.log 2>/dev/null | tail -1",
-                            timeout=30).stdout.strip()
+            sl = "" if live else drv.run_on(n, f"grep -h x2_fada_replay_start_late_s {od}/writer_live.log "
+                                               "2>/dev/null | tail -1", timeout=30).stdout.strip()
             try:
                 r["writer_start_late_s"] = json.loads(sl)["x2_fada_replay_start_late_s"] if sl else 0.0
             except (ValueError, KeyError):
@@ -1464,6 +1522,9 @@ def evaluate_replay(res: dict, corr_res: dict, ring_res: dict, eng_res: dict, *,
             "writer_blocks": w.get("n_blocks"), "writer_late_blocks": w.get("late_blocks"),
             "writer_start_late_s": r.get("writer_start_late_s"),
             "replay_max_nfull": r.get("max_nfull"), "replay_nbufs": r.get("nbufs"),
+            "capture_drop_frac": max((v.get("drop_frac") or 0.0 for v in (r.get("capture") or {}).values()),
+                                     default=None) if r.get("capture") else None,
+            "snap_nic_discard_frac": (r.get("nic") or {}).get("discard_frac"),
             "tx_sent_per_dest": sent, "tx_bytes_per_dest": tl.get("dest_bytes"),
             "tx_full_drops": sum(tl.get("dest_full_drops") or [0]), "tx_errors": sum(tl.get("dest_errors") or [0]),
             "tx_unrouted": int(cnt.get("unrouted", 0) or 0),

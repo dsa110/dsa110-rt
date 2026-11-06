@@ -86,6 +86,13 @@ FIXTURE_ROOTS = ("/home/ubuntu/x2_scratch/voltages", "/home/ubuntu/data/voltage_
 FIXTURE_POINTING_DEC_DEG = {"250924mptq": 54.5737}
 MAP_NAMES = {"gridded": "gridded", "baselines": "baselines"}
 PROD_CORR_FAST_RE = r"dsart[.]services[.]corr_fast_integration"
+#: ``live --live-capture`` (G2, SNAPs on): the two capture TEST buffers (production dada/eada block
+#: size; a DADA key K also takes K+1), the capture binary's test control ports (production 11223/4)
+CAP_KEYS = ("c2b0", "c2b2")
+CAP_BYTES = 150994944
+CAP_PORTS = (4011, 4012)
+CAP_CTRL_PORTS = (11323, 11324)
+DSAX_MERGE = "/home/ubuntu/proj/dsa110-shell/dsa110-xengine/src/dsaX_merge"
 
 
 # ---------------------------------------------------------------------------
@@ -1064,8 +1071,8 @@ def cmd_live(args) -> int:
     if args.reader_identity != "corr_fast" or args.tx not in ("drain", "loopback", "v2"):
         print("live: only --tx drain|loopback|v2 --reader-identity corr_fast are supported", file=sys.stderr)
         return EXIT_ERR
-    if args.tx in ("loopback", "v2") and not getattr(args, "replay", None):
-        print(f"live: --tx {args.tx} needs --replay", file=sys.stderr)
+    if args.tx in ("loopback", "v2") and not (getattr(args, "replay", None) or args.live_capture):
+        print(f"live: --tx {args.tx} needs --replay or --live-capture", file=sys.stderr)
         return EXIT_ERR
     prod = _production_corr_fast_pids()
     if prod:
@@ -1100,6 +1107,8 @@ def cmd_live(args) -> int:
     if getattr(args, "plan_id", None):
         argv += ["--plan-id", args.plan_id]
     _set_gpu_env(env)
+    if args.live_capture:
+        return _live_on_capture(args, argv, n_blocks)
     if getattr(args, "replay", None):
         return _live_on_replay(args, argv, n_blocks)
     import dsart.services.corr_fast_integration as cfi
@@ -1473,11 +1482,320 @@ def _live_on_replay(args, argv: list, n_blocks: int) -> int:
     return _finish(args.out, "live_2x.json", res, gates)
 
 
+def _capture_data_ip() -> str:
+    """This corr node's SNAP data IP: the production cap_a_real ``-j`` hostarg."""
+    import yaml
+    with open(os.path.join(ROOT, "configs", "dsart_pipeline_rt.yaml")) as fh:
+        doc = yaml.safe_load(fh)
+    r = next(r for r in doc["routines"] if r.get("name") == "cap_a_real")
+    return r["hostargs"][socket.gethostname()].split()[-1]
+
+
+def _cap_mon(port: int) -> dict | None:
+    from dsart.capture.mon_shm import MonShm
+    try:
+        with MonShm.open(port) as m:
+            return m.snapshot().to_dict()
+    except Exception:  # noqa: BLE001 -- not up yet
+        return None
+
+
+def _nic_counters(ip: str) -> dict:
+    """rx_discards_phy / rx_out_of_buffer / rx_crc_errors_phy of the interface holding ``ip``."""
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+    ifc = next((ln.split()[1] for ln in out.splitlines() if f" {ip}/" in ln), None)
+    if ifc is None:
+        return {}
+    st = subprocess.run(["ethtool", "-S", ifc], capture_output=True, text=True).stdout
+    c = {"iface": ifc, "t": time.time()}
+    for ln in st.splitlines():
+        k, _, v = ln.strip().partition(":")
+        if k in ("rx_discards_phy", "rx_out_of_buffer", "rx_crc_errors_phy", "rx_packets_phy"):
+            c[k] = int(v)
+    return c
+
+
+class LiveCapture:
+    """The G2 live front end on this corr node: two capture TEST buffers, dsaX_merge into the test fada
+    (0xREPLAY_KEY, created by the caller), and this copy's capture binary on the SNAP ports with test
+    control ports -- production's cap_a_real/cap_b_real/merge_real routines on test keys. Run from a
+    /home/ubuntu/x2_scratch copy (prod_guard ignores processes whose cwd is one). Data flows only after
+    ``arm``."""
+
+    def __init__(self, out_dir: str) -> None:
+        self.out, self.ip = out_dir, _capture_data_ip()
+        self.procs: dict[str, subprocess.Popen] = {}
+
+    def __enter__(self) -> "LiveCapture":
+        if subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True).returncode == 0:
+            raise RuntimeError("a capture binary already runs on this node")
+        try:
+            return self._start()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def _start(self) -> "LiveCapture":
+        for k in CAP_KEYS:
+            _dada_db_destroy(k)
+            r = _dada_db("-k", k, "-b", str(CAP_BYTES), "-n", "20", "-l", "-p", "-c", "1")
+            if r.returncode != 0:
+                raise RuntimeError(f"dada_db -k {k}: {r.stderr.strip()[-300:]}")
+        logf = lambda n: open(os.path.join(self.out, f"{n}.log"), "w")  # noqa: E731
+        self.procs["merge"] = subprocess.Popen(
+            [DSAX_MERGE, "-i", CAP_KEYS[0], "-j", CAP_KEYS[1], "-o", REPLAY_KEY, "-m", "-c", "12"],
+            cwd=ROOT, stdout=logf("merge"), stderr=subprocess.STDOUT)
+        cap = os.path.join(ROOT, "src", "dsart", "capture", "dsart_capture_manythread")
+        for k, port, ctrl in zip(CAP_KEYS, CAP_PORTS, CAP_CTRL_PORTS):
+            self.procs[f"cap_{port}"] = subprocess.Popen(
+                [cap, "-o", k, "-p", str(port), "-q", str(ctrl), "-j", self.ip],
+                cwd=ROOT, stdout=logf(f"cap_{port}"), stderr=subprocess.STDOUT)
+        t_end = time.time() + 60
+        while time.time() < t_end:
+            m = [_cap_mon(p) for p in CAP_PORTS]
+            if all(x and x.get("last_seq_no") for x in m):
+                return self
+            self.check()
+            time.sleep(1.0)
+        raise RuntimeError("no SNAP packets reached the test captures in 60 s")
+
+    def check(self) -> None:
+        for n, p in self.procs.items():
+            if p.poll() is not None:
+                raise RuntimeError(f"live capture: {n} exited rc={p.returncode}")
+
+    def __exit__(self, *exc) -> None:
+        for p in self.procs.values():
+            if p.poll() is None:
+                p.terminate()
+        for p in self.procs.values():
+            try:
+                p.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=10)
+        for k in CAP_KEYS:
+            _dada_db_destroy(k)
+        if subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True).returncode != 0:
+            for port in CAP_PORTS:            # a killed capture leaves its mon shm behind
+                try:
+                    os.unlink(f"/dev/shm/dsart-capture-{port}")
+                except FileNotFoundError:
+                    pass
+
+
+def _cap_seq_now() -> tuple[int, float]:
+    """(latest seq_no over both test captures, seq units per second measured over 2 s)."""
+    a = [_cap_mon(p)["last_seq_no"] for p in CAP_PORTS]
+    t0 = time.time()
+    time.sleep(2.0)
+    b = [_cap_mon(p)["last_seq_no"] for p in CAP_PORTS]
+    return max(b), max(y - x for x, y in zip(a, b)) / (time.time() - t0)
+
+
+def _cap_arm(seq: int) -> None:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for ctrl in CAP_CTRL_PORTS:
+        s.sendto(f"UTC_START-{int(seq)}".encode("ascii"), ("127.0.0.1", ctrl))
+    s.close()
+
+
+def _cap_stats() -> dict:
+    return {str(p): _cap_mon(p) for p in CAP_PORTS}
+
+
+def cmd_live_arm(args) -> int:
+    """Helper PROCESS of ``live --live-capture`` (a thread cannot do this: corr_fast blocks in the
+    PSRDADA reader without releasing the GIL until data flows, and data flows only once armed):
+    wait for corr_fast's ready sentinel, arm the test captures (``--arm-file``: the fleet driver's
+    common seq, announced via <out>/arm_ready.json; else ``--arm-lead-s`` ahead), record the capture /
+    NIC counters at the arm, then sample the test fada fill every 2 s into <out>/live_front.json until
+    <out>/live_front.stop appears."""
+    out = args.out
+    front: dict = {"samples": 0, "max_nfull": None, "nbufs": None}
+    stop = os.path.join(out, "live_front.stop")
+    try:
+        while not os.path.exists(args.sentinel):
+            if os.path.exists(stop):
+                front["error"] = "stopped before corr_fast was ready"
+                return EXIT_ERR
+            time.sleep(1.0)
+        seq, rate = _cap_seq_now()
+        if args.arm_file:
+            _write(out, "arm_ready.json", {"last_seq": seq, "seq_rate_per_s": rate, "t": time.time()})
+            t_end = time.time() + args.arm_timeout_s
+            while not os.path.exists(args.arm_file):
+                if time.time() > t_end or os.path.exists(stop):
+                    front["error"] = "no arm file"
+                    return EXIT_ERR
+                time.sleep(0.5)
+            arm = int(json.load(open(args.arm_file))["arm_seq"])
+        else:
+            arm = int(seq + rate * args.arm_lead_s)
+            arm += (-arm) % 32                       # the 2x epoch needs a multiple of 16
+        _cap_arm(arm)
+        front.update(arm_seq=arm, t_sent=time.time(), seq_before=seq, seq_rate_per_s=rate,
+                     t_data_est=time.time() + (arm - seq) / rate, stats0=_cap_stats(), nic0=_nic_counters(args.data_ip))
+        last_write = 0.0
+        while not os.path.exists(stop):
+            m = _dbmetric(REPLAY_KEY)
+            if m:
+                front["samples"] += 1
+                front["nbufs"] = m["nbufs"]
+                front["max_nfull"] = max(front["max_nfull"] or 0, m["nfull"])
+            if time.time() - last_write > 10:
+                _write_quiet(out, "live_front.json", front)
+                last_write = time.time()
+            time.sleep(2.0)
+        return EXIT_OK
+    except Exception:  # noqa: BLE001
+        front["error"] = traceback.format_exc()[-2000:]
+        return EXIT_ERR
+    finally:
+        front["done"] = True
+        _write_quiet(out, "live_front.json", front)
+
+
+def _write_quiet(out_dir: str, name: str, payload: dict) -> None:
+    tmp = os.path.join(out_dir, name + ".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, default=str)
+    os.replace(tmp, os.path.join(out_dir, name))
+
+
+def _capture_delta(a: dict, b: dict) -> dict:
+    """Per port: received / dropped packets between two LiveCapture.stats() snapshots."""
+    out = {}
+    for port in a:
+        x, y = a.get(port) or {}, b.get(port) or {}
+        d = {k: (y.get(k) or 0) - (x.get(k) or 0) for k in
+             ("n_recv_packets", "n_dropped_payload", "n_dropped_kernel", "n_too_late", "n_block_writes")}
+        tot = d["n_recv_packets"] + d["n_dropped_payload"]
+        d["drop_frac"] = d["n_dropped_payload"] / tot if tot else None
+        out[port] = d
+    return out
+
+
+def _live_on_capture(args, argv: list, n_blocks: int) -> int:
+    """``live`` on LIVE SNAP data (G2): LiveCapture -> 0xREPLAY_KEY -> corr_fast's own main/run with the
+    production cal and the array DEC (--dec). Arms after corr_fast's ready sentinel (kernels warm): at
+    the fleet driver's common seq (--arm-file) or, alone, --arm-lead-s ahead. Gates: block time, no
+    dropped blocks, the test fada never full, plus the capture drop fraction and the NIC discard counters
+    over the armed run (reported; the SNAP-discard gate compares them with a 1x run)."""
+    import signal
+    import dsart.services.corr_fast_integration as cfi
+
+    def _term(signum, _frame):           # prod_guard / timeout stop us with TERM: still tear down
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _term)
+    argv = list(argv)
+    if "--fada-key" in argv:
+        argv[argv.index("--fada-key") + 1] = REPLAY_KEY
+    else:
+        argv += ["--fada-key", REPLAY_KEY]
+    os.makedirs(args.out, exist_ok=True)
+    trace = os.path.join(args.out, "block_trace.jsonl") if args.trace else None
+    if trace:
+        os.environ["DSART_X2_BLOCK_TRACE"] = trace
+    sentinel = argv[argv.index("--ready-sentinel-path") + 1]
+    if os.path.exists(sentinel):
+        os.unlink(sentinel)
+    cap: dict = {}
+    real = cfi.run
+    res: dict = {"opoint": args.opoint, "argv": argv, "source": "live-capture", "dec": args.dec}
+
+    def run_and_keep(*a, **kw):
+        cap["summary"] = real(*a, **kw)
+        return cap["summary"]
+
+    rc = EXIT_ERR
+    front_file, stop_file = os.path.join(args.out, "live_front.json"), os.path.join(args.out, "live_front.stop")
+    for f in (front_file, stop_file):
+        if os.path.exists(f):
+            os.unlink(f)
+    armed: dict = {}
+    with ReplayBuffer(nbufs=24, readers=1), LiveCapture(args.out) as lc:
+        res["data_ip"] = lc.ip
+        helper = [sys.executable, os.path.abspath(__file__), "live-arm", "--out", args.out, "--sentinel", sentinel,
+                  "--data-ip", lc.ip, "--arm-lead-s", str(args.arm_lead_s), "--arm-timeout-s", str(args.arm_timeout_s)]
+        if args.arm_file:
+            helper += ["--arm-file", args.arm_file]
+        arm_proc = subprocess.Popen(helper, cwd=ROOT, stdout=open(os.path.join(args.out, "live_arm.log"), "w"),
+                                    stderr=subprocess.STDOUT)
+        cfi.run = run_and_keep
+        txmon = TxDrainMonitor(cfi) if args.tx in ("loopback", "v2") else None
+        try:
+            if txmon is not None:
+                txmon.__enter__()
+            rc = cfi.main(argv)
+        finally:
+            cfi.run = real
+            if txmon is not None:
+                txmon.__exit__()
+            open(stop_file, "w").close()
+            try:
+                arm_proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                arm_proc.kill()
+            try:
+                armed = json.load(open(front_file))
+            except (OSError, ValueError):
+                armed = {"error": "no live_front.json"}
+            armed["stats1"], armed["nic1"] = _cap_stats(), _nic_counters(lc.ip)
+            dead = [f"{n} rc={p.returncode}" for n, p in lc.procs.items() if p.poll() is not None]
+            if dead:
+                armed["died"] = dead
+    if trace:
+        os.environ.pop("DSART_X2_BLOCK_TRACE", None)
+    s = cap.get("summary") or {}
+    capd = _capture_delta(armed.get("stats0") or {}, armed.get("stats1") or {})
+    n0, n1 = armed.get("nic0") or {}, armed.get("nic1") or {}
+    nic = {k: n1.get(k, 0) - n0.get(k, 0) for k in ("rx_discards_phy", "rx_out_of_buffer", "rx_crc_errors_phy",
+                                                    "rx_packets_phy")}
+    dt = (n1.get("t") or 0) - (n0.get("t") or 0)
+    nic["seconds"] = round(dt, 1)
+    nic["discard_frac"] = (nic["rx_discards_phy"] / (nic["rx_packets_phy"] + nic["rx_discards_phy"])
+                           if nic["rx_packets_phy"] else None)
+    res.update(rc=rc, summary=s,
+               arm={k: v for k, v in armed.items() if k not in ("stats0", "stats1", "nic0", "nic1")},
+               capture=capd, nic=nic,
+               trace=trace_summary(trace) if trace and os.path.exists(trace) else None,
+               max_nfull=armed.get("max_nfull"), nbufs=armed.get("nbufs"))
+    if txmon is not None:
+        res["tx_loopback"] = txmon.summary()
+    if rc != 0 or not s or "arm_seq" not in armed:
+        _write(args.out, "live_2x.json", res)
+        return EXIT_ERR
+    mean, p99 = float(s.get("ms_per_block_mean", np.nan)), float(s.get("ms_per_block_p99", np.nan))
+    gates = {
+        "mean_le_85pct": mean <= 0.85 * BLOCK_MS,
+        "p99_le_100pct": p99 <= BLOCK_MS,
+        "no_dropped_blocks": int(s.get("n_dropped", 1)) == 0,
+        "ran_requested_blocks": int(s.get("n_blocks_in", 0)) >= n_blocks,
+        "fada_never_full": res["max_nfull"] is not None and res["max_nfull"] < res["nbufs"],
+        "front_end_alive": "died" not in armed,
+    }
+    if args.tx in ("loopback", "v2"):
+        gates["tx_framed_no_rejects"] = bool((s.get("x2_tx") or {}).get("datagrams", 0) > 0
+                                             and (s.get("x2_tx") or {}).get("rejected", 1) == 0)
+    if txmon is not None:
+        tl = res["tx_loopback"]
+        gates["tx_no_queue_drops"] = sum(tl.get("dest_full_drops", [1])) == 0 and \
+            sum(tl.get("dest_errors", [1])) == 0
+        gates["tx_drains_inside_block"] = bool(tl.get("drain_ms")) and tl["drain_ms"]["p99"] < BLOCK_MS
+    return _finish(args.out, "live_2x.json", res, gates)
+
+
 def cmd_teardown(args) -> int:
     removed = []
-    if _dada_db_destroy(REPLAY_KEY):
-        removed.append(f"dada:{REPLAY_KEY}")
-    for pat in ("/dev/shm/dsart-x2-*", "/tmp/dsart-x2-*"):
+    for k in (REPLAY_KEY,) + CAP_KEYS:
+        if _dada_db_destroy(k):
+            removed.append(f"dada:{k}")
+    pats = ["/dev/shm/dsart-x2-*", "/tmp/dsart-x2-*"]
+    if subprocess.run(["pgrep", "-f", "dsart_capture_manythread"], capture_output=True).returncode != 0:
+        pats.append("/dev/shm/dsart-capture-*")      # left by a killed --live-capture run
+    for pat in pats:
         for p in glob.glob(pat):
             try:
                 if os.path.isdir(p):
@@ -1552,17 +1870,33 @@ def main(argv=None) -> int:
     p.add_argument("--replay", default=None,
                    help="fixture run id: feed corr_fast from the replay writer via the test DADA "
                         f"buffer 0x{REPLAY_KEY} instead of the node's fada")
+    p.add_argument("--live-capture", action="store_true",
+                   help="G2: feed corr_fast from LIVE SNAP data -- this copy's capture binary x2 (test "
+                        f"buffers {CAP_KEYS}, control ports {CAP_CTRL_PORTS}) -> dsaX_merge -> 0x{REPLAY_KEY}")
+    p.add_argument("--arm-file", default=None,
+                   help="--live-capture: wait for this JSON {\"arm_seq\": S} (the fleet driver's common "
+                        "arm) after writing <out>/arm_ready.json; default: arm itself")
+    p.add_argument("--arm-lead-s", type=float, default=10.0,
+                   help="--live-capture self-arm: seconds ahead of the latest SNAP seq_no")
+    p.add_argument("--arm-timeout-s", type=float, default=900.0)
     p = common(sub.add_parser("replay-1x"))
     p.add_argument("--run-id", default="250924mptq")
     p.add_argument("--blocks", type=int, default=64)
     p.add_argument("--probe-blocks", type=int, default=150)
     p.add_argument("--rate", default="native", help="writer pacing for the legacy/pipelined runs")
     common(sub.add_parser("teardown"), gpu=False)
+    p = sub.add_parser("live-arm", help="internal: the arm/fada-sampling helper process of live --live-capture")
+    p.add_argument("--out", required=True)
+    p.add_argument("--sentinel", required=True)
+    p.add_argument("--data-ip", required=True)
+    p.add_argument("--arm-file", default=None)
+    p.add_argument("--arm-lead-s", type=float, default=10.0)
+    p.add_argument("--arm-timeout-s", type=float, default=900.0)
     args = ap.parse_args(argv)
     fn = {"compile-check": cmd_compile_check, "profile-1x": cmd_profile_1x, "replay-1x": cmd_replay_1x,
           "golden-capture": cmd_golden_capture, "kernels": cmd_kernels, "compat-1x": cmd_compat_1x,
-          "live": cmd_live, "teardown": cmd_teardown}[args.cmd]
-    if args.cmd not in ("compile-check", "teardown"):
+          "live": cmd_live, "teardown": cmd_teardown, "live-arm": cmd_live_arm}[args.cmd]
+    if args.cmd not in ("compile-check", "teardown", "live-arm"):
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # bench/timeres/common.py
     try:
         return fn(args)
