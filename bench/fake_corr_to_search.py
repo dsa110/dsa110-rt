@@ -858,7 +858,10 @@ class Driver:
         for n in dict.fromkeys(self.tx_nodes + self.rx_nodes):
             sh = self._kill_marker() + f"; rm -f /dev/shm/dsart-x2-{self.marker}*"
             if n in corr_nodes:
-                sh += ("; if pgrep -f '[b]8_corr2x[.]py|[x]2_fada_replay[.]py' > /dev/null; then "
+                # anchored on the python executable: this very shell's command line names
+                # b8_corr2x.py (its teardown) and must not count as "another b8 running"
+                sh += ("; if pgrep -f '^[^ ]*python[^ ]* (bench/timeres/)?[b]8_corr2x[.]py live|"
+                       "^[^ ]*python[^ ]* .*[x]2_fada_replay[.]py' > /dev/null; then "
                        f"echo other-b8-running; else cd {shlex.quote(self.scratch)} && env PYTHONPATH=src "
                        f"{self.py} bench/timeres/b8_corr2x.py teardown > /dev/null 2>&1; "
                        f"rm -f {CORR_READY_SENTINEL}; fi")
