@@ -60,3 +60,6 @@ Value maps: the search side used its own production `antennas.out` (E/N/core ide
 - Downstream live (C1 -> C2 -> C3 / cutouts / plots) with the production 2x search service: needs a C2 test
   instance isolated from production etcd/Slack (user decision on how).
 - 1x golden RX recordings (incl. the storm window) need the 1x pipeline producing a 1x RX ring.
+- 1x on the unified code, live timing: not measurable with the bench (`--transport-tx-mode drain` is
+  2x-only; 1x TX workers would need loopback hosts and production shm names) -> measured on the production
+  path (web-UI 1x start) after the deploy.
