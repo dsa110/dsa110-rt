@@ -849,16 +849,19 @@ class Driver:
 
     def teardown_replay(self, corr_nodes: list[str]) -> dict:
         """Kill the marker's processes on every node, remove only this marker's
-        /dev/shm/dsart-x2-<marker>* and, on corr nodes, the TEST DADA buffer
-        0x{REPLAY_KEY} and the corr ready sentinel -- unless another (unmarked)
-        b8 corr / replay writer still runs there (its buffer, not ours)."""
+        /dev/shm/dsart-x2-<marker>* and, on corr nodes, b8_corr2x's own ``teardown``
+        (the TEST DADA buffers 0x{REPLAY_KEY} and --live-capture's c2b0/c2b2, the
+        capture mon shm when no capture runs, the corr ready sentinel) -- unless
+        another (unmarked) b8 corr / replay writer still runs there (its buffers,
+        not ours). The KILL 3 s after TERM can cut b8's own cleanup short."""
         out = {}
         for n in dict.fromkeys(self.tx_nodes + self.rx_nodes):
             sh = self._kill_marker() + f"; rm -f /dev/shm/dsart-x2-{self.marker}*"
             if n in corr_nodes:
                 sh += ("; if pgrep -f '[b]8_corr2x[.]py|[x]2_fada_replay[.]py' > /dev/null; then "
-                       "echo other-b8-running; else "
-                       f"dada_db -d -k {REPLAY_KEY} > /dev/null 2>&1; rm -f {CORR_READY_SENTINEL}; fi")
+                       f"echo other-b8-running; else cd {shlex.quote(self.scratch)} && env PYTHONPATH=src "
+                       f"{self.py} bench/timeres/b8_corr2x.py teardown > /dev/null 2>&1; "
+                       f"rm -f {CORR_READY_SENTINEL}; fi")
             sh += "; true"
             try:
                 r = self.run_on(n, sh, timeout=90)
@@ -877,8 +880,10 @@ class Driver:
                   f"'DSART_X2_CP={self.marker}' && echo \"proc $p $(cat /proc/$p/comm)\"; done; "
                   f"ls /dev/shm/ | grep -- 'dsart-x2-{self.marker}' | sed 's/^/shm /'")
             if n in corr_nodes:
-                sh += (f"; ipcs -m | grep -i '0x0000{REPLAY_KEY}\\|0x0000{int(REPLAY_KEY, 16) + 1:04x}' "
-                       f"| sed 's/^/dada /'; ls {CORR_READY_SENTINEL} 2>/dev/null | sed 's/^/file /'")
+                keys = [REPLAY_KEY, f"{int(REPLAY_KEY, 16) + 1:04x}", "c2b0", "c2b1", "c2b2", "c2b3"]
+                sh += (f"; ipcs -m | grep -i -E '{'|'.join('0x0000' + k for k in keys)}' "
+                       f"| sed 's/^/dada /'; ls {CORR_READY_SENTINEL} 2>/dev/null | sed 's/^/file /'; "
+                       "ls /dev/shm/ | grep -- 'dsart-capture-' | sed 's/^/shm /'")
             sh += "; true"
             try:
                 r = self.run_on(n, sh, timeout=60)
