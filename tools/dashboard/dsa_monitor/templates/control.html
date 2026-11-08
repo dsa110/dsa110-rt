@@ -217,8 +217,9 @@
                 <input type="text" id="obs_dec_deg" name="obs_dec_deg"
                        placeholder="(auto from etcd)"
                        oninput="scheduleFstStatusRefresh();" />
-                <!-- x2 op-point selector (docs/x2/SPEC.md §10). Default =
-                     the active op-point (/cnf/opoint, absent = 1x). -->
+                <!-- x2 op-point selector (docs/x2/SPEC.md §10): the production
+                     2x op-point only (opoint_runtime.ui_selections; 1x only with
+                     DSA_MONITOR_OPOINT_FALLBACK=1 for an emergency rollback). -->
                 <label for="opoint">op-point</label>
                 <select id="opoint" name="opoint" data-current="{{ opoint_current }}">
                     {% for op in opoint_choices %}

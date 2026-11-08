@@ -1323,14 +1323,16 @@ def control_page():
         LOG.warning("spl freq map: %s", exc)
         spl_chgroup_freqs = {}
         spl_raw_chan_khz = 0.030517578125 * 1.0e3    # native Δν fallback
-    # x2 op-point selector default = the active op-point (fallback 1x).
+    # x2 op-point selector: the production 2x op-point is the only choice (and so the default);
+    # opoint_current marks it "(active)" once it is.
     try:
         import opoint_switch                                        # local
         opoint_choices = list(opoint_switch.OPOINT_CHOICES)
         opoint_current = opoint_switch.opoint_banner(control_store)["active"]
     except Exception as exc:                                        # noqa: BLE001
         LOG.warning("opoint_banner: %s", exc)
-        opoint_choices, opoint_current = ["1x", "1x-legacy", "2x"], "1x"
+        from dsart.x2.opoint_runtime import PRODUCTION_OPOINT
+        opoint_choices, opoint_current = [PRODUCTION_OPOINT], ""
     return render_template(
         "control.html",
         active_tab="control",

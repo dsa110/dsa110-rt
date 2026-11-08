@@ -82,8 +82,9 @@ OPOINT_RESTART_UNITS: tuple[str, ...] = (
     "hiplot_c2.service",
 )
 
-#: Start-control choices: 1x, 1x-legacy and the six CP1 2x formats (by op-point id).
-OPOINT_CHOICES: tuple[str, ...] = opr.UI_SELECTIONS
+#: Start-control choices: the production 2x op-point only (1x / 1x-legacy only with
+#: DSA_MONITOR_OPOINT_FALLBACK=1 in the dashboard's environment, for an emergency rollback).
+OPOINT_CHOICES: tuple[str, ...] = opr.ui_selections()
 DEFAULT_HEALTH_TIMEOUT_S: float = 90.0
 DEFAULT_SETTLE_S: float = 8.0
 _SEARCH_CN_IDS: tuple[int, ...] = (1, 2, 9, 13)

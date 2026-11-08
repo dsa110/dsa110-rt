@@ -616,7 +616,13 @@ def test_control_start_fleet_without_opoint_is_unchanged():
 # ------------------------------------------------------------ banner/status
 
 
-def test_banner_and_status(env2x, tmp_path):
+def test_start_control_offers_only_the_production_opoint():
+    # user 2026-11-08: 2x is the default and 1x must not look like an option
+    assert osw.OPOINT_CHOICES == (opr.PRODUCTION_OPOINT,)
+
+
+def test_banner_and_status(env2x, tmp_path, monkeypatch):
+    monkeypatch.setattr(osw, "OPOINT_CHOICES", opr.UI_SELECTIONS)    # every set (the fallback view)
     osw._BANNER_CACHE["val"] = None
     s = _kv_with_sets(env2x, live_sel=NS2, active=opr.make_active_record(NS2, plan_id="0x1"))
     b = osw.opoint_banner(s, ttl_s=0)

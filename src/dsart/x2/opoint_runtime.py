@@ -72,8 +72,21 @@ CONFIG_SETS: tuple[str, ...] = ("1x", "1x-legacy", "2x")
 DEFAULT_SELECTION: str = "1x"
 #: Config sets that fall back to the base config file when they have no own file.
 BASE_FALLBACK: frozenset[str] = frozenset({"1x", "1x-legacy"})
-#: Selections offered by the Start control: both 1x sets, then the CP1 format rows.
+#: Every selection the tooling understands (push, switch, rollback): both 1x sets, then the CP1 rows.
 UI_SELECTIONS: tuple[str, ...] = ("1x", "1x-legacy") + tuple(sorted(FORMATS_2X))
+#: The production op-point (S1 decided 2026-10-29, deployed 2026-11-08): the only selection the web-UI
+#: Start control offers (user 2026-11-08: 2x is the default, 1x must not look like an option).
+PRODUCTION_OPOINT: str = "2x-gridded-ns4-cint4"
+#: Dashboard environment switch that also offers 1x / 1x-legacy (emergency rollback only).
+FALLBACK_ENV: str = "DSA_MONITOR_OPOINT_FALLBACK"
+
+
+def ui_selections(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Selections the web-UI Start control offers: the production op-point only; with
+    ``DSA_MONITOR_OPOINT_FALLBACK=1`` in the dashboard's environment also 1x and 1x-legacy."""
+    env = os.environ if env is None else env
+    fallback = str(env.get(FALLBACK_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+    return (PRODUCTION_OPOINT,) + (("1x", "1x-legacy") if fallback else ())
 
 ACTIVE_KEY: str = "/cnf/opoint"
 SETS_PREFIX: str = "/cnf/opoints"

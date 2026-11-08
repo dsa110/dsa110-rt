@@ -48,6 +48,10 @@ def test_selections():
         assert opr.validate_selection(sel) == sel
     assert opr.config_set_of("1x-legacy") == "1x-legacy"
     assert opr.config_set_of(NS2) == "2x"
+    # the web UI offers the production 2x op-point only; 1x only behind the fallback switch
+    assert opr.PRODUCTION_OPOINT in FORMATS_2X
+    assert opr.ui_selections({}) == (opr.PRODUCTION_OPOINT,)
+    assert opr.ui_selections({opr.FALLBACK_ENV: "1"}) == (opr.PRODUCTION_OPOINT, "1x", "1x-legacy")
     assert opr.op_of("1x-legacy") is OPPOINT_1X
     assert opr.op_of(NS4).n_sub == 4 and opr.op_of(NS4).value_kind == "baselines"
     assert opr.k_family_of("1x-legacy") == "1x" and opr.k_family_of(NS4) == "2x"
