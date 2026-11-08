@@ -39,8 +39,11 @@ class DiffEntry:
 
 
 def canonical_sha256(obj: Any) -> str:
-    """sha256 of the canonical JSON form (sorted keys, no whitespace)."""
-    blob = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    """sha256 of the canonical JSON form (sorted keys, no whitespace). Keys are made strings
+    first (a JSON round trip), so a YAML dict with int keys (c3.corr_nodes 0..15) hashes the same
+    as its etcd copy: sort_keys orders ints numerically but their strings lexicographically."""
+    norm = json.loads(json.dumps(obj, default=str))
+    blob = json.dumps(norm, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
