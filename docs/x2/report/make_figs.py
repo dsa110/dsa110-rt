@@ -92,16 +92,11 @@ def bucket(dm: float, width: int) -> str:
 def load_k(campaign: str | None, k1x: str | None):
     """(dm, width_native, K_2x, K_1x) for every bucket measured in both."""
     out = []
-    if not campaign or not os.path.exists(campaign) or not k1x or not os.path.exists(k1x):
+    if not k1x or not os.path.exists(k1x):
         return out
     old = json.load(open(k1x))
     old = {k.rsplit("/", 1)[-1]: v.get("K") for k, v in old.items() if isinstance(v, dict) and v.get("K")}
-    new = {}
-    for line in open(campaign):
-        d = json.loads(line)
-        if d.get("phase") == "calibrate" and d.get("ok") and d.get("K"):
-            new[bucket(float(d["dm"]), int(d["width"]))] = (float(d["dm"]), int(d["width"]),
-                                                            float(d["K"]))
+    new = {bucket(dm, w): (dm, w, k) for dm, w, k, _s in load_k2x(campaign)}
     for b, (dm, w, k2) in sorted(new.items()):
         if b in old:
             out.append((dm, w, k2, float(old[b])))
@@ -120,6 +115,12 @@ def fig_gain(z, kpairs):
         dm = np.array([p[0] for p in kpairs])
         w_ms = np.array([p[1] for p in kpairs]) * 32.768e-3
         r = np.array([p[2] / p[3] for p in kpairs])
+        model_r = np.array([model_eta(z, "prop_ns4", d, w, Q_2X) / model_eta(z, "current", d, w)
+                            for d, w in zip(dm, w_ms)])
+        f = float(np.median(r / model_r))
+        g = band_mean(z, "prop_ns4", 100, 1500) * Q_2X / band_mean(z, "current", 100, 1500)
+        ax.plot(W, g * f, color=INK2, ls="-.", lw=1.4,
+                label=f"model x {f:.2f} (median measured / model), DM 100-1500")
         ax.scatter(w_ms, r, s=26, color=C1X, edgecolor=SURF, linewidth=1.0, zorder=3,
                    label="measured: injection K(2x) / K(1x), per (DM, width) bucket")
         for x, y, d in zip(w_ms, r, dm):
@@ -151,13 +152,18 @@ def model_eta(z, key, dm, w_ms, q=1.0):
 
 def load_k2x(campaign: str | None):
     """[(dm, width_native, K, observed_snr)] of every ok calibrate probe (last one per bucket)."""
-    if not campaign or not os.path.exists(campaign):
+    files = [f for f in (campaign or "").split(",") if f and os.path.exists(f)]
+    if not files:
         return []
-    got = {}
-    for line in open(campaign):
-        d = json.loads(line)
+    got = {}                                       # a later file's probe of a bucket replaces an earlier one
+    for d in (json.loads(line) for f in files for line in open(f)):
         if d.get("phase") == "calibrate" and d.get("ok") and d.get("K"):
-            got[(float(d["dm"]), int(d["width"]))] = float(d["K"]), float(d.get("observed_snr", 0))
+            s0 = float(d.get("observed_snr") or 0)
+            s1 = float((d.get("settled_best") or {}).get("observed_snr") or 0)
+            k = float(d["K"])
+            if s0 > 0 and s1 > s0:                 # the endpoint took K from an early, weaker match
+                k, s0 = k * s1 / s0, s1
+            got[(float(d["dm"]), int(d["width"]))] = k, s0
     return [(dm, w, k, s) for (dm, w), (k, s) in sorted(got.items())]
 
 

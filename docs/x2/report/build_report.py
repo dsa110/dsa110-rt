@@ -229,6 +229,9 @@ def build():
 
     s += [P("Found and fixed while deploying", H2)]
     s += bullets(D["fixed_in_deploy"])
+    if D.get("incidents"):
+        s += [P("Incidents on the first day of 2x observing", H2)]
+        s += bullets(D["incidents"])
 
     # ---------------------------------------------------------------- operating
     s += [PageBreak(), P("Operating it", H2)]
