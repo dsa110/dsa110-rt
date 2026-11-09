@@ -482,12 +482,15 @@ class GpuBackend:
         N = self.eng.cfg.n_grid
         l_pix, m_pix = (int(v) for v in reduce_pix)
         with _OnStream(self.low):
+            img = ring
             if normalise:
                 sig, _f = self.eng.sigma_at(spec.d, rows)
                 sig_t = torch.from_numpy(np.asarray(sig, np.float32)).to(self.dev)
-                img = (ring.float() / sig_t[:, :, None]).half()
-            else:
-                img = ring
+                # in place, one row at a time: no batch-sized fp32 copy (the
+                # search GPUs run with ~1 GB free; the old path's peak was
+                # ring + ring.float())
+                for i in range(n):
+                    img[i] = (img[i].float() / sig_t[i, :, None]).half()
             peak, pix = torch.max(img, dim=2)               # first max, as np.argmax
             lc = (img[:, :, l_pix * N + m_pix] if l_pix >= 0 and m_pix >= 0 else None)
             host = img.cpu()

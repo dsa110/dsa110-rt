@@ -7,16 +7,18 @@ Flow per request (``docs/x2/downstream_inventory.md`` §3.4):
    a 64-B DSRT v1 packet is counted (``c2_trigger_v1_ignored``) and ignored.
 2. **Enqueue** (depth 8, FAILED/QUEUE_FULL beyond); MANUAL requests are
    served after triggered ones; send ACCEPTED (64-B ``DSCS`` to C2:11501).
-3. **Raw snapshot** (RAW_ARCHIVE): per owned coarse DM the ring-v4 rows of
-   every stream covering ``[t_peak - raw_pre, t_peak + raw_post)`` plus the
-   stage-2 extents, written verbatim with WS-D's D4 ``raw_archive``
-   (``write_raw_slab`` per DM, ``write_raw_meta``, ``mark_raw_ok`` last) --
-   a start that rotated out is TOO_LATE, a window not complete by
-   ``deadline_s`` is zero-filled and flagged.
-4. **Cutout**: every owned fine re-imaged over ``[t0, t0 + n_t)`` on the
-   low-priority stream (``OwnerEngine.reimage_iter``) from the snapshot (or
-   the ring), normalised with the Layer-1 sigma applied at detection;
-   tier-B rows are EXACT duplicates on ext rows 2k and 2k+1 (one tier
+3. **Copy at accept** (``capture``, on the socket thread): per owned coarse
+   DM the ring-v4 rows of every stream covering the cutout window and, with
+   RAW_ARCHIVE, ``[t_peak - raw_pre, t_peak + raw_post)``, plus the stage-2
+   extents -- before they rotate out of the 20 s ring (a window not released
+   by ``deadline_s``, or already rotated out, is TOO_LATE). A builder thread
+   serves the queue: the raw window is written verbatim with WS-D's D4
+   ``raw_archive`` (``write_raw_slab`` per DM, ``write_raw_meta``,
+   ``mark_raw_ok`` last; nothing when no DM has rows).
+4. **Cutout**: every owned fine re-imaged ONCE over ``[t0, t0 + n_t)`` on
+   the low-priority stream (``OwnerEngine.reimage_iter``) from the copy (or
+   the ring), with the per-fine reductions on the GPU, normalised with the
+   Layer-1 sigma applied at detection; tier-B rows are EXACT duplicates on ext rows 2k and 2k+1 (one tier
    sample, one image, two references -- C3's apex lookup relies on it);
    assembled by WS-D's ``x2.cutout.schema.assemble_cutout`` (the reference)
    and written with ``write_cutout`` (npz, then the json manifest).
@@ -36,7 +38,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -308,6 +310,10 @@ class CutoutProducer:
         self._q: list = []
         self._seq = itertools.count()
         self._seen: Dict[tuple, int] = {}
+        self._lock = threading.Lock()
+        self._held: Dict[tuple, CutoutRequest] = {}            # accepted, rows not copied yet
+        self._snaps: Dict[tuple, tuple] = {}                   # key -> copy_rows() result
+        self.last_capture_ms = 0
         self.counters = dict(requests=0, accepted=0, done=0, partial=0, failed=0,
                              failed_queue_full=0, failed_plan_mismatch=0, failed_bad_request=0,
                              failed_too_late=0, c2_trigger_v1_ignored=0)
@@ -316,8 +322,10 @@ class CutoutProducer:
     def t_ext_us(self) -> float:
         return float(self.eng.plan.ext_period_us)
 
-    def offer(self, buf: bytes) -> Optional[tuple]:
-        """Packet in -> ``(request, state, reason)`` to report, or None."""
+    def offer(self, buf: bytes, *, hold: bool = False) -> Optional[tuple]:
+        """Packet in -> ``(request, state, reason)`` to report, or None.
+        With ``hold`` an accepted request is queued only by :meth:`capture`
+        (the listener copies its rows first)."""
         if len(buf) == 64:
             self.counters["c2_trigger_v1_ignored"] += 1
             return None
@@ -335,62 +343,125 @@ class CutoutProducer:
                           else "failed_bad_request"] += 1
             self._seen[req.key] = FAILED
             return req, FAILED, why
-        if len(self._q) >= self.queue_depth:
-            self.counters["failed"] += 1
-            self.counters["failed_queue_full"] += 1
-            self._seen[req.key] = FAILED
-            return req, FAILED, R_QUEUE_FULL
-        heapq.heappush(self._q, (1 if req.is_manual else 0, next(self._seq), req))
-        self._seen[req.key] = ACCEPTED
+        with self._lock:
+            if len(self._q) + len(self._held) >= self.queue_depth:
+                self.counters["failed"] += 1
+                self.counters["failed_queue_full"] += 1
+                self._seen[req.key] = FAILED
+                return req, FAILED, R_QUEUE_FULL
+            if hold:
+                self._held[req.key] = req
+            else:
+                heapq.heappush(self._q, (1 if req.is_manual else 0, next(self._seq), req))
+            self._seen[req.key] = ACCEPTED
         self.counters["accepted"] += 1
         return req, ACCEPTED, R_OK
 
     def next_request(self) -> Optional[CutoutRequest]:
-        return heapq.heappop(self._q)[2] if self._q else None
+        with self._lock:
+            return heapq.heappop(self._q)[2] if self._q else None
+
+    def capture(self, req: CutoutRequest) -> bool:
+        """At ACCEPT: copy the request's rows out of the ring before they
+        rotate out (retention 20 s; C2's request arrives ~8 s after the
+        burst), then queue it. False if ``req`` was not held (duplicate).
+        (G2 2026-11-09: copying only when a request was served let a
+        backlog of slow builds lap every later window -- empty cutouts and
+        ~9 GB raw windows of invalid rows.)"""
+        with self._lock:
+            if self._held.pop(req.key, None) is None:
+                return False
+        t = time.monotonic()
+        try:
+            got = self.copy_rows(req)
+        except Exception:                                       # noqa: BLE001
+            got = None                                          # serve() copies (and fails) itself
+        self.last_capture_ms = int(1e3 * (time.monotonic() - t))
+        with self._lock:
+            if got is not None:
+                self._snaps[req.key] = got
+            heapq.heappush(self._q, (1 if req.is_manual else 0, next(self._seq), req))
+        return True
 
     # ------------------------------------------------------------------
-    def raw_snapshot(self, req: CutoutRequest, out_dir: Optional[Path] = None) -> tuple:
-        """Per owned DM ``(raw, valid, row0)`` covering the raw window plus the
-        stage-2 extents (``raw_archive.stream_window``); written with WS-D's
-        D4 ``write_raw_slab`` per DM, then ``write_raw_meta``, then
-        ``mark_raw_ok`` LAST (readers trust only RAW_OK dirs)."""
-        from ..cutout.raw_archive import mark_raw_ok, stream_window, write_raw_meta, \
-            write_raw_slab
-        from .codec import as_stream_formats
+    def _windows(self, req: CutoutRequest, spec) -> tuple:
+        """``((s_lo, n) raw window or None, (s_lo, n) cutout window)`` in tier rows."""
+        from ..cutout.raw_archive import stream_window
 
+        kw = dict(ext_factor=self.eng.plan.ext_factor(spec), max_pos=spec.max_pos,
+                  max_neg=spec.max_neg)
+        cut = stream_window(req.t0_ext, 0, req.n_t, **kw)
+        raw = (stream_window(req.t_peak_ext, req.raw_pre_ext, req.raw_post_ext, **kw)
+               if req.flags & FLAG_RAW else None)
+        return raw, cut
+
+    def copy_rows(self, req: CutoutRequest) -> tuple:
+        """Per owned DM ``(raw, valid, row0)`` covering the cutout window and,
+        with RAW_ARCHIVE, the raw window (``raw_archive.stream_window``) ->
+        ``(snaps, too_late, raw_bytes)``. A window not released by
+        ``deadline_s``, or whose rows have all rotated out, is TOO_LATE."""
         snaps, too_late, raw_bytes = {}, [], 0
         for spec in self.eng.plan.dms:
-            s_lo, n = stream_window(req.t_peak_ext, req.raw_pre_ext, req.raw_post_ext,
-                                    ext_factor=self.eng.plan.ext_factor(spec),
-                                    max_pos=spec.max_pos, max_neg=spec.max_neg)
+            rw, cw = self._windows(req, spec)
+            lo, hi = cw[0], cw[0] + cw[1]
+            if rw is not None:
+                lo, hi = min(lo, rw[0]), max(hi, rw[0] + rw[1])
             try:
-                raw, valid = self.eng.ring.wait_window(spec.d, s_lo, n,
+                raw, valid = self.eng.ring.wait_window(spec.d, lo, hi - lo,
                                                        timeout_s=float(req.deadline_s))
             except TimeoutError:
                 too_late.append(spec.d)
                 continue
-            snaps[spec.d] = (raw, valid, s_lo)
+            if not np.asarray(valid).any():                        # lapped: nothing to keep
+                too_late.append(spec.d)
+                continue
+            snaps[spec.d] = (raw, valid, lo)
             raw_bytes += raw.nbytes
-            if out_dir is not None:
-                inp = self.eng.states[spec.d].inp
-                fm = as_stream_formats(inp.fmt, spec.n_stream)
-                extra = dict(n_values=np.array([f.n_values for f in fm.per_stream], np.int32),
-                             n_heavy=np.array([getattr(f, "n_heavy", 0) for f in fm.per_stream],
-                                              np.int32),
-                             bits_main=np.int32(2 * getattr(fm.per_stream[0], "bits", 8)),
-                             n_grid=np.int32(self.eng.cfg.n_grid))
-                if inp.pattern_id is not None:
-                    extra["pattern_id"] = np.uint64(int(inp.pattern_id))
-                write_raw_slab(out_dir, codes=np.ascontiguousarray(raw, dtype=np.uint8),
-                               valid=np.asarray(valid).astype(np.uint8), row0=int(s_lo),
-                               t_native=int(spec.t_native), d=int(spec.d), shifts=spec.shifts,
-                               fine_global=spec.fine_global, **extra)
-        if out_dir is not None:
-            Path(out_dir).mkdir(parents=True, exist_ok=True)
-            write_raw_meta(out_dir, req, identity=dict(
-                search_node_id=self.sid, gpu_half=self.g, half_index=self.eng.plan.half,
-                opoint=self.eng.plan.opoint, plan_id=self.plan_id), too_late=too_late)
-            mark_raw_ok(out_dir)
+        return snaps, too_late, raw_bytes
+
+    def write_raw(self, req: CutoutRequest, snaps: dict, too_late: list, out_dir: Path) -> int:
+        """The raw window of every snapshot DM with WS-D's D4 ``write_raw_slab``,
+        then ``write_raw_meta``, then ``mark_raw_ok`` LAST (readers trust only
+        RAW_OK dirs). Nothing is written when no DM has rows. Returns bytes."""
+        from ..cutout.raw_archive import mark_raw_ok, write_raw_meta, write_raw_slab
+        from .codec import as_stream_formats
+
+        if not snaps:
+            return 0
+        n_bytes = 0
+        for spec in self.eng.plan.dms:
+            if spec.d not in snaps:
+                continue
+            raw, valid, row0 = snaps[spec.d]
+            s_lo, n = self._windows(req, spec)[0]
+            a = s_lo - int(row0)
+            codes = np.ascontiguousarray(raw[:, a:a + n], dtype=np.uint8)
+            inp = self.eng.states[spec.d].inp
+            fm = as_stream_formats(inp.fmt, spec.n_stream)
+            extra = dict(n_values=np.array([f.n_values for f in fm.per_stream], np.int32),
+                         n_heavy=np.array([getattr(f, "n_heavy", 0) for f in fm.per_stream],
+                                          np.int32),
+                         bits_main=np.int32(2 * getattr(fm.per_stream[0], "bits", 8)),
+                         n_grid=np.int32(self.eng.cfg.n_grid))
+            if inp.pattern_id is not None:
+                extra["pattern_id"] = np.uint64(int(inp.pattern_id))
+            write_raw_slab(out_dir, codes=codes,
+                           valid=np.asarray(valid[:, a:a + n]).astype(np.uint8), row0=int(s_lo),
+                           t_native=int(spec.t_native), d=int(spec.d), shifts=spec.shifts,
+                           fine_global=spec.fine_global, **extra)
+            n_bytes += codes.nbytes
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        write_raw_meta(out_dir, req, identity=dict(
+            search_node_id=self.sid, gpu_half=self.g, half_index=self.eng.plan.half,
+            opoint=self.eng.plan.opoint, plan_id=self.plan_id), too_late=too_late)
+        mark_raw_ok(out_dir)
+        return n_bytes
+
+    def raw_snapshot(self, req: CutoutRequest, out_dir: Optional[Path] = None) -> tuple:
+        """:meth:`copy_rows` now, then (``out_dir``, RAW_ARCHIVE) :meth:`write_raw`."""
+        snaps, too_late, raw_bytes = self.copy_rows(req)
+        if out_dir is not None and req.flags & FLAG_RAW:
+            self.write_raw(req, snaps, too_late, out_dir)
         return snaps, too_late, raw_bytes
 
     def build_arrays(self, req: CutoutRequest, snaps: Optional[dict] = None) -> tuple:
@@ -421,30 +492,37 @@ class CutoutProducer:
         return arrays, status
 
     def serve(self, req: CutoutRequest, *, event_dir: Path) -> tuple:
-        """Run one job; returns ``(state, reason, info)``. Uploads (when
-        ``uploaders`` are set): the cutout first, then the raw window (D4)."""
+        """Run one job; returns ``(state, reason, info)``. Rows copied by
+        :meth:`capture` are used, else copied now. Uploads (when ``uploaders``
+        are set): the cutout first, then the raw window (D4)."""
         from ..cutout.schema import write_cutout
 
         t_start = time.monotonic()
-        snaps, too_late, raw_bytes = ({}, [], 0)
         raw_dir = event_dir / "raw" / f"raw_s{self.sid}_g{self.g}"
-        if req.flags & FLAG_RAW:
-            snaps, too_late, raw_bytes = self.raw_snapshot(req, raw_dir)
+        with self._lock:
+            got = self._snaps.pop(req.key, None)
+        raw_bytes = 0
         try:
+            snaps, too_late, _n = got if got is not None else self.copy_rows(req)
+            if req.flags & FLAG_RAW:
+                raw_bytes = self.write_raw(req, snaps, too_late, raw_dir)
             arrays, status = self.build_arrays(req, snaps)
             path, _manifest = write_cutout(event_dir / "cutouts", arrays)
         except Exception as e:                                  # noqa: BLE001
             self.counters["failed"] += 1
+            with self._lock:
+                self._seen[req.key] = FAILED
             return FAILED, R_IO, dict(error=repr(e))
         if self.uploaders is not None:
             cut_up, raw_up = self.uploaders
             cut_up.submit(req.event_name, event_dir / "cutouts")
-            if req.flags & FLAG_RAW:
+            if raw_bytes:
                 raw_up.submit(req.event_name, raw_dir)
         self.last_latency_ms = int(1e3 * (time.monotonic() - t_start))
         state = DONE if (status == "complete" and not too_late) else PARTIAL
         self.counters["done" if state == DONE else "partial"] += 1
-        self._seen[req.key] = state
+        with self._lock:
+            self._seen[req.key] = state
         return state, (R_TOO_LATE if too_late else R_OK), dict(
             path=str(path), raw_bytes=raw_bytes, too_late=too_late,
             latency_ms=int(1e3 * (time.monotonic() - t_start)))
@@ -492,23 +570,39 @@ class CutoutListener:
                                  n_ok=n if state == DONE else 0, **kw))
 
     def run(self) -> None:
+        """Socket thread: validate, ACK, copy the rows (``capture``); a builder
+        thread serves the queue, so a slow build never delays a copy."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(self.addr)
         self._sock.settimeout(0.2)
+        ready = threading.Event()
+        builder = threading.Thread(target=self._build_loop, args=(ready,), daemon=True,
+                                   name=f"x2-cutout-build-g{self.p.g}")
+        builder.start()
         while not self._stop.is_set():
             try:
                 buf, _a = self._sock.recvfrom(256)
-                got = self.p.offer(buf)
-                if got is not None:
-                    self._status(got[0], got[1], got[2])
             except socket.timeout:
-                pass
-            req = self.p.next_request()
-            if req is not None:
-                state, reason, info = self.p.serve(req, event_dir=self.event_root / req.event_name)
-                self._status(req, state, reason, raw_bytes=info.get("raw_bytes", 0),
-                             latency_ms=info.get("latency_ms", 0))
+                continue
+            got = self.p.offer(buf, hold=True)
+            if got is None:
+                continue
+            self._status(got[0], got[1], got[2])
+            if got[1] == ACCEPTED and self.p.capture(got[0]):
+                ready.set()
         self._sock.close()
+        builder.join(timeout=5.0)
+
+    def _build_loop(self, ready: threading.Event) -> None:
+        while not self._stop.is_set():
+            req = self.p.next_request()
+            if req is None:
+                ready.wait(0.2)
+                ready.clear()
+                continue
+            state, reason, info = self.p.serve(req, event_dir=self.event_root / req.event_name)
+            self._status(req, state, reason, raw_bytes=info.get("raw_bytes", 0),
+                         latency_ms=info.get("latency_ms", 0))
 
     def stop(self) -> None:
         self._stop.set()

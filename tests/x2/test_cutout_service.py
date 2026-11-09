@@ -397,8 +397,8 @@ def test_gpu_backend_reduce_batch_matches_reduce_images_on_its_own_float16_image
                            dev="cpu", low=SimpleNamespace(synchronize=lambda: None))
     spec = SimpleNamespace(d=0)
     for normalise, pix in ((True, (10, 12)), (False, (-1, -1))):
-        img, red = gpu_backend.GpuBackend._reduce_batch(fake, torch.from_numpy(ring), np.arange(n),
-                                                        spec, normalise, pix)
+        img, red = gpu_backend.GpuBackend._reduce_batch(      # normalises in place: a copy
+            fake, torch.from_numpy(ring.copy()), np.arange(n), spec, normalise, pix)
         want = ring.astype(np.float32)
         if normalise:
             want = want / sig.astype(np.float32)[:, :, None]
@@ -408,3 +408,70 @@ def test_gpu_backend_reduce_batch_matches_reduce_images_on_its_own_float16_image
             assert got.dtype == ref.dtype and np.array_equal(got, ref)
         if not normalise:
             assert np.all(red[1] == 5)
+
+
+def _lap_ring(eng):
+    """Push a whole ring's worth of zero rows on every DM: every earlier row rotates out."""
+    for s in eng.plan.dms:
+        nb = eng.ring.row_format(s.d).row_bytes
+        eng.ring.push(s.d, eng.ring.write_pos(s.d), np.zeros((s.n_stream, 4096, nb), np.uint8))
+
+
+def test_rows_copied_at_accept_survive_the_ring_lapping_the_window(tmp_path):
+    """G2 2026-11-09: rows copied only when a request was SERVED -- behind a
+    backlog the 20 s ring had lapped them (empty cutouts, raw windows of
+    invalid rows). A held request is queued once ``capture`` copied its rows;
+    an uncopied lapped window is TOO_LATE and archives nothing."""
+    from dsart.x2.search.cutout_service import DONE, PARTIAL, R_TOO_LATE
+
+    eng = _engine()
+    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path, plan=_axis_plan(eng))
+    req = _req()
+    assert p.offer(encode_request(req), hold=True)[1] == ACCEPTED
+    assert p.next_request() is None                           # held until its rows are copied
+    assert p.capture(req) and not p.capture(req)              # a duplicate is not copied twice
+    late = _req(request_id=8, event_name="261022late")
+    assert p.offer(encode_request(late))[1] == ACCEPTED       # queued, nothing copied
+    _lap_ring(eng)
+    st, why, info = p.serve(p.next_request(), event_dir=tmp_path / req.event_name)
+    assert (st, why) == (DONE, 0) and not info["too_late"] and info["raw_bytes"] > 0, info
+    st2, why2, info2 = p.serve(p.next_request(), event_dir=tmp_path / late.event_name)
+    assert (st2, why2) == (PARTIAL, R_TOO_LATE)
+    assert sorted(info2["too_late"]) == sorted(s.d for s in eng.plan.dms)
+    assert info2["raw_bytes"] == 0 and not (tmp_path / late.event_name / "raw").exists()
+
+
+def test_listener_copies_on_the_socket_thread_and_builds_on_a_worker(tmp_path):
+    import socket
+    import time
+
+    from dsart.x2.search.cutout_service import DONE, STATUS_STRUCT, CutoutListener
+
+    eng = _engine()
+    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path, plan=_axis_plan(eng))
+    st_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    st_sock.bind(("127.0.0.1", 0))
+    st_sock.settimeout(30.0)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    base = probe.getsockname()[1]
+    probe.close()
+    lis = CutoutListener(p, bind_host="127.0.0.1", base_port=base, c2_host="127.0.0.1",
+                         status_port=st_sock.getsockname()[1], event_root=tmp_path)
+    import threading
+    th = threading.Thread(target=lis.run, daemon=True)
+    th.start()
+    try:
+        time.sleep(0.3)
+        req = _req()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(encode_request(req), ("127.0.0.1", base))
+        states = [STATUS_STRUCT.unpack(st_sock.recvfrom(256)[0])[2] for _ in range(2)]
+        assert states == [ACCEPTED, DONE]
+        assert (tmp_path / req.event_name / "cutouts" / "cutout_s0_g0.json").is_file()
+        assert (tmp_path / req.event_name / "raw" / "raw_s0_g0" / "RAW_OK.json").is_file()
+    finally:
+        lis.stop()
+        th.join(timeout=10)
+        st_sock.close()
+    assert not th.is_alive()
