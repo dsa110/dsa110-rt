@@ -23,7 +23,8 @@ from dsart.x2.search.codec import RowFormat
 from dsart.x2.search.cutout_service import (ACCEPTED, FAILED, FLAG_MANUAL, R_BAD_REQUEST,
                                             R_PLAN_MISMATCH, R_QUEUE_FULL, CutoutImages,
                                             CutoutProducer, CutoutRequest, decode_request,
-                                            encode_request, encode_status)
+                                            encode_request, encode_status,
+                                            fine_axis_for_owner)
 from dsart.x2.search.engine import EngineConfig, OwnerEngine
 from dsart.x2.search.geometry import owner_plan_from_tiers
 from dsart.x2.search.ring import MemoryRing
@@ -177,6 +178,42 @@ def test_end_to_end_with_ws_d_schema(tmp_path):
     fb = 3                                                    # first tier-B plane fine
     assert np.array_equal(pg[0::2, fb], pg[1::2, fb])
     assert np.array_equal(cut["sigma_applied"][0::2, fb], cut["sigma_applied"][1::2, fb])
+
+
+def test_reductions_alongside_the_images_equal_the_reference_and_reimage_once(tmp_path):
+    """The producer's per-fine reductions (GPU in production; the CPU twin
+    here) give the SAME cutout arrays as assemble_cutout's reference path on
+    the same float16 images, and each owned DM is re-imaged once per request
+    (G2 2026-11-09: an LRU of 2 DMs re-imaged each ~12 times)."""
+    schema = pytest.importorskip("dsart.x2.cutout.schema")
+    eng = _engine()
+    calls = []
+    real = eng.reimage_iter
+
+    def counted(d, *a, **kw):
+        calls.append(d)
+        return real(d, *a, **kw)
+
+    eng.reimage_iter = counted
+    p = CutoutProducer(eng, search_node_id=0, gpu_half=0, out_root=tmp_path, plan=_axis_plan(eng))
+    for req in (_req(), _req(l_pix=-1, m_pix=-1, stamp_half_px=0)):
+        calls.clear()
+        fast, _status = p.build_arrays(req)
+        assert sorted(calls) == sorted(s.d for s in eng.plan.dms)
+        src = CutoutImages(eng, t0_ext=req.t0_ext, n_t=req.n_t, pix=(req.l_pix, req.m_pix))
+        ref = schema.assemble_cutout(
+            axis=fine_axis_for_owner(eng.plan, _axis_plan(eng),
+                                     t_ext_native=eng.plan.ext_native),
+            images=lambda f: src(f),
+            n_t=req.n_t, sigma_applied=src.sigma_applied(), row_valid=src.valid()[0],
+            input_valid_frac=src.valid()[1], request=req,
+            identity=dict(search_node_id=0, gpu_half=0), clock=dict(t_ext_us=524.288,
+                                                                     native_per_ext=16),
+            geometry=dict(n_grid=N))
+        for k in ("peak_grid", "peak_pix", "pix_lc", "apex_t", "apex_f", "apex_image",
+                  "peak_image", "peak_image_w", "stamp"):
+            assert np.array_equal(fast[k], ref[k], equal_nan=fast[k].dtype.kind == "f"), k
+        assert fast["pix_lc"].shape[0] == (req.n_t if req.l_pix >= 0 else 0)
 
 
 class _SV:
@@ -336,3 +373,38 @@ def test_cutout_axis_is_the_engines_owned_dms(tmp_path):
     ref = schema.fine_axis_for_half(view, 0, t_ext_native=16)
     for key in ref:
         assert np.array_equal(whole[key], ref[key]) and whole[key].dtype == ref[key].dtype, key
+
+
+def test_gpu_backend_reduce_batch_matches_reduce_images_on_its_own_float16_images(monkeypatch):
+    """GpuBackend._reduce_batch's torch logic (run here on CPU tensors):
+    normalised float16 images = (ring / sigma) rounded once, and its
+    reductions == reduce_images of those images, incl. first-max ties."""
+    import contextlib
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    from dsart.x2.cutout.schema import reduce_images
+    from dsart.x2.search import gpu_backend
+
+    monkeypatch.setattr(gpu_backend, "_OnStream", lambda s: contextlib.nullcontext())
+    rng = np.random.default_rng(3)
+    n, F = 6, 4
+    ring = rng.normal(size=(n, F, N * N)).astype(np.float16)
+    ring[:, :, 17] = ring[:, :, 5] = 9.0                      # tied maxima: first wins
+    sig = rng.uniform(0.3, 1.5, size=(n, F))
+    fake = SimpleNamespace(eng=SimpleNamespace(cfg=SimpleNamespace(n_grid=N),
+                                               sigma_at=lambda d, rows: (sig, None)),
+                           dev="cpu", low=SimpleNamespace(synchronize=lambda: None))
+    spec = SimpleNamespace(d=0)
+    for normalise, pix in ((True, (10, 12)), (False, (-1, -1))):
+        img, red = gpu_backend.GpuBackend._reduce_batch(fake, torch.from_numpy(ring), np.arange(n),
+                                                        spec, normalise, pix)
+        want = ring.astype(np.float32)
+        if normalise:
+            want = want / sig.astype(np.float32)[:, :, None]
+        want = want.astype(np.float16).reshape(n, F, N, N)
+        assert img.dtype == np.float16 and np.array_equal(img.view(np.uint16), want.view(np.uint16))
+        for got, ref in zip(red, reduce_images(want, *pix)):
+            assert got.dtype == ref.dtype and np.array_equal(got, ref)
+        if not normalise:
+            assert np.all(red[1] == 5)

@@ -191,21 +191,24 @@ def fine_axis_for_owner(oplan, plan=None, *, t_ext_native: int) -> Dict[str, np.
 class CutoutImages:
     """Per-fine image source over EXTERNAL rows ``[t0_ext, t0_ext + n_t)``.
 
-    One owned DM at a time is re-imaged (all its fines, tier rows covering
-    the window) and cached (LRU of ``cache_dms``); a tier-B fine's ext rows
-    2k, 2k+1 reference the SAME tier image, so they are bit-identical.
+    Each owned DM is re-imaged ONCE (all its fines, tier rows covering the
+    window) and kept for the request as float16, with the ``reduce_images``
+    reductions at pixel ``pix`` computed alongside (on the GPU in
+    production); a tier-B fine's ext rows 2k, 2k+1 reference the SAME tier
+    image, so they are bit-identical. (G2 2026-11-09: an LRU of 2 DMs over a
+    half's 3 re-imaged each DM ~12 times per request -- cutouts took
+    150-190 s against C2's 120 s wait.)
     """
 
     def __init__(self, engine, *, t0_ext: int, n_t: int,
-                 raw: Optional[Dict[int, tuple]] = None,
-                 cache_dms: int = 2, batch_rows: int = 32) -> None:
+                 raw: Optional[Dict[int, tuple]] = None, pix: tuple = (-1, -1),
+                 batch_rows: int = 32) -> None:
         self.eng = engine
         self.t0 = int(t0_ext)
         self.n_t = int(n_t)
         self.raw = raw or {}
+        self.pix = (int(pix[0]), int(pix[1]))
         self.cache: "Dict[int, dict]" = {}
-        self.order: List[int] = []
-        self.cache_dms = int(cache_dms)
         self.batch_rows = int(batch_rows)
         self.specs = [s for s in sorted(engine.plan.dms, key=lambda s: s.d)]
         self.offsets = np.concatenate([[0], np.cumsum([s.n_fdm for s in self.specs])])
@@ -220,21 +223,30 @@ class CutoutImages:
         tlo, thi = int(t_rows[0]), int(t_rows[-1]) + 1
         snap = self.raw.get(spec.d)
         kw = {} if snap is None else dict(raw=snap[0], valid=snap[1], raw_row0=int(snap[2]))
-        imgs, sig, vf = [], [], []
-        for rows, img, v in self.eng.reimage_iter(spec.d, tlo, thi, batch_rows=self.batch_rows,
-                                                  normalise=True, **kw):
-            imgs.append(img.astype(np.float16))
+        N = self.eng.cfg.n_grid
+        F = spec.n_fdm
+        tier_img = np.empty((thi - tlo, F, N, N), dtype=np.float16)
+        peak = np.empty((thi - tlo, F), dtype=np.float32)
+        ppix = np.empty((thi - tlo, F), dtype=np.int32)
+        lc = np.empty((thi - tlo if self.pix[0] >= 0 and self.pix[1] >= 0 else 0, F),
+                      dtype=np.float32)
+        sig, vf = [], []
+        for rows, img, v, red in self.eng.reimage_iter(
+                spec.d, tlo, thi, batch_rows=self.batch_rows, normalise=True,
+                reduce_pix=self.pix, **kw):
+            a, b = int(rows[0]) - tlo, int(rows[-1]) + 1 - tlo
+            tier_img[a:b] = img
+            peak[a:b], ppix[a:b] = red[0], red[1]
+            if lc.shape[0]:
+                lc[a:b] = red[2]
             s, _found = self.eng.sigma_at(spec.d, rows)
             sig.append(s)
             vf.append((len(rows), v))
-        tier_img = np.concatenate(imgs, axis=0)                  # [n_tier, F_d, N, N]
         idx = t_rows - tlo                                       # ext row -> tier row
         ent = dict(img=tier_img, idx=idx, sigma=np.concatenate(sig, axis=0)[idx],
+                   peak=peak[idx], pix=ppix[idx], lc=lc[idx] if lc.shape[0] else lc,
                    valid_frac=float(sum(n * v for n, v in vf) / max(1, sum(n for n, _ in vf))))
         self.cache[spec.d] = ent
-        self.order.append(spec.d)
-        while len(self.order) > self.cache_dms:
-            self.cache.pop(self.order.pop(0), None)
         return ent
 
     def block_of(self, f: int) -> tuple:
@@ -246,6 +258,14 @@ class CutoutImages:
         k, fl = self.block_of(f)
         ent = self._dm(k)
         return ent["img"][ent["idx"], fl]                       # tier-B: duplicated rows
+
+    def reduced(self, f: int) -> tuple:
+        """``reduce_images`` of plane fine ``f`` over the window rows:
+        ``(peak [n_t], pix [n_t], lc [n_t] or [0])`` -- what
+        ``assemble_cutout`` would compute from ``self(f)``, without it."""
+        k, fl = self.block_of(f)
+        ent = self._dm(k)
+        return ent["peak"][:, fl], ent["pix"][:, fl], ent["lc"][:, fl]
 
     def sigma_applied(self) -> np.ndarray:
         out = np.zeros((self.n_t, int(self.offsets[-1])), dtype=np.float32)
@@ -378,7 +398,8 @@ class CutoutProducer:
         from ..cutout.schema import assemble_cutout
 
         t0 = int(req.t0_ext)
-        src = CutoutImages(self.eng, t0_ext=t0, n_t=int(req.n_t), raw=snaps or {})
+        src = CutoutImages(self.eng, t0_ext=t0, n_t=int(req.n_t), raw=snaps or {},
+                           pix=(int(req.l_pix), int(req.m_pix)))
         # the engine's own DMs (not the whole half's: an engine may own a subset)
         axis = fine_axis_for_owner(self.eng.plan, self.plan,
                                    t_ext_native=self.eng.plan.ext_native)

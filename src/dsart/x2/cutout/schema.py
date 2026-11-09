@@ -544,7 +544,19 @@ def assemble_cutout(
     peak_grid = np.zeros((n_t, n_f), dtype=np.float32)
     peak_pix = np.zeros((n_t, n_f), dtype=np.int32)
     pix_lc = np.zeros((n_t if has_pix else 0, n_f), dtype=np.float32)
+    # A source that already reduced its images at this pixel (the production
+    # producer, on the GPU) supplies reduce_images' outputs per fine.
+    reduced = (getattr(images, "reduced", None)
+               if tuple(getattr(images, "pix", ())) == (l_req, m_req) else None)
     for f in range(n_f):
+        if reduced is not None:
+            pg, pp, lc = reduced(f)
+            if pg.shape != (n_t,) or pp.shape != (n_t,):
+                raise CutoutError(f"fine {f}: reductions {pg.shape}, expected {(n_t,)}")
+            peak_grid[:, f], peak_pix[:, f] = pg, pp
+            if has_pix:
+                pix_lc[:, f] = lc
+            continue
         rows = _image_rows(images, f)
         if rows.shape != (n_t, n_grid, n_grid):
             raise CutoutError(f"fine {f}: images {rows.shape}, expected "

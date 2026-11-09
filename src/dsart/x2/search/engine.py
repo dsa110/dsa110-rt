@@ -659,14 +659,22 @@ class OwnerEngine:
 
     def reimage_iter(self, d: int, t_lo: int, t_hi: int, *, raw: Optional[np.ndarray] = None,
                      valid: Optional[np.ndarray] = None, raw_row0: Optional[int] = None,
-                     batch_rows: int = 32, normalise: bool = True):
+                     batch_rows: int = 32, normalise: bool = True,
+                     reduce_pix: Optional[tuple] = None):
         """Re-image tier rows ``[t_lo, t_hi)`` of DM ``d`` for every fine DM,
         from a raw snapshot (``raw [S, n, row_bytes]`` covering stream rows
         ``[t_lo - max_pos, t_hi + max_neg)``) or the ring, into a private
         scratch stream ring (the live DM state is untouched; on the GPU this
         runs on the low-priority stream). Yields ``(rows, images, valid_frac)``
         batches, ``images [n, F, N, N]`` float32, divided by the Layer-1
-        sigma applied at detection when ``normalise``."""
+        sigma applied at detection when ``normalise``.
+
+        ``reduce_pix=(l_pix, m_pix)`` (cutouts; ``(-1, -1)`` = no pixel): yields
+        ``(rows, images, valid_frac, red)`` with ``images`` float16 and ``red`` =
+        ``cutout.schema.reduce_images`` of exactly those float16 values
+        (``peak [n, F]``, ``pix [n, F]``, ``lc [n | 0, F]``), computed on the GPU
+        by the GPU backend (G2 2026-11-09: the host-side reductions and float32
+        copies made cutouts arrive after C2's 120 s wait)."""
         st = self.states[d]
         spec = st.spec
         s_lo, s_hi = t_lo - spec.max_pos, t_hi + spec.max_neg
@@ -690,7 +698,7 @@ class OwnerEngine:
             valid = np.ones(raw.shape[:2], dtype=bool)
         if self._gpu is not None and hasattr(self._gpu, "reimage_iter"):
             yield from self._gpu.reimage_iter(st, t_lo, t_hi, raw, valid, s_lo, batch_rows,
-                                              normalise)
+                                              normalise, reduce_pix=reduce_pix)
             return
         scratch = StreamRing(spec.n_stream, int(st.inp.c_v.shape[1]), s_hi - s_lo + 1)
         k0_rows_to_ring(scratch, raw, valid, row0=int(s_lo), fmt=st.inp.fmt)
@@ -715,7 +723,12 @@ class OwnerEngine:
                 img = img / sig[:, :, None, None]
             sl = scratch.slots(rows[None, :, None] - spec.shifts[:, None, :])  # [F, n, S]
             vf = float(scratch.valid[np.arange(spec.n_stream)[None, None, :], sl].mean())
-            yield rows, img, vf
+            if reduce_pix is None:
+                yield rows, img, vf
+            else:
+                from ..cutout.schema import reduce_images
+                img16 = img.astype(np.float16)
+                yield rows, img16, vf, reduce_images(img16, *reduce_pix)
 
     # ------------------------------------------------------------------
     def detector_input(self, d: int, t_lo: int, t_hi: int, sigma: np.ndarray) -> np.ndarray:

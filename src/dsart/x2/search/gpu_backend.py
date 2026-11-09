@@ -475,8 +475,34 @@ class GpuBackend:
         return out
 
     # ------------------------------------------------------------------
-    def reimage_iter(self, st, t_lo, t_hi, raw, valid, s_lo, batch_rows, normalise):
-        """Re-imaging on the LOW-priority stream into private buffers."""
+    def _reduce_batch(self, ring, rows, spec, normalise, reduce_pix) -> tuple:
+        """``ring [n, F, N*N]`` fp16 -> (float16 host images ``[n, F, N, N]``,
+        ``reduce_images`` of exactly those values), on the low stream."""
+        n, F, NN = (int(v) for v in ring.shape)
+        N = self.eng.cfg.n_grid
+        l_pix, m_pix = (int(v) for v in reduce_pix)
+        with _OnStream(self.low):
+            if normalise:
+                sig, _f = self.eng.sigma_at(spec.d, rows)
+                sig_t = torch.from_numpy(np.asarray(sig, np.float32)).to(self.dev)
+                img = (ring.float() / sig_t[:, :, None]).half()
+            else:
+                img = ring
+            peak, pix = torch.max(img, dim=2)               # first max, as np.argmax
+            lc = (img[:, :, l_pix * N + m_pix] if l_pix >= 0 and m_pix >= 0 else None)
+            host = img.cpu()
+            peak, pix = peak.float().cpu(), pix.to(torch.int32).cpu()
+            lc = lc.float().cpu() if lc is not None else None
+        self.low.synchronize()
+        red = (peak.numpy(), pix.numpy(),
+               lc.numpy() if lc is not None else np.zeros((0, F), dtype=np.float32))
+        return host.numpy().reshape(n, F, N, N), red
+
+    def reimage_iter(self, st, t_lo, t_hi, raw, valid, s_lo, batch_rows, normalise,
+                     reduce_pix=None):
+        """Re-imaging on the LOW-priority stream into private buffers. With
+        ``reduce_pix`` the normalisation and the ``reduce_images`` reductions
+        run on the GPU and only float16 images cross to the host."""
         from .kernels_cuda import get_module
 
         spec = st.spec
@@ -516,9 +542,13 @@ class GpuBackend:
             with _OnStream(self.low):
                 if r0 % n:
                     ring = torch.roll(ring, -(r0 % n), dims=0)
+            rows = np.arange(r0, r0 + n)
+            if reduce_pix is not None:
+                img16, red = self._reduce_batch(ring, rows, spec, normalise, reduce_pix)
+                yield rows, img16, float(valid.mean()), red
+                continue
             self.low.synchronize()
             img = ring.float().cpu().numpy().reshape(n, spec.n_fdm, N, N)
-            rows = np.arange(r0, r0 + n)
             if normalise:
                 sig, _f = self.eng.sigma_at(spec.d, rows)
                 img = img / sig[:, :, None, None]
