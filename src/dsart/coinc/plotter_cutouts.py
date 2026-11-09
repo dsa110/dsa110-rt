@@ -140,7 +140,15 @@ def assemble_dm_time(
         row = np.full(n_t, np.nan, np.float32)
         off = int(p.t0_ext) - t_lo
         series = np.asarray(p.peak_grid[:, j], np.float32).copy()
-        if p.row_valid is not None:
+        # row_valid is 0 for a whole coarse DM when ANY input of its window is
+        # missing -- n01/n02 always lose ~1e-3 of their packets (fabric), and
+        # missing inputs are zero-filled, so those images are still good. Blank
+        # only a plane that carried no input at all (its window had rotated
+        # out of the raw ring). (2026-11-09: the n01/n02 halves' coarse DMs --
+        # half the waterfall, often the trigger's band -- were blank.)
+        no_input = (p.input_valid_frac is not None and p.input_valid_frac.size
+                    and float(np.max(p.input_valid_frac)) <= 0.0)
+        if p.row_valid is not None and (p.input_valid_frac is None or no_input):
             series[~np.asarray(p.row_valid, bool)] = np.nan
         row[off:off + series.shape[0]] = series
         rows_img.append(row)

@@ -33,7 +33,8 @@ def _plan():
     return build_tiered_plan_for_opoint(opoint_2x("gridded", 4, 8))
 
 
-def _write_half(ev: Path, h: int, fine_global_peak: int, peak_dm: float) -> None:
+def _write_half(ev: Path, h: int, fine_global_peak: int, peak_dm: float,
+                ivf: float = 1.0) -> None:
     plan = _plan()
     ax = S.fine_axis_for_half(plan, h, t_ext_native=16)
     n_f = len(ax["fine_dm_pc_cc"])
@@ -52,8 +53,9 @@ def _write_half(ev: Path, h: int, fine_global_peak: int, peak_dm: float) -> None
     fields = S.assemble_cutout(
         axis=ax, images=imgs, n_t=NT,
         sigma_applied=np.ones((NT, n_f), np.float32),
-        row_valid=np.ones((NT, len(ax["coarse_owned"])), bool),
-        input_valid_frac=np.ones(n_f, np.float32), request=req,
+        # the producer marks a whole coarse DM row-invalid when any input is missing
+        row_valid=np.full((NT, len(ax["coarse_owned"])), ivf >= 1.0),
+        input_valid_frac=np.full(n_f, ivf, np.float32), request=req,
         identity=dict(search_node_id=SIDS[h // 2], gpu_half=h % 2,
                       half_index=h, plan_id=plan.plan_id),
         clock=dict(t_ext_us=524.288, native_per_ext=16),
@@ -99,6 +101,25 @@ def test_assemble_dm_time_sorted_and_gapped(tmp_path: Path) -> None:
     n_real = sum(1 for s in src if s[0] >= 0)
     plan = _plan()
     assert n_real == sum(len(plan.fines_of_half(h)) for h in (0, 1, 3, 4, 5, 6, 7))
+
+
+def test_partial_halves_are_drawn_and_only_inputless_planes_blanked(tmp_path: Path) -> None:
+    """2026-11-09: n01/n02 lose ~1e-3 of their packets, the producer marks
+    their coarse DMs row-invalid, and the waterfall blanked half its bands.
+    A plane with any input is drawn; a plane with none stays blank."""
+    plan = _plan()
+    fg = int(plan.fines_of(2).start + 3)
+    ev = tmp_path / NAME
+    for h in range(8):
+        _write_half(ev, h, fg, float(plan.fine_dm[fg]),
+                    ivf=(0.998 if h < 4 else 0.0 if h == 7 else 1.0))
+    prod = PR.load_event_products(ev)
+    img, _t, row_dm, _st, row_src = assemble_dm_time(prod.planes, 10_032)
+    for r, (i, _j, _fg) in enumerate(row_src):
+        if i < 0:
+            continue
+        half = prod.planes[i].gpu_half + 2 * SIDS.index(prod.planes[i].sid)
+        assert np.isfinite(img[r]).any() == (half != 7), (half, row_dm[r])
 
 
 def test_render_from_cutouts(tmp_path: Path) -> None:

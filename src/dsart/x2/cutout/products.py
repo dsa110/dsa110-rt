@@ -159,6 +159,7 @@ class PeakPlane:
     fine_local_idx: Optional[np.ndarray] = None
     t_step: int = 1
     row_valid: Optional[np.ndarray] = None
+    input_valid_frac: Optional[np.ndarray] = None   # [F] of this plane's fines
     t0_ext: Optional[int] = None
     t_ext_us: Optional[float] = None
     pix_lc: Optional[np.ndarray] = None
@@ -197,6 +198,7 @@ def _planes_from_cutout(c: Cutout) -> List[PeakPlane]:
     t0 = int(c.scalar("t0_ext"))
     t_ext_us = float(c.scalar("t_ext_us"))
     row_valid = np.asarray(a["row_valid"]).astype(bool)
+    ivf = np.asarray(a["input_valid_frac"], dtype=np.float32) if "input_valid_frac" in a else None
     pix = np.asarray(a["pix_lc"])
     for k in range(c.n_coarse):
         sl = c.block(k)
@@ -220,6 +222,7 @@ def _planes_from_cutout(c: Cutout) -> List[PeakPlane]:
             fine_local_idx=np.asarray(a["fine_local_idx"][sl]).astype(np.int64),
             t_step=t_step,
             row_valid=row_valid[:n_t, k],
+            input_valid_frac=(ivf[sl] if ivf is not None else None),
             t0_ext=t0, t_ext_us=t_ext_us,
             pix_lc=(np.asarray(pix[:, sl], dtype=np.float32) if pix.size else None),
             apex_t=at if at >= 0 else None,
