@@ -96,6 +96,20 @@ def run_calibrate(a, store, fh, buckets, pos) -> None:
             dm_pc_cm3=dm, width_samples=w, l_rad=l, m_rad=m, profile="gaussian",
             poll_timeout_s=a.poll_timeout_s, use_ladder=1, health_check=1,
             user="claude x2 campaign (calibrate)"), timeout=a.poll_timeout_s * 4 + 120)
+        snr0 = r.get("observed_snr")
+        if not r.get("ok") and "saturated" in str(r.get("reason")) and snr0:
+            # the endpoint's ladder only steps UP (for non-detections): a probe on the clip rail is
+            # repeated once, scaled to ~S/N 40, after the usual gap
+            _log(fh, dict(phase="calibrate_saturated", dm=dm, width=w, observed_snr=snr0,
+                          inj_id=r.get("inj_id"), response=r))
+            _sleep_until(t0 + a.probe_gap_s)
+            t0 = time.time()
+            f = max(1e-6, float(r.get("fluence_used") or 5e-4) * 40.0 / float(snr0))
+            r = _post("/control/inject_calibrate", dict(
+                dm_pc_cm3=dm, width_samples=w, l_rad=l, m_rad=m, profile="gaussian",
+                fluence_jy_ms=f"{f:.3e}", poll_timeout_s=a.poll_timeout_s, use_ladder=0,
+                health_check=1, user="claude x2 campaign (calibrate, scaled)"),
+                timeout=a.poll_timeout_s * 2 + 120)
         time.sleep(a.settle_s)
         doc = _match_doc(store, r.get("inj_id")) if r.get("inj_id") else None
         best = (doc or {}).get("best") or {}
