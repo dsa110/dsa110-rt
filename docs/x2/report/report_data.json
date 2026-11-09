@@ -1,0 +1,94 @@
+{
+ "date": "2026-11-09",
+ "production_since": "2026-11-09 15:13 UTC (op-point 2x-gridded-ns4-cint4, DM plan 0xae1599d449a35b00)",
+ "n_coarse": 24,
+ "n_fine": 758,
+ "measured_summary": "A real FRB (250924mptq) replayed from recorded voltages: same pixel and DM trial as 1x, S/N x1.84. Injection calibration campaign: see 'What was measured' (DRAFT -- campaign in progress).",
+ "status_summary": "Observing at DEC +16.27 (el 69.04). The calibration pipeline receives the new data; the first transit after the restart is 2253+161 at ~03:26 UTC 2026-11-10.",
+ "corr_block_summary": "p50 61-72 ms, p99 67-86 ms of 134 ms (45-64%)",
+ "campaign_text": "DRAFT -- the campaign (72 (DM, width) buckets: DM 150-2900 across both tiers x widths 0.13-16.8 ms) is running.",
+ "gain_caption": "Model S/N gain of 2x over 1x vs burst width for three DM bands (blue). Orange points: measured ratio of the injection calibration factor K (S/N per unit injected fluence) in 2x to the last 1x value of the same (DM, width) bucket, labelled by DM.",
+ "realtime_text": "Snapshot of the x2 health page in production, 2026-11-09 ~17:15 UTC, two hours after the start. Every correlator node and every search half is inside its real-time gate with wide margin. The only red entry is RX loss on n01/n02 (4-7e-4), which is the known fault on 2-3 fabric paths into those nodes. It was present before 2x, and fan-in absorbs it.",
+ "realtime_table": [
+  [
+   "Quantity",
+   "Gate",
+   "Production (16 corr nodes, 8 halves)"
+  ],
+  [
+   "Correlator block time, p50",
+   "mean <= 85% of 134.2 ms",
+   "61-72 ms (45-54%)"
+  ],
+  [
+   "Correlator block time, p99",
+   "<= 134.2 ms",
+   "67-86 ms"
+  ],
+  [
+   "Corner-turn TX per corr node",
+   "-",
+   "2.70-2.82 Gb/s"
+  ],
+  [
+   "RX per search node",
+   "<= 80% of clean capacity (17 Gb/s)",
+   "11.0-11.6 Gb/s"
+  ],
+  [
+   "RX loss per search node",
+   "<= 1e-4 (or the 1x value)",
+   "n09, n13: 0; n01: 6.9e-4; n02: 4.2e-4"
+  ],
+  [
+   "Search GPU duty per half",
+   "<= 0.75 (aim 0.6)",
+   "0.55-0.59"
+  ],
+  [
+   "Cubes per second",
+   "nominal 14.90",
+   "99.94-100% of nominal"
+  ]
+ ],
+ "compromises": [
+  "<b>Corner-turn format: 4-bit gridded cells with four sub-bands (gridded ns4 cint4), about 0.6% of S/N.</b> You chose it on 2026-10-29 from the measured network capacity. It recovers 0.994 of the dedispersion model and needs 14 Gb/s of clean ingress per search node, the most network margin of the candidates. The heaviest cells travel at 8 bits so bright bursts do not clip. Even so, the 2x wire costs less S/N than the 1x wire, which lost 1.2%.",
+  "<b>Four sub-bands in stage 1 (n_sub 4): under 0.5% of S/N on average, up to 1.7% for narrow bursts at DM 100-500.</b> This halves the stage-1 kernel's cost. It was the plan's first fallback for the correlator budget.",
+  "<b>0.52 ms, not 0.26 ms.</b> 4x resolution is network-bound: corner-turn traffic grows as 1/T^2, and the fabric cannot carry it without the on-board 10G ports. As a result the legacy-style single-stage search is still ahead below 0.5 ms at low DM (0.70 vs 0.52 of ideal at 0.2 ms).",
+  "<b>DM 1600-3000 is searched at 1.05 ms (tier B).</b> Bursts narrower than ~1 ms lose ~25% there, as the injections confirm. Searching it at 0.52 ms would double tier B's cost. At those DMs intra-channel smearing and scattering usually broaden bursts past 1 ms anyway.",
+  "<b>The detector amplitude regime is carried over from 1x unchanged.</b> That means input clip 250 sigma, sigma floors, and the injection saturation guard at 240. S/N is linear only up to ~35 sigma and rails at ~250 x sqrt(width). The 2026-07-22 attempt to change it produced an all-night RFI storm, so linearity was left out of scope by decision.",
+  "<b>Trial spacing tolerance 1.25.</b> Midway between two DM trials a narrow burst loses up to 1/sqrt(1.25), about 11%; the average loss over DM is a few percent. This is the plan's op-point and is included in the model curves.",
+  "<b>A 20 s raw ring instead of cube files.</b> Cutouts must be copied out of the ring within ~11 s of C2's request, and the producer now copies at accept time. A window that has already rotated out is reported TOO_LATE rather than archived.",
+  "<b>The fabric's packet loss into n01/n02 is absorbed, not fixed.</b> 2-3 of the 64 paths into those nodes lose ~3e-3 (node totals 4-7e-4) because of a faulty inter-switch link. Data-time fan-in (60 of 64 streams) means it never stalls the search; the S/N cost is ~0.05%.",
+  "<b>The web-UI arm epoch is rounded down to the 32-sample grid by corr_fast</b>, and the search mirrors the rounding. Labels stay exact. Rounding `compute_arm_seq` itself would change 1x too, so it was left alone.",
+  "<b>Plan steps not done as written.</b> The 1x/2x web-UI drill was dropped, because you asked for 2x to be the only option. The >= 12 h soak is the production run itself, since 15:13 UTC on 11-09. The science validation grid was replaced by the injection calibration campaign, which covers more DMs and all eight filter widths."
+ ],
+ "fixed_in_deploy": [
+  "<b>Cutouts arrived late and empty (fixed 11-09).</b> Each half re-imaged each of its DMs ~12 times per request and reduced the images on the CPU. That took 140-190 s against C2's 120 s wait. Requests queued behind that backlog found their rows already overwritten in the 20 s ring, so every cutout after the first had no valid rows, and ~9 GB raw windows of invalid rows were archived. Now each DM is re-imaged once with the reductions on the GPU, rows are copied when the request is accepted, and lapped windows are never archived.",
+  "<b>Voltage dumps wrote 0 blocks.</b> 2x candidate times are absolute SNAP-epoch sample numbers, but voltage_retention expected capture-relative ones. It now converts them (--event-specnum-epoch snap); ring block 0 is the first armed page.",
+  "<b>The Sky-tab export crashed</b> on the 2x sky object (an attribute only 1x has). Fixed by duck-typing.",
+  "<b>The etcd read-back check failed</b> on configs with integer keys. The canonical hash now normalises through a JSON round trip.",
+  "<b>The restart helper armed too early.</b> It matched old 'ready' lines in appended child logs. It now arms only after every ready sentinel is newer than the Start.",
+  "<b>Search start-up seek.</b> The first live fleet run lagged at attach. The engines now run two throwaway cycles on in-memory data first (priming).",
+  "<b>The injection campaign's probe saturated</b> at DM 150, width 4 (S/N 516 > rail). The probe is now repeated once at a fluence scaled to S/N ~40."
+ ],
+ "operating": [
+  "<b>Start / stop:</b> web UI Control tab. Start offers only 2x (2x-gridded-ns4-cint4). Use 're-apply op-point' after any config push. Arm only after every corr node has written a fresh ready sentinel (/tmp/dsart-corr-fast-*.ready, a few minutes after Start). The child logs are appended, so an old 'ready' line there does not count.",
+  "<b>Updating node code:</b> Control tab, update_dsart, <b>branch x2/main, force on</b>. Never leave the branch blank: blank resets the nodes to origin/main, which is the 1x code. The h23 live checkout is on branch x2-live tracking origin/x2/main; 'git pull' there updates C2/C3/dashboard code (restart the unit or the dashboard afterwards).",
+  "<b>Changing configs:</b> edit configs/opoints/2x/*.yaml, then run tools/ops/push_dsart_to_etcd.py --opoint 2x-gridded-ns4-cint4 --plan /home/ubuntu/data/dm_plans/dm_plan_tiered_ns4.npz --write. C2/C3/the inject bot read the yaml from the h23 checkout, so 'git pull' there and restart them.",
+  "<b>After a SNAP restart:</b> tools/x2/snap_capture_check.py replaces the Grafana drop-counter check. It captures packets on every corr node and reports per-SNAP sequence offsets and drop rates.",
+  "<b>Health:</b> the dashboard's x2 health page (/api/x2/health) shows correlator block time, per-half GPU duty, cube rate, per-node RX loss and cutout latency against the real-time gates. n01/n02 show a loss 'FAIL' at 4-7e-4; that is the known fabric fault, not the search.",
+  "<b>Injections:</b> the bot injects at a requested S/N using per-(DM, width) calibration K from this campaign. Widths 4-512 native samples (0.13-16.8 ms), DMs 150-2900. Re-run tools/x2/inject_campaign.py --phase calibrate after any change to gains, beamformer weights or the detector.",
+  "<b>New beamformer weights:</b> as you planned, restart with the new weights once a good calibration is in (Stop, update weights, Start with re-apply, arm)."
+ ],
+ "open_items": [
+  "<b>C2 needs a 2x retune.</b> During RFI storms C2 dumps real events at up to ~28 per hour (1x: 3-4.5 per hour), mostly impulsive low-DM RFI. 2x searches ~4x the trials at twice the rate with 1x's 11-sigma trigger. Proposed: raise the narrow-width trigger or the low-DM bar, using the injection completeness measured here to keep real bursts.",
+  "<b>Raw-window retention needs your decision.</b> Each real C2 event archives ~9 GB of raw corner-turn data (all DMs, +-0.5 s) under /dataz/dsa110/candidates/&lt;event&gt;/raw. Nothing prunes it, and /dataz has ~2.3 TB free. Options: keep N days, keep only C3-KEEP events, or archive only for bright classes. Raw windows written 11-09 15:36-20:30 hold only invalid (lapped) rows and could be deleted.",
+  "<b>Fabric fault into n01/n02:</b> check the Arista inter-switch/LAG member error counters. 2-3 paths per node lose ~3e-3 because of CRC errors, and the faulty paths change with flow hashing.",
+  "<b>Search nodes' antennas.out is not refreshed by calibration pushes.</b> If a calibration ever changes the E/N header, every 2x stream arrives PATTERN_MISMATCH and the search goes blind (fail-loud).",
+  "<b>Verify C3 on 2x cutouts</b> now that they arrive in time, and check its R-rule thresholds in ms / DM density against a few days of real events.",
+  "<b>4x resolution</b> needs the corr nodes' on-board eno2 10G ports as a second corner-turn path (a slot move does not help).",
+  "<b>Merge x2/main into main</b> after your review. The nodes and h23 run x2/main today."
+ ],
+ "provenance": "Sources: docs/x2/ (SPEC.md, signoff_ledger.md, g1_results.md, g2_results.md), docs/timeroot_study/snr2x (model), tools/x2/inject_campaign.py output on h23."
+}
