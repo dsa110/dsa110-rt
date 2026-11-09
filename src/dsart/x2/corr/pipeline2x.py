@@ -553,10 +553,19 @@ class Corr2xPipeline(PipelinedCorrFast):
 
 
 class _ScaledSky:
-    """``running_mean_for`` duck type of ``StaticSkyMean`` with a gain."""
+    """The ``StaticSkyMean`` duck type ``SkySnapshotExporter`` reads (``cubes_seen_for``,
+    ``running_mean_for``, ``window_blocks``), with a gain. G2 production 2026-11-09: without
+    ``cubes_seen_for`` every export raised (caught + logged per block: no Sky-tab snapshots)."""
 
     def __init__(self, sky: BatchedStaticSky, gain: float) -> None:
         self.sky, self.gain = sky, float(gain)
+
+    def cubes_seen_for(self, dm_slot: int = 0) -> int:
+        return int(self.sky.seen)            # one count for the batch: every DM is pushed per block
+
+    @property
+    def window_blocks(self) -> int:
+        return int(self.sky.window_blocks)
 
     def running_mean_for(self, dm_slot: int = 0):
         m = self.sky.running_mean_for(dm_slot)

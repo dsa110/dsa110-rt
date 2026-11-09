@@ -274,6 +274,9 @@ def test_sky_export_hooks(monkeypatch) -> None:
     x = torch.ones((len(orch.tiers[0].dms), 4, orch.csr.n_values), dtype=torch.complex64)
     orch.tiers[0].static_sky.apply_(x)
     assert torch.allclose(orch.sky_static.running_mean_for(0), torch.full((orch.csr.n_values,), 2.0 + 0j))
+    # every attribute SkySnapshotExporter.maybe_export reads (G2 2026-11-09: cubes_seen_for was missing)
+    assert orch.sky_static.cubes_seen_for(0) == 1
+    assert orch.sky_static.window_blocks == orch.tiers[0].static_sky.window_blocks
 
 
 def test_injection_window_detection() -> None:
