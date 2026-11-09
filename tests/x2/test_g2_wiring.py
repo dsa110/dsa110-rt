@@ -338,6 +338,10 @@ def test_corr_buffers_readers_and_other_routines_unchanged(env):
         if name == "voltage_retention":
             assert "--n-pre 15" in b["args"] and "--n-pre 14" in a["args"]
             b["args"] = b["args"].replace("--n-pre 15", "--n-pre 14")
+            # 2x triggers carry SNAP-epoch specnums (G2 2026-11-09)
+            assert " --event-specnum-epoch snap" in b["args"]
+            assert "--event-specnum-epoch" not in a["args"]
+            b["args"] = b["args"].replace(" --event-specnum-epoch snap", "")
         assert a == b, name
     # corr_fast keeps today's reader role and every non-x2 argument
     t1 = shlex.split(r1["corr_fast"]["args"])

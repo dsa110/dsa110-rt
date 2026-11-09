@@ -794,6 +794,7 @@ routines:
       --n-pre 15
       --n-post 8
       --dump-wait-s 5.0
+      --event-specnum-epoch snap
       --mon-interval-s 5.0
       --ready-sentinel-path /tmp/dsart-voltage-retention-CN.ready
       --min-free-bytes-floor 17179869184

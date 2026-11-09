@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ..common.constants import BLOCK_DURATION_S, FADA_BYTES_PER_BLOCK
+from ..common.constants import BLOCK_SAMPLES_SPECNUM
 from ..dump.voltage_ring import VoltageRing, specnum_to_block_n
 from ..dump.voltage_trigger_listener import (
     VoltageTriggerListener,
@@ -141,6 +142,10 @@ class RetentionConfig:
     # case (many back-to-back real triggers) even when the disk has
     # plenty of headroom otherwise.
     staging_max_total_bytes: int = _DEFAULT_STAGING_MAX_TOTAL_BYTES
+    # Epoch of the trigger's event_specnum: "capture" (1x: counted from the arm, block_n 1 =
+    # the first armed page) or "snap" (2x: the search clock is absolute, native 0 = the SNAP
+    # epoch, so C2's specnum = arm specnum + offset; see capture_relative_specnum).
+    event_specnum_epoch: str = "capture"
     # 2026-07-24 orphan-eviction guard. A staged fragment older than
     # staging_orphan_ttl_s is evicted by the periodic sweeper (a C2-
     # discarded event C3 never adjudicates, so it is never cleaned
@@ -277,6 +282,29 @@ def check_disk_headroom(
         staging_dir.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(staging_dir)
     return usage.free >= required_bytes, usage.free
+
+
+def capture_relative_specnum(event_specnum: int, *, epoch: str,
+                              utc_start_specnum: Optional[int]) -> int:
+    """A C2 trigger's ``event_specnum`` in this ring's convention (specnums since the arm,
+    ``block_n = specnum // 2048`` with the first armed page = block 1).
+
+    ``epoch="capture"`` (1x) passes it through. ``epoch="snap"`` (2x): the 2x search labels
+    absolute native time (corr_fast's x2 epoch: page 1 starts at native ``2 x utc_start_specnum``,
+    rounded down to the 32-native grid by < 1 ms), so ``specnum - utc_start_specnum + 2048``.
+    G2 production 2026-11-09: without it every 2x dump asked for block ~3.5e6 of a ring holding
+    blocks ~1700-1900 and wrote 0 blocks. Raises ``ValueError`` when it cannot be placed."""
+    if epoch == "capture":
+        return int(event_specnum)
+    if epoch != "snap":
+        raise ValueError(f"event_specnum_epoch={epoch!r}: 'capture' or 'snap'")
+    if utc_start_specnum is None:
+        raise ValueError("SNAP-epoch trigger but utc_start_specnum unknown (no UTC_START in the "
+                         "fada header, no capture mon shm)")
+    rel = int(event_specnum) - int(utc_start_specnum) + BLOCK_SAMPLES_SPECNUM
+    if rel < BLOCK_SAMPLES_SPECNUM:
+        raise ValueError(f"SNAP-epoch specnum {event_specnum} precedes the arm ({utc_start_specnum})")
+    return rel
 
 
 def write_window_to_staging(
@@ -713,10 +741,19 @@ class VoltageRetentionService:
                         self._armed_mjd = v if v > 40000.0 else None
                     except (TypeError, ValueError):
                         self._armed_mjd = None
+                try:
+                    specnum_ring = capture_relative_specnum(
+                        specnum, epoch=self._cfg.event_specnum_epoch,
+                        utc_start_specnum=self._utc_start_specnum)
+                except ValueError as exc:
+                    self._counters["dumps_failed"] += 1
+                    LOG.error("voltage_retention: dump %s %s not placed: %s", name,
+                              self._cfg.sb, exc)
+                    continue
                 manifest = write_window_to_staging(
                     ring=self._ring,
                     event_name=name,
-                    event_specnum=specnum,
+                    event_specnum=specnum_ring,
                     cn_id=self._cfg.cn_id,
                     chgroup=self._cfg.chgroup,
                     staging_dir=self._cfg.staging_dir,
@@ -963,6 +1000,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         "only pulse width + intra-chgroup smear land "
                         "after the label).")
     p.add_argument("--dump-wait-s", type=float, default=5.0)
+    p.add_argument("--event-specnum-epoch", choices=("capture", "snap"), default="capture",
+                   help="epoch of the C2 trigger's event_specnum: capture (1x, since the arm) or "
+                        "snap (2x: absolute, converted with the fada header's UTC_START)")
     p.add_argument("--queue-max", type=int, default=32)
     p.add_argument("--mon-interval-s", type=float, default=5.0)
     p.add_argument("--ready-sentinel-path", default=None)
@@ -1045,6 +1085,7 @@ def main(argv: Optional[list] = None) -> int:
         max_blocks=int(args.max_blocks),
         min_free_bytes_floor=int(args.min_free_bytes_floor),
         staging_max_total_bytes=int(args.staging_max_total_bytes),
+        event_specnum_epoch=str(args.event_specnum_epoch),
         staging_orphan_ttl_s=float(args.staging_orphan_ttl_s),
         orphan_sweep_interval_s=float(args.orphan_sweep_interval_s),
     )
