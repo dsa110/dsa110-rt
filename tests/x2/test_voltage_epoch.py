@@ -12,10 +12,10 @@ def test_capture_epoch_passes_through():
 
 def test_snap_epoch_lands_on_the_ring_block():
     utc = 7_140_393_504                                   # G2 production arm, 2026-11-09
-    # page 1 (block_n 1) starts at the arm: an event there is block 1, one block later block 2
-    assert specnum_to_block_n(capture_relative_specnum(utc, epoch="snap", utc_start_specnum=utc)) == 1
+    # the first armed page (corr_fast's 2x page 1 starts at utc_start) is ring block 0
+    assert specnum_to_block_n(capture_relative_specnum(utc, epoch="snap", utc_start_specnum=utc)) == 0
     ev = utc + 1800 * BLOCK_SAMPLES_SPECNUM + 100
-    assert specnum_to_block_n(capture_relative_specnum(ev, epoch="snap", utc_start_specnum=utc)) == 1801
+    assert specnum_to_block_n(capture_relative_specnum(ev, epoch="snap", utc_start_specnum=utc)) == 1800
     # the failure it fixes: the absolute specnum maps ~3.5e6 blocks away from a ~2000-block ring
     assert specnum_to_block_n(ev) > 3_000_000
 

@@ -49,7 +49,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ..common.constants import BLOCK_DURATION_S, FADA_BYTES_PER_BLOCK
-from ..common.constants import BLOCK_SAMPLES_SPECNUM
 from ..dump.voltage_ring import VoltageRing, specnum_to_block_n
 from ..dump.voltage_trigger_listener import (
     VoltageTriggerListener,
@@ -286,12 +285,13 @@ def check_disk_headroom(
 
 def capture_relative_specnum(event_specnum: int, *, epoch: str,
                               utc_start_specnum: Optional[int]) -> int:
-    """A C2 trigger's ``event_specnum`` in this ring's convention (specnums since the arm,
-    ``block_n = specnum // 2048`` with the first armed page = block 1).
+    """A C2 trigger's ``event_specnum`` in this ring's convention: specnums since the first
+    armed page, which the ring labels block 0 (zero-based since attach, 2026-07-19 reconciliation),
+    ``block = specnum // 2048``.
 
     ``epoch="capture"`` (1x) passes it through. ``epoch="snap"`` (2x): the 2x search labels
     absolute native time (corr_fast's x2 epoch: page 1 starts at native ``2 x utc_start_specnum``,
-    rounded down to the 32-native grid by < 1 ms), so ``specnum - utc_start_specnum + 2048``.
+    rounded down to the 32-native grid by < 1 ms), so ``specnum - utc_start_specnum``.
     G2 production 2026-11-09: without it every 2x dump asked for block ~3.5e6 of a ring holding
     blocks ~1700-1900 and wrote 0 blocks. Raises ``ValueError`` when it cannot be placed."""
     if epoch == "capture":
@@ -301,8 +301,8 @@ def capture_relative_specnum(event_specnum: int, *, epoch: str,
     if utc_start_specnum is None:
         raise ValueError("SNAP-epoch trigger but utc_start_specnum unknown (no UTC_START in the "
                          "fada header, no capture mon shm)")
-    rel = int(event_specnum) - int(utc_start_specnum) + BLOCK_SAMPLES_SPECNUM
-    if rel < BLOCK_SAMPLES_SPECNUM:
+    rel = int(event_specnum) - int(utc_start_specnum)
+    if rel < 0:
         raise ValueError(f"SNAP-epoch specnum {event_specnum} precedes the arm ({utc_start_specnum})")
     return rel
 
@@ -741,6 +741,11 @@ class VoltageRetentionService:
                         self._armed_mjd = v if v > 40000.0 else None
                     except (TypeError, ValueError):
                         self._armed_mjd = None
+                if (self._cfg.event_specnum_epoch == "snap"
+                        and self._utc_start_specnum is None):
+                    # the fada attach (header read) precedes the operator's arm, so the
+                    # capture mon had no armed specnum yet: read it now, after the arm
+                    self._utc_start_specnum = _utc_start_from_capture_mon()
                 try:
                     specnum_ring = capture_relative_specnum(
                         specnum, epoch=self._cfg.event_specnum_epoch,
