@@ -29,7 +29,8 @@ def _plan():
 
 
 def _event(tmp: Path, name: str, fg: int, *, halves=range(8),
-           burst_row: int = 64, burst_pix=(12, 17), amp: float = 40.0) -> Path:
+           burst_row: int = 64, burst_pix=(12, 17), amp: float = 40.0,
+           empty: bool = False) -> Path:
     plan = _plan()
     ev = tmp / name
     d_trig = int(plan.fine_to_coarse[fg])
@@ -47,6 +48,8 @@ def _event(tmp: Path, name: str, fg: int, *, halves=range(8),
             step = int(ax["t_step_ext"][f])
             r0 = burst_row - burst_row % step
             imgs[r0:r0 + step, f, burst_pix[0], burst_pix[1]] += amp
+        if empty:                                   # window rotated out before the copy
+            imgs[:] = 0.0
         req = CutoutRequest(
             event_name=name, request_id=1, t_peak_ext=T0 + 64, t0_ext=T0,
             n_t=NT, width_ext=1, dm_peak_pc_cc=float(plan.fine_dm[fg]),
@@ -55,8 +58,8 @@ def _event(tmp: Path, name: str, fg: int, *, halves=range(8),
         fields = S.assemble_cutout(
             axis=ax, images=imgs, n_t=NT,
             sigma_applied=np.ones((NT, n_f), np.float32),
-            row_valid=np.ones((NT, len(ax["coarse_owned"])), bool),
-            input_valid_frac=np.ones(n_f, np.float32), request=req,
+            row_valid=np.full((NT, len(ax["coarse_owned"])), not empty),
+            input_valid_frac=np.full(n_f, 0.0 if empty else 1.0, np.float32), request=req,
             identity=dict(search_node_id=SIDS[h // 2], gpu_half=h % 2,
                           half_index=h, plan_id=plan.plan_id),
             clock=dict(t_ext_us=524.288, native_per_ext=16),
@@ -111,6 +114,16 @@ def test_missing_owner_half_fails_open(tmp_path: Path) -> None:
                 halves=[h for h in range(8) if h != owner])
     m = CV.compute_metrics(ev, "261022cccc")
     assert not m.ok and m.reason == "trigger cutout absent"
+    assert CV.decide(m, is_injection=False).keep
+
+
+def test_empty_trigger_cutout_fails_open(tmp_path: Path) -> None:
+    """2026-11-09: cutouts whose rows had rotated out of the raw ring were all
+    zeros; R1/R4/R5/R10 fired on them and 28 real events were REJECTed with
+    their voltages deleted. No valid input is not evidence: KEEP."""
+    ev = _event(tmp_path, "261022eeee", _tier_fine(0), empty=True)
+    m = CV.compute_metrics(ev, "261022eeee")
+    assert not m.ok and m.reason == "trigger cutout holds no valid rows"
     assert CV.decide(m, is_injection=False).keep
 
 

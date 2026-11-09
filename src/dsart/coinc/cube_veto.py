@@ -737,6 +737,17 @@ def _compute_metrics_cutouts(
     if hit is None:
         return CubeMetrics(ok=False, reason="trigger cutout absent")
     plane, j = hit
+    # A trigger plane with no valid input rows (its window rotated out of the
+    # raw ring before it was copied) is all zeros: R1/R4/R5/R10 would fire on
+    # it. No data is not evidence -- fail open (2026-11-09: 28 real events
+    # REJECTed, voltages deleted, on empty cutouts).
+    cut = prod.cutouts.get((plane.sid, plane.gpu_half))
+    if cut is not None and "input_valid_frac" in cut.arrays:
+        ivf = np.asarray(cut.arrays["input_valid_frac"], dtype=np.float64)
+        mine = np.isin(np.asarray(cut.arrays["fine_global_idx"]).astype(np.int64),
+                       np.asarray(plane.fine_global_idx, dtype=np.int64))
+        if mine.any() and float(ivf[mine].max()) <= 0.0:
+            return CubeMetrics(ok=False, reason="trigger cutout holds no valid rows")
     grids: Dict[Tuple[int, ...], np.ndarray] = {}
     for p in prod.planes:
         grids[p.key] = np.asarray(p.peak_grid, dtype=np.float32)[::max(1, int(p.t_step))]
