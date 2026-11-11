@@ -44,16 +44,19 @@ def test_ws_o_2x_criteria_file_loads_and_gates_in_ms() -> None:
     assert "x2_todo" not in doc                     # D6 landed
     ev = CriteriaEvaluator(CRIT_2X, opoint=SEL2)
     names = [c.name for c in ev.classes]
-    assert names[0] == "bright_frb_extragalactic"
+    assert names[:2] == ["bright_frb_extragalactic", "wide_frb_extragalactic"]
     req = ev.classes[0].require
-    assert req["width_median_max_ms"] == 16.8
+    assert req["width_median_max_ms"] == 8.3        # 2026-11-11: wide needs S/N 14
     assert req["dm_median_max_pc_cc"] == 3100.0
-    assert ev.evaluate(_stats(32, 524.288)).name == "bright_frb_extragalactic"
+    assert ev.evaluate(_stats(32, 524.288)).name == "wide_frb_extragalactic"   # 16.8 ms, S/N 20
     ev2 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)
-    assert ev2.evaluate(_stats(33, 524.288)).name != "bright_frb_extragalactic"
+    assert ev2.evaluate(_stats(33, 524.288)).name not in (
+        "bright_frb_extragalactic", "wide_frb_extragalactic")                   # 17.3 ms
     ev3 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)
     assert ev3.evaluate(_stats(4, 524.288, dm=3050.0)).name == \
         "bright_frb_extragalactic"
+    ev4 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)                              # wide, S/N 13
+    assert ev4.evaluate(_stats(16, 524.288, snr=13.0)).action == "log_only"
 
 
 def test_ws_o_2x_search_config_parses_with_2x_defaults() -> None:

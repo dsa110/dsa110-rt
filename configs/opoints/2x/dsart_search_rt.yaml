@@ -757,6 +757,11 @@ coinc:
   # cutout.wait_s for the per-half cutouts; halves report status to
   # status_port.
   partial_event_policy: archive
+  # 2026-11-11 (2x retune): never dump a cluster containing a member of an
+  # already-dumped event -- required by wide_frb_extragalactic (a narrow
+  # bright burst whose cluster widens during the bright holdoff must not
+  # dump again as "wide").
+  dedupe_fired_clusters: true
   cutout:
     wait_s: 120
     status_port: 11501

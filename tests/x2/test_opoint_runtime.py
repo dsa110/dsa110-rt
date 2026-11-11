@@ -463,7 +463,9 @@ def test_repo_2x_k_isolation_and_c2_keys():
     assert two["search_rt"]["c3"]["veto"]["r2_t_shift_ms"] == 31.5
     req = [c["require"] for c in two["c2_criteria"]["trigger_classes"]]
     assert all("width_median_max_samples" not in r for r in req)
-    assert [r["width_median_max_ms"] for r in req if "width_median_max_ms" in r] == [16.8, 8.4, 33.6]
+    # bright (narrow), wide (S/N 14, 2026-11-11), faint, galactic
+    assert [r["width_median_max_ms"] for r in req if "width_median_max_ms" in r] == [8.3, 16.8, 8.3, 33.6]
+    assert two["search_rt"]["coinc"]["dedupe_fired_clusters"] is True   # needed by the wide class
     assert all(r["dm_median_max_pc_cc"] >= 3000 for r in req if "dm_median_max_pc_cc" in r)
     assert opr.recalibration_notes(two["c2_criteria"])
     assert opr.recalibration_notes(one["c2_criteria"]) == []

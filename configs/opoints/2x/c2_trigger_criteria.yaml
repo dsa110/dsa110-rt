@@ -98,7 +98,35 @@ trigger_classes:
       # range without re-opening the >2653 unphysical tail.
       dm_median_max_pc_cc: 3100.0      # 2x: the search reaches DM 3000
       dm_iqr_max_pc_cc: 100.0
-      width_median_max_ms: 16.8        # 1x: 16 samples x 1.048576 ms
+      # 2026-11-11 (2x retune): narrow only; wide bursts need S/N >= 14
+      # (wide_frb_extragalactic below). Was 16.8.
+      width_median_max_ms: 8.3
+      lm_diag_max_rad: 0.1
+      dm_galactic_fraction_min: 0.75
+    action: dump_all_gpus
+    holdoff_s: 30.0
+
+  - name: wide_frb_extragalactic
+    description: >-
+      2026-11-11 (2x retune): bright_frb_extragalactic for widths
+      8.4-16.8 ms at S/N >= 14 (was 12). Over 29.5 h of 2x data (11-09
+      15:14 .. 11-11 05:30, injections and the first 30 min after each arm
+      excluded) wide (>= 8.4 ms) clusters at S/N < 14 were 52% of all
+      trigger-eligible sky clusters (91 of 175), and C3 rejected 88% of
+      real dumps judged on valid cutouts, 49 of 56 of them this wide
+      population (mostly R10). The rule roughly halves the trigger rate
+      (5.9 -> ~3/h) and costs 33 of 555 injections (all wide, S/N 11-14).
+      Needs coinc.dedupe_fired_clusters (a narrow bright burst whose
+      cluster widens during the bright holdoff must not dump again here).
+    require:
+      snr_max_min: 14.0
+      n_events_min: 1
+      n_search_nodes_min: 1
+      dm_median_min_pc_cc: 115.0
+      dm_median_max_pc_cc: 3100.0
+      dm_iqr_max_pc_cc: 100.0
+      width_median_min_ms: 8.35
+      width_median_max_ms: 16.8
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
@@ -141,7 +169,7 @@ trigger_classes:
       dm_median_min_pc_cc: 115.0
       dm_median_max_pc_cc: 3100.0      # 2x: the search reaches DM 3000
       dm_iqr_max_pc_cc: 100.0
-      width_median_max_ms: 8.4         # 1x: 8 samples x 1.048576 ms
+      width_median_max_ms: 8.3         # 2026-11-11: < 8.4 ms (wide needs S/N 14)
       lm_diag_max_rad: 0.1
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
