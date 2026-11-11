@@ -949,10 +949,16 @@ c3:
   # dsa110-bbproc toolkit (coherent core-antenna beamform toward the
   # cluster's (l_median, m_median)) and tools/plot_fil.py, writing
   # <cand>/filterbank/<event>[_rfi].{fil,png} + filterbank.json
-  # provenance. Runs synchronously inside the scan loop -> events are
-  # processed strictly one after another (no GPU/disk contention).
+  # provenance. One filterbank at a time (no GPU contention).
+  # 2026-11-11: background -- a 2x KEEP took ~23 min (11 min serial
+  # collection + 11 min of filterbanks, rfi_mode both) and every later
+  # event waited behind it (16 queued, oldest 34 min, with the corr
+  # staging cap ~8 dumps away). The filterbank now runs on its own worker
+  # (oldest first; the Slack follow-up posts when it finishes) and the
+  # scan loop moves on to the next decision + collection.
   filterbank:
     enabled: true
+    background: true
     toolkit_bin: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/toolkit
     plot_script: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/tools/plot_fil.py
     core_antennas: /home/ubuntu/proj/dsa110-shell/dsa110-bbproc/config/core_antennas.txt
@@ -993,6 +999,10 @@ c3:
   collect_min_fragments: 8           # legacy dsa110-T3 MIN_CT — proceed once >=8/16 fragments land
   collect_no_show_grace_s: 120.0     # give up if NO fragment shows up at all (event never dumped — e.g. voltages off); bounds the per-event wait so the scan loop can't wedge
   rsync_bwlimit_kbps: 0              # 0 = unthrottled; raise if collection saturates br1
+  # 2026-11-11: one rsync stream runs at ~176 MB/s (7.2 GB / 41 s per 2x
+  # fragment), so 16 in a row took 11 min; pull 4 at once (4 corr nodes,
+  # h23 br2 is 40G). C3 logs "collect <event>: n/16 fragments in T s".
+  collect_parallel: 4
   cleanup_staging_after_keep: true   # free corr NVMe staging once fragments are safely on h23
   # Rollout safety: flag_only logs every veto decision + writes the audit
   # sidecar but performs NO destructive REJECT actions (still collects

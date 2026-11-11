@@ -79,6 +79,10 @@ class FilterbankConfig:
     #: 2D coherent beamform is fully decorrelated (260715twmx
     #: incident). Empty string disables the etcd read (tests).
     dec_key: str = "/mon/array/dec"
+    #: True: C3 queues the filterbank to its own worker thread (one at a
+    #: time, oldest first) and moves on to the next event; the Slack
+    #: follow-up is posted when it finishes. False: inline, as before.
+    background: bool = False
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FilterbankConfig":
@@ -96,6 +100,7 @@ class FilterbankConfig:
             phase_only=bool(d.get("phase_only", True)),
             timeout_s=float(d.get("timeout_s", 1800.0)),
             dec_key=str(d.get("dec_key", "/mon/array/dec")),
+            background=bool(d.get("background", False)),
         )
 
 

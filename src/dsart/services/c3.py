@@ -31,9 +31,11 @@ import asyncio
 import json
 import logging
 import math
+import queue
 import shutil
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -115,6 +117,9 @@ class C3Config:
     # full collect_timeout_s / collect_min_fragments logic takes over.
     collect_no_show_grace_s: float = 120.0
     rsync_bwlimit_kbps: int = 0
+    # Fragments pulled at once (each from a different corr node); 1 =
+    # one after another, as before.
+    collect_parallel: int = 1
     cleanup_staging_after_keep: bool = True
     # False: a CONFIRMED injection (cube_veto.confirmed_injection_id -- C2's
     # marker, a C1 inj_id, or a tight DM+sky+time match to the fired log)
@@ -193,6 +198,7 @@ class C3Config:
             collect_no_show_grace_s=float(
                 c3.get("collect_no_show_grace_s", 120.0)),
             rsync_bwlimit_kbps=int(c3.get("rsync_bwlimit_kbps", 0)),
+            collect_parallel=max(1, int(c3.get("collect_parallel", 1))),
             cleanup_staging_after_keep=bool(
                 c3.get("cleanup_staging_after_keep", True)),
             collect_injection_voltages=bool(
@@ -269,6 +275,7 @@ class C3Service:
             "fragments_collected": 0,
             "filterbanks_ok": 0,
             "filterbanks_failed": 0,
+            "filterbanks_queued": 0,
             "cal_hdf5_complete": 0,
             "cal_hdf5_partial": 0,
             "cal_hdf5_failed": 0,
@@ -281,6 +288,13 @@ class C3Service:
         # whose +window is still in the future (persisted; re-checked
         # each scan tick until complete or too late).
         self._cal_pending: Dict[str, Dict[str, Any]] = {}
+        # name -> {"is_inj", "thread_ts", "report", "queued_unix"} --
+        # KEEPs whose filterbank runs on the background worker
+        # (filterbank.background; persisted, re-queued on restart).
+        self._fb_pending: Dict[str, Dict[str, Any]] = {}
+        self._fb_queue: "queue.Queue[str]" = queue.Queue()
+        self._fb_stop = threading.Event()
+        self._state_lock = threading.Lock()
         self._load_state()
 
     # ----- state -------------------------------------------------------
@@ -293,39 +307,49 @@ class C3Service:
                     doc = json.load(fh)
                 self._processed = dict(doc.get("processed", {}))
                 self._cal_pending = dict(doc.get("cal_pending", {}))
+                self._fb_pending = dict(doc.get("filterbank_pending", {}))
             except (OSError, ValueError):
                 LOG.warning("could not read C3 state %s; starting fresh", p)
 
     def _save_state(self) -> None:
         p = self._cfg.state_path
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
-            with tmp.open("w") as fh:
-                json.dump({"processed": self._processed,
-                           "cal_pending": self._cal_pending}, fh, indent=2)
-            tmp.replace(p)
-        except OSError as exc:
-            LOG.warning("could not write C3 state %s: %s", p, exc)
+        # Two writers (scan loop, filterbank worker): serialise, and dump
+        # copies so the other thread can't resize a dict mid-dump.
+        with self._state_lock:
+            doc = {"processed": dict(self._processed),
+                   "cal_pending": dict(self._cal_pending),
+                   "filterbank_pending": dict(self._fb_pending)}
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(".tmp")
+                with tmp.open("w") as fh:
+                    json.dump(doc, fh, indent=2)
+                tmp.replace(p)
+            except OSError as exc:
+                LOG.warning("could not write C3 state %s: %s", p, exc)
 
     # ----- discovery ---------------------------------------------------
 
     def _completed_events(self) -> List[str]:
         """Event names with a Level3 JSON (C2 writes it last, only on a
-        complete cube set) that C3 has not processed yet."""
+        complete cube set) that C3 has not processed yet, oldest Level3
+        first. (Alphabetical order let newer events overtake an older one
+        while its corr staging ages towards the orphan TTL.)"""
         root = self._cfg.archive_root
-        out: List[str] = []
+        out: List[tuple] = []
         if not root.is_dir():
-            return out
-        for d in sorted(root.iterdir()):
+            return []
+        for d in root.iterdir():
             if not d.is_dir():
                 continue
             name = d.name
             if name in self._processed:
                 continue
-            if (d / "Level3" / f"{name}.json").is_file():
-                out.append(name)
-        return out
+            try:
+                out.append(((d / "Level3" / f"{name}.json").stat().st_mtime, name))
+            except OSError:
+                continue
+        return [name for _, name in sorted(out)]
 
     # ----- runtime mode ------------------------------------------------
 
@@ -436,15 +460,7 @@ class C3Service:
         # c2 dict (from the Level3 JSON C2 writes) is needed immediately
         # for the KEEP card, and again later for the filterbank beamform
         # + followup message — read it once, up front.
-        c2row: Dict[str, Any] = {}
-        l3p = ev_dir / "Level3" / f"{name}.json"
-        try:
-            with l3p.open("r") as fh:
-                c2row = (json.load(fh) or {}).get("c2", {}) or {}
-        except (OSError, json.JSONDecodeError) as exc:
-            LOG.warning("keep %s: could not read %s: %s — slack summary "
-                        "will be sparse; filterbank beamforms at "
-                        "(l,m)=(0,0)", name, l3p, exc)
+        c2row = self._read_c2row(name, ev_dir)
 
         # Slack KEEP card — posted IMMEDIATELY, before voltage collection
         # / filterbank even start, so ops sees a candidate within
@@ -480,6 +496,7 @@ class C3Service:
                     plans,
                     pull_fn=lambda r, d: rsync_pull(
                         r, d, bwlimit_kbps=self._cfg.rsync_bwlimit_kbps),
+                    max_workers=self._cfg.collect_parallel,
                 )
                 elapsed = time.monotonic() - t0
                 if collection_done(
@@ -490,6 +507,9 @@ class C3Service:
                 ):
                     break
                 time.sleep(self._cfg.collect_poll_s)
+            LOG.info("collect %s: %d/%d fragments in %.0f s (%d at once)",
+                     name, n_present, n_total, time.monotonic() - t0,
+                     self._cfg.collect_parallel)
         self._counters["fragments_collected"] += n_present
         report = {
             "n_fragments_present": n_present,
@@ -518,6 +538,7 @@ class C3Service:
                     man_plans,
                     pull_fn=lambda r, d: rsync_pull(
                         r, d, bwlimit_kbps=self._cfg.rsync_bwlimit_kbps),
+                    max_workers=self._cfg.collect_parallel,
                 )
             except Exception:  # noqa: BLE001
                 LOG.exception("manifest collection failed for %s", name)
@@ -538,18 +559,18 @@ class C3Service:
         if self._cfg.cal_hdf5.enabled and n_present > 0:
             cal_report = self._run_cal_archive(name, first_pass=True)
 
-        # bbproc coherent filterbank + inspection plot (synchronous, so
-        # events queue one after another; best-effort — a filterbank
-        # failure never affects the KEEP).
+        # bbproc coherent filterbank + inspection plot (best-effort — a
+        # filterbank failure never affects the KEEP). Inline, events queue
+        # one after another behind it (~11 min per KEEP at 2x with
+        # rfi_mode both); with filterbank.background it goes to the worker
+        # and this event's staging is released right away.
         fb_report: Dict[str, Any] = {"skipped": "disabled"}
         if self._cfg.filterbank.enabled and n_present > 0:
-            dec_deg = self._resolve_pointing_dec(name, c2row)
-            fb_report = run_for_event(
-                self._cfg.filterbank, ev_dir, name, c2row, dec_deg=dec_deg)
-            if fb_report.get("ok"):
-                self._counters["filterbanks_ok"] += 1
+            if self._cfg.filterbank.background:
+                fb_report = self._queue_filterbank(
+                    name, is_inj=is_inj, thread_ts=thread_ts, report=report)
             else:
-                self._counters["filterbanks_failed"] += 1
+                fb_report = self._run_filterbank(name, ev_dir, c2row)
 
         if (
             (n_present > 0 or skip_inj is not None)
@@ -567,18 +588,94 @@ class C3Service:
         # top-level message if the card post failed/was skipped — see
         # SlackNotifier.post_keep_followup). Never posted for injections.
         followup_status: Dict[str, Any] = {"ok": False, "error": "injection"}
-        if not is_inj:
-            followup_status = self._slack.post_keep_followup(
-                name, ev_dir, fb_report, report, thread_ts=thread_ts)
-            if self._cfg.slack.enabled:
-                if followup_status.get("ok"):
-                    self._counters["slack_followup_ok"] += 1
-                else:
-                    self._counters["slack_followup_failed"] += 1
+        if fb_report.get("queued"):
+            followup_status = {"ok": False, "error": "after the filterbank"}
+        elif not is_inj:
+            followup_status = self._post_followup(
+                name, ev_dir, fb_report, report, thread_ts)
 
         return {"keep": report, "filterbank": fb_report,
                 "cal_hdf5": cal_report,
                 "slack": {"card": card_status, "followup": followup_status}}
+
+    def _read_c2row(self, name: str, ev_dir: Path) -> Dict[str, Any]:
+        l3p = ev_dir / "Level3" / f"{name}.json"
+        try:
+            with l3p.open("r") as fh:
+                return (json.load(fh) or {}).get("c2", {}) or {}
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("keep %s: could not read %s: %s — slack summary "
+                        "will be sparse; filterbank beamforms at "
+                        "(l,m)=(0,0)", name, l3p, exc)
+            return {}
+
+    def _run_filterbank(self, name: str, ev_dir: Path,
+                        c2row: Mapping[str, Any]) -> Dict[str, Any]:
+        dec_deg = self._resolve_pointing_dec(name, c2row)
+        fb_report = run_for_event(
+            self._cfg.filterbank, ev_dir, name, c2row, dec_deg=dec_deg)
+        if fb_report.get("ok"):
+            self._counters["filterbanks_ok"] += 1
+        else:
+            self._counters["filterbanks_failed"] += 1
+        return fb_report
+
+    def _post_followup(self, name: str, ev_dir: Path,
+                       fb_report: Dict[str, Any], report: Dict[str, Any],
+                       thread_ts: Optional[str]) -> Dict[str, Any]:
+        status = self._slack.post_keep_followup(
+            name, ev_dir, fb_report, report, thread_ts=thread_ts)
+        if self._cfg.slack.enabled:
+            if status.get("ok"):
+                self._counters["slack_followup_ok"] += 1
+            else:
+                self._counters["slack_followup_failed"] += 1
+        return status
+
+    # ----- background filterbank --------------------------------------
+
+    def _queue_filterbank(self, name: str, *, is_inj: bool,
+                          thread_ts: Optional[str],
+                          report: Dict[str, Any]) -> Dict[str, Any]:
+        with self._state_lock:
+            self._fb_pending[name] = {
+                "is_inj": bool(is_inj), "thread_ts": thread_ts,
+                "report": report, "queued_unix": time.time()}
+        self._save_state()
+        self._fb_queue.put(name)
+        self._counters["filterbanks_queued"] += 1
+        LOG.info("filterbank %s: queued (%d waiting)", name,
+                 self._fb_queue.qsize())
+        return {"queued": True}
+
+    def _filterbank_one(self, name: str) -> None:
+        ent = self._fb_pending.get(name)
+        if ent is None:
+            return
+        ev_dir = self._cfg.archive_root / name
+        try:
+            fb_report = self._run_filterbank(
+                name, ev_dir, self._read_c2row(name, ev_dir))
+            LOG.info("filterbank %s: ok=%s (%.0f s after the KEEP)", name,
+                     fb_report.get("ok"),
+                     time.time() - float(ent.get("queued_unix") or 0))
+            if not ent.get("is_inj"):
+                self._post_followup(name, ev_dir, fb_report,
+                                    ent.get("report") or {},
+                                    ent.get("thread_ts"))
+        except Exception:  # noqa: BLE001
+            LOG.exception("background filterbank %s failed", name)
+        with self._state_lock:
+            self._fb_pending.pop(name, None)
+        self._save_state()
+
+    def _filterbank_worker(self) -> None:
+        while not self._fb_stop.is_set():
+            try:
+                name = self._fb_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            self._filterbank_one(name)
 
     def _resolve_pointing_dec(
         self, name: str, c2row: Mapping[str, Any],
@@ -821,6 +918,7 @@ class C3Service:
                     "ts_unix": time.time(),
                     "counters": dict(self._counters),
                     "cal_hdf5_pending": len(self._cal_pending),
+                    "filterbank_pending": len(self._fb_pending),
                     "n_processed": len(self._processed),
                     "flag_only": self._effective_flag_only(),
                     "flag_only_config": self._cfg.flag_only,
@@ -845,6 +943,17 @@ class C3Service:
             self._cfg.archive_root, self._cfg.rejected_root,
             self._cfg.flag_only, len(self._cfg.corr_nodes),
         )
+        fb_thread: Optional[threading.Thread] = None
+        if self._cfg.filterbank.background or self._fb_pending:
+            # filterbanks queued before a restart run first, oldest first
+            for name, _ent in sorted(
+                    self._fb_pending.items(),
+                    key=lambda kv: float(kv[1].get("queued_unix") or 0)):
+                self._fb_queue.put(name)
+            fb_thread = threading.Thread(
+                target=self._filterbank_worker, name="c3-filterbank",
+                daemon=True)
+            fb_thread.start()
         tasks = [
             asyncio.create_task(self._scan_loop(), name="c3-scan"),
             asyncio.create_task(self._mon_loop(), name="c3-mon"),
@@ -852,6 +961,7 @@ class C3Service:
         try:
             await self._stop.wait()
         finally:
+            self._fb_stop.set()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

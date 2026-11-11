@@ -126,6 +126,40 @@ def test_collect_fragments_skips_already_present(tmp_path: Path) -> None:
     assert "sb01" in calls[0]
 
 
+def test_collect_fragments_pulls_in_parallel(tmp_path: Path) -> None:
+    import threading
+    import time as _time
+    plans = plan_fragments(
+        event_name="ev", corr_nodes=_nodes(6),
+        staging_dir="/stage", dest_dir=tmp_path,
+    )
+    plans[2].dest.write_bytes(b"already-here")
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+    calls: List[str] = []
+
+    def fake_pull(remote: str, dest: Path) -> bool:
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+            calls.append(remote)
+        _time.sleep(0.05)
+        with lock:
+            state["now"] -= 1
+        if "sb04" in remote:
+            return False
+        dest.write_bytes(b"x")
+        return True
+
+    present, n_present = collect_fragments(plans, pull_fn=fake_pull,
+                                           max_workers=3)
+    assert state["max"] == 3                       # three at once, no more
+    assert len(calls) == 5                         # sb02 was already here
+    assert list(present) == [0, 1, 2, 3, 4, 5]     # plan order kept
+    assert present == {0: True, 1: True, 2: True, 3: True, 4: False, 5: True}
+    assert n_present == 5
+
+
 def test_plan_manifests_naming(tmp_path: Path) -> None:
     """Manifest sidecars (<event>_sbNN.json) — 2026-07-15: collected to
     h23 so dump-timing provenance survives the staging cleanup."""

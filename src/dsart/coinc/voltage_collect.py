@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
@@ -177,18 +178,26 @@ def collect_fragments(
     plans: List[FragmentPlan],
     *,
     pull_fn: Callable[[str, Path], bool] = lambda r, d: rsync_pull(r, d),
+    max_workers: int = 1,
 ) -> Tuple[Dict[int, bool], int]:
     """Attempt one pull pass over the not-yet-present fragments.
 
     Returns ``(present_by_chgroup, n_present)``. A fragment already on
-    disk counts as present without re-pulling.
+    disk counts as present without re-pulling. ``max_workers`` > 1 pulls
+    that many fragments at once (each from a different corr node): one
+    rsync stream runs at ~176 MB/s, so 16 x 7.2 GB took 11 min serially
+    at 2x (261111anyh).
     """
-    present: Dict[int, bool] = {}
-    for plan in plans:
-        if plan.dest.is_file() and plan.dest.stat().st_size > 0:
-            present[plan.chgroup] = True
-            continue
-        ok = bool(pull_fn(plan.remote, plan.dest))
-        present[plan.chgroup] = ok
+    have = {p.chgroup for p in plans
+            if p.dest.is_file() and p.dest.stat().st_size > 0}
+    todo = [p for p in plans if p.chgroup not in have]
+    if max_workers > 1 and len(todo) > 1:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as ex:
+            oks = list(ex.map(lambda p: bool(pull_fn(p.remote, p.dest)), todo))
+    else:
+        oks = [bool(pull_fn(p.remote, p.dest)) for p in todo]
+    pulled = {p.chgroup: ok for p, ok in zip(todo, oks)}
+    present: Dict[int, bool] = {
+        p.chgroup: p.chgroup in have or pulled[p.chgroup] for p in plans}
     n_present = sum(1 for v in present.values() if v)
     return present, n_present
