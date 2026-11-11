@@ -46,7 +46,7 @@ def test_ws_o_2x_criteria_file_loads_and_gates_in_ms() -> None:
     names = [c.name for c in ev.classes]
     assert names[:2] == ["bright_frb_extragalactic", "wide_frb_extragalactic"]
     req = ev.classes[0].require
-    assert req["width_median_max_ms"] == 8.3        # 2026-11-11: wide needs S/N 14
+    assert req["width_median_max_ms"] == 8.3        # 2026-11-11: wide needs S/N 20
     assert req["dm_median_max_pc_cc"] == 3100.0
     assert ev.evaluate(_stats(32, 524.288)).name == "wide_frb_extragalactic"   # 16.8 ms, S/N 20
     ev2 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)
@@ -55,8 +55,8 @@ def test_ws_o_2x_criteria_file_loads_and_gates_in_ms() -> None:
     ev3 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)
     assert ev3.evaluate(_stats(4, 524.288, dm=3050.0)).name == \
         "bright_frb_extragalactic"
-    ev4 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)                              # wide, S/N 13
-    assert ev4.evaluate(_stats(16, 524.288, snr=13.0)).action == "log_only"
+    ev4 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)                              # wide, S/N 19
+    assert ev4.evaluate(_stats(16, 524.288, snr=19.0)).action == "log_only"    # threshold 20
     # 261111kzsk + bvxk: one injection clustered as wide (S/N 45) then narrow
     # (S/N 144) 14 ms later -- the shared holdoff dumps it once
     clock = {"t": 0.0}

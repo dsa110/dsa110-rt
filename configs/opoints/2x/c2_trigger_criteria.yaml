@@ -119,8 +119,12 @@ trigger_classes:
       (5.9 -> ~3/h) and costs 33 of 555 injections (all wide, S/N 11-14).
       Needs coinc.dedupe_fired_clusters (a narrow bright burst whose
       cluster widens during the bright holdoff must not dump again here).
+      2026-11-11 22:40 (user): threshold 14 -> 20. Replay of the same 29.5 h
+      (events = dumps >= 30 s apart): sky events 160 (old criteria) -> 115
+      at S/N 14 -> 76 at S/N 20 (-53%); injection events 200 -> 191 (the
+      lost ones are wide injections at S/N 14-20).
     require:
-      snr_max_min: 14.0
+      snr_max_min: 20.0
       n_events_min: 1
       n_search_nodes_min: 1
       dm_median_min_pc_cc: 115.0
