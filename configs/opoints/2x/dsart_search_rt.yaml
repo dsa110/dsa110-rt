@@ -926,6 +926,11 @@ c3:
   # matcher missed at fire time. Empty string disables the fallback.
   fired_injection_log: /dataz/dsa110/operations/inject/fired_injections.jsonl
   staging_dir: /home/ubuntu/data/voltage_staging
+  # 2026-11-11 (user): don't collect voltages for CONFIRMED injections (C2
+  # marker, C1 inj_id, or a tight DM+sky+time fired-log match) -- ~108 GB
+  # each at 2x; still KEPT, staging released. Events only the loose
+  # backstop above calls injections are collected as real.
+  collect_injection_voltages: false
   voltage_port: 11229
   expected_cube_count: 8
   scan_interval_s: 10.0

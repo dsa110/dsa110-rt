@@ -851,3 +851,69 @@ def event_is_injection(
         except Exception:  # noqa: BLE001 - backstop must never raise
             pass
     return False
+
+
+#: :func:`confirmed_injection_id` sky / time gates for the fired-log match:
+#: ~3 image cells (0.6 mrad each) and the arm-to-detection lag. The
+#: KEEP-side backstop above is far looser (0.06 rad, +120 s) -- safe for an
+#: exemption, not for skipping voltage collection.
+CONFIRM_LM_TOL_RAD = 0.002
+CONFIRM_WALL_PRE_S = 10.0
+CONFIRM_WALL_POST_S = 30.0
+
+
+def confirmed_injection_id(
+    event_dir: Path,
+    event_name: str,
+    *,
+    fired_log_path: Optional[Path] = None,
+) -> Optional[str]:
+    """How the event is KNOWN to be an injection, or ``None``.
+
+    For actions that lose data when wrong (C3 skips voltage collection):
+    C2's fire-time ``injection.is_injection`` marker, a C1-window
+    ``inj_id``, or the trigger row matching ONE fired injection in DM
+    (10%), sky (``CONFIRM_LM_TOL_RAD``) and time. (2026-11-09: the loose
+    backstop of :func:`event_is_injection` labelled real events at DM
+    149-1035 as injections because a probe fired within two minutes.)
+    """
+    import csv
+    import json
+
+    event_dir = Path(event_dir)
+    try:
+        with (event_dir / "Level3" / f"{event_name}.json").open("r") as fh:
+            inj = (json.load(fh) or {}).get("injection")
+        if isinstance(inj, dict) and bool(inj.get("is_injection")):
+            return f"c2:{inj.get('inj_id', '')}"
+    except (OSError, ValueError):
+        pass
+    try:
+        with (event_dir / "Level2" / f"C1_window_{event_name}.csv").open(
+                "r", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError:
+        return None
+    for row in rows:
+        if str(row.get("inj_id", "")).strip():
+            return f"csv:{row['inj_id'].strip()}"
+    if fired_log_path is None or not rows:
+        return None
+    try:
+        from .inject_log import event_coincident_inj_id, load_fired_injections
+
+        fired = load_fired_injections(fired_log_path)
+        trig = max(rows, key=lambda r: float(r.get("snr", 0.0) or 0.0))
+        mjd = float(trig.get("mjd", 0.0) or 0.0)
+        if not mjd > 0.0:                    # no time gate -> not confirmed
+            return None
+        hit = event_coincident_inj_id(
+            fired, mjd=mjd,
+            dm_pc_cc=float(trig.get("dm_pc_cc", 0.0) or 0.0),
+            l_rad=float(trig.get("l_rad", 0.0) or 0.0),
+            m_rad=float(trig.get("m_rad", 0.0) or 0.0),
+            lm_tol_rad=CONFIRM_LM_TOL_RAD, wall_pre_s=CONFIRM_WALL_PRE_S,
+            wall_post_s=CONFIRM_WALL_POST_S)
+        return f"fired:{hit}" if hit is not None else None
+    except Exception:  # noqa: BLE001 - never raise; unknown = not confirmed
+        return None

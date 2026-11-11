@@ -46,6 +46,7 @@ from ..coinc.broadcast import DEFAULT_VOLTAGE_PORT, VoltageBroadcaster
 from ..coinc.cube_veto import (
     CubeVetoThresholds,
     compute_metrics,
+    confirmed_injection_id,
     decide,
     event_is_injection,
 )
@@ -115,6 +116,12 @@ class C3Config:
     collect_no_show_grace_s: float = 120.0
     rsync_bwlimit_kbps: int = 0
     cleanup_staging_after_keep: bool = True
+    # False: a CONFIRMED injection (cube_veto.confirmed_injection_id -- C2's
+    # marker, a C1 inj_id, or a tight DM+sky+time match to the fired log)
+    # is still KEPT but its voltages are not collected (~108 GB each at
+    # 2x); its staged fragments are released on the corr nodes. Events
+    # only the loose KEEP backstop calls injections are collected as real.
+    collect_injection_voltages: bool = True
     flag_only: bool = True               # conservative default
     mon_key: str = "/mon/c3/h23"
     mon_interval_s: float = 5.0
@@ -188,6 +195,8 @@ class C3Config:
             rsync_bwlimit_kbps=int(c3.get("rsync_bwlimit_kbps", 0)),
             cleanup_staging_after_keep=bool(
                 c3.get("cleanup_staging_after_keep", True)),
+            collect_injection_voltages=bool(
+                c3.get("collect_injection_voltages", True)),
             flag_only=bool(c3.get("flag_only", True)),
             mon_key=str(c3.get("mon_key", "/mon/c3/h23")),
             mon_interval_s=float(c3.get("mon_interval_s", 5.0)),
@@ -451,7 +460,11 @@ class C3Service:
         thread_ts = card_status.get("ts")
 
         dest = ev_dir / "Level2" / "voltages"
-        plans = plan_fragments(
+        skip_inj = None
+        if is_inj and not self._cfg.collect_injection_voltages:
+            skip_inj = confirmed_injection_id(
+                ev_dir, name, fired_log_path=self._cfg.fired_injection_log)
+        plans = [] if skip_inj is not None else plan_fragments(
             event_name=name,
             corr_nodes=self._cfg.corr_nodes,
             staging_dir=self._cfg.staging_dir,
@@ -483,6 +496,10 @@ class C3Service:
             "n_fragments_total": n_total,
             "present_by_chgroup": {str(k): v for k, v in present.items()},
         }
+        if skip_inj is not None:
+            report["skipped"] = f"confirmed injection ({skip_inj})"
+            self._counters["injection_voltages_skipped"] = (
+                self._counters.get("injection_voltages_skipped", 0) + 1)
         # Staging manifests (<event>_sbNN.json: target/first/last block,
         # drop list, mjd_target). Best-effort, single pass, NOT counted
         # toward completion — but MUST land before the staging-cleanup
@@ -535,11 +552,12 @@ class C3Service:
                 self._counters["filterbanks_failed"] += 1
 
         if (
-            n_present > 0
+            (n_present > 0 or skip_inj is not None)
             and self._cfg.cleanup_staging_after_keep
             and self._broadcaster is not None
         ):
-            # Voltages are safely in the candidate dir → free corr NVMe.
+            # Voltages are safely in the candidate dir (or, for a confirmed
+            # injection, not wanted) -> free corr NVMe.
             self._broadcaster.broadcast(name, 0, 0.0)
 
         # Slack bbproc follow-up (best-effort; never affects the KEEP
