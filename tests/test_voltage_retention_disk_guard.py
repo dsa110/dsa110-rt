@@ -241,6 +241,26 @@ def test_worker_normal_dump_still_succeeds(tmp_path, monkeypatch):
     assert svc._staged_bytes == out_path.stat().st_size
 
 
+def test_snap_epoch_dumps_do_not_sit_out_the_wait(tmp_path, monkeypatch):
+    # 2026-11-11: the post-window wait compared the raw SNAP-epoch block
+    # (~6.4e6) with the ring's blocks (~5e3), so every 2x dump waited the
+    # full dump_wait_s and a second trigger for the same moment found its
+    # window lapped. Both post windows here are already in the ring.
+    svc = _make_service(tmp_path, dump_wait_s=3.0, event_specnum_epoch="snap")
+    svc._utc_start_specnum = 13_152_864_534
+    Usage = type("Usage", (), {})
+    usage = Usage()
+    usage.free = 500 * (1 << 30)
+    monkeypatch.setattr(vr.shutil, "disk_usage", lambda p: usage)
+
+    svc._q.put_nowait(("dump", "xtla", 13_152_864_534 + 1 * 2048, 0.0))
+    svc._q.put_nowait(("dump", "xwfr", 13_152_864_534 + 1 * 2048 + 352, 0.0))
+    t0 = time.monotonic()
+    _drain_worker(svc, timeout=10.0)
+    assert time.monotonic() - t0 < 1.5
+    assert svc._counters["dumps_done"] == 2
+
+
 def test_staged_bytes_seeded_from_existing_files(tmp_path):
     (tmp_path / "preexisting_sb00_data.out").write_bytes(b"x" * 4096)
     svc = _make_service(tmp_path)

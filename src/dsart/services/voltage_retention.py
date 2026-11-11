@@ -687,7 +687,36 @@ class VoltageRetentionService:
                             name, n,
                         )
                     continue
-                target = specnum_to_block_n(specnum)
+                if not self._armed_mjd_read:
+                    # once per process; the arm record is fixed for the
+                    # lifetime of this capture epoch
+                    self._armed_mjd_read = True
+                    doc = self._mon_store.get_dict("/mon/snap/1/armed_mjd") or {}
+                    try:
+                        v = float(doc.get("armed_mjd") or 0.0)
+                        self._armed_mjd = v if v > 40000.0 else None
+                    except (TypeError, ValueError):
+                        self._armed_mjd = None
+                if (self._cfg.event_specnum_epoch == "snap"
+                        and self._utc_start_specnum is None):
+                    # the fada attach (header read) precedes the operator's arm, so the
+                    # capture mon had no armed specnum yet: read it now, after the arm
+                    self._utc_start_specnum = _utc_start_from_capture_mon()
+                try:
+                    specnum_ring = capture_relative_specnum(
+                        specnum, epoch=self._cfg.event_specnum_epoch,
+                        utc_start_specnum=self._utc_start_specnum)
+                except ValueError as exc:
+                    self._counters["dumps_failed"] += 1
+                    LOG.error("voltage_retention: dump %s %s not placed: %s", name,
+                              self._cfg.sb, exc)
+                    continue
+                # Ring block numbers. 2026-11-11: the wait used the raw
+                # SNAP-epoch block (~6.4e6 vs a ring at ~5e3), so every 2x
+                # dump sat out the full dump_wait_s; a second trigger for
+                # the same moment (C2 fires two classes ~20 ms apart) then
+                # found its window lapped: 5 of 18 dumps wrote 0 blocks.
+                target = specnum_to_block_n(specnum_ring)
                 self._wait_for_post(target)
 
                 # --- 2026-07-21 disk-headroom guard (ENOSPC fleet stall) ---
@@ -731,30 +760,6 @@ class VoltageRetentionService:
                     )
                     continue
 
-                if not self._armed_mjd_read:
-                    # once per process; the arm record is fixed for the
-                    # lifetime of this capture epoch
-                    self._armed_mjd_read = True
-                    doc = self._mon_store.get_dict("/mon/snap/1/armed_mjd") or {}
-                    try:
-                        v = float(doc.get("armed_mjd") or 0.0)
-                        self._armed_mjd = v if v > 40000.0 else None
-                    except (TypeError, ValueError):
-                        self._armed_mjd = None
-                if (self._cfg.event_specnum_epoch == "snap"
-                        and self._utc_start_specnum is None):
-                    # the fada attach (header read) precedes the operator's arm, so the
-                    # capture mon had no armed specnum yet: read it now, after the arm
-                    self._utc_start_specnum = _utc_start_from_capture_mon()
-                try:
-                    specnum_ring = capture_relative_specnum(
-                        specnum, epoch=self._cfg.event_specnum_epoch,
-                        utc_start_specnum=self._utc_start_specnum)
-                except ValueError as exc:
-                    self._counters["dumps_failed"] += 1
-                    LOG.error("voltage_retention: dump %s %s not placed: %s", name,
-                              self._cfg.sb, exc)
-                    continue
                 manifest = write_window_to_staging(
                     ring=self._ring,
                     event_name=name,
