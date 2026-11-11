@@ -5,11 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import shutil
+
+import pytest
+
 from dsart.coinc.voltage_collect import (
     CorrNode,
     collect_fragments,
     collection_done,
     plan_fragments,
+    rsync_pull,
 )
 
 
@@ -178,3 +183,24 @@ def test_plan_manifests_naming(tmp_path: Path) -> None:
         "ubuntu@n03.pro.pvt:/home/ubuntu/data/voltage_staging/"
         "260715twmx_sb00.json")
     assert plans[1].dest == tmp_path / "260715twmx_sb15.json"
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="needs rsync")
+def test_rsync_pull_never_leaves_a_partial_under_the_final_name(tmp_path: Path) -> None:
+    # 2026-11-11: a C3 restart mid-pull left 261111xtla_sb05 at 2.4 of 7.2 GB
+    # under its final name; the next C3 counted it present.
+    src = tmp_path / "stage" / "ev_sb05_data.out"
+    src.parent.mkdir()
+    src.write_bytes(bytes(range(256)) * 4096)
+    dest = tmp_path / "voltages" / "ev_sb05_data.out"
+    part = dest.with_name(dest.name + ".partial")
+    dest.parent.mkdir()
+    part.write_bytes(src.read_bytes()[:300_000])          # an interrupted pull
+    plans = plan_fragments(event_name="ev", corr_nodes=_nodes(1),
+                           staging_dir="/stage", dest_dir=dest.parent)
+    assert collect_fragments(plans, pull_fn=lambda r, d: False)[1] == 0   # not present
+    assert rsync_pull(str(src), dest)
+    assert dest.read_bytes() == src.read_bytes() and not part.exists()
+    missing = tmp_path / "voltages" / "ev_sb06_data.out"
+    assert not rsync_pull(str(src.parent / "nope_data.out"), missing)
+    assert not missing.exists()

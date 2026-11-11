@@ -150,13 +150,20 @@ def rsync_pull(remote: str, dest: Path, *, timeout_s: float = 600.0,
 
     A missing remote file (rsync exit 23/24) is a normal "not ready yet"
     and returns False without raising.
+
+    The transfer lands in ``<dest>.partial`` (resumed in place by the next
+    attempt) and is renamed to ``dest`` only when rsync succeeds, so a
+    non-empty ``dest`` is always complete. 2026-11-11: a C3 restart
+    mid-pull left 261111xtla_sb05 at 2.4 of 7.2 GB under its final name;
+    the new C3 counted it present and released the corr copy.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".partial")
     cmd = ["rsync", "-a", "--partial", "--inplace"]
     if bwlimit_kbps > 0:
         cmd.append(f"--bwlimit={int(bwlimit_kbps)}")
-    cmd += [remote, str(dest)]
+    cmd += [remote, str(part)]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, timeout=timeout_s, check=False,
@@ -164,7 +171,8 @@ def rsync_pull(remote: str, dest: Path, *, timeout_s: float = 600.0,
     except (subprocess.TimeoutExpired, OSError) as exc:
         LOG.warning("rsync %s failed: %s", " ".join(shlex.quote(c) for c in cmd), exc)
         return False
-    if proc.returncode == 0 and dest.is_file():
+    if proc.returncode == 0 and part.is_file():
+        part.replace(dest)
         return True
     if proc.returncode not in (0, 23, 24):
         LOG.warning(
