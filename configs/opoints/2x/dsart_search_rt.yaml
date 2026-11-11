@@ -214,6 +214,8 @@ routines:
       --cutout-retention-max-age-h 96
       --cutout-retention-max-total-gb 150
       --cutout-retention-low-water-gb 120
+      --max-lag-cycles 25
+      --cutout-batch-pause-s 0.05
       --mon-interval-s 2.0
       --max-cycles 0
       --log-level INFO
@@ -265,6 +267,8 @@ routines:
       --cutout-retention-max-age-h 96
       --cutout-retention-max-total-gb 150
       --cutout-retention-low-water-gb 120
+      --max-lag-cycles 25
+      --cutout-batch-pause-s 0.05
       --mon-interval-s 2.0
       --max-cycles 0
       --log-level INFO

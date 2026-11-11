@@ -543,6 +543,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--cutout-retention-max-total-gb", type=float, default=150.0,
                    help="0 = no retention sweeper")
     p.add_argument("--cutout-retention-low-water-gb", type=float, default=120.0)
+    p.add_argument("--max-lag-cycles", type=int, default=8,
+                   help="seek forward when the newest complete cycle is this far ahead "
+                        "(2026-11-11: 8 = 1.6 s made every half seek ~10 s after each C2 dump, "
+                        "during the cutout build)")
+    p.add_argument("--cutout-batch-pause-s", type=float, default=0.0,
+                   help="pause between cutout re-imaging batches (spreads the build's PCIe / "
+                        "host-memory load against the live search)")
     p.add_argument("--mon-interval-s", type=float, default=2.0)
     p.add_argument("--max-cycles", type=int, default=0)
     p.add_argument("--ring-access", default="pread", choices=("pread", "mmap"),
@@ -612,7 +619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         producer = CutoutProducer(eng, search_node_id=a.search_node_id, gpu_half=a.gpu_half,
                                   out_root=Path(a.cutout_root), plan=plan,
                                   plan_id=int(plan.plan_id), geometry=geom,
-                                  clock_mjd=lambda t0e: clock.mjd_of_native(int(t0e) * ext))
+                                  clock_mjd=lambda t0e: clock.mjd_of_native(int(t0e) * ext),
+                                  batch_pause_s=float(a.cutout_batch_pause_s))
         if a.upload_dest_host:
             producer.uploaders = make_uploaders(sid=a.search_node_id, g=a.gpu_half,
                                                 dest_host=a.upload_dest_host,
@@ -634,7 +642,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 thread_name=f"cutout-retention-g{a.gpu_half}")
             retention.start()
     svc = OwnerService(eng, search_node_id=a.search_node_id, gpu_half=a.gpu_half, c1_pool=pool,
-                       emit=emit, cutout=producer, geom=geom)
+                       emit=emit, cutout=producer, geom=geom,
+                       max_lag_cycles=int(a.max_lag_cycles))
     mon = MonThread(svc, opoint=a.opoint, put=_etcd_put(), interval_s=a.mon_interval_s)
     mon.start()
     n = 0

@@ -475,3 +475,20 @@ def test_listener_copies_on_the_socket_thread_and_builds_on_a_worker(tmp_path):
         th.join(timeout=10)
         st_sock.close()
     assert not th.is_alive()
+
+
+def test_batch_pause_runs_once_per_reimage_batch(monkeypatch):
+    """--cutout-batch-pause-s (2026-11-11): the build pauses between re-imaging batches so it
+    does not starve the live search (every half seeked ~10 s after each C2 dump)."""
+    from dsart.x2.search import cutout_service as CS
+
+    eng = _engine()
+    naps = []
+    monkeypatch.setattr(CS.time, "sleep", lambda s: naps.append(s))
+    src = CutoutImages(eng, t0_ext=800, n_t=64, batch_rows=8, batch_pause_s=0.05)
+    src.valid()                                               # re-images every owned DM
+    n_batches = sum(-(-(64 // eng.plan.ext_factor(s)) // 8) for s in eng.plan.dms)
+    assert naps == [0.05] * n_batches
+    naps.clear()
+    CutoutImages(eng, t0_ext=800, n_t=64, batch_rows=8).valid()
+    assert naps == []                                          # default: no pause

@@ -204,7 +204,7 @@ class CutoutImages:
 
     def __init__(self, engine, *, t0_ext: int, n_t: int,
                  raw: Optional[Dict[int, tuple]] = None, pix: tuple = (-1, -1),
-                 batch_rows: int = 32) -> None:
+                 batch_rows: int = 32, batch_pause_s: float = 0.0) -> None:
         self.eng = engine
         self.t0 = int(t0_ext)
         self.n_t = int(n_t)
@@ -212,6 +212,7 @@ class CutoutImages:
         self.pix = (int(pix[0]), int(pix[1]))
         self.cache: "Dict[int, dict]" = {}
         self.batch_rows = int(batch_rows)
+        self.batch_pause_s = float(batch_pause_s)
         self.specs = [s for s in sorted(engine.plan.dms, key=lambda s: s.d)]
         self.offsets = np.concatenate([[0], np.cumsum([s.n_fdm for s in self.specs])])
 
@@ -244,6 +245,8 @@ class CutoutImages:
             s, _found = self.eng.sigma_at(spec.d, rows)
             sig.append(s)
             vf.append((len(rows), v))
+            if self.batch_pause_s > 0:                           # let the live search breathe
+                time.sleep(self.batch_pause_s)
         idx = t_rows - tlo                                       # ext row -> tier row
         ent = dict(img=tier_img, idx=idx, sigma=np.concatenate(sig, axis=0)[idx],
                    peak=peak[idx], pix=ppix[idx], lc=lc[idx] if lc.shape[0] else lc,
@@ -294,7 +297,8 @@ class CutoutProducer:
 
     def __init__(self, engine, *, search_node_id: int, gpu_half: int, out_root: Path,
                  plan=None, plan_id: int = 0, code_version: str = "", queue_depth: int = 8,
-                 geometry: Optional[dict] = None, clock_mjd=None) -> None:
+                 geometry: Optional[dict] = None, clock_mjd=None,
+                 batch_pause_s: float = 0.0) -> None:
         self.eng = engine
         self.sid = int(search_node_id)
         self.g = int(gpu_half)
@@ -305,6 +309,7 @@ class CutoutProducer:
         self.queue_depth = int(queue_depth)
         self.geometry = dict(geometry or dict(n_grid=engine.cfg.n_grid))
         self.clock_mjd = clock_mjd
+        self.batch_pause_s = float(batch_pause_s)
         self.uploaders: Optional[tuple] = None
         self.last_latency_ms = 0
         self._q: list = []
@@ -470,7 +475,7 @@ class CutoutProducer:
 
         t0 = int(req.t0_ext)
         src = CutoutImages(self.eng, t0_ext=t0, n_t=int(req.n_t), raw=snaps or {},
-                           pix=(int(req.l_pix), int(req.m_pix)))
+                           pix=(int(req.l_pix), int(req.m_pix)), batch_pause_s=self.batch_pause_s)
         # the engine's own DMs (not the whole half's: an engine may own a subset)
         axis = fine_axis_for_owner(self.eng.plan, self.plan,
                                    t_ext_native=self.eng.plan.ext_native)
