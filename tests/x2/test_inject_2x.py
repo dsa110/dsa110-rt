@@ -57,6 +57,13 @@ def test_ws_o_2x_criteria_file_loads_and_gates_in_ms() -> None:
         "bright_frb_extragalactic"
     ev4 = CriteriaEvaluator(CRIT_2X, opoint=SEL2)                              # wide, S/N 13
     assert ev4.evaluate(_stats(16, 524.288, snr=13.0)).action == "log_only"
+    # 261111kzsk + bvxk: one injection clustered as wide (S/N 45) then narrow
+    # (S/N 144) 14 ms later -- the shared holdoff dumps it once
+    clock = {"t": 0.0}
+    ev5 = CriteriaEvaluator(CRIT_2X, opoint=SEL2, now=lambda: clock["t"])
+    assert ev5.evaluate(_stats(32, 524.288, snr=45.0, dm=1029.0)).name == "wide_frb_extragalactic"
+    clock["t"] = 0.014
+    assert ev5.evaluate(_stats(2, 524.288, snr=144.0, dm=999.0)).action == "log_only"
 
 
 def test_ws_o_2x_search_config_parses_with_2x_defaults() -> None:

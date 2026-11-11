@@ -105,6 +105,7 @@ trigger_classes:
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
     holdoff_s: 30.0
+    holdoff_group: bright_frb_extragalactic   # shared with wide_frb_extragalactic
 
   - name: wide_frb_extragalactic
     description: >-
@@ -131,6 +132,10 @@ trigger_classes:
       dm_galactic_fraction_min: 0.75
     action: dump_all_gpus
     holdoff_s: 30.0
+    # One holdoff clock with bright_frb_extragalactic (they were one class
+    # before the split): a burst whose detections cluster into a narrow and
+    # a wide cluster 14 ms apart was dumped twice (261111kzsk + bvxk).
+    holdoff_group: bright_frb_extragalactic
 
   - name: faint_frb_extragalactic
     description: >-

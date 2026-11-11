@@ -395,3 +395,65 @@ trigger_classes:
     m3 = ev.evaluate(_stats(snr_max=15.0, dm_galactic_fraction=0.30))
     assert m3 is not None
     assert m3.name == "gal"
+
+
+def test_criteria_holdoff_group_shares_one_clock(tmp_path: Path) -> None:
+    """2026-11-11: bright (narrow) and wide share a holdoff_group, so one burst
+    split into a narrow and a wide cluster is not dumped twice; a class
+    outside the group keeps its own clock."""
+    p = tmp_path / "c.yaml"
+    _write(p, """
+trigger_classes:
+  - name: narrow
+    require:
+      snr_max_min: 12.0
+      width_median_max_samples: 8
+    action: dump_all_gpus
+    holdoff_s: 30.0
+    holdoff_group: bright
+  - name: wide
+    require:
+      snr_max_min: 14.0
+      width_median_min_samples: 9
+    action: dump_all_gpus
+    holdoff_s: 30.0
+    holdoff_group: bright
+  - name: faint
+    require:
+      snr_max_min: 11.0
+      snr_max_max: 11.99
+    action: dump_all_gpus
+    holdoff_s: 30.0
+  - name: log_only
+    require:
+      n_events_min: 1
+    action: log_only
+""")
+    clock = {"t": 100.0}
+    ev = CriteriaEvaluator(p, now=lambda: clock["t"])
+    assert {c.name: c.holdoff_key for c in ev.classes} == {
+        "narrow": "bright", "wide": "bright", "faint": "faint", "log_only": "log_only"}
+    wide, narrow = _stats(snr_max=45.0, width_median=16.0), _stats(snr_max=144.0, width_median=2.0)
+    assert ev.evaluate(wide).name == "wide"
+    clock["t"] = 100.014                                   # the peak cluster, 14 ms later
+    assert ev.evaluate(narrow).name == "log_only"
+    assert ev.evaluate(_stats(snr_max=11.5, width_median=2.0)).name == "faint"   # own clock
+    snap = ev.last_fired_at_snapshot()
+    assert {"bright", "faint"} <= set(snap) and "narrow" not in snap and "wide" not in snap
+    ev.restore_last_fired_at("bright", None)              # C2's dumps-gate rollback, by key
+    assert ev.evaluate(narrow).name == "narrow"
+    clock["t"] = 131.0
+    assert ev.evaluate(wide).name == "wide"
+
+
+def test_criteria_holdoff_group_must_be_a_string(tmp_path: Path) -> None:
+    p = tmp_path / "c.yaml"
+    _write(p, """
+trigger_classes:
+  - name: a
+    require: {snr_max_min: 12.0}
+    action: dump_all_gpus
+    holdoff_group: [x]
+""")
+    with pytest.raises(BadCriteriaFile):
+        CriteriaEvaluator(p)

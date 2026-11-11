@@ -4,7 +4,8 @@ Each criterion is a :class:`TriggerClass` describing a ``require``
 predicate over :class:`dsart.coinc.stats.ClusterStats` and an
 ``action``. The evaluator walks the classes top-to-bottom on each
 cluster; the first one whose ``require`` block satisfies and whose
-holdoff window has elapsed wins.
+holdoff window has elapsed wins. Classes with the same optional
+``holdoff_group`` share one holdoff clock (default: each class its own).
 
 YAML schema (single source of truth: ``configs/c2_trigger_criteria.yaml``):
 
@@ -261,6 +262,15 @@ class TriggerClass:
     action: str
     holdoff_s: float = 0.0
     description: str = ""
+    #: Classes sharing a holdoff_group share one holdoff clock (default: the
+    #: class's own name). 2026-11-11: the 2x retune split bright into
+    #: bright (narrow) + wide; one burst whose detections cluster into a
+    #: narrow and a wide cluster 14 ms apart was dumped twice.
+    holdoff_group: str = ""
+
+    @property
+    def holdoff_key(self) -> str:
+        return self.holdoff_group or self.name
 
 
 def _validate_class(entry: Mapping[str, Any], idx: int) -> TriggerClass:
@@ -301,12 +311,18 @@ def _validate_class(entry: Mapping[str, Any], idx: int) -> TriggerClass:
             f"trigger_classes[{idx}].holdoff_s={holdoff} must be >= 0"
         )
     description = str(entry.get("description", "") or "")
+    group = entry.get("holdoff_group", "") or ""
+    if not isinstance(group, str):
+        raise BadCriteriaFile(
+            f"trigger_classes[{idx}].holdoff_group must be a string"
+        )
     return TriggerClass(
         name=name,
         require={k: float(v) for k, v in require.items()},
         action=action,
         holdoff_s=holdoff,
         description=description,
+        holdoff_group=group,
     )
 
 
@@ -461,10 +477,10 @@ class CriteriaEvaluator:
             if not _matches(stats, cls.require):
                 continue
             if cls.holdoff_s > 0.0:
-                last = self._last_fired_at.get(cls.name, -float("inf"))
+                last = self._last_fired_at.get(cls.holdoff_key, -float("inf"))
                 if (now - last) < cls.holdoff_s:
                     continue
-            self._last_fired_at[cls.name] = now
+            self._last_fired_at[cls.holdoff_key] = now
             return cls
         return None
 

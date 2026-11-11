@@ -1718,7 +1718,7 @@ class CoincidencerService:
             tc = self._criteria.evaluate(stats)
             if tc is None:
                 continue
-            prev_holdoff = holdoff_snapshot.get(tc.name)
+            prev_holdoff = holdoff_snapshot.get(tc.holdoff_key)
             await self._fire(
                 stats, members, tc, prev_holdoff=prev_holdoff,
             )
@@ -1940,7 +1940,7 @@ class CoincidencerService:
             self._counters["triggers_startup_grace"] += 1
             if prev_holdoff is not None:
                 self._criteria.restore_last_fired_at(
-                    trigger_class.name, prev_holdoff,
+                    trigger_class.holdoff_key, prev_holdoff,
                 )
             elapsed = (
                 time.monotonic() - self._first_batch_mono
@@ -1964,7 +1964,7 @@ class CoincidencerService:
                 self._counters["dumps_dedup_suppressed"] += 1
                 if prev_holdoff is not None:
                     self._criteria.restore_last_fired_at(
-                        trigger_class.name, prev_holdoff,
+                        trigger_class.holdoff_key, prev_holdoff,
                     )
                 _LOG.info(
                     "DUMP DEDUP-SUPPRESSED class=%s n=%d snr_max=%.2f "
@@ -2026,7 +2026,7 @@ class CoincidencerService:
             if sidereal_vetoed:
                 self._counters["dumps_sidereal_vetoed"] += 1
                 self._criteria.restore_last_fired_at(
-                    trigger_class.name, prev_holdoff,
+                    trigger_class.holdoff_key, prev_holdoff,
                 )
                 _LOG.warning(
                     "DUMP SIDEREAL-VETOED class=%s name=%s n=%d "
@@ -2047,7 +2047,7 @@ class CoincidencerService:
             if self._dm_comb_vetoed(stats):
                 self._counters["dumps_dm_comb_vetoed"] += 1
                 self._criteria.restore_last_fired_at(
-                    trigger_class.name, prev_holdoff,
+                    trigger_class.holdoff_key, prev_holdoff,
                 )
                 _LOG.warning(
                     "DUMP DM-COMB-VETOED class=%s name=%s n=%d snr_max=%.2f "
@@ -2088,7 +2088,7 @@ class CoincidencerService:
                 # trigger after dumps re-enable fires immediately.
                 self._counters["triggers_suppressed"] += 1
                 self._criteria.restore_last_fired_at(
-                    trigger_class.name, prev_holdoff,
+                    trigger_class.holdoff_key, prev_holdoff,
                 )
                 _LOG.info(
                     "WOULD-DUMP class=%s name=%s n=%d snr_max=%.2f "
