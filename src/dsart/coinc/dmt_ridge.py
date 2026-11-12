@@ -44,7 +44,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 __all__ = ["RidgeConfig", "RidgeFeatures", "ridge_features", "slope_of_freq", "freq_of_slope",
-           "dm_time_from_cutouts", "boxcar_rows", "robust_rows"]
+           "dm_time_from_cutouts", "boxcar_rows", "robust_rows", "event_ridge", "narrowband_verdict"]
 
 K_DM_MS_GHZ2 = 4.148808          # ms GHz^2 cm^3 / pc
 NU_LO_MHZ = 1311.28              # 2x time reference (bottom of the processed band)
@@ -302,6 +302,17 @@ def dm_time_from_cutouts(event_dir, *, kind: str = "pix") -> Optional[Dict[str, 
     return {"plane": np.stack([rows[i] for i in order]), "dms": np.asarray(dms)[order],
             "t_trig": planes[0][3] - t_lo, "width": max(1, planes[0][4]), "dm_trig": planes[0][5],
             "n_halves": len(planes)}
+
+
+def narrowband_verdict(f: RidgeFeatures, *, bw_max_mhz: float = 6.0, f_min: float = 0.45,
+                       sigma_min: float = 8.0) -> bool:
+    """R12: a line narrower than ``bw_max_mhz`` that carries the trigger.
+
+    Defaults from docs/x2/dmt_ridge_study (0/26 legacy FRBs, 0 of 4 other
+    FRB records, B1933+16 and 11 injections flagged; 10/11 voltage-confirmed narrow-band).
+    ``bw_fit_mhz == 0`` means no line was found.
+    """
+    return bool(f.ok and 0.0 < f.bw_fit_mhz <= bw_max_mhz and f.f_fit >= f_min and f.fit_sigma >= sigma_min)
 
 
 def event_ridge(event_dir, *, kind: str = "pix", cfg: RidgeConfig = RidgeConfig()):

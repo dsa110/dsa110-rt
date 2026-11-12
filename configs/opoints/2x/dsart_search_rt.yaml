@@ -1004,6 +1004,22 @@ c3:
   # h23 br2 is 40G). C3 logs "collect <event>: n/16 fragments in T s".
   collect_parallel: 4
   cleanup_staging_after_keep: true   # free corr NVMe staging once fragments are safely on h23
+  # ---- R12: DM-time ridge narrow-band rule (2026-11-12) -------------------
+  # docs/x2/dmt_ridge_study: a narrow-band impulse draws a line through the
+  # trigger in the cutout DM-time plane (slope = its frequency, in-focus DM
+  # range = w nu^3 / (2 k B)). Fires when the fitted B <= 6 MHz (user-agreed
+  # cut) and the line carries the trigger (f >= 0.45) at >= 8 sigma: 0/26
+  # legacy FRBs, 0 of zzeg/twmx/quga/B1933+16/11 injections, 10/11 voltage-
+  # confirmed narrow-band. mode shadow = record + archive only; reject = the
+  # user-approved P3 (REJECT: no voltages, no cubes). Injections never.
+  r12:
+    enabled: true
+    mode: shadow
+    bw_max_mhz: 6.0
+    f_min: 0.45
+    sigma_min: 8.0
+    plane: pix
+    archive_dir: /dataz/dsa110/operations/c3/dmt     # ~0.7 MB per event, every event
   # Rollout safety: flag_only logs every veto decision + writes the audit
   # sidecar but performs NO destructive REJECT actions (still collects
   # voltages). Per the FP-analysis plan: run flag-first for a few days,

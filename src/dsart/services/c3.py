@@ -42,16 +42,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
+import numpy as np
 import yaml
 
 from ..coinc.broadcast import DEFAULT_VOLTAGE_PORT, VoltageBroadcaster
 from ..coinc.cube_veto import (
     CubeVetoThresholds,
+    VetoDecision,
     compute_metrics,
     confirmed_injection_id,
     decide,
     event_is_injection,
 )
+from ..coinc.dmt_ridge import event_ridge, narrowband_verdict
 from ..coinc.cal_hdf5_archive import CalHdf5Config
 from ..coinc.cal_hdf5_archive import archive_event as cal_hdf5_archive_event
 from ..coinc.filterbank import FilterbankConfig, run_for_event
@@ -66,6 +69,18 @@ from ..coinc.voltage_collect import (
 from .slack_notify import SlackNotifier, SlackNotifyConfig
 
 LOG = logging.getLogger("dsart.services.c3")
+
+
+def _r12_note(r12: Mapping[str, Any]) -> str:
+    """Log suffix: ' r12=FLAG@1341.3MHz(B0.79 f0.60 98sig)', ' r12=pass@...', ' r12=n/a(...)'."""
+    if not r12:
+        return ""
+    f = r12.get("features") or {}
+    if not r12.get("ok"):
+        return f" r12=n/a({str(r12.get('reason', ''))[:40]})"
+    tag = ("REJECT" if r12.get("acted") else "FLAG") if r12.get("would_reject") else "pass"
+    return (f" r12={tag}@{f.get('freq_mhz', 0):.1f}MHz(B{f.get('bw_fit_mhz', 0):.2f} "
+            f"f{f.get('f_fit', 0):.2f} {f.get('fit_sigma', 0):.0f}sig)")
 
 
 def _count_pngs(d: Path) -> int:
@@ -87,6 +102,46 @@ __all__ = ["C3Config", "C3Service", "C3_FLAG_ONLY_KEY", "main"]
 #: Mirrored by ``tools/dashboard/dsa_monitor/voltage_controls.py``;
 #: drift is caught by ``tests/test_voltage_controls.py``.
 C3_FLAG_ONLY_KEY: str = "/cmd/c3/flag_only"
+
+
+@dataclass(frozen=True)
+class R12Config:
+    """R12: DM-time ridge narrow-band rule (docs/x2/dmt_ridge_study).
+
+    The candidate's cutout DM-time plane (light curve at the trigger pixel)
+    shows a narrow-band impulse as a line through the trigger whose slope is
+    its frequency and whose in-focus DM range is w nu^3 / (2 k B); R12 fires
+    when the fitted bandwidth B <= ``bw_max_mhz`` and the line carries the
+    trigger (``f_min``) at ``sigma_min``. ``mode``: "shadow" records the
+    features and the would-be verdict and never acts; "reject" REJECTs a
+    non-injection event R12 fires on (rule ``R12_narrowband``; voltages and
+    cubes go with the usual REJECT cleanup). Injections are never rejected
+    by R12; one it fires on is counted (``r12_injection_flagged``).
+    """
+
+    enabled: bool = False
+    mode: str = "shadow"
+    bw_max_mhz: float = 6.0
+    f_min: float = 0.45
+    sigma_min: float = 8.0
+    plane: str = "pix"
+    #: stacked DM-time plane (float16) + features per event, OUTSIDE the
+    #: event dir (survives REJECT moves and candidate clean-up); "" = off
+    archive_dir: str = ""
+
+    @classmethod
+    def from_dict(cls, d: Optional[Mapping[str, Any]]) -> "R12Config":
+        d = dict(d or {})
+        mode = str(d.get("mode", "shadow"))
+        if mode not in ("shadow", "reject"):
+            raise ValueError(f"c3.r12.mode={mode!r}: 'shadow' or 'reject'")
+        plane = str(d.get("plane", "pix"))
+        if plane not in ("pix", "max"):
+            raise ValueError(f"c3.r12.plane={plane!r}: 'pix' or 'max'")
+        return cls(enabled=bool(d.get("enabled", False)), mode=mode,
+                   bw_max_mhz=float(d.get("bw_max_mhz", 6.0)), f_min=float(d.get("f_min", 0.45)),
+                   sigma_min=float(d.get("sigma_min", 8.0)), plane=plane,
+                   archive_dir=str(d.get("archive_dir", "") or ""))
 
 
 @dataclass(frozen=True)
@@ -141,6 +196,7 @@ class C3Config:
     # Slack KEEP notifications (best-effort; token from env var named by
     # slack.token_env, never logged). See services/slack_notify.py.
     slack: SlackNotifyConfig = field(default_factory=SlackNotifyConfig)
+    r12: R12Config = field(default_factory=R12Config)
     #: SPEC §10: the op-point resolved at startup (published in the mon key).
     opoint: str = ""
     opoint_selection: str = ""
@@ -209,6 +265,7 @@ class C3Config:
             veto=th,
             filterbank=FilterbankConfig.from_dict(c3.get("filterbank")),
             cal_hdf5=CalHdf5Config.from_dict(c3.get("cal_hdf5")),
+            r12=R12Config.from_dict(c3.get("r12")),
             slack=SlackNotifyConfig.from_dict(c3.get("slack")),
         )
 
@@ -283,6 +340,15 @@ class C3Service:
             "slack_failed": 0,
             "slack_followup_ok": 0,
             "slack_followup_failed": 0,
+            # R12 (DM-time ridge): evaluated / would-reject / acted / no
+            # verdict (no cutouts, too little coverage) / errors / fired on
+            # an injection (must stay 0 -- the safety monitor)
+            "r12_evaluated": 0,
+            "r12_would_reject": 0,
+            "r12_rejected": 0,
+            "r12_no_verdict": 0,
+            "r12_errors": 0,
+            "r12_injection_flagged": 0,
         }
         # name -> {"due_unix": float, "attempts": int} — cal archives
         # whose +window is still in the future (persisted; re-checked
@@ -389,6 +455,16 @@ class C3Service:
         if not metrics.ok:
             self._counters["veto_errors"] += 1
         decision = decide(metrics, is_injection=is_inj, thresholds=self._cfg.veto)
+        r12 = self._r12(name, ev_dir, is_inj=is_inj)
+        if (r12.get("would_reject") and self._cfg.r12.mode == "reject"
+                and decision.keep and not is_inj):
+            f12 = r12["features"]
+            decision = VetoDecision(
+                keep=False, rules_fired=("R12_narrowband",), is_injection=False,
+                notes=f"R12: narrow-band line at {f12['freq_mhz']:.1f} MHz "
+                      f"(B {f12['bw_fit_mhz']:.2f} MHz, f {f12['f_fit']:.2f})")
+            r12["acted"] = True
+            self._counters["r12_rejected"] += 1
         # Shadow veto (2026-08-24). ``decide`` short-circuits injections to
         # an unconditional KEEP ("injection - exempt from veto"), so in
         # production the veto thresholds are NEVER exercised: every hourly
@@ -415,6 +491,8 @@ class C3Service:
             "flag_only_source": flag_only_source,
             "metrics": metrics.__dict__,
         }
+        if r12:
+            rec["r12"] = r12
         if shadow is not None:
             rec["shadow_action"] = shadow.action
             rec["shadow_keep"] = bool(shadow.keep)
@@ -439,12 +517,66 @@ class C3Service:
                 "" if shadow.keep else str(list(shadow.rules_fired)),
             )
         LOG.info(
-            "C3 %s name=%s inj=%s rules=%s%s%s",
+            "C3 %s name=%s inj=%s rules=%s%s%s%s",
             decision.action, name, is_inj, list(decision.rules_fired),
             " [flag-only]" if (not decision.keep and flag_only) else "",
-            shadow_note,
+            shadow_note, _r12_note(r12),
         )
         return rec
+
+    # ----- R12: DM-time ridge ----------------------------------------------
+
+    def _r12(self, name: str, ev_dir: Path, *, is_inj: bool) -> Dict[str, Any]:
+        """Features + verdict of the DM-time ridge rule; {} when disabled.
+
+        Never raises: an error or a missing plane gives no verdict (the event
+        is decided by the other rules, as before).
+        """
+        cfg = self._cfg.r12
+        if not cfg.enabled:
+            return {}
+        t0 = time.monotonic()
+        out: Dict[str, Any] = {"mode": cfg.mode, "would_reject": False, "acted": False,
+                               "thresholds": {"bw_max_mhz": cfg.bw_max_mhz, "f_min": cfg.f_min,
+                                              "sigma_min": cfg.sigma_min, "plane": cfg.plane}}
+        try:
+            feats, _spec, plane = event_ridge(ev_dir, kind=cfg.plane)
+            flag = narrowband_verdict(feats, bw_max_mhz=cfg.bw_max_mhz, f_min=cfg.f_min,
+                                      sigma_min=cfg.sigma_min)
+            out.update(ok=bool(feats.ok), reason=feats.reason, would_reject=flag,
+                       features=feats.to_dict())
+            if plane is not None and cfg.archive_dir:
+                out["archive"] = self._r12_archive(name, plane, out)
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("R12 %s failed", name)
+            self._counters["r12_errors"] += 1
+            out.update(ok=False, reason=f"error: {exc!r}"[:200])
+        out["elapsed_s"] = round(time.monotonic() - t0, 2)
+        self._counters["r12_evaluated"] += 1
+        if not out.get("ok"):
+            self._counters["r12_no_verdict"] += 1
+        if out["would_reject"]:
+            self._counters["r12_would_reject"] += 1
+            if is_inj:
+                self._counters["r12_injection_flagged"] += 1
+                LOG.warning("R12 fired on INJECTION %s (%s) -- never acted on; check the rule",
+                            name, _r12_note(out).strip())
+        return out
+
+    def _r12_archive(self, name: str, plane: Dict[str, Any], rec: Dict[str, Any]) -> str:
+        """<archive_dir>/<yymmdd>/<event>.npz: the stacked plane + features."""
+        d = Path(self._cfg.r12.archive_dir) / name[:6]
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{name}.npz"
+        tmp = d / f".{name}.tmp.npz"
+        np.savez_compressed(
+            tmp, plane=np.asarray(plane["plane"], np.float16),
+            dms=np.asarray(plane["dms"], np.float32), t_trig=np.int64(plane["t_trig"]),
+            width=np.int64(plane["width"]), dm_trig=np.float64(plane["dm_trig"]),
+            n_halves=np.int64(plane["n_halves"]), kind=self._cfg.r12.plane,
+            r12=json.dumps({k: v for k, v in rec.items() if k != "archive"}, default=str))
+        tmp.replace(path)
+        return str(path)
 
     def _do_keep(
         self, name: str, ev_dir: Path, is_inj: bool = False,
