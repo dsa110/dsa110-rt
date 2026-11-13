@@ -1012,9 +1012,14 @@ c3:
   # legacy FRBs, 0 of zzeg/twmx/quga/B1933+16/11 injections, 10/11 voltage-
   # confirmed narrow-band. mode shadow = record + archive only; reject = the
   # user-approved P3 (REJECT: no voltages, no cubes). Injections never.
+  # 2026-11-13 (user): reject. Shadow 11-12 20:42 -> 11-13 04:22, 94 events:
+  # 72 would-reject (22 of 30 sky KEEPs); of the flagged KEEPs 17/19 with a
+  # filterbank were voltage-confirmed narrow-band (the other two: a 1 MHz
+  # component at the R12 frequency, and a non-detection with two parallel
+  # lines DM 50-1500); 0 of 4 injections and both B1933+16 pulses passed.
   r12:
     enabled: true
-    mode: shadow
+    mode: reject
     bw_max_mhz: 6.0
     f_min: 0.45
     sigma_min: 8.0

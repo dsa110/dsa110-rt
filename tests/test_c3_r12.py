@@ -165,7 +165,7 @@ def test_r12_errors_never_break_the_decision(tmp_path: Path, keep_everything, mo
 
 def test_config(tmp_path: Path) -> None:
     two = c3mod.C3Config.from_yaml(REPO / "configs" / "opoints" / "2x" / "dsart_search_rt.yaml").r12
-    assert two.enabled and two.mode == "shadow" and two.bw_max_mhz == 6.0 and two.f_min == 0.45
+    assert two.enabled and two.mode == "reject" and two.bw_max_mhz == 6.0 and two.f_min == 0.45
     assert two.plane == "pix" and two.archive_dir == "/dataz/dsa110/operations/c3/dmt"
     one = c3mod.C3Config.from_yaml(REPO / "configs" / "dsart_search_rt.yaml").r12
     assert not one.enabled
