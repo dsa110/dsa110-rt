@@ -959,9 +959,17 @@ class C3Service:
 
         # 2b. x2: delete the archived raw-stream windows (GB per event);
         # the cutouts (a few MB) stay so the event can still be re-plotted
-        # and its veto audited.
+        # and its veto audited. Only when nothing has landed for
+        # raw_reap_quiet_s: deleting raw/ under a half's running rsync
+        # killed it (rc 23) and that half then kept its copy in staging
+        # with no UPLOAD_OK, so it was never purged (2026-11-20: every
+        # failed raw upload of 11-16..20 was a REJECT 3-42 s into the
+        # transfer). A busy raw/ is left to the reaper.
         raw_dir = ev_dir / "raw"
-        if raw_dir.is_dir():
+        quiet = self._cfg.raw_reap_quiet_s
+        if raw_dir.is_dir() and time.time() - _newest_ctime(raw_dir) < quiet:
+            actions["raw_deferred_to_reaper"] = True
+        elif raw_dir.is_dir():
             n_raw = sum(1 for f in raw_dir.rglob("*") if f.is_file())
             try:
                 shutil.rmtree(raw_dir)

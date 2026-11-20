@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -350,6 +351,31 @@ async def test_cutout_event_incomplete_is_kept_and_late_recorded(
     assert [x["half"] for x in l3["products"]["late"]] == ["s13g1"]
     assert "s13g1" not in l3["products"]["missing"]
     assert svc._counters["events_finalised_late"] == 1
+
+
+@asyncio_test
+async def test_late_cutouts_after_c3_reject_stop_the_watch(
+    tmp_path: Path, plots,
+) -> None:
+    # C3 REJECTs (moves Level3 to candidates_rejected) before the last half
+    # lands: one INFO line and the event leaves the watch, not a warning
+    # every pass for late_accept_s (2026-11-20).
+    svc, bc = _svc(tmp_path)
+    await svc._on_batch(_batch(61335.0, 3), peer_repr="x")
+    name = svc._last_event_name
+    ev = tmp_path / "events" / name
+    for sid, g in ALL8[:7]:
+        _manifest(ev, sid, g)
+    later = time.monotonic() + 121.0
+    svc._scan_pending_events(later)
+    assert name in svc._finalised_cutouts
+    shutil.rmtree(ev / "Level3")                           # C3 moved it away
+    _manifest(ev, *ALL8[-1])
+    svc._scan_pending_events(later + 5)
+    assert name not in svc._finalised_cutouts
+    assert svc._counters["late_cutouts_after_reject"] == 1
+    assert svc._counters["events_finalised_late"] == 0
+    assert not (ev / "Level3").exists()
 
 
 @asyncio_test

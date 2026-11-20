@@ -7,6 +7,7 @@ windows for minutes afterwards and rsync recreates raw/. 2026-11-16..19 left
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -133,3 +134,17 @@ def test_reap_list_survives_a_restart(tmp_path: Path) -> None:
     svc._save_state()
     again = _service(tmp_path, raw_reap_backfill_days=0)
     assert "261119ffff" in again._raw_reap
+
+
+def test_reject_leaves_a_landing_raw_window_to_the_reaper(tmp_path: Path) -> None:
+    # 2026-11-20: rmtree under a half's running rsync killed it (rc 23) and the
+    # half never purged its staging copy. A raw/ still being written is left.
+    svc = _service(tmp_path, quiet_s=3600.0)
+    ev = _event(tmp_path, "261120gggg")
+    raw = _raw(tmp_path, "261120gggg")
+    out = svc._do_reject("261120gggg", ev, None, flag_only=False)
+    assert raw.exists() and out["reject"].get("raw_deferred_to_reaper") is True
+    assert "261120gggg" in svc._raw_reap
+    svc._cfg = dataclasses.replace(svc._cfg, raw_reap_quiet_s=0.0)   # upload done
+    svc._reap_raw()
+    assert not raw.exists() and svc._counters["raw_reaped"] == 1

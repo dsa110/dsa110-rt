@@ -1244,6 +1244,7 @@ class CoincidencerService:
             "events_complete": 0,
             "events_incomplete": 0,
             "events_finalised_late": 0,
+            "late_cutouts_after_reject": 0,
             "events_recovered": 0,
             "halves_missing": 0,
             "dumps_dedup_suppressed": 0,
@@ -2457,6 +2458,16 @@ class CoincidencerService:
         try:
             with l3.open("r", encoding="utf-8") as fh:
                 doc = json.load(fh)
+        except FileNotFoundError:
+            # C3 REJECTed it and moved Level3 to candidates_rejected; the
+            # cutouts stay with the tombstone. Stop watching (this used to
+            # warn every pass for the whole late_accept_s, 2026-11-20).
+            self._finalised_cutouts.pop(name, None)
+            self._counters["late_cutouts_after_reject"] = (
+                self._counters.get("late_cutouts_after_reject", 0) + 1)
+            _LOG.info("late cutouts for %s (%s) arrived after its Level3 left %s "
+                      "(C3 reject); not recorded", name, ", ".join(newly), ev_dir)
+            return
         except (OSError, ValueError) as exc:
             _LOG.warning("late cutouts for %s: cannot read %s: %s", name, l3, exc)
             return

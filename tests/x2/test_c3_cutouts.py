@@ -159,7 +159,7 @@ def test_reject_deletes_raw_keeps_cutouts(tmp_path: Path) -> None:
         archive_root=tmp_path / "candidates",
         rejected_root=tmp_path / "rejected",
         state_path=tmp_path / "state.json", fired_injection_log=None,
-        corr_nodes={}, flag_only=False)
+        corr_nodes={}, flag_only=False, raw_reap_quiet_s=0.0)   # raw/ already quiet
     svc = c3mod.C3Service(cfg, mon_store=_Store())
     ev = cfg.archive_root / "261022dddd"
     (ev / "raw" / "raw_s1_g0").mkdir(parents=True)

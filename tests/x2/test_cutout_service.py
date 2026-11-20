@@ -262,7 +262,7 @@ def test_raw_archive_d4_and_offline_reimage_matches_the_producer(tmp_path):
             assert np.array_equal(img[0::2], img[1::2])
 
 
-def test_serve_writes_raw_then_cutout_and_uploads_cutout_first(tmp_path):
+def test_serve_writes_and_uploads_the_cutout_before_the_raw_window(tmp_path):
     pytest.importorskip("dsart.x2.cutout.schema")
     from dsart.x2.cutout.raw_archive import is_raw_complete
     from dsart.x2.search.cutout_service import DONE
@@ -287,6 +287,39 @@ def test_serve_writes_raw_then_cutout_and_uploads_cutout_first(tmp_path):
     assert is_raw_complete(tmp_path / req.event_name / "raw" / "raw_s2_g1")
     assert (tmp_path / req.event_name / "cutouts" / "cutout_s2_g1.json").is_file()
     assert [c[0] for c in calls] == ["cutout", "raw"]
+
+
+def test_serve_keeps_the_raw_window_when_the_cutout_build_fails(tmp_path):
+    # 261117dbty (2026-11-17, S/N 15.4, KEEP) reached h23 with neither its
+    # cutouts nor its raw windows: the raw is now written and uploaded after
+    # the cutout, and also when the cutout fails.
+    pytest.importorskip("dsart.x2.cutout.schema")
+    from dsart.x2.cutout.raw_archive import is_raw_complete
+
+    eng = _engine()
+    calls = []
+
+    class _Up:
+        def __init__(self, name):
+            self.name = name
+
+        def submit(self, ev, src):
+            calls.append(self.name)
+            return True
+
+    p = CutoutProducer(eng, search_node_id=2, gpu_half=1, out_root=tmp_path,
+                       plan=_axis_plan(eng))
+    p.uploaders = (_Up("cutout"), _Up("raw"))
+
+    def boom(*a, **k):
+        raise RuntimeError("build died")
+    p.build_arrays = boom
+    req = _req(raw_pre_ext=40, raw_post_ext=40)
+    state, reason, info = p.serve(req, event_dir=tmp_path / req.event_name)
+    assert state == FAILED and info["raw_bytes"] > 0
+    assert is_raw_complete(tmp_path / req.event_name / "raw" / "raw_s2_g1")
+    assert calls == ["raw"] and p.counters["failed"] == 1
+    assert p.offer(encode_request(req))[1] == FAILED          # a RESEND sees the failure
 
 
 def _engine_two_tier_a(owned):

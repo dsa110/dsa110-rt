@@ -32,6 +32,8 @@ Sweep policy (per pass, in order):
    ``upload.log`` carries an ``UPLOAD_OK`` marker; un-uploaded dirs
    are only sacrificed if the uploaded ones weren't enough, each with
    a loud warning (that data exists nowhere else).
+4. tier 3 — empty shells: empty ``<event>/raw``, ``<event>/cutouts`` and
+   event dirs older than ``tmp_age_h`` are rmdir'ed.
 
 Both GPU halves run a sweeper over the same ``dump_root``; a
 non-blocking ``flock`` on ``<dump_root>/.retention.lock`` makes the
@@ -231,6 +233,7 @@ def sweep_once(config: CubeRetentionConfig, *,
         "n_unuploaded_sacrificed": 0,
         "bytes_freed": 0,
         "bytes_after": 0,
+        "n_empty_dirs_removed": 0,
     }
     if not root.is_dir():
         return stats
@@ -306,7 +309,33 @@ def sweep_once(config: CubeRetentionConfig, *,
             stats["bytes_freed"] += freed
             total -= e.n_bytes
     stats["bytes_after"] = total
+
+    # ---- tier 3: empty shells ----------------------------------------------
+    # Deleting product entries leaves their parents behind: 2026-11-20 the
+    # nodes held ~1000 empty raw/ dirs (and the event dirs around them) that
+    # no tier ever revisited. rmdir only removes an empty dir, so a writer
+    # racing us either recreates it or makes the rmdir fail.
+    stats["n_empty_dirs_removed"] = _prune_empty_shells(root, tmp_cutoff)
     return stats
+
+
+def _prune_empty_shells(root: Path, cutoff: float) -> int:
+    """rmdir empty ``<event>/raw``, ``<event>/cutouts`` and then ``<event>``
+    dirs whose mtime is older than ``cutoff``."""
+    n = 0
+    try:
+        events = [p for p in root.iterdir() if p.name != _LOCK_NAME and p.is_dir()]
+    except OSError:
+        return 0
+    for ev in events:
+        for d in (ev / "raw", ev / "cutouts", ev):
+            try:
+                if d.stat().st_mtime < cutoff:
+                    os.rmdir(d)
+                    n += 1
+            except OSError:                    # absent, not empty, or raced
+                continue
+    return n
 
 
 class CubeRetentionSweeper:

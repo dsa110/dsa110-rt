@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import logging
 import socket
 import struct
 import threading
@@ -41,6 +42,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
+
+_LOG = logging.getLogger(__name__)
 
 __all__ = [
     "REQ_STRUCT", "STATUS_STRUCT", "CutoutRequest", "decode_request", "encode_status",
@@ -498,39 +501,77 @@ class CutoutProducer:
 
     def serve(self, req: CutoutRequest, *, event_dir: Path) -> tuple:
         """Run one job; returns ``(state, reason, info)``. Rows copied by
-        :meth:`capture` are used, else copied now. Uploads (when ``uploaders``
-        are set): the cutout first, then the raw window (D4)."""
+        :meth:`capture` are used, else copied now. The cutout is built,
+        written and submitted for upload FIRST, then the raw window is
+        written and submitted (D4) -- also when the cutout failed, since the
+        rows are already in hand. (Until 2026-11-20 the ~1.3 GB raw window
+        was written before the build began, and a build that failed or
+        stalled left an event -- 261117dbty, S/N 15.4, KEEP -- with neither
+        product on h23.) Each phase's time is logged."""
         from ..cutout.schema import write_cutout
 
         t_start = time.monotonic()
         raw_dir = event_dir / "raw" / f"raw_s{self.sid}_g{self.g}"
         with self._lock:
             got = self._snaps.pop(req.key, None)
-        raw_bytes = 0
+        ms = dict(copy=0, build=0, write=0, raw=0)
         try:
+            t = time.monotonic()
             snaps, too_late, _n = got if got is not None else self.copy_rows(req)
-            if req.flags & FLAG_RAW:
-                raw_bytes = self.write_raw(req, snaps, too_late, raw_dir)
-            arrays, status = self.build_arrays(req, snaps)
-            path, _manifest = write_cutout(event_dir / "cutouts", arrays)
+            ms["copy"] = int(1e3 * (time.monotonic() - t))
         except Exception as e:                                  # noqa: BLE001
-            self.counters["failed"] += 1
-            with self._lock:
-                self._seen[req.key] = FAILED
-            return FAILED, R_IO, dict(error=repr(e))
-        if self.uploaders is not None:
-            cut_up, raw_up = self.uploaders
-            cut_up.submit(req.event_name, event_dir / "cutouts")
-            if raw_bytes:
-                raw_up.submit(req.event_name, raw_dir)
+            return self._fail(req, e, t_start)
+        cut_err: Optional[Exception] = None
+        path = None
+        status = "partial"
+        try:
+            t = time.monotonic()
+            arrays, status = self.build_arrays(req, snaps)
+            t1 = time.monotonic()
+            path, _manifest = write_cutout(event_dir / "cutouts", arrays)
+            ms["build"], ms["write"] = int(1e3 * (t1 - t)), int(1e3 * (time.monotonic() - t1))
+            del arrays
+            if self.uploaders is not None:
+                self.uploaders[0].submit(req.event_name, event_dir / "cutouts")
+        except Exception as e:                                  # noqa: BLE001
+            cut_err = e
+        raw_bytes = 0
+        if req.flags & FLAG_RAW:
+            try:
+                t = time.monotonic()
+                raw_bytes = self.write_raw(req, snaps, too_late, raw_dir)
+                ms["raw"] = int(1e3 * (time.monotonic() - t))
+                if raw_bytes and self.uploaders is not None:
+                    self.uploaders[1].submit(req.event_name, raw_dir)
+            except Exception as e:                              # noqa: BLE001
+                _LOG.warning("cutout %s s%dg%d: raw window not written: %r",
+                             req.event_name, self.sid, self.g, e)
+                raw_bytes = 0
+        del snaps
+        if cut_err is not None:
+            return self._fail(req, cut_err, t_start, raw_bytes=raw_bytes)
         self.last_latency_ms = int(1e3 * (time.monotonic() - t_start))
         state = DONE if (status == "complete" and not too_late) else PARTIAL
         self.counters["done" if state == DONE else "partial"] += 1
         with self._lock:
             self._seen[req.key] = state
+        _LOG.info("cutout %s s%dg%d %s in %d ms: copy %d build %d write %d raw %d ms "
+                  "(%.2f GB)%s", req.event_name, self.sid, self.g,
+                  "done" if state == DONE else "partial", self.last_latency_ms, ms["copy"],
+                  ms["build"], ms["write"], ms["raw"], raw_bytes / 1e9,
+                  f" too_late={too_late}" if too_late else "")
         return state, (R_TOO_LATE if too_late else R_OK), dict(
             path=str(path), raw_bytes=raw_bytes, too_late=too_late,
-            latency_ms=int(1e3 * (time.monotonic() - t_start)))
+            latency_ms=self.last_latency_ms)
+
+    def _fail(self, req: CutoutRequest, err: Exception, t_start: float, *,
+              raw_bytes: int = 0) -> tuple:
+        self.counters["failed"] += 1
+        with self._lock:
+            self._seen[req.key] = FAILED
+        _LOG.warning("cutout %s s%dg%d FAILED after %d ms: %r", req.event_name, self.sid,
+                     self.g, int(1e3 * (time.monotonic() - t_start)), err)
+        return FAILED, R_IO, dict(error=repr(err), raw_bytes=raw_bytes)
 
 
 def make_uploaders(*, sid: int, g: int, dest_host: str, dest_root: str,

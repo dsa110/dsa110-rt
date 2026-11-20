@@ -105,3 +105,25 @@ def test_sweeper_sweep_now_locks_and_reports(tmp_path) -> None:
     assert (tmp_path / ".retention.lock").exists()
     stats2 = sw.sweep_now()
     assert stats2["n_age_deleted"] == 0
+
+
+def test_tier3_removes_empty_shells_left_by_deleted_products(tmp_path) -> None:
+    # 2026-11-20: ~1000 empty raw/ dirs (their raw_s*_g* entries swept)
+    # and the event dirs around them were never removed.
+    old = time.time() - 3 * 3600.0
+    shell = tmp_path / "261117aaaa"
+    (shell / "raw").mkdir(parents=True)
+    fresh = tmp_path / "261120bbbb"
+    (fresh / "raw").mkdir(parents=True)                     # being written now
+    busy = tmp_path / "261117cccc"
+    (busy / "cutouts").mkdir(parents=True)
+    (busy / "cutouts" / "upload.log").write_text("x")
+    for d in (shell / "raw", shell, busy / "cutouts", busy):
+        os.utime(d, (old, old))
+    stats = sweep_once(_cfg(tmp_path))
+    assert stats["n_empty_dirs_removed"] == 1 and not (shell / "raw").exists()
+    assert shell.exists()                                   # its mtime moved: next pass
+    os.utime(shell, (old, old))
+    sweep_once(_cfg(tmp_path))
+    assert not shell.exists()
+    assert (fresh / "raw").is_dir() and (busy / "cutouts" / "upload.log").is_file()
