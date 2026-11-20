@@ -42,14 +42,20 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from ..common.constants import BLOCK_DURATION_S, FADA_BYTES_PER_BLOCK
-from ..dump.voltage_ring import VoltageRing, specnum_to_block_n
+from ..dump.voltage_ring import (
+    VoltageRing,
+    WindowExtract,
+    specnum_to_block_n,
+    window_block_range,
+)
 from ..dump.voltage_trigger_listener import (
     VoltageTriggerListener,
     VoltageTriggerListenerConfig,
@@ -102,6 +108,10 @@ _DEFAULT_STAGING_ORPHAN_TTL_S: float = 7200.0                # 2 h (4x c3 collec
 _DEFAULT_ORPHAN_SWEEP_INTERVAL_S: float = 300.0             # scan every 5 min
 
 
+#: _prepare() result for a dump whose post-window is not in the ring yet.
+_NOT_READY = object()
+
+
 class DiskFullError(OSError):
     """Raised when a staging write hits ENOSPC mid-write.
 
@@ -152,6 +162,11 @@ class RetentionConfig:
     # c3.collect_timeout_s with margin. 0 disables the sweep.
     staging_orphan_ttl_s: float = _DEFAULT_STAGING_ORPHAN_TTL_S
     orphan_sweep_interval_s: float = _DEFAULT_ORPHAN_SWEEP_INTERVAL_S
+    # Dump windows the worker may copy out of the ring ahead of time while
+    # it is still writing an earlier one (see _absorb). Each costs up to one
+    # fragment of RAM (6.75 GiB at 2x) unless it shares blocks with the
+    # window before it; NUMA 1 has ~23 GiB of headroom beside the ring.
+    max_prepared_windows: int = 1
 
     @property
     def sb(self) -> str:
@@ -320,6 +335,9 @@ def write_window_to_staging(
     mjd_target: float = 0.0,
     utc_start_specnum: Optional[int] = None,
     armed_mjd: Optional[float] = None,
+    extract: Optional[WindowExtract] = None,
+    link_from: Optional[Path] = None,
+    between_blocks: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Extract the dump window from ``ring`` and write it to staging.
 
@@ -327,9 +345,16 @@ def write_window_to_staging(
     convention) to ``<event>_<sb>_data.out`` and a sidecar manifest. The
     ``.out`` is written to a ``.tmp`` then atomically renamed so C3 never
     sees a partial file. Returns the manifest dict (also written as JSON).
+
+    ``extract``: a window already copied out of the ring (the worker
+    prepares a second trigger's window while the first is being written).
+    ``link_from``: an already staged fragment with exactly this window --
+    hard-linked instead of written again. ``between_blocks`` is called
+    after each block written (the worker uses it to prepare queued dumps).
     """
     target_block = specnum_to_block_n(int(event_specnum))
-    extract = ring.extract_window(target_block, n_pre=n_pre, n_post=n_post)
+    if extract is None:
+        extract = ring.extract_window(target_block, n_pre=n_pre, n_post=n_post)
     out_path, json_path = staged_paths(staging_dir, event_name, chgroup)
     staging_dir = Path(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -337,10 +362,17 @@ def write_window_to_staging(
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     n_written = 0
     try:
-        with open(tmp_path, "wb") as fh:
-            for _b, arr in extract.blocks:
-                fh.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
-                n_written += 1
+        if link_from is not None:
+            tmp_path.unlink(missing_ok=True)
+            os.link(link_from, tmp_path)
+            n_written = len(extract.blocks)
+        else:
+            with open(tmp_path, "wb") as fh:
+                for _b, arr in extract.blocks:
+                    fh.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
+                    n_written += 1
+                    if between_blocks is not None:
+                        between_blocks()
         os.replace(tmp_path, out_path)
     except OSError as exc:
         if exc.errno == errno.ENOSPC:
@@ -415,6 +447,7 @@ def write_window_to_staging(
         "ring_oldest_block_n": int(ring.oldest_block_n),
         "written_at_unix": time.time(),
         "data_path": str(out_path),
+        "linked_from": str(link_from) if link_from is not None else None,
     }
     with open(json_path, "w") as fh:
         json.dump(manifest, fh, indent=2, default=str)
@@ -511,6 +544,15 @@ class VoltageRetentionService:
         self._worker_thread: Optional[threading.Thread] = None
         self._sweeper_thread: Optional[threading.Thread] = None
         self._listener: Optional[VoltageTriggerListener] = None
+        # Dump worker (single thread, queue order): items ready to run --
+        # ("write", ctx) for windows already copied out of the ring, or
+        # ("delete"/"evict", name) -- a queued dump whose post-window is not
+        # in the ring yet, and the blocks of the most recently copied window
+        # (shared by an overlapping next window). See _absorb.
+        self._pending: Deque[Tuple[str, Any]] = deque()
+        self._on_deck: Optional[Tuple[str, str, int, float]] = None
+        self._recent_blocks: Dict[int, np.ndarray] = {}
+        self._last_written: Optional[Tuple[Tuple[int, ...], Path]] = None
         self._counters: Dict[str, int] = {
             "blocks_read": 0,
             "dumps_done": 0,
@@ -528,6 +570,13 @@ class VoltageRetentionService:
             # (C2-discarded events C3 never adjudicates; counted apart
             # from C3-driven deletes_done for observability).
             "orphans_evicted": 0,
+            # 2026-11-20 back-to-back dumps: windows copied out of the ring
+            # while an earlier fragment was being written, blocks they
+            # shared with the window before them, and fragments hard-linked
+            # to an identical one already staged.
+            "dumps_prepared_early": 0,
+            "blocks_shared": 0,
+            "dumps_linked": 0,
         }
         # In-process running total of bytes staged in config.staging_dir,
         # seeded from disk at startup, kept current on every successful
@@ -647,181 +696,298 @@ class VoltageRetentionService:
         ):
             time.sleep(0.02)
 
+    # ----- dump worker ---------------------------------------------------
+    #
+    # One thread, queue order. A fragment takes ~18-25 s to write (6.75 GiB
+    # at 2x) while the RAM ring holds ~25 s, so a second trigger for the
+    # same burst (C2 fires two classes within ~1 s) used to be copied out of
+    # the ring only after the first write finished -- by then its window had
+    # lapped: 261120czvd, 45 ms after 261120lnkq, wrote 0 blocks on
+    # n07/n08/n10 and 15/24 on n03 (2026-11-20). Now, between the blocks of
+    # a write, the worker copies out the next queued dump whose post-window
+    # is already in the ring (_absorb), reusing the blocks it just copied
+    # (a same-burst pair costs no second copy), and a fragment whose window
+    # is identical to the last one staged is hard-linked, not rewritten.
+
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                kind, name, specnum, mjd = self._q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                if kind in ("delete", "evict"):
-                    # Both remove a staged .out/.json pair and decrement
-                    # the cap counter through this single (worker-thread)
-                    # path so _staged_bytes stays race-free. "delete" is
-                    # C3-driven (KEEP-collect cleanup / REJECT); "evict"
-                    # is the TTL sweeper dropping an orphan. Counted
-                    # separately for observability.
-                    removed_bytes = _staged_fragment_bytes(
-                        self._cfg.staging_dir, name, self._cfg.chgroup,
-                    )
-                    n = delete_staged(
-                        self._cfg.staging_dir, name, self._cfg.chgroup,
-                    )
-                    if n:
-                        self._staged_bytes = max(
-                            0, self._staged_bytes - removed_bytes,
-                        )
-                    if kind == "evict":
-                        self._counters["orphans_evicted"] += 1
-                        LOG.warning(
-                            "voltage_retention: evicted ORPHAN staged %s "
-                            "(%d files, %.2f GiB) — older than TTL %.0f s; "
-                            "C2-discarded event never collected by C3",
-                            name, n, removed_bytes / (1 << 30),
-                            self._cfg.staging_orphan_ttl_s,
-                        )
+                if self._pending:
+                    item = self._pending.popleft()
+                else:
+                    if self._on_deck is not None:
+                        raw, self._on_deck = self._on_deck, None
                     else:
-                        self._counters["deletes_done"] += 1
-                        LOG.info(
-                            "voltage_retention: deleted staged %s (%d files)",
-                            name, n,
-                        )
+                        try:
+                            raw = self._q.get(timeout=0.2)
+                        except queue.Empty:
+                            continue
+                    item = self._prepare(raw, block=True)
+                if item is None:
                     continue
-                if not self._armed_mjd_read:
-                    # once per process; the arm record is fixed for the
-                    # lifetime of this capture epoch
-                    self._armed_mjd_read = True
-                    doc = self._mon_store.get_dict("/mon/snap/1/armed_mjd") or {}
-                    try:
-                        v = float(doc.get("armed_mjd") or 0.0)
-                        self._armed_mjd = v if v > 40000.0 else None
-                    except (TypeError, ValueError):
-                        self._armed_mjd = None
-                if (self._cfg.event_specnum_epoch == "snap"
-                        and self._utc_start_specnum is None):
-                    # the fada attach (header read) precedes the operator's arm, so the
-                    # capture mon had no armed specnum yet: read it now, after the arm
-                    self._utc_start_specnum = _utc_start_from_capture_mon()
-                try:
-                    specnum_ring = capture_relative_specnum(
-                        specnum, epoch=self._cfg.event_specnum_epoch,
-                        utc_start_specnum=self._utc_start_specnum)
-                except ValueError as exc:
-                    self._counters["dumps_failed"] += 1
-                    LOG.error("voltage_retention: dump %s %s not placed: %s", name,
-                              self._cfg.sb, exc)
-                    continue
-                # Ring block numbers. 2026-11-11: the wait used the raw
-                # SNAP-epoch block (~6.4e6 vs a ring at ~5e3), so every 2x
-                # dump sat out the full dump_wait_s; a second trigger for
-                # the same moment (C2 fires two classes ~20 ms apart) then
-                # found its window lapped: 5 of 18 dumps wrote 0 blocks.
-                target = specnum_to_block_n(specnum_ring)
-                self._wait_for_post(target)
-
-                # --- 2026-07-21 disk-headroom guard (ENOSPC fleet stall) ---
-                # Checked here, in the disk-worker path only, BEFORE any
-                # bytes are written. The reader thread / RAM ring are
-                # untouched by either branch below — the trigger is
-                # still absorbed off the queue exactly like a completed
-                # dump, it just isn't staged to NVMe.
-                expected = self._cfg.expected_fragment_bytes
-                required_free = max(
-                    2 * expected, self._cfg.min_free_bytes_floor,
-                )
-                free_ok, free_bytes = check_disk_headroom(
-                    self._cfg.staging_dir, required_free,
-                )
-                if not free_ok:
-                    self._counters["dumps_skipped_disk_full"] += 1
-                    LOG.warning(
-                        "voltage_retention: SKIPPING dump %s %s — disk "
-                        "headroom guard: %.2f GiB free < %.2f GiB "
-                        "required (2x expected fragment or floor); not "
-                        "writing (2026-07-21 ENOSPC fleet stall guard)",
-                        name, self._cfg.sb,
-                        free_bytes / (1 << 30), required_free / (1 << 30),
-                    )
-                    continue
-                if (
-                    self._staged_bytes + expected
-                    > self._cfg.staging_max_total_bytes
-                ):
-                    self._counters["dumps_skipped_staging_cap"] += 1
-                    LOG.warning(
-                        "voltage_retention: SKIPPING dump %s %s — "
-                        "cumulative staging cap: %.2f GiB staged + "
-                        "%.2f GiB fragment > %.2f GiB cap; not writing "
-                        "(2026-07-21 C2 storm containment guard)",
-                        name, self._cfg.sb,
-                        self._staged_bytes / (1 << 30),
-                        expected / (1 << 30),
-                        self._cfg.staging_max_total_bytes / (1 << 30),
-                    )
-                    continue
-
-                manifest = write_window_to_staging(
-                    ring=self._ring,
-                    event_name=name,
-                    event_specnum=specnum_ring,
-                    cn_id=self._cfg.cn_id,
-                    chgroup=self._cfg.chgroup,
-                    staging_dir=self._cfg.staging_dir,
-                    n_pre=self._cfg.n_pre,
-                    n_post=self._cfg.n_post,
-                    mjd_target=mjd,
-                    utc_start_specnum=self._utc_start_specnum,
-                    armed_mjd=self._armed_mjd,
-                )
-                self._counters["blocks_dropped_total"] += int(
-                    manifest["n_blocks_dropped"]
-                )
-                if int(manifest["n_blocks_written"]) == 0:
-                    # Every requested block missed the ring: the staged
-                    # file is empty and the dump is a FAILURE (e.g. a
-                    # trigger specnum in the wrong units/epoch), not a
-                    # success. Manifest + empty file are kept for
-                    # forensics.
-                    self._counters["dumps_failed"] += 1
-                    LOG.error(
-                        "voltage_retention: dump %s %s wrote 0 blocks "
-                        "(all %d dropped; target=%d ring=%s..%s) — FAILED",
-                        name, self._cfg.sb,
-                        manifest["n_blocks_dropped"], target,
-                        manifest["ring_oldest_block_n"],
-                        manifest["ring_newest_block_n"],
-                    )
-                    continue
-                self._counters["dumps_done"] += 1
-                self._staged_bytes += int(manifest["total_bytes"])
-                LOG.info(
-                    "voltage_retention: staged %s %s — %d blocks (%d dropped) "
-                    "%.2f GiB",
-                    name, self._cfg.sb,
-                    manifest["n_blocks_written"], manifest["n_blocks_dropped"],
-                    manifest["total_bytes"] / (1 << 30),
-                )
-            except DiskFullError:
+                if item[0] in ("delete", "evict"):
+                    self._do_delete(item[0], item[1])
+                else:
+                    self._write_prepared(item[1])
+            except DiskFullError as exc:
                 # 2026-07-21 fleet stall: ENOSPC hit mid-write despite
                 # the pre-write headroom check (a concurrent writer, or
                 # the disk filling between the check and the write).
                 # write_window_to_staging already cleaned up the partial
                 # .tmp fragment. Count it separately from generic
-                # failures and keep the worker loop running — this is
-                # the behavior that survived the incident tonight; we're
-                # only adding cleanup + a dedicated counter.
+                # failures and keep the worker loop running.
                 self._counters["dumps_failed_enospc"] += 1
                 LOG.error(
-                    "voltage_retention: ENOSPC writing dump %s %s — "
-                    "partial fragment cleaned up, continuing",
-                    name, self._cfg.sb,
+                    "voltage_retention: ENOSPC writing dump — partial "
+                    "fragment cleaned up, continuing (%s)", exc,
                 )
             except Exception:  # noqa: BLE001
                 self._counters["dumps_failed"] += 1
-                LOG.exception(
-                    "voltage_retention: dump failed for %s specnum=%d",
-                    name, specnum,
+                LOG.exception("voltage_retention: dump worker step failed")
+
+    def _do_delete(self, kind: str, name: str) -> None:
+        """Both remove a staged .out/.json pair and decrement the cap
+        counter through this single (worker-thread) path so _staged_bytes
+        stays race-free. "delete" is C3-driven (KEEP-collect cleanup /
+        REJECT); "evict" is the TTL sweeper dropping an orphan. Counted
+        separately for observability."""
+        removed_bytes = _staged_fragment_bytes(
+            self._cfg.staging_dir, name, self._cfg.chgroup,
+        )
+        n = delete_staged(self._cfg.staging_dir, name, self._cfg.chgroup)
+        if n:
+            self._staged_bytes = max(0, self._staged_bytes - removed_bytes)
+        if kind == "evict":
+            self._counters["orphans_evicted"] += 1
+            LOG.warning(
+                "voltage_retention: evicted ORPHAN staged %s "
+                "(%d files, %.2f GiB) — older than TTL %.0f s; "
+                "C2-discarded event never collected by C3",
+                name, n, removed_bytes / (1 << 30),
+                self._cfg.staging_orphan_ttl_s,
+            )
+        else:
+            self._counters["deletes_done"] += 1
+            LOG.info("voltage_retention: deleted staged %s (%d files)", name, n)
+
+    def _read_arm_records(self) -> None:
+        if not self._armed_mjd_read:
+            # once per process; the arm record is fixed for the
+            # lifetime of this capture epoch
+            self._armed_mjd_read = True
+            doc = self._mon_store.get_dict("/mon/snap/1/armed_mjd") or {}
+            try:
+                v = float(doc.get("armed_mjd") or 0.0)
+                self._armed_mjd = v if v > 40000.0 else None
+            except (TypeError, ValueError):
+                self._armed_mjd = None
+        if (self._cfg.event_specnum_epoch == "snap"
+                and self._utc_start_specnum is None):
+            # the fada attach (header read) precedes the operator's arm, so the
+            # capture mon had no armed specnum yet: read it now, after the arm
+            self._utc_start_specnum = _utc_start_from_capture_mon()
+
+    def _n_prepared(self) -> int:
+        return sum(1 for it in self._pending if it[0] == "write")
+
+    def _prepare(self, raw: Tuple[str, str, int, float], *, block: bool) -> Any:
+        """Turn a queue item into a runnable one.
+
+        A dump is placed on the ring, checked against the disk guards and
+        its window copied out of the ring. Returns ``("write", ctx)``,
+        ``(kind, name)`` for a delete/evict, None when the dump is skipped
+        or failed (counted and logged here), or ``_NOT_READY`` when
+        ``block`` is False and the post-window is not in the ring yet.
+        """
+        kind, name, specnum, mjd = raw
+        if kind in ("delete", "evict"):
+            return (kind, name)
+        self._read_arm_records()
+        try:
+            specnum_ring = capture_relative_specnum(
+                specnum, epoch=self._cfg.event_specnum_epoch,
+                utc_start_specnum=self._utc_start_specnum)
+        except ValueError as exc:
+            self._counters["dumps_failed"] += 1
+            LOG.error("voltage_retention: dump %s %s not placed: %s", name,
+                      self._cfg.sb, exc)
+            return None
+        # Ring block numbers. 2026-11-11: the wait used the raw SNAP-epoch
+        # block (~6.4e6 vs a ring at ~5e3), so every 2x dump sat out the
+        # full dump_wait_s.
+        target = specnum_to_block_n(specnum_ring)
+        if block:
+            self._wait_for_post(target)
+        elif self._ring.newest_block_n < target + self._cfg.n_post:
+            return _NOT_READY
+
+        # --- 2026-07-21 disk-headroom guard (ENOSPC fleet stall) ---
+        # Checked BEFORE the window is copied or any bytes are written. The
+        # reader thread / RAM ring are untouched by either branch below —
+        # the trigger is still absorbed off the queue exactly like a
+        # completed dump, it just isn't staged to NVMe.
+        expected = self._cfg.expected_fragment_bytes
+        required_free = max(2 * expected, self._cfg.min_free_bytes_floor)
+        free_ok, free_bytes = check_disk_headroom(
+            self._cfg.staging_dir, required_free,
+        )
+        if not free_ok:
+            self._counters["dumps_skipped_disk_full"] += 1
+            LOG.warning(
+                "voltage_retention: SKIPPING dump %s %s — disk "
+                "headroom guard: %.2f GiB free < %.2f GiB "
+                "required (2x expected fragment or floor); not "
+                "writing (2026-07-21 ENOSPC fleet stall guard)",
+                name, self._cfg.sb,
+                free_bytes / (1 << 30), required_free / (1 << 30),
+            )
+            return None
+        pending_bytes = self._n_prepared() * expected
+        if (self._staged_bytes + pending_bytes + expected
+                > self._cfg.staging_max_total_bytes):
+            self._counters["dumps_skipped_staging_cap"] += 1
+            LOG.warning(
+                "voltage_retention: SKIPPING dump %s %s — "
+                "cumulative staging cap: %.2f GiB staged + "
+                "%.2f GiB fragment > %.2f GiB cap; not writing "
+                "(2026-07-21 C2 storm containment guard)",
+                name, self._cfg.sb,
+                (self._staged_bytes + pending_bytes) / (1 << 30),
+                expected / (1 << 30),
+                self._cfg.staging_max_total_bytes / (1 << 30),
+            )
+            return None
+        extract, n_shared = self._extract_shared(target)
+        return ("write", {"name": name, "specnum_ring": specnum_ring,
+                          "target": target, "mjd": mjd, "extract": extract,
+                          "n_shared": n_shared})
+
+    def _extract_shared(self, target: int) -> Tuple[WindowExtract, int]:
+        """Copy a dump window out of the ring, reusing blocks of the window
+        copied just before it (block_n is absolute, so a block's bytes never
+        change). Returns the extract and how many blocks were reused."""
+        blocks: List[Tuple[int, np.ndarray]] = []
+        dropped: List[int] = []
+        keep: Dict[int, np.ndarray] = {}
+        n_shared = 0
+        for b in window_block_range(target, self._cfg.n_pre, self._cfg.n_post):
+            arr = self._recent_blocks.get(b)
+            if arr is not None:
+                n_shared += 1
+            else:
+                arr = self._ring.copy_block(b)
+            if arr is None:
+                dropped.append(b)
+            else:
+                blocks.append((b, arr))
+                keep[b] = arr
+        self._recent_blocks = keep
+        self._counters["blocks_shared"] += n_shared
+        return WindowExtract(
+            blocks=tuple(blocks), dropped=tuple(dropped),
+            first_block_n=blocks[0][0] if blocks else None,
+            last_block_n=blocks[-1][0] if blocks else None,
+        ), n_shared
+
+    def _absorb(self) -> None:
+        """Called between the blocks of a write: copy out the windows of
+        queued dumps whose post-window is already in the ring, up to
+        ``max_prepared_windows``, keeping queue order (deletes/evicts
+        pulled on the way run after them). A dump whose post-window is not
+        in yet waits on deck and is retried at the next block."""
+        while not self._stop.is_set():
+            if self._on_deck is None:
+                if self._n_prepared() >= self._cfg.max_prepared_windows:
+                    return
+                try:
+                    raw = self._q.get_nowait()
+                except queue.Empty:
+                    return
+            else:
+                raw, self._on_deck = self._on_deck, None
+            try:
+                item = self._prepare(raw, block=False)
+            except Exception:  # noqa: BLE001
+                self._counters["dumps_failed"] += 1
+                LOG.exception("voltage_retention: preparing %s failed", raw[1])
+                continue
+            if item is _NOT_READY:
+                self._on_deck = raw
+                return
+            if item is None:
+                continue
+            self._pending.append(item)
+            if item[0] == "write":
+                self._counters["dumps_prepared_early"] += 1
+                ctx = item[1]
+                LOG.info(
+                    "voltage_retention: copied out %s %s during a write "
+                    "(%d blocks, %d shared with the previous window)",
+                    ctx["name"], self._cfg.sb, ctx["extract"].n_present,
+                    ctx["n_shared"],
                 )
+
+    def _write_prepared(self, ctx: Dict[str, Any]) -> None:
+        name, extract, target = ctx["name"], ctx["extract"], ctx["target"]
+        block_ns = tuple(b for b, _ in extract.blocks)
+        link_from: Optional[Path] = None
+        if (self._last_written is not None and block_ns and not extract.dropped
+                and self._last_written[0] == block_ns
+                and self._last_written[1].is_file()):
+            link_from = self._last_written[1]
+        try:
+            manifest = write_window_to_staging(
+                ring=self._ring,
+                event_name=name,
+                event_specnum=ctx["specnum_ring"],
+                cn_id=self._cfg.cn_id,
+                chgroup=self._cfg.chgroup,
+                staging_dir=self._cfg.staging_dir,
+                n_pre=self._cfg.n_pre,
+                n_post=self._cfg.n_post,
+                mjd_target=ctx["mjd"],
+                utc_start_specnum=self._utc_start_specnum,
+                armed_mjd=self._armed_mjd,
+                extract=extract,
+                link_from=link_from,
+                between_blocks=self._absorb,
+            )
+        finally:
+            ctx["extract"] = None                     # release the window
+            if not self._n_prepared():
+                self._recent_blocks = {}
+        self._counters["blocks_dropped_total"] += int(manifest["n_blocks_dropped"])
+        if int(manifest["n_blocks_written"]) == 0:
+            # Every requested block missed the ring: the staged file is
+            # empty and the dump is a FAILURE (e.g. a trigger specnum in the
+            # wrong units/epoch), not a success. Manifest + empty file are
+            # kept for forensics.
+            self._counters["dumps_failed"] += 1
+            LOG.error(
+                "voltage_retention: dump %s %s wrote 0 blocks "
+                "(all %d dropped; target=%d ring=%s..%s) — FAILED",
+                name, self._cfg.sb, manifest["n_blocks_dropped"], target,
+                manifest["ring_oldest_block_n"], manifest["ring_newest_block_n"],
+            )
+            return
+        self._counters["dumps_done"] += 1
+        self._staged_bytes += int(manifest["total_bytes"])
+        if not extract.dropped:
+            self._last_written = (block_ns, Path(manifest["data_path"]))
+        if link_from is not None:
+            self._counters["dumps_linked"] += 1
+            LOG.info(
+                "voltage_retention: staged %s %s — %d blocks, hard-linked to "
+                "the identical window of %s", name, self._cfg.sb,
+                manifest["n_blocks_written"], link_from.name,
+            )
+            return
+        LOG.info(
+            "voltage_retention: staged %s %s — %d blocks (%d dropped) %.2f GiB",
+            name, self._cfg.sb,
+            manifest["n_blocks_written"], manifest["n_blocks_dropped"],
+            manifest["total_bytes"] / (1 << 30),
+        )
 
     # ----- orphan sweeper thread ---------------------------------------
 
@@ -1014,6 +1180,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="epoch of the C2 trigger's event_specnum: capture (1x, since the arm) or "
                         "snap (2x: absolute, converted with the fada header's UTC_START)")
     p.add_argument("--queue-max", type=int, default=32)
+    p.add_argument("--max-prepared-windows", type=int, default=1,
+                   help="dump windows copied out of the ring ahead of time while an "
+                        "earlier one is being written (RAM: up to one fragment each)")
     p.add_argument("--mon-interval-s", type=float, default=5.0)
     p.add_argument("--ready-sentinel-path", default=None)
     p.add_argument("--max-blocks", type=int, default=0)
@@ -1087,6 +1256,7 @@ def main(argv: Optional[list] = None) -> int:
         n_post=int(args.n_post),
         dump_wait_s=float(args.dump_wait_s),
         queue_max=int(args.queue_max),
+        max_prepared_windows=max(0, int(args.max_prepared_windows)),
         mon_interval_s=float(args.mon_interval_s),
         ready_sentinel_path=(
             Path(args.ready_sentinel_path)
