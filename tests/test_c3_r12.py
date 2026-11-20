@@ -139,6 +139,20 @@ def test_injections_are_never_rejected_by_r12(tmp_path: Path, keep_everything, m
     assert svc._counters["r12_injection_flagged"] == 1
 
 
+def test_fail_open_keep_is_not_rejected_by_r12(tmp_path: Path, keep_everything, monkeypatch) -> None:
+    # metrics.ok False = the cutout veto failed open (no trigger cutout / no
+    # valid rows). R12 still evaluates and records, but must not act.
+    bad = CubeMetrics(ok=False, reason="trigger cutout absent")
+    monkeypatch.setattr(c3mod, "compute_metrics", lambda *a, **k: bad)
+    svc = _service(tmp_path, mode="reject")
+    _event(tmp_path / "c", "261112narr", narrow=True)
+    rec = svc.process_event("261112narr")
+    assert rec["action"] == "KEEP" and "R12_narrowband" not in rec["rules_fired"]
+    assert rec["r12"]["would_reject"] and not rec["r12"]["acted"]
+    assert rec["r12"]["gated"] == "metrics_not_ok"
+    assert svc._counters["r12_rejected"] == 0 and svc._counters["r12_gated_metrics_not_ok"] == 1
+
+
 def test_no_cutouts_or_disabled_gives_no_verdict(tmp_path: Path, keep_everything) -> None:
     svc = _service(tmp_path, mode="reject")
     ev = tmp_path / "c" / "261112none"

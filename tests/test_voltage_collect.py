@@ -109,6 +109,50 @@ def test_collect_fragments_uses_injected_puller(tmp_path: Path) -> None:
     assert len(pulled) == 3
 
 
+def test_empty_fragment_is_failed_not_present(tmp_path: Path) -> None:
+    # A corr dump that wrote 0 blocks leaves a 0-byte fragment: it must not
+    # count as collected (2026-11-16..19 three KEEPs were "16/16" with every
+    # fragment empty), must be reported, and must not be pulled again.
+    plans = plan_fragments(
+        event_name="ev", corr_nodes=_nodes(3),
+        staging_dir="/stage", dest_dir=tmp_path,
+    )
+    calls: List[str] = []
+
+    def fake_pull(remote: str, dest: Path) -> bool:
+        calls.append(remote)
+        dest.write_bytes(b"" if "sb01" in remote else b"data")
+        return True
+
+    empty: set = set()
+    present, n_present = collect_fragments(plans, pull_fn=fake_pull, empty=empty)
+    assert n_present == 2 and present == {0: True, 1: False, 2: True}
+    assert empty == {1}
+    calls.clear()
+    empty2: set = set()
+    present, n_present = collect_fragments(plans, pull_fn=fake_pull, empty=empty2)
+    assert calls == [] and n_present == 2 and empty2 == {1}   # settled: no re-pull
+    assert collection_done(n_present=2, n_total=3, min_fragments=8, elapsed_s=0.0,
+                           timeout_s=300.0, n_failed=len(empty2))
+
+
+def test_all_fragments_empty_finishes_at_once_with_none_present(tmp_path: Path) -> None:
+    plans = plan_fragments(
+        event_name="ev", corr_nodes=_nodes(16),
+        staging_dir="/stage", dest_dir=tmp_path,
+    )
+
+    def fake_pull(remote: str, dest: Path) -> bool:
+        dest.write_bytes(b"")
+        return True
+
+    empty: set = set()
+    present, n_present = collect_fragments(plans, pull_fn=fake_pull, empty=empty)
+    assert n_present == 0 and len(empty) == 16 and not any(present.values())
+    assert collection_done(n_present=0, n_total=16, min_fragments=8, elapsed_s=0.0,
+                           timeout_s=300.0, no_show_grace_s=60.0, n_failed=16)
+
+
 def test_collect_fragments_skips_already_present(tmp_path: Path) -> None:
     plans = plan_fragments(
         event_name="ev", corr_nodes=_nodes(2),

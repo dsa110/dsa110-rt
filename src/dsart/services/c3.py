@@ -37,10 +37,10 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 import numpy as np
 import yaml
@@ -144,6 +144,18 @@ class R12Config:
                    archive_dir=str(d.get("archive_dir", "") or ""))
 
 
+def _newest_ctime(root: Path) -> float:
+    """Newest ctime of ``root`` and everything under it (rsync -a keeps the
+    source mtimes, so when a file landed shows only in its ctime)."""
+    newest = root.stat().st_ctime
+    for f in root.rglob("*"):
+        try:
+            newest = max(newest, f.stat().st_ctime)
+        except OSError:
+            continue
+    return newest
+
+
 @dataclass(frozen=True)
 class C3Config:
     archive_root: Path = Path("/dataz/dsa110/candidates")
@@ -172,6 +184,19 @@ class C3Config:
     # full collect_timeout_s / collect_min_fragments logic takes over.
     collect_no_show_grace_s: float = 120.0
     rsync_bwlimit_kbps: int = 0
+    # A destructive REJECT deletes raw/ at decision time, but each search
+    # half keeps uploading its raw windows on its own queue -- up to ~18 min
+    # later (2026-11-16..19 median 128 s) -- and rsync recreates raw/, which
+    # nothing revisited: 91 of 303 REJECTs, 278 GiB. The reaper re-deletes
+    # raw/ of destructively REJECTed events once it has been quiet for
+    # raw_reap_quiet_s, and keeps watching each event for raw_reap_horizon_s.
+    raw_reap_quiet_s: float = 120.0
+    raw_reap_horizon_s: float = 6 * 3600.0
+    # At start-up, REJECTed events of the last N days whose raw/ is back are
+    # queued too (reclaims what was left before the reaper existed).
+    raw_reap_backfill_days: float = 14.0
+    # Deletions per scan pass, so a backlog never stalls event processing.
+    raw_reap_max_per_pass: int = 10
     # Fragments pulled at once (each from a different corr node); 1 =
     # one after another, as before.
     collect_parallel: int = 1
@@ -254,6 +279,10 @@ class C3Config:
             collect_no_show_grace_s=float(
                 c3.get("collect_no_show_grace_s", 120.0)),
             rsync_bwlimit_kbps=int(c3.get("rsync_bwlimit_kbps", 0)),
+            raw_reap_quiet_s=float(c3.get("raw_reap_quiet_s", 120.0)),
+            raw_reap_horizon_s=float(c3.get("raw_reap_horizon_s", 6 * 3600.0)),
+            raw_reap_backfill_days=float(c3.get("raw_reap_backfill_days", 14.0)),
+            raw_reap_max_per_pass=int(c3.get("raw_reap_max_per_pass", 10)),
             collect_parallel=max(1, int(c3.get("collect_parallel", 1))),
             cleanup_staging_after_keep=bool(
                 c3.get("cleanup_staging_after_keep", True)),
@@ -358,10 +387,14 @@ class C3Service:
         # KEEPs whose filterbank runs on the background worker
         # (filterbank.background; persisted, re-queued on restart).
         self._fb_pending: Dict[str, Dict[str, Any]] = {}
+        # name -> unix time of its destructive REJECT: events whose raw/ the
+        # reaper keeps deleting as late raw uploads recreate it (persisted).
+        self._raw_reap: Dict[str, float] = {}
         self._fb_queue: "queue.Queue[str]" = queue.Queue()
         self._fb_stop = threading.Event()
         self._state_lock = threading.Lock()
         self._load_state()
+        self._seed_raw_reap()
 
     # ----- state -------------------------------------------------------
 
@@ -374,6 +407,8 @@ class C3Service:
                 self._processed = dict(doc.get("processed", {}))
                 self._cal_pending = dict(doc.get("cal_pending", {}))
                 self._fb_pending = dict(doc.get("filterbank_pending", {}))
+                self._raw_reap = {str(k): float(v)
+                                  for k, v in doc.get("raw_reap", {}).items()}
             except (OSError, ValueError):
                 LOG.warning("could not read C3 state %s; starting fresh", p)
 
@@ -384,7 +419,8 @@ class C3Service:
         with self._state_lock:
             doc = {"processed": dict(self._processed),
                    "cal_pending": dict(self._cal_pending),
-                   "filterbank_pending": dict(self._fb_pending)}
+                   "filterbank_pending": dict(self._fb_pending),
+                   "raw_reap": dict(self._raw_reap)}
             try:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 tmp = p.with_suffix(".tmp")
@@ -457,6 +493,17 @@ class C3Service:
         decision = decide(metrics, is_injection=is_inj, thresholds=self._cfg.veto)
         r12 = self._r12(name, ev_dir, is_inj=is_inj)
         if (r12.get("would_reject") and self._cfg.r12.mode == "reject"
+                and decision.keep and not is_inj and not metrics.ok):
+            # A KEEP with metrics.ok False is the veto failing open (no
+            # trigger cutout / no valid rows): no data is not evidence, so
+            # R12 must not turn it into a REJECT either. With the trigger
+            # half missing the ridge is anchored at the nearest surviving DM
+            # row, not the trigger. 2026-11-16..19: 29 of 103 R12 rejects
+            # were such events (261117mhma, S/N 34.4).
+            r12["gated"] = "metrics_not_ok"
+            self._counters["r12_gated_metrics_not_ok"] = (
+                self._counters.get("r12_gated_metrics_not_ok", 0) + 1)
+        elif (r12.get("would_reject") and self._cfg.r12.mode == "reject"
                 and decision.keep and not is_inj):
             f12 = r12["features"]
             decision = VetoDecision(
@@ -621,6 +668,7 @@ class C3Service:
         n_total = len(plans)
         present: Dict[int, bool] = {}
         n_present = 0
+        empties: Set[int] = set()      # dumps that wrote 0 blocks (final)
         t0 = time.monotonic()
         if n_total:
             while not self._stop.is_set():
@@ -629,6 +677,7 @@ class C3Service:
                     pull_fn=lambda r, d: rsync_pull(
                         r, d, bwlimit_kbps=self._cfg.rsync_bwlimit_kbps),
                     max_workers=self._cfg.collect_parallel,
+                    empty=empties,
                 )
                 elapsed = time.monotonic() - t0
                 if collection_done(
@@ -636,16 +685,27 @@ class C3Service:
                     min_fragments=self._cfg.collect_min_fragments,
                     elapsed_s=elapsed, timeout_s=self._cfg.collect_timeout_s,
                     no_show_grace_s=self._cfg.collect_no_show_grace_s,
+                    n_failed=len(empties),
                 ):
                     break
                 time.sleep(self._cfg.collect_poll_s)
-            LOG.info("collect %s: %d/%d fragments in %.0f s (%d at once)",
-                     name, n_present, n_total, time.monotonic() - t0,
-                     self._cfg.collect_parallel)
+            if empties:
+                LOG.warning("collect %s: %d/%d fragments in %.0f s; %d EMPTY "
+                            "(dump wrote 0 blocks on sb %s)", name, n_present,
+                            n_total, time.monotonic() - t0, len(empties),
+                            ",".join(f"{c:02d}" for c in sorted(empties)))
+            else:
+                LOG.info("collect %s: %d/%d fragments in %.0f s (%d at once)",
+                         name, n_present, n_total, time.monotonic() - t0,
+                         self._cfg.collect_parallel)
         self._counters["fragments_collected"] += n_present
+        self._counters["fragments_empty"] = (
+            self._counters.get("fragments_empty", 0) + len(empties))
         report = {
             "n_fragments_present": n_present,
             "n_fragments_total": n_total,
+            "n_fragments_empty": len(empties),
+            "empty_chgroups": sorted(empties),
             "present_by_chgroup": {str(k): v for k, v in present.items()},
         }
         if skip_inj is not None:
@@ -658,7 +718,7 @@ class C3Service:
         # broadcast below deletes the originals (260715twmx lost its
         # dump provenance this way, 2026-07-15).
         n_manifests = 0
-        if n_present > 0:
+        if n_present > 0 or empties:   # manifests say why a dump came back empty
             try:
                 man_plans = plan_manifests(
                     event_name=name,
@@ -910,6 +970,8 @@ class C3Service:
                     self._counters.get("raw_deleted", 0) + 1)
             except OSError as exc:
                 LOG.warning("could not delete raw windows %s: %s", raw_dir, exc)
+        # Late raw windows keep landing after this; the reaper deletes them.
+        self._raw_reap[name] = time.time()
 
         # 3. move metadata aside (never rm the dir) — EXCEPT the
         # inspection plots (Level2/plots/*.png, ~1 MB/event): those stay
@@ -940,6 +1002,63 @@ class C3Service:
             LOG.warning("reject move failed for %s: %s", name, exc)
             actions["move_error"] = str(exc)
         return {"reject": actions}
+
+    def _seed_raw_reap(self) -> None:
+        """Queue destructively REJECTed events of the last
+        ``raw_reap_backfill_days`` whose raw/ has come back. They are queued
+        as already past the horizon, so each is dropped once its raw/ is gone.
+        Event names start with their UTC date (YYMMDD)."""
+        days = self._cfg.raw_reap_backfill_days
+        if days <= 0:
+            return
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%y%m%d")
+        t_old = time.time() - self._cfg.raw_reap_horizon_s
+        added = 0
+        for name, action in list(self._processed.items()):
+            if action != "REJECT" or name in self._raw_reap or name[:6] < cutoff:
+                continue
+            if (self._cfg.archive_root / name / "raw").is_dir():
+                self._raw_reap[name] = t_old
+                added += 1
+        if added:
+            LOG.info("raw reaper: %d REJECTed events of the last %g days have raw/ "
+                     "back; queued", added, days)
+
+    def _reap_raw(self) -> None:
+        """Delete raw/ recreated under destructively REJECTed events by late
+        raw uploads, once it has been quiet ``raw_reap_quiet_s`` (arrival is
+        judged by ctime: rsync -a preserves mtimes). Does nothing while the
+        live mode is flag-only."""
+        if not self._raw_reap or self._effective_flag_only():
+            return
+        now = time.time()
+        n_done, changed = 0, False
+        for name, t_rej in sorted(self._raw_reap.items(), key=lambda kv: kv[1]):
+            raw = self._cfg.archive_root / name / "raw"
+            if not raw.is_dir():
+                if now - t_rej >= self._cfg.raw_reap_horizon_s:
+                    del self._raw_reap[name]
+                    changed = True
+                continue
+            if n_done >= self._cfg.raw_reap_max_per_pass:
+                continue
+            if now - _newest_ctime(raw) < self._cfg.raw_reap_quiet_s:
+                continue                       # an upload is still landing
+            n_files = sum(1 for f in raw.rglob("*") if f.is_file())
+            try:
+                shutil.rmtree(raw)
+            except OSError as exc:
+                LOG.warning("raw reaper: could not delete %s: %s", raw, exc)
+                continue
+            n_done += 1
+            if now - t_rej >= self._cfg.raw_reap_horizon_s:
+                del self._raw_reap[name]
+                changed = True
+            self._counters["raw_reaped"] = self._counters.get("raw_reaped", 0) + 1
+            LOG.info("raw reaper: deleted %d late raw files of %s (%.0f s after "
+                     "the REJECT)", n_files, name, now - t_rej)
+        if n_done or changed:
+            self._save_state()
 
     def _run_cal_archive(self, name: str,
                          first_pass: bool) -> Dict[str, Any]:
@@ -1039,6 +1158,10 @@ class C3Service:
                     await asyncio.to_thread(self._recheck_cal_pending)
                 except Exception:  # noqa: BLE001
                     LOG.exception("cal_hdf5 pending re-check failed")
+                try:
+                    await asyncio.to_thread(self._reap_raw)
+                except Exception:  # noqa: BLE001
+                    LOG.exception("raw reaper failed")
                 await asyncio.sleep(self._cfg.scan_interval_s)
         except asyncio.CancelledError:
             return

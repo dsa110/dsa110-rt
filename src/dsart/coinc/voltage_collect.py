@@ -19,7 +19,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 LOG = logging.getLogger("dsart.coinc.voltage_collect")
 
@@ -106,6 +106,7 @@ def collection_done(
     elapsed_s: float,
     timeout_s: float,
     no_show_grace_s: float = float("inf"),
+    n_failed: int = 0,
 ) -> bool:
     """True when collection should stop.
 
@@ -134,12 +135,17 @@ def collection_done(
     timeout, proceed with whatever is in hand; downstream policy decides
     what a partial set is worth (min_fragments remains the legacy
     MIN_CT quality bar for the "proceed with partial" report field).
+
+    ``n_failed`` counts fragments that are settled but empty (the corr
+    node's dump wrote 0 blocks -- see :func:`collect_fragments`): they will
+    never become present, so once present + failed covers every chgroup
+    there is nothing left to wait for.
     """
-    if n_present >= n_total:
+    if n_present + n_failed >= n_total:
         return True
     if elapsed_s >= timeout_s:
         return True
-    if n_present == 0 and elapsed_s >= no_show_grace_s:
+    if n_present + n_failed == 0 and elapsed_s >= no_show_grace_s:
         return True
     return False
 
@@ -187,6 +193,7 @@ def collect_fragments(
     *,
     pull_fn: Callable[[str, Path], bool] = lambda r, d: rsync_pull(r, d),
     max_workers: int = 1,
+    empty: Optional[Set[int]] = None,
 ) -> Tuple[Dict[int, bool], int]:
     """Attempt one pull pass over the not-yet-present fragments.
 
@@ -195,17 +202,39 @@ def collect_fragments(
     that many fragments at once (each from a different corr node): one
     rsync stream runs at ~176 MB/s, so 16 x 7.2 GB took 11 min serially
     at 2x (261111anyh).
+
+    A fragment that arrives EMPTY is not present. The corr node renames a
+    fragment into place only after writing it, so a 0-byte file is final:
+    that node's dump wrote 0 blocks (its window had already left the ring).
+    Such chgroups are added to ``empty`` (when given) and not pulled again.
+    2026-11-16..19: 48 empty fragments (three KEEPs with all 16 empty) were
+    counted present, reported "16/16", and released the corr staging.
     """
+    def _is_empty(path: Path) -> bool:
+        try:
+            return path.is_file() and path.stat().st_size == 0
+        except OSError:
+            return False
+
     have = {p.chgroup for p in plans
             if p.dest.is_file() and p.dest.stat().st_size > 0}
-    todo = [p for p in plans if p.chgroup not in have]
+    was_empty = {p.chgroup for p in plans if _is_empty(p.dest)}
+    todo = [p for p in plans if p.chgroup not in have and p.chgroup not in was_empty]
     if max_workers > 1 and len(todo) > 1:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as ex:
             oks = list(ex.map(lambda p: bool(pull_fn(p.remote, p.dest)), todo))
     else:
         oks = [bool(pull_fn(p.remote, p.dest)) for p in todo]
     pulled = {p.chgroup: ok for p, ok in zip(todo, oks)}
-    present: Dict[int, bool] = {
-        p.chgroup: p.chgroup in have or pulled[p.chgroup] for p in plans}
+    present: Dict[int, bool] = {}
+    for p in plans:
+        if p.chgroup in have:
+            present[p.chgroup] = True
+        elif p.chgroup in was_empty or (pulled[p.chgroup] and _is_empty(p.dest)):
+            present[p.chgroup] = False
+            if empty is not None:
+                empty.add(p.chgroup)
+        else:
+            present[p.chgroup] = pulled[p.chgroup]
     n_present = sum(1 for v in present.values() if v)
     return present, n_present
